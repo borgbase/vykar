@@ -1,11 +1,11 @@
 ---
 name: release
-description: "Cut a new vger release: bump versions, tag, push, wait for CI, and draft release notes."
+description: "Cut a new vykar release: bump versions, tag, push, wait for CI, and draft release notes."
 ---
 
-# vger Release
+# vykar Release
 
-Release workflow for vger. The CI pipeline lives in `.github/workflows/release.yml` and triggers on `v*` tags pushed to `main`. It builds binaries for Linux (x86_64), macOS (aarch64), and Windows (x86_64), then publishes a GitHub Release with the artifacts and SHA256 checksums.
+Release workflow for vykar. The CI pipeline lives in `.github/workflows/release.yml` and triggers on `v*` tags pushed to `main`. It builds binaries for Linux (x86_64), macOS (aarch64), and Windows (x86_64), then publishes a GitHub Release with the artifacts and SHA256 checksums.
 
 ## Steps
 
@@ -17,15 +17,15 @@ Run `make pre-commit` first to catch formatting, clippy, and test issues before 
 
 Update the `version` field in **all** workspace crates and the macOS Info.plist:
 
-- `crates/vger-types/Cargo.toml`
-- `crates/vger-crypto/Cargo.toml`
-- `crates/vger-storage/Cargo.toml`
-- `crates/vger-protocol/Cargo.toml`
-- `crates/vger-core/Cargo.toml`
-- `crates/vger-cli/Cargo.toml`
-- `crates/vger-server/Cargo.toml`
-- `crates/vger-gui/Cargo.toml`
-- `crates/vger-gui/macos/Info.plist` (update both `CFBundleVersion` and `CFBundleShortVersionString`)
+- `crates/vykar-types/Cargo.toml`
+- `crates/vykar-crypto/Cargo.toml`
+- `crates/vykar-storage/Cargo.toml`
+- `crates/vykar-protocol/Cargo.toml`
+- `crates/vykar-core/Cargo.toml`
+- `crates/vykar-cli/Cargo.toml`
+- `crates/vykar-server/Cargo.toml`
+- `crates/vykar-gui/Cargo.toml`
+- `crates/vykar-gui/macos/Info.plist` (update both `CFBundleVersion` and `CFBundleShortVersionString`)
 
 Run `cargo check` to regenerate `Cargo.lock` with the new versions.
 

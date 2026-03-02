@@ -1,6 +1,6 @@
 # Backup Recipes
 
-V'Ger provides hooks, command dumps, and source directories as universal building blocks. Rather than adding dedicated flags for each database or container runtime, the same patterns work for any application.
+Vykar provides hooks, command dumps, and source directories as universal building blocks. Rather than adding dedicated flags for each database or container runtime, the same patterns work for any application.
 
 These recipes are starting points — adapt the commands to your setup.
 
@@ -220,7 +220,7 @@ sources:
 
 ## Virtual Machine Disk Images
 
-Virtual machine disk images are an excellent use case for deduplicated backups. Large portions of a VM's disk remain unchanged between snapshots, so V'Ger's content-defined chunking achieves high deduplication ratios — often reducing storage to a fraction of the raw image size.
+Virtual machine disk images are an excellent use case for deduplicated backups. Large portions of a VM's disk remain unchanged between snapshots, so Vykar's content-defined chunking achieves high deduplication ratios — often reducing storage to a fraction of the raw image size.
 
 ### Prerequisites
 
@@ -244,7 +244,7 @@ sources:
         socat - unix-connect:/tmp/qga.sock
 ```
 
-The freeze ensures the filesystem is in a clean state while V'Ger reads the image. For incremental backups (every run after the first), only changed chunks are processed, so the freeze window is short.
+The freeze ensures the filesystem is in a clean state while Vykar reads the image. For incremental backups (every run after the first), only changed chunks are processed, so the freeze window is short.
 
 ### Tips
 
@@ -280,11 +280,11 @@ mkdir -p /mnt/.snapshots
 
 ```yaml
 sources:
-  - path: /tank/data/.zfs/snapshot/vger-tmp
+  - path: /tank/data/.zfs/snapshot/vykar-tmp
     label: data
     hooks:
-      before: "zfs snapshot tank/data@vger-tmp"
-      after:  "zfs destroy tank/data@vger-tmp"
+      before: "zfs snapshot tank/data@vykar-tmp"
+      after:  "zfs destroy tank/data@vykar-tmp"
 ```
 
 > **Important:** The `.zfs/snapshot` directory is only accessible if `snapdir` is set to `visible` on the dataset. This is not the default. Set it before using this recipe:
@@ -302,12 +302,12 @@ sources:
     label: data
     hooks:
       before: >
-        lvcreate -s -n vger-snap -L 5G /dev/vg0/data &&
+        lvcreate -s -n vykar-snap -L 5G /dev/vg0/data &&
         mkdir -p /mnt/lvm-snapshot &&
-        mount -o ro /dev/vg0/vger-snap /mnt/lvm-snapshot
+        mount -o ro /dev/vg0/vykar-snap /mnt/lvm-snapshot
       after: >
         umount /mnt/lvm-snapshot &&
-        lvremove -f /dev/vg0/vger-snap
+        lvremove -f /dev/vg0/vykar-snap
 ```
 
 Set the snapshot size (`-L 5G`) large enough to hold changes during the backup.
@@ -346,7 +346,7 @@ limits:
 
 ## Monitoring
 
-V'Ger hooks can notify monitoring services on success or failure. A `curl` in an `after` hook replaces the need for dedicated integrations.
+Vykar hooks can notify monitoring services on success or failure. A `curl` in an `after` hook replaces the need for dedicated integrations.
 
 
 ### Healthchecks
@@ -378,7 +378,7 @@ hooks:
     -H "Title: Backup failed"
     -H "Priority: high"
     -H "Tags: warning"
-    -d "vger backup failed on $(hostname)"
+    -d "vykar backup failed on $(hostname)"
     https://ntfy.sh/my-backup-alerts
 ```
 

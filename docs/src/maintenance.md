@@ -4,7 +4,7 @@
 
 ```bash
 # Delete a specific snapshot by ID
-vger snapshot delete a1b2c3d4
+vykar snapshot delete a1b2c3d4
 ```
 
 ## Delete a repository
@@ -13,10 +13,10 @@ Permanently delete an entire repository and all its snapshots.
 
 ```bash
 # Interactive confirmation (prompts you to type "delete")
-vger delete
+vykar delete
 
 # Non-interactive (for scripting)
-vger delete --yes-delete-this-repo
+vykar delete --yes-delete-this-repo
 ```
 
 ## Prune old snapshots
@@ -24,17 +24,17 @@ vger delete --yes-delete-this-repo
 Apply the retention policy defined in your configuration to remove expired snapshots. Optionally `compact` the repository after pruning.
 
 ```bash
-vger prune --compact
+vykar prune --compact
 ```
 
 ## Verify repository integrity
 
 ```bash
 # Structural integrity check
-vger check
+vykar check
 
 # Full data verification (reads and verifies every chunk)
-vger check --verify-data
+vykar check --verify-data
 ```
 
 ## Compact (reclaim space)
@@ -43,10 +43,10 @@ After `delete` or `prune`, blob data remains in pack files. Run `compact` to rew
 
 ```bash
 # Preview what would be repacked
-vger compact --dry-run
+vykar compact --dry-run
 
 # Repack to reclaim space
-vger compact
+vykar compact
 ```
 
 ## Related pages

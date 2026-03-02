@@ -4,14 +4,14 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/lib/common.sh"
 source "$SCRIPT_DIR/lib/defaults.sh"
-source "$SCRIPT_DIR/lib/vger-repo.sh"
+source "$SCRIPT_DIR/lib/vykar-repo.sh"
 
 usage() {
   cat <<USAGE
 Usage: $(basename "$0") [options]
 
-Run an autonomous vger stress test against a corpus dataset.
-Defaults target the standard vger benchmark server.
+Run an autonomous vykar stress test against a corpus dataset.
+Defaults target the standard vykar benchmark server.
 
 Options:
   --iterations N         Loop count (default: 1000)
@@ -19,11 +19,11 @@ Options:
   --verify-data-every N  Run 'check --verify-data' every N iters; 0 disables (default: 0)
   --backend NAME         Storage backend: local|rest|s3 (default: local)
   --drop-caches          Drop OS file caches before backup and restore
-  --time-v               Capture /usr/bin/time -v per vger step into logs/*.timev
+  --time-v               Capture /usr/bin/time -v per vykar step into logs/*.timev
   --help                 Show help
 
 Environment overrides (via env vars or scripts/lib/defaults.sh):
-  CORPUS_LOCAL, REPO_URL, REST_URL, REST_TOKEN, VGER_REST_TOKEN, VGER_TOKEN,
+  CORPUS_LOCAL, REPO_URL, REST_URL, REST_TOKEN, VYKAR_REST_TOKEN, VYKAR_TOKEN,
   REST_DATA_DIR, ALLOW_INSECURE_HTTP,
   S3_REGION, S3_ACCESS_KEY, S3_SECRET_KEY,
   MINIO_SERVICE, MINIO_DATA_DIR, MINIO_HEALTH_URL, STRESS_ROOT
@@ -57,9 +57,9 @@ done
 [[ "$VERIFY_DATA_EVERY" =~ ^[0-9]+$ ]] || die "--verify-data-every must be a non-negative integer"
 [[ "$BACKEND" =~ ^(local|rest|s3)$ ]] || die "--backend must be one of: local, rest, s3"
 
-VGER_BIN="$(command -v vger || true)"
-[[ -n "$VGER_BIN" ]] || die "vger binary not found on PATH"
-VGER_BIN="$(abs_path "$VGER_BIN")"
+VYKAR_BIN="$(command -v vykar || true)"
+[[ -n "$VYKAR_BIN" ]] || die "vykar binary not found on PATH"
+VYKAR_BIN="$(abs_path "$VYKAR_BIN")"
 
 CORPUS_DIR="$(abs_path "$CORPUS_LOCAL")"
 [[ -d "$CORPUS_DIR" ]] || die "corpus directory not found: $CORPUS_DIR"
@@ -87,7 +87,7 @@ resolve_repo_url() {
   case "$BACKEND" in
     local) REPO_URL_RESOLVED="$REPO_DIR" ;;
     rest)  REPO_URL_RESOLVED="$REST_URL" ;;
-    s3)    REPO_URL_RESOLVED="s3+http://127.0.0.1:9000/vger-stress/$REPO_LABEL" ;;
+    s3)    REPO_URL_RESOLVED="s3+http://127.0.0.1:9000/vykar-stress/$REPO_LABEL" ;;
   esac
 }
 
@@ -98,7 +98,7 @@ WORK_DIR="$STRESS_ROOT/work"
 REPO_DIR="$WORK_DIR/repository"
 RESTORE_DIR="$WORK_DIR/restore"
 RUNTIME_DIR="$WORK_DIR/runtime"
-CONFIG_PATH="$WORK_DIR/vger.stress.yaml"
+CONFIG_PATH="$WORK_DIR/vykar.stress.yaml"
 LOG_DIR="$WORK_DIR/logs"
 HOME_DIR="$RUNTIME_DIR/home"
 XDG_CACHE_DIR="$RUNTIME_DIR/xdg-cache"
@@ -116,7 +116,7 @@ declare -A LAST_LOGS=()
 
 # --- Helpers ---
 
-run_vger() {
+run_vykar() {
   local iter="$1" name="$2"
   shift 2
 
@@ -126,10 +126,10 @@ run_vger() {
 
   if [[ "$TIME_V" == "1" ]]; then
     HOME="$HOME_DIR" XDG_CACHE_HOME="$XDG_CACHE_DIR" \
-      "$TIME_CMD" -v -o "$time_file" "$VGER_BIN" --config "$CONFIG_PATH" "$@" >"$log_file" 2>&1 || rc=$?
+      "$TIME_CMD" -v -o "$time_file" "$VYKAR_BIN" --config "$CONFIG_PATH" "$@" >"$log_file" 2>&1 || rc=$?
   else
     HOME="$HOME_DIR" XDG_CACHE_HOME="$XDG_CACHE_DIR" \
-      "$VGER_BIN" --config "$CONFIG_PATH" "$@" >"$log_file" 2>&1 || rc=$?
+      "$VYKAR_BIN" --config "$CONFIG_PATH" "$@" >"$log_file" 2>&1 || rc=$?
   fi
 
   if [[ "$rc" -ne 0 ]]; then
@@ -263,7 +263,7 @@ main() {
   [[ "$BACKEND" == "s3" ]] && reset_minio
   [[ "$BACKEND" == "s3" ]] && ensure_s3_bucket "$REPO_URL_RESOLVED"
 
-  write_vger_config "$CONFIG_PATH" "$REPO_LABEL" "$REPO_URL_RESOLVED" "$BACKEND" "$CORPUS_DIR"
+  write_vykar_config "$CONFIG_PATH" "$REPO_LABEL" "$REPO_URL_RESOLVED" "$BACKEND" "$CORPUS_DIR"
   ensure_insecure_http_opt_in "$CONFIG_PATH" "$REPO_URL_RESOLVED"
 
   log "Stress backend=$BACKEND repo_url=$REPO_URL_RESOLVED"
@@ -272,12 +272,12 @@ main() {
   log "Deleting repository before init"
   CURRENT_STEP="delete-repo"
   LAST_LOGS[reset]="$LOG_DIR/iter-000000-delete-repo.log"
-  vger_repo_delete "$VGER_BIN" "$CONFIG_PATH" "$REPO_LABEL" "$REPO_URL_RESOLVED" \
+  vykar_repo_delete "$VYKAR_BIN" "$CONFIG_PATH" "$REPO_LABEL" "$REPO_URL_RESOLVED" \
     >"${LAST_LOGS[reset]}" 2>&1 || true
 
   log "Initializing repository"
   CURRENT_STEP="init"
-  LAST_LOGS[init]="$(run_vger 0 init init -R "$REPO_LABEL")"
+  LAST_LOGS[init]="$(run_vykar 0 init init -R "$REPO_LABEL")"
 
   log "Starting stress run iterations=$ITERATIONS"
 
@@ -299,16 +299,16 @@ main() {
     if [[ "$BACKEND" == "rest" || "$BACKEND" == "s3" ]]; then
       log "[$i/$ITERATIONS] break-lock"
       CURRENT_STEP="break-lock"
-      LAST_LOGS[break_lock]="$(run_vger "$i" break-lock break-lock -R "$REPO_LABEL")"
+      LAST_LOGS[break_lock]="$(run_vykar "$i" break-lock break-lock -R "$REPO_LABEL")"
       break_locks=$((break_locks + 1))
     fi
 
     log "[$i/$ITERATIONS] backup"
     CURRENT_STEP="backup"
     if [[ "$BACKEND" == "rest" ]]; then
-      backup_log="$(run_vger "$i" backup backup -R "$REPO_LABEL" --upload-concurrency 6)"
+      backup_log="$(run_vykar "$i" backup backup -R "$REPO_LABEL" --upload-concurrency 6)"
     else
-      backup_log="$(run_vger "$i" backup backup -R "$REPO_LABEL")"
+      backup_log="$(run_vykar "$i" backup backup -R "$REPO_LABEL")"
     fi
     LAST_LOGS[backup]="$backup_log"
     snapshot="$(extract_snapshot_id "$backup_log")" || die "failed to parse snapshot ID"
@@ -318,7 +318,7 @@ main() {
 
     log "[$i/$ITERATIONS] list (snapshot $snapshot)"
     CURRENT_STEP="list"
-    LAST_LOGS[list]="$(run_vger "$i" list list -R "$REPO_LABEL" --last 20)"
+    LAST_LOGS[list]="$(run_vykar "$i" list list -R "$REPO_LABEL" --last 20)"
     grep -q "$snapshot" "${LAST_LOGS[list]}" || die "snapshot '$snapshot' missing from list output"
     lists=$((lists + 1))
 
@@ -334,7 +334,7 @@ main() {
 
     log "[$i/$ITERATIONS] restore"
     CURRENT_STEP="restore"
-    LAST_LOGS[restore]="$(run_vger "$i" restore restore -R "$REPO_LABEL" "$snapshot" "$restore_target")"
+    LAST_LOGS[restore]="$(run_vykar "$i" restore restore -R "$REPO_LABEL" "$snapshot" "$restore_target")"
 
     log "[$i/$ITERATIONS] verify"
     CURRENT_STEP="verify"
@@ -343,33 +343,33 @@ main() {
 
     log "[$i/$ITERATIONS] delete"
     CURRENT_STEP="delete"
-    LAST_LOGS[delete]="$(run_vger "$i" delete snapshot delete "$snapshot" -R "$REPO_LABEL")"
+    LAST_LOGS[delete]="$(run_vykar "$i" delete snapshot delete "$snapshot" -R "$REPO_LABEL")"
     deletes=$((deletes + 1))
     check_locks_clear
 
     log "[$i/$ITERATIONS] compact"
     CURRENT_STEP="compact"
-    LAST_LOGS[compact]="$(run_vger "$i" compact compact -R "$REPO_LABEL" --threshold 0)"
+    LAST_LOGS[compact]="$(run_vykar "$i" compact compact -R "$REPO_LABEL" --threshold 0)"
     compacts=$((compacts + 1))
     check_locks_clear
 
     log "[$i/$ITERATIONS] prune"
     CURRENT_STEP="prune"
-    LAST_LOGS[prune]="$(run_vger "$i" prune prune -R "$REPO_LABEL")"
+    LAST_LOGS[prune]="$(run_vykar "$i" prune prune -R "$REPO_LABEL")"
     prunes=$((prunes + 1))
     check_locks_clear
 
     if (( CHECK_EVERY > 0 && i % CHECK_EVERY == 0 )); then
       log "[$i/$ITERATIONS] check"
       CURRENT_STEP="check"
-      LAST_LOGS[check]="$(run_vger "$i" check check -R "$REPO_LABEL")"
+      LAST_LOGS[check]="$(run_vykar "$i" check check -R "$REPO_LABEL")"
       checks=$((checks + 1))
     fi
 
     if (( VERIFY_DATA_EVERY > 0 && i % VERIFY_DATA_EVERY == 0 )); then
       log "[$i/$ITERATIONS] check --verify-data"
       CURRENT_STEP="check-verify-data"
-      LAST_LOGS[check_verify]="$(run_vger "$i" check-data check -R "$REPO_LABEL" --verify-data)"
+      LAST_LOGS[check_verify]="$(run_vykar "$i" check-data check -R "$REPO_LABEL" --verify-data)"
       verify_checks=$((verify_checks + 1))
     fi
 

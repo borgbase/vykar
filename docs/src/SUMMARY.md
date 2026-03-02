@@ -28,4 +28,4 @@
 
 # Contribute
 
-- [GitHub](https://github.com/borgbase/vger)
+- [GitHub](https://github.com/borgbase/vykar)

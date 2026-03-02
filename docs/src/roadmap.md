@@ -34,9 +34,9 @@
 | **Parallel transforms** | rayon-backed compression/encryption within the bounded pipeline |
 | **break-lock command** | Forced stale-lock cleanup for backend/object lock recovery |
 | **Compact pack health accounting** | Compact analysis reports/tracks corrupt and orphan packs in addition to reclaimable dead bytes |
-| **File-level cache** | inode/mtime/ctime skip for unchanged files — avoids read, chunk, compress, encrypt. Keys are 16-byte BLAKE2b path hashes (with transparent legacy migration). Stored locally under the per-repo cache root (default platform cache dir + `vger`, or `cache_dir` override). |
-| **Daemon mode** | `vger daemon` runs scheduled backup→prune→compact→check cycles with two-stage signal handling |
-| **Server-side pack verification** | `vger check` delegates pack integrity checks to vger-server when available; `--distrust-server` opts out |
+| **File-level cache** | inode/mtime/ctime skip for unchanged files — avoids read, chunk, compress, encrypt. Keys are 16-byte BLAKE2b path hashes (with transparent legacy migration). Stored locally under the per-repo cache root (default platform cache dir + `vykar`, or `cache_dir` override). |
+| **Daemon mode** | `vykar daemon` runs scheduled backup→prune→compact→check cycles with two-stage signal handling |
+| **Server-side pack verification** | `vykar check` delegates pack integrity checks to vykar-server when available; `--distrust-server` opts out |
 | **Upload integrity** | REST `PUT` includes `X-Content-BLAKE2b` header; server verifies during streaming write |
-| **vger-protocol crate** | Shared wire-format types and pack/protocol version constants between client and server |
+| **vykar-protocol crate** | Shared wire-format types and pack/protocol version constants between client and server |
 | **Type-safe SnapshotId** | Newtype for snapshot identifiers with `storage_key()` (ManifestId dropped — manifest is a singleton) |

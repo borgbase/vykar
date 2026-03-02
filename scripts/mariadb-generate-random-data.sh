@@ -17,7 +17,7 @@ Required:
 
 Options:
   --target-gib N             Target database size in GiB (default: 10)
-  --db NAME                  Database name (default: vger_maria_test)
+  --db NAME                  Database name (default: vykar_maria_test)
   --table NAME               Event table name (default: order_events)
   --root-user USER           MariaDB admin user (default: root)
   --root-password PASS       MariaDB admin password (default: testpass)
@@ -34,14 +34,14 @@ Options:
   --help                     Show this help
 
 Examples:
-  $(basename "$0") --container vger-maria --target-gib 10
-  $(basename "$0") --container vger-maria --target-gib 30 --rows-per-batch 1024
+  $(basename "$0") --container vykar-maria --target-gib 10
+  $(basename "$0") --container vykar-maria --target-gib 30 --rows-per-batch 1024
 USAGE
 }
 
 CONTAINER=""
 TARGET_GIB=10
-DB_NAME="vger_maria_test"
+DB_NAME="vykar_maria_test"
 TABLE_NAME="order_events"
 ROOT_USER="root"
 ROOT_PASSWORD="testpass"

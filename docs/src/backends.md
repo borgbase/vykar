@@ -8,7 +8,7 @@ The repository URL in your config determines which backend is used.
 | S3 / S3-compatible (HTTPS) | `s3://endpoint[:port]/bucket/prefix` |
 | S3 / S3-compatible (HTTP, unsafe) | `s3+http://endpoint[:port]/bucket/prefix` |
 | SFTP | `sftp://host/path` |
-| REST (vger-server) | `https://host/repo` |
+| REST (vykar-server) | `https://host/repo` |
 
 ## Transport security
 
@@ -48,7 +48,7 @@ S3 URLs must include an explicit endpoint and bucket path.
 ```yaml
 repositories:
   - label: "s3"
-    url: "s3://s3.us-east-1.amazonaws.com/my-bucket/vger"
+    url: "s3://s3.us-east-1.amazonaws.com/my-bucket/vykar"
     region: "us-east-1"                    # Default if omitted
     access_key_id: "AKIA..."
     secret_access_key: "..."
@@ -61,7 +61,7 @@ The endpoint is always the URL host, and the first path segment is the bucket:
 ```yaml
 repositories:
   - label: "minio"
-    url: "s3://minio.local:9000/my-bucket/vger"
+    url: "s3://minio.local:9000/my-bucket/vykar"
     region: "us-east-1"
     access_key_id: "minioadmin"
     secret_access_key: "minioadmin"
@@ -72,7 +72,7 @@ repositories:
 ```yaml
 repositories:
   - label: "minio-dev"
-    url: "s3+http://minio.local:9000/my-bucket/vger"
+    url: "s3+http://minio.local:9000/my-bucket/vykar"
     region: "us-east-1"
     access_key_id: "minioadmin"
     secret_access_key: "minioadmin"
@@ -97,7 +97,7 @@ Host keys are verified with an OpenSSH `known_hosts` file. Unknown hosts use TOF
 ```yaml
 repositories:
   - label: "nas"
-    url: "sftp://backup@nas.local/backups/vger"
+    url: "sftp://backup@nas.local/backups/vykar"
     # sftp_key: "/home/user/.ssh/id_rsa"  # Path to private key (optional)
     # sftp_known_hosts: "/home/user/.ssh/known_hosts"  # Optional known_hosts path
     # sftp_max_connections: 4  # Optional concurrency limit (1..=32)
@@ -113,9 +113,9 @@ URL format: `sftp://[user@]host[:port]/path`. Default port is 22.
 | `sftp_known_hosts` | Path to OpenSSH `known_hosts` file (default: `~/.ssh/known_hosts`) |
 | `sftp_max_connections` | Max concurrent SFTP connections (default: `4`, clamped to `1..=32`) |
 
-## REST (vger-server)
+## REST (vykar-server)
 
-Store backups on a dedicated [vger-server](server-setup.md) instance via HTTP/HTTPS. The server provides append-only enforcement, quotas, lock management, and server-side compaction.
+Store backups on a dedicated [vykar-server](server-setup.md) instance via HTTP/HTTPS. The server provides append-only enforcement, quotas, lock management, and server-side compaction.
 
 ```yaml
 repositories:
@@ -133,4 +133,4 @@ repositories:
 
 See [Server Setup](server-setup.md) for how to set up and configure the server.
 
-All backends are included in pre-built binaries from the [releases page](https://github.com/borgbase/vger/releases).
+All backends are included in pre-built binaries from the [releases page](https://github.com/borgbase/vykar/releases).

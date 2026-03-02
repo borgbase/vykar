@@ -1,19 +1,19 @@
 ---
 name: benchmarks
-description: "Compare vger performance against restic, rustic, borg, and kopia on local backend"
+description: "Compare vykar performance against restic, rustic, borg, and kopia on local backend"
 ---
 
 # Performance Benchmarks
 
 ## Goal
 
-Compare vger against established backup tools — restic, rustic, borg, and kopia — on a local backend. Measure wall-clock time, peak memory usage, and CPU usage across common backup operations.
+Compare vykar against established backup tools — restic, rustic, borg, and kopia — on a local backend. Measure wall-clock time, peak memory usage, and CPU usage across common backup operations.
 
 ## Scope
 
 - **Backend**: local only (eliminates network variability)
 - **Source dataset**: default `~/corpus-remote` (smaller, faster iteration). Optionally `~/corpus-local` for stress.
-- **Tools under test**: `vger`, `restic`, `rustic`, `borg`, `kopia`
+- **Tools under test**: `vykar`, `restic`, `rustic`, `borg`, `kopia`
 
 Dataset layout expected by the harness:
 - `<dataset>/snapshot-1` (untimed seed snapshot)
@@ -29,7 +29,7 @@ Dataset layout expected by the harness:
    ```
 2. Verify all tools are available:
    ```bash
-   vger --version
+   vykar --version
    restic version
    rustic --version
    borg --version
@@ -50,7 +50,7 @@ REPO_ROOT="$(git rev-parse --show-toplevel)"
 bash "$REPO_ROOT/scripts/benchmark.sh" --runs 5
 
 # Single tool + strace/perf on top of default profiling
-bash "$REPO_ROOT/scripts/benchmark.sh" --tool vger --runs 3 --strace --perf
+bash "$REPO_ROOT/scripts/benchmark.sh" --tool vykar --runs 3 --strace --perf
 
 # Custom dataset path
 bash "$REPO_ROOT/scripts/benchmark.sh" --dataset ~/corpus-local --runs 3
@@ -83,7 +83,7 @@ From `strace.summary.txt` (when `--strace` is enabled):
 - Heavy `statx/newfstatat/llistxattr/getdents64` indicates metadata-walk cost (tree scan).
 
 From tool stats:
-- vger: `vger.info.txt`
+- vykar: `vykar.info.txt`
 - restic: `restic.stats.txt` (includes `restic stats --mode raw-data`)
 - rustic: `rustic.stats.txt`
 - borg: `borg.stats.txt`
@@ -91,10 +91,10 @@ From tool stats:
 ## Full vs Incremental
 
 Decide what you are measuring:
-- **Incremental**: run backups repeatedly against an existing repo (measures “unchanged tree” behavior).
+- **Incremental**: run backups repeatedly against an existing repo (measures "unchanged tree" behavior).
 - **Full**: wipe/re-init the repo before each backup run (measures ingest/pack performance).
 
-The harness defaults to an “incremental-like” loop once initialized, but you can rerun it multiple times and compare across stamps. For full-ingest benchmarks, patch the harness to re-init repos per run or wrap each command with repo wipe + init.
+The harness defaults to an "incremental-like" loop once initialized, but you can rerun it multiple times and compare across stamps. For full-ingest benchmarks, patch the harness to re-init repos per run or wrap each command with repo wipe + init.
 
 Run controls:
 - `--runs N` (default `3`): number of measured runs per operation.
@@ -133,12 +133,12 @@ Test each tool through four phases:
 
 ## Tool Setup
 
-### vger
+### vykar
 ```bash
-export VGER_PASSPHRASE=123
-vger --config <config> init -R local
-vger --config <config> backup -R local -l bench ~/corpus-local
-vger --config <config> restore -R local <snapshot_id> <restore_dir>
+export VYKAR_PASSPHRASE=123
+vykar --config <config> init -R local
+vykar --config <config> backup -R local -l bench ~/corpus-local
+vykar --config <config> restore -R local <snapshot_id> <restore_dir>
 ```
 
 ### restic
@@ -196,8 +196,8 @@ From `perf stat` (optional):
 
 Produce a comparison table:
 
-| Phase | Metric | vger | restic | rustic | borg | kopia |
-|-------|--------|------|--------|--------|------|-------|
+| Phase | Metric | vykar | restic | rustic | borg | kopia |
+|-------|--------|-------|--------|--------|------|-------|
 | Init | Wall time | ... | ... | ... | ... | ... |
 | First backup | Wall time | ... | ... | ... | ... | ... |
 | First backup | Peak RSS | ... | ... | ... | ... | ... |

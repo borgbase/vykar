@@ -1,0 +1,14 @@
+[package]
+name = "vykar-protocol"
+version = "0.10.2"
+edition = "2021"
+license = "GPL-3.0-only"
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

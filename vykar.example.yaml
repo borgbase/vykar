@@ -1,0 +1,218 @@
+# vykar example configuration
+# Copy this file to vykar.yaml and adjust to your needs.
+#
+# Main concepts:
+#   1) sources      -> what gets backed up
+#   2) repositories -> where backups are stored
+#
+# Top-level options (encryption/compression/retention/etc.) are defaults.
+# Rich source/repository entries can override parts of those defaults.
+#
+# Environment variable expansion (before YAML parsing):
+#   Use env placeholders in values (see docs for exact syntax).
+#   Avoid writing placeholder syntax in comments, because expansion runs
+#   before YAML parsing.
+
+# --- Minimal runnable config -------------------------------------------------
+
+sources:
+  - /home/user/documents
+
+repositories:
+  - label: main
+    url: /backups/myrepo
+
+# --- Common options many users enable ---------------------------------------
+
+# Many users prefer zstd over lz4 for better compression ratio.
+compression:
+  algorithm: zstd                 # lz4|zstd|none
+  zstd_level: 3
+
+# Optional global hooks (run for backup/prune/check/compact):
+#
+# hooks:
+#   before_backup:
+#     - "echo starting backup for {repository}"
+#   failed:
+#     - "notify-send 'vykar {command} failed: {error}'"
+
+# --- Sources (what to back up) ----------------------------------------------
+
+# Simple source form (path strings, label auto-derived from basename):
+#
+# sources:
+#   - /home/user/documents
+#   - /home/user/photos
+
+# Rich source form (single path):
+#
+# sources:
+#   - path: /home/user/documents
+#     label: docs
+#     exclude:
+#       - "*.tmp"
+#       - ".cache/**"
+#     exclude_if_present:
+#       - .nobackup
+#       - CACHEDIR.TAG
+#     one_file_system: false
+#     git_ignore: false
+#     xattrs:
+#       enabled: false
+#     repos:                 # only back up to these repos (default: all)
+#       - main
+#     retention:
+#       keep_daily: 14
+#       keep_weekly: 8
+#     hooks:                 # source hooks: before/after/failed/finally
+#       before: "echo starting docs backup"
+#       after:
+#         - "notify-send 'docs backup complete'"
+#     command_dumps:
+#       - name: postgres.sql
+#         command: pg_dump -U myuser mydb
+
+# Rich source form (multiple paths; requires explicit label):
+#
+# sources:
+#   - paths:
+#       - /home/user/documents
+#       - /home/user/notes
+#     label: writing
+#     exclude:
+#       - "*.tmp"
+
+# Dump-only source (no filesystem paths; label required):
+#
+# sources:
+#   - label: databases
+#     command_dumps:
+#       - name: all-databases.sql
+#         command: pg_dumpall -U postgres
+
+# --- Repositories (where backups go) ----------------------------------------
+
+# URL formats:
+#   Local: /backups/repo  or  file:///backups/repo
+#   S3:    s3://endpoint:port/bucket/prefix
+#          s3+http://endpoint:port/bucket/prefix  (requires allow_insecure_http: true)
+#   SFTP:  sftp://user@host/path               (compile with feature 'backend-sftp')
+#   REST:  https://backup.example.com/repo
+
+# Simple repository form:
+#
+# repositories:
+#   - label: main
+#     url: /backups/myrepo
+
+# Rich repository form (backend options + per-repo overrides):
+#
+# repositories:
+#   - label: offsite
+#     url: s3://s3.us-east-1.amazonaws.com/my-bucket/vykar
+#     region: us-east-1
+#     access_key_id: AWS_ACCESS_KEY_ID
+#     secret_access_key: AWS_SECRET_ACCESS_KEY
+#     # sftp_key: ~/.ssh/id_ed25519
+#     # sftp_known_hosts: ~/.ssh/known_hosts
+#     # sftp_max_connections: 4
+#     # access_token: VYKAR_ACCESS_TOKEN
+#
+#     min_pack_size: 33554432      # 32 MiB
+#     max_pack_size: 536870912     # 512 MiB
+#
+#     retry:
+#       max_retries: 5
+#       retry_delay_ms: 2000
+#       retry_max_delay_ms: 120000
+#
+#     encryption:
+#       passcommand: "pass show vykar-offsite"
+#     compression:
+#       algorithm: zstd
+#       zstd_level: 6
+#     retention:
+#       keep_daily: 30
+#
+#     limits:
+#       cpu:
+#         max_threads: 2
+#       network:
+#         write_mib_per_sec: 25
+#
+#     hooks:
+#       before:
+#         - "echo starting offsite backup"
+#       finally:
+#         - "echo finished offsite backup"
+
+# --- Global defaults and advanced options -----------------------------------
+
+# Encryption defaults to mode: auto.
+#
+# encryption:
+#   mode: auto                     # auto|aes256gcm|chacha20poly1305|none
+#   # passphrase: "inline-secret"
+#   # passcommand: "pass show vykar"
+
+# chunker:
+#   min_size: 524288               # 512 KiB
+#   avg_size: 2097152              # 2 MiB
+#   max_size: 8388608              # 8 MiB
+
+# Global source traversal defaults:
+#
+# exclude_patterns:
+#   - "*.tmp"
+#   - "*.cache"
+#   - ".DS_Store"
+#   - "node_modules"
+# exclude_if_present:
+#   - .nobackup
+#   - CACHEDIR.TAG
+# one_file_system: false
+# git_ignore: false
+# xattrs:
+#   enabled: true
+
+# Retention policy for `vykar prune` (rules are additive):
+#
+# retention:
+#   keep_within: "2d"             # plain number means days
+#   keep_last: 5
+#   keep_hourly: 24
+#   keep_daily: 7
+#   keep_weekly: 4
+#   keep_monthly: 6
+#   keep_yearly: 2
+
+# Desktop scheduler settings (used by vykar-gui):
+#
+# schedule:
+#   enabled: false
+#   every: "24h"                  # supports m, h, d
+#   on_startup: false
+#   jitter_seconds: 0
+#   passphrase_prompt_timeout_seconds: 300
+
+# Optional resource limits for backup.
+# All values are MiB/s unless noted; 0 means unlimited/no change.
+#
+# limits:
+#   cpu:
+#     max_threads: 0
+#     nice: 0                      # Unix niceness target (-20..19)
+#     max_upload_concurrency: 4
+#     transform_batch_mib: 32
+#     transform_batch_chunks: 8192
+#     pipeline_depth: 4
+#     pipeline_buffer_mib: 256
+#   io:
+#     read_mib_per_sec: 0
+#     write_mib_per_sec: 0
+#   network:
+#     read_mib_per_sec: 0
+#     write_mib_per_sec: 0
+
+# See docs/src/configuration.md for full option reference.

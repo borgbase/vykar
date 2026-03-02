@@ -5,12 +5,12 @@
 Back up all configured sources to all configured repositories:
 
 ```bash
-vger backup
+vykar backup
 ```
 
-By default, V'Ger preserves filesystem extended attributes (`xattrs`). Configure this globally with `xattrs.enabled`, and override per source in rich `sources` entries.
+By default, Vykar preserves filesystem extended attributes (`xattrs`). Configure this globally with `xattrs.enabled`, and override per source in rich `sources` entries.
 
-If some files are unreadable or disappear during the run (for example, permission denied or a file vanishes), V'Ger skips those files, still creates the snapshot from everything else, and returns exit code `3` to indicate partial success.
+If some files are unreadable or disappear during the run (for example, permission denied or a file vanishes), Vykar skips those files, still creates the snapshot from everything else, and returns exit code `3` to indicate partial success.
 
 ## Sources and labels
 
@@ -40,13 +40,13 @@ sources:
 Back up only a specific source by label:
 
 ```bash
-vger backup --source docs
+vykar backup --source docs
 ```
 
 When targeting a specific repository, use `--repo`:
 
 ```bash
-vger backup --repo local --source docs
+vykar backup --repo local --source docs
 ```
 
 ## Ad-hoc backups
@@ -54,37 +54,37 @@ vger backup --repo local --source docs
 You can still do ad-hoc backups of arbitrary folders and annotate them with a label, for example before a system change:
 
 ```bash
-vger backup --label before-upgrade /var/www
+vykar backup --label before-upgrade /var/www
 ```
 
 `--label` is only valid for ad-hoc backups with explicit path arguments. For example, this is rejected:
 
 ```bash
-vger backup --label before-upgrade
+vykar backup --label before-upgrade
 ```
 
-So you can identify it later in `vger list` output.
+So you can identify it later in `vykar list` output.
 
 ## List and verify snapshots
 
 ```bash
 # List all snapshots
-vger list
+vykar list
 
 # List the 5 most recent snapshots
-vger list --last 5
+vykar list --last 5
 
 # List snapshots for a specific source
-vger list --source docs
+vykar list --source docs
 
 # List files inside a snapshot
-vger snapshot list a1b2c3d4
+vykar snapshot list a1b2c3d4
 
 # Find recent SQL dumps across recent snapshots
-vger snapshot find --last 5 --name '*.sql'
+vykar snapshot find --last 5 --name '*.sql'
 
 # Find logs from one source changed in the last week
-vger snapshot find --source myapp --since 7d --iname '*.log'
+vykar snapshot find --source myapp --since 7d --iname '*.log'
 ```
 
 ## Command dumps
@@ -102,11 +102,11 @@ sources:
         command: redis-cli --rdb -
 ```
 
-Each command runs via `sh -c` and the captured output is stored as a virtual file under `.vger-dumps/` in the snapshot. On restore, these appear as regular files:
+Each command runs via `sh -c` and the captured output is stored as a virtual file under `.vykar-dumps/` in the snapshot. On restore, these appear as regular files:
 
 ```text
-.vger-dumps/postgres.sql
-.vger-dumps/redis.rdb
+.vykar-dumps/postgres.sql
+.vykar-dumps/redis.rdb
 ```
 
 You can also create dump-only sources with no filesystem paths:

@@ -9,7 +9,7 @@ Use this skill when reviewing, refactoring, or planning the structure of a large
 
 Apply this skill by comparing the target codebase against each section's recommendations. Flag deviations as review findings, prioritizing structural issues (workspace layout, crate boundaries, error handling strategy) over stylistic ones (clippy lint choices, formatting). Not every recommendation will apply to every project — use judgment based on codebase size, team size, and project maturity.
 
-**A CLI backup tool like V'Ger — combining backup logic, REST client/server communication, and a rich command-line interface — demands disciplined architecture to remain maintainable as it grows.** This report distills best practices from the Rust ecosystem, drawing on patterns from ripgrep, rustic-rs, cargo, rust-analyzer, restic, and Borg. Each section provides actionable recommendations and concrete code patterns that a skilled developer can apply immediately when reviewing or refactoring a large Rust codebase.
+**A CLI backup tool like Vykar — combining backup logic, REST client/server communication, and a rich command-line interface — demands disciplined architecture to remain maintainable as it grows.** This report distills best practices from the Rust ecosystem, drawing on patterns from ripgrep, rustic-rs, cargo, rust-analyzer, restic, and Borg. Each section provides actionable recommendations and concrete code patterns that a skilled developer can apply immediately when reviewing or refactoring a large Rust codebase.
 
 ---
 
@@ -24,28 +24,28 @@ The single most impactful architectural decision is **how you split code across 
 A backup tool with a REST component should target this structure:
 
 ```
-vger/
+vykar/
 ├── Cargo.toml              # Virtual workspace manifest (no [package])
 ├── Cargo.lock              # Committed for reproducible builds
 ├── deny.toml               # cargo-deny configuration
 ├── rust-toolchain.toml     # Pin Rust version for contributors
 ├── crates/
-│   ├── vger-types/         # Shared data types (serde-enabled)
-│   ├── vger-core/          # Core backup logic (no network I/O)
-│   ├── vger-backend/       # Storage backend abstraction (local, S3, REST)
-│   ├── vger-client/        # REST API client library
-│   ├── vger-server/        # REST server binary
-│   ├── vger-cli/           # CLI binary
-│   └── vger-testing/       # Test fixtures and helpers
+│   ├── vykar-types/         # Shared data types (serde-enabled)
+│   ├── vykar-core/          # Core backup logic (no network I/O)
+│   ├── vykar-backend/       # Storage backend abstraction (local, S3, REST)
+│   ├── vykar-client/        # REST API client library
+│   ├── vykar-server/        # REST server binary
+│   ├── vykar-cli/           # CLI binary
+│   └── vykar-testing/       # Test fixtures and helpers
 └── xtask/                  # Build automation (cargo xtask pattern)
 ```
 
 **The "thin binary" pattern** keeps `main.rs` to under 20 lines. All business logic lives in `lib.rs` or separate library crates. This makes the codebase independently testable, reusable across multiple binaries, and accessible to integration tests:
 
 ```rust
-// crates/vger-cli/src/main.rs — thin entry point
+// crates/vykar-cli/src/main.rs — thin entry point
 fn main() -> std::process::ExitCode {
-    if let Err(err) = vger_cli::run() {
+    if let Err(err) = vykar_cli::run() {
         eprintln!("Error: {err:#}");
         std::process::ExitCode::FAILURE
     } else {
@@ -77,8 +77,8 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-
 thiserror = "2"
 anyhow = "1"
 # Internal crates
-vger-core = { path = "crates/vger-core" }
-vger-types = { path = "crates/vger-types" }
+vykar-core = { path = "crates/vykar-core" }
+vykar-types = { path = "crates/vykar-types" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
@@ -87,7 +87,7 @@ unsafe_code = "forbid"
 pedantic = { level = "warn", priority = -1 }
 ```
 
-**A shared types crate** (`vger-types`) is critical for projects with both CLI and server components. It contains all data structures that cross crate boundaries: API request/response types, configuration structures, snapshot metadata, repository definitions, and error types that are part of the public API. Both `vger-cli` and `vger-server` depend on this crate, ensuring type consistency.
+**A shared types crate** (`vykar-types`) is critical for projects with both CLI and server components. It contains all data structures that cross crate boundaries: API request/response types, configuration structures, snapshot metadata, repository definitions, and error types that are part of the public API. Both `vykar-cli` and `vykar-server` depend on this crate, ensuring type consistency.
 
 **Visibility strategy** should default to minimal exposure. Use `pub(crate)` aggressively for internal helpers that need cross-module access within a crate but shouldn't leak to consumers. Reserve `pub` for items that genuinely form the crate's public API. Avoid `pub(super)` — it usually signals that modules need reorganization.
 
@@ -177,7 +177,7 @@ let (upload_tx, upload_rx) = mpsc::channel::<PreparedFile>(50);
 
 ```rust
 #[derive(Parser)]
-#[command(name = "vger", version, about)]
+#[command(name = "vykar", version, about)]
 pub struct Cli {
     #[command(flatten)]
     global: GlobalOpts,
@@ -187,7 +187,7 @@ pub struct Cli {
 
 #[derive(Args)]
 struct GlobalOpts {
-    #[arg(long, short, global = true, env = "VGER_REPO")]
+    #[arg(long, short, global = true, env = "VYKAR_REPO")]
     repo: Option<String>,
     #[arg(long, short, global = true, action = ArgAction::Count)]
     verbose: u8,
@@ -207,7 +207,7 @@ enum Commands {
 
 **Configuration layering** should follow the priority: defaults < config file < environment variables < CLI arguments. The **figment** crate handles this elegantly with composable providers, though the `config` crate is simpler for common cases. Clap's built-in `env` attribute integrates environment variables directly into argument parsing.
 
-**For logging**, use **tracing** (the modern standard, maintained by the Tokio project) over `log`. Map `-v` flags to filter levels: 0→warn, 1→info, 2→debug, 3→trace. Use `EnvFilter` for per-module filtering (`VGER_LOG=vger_core::chunker=trace`). Write logs to stderr, data to stdout.
+**For logging**, use **tracing** (the modern standard, maintained by the Tokio project) over `log`. Map `-v` flags to filter levels: 0→warn, 1→info, 2→debug, 3→trace. Use `EnvFilter` for per-module filtering (`VYKAR_LOG=vykar_core::chunker=trace`). Write logs to stderr, data to stdout.
 
 **Progress reporting** with **indicatif** is essential for backup tools. Use `MultiProgress` for concurrent operations, `wrap_read`/`wrap_write` for transparent I/O progress, and `ProgressBar::hidden()` when output is not a TTY. Always call `suspend()` before printing log lines to avoid corrupting the progress display.
 
@@ -218,13 +218,13 @@ enum Commands {
 **Structure the HTTP client as a typed abstraction layer** that hides raw reqwest calls behind domain-specific methods. This is the pattern from Luca Palmieri's "Zero to Production":
 
 ```rust
-pub struct VgerApiClient {
+pub struct VykarApiClient {
     client: reqwest::Client,
     base_url: String,
     auth_token: String,
 }
 
-impl VgerApiClient {
+impl VykarApiClient {
     // Generic request handler with structured error mapping
     async fn request<T: DeserializeOwned>(
         &self, method: Method, path: &str, body: Option<&impl Serialize>,
@@ -258,14 +258,14 @@ Use `#[serde(rename_all = "camelCase")]` or `"snake_case"` to match API conventi
 
 ## 7. Testing strategy across unit, integration, and property layers
 
-**Unit tests** live in `#[cfg(test)] mod tests` blocks alongside the code they test. Rust uniquely allows testing private functions directly via `use super::*`. For cross-module test utilities, create a dedicated `vger-testing` crate as a dev-dependency.
+**Unit tests** live in `#[cfg(test)] mod tests` blocks alongside the code they test. Rust uniquely allows testing private functions directly via `use super::*`. For cross-module test utilities, create a dedicated `vykar-testing` crate as a dev-dependency.
 
 **CLI integration tests** use **assert_cmd** with **predicates** for testing the compiled binary:
 
 ```rust
 #[test]
 fn backup_missing_repo_shows_error() {
-    Command::cargo_bin("vger").unwrap()
+    Command::cargo_bin("vykar").unwrap()
         .args(&["backup", "/tmp/test"])
         .assert()
         .failure()
@@ -358,7 +358,7 @@ Never enable the `restriction` group wholesale — cherry-pick individual lints.
 struct AppContext {
     config: AppConfig,
     repo: Repository<Open>,
-    client: VgerApiClient,
+    client: VykarApiClient,
     progress: ProgressReporter,
 }
 ```
@@ -383,4 +383,4 @@ impl Repository<Open> { fn backup(&self) -> Result<Snapshot> { /* ... */ } }
 
 Three decisions dominate the long-term maintainability of a large Rust backup tool. **First, the workspace structure**: a flat `crates/` layout with thin binaries and a shared types crate prevents the architectural decay that makes refactoring painful. **Second, the async/sync boundary**: keeping CPU-intensive backup operations (chunking, hashing, compression) in rayon while using tokio only for network I/O avoids the complexity explosion that comes from making everything async. **Third, error handling discipline**: thiserror in libraries with anyhow at the CLI boundary gives both structured error handling for programmatic consumers and rich error reporting for users.
 
-The patterns from rustic-rs are particularly instructive as the closest real-world analog — its library/CLI split, typestate repository lifecycle, TOML configuration profiles, and lock-free operations represent hard-won architectural wisdom from reimplementing restic's concepts in Rust. Where V'Ger synthesizes ideas from multiple backup tools, these structural patterns provide the scaffolding to keep that synthesis coherent as the codebase grows.
+The patterns from rustic-rs are particularly instructive as the closest real-world analog — its library/CLI split, typestate repository lifecycle, TOML configuration profiles, and lock-free operations represent hard-won architectural wisdom from reimplementing restic's concepts in Rust. Where Vykar synthesizes ideas from multiple backup tools, these structural patterns provide the scaffolding to keep that synthesis coherent as the codebase grows.

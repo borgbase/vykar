@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# scripts/lib/common.sh — shared shell utilities for vger scripts
+# scripts/lib/common.sh — shared shell utilities for vykar scripts
 #
 # Source this file, don't execute it:
 #   SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 #   source "$SCRIPT_DIR/lib/common.sh"
 
-[[ -n "${_VGER_COMMON_LOADED:-}" ]] && return 0
-_VGER_COMMON_LOADED=1
+[[ -n "${_VYKAR_COMMON_LOADED:-}" ]] && return 0
+_VYKAR_COMMON_LOADED=1
 
 log() {
   printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"

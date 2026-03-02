@@ -7,7 +7,7 @@ description: "Test PostgreSQL backups using hooks and command_dumps patterns"
 
 ## Goal
 
-Test PostgreSQL backups using both recipe patterns from [vger docs](https://vger.borgbase.com/recipes#databases):
+Test PostgreSQL backups using both recipe patterns from [vykar docs](https://vykar.borgbase.com/recipes#databases):
 1. **Hooks** that write dump files to disk
 2. **command_dumps** that stream stdout directly
 
@@ -15,13 +15,13 @@ Test PostgreSQL backups using both recipe patterns from [vger docs](https://vger
 
 1. Start a Postgres container:
    ```bash
-   sudo docker run -d --name vger-pg -e POSTGRES_PASSWORD=testpass -p 5432:5432 postgres:16
+   sudo docker run -d --name vykar-pg -e POSTGRES_PASSWORD=testpass -p 5432:5432 postgres:16
    ```
 2. Generate realistic large data (default baseline: ~10 GiB):
    ```bash
    REPO_ROOT="$(git rev-parse --show-toplevel)"
    bash "$REPO_ROOT/scripts/postgres-generate-random-data.sh" \
-     --container vger-pg \
+     --container vykar-pg \
      --target-gib 10
    ```
 3. Verify generator output includes:
@@ -31,23 +31,23 @@ Test PostgreSQL backups using both recipe patterns from [vger docs](https://vger
 
 ## Variant A: Hooks Dump to Temporary Directory
 
-Configure source in vger config:
+Configure source in vykar config:
 - `label: pg-hooks`
 - `path: <temp_dump_dir>`
-- `hooks.before`: create dir + `pg_dump -U postgres -Fc vger_pg_test > <temp_dump_dir>/vger_pg_test.dump`
+- `hooks.before`: create dir + `pg_dump -U postgres -Fc vykar_pg_test > <temp_dump_dir>/vykar_pg_test.dump`
 - `hooks.after`: remove temp dir
 
-Run backup and validate snapshot contains `vger_pg_test.dump`.
+Run backup and validate snapshot contains `vykar_pg_test.dump`.
 
 ## Variant B: command_dumps
 
-Configure source in vger config:
+Configure source in vykar config:
 - `label: pg-cmd`
 - `command_dumps`:
-  - `name: vger_pg_test.dump`
-  - `command: pg_dump -U postgres -h 127.0.0.1 -Fc vger_pg_test`
+  - `name: vykar_pg_test.dump`
+  - `command: pg_dump -U postgres -h 127.0.0.1 -Fc vykar_pg_test`
 
-Run backup and validate artifact exists under `.vger-dumps/` in snapshot listing.
+Run backup and validate artifact exists under `.vykar-dumps/` in snapshot listing.
 
 ## Run Matrix
 
@@ -62,7 +62,7 @@ Clean remote storage with `rclone delete --rmdirs` between backend runs.
 ## Integrity Check
 
 1. Restore dump artifact from snapshot into temp directory
-2. Create fresh database `vger_pg_restore_test`
+2. Create fresh database `vykar_pg_restore_test`
 3. `pg_restore` the dump into the fresh database
 4. Verify restored counts match seeded source counts for:
    - `customers`
@@ -74,8 +74,8 @@ Clean remote storage with `rclone delete --rmdirs` between backend runs.
 
 ## Common Issues
 
-- `vger snapshot` usage: `-R <repo>` belongs to `snapshot`, not `list` subcommand
-- Command dump artifacts appear under `.vger-dumps/` in snapshot listings
+- `vykar snapshot` usage: `-R <repo>` belongs to `snapshot`, not `list` subcommand
+- Command dump artifacts appear under `.vykar-dumps/` in snapshot listings
 - Client/server version mismatches can cause `pg_restore` config parameter errors
 - Use `sudo docker` if user lacks Docker socket access
 - Large dumps can run for a long time; use generous command timeouts for remote backends
@@ -83,5 +83,5 @@ Clean remote storage with `rclone delete --rmdirs` between backend runs.
 ## Cleanup
 
 1. Drop test databases
-2. Stop and remove Postgres container: `sudo docker rm -f vger-pg`
+2. Stop and remove Postgres container: `sudo docker rm -f vykar-pg`
 3. Clean remote storage paths with `rclone` before next scenario

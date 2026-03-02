@@ -7,7 +7,7 @@
 #   APPLE_API_KEY_ID    - API key ID
 #   APPLE_API_ISSUER_ID - Issuer ID from App Store Connect
 #
-# Usage: ./scripts/macos-sign.sh "path/to/App.app" path/to/vger path/to/vger-server
+# Usage: ./scripts/macos-sign.sh "path/to/App.app" path/to/vykar path/to/vykar-server
 
 set -euo pipefail
 
@@ -43,8 +43,8 @@ for item in "$@"; do
 done
 
 # --- Notarize (single submission for all items) ---
-ZIP_PATH="$(mktemp -t vger-notarize-XXXXXX).zip"
-STAGE_DIR="$(mktemp -d -t vger-notarize-stage-XXXXXX)"
+ZIP_PATH="$(mktemp -t vykar-notarize-XXXXXX).zip"
+STAGE_DIR="$(mktemp -d -t vykar-notarize-stage-XXXXXX)"
 echo "==> Creating zip for notarization..."
 for item in "$@"; do
     cp -R "$item" "$STAGE_DIR/"

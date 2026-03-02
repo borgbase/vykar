@@ -46,7 +46,7 @@ jobs:
   build-linux:
     name: linux-x86_64-unknown-linux-gnu
     if: github.event_name != 'workflow_dispatch' || github.event.inputs.build_linux == 'true'
-    # Pinned to Ubuntu 24.04 (glibc 2.39). vger-gui (Slint) needs newer system libs.
+    # Pinned to Ubuntu 24.04 (glibc 2.39). vykar-gui (Slint) needs newer system libs.
     # If bumped, update MIN_GLIBC_MAJOR/MIN_GLIBC_MINOR in docs/src/install.sh.
     runs-on: ubuntu-24.04
     steps:
@@ -65,9 +65,9 @@ jobs:
       - name: Build
         run: |
           if [ "${{ github.event.inputs.debug_build }}" = "true" ]; then
-            cargo build --profile profiling -p vger-cli -p vger-server -p vger-gui
+            cargo build --profile profiling -p vykar-cli -p vykar-server -p vykar-gui
           else
-            cargo build --release -p vger-cli -p vger-server -p vger-gui
+            cargo build --release -p vykar-cli -p vykar-server -p vykar-gui
           fi
       - name: Package
         run: |
@@ -83,13 +83,13 @@ jobs:
             PROFILE_DIR="release"
             SUFFIX=""
           fi
-          ARCHIVE="vger-${VERSION}-x86_64-unknown-linux-gnu${SUFFIX}.tar.gz"
-          tar -czf "${ARCHIVE}" -C "target/${PROFILE_DIR}" vger vger-server vger-gui
+          ARCHIVE="vykar-${VERSION}-x86_64-unknown-linux-gnu${SUFFIX}.tar.gz"
+          tar -czf "${ARCHIVE}" -C "target/${PROFILE_DIR}" vykar vykar-server vykar-gui
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: linux-x86_64-unknown-linux-gnu
-          path: vger-*.tar.gz
+          path: vykar-*.tar.gz
 
   build-linux-musl:
     name: linux-x86_64-unknown-linux-musl
@@ -111,9 +111,9 @@ jobs:
       - name: Build
         run: |
           if [ "${{ github.event.inputs.debug_build }}" = "true" ]; then
-            cargo build --profile profiling --target x86_64-unknown-linux-musl -p vger-cli -p vger-server
+            cargo build --profile profiling --target x86_64-unknown-linux-musl -p vykar-cli -p vykar-server
           else
-            cargo build --release --target x86_64-unknown-linux-musl -p vger-cli -p vger-server
+            cargo build --release --target x86_64-unknown-linux-musl -p vykar-cli -p vykar-server
           fi
       - name: Package
         run: |
@@ -129,13 +129,13 @@ jobs:
             PROFILE_DIR="release"
             SUFFIX=""
           fi
-          ARCHIVE="vger-${VERSION}-x86_64-unknown-linux-musl${SUFFIX}.tar.gz"
-          tar -czf "${ARCHIVE}" -C "target/x86_64-unknown-linux-musl/${PROFILE_DIR}" vger vger-server
+          ARCHIVE="vykar-${VERSION}-x86_64-unknown-linux-musl${SUFFIX}.tar.gz"
+          tar -czf "${ARCHIVE}" -C "target/x86_64-unknown-linux-musl/${PROFILE_DIR}" vykar vykar-server
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: linux-x86_64-unknown-linux-musl
-          path: vger-*.tar.gz
+          path: vykar-*.tar.gz
 
   build-macos:
     name: macos-aarch64-apple-darwin
@@ -154,16 +154,16 @@ jobs:
           shared-key: release-macos
           cache-on-failure: true
       - name: Build
-        run: cargo build --release --target aarch64-apple-darwin -p vger-cli -p vger-server -p vger-gui
+        run: cargo build --release --target aarch64-apple-darwin -p vykar-cli -p vykar-server -p vykar-gui
       - name: Create app bundle
         run: |
           RELEASE_DIR="target/aarch64-apple-darwin/release"
-          APP_BUNDLE="${RELEASE_DIR}/Vger Backup.app"
+          APP_BUNDLE="${RELEASE_DIR}/Vykar Backup.app"
           mkdir -p "${APP_BUNDLE}/Contents/MacOS" "${APP_BUNDLE}/Contents/Resources"
-          cp crates/vger-gui/macos/Info.plist "${APP_BUNDLE}/Contents/"
-          cp "${RELEASE_DIR}/vger-gui" "${APP_BUNDLE}/Contents/MacOS/"
+          cp crates/vykar-gui/macos/Info.plist "${APP_BUNDLE}/Contents/"
+          cp "${RELEASE_DIR}/vykar-gui" "${APP_BUNDLE}/Contents/MacOS/"
           brew install librsvg
-          crates/vger-gui/macos/create-icns.sh docs/src/images/logo-colored-gradient.svg "${APP_BUNDLE}/Contents/Resources/AppIcon.icns"
+          crates/vykar-gui/macos/create-icns.sh docs/src/images/logo-colored-gradient.svg "${APP_BUNDLE}/Contents/Resources/AppIcon.icns"
       - name: Import signing certificate
         if: env.HAS_SIGNING != ''
         env:
@@ -192,9 +192,9 @@ jobs:
           echo "${{ secrets.APPLE_API_KEY }}" | base64 --decode > "$RUNNER_TEMP/AuthKey.p8"
           export APPLE_API_KEY="$RUNNER_TEMP/AuthKey.p8"
           scripts/macos-sign.sh \
-            "${RELEASE_DIR}/Vger Backup.app" \
-            "${RELEASE_DIR}/vger" \
-            "${RELEASE_DIR}/vger-server"
+            "${RELEASE_DIR}/Vykar Backup.app" \
+            "${RELEASE_DIR}/vykar" \
+            "${RELEASE_DIR}/vykar-server"
           rm -f "$RUNNER_TEMP/AuthKey.p8"
       - name: Package
         run: |
@@ -204,13 +204,13 @@ jobs:
             VERSION="${GITHUB_REF_NAME}"
           fi
           RELEASE_DIR="target/aarch64-apple-darwin/release"
-          ARCHIVE="vger-${VERSION}-aarch64-apple-darwin.tar.gz"
-          tar -czf "${ARCHIVE}" -C "${RELEASE_DIR}" vger vger-server "Vger Backup.app"
+          ARCHIVE="vykar-${VERSION}-aarch64-apple-darwin.tar.gz"
+          tar -czf "${ARCHIVE}" -C "${RELEASE_DIR}" vykar vykar-server "Vykar Backup.app"
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: macos-aarch64-apple-darwin
-          path: vger-*.tar.gz
+          path: vykar-*.tar.gz
 
   build-windows:
     name: windows-x86_64-pc-windows-msvc
@@ -226,7 +226,7 @@ jobs:
           shared-key: release-windows
           cache-on-failure: true
       - name: Build
-        run: cargo build --release --target x86_64-pc-windows-msvc -p vger-cli -p vger-server -p vger-gui
+        run: cargo build --release --target x86_64-pc-windows-msvc -p vykar-cli -p vykar-server -p vykar-gui
       - name: Package
         shell: pwsh
         run: |
@@ -235,13 +235,13 @@ jobs:
           } else {
             $version = "${{ github.ref_name }}"
           }
-          $archive = "vger-$version-x86_64-pc-windows-msvc.zip"
-          Compress-Archive -Path "target/x86_64-pc-windows-msvc/release/vger.exe","target/x86_64-pc-windows-msvc/release/vger-server.exe","target/x86_64-pc-windows-msvc/release/vger-gui.exe" -DestinationPath $archive -Force
+          $archive = "vykar-$version-x86_64-pc-windows-msvc.zip"
+          Compress-Archive -Path "target/x86_64-pc-windows-msvc/release/vykar.exe","target/x86_64-pc-windows-msvc/release/vykar-server.exe","target/x86_64-pc-windows-msvc/release/vykar-gui.exe" -DestinationPath $archive -Force
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: windows-x86_64-pc-windows-msvc
-          path: vger-*.zip
+          path: vykar-*.zip
 
   release:
     name: publish

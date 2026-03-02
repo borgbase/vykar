@@ -1,26 +1,26 @@
 # Configuration
 
-V'Ger is driven by a YAML configuration file. Generate a starter config with:
+Vykar is driven by a YAML configuration file. Generate a starter config with:
 
 ```bash
-vger config
+vykar config
 ```
 
 ## Config file locations
 
-V'Ger automatically finds config files in this order:
+Vykar automatically finds config files in this order:
 
 1. `--config <path>` flag
-2. `VGER_CONFIG` environment variable
-3. `./vger.yaml` (project)
-4. User config dir + `vger/config.yaml`:
-   - Unix: `$XDG_CONFIG_HOME/vger/config.yaml` or `~/.config/vger/config.yaml`
-   - Windows: `%APPDATA%\\vger\\config.yaml`
+2. `VYKAR_CONFIG` environment variable
+3. `./vykar.yaml` (project)
+4. User config dir + `vykar/config.yaml`:
+   - Unix: `$XDG_CONFIG_HOME/vykar/config.yaml` or `~/.config/vykar/config.yaml`
+   - Windows: `%APPDATA%\\vykar\\config.yaml`
 5. System config:
-   - Unix: `/etc/vger/config.yaml`
-   - Windows: `%PROGRAMDATA%\\vger\\config.yaml`
+   - Unix: `/etc/vykar/config.yaml`
+   - Windows: `%PROGRAMDATA%\\vykar\\config.yaml`
 
-You can also set `VGER_PASSPHRASE` to supply the passphrase non-interactively.
+You can also set `VYKAR_PASSPHRASE` to supply the passphrase non-interactively.
 
 ## Minimal example
 
@@ -49,13 +49,13 @@ repositories:
 ```yaml
 repositories:
   - label: "s3"
-    url: "s3://s3.us-east-1.amazonaws.com/my-bucket/vger"
+    url: "s3://s3.us-east-1.amazonaws.com/my-bucket/vykar"
     region: "us-east-1"
     access_key_id: "AKIA..."
     secret_access_key: "..."
 ```
 
-Each entry accepts an optional `label` for CLI targeting (`vger list --repo local`) and optional pack size tuning (`min_pack_size`, `max_pack_size`). Defaults are `min_pack_size = 32 MiB` and `max_pack_size = 128 MiB`; `max_pack_size` has a hard ceiling of `512 MiB`. See [Storage Backends](backends.md) for all backend-specific options.
+Each entry accepts an optional `label` for CLI targeting (`vykar list --repo local`) and optional pack size tuning (`min_pack_size`, `max_pack_size`). Defaults are `min_pack_size = 32 MiB` and `max_pack_size = 128 MiB`; `max_pack_size` has a hard ceiling of `512 MiB`. See [Storage Backends](backends.md) for all backend-specific options.
 
 For remote repositories, transport is HTTPS-first by default. To intentionally use plaintext HTTP (for local/dev setups), set:
 
@@ -82,7 +82,7 @@ repositories:
     access_key_id: "AKIA..."
     secret_access_key: "..."
     encryption:
-      passcommand: "pass show vger-remote"
+      passcommand: "pass show vykar-remote"
     compression:
       algorithm: "zstd"             # Better ratio for remote
     retention:
@@ -99,8 +99,8 @@ When `limits` is set on a repository entry, it replaces top-level `limits` for t
 By default, commands operate on all repositories. Use `--repo` / `-R` to target a single one:
 
 ```bash
-vger list --repo local
-vger list -R /backups/local
+vykar list --repo local
+vykar list -R /backups/local
 ```
 
 ### 3-2-1 backup strategy
@@ -201,7 +201,7 @@ Each entry has two required fields:
 | `name`    | Virtual filename (e.g. `mydb.sql`). Must not contain `/` or `\`. No duplicates within a source. |
 | `command` | Shell command whose stdout is captured (run via `sh -c`). |
 
-Output is stored as virtual files under `.vger-dumps/` in the snapshot. On restore they appear as regular files (e.g. `.vger-dumps/postgres.sql`).
+Output is stored as virtual files under `.vykar-dumps/` in the snapshot. On restore they appear as regular files (e.g. `.vykar-dumps/postgres.sql`).
 
 You can also create **dump-only sources** with no filesystem paths — an explicit `label` is required:
 
@@ -213,7 +213,7 @@ sources:
         command: pg_dumpall -U postgres
 ```
 
-If a dump command exits with non-zero status, the backup is aborted. Any chunks already uploaded to packs remain on disk but are not added to the index; they are reclaimed on the next `vger compact` run.
+If a dump command exits with non-zero status, the backup is aborted. Any chunks already uploaded to packs remain on disk but are not added to the index; they are reclaimed on the next `vykar compact` run.
 
 See [Backup — Command dumps](backup.md#command-dumps) for more details and [Recipes](recipes.md) for PostgreSQL, MySQL, MongoDB, and Docker examples.
 
@@ -307,14 +307,14 @@ limits:                              # Optional backup resource limits
 
 ## Hooks
 
-Shell commands that run at specific points in the vger command lifecycle. Hooks can be defined at three levels: global (top-level `hooks:`), per-repository, and per-source.
+Shell commands that run at specific points in the vykar command lifecycle. Hooks can be defined at three levels: global (top-level `hooks:`), per-repository, and per-source.
 
 ```yaml
 hooks:                               # Global hooks: run for backup/prune/check/compact
   before: "echo starting"
   after: "echo done"
   # before_backup: "echo backup starting"  # Command-specific hooks
-  # failed: "notify-send 'vger failed'"
+  # failed: "notify-send 'vykar failed'"
   # finally: "cleanup.sh"
 ```
 
@@ -332,7 +332,7 @@ Hooks only run for `backup`, `prune`, `check`, and `compact`. The bare form (`be
 ### Execution order
 
 1. `before` hooks run: global bare → repo bare → global specific → repo specific
-2. The vger command runs (skipped if a `before` hook fails)
+2. The vykar command runs (skipped if a `before` hook fails)
 3. On success: `after` hooks run (repo specific → global specific → repo bare → global bare)
    On failure: `failed` hooks run (same order)
 4. `finally` hooks always run last (same order)
@@ -345,28 +345,28 @@ Hook commands support `{variable}` placeholders that are replaced before executi
 
 | Variable         | Description                                  |
 |------------------|----------------------------------------------|
-| `{command}`      | The vger command name (e.g. `backup`, `prune`) |
+| `{command}`      | The vykar command name (e.g. `backup`, `prune`) |
 | `{repository}`   | Repository URL                               |
 | `{label}`        | Repository label (empty if unset)            |
 | `{error}`        | Error message (empty if no error)            |
 | `{source_label}` | Source label (empty if unset)                |
 | `{source_path}`  | Source path list (Unix `:`, Windows `;`)     |
 
-The same values are also exported as environment variables: `VGER_COMMAND`, `VGER_REPOSITORY`, `VGER_LABEL`, `VGER_ERROR`, `VGER_SOURCE_LABEL`, `VGER_SOURCE_PATH`.
+The same values are also exported as environment variables: `VYKAR_COMMAND`, `VYKAR_REPOSITORY`, `VYKAR_LABEL`, `VYKAR_ERROR`, `VYKAR_SOURCE_LABEL`, `VYKAR_SOURCE_PATH`.
 
-`{source_path}` / `VGER_SOURCE_PATH` joins multiple paths with `:` on Unix and `;` on Windows.
+`{source_path}` / `VYKAR_SOURCE_PATH` joins multiple paths with `:` on Unix and `;` on Windows.
 
 ```yaml
 hooks:
   failed:
-    - 'notify-send "vger {command} failed: {error}"'
+    - 'notify-send "vykar {command} failed: {error}"'
   after_backup:
     - 'echo "Backed up {source_label} to {repository}"'
 ```
 
 ### Notifications with Apprise
 
-[Apprise](https://github.com/caronc/apprise) lets you send notifications to 100+ services (Gotify, Slack, Discord, Telegram, ntfy, email, and more) from the command line. Since vger hooks run arbitrary shell commands, you can use the `apprise` CLI directly — no built-in integration needed.
+[Apprise](https://github.com/caronc/apprise) lets you send notifications to 100+ services (Gotify, Slack, Discord, Telegram, ntfy, email, and more) from the command line. Since vykar hooks run arbitrary shell commands, you can use the `apprise` CLI directly — no built-in integration needed.
 
 Install it with:
 
@@ -381,13 +381,13 @@ hooks:
   after_backup:
     - >-
       apprise -t "Backup complete"
-      -b "vger {command} finished for {repository}"
+      -b "vykar {command} finished for {repository}"
       "gotify://hostname/token"
       "slack://tokenA/tokenB/tokenC"
   failed:
     - >-
       apprise -t "Backup failed"
-      -b "vger {command} failed for {repository}: {error}"
+      -b "vykar {command} failed for {repository}: {error}"
       "gotify://hostname/token"
 ```
 
@@ -406,7 +406,7 @@ You can pass multiple URLs in a single command to notify several services at onc
 
 ## Schedule
 
-Configure the built-in daemon scheduler for automatic periodic backups. Used with `vger daemon`.
+Configure the built-in daemon scheduler for automatic periodic backups. Used with `vykar daemon`.
 
 ```yaml
 schedule:
@@ -427,8 +427,8 @@ Config files support environment variable placeholders in values:
 
 ```yaml
 repositories:
-  - url: "${VGER_REPO_URL:-/backup/repo}"
-    # access_token: "${VGER_ACCESS_TOKEN}"
+  - url: "${VYKAR_REPO_URL:-/backup/repo}"
+    # access_token: "${VYKAR_ACCESS_TOKEN}"
 ```
 
 Supported syntax:

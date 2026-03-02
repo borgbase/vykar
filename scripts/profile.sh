@@ -5,13 +5,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 source "$SCRIPT_DIR/lib/common.sh"
 source "$SCRIPT_DIR/lib/defaults.sh"
-source "$SCRIPT_DIR/lib/vger-repo.sh"
+source "$SCRIPT_DIR/lib/vykar-repo.sh"
 
 usage() {
   cat <<USAGE
 Usage: $(basename "$0") [options]
 
-Build vger with the profiling profile, prepare repo state, and run
+Build vykar with the profiling profile, prepare repo state, and run
 heaptrack and/or perf profiling on the selected command.
 
 Options:
@@ -19,16 +19,16 @@ Options:
   --backend NAME           Storage backend: local|rest|s3 (default: local)
   --source PATH            Source path to back up (default: \$CORPUS_LOCAL)
   --profiler NAME          heaptrack|perf|both (default: heaptrack)
-  --skip-build             Skip cargo build, use existing target/profiling/vger
+  --skip-build             Skip cargo build, use existing target/profiling/vykar
   --no-drop-caches         Do not drop caches before profiling run
   --dry-run                Enable dry-run for compact/prune
   --verify-data            Include --verify-data for check
   --compact-threshold N    Compact threshold percentage (default: 10)
   --help                   Show help
 
-Environment overrides: CORPUS_LOCAL, RUNTIME_ROOT, VGER_CONFIG, REST_URL,
-REST_TOKEN, VGER_REST_TOKEN, VGER_TOKEN, PERF_EVENTS
-If VGER_CONFIG is set, it overrides --backend and uses the given config as-is.
+Environment overrides: CORPUS_LOCAL, RUNTIME_ROOT, VYKAR_CONFIG, REST_URL,
+REST_TOKEN, VYKAR_REST_TOKEN, VYKAR_TOKEN, PERF_EVENTS
+If VYKAR_CONFIG is set, it overrides --backend and uses the given config as-is.
 USAGE
 }
 
@@ -82,8 +82,8 @@ fi
 # --- Config: explicit override or auto-generated from --backend ---
 
 CONFIG_GENERATED=0
-if [[ -n "${VGER_CONFIG:-}" ]]; then
-  CONFIG_PATH="$VGER_CONFIG"
+if [[ -n "${VYKAR_CONFIG:-}" ]]; then
+  CONFIG_PATH="$VYKAR_CONFIG"
   [[ -f "$CONFIG_PATH" ]] || die "config not found: $CONFIG_PATH"
 fi
 
@@ -116,7 +116,7 @@ RUN_ROOT="$OUT_ROOT/$STAMP"
 RUN_DIR="$RUN_ROOT/$MODE"
 mkdir -p "$RUN_DIR"
 
-HEAPTRACK_DATA="$RUN_DIR/heaptrack.vger.$STAMP.%p.gz"
+HEAPTRACK_DATA="$RUN_DIR/heaptrack.vykar.$STAMP.%p.gz"
 ANALYSIS_TXT="$RUN_DIR/heaptrack.analysis.txt"
 STACKS_TXT="$RUN_DIR/heaptrack.stacks.txt"
 FLAMEGRAPH_SVG="$RUN_DIR/heaptrack.flamegraph.svg"
@@ -132,7 +132,7 @@ DROP_CACHES_LOG="$RUN_DIR/drop-caches.log"
 META_TXT="$RUN_DIR/meta.txt"
 HEAPTRACK_FILE=""
 
-VGER_BIN="$REPO_ROOT/target/profiling/vger"
+VYKAR_BIN="$REPO_ROOT/target/profiling/vykar"
 PROFILE_CMD=()
 SETUP_STEPS=()
 CLEANUP_DIRS=()
@@ -149,9 +149,9 @@ trap cleanup_restored_data EXIT
 
 # --- Generate config if not explicitly provided ---
 
-if [[ -z "${VGER_CONFIG:-}" ]]; then
+if [[ -z "${VYKAR_CONFIG:-}" ]]; then
   CONFIG_GENERATED=1
-  CONFIG_PATH="$RUN_DIR/vger.profile.yaml"
+  CONFIG_PATH="$RUN_DIR/vykar.profile.yaml"
 
   WORK_DIR="$RUN_DIR/work"
   mkdir -p "$WORK_DIR"
@@ -167,14 +167,14 @@ if [[ -z "${VGER_CONFIG:-}" ]]; then
       REPO_URL="$REST_URL"
       ;;
     s3)
-      REPO_URL="s3://127.0.0.1:9000/vger-profile/$REPO_LABEL"
+      REPO_URL="s3://127.0.0.1:9000/vykar-profile/$REPO_LABEL"
       reset_minio
       ensure_s3_bucket "$REPO_URL"
       ;;
   esac
 
-  write_vger_config "$CONFIG_PATH" "$REPO_LABEL" "$REPO_URL" "$BACKEND" "$SOURCE_PATH"
-  export VGER_PASSPHRASE="$PASSPHRASE"
+  write_vykar_config "$CONFIG_PATH" "$REPO_LABEL" "$REPO_URL" "$BACKEND" "$SOURCE_PATH"
+  export VYKAR_PASSPHRASE="$PASSPHRASE"
 fi
 
 maybe_drop_caches() {
@@ -188,12 +188,12 @@ maybe_drop_caches() {
 # --- Build ---
 
 if (( SKIP_BUILD == 0 )); then
-  echo "[1/6] Building vger-cli with profiling profile..."
-  (cd "$REPO_ROOT" && cargo build -p vger-cli --profile profiling)
+  echo "[1/6] Building vykar-cli with profiling profile..."
+  (cd "$REPO_ROOT" && cargo build -p vykar-cli --profile profiling)
 else
   echo "[1/6] Skipping build (--skip-build)"
 fi
-[[ -x "$VGER_BIN" ]] || die "built binary not found: $VGER_BIN"
+[[ -x "$VYKAR_BIN" ]] || die "built binary not found: $VYKAR_BIN"
 
 # --- Setup ---
 
@@ -203,8 +203,8 @@ echo "[2/6] Running setup for mode: $MODE"
 run_setup_reset_and_init() {
   add_setup_step "delete+init repo ($REPO_LABEL, backend=$BACKEND)"
   {
-    vger_repo_delete "$VGER_BIN" "$CONFIG_PATH" "$REPO_LABEL" "${REPO_URL:-}"
-    vger_repo_init "$VGER_BIN" "$CONFIG_PATH" "$REPO_LABEL"
+    vykar_repo_delete "$VYKAR_BIN" "$CONFIG_PATH" "$REPO_LABEL" "${REPO_URL:-}"
+    vykar_repo_init "$VYKAR_BIN" "$CONFIG_PATH" "$REPO_LABEL"
   } 2>&1 | tee -a "$SETUP_LOG"
 }
 
@@ -212,14 +212,14 @@ run_setup_backup() {
   local label="$1" src="$2"
   add_setup_step "backup ($src, label=$label)"
   echo "[setup] Backup: $src (label: $label)" | tee -a "$SETUP_LOG"
-  "$VGER_BIN" --config "$CONFIG_PATH" backup -R "$REPO_LABEL" -l "$label" "$src" 2>&1 | tee -a "$SETUP_LOG"
+  "$VYKAR_BIN" --config "$CONFIG_PATH" backup -R "$REPO_LABEL" -l "$label" "$src" 2>&1 | tee -a "$SETUP_LOG"
 }
 
 case "$MODE" in
   backup)
     run_setup_reset_and_init
     run_setup_backup "$SNAPSHOT_LABEL" "$SEED_SOURCE_PATH"
-    PROFILE_CMD=( "$VGER_BIN" --config "$CONFIG_PATH" backup -R "$REPO_LABEL" -l "$SNAPSHOT_LABEL" "$SOURCE_PATH" )
+    PROFILE_CMD=( "$VYKAR_BIN" --config "$CONFIG_PATH" backup -R "$REPO_LABEL" -l "$SNAPSHOT_LABEL" "$SOURCE_PATH" )
     ;;
   restore)
     run_setup_reset_and_init
@@ -229,7 +229,7 @@ case "$MODE" in
     mkdir -p "$RESTORE_DEST"
     register_cleanup_dir "$RESTORE_DEST"
     add_setup_step "prepare restore destination ($RESTORE_DEST)"
-    PROFILE_CMD=( "$VGER_BIN" --config "$CONFIG_PATH" restore -R "$REPO_LABEL" latest "$RESTORE_DEST" )
+    PROFILE_CMD=( "$VYKAR_BIN" --config "$CONFIG_PATH" restore -R "$REPO_LABEL" latest "$RESTORE_DEST" )
     ;;
   compact)
     SEED_LABEL="${SNAPSHOT_LABEL}-seed"
@@ -237,24 +237,24 @@ case "$MODE" in
     run_setup_backup "$SEED_LABEL" "$SEED_SOURCE_PATH"
     run_setup_backup "$SNAPSHOT_LABEL" "$SOURCE_PATH"
     # Delete seed snapshot to create reclaimable data
-    SEED_SNAPSHOT="$("$VGER_BIN" --config "$CONFIG_PATH" list -R "$REPO_LABEL" -S "$SEED_LABEL" --last 1 | awk 'NR==2{print $1}')"
+    SEED_SNAPSHOT="$("$VYKAR_BIN" --config "$CONFIG_PATH" list -R "$REPO_LABEL" -S "$SEED_LABEL" --last 1 | awk 'NR==2{print $1}')"
     [[ -n "$SEED_SNAPSHOT" ]] || die "could not resolve seed snapshot for compact setup"
     echo "[setup] Deleting seed snapshot: $SEED_SNAPSHOT" | tee -a "$SETUP_LOG"
     add_setup_step "delete seed snapshot ($SEED_SNAPSHOT)"
-    "$VGER_BIN" --config "$CONFIG_PATH" snapshot delete "$SEED_SNAPSHOT" -R "$REPO_LABEL" 2>&1 | tee -a "$SETUP_LOG"
-    PROFILE_CMD=( "$VGER_BIN" --config "$CONFIG_PATH" compact -R "$REPO_LABEL" --threshold "$COMPACT_THRESHOLD" )
+    "$VYKAR_BIN" --config "$CONFIG_PATH" snapshot delete "$SEED_SNAPSHOT" -R "$REPO_LABEL" 2>&1 | tee -a "$SETUP_LOG"
+    PROFILE_CMD=( "$VYKAR_BIN" --config "$CONFIG_PATH" compact -R "$REPO_LABEL" --threshold "$COMPACT_THRESHOLD" )
     (( DRY_RUN == 1 )) && PROFILE_CMD+=( -n )
     ;;
   prune)
     run_setup_reset_and_init
     run_setup_backup "$SNAPSHOT_LABEL" "$SOURCE_PATH"
-    PROFILE_CMD=( "$VGER_BIN" --config "$CONFIG_PATH" prune -R "$REPO_LABEL" )
+    PROFILE_CMD=( "$VYKAR_BIN" --config "$CONFIG_PATH" prune -R "$REPO_LABEL" )
     (( DRY_RUN == 1 )) && PROFILE_CMD+=( -n )
     ;;
   check)
     run_setup_reset_and_init
     run_setup_backup "$SNAPSHOT_LABEL" "$SOURCE_PATH"
-    PROFILE_CMD=( "$VGER_BIN" --config "$CONFIG_PATH" check -R "$REPO_LABEL" )
+    PROFILE_CMD=( "$VYKAR_BIN" --config "$CONFIG_PATH" check -R "$REPO_LABEL" )
     (( VERIFY_DATA == 1 )) && PROFILE_CMD+=( --verify-data )
     ;;
 esac
@@ -268,7 +268,7 @@ maybe_drop_caches
 # --- Profiling ---
 
 resolve_heaptrack_data_file() {
-  HEAPTRACK_FILE="$(ls -1t "$RUN_DIR"/heaptrack.vger."$STAMP".*.gz.zst "$RUN_DIR"/heaptrack.vger."$STAMP".*.gz 2>/dev/null | head -n 1 || true)"
+  HEAPTRACK_FILE="$(ls -1t "$RUN_DIR"/heaptrack.vykar."$STAMP".*.gz.zst "$RUN_DIR"/heaptrack.vykar."$STAMP".*.gz 2>/dev/null | head -n 1 || true)"
   [[ -n "$HEAPTRACK_FILE" ]] || die "could not find heaptrack output in: $RUN_DIR"
 }
 
@@ -328,7 +328,7 @@ render_heaptrack_reports() {
 
   echo "[6/6] Rendering flamegraph SVG..."
   perl "$FLAMEGRAPH_PL" \
-    --title "heaptrack: $COST_TYPE (vger-cli profiling, mode=$MODE)" \
+    --title "heaptrack: $COST_TYPE (vykar-cli profiling, mode=$MODE)" \
     --colors mem \
     --countname "$COST_TYPE" \
     <"$STACKS_TXT" >"$FLAMEGRAPH_SVG"
@@ -358,7 +358,7 @@ fi
   echo "mode=$MODE"
   echo "backend=$BACKEND"
   echo "timestamp_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  echo "vger_bin=$VGER_BIN"
+  echo "vykar_bin=$VYKAR_BIN"
   echo "config=$CONFIG_PATH"
   echo "config_generated=$CONFIG_GENERATED"
   echo "repo=$REPO_LABEL"

@@ -1,0 +1,26 @@
+[package]
+name = "vykar-gui"
+version = "0.10.2"
+edition = "2021"
+license = "GPL-3.0-only"
+
+[[bin]]
+name = "vykar-gui"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+vykar-core.workspace = true
+vykar-types.workspace = true
+slint = { version = "1.13", default-features = true }
+tray-icon = "0.21"
+notify = "6.1"
+crossbeam-channel.workspace = true
+tinyfiledialogs = "3"
+chrono.workspace = true
+zeroize.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+image = { version = "0.25", default-features = false, features = ["png"] }

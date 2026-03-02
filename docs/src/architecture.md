@@ -1,6 +1,6 @@
 # Architecture
 
-Technical reference for vger's cryptographic, chunking, compression, and storage design decisions.
+Technical reference for vykar's cryptographic, chunking, compression, and storage design decisions.
 
 ---
 
@@ -19,7 +19,7 @@ Rationale:
 
 ### Plaintext Mode (`none`)
 
-When `encryption` is set to `none`, vger uses a `PlaintextEngine` — an identity transform where `encrypt()` and `decrypt()` return data unchanged. AAD is ignored (there is no AEAD construction to bind it to). The format layer detects plaintext mode via `is_encrypting() == false` and uses the shorter wire format: `[1-byte type_tag][plaintext]` (1-byte overhead instead of 29 bytes).
+When `encryption` is set to `none`, vykar uses a `PlaintextEngine` — an identity transform where `encrypt()` and `decrypt()` return data unchanged. AAD is ignored (there is no AEAD construction to bind it to). The format layer detects plaintext mode via `is_encrypting() == false` and uses the shorter wire format: `[1-byte type_tag][plaintext]` (1-byte overhead instead of 29 bytes).
 
 This mode does **not** provide authentication or tamper protection — it is designed for trusted storage where confidentiality is unnecessary. Data integrity against accidental corruption is still provided via keyed BLAKE2b-256 chunk IDs (see [Hashing / Chunk IDs](#hashing--chunk-ids) below).
 
@@ -40,9 +40,9 @@ Keyed BLAKE2b-256 MAC using a `chunk_id_key` derived from the master key.
 Rationale:
 - Prevents content confirmation attacks (an adversary cannot check whether known plaintext exists in the backup without the key)
 - BLAKE2b is faster than SHA-256 in software
-- Trade-off: keyed IDs prevent dedup across different encryption keys (acceptable for vger's single-key-per-repo model)
+- Trade-off: keyed IDs prevent dedup across different encryption keys (acceptable for vykar's single-key-per-repo model)
 
-In `none` mode the same keyed BLAKE2b-256 construction is used, but the key is derived from the public `repo_id` rather than a secret master key. The MAC therefore acts as a **checksum for corruption detection**, not as authentication against tampering. `vger check --verify-data` recomputes chunk IDs and compares them to detect bit-rot or storage corruption — this works identically across all encryption modes.
+In `none` mode the same keyed BLAKE2b-256 construction is used, but the key is derived from the public `repo_id` rather than a secret master key. The MAC therefore acts as a **checksum for corruption detection**, not as authentication against tampering. `vykar check --verify-data` recomputes chunk IDs and compares them to detect bit-rot or storage corruption — this works identically across all encryption modes.
 
 ---
 
@@ -74,7 +74,7 @@ Rationale:
 
 Content-addressed deduplication uses keyed `ChunkId` values (BLAKE2b-256 MAC). Identical plaintext produces the same `ChunkId`, so the second copy is not stored; only refcounts are incremented.
 
-vger supports three index modes for dedup lookups:
+vykar supports three index modes for dedup lookups:
 
 1. **Full index mode** — in-memory `ChunkIndex` (`HashMap<ChunkId, ChunkIndexEntry>`)
 2. **Dedup-only mode** — lightweight `DedupIndex` (`ChunkId -> stored_size`) plus `IndexDelta` for mutations
@@ -83,7 +83,7 @@ vger supports three index modes for dedup lookups:
    - Xor filter (`xorf::Xor8`) as probabilistic negative check
    - mmap-backed on-disk dedup cache for exact lookup
 
-During backup, `enable_tiered_dedup_mode()` is used by default. If the mmap cache is missing/stale/corrupt, vger safely falls back to dedup-only HashMap mode.
+During backup, `enable_tiered_dedup_mode()` is used by default. If the mmap cache is missing/stale/corrupt, vykar safely falls back to dedup-only HashMap mode.
 
 **Two-level dedup check** (in `Repository::bump_ref_if_exists`):
 1. **Persistent dedup tier** — full index, dedup-only index, or tiered dedup index (depending on mode)
@@ -142,7 +142,7 @@ The type tag byte is always included in AAD (authenticated additional data). For
 
 ### Local Optimization Caches (Client Machine)
 
-These files live under a per-repo local cache root. By default this is the platform cache directory + `vger` (for example, `~/.cache/vger/<repo_id_hex>/...` on Linux, `~/Library/Caches/vger/<repo_id_hex>/...` on macOS). If `cache_dir` is set in config, that path becomes the cache root. These are optimization artifacts, not repository source of truth.
+These files live under a per-repo local cache root. By default this is the platform cache directory + `vykar` (for example, `~/.cache/vykar/<repo_id_hex>/...` on Linux, `~/Library/Caches/vykar/<repo_id_hex>/...` on macOS). If `cache_dir` is set in config, that path becomes the cache root. These are optimization artifacts, not repository source of truth.
 
 ```text
 <cache>/<repo_id_hex>/
@@ -336,7 +336,7 @@ clear sessions/<session_id>.index
 
 ── Error Paths ──
 
-  → on VgerError::Interrupted (Ctrl-C):
+  → on VykarError::Interrupted (Ctrl-C):
     → flush_on_abort(): seal partial packs, join upload threads, write final sessions/<id>.index
     → deregister_session(), release advisory lock, exit code 130
   → on soft file error (PermissionDenied / NotFound before commit):
@@ -385,7 +385,7 @@ When the mmap restore cache is valid, item-stream chunk lookups can avoid loadin
 
 ### Locking
 
-vger uses a two-tier locking model to allow concurrent backup uploads while serializing commits and maintenance.
+vykar uses a two-tier locking model to allow concurrent backup uploads while serializing commits and maintenance.
 
 #### Session Markers (shared, non-exclusive)
 
@@ -397,16 +397,16 @@ Session markers are refreshed approximately every 15 minutes (`maybe_refresh_ses
 
 #### Advisory Lock (exclusive)
 
-- Preferred path: backend-native lock APIs (`acquire_advisory_lock` / `release_advisory_lock`) when the backend supports them (for example, vger-server)
+- Preferred path: backend-native lock APIs (`acquire_advisory_lock` / `release_advisory_lock`) when the backend supports them (for example, vykar-server)
 - Fallback path: lock files at `locks/<timestamp>-<uuid>.json`
 - Each lock contains: hostname, PID, and acquisition timestamp
 - **Oldest-key-wins**: after writing its lock, a client lists all locks — if its key isn't lexicographically first, it deletes its own lock and returns an error
 - **Stale cleanup**: locks older than 6 hours are automatically removed before each acquisition attempt
-- **Recovery**: `vger break-lock` forcibly removes stale backend/object locks when interrupted processes leave lock conflicts
+- **Recovery**: `vykar break-lock` forcibly removes stale backend/object locks when interrupted processes leave lock conflicts
 
 The advisory lock is used for:
 - **Backup commit phase**: acquired with `acquire_lock_with_retry` (10 attempts, 500 ms base delay, exponential backoff + 25 % jitter). Held only for the brief commit — typically seconds.
-- **Maintenance commands** (`delete`, `prune`, `compact`): acquired via `with_maintenance_lock()`, which additionally cleans stale sessions (72 h), removes companion `.index` journal files and orphaned `.index` files, then checks for remaining active sessions. If any non-stale sessions exist, the lock is released and `VgerError::ActiveSessions` is returned — this prevents compaction from deleting packs that upload-phase backups depend on.
+- **Maintenance commands** (`delete`, `prune`, `compact`): acquired via `with_maintenance_lock()`, which additionally cleans stale sessions (72 h), removes companion `.index` journal files and orphaned `.index` files, then checks for remaining active sessions. If any non-stale sessions exist, the lock is released and `VykarError::ActiveSessions` is returned — this prevents compaction from deleting packs that upload-phase backups depend on.
 
 #### Command Summary
 
@@ -416,24 +416,24 @@ The advisory lock is used for:
 | `delete`, `prune`, `compact` | — | Maintenance lock (exclusive + session check) |
 | `list`, `restore`, `check`, `info` | — | No lock (read-only) |
 
-When using a vger server, server-managed locks with TTL replace client-side advisory locks (see [Server Internals](server-internals.md)).
+When using a vykar server, server-managed locks with TTL replace client-side advisory locks (see [Server Internals](server-internals.md)).
 
 ### Signal Handling
 
 Two-stage signal handling applies to all commands:
 
-1. First SIGINT/SIGTERM sets a global shutdown flag; iterative loops (`backup`, `prune`, `compact`) check it and return `VgerError::Interrupted`
+1. First SIGINT/SIGTERM sets a global shutdown flag; iterative loops (`backup`, `prune`, `compact`) check it and return `VykarError::Interrupted`
 2. Second signal restores the default handler (immediate kill)
 3. On backup abort: `flush_on_abort()` seals partial packs, joins upload threads, writes final `sessions/<id>.index` journal for recovery
 4. Advisory lock is released before exit; CLI exits with code 130
 
 ### Daemon Mode
 
-`vger daemon` runs scheduled backup cycles as a foreground process (no cron dependency).
+`vykar daemon` runs scheduled backup cycles as a foreground process (no cron dependency).
 
 - **Scheduling**: sleep-loop with configurable interval (`schedule.every` human-duration string, e.g. `"6h"`). Optional random jitter (`jitter_seconds`) spreads load across hosts.
 - **Cycle**: `backup → prune → compact → check` per repo, sequential. Shutdown flag checked between steps.
-- **Passphrase**: daemon validates at startup that all encrypted repos have a non-interactive passphrase source (`passcommand`, `passphrase`, or `VGER_PASSPHRASE` env). Cannot prompt interactively.
+- **Passphrase**: daemon validates at startup that all encrypted repos have a non-interactive passphrase source (`passcommand`, `passphrase`, or `VYKAR_PASSPHRASE` env). Cannot prompt interactively.
 
 Configuration:
 ```yaml
@@ -459,7 +459,7 @@ This design means `delete` is fast (just index updates), while space reclamation
 
 If a backup is interrupted after packs have been flushed but before commit, those packs would be orphaned. The **pending index journal** prevents re-uploading their data on the next run:
 
-1. During backup, every 8 data-pack flushes, vger writes a `sessions/<session_id>.index` blob to storage containing pack→chunk mappings for all flushed packs in this session
+1. During backup, every 8 data-pack flushes, vykar writes a `sessions/<session_id>.index` blob to storage containing pack→chunk mappings for all flushed packs in this session
 2. On the next backup with the same session ID, if the journal exists, packs are batch-verified by listing shard directories (avoiding per-pack HEAD requests on REST/S3 backends)
 3. Verified chunks are promoted into the dedup structures so subsequent dedup checks find them
 4. After a successful commit, the `sessions/<session_id>.index` blob is deleted
@@ -527,7 +527,7 @@ The index never points to a deleted pack. Sequence: write new pack → save inde
 #### CLI
 
 ```text
-vger compact [--threshold N] [--max-repack-size 2G] [-n/--dry-run]
+vykar compact [--threshold N] [--max-repack-size 2G] [-n/--dry-run]
 ```
 
 ---
@@ -565,7 +565,7 @@ limits:
 
 ## Why This Is Notable for Backup Tools
 
-Deduplicating backup tools are often dominated by index memory and restore-planning overhead at large chunk counts. vger's implemented architecture addresses that class of bottlenecks with:
+Deduplicating backup tools are often dominated by index memory and restore-planning overhead at large chunk counts. vykar's implemented architecture addresses that class of bottlenecks with:
 
 - Tiered dedup lookups (session map + xor filter + mmap cache) instead of always materializing a full in-memory index during backup
 - Pending-index journal for crash recovery — interrupted backups resume without re-uploading flushed packs
@@ -574,4 +574,4 @@ Deduplicating backup tools are often dominated by index memory and restore-plann
 - Incremental index update paths that avoid rebuilding/uploading from a full in-memory index on every save
 - Concurrent multi-client backup protocol where only the brief commit phase requires an exclusive lock — upload phases run in parallel across all clients
 
-These optimizations are implementation choices in current vger, not future roadmap items.
+These optimizations are implementation choices in current vykar, not future roadmap items.

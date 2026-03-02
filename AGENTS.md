@@ -1,4 +1,4 @@
-# CLAUDE.md — vger
+# CLAUDE.md — vykar
 
 ## What this project is
 
@@ -7,7 +7,7 @@ A fast, encrypted, deduplicated backup tool written in Rust. YAML config inspire
 ## Build & test
 
 ```bash
-cargo build --release        # binary at target/release/vger
+cargo build --release        # binary at target/release/vykar
 cargo check                  # fast type-check
 cargo test                   # run unit + integration tests
 make fmt                     # apply rustfmt across workspace
@@ -21,10 +21,10 @@ Minimum Rust version: 1.88 (some deps require it). Tested on macOS (aarch64).
 ```
 Cargo.toml                              # workspace root
 crates/
-  vger-core/                            # library crate — all backup logic
+  vykar-core/                            # library crate — all backup logic
     src/
       lib.rs                            # module re-exports
-      error.rs                          # VgerError enum (thiserror)
+      error.rs                          # VykarError enum (thiserror)
       config.rs                         # YAML config structs (serde)
       storage/
         mod.rs                          # StorageBackend trait (get/put/delete/exists/list/get_range/create_dir)
@@ -53,8 +53,8 @@ crates/
         item.rs                         # Item, ItemType, ChunkRef
       commands/
         mod.rs
-        init.rs                         # vger init
-        backup/                         # vger backup (two-phase: upload + commit)
+        init.rs                         # vykar init
+        backup/                         # vykar backup (two-phase: upload + commit)
           mod.rs                        # run(), two-phase entry point, session lifecycle
           pipeline.rs                   # parallel streaming pipeline (worker threads + ByteBudget)
           sequential.rs                 # single-threaded/rayon fallback path
@@ -63,15 +63,15 @@ crates/
           commit.rs                     # chunk commitment to repo (shared by pipeline/sequential)
           command_dump.rs               # shell command execution and capture
           concurrency.rs                # ByteBudget, PendingFiles work queue
-        list.rs                         # vger list (snapshots or snapshot contents)
-        restore.rs                      # vger restore (restore files)
-        delete.rs                       # vger delete (remove snapshot, decrement refcounts)
-        prune.rs                        # vger prune (retention policy)
-        check.rs                        # vger check (integrity verification)
-        compact.rs                      # vger compact (repack packs to reclaim space)
+        list.rs                         # vykar list (snapshots or snapshot contents)
+        restore.rs                      # vykar restore (restore files)
+        delete.rs                       # vykar delete (remove snapshot, decrement refcounts)
+        prune.rs                        # vykar prune (retention policy)
+        check.rs                        # vykar check (integrity verification)
+        compact.rs                      # vykar compact (repack packs to reclaim space)
         util.rs                         # open_repo variants, with_repo_lock, with_maintenance_lock
-  vger-cli/                             # binary crate — thin CLI
-    src/main.rs                         # clap CLI, passphrase handling, dispatches to vger-core commands
+  vykar-cli/                             # binary crate — thin CLI
+    src/main.rs                         # clap CLI, passphrase handling, dispatches to vykar-core commands
 ```
 
 ## Architecture overview
@@ -147,7 +147,7 @@ The type tag byte is used as AAD (authenticated additional data) in AES-GCM.
 - **Two-phase backup**: Phase 1 (no lock, session marker) handles upload; Phase 2 (exclusive lock, brief) handles commit via `commit_concurrent_session()`. Multiple clients can upload concurrently.
 - **Per-session crash-recovery journal** at `sessions/<id>.index`, co-located with the session marker at `sessions/<id>.json`.
 - **Index-first persistence**: in `commit_concurrent_session()`, the index is always written before the manifest. Crash between the two leaves harmless orphan index entries.
-- **Maintenance lock**: `with_maintenance_lock()` (compact/delete/prune) acquires the advisory lock, cleans stale sessions (72 h), then refuses to proceed if any active sessions remain (`VgerError::ActiveSessions`).
+- **Maintenance lock**: `with_maintenance_lock()` (compact/delete/prune) acquires the advisory lock, cleans stale sessions (72 h), then refuses to proceed if any active sessions remain (`VykarError::ActiveSessions`).
 
 ## Dependencies (key ones)
 

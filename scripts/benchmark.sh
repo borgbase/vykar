@@ -9,14 +9,14 @@ usage() {
   cat <<USAGE
 Usage: $(basename "$0") [options]
 
-Reproducible benchmark harness for vger vs restic vs rustic vs borg vs kopia.
+Reproducible benchmark harness for vykar vs restic vs rustic vs borg vs kopia.
 
 Per measured run: reset repo, init, untimed seed backup of snapshot-1, storage settle
 (sync + fstrim + nvme flush + cooldown), drop caches, then timed benchmark.
 
 Options:
   --dataset PATH   Dataset directory (default: \$CORPUS_REMOTE)
-  --tool NAMES     Comma-separated tools: vger,restic,rustic,borg,kopia (default: all)
+  --tool NAMES     Comma-separated tools: vykar,restic,rustic,borg,kopia (default: all)
   --runs N         Timed runs per operation (default: 3)
   --warmups N      Warmup runs per operation (default: 0)
   --perf           Run perf stat summary after timed runs
@@ -64,7 +64,7 @@ need /usr/bin/time
 command -v perf >/dev/null 2>&1 && HAVE_PERF=1 || HAVE_PERF=0
 command -v strace >/dev/null 2>&1 && HAVE_STRACE=1 || HAVE_STRACE=0
 
-ALL_TOOLS=(vger restic rustic borg kopia)
+ALL_TOOLS=(vykar restic rustic borg kopia)
 SELECTED_TOOLS=()
 
 if [[ -z "$TOOL" ]]; then
@@ -76,8 +76,8 @@ else
     tool_item="${raw_tool//[[:space:]]/}"
     [[ -n "$tool_item" ]] || die "--tool contains an empty item: '$TOOL'"
     case "$tool_item" in
-      vger|restic|rustic|borg|kopia) ;;
-      *) die "--tool item must be one of: vger, restic, rustic, borg, kopia; got: $tool_item" ;;
+      vykar|restic|rustic|borg|kopia) ;;
+      *) die "--tool item must be one of: vykar, restic, rustic, borg, kopia; got: $tool_item" ;;
     esac
     if [[ -z "${SEEN_TOOLS[$tool_item]:-}" ]]; then
       SELECTED_TOOLS+=("$tool_item")
@@ -104,7 +104,7 @@ mkdir -p "$LOGS"
 
 # --- Repos ---
 
-VGER_REPO="$REPO_ROOT/bench-vger"
+VYKAR_REPO="$REPO_ROOT/bench-vykar"
 RESTIC_REPO="$REPO_ROOT/bench-restic"
 RUSTIC_REPO="$REPO_ROOT/bench-rustic"
 BORG_REPO="$REPO_ROOT/bench-borg"
@@ -112,23 +112,23 @@ KOPIA_REPO="$REPO_ROOT/bench-kopia"
 KOPIA_CONFIG="$OUT_ROOT/kopia.repository.config"
 KOPIA_CACHE="$OUT_ROOT/kopia-cache"
 
-sudo -n mkdir -p "$VGER_REPO" "$RESTIC_REPO" "$RUSTIC_REPO" "$BORG_REPO" "$KOPIA_REPO"
-sudo -n chown -R "$USER:$USER" "$VGER_REPO" "$RESTIC_REPO" "$RUSTIC_REPO" "$BORG_REPO" "$KOPIA_REPO"
+sudo -n mkdir -p "$VYKAR_REPO" "$RESTIC_REPO" "$RUSTIC_REPO" "$BORG_REPO" "$KOPIA_REPO"
+sudo -n chown -R "$USER:$USER" "$VYKAR_REPO" "$RESTIC_REPO" "$RUSTIC_REPO" "$BORG_REPO" "$KOPIA_REPO"
 
 # --- Tool config ---
 
-VGER_CFG="$OUT_ROOT/vger.bench.yaml"
-cat >"$VGER_CFG" <<YAML
+VYKAR_CFG="$OUT_ROOT/vykar.bench.yaml"
+cat >"$VYKAR_CFG" <<YAML
 repositories:
-  - url: "$VGER_REPO"
+  - url: "$VYKAR_REPO"
     label: bench
 compression:
   algorithm: zstd
 YAML
-chmod 600 "$VGER_CFG"
+chmod 600 "$VYKAR_CFG"
 
-export VGER_CONFIG="$VGER_CFG"
-export VGER_PASSPHRASE="$PASSPHRASE"
+export VYKAR_CONFIG="$VYKAR_CFG"
+export VYKAR_PASSPHRASE="$PASSPHRASE"
 export RESTIC_REPOSITORY="$RESTIC_REPO"
 export RESTIC_PASSWORD="$PASSPHRASE"
 export RUSTIC_REPOSITORY="$RUSTIC_REPO"
@@ -139,15 +139,15 @@ export KOPIA_PASSWORD="$PASSPHRASE"
 
 # --- Restore dirs ---
 
-RESTORE_VGER="$OUT_ROOT/restore-vger"
+RESTORE_VYKAR="$OUT_ROOT/restore-vykar"
 RESTORE_RESTIC="$OUT_ROOT/restore-restic"
 RESTORE_RUSTIC="$OUT_ROOT/restore-rustic"
 RESTORE_BORG="$OUT_ROOT/restore-borg"
 RESTORE_KOPIA="$OUT_ROOT/restore-kopia"
-mkdir -p "$RESTORE_VGER" "$RESTORE_RESTIC" "$RESTORE_RUSTIC" "$RESTORE_BORG" "$RESTORE_KOPIA"
+mkdir -p "$RESTORE_VYKAR" "$RESTORE_RESTIC" "$RESTORE_RUSTIC" "$RESTORE_BORG" "$RESTORE_KOPIA"
 
 cleanup_restore_dirs() {
-  rm -rf "$RESTORE_VGER" "$RESTORE_RESTIC" "$RESTORE_RUSTIC" "$RESTORE_BORG" "$RESTORE_KOPIA"
+  rm -rf "$RESTORE_VYKAR" "$RESTORE_RESTIC" "$RESTORE_RUSTIC" "$RESTORE_BORG" "$RESTORE_KOPIA"
   [[ -n "${KOPIA_CACHE:-}" ]] && rm -rf "$KOPIA_CACHE"
 }
 trap cleanup_restore_dirs EXIT
@@ -165,7 +165,7 @@ tool_from_op()  { echo "${1%%_*}"; }
 phase_from_op() { echo "${1##*_}"; }
 
 # Per-run resolved values used by measured commands.
-RUN_VGER_RESTORE_SNAPSHOT=""
+RUN_VYKAR_RESTORE_SNAPSHOT=""
 RUN_BORG_BACKUP_ARCHIVE=""
 RUN_BORG_RESTORE_ARCHIVE=""
 declare -a STORAGE_TRIM_MOUNTS=()
@@ -175,7 +175,7 @@ run_with_op_env() {
   local op="$1"
   shift
   case "$op" in
-    vger_restore) VGER_RESTORE_SNAPSHOT="$RUN_VGER_RESTORE_SNAPSHOT" "$@" ;;
+    vykar_restore) VYKAR_RESTORE_SNAPSHOT="$RUN_VYKAR_RESTORE_SNAPSHOT" "$@" ;;
     borg_backup)  BORG_BACKUP_ARCHIVE="$RUN_BORG_BACKUP_ARCHIVE" "$@" ;;
     borg_restore) BORG_RESTORE_ARCHIVE="$RUN_BORG_RESTORE_ARCHIVE" "$@" ;;
     *)            "$@" ;;
@@ -280,7 +280,7 @@ build_storage_settle_targets
 
 repo_dir_for_tool() {
   case "$1" in
-    vger)   echo "$VGER_REPO" ;;
+    vykar)   echo "$VYKAR_REPO" ;;
     restic) echo "$RESTIC_REPO" ;;
     rustic) echo "$RUSTIC_REPO" ;;
     borg)   echo "$BORG_REPO" ;;
@@ -291,7 +291,7 @@ repo_dir_for_tool() {
 
 restore_dir_for_tool() {
   case "$1" in
-    vger)   echo "$RESTORE_VGER" ;;
+    vykar)   echo "$RESTORE_VYKAR" ;;
     restic) echo "$RESTORE_RESTIC" ;;
     rustic) echo "$RESTORE_RUSTIC" ;;
     borg)   echo "$RESTORE_BORG" ;;
@@ -349,7 +349,7 @@ cleanup_restore_for_tool() {
 
 init_repo_for_tool() {
   case "$1" in
-    vger)   vger init -R bench ;;
+    vykar)   vykar init -R bench ;;
     restic) restic init ;;
     rustic) rustic init ;;
     borg)   borg init --encryption=repokey-blake2 ;;
@@ -364,7 +364,7 @@ init_repo_for_tool() {
 backup_adhoc_for_tool() {
   local tool="$1" src="$2"
   case "$tool" in
-    vger)   vger backup -R bench -l bench "$src" ;;
+    vykar)   vykar backup -R bench -l bench "$src" ;;
     restic) restic backup "$src" ;;
     rustic) rustic backup "$src" ;;
     borg)
@@ -378,8 +378,8 @@ backup_adhoc_for_tool() {
 
 measured_cmd_for_op() {
   case "$1" in
-    vger_backup)    echo "vger backup -R bench -l bench '$DATASET_BENCHMARK'" ;;
-    vger_restore)   echo "vger restore -R bench \"\$VGER_RESTORE_SNAPSHOT\" '$RESTORE_VGER'" ;;
+    vykar_backup)    echo "vykar backup -R bench -l bench '$DATASET_BENCHMARK'" ;;
+    vykar_restore)   echo "vykar restore -R bench \"\$VYKAR_RESTORE_SNAPSHOT\" '$RESTORE_VYKAR'" ;;
     restic_backup)  echo "restic backup '$DATASET_BENCHMARK'" ;;
     restic_restore) echo "restic restore latest --target '$RESTORE_RESTIC'" ;;
     rustic_backup)  echo "rustic backup '$DATASET_BENCHMARK'" ;;
@@ -413,30 +413,30 @@ prepare_op_run() {
 prepare_measurement_for_op() {
   local op="$1" prep_log="$2"
 
-  RUN_VGER_RESTORE_SNAPSHOT=""
+  RUN_VYKAR_RESTORE_SNAPSHOT=""
   RUN_BORG_BACKUP_ARCHIVE=""
   RUN_BORG_RESTORE_ARCHIVE=""
 
   echo "[measure-prepare] op=$op" >>"$prep_log"
 
   case "$op" in
-    vger_restore)
-      echo "[measure-prepare] clean restore dir: $RESTORE_VGER" >>"$prep_log"
-      if ! clear_dir_contents "$RESTORE_VGER" "$prep_log"; then
-        echo "[measure-prepare] failed to clean restore dir: $RESTORE_VGER" >>"$prep_log"
+    vykar_restore)
+      echo "[measure-prepare] clean restore dir: $RESTORE_VYKAR" >>"$prep_log"
+      if ! clear_dir_contents "$RESTORE_VYKAR" "$prep_log"; then
+        echo "[measure-prepare] failed to clean restore dir: $RESTORE_VYKAR" >>"$prep_log"
         return 1
       fi
-      if ! RUN_VGER_RESTORE_SNAPSHOT="$(
-        vger list -R bench --last 1 | awk 'NR==2{print $1}'
+      if ! RUN_VYKAR_RESTORE_SNAPSHOT="$(
+        vykar list -R bench --last 1 | awk 'NR==2{print $1}'
       )"; then
-        echo "[measure-prepare] failed to resolve latest vger snapshot" >>"$prep_log"
+        echo "[measure-prepare] failed to resolve latest vykar snapshot" >>"$prep_log"
         return 1
       fi
-      [[ -n "$RUN_VGER_RESTORE_SNAPSHOT" ]] || {
-        echo "[measure-prepare] empty latest vger snapshot id" >>"$prep_log"
+      [[ -n "$RUN_VYKAR_RESTORE_SNAPSHOT" ]] || {
+        echo "[measure-prepare] empty latest vykar snapshot id" >>"$prep_log"
         return 1
       }
-      echo "[measure-prepare] vger snapshot=$RUN_VGER_RESTORE_SNAPSHOT" >>"$prep_log"
+      echo "[measure-prepare] vykar snapshot=$RUN_VYKAR_RESTORE_SNAPSHOT" >>"$prep_log"
       ;;
     restic_restore)
       echo "[measure-prepare] clean restore dir: $RESTORE_RESTIC" >>"$prep_log"
@@ -659,10 +659,10 @@ for op in "${OPS[@]}"; do
 done
 
 # Repo size stats
-du -sh "$VGER_REPO" "$RESTIC_REPO" "$RUSTIC_REPO" "$BORG_REPO" "$KOPIA_REPO" >"$OUT_ROOT/repo-sizes.txt"
+du -sh "$VYKAR_REPO" "$RESTIC_REPO" "$RUSTIC_REPO" "$BORG_REPO" "$KOPIA_REPO" >"$OUT_ROOT/repo-sizes.txt"
 
 # Tool-specific repo stats
-{ echo "== vger info =="; vger info -R bench || true; } >"$OUT_ROOT/vger.info.txt" 2>&1
+{ echo "== vykar info =="; vykar info -R bench || true; } >"$OUT_ROOT/vykar.info.txt" 2>&1
 { echo "== restic snapshots =="; restic snapshots || true; echo; echo "== restic stats (raw-data) =="; restic stats --mode raw-data || true; } >"$OUT_ROOT/restic.stats.txt" 2>&1
 { echo "== rustic snapshots =="; rustic snapshots || true; echo; echo "== rustic stats =="; rustic stats || true; } >"$OUT_ROOT/rustic.stats.txt" 2>&1
 { echo "== borg info =="; borg info || true; echo; echo "== borg list =="; borg list || true; } >"$OUT_ROOT/borg.stats.txt" 2>&1

@@ -16,7 +16,7 @@ Required:
 
 Options:
   --target-gib N             Target database size in GiB (default: 10)
-  --db NAME                  Database name (default: vger_pg_test)
+  --db NAME                  Database name (default: vykar_pg_test)
   --postgres-db NAME         Admin DB for control commands (default: postgres)
   --user USER                PostgreSQL user (default: postgres)
   --password PASS            PostgreSQL password (default: testpass)
@@ -27,14 +27,14 @@ Options:
   --help                     Show help
 
 Examples:
-  $(basename "$0") --container vger-pg --target-gib 10
-  $(basename "$0") --container vger-pg --rows-per-batch 10000
+  $(basename "$0") --container vykar-pg --target-gib 10
+  $(basename "$0") --container vykar-pg --rows-per-batch 10000
 USAGE
 }
 
 CONTAINER=""
 TARGET_GIB=10
-DB_NAME="vger_pg_test"
+DB_NAME="vykar_pg_test"
 POSTGRES_DB="postgres"
 PG_USER="postgres"
 PG_PASSWORD="testpass"

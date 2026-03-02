@@ -1,11 +1,11 @@
 #!/bin/sh
 set -eu
 
-REPO="borgbase/vger"
+REPO="borgbase/vykar"
 GITHUB_API="https://api.github.com/repos/${REPO}/releases/latest"
 GITHUB_DOWNLOAD="https://github.com/${REPO}/releases/download"
 DEFAULT_INSTALL_DIR="/usr/local/bin"
-BINARY_NAME="vger"
+BINARY_NAME="vykar"
 TMPDIR_CLEANUP=""
 
 # Minimum glibc required by the GNU build.
@@ -162,7 +162,7 @@ prompt_install_dir() {
 
 prompt_config() {
     if [ -t 0 ]; then
-        printf 'Run "vger config" to create a starter configuration? [Y/n]: '
+        printf 'Run "vykar config" to create a starter configuration? [Y/n]: '
         read -r answer || true
         case "$answer" in
             [nN]*) ;;
@@ -176,7 +176,7 @@ prompt_config() {
 download_and_verify() {
     local archive checksum_file expected actual
 
-    archive="vger-${VERSION}-${TARGET}.tar.gz"
+    archive="vykar-${VERSION}-${TARGET}.tar.gz"
     TMPDIR_CLEANUP="$(mktemp -d)"
     tmpdir="$TMPDIR_CLEANUP"
     trap 'rm -rf "$TMPDIR_CLEANUP"' EXIT
@@ -228,7 +228,7 @@ install_binary() {
 # --- Main -----------------------------------------------------------------
 
 main() {
-    log "vger installer"
+    log "vykar installer"
     log ""
 
     require_cmd curl
@@ -245,7 +245,7 @@ main() {
 
     prompt_install_dir
 
-    log "Installing vger ${VERSION} to ${INSTALL_DIR}"
+    log "Installing vykar ${VERSION} to ${INSTALL_DIR}"
     log ""
 
     download_and_verify
@@ -255,7 +255,7 @@ main() {
     prompt_config
 
     log ""
-    log "Done. Run 'vger config' to create a starter configuration."
+    log "Done. Run 'vykar config' to create a starter configuration."
 }
 
 main

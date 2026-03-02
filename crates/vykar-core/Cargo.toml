@@ -1,0 +1,83 @@
+[package]
+name = "vykar-core"
+version = "0.10.2"
+edition = "2021"
+license = "GPL-3.0-only"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Internal
+vykar-types.workspace = true
+vykar-crypto.workspace = true
+vykar-storage.workspace = true
+vykar-protocol.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+rmp = "0.8"
+rmp-serde.workspace = true
+
+# Crypto
+blake2.workspace = true
+rand.workspace = true
+zeroize.workspace = true
+hex.workspace = true
+
+# Compression
+lz4_flex = "0.11"
+zstd = "0.13"
+
+# Chunking
+fastcdc = "3"
+
+# Filesystem
+tempfile.workspace = true
+globset = "0.4"
+ignore = "0.4"
+
+# Time
+chrono.workspace = true
+
+# Memory-mapped I/O
+memmap2 = "0.9"
+
+# Probabilistic filter
+xorf = "0.12"
+
+# Small-vec optimization
+smallvec = "1"
+
+# Error handling
+thiserror.workspace = true
+
+# Logging
+tracing.workspace = true
+rayon = "1"
+crossbeam-channel.workspace = true
+
+# Async runtime (mount only)
+tokio = { workspace = true, features = ["rt-multi-thread"], optional = true }
+
+# Mount (WebDAV server)
+dav-server = { version = "0.10", optional = true }
+hyper = { version = "1", features = ["server", "http1"], optional = true }
+hyper-util = { version = "0.1", features = ["tokio"], optional = true }
+lru = { version = "0.12", optional = true }
+bytes = { version = "1", optional = true }
+futures-util = { version = "0.3", optional = true }
+
+[features]
+default = ["backend-sftp"]
+backend-sftp = ["vykar-storage/backend-sftp"]
+mount = ["dav-server", "tokio/rt-multi-thread", "tokio/macros", "tokio/signal", "tokio/net", "hyper", "hyper-util", "lru", "bytes", "futures-util"]
+
+[dev-dependencies]
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+nix = { version = "0.29", features = ["fs", "hostname", "user", "signal", "process"] }
+xattr = "1"

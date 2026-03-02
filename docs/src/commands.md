@@ -2,23 +2,23 @@
 
 | Command | Description |
 |---------|-------------|
-| `vger` | Run full backup process: `backup`, `prune`, `compact`, `check`. This is useful for automation. |
-| `vger config` | Generate a starter configuration file |
-| `vger init` | Initialize a new backup repository |
-| `vger backup` | Back up files to a new snapshot |
-| `vger restore` | Restore files from a snapshot |
-| `vger list` | List snapshots |
-| `vger snapshot list` | Show files and directories inside a snapshot |
-| `vger snapshot info` | Show metadata for a snapshot |
-| `vger snapshot find` | Find matching files across snapshots and show change timeline (`added`, `modified`, `unchanged`) |
-| `vger snapshot delete` | Delete a specific snapshot |
-| `vger delete` | Delete an entire repository permanently |
-| `vger prune` | Prune snapshots according to retention policy |
-| `vger break-lock` | Remove stale repository locks left by interrupted processes when lock conflicts block operations |
-| `vger check` | Verify repository integrity (`--verify-data` for full content verification) |
-| `vger info` | Show repository statistics (snapshot counts and size totals) |
-| `vger compact` | Free space by repacking pack files after delete/prune |
-| `vger mount` | Browse snapshots via a local WebDAV server |
+| `vykar` | Run full backup process: `backup`, `prune`, `compact`, `check`. This is useful for automation. |
+| `vykar config` | Generate a starter configuration file |
+| `vykar init` | Initialize a new backup repository |
+| `vykar backup` | Back up files to a new snapshot |
+| `vykar restore` | Restore files from a snapshot |
+| `vykar list` | List snapshots |
+| `vykar snapshot list` | Show files and directories inside a snapshot |
+| `vykar snapshot info` | Show metadata for a snapshot |
+| `vykar snapshot find` | Find matching files across snapshots and show change timeline (`added`, `modified`, `unchanged`) |
+| `vykar snapshot delete` | Delete a specific snapshot |
+| `vykar delete` | Delete an entire repository permanently |
+| `vykar prune` | Prune snapshots according to retention policy |
+| `vykar break-lock` | Remove stale repository locks left by interrupted processes when lock conflicts block operations |
+| `vykar check` | Verify repository integrity (`--verify-data` for full content verification) |
+| `vykar info` | Show repository statistics (snapshot counts and size totals) |
+| `vykar compact` | Free space by repacking pack files after delete/prune |
+| `vykar mount` | Browse snapshots via a local WebDAV server |
 
 ## Exit codes
 
@@ -26,4 +26,4 @@
 - `1`: Error (command failed)
 - `3`: Partial success (backup completed, but one or more files were skipped)
 
-`vger backup` and the default `vger` workflow can return `3` when a backup succeeds with skipped unreadable/missing files.
+`vykar backup` and the default `vykar` workflow can return `3` when a backup succeeds with skipped unreadable/missing files.

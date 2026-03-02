@@ -1,6 +1,6 @@
 # Server Internals
 
-Technical reference for vger-server's internal architecture: crate layout, REST API surface, authentication, policy enforcement, and server-side operations.
+Technical reference for vykar-server's internal architecture: crate layout, REST API surface, authentication, policy enforcement, and server-side operations.
 
 *For deployment and configuration, see [Setup](server-setup.md).*
 
@@ -10,9 +10,9 @@ Technical reference for vger-server's internal architecture: crate layout, REST 
 
 | Component | Location | Purpose |
 |-----------|----------|---------|
-| **vger-server** | `crates/vger-server/` | axum HTTP server with all server-side features |
-| **vger-protocol** | `crates/vger-protocol/` | Shared wire-format types and pack/protocol version constants (no I/O or crypto deps) |
-| **RestBackend** | `crates/vger-core/src/storage/rest_backend.rs` | `StorageBackend` impl over HTTP |
+| **vykar-server** | `crates/vykar-server/` | axum HTTP server with all server-side features |
+| **vykar-protocol** | `crates/vykar-protocol/` | Shared wire-format types and pack/protocol version constants (no I/O or crypto deps) |
+| **RestBackend** | `crates/vykar-core/src/storage/rest_backend.rs` | `StorageBackend` impl over HTTP |
 
 ## REST API
 
@@ -49,7 +49,7 @@ Lock endpoints:
 
 ## Authentication
 
-Single shared bearer token, constant-time compared via the `subtle` crate. Set via the `VGER_TOKEN` environment variable.
+Single shared bearer token, constant-time compared via the `subtle` crate. Set via the `VYKAR_TOKEN` environment variable.
 
 `GET /health` is the only unauthenticated endpoint.
 
@@ -132,23 +132,23 @@ For packs with `keep_blobs: []`, the server simply deletes the pack.
 
 Full content verification (decrypt + recompute chunk IDs) can be done client- or server-side
 
-- Server-side `vger check --verify-data`: This won't download the whole repo, but instruct the server to checksum the actual data.
-- Client-side `vger check --verify-data --distrust-server`: This will download all the data and verify it client-side.
+- Server-side `vykar check --verify-data`: This won't download the whole repo, but instruct the server to checksum the actual data.
+- Client-side `vykar check --verify-data --distrust-server`: This will download all the data and verify it client-side.
 
 ## Server Configuration
 
-All settings are passed as CLI flags. The authentication token is read from the `VGER_TOKEN` environment variable.
+All settings are passed as CLI flags. The authentication token is read from the `VYKAR_TOKEN` environment variable.
 
 ```bash
-export VGER_TOKEN="some-secret-token"
-vger-server --data-dir /var/lib/vger --append-only --log-format json --quota 10G --max-blocking-threads 6
+export VYKAR_TOKEN="some-secret-token"
+vykar-server --data-dir /var/lib/vykar --append-only --log-format json --quota 10G --max-blocking-threads 6
 ```
 
-See `vger-server --help` for the full list of flags and defaults.
+See `vykar-server --help` for the full list of flags and defaults.
 
 ## RestBackend (Client Side)
 
-`crates/vger-core/src/storage/rest_backend.rs` implements `StorageBackend` using `ureq` (sync HTTP client). Connection-pooled. Maps each trait method to the corresponding HTTP verb. `get_range` sends a `Range: bytes=<start>-<end>` header and expects `206 Partial Content`. Also exposes extra methods beyond the trait: `batch_delete()`, `repack()`, `verify_packs()`, `acquire_lock()`, `release_lock()`, `stats()`.
+`crates/vykar-core/src/storage/rest_backend.rs` implements `StorageBackend` using `ureq` (sync HTTP client). Connection-pooled. Maps each trait method to the corresponding HTTP verb. `get_range` sends a `Range: bytes=<start>-<end>` header and expects `206 Partial Content`. Also exposes extra methods beyond the trait: `batch_delete()`, `repack()`, `verify_packs()`, `acquire_lock()`, `release_lock()`, `stats()`.
 
 Client config:
 ```yaml

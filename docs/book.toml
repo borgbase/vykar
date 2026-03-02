@@ -1,15 +1,15 @@
 [book]
-authors = ["vger contributors"]
+authors = ["vykar contributors"]
 language = "en"
 src = "src"
-title = "V'Ger Backup Documentation"
+title = "Vykar Backup Documentation"
 
 [build]
 build-dir = "book"
 
 [output.html]
 no-section-label = true
-git-repository-url = "https://github.com/borgbase/vger"
+git-repository-url = "https://github.com/borgbase/vykar"
 # Cloudflare Pages can serve extensionless chapter routes (/backup) while
 # mdBook links chapters as .html files; this shim normalizes active-page
 # matching so current-page headers still appear in sidebar navigation.

@@ -1,21 +1,21 @@
 ---
 name: security-review
-description: "Security review skill for the vger backup tool (Rust). Use when reviewing code for security issues, auditing cryptographic implementations, checking for credential leaks, reviewing unsafe code, or validating the security model of the backup tool. Covers encryption, key management, repository integrity, hook execution, config parsing, dependency auditing, and backup-specific attack surfaces."
+description: "Security review skill for the vykar backup tool (Rust). Use when reviewing code for security issues, auditing cryptographic implementations, checking for credential leaks, reviewing unsafe code, or validating the security model of the backup tool. Covers encryption, key management, repository integrity, hook execution, config parsing, dependency auditing, and backup-specific attack surfaces."
 ---
 
-# vger Security Review
+# vykar Security Review
 
-A skill for reviewing the security of the vger backup tool — a Rust-based deduplicated, encrypted backup tool inspired by BorgBackup, Restic, and Kopia.
+A skill for reviewing the security of the vykar backup tool — a Rust-based deduplicated, encrypted backup tool inspired by BorgBackup, Restic, and Kopia.
 
 ## Context
 
-vger is a backup tool that handles extremely sensitive data: users' files, database dumps, credentials, and encryption keys. A security flaw here is catastrophic — it can mean silent data loss, leaked secrets, or ransomware destroying all backups. The bar for security is higher than a typical application.
+vykar is a backup tool that handles extremely sensitive data: users' files, database dumps, credentials, and encryption keys. A security flaw here is catastrophic — it can mean silent data loss, leaked secrets, or ransomware destroying all backups. The bar for security is higher than a typical application.
 
-This skill should be used to review any code change, new feature, or periodic audit of the vger codebase. It draws on real-world vulnerabilities and security models from BorgBackup, Restic, Kopia, and Rustic.
+This skill should be used to review any code change, new feature, or periodic audit of the vykar codebase. It draws on real-world vulnerabilities and security models from BorgBackup, Restic, Kopia, and Rustic.
 
 ## How to Use This Skill
 
-When asked to review vger code for security, follow this process:
+When asked to review vykar code for security, follow this process:
 
 1. **Identify the scope** — Is this a full audit, a PR review, or a focused review of a specific subsystem (crypto, hooks, config, networking)?
 2. **Walk through the checklist** below for the relevant areas
@@ -32,7 +32,7 @@ This is the most critical area. Backup tools live or die by their encryption cor
 
 **What to check:**
 
-- **Use AEAD ciphers only.** vger should use AES-256-GCM or ChaCha20-Poly1305. Flag any use of AES-CTR, AES-CBC, or other non-authenticated modes. Borg 1.x used AES-CTR + HMAC (Encrypt-then-MAC) which was secure but fragile; Borg 2.0 moved to AEAD for good reason.
+- **Use AEAD ciphers only.** vykar should use AES-256-GCM or ChaCha20-Poly1305. Flag any use of AES-CTR, AES-CBC, or other non-authenticated modes. Borg 1.x used AES-CTR + HMAC (Encrypt-then-MAC) which was secure but fragile; Borg 2.0 moved to AEAD for good reason.
 - **Never roll custom crypto.** All cryptographic operations should use well-audited crates: `aes-gcm`, `chacha20poly1305`, `ring`, or `rustcrypto` family. Flag any manual XOR, custom MAC construction, or hand-rolled key derivation.
 - **Use a CSPRNG for secrets.** Keys, nonces, salts, and tokens must come from `OsRng`/`getrandom` (or equivalent CSPRNG). Flag `SmallRng`, `rand_pcg`, `rand_xoshiro`, or other non-cryptographic RNGs in security-sensitive paths.
 - **Nonce/IV management.** Every encryption operation needs a unique nonce. Check for:
@@ -45,7 +45,7 @@ This is the most critical area. Backup tools live or die by their encryption cor
   - Argon2id parameters are reasonable (memory ≥ 64 MiB, iterations ≥ 3, parallelism ≥ 1)
   - Parameters are stored with the key so they can be upgraded later
 - **Master key architecture.** The passphrase should derive a Key Encryption Key (KEK) that wraps a randomly-generated master key. Never derive the encryption key directly from the passphrase — this allows passphrase changes without re-encrypting the entire repo.
-- **Session keys.** Borg 2.0 derives per-session keys from the master key + a session ID. This limits the impact of nonce reuse. Consider whether vger does something similar.
+- **Session keys.** Borg 2.0 derives per-session keys from the master key + a session ID. This limits the impact of nonce reuse. Consider whether vykar does something similar.
 - **Chunk ID derivation.** Chunk IDs must be derived using a keyed MAC (HMAC-SHA256 or keyed BLAKE2b), not a plain hash. Plain hashes allow an attacker with repo access to confirm whether specific files exist in the backup (content fingerprinting attack).
 - **Compression + encryption interaction.** Compressing before encrypting can leak information about plaintext through ciphertext size (CRIME/BREACH-style attacks). For a backup tool with offline storage this is low risk, but flag it if compression ratios are observable to an attacker (e.g., exposed via a web API or monitoring metrics).
 - **Encrypt-then-MAC ordering.** If not using AEAD, the only acceptable construction is Encrypt-then-MAC. MAC-then-Encrypt and Encrypt-and-MAC are vulnerable to padding oracles. But prefer AEAD which handles this automatically.
@@ -65,19 +65,19 @@ This is the most critical area. Backup tools live or die by their encryption cor
 - **Passphrase in memory.** After deriving the KEK, the passphrase should be zeroized from memory immediately. Use the `zeroize` crate with `Zeroizing<>` wrapper. Check that passphrases are not stored in `String` (which may be copied by the allocator) — use `SecretString` or `Zeroizing<Vec<u8>>`.
 - **Key material in memory.** All key material (master key, session keys, KEK) should use `Zeroizing<>`. Verify keys are zeroized on drop, not just when the program exits cleanly.
 - **No keys in logs or error messages.** Grep for any logging of key material, passphrases, or encryption parameters that include secrets. Check `Debug` trait implementations on key-containing structs — they should redact sensitive fields.
-- **Config file permissions.** If the config file contains `passphrase:` in plaintext, vger should warn the user and recommend `passcommand` instead. Check that vger sets restrictive permissions (0600) on any file it creates that contains secrets.
+- **Config file permissions.** If the config file contains `passphrase:` in plaintext, vykar should warn the user and recommend `passcommand` instead. Check that vykar sets restrictive permissions (0600) on any file it creates that contains secrets.
 - **passcommand execution.** The `passcommand` is a shell command. Check:
   - It's executed via the user's shell, not via direct exec (to support pipes, variable expansion)
   - stdout is captured, stderr is passed through to the user
   - The output is trimmed of trailing newlines
   - The command is not logged
-  - Environment variables like `VGER_PASSPHRASE` are cleared from the environment after use
-- **Key file storage.** If vger stores the encrypted key in the repo (like Borg's repokey mode), verify:
+  - Environment variables like `VYKAR_PASSPHRASE` are cleared from the environment after use
+- **Key file storage.** If vykar stores the encrypted key in the repo (like Borg's repokey mode), verify:
   - The key is encrypted with the KEK before storage
   - The encrypted key includes a MAC/authentication tag
   - The salt is stored alongside the encrypted key
   - Multiple keys can exist (for key rotation)
-- **Repository swapping attack.** An attacker who controls the storage could swap the entire repository (including key material) with one they control. Borg mitigates this by aborting if BORG_PASSPHRASE doesn't match. Check that vger detects repository identity changes.
+- **Repository swapping attack.** An attacker who controls the storage could swap the entire repository (including key material) with one they control. Borg mitigates this by aborting if BORG_PASSPHRASE doesn't match. Check that vykar detects repository identity changes.
 
 ### 3. Repository Integrity and Data Verification
 
@@ -93,8 +93,8 @@ This is the most critical area. Backup tools live or die by their encryption cor
   - Lock files on cloud storage are inherently unreliable (no atomic operations)
   - Stale locks must be detectable and breakable (include PID, hostname, timestamp)
   - Lock-free designs (like Duplicacy/Rustic) are preferred
-- **Repair safety.** Repository repair operations (`vger check --repair`) must never delete data that might be needed. Flag any repair logic that removes chunks without first verifying they're unreferenced by ALL snapshots.
-- **Time-of-check-to-time-of-use (TOCTOU).** Check for gaps between verifying a file's metadata and reading its content during backup. Filesystem snapshots (ZFS/Btrfs/LVM) are the proper fix, but if not available, vger should at minimum detect and warn about files that changed during backup.
+- **Repair safety.** Repository repair operations (`vykar check --repair`) must never delete data that might be needed. Flag any repair logic that removes chunks without first verifying they're unreferenced by ALL snapshots.
+- **Time-of-check-to-time-of-use (TOCTOU).** Check for gaps between verifying a file's metadata and reading its content during backup. Filesystem snapshots (ZFS/Btrfs/LVM) are the proper fix, but if not available, vykar should at minimum detect and warn about files that changed during backup.
 - **Arithmetic on untrusted sizes/lengths.** Metadata-driven sizes, offsets, and capacities must use `checked_*`/`try_into()` style conversions. In release builds, integer overflow wraps silently and can invalidate bounds checks.
 
 ### 4. Hook Execution Security
@@ -106,18 +106,18 @@ Hooks (`before_backup`, `after`, `failed`, etc.) execute arbitrary shell command
 - **Variable injection in hooks.** Hook templates use variables like `{error}`, `{label}`, `{repository}`. If these are interpolated directly into shell commands, an attacker who controls the error message or label name can inject shell commands. Example: a malicious repository could return an error containing `$(rm -rf /)`. Variables must be shell-escaped or passed via environment variables only (not interpolated into the command string).
 - **Shell command construction.** Flag any hook implementation that shells out through `sh -c`/`bash -c`/`cmd /c` with untrusted input. Prefer direct argument passing where possible, or strict escaping plus allowlists for dynamic values.
 - **Hook execution environment.** Check that hooks:
-  - Run with the same privileges as vger (not elevated)
-  - Have a clean, minimal environment (don't leak `VGER_PASSPHRASE` or key material)
+  - Run with the same privileges as vykar (not elevated)
+  - Have a clean, minimal environment (don't leak `VYKAR_PASSPHRASE` or key material)
   - Have a timeout to prevent hangs
   - Have their exit codes checked (`before` hooks should abort on failure)
-- **Config file hook injection.** If the config is writable by other users, they can inject hooks. The config file should be owned by the user running vger, with permissions 0600 or 0644.
-- **Per-repo hooks in untrusted repos.** If hooks can be stored in the repository itself (like `.vger-hooks`), this is a remote code execution vector. vger should NOT load hooks from repositories — only from the local config file. Kopia requires explicit `--enable-actions` for this reason.
+- **Config file hook injection.** If the config is writable by other users, they can inject hooks. The config file should be owned by the user running vykar, with permissions 0600 or 0644.
+- **Per-repo hooks in untrusted repos.** If hooks can be stored in the repository itself (like `.vykar-hooks`), this is a remote code execution vector. vykar should NOT load hooks from repositories — only from the local config file. Kopia requires explicit `--enable-actions` for this reason.
 
 ### 5. Configuration Parsing and Input Validation
 
 **What to check:**
 
-- **YAML parsing safety.** YAML has dangerous features (arbitrary code execution in some parsers, billion laughs DoS via entity expansion). Verify vger uses `serde_yaml` or a safe subset parser, not a parser that supports tags or arbitrary constructors.
+- **YAML parsing safety.** YAML has dangerous features (arbitrary code execution in some parsers, billion laughs DoS via entity expansion). Verify vykar uses `serde_yaml` or a safe subset parser, not a parser that supports tags or arbitrary constructors.
 - **Parser resource limits.** Untrusted config and remote metadata parsing should enforce size/depth limits to prevent recursion bombs, deep nesting stack overflows, and memory exhaustion.
 - **Deserialization hardening.** Use dedicated input DTOs and `#[serde(deny_unknown_fields)]` where practical. Avoid deserializing untrusted payloads directly into internal privileged structs.
 - **Path traversal.** Source directories, exclude patterns, and restore targets must be validated:
@@ -138,7 +138,7 @@ Hooks (`before_backup`, `after`, `failed`, etc.) execute arbitrary shell command
 **What to check:**
 
 - **Minimize `unsafe` blocks.** Every `unsafe` block should have a `// SAFETY:` comment explaining why it's safe. Flag any `unsafe` without justification.
-- **FFI boundaries.** If vger calls into C libraries (libzstd, liblz4, OpenSSL), check:
+- **FFI boundaries.** If vykar calls into C libraries (libzstd, liblz4, OpenSSL), check:
   - Buffer sizes are validated before passing to C functions
   - Return values are checked for errors
   - Pointers are valid for the expected lifetime
@@ -171,11 +171,11 @@ Hooks (`before_backup`, `after`, `failed`, etc.) execute arbitrary shell command
 - **TLS certificate validation.** Must be enabled by default. Any option to disable TLS verification should require an explicit flag and print a prominent warning. Never skip certificate validation silently.
 - **Danger flags in HTTP clients.** Explicitly flag `danger_accept_invalid_certs(true)` and similar bypasses in `reqwest`/HTTP stacks; these should never be enabled in production paths.
 - **Credential handling for cloud backends.**
-  - AWS credentials should come from the standard credential chain (env vars, instance profile, config file), never from the vger config
-  - SFTP keys should be handled by the system SSH agent, not stored in vger's config
+  - AWS credentials should come from the standard credential chain (env vars, instance profile, config file), never from the vykar config
+  - SFTP keys should be handled by the system SSH agent, not stored in vykar's config
   - REST API tokens should use environment variables or a credential helper
 - **Request signing.** S3 requests must use SigV4 signing. Check for any fallback to unsigned requests.
-- **Bandwidth limiting.** If vger supports `--limit-upload` / `--limit-download`, verify the rate limiting doesn't have timing side channels that leak information about data content.
+- **Bandwidth limiting.** If vykar supports `--limit-upload` / `--limit-download`, verify the rate limiting doesn't have timing side channels that leak information about data content.
 - **HTTP parser/protocol hardening.** Review handling of `Content-Length` / `Transfer-Encoding` combinations and malformed headers to avoid request smuggling classes seen in `hyper`-ecosystem CVEs.
 - **DoS controls.** Require connection timeouts, request/body size limits, and concurrency caps to reduce slowloris and frame-flooding style attacks.
 - **Error message information leakage.** Cloud backend errors should not expose internal paths, credentials, or bucket structures in user-facing error messages or logs.
@@ -186,7 +186,7 @@ These are unique to backup tools and not covered by generic security checklists.
 
 **What to check:**
 
-- **Append-only mode bypass.** If vger supports append-only repositories (for ransomware protection), verify that:
+- **Append-only mode bypass.** If vykar supports append-only repositories (for ransomware protection), verify that:
   - `forget` and `prune` are genuinely blocked, not just at the CLI level
   - The server/storage enforces the policy, not just the client
   - An attacker can't trick `forget` into deleting valid snapshots by adding fake ones
@@ -204,7 +204,7 @@ These are unique to backup tools and not covered by generic security checklists.
 
 **What to check:**
 
-- **Parallel backup safety.** If multiple vger instances back up to the same repo concurrently, verify:
+- **Parallel backup safety.** If multiple vykar instances back up to the same repo concurrently, verify:
   - No data corruption from concurrent writes
   - Index updates are atomic or use a conflict-resolution strategy
   - No chunk is partially written and then referenced by another process

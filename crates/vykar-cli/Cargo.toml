@@ -1,0 +1,36 @@
+[package]
+name = "vykar-cli"
+version = "0.10.2"
+edition = "2021"
+license = "GPL-3.0-only"
+
+[[bin]]
+name = "vykar"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+vykar-core = { workspace = true, features = ["mount", "backend-sftp"] }
+vykar-types.workspace = true
+vykar-storage.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_yaml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+comfy-table = "7"
+chrono.workspace = true
+hex.workspace = true
+rand.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Console"] }

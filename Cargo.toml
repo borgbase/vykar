@@ -1,23 +1,23 @@
 [workspace]
 members = [
-    "crates/vger-types",
-    "crates/vger-crypto",
-    "crates/vger-storage",
-    "crates/vger-core",
-    "crates/vger-cli",
-    "crates/vger-server",
-    "crates/vger-gui",
-    "crates/vger-protocol",
+    "crates/vykar-types",
+    "crates/vykar-crypto",
+    "crates/vykar-storage",
+    "crates/vykar-core",
+    "crates/vykar-cli",
+    "crates/vykar-server",
+    "crates/vykar-gui",
+    "crates/vykar-protocol",
 ]
 resolver = "2"
 
 [workspace.dependencies]
 # Internal crates
-vger-types = { path = "crates/vger-types" }
-vger-crypto = { path = "crates/vger-crypto" }
-vger-storage = { path = "crates/vger-storage" }
-vger-core = { path = "crates/vger-core" }
-vger-protocol = { path = "crates/vger-protocol" }
+vykar-types = { path = "crates/vykar-types" }
+vykar-crypto = { path = "crates/vykar-crypto" }
+vykar-storage = { path = "crates/vykar-storage" }
+vykar-core = { path = "crates/vykar-core" }
+vykar-protocol = { path = "crates/vykar-protocol" }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

@@ -16,7 +16,7 @@ Repeat Docker-style container workflow tests using Podman command equivalents:
 
 1. Ensure Podman is installed and functional
 2. If rootless mode fails (e.g., missing `newuidmap`), use `sudo podman ...`
-3. Use `sudo vger ...` when backing up paths under `/var/lib/containers/storage/volumes/...`
+3. Use `sudo vykar ...` when backing up paths under `/var/lib/containers/storage/volumes/...`
 4. Create equivalent test containers/volumes as used in Docker tests
 
 ## Command Translation
@@ -64,7 +64,7 @@ Validate artifact naming and size.
 
 Run at least one Podman scenario per backend:
 1. **local** — full matrix
-2. **rest** — at least one scenario against local `vger-server`
+2. **rest** — at least one scenario against local `vykar-server`
 3. **s3** — at least one scenario
 4. **sftp** — bounded probe with timeouts
 

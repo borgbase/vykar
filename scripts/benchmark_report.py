@@ -16,8 +16,8 @@ from typing import Dict, List
 
 
 OPS: List[str] = [
-    "vger_backup",
-    "vger_restore",
+    "vykar_backup",
+    "vykar_restore",
     "restic_backup",
     "restic_restore",
     "rustic_backup",
@@ -28,7 +28,7 @@ OPS: List[str] = [
     "kopia_restore",
 ]
 
-TOOLS: List[str] = ["vger", "restic", "rustic", "borg", "kopia"]
+TOOLS: List[str] = ["vykar", "restic", "rustic", "borg", "kopia"]
 
 TIMEV_FIELDS = {
     "elapsed": "Elapsed (wall clock) time (h:mm:ss or m:ss)",
@@ -69,7 +69,7 @@ def parse_repo_sizes(path: pathlib.Path) -> Dict[str, str]:
     if not path.exists():
         return out
     tool_map = {
-        "bench-vger": "vger",
+        "bench-vykar": "vykar",
         "bench-restic": "restic",
         "bench-rustic": "rustic",
         "bench-borg": "borg",
@@ -708,7 +708,7 @@ def generate_chart_with_deps(
                 cmd.extend(["--selected-tool", selected_tool])
         return subprocess.call(cmd)
 
-    tools_display = ["V'Ger", "Restic", "Rustic", "Borg", "Kopia"]
+    tools_display = ["Vykar", "Restic", "Rustic", "Borg", "Kopia"]
     duration = _chart_values(records, "duration_s")
     cpu_seconds = _chart_values(records, "cpu_s")
     user_seconds = _chart_values(records, "user_s")
@@ -721,8 +721,8 @@ def generate_chart_with_deps(
     repo_size_gb["restore"] = [v / 1_000_000_000.0 if not math.isnan(v) else v for v in repo_size_gb["restore"]]
 
     # Match the original benchmark chart style.
-    VGER = "#fb8c00"
-    VGER_LIGHT = "#ffb74d"
+    VYKAR = "#fb8c00"
+    VYKAR_LIGHT = "#ffb74d"
     OTHER = "#546e7a"
     OTHER_LIGHT = "#78909c"
     BG = "#1a2327"
@@ -742,10 +742,10 @@ def generate_chart_with_deps(
     x = np.arange(len(TOOLS))
     w = 0.32
 
-    backup_colors = [VGER if t == "V'Ger" else OTHER for t in tools_display]
-    restore_colors = [VGER_LIGHT if t == "V'Ger" else OTHER_LIGHT for t in tools_display]
-    backup_top_colors = ["#f57c00" if t == "V'Ger" else "#455a64" for t in tools_display]
-    restore_top_colors = ["#ffa726" if t == "V'Ger" else "#607d8b" for t in tools_display]
+    backup_colors = [VYKAR if t == "Vykar" else OTHER for t in tools_display]
+    restore_colors = [VYKAR_LIGHT if t == "Vykar" else OTHER_LIGHT for t in tools_display]
+    backup_top_colors = ["#f57c00" if t == "Vykar" else "#455a64" for t in tools_display]
+    restore_top_colors = ["#ffa726" if t == "Vykar" else "#607d8b" for t in tools_display]
 
     def style_axis(
         ax,
@@ -757,8 +757,8 @@ def generate_chart_with_deps(
         ax.set_xticks(x)
         ax.set_xticklabels(tools_display, fontsize=10)
         for label in ax.get_xticklabels():
-            if "V'Ger" in label.get_text():
-                label.set_color(VGER)
+            if "Vykar" in label.get_text():
+                label.set_color(VYKAR)
                 label.set_fontweight("bold")
         arrow = "↑" if higher_is_better else "↓"
         qualifier = qualifier_override if qualifier_override is not None else (
@@ -938,8 +938,8 @@ def generate_chart_with_deps(
         ax_bot.set_xticks(x)
         ax_bot.set_xticklabels(tools_display, fontsize=10)
         for label in ax_bot.get_xticklabels():
-            if "V'Ger" in label.get_text():
-                label.set_color(VGER)
+            if "Vykar" in label.get_text():
+                label.set_color(VYKAR)
                 label.set_fontweight("bold")
         ax_top.set_xticks([])
         ax_top.set_title("Peak Memory (MB)  (↓ lower is better)", fontsize=10, color="#cfd8dc", pad=10)
@@ -1026,8 +1026,8 @@ def generate_chart_with_deps(
         ax_bot.set_xticks(x)
         ax_bot.set_xticklabels(tools_display, fontsize=10)
         for label in ax_bot.get_xticklabels():
-            if "V'Ger" in label.get_text():
-                label.set_color(VGER)
+            if "Vykar" in label.get_text():
+                label.set_color(VYKAR)
                 label.set_fontweight("bold")
         ax_top.set_xticks([])
         ax_top.set_title("I/O Wait Events  (↓ lower is better)", fontsize=10, color="#cfd8dc", pad=10)
@@ -1088,8 +1088,8 @@ def generate_chart_with_deps(
     )
 
     legend_elements = [
-        Patch(facecolor=VGER, label="V'Ger backup"),
-        Patch(facecolor=VGER_LIGHT, label="V'Ger restore"),
+        Patch(facecolor=VYKAR, label="Vykar backup"),
+        Patch(facecolor=VYKAR_LIGHT, label="Vykar restore"),
         Patch(facecolor=OTHER, label="Others backup"),
         Patch(facecolor=OTHER_LIGHT, label="Others restore"),
     ]

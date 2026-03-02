@@ -1,18 +1,18 @@
 ---
 name: btrfs
-description: "Validate Btrfs snapshot hooks pattern from vger recipes"
+description: "Validate Btrfs snapshot hooks pattern from vykar recipes"
 ---
 
 # Btrfs Filesystem Snapshots
 
 ## Goal
 
-Validate vger's filesystem snapshot backup pattern for Btrfs using hooks:
+Validate vykar's filesystem snapshot backup pattern for Btrfs using hooks:
 1. Create a read-only snapshot before backup
 2. Back up the snapshot path
 3. Delete the snapshot after backup
 
-Recipe reference: https://vger.borgbase.com/recipes#filesystem-snapshots (Btrfs section)
+Recipe reference: https://vykar.borgbase.com/recipes#filesystem-snapshots (Btrfs section)
 
 ## Safety Gate (REQUIRED)
 
@@ -48,7 +48,7 @@ sudo mount /dev/<test_partition> /mnt/btrfs-test
 
 ## Source Definition
 
-Configure in vger config:
+Configure in vykar config:
 ```yaml
 sources:
   - path: /mnt/btrfs-test/.snapshots/data-backup
@@ -58,20 +58,20 @@ sources:
       after: btrfs subvolume delete /mnt/btrfs-test/.snapshots/data-backup
 ```
 
-Use `sudo vger` since the source path is root-owned.
+Use `sudo vykar` since the source path is root-owned.
 
 ## Run Matrix
 
 1. `local` repository first
-2. `rest` second (local `vger-server`)
+2. `rest` second (local `vykar-server`)
 3. `s3` third
 4. `sftp` optional and last (use `timeout` wrappers, skip if unstable)
 
 ## Validation
 
-1. `vger backup` exits 0
-2. `vger list` shows new snapshot for `btrfs-data`
-3. `vger --config <config> snapshot list -R <repo> <id>` includes seeded files
+1. `vykar backup` exits 0
+2. `vykar list` shows new snapshot for `btrfs-data`
+3. `vykar --config <config> snapshot list -R <repo> <id>` includes seeded files
 4. Hook cleanup verified:
    ```bash
    test ! -d /mnt/btrfs-test/.snapshots/data-backup

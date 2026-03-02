@@ -1,10 +1,10 @@
-# Contributing to V'Ger
+# Contributing to Vykar
 
 Thanks for your interest in contributing!
 
 ## How to contribute
 
-1. **Open an issue first.** Before writing any code, please [open an issue](https://github.com/borgbase/vger/issues) describing the bug or feature. This lets us discuss the approach before you invest time on a PR.
+1. **Open an issue first.** Before writing any code, please [open an issue](https://github.com/borgbase/vykar/issues) describing the bug or feature. This lets us discuss the approach before you invest time on a PR.
 
 2. **PRs require an approved issue.** Pull requests are only accepted for issues that have been triaged and approved. If you open a PR without a corresponding issue, you'll be asked to create one first.
 

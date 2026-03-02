@@ -23,14 +23,14 @@ test:
 
 pre-commit: fmt-check lint test
 
-APP_BUNDLE = target/release/Vger Backup.app
+APP_BUNDLE = target/release/Vykar Backup.app
 
 app:
-	cargo build --release -p vger-gui
-	crates/vger-gui/macos/create-icns.sh docs/src/images/logo-colored-gradient.svg target/AppIcon.icns
+	cargo build --release -p vykar-gui
+	crates/vykar-gui/macos/create-icns.sh docs/src/images/logo-colored-gradient.svg target/AppIcon.icns
 	mkdir -p "$(APP_BUNDLE)/Contents/MacOS" "$(APP_BUNDLE)/Contents/Resources"
-	cp crates/vger-gui/macos/Info.plist "$(APP_BUNDLE)/Contents/"
-	cp target/release/vger-gui "$(APP_BUNDLE)/Contents/MacOS/"
+	cp crates/vykar-gui/macos/Info.plist "$(APP_BUNDLE)/Contents/"
+	cp target/release/vykar-gui "$(APP_BUNDLE)/Contents/MacOS/"
 	cp target/AppIcon.icns "$(APP_BUNDLE)/Contents/Resources/"
 
 docs-build:

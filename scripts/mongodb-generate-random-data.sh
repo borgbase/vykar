@@ -16,7 +16,7 @@ Required:
 
 Options:
   --target-gib N             Target database size in GiB (default: 10)
-  --db NAME                  Database name (default: vger_mongo_test)
+  --db NAME                  Database name (default: vykar_mongo_test)
   --batch-size N             Documents inserted per growth batch (default: 2000)
   --payload-bytes N          Approx bytes in random payload field (default: 8192)
   --max-batches N            Safety cap for growth loop (default: 20000)
@@ -25,14 +25,14 @@ Options:
   --help                     Show help
 
 Examples:
-  $(basename "$0") --container vger-mongo --target-gib 10
-  $(basename "$0") --container vger-mongo --batch-size 1000 --payload-bytes 12288
+  $(basename "$0") --container vykar-mongo --target-gib 10
+  $(basename "$0") --container vykar-mongo --batch-size 1000 --payload-bytes 12288
 USAGE
 }
 
 CONTAINER=""
 TARGET_GIB=10
-DB_NAME="vger_mongo_test"
+DB_NAME="vykar_mongo_test"
 BATCH_SIZE=2000
 PAYLOAD_BYTES=8192
 MAX_BATCHES=20000
@@ -93,13 +93,13 @@ cleanup() {
 trap cleanup EXIT
 
 cat >"$JS_FILE" <<'JS'
-const dbName = process.env.VGER_DB_NAME;
-const targetBytes = Number(process.env.VGER_TARGET_BYTES);
-const batchSize = Number(process.env.VGER_BATCH_SIZE);
-const payloadBytes = Number(process.env.VGER_PAYLOAD_BYTES);
-const maxBatches = Number(process.env.VGER_MAX_BATCHES);
-const progressEvery = Number(process.env.VGER_PROGRESS_EVERY);
-const recreateDb = process.env.VGER_RECREATE_DB === "1";
+const dbName = process.env.VYKAR_DB_NAME;
+const targetBytes = Number(process.env.VYKAR_TARGET_BYTES);
+const batchSize = Number(process.env.VYKAR_BATCH_SIZE);
+const payloadBytes = Number(process.env.VYKAR_PAYLOAD_BYTES);
+const maxBatches = Number(process.env.VYKAR_MAX_BATCHES);
+const progressEvery = Number(process.env.VYKAR_PROGRESS_EVERY);
+const recreateDb = process.env.VYKAR_RECREATE_DB === "1";
 
 if (!dbName || !Number.isFinite(targetBytes) || targetBytes < 0) {
   throw new Error("invalid script inputs");
@@ -278,11 +278,11 @@ JS
 log "seeding/filling db=$DB_NAME target_bytes=$TARGET_BYTES (~${TARGET_GIB}GiB)"
 sudo -n docker cp "$JS_FILE" "$CONTAINER:$CONTAINER_JS_FILE"
 sudo -n docker exec \
-  -e VGER_DB_NAME="$DB_NAME" \
-  -e VGER_TARGET_BYTES="$TARGET_BYTES" \
-  -e VGER_BATCH_SIZE="$BATCH_SIZE" \
-  -e VGER_PAYLOAD_BYTES="$PAYLOAD_BYTES" \
-  -e VGER_MAX_BATCHES="$MAX_BATCHES" \
-  -e VGER_PROGRESS_EVERY="$PROGRESS_EVERY" \
-  -e VGER_RECREATE_DB="$RECREATE_DB" \
+  -e VYKAR_DB_NAME="$DB_NAME" \
+  -e VYKAR_TARGET_BYTES="$TARGET_BYTES" \
+  -e VYKAR_BATCH_SIZE="$BATCH_SIZE" \
+  -e VYKAR_PAYLOAD_BYTES="$PAYLOAD_BYTES" \
+  -e VYKAR_MAX_BATCHES="$MAX_BATCHES" \
+  -e VYKAR_PROGRESS_EVERY="$PROGRESS_EVERY" \
+  -e VYKAR_RECREATE_DB="$RECREATE_DB" \
   "$CONTAINER" mongosh --quiet "$CONTAINER_JS_FILE"

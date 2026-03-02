@@ -878,6 +878,88 @@ fn save_state_rebases_pack_counters() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Cross-session pending index recovery
+// ---------------------------------------------------------------------------
+
+#[test]
+fn cross_session_pending_index_recovery() {
+    use crate::config::{RepositoryConfig, RetryConfig};
+
+    crate::testutil::init_test_environment();
+
+    // Use tiny pack sizes so chunks trigger pack flushes.
+    let small_config = RepositoryConfig {
+        url: String::new(),
+        region: None,
+        access_key_id: None,
+        secret_access_key: None,
+        sftp_key: None,
+        sftp_known_hosts: None,
+        sftp_max_connections: None,
+        access_token: None,
+        allow_insecure_http: false,
+        min_pack_size: 256,
+        max_pack_size: 256,
+        retry: RetryConfig::default(),
+    };
+
+    // Session 1: init repo, store chunks, flush, write pending index, then drop.
+    let mut repo = Repository::init(
+        Box::new(MemoryBackend::new()),
+        EncryptionMode::None,
+        ChunkerConfig::default(),
+        None,
+        Some(&small_config),
+        None,
+    )
+    .unwrap();
+    repo.begin_write_session().unwrap();
+    repo.set_write_session_id("aaa".to_string());
+
+    // Store several chunks large enough to trigger pack flushes.
+    let mut chunk_ids = Vec::new();
+    for i in 0u32..3 {
+        let mut data = vec![0xABu8; 300];
+        data[..4].copy_from_slice(&i.to_le_bytes());
+        let (chunk_id, _, _) = repo
+            .store_chunk(&data, Compression::None, PackType::Data)
+            .unwrap();
+        chunk_ids.push(chunk_id);
+    }
+
+    // Simulate crash: flush packs and write pending index, but don't commit.
+    repo.flush_on_abort();
+
+    // Verify the journal exists under the old session ID.
+    assert!(
+        repo.storage.exists("sessions/aaa.index").unwrap(),
+        "sessions/aaa.index should exist after flush_on_abort"
+    );
+
+    // Save the storage Arc for reuse.
+    let shared_storage = repo.storage.clone();
+    drop(repo);
+
+    // Session 2: reopen the same repo with a different session ID.
+    let mut repo2 = Repository::open(Box::new(shared_storage), None, None).unwrap();
+    repo2.begin_write_session().unwrap();
+    repo2.set_write_session_id("bbb".to_string());
+
+    let recovered = repo2.recover_pending_index().unwrap();
+    assert!(
+        recovered > 0,
+        "should recover chunks from session aaa's journal, got {recovered}"
+    );
+
+    // Verify that the recovered chunk count matches what we stored.
+    assert_eq!(
+        recovered,
+        chunk_ids.len(),
+        "recovered count should match stored chunk count"
+    );
+}
+
 /// Verify that tree packs in the persisted index are included in the initial
 /// data pack target calculation. This is a known limitation: the persisted
 /// `ChunkIndex` does not distinguish data packs from tree packs, so

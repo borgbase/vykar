@@ -1087,6 +1087,11 @@ impl Repository {
             self.rebuild_dedup_cache = false;
         }
 
+        // Clean up recovered index journals from previous interrupted sessions.
+        if let Some(ws) = self.write_session.as_mut() {
+            ws.cleanup_recovered_indices(&*self.storage);
+        }
+
         // Consume write session.
         self.write_session = None;
 

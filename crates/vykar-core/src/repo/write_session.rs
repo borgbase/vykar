@@ -16,7 +16,7 @@ use vykar_types::error::{Result, VykarError};
 use vykar_types::pack_id::PackId;
 
 use super::format::{pack_object_with_context, unpack_object_expect_with_context, ObjectType};
-use super::lock::session_index_key;
+use super::lock::{session_index_key, SessionEntry, SESSIONS_PREFIX};
 use super::pack::{PackType, PackWriter, PackedChunkEntry};
 
 /// Extra upload handles allowed beyond `max_in_flight_uploads` before blocking.
@@ -27,6 +27,31 @@ const JOURNAL_WRITE_INTERVAL: usize = 8;
 
 const DEFAULT_SESSION_ID: &str = "default";
 const PENDING_INDEX_OBJECT_CONTEXT: &[u8] = b"pending_index";
+
+/// Sessions with markers older than this are considered stale for recovery.
+/// 3x the 15-minute refresh interval — if a session missed 2 refreshes, it's dead.
+const RECOVERY_STALE_SECS: i64 = 45 * 60;
+
+/// Result of attempting to recover a single session's pending index journal.
+enum RecoverResult {
+    /// No journal data found at key.
+    NotFound,
+    /// Journal was corrupt (decrypt/decompress/deserialize failed).
+    Corrupt,
+    /// Successfully recovered N chunk entries (may be 0 if all already indexed).
+    Ok(usize),
+}
+
+/// Marker state for a session's `.json` file during recovery scanning.
+#[derive(Debug)]
+enum MarkerState {
+    /// Marker exists, parseable, `last_refresh` < RECOVERY_STALE_SECS ago.
+    Active,
+    /// Marker exists, parseable, `last_refresh` >= RECOVERY_STALE_SECS ago.
+    Stale,
+    /// Marker exists but unreadable or unparseable.
+    Unknown,
+}
 
 /// Tracks index mutations during a streaming command dump so they can be
 /// rolled back if the dump command fails mid-stream.
@@ -71,6 +96,11 @@ pub(crate) struct WriteSessionState {
     pub(crate) pending_journal_last_written: usize,
     /// Chunks recovered from a previous interrupted session's `pending_index`.
     pub(crate) recovered_chunks: StdHashMap<ChunkId, RecoveredChunkEntry>,
+    /// `.index` keys to delete after successful commit.
+    /// `.json` markers are never deleted here — their lifecycle is managed
+    /// exclusively by `deregister_session()` (normal exit) and
+    /// `cleanup_stale_sessions()` (72h threshold, under maintenance lock).
+    pub(crate) recovered_index_keys: Vec<String>,
     /// Number of distinct packs (data + tree) in the persisted index at load time.
     pub(crate) persisted_pack_count: usize,
     /// Number of data packs flushed during the current session.
@@ -102,6 +132,7 @@ impl WriteSessionState {
             pending_journal: PendingIndexJournal::new(),
             pending_journal_last_written: 0,
             recovered_chunks: StdHashMap::new(),
+            recovered_index_keys: Vec::new(), // only .index keys, never .json
             persisted_pack_count: 0,
             session_packs_flushed: 0,
             session_id: DEFAULT_SESSION_ID.to_string(),
@@ -319,21 +350,121 @@ impl WriteSessionState {
 
     // --- Recovery ---
 
-    /// Recover chunk→pack mappings from a previous interrupted session's
-    /// `pending_index` file. Verifies each pack exists before adding entries.
+    /// Recover chunk→pack mappings from previous interrupted sessions'
+    /// `pending_index` files. Scans all `.index` files under `sessions/`,
+    /// classifying each by its companion `.json` marker state.
+    ///
+    /// A journal is recoverable if it is **orphaned** (no companion `.json`)
+    /// or **stale** (companion `.json` has `last_refresh` older than 45 min).
+    /// Active sessions and sessions with unreadable markers are skipped.
     ///
     /// Must be called inside the repo lock, before `enable_tiered_dedup_mode()`.
-    /// Returns the number of recovered chunk entries.
+    /// Returns the total number of recovered chunk entries.
     pub(crate) fn recover_pending_index(
         &mut self,
         storage: &dyn StorageBackend,
         crypto: &dyn CryptoEngine,
         chunk_index: &ChunkIndex,
     ) -> Result<usize> {
-        let key = self.pending_index_key();
-        let data = match storage.get(&key)? {
+        let all_keys = storage.list(SESSIONS_PREFIX)?;
+        let now = chrono::Utc::now();
+
+        // Build marker state map from .json keys.
+        let mut marker_states: StdHashMap<String, MarkerState> = StdHashMap::new();
+        for key in &all_keys {
+            let Some(session_id) = key
+                .strip_prefix(SESSIONS_PREFIX)
+                .and_then(|s| s.strip_suffix(".json"))
+            else {
+                continue;
+            };
+            let state = match storage.get(key) {
+                Ok(Some(data)) => match serde_json::from_slice::<SessionEntry>(&data) {
+                    Ok(entry) => {
+                        let ts = chrono::DateTime::parse_from_rfc3339(&entry.last_refresh).or_else(
+                            |_| chrono::DateTime::parse_from_rfc3339(&entry.registered_at),
+                        );
+                        match ts {
+                            Ok(ts) => {
+                                let age = now.signed_duration_since(ts.with_timezone(&chrono::Utc));
+                                if age.num_seconds() >= RECOVERY_STALE_SECS {
+                                    MarkerState::Stale
+                                } else {
+                                    MarkerState::Active
+                                }
+                            }
+                            Err(_) => MarkerState::Unknown,
+                        }
+                    }
+                    Err(_) => MarkerState::Unknown,
+                },
+                _ => MarkerState::Unknown,
+            };
+            marker_states.insert(session_id.to_string(), state);
+        }
+
+        // Collect .index keys, skip our own session.
+        let my_key = self.pending_index_key();
+        let index_keys: Vec<(String, String)> = all_keys
+            .iter()
+            .filter_map(|key| {
+                let session_id = key
+                    .strip_prefix(SESSIONS_PREFIX)
+                    .and_then(|s| s.strip_suffix(".index"))?;
+                Some((key.clone(), session_id.to_string()))
+            })
+            .filter(|(key, _)| *key != my_key)
+            .collect();
+
+        let mut total_recovered = 0usize;
+        for (index_key, session_id) in &index_keys {
+            match marker_states.get(session_id) {
+                None => {}                     // orphan — no .json, recoverable
+                Some(MarkerState::Stale) => {} // stale — recoverable
+                Some(MarkerState::Active) => continue,
+                Some(MarkerState::Unknown) => continue,
+            };
+
+            match self.recover_single_index(storage, crypto, chunk_index, index_key) {
+                Ok(RecoverResult::Ok(n)) => {
+                    self.recovered_index_keys.push(index_key.clone());
+                    total_recovered += n;
+                }
+                Ok(RecoverResult::Corrupt) => {
+                    // Only delete the corrupt .index — never touch .json markers.
+                    // Session marker lifecycle is managed by deregister_session()
+                    // and cleanup_stale_sessions() (72h, under maintenance lock).
+                    warn!(key = %index_key, "corrupt pending index journal, deleting");
+                    let _ = storage.delete(index_key);
+                }
+                Ok(RecoverResult::NotFound) => {}
+                Err(e) => {
+                    warn!(key = %index_key, error = %e, "failed to recover pending index, skipping");
+                }
+            }
+        }
+
+        if total_recovered > 0 {
+            warn!(
+                recovered_chunks = total_recovered,
+                journals = self.recovered_index_keys.len(),
+                "recovered pending index entries from interrupted sessions"
+            );
+        }
+        Ok(total_recovered)
+    }
+
+    /// Attempt to recover a single session's pending index journal.
+    fn recover_single_index(
+        &mut self,
+        storage: &dyn StorageBackend,
+        crypto: &dyn CryptoEngine,
+        chunk_index: &ChunkIndex,
+        key: &str,
+    ) -> Result<RecoverResult> {
+        let data = match storage.get(key)? {
             Some(d) => d,
-            None => return Ok(0),
+            None => return Ok(RecoverResult::NotFound),
         };
 
         let compressed = match unpack_object_expect_with_context(
@@ -344,28 +475,29 @@ impl WriteSessionState {
         ) {
             Ok(c) => c,
             Err(e) => {
-                warn!("pending_index: decrypt failed, skipping recovery: {e}");
-                return Ok(0);
+                warn!(key = %key, error = %e, "pending_index: decrypt failed");
+                return Ok(RecoverResult::Corrupt);
             }
         };
 
         let serialized = match compress::decompress_metadata(&compressed) {
             Ok(s) => s,
             Err(e) => {
-                warn!("pending_index: decompress failed, skipping recovery: {e}");
-                return Ok(0);
+                warn!(key = %key, error = %e, "pending_index: decompress failed");
+                return Ok(RecoverResult::Corrupt);
             }
         };
 
         let wire: Vec<crate::index::PendingPackEntry> = match rmp_serde::from_slice(&serialized) {
             Ok(w) => w,
             Err(e) => {
-                warn!("pending_index: deserialize failed, skipping recovery: {e}");
-                return Ok(0);
+                warn!(key = %key, error = %e, "pending_index: deserialize failed");
+                return Ok(RecoverResult::Corrupt);
             }
         };
 
-        warn!(
+        debug!(
+            key = %key,
             packs = wire.len(),
             "found pending index from interrupted session, verifying packs\u{2026}"
         );
@@ -428,11 +560,12 @@ impl WriteSessionState {
         }
 
         debug!(
+            key = %key,
             packs = wire.len(),
             recovered_chunks = recovered,
             "recovered pending_index entries"
         );
-        Ok(recovered)
+        Ok(RecoverResult::Ok(recovered))
     }
 
     /// Best-effort delete of the session's pending index file from storage.
@@ -444,6 +577,18 @@ impl WriteSessionState {
             }
             Err(e) => {
                 warn!(key = %key, "failed to clear pending_index: {e}");
+            }
+        }
+    }
+
+    /// Delete recovered `.index` files from storage after successful commit.
+    /// Never deletes `.json` markers — their lifecycle is managed by
+    /// `deregister_session()` and `cleanup_stale_sessions()`.
+    /// Best-effort: logs on failure.
+    pub(crate) fn cleanup_recovered_indices(&mut self, storage: &dyn StorageBackend) {
+        for index_key in self.recovered_index_keys.drain(..) {
+            if let Err(e) = storage.delete(&index_key) {
+                warn!(key = %index_key, error = %e, "failed to delete recovered index journal");
             }
         }
     }
@@ -522,5 +667,313 @@ impl WriteSessionState {
             return Some(s);
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::compress;
+    use crate::index::{ChunkIndex, PendingChunkEntry, PendingPackEntry};
+    use crate::repo::format::{pack_object_with_context, ObjectType};
+    use crate::repo::lock::{session_index_key, session_marker_key, SessionEntry};
+    use crate::testutil::{init_test_environment, MemoryBackend};
+    use vykar_crypto::PlaintextEngine;
+
+    /// Create a PlaintextEngine for tests.
+    fn test_crypto() -> PlaintextEngine {
+        PlaintextEngine::new(&[0xAA; 32])
+    }
+
+    /// Write a valid pending index journal to storage at the given key.
+    /// Returns the PackId and ChunkId used.
+    fn write_valid_journal(
+        storage: &dyn StorageBackend,
+        crypto: &dyn CryptoEngine,
+        key: &str,
+    ) -> (PackId, ChunkId) {
+        let pack_id = PackId([0x11; 32]);
+        let chunk_id = ChunkId([0x22; 32]);
+
+        // Create the pack file so verification passes.
+        let pack_key = pack_id.storage_key();
+        storage.put(&pack_key, b"fake pack data").unwrap();
+
+        let entries = vec![PendingPackEntry {
+            pack_id,
+            chunks: vec![PendingChunkEntry {
+                chunk_id,
+                stored_size: 100,
+                pack_offset: 0,
+            }],
+        }];
+
+        let serialized = rmp_serde::to_vec(&entries).unwrap();
+        let compressed =
+            compress::compress(compress::Compression::Zstd { level: 3 }, &serialized).unwrap();
+        let packed = pack_object_with_context(
+            ObjectType::PendingIndex,
+            PENDING_INDEX_OBJECT_CONTEXT,
+            &compressed,
+            crypto,
+        )
+        .unwrap();
+        storage.put(key, &packed).unwrap();
+
+        (pack_id, chunk_id)
+    }
+
+    /// Write a session marker JSON with a specific last_refresh time.
+    fn write_session_marker(storage: &dyn StorageBackend, session_id: &str, last_refresh: &str) {
+        let key = session_marker_key(session_id);
+        let entry = SessionEntry {
+            hostname: "test".to_string(),
+            pid: 1234,
+            registered_at: last_refresh.to_string(),
+            last_refresh: last_refresh.to_string(),
+        };
+        let data = serde_json::to_vec(&entry).unwrap();
+        storage.put(&key, &data).unwrap();
+    }
+
+    fn stale_timestamp() -> String {
+        let stale = chrono::Utc::now() - chrono::Duration::hours(2);
+        stale.to_rfc3339()
+    }
+
+    fn fresh_timestamp() -> String {
+        chrono::Utc::now().to_rfc3339()
+    }
+
+    #[test]
+    fn recover_orphan_index_from_different_session() {
+        init_test_environment();
+        let storage = MemoryBackend::new();
+        let crypto = test_crypto();
+        let chunk_index = ChunkIndex::new();
+
+        // Write a valid journal for session "old" with no .json marker.
+        let index_key = session_index_key("old");
+        let (_pack_id, _chunk_id) = write_valid_journal(&storage, &crypto, &index_key);
+
+        // Create a WriteSessionState with a different session ID.
+        let mut ws = WriteSessionState::new(1024, 1024, 1);
+        ws.session_id = "new".to_string();
+
+        let recovered = ws
+            .recover_pending_index(&storage, &crypto, &chunk_index)
+            .unwrap();
+        assert!(recovered > 0, "should recover chunks from orphan journal");
+        assert_eq!(ws.recovered_index_keys.len(), 1);
+        assert_eq!(ws.recovered_index_keys[0], index_key);
+    }
+
+    #[test]
+    fn recover_stale_index() {
+        init_test_environment();
+        let storage = MemoryBackend::new();
+        let crypto = test_crypto();
+        let chunk_index = ChunkIndex::new();
+
+        // Write a stale .json marker and companion .index.
+        write_session_marker(&storage, "stale", &stale_timestamp());
+        let index_key = session_index_key("stale");
+        write_valid_journal(&storage, &crypto, &index_key);
+
+        let mut ws = WriteSessionState::new(1024, 1024, 1);
+        ws.session_id = "current".to_string();
+
+        let recovered = ws
+            .recover_pending_index(&storage, &crypto, &chunk_index)
+            .unwrap();
+        assert!(recovered > 0, "should recover chunks from stale session");
+        assert_eq!(ws.recovered_index_keys.len(), 1);
+        assert_eq!(ws.recovered_index_keys[0], index_key);
+        // .json marker must NOT be tracked for deletion — it's managed by
+        // deregister_session() / cleanup_stale_sessions() only.
+        assert!(
+            storage.exists(&session_marker_key("stale")).unwrap(),
+            "stale .json marker must not be deleted by recovery"
+        );
+    }
+
+    #[test]
+    fn skip_active_session_index() {
+        init_test_environment();
+        let storage = MemoryBackend::new();
+        let crypto = test_crypto();
+        let chunk_index = ChunkIndex::new();
+
+        // Write an active (fresh) .json marker and companion .index.
+        write_session_marker(&storage, "active", &fresh_timestamp());
+        let index_key = session_index_key("active");
+        write_valid_journal(&storage, &crypto, &index_key);
+
+        let mut ws = WriteSessionState::new(1024, 1024, 1);
+        ws.session_id = "current".to_string();
+
+        let recovered = ws
+            .recover_pending_index(&storage, &crypto, &chunk_index)
+            .unwrap();
+        assert_eq!(recovered, 0, "should skip active session's journal");
+        assert!(ws.recovered_index_keys.is_empty());
+    }
+
+    #[test]
+    fn skip_unknown_marker_session_index() {
+        init_test_environment();
+        let storage = MemoryBackend::new();
+        let crypto = test_crypto();
+        let chunk_index = ChunkIndex::new();
+
+        // Write invalid JSON as the session marker.
+        storage
+            .put(&session_marker_key("bad"), b"not valid json")
+            .unwrap();
+        let index_key = session_index_key("bad");
+        write_valid_journal(&storage, &crypto, &index_key);
+
+        let mut ws = WriteSessionState::new(1024, 1024, 1);
+        ws.session_id = "current".to_string();
+
+        let recovered = ws
+            .recover_pending_index(&storage, &crypto, &chunk_index)
+            .unwrap();
+        assert_eq!(
+            recovered, 0,
+            "should skip session with unknown marker state"
+        );
+        assert!(ws.recovered_index_keys.is_empty());
+    }
+
+    #[test]
+    fn mixed_valid_and_corrupt_journals() {
+        init_test_environment();
+        let storage = MemoryBackend::new();
+        let crypto = test_crypto();
+        let chunk_index = ChunkIndex::new();
+
+        // Valid orphan journal.
+        let valid_key = session_index_key("valid");
+        write_valid_journal(&storage, &crypto, &valid_key);
+
+        // Corrupt orphan journal (random bytes).
+        let corrupt_key = session_index_key("corrupt");
+        storage.put(&corrupt_key, b"random garbage").unwrap();
+
+        let mut ws = WriteSessionState::new(1024, 1024, 1);
+        ws.session_id = "current".to_string();
+
+        let recovered = ws
+            .recover_pending_index(&storage, &crypto, &chunk_index)
+            .unwrap();
+        assert!(recovered > 0, "should recover from the valid journal");
+
+        // Valid journal tracked for cleanup.
+        assert_eq!(ws.recovered_index_keys.len(), 1);
+        assert_eq!(ws.recovered_index_keys[0], valid_key);
+
+        // Corrupt journal should have been deleted.
+        assert!(
+            !storage.exists(&corrupt_key).unwrap(),
+            "corrupt .index should be deleted"
+        );
+    }
+
+    #[test]
+    fn corrupt_stale_journal_deletes_index_preserves_json() {
+        init_test_environment();
+        let storage = MemoryBackend::new();
+        let crypto = test_crypto();
+        let chunk_index = ChunkIndex::new();
+
+        // Write a stale .json marker.
+        write_session_marker(&storage, "old", &stale_timestamp());
+        // Write a corrupt .index companion.
+        let index_key = session_index_key("old");
+        storage.put(&index_key, b"corrupt data").unwrap();
+
+        let mut ws = WriteSessionState::new(1024, 1024, 1);
+        ws.session_id = "current".to_string();
+
+        let _recovered = ws
+            .recover_pending_index(&storage, &crypto, &chunk_index)
+            .unwrap();
+
+        // Corrupt .index should be deleted.
+        assert!(
+            !storage.exists(&index_key).unwrap(),
+            "corrupt .index should be deleted"
+        );
+        // .json marker must NOT be deleted — a live backup could still own it.
+        assert!(
+            storage.exists(&session_marker_key("old")).unwrap(),
+            "stale .json must not be deleted by recovery"
+        );
+    }
+
+    #[test]
+    fn zero_recovery_journals_tracked_for_cleanup() {
+        init_test_environment();
+        let storage = MemoryBackend::new();
+        let crypto = test_crypto();
+
+        // Write a valid orphan journal.
+        let index_key = session_index_key("old");
+        let (_pack_id, chunk_id) = write_valid_journal(&storage, &crypto, &index_key);
+
+        // Pre-populate the chunk index so recovery yields 0 new chunks.
+        let mut chunk_index = ChunkIndex::new();
+        chunk_index.add(chunk_id, 100, PackId([0x11; 32]), 0);
+
+        let mut ws = WriteSessionState::new(1024, 1024, 1);
+        ws.session_id = "current".to_string();
+
+        let recovered = ws
+            .recover_pending_index(&storage, &crypto, &chunk_index)
+            .unwrap();
+        assert_eq!(recovered, 0, "all chunks already indexed");
+        // The journal should still be tracked for cleanup.
+        assert_eq!(
+            ws.recovered_index_keys.len(),
+            1,
+            "Ok(0) journal should be tracked for cleanup"
+        );
+    }
+
+    #[test]
+    fn cleanup_deletes_index_files_only() {
+        init_test_environment();
+        let storage = MemoryBackend::new();
+
+        // Simulate an orphan entry (index only, no json).
+        let orphan_index = session_index_key("orphan");
+        storage.put(&orphan_index, b"data").unwrap();
+
+        // Simulate a stale entry (both index and json exist in storage).
+        let stale_index = session_index_key("stale");
+        let stale_json = session_marker_key("stale");
+        storage.put(&stale_index, b"data").unwrap();
+        storage.put(&stale_json, b"data").unwrap();
+
+        let mut ws = WriteSessionState::new(1024, 1024, 1);
+        ws.recovered_index_keys = vec![orphan_index.clone(), stale_index.clone()];
+
+        ws.cleanup_recovered_indices(&storage);
+
+        assert!(
+            !storage.exists(&orphan_index).unwrap(),
+            "orphan .index should be deleted"
+        );
+        assert!(
+            !storage.exists(&stale_index).unwrap(),
+            "stale .index should be deleted"
+        );
+        // .json marker must NOT be touched by cleanup.
+        assert!(
+            storage.exists(&stale_json).unwrap(),
+            "stale .json must not be deleted by cleanup"
+        );
+        assert!(ws.recovered_index_keys.is_empty(), "keys should be drained");
     }
 }

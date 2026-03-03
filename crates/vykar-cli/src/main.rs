@@ -82,6 +82,11 @@ fn main() {
         }
     };
 
+    if all_repos.is_empty() {
+        eprintln!("Error: no repositories configured. Edit your config file and add a 'repositories' section.");
+        std::process::exit(1);
+    }
+
     // Handle `daemon` subcommand early — operates on all repos at once
     if matches!(&cli.command, Some(Commands::Daemon)) {
         let runtime = vykar_core::app::RuntimeConfig {

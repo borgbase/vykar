@@ -285,9 +285,7 @@ pub fn load_and_resolve(path: &Path) -> vykar_types::error::Result<Vec<ResolvedR
 
 fn resolve_document(mut raw: ConfigDocument) -> vykar_types::error::Result<Vec<ResolvedRepo>> {
     if raw.repositories.is_empty() {
-        return Err(vykar_types::error::VykarError::Config(
-            "No repositories configured. Edit your config file and uncomment the 'repositories' section.".into(),
-        ));
+        return Ok(Vec::new());
     }
 
     // Check for duplicate repo labels
@@ -561,7 +559,9 @@ pub fn resolve_config_path(cli_config: Option<&str>) -> Option<ConfigSource> {
 )]
 pub fn load_config(path: &Path) -> vykar_types::error::Result<VykarConfig> {
     let repos = load_and_resolve(path)?;
-    Ok(repos.into_iter().next().unwrap().config)
+    repos.into_iter().next().map(|r| r.config).ok_or_else(|| {
+        vykar_types::error::VykarError::Config("no repositories configured".into())
+    })
 }
 
 /// Returns a minimal YAML config template suitable for bootstrapping.
@@ -691,13 +691,10 @@ mod tests {
             "template should parse as valid YAML: {:?}",
             parsed.err()
         );
-        // But resolve_document should fail because repositories are commented out.
+        // With repositories commented out, resolve_document should return an empty vec.
         let raw = parsed.unwrap();
-        let err = resolve_document(raw).unwrap_err();
-        assert!(
-            err.to_string().contains("No repositories configured"),
-            "unexpected error: {err}"
-        );
+        let result = resolve_document(raw).unwrap();
+        assert!(result.is_empty(), "expected empty vec for template config");
     }
 
     #[test]
@@ -705,6 +702,21 @@ mod tests {
     fn test_load_config_missing_file() {
         let result = load_config(Path::new("/nonexistent/path/config.yaml"));
         assert!(result.is_err());
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn test_load_config_empty_repos() {
+        let yaml = "repositories: []\nencryption:\n  mode: none\n";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        fs::write(&path, yaml).unwrap();
+
+        let err = load_config(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("no repositories configured"),
+            "expected 'no repositories configured' error, got: {err}"
+        );
     }
 
     /// RAII guard to set an env var and restore its previous value on drop.
@@ -1073,7 +1085,7 @@ repositories:
     }
 
     #[test]
-    fn test_reject_missing_repositories() {
+    fn test_missing_repositories_returns_empty_vec() {
         let yaml = r#"
 encryption:
   mode: none
@@ -1082,15 +1094,12 @@ encryption:
         let path = dir.path().join("config.yaml");
         fs::write(&path, yaml).unwrap();
 
-        let err = load_and_resolve(&path).unwrap_err();
-        assert!(
-            err.to_string().contains("No repositories configured"),
-            "unexpected error: {err}"
-        );
+        let result = load_and_resolve(&path).unwrap();
+        assert!(result.is_empty(), "expected empty vec when repositories key is missing");
     }
 
     #[test]
-    fn test_reject_empty_repositories() {
+    fn test_empty_repositories_returns_empty_vec() {
         let yaml = r#"
 repositories: []
 "#;
@@ -1098,12 +1107,8 @@ repositories: []
         let path = dir.path().join("config.yaml");
         fs::write(&path, yaml).unwrap();
 
-        let err = load_and_resolve(&path).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("No repositories configured"),
-            "unexpected error: {msg}"
-        );
+        let result = load_and_resolve(&path).unwrap();
+        assert!(result.is_empty(), "expected empty vec for repositories: []");
     }
 
     #[test]

@@ -669,3 +669,17 @@ fn cli_daemon_on_startup_and_shutdown() {
         output.status
     );
 }
+
+#[test]
+fn cli_empty_config_exits_with_error() {
+    let fx = CliFixture::new();
+    let yaml = "encryption:\n  mode: none\n";
+    std::fs::write(&fx.config_path, yaml).unwrap();
+
+    let cfg = fx.config_path.to_string_lossy().to_string();
+    let (_stdout, stderr) = fx.run_err(&["--config", &cfg, "list"]);
+    assert!(
+        stderr.contains("no repositories configured"),
+        "expected 'no repositories configured' error, got:\n{stderr}"
+    );
+}

@@ -69,11 +69,12 @@ hyper-util = { version = "0.1", features = ["tokio"], optional = true }
 lru = { version = "0.12", optional = true }
 bytes = { version = "1", optional = true }
 futures-util = { version = "0.3", optional = true }
+percent-encoding = { version = "2", optional = true }
 
 [features]
 default = ["backend-sftp"]
 backend-sftp = ["vykar-storage/backend-sftp"]
-mount = ["dav-server", "tokio/rt-multi-thread", "tokio/macros", "tokio/signal", "tokio/net", "hyper", "hyper-util", "lru", "bytes", "futures-util"]
+mount = ["dav-server", "tokio/rt-multi-thread", "tokio/macros", "tokio/signal", "tokio/net", "hyper", "hyper-util", "lru", "bytes", "futures-util", "percent-encoding"]
 
 [dev-dependencies]
 

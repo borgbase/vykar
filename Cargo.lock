@@ -7048,6 +7048,7 @@ dependencies = [
  "lz4_flex",
  "memmap2",
  "nix 0.29.0",
+ "percent-encoding",
  "rand",
  "rayon",
  "rmp",

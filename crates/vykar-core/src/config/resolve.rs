@@ -87,6 +87,7 @@ impl RepositoryEntry {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ConfigDocument {
+    #[serde(default)]
     repositories: Vec<RepositoryEntry>,
     #[serde(default)]
     encryption: EncryptionConfig,
@@ -285,7 +286,7 @@ pub fn load_and_resolve(path: &Path) -> vykar_types::error::Result<Vec<ResolvedR
 fn resolve_document(mut raw: ConfigDocument) -> vykar_types::error::Result<Vec<ResolvedRepo>> {
     if raw.repositories.is_empty() {
         return Err(vykar_types::error::VykarError::Config(
-            "'repositories:' must not be empty".into(),
+            "No repositories configured. Edit your config file and uncomment the 'repositories' section.".into(),
         ));
     }
 
@@ -569,11 +570,11 @@ pub fn minimal_config_template() -> &'static str {
 # Minimal required configuration.
 # Full reference: https://vykar.borgbase.com/configuration
 
-repositories:
-  - url: /path/to/repo
+# repositories:
+#   - url: /path/to/repo
 
-sources:
-  - /path/to/source
+# sources:
+#   - /path/to/source
 
 # --- Common optional settings (uncomment as needed) ---
 
@@ -683,19 +684,20 @@ mod tests {
     #[test]
     fn test_minimal_template_is_valid_yaml() {
         let template = minimal_config_template();
+        // Template is valid YAML (everything uncommented is still parseable).
         let parsed: Result<RawConfig, _> = serde_yaml::from_str(template);
         assert!(
             parsed.is_ok(),
             "template should parse as valid YAML: {:?}",
             parsed.err()
         );
+        // But resolve_document should fail because repositories are commented out.
         let raw = parsed.unwrap();
-        let repos = resolve_document(raw).unwrap();
-        assert_eq!(repos.len(), 1);
-        assert_eq!(repos[0].config.repository.url, "/path/to/repo");
-        assert_eq!(repos[0].sources.len(), 1);
-        assert_eq!(repos[0].sources[0].paths, vec!["/path/to/source"]);
-        assert_eq!(repos[0].sources[0].label, "source");
+        let err = resolve_document(raw).unwrap_err();
+        assert!(
+            err.to_string().contains("No repositories configured"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -1081,7 +1083,10 @@ encryption:
         fs::write(&path, yaml).unwrap();
 
         let err = load_and_resolve(&path).unwrap_err();
-        assert!(err.to_string().contains("missing field"));
+        assert!(
+            err.to_string().contains("No repositories configured"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -1095,7 +1100,10 @@ repositories: []
 
         let err = load_and_resolve(&path).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("must not be empty"), "unexpected error: {msg}");
+        assert!(
+            msg.contains("No repositories configured"),
+            "unexpected error: {msg}"
+        );
     }
 
     #[test]

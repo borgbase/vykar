@@ -20,6 +20,7 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use lru::LruCache;
+use percent_encoding::percent_decode_str;
 use tokio::net::TcpListener;
 
 use crate::commands::list as list_cmd;
@@ -241,6 +242,7 @@ fn format_mtime(t: SystemTime) -> String {
 
 /// Determine what to do with an incoming request: serve HTML, redirect, or
 /// pass through to the WebDAV handler.
+#[derive(Debug)]
 enum BrowserAction {
     ServeHtml,
     Redirect(String),
@@ -259,13 +261,14 @@ fn classify_browser_request<B>(req: &hyper::Request<B>, tree: &VfsNode) -> Brows
     if !is_browser {
         return BrowserAction::PassThrough;
     }
-    let path = req.uri().path();
-    match lookup(tree, path.as_bytes()) {
+    let raw_path = req.uri().path();
+    let decoded = percent_decode_str(raw_path).decode_utf8_lossy();
+    match lookup(tree, decoded.as_bytes()) {
         Some(VfsNode::Dir { .. }) => {
-            if path == "/" || path.ends_with('/') {
+            if raw_path == "/" || raw_path.ends_with('/') {
                 BrowserAction::ServeHtml
             } else {
-                BrowserAction::Redirect(format!("{path}/"))
+                BrowserAction::Redirect(format!("{raw_path}/"))
             }
         }
         _ => BrowserAction::PassThrough,
@@ -767,8 +770,9 @@ async fn serve(handler: DavHandler, tree: Arc<VfsNode>, address: &str) -> Result
                                 async move {
                                     match classify_browser_request(&req, &tree) {
                                         BrowserAction::ServeHtml => {
-                                            let path = req.uri().path().to_string();
-                                            let html = render_directory_html(&path, &tree);
+                                            let raw_path = req.uri().path().to_string();
+                                            let decoded = percent_decode_str(&raw_path).decode_utf8_lossy();
+                                            let html = render_directory_html(&decoded, &tree);
                                             let resp = hyper::Response::builder()
                                                 .status(200)
                                                 .header("content-type", "text/html; charset=utf-8")
@@ -806,3 +810,69 @@ async fn serve(handler: DavHandler, tree: Arc<VfsNode>, address: &str) -> Result
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper: build a simple VFS tree with a single directory entry.
+    fn tree_with_dir(name: &str) -> VfsNode {
+        let mut children = HashMap::new();
+        children.insert(
+            name.to_string(),
+            VfsNode::Dir {
+                children: HashMap::new(),
+                meta: VfsMeta::dir_default(),
+            },
+        );
+        VfsNode::Dir {
+            children,
+            meta: VfsMeta::dir_default(),
+        }
+    }
+
+    /// Helper: build a hyper GET request with the given URI and Accept header.
+    fn browser_get(uri: &str) -> hyper::Request<()> {
+        hyper::Request::builder()
+            .method(hyper::Method::GET)
+            .uri(uri)
+            .header("accept", "text/html")
+            .body(())
+            .unwrap()
+    }
+
+    #[test]
+    fn test_classify_encoded_dir_as_html() {
+        // VFS tree has "form c" (with a real space); request uses percent-encoded path.
+        let tree = tree_with_dir("form c");
+        let req = browser_get("/form%20c/");
+        match classify_browser_request(&req, &tree) {
+            BrowserAction::ServeHtml => {} // expected
+            other => panic!("expected ServeHtml, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_classify_encoded_dir_redirect() {
+        let tree = tree_with_dir("form c");
+        // No trailing slash → should redirect, preserving the encoded path.
+        let req = browser_get("/form%20c");
+        match classify_browser_request(&req, &tree) {
+            BrowserAction::Redirect(loc) => assert_eq!(loc, "/form%20c/"),
+            other => panic!("expected Redirect, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_render_html_decoded_path() {
+        let tree = tree_with_dir("form c");
+        // After decoding, render_directory_html should find the "form c" dir.
+        let decoded = percent_decode_str("/form%20c/").decode_utf8_lossy();
+        let html = render_directory_html(&decoded, &tree);
+        assert!(
+            !html.contains("Not Found"),
+            "decoded path should resolve the directory"
+        );
+    }
+}
+

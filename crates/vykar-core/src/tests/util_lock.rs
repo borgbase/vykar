@@ -152,7 +152,6 @@ fn with_repo_lock_flushes_pending_state_on_action_error() {
         secret_access_key: None,
         sftp_key: None,
         sftp_known_hosts: None,
-        sftp_max_connections: None,
         sftp_timeout: None,
         access_token: None,
         allow_insecure_http: false,

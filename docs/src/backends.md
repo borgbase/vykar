@@ -100,7 +100,6 @@ repositories:
     url: "sftp://backup@nas.local/backups/vykar"
     # sftp_key: "/home/user/.ssh/id_rsa"  # Path to private key (optional)
     # sftp_known_hosts: "/home/user/.ssh/known_hosts"  # Optional known_hosts path
-    # sftp_max_connections: 4  # Optional concurrency limit (1..=32)
     # sftp_timeout: 30         # Per-request timeout in seconds (default: 30, range: 5–300)
 ```
 
@@ -112,7 +111,6 @@ URL format: `sftp://[user@]host[:port]/path`. Default port is 22.
 |-------|-------------|
 | `sftp_key` | Path to SSH private key (auto-detects `~/.ssh/id_ed25519`, `id_rsa`, `id_ecdsa`) |
 | `sftp_known_hosts` | Path to OpenSSH `known_hosts` file (default: `~/.ssh/known_hosts`) |
-| `sftp_max_connections` | Max concurrent SFTP connections (default: `4`, clamped to `1..=32`) |
 | `sftp_timeout` | Per-request SFTP timeout in seconds (default: `30`, clamped to `5..=300`) |
 
 ## REST (vykar-server)

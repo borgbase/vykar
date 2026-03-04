@@ -220,7 +220,7 @@ pub fn run_with_progress(
         sequential::build_transform_pool(config.limits.cpu.max_threads)?
     };
 
-    let backend = storage::backend_from_config(&config.repository)?;
+    let backend = storage::backend_from_config_with_pool(&config.repository, upload_concurrency)?;
     let backend =
         limits::wrap_backup_storage_backend(backend, &config.repository.url, &config.limits)?;
 

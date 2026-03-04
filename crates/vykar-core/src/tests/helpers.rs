@@ -37,7 +37,6 @@ pub fn make_test_config(repo_dir: &Path) -> VykarConfig {
             secret_access_key: None,
             sftp_key: None,
             sftp_known_hosts: None,
-            sftp_max_connections: None,
             sftp_timeout: None,
             access_token: None,
             allow_insecure_http: false,

@@ -116,7 +116,6 @@ compression:
 #     secret_access_key: AWS_SECRET_ACCESS_KEY
 #     # sftp_key: ~/.ssh/id_ed25519
 #     # sftp_known_hosts: ~/.ssh/known_hosts
-#     # sftp_max_connections: 4
 #     # sftp_timeout: 30          # per-request timeout in seconds (5–300)
 #     # access_token: VYKAR_ACCESS_TOKEN
 #

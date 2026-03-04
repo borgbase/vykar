@@ -129,8 +129,6 @@ pub struct RepositoryConfig {
     pub sftp_key: Option<String>,
     /// Path to OpenSSH known_hosts file for SFTP host key verification.
     pub sftp_known_hosts: Option<String>,
-    /// Maximum concurrent SFTP connections (default: 4, clamped to 1..=32).
-    pub sftp_max_connections: Option<usize>,
     /// Per-request SFTP timeout in seconds (default: 30).
     pub sftp_timeout: Option<u64>,
     /// Bearer token for server backend authentication.

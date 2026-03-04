@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -200,6 +201,8 @@ pub struct SftpBackend {
     pool_ready: Condvar,
     max_connections: usize,
     retry: RetryConfig,
+    /// Cache of directories known to exist, skipping redundant `mkdir_p` calls.
+    known_dirs: Mutex<HashSet<String>>,
 }
 
 impl SftpBackend {
@@ -227,7 +230,7 @@ impl SftpBackend {
                 tracing::warn!(
                     requested,
                     effective = max_connections,
-                    "adjusted sftp_max_connections to supported range"
+                    "adjusted max_connections to supported range"
                 );
             }
         }
@@ -261,12 +264,39 @@ impl SftpBackend {
             pool_ready: Condvar::new(),
             max_connections,
             retry,
+            known_dirs: Mutex::new(HashSet::new()),
         })
     }
 
     /// Full remote path for a given key.
     fn full_path(&self, key: &str) -> String {
         join_root_key(&self.params.root, key)
+    }
+
+    /// Check if a directory is in the known-dirs cache.
+    fn is_known_dir(&self, dir: &str) -> bool {
+        self.known_dirs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(dir)
+    }
+
+    /// Mark a directory (and all its ancestors) as known.
+    fn mark_dir_known(&self, dir: &str) {
+        let mut known = self.known_dirs.lock().unwrap_or_else(|e| e.into_inner());
+        let mut current = String::new();
+        for component in dir.split('/') {
+            if component.is_empty() {
+                current.push('/');
+                continue;
+            }
+            if current.is_empty() || current == "/" {
+                current = format!("{current}{component}");
+            } else {
+                current = format!("{current}/{component}");
+            }
+            known.insert(current.clone());
+        }
     }
 
     fn lock_pool(&self) -> std::sync::MutexGuard<'_, ConnPoolState> {
@@ -340,6 +370,8 @@ impl SftpBackend {
             inactivity_timeout: Some(INACTIVITY_TIMEOUT),
             keepalive_interval: Some(DEFAULT_KEEPALIVE_INTERVAL),
             nodelay: true,
+            window_size: 16 * 1024 * 1024, // 16 MiB (default: 2 MiB)
+            maximum_packet_size: 65535,    // max safe value (russh errors above this)
             ..Default::default()
         });
         let handler = SshHandler {
@@ -824,14 +856,20 @@ impl StorageBackend for SftpBackend {
 
     fn put(&self, key: &str, data: &[u8]) -> Result<()> {
         let path = self.full_path(key);
+        let parent_known = match path.rsplit_once('/').map(|(p, _)| p) {
+            Some(p) if !p.is_empty() => self.is_known_dir(p),
+            _ => true,
+        };
         let data = Arc::new(data.to_vec());
         self.retry_op(&format!("PUT {key}"), |sftp| {
             let data = data.clone();
             ASYNC_RUNTIME.block_on(async {
-                // Ensure parent directory exists.
-                if let Some(parent) = path.rsplit_once('/').map(|(p, _)| p) {
-                    if !parent.is_empty() {
-                        mkdir_p(sftp, parent).await?;
+                // Ensure parent directory exists (skip if already cached).
+                if !parent_known {
+                    if let Some(parent) = path.rsplit_once('/').map(|(p, _)| p) {
+                        if !parent.is_empty() {
+                            mkdir_p(sftp, parent).await?;
+                        }
                     }
                 }
 
@@ -854,7 +892,16 @@ impl StorageBackend for SftpBackend {
                     .map_err(|e| io_retry_error("close", &path, e))?;
                 Ok(())
             })
-        })
+        })?;
+        // Cache parent dir on success.
+        if !parent_known {
+            if let Some(parent) = path.rsplit_once('/').map(|(p, _)| p) {
+                if !parent.is_empty() {
+                    self.mark_dir_known(parent);
+                }
+            }
+        }
+        Ok(())
     }
 
     fn delete(&self, key: &str) -> Result<()> {
@@ -947,13 +994,63 @@ impl StorageBackend for SftpBackend {
 
     fn create_dir(&self, key: &str) -> Result<()> {
         let path = self.full_path(key.trim_end_matches('/'));
+        if self.is_known_dir(&path) {
+            return Ok(());
+        }
         self.retry_op(&format!("MKDIR {key}"), |sftp| {
             ASYNC_RUNTIME.block_on(mkdir_p(sftp, &path))
-        })
+        })?;
+        self.mark_dir_known(&path);
+        Ok(())
     }
 
     fn put_owned(&self, key: &str, data: Vec<u8>) -> Result<()> {
-        self.put(key, &data)
+        let path = self.full_path(key);
+        let parent_known = match path.rsplit_once('/').map(|(p, _)| p) {
+            Some(p) if !p.is_empty() => self.is_known_dir(p),
+            _ => true,
+        };
+        // Wrap the owned Vec directly — no clone needed.
+        let data = Arc::new(data);
+        self.retry_op(&format!("PUT {key}"), |sftp| {
+            let data = data.clone();
+            ASYNC_RUNTIME.block_on(async {
+                if !parent_known {
+                    if let Some(parent) = path.rsplit_once('/').map(|(p, _)| p) {
+                        if !parent.is_empty() {
+                            mkdir_p(sftp, parent).await?;
+                        }
+                    }
+                }
+
+                let mut file = sftp
+                    .open_with_flags(
+                        &path,
+                        OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE,
+                    )
+                    .await
+                    .map_err(|e| sftp_retry_error("create", &path, e))?;
+
+                file.write_all(data.as_ref())
+                    .await
+                    .map_err(|e| io_retry_error("write", &path, e))?;
+                file.flush()
+                    .await
+                    .map_err(|e| io_retry_error("flush", &path, e))?;
+                file.shutdown()
+                    .await
+                    .map_err(|e| io_retry_error("close", &path, e))?;
+                Ok(())
+            })
+        })?;
+        if !parent_known {
+            if let Some(parent) = path.rsplit_once('/').map(|(p, _)| p) {
+                if !parent.is_empty() {
+                    self.mark_dir_known(parent);
+                }
+            }
+        }
+        Ok(())
     }
 }
 

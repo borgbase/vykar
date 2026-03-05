@@ -130,7 +130,13 @@ pub fn with_maintenance_lock<T>(
 
     // Clean up stale sessions before checking for active ones.
     let stale_threshold = lock::default_stale_session_duration();
-    match lock::cleanup_stale_sessions(repo.storage.as_ref(), stale_threshold) {
+    let local_hostname = crate::platform::hostname();
+    match lock::cleanup_stale_sessions(
+        repo.storage.as_ref(),
+        stale_threshold,
+        &local_hostname,
+        crate::platform::is_pid_alive,
+    ) {
         Ok(cleaned) => {
             if !cleaned.is_empty() {
                 info!(

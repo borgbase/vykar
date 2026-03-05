@@ -196,6 +196,10 @@ pub(crate) enum Commands {
         /// Select repository by label or path
         #[arg(short = 'R', long = "repo")]
         repo: Option<String>,
+
+        /// Also remove all session markers (orphaned by crashed backups)
+        #[arg(long)]
+        sessions: bool,
     },
 
     /// Run scheduled backups as a foreground daemon

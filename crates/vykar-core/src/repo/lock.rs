@@ -309,19 +309,33 @@ pub fn list_sessions(storage: &dyn StorageBackend) -> Result<Vec<String>> {
         .collect())
 }
 
-/// Remove session markers older than `max_age`. Returns the IDs of cleaned sessions.
+/// Remove session markers older than `max_age`, or from dead local processes.
+/// Returns the IDs of cleaned sessions.
 ///
-/// Also cleans up companion `.index` (pending index journal) files for stale
-/// sessions, and orphaned `.index` files whose `.json` marker no longer exists.
+/// `.index` journals for cleaned sessions are **preserved** so the next backup
+/// can recover uploaded-but-uncommitted chunks via `recover_pending_index()`.
+/// Orphaned `.index` files from a *prior* cleanup run (no companion `.json`
+/// and not cleaned this invocation) are deleted — they already had their
+/// grace period.
+///
+/// `local_hostname` and `pid_alive_fn` enable same-host dead-process detection:
+/// if a session's hostname matches and the PID is no longer alive, the session
+/// is treated as stale regardless of age. Sessions from different hosts are
+/// only cleaned by the `max_age` timeout.
 pub fn cleanup_stale_sessions(
     storage: &dyn StorageBackend,
     max_age: Duration,
+    local_hostname: &str,
+    pid_alive_fn: impl Fn(u32) -> bool,
 ) -> Result<Vec<String>> {
     let now = Utc::now();
     let keys = storage.list(SESSIONS_PREFIX)?;
     let mut cleaned = Vec::new();
     // Track which session IDs survived the first pass (not deleted).
     let mut surviving_markers: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Track session IDs cleaned in this invocation — their .index files get
+    // a one-run grace period so the next backup can recover the journal.
+    let mut cleaned_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     // First pass: process only .json session markers.
     for key in &keys {
@@ -332,43 +346,95 @@ pub fn cleanup_stale_sessions(
             continue;
         };
         let Ok(entry) = serde_json::from_slice::<SessionEntry>(&data) else {
-            // Unparseable .json — treat as stale.
+            // Unparseable .json — treat as stale. Keep .index for recovery.
             let _ = storage.delete(key);
-            let _ = storage.delete(&session_index_key(session_id));
+            cleaned_ids.insert(session_id.to_string());
             continue;
         };
         let ts = chrono::DateTime::parse_from_rfc3339(&entry.last_refresh)
             .or_else(|_| chrono::DateTime::parse_from_rfc3339(&entry.registered_at));
         let Ok(ts) = ts else {
+            // Bad timestamp — treat as stale. Keep .index for recovery.
             let _ = storage.delete(key);
-            let _ = storage.delete(&session_index_key(session_id));
+            cleaned_ids.insert(session_id.to_string());
             continue;
         };
-        if now.signed_duration_since(ts.with_timezone(&Utc)) > max_age {
+
+        let is_stale_by_age = now.signed_duration_since(ts.with_timezone(&Utc)) > max_age;
+        let is_dead_local = entry.hostname == local_hostname && !pid_alive_fn(entry.pid);
+
+        if is_stale_by_age {
             debug!(session_id, age_hours = %((now - ts.with_timezone(&Utc)).num_hours()), "cleaning stale session");
             let _ = storage.delete(key);
-            let _ = storage.delete(&session_index_key(session_id));
+            cleaned_ids.insert(session_id.to_string());
+            cleaned.push(session_id.to_string());
+        } else if is_dead_local {
+            debug!(
+                session_id,
+                pid = entry.pid,
+                "cleaning session from dead local process"
+            );
+            let _ = storage.delete(key);
+            cleaned_ids.insert(session_id.to_string());
             cleaned.push(session_id.to_string());
         } else {
             surviving_markers.insert(session_id.to_string());
         }
     }
 
-    // Second pass: clean orphaned .index files whose .json marker no longer exists.
-    // These arise when flush_on_abort writes the journal but deregister_session
-    // already deleted the marker.
+    // Second pass: clean orphaned .index files whose .json marker no longer exists
+    // AND that were not cleaned in *this* invocation. Files cleaned this run get
+    // a one-run grace period so the next backup can recover their journal via
+    // `recover_pending_index()`.
     for key in &keys {
         if let Some(id) = key
             .strip_prefix(SESSIONS_PREFIX)
             .and_then(|s| s.strip_suffix(".index"))
         {
-            if !surviving_markers.contains(id) {
+            if !surviving_markers.contains(id) && !cleaned_ids.contains(id) {
                 let _ = storage.delete(key);
             }
         }
     }
 
     Ok(cleaned)
+}
+
+/// List all session entries with their parsed content.
+///
+/// Returns `(session_id, Option<SessionEntry>)` pairs. The entry is `None`
+/// if the marker file could not be parsed (malformed JSON).
+pub fn list_session_entries(
+    storage: &dyn StorageBackend,
+) -> Result<Vec<(String, Option<SessionEntry>)>> {
+    let keys = storage.list(SESSIONS_PREFIX)?;
+    let mut entries = Vec::new();
+    for key in &keys {
+        let Some(session_id) = parse_session_id(key) else {
+            continue;
+        };
+        let entry = storage
+            .get(key)?
+            .and_then(|data| serde_json::from_slice::<SessionEntry>(&data).ok());
+        entries.push((session_id.to_string(), entry));
+    }
+    Ok(entries)
+}
+
+/// Delete all files under `sessions/` regardless of parse result.
+///
+/// Returns the number of files removed. This is a recovery mechanism that
+/// cleans `.json` markers, `.index` journals, and any other stray files.
+pub fn clear_all_sessions(storage: &dyn StorageBackend) -> Result<usize> {
+    let keys = storage.list(SESSIONS_PREFIX)?;
+    let mut removed = 0usize;
+    for key in &keys {
+        if key.starts_with(SESSIONS_PREFIX) {
+            storage.delete(key)?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
 }
 
 /// Acquire a repo lock with retry and exponential backoff + jitter.

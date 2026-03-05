@@ -281,6 +281,9 @@ pub fn compact_repo(
         return Ok(stats);
     }
 
+    // Proactive fence check at Phase 1→Phase 2 boundary.
+    repo.check_lock_fence()?;
+
     // Phase 2: Repack
     let mut total_repacked_bytes: u64 = 0;
     let pack_target = repo.config.min_pack_size as usize;

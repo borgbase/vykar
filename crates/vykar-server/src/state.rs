@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -24,27 +23,6 @@ pub struct AppStateInner {
 
     /// Last backup timestamp (updated on manifest PUT).
     pub last_backup_at: RwLock<Option<DateTime<Utc>>>,
-
-    /// Active locks: lock_id -> LockInfo
-    pub locks: RwLock<HashMap<String, LockInfo>>,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct LockInfo {
-    pub hostname: String,
-    pub pid: u64,
-    pub acquired_at: DateTime<Utc>,
-    pub ttl_seconds: u64,
-}
-
-impl LockInfo {
-    pub fn is_expired(&self) -> bool {
-        let elapsed = Utc::now()
-            .signed_duration_since(self.acquired_at)
-            .num_seconds();
-        let ttl_i64 = i64::try_from(self.ttl_seconds).unwrap_or(i64::MAX);
-        elapsed > ttl_i64
-    }
 }
 
 pub(crate) fn read_unpoisoned<'a, T>(
@@ -137,7 +115,6 @@ impl AppState {
                 quota_usage: AtomicU64::new(quota_usage),
                 quota_state,
                 last_backup_at: RwLock::new(None),
-                locks: RwLock::new(HashMap::new()),
             }),
         }
     }
@@ -174,7 +151,6 @@ impl AppState {
                 quota_usage: AtomicU64::new(quota_usage),
                 quota_state,
                 last_backup_at: RwLock::new(None),
-                locks: RwLock::new(HashMap::new()),
             }),
         }
     }

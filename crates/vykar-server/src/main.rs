@@ -4,14 +4,12 @@ mod handlers;
 mod quota;
 mod state;
 
-use std::time::Duration;
-
 use clap::Parser;
 use tokio::net::TcpListener;
 use tracing::info;
 
 use crate::config::{parse_size, ServerSection};
-use crate::state::{write_unpoisoned, AppState};
+use crate::state::AppState;
 
 #[derive(Parser)]
 #[command(name = "vykar-server", version, about = "vykar backup server")]
@@ -36,10 +34,6 @@ struct Cli {
     /// Omit for automatic detection from filesystem quotas or free space.
     #[arg(long, value_parser = parse_size)]
     quota: Option<u64>,
-
-    /// Lock TTL in seconds
-    #[arg(long, default_value_t = 3600)]
-    lock_ttl_seconds: u64,
 
     /// Number of async threads for handling network connections (minimum 1)
     #[arg(long, default_value_t = 4, value_parser = parse_min_one)]
@@ -92,7 +86,6 @@ async fn async_main(cli: Cli) {
         token,
         append_only: cli.append_only,
         log_format: cli.log_format,
-        lock_ttl_seconds: cli.lock_ttl_seconds,
     };
 
     // Initialize tracing
@@ -125,16 +118,6 @@ async fn async_main(cli: Cli) {
     let listen_addr = config.listen.clone();
     let state = AppState::new(config, cli.quota);
 
-    // Spawn lock cleanup background task
-    let cleanup_state = state.clone();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(60));
-        loop {
-            interval.tick().await;
-            cleanup_expired_locks(&cleanup_state);
-        }
-    });
-
     let app = handlers::router(state);
 
     info!("vykar-server listening on {listen_addr}");
@@ -143,9 +126,4 @@ async fn async_main(cli: Cli) {
         std::process::exit(1);
     });
     axum::serve(listener, app).await.unwrap();
-}
-
-fn cleanup_expired_locks(state: &AppState) {
-    let mut locks = write_unpoisoned(&state.inner.locks, "locks");
-    locks.retain(|_id, info| !info.is_expired());
 }

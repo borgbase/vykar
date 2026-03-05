@@ -268,7 +268,8 @@ pub async fn delete_object(
     State(state): State<AppState>,
     Path(key): Path<String>,
 ) -> Result<Response, ServerError> {
-    if state.inner.config.append_only {
+    if state.inner.config.append_only && !key.starts_with("locks/") && !key.starts_with("sessions/")
+    {
         return Err(ServerError::Forbidden(
             "append-only: delete not allowed".into(),
         ));

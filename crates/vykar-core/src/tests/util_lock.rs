@@ -7,7 +7,7 @@ use crate::compress::Compression;
 use crate::config::{ChunkerConfig, RepositoryConfig, RetryConfig};
 use crate::repo::pack::PackType;
 use crate::repo::{EncryptionMode, Repository};
-use vykar_storage::{BackendLockInfo, StorageBackend};
+use vykar_storage::StorageBackend;
 use vykar_types::error::{Result, VykarError};
 
 #[derive(Clone)]
@@ -50,6 +50,13 @@ impl StorageBackend for AdvisoryLockBackend {
     }
 
     fn delete(&self, key: &str) -> Result<()> {
+        // Track lock release via delete of lock files.
+        if key.starts_with("locks/") {
+            self.state.release_calls.fetch_add(1, Ordering::SeqCst);
+            if self.state.fail_release {
+                return Err(VykarError::Other("forced release failure".into()));
+            }
+        }
         let mut map = self.state.data.lock().unwrap();
         map.remove(key);
         Ok(())
@@ -91,19 +98,6 @@ impl StorageBackend for AdvisoryLockBackend {
 
     fn create_dir(&self, _key: &str) -> Result<()> {
         Ok(())
-    }
-
-    fn acquire_advisory_lock(&self, _lock_id: &str, _info: &BackendLockInfo) -> Result<()> {
-        Ok(())
-    }
-
-    fn release_advisory_lock(&self, _lock_id: &str) -> Result<()> {
-        self.state.release_calls.fetch_add(1, Ordering::SeqCst);
-        if self.state.fail_release {
-            Err(VykarError::Other("forced release failure".into()))
-        } else {
-            Ok(())
-        }
     }
 }
 

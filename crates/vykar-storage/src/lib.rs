@@ -20,13 +20,6 @@ use url::Url;
 
 use vykar_types::error::{Result, VykarError};
 
-/// Metadata sent to backends that support native advisory lock APIs.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BackendLockInfo {
-    pub hostname: String,
-    pub pid: u64,
-}
-
 // Re-export wire-format types from vykar-protocol (shared with vykar-server).
 pub use vykar_protocol::{
     RepackBlobRef, RepackOperationRequest, RepackOperationResult, RepackPlanRequest,
@@ -101,20 +94,6 @@ pub trait StorageBackend: Send + Sync {
         Ok(self.get(key)?.map(|v| v.len() as u64))
     }
 
-    /// Acquire an advisory lock using a backend-native API.
-    ///
-    /// Backends that don't support a lock API should return
-    /// `VykarError::UnsupportedBackend`, so the caller can fall back to
-    /// object-based lock files.
-    fn acquire_advisory_lock(&self, _lock_id: &str, _info: &BackendLockInfo) -> Result<()> {
-        Err(VykarError::UnsupportedBackend("advisory lock API".into()))
-    }
-
-    /// Release an advisory lock using a backend-native API.
-    fn release_advisory_lock(&self, _lock_id: &str) -> Result<()> {
-        Err(VykarError::UnsupportedBackend("advisory lock API".into()))
-    }
-
     /// Execute a server-side repack plan when supported by the backend.
     fn server_repack(&self, _plan: &RepackPlanRequest) -> Result<RepackResultResponse> {
         Err(VykarError::UnsupportedBackend(
@@ -178,12 +157,6 @@ impl StorageBackend for Arc<dyn StorageBackend> {
     }
     fn size(&self, key: &str) -> Result<Option<u64>> {
         (**self).size(key)
-    }
-    fn acquire_advisory_lock(&self, lock_id: &str, info: &BackendLockInfo) -> Result<()> {
-        (**self).acquire_advisory_lock(lock_id, info)
-    }
-    fn release_advisory_lock(&self, lock_id: &str) -> Result<()> {
-        (**self).release_advisory_lock(lock_id)
     }
     fn server_repack(&self, plan: &RepackPlanRequest) -> Result<RepackResultResponse> {
         (**self).server_repack(plan)

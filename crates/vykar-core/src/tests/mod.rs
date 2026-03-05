@@ -11,6 +11,7 @@ mod index;
 mod info;
 mod item;
 mod lock;
+mod lock_fence;
 mod manifest;
 mod passphrase;
 mod prune;

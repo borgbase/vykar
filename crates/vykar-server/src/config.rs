@@ -14,9 +14,6 @@ pub struct ServerSection {
 
     /// Log output format: "json" or "pretty".
     pub log_format: String,
-
-    /// Default lock TTL in seconds.
-    pub lock_ttl_seconds: u64,
 }
 
 impl Default for ServerSection {
@@ -27,7 +24,6 @@ impl Default for ServerSection {
             token: String::new(),
             append_only: false,
             log_format: "pretty".to_string(),
-            lock_ttl_seconds: 3600,
         }
     }
 }

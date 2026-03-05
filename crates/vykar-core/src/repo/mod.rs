@@ -146,6 +146,8 @@ pub struct Repository {
     /// `None` when no write session is active (read-only operations, compact, delete, prune).
     /// Activated by `begin_write_session()` before backup.
     write_session: Option<WriteSessionState>,
+    /// Lock fence: called before persisting index/manifest to verify the lock is still valid.
+    lock_fence: Option<Arc<dyn Fn() -> Result<()> + Send + Sync>>,
 }
 
 impl Repository {
@@ -299,6 +301,7 @@ impl Repository {
             rebuild_dedup_cache: false,
             cache_dir_override: cache_dir,
             write_session: None,
+            lock_fence: None,
         })
     }
 
@@ -445,6 +448,7 @@ impl Repository {
             rebuild_dedup_cache: false,
             cache_dir_override: cache_dir,
             write_session: None,
+            lock_fence: None,
         })
     }
 
@@ -1130,6 +1134,7 @@ impl Repository {
                 })
             },
         )?;
+        self.check_lock_fence()?;
         self.storage.put("index", &index_packed)?;
         self.index_dirty = false;
         Ok(())
@@ -1144,6 +1149,7 @@ impl Repository {
             &manifest_bytes,
             self.crypto.as_ref(),
         )?;
+        self.check_lock_fence()?;
         self.storage.put("manifest", &manifest_packed)?;
         self.manifest_dirty = false;
         Ok(())
@@ -1163,6 +1169,24 @@ impl Repository {
         )?;
         self.manifest = rmp_serde::from_slice(&compressed)?;
         self.manifest_dirty = false;
+        Ok(())
+    }
+
+    /// Install a lock fence that will be checked before persisting index/manifest.
+    pub fn set_lock_fence(&mut self, fence: Arc<dyn Fn() -> Result<()> + Send + Sync>) {
+        self.lock_fence = Some(fence);
+    }
+
+    /// Remove the lock fence.
+    pub fn clear_lock_fence(&mut self) {
+        self.lock_fence = None;
+    }
+
+    /// Check the lock fence if one is installed. No-op if no fence is set.
+    pub(crate) fn check_lock_fence(&self) -> Result<()> {
+        if let Some(ref fence) = self.lock_fence {
+            fence()?;
+        }
         Ok(())
     }
 
@@ -1213,6 +1237,7 @@ impl Repository {
             dedup_cache::serialize_full_cache_to_packed_object(&new_cache, self.crypto.as_ref())?;
 
         // Upload
+        self.check_lock_fence()?;
         self.storage.put("index", &packed)?;
 
         // Free upload buffer

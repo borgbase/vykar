@@ -16,6 +16,8 @@ use tracing::{debug, info, warn};
 use super::util::check_interrupted;
 use crate::compress::Compression;
 use crate::config::{ChunkerConfig, CommandDump, VykarConfig};
+use std::sync::Arc;
+
 use crate::limits;
 use crate::platform::fs;
 use crate::repo::file_cache::FileCache;
@@ -439,6 +441,8 @@ pub fn run_with_progress(
 
     let commit_result = (|| -> Result<()> {
         let guard = lock::acquire_lock_with_retry(repo.storage.as_ref(), 10, 500)?;
+        let fence = lock::build_lock_fence(&guard, Arc::clone(&repo.storage));
+        repo.set_lock_fence(fence);
 
         let result = repo.commit_concurrent_session(snapshot_entry, new_file_cache);
 
@@ -449,6 +453,7 @@ pub fn run_with_progress(
         // Deregister session while holding the lock.
         lock::deregister_session(repo.storage.as_ref(), &session_id);
 
+        repo.clear_lock_fence();
         match lock::release_lock(repo.storage.as_ref(), guard) {
             Ok(()) => {}
             Err(release_err) => {

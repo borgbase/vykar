@@ -73,6 +73,9 @@ pub enum VykarError {
     #[error("commit failed: referenced chunks were deleted since session started")]
     StaleChunksDuringCommit,
 
+    #[error("lock expired: {0}")]
+    LockExpired(String),
+
     #[error("{0}")]
     Other(String),
 }

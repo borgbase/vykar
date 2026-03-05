@@ -1,5 +1,4 @@
 pub mod admin;
-pub mod locks;
 pub mod objects;
 
 #[cfg(test)]
@@ -24,13 +23,8 @@ const MAX_OBJECT_BODY_BYTES: usize = 512 * 1024 * 1024; // 512 MiB
 const MAX_ADMIN_BODY_BYTES: usize = 64 * 1024 * 1024; // 64 MiB
 
 pub fn router(state: AppState) -> Router {
-    // Admin + lock routes — small body limit for JSON payloads.
+    // Admin routes — small body limit for JSON payloads.
     let admin_routes = Router::new()
-        .route(
-            "/locks/{id}",
-            axum::routing::post(locks::acquire_lock).delete(locks::release_lock),
-        )
-        .route("/locks", axum::routing::get(locks::list_locks))
         .route(
             "/",
             axum::routing::get(admin::repo_dispatch).post(admin::repo_action_dispatch),

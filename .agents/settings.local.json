@@ -10,7 +10,8 @@
       "Bash(make:*)",
       "Bash(fi)",
       "Bash(done)",
-      "Bash(do sed:*)"
+      "Bash(do sed:*)",
+      "Bash(magick:*)"
     ]
   }
 }

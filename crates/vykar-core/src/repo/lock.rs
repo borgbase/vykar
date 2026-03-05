@@ -1,8 +1,12 @@
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::Arc;
+use std::time::SystemTime;
+
 use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
-use vykar_storage::{BackendLockInfo, StorageBackend};
+use vykar_storage::StorageBackend;
 use vykar_types::error::{Result, VykarError};
 
 /// A simple advisory lock stored in `locks/<uuid>.json`.
@@ -15,58 +19,38 @@ struct LockEntry {
 
 const LOCKS_PREFIX: &str = "locks/";
 const DEFAULT_STALE_LOCK_SECS: i64 = 6 * 60 * 60; // 6 hours
-const BACKEND_LOCK_ID: &str = "repo-lock";
 
-#[derive(Debug)]
-enum LockGuardKind {
-    Object { key: String },
-    Backend { lock_id: String },
-}
+/// Refresh the lock file every 3 hours to prevent stale-lock cleanup.
+const LOCK_REFRESH_INTERVAL_SECS: u64 = 3 * 60 * 60;
+
+/// Abort if the lock has not been refreshed for this long.
+/// Set to DEFAULT_STALE_LOCK_SECS minus 30 minutes.
+const LOCK_MAX_UNREFRESHED_SECS: u64 = (DEFAULT_STALE_LOCK_SECS as u64) - 30 * 60;
 
 /// Handle to an acquired lock.
 #[derive(Debug)]
 pub struct LockGuard {
-    kind: LockGuardKind,
+    key: String,
+    acquired_at: SystemTime,
 }
 
 impl LockGuard {
     pub fn key(&self) -> &str {
-        match &self.kind {
-            LockGuardKind::Object { key } => key,
-            LockGuardKind::Backend { lock_id } => lock_id,
-        }
+        &self.key
     }
 }
 
 /// Acquire an advisory lock on the repository.
 pub fn acquire_lock(storage: &dyn StorageBackend) -> Result<LockGuard> {
     let hostname = crate::platform::hostname();
-    let pid = std::process::id() as u64;
+    let pid = std::process::id();
 
-    // Prefer backend-native lock APIs when available (e.g. REST server locks).
-    let backend_info = BackendLockInfo {
-        hostname: hostname.clone(),
-        pid,
-    };
-    match storage.acquire_advisory_lock(BACKEND_LOCK_ID, &backend_info) {
-        Ok(()) => {
-            return Ok(LockGuard {
-                kind: LockGuardKind::Backend {
-                    lock_id: BACKEND_LOCK_ID.to_string(),
-                },
-            });
-        }
-        Err(VykarError::UnsupportedBackend(_)) => {}
-        Err(err) => return Err(err),
-    }
-
-    // Fallback to object-based lock files.
     cleanup_stale_locks(storage, Duration::seconds(DEFAULT_STALE_LOCK_SECS))?;
 
     let now = Utc::now();
     let entry = LockEntry {
         hostname,
-        pid: pid as u32,
+        pid,
         time: now.to_rfc3339(),
     };
 
@@ -93,16 +77,14 @@ pub fn acquire_lock(storage: &dyn StorageBackend) -> Result<LockGuard> {
     }
 
     Ok(LockGuard {
-        kind: LockGuardKind::Object { key },
+        key,
+        acquired_at: SystemTime::now(),
     })
 }
 
 /// Release an advisory lock.
 pub fn release_lock(storage: &dyn StorageBackend, guard: LockGuard) -> Result<()> {
-    match guard.kind {
-        LockGuardKind::Object { key } => storage.delete(&key),
-        LockGuardKind::Backend { lock_id } => storage.release_advisory_lock(&lock_id),
-    }
+    storage.delete(&guard.key)
 }
 
 /// Forcibly remove all advisory locks from the repository.
@@ -113,28 +95,6 @@ pub fn release_lock(storage: &dyn StorageBackend, guard: LockGuard) -> Result<()
 pub fn break_lock(storage: &dyn StorageBackend) -> Result<usize> {
     let mut removed: usize = 0;
 
-    // Probe backend-native lock: try to acquire it. If we succeed, no stale
-    // lock existed — release our own acquire and don't count it. If we get
-    // `Locked`, a stale lock exists — force-release it and count 1.
-    let dummy_info = BackendLockInfo {
-        hostname: String::new(),
-        pid: 0,
-    };
-    match storage.acquire_advisory_lock(BACKEND_LOCK_ID, &dummy_info) {
-        Ok(()) => {
-            // No stale lock — undo our probe acquire.
-            let _ = storage.release_advisory_lock(BACKEND_LOCK_ID);
-        }
-        Err(VykarError::Locked(_)) => {
-            // Stale lock exists — force-release it.
-            storage.release_advisory_lock(BACKEND_LOCK_ID)?;
-            removed += 1;
-        }
-        Err(VykarError::UnsupportedBackend(_)) => {}
-        Err(err) => return Err(err),
-    }
-
-    // Remove all object-based lock files.
     for key in list_lock_keys(storage)? {
         storage.delete(&key)?;
         removed += 1;
@@ -165,6 +125,112 @@ fn cleanup_stale_locks(storage: &dyn StorageBackend, max_age: Duration) -> Resul
             let _ = storage.delete(&key);
         }
     }
+    Ok(())
+}
+
+/// Build a lock fence closure that verifies the lock is still valid.
+///
+/// The returned closure checks:
+/// 1. The lock file still exists on storage (not cleaned up by another client).
+/// 2. Time since last refresh has not exceeded `LOCK_MAX_UNREFRESHED_SECS`.
+/// 3. If the refresh interval has elapsed, rewrites the lock file with a fresh timestamp.
+pub fn build_lock_fence(
+    guard: &LockGuard,
+    storage: Arc<dyn StorageBackend>,
+) -> Arc<dyn Fn() -> Result<()> + Send + Sync> {
+    let acquired_secs = guard
+        .acquired_at
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    build_lock_fence_inner(guard, storage, acquired_secs)
+}
+
+/// Same as [`build_lock_fence`] but with an overridden initial epoch for testing.
+#[cfg(test)]
+pub fn build_lock_fence_with_epoch(
+    guard: &LockGuard,
+    storage: Arc<dyn StorageBackend>,
+    override_epoch_secs: i64,
+) -> Arc<dyn Fn() -> Result<()> + Send + Sync> {
+    build_lock_fence_inner(guard, storage, override_epoch_secs)
+}
+
+fn build_lock_fence_inner(
+    guard: &LockGuard,
+    storage: Arc<dyn StorageBackend>,
+    initial_epoch_secs: i64,
+) -> Arc<dyn Fn() -> Result<()> + Send + Sync> {
+    let lock_key = guard.key.clone();
+    let hostname = crate::platform::hostname();
+    let pid = std::process::id();
+
+    let last_refreshed = Arc::new(AtomicI64::new(initial_epoch_secs));
+
+    Arc::new(move || {
+        verify_lock_validity(&lock_key, last_refreshed.load(Ordering::SeqCst), &*storage)?;
+
+        // Refresh lock file if refresh interval has elapsed.
+        let now_secs = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(i64::MAX);
+        let elapsed = now_secs - last_refreshed.load(Ordering::SeqCst);
+        if elapsed >= LOCK_REFRESH_INTERVAL_SECS as i64 {
+            let entry = LockEntry {
+                hostname: hostname.clone(),
+                pid,
+                time: Utc::now().to_rfc3339(),
+            };
+            if let Ok(data) = serde_json::to_vec(&entry) {
+                if storage.put(&lock_key, &data).is_ok() {
+                    last_refreshed.store(now_secs, Ordering::SeqCst);
+                    debug!(lock_key = %lock_key, "lock file refreshed");
+                }
+            }
+        }
+
+        Ok(())
+    })
+}
+
+/// Verify that a lock is still valid by checking existence and time elapsed.
+///
+/// This is the core validation logic, exposed for unit testing.
+pub fn verify_lock_validity(
+    lock_key: &str,
+    last_refreshed_secs: i64,
+    storage: &dyn StorageBackend,
+) -> Result<()> {
+    // 1. Check lock file still exists.
+    if !storage.exists(lock_key)? {
+        return Err(VykarError::LockExpired(
+            "lock file removed by another client".into(),
+        ));
+    }
+
+    // 2. Check time since last refresh.
+    let now_secs = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(i64::MAX);
+
+    let elapsed = now_secs - last_refreshed_secs;
+
+    // Fail closed on clock anomaly (negative elapsed or clock failure).
+    if elapsed < 0 || now_secs == i64::MAX {
+        return Err(VykarError::LockExpired(
+            "clock anomaly detected; refusing to write with potentially stale lock".into(),
+        ));
+    }
+
+    if elapsed > LOCK_MAX_UNREFRESHED_SECS as i64 {
+        return Err(VykarError::LockExpired(format!(
+            "lock unrefreshed for {elapsed}s (limit: {LOCK_MAX_UNREFRESHED_SECS}s); \
+             machine may have been suspended"
+        )));
+    }
+
     Ok(())
 }
 

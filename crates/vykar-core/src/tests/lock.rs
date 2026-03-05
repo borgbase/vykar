@@ -1,7 +1,7 @@
 use crate::repo::lock::{
     acquire_lock, break_lock, cleanup_stale_sessions, clear_all_sessions, release_lock,
 };
-use crate::testutil::{LockableMemoryBackend, MemoryBackend};
+use crate::testutil::MemoryBackend;
 use chrono::{Duration, Utc};
 use vykar_storage::StorageBackend;
 
@@ -82,47 +82,6 @@ fn break_lock_removes_all_locks() {
 #[test]
 fn break_lock_returns_zero_when_no_locks() {
     let storage = MemoryBackend::new();
-    let removed = break_lock(&storage).unwrap();
-    assert_eq!(removed, 0);
-}
-
-// --- Backend-native advisory lock tests ---
-
-#[test]
-fn backend_lock_acquire_and_release() {
-    let storage = LockableMemoryBackend::new();
-    let guard = acquire_lock(&storage).unwrap();
-    // Backend lock uses the lock_id, not a locks/ key
-    assert_eq!(guard.key(), "repo-lock");
-    release_lock(&storage, guard).unwrap();
-}
-
-#[test]
-fn backend_lock_second_acquire_is_rejected() {
-    let storage = LockableMemoryBackend::new();
-    let first = acquire_lock(&storage).unwrap();
-    let second = acquire_lock(&storage);
-    assert!(second.is_err(), "second lock should fail");
-    release_lock(&storage, first).unwrap();
-}
-
-#[test]
-fn break_lock_removes_backend_lock() {
-    let storage = LockableMemoryBackend::new();
-    let guard = acquire_lock(&storage).unwrap();
-    std::mem::forget(guard);
-
-    let removed = break_lock(&storage).unwrap();
-    assert_eq!(removed, 1);
-
-    // Should be able to acquire again after break
-    let guard = acquire_lock(&storage).unwrap();
-    release_lock(&storage, guard).unwrap();
-}
-
-#[test]
-fn break_lock_returns_zero_when_no_backend_lock_held() {
-    let storage = LockableMemoryBackend::new();
     let removed = break_lock(&storage).unwrap();
     assert_eq!(removed, 0);
 }

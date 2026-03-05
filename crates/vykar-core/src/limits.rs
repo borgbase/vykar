@@ -7,7 +7,7 @@ use nix::errno::Errno;
 use tracing::warn;
 
 use crate::config::ResourceLimitsConfig;
-use vykar_storage::{BackendLockInfo, RepackPlanRequest, RepackResultResponse, StorageBackend};
+use vykar_storage::{RepackPlanRequest, RepackResultResponse, StorageBackend};
 use vykar_types::error::Result;
 
 // ── Rate limiting runtime ────────────────────────────────────────────────────
@@ -193,14 +193,6 @@ impl StorageBackend for ThrottledStorageBackend {
 
     fn size(&self, key: &str) -> Result<Option<u64>> {
         self.inner.size(key)
-    }
-
-    fn acquire_advisory_lock(&self, lock_id: &str, info: &BackendLockInfo) -> Result<()> {
-        self.inner.acquire_advisory_lock(lock_id, info)
-    }
-
-    fn release_advisory_lock(&self, lock_id: &str) -> Result<()> {
-        self.inner.release_advisory_lock(lock_id)
     }
 
     fn server_repack(&self, plan: &RepackPlanRequest) -> Result<RepackResultResponse> {

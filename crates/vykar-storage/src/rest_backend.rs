@@ -8,8 +8,8 @@ use crate::RetryConfig;
 use vykar_types::error::{Result, VykarError};
 
 use crate::{
-    BackendLockInfo, RepackPlanRequest, RepackResultResponse, StorageBackend,
-    VerifyPacksPlanRequest, VerifyPacksResponse,
+    RepackPlanRequest, RepackResultResponse, StorageBackend, VerifyPacksPlanRequest,
+    VerifyPacksResponse,
 };
 
 /// HTTP REST backend for remote repository access via vykar-server.
@@ -111,33 +111,6 @@ impl RestBackend {
         let val: serde_json::Value = serde_json::from_slice(&body)
             .map_err(|e| VykarError::Other(format!("REST stats parse: {e}")))?;
         Ok(val)
-    }
-
-    /// Acquire a lock on the server.
-    pub fn acquire_lock(&self, id: &str, info: &BackendLockInfo) -> Result<()> {
-        let url = format!("{}/locks/{}", self.base_url, id);
-        let info = info.clone();
-        match self.retry_call("lock-acquire", || {
-            let req = self.apply_auth(self.agent.post(&url));
-            req.send_json(info.clone())
-        }) {
-            Ok(_) => Ok(()),
-            Err(ureq::Error::Status(409, _)) => Err(VykarError::Locked(id.to_string())),
-            Err(e) => Err(VykarError::Other(format!("REST lock acquire: {e}"))),
-        }
-    }
-
-    /// Release a lock on the server.
-    pub fn release_lock(&self, id: &str) -> Result<()> {
-        let url = format!("{}/locks/{}", self.base_url, id);
-        match self.retry_call("lock-release", || {
-            let req = self.apply_auth(self.agent.delete(&url));
-            req.call()
-        }) {
-            Ok(_) => Ok(()),
-            Err(ureq::Error::Status(404, _)) => Ok(()),
-            Err(e) => Err(VykarError::Other(format!("REST lock release: {e}"))),
-        }
     }
 
     /// Send a verify-packs plan to the server for server-side pack verification.
@@ -460,14 +433,6 @@ impl StorageBackend for RestBackend {
         })
         .map_err(|e| VykarError::Other(format!("REST MKDIR {key}: {e}")))?;
         Ok(())
-    }
-
-    fn acquire_advisory_lock(&self, lock_id: &str, info: &BackendLockInfo) -> Result<()> {
-        self.acquire_lock(lock_id, info)
-    }
-
-    fn release_advisory_lock(&self, lock_id: &str) -> Result<()> {
-        self.release_lock(lock_id)
     }
 
     fn server_repack(&self, plan: &RepackPlanRequest) -> Result<RepackResultResponse> {

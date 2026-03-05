@@ -3,6 +3,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use tracing::info;
 
+use std::sync::Arc;
+
 use crate::config::VykarConfig;
 use crate::limits;
 use crate::repo::lock;
@@ -85,12 +87,16 @@ pub fn with_repo_lock<T>(
     action: impl FnOnce(&mut Repository) -> Result<T>,
 ) -> Result<T> {
     let guard = lock::acquire_lock(repo.storage.as_ref())?;
+    let fence = lock::build_lock_fence(&guard, Arc::clone(&repo.storage));
+    repo.set_lock_fence(fence);
+
     let result = action(repo);
 
     if result.is_err() {
         repo.flush_on_abort();
     }
 
+    repo.clear_lock_fence();
     match lock::release_lock(repo.storage.as_ref(), guard) {
         Ok(()) => result,
         Err(release_err) => {
@@ -168,12 +174,17 @@ pub fn with_maintenance_lock<T>(
         _ => {}
     }
 
+    // Install lock fence after session checks pass.
+    let fence = lock::build_lock_fence(&guard, Arc::clone(&repo.storage));
+    repo.set_lock_fence(fence);
+
     let result = action(repo);
 
     if result.is_err() {
         repo.flush_on_abort();
     }
 
+    repo.clear_lock_fence();
     match lock::release_lock(repo.storage.as_ref(), guard) {
         Ok(()) => result,
         Err(release_err) => {

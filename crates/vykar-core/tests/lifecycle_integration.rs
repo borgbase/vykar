@@ -114,6 +114,7 @@ fn backup_source(
             xattrs_enabled: config.xattrs.enabled,
             compression: Compression::None,
             command_dumps: &[],
+            verbose: false,
         },
     )
     .unwrap()
@@ -399,6 +400,7 @@ fn command_dump_failure_does_not_mutate_repository_state() {
             xattrs_enabled: false,
             compression: Compression::None,
             command_dumps: &dumps,
+            verbose: false,
         },
     );
     assert!(result.is_err());
@@ -443,6 +445,7 @@ fn backup_fails_when_repository_lock_is_held_by_another_process() {
             xattrs_enabled: false,
             compression: Compression::None,
             command_dumps: &[],
+            verbose: false,
         },
     );
 

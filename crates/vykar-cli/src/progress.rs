@@ -83,11 +83,15 @@ pub(crate) struct BackupProgressRenderer {
     last_draw: Instant,
     last_line_len: usize,
     rendered_any: bool,
+    verbose: u8,
+    is_tty: bool,
 }
 
 impl BackupProgressRenderer {
-    pub(crate) fn new() -> Self {
-        PROGRESS_ACTIVE.store(true, Relaxed);
+    pub(crate) fn new(verbose: u8, is_tty: bool) -> Self {
+        if is_tty {
+            PROGRESS_ACTIVE.store(true, Relaxed);
+        }
         Self {
             current_file: None,
             nfiles: 0,
@@ -98,14 +102,45 @@ impl BackupProgressRenderer {
             last_draw: Instant::now(),
             last_line_len: 0,
             rendered_any: false,
+            verbose,
+            is_tty,
         }
     }
 
     pub(crate) fn on_event(&mut self, event: commands::backup::BackupProgressEvent) {
-        let should_render = match event {
+        match event {
+            commands::backup::BackupProgressEvent::FileProcessed {
+                path,
+                status,
+                added_bytes,
+            } => {
+                if self.verbose >= 1 {
+                    if status == commands::backup::FileStatus::Unchanged && self.verbose < 2 {
+                        return;
+                    }
+                    let status_str = match status {
+                        commands::backup::FileStatus::New => "new      ",
+                        commands::backup::FileStatus::Modified => "modified ",
+                        commands::backup::FileStatus::Unchanged => "unchanged",
+                    };
+                    let size_suffix = if status == commands::backup::FileStatus::Unchanged {
+                        String::new()
+                    } else {
+                        format!(" ({} added)", format_bytes(added_bytes))
+                    };
+                    let _guard = acquire_stderr_lock();
+                    if self.is_tty {
+                        eprint!("\r\x1b[2K");
+                        self.last_line_len = 0;
+                    }
+                    eprintln!("{status_str} {path}{size_suffix}");
+                }
+                return;
+            }
             commands::backup::BackupProgressEvent::FileStarted { path } => {
-                self.current_file = Some(path);
-                true
+                if self.is_tty {
+                    self.current_file = Some(path);
+                }
             }
             commands::backup::BackupProgressEvent::StatsUpdated {
                 nfiles,
@@ -115,27 +150,28 @@ impl BackupProgressRenderer {
                 errors,
                 current_file,
             } => {
-                self.nfiles = nfiles;
-                self.original_size = original_size;
-                self.compressed_size = compressed_size;
-                self.deduplicated_size = deduplicated_size;
-                self.errors = errors;
-                if let Some(path) = current_file {
-                    self.current_file = Some(path);
+                if self.is_tty {
+                    self.nfiles = nfiles;
+                    self.original_size = original_size;
+                    self.compressed_size = compressed_size;
+                    self.deduplicated_size = deduplicated_size;
+                    self.errors = errors;
+                    if let Some(path) = current_file {
+                        self.current_file = Some(path);
+                    }
                 }
-                true
             }
             commands::backup::BackupProgressEvent::SourceStarted { .. }
-            | commands::backup::BackupProgressEvent::SourceFinished { .. } => false,
-        };
+            | commands::backup::BackupProgressEvent::SourceFinished { .. } => return,
+        }
 
-        if should_render {
+        if self.is_tty {
             self.render(false);
         }
     }
 
     pub(crate) fn finish(&mut self) {
-        if !self.rendered_any {
+        if !self.is_tty || !self.rendered_any {
             PROGRESS_ACTIVE.store(false, Relaxed);
             return;
         }

@@ -88,6 +88,13 @@ pub struct BackupOutcome {
     pub is_partial: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileStatus {
+    New,
+    Modified,
+    Unchanged,
+}
+
 #[derive(Debug, Clone)]
 pub enum BackupProgressEvent {
     SourceStarted {
@@ -106,6 +113,12 @@ pub enum BackupProgressEvent {
         deduplicated_size: u64,
         errors: u64,
         current_file: Option<String>,
+    },
+    FileProcessed {
+        path: String,
+        status: FileStatus,
+        /// Bytes of new (deduplicated) data added for this file.
+        added_bytes: u64,
     },
 }
 
@@ -149,6 +162,8 @@ pub struct BackupRequest<'a> {
     pub xattrs_enabled: bool,
     pub compression: Compression,
     pub command_dumps: &'a [CommandDump],
+    /// When true, emit `FileProcessed` events for per-file verbose output.
+    pub verbose: bool,
 }
 
 pub fn run(config: &VykarConfig, req: BackupRequest<'_>) -> Result<BackupOutcome> {
@@ -177,6 +192,8 @@ pub fn run_with_progress(
     };
     let compression = req.compression;
     let command_dumps = req.command_dumps;
+    // Verbose per-file events only make sense when there is a callback to receive them.
+    let verbose = req.verbose && progress.is_some();
 
     if source_paths.is_empty() && command_dumps.is_empty() {
         return Err(VykarError::Other(
@@ -347,6 +364,7 @@ pub fn run_with_progress(
                 pipeline_buffer_bytes,
                 dedup_filter.as_deref(),
                 shutdown,
+                verbose,
             )?;
         } else {
             for source_path in source_paths {
@@ -374,6 +392,7 @@ pub fn run_with_progress(
                     &mut progress,
                     dedup_filter.as_deref(),
                     shutdown,
+                    verbose,
                 )?;
             }
         }

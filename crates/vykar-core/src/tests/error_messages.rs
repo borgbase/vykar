@@ -49,6 +49,7 @@ fn backup_on_uninitialized_repo_includes_url() {
             xattrs_enabled: false,
             compression: Compression::None,
             command_dumps: &[],
+            verbose: false,
         },
     );
     let err = match result {

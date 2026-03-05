@@ -52,6 +52,7 @@ fn open_local_repo(dir: &std::path::Path) -> Repository {
 }
 
 fn make_test_config(repo_dir: &std::path::Path) -> VykarConfig {
+    init_test_environment();
     VykarConfig {
         repository: RepositoryConfig {
             url: repo_dir.to_string_lossy().to_string(),
@@ -217,6 +218,7 @@ fn backup_exclude_if_present_skips_marked_directories() {
             xattrs_enabled: config.xattrs.enabled,
             compression: Compression::None,
             command_dumps: &[],
+            verbose: false,
         },
     )
     .unwrap()
@@ -257,6 +259,7 @@ fn backup_git_ignore_respected_when_enabled() {
             xattrs_enabled: config.xattrs.enabled,
             compression: Compression::None,
             command_dumps: &[],
+            verbose: false,
         },
     )
     .unwrap()
@@ -276,6 +279,7 @@ fn backup_git_ignore_respected_when_enabled() {
             xattrs_enabled: config.xattrs.enabled,
             compression: Compression::None,
             command_dumps: &[],
+            verbose: false,
         },
     )
     .unwrap()
@@ -323,6 +327,7 @@ fn backup_deduplicates_identical_files_and_extracts_correctly() {
             xattrs_enabled: config.xattrs.enabled,
             compression: Compression::None,
             command_dumps: &[],
+            verbose: false,
         },
     )
     .unwrap()
@@ -400,6 +405,7 @@ fn backup_run_with_progress_emits_events_and_final_stats() {
             xattrs_enabled: config.xattrs.enabled,
             compression: Compression::None,
             command_dumps: &[],
+            verbose: false,
         },
         Some(&mut on_progress),
         None,
@@ -484,6 +490,7 @@ fn backup_and_restore_preserves_file_xattrs_when_enabled() {
             xattrs_enabled: true,
             compression: Compression::None,
             command_dumps: &[],
+            verbose: false,
         },
     )
     .unwrap();
@@ -553,6 +560,7 @@ fn backup_skips_xattrs_when_disabled() {
             xattrs_enabled: false,
             compression: Compression::None,
             command_dumps: &[],
+            verbose: false,
         },
     )
     .unwrap();
@@ -603,6 +611,7 @@ fn file_cache_persists_and_matches_snapshot_items() {
             xattrs_enabled: config.xattrs.enabled,
             compression: Compression::None,
             command_dumps: &[],
+            verbose: false,
         },
     )
     .unwrap()
@@ -655,6 +664,7 @@ fn file_cache_persists_and_matches_snapshot_items() {
             xattrs_enabled: config.xattrs.enabled,
             compression: Compression::None,
             command_dumps: &[],
+            verbose: false,
         },
     )
     .unwrap();
@@ -729,6 +739,7 @@ fn file_cache_misses_on_modified_file() {
             xattrs_enabled: config.xattrs.enabled,
             compression: Compression::None,
             command_dumps: &[],
+            verbose: false,
         },
     )
     .unwrap();
@@ -763,6 +774,7 @@ fn file_cache_misses_on_modified_file() {
             xattrs_enabled: config.xattrs.enabled,
             compression: Compression::None,
             command_dumps: &[],
+            verbose: false,
         },
     )
     .unwrap();
@@ -848,6 +860,7 @@ fn info_reports_repository_statistics() {
             xattrs_enabled: config.xattrs.enabled,
             compression: Compression::None,
             command_dumps: &[],
+            verbose: false,
         },
     )
     .unwrap()
@@ -894,6 +907,7 @@ fn command_dump_backup_and_restore() {
             xattrs_enabled: false,
             compression: Compression::None,
             command_dumps: &dumps,
+            verbose: false,
         },
     )
     .unwrap()
@@ -965,6 +979,7 @@ fn command_dump_failing_command_aborts_backup() {
             xattrs_enabled: false,
             compression: Compression::None,
             command_dumps: &dumps,
+            verbose: false,
         },
     );
 
@@ -1009,6 +1024,7 @@ fn command_dump_mixed_with_files() {
             xattrs_enabled: false,
             compression: Compression::None,
             command_dumps: &dumps,
+            verbose: false,
         },
     )
     .unwrap()
@@ -1086,6 +1102,7 @@ fn backup_many_small_files_plus_large_file_roundtrip() {
             xattrs_enabled: false,
             compression: Compression::Lz4,
             command_dumps: &[],
+            verbose: false,
         },
     )
     .unwrap()
@@ -1151,6 +1168,7 @@ fn backup_many_small_files_plus_large_file_roundtrip() {
             xattrs_enabled: false,
             compression: Compression::Lz4,
             command_dumps: &[],
+            verbose: false,
         },
     )
     .unwrap()
@@ -1240,6 +1258,7 @@ fn backup_pipeline_threshold_splitting_roundtrip() {
             xattrs_enabled: false,
             compression: Compression::Lz4,
             command_dumps: &[],
+            verbose: false,
         },
     )
     .unwrap()
@@ -1318,6 +1337,7 @@ fn backup_pipeline_preserves_walk_order_with_mixed_file_sizes() {
             xattrs_enabled: false,
             compression: Compression::Lz4,
             command_dumps: &[],
+            verbose: false,
         },
     )
     .unwrap()
@@ -1373,6 +1393,7 @@ fn backup_pipeline_mixed_cache_hit_processed_and_large_roundtrip() {
             xattrs_enabled: false,
             compression: Compression::Lz4,
             command_dumps: &[],
+            verbose: false,
         },
     )
     .unwrap();
@@ -1397,6 +1418,7 @@ fn backup_pipeline_mixed_cache_hit_processed_and_large_roundtrip() {
             xattrs_enabled: false,
             compression: Compression::Lz4,
             command_dumps: &[],
+            verbose: false,
         },
     )
     .unwrap()
@@ -1475,6 +1497,7 @@ fn backup_emits_intermediate_progress_during_large_file() {
             xattrs_enabled: false,
             compression: Compression::None,
             command_dumps: &[],
+            verbose: false,
         },
         Some(&mut on_progress),
         None,
@@ -1589,6 +1612,7 @@ fn command_dump_emits_progress_events() {
             xattrs_enabled: false,
             compression: Compression::None,
             command_dumps: &dumps,
+            verbose: false,
         },
         Some(&mut on_progress),
         None,
@@ -1700,6 +1724,7 @@ fn command_dump_mixed_progress_events() {
             xattrs_enabled: false,
             compression: Compression::None,
             command_dumps: &dumps,
+            verbose: false,
         },
         Some(&mut on_progress),
         None,
@@ -1737,4 +1762,193 @@ fn command_dump_mixed_progress_events() {
         .expect("expected at least one StatsUpdated");
 
     assert_eq!(final_stats, 2, "final nfiles should be 2 (file + dump)");
+}
+
+#[test]
+fn verbose_file_processed_events_classify_new_modified_unchanged() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = tmp.path().join("repo");
+    let source_dir = tmp.path().join("source");
+    let cache_dir = tmp.path().join("cache");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    std::fs::create_dir_all(&source_dir).unwrap();
+    std::fs::create_dir_all(&cache_dir).unwrap();
+    std::fs::write(source_dir.join("alpha.txt"), b"alpha content").unwrap();
+    std::fs::write(source_dir.join("beta.txt"), b"beta content").unwrap();
+
+    let config = {
+        let mut cfg = make_test_config(&repo_dir);
+        cfg.cache_dir = Some(cache_dir.to_string_lossy().to_string());
+        cfg
+    };
+    commands::init::run(&config, None).unwrap();
+
+    let source_paths = vec![source_dir.to_string_lossy().to_string()];
+    let exclude_if_present: Vec<String> = Vec::new();
+    let exclude_patterns: Vec<String> = Vec::new();
+
+    // Helper to extract FileProcessed events.
+    fn file_processed_events(
+        events: &[commands::backup::BackupProgressEvent],
+    ) -> Vec<(String, commands::backup::FileStatus, u64)> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                commands::backup::BackupProgressEvent::FileProcessed {
+                    path,
+                    status,
+                    added_bytes,
+                } => Some((path.clone(), *status, *added_bytes)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    // --- First backup: all files should be New ---
+    let mut events1 = Vec::new();
+    let mut cb1 = |e| events1.push(e);
+    commands::backup::run_with_progress(
+        &config,
+        commands::backup::BackupRequest {
+            snapshot_name: "snap1",
+            passphrase: None,
+            source_paths: &source_paths,
+            source_label: "source",
+            exclude_patterns: &exclude_patterns,
+            exclude_if_present: &exclude_if_present,
+            one_file_system: true,
+            git_ignore: false,
+            xattrs_enabled: false,
+            compression: Compression::None,
+            command_dumps: &[],
+            verbose: true,
+        },
+        Some(&mut cb1),
+        None,
+    )
+    .unwrap();
+    let fp1 = file_processed_events(&events1);
+    assert_eq!(
+        fp1.len(),
+        2,
+        "expected 2 FileProcessed events, got {}",
+        fp1.len()
+    );
+    for (path, status, added_bytes) in &fp1 {
+        assert_eq!(
+            *status,
+            commands::backup::FileStatus::New,
+            "first backup: {path} should be New"
+        );
+        assert!(
+            *added_bytes > 0,
+            "first backup: {path} should have added_bytes > 0"
+        );
+    }
+
+    // --- Second backup (no changes): all files should be Unchanged ---
+    let mut events2 = Vec::new();
+    let mut cb2 = |e| events2.push(e);
+    commands::backup::run_with_progress(
+        &config,
+        commands::backup::BackupRequest {
+            snapshot_name: "snap2",
+            passphrase: None,
+            source_paths: &source_paths,
+            source_label: "source",
+            exclude_patterns: &exclude_patterns,
+            exclude_if_present: &exclude_if_present,
+            one_file_system: true,
+            git_ignore: false,
+            xattrs_enabled: false,
+            compression: Compression::None,
+            command_dumps: &[],
+            verbose: true,
+        },
+        Some(&mut cb2),
+        None,
+    )
+    .unwrap();
+    let fp2 = file_processed_events(&events2);
+    assert_eq!(
+        fp2.len(),
+        2,
+        "expected 2 FileProcessed events, got {}",
+        fp2.len()
+    );
+    for (path, status, added_bytes) in &fp2 {
+        assert_eq!(
+            *status,
+            commands::backup::FileStatus::Unchanged,
+            "second backup: {path} should be Unchanged"
+        );
+        assert_eq!(
+            *added_bytes, 0,
+            "second backup: {path} should have added_bytes == 0"
+        );
+    }
+
+    // --- Modify one file, third backup: one Modified, one Unchanged ---
+    // Ensure mtime changes (some filesystems have 1s resolution).
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    std::fs::write(source_dir.join("alpha.txt"), b"alpha CHANGED content").unwrap();
+
+    let mut events3 = Vec::new();
+    let mut cb3 = |e| events3.push(e);
+    commands::backup::run_with_progress(
+        &config,
+        commands::backup::BackupRequest {
+            snapshot_name: "snap3",
+            passphrase: None,
+            source_paths: &source_paths,
+            source_label: "source",
+            exclude_patterns: &exclude_patterns,
+            exclude_if_present: &exclude_if_present,
+            one_file_system: true,
+            git_ignore: false,
+            xattrs_enabled: false,
+            compression: Compression::None,
+            command_dumps: &[],
+            verbose: true,
+        },
+        Some(&mut cb3),
+        None,
+    )
+    .unwrap();
+    let fp3 = file_processed_events(&events3);
+    assert_eq!(
+        fp3.len(),
+        2,
+        "expected 2 FileProcessed events, got {}",
+        fp3.len()
+    );
+
+    let alpha = fp3
+        .iter()
+        .find(|(p, _, _)| p.contains("alpha"))
+        .expect("alpha event");
+    let beta = fp3
+        .iter()
+        .find(|(p, _, _)| p.contains("beta"))
+        .expect("beta event");
+
+    assert_eq!(
+        alpha.1,
+        commands::backup::FileStatus::Modified,
+        "third backup: alpha should be Modified"
+    );
+    assert!(
+        alpha.2 > 0,
+        "third backup: modified file should have added_bytes > 0"
+    );
+
+    assert_eq!(
+        beta.1,
+        commands::backup::FileStatus::Unchanged,
+        "third backup: beta should be Unchanged"
+    );
+    assert_eq!(
+        beta.2, 0,
+        "third backup: unchanged file should have added_bytes == 0"
+    );
 }

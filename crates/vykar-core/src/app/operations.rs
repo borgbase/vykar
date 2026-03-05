@@ -81,6 +81,7 @@ pub fn run_backup_for_repo_with_progress(
                 xattrs_enabled: source.xattrs_enabled,
                 compression,
                 command_dumps: &source.command_dumps,
+                verbose: false,
             },
             Some(progress),
             None,

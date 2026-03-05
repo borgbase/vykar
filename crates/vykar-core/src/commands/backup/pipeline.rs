@@ -311,6 +311,8 @@ struct LargeFileAccum {
     metadata: fs::MetadataSummary,
     next_expected_index: usize,
     num_segments: usize,
+    /// Baseline `deduplicated_size` when segment 0 started (for verbose added_bytes).
+    dedup_baseline: u64,
 }
 
 /// Validate and update the segment accumulator state machine.
@@ -325,6 +327,7 @@ fn validate_segment_accum(
     metadata: fs::MetadataSummary,
     segment_index: usize,
     num_segments: usize,
+    dedup_baseline: u64,
 ) -> Result<()> {
     if segment_index == 0 {
         if large_file_accum.is_some() {
@@ -337,6 +340,7 @@ fn validate_segment_accum(
             abs_path,
             metadata,
             next_expected_index: 1,
+            dedup_baseline,
             num_segments,
         });
     } else {
@@ -378,8 +382,10 @@ fn consume_processed_entry(
     budget: &ByteBudget,
     dedup_filter: Option<&xorf::Xor8>,
     large_file_accum: &mut Option<LargeFileAccum>,
+    old_file_cache: &FileCache,
+    verbose: bool,
 ) -> Result<()> {
-    use super::{append_item_to_stream, emit_stats_progress};
+    use super::{append_item_to_stream, emit_stats_progress, FileStatus};
 
     match entry {
         ProcessedEntry::ProcessedFile {
@@ -395,12 +401,31 @@ fn consume_processed_entry(
                 });
             }
 
+            let dedup_before = if verbose { stats.deduplicated_size } else { 0 };
+
             process_worker_chunks(repo, &mut item, chunks, stats, compression, dedup_filter)?;
 
             // Release budget bytes now that chunks are committed.
             budget.release(acquired_bytes);
 
             stats.nfiles += 1;
+
+            if verbose {
+                let added_bytes = stats.deduplicated_size - dedup_before;
+                let status = if old_file_cache.get(&abs_path).is_some() {
+                    FileStatus::Modified
+                } else {
+                    FileStatus::New
+                };
+                super::emit_progress(
+                    progress,
+                    BackupProgressEvent::FileProcessed {
+                        path: item.path.clone(),
+                        status,
+                        added_bytes,
+                    },
+                );
+            }
 
             append_item_to_stream(
                 repo,
@@ -442,6 +467,12 @@ fn consume_processed_entry(
                 }
             }
 
+            let dedup_baseline = if verbose && segment_index == 0 {
+                stats.deduplicated_size
+            } else {
+                0
+            };
+
             validate_segment_accum(
                 large_file_accum,
                 item,
@@ -449,6 +480,7 @@ fn consume_processed_entry(
                 metadata,
                 segment_index,
                 num_segments,
+                dedup_baseline,
             )?;
 
             // Process chunks via shared helper.
@@ -477,6 +509,23 @@ fn consume_processed_entry(
                     )
                 })?;
                 stats.nfiles += 1;
+
+                if verbose {
+                    let added_bytes = stats.deduplicated_size - accum.dedup_baseline;
+                    let status = if old_file_cache.get(&accum.abs_path).is_some() {
+                        FileStatus::Modified
+                    } else {
+                        FileStatus::New
+                    };
+                    super::emit_progress(
+                        progress,
+                        BackupProgressEvent::FileProcessed {
+                            path: accum.item.path.clone(),
+                            status,
+                            added_bytes,
+                        },
+                    );
+                }
 
                 append_item_to_stream(
                     repo,
@@ -514,6 +563,17 @@ fn consume_processed_entry(
             }
 
             super::commit::commit_cache_hit(repo, &mut item, cached_refs, stats);
+
+            if verbose {
+                super::emit_progress(
+                    progress,
+                    BackupProgressEvent::FileProcessed {
+                        path: item.path.clone(),
+                        status: FileStatus::Unchanged,
+                        added_bytes: 0,
+                    },
+                );
+            }
 
             append_item_to_stream(
                 repo,
@@ -621,6 +681,7 @@ pub(crate) fn run_parallel_pipeline(
     pipeline_buffer_bytes: usize,
     dedup_filter: Option<&xorf::Xor8>,
     shutdown: Option<&AtomicBool>,
+    verbose: bool,
 ) -> Result<()> {
     debug_assert!(segment_size > 0, "segment_size must be non-zero");
     debug_assert!(num_workers > 0, "num_workers must be non-zero");
@@ -801,6 +862,8 @@ pub(crate) fn run_parallel_pipeline(
                             &budget,
                             dedup_filter,
                             &mut large_file_accum,
+                            file_cache,
+                            verbose,
                         ) {
                             budget.poison();
                             consume_err = Some(e);
@@ -915,12 +978,13 @@ mod tests {
             meta,
             0,
             3,
+            0,
         )
         .unwrap();
 
         // Skip segment 1, feed segment 2 → error.
-        let err =
-            validate_segment_accum(&mut accum, None, "/tmp/file_a".into(), meta, 2, 3).unwrap_err();
+        let err = validate_segment_accum(&mut accum, None, "/tmp/file_a".into(), meta, 2, 3, 0)
+            .unwrap_err();
         assert!(
             err.to_string().contains("segment index mismatch"),
             "expected 'segment index mismatch', got: {err}"
@@ -940,12 +1004,13 @@ mod tests {
             meta,
             0,
             3,
+            0,
         )
         .unwrap();
 
         // Feed segment 1 with different abs_path → error.
-        let err =
-            validate_segment_accum(&mut accum, None, "/tmp/file_b".into(), meta, 1, 3).unwrap_err();
+        let err = validate_segment_accum(&mut accum, None, "/tmp/file_b".into(), meta, 1, 3, 0)
+            .unwrap_err();
         assert!(
             err.to_string().contains("segment file identity mismatch"),
             "expected 'segment file identity mismatch', got: {err}"
@@ -965,6 +1030,7 @@ mod tests {
             meta,
             0,
             3,
+            0,
         )
         .unwrap();
 
@@ -976,6 +1042,7 @@ mod tests {
             meta,
             0,
             2,
+            0,
         )
         .unwrap_err();
         assert!(
@@ -990,8 +1057,8 @@ mod tests {
         let meta = test_metadata();
 
         // Feed segment 1 with no prior segment 0 → error.
-        let err =
-            validate_segment_accum(&mut accum, None, "/tmp/file_a".into(), meta, 1, 3).unwrap_err();
+        let err = validate_segment_accum(&mut accum, None, "/tmp/file_a".into(), meta, 1, 3, 0)
+            .unwrap_err();
         assert!(
             err.to_string()
                 .contains("FileSegment without preceding segment 0"),
@@ -1012,9 +1079,10 @@ mod tests {
             meta,
             0,
             3,
+            0,
         )
         .unwrap();
-        validate_segment_accum(&mut accum, None, "/tmp/file_a".into(), meta, 1, 3).unwrap();
+        validate_segment_accum(&mut accum, None, "/tmp/file_a".into(), meta, 1, 3, 0).unwrap();
 
         // Simulate the post-loop check from run_parallel_pipeline.
         assert!(accum.is_some(), "accum should still be active");
@@ -1045,12 +1113,13 @@ mod tests {
             meta,
             0,
             3,
+            0,
         )
         .unwrap();
 
         // Feed segment 1 with different num_segments → error.
-        let err =
-            validate_segment_accum(&mut accum, None, "/tmp/file_a".into(), meta, 1, 5).unwrap_err();
+        let err = validate_segment_accum(&mut accum, None, "/tmp/file_a".into(), meta, 1, 5, 0)
+            .unwrap_err();
         assert!(
             err.to_string().contains("segment count mismatch"),
             "expected 'segment count mismatch', got: {err}"
@@ -1069,7 +1138,7 @@ mod tests {
             } else {
                 None
             };
-            validate_segment_accum(&mut accum, item, "/tmp/file_a".into(), meta, i, 3).unwrap();
+            validate_segment_accum(&mut accum, item, "/tmp/file_a".into(), meta, i, 3, 0).unwrap();
         }
 
         // Accumulator should be present with next_expected_index == 3.

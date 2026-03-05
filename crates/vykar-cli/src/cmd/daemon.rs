@@ -124,6 +124,7 @@ fn run_backup_cycle(repos: &[&ResolvedRepo]) {
             &repo.repo_hooks,
             &repo.label,
             Some(&SHUTDOWN),
+            0,
         ) {
             Ok(partial) => {
                 if partial {

@@ -110,6 +110,7 @@ pub fn backup_single_source(
             xattrs_enabled: config.xattrs.enabled,
             compression: Compression::None,
             command_dumps: &[],
+            verbose: false,
         },
     )
     .unwrap()

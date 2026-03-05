@@ -47,6 +47,7 @@ fn make_hook_ctx(command: &str, cfg: &VykarConfig, repo_label: &Option<String>) 
 }
 
 /// Returns `Ok(had_partial)` — `true` if backup had soft errors but still succeeded.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_default_actions(
     cfg: &VykarConfig,
     label: Option<&str>,
@@ -55,6 +56,7 @@ pub(crate) fn run_default_actions(
     repo_hooks: &HooksConfig,
     repo_label: &Option<String>,
     shutdown: Option<&AtomicBool>,
+    verbose: u8,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let start = std::time::Instant::now();
     let mut steps: Vec<(&str, StepResult)> = Vec::new();
@@ -68,7 +70,20 @@ pub(crate) fn run_default_actions(
         global_hooks,
         repo_hooks,
         &mut make_hook_ctx("backup", cfg, repo_label),
-        || cmd::backup::run_backup(cfg, label, None, None, None, vec![], sources, &[], shutdown),
+        || {
+            cmd::backup::run_backup(
+                cfg,
+                label,
+                None,
+                None,
+                None,
+                vec![],
+                sources,
+                &[],
+                shutdown,
+                verbose,
+            )
+        },
     ) {
         Ok(partial) => {
             if partial {
@@ -207,6 +222,7 @@ pub(crate) fn dispatch_command(
     label: Option<&str>,
     sources: &[SourceEntry],
     shutdown: Option<&AtomicBool>,
+    verbose: u8,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     match command {
         Commands::Init { .. } => cmd::init::run_init(cfg, label).map(|()| false),
@@ -227,6 +243,7 @@ pub(crate) fn dispatch_command(
             sources,
             source,
             shutdown,
+            verbose,
         ),
         Commands::List { source, last, .. } => {
             cmd::list::run_list(cfg, label, source, *last).map(|()| false)

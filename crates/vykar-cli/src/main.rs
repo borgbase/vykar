@@ -314,11 +314,12 @@ fn run_repo_command(cli: &Cli, repo: &ResolvedRepo) -> Result<bool, Box<dyn std:
     warn_if_untrusted_rest(cfg, label);
 
     let has_hooks = !repo.global_hooks.is_empty() || !repo.repo_hooks.is_empty();
+    let verbose = cli.verbose;
 
     let shutdown = Some(&signal::SHUTDOWN as &std::sync::atomic::AtomicBool);
     match &cli.command {
         Some(cmd) => {
-            let run_action = || dispatch_command(cmd, cfg, label, &repo.sources, shutdown);
+            let run_action = || dispatch_command(cmd, cfg, label, &repo.sources, shutdown, verbose);
             if has_hooks {
                 let mut ctx = HookContext {
                     command: cmd.name().to_string(),
@@ -341,6 +342,7 @@ fn run_repo_command(cli: &Cli, repo: &ResolvedRepo) -> Result<bool, Box<dyn std:
             &repo.repo_hooks,
             &repo.label,
             shutdown,
+            verbose,
         ),
     }
 }

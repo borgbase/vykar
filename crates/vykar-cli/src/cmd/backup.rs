@@ -14,14 +14,16 @@ fn run_backup_operation(
     config: &VykarConfig,
     req: commands::backup::BackupRequest<'_>,
     show_progress: bool,
+    verbose: u8,
     shutdown: Option<&AtomicBool>,
 ) -> Result<commands::backup::BackupOutcome, Box<dyn std::error::Error>> {
-    if !show_progress {
+    if !show_progress && verbose == 0 {
         return commands::backup::run_with_progress(config, req, None, shutdown)
             .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) });
     }
 
-    let mut renderer = BackupProgressRenderer::new();
+    let is_tty = std::io::stderr().is_terminal();
+    let mut renderer = BackupProgressRenderer::new(verbose, is_tty);
     let mut on_progress = |event| renderer.on_event(event);
     let result = commands::backup::run_with_progress(config, req, Some(&mut on_progress), shutdown);
     renderer.finish();
@@ -42,6 +44,7 @@ pub(crate) fn run_backup(
     sources: &[SourceEntry],
     source_filter: &[String],
     shutdown: Option<&AtomicBool>,
+    verbose: u8,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     // Apply connections override before opening the repo
     let config = if let Some(c) = connections {
@@ -100,8 +103,10 @@ pub(crate) fn run_backup(
                     xattrs_enabled: config.xattrs.enabled,
                     compression,
                     command_dumps: &[],
+                    verbose: verbose >= 1,
                 },
                 show_progress,
+                verbose,
                 shutdown,
             )?;
 
@@ -151,8 +156,10 @@ pub(crate) fn run_backup(
                             xattrs_enabled: source.xattrs_enabled,
                             compression,
                             command_dumps: &source.command_dumps,
+                            verbose: verbose >= 1,
                         },
                         show_progress,
+                        verbose,
                         shutdown,
                     )?;
 

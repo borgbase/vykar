@@ -24,8 +24,8 @@ use super::commit::process_worker_chunks;
 use super::walk::{
     build_configured_walker, is_soft_io_error, is_soft_walk_error, read_item_xattrs,
 };
-use super::BackupProgressEvent;
 use super::{append_item_to_stream, emit_progress, emit_stats_progress};
+use super::{BackupProgressEvent, FileStatus};
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn flush_regular_file_batch(
@@ -133,6 +133,7 @@ fn flush_cross_file_batch(
     new_file_cache: &mut FileCache,
     progress: &mut Option<&mut dyn FnMut(BackupProgressEvent)>,
     dedup_filter: Option<&xorf::Xor8>,
+    verbose: bool,
 ) -> Result<()> {
     if batch.is_empty() {
         return Ok(());
@@ -163,6 +164,8 @@ fn flush_cross_file_batch(
 
         let mut item = file.item;
 
+        let dedup_before = if verbose { stats.deduplicated_size } else { 0 };
+
         process_worker_chunks(
             repo,
             &mut item,
@@ -173,6 +176,23 @@ fn flush_cross_file_batch(
         )?;
 
         stats.nfiles += 1;
+
+        if verbose {
+            let added_bytes = stats.deduplicated_size - dedup_before;
+            let status = if repo.file_cache().get(&file.abs_path).is_some() {
+                FileStatus::Modified
+            } else {
+                FileStatus::New
+            };
+            emit_progress(
+                progress,
+                BackupProgressEvent::FileProcessed {
+                    path: item.path.clone(),
+                    status,
+                    added_bytes,
+                },
+            );
+        }
 
         append_item_to_stream(
             repo,
@@ -234,6 +254,7 @@ pub(super) fn process_regular_file_item(
     max_pending_transform_bytes: usize,
     max_pending_file_actions: usize,
     dedup_filter: Option<&xorf::Xor8>,
+    verbose: bool,
 ) -> Result<()> {
     if let Some(cb) = progress.as_deref_mut() {
         cb(BackupProgressEvent::FileStarted {
@@ -259,6 +280,17 @@ pub(super) fn process_regular_file_item(
         let cached_refs = cached_refs.to_vec();
         super::commit::commit_cache_hit(repo, item, cached_refs, stats);
 
+        if verbose {
+            emit_progress(
+                progress,
+                BackupProgressEvent::FileProcessed {
+                    path: item.path.clone(),
+                    status: FileStatus::Unchanged,
+                    added_bytes: 0,
+                },
+            );
+        }
+
         new_file_cache.insert(
             &abs_path,
             metadata_summary.device,
@@ -275,6 +307,14 @@ pub(super) fn process_regular_file_item(
     }
 
     let chunk_id_key = *repo.crypto.chunk_id_key();
+    // Check old cache for new-vs-modified before opening file (avoids borrow conflict).
+    let was_in_old_cache = if verbose {
+        repo.file_cache().get(&abs_path).is_some()
+    } else {
+        false
+    };
+    let dedup_before = if verbose { stats.deduplicated_size } else { 0 };
+
     let file = File::open(entry_path).map_err(VykarError::Io)?;
     let chunk_stream = chunker::chunk_stream(
         limits::LimitedReader::new(file, read_limiter),
@@ -324,6 +364,23 @@ pub(super) fn process_regular_file_item(
 
     stats.nfiles += 1;
 
+    if verbose {
+        let added_bytes = stats.deduplicated_size - dedup_before;
+        let status = if was_in_old_cache {
+            FileStatus::Modified
+        } else {
+            FileStatus::New
+        };
+        emit_progress(
+            progress,
+            BackupProgressEvent::FileProcessed {
+                path: item.path.clone(),
+                status,
+                added_bytes,
+            },
+        );
+    }
+
     // Update file cache with the chunks we just stored.
     new_file_cache.insert(
         &abs_path,
@@ -362,6 +419,7 @@ pub(super) fn process_source_path(
     progress: &mut Option<&mut dyn FnMut(BackupProgressEvent)>,
     dedup_filter: Option<&xorf::Xor8>,
     shutdown: Option<&AtomicBool>,
+    verbose: bool,
 ) -> Result<()> {
     emit_progress(
         progress,
@@ -547,6 +605,7 @@ pub(super) fn process_source_path(
                         new_file_cache,
                         progress,
                         dedup_filter,
+                        verbose,
                     )?;
 
                     if let Some(cb) = progress.as_deref_mut() {
@@ -556,6 +615,17 @@ pub(super) fn process_source_path(
                     }
 
                     super::commit::commit_cache_hit(repo, &mut item, cached_refs, stats);
+
+                    if verbose {
+                        emit_progress(
+                            progress,
+                            BackupProgressEvent::FileProcessed {
+                                path: item.path.clone(),
+                                status: FileStatus::Unchanged,
+                                added_bytes: 0,
+                            },
+                        );
+                    }
 
                     new_file_cache.insert(
                         &abs_path,
@@ -598,6 +668,7 @@ pub(super) fn process_source_path(
                             new_file_cache,
                             progress,
                             dedup_filter,
+                            verbose,
                         )?;
                     }
                     continue; // item will be appended by flush
@@ -617,6 +688,7 @@ pub(super) fn process_source_path(
                     new_file_cache,
                     progress,
                     dedup_filter,
+                    verbose,
                 )?;
 
                 if let Err(e) = process_regular_file_item(
@@ -633,6 +705,7 @@ pub(super) fn process_source_path(
                     max_pending_transform_bytes,
                     max_pending_file_actions,
                     dedup_filter,
+                    verbose,
                 ) {
                     if e.is_soft_file_error() {
                         warn!(path = %entry.path().display(), error = %e, "skipping file");
@@ -657,6 +730,7 @@ pub(super) fn process_source_path(
                 new_file_cache,
                 progress,
                 dedup_filter,
+                verbose,
             )?;
         }
 
@@ -685,6 +759,7 @@ pub(super) fn process_source_path(
         new_file_cache,
         progress,
         dedup_filter,
+        verbose,
     )?;
 
     emit_progress(

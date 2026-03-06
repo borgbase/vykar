@@ -1,5 +1,6 @@
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::JoinHandle;
 use std::time::SystemTime;
 
 use chrono::{Duration, Utc};
@@ -323,6 +324,99 @@ pub fn deregister_session(storage: &dyn StorageBackend, session_id: &str) {
                 }
             }
         }
+    }
+}
+
+/// Interruptible stop signal for the refresh thread.
+struct StopSignal {
+    mutex: Mutex<bool>,
+    condvar: Condvar,
+}
+
+impl StopSignal {
+    fn new() -> Self {
+        Self {
+            mutex: Mutex::new(false),
+            condvar: Condvar::new(),
+        }
+    }
+
+    /// Block up to `timeout`. Returns true immediately if signalled.
+    fn wait_timeout(&self, timeout: std::time::Duration) -> bool {
+        let guard = self.mutex.lock().unwrap();
+        let (guard, _) = self
+            .condvar
+            .wait_timeout_while(guard, timeout, |stopped| !*stopped)
+            .unwrap();
+        *guard
+    }
+
+    /// Wake the thread immediately.
+    fn signal(&self) {
+        *self.mutex.lock().unwrap() = true;
+        self.condvar.notify_all();
+    }
+}
+
+/// RAII guard that deregisters a session on drop and periodically refreshes
+/// the session marker so maintenance doesn't treat it as stale.
+pub struct SessionGuard {
+    storage: Arc<dyn StorageBackend>,
+    session_id: String,
+    refresh_handle: Option<JoinHandle<()>>,
+    stop: Arc<StopSignal>,
+}
+
+impl SessionGuard {
+    /// Adopt an already-registered session. Starts the refresh thread but
+    /// does NOT call `register_session()` — the caller must have done that
+    /// before opening the repo (mirrors backup's ordering).
+    pub fn adopt(storage: Arc<dyn StorageBackend>, session_id: String) -> Result<Self> {
+        let stop = Arc::new(StopSignal::new());
+        let handle =
+            Self::spawn_refresher(Arc::clone(&storage), session_id.clone(), Arc::clone(&stop))?;
+        Ok(Self {
+            storage,
+            session_id,
+            refresh_handle: Some(handle),
+            stop,
+        })
+    }
+
+    fn spawn_refresher(
+        storage: Arc<dyn StorageBackend>,
+        session_id: String,
+        stop: Arc<StopSignal>,
+    ) -> Result<JoinHandle<()>> {
+        std::thread::Builder::new()
+            .name("session-refresh".into())
+            .spawn(move || {
+                const REFRESH_INTERVAL: std::time::Duration =
+                    std::time::Duration::from_secs(15 * 60);
+                const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+                let mut elapsed = std::time::Duration::ZERO;
+                loop {
+                    if stop.wait_timeout(POLL_INTERVAL) {
+                        break;
+                    }
+                    elapsed += POLL_INTERVAL;
+                    if elapsed >= REFRESH_INTERVAL {
+                        refresh_session(storage.as_ref(), &session_id);
+                        elapsed = std::time::Duration::ZERO;
+                    }
+                }
+            })
+            .map_err(|e| VykarError::Other(format!("failed to spawn session refresh thread: {e}")))
+    }
+}
+
+impl Drop for SessionGuard {
+    fn drop(&mut self) {
+        self.stop.signal();
+        if let Some(handle) = self.refresh_handle.take() {
+            let _ = handle.join();
+        }
+        deregister_session(self.storage.as_ref(), &self.session_id);
     }
 }
 

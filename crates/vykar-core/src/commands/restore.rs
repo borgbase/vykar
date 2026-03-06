@@ -25,8 +25,6 @@ use vykar_types::pack_id::PackId;
 
 use crate::repo::Repository;
 
-use super::util::open_repo_without_index_or_cache;
-
 // ---------------------------------------------------------------------------
 // Constants for coalesced parallel restore
 // ---------------------------------------------------------------------------
@@ -166,7 +164,8 @@ fn restore_with_filter<F>(
 where
     F: FnMut(&str) -> bool,
 {
-    let mut repo = open_repo_without_index_or_cache(config, passphrase)?;
+    let (mut repo, _session_guard) =
+        super::util::open_repo_with_read_session(config, passphrase, true, true)?;
     // Shrink blob cache for restore — the parallel pipeline reads pack data
     // directly via storage.get_range(), so the cache only serves the small
     // item-stream tree-pack chunks. 2 MiB is plenty.

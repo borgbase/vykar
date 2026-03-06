@@ -60,6 +60,54 @@ pub fn open_repo_without_index_or_cache(
         .map_err(|e| enrich_repo_not_found(e, &config.repository.url))
 }
 
+/// Open a repo for a read-only operation, registering a session marker
+/// BEFORE opening so that concurrent maintenance sees us.
+/// Returns (repo, session_guard). The guard deregisters on drop.
+pub fn open_repo_with_read_session(
+    config: &VykarConfig,
+    passphrase: Option<&str>,
+    skip_index: bool,
+    skip_file_cache: bool,
+) -> Result<(Repository, lock::SessionGuard)> {
+    let connections = config.limits.connections;
+    let backend = storage::backend_from_config(&config.repository, connections)?;
+    let backend = limits::wrap_storage_backend(backend, &config.limits);
+
+    let session_id = format!("{:032x}", rand::random::<u128>());
+    lock::register_session(backend.as_ref(), &session_id)?;
+
+    let open_result = if skip_file_cache {
+        Repository::open_without_index_or_cache(backend, passphrase, cache_dir_from_config(config))
+    } else if skip_index {
+        Repository::open_without_index(backend, passphrase, cache_dir_from_config(config))
+    } else {
+        Repository::open(backend, passphrase, cache_dir_from_config(config))
+    };
+
+    let deregister_fresh = |sid: &str| {
+        if let Ok(cleanup) = storage::backend_from_config(&config.repository, 1) {
+            lock::deregister_session(cleanup.as_ref(), sid);
+        }
+    };
+
+    match open_result {
+        Ok(repo) => {
+            match lock::SessionGuard::adopt(Arc::clone(&repo.storage), session_id.clone()) {
+                Ok(guard) => Ok((repo, guard)),
+                Err(e) => {
+                    lock::deregister_session(repo.storage.as_ref(), &session_id);
+                    Err(e)
+                }
+            }
+        }
+        Err(e) => {
+            // Backend was consumed by open — build a fresh one just for cleanup.
+            deregister_fresh(&session_id);
+            Err(enrich_repo_not_found(e, &config.repository.url))
+        }
+    }
+}
+
 /// Open a repository and execute a mutation while holding an advisory lock.
 pub fn with_open_repo_lock<T>(
     config: &VykarConfig,

@@ -9,7 +9,6 @@ use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
 
 use super::list;
-use super::util::open_repo_without_index;
 
 /// Filter criteria (all fields are AND-combined).
 pub struct FindFilter {
@@ -106,7 +105,8 @@ pub fn run(
     scope: &FindScope,
     filter: &FindFilter,
 ) -> Result<Vec<PathTimeline>> {
-    let mut repo = open_repo_without_index(config, passphrase)?;
+    let (mut repo, _session_guard) =
+        super::util::open_repo_with_read_session(config, passphrase, true, false)?;
 
     // Select and sort snapshots chronologically
     let mut entries: Vec<_> = repo.manifest().snapshots.clone();

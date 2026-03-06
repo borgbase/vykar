@@ -67,7 +67,7 @@ pub enum VykarError {
     #[error("operation interrupted by signal")]
     Interrupted,
 
-    #[error("active backup sessions prevent maintenance: {0:?}")]
+    #[error("active sessions prevent maintenance: {0:?}")]
     ActiveSessions(Vec<String>),
 
     #[error("commit failed: referenced chunks were deleted since session started")]

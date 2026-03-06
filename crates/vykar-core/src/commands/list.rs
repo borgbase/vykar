@@ -29,7 +29,8 @@ pub fn list_snapshot_items(
     passphrase: Option<&str>,
     snapshot_name: &str,
 ) -> Result<Vec<Item>> {
-    let mut repo = open_repo_without_index(config, passphrase)?;
+    let (mut repo, _session_guard) =
+        super::util::open_repo_with_read_session(config, passphrase, true, false)?;
 
     // Resolve "latest" or exact snapshot name
     let resolved_name = repo

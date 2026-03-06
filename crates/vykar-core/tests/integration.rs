@@ -1952,3 +1952,98 @@ fn verbose_file_processed_events_classify_new_modified_unchanged() {
         "third backup: unchanged file should have added_bytes == 0"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Bug 1 verification: plaintext chunk_id_key consistency across init/open
+// ---------------------------------------------------------------------------
+
+#[test]
+fn plaintext_chunk_id_key_consistent_across_init_and_open() {
+    init_test_environment();
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = tmp.path().join("repo");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+
+    let data = b"hello world";
+
+    // Init a plaintext repo and compute a ChunkId
+    let storage = Box::new(LocalBackend::new(repo_dir.to_str().unwrap()).unwrap());
+    let repo = Repository::init(
+        storage,
+        EncryptionMode::None,
+        ChunkerConfig::default(),
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+    let key_init = *repo.crypto.chunk_id_key();
+    let id_init = vykar_types::chunk_id::ChunkId::compute(&key_init, data);
+    drop(repo);
+
+    // Re-open the same repo and compute the ChunkId for the same data
+    let storage = Box::new(LocalBackend::new(repo_dir.to_str().unwrap()).unwrap());
+    let repo = Repository::open(storage, None, None).unwrap();
+    let key_open = *repo.crypto.chunk_id_key();
+    let id_open = vykar_types::chunk_id::ChunkId::compute(&key_open, data);
+
+    assert_eq!(
+        key_init, key_open,
+        "chunk_id_key must be identical after init and open"
+    );
+    assert_eq!(
+        id_init, id_open,
+        "ChunkId for same data must match across init and open"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Bug 2 verification: SessionGuard blocks maintenance
+// ---------------------------------------------------------------------------
+
+#[test]
+fn session_guard_blocks_maintenance() {
+    use vykar_core::commands::util::with_maintenance_lock;
+    use vykar_core::repo::lock;
+
+    init_test_environment();
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = tmp.path().join("repo");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+
+    // Init a repo so with_maintenance_lock can open it
+    let storage = Box::new(LocalBackend::new(repo_dir.to_str().unwrap()).unwrap());
+    let repo = Repository::init(
+        storage,
+        EncryptionMode::None,
+        ChunkerConfig::default(),
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+    drop(repo);
+
+    // Register a read session and adopt it with a guard
+    let storage: std::sync::Arc<dyn vykar_storage::StorageBackend> =
+        std::sync::Arc::new(LocalBackend::new(repo_dir.to_str().unwrap()).unwrap());
+    let session_id = format!("{:032x}", rand::random::<u128>());
+    lock::register_session(storage.as_ref(), &session_id).unwrap();
+    let guard =
+        lock::SessionGuard::adopt(std::sync::Arc::clone(&storage), session_id.clone()).unwrap();
+
+    // with_maintenance_lock must refuse while the session is active
+    let mut repo2 = open_local_repo(&repo_dir);
+    let err = with_maintenance_lock(&mut repo2, |_| Ok(())).unwrap_err();
+    assert!(
+        matches!(err, vykar_types::error::VykarError::ActiveSessions(_)),
+        "expected ActiveSessions, got: {err}"
+    );
+
+    // Drop the guard — session deregistered
+    drop(guard);
+
+    // Maintenance should now succeed
+    let mut repo3 = open_local_repo(&repo_dir);
+    with_maintenance_lock(&mut repo3, |_| Ok(())).unwrap();
+}

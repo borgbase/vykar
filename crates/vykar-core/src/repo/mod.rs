@@ -150,6 +150,17 @@ pub struct Repository {
     lock_fence: Option<Arc<dyn Fn() -> Result<()> + Send + Sync>>,
 }
 
+/// Derive a deterministic chunk_id_key for plaintext repos from the repo ID.
+fn derive_plaintext_chunk_id_key(repo_id: &[u8]) -> [u8; 32] {
+    use blake2::digest::{Update, VariableOutput};
+    use blake2::Blake2bVar;
+    let mut key = [0u8; 32];
+    let mut hasher = Blake2bVar::new(32).unwrap();
+    hasher.update(repo_id);
+    hasher.finalize_variable(&mut key).unwrap();
+    key
+}
+
 impl Repository {
     /// Initialize a new repository.
     pub fn init(
@@ -199,8 +210,7 @@ impl Repository {
         let (crypto, encrypted_key): (Arc<dyn CryptoEngine>, Option<EncryptedKey>) =
             match &encryption {
                 EncryptionMode::None => {
-                    let mut chunk_id_key = [0u8; 32];
-                    rng.fill_bytes(&mut chunk_id_key);
+                    let chunk_id_key = derive_plaintext_chunk_id_key(&repo_config.id);
                     (Arc::new(PlaintextEngine::new(&chunk_id_key)), None)
                 }
                 EncryptionMode::Aes256Gcm => {
@@ -375,12 +385,7 @@ impl Repository {
         // Build crypto engine
         let crypto: Arc<dyn CryptoEngine> = match &repo_config.encryption {
             EncryptionMode::None => {
-                let mut chunk_id_key = [0u8; 32];
-                use blake2::digest::{Update, VariableOutput};
-                use blake2::Blake2bVar;
-                let mut hasher = Blake2bVar::new(32).unwrap();
-                hasher.update(&repo_config.id);
-                hasher.finalize_variable(&mut chunk_id_key).unwrap();
+                let chunk_id_key = derive_plaintext_chunk_id_key(&repo_config.id);
                 Arc::new(PlaintextEngine::new(&chunk_id_key))
             }
             EncryptionMode::Aes256Gcm => {

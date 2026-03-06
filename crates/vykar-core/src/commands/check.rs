@@ -20,7 +20,6 @@ use vykar_types::error::{Result, VykarError};
 use vykar_types::pack_id::PackId;
 
 use super::list::{for_each_decoded_item, load_snapshot_item_stream, load_snapshot_meta};
-use super::util::open_repo_without_index;
 
 /// Number of chunks in a pack before we download the full pack instead of
 /// issuing individual range reads.
@@ -128,7 +127,8 @@ pub fn run_with_progress(
     distrust_server: bool,
     mut progress: Option<&mut dyn FnMut(CheckProgressEvent)>,
 ) -> Result<CheckResult> {
-    let mut repo = open_repo_without_index(config, passphrase)?;
+    let (mut repo, _session_guard) =
+        super::util::open_repo_with_read_session(config, passphrase, true, false)?;
     repo.load_chunk_index_uncached()?;
 
     let mut errors: Vec<CheckError> = Vec::new();

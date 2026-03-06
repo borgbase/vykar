@@ -9,9 +9,9 @@
 	<key>CFBundleIdentifier</key>
 	<string>com.borgbase.vykar</string>
 	<key>CFBundleVersion</key>
-	<string>0.11.5</string>
+	<string>0.11.6</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.11.5</string>
+	<string>0.11.6</string>
 	<key>CFBundleExecutable</key>
 	<string>vykar-gui</string>
 	<key>CFBundleIconFile</key>

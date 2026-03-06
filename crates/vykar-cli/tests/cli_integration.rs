@@ -10,6 +10,7 @@ struct CliFixture {
     _tmp: TempDir,
     home_dir: PathBuf,
     cache_dir: PathBuf,
+    config_home: PathBuf,
     repo_dir: PathBuf,
     source_a: PathBuf,
     source_b: PathBuf,
@@ -21,6 +22,7 @@ impl CliFixture {
         let tmp = tempfile::tempdir().unwrap();
         let home_dir = tmp.path().join("home");
         let cache_dir = tmp.path().join("cache");
+        let config_home = tmp.path().join("config-home");
         let repo_dir = tmp.path().join("repo");
         let source_a = tmp.path().join("source-a");
         let source_b = tmp.path().join("source-b");
@@ -28,6 +30,7 @@ impl CliFixture {
 
         std::fs::create_dir_all(&home_dir).unwrap();
         std::fs::create_dir_all(&cache_dir).unwrap();
+        std::fs::create_dir_all(&config_home).unwrap();
         std::fs::create_dir_all(&repo_dir).unwrap();
         std::fs::create_dir_all(&source_a).unwrap();
         std::fs::create_dir_all(&source_b).unwrap();
@@ -36,6 +39,7 @@ impl CliFixture {
             _tmp: tmp,
             home_dir,
             cache_dir,
+            config_home,
             repo_dir,
             source_a,
             source_b,
@@ -48,6 +52,7 @@ impl CliFixture {
         cmd.args(args);
         cmd.env("HOME", &self.home_dir);
         cmd.env("XDG_CACHE_HOME", &self.cache_dir);
+        cmd.env("XDG_CONFIG_HOME", &self.config_home);
         cmd.env("NO_COLOR", "1");
         cmd.output().unwrap()
     }
@@ -589,6 +594,7 @@ fn cli_daemon_encrypted_without_passphrase_fails() {
         .args(["--config", &cfg, "daemon"])
         .env("HOME", &fx.home_dir)
         .env("XDG_CACHE_HOME", &fx.cache_dir)
+        .env("XDG_CONFIG_HOME", &fx.config_home)
         .env("NO_COLOR", "1")
         .env_remove("VYKAR_PASSPHRASE")
         .output()
@@ -623,6 +629,7 @@ fn cli_daemon_on_startup_and_shutdown() {
         .args(["--config", &cfg, "daemon"])
         .env("HOME", &fx.home_dir)
         .env("XDG_CACHE_HOME", &fx.cache_dir)
+        .env("XDG_CONFIG_HOME", &fx.config_home)
         .env("NO_COLOR", "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -690,6 +697,7 @@ fn cli_daemon_second_instance_rejected_by_scheduler_lock() {
         .args(["--config", &cfg, "daemon"])
         .env("HOME", &fx.home_dir)
         .env("XDG_CACHE_HOME", &fx.cache_dir)
+        .env("XDG_CONFIG_HOME", &fx.config_home)
         .env("NO_COLOR", "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -710,6 +718,7 @@ fn cli_daemon_second_instance_rejected_by_scheduler_lock() {
         .args(["--config", &cfg, "daemon"])
         .env("HOME", &fx.home_dir)
         .env("XDG_CACHE_HOME", &fx.cache_dir)
+        .env("XDG_CONFIG_HOME", &fx.config_home)
         .env("NO_COLOR", "1")
         .output()
         .unwrap();

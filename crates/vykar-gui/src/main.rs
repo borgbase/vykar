@@ -1051,7 +1051,6 @@ enum AppCommand {
     SaveAndApplyConfig {
         yaml_text: String,
     },
-    CancelOperation,
     ShowWindow,
     Quit,
 }
@@ -2687,13 +2686,6 @@ fn run_worker(
                     ));
                 }
             }
-            AppCommand::CancelOperation => {
-                cancel_requested.store(true, Ordering::SeqCst);
-                send_log(
-                    &ui_tx,
-                    "Cancel requested; will stop after current step completes.".to_string(),
-                );
-            }
             AppCommand::ShowWindow => {
                 let _ = ui_tx.send(UiEvent::ShowWindow);
             }
@@ -3218,10 +3210,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = tx.send(AppCommand::RunBackupAll { scheduled: false });
     });
 
-    let tx = app_tx.clone();
-    ui.on_cancel_clicked(move || {
-        let _ = tx.send(AppCommand::CancelOperation);
-    });
+    {
+        let cancel = cancel_requested.clone();
+        let log_tx = ui_tx_for_cancel.clone();
+        ui.on_cancel_clicked(move || {
+            cancel.store(true, Ordering::SeqCst);
+            send_log(&log_tx, "Cancel requested; will stop after current step completes.");
+        });
+    }
 
     // Find Files button — sync repo names and show FindWindow
     {
@@ -3693,6 +3689,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let tx = app_tx.clone();
         let tray_source_items = tray_source_items.clone();
+        let cancel = cancel_requested.clone();
+        let log_tx = ui_tx_for_cancel.clone();
         thread::spawn(move || {
             let menu_rx = MenuEvent::receiver();
             while let Ok(event) = menu_rx.recv() {
@@ -3701,7 +3699,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 } else if event.id == run_now_item_id {
                     let _ = tx.send(AppCommand::RunBackupAll { scheduled: false });
                 } else if event.id == cancel_item_id {
-                    let _ = tx.send(AppCommand::CancelOperation);
+                    cancel.store(true, Ordering::SeqCst);
+                    send_log(&log_tx, "Cancel requested; will stop after current step completes.");
                 } else if event.id == quit_item_id {
                     let _ = tx.send(AppCommand::Quit);
                     break;

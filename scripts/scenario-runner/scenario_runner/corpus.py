@@ -1,28 +1,27 @@
-"""Corpus generation and churn mutations using faker-file."""
+"""Corpus generation and churn mutations.
 
+Fast path: bin/txt/csv/json/xml/zip/tar are generated directly with stdlib.
+Slow path: docx/xlsx/png still use faker-file for format-specific libraries.
+"""
+
+import csv
+import io
+import json
 import os
 import random
 import re
-import string
-
 import sys
+import tarfile
+import zipfile
 
 from faker import Faker
-from faker_file.providers.bin_file import BinFileProvider
-from faker_file.providers.csv_file import CsvFileProvider
-from faker_file.providers.json_file import JsonFileProvider
-from faker_file.providers.png_file import PngFileProvider
-from faker_file.providers.tar_file import TarFileProvider
-from faker_file.providers.txt_file import TxtFileProvider
-from faker_file.providers.xml_file import XmlFileProvider
-from faker_file.providers.zip_file import ZipFileProvider
-from faker_file.storages.filesystem import FileSystemStorage
 
 # Optional providers — available only when their extra deps are installed.
 _OPTIONAL_PROVIDERS: dict[str, type | None] = {}
 for _name, _mod, _cls in [
     ("docx", "faker_file.providers.docx_file", "DocxFileProvider"),
     ("xlsx", "faker_file.providers.xlsx_file", "XlsxFileProvider"),
+    ("png", "faker_file.providers.png_file", "PngFileProvider"),
 ]:
     try:
         _m = __import__(_mod, fromlist=[_cls])
@@ -53,6 +52,12 @@ def parse_size(s: str) -> int:
 # Default per-file size when not specified in the YAML mix entry.
 _DEFAULT_FILE_SIZE = parse_size("500kb")
 
+# Types that use the fast direct-write path (no faker-file).
+_FAST_TYPES = {"bin", "txt", "csv", "json", "xml", "zip", "tar"}
+
+# Types that need faker-file providers.
+_FAKER_TYPES = {"docx", "xlsx", "png"}
+
 
 def _make_subdirs(root: str, max_depth: int, rng: random.Random) -> list[str]:
     """Create a tree of subdirectories and return their relative paths."""
@@ -72,56 +77,147 @@ def _pick_subdir(dirs: list[str], rng: random.Random) -> str:
 
 _TEXT_EXTENSIONS = (".txt", ".csv", ".json", ".xml", ".svg")
 
+_TEXT_BLOCK_SIZE = 64 * 1024  # 64 KB
 
-def _make_faker(rng: random.Random) -> Faker:
-    """Create a Faker instance with all available file providers."""
+
+def _generate_text_block(rng: random.Random) -> str:
+    """Generate a ~64KB block of semi-realistic text for tiling into txt files."""
     fake = Faker()
     Faker.seed(rng.randint(0, 2**31))
-    for provider in [TxtFileProvider, CsvFileProvider, BinFileProvider,
-                     PngFileProvider, JsonFileProvider, XmlFileProvider,
-                     ZipFileProvider, TarFileProvider]:
-        fake.add_provider(provider)
+    paragraphs = []
+    total = 0
+    while total < _TEXT_BLOCK_SIZE:
+        p = fake.paragraph(nb_sentences=5)
+        paragraphs.append(p)
+        total += len(p) + 1
+    return "\n".join(paragraphs)
+
+
+def _make_faker(rng: random.Random) -> Faker:
+    """Create a Faker instance with faker-file providers for docx/xlsx/png."""
+    fake = Faker()
+    Faker.seed(rng.randint(0, 2**31))
     for prov in _OPTIONAL_PROVIDERS.values():
         if prov is not None:
             fake.add_provider(prov)
     return fake
 
 
-def _generate_one(fake: Faker, file_type: str, storage: FileSystemStorage,
-                   file_size_bytes: int, options: dict) -> str:
+def _generate_one(file_type: str, dest_dir: str, file_size_bytes: int,
+                   options: dict, rng: random.Random, text_block: str,
+                   fake: Faker | None, counter: list[int]) -> str:
     """Generate a single file of the given type, return absolute path."""
+    counter[0] += 1
+    seq = counter[0]
+
+    if file_type == "bin":
+        path = os.path.join(dest_dir, f"{seq:06d}.bin")
+        with open(path, "wb") as f:
+            f.write(rng.randbytes(file_size_bytes))
+        return path
+
     if file_type == "txt":
-        result = fake.txt_file(storage=storage, max_nb_chars=file_size_bytes)
-    elif file_type == "csv":
-        rows = max(1, file_size_bytes // 100)
-        result = fake.csv_file(storage=storage, num_rows=rows)
-    elif file_type == "bin":
-        result = fake.bin_file(storage=storage, length=file_size_bytes)
-    elif file_type == "png":
-        size = options.get("size", [256, 256])
-        result = fake.png_file(storage=storage, size=tuple(size))
-    elif file_type == "json":
-        rows = max(1, file_size_bytes // 200)
-        result = fake.json_file(storage=storage, num_rows=rows)
-    elif file_type == "xml":
-        rows = max(1, file_size_bytes // 150)
-        result = fake.xml_file(storage=storage, num_rows=rows)
-    elif file_type == "zip":
-        count = max(1, file_size_bytes // max(options.get("inner_size", 10000), 1))
-        inner = options.get("inner_size", 10000)
-        result = fake.zip_file(storage=storage, options={"count": count, "max_nb_chars": inner})
-    elif file_type == "tar":
-        count = max(1, file_size_bytes // max(options.get("inner_size", 10000), 1))
-        inner = options.get("inner_size", 10000)
-        result = fake.tar_file(storage=storage, options={"count": count, "max_nb_chars": inner})
-    elif file_type == "docx":
+        path = os.path.join(dest_dir, f"{seq:06d}.txt")
+        # Tile the pre-built text block to reach target size
+        block_len = len(text_block)
+        repeats = file_size_bytes // block_len
+        remainder = file_size_bytes % block_len
+        with open(path, "w") as f:
+            for _ in range(repeats):
+                f.write(text_block)
+                f.write("\n")
+            if remainder > 0:
+                f.write(text_block[:remainder])
+        return path
+
+    if file_type == "csv":
+        path = os.path.join(dest_dir, f"{seq:06d}.csv")
+        # ~100 bytes per row: 6 columns of hex values
+        num_rows = max(1, file_size_bytes // 100)
+        with open(path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["id", "col_a", "col_b", "col_c", "col_d", "col_e"])
+            for i in range(num_rows):
+                writer.writerow([
+                    i,
+                    rng.randint(0, 999999),
+                    f"{rng.getrandbits(32):08x}",
+                    rng.uniform(0, 1000),
+                    rng.choice(["alpha", "beta", "gamma", "delta", "epsilon"]),
+                    f"{rng.getrandbits(64):016x}",
+                ])
+        return path
+
+    if file_type == "json":
+        path = os.path.join(dest_dir, f"{seq:06d}.json")
+        num_rows = max(1, file_size_bytes // 200)
+        records = []
+        for i in range(num_rows):
+            records.append({
+                "id": i,
+                "value": rng.randint(0, 999999),
+                "hex": f"{rng.getrandbits(64):016x}",
+                "score": round(rng.uniform(0, 100), 4),
+                "tag": rng.choice(["alpha", "beta", "gamma", "delta", "epsilon"]),
+            })
+        with open(path, "w") as f:
+            json.dump(records, f)
+        return path
+
+    if file_type == "xml":
+        path = os.path.join(dest_dir, f"{seq:06d}.xml")
+        num_rows = max(1, file_size_bytes // 150)
+        parts = ['<?xml version="1.0" encoding="UTF-8"?>\n<data>\n']
+        for i in range(num_rows):
+            parts.append(
+                f'  <row id="{i}" value="{rng.randint(0, 999999)}" '
+                f'hex="{rng.getrandbits(64):016x}" '
+                f'tag="{rng.choice(["alpha", "beta", "gamma", "delta", "epsilon"])}"/>\n'
+            )
+        parts.append("</data>\n")
+        with open(path, "w") as f:
+            f.write("".join(parts))
+        return path
+
+    if file_type == "zip":
+        path = os.path.join(dest_dir, f"{seq:06d}.zip")
+        inner_size = max(options.get("inner_size", 10000), 1)
+        count = max(1, file_size_bytes // inner_size)
+        with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for j in range(count):
+                zf.writestr(f"inner_{j:04d}.bin", rng.randbytes(inner_size))
+        return path
+
+    if file_type == "tar":
+        path = os.path.join(dest_dir, f"{seq:06d}.tar")
+        inner_size = max(options.get("inner_size", 10000), 1)
+        count = max(1, file_size_bytes // inner_size)
+        with tarfile.open(path, "w") as tf:
+            for j in range(count):
+                data = rng.randbytes(inner_size)
+                info = tarfile.TarInfo(name=f"inner_{j:04d}.bin")
+                info.size = len(data)
+                tf.addfile(info, io.BytesIO(data))
+        return path
+
+    # Faker-file types: docx, xlsx, png
+    if fake is None:
+        return ""
+
+    from faker_file.storages.filesystem import FileSystemStorage
+    storage = FileSystemStorage(root_path=dest_dir, rel_path="")
+
+    if file_type == "docx":
         result = fake.docx_file(storage=storage, max_nb_chars=file_size_bytes)
     elif file_type == "xlsx":
         rows = max(1, file_size_bytes // 100)
         result = fake.xlsx_file(storage=storage, num_rows=rows)
+    elif file_type == "png":
+        size = options.get("size", [256, 256])
+        result = fake.png_file(storage=storage, size=tuple(size))
     else:
         return ""
-    # faker-file returns the relative path string from the storage
+
     return os.path.join(storage.root_path, str(result)) if result else ""
 
 
@@ -132,8 +228,6 @@ def generate_corpus(target_dir: str, corpus_config: dict, rng: random.Random | N
     """
     if rng is None:
         rng = random.Random()
-
-    fake = _make_faker(rng)
 
     os.makedirs(target_dir, exist_ok=True)
 
@@ -157,6 +251,14 @@ def generate_corpus(target_dir: str, corpus_config: dict, rng: random.Random | N
         file_sizes[t] = parse_size(entry["file_size"]) if "file_size" in entry else _DEFAULT_FILE_SIZE
         file_options[t] = entry.get("options", {})
 
+    # Pre-generate text block for txt files
+    text_block = _generate_text_block(rng)
+
+    # Only create faker if we need docx/xlsx/png
+    needs_faker = any(t in _FAKER_TYPES for t in types)
+    fake = _make_faker(rng) if needs_faker else None
+
+    counter = [0]
     subdirs = _make_subdirs(target_dir, max_depth, rng)
     total_bytes = 0
     file_count = 0
@@ -168,9 +270,9 @@ def generate_corpus(target_dir: str, corpus_config: dict, rng: random.Random | N
         full_subdir = os.path.join(target_dir, subdir) if subdir else target_dir
         os.makedirs(full_subdir, exist_ok=True)
 
-        storage = FileSystemStorage(root_path=full_subdir, rel_path="")
         size = file_sizes[file_type]
-        path = _generate_one(fake, file_type, storage, size, file_options[file_type])
+        path = _generate_one(file_type, full_subdir, size, file_options[file_type],
+                             rng, text_block, fake, counter)
         if not path or not os.path.exists(path):
             continue
 
@@ -204,8 +306,6 @@ def apply_churn(target_dir: str, corpus_config: dict, churn_config: dict,
     if rng is None:
         rng = random.Random()
 
-    fake = _make_faker(rng)
-
     mix = corpus_config.get("mix", [{"type": "bin", "weight": 1}])
     types = [e["type"] for e in mix]
     weights = [e.get("weight", 1) for e in mix]
@@ -215,6 +315,12 @@ def apply_churn(target_dir: str, corpus_config: dict, churn_config: dict,
         t = entry["type"]
         file_sizes[t] = parse_size(entry["file_size"]) if "file_size" in entry else _DEFAULT_FILE_SIZE
         file_options[t] = entry.get("options", {})
+
+    # Pre-generate text block and lazy faker
+    text_block = _generate_text_block(rng)
+    needs_faker = any(t in _FAKER_TYPES for t in types)
+    fake = _make_faker(rng) if needs_faker else None
+    counter = [0]
 
     stats = {"added": 0, "deleted": 0, "modified": 0, "dirs_added": 0}
 
@@ -239,9 +345,9 @@ def apply_churn(target_dir: str, corpus_config: dict, churn_config: dict,
         # Add 1-3 files in new dir
         for _ in range(rng.randint(1, 3)):
             ft = rng.choices(types, weights=weights, k=1)[0]
-            storage = FileSystemStorage(root_path=full, rel_path="")
             size = file_sizes[ft]
-            path = _generate_one(fake, ft, storage, size, file_options[ft])
+            path = _generate_one(ft, full, size, file_options[ft],
+                                 rng, text_block, fake, counter)
             if path and os.path.exists(path):
                 stats["added"] += 1
         stats["dirs_added"] += 1
@@ -252,9 +358,9 @@ def apply_churn(target_dir: str, corpus_config: dict, churn_config: dict,
         subdir = rng.choice(subdirs)
         full_subdir = os.path.join(target_dir, subdir) if subdir else target_dir
         os.makedirs(full_subdir, exist_ok=True)
-        storage = FileSystemStorage(root_path=full_subdir, rel_path="")
         size = file_sizes[ft]
-        path = _generate_one(fake, ft, storage, size, file_options[ft])
+        path = _generate_one(ft, full_subdir, size, file_options[ft],
+                             rng, text_block, fake, counter)
         if path and os.path.exists(path):
             stats["added"] += 1
 

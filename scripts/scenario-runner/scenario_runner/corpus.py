@@ -1,0 +1,295 @@
+"""Corpus generation and churn mutations using faker-file."""
+
+import os
+import random
+import re
+import string
+
+import sys
+
+from faker import Faker
+from faker_file.providers.bin_file import BinFileProvider
+from faker_file.providers.csv_file import CsvFileProvider
+from faker_file.providers.json_file import JsonFileProvider
+from faker_file.providers.png_file import PngFileProvider
+from faker_file.providers.tar_file import TarFileProvider
+from faker_file.providers.txt_file import TxtFileProvider
+from faker_file.providers.xml_file import XmlFileProvider
+from faker_file.providers.zip_file import ZipFileProvider
+from faker_file.storages.filesystem import FileSystemStorage
+
+# Optional providers — available only when their extra deps are installed.
+_OPTIONAL_PROVIDERS: dict[str, type | None] = {}
+for _name, _mod, _cls in [
+    ("docx", "faker_file.providers.docx_file", "DocxFileProvider"),
+    ("xlsx", "faker_file.providers.xlsx_file", "XlsxFileProvider"),
+]:
+    try:
+        _m = __import__(_mod, fromlist=[_cls])
+        _OPTIONAL_PROVIDERS[_name] = getattr(_m, _cls)
+    except ImportError:
+        _OPTIONAL_PROVIDERS[_name] = None
+
+
+_SIZE_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*(b|kb|mb|gb|tb)\s*$", re.IGNORECASE)
+
+_SIZE_UNITS = {
+    "b": 1,
+    "kb": 1024,
+    "mb": 1024 ** 2,
+    "gb": 1024 ** 3,
+    "tb": 1024 ** 4,
+}
+
+
+def parse_size(s: str) -> int:
+    """Convert human-readable size string to bytes. E.g. '100mb' -> 104857600."""
+    m = _SIZE_RE.match(str(s))
+    if not m:
+        raise ValueError(f"invalid size string: {s!r}")
+    return int(float(m.group(1)) * _SIZE_UNITS[m.group(2).lower()])
+
+
+# Default per-file size when not specified in the YAML mix entry.
+_DEFAULT_FILE_SIZE = parse_size("500kb")
+
+
+def _make_subdirs(root: str, max_depth: int, rng: random.Random) -> list[str]:
+    """Create a tree of subdirectories and return their relative paths."""
+    dirs = [""]
+    for depth in range(1, max_depth + 1):
+        parent = rng.choice(dirs)
+        name = f"d{depth}_{rng.randint(0, 999):03d}"
+        rel = os.path.join(parent, name) if parent else name
+        os.makedirs(os.path.join(root, rel), exist_ok=True)
+        dirs.append(rel)
+    return dirs
+
+
+def _pick_subdir(dirs: list[str], rng: random.Random) -> str:
+    return rng.choice(dirs)
+
+
+_TEXT_EXTENSIONS = (".txt", ".csv", ".json", ".xml", ".svg")
+
+
+def _make_faker(rng: random.Random) -> Faker:
+    """Create a Faker instance with all available file providers."""
+    fake = Faker()
+    Faker.seed(rng.randint(0, 2**31))
+    for provider in [TxtFileProvider, CsvFileProvider, BinFileProvider,
+                     PngFileProvider, JsonFileProvider, XmlFileProvider,
+                     ZipFileProvider, TarFileProvider]:
+        fake.add_provider(provider)
+    for prov in _OPTIONAL_PROVIDERS.values():
+        if prov is not None:
+            fake.add_provider(prov)
+    return fake
+
+
+def _generate_one(fake: Faker, file_type: str, storage: FileSystemStorage,
+                   file_size_bytes: int, options: dict) -> str:
+    """Generate a single file of the given type, return absolute path."""
+    if file_type == "txt":
+        result = fake.txt_file(storage=storage, max_nb_chars=file_size_bytes)
+    elif file_type == "csv":
+        rows = max(1, file_size_bytes // 100)
+        result = fake.csv_file(storage=storage, num_rows=rows)
+    elif file_type == "bin":
+        result = fake.bin_file(storage=storage, length=file_size_bytes)
+    elif file_type == "png":
+        size = options.get("size", [256, 256])
+        result = fake.png_file(storage=storage, size=tuple(size))
+    elif file_type == "json":
+        rows = max(1, file_size_bytes // 200)
+        result = fake.json_file(storage=storage, num_rows=rows)
+    elif file_type == "xml":
+        rows = max(1, file_size_bytes // 150)
+        result = fake.xml_file(storage=storage, num_rows=rows)
+    elif file_type == "zip":
+        count = max(1, file_size_bytes // max(options.get("inner_size", 10000), 1))
+        inner = options.get("inner_size", 10000)
+        result = fake.zip_file(storage=storage, options={"count": count, "max_nb_chars": inner})
+    elif file_type == "tar":
+        count = max(1, file_size_bytes // max(options.get("inner_size", 10000), 1))
+        inner = options.get("inner_size", 10000)
+        result = fake.tar_file(storage=storage, options={"count": count, "max_nb_chars": inner})
+    elif file_type == "docx":
+        result = fake.docx_file(storage=storage, max_nb_chars=file_size_bytes)
+    elif file_type == "xlsx":
+        rows = max(1, file_size_bytes // 100)
+        result = fake.xlsx_file(storage=storage, num_rows=rows)
+    else:
+        return ""
+    # faker-file returns the relative path string from the storage
+    return os.path.join(storage.root_path, str(result)) if result else ""
+
+
+def generate_corpus(target_dir: str, corpus_config: dict, rng: random.Random | None = None) -> dict:
+    """Generate files in target_dir until size_gib is reached.
+
+    Returns dict with keys: total_bytes, file_count, files_by_type.
+    """
+    if rng is None:
+        rng = random.Random()
+
+    fake = _make_faker(rng)
+
+    os.makedirs(target_dir, exist_ok=True)
+
+    target_bytes = int(corpus_config.get("size_gib", 0.1) * 1024 ** 3)
+    mix = corpus_config.get("mix", [{"type": "bin", "weight": 1}])
+    max_depth = corpus_config.get("max_depth", 2)
+
+    # Build weighted type list
+    types = []
+    weights = []
+    file_sizes = {}
+    file_options = {}
+    for entry in mix:
+        t = entry["type"]
+        if t in _OPTIONAL_PROVIDERS and _OPTIONAL_PROVIDERS[t] is None:
+            print(f"[corpus] skipping type '{t}': optional dependency not installed",
+                  file=sys.stderr)
+            continue
+        types.append(t)
+        weights.append(entry.get("weight", 1))
+        file_sizes[t] = parse_size(entry["file_size"]) if "file_size" in entry else _DEFAULT_FILE_SIZE
+        file_options[t] = entry.get("options", {})
+
+    subdirs = _make_subdirs(target_dir, max_depth, rng)
+    total_bytes = 0
+    file_count = 0
+    files_by_type: dict[str, int] = {}
+
+    while total_bytes < target_bytes:
+        file_type = rng.choices(types, weights=weights, k=1)[0]
+        subdir = _pick_subdir(subdirs, rng)
+        full_subdir = os.path.join(target_dir, subdir) if subdir else target_dir
+        os.makedirs(full_subdir, exist_ok=True)
+
+        storage = FileSystemStorage(root_path=full_subdir, rel_path="")
+        size = file_sizes[file_type]
+        path = _generate_one(fake, file_type, storage, size, file_options[file_type])
+        if not path or not os.path.exists(path):
+            continue
+
+        actual_size = os.path.getsize(path)
+        total_bytes += actual_size
+        file_count += 1
+        files_by_type[file_type] = files_by_type.get(file_type, 0) + 1
+
+    return {
+        "total_bytes": total_bytes,
+        "file_count": file_count,
+        "files_by_type": files_by_type,
+    }
+
+
+def _walk_files(target_dir: str) -> list[str]:
+    """Return list of absolute file paths in target_dir."""
+    result = []
+    for dirpath, _, filenames in os.walk(target_dir):
+        for f in filenames:
+            result.append(os.path.join(dirpath, f))
+    return result
+
+
+def apply_churn(target_dir: str, corpus_config: dict, churn_config: dict,
+                rng: random.Random | None = None) -> dict:
+    """Mutate the existing corpus: add, delete, modify files.
+
+    Returns dict with keys: added, deleted, modified, dirs_added.
+    """
+    if rng is None:
+        rng = random.Random()
+
+    fake = _make_faker(rng)
+
+    mix = corpus_config.get("mix", [{"type": "bin", "weight": 1}])
+    types = [e["type"] for e in mix]
+    weights = [e.get("weight", 1) for e in mix]
+    file_sizes = {}
+    file_options = {}
+    for entry in mix:
+        t = entry["type"]
+        file_sizes[t] = parse_size(entry["file_size"]) if "file_size" in entry else _DEFAULT_FILE_SIZE
+        file_options[t] = entry.get("options", {})
+
+    stats = {"added": 0, "deleted": 0, "modified": 0, "dirs_added": 0}
+
+    # Collect existing subdirectories
+    subdirs = []
+    for dirpath, dirnames, _ in os.walk(target_dir):
+        rel = os.path.relpath(dirpath, target_dir)
+        subdirs.append(rel if rel != "." else "")
+
+    if not subdirs:
+        subdirs = [""]
+
+    # Add new directories
+    for _ in range(churn_config.get("add_dirs", 0)):
+        parent = rng.choice(subdirs)
+        name = f"churn_{rng.randint(0, 99999):05d}"
+        rel = os.path.join(parent, name) if parent else name
+        full = os.path.join(target_dir, rel)
+        os.makedirs(full, exist_ok=True)
+        subdirs.append(rel)
+
+        # Add 1-3 files in new dir
+        for _ in range(rng.randint(1, 3)):
+            ft = rng.choices(types, weights=weights, k=1)[0]
+            storage = FileSystemStorage(root_path=full, rel_path="")
+            size = file_sizes[ft]
+            path = _generate_one(fake, ft, storage, size, file_options[ft])
+            if path and os.path.exists(path):
+                stats["added"] += 1
+        stats["dirs_added"] += 1
+
+    # Add files in existing dirs
+    for _ in range(churn_config.get("add_files", 0)):
+        ft = rng.choices(types, weights=weights, k=1)[0]
+        subdir = rng.choice(subdirs)
+        full_subdir = os.path.join(target_dir, subdir) if subdir else target_dir
+        os.makedirs(full_subdir, exist_ok=True)
+        storage = FileSystemStorage(root_path=full_subdir, rel_path="")
+        size = file_sizes[ft]
+        path = _generate_one(fake, ft, storage, size, file_options[ft])
+        if path and os.path.exists(path):
+            stats["added"] += 1
+
+    # Delete random files
+    files = _walk_files(target_dir)
+    n_delete = min(churn_config.get("delete_files", 0), len(files))
+    if n_delete > 0:
+        to_delete = rng.sample(files, n_delete)
+        for f in to_delete:
+            os.unlink(f)
+            stats["deleted"] += 1
+        # Refresh file list
+        files = _walk_files(target_dir)
+
+    # Modify random files
+    n_modify = min(churn_config.get("modify_files", 0), len(files))
+    if n_modify > 0:
+        to_modify = rng.sample(files, n_modify)
+        for f in to_modify:
+            try:
+                # Check if file looks like text
+                is_text = f.endswith(_TEXT_EXTENSIONS)
+                if is_text:
+                    with open(f, "a") as fh:
+                        fh.write(f"\n# churn modification {rng.randint(0, 999999)}\n")
+                else:
+                    # Binary: truncate to 75% and append random bytes
+                    size = os.path.getsize(f)
+                    trunc = max(1, int(size * 0.75))
+                    with open(f, "r+b") as fh:
+                        fh.truncate(trunc)
+                        fh.seek(0, 2)
+                        fh.write(rng.randbytes(rng.randint(64, 4096)))
+                stats["modified"] += 1
+            except (OSError, PermissionError):
+                pass
+
+    return stats

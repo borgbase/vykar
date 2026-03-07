@@ -1,0 +1,31 @@
+name: "simple-backup"
+description: "Basic backup-verify-check cycle with a small corpus"
+
+corpus:
+  size_gib: 0.1
+  mix:
+    - type: txt
+      weight: 3
+      file_size: 100kb
+    - type: bin
+      weight: 2
+      file_size: 1mb
+    - type: csv
+      weight: 1
+      file_size: 500kb
+    - type: docx
+      weight: 1
+      file_size: 100kb
+    - type: xml
+      weight: 1
+      file_size: 200kb
+  max_depth: 2
+
+phases:
+  - action: init
+  - action: backup
+    label: "baseline"
+  - action: verify
+  - action: check
+  - action: list
+  - action: cleanup

@@ -1,0 +1,78 @@
+name: "5xchurn"
+description: "5 churn rounds with mixed file types"
+
+corpus:
+  size_gib: 1.0
+  mix:
+    - type: txt
+      weight: 3
+      file_size: 500kb
+    - type: csv
+      weight: 2
+      file_size: 2mb
+    - type: bin
+      weight: 1
+      file_size: 50mb
+    - type: png
+      weight: 2
+      file_size: 200kb
+      options: { size: [800, 600] }
+    - type: docx
+      weight: 2
+      file_size: 300kb
+    - type: xlsx
+      weight: 1
+      file_size: 1mb
+    - type: xml
+      weight: 1
+      file_size: 500kb
+    - type: zip
+      weight: 1
+      file_size: 2mb
+      options: { inner_size: 50000 }
+  max_depth: 3
+
+churn:
+  add_files: 15
+  delete_files: 8
+  modify_files: 12
+  add_dirs: 2
+
+phases:
+  - action: init
+  - action: backup
+    label: "baseline"
+  - action: verify
+
+  - action: churn
+  - action: backup
+    label: "churn-1"
+  - action: verify
+
+  - action: churn
+  - action: backup
+    label: "churn-2"
+  - action: verify
+  - action: check
+
+  - action: churn
+  - action: backup
+    label: "churn-3"
+  - action: verify
+
+  - action: churn
+  - action: backup
+    label: "churn-4"
+  - action: verify
+
+  - action: churn
+  - action: backup
+    label: "churn-5"
+  - action: verify
+  - action: check
+
+  - action: list
+  - action: prune
+  - action: compact
+  - action: check
+  - action: cleanup

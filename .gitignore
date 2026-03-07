@@ -2,5 +2,6 @@
 /docs/book
 /dist
 __pycache__
+*.egg-info
 docs/src/https*
 .zed

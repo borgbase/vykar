@@ -9,7 +9,7 @@ pub struct ServerSection {
     /// Shared bearer token for authentication.
     pub token: String,
 
-    /// If true, reject DELETE and overwrite operations on pack files.
+    /// If true, only index/index.gen/locks/sessions are overwritable; all other objects are immutable once written. DELETEs are restricted to locks/sessions.
     pub append_only: bool,
 
     /// Log output format: "json" or "pretty".

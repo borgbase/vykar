@@ -10,6 +10,24 @@ use xorf::Xor8;
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::pack_id::PackId;
 
+/// Wire format for the persisted index blob.
+///
+/// Contains the generation counter (previously stored in the manifest) alongside
+/// the chunk index data. Encrypted at the `index` key with context `b"index"`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexBlob {
+    pub generation: u64,
+    pub chunks: ChunkIndex,
+}
+
+/// Borrowed variant of [`IndexBlob`] for serialization without cloning.
+/// Produces the same wire format as `IndexBlob`.
+#[derive(Serialize)]
+pub struct IndexBlobRef<'a> {
+    pub generation: u64,
+    pub chunks: &'a ChunkIndex,
+}
+
 /// In-memory index of all chunks in the repository.
 /// Maps chunk_id -> (refcount, stored_size, pack_id, pack_offset).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -670,5 +688,56 @@ mod tests {
         // Remove non-existent pack — no-op
         journal.remove_pack(&make_pack_id(99));
         assert_eq!(journal.len(), 2);
+    }
+
+    #[test]
+    fn index_blob_msgpack_round_trip() {
+        let mut chunks = ChunkIndex::new();
+        chunks.add(make_chunk_id(1), 100, make_pack_id(10), 0);
+        chunks.add(make_chunk_id(2), 200, make_pack_id(20), 100);
+        // Bump refcount on chunk 1
+        chunks.increment_refcount(&make_chunk_id(1));
+
+        let generation = 42u64;
+        let blob = IndexBlob {
+            generation,
+            chunks: chunks.clone(),
+        };
+
+        let serialized = rmp_serde::to_vec(&blob).unwrap();
+        let restored: IndexBlob = rmp_serde::from_slice(&serialized).unwrap();
+
+        assert_eq!(restored.generation, generation);
+        assert_eq!(restored.chunks.len(), 2);
+        assert_eq!(restored.chunks.get(&make_chunk_id(1)).unwrap().refcount, 2);
+        assert_eq!(
+            restored.chunks.get(&make_chunk_id(2)).unwrap().stored_size,
+            200
+        );
+    }
+
+    #[test]
+    fn index_blob_ref_matches_index_blob_wire_format() {
+        let mut chunks = ChunkIndex::new();
+        chunks.add(make_chunk_id(5), 500, make_pack_id(50), 0);
+
+        let generation = 99u64;
+
+        let blob = IndexBlob {
+            generation,
+            chunks: chunks.clone(),
+        };
+        let blob_ref = IndexBlobRef {
+            generation,
+            chunks: &chunks,
+        };
+
+        let serialized_blob = rmp_serde::to_vec(&blob).unwrap();
+        let serialized_ref = rmp_serde::to_vec(&blob_ref).unwrap();
+
+        assert_eq!(
+            serialized_blob, serialized_ref,
+            "IndexBlobRef should produce the same wire format as IndexBlob"
+        );
     }
 }

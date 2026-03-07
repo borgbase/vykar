@@ -3,6 +3,7 @@ pub mod format;
 pub mod lock;
 pub mod manifest;
 pub mod pack;
+pub mod snapshot_cache;
 pub(crate) mod write_session;
 
 use std::collections::{HashMap as StdHashMap, VecDeque};
@@ -21,7 +22,9 @@ use crate::config::{
     default_max_pack_size, default_min_pack_size, ChunkerConfig, RepositoryConfig,
 };
 use crate::index::dedup_cache::{self, TieredDedupIndex};
-use crate::index::{ChunkIndex, DedupIndex, IndexDelta, PendingChunkEntry};
+use crate::index::{
+    ChunkIndex, DedupIndex, IndexBlob, IndexBlobRef, IndexDelta, PendingChunkEntry,
+};
 use vykar_crypto::key::{EncryptedKey, MasterKey};
 use vykar_crypto::{self as crypto, CryptoEngine, PlaintextEngine};
 use vykar_storage::StorageBackend;
@@ -57,7 +60,6 @@ pub struct RepoConfig {
 /// Maximum total weight (bytes) of cached blobs in the blob cache.
 const BLOB_CACHE_MAX_BYTES: usize = 32 * 1024 * 1024; // 32 MiB
 
-const MANIFEST_OBJECT_CONTEXT: &[u8] = b"manifest";
 const INDEX_OBJECT_CONTEXT: &[u8] = b"index";
 
 /// FIFO blob cache bounded by total weight in bytes.
@@ -132,8 +134,12 @@ pub struct Repository {
     file_cache: FileCache,
     /// Weight-bounded cache for decrypted chunks (used during restore).
     blob_cache: BlobCache,
-    /// Whether the manifest has been modified since last persist.
-    manifest_dirty: bool,
+    /// Cache-validity token for the local dedup/restore caches.
+    /// A random u64 rotated each time the index is saved.
+    /// Stored inside the encrypted `IndexBlob` (source of truth) and
+    /// advisory `index.gen` sidecar. Read from `index.gen` on open;
+    /// verified against the remote `IndexBlob` on write paths.
+    index_generation: u64,
     /// Whether the chunk index has been modified since last persist.
     index_dirty: bool,
     /// Whether the file cache has been modified since last persist.
@@ -197,7 +203,7 @@ impl Repository {
         }
 
         let repo_config = RepoConfig {
-            version: 1,
+            version: 2,
             id: repo_id,
             chunker_params: chunker_params.clone(),
             encryption: encryption.clone(),
@@ -261,19 +267,13 @@ impl Repository {
             storage.put("keys/repokey", &key_data)?;
         }
 
-        // Store empty manifest
+        // Store empty IndexBlob (compressed with ZSTD)
         let manifest = Manifest::new();
-        let manifest_bytes = rmp_serde::to_vec(&manifest)?;
-        let manifest_packed = pack_object_with_context(
-            ObjectType::Manifest,
-            MANIFEST_OBJECT_CONTEXT,
-            &manifest_bytes,
-            crypto.as_ref(),
-        )?;
-        storage.put("manifest", &manifest_packed)?;
-
-        // Store empty chunk index (compressed with ZSTD)
         let chunk_index = ChunkIndex::new();
+        let index_blob = IndexBlob {
+            generation: 0,
+            chunks: chunk_index.clone(),
+        };
         let index_packed = pack_object_streaming_with_context(
             ObjectType::ChunkIndex,
             INDEX_OBJECT_CONTEXT,
@@ -281,12 +281,15 @@ impl Repository {
             crypto.as_ref(),
             |buf| {
                 compress::compress_stream_zstd(buf, 3, |encoder| {
-                    rmp_serde::encode::write(encoder, &chunk_index)?;
+                    rmp_serde::encode::write(encoder, &index_blob)?;
                     Ok(())
                 })
             },
         )?;
         storage.put("index", &index_packed)?;
+
+        // Write advisory index.gen sidecar
+        storage.put("index.gen", &0u64.to_le_bytes())?;
 
         // Create directory structure (skip if server already did it)
         if !server_did_init {
@@ -305,7 +308,7 @@ impl Repository {
             config: repo_config,
             file_cache: FileCache::new(),
             blob_cache: BlobCache::new(BLOB_CACHE_MAX_BYTES),
-            manifest_dirty: false,
+            index_generation: 0,
             index_dirty: false,
             file_cache_dirty: false,
             rebuild_dedup_cache: false,
@@ -371,7 +374,7 @@ impl Repository {
             .ok_or_else(|| VykarError::RepoNotFound("config not found".into()))?;
         let repo_config: RepoConfig = rmp_serde::from_slice(&config_data)?;
 
-        if repo_config.version != 1 {
+        if repo_config.version != 2 {
             return Err(VykarError::UnsupportedVersion(repo_config.version));
         }
 
@@ -420,17 +423,25 @@ impl Repository {
             }
         };
 
-        // Read manifest
-        let manifest_data = storage
-            .get("manifest")?
-            .ok_or_else(|| VykarError::InvalidFormat("missing manifest".into()))?;
-        let manifest_bytes = unpack_object_expect_with_context(
-            &manifest_data,
-            ObjectType::Manifest,
-            MANIFEST_OBJECT_CONTEXT,
+        // Read advisory index.gen sidecar (cache hint only, not trusted for writes).
+        let index_generation = match storage.get("index.gen")? {
+            Some(data) if data.len() == 8 => {
+                u64::from_le_bytes(data[..8].try_into().unwrap_or([0u8; 8]))
+            }
+            _ => 0,
+        };
+
+        // Refresh snapshot list from snapshots/ (replaces manifest load).
+        // Resilient open: skip unreadable snapshots so a single corrupt blob
+        // doesn't prevent opening the repo.
+        let snapshot_entries = snapshot_cache::refresh_snapshot_cache(
+            storage.as_ref(),
             crypto.as_ref(),
+            &repo_config.id,
+            cache_dir.as_deref(),
+            false, // strict_io: false — resilient open
         )?;
-        let manifest: Manifest = rmp_serde::from_slice(&manifest_bytes)?;
+        let manifest = Manifest::from_snapshot_entries(snapshot_entries);
 
         // Load file cache from local disk (not from the repo).
         let file_cache = if skip_file_cache {
@@ -447,7 +458,7 @@ impl Repository {
             config: repo_config,
             file_cache,
             blob_cache: BlobCache::new(BLOB_CACHE_MAX_BYTES),
-            manifest_dirty: false,
+            index_generation,
             index_dirty: false,
             file_cache_dirty: false,
             rebuild_dedup_cache: false,
@@ -457,11 +468,16 @@ impl Repository {
         })
     }
 
-    /// Load the chunk index from storage on demand (using local blob cache).
+    /// Load the chunk index from storage on demand.
+    /// Always downloads the remote index blob to get the authenticated generation.
     /// Can be called after `open_without_index()` to lazily load the index.
     /// Also recalculates the data pack writer target from the loaded index.
     pub fn load_chunk_index(&mut self) -> Result<()> {
-        self.chunk_index = self.reload_full_index_cached()?;
+        let (gen, index) = self.reload_full_index_with_generation()?;
+        self.index_generation = gen;
+        self.chunk_index = index;
+        // Best-effort rewrite index.gen
+        let _ = self.storage.put("index.gen", &gen.to_le_bytes());
         self.rebase_pack_target_from_index();
         Ok(())
     }
@@ -469,6 +485,9 @@ impl Repository {
     /// Load the chunk index from storage, bypassing the local blob cache.
     /// Use this for operations like `check` that must verify what's actually
     /// in the remote repository.
+    ///
+    /// NOTE: Does not update `index_generation` — only suitable for read-only
+    /// operations. Use `load_chunk_index()` for write paths.
     pub fn load_chunk_index_uncached(&mut self) -> Result<()> {
         self.chunk_index = self.reload_full_index()?;
         self.rebase_pack_target_from_index();
@@ -533,11 +552,6 @@ impl Repository {
         ws.data_pack_writer.set_target_size(data_target);
     }
 
-    /// Mark the manifest as needing persistence on the next `save_state()`.
-    pub fn mark_manifest_dirty(&mut self) {
-        self.manifest_dirty = true;
-    }
-
     /// Mark the chunk index as needing persistence on the next `save_state()`.
     pub fn mark_index_dirty(&mut self) {
         self.index_dirty = true;
@@ -553,21 +567,25 @@ impl Repository {
     pub fn open_restore_cache(&self) -> Option<dedup_cache::MmapRestoreCache> {
         dedup_cache::MmapRestoreCache::open(
             &self.config.id,
-            self.manifest.index_generation,
+            self.index_generation,
             self.cache_dir_override.as_deref(),
         )
     }
 
     // ----- Accessors for private fields -----
 
+    /// Current index generation (cache-validity token).
+    pub fn index_generation(&self) -> u64 {
+        self.index_generation
+    }
+
     /// Read-only access to the manifest.
     pub fn manifest(&self) -> &Manifest {
         &self.manifest
     }
 
-    /// Mutable access to the manifest. Automatically marks it dirty.
+    /// Mutable access to the manifest (in-memory only, never persisted to storage).
     pub fn manifest_mut(&mut self) -> &mut Manifest {
-        self.manifest_dirty = true;
         &mut self.manifest
     }
 
@@ -694,7 +712,7 @@ impl Repository {
         }
 
         self.rebuild_dedup_cache = true;
-        let generation = self.manifest.index_generation;
+        let generation = self.index_generation;
         if let Some(mmap_cache) = dedup_cache::MmapDedupCache::open(
             &self.config.id,
             generation,
@@ -782,27 +800,13 @@ impl Repository {
 
         if let Some(delta) = delta {
             if !delta.is_empty() {
-                // Non-empty delta: try incremental update first
-                let fast_ok = self
-                    .try_incremental_index_update(&delta)
-                    .unwrap_or_else(|e| {
-                        warn!("incremental index update failed: {e}");
-                        false
-                    });
-
-                if fast_ok {
-                    // Fast path succeeded — index uploaded, caches rebuilt,
-                    // manifest.index_generation and manifest_dirty already set.
-                    // Defer chunk_index hydration to reduce peak memory.
-                    self.rebuild_dedup_cache = false;
-                    deferred_index_load = true;
-                } else {
-                    // Slow path: full HashMap (first run, stale cache, error)
-                    let mut full_index = self.reload_full_index()?;
-                    delta.apply_to(&mut full_index);
-                    self.chunk_index = full_index;
-                    self.index_dirty = true;
-                }
+                // Download fresh remote index and apply delta.
+                // No reconcile() needed: callers use with_maintenance_lock()
+                // which guarantees no concurrent sessions are active.
+                let mut full_index = self.reload_full_index()?;
+                delta.apply_to(&mut full_index);
+                self.chunk_index = full_index;
+                self.index_dirty = true;
             } else if self.rebuild_dedup_cache {
                 // Empty delta: index unchanged, but caches may need rebuilding.
                 // Try to rebuild caches from full_index_cache if available.
@@ -811,12 +815,12 @@ impl Repository {
                 if let Some(cache_path) = dedup_cache::full_index_cache_path(&self.config.id, cd) {
                     if dedup_cache::MmapFullIndexCache::open(
                         &self.config.id,
-                        self.manifest.index_generation,
+                        self.index_generation,
                         cd,
                     )
                     .is_some()
                     {
-                        let gen = self.manifest.index_generation;
+                        let gen = self.index_generation;
                         let id = &self.config.id;
                         let dedup_ok = dedup_cache::build_dedup_cache_from_full_cache(
                             &cache_path,
@@ -858,9 +862,9 @@ impl Repository {
         Ok(deferred_index_load)
     }
 
-    /// Save the manifest and chunk index back to storage.
+    /// Save the chunk index back to storage.
     /// When a write session is active: flushes pending packs, applies dedup delta.
-    /// When no session is active: just persists dirty manifest/index/file_cache.
+    /// When no session is active: just persists dirty index/file_cache.
     /// Only writes components that have been marked dirty.
     pub fn save_state(&mut self) -> Result<()> {
         let deferred_index_load = if self.write_session.is_some() {
@@ -870,21 +874,13 @@ impl Repository {
         };
 
         // When the index changes, rotate index_generation so the local dedup
-        // cache is invalidated.  Must happen before the manifest write below.
+        // cache is invalidated.
         if self.index_dirty {
-            self.manifest.index_generation = rand::thread_rng().next_u64();
-            self.manifest_dirty = true;
+            self.index_generation = rand::thread_rng().next_u64();
         }
 
-        // Index-first persistence: readers never see manifest referencing
-        // missing data. Crash between index and manifest write leaves
-        // harmless orphan entries in the index.
         if self.index_dirty {
             self.persist_index()?;
-        }
-
-        if self.manifest_dirty {
-            self.persist_manifest()?;
         }
 
         // Rebuild the local dedup cache for next backup so tiered mode can
@@ -894,7 +890,7 @@ impl Repository {
             let cd = self.cache_dir_override.as_deref();
             if let Err(e) = dedup_cache::build_dedup_cache(
                 &self.chunk_index,
-                self.manifest.index_generation,
+                self.index_generation,
                 &self.config.id,
                 cd,
             ) {
@@ -902,7 +898,7 @@ impl Repository {
             }
             if let Err(e) = dedup_cache::build_restore_cache(
                 &self.chunk_index,
-                self.manifest.index_generation,
+                self.index_generation,
                 &self.config.id,
                 cd,
             ) {
@@ -911,7 +907,7 @@ impl Repository {
             // Also build the full index cache for next incremental update.
             if let Err(e) = dedup_cache::build_full_index_cache(
                 &self.chunk_index,
-                self.manifest.index_generation,
+                self.index_generation,
                 &self.config.id,
                 cd,
             ) {
@@ -945,7 +941,7 @@ impl Repository {
             // fall back to reloading from remote storage if cache is unavailable.
             self.chunk_index = dedup_cache::load_chunk_index_from_full_cache(
                 &self.config.id,
-                self.manifest.index_generation,
+                self.index_generation,
                 self.cache_dir_override.as_deref(),
             )
             .or_else(|_| self.reload_full_index())?;
@@ -966,15 +962,16 @@ impl Repository {
     ///
     /// 1. Flush packs and join uploads.
     /// 2. Take the delta from the write session.
-    /// 3. Reload fresh manifest from storage.
-    /// 4. Check snapshot name uniqueness against the fresh manifest.
-    /// 5. Verify all new_entries pack_ids exist on storage.
-    /// 6. Fast/slow path for index update based on generation match.
-    /// 7. Persist index (first) then manifest (second).
+    /// 3. Refresh snapshot list from storage.
+    /// 4. Check snapshot name uniqueness against fresh list.
+    /// 5. Download fresh remote index, reconcile delta, persist index.
+    /// 6. Write `snapshots/<id>` to storage — **commit point**.
+    /// 7. Update local manifest + snapshot cache.
     /// 8. Save file cache and consume write session.
     pub fn commit_concurrent_session(
         &mut self,
         snapshot_entry: manifest::SnapshotEntry,
+        snapshot_packed: Vec<u8>,
         new_file_cache: file_cache::FileCache,
     ) -> Result<()> {
         // 1. Flush all pending packs and wait for uploads.
@@ -991,66 +988,52 @@ impl Repository {
             ws.dedup_index = None;
         }
 
-        // 3. Record T0 generation and reload fresh manifest.
-        let t0_generation = self.manifest.index_generation;
-        self.reload_manifest()?;
+        // 3. Refresh snapshot list (unreadable blobs are skipped — a garbage
+        //    snapshot that can't be decrypted cannot conflict with a valid name).
+        self.refresh_snapshot_list()?;
 
-        // 4. Check snapshot name uniqueness against fresh manifest.
+        // 4. Check snapshot name uniqueness against fresh list.
         if self.manifest.find_snapshot(&snapshot_entry.name).is_some() {
             return Err(VykarError::SnapshotAlreadyExists(
                 snapshot_entry.name.clone(),
             ));
         }
 
+        // 5. Download fresh remote index, reconcile delta, persist index.
         if let Some(delta) = delta {
             if !delta.is_empty() {
-                if t0_generation == self.manifest.index_generation {
-                    // FAST PATH: No concurrent commits happened.
-                    // Verify packs before applying (no reconciliation needed).
-                    self.verify_delta_packs(&delta)?;
-
-                    let fast_ok = self
-                        .try_incremental_index_update(&delta)
-                        .unwrap_or_else(|e| {
-                            warn!("incremental index update failed during concurrent commit: {e}");
-                            false
-                        });
-
-                    if fast_ok {
-                        // Index uploaded, caches rebuilt, manifest.index_generation set.
-                        self.rebuild_dedup_cache = false;
-                    } else {
-                        // Fall through to slow path.
-                        let mut full_index = self.reload_full_index()?;
-                        delta.apply_to(&mut full_index);
-                        self.chunk_index = full_index;
-                        self.index_dirty = true;
-                        self.manifest.index_generation = rand::thread_rng().next_u64();
-                        self.persist_index()?;
-                    }
-                } else {
-                    // SLOW PATH: Another client committed since T0. Must reconcile.
-                    // Reconcile first — some new_entries may become refcount bumps
-                    // and no longer require their original packs.
-                    let fresh_index = self.reload_full_index()?;
-                    let reconciled = delta.reconcile(&fresh_index)?;
-                    // Verify packs only for entries that remain after reconciliation.
-                    self.verify_delta_packs(&reconciled)?;
-                    let mut fresh_index = fresh_index;
-                    reconciled.apply_to(&mut fresh_index);
-                    self.chunk_index = fresh_index;
-                    self.index_dirty = true;
-                    self.manifest.index_generation = rand::thread_rng().next_u64();
-                    self.persist_index()?;
-                }
+                let fresh_index = self.reload_full_index()?;
+                // Always reconcile against fresh index (handles concurrent commits).
+                let reconciled = delta.reconcile(&fresh_index)?;
+                self.verify_delta_packs(&reconciled)?;
+                let mut fresh_index = fresh_index;
+                reconciled.apply_to(&mut fresh_index);
+                self.chunk_index = fresh_index;
+                self.index_dirty = true;
+                self.index_generation = rand::thread_rng().next_u64();
+                self.persist_index()?;
+            } else if self.rebuild_dedup_cache {
+                // Empty delta but caches need rebuilding (tiered dedup was active).
+                // chunk_index was dropped — reload from remote for cache rebuild.
+                self.chunk_index = self.reload_full_index()?;
             }
         }
 
-        // Add snapshot entry to manifest and persist.
+        // Defensive: persist index if dirty but no delta (unreachable today
+        // because backup always activates dedup mode, but guards future callers).
+        if self.index_dirty {
+            self.index_generation = rand::thread_rng().next_u64();
+            self.persist_index()?;
+        }
+
+        // 6. Write snapshots/<id> — commit point.
+        self.check_lock_fence()?;
+        self.storage
+            .put(&snapshot_entry.id.storage_key(), &snapshot_packed)?;
+
+        // 7. Update local manifest.
         self.manifest.timestamp = Utc::now();
         self.manifest.snapshots.push(snapshot_entry);
-        self.manifest_dirty = true;
-        self.persist_manifest()?;
 
         // Save file cache.
         self.file_cache = new_file_cache;
@@ -1070,7 +1053,7 @@ impl Repository {
             let cd = self.cache_dir_override.as_deref();
             if let Err(e) = dedup_cache::build_dedup_cache(
                 &self.chunk_index,
-                self.manifest.index_generation,
+                self.index_generation,
                 &self.config.id,
                 cd,
             ) {
@@ -1078,7 +1061,7 @@ impl Repository {
             }
             if let Err(e) = dedup_cache::build_restore_cache(
                 &self.chunk_index,
-                self.manifest.index_generation,
+                self.index_generation,
                 &self.config.id,
                 cd,
             ) {
@@ -1086,7 +1069,7 @@ impl Repository {
             }
             if let Err(e) = dedup_cache::build_full_index_cache(
                 &self.chunk_index,
-                self.manifest.index_generation,
+                self.index_generation,
                 &self.config.id,
                 cd,
             ) {
@@ -1123,9 +1106,11 @@ impl Repository {
         Ok(())
     }
 
-    /// Serialize, encrypt, and write the chunk index to storage.
+    /// Serialize, encrypt, and write the IndexBlob (generation + chunks) to storage.
+    /// Also writes the advisory `index.gen` sidecar.
     fn persist_index(&mut self) -> Result<()> {
-        let estimated_msgpack = self.chunk_index.len().saturating_mul(80);
+        let generation = self.index_generation;
+        let estimated_msgpack = self.chunk_index.len().saturating_mul(80) + 16;
         let estimated = 1 + zstd::zstd_safe::compress_bound(estimated_msgpack);
         let index_packed = pack_object_streaming_with_context(
             ObjectType::ChunkIndex,
@@ -1133,47 +1118,37 @@ impl Repository {
             estimated,
             self.crypto.as_ref(),
             |buf| {
+                let blob = IndexBlobRef {
+                    generation,
+                    chunks: &self.chunk_index,
+                };
                 compress::compress_stream_zstd(buf, 3, |encoder| {
-                    rmp_serde::encode::write(encoder, &self.chunk_index)?;
+                    rmp_serde::encode::write(encoder, &blob)?;
                     Ok(())
                 })
             },
         )?;
         self.check_lock_fence()?;
         self.storage.put("index", &index_packed)?;
+        // Advisory sidecar — best-effort, non-fatal.
+        let _ = self.storage.put("index.gen", &generation.to_le_bytes());
         self.index_dirty = false;
         Ok(())
     }
 
-    /// Serialize, encrypt, and write the manifest to storage.
-    fn persist_manifest(&mut self) -> Result<()> {
-        let manifest_bytes = rmp_serde::to_vec(&self.manifest)?;
-        let manifest_packed = pack_object_with_context(
-            ObjectType::Manifest,
-            MANIFEST_OBJECT_CONTEXT,
-            &manifest_bytes,
+    /// Re-list snapshots/ and rebuild the in-memory manifest.
+    /// Used by concurrent session commit to get a fresh snapshot list.
+    pub fn refresh_snapshot_list(&mut self) -> Result<()> {
+        // Strict I/O: fail on GET errors so a transient failure can't hide an
+        // existing snapshot name and allow a duplicate during commit.
+        let entries = snapshot_cache::refresh_snapshot_cache(
+            self.storage.as_ref(),
             self.crypto.as_ref(),
+            &self.config.id,
+            self.cache_dir_override.as_deref(),
+            true, // strict_io: true — commit uniqueness check
         )?;
-        self.check_lock_fence()?;
-        self.storage.put("manifest", &manifest_packed)?;
-        self.manifest_dirty = false;
-        Ok(())
-    }
-
-    /// Reload the manifest from storage (for concurrent session commit).
-    pub fn reload_manifest(&mut self) -> Result<()> {
-        let manifest_data = self
-            .storage
-            .get("manifest")?
-            .ok_or_else(|| VykarError::Other("manifest not found on reload".into()))?;
-        let compressed = unpack_object_expect_with_context(
-            &manifest_data,
-            ObjectType::Manifest,
-            MANIFEST_OBJECT_CONTEXT,
-            self.crypto.as_ref(),
-        )?;
-        self.manifest = rmp_serde::from_slice(&compressed)?;
-        self.manifest_dirty = false;
+        self.manifest = Manifest::from_snapshot_entries(entries);
         Ok(())
     }
 
@@ -1195,158 +1170,24 @@ impl Repository {
         Ok(())
     }
 
-    /// Try to perform an incremental index update using the local full_index_cache.
-    /// Returns `Ok(true)` on success (index uploaded, caches rebuilt, manifest updated).
-    /// Returns `Ok(false)` if the cache is missing or stale (caller should use slow path).
-    fn try_incremental_index_update(&mut self, delta: &IndexDelta) -> Result<bool> {
-        let cd = self.cache_dir_override.as_deref();
-        let cache_path = match dedup_cache::full_index_cache_path(&self.config.id, cd) {
-            Some(p) => p,
-            None => return Ok(false),
-        };
-
-        let old_cache = match dedup_cache::MmapFullIndexCache::open(
-            &self.config.id,
-            self.manifest.index_generation,
-            cd,
-        ) {
-            Some(c) => c,
-            None => return Ok(false),
-        };
-
-        debug!(
-            old_entries = old_cache.entry_count(),
-            new_entries = delta.new_entries.len(),
-            refcount_bumps = delta.refcount_bumps.len(),
-            "incremental index update: merging delta"
-        );
-
-        let new_gen = rand::thread_rng().next_u64();
-
-        // Merge old cache + delta → new cache file
-        dedup_cache::merge_full_index_cache(&old_cache, delta, new_gen, &cache_path)?;
-
-        // Drop old mmap before we open the new one
-        drop(old_cache);
-
-        // Open the newly merged cache for serialization
-        let new_cache = dedup_cache::MmapFullIndexCache::open_path(&cache_path, new_gen)
-            .ok_or_else(|| {
-                vykar_types::error::VykarError::Other(
-                    "failed to open newly merged full index cache".into(),
-                )
-            })?;
-
-        // Serialize from cache → encrypted packed object
-        let packed =
-            dedup_cache::serialize_full_cache_to_packed_object(&new_cache, self.crypto.as_ref())?;
-
-        // Upload
-        self.check_lock_fence()?;
-        self.storage.put("index", &packed)?;
-
-        // Free upload buffer
-        drop(packed);
-
-        // Rebuild dedup + restore caches from full cache (streaming)
-        if let Err(e) = dedup_cache::build_dedup_cache_from_full_cache(
-            &cache_path,
-            new_gen,
-            &self.config.id,
-            cd,
-        ) {
-            warn!("failed to rebuild dedup cache from full cache: {e}");
-        }
-        if let Err(e) = dedup_cache::build_restore_cache_from_full_cache(
-            &cache_path,
-            new_gen,
-            &self.config.id,
-            cd,
-        ) {
-            warn!("failed to rebuild restore cache from full cache: {e}");
-        }
-
-        // Update manifest generation — must happen before return so
-        // load_chunk_index_from_full_cache uses the correct generation.
-        self.manifest.index_generation = new_gen;
-        self.manifest_dirty = true;
-
-        Ok(true)
-    }
-
     /// Reload the full chunk index from storage (always downloads from remote).
     fn reload_full_index(&self) -> Result<ChunkIndex> {
+        self.reload_full_index_with_generation()
+            .map(|(_, index)| index)
+    }
+
+    /// Reload the full chunk index + generation from storage.
+    fn reload_full_index_with_generation(&self) -> Result<(u64, ChunkIndex)> {
         if let Some(index_data) = self.storage.get("index")? {
-            Self::decode_index_blob(&index_data, self.crypto.as_ref())
+            let blob = Self::decode_index_blob_full(&index_data, self.crypto.as_ref())?;
+            Ok((blob.generation, blob.chunks))
         } else {
-            Ok(ChunkIndex::new())
+            Ok((0, ChunkIndex::new()))
         }
     }
 
-    /// Load the index blob, trying the local blob cache first.
-    /// Falls back to remote download on cache miss.
-    fn load_index_blob_cached(&self) -> Result<Option<Vec<u8>>> {
-        let generation = self.manifest.index_generation;
-        let cache_dir = self.cache_dir_override.as_deref();
-
-        // Try local blob cache
-        if let Some(blob) =
-            dedup_cache::read_index_blob_cache(&self.config.id, generation, cache_dir)
-        {
-            debug!("index blob cache hit (generation {generation})");
-            return Ok(Some(blob));
-        }
-
-        // Cache miss — download from remote
-        let Some(blob) = self.storage.get("index")? else {
-            return Ok(None);
-        };
-
-        // Save to local cache (non-fatal on error)
-        if let Err(e) =
-            dedup_cache::write_index_blob_cache(&blob, generation, &self.config.id, cache_dir)
-        {
-            debug!("failed to write index blob cache: {e}");
-        }
-
-        Ok(Some(blob))
-    }
-
-    /// Reload the full chunk index, trying the local blob cache first.
-    /// Falls back to remote download if the cached blob is corrupt.
-    fn reload_full_index_cached(&self) -> Result<ChunkIndex> {
-        if let Some(index_data) = self.load_index_blob_cached()? {
-            match Self::decode_index_blob(&index_data, self.crypto.as_ref()) {
-                Ok(index) => return Ok(index),
-                Err(e) => {
-                    warn!("index blob cache corrupt, falling back to remote: {e}");
-                    // Fall through to uncached remote download
-                }
-            }
-        } else {
-            return Ok(ChunkIndex::new());
-        }
-
-        // Cached blob was corrupt — download fresh and rewrite the cache
-        let Some(blob) = self.storage.get("index")? else {
-            return Ok(ChunkIndex::new());
-        };
-        let index = Self::decode_index_blob(&blob, self.crypto.as_ref())?;
-
-        if let Err(e) = dedup_cache::write_index_blob_cache(
-            &blob,
-            self.manifest.index_generation,
-            &self.config.id,
-            self.cache_dir_override.as_deref(),
-        ) {
-            debug!("failed to rewrite index blob cache: {e}");
-        }
-
-        Ok(index)
-    }
-
-    /// Decrypt, decompress, and deserialize an index blob.
-    fn decode_index_blob(index_data: &[u8], crypto: &dyn CryptoEngine) -> Result<ChunkIndex> {
+    /// Decrypt, decompress, and deserialize an index blob into an `IndexBlob`.
+    fn decode_index_blob_full(index_data: &[u8], crypto: &dyn CryptoEngine) -> Result<IndexBlob> {
         let compressed = unpack_object_expect_with_context(
             index_data,
             ObjectType::ChunkIndex,

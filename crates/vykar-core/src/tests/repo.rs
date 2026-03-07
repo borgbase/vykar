@@ -20,10 +20,10 @@ fn init_creates_required_keys() {
     )
     .unwrap();
 
-    // config, manifest, and index should exist
+    // config, index, and index.gen should exist (no manifest in v2)
     assert!(repo.storage.exists("config").unwrap());
-    assert!(repo.storage.exists("manifest").unwrap());
     assert!(repo.storage.exists("index").unwrap());
+    assert!(repo.storage.exists("index.gen").unwrap());
 }
 
 #[test]
@@ -110,17 +110,16 @@ fn store_chunk_with_compression() {
 }
 
 #[test]
-fn save_state_persists_manifest_and_index() {
+fn save_state_persists_index() {
     let mut repo = test_repo_plaintext();
     let data = b"persistent chunk";
     repo.store_chunk(data, Compression::None, PackType::Data)
         .unwrap();
-    // Mark manifest dirty so it gets written (store_chunk only marks index dirty)
-    repo.mark_manifest_dirty();
+    // Mark index dirty so it gets written (store_chunk only marks index dirty)
+    repo.mark_index_dirty();
     repo.save_state().unwrap();
 
-    // Verify manifest and index are updated in storage
-    assert!(repo.storage.exists("manifest").unwrap());
+    // Verify index is updated in storage
     assert!(repo.storage.exists("index").unwrap());
 
     // Index should have one entry
@@ -181,17 +180,13 @@ fn repo_on_recording_backend() -> (Repository, PutLog) {
 fn save_state_no_mutations_skips_writes() {
     let (mut repo, log) = repo_on_recording_backend();
 
-    // Clear the put log from init (which writes config, manifest, index)
+    // Clear the put log from init (which writes config, index, index.gen)
     log.clear();
 
-    // No mutations — save_state should not write manifest, index, or file cache
+    // No mutations — save_state should not write index or file cache
     repo.save_state().unwrap();
 
     let entries = log.entries();
-    assert!(
-        !entries.contains(&"manifest".to_string()),
-        "manifest should not be written when not dirty: {entries:?}"
-    );
     assert!(
         !entries.contains(&"index".to_string()),
         "index should not be written when not dirty: {entries:?}"
@@ -203,18 +198,14 @@ fn save_state_writes_only_dirty_components() {
     let (mut repo, log) = repo_on_recording_backend();
     log.clear();
 
-    // Only mark manifest dirty
-    repo.mark_manifest_dirty();
+    // Mark index dirty
+    repo.mark_index_dirty();
     repo.save_state().unwrap();
 
     let entries = log.entries();
     assert!(
-        entries.contains(&"manifest".to_string()),
-        "manifest should be written: {entries:?}"
-    );
-    assert!(
-        !entries.contains(&"index".to_string()),
-        "index should NOT be written: {entries:?}"
+        entries.contains(&"index".to_string()),
+        "index should be written: {entries:?}"
     );
 }
 
@@ -244,7 +235,7 @@ fn dedup_mode_empty_delta_restores_index_without_write() {
     let (id_a, _, _) = repo
         .store_chunk(data_a, Compression::None, PackType::Data)
         .unwrap();
-    repo.mark_manifest_dirty();
+    repo.mark_index_dirty();
     repo.mark_index_dirty();
     repo.save_state().unwrap();
 
@@ -327,7 +318,7 @@ fn dirty_flags_reset_after_save() {
     let (mut repo, log) = repo_on_recording_backend();
 
     // Mark everything dirty and save
-    repo.mark_manifest_dirty();
+    repo.mark_index_dirty();
     repo.mark_index_dirty();
     repo.mark_file_cache_dirty();
     repo.save_state().unwrap();
@@ -337,10 +328,6 @@ fn dirty_flags_reset_after_save() {
     repo.save_state().unwrap();
 
     let entries = log.entries();
-    assert!(
-        !entries.contains(&"manifest".to_string()),
-        "manifest should not be rewritten: {entries:?}"
-    );
     assert!(
         !entries.contains(&"index".to_string()),
         "index should not be rewritten: {entries:?}"
@@ -376,7 +363,7 @@ fn deferred_hydration_survives_file_cache_save_error() {
     let (id_a, _, _) = repo
         .store_chunk(b"hydration test chunk", Compression::None, PackType::Data)
         .unwrap();
-    repo.mark_manifest_dirty();
+    repo.mark_index_dirty();
     repo.mark_index_dirty();
     repo.save_state().unwrap();
     assert_eq!(repo.chunk_index().len(), 1);
@@ -812,7 +799,7 @@ fn load_chunk_index_resets_session_counter() {
     assert!(repo.data_pack_target() > 1024);
 
     // Save state to persist the index with current packs.
-    repo.mark_manifest_dirty();
+    repo.mark_index_dirty();
     repo.save_state().unwrap();
 
     // Reload the index — session counter should reset to 0, so the target
@@ -840,7 +827,7 @@ fn save_state_rebases_pack_counters() {
     // First session: flush several packs.
     store_unique_chunks(&mut repo, 0, 20, PackType::Data);
     let target_before_save = repo.data_pack_target();
-    repo.mark_manifest_dirty();
+    repo.mark_index_dirty();
     repo.save_state().unwrap();
 
     // Second session on the same Repository instance: flush more packs.
@@ -861,7 +848,7 @@ fn save_state_rebases_pack_counters() {
 
     // Verify via reload: the target from a fresh index load should match
     // what the reused instance computed.
-    repo.mark_manifest_dirty();
+    repo.mark_index_dirty();
     repo.save_state().unwrap();
     repo.load_chunk_index().unwrap();
     repo.begin_write_session().unwrap();
@@ -979,7 +966,7 @@ fn initial_session_seed_includes_tree_packs() {
         .unwrap();
 
     // Persist everything and consume the session.
-    repo.mark_manifest_dirty();
+    repo.mark_index_dirty();
     repo.save_state().unwrap();
 
     // Count all distinct packs in the index (data + tree).
@@ -1000,5 +987,43 @@ fn initial_session_seed_includes_tree_packs() {
     assert_eq!(
         target, expected,
         "initial session target should be based on all packs (data + tree)"
+    );
+}
+
+#[test]
+fn load_chunk_index_overwrites_stale_index_gen() {
+    let mut repo = test_repo_plaintext();
+
+    // Store a chunk and persist so the index has a real generation.
+    repo.store_chunk(b"gen test chunk", Compression::None, PackType::Data)
+        .unwrap();
+    repo.mark_index_dirty();
+    repo.save_state().unwrap();
+
+    let real_gen = repo.index_generation();
+    assert_ne!(real_gen, 0, "generation should be non-zero after save");
+
+    // Write a stale value to index.gen.
+    let stale_gen = 12345u64;
+    repo.storage
+        .put("index.gen", &stale_gen.to_le_bytes())
+        .unwrap();
+
+    // Reload the index — should use the authenticated generation from IndexBlob,
+    // not the stale index.gen sidecar.
+    repo.load_chunk_index().unwrap();
+
+    assert_eq!(
+        repo.index_generation(),
+        real_gen,
+        "load_chunk_index should use authenticated generation, not stale index.gen"
+    );
+
+    // Verify index.gen was overwritten with the correct value.
+    let gen_data = repo.storage.get("index.gen").unwrap().unwrap();
+    let restored_gen = u64::from_le_bytes(gen_data.try_into().unwrap());
+    assert_eq!(
+        restored_gen, real_gen,
+        "index.gen should be overwritten with the authenticated generation"
     );
 }

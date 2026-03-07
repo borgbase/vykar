@@ -6,7 +6,7 @@ use globset::GlobMatcher;
 use crate::config::VykarConfig;
 use crate::snapshot::item::{Item, ItemType};
 use vykar_types::chunk_id::ChunkId;
-use vykar_types::error::{Result, VykarError};
+use vykar_types::error::Result;
 
 use super::list;
 
@@ -141,14 +141,13 @@ pub fn run(
                 cache.lookup(id)
             }) {
                 Ok(s) => s,
-                Err(VykarError::ChunkNotInIndex(_)) => {
-                    // Restore cache incomplete — fall back to full index
+                Err(_) => {
+                    // Restore cache incomplete or stale — fall back to full index
                     restore_cache = None;
                     repo.load_chunk_index()?;
                     index_loaded = true;
                     list::load_snapshot_item_stream(&mut repo, &snapshot_name)?
                 }
-                Err(e) => return Err(e),
             }
         } else {
             if !index_loaded {

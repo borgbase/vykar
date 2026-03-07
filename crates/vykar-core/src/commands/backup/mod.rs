@@ -262,7 +262,7 @@ pub fn run_with_progress(
     };
 
     // Wrap Phase 1 in a closure that deregisters the session on error.
-    let phase1_result = (|| -> Result<(SnapshotEntry, FileCache, SnapshotStats)> {
+    let phase1_result = (|| -> Result<(SnapshotEntry, Vec<u8>, FileCache, SnapshotStats)> {
         // Check snapshot name is unique (best-effort, re-checked at commit).
         if repo.manifest().find_snapshot(snapshot_name).is_some() {
             return Err(VykarError::SnapshotAlreadyExists(snapshot_name.into()));
@@ -422,16 +422,16 @@ pub fn run_with_progress(
             label: String::new(),
         };
 
-        // Generate snapshot ID and store snapshot metadata.
+        // Generate snapshot ID and pack the blob (but DO NOT write to storage yet).
+        // Writing snapshots/<id> is deferred to Phase 2 (commit barrier).
         let snapshot_id = SnapshotId::generate();
         let meta_bytes = rmp_serde::to_vec(&snapshot_meta)?;
-        let meta_packed = pack_object_with_context(
+        let snapshot_packed = pack_object_with_context(
             ObjectType::SnapshotMeta,
             snapshot_id.as_bytes(),
             &meta_bytes,
             repo.crypto.as_ref(),
         )?;
-        repo.storage.put(&snapshot_id.storage_key(), &meta_packed)?;
 
         let snapshot_entry = SnapshotEntry {
             name: snapshot_name.to_string(),
@@ -443,11 +443,11 @@ pub fn run_with_progress(
             hostname,
         };
 
-        Ok((snapshot_entry, new_file_cache, stats))
+        Ok((snapshot_entry, snapshot_packed, new_file_cache, stats))
     })();
 
     // On Phase 1 error: best-effort cleanup then deregister session.
-    let (snapshot_entry, new_file_cache, stats) = match phase1_result {
+    let (snapshot_entry, snapshot_packed, new_file_cache, stats) = match phase1_result {
         Ok(result) => result,
         Err(e) => {
             repo.flush_on_abort();
@@ -463,7 +463,8 @@ pub fn run_with_progress(
         let fence = lock::build_lock_fence(&guard, Arc::clone(&repo.storage));
         repo.set_lock_fence(fence);
 
-        let result = repo.commit_concurrent_session(snapshot_entry, new_file_cache);
+        let result =
+            repo.commit_concurrent_session(snapshot_entry, snapshot_packed, new_file_cache);
 
         if result.is_err() {
             repo.flush_on_abort();

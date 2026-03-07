@@ -8,10 +8,10 @@ Dumb storage backends (S3, WebDAV, SFTP) work well for basic backups, but they c
 
 | Capability | S3 / dumb storage | vykar-server |
 |------------|-------------------|-------------|
-| Append-only mode | Not enforceable; a compromised client with S3 credentials can delete anything | Rejects delete and pack overwrite operations |
+| Append-only mode | Not enforceable; a compromised client with S3 credentials can delete anything | Rejects deletes and overwrites of immutable keys; only `index`, `index.gen`, `locks/*`, and `sessions/*` remain mutable |
 | Server-side compaction | Client must download and re-upload all live blobs | Server repacks locally on disk from a compact plan |
 | Quota enforcement | Requires external bucket policy/IAM setup | Built-in byte quota checks on writes |
-| Backup freshness monitoring | Requires external polling and parsing | Tracks `last_backup_at` on manifest writes |
+| Backup freshness monitoring | Requires external polling and parsing | Tracks `last_backup_at` on new snapshot writes |
 | Upload integrity | Relies on backend checksums only | Verifies `X-Content-BLAKE2b` during uploads |
 | Structural health checks | Client has to fetch data to verify structure | Server validates repository shape directly |
 
@@ -31,7 +31,7 @@ All settings are passed as CLI flags. The authentication token is read from the 
 |------|---------|-------------|
 | `-l, --listen` | `localhost:8585` | Address to listen on |
 | `-d, --data-dir` | `/var/lib/vykar` | Root directory where repositories are stored |
-| `--append-only` | `false` | Reject `DELETE` and overwriting existing pack files |
+| `--append-only` | `false` | Reject `DELETE` and overwriting immutable keys (config, keys, snapshots, packs). Mutable keys (index, index.gen, locks, sessions) remain writable. |
 | `--log-format` | `pretty` | Log output format: `json` or `pretty` |
 | `--quota` | auto-detect | Storage quota (`500M`, `10G`, plain bytes). If omitted, the server detects filesystem quota or falls back to free space |
 | `--network-threads` | `4` | Async threads for handling network connections |

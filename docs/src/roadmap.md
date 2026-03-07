@@ -26,8 +26,8 @@
 | **REST server** | axum-based backup server with auth, append-only enforcement, quotas, freshness tracking, and server-side compaction |
 | **REST backend** | `StorageBackend` over HTTP with range-read support |
 | **Tiered dedup index** | Backup dedup via session map + xor filter + mmap dedup cache, with safe fallback to HashMap dedup mode |
-| **Restore mmap cache** | Index-light restore planning via local restore cache; fallback to filtered full-index loading when needed |
-| **Incremental index update** | `save_state()` fast path merges `IndexDelta` into local full-index cache and serializes index from cache |
+| **Restore mmap cache** | Restore-cache-first item-stream lookup with safe fallback to the full index when cache entries are stale or incomplete |
+| **Append-only repository layout v2** | Snapshot listing derived from immutable `snapshots/<id>` blobs; `index` stores authenticated generation and `index.gen` is an advisory cache hint |
 | **Bounded parallel pipeline** | Byte-budgeted pipeline with bounded worker/upload concurrency derived from `limits.threads` and `limits.connections` |
 | **Heap-backed pack assembly** | Pack writers use heap-backed buffers after the mmap path was removed for reliability on some systems |
 | **cache_dir override** | Configurable root for file cache, dedup/restore/full-index caches, and preferred mmap temp-file location |
@@ -39,4 +39,4 @@
 | **Server-side pack verification** | `vykar check` delegates pack integrity checks to vykar-server when available; `--distrust-server` opts out |
 | **Upload integrity** | REST `PUT` includes `X-Content-BLAKE2b` header; server verifies during streaming write |
 | **vykar-protocol crate** | Shared wire-format types and pack/protocol version constants between client and server |
-| **Type-safe SnapshotId** | Newtype for snapshot identifiers with `storage_key()` (ManifestId dropped — manifest is a singleton) |
+| **Type-safe SnapshotId** | Newtype for snapshot identifiers with `storage_key()` for `snapshots/<id>` objects |

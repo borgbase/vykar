@@ -45,7 +45,8 @@ crates/
         file_cache.rs                   # FileCache — inode/mtime skip for unchanged files
         format.rs                       # RepoObj envelope — pack_object / unpack_object
         pack.rs                         # PackWriter, PackType, pack read/write helpers
-        manifest.rs                     # Manifest — snapshot list
+        manifest.rs                     # Manifest — runtime-only snapshot list (never serialized to storage)
+        snapshot_cache.rs                # Local snapshot cache — avoids O(n) GETs on open
         lock.rs                         # Advisory locks, SessionEntry, session register/deregister/refresh, acquire_lock_with_retry
         write_session.rs                # WriteSessionState — pack writers, upload queue, IndexDelta, session journal
       snapshot/
@@ -92,26 +93,26 @@ Backup runs in two phases so multiple clients can upload concurrently.
    - Compress (LZ4/ZSTD) → encrypt (AES-256-GCM) → buffer into `PackWriter`
    - When pack reaches target size → flush to `packs/<shard>/<pack_id>`
 6. Serialize all `Item` structs → chunk the item stream → store item-stream chunks (tree packs)
-7. Build `SnapshotMeta` with `item_ptrs` → encrypt → store at `snapshots/<id>`
+7. Build `SnapshotMeta` with `item_ptrs` → encrypt → pack snapshot blob in memory (NOT written to storage yet)
 
 **Phase 2 — Commit (exclusive lock, brief):**
 
 8. Acquire advisory lock with retry (10 attempts, exponential backoff)
-9. `commit_concurrent_session()`: reload fresh manifest+index, reconcile `IndexDelta` (fast path if no concurrent commits, slow path with full reload + reconcile), write index first then manifest
+9. `commit_concurrent_session()`: download fresh remote index, reconcile `IndexDelta`, persist index, write `snapshots/<id>` (commit point), update local snapshot cache
 10. Deregister session, release lock, delete `sessions/<id>.index`
 
 ### Repository on-disk layout
 
 ```
 <repo>/
-  config              # unencrypted msgpack: RepoConfig (version, chunker params, pack size limits)
-  keys/repokey        # Argon2id-wrapped master key
-  manifest            # encrypted: Manifest (snapshot list)
-  index               # encrypted: ChunkIndex (chunk_id → pack_id, offset, size, refcount)
-  snapshots/<id>      # encrypted: SnapshotMeta per snapshot
-  sessions/<id>.json  # session presence markers (concurrent backups)
-  sessions/<id>.index # per-session crash-recovery journals
-  packs/<xx>/<id>     # pack files containing compressed+encrypted chunks (256 shard dirs)
+  config              # write-once, unencrypted msgpack: RepoConfig (version 2, chunker params, pack size limits)
+  keys/repokey        # write-once, Argon2id-wrapped master key
+  index               # mutable, encrypted: IndexBlob {generation, chunks} (ChunkIndex + generation counter)
+  index.gen           # mutable, unencrypted, advisory: u64 generation hint for cache lookups
+  snapshots/<id>      # write-once, encrypted: SnapshotMeta per snapshot — source of truth for snapshot listing
+  sessions/<id>.json  # ephemeral: session presence markers (concurrent backups)
+  sessions/<id>.index # ephemeral: per-session crash-recovery journals
+  packs/<xx>/<id>     # write-once: pack files containing compressed+encrypted chunks (256 shard dirs)
   locks/*.json        # advisory locks
 ```
 
@@ -130,7 +131,7 @@ The type tag byte is used as AAD (authenticated additional data) in AES-GCM.
 - `PackId` (crypto/pack_id.rs) — 32-byte unkeyed BLAKE2b-256, has `storage_key()` → `packs/<shard>/<hex>`, `from_hex()`, `from_storage_key()`
 - `PackWriter` (repo/pack.rs) — buffers encrypted blobs and flushes them as pack files
 - `PackType` (repo/pack.rs) — `Data` (file content) or `Tree` (item-stream metadata)
-- `Repository` (repo/mod.rs) — central orchestrator, owns storage + crypto + manifest + index + pack writers
+- `Repository` (repo/mod.rs) — central orchestrator, owns storage + crypto + manifest (runtime) + index + pack writers
 - `WriteSessionState` (repo/write_session.rs) — transient backup-session state: pack writers, upload queue, `IndexDelta`, session journal
 - `IndexDelta` (index/mod.rs) — accumulated index mutations during backup: `new_entries` + `refcount_bumps`; `reconcile()` merges against fresh index at commit
 - `SessionEntry` (repo/lock.rs) — JSON marker at `sessions/<id>.json` for concurrent backup coordination
@@ -143,10 +144,12 @@ The type tag byte is used as AAD (authenticated additional data) in AES-GCM.
 - `blake2::Blake2bMac<U32>` has ambiguous trait methods — use `Mac::update(&mut hasher, data)` and `<KeyedBlake2b256 as KeyInit>::new_from_slice()` if needed.
 - The `PlaintextEngine` still needs a `chunk_id_key` for deterministic dedup. For unencrypted repos, it's derived as `BLAKE2b(repo_id)`.
 - `store_chunk()` requires a `PackType` argument — use `PackType::Data` for file content and `PackType::Tree` for item-stream metadata.
-- `save_state()` takes `&mut self` (not `&self`) because it flushes pending pack writes before persisting manifest/index.
-- **Two-phase backup**: Phase 1 (no lock, session marker) handles upload; Phase 2 (exclusive lock, brief) handles commit via `commit_concurrent_session()`. Multiple clients can upload concurrently.
+- `save_state()` takes `&mut self` (not `&self`) because it flushes pending pack writes before persisting the index.
+- **Two-phase backup**: Phase 1 (no lock, session marker) handles upload; Phase 2 (exclusive lock, brief) handles commit via `commit_concurrent_session()`. Multiple clients can upload concurrently. Snapshot blob is packed in Phase 1 but only written to storage in Phase 2 as the commit point.
 - **Per-session crash-recovery journal** at `sessions/<id>.index`, co-located with the session marker at `sessions/<id>.json`.
-- **Index-first persistence**: in `commit_concurrent_session()`, the index is always written before the manifest. Crash between the two leaves harmless orphan index entries.
+- **Manifest is runtime-only**: The `Manifest` struct is an in-memory snapshot list derived from `snapshots/` blobs on open. It is never serialized to storage. A local AEAD-encrypted snapshot cache avoids O(n) GETs on every open.
+- **IndexBlob**: The `index` file stores `IndexBlob { generation: u64, chunks: ChunkIndex }`. The `index.gen` sidecar is an unencrypted advisory cache hint — never trusted for writes.
+- **Delete/prune ordering**: Delete `snapshots/<id>` first (must succeed, failure aborts), then decrement refcounts and persist the index. Crash between delete and index persist leaves inflated refcounts (safe).
 - **Maintenance lock**: `with_maintenance_lock()` (compact/delete/prune) acquires the advisory lock, cleans stale sessions (72 h), then refuses to proceed if any active sessions remain (`VykarError::ActiveSessions`).
 
 ### Output conventions

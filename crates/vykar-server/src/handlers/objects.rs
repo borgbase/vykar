@@ -90,11 +90,18 @@ pub async fn put_object(
         Err(e) => return Err(ServerError::from(e)),
     };
 
-    // Append-only: reject overwrites of pack files
-    if state.inner.config.append_only && key.starts_with("packs/") && existing_meta.is_some() {
-        return Err(ServerError::Forbidden(
-            "append-only: cannot overwrite pack files".into(),
-        ));
+    // Append-only: only index, index.gen, locks/*, sessions/* are overwritable.
+    // Everything else (config, keys/*, snapshots/*, packs/*) is immutable once written.
+    if state.inner.config.append_only && existing_meta.is_some() {
+        let is_mutable = key == "index"
+            || key == "index.gen"
+            || key.starts_with("locks/")
+            || key.starts_with("sessions/");
+        if !is_mutable {
+            return Err(ServerError::Forbidden(
+                "append-only: cannot overwrite immutable object".into(),
+            ));
+        }
     }
 
     // Track old file size for quota accounting
@@ -250,8 +257,8 @@ pub async fn put_object(
         state.sub_quota_usage(old_size - data_len);
     }
 
-    // Detect manifest write → record backup timestamp
-    if key == "manifest" {
+    // Detect new snapshot write → record backup timestamp
+    if key.starts_with("snapshots/") && old_size == 0 {
         state.record_backup();
     }
 

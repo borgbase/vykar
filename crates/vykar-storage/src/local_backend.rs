@@ -302,10 +302,10 @@ mod tests {
     fn put_overwrites_existing_key() {
         let dir = tempfile::tempdir().unwrap();
         let backend = LocalBackend::new(dir.path().to_str().unwrap()).unwrap();
-        backend.put("manifest", b"version1").unwrap();
-        assert_eq!(backend.get("manifest").unwrap().unwrap(), b"version1");
-        backend.put("manifest", b"version2").unwrap();
-        assert_eq!(backend.get("manifest").unwrap().unwrap(), b"version2");
+        backend.put("index", b"version1").unwrap();
+        assert_eq!(backend.get("index").unwrap().unwrap(), b"version1");
+        backend.put("index", b"version2").unwrap();
+        assert_eq!(backend.get("index").unwrap().unwrap(), b"version2");
     }
 
     #[test]

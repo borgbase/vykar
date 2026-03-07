@@ -156,7 +156,7 @@ pub struct VerifyPacksResponse {
 // ── Repository layout ─────────────────────────────────────────────────────
 
 /// Top-level file entries that can appear in a vykar repository root.
-pub const KNOWN_ROOT_FILES: &[&str] = &["config", "manifest", "index"];
+pub const KNOWN_ROOT_FILES: &[&str] = &["config", "index", "index.gen"];
 
 /// Top-level directory entries that can appear in a vykar repository root.
 pub const KNOWN_ROOT_DIRS: &[&str] = &[

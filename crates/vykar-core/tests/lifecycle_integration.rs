@@ -514,7 +514,7 @@ fn restore_falls_back_to_index_on_cache_miss() {
     // Read repo_id and index_generation
     let repo = open_local_repo(&repo_dir, None);
     let repo_id = repo.config.id.clone();
-    let generation = repo.manifest().index_generation;
+    let generation = repo.index_generation();
     drop(repo);
 
     // Overwrite restore cache: valid generation, but 0 entries.

@@ -1,4 +1,3 @@
-use chrono::Utc;
 use vykar_core::commands;
 use vykar_core::compress::Compression;
 use vykar_core::config::{
@@ -6,12 +5,10 @@ use vykar_core::config::{
     RepositoryConfig, ResourceLimitsConfig, RetentionConfig, RetryConfig, ScheduleConfig,
     VykarConfig, XattrsConfig,
 };
-use vykar_core::repo::manifest::SnapshotEntry;
 use vykar_core::repo::pack::PackType;
 use vykar_core::repo::{EncryptionMode, Repository};
 use vykar_core::snapshot::item::ItemType;
 use vykar_storage::local_backend::LocalBackend;
-use vykar_types::snapshot_id::SnapshotId;
 
 static TEST_ENV_INIT: std::sync::Once = std::sync::Once::new();
 
@@ -138,27 +135,42 @@ fn init_store_reopen_read() {
 }
 
 #[test]
-fn manifest_survives_reopen() {
+fn snapshot_list_survives_reopen() {
     let tmp = tempfile::tempdir().unwrap();
-    let dir = tmp.path();
+    let repo_dir = tmp.path().join("repo");
+    let source_dir = tmp.path().join("source");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    std::fs::create_dir_all(&source_dir).unwrap();
+    std::fs::write(source_dir.join("file.txt"), b"reopen-test").unwrap();
 
-    // Init and add a snapshot entry to manifest
-    {
-        let mut repo = init_local_repo(dir);
-        repo.manifest_mut().snapshots.push(SnapshotEntry {
-            name: "test-snapshot".to_string(),
-            id: SnapshotId([0x42; 32]),
-            time: Utc::now(),
-            source_label: String::new(),
-            label: String::new(),
-            source_paths: Vec::new(),
-            hostname: String::new(),
-        });
-        repo.save_state().unwrap();
-    }
+    let config = make_test_config(&repo_dir);
+    commands::init::run(&config, None).unwrap();
 
-    // Reopen and check manifest
-    let repo = open_local_repo(dir);
+    let source_paths = vec![source_dir.to_string_lossy().to_string()];
+    let exclude_patterns: Vec<String> = Vec::new();
+    let exclude_if_present: Vec<String> = Vec::new();
+
+    commands::backup::run(
+        &config,
+        commands::backup::BackupRequest {
+            snapshot_name: "test-snapshot",
+            passphrase: None,
+            source_paths: &source_paths,
+            source_label: "source",
+            exclude_patterns: &exclude_patterns,
+            exclude_if_present: &exclude_if_present,
+            one_file_system: true,
+            git_ignore: false,
+            xattrs_enabled: false,
+            compression: Compression::None,
+            command_dumps: &[],
+            verbose: false,
+        },
+    )
+    .unwrap();
+
+    // Reopen and check snapshot list
+    let repo = open_local_repo(&repo_dir);
     assert_eq!(repo.manifest().snapshots.len(), 1);
     assert_eq!(repo.manifest().snapshots[0].name, "test-snapshot");
 }

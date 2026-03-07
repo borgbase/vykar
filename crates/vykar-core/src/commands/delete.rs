@@ -1,5 +1,4 @@
 use crate::config::VykarConfig;
-use tracing::warn;
 use vykar_types::error::Result;
 
 use super::list::{load_snapshot_item_stream, load_snapshot_meta};
@@ -29,7 +28,7 @@ pub fn run(
             })?;
         let snapshot_key = entry.id.storage_key();
 
-        // Load snapshot metadata and item stream to find all chunk refs.
+        // Load snapshot metadata and item stream BEFORE deleting.
         let snapshot_meta = load_snapshot_meta(repo, snapshot_name)?;
         let items_stream = load_snapshot_item_stream(repo, snapshot_name)?;
 
@@ -44,26 +43,19 @@ pub fn run(
             });
         }
 
-        // Orphaned blobs remain in pack files until a future `compact` command.
-        let impact = decrement_snapshot_chunk_refs(repo, &items_stream, &snapshot_meta.item_ptrs)?;
+        // Delete snapshot object FIRST (commit point).
+        // Must succeed — failure aborts before touching refcounts.
+        repo.check_lock_fence()?;
+        repo.storage.delete(&snapshot_key)?;
 
-        // Remove from manifest
+        // Remove from in-memory manifest
         repo.manifest_mut().remove_snapshot(snapshot_name);
 
-        // Persist state
-        repo.save_state()?;
+        // Decrement refcounts using pre-loaded data.
+        let impact = decrement_snapshot_chunk_refs(repo, &items_stream, &snapshot_meta.item_ptrs)?;
 
-        // Best-effort cleanup of snapshot metadata object.
-        // If this fails after state is persisted, the repo remains consistent and
-        // only leaves an orphaned metadata object.
-        if let Err(err) = repo.storage.delete(&snapshot_key) {
-            warn!(
-                snapshot = %snapshot_name,
-                key = %snapshot_key,
-                error = %err,
-                "failed to delete snapshot metadata object after state commit"
-            );
-        }
+        // Persist index state
+        repo.save_state()?;
 
         Ok(DeleteStats {
             snapshot_name: snapshot_name.to_string(),

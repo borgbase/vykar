@@ -130,7 +130,8 @@ fn check_reports_snapshot_metadata_load_failures() {
     let entry = repo.manifest().find_snapshot("snap-check-meta").unwrap();
     let snapshot_path = repo_dir.join("snapshots").join(entry.id.to_hex());
     assert!(snapshot_path.exists());
-    std::fs::remove_file(snapshot_path).unwrap();
+    // Corrupt the snapshot blob so it's still listed but fails to decrypt/deserialize.
+    std::fs::write(&snapshot_path, b"corrupted-snapshot-data").unwrap();
 
     let result = commands::check::run(&config, None, false, false).unwrap();
     assert_eq!(result.snapshots_checked, 0);

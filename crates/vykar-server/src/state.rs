@@ -21,7 +21,7 @@ pub struct AppStateInner {
     /// Auto-detected or explicit quota state.
     pub quota_state: Arc<QuotaState>,
 
-    /// Last backup timestamp (updated on manifest PUT).
+    /// Last backup timestamp (updated on new snapshot write).
     pub last_backup_at: RwLock<Option<DateTime<Utc>>>,
 }
 
@@ -335,8 +335,8 @@ mod tests {
     #[test]
     fn valid_single_file_keys() {
         assert!(is_valid_storage_key("config"));
-        assert!(is_valid_storage_key("manifest"));
         assert!(is_valid_storage_key("index"));
+        assert!(is_valid_storage_key("index.gen"));
     }
 
     #[test]

@@ -17,6 +17,7 @@ pub enum ObjectType {
     PackHeader = 5,
     FileCache = 6,
     PendingIndex = 7,
+    SnapshotCache = 8,
 }
 
 impl ObjectType {
@@ -30,6 +31,7 @@ impl ObjectType {
             5 => Ok(Self::PackHeader),
             6 => Ok(Self::FileCache),
             7 => Ok(Self::PendingIndex),
+            8 => Ok(Self::SnapshotCache),
             _ => Err(VykarError::UnknownObjectType(v)),
         }
     }

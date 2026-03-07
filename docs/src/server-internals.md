@@ -54,12 +54,13 @@ All routes except `GET /health` require `Authorization: Bearer <token>`. The tok
 When `append_only = true`:
 
 - `DELETE` on any object path returns `403 Forbidden`
-- `PUT` to an existing `packs/**` key returns `403`
-- writes to mutable metadata like `manifest` and `index` are still allowed
+- `PUT` to an existing key returns `403` **unless** the key is on the mutable-allowlist
+- Mutable-allowlist: `index`, `index.gen`, `locks/*`, `sessions/*` — these may be overwritten freely
+- All other keys (`config`, `keys/*`, `snapshots/*`, `packs/*`) are immutable once written
 - `/?batch-delete` is rejected
 - `/?repack` operations that delete old packs are rejected
 
-This protects existing history from a compromised client while still allowing normal backup commits.
+This protects existing history from a compromised client while still allowing normal backup commits. In particular, snapshot blobs under `snapshots/` are immutable — a compromised client cannot hide historical backups by overwriting or deleting them.
 
 ## Quota Enforcement
 
@@ -81,7 +82,7 @@ The stats response includes:
 
 ## Backup Freshness Monitoring
 
-The server updates `last_backup_at` when it observes a successful write to `manifest`, which is the final persisted step of a completed backup commit.
+The server updates `last_backup_at` when it observes a new `snapshots/*` key being written for the first time. This marks the completion of a backup commit.
 
 ## Server-Side Verify Packs
 

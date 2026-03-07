@@ -84,7 +84,7 @@ fn object_type_from_u8_valid() {
 
 #[test]
 fn object_type_from_u8_invalid() {
-    assert!(ObjectType::from_u8(8).is_err());
+    assert!(ObjectType::from_u8(9).is_err());
     assert!(ObjectType::from_u8(255).is_err());
 }
 

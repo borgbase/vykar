@@ -72,18 +72,14 @@ fn remove_snapshot_returns_none() {
 }
 
 #[test]
-fn serde_roundtrip() {
-    let mut m = Manifest::new();
-    m.snapshots.push(make_entry("backup-1"));
-    m.snapshots.push(make_entry("backup-2"));
+fn from_snapshot_entries() {
+    let entries = vec![make_entry("backup-1"), make_entry("backup-2")];
+    let m = Manifest::from_snapshot_entries(entries);
 
-    let serialized = rmp_serde::to_vec(&m).unwrap();
-    let deserialized: Manifest = rmp_serde::from_slice(&serialized).unwrap();
-
-    assert_eq!(deserialized.version, m.version);
-    assert_eq!(deserialized.snapshots.len(), 2);
-    assert_eq!(deserialized.snapshots[0].name, "backup-1");
-    assert_eq!(deserialized.snapshots[1].name, "backup-2");
+    assert_eq!(m.version, 1);
+    assert_eq!(m.snapshots.len(), 2);
+    assert_eq!(m.snapshots[0].name, "backup-1");
+    assert_eq!(m.snapshots[1].name, "backup-2");
 }
 
 // ---------------------------------------------------------------------------

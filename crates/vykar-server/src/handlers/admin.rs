@@ -882,7 +882,7 @@ fn check_structure(repo_dir: &std::path::Path) -> serde_json::Value {
     let mut total_size = 0u64;
 
     // Check required files
-    for required in &["config", "manifest", "index", "keys/repokey"] {
+    for required in &["config", "index", "keys/repokey"] {
         let path = repo_dir.join(required);
         if !path.exists() {
             errors.push(format!("missing required file: {required}"));
@@ -1240,7 +1240,7 @@ mod tests {
         let resp = authed_put(router.clone(), "/config", b"cfg".to_vec()).await;
         assert_status(&resp, StatusCode::CREATED);
 
-        let resp = authed_put(router.clone(), "/manifest", b"man".to_vec()).await;
+        let resp = authed_put(router.clone(), "/index.gen", b"gen".to_vec()).await;
         assert_status(&resp, StatusCode::CREATED);
 
         // GET /?list should return both keys
@@ -1254,8 +1254,8 @@ mod tests {
             "expected 'config' in {keys:?}"
         );
         assert!(
-            keys.contains(&"manifest".to_string()),
-            "expected 'manifest' in {keys:?}"
+            keys.contains(&"index.gen".to_string()),
+            "expected 'index.gen' in {keys:?}"
         );
     }
 
@@ -1513,12 +1513,12 @@ mod tests {
         // Create regular repo files
         let resp = authed_put(router.clone(), "/config", b"cfg".to_vec()).await;
         assert_status(&resp, StatusCode::CREATED);
-        let resp = authed_put(router.clone(), "/manifest", b"man".to_vec()).await;
+        let resp = authed_put(router.clone(), "/index.gen", b"gen".to_vec()).await;
         assert_status(&resp, StatusCode::CREATED);
 
         // Create temp files at root level (simulating interrupted PUTs)
         std::fs::write(tmp.path().join(".tmp.config.0"), b"partial").unwrap();
-        std::fs::write(tmp.path().join(".tmp.manifest.0"), b"partial").unwrap();
+        std::fs::write(tmp.path().join(".tmp.index.gen.0"), b"partial").unwrap();
 
         // Create a temp file inside a pack shard directory
         let shard_dir = tmp.path().join("packs").join("ab");
@@ -1532,9 +1532,9 @@ mod tests {
         // batch-delete should succeed with all these keys (including temp files)
         let keys = serde_json::to_vec(&serde_json::json!([
             "config",
-            "manifest",
+            "index.gen",
             ".tmp.config.0",
-            ".tmp.manifest.0",
+            ".tmp.index.gen.0",
             "packs/ab/.tmp.deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef.0"
         ]))
         .unwrap();
@@ -1543,9 +1543,9 @@ mod tests {
 
         // Verify all files are gone
         assert!(!tmp.path().join("config").exists());
-        assert!(!tmp.path().join("manifest").exists());
+        assert!(!tmp.path().join("index.gen").exists());
         assert!(!tmp.path().join(".tmp.config.0").exists());
-        assert!(!tmp.path().join(".tmp.manifest.0").exists());
+        assert!(!tmp.path().join(".tmp.index.gen.0").exists());
     }
 
     #[tokio::test]
@@ -1643,8 +1643,12 @@ mod tests {
         let (router, _state, _tmp) = setup_app(0);
 
         // Delete nonexistent keys with cleanup-dirs
-        let keys = serde_json::to_vec(&serde_json::json!(["config", "manifest", "snapshots/nope"]))
-            .unwrap();
+        let keys = serde_json::to_vec(&serde_json::json!([
+            "config",
+            "index.gen",
+            "snapshots/nope"
+        ]))
+        .unwrap();
         let resp = authed_post(router.clone(), "/?batch-delete&cleanup-dirs", keys).await;
         assert_status(&resp, StatusCode::NO_CONTENT);
     }

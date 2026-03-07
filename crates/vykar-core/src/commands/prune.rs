@@ -2,13 +2,12 @@ use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 
 use chrono::Utc;
-use tracing::warn;
 
 use crate::config::{RetentionConfig, SourceEntry, VykarConfig};
 use crate::prune::{apply_policy, apply_policy_by_label, PruneDecision};
 use vykar_types::error::{Result, VykarError};
 
-use super::list::{load_snapshot_item_stream, load_snapshot_meta};
+use super::list::load_snapshot_meta;
 use super::snapshot_ops::decrement_snapshot_chunk_refs;
 use super::util::{check_interrupted, with_open_repo_maintenance_lock};
 
@@ -125,49 +124,63 @@ pub fn run(
             ));
         }
 
-        // Delete pruned snapshots (process oldest first)
+        // Process oldest first
         to_prune.reverse();
-        let mut total_chunks_deleted = 0u64;
-        let mut total_space_freed = 0u64;
-        let mut metadata_keys_to_delete: Vec<(String, String)> = Vec::with_capacity(to_prune.len());
 
+        // Phase 1: Load snapshot keys and item_ptrs BEFORE deleting anything.
+        // Only metadata is retained — item streams are loaded lazily in Phase 3
+        // to avoid holding all pruned snapshots' items in memory at once.
+        struct PruneTarget {
+            snapshot_name: String,
+            snapshot_key: String,
+            item_ptrs: Vec<vykar_types::chunk_id::ChunkId>,
+        }
+        let mut targets: Vec<PruneTarget> = Vec::with_capacity(to_prune.len());
         for snapshot_name in &to_prune {
             check_interrupted(shutdown)?;
-            // Get snapshot ID before we modify manifest
             let snapshot_key = repo
                 .manifest()
                 .find_snapshot(snapshot_name)
                 .map(|e| e.id.storage_key())
                 .ok_or_else(|| VykarError::SnapshotNotFound(snapshot_name.clone()))?;
-
             let snapshot_meta = load_snapshot_meta(repo, snapshot_name)?;
-            let items_stream = load_snapshot_item_stream(repo, snapshot_name)?;
+            targets.push(PruneTarget {
+                snapshot_name: snapshot_name.clone(),
+                snapshot_key,
+                item_ptrs: snapshot_meta.item_ptrs,
+            });
+        }
 
-            // Orphaned blobs remain in pack files until a future `compact` command.
-            let impact =
-                decrement_snapshot_chunk_refs(repo, &items_stream, &snapshot_meta.item_ptrs)?;
+        // Phase 2: Delete all pruned snapshot objects FIRST (commit point).
+        for target in &targets {
+            check_interrupted(shutdown)?;
+            repo.check_lock_fence()?;
+            repo.storage.delete(&target.snapshot_key).map_err(|e| {
+                VykarError::Other(format!(
+                    "failed to delete snapshot object {}: {e}",
+                    target.snapshot_name
+                ))
+            })?;
+        }
+
+        // Phase 3: Decrement refcounts. Item streams are reconstructed one at a
+        // time from packs (still on storage) using the saved item_ptrs.
+        let mut total_chunks_deleted = 0u64;
+        let mut total_space_freed = 0u64;
+        for target in targets {
+            let mut items_stream = Vec::new();
+            for chunk_id in &target.item_ptrs {
+                let chunk_data = repo.read_chunk(chunk_id)?;
+                items_stream.extend_from_slice(&chunk_data);
+            }
+            let impact = decrement_snapshot_chunk_refs(repo, &items_stream, &target.item_ptrs)?;
             total_chunks_deleted += impact.chunks_deleted;
             total_space_freed += impact.space_freed;
-
-            // Remove from manifest
-            repo.manifest_mut().remove_snapshot(snapshot_name);
-            metadata_keys_to_delete.push((snapshot_name.clone(), snapshot_key));
+            repo.manifest_mut().remove_snapshot(&target.snapshot_name);
         }
 
         // Single atomic save after all deletions
         repo.save_state()?;
-
-        // Best-effort cleanup of snapshot metadata objects after state commit.
-        for (snapshot_name, snapshot_key) in metadata_keys_to_delete {
-            if let Err(err) = repo.storage.delete(&snapshot_key) {
-                warn!(
-                    snapshot = %snapshot_name,
-                    key = %snapshot_key,
-                    error = %err,
-                    "failed to delete snapshot metadata object after state commit"
-                );
-            }
-        }
 
         Ok((
             PruneStats {

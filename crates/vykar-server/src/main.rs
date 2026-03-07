@@ -22,7 +22,7 @@ struct Cli {
     #[arg(short, long, default_value = "/var/lib/vykar")]
     data_dir: String,
 
-    /// Reject DELETE and overwrite operations on pack files
+    /// Append-only mode: only index/index.gen/locks/sessions are mutable; all other objects are immutable once written
     #[arg(long, default_value_t = false)]
     append_only: bool,
 

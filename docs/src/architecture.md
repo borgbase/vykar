@@ -15,7 +15,7 @@ Rationale:
 - `auto` mode benchmarks `AES-256-GCM` vs `ChaCha20-Poly1305` at init and stores one concrete mode per repo
 - Strong performance across mixed CPU capabilities (AES acceleration and non-AES acceleration)
 - 32-byte symmetric keys (simpler key management than split-key schemes)
-- AEAD AAD always includes the 1-byte type tag; for identity-bound objects it also includes a domain-separated object context (for example: `manifest`, `index`, snapshot ID, chunk ID, or `filecache`)
+- AEAD AAD always includes the 1-byte type tag; for identity-bound objects it also includes a domain-separated object context (for example: `index`, snapshot ID, chunk ID, `filecache`, or `snapshot_cache`)
 
 ### Plaintext Mode (`none`)
 
@@ -99,7 +99,7 @@ All persistent data structures use **msgpack** via `rmp_serde`. Structs serializ
 
 ### RepoObj Envelope
 
-Every object stored in the repository is wrapped in a `RepoObj` envelope (`repo/format.rs`). The wire format depends on the encryption mode:
+Every repo object and local encrypted cache blob uses the same `RepoObj` envelope (`repo/format.rs`). The wire format depends on the encryption mode:
 
 ```text
 Encrypted:  [1-byte type_tag][12-byte nonce][ciphertext + 16-byte AEAD tag]
@@ -111,15 +111,16 @@ The type tag identifies the object kind via the `ObjectType` enum:
 | Tag | ObjectType | Used for |
 |-----|------------|----------|
 | 0 | Config | Repository configuration (stored unencrypted) |
-| 1 | Manifest | Snapshot list |
+| 1 | Manifest | Legacy manifest object tag (unused in v2 repositories) |
 | 2 | SnapshotMeta | Per-snapshot metadata |
 | 3 | ChunkData | Compressed file/item-stream chunks |
-| 4 | ChunkIndex | Chunk-to-pack mapping |
+| 4 | ChunkIndex | Encrypted `IndexBlob` stored at `index` |
 | 5 | PackHeader | Reserved legacy tag (current pack files have no trailing header object) |
-| 6 | FileCache | File-level cache (inode/mtime skip) |
+| 6 | FileCache | Local file-level cache (inode/mtime skip) |
 | 7 | PendingIndex | Transient crash-recovery journal |
+| 8 | SnapshotCache | Local snapshot-list cache |
 
-The type tag byte is always included in AAD (authenticated additional data). For identity-bound objects, AAD also includes a domain-separated object context, binding ciphertext to both object type and identity (for example, `ChunkData` to its `ChunkId`, `SnapshotMeta` to snapshot ID, and manifest/index to fixed context labels).
+The type tag byte is always included in AAD (authenticated additional data). For identity-bound objects, AAD also includes a domain-separated object context, binding ciphertext to both object type and identity (for example, `ChunkData` to its `ChunkId`, `SnapshotMeta` to snapshot ID, `ChunkIndex` to `b"index"`, `FileCache` to `b"filecache"`, and `SnapshotCache` to `b"snapshot_cache"`).
 
 ---
 
@@ -127,13 +128,15 @@ The type tag byte is always included in AAD (authenticated additional data). For
 
 ### On-Disk Layout
 
+`RepoConfig.version = 2` describes the current repository layout.
+
 ```text
 <repo>/
 |- config                    # Repository metadata (unencrypted msgpack)
 |- keys/repokey              # Encrypted master key (Argon2id-wrapped; absent in `none` mode)
-|- manifest                  # Encrypted snapshot list
-|- index                     # Encrypted chunk index
-|- snapshots/<id>            # Encrypted snapshot metadata
+|- index                     # Encrypted IndexBlob { generation, chunks }
+|- index.gen                 # Unencrypted advisory u64 generation hint
+|- snapshots/<id>            # Encrypted snapshot metadata; source of truth for snapshot listing
 |- sessions/<id>.json        # Session presence markers (concurrent backups)
 |- sessions/<id>.index       # Per-session crash-recovery journals (absent after clean backup)
 |- packs/<xx>/<pack-id>      # Pack files containing compressed+encrypted chunks (256 shard dirs)
@@ -147,18 +150,28 @@ These files live under a per-repo local cache root. By default this is the platf
 ```text
 <cache>/<repo_id_hex>/
 |- filecache                 # File metadata -> cached ChunkRefs
+|- snapshot_list             # Snapshot ID -> SnapshotEntry cache
 |- dedup_cache               # Sorted ChunkId -> stored_size (mmap + xor filter)
 |- restore_cache             # Sorted ChunkId -> pack_id, pack_offset, stored_size (mmap)
-`- full_index_cache          # Sorted full index rows for incremental index updates
+`- full_index_cache          # Sorted full index rows for local rehydration/cache rebuilds
 ```
 
-All three index caches are validated against `manifest.index_generation`. A generation mismatch means "stale cache" and triggers safe fallback/rebuild paths.
+The index caches are validated against the current index generation. The authenticated source of truth is `IndexBlob.generation` inside `index`; `index.gen` is only an advisory hint used to avoid unnecessary remote index downloads on read paths. A stale or missing sidecar causes cache misses or full-index fallback, not correctness issues.
+
+The `snapshot_list` cache is separate: on open/refresh, the client lists `snapshots/`, removes stale local entries, loads only new snapshot blobs, and persists the resulting snapshot list locally. This avoids O(n) snapshot metadata GETs on every open.
 
 The same per-repo cache root is also used as the preferred temp location for intermediate files (e.g. cache rebuilds).
 
 ### Key Data Structures
 
-**ChunkIndex** — `HashMap<ChunkId, ChunkIndexEntry>`, stored encrypted at the `index` key. The central lookup table for deduplication, restore, and compaction.
+**IndexBlob** — the encrypted object stored at the `index` key. It combines the current cache-validity token with the chunk index.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| generation | u64 | Authenticated cache-validity token rotated when the index changes |
+| chunks | ChunkIndex | Full chunk-to-pack mapping |
+
+**ChunkIndex** — `HashMap<ChunkId, ChunkIndexEntry>`, persisted inside `IndexBlob`. The central lookup table for deduplication, restore, and compaction.
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -167,16 +180,17 @@ The same per-repo cache root is also used as the preferred temp location for int
 | pack_id | PackId | Which pack file contains this chunk |
 | pack_offset | u64 | Byte offset within the pack file |
 
-**Manifest** — the encrypted snapshot list stored at the `manifest` key.
+**Manifest** — runtime-only in-memory snapshot list derived from `snapshots/` and the local `snapshot_list` cache. It is not persisted to repository storage.
 
 | Field | Type | Description |
 |-------|------|-------------|
 | version | u32 | Format version (currently 1) |
 | timestamp | DateTime | Last modification time |
 | snapshots | Vec\<SnapshotEntry\> | One entry per snapshot |
-| index_generation | u64 | Cache-validity token rotated when index changes; used to validate local mmap caches |
 
-Each `SnapshotEntry` contains: `name`, `id` (32-byte random), `time`, `source_label`, `label`, `source_paths`.
+**SnapshotListCache** — local encrypted map from snapshot ID hex to `SnapshotEntry`. It is refreshed incrementally from `snapshots/` and exists only to avoid repeatedly downloading every snapshot blob on open.
+
+Each `SnapshotEntry` contains: `name`, `id` (32-byte random), `time`, `source_label`, `label`, `source_paths`, `hostname`.
 
 **SnapshotMeta** — per-snapshot metadata stored at `snapshots/<id>`.
 
@@ -308,28 +322,27 @@ begin_write_session(session_id) → journal key = sessions/<session_id>.index
           (64 MiB × effective threads, clamped to 64 MiB..1 GiB)
       → sequential fallback path (effective worker threads == 1)
   → serialize items incrementally into item-stream chunks (tree packs)
-  → write SnapshotMeta at snapshots/<id>
+  → pack SnapshotMeta in memory (do not write snapshots/<id> yet)
 
 ── Phase 2: Commit (exclusive lock, brief) ──
 
 acquire_lock_with_retry(10 attempts, 500ms base, exponential backoff + jitter)
 commit_concurrent_session():
   → flush packs/pending uploads (pack flush triggers: target size, 10,000 blobs, or 300s age)
-  → record T0 generation from in-memory manifest
-  → reload fresh manifest from storage
-  → check snapshot name uniqueness against fresh manifest
-  → fast path (t0_generation == fresh manifest.index_generation):
-      → verify_delta_packs (confirm new pack files exist on storage)
-      → try_incremental_index_update (mmap cache merge)
-      → on cache miss: reload full index + apply delta
-  → slow path (generation mismatch — another client committed since T0):
+  → refresh snapshot list from snapshots/ (via local snapshot cache diff)
+  → check snapshot name uniqueness against fresh list
+  → if delta is non-empty:
       → reload full index from storage
       → delta.reconcile(fresh_index): new_entries already present → refcount bumps;
         missing bump targets → Err(StaleChunksDuringCommit)
       → verify_delta_packs on reconciled delta
       → apply reconciled delta to fresh index
-  → persist index first, then manifest (index-first ordering)
+      → persist IndexBlob + advisory index.gen
+  → if delta is empty but local dedup caches need rebuilding:
+      → reload full index from storage for cache rebuild
+  → write snapshots/<id> (commit point)
   → rebuild local dedup/restore/full-index caches as needed
+  → update in-memory manifest
   → persist local file cache
 deregister_session() → delete sessions/<session_id>.json (while holding lock)
 release_lock()
@@ -345,21 +358,21 @@ clear sessions/<session_id>.index
     → exit code 3 (partial success) if any files were skipped
 ```
 
+Unreadable listed snapshot blobs are warned and skipped during snapshot-list refresh. Snapshot names are only available after successful decrypt + deserialize, so the implementation chooses availability over failing all future opens or commits in append-only mode.
+
 ### Restore Pipeline
 
 ```text
 open repository without index (`open_without_index`)
   → resolve snapshot
-  → try mmap restore cache (validated by manifest.index_generation)
+  → try mmap restore cache (validated by index_generation)
   → load item stream:
     → preferred: lookup tree-pack chunk locations via restore cache
     → fallback: load full index and read item stream normally
   → stream-decode items in two passes:
     → pass 1 create directories
     → pass 2 create symlinks and plan file chunk writes
-  → build coalesced pack read groups:
-    → preferred: index-free lookup via restore cache
-    → fallback: load full index and retain only snapshot-needed chunks
+  → build coalesced pack read groups via the full index
   → parallel coalesced range reads by pack/offset
     (merge when gap <= 256 KiB and merged range <= 16 MiB)
     → `limits.connections` reader workers fetch groups, decrypt + decompress-with-size-hint chunks
@@ -378,7 +391,7 @@ Snapshot metadata (the list of files, directories, and symlinks) is **not** stor
 This design means the item stream benefits from deduplication — if most files are unchanged between backups, the item-stream chunks are mostly identical and deduplicated away.
 
 Restore now also consumes item streams incrementally (streaming deserialization) instead of materializing full `Vec<Item>` state up front.
-When the mmap restore cache is valid, item-stream chunk lookups can avoid loading the full chunk index.
+When the mmap restore cache is valid, item-stream chunk lookups can avoid loading the full chunk index. File-data read-group planning still uses the full index after planning, avoiding unrecoverable stale-location failures.
 
 ---
 
@@ -450,9 +463,10 @@ schedule:
 Chunk refcounts track how many snapshots reference each chunk, driving the dedup → delete → compact lifecycle:
 
 1. **Backup** — `store_chunk()` adds a new entry with refcount=1, or increments an existing entry's refcount on dedup hit
-2. **Delete / Prune** — `ChunkIndex::decrement()` decreases the refcount; entries reaching 0 are removed from the index
-3. **Orphaned blobs** — after delete/prune, the encrypted blob data remains in pack files (the index no longer points to it, but the bytes are still on disk)
-4. **Compact** — rewrites packs to reclaim space from orphaned blobs
+2. **Delete / Prune** — delete `snapshots/<id>` first, then decrement chunk refs in the index and save it
+3. **Crash window** — if the process dies after snapshot deletion but before index save, refcounts stay inflated; this is safe and only keeps chunks live longer than necessary
+4. **Orphaned blobs** — after delete/prune commits, the encrypted blob data remains in pack files (the index no longer points to it, but the bytes are still on disk)
+5. **Compact** — rewrites packs to reclaim space from orphaned blobs
 
 This design means `delete` is fast (just index updates), while space reclamation is deferred to `compact`.
 
@@ -470,7 +484,7 @@ If a backup process crashes or is killed without clean shutdown, its session mar
 
 ### Concurrent Multi-Client Backups
 
-Multiple machines or scheduled jobs can back up to the same repository concurrently. The expensive work (walking files, compressing, encrypting, uploading packs) runs in parallel across all clients without coordination. Only the brief index+manifest commit requires mutual exclusion.
+Multiple machines or scheduled jobs can back up to the same repository concurrently. The expensive work (walking files, compressing, encrypting, uploading packs) runs in parallel across all clients without coordination. Only the brief index+snapshot commit requires mutual exclusion.
 
 #### Session Lifecycle
 
@@ -486,15 +500,15 @@ Two concurrent backups do not block each other during upload — each operates o
 
 Each backup session accumulates index mutations in an `IndexDelta`: `new_entries` (newly uploaded chunks) and `refcount_bumps` (dedup hits on existing chunks). At commit time, the delta is reconciled against the current on-storage index:
 
-- If the `manifest.index_generation` is unchanged since session open (T0), no concurrent commits occurred — the delta is applied directly via the fast path (incremental mmap cache merge, or full index reload + apply).
-- If the generation changed (slow path), the full index is reloaded from storage and the delta is reconciled:
+- If the delta is non-empty, the full index is reloaded from storage and the delta is reconciled against it:
   - `new_entries` for chunks already present in the fresh index (another client uploaded the same chunk) are converted to `refcount_bumps`
   - `refcount_bumps` referencing chunks no longer in the index (deleted by a concurrent maintenance operation) cause `StaleChunksDuringCommit` — the backup must be retried
 - Pack verification (`verify_delta_packs`) runs after reconciliation to avoid false negatives when chunks were absorbed as refcount bumps.
+- If the delta is empty, no remote index write is needed. The client only reloads the full index when local dedup caches need rebuilding.
 
-#### Index-First Persistence
+#### Index Then Snapshot Commit Point
 
-The index is always written before the manifest. A crash between these two writes leaves orphan entries in the index (no snapshot references them) — harmless, cleaned up by the next `compact`. The reverse order would be unsafe: a manifest referencing chunks not yet in the index would cause restore failures.
+The index is always written before `snapshots/<id>`. A crash between these two writes leaves orphan entries in the index (no snapshot references them) — harmless, cleaned up by the next `compact`. Once `snapshots/<id>` is written, the backup is committed. Delete/prune intentionally invert this ordering: snapshot object first, then index save, so crashes leave inflated refcounts instead of visible snapshots whose chunks were already removed from the index.
 
 ### Compact
 
@@ -518,7 +532,7 @@ For each candidate pack (most wasteful first, respecting `--max-repack-size` cap
    - If all blobs are dead → delete the pack file directly
    - Else validate pack header (magic + version) via `get_range(0..9)` and cross-check each on-disk blob length prefix against the index's `stored_size`
    - Read live blobs as encrypted passthrough (no decrypt/re-encrypt cycle), write a new pack, update index mappings
-3. Persist index/manifest updates before old pack deletion (`save_state()`)
+3. Persist index updates before old pack deletion (`save_state()`)
 4. Delete old pack(s)
 
 #### Crash Safety
@@ -570,9 +584,10 @@ Deduplicating backup tools are often dominated by index memory and restore-plann
 
 - Tiered dedup lookups (session map + xor filter + mmap cache) instead of always materializing a full in-memory index during backup
 - Pending-index journal for crash recovery — interrupted backups resume without re-uploading flushed packs
-- Index-light restore planning (restore-cache-first, filtered-index fallback) for lower peak memory on restore
+- Restore-cache-first item-stream lookup, with full-index read-group planning for predictable fallback behavior
+- Authenticated `IndexBlob` generation plus advisory `index.gen` for safe local cache validation
+- Local snapshot-list cache to avoid O(n) snapshot metadata GETs on every open
 - Explicitly bounded backup pipeline memory and bounded in-flight uploads derived from a small public limits surface
-- Incremental index update paths that avoid rebuilding/uploading from a full in-memory index on every save
 - Concurrent multi-client backup protocol where only the brief commit phase requires an exclusive lock — upload phases run in parallel across all clients
 
 These optimizations are implementation choices in current vykar, not future roadmap items.

@@ -129,24 +129,13 @@ fn fence_blocks_persist_index() {
 }
 
 #[test]
-fn fence_blocks_persist_manifest() {
+fn fence_blocks_persist_index_via_mark_dirty() {
     crate::testutil::init_test_environment();
 
     let mut repo = crate::testutil::test_repo_plaintext();
 
-    // Dirty the manifest by adding a snapshot entry.
-    use crate::repo::manifest::SnapshotEntry;
-    use chrono::Utc;
-    use vykar_types::snapshot_id::SnapshotId;
-    repo.manifest_mut().snapshots.push(SnapshotEntry {
-        name: "test".into(),
-        id: SnapshotId::generate(),
-        time: Utc::now(),
-        source_label: String::new(),
-        label: String::new(),
-        source_paths: vec![],
-        hostname: String::new(),
-    });
+    // Dirty the index so save_state will try to persist it.
+    repo.mark_index_dirty();
 
     // Install an always-fail fence.
     let fail_fence: Arc<dyn Fn() -> vykar_types::error::Result<()> + Send + Sync> =

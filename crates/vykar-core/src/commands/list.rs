@@ -46,7 +46,9 @@ pub fn list_snapshot_items(
             Err(VykarError::ChunkNotInIndex(_)) => {
                 // Restore cache incomplete — fall through to full index
             }
-            Err(e) => return Err(e),
+            Err(_) => {
+                // Decryption/read error (stale cache) — fall through to full index
+            }
         }
     }
 

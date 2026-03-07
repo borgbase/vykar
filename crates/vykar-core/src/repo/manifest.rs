@@ -4,18 +4,15 @@ use serde::{Deserialize, Serialize};
 use vykar_types::error::{Result, VykarError};
 use vykar_types::snapshot_id::SnapshotId;
 
-/// The manifest — list of all snapshots in the repository.
-/// Stored encrypted at the `manifest` key.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// The manifest — in-memory list of all snapshots in the repository.
+///
+/// No longer serialized to storage. Populated from the snapshot cache on open
+/// (by listing `snapshots/` and reading each blob).
+#[derive(Debug, Clone)]
 pub struct Manifest {
     pub version: u32,
     pub timestamp: DateTime<Utc>,
     pub snapshots: Vec<SnapshotEntry>,
-    /// Cache-validity token for the local dedup cache.
-    /// A random u64 written each time the index is saved.
-    /// Old manifests deserialize with `index_generation = 0` (cache stale → safe fallback).
-    #[serde(default)]
-    pub index_generation: u64,
 }
 
 /// A single entry in the manifest's snapshot list.
@@ -46,7 +43,15 @@ impl Manifest {
             version: 1,
             timestamp: Utc::now(),
             snapshots: Vec::new(),
-            index_generation: 0,
+        }
+    }
+
+    /// Build a manifest from a pre-loaded list of snapshot entries.
+    pub fn from_snapshot_entries(entries: Vec<SnapshotEntry>) -> Self {
+        Self {
+            version: 1,
+            timestamp: Utc::now(),
+            snapshots: entries,
         }
     }
 

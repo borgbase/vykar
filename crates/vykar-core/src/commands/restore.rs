@@ -200,12 +200,11 @@ where
             cache.lookup(id)
         }) {
             Ok(stream) => stream,
-            Err(VykarError::ChunkNotInIndex(_)) => {
-                info!("restore cache missing tree-pack chunk, falling back to full index");
+            Err(_) => {
+                info!("restore cache incomplete or stale, falling back to full index");
                 repo.load_chunk_index()?;
                 super::list::load_snapshot_item_stream(&mut repo, &resolved_name)?
             }
-            Err(e) => return Err(e),
         }
     } else {
         repo.load_chunk_index()?;
@@ -237,25 +236,9 @@ where
     planned_files.shrink_to_fit(); // reclaim amortized-doubling slack (~2x → 1x)
 
     if !planned_files.is_empty() {
-        // Build read groups from chunk targets.
+        // Build read groups from chunk targets — always via full index.
         let mut groups = if !chunk_targets.is_empty() {
-            if let Some(ref cache) = restore_cache {
-                info!("using mmap restore cache ({} entries)", cache.entry_count());
-                repo.clear_chunk_index();
-
-                // Pre-scan: check if all chunks exist in cache before consuming chunk_targets.
-                let all_in_cache = chunk_targets.keys().all(|id| cache.lookup(id).is_some());
-
-                if all_in_cache {
-                    build_read_groups(chunk_targets, |id| cache.lookup(id)).map_err(&cleanup)?
-                } else {
-                    info!("restore cache incomplete, falling back to chunk index");
-                    build_read_groups_via_index(&mut repo, chunk_targets).map_err(&cleanup)?
-                }
-            } else {
-                info!("restore cache unavailable, using chunk index");
-                build_read_groups_via_index(&mut repo, chunk_targets).map_err(&cleanup)?
-            }
+            build_read_groups_via_index(&mut repo, chunk_targets).map_err(&cleanup)?
         } else {
             Vec::new()
         };

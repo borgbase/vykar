@@ -337,6 +337,7 @@ mod tests {
         assert!(is_valid_storage_key("config"));
         assert!(is_valid_storage_key("index"));
         assert!(is_valid_storage_key("index.gen"));
+        assert!(is_valid_storage_key("manifest"));
     }
 
     #[test]

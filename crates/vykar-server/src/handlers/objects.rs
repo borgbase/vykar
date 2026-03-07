@@ -95,6 +95,7 @@ pub async fn put_object(
     if state.inner.config.append_only && existing_meta.is_some() {
         let is_mutable = key == "index"
             || key == "index.gen"
+            || key == "manifest" // v1 compat — remove once v1 clients are retired
             || key.starts_with("locks/")
             || key.starts_with("sessions/");
         if !is_mutable {
@@ -257,8 +258,9 @@ pub async fn put_object(
         state.sub_quota_usage(old_size - data_len);
     }
 
-    // Detect new snapshot write → record backup timestamp
-    if key.starts_with("snapshots/") && old_size == 0 {
+    // Detect backup completion: v2 writes snapshots/<id>, v1 writes manifest.
+    // Remove the manifest branch once v1 clients are retired.
+    if (key.starts_with("snapshots/") && old_size == 0) || key == "manifest" {
         state.record_backup();
     }
 

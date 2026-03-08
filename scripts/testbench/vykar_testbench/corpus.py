@@ -2,6 +2,8 @@
 
 Fast path: bin/txt/csv/json/xml/zip/tar are generated directly with stdlib.
 Slow path: docx/xlsx/png still use faker-file for format-specific libraries.
+
+Moved from scripts/scenarios/scenario_runner/corpus.py with import path updates only.
 """
 
 import csv
@@ -185,7 +187,6 @@ def _generate_one(file_type: str, dest_dir: str, file_size_bytes: int,
 
     if file_type == "txt":
         path = os.path.join(dest_dir, f"{seq:06d}.txt")
-        # Tile the pre-built text block to reach target size
         block_len = len(text_block)
         repeats = file_size_bytes // block_len
         remainder = file_size_bytes % block_len
@@ -199,7 +200,6 @@ def _generate_one(file_type: str, dest_dir: str, file_size_bytes: int,
 
     if file_type == "csv":
         path = os.path.join(dest_dir, f"{seq:06d}.csv")
-        # ~100 bytes per row: 6 columns of hex values
         num_rows = max(1, file_size_bytes // 100)
         with open(path, "w", newline="") as f:
             writer = csv.writer(f)
@@ -310,10 +310,8 @@ def generate_corpus(target_dir: str, corpus_config: dict, rng: random.Random | N
 
     types, weights, file_sizes, file_options = _resolve_mix_config(corpus_config)
 
-    # Pre-generate text block for txt files
     text_block = _generate_text_block(rng)
 
-    # Only create faker if we need docx/xlsx/png
     needs_faker = any(t in _FAKER_TYPES for t in types)
     fake = _make_faker(rng) if needs_faker else None
 
@@ -403,7 +401,6 @@ def apply_churn(target_dir: str, corpus_config: dict, churn_config: dict,
 
     types, weights, file_sizes, file_options = _resolve_mix_config(corpus_config)
 
-    # Pre-generate text block and lazy faker
     text_block = _generate_text_block(rng)
     needs_faker = any(t in _FAKER_TYPES for t in types)
     fake = _make_faker(rng) if needs_faker else None
@@ -454,7 +451,6 @@ def apply_churn(target_dir: str, corpus_config: dict, churn_config: dict,
                 stats["deleted_bytes"] += size
             except OSError:
                 pass
-        # Refresh file list
         files = _walk_files(target_dir)
 
     # Modify random files
@@ -464,13 +460,11 @@ def apply_churn(target_dir: str, corpus_config: dict, churn_config: dict,
         for f in to_modify:
             try:
                 before_size = os.path.getsize(f)
-                # Check if file looks like text
                 is_text = f.endswith(_TEXT_EXTENSIONS)
                 if is_text:
                     with open(f, "a") as fh:
                         fh.write(f"\n# churn modification {rng.randint(0, 999999)}\n")
                 else:
-                    # Binary: truncate to 75% and append random bytes
                     size = os.path.getsize(f)
                     trunc = max(1, int(size * 0.75))
                     with open(f, "r+b") as fh:
@@ -508,8 +502,7 @@ def apply_churn(target_dir: str, corpus_config: dict, churn_config: dict,
         stats["added"] += 1
         return True
 
-    # Add new directories after deletes/modifies, but skip directories if none of
-    # their planned files can fit within the remaining growth budget.
+    # Add new directories
     for _ in range(churn_config.get("add_dirs", 0)):
         parent = rng.choice(subdirs)
         name = f"churn_{rng.randint(0, 99999):05d}"
@@ -543,7 +536,7 @@ def apply_churn(target_dir: str, corpus_config: dict, churn_config: dict,
                     pass
                 stats["added"] += 1
 
-    # Add files in existing dirs last and stop each individual add at the cap.
+    # Add files in existing dirs
     for _ in range(churn_config.get("add_files", 0)):
         subdir = rng.choice(subdirs)
         full_subdir = os.path.join(target_dir, subdir) if subdir else target_dir

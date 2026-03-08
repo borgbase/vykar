@@ -1,7 +1,7 @@
 import unittest
 from unittest import mock
 
-from scenario_runner import config
+from vykar_testbench import config
 
 
 class ConfigTests(unittest.TestCase):

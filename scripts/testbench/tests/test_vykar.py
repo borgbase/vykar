@@ -2,7 +2,7 @@ import subprocess
 import unittest
 from unittest import mock
 
-from scenario_runner import vykar
+from vykar_testbench import vykar
 
 
 class VykarWrapperTests(unittest.TestCase):
@@ -14,7 +14,7 @@ class VykarWrapperTests(unittest.TestCase):
             stderr="Error: no repository found at '/mnt/repos/scenario-repo'\n",
         )
 
-        with mock.patch("scenario_runner.vykar.subprocess.run", return_value=missing_repo):
+        with mock.patch("vykar_testbench.vykar.subprocess.run", return_value=missing_repo):
             result = vykar.vykar_delete_repo("vykar", "/tmp/config.yaml", "scenario-simple")
 
         self.assertEqual(result.returncode, 0)
@@ -27,7 +27,7 @@ class VykarWrapperTests(unittest.TestCase):
             stderr="",
         )
 
-        with mock.patch("scenario_runner.vykar.subprocess.run", return_value=backup_result) as run:
+        with mock.patch("vykar_testbench.vykar.subprocess.run", return_value=backup_result) as run:
             result, snapshot_id = vykar.vykar_backup(
                 "vykar",
                 "/tmp/config.yaml",

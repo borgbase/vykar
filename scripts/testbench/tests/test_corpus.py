@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from scenario_runner import corpus
+from vykar_testbench import corpus
 
 
 class CorpusTests(unittest.TestCase):
@@ -28,7 +28,7 @@ class CorpusTests(unittest.TestCase):
 
     def test_validate_corpus_mix_raises_when_optional_probe_fails(self) -> None:
         with mock.patch(
-            "scenario_runner.corpus._probe_optional_type",
+            "vykar_testbench.corpus._probe_optional_type",
             side_effect=corpus.CorpusDependencyError("corpus type 'docx' is unavailable: sample generation failed"),
         ):
             with self.assertRaisesRegex(corpus.CorpusDependencyError, "sample generation failed"):

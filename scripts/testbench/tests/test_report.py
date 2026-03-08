@@ -4,10 +4,10 @@ import tempfile
 import unittest
 from contextlib import redirect_stdout
 
-from scenario_runner import report
+from vykar_testbench import scenarios
 
 
-class ReportTests(unittest.TestCase):
+class ScenarioReportTests(unittest.TestCase):
     def test_build_summary_aggregates_runs_and_phases(self) -> None:
         summaries = [
             {
@@ -51,7 +51,7 @@ class ReportTests(unittest.TestCase):
             },
         ]
 
-        summary = report.build_summary(summaries)
+        summary = scenarios.build_summary(summaries)
 
         self.assertEqual(summary["run_totals"]["count"], 2)
         self.assertEqual(summary["run_totals"]["excluded_failed_runs"], 1)
@@ -82,7 +82,7 @@ class ReportTests(unittest.TestCase):
         ]
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            path = report.write_aggregate_report(tmpdir, summaries)
+            path = scenarios.write_aggregate_report(tmpdir, summaries)
             with open(path) as f:
                 payload = json.load(f)
 
@@ -135,7 +135,7 @@ class ReportTests(unittest.TestCase):
 
         out = io.StringIO()
         with redirect_stdout(out):
-            report.print_summary(summaries)
+            scenarios.print_summary(summaries)
 
         printed = out.getvalue()
         self.assertIn("Performance Summary", printed)

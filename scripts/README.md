@@ -1,32 +1,51 @@
 # Scripts
 
-This directory contains two Python sub-projects intended to be run with `uv` from the repository root.
+This directory contains the `testbench` Python project — a unified suite for testing, benchmarking, profiling, and stress-testing `vykar`. Run with `uv` from the repository root.
 
-## `benchmarks`
+## Entry points
 
-Benchmark harness for comparing `vykar` with `restic`, `rustic`, `borg`, and `kopia`.
-
-Examples:
+### `scenario` — YAML-driven end-to-end scenario runner
 
 ```bash
-uv run --project scripts/benchmarks benchmark-runner --runs 3
-uv run --project scripts/benchmarks benchmark-runner --runs 5 --tool vykar
-uv run --project scripts/benchmarks benchmark-runner --runs 3 --dataset ~/corpus-remote
+uv run --project scripts/testbench scenario scripts/scenarios/simple-backup.yaml
+uv run --project scripts/testbench scenario scripts/scenarios/5xchurn.yaml --backend local --runs 3
 ```
 
-Report entrypoint:
+### `benchmark` — comparative benchmark harness
+
+Compares `vykar` with `restic`, `rustic`, `borg`, and `kopia`.
 
 ```bash
-uv run --project scripts/benchmarks benchmark-report all ~/runtime/benchmarks/<STAMP>
+uv run --project scripts/testbench benchmark --runs 3
+uv run --project scripts/testbench benchmark --runs 5 --tool vykar
+uv run --project scripts/testbench benchmark --runs 3 --dataset ~/corpus-remote
 ```
 
-## `scenarios`
-
-YAML-driven end-to-end scenario runner for `vykar` across multiple backends.
-
-Examples:
+### `bench-report` — benchmark chart generation
 
 ```bash
-uv run --project scripts/scenarios scenario-runner scripts/scenarios/scenarios/simple-backup.yaml
-uv run --project scripts/scenarios scenario-runner scripts/scenarios/scenarios/5xchurn.yaml --backend local --runs 3
+uv run --project scripts/testbench bench-report all ~/runtime/benchmarks/<STAMP>
+uv run --project scripts/testbench bench-report chart ~/runtime/benchmarks/<STAMP>
+```
+
+### `stress` — autonomous stress tester
+
+Runs repeated backup/restore/verify cycles.
+
+```bash
+uv run --project scripts/testbench stress --iterations 100 --backend local
+uv run --project scripts/testbench stress --iterations 50 --check-every 5 --verify-data-every 10
+```
+
+### `profile` — heaptrack/perf profiler wrapper
+
+```bash
+uv run --project scripts/testbench profile --mode backup --backend local
+uv run --project scripts/testbench profile --mode backup --profiler perf --skip-build
+```
+
+## Tests
+
+```bash
+uv run --project scripts/testbench --with pytest pytest scripts/testbench/tests/
 ```

@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "testbench"
+version = "0.1.0"
+description = "Testing, benchmarking, profiling, and stress tooling for vykar"
+requires-python = ">=3.12"
+dependencies = [
+    "PyYAML>=6.0",
+    "faker>=18.0",
+    "faker-file>=0.17",
+    "imgkit>=1.2",
+    "minio>=7.2",
+    "python-docx>=1.0",
+    "tablib[xlsx]>=3.5",
+    "matplotlib>=3.9,<4",
+    "numpy>=2.0,<3",
+]
+
+[tool.setuptools]
+packages = ["vykar_testbench"]
+
+[project.scripts]
+scenario = "vykar_testbench.scenarios:main"
+benchmark = "vykar_testbench.benchmarks:main"
+bench-report = "vykar_testbench.bench_report:main"
+stress = "vykar_testbench.stress:main"
+profile = "vykar_testbench.profiler:main"

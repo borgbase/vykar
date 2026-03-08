@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use vykar_types::chunk_id::ChunkId;
 
 /// A single filesystem entry stored in a snapshot.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Item {
     pub path: String,
     pub entry_type: ItemType,
@@ -42,7 +42,7 @@ pub enum ItemType {
 }
 
 /// Reference to a chunk stored in the repository.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChunkRef {
     pub id: ChunkId,
     /// Uncompressed (original) size of this chunk.

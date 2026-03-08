@@ -5,3 +5,4 @@ __pycache__
 *.egg-info
 docs/src/https*
 .zed
+proptest-regressions/

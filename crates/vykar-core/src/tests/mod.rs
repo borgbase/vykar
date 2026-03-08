@@ -14,6 +14,7 @@ mod lock;
 mod lock_fence;
 mod manifest;
 mod passphrase;
+mod proptest;
 mod prune;
 mod prune_command;
 mod repo;

@@ -7,6 +7,7 @@
 	fmt-check \
 	lint \
 	test \
+	test-all \
 	pre-commit
 
 fmt:
@@ -20,6 +21,9 @@ lint:
 
 test:
 	cargo test --workspace
+
+test-all:
+	cargo test --workspace -- --include-ignored
 
 pre-commit: fmt-check lint test
 

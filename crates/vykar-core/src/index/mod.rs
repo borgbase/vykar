@@ -35,7 +35,7 @@ pub struct ChunkIndex {
     entries: HashMap<ChunkId, ChunkIndexEntry>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct ChunkIndexEntry {
     pub refcount: u32,
     pub stored_size: u32,

@@ -51,6 +51,7 @@ tokio = "1"
 
 # Testing
 tempfile = "3"
+proptest = "1"
 
 [workspace.lints.rust]
 

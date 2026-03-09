@@ -288,3 +288,100 @@ where
 {
     deserializer.deserialize_any(StringOrVecVisitor)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde::Deserialize;
+
+    #[derive(Debug, Deserialize)]
+    struct OptionalStrictStringTest {
+        #[serde(default, deserialize_with = "deserialize_optional_strict_string")]
+        value: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct OptionalDurationStringTest {
+        #[serde(default, deserialize_with = "deserialize_optional_duration_string")]
+        value: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[allow(dead_code)]
+    struct OptionalVecStrictStringTest {
+        #[serde(
+            default,
+            deserialize_with = "deserialize_optional_vec_strict_string"
+        )]
+        value: Option<Vec<String>>,
+    }
+
+    #[test]
+    fn optional_strict_string_rejects_null() {
+        let err = serde_yaml::from_str::<OptionalStrictStringTest>("value: ~")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(NULL_VALUE_ERROR),
+            "expected NULL_VALUE_ERROR, got: {err}"
+        );
+    }
+
+    #[test]
+    fn optional_strict_string_accepts_string() {
+        let result: OptionalStrictStringTest =
+            serde_yaml::from_str("value: \"hello\"").unwrap();
+        assert_eq!(result.value, Some("hello".to_string()));
+    }
+
+    #[test]
+    fn optional_duration_string_rejects_null() {
+        let err = serde_yaml::from_str::<OptionalDurationStringTest>("value: null")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(NULL_VALUE_ERROR),
+            "expected NULL_VALUE_ERROR, got: {err}"
+        );
+    }
+
+    #[test]
+    fn optional_duration_string_rejects_bool() {
+        let err = serde_yaml::from_str::<OptionalDurationStringTest>("value: true")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(STRICT_STRING_ERROR),
+            "expected STRICT_STRING_ERROR, got: {err}"
+        );
+    }
+
+    #[test]
+    fn optional_duration_string_rejects_float() {
+        let err = serde_yaml::from_str::<OptionalDurationStringTest>("value: 3.14")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(STRICT_STRING_ERROR),
+            "expected STRICT_STRING_ERROR, got: {err}"
+        );
+    }
+
+    #[test]
+    fn optional_duration_string_accepts_int() {
+        let result: OptionalDurationStringTest =
+            serde_yaml::from_str("value: 42").unwrap();
+        assert_eq!(result.value, Some("42".to_string()));
+    }
+
+    #[test]
+    fn optional_vec_strict_string_rejects_null() {
+        let err = serde_yaml::from_str::<OptionalVecStrictStringTest>("value: null")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(NULL_VALUE_ERROR),
+            "expected NULL_VALUE_ERROR, got: {err}"
+        );
+    }
+}

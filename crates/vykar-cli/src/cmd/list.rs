@@ -1,3 +1,4 @@
+use chrono::Local;
 use comfy_table::Cell;
 
 use vykar_core::commands;
@@ -62,7 +63,13 @@ pub(crate) fn run_list(
             Cell::new(host_col),
             Cell::new(source_col),
             Cell::new(label_col),
-            Cell::new(entry.time.format("%Y-%m-%d %H:%M:%S").to_string()),
+            Cell::new(
+                entry
+                    .time
+                    .with_timezone(&Local)
+                    .format("%Y-%m-%d %H:%M:%S")
+                    .to_string(),
+            ),
         ]);
     }
     println!("{table}");

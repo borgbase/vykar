@@ -1,3 +1,5 @@
+use chrono::Local;
+
 use vykar_core::commands;
 use vykar_core::config::VykarConfig;
 
@@ -26,7 +28,10 @@ pub(crate) fn run_info(
         &mut t1,
         theme,
         "Created",
-        stats.repo_created.format("%Y-%m-%d %H:%M:%S UTC"),
+        stats
+            .repo_created
+            .with_timezone(&Local)
+            .format("%Y-%m-%d %H:%M:%S"),
     );
     println!("{t1}");
     println!();
@@ -36,7 +41,11 @@ pub(crate) fn run_info(
     add_kv_row(&mut t2, theme, "Snapshots", stats.snapshot_count);
     let last_snapshot = stats
         .last_snapshot_time
-        .map(|t| t.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+        .map(|t| {
+            t.with_timezone(&Local)
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string()
+        })
         .unwrap_or_else(|| "-".to_string());
     add_kv_row(&mut t2, theme, "Last snapshot", last_snapshot);
     add_kv_row(

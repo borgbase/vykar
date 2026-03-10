@@ -1,5 +1,7 @@
 use std::sync::atomic::AtomicBool;
 
+use chrono::Local;
+
 use vykar_core::commands;
 use vykar_core::config::VykarConfig;
 
@@ -61,7 +63,11 @@ pub(crate) fn run_snapshot_command(
                     let secs = item.mtime / 1_000_000_000;
                     let nsecs = (item.mtime % 1_000_000_000) as u32;
                     let mtime = chrono::DateTime::<chrono::Utc>::from_timestamp(secs, nsecs)
-                        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+                        .map(|dt| {
+                            dt.with_timezone(&Local)
+                                .format("%Y-%m-%d %H:%M:%S")
+                                .to_string()
+                        })
                         .unwrap_or_else(|| "-".to_string());
                     println!(
                         "{}{:04o} {:>10} {} {}",
@@ -113,13 +119,15 @@ pub(crate) fn run_snapshot_command(
                 &mut t1,
                 theme,
                 "Start time",
-                meta.time.format("%Y-%m-%d %H:%M:%S UTC"),
+                meta.time.with_timezone(&Local).format("%Y-%m-%d %H:%M:%S"),
             );
             add_kv_row(
                 &mut t1,
                 theme,
                 "End time",
-                meta.time_end.format("%Y-%m-%d %H:%M:%S UTC"),
+                meta.time_end
+                    .with_timezone(&Local)
+                    .format("%Y-%m-%d %H:%M:%S"),
             );
             let duration = meta.time_end.signed_duration_since(meta.time);
             let secs = duration.num_seconds();
@@ -235,7 +243,12 @@ fn run_snapshot_find(
         println!("{}", timeline.path);
         println!("  {:<12} {:<20} {:>10}  Status", "Snapshot", "Date", "Size");
         for ah in &timeline.hits {
-            let date = ah.hit.snapshot_time.format("%Y-%m-%d %H:%M:%S").to_string();
+            let date = ah
+                .hit
+                .snapshot_time
+                .with_timezone(&Local)
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string();
             let size = format_bytes(ah.hit.size);
             let status = match ah.status {
                 FileStatus::Added => "added",

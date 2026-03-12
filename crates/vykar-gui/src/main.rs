@@ -668,6 +668,41 @@ slint::slint! {
         }
     }
 
+    component ToolTipArea {
+        preferred-height: 100%;
+        preferred-width: 100%;
+
+        in property <string> text;
+        in property <bool> show-left: false;
+
+        ta := TouchArea {
+            @children
+        }
+        Rectangle {
+            states [
+                visible when ta.has-hover: {
+                    opacity: 0.8;
+                    in {
+                        animate opacity { duration: 175ms; delay: 700ms; }
+                    }
+                }
+            ]
+            x: root.show-left ? ta.mouse-x - self.width - 1rem : ta.mouse-x + 1rem;
+            y: ta.mouse-y + 1rem;
+            background: Palette.background;
+            border-width: 1px;
+            border-color: #888888;
+            border-radius: 4px;
+            opacity: 0;
+            width: tt.preferred-width;
+            height: tt.preferred-height;
+            tt := HorizontalLayout {
+                padding: 4px;
+                Text { text <=> root.text; font-size: 11px; }
+            }
+        }
+    }
+
     export component MainWindow inherits Window {
         in-out property <string> config_path;
         in-out property <string> schedule_text;
@@ -704,8 +739,6 @@ slint::slint! {
         callback find_files_clicked();
         callback reload_config_clicked();
         callback backup_repo_clicked(/* index */ int);
-        callback check_repo_clicked(/* index */ int);
-        callback compact_repo_clicked(/* index */ int);
         callback backup_source_clicked(/* index */ int);
         callback refresh_snapshots_clicked();
         callback restore_selected_snapshot_clicked(/* row */ int);
@@ -745,24 +778,34 @@ slint::slint! {
                         Text { text: "(Change)"; color: #4a90d9; vertical-alignment: center; font-size: 12px; }
                     }
                     Rectangle { horizontal-stretch: 1; }
-                    Button {
-                        text: "Reload";
-                        enabled: !root.operation_busy && !root.editor_dirty;
-                        clicked => { root.reload_config_clicked(); }
+                    ToolTipArea {
+                        text: "Reload configuration from disk";
+                        Button {
+                            text: "Reload";
+                            enabled: !root.operation_busy && !root.editor_dirty;
+                            clicked => { root.reload_config_clicked(); }
+                        }
                     }
-                    Button {
-                        text: "Find Files";
-                        enabled: !root.operation_busy;
-                        clicked => { root.find_files_clicked(); }
+                    ToolTipArea {
+                        text: "Search files across snapshots";
+                        Button {
+                            text: "Find Files";
+                            enabled: !root.operation_busy;
+                            clicked => { root.find_files_clicked(); }
+                        }
                     }
-                    Button {
-                        text: root.operation_busy ? "Cancel" : "Backup All";
-                        primary: !root.operation_busy;
-                        clicked => {
-                            if (root.operation_busy) {
-                                root.cancel_clicked();
-                            } else {
-                                root.backup_all_clicked();
+                    ToolTipArea {
+                        text: "Backup, prune, compact, and check all repos";
+                        show-left: true;
+                        Button {
+                            text: root.operation_busy ? "Cancel" : "Full Backup";
+                            primary: !root.operation_busy;
+                            clicked => {
+                                if (root.operation_busy) {
+                                    root.cancel_clicked();
+                                } else {
+                                    root.backup_all_clicked();
+                                }
                             }
                         }
                     }
@@ -818,8 +861,6 @@ slint::slint! {
                                         HorizontalLayout {
                                             spacing: 8px;
                                             Button { text: "Backup"; primary: true; enabled: !root.operation_busy; clicked => { root.backup_repo_clicked(idx); } }
-                                            Button { text: "Check"; enabled: !root.operation_busy; clicked => { root.check_repo_clicked(idx); } }
-                                            Button { text: "Compact"; enabled: !root.operation_busy; clicked => { root.compact_repo_clicked(idx); } }
                                         }
                                     }
                                 }
@@ -1031,12 +1072,6 @@ enum AppCommand {
         dest: String,
         paths: Vec<String>,
     },
-    CheckRepo {
-        repo_name: String,
-    },
-    CompactRepo {
-        repo_name: String,
-    },
     DeleteSnapshot {
         repo_name: String,
         snapshot_name: String,
@@ -1188,7 +1223,7 @@ fn build_tray_icon() -> Result<
     let menu = Menu::new();
 
     let open_item = MenuItem::new(format!("Open {APP_TITLE}"), true, None);
-    let run_now_item = MenuItem::new("Run All Backups", true, None);
+    let run_now_item = MenuItem::new("Full Backup", true, None);
     let source_submenu = Submenu::new("Backup Source", true);
     let cancel_item = MenuItem::new("Cancel Backup", false, None);
     let quit_item = MenuItem::new("Quit", true, None);
@@ -2353,111 +2388,6 @@ fn run_worker(
                 let _ = ui_tx.send(UiEvent::OperationFinished);
                 let _ = ui_tx.send(UiEvent::Status("Idle".to_string()));
             }
-            AppCommand::CheckRepo { repo_name } => {
-                cancel_requested.store(false, Ordering::SeqCst);
-                let _ = ui_tx.send(UiEvent::OperationStarted);
-                let _ = ui_tx.send(UiEvent::Status("Checking repository...".to_string()));
-
-                let repo = match config::select_repo(&runtime.repos, &repo_name) {
-                    Some(r) => r,
-                    None => {
-                        send_log(&ui_tx, format!("No repository matching '{repo_name}'."));
-                        let _ = ui_tx.send(UiEvent::OperationFinished);
-                        let _ = ui_tx.send(UiEvent::Status("Idle".to_string()));
-                        continue;
-                    }
-                };
-
-                let passphrase = match get_or_resolve_passphrase(repo, &mut passphrases) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        send_log(&ui_tx, format!("[{repo_name}] passphrase error: {e}"));
-                        let _ = ui_tx.send(UiEvent::OperationFinished);
-                        let _ = ui_tx.send(UiEvent::Status("Idle".to_string()));
-                        continue;
-                    }
-                };
-
-                let ui_tx_progress = ui_tx.clone();
-                let rn = repo_name.clone();
-                match operations::check_repo_with_progress(
-                    &repo.config,
-                    passphrase.as_deref().map(|s| s.as_str()),
-                    false,
-                    &mut |event| {
-                        let _ =
-                            ui_tx_progress.send(UiEvent::Status(format_check_status(&rn, &event)));
-                    },
-                ) {
-                    Ok(result) => {
-                        send_log(
-                            &ui_tx,
-                            format!(
-                                "[{repo_name}] Check complete: {} snapshots, {} items checked, {} errors",
-                                result.snapshots_checked, result.items_checked, result.errors.len()
-                            ),
-                        );
-                        for err in &result.errors {
-                            send_log(
-                                &ui_tx,
-                                format!("  [{repo_name}] {}: {}", err.context, err.message),
-                            );
-                        }
-                    }
-                    Err(e) => send_log(&ui_tx, format!("[{repo_name}] check failed: {e}")),
-                }
-                let _ = ui_tx.send(UiEvent::OperationFinished);
-                let _ = ui_tx.send(UiEvent::Status("Idle".to_string()));
-            }
-            AppCommand::CompactRepo { repo_name } => {
-                cancel_requested.store(false, Ordering::SeqCst);
-                let _ = ui_tx.send(UiEvent::OperationStarted);
-                let _ = ui_tx.send(UiEvent::Status("Compacting repository...".to_string()));
-
-                let repo = match config::select_repo(&runtime.repos, &repo_name) {
-                    Some(r) => r,
-                    None => {
-                        send_log(&ui_tx, format!("No repository matching '{repo_name}'."));
-                        let _ = ui_tx.send(UiEvent::OperationFinished);
-                        let _ = ui_tx.send(UiEvent::Status("Idle".to_string()));
-                        continue;
-                    }
-                };
-
-                let passphrase = match get_or_resolve_passphrase(repo, &mut passphrases) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        send_log(&ui_tx, format!("[{repo_name}] passphrase error: {e}"));
-                        let _ = ui_tx.send(UiEvent::OperationFinished);
-                        let _ = ui_tx.send(UiEvent::Status("Idle".to_string()));
-                        continue;
-                    }
-                };
-
-                match vykar_core::commands::compact::run(
-                    &repo.config,
-                    passphrase.as_deref().map(|s| s.as_str()),
-                    repo.config.compact.threshold,
-                    None,
-                    false,
-                    None,
-                ) {
-                    Ok(stats) => {
-                        send_log(
-                            &ui_tx,
-                            format!(
-                                "[{repo_name}] Compact complete: {} packs repacked, {} empty deleted, {} freed",
-                                stats.packs_repacked,
-                                stats.packs_deleted_empty,
-                                format_bytes(stats.space_freed),
-                            ),
-                        );
-                    }
-                    Err(e) => send_log(&ui_tx, format!("[{repo_name}] compact failed: {e}")),
-                }
-                let _ = ui_tx.send(UiEvent::OperationFinished);
-                let _ = ui_tx.send(UiEvent::Status("Idle".to_string()));
-            }
             AppCommand::DeleteSnapshot {
                 repo_name,
                 snapshot_name,
@@ -3279,36 +3209,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Ok(labels) = rl.lock() {
             if let Some(name) = labels.get(i) {
                 let _ = tx.send(AppCommand::RunBackupRepo {
-                    repo_name: name.clone(),
-                });
-            }
-        }
-    });
-
-    let tx = app_tx.clone();
-    let rl = repo_labels.clone();
-    ui.on_check_repo_clicked(move |idx| {
-        let Some(i) = usize::try_from(idx).ok() else {
-            return;
-        };
-        if let Ok(labels) = rl.lock() {
-            if let Some(name) = labels.get(i) {
-                let _ = tx.send(AppCommand::CheckRepo {
-                    repo_name: name.clone(),
-                });
-            }
-        }
-    });
-
-    let tx = app_tx.clone();
-    let rl = repo_labels.clone();
-    ui.on_compact_repo_clicked(move |idx| {
-        let Some(i) = usize::try_from(idx).ok() else {
-            return;
-        };
-        if let Ok(labels) = rl.lock() {
-            if let Some(name) = labels.get(i) {
-                let _ = tx.send(AppCommand::CompactRepo {
                     repo_name: name.clone(),
                 });
             }

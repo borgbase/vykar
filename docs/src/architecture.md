@@ -17,6 +17,8 @@ Rationale:
 - 32-byte symmetric keys (simpler key management than split-key schemes)
 - AEAD AAD always includes the 1-byte type tag; for identity-bound objects it also includes a domain-separated object context (for example: `index`, snapshot ID, chunk ID, `filecache`, or `snapshot_cache`)
 
+**Key usage model:** The master `encryption_key` is used directly as the AEAD symmetric key for all encryption operations throughout the lifetime of the repository. There is no per-session or per-snapshot key derivation. Cryptographic isolation between objects relies on random 12-byte nonces (unique per encryption call) and domain-separated AAD (binding ciphertext to object type and identity). With 96-bit random nonces, the birthday-bound collision threshold is approximately 2^48 encryptions under a single key — well beyond realistic backup workloads.
+
 ### Plaintext Mode (`none`)
 
 When `encryption` is set to `none`, vykar uses a `PlaintextEngine` — an identity transform where `encrypt()` and `decrypt()` return data unchanged. AAD is ignored (there is no AEAD construction to bind it to). The format layer detects plaintext mode via `is_encrypting() == false` and uses the shorter wire format: `[1-byte type_tag][plaintext]` (1-byte overhead instead of 29 bytes).
@@ -25,10 +27,11 @@ This mode does **not** provide authentication or tamper protection — it is des
 
 ### Key Derivation
 
-Argon2id for passphrase-to-key derivation.
+The master key (64 bytes: 32-byte encryption key + 32-byte chunk ID key) is generated from OS entropy (`OsRng`) at repository init. It is never derived from the passphrase. Instead, the passphrase is used to derive a Key Encryption Key (KEK) via Argon2id, and the KEK wraps the master key with AES-256-GCM. The encrypted master key blob is stored at `keys/repokey` alongside the KDF parameters (algorithm, memory/time/parallelism costs, salt) and the wrapping nonce. Changing the passphrase re-wraps the same master key without re-encrypting any repository data.
 
 Rationale:
-- Modern memory-hard KDF recommended by OWASP and IETF
+- Two-layer scheme (random data key, passphrase-derived wrapping key) separates key strength from passphrase quality
+- Argon2id is a modern memory-hard KDF recommended by OWASP and IETF
 - Resists both GPU and ASIC brute-force attacks
 
 In `none` mode no passphrase or key file is needed. The `chunk_id_key` is deterministically derived as `BLAKE2b-256(repo_id)`. Since `repo_id` is stored unencrypted in the repo `config`, this key is not secret — it exists only so that the same keyed hashing path is used in all modes. No `keys/repokey` file is created.
@@ -39,7 +42,7 @@ Keyed BLAKE2b-256 MAC using a `chunk_id_key` derived from the master key.
 
 Rationale:
 - Prevents content confirmation attacks (an adversary cannot check whether known plaintext exists in the backup without the key)
-- BLAKE2b is faster than SHA-256 in software
+- BLAKE2b is faster than SHA-256 in pure software implementations (on CPUs with hardware SHA-256 acceleration — SHA-NI on x86, SHA extensions on ARM — hardware SHA-256 can be faster; BLAKE2b was chosen for consistent performance across all architectures without requiring hardware-specific instruction sets)
 - Trade-off: keyed IDs prevent dedup across different encryption keys (acceptable for vykar's single-key-per-repo model)
 
 In `none` mode the same keyed BLAKE2b-256 construction is used, but the key is derived from the public `repo_id` rather than a secret master key. The MAC therefore acts as a **checksum for corruption detection**, not as authentication against tampering. `vykar check --verify-data` recomputes chunk IDs and compares them to detect bit-rot or storage corruption — this works identically across all encryption modes.
@@ -61,11 +64,11 @@ Rationale:
 
 ### Compression
 
-Per-chunk compression with a 1-byte tag prefix. Supported algorithms: LZ4, ZSTD, and None.
+Per-chunk compression with a 1-byte tag prefix. Supported algorithms: LZ4, ZSTD, and None. The tag identifies the codec only, not the compression level — the ZSTD level is a repo-wide configuration setting. Recompression at a different level requires decompressing and recompressing every chunk.
 
 Rationale:
 - Per-chunk tags allow mixing algorithms within a single repository
-- LZ4 for speed-sensitive workloads, ZSTD for better compression ratios
+- LZ4 for speed-sensitive workloads, ZSTD for better compression ratios. LZ4 is recommended over None for most workloads — even on incompressible data the overhead is negligible, and the reduced I/O and transfer size typically more than compensate
 - No repository-wide format version lock-in for compression choice
 - ZSTD compression reuses a thread-local compressor context per level, reducing allocation churn in parallel backup paths
 - Decompression enforces a hard output cap (32 MiB) to bound memory usage and mitigate decompression-bomb inputs
@@ -252,6 +255,8 @@ Each `SnapshotEntry` contains: `name`, `id` (32-byte random), `time`, `source_la
 | deduplicated_size | u64 | Bytes newly stored after deduplication |
 | errors | u64 | Number of soft file-read errors skipped during backup |
 
+`deduplicated_size` records the bytes newly stored at the time the snapshot was created. It depends on the global repository state at that moment and becomes stale if other snapshots are later deleted — a snapshot that originally shared all its chunks (showing `deduplicated_size ≈ 0`) may become the sole owner of those chunks after the other snapshot is removed. Treat this field as a creation-time accounting metric, not a durable measure of a snapshot's unique storage footprint.
+
 **Item** — a single filesystem entry within a snapshot's item stream.
 
 | Field | Type | Description |
@@ -276,6 +281,8 @@ Each `SnapshotEntry` contains: `name`, `id` (32-byte random), `time`, `source_la
 | size | u32 | Uncompressed (original) size |
 | csize | u32 | Stored size (compressed + encrypted) |
 
+`csize` is stored per-reference so the restore path can pass it as a size hint to the ZSTD bulk decompressor, avoiding the overhead of a streaming decoder. Without it, each chunk decompression would either need an index lookup or fall back to the slower streaming path.
+
 ### Pack Files
 
 Chunks are grouped into **pack files** (~32 MiB) instead of being stored as individual files. This reduces file count by 1000x+, critical for cloud storage costs (fewer PUT/GET ops) and filesystem performance (fewer inodes).
@@ -293,7 +300,7 @@ Chunks are grouped into **pack files** (~32 MiB) instead of being stored as indi
 - **Per-blob length prefix** (4 bytes): enables forward scanning of all blobs from byte 9 to EOF
 - Each blob is a complete RepoObj envelope: `[1B type_tag][12B nonce][ciphertext+16B AEAD tag]`
 - Each blob is independently encrypted (can read one chunk without decrypting the whole pack)
-- No trailing per-pack header object; pack analysis/compaction enumerate blobs via length-prefix scan
+- No trailing per-pack header object — the chunk index already records which blobs reside in which pack at which offset, making a per-pack blob manifest redundant. Pack analysis for compaction enumerates blobs by forward-scanning length prefixes. Trade-off: if the index is lost, rebuilding requires a full sequential scan of all pack data (reading every byte); a trailing header would allow reading just the last N bytes per pack. In practice index loss is rare (single encrypted blob, written atomically) and `check --verify-data` already performs a full pack scan
 - Pack ID = unkeyed BLAKE2b-256 of entire pack contents, stored at `packs/<shard>/<hex_pack_id>`
 
 #### Data Packs vs Tree Packs

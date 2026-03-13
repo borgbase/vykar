@@ -1,0 +1,202 @@
+import { VerticalBox, HorizontalBox, Button, ListView, Palette } from "std-widgets.slint";
+
+// check_state: 0=unchecked, 1=checked, 2=partial
+export struct TreeRowData {
+    name: string,
+    type_str: string,
+    permissions: string,
+    size_str: string,
+    depth: int,
+    is_dir: bool,
+    expanded: bool,
+    check_state: int,
+    node_index: int,
+}
+
+export component RestoreWindow inherits Window {
+    in-out property <string> snapshot_name;
+    in-out property <string> repo_name;
+    in-out property <string> status_text: "Ready";
+    in-out property <string> selection_text: "";
+    in-out property <[TreeRowData]> tree_rows: [];
+    in-out property <bool> busy: false;
+
+    callback toggle_expanded(/* node_index */ int);
+    callback toggle_checked(/* node_index */ int);
+    callback expand_all_clicked();
+    callback collapse_all_clicked();
+    callback select_all_clicked();
+    callback deselect_all_clicked();
+    callback restore_selected_clicked();
+    callback cancel_clicked();
+
+    title: "Restore Snapshot";
+    preferred-width: 900px;
+    preferred-height: 600px;
+
+    VerticalBox {
+        padding: 12px;
+        spacing: 8px;
+
+        HorizontalLayout {
+            spacing: 24px;
+            HorizontalLayout {
+                spacing: 4px;
+                Text { text: "Snapshot:"; vertical-alignment: center; font-weight: 700; }
+                Text { text: root.snapshot_name; vertical-alignment: center; }
+            }
+            HorizontalLayout {
+                spacing: 4px;
+                Text { text: "Repository:"; vertical-alignment: center; font-weight: 700; }
+                Text { text: root.repo_name; vertical-alignment: center; }
+            }
+            Rectangle { horizontal-stretch: 1; }
+        }
+
+        // Toolbar
+        HorizontalBox {
+            spacing: 8px;
+            Button { text: "Expand All"; enabled: !root.busy; clicked => { root.expand_all_clicked(); } }
+            Button { text: "Collapse All"; enabled: !root.busy; clicked => { root.collapse_all_clicked(); } }
+            Button { text: "Select All"; enabled: !root.busy; clicked => { root.select_all_clicked(); } }
+            Button { text: "Deselect All"; enabled: !root.busy; clicked => { root.deselect_all_clicked(); } }
+            Rectangle { horizontal-stretch: 1; }
+            Text { text: root.selection_text; vertical-alignment: center; color: Palette.foreground; }
+        }
+
+        // Tree view
+        Rectangle {
+            vertical-stretch: 1;
+            border-width: 1px;
+            border-color: Palette.border;
+            border-radius: 4px;
+            background: Palette.alternate-background;
+            ListView {
+            for row[row_idx] in root.tree_rows: Rectangle {
+                height: 28px;
+                // Hover highlight — declared first so it sits behind the interactive layout
+                Rectangle {
+                    background: ta.has-hover ? Palette.background.darker(3%) : transparent;
+                    opacity: 0.5;
+                    ta := TouchArea { }
+                }
+                HorizontalLayout {
+                    padding-left: 4px;
+                    padding-right: 8px;
+                    spacing: 0px;
+
+                    // Indentation
+                    Rectangle { width: row.depth * 20px; }
+
+                    // Expand/collapse arrow (for directories)
+                    if row.is_dir: TouchArea {
+                        width: 20px;
+                        mouse-cursor: pointer;
+                        enabled: !root.busy;
+                        clicked => { root.toggle_expanded(row.node_index); }
+                        Text {
+                            text: row.expanded ? "v" : ">";
+                            font-size: 10px;
+                            color: Palette.foreground;
+                            vertical-alignment: center;
+                            horizontal-alignment: center;
+                        }
+                    }
+                    if !row.is_dir: Rectangle { width: 20px; }
+
+                    // Tri-state checkbox
+                    TouchArea {
+                        width: 22px;
+                        mouse-cursor: pointer;
+                        enabled: !root.busy;
+                        clicked => { root.toggle_checked(row.node_index); }
+                        Rectangle {
+                            x: 2px;
+                            y: (parent.height - 16px) / 2;
+                            width: 16px;
+                            height: 16px;
+                            border-width: 1px;
+                            border-color: row.check_state == 0 ? Palette.border : Palette.accent-background;
+                            border-radius: 3px;
+                            background: row.check_state == 1 ? Palette.accent-background : row.check_state == 2 ? Palette.accent-background.transparentize(50%) : Palette.background;
+
+                            // Checkmark for checked state
+                            if row.check_state == 1: Text {
+                                text: "x";
+                                color: white;
+                                font-size: 12px;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                            // Dash for partial state
+                            if row.check_state == 2: Rectangle {
+                                x: 3px;
+                                y: (parent.height - 2px) / 2;
+                                width: parent.width - 6px;
+                                height: 2px;
+                                background: white;
+                            }
+                        }
+                    }
+
+                    // Name
+                    Text {
+                        text: row.name;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                        overflow: elide;
+                        font-weight: row.is_dir ? 700 : 400;
+                    }
+
+                    // Type
+                    Text {
+                        text: row.type_str;
+                        vertical-alignment: center;
+                        width: 50px;
+                        color: Palette.foreground.transparentize(40%);
+                        font-size: 11px;
+                    }
+
+                    // Permissions
+                    Text {
+                        text: row.permissions;
+                        vertical-alignment: center;
+                        width: 70px;
+                        color: Palette.foreground.transparentize(40%);
+                        font-size: 11px;
+                    }
+
+                    // Size
+                    Text {
+                        text: row.size_str;
+                        vertical-alignment: center;
+                        width: 80px;
+                        horizontal-alignment: right;
+                        color: Palette.foreground.transparentize(40%);
+                        font-size: 11px;
+                    }
+                }
+            }
+        }
+        }
+
+        HorizontalBox {
+            spacing: 8px;
+            Text {
+                vertical-alignment: center;
+                text: root.status_text;
+                color: Palette.foreground;
+            }
+            Rectangle { horizontal-stretch: 1; }
+            Button {
+                text: "Close";
+                clicked => { root.cancel_clicked(); }
+            }
+            Button {
+                text: "Restore Selected";
+                enabled: !root.busy;
+                clicked => { root.restore_selected_clicked(); }
+            }
+        }
+    }
+}

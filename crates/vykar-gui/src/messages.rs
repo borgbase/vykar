@@ -1,0 +1,142 @@
+use vykar_core::snapshot::item::Item;
+
+// ── Commands (UI → worker) ──
+
+#[derive(Debug)]
+pub(crate) enum AppCommand {
+    RunBackupAll {
+        scheduled: bool,
+    },
+    RunBackupRepo {
+        repo_name: String,
+    },
+    RunBackupSource {
+        source_label: String,
+    },
+    FetchAllRepoInfo,
+    RefreshSnapshots {
+        repo_selector: String,
+    },
+    FetchSnapshotContents {
+        repo_name: String,
+        snapshot_name: String,
+    },
+    RestoreSelected {
+        repo_name: String,
+        snapshot: String,
+        dest: String,
+        paths: Vec<String>,
+    },
+    DeleteSnapshot {
+        repo_name: String,
+        snapshot_name: String,
+    },
+    FindFiles {
+        repo_name: String,
+        name_pattern: String,
+    },
+    OpenConfigFile,
+    ReloadConfig,
+    SwitchConfig,
+    SaveAndApplyConfig {
+        yaml_text: String,
+    },
+    ShowWindow,
+    Quit,
+}
+
+// ── Data transfer structs ──
+
+#[derive(Debug, Clone)]
+pub(crate) struct RepoInfoData {
+    pub name: String,
+    pub url: String,
+    pub snapshots: String,
+    pub last_snapshot: String,
+    pub size: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SnapshotRowData {
+    pub id: String,
+    pub hostname: String,
+    pub time_str: String,
+    pub source: String,
+    pub label: String,
+    pub files: String,
+    pub size: String,
+    pub nfiles: u64,
+    pub size_bytes: u64,
+    pub time_epoch: i64,
+    pub repo_name: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SourceInfoData {
+    pub label: String,
+    pub paths: String,
+    pub excludes: String,
+    pub target_repos: String,
+    pub detail_paths: String,
+    pub detail_excludes: String,
+    pub detail_exclude_if_present: String,
+    pub detail_flags: String,
+    pub detail_hooks: String,
+    pub detail_retention: String,
+    pub detail_command_dumps: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct FindResultRow {
+    pub path: String,
+    pub snapshot: String,
+    pub date: String,
+    pub size: String,
+    pub status: String,
+}
+
+// ── Events (worker → UI) ──
+
+#[derive(Debug, Clone)]
+pub(crate) enum UiEvent {
+    Status(String),
+    LogEntry {
+        timestamp: String,
+        message: String,
+    },
+    ConfigInfo {
+        path: String,
+        schedule: String,
+    },
+    RepoNames(Vec<String>),
+    RepoModelData {
+        items: Vec<RepoInfoData>,
+        labels: Vec<String>,
+    },
+    SourceModelData {
+        items: Vec<SourceInfoData>,
+        labels: Vec<String>,
+    },
+    SnapshotTableData {
+        data: Vec<SnapshotRowData>,
+    },
+    SnapshotContentsData {
+        items: Vec<Item>,
+    },
+    RestoreFinished {
+        success: bool,
+        message: String,
+    },
+    FindResultsData {
+        rows: Vec<FindResultRow>,
+    },
+    ConfigText(String),
+    ConfigSaveError(String),
+    OperationStarted {
+        cancellable: bool,
+    },
+    OperationFinished,
+    Quit,
+    ShowWindow,
+    TriggerSnapshotRefresh,
+}

@@ -1,0 +1,16 @@
+import { MainWindow, RepoInfo, SourceInfo } from "main-window.slint";
+import { RestoreWindow, TreeRowData } from "restore.slint";
+import { FindWindow } from "find.slint";
+
+export { MainWindow, RestoreWindow, FindWindow, RepoInfo, SourceInfo, TreeRowData }
+
+export global AppData {
+    // Label caches — written by event consumer, read by MainWindow callbacks.
+    // Replaces the Arc<Mutex<Vec<String>>> fields.
+    in-out property <[string]> repo-labels: [];
+    in-out property <[string]> source-labels: [];
+    in-out property <[string]> snapshot-ids: [];
+    in-out property <[string]> snapshot-repo-names: [];
+    // Config path for GUI state persistence.
+    in-out property <string> active-config-path: "";
+}

@@ -36,4 +36,5 @@ objc2 = "0.6"
 objc2-app-kit = { version = "0.3", features = ["NSApplication"] }
 
 [build-dependencies]
+slint-build = "1.13"
 winresource = "0.1"

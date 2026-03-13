@@ -184,6 +184,7 @@ pub(crate) fn run_worker(
 
                 if any_snapshots_created {
                     let _ = ui_tx.send(UiEvent::TriggerSnapshotRefresh);
+                    let _ = app_tx.send(AppCommand::FetchAllRepoInfo);
                 }
 
                 backup_running.store(false, Ordering::SeqCst);
@@ -259,6 +260,7 @@ pub(crate) fn run_worker(
                             let _ = app_tx.send(AppCommand::RefreshSnapshots {
                                 repo_selector: rn.clone(),
                             });
+                            let _ = app_tx.send(AppCommand::FetchAllRepoInfo);
                         }
                         log_backup_report(&ui_tx, &rn, &report);
                     }
@@ -369,6 +371,7 @@ pub(crate) fn run_worker(
                     );
                 } else {
                     let _ = ui_tx.send(UiEvent::TriggerSnapshotRefresh);
+                    let _ = app_tx.send(AppCommand::FetchAllRepoInfo);
                 }
 
                 backup_running.store(false, Ordering::SeqCst);
@@ -822,10 +825,11 @@ pub(crate) fn run_worker(
                                 format_bytes(stats.space_freed),
                             ),
                         );
-                        // Auto-refresh snapshots
+                        // Auto-refresh snapshots and repo details
                         let _ = app_tx.send(AppCommand::RefreshSnapshots {
                             repo_selector: repo_name,
                         });
+                        let _ = app_tx.send(AppCommand::FetchAllRepoInfo);
                     }
                     Err(e) => {
                         send_log(&ui_tx, format!("[{repo_name}] delete failed: {e}"));

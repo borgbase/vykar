@@ -65,3 +65,12 @@ pub struct SourceHooksConfig {
     #[serde(default, deserialize_with = "deserialize_string_or_vec")]
     pub finally: Vec<String>,
 }
+
+impl SourceHooksConfig {
+    pub fn has_any(&self) -> bool {
+        !self.before.is_empty()
+            || !self.after.is_empty()
+            || !self.failed.is_empty()
+            || !self.finally.is_empty()
+    }
+}

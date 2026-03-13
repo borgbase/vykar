@@ -1,12 +1,3 @@
-use rand::RngCore;
-
-/// Generate an 8-character hex snapshot name (4 random bytes).
-pub(crate) fn generate_snapshot_name() -> String {
-    let mut buf = [0u8; 4];
-    rand::thread_rng().fill_bytes(&mut buf);
-    hex::encode(buf)
-}
-
 pub(crate) fn parse_duration_span(
     s: &str,
 ) -> Result<chrono::DateTime<chrono::Utc>, Box<dyn std::error::Error>> {

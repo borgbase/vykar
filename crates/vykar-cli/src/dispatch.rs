@@ -1,11 +1,10 @@
 use std::io::IsTerminal;
 use std::sync::atomic::AtomicBool;
 
-use crate::hooks::{self, HookContext};
 use crate::progress::BackupProgressRenderer;
-use vykar_core::app::operations::{CycleEvent, CycleStep, FullCycleResult, StepOutcome};
+use vykar_core::app::operations::{self, CycleEvent, CycleStep, FullCycleResult, StepOutcome};
 use vykar_core::commands;
-use vykar_core::config::{EncryptionModeConfig, HooksConfig, SourceEntry, VykarConfig};
+use vykar_core::config::{EncryptionModeConfig, ResolvedRepo, VykarConfig};
 use vykar_storage::{parse_repo_url, ParsedUrl};
 
 use crate::cli::Commands;
@@ -34,89 +33,55 @@ pub(crate) fn warn_if_untrusted_rest(config: &VykarConfig, label: Option<&str>) 
     }
 }
 
-fn make_hook_ctx(command: &str, cfg: &VykarConfig, repo_label: &Option<String>) -> HookContext {
-    HookContext {
-        command: command.to_string(),
-        repository: cfg.repository.url.clone(),
-        label: repo_label.clone(),
-        error: None,
-        source_label: None,
-        source_paths: None,
-    }
-}
-
 /// Returns `Ok(had_partial)` — `true` if backup had soft errors but still succeeded.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_default_actions(
-    cfg: &VykarConfig,
-    label: Option<&str>,
-    sources: &[SourceEntry],
-    global_hooks: &HooksConfig,
-    repo_hooks: &HooksConfig,
-    repo_label: &Option<String>,
+    repo: &ResolvedRepo,
     shutdown: Option<&AtomicBool>,
     verbose: u8,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let start = std::time::Instant::now();
+    let label = repo.label.as_deref();
 
-    // Resolve passphrase once up front so all steps share it.
-    let result = with_repo_passphrase(cfg, label, |passphrase| {
-        let mut before_step = |step: CycleStep| -> std::result::Result<(), String> {
-            let mut ctx = make_hook_ctx(step.command_name(), cfg, repo_label);
-            hooks::run_before(global_hooks, repo_hooks, &mut ctx).map_err(|e| e.to_string())
-        };
-
-        let mut after_step = |step: CycleStep, outcome: &StepOutcome| {
-            let mut ctx = make_hook_ctx(step.command_name(), cfg, repo_label);
-            let success = outcome.is_success();
-            if let Some(msg) = outcome.error_msg() {
-                ctx.error = Some(msg.to_string());
-            }
-            hooks::run_after_or_failed(global_hooks, repo_hooks, &mut ctx, success);
-            hooks::run_finally(global_hooks, repo_hooks, &mut ctx);
-        };
-
+    let result = with_repo_passphrase(&repo.config, label, |passphrase| {
         let is_tty = std::io::stderr().is_terminal();
         let show_progress = is_tty || verbose > 0;
         let mut backup_renderer: Option<BackupProgressRenderer> = None;
 
-        let cycle_result = vykar_core::app::operations::run_full_cycle_for_repo(
-            cfg,
-            sources,
-            passphrase,
-            shutdown,
-            &mut |event| match &event {
-                CycleEvent::StepStarted(step) => {
-                    eprintln!("==> Starting {}", step.command_name());
-                    if matches!(step, CycleStep::Backup) && show_progress {
-                        backup_renderer = Some(BackupProgressRenderer::new(verbose, is_tty));
+        let cycle_result =
+            operations::run_full_cycle_for_repo(repo, passphrase, shutdown, &mut |event| {
+                match &event {
+                    CycleEvent::StepStarted(step) => {
+                        eprintln!("==> Starting {}", step.command_name());
+                        if matches!(step, CycleStep::Backup) && show_progress {
+                            backup_renderer = Some(BackupProgressRenderer::new(verbose, is_tty));
+                        }
                     }
-                }
-                CycleEvent::StepFinished(step, outcome) => {
-                    if matches!(step, CycleStep::Backup) {
+                    CycleEvent::StepFinished(step, outcome) => {
+                        if matches!(step, CycleStep::Backup) {
+                            if let Some(ref mut r) = backup_renderer {
+                                r.finish();
+                            }
+                            backup_renderer = None;
+                        }
+                        if matches!(outcome, StepOutcome::Failed(..)) {
+                            if let StepOutcome::Failed(e) = outcome {
+                                eprintln!("Error: {e}");
+                            }
+                        }
+                    }
+                    CycleEvent::Backup(evt) => {
                         if let Some(ref mut r) = backup_renderer {
-                            r.finish();
-                        }
-                        backup_renderer = None;
-                    }
-                    if matches!(outcome, StepOutcome::Failed(..)) {
-                        if let StepOutcome::Failed(e) = outcome {
-                            eprintln!("Error: {e}");
+                            r.on_event(evt.clone());
                         }
                     }
-                }
-                CycleEvent::Backup(evt) => {
-                    if let Some(ref mut r) = backup_renderer {
-                        r.on_event(evt.clone());
+                    CycleEvent::Check(evt) => {
+                        format_check_progress(evt);
                     }
+                    // HookWarning: tracing::warn! already fired inside log_hook_errors.
+                    // Events are for GUI consumers only.
+                    CycleEvent::HookWarning { .. } => {}
                 }
-                CycleEvent::Check(evt) => {
-                    format_check_progress(evt);
-                }
-            },
-            Some(&mut before_step),
-            Some(&mut after_step),
-        );
+            });
 
         // Ensure renderer is cleaned up if cycle ended abruptly (e.g. shutdown).
         if let Some(ref mut r) = backup_renderer {
@@ -294,12 +259,14 @@ fn format_check_progress(event: &commands::check::CheckProgressEvent) {
 /// Returns `Ok(had_partial)` — `true` if backup had soft errors but still succeeded.
 pub(crate) fn dispatch_command(
     command: &Commands,
-    cfg: &VykarConfig,
-    label: Option<&str>,
-    sources: &[SourceEntry],
+    repo: &ResolvedRepo,
     shutdown: Option<&AtomicBool>,
     verbose: u8,
 ) -> Result<bool, Box<dyn std::error::Error>> {
+    let cfg = &repo.config;
+    let label = repo.label.as_deref();
+    let sources = &repo.sources;
+
     match command {
         Commands::Init { .. } => cmd::init::run_init(cfg, label).map(|()| false),
         Commands::Backup {
@@ -310,13 +277,11 @@ pub(crate) fn dispatch_command(
             paths,
             ..
         } => cmd::backup::run_backup(
-            cfg,
-            label,
+            repo,
             user_label.clone(),
             compression.clone(),
             connections.map(|v| v as usize),
             paths.clone(),
-            sources,
             source,
             shutdown,
             verbose,

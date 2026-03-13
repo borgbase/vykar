@@ -182,20 +182,9 @@ fn run_backup_cycle(repos: &[ResolvedRepo]) {
             }
         }
 
-        let label = repo.label.as_deref();
-        let cfg = &repo.config;
-        warn_if_untrusted_rest(cfg, label);
+        warn_if_untrusted_rest(&repo.config, repo.label.as_deref());
 
-        match run_default_actions(
-            cfg,
-            label,
-            &repo.sources,
-            &repo.global_hooks,
-            &repo.repo_hooks,
-            &repo.label,
-            Some(&SHUTDOWN),
-            0,
-        ) {
+        match run_default_actions(repo, Some(&SHUTDOWN), 0) {
             Ok(partial) => {
                 if partial {
                     tracing::warn!(repo = name, "backup cycle partial: some files were skipped");

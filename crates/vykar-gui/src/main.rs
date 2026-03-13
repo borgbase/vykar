@@ -1946,8 +1946,7 @@ fn run_worker(
                     let ui_tx_progress = ui_tx.clone();
                     let rn = repo_name.clone();
                     let result = operations::run_full_cycle_for_repo(
-                        &repo.config,
-                        &repo.sources,
+                        repo,
                         passphrase.as_deref().map(|s| s.as_str()),
                         Some(&cancel_requested),
                         &mut |event| match &event {
@@ -1966,10 +1965,14 @@ fn run_worker(
                                 let _ = ui_tx_progress
                                     .send(UiEvent::Status(format_check_status(&rn, evt)));
                             }
+                            operations::CycleEvent::HookWarning { warning, .. } => {
+                                send_log(
+                                    &ui_tx_progress,
+                                    format!("[{rn}] hook warning: {warning}"),
+                                );
+                            }
                             _ => {}
                         },
-                        None,
-                        None,
                     );
 
                     if let Some(ref report) = result.backup_report {
@@ -2041,16 +2044,22 @@ fn run_worker(
 
                 let mut tracker = BackupStatusTracker::new(rn.clone());
                 let ui_tx_progress = ui_tx.clone();
-                match operations::run_backup_for_repo_with_progress(
-                    &repo.config,
+                match operations::run_backup_selection(
+                    repo,
                     &repo.sources,
                     passphrase.as_deref().map(|s| s.as_str()),
-                    &mut |event| {
-                        if let Some(status) = tracker.format(&event) {
-                            let _ = ui_tx_progress.send(UiEvent::Status(status));
-                        }
-                    },
                     Some(&cancel_requested),
+                    false,
+                    Some(&mut |evt| match evt {
+                        operations::BackupRunEvent::Backup(bpe) => {
+                            if let Some(status) = tracker.format(&bpe) {
+                                let _ = ui_tx_progress.send(UiEvent::Status(status));
+                            }
+                        }
+                        operations::BackupRunEvent::HookWarning { warning, .. } => {
+                            send_log(&ui_tx_progress, format!("[{rn}] hook warning: {warning}"));
+                        }
+                    }),
                 ) {
                     Ok(report) => {
                         if !report.created.is_empty() {
@@ -2127,16 +2136,26 @@ fn run_worker(
 
                     let mut tracker = BackupStatusTracker::new(repo_name.clone());
                     let ui_tx_progress = ui_tx.clone();
-                    match operations::run_backup_for_repo_with_progress(
-                        &repo.config,
+                    let rn_src = repo_name.clone();
+                    match operations::run_backup_selection(
+                        repo,
                         &matching_sources,
                         passphrase.as_deref().map(|s| s.as_str()),
-                        &mut |event| {
-                            if let Some(status) = tracker.format(&event) {
-                                let _ = ui_tx_progress.send(UiEvent::Status(status));
-                            }
-                        },
                         Some(&cancel_requested),
+                        false,
+                        Some(&mut |evt| match evt {
+                            operations::BackupRunEvent::Backup(bpe) => {
+                                if let Some(status) = tracker.format(&bpe) {
+                                    let _ = ui_tx_progress.send(UiEvent::Status(status));
+                                }
+                            }
+                            operations::BackupRunEvent::HookWarning { warning, .. } => {
+                                send_log(
+                                    &ui_tx_progress,
+                                    format!("[{rn_src}] hook warning: {warning}"),
+                                );
+                            }
+                        }),
                     ) {
                         Ok(report) => {
                             if !report.created.is_empty() {

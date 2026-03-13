@@ -3,6 +3,7 @@ pub mod chunker;
 pub mod commands;
 pub mod compress;
 pub mod config;
+pub(crate) mod hooks;
 pub mod index;
 pub mod limits;
 pub mod platform;

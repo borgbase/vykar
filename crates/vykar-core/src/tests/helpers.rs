@@ -5,8 +5,8 @@ use crate::commands;
 use crate::compress::Compression;
 use crate::config::{
     ChunkerConfig, CompactConfig, CompressionConfig, EncryptionConfig, EncryptionModeConfig,
-    RepositoryConfig, ResourceLimitsConfig, RetentionConfig, RetryConfig, ScheduleConfig,
-    SourceEntry, SourceHooksConfig, VykarConfig, XattrsConfig,
+    HooksConfig, RepositoryConfig, ResolvedRepo, ResourceLimitsConfig, RetentionConfig,
+    RetryConfig, ScheduleConfig, SourceEntry, SourceHooksConfig, VykarConfig, XattrsConfig,
 };
 use crate::repo::Repository;
 use crate::snapshot::SnapshotStats;
@@ -85,6 +85,16 @@ pub fn source_entry(path: &Path, label: &str) -> SourceEntry {
         retention: None,
         repos: Vec::new(),
         command_dumps: Vec::new(),
+    }
+}
+
+pub fn resolved_repo(config: VykarConfig, sources: Vec<SourceEntry>) -> ResolvedRepo {
+    ResolvedRepo {
+        label: None,
+        config,
+        global_hooks: HooksConfig::default(),
+        repo_hooks: HooksConfig::default(),
+        sources,
     }
 }
 

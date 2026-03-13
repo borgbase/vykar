@@ -1,7 +1,7 @@
 use std::time::Duration;
 
-use vykar_core::config::{HooksConfig, SourceHooksConfig, HOOK_COMMANDS};
-use vykar_core::platform::shell;
+use crate::config::{HooksConfig, SourceHooksConfig, HOOK_COMMANDS};
+use crate::platform::shell;
 use vykar_types::error::{Result, VykarError};
 
 // ── Hook runner ──────────────────────────────────────────────────────────────
@@ -10,19 +10,27 @@ use vykar_types::error::{Result, VykarError};
 const HOOK_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Context passed to hook commands via environment variables and variable substitution.
-pub struct HookContext {
+pub(crate) struct HookContext {
     pub command: String,
     pub repository: String,
     pub label: Option<String>,
     pub error: Option<String>,
     pub source_label: Option<String>,
     pub source_paths: Option<Vec<String>>,
+    /// Accumulated non-fatal hook warnings. Callers drain after each hook call
+    /// to surface via events (GUI) or tracing (CLI). `log_hook_errors` always
+    /// fires `tracing::warn!` AND pushes here so no warning is ever lost.
+    pub(crate) warnings: Vec<String>,
 }
 
 /// Run before hooks for a command: global bare → repo bare → global specific → repo specific.
 ///
 /// Returns `Ok(())` on success, `Err` if any before hook fails.
-pub fn run_before(global: &HooksConfig, repo: &HooksConfig, ctx: &mut HookContext) -> Result<()> {
+pub(crate) fn run_before(
+    global: &HooksConfig,
+    repo: &HooksConfig,
+    ctx: &mut HookContext,
+) -> Result<()> {
     let before_key = format!("before_{}", ctx.command);
     run_hook_list(global.get_hooks("before"), ctx)?;
     run_hook_list(repo.get_hooks("before"), ctx)?;
@@ -36,7 +44,7 @@ pub fn run_before(global: &HooksConfig, repo: &HooksConfig, ctx: &mut HookContex
 /// On success: `after_<cmd>` then `after` (repo then global).
 /// On failure: `failed_<cmd>` then `failed` (repo then global).
 /// Hook failures are logged but don't affect the caller.
-pub fn run_after_or_failed(
+pub(crate) fn run_after_or_failed(
     global: &HooksConfig,
     repo: &HooksConfig,
     ctx: &mut HookContext,
@@ -45,28 +53,28 @@ pub fn run_after_or_failed(
     let cmd = &ctx.command.clone();
     if success {
         let after_key = format!("after_{cmd}");
-        log_hook_errors(run_hook_list(repo.get_hooks(&after_key), ctx));
-        log_hook_errors(run_hook_list(global.get_hooks(&after_key), ctx));
-        log_hook_errors(run_hook_list(repo.get_hooks("after"), ctx));
-        log_hook_errors(run_hook_list(global.get_hooks("after"), ctx));
+        log_hook_errors(run_hook_list(repo.get_hooks(&after_key), ctx), ctx);
+        log_hook_errors(run_hook_list(global.get_hooks(&after_key), ctx), ctx);
+        log_hook_errors(run_hook_list(repo.get_hooks("after"), ctx), ctx);
+        log_hook_errors(run_hook_list(global.get_hooks("after"), ctx), ctx);
     } else {
         let failed_key = format!("failed_{cmd}");
-        log_hook_errors(run_hook_list(repo.get_hooks(&failed_key), ctx));
-        log_hook_errors(run_hook_list(global.get_hooks(&failed_key), ctx));
-        log_hook_errors(run_hook_list(repo.get_hooks("failed"), ctx));
-        log_hook_errors(run_hook_list(global.get_hooks("failed"), ctx));
+        log_hook_errors(run_hook_list(repo.get_hooks(&failed_key), ctx), ctx);
+        log_hook_errors(run_hook_list(global.get_hooks(&failed_key), ctx), ctx);
+        log_hook_errors(run_hook_list(repo.get_hooks("failed"), ctx), ctx);
+        log_hook_errors(run_hook_list(global.get_hooks("failed"), ctx), ctx);
     }
 }
 
 /// Run finally hooks: repo specific → global specific → repo bare → global bare.
 ///
 /// Hook failures are logged but don't affect the caller.
-pub fn run_finally(global: &HooksConfig, repo: &HooksConfig, ctx: &mut HookContext) {
+pub(crate) fn run_finally(global: &HooksConfig, repo: &HooksConfig, ctx: &mut HookContext) {
     let finally_key = format!("finally_{}", ctx.command);
-    log_hook_errors(run_hook_list(repo.get_hooks(&finally_key), ctx));
-    log_hook_errors(run_hook_list(global.get_hooks(&finally_key), ctx));
-    log_hook_errors(run_hook_list(repo.get_hooks("finally"), ctx));
-    log_hook_errors(run_hook_list(global.get_hooks("finally"), ctx));
+    log_hook_errors(run_hook_list(repo.get_hooks(&finally_key), ctx), ctx);
+    log_hook_errors(run_hook_list(global.get_hooks(&finally_key), ctx), ctx);
+    log_hook_errors(run_hook_list(repo.get_hooks("finally"), ctx), ctx);
+    log_hook_errors(run_hook_list(global.get_hooks("finally"), ctx), ctx);
 }
 
 /// Run the full hook lifecycle around an action:
@@ -79,7 +87,7 @@ pub fn run_finally(global: &HooksConfig, repo: &HooksConfig, ctx: &mut HookConte
 ///
 /// `before` hook failure aborts the action and triggers `failed` + `finally`.
 /// `after` / `failed` / `finally` hook failures are logged but don't affect the result.
-pub fn run_with_hooks<F, T>(
+pub(crate) fn run_with_hooks<F, T>(
     global: &HooksConfig,
     repo: &HooksConfig,
     ctx: &mut HookContext,
@@ -220,20 +228,23 @@ fn source_paths_separator() -> &'static str {
 }
 
 /// Run source-level hooks (before/after/failed/finally) around an action.
-pub fn run_source_hooks<F, T>(
+///
+/// Error type is narrowed to `VykarError` since both hook errors and backup
+/// errors are `VykarError` when called from core's `run_backup_sources`.
+pub(crate) fn run_source_hooks<F, T>(
     hooks: &SourceHooksConfig,
     ctx: &mut HookContext,
     action: F,
-) -> std::result::Result<T, Box<dyn std::error::Error>>
+) -> Result<T>
 where
-    F: FnOnce() -> std::result::Result<T, Box<dyn std::error::Error>>,
+    F: FnOnce() -> Result<T>,
 {
     // 1. Run before hooks
     let before_result = run_hook_list(&hooks.before, ctx);
 
     let action_result = if let Err(e) = before_result {
         ctx.error = Some(e.to_string());
-        Err(e.into())
+        Err(e)
     } else {
         action()
     };
@@ -241,25 +252,27 @@ where
     // 2. After or Failed hooks
     match &action_result {
         Ok(_) => {
-            log_hook_errors(run_hook_list(&hooks.after, ctx));
+            log_hook_errors(run_hook_list(&hooks.after, ctx), ctx);
         }
         Err(e) => {
             if ctx.error.is_none() {
                 ctx.error = Some(e.to_string());
             }
-            log_hook_errors(run_hook_list(&hooks.failed, ctx));
+            log_hook_errors(run_hook_list(&hooks.failed, ctx), ctx);
         }
     }
 
     // 3. Finally hooks
-    log_hook_errors(run_hook_list(&hooks.finally, ctx));
+    log_hook_errors(run_hook_list(&hooks.finally, ctx), ctx);
 
     action_result
 }
 
-fn log_hook_errors(result: Result<()>) {
+fn log_hook_errors(result: Result<()>, ctx: &mut HookContext) {
     if let Err(e) = result {
-        tracing::warn!("Hook warning: {e}");
+        let msg = e.to_string();
+        tracing::warn!("Hook warning: {msg}");
+        ctx.warnings.push(msg);
     }
 }
 
@@ -276,6 +289,7 @@ mod tests {
             error: None,
             source_label: None,
             source_paths: None,
+            warnings: Vec::new(),
         }
     }
 
@@ -342,6 +356,7 @@ mod tests {
             error: Some("disk full".into()),
             source_label: Some("docs".into()),
             source_paths: Some(vec!["/home/user/docs".into()]),
+            warnings: Vec::new(),
         };
         let result = substitute_variables(
             "echo {command} {repository} {label} {error} {source_label} {source_path}",
@@ -362,6 +377,7 @@ mod tests {
             error: None,
             source_label: Some("default".into()),
             source_paths: Some(vec!["/home/user/docs".into(), "/home/user/photos".into()]),
+            warnings: Vec::new(),
         };
         let result = substitute_variables("paths={source_path}", &ctx);
         let expected_sep = if cfg!(windows) { ";" } else { ":" };
@@ -380,6 +396,7 @@ mod tests {
             error: None,
             source_label: None,
             source_paths: None,
+            warnings: Vec::new(),
         };
         let result = substitute_variables("cmd={command} label={label} err={error}", &ctx);
         assert_eq!(result, "cmd='backup' label='' err=''");

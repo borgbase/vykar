@@ -3,7 +3,6 @@ mod cmd;
 mod config_gen;
 mod dispatch;
 mod format;
-mod hooks;
 mod passphrase;
 mod progress;
 mod prompt;
@@ -15,9 +14,9 @@ use std::sync::atomic::Ordering;
 
 use clap::Parser;
 
+use vykar_core::app::operations;
 use vykar_core::config::{self, ResolvedRepo};
 
-use crate::hooks::HookContext;
 use crate::passphrase::with_repo_passphrase;
 
 use cli::{Cli, Commands};
@@ -335,40 +334,20 @@ fn probe_snapshot(
 /// Execute the CLI command (or default actions) against one repo.
 /// Returns `Ok(had_partial)` where `true` means backup had soft errors.
 fn run_repo_command(cli: &Cli, repo: &ResolvedRepo) -> Result<bool, Box<dyn std::error::Error>> {
-    let label = repo.label.as_deref();
-    let cfg = &repo.config;
-    warn_if_untrusted_rest(cfg, label);
-
-    let has_hooks = !repo.global_hooks.is_empty() || !repo.repo_hooks.is_empty();
-    let verbose = cli.verbose;
+    warn_if_untrusted_rest(&repo.config, repo.label.as_deref());
 
     let shutdown = Some(&signal::SHUTDOWN as &std::sync::atomic::AtomicBool);
     match &cli.command {
         Some(cmd) => {
-            let run_action = || dispatch_command(cmd, cfg, label, &repo.sources, shutdown, verbose);
-            if has_hooks {
-                let mut ctx = HookContext {
-                    command: cmd.name().to_string(),
-                    repository: cfg.repository.url.clone(),
-                    label: repo.label.clone(),
-                    error: None,
-                    source_label: None,
-                    source_paths: None,
-                };
-                hooks::run_with_hooks(&repo.global_hooks, &repo.repo_hooks, &mut ctx, run_action)
-            } else {
+            let run_action = || dispatch_command(cmd, repo, shutdown, cli.verbose);
+            if matches!(cmd, Commands::Backup { .. }) {
+                // Backup: hooks handled by run_backup_selection in core
                 run_action()
+            } else {
+                // Other commands: wrap with repo-level hooks via core
+                operations::run_command_with_hooks(repo, cmd.name(), run_action)
             }
         }
-        None => run_default_actions(
-            cfg,
-            label,
-            &repo.sources,
-            &repo.global_hooks,
-            &repo.repo_hooks,
-            &repo.label,
-            shutdown,
-            verbose,
-        ),
+        None => run_default_actions(repo, shutdown, cli.verbose),
     }
 }

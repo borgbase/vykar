@@ -1,71 +1,49 @@
 use std::io::IsTerminal;
 use std::sync::atomic::AtomicBool;
 
-use crate::hooks::{self, HookContext};
-use vykar_core::commands;
+use vykar_core::app::operations::{self, BackupRunEvent};
 use vykar_core::compress::Compression;
-use vykar_core::config::{self, SourceEntry, VykarConfig};
+use vykar_core::config::{self, CompressionAlgorithm, ResolvedRepo, SourceEntry};
 
-use crate::format::{format_bytes, generate_snapshot_name};
+use crate::format::format_bytes;
 use crate::passphrase::with_repo_passphrase;
 use crate::progress::BackupProgressRenderer;
-
-fn run_backup_operation(
-    config: &VykarConfig,
-    req: commands::backup::BackupRequest<'_>,
-    show_progress: bool,
-    verbose: u8,
-    shutdown: Option<&AtomicBool>,
-) -> Result<commands::backup::BackupOutcome, Box<dyn std::error::Error>> {
-    if !show_progress && verbose == 0 {
-        return commands::backup::run_with_progress(config, req, None, shutdown)
-            .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) });
-    }
-
-    let is_tty = std::io::stderr().is_terminal();
-    let mut renderer = BackupProgressRenderer::new(verbose, is_tty);
-    let mut on_progress = |event| renderer.on_event(event);
-    let result = commands::backup::run_with_progress(config, req, Some(&mut on_progress), shutdown);
-    renderer.finish();
-
-    result.map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })
-}
 
 /// Returns `Ok(true)` if the backup completed with partial success (some files skipped),
 /// `Ok(false)` for full success.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_backup(
-    config: &VykarConfig,
-    label: Option<&str>,
+    repo: &ResolvedRepo,
     user_label: Option<String>,
     compression_override: Option<String>,
     connections: Option<usize>,
     paths: Vec<String>,
-    sources: &[SourceEntry],
     source_filter: &[String],
     shutdown: Option<&AtomicBool>,
     verbose: u8,
 ) -> Result<bool, Box<dyn std::error::Error>> {
-    // Apply connections override before opening the repo
-    let config = if let Some(c) = connections {
-        let mut cfg = config.clone();
-        cfg.limits.connections = c;
-        cfg
-    } else {
-        config.clone()
-    };
-    let config = &config;
-
-    with_repo_passphrase(config, label, |passphrase| {
-        let user_label_str = user_label.as_deref().unwrap_or("");
-        let show_progress = std::io::stderr().is_terminal();
-
-        // Determine compression
-        let compression = if let Some(ref algo) = compression_override {
-            Compression::from_config(algo, config.compression.zstd_level)?
-        } else {
-            Compression::from_algorithm(config.compression.algorithm, config.compression.zstd_level)
+    // Clone repo and apply overrides
+    let mut repo = repo.clone();
+    if let Some(c) = connections {
+        repo.config.limits.connections = c;
+    }
+    if let Some(ref algo) = compression_override {
+        // Validate the compression string by trying to parse it
+        Compression::from_config(algo, repo.config.compression.zstd_level)?;
+        // Set on config so run_backup_sources uses it
+        repo.config.compression.algorithm = match algo.as_str() {
+            "none" => CompressionAlgorithm::None,
+            "lz4" => CompressionAlgorithm::Lz4,
+            "zstd" => CompressionAlgorithm::Zstd,
+            _ => return Err(format!("unsupported compression: {algo}").into()),
         };
+    }
+
+    let label = repo.label.as_deref();
+
+    with_repo_passphrase(&repo.config, label, |passphrase| {
+        let is_tty = std::io::stderr().is_terminal();
+        let show_progress = is_tty || verbose > 0;
 
         if !source_filter.is_empty() && !paths.is_empty() {
             return Err("cannot combine --source with ad-hoc paths".into());
@@ -75,122 +53,84 @@ pub(crate) fn run_backup(
             return Err("--label can only be used with ad-hoc paths".into());
         }
 
-        let mut had_partial = false;
-
-        if !paths.is_empty() {
-            // Ad-hoc paths mode: group all paths into a single snapshot
+        // Resolve sources — configured, filtered, or synthesized from ad-hoc paths
+        let sources: Vec<SourceEntry> = if !paths.is_empty() {
             let expanded: Vec<String> = paths.iter().map(|p| config::expand_tilde(p)).collect();
-            let source_label = if !user_label_str.is_empty() {
-                user_label_str.to_string()
+            let source_label = if let Some(ref lbl) = user_label {
+                lbl.clone()
             } else if expanded.len() == 1 {
                 config::label_from_path(&expanded[0])
             } else {
                 "adhoc".to_string()
             };
-            let name = generate_snapshot_name();
+            vec![SourceEntry {
+                paths: expanded,
+                label: source_label,
+                exclude: repo.config.exclude_patterns.clone(),
+                exclude_if_present: repo.config.exclude_if_present.clone(),
+                one_file_system: repo.config.one_file_system,
+                git_ignore: repo.config.git_ignore,
+                xattrs_enabled: repo.config.xattrs.enabled,
+                hooks: Default::default(),
+                retention: None,
+                repos: Vec::new(),
+                command_dumps: Vec::new(),
+            }]
+        } else if repo.sources.is_empty() {
+            return Err("no sources configured and no paths specified".into());
+        } else if !source_filter.is_empty() {
+            config::select_sources(&repo.sources, source_filter)
+                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?
+                .into_iter()
+                .cloned()
+                .collect()
+        } else {
+            repo.sources.clone()
+        };
 
-            let outcome = run_backup_operation(
-                config,
-                commands::backup::BackupRequest {
-                    snapshot_name: &name,
-                    passphrase,
-                    source_paths: &expanded,
-                    source_label: &source_label,
-                    exclude_patterns: &config.exclude_patterns,
-                    exclude_if_present: &config.exclude_if_present,
-                    one_file_system: config.one_file_system,
-                    git_ignore: config.git_ignore,
-                    xattrs_enabled: config.xattrs.enabled,
-                    compression,
-                    command_dumps: &[],
-                    verbose: verbose >= 1,
-                },
-                show_progress,
-                verbose,
-                shutdown,
-            )?;
+        // Delegate to core's hook-aware backup
+        let mut renderer = show_progress.then(|| BackupProgressRenderer::new(verbose, is_tty));
 
-            let stats = &outcome.stats;
-            if outcome.is_partial {
+        let result = operations::run_backup_selection(
+            &repo,
+            &sources,
+            passphrase,
+            shutdown,
+            verbose >= 1,
+            Some(&mut |evt| match evt {
+                BackupRunEvent::Backup(bpe) => {
+                    if let Some(ref mut r) = renderer {
+                        r.on_event(bpe);
+                    }
+                }
+                // HookWarning: no action — tracing::warn! already fired
+                BackupRunEvent::HookWarning { .. } => {}
+            }),
+        );
+
+        if let Some(ref mut r) = renderer {
+            r.finish();
+        }
+
+        let report = result.map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
+
+        let mut had_partial = false;
+        for created in &report.created {
+            let stats = &created.stats;
+            if stats.errors > 0 {
                 had_partial = true;
                 eprintln!(
                     "Warning: {} file(s) could not be read and were excluded from the snapshot",
                     stats.errors
                 );
             }
-
-            let paths_display = expanded.join(", ");
-            print_backup_summary(&name, &paths_display, &source_label, stats);
-        } else if sources.is_empty() {
-            return Err("no sources configured and no paths specified".into());
-        } else {
-            // Filter sources by --source if specified
-            let active_sources: Vec<&SourceEntry> = if source_filter.is_empty() {
-                sources.iter().collect()
-            } else {
-                config::select_sources(sources, source_filter)
-                    .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?
-            };
-
-            for source in &active_sources {
-                let name = generate_snapshot_name();
-
-                let has_source_hooks = !source.hooks.before.is_empty()
-                    || !source.hooks.after.is_empty()
-                    || !source.hooks.failed.is_empty()
-                    || !source.hooks.finally.is_empty();
-
-                let partial_flag = &mut had_partial;
-                let mut backup_action = || -> Result<(), Box<dyn std::error::Error>> {
-                    let outcome = run_backup_operation(
-                        config,
-                        commands::backup::BackupRequest {
-                            snapshot_name: &name,
-                            passphrase,
-                            source_paths: &source.paths,
-                            source_label: &source.label,
-                            exclude_patterns: &source.exclude,
-                            exclude_if_present: &source.exclude_if_present,
-                            one_file_system: source.one_file_system,
-                            git_ignore: source.git_ignore,
-                            xattrs_enabled: source.xattrs_enabled,
-                            compression,
-                            command_dumps: &source.command_dumps,
-                            verbose: verbose >= 1,
-                        },
-                        show_progress,
-                        verbose,
-                        shutdown,
-                    )?;
-
-                    let stats = &outcome.stats;
-                    if outcome.is_partial {
-                        *partial_flag = true;
-                        eprintln!(
-                            "Warning: {} file(s) could not be read and were excluded from the snapshot",
-                            stats.errors
-                        );
-                    }
-
-                    let paths_display = source.paths.join(", ");
-                    print_backup_summary(&name, &paths_display, &source.label, stats);
-                    Ok(())
-                };
-
-                if has_source_hooks {
-                    let mut ctx = HookContext {
-                        command: "backup".to_string(),
-                        repository: config.repository.url.clone(),
-                        label: label.map(|s| s.to_string()),
-                        error: None,
-                        source_label: Some(source.label.clone()),
-                        source_paths: Some(source.paths.clone()),
-                    };
-                    hooks::run_source_hooks(&source.hooks, &mut ctx, backup_action)?;
-                } else {
-                    backup_action()?;
-                }
-            }
+            let paths_display = created.source_paths.join(", ");
+            print_backup_summary(
+                &created.snapshot_name,
+                &paths_display,
+                &created.source_label,
+                stats,
+            );
         }
 
         Ok(had_partial)

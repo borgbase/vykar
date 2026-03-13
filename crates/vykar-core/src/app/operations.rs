@@ -23,17 +23,27 @@ pub struct BackupRunReport {
 }
 
 #[derive(Debug, Clone)]
-pub struct RepoBackupRunReport {
-    pub repo_label: Option<String>,
-    pub repository_url: String,
-    pub report: BackupRunReport,
-}
-
-#[derive(Debug, Clone)]
 pub struct RestoreRequest {
     pub snapshot_name: String,
     pub destination: String,
     pub pattern: Option<String>,
+}
+
+// ── Hook-aware backup event types ─────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub enum HookScope {
+    Repo,
+    Source { label: String },
+}
+
+/// Events from a hook-aware backup run (backup-only path).
+#[derive(Debug, Clone)]
+pub enum BackupRunEvent {
+    /// Pure backup engine event (files, stats, sources).
+    Backup(commands::backup::BackupProgressEvent),
+    /// A non-fatal hook failure (tracing::warn! already fired — this adds GUI visibility).
+    HookWarning { scope: HookScope, warning: String },
 }
 
 // ── Full-cycle types ────────────────────────────────────────────────────────
@@ -86,6 +96,12 @@ pub enum CycleEvent {
     StepFinished(CycleStep, StepOutcome),
     Backup(commands::backup::BackupProgressEvent),
     Check(commands::check::CheckProgressEvent),
+    /// Non-fatal hook failure (tracing::warn! already fired — this adds GUI visibility).
+    HookWarning {
+        step: CycleStep,
+        scope: HookScope,
+        warning: String,
+    },
 }
 
 pub struct FullCycleResult {
@@ -118,20 +134,18 @@ fn generate_snapshot_name() -> String {
     hex::encode(buf)
 }
 
-pub fn run_backup_for_repo(
-    config: &VykarConfig,
-    sources: &[SourceEntry],
-    passphrase: Option<&str>,
-) -> Result<BackupRunReport> {
-    run_backup_for_repo_with_progress(config, sources, passphrase, &mut |_| {}, None)
-}
+// ── Internal: source iteration + source hooks ─────────────────────────────
 
-pub fn run_backup_for_repo_with_progress(
+/// Run backup for each source, executing source-level hooks.
+/// Emits BackupRunEvent for progress and hook lifecycle.
+fn run_backup_sources(
     config: &VykarConfig,
     sources: &[SourceEntry],
     passphrase: Option<&str>,
-    progress: &mut dyn FnMut(commands::backup::BackupProgressEvent),
+    repo_label: Option<&str>,
     shutdown: Option<&AtomicBool>,
+    verbose: bool,
+    on_event: &mut Option<&mut dyn FnMut(BackupRunEvent)>,
 ) -> Result<BackupRunReport> {
     if sources.is_empty() {
         return Err(VykarError::Config(
@@ -146,9 +160,9 @@ pub fn run_backup_for_repo_with_progress(
 
     for source in sources {
         let snapshot_name = generate_snapshot_name();
-        let outcome = commands::backup::run_with_progress(
-            config,
-            commands::backup::BackupRequest {
+
+        let run_backup = |on_event: &mut Option<&mut dyn FnMut(BackupRunEvent)>| -> Result<_> {
+            let req = commands::backup::BackupRequest {
                 snapshot_name: &snapshot_name,
                 passphrase,
                 source_paths: &source.paths,
@@ -160,11 +174,43 @@ pub fn run_backup_for_repo_with_progress(
                 xattrs_enabled: source.xattrs_enabled,
                 compression,
                 command_dumps: &source.command_dumps,
-                verbose: false,
-            },
-            Some(progress),
-            shutdown,
-        )?;
+                verbose,
+            };
+
+            if let Some(ref mut cb) = on_event {
+                let mut backup_cb = |bpe| {
+                    cb(BackupRunEvent::Backup(bpe));
+                };
+                commands::backup::run_with_progress(config, req, Some(&mut backup_cb), shutdown)
+            } else {
+                commands::backup::run_with_progress(config, req, None, shutdown)
+            }
+        };
+
+        let outcome = if source.hooks.has_any() {
+            let mut ctx = crate::hooks::HookContext {
+                command: "backup".to_string(),
+                repository: config.repository.url.clone(),
+                label: repo_label.map(|s| s.to_string()),
+                error: None,
+                source_label: Some(source.label.clone()),
+                source_paths: Some(source.paths.clone()),
+                warnings: Vec::new(),
+            };
+            let scope = HookScope::Source {
+                label: source.label.clone(),
+            };
+
+            let result =
+                crate::hooks::run_source_hooks(&source.hooks, &mut ctx, || run_backup(on_event));
+
+            // Drain accumulated warnings into events (tracing already fired)
+            drain_backup_warnings(&mut ctx, on_event, &scope);
+
+            result?
+        } else {
+            run_backup(on_event)?
+        };
 
         report.created.push(BackupSourceResult {
             source_label: source.label.clone(),
@@ -177,22 +223,132 @@ pub fn run_backup_for_repo_with_progress(
     Ok(report)
 }
 
-/// Run the full backup cycle: backup → prune → compact → check.
-///
-/// - `before_step`: Called before each step. Return `Ok(())` to proceed,
-///   `Err(reason)` to mark the step as Failed (e.g. hook failure).
-/// - `after_step`: Called after each step with its outcome.
-/// - `on_event`: Progress/lifecycle events for UI updates.
-#[allow(clippy::too_many_arguments, clippy::type_complexity)]
-pub fn run_full_cycle_for_repo(
-    config: &VykarConfig,
+/// Drain accumulated warnings from HookContext into BackupRunEvent.
+fn drain_backup_warnings(
+    ctx: &mut crate::hooks::HookContext,
+    on_event: &mut Option<&mut dyn FnMut(BackupRunEvent)>,
+    scope: &HookScope,
+) {
+    if let Some(ref mut cb) = on_event {
+        for warning in ctx.warnings.drain(..) {
+            cb(BackupRunEvent::HookWarning {
+                scope: scope.clone(),
+                warning,
+            });
+        }
+    }
+}
+
+// ── Public hook-aware backup API ──────────────────────────────────────────
+
+/// Run backup with full hook lifecycle (repo + source hooks).
+/// Used by: CLI `vykar backup`, GUI RunBackupRepo, GUI RunBackupSource.
+pub fn run_backup_selection(
+    repo: &ResolvedRepo,
     sources: &[SourceEntry],
     passphrase: Option<&str>,
     shutdown: Option<&AtomicBool>,
+    verbose: bool,
+    on_event: Option<&mut dyn FnMut(BackupRunEvent)>,
+) -> Result<BackupRunReport> {
+    let config = &repo.config;
+    let label = repo.label.as_deref();
+    let has_hooks = !repo.global_hooks.is_empty() || !repo.repo_hooks.is_empty();
+    let mut on_event = on_event;
+
+    if !has_hooks {
+        return run_backup_sources(
+            config,
+            sources,
+            passphrase,
+            label,
+            shutdown,
+            verbose,
+            &mut on_event,
+        );
+    }
+
+    let mut ctx = crate::hooks::HookContext {
+        command: "backup".to_string(),
+        repository: config.repository.url.clone(),
+        label: repo.label.clone(),
+        error: None,
+        source_label: None,
+        source_paths: None,
+        warnings: Vec::new(),
+    };
+
+    // 1. Before hooks (fatal — run_before returns Err on failure)
+    if let Err(e) = crate::hooks::run_before(&repo.global_hooks, &repo.repo_hooks, &mut ctx) {
+        ctx.error = Some(e.to_string());
+        crate::hooks::run_after_or_failed(&repo.global_hooks, &repo.repo_hooks, &mut ctx, false);
+        crate::hooks::run_finally(&repo.global_hooks, &repo.repo_hooks, &mut ctx);
+        drain_backup_warnings(&mut ctx, &mut on_event, &HookScope::Repo);
+        return Err(e);
+    }
+    drain_backup_warnings(&mut ctx, &mut on_event, &HookScope::Repo);
+
+    // 2. Backup (source hooks handled inside run_backup_sources)
+    let result = run_backup_sources(
+        config,
+        sources,
+        passphrase,
+        label,
+        shutdown,
+        verbose,
+        &mut on_event,
+    );
+
+    // 3. After/Failed + Finally
+    let success = result.is_ok();
+    if let Err(ref e) = result {
+        if ctx.error.is_none() {
+            ctx.error = Some(e.to_string());
+        }
+    }
+    crate::hooks::run_after_or_failed(&repo.global_hooks, &repo.repo_hooks, &mut ctx, success);
+    crate::hooks::run_finally(&repo.global_hooks, &repo.repo_hooks, &mut ctx);
+    drain_backup_warnings(&mut ctx, &mut on_event, &HookScope::Repo);
+
+    result
+}
+
+// ── Public hook wrapper for CLI standalone commands ───────────────────────
+
+/// Wrap an action with repo-level hooks. For CLI standalone commands
+/// (prune, compact, check) that aren't part of the full cycle.
+pub fn run_command_with_hooks<F, T>(
+    repo: &ResolvedRepo,
+    command: &str,
+    action: F,
+) -> std::result::Result<T, Box<dyn std::error::Error>>
+where
+    F: FnOnce() -> std::result::Result<T, Box<dyn std::error::Error>>,
+{
+    let mut ctx = crate::hooks::HookContext {
+        command: command.to_string(),
+        repository: repo.config.repository.url.clone(),
+        label: repo.label.clone(),
+        error: None,
+        source_label: None,
+        source_paths: None,
+        warnings: Vec::new(),
+    };
+    crate::hooks::run_with_hooks(&repo.global_hooks, &repo.repo_hooks, &mut ctx, action)
+}
+
+// ── Full-cycle with internalized hooks ───────────────────────────────────
+
+/// Run the full backup cycle: backup → prune → compact → check.
+/// Hooks are run internally — callers don't need to handle them.
+pub fn run_full_cycle_for_repo(
+    repo: &ResolvedRepo,
+    passphrase: Option<&str>,
+    shutdown: Option<&AtomicBool>,
     on_event: &mut dyn FnMut(CycleEvent),
-    before_step: Option<&mut dyn FnMut(CycleStep) -> std::result::Result<(), String>>,
-    after_step: Option<&mut dyn FnMut(CycleStep, &StepOutcome)>,
 ) -> FullCycleResult {
+    let config = &repo.config;
+    let sources = &repo.sources;
     let shutting_down = |s: Option<&AtomicBool>| s.is_some_and(|f| f.load(Ordering::SeqCst));
 
     let mut steps: Vec<(CycleStep, StepOutcome)> = Vec::new();
@@ -201,80 +357,41 @@ pub fn run_full_cycle_for_repo(
     let mut compact_stats: Option<commands::compact::CompactStats> = None;
     let mut check_result: Option<commands::check::CheckResult> = None;
 
-    // We need mutable access to both callbacks but they're behind Option.
-    // Use a helper to split mutable borrows.
-    let (before_step, after_step) = {
-        // Convert Option<&mut dyn ...> to raw pointers for split borrowing.
-        // This is safe because we never hold both references simultaneously.
-        (
-            before_step.map(|b| b as *mut dyn FnMut(CycleStep) -> std::result::Result<(), String>),
-            after_step.map(|a| a as *mut dyn FnMut(CycleStep, &StepOutcome)),
-        )
-    };
-
-    macro_rules! call_before {
-        ($step:expr) => {
-            if let Some(ptr) = before_step {
-                // SAFETY: we never alias these pointers; only one is called at a time.
-                match unsafe { (*ptr)($step) } {
-                    Ok(()) => true,
-                    Err(reason) => {
-                        let outcome = StepOutcome::Failed(reason);
-                        on_event(CycleEvent::StepFinished($step, outcome.clone()));
-                        if let Some(ptr) = after_step {
-                            unsafe { (*ptr)($step, &outcome) };
-                        }
-                        steps.push(($step, outcome));
-                        false
-                    }
-                }
-            } else {
-                true
-            }
-        };
-    }
-
-    macro_rules! call_after {
-        ($step:expr, $outcome:expr) => {
-            if let Some(ptr) = after_step {
-                unsafe { (*ptr)($step, $outcome) };
-            }
-        };
-    }
-
     // 1. Backup
     if !shutting_down(shutdown) {
-        let step = CycleStep::Backup;
-        on_event(CycleEvent::StepStarted(step));
-
-        if call_before!(step) {
-            match run_backup_for_repo_with_progress(
-                config,
-                sources,
-                passphrase,
-                &mut |evt| on_event(CycleEvent::Backup(evt)),
-                shutdown,
-            ) {
-                Ok(report) => {
-                    let has_errors = report.created.iter().any(|s| s.stats.errors > 0);
-                    let outcome = if has_errors {
-                        StepOutcome::Partial
-                    } else {
-                        StepOutcome::Ok
-                    };
-                    on_event(CycleEvent::StepFinished(step, outcome.clone()));
-                    call_after!(step, &outcome);
-                    steps.push((step, outcome));
-                    backup_report = Some(report);
+        backup_report = run_hooked_step(
+            CycleStep::Backup,
+            repo,
+            on_event,
+            &mut steps,
+            |evt| {
+                run_backup_sources(
+                    config,
+                    sources,
+                    passphrase,
+                    repo.label.as_deref(),
+                    shutdown,
+                    false,
+                    &mut Some(&mut |bpe: BackupRunEvent| match bpe {
+                        BackupRunEvent::Backup(e) => evt(CycleEvent::Backup(e)),
+                        BackupRunEvent::HookWarning { scope, warning } => {
+                            evt(CycleEvent::HookWarning {
+                                step: CycleStep::Backup,
+                                scope,
+                                warning,
+                            });
+                        }
+                    }),
+                )
+            },
+            |report| {
+                if report.created.iter().any(|s| s.stats.errors > 0) {
+                    StepOutcome::Partial
+                } else {
+                    StepOutcome::Ok
                 }
-                Err(e) => {
-                    let outcome = StepOutcome::Failed(e.to_string());
-                    on_event(CycleEvent::StepFinished(step, outcome.clone()));
-                    call_after!(step, &outcome);
-                    steps.push((step, outcome));
-                }
-            }
-        }
+            },
+        );
     }
 
     let backup_ok = steps
@@ -283,113 +400,79 @@ pub fn run_full_cycle_for_repo(
 
     // 2. Prune
     if !shutting_down(shutdown) {
-        let step = CycleStep::Prune;
         let has_retention = config.retention.has_any_rule()
             || sources
                 .iter()
                 .any(|s| s.retention.as_ref().is_some_and(|r| r.has_any_rule()));
 
         if !has_retention {
-            let outcome = StepOutcome::Skipped("no retention rules".into());
-            on_event(CycleEvent::StepStarted(step));
-            on_event(CycleEvent::StepFinished(step, outcome.clone()));
-            steps.push((step, outcome));
+            emit_skipped(CycleStep::Prune, "no retention rules", on_event, &mut steps);
         } else if !backup_ok {
-            let outcome = StepOutcome::Skipped("backup failed".into());
-            on_event(CycleEvent::StepStarted(step));
-            on_event(CycleEvent::StepFinished(step, outcome.clone()));
-            steps.push((step, outcome));
+            emit_skipped(CycleStep::Prune, "backup failed", on_event, &mut steps);
         } else {
-            on_event(CycleEvent::StepStarted(step));
-            if call_before!(step) {
-                match commands::prune::run(config, passphrase, false, false, sources, &[], shutdown)
-                {
-                    Ok((stats, _list_entries)) => {
-                        prune_stats = Some(stats);
-                        let outcome = StepOutcome::Ok;
-                        on_event(CycleEvent::StepFinished(step, outcome.clone()));
-                        call_after!(step, &outcome);
-                        steps.push((step, outcome));
-                    }
-                    Err(e) => {
-                        let outcome = StepOutcome::Failed(e.to_string());
-                        on_event(CycleEvent::StepFinished(step, outcome.clone()));
-                        call_after!(step, &outcome);
-                        steps.push((step, outcome));
-                    }
-                }
-            }
+            prune_stats = run_hooked_step(
+                CycleStep::Prune,
+                repo,
+                on_event,
+                &mut steps,
+                |_evt| {
+                    commands::prune::run(config, passphrase, false, false, sources, &[], shutdown)
+                        .map(|(stats, _)| stats)
+                },
+                |_| StepOutcome::Ok,
+            );
         }
     }
 
     // 3. Compact
     if !shutting_down(shutdown) {
-        let step = CycleStep::Compact;
         if !backup_ok {
-            let outcome = StepOutcome::Skipped("backup failed".into());
-            on_event(CycleEvent::StepStarted(step));
-            on_event(CycleEvent::StepFinished(step, outcome.clone()));
-            steps.push((step, outcome));
+            emit_skipped(CycleStep::Compact, "backup failed", on_event, &mut steps);
         } else {
-            on_event(CycleEvent::StepStarted(step));
-            if call_before!(step) {
-                match commands::compact::run(
-                    config,
-                    passphrase,
-                    config.compact.threshold,
-                    None,
-                    false,
-                    shutdown,
-                ) {
-                    Ok(stats) => {
-                        compact_stats = Some(stats);
-                        let outcome = StepOutcome::Ok;
-                        on_event(CycleEvent::StepFinished(step, outcome.clone()));
-                        call_after!(step, &outcome);
-                        steps.push((step, outcome));
-                    }
-                    Err(e) => {
-                        let outcome = StepOutcome::Failed(e.to_string());
-                        on_event(CycleEvent::StepFinished(step, outcome.clone()));
-                        call_after!(step, &outcome);
-                        steps.push((step, outcome));
-                    }
-                }
-            }
+            compact_stats = run_hooked_step(
+                CycleStep::Compact,
+                repo,
+                on_event,
+                &mut steps,
+                |_evt| {
+                    commands::compact::run(
+                        config,
+                        passphrase,
+                        config.compact.threshold,
+                        None,
+                        false,
+                        shutdown,
+                    )
+                },
+                |_| StepOutcome::Ok,
+            );
         }
     }
 
     // 4. Check (metadata-only)
     if !shutting_down(shutdown) {
-        let step = CycleStep::Check;
-        on_event(CycleEvent::StepStarted(step));
-        if call_before!(step) {
-            match commands::check::run_with_progress(
-                config,
-                passphrase,
-                false,
-                false,
-                Some(&mut |evt| on_event(CycleEvent::Check(evt))),
-            ) {
-                Ok(result) => {
-                    let outcome = if result.errors.is_empty() {
-                        StepOutcome::Ok
-                    } else {
-                        StepOutcome::Failed(format!("check found {} error(s)", result.errors.len()))
-                    };
-                    check_result = Some(result);
-                    on_event(CycleEvent::StepFinished(step, outcome.clone()));
-                    call_after!(step, &outcome);
-                    steps.push((step, outcome));
+        check_result = run_hooked_step(
+            CycleStep::Check,
+            repo,
+            on_event,
+            &mut steps,
+            |evt| {
+                commands::check::run_with_progress(
+                    config,
+                    passphrase,
+                    false,
+                    false,
+                    Some(&mut |check_evt| evt(CycleEvent::Check(check_evt))),
+                )
+            },
+            |result| {
+                if result.errors.is_empty() {
+                    StepOutcome::Ok
+                } else {
+                    StepOutcome::Failed(format!("check found {} error(s)", result.errors.len()))
                 }
-                Err(e) => {
-                    let outcome = StepOutcome::Failed(e.to_string());
-                    on_event(CycleEvent::StepFinished(step, outcome.clone()));
-                    call_after!(step, &outcome);
-                    steps.push((step, outcome));
-                }
-            }
-        }
+            },
+        );
     }
 
     FullCycleResult {
@@ -401,22 +484,100 @@ pub fn run_full_cycle_for_repo(
     }
 }
 
-pub fn run_backup_for_all_repos(
-    repos: &[ResolvedRepo],
-    passphrase_lookup: &mut dyn FnMut(&ResolvedRepo) -> Result<Option<String>>,
-) -> Result<Vec<RepoBackupRunReport>> {
-    let mut reports = Vec::with_capacity(repos.len());
-    for repo in repos {
-        let passphrase = passphrase_lookup(repo)?;
-        let report = run_backup_for_repo(&repo.config, &repo.sources, passphrase.as_deref())?;
-        reports.push(RepoBackupRunReport {
-            repo_label: repo.label.clone(),
-            repository_url: repo.config.repository.url.clone(),
-            report,
+/// Run a single cycle step with the full hook lifecycle.
+/// Returns Some(value) on success/partial, None on failure or before-hook abort.
+fn run_hooked_step<T>(
+    step: CycleStep,
+    repo: &ResolvedRepo,
+    on_event: &mut dyn FnMut(CycleEvent),
+    steps: &mut Vec<(CycleStep, StepOutcome)>,
+    action: impl FnOnce(&mut dyn FnMut(CycleEvent)) -> Result<T>,
+    classify: impl FnOnce(&T) -> StepOutcome,
+) -> Option<T> {
+    let has_hooks = !repo.global_hooks.is_empty() || !repo.repo_hooks.is_empty();
+    let mut hook_ctx = has_hooks.then(|| crate::hooks::HookContext {
+        command: step.command_name().to_string(),
+        repository: repo.config.repository.url.clone(),
+        label: repo.label.clone(),
+        error: None,
+        source_label: None,
+        source_paths: None,
+        warnings: Vec::new(),
+    });
+
+    on_event(CycleEvent::StepStarted(step));
+
+    // Before hooks (fatal — abort step on failure)
+    if let Some(ref mut ctx) = hook_ctx {
+        if let Err(e) = crate::hooks::run_before(&repo.global_hooks, &repo.repo_hooks, ctx) {
+            ctx.error = Some(e.to_string());
+            crate::hooks::run_after_or_failed(&repo.global_hooks, &repo.repo_hooks, ctx, false);
+            crate::hooks::run_finally(&repo.global_hooks, &repo.repo_hooks, ctx);
+            drain_cycle_warnings(ctx, step, on_event);
+            let outcome = StepOutcome::Failed(e.to_string());
+            on_event(CycleEvent::StepFinished(step, outcome.clone()));
+            steps.push((step, outcome));
+            return None;
+        }
+        drain_cycle_warnings(ctx, step, on_event);
+    }
+
+    // Action
+    let result = action(on_event);
+
+    // Classify outcome + After/Failed/Finally hooks
+    let (outcome, value) = match result {
+        std::result::Result::Ok(val) => {
+            let o = classify(&val);
+            (o, Some(val))
+        }
+        Err(e) => (StepOutcome::Failed(e.to_string()), None),
+    };
+
+    if let Some(ref mut ctx) = hook_ctx {
+        let success = outcome.is_success();
+        if let Some(msg) = outcome.error_msg() {
+            if ctx.error.is_none() {
+                ctx.error = Some(msg.to_string());
+            }
+        }
+        crate::hooks::run_after_or_failed(&repo.global_hooks, &repo.repo_hooks, ctx, success);
+        crate::hooks::run_finally(&repo.global_hooks, &repo.repo_hooks, ctx);
+        drain_cycle_warnings(ctx, step, on_event);
+    }
+
+    on_event(CycleEvent::StepFinished(step, outcome.clone()));
+    steps.push((step, outcome));
+    value
+}
+
+fn emit_skipped(
+    step: CycleStep,
+    reason: &str,
+    on_event: &mut dyn FnMut(CycleEvent),
+    steps: &mut Vec<(CycleStep, StepOutcome)>,
+) {
+    let outcome = StepOutcome::Skipped(reason.into());
+    on_event(CycleEvent::StepStarted(step));
+    on_event(CycleEvent::StepFinished(step, outcome.clone()));
+    steps.push((step, outcome));
+}
+
+fn drain_cycle_warnings(
+    ctx: &mut crate::hooks::HookContext,
+    step: CycleStep,
+    on_event: &mut dyn FnMut(CycleEvent),
+) {
+    for warning in ctx.warnings.drain(..) {
+        on_event(CycleEvent::HookWarning {
+            step,
+            scope: HookScope::Repo,
+            warning,
         });
     }
-    Ok(reports)
 }
+
+// ── Remaining public APIs (unchanged) ────────────────────────────────────
 
 pub fn list_snapshots(
     config: &VykarConfig,

@@ -400,6 +400,14 @@ slint::slint! {
         paths: string,
         excludes: string,
         target_repos: string,
+        expanded: bool,
+        detail_paths: string,
+        detail_excludes: string,
+        detail_exclude_if_present: string,
+        detail_flags: string,
+        detail_hooks: string,
+        detail_retention: string,
+        detail_command_dumps: string,
     }
 
     // check_state: 0=unchecked, 1=checked, 2=partial
@@ -740,6 +748,7 @@ slint::slint! {
         callback reload_config_clicked();
         callback backup_repo_clicked(/* index */ int);
         callback backup_source_clicked(/* index */ int);
+        callback toggle_source_expanded(/* index */ int);
         callback refresh_snapshots_clicked();
         callback restore_selected_snapshot_clicked(/* row */ int);
         callback delete_selected_snapshot_clicked(/* row */ int);
@@ -877,26 +886,101 @@ slint::slint! {
                         ListView {
                             vertical-stretch: 1;
                             for source[idx] in root.source_model: GroupBox {
-                                HorizontalLayout {
-                                    padding: 8px;
-                                    spacing: 16px;
-                                    VerticalLayout {
-                                        horizontal-stretch: 1;
-                                        min-width: 350px;
-                                        spacing: 4px;
-                                        Text { text: source.label; font-weight: 700; }
-                                        Text { text: source.paths; color: #888888; font-size: 11px; overflow: elide; }
+                                VerticalLayout {
+                                    spacing: 0px;
+                                    // Header row — always visible
+                                    HorizontalLayout {
+                                        padding: 8px;
+                                        spacing: 16px;
+                                        TouchArea {
+                                            horizontal-stretch: 1;
+                                            mouse-cursor: pointer;
+                                            clicked => { root.toggle_source_expanded(idx); }
+                                            HorizontalLayout {
+                                                spacing: 12px;
+                                                // Chevron
+                                                Text {
+                                                    text: source.expanded ? "v" : ">";
+                                                    vertical-alignment: center;
+                                                    font-size: 11px;
+                                                    width: 14px;
+                                                    color: #888888;
+                                                }
+                                                VerticalLayout {
+                                                    horizontal-stretch: 1;
+                                                    spacing: 4px;
+                                                    Text { text: source.label; font-weight: 700; }
+                                                    if !source.expanded: Text { text: source.paths; color: #888888; font-size: 11px; overflow: elide; }
+                                                }
+                                                if !source.expanded: VerticalLayout {
+                                                    horizontal-stretch: 0;
+                                                    min-width: 200px;
+                                                    max-width: 350px;
+                                                    spacing: 4px;
+                                                    Text { text: "Excludes: " + source.excludes; font-size: 11px; overflow: elide; }
+                                                    Text { text: "Repos: " + source.target_repos; font-size: 11px; color: #888888; }
+                                                }
+                                            }
+                                        }
+                                        VerticalLayout {
+                                            alignment: center;
+                                            Button { text: "Backup"; primary: true; enabled: !root.operation_busy; clicked => { root.backup_source_clicked(idx); } }
+                                        }
                                     }
-                                    VerticalLayout {
-                                        horizontal-stretch: 0;
-                                        min-width: 250px;
-                                        spacing: 4px;
-                                        Text { text: "Excludes: " + source.excludes; font-size: 11px; overflow: elide; }
-                                        Text { text: "Repos: " + source.target_repos; font-size: 11px; color: #888888; }
-                                    }
-                                    VerticalLayout {
-                                        alignment: center;
-                                        Button { text: "Backup"; primary: true; enabled: !root.operation_busy; clicked => { root.backup_source_clicked(idx); } }
+                                    // Expanded detail section
+                                    if source.expanded: VerticalLayout {
+                                        padding-left: 42px;
+                                        padding-right: 8px;
+                                        padding-bottom: 8px;
+                                        spacing: 6px;
+                                        // Folders
+                                        VerticalLayout {
+                                            spacing: 2px;
+                                            Text { text: "Folders"; font-weight: 700; font-size: 11px; color: #888888; }
+                                            Text { text: source.detail_paths; font-size: 11px; wrap: word-wrap; }
+                                        }
+                                        // Exclusions
+                                        if source.detail_excludes != "": VerticalLayout {
+                                            spacing: 2px;
+                                            Text { text: "Exclusions"; font-weight: 700; font-size: 11px; color: #888888; }
+                                            Text { text: source.detail_excludes; font-size: 11px; wrap: word-wrap; }
+                                        }
+                                        // Exclude-If-Present
+                                        if source.detail_exclude_if_present != "": VerticalLayout {
+                                            spacing: 2px;
+                                            Text { text: "Exclude If Present"; font-weight: 700; font-size: 11px; color: #888888; }
+                                            Text { text: source.detail_exclude_if_present; font-size: 11px; wrap: word-wrap; }
+                                        }
+                                        // Options (flags)
+                                        if source.detail_flags != "": VerticalLayout {
+                                            spacing: 2px;
+                                            Text { text: "Options"; font-weight: 700; font-size: 11px; color: #888888; }
+                                            Text { text: source.detail_flags; font-size: 11px; }
+                                        }
+                                        // Target Repositories
+                                        VerticalLayout {
+                                            spacing: 2px;
+                                            Text { text: "Target Repositories"; font-weight: 700; font-size: 11px; color: #888888; }
+                                            Text { text: source.target_repos; font-size: 11px; }
+                                        }
+                                        // Command Dumps
+                                        if source.detail_command_dumps != "": VerticalLayout {
+                                            spacing: 2px;
+                                            Text { text: "Command Dumps"; font-weight: 700; font-size: 11px; color: #888888; }
+                                            Text { text: source.detail_command_dumps; font-size: 11px; wrap: word-wrap; }
+                                        }
+                                        // Hooks
+                                        if source.detail_hooks != "": VerticalLayout {
+                                            spacing: 2px;
+                                            Text { text: "Hooks"; font-weight: 700; font-size: 11px; color: #888888; }
+                                            Text { text: source.detail_hooks; font-size: 11px; wrap: word-wrap; }
+                                        }
+                                        // Retention
+                                        if source.detail_retention != "": VerticalLayout {
+                                            spacing: 2px;
+                                            Text { text: "Retention"; font-weight: 700; font-size: 11px; color: #888888; }
+                                            Text { text: source.detail_retention; font-size: 11px; }
+                                        }
                                     }
                                 }
                             }
@@ -1120,6 +1204,13 @@ struct SourceInfoData {
     paths: String,
     excludes: String,
     target_repos: String,
+    detail_paths: String,
+    detail_excludes: String,
+    detail_exclude_if_present: String,
+    detail_flags: String,
+    detail_hooks: String,
+    detail_retention: String,
+    detail_command_dumps: String,
 }
 
 #[derive(Debug, Clone)]
@@ -1454,11 +1545,71 @@ fn build_source_model_data(repos: &[ResolvedRepo]) -> (Vec<SourceInfoData>, Vec<
             } else {
                 source.repos.join(", ")
             };
+            let mut flags = Vec::new();
+            if source.one_file_system {
+                flags.push("one_file_system");
+            }
+            if source.git_ignore {
+                flags.push("git_ignore");
+            }
+            if source.xattrs_enabled {
+                flags.push("xattrs");
+            }
+
+            let mut hooks_lines = Vec::new();
+            for (phase, cmds) in [
+                ("before", &source.hooks.before),
+                ("after", &source.hooks.after),
+                ("failed", &source.hooks.failed),
+                ("finally", &source.hooks.finally),
+            ] {
+                if !cmds.is_empty() {
+                    hooks_lines.push(format!("{}: {}", phase, cmds.join("; ")));
+                }
+            }
+
+            let mut retention_parts = Vec::new();
+            if let Some(ref ret) = source.retention {
+                if let Some(ref v) = ret.keep_within {
+                    retention_parts.push(format!("keep_within: {v}"));
+                }
+                if let Some(v) = ret.keep_last {
+                    retention_parts.push(format!("keep_last: {v}"));
+                }
+                if let Some(v) = ret.keep_hourly {
+                    retention_parts.push(format!("keep_hourly: {v}"));
+                }
+                if let Some(v) = ret.keep_daily {
+                    retention_parts.push(format!("keep_daily: {v}"));
+                }
+                if let Some(v) = ret.keep_weekly {
+                    retention_parts.push(format!("keep_weekly: {v}"));
+                }
+                if let Some(v) = ret.keep_monthly {
+                    retention_parts.push(format!("keep_monthly: {v}"));
+                }
+                if let Some(v) = ret.keep_yearly {
+                    retention_parts.push(format!("keep_yearly: {v}"));
+                }
+            }
+
             items.push(SourceInfoData {
                 label: source.label.clone(),
                 paths: source.paths.join(", "),
                 excludes: source.exclude.join(", "),
                 target_repos: target,
+                detail_paths: source.paths.join("\n"),
+                detail_excludes: source.exclude.join("\n"),
+                detail_exclude_if_present: source.exclude_if_present.join("\n"),
+                detail_flags: flags.join(", "),
+                detail_hooks: hooks_lines.join("\n"),
+                detail_retention: retention_parts.join(", "),
+                detail_command_dumps: source
+                    .command_dumps
+                    .iter()
+                    .map(|d| format!("{}: {}", d.name, d.command))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
             });
             labels.push(source.label.clone());
         }
@@ -3010,6 +3161,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 paths: d.paths.into(),
                                 excludes: d.excludes.into(),
                                 target_repos: d.target_repos.into(),
+                                expanded: false,
+                                detail_paths: d.detail_paths.into(),
+                                detail_excludes: d.detail_excludes.into(),
+                                detail_exclude_if_present: d.detail_exclude_if_present.into(),
+                                detail_flags: d.detail_flags.into(),
+                                detail_hooks: d.detail_hooks.into(),
+                                detail_retention: d.detail_retention.into(),
+                                detail_command_dumps: d.detail_command_dumps.into(),
                             })
                             .collect();
                         ui.set_source_model(ModelRc::new(VecModel::from(model)));
@@ -3229,6 +3388,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     });
+
+    {
+        let ui_weak = ui.as_weak();
+        ui.on_toggle_source_expanded(move |idx| {
+            let Some(ui) = ui_weak.upgrade() else {
+                return;
+            };
+            let model = ui.get_source_model();
+            let mut items: Vec<SourceInfo> = (0..model.row_count())
+                .filter_map(|i| model.row_data(i))
+                .collect();
+            if let Some(item) = items.get_mut(idx as usize) {
+                item.expanded = !item.expanded;
+            }
+            ui.set_source_model(ModelRc::new(VecModel::from(items)));
+        });
+    }
 
     let tx = app_tx.clone();
     let ui_weak = ui.as_weak();

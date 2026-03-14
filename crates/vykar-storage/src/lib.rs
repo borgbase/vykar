@@ -338,6 +338,8 @@ pub struct StorageConfig {
     pub access_token: Option<String>,
     pub allow_insecure_http: bool,
     pub retry: RetryConfig,
+    /// Use soft-delete for S3 Object Lock compatibility.
+    pub s3_soft_delete: bool,
 }
 
 /// Retry configuration for remote storage backends (S3, SFTP, REST).
@@ -413,6 +415,7 @@ pub fn backend_from_config(cfg: &StorageConfig) -> Result<Box<dyn StorageBackend
                 access_key_id,
                 secret_access_key,
                 cfg.retry.clone(),
+                cfg.s3_soft_delete,
             )?))
         }
         #[cfg(feature = "backend-sftp")]
@@ -668,6 +671,7 @@ mod tests {
             access_token: None,
             allow_insecure_http: false,
             retry: RetryConfig::default(),
+            s3_soft_delete: false,
         }
     }
 

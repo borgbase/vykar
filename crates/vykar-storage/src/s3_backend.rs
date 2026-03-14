@@ -20,10 +20,14 @@ pub struct S3Backend {
     retry: RetryConfig,
     /// Prefix (root path) prepended to all keys.
     root: String,
+    /// When true, `delete()` overwrites with a zero-byte tombstone instead of
+    /// issuing a real DELETE. For S3 Object Lock compatibility.
+    soft_delete: bool,
 }
 
 #[allow(clippy::result_large_err)]
 impl S3Backend {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         bucket_name: &str,
         region: &str,
@@ -32,6 +36,7 @@ impl S3Backend {
         access_key_id: &str,
         secret_access_key: &str,
         retry: RetryConfig,
+        soft_delete: bool,
     ) -> Result<Self> {
         let base_url = endpoint.parse().map_err(|e| {
             VykarError::Config(format!("invalid S3 endpoint URL '{endpoint}': {e}"))
@@ -65,6 +70,7 @@ impl S3Backend {
             agent,
             retry,
             root,
+            soft_delete,
         })
     }
 
@@ -107,6 +113,7 @@ impl StorageBackend for S3Backend {
             .get_object(Some(&self.credentials), &full_key)
             .sign(PRESIGN_DURATION);
 
+        let soft_delete = self.soft_delete;
         self.retry_call_body(&format!("GET {key}"), || {
             match self.agent.get(url.as_str()).call() {
                 Ok(resp) => {
@@ -114,6 +121,10 @@ impl StorageBackend for S3Backend {
                     resp.into_reader()
                         .read_to_end(&mut buf)
                         .map_err(HttpRetryError::BodyIo)?;
+                    // Treat zero-byte objects as tombstones (soft-deleted).
+                    if soft_delete && buf.is_empty() {
+                        return Ok(None);
+                    }
                     Ok(Some(buf))
                 }
                 Err(ureq::Error::Status(404, _)) => Ok(None),
@@ -132,6 +143,12 @@ impl StorageBackend for S3Backend {
     }
 
     fn delete(&self, key: &str) -> Result<()> {
+        if self.soft_delete {
+            // Overwrite with a zero-byte tombstone instead of deleting.
+            // With S3 Object Lock + versioning, the previous version is
+            // preserved for the configured retention period.
+            return self.put_bytes(key, &[]);
+        }
         let full_key = self.full_key(key);
         let url = self
             .bucket
@@ -155,7 +172,17 @@ impl StorageBackend for S3Backend {
         match self.retry_call(&format!("HEAD {key}"), || {
             self.agent.head(url.as_str()).call()
         }) {
-            Ok(_) => Ok(true),
+            Ok(resp) => {
+                if self.soft_delete {
+                    let len = crate::http_util::extract_content_length(
+                        &resp,
+                        &format!("S3 HEAD {key}"),
+                    )?;
+                    Ok(len > 0)
+                } else {
+                    Ok(true)
+                }
+            }
             Err(ureq::Error::Status(404, _)) => Ok(false),
             Err(e) => Err(VykarError::Other(format!("S3 HEAD {key}: {e}"))),
         }
@@ -174,6 +201,10 @@ impl StorageBackend for S3Backend {
             Ok(resp) => {
                 let len =
                     crate::http_util::extract_content_length(&resp, &format!("S3 HEAD {key}"))?;
+                // Treat zero-byte objects as tombstones (soft-deleted).
+                if self.soft_delete && len == 0 {
+                    return Ok(None);
+                }
                 Ok(Some(len))
             }
             Err(ureq::Error::Status(404, _)) => Ok(None),
@@ -232,6 +263,10 @@ impl StorageBackend for S3Backend {
                 if key.ends_with('/') {
                     continue;
                 }
+                // Skip zero-byte tombstones (soft-deleted objects).
+                if self.soft_delete && obj.size == 0 {
+                    continue;
+                }
                 // Strip root prefix to return relative keys
                 if root_prefix_len > 0 && key.len() > root_prefix_len {
                     keys.push(key[root_prefix_len..].to_string());
@@ -255,6 +290,10 @@ impl StorageBackend for S3Backend {
             return Err(VykarError::Other(format!(
                 "S3 GET_RANGE {key}: zero-length read requested"
             )));
+        }
+        // Tombstone check: a zero-byte object cannot satisfy a range read.
+        if self.soft_delete && self.size(key)?.is_none() {
+            return Ok(None);
         }
         let full_key = self.full_key(key);
         let end = offset

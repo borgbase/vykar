@@ -56,6 +56,10 @@ pub struct RepositoryEntry {
     /// Retry settings for remote backends.
     pub retry: Option<RetryConfig>,
 
+    /// Use soft-delete for S3 Object Lock compatibility.
+    #[serde(default)]
+    pub s3_soft_delete: bool,
+
     /// Per-repository resource limits (full override of top-level `limits`).
     pub limits: Option<ResourceLimitsConfig>,
 
@@ -79,6 +83,7 @@ impl RepositoryEntry {
             min_pack_size: self.min_pack_size.unwrap_or_else(default_min_pack_size),
             max_pack_size: self.max_pack_size.unwrap_or_else(default_max_pack_size),
             retry: self.retry.clone().unwrap_or_default(),
+            s3_soft_delete: self.s3_soft_delete,
         }
     }
 }
@@ -1222,6 +1227,7 @@ repositories:
                     min_pack_size: default_min_pack_size(),
                     max_pack_size: default_max_pack_size(),
                     retry: RetryConfig::default(),
+                    s3_soft_delete: false,
                 },
                 encryption: EncryptionConfig::default(),
                 exclude_patterns: vec![],

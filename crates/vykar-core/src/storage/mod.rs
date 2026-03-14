@@ -16,6 +16,7 @@ fn storage_config_from_repo(cfg: &RepositoryConfig) -> StorageConfig {
         access_token: cfg.access_token.clone(),
         allow_insecure_http: cfg.allow_insecure_http,
         retry: cfg.retry.clone(),
+        s3_soft_delete: cfg.s3_soft_delete,
     }
 }
 

@@ -152,6 +152,7 @@ fn with_repo_lock_flushes_pending_state_on_action_error() {
         min_pack_size: 256,
         max_pack_size: 256,
         retry: RetryConfig::default(),
+        s3_soft_delete: false,
     };
     let mut repo = Repository::init(
         Box::new(backend.clone()),

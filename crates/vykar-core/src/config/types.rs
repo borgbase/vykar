@@ -182,6 +182,13 @@ pub struct RepositoryConfig {
     /// Retry settings for remote backends (S3, SFTP, REST).
     #[serde(default)]
     pub retry: RetryConfig,
+    /// Use soft-delete for S3 Object Lock compatibility.
+    ///
+    /// When enabled, `delete()` overwrites the object with a zero-byte tombstone
+    /// instead of issuing a real DELETE. Combined with S3 Object Lock, this
+    /// preserves previous versions for the configured retention period.
+    #[serde(default)]
+    pub s3_soft_delete: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

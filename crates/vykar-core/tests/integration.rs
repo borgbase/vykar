@@ -64,6 +64,7 @@ fn make_test_config(repo_dir: &std::path::Path) -> VykarConfig {
             min_pack_size: 32 * 1024 * 1024,
             max_pack_size: 512 * 1024 * 1024,
             retry: RetryConfig::default(),
+            s3_soft_delete: false,
         },
         encryption: EncryptionConfig {
             mode: EncryptionModeConfig::None,

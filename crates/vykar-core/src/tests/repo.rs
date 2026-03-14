@@ -430,6 +430,7 @@ fn init_rejects_oversized_max_pack_size() {
         min_pack_size: min_pack,
         max_pack_size: 513 * 1024 * 1024,
         retry: RetryConfig::default(),
+        s3_soft_delete: false,
     };
 
     let result = Repository::init(
@@ -461,6 +462,7 @@ fn init_rejects_oversized_max_pack_size() {
         min_pack_size: min_pack,
         max_pack_size: 512 * 1024 * 1024,
         retry: RetryConfig::default(),
+        s3_soft_delete: false,
     };
 
     let result = Repository::init(
@@ -500,6 +502,7 @@ fn flush_on_abort_writes_pending_index() {
         min_pack_size: 256,
         max_pack_size: 256,
         retry: RetryConfig::default(),
+        s3_soft_delete: false,
     };
     let mut repo = Repository::init(
         Box::new(MemoryBackend::new()),
@@ -637,6 +640,7 @@ fn flush_on_abort_survives_pack_upload_failure() {
         min_pack_size: 256,
         max_pack_size: 256,
         retry: RetryConfig::default(),
+        s3_soft_delete: false,
     };
     let mut repo = Repository::init(
         Box::new(FailPackUploadsBackend::new()),
@@ -721,6 +725,7 @@ fn repo_with_small_packs(min_pack: u32, max_pack: u32) -> Repository {
         min_pack_size: min_pack,
         max_pack_size: max_pack,
         retry: RetryConfig::default(),
+        s3_soft_delete: false,
     };
     let mut repo = Repository::init(
         Box::new(MemoryBackend::new()),
@@ -889,6 +894,7 @@ fn cross_session_pending_index_recovery() {
         min_pack_size: 256,
         max_pack_size: 256,
         retry: RetryConfig::default(),
+        s3_soft_delete: false,
     };
 
     // Session 1: init repo, store chunks, flush, write pending index, then drop.

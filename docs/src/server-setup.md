@@ -8,7 +8,7 @@ Dumb storage backends (S3, WebDAV, SFTP) work well for basic backups, but they c
 
 | Capability | S3 / dumb storage | vykar-server |
 |------------|-------------------|-------------|
-| Append-only mode | Not enforceable; a compromised client with S3 credentials can delete anything | Rejects deletes and overwrites of immutable keys; only `index`, `index.gen`, `locks/*`, and `sessions/*` remain mutable |
+| Append-only mode | [S3 Object Lock + soft-delete](backends.md#s3-append-only--ransomware-protection) preserves previous versions for a configurable retention period; overwrites are not blocked but are recoverable within the retention window | Rejects deletes and overwrites of immutable keys; only `index`, `index.gen`, `locks/*`, and `sessions/*` remain mutable |
 | Server-side compaction | Client must download and re-upload all live blobs | Server repacks locally on disk from a compact plan |
 | Quota enforcement | Requires external bucket policy/IAM setup | Built-in byte quota checks on writes |
 | Backup freshness monitoring | Requires external polling and parsing | Tracks `last_backup_at` on new snapshot writes |

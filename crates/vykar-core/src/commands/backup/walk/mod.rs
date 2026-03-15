@@ -13,6 +13,11 @@ use vykar_types::error::{Result, VykarError};
 
 use super::concurrency::ByteBudget;
 
+#[cfg(target_os = "linux")]
+mod inode_walk;
+#[cfg(target_os = "linux")]
+pub(super) use inode_walk::{rel_path_from_abs, InodeSortedWalk, WalkEvent, WalkedEntry};
+
 /// Returns `true` for I/O errors safe to skip (permission denied, not found, or EIO).
 pub(super) fn is_soft_io_error(e: &std::io::Error) -> bool {
     matches!(
@@ -370,6 +375,244 @@ impl Iterator for WalkItems {
 /// Walk a single source path and yield WalkEntry items.
 #[allow(clippy::too_many_arguments)]
 fn walk_source<'a>(
+    source_path: &'a str,
+    multi_path: bool,
+    exclude_patterns: &'a [String],
+    exclude_if_present: &'a [String],
+    one_file_system: bool,
+    git_ignore: bool,
+    xattrs_enabled: bool,
+    file_cache: &'a FileCache,
+    segment_size: u64,
+) -> Box<dyn Iterator<Item = Result<WalkEntry>> + Send + 'a> {
+    #[cfg(target_os = "linux")]
+    {
+        return walk_source_inode_sorted(
+            source_path,
+            multi_path,
+            exclude_patterns,
+            exclude_if_present,
+            one_file_system,
+            git_ignore,
+            xattrs_enabled,
+            file_cache,
+            segment_size,
+        );
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    walk_source_ignore(
+        source_path,
+        multi_path,
+        exclude_patterns,
+        exclude_if_present,
+        one_file_system,
+        git_ignore,
+        xattrs_enabled,
+        file_cache,
+        segment_size,
+    )
+}
+
+/// Walk a single source path using the inode-sorted walker (Linux only).
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+fn walk_source_inode_sorted<'a>(
+    source_path: &'a str,
+    multi_path: bool,
+    exclude_patterns: &'a [String],
+    exclude_if_present: &'a [String],
+    one_file_system: bool,
+    git_ignore: bool,
+    xattrs_enabled: bool,
+    file_cache: &'a FileCache,
+    segment_size: u64,
+) -> Box<dyn Iterator<Item = Result<WalkEntry>> + Send + 'a> {
+    let source = Path::new(source_path);
+    let inode_walk = match InodeSortedWalk::new(
+        source,
+        exclude_patterns,
+        exclude_if_present,
+        one_file_system,
+        git_ignore,
+    ) {
+        Ok(w) => w,
+        Err(e) => return Box::new(std::iter::once(Err(e))),
+    };
+
+    // Multi-path prefix item.
+    let prefix = if multi_path {
+        let base = source
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| source_path.to_string());
+        Some(base)
+    } else {
+        None
+    };
+
+    let prefix_item: Box<dyn Iterator<Item = Result<WalkEntry>> + Send> =
+        if let Some(ref pfx) = prefix {
+            let dir_item = Item {
+                path: pfx.clone(),
+                entry_type: ItemType::Directory,
+                mode: 0o755,
+                uid: 0,
+                gid: 0,
+                user: None,
+                group: None,
+                mtime: 0,
+                atime: None,
+                ctime: None,
+                size: 0,
+                chunks: Vec::new(),
+                link_target: None,
+                xattrs: None,
+            };
+            Box::new(std::iter::once(Ok(WalkEntry::NonFile { item: dir_item })))
+        } else {
+            Box::new(std::iter::empty())
+        };
+
+    let abs_source = inode_walk.abs_source().to_owned();
+    let prefix_clone = prefix.clone();
+    let walk_entries = inode_walk.flat_map(move |event_result| -> WalkItems {
+        let event = match event_result {
+            Ok(e) => e,
+            Err(e) => {
+                return WalkItems::One(Some(Err(e)));
+            }
+        };
+
+        match event {
+            WalkEvent::Skipped => WalkItems::One(Some(Ok(WalkEntry::Skipped))),
+            WalkEvent::Entry(walked) => walked_entry_to_walk_items(
+                walked,
+                &abs_source,
+                &prefix_clone,
+                xattrs_enabled,
+                file_cache,
+                segment_size,
+            ),
+        }
+    });
+
+    Box::new(prefix_item.chain(walk_entries))
+}
+
+/// Convert a `WalkedEntry` (pre-statted) into pipeline `WalkItems`.
+#[cfg(target_os = "linux")]
+fn walked_entry_to_walk_items(
+    walked: WalkedEntry,
+    abs_source: &Path,
+    prefix: &Option<String>,
+    xattrs_enabled: bool,
+    file_cache: &FileCache,
+    segment_size: u64,
+) -> WalkItems {
+    let file_type = walked.file_type;
+    let metadata_summary = walked.metadata;
+
+    let (entry_type, link_target) = if file_type.is_dir() {
+        (ItemType::Directory, None)
+    } else if file_type.is_symlink() {
+        match std::fs::read_link(&walked.abs_path) {
+            Ok(target) => (
+                ItemType::Symlink,
+                Some(target.to_string_lossy().to_string()),
+            ),
+            Err(e) => {
+                if is_soft_io_error(&e) {
+                    warn!(path = %walked.abs_path.display(), error = %e, "skipping entry (readlink error)");
+                    return WalkItems::One(Some(Ok(WalkEntry::Skipped)));
+                }
+                return WalkItems::One(Some(Err(VykarError::Other(format!("readlink: {e}")))));
+            }
+        }
+    } else if file_type.is_file() {
+        (ItemType::RegularFile, None)
+    } else {
+        return WalkItems::Empty; // skip special files
+    };
+
+    let rel_path = rel_path_from_abs(abs_source, &walked.abs_path);
+    let item_path = match prefix {
+        Some(pfx) => format!("{pfx}/{rel_path}"),
+        None => rel_path,
+    };
+
+    let mut item = Item {
+        path: item_path,
+        entry_type,
+        mode: metadata_summary.mode,
+        uid: metadata_summary.uid,
+        gid: metadata_summary.gid,
+        user: None,
+        group: None,
+        mtime: metadata_summary.mtime_ns,
+        atime: None,
+        ctime: None,
+        size: metadata_summary.size,
+        chunks: Vec::new(),
+        link_target,
+        xattrs: None,
+    };
+
+    if xattrs_enabled {
+        item.xattrs = read_item_xattrs(&walked.abs_path);
+    }
+
+    if entry_type == ItemType::RegularFile && metadata_summary.size > 0 {
+        let abs_path = walked.abs_path.to_string_lossy().to_string();
+
+        let cache_hit = file_cache.lookup(
+            &abs_path,
+            metadata_summary.device,
+            metadata_summary.inode,
+            metadata_summary.mtime_ns,
+            metadata_summary.ctime_ns,
+            metadata_summary.size,
+        );
+
+        if let Some(cached_refs) = cache_hit {
+            return WalkItems::One(Some(Ok(WalkEntry::CacheHit {
+                item,
+                abs_path,
+                metadata: metadata_summary,
+                cached_refs: cached_refs.to_vec(),
+            })));
+        }
+
+        let file_size = metadata_summary.size;
+        if file_size > segment_size {
+            let num_segments = file_size.div_ceil(segment_size) as usize;
+            let abs_path: Arc<str> = abs_path.into();
+            WalkItems::Segments {
+                item: Some(item),
+                abs_path,
+                metadata: metadata_summary,
+                segment_size,
+                file_size,
+                num_segments,
+                next: 0,
+            }
+        } else {
+            WalkItems::One(Some(Ok(WalkEntry::File {
+                file_size,
+                item,
+                abs_path,
+                metadata: metadata_summary,
+            })))
+        }
+    } else {
+        WalkItems::One(Some(Ok(WalkEntry::NonFile { item })))
+    }
+}
+
+/// Walk a single source path using the `ignore` crate walker (non-Linux fallback).
+#[cfg(not(target_os = "linux"))]
+#[allow(clippy::too_many_arguments)]
+fn walk_source_ignore<'a>(
     source_path: &'a str,
     multi_path: bool,
     exclude_patterns: &'a [String],

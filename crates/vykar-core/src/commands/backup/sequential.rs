@@ -1,5 +1,5 @@
-use std::fs::File;
-use std::path::Path;
+use std::fs::{File, FileType};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
 use rayon::prelude::*;
@@ -24,6 +24,8 @@ use super::commit::process_worker_chunks;
 use super::walk::{
     build_configured_walker, is_soft_io_error, is_soft_walk_error, read_item_xattrs,
 };
+#[cfg(target_os = "linux")]
+use super::walk::{rel_path_from_abs, InodeSortedWalk, WalkEvent};
 use super::{append_item_to_stream, emit_progress, emit_stats_progress};
 use super::{BackupProgressEvent, FileStatus};
 
@@ -400,6 +402,19 @@ pub(super) fn process_regular_file_item(
     Ok(())
 }
 
+/// Unified walk item for the sequential backup loop.
+/// Abstracts over the inode-sorted walker (Linux) and ignore-crate walker.
+enum SequentialWalkItem {
+    Entry {
+        abs_path: PathBuf,
+        rel_path: String,
+        metadata_summary: fs::MetadataSummary,
+        file_type: FileType,
+    },
+    Skipped,
+    HardError(VykarError),
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn process_source_path(
     repo: &mut Repository,
@@ -433,13 +448,6 @@ pub(super) fn process_source_path(
     );
 
     let source = Path::new(source_path);
-    let walk_builder = build_configured_walker(
-        source,
-        exclude_patterns,
-        exclude_if_present,
-        one_file_system,
-        git_ignore,
-    )?;
 
     // For multi-path mode, derive basename prefix.
     let prefix = if multi_path {
@@ -481,62 +489,120 @@ pub(super) fn process_source_path(
     let min_chunk_size = repo.config.chunker_params.min_size as u64;
     let mut cross_batch = CrossFileBatch::new();
 
-    for entry in walk_builder.build() {
+    // --- Walk loop: platform-dispatched ---
+    // On Linux, use inode-sorted walk for HDD performance.
+    // On other platforms, use the ignore-crate walker.
+    #[cfg(target_os = "linux")]
+    let walk_iter: Box<dyn Iterator<Item = SequentialWalkItem>> = {
+        let inode_walk = InodeSortedWalk::new(
+            source,
+            exclude_patterns,
+            exclude_if_present,
+            one_file_system,
+            git_ignore,
+        )?;
+        let abs_source = inode_walk.abs_source().to_owned();
+        Box::new(inode_walk.map(move |event_result| match event_result {
+            Ok(WalkEvent::Entry(walked)) => {
+                let rel_path = rel_path_from_abs(&abs_source, &walked.abs_path);
+                SequentialWalkItem::Entry {
+                    abs_path: walked.abs_path,
+                    rel_path,
+                    metadata_summary: walked.metadata,
+                    file_type: walked.file_type,
+                }
+            }
+            Ok(WalkEvent::Skipped) => SequentialWalkItem::Skipped,
+            Err(e) => SequentialWalkItem::HardError(e),
+        }))
+    };
+    #[cfg(not(target_os = "linux"))]
+    let walk_iter: Box<dyn Iterator<Item = SequentialWalkItem>> = {
+        let walk_builder = build_configured_walker(
+            source,
+            exclude_patterns,
+            exclude_if_present,
+            one_file_system,
+            git_ignore,
+        )?;
+        Box::new(walk_builder.build().filter_map(|entry_result| {
+            match entry_result {
+                Ok(entry) => {
+                    let rel_path = entry
+                        .path()
+                        .strip_prefix(source)
+                        .unwrap_or(entry.path())
+                        .to_string_lossy()
+                        .to_string();
+                    let rel_path = super::normalize_rel_path(rel_path);
+                    if rel_path.is_empty() {
+                        return None; // skip root
+                    }
+                    let metadata = match std::fs::symlink_metadata(entry.path()) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            if is_soft_io_error(&e) {
+                                warn!(path = %entry.path().display(), error = %e, "skipping entry (stat error)");
+                                return Some(SequentialWalkItem::Skipped);
+                            }
+                            return Some(SequentialWalkItem::HardError(VykarError::Other(
+                                format!("stat error for {}: {e}", entry.path().display()),
+                            )));
+                        }
+                    };
+                    let file_type = metadata.file_type();
+                    let metadata_summary = fs::summarize_metadata(&metadata, &file_type);
+                    Some(SequentialWalkItem::Entry {
+                        abs_path: entry.path().to_path_buf(),
+                        rel_path,
+                        metadata_summary,
+                        file_type,
+                    })
+                }
+                Err(e) => {
+                    if is_soft_walk_error(&e) {
+                        warn!(error = %e, "skipping entry (walk error)");
+                        Some(SequentialWalkItem::Skipped)
+                    } else {
+                        Some(SequentialWalkItem::HardError(VykarError::Other(
+                            format!("walk error: {e}"),
+                        )))
+                    }
+                }
+            }
+        }))
+    };
+
+    for walk_item in walk_iter {
         check_interrupted(shutdown)?;
-        let entry = match entry {
-            Ok(e) => e,
-            Err(e) => {
-                if is_soft_walk_error(&e) {
-                    warn!(error = %e, "skipping entry (walk error)");
-                    stats.errors += 1;
-                    continue;
-                }
-                return Err(VykarError::Other(format!("walk error: {e}")));
+
+        let (entry_path, rel_path, metadata_summary, file_type) = match walk_item {
+            SequentialWalkItem::Entry {
+                abs_path,
+                rel_path,
+                metadata_summary,
+                file_type,
+            } => (abs_path, rel_path, metadata_summary, file_type),
+            SequentialWalkItem::Skipped => {
+                stats.errors += 1;
+                continue;
+            }
+            SequentialWalkItem::HardError(e) => {
+                return Err(e);
             }
         };
-
-        let rel_path = entry
-            .path()
-            .strip_prefix(source)
-            .unwrap_or(entry.path())
-            .to_string_lossy()
-            .to_string();
-        let rel_path = super::normalize_rel_path(rel_path);
-
-        // Skip root directory itself.
-        if rel_path.is_empty() {
-            continue;
-        }
-
-        let metadata = match std::fs::symlink_metadata(entry.path()) {
-            Ok(m) => m,
-            Err(e) => {
-                if is_soft_io_error(&e) {
-                    warn!(path = %entry.path().display(), error = %e, "skipping entry (stat error)");
-                    stats.errors += 1;
-                    continue;
-                }
-                return Err(VykarError::Other(format!(
-                    "stat error for {}: {e}",
-                    entry.path().display()
-                )));
-            }
-        };
-
-        let file_type = metadata.file_type();
-        let metadata_summary = fs::summarize_metadata(&metadata, &file_type);
 
         let (entry_type, link_target) = if file_type.is_dir() {
             (ItemType::Directory, None)
         } else if file_type.is_symlink() {
-            match std::fs::read_link(entry.path()) {
+            match std::fs::read_link(&entry_path) {
                 Ok(target) => (
                     ItemType::Symlink,
                     Some(target.to_string_lossy().to_string()),
                 ),
                 Err(e) => {
                     if is_soft_io_error(&e) {
-                        warn!(path = %entry.path().display(), error = %e, "skipping entry (readlink error)");
+                        warn!(path = %entry_path.display(), error = %e, "skipping entry (readlink error)");
                         stats.errors += 1;
                         continue;
                     }
@@ -574,7 +640,7 @@ pub(super) fn process_source_path(
         };
 
         if xattrs_enabled {
-            item.xattrs = read_item_xattrs(entry.path());
+            item.xattrs = read_item_xattrs(&entry_path);
         }
 
         // For regular files, chunk and store the content.
@@ -582,7 +648,7 @@ pub(super) fn process_source_path(
             // Small-file fast path: read directly, accumulate in cross-file batch.
             if metadata_summary.size < min_chunk_size {
                 // Flush batch before cache-hit check since it may need walk-order items.
-                let abs_path = entry.path().to_string_lossy().to_string();
+                let abs_path = entry_path.to_string_lossy().to_string();
 
                 let cache_hit = repo.file_cache().lookup(
                     &abs_path,
@@ -645,11 +711,11 @@ pub(super) fn process_source_path(
                     emit_stats_progress(progress, stats, Some(item.path.clone()));
                 } else {
                     // Cache miss — read and add to batch.
-                    let data = match std::fs::read(entry.path()) {
+                    let data = match std::fs::read(&entry_path) {
                         Ok(d) => d,
                         Err(e) => {
                             if is_soft_io_error(&e) {
-                                warn!(path = %entry.path().display(), error = %e, "skipping file (read error)");
+                                warn!(path = %entry_path.display(), error = %e, "skipping file (read error)");
                                 stats.errors += 1;
                                 continue;
                             }
@@ -697,7 +763,7 @@ pub(super) fn process_source_path(
 
                 if let Err(e) = process_regular_file_item(
                     repo,
-                    entry.path(),
+                    &entry_path,
                     metadata_summary,
                     compression,
                     transform_pool,
@@ -712,7 +778,7 @@ pub(super) fn process_source_path(
                     verbose,
                 ) {
                     if e.is_soft_file_error() {
-                        warn!(path = %entry.path().display(), error = %e, "skipping file");
+                        warn!(path = %entry_path.display(), error = %e, "skipping file");
                         stats.errors += 1;
                         continue;
                     }

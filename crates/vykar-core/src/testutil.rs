@@ -9,6 +9,10 @@ use vykar_types::error::{Result, VykarError};
 
 static TEST_ENV_INIT: Once = Once::new();
 
+/// Tests that mutate process-global state (CWD, env vars) must hold this lock.
+/// Shared across all test modules (inode_walk, resolve, etc.).
+pub static CWD_LOCK: Mutex<()> = Mutex::new(());
+
 pub fn init_test_environment() {
     TEST_ENV_INIT.call_once(|| {
         let base = std::env::temp_dir().join(format!("vykar-tests-{}", std::process::id()));

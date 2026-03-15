@@ -651,15 +651,11 @@ pub fn minimal_config_template() -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use std::fs;
-    use std::sync::Mutex;
-
     use super::super::deserialize::STRICT_STRING_ERROR;
+    use super::*;
     use crate::config::SourceHooksConfig;
-
-    // Tests that mutate process-global state (env vars, CWD) must be serialized.
-    static GLOBAL_STATE: Mutex<()> = Mutex::new(());
+    use crate::testutil::CWD_LOCK;
+    use std::fs;
 
     #[test]
     fn test_search_paths_order() {
@@ -684,7 +680,7 @@ mod tests {
 
     #[test]
     fn test_resolve_env_var() {
-        let _lock = GLOBAL_STATE.lock().unwrap();
+        let _lock = CWD_LOCK.lock().unwrap();
         let _guard = EnvGuard::set("VYKAR_CONFIG", "/tmp/env-config.yaml");
         let result = resolve_config_path(None);
         let source = result.unwrap();
@@ -694,7 +690,7 @@ mod tests {
 
     #[test]
     fn test_resolve_search_finds_project() {
-        let _lock = GLOBAL_STATE.lock().unwrap();
+        let _lock = CWD_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("vykar.yaml");
         fs::write(&config_path, "repositories:\n  - url: /tmp/repo\n").unwrap();
@@ -718,7 +714,7 @@ mod tests {
 
     #[test]
     fn test_resolve_nothing_found() {
-        let _lock = GLOBAL_STATE.lock().unwrap();
+        let _lock = CWD_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let original = std::env::current_dir().unwrap();
         std::env::set_current_dir(dir.path()).unwrap();
@@ -1945,7 +1941,7 @@ sources:
 
     #[test]
     fn test_env_expand_bare_var_in_config() {
-        let _lock = GLOBAL_STATE.lock().unwrap();
+        let _lock = CWD_LOCK.lock().unwrap();
         let _repo_guard = EnvGuard::set("VYKAR_TEST_REPO_URL", "/tmp/vykar-env-repo");
 
         let yaml = r#"
@@ -1964,7 +1960,7 @@ sources:
 
     #[test]
     fn test_env_expand_default_used_when_unset() {
-        let _lock = GLOBAL_STATE.lock().unwrap();
+        let _lock = CWD_LOCK.lock().unwrap();
         let _repo_guard = EnvGuard::unset("VYKAR_TEST_REPO_URL");
 
         let yaml = r#"
@@ -1983,7 +1979,7 @@ sources:
 
     #[test]
     fn test_env_expand_default_used_when_empty() {
-        let _lock = GLOBAL_STATE.lock().unwrap();
+        let _lock = CWD_LOCK.lock().unwrap();
         let _repo_guard = EnvGuard::set("VYKAR_TEST_REPO_URL", "");
 
         let yaml = r#"
@@ -2002,7 +1998,7 @@ sources:
 
     #[test]
     fn test_env_expand_default_not_used_when_non_empty() {
-        let _lock = GLOBAL_STATE.lock().unwrap();
+        let _lock = CWD_LOCK.lock().unwrap();
         let _repo_guard = EnvGuard::set("VYKAR_TEST_REPO_URL", "/tmp/vykar-non-empty-repo");
 
         let yaml = r#"
@@ -2021,7 +2017,7 @@ sources:
 
     #[test]
     fn test_env_expand_bare_var_missing_is_error() {
-        let _lock = GLOBAL_STATE.lock().unwrap();
+        let _lock = CWD_LOCK.lock().unwrap();
         let _repo_guard = EnvGuard::unset("VYKAR_TEST_REPO_URL");
 
         let yaml = r#"
@@ -2043,7 +2039,7 @@ sources:
 
     #[test]
     fn test_env_expand_bare_var_can_be_empty() {
-        let _lock = GLOBAL_STATE.lock().unwrap();
+        let _lock = CWD_LOCK.lock().unwrap();
         let _guard = EnvGuard::set("VYKAR_TEST_EMPTY", "");
 
         let expanded =

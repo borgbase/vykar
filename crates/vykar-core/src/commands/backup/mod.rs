@@ -273,11 +273,21 @@ pub fn run_with_progress(
 
     // Open repo after session registration (minimizes T0→commit window).
     // If open fails, deregister the session so it doesn't block maintenance for 72h.
-    let mut repo = match Repository::open(
-        backend,
-        passphrase,
-        super::util::cache_dir_from_config(config),
-    ) {
+    //
+    // When there are no filesystem source paths (command-dump-only backup),
+    // skip loading the file cache — it's never consulted for command dumps
+    // and can be large (~736K entries).
+    let skip_file_cache = source_paths.is_empty();
+    let cache_dir = super::util::cache_dir_from_config(config);
+    let open_result = if skip_file_cache {
+        Repository::open_without_index_or_cache(backend, passphrase, cache_dir).and_then(|mut r| {
+            r.load_chunk_index()?;
+            Ok(r)
+        })
+    } else {
+        Repository::open(backend, passphrase, cache_dir)
+    };
+    let mut repo = match open_result {
         Ok(r) => {
             if let Err(e) = super::util::verify_repo_identity(config, &r) {
                 if let Ok(cleanup) = storage::backend_from_config(&config.repository, 1) {

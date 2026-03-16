@@ -761,3 +761,84 @@ fn parent_fallback_survives_label_rename() {
         );
     }
 }
+
+#[test]
+fn command_dump_only_backup_does_not_load_or_mutate_file_cache() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = tmp.path().join("repo");
+    let source_dir = tmp.path().join("source");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    std::fs::create_dir_all(&source_dir).unwrap();
+
+    let cache_dir = tmp.path().join("cache");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+    let mut config = make_test_config(&repo_dir);
+    config.cache_dir = Some(cache_dir.to_string_lossy().to_string());
+    commands::init::run(&config, None).unwrap();
+
+    // Step 1: filesystem backup to populate the file cache on disk.
+    std::fs::write(source_dir.join("data.txt"), b"hello world").unwrap();
+    backup_source(&config, &source_dir, "src-a", "snap-fs", None);
+
+    // Step 2: locate the filecache file and snapshot its contents + mtime.
+    let repo = open_local_repo(&repo_dir, None);
+    let repo_id_hex = hex::encode(&repo.config.id);
+    drop(repo);
+
+    let filecache_path = cache_dir.join(&repo_id_hex).join("filecache");
+    assert!(
+        filecache_path.exists(),
+        "filecache should exist after filesystem backup: {}",
+        filecache_path.display()
+    );
+    let bytes_before = std::fs::read(&filecache_path).unwrap();
+    let mtime_before = std::fs::metadata(&filecache_path)
+        .unwrap()
+        .modified()
+        .unwrap();
+
+    // Step 3: run a command-dump-only backup (no filesystem paths).
+    let exclude_patterns: Vec<String> = Vec::new();
+    let exclude_if_present: Vec<String> = Vec::new();
+    let dumps = vec![CommandDump {
+        name: "echo.txt".to_string(),
+        command: "echo dump-data".to_string(),
+    }];
+    commands::backup::run(
+        &config,
+        commands::backup::BackupRequest {
+            snapshot_name: "snap-dump",
+            passphrase: None,
+            source_paths: &[],
+            source_label: "dump-only",
+            exclude_patterns: &exclude_patterns,
+            exclude_if_present: &exclude_if_present,
+            one_file_system: true,
+            git_ignore: false,
+            xattrs_enabled: false,
+            compression: Compression::None,
+            command_dumps: &dumps,
+            verbose: false,
+        },
+    )
+    .unwrap();
+
+    // Step 4: assert the filecache file is byte-identical (not rewritten).
+    let bytes_after = std::fs::read(&filecache_path).unwrap();
+    let mtime_after = std::fs::metadata(&filecache_path)
+        .unwrap()
+        .modified()
+        .unwrap();
+    assert_eq!(
+        bytes_before, bytes_after,
+        "filecache bytes should be identical after dump-only backup"
+    );
+    assert_eq!(
+        mtime_before, mtime_after,
+        "filecache mtime should be unchanged after dump-only backup"
+    );
+
+    // Verify the dump-only snapshot was actually created.
+    let repo = open_local_repo(&repo_dir, None);
+    assert!(repo.manifest().find_snapshot("snap-dump").is_some());
+}

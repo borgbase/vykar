@@ -25,6 +25,17 @@ use crate::scheduler;
 use crate::view_models::send_structured_data;
 use crate::APP_TITLE;
 
+fn finish_operation(
+    backup_running: &AtomicBool,
+    ui_tx: &Sender<UiEvent>,
+    sched_notify_tx: &Sender<()>,
+) {
+    backup_running.store(false, Ordering::SeqCst);
+    let _ = ui_tx.send(UiEvent::OperationFinished);
+    let _ = ui_tx.send(UiEvent::Status("Idle".to_string()));
+    let _ = sched_notify_tx.try_send(());
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_worker(
     app_tx: Sender<AppCommand>,
@@ -35,6 +46,7 @@ pub(crate) fn run_worker(
     cancel_requested: Arc<AtomicBool>,
     mut runtime: app::RuntimeConfig,
     scheduler_lock_held: bool,
+    sched_notify_tx: Sender<()>,
 ) {
     let mut passphrases: HashMap<String, zeroize::Zeroizing<String>> = HashMap::new();
 
@@ -56,6 +68,7 @@ pub(crate) fn run_worker(
         state.jitter_seconds = schedule.jitter_seconds;
         state.next_run = Some(Instant::now() + schedule_delay);
     }
+    let _ = sched_notify_tx.try_send(());
 
     let schedule_desc = if scheduler_lock_held {
         scheduler::schedule_description(&schedule, false)
@@ -187,9 +200,7 @@ pub(crate) fn run_worker(
                     let _ = app_tx.send(AppCommand::FetchAllRepoInfo);
                 }
 
-                backup_running.store(false, Ordering::SeqCst);
-                let _ = ui_tx.send(UiEvent::OperationFinished);
-                let _ = ui_tx.send(UiEvent::Status("Idle".to_string()));
+                finish_operation(&backup_running, &ui_tx, &sched_notify_tx);
             }
             AppCommand::RunBackupRepo { repo_name } => {
                 let repo_name_sel = repo_name.trim().to_string();
@@ -216,9 +227,7 @@ pub(crate) fn run_worker(
                     Ok(p) => p,
                     Err(e) => {
                         send_log(&ui_tx, format!("[{rn}] passphrase error: {e}"));
-                        backup_running.store(false, Ordering::SeqCst);
-                        let _ = ui_tx.send(UiEvent::OperationFinished);
-                        let _ = ui_tx.send(UiEvent::Status("Idle".to_string()));
+                        finish_operation(&backup_running, &ui_tx, &sched_notify_tx);
                         continue;
                     }
                 };
@@ -230,9 +239,7 @@ pub(crate) fn run_worker(
                         &ui_tx,
                         format!("[{rn}] passphrase prompt canceled; skipping."),
                     );
-                    backup_running.store(false, Ordering::SeqCst);
-                    let _ = ui_tx.send(UiEvent::OperationFinished);
-                    let _ = ui_tx.send(UiEvent::Status("Idle".to_string()));
+                    finish_operation(&backup_running, &ui_tx, &sched_notify_tx);
                     continue;
                 }
 
@@ -267,9 +274,7 @@ pub(crate) fn run_worker(
                     Err(e) => send_log(&ui_tx, format!("[{rn}] backup failed: {e}")),
                 }
 
-                backup_running.store(false, Ordering::SeqCst);
-                let _ = ui_tx.send(UiEvent::OperationFinished);
-                let _ = ui_tx.send(UiEvent::Status("Idle".to_string()));
+                finish_operation(&backup_running, &ui_tx, &sched_notify_tx);
             }
             AppCommand::RunBackupSource { source_label } => {
                 let source_label = source_label.trim().to_string();
@@ -374,9 +379,7 @@ pub(crate) fn run_worker(
                     let _ = app_tx.send(AppCommand::FetchAllRepoInfo);
                 }
 
-                backup_running.store(false, Ordering::SeqCst);
-                let _ = ui_tx.send(UiEvent::OperationFinished);
-                let _ = ui_tx.send(UiEvent::Status("Idle".to_string()));
+                finish_operation(&backup_running, &ui_tx, &sched_notify_tx);
             }
             AppCommand::FetchAllRepoInfo => {
                 let _ = ui_tx.send(UiEvent::Status("Fetching repository info...".to_string()));
@@ -952,6 +955,7 @@ pub(crate) fn run_worker(
                     scheduler_lock_held,
                     &ui_tx,
                     &app_tx,
+                    &sched_notify_tx,
                 );
             }
             AppCommand::SwitchConfig => {
@@ -972,6 +976,7 @@ pub(crate) fn run_worker(
                         scheduler_lock_held,
                         &ui_tx,
                         &app_tx,
+                        &sched_notify_tx,
                     );
                 }
             }
@@ -1008,6 +1013,7 @@ pub(crate) fn run_worker(
                     scheduler_lock_held,
                     &ui_tx,
                     &app_tx,
+                    &sched_notify_tx,
                 ) {
                     send_log(&ui_tx, "Configuration saved and applied.");
                 } else {

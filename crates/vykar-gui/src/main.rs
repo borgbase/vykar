@@ -6,10 +6,9 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
 
 use slint::ComponentHandle;
-use tray_icon::menu::{MenuEvent, MenuId, MenuItem};
+use tray_icon::menu::MenuEvent;
 
 mod config_helpers;
 mod controllers;
@@ -21,6 +20,7 @@ mod repo_helpers;
 mod scheduler;
 mod state;
 mod tray;
+mod tray_state;
 mod view_models;
 mod worker;
 use messages::{log_entry_now, AppCommand, SnapshotRowData, UiEvent};
@@ -70,11 +70,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ));
     }
 
+    let (sched_notify_tx, sched_notify_rx) = crossbeam_channel::bounded::<()>(1);
+
     scheduler::spawn_scheduler(
         app_tx.clone(),
         ui_tx.clone(),
         scheduler.clone(),
         backup_running.clone(),
+        sched_notify_rx,
     );
 
     let ui_tx_for_cancel = ui_tx.clone();
@@ -84,6 +87,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let scheduler = scheduler.clone();
         let backup_running = backup_running.clone();
         let cancel_requested = cancel_requested.clone();
+        let sched_notify_tx = sched_notify_tx.clone();
         move || {
             worker::run_worker(
                 app_tx,
@@ -94,6 +98,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 cancel_requested,
                 runtime,
                 scheduler_lock_held,
+                sched_notify_tx,
             )
         }
     });
@@ -128,8 +133,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── Event consumer ──
 
-    let tray_source_items: Arc<Mutex<Vec<(MenuId, String)>>> = Arc::new(Mutex::new(Vec::new()));
-    let (submenu_labels_tx, submenu_labels_rx) = crossbeam_channel::unbounded::<Vec<String>>();
+    let tray_source_items: Arc<Mutex<Vec<(tray_icon::menu::MenuId, String)>>> =
+        Arc::new(Mutex::new(Vec::new()));
 
     event_consumer::spawn(
         ui_rx,
@@ -139,7 +144,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         app_tx.clone(),
         snapshot_data.clone(),
         last_gui_state.clone(),
-        submenu_labels_tx,
+        tray_source_items.clone(),
     );
 
     // ── Callback wiring ──
@@ -191,95 +196,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // ── Periodic resize-save timer ──
-    // Flush GUI state to disk when the window size changes so Cmd-Q (which
-    // bypasses on_close_requested) doesn't lose the latest dimensions.
-    let _resize_save_timer = {
-        let ui_weak = ui.as_weak();
-        let last_gui_state = last_gui_state.clone();
-        let mut last_saved_size: Option<(u32, u32)> = None;
-        let timer = slint::Timer::default();
-        timer.start(
-            slint::TimerMode::Repeated,
-            Duration::from_secs(2),
-            move || {
-                let Some(ui) = ui_weak.upgrade() else {
-                    return;
-                };
-                let sz = ui.window().size();
-                let current = (sz.width, sz.height);
-                if current.0 == 0 || current.1 == 0 {
-                    return;
-                }
-                if last_saved_size == Some(current) {
-                    return;
-                }
-                if let Some(s) = event_consumer::capture_gui_state(&ui) {
-                    state::save(&s);
-                    if let Ok(mut last) = last_gui_state.lock() {
-                        *last = Some(s);
-                    }
-                    last_saved_size = Some(current);
-                }
-            },
-        );
-        timer
-    };
-
     // ── Tray icon ──
 
-    let (_tray_icon, open_item_id, run_now_item_id, quit_item_id, source_submenu, cancel_item) =
+    let (_tray_icon, open_item_id, run_now_item_id, quit_item_id, source_submenu, cancel_item_id) =
         tray::build_tray_icon().map_err(|e| format!("failed to initialize tray icon: {e}"))?;
 
-    let cancel_item_id = cancel_item.id().clone();
-
-    // Timer to keep tray menu state in sync with the app.
-    // Submenu/MenuItem are !Send, so they must stay on the main thread; the event
-    // consumer sends updated labels via a channel and this timer picks them up.
-    // The timer also syncs the cancel item's enabled state with backup_running.
-    let _tray_sync_timer = {
-        let tray_source_items = tray_source_items.clone();
-        let backup_running = backup_running.clone();
-        let timer = slint::Timer::default();
-        let mut was_running = false;
-        timer.start(
-            slint::TimerMode::Repeated,
-            Duration::from_millis(200),
-            move || {
-                // Drain all pending submenu updates, keeping only the latest
-                let mut latest = None;
-                while let Ok(labels) = submenu_labels_rx.try_recv() {
-                    latest = Some(labels);
-                }
-                if let Some(labels) = latest {
-                    while source_submenu.remove_at(0).is_some() {}
-                    let mut new_items = Vec::new();
-                    for label in &labels {
-                        let mi = MenuItem::new(label, true, None);
-                        new_items.push((mi.id().clone(), label.clone()));
-                        let _ = source_submenu.append(&mi);
-                    }
-                    if let Ok(mut tsi) = tray_source_items.lock() {
-                        *tsi = new_items;
-                    }
-                }
-
-                // Sync cancel item enabled state
-                let running = backup_running.load(Ordering::SeqCst);
-                if running != was_running {
-                    cancel_item.set_enabled(running);
-                    was_running = running;
-                }
-            },
-        );
-        timer
-    };
+    // Store the submenu in a thread-local so the event consumer can rebuild it
+    // directly from invoke_from_event_loop (no polling timer needed).
+    tray_state::set_submenu(source_submenu);
 
     {
         let tx = app_tx.clone();
         let tray_source_items = tray_source_items.clone();
         let cancel = cancel_requested.clone();
         let log_tx = ui_tx_for_cancel.clone();
+        let backup_running = backup_running.clone();
         thread::spawn(move || {
             let menu_rx = MenuEvent::receiver();
             while let Ok(event) = menu_rx.recv() {
@@ -288,6 +219,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 } else if event.id == run_now_item_id {
                     let _ = tx.send(AppCommand::RunBackupAll { scheduled: false });
                 } else if event.id == cancel_item_id {
+                    if !backup_running.load(Ordering::SeqCst) {
+                        send_log(&log_tx, "No backup running.");
+                        continue;
+                    }
                     cancel.store(true, Ordering::SeqCst);
                     send_log(
                         &log_tx,
@@ -310,9 +245,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ui.show()?;
     slint::run_event_loop_until_quit()?;
 
-    // Persist GUI state. Eager saves (config change, resize timer, window hide)
-    // cover most paths; this final capture handles Cmd-Q on macOS where the
-    // event loop exits without triggering on_close_requested.
+    // Persist GUI state. Eager saves (config change, window hide) cover most
+    // paths; this final capture handles Cmd-Q on macOS where the event loop
+    // exits without triggering on_close_requested.
     let final_state = event_consumer::capture_gui_state(&ui)
         .or_else(|| last_gui_state.lock().ok().and_then(|g| g.clone()));
     if let Some(s) = final_state {

@@ -42,6 +42,7 @@ pub(crate) fn apply_config(
     scheduler_lock_held: bool,
     ui_tx: &Sender<UiEvent>,
     app_tx: &Sender<AppCommand>,
+    sched_notify_tx: &Sender<()>,
 ) -> bool {
     let repos = match validate_config(&config_path) {
         Ok(v) => v,
@@ -75,6 +76,7 @@ pub(crate) fn apply_config(
             .unwrap_or(Duration::from_secs(24 * 60 * 60));
         state.next_run = Some(Instant::now() + delay);
     }
+    let _ = sched_notify_tx.try_send(());
 
     let canonical = dunce::canonicalize(&config_path).unwrap_or_else(|_| config_path.clone());
     *config_display_path = canonical.clone();

@@ -2,12 +2,14 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-use crossbeam_channel::{Receiver, Sender};
+use crossbeam_channel::Receiver;
 use slint::{ComponentHandle, Model, ModelRc, SharedString, StandardListViewItem, VecModel};
+use tray_icon::menu::MenuId;
 
 use crate::controllers;
 use crate::messages::{AppCommand, SnapshotRowData, UiEvent};
 use crate::state;
+use crate::tray_state;
 use crate::view_models::{to_string_model, to_table_model};
 use crate::{AppData, FindWindow, MainWindow, RepoInfo, RestoreWindow, SourceInfo};
 
@@ -91,10 +93,10 @@ pub(crate) fn spawn(
     ui_weak: slint::Weak<MainWindow>,
     restore_weak: slint::Weak<RestoreWindow>,
     find_weak: slint::Weak<FindWindow>,
-    app_tx: Sender<AppCommand>,
+    app_tx: crossbeam_channel::Sender<AppCommand>,
     snapshot_data: Arc<Mutex<Vec<SnapshotRowData>>>,
     last_gui_state: Arc<Mutex<Option<state::GuiState>>>,
-    submenu_labels_tx: Sender<Vec<String>>,
+    tray_source_items: Arc<Mutex<Vec<(MenuId, String)>>>,
 ) {
     std::thread::spawn(move || {
         while let Ok(event) = ui_rx.recv() {
@@ -104,7 +106,7 @@ pub(crate) fn spawn(
             let snapshot_data = snapshot_data.clone();
             let app_tx = app_tx.clone();
             let last_gui_state = last_gui_state.clone();
-            let submenu_labels_tx = submenu_labels_tx.clone();
+            let tray_source_items = tray_source_items.clone();
 
             let _ = slint::invoke_from_event_loop(move || {
                 let Some(ui) = ui_weak.upgrade() else {
@@ -161,8 +163,8 @@ pub(crate) fn spawn(
                         ui.set_repo_model(ModelRc::new(VecModel::from(model)));
                     }
                     UiEvent::SourceModelData { items, labels } => {
-                        // Signal the main thread to rebuild the tray submenu
-                        let _ = submenu_labels_tx.send(labels.clone());
+                        // Rebuild the tray submenu directly (we're on the main thread).
+                        tray_state::rebuild_submenu(&labels, &tray_source_items);
 
                         ui.global::<AppData>()
                             .set_source_labels(to_string_model(labels));

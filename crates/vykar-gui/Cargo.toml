@@ -16,9 +16,8 @@ workspace = true
 [dependencies]
 vykar-core.workspace = true
 vykar-types.workspace = true
-slint = { version = "1.13", default-features = true }
+slint = { version = "1.13", default-features = false, features = ["std", "compat-1-2", "backend-winit", "renderer-software", "accessibility"] }
 tray-icon = "0.21"
-notify = "6.1"
 crossbeam-channel.workspace = true
 tinyfiledialogs = "3"
 chrono.workspace = true

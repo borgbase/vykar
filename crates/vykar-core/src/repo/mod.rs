@@ -1054,10 +1054,13 @@ impl Repository {
         self.manifest.timestamp = Utc::now();
         self.manifest.snapshots.push(snapshot_entry);
 
-        // Merge the active section if one was produced (filesystem backup).
-        // Dump-only runs produce no active section and skip this block.
-        if let Some((label, section)) = new_file_cache.take_active_section() {
-            self.file_cache.merge_section(&label, section);
+        // Merge active sections if any were produced (filesystem backup).
+        // Dump-only runs produce no active sections and skip this block.
+        let sections = new_file_cache.take_active_sections();
+        if !sections.is_empty() {
+            for (key, section) in sections {
+                self.file_cache.merge_section(&key, section);
+            }
             self.file_cache_dirty = true;
         }
 

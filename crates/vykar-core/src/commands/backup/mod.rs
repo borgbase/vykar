@@ -341,16 +341,20 @@ pub fn run_with_progress(
         }
 
         // Set up read cache + write cache sections for filesystem sources.
+        let canonical_roots: Vec<String> =
+            walk_roots.iter().map(|(_, root)| root.clone()).collect();
         let mut parent_reuse_index: Option<ParentReuseIndex> = None;
         if !source_paths.is_empty() {
-            let section_valid = repo.file_cache_mut().activate_for_paths(source_paths);
+            let section_valid = repo
+                .file_cache_mut()
+                .activate_for_walk_roots(&canonical_roots);
 
             if section_valid {
                 info!(
                     source_label,
                     "file cache: section valid, using cached metadata"
                 );
-            } else if let Some(reason) = repo.file_cache().diagnose_section(source_paths) {
+            } else if let Some(reason) = repo.file_cache().diagnose_sections(&canonical_roots) {
                 info!(source_label, reason = %reason, "file cache: section invalid, cold start");
             }
 
@@ -413,7 +417,7 @@ pub fn run_with_progress(
 
         // Prepare write cache: create empty section for inserts.
         if !source_paths.is_empty() {
-            new_file_cache.begin_section(source_paths);
+            new_file_cache.begin_sections(&canonical_roots);
         }
 
         // Execute command dumps before walking filesystem.
@@ -544,7 +548,7 @@ pub fn run_with_progress(
 
         // Finalize the write cache section with the snapshot ID.
         if !source_paths.is_empty() {
-            new_file_cache.finalize_section(snapshot_id);
+            new_file_cache.finalize_sections(snapshot_id);
         }
         let meta_bytes = rmp_serde::to_vec(&snapshot_meta)?;
         let snapshot_packed = pack_object_with_context(

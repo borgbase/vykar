@@ -174,6 +174,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         *last = Some(s);
                     }
                 }
+                ui.invoke_release_focus();
                 let _ = ui.hide();
             }
             slint::CloseRequestResponse::HideWindow
@@ -191,6 +192,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         *last = Some(s);
                     }
                 }
+                ui.invoke_release_focus();
                 let _ = ui.hide();
             }
         }

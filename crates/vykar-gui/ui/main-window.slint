@@ -37,9 +37,6 @@ component ToolTipArea {
         states [
             visible when ta.has-hover: {
                 opacity: 0.8;
-                in {
-                    animate opacity { duration: 175ms; delay: 700ms; }
-                }
             }
         ]
         x: root.show-left ? ta.mouse-x - self.width - 1rem : ta.mouse-x + 1rem;
@@ -105,12 +102,13 @@ export component MainWindow inherits Window {
     callback snapshot_sort_descending(/* column */ int);
     callback cancel_clicked();
     callback close_window();
-
+    callback release-focus();
+    release-focus => { focus-sink.focus(); }
     title: "Vykar Backup";
     preferred-width: 1100px;
     preferred-height: 760px;
 
-    FocusScope {
+    focus-sink := FocusScope {
         key-pressed(event) => {
             if ((event.modifiers.meta || event.modifiers.control) && event.text == "w") {
                 root.close_window();

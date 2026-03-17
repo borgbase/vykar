@@ -118,6 +118,33 @@ With Docker Compose:
 - Available for `linux/amd64` and `linux/arm64`
 
 
+## Ansible
+
+An official Ansible role is available for automated deployment on Linux servers:
+
+    ansible-galaxy role install borgbase.vykar
+
+The `vykar_config` variable accepts your vykar configuration directly as a YAML dict — since both Ansible and vykar use YAML, the config maps one-to-one:
+
+    - hosts: myserver
+      roles:
+        - role: vykar
+          vars:
+            vykar_config:
+              repositories:
+                - url: "/backup/repo"
+              encryption:
+                passphrase: "mysuperduperpassword"
+              sources:
+                - "/home"
+                - "/etc"
+              schedule:
+                enabled: true
+                every: "24h"
+
+See the [borgbase.vykar role](https://github.com/borgbase/ansible-role-vykar) for all available variables.
+
+
 ## Pre-built binaries
 
 Extract the archive and place the `vykar` binary somewhere on your `PATH`:

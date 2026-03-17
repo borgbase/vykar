@@ -107,7 +107,13 @@ pub fn open_local_repo(repo_dir: &Path) -> Repository {
     let storage = Box::new(
         vykar_storage::local_backend::LocalBackend::new(repo_dir.to_str().unwrap()).unwrap(),
     );
-    Repository::open(storage, None, None).unwrap()
+    Repository::open(
+        storage,
+        None,
+        None,
+        crate::repo::OpenOptions::new().with_index(),
+    )
+    .unwrap()
 }
 
 pub fn backup_single_source(

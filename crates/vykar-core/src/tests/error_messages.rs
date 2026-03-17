@@ -9,7 +9,7 @@ use super::helpers::{make_test_config, source_entry};
 fn open_repo_on_empty_storage_includes_url() {
     let repo_dir = TempDir::new().unwrap();
     let config = make_test_config(repo_dir.path());
-    let result = commands::util::open_repo_without_index(&config, None);
+    let result = commands::util::open_repo(&config, None, crate::repo::OpenOptions::new());
     let err = match result {
         Err(e) => e,
         Ok(_) => panic!("expected RepoNotFound error"),

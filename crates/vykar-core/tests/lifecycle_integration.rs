@@ -10,7 +10,7 @@ use vykar_core::config::{
     ScheduleConfig, SourceEntry, SourceHooksConfig, VykarConfig, XattrsConfig,
 };
 use vykar_core::repo::lock;
-use vykar_core::repo::{EncryptionMode, Repository};
+use vykar_core::repo::{EncryptionMode, OpenOptions, Repository};
 use vykar_storage::local_backend::LocalBackend;
 use vykar_types::error::VykarError;
 
@@ -90,7 +90,7 @@ fn source_entry(path: &Path, label: &str) -> SourceEntry {
 
 fn open_local_repo(repo_dir: &Path, passphrase: Option<&str>) -> Repository {
     let storage = Box::new(LocalBackend::new(repo_dir.to_str().unwrap()).unwrap());
-    Repository::open(storage, passphrase, None).unwrap()
+    Repository::open(storage, passphrase, None, OpenOptions::new().with_index()).unwrap()
 }
 
 fn backup_source(
@@ -334,7 +334,7 @@ fn run_encrypted_lifecycle(mode: EncryptionModeConfig, expected_mode: Encryption
     );
 
     let storage = Box::new(LocalBackend::new(repo_dir.to_str().unwrap()).unwrap());
-    let wrong_open = Repository::open(storage, Some(wrong_passphrase), None);
+    let wrong_open = Repository::open(storage, Some(wrong_passphrase), None, OpenOptions::new());
     assert!(matches!(wrong_open, Err(VykarError::DecryptionFailed)));
 
     let wrong_extract = commands::restore::run(
@@ -480,7 +480,7 @@ fn restore_loads_items_via_restore_cache_without_index() {
 
     // Open repo WITHOUT loading the chunk index
     let storage = Box::new(LocalBackend::new(repo_dir.to_str().unwrap()).unwrap());
-    let mut repo = Repository::open_without_index(storage, None, None).unwrap();
+    let mut repo = Repository::open(storage, None, None, OpenOptions::new()).unwrap();
 
     // Restore cache should exist (built by save_state during backup)
     let cache = repo

@@ -4,6 +4,7 @@ use chrono::{DateTime, Utc};
 use globset::GlobMatcher;
 
 use crate::config::VykarConfig;
+use crate::repo::OpenOptions;
 use crate::snapshot::item::{Item, ItemType};
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::Result;
@@ -106,7 +107,7 @@ pub fn run(
     filter: &FindFilter,
 ) -> Result<Vec<PathTimeline>> {
     let (mut repo, _session_guard) =
-        super::util::open_repo_with_read_session(config, passphrase, true, false)?;
+        super::util::open_repo_with_read_session(config, passphrase, OpenOptions::new())?;
 
     // Select and sort snapshots chronologically
     let mut entries: Vec<_> = repo.manifest().snapshots.clone();

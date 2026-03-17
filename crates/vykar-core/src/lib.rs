@@ -9,6 +9,7 @@ pub mod limits;
 pub mod platform;
 pub mod prune;
 pub mod repo;
+pub use repo::OpenOptions;
 pub mod snapshot;
 pub mod storage;
 

@@ -325,8 +325,12 @@ fn probe_snapshot(
     snapshot_name: &str,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     with_repo_passphrase(config, label, |passphrase| {
-        let repo = vykar_core::commands::util::open_repo_without_index_or_cache(config, passphrase)
-            .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
+        let repo = vykar_core::commands::util::open_repo(
+            config,
+            passphrase,
+            vykar_core::OpenOptions::new(),
+        )
+        .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
         Ok(repo.manifest().find_snapshot(snapshot_name).is_some())
     })
 }

@@ -6,7 +6,7 @@ use vykar_core::config::{
     ScheduleConfig, VykarConfig, XattrsConfig,
 };
 use vykar_core::repo::pack::PackType;
-use vykar_core::repo::{EncryptionMode, Repository};
+use vykar_core::repo::{EncryptionMode, OpenOptions, Repository};
 use vykar_core::snapshot::item::ItemType;
 use vykar_storage::local_backend::LocalBackend;
 
@@ -45,7 +45,13 @@ fn init_local_repo(dir: &std::path::Path) -> Repository {
 fn open_local_repo(dir: &std::path::Path) -> Repository {
     init_test_environment();
     let storage = Box::new(LocalBackend::new(dir.to_str().unwrap()).unwrap());
-    Repository::open(storage, None, None).unwrap()
+    Repository::open(
+        storage,
+        None,
+        None,
+        OpenOptions::new().with_index().with_file_cache(),
+    )
+    .unwrap()
 }
 
 fn make_test_config(repo_dir: &std::path::Path) -> VykarConfig {
@@ -197,7 +203,13 @@ fn init_auto_mode_persists_concrete_encryption_mode() {
     drop(repo);
 
     let storage = Box::new(LocalBackend::new(repo_dir.to_str().unwrap()).unwrap());
-    let reopened = Repository::open(storage, Some("test-passphrase"), None).unwrap();
+    let reopened = Repository::open(
+        storage,
+        Some("test-passphrase"),
+        None,
+        OpenOptions::new().with_index(),
+    )
+    .unwrap();
     assert_eq!(reopened.config.encryption, selected);
 }
 
@@ -2069,7 +2081,7 @@ fn plaintext_chunk_id_key_consistent_across_init_and_open() {
 
     // Re-open the same repo and compute the ChunkId for the same data
     let storage = Box::new(LocalBackend::new(repo_dir.to_str().unwrap()).unwrap());
-    let repo = Repository::open(storage, None, None).unwrap();
+    let repo = Repository::open(storage, None, None, OpenOptions::new()).unwrap();
     let key_open = *repo.crypto.chunk_id_key();
     let id_open = vykar_types::chunk_id::ChunkId::compute(&key_open, data);
 

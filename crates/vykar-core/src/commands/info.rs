@@ -6,6 +6,7 @@ use vykar_types::error::Result;
 
 use super::list::load_snapshot_meta;
 use super::util::open_repo;
+use crate::repo::OpenOptions;
 
 /// Repository statistics for the `info` command.
 #[derive(Debug, Clone)]
@@ -24,7 +25,7 @@ pub struct InfoStats {
 
 /// Run `vykar info`.
 pub fn run(config: &VykarConfig, passphrase: Option<&str>) -> Result<InfoStats> {
-    let repo = open_repo(config, passphrase)?;
+    let repo = open_repo(config, passphrase, OpenOptions::new().with_index())?;
 
     let mut raw_size = 0u64;
     let mut compressed_size = 0u64;

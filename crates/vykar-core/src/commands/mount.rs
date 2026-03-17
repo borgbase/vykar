@@ -709,7 +709,11 @@ pub fn run_with_progress(
     source_filter: &[String],
     mut progress: Option<&mut dyn FnMut(MountProgressEvent)>,
 ) -> Result<()> {
-    let mut repo = open_repo(config, passphrase)?;
+    let mut repo = open_repo(
+        config,
+        passphrase,
+        crate::repo::OpenOptions::new().with_index(),
+    )?;
 
     // Build the VFS tree from snapshot items
     if let Some(ref mut cb) = progress {

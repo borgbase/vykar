@@ -9,7 +9,7 @@ use crate::repo::format::{unpack_object_expect_with_context, ObjectType};
 use crate::repo::pack::{
     read_blob_from_pack, PACK_HEADER_SIZE, PACK_MAGIC, PACK_VERSION_MAX, PACK_VERSION_MIN,
 };
-use crate::repo::Repository;
+use crate::repo::{OpenOptions, Repository};
 use crate::snapshot::item::ItemType;
 use vykar_crypto::CryptoEngine;
 use vykar_storage::{
@@ -344,7 +344,7 @@ pub fn run_with_progress(
 
     // Open repo (needed for fingerprint check and actual scan).
     let (mut repo, _session_guard) =
-        super::util::open_repo_with_read_session(config, passphrase, true, false)?;
+        super::util::open_repo_with_read_session(config, passphrase, OpenOptions::new())?;
 
     // Determine effective check percentage using repo fingerprint.
     let fingerprint = compute_repo_fingerprint(&repo);
@@ -1624,7 +1624,7 @@ pub fn run_with_repair(
     if mode == RepairMode::PlanOnly {
         // PlanOnly: read session, no lock, purely read-only.
         let (mut repo, _session_guard) =
-            super::util::open_repo_with_read_session(config, passphrase, true, false)?;
+            super::util::open_repo_with_read_session(config, passphrase, OpenOptions::new())?;
         repo.load_chunk_index_uncached()?;
         repo.refresh_snapshot_list()?;
 
@@ -1658,52 +1658,59 @@ pub fn run_with_repair(
         })
     } else {
         // Apply: maintenance lock, re-scan under lock, mutate state.
-        super::util::with_open_repo_maintenance_lock(config, passphrase, |repo| {
-            repo.load_chunk_index_uncached()?;
-            repo.refresh_snapshot_list()?;
+        super::util::with_open_repo_maintenance_lock(
+            config,
+            passphrase,
+            OpenOptions::new(),
+            |repo| {
+                repo.load_chunk_index_uncached()?;
+                repo.refresh_snapshot_list()?;
 
-            let scan = integrity_scan(repo, config, &scan_opts, &mut progress)?;
+                let scan = integrity_scan(repo, config, &scan_opts, &mut progress)?;
 
-            // Build per-pack grouping for plan
-            let mut pack_chunks: HashMap<PackId, Vec<(ChunkId, ChunkIndexEntry)>> = HashMap::new();
-            for (chunk_id, entry) in repo.chunk_index().iter() {
-                pack_chunks
-                    .entry(entry.pack_id)
-                    .or_default()
-                    .push((*chunk_id, *entry));
-            }
+                // Build per-pack grouping for plan
+                let mut pack_chunks: HashMap<PackId, Vec<(ChunkId, ChunkIndexEntry)>> =
+                    HashMap::new();
+                for (chunk_id, entry) in repo.chunk_index().iter() {
+                    pack_chunks
+                        .entry(entry.pack_id)
+                        .or_default()
+                        .push((*chunk_id, *entry));
+                }
 
-            let plan = build_repair_plan(&scan.issues, &pack_chunks, &scan.snapshot_chunk_refs);
+                let plan = build_repair_plan(&scan.issues, &pack_chunks, &scan.snapshot_chunk_refs);
 
-            // If plan has data-loss actions, probe append-only before mutating.
-            if plan.has_data_loss && !probe_deletes_allowed(repo.storage.as_ref()) {
-                return Err(VykarError::Other(
-                    "repair requires deleting immutable snapshot objects; \
+                // If plan has data-loss actions, probe append-only before mutating.
+                if plan.has_data_loss && !probe_deletes_allowed(repo.storage.as_ref()) {
+                    return Err(VykarError::Other(
+                        "repair requires deleting immutable snapshot objects; \
                      not supported on append-only backends"
-                        .into(),
-                ));
-            }
+                            .into(),
+                    ));
+                }
 
-            // Execute the repair
-            let (applied, repair_errors) = execute_repair(repo, &plan, &scan.issues, &pack_chunks)?;
+                // Execute the repair
+                let (applied, repair_errors) =
+                    execute_repair(repo, &plan, &scan.issues, &pack_chunks)?;
 
-            let check_result = CheckResult {
-                snapshots_checked: scan.counters.snapshots_checked,
-                items_checked: scan.counters.items_checked,
-                chunks_existence_checked: scan.counters.chunks_existence_checked,
-                packs_existence_checked: scan.counters.packs_existence_checked,
-                chunks_data_verified: scan.counters.chunks_data_verified,
-                errors: scan.issues.iter().map(|i| i.to_check_error()).collect(),
-                skipped: false,
-            };
+                let check_result = CheckResult {
+                    snapshots_checked: scan.counters.snapshots_checked,
+                    items_checked: scan.counters.items_checked,
+                    chunks_existence_checked: scan.counters.chunks_existence_checked,
+                    packs_existence_checked: scan.counters.packs_existence_checked,
+                    chunks_data_verified: scan.counters.chunks_data_verified,
+                    errors: scan.issues.iter().map(|i| i.to_check_error()).collect(),
+                    skipped: false,
+                };
 
-            Ok(RepairResult {
-                check_result,
-                plan,
-                applied,
-                repair_errors,
-            })
-        })
+                Ok(RepairResult {
+                    check_result,
+                    plan,
+                    applied,
+                    repair_errors,
+                })
+            },
+        )
     }
 }
 

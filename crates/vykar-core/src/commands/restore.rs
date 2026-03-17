@@ -164,8 +164,11 @@ fn restore_with_filter<F>(
 where
     F: FnMut(&str) -> bool,
 {
-    let (mut repo, _session_guard) =
-        super::util::open_repo_with_read_session(config, passphrase, true, true)?;
+    let (mut repo, _session_guard) = super::util::open_repo_with_read_session(
+        config,
+        passphrase,
+        crate::repo::OpenOptions::new(),
+    )?;
     // Shrink blob cache for restore — the parallel pipeline reads pack data
     // directly via storage.get_range(), so the cache only serves the small
     // item-stream tree-pack chunks. 2 MiB is plenty.

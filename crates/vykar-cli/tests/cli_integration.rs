@@ -3,7 +3,7 @@ use std::process::{Command, Output};
 use std::time::Duration;
 
 use tempfile::TempDir;
-use vykar_core::repo::Repository;
+use vykar_core::repo::{OpenOptions, Repository};
 use vykar_storage::local_backend::LocalBackend;
 
 struct CliFixture {
@@ -179,7 +179,7 @@ fn parse_snapshot_name(output: &str) -> String {
 
 fn delete_pack_for_first_chunk(repo_dir: &Path) {
     let storage = Box::new(LocalBackend::new(repo_dir.to_str().unwrap()).unwrap());
-    let repo = Repository::open(storage, None, None).unwrap();
+    let repo = Repository::open(storage, None, None, OpenOptions::new().with_index()).unwrap();
     let (_chunk_id, entry) = repo
         .chunk_index()
         .iter()
@@ -195,7 +195,7 @@ fn delete_pack_for_first_chunk(repo_dir: &Path) {
 
 fn corrupt_first_snapshot(repo_dir: &Path) {
     let storage = Box::new(LocalBackend::new(repo_dir.to_str().unwrap()).unwrap());
-    let repo = Repository::open(storage, None, None).unwrap();
+    let repo = Repository::open(storage, None, None, OpenOptions::new().with_index()).unwrap();
     let entry = repo
         .manifest()
         .snapshots

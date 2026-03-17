@@ -693,7 +693,12 @@ fn open_rejects_oversized_max_pack_size() {
     repo.storage.put("config", &tampered_data).unwrap();
 
     // Re-open should fail.
-    let result = Repository::open(Box::new(repo.storage.clone()), None, None);
+    let result = Repository::open(
+        Box::new(repo.storage.clone()),
+        None,
+        None,
+        crate::repo::OpenOptions::new().with_index(),
+    );
     assert!(
         result.is_err(),
         "open should reject stored max_pack_size > 512 MiB"
@@ -935,7 +940,13 @@ fn cross_session_pending_index_recovery() {
     drop(repo);
 
     // Session 2: reopen the same repo with a different session ID.
-    let mut repo2 = Repository::open(Box::new(shared_storage), None, None).unwrap();
+    let mut repo2 = Repository::open(
+        Box::new(shared_storage),
+        None,
+        None,
+        crate::repo::OpenOptions::new().with_index(),
+    )
+    .unwrap();
     repo2.begin_write_session().unwrap();
     repo2.set_write_session_id("bbb".to_string());
 

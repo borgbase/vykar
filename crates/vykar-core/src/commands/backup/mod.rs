@@ -291,16 +291,15 @@ pub fn run_with_progress(
     // When there are no filesystem source paths (command-dump-only backup),
     // skip loading the file cache — it's never consulted for command dumps
     // and can be large (~736K entries).
-    let skip_file_cache = source_paths.is_empty();
     let cache_dir = super::util::cache_dir_from_config(config);
-    let open_result = if skip_file_cache {
-        Repository::open_without_index_or_cache(backend, passphrase, cache_dir).and_then(|mut r| {
-            r.load_chunk_index()?;
-            Ok(r)
-        })
+    let opts = if source_paths.is_empty() {
+        crate::repo::OpenOptions::new().with_index()
     } else {
-        Repository::open(backend, passphrase, cache_dir)
+        crate::repo::OpenOptions::new()
+            .with_index()
+            .with_file_cache()
     };
+    let open_result = Repository::open(backend, passphrase, cache_dir, opts);
     let mut repo = match open_result {
         Ok(r) => {
             if let Err(e) = super::util::verify_repo_identity(config, &r) {

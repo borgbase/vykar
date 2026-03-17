@@ -9,6 +9,7 @@ use crate::config::VykarConfig;
 use crate::repo::pack::{
     PackType, PackWriter, PACK_HEADER_SIZE, PACK_MAGIC, PACK_VERSION_MAX, PACK_VERSION_MIN,
 };
+use crate::repo::OpenOptions;
 use crate::repo::Repository;
 use vykar_storage::{RepackBlobRef, RepackOperationRequest, RepackPlanRequest, StorageBackend};
 use vykar_types::chunk_id::ChunkId;
@@ -62,7 +63,7 @@ pub fn run(
         threshold
     };
 
-    let mut repo = open_repo(config, passphrase)?;
+    let mut repo = open_repo(config, passphrase, OpenOptions::new().with_index())?;
 
     let is_remote = matches!(
         vykar_storage::parse_repo_url(&config.repository.url),

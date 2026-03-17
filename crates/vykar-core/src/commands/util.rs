@@ -8,7 +8,7 @@ use std::sync::Arc;
 use crate::config::VykarConfig;
 use crate::limits;
 use crate::repo::lock;
-use crate::repo::{identity, Repository};
+use crate::repo::{identity, OpenOptions, Repository};
 use crate::storage;
 use vykar_types::error::{Result, VykarError};
 
@@ -37,43 +37,16 @@ pub(crate) fn verify_repo_identity(config: &VykarConfig, repo: &Repository) -> R
 }
 
 /// Open a repository from config using the standard backend resolver.
-pub fn open_repo(config: &VykarConfig, passphrase: Option<&str>) -> Result<Repository> {
-    let connections = config.limits.connections;
-    let backend = storage::backend_from_config(&config.repository, connections)?;
-    let backend = limits::wrap_storage_backend(backend, &config.limits);
-    let repo = Repository::open(backend, passphrase, cache_dir_from_config(config))
-        .map_err(|e| enrich_repo_not_found(e, &config.repository.url))?;
-    verify_repo_identity(config, &repo)?;
-    Ok(repo)
-}
-
-/// Open a repository without loading the chunk index.
-/// Suitable for read-only operations that load or filter the index lazily.
-pub fn open_repo_without_index(
+pub fn open_repo(
     config: &VykarConfig,
     passphrase: Option<&str>,
+    opts: OpenOptions,
 ) -> Result<Repository> {
     let connections = config.limits.connections;
     let backend = storage::backend_from_config(&config.repository, connections)?;
     let backend = limits::wrap_storage_backend(backend, &config.limits);
-    let repo = Repository::open_without_index(backend, passphrase, cache_dir_from_config(config))
+    let repo = Repository::open(backend, passphrase, cache_dir_from_config(config), opts)
         .map_err(|e| enrich_repo_not_found(e, &config.repository.url))?;
-    verify_repo_identity(config, &repo)?;
-    Ok(repo)
-}
-
-/// Open a repository without loading the chunk index or file cache.
-/// Suitable for operations (e.g. restore) that need neither.
-pub fn open_repo_without_index_or_cache(
-    config: &VykarConfig,
-    passphrase: Option<&str>,
-) -> Result<Repository> {
-    let connections = config.limits.connections;
-    let backend = storage::backend_from_config(&config.repository, connections)?;
-    let backend = limits::wrap_storage_backend(backend, &config.limits);
-    let repo =
-        Repository::open_without_index_or_cache(backend, passphrase, cache_dir_from_config(config))
-            .map_err(|e| enrich_repo_not_found(e, &config.repository.url))?;
     verify_repo_identity(config, &repo)?;
     Ok(repo)
 }
@@ -84,8 +57,7 @@ pub fn open_repo_without_index_or_cache(
 pub fn open_repo_with_read_session(
     config: &VykarConfig,
     passphrase: Option<&str>,
-    skip_index: bool,
-    skip_file_cache: bool,
+    opts: OpenOptions,
 ) -> Result<(Repository, lock::SessionGuard)> {
     let connections = config.limits.connections;
     let backend = storage::backend_from_config(&config.repository, connections)?;
@@ -94,13 +66,7 @@ pub fn open_repo_with_read_session(
     let session_id = format!("{:032x}", rand::random::<u128>());
     lock::register_session(backend.as_ref(), &session_id)?;
 
-    let open_result = if skip_file_cache {
-        Repository::open_without_index_or_cache(backend, passphrase, cache_dir_from_config(config))
-    } else if skip_index {
-        Repository::open_without_index(backend, passphrase, cache_dir_from_config(config))
-    } else {
-        Repository::open(backend, passphrase, cache_dir_from_config(config))
-    };
+    let open_result = Repository::open(backend, passphrase, cache_dir_from_config(config), opts);
 
     let deregister_fresh = |sid: &str| {
         if let Ok(cleanup) = storage::backend_from_config(&config.repository, 1) {
@@ -135,9 +101,10 @@ pub fn open_repo_with_read_session(
 pub fn with_open_repo_lock<T>(
     config: &VykarConfig,
     passphrase: Option<&str>,
+    opts: OpenOptions,
     action: impl FnOnce(&mut Repository) -> Result<T>,
 ) -> Result<T> {
-    let mut repo = open_repo(config, passphrase)?;
+    let mut repo = open_repo(config, passphrase, opts)?;
     with_repo_lock(&mut repo, action)
 }
 
@@ -188,9 +155,10 @@ pub fn with_repo_lock<T>(
 pub fn with_open_repo_maintenance_lock<T>(
     config: &VykarConfig,
     passphrase: Option<&str>,
+    opts: OpenOptions,
     action: impl FnOnce(&mut Repository) -> Result<T>,
 ) -> Result<T> {
-    let mut repo = open_repo(config, passphrase)?;
+    let mut repo = open_repo(config, passphrase, opts)?;
     with_maintenance_lock(&mut repo, action)
 }
 

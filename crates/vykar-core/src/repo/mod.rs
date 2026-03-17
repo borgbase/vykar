@@ -125,6 +125,28 @@ impl EncryptionMode {
     }
 }
 
+/// Options controlling which expensive subsystems are loaded when opening a
+/// repository. Both default to `false` (skip). Only `backup` needs both.
+#[derive(Clone, Debug, Default)]
+pub struct OpenOptions {
+    pub load_index: bool,
+    pub load_file_cache: bool,
+}
+
+impl OpenOptions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn with_index(mut self) -> Self {
+        self.load_index = true;
+        self
+    }
+    pub fn with_file_cache(mut self) -> Self {
+        self.load_file_cache = true;
+        self
+    }
+}
+
 /// A handle to an opened repository.
 pub struct Repository {
     pub storage: Arc<dyn StorageBackend>,
@@ -319,49 +341,25 @@ impl Repository {
         })
     }
 
-    /// Open an existing repository.
+    /// Open an existing repository with the given options.
+    ///
+    /// By default (`OpenOptions::new()`), neither the chunk index nor the file
+    /// cache is loaded. Use `.with_index()` and/or `.with_file_cache()` to
+    /// opt in.
     pub fn open(
         storage: Box<dyn StorageBackend>,
         passphrase: Option<&str>,
         cache_dir: Option<PathBuf>,
+        opts: OpenOptions,
     ) -> Result<Self> {
-        let mut repo = Self::open_base(storage, passphrase, cache_dir)?;
-        repo.load_chunk_index()?;
+        let mut repo = Self::open_inner(storage, passphrase, cache_dir, !opts.load_file_cache)?;
+        if opts.load_index {
+            repo.load_chunk_index()?;
+        }
         Ok(repo)
     }
 
-    /// Open a repository without loading the chunk index.
-    /// Suitable for read-only operations (restore, list) that either don't need
-    /// the index or will load it lazily via `load_chunk_index()`.
-    pub fn open_without_index(
-        storage: Box<dyn StorageBackend>,
-        passphrase: Option<&str>,
-        cache_dir: Option<PathBuf>,
-    ) -> Result<Self> {
-        Self::open_base(storage, passphrase, cache_dir)
-    }
-
-    /// Open a repository without loading the chunk index or file cache.
-    /// Suitable for read-only operations (e.g. restore) that need neither.
-    pub fn open_without_index_or_cache(
-        storage: Box<dyn StorageBackend>,
-        passphrase: Option<&str>,
-        cache_dir: Option<PathBuf>,
-    ) -> Result<Self> {
-        Self::open_base_inner(storage, passphrase, cache_dir, true)
-    }
-
-    /// Shared open logic: reads config, builds crypto, loads manifest and file cache.
-    /// Does NOT load the chunk index — callers either load it themselves or skip it.
-    fn open_base(
-        storage: Box<dyn StorageBackend>,
-        passphrase: Option<&str>,
-        cache_dir: Option<PathBuf>,
-    ) -> Result<Self> {
-        Self::open_base_inner(storage, passphrase, cache_dir, false)
-    }
-
-    fn open_base_inner(
+    fn open_inner(
         storage: Box<dyn StorageBackend>,
         passphrase: Option<&str>,
         cache_dir: Option<PathBuf>,
@@ -471,7 +469,7 @@ impl Repository {
 
     /// Load the chunk index from storage on demand.
     /// Always downloads the remote index blob to get the authenticated generation.
-    /// Can be called after `open_without_index()` to lazily load the index.
+    /// Can be called after opening without `load_index` to lazily load the index.
     /// Also recalculates the data pack writer target from the loaded index.
     pub fn load_chunk_index(&mut self) -> Result<()> {
         let (gen, index) = self.reload_full_index_with_generation()?;

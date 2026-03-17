@@ -1,40 +1,52 @@
 use chrono::{DateTime, Duration, TimeZone, Utc};
 
 use crate::config::RetentionConfig;
-use crate::prune::{apply_policy, parse_duration, PruneDecision};
+use crate::prune::{apply_policy, parse_timespan, PruneDecision};
 use crate::repo::manifest::SnapshotEntry;
 use vykar_types::snapshot_id::SnapshotId;
 
 #[test]
 fn parse_duration_days() {
-    let d = parse_duration("7d").unwrap();
+    let d = parse_timespan("7d").unwrap();
     assert_eq!(d, Duration::days(7));
 }
 
 #[test]
 fn parse_duration_hours() {
-    let d = parse_duration("48h").unwrap();
+    let d = parse_timespan("48h").unwrap();
     assert_eq!(d, Duration::hours(48));
 }
 
 #[test]
 fn parse_duration_weeks() {
-    let d = parse_duration("2w").unwrap();
+    let d = parse_timespan("2w").unwrap();
     assert_eq!(d, Duration::weeks(2));
 }
 
 #[test]
 fn parse_duration_pure_numeric() {
     // Pure numeric → days (borg convention)
-    let d = parse_duration("30").unwrap();
+    let d = parse_timespan("30").unwrap();
     assert_eq!(d, Duration::days(30));
 }
 
 #[test]
+fn parse_duration_months() {
+    let d = parse_timespan("6m").unwrap();
+    assert_eq!(d, Duration::days(6 * 30));
+}
+
+#[test]
+fn parse_duration_years() {
+    let d = parse_timespan("1y").unwrap();
+    assert_eq!(d, Duration::days(365));
+}
+
+#[test]
 fn parse_duration_invalid() {
-    assert!(parse_duration("").is_err());
-    assert!(parse_duration("abc").is_err());
-    assert!(parse_duration("5x").is_err());
+    assert!(parse_timespan("").is_err());
+    assert!(parse_timespan("abc").is_err());
+    assert!(parse_timespan("5x").is_err());
 }
 
 fn make_snapshots(count: usize) -> Vec<SnapshotEntry> {

@@ -13,7 +13,7 @@ pub use self::hooks::{HooksConfig, SourceHooksConfig};
 pub use self::limits::ResourceLimitsConfig;
 
 // Re-export from submodules
-pub use self::defaults::parse_human_duration;
+pub use self::defaults::parse_interval;
 pub(crate) use self::defaults::{default_max_pack_size, default_min_pack_size};
 #[allow(deprecated)]
 pub use self::resolve::load_config;

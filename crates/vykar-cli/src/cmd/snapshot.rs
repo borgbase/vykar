@@ -6,7 +6,7 @@ use vykar_core::commands;
 use vykar_core::config::VykarConfig;
 
 use crate::cli::{SnapshotCommand, SortField};
-use crate::format::{format_bytes, parse_duration_span, parse_size};
+use crate::format::{format_bytes, parse_size};
 use crate::passphrase::with_repo_passphrase;
 use crate::table::{add_kv_row, CliTableTheme};
 
@@ -212,7 +212,21 @@ fn run_snapshot_find(
         .transpose()
         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
-    let since_dt = since.as_deref().map(parse_duration_span).transpose()?;
+    let since_dt = since
+        .as_deref()
+        .map(|s| -> Result<_, Box<dyn std::error::Error>> {
+            if !s.trim().ends_with(|c: char| c.is_ascii_alphabetic()) {
+                return Err(
+                    format!("--since requires a unit suffix (h, d, w, m, y), got '{s}'").into(),
+                );
+            }
+            let dur = vykar_core::prune::parse_timespan(s)?;
+            if dur <= chrono::Duration::zero() {
+                return Err(format!("--since duration must be positive (got '{s}')").into());
+            }
+            Ok(chrono::Utc::now() - dur)
+        })
+        .transpose()?;
 
     let larger_than = larger.as_deref().map(|s| parse_size(s)).transpose()?;
 

@@ -21,7 +21,7 @@ pub struct PruneEntry {
 
 /// Parse a duration string like "2d", "48h", "1w", "6m", "1y".
 /// Pure numeric values are treated as days (borg convention).
-pub fn parse_duration(s: &str) -> Result<chrono::Duration> {
+pub fn parse_timespan(s: &str) -> Result<chrono::Duration> {
     let s = s.trim();
     if s.is_empty() {
         return Err(VykarError::Config("empty duration string".into()));
@@ -147,7 +147,7 @@ pub fn apply_policy(
 
     // keep_within
     if let Some(ref within_str) = policy.keep_within {
-        let dur = parse_duration(within_str)?;
+        let dur = parse_timespan(within_str)?;
         let cutoff = now - dur;
         for &idx in &indices {
             if times[idx] >= cutoff {

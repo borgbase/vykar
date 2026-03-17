@@ -56,7 +56,7 @@ vykar snapshot find --type f --larger 1M --smaller 20M --since 30d
 ```
 
 - `--last` must be `>= 1`.
-- `--since` accepts positive spans with suffix `h`, `d`, or `w` (for example: `24h`, `7d`, `2w`).
+- `--since` accepts positive spans with suffix `h`, `d`, `w`, `m` (months), or `y` (for example: `24h`, `7d`, `2w`, `6m`, `1y`).
 - `--larger` means at least this size, and `--smaller` means at most this size.
 
 ## Restore to a directory

@@ -124,7 +124,7 @@ impl Default for ScheduleConfig {
 impl ScheduleConfig {
     pub fn every_duration(&self) -> vykar_types::error::Result<Duration> {
         let raw = self.every.as_deref().unwrap_or("24h");
-        super::defaults::parse_human_duration(raw)
+        super::defaults::parse_interval(raw)
     }
 
     pub fn is_cron(&self) -> bool {
@@ -428,7 +428,7 @@ impl CheckConfig {
     pub fn full_every_duration(&self) -> Option<Duration> {
         self.full_every
             .as_deref()
-            .and_then(|s| super::defaults::parse_human_duration(s).ok())
+            .and_then(|s| super::defaults::parse_interval(s).ok())
     }
 
     pub fn validate(&self) -> vykar_types::error::Result<()> {
@@ -442,7 +442,7 @@ impl CheckConfig {
         }
 
         if let Some(ref raw) = self.full_every {
-            super::defaults::parse_human_duration(raw).map_err(|_| {
+            super::defaults::parse_interval(raw).map_err(|_| {
                 VykarError::Config(format!(
                     "check.full_every: invalid duration '{raw}' (use s/m/h/d)"
                 ))

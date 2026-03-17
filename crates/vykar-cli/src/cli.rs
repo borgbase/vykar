@@ -314,7 +314,7 @@ pub(crate) enum SnapshotCommand {
         /// Filter by entry type: f (file), d (directory), l (symlink)
         #[arg(long = "type", value_name = "TYPE", help_heading = "Filter Options")]
         entry_type: Option<String>,
-        /// Only include items modified within this time span (e.g. 24h, 7d, 2w)
+        /// Only include items modified within this time span (e.g. 24h, 7d, 2w, 6m, 1y)
         #[arg(long, help_heading = "Filter Options")]
         since: Option<String>,
         /// Only include items at least this size (e.g. 1M, 500K)

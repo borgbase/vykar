@@ -55,7 +55,7 @@ pub(super) fn default_passphrase_prompt_timeout_seconds() -> u64 {
 }
 
 /// Parse a simple duration string like "30m", "4h", or "2d".
-pub fn parse_human_duration(raw: &str) -> vykar_types::error::Result<Duration> {
+pub fn parse_interval(raw: &str) -> vykar_types::error::Result<Duration> {
     let input = raw.trim();
     if input.is_empty() {
         return Err(vykar_types::error::VykarError::Config(
@@ -104,28 +104,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_human_duration_units() {
-        assert_eq!(parse_human_duration("10s").unwrap().as_secs(), 10);
-        assert_eq!(parse_human_duration("30m").unwrap().as_secs(), 30 * 60);
-        assert_eq!(parse_human_duration("4h").unwrap().as_secs(), 4 * 60 * 60);
-        assert_eq!(
-            parse_human_duration("2d").unwrap().as_secs(),
-            2 * 24 * 60 * 60
-        );
+    fn test_parse_interval_units() {
+        assert_eq!(parse_interval("10s").unwrap().as_secs(), 10);
+        assert_eq!(parse_interval("30m").unwrap().as_secs(), 30 * 60);
+        assert_eq!(parse_interval("4h").unwrap().as_secs(), 4 * 60 * 60);
+        assert_eq!(parse_interval("2d").unwrap().as_secs(), 2 * 24 * 60 * 60);
     }
 
     #[test]
-    fn test_parse_human_duration_plain_number_is_days() {
-        assert_eq!(
-            parse_human_duration("3").unwrap().as_secs(),
-            3 * 24 * 60 * 60
-        );
+    fn test_parse_interval_plain_number_is_days() {
+        assert_eq!(parse_interval("3").unwrap().as_secs(), 3 * 24 * 60 * 60);
     }
 
     #[test]
-    fn test_parse_human_duration_rejects_invalid_values() {
-        assert!(parse_human_duration("").is_err());
-        assert!(parse_human_duration("0h").is_err());
-        assert!(parse_human_duration("5w").is_err());
+    fn test_parse_interval_rejects_invalid_values() {
+        assert!(parse_interval("").is_err());
+        assert!(parse_interval("0h").is_err());
+        assert!(parse_interval("5w").is_err());
     }
 }

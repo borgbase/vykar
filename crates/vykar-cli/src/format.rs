@@ -1,36 +1,3 @@
-pub(crate) fn parse_duration_span(
-    s: &str,
-) -> Result<chrono::DateTime<chrono::Utc>, Box<dyn std::error::Error>> {
-    let s = s.trim();
-    if s.is_empty() {
-        return Err("empty duration string".into());
-    }
-
-    let (num_str, suffix) = match s.as_bytes().last() {
-        Some(b'h' | b'H') => (&s[..s.len() - 1], 3600i64),
-        Some(b'd' | b'D') => (&s[..s.len() - 1], 86400i64),
-        Some(b'w' | b'W') => (&s[..s.len() - 1], 604800i64),
-        _ => {
-            return Err(format!(
-                "invalid duration '{s}': use a suffix of h, d, or w (e.g. 24h, 7d, 2w)"
-            )
-            .into())
-        }
-    };
-
-    let n: i64 = num_str
-        .parse()
-        .map_err(|_| format!("invalid duration number: '{num_str}'"))?;
-
-    if n <= 0 {
-        return Err(format!("--since duration must be positive (got '{s}')").into());
-    }
-
-    let seconds = n * suffix;
-    let duration = chrono::Duration::seconds(seconds);
-    Ok(chrono::Utc::now() - duration)
-}
-
 /// Parse a human-readable size string like "500M", "2G", "1024K" into bytes.
 pub(crate) fn parse_size(s: &str) -> Result<u64, Box<dyn std::error::Error>> {
     let s = s.trim();

@@ -122,6 +122,10 @@ pub enum BackupProgressEvent {
         /// Bytes of new (deduplicated) data added for this file.
         added_bytes: u64,
     },
+    /// Emitted at each phase-2 commit stage boundary for progress reporting.
+    CommitStage {
+        stage: &'static str,
+    },
 }
 
 pub(crate) fn emit_progress(
@@ -626,8 +630,12 @@ pub fn run_with_progress(
         let fence = lock::build_lock_fence(&guard, Arc::clone(&repo.storage));
         repo.set_lock_fence(fence);
 
-        let result =
-            repo.commit_concurrent_session(snapshot_entry, snapshot_packed, &mut new_file_cache);
+        let result = repo.commit_concurrent_session_with_progress(
+            snapshot_entry,
+            snapshot_packed,
+            &mut new_file_cache,
+            &mut progress,
+        );
 
         // Deregister session while holding the lock.
         lock::deregister_session(repo.storage.as_ref(), &session_id);

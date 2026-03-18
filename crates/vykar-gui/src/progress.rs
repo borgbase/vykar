@@ -165,6 +165,10 @@ impl BackupStatusTracker {
                     file_suffix,
                 ))
             }
+            BackupProgressEvent::CommitStage { stage } => {
+                self.last_update = Instant::now();
+                Some(format!("[{}] committing: {}...", self.repo_name, stage))
+            }
             _ => None,
         }
     }

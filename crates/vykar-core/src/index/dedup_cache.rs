@@ -921,9 +921,9 @@ pub fn load_chunk_index_from_full_cache_path(path: &Path, generation: u64) -> Re
             entry.pack_id,
             entry.pack_offset,
         );
-        // add() sets refcount=1; apply remaining refs
-        for _ in 1..entry.refcount {
-            index.increment_refcount(&entry.chunk_id);
+        // add() sets refcount=1; apply remaining refs in bulk
+        if entry.refcount > 1 {
+            index.increment_refcount_by(&entry.chunk_id, entry.refcount - 1);
         }
     }
     Ok(index)
@@ -1003,6 +1003,55 @@ pub fn serialize_full_cache_to_packed_object(
         |buf| {
             crate::compress::compress_stream_zstd(buf, 3, |encoder| {
                 rmp_serde::encode::write(encoder, &serializable)
+                    .map_err(vykar_types::error::VykarError::Serialization)?;
+                Ok(())
+            })
+        },
+    )
+}
+
+/// Wraps `FullCacheSerializable` (ChunkIndex only) in the `IndexBlob` envelope
+/// (generation + chunks) so the wire format matches `IndexBlobRef`'s derived
+/// `Serialize`. Necessary because `serialize_full_cache_to_packed_object` only
+/// serializes the ChunkIndex portion.
+struct IndexBlobFromCache<'a> {
+    generation: u64,
+    cache: &'a MmapFullIndexCache,
+}
+
+impl<'a> serde::Serialize for IndexBlobFromCache<'a> {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("IndexBlob", 2)?;
+        state.serialize_field("generation", &self.generation)?;
+        state.serialize_field("chunks", &FullCacheSerializable { cache: self.cache })?;
+        state.end()
+    }
+}
+
+/// Serialize the full index cache as a complete `IndexBlob` (generation + chunks)
+/// packed into an encrypted repo object. Returns a single Vec suitable for
+/// upload as the "index" key.
+pub fn serialize_full_cache_as_index_blob(
+    cache: &MmapFullIndexCache,
+    generation: u64,
+    crypto: &dyn vykar_crypto::CryptoEngine,
+) -> Result<Vec<u8>> {
+    let estimated_msgpack = cache.entry_count() as usize * 86 + 16;
+    let estimated = 1 + zstd::zstd_safe::compress_bound(estimated_msgpack);
+    let blob = IndexBlobFromCache { generation, cache };
+
+    crate::repo::format::pack_object_streaming_with_context(
+        crate::repo::format::ObjectType::ChunkIndex,
+        b"index",
+        estimated,
+        crypto,
+        |buf| {
+            crate::compress::compress_stream_zstd(buf, 3, |encoder| {
+                rmp_serde::encode::write(encoder, &blob)
                     .map_err(vykar_types::error::VykarError::Serialization)?;
                 Ok(())
             })
@@ -1725,5 +1774,88 @@ mod tests {
         let p = path.unwrap();
         assert!(p.to_string_lossy().contains("index_blob"));
         assert!(p.to_string_lossy().contains(&hex::encode(repo_id)));
+    }
+
+    /// Verify that `serialize_full_cache_as_index_blob` produces data that
+    /// round-trips through decrypt + decompress + `from_slice::<IndexBlob>`,
+    /// uses compact positional encoding (FixArray envelope), and is semantically
+    /// identical to what
+    /// `IndexBlobRef`'s derived `Serialize` would produce.
+    #[test]
+    fn index_blob_from_cache_round_trip_and_wire_equivalence() {
+        use crate::index::{ChunkIndex, IndexBlob, IndexBlobRef};
+        use vykar_types::pack_id::PackId;
+
+        let dir = tempfile::tempdir().unwrap();
+        let full_path = dir.path().join("full_cache");
+
+        // Build a ChunkIndex with a few entries (including multi-refcount).
+        let mut index = ChunkIndex::new();
+        let pack = PackId([0x01; 32]);
+        for i in 0u8..5 {
+            let mut id = [0u8; 32];
+            id[0] = i;
+            index.add(ChunkId(id), 100 + i as u32, pack, i as u64 * 100);
+        }
+        // Bump one entry's refcount
+        let mut bump_id = [0u8; 32];
+        bump_id[0] = 2;
+        index.increment_refcount(&ChunkId(bump_id));
+
+        let generation = 7777u64;
+
+        // Write full cache, reopen as mmap
+        build_full_index_cache_to_path(&index, generation, &full_path).unwrap();
+        let cache = MmapFullIndexCache::open_path(&full_path, generation).unwrap();
+
+        // Serialize as IndexBlob envelope via cache
+        let crypto = vykar_crypto::PlaintextEngine::new(&[0xAA; 32]);
+        let packed = serialize_full_cache_as_index_blob(&cache, generation, &crypto).unwrap();
+
+        // Decrypt + decompress
+        let compressed = crate::repo::format::unpack_object_expect_with_context(
+            &packed,
+            crate::repo::format::ObjectType::ChunkIndex,
+            b"index",
+            &crypto,
+        )
+        .unwrap();
+        let decompressed = crate::compress::decompress_metadata(&compressed).unwrap();
+        let blob: IndexBlob = rmp_serde::from_slice(&decompressed).unwrap();
+
+        // Verify round-trip correctness
+        assert_eq!(blob.generation, generation);
+        assert_eq!(blob.chunks.len(), 5);
+        assert_eq!(blob.chunks.get(&ChunkId(bump_id)).unwrap().refcount, 2);
+
+        // Verify compact positional encoding: the outer IndexBlob must be
+        // serialized as a FixArray (marker 0x92 = 2-element array), not a
+        // FixMap. A map-shaped envelope would round-trip through from_slice
+        // but break streaming readers (from_read) and is a format regression.
+        assert_eq!(
+            decompressed[0], 0x92,
+            "IndexBlob envelope must be a 2-element FixArray (0x92), got {:#04x}",
+            decompressed[0]
+        );
+        // The IndexBlobRef derive produces the same FixArray envelope.
+        let ref_bytes = rmp_serde::to_vec(&IndexBlobRef {
+            generation,
+            chunks: &index,
+        })
+        .unwrap();
+        assert_eq!(
+            ref_bytes[0], 0x92,
+            "IndexBlobRef must also produce FixArray"
+        );
+
+        // Verify semantic equivalence of all entries (byte-for-byte
+        // comparison is not possible due to HashMap iteration order).
+        let ref_blob: IndexBlob = rmp_serde::from_slice(&ref_bytes).unwrap();
+        assert_eq!(ref_blob.generation, blob.generation);
+        assert_eq!(ref_blob.chunks.len(), blob.chunks.len());
+        for (id, entry) in ref_blob.chunks.iter() {
+            let cache_entry = blob.chunks.get(id).expect("missing chunk in cache output");
+            assert_eq!(entry, cache_entry, "mismatch for chunk {id:?}");
+        }
     }
 }

@@ -161,6 +161,17 @@ impl BackupProgressRenderer {
                     }
                 }
             }
+            commands::backup::BackupProgressEvent::CommitStage { stage } => {
+                if self.is_tty {
+                    let _guard = acquire_stderr_lock();
+                    eprint!("\r\x1b[2K");
+                    self.last_line_len = 0;
+                    eprint!("Committing: {stage}...");
+                    let _ = io::stderr().flush();
+                    self.rendered_any = true;
+                }
+                return;
+            }
             commands::backup::BackupProgressEvent::SourceStarted { .. }
             | commands::backup::BackupProgressEvent::SourceFinished { .. } => return,
         }

@@ -81,6 +81,13 @@ impl ChunkIndex {
         }
     }
 
+    /// Increment the refcount for an existing chunk by a given amount.
+    pub fn increment_refcount_by(&mut self, id: &ChunkId, amount: u32) {
+        if let Some(entry) = self.entries.get_mut(id) {
+            entry.refcount += amount;
+        }
+    }
+
     pub fn get(&self, id: &ChunkId) -> Option<&ChunkIndexEntry> {
         self.entries.get(id)
     }
@@ -422,10 +429,9 @@ impl IndexDelta {
         self.new_entries = still_new;
 
         // Verify all bump targets still exist.
+        let new_entry_ids: HashSet<ChunkId> = self.new_entries.iter().map(|e| e.chunk_id).collect();
         for chunk_id in self.refcount_bumps.keys() {
-            if !fresh_index.contains(chunk_id)
-                && !self.new_entries.iter().any(|e| e.chunk_id == *chunk_id)
-            {
+            if !fresh_index.contains(chunk_id) && !new_entry_ids.contains(chunk_id) {
                 return Err(vykar_types::error::VykarError::StaleChunksDuringCommit);
             }
         }
@@ -443,17 +449,15 @@ impl IndexDelta {
                 entry.pack_id,
                 entry.pack_offset,
             );
-            // add() sets refcount=1; apply remaining refs
-            for _ in 1..entry.refcount {
-                index.increment_refcount(&entry.chunk_id);
+            // add() sets refcount=1; apply remaining refs in bulk
+            if entry.refcount > 1 {
+                index.increment_refcount_by(&entry.chunk_id, entry.refcount - 1);
             }
         }
 
         // Apply refcount bumps for pre-existing chunks
         for (id, count) in self.refcount_bumps {
-            for _ in 0..count {
-                index.increment_refcount(&id);
-            }
+            index.increment_refcount_by(&id, count);
         }
     }
 }
@@ -829,5 +833,41 @@ mod tests {
         assert_eq!(index.get(&c1).unwrap().refcount, 5);
         assert_eq!(index.get(&c2).unwrap().refcount, 1);
         assert!(!index.contains(&c3));
+    }
+
+    #[test]
+    fn increment_refcount_by_adds_amount() {
+        let mut index = ChunkIndex::new();
+        let c = make_chunk_id(1);
+        let pack = make_pack_id(10);
+        index.add(c, 100, pack, 0);
+        assert_eq!(index.get(&c).unwrap().refcount, 1);
+
+        index.increment_refcount_by(&c, 5);
+        assert_eq!(index.get(&c).unwrap().refcount, 6);
+
+        // No-op for missing chunk
+        index.increment_refcount_by(&make_chunk_id(99), 10);
+    }
+
+    #[test]
+    fn apply_to_bulk_refcount() {
+        let mut index = ChunkIndex::new();
+        let c1 = make_chunk_id(1);
+        let c2 = make_chunk_id(2);
+        let pack = make_pack_id(10);
+        index.add(c1, 100, pack, 0);
+
+        let mut delta = IndexDelta::new();
+        // New entry with refcount > 1
+        delta.add_new_entry(c2, 200, pack, 100, 5);
+        // Bump existing entry multiple times
+        delta.bump_refcount(&c1);
+        delta.bump_refcount(&c1);
+        delta.bump_refcount(&c1);
+
+        delta.apply_to(&mut index);
+        assert_eq!(index.get(&c1).unwrap().refcount, 4); // 1 + 3 bumps
+        assert_eq!(index.get(&c2).unwrap().refcount, 5); // new entry with rc=5
     }
 }

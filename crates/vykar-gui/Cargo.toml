@@ -17,7 +17,6 @@ workspace = true
 vykar-core.workspace = true
 vykar-types.workspace = true
 slint = { version = "1.13", default-features = false, features = ["std", "compat-1-2", "backend-winit", "renderer-femtovg", "accessibility"] }
-mimalloc = { version = "0.1", default-features = false }
 tray-icon = "0.21"
 crossbeam-channel.workspace = true
 tinyfiledialogs = "3"

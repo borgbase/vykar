@@ -173,15 +173,16 @@ impl FileCache {
     }
 
     /// Start new sections for the given canonicalized roots on the **write** cache.
-    /// Creates one empty section per root and sets all as active.
-    pub fn begin_sections(&mut self, roots: &[String]) {
+    /// Creates one section per root (pre-sized via `capacity_hints`) and sets all as active.
+    pub fn begin_sections(&mut self, roots: &[String], capacity_hints: &[usize]) {
+        assert_eq!(roots.len(), capacity_hints.len());
         self.active_keys.clear();
-        for root in roots {
+        for (root, &hint) in roots.iter().zip(capacity_hints.iter()) {
             self.sections.insert(
                 root.clone(),
                 CacheSection {
                     anchor_snapshot_id: SnapshotId([0u8; 32]),
-                    entries: HashMap::new(),
+                    entries: HashMap::with_capacity(hint),
                 },
             );
             self.active_keys.push(root.clone());
@@ -359,6 +360,11 @@ impl FileCache {
                 self.sections.len()
             ))
         }
+    }
+
+    /// Entry count for the section matching `root`, or 0 if absent.
+    pub fn section_len(&self, root: &str) -> usize {
+        self.sections.get(root).map_or(0, |s| s.entries.len())
     }
 
     /// Total entries across all sections.
@@ -689,7 +695,7 @@ mod tests {
     #[test]
     fn section_based_insert_and_lookup() {
         let mut cache = FileCache::new();
-        cache.begin_sections(&roots(&["/tmp"]));
+        cache.begin_sections(&roots(&["/tmp"]), &[0]);
         cache.insert(
             "/tmp/test.txt",
             1,
@@ -708,7 +714,7 @@ mod tests {
     #[test]
     fn lookup_requires_active_section() {
         let mut cache = FileCache::new();
-        cache.begin_sections(&roots(&["/tmp"]));
+        cache.begin_sections(&roots(&["/tmp"]), &[0]);
         cache.insert(
             "/tmp/test.txt",
             1,
@@ -733,7 +739,7 @@ mod tests {
     #[test]
     fn lookup_miss_wrong_path() {
         let mut cache = FileCache::new();
-        cache.begin_sections(&roots(&["/tmp"]));
+        cache.begin_sections(&roots(&["/tmp"]), &[0]);
         cache.insert(
             "/tmp/test.txt",
             1,
@@ -751,7 +757,7 @@ mod tests {
     #[test]
     fn lookup_miss_changed_mtime() {
         let mut cache = FileCache::new();
-        cache.begin_sections(&roots(&["/tmp"]));
+        cache.begin_sections(&roots(&["/tmp"]), &[0]);
         cache.insert(
             "/tmp/test.txt",
             1,
@@ -769,7 +775,7 @@ mod tests {
     #[test]
     fn lookup_miss_changed_ctime() {
         let mut cache = FileCache::new();
-        cache.begin_sections(&roots(&["/tmp"]));
+        cache.begin_sections(&roots(&["/tmp"]), &[0]);
         cache.insert(
             "/tmp/test.txt",
             1,
@@ -787,7 +793,7 @@ mod tests {
     #[test]
     fn lookup_miss_changed_size() {
         let mut cache = FileCache::new();
-        cache.begin_sections(&roots(&["/tmp"]));
+        cache.begin_sections(&roots(&["/tmp"]), &[0]);
         cache.insert(
             "/tmp/test.txt",
             1,
@@ -805,7 +811,7 @@ mod tests {
     #[test]
     fn lookup_miss_changed_inode() {
         let mut cache = FileCache::new();
-        cache.begin_sections(&roots(&["/tmp"]));
+        cache.begin_sections(&roots(&["/tmp"]), &[0]);
         cache.insert(
             "/tmp/test.txt",
             1,
@@ -823,7 +829,7 @@ mod tests {
     #[test]
     fn lookup_miss_changed_device() {
         let mut cache = FileCache::new();
-        cache.begin_sections(&roots(&["/tmp"]));
+        cache.begin_sections(&roots(&["/tmp"]), &[0]);
         cache.insert(
             "/tmp/test.txt",
             1,
@@ -841,7 +847,7 @@ mod tests {
     #[test]
     fn insert_overwrites_existing() {
         let mut cache = FileCache::new();
-        cache.begin_sections(&roots(&["/tmp"]));
+        cache.begin_sections(&roots(&["/tmp"]), &[0]);
         cache.insert(
             "/tmp/test.txt",
             1,
@@ -881,10 +887,10 @@ mod tests {
     fn independent_sections() {
         let mut cache = FileCache::new();
 
-        cache.begin_sections(&roots(&["/a"]));
+        cache.begin_sections(&roots(&["/a"]), &[0]);
         cache.insert("/a/file.txt", 1, 100, 111, 111, 4096, sample_chunk_refs());
 
-        cache.begin_sections(&roots(&["/b"]));
+        cache.begin_sections(&roots(&["/b"]), &[0]);
         cache.insert("/b/file.txt", 1, 200, 222, 222, 8192, sample_chunk_refs());
 
         // Looking up in /b should not find /a's entry.
@@ -940,7 +946,7 @@ mod tests {
     #[test]
     fn activate_for_walk_roots_finds_sections() {
         let mut cache = FileCache::new();
-        cache.begin_sections(&roots(&["/data", "/config"]));
+        cache.begin_sections(&roots(&["/data", "/config"]), &[0, 0]);
         cache.finalize_sections(SnapshotId([0x11; 32]));
 
         // Both paths activate.
@@ -957,7 +963,7 @@ mod tests {
     fn activate_for_walk_roots_is_label_independent() {
         // Sections are keyed by canonicalized paths, not label.
         let mut cache = FileCache::new();
-        cache.begin_sections(&roots(&["/data"]));
+        cache.begin_sections(&roots(&["/data"]), &[0]);
         cache.insert("/data/a.txt", 1, 1, 1, 1, 100, sample_chunk_refs());
         cache.finalize_sections(SnapshotId([0x22; 32]));
 
@@ -1022,7 +1028,7 @@ mod tests {
     #[test]
     fn take_active_sections() {
         let mut cache = FileCache::new();
-        cache.begin_sections(&roots(&["/src"]));
+        cache.begin_sections(&roots(&["/src"]), &[0]);
         cache.insert("/src/a.txt", 1, 1, 1, 1, 100, sample_chunk_refs());
         cache.finalize_sections(SnapshotId([0x42; 32]));
 
@@ -1038,7 +1044,7 @@ mod tests {
     #[test]
     fn take_active_sections_multi() {
         let mut cache = FileCache::new();
-        cache.begin_sections(&roots(&["/a", "/b"]));
+        cache.begin_sections(&roots(&["/a", "/b"]), &[0, 0]);
         cache.insert("/a/f.txt", 1, 1, 1, 1, 100, sample_chunk_refs());
         cache.insert("/b/g.txt", 1, 2, 2, 2, 200, sample_chunk_refs());
         cache.finalize_sections(SnapshotId([0x42; 32]));
@@ -1051,7 +1057,7 @@ mod tests {
     #[test]
     fn contains_checks_active_section() {
         let mut cache = FileCache::new();
-        cache.begin_sections(&roots(&["/tmp"]));
+        cache.begin_sections(&roots(&["/tmp"]), &[0]);
         cache.insert("/tmp/a.txt", 1, 1, 1, 1, 100, sample_chunk_refs());
 
         assert!(cache.contains("/tmp/a.txt"));
@@ -1061,7 +1067,7 @@ mod tests {
     #[test]
     fn round_trip_serialization() {
         let mut cache = FileCache::new();
-        cache.begin_sections(&roots(&["/tmp"]));
+        cache.begin_sections(&roots(&["/tmp"]), &[0]);
         for i in 0..10 {
             cache.insert(
                 &format!("/tmp/file_{i}.txt"),
@@ -1359,7 +1365,7 @@ mod tests {
     fn add_path_preserves_existing_sections() {
         // Build cache with ["/a", "/b"], persist, then activate with ["/a", "/b", "/c"].
         let mut cache = FileCache::new();
-        cache.begin_sections(&roots(&["/a", "/b"]));
+        cache.begin_sections(&roots(&["/a", "/b"]), &[0, 0]);
         cache.insert("/a/f.txt", 1, 1, 1, 1, 100, sample_chunk_refs());
         cache.insert("/b/g.txt", 1, 2, 2, 2, 200, sample_chunk_refs());
         cache.finalize_sections(SnapshotId([0x11; 32]));
@@ -1383,7 +1389,7 @@ mod tests {
     fn remove_path_leaves_remaining_sections() {
         // Build cache with ["/a", "/b"], persist, then activate with ["/a"] only.
         let mut cache = FileCache::new();
-        cache.begin_sections(&roots(&["/a", "/b"]));
+        cache.begin_sections(&roots(&["/a", "/b"]), &[0, 0]);
         cache.insert("/a/f.txt", 1, 1, 1, 1, 100, sample_chunk_refs());
         cache.insert("/b/g.txt", 1, 2, 2, 2, 200, sample_chunk_refs());
         cache.finalize_sections(SnapshotId([0x11; 32]));
@@ -1410,7 +1416,7 @@ mod tests {
     fn longest_prefix_match_routing() {
         // Active keys ["/data", "/data/sub"]. Lookup routes to longest match.
         let mut cache = FileCache::new();
-        cache.begin_sections(&roots(&["/data", "/data/sub"]));
+        cache.begin_sections(&roots(&["/data", "/data/sub"]), &[0, 0]);
 
         let refs_a = Arc::new(vec![ChunkRef {
             id: ChunkId([0xAA; 32]),
@@ -1445,7 +1451,7 @@ mod tests {
         // with just ["/data"]. Files under /data/sub/ should still be found
         // in the /data section.
         let mut cache = FileCache::new();
-        cache.begin_sections(&roots(&["/data", "/data/sub"]));
+        cache.begin_sections(&roots(&["/data", "/data/sub"]), &[0, 0]);
         cache.insert("/data/sub/foo.txt", 1, 1, 1, 1, 100, sample_chunk_refs());
         cache.insert("/data/sub/bar.txt", 1, 2, 2, 2, 200, sample_chunk_refs());
         cache.insert("/data/top.txt", 1, 3, 3, 3, 300, sample_chunk_refs());
@@ -1470,7 +1476,7 @@ mod tests {
         // ["/data", "/data/sub"]. Files under /data/sub/ should still hit
         // via the /data section (partial activation — /data/sub is new).
         let mut cache = FileCache::new();
-        cache.begin_sections(&roots(&["/data"]));
+        cache.begin_sections(&roots(&["/data"]), &[0]);
         cache.insert("/data/sub/foo.txt", 1, 1, 1, 1, 100, sample_chunk_refs());
         cache.insert("/data/top.txt", 1, 2, 2, 2, 200, sample_chunk_refs());
         cache.finalize_sections(SnapshotId([0x11; 32]));
@@ -1494,10 +1500,26 @@ mod tests {
         // Active key ["/"] — should match any absolute path.
         let mut cache = FileCache::new();
         // Root path: basename is "", use "/" as walk_root.
-        cache.begin_sections(&roots(&["/"]));
+        cache.begin_sections(&roots(&["/"]), &[0]);
         cache.insert("/etc/foo.txt", 1, 1, 1, 1, 100, sample_chunk_refs());
 
         assert!(cache.lookup("/etc/foo.txt", 1, 1, 1, 1, 100).is_some());
         assert!(cache.lookup("/var/bar.txt", 1, 1, 1, 1, 100).is_none());
+    }
+
+    #[test]
+    fn begin_sections_applies_capacity_hints() {
+        // Each root gets its own pre-sized section from the capacity hint.
+        let mut cache = FileCache::new();
+        cache.begin_sections(&roots(&["/data", "/data/sub"]), &[100, 50]);
+
+        // Verify capacity was applied before any inserts.
+        assert!(cache.sections["/data"].entries.capacity() >= 100);
+        assert!(cache.sections["/data/sub"].entries.capacity() >= 50);
+
+        // Zero hint produces a minimal allocation (same as cold start).
+        let mut cache2 = FileCache::new();
+        cache2.begin_sections(&roots(&["/x"]), &[0]);
+        assert_eq!(cache2.sections["/x"].entries.capacity(), 0);
     }
 }

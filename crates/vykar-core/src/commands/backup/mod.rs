@@ -450,9 +450,13 @@ pub fn run_with_progress(
         let items_config = items_chunker_config();
         let mut new_file_cache = FileCache::new();
 
-        // Prepare write cache: create empty section for inserts.
+        // Prepare write cache: pre-size sections from loaded cache to avoid resize doublings.
         if !source_paths.is_empty() {
-            new_file_cache.begin_sections(&canonical_roots);
+            let capacity_hints: Vec<usize> = canonical_roots
+                .iter()
+                .map(|root| repo.file_cache().section_len(root))
+                .collect();
+            new_file_cache.begin_sections(&canonical_roots, &capacity_hints);
         }
 
         // Execute command dumps before walking filesystem.

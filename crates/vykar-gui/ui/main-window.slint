@@ -28,29 +28,26 @@ component ToolTipArea {
     preferred-width: 100%;
 
     in property <string> text;
-    in property <bool> show-left: false;
 
     ta := TouchArea {
-        @children
+        HorizontalLayout {
+            padding: 2px;
+            @children
+        }
     }
     Rectangle {
-        states [
-            visible when ta.has-hover: {
-                opacity: 0.8;
-            }
-        ]
-        x: root.show-left ? ta.mouse-x - self.width - 1rem : ta.mouse-x + 1rem;
-        y: ta.mouse-y + 1rem;
+        x: root.width - self.width;
+        y: root.height + 4px;
         background: Palette.background;
         border-width: 1px;
         border-color: #888888;
         border-radius: 4px;
-        opacity: 0;
+        opacity: ta.has-hover ? 1 : 0;
         width: tt.preferred-width;
         height: tt.preferred-height;
         tt := HorizontalLayout {
             padding: 4px;
-            Text { text <=> root.text; font-size: 11px; }
+            Text { text: root.text; font-size: 11px; }
         }
     }
 }
@@ -122,14 +119,28 @@ export component MainWindow inherits Window {
         spacing: 0px;
 
         // ── Header ──
-        VerticalBox {
-            padding-left: 12px;
-            padding-right: 12px;
-            padding-top: 10px;
-            padding-bottom: 6px;
-            spacing: 4px;
+        // Plain Rectangle (not a layout) so we control paint order:
+        // schedule-row is declared first (painted underneath),
+        // config-row second (painted on top, including tooltip overflows).
+        Rectangle {
+            vertical-stretch: 0;
+            preferred-height: 10px + config-row.preferred-height + 4px + schedule-row.preferred-height + 6px;
 
-            HorizontalBox {
+            schedule-row := HorizontalBox {
+                x: 12px;
+                y: 10px + config-row.preferred-height + 4px;
+                width: parent.width - 24px;
+                height: self.preferred-height;
+                spacing: 8px;
+                Text { text: "Schedule:"; vertical-alignment: center; width: 65px; font-weight: 700; }
+                Text { text: root.schedule_text; vertical-alignment: center; }
+            }
+
+            config-row := HorizontalBox {
+                x: 12px;
+                y: 10px;
+                width: parent.width - 24px;
+                height: self.preferred-height;
                 spacing: 8px;
                 Text { text: "Config:"; vertical-alignment: center; width: 65px; font-weight: 700; }
                 TouchArea {
@@ -161,7 +172,6 @@ export component MainWindow inherits Window {
                 }
                 ToolTipArea {
                     text: "Backup, prune, compact, and check all repos";
-                    show-left: true;
                     Button {
                         text: root.operation_busy && root.operation_cancellable ? "Cancel" : "Full Backup";
                         enabled: !root.operation_busy || root.operation_cancellable;
@@ -175,11 +185,6 @@ export component MainWindow inherits Window {
                         }
                     }
                 }
-            }
-            HorizontalBox {
-                spacing: 8px;
-                Text { text: "Schedule:"; vertical-alignment: center; width: 65px; font-weight: 700; }
-                Text { text: root.schedule_text; vertical-alignment: center; }
             }
         }
 

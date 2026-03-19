@@ -629,16 +629,25 @@ pub(crate) fn run_worker(
                                 } else {
                                     s.hostname.clone()
                                 };
+                                let (files, size, nfiles, size_bytes) = match stats {
+                                    Some(st) => (
+                                        format_count(st.nfiles),
+                                        format_bytes(st.deduplicated_size),
+                                        Some(st.nfiles),
+                                        Some(st.deduplicated_size),
+                                    ),
+                                    None => ("-".to_string(), "-".to_string(), None, None),
+                                };
                                 data.push(SnapshotRowData {
                                     id: s.name.clone(),
                                     hostname,
                                     time_str: ts.format("%Y-%m-%d %H:%M:%S").to_string(),
                                     source: sources,
                                     label,
-                                    files: format_count(stats.nfiles),
-                                    size: format_bytes(stats.deduplicated_size),
-                                    nfiles: stats.nfiles,
-                                    size_bytes: stats.deduplicated_size,
+                                    files,
+                                    size,
+                                    nfiles,
+                                    size_bytes,
                                     time_epoch: s.time.timestamp(),
                                     repo_name: repo_name.clone(),
                                 });

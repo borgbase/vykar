@@ -47,8 +47,18 @@ pub(crate) fn sort_snapshot_table(
         2 => data.sort_by(|a, b| a.time_epoch.cmp(&b.time_epoch)),
         3 => data.sort_by(|a, b| a.source.cmp(&b.source)),
         4 => data.sort_by(|a, b| a.label.cmp(&b.label)),
-        5 => data.sort_by(|a, b| a.nfiles.cmp(&b.nfiles)),
-        6 => data.sort_by(|a, b| a.size_bytes.cmp(&b.size_bytes)),
+        5 => data.sort_by(|a, b| match (a.nfiles, b.nfiles) {
+            (Some(a), Some(b)) => a.cmp(&b),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        }),
+        6 => data.sort_by(|a, b| match (a.size_bytes, b.size_bytes) {
+            (Some(a), Some(b)) => a.cmp(&b),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        }),
         _ => return,
     }
     if !ascending {

@@ -76,8 +76,8 @@ pub(crate) struct SnapshotRowData {
     pub label: String,
     pub files: String,
     pub size: String,
-    pub nfiles: u64,
-    pub size_bytes: u64,
+    pub nfiles: Option<u64>,
+    pub size_bytes: Option<u64>,
     pub time_epoch: i64,
     pub repo_name: String,
 }

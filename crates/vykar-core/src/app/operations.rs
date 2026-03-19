@@ -596,7 +596,7 @@ pub fn list_snapshots(
 pub fn list_snapshots_with_stats(
     config: &VykarConfig,
     passphrase: Option<&str>,
-) -> Result<Vec<(SnapshotEntry, crate::snapshot::SnapshotStats)>> {
+) -> Result<Vec<(SnapshotEntry, Option<crate::snapshot::SnapshotStats>)>> {
     commands::list::list_snapshots_with_stats(config, passphrase)
 }
 

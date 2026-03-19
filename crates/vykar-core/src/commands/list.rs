@@ -59,18 +59,18 @@ pub fn list_snapshot_items(
 }
 
 /// List all snapshots with their stats (loaded from snapshot metadata).
+/// Returns `None` for stats when the snapshot blob cannot be read or decrypted.
 pub fn list_snapshots_with_stats(
     config: &VykarConfig,
     passphrase: Option<&str>,
-) -> Result<Vec<(SnapshotEntry, crate::snapshot::SnapshotStats)>> {
+) -> Result<Vec<(SnapshotEntry, Option<crate::snapshot::SnapshotStats>)>> {
     let repo = open_repo(config, passphrase, OpenOptions::new())?;
     let entries = repo.manifest().snapshots.clone();
     let mut result = Vec::with_capacity(entries.len());
     for entry in entries {
-        let stats = match load_snapshot_meta(&repo, &entry.name) {
-            Ok(meta) => meta.stats,
-            Err(_) => crate::snapshot::SnapshotStats::default(),
-        };
+        let stats = load_snapshot_meta(&repo, &entry.name)
+            .ok()
+            .map(|meta| meta.stats);
         result.push((entry, stats));
     }
     Ok(result)

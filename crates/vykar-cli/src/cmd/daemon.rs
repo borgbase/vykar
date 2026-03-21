@@ -9,6 +9,26 @@ use vykar_core::config::{self, ConfigSource, EncryptionModeConfig, ResolvedRepo,
 use crate::dispatch::{run_default_actions, warn_if_untrusted_rest};
 use crate::signal::{RELOAD, SHUTDOWN, TRIGGER};
 
+/// Ask the system allocator to return freed memory to the OS.
+///
+/// After a backup cycle the daemon has freed hundreds of megabytes of
+/// HashMap entries (chunk index, dedup structures) but glibc retains them
+/// in arena free lists. `malloc_trim(0)` tells glibc to release those
+/// pages via madvise/munmap.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn release_malloc_arenas() {
+    extern "C" {
+        fn malloc_trim(pad: libc::size_t) -> libc::c_int;
+    }
+    // SAFETY: malloc_trim is safe to call at any time and is thread-safe.
+    if unsafe { malloc_trim(0) } != 0 {
+        tracing::debug!("malloc_trim: released memory to OS");
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn release_malloc_arenas() {}
+
 /// Load and validate daemon config from the given source.
 /// Returns the resolved repos and merged schedule, or an error describing
 /// what went wrong (suitable for both fatal startup errors and non-fatal
@@ -226,6 +246,11 @@ fn run_backup_cycle(repos: &[ResolvedRepo]) {
         tracing::warn!(duration = ?elapsed, "backup cycle finished with partial success (some files skipped)");
     } else {
         tracing::info!(duration = ?elapsed, "backup cycle finished successfully");
+    }
+
+    // All Repository instances are dropped. Ask glibc to return freed pages.
+    if !SHUTDOWN.load(Ordering::SeqCst) {
+        release_malloc_arenas();
     }
 }
 

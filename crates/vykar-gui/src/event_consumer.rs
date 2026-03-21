@@ -158,7 +158,17 @@ pub(crate) fn spawn(
                         ui.set_repo_model(ModelRc::new(VecModel::from(model)));
                     }
                     UiEvent::SourceModelData { items, labels } => {
-                        // Rebuild the tray submenu directly (we're on the main thread).
+                        // On Linux the tray submenu lives on the GTK thread;
+                        // dispatch via idle_add_once to run there.
+                        #[cfg(target_os = "linux")]
+                        {
+                            let tray_labels = labels.clone();
+                            let tsi = tray_source_items.clone();
+                            gtk::glib::idle_add_once(move || {
+                                tray_state::rebuild_submenu(&tray_labels, &tsi);
+                            });
+                        }
+                        #[cfg(not(target_os = "linux"))]
                         tray_state::rebuild_submenu(&labels, &tray_source_items);
 
                         ui.global::<AppData>()

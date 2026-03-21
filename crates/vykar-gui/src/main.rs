@@ -43,11 +43,6 @@ fn main() {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
-    // tray-icon uses GTK widgets internally on Linux; GTK must be
-    // initialised before any Menu / MenuItem is created.
-    #[cfg(target_os = "linux")]
-    gtk::init().expect("Failed to initialize GTK");
-
     let gui_state = state::load();
     let runtime = config_helpers::resolve_or_create_config(gui_state.config_path.as_deref())?;
 
@@ -108,11 +103,42 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     ui.global::<AppData>()
         .set_active_config_path(initial_config_path.into());
 
+    // On Linux, tray-icon requires a running GTK event loop for D-Bus
+    // registration (AppIndicator) and menu signals. Spawn a dedicated thread
+    // that owns the tray icon and runs gtk::main() — fully event-driven,
+    // zero CPU when idle. On other platforms the tray icon lives on the main
+    // thread and no GTK integration is needed.
+    #[cfg(target_os = "linux")]
+    let (open_item_id, run_now_item_id, quit_item_id, cancel_item_id) = {
+        use tray_icon::menu::MenuId;
+        let (ids_tx, ids_rx) =
+            std::sync::mpsc::sync_channel::<Result<(MenuId, MenuId, MenuId, MenuId), String>>(1);
+        thread::spawn(move || {
+            if let Err(e) = gtk::init() {
+                let _ = ids_tx.send(Err(format!("Failed to initialize GTK: {e}")));
+                return;
+            }
+            match tray::build_tray_icon() {
+                Ok((_tray, open_id, run_now_id, quit_id, source_submenu, cancel_id)) => {
+                    tray_state::set_submenu(source_submenu);
+                    let _ = ids_tx.send(Ok((open_id, run_now_id, quit_id, cancel_id)));
+                    gtk::main();
+                }
+                Err(e) => {
+                    let _ = ids_tx.send(Err(format!("failed to initialize tray icon: {e}")));
+                }
+            }
+        });
+        ids_rx
+            .recv()
+            .map_err(|_| "GTK thread exited unexpectedly")??
+    };
+
+    #[cfg(not(target_os = "linux"))]
     let (_tray_icon, open_item_id, run_now_item_id, quit_item_id, source_submenu, cancel_item_id) =
         tray::build_tray_icon().map_err(|e| format!("failed to initialize tray icon: {e}"))?;
 
-    // Store the submenu in a thread-local so the event consumer can rebuild it
-    // directly from invoke_from_event_loop (no polling timer needed).
+    #[cfg(not(target_os = "linux"))]
     tray_state::set_submenu(source_submenu);
 
     // ── Background threads (only after all fallible init succeeded) ──

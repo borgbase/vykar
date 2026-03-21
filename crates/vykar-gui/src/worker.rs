@@ -13,6 +13,7 @@ use vykar_core::config;
 use vykar_types::error::VykarError;
 
 use crate::config_helpers;
+use crate::controllers;
 use crate::messages::{AppCommand, FindResultRow, RepoInfoData, SnapshotRowData, UiEvent};
 use crate::progress::{
     format_bytes, format_check_status, format_count, format_step_outcome, BackupStatusTracker,
@@ -454,58 +455,59 @@ pub(crate) fn run_worker(
                                     let has_configured_source =
                                         repo.config.encryption.passphrase.is_some()
                                             || repo.config.encryption.passcommand.is_some();
-                                    let init_pass: Option<zeroize::Zeroizing<String>> =
-                                        if repo.config.encryption.mode
-                                            == vykar_core::config::EncryptionModeConfig::None
-                                        {
-                                            None
-                                        } else if has_configured_source && passphrase.is_some() {
-                                            passphrase.clone()
-                                        } else {
-                                            let title = format!(
-                                                "{APP_TITLE} - New Passphrase ({repo_name})"
-                                            );
-                                            let p1 = tinyfiledialogs::password_box(
-                                                &title,
-                                                "Enter new passphrase:",
-                                            );
-                                            match p1.filter(|v| !v.is_empty()) {
-                                                None => {
-                                                    send_log(
-                                                        &ui_tx,
-                                                        format!(
-                                                            "[{repo_name}] Init cancelled \
+                                    let init_pass: Option<zeroize::Zeroizing<String>> = if repo
+                                        .config
+                                        .encryption
+                                        .mode
+                                        == vykar_core::config::EncryptionModeConfig::None
+                                    {
+                                        None
+                                    } else if has_configured_source && passphrase.is_some() {
+                                        passphrase.clone()
+                                    } else {
+                                        let title =
+                                            format!("{APP_TITLE} - New Passphrase ({repo_name})");
+                                        let p1 = controllers::password_dialog::show_password_dialog(
+                                            &title,
+                                            "Enter new passphrase:",
+                                        );
+                                        match p1.filter(|v| !v.is_empty()) {
+                                            None => {
+                                                send_log(
+                                                    &ui_tx,
+                                                    format!(
+                                                        "[{repo_name}] Init cancelled \
                                                              (no passphrase)."
-                                                        ),
-                                                    );
-                                                    continue;
-                                                }
-                                                Some(p1_val) => {
-                                                    let p2 = tinyfiledialogs::password_box(
+                                                    ),
+                                                );
+                                                continue;
+                                            }
+                                            Some(p1_val) => {
+                                                let p2 = controllers::password_dialog::show_password_dialog(
                                                         &format!(
                                                             "{APP_TITLE} - Confirm Passphrase \
                                                              ({repo_name})"
                                                         ),
                                                         "Confirm passphrase:",
                                                     );
-                                                    match p2 {
-                                                        Some(ref p2_val) if p2_val == &p1_val => {
-                                                            Some(zeroize::Zeroizing::new(p1_val))
-                                                        }
-                                                        _ => {
-                                                            send_log(
-                                                                &ui_tx,
-                                                                format!(
-                                                                    "[{repo_name}] Passphrases \
+                                                match p2 {
+                                                    Some(ref p2_val) if p2_val == &p1_val => {
+                                                        Some(zeroize::Zeroizing::new(p1_val))
+                                                    }
+                                                    _ => {
+                                                        send_log(
+                                                            &ui_tx,
+                                                            format!(
+                                                                "[{repo_name}] Passphrases \
                                                                      do not match."
-                                                                ),
-                                                            );
-                                                            continue;
-                                                        }
+                                                            ),
+                                                        );
+                                                        continue;
                                                     }
                                                 }
                                             }
-                                        };
+                                        }
+                                    };
 
                                     let retry_pass = init_pass.clone();
                                     match init::run(

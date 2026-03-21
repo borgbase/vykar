@@ -28,7 +28,7 @@ pub(crate) fn resolve_passphrase_for_repo(
             ),
             _ => format!("Enter passphrase for {}", prompt.repository_url),
         };
-        let value = tinyfiledialogs::password_box(&title, &message);
+        let value = crate::controllers::password_dialog::show_password_dialog(&title, &message);
         Ok(value.filter(|v| !v.is_empty()).map(zeroize::Zeroizing::new))
     })?;
     Ok(pass)

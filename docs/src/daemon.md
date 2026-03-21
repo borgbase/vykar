@@ -56,17 +56,19 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+ExecStartPre=+/bin/mkdir -p %h/.cache/vykar %h/.config/vykar
 ExecStart=/usr/local/bin/vykar --config /etc/vykar/config.yaml daemon
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
-RestartSec=30
+RestartSec=60
 
 # Security hardening
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/var/cache/vykar
+ReadWritePaths=%h/.cache/vykar %h/.config/vykar
 PrivateTmp=true
+PrivateDevices=true
 
 # Passphrase via environment file (optional)
 # EnvironmentFile=/etc/vykar/env

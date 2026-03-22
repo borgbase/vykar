@@ -67,6 +67,8 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=read-only
 ReadWritePaths=%h/.cache/vykar %h/.config/vykar
+# If backing up to a local path, add it here too, e.g.:
+# ReadWritePaths=%h/.cache/vykar %h/.config/vykar /mnt/backup/vykar
 PrivateTmp=true
 PrivateDevices=true
 
@@ -76,6 +78,8 @@ PrivateDevices=true
 [Install]
 WantedBy=multi-user.target
 ```
+
+> **Local repositories**: the `ProtectSystem=strict` directive makes the filesystem read-only by default. If any repository target is a local path, add it to `ReadWritePaths` or the backup will fail with "Read-only file system".
 
 Then enable and start:
 

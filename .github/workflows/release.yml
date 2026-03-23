@@ -287,6 +287,40 @@ jobs:
           name: windows-x86_64-pc-windows-msvc
           path: vykar-*.zip
 
+  sign-windows:
+    name: sign-windows
+    if: github.event_name != 'workflow_dispatch' || github.event.inputs.build_windows == 'true'
+    needs: build-windows
+    runs-on: ubuntu-latest
+    environment: release
+    env:
+      HAS_SIGNING: ${{ secrets.CERTUM_CERT_SHA1 }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        if: env.HAS_SIGNING != ''
+        with:
+          name: windows-x86_64-pc-windows-msvc
+          path: dist
+      - name: Sign Windows binaries
+        if: env.HAS_SIGNING != ''
+        env:
+          CERTUM_SIMPLYSIGN_USER: ${{ secrets.CERTUM_SIMPLYSIGN_USER }}
+          CERTUM_TOTP_SECRET: ${{ secrets.CERTUM_TOTP_SECRET }}
+          CERTUM_CERT_PEM: ${{ secrets.CERTUM_CERT_PEM }}
+        run: |
+          ARCHIVE=$(ls dist/vykar-*.zip)
+          unzip -o "$ARCHIVE" -d dist/unsigned
+          scripts/windows-sign.sh dist/unsigned/*.exe
+          rm -f "$ARCHIVE"
+          cd dist && zip -j "$(basename "$ARCHIVE" .zip).zip" unsigned/*.exe && cd ..
+      - uses: actions/upload-artifact@v4
+        if: env.HAS_SIGNING != ''
+        with:
+          name: windows-x86_64-pc-windows-msvc
+          path: dist/vykar-*.zip
+          overwrite: true
+
   release:
     name: publish
     runs-on: ubuntu-latest
@@ -299,7 +333,7 @@ jobs:
       - build-linux-arm64
       - build-linux-arm64-musl
       - build-macos
-      - build-windows
+      - sign-windows
     steps:
       - uses: actions/download-artifact@v4
         with:

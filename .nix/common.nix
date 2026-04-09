@@ -23,8 +23,6 @@ let
   nativeBuildInputsGui = [
     pkgs.python3
     pkgs.ninja
-    pkgs.curl
-    pkgs.cacert
   ];
 
   buildInputsGui =

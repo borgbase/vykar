@@ -16,7 +16,6 @@ craneLib.buildPackage (
       description = "Vykar backup tool server";
       homepage = "https://vykar.borgbase.com";
       license = pkgs.lib.licenses.gpl3Only;
-      maintainers = [ pkgs.lib.maintainers.sntx ];
       mainProgram = "vykar-server";
     };
   }

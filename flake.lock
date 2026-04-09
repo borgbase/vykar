@@ -1,0 +1,137 @@
+{
+  "nodes": {
+    "crane": {
+      "locked": {
+        "lastModified": 1775236976,
+        "narHash": "sha256-gCgX+AXN7K1gAIEqcLcZHxmC+QoZcwn9m6Z9r2Az+N8=",
+        "owner": "ipetkov",
+        "repo": "crane",
+        "rev": "6c23998526351a53ce734f0ac84940da988ccef1",
+        "type": "github"
+      },
+      "original": {
+        "owner": "ipetkov",
+        "repo": "crane",
+        "type": "github"
+      }
+    },
+    "flake-utils": {
+      "inputs": {
+        "systems": "systems"
+      },
+      "locked": {
+        "lastModified": 1731533236,
+        "narHash": "sha256-l0KFg5HjrsfsO/JpG+r7fRrqm12kzFHyUHqHCVpMMbI=",
+        "owner": "numtide",
+        "repo": "flake-utils",
+        "rev": "11707dc2f618dd54ca8739b309ec4fc024de578b",
+        "type": "github"
+      },
+      "original": {
+        "owner": "numtide",
+        "repo": "flake-utils",
+        "type": "github"
+      }
+    },
+    "nixpkgs": {
+      "locked": {
+        "lastModified": 1775423009,
+        "narHash": "sha256-vPKLpjhIVWdDrfiUM8atW6YkIggCEKdSAlJPzzhkQlw=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "68d8aa3d661f0e6bd5862291b5bb263b2a6595c9",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixos-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "root": {
+      "inputs": {
+        "crane": "crane",
+        "flake-utils": "flake-utils",
+        "nixpkgs": "nixpkgs",
+        "rust-overlay": "rust-overlay",
+        "skia-binaries-aarch64-darwin": "skia-binaries-aarch64-darwin",
+        "skia-binaries-aarch64-linux": "skia-binaries-aarch64-linux",
+        "skia-binaries-x86_64-linux": "skia-binaries-x86_64-linux"
+      }
+    },
+    "rust-overlay": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1775617983,
+        "narHash": "sha256-2NWGA/I4j/qlx6qbg86QvJiK1/GyH9gnf0hFiARWVwE=",
+        "owner": "oxalica",
+        "repo": "rust-overlay",
+        "rev": "d98b91b1feae7ef07fa2ccb3aa3f83f11abfae54",
+        "type": "github"
+      },
+      "original": {
+        "owner": "oxalica",
+        "repo": "rust-overlay",
+        "type": "github"
+      }
+    },
+    "skia-binaries-aarch64-darwin": {
+      "flake": false,
+      "locked": {
+        "narHash": "sha256-8k2f0muEP5p8RNDSMxVZ3r+LPeufeRvYCC0ZvWg08VY=",
+        "type": "file",
+        "url": "https://github.com/rust-skia/skia-binaries/releases/download/0.90.0/skia-binaries-da4579b39b75fa2187c5-aarch64-apple-darwin-gl-pdf-textlayout-vulkan.tar.gz"
+      },
+      "original": {
+        "type": "file",
+        "url": "https://github.com/rust-skia/skia-binaries/releases/download/0.90.0/skia-binaries-da4579b39b75fa2187c5-aarch64-apple-darwin-gl-pdf-textlayout-vulkan.tar.gz"
+      }
+    },
+    "skia-binaries-aarch64-linux": {
+      "flake": false,
+      "locked": {
+        "narHash": "sha256-d6Bcvz8+jRWneN1CKHZ9/630+OHkafGY/kec/uf3hBk=",
+        "type": "file",
+        "url": "https://github.com/rust-skia/skia-binaries/releases/download/0.90.0/skia-binaries-da4579b39b75fa2187c5-aarch64-unknown-linux-gnu-gl-pdf-textlayout-vulkan.tar.gz"
+      },
+      "original": {
+        "type": "file",
+        "url": "https://github.com/rust-skia/skia-binaries/releases/download/0.90.0/skia-binaries-da4579b39b75fa2187c5-aarch64-unknown-linux-gnu-gl-pdf-textlayout-vulkan.tar.gz"
+      }
+    },
+    "skia-binaries-x86_64-linux": {
+      "flake": false,
+      "locked": {
+        "narHash": "sha256-4x3zKy0SbnKHPl9T4for1hObYKuVKN2T83+AIh6HQZs=",
+        "type": "file",
+        "url": "https://github.com/rust-skia/skia-binaries/releases/download/0.90.0/skia-binaries-da4579b39b75fa2187c5-x86_64-unknown-linux-gnu-gl-pdf-textlayout-vulkan.tar.gz"
+      },
+      "original": {
+        "type": "file",
+        "url": "https://github.com/rust-skia/skia-binaries/releases/download/0.90.0/skia-binaries-da4579b39b75fa2187c5-x86_64-unknown-linux-gnu-gl-pdf-textlayout-vulkan.tar.gz"
+      }
+    },
+    "systems": {
+      "locked": {
+        "lastModified": 1681028828,
+        "narHash": "sha256-Vy1rq5AaRuLzOxct8nz4T6wlgyUR7zLU309k9mBC768=",
+        "owner": "nix-systems",
+        "repo": "default",
+        "rev": "da67096a3b9bf56a91d16901293e51ba5b49a27e",
+        "type": "github"
+      },
+      "original": {
+        "owner": "nix-systems",
+        "repo": "default",
+        "type": "github"
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}

@@ -10,3 +10,9 @@ proptest-regressions/
 fuzz/artifacts/
 fuzz/target/
 /output
+
+# Nix build artifacts
+/result
+
+# Personal direnv config
+.envrc

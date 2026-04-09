@@ -31,4 +31,14 @@ This project uses [prek](https://prek.j178.dev/) for git hooks. Run `prek instal
 
 Individual targets (`fmt-check`, `lint`, `doc-check`, `test`) remain available for ad-hoc use.
 
+### Nix users
+
+If you use Nix with flakes, you can enter the development shell with:
+
+```bash
+nix develop
+```
+
+If you use [direnv](https://direnv.net/), add `use flake` to a local `.envrc` file for automatic shell activation.
+
 See [CLAUDE.md](CLAUDE.md) for the full project structure and architecture overview.

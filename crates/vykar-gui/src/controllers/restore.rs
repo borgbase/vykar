@@ -211,7 +211,10 @@ pub(crate) fn wire_callbacks(restore_win: &RestoreWindow, app_tx: Sender<AppComm
         });
     }
 
-    // Restore Selected — opens folder picker, then sends command
+    // Restore Selected — validate selection, spawn thread for folder picker
+    // The folder dialog must NOT run on the Slint event loop thread because
+    // on Windows the native dialog pumps its own Win32 message loop, which
+    // deadlocks with Slint's event loop (borgbase/vykar#98).
     {
         let tx = app_tx.clone();
         let rw_weak = restore_win.as_weak();
@@ -232,18 +235,37 @@ pub(crate) fn wire_callbacks(restore_win: &RestoreWindow, app_tx: Sender<AppComm
                 return;
             }
 
-            let dest = tinyfiledialogs::select_folder_dialog("Select restore destination", ".");
-            let Some(dest) = dest else {
-                return;
-            };
+            rw.set_status_text("Pick a destination folder...".into());
 
-            rw.set_busy(true);
-            rw.set_status_text("Restoring...".into());
-            let _ = tx.send(AppCommand::RestoreSelected {
-                repo_name: rw.get_repo_name().to_string(),
-                snapshot: rw.get_snapshot_name().to_string(),
-                dest,
-                paths,
+            let tx = tx.clone();
+            let rw_weak = rw.as_weak();
+            let repo_name = rw.get_repo_name().to_string();
+            let snapshot = rw.get_snapshot_name().to_string();
+            std::thread::spawn(move || {
+                let dest = tinyfiledialogs::select_folder_dialog("Select restore destination", ".");
+                let Some(dest) = dest else {
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(rw) = rw_weak.upgrade() {
+                            rw.set_status_text("Ready".into());
+                        }
+                    });
+                    return;
+                };
+                let _ = slint::invoke_from_event_loop({
+                    let rw_weak = rw_weak.clone();
+                    move || {
+                        if let Some(rw) = rw_weak.upgrade() {
+                            rw.set_busy(true);
+                            rw.set_status_text("Restoring...".into());
+                        }
+                    }
+                });
+                let _ = tx.send(AppCommand::RestoreSelected {
+                    repo_name,
+                    snapshot,
+                    dest,
+                    paths,
+                });
             });
         });
     }

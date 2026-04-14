@@ -125,6 +125,16 @@ pub fn with_repo_lock<T>(
     action: impl FnOnce(&mut Repository) -> Result<T>,
 ) -> Result<T> {
     let guard = lock::acquire_lock(repo.storage.as_ref())?;
+    run_under_fence(repo, guard, action)
+}
+
+/// Shared epilogue for lock-guarded operations: installs a lock fence, runs
+/// the action, performs best-effort cleanup on error, then releases the lock.
+fn run_under_fence<T>(
+    repo: &mut Repository,
+    guard: lock::LockGuard,
+    action: impl FnOnce(&mut Repository) -> Result<T>,
+) -> Result<T> {
     let fence = lock::build_lock_fence(&guard, Arc::clone(&repo.storage));
     repo.set_lock_fence(fence);
 
@@ -213,26 +223,6 @@ pub fn with_maintenance_lock<T>(
         _ => {}
     }
 
-    // Install lock fence after session checks pass.
-    let fence = lock::build_lock_fence(&guard, Arc::clone(&repo.storage));
-    repo.set_lock_fence(fence);
-
-    let result = action(repo);
-
-    if result.is_err() {
-        repo.flush_on_abort();
-    }
-
-    repo.clear_lock_fence();
-    match lock::release_lock(repo.storage.as_ref(), guard) {
-        Ok(()) => result,
-        Err(release_err) => {
-            if result.is_err() {
-                tracing::warn!("failed to release repository lock: {release_err}");
-                result
-            } else {
-                Err(release_err)
-            }
-        }
-    }
+    // Session checks passed — hand off to the shared fence/flush/release epilogue.
+    run_under_fence(repo, guard, action)
 }

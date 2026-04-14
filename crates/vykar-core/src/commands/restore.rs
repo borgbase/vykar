@@ -118,12 +118,7 @@ pub fn run(
         snapshot_name,
         dest,
         xattrs_enabled,
-        move |path| {
-            filter
-                .as_ref()
-                .map(|matcher| matcher.is_match(path))
-                .unwrap_or(true)
-        },
+        move |path| filter.as_ref().is_none_or(|matcher| matcher.is_match(path)),
     )
 }
 
@@ -758,8 +753,7 @@ fn lightest_bucket(bucket_bytes: &[u64]) -> usize {
         .iter()
         .enumerate()
         .min_by_key(|(_, &b)| b)
-        .map(|(i, _)| i)
-        .unwrap_or(0)
+        .map_or(0, |(i, _)| i)
 }
 
 fn execute_parallel_restore(

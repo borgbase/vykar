@@ -346,8 +346,7 @@ fn render_directory_html(path: &str, tree: &VfsNode, is_snapshot_root: bool) -> 
         let mtime_ms = meta
             .mtime
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_millis());
         let name_sort = html_escape(&name.to_lowercase());
         rows.push_str(&format!(
             r#"<tr><td class="icon">📁</td><td data-sort="{name_sort}"><a href="{}/"><strong>{}/</strong></a></td><td class="size" data-sort="0" data-dir="1">—</td><td class="mtime" data-sort="{mtime_ms}">{}</td></tr>
@@ -364,8 +363,7 @@ fn render_directory_html(path: &str, tree: &VfsNode, is_snapshot_root: bool) -> 
         let mtime_ms = meta
             .mtime
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
+            .map_or(0, |d| d.as_millis());
         let name_sort = html_escape(&name.to_lowercase());
         let (icon, display) = match child {
             VfsNode::Symlink { _target, .. } => (

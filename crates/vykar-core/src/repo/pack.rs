@@ -225,11 +225,7 @@ impl PackWriter {
             let offset = running_offset as u64 + 4;
             running_offset += 4 + meta.stored_size as usize;
 
-            let refcount = self
-                .pending
-                .get(&meta.chunk_id)
-                .map(|(_, rc)| *rc)
-                .unwrap_or(1);
+            let refcount = self.pending.get(&meta.chunk_id).map_or(1, |(_, rc)| *rc);
             results.push((meta.chunk_id, meta.stored_size, offset, refcount));
         }
 

@@ -265,9 +265,8 @@ pub fn run_with_progress(
 
     // Resolve effective worker count before building the rayon pool so we
     // can right-size it in pipeline mode (avoids 2× thread oversubscription).
-    let is_local = vykar_storage::parse_repo_url(&config.repository.url)
-        .map(|u| u.is_local())
-        .unwrap_or(false);
+    let is_local =
+        vykar_storage::parse_repo_url(&config.repository.url).is_ok_and(|u| u.is_local());
     let num_workers = config.limits.effective_backup_threads(is_local);
 
     // Pipeline mode when we have more than 1 worker thread.

@@ -363,7 +363,7 @@ fn execute_repack(
         if op.keep_blobs.is_empty() {
             // Just delete the pack
             if op.delete_after {
-                let old_size = source_path.metadata().map(|m| m.len()).unwrap_or(0);
+                let old_size = source_path.metadata().map_or(0, |m| m.len());
                 let _ = std::fs::remove_file(&source_path);
                 state.sub_quota_usage(old_size);
             }
@@ -507,7 +507,7 @@ fn execute_repack(
 
         // Delete source if requested
         if op.delete_after {
-            let old_size = source_path.metadata().map(|m| m.len()).unwrap_or(0);
+            let old_size = source_path.metadata().map_or(0, |m| m.len());
             let _ = std::fs::remove_file(&source_path);
             state.sub_quota_usage(old_size);
         }
@@ -964,9 +964,7 @@ fn check_structure(repo_dir: &std::path::Path) -> serde_json::Value {
     // Check for stale locks
     let locks_dir = repo_dir.join("locks");
     let stale_locks = if locks_dir.exists() {
-        std::fs::read_dir(&locks_dir)
-            .map(|entries| entries.flatten().count())
-            .unwrap_or(0)
+        std::fs::read_dir(&locks_dir).map_or(0, |entries| entries.flatten().count())
     } else {
         0
     };

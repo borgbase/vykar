@@ -198,9 +198,7 @@ pub(super) fn normalize_sources(
                         .unwrap_or_else(|| default_exclude_if_present.to_vec()),
                     one_file_system: one_file_system.unwrap_or(default_one_file_system),
                     git_ignore: git_ignore.unwrap_or(default_git_ignore),
-                    xattrs_enabled: xattrs
-                        .map(|cfg| cfg.enabled)
-                        .unwrap_or(default_xattrs_enabled),
+                    xattrs_enabled: xattrs.map_or(default_xattrs_enabled, |cfg| cfg.enabled),
                     hooks,
                     retention,
                     repos,

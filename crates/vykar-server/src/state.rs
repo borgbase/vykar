@@ -320,8 +320,7 @@ fn existing_ancestor_within(path: &Path, base: &Path) -> bool {
         if candidate.exists() {
             return candidate
                 .canonicalize()
-                .map(|canon| canon.starts_with(base))
-                .unwrap_or(false);
+                .is_ok_and(|canon| canon.starts_with(base));
         }
         cursor = candidate.parent();
     }

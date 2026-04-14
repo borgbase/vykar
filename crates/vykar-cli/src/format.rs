@@ -1,25 +1,29 @@
-/// Parse a human-readable size string like "500M", "2G", "1024K" into bytes.
 pub(crate) fn parse_size(s: &str) -> Result<u64, Box<dyn std::error::Error>> {
-    let s = s.trim();
-    if s.is_empty() {
-        return Err("empty size string".into());
-    }
-
-    let (num_str, multiplier) = match s.as_bytes().last() {
-        Some(b'K' | b'k') => (&s[..s.len() - 1], 1024u64),
-        Some(b'M' | b'm') => (&s[..s.len() - 1], 1024 * 1024),
-        Some(b'G' | b'g') => (&s[..s.len() - 1], 1024 * 1024 * 1024),
-        Some(b'T' | b't') => (&s[..s.len() - 1], 1024 * 1024 * 1024 * 1024),
-        _ => (s, 1u64),
-    };
-
-    let num: f64 = num_str
-        .parse()
-        .map_err(|_| format!("invalid size: '{s}'"))?;
-    Ok((num * multiplier as f64) as u64)
+    vykar_common::display::parse_size(s).map_err(|e| e.into())
 }
 
 pub(crate) use vykar_common::display::{format_bytes, format_count};
+
+pub(crate) fn print_backup_stats(stats: &vykar_core::snapshot::SnapshotStats) {
+    if stats.errors > 0 {
+        println!(
+            "  Files: {}, Errors: {}, Original: {}, Compressed: {}, Deduplicated: {}",
+            stats.nfiles,
+            stats.errors,
+            format_bytes(stats.original_size),
+            format_bytes(stats.compressed_size),
+            format_bytes(stats.deduplicated_size),
+        );
+    } else {
+        println!(
+            "  Files: {}, Original: {}, Compressed: {}, Deduplicated: {}",
+            stats.nfiles,
+            format_bytes(stats.original_size),
+            format_bytes(stats.compressed_size),
+            format_bytes(stats.deduplicated_size),
+        );
+    }
+}
 
 pub(crate) fn format_size_with_savings(bytes: u64, reference: u64, label: &str) -> String {
     if reference == 0 {

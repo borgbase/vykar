@@ -28,30 +28,4 @@ impl Default for ServerSection {
     }
 }
 
-/// Parse a human-readable size string like "500M", "2G", "1024K" into bytes.
-pub fn parse_size(s: &str) -> Result<u64, String> {
-    let s = s.trim();
-    if s.is_empty() {
-        return Err("empty size string".into());
-    }
-
-    let (num_str, multiplier) = match s.as_bytes().last() {
-        Some(b'K' | b'k') => (&s[..s.len() - 1], 1024u64),
-        Some(b'M' | b'm') => (&s[..s.len() - 1], 1024 * 1024),
-        Some(b'G' | b'g') => (&s[..s.len() - 1], 1024 * 1024 * 1024),
-        Some(b'T' | b't') => (&s[..s.len() - 1], 1024 * 1024 * 1024 * 1024),
-        _ => (s, 1u64),
-    };
-
-    let num: f64 = num_str
-        .parse()
-        .map_err(|_| format!("invalid size: '{s}'"))?;
-    if !num.is_finite() || num < 0.0 {
-        return Err(format!("invalid size: '{s}'"));
-    }
-    let bytes = num * multiplier as f64;
-    if bytes > u64::MAX as f64 {
-        return Err(format!("size too large: '{s}'"));
-    }
-    Ok(bytes as u64)
-}
+pub use vykar_common::display::parse_size;

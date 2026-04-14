@@ -193,7 +193,7 @@ fn make_progress_callback() -> impl FnMut(commands::check::CheckProgressEvent) {
     |event| format_check_progress(&event)
 }
 
-fn print_check_summary(result: &commands::check::CheckResult) {
+pub(crate) fn print_check_summary(result: &commands::check::CheckResult) {
     if !result.errors.is_empty() {
         println!("Errors found:");
         for err in &result.errors {

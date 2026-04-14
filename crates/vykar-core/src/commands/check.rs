@@ -1461,7 +1461,7 @@ fn build_repair_plan(
         }
     }
     for pack_id in &missing_packs {
-        let chunk_count = pack_chunks.get(pack_id).map(|c| c.len()).unwrap_or(0);
+        let chunk_count = pack_chunks.get(pack_id).map_or(0, |c| c.len());
         actions.push(RepairAction::RemoveDanglingIndexEntries {
             pack_id: *pack_id,
             chunk_count,
@@ -1495,7 +1495,7 @@ fn build_repair_plan(
         if missing_packs.contains(pack_id) {
             continue; // Already handled as dangling
         }
-        let chunk_count = pack_chunks.get(pack_id).map(|c| c.len()).unwrap_or(0);
+        let chunk_count = pack_chunks.get(pack_id).map_or(0, |c| c.len());
         actions.push(RepairAction::RemoveCorruptPack {
             pack_id: *pack_id,
             chunk_count,

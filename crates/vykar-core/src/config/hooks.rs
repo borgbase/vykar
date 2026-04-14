@@ -44,7 +44,7 @@ impl HooksConfig {
 
     /// Look up commands for a hook key, returning an empty slice if absent.
     pub fn get_hooks(&self, key: &str) -> &[String] {
-        self.hooks.get(key).map(|v| v.as_slice()).unwrap_or(&[])
+        self.hooks.get(key).map_or(&[], |v| v.as_slice())
     }
 
     pub fn is_empty(&self) -> bool {

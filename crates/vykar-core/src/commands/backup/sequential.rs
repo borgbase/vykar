@@ -29,6 +29,31 @@ use super::walk::{is_soft_io_error, read_item_xattrs};
 use super::walk::{rel_path_from_abs, InodeSortedWalk, WalkEvent};
 use super::{append_item_to_stream, emit_progress, emit_stats_progress};
 use super::{BackupProgressEvent, FileStatus};
+use vykar_crypto::CryptoEngine;
+
+/// Classify raw data chunks into `WorkerChunk`s, optionally using a rayon pool
+/// for parallel compression/hashing.
+fn classify_chunks(
+    chunks: Vec<Vec<u8>>,
+    chunk_id_key: &[u8; 32],
+    dedup_filter: Option<&xorf::Xor8>,
+    compression: Compression,
+    crypto: &dyn CryptoEngine,
+    transform_pool: Option<&rayon::ThreadPool>,
+) -> Result<Vec<WorkerChunk>> {
+    let classify = |data: Vec<u8>| -> Result<WorkerChunk> {
+        let chunk_id = ChunkId::compute(chunk_id_key, &data);
+        classify_chunk(chunk_id, data, dedup_filter, compression, crypto)
+    };
+
+    let results: Vec<Result<WorkerChunk>> = if let Some(pool) = transform_pool {
+        pool.install(|| chunks.into_par_iter().map(classify).collect())
+    } else {
+        chunks.into_iter().map(classify).collect()
+    };
+
+    results.into_iter().collect()
+}
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn flush_regular_file_batch(
@@ -46,22 +71,14 @@ pub(super) fn flush_regular_file_batch(
     }
 
     let taken = std::mem::take(raw_chunks);
-    let crypto = repo.crypto.as_ref();
-
-    let classify = |data: Vec<u8>| -> Result<WorkerChunk> {
-        let chunk_id = ChunkId::compute(chunk_id_key, &data);
-        classify_chunk(chunk_id, data, dedup_filter, compression, crypto)
-    };
-
-    let results: Vec<Result<WorkerChunk>> = if let Some(pool) = transform_pool {
-        pool.install(|| taken.into_par_iter().map(classify).collect())
-    } else {
-        taken.into_iter().map(classify).collect()
-    };
-
-    // All-or-nothing: if any classification fails, no chunks are committed
-    // for this batch (matches pipeline path semantics, avoids orphaned chunks).
-    let worker_chunks: Vec<WorkerChunk> = results.into_iter().collect::<Result<Vec<_>>>()?;
+    let worker_chunks = classify_chunks(
+        taken,
+        chunk_id_key,
+        dedup_filter,
+        compression,
+        repo.crypto.as_ref(),
+        transform_pool,
+    )?;
     process_worker_chunks(repo, item, worker_chunks, stats, compression, dedup_filter)
 }
 
@@ -143,20 +160,14 @@ fn flush_cross_file_batch(
     }
 
     let taken = std::mem::take(&mut batch.raw_chunks);
-    let crypto = repo.crypto.as_ref();
-
-    let classify = |data: Vec<u8>| -> Result<WorkerChunk> {
-        let chunk_id = ChunkId::compute(chunk_id_key, &data);
-        classify_chunk(chunk_id, data, dedup_filter, compression, crypto)
-    };
-
-    let results: Vec<Result<WorkerChunk>> = if let Some(pool) = transform_pool {
-        pool.install(|| taken.into_par_iter().map(classify).collect())
-    } else {
-        taken.into_iter().map(classify).collect()
-    };
-
-    let mut worker_chunks: Vec<WorkerChunk> = results.into_iter().collect::<Result<Vec<_>>>()?;
+    let mut worker_chunks = classify_chunks(
+        taken,
+        chunk_id_key,
+        dedup_filter,
+        compression,
+        repo.crypto.as_ref(),
+        transform_pool,
+    )?;
 
     for file in batch.files.drain(..) {
         if let Some(cb) = progress.as_deref_mut() {

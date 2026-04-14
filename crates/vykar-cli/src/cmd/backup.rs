@@ -5,7 +5,7 @@ use vykar_core::app::operations::{self, BackupRunEvent};
 use vykar_core::compress::Compression;
 use vykar_core::config::{self, CompressionAlgorithm, ResolvedRepo, SourceEntry};
 
-use crate::format::format_bytes;
+use crate::format::print_backup_stats;
 use crate::passphrase::with_repo_passphrase;
 use crate::progress::BackupProgressRenderer;
 
@@ -138,24 +138,7 @@ pub(crate) fn run_backup(
                 "  Source: {paths_display} (label: {})",
                 created.source_label
             );
-            if stats.errors > 0 {
-                println!(
-                    "  Files: {}, Errors: {}, Original: {}, Compressed: {}, Deduplicated: {}",
-                    stats.nfiles,
-                    stats.errors,
-                    format_bytes(stats.original_size),
-                    format_bytes(stats.compressed_size),
-                    format_bytes(stats.deduplicated_size),
-                );
-            } else {
-                println!(
-                    "  Files: {}, Original: {}, Compressed: {}, Deduplicated: {}",
-                    stats.nfiles,
-                    format_bytes(stats.original_size),
-                    format_bytes(stats.compressed_size),
-                    format_bytes(stats.deduplicated_size),
-                );
-            }
+            print_backup_stats(stats);
         }
 
         Ok(had_partial)

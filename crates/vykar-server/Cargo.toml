@@ -13,6 +13,7 @@ workspace = true
 
 [dependencies]
 # Internal
+vykar-common.workspace = true
 vykar-protocol.workspace = true
 
 # Web framework

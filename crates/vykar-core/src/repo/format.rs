@@ -120,31 +120,7 @@ where
 {
     let tag = obj_type as u8;
     let aad = legacy_aad(tag);
-
-    if crypto.is_encrypting() {
-        // Layout: [tag][nonce 12][plaintext → ciphertext][tag 16]
-        let mut buf = Vec::with_capacity(1 + 12 + estimated_plaintext_size + 16);
-        buf.push(tag);
-        // Reserve 12 bytes for the nonce (filled after encryption)
-        buf.extend_from_slice(&[0u8; 12]);
-        // Let the caller write plaintext starting at offset 13
-        write_plaintext(&mut buf)?;
-        // Encrypt the plaintext region in-place
-        let plaintext_start = 1 + 12; // after tag + nonce placeholder
-        let (nonce, gcm_tag) =
-            crypto.encrypt_in_place_detached(&mut buf[plaintext_start..], &aad)?;
-        // Fill in the nonce
-        buf[1..13].copy_from_slice(&nonce);
-        // Append the authentication tag
-        buf.extend_from_slice(&gcm_tag);
-        Ok(buf[..].to_vec())
-    } else {
-        // Plaintext engine: [tag][plaintext]
-        let mut buf = Vec::with_capacity(1 + estimated_plaintext_size);
-        buf.push(tag);
-        write_plaintext(&mut buf)?;
-        Ok(buf[..].to_vec())
-    }
+    pack_object_streaming_inner(tag, &aad, estimated_plaintext_size, crypto, write_plaintext)
 }
 
 /// Streaming variant of `pack_object_with_context`.
@@ -160,7 +136,19 @@ where
 {
     let tag = obj_type as u8;
     let aad = contextual_aad(tag, context);
+    pack_object_streaming_inner(tag, &aad, estimated_plaintext_size, crypto, write_plaintext)
+}
 
+fn pack_object_streaming_inner<F>(
+    tag: u8,
+    aad: &[u8],
+    estimated_plaintext_size: usize,
+    crypto: &dyn CryptoEngine,
+    write_plaintext: F,
+) -> Result<Vec<u8>>
+where
+    F: FnOnce(&mut Vec<u8>) -> Result<()>,
+{
     if crypto.is_encrypting() {
         // Layout: [tag][nonce 12][plaintext → ciphertext][tag 16]
         let mut buf = Vec::with_capacity(1 + 12 + estimated_plaintext_size + 16);
@@ -172,18 +160,18 @@ where
         // Encrypt the plaintext region in-place
         let plaintext_start = 1 + 12; // after tag + nonce placeholder
         let (nonce, gcm_tag) =
-            crypto.encrypt_in_place_detached(&mut buf[plaintext_start..], &aad)?;
+            crypto.encrypt_in_place_detached(&mut buf[plaintext_start..], aad)?;
         // Fill in the nonce
         buf[1..13].copy_from_slice(&nonce);
         // Append the authentication tag
         buf.extend_from_slice(&gcm_tag);
-        Ok(buf[..].to_vec())
+        Ok(buf)
     } else {
         // Plaintext engine: [tag][plaintext]
         let mut buf = Vec::with_capacity(1 + estimated_plaintext_size);
         buf.push(tag);
         write_plaintext(&mut buf)?;
-        Ok(buf[..].to_vec())
+        Ok(buf)
     }
 }
 

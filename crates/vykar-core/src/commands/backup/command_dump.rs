@@ -53,14 +53,12 @@ impl DumpProcessGuard {
         let timed_out = self
             .watchdog
             .take()
-            .map(|h| h.join().unwrap_or(false))
-            .unwrap_or(false);
+            .is_some_and(|h| h.join().unwrap_or(false));
 
         let stderr = self
             .stderr_thread
             .take()
-            .map(|h| h.join().unwrap_or(Ok(Vec::new())))
-            .unwrap_or(Ok(Vec::new()))
+            .map_or(Ok(Vec::new()), |h| h.join().unwrap_or(Ok(Vec::new())))
             .unwrap_or_default();
 
         self.child.take();

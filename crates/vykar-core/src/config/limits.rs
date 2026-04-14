@@ -71,9 +71,7 @@ impl ResourceLimitsConfig {
             return self.threads;
         }
         auto_backup_threads(
-            std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(2),
+            std::thread::available_parallelism().map_or(2, |n| n.get()),
             is_local,
         )
     }

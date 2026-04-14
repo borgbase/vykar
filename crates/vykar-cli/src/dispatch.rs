@@ -8,8 +8,8 @@ use vykar_storage::{parse_repo_url, ParsedUrl};
 
 use crate::cli::Commands;
 use crate::cmd;
-use crate::cmd::check::format_check_progress;
-use crate::format::format_bytes;
+use crate::cmd::check::{format_check_progress, print_check_summary};
+use crate::format::{format_bytes, print_backup_stats};
 use crate::passphrase::with_repo_passphrase;
 
 pub(crate) fn warn_if_untrusted_rest(config: &VykarConfig, label: Option<&str>) {
@@ -118,23 +118,8 @@ fn print_step_details(result: &FullCycleResult) {
                     "Warning: {} file(s) could not be read and were excluded from the snapshot",
                     stats.errors
                 );
-                println!(
-                    "  Files: {}, Errors: {}, Original: {}, Compressed: {}, Deduplicated: {}",
-                    stats.nfiles,
-                    stats.errors,
-                    format_bytes(stats.original_size),
-                    format_bytes(stats.compressed_size),
-                    format_bytes(stats.deduplicated_size),
-                );
-            } else {
-                println!(
-                    "  Files: {}, Original: {}, Compressed: {}, Deduplicated: {}",
-                    stats.nfiles,
-                    format_bytes(stats.original_size),
-                    format_bytes(stats.compressed_size),
-                    format_bytes(stats.deduplicated_size),
-                );
             }
+            print_backup_stats(stats);
         }
     }
 
@@ -174,22 +159,7 @@ fn print_step_details(result: &FullCycleResult) {
     // Check results (skip summary if check was skipped — the step outcome table already shows it)
     if let Some(ref result) = result.check_result {
         if !result.skipped {
-            if !result.errors.is_empty() {
-                println!("Errors found:");
-                for err in &result.errors {
-                    println!("  [{}] {}", err.context, err.message);
-                }
-                println!();
-            }
-            println!(
-                "Check complete: {} snapshots, {} items, {} packs existence-checked ({} chunks), {} chunks data-verified, {} errors",
-                result.snapshots_checked,
-                result.items_checked,
-                result.packs_existence_checked,
-                result.chunks_existence_checked,
-                result.chunks_data_verified,
-                result.errors.len(),
-            );
+            print_check_summary(result);
         }
     }
 }

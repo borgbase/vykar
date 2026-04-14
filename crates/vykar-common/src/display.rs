@@ -26,6 +26,42 @@ pub fn format_count(n: u64) -> String {
     result
 }
 
+/// Parse a human-readable size string like "500M", "2G", "1024K" into bytes.
+pub fn parse_size(s: &str) -> Result<u64, String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err("empty size string".into());
+    }
+
+    let (num_str, multiplier) = match s.as_bytes().last() {
+        Some(b'K' | b'k') => (&s[..s.len() - 1], 1024u64),
+        Some(b'M' | b'm') => (&s[..s.len() - 1], 1024 * 1024),
+        Some(b'G' | b'g') => (&s[..s.len() - 1], 1024 * 1024 * 1024),
+        Some(b'T' | b't') => (&s[..s.len() - 1], 1024 * 1024 * 1024 * 1024),
+        _ => (s, 1u64),
+    };
+
+    // Try integer parse first (exact for the full u64 range), fall back to
+    // f64 only for fractional values like "1.5G".
+    if let Ok(n) = num_str.parse::<u64>() {
+        return n
+            .checked_mul(multiplier)
+            .ok_or_else(|| format!("size too large: '{s}'"));
+    }
+
+    let num: f64 = num_str
+        .parse()
+        .map_err(|_| format!("invalid size: '{s}'"))?;
+    if !num.is_finite() || num < 0.0 {
+        return Err(format!("invalid size: '{s}'"));
+    }
+    let bytes = num * multiplier as f64;
+    if bytes >= 2.0f64.powi(64) {
+        return Err(format!("size too large: '{s}'"));
+    }
+    Ok(bytes as u64)
+}
+
 /// Return the terminal display width of a single character.
 /// CJK and fullwidth characters occupy 2 columns; everything else occupies 1.
 pub fn char_display_width(c: char) -> usize {
@@ -105,7 +141,7 @@ pub fn truncate_middle(input: &str, max_cols: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{str_display_width, truncate_middle};
+    use super::{parse_size, str_display_width, truncate_middle};
 
     #[test]
     fn truncate_middle_shows_head_and_tail() {
@@ -163,5 +199,45 @@ mod tests {
         let out = truncate_middle(input, 60);
         assert!(str_display_width(&out) <= 60);
         assert!(out.contains("..."));
+    }
+
+    #[test]
+    fn parse_size_basic() {
+        assert_eq!(parse_size("1024").unwrap(), 1024);
+        assert_eq!(parse_size("1K").unwrap(), 1024);
+        assert_eq!(parse_size("1k").unwrap(), 1024);
+        assert_eq!(parse_size("2M").unwrap(), 2 * 1024 * 1024);
+        assert_eq!(parse_size("1G").unwrap(), 1024 * 1024 * 1024);
+        assert_eq!(parse_size("1T").unwrap(), 1024u64 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn parse_size_fractional() {
+        assert_eq!(
+            parse_size("1.5G").unwrap(),
+            (1.5 * 1024.0 * 1024.0 * 1024.0) as u64
+        );
+    }
+
+    #[test]
+    fn parse_size_rejects_invalid() {
+        assert!(parse_size("").is_err());
+        assert!(parse_size("abc").is_err());
+        assert!(parse_size("-1M").is_err());
+        assert!(parse_size("NaN").is_err());
+        assert!(parse_size("infG").is_err());
+    }
+
+    #[test]
+    fn parse_size_rejects_overflow() {
+        // u64::MAX + 1 — must not silently saturate to u64::MAX
+        assert!(parse_size("18446744073709551616").is_err());
+        // Also reject when multiplied
+        assert!(parse_size("17592186044416T").is_err()); // 16 EiB
+    }
+
+    #[test]
+    fn parse_size_accepts_u64_max() {
+        assert_eq!(parse_size("18446744073709551615").unwrap(), u64::MAX);
     }
 }

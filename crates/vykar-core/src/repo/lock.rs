@@ -157,8 +157,7 @@ pub fn build_lock_fence(
     let acquired_secs = guard
         .acquired_at
         .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_secs() as i64);
     build_lock_fence_inner(guard, storage, acquired_secs)
 }
 
@@ -189,8 +188,7 @@ fn build_lock_fence_inner(
         // Refresh lock file if refresh interval has elapsed.
         let now_secs = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(i64::MAX);
+            .map_or(i64::MAX, |d| d.as_secs() as i64);
         let elapsed = now_secs - last_refreshed.load(Ordering::SeqCst);
         if elapsed >= LOCK_REFRESH_INTERVAL_SECS as i64 {
             let entry = LockEntry {
@@ -228,8 +226,7 @@ pub fn verify_lock_validity(
     // 2. Check time since last refresh.
     let now_secs = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(i64::MAX);
+        .map_or(i64::MAX, |d| d.as_secs() as i64);
 
     let elapsed = now_secs - last_refreshed_secs;
 

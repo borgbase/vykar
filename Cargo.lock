@@ -8071,6 +8071,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "vykar-common",
  "vykar-protocol",
 ]
 

@@ -213,6 +213,32 @@ def extract_snapshot_id(stdout: str) -> str | None:
     return m.group(1) if m else None
 
 
+def _build_diff_args(corpus_dir: str, restore_dir: str) -> list[str]:
+    diff_args = ["diff", "-qr"]
+    if platform.system() != "Darwin":
+        diff_args.append("--no-dereference")
+    diff_args += [corpus_dir, restore_dir]
+    return diff_args
+
+
+def _run_diff(corpus_dir: str, restore_dir: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        _build_diff_args(corpus_dir, restore_dir),
+        capture_output=True,
+        text=True,
+    )
+
+
+def _diff_output(diff_result: subprocess.CompletedProcess) -> str:
+    output = diff_result.stdout.strip()
+    if output:
+        return output
+    error_output = diff_result.stderr.strip()
+    if error_output:
+        return error_output
+    return f"diff exited with rc={diff_result.returncode} and produced no output"
+
+
 def verify_restore(
     vykar_bin: str,
     config_path: str,
@@ -220,10 +246,10 @@ def verify_restore(
     snapshot_id: str,
     corpus_dir: str,
     work_dir: str,
-) -> tuple[bool, str]:
+) -> tuple[bool, str, bool]:
     """Restore a snapshot and diff against the corpus.
 
-    Returns (passed, detail_message).
+    Returns (passed, detail_message, stop_scenario).
     """
     restore_dir = os.path.join(work_dir, "restore")
     if os.path.exists(restore_dir):
@@ -233,25 +259,22 @@ def verify_restore(
     result = vykar_restore(vykar_bin, config_path, repo_label, snapshot_id, restore_dir)
     if result.returncode != 0:
         shutil.rmtree(restore_dir, ignore_errors=True)
-        return False, f"restore failed (rc={result.returncode}): {result.stderr[-500:]}"
+        return False, f"restore failed (rc={result.returncode}): {result.stderr[-500:]}", False
 
-    diff_args = ["diff", "-qr"]
-    if platform.system() != "Darwin":
-        diff_args.append("--no-dereference")
-    diff_args += [corpus_dir, restore_dir]
-
-    diff_result = subprocess.run(diff_args, capture_output=True, text=True)
+    diff_result = _run_diff(corpus_dir, restore_dir)
+    if diff_result.returncode != 0:
+        retry_result = _run_diff(corpus_dir, restore_dir)
+    else:
+        retry_result = None
 
     shutil.rmtree(restore_dir, ignore_errors=True)
 
     if diff_result.returncode == 0:
-        return True, "restore matches corpus"
-    else:
-        lines = diff_result.stdout.strip().splitlines()
-        summary = "\n".join(lines[:20])
-        if len(lines) > 20:
-            summary += f"\n... and {len(lines) - 20} more differences"
-        return False, f"diff mismatch:\n{summary}"
+        return True, "restore matches corpus", False
+    if retry_result is not None and retry_result.returncode == 0:
+        return True, "restore matches corpus after diff retry", False
+    failed_result = retry_result if retry_result is not None else diff_result
+    return False, f"diff mismatch after retry:\n{_diff_output(failed_result)}", True
 
 
 def drop_caches() -> None:

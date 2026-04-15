@@ -208,7 +208,7 @@ impl Repository {
         }
 
         // Generate repo ID
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let mut repo_id = vec![0u8; 32];
         rng.fill_bytes(&mut repo_id);
 
@@ -907,7 +907,7 @@ impl Repository {
         // When the index changes, rotate index_generation so the local dedup
         // cache is invalidated.
         if self.index_dirty {
-            self.index_generation = rand::thread_rng().next_u64();
+            self.index_generation = rand::rng().next_u64();
         }
 
         if self.index_dirty {
@@ -1078,7 +1078,7 @@ impl Repository {
                     reconciled.apply_to(&mut fresh_index);
                     self.chunk_index = fresh_index;
                     self.index_dirty = true;
-                    self.index_generation = rand::thread_rng().next_u64();
+                    self.index_generation = rand::rng().next_u64();
 
                     let ctx = emit_stage!(progress, "write index");
                     self.persist_index()?;
@@ -1096,7 +1096,7 @@ impl Repository {
         // Defensive: persist index if dirty but no delta (unreachable today
         // because backup always activates dedup mode, but guards future callers).
         if self.index_dirty {
-            self.index_generation = rand::thread_rng().next_u64();
+            self.index_generation = rand::rng().next_u64();
             self.persist_index()?;
         }
 
@@ -1442,7 +1442,7 @@ impl Repository {
         );
 
         // Merge old cache + delta into new full cache.
-        self.index_generation = rand::thread_rng().next_u64();
+        self.index_generation = rand::rng().next_u64();
         let new_cache_path = full_cache_path.with_extension("merged");
         dedup_cache::merge_full_index_cache(
             &old_cache,

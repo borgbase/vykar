@@ -216,7 +216,7 @@ where
     // remove_dir_all the temp root so no partial files are left at dest.
     let temp_dir_name = format!(
         ".vykar-restore-{:016x}",
-        rand::Rng::gen::<u64>(&mut rand::thread_rng())
+        rand::Rng::random::<u64>(&mut rand::rng())
     );
     let temp_root = dest_root.join(&temp_dir_name);
     std::fs::create_dir_all(&temp_root)?;

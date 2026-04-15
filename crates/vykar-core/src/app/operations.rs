@@ -130,7 +130,7 @@ impl FullCycleResult {
 
 fn generate_snapshot_name() -> String {
     let mut buf = [0u8; 4];
-    rand::thread_rng().fill_bytes(&mut buf);
+    rand::rng().fill_bytes(&mut buf);
     hex::encode(buf)
 }
 

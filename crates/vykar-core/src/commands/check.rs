@@ -518,7 +518,7 @@ fn sample_packs_out(
     let keep = keep.max(1).min(total);
 
     let pack_ids: Vec<PackId> = pack_chunks.keys().copied().collect();
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let indices = sample(&mut rng, total, keep);
 
     let kept: HashSet<usize> = indices.into_iter().collect();
@@ -896,7 +896,7 @@ fn integrity_scan(
         } else {
             let keep = (total as u64 * pct as u64).div_ceil(100) as usize;
             let keep = keep.max(1).min(total);
-            let mut rng = rand::thread_rng();
+            let mut rng = rand::rng();
             let indices: std::collections::HashSet<usize> =
                 rand::seq::index::sample(&mut rng, total, keep)
                     .into_iter()

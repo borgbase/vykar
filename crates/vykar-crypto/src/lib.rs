@@ -64,7 +64,7 @@ macro_rules! impl_aead_engine {
             fn encrypt(&self, plaintext: &[u8], aad: &[u8]) -> vykar_types::error::Result<Vec<u8>> {
                 use rand::RngCore;
                 use $crate_path::aead::Aead;
-                let mut rng = rand::thread_rng();
+                let mut rng = rand::rng();
                 let mut nonce_bytes = [0u8; 12];
                 rng.fill_bytes(&mut nonce_bytes);
                 let nonce = $crate_path::Nonce::from_slice(&nonce_bytes);
@@ -133,7 +133,7 @@ macro_rules! impl_aead_engine {
             ) -> vykar_types::error::Result<([u8; 12], [u8; 16])> {
                 use rand::RngCore;
                 use $crate_path::aead::AeadInPlace;
-                let mut rng = rand::thread_rng();
+                let mut rng = rand::rng();
                 let mut nonce_bytes = [0u8; 12];
                 rng.fill_bytes(&mut nonce_bytes);
                 let nonce = $crate_path::Nonce::from_slice(&nonce_bytes);

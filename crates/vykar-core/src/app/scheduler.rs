@@ -91,7 +91,7 @@ pub fn random_jitter(jitter_seconds: u64) -> Duration {
     if jitter_seconds == 0 {
         return Duration::ZERO;
     }
-    let secs = rand::thread_rng().gen_range(0..=jitter_seconds);
+    let secs = rand::rng().random_range(0..=jitter_seconds);
     Duration::from_secs(secs)
 }
 

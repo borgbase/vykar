@@ -287,21 +287,26 @@ impl ChunkerConfig {
             self.max_size = CHUNK_MAX_SIZE_HARD_CAP;
         }
 
-        if !(MINIMUM_MIN..=MINIMUM_MAX).contains(&self.min_size) {
+        let min = self.min_size as usize;
+        let avg = self.avg_size as usize;
+        let max = self.max_size as usize;
+        let hard_cap = CHUNK_MAX_SIZE_HARD_CAP as usize;
+
+        if !(MINIMUM_MIN..=MINIMUM_MAX).contains(&min) {
             return Err(VykarError::Config(format!(
                 "chunker.min_size must be in [{MINIMUM_MIN}, {MINIMUM_MAX}], got {}",
                 self.min_size
             )));
         }
 
-        if !(AVERAGE_MIN..=AVERAGE_MAX).contains(&self.avg_size) {
+        if !(AVERAGE_MIN..=AVERAGE_MAX).contains(&avg) {
             return Err(VykarError::Config(format!(
                 "chunker.avg_size must be in [{AVERAGE_MIN}, {AVERAGE_MAX}], got {}",
                 self.avg_size
             )));
         }
 
-        if !(MAXIMUM_MIN..=CHUNK_MAX_SIZE_HARD_CAP).contains(&self.max_size) {
+        if !(MAXIMUM_MIN..=hard_cap).contains(&max) {
             return Err(VykarError::Config(format!(
                 "chunker.max_size must be in [{MAXIMUM_MIN}, {CHUNK_MAX_SIZE_HARD_CAP}], got {}",
                 self.max_size
@@ -573,7 +578,7 @@ mod tests {
     #[test]
     fn chunker_validate_rejects_fastcdc_bounds() {
         let mut config = ChunkerConfig {
-            min_size: MINIMUM_MIN - 1,
+            min_size: (MINIMUM_MIN - 1) as u32,
             avg_size: 1024,
             max_size: 4096,
         };

@@ -31,7 +31,7 @@ url = "2"
 percent-encoding = "2"
 
 # HTTP client (S3 + REST backends)
-rusty-s3 = "0.8"
+rusty-s3 = "0.9"
 ureq = { version = "3", features = ["json"] }
 http = "1"
 
@@ -45,7 +45,7 @@ tempfile.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread"], optional = true }
 
 # SSH/SFTP
-russh = { version = "0.58", default-features = false, features = ["aws-lc-rs"], optional = true }
+russh = { version = "0.60", default-features = false, features = ["aws-lc-rs"], optional = true }
 russh-sftp = { version = "2.1", optional = true }
 
 [features]

@@ -33,7 +33,7 @@ lz4_flex = "0.13"
 zstd = "0.13"
 
 # Chunking
-fastcdc = "3"
+fastcdc = "4"
 
 # Filesystem
 tempfile.workspace = true
@@ -68,7 +68,7 @@ tokio = { workspace = true, features = ["rt-multi-thread"], optional = true }
 dav-server = { version = "0.11", optional = true }
 hyper = { version = "1", features = ["server", "http1"], optional = true }
 hyper-util = { version = "0.1", features = ["tokio"], optional = true }
-lru = { version = "0.16", optional = true }
+lru = { version = "0.17", optional = true }
 bytes = { version = "1", optional = true }
 futures-util = { version = "0.3", optional = true }
 percent-encoding = { version = "2", optional = true }

@@ -1,7 +1,7 @@
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
 use argon2::Argon2;
-use rand::RngCore;
+use rand::TryRngCore;
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
@@ -73,8 +73,12 @@ impl MasterKey {
     pub fn generate() -> Self {
         let mut encryption_key = [0u8; 32];
         let mut chunk_id_key = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut encryption_key);
-        rand::rngs::OsRng.fill_bytes(&mut chunk_id_key);
+        rand::rngs::OsRng
+            .try_fill_bytes(&mut encryption_key)
+            .expect("OS entropy source unavailable");
+        rand::rngs::OsRng
+            .try_fill_bytes(&mut chunk_id_key)
+            .expect("OS entropy source unavailable");
         Self {
             encryption_key,
             chunk_id_key,
@@ -87,7 +91,9 @@ impl MasterKey {
 
         // Generate salt using OS entropy
         let mut salt = vec![0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut salt);
+        rand::rngs::OsRng
+            .try_fill_bytes(&mut salt)
+            .expect("OS entropy source unavailable");
 
         // Derive a wrapping key from the passphrase
         let kdf = KdfParams {
@@ -112,7 +118,9 @@ impl MasterKey {
         let cipher = Aes256Gcm::new_from_slice(wrapping_key.as_ref())
             .map_err(|e| VykarError::KeyDerivation(format!("cipher init: {e}")))?;
         let mut nonce_bytes = [0u8; 12];
-        rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
+        rand::rngs::OsRng
+            .try_fill_bytes(&mut nonce_bytes)
+            .expect("OS entropy source unavailable");
         let nonce = Nonce::from_slice(&nonce_bytes);
         let ciphertext = cipher
             .encrypt(
@@ -275,12 +283,15 @@ fn derive_key_from_passphrase(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::RngCore;
 
     const TEST_PASSPHRASE: &str = "test-passphrase-123";
 
     fn make_test_kdf() -> KdfParams {
         let mut salt = vec![0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut salt);
+        rand::rngs::OsRng
+            .try_fill_bytes(&mut salt)
+            .expect("OS entropy source unavailable");
         KdfParams {
             algorithm: "argon2id".to_string(),
             time_cost: 1,
@@ -401,7 +412,7 @@ mod tests {
         let legacy_aad = kdf_params_aad_legacy(&kdf).unwrap();
         let cipher = Aes256Gcm::new_from_slice(wrapping_key.as_ref()).unwrap();
         let mut nonce_bytes = [0u8; 12];
-        rand::thread_rng().fill_bytes(&mut nonce_bytes);
+        rand::rng().fill_bytes(&mut nonce_bytes);
         let nonce = Nonce::from_slice(&nonce_bytes);
         let ciphertext = cipher
             .encrypt(
@@ -491,7 +502,7 @@ mod tests {
 
         let cipher = Aes256Gcm::new_from_slice(wrapping_key.as_ref()).unwrap();
         let mut nonce_bytes = [0u8; 12];
-        rand::thread_rng().fill_bytes(&mut nonce_bytes);
+        rand::rng().fill_bytes(&mut nonce_bytes);
         let nonce = Nonce::from_slice(&nonce_bytes);
         // Encrypt with no AAD
         let ciphertext = cipher.encrypt(nonce, plaintext.as_ref()).unwrap();

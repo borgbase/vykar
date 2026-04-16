@@ -609,6 +609,14 @@ pub fn list_snapshot_items(
     commands::list::list_snapshot_items(config, passphrase, snapshot_name)
 }
 
+pub fn list_snapshot_items_with_source_paths(
+    config: &VykarConfig,
+    passphrase: Option<&str>,
+    snapshot_name: &str,
+) -> Result<(Vec<Item>, Vec<String>)> {
+    commands::list::list_snapshot_items_with_source_paths(config, passphrase, snapshot_name)
+}
+
 pub fn restore_snapshot(
     config: &VykarConfig,
     passphrase: Option<&str>,

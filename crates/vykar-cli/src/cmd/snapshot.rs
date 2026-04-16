@@ -1,3 +1,4 @@
+use std::cmp::Reverse;
 use std::sync::atomic::AtomicBool;
 
 use chrono::Local;
@@ -49,8 +50,8 @@ pub(crate) fn run_snapshot_command(
             // Apply sort
             match sort {
                 SortField::Name => items.sort_by(|a, b| a.path.cmp(&b.path)),
-                SortField::Size => items.sort_by(|a, b| b.size.cmp(&a.size)),
-                SortField::Mtime => items.sort_by(|a, b| b.mtime.cmp(&a.mtime)),
+                SortField::Size => items.sort_by_key(|a| Reverse(a.size)),
+                SortField::Mtime => items.sort_by_key(|a| Reverse(a.mtime)),
             }
 
             if *long {

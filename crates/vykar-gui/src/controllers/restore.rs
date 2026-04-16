@@ -64,16 +64,18 @@ pub(crate) fn handle_snapshot_contents(
     repo_name: &str,
     snapshot_name: &str,
     items: Vec<Item>,
+    source_paths: &[String],
 ) {
     // Discard stale results if the window has moved on to a different snapshot.
     if rw.get_repo_name() != repo_name || rw.get_snapshot_name() != snapshot_name {
         return;
     }
-    let tree = FileTree::build_from_items(&items);
+    let (tree, common_prefix) = FileTree::build_from_items(&items, source_paths);
     let selection = tree.selection_text();
     let rows = tree.to_slint_model();
     rw.set_tree_rows(ModelRc::new(VecModel::from(rows)));
     rw.set_selection_text(selection.into());
+    rw.set_source_root_text(common_prefix.into());
     rw.set_status_text("Ready".into());
     FILE_TREE.with(|cell| {
         *cell.borrow_mut() = Some(tree);
@@ -86,6 +88,7 @@ fn clear_tree(rw: &RestoreWindow) {
     });
     rw.set_tree_rows(ModelRc::new(VecModel::<TreeRowData>::default()));
     rw.set_selection_text(SharedString::default());
+    rw.set_source_root_text(SharedString::default());
 }
 
 pub(crate) fn handle_restore_finished(rw: &RestoreWindow, success: bool, message: String) {

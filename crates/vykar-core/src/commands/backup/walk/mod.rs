@@ -4,7 +4,9 @@ use std::sync::Arc;
 
 #[cfg(any(not(target_os = "linux"), test))]
 use ignore::WalkBuilder;
-use tracing::{debug, warn};
+#[cfg(any(not(target_os = "linux"), test))]
+use tracing::debug;
+use tracing::warn;
 
 use crate::config::ChunkerConfig;
 use crate::platform::fs;

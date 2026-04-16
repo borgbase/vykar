@@ -1,3 +1,4 @@
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use chrono::{DateTime, Datelike, IsoWeek, Timelike, Utc};
@@ -304,7 +305,7 @@ pub fn apply_policy_by_label(
     }
 
     // Sort newest-first across all groups
-    all_entries.sort_by(|a, b| b.snapshot_time.cmp(&a.snapshot_time));
+    all_entries.sort_by_key(|a| Reverse(a.snapshot_time));
 
     Ok(all_entries)
 }

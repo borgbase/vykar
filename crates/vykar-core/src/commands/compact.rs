@@ -1,3 +1,4 @@
+use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -247,7 +248,7 @@ pub fn compact_repo(
     }
 
     // Sort by most wasteful first (highest dead bytes)
-    analyses.sort_by(|a, b| b.dead_bytes.cmp(&a.dead_bytes));
+    analyses.sort_by_key(|a| Reverse(a.dead_bytes));
     let selected = select_analyses_by_cap(&analyses, max_repack_size);
 
     if dry_run {

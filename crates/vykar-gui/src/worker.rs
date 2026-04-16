@@ -680,12 +680,12 @@ pub(crate) fn run_worker(
                     &mut passphrases,
                 ) {
                     Ok((repo, passphrase)) => {
-                        match operations::list_snapshot_items(
+                        match operations::list_snapshot_items_with_source_paths(
                             &repo.config,
                             passphrase.as_deref().map(|s| s.as_str()),
                             &snapshot_name,
                         ) {
-                            Ok(items) => {
+                            Ok((items, source_paths)) => {
                                 send_log(
                                     &ui_tx,
                                     format!(
@@ -700,6 +700,7 @@ pub(crate) fn run_worker(
                                     repo_name: repo_name.clone(),
                                     snapshot_name: snapshot_name.clone(),
                                     items,
+                                    source_paths,
                                 });
                             }
                             Err(e) => {

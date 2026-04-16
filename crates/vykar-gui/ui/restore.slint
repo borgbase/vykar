@@ -16,6 +16,7 @@ export struct TreeRowData {
 export component RestoreWindow inherits Window {
     in-out property <string> snapshot_name;
     in-out property <string> repo_name;
+    in-out property <string> source_root_text: "";
     in-out property <string> status_text: "Ready";
     in-out property <string> selection_text: "";
     in-out property <[TreeRowData]> tree_rows: [];
@@ -49,6 +50,19 @@ export component RestoreWindow inherits Window {
                 spacing: 4px;
                 Text { text: "Repository:"; vertical-alignment: center; font-weight: 700; }
                 Text { text: root.repo_name; vertical-alignment: center; }
+            }
+            Rectangle { horizontal-stretch: 1; }
+        }
+
+        // Source root (shown when source_paths are available)
+        if root.source_root_text != "": HorizontalLayout {
+            spacing: 4px;
+            Text { text: "Root:"; vertical-alignment: center; font-weight: 700; }
+            Text {
+                text: root.source_root_text;
+                vertical-alignment: center;
+                overflow: elide;
+                color: Palette.foreground.transparentize(20%);
             }
             Rectangle { horizontal-stretch: 1; }
         }

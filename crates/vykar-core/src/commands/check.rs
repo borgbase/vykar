@@ -1430,18 +1430,16 @@ fn build_repair_plan(
             IntegrityIssue::CorruptSnapshot {
                 snapshot_id,
                 snapshot_name,
-            } => {
+            } if !actions.iter().any(|a| matches!(a, RepairAction::RemoveCorruptSnapshot { snapshot_id: id, .. } if *id == *snapshot_id)) => {
                 // Deduplicate by snapshot_id
-                if !actions.iter().any(|a| matches!(a, RepairAction::RemoveCorruptSnapshot { snapshot_id: id, .. } if *id == *snapshot_id)) {
-                    actions.push(RepairAction::RemoveCorruptSnapshot {
-                        snapshot_id: *snapshot_id,
-                        name: snapshot_name.clone(),
-                    });
-                    if let Some(name) = snapshot_name {
-                        corrupt_snapshot_names.insert(name.clone());
-                    }
-                    has_data_loss = true;
+                actions.push(RepairAction::RemoveCorruptSnapshot {
+                    snapshot_id: *snapshot_id,
+                    name: snapshot_name.clone(),
+                });
+                if let Some(name) = snapshot_name {
+                    corrupt_snapshot_names.insert(name.clone());
                 }
+                has_data_loss = true;
             }
             IntegrityIssue::InvalidSnapshotKey { storage_key } => {
                 actions.push(RepairAction::RemoveInvalidSnapshotKey {
@@ -1479,14 +1477,12 @@ fn build_repair_plan(
             }
             IntegrityIssue::CorruptChunk {
                 chunk_id, pack_id, ..
-            } => {
+            } if !corrupt_packs.contains(pack_id) && !missing_packs.contains(pack_id) => {
                 // Only add as corrupt chunk if the whole pack isn't already corrupt
-                if !corrupt_packs.contains(pack_id) && !missing_packs.contains(pack_id) {
-                    corrupt_chunks_by_pack
-                        .entry(*pack_id)
-                        .or_default()
-                        .push(*chunk_id);
-                }
+                corrupt_chunks_by_pack
+                    .entry(*pack_id)
+                    .or_default()
+                    .push(*chunk_id);
             }
             _ => {}
         }

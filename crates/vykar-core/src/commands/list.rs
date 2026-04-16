@@ -30,6 +30,24 @@ pub fn list_snapshot_items(
     passphrase: Option<&str>,
     snapshot_name: &str,
 ) -> Result<Vec<Item>> {
+    list_snapshot_items_inner(config, passphrase, snapshot_name).map(|(items, _)| items)
+}
+
+/// Like [`list_snapshot_items`], but also returns the `source_paths` from
+/// the snapshot metadata so the caller can reconstruct absolute paths.
+pub fn list_snapshot_items_with_source_paths(
+    config: &VykarConfig,
+    passphrase: Option<&str>,
+    snapshot_name: &str,
+) -> Result<(Vec<Item>, Vec<String>)> {
+    list_snapshot_items_inner(config, passphrase, snapshot_name)
+}
+
+fn list_snapshot_items_inner(
+    config: &VykarConfig,
+    passphrase: Option<&str>,
+    snapshot_name: &str,
+) -> Result<(Vec<Item>, Vec<String>)> {
     let (mut repo, _session_guard) =
         super::util::open_repo_with_read_session(config, passphrase, OpenOptions::new())?;
 
@@ -40,10 +58,23 @@ pub fn list_snapshot_items(
         .name
         .clone();
 
+    // Load snapshot metadata once — extract both source_paths and item_ptrs
+    // to avoid a redundant second load inside the item-reading path.
+    let meta = load_snapshot_meta(&repo, &resolved_name)?;
+    let source_paths = meta.source_paths;
+    let item_ptrs = meta.item_ptrs;
+
     // Try restore cache first (avoids loading the full index entirely)
     if let Some(ref cache) = repo.open_restore_cache() {
-        match load_snapshot_items_via_lookup(&mut repo, &resolved_name, |id| cache.lookup(id)) {
-            Ok(items) => return Ok(items),
+        match resolve_and_read(&mut repo, &item_ptrs, |chunk_id, _repo| {
+            cache
+                .lookup(chunk_id)
+                .ok_or(VykarError::ChunkNotInIndex(*chunk_id))
+        }) {
+            Ok(stream) => {
+                let items = decode_items_stream(&stream)?;
+                return Ok((items, source_paths));
+            }
             Err(VykarError::ChunkNotInIndex(_)) => {
                 // Restore cache incomplete — fall through to full index
             }
@@ -55,7 +86,9 @@ pub fn list_snapshot_items(
 
     // Fall back to full index load (benefits from blob cache)
     repo.load_chunk_index()?;
-    load_snapshot_items(&mut repo, &resolved_name)
+    let stream = load_item_stream_from_ptrs(&mut repo, &item_ptrs)?;
+    let items = decode_items_stream(&stream)?;
+    Ok((items, source_paths))
 }
 
 /// List all snapshots with their stats (loaded from snapshot metadata).

@@ -116,7 +116,7 @@ pub fn run(
         entries.retain(|e| &e.source_label == source);
     }
 
-    entries.sort_by(|a, b| a.time.cmp(&b.time));
+    entries.sort_by_key(|a| a.time);
 
     if let Some(n) = scope.last_n {
         let len = entries.len();

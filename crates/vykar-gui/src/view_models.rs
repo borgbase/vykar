@@ -44,7 +44,7 @@ pub(crate) fn sort_snapshot_table(
     match col_idx {
         0 => data.sort_by(|a, b| a.id.cmp(&b.id)),
         1 => data.sort_by(|a, b| a.hostname.cmp(&b.hostname)),
-        2 => data.sort_by(|a, b| a.time_epoch.cmp(&b.time_epoch)),
+        2 => data.sort_by_key(|a| a.time_epoch),
         3 => data.sort_by(|a, b| a.source.cmp(&b.source)),
         4 => data.sort_by(|a, b| a.label.cmp(&b.label)),
         5 => data.sort_by(|a, b| match (a.nfiles, b.nfiles) {

@@ -64,7 +64,7 @@ pub fn build_dedup_cache_to_path(index: &ChunkIndex, generation: u64, path: &Pat
         .iter()
         .map(|(id, entry)| (*id, entry.stored_size))
         .collect();
-    entries.sort_unstable_by(|a, b| a.0 .0.cmp(&b.0 .0));
+    entries.sort_unstable_by_key(|a| a.0 .0);
 
     let entry_count = entries.len() as u32;
 
@@ -432,7 +432,7 @@ pub fn build_restore_cache_to_path(index: &ChunkIndex, generation: u64, path: &P
         .iter()
         .map(|(id, entry)| (*id, entry.stored_size, entry.pack_id, entry.pack_offset))
         .collect();
-    entries.sort_unstable_by(|a, b| a.0 .0.cmp(&b.0 .0));
+    entries.sort_unstable_by_key(|a| a.0 .0);
 
     let entry_count = entries.len() as u32;
 
@@ -796,7 +796,7 @@ pub fn build_full_index_cache_to_path(
             pack_offset: e.pack_offset,
         })
         .collect();
-    entries.sort_unstable_by(|a, b| a.chunk_id.0.cmp(&b.chunk_id.0));
+    entries.sort_unstable_by_key(|a| a.chunk_id.0);
 
     let entry_count = entries.len() as u32;
     let tmp_path = path.with_extension("tmp");
@@ -831,7 +831,7 @@ pub fn merge_full_index_cache(
 ) -> Result<()> {
     // Sort new entries by ChunkId for merge
     let mut sorted_new: Vec<&crate::index::NewChunkEntry> = delta.new_entries.iter().collect();
-    sorted_new.sort_unstable_by(|a, b| a.chunk_id.0.cmp(&b.chunk_id.0));
+    sorted_new.sort_unstable_by_key(|a| a.chunk_id.0);
 
     // Count total entries: old + new (new entries should not overlap with old)
     let total_count = old_cache.entry_count() + sorted_new.len() as u32;

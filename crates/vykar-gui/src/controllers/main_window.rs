@@ -214,6 +214,7 @@ pub(crate) fn wire_callbacks(
                 rw.set_status_text("Loading contents...".into());
                 rw.set_tree_rows(ModelRc::new(VecModel::<TreeRowData>::default()));
                 rw.set_selection_text("".into());
+                rw.set_source_root_text("".into());
                 let _ = rw.show();
             }
 

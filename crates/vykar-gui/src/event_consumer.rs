@@ -223,6 +223,7 @@ pub(crate) fn spawn(
                         repo_name,
                         snapshot_name,
                         items,
+                        source_paths,
                     } => {
                         controllers::restore::with_window(|rw| {
                             controllers::restore::handle_snapshot_contents(
@@ -230,6 +231,7 @@ pub(crate) fn spawn(
                                 &repo_name,
                                 &snapshot_name,
                                 items,
+                                &source_paths,
                             );
                         });
                     }

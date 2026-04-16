@@ -136,6 +136,7 @@ pub(crate) enum UiEvent {
         repo_name: String,
         snapshot_name: String,
         items: Vec<Item>,
+        source_paths: Vec<String>,
     },
     RestoreFinished {
         success: bool,

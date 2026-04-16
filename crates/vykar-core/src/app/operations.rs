@@ -670,5 +670,6 @@ pub fn delete_snapshot(
     passphrase: Option<&str>,
     snapshot_name: &str,
 ) -> Result<commands::delete::DeleteStats> {
-    commands::delete::run(config, passphrase, snapshot_name, false, None)
+    let mut results = commands::delete::run(config, passphrase, &[snapshot_name], false, None)?;
+    Ok(results.remove(0))
 }

@@ -10,29 +10,50 @@ use crate::passphrase::with_repo_passphrase;
 pub(crate) fn run_delete(
     config: &VykarConfig,
     label: Option<&str>,
-    snapshot_name: String,
+    snapshot_names: &[String],
     dry_run: bool,
     shutdown: Option<&AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let stats = with_repo_passphrase(config, label, |passphrase| {
-        commands::delete::run(config, passphrase, &snapshot_name, dry_run, shutdown)
+    let name_refs: Vec<&str> = snapshot_names.iter().map(|s| s.as_str()).collect();
+    let all_stats = with_repo_passphrase(config, label, |passphrase| {
+        commands::delete::run(config, passphrase, &name_refs, dry_run, shutdown)
             .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })
     })?;
 
-    if dry_run {
-        println!("Dry run: would delete snapshot '{}'", stats.snapshot_name);
-        println!(
-            "  Would free: {} chunks, {}",
-            stats.chunks_deleted,
-            format_bytes(stats.space_freed),
-        );
-    } else {
-        println!("Deleted snapshot '{}'", stats.snapshot_name);
-        println!(
-            "  Freed: {} chunks, {}",
-            stats.chunks_deleted,
-            format_bytes(stats.space_freed),
-        );
+    for stats in &all_stats {
+        if dry_run {
+            println!("Dry run: would delete snapshot '{}'", stats.snapshot_name);
+            println!(
+                "  Would free: {} chunks, {}",
+                stats.chunks_deleted,
+                format_bytes(stats.space_freed),
+            );
+        } else {
+            println!("Deleted snapshot '{}'", stats.snapshot_name);
+            println!(
+                "  Freed: {} chunks, {}",
+                stats.chunks_deleted,
+                format_bytes(stats.space_freed),
+            );
+        }
+    }
+
+    if all_stats.len() > 1 {
+        let total_chunks: u64 = all_stats.iter().map(|s| s.chunks_deleted).sum();
+        let total_space: u64 = all_stats.iter().map(|s| s.space_freed).sum();
+        if dry_run {
+            println!(
+                "Total: would free {} chunks, {}",
+                total_chunks,
+                format_bytes(total_space),
+            );
+        } else {
+            println!(
+                "Total: freed {} chunks, {}",
+                total_chunks,
+                format_bytes(total_space),
+            );
+        }
     }
 
     Ok(())

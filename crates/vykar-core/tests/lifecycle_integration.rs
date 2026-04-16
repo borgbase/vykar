@@ -151,9 +151,9 @@ fn lifecycle_delete_compact_check_and_restore() {
     std::fs::write(source_dir.join("new.txt"), b"new file").unwrap();
     backup_source(&config, &source_dir, "src-a", "snap-v2", None);
 
-    let delete_stats = commands::delete::run(&config, None, "snap-v1", false, None).unwrap();
-    assert_eq!(delete_stats.snapshot_name, "snap-v1");
-    assert!(delete_stats.chunks_deleted > 0);
+    let delete_stats = commands::delete::run(&config, None, &["snap-v1"], false, None).unwrap();
+    assert_eq!(delete_stats[0].snapshot_name, "snap-v1");
+    assert!(delete_stats[0].chunks_deleted > 0);
 
     let compact_stats = commands::compact::run(&config, None, 0.0, None, false, None).unwrap();
     assert!(compact_stats.space_freed > 0);

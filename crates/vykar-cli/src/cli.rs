@@ -283,13 +283,14 @@ pub(crate) enum SnapshotCommand {
         /// Snapshot to inspect (name or "latest")
         snapshot: String,
     },
-    /// Delete a specific snapshot
+    /// Delete one or more snapshots
     Delete {
         /// Select repository by label or path
         #[arg(short = 'R', long = "repo")]
         repo: Option<String>,
-        /// Snapshot name to delete
-        snapshot: String,
+        /// Snapshot name(s) to delete
+        #[arg(required = true)]
+        snapshots: Vec<String>,
         /// Only show what would be deleted, don't actually delete
         #[arg(short = 'n', long)]
         dry_run: bool,
@@ -363,15 +364,18 @@ impl Commands {
     }
 
     /// Returns the targeted snapshot name, if the command references one.
+    /// For bulk delete (multiple names), returns `None` to disable smart
+    /// multi-repo probing — the caller must require `-R` instead.
     pub(crate) fn snapshot_name(&self) -> Option<&str> {
         match self {
             Self::Restore { snapshot, .. } => Some(snapshot),
             Self::Snapshot {
                 command:
-                    SnapshotCommand::List { snapshot, .. }
-                    | SnapshotCommand::Info { snapshot, .. }
-                    | SnapshotCommand::Delete { snapshot, .. },
+                    SnapshotCommand::List { snapshot, .. } | SnapshotCommand::Info { snapshot, .. },
             } => Some(snapshot),
+            Self::Snapshot {
+                command: SnapshotCommand::Delete { snapshots, .. },
+            } if snapshots.len() == 1 => Some(&snapshots[0]),
             Self::Mount { snapshot, .. } => snapshot.as_deref(),
             _ => None,
         }

@@ -86,8 +86,8 @@ pub(crate) fn run_snapshot_command(
             Ok(())
         }
         SnapshotCommand::Delete {
-            snapshot, dry_run, ..
-        } => super::delete::run_delete(config, label, snapshot.clone(), *dry_run, shutdown),
+            snapshots, dry_run, ..
+        } => super::delete::run_delete(config, label, snapshots, *dry_run, shutdown),
         SnapshotCommand::Find {
             path,
             source,

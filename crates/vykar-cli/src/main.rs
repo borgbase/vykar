@@ -154,6 +154,23 @@ fn main() {
 
     let multi = repos.len() > 1;
 
+    // Bulk snapshot delete requires -R when multiple repos are configured,
+    // since the smart single-snapshot probe cannot handle multiple names.
+    if multi {
+        if let Some(cli::Commands::Snapshot {
+            command: cli::SnapshotCommand::Delete { snapshots, .. },
+        }) = cli.command.as_ref()
+        {
+            if snapshots.len() > 1 {
+                eprintln!(
+                    "Error: deleting multiple snapshots requires -R / --repo \
+                     when multiple repositories are configured"
+                );
+                std::process::exit(1);
+            }
+        }
+    }
+
     // Smart snapshot dispatch: when multiple repos are configured and the
     // command targets a specific snapshot, probe repos to find the one that
     // actually contains it, rather than running against all repos.

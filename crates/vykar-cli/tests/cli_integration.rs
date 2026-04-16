@@ -599,6 +599,83 @@ fn cli_snapshot_delete_latest_rejects_alias() {
     );
 }
 
+#[test]
+fn cli_bulk_snapshot_delete() {
+    let fx = CliFixture::new();
+    write_plain_config(&fx.config_path, &fx.repo_dir);
+
+    let cfg = fx.config_path.to_string_lossy().to_string();
+    let source = fx.source_a.to_string_lossy().to_string();
+
+    fx.run_ok(&["--config", &cfg, "init"]);
+
+    std::fs::write(fx.source_a.join("a.txt"), b"aaa").unwrap();
+    let out1 = fx.run_ok(&["--config", &cfg, "backup", &source]);
+    let snap1 = parse_snapshot_name(&out1);
+
+    std::fs::write(fx.source_a.join("b.txt"), b"bbb").unwrap();
+    let out2 = fx.run_ok(&["--config", &cfg, "backup", &source]);
+    let snap2 = parse_snapshot_name(&out2);
+
+    std::fs::write(fx.source_a.join("c.txt"), b"ccc").unwrap();
+    let out3 = fx.run_ok(&["--config", &cfg, "backup", &source]);
+    let snap3 = parse_snapshot_name(&out3);
+
+    // Delete two snapshots in one command.
+    let delete_out = fx.run_ok(&["--config", &cfg, "snapshot", "delete", &snap1, &snap2]);
+    assert!(delete_out.contains(&format!("Deleted snapshot '{snap1}'")));
+    assert!(delete_out.contains(&format!("Deleted snapshot '{snap2}'")));
+    assert!(delete_out.contains("Total:"));
+
+    // Third snapshot survives.
+    let list_after = fx.run_ok(&["--config", &cfg, "list"]);
+    assert!(!list_after.contains(&snap1));
+    assert!(!list_after.contains(&snap2));
+    assert!(list_after.contains(&snap3));
+}
+
+#[test]
+fn cli_bulk_delete_requires_repo_flag_with_multiple_repos() {
+    let fx = CliFixture::new();
+    let repo_b = fx._tmp.path().join("repo_b");
+    std::fs::create_dir_all(&repo_b).unwrap();
+
+    // Config with two repositories.
+    let config = format!(
+        "repositories:\n  - url: {}\n    label: repo-a\n  - url: {}\n    label: repo-b\nencryption:\n  mode: none\nsources: []\n",
+        yaml_quote_path(&fx.repo_dir),
+        yaml_quote_path(&repo_b),
+    );
+    std::fs::write(&fx.config_path, config).unwrap();
+
+    let cfg = fx.config_path.to_string_lossy().to_string();
+    fx.run_ok(&["--config", &cfg, "init", "-R", "repo-a"]);
+    fx.run_ok(&["--config", &cfg, "init", "-R", "repo-b"]);
+
+    let source = fx.source_a.to_string_lossy().to_string();
+    std::fs::write(fx.source_a.join("file.txt"), b"data").unwrap();
+
+    let out1 = fx.run_ok(&["--config", &cfg, "backup", "-R", "repo-a", &source]);
+    let snap1 = parse_snapshot_name(&out1);
+
+    std::fs::write(fx.source_a.join("file2.txt"), b"data2").unwrap();
+    let out2 = fx.run_ok(&["--config", &cfg, "backup", "-R", "repo-a", &source]);
+    let snap2 = parse_snapshot_name(&out2);
+
+    // Bulk delete without -R should fail.
+    let (_stdout, stderr) = fx.run_err(&["--config", &cfg, "snapshot", "delete", &snap1, &snap2]);
+    assert!(
+        stderr.contains("requires -R") || stderr.contains("requires --repo"),
+        "expected -R requirement error, got:\n{stderr}"
+    );
+
+    // Same command with -R should succeed.
+    let delete_out = fx.run_ok(&[
+        "--config", &cfg, "snapshot", "delete", "-R", "repo-a", &snap1, &snap2,
+    ]);
+    assert!(delete_out.contains(&format!("Deleted snapshot '{snap1}'")));
+}
+
 // ── Backup --threads tests ──────────────────────────────────────────────────
 
 #[test]

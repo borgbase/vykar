@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tracing::warn;
@@ -119,6 +119,102 @@ pub(super) fn read_item_xattrs(path: &Path) -> Option<HashMap<String, Vec<u8>>> 
 #[cfg(not(unix))]
 pub(super) fn read_item_xattrs(_path: &Path) -> Option<HashMap<String, Vec<u8>>> {
     None
+}
+
+// ---------------------------------------------------------------------------
+// Entry materialization — shared between pipeline and sequential paths
+// ---------------------------------------------------------------------------
+
+/// Result of converting a walked filesystem entry into an `Item`.
+#[derive(Debug)]
+#[allow(clippy::large_enum_variant)] // Entry dominates; SoftError/Unsupported are rare early-returns
+pub(super) enum Materialized {
+    /// Successfully built an Item with its metadata.
+    Entry {
+        item: Item,
+        abs_path: PathBuf,
+        metadata: fs::MetadataSummary,
+    },
+    /// Soft I/O error (e.g. permission denied on readlink) — caller should count as error.
+    SoftError,
+    /// Unsupported file type (block device, FIFO, etc.) — silent skip.
+    Unsupported,
+}
+
+/// Classify a walked filesystem entry and build an `Item` from its metadata.
+///
+/// Handles file-type classification, symlink target resolution, path prefixing,
+/// ctime computation, Item construction, and xattr population.
+pub(super) fn materialize_item(
+    walked: WalkedEntry,
+    abs_source: &Path,
+    prefix: &Option<String>,
+    xattrs_enabled: bool,
+) -> Result<Materialized> {
+    let file_type = walked.file_type;
+    let metadata_summary = walked.metadata;
+
+    let (entry_type, link_target) = if file_type.is_dir() {
+        (ItemType::Directory, None)
+    } else if file_type.is_symlink() {
+        match std::fs::read_link(&walked.abs_path) {
+            Ok(target) => (
+                ItemType::Symlink,
+                Some(target.to_string_lossy().to_string()),
+            ),
+            Err(e) => {
+                if is_soft_io_error(&e) {
+                    warn!(path = %walked.abs_path.display(), error = %e,
+                          "skipping entry (readlink error)");
+                    return Ok(Materialized::SoftError);
+                }
+                return Err(VykarError::Other(format!("readlink: {e}")));
+            }
+        }
+    } else if file_type.is_file() {
+        (ItemType::RegularFile, None)
+    } else {
+        return Ok(Materialized::Unsupported);
+    };
+
+    let rel_path = rel_path_from_abs(abs_source, &walked.abs_path);
+    let item_path = match prefix {
+        Some(pfx) => format!("{pfx}/{rel_path}"),
+        None => rel_path,
+    };
+
+    let item_ctime = if entry_type == ItemType::RegularFile {
+        Some(metadata_summary.ctime_ns)
+    } else {
+        None
+    };
+
+    let mut item = Item {
+        path: item_path,
+        entry_type,
+        mode: metadata_summary.mode,
+        uid: metadata_summary.uid,
+        gid: metadata_summary.gid,
+        user: None,
+        group: None,
+        mtime: metadata_summary.mtime_ns,
+        atime: None,
+        ctime: item_ctime,
+        size: metadata_summary.size,
+        chunks: Vec::new(),
+        link_target,
+        xattrs: None,
+    };
+
+    if xattrs_enabled {
+        item.xattrs = read_item_xattrs(&walked.abs_path);
+    }
+
+    Ok(Materialized::Entry {
+        item,
+        abs_path: walked.abs_path,
+        metadata: metadata_summary,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -400,67 +496,22 @@ fn walked_entry_to_walk_items(
     segment_size: u64,
     parent_reuse_index: Option<&ParentReuseIndex>,
 ) -> WalkItems {
-    let file_type = walked.file_type;
-    let metadata_summary = walked.metadata;
-
-    let (entry_type, link_target) = if file_type.is_dir() {
-        (ItemType::Directory, None)
-    } else if file_type.is_symlink() {
-        match std::fs::read_link(&walked.abs_path) {
-            Ok(target) => (
-                ItemType::Symlink,
-                Some(target.to_string_lossy().to_string()),
-            ),
-            Err(e) => {
-                if is_soft_io_error(&e) {
-                    warn!(path = %walked.abs_path.display(), error = %e, "skipping entry (readlink error)");
-                    return WalkItems::One(Some(Ok(WalkEntry::Skipped)));
-                }
-                return WalkItems::One(Some(Err(VykarError::Other(format!("readlink: {e}")))));
+    let (item, abs_path, metadata_summary) =
+        match materialize_item(walked, abs_source, prefix, xattrs_enabled) {
+            Ok(Materialized::Entry {
+                item,
+                abs_path,
+                metadata,
+            }) => (item, abs_path, metadata),
+            Ok(Materialized::SoftError) => {
+                return WalkItems::One(Some(Ok(WalkEntry::Skipped)));
             }
-        }
-    } else if file_type.is_file() {
-        (ItemType::RegularFile, None)
-    } else {
-        return WalkItems::Empty; // skip special files
-    };
+            Ok(Materialized::Unsupported) => return WalkItems::Empty,
+            Err(e) => return WalkItems::One(Some(Err(e))),
+        };
 
-    let rel_path = rel_path_from_abs(abs_source, &walked.abs_path);
-    let item_path = match prefix {
-        Some(pfx) => format!("{pfx}/{rel_path}"),
-        None => rel_path,
-    };
-
-    let item_ctime = if entry_type == ItemType::RegularFile {
-        Some(metadata_summary.ctime_ns)
-    } else {
-        None
-    };
-
-    let mut item = Item {
-        path: item_path,
-        entry_type,
-        mode: metadata_summary.mode,
-        uid: metadata_summary.uid,
-        gid: metadata_summary.gid,
-        user: None,
-        group: None,
-        mtime: metadata_summary.mtime_ns,
-        atime: None,
-        ctime: item_ctime,
-        size: metadata_summary.size,
-        chunks: Vec::new(),
-        link_target,
-        xattrs: None,
-    };
-
-    if xattrs_enabled {
-        item.xattrs = read_item_xattrs(&walked.abs_path);
-    }
-
-    if entry_type == ItemType::RegularFile && metadata_summary.size > 0 {
-        let abs_path = walked
-            .abs_path
+    if item.entry_type == ItemType::RegularFile && metadata_summary.size > 0 {
+        let abs_path = abs_path
             .into_os_string()
             .into_string()
             .unwrap_or_else(|os| os.to_string_lossy().into_owned());
@@ -692,6 +743,155 @@ mod tests {
             assert_eq!(actual, expected, "mismatch for path {p}");
         }
     }
+
+    // -----------------------------------------------------------------------
+    // materialize_item tests
+    // -----------------------------------------------------------------------
+
+    fn walked_from_path(path: &std::path::Path) -> WalkedEntry {
+        let meta = std::fs::symlink_metadata(path).unwrap();
+        WalkedEntry {
+            abs_path: path.to_path_buf(),
+            metadata: fs::summarize_metadata(&meta, &meta.file_type()),
+            file_type: meta.file_type(),
+        }
+    }
+
+    #[test]
+    fn materialize_regular_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("hello.txt");
+        std::fs::write(&file, b"content").unwrap();
+        let walked = walked_from_path(&file);
+        let result = materialize_item(walked, tmp.path(), &None, false).unwrap();
+        match result {
+            Materialized::Entry { item, metadata, .. } => {
+                assert_eq!(item.entry_type, ItemType::RegularFile);
+                assert_eq!(item.path, "hello.txt");
+                assert_eq!(item.ctime, Some(metadata.ctime_ns));
+                assert!(item.xattrs.is_none());
+            }
+            other => panic!("expected Entry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn materialize_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("sub");
+        std::fs::create_dir(&dir).unwrap();
+        let walked = walked_from_path(&dir);
+        let result = materialize_item(walked, tmp.path(), &None, false).unwrap();
+        match result {
+            Materialized::Entry { item, .. } => {
+                assert_eq!(item.entry_type, ItemType::Directory);
+                assert!(item.ctime.is_none());
+            }
+            other => panic!("expected Entry, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialize_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("target.txt");
+        std::fs::write(&target, b"x").unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let walked = walked_from_path(&link);
+        let result = materialize_item(walked, tmp.path(), &None, false).unwrap();
+        match result {
+            Materialized::Entry { item, .. } => {
+                assert_eq!(item.entry_type, ItemType::Symlink);
+                assert!(item.link_target.is_some());
+                assert!(item.ctime.is_none());
+            }
+            other => panic!("expected Entry, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialize_unix_socket_unsupported() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock_path = tmp.path().join("test.sock");
+        let listener = match std::os::unix::net::UnixListener::bind(&sock_path) {
+            Ok(l) => l,
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => return, // skip in restricted envs
+            Err(e) => panic!("unexpected bind error: {e}"),
+        };
+        let _listener = listener;
+        let walked = walked_from_path(&sock_path);
+        let result = materialize_item(walked, tmp.path(), &None, false).unwrap();
+        assert!(matches!(result, Materialized::Unsupported));
+    }
+
+    #[test]
+    fn materialize_with_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("data.bin");
+        std::fs::write(&file, b"x").unwrap();
+        let walked = walked_from_path(&file);
+        let prefix = Some("myhost".to_string());
+        let result = materialize_item(walked, tmp.path(), &prefix, false).unwrap();
+        match result {
+            Materialized::Entry { item, .. } => {
+                assert_eq!(item.path, "myhost/data.bin");
+            }
+            other => panic!("expected Entry, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialize_soft_error_on_removed_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("target.txt");
+        std::fs::write(&target, b"x").unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        // Stat the symlink to get its FileType *before* removing it.
+        let walked = walked_from_path(&link);
+
+        // Remove the symlink so read_link will fail with NotFound.
+        std::fs::remove_file(&link).unwrap();
+
+        let result = materialize_item(walked, tmp.path(), &None, false).unwrap();
+        assert!(matches!(result, Materialized::SoftError));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walked_entry_to_walk_items_soft_error_yields_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("target.txt");
+        std::fs::write(&target, b"x").unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let walked = walked_from_path(&link);
+        std::fs::remove_file(&link).unwrap();
+
+        let file_cache = FileCache::default();
+        let mut items = walked_entry_to_walk_items(
+            walked,
+            tmp.path(),
+            &None,
+            false,
+            &file_cache,
+            u64::MAX,
+            None,
+        );
+        match items.next() {
+            Some(Ok(WalkEntry::Skipped)) => {}
+            _ => panic!("expected WalkEntry::Skipped"),
+        }
+        assert!(items.next().is_none());
+    }
+
+    // -----------------------------------------------------------------------
 
     #[test]
     #[cfg(unix)]

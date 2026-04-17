@@ -22,9 +22,7 @@ use vykar_types::error::{Result, VykarError};
 
 use super::chunk_process::{classify_chunk, WorkerChunk};
 use super::commit::process_worker_chunks;
-use super::walk::{
-    is_soft_io_error, read_item_xattrs, rel_path_from_abs, InodeSortedWalk, WalkEvent,
-};
+use super::walk::{is_soft_io_error, materialize_item, InodeSortedWalk, Materialized, WalkEvent};
 use super::{append_item_to_stream, emit_progress, emit_stats_progress};
 use super::{BackupProgressEvent, FileStatus};
 use vykar_crypto::CryptoEngine;
@@ -485,70 +483,23 @@ pub(super) fn process_source_path(
             Err(e) => return Err(e),
         };
 
-        let rel_path = rel_path_from_abs(&abs_source, &walked.abs_path);
-        let entry_path = walked.abs_path;
-        let metadata_summary = walked.metadata;
-        let file_type = walked.file_type;
-
-        let (entry_type, link_target) = if file_type.is_dir() {
-            (ItemType::Directory, None)
-        } else if file_type.is_symlink() {
-            match std::fs::read_link(&entry_path) {
-                Ok(target) => (
-                    ItemType::Symlink,
-                    Some(target.to_string_lossy().to_string()),
-                ),
-                Err(e) => {
-                    if is_soft_io_error(&e) {
-                        warn!(path = %entry_path.display(), error = %e, "skipping entry (readlink error)");
-                        stats.errors += 1;
-                        continue;
-                    }
-                    return Err(VykarError::Other(format!("readlink: {e}")));
+        let (mut item, entry_path, metadata_summary) =
+            match materialize_item(walked, &abs_source, &prefix, xattrs_enabled) {
+                Ok(Materialized::Entry {
+                    item,
+                    abs_path,
+                    metadata,
+                }) => (item, abs_path, metadata),
+                Ok(Materialized::SoftError) => {
+                    stats.errors += 1;
+                    continue;
                 }
-            }
-        } else if file_type.is_file() {
-            (ItemType::RegularFile, None)
-        } else {
-            // Skip special files (block devices, FIFOs, etc.)
-            continue;
-        };
-
-        // In multi-path mode, prefix each item path with the source basename.
-        let item_path = match &prefix {
-            Some(pfx) => format!("{pfx}/{rel_path}"),
-            None => rel_path,
-        };
-
-        let item_ctime = if entry_type == ItemType::RegularFile {
-            Some(metadata_summary.ctime_ns)
-        } else {
-            None
-        };
-
-        let mut item = Item {
-            path: item_path,
-            entry_type,
-            mode: metadata_summary.mode,
-            uid: metadata_summary.uid,
-            gid: metadata_summary.gid,
-            user: None,
-            group: None,
-            mtime: metadata_summary.mtime_ns,
-            atime: None,
-            ctime: item_ctime,
-            size: metadata_summary.size,
-            chunks: Vec::new(),
-            link_target,
-            xattrs: None,
-        };
-
-        if xattrs_enabled {
-            item.xattrs = read_item_xattrs(&entry_path);
-        }
+                Ok(Materialized::Unsupported) => continue,
+                Err(e) => return Err(e),
+            };
 
         // For regular files, chunk and store the content.
-        if entry_type == ItemType::RegularFile && metadata_summary.size > 0 {
+        if item.entry_type == ItemType::RegularFile && metadata_summary.size > 0 {
             // Small-file fast path: read directly, accumulate in cross-file batch.
             if metadata_summary.size < min_chunk_size {
                 // Flush batch before cache-hit check since it may need walk-order items.

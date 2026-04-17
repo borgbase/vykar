@@ -2152,3 +2152,136 @@ fn session_guard_blocks_maintenance() {
     let mut repo3 = open_local_repo(&repo_dir);
     with_maintenance_lock(&mut repo3, |_| Ok(())).unwrap();
 }
+
+/// Verify that pipeline (multi-threaded) and sequential (single-threaded) backup
+/// paths produce identical item metadata for symlinks, directories, and xattrs.
+#[test]
+#[cfg(unix)]
+fn backup_pipeline_and_sequential_parity_symlinks_xattrs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = tmp.path().join("repo");
+    let source_dir = tmp.path().join("source");
+    std::fs::create_dir_all(&source_dir).unwrap();
+
+    // Regular file
+    std::fs::write(source_dir.join("file.txt"), b"hello").unwrap();
+
+    // Subdirectory with a file
+    std::fs::create_dir(source_dir.join("sub")).unwrap();
+    std::fs::write(source_dir.join("sub/nested.txt"), b"nested").unwrap();
+
+    // Symlink (valid target)
+    std::os::unix::fs::symlink("file.txt", source_dir.join("link")).unwrap();
+
+    // Dangling symlink (target doesn't exist)
+    std::os::unix::fs::symlink("nonexistent", source_dir.join("dangling")).unwrap();
+
+    // Set xattrs if supported
+    let xattrs_ok = supports_xattrs(&source_dir);
+    if xattrs_ok {
+        xattr::set(source_dir.join("file.txt"), xattr_test_name(), b"val1").unwrap();
+    }
+
+    let config_pipeline = make_test_config(&repo_dir);
+    commands::init::run(&config_pipeline, None).unwrap();
+
+    let source_paths = vec![source_dir.to_string_lossy().to_string()];
+    let exclude_patterns: Vec<String> = Vec::new();
+    let exclude_if_present: Vec<String> = Vec::new();
+
+    // Pipeline backup (default threads)
+    commands::backup::run(
+        &config_pipeline,
+        commands::backup::BackupRequest {
+            snapshot_name: "snap-pipeline",
+            passphrase: None,
+            source_paths: &source_paths,
+            source_label: "source",
+            exclude_patterns: &exclude_patterns,
+            exclude_if_present: &exclude_if_present,
+            one_file_system: true,
+            git_ignore: false,
+            xattrs_enabled: xattrs_ok,
+            compression: Compression::None,
+            command_dumps: &[],
+            verbose: false,
+        },
+    )
+    .unwrap();
+
+    // Sequential backup (threads = 1)
+    let mut config_seq = make_test_config(&repo_dir);
+    config_seq.limits.threads = 1;
+    commands::backup::run(
+        &config_seq,
+        commands::backup::BackupRequest {
+            snapshot_name: "snap-sequential",
+            passphrase: None,
+            source_paths: &source_paths,
+            source_label: "source",
+            exclude_patterns: &exclude_patterns,
+            exclude_if_present: &exclude_if_present,
+            one_file_system: true,
+            git_ignore: false,
+            xattrs_enabled: xattrs_ok,
+            compression: Compression::None,
+            command_dumps: &[],
+            verbose: false,
+        },
+    )
+    .unwrap();
+
+    // Compare item lists — should be identical
+    let mut repo = open_local_repo(&repo_dir);
+    let items_p = commands::list::load_snapshot_items(&mut repo, "snap-pipeline").unwrap();
+    let items_s = commands::list::load_snapshot_items(&mut repo, "snap-sequential").unwrap();
+
+    // Sort by path for deterministic comparison (walk order may differ)
+    let mut sorted_p: Vec<_> = items_p.iter().collect();
+    let mut sorted_s: Vec<_> = items_s.iter().collect();
+    sorted_p.sort_by_key(|i| &i.path);
+    sorted_s.sort_by_key(|i| &i.path);
+
+    assert_eq!(sorted_p.len(), sorted_s.len(), "item count mismatch");
+    for (p, s) in sorted_p.iter().zip(sorted_s.iter()) {
+        assert_eq!(p.path, s.path);
+        assert_eq!(p.entry_type, s.entry_type, "type mismatch for {}", p.path);
+        assert_eq!(
+            p.link_target, s.link_target,
+            "link_target mismatch for {}",
+            p.path
+        );
+        assert_eq!(p.xattrs, s.xattrs, "xattrs mismatch for {}", p.path);
+        assert_eq!(p.mode, s.mode, "mode mismatch for {}", p.path);
+        assert_eq!(p.uid, s.uid, "uid mismatch for {}", p.path);
+        assert_eq!(p.gid, s.gid, "gid mismatch for {}", p.path);
+        assert_eq!(p.mtime, s.mtime, "mtime mismatch for {}", p.path);
+        assert_eq!(p.ctime, s.ctime, "ctime mismatch for {}", p.path);
+        assert_eq!(p.size, s.size, "size mismatch for {}", p.path);
+    }
+
+    // Verify symlinks actually present
+    let link_item = sorted_p
+        .iter()
+        .find(|i| i.path == "link")
+        .expect("symlink missing");
+    assert_eq!(link_item.entry_type, ItemType::Symlink);
+    assert_eq!(link_item.link_target.as_deref(), Some("file.txt"));
+
+    let dangling = sorted_p
+        .iter()
+        .find(|i| i.path == "dangling")
+        .expect("dangling symlink missing");
+    assert_eq!(dangling.entry_type, ItemType::Symlink);
+    assert_eq!(dangling.link_target.as_deref(), Some("nonexistent"));
+
+    // Verify xattrs if supported
+    if xattrs_ok {
+        let file_item = sorted_p.iter().find(|i| i.path == "file.txt").unwrap();
+        let xmap = file_item
+            .xattrs
+            .as_ref()
+            .expect("xattrs should be populated");
+        assert_eq!(xmap.get(xattr_test_name()), Some(&b"val1".to_vec()));
+    }
+}

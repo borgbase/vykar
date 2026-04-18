@@ -1,16 +1,7 @@
-use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
 
-use crossbeam_channel::Sender;
 use vykar_core::app;
 use vykar_core::config;
-
-use crate::messages::{AppCommand, UiEvent};
-use crate::repo_helpers::send_log;
-use crate::scheduler;
-use crate::view_models::send_structured_data;
 
 /// Load and fully validate a config file: parse YAML, check non-empty, validate schedule.
 /// Returns the parsed repos or a human-readable error string.
@@ -25,86 +16,6 @@ pub(crate) fn validate_config(
     vykar_core::app::scheduler::next_run_delay(&repos[0].config.schedule)
         .map_err(|e| format!("Invalid schedule: {e}"))?;
     Ok(repos)
-}
-
-/// Apply a (possibly new) config file: load, validate, update runtime state, and notify the UI.
-/// When `update_source` is true the runtime source path is switched to `config_path`.
-/// Returns `true` on success, `false` on failure.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn apply_config(
-    config_path: PathBuf,
-    update_source: bool,
-    runtime: &mut app::RuntimeConfig,
-    config_display_path: &mut PathBuf,
-    passphrases: &mut HashMap<String, zeroize::Zeroizing<String>>,
-    sched: &Arc<Mutex<scheduler::SchedulerState>>,
-    schedule_paused: bool,
-    scheduler_lock_held: bool,
-    ui_tx: &Sender<UiEvent>,
-    app_tx: &Sender<AppCommand>,
-    sched_notify_tx: &Sender<()>,
-) -> bool {
-    let repos = match validate_config(&config_path) {
-        Ok(v) => v,
-        Err(msg) => {
-            send_log(ui_tx, format!("{msg} Keeping previous config."));
-            return false;
-        }
-    };
-    let schedule = repos[0].config.schedule.clone();
-
-    if update_source {
-        use vykar_core::config::ConfigSource;
-        runtime.source = ConfigSource::SearchOrder {
-            path: config_path.clone(),
-            level: "user",
-        };
-    }
-    runtime.repos = repos;
-    passphrases.clear();
-
-    if let Ok(mut state) = sched.lock() {
-        state.enabled = schedule.enabled && scheduler_lock_held;
-        state.paused = schedule_paused || !scheduler_lock_held;
-        state.every = schedule
-            .every_duration()
-            .unwrap_or(Duration::from_secs(24 * 60 * 60));
-        state.cron = schedule.cron.clone();
-        state.jitter_seconds = schedule.jitter_seconds;
-        // Compute initial next_run via the scheduler delay (includes jitter)
-        let delay = vykar_core::app::scheduler::next_run_delay(&schedule)
-            .unwrap_or(Duration::from_secs(24 * 60 * 60));
-        state.next_run = Some(Instant::now() + delay);
-    }
-    let _ = sched_notify_tx.try_send(());
-
-    let canonical = dunce::canonicalize(&config_path).unwrap_or_else(|_| config_path.clone());
-    *config_display_path = canonical.clone();
-
-    let schedule_desc = if scheduler_lock_held {
-        scheduler::schedule_description(&schedule, schedule_paused)
-    } else {
-        "disabled (external scheduler)".to_string()
-    };
-    let _ = ui_tx.send(UiEvent::ConfigInfo {
-        path: canonical.display().to_string(),
-        schedule: schedule_desc,
-    });
-    send_structured_data(ui_tx, &runtime.repos);
-    let _ = app_tx.send(AppCommand::FetchAllRepoInfo);
-    send_log(ui_tx, "Configuration reloaded.");
-
-    // Send raw config text to populate the editor tab
-    match std::fs::read_to_string(&canonical) {
-        Ok(text) => {
-            let _ = ui_tx.send(UiEvent::ConfigText(text));
-        }
-        Err(e) => {
-            send_log(ui_tx, format!("Could not read config file for editor: {e}"));
-        }
-    }
-
-    true
 }
 
 pub(crate) fn resolve_or_create_config(

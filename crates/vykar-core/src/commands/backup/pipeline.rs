@@ -649,6 +649,41 @@ enum PipelineResult {
     WalkErr(VykarError),
 }
 
+/// Immutable inputs to the parallel pipeline. Bundled so `run_parallel_pipeline`
+/// and its walk/worker/consumer stages can thread them through without passing
+/// 20+ individual arguments.
+#[derive(Clone, Copy)]
+pub(crate) struct PipelineCtx<'a> {
+    pub source_paths: &'a [String],
+    pub multi_path: bool,
+    pub exclude_patterns: &'a [String],
+    pub exclude_if_present: &'a [String],
+    pub one_file_system: bool,
+    pub git_ignore: bool,
+    pub xattrs_enabled: bool,
+    pub file_cache: &'a FileCache,
+    pub crypto: &'a Arc<dyn CryptoEngine>,
+    pub compression: Compression,
+    pub read_limiter: Option<&'a ByteRateLimiter>,
+    pub num_workers: usize,
+    pub readahead_depth: usize,
+    pub segment_size: u64,
+    pub items_config: &'a ChunkerConfig,
+    pub pipeline_buffer_bytes: usize,
+    pub dedup_filter: Option<&'a xorf::Xor8>,
+    pub shutdown: Option<&'a AtomicBool>,
+    pub verbose: bool,
+    pub parent_reuse_index: Option<&'a ParentReuseIndex>,
+}
+
+/// Mutable output buffers written by the pipeline's consumer stage.
+pub(crate) struct PipelineBuffers<'a> {
+    pub item_stream: &'a mut Vec<u8>,
+    pub item_ptrs: &'a mut Vec<ChunkId>,
+    pub stats: &'a mut SnapshotStats,
+    pub new_file_cache: &'a mut FileCache,
+}
+
 /// Run the parallel file processing pipeline using crossbeam-channel.
 ///
 /// Walk → bounded work channel → N worker threads → bounded result channel
@@ -657,35 +692,40 @@ enum PipelineResult {
 /// Unlike the previous pariter-based design, no single thread both feeds
 /// work and delivers results, eliminating the deadlock where budget
 /// acquisition in the walk thread could block result delivery.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_parallel_pipeline(
     repo: &mut Repository,
-    source_paths: &[String],
-    multi_path: bool,
-    exclude_patterns: &[String],
-    exclude_if_present: &[String],
-    one_file_system: bool,
-    git_ignore: bool,
-    xattrs_enabled: bool,
-    file_cache: &FileCache,
-    crypto: &Arc<dyn CryptoEngine>,
-    compression: Compression,
-    read_limiter: Option<&ByteRateLimiter>,
-    num_workers: usize,
-    readahead_depth: usize,
-    segment_size: u64,
-    items_config: &ChunkerConfig,
-    item_stream: &mut Vec<u8>,
-    item_ptrs: &mut Vec<ChunkId>,
-    stats: &mut SnapshotStats,
-    new_file_cache: &mut FileCache,
+    ctx: &PipelineCtx<'_>,
+    bufs: &mut PipelineBuffers<'_>,
     progress: &mut Option<&mut dyn FnMut(BackupProgressEvent)>,
-    pipeline_buffer_bytes: usize,
-    dedup_filter: Option<&xorf::Xor8>,
-    shutdown: Option<&AtomicBool>,
-    verbose: bool,
-    parent_reuse_index: Option<&ParentReuseIndex>,
 ) -> Result<()> {
+    let PipelineCtx {
+        source_paths,
+        multi_path,
+        exclude_patterns,
+        exclude_if_present,
+        one_file_system,
+        git_ignore,
+        xattrs_enabled,
+        file_cache,
+        crypto,
+        compression,
+        read_limiter,
+        num_workers,
+        readahead_depth,
+        segment_size,
+        items_config,
+        pipeline_buffer_bytes,
+        dedup_filter,
+        shutdown,
+        verbose,
+        parent_reuse_index,
+    } = *ctx;
+    let PipelineBuffers {
+        item_stream,
+        item_ptrs,
+        stats,
+        new_file_cache,
+    } = bufs;
     debug_assert!(segment_size > 0, "segment_size must be non-zero");
     debug_assert!(num_workers > 0, "num_workers must be non-zero");
     let chunk_id_key = *crypto.chunk_id_key();

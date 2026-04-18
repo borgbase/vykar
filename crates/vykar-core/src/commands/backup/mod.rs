@@ -535,8 +535,7 @@ pub fn run_with_progress(
                 .segment_size_bytes()
                 .min(pipeline_buffer_bytes) as u64;
 
-            let pipeline_result = pipeline::run_parallel_pipeline(
-                &mut repo,
+            let pipeline_ctx = pipeline::PipelineCtx {
                 source_paths,
                 multi_path,
                 exclude_patterns,
@@ -544,24 +543,31 @@ pub fn run_with_progress(
                 one_file_system,
                 git_ignore,
                 xattrs_enabled,
-                &file_cache_snapshot,
-                &crypto,
+                file_cache: &file_cache_snapshot,
+                crypto: &crypto,
                 compression,
-                None, // no source-file read limiter
+                read_limiter: None,
                 num_workers,
-                pipeline_depth,
+                readahead_depth: pipeline_depth,
                 segment_size,
-                &items_config,
-                &mut item_stream,
-                &mut item_ptrs,
-                &mut stats,
-                &mut new_file_cache,
-                &mut progress,
+                items_config: &items_config,
                 pipeline_buffer_bytes,
-                dedup_filter.as_deref(),
+                dedup_filter: dedup_filter.as_deref(),
                 shutdown,
                 verbose,
-                parent_reuse_index.as_ref(),
+                parent_reuse_index: parent_reuse_index.as_ref(),
+            };
+            let mut pipeline_bufs = pipeline::PipelineBuffers {
+                item_stream: &mut item_stream,
+                item_ptrs: &mut item_ptrs,
+                stats: &mut stats,
+                new_file_cache: &mut new_file_cache,
+            };
+            let pipeline_result = pipeline::run_parallel_pipeline(
+                &mut repo,
+                &pipeline_ctx,
+                &mut pipeline_bufs,
+                &mut progress,
             );
             // Always restore before propagating — keeps repo.file_cache valid
             // for commit-time merge.

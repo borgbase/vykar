@@ -1,8 +1,11 @@
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use crate::config_helpers;
 use crate::messages::UiEvent;
 use crate::repo_helpers::send_log;
+use crate::scheduler;
+use crate::view_models::send_structured_data;
 
 use super::WorkerContext;
 
@@ -15,19 +18,7 @@ pub(super) fn handle_open_config_file(ctx: &WorkerContext) {
 pub(super) fn handle_reload_config(ctx: &mut WorkerContext) {
     let config_path = dunce::canonicalize(ctx.runtime.source.path())
         .unwrap_or_else(|_| ctx.runtime.source.path().to_path_buf());
-    config_helpers::apply_config(
-        config_path,
-        false,
-        &mut ctx.runtime,
-        &mut ctx.config_display_path,
-        &mut ctx.passphrases,
-        &ctx.scheduler,
-        ctx.schedule_paused,
-        ctx.scheduler_lock_held,
-        &ctx.ui_tx,
-        &ctx.app_tx,
-        &ctx.sched_notify_tx,
-    );
+    apply_config(ctx, config_path, false);
 }
 
 pub(super) fn handle_switch_config(ctx: &mut WorkerContext) {
@@ -37,19 +28,7 @@ pub(super) fn handle_switch_config(ctx: &mut WorkerContext) {
         Some((&["*.yaml", "*.yml"], "YAML files")),
     );
     if let Some(path_str) = picked {
-        config_helpers::apply_config(
-            PathBuf::from(path_str),
-            true,
-            &mut ctx.runtime,
-            &mut ctx.config_display_path,
-            &mut ctx.passphrases,
-            &ctx.scheduler,
-            ctx.schedule_paused,
-            ctx.scheduler_lock_held,
-            &ctx.ui_tx,
-            &ctx.app_tx,
-            &ctx.sched_notify_tx,
-        );
+        apply_config(ctx, PathBuf::from(path_str), true);
     }
 }
 
@@ -79,23 +58,85 @@ pub(super) fn handle_save_and_apply_config(ctx: &mut WorkerContext, yaml_text: S
 
     // apply_config re-runs validate_config internally, which is
     // redundant but harmless — it keeps the function self-contained.
-    if config_helpers::apply_config(
-        config_path,
-        false,
-        &mut ctx.runtime,
-        &mut ctx.config_display_path,
-        &mut ctx.passphrases,
-        &ctx.scheduler,
-        ctx.schedule_paused,
-        ctx.scheduler_lock_held,
-        &ctx.ui_tx,
-        &ctx.app_tx,
-        &ctx.sched_notify_tx,
-    ) {
+    if apply_config(ctx, config_path, false) {
         send_log(&ctx.ui_tx, "Configuration saved and applied.");
     } else {
         let _ = ctx.ui_tx.send(UiEvent::ConfigSaveError(
             "Config saved to disk but failed to apply. Check log for details.".into(),
         ));
     }
+}
+
+/// Apply a (possibly new) config file: load, validate, update runtime state, and notify the UI.
+/// When `update_source` is true the runtime source path is switched to `config_path`.
+/// Returns `true` on success, `false` on failure.
+pub(super) fn apply_config(
+    ctx: &mut WorkerContext,
+    config_path: PathBuf,
+    update_source: bool,
+) -> bool {
+    let repos = match config_helpers::validate_config(&config_path) {
+        Ok(v) => v,
+        Err(msg) => {
+            send_log(&ctx.ui_tx, format!("{msg} Keeping previous config."));
+            return false;
+        }
+    };
+    let schedule = repos[0].config.schedule.clone();
+
+    if update_source {
+        use vykar_core::config::ConfigSource;
+        ctx.runtime.source = ConfigSource::SearchOrder {
+            path: config_path.clone(),
+            level: "user",
+        };
+    }
+    ctx.runtime.repos = repos;
+    ctx.passphrases.clear();
+
+    if let Ok(mut state) = ctx.scheduler.lock() {
+        state.enabled = schedule.enabled && ctx.scheduler_lock_held;
+        state.paused = ctx.schedule_paused || !ctx.scheduler_lock_held;
+        state.every = schedule
+            .every_duration()
+            .unwrap_or(Duration::from_secs(24 * 60 * 60));
+        state.cron = schedule.cron.clone();
+        state.jitter_seconds = schedule.jitter_seconds;
+        let delay = vykar_core::app::scheduler::next_run_delay(&schedule)
+            .unwrap_or(Duration::from_secs(24 * 60 * 60));
+        state.next_run = Some(Instant::now() + delay);
+    }
+    let _ = ctx.sched_notify_tx.try_send(());
+
+    let canonical = dunce::canonicalize(&config_path).unwrap_or_else(|_| config_path.clone());
+    ctx.config_display_path = canonical.clone();
+
+    let schedule_desc = if ctx.scheduler_lock_held {
+        scheduler::schedule_description(&schedule, ctx.schedule_paused)
+    } else {
+        "disabled (external scheduler)".to_string()
+    };
+    let _ = ctx.ui_tx.send(UiEvent::ConfigInfo {
+        path: canonical.display().to_string(),
+        schedule: schedule_desc,
+    });
+    send_structured_data(&ctx.ui_tx, &ctx.runtime.repos);
+    let _ = ctx
+        .app_tx
+        .send(crate::messages::AppCommand::FetchAllRepoInfo);
+    send_log(&ctx.ui_tx, "Configuration reloaded.");
+
+    match std::fs::read_to_string(&canonical) {
+        Ok(text) => {
+            let _ = ctx.ui_tx.send(UiEvent::ConfigText(text));
+        }
+        Err(e) => {
+            send_log(
+                &ctx.ui_tx,
+                format!("Could not read config file for editor: {e}"),
+            );
+        }
+    }
+
+    true
 }

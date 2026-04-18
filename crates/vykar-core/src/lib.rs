@@ -1,11 +1,11 @@
 pub mod app;
-pub mod chunker;
+pub(crate) mod chunker;
 pub mod commands;
 pub mod compress;
 pub mod config;
 pub(crate) mod hooks;
 pub mod index;
-pub mod limits;
+pub(crate) mod limits;
 pub mod platform;
 pub mod prune;
 pub mod repo;

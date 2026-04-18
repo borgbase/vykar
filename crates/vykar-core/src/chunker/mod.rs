@@ -1,13 +1,14 @@
 use std::io::Read;
 
-use fastcdc::v2020::{FastCDC, StreamCDC};
+use fastcdc::v2020::StreamCDC;
 
 use crate::config::ChunkerConfig;
 
 /// Chunk a byte slice using FastCDC content-defined chunking.
 /// Returns a vector of `(offset, length)` pairs.
-pub fn chunk_data(data: &[u8], config: &ChunkerConfig) -> Vec<(usize, usize)> {
-    let chunker = FastCDC::new(
+#[cfg(test)]
+pub(crate) fn chunk_data(data: &[u8], config: &ChunkerConfig) -> Vec<(usize, usize)> {
+    let chunker = fastcdc::v2020::FastCDC::new(
         data,
         config.min_size as usize,
         config.avg_size as usize,

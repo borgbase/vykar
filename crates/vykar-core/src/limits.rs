@@ -42,16 +42,6 @@ impl ByteRateLimiter {
         }
     }
 
-    pub fn from_mib_per_sec(mib_per_sec: u64) -> Option<Arc<Self>> {
-        if mib_per_sec == 0 {
-            None
-        } else {
-            Some(Arc::new(Self::new(mib_per_sec_to_bytes_per_sec(
-                mib_per_sec,
-            ))))
-        }
-    }
-
     pub fn consume(&self, bytes: usize) {
         if bytes == 0 || self.bytes_per_sec == 0 {
             return;

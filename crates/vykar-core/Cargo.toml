@@ -74,7 +74,7 @@ futures-util = { version = "0.3", optional = true }
 percent-encoding = { version = "2", optional = true }
 
 [features]
-default = ["backend-sftp"]
+default = []
 backend-sftp = ["vykar-storage/backend-sftp"]
 mount = ["dav-server", "tokio/rt-multi-thread", "tokio/macros", "tokio/signal", "tokio/net", "hyper", "hyper-util", "lru", "bytes", "futures-util", "percent-encoding"]
 

@@ -322,9 +322,9 @@ pub fn run_command_with_hooks<F, T>(
     repo: &ResolvedRepo,
     command: &str,
     action: F,
-) -> std::result::Result<T, Box<dyn std::error::Error>>
+) -> vykar_types::error::Result<T>
 where
-    F: FnOnce() -> std::result::Result<T, Box<dyn std::error::Error>>,
+    F: FnOnce() -> vykar_types::error::Result<T>,
 {
     let mut ctx = crate::hooks::HookContext {
         command: command.to_string(),

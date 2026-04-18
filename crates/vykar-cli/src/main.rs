@@ -390,13 +390,20 @@ fn run_repo_command(cli: &Cli, repo: &ResolvedRepo) -> Result<bool, Box<dyn std:
     let shutdown = Some(&signal::SHUTDOWN as &std::sync::atomic::AtomicBool);
     match &cli.command {
         Some(cmd) => {
-            let run_action = || dispatch_command(cmd, repo, shutdown, cli.verbose);
             if matches!(cmd, Commands::Backup { .. }) {
                 // Backup: hooks handled by run_backup_selection in core
-                run_action()
+                dispatch_command(cmd, repo, shutdown, cli.verbose)
             } else {
-                // Other commands: wrap with repo-level hooks via core
+                // Other commands: wrap with repo-level hooks via core. The closure
+                // flattens the CLI's boxed error into VykarError::Other to match the
+                // library signature; display-only usage downstream makes the lost
+                // downcast info immaterial.
+                let run_action = || -> vykar_types::error::Result<bool> {
+                    dispatch_command(cmd, repo, shutdown, cli.verbose)
+                        .map_err(|e| vykar_types::error::VykarError::Other(e.to_string()))
+                };
                 operations::run_command_with_hooks(repo, cmd.name(), run_action)
+                    .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })
             }
         }
         None => run_default_actions(repo, shutdown, cli.verbose, &cli.source),

@@ -92,9 +92,9 @@ pub(crate) fn run_with_hooks<F, T>(
     repo: &HooksConfig,
     ctx: &mut HookContext,
     action: F,
-) -> std::result::Result<T, Box<dyn std::error::Error>>
+) -> Result<T>
 where
-    F: FnOnce() -> std::result::Result<T, Box<dyn std::error::Error>>,
+    F: FnOnce() -> Result<T>,
 {
     // Hooks only run for hookable commands (backup, prune, check, compact).
     if !HOOK_COMMANDS.contains(&ctx.command.as_str()) {
@@ -105,7 +105,7 @@ where
     let action_result = if let Err(e) = run_before(global, repo, ctx) {
         // Before hook failed — skip action, go to failed/finally
         ctx.error = Some(e.to_string());
-        Err(e.into())
+        Err(e)
     } else {
         // 2. Run the action
         action()
@@ -486,8 +486,9 @@ mod tests {
         let global2 = hooks_from(&[("after", vec![&cmd2])]);
         let mut ctx2 = make_ctx("backup");
 
-        let _result: std::result::Result<(), _> =
-            run_with_hooks(&global2, &repo, &mut ctx2, || Err("action failed".into()));
+        let _result: Result<()> = run_with_hooks(&global2, &repo, &mut ctx2, || {
+            Err(VykarError::Other("action failed".into()))
+        });
         assert!(!marker2.exists(), "after hook should NOT run on failure");
     }
 
@@ -501,8 +502,9 @@ mod tests {
         let repo = HooksConfig::default();
         let mut ctx = make_ctx("backup");
 
-        let _result: std::result::Result<(), _> =
-            run_with_hooks(&global, &repo, &mut ctx, || Err("something broke".into()));
+        let _result: Result<()> = run_with_hooks(&global, &repo, &mut ctx, || {
+            Err(VykarError::Other("something broke".into()))
+        });
         assert!(marker.exists(), "failed hook should run on failure");
 
         // Now test success case
@@ -535,8 +537,9 @@ mod tests {
         let global2 = hooks_from(&[("finally", vec![&cmd2])]);
         let mut ctx2 = make_ctx("backup");
 
-        let _result: std::result::Result<(), _> =
-            run_with_hooks(&global2, &repo, &mut ctx2, || Err("error".into()));
+        let _result: Result<()> = run_with_hooks(&global2, &repo, &mut ctx2, || {
+            Err(VykarError::Other("error".into()))
+        });
         assert!(marker2.exists(), "finally should run on failure");
     }
 

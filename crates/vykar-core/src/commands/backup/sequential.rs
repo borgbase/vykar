@@ -22,6 +22,7 @@ use vykar_types::error::{Result, VykarError};
 
 use super::chunk_process::{classify_chunk, WorkerChunk};
 use super::commit::process_worker_chunks;
+use super::source::ResolvedSource;
 use super::walk::{is_soft_io_error, materialize_item, InodeSortedWalk, Materialized, WalkEvent};
 use super::{append_item_to_stream, emit_progress, emit_stats_progress};
 use super::{BackupProgressEvent, FileStatus};
@@ -410,8 +411,7 @@ pub(super) fn process_regular_file_item(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn process_source_path(
     repo: &mut Repository,
-    source_path: &str,
-    multi_path: bool,
+    source: &ResolvedSource,
     exclude_patterns: &[String],
     exclude_if_present: &[String],
     one_file_system: bool,
@@ -436,27 +436,9 @@ pub(super) fn process_source_path(
     emit_progress(
         progress,
         BackupProgressEvent::SourceStarted {
-            source_path: source_path.to_string(),
+            source_path: source.configured.clone(),
         },
     );
-
-    let source = Path::new(source_path);
-
-    // For multi-path mode, derive basename prefix.
-    let prefix = if multi_path {
-        let (base, dir_item) = super::build_multi_path_prefix(source_path, source);
-        append_item_to_stream(
-            repo,
-            item_stream,
-            item_ptrs,
-            &dir_item,
-            items_config,
-            compression,
-        )?;
-        Some(base)
-    } else {
-        None
-    };
 
     let chunk_id_key = *repo.crypto.chunk_id_key();
     let min_chunk_size = repo.config.chunker_params.min_size as u64;
@@ -469,7 +451,6 @@ pub(super) fn process_source_path(
         one_file_system,
         git_ignore,
     )?;
-    let abs_source = inode_walk.abs_source().to_owned();
 
     for event_result in inode_walk {
         check_interrupted(shutdown)?;
@@ -484,7 +465,7 @@ pub(super) fn process_source_path(
         };
 
         let (mut item, entry_path, metadata_summary) =
-            match materialize_item(walked, &abs_source, &prefix, xattrs_enabled) {
+            match materialize_item(walked, xattrs_enabled) {
                 Ok(Materialized::Entry {
                     item,
                     abs_path,
@@ -688,7 +669,7 @@ pub(super) fn process_source_path(
     emit_progress(
         progress,
         BackupProgressEvent::SourceFinished {
-            source_path: source_path.to_string(),
+            source_path: source.configured.clone(),
         },
     );
 

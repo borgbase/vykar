@@ -4,6 +4,7 @@ mod commit;
 mod concurrency;
 pub(crate) mod pipeline;
 mod sequential;
+mod source;
 mod walk;
 
 pub(crate) use chunk_process::WorkerChunk;
@@ -20,7 +21,7 @@ use std::sync::Arc;
 
 use crate::limits;
 use crate::platform::fs;
-use crate::repo::file_cache::{FileCache, ParentReuseBuilder, ParentReuseIndex};
+use crate::repo::file_cache::{FileCache, ParentReuseBuilder, ParentReuseIndex, ParentReuseRoot};
 use crate::repo::format::{pack_object_with_context, ObjectType};
 use crate::repo::lock;
 use crate::repo::manifest::SnapshotEntry;
@@ -50,33 +51,6 @@ pub(crate) fn normalize_rel_path(path: String) -> String {
     } else {
         path
     }
-}
-
-/// Build the multi-path prefix basename and synthetic directory item.
-/// Used when backing up multiple source paths to namespace each source.
-fn build_multi_path_prefix(source_path: &str, source: &std::path::Path) -> (String, Item) {
-    use crate::snapshot::item::ItemType;
-    let base = source
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| source_path.to_string());
-    let dir_item = Item {
-        path: base.clone(),
-        entry_type: ItemType::Directory,
-        mode: 0o755,
-        uid: 0,
-        gid: 0,
-        user: None,
-        group: None,
-        mtime: 0,
-        atime: None,
-        ctime: None,
-        size: 0,
-        chunks: Vec::new(),
-        link_target: None,
-        xattrs: None,
-    };
-    (base, dir_item)
 }
 
 /// Resolve a cache hit by checking the file cache, falling back to the parent reuse index.
@@ -276,31 +250,11 @@ pub fn run_with_progress(
 
     let multi_path = source_paths.len() > 1;
 
-    // Build walk-root pairs: (original_basename, canonicalized_walk_root).
-    // The walker uses the original basename for snapshot item prefixes, but
-    // canonicalizes the root for abs_path construction (at least on Linux).
-    // The parent reuse builder needs both to reconstruct matching abs_paths.
-    let walk_roots: Vec<(String, String)> = source_paths
-        .iter()
-        .map(|sp| {
-            let p = std::path::Path::new(sp);
-            let basename = p
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| sp.clone());
-            let walk_root = std::fs::canonicalize(p)
-                .unwrap_or_else(|_| {
-                    if p.is_absolute() {
-                        p.to_path_buf()
-                    } else {
-                        std::env::current_dir().unwrap_or_default().join(p)
-                    }
-                })
-                .to_string_lossy()
-                .to_string();
-            (basename, walk_root)
-        })
-        .collect();
+    // Resolve every configured source up-front: stat, canonicalize, derive
+    // basename + emission policy, and reject duplicate basenames. This runs
+    // BEFORE opening the repo so any source-validation failure short-circuits
+    // with no session registered.
+    let resolved_sources = source::ResolvedSource::resolve_all(source_paths, multi_path)?;
 
     let _nice_guard = match limits::NiceGuard::apply(config.limits.nice) {
         Ok(guard) => guard,
@@ -420,8 +374,10 @@ pub fn run_with_progress(
         }
 
         // Set up read cache + write cache sections for filesystem sources.
-        let canonical_roots: Vec<String> =
-            walk_roots.iter().map(|(_, root)| root.clone()).collect();
+        let canonical_roots: Vec<String> = resolved_sources
+            .iter()
+            .map(|s| s.abs_source_str.clone())
+            .collect();
         let mut parent_reuse_index: Option<ParentReuseIndex> = None;
         if !source_paths.is_empty() {
             let section_valid = repo
@@ -449,7 +405,11 @@ pub fn run_with_progress(
                     .max_by_key(|s| s.time);
                 if let Some(parent_entry) = latest {
                     let parent_name = parent_entry.name.clone();
-                    let mut builder = ParentReuseBuilder::new(walk_roots.clone(), multi_path);
+                    let parent_roots: Vec<ParentReuseRoot> = resolved_sources
+                        .iter()
+                        .map(|s| s.parent_reuse_root())
+                        .collect();
+                    let mut builder = ParentReuseBuilder::new(parent_roots);
                     let stream_result =
                         super::list::for_each_snapshot_item(&mut repo, &parent_name, |item| {
                             builder.push(item);
@@ -536,8 +496,7 @@ pub fn run_with_progress(
                 .min(pipeline_buffer_bytes) as u64;
 
             let pipeline_ctx = pipeline::PipelineCtx {
-                source_paths,
-                multi_path,
+                sources: &resolved_sources,
                 exclude_patterns,
                 exclude_if_present,
                 one_file_system,
@@ -574,13 +533,12 @@ pub fn run_with_progress(
             repo.restore_file_cache(file_cache_snapshot);
             pipeline_result?;
         } else {
-            for source_path in source_paths {
+            for source in &resolved_sources {
                 check_interrupted(shutdown)?;
 
                 sequential::process_source_path(
                     &mut repo,
-                    source_path,
-                    multi_path,
+                    source,
                     exclude_patterns,
                     exclude_if_present,
                     one_file_system,

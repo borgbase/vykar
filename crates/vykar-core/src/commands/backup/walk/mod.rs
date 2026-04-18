@@ -11,9 +11,10 @@ use crate::snapshot::item::{ChunkRef, Item, ItemType};
 use vykar_types::error::{Result, VykarError};
 
 use super::concurrency::ByteBudget;
+use super::source::ResolvedSource;
 
 mod inode_walk;
-pub(super) use inode_walk::{rel_path_from_abs, InodeSortedWalk, WalkEvent, WalkedEntry};
+pub(super) use inode_walk::{InodeSortedWalk, WalkEvent, WalkedEntry};
 
 /// Returns `true` for I/O errors safe to skip (permission denied, not found, or EIO).
 pub(super) fn is_soft_io_error(e: &std::io::Error) -> bool {
@@ -143,14 +144,10 @@ pub(super) enum Materialized {
 
 /// Classify a walked filesystem entry and build an `Item` from its metadata.
 ///
-/// Handles file-type classification, symlink target resolution, path prefixing,
-/// ctime computation, Item construction, and xattr population.
-pub(super) fn materialize_item(
-    walked: WalkedEntry,
-    abs_source: &Path,
-    prefix: &Option<String>,
-    xattrs_enabled: bool,
-) -> Result<Materialized> {
+/// Handles file-type classification, symlink target resolution, ctime
+/// computation, Item construction, and xattr population. The snapshot path is
+/// taken from `walked.snapshot_path` as computed by the walker.
+pub(super) fn materialize_item(walked: WalkedEntry, xattrs_enabled: bool) -> Result<Materialized> {
     let file_type = walked.file_type;
     let metadata_summary = walked.metadata;
 
@@ -177,12 +174,6 @@ pub(super) fn materialize_item(
         return Ok(Materialized::Unsupported);
     };
 
-    let rel_path = rel_path_from_abs(abs_source, &walked.abs_path);
-    let item_path = match prefix {
-        Some(pfx) => format!("{pfx}/{rel_path}"),
-        None => rel_path,
-    };
-
     let item_ctime = if entry_type == ItemType::RegularFile {
         Some(metadata_summary.ctime_ns)
     } else {
@@ -190,7 +181,7 @@ pub(super) fn materialize_item(
     };
 
     let mut item = Item {
-        path: item_path,
+        path: walked.snapshot_path,
         entry_type,
         mode: metadata_summary.mode,
         uid: metadata_summary.uid,
@@ -272,11 +263,10 @@ pub(super) fn reserve_budget(entry: &WalkEntry, budget: &ByteBudget) -> Result<u
     }
 }
 
-/// Build a walk iterator that yields `WalkEntry` items for all source paths.
+/// Build a walk iterator that yields `WalkEntry` items for all resolved sources.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn build_walk_iter<'a>(
-    source_paths: &'a [String],
-    multi_path: bool,
+    sources: &'a [ResolvedSource],
     exclude_patterns: &'a [String],
     exclude_if_present: &'a [String],
     one_file_system: bool,
@@ -286,14 +276,13 @@ pub(super) fn build_walk_iter<'a>(
     segment_size: u64,
     parent_reuse_index: Option<&'a ParentReuseIndex>,
 ) -> Box<dyn Iterator<Item = Result<WalkEntry>> + Send + 'a> {
-    let iter = source_paths.iter().flat_map(move |source_path| {
+    let iter = sources.iter().flat_map(move |source| {
         let source_started = std::iter::once(Ok(WalkEntry::SourceStarted {
-            path: source_path.clone(),
+            path: source.configured.clone(),
         }));
 
         let entries = walk_source(
-            source_path,
-            multi_path,
+            source,
             exclude_patterns,
             exclude_if_present,
             one_file_system,
@@ -305,7 +294,7 @@ pub(super) fn build_walk_iter<'a>(
         );
 
         let source_finished = std::iter::once(Ok(WalkEntry::SourceFinished {
-            path: source_path.clone(),
+            path: source.configured.clone(),
         }));
 
         source_started.chain(entries).chain(source_finished)
@@ -391,11 +380,10 @@ impl Iterator for WalkItems {
     }
 }
 
-/// Walk a single source path and yield WalkEntry items.
+/// Walk a single resolved source and yield WalkEntry items.
 #[allow(clippy::too_many_arguments)]
 fn walk_source<'a>(
-    source_path: &'a str,
-    multi_path: bool,
+    source: &'a ResolvedSource,
     exclude_patterns: &'a [String],
     exclude_if_present: &'a [String],
     one_file_system: bool,
@@ -406,8 +394,7 @@ fn walk_source<'a>(
     parent_reuse_index: Option<&'a ParentReuseIndex>,
 ) -> Box<dyn Iterator<Item = Result<WalkEntry>> + Send + 'a> {
     walk_source_inode_sorted(
-        source_path,
-        multi_path,
+        source,
         exclude_patterns,
         exclude_if_present,
         one_file_system,
@@ -419,11 +406,10 @@ fn walk_source<'a>(
     )
 }
 
-/// Walk a single source path using the inode-sorted walker.
+/// Walk a single resolved source using the inode-sorted walker.
 #[allow(clippy::too_many_arguments)]
 fn walk_source_inode_sorted<'a>(
-    source_path: &'a str,
-    multi_path: bool,
+    source: &'a ResolvedSource,
     exclude_patterns: &'a [String],
     exclude_if_present: &'a [String],
     one_file_system: bool,
@@ -433,7 +419,6 @@ fn walk_source_inode_sorted<'a>(
     segment_size: u64,
     parent_reuse_index: Option<&'a ParentReuseIndex>,
 ) -> Box<dyn Iterator<Item = Result<WalkEntry>> + Send + 'a> {
-    let source = Path::new(source_path);
     let inode_walk = match InodeSortedWalk::new(
         source,
         exclude_patterns,
@@ -445,22 +430,6 @@ fn walk_source_inode_sorted<'a>(
         Err(e) => return Box::new(std::iter::once(Err(e))),
     };
 
-    // Multi-path prefix item.
-    let (prefix, prefix_item): (
-        Option<String>,
-        Box<dyn Iterator<Item = Result<WalkEntry>> + Send>,
-    ) = if multi_path {
-        let (base, dir_item) = super::build_multi_path_prefix(source_path, source);
-        (
-            Some(base),
-            Box::new(std::iter::once(Ok(WalkEntry::NonFile { item: dir_item }))),
-        )
-    } else {
-        (None, Box::new(std::iter::empty()))
-    };
-
-    let abs_source = inode_walk.abs_source().to_owned();
-    let prefix_clone = prefix.clone();
     let walk_entries = inode_walk.flat_map(move |event_result| -> WalkItems {
         let event = match event_result {
             Ok(e) => e,
@@ -473,8 +442,6 @@ fn walk_source_inode_sorted<'a>(
             WalkEvent::Skipped => WalkItems::One(Some(Ok(WalkEntry::Skipped))),
             WalkEvent::Entry(walked) => walked_entry_to_walk_items(
                 walked,
-                &abs_source,
-                &prefix_clone,
                 xattrs_enabled,
                 file_cache,
                 segment_size,
@@ -483,32 +450,29 @@ fn walk_source_inode_sorted<'a>(
         }
     });
 
-    Box::new(prefix_item.chain(walk_entries))
+    Box::new(walk_entries)
 }
 
 /// Convert a `WalkedEntry` (pre-statted) into pipeline `WalkItems`.
 fn walked_entry_to_walk_items(
     walked: WalkedEntry,
-    abs_source: &Path,
-    prefix: &Option<String>,
     xattrs_enabled: bool,
     file_cache: &FileCache,
     segment_size: u64,
     parent_reuse_index: Option<&ParentReuseIndex>,
 ) -> WalkItems {
-    let (item, abs_path, metadata_summary) =
-        match materialize_item(walked, abs_source, prefix, xattrs_enabled) {
-            Ok(Materialized::Entry {
-                item,
-                abs_path,
-                metadata,
-            }) => (item, abs_path, metadata),
-            Ok(Materialized::SoftError) => {
-                return WalkItems::One(Some(Ok(WalkEntry::Skipped)));
-            }
-            Ok(Materialized::Unsupported) => return WalkItems::Empty,
-            Err(e) => return WalkItems::One(Some(Err(e))),
-        };
+    let (item, abs_path, metadata_summary) = match materialize_item(walked, xattrs_enabled) {
+        Ok(Materialized::Entry {
+            item,
+            abs_path,
+            metadata,
+        }) => (item, abs_path, metadata),
+        Ok(Materialized::SoftError) => {
+            return WalkItems::One(Some(Ok(WalkEntry::Skipped)));
+        }
+        Ok(Materialized::Unsupported) => return WalkItems::Empty,
+        Err(e) => return WalkItems::One(Some(Err(e))),
+    };
 
     if item.entry_type == ItemType::RegularFile && metadata_summary.size > 0 {
         let abs_path = abs_path
@@ -748,12 +712,13 @@ mod tests {
     // materialize_item tests
     // -----------------------------------------------------------------------
 
-    fn walked_from_path(path: &std::path::Path) -> WalkedEntry {
+    fn walked_from_path(path: &std::path::Path, snapshot_path: &str) -> WalkedEntry {
         let meta = std::fs::symlink_metadata(path).unwrap();
         WalkedEntry {
             abs_path: path.to_path_buf(),
             metadata: fs::summarize_metadata(&meta, &meta.file_type()),
             file_type: meta.file_type(),
+            snapshot_path: snapshot_path.to_string(),
         }
     }
 
@@ -762,8 +727,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let file = tmp.path().join("hello.txt");
         std::fs::write(&file, b"content").unwrap();
-        let walked = walked_from_path(&file);
-        let result = materialize_item(walked, tmp.path(), &None, false).unwrap();
+        let walked = walked_from_path(&file, "hello.txt");
+        let result = materialize_item(walked, false).unwrap();
         match result {
             Materialized::Entry { item, metadata, .. } => {
                 assert_eq!(item.entry_type, ItemType::RegularFile);
@@ -780,8 +745,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("sub");
         std::fs::create_dir(&dir).unwrap();
-        let walked = walked_from_path(&dir);
-        let result = materialize_item(walked, tmp.path(), &None, false).unwrap();
+        let walked = walked_from_path(&dir, "sub");
+        let result = materialize_item(walked, false).unwrap();
         match result {
             Materialized::Entry { item, .. } => {
                 assert_eq!(item.entry_type, ItemType::Directory);
@@ -799,8 +764,8 @@ mod tests {
         std::fs::write(&target, b"x").unwrap();
         let link = tmp.path().join("link");
         std::os::unix::fs::symlink(&target, &link).unwrap();
-        let walked = walked_from_path(&link);
-        let result = materialize_item(walked, tmp.path(), &None, false).unwrap();
+        let walked = walked_from_path(&link, "link");
+        let result = materialize_item(walked, false).unwrap();
         match result {
             Materialized::Entry { item, .. } => {
                 assert_eq!(item.entry_type, ItemType::Symlink);
@@ -822,8 +787,8 @@ mod tests {
             Err(e) => panic!("unexpected bind error: {e}"),
         };
         let _listener = listener;
-        let walked = walked_from_path(&sock_path);
-        let result = materialize_item(walked, tmp.path(), &None, false).unwrap();
+        let walked = walked_from_path(&sock_path, "test.sock");
+        let result = materialize_item(walked, false).unwrap();
         assert!(matches!(result, Materialized::Unsupported));
     }
 
@@ -832,9 +797,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let file = tmp.path().join("data.bin");
         std::fs::write(&file, b"x").unwrap();
-        let walked = walked_from_path(&file);
-        let prefix = Some("myhost".to_string());
-        let result = materialize_item(walked, tmp.path(), &prefix, false).unwrap();
+        let walked = walked_from_path(&file, "myhost/data.bin");
+        let result = materialize_item(walked, false).unwrap();
         match result {
             Materialized::Entry { item, .. } => {
                 assert_eq!(item.path, "myhost/data.bin");
@@ -853,12 +817,12 @@ mod tests {
         std::os::unix::fs::symlink(&target, &link).unwrap();
 
         // Stat the symlink to get its FileType *before* removing it.
-        let walked = walked_from_path(&link);
+        let walked = walked_from_path(&link, "link");
 
         // Remove the symlink so read_link will fail with NotFound.
         std::fs::remove_file(&link).unwrap();
 
-        let result = materialize_item(walked, tmp.path(), &None, false).unwrap();
+        let result = materialize_item(walked, false).unwrap();
         assert!(matches!(result, Materialized::SoftError));
     }
 
@@ -871,19 +835,11 @@ mod tests {
         let link = tmp.path().join("link");
         std::os::unix::fs::symlink(&target, &link).unwrap();
 
-        let walked = walked_from_path(&link);
+        let walked = walked_from_path(&link, "link");
         std::fs::remove_file(&link).unwrap();
 
         let file_cache = FileCache::default();
-        let mut items = walked_entry_to_walk_items(
-            walked,
-            tmp.path(),
-            &None,
-            false,
-            &file_cache,
-            u64::MAX,
-            None,
-        );
+        let mut items = walked_entry_to_walk_items(walked, false, &file_cache, u64::MAX, None);
         match items.next() {
             Some(Ok(WalkEntry::Skipped)) => {}
             _ => panic!("expected WalkEntry::Skipped"),

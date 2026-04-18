@@ -20,6 +20,7 @@ use tracing::{debug, warn};
 use crate::platform::fs::{self, MetadataSummary};
 use vykar_types::error::{Result, VykarError};
 
+use super::super::source::{ResolvedSource, RootEmission, SourceKind};
 use super::{build_explicit_excludes, is_soft_io_error, should_skip_for_device};
 
 #[cfg(unix)]
@@ -77,11 +78,14 @@ pub(in crate::commands::backup) struct WalkedEntry {
     pub abs_path: PathBuf,
     pub metadata: MetadataSummary,
     pub file_type: FileType,
+    /// Pre-computed snapshot-relative path, including the multi-path / file-
+    /// source basename prefix when `RootEmission::EmitRoot` is in effect.
+    pub snapshot_path: String,
 }
 
 /// Derive the snapshot-relative path from an absolute entry path.
 /// Uses `abs_source` (the canonicalized walk root) for `strip_prefix`.
-pub(in crate::commands::backup) fn rel_path_from_abs(abs_source: &Path, abs_path: &Path) -> String {
+pub(super) fn rel_path_from_abs(abs_source: &Path, abs_path: &Path) -> String {
     let rel = abs_path
         .strip_prefix(abs_source)
         .unwrap_or(abs_path)
@@ -95,6 +99,26 @@ pub(in crate::commands::backup) enum WalkEvent {
     Entry(WalkedEntry),
     /// A soft error occurred (permission denied, not found, EIO).
     Skipped,
+}
+
+/// Build a single-event `DirLevel` holding the root `WalkedEntry` for an
+/// `EmitRoot` source.
+fn root_entry_level(
+    abs_source: &Path,
+    file_type: FileType,
+    metadata: MetadataSummary,
+    basename: &str,
+) -> DirLevel {
+    let root_entry = WalkedEntry {
+        abs_path: abs_source.to_path_buf(),
+        metadata,
+        file_type,
+        snapshot_path: basename.to_string(),
+    };
+    DirLevel {
+        events: VecDeque::from([WalkEvent::Entry(root_entry)]),
+        pending_subdirs: VecDeque::new(),
+    }
 }
 
 /// Raw directory entry from readdir, before stat.
@@ -134,46 +158,41 @@ pub(in crate::commands::backup) struct InodeSortedWalk {
     /// Cached result of `inode_sort_beneficial()` for the source root.
     /// Avoids per-directory `statfs()` + `CString` allocation.
     inode_sort_for_source: bool,
+    /// Snapshot-root policy: `SkipRoot` (descendants only, relative to
+    /// `abs_source`) or `EmitRoot` (prefix all emitted paths with `basename`).
+    policy: RootEmission,
 }
 
 impl InodeSortedWalk {
     /// The canonicalized source root. Consumers must use this for `strip_prefix`.
+    #[cfg(test)]
     pub fn abs_source(&self) -> &Path {
         &self.abs_source
     }
 
-    /// Create a new inode-sorted walker for the given source directory.
+    /// Create a new inode-sorted walker for the given resolved source.
+    ///
+    /// The root is re-statted here (not taken from `ResolvedSource`) so that
+    /// the metadata emitted for an `EmitRoot` entry reflects the filesystem
+    /// state at walk time, not resolve time. `std::fs::metadata` follows
+    /// symlinks — `abs_source` is already canonicalized by `ResolvedSource`.
     pub fn new(
-        source: &Path,
+        source: &ResolvedSource,
         exclude_patterns: &[String],
         exclude_if_present: &[String],
         one_file_system: bool,
         git_ignore: bool,
     ) -> Result<Self> {
-        let source_meta = std::fs::symlink_metadata(source).map_err(|e| {
-            VykarError::Other(format!(
-                "source directory does not exist: {}: {e}",
-                source.display()
-            ))
+        let abs_source = source.abs_source.clone();
+
+        let source_meta = std::fs::metadata(&abs_source).map_err(|e| {
+            VykarError::Other(format!("stat error for {}: {e}", abs_source.display()))
         })?;
         let source_ft = source_meta.file_type();
         let source_summary = fs::summarize_metadata(&source_meta, &source_ft);
         let source_dev = source_summary.device;
 
-        let excludes = build_explicit_excludes(source, exclude_patterns)?;
-
-        // Canonicalize the source path so that read_dir returns absolute paths
-        // (needed for gitignore prefix stripping) and so that the parent
-        // directory chain for ancestor .gitignore discovery is correct even
-        // for sources containing `..` components. This matches the ignore
-        // crate's `add_parents` which also calls `canonicalize()`.
-        let abs_source = std::fs::canonicalize(source).unwrap_or_else(|_| {
-            if source.is_absolute() {
-                source.to_path_buf()
-            } else {
-                std::env::current_dir().unwrap_or_default().join(source)
-            }
-        });
+        let excludes = build_explicit_excludes(&abs_source, exclude_patterns)?;
 
         let inode_sort_for_source = inode_sort_beneficial(&abs_source);
 
@@ -211,12 +230,14 @@ impl InodeSortedWalk {
             }
 
             // Load the source directory's own .gitignore (if present).
-            let source_gi_path = abs_source.join(".gitignore");
-            if source_gi_path.is_file() {
-                let mut builder = GitignoreBuilder::new(&abs_source);
-                builder.add(&source_gi_path);
-                if let Ok(gi) = builder.build() {
-                    gitignore_stack.push((0, gi));
+            if source.kind == SourceKind::Directory {
+                let source_gi_path = abs_source.join(".gitignore");
+                if source_gi_path.is_file() {
+                    let mut builder = GitignoreBuilder::new(&abs_source);
+                    builder.add(&source_gi_path);
+                    if let Ok(gi) = builder.build() {
+                        gitignore_stack.push((0, gi));
+                    }
                 }
             }
         }
@@ -233,12 +254,36 @@ impl InodeSortedWalk {
             gitignore_enabled: git_ignore,
             gitignore_stack,
             inode_sort_for_source,
+            policy: source.policy.clone(),
         };
 
-        // Build the root DirLevel for the source directory.
-        // Walk abs_source so that read_dir returns absolute paths.
-        let root_level = walk.build_dir_level(&walk.abs_source)?;
-        walk.stack.push(root_level);
+        // Build the emission order: descendants-first (bottom of stack) so
+        // DFS drains the root event on top before descending.
+        match (&walk.policy.clone(), source.kind) {
+            (RootEmission::SkipRoot, _) => {
+                let root_level = walk.build_dir_level(&walk.abs_source)?;
+                walk.stack.push(root_level);
+            }
+            (RootEmission::EmitRoot { basename }, SourceKind::Directory) => {
+                let descendants = walk.build_dir_level(&walk.abs_source)?;
+                walk.stack.push(descendants);
+                walk.stack.push(root_entry_level(
+                    &walk.abs_source,
+                    source_ft,
+                    source_summary,
+                    basename,
+                ));
+            }
+            (RootEmission::EmitRoot { basename }, SourceKind::File) => {
+                // Never call read_dir on a file source. This is the regression fix.
+                walk.stack.push(root_entry_level(
+                    &walk.abs_source,
+                    source_ft,
+                    source_summary,
+                    basename,
+                ));
+            }
+        }
 
         Ok(walk)
     }
@@ -428,10 +473,17 @@ impl InodeSortedWalk {
                 pending_subdirs.push_back(raw.path.clone());
             }
 
+            let rel = rel_path_from_abs(&self.abs_source, &raw.path);
+            let snapshot_path = match &self.policy {
+                RootEmission::SkipRoot => rel,
+                RootEmission::EmitRoot { basename } => format!("{basename}/{rel}"),
+            };
+
             events.push_back(WalkEvent::Entry(WalkedEntry {
                 abs_path: raw.path,
                 metadata: summary,
                 file_type,
+                snapshot_path,
             }));
         }
 
@@ -517,6 +569,10 @@ mod tests {
     use super::*;
     use std::fs;
 
+    fn resolve_dir(path: &Path) -> ResolvedSource {
+        ResolvedSource::resolve(&path.to_string_lossy(), false).unwrap()
+    }
+
     #[test]
     fn walks_basic_directory_structure() {
         let tmp = tempfile::tempdir().unwrap();
@@ -528,7 +584,7 @@ mod tests {
         fs::write(root.join("sub/b.txt"), "b").unwrap();
         fs::write(root.join("sub/deep/c.txt"), "c").unwrap();
 
-        let walk = InodeSortedWalk::new(root, &[], &[], false, false).unwrap();
+        let walk = InodeSortedWalk::new(&resolve_dir(root), &[], &[], false, false).unwrap();
         let abs_source = walk.abs_source().to_owned();
         let mut paths: Vec<String> = Vec::new();
         for event in walk {
@@ -555,7 +611,7 @@ mod tests {
         fs::write(root.join("logs/app.log"), "l").unwrap();
 
         let excludes = vec!["*.log".to_string(), "logs".to_string()];
-        let walk = InodeSortedWalk::new(root, &excludes, &[], false, false).unwrap();
+        let walk = InodeSortedWalk::new(&resolve_dir(root), &excludes, &[], false, false).unwrap();
         let abs_source = walk.abs_source().to_owned();
         let mut paths: Vec<String> = Vec::new();
         for event in walk {
@@ -580,7 +636,7 @@ mod tests {
         fs::write(root.join("excluded/.nobackup"), "").unwrap();
 
         let markers = vec![".nobackup".to_string()];
-        let walk = InodeSortedWalk::new(root, &[], &markers, false, false).unwrap();
+        let walk = InodeSortedWalk::new(&resolve_dir(root), &[], &markers, false, false).unwrap();
         let abs_source = walk.abs_source().to_owned();
         let mut paths: Vec<String> = Vec::new();
         for event in walk {
@@ -603,7 +659,7 @@ mod tests {
         fs::write(root.join("real.txt"), "r").unwrap();
         unix_fs::symlink("real.txt", root.join("link.txt")).unwrap();
 
-        let walk = InodeSortedWalk::new(root, &[], &[], false, false).unwrap();
+        let walk = InodeSortedWalk::new(&resolve_dir(root), &[], &[], false, false).unwrap();
         let abs_source = walk.abs_source().to_owned();
         let mut found_symlink = false;
         for event in walk {
@@ -620,7 +676,7 @@ mod tests {
     #[test]
     fn empty_directory_yields_nothing() {
         let tmp = tempfile::tempdir().unwrap();
-        let walk = InodeSortedWalk::new(tmp.path(), &[], &[], false, false).unwrap();
+        let walk = InodeSortedWalk::new(&resolve_dir(tmp.path()), &[], &[], false, false).unwrap();
         let count = walk.count();
         assert_eq!(count, 0);
     }
@@ -638,7 +694,7 @@ mod tests {
         fs::create_dir(root.join("src")).unwrap();
         fs::write(root.join("src/main.rs"), "m").unwrap();
 
-        let walk = InodeSortedWalk::new(root, &[], &[], false, true).unwrap();
+        let walk = InodeSortedWalk::new(&resolve_dir(root), &[], &[], false, true).unwrap();
         let abs_source = walk.abs_source().to_owned();
         let mut paths: Vec<String> = Vec::new();
         for event in walk {
@@ -666,7 +722,7 @@ mod tests {
         fs::write(root.join("sub/child.log"), "c").unwrap();
         fs::write(root.join("sub/child.txt"), "t").unwrap();
 
-        let walk = InodeSortedWalk::new(root, &[], &[], false, true).unwrap();
+        let walk = InodeSortedWalk::new(&resolve_dir(root), &[], &[], false, true).unwrap();
         let abs_source = walk.abs_source().to_owned();
         let mut paths: Vec<String> = Vec::new();
         for event in walk {
@@ -735,7 +791,8 @@ mod tests {
         let excludes = vec!["*.log".to_string()];
         let markers = vec![".nobackup".to_string()];
 
-        let inode_walk = InodeSortedWalk::new(root, &excludes, &markers, false, true).unwrap();
+        let inode_walk =
+            InodeSortedWalk::new(&resolve_dir(root), &excludes, &markers, false, true).unwrap();
         let abs_source = inode_walk.abs_source().to_owned();
         let mut paths: Vec<String> = Vec::new();
         for event in inode_walk {
@@ -776,7 +833,14 @@ mod tests {
         let prev_dir = std::env::current_dir().unwrap();
         std::env::set_current_dir(root).unwrap();
 
-        let walk = InodeSortedWalk::new(Path::new("./target"), &[], &[], false, false).unwrap();
+        let walk = InodeSortedWalk::new(
+            &ResolvedSource::resolve("./target", false).unwrap(),
+            &[],
+            &[],
+            false,
+            false,
+        )
+        .unwrap();
         let abs_source = walk.abs_source().to_owned();
         let mut paths: Vec<String> = Vec::new();
         for event in walk {
@@ -805,7 +869,14 @@ mod tests {
         let prev_dir = std::env::current_dir().unwrap();
         std::env::set_current_dir(root.join("sibling")).unwrap();
 
-        let walk = InodeSortedWalk::new(Path::new("../target"), &[], &[], false, false).unwrap();
+        let walk = InodeSortedWalk::new(
+            &ResolvedSource::resolve("../target", false).unwrap(),
+            &[],
+            &[],
+            false,
+            false,
+        )
+        .unwrap();
         let abs_source = walk.abs_source().to_owned();
         let mut paths: Vec<String> = Vec::new();
         for event in walk {
@@ -856,7 +927,8 @@ mod tests {
         unix_fs::symlink(root.join("real"), root.join("link")).unwrap();
 
         // Walk via symlink
-        let walk = InodeSortedWalk::new(&root.join("link"), &[], &[], false, false).unwrap();
+        let walk =
+            InodeSortedWalk::new(&resolve_dir(&root.join("link")), &[], &[], false, false).unwrap();
         let abs_source = walk.abs_source().to_owned();
         let mut paths: Vec<String> = Vec::new();
         for event in walk {
@@ -867,5 +939,126 @@ mod tests {
 
         paths.sort();
         assert_eq!(paths, vec!["a.txt", "sub", "sub/b.txt"]);
+    }
+
+    #[test]
+    fn walker_single_file_yields_one_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("hello.txt");
+        fs::write(&file, "world").unwrap();
+
+        let source = ResolvedSource::resolve(&file.to_string_lossy(), false).unwrap();
+        let walk = InodeSortedWalk::new(&source, &[], &[], false, false).unwrap();
+        let events: Vec<_> = walk.collect::<Result<Vec<_>>>().unwrap();
+        assert_eq!(events.len(), 1, "expected exactly one entry");
+        match &events[0] {
+            WalkEvent::Entry(e) => {
+                assert!(e.file_type.is_file());
+                assert_eq!(e.snapshot_path, "hello.txt");
+            }
+            _ => panic!("expected Entry"),
+        }
+    }
+
+    #[test]
+    fn walker_empty_file_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("empty");
+        fs::write(&file, "").unwrap();
+
+        let source = ResolvedSource::resolve(&file.to_string_lossy(), false).unwrap();
+        let walk = InodeSortedWalk::new(&source, &[], &[], false, false).unwrap();
+        let events: Vec<_> = walk.collect::<Result<Vec<_>>>().unwrap();
+        assert_eq!(events.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walker_symlink_to_dir_descends_target() {
+        use std::os::unix::fs as unix_fs;
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        fs::create_dir(&real).unwrap();
+        fs::write(real.join("a.txt"), "a").unwrap();
+        fs::create_dir(real.join("sub")).unwrap();
+        fs::write(real.join("sub/b.txt"), "b").unwrap();
+
+        let link = tmp.path().join("link");
+        unix_fs::symlink(&real, &link).unwrap();
+
+        let source = ResolvedSource::resolve(&link.to_string_lossy(), false).unwrap();
+        let walk = InodeSortedWalk::new(&source, &[], &[], false, false).unwrap();
+        let mut snapshot_paths: Vec<String> = Vec::new();
+        for ev in walk {
+            if let Ok(WalkEvent::Entry(e)) = ev {
+                snapshot_paths.push(e.snapshot_path);
+            }
+        }
+        snapshot_paths.sort();
+        assert_eq!(snapshot_paths, vec!["a.txt", "sub", "sub/b.txt"]);
+    }
+
+    #[test]
+    fn walker_directory_skip_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("a.txt"), "a").unwrap();
+
+        let source = ResolvedSource::resolve(&tmp.path().to_string_lossy(), false).unwrap();
+        let walk = InodeSortedWalk::new(&source, &[], &[], false, false).unwrap();
+        let events: Vec<_> = walk.collect::<Result<Vec<_>>>().unwrap();
+        // SkipRoot: should NOT include the root directory itself.
+        let paths: Vec<String> = events
+            .into_iter()
+            .filter_map(|e| match e {
+                WalkEvent::Entry(entry) => Some(entry.snapshot_path),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(paths, vec!["a.txt"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walker_directory_emit_root() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("data");
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("a.txt"), "a").unwrap();
+        // Give the directory an obvious, non-default mode so we can verify
+        // the walker reads real metadata rather than synthetic placeholders.
+        fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o711)).unwrap();
+
+        let source = ResolvedSource::resolve(&dir.to_string_lossy(), true).unwrap();
+
+        // Resolve captures a snapshot of the source above. Mutate the
+        // directory mode *before* the walker initializes so we can verify
+        // the walker re-stats at init (closing the resolve→walker TOCTOU).
+        fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o751)).unwrap();
+
+        let walk = InodeSortedWalk::new(&source, &[], &[], false, false).unwrap();
+        let events: Vec<_> = walk.collect::<Result<Vec<_>>>().unwrap();
+
+        let entries: Vec<WalkedEntry> = events
+            .into_iter()
+            .filter_map(|e| match e {
+                WalkEvent::Entry(entry) => Some(entry),
+                _ => None,
+            })
+            .collect();
+        assert!(!entries.is_empty());
+
+        // Root entry emitted first with `snapshot_path == "data"`.
+        assert_eq!(entries[0].snapshot_path, "data");
+        assert!(entries[0].file_type.is_dir());
+        // Walker's fresh stat at init picks up the post-resolve mutation.
+        assert_eq!(entries[0].metadata.mode & 0o777, 0o751);
+
+        // Descendants prefixed with "data/".
+        let descendant_paths: Vec<String> = entries[1..]
+            .iter()
+            .map(|e| e.snapshot_path.clone())
+            .collect();
+        assert_eq!(descendant_paths, vec!["data/a.txt"]);
     }
 }

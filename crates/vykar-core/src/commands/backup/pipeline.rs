@@ -23,6 +23,7 @@ use vykar_types::error::{Result, VykarError};
 use super::chunk_process::classify_chunk;
 use super::commit::process_worker_chunks;
 use super::concurrency::{BudgetGuard, ByteBudget};
+use super::source::ResolvedSource;
 use super::walk::{build_walk_iter, reserve_budget, WalkEntry};
 use super::BackupProgressEvent;
 
@@ -654,8 +655,7 @@ enum PipelineResult {
 /// 20+ individual arguments.
 #[derive(Clone, Copy)]
 pub(crate) struct PipelineCtx<'a> {
-    pub source_paths: &'a [String],
-    pub multi_path: bool,
+    pub sources: &'a [ResolvedSource],
     pub exclude_patterns: &'a [String],
     pub exclude_if_present: &'a [String],
     pub one_file_system: bool,
@@ -699,8 +699,7 @@ pub(crate) fn run_parallel_pipeline(
     progress: &mut Option<&mut dyn FnMut(BackupProgressEvent)>,
 ) -> Result<()> {
     let PipelineCtx {
-        source_paths,
-        multi_path,
+        sources,
         exclude_patterns,
         exclude_if_present,
         one_file_system,
@@ -753,8 +752,7 @@ pub(crate) fn run_parallel_pipeline(
         let walk_result_tx = result_tx.clone();
         s.spawn(move || {
             let walk_iter = build_walk_iter(
-                source_paths,
-                multi_path,
+                sources,
                 exclude_patterns,
                 exclude_if_present,
                 one_file_system,

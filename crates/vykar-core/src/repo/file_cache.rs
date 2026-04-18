@@ -533,35 +533,63 @@ struct ParentEntry {
     chunk_refs: Arc<Vec<ChunkRef>>,
 }
 
+/// Root emission policy for a single parent-reuse source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParentReusePolicy {
+    /// Descendants are emitted relative to `abs_root`; no synthetic root entry
+    /// is present in the snapshot.
+    SkipRoot,
+    /// Snapshot paths are prefixed with `basename`; when the item path equals
+    /// `basename` exactly, the "remainder" is empty (file source).
+    EmitRoot { basename: String },
+}
+
+/// One root plus its policy, used to invert snapshot item paths back into
+/// filesystem absolute paths at parent-reuse time.
+#[derive(Debug, Clone)]
+pub struct ParentReuseRoot {
+    pub abs_root: String,
+    pub policy: ParentReusePolicy,
+}
+
+impl ParentReuseRoot {
+    fn invert(&self, item_path: &str) -> Option<PathBuf> {
+        match &self.policy {
+            ParentReusePolicy::SkipRoot => Some(Path::new(&self.abs_root).join(item_path)),
+            ParentReusePolicy::EmitRoot { basename } => {
+                if item_path == basename {
+                    Some(PathBuf::from(&self.abs_root))
+                } else {
+                    item_path
+                        .strip_prefix(basename.as_str())
+                        .and_then(|r| r.strip_prefix('/'))
+                        .map(|rest| Path::new(&self.abs_root).join(rest))
+                }
+            }
+        }
+    }
+}
+
 /// Incremental builder for `ParentReuseIndex`.
 ///
 /// Fed items one at a time inside a streaming callback. Call `finish()` to
 /// obtain the index if the legacy gate was never tripped.
 pub struct ParentReuseBuilder {
     entries: HashMap<PathHash, ParentEntry>,
-    /// Pairs of (original_basename, walk_root) for multi-path reconstruction,
-    /// or a single walk_root for single-path mode.
-    walk_roots: Vec<(String, String)>,
-    multi_path: bool,
+    roots: Vec<ParentReuseRoot>,
     /// Set to true when a filesystem file lacks ctime (legacy gate).
     legacy_abort: bool,
 }
 
 impl ParentReuseBuilder {
-    /// Create a builder.
-    ///
-    /// `walk_roots`: for each source, the `(original_basename, walk_root)` pair.
-    /// - `original_basename`: the basename used in snapshot item paths (from the
-    ///   raw configured source path, before canonicalization).
-    /// - `walk_root`: the absolute path the walker uses to construct abs_paths
-    ///   (canonicalized, matching what cache lookups will see at runtime).
-    ///
-    /// In single-path mode, only the walk_root of the first entry is used.
-    pub fn new(walk_roots: Vec<(String, String)>, multi_path: bool) -> Self {
+    /// Create a builder from a list of `ParentReuseRoot`s. Each root carries
+    /// the canonical filesystem root plus its emission policy, so inversion
+    /// is uniform across SkipRoot / EmitRoot / EmitRoot-with-empty-remainder
+    /// cases.
+    pub fn new(roots: Vec<ParentReuseRoot>) -> Self {
         Self {
             entries: HashMap::new(),
-            walk_roots,
-            multi_path,
+            roots,
             legacy_abort: false,
         }
     }
@@ -583,7 +611,7 @@ impl ParentReuseBuilder {
             return false;
         };
 
-        let abs_path = reconstruct_abs_path(&item.path, &self.walk_roots, self.multi_path);
+        let abs_path = reconstruct_abs_path(&item.path, &self.roots);
         self.entries.insert(
             hash_path(&abs_path),
             ParentEntry {
@@ -629,40 +657,19 @@ impl ParentReuseIndex {
 }
 
 /// Reconstruct the absolute path that the walker will use for cache lookups,
-/// given a snapshot item path and the `(original_basename, walk_root)` pairs.
+/// given a snapshot item path and a list of `ParentReuseRoot`s. Returns the
+/// first root that matches — duplicate basenames are rejected up front at
+/// source resolution, so first-match is unambiguous for current snapshots.
 ///
 /// Uses `Path::join` + `to_string_lossy` to produce the same string form
 /// as the walker's `abs_path.to_string_lossy()`.
-fn reconstruct_abs_path(
-    item_path: &str,
-    walk_roots: &[(String, String)],
-    multi_path: bool,
-) -> String {
-    if multi_path {
-        // In multi-path mode, item.path has a basename prefix: "docs/a.txt"
-        // where "docs" is the original basename of the configured source path
-        // (before canonicalization). Match against the original_basename and
-        // join with the walk_root (the canonicalized path the walker uses).
-        if let Some(slash_pos) = item_path.find('/') {
-            let prefix = &item_path[..slash_pos];
-            let rel = &item_path[slash_pos + 1..];
-            for (basename, walk_root) in walk_roots {
-                if basename == prefix {
-                    return Path::new(walk_root).join(rel).to_string_lossy().to_string();
-                }
-            }
+fn reconstruct_abs_path(item_path: &str, roots: &[ParentReuseRoot]) -> String {
+    for root in roots {
+        if let Some(abs) = root.invert(item_path) {
+            return abs.to_string_lossy().to_string();
         }
-        // Fallback: can't reconstruct — use item path as-is (won't match).
-        item_path.to_string()
-    } else if let Some((_basename, walk_root)) = walk_roots.first() {
-        // Single-path: join with the walk root.
-        Path::new(walk_root)
-            .join(item_path)
-            .to_string_lossy()
-            .to_string()
-    } else {
-        item_path.to_string()
     }
+    item_path.to_string()
 }
 
 #[cfg(test)]
@@ -1151,13 +1158,14 @@ mod tests {
     }
 
     /// Helper: build a ParentReuseIndex from a Vec<Item> using the builder.
-    /// Accepts raw source paths and derives walk_roots (basename = walk_root basename).
+    /// Accepts raw source paths and derives ParentReuseRoot (basename =
+    /// last component of the path).
     fn build_parent_index(
         items: Vec<Item>,
         source_paths: &[String],
         multi_path: bool,
     ) -> Option<ParentReuseIndex> {
-        let walk_roots: Vec<(String, String)> = source_paths
+        let parent_roots: Vec<ParentReuseRoot> = source_paths
             .iter()
             .map(|sp| {
                 let p = Path::new(sp);
@@ -1165,10 +1173,18 @@ mod tests {
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_else(|| sp.clone());
-                (basename, sp.clone())
+                let policy = if multi_path {
+                    ParentReusePolicy::EmitRoot { basename }
+                } else {
+                    ParentReusePolicy::SkipRoot
+                };
+                ParentReuseRoot {
+                    abs_root: sp.clone(),
+                    policy,
+                }
             })
             .collect();
-        let mut builder = ParentReuseBuilder::new(walk_roots, multi_path);
+        let mut builder = ParentReuseBuilder::new(parent_roots);
         for item in items {
             builder.push(item);
         }
@@ -1323,38 +1339,51 @@ mod tests {
             .is_some());
     }
 
+    fn skiproot(abs_root: &str) -> ParentReuseRoot {
+        ParentReuseRoot {
+            abs_root: abs_root.to_string(),
+            policy: ParentReusePolicy::SkipRoot,
+        }
+    }
+
+    fn emitroot(abs_root: &str, basename: &str) -> ParentReuseRoot {
+        ParentReuseRoot {
+            abs_root: abs_root.to_string(),
+            policy: ParentReusePolicy::EmitRoot {
+                basename: basename.to_string(),
+            },
+        }
+    }
+
     #[test]
     fn reconstruct_abs_path_single() {
-        let roots = vec![("data".into(), "/data".into())];
-        let p = reconstruct_abs_path("dir/file.txt", &roots, false);
+        let roots = vec![skiproot("/data")];
+        let p = reconstruct_abs_path("dir/file.txt", &roots);
         assert_eq!(p, native_join("/data", "dir/file.txt"));
     }
 
     #[test]
     fn reconstruct_abs_path_single_trailing_slash() {
         // Trailing slash in walk_root must not produce double-slash.
-        let roots = vec![("data".into(), "/data/".into())];
-        let p = reconstruct_abs_path("dir/file.txt", &roots, false);
+        let roots = vec![skiproot("/data/")];
+        let p = reconstruct_abs_path("dir/file.txt", &roots);
         assert_eq!(p, native_join("/data/", "dir/file.txt"));
     }
 
     #[test]
     fn reconstruct_abs_path_multi() {
-        let roots = vec![
-            ("data".into(), "/mnt/data".into()),
-            ("home".into(), "/mnt/home".into()),
-        ];
-        let p = reconstruct_abs_path("data/sub/file.txt", &roots, true);
+        let roots = vec![emitroot("/mnt/data", "data"), emitroot("/mnt/home", "home")];
+        let p = reconstruct_abs_path("data/sub/file.txt", &roots);
         assert_eq!(p, native_join("/mnt/data", "sub/file.txt"));
     }
 
     #[test]
     fn reconstruct_abs_path_multi_trailing_slash() {
         let roots = vec![
-            ("data".into(), "/mnt/data/".into()),
-            ("home".into(), "/mnt/home/".into()),
+            emitroot("/mnt/data/", "data"),
+            emitroot("/mnt/home/", "home"),
         ];
-        let p = reconstruct_abs_path("data/sub/file.txt", &roots, true);
+        let p = reconstruct_abs_path("data/sub/file.txt", &roots);
         assert_eq!(p, native_join("/mnt/data/", "sub/file.txt"));
     }
 
@@ -1363,11 +1392,48 @@ mod tests {
         // Symlink: docs -> /mnt/real-docs. The snapshot uses "docs" as prefix
         // (original basename), but the walk root is the canonicalized target.
         let roots = vec![
-            ("docs".into(), "/mnt/real-docs".into()),
-            ("config".into(), "/etc".into()),
+            emitroot("/mnt/real-docs", "docs"),
+            emitroot("/etc", "config"),
         ];
-        let p = reconstruct_abs_path("docs/readme.txt", &roots, true);
+        let p = reconstruct_abs_path("docs/readme.txt", &roots);
         assert_eq!(p, native_join("/mnt/real-docs", "readme.txt"));
+    }
+
+    #[test]
+    fn parent_reuse_file_source_inversion() {
+        // File source: EmitRoot with empty remainder. item_path == basename
+        // → abs_root is returned as-is (no trailing component).
+        let root = emitroot("/data/notes.txt", "notes.txt");
+        let abs = root.invert("notes.txt").unwrap();
+        assert_eq!(abs, PathBuf::from("/data/notes.txt"));
+
+        // And longer paths don't falsely match.
+        assert!(root.invert("notes.txt.bak").is_none());
+        assert!(root.invert("notesXtxt").is_none());
+    }
+
+    #[test]
+    fn parent_reuse_skiproot_inversion() {
+        let root = skiproot("/data");
+        let abs = root.invert("dir/file.txt").unwrap();
+        assert_eq!(abs.to_string_lossy(), native_join("/data", "dir/file.txt"));
+    }
+
+    #[test]
+    fn parent_reuse_multi_root_dispatches_correctly() {
+        let roots = vec![emitroot("/mnt/data", "data"), emitroot("/mnt/home", "home")];
+        let d = reconstruct_abs_path("data/file.txt", &roots);
+        assert_eq!(d, native_join("/mnt/data", "file.txt"));
+        let h = reconstruct_abs_path("home/file.txt", &roots);
+        assert_eq!(h, native_join("/mnt/home", "file.txt"));
+    }
+
+    #[test]
+    fn parent_reuse_unknown_path_returns_none() {
+        let roots = vec![emitroot("/mnt/data", "data")];
+        // A path whose prefix matches no root falls back to item_path as-is.
+        let out = reconstruct_abs_path("other/file.txt", &roots);
+        assert_eq!(out, "other/file.txt");
     }
 
     // ── Per-path section tests ──────────────────────────────────────────

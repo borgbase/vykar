@@ -153,6 +153,15 @@ pub struct FileCache {
     active_keys: Vec<String>,
 }
 
+/// Structured outcome of decoding an on-disk cache blob. `load` matches on
+/// this so a rejected-to-empty result does not masquerade as a legitimately
+/// empty decode in the logs.
+enum CacheDecode {
+    Loaded(FileCache),
+    Rejected { reason: &'static str },
+    Malformed { error: String },
+}
+
 impl FileCache {
     pub fn new() -> Self {
         Self {
@@ -376,47 +385,46 @@ impl FileCache {
         self.sections.values().all(|s| s.entries.is_empty())
     }
 
-    /// Maximum plausible cache entries per byte of plaintext.
-    /// Each serialized entry is at least ~40 bytes (16-byte key + metadata).
+    /// Minimum plaintext bytes per serialized entry. Used as a post-decode
+    /// plausibility ratio (16-byte key + metadata ≥ ~40 bytes).
     const MIN_BYTES_PER_ENTRY: usize = 40;
 
-    /// Decode from msgpack plaintext. Old format (flat HashMap) returns empty
-    /// cache for one-time migration.
+    /// Decode from msgpack plaintext. Old format (flat HashMap) and bogus
+    /// input collapse to an empty cache so the one-time migration path is
+    /// non-fatal.
     ///
-    /// Applies a safety cap: rejects caches that claim more entries than the
-    /// plaintext could possibly encode, preventing allocation bombs from
-    /// corrupted local cache files.
+    /// Thin wrapper over the private `decode_from_plaintext_outcome` helper
+    /// for callers that only need a `FileCache` and can treat rejected and
+    /// malformed input alike as "start fresh".
     pub fn decode_from_plaintext(plaintext: &[u8]) -> Result<Self> {
-        // Reject absurdly large inputs early (256 MiB should cover any real cache).
-        if plaintext.len() > 256 * 1024 * 1024 {
-            debug!(
-                "file cache: plaintext too large ({}), starting fresh",
-                plaintext.len()
-            );
-            return Ok(Self::new());
-        }
+        Ok(match Self::decode_from_plaintext_outcome(plaintext) {
+            CacheDecode::Loaded(cache) => cache,
+            CacheDecode::Rejected { .. } | CacheDecode::Malformed { .. } => Self::new(),
+        })
+    }
 
+    /// Structured decode: lets callers distinguish "decoded fine" from
+    /// "rejected to empty" from "malformed input", so log sites aren't
+    /// forced to claim every empty cache was legitimately empty.
+    ///
+    /// The ratio check below runs *after* `rmp_serde::from_slice` has
+    /// already allocated, so it doesn't prevent allocation — it only
+    /// catches msgpack containers whose inflated length headers rmp_serde
+    /// happened to fill with garbage.
+    fn decode_from_plaintext_outcome(plaintext: &[u8]) -> CacheDecode {
         match rmp_serde::from_slice::<FileCache>(plaintext) {
             Ok(cache) => {
-                // Post-decode sanity: reject if total entry count exceeds what
-                // the plaintext could encode. This catches msgpack containers
-                // with inflated length headers that rmp_serde happened to fill.
                 let max_entries = plaintext.len() / Self::MIN_BYTES_PER_ENTRY;
                 if cache.len() > max_entries {
-                    debug!(
-                        entries = cache.len(),
-                        max_entries,
-                        "file cache: entry count exceeds plausible limit, starting fresh"
-                    );
-                    return Ok(Self::new());
+                    return CacheDecode::Rejected {
+                        reason: "entry count exceeds plausible ratio",
+                    };
                 }
-                Ok(cache)
+                CacheDecode::Loaded(cache)
             }
-            Err(_) => {
-                // Old format or corrupted — return empty cache.
-                debug!("file cache: failed to decode, starting fresh");
-                Ok(Self::new())
-            }
+            Err(e) => CacheDecode::Malformed {
+                error: e.to_string(),
+            },
         }
     }
 
@@ -456,8 +464,8 @@ impl FileCache {
                 }
             }
         };
-        match Self::decode_from_plaintext(&plaintext) {
-            Ok(cache) => {
+        match Self::decode_from_plaintext_outcome(&plaintext) {
+            CacheDecode::Loaded(cache) => {
                 let total_entries: usize = cache.sections.values().map(|s| s.entries.len()).sum();
                 info!(
                     sections = cache.sections.len(),
@@ -474,8 +482,22 @@ impl FileCache {
                 }
                 cache
             }
-            Err(e) => {
-                warn!(error = %e, "file cache: failed to deserialize, starting fresh");
+            CacheDecode::Rejected { reason } => {
+                info!(
+                    path = %path.display(),
+                    plaintext_bytes = plaintext.len(),
+                    reason,
+                    "file cache rejected, starting fresh"
+                );
+                Self::new()
+            }
+            CacheDecode::Malformed { error } => {
+                warn!(
+                    path = %path.display(),
+                    plaintext_bytes = plaintext.len(),
+                    error,
+                    "file cache: failed to deserialize (corrupt or legacy format?), starting fresh"
+                );
                 Self::new()
             }
         }

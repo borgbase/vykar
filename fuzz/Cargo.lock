@@ -1810,7 +1810,7 @@ dependencies = [
 
 [[package]]
 name = "vykar-core"
-version = "0.12.13"
+version = "0.12.15"
 dependencies = [
  "blake2",
  "chrono",
@@ -1848,7 +1848,7 @@ dependencies = [
 
 [[package]]
 name = "vykar-crypto"
-version = "0.12.13"
+version = "0.12.15"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -1880,14 +1880,14 @@ dependencies = [
 
 [[package]]
 name = "vykar-protocol"
-version = "0.12.13"
+version = "0.12.15"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "vykar-storage"
-version = "0.12.13"
+version = "0.12.15"
 dependencies = [
  "base64",
  "blake2",
@@ -1910,7 +1910,7 @@ dependencies = [
 
 [[package]]
 name = "vykar-types"
-version = "0.12.13"
+version = "0.12.15"
 dependencies = [
  "blake2",
  "hex",

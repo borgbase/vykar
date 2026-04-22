@@ -1,4 +1,4 @@
-use chrono::{DateTime, Local};
+use chrono::{DateTime, Local, Utc};
 use vykar_core::app::operations;
 use vykar_core::commands::init;
 use vykar_types::error::VykarError;
@@ -12,6 +12,25 @@ use crate::APP_TITLE;
 use vykar_common::display::{format_bytes, format_count};
 
 use super::WorkerContext;
+
+fn format_last_snapshot(t: Option<DateTime<Utc>>) -> String {
+    let Some(t) = t else {
+        return "N/A".to_string();
+    };
+    let secs = (Utc::now() - t).num_seconds();
+    if secs < 0 {
+        return t.with_timezone(&Local).format("%Y-%m-%d %H:%M").to_string();
+    }
+    if secs < 60 {
+        "just now".to_string()
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h ago", secs / 3600)
+    } else {
+        format!("{}d ago", secs / 86_400)
+    }
+}
 
 pub(super) fn handle_fetch_all_repo_info(ctx: &mut WorkerContext) {
     let _ = ctx
@@ -43,20 +62,12 @@ pub(super) fn handle_fetch_all_repo_info(ctx: &mut WorkerContext) {
             passphrase.as_deref().map(|s| s.as_str()),
         ) {
             Ok(stats) => {
-                let last_snapshot = stats
-                    .last_snapshot_time
-                    .map(|t| {
-                        let local: DateTime<Local> = t.with_timezone(&Local);
-                        local.format("%Y-%m-%d %H:%M:%S").to_string()
-                    })
-                    .unwrap_or_else(|| "N/A".to_string());
-
                 items.push(RepoInfoData {
                     name: repo_name.clone(),
                     url,
                     snapshots: stats.snapshot_count.to_string(),
-                    last_snapshot,
-                    size: format_bytes(stats.deduplicated_size),
+                    last_snapshot: format_last_snapshot(stats.last_snapshot_time),
+                    size: format_bytes(stats.unique_stored_size),
                 });
                 labels.push(repo_name);
             }
@@ -165,19 +176,12 @@ pub(super) fn handle_fetch_all_repo_info(ctx: &mut WorkerContext) {
                             &repo.config,
                             retry_pass.as_deref().map(|s| s.as_str()),
                         ) {
-                            let last_snapshot = stats
-                                .last_snapshot_time
-                                .map(|t| {
-                                    let local: DateTime<Local> = t.with_timezone(&Local);
-                                    local.format("%Y-%m-%d %H:%M:%S").to_string()
-                                })
-                                .unwrap_or_else(|| "N/A".to_string());
                             items.push(RepoInfoData {
                                 name: repo_name.clone(),
                                 url: url.clone(),
                                 snapshots: stats.snapshot_count.to_string(),
-                                last_snapshot,
-                                size: format_bytes(stats.deduplicated_size),
+                                last_snapshot: format_last_snapshot(stats.last_snapshot_time),
+                                size: format_bytes(stats.unique_stored_size),
                             });
                             labels.push(repo_name);
                         }
@@ -232,15 +236,6 @@ pub(super) fn handle_refresh_snapshots(ctx: &mut WorkerContext, repo_selector: S
                 snapshots.sort_by_key(|(s, _)| s.time);
                 for (s, stats) in snapshots {
                     let ts: DateTime<Local> = s.time.with_timezone(&Local);
-                    let sources = if s.source_paths.is_empty() {
-                        if s.source_label.is_empty() {
-                            "-".to_string()
-                        } else {
-                            s.source_label.clone()
-                        }
-                    } else {
-                        s.source_paths.join("\n")
-                    };
                     let label = if s.source_label.is_empty() {
                         "-".to_string()
                     } else {
@@ -264,7 +259,6 @@ pub(super) fn handle_refresh_snapshots(ctx: &mut WorkerContext, repo_selector: S
                         id: s.name.clone(),
                         hostname,
                         time_str: ts.format("%Y-%m-%d %H:%M:%S").to_string(),
-                        source: sources,
                         label,
                         files,
                         size,

@@ -42,6 +42,9 @@ pub(crate) enum AppCommand {
         repo_name: String,
         snapshot_name: String,
     },
+    PruneRepo {
+        repo_name: String,
+    },
     FindFiles {
         repo_name: String,
         name_pattern: String,
@@ -70,7 +73,6 @@ pub(crate) struct SnapshotRowData {
     pub id: String,
     pub hostname: String,
     pub time_str: String,
-    pub source: String,
     pub label: String,
     pub files: String,
     pub size: String,
@@ -86,6 +88,8 @@ pub(crate) struct SourceInfoData {
     pub paths: String,
     pub excludes: String,
     pub target_repos: String,
+    /// Resolved list of repo names the source targets. Empty means "all repos".
+    pub target_repo_names: Vec<String>,
     pub detail_paths: String,
     pub detail_excludes: String,
     pub detail_exclude_if_present: String,
@@ -116,7 +120,7 @@ pub(crate) enum UiEvent {
     },
     ConfigInfo {
         path: String,
-        schedule: String,
+        schedule_brief: String,
     },
     RepoNames(Vec<String>),
     RepoModelData {
@@ -145,9 +149,7 @@ pub(crate) enum UiEvent {
     },
     ConfigText(String),
     ConfigSaveError(String),
-    OperationStarted {
-        cancellable: bool,
-    },
+    OperationStarted,
     OperationFinished,
     Quit,
     ShowWindow,

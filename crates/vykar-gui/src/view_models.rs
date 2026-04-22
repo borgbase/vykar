@@ -1,12 +1,12 @@
 use std::sync::{Arc, Mutex};
 
 use crossbeam_channel::Sender;
-use slint::{ComponentHandle, ModelRc, SharedString, StandardListViewItem, VecModel};
+use slint::{ComponentHandle, Model, ModelRc, SharedString, StandardListViewItem, VecModel};
 use vykar_core::config::ResolvedRepo;
 
 use crate::messages::{SnapshotRowData, SourceInfoData, UiEvent};
 use crate::repo_helpers::format_repo_name;
-use crate::{AppData, MainWindow};
+use crate::{AppData, MainWindow, SourceInfo};
 
 pub(crate) fn to_table_model(rows: Vec<Vec<String>>) -> ModelRc<ModelRc<StandardListViewItem>> {
     let outer: Vec<ModelRc<StandardListViewItem>> = rows
@@ -40,20 +40,19 @@ pub(crate) fn sort_snapshot_table(
         return;
     };
 
-    // Columns: 0=ID, 1=Host, 2=Time, 3=Source, 4=Label, 5=Files, 6=Size
+    // Columns: 0=ID, 1=Host, 2=Time, 3=Label, 4=Files, 5=Size
     match col_idx {
         0 => data.sort_by(|a, b| a.id.cmp(&b.id)),
         1 => data.sort_by(|a, b| a.hostname.cmp(&b.hostname)),
         2 => data.sort_by_key(|a| a.time_epoch),
-        3 => data.sort_by(|a, b| a.source.cmp(&b.source)),
-        4 => data.sort_by(|a, b| a.label.cmp(&b.label)),
-        5 => data.sort_by(|a, b| match (a.nfiles, b.nfiles) {
+        3 => data.sort_by(|a, b| a.label.cmp(&b.label)),
+        4 => data.sort_by(|a, b| match (a.nfiles, b.nfiles) {
             (Some(a), Some(b)) => a.cmp(&b),
             (Some(_), None) => std::cmp::Ordering::Less,
             (None, Some(_)) => std::cmp::Ordering::Greater,
             (None, None) => std::cmp::Ordering::Equal,
         }),
-        6 => data.sort_by(|a, b| match (a.size_bytes, b.size_bytes) {
+        5 => data.sort_by(|a, b| match (a.size_bytes, b.size_bytes) {
             (Some(a), Some(b)) => a.cmp(&b),
             (Some(_), None) => std::cmp::Ordering::Less,
             (None, Some(_)) => std::cmp::Ordering::Greater,
@@ -79,7 +78,6 @@ pub(crate) fn sort_snapshot_table(
                 d.id.clone(),
                 d.hostname.clone(),
                 d.time_str.clone(),
-                d.source.clone(),
                 d.label.clone(),
                 d.files.clone(),
                 d.size.clone(),
@@ -163,6 +161,7 @@ pub(crate) fn build_source_model_data(
                 paths: source.paths.join(", "),
                 excludes: source.exclude.join(", "),
                 target_repos: target,
+                target_repo_names: source.repos.clone(),
                 detail_paths: source.paths.join("\n"),
                 detail_excludes: source.exclude.join("\n"),
                 detail_exclude_if_present: source.exclude_if_present.join("\n"),
@@ -183,9 +182,127 @@ pub(crate) fn build_source_model_data(
     (items, labels)
 }
 
+/// Look up the currently selected repo name from AppData.repo_labels.
+pub(crate) fn current_repo_name(ui: &MainWindow) -> Option<String> {
+    let idx = ui.get_current_repo_index();
+    if idx < 0 {
+        return None;
+    }
+    let labels = ui.global::<AppData>().get_repo_labels();
+    labels.row_data(idx as usize).map(|s| s.to_string())
+}
+
+fn source_info_from_data(d: &SourceInfoData) -> SourceInfo {
+    SourceInfo {
+        label: d.label.clone().into(),
+        paths: d.paths.clone().into(),
+        excludes: d.excludes.clone().into(),
+        target_repos: d.target_repos.clone().into(),
+        expanded: false,
+        detail_paths: d.detail_paths.clone().into(),
+        detail_excludes: d.detail_excludes.clone().into(),
+        detail_exclude_if_present: d.detail_exclude_if_present.clone().into(),
+        detail_flags: d.detail_flags.clone().into(),
+        detail_hooks: d.detail_hooks.clone().into(),
+        detail_retention: d.detail_retention.clone().into(),
+        detail_command_dumps: d.detail_command_dumps.clone().into(),
+    }
+}
+
+/// Build the per-repo sources model: those targeting the given repo, or all repos.
+pub(crate) fn build_repo_source_model(
+    items: &[SourceInfoData],
+    current_repo: Option<&str>,
+) -> Vec<SourceInfo> {
+    items
+        .iter()
+        .filter(|d| {
+            d.target_repo_names.is_empty()
+                || current_repo
+                    .map(|r| d.target_repo_names.iter().any(|n| n == r))
+                    .unwrap_or(false)
+        })
+        .map(source_info_from_data)
+        .collect()
+}
+
 pub(crate) fn send_structured_data(ui_tx: &Sender<UiEvent>, repos: &[ResolvedRepo]) {
     let _ = ui_tx.send(UiEvent::RepoNames(collect_repo_names(repos)));
 
     let (items, labels) = build_source_model_data(repos);
     let _ = ui_tx.send(UiEvent::SourceModelData { items, labels });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn source(label: &str, target_repo_names: &[&str]) -> SourceInfoData {
+        SourceInfoData {
+            label: label.to_string(),
+            paths: String::new(),
+            excludes: String::new(),
+            target_repos: target_repo_names.join(", "),
+            target_repo_names: target_repo_names.iter().map(|s| (*s).to_string()).collect(),
+            detail_paths: String::new(),
+            detail_excludes: String::new(),
+            detail_exclude_if_present: String::new(),
+            detail_flags: String::new(),
+            detail_hooks: String::new(),
+            detail_retention: String::new(),
+            detail_command_dumps: String::new(),
+        }
+    }
+
+    fn labels_of(model: &[SourceInfo]) -> Vec<String> {
+        model.iter().map(|s| s.label.to_string()).collect()
+    }
+
+    #[test]
+    fn empty_target_list_means_all_repos() {
+        // Sources without a targets list appear for every repo, and also when
+        // no repo is selected.
+        let items = vec![source("everywhere", &[])];
+        assert_eq!(
+            labels_of(&build_repo_source_model(&items, None)),
+            ["everywhere"]
+        );
+        assert_eq!(
+            labels_of(&build_repo_source_model(&items, Some("any-repo"))),
+            ["everywhere"]
+        );
+    }
+
+    #[test]
+    fn target_list_filters_by_current_repo() {
+        let items = vec![
+            source("docs", &["main"]),
+            source("photos", &["main", "offsite"]),
+            source("vm", &["offsite"]),
+        ];
+        assert_eq!(
+            labels_of(&build_repo_source_model(&items, Some("main"))),
+            ["docs", "photos"]
+        );
+        assert_eq!(
+            labels_of(&build_repo_source_model(&items, Some("offsite"))),
+            ["photos", "vm"]
+        );
+    }
+
+    #[test]
+    fn unmatched_repo_hides_targeted_sources() {
+        let items = vec![source("docs", &["main"]), source("any", &[])];
+        // "any" is still visible (empty target = all); "docs" is filtered out.
+        assert_eq!(
+            labels_of(&build_repo_source_model(&items, Some("other"))),
+            ["any"]
+        );
+    }
+
+    #[test]
+    fn no_selected_repo_shows_only_untargeted_sources() {
+        let items = vec![source("docs", &["main"]), source("any", &[])];
+        assert_eq!(labels_of(&build_repo_source_model(&items, None)), ["any"]);
+    }
 }

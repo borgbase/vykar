@@ -1,0 +1,70 @@
+import { VerticalBox, HorizontalBox, Button, StandardTableView, Palette } from "std-widgets.slint";
+
+export component SnapshotsPage inherits Rectangle {
+    in property <string> repo_name;
+    in property <[[StandardListViewItem]]> snapshot_rows;
+    in property <bool> operation_busy;
+
+    callback refresh_clicked();
+    callback prune_clicked();
+    callback restore_row(int);
+    callback delete_row(int);
+    callback sort_ascending(int);
+    callback sort_descending(int);
+
+    VerticalBox {
+        padding: 12px;
+        spacing: 8px;
+
+        HorizontalBox {
+            padding: 0px;
+            spacing: 8px;
+            Text {
+                text: root.repo_name != "" ? "Snapshots in " + root.repo_name : "Snapshots";
+                vertical-alignment: center;
+                font-weight: 700;
+                horizontal-stretch: 1;
+            }
+            Button {
+                text: "Refresh";
+                enabled: !root.operation_busy;
+                clicked => { root.refresh_clicked(); }
+            }
+            Button {
+                text: "Prune";
+                enabled: !root.operation_busy;
+                clicked => { root.prune_clicked(); }
+            }
+        }
+
+        snapshot-table := StandardTableView {
+            vertical-stretch: 1;
+            columns: [
+                { title: "ID" },
+                { title: "Host" },
+                { title: "Time" },
+                { title: "Label" },
+                { title: "Files" },
+                { title: "Size" },
+            ];
+            rows: root.snapshot_rows;
+            sort-ascending(col-idx) => { root.sort_ascending(col-idx); }
+            sort-descending(col-idx) => { root.sort_descending(col-idx); }
+        }
+
+        HorizontalBox {
+            padding: 0px;
+            spacing: 8px;
+            Button {
+                text: "Restore Selected Snapshot";
+                enabled: !root.operation_busy;
+                clicked => { root.restore_row(snapshot-table.current-row); }
+            }
+            Button {
+                text: "Delete Selected Snapshot";
+                enabled: !root.operation_busy;
+                clicked => { root.delete_row(snapshot-table.current-row); }
+            }
+        }
+    }
+}

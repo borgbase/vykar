@@ -1,0 +1,33 @@
+// Keep in sync with `state::Page` in Rust.
+export enum Page {
+    overview,
+    snapshots,
+    find,
+    sources,
+    advanced,
+    log,
+    settings,
+}
+
+export struct RepoInfo {
+    name: string,
+    url: string,
+    snapshots: string,
+    last_snapshot: string,
+    size: string,
+}
+
+export struct SourceInfo {
+    label: string,
+    paths: string,
+    excludes: string,
+    target_repos: string,
+    expanded: bool,
+    detail_paths: string,
+    detail_excludes: string,
+    detail_exclude_if_present: string,
+    detail_flags: string,
+    detail_hooks: string,
+    detail_retention: string,
+    detail_command_dumps: string,
+}

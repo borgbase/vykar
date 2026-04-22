@@ -1,0 +1,184 @@
+import { Palette } from "std-widgets.slint";
+
+export component SideBarSection inherits VerticalLayout {
+    in property <string> title;
+
+    spacing: 2px;
+
+    Text {
+        text: root.title;
+        font-size: 10px;
+        font-weight: 700;
+        color: #888888;
+        horizontal-alignment: left;
+    }
+
+    @children
+}
+
+export component SideBarItem inherits Rectangle {
+    in property <bool> selected;
+    in property <string> text;
+    in property <int> count: 0;
+
+    callback clicked <=> touch.clicked;
+
+    min-height: 28px;
+    border-radius: 4px;
+
+    states [
+        pressed when touch.pressed: {
+            state.opacity: 0.35;
+        }
+        selected when root.selected: {
+            state.opacity: 0.28;
+        }
+        hover when touch.has-hover: {
+            state.opacity: 0.15;
+        }
+    ]
+
+    state := Rectangle {
+        opacity: 0;
+        background: Palette.foreground;
+        border-radius: 4px;
+        animate opacity { duration: 120ms; }
+    }
+
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+        spacing: 6px;
+
+        Text {
+            text: root.text;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+            font-weight: root.selected ? 700 : 400;
+            overflow: elide;
+        }
+
+        if root.count > 0: Text {
+            text: root.count;
+            vertical-alignment: center;
+            color: #888888;
+            font-size: 11px;
+        }
+    }
+
+    touch := TouchArea {
+        width: 100%;
+        height: 100%;
+        mouse-cursor: pointer;
+    }
+}
+
+export component SideBarSubItem inherits Rectangle {
+    in property <bool> selected;
+    in property <string> text;
+    in property <string> glyph: "";
+    in property <int> count: 0;
+
+    callback clicked <=> touch.clicked;
+
+    min-height: 24px;
+    border-radius: 4px;
+
+    states [
+        pressed when touch.pressed: {
+            state.opacity: 0.30;
+        }
+        selected when root.selected: {
+            state.opacity: 0.22;
+        }
+        hover when touch.has-hover: {
+            state.opacity: 0.12;
+        }
+    ]
+
+    state := Rectangle {
+        opacity: 0;
+        background: Palette.foreground;
+        border-radius: 4px;
+        animate opacity { duration: 120ms; }
+    }
+
+    HorizontalLayout {
+        padding-left: 26px;
+        padding-right: 10px;
+        spacing: 6px;
+
+        if root.glyph != "": Text {
+            text: root.glyph;
+            vertical-alignment: center;
+            width: 14px;
+            font-size: 11px;
+            color: #888888;
+        }
+
+        Text {
+            text: root.text;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+            font-size: 12px;
+            font-weight: root.selected ? 700 : 400;
+            overflow: elide;
+        }
+
+        if root.count > 0: Text {
+            text: root.count;
+            vertical-alignment: center;
+            color: #888888;
+            font-size: 11px;
+        }
+    }
+
+    touch := TouchArea {
+        width: 100%;
+        height: 100%;
+        mouse-cursor: pointer;
+    }
+}
+
+export component SideBarActionRow inherits Rectangle {
+    in property <string> text;
+
+    callback clicked <=> touch.clicked;
+
+    min-height: 26px;
+    border-radius: 4px;
+
+    states [
+        pressed when touch.pressed: {
+            state.opacity: 0.30;
+        }
+        hover when touch.has-hover: {
+            state.opacity: 0.15;
+        }
+    ]
+
+    state := Rectangle {
+        opacity: 0;
+        background: #4a90d9;
+        border-radius: 4px;
+        animate opacity { duration: 120ms; }
+    }
+
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+
+        Text {
+            text: root.text;
+            vertical-alignment: center;
+            color: #4a90d9;
+            font-size: 12px;
+        }
+    }
+
+    touch := TouchArea {
+        width: 100%;
+        height: 100%;
+        mouse-cursor: pointer;
+    }
+}

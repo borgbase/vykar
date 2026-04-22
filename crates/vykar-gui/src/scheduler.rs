@@ -46,16 +46,16 @@ impl Default for SchedulerState {
     }
 }
 
-pub(crate) fn schedule_description(schedule: &ScheduleConfig, paused: bool) -> String {
-    let timing = if let Some(ref cron) = schedule.cron {
-        format!("cron={cron}")
-    } else {
-        format!("every={}", schedule.every.as_deref().unwrap_or("24h"))
-    };
-    format!(
-        "enabled={}, {timing}, on_startup={}, jitter_seconds={}, paused={}",
-        schedule.enabled, schedule.on_startup, schedule.jitter_seconds, paused,
-    )
+/// Terse schedule summary for the Overview metric card: the interval string,
+/// the cron expression, or "Off" when disabled/paused.
+pub(crate) fn schedule_brief(schedule: &ScheduleConfig, paused: bool) -> String {
+    if !schedule.enabled || paused {
+        return "Off".to_string();
+    }
+    if let Some(ref cron) = schedule.cron {
+        return cron.clone();
+    }
+    schedule.every.clone().unwrap_or_else(|| "24h".to_string())
 }
 
 pub(crate) fn spawn_scheduler(

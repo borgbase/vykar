@@ -1,30 +1,25 @@
-import { VerticalBox, HorizontalBox, Button, LineEdit, ComboBox, StandardTableView } from "std-widgets.slint";
+import { VerticalBox, HorizontalBox, Button, LineEdit, StandardTableView } from "std-widgets.slint";
 
-export component FindWindow inherits Window {
-    in-out property <[string]> repo_names: [];
-    in-out property <string> repo_combo_value;
+export component FindPage inherits Rectangle {
+    in property <string> repo_name;
     in-out property <string> name_pattern;
-    in-out property <string> status_text: "Enter a name pattern and click Search.";
-    in-out property <[[StandardListViewItem]]> result_rows: [];
+    in property <string> status_text;
+    in property <[[StandardListViewItem]]> result_rows;
 
     callback search_clicked();
-    callback close_clicked();
-
-    title: "Find Files";
-    preferred-width: 950px;
-    preferred-height: 600px;
 
     VerticalBox {
         padding: 12px;
         spacing: 8px;
 
-        // Search controls bar
         HorizontalBox {
+            padding: 0px;
             spacing: 8px;
-            Text { text: "Repository:"; vertical-alignment: center; }
-            ComboBox {
-                model: root.repo_names;
-                current-value <=> root.repo_combo_value;
+            Text {
+                text: root.repo_name != "" ? "Find in " + root.repo_name : "Find files";
+                vertical-alignment: center;
+                font-weight: 700;
+                width: 200px;
             }
             Text { text: "Name pattern:"; vertical-alignment: center; }
             LineEdit {
@@ -39,7 +34,6 @@ export component FindWindow inherits Window {
             }
         }
 
-        // Results table
         StandardTableView {
             vertical-stretch: 1;
             columns: [
@@ -52,18 +46,14 @@ export component FindWindow inherits Window {
             rows: root.result_rows;
         }
 
-        // Footer
         HorizontalBox {
+            padding: 0px;
             spacing: 8px;
             Text {
                 vertical-alignment: center;
                 text: root.status_text;
                 color: #666666;
                 horizontal-stretch: 1;
-            }
-            Button {
-                text: "Close";
-                clicked => { root.close_clicked(); }
             }
         }
     }

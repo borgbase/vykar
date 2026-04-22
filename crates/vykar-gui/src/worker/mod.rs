@@ -52,14 +52,14 @@ fn startup(ctx: &mut WorkerContext) {
     }
     let _ = ctx.sched_notify_tx.try_send(());
 
-    let schedule_desc = if ctx.scheduler_lock_held {
-        scheduler::schedule_description(&schedule, false)
+    let schedule_brief = if ctx.scheduler_lock_held {
+        scheduler::schedule_brief(&schedule, false)
     } else {
-        "disabled (external scheduler)".to_string()
+        "Off".to_string()
     };
     let _ = ctx.ui_tx.send(UiEvent::ConfigInfo {
         path: ctx.config_display_path.display().to_string(),
-        schedule: schedule_desc,
+        schedule_brief,
     });
 
     send_structured_data(&ctx.ui_tx, &ctx.runtime.repos);
@@ -141,6 +141,7 @@ pub(crate) fn run_worker(
                 repo_name,
                 snapshot_name,
             } => actions::handle_delete_snapshot(&mut ctx, repo_name, snapshot_name),
+            AppCommand::PruneRepo { repo_name } => actions::handle_prune_repo(&mut ctx, repo_name),
             AppCommand::FindFiles {
                 repo_name,
                 name_pattern,

@@ -24,7 +24,7 @@ mod tray;
 mod tray_state;
 mod view_models;
 mod worker;
-use messages::{log_entry_now, AppCommand, SnapshotRowData, UiEvent};
+use messages::{log_entry_now, AppCommand, SnapshotRowData, SourceInfoData, UiEvent};
 use repo_helpers::send_log;
 
 const APP_TITLE: &str = "Vykar Backup";
@@ -91,8 +91,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     if let (Some(w), Some(h)) = (gui_state.window_width, gui_state.window_height) {
         ui.window().set_size(slint::LogicalSize::new(w, h));
     }
+    if let Some(p) = gui_state.last_page {
+        ui.set_current_page(state::page_from_i32(p));
+    }
+    // Selection is resolved by name once RepoModelData arrives — see
+    // event_consumer. Holding the name here avoids the stale-index bug where
+    // repo filtering (failed loads, reordering, renames) leaves the saved
+    // index pointing at the wrong row.
+    let pending_repo_name: Arc<Mutex<Option<String>>> =
+        Arc::new(Mutex::new(gui_state.last_repo_name.clone()));
     ui.set_config_path("(loading...)".into());
-    ui.set_schedule_text("(loading...)".into());
     ui.set_editor_font_family(
         if cfg!(target_os = "macos") {
             "Menlo"
@@ -184,6 +192,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // snapshot_data stays as Arc<Mutex> — complex Rust struct used by sort_snapshot_table.
     let snapshot_data: Arc<Mutex<Vec<SnapshotRowData>>> = Arc::new(Mutex::new(Vec::new()));
 
+    // Raw source data, used to rebuild the per-repo filtered source model
+    // when the selected repo changes.
+    let source_cache: Arc<Mutex<Vec<SourceInfoData>>> = Arc::new(Mutex::new(Vec::new()));
+
     // ── Event consumer ──
 
     let tray_source_items: Arc<Mutex<Vec<(tray_icon::menu::MenuId, String)>>> =
@@ -194,9 +206,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         ui.as_weak(),
         app_tx.clone(),
         snapshot_data.clone(),
+        source_cache.clone(),
         last_gui_state.clone(),
         tray_source_items.clone(),
         start_in_background_pref.clone(),
+        pending_repo_name.clone(),
     );
 
     // ── Callback wiring ──
@@ -205,8 +219,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         &ui,
         app_tx.clone(),
         ui_tx_for_cancel.clone(),
-        cancel_requested.clone(),
         snapshot_data,
+        source_cache,
+        cancel_requested.clone(),
     );
 
     // ── Settings tab initialization ──
@@ -256,13 +271,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let pref = start_in_background_pref.clone();
         let ui_weak = ui.as_weak();
         let last = last_gui_state.clone();
+        let pending = pending_repo_name.clone();
         move |checked| {
             pref.store(checked, Ordering::Relaxed);
             // Capture live UI state so we never overwrite config_path / window
             // size with stale or default values.
             if let Some(s) = ui_weak
                 .upgrade()
-                .and_then(|ui| event_consumer::capture_gui_state(&ui, &pref))
+                .and_then(|ui| event_consumer::capture_gui_state(&ui, &pref, &pending))
             {
                 state::save(&s);
                 if let Ok(mut guard) = last.lock() {
@@ -278,9 +294,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let ui_weak = ui.as_weak();
         let last_gui_state = last_gui_state.clone();
         let pref = start_in_background_pref.clone();
+        let pending = pending_repo_name.clone();
         move || {
             if let Some(ui) = ui_weak.upgrade() {
-                if let Some(s) = event_consumer::capture_gui_state(&ui, &pref) {
+                if let Some(s) = event_consumer::capture_gui_state(&ui, &pref, &pending) {
                     state::save(&s);
                     if let Ok(mut last) = last_gui_state.lock() {
                         *last = Some(s);
@@ -297,9 +314,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let ui_weak = ui.as_weak();
         let last_gui_state = last_gui_state.clone();
         let pref = start_in_background_pref.clone();
+        let pending = pending_repo_name.clone();
         move || {
             if let Some(ui) = ui_weak.upgrade() {
-                if let Some(s) = event_consumer::capture_gui_state(&ui, &pref) {
+                if let Some(s) = event_consumer::capture_gui_state(&ui, &pref, &pending) {
                     state::save(&s);
                     if let Ok(mut last) = last_gui_state.lock() {
                         *last = Some(s);
@@ -360,8 +378,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Persist GUI state. Eager saves (config change, window hide) cover most
     // paths; this final capture handles Cmd-Q on macOS where the event loop
     // exits without triggering on_close_requested.
-    let final_state = event_consumer::capture_gui_state(&ui, &start_in_background_pref)
-        .or_else(|| last_gui_state.lock().ok().and_then(|g| g.clone()));
+    let final_state =
+        event_consumer::capture_gui_state(&ui, &start_in_background_pref, &pending_repo_name)
+            .or_else(|| last_gui_state.lock().ok().and_then(|g| g.clone()));
     if let Some(s) = final_state {
         state::save(&s);
     }

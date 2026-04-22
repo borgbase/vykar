@@ -1,0 +1,119 @@
+import { Button, GroupBox } from "std-widgets.slint";
+import { SourceInfo } from "types.slint";
+
+export component SourceRow inherits GroupBox {
+    in property <SourceInfo> source;
+    in property <bool> operation_busy;
+    in property <bool> show_backup: true;
+    in property <string> backup_label: "Backup";
+
+    callback toggle_expanded();
+    callback backup_clicked();
+
+    VerticalLayout {
+        spacing: 0px;
+        // Header row — always visible
+        HorizontalLayout {
+            padding: 8px;
+            spacing: 16px;
+            TouchArea {
+                horizontal-stretch: 1;
+                mouse-cursor: pointer;
+                clicked => { root.toggle_expanded(); }
+                HorizontalLayout {
+                    spacing: 12px;
+                    Text {
+                        text: root.source.expanded ? "v" : ">";
+                        vertical-alignment: center;
+                        font-size: 11px;
+                        width: 14px;
+                        color: #888888;
+                    }
+                    VerticalLayout {
+                        horizontal-stretch: 1;
+                        spacing: 4px;
+                        Text { text: root.source.label; font-weight: 700; }
+                        if !root.source.expanded: Text {
+                            text: root.source.paths;
+                            color: #888888;
+                            font-size: 11px;
+                            overflow: elide;
+                        }
+                    }
+                    if !root.source.expanded: VerticalLayout {
+                        horizontal-stretch: 0;
+                        min-width: 200px;
+                        max-width: 350px;
+                        spacing: 4px;
+                        Text {
+                            text: "Excludes: " + root.source.excludes;
+                            font-size: 11px;
+                            overflow: elide;
+                        }
+                        Text {
+                            text: "Repos: " + root.source.target_repos;
+                            font-size: 11px;
+                            color: #888888;
+                        }
+                    }
+                }
+            }
+            if root.show_backup: VerticalLayout {
+                alignment: center;
+                Button {
+                    text: root.backup_label;
+                    primary: true;
+                    enabled: !root.operation_busy;
+                    clicked => { root.backup_clicked(); }
+                }
+            }
+        }
+        // Expanded detail section
+        if root.source.expanded: VerticalLayout {
+            padding-left: 42px;
+            padding-right: 8px;
+            padding-bottom: 8px;
+            spacing: 6px;
+            VerticalLayout {
+                spacing: 2px;
+                Text { text: "Folders"; font-weight: 700; font-size: 11px; color: #888888; }
+                Text { text: root.source.detail_paths; font-size: 11px; wrap: word-wrap; }
+            }
+            if root.source.detail_excludes != "": VerticalLayout {
+                spacing: 2px;
+                Text { text: "Exclusions"; font-weight: 700; font-size: 11px; color: #888888; }
+                Text { text: root.source.detail_excludes; font-size: 11px; wrap: word-wrap; }
+            }
+            if root.source.detail_exclude_if_present != "": VerticalLayout {
+                spacing: 2px;
+                Text { text: "Exclude If Present"; font-weight: 700; font-size: 11px; color: #888888; }
+                Text { text: root.source.detail_exclude_if_present; font-size: 11px; wrap: word-wrap; }
+            }
+            if root.source.detail_flags != "": VerticalLayout {
+                spacing: 2px;
+                Text { text: "Options"; font-weight: 700; font-size: 11px; color: #888888; }
+                Text { text: root.source.detail_flags; font-size: 11px; }
+            }
+            VerticalLayout {
+                spacing: 2px;
+                Text { text: "Target Repositories"; font-weight: 700; font-size: 11px; color: #888888; }
+                Text { text: root.source.target_repos; font-size: 11px; }
+            }
+            if root.source.detail_command_dumps != "": VerticalLayout {
+                spacing: 2px;
+                Text { text: "Command Dumps"; font-weight: 700; font-size: 11px; color: #888888; }
+                Text { text: root.source.detail_command_dumps; font-size: 11px; wrap: word-wrap; }
+            }
+            if root.source.detail_hooks != "": VerticalLayout {
+                spacing: 2px;
+                Text { text: "Hooks"; font-weight: 700; font-size: 11px; color: #888888; }
+                Text { text: root.source.detail_hooks; font-size: 11px; wrap: word-wrap; }
+            }
+            if root.source.detail_retention != "": VerticalLayout {
+                spacing: 2px;
+                Text { text: "Retention"; font-weight: 700; font-size: 11px; color: #888888; }
+                Text { text: root.source.detail_retention; font-size: 11px; }
+            }
+        }
+    }
+}

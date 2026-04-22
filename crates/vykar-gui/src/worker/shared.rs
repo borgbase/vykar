@@ -13,9 +13,7 @@ use super::WorkerContext;
 pub(super) fn begin_backup_operation(ctx: &WorkerContext, status_msg: impl Into<String>) {
     ctx.cancel_requested.store(false, Ordering::SeqCst);
     ctx.backup_running.store(true, Ordering::SeqCst);
-    let _ = ctx
-        .ui_tx
-        .send(UiEvent::OperationStarted { cancellable: true });
+    let _ = ctx.ui_tx.send(UiEvent::OperationStarted);
     let _ = ctx.ui_tx.send(UiEvent::Status(status_msg.into()));
 }
 
@@ -28,9 +26,7 @@ pub(super) fn end_backup_operation(ctx: &WorkerContext) {
 
 pub(super) fn begin_ui_operation(ctx: &WorkerContext, status_msg: impl Into<String>) {
     ctx.cancel_requested.store(false, Ordering::SeqCst);
-    let _ = ctx
-        .ui_tx
-        .send(UiEvent::OperationStarted { cancellable: false });
+    let _ = ctx.ui_tx.send(UiEvent::OperationStarted);
     let _ = ctx.ui_tx.send(UiEvent::Status(status_msg.into()));
 }
 

@@ -1,0 +1,18 @@
+import { VerticalBox, StandardTableView } from "std-widgets.slint";
+
+export component LogPage inherits Rectangle {
+    in property <[[StandardListViewItem]]> log_rows;
+
+    VerticalBox {
+        padding: 12px;
+        StandardTableView {
+            vertical-stretch: 1;
+            columns: [
+                { title: "Date", width: 70px },
+                { title: "Time", width: 90px },
+                { title: "Event", horizontal-stretch: 1 },
+            ];
+            rows: root.log_rows;
+        }
+    }
+}

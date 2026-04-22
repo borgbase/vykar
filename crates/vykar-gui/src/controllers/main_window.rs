@@ -5,17 +5,39 @@ use crossbeam_channel::Sender;
 use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 
 use crate::controllers;
-use crate::messages::{AppCommand, SnapshotRowData, UiEvent};
+use crate::messages::{AppCommand, SnapshotRowData, SourceInfoData, UiEvent};
 use crate::repo_helpers::send_log;
-use crate::view_models::sort_snapshot_table;
+use crate::view_models::{
+    build_repo_source_model, current_repo_name, sort_snapshot_table, to_table_model,
+};
 use crate::{AppData, MainWindow, SourceInfo, TreeRowData};
+
+/// Toggle the `expanded` flag on a `SourceInfo` row in the given model, which
+/// must be a `VecModel<SourceInfo>`. Rebuilds the model since Slint's
+/// `ModelRc` doesn't expose mutable row access.
+fn toggle_expanded(
+    ui: &MainWindow,
+    idx: i32,
+    getter: fn(&MainWindow) -> ModelRc<SourceInfo>,
+    setter: fn(&MainWindow, ModelRc<SourceInfo>),
+) {
+    let model = getter(ui);
+    let mut items: Vec<SourceInfo> = (0..model.row_count())
+        .filter_map(|i| model.row_data(i))
+        .collect();
+    if let Some(item) = items.get_mut(idx as usize) {
+        item.expanded = !item.expanded;
+    }
+    setter(ui, ModelRc::new(VecModel::from(items)));
+}
 
 pub(crate) fn wire_callbacks(
     ui: &MainWindow,
     app_tx: Sender<AppCommand>,
     ui_tx: Sender<UiEvent>,
-    cancel_requested: Arc<AtomicBool>,
     snapshot_data: Arc<Mutex<Vec<SnapshotRowData>>>,
+    source_cache: Arc<Mutex<Vec<SourceInfoData>>>,
+    cancel_requested: Arc<AtomicBool>,
 ) {
     let tx = app_tx.clone();
     ui.on_open_config_clicked(move || {
@@ -63,39 +85,6 @@ pub(crate) fn wire_callbacks(
     });
 
     let tx = app_tx.clone();
-    ui.on_backup_all_clicked(move || {
-        let _ = tx.send(AppCommand::RunBackupAll { scheduled: false });
-    });
-
-    {
-        let cancel = cancel_requested;
-        let log_tx = ui_tx;
-        ui.on_cancel_clicked(move || {
-            cancel.store(true, Ordering::SeqCst);
-            send_log(
-                &log_tx,
-                "Cancel requested; will stop after current step completes.",
-            );
-        });
-    }
-
-    // Find Files button — lazy-create FindWindow, sync repo names, and show
-    {
-        let tx = app_tx.clone();
-        let ui_weak = ui.as_weak();
-        ui.on_find_files_clicked(move || {
-            if let (Some(fw), Some(u)) = (controllers::find::ensure_window(&tx), ui_weak.upgrade())
-            {
-                fw.set_repo_names(u.get_repo_names());
-                if fw.get_repo_combo_value().is_empty() {
-                    fw.set_repo_combo_value(u.get_snapshots_repo_combo_value());
-                }
-                let _ = fw.show();
-            }
-        });
-    }
-
-    let tx = app_tx.clone();
     let ui_weak = ui.as_weak();
     ui.on_reload_config_clicked(move || {
         if let Some(u) = ui_weak.upgrade() {
@@ -139,17 +128,44 @@ pub(crate) fn wire_callbacks(
     {
         let ui_weak = ui.as_weak();
         ui.on_toggle_source_expanded(move |idx| {
+            if let Some(ui) = ui_weak.upgrade() {
+                toggle_expanded(
+                    &ui,
+                    idx,
+                    MainWindow::get_source_model,
+                    MainWindow::set_source_model,
+                );
+            }
+        });
+    }
+
+    {
+        let ui_weak = ui.as_weak();
+        ui.on_toggle_repo_source_expanded(move |idx| {
+            if let Some(ui) = ui_weak.upgrade() {
+                toggle_expanded(
+                    &ui,
+                    idx,
+                    MainWindow::get_repo_source_model,
+                    MainWindow::set_repo_source_model,
+                );
+            }
+        });
+    }
+
+    {
+        let tx = app_tx.clone();
+        let ui_weak = ui.as_weak();
+        ui.on_backup_repo_source_clicked(move |idx| {
             let Some(ui) = ui_weak.upgrade() else {
                 return;
             };
-            let model = ui.get_source_model();
-            let mut items: Vec<SourceInfo> = (0..model.row_count())
-                .filter_map(|i| model.row_data(i))
-                .collect();
-            if let Some(item) = items.get_mut(idx as usize) {
-                item.expanded = !item.expanded;
+            let model = ui.get_repo_source_model();
+            if let Some(item) = model.row_data(idx as usize) {
+                let _ = tx.send(AppCommand::RunBackupSource {
+                    source_label: item.label.to_string(),
+                });
             }
-            ui.set_source_model(ModelRc::new(VecModel::from(items)));
         });
     }
 
@@ -159,20 +175,114 @@ pub(crate) fn wire_callbacks(
         let Some(ui) = ui_weak.upgrade() else {
             return;
         };
-        let _ = tx.send(AppCommand::RefreshSnapshots {
-            repo_selector: ui.get_snapshots_repo_combo_value().to_string(),
-        });
-    });
-
-    let tx = app_tx.clone();
-    ui.on_snapshots_repo_changed({
-        let tx = tx.clone();
-        move |value| {
+        if let Some(name) = current_repo_name(&ui) {
             let _ = tx.send(AppCommand::RefreshSnapshots {
-                repo_selector: value.to_string(),
+                repo_selector: name,
             });
         }
     });
+
+    let tx = app_tx.clone();
+    let ui_weak = ui.as_weak();
+    ui.on_prune_snapshots_clicked(move || {
+        let Some(ui) = ui_weak.upgrade() else {
+            return;
+        };
+        if let Some(name) = current_repo_name(&ui) {
+            let confirmed = tinyfiledialogs::message_box_yes_no(
+                "Prune Snapshots",
+                &format!(
+                    "Run prune on {name}? This will delete snapshots not matched by the repository's retention rules."
+                ),
+                tinyfiledialogs::MessageBoxIcon::Question,
+                tinyfiledialogs::YesNo::No,
+            );
+            if confirmed == tinyfiledialogs::YesNo::No {
+                return;
+            }
+            let _ = tx.send(AppCommand::PruneRepo { repo_name: name });
+        }
+    });
+
+    // Sidebar navigation
+    {
+        let ui_weak = ui.as_weak();
+        ui.on_select_page(move |page| {
+            if let Some(ui) = ui_weak.upgrade() {
+                ui.set_current_page(page);
+            }
+        });
+    }
+
+    {
+        let tx = app_tx.clone();
+        let ui_weak = ui.as_weak();
+        let source_cache = source_cache.clone();
+        ui.on_select_repo_and_page(move |repo_idx, page| {
+            let Some(ui) = ui_weak.upgrade() else {
+                return;
+            };
+            let prev_repo = ui.get_current_repo_index();
+            ui.set_current_repo_index(repo_idx);
+            ui.set_current_page(page);
+
+            if repo_idx != prev_repo {
+                let labels = ui.global::<AppData>().get_repo_labels();
+                if let Some(name) = labels.row_data(repo_idx as usize) {
+                    let repo_name = name.to_string();
+                    if let Ok(cache) = source_cache.lock() {
+                        let model = build_repo_source_model(&cache, Some(repo_name.as_str()));
+                        ui.set_repo_source_model(ModelRc::new(VecModel::from(model)));
+                    }
+                    let _ = tx.send(AppCommand::RefreshSnapshots {
+                        repo_selector: repo_name,
+                    });
+                }
+            }
+        });
+    }
+
+    // Cancel the current operation — mirrors the tray "Cancel" menu item.
+    {
+        let cancel = cancel_requested.clone();
+        let ui_tx = ui_tx.clone();
+        ui.on_cancel_operation_clicked(move || {
+            cancel.store(true, Ordering::SeqCst);
+            send_log(
+                &ui_tx,
+                "Cancel requested; will stop after current step completes.",
+            );
+        });
+    }
+
+    // Find page — search callback (formerly FindWindow::on_search_clicked)
+    {
+        let tx = app_tx.clone();
+        let ui_weak = ui.as_weak();
+        ui.on_find_search_clicked(move || {
+            let Some(ui) = ui_weak.upgrade() else {
+                return;
+            };
+            let pattern = ui.get_find_name_pattern().to_string();
+            let repo = match current_repo_name(&ui) {
+                Some(n) => n,
+                None => {
+                    ui.set_find_status_text("Please select a repository.".into());
+                    return;
+                }
+            };
+            if pattern.is_empty() {
+                ui.set_find_status_text("Please enter a name pattern.".into());
+                return;
+            }
+            ui.set_find_status_text("Searching...".into());
+            ui.set_find_result_rows(to_table_model(vec![]));
+            let _ = tx.send(AppCommand::FindFiles {
+                repo_name: repo,
+                name_pattern: pattern,
+            });
+        });
+    }
 
     // Snapshot sorting callbacks
     {

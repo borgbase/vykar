@@ -1,13 +1,11 @@
 import { MainWindow, RepoInfo, SourceInfo } from "main-window.slint";
 import { RestoreWindow, TreeRowData } from "restore.slint";
-import { FindWindow } from "find.slint";
 import { PasswordDialog } from "password-dialog.slint";
 
-export { MainWindow, RestoreWindow, FindWindow, PasswordDialog, RepoInfo, SourceInfo, TreeRowData }
+export { MainWindow, RestoreWindow, PasswordDialog, RepoInfo, SourceInfo, TreeRowData }
 
 export global AppData {
     // Label caches — written by event consumer, read by MainWindow callbacks.
-    // Replaces the Arc<Mutex<Vec<String>>> fields.
     in-out property <[string]> repo-labels: [];
     in-out property <[string]> source-labels: [];
     in-out property <[string]> snapshot-ids: [];

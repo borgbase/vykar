@@ -1,5 +1,6 @@
 use chrono::{DateTime, Local};
 use vykar_core::app::operations;
+use vykar_core::commands;
 use vykar_core::commands::find::{FileStatus, FindFilter, FindScope};
 
 use crate::messages::{AppCommand, FindResultRow, UiEvent};
@@ -138,6 +139,59 @@ pub(super) fn handle_delete_snapshot(
             send_log(&ctx.ui_tx, format!("[{repo_name}] delete failed: {e}"));
         }
     }
+    end_ui_operation(ctx);
+}
+
+pub(super) fn handle_prune_repo(ctx: &mut WorkerContext, repo_name: String) {
+    begin_ui_operation(ctx, "Pruning snapshots...");
+
+    let repo = match select_repo_or_log(ctx, &ctx.runtime.repos, &repo_name) {
+        Some(r) => r,
+        None => {
+            end_ui_operation(ctx);
+            return;
+        }
+    };
+
+    let passphrase = match get_or_resolve_passphrase(repo, &mut ctx.passphrases) {
+        Ok(p) => p,
+        Err(e) => {
+            send_log(&ctx.ui_tx, format!("[{repo_name}] passphrase error: {e}"));
+            end_ui_operation(ctx);
+            return;
+        }
+    };
+
+    match commands::prune::run(
+        &repo.config,
+        passphrase.as_deref().map(|s| s.as_str()),
+        false,
+        false,
+        &repo.sources,
+        &[],
+        Some(&ctx.cancel_requested),
+    ) {
+        Ok((stats, _)) => {
+            send_log(
+                &ctx.ui_tx,
+                format!(
+                    "[{repo_name}] Pruned {} snapshots (kept {}), freed {} chunks ({})",
+                    stats.pruned,
+                    stats.kept,
+                    stats.chunks_deleted,
+                    format_bytes(stats.space_freed),
+                ),
+            );
+            let _ = ctx.app_tx.send(AppCommand::RefreshSnapshots {
+                repo_selector: repo_name,
+            });
+            let _ = ctx.app_tx.send(AppCommand::FetchAllRepoInfo);
+        }
+        Err(e) => {
+            send_log(&ctx.ui_tx, format!("[{repo_name}] prune failed: {e}"));
+        }
+    }
+
     end_ui_operation(ctx);
 }
 

@@ -1,117 +1,102 @@
-import { VerticalBox, HorizontalBox, Button, LineEdit, ScrollView, TabWidget, ComboBox, StandardTableView, ListView, CheckBox, Palette, GroupBox, TextEdit } from "std-widgets.slint";
+import { VerticalBox, HorizontalBox, Button, ScrollView, Palette, StandardButton } from "std-widgets.slint";
+import { RepoInfo, SourceInfo, Page } from "components/types.slint";
+import { SideBarSection, SideBarItem, SideBarSubItem, SideBarActionRow } from "components/side_bar.slint";
+import { OverviewPage } from "pages/overview.slint";
+import { SnapshotsPage } from "pages/snapshots.slint";
+import { FindPage } from "pages/find.slint";
+import { SourcesPage } from "pages/sources.slint";
+import { AdvancedPage } from "pages/advanced.slint";
+import { LogPage } from "pages/log.slint";
+import { SettingsPage } from "pages/settings.slint";
 
-export struct RepoInfo {
-    name: string,
-    url: string,
-    snapshots: string,
-    last_snapshot: string,
-    size: string,
-}
-
-export struct SourceInfo {
-    label: string,
-    paths: string,
-    excludes: string,
-    target_repos: string,
-    expanded: bool,
-    detail_paths: string,
-    detail_excludes: string,
-    detail_exclude_if_present: string,
-    detail_flags: string,
-    detail_hooks: string,
-    detail_retention: string,
-    detail_command_dumps: string,
-}
-
-component ToolTipArea {
-    preferred-height: 100%;
-    preferred-width: 100%;
-
-    in property <string> text;
-
-    ta := TouchArea {
-        HorizontalLayout {
-            padding: 2px;
-            @children
-        }
-    }
-    Rectangle {
-        x: root.width - self.width;
-        y: root.height + 4px;
-        background: Palette.background;
-        border-width: 1px;
-        border-color: #888888;
-        border-radius: 4px;
-        opacity: ta.has-hover ? 1 : 0;
-        width: tt.preferred-width;
-        height: tt.preferred-height;
-        tt := HorizontalLayout {
-            padding: 4px;
-            Text { text: root.text; font-size: 11px; }
-        }
-    }
-}
+export { RepoInfo, SourceInfo, Page }
 
 export component MainWindow inherits Window {
     in-out property <string> config_path;
-    in-out property <string> schedule_text;
+    in-out property <string> schedule_brief;
     in-out property <string> status_text;
     in-out property <string> version_text;
     in-out property <[[StandardListViewItem]]> log_rows: [];
 
     // Operation busy state — disables all action buttons
     in-out property <bool> operation_busy: false;
-    in-out property <bool> operation_cancellable: false;
 
-    // Repo model (custom cards)
+    // Repo model — drives the sidebar REPOSITORIES section and overview
     in-out property <bool> repo_loading: true;
     in-out property <[RepoInfo]> repo_model: [];
 
-    // Source model (custom cards)
+    // Source model
     in-out property <[SourceInfo]> source_model: [];
+    // Per-repo filtered source model for the Overview page
+    in-out property <[SourceInfo]> repo_source_model: [];
 
     // Snapshot table
-    in-out property <[string]> repo_names: [];
-    in-out property <string> snapshots_repo_combo_value;
     in-out property <[[StandardListViewItem]]> snapshot_rows: [];
+    // Latest 3 snapshots (4 cols: ID / Time / Files / Size) for the Overview page
+    in-out property <[[StandardListViewItem]]> recent_snapshot_rows: [];
 
-    // Editor tab state
+    // Find state (embedded page)
+    in-out property <string> find_name_pattern;
+    in-out property <string> find_status_text: "Enter a name pattern and click Search.";
+    in-out property <[[StandardListViewItem]]> find_result_rows: [];
+
+    // Editor state (Advanced page)
     in-out property <string> editor_text: "";
     in-out property <string> editor_baseline: "";
     in-out property <string> editor_status: "";
     in-out property <bool> editor_dirty: false;
     in-out property <string> editor_font_family: "";
 
-    callback open_config_clicked();
-    callback switch_config_clicked();
-    callback save_and_apply_clicked();
-    callback discard_clicked();
-    callback backup_all_clicked();
-    callback find_files_clicked();
-    callback reload_config_clicked();
-    callback backup_repo_clicked(/* index */ int);
-    callback backup_source_clicked(/* index */ int);
-    callback toggle_source_expanded(/* index */ int);
-    callback refresh_snapshots_clicked();
-    callback restore_selected_snapshot_clicked(/* row */ int);
-    callback delete_selected_snapshot_clicked(/* row */ int);
-    callback snapshots_repo_changed(/* value */ string);
-    callback snapshot_sort_ascending(/* column */ int);
-    callback snapshot_sort_descending(/* column */ int);
-    callback cancel_clicked();
-    callback close_window();
-    callback release-focus();
+    // Navigation state — see `components/types.slint::Page` for the enum.
+    in-out property <Page> current_page: Page.overview;
+    in-out property <int> current_repo_index: 0;
+
+    // Pages scoped to a repository (sidebar sub-items appear only for these).
+    property <bool> repo_scoped_page:
+        root.current_page == Page.overview
+        || root.current_page == Page.snapshots
+        || root.current_page == Page.find;
 
     // Settings tab state
     in-out property <bool> start_at_login: false;
     in-out property <bool> start_in_background: false;
     in-out property <bool> start_in_background_enabled: true;
+
+    callback open_config_clicked();
+    callback switch_config_clicked();
+    callback save_and_apply_clicked();
+    callback discard_clicked();
+    callback reload_config_clicked();
+    callback backup_repo_clicked(/* index */ int);
+    callback backup_source_clicked(/* index */ int);
+    callback toggle_source_expanded(/* index */ int);
+    callback backup_repo_source_clicked(/* index */ int);
+    callback toggle_repo_source_expanded(/* index */ int);
+    callback refresh_snapshots_clicked();
+    callback prune_snapshots_clicked();
+    callback restore_selected_snapshot_clicked(/* row */ int);
+    callback delete_selected_snapshot_clicked(/* row */ int);
+    callback snapshot_sort_ascending(/* column */ int);
+    callback snapshot_sort_descending(/* column */ int);
+    callback find_search_clicked();
+    callback select_page(Page);
+    callback select_repo_and_page(/* repo_index */ int, Page);
+    callback cancel_operation_clicked();
+    callback close_window();
     callback start_at_login_toggled(/* checked */ bool);
     callback start_in_background_toggled(/* checked */ bool);
+    callback release-focus();
+
     release-focus => { focus-sink.focus(); }
     title: "Vykar Backup";
     preferred-width: 1100px;
     preferred-height: 760px;
+
+    // Derived: the currently selected RepoInfo (or an empty fallback).
+    property <RepoInfo> active_repo: root.current_repo_index >= 0
+        && root.current_repo_index < root.repo_model.length
+        ? root.repo_model[root.current_repo_index]
+        : { name: "", url: "", snapshots: "", last_snapshot: "", size: "" };
 
     focus-sink := FocusScope {
         key-pressed(event) => {
@@ -126,231 +111,98 @@ export component MainWindow inherits Window {
         padding: 0px;
         spacing: 0px;
 
-        // ── Header ──
-        // Plain Rectangle (not a layout) so we control paint order:
-        // schedule-row is declared first (painted underneath),
-        // config-row second (painted on top, including tooltip overflows).
-        Rectangle {
-            vertical-stretch: 0;
-            preferred-height: 10px + config-row.preferred-height + 4px + schedule-row.preferred-height + 6px;
-
-            schedule-row := HorizontalBox {
-                x: 12px;
-                y: 10px + config-row.preferred-height + 4px;
-                width: parent.width - 24px;
-                height: self.preferred-height;
-                spacing: 8px;
-                Text { text: "Schedule:"; vertical-alignment: center; width: 65px; font-weight: 700; }
-                Text { text: root.schedule_text; vertical-alignment: center; }
-            }
-
-            config-row := HorizontalBox {
-                x: 12px;
-                y: 10px;
-                width: parent.width - 24px;
-                height: self.preferred-height;
-                spacing: 8px;
-                Text { text: "Config:"; vertical-alignment: center; width: 65px; font-weight: 700; }
-                TouchArea {
-                    mouse-cursor: pointer;
-                    clicked => { root.open_config_clicked(); }
-                    Text { text: root.config_path; color: #4a90d9; vertical-alignment: center; }
-                }
-                TouchArea {
-                    mouse-cursor: pointer;
-                    clicked => { root.switch_config_clicked(); }
-                    Text { text: "(Change)"; color: #4a90d9; vertical-alignment: center; font-size: 12px; }
-                }
-                Rectangle { horizontal-stretch: 1; }
-                ToolTipArea {
-                    text: "Reload configuration from disk";
-                    Button {
-                        text: "Reload";
-                        enabled: !root.operation_busy && !root.editor_dirty;
-                        clicked => { root.reload_config_clicked(); }
-                    }
-                }
-                ToolTipArea {
-                    text: "Search files across snapshots";
-                    Button {
-                        text: "Find Files";
-                        enabled: !root.operation_busy;
-                        clicked => { root.find_files_clicked(); }
-                    }
-                }
-                ToolTipArea {
-                    text: "Backup, prune, compact, and check all repos";
-                    Button {
-                        text: root.operation_busy && root.operation_cancellable ? "Cancel" : "Full Backup";
-                        enabled: !root.operation_busy || root.operation_cancellable;
-                        primary: !root.operation_busy;
-                        clicked => {
-                            if (root.operation_busy) {
-                                root.cancel_clicked();
-                            } else {
-                                root.backup_all_clicked();
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // ── Tabs ──
+        // ── Sidebar + page switcher ──
         HorizontalLayout {
             vertical-stretch: 1;
-            padding-left: 8px;
-            padding-right: 8px;
-        TabWidget {
+            spacing: 0px;
 
-            Tab {
-                title: "Repositories";
-                VerticalBox {
-                    spacing: 8px;
-                    padding: 8px;
-                    if root.repo_loading: Text {
-                        text: "Loading repository data\u{2026}";
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
-                        vertical-stretch: 1;
-                        color: #888888;
-                    }
-                    if !root.repo_loading: ListView {
-                        vertical-stretch: 1;
-                        for repo[idx] in root.repo_model: GroupBox {
-                            HorizontalLayout {
-                                padding: 8px;
-                                spacing: 16px;
-                                VerticalLayout {
-                                    horizontal-stretch: 1;
-                                    min-width: 350px;
-                                    spacing: 4px;
-                                    Text { text: repo.name; font-weight: 700; }
-                                    Text { text: repo.url; color: #888888; font-size: 11px; }
-                                }
-                                VerticalLayout {
-                                    horizontal-stretch: 0;
-                                    min-width: 250px;
-                                    spacing: 4px;
-                                    Text { text: "Snapshots: " + repo.snapshots + "  ·  Size: " + repo.size; }
-                                    Text { text: "Latest: " + repo.last_snapshot; font-size: 11px; color: #888888; }
-                                }
-                                VerticalLayout {
-                                    alignment: center;
-                                    HorizontalLayout {
-                                        spacing: 8px;
-                                        Button { text: "Backup"; primary: true; enabled: !root.operation_busy; clicked => { root.backup_repo_clicked(idx); } }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            // Sidebar
+            Rectangle {
+                width: 220px;
+                background: Palette.background.darker(0.04);
 
-            Tab {
-                title: "Sources";
-                VerticalBox {
-                    spacing: 8px;
-                    padding: 8px;
-                    ListView {
+                VerticalLayout {
+                    padding: 10px;
+                    spacing: 10px;
+
+                    ScrollView {
                         vertical-stretch: 1;
-                        for source[idx] in root.source_model: GroupBox {
-                            VerticalLayout {
-                                spacing: 0px;
-                                // Header row — always visible
-                                HorizontalLayout {
-                                    padding: 8px;
-                                    spacing: 16px;
-                                    TouchArea {
-                                        horizontal-stretch: 1;
-                                        mouse-cursor: pointer;
-                                        clicked => { root.toggle_source_expanded(idx); }
-                                        HorizontalLayout {
-                                            spacing: 12px;
-                                            // Chevron
-                                            Text {
-                                                text: source.expanded ? "v" : ">";
-                                                vertical-alignment: center;
-                                                font-size: 11px;
-                                                width: 14px;
-                                                color: #888888;
-                                            }
-                                            VerticalLayout {
-                                                horizontal-stretch: 1;
-                                                spacing: 4px;
-                                                Text { text: source.label; font-weight: 700; }
-                                                if !source.expanded: Text { text: source.paths; color: #888888; font-size: 11px; overflow: elide; }
-                                            }
-                                            if !source.expanded: VerticalLayout {
-                                                horizontal-stretch: 0;
-                                                min-width: 200px;
-                                                max-width: 350px;
-                                                spacing: 4px;
-                                                Text { text: "Excludes: " + source.excludes; font-size: 11px; overflow: elide; }
-                                                Text { text: "Repos: " + source.target_repos; font-size: 11px; color: #888888; }
-                                            }
+                        VerticalLayout {
+                            spacing: 10px;
+                            alignment: start;
+
+                            // REPOSITORIES
+                            SideBarSection {
+                                title: "REPOSITORIES";
+                                if root.repo_loading: Text {
+                                    text: "Loading...";
+                                    color: #888888;
+                                    font-size: 11px;
+                                }
+                                for repo[idx] in root.repo_model: VerticalLayout {
+                                    spacing: 0px;
+                                    SideBarItem {
+                                        text: repo.name;
+                                        selected: root.current_repo_index == idx
+                                            && root.repo_scoped_page;
+                                        clicked => {
+                                            root.select_repo_and_page(idx,
+                                                root.repo_scoped_page ? root.current_page : Page.overview);
                                         }
                                     }
-                                    VerticalLayout {
-                                        alignment: center;
-                                        Button { text: "Backup"; primary: true; enabled: !root.operation_busy; clicked => { root.backup_source_clicked(idx); } }
+                                    // Nested sub-items only under the selected repo, on a repo-scoped page
+                                    if root.current_repo_index == idx && root.repo_scoped_page: VerticalLayout {
+                                        spacing: 0px;
+                                        SideBarSubItem {
+                                            text: "Overview";
+                                            glyph: ">";
+                                            selected: root.current_page == Page.overview;
+                                            clicked => { root.select_repo_and_page(idx, Page.overview); }
+                                        }
+                                        SideBarSubItem {
+                                            text: "Snapshots";
+                                            glyph: ">";
+                                            selected: root.current_page == Page.snapshots;
+                                            clicked => { root.select_repo_and_page(idx, Page.snapshots); }
+                                        }
+                                        SideBarSubItem {
+                                            text: "Find files";
+                                            glyph: ">";
+                                            selected: root.current_page == Page.find;
+                                            clicked => { root.select_repo_and_page(idx, Page.find); }
+                                        }
                                     }
                                 }
-                                // Expanded detail section
-                                if source.expanded: VerticalLayout {
-                                    padding-left: 42px;
-                                    padding-right: 8px;
-                                    padding-bottom: 8px;
-                                    spacing: 6px;
-                                    // Folders
-                                    VerticalLayout {
-                                        spacing: 2px;
-                                        Text { text: "Folders"; font-weight: 700; font-size: 11px; color: #888888; }
-                                        Text { text: source.detail_paths; font-size: 11px; wrap: word-wrap; }
-                                    }
-                                    // Exclusions
-                                    if source.detail_excludes != "": VerticalLayout {
-                                        spacing: 2px;
-                                        Text { text: "Exclusions"; font-weight: 700; font-size: 11px; color: #888888; }
-                                        Text { text: source.detail_excludes; font-size: 11px; wrap: word-wrap; }
-                                    }
-                                    // Exclude-If-Present
-                                    if source.detail_exclude_if_present != "": VerticalLayout {
-                                        spacing: 2px;
-                                        Text { text: "Exclude If Present"; font-weight: 700; font-size: 11px; color: #888888; }
-                                        Text { text: source.detail_exclude_if_present; font-size: 11px; wrap: word-wrap; }
-                                    }
-                                    // Options (flags)
-                                    if source.detail_flags != "": VerticalLayout {
-                                        spacing: 2px;
-                                        Text { text: "Options"; font-weight: 700; font-size: 11px; color: #888888; }
-                                        Text { text: source.detail_flags; font-size: 11px; }
-                                    }
-                                    // Target Repositories
-                                    VerticalLayout {
-                                        spacing: 2px;
-                                        Text { text: "Target Repositories"; font-weight: 700; font-size: 11px; color: #888888; }
-                                        Text { text: source.target_repos; font-size: 11px; }
-                                    }
-                                    // Command Dumps
-                                    if source.detail_command_dumps != "": VerticalLayout {
-                                        spacing: 2px;
-                                        Text { text: "Command Dumps"; font-weight: 700; font-size: 11px; color: #888888; }
-                                        Text { text: source.detail_command_dumps; font-size: 11px; wrap: word-wrap; }
-                                    }
-                                    // Hooks
-                                    if source.detail_hooks != "": VerticalLayout {
-                                        spacing: 2px;
-                                        Text { text: "Hooks"; font-weight: 700; font-size: 11px; color: #888888; }
-                                        Text { text: source.detail_hooks; font-size: 11px; wrap: word-wrap; }
-                                    }
-                                    // Retention
-                                    if source.detail_retention != "": VerticalLayout {
-                                        spacing: 2px;
-                                        Text { text: "Retention"; font-weight: 700; font-size: 11px; color: #888888; }
-                                        Text { text: source.detail_retention; font-size: 11px; }
-                                    }
+                            }
+
+                            // CONFIG
+                            SideBarSection {
+                                title: "CONFIG";
+                                SideBarItem {
+                                    text: "Sources";
+                                    count: root.source_model.length;
+                                    selected: root.current_page == Page.sources;
+                                    clicked => { root.select_page(Page.sources); }
+                                }
+                                SideBarItem {
+                                    text: "Advanced";
+                                    selected: root.current_page == Page.advanced;
+                                    clicked => { root.select_page(Page.advanced); }
+                                }
+                            }
+
+                            // Standalone
+                            VerticalLayout {
+                                spacing: 2px;
+                                SideBarItem {
+                                    text: "Log";
+                                    selected: root.current_page == Page.log;
+                                    clicked => { root.select_page(Page.log); }
+                                }
+                                SideBarItem {
+                                    text: "Settings";
+                                    selected: root.current_page == Page.settings;
+                                    clicked => { root.select_page(Page.settings); }
                                 }
                             }
                         }
@@ -358,161 +210,89 @@ export component MainWindow inherits Window {
                 }
             }
 
-            Tab {
-                title: "Snapshots";
-                VerticalBox {
-                    spacing: 8px;
-                    padding: 8px;
+            Rectangle { width: 1px; background: #d5d5d5; }
 
-                    HorizontalBox {
-                        spacing: 8px;
-                        Text { text: "Repository:"; vertical-alignment: center; }
-                        ComboBox {
-                            model: root.repo_names;
-                            current-value <=> root.snapshots_repo_combo_value;
-                            selected(value) => {
-                                root.snapshots_repo_changed(value);
-                            }
-                        }
-                        Button {
-                            text: "Refresh";
-                            enabled: !root.operation_busy;
-                            clicked => { root.refresh_snapshots_clicked(); }
-                        }
+            // Page area
+            Rectangle {
+                horizontal-stretch: 1;
+
+                if root.current_page == Page.overview: OverviewPage {
+                    repo: root.active_repo;
+                    schedule_brief: root.schedule_brief;
+                    source_model: root.repo_source_model;
+                    snapshot_rows: root.recent_snapshot_rows;
+                    operation_busy: root.operation_busy;
+                    backup_clicked => { root.backup_repo_clicked(root.current_repo_index); }
+                    view_all_snapshots_clicked => {
+                        root.select_repo_and_page(root.current_repo_index, Page.snapshots);
                     }
+                    view_all_sources_clicked => { root.select_page(Page.sources); }
+                    toggle_source_expanded(i) => { root.toggle_repo_source_expanded(i); }
+                    backup_source(i) => { root.backup_repo_source_clicked(i); }
+                }
 
-                    snapshot-table := StandardTableView {
-                        vertical-stretch: 1;
-                        columns: [
-                            { title: "ID" },
-                            { title: "Host" },
-                            { title: "Time" },
-                            { title: "Source" },
-                            { title: "Label" },
-                            { title: "Files" },
-                            { title: "Size" },
-                        ];
-                        rows: root.snapshot_rows;
-                        sort-ascending(col-idx) => { root.snapshot_sort_ascending(col-idx); }
-                        sort-descending(col-idx) => { root.snapshot_sort_descending(col-idx); }
-                    }
+                if root.current_page == Page.snapshots: SnapshotsPage {
+                    repo_name: root.active_repo.name;
+                    snapshot_rows: root.snapshot_rows;
+                    operation_busy: root.operation_busy;
+                    refresh_clicked => { root.refresh_snapshots_clicked(); }
+                    prune_clicked => { root.prune_snapshots_clicked(); }
+                    restore_row(r) => { root.restore_selected_snapshot_clicked(r); }
+                    delete_row(r) => { root.delete_selected_snapshot_clicked(r); }
+                    sort_ascending(c) => { root.snapshot_sort_ascending(c); }
+                    sort_descending(c) => { root.snapshot_sort_descending(c); }
+                }
 
-                    HorizontalBox {
-                        spacing: 8px;
-                        Button {
-                            text: "Restore Selected Snapshot";
-                            enabled: !root.operation_busy;
-                            clicked => {
-                                root.restore-selected-snapshot-clicked(snapshot-table.current-row);
-                            }
-                        }
-                        Button {
-                            text: "Delete Selected Snapshot";
-                            enabled: !root.operation_busy;
-                            clicked => {
-                                root.delete-selected-snapshot-clicked(snapshot-table.current-row);
-                            }
-                        }
+                if root.current_page == Page.find: FindPage {
+                    repo_name: root.active_repo.name;
+                    name_pattern <=> root.find_name_pattern;
+                    status_text: root.find_status_text;
+                    result_rows: root.find_result_rows;
+                    search_clicked => { root.find_search_clicked(); }
+                }
+
+                if root.current_page == Page.sources: SourcesPage {
+                    source_model: root.source_model;
+                    operation_busy: root.operation_busy;
+                    backup_source(i) => { root.backup_source_clicked(i); }
+                    toggle_source_expanded(i) => { root.toggle_source_expanded(i); }
+                }
+
+                if root.current_page == Page.advanced: AdvancedPage {
+                    config_path: root.config_path;
+                    editor_text <=> root.editor_text;
+                    editor_baseline: root.editor_baseline;
+                    editor_status: root.editor_status;
+                    editor_dirty <=> root.editor_dirty;
+                    editor_font_family: root.editor_font_family;
+                    operation_busy: root.operation_busy;
+                    open_config_clicked => { root.open_config_clicked(); }
+                    switch_config_clicked => { root.switch_config_clicked(); }
+                    reload_config_clicked => { root.reload_config_clicked(); }
+                    save_clicked => { root.save_and_apply_clicked(); }
+                    discard_clicked => { root.discard_clicked(); }
+                    text_edited(new_text) => {
+                        root.editor_dirty = (new_text != root.editor_baseline);
+                        root.editor_status = "";
                     }
                 }
-            }
 
-            Tab {
-                title: "Log";
-                VerticalBox {
-                    padding: 8px;
-                    StandardTableView {
-                        vertical-stretch: 1;
-                        columns: [
-                            { title: "Date", width: 70px },
-                            { title: "Time", width: 90px },
-                            { title: "Event", horizontal-stretch: 1 },
-                        ];
-                        rows: root.log_rows;
-                    }
+                if root.current_page == Page.log: LogPage {
+                    log_rows: root.log_rows;
+                }
+
+                if root.current_page == Page.settings: SettingsPage {
+                    start_at_login <=> root.start_at_login;
+                    start_in_background <=> root.start_in_background;
+                    start_in_background_enabled: root.start_in_background_enabled;
+                    start_at_login_toggled(c) => { root.start_at_login_toggled(c); }
+                    start_in_background_toggled(c) => { root.start_in_background_toggled(c); }
                 }
             }
-
-            Tab {
-                title: "Edit";
-                VerticalBox {
-                    padding: 8px;
-                    spacing: 8px;
-                    Text {
-                        text: "You can edit Vykar's YAML config below. This will be saved to disk and can also be used by the command line client. We plan on adding a prettier interface for editing the configuration in the future.";
-                        wrap: word-wrap;
-                        color: #888888;
-                        font-size: 12px;
-                    }
-                    TextEdit {
-                        vertical-stretch: 1;
-                        text <=> root.editor_text;
-                        font-size: 13px;
-                        font-family: root.editor_font_family;
-                        wrap: no-wrap;
-                        edited(new_text) => {
-                            root.editor_dirty = (new_text != root.editor_baseline);
-                            root.editor_status = "";
-                        }
-                    }
-                    if root.editor_status != "": Text {
-                        text: root.editor_status;
-                        color: #cc0000;
-                        wrap: word-wrap;
-                    }
-                    HorizontalBox {
-                        spacing: 8px;
-                        Rectangle { horizontal-stretch: 1; }
-                        Button {
-                            text: "Discard";
-                            enabled: root.editor_dirty;
-                            clicked => { root.discard_clicked(); }
-                        }
-                        Button {
-                            text: "Save and Apply";
-                            primary: true;
-                            enabled: root.editor_dirty && !root.operation_busy;
-                            clicked => { root.save_and_apply_clicked(); }
-                        }
-                    }
-                }
-            }
-
-            Tab {
-                title: "Settings";
-                VerticalBox {
-                    padding: 8px;
-                    spacing: 12px;
-                    Text {
-                        text: "Startup";
-                        font-weight: 700;
-                    }
-                    CheckBox {
-                        text: "Start at login";
-                        checked <=> root.start_at_login;
-                        toggled => {
-                            root.start-at-login-toggled(self.checked);
-                        }
-                    }
-                    CheckBox {
-                        text: "Start in background (tray only)";
-                        checked <=> root.start_in_background;
-                        enabled: root.start_in_background_enabled;
-                        toggled => {
-                            root.start-in-background-toggled(self.checked);
-                        }
-                    }
-                    Rectangle { vertical-stretch: 1; }
-                }
-            }
-        }
         }
 
         // ── Footer ──
-        Rectangle {
-            height: 1px;
-            background: #d5d5d5;
-        }
+        Rectangle { height: 1px; background: #d5d5d5; }
 
         HorizontalBox {
             padding-left: 12px;
@@ -523,6 +303,10 @@ export component MainWindow inherits Window {
 
             Text { text: "Status:"; vertical-alignment: center; }
             Text { text: root.status_text; vertical-alignment: center; horizontal-stretch: 1; }
+            if root.operation_busy: Button {
+                text: "Cancel";
+                clicked => { root.cancel_operation_clicked(); }
+            }
             Text { text: root.version_text; vertical-alignment: center; color: #888888; }
         }
     }

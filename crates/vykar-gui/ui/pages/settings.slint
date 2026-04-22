@@ -1,0 +1,31 @@
+import { VerticalBox, CheckBox } from "std-widgets.slint";
+
+export component SettingsPage inherits Rectangle {
+    in-out property <bool> start_at_login;
+    in-out property <bool> start_in_background;
+    in property <bool> start_in_background_enabled;
+
+    callback start_at_login_toggled(bool);
+    callback start_in_background_toggled(bool);
+
+    VerticalBox {
+        padding: 12px;
+        spacing: 12px;
+        Text {
+            text: "Startup";
+            font-weight: 700;
+        }
+        CheckBox {
+            text: "Start at login";
+            checked <=> root.start_at_login;
+            toggled => { root.start_at_login_toggled(self.checked); }
+        }
+        CheckBox {
+            text: "Start in background (tray only)";
+            checked <=> root.start_in_background;
+            enabled: root.start_in_background_enabled;
+            toggled => { root.start_in_background_toggled(self.checked); }
+        }
+        Rectangle { vertical-stretch: 1; }
+    }
+}

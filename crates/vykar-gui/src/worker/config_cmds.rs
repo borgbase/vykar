@@ -111,14 +111,14 @@ pub(super) fn apply_config(
     let canonical = dunce::canonicalize(&config_path).unwrap_or_else(|_| config_path.clone());
     ctx.config_display_path = canonical.clone();
 
-    let schedule_desc = if ctx.scheduler_lock_held {
-        scheduler::schedule_description(&schedule, ctx.schedule_paused)
+    let schedule_brief = if ctx.scheduler_lock_held {
+        scheduler::schedule_brief(&schedule, ctx.schedule_paused)
     } else {
-        "disabled (external scheduler)".to_string()
+        "Off".to_string()
     };
     let _ = ctx.ui_tx.send(UiEvent::ConfigInfo {
         path: canonical.display().to_string(),
-        schedule: schedule_desc,
+        schedule_brief,
     });
     send_structured_data(&ctx.ui_tx, &ctx.runtime.repos);
     let _ = ctx

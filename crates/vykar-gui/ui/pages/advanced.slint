@@ -1,0 +1,83 @@
+import { VerticalBox, HorizontalBox, Button, TextEdit } from "std-widgets.slint";
+
+export component AdvancedPage inherits Rectangle {
+    in property <string> config_path;
+    in-out property <string> editor_text;
+    in property <string> editor_baseline;
+    in property <string> editor_status;
+    in-out property <bool> editor_dirty;
+    in property <string> editor_font_family;
+    in property <bool> operation_busy;
+
+    callback open_config_clicked();
+    callback switch_config_clicked();
+    callback reload_config_clicked();
+    callback save_clicked();
+    callback discard_clicked();
+    callback text_edited(string);
+
+    VerticalBox {
+        padding: 12px;
+        spacing: 8px;
+
+        HorizontalBox {
+            padding: 0px;
+            spacing: 8px;
+            Text { text: "Config:"; vertical-alignment: center; font-weight: 700; }
+            TouchArea {
+                mouse-cursor: pointer;
+                clicked => { root.open_config_clicked(); }
+                Text { text: root.config_path; color: #4a90d9; vertical-alignment: center; overflow: elide; }
+            }
+            TouchArea {
+                mouse-cursor: pointer;
+                clicked => { root.switch_config_clicked(); }
+                Text { text: "(Change)"; color: #4a90d9; vertical-alignment: center; font-size: 12px; }
+            }
+            Rectangle { horizontal-stretch: 1; }
+            Button {
+                text: "Reload";
+                enabled: !root.operation_busy && !root.editor_dirty;
+                clicked => { root.reload_config_clicked(); }
+            }
+        }
+
+        Text {
+            text: "You can edit Vykar's YAML config below. This will be saved to disk and can also be used by the command line client. We plan on adding a prettier interface for editing the configuration in the future.";
+            wrap: word-wrap;
+            color: #888888;
+            font-size: 12px;
+        }
+        TextEdit {
+            vertical-stretch: 1;
+            text <=> root.editor_text;
+            font-size: 13px;
+            font-family: root.editor_font_family;
+            wrap: no-wrap;
+            edited(new_text) => {
+                root.text_edited(new_text);
+            }
+        }
+        if root.editor_status != "": Text {
+            text: root.editor_status;
+            color: #cc0000;
+            wrap: word-wrap;
+        }
+        HorizontalBox {
+            padding: 0px;
+            spacing: 8px;
+            Rectangle { horizontal-stretch: 1; }
+            Button {
+                text: "Discard";
+                enabled: root.editor_dirty;
+                clicked => { root.discard_clicked(); }
+            }
+            Button {
+                text: "Save and Apply";
+                primary: true;
+                enabled: root.editor_dirty && !root.operation_busy;
+                clicked => { root.save_clicked(); }
+            }
+        }
+    }
+}

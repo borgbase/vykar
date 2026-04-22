@@ -1,0 +1,139 @@
+import { VerticalBox, HorizontalBox, Button, ScrollView, StandardTableView, ListView, Palette } from "std-widgets.slint";
+import { RepoInfo, SourceInfo } from "../components/types.slint";
+import { SourceRow } from "../components/source_row.slint";
+
+component MetricCard inherits Rectangle {
+    in property <string> caption;
+    in property <string> value;
+
+    border-width: 1px;
+    border-color: #cccccc;
+    border-radius: 6px;
+    min-height: 70px;
+    horizontal-stretch: 1;
+
+    VerticalLayout {
+        padding: 10px;
+        spacing: 4px;
+        Text {
+            text: root.caption;
+            font-size: 11px;
+            color: #888888;
+        }
+        Text {
+            text: root.value;
+            font-size: 18px;
+            font-weight: 700;
+            overflow: elide;
+        }
+    }
+}
+
+export component OverviewPage inherits Rectangle {
+    in property <RepoInfo> repo;
+    in property <string> schedule_brief;
+    in property <[SourceInfo]> source_model;
+    in property <[[StandardListViewItem]]> snapshot_rows;
+    in property <bool> operation_busy;
+
+    callback backup_clicked();
+    callback view_all_snapshots_clicked();
+    callback view_all_sources_clicked();
+    callback toggle_source_expanded(int);
+    callback backup_source(int);
+
+    VerticalBox {
+        padding: 12px;
+        spacing: 12px;
+
+        // Header: name + URL + actions
+        HorizontalLayout {
+            spacing: 12px;
+            VerticalLayout {
+                horizontal-stretch: 1;
+                spacing: 2px;
+                Text { text: root.repo.name; font-weight: 700; font-size: 16px; }
+                Text { text: root.repo.url; color: #888888; font-size: 11px; overflow: elide; }
+            }
+            VerticalLayout {
+                alignment: center;
+                HorizontalLayout {
+                    spacing: 8px;
+                    Button {
+                        text: "Backup";
+                        primary: true;
+                        enabled: !root.operation_busy;
+                        clicked => { root.backup_clicked(); }
+                    }
+                }
+            }
+        }
+
+        // Metric cards
+        HorizontalLayout {
+            spacing: 10px;
+            MetricCard { caption: "Snapshots"; value: root.repo.snapshots; }
+            MetricCard { caption: "Size"; value: root.repo.size; }
+            MetricCard { caption: "Last"; value: root.repo.last_snapshot; }
+            MetricCard { caption: "Schedule"; value: root.schedule_brief; }
+        }
+
+        // Recent snapshots
+        VerticalLayout {
+            spacing: 4px;
+            HorizontalLayout {
+                Text { text: "Recent snapshots"; font-weight: 700; horizontal-stretch: 1; }
+                TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => { root.view_all_snapshots_clicked(); }
+                    Text {
+                        text: "View all";
+                        color: #4a90d9;
+                        font-size: 12px;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+            StandardTableView {
+                min-height: 140px;
+                columns: [
+                    { title: "ID" },
+                    { title: "Time" },
+                    { title: "Files" },
+                    { title: "Size" },
+                ];
+                rows: root.snapshot_rows;
+            }
+        }
+
+        // Sources going into this repo
+        VerticalLayout {
+            spacing: 4px;
+            vertical-stretch: 1;
+            HorizontalLayout {
+                Text { text: "Sources"; font-weight: 700; horizontal-stretch: 1; }
+                TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => { root.view_all_sources_clicked(); }
+                    Text {
+                        text: "View all";
+                        color: #4a90d9;
+                        font-size: 12px;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+            ListView {
+                min-height: 100px;
+                vertical-stretch: 1;
+                for source[idx] in root.source_model: SourceRow {
+                    source: source;
+                    operation_busy: root.operation_busy;
+                    show_backup: false;
+                    toggle_expanded => { root.toggle_source_expanded(idx); }
+                    backup_clicked => { root.backup_source(idx); }
+                }
+            }
+        }
+    }
+}

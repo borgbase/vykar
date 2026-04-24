@@ -140,6 +140,9 @@ pub enum VykarError {
     #[error("repository identity mismatch: {0}")]
     RepositoryMismatch(String),
 
+    #[error("file changed during read: {path}")]
+    FileChangedDuringRead { path: String },
+
     #[error("{0}")]
     Other(String),
 }
@@ -162,10 +165,16 @@ impl VykarError {
     /// (permission denied, file vanished, or EIO) **before** any data was
     /// committed. These are safe to skip for partial-backup support.
     pub fn is_soft_file_error(&self) -> bool {
-        matches!(self, VykarError::Io(e)
-            if matches!(e.kind(),
-                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotFound)
-            || is_eio(e))
+        match self {
+            VykarError::Io(e) => {
+                matches!(
+                    e.kind(),
+                    std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotFound
+                ) || is_eio(e)
+            }
+            VykarError::FileChangedDuringRead { .. } => true,
+            _ => false,
+        }
     }
 }
 
@@ -211,5 +220,13 @@ mod tests {
     fn other_variant_is_not_soft() {
         let err = VykarError::Other("some error".to_string());
         assert!(!err.is_soft_file_error());
+    }
+
+    #[test]
+    fn is_soft_file_error_file_changed_during_read() {
+        let err = VykarError::FileChangedDuringRead {
+            path: "/tmp/some/file".to_string(),
+        };
+        assert!(err.is_soft_file_error());
     }
 }

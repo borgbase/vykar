@@ -13,6 +13,27 @@ pub struct MetadataSummary {
     pub size: u64,
 }
 
+/// Stat an open file descriptor and build a `MetadataSummary`.
+pub fn fstat_summary(file: &std::fs::File) -> std::io::Result<MetadataSummary> {
+    let meta = file.metadata()?;
+    let ft = meta.file_type();
+    Ok(summarize_metadata(&meta, &ft))
+}
+
+/// True iff both summaries identify the same file content & identity.
+///
+/// Used for walk-vs-open and pre-vs-post drift checks during backup.
+/// Compares `size`, `mtime_ns`, `ctime_ns`, `device`, and `inode`. On
+/// Windows `device`/`inode` are always `0` (see [`summarize_metadata`]),
+/// so the rename-atop guard is effectively Unix-only.
+pub fn metadata_matches(a: &MetadataSummary, b: &MetadataSummary) -> bool {
+    a.size == b.size
+        && a.mtime_ns == b.mtime_ns
+        && a.ctime_ns == b.ctime_ns
+        && a.device == b.device
+        && a.inode == b.inode
+}
+
 pub fn summarize_metadata(metadata: &Metadata, file_type: &FileType) -> MetadataSummary {
     #[cfg(unix)]
     {
@@ -353,6 +374,53 @@ mod tests {
         let since_epoch = mtime.duration_since(SystemTime::UNIX_EPOCH).unwrap();
         let diff = (since_epoch.as_secs() as i64 - target_secs).unsigned_abs();
         assert!(diff <= 1, "mtime off by {diff} seconds");
+    }
+
+    /// `metadata_matches` must catch mutations in every guarded field.
+    /// Mutating any one of size / mtime_ns / ctime_ns / device / inode
+    /// should return false; the baseline should return true.
+    #[test]
+    fn metadata_matches_covers_all_fields() {
+        let base = MetadataSummary {
+            mode: 0o644,
+            uid: 100,
+            gid: 100,
+            mtime_ns: 111,
+            ctime_ns: 222,
+            device: 333,
+            inode: 444,
+            size: 555,
+        };
+        assert!(metadata_matches(&base, &base));
+
+        let mut m = base;
+        m.size = 1;
+        assert!(!metadata_matches(&base, &m));
+
+        let mut m = base;
+        m.mtime_ns += 1;
+        assert!(!metadata_matches(&base, &m));
+
+        let mut m = base;
+        m.ctime_ns += 1;
+        assert!(!metadata_matches(&base, &m));
+
+        let mut m = base;
+        m.device = 0;
+        assert!(!metadata_matches(&base, &m));
+
+        let mut m = base;
+        m.inode = 0;
+        assert!(!metadata_matches(&base, &m));
+
+        // Changing mode/uid/gid alone does NOT count as a content-identity
+        // change — by design, only size/mtime/ctime/device/inode are
+        // content-identity fields.
+        let mut m = base;
+        m.mode = 0o777;
+        m.uid = 1;
+        m.gid = 1;
+        assert!(metadata_matches(&base, &m));
     }
 
     #[test]

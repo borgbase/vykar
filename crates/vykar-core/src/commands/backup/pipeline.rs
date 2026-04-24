@@ -1,6 +1,5 @@
 use std::collections::BTreeMap;
-use std::fs::File;
-use std::io::{Read, Seek};
+use std::io::Read;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -37,7 +36,9 @@ pub(crate) enum ProcessedEntry {
     ProcessedFile {
         item: Item,
         abs_path: String,
-        metadata: fs::MetadataSummary,
+        /// Pre-read fstat taken in the worker. Replaces walk-time `metadata`
+        /// for item/cache fields so drift-checked values flow to disk.
+        pre_meta: fs::MetadataSummary,
         chunks: Vec<super::WorkerChunk>,
         /// Bytes acquired from ByteBudget; consumer must release after committing.
         acquired_bytes: usize,
@@ -47,7 +48,11 @@ pub(crate) enum ProcessedEntry {
         /// Only present for segment 0; `None` for continuations.
         item: Option<Item>,
         abs_path: Arc<str>,
-        metadata: fs::MetadataSummary,
+        /// Pre-read fstat from segment 0's worker — the canonical meta that
+        /// populates the final item fields. `None` on continuations (each
+        /// segment's worker already verified its own `pre_meta` against the
+        /// walker's metadata, so by transitivity every segment agrees).
+        pre_meta: Option<fs::MetadataSummary>,
         chunks: Vec<super::WorkerChunk>,
         acquired_bytes: usize,
         segment_index: usize,
@@ -64,13 +69,31 @@ pub(crate) enum ProcessedEntry {
     NonFile {
         item: Item,
     },
-    /// A file skipped due to a soft error (permission denied, not found).
-    /// No data was committed for this file.
-    Skipped,
-    /// Segment 0 of a large file was skipped due to a soft error.
-    /// The consumer must drain remaining segments via `segments_to_skip`.
+    /// A file skipped due to a soft error (permission denied, not found,
+    /// or drift detected between walk and open / during read). No data
+    /// was committed for this file.
+    Skipped {
+        path: String,
+        /// Pre-formatted reason (avoids carrying `VykarError` across threads).
+        reason: String,
+    },
+    /// The walker reported a soft error before it could materialize a
+    /// path (e.g. directory-iteration `EACCES`). The walker has already
+    /// logged the failing path via `tracing::warn!`, so the consumer
+    /// just bumps the error counter without emitting a pathless GUI
+    /// warning. Mirrors `sequential.rs` `WalkEvent::Skipped` handling.
+    WalkSkip,
+    /// A segment of a large file was skipped.
+    ///
+    /// If `segment_index == 0` nothing was committed. If `segment_index > 0`,
+    /// earlier segments may already be committed — the consumer invokes
+    /// cross-segment rollback. `segment_index` + `num_segments` together
+    /// drive the drain count for the skipped remainder.
     SegmentSkipped {
+        segment_index: usize,
         num_segments: usize,
+        path: Arc<str>,
+        reason: String,
     },
     SourceStarted {
         path: String,
@@ -89,11 +112,12 @@ fn estimate_chunk_count(data_len: u64, avg_chunk_size: u32) -> usize {
     est.min(4096) as usize
 }
 
-/// Wrapper that converts soft I/O errors into `Skipped` / `SegmentSkipped`
-/// for entries where no data has been committed yet.
+/// Wrapper that converts soft I/O errors (and file-drift errors) into
+/// `Skipped` / `SegmentSkipped` variants.
 ///
-/// Segment N>0 errors are NEVER converted — they propagate as hard errors
-/// because earlier segments may already be committed.
+/// For segment N>0, the consumer performs a cross-segment rollback of the
+/// earlier segments' refcounts/dedup inserts before draining the rest, so
+/// it is now safe to convert soft errors at any segment index.
 #[allow(clippy::too_many_arguments)]
 fn process_file_worker(
     entry: WalkEntry,
@@ -107,14 +131,19 @@ fn process_file_worker(
     dedup_filter: Option<&xorf::Xor8>,
 ) -> Result<ProcessedEntry> {
     // Extract info needed for soft-error conversion before moving entry.
-    let is_regular_file = matches!(&entry, WalkEntry::File { .. });
-    let segment_info = match &entry {
+    let (path_for_skip, seg_path_for_skip, segment_info) = match &entry {
+        WalkEntry::File { abs_path, .. } => (Some(abs_path.clone()), None, None),
         WalkEntry::FileSegment {
+            abs_path,
             segment_index,
             num_segments,
             ..
-        } => Some((*segment_index, *num_segments)),
-        _ => None,
+        } => (
+            None,
+            Some(abs_path.clone()),
+            Some((*segment_index, *num_segments)),
+        ),
+        _ => (None, None, None),
     };
 
     match process_file_worker_inner(
@@ -130,15 +159,27 @@ fn process_file_worker(
     ) {
         Ok(processed) => Ok(processed),
         Err(e) if e.is_soft_file_error() => {
-            if is_regular_file {
-                warn!(error = %e, "skipping file in pipeline (soft error)");
-                Ok(ProcessedEntry::Skipped)
-            } else if let Some((0, num_segments)) = segment_info {
-                // Segment 0 only — safe because no data committed yet.
-                warn!(error = %e, "skipping segmented file in pipeline (soft error on segment 0)");
-                Ok(ProcessedEntry::SegmentSkipped { num_segments })
+            if let Some(path) = path_for_skip {
+                let reason = e.to_string();
+                warn!(path = %path, error = %e, "skipping file in pipeline (soft error)");
+                Ok(ProcessedEntry::Skipped { path, reason })
+            } else if let (Some(path), Some((segment_index, num_segments))) =
+                (seg_path_for_skip, segment_info)
+            {
+                let reason = e.to_string();
+                warn!(
+                    path = %path,
+                    segment_index,
+                    error = %e,
+                    "skipping segmented file in pipeline (soft error)"
+                );
+                Ok(ProcessedEntry::SegmentSkipped {
+                    segment_index,
+                    num_segments,
+                    path,
+                    reason,
+                })
             } else {
-                // Segment N>0: NOT safe to convert — propagate as hard error.
                 Err(e)
             }
         }
@@ -167,22 +208,42 @@ fn process_file_worker_inner(
             item,
             abs_path,
             metadata,
-            file_size,
+            file_size: _,
         } => {
             // Budget was pre-acquired by the walk thread. Wrap in a guard for
             // error safety — if we `?`-bail, the guard drops and releases bytes.
             let guard = BudgetGuard::from_pre_acquired(budget, pre_acquired_bytes);
 
+            let mut source = super::read_source::BackupSource::open(Path::new(&abs_path))
+                .map_err(VykarError::Io)?;
+            let pre_meta = fs::fstat_summary(source.file()).map_err(VykarError::Io)?;
+
+            // Walk-to-open drift check — catches pre-open mutation and
+            // rename-atop (device+inode differ).
+            if !fs::metadata_matches(&pre_meta, &metadata) {
+                return Err(VykarError::FileChangedDuringRead {
+                    path: abs_path.clone(),
+                });
+            }
+
             // Small file (< min_chunk_size): read whole, single chunk.
-            if file_size < chunker_config.min_size as u64 {
-                let mut file = File::open(Path::new(&abs_path)).map_err(VykarError::Io)?;
-                let mut data = Vec::with_capacity(file_size as usize);
+            if pre_meta.size < chunker_config.min_size as u64 {
+                let mut data = Vec::with_capacity(pre_meta.size as usize);
                 if let Some(limiter) = read_limiter {
-                    limits::LimitedReader::new(&mut file, Some(limiter))
+                    limits::LimitedReader::new(&mut source, Some(limiter))
                         .read_to_end(&mut data)
                         .map_err(VykarError::Io)?;
                 } else {
-                    file.read_to_end(&mut data).map_err(VykarError::Io)?;
+                    source.read_to_end(&mut data).map_err(VykarError::Io)?;
+                }
+
+                let post_meta = fs::fstat_summary(source.file()).map_err(VykarError::Io)?;
+                if !fs::metadata_matches(&pre_meta, &post_meta)
+                    || data.len() as u64 != pre_meta.size
+                {
+                    return Err(VykarError::FileChangedDuringRead {
+                        path: abs_path.clone(),
+                    });
                 }
 
                 let chunk_id = ChunkId::compute(chunk_id_key, &data);
@@ -193,42 +254,54 @@ fn process_file_worker_inner(
                 return Ok(ProcessedEntry::ProcessedFile {
                     item,
                     abs_path,
-                    metadata,
+                    pre_meta,
                     chunks: vec![worker_chunk],
                     acquired_bytes,
                 });
             }
 
             // Medium file: read, chunk via FastCDC, then hash → classify each chunk.
-            let file = File::open(Path::new(&abs_path)).map_err(VykarError::Io)?;
-            let chunk_stream = chunker::chunk_stream(
-                limits::LimitedReader::new(file, read_limiter),
-                chunker_config,
-            );
-
+            let mut total_bytes: u64 = 0;
             let mut worker_chunks =
-                Vec::with_capacity(estimate_chunk_count(file_size, chunker_config.avg_size));
-            for chunk_result in chunk_stream {
-                let chunk = chunk_result.map_err(|e| match e {
-                    fastcdc::v2020::Error::IoError(ioe) => VykarError::Io(ioe),
-                    other => VykarError::Other(format!("chunking failed for {abs_path}: {other}")),
-                })?;
+                Vec::with_capacity(estimate_chunk_count(pre_meta.size, chunker_config.avg_size));
+            {
+                let chunk_stream = chunker::chunk_stream(
+                    limits::LimitedReader::new(&mut source, read_limiter),
+                    chunker_config,
+                );
 
-                let chunk_id = ChunkId::compute(chunk_id_key, &chunk.data);
-                worker_chunks.push(classify_chunk(
-                    chunk_id,
-                    chunk.data,
-                    dedup_filter,
-                    compression,
-                    crypto,
-                )?);
+                for chunk_result in chunk_stream {
+                    let chunk = chunk_result.map_err(|e| match e {
+                        fastcdc::v2020::Error::IoError(ioe) => VykarError::Io(ioe),
+                        other => {
+                            VykarError::Other(format!("chunking failed for {abs_path}: {other}"))
+                        }
+                    })?;
+
+                    total_bytes = total_bytes.saturating_add(chunk.data.len() as u64);
+                    let chunk_id = ChunkId::compute(chunk_id_key, &chunk.data);
+                    worker_chunks.push(classify_chunk(
+                        chunk_id,
+                        chunk.data,
+                        dedup_filter,
+                        compression,
+                        crypto,
+                    )?);
+                }
+            }
+
+            let post_meta = fs::fstat_summary(source.file()).map_err(VykarError::Io)?;
+            if !fs::metadata_matches(&pre_meta, &post_meta) || total_bytes != pre_meta.size {
+                return Err(VykarError::FileChangedDuringRead {
+                    path: abs_path.clone(),
+                });
             }
 
             let acquired_bytes = guard.defuse();
             Ok(ProcessedEntry::ProcessedFile {
                 item,
                 abs_path,
-                metadata,
+                pre_meta,
                 chunks: worker_chunks,
                 acquired_bytes,
             })
@@ -245,39 +318,65 @@ fn process_file_worker_inner(
         } => {
             let guard = BudgetGuard::from_pre_acquired(budget, pre_acquired_bytes);
 
-            let mut file = File::open(Path::new(&*abs_path)).map_err(VykarError::Io)?;
-            file.seek(std::io::SeekFrom::Start(offset))
+            let mut source = super::read_source::BackupSource::open(Path::new(&*abs_path))
                 .map_err(VykarError::Io)?;
-            let reader = file.take(len);
+            let pre_meta = fs::fstat_summary(source.file()).map_err(VykarError::Io)?;
 
-            let chunk_stream = chunker::chunk_stream(
-                limits::LimitedReader::new(reader, read_limiter),
-                chunker_config,
-            );
+            // Walk-to-open drift check. Segmented reads are a plan driven
+            // by walk-time size (`num_segments`/`offset`/`len`). Any drift
+            // invalidates the plan — skip the segment.
+            if !fs::metadata_matches(&pre_meta, &metadata) {
+                return Err(VykarError::FileChangedDuringRead {
+                    path: abs_path.to_string(),
+                });
+            }
+
+            source.seek_from_start(offset).map_err(VykarError::Io)?;
 
             let mut worker_chunks =
                 Vec::with_capacity(estimate_chunk_count(len, chunker_config.avg_size));
-            for chunk_result in chunk_stream {
-                let chunk = chunk_result.map_err(|e| match e {
-                    fastcdc::v2020::Error::IoError(ioe) => VykarError::Io(ioe),
-                    other => VykarError::Other(format!("chunking failed for {abs_path}: {other}")),
-                })?;
+            {
+                let reader = (&mut source).take(len);
+                let chunk_stream = chunker::chunk_stream(
+                    limits::LimitedReader::new(reader, read_limiter),
+                    chunker_config,
+                );
 
-                let chunk_id = ChunkId::compute(chunk_id_key, &chunk.data);
-                worker_chunks.push(classify_chunk(
-                    chunk_id,
-                    chunk.data,
-                    dedup_filter,
-                    compression,
-                    crypto,
-                )?);
+                for chunk_result in chunk_stream {
+                    let chunk = chunk_result.map_err(|e| match e {
+                        fastcdc::v2020::Error::IoError(ioe) => VykarError::Io(ioe),
+                        other => {
+                            VykarError::Other(format!("chunking failed for {abs_path}: {other}"))
+                        }
+                    })?;
+
+                    let chunk_id = ChunkId::compute(chunk_id_key, &chunk.data);
+                    worker_chunks.push(classify_chunk(
+                        chunk_id,
+                        chunk.data,
+                        dedup_filter,
+                        compression,
+                        crypto,
+                    )?);
+                }
+            }
+
+            // Intra-segment drift check. `file.take(len)` legitimately stops
+            // short, so we don't short-read-guard; the post-fstat catches
+            // mutation of size/mtime/ctime/device/inode.
+            let post_meta = fs::fstat_summary(source.file()).map_err(VykarError::Io)?;
+            if !fs::metadata_matches(&pre_meta, &post_meta) {
+                return Err(VykarError::FileChangedDuringRead {
+                    path: abs_path.to_string(),
+                });
             }
 
             let acquired_bytes = guard.defuse();
             Ok(ProcessedEntry::FileSegment {
                 item,
                 abs_path,
-                metadata,
+                // Only segment 0's pre_meta is consumed downstream.
+                pre_meta: (segment_index == 0).then_some(pre_meta),
                 chunks: worker_chunks,
                 acquired_bytes,
                 segment_index,
@@ -299,7 +398,7 @@ fn process_file_worker_inner(
 
         WalkEntry::NonFile { item } => Ok(ProcessedEntry::NonFile { item }),
 
-        WalkEntry::Skipped => Ok(ProcessedEntry::Skipped),
+        WalkEntry::Skipped => Ok(ProcessedEntry::WalkSkip),
 
         WalkEntry::SourceStarted { path } => Ok(ProcessedEntry::SourceStarted { path }),
 
@@ -311,26 +410,76 @@ fn process_file_worker_inner(
 struct LargeFileAccum {
     item: Item,
     abs_path: Arc<str>,
+    /// Pre-read fstat captured by segment 0's worker. Each segment's worker
+    /// already validates its own `pre_meta` against the walker's metadata,
+    /// so by transitivity all segments agree — we use this value at
+    /// finalization to populate the item fields.
     metadata: fs::MetadataSummary,
     next_expected_index: usize,
     num_segments: usize,
     /// Baseline `deduplicated_size` when segment 0 started (for verbose added_bytes).
     dedup_baseline: u64,
+    /// Stats byte-counter snapshot taken at segment 0 (restored on rollback).
+    stats_snap: crate::snapshot::ByteCounterSnapshot,
+}
+
+/// Take the current segmented accumulator, roll back any commits from
+/// earlier segments, restore stats, and emit a skip warning. Returns the
+/// number of remaining segments the consumer loop should drain
+/// (`num_segments - current_segment_index - 1`).
+///
+/// Called by:
+/// - the main loop when the worker reports `SegmentSkipped` at
+///   `segment_index > 0` with an active accumulator,
+/// - the main loop when a `WorkerErr` arrives soft during accumulation.
+///
+/// The rollback checkpoint is armed for the entire lifetime of the
+/// accumulator, so aborting it here is unconditional.
+fn rollback_and_skip_large_file(
+    repo: &mut Repository,
+    stats: &mut SnapshotStats,
+    large_file_accum: &mut Option<LargeFileAccum>,
+    progress: &mut Option<&mut dyn FnMut(BackupProgressEvent)>,
+    current_segment_index: usize,
+    reason: &str,
+) -> usize {
+    let Some(accum) = large_file_accum.take() else {
+        return 0;
+    };
+    repo.abort_rollback_checkpoint();
+    stats.restore_byte_counters(accum.stats_snap);
+    stats.errors += 1;
+    super::emit_post_commit_warning(
+        progress,
+        format!("skipping file '{}': {reason}", accum.abs_path),
+    );
+    accum.num_segments.saturating_sub(current_segment_index + 1)
 }
 
 /// Validate and update the segment accumulator state machine.
 ///
-/// For segment 0: initializes the accumulator (errors if one already exists).
+/// For segment 0: arms the rollback checkpoint, snapshots stats byte
+/// counters, and installs the accumulator (errors if one already exists).
+/// Ordering matters: the overlap check runs first, then the checkpoint is
+/// armed, then the accumulator is installed. That way a nested-segmentation
+/// error cannot leave a stray checkpoint, and accumulator-present always
+/// implies checkpoint-armed.
+///
 /// For continuations: validates ordering, file identity, and segment count.
-/// Returns `Ok(())` on success.
+/// Cross-segment metadata drift is not checked here — each segment's
+/// worker already verifies `pre_meta` against the walker's metadata, which
+/// is identical across segments.
+#[allow(clippy::too_many_arguments)]
 fn validate_segment_accum(
     large_file_accum: &mut Option<LargeFileAccum>,
     item: Option<Item>,
     abs_path: Arc<str>,
-    metadata: fs::MetadataSummary,
+    pre_meta: Option<fs::MetadataSummary>,
     segment_index: usize,
     num_segments: usize,
     dedup_baseline: u64,
+    repo: &mut Repository,
+    stats: &SnapshotStats,
 ) -> Result<()> {
     if segment_index == 0 {
         if large_file_accum.is_some() {
@@ -338,13 +487,21 @@ fn validate_segment_accum(
         }
         let item =
             item.ok_or_else(|| VykarError::Other("BUG: segment 0 must carry item".into()))?;
+        let pre_meta = pre_meta
+            .ok_or_else(|| VykarError::Other("BUG: segment 0 must carry pre_meta".into()))?;
+        // Arm the rollback checkpoint BEFORE installing the accumulator so
+        // the invariant `accum.is_some() ⇒ checkpoint armed` holds
+        // unconditionally.
+        repo.begin_rollback_checkpoint()?;
+        let stats_snap = stats.snapshot_byte_counters();
         *large_file_accum = Some(LargeFileAccum {
             item,
             abs_path,
-            metadata,
+            metadata: pre_meta,
             next_expected_index: 1,
             dedup_baseline,
             num_segments,
+            stats_snap,
         });
     } else {
         let accum = large_file_accum
@@ -394,7 +551,7 @@ fn consume_processed_entry(
         ProcessedEntry::ProcessedFile {
             mut item,
             abs_path,
-            metadata,
+            pre_meta,
             chunks,
             acquired_bytes,
         } => {
@@ -412,6 +569,15 @@ fn consume_processed_entry(
             budget.release(acquired_bytes);
 
             stats.nfiles += 1;
+
+            // Replace walk-time metadata with the pre-read fstat values so
+            // the persisted `Item` matches the bytes we just committed.
+            item.mode = pre_meta.mode;
+            item.uid = pre_meta.uid;
+            item.gid = pre_meta.gid;
+            item.size = pre_meta.size;
+            item.mtime = pre_meta.mtime_ns;
+            item.ctime = Some(pre_meta.ctime_ns);
 
             if verbose {
                 let added_bytes = stats.deduplicated_size - dedup_before;
@@ -441,11 +607,11 @@ fn consume_processed_entry(
 
             new_file_cache.insert(
                 &abs_path,
-                metadata.device,
-                metadata.inode,
-                metadata.mtime_ns,
-                metadata.ctime_ns,
-                metadata.size,
+                pre_meta.device,
+                pre_meta.inode,
+                pre_meta.mtime_ns,
+                pre_meta.ctime_ns,
+                pre_meta.size,
                 CachedChunks::from_chunk_refs(&item.chunks),
             );
 
@@ -455,7 +621,7 @@ fn consume_processed_entry(
         ProcessedEntry::FileSegment {
             item,
             abs_path,
-            metadata,
+            pre_meta,
             chunks,
             acquired_bytes,
             segment_index,
@@ -480,10 +646,12 @@ fn consume_processed_entry(
                 large_file_accum,
                 item,
                 abs_path,
-                metadata,
+                pre_meta,
                 segment_index,
                 num_segments,
                 dedup_baseline,
+                repo,
+                stats,
             )?;
 
             // Process chunks via shared helper.
@@ -513,6 +681,19 @@ fn consume_processed_entry(
                 })?;
                 stats.nfiles += 1;
 
+                // Commit the checkpoint — all segments landed successfully.
+                repo.commit_rollback_checkpoint();
+
+                // Update item metadata from segment 0's pre_meta (matches
+                // the chunks we committed across all segments).
+                let canon = accum.metadata;
+                accum.item.mode = canon.mode;
+                accum.item.uid = canon.uid;
+                accum.item.gid = canon.gid;
+                accum.item.size = canon.size;
+                accum.item.mtime = canon.mtime_ns;
+                accum.item.ctime = Some(canon.ctime_ns);
+
                 if verbose {
                     let added_bytes = stats.deduplicated_size - accum.dedup_baseline;
                     let status = if old_file_cache.contains(&accum.abs_path) {
@@ -541,11 +722,11 @@ fn consume_processed_entry(
 
                 new_file_cache.insert(
                     &accum.abs_path,
-                    accum.metadata.device,
-                    accum.metadata.inode,
-                    accum.metadata.mtime_ns,
-                    accum.metadata.ctime_ns,
-                    accum.metadata.size,
+                    canon.device,
+                    canon.inode,
+                    canon.mtime_ns,
+                    canon.ctime_ns,
+                    canon.size,
                     CachedChunks::from_chunk_refs(&accum.item.chunks),
                 );
 
@@ -627,8 +808,12 @@ fn consume_processed_entry(
         }
 
         // Skipped entries are handled in the consumer loop before reaching here.
-        ProcessedEntry::Skipped | ProcessedEntry::SegmentSkipped { .. } => {
-            unreachable!("Skipped/SegmentSkipped should be handled before consume_processed_entry");
+        ProcessedEntry::Skipped { .. }
+        | ProcessedEntry::SegmentSkipped { .. }
+        | ProcessedEntry::WalkSkip => {
+            unreachable!(
+                "Skipped/SegmentSkipped/WalkSkip should be handled before consume_processed_entry"
+            );
         }
     }
 
@@ -882,13 +1067,43 @@ pub(crate) fn run_parallel_pipeline(
                 }
 
                 match result {
-                    Ok(ProcessedEntry::Skipped) => {
+                    Ok(ProcessedEntry::Skipped { path, reason }) => {
+                        stats.errors += 1;
+                        super::emit_post_commit_warning(
+                            progress,
+                            format!("skipping file '{path}': {reason}"),
+                        );
+                    }
+                    Ok(ProcessedEntry::WalkSkip) => {
+                        // Walker already logged the failing path with
+                        // tracing::warn!; surface only the error count.
                         stats.errors += 1;
                     }
-                    Ok(ProcessedEntry::SegmentSkipped { num_segments }) => {
-                        stats.errors += 1;
-                        // Skip the remaining N-1 segments.
-                        segments_to_skip = num_segments.saturating_sub(1);
+                    Ok(ProcessedEntry::SegmentSkipped {
+                        segment_index,
+                        num_segments,
+                        path,
+                        reason,
+                    }) => {
+                        if segment_index == 0 || large_file_accum.is_none() {
+                            // Nothing committed yet — simple count + drain.
+                            stats.errors += 1;
+                            super::emit_post_commit_warning(
+                                progress,
+                                format!("skipping file '{path}': {reason}"),
+                            );
+                            segments_to_skip = num_segments.saturating_sub(segment_index + 1);
+                        } else {
+                            // Mid-accumulation skip: rollback earlier segments.
+                            segments_to_skip = rollback_and_skip_large_file(
+                                repo,
+                                stats,
+                                &mut large_file_accum,
+                                progress,
+                                segment_index,
+                                &reason,
+                            );
+                        }
                     }
                     Ok(entry) => {
                         if let Err(e) = consume_processed_entry(
@@ -913,10 +1128,27 @@ pub(crate) fn run_parallel_pipeline(
                         }
                     }
                     Err(e) => {
-                        // Safety net: soft WorkerErr on a regular file (no
-                        // data committed). Only safe if we're not mid-accumulation.
-                        if e.is_soft_file_error() && large_file_accum.is_none() {
-                            stats.errors += 1;
+                        if e.is_soft_file_error() {
+                            if large_file_accum.is_some() {
+                                // Mid-accumulation soft worker error: rollback
+                                // earlier segments. `next_expected_index`
+                                // is the segment we were about to process,
+                                // so current_segment_index is one less.
+                                let current = large_file_accum
+                                    .as_ref()
+                                    .map(|a| a.next_expected_index)
+                                    .unwrap_or(0);
+                                segments_to_skip = rollback_and_skip_large_file(
+                                    repo,
+                                    stats,
+                                    &mut large_file_accum,
+                                    progress,
+                                    current,
+                                    &e.to_string(),
+                                );
+                            } else {
+                                stats.errors += 1;
+                            }
                             continue;
                         }
                         budget.poison();
@@ -1007,8 +1239,15 @@ mod tests {
         }
     }
 
+    fn test_stats() -> SnapshotStats {
+        SnapshotStats::default()
+    }
+
     #[test]
     fn segment_out_of_order() {
+        let mut repo = crate::testutil::test_repo_plaintext();
+        repo.enable_dedup_mode();
+        let stats = test_stats();
         let mut accum: Option<LargeFileAccum> = None;
         let meta = test_metadata();
 
@@ -1017,24 +1256,40 @@ mod tests {
             &mut accum,
             Some(test_item("file_a")),
             "/tmp/file_a".into(),
-            meta,
+            Some(meta),
             0,
             3,
             0,
+            &mut repo,
+            &stats,
         )
         .unwrap();
 
         // Skip segment 1, feed segment 2 → error.
-        let err = validate_segment_accum(&mut accum, None, "/tmp/file_a".into(), meta, 2, 3, 0)
-            .unwrap_err();
+        let err = validate_segment_accum(
+            &mut accum,
+            None,
+            "/tmp/file_a".into(),
+            None,
+            2,
+            3,
+            0,
+            &mut repo,
+            &stats,
+        )
+        .unwrap_err();
         assert!(
             err.to_string().contains("segment index mismatch"),
             "expected 'segment index mismatch', got: {err}"
         );
+        repo.abort_rollback_checkpoint();
     }
 
     #[test]
     fn segment_file_identity_mismatch() {
+        let mut repo = crate::testutil::test_repo_plaintext();
+        repo.enable_dedup_mode();
+        let stats = test_stats();
         let mut accum: Option<LargeFileAccum> = None;
         let meta = test_metadata();
 
@@ -1043,24 +1298,40 @@ mod tests {
             &mut accum,
             Some(test_item("file_a")),
             "/tmp/file_a".into(),
-            meta,
+            Some(meta),
             0,
             3,
             0,
+            &mut repo,
+            &stats,
         )
         .unwrap();
 
         // Feed segment 1 with different abs_path → error.
-        let err = validate_segment_accum(&mut accum, None, "/tmp/file_b".into(), meta, 1, 3, 0)
-            .unwrap_err();
+        let err = validate_segment_accum(
+            &mut accum,
+            None,
+            "/tmp/file_b".into(),
+            None,
+            1,
+            3,
+            0,
+            &mut repo,
+            &stats,
+        )
+        .unwrap_err();
         assert!(
             err.to_string().contains("segment file identity mismatch"),
             "expected 'segment file identity mismatch', got: {err}"
         );
+        repo.abort_rollback_checkpoint();
     }
 
     #[test]
     fn segment_nested_start() {
+        let mut repo = crate::testutil::test_repo_plaintext();
+        repo.enable_dedup_mode();
+        let stats = test_stats();
         let mut accum: Option<LargeFileAccum> = None;
         let meta = test_metadata();
 
@@ -1069,38 +1340,56 @@ mod tests {
             &mut accum,
             Some(test_item("file_a")),
             "/tmp/file_a".into(),
-            meta,
+            Some(meta),
             0,
             3,
             0,
+            &mut repo,
+            &stats,
         )
         .unwrap();
 
         // Feed segment 0 for file B before file A completes → error.
+        // The overlap check must fire BEFORE begin_rollback_checkpoint, so
+        // the tracker remains armed from file A only.
         let err = validate_segment_accum(
             &mut accum,
             Some(test_item("file_b")),
             "/tmp/file_b".into(),
-            meta,
+            Some(meta),
             0,
             2,
             0,
+            &mut repo,
+            &stats,
         )
         .unwrap_err();
         assert!(
             err.to_string().contains("nested large file segmentation"),
             "expected 'nested large file segmentation', got: {err}"
         );
+        repo.abort_rollback_checkpoint();
     }
 
     #[test]
     fn segment_without_start() {
+        let mut repo = crate::testutil::test_repo_plaintext();
+        let stats = test_stats();
         let mut accum: Option<LargeFileAccum> = None;
-        let meta = test_metadata();
 
         // Feed segment 1 with no prior segment 0 → error.
-        let err = validate_segment_accum(&mut accum, None, "/tmp/file_a".into(), meta, 1, 3, 0)
-            .unwrap_err();
+        let err = validate_segment_accum(
+            &mut accum,
+            None,
+            "/tmp/file_a".into(),
+            None,
+            1,
+            3,
+            0,
+            &mut repo,
+            &stats,
+        )
+        .unwrap_err();
         assert!(
             err.to_string()
                 .contains("FileSegment without preceding segment 0"),
@@ -1110,6 +1399,9 @@ mod tests {
 
     #[test]
     fn incomplete_accumulator_check() {
+        let mut repo = crate::testutil::test_repo_plaintext();
+        repo.enable_dedup_mode();
+        let stats = test_stats();
         let mut accum: Option<LargeFileAccum> = None;
         let meta = test_metadata();
 
@@ -1118,13 +1410,26 @@ mod tests {
             &mut accum,
             Some(test_item("file_a")),
             "/tmp/file_a".into(),
-            meta,
+            Some(meta),
             0,
             3,
             0,
+            &mut repo,
+            &stats,
         )
         .unwrap();
-        validate_segment_accum(&mut accum, None, "/tmp/file_a".into(), meta, 1, 3, 0).unwrap();
+        validate_segment_accum(
+            &mut accum,
+            None,
+            "/tmp/file_a".into(),
+            None,
+            1,
+            3,
+            0,
+            &mut repo,
+            &stats,
+        )
+        .unwrap();
 
         // Simulate the post-loop check from run_parallel_pipeline.
         assert!(accum.is_some(), "accum should still be active");
@@ -1140,10 +1445,14 @@ mod tests {
             err_msg.contains("incomplete segmented file"),
             "expected incomplete message, got: {err_msg}"
         );
+        repo.abort_rollback_checkpoint();
     }
 
     #[test]
     fn segment_count_mismatch() {
+        let mut repo = crate::testutil::test_repo_plaintext();
+        repo.enable_dedup_mode();
+        let stats = test_stats();
         let mut accum: Option<LargeFileAccum> = None;
         let meta = test_metadata();
 
@@ -1152,24 +1461,40 @@ mod tests {
             &mut accum,
             Some(test_item("file_a")),
             "/tmp/file_a".into(),
-            meta,
+            Some(meta),
             0,
             3,
             0,
+            &mut repo,
+            &stats,
         )
         .unwrap();
 
         // Feed segment 1 with different num_segments → error.
-        let err = validate_segment_accum(&mut accum, None, "/tmp/file_a".into(), meta, 1, 5, 0)
-            .unwrap_err();
+        let err = validate_segment_accum(
+            &mut accum,
+            None,
+            "/tmp/file_a".into(),
+            None,
+            1,
+            5,
+            0,
+            &mut repo,
+            &stats,
+        )
+        .unwrap_err();
         assert!(
             err.to_string().contains("segment count mismatch"),
             "expected 'segment count mismatch', got: {err}"
         );
+        repo.abort_rollback_checkpoint();
     }
 
     #[test]
     fn segment_happy_path() {
+        let mut repo = crate::testutil::test_repo_plaintext();
+        repo.enable_dedup_mode();
+        let stats = test_stats();
         let mut accum: Option<LargeFileAccum> = None;
         let meta = test_metadata();
 
@@ -1180,7 +1505,19 @@ mod tests {
             } else {
                 None
             };
-            validate_segment_accum(&mut accum, item, "/tmp/file_a".into(), meta, i, 3, 0).unwrap();
+            let pre_meta = (i == 0).then_some(meta);
+            validate_segment_accum(
+                &mut accum,
+                item,
+                "/tmp/file_a".into(),
+                pre_meta,
+                i,
+                3,
+                0,
+                &mut repo,
+                &stats,
+            )
+            .unwrap();
         }
 
         // Accumulator should be present with next_expected_index == 3.
@@ -1189,6 +1526,101 @@ mod tests {
         assert_eq!(a.num_segments, 3);
         assert_eq!(a.item.path, "file_a");
         assert_eq!(&*a.abs_path, "/tmp/file_a");
+        repo.abort_rollback_checkpoint();
+    }
+
+    /// Drives `rollback_and_skip_large_file` directly (Mechanism B): an
+    /// accumulator midway through a 4-segment file is rolled back, byte
+    /// counters are restored, and the drain count for the remaining
+    /// segments is reported correctly.
+    #[test]
+    fn rollback_and_skip_large_file_drains_and_restores_stats() {
+        let mut repo = crate::testutil::test_repo_plaintext();
+        repo.enable_dedup_mode();
+
+        // Arm the checkpoint just like validate_segment_accum would for
+        // segment 0.
+        repo.begin_rollback_checkpoint().unwrap();
+        assert!(repo.rollback_tracker_armed());
+
+        // Snapshot initial byte counters (all zeros), then dirty them so
+        // we can verify they get restored.
+        let stats_snap = SnapshotStats::default().snapshot_byte_counters();
+        let mut stats = SnapshotStats {
+            deduplicated_size: 12345,
+            original_size: 99999,
+            compressed_size: 4242,
+            errors: 0,
+            ..Default::default()
+        };
+
+        let accum = LargeFileAccum {
+            item: test_item("big"),
+            abs_path: Arc::from("/tmp/big"),
+            metadata: test_metadata(),
+            next_expected_index: 2,
+            num_segments: 4,
+            dedup_baseline: 0,
+            stats_snap,
+        };
+        let mut accum = Some(accum);
+        let mut progress: Option<&mut dyn FnMut(BackupProgressEvent)> = None;
+
+        let drain = rollback_and_skip_large_file(
+            &mut repo,
+            &mut stats,
+            &mut accum,
+            &mut progress,
+            2,
+            "drift",
+        );
+
+        // 4 segments, skipped at index 2 → segments 3 remain to drain.
+        assert_eq!(drain, 1, "4 segs, skipped at idx 2 → 1 remaining");
+        assert!(accum.is_none(), "accumulator cleared");
+        assert!(!repo.rollback_tracker_armed(), "checkpoint must be aborted");
+        assert_eq!(stats.errors, 1);
+        assert_eq!(
+            stats.deduplicated_size, 0,
+            "deduplicated_size restored from snapshot"
+        );
+        assert_eq!(
+            stats.original_size, 0,
+            "original_size restored from snapshot"
+        );
+        assert_eq!(
+            stats.compressed_size, 0,
+            "compressed_size restored from snapshot"
+        );
+    }
+
+    /// Idempotency: calling `rollback_and_skip_large_file` with no
+    /// accumulator is a no-op — drain count of zero, stats untouched.
+    #[test]
+    fn rollback_and_skip_large_file_no_accum_is_noop() {
+        let mut repo = crate::testutil::test_repo_plaintext();
+        let mut stats = SnapshotStats {
+            deduplicated_size: 7,
+            ..Default::default()
+        };
+        let mut accum: Option<LargeFileAccum> = None;
+        let mut progress: Option<&mut dyn FnMut(BackupProgressEvent)> = None;
+
+        let drain = rollback_and_skip_large_file(
+            &mut repo,
+            &mut stats,
+            &mut accum,
+            &mut progress,
+            0,
+            "ignored",
+        );
+
+        assert_eq!(drain, 0);
+        assert_eq!(stats.errors, 0, "no error counted when accum was empty");
+        assert_eq!(
+            stats.deduplicated_size, 7,
+            "stats untouched when accum was empty"
+        );
     }
 
     // -----------------------------------------------------------------------

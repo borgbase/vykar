@@ -58,16 +58,20 @@ enum MarkerState {
     Unknown,
 }
 
-/// Tracks index mutations during a streaming command dump so they can be
-/// rolled back if the dump command fails mid-stream.
-pub(crate) struct DumpRollbackTracker {
+/// Tracks index mutations between `begin_rollback_checkpoint` and commit so
+/// they can be undone if the guarded scope (command dump, or per-file backup
+/// chunk loop) fails mid-stream.
+///
+/// The primitive is single-slot: only one tracker can be armed at a time.
+/// The backup serial consumer and the dump command never overlap.
+pub(crate) struct RollbackTracker {
     /// Truncation point for IndexDelta.
     pub delta_checkpoint: IndexDeltaCheckpoint,
-    /// ChunkIds inserted into tiered_dedup or dedup_index during this dump.
+    /// ChunkIds inserted into tiered_dedup or dedup_index during this scope.
     pub dedup_inserts: Vec<ChunkId>,
     /// Entries promoted out of recovered_chunks — saved to re-insert on rollback.
     pub promoted_recovered: Vec<(ChunkId, RecoveredChunkEntry)>,
-    /// PackIds added to PendingIndexJournal during this dump.
+    /// PackIds added to PendingIndexJournal during this scope.
     pub journal_pack_ids: Vec<PackId>,
     /// Data pack writer target size at checkpoint time (for reset on rollback).
     pub data_pack_target_size: usize,
@@ -114,8 +118,10 @@ pub(crate) struct WriteSessionState {
     /// Session ID for per-session pending_index files.
     /// Defaults to `"default"` for non-backup callers/tests.
     pub(crate) session_id: String,
-    /// Active dump rollback tracker (set during streaming command dumps).
-    pub(crate) dump_tracker: Option<DumpRollbackTracker>,
+    /// Active rollback tracker — set during streaming command dumps and
+    /// during per-file backup chunk loops that need to survive mid-read
+    /// drift detection. Single-slot by design.
+    pub(crate) rollback_tracker: Option<RollbackTracker>,
 }
 
 impl WriteSessionState {
@@ -140,7 +146,7 @@ impl WriteSessionState {
             persisted_pack_count: 0,
             session_packs_flushed: 0,
             session_id: DEFAULT_SESSION_ID.to_string(),
-            dump_tracker: None,
+            rollback_tracker: None,
         }
     }
 
@@ -305,7 +311,7 @@ impl WriteSessionState {
                 if let Some(ref mut delta) = self.index_delta {
                     delta.add_new_entry(chunk_id, stored_size, pack_id, offset, refcount);
                 }
-                if let Some(ref mut tracker) = self.dump_tracker {
+                if let Some(ref mut tracker) = self.rollback_tracker {
                     tracker.dedup_inserts.push(chunk_id);
                 }
             }
@@ -318,19 +324,19 @@ impl WriteSessionState {
                 if let Some(ref mut delta) = self.index_delta {
                     delta.add_new_entry(chunk_id, stored_size, pack_id, offset, refcount);
                 }
-                if let Some(ref mut tracker) = self.dump_tracker {
+                if let Some(ref mut tracker) = self.rollback_tracker {
                     tracker.dedup_inserts.push(chunk_id);
                 }
             }
             false
         } else {
+            // Non-dedup mode: `begin_rollback_checkpoint` asserts a dedup
+            // mode is active, so no tracker can exist here.
+            debug_assert!(self.rollback_tracker.is_none());
             for (chunk_id, stored_size, offset, refcount) in entries {
                 chunk_index.add(chunk_id, stored_size, pack_id, offset);
                 for _ in 1..refcount {
                     chunk_index.increment_refcount(&chunk_id);
-                }
-                if let Some(ref mut tracker) = self.dump_tracker {
-                    tracker.dedup_inserts.push(chunk_id);
                 }
             }
             true
@@ -598,8 +604,8 @@ impl WriteSessionState {
         chunk_id: &ChunkId,
         chunk_index: &mut ChunkIndex,
     ) -> Option<(u32, bool)> {
-        // Record for dump rollback before removing from recovered_chunks.
-        if let Some(ref mut tracker) = self.dump_tracker {
+        // Record for rollback before removing from recovered_chunks.
+        if let Some(ref mut tracker) = self.rollback_tracker {
             if let Some(recovered) = self.recovered_chunks.get(chunk_id) {
                 tracker
                     .promoted_recovered

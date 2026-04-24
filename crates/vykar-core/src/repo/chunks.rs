@@ -267,8 +267,8 @@ impl Repository {
             .collect();
         ws.pending_journal.record_pack(pack_id, journal_chunks);
 
-        // Record pack ID for dump rollback tracking.
-        if let Some(ref mut tracker) = ws.dump_tracker {
+        // Record pack ID for rollback tracking (dump / per-file backup).
+        if let Some(ref mut tracker) = ws.rollback_tracker {
             tracker.journal_pack_ids.push(pack_id);
         }
 

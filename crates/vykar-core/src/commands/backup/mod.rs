@@ -7,6 +7,8 @@ mod sequential;
 mod source;
 mod walk;
 
+pub(crate) mod read_source;
+
 pub(crate) use chunk_process::WorkerChunk;
 
 use std::sync::atomic::AtomicBool;
@@ -184,6 +186,37 @@ pub(crate) fn emit_post_commit_warning<F: FnMut(BackupProgressEvent)>(
     warn!("{msg}");
     if let Some(ref mut cb) = progress {
         cb(BackupProgressEvent::Warning { message: msg });
+    }
+}
+
+/// Run `body` inside a rollback-guarded scope.
+///
+/// Arms a rollback checkpoint on the repo and snapshots the stats byte
+/// counters. On `Ok` the checkpoint is committed; on `Err` the checkpoint
+/// is rolled back (undoing refcount bumps, dedup inserts, recovered-chunk
+/// promotion, and partial pack writer state) and the stats byte counters
+/// are restored to their pre-scope values.
+///
+/// Closure form because a drop-guard holding `&mut Repository` + `&mut
+/// SnapshotStats` can't compose with bodies that need to pass those same
+/// mutable references to helpers like `flush_regular_file_batch`.
+pub(crate) fn with_rollback_checkpoint<R>(
+    repo: &mut Repository,
+    stats: &mut SnapshotStats,
+    body: impl FnOnce(&mut Repository, &mut SnapshotStats) -> Result<R>,
+) -> Result<R> {
+    let stats_snap = stats.snapshot_byte_counters();
+    repo.begin_rollback_checkpoint()?;
+    match body(repo, stats) {
+        Ok(r) => {
+            repo.commit_rollback_checkpoint();
+            Ok(r)
+        }
+        Err(e) => {
+            repo.abort_rollback_checkpoint();
+            stats.restore_byte_counters(stats_snap);
+            Err(e)
+        }
     }
 }
 

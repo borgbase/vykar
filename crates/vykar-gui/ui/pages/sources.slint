@@ -1,4 +1,4 @@
-import { VerticalBox, ListView } from "std-widgets.slint";
+import { VerticalBox, HorizontalBox, Button, ListView } from "std-widgets.slint";
 import { SourceInfo } from "../components/types.slint";
 import { SourceRow } from "../components/source_row.slint";
 
@@ -8,17 +8,34 @@ export component SourcesPage inherits Rectangle {
 
     callback backup_source(int);
     callback toggle_source_expanded(int);
+    callback edit_config_clicked();
 
     VerticalBox {
         padding: 12px;
         spacing: 8px;
+
+        HorizontalBox {
+            padding: 0px;
+            spacing: 8px;
+            Text {
+                text: "Sources";
+                vertical-alignment: center;
+                font-weight: 700;
+                font-size: 16px;
+                horizontal-stretch: 1;
+            }
+            Button {
+                text: "Advanced Config";
+                clicked => { root.edit_config_clicked(); }
+            }
+        }
 
         ListView {
             vertical-stretch: 1;
             for source[idx] in root.source_model: SourceRow {
                 source: source;
                 operation_busy: root.operation_busy;
-                backup_label: "Backup to all Repos";
+                backup_label: "Run Backup";
                 toggle_expanded => { root.toggle_source_expanded(idx); }
                 backup_clicked => { root.backup_source(idx); }
             }

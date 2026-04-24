@@ -5,6 +5,12 @@ export component LogPage inherits Rectangle {
 
     VerticalBox {
         padding: 12px;
+        spacing: 8px;
+        Text {
+            text: "Activity Log";
+            font-weight: 700;
+            font-size: 16px;
+        }
         StandardTableView {
             vertical-stretch: 1;
             columns: [

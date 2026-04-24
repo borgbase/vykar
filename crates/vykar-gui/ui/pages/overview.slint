@@ -35,10 +35,8 @@ export component OverviewPage inherits Rectangle {
     in property <[SourceInfo]> source_model;
     in property <[[StandardListViewItem]]> snapshot_rows;
     in property <bool> operation_busy;
-    in property <bool> is_mount_active;
 
     callback backup_clicked();
-    callback mount_clicked();
     callback view_all_snapshots_clicked();
     callback view_all_sources_clicked();
     callback toggle_source_expanded(int);
@@ -62,15 +60,10 @@ export component OverviewPage inherits Rectangle {
                 HorizontalLayout {
                     spacing: 8px;
                     Button {
-                        text: "Backup";
+                        text: "Run Backup";
                         primary: true;
                         enabled: !root.operation_busy;
                         clicked => { root.backup_clicked(); }
-                    }
-                    Button {
-                        text: "Mount";
-                        enabled: !root.operation_busy && !root.is_mount_active;
-                        clicked => { root.mount_clicked(); }
                     }
                 }
             }

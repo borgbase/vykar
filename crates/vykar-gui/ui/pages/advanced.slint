@@ -23,8 +23,37 @@ export component AdvancedPage inherits Rectangle {
         HorizontalBox {
             padding: 0px;
             spacing: 8px;
+            Text {
+                text: "Advanced Config";
+                vertical-alignment: center;
+                font-weight: 700;
+                font-size: 16px;
+                horizontal-stretch: 1;
+            }
+            Button {
+                text: "Reload";
+                enabled: !root.operation_busy && !root.editor_dirty;
+                clicked => { root.reload_config_clicked(); }
+            }
+            Button {
+                text: "Discard Changes";
+                enabled: root.editor_dirty && !root.operation_busy;
+                clicked => { root.discard_clicked(); }
+            }
+            Button {
+                text: "Save and Apply";
+                primary: true;
+                enabled: root.editor_dirty && !root.operation_busy;
+                clicked => { root.save_clicked(); }
+            }
+        }
+
+        HorizontalBox {
+            padding: 0px;
+            spacing: 8px;
             Text { text: "Config:"; vertical-alignment: center; font-weight: 700; }
             TouchArea {
+                horizontal-stretch: 1;
                 mouse-cursor: pointer;
                 clicked => { root.open_config_clicked(); }
                 Text { text: root.config_path; color: #4a90d9; vertical-alignment: center; overflow: elide; }
@@ -33,12 +62,6 @@ export component AdvancedPage inherits Rectangle {
                 mouse-cursor: pointer;
                 clicked => { root.switch_config_clicked(); }
                 Text { text: "(Change)"; color: #4a90d9; vertical-alignment: center; font-size: 12px; }
-            }
-            Rectangle { horizontal-stretch: 1; }
-            Button {
-                text: "Reload";
-                enabled: !root.operation_busy && !root.editor_dirty;
-                clicked => { root.reload_config_clicked(); }
             }
         }
 
@@ -62,22 +85,6 @@ export component AdvancedPage inherits Rectangle {
             text: root.editor_status;
             color: #cc0000;
             wrap: word-wrap;
-        }
-        HorizontalBox {
-            padding: 0px;
-            spacing: 8px;
-            Rectangle { horizontal-stretch: 1; }
-            Button {
-                text: "Discard";
-                enabled: root.editor_dirty;
-                clicked => { root.discard_clicked(); }
-            }
-            Button {
-                text: "Save and Apply";
-                primary: true;
-                enabled: root.editor_dirty && !root.operation_busy;
-                clicked => { root.save_clicked(); }
-            }
         }
     }
 }

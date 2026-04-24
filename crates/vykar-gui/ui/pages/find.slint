@@ -2,6 +2,7 @@ import { VerticalBox, HorizontalBox, Button, LineEdit, StandardTableView } from 
 
 export component FindPage inherits Rectangle {
     in property <string> repo_name;
+    in property <bool> operation_busy;
     in-out property <string> name_pattern;
     in property <string> status_text;
     in property <[[StandardListViewItem]]> result_rows;
@@ -16,20 +17,35 @@ export component FindPage inherits Rectangle {
             padding: 0px;
             spacing: 8px;
             Text {
-                text: root.repo_name != "" ? "Find in " + root.repo_name : "Find files";
+                text: root.repo_name != "" ? "Find Files: " + root.repo_name : "Find Files";
                 vertical-alignment: center;
                 font-weight: 700;
-                width: 200px;
+                font-size: 16px;
+                horizontal-stretch: 1;
             }
-            Text { text: "Name pattern:"; vertical-alignment: center; }
+        }
+
+        HorizontalBox {
+            padding: 0px;
+            spacing: 8px;
+            Text {
+                text: "Name pattern:";
+                vertical-alignment: center;
+            }
             LineEdit {
                 horizontal-stretch: 1;
                 text <=> root.name_pattern;
                 placeholder-text: "e.g. *.rs, config*";
-                accepted => { root.search_clicked(); }
+                accepted => {
+                    if (!root.operation_busy) {
+                        root.search_clicked();
+                    }
+                }
             }
             Button {
                 text: "Search";
+                primary: true;
+                enabled: !root.operation_busy;
                 clicked => { root.search_clicked(); }
             }
         }

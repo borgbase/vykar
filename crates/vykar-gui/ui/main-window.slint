@@ -81,7 +81,6 @@ export component MainWindow inherits Window {
     callback restore_selected_snapshot_clicked(/* row */ int);
     callback delete_selected_snapshot_clicked(/* row */ int);
     callback mount_selected_snapshot_clicked(/* row */ int);
-    callback mount_repo_clicked(/* repo_index */ int);
     callback stop_mount_clicked();
     callback open_mount_url_clicked();
     callback snapshot_sort_ascending(/* column */ int);
@@ -95,16 +94,28 @@ export component MainWindow inherits Window {
     callback start_in_background_toggled(/* checked */ bool);
     callback release-focus();
 
-    release-focus => { focus-sink.focus(); }
-    title: "Vykar Backup";
-    preferred-width: 1100px;
-    preferred-height: 760px;
-
     // Derived: the currently selected RepoInfo (or an empty fallback).
     property <RepoInfo> active_repo: root.current_repo_index >= 0
         && root.current_repo_index < root.repo_model.length
         ? root.repo_model[root.current_repo_index]
         : { name: "", url: "", snapshots: "", last_snapshot: "", size: "" };
+
+    property <string> active_repo_title_suffix:
+        root.active_repo.name != "" ? " - " + root.active_repo.name : "";
+
+    property <string> window_title:
+        root.current_page == Page.overview ? "Overview" + root.active_repo_title_suffix + " - Vykar Backup"
+        : root.current_page == Page.snapshots ? "Snapshots" + root.active_repo_title_suffix + " - Vykar Backup"
+        : root.current_page == Page.find ? "Find Files" + root.active_repo_title_suffix + " - Vykar Backup"
+        : root.current_page == Page.sources ? "Sources - Vykar Backup"
+        : root.current_page == Page.advanced ? "Advanced Config - Vykar Backup"
+        : root.current_page == Page.log ? "Activity Log - Vykar Backup"
+        : "Settings - Vykar Backup";
+
+    release-focus => { focus-sink.focus(); }
+    title: root.window_title;
+    preferred-width: 1100px;
+    preferred-height: 760px;
 
     focus-sink := FocusScope {
         key-pressed(event) => {
@@ -174,7 +185,7 @@ export component MainWindow inherits Window {
                                             clicked => { root.select_repo_and_page(idx, Page.snapshots); }
                                         }
                                         SideBarSubItem {
-                                            text: "Find files";
+                                            text: "Find Files";
                                             glyph: ">";
                                             selected: root.current_page == Page.find;
                                             clicked => { root.select_repo_and_page(idx, Page.find); }
@@ -230,9 +241,7 @@ export component MainWindow inherits Window {
                     source_model: root.repo_source_model;
                     snapshot_rows: root.recent_snapshot_rows;
                     operation_busy: root.operation_busy;
-                    is_mount_active: root.is_mount_active;
                     backup_clicked => { root.backup_repo_clicked(root.current_repo_index); }
-                    mount_clicked => { root.mount_repo_clicked(root.current_repo_index); }
                     view_all_snapshots_clicked => {
                         root.select_repo_and_page(root.current_repo_index, Page.snapshots);
                     }
@@ -257,6 +266,7 @@ export component MainWindow inherits Window {
 
                 if root.current_page == Page.find: FindPage {
                     repo_name: root.active_repo.name;
+                    operation_busy: root.operation_busy;
                     name_pattern <=> root.find_name_pattern;
                     status_text: root.find_status_text;
                     result_rows: root.find_result_rows;
@@ -268,6 +278,7 @@ export component MainWindow inherits Window {
                     operation_busy: root.operation_busy;
                     backup_source(i) => { root.backup_source_clicked(i); }
                     toggle_source_expanded(i) => { root.toggle_source_expanded(i); }
+                    edit_config_clicked => { root.select_page(Page.advanced); }
                 }
 
                 if root.current_page == Page.advanced: AdvancedPage {

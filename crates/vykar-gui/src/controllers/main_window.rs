@@ -361,24 +361,6 @@ pub(crate) fn wire_callbacks(
 
     {
         let tx = app_tx.clone();
-        let ui_weak = ui.as_weak();
-        ui.on_mount_repo_clicked(move |idx| {
-            let Some(ui) = ui_weak.upgrade() else {
-                return;
-            };
-            let labels = ui.global::<AppData>().get_repo_labels();
-            if let Some(name) = labels.row_data(idx as usize) {
-                ui.set_is_mount_active(true);
-                let _ = tx.send(AppCommand::StartMount {
-                    repo_name: name.to_string(),
-                    snapshot_name: None,
-                });
-            }
-        });
-    }
-
-    {
-        let tx = app_tx.clone();
         ui.on_stop_mount_clicked(move || {
             let _ = tx.send(AppCommand::StopMount);
         });

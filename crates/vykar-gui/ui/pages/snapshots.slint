@@ -22,9 +22,10 @@ export component SnapshotsPage inherits Rectangle {
             padding: 0px;
             spacing: 8px;
             Text {
-                text: root.repo_name != "" ? "Snapshots in " + root.repo_name : "Snapshots";
+                text: root.repo_name != "" ? "Snapshots: " + root.repo_name : "Snapshots";
                 vertical-alignment: center;
                 font-weight: 700;
+                font-size: 16px;
                 horizontal-stretch: 1;
             }
             Button {
@@ -34,6 +35,7 @@ export component SnapshotsPage inherits Rectangle {
             }
             Button {
                 text: "Prune";
+                primary: true;
                 enabled: !root.operation_busy;
                 clicked => { root.prune_clicked(); }
             }

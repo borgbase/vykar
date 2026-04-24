@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use vykar_types::chunk_id::ChunkId;
+use vykar_types::error::{Result, VykarError};
 
 /// A single filesystem entry stored in a snapshot.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -49,4 +50,169 @@ pub struct ChunkRef {
     pub size: u32,
     /// Size as stored (compressed + encrypted).
     pub csize: u32,
+}
+
+impl Item {
+    /// Validate per-item invariants. Cross-item invariants (e.g. duplicate
+    /// paths) are the caller's responsibility.
+    pub fn validate(&self) -> Result<()> {
+        match self.entry_type {
+            ItemType::RegularFile => {
+                if self.link_target.is_some() {
+                    return Err(VykarError::InvalidFormat(format!(
+                        "item '{}': regular file has link_target",
+                        self.path
+                    )));
+                }
+                let sum: u64 = self.chunks.iter().map(|c| c.size as u64).sum();
+                if sum != self.size {
+                    return Err(VykarError::InvalidFormat(format!(
+                        "regular file {:?} has size {} but chunk sizes sum to {}",
+                        self.path, self.size, sum
+                    )));
+                }
+            }
+            ItemType::Directory => {
+                if !self.chunks.is_empty() {
+                    return Err(VykarError::InvalidFormat(format!(
+                        "item '{}': directory has {} chunks",
+                        self.path,
+                        self.chunks.len()
+                    )));
+                }
+                if self.link_target.is_some() {
+                    return Err(VykarError::InvalidFormat(format!(
+                        "item '{}': directory has link_target",
+                        self.path
+                    )));
+                }
+                // Deliberately do NOT assert size == 0. Historical snapshots
+                // may not guarantee it and we don't want to break reads.
+            }
+            ItemType::Symlink => {
+                if !self.chunks.is_empty() {
+                    return Err(VykarError::InvalidFormat(format!(
+                        "item '{}': symlink has {} chunks",
+                        self.path,
+                        self.chunks.len()
+                    )));
+                }
+                if self.link_target.is_none() {
+                    return Err(VykarError::InvalidFormat(format!(
+                        "item '{}': symlink missing link_target",
+                        self.path
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_item(entry_type: ItemType, path: &str) -> Item {
+        Item {
+            path: path.to_string(),
+            entry_type,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            user: None,
+            group: None,
+            mtime: 0,
+            atime: None,
+            ctime: None,
+            size: 0,
+            chunks: Vec::new(),
+            link_target: None,
+            xattrs: None,
+        }
+    }
+
+    fn chunk(size: u32) -> ChunkRef {
+        ChunkRef {
+            id: ChunkId([0u8; 32]),
+            size,
+            csize: size,
+        }
+    }
+
+    #[test]
+    fn validate_ok_regular_file_with_matching_size() {
+        let mut item = base_item(ItemType::RegularFile, "a.txt");
+        item.chunks = vec![chunk(100), chunk(50)];
+        item.size = 150;
+        item.validate().unwrap();
+    }
+
+    #[test]
+    fn validate_ok_empty_regular_file() {
+        let item = base_item(ItemType::RegularFile, "empty.txt");
+        item.validate().unwrap();
+    }
+
+    #[test]
+    fn validate_rejects_regular_file_with_wrong_sum() {
+        let mut item = base_item(ItemType::RegularFile, "a.txt");
+        item.chunks = vec![chunk(50)];
+        item.size = 100;
+        let err = item.validate().unwrap_err().to_string();
+        assert!(err.contains("chunk sizes sum to"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_regular_file_with_link_target() {
+        let mut item = base_item(ItemType::RegularFile, "a.txt");
+        item.link_target = Some("target".into());
+        let err = item.validate().unwrap_err().to_string();
+        assert!(err.contains("regular file has link_target"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_ok_directory() {
+        let item = base_item(ItemType::Directory, "dir");
+        item.validate().unwrap();
+    }
+
+    #[test]
+    fn validate_rejects_directory_with_chunks() {
+        let mut item = base_item(ItemType::Directory, "dir");
+        item.chunks = vec![chunk(10)];
+        let err = item.validate().unwrap_err().to_string();
+        assert!(err.contains("directory has 1 chunks"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_directory_with_link_target() {
+        let mut item = base_item(ItemType::Directory, "dir");
+        item.link_target = Some("target".into());
+        let err = item.validate().unwrap_err().to_string();
+        assert!(err.contains("directory has link_target"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_ok_symlink() {
+        let mut item = base_item(ItemType::Symlink, "link");
+        item.link_target = Some("target".into());
+        item.validate().unwrap();
+    }
+
+    #[test]
+    fn validate_rejects_symlink_without_link_target() {
+        let item = base_item(ItemType::Symlink, "link");
+        let err = item.validate().unwrap_err().to_string();
+        assert!(err.contains("symlink missing link_target"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_symlink_with_chunks() {
+        let mut item = base_item(ItemType::Symlink, "link");
+        item.chunks = vec![chunk(10)];
+        item.link_target = Some("target".into());
+        let err = item.validate().unwrap_err().to_string();
+        assert!(err.contains("symlink has 1 chunks"), "got: {err}");
+    }
 }

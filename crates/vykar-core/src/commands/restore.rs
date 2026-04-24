@@ -457,6 +457,7 @@ where
         if !include_path(&item.path) {
             return Ok(());
         }
+        item.validate()?;
         match item.entry_type {
             ItemType::Directory => {
                 sanitize_item_path_into(&item.path, &mut rel_scratch)?;
@@ -508,12 +509,6 @@ where
                         file_offset,
                     });
                     file_offset += chunk_ref.size as u64;
-                }
-                if file_offset != item.size {
-                    return Err(VykarError::InvalidFormat(format!(
-                        "regular file {:?} has size {} but chunk sizes sum to {}",
-                        item.path, item.size, file_offset
-                    )));
                 }
                 planned_files.push(PlannedFile {
                     rel_path: rel_scratch.clone(),

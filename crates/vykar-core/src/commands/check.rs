@@ -100,6 +100,13 @@ pub enum IntegrityIssue {
         snapshot_name: String,
         detail: String,
     },
+    /// Snapshot item failed per-item invariant validation.
+    InvalidItem {
+        snapshot_id: SnapshotId,
+        snapshot_name: Option<String>,
+        item_path: String,
+        reason: String,
+    },
 }
 
 impl IntegrityIssue {
@@ -170,6 +177,21 @@ impl IntegrityIssue {
                 context: format!("snapshot '{snapshot_name}'"),
                 message: format!("I/O error: {detail}"),
             },
+            IntegrityIssue::InvalidItem {
+                snapshot_id,
+                snapshot_name,
+                item_path,
+                reason,
+            } => {
+                let ctx = match snapshot_name {
+                    Some(name) => format!("snapshot '{name}' item '{item_path}'"),
+                    None => format!("snapshot {snapshot_id} item '{item_path}'"),
+                };
+                CheckError {
+                    context: ctx,
+                    message: reason.clone(),
+                }
+            }
         }
     }
 }
@@ -977,11 +999,23 @@ fn integrity_scan(
 
         let mut per_snapshot_items = 0usize;
         let entry_name = entry.name.clone();
+        let entry_id = entry.id;
         let collect_refs = opts.collect_chunk_refs;
         let item_issues: Mutex<Vec<IntegrityIssue>> = Mutex::new(Vec::new());
         let file_chunk_ids: Mutex<Vec<ChunkId>> = Mutex::new(Vec::new());
         if let Err(e) = for_each_decoded_item(&items_stream, |item| {
             per_snapshot_items += 1;
+            if let Err(e) = item.validate() {
+                item_issues
+                    .lock()
+                    .unwrap()
+                    .push(IntegrityIssue::InvalidItem {
+                        snapshot_id: entry_id,
+                        snapshot_name: Some(entry_name.clone()),
+                        item_path: item.path.clone(),
+                        reason: e.to_string(),
+                    });
+            }
             if item.entry_type == ItemType::RegularFile {
                 for chunk_ref in &item.chunks {
                     if collect_refs {
@@ -1432,6 +1466,23 @@ fn build_repair_plan(
                 snapshot_name,
             } if !actions.iter().any(|a| matches!(a, RepairAction::RemoveCorruptSnapshot { snapshot_id: id, .. } if *id == *snapshot_id)) => {
                 // Deduplicate by snapshot_id
+                actions.push(RepairAction::RemoveCorruptSnapshot {
+                    snapshot_id: *snapshot_id,
+                    name: snapshot_name.clone(),
+                });
+                if let Some(name) = snapshot_name {
+                    corrupt_snapshot_names.insert(name.clone());
+                }
+                has_data_loss = true;
+            }
+            IntegrityIssue::InvalidItem {
+                snapshot_id,
+                snapshot_name,
+                ..
+            } if !actions.iter().any(|a| matches!(a, RepairAction::RemoveCorruptSnapshot { snapshot_id: id, .. } if *id == *snapshot_id)) => {
+                // An invalid item dooms its containing snapshot — restore would
+                // either fail or produce incorrect output. Treat the same as a
+                // corrupt snapshot (deduplicated by snapshot_id).
                 actions.push(RepairAction::RemoveCorruptSnapshot {
                     snapshot_id: *snapshot_id,
                     name: snapshot_name.clone(),
@@ -1946,5 +1997,70 @@ mod tests {
     fn probe_deletes_allowed_false_for_forbidden_backend() {
         let backend = ForbiddenDeleteBackend;
         assert!(!probe_deletes_allowed(&backend));
+    }
+
+    #[test]
+    fn build_repair_plan_treats_invalid_item_as_doomed_snapshot() {
+        let snapshot_id = SnapshotId([0x11u8; 32]);
+        let snapshot_name = "bad".to_string();
+        let issues = vec![IntegrityIssue::InvalidItem {
+            snapshot_id,
+            snapshot_name: Some(snapshot_name.clone()),
+            item_path: "foo.txt".into(),
+            reason: "regular file has size 10 but chunk sizes sum to 20".into(),
+        }];
+        let pack_chunks: HashMap<PackId, Vec<(ChunkId, ChunkIndexEntry)>> = HashMap::new();
+        let snapshot_chunk_refs: HashMap<String, HashSet<ChunkId>> = HashMap::new();
+
+        let plan = build_repair_plan(&issues, &pack_chunks, &snapshot_chunk_refs);
+
+        assert!(plan.has_data_loss);
+        let has_remove = plan.actions.iter().any(|a| {
+            matches!(
+                a,
+                RepairAction::RemoveCorruptSnapshot { snapshot_id: id, name: Some(n) }
+                    if *id == snapshot_id && n == &snapshot_name
+            )
+        });
+        assert!(
+            has_remove,
+            "expected RemoveCorruptSnapshot for invalid item, got: {:?}",
+            plan.actions
+        );
+    }
+
+    #[test]
+    fn build_repair_plan_dedupes_invalid_item_with_corrupt_snapshot() {
+        let snapshot_id = SnapshotId([0x22u8; 32]);
+        let snapshot_name = "dup".to_string();
+        let issues = vec![
+            IntegrityIssue::CorruptSnapshot {
+                snapshot_id,
+                snapshot_name: Some(snapshot_name.clone()),
+            },
+            IntegrityIssue::InvalidItem {
+                snapshot_id,
+                snapshot_name: Some(snapshot_name.clone()),
+                item_path: "foo.txt".into(),
+                reason: "reason".into(),
+            },
+        ];
+        let pack_chunks: HashMap<PackId, Vec<(ChunkId, ChunkIndexEntry)>> = HashMap::new();
+        let snapshot_chunk_refs: HashMap<String, HashSet<ChunkId>> = HashMap::new();
+
+        let plan = build_repair_plan(&issues, &pack_chunks, &snapshot_chunk_refs);
+
+        let count = plan
+            .actions
+            .iter()
+            .filter(|a| {
+                matches!(
+                    a,
+                    RepairAction::RemoveCorruptSnapshot { snapshot_id: id, .. }
+                        if *id == snapshot_id
+                )
+            })
+            .count();
+        assert_eq!(count, 1, "expected dedupe, got: {:?}", plan.actions);
     }
 }

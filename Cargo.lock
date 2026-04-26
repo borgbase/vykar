@@ -8176,6 +8176,7 @@ dependencies = [
  "libc",
  "rand 0.9.4",
  "serde",
+ "serde_json",
  "serde_yaml",
  "tempfile",
  "tracing",

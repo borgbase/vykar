@@ -39,38 +39,52 @@ pub(super) struct ChunkTargets {
     pub(super) targets: SmallVec<[WriteTarget; 1]>,
 }
 
-/// Stream items from raw bytes: create dirs/symlinks immediately, build file
-/// plan + chunk targets.  All item types are handled in a single pass over the
-/// msgpack stream, avoiding redundant deserialization.
+/// Stream items from raw bytes: create dirs/symlinks immediately, accumulate
+/// regular files into bounded batches, and invoke `flush_batch` whenever a
+/// batch fills up. After the stream ends a final flush is always invoked
+/// (even with empty batch contents) so callers see the post-stream state.
+///
+/// Bounded batching keeps peak memory proportional to `batch_size` rather than
+/// to total file count — a 10M-file restore that would otherwise allocate
+/// gigabytes of `PlannedFile` state stays well-bounded. Cross-batch chunk
+/// reuse pays a re-download cost for chunks referenced from files in
+/// different batches; pack locality within a `walkdir`-ordered window keeps
+/// this cost small in practice.
 ///
 /// Directories in the snapshot stream typically precede their children (natural
 /// `walkdir` order), so `verified_dirs` is populated before files/symlinks that
 /// need it.  When a file or symlink appears before its parent directory item,
 /// `ensure_parent_exists_within_root` handles it (the later directory item's
 /// `create_dir_all` is a no-op, but mode/xattrs are still applied).
+/// `verified_dirs` lives across batches and is passed to `flush_batch` by
+/// reference so phase 3 can skip canonicalize for already-verified parents.
 ///
 /// Because directories are created during decoding, a malformed item stream
 /// that fails to decode partway through may leave partial directories on disk.
 /// This is acceptable — directory creation is idempotent and restore is not
 /// transactional.
-#[allow(clippy::type_complexity)]
-pub(super) fn stream_and_plan<F>(
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
+pub(super) fn stream_and_plan<F, B>(
     items_stream: &[u8],
     dest_root: &Path,
     include_path: &mut F,
     xattrs_enabled: bool,
     stats: &mut RestoreStats,
-) -> Result<(
-    Vec<PlannedFile>,
-    HashMap<ChunkId, ChunkTargets>,
-    HashSet<PathBuf>,
-)>
+    batch_size: usize,
+    mut flush_batch: B,
+) -> Result<()>
 where
     F: FnMut(&str) -> bool,
+    B: FnMut(
+        Vec<PlannedFile>,
+        HashMap<ChunkId, ChunkTargets>,
+        &HashSet<PathBuf>,
+        &mut RestoreStats,
+    ) -> Result<()>,
 {
     let mut verified_dirs: HashSet<PathBuf> = HashSet::new();
     verified_dirs.insert(dest_root.to_path_buf());
-    let mut planned_files = Vec::new();
+    let mut planned_files: Vec<PlannedFile> = Vec::new();
     let mut chunk_targets: HashMap<ChunkId, ChunkTargets> = HashMap::new();
     let mut rel_scratch = PathBuf::new();
 
@@ -139,12 +153,20 @@ where
                     xattrs: item.xattrs,
                     created: AtomicBool::new(false),
                 });
+                if planned_files.len() >= batch_size {
+                    let batch_files = std::mem::take(&mut planned_files);
+                    let batch_chunks = std::mem::take(&mut chunk_targets);
+                    flush_batch(batch_files, batch_chunks, &verified_dirs, stats)?;
+                }
             }
         }
         Ok(())
     })?;
 
-    Ok((planned_files, chunk_targets, verified_dirs))
+    // Final flush — always invoked so the caller observes terminal
+    // verified_dirs / dir-only restores even if no files remain.
+    flush_batch(planned_files, chunk_targets, &verified_dirs, stats)?;
+    Ok(())
 }
 
 /// Validate the restore destination: must be non-existing or empty.
@@ -270,6 +292,42 @@ mod tests {
     use crate::snapshot::item::Item;
     use tempfile::tempdir;
 
+    /// Drains every batch into local accumulators so existing assertions can
+    /// keep operating on a single (files, chunks, verified_dirs) tuple.
+    #[allow(clippy::type_complexity)]
+    fn collect_all<F: FnMut(&str) -> bool>(
+        stream: &[u8],
+        dest: &Path,
+        mut filter: F,
+        xattrs_enabled: bool,
+        stats: &mut RestoreStats,
+    ) -> Result<(
+        Vec<PlannedFile>,
+        HashMap<ChunkId, ChunkTargets>,
+        HashSet<PathBuf>,
+    )> {
+        let mut all_files: Vec<PlannedFile> = Vec::new();
+        let mut all_chunks: HashMap<ChunkId, ChunkTargets> = HashMap::new();
+        let mut all_verified: HashSet<PathBuf> = HashSet::new();
+        stream_and_plan(
+            stream,
+            dest,
+            &mut filter,
+            xattrs_enabled,
+            stats,
+            usize::MAX,
+            |files, chunks, verified, _stats| {
+                all_files.extend(files);
+                for (k, v) in chunks {
+                    all_chunks.insert(k, v);
+                }
+                all_verified.clone_from(verified);
+                Ok(())
+            },
+        )?;
+        Ok((all_files, all_chunks, all_verified))
+    }
+
     #[test]
     fn sanitize_rejects_parent_dir_traversal() {
         let err = sanitize_item_path("../etc/passwd").unwrap_err().to_string();
@@ -294,7 +352,7 @@ mod tests {
 
         let mut stats = RestoreStats::default();
         let (planned_files, chunk_targets, _verified_dirs) =
-            stream_and_plan(&stream, dest, &mut |_| true, false, &mut stats).unwrap();
+            collect_all(&stream, dest, |_| true, false, &mut stats).unwrap();
 
         // Directory was created (pass 1 runs before pass 2).
         assert!(dest.join("mydir").is_dir());
@@ -320,10 +378,10 @@ mod tests {
         let stream = serialize_items(&items);
 
         let mut stats = RestoreStats::default();
-        let (planned_files, _chunk_targets, _verified_dirs) = stream_and_plan(
+        let (planned_files, _chunk_targets, _verified_dirs) = collect_all(
             &stream,
             dest,
-            &mut |p: &str| p.starts_with("included"),
+            |p: &str| p.starts_with("included"),
             false,
             &mut stats,
         )
@@ -362,7 +420,7 @@ mod tests {
 
         let mut stats = RestoreStats::default();
         let (planned_files, _chunk_targets, _verified_dirs) =
-            stream_and_plan(&stream, dest, &mut |_| true, false, &mut stats).unwrap();
+            collect_all(&stream, dest, |_| true, false, &mut stats).unwrap();
 
         assert_eq!(planned_files.len(), m_files as usize);
         assert_eq!(stats.dirs, n_dirs);
@@ -382,7 +440,7 @@ mod tests {
         stream.extend_from_slice(&[0xFF, 0xFF, 0xFF]);
 
         let mut stats = RestoreStats::default();
-        let result = stream_and_plan(&stream, dest, &mut |_| true, false, &mut stats);
+        let result = collect_all(&stream, dest, |_| true, false, &mut stats);
         assert!(result.is_err());
         // The directory from before the corrupt bytes was still created.
         assert!(dest.join("aaa").is_dir());
@@ -404,7 +462,7 @@ mod tests {
 
         let mut stats = RestoreStats::default();
         let (_planned_files, _chunk_targets, verified_dirs) =
-            stream_and_plan(&stream, dest, &mut |_| true, false, &mut stats).unwrap();
+            collect_all(&stream, dest, |_| true, false, &mut stats).unwrap();
 
         // Directory exists and is in verified_dirs.
         assert!(dest.join("mydir").is_dir());
@@ -454,7 +512,7 @@ mod tests {
 
         let mut stats = RestoreStats::default();
         let (planned_files, chunk_targets, verified_dirs) =
-            stream_and_plan(&stream, dest, &mut |_| true, false, &mut stats).unwrap();
+            collect_all(&stream, dest, |_| true, false, &mut stats).unwrap();
 
         // Directory exists with correct mode.
         assert!(dest.join("mydir").is_dir());
@@ -533,7 +591,7 @@ mod tests {
         let stream = serialize_items(&items);
 
         let mut stats = RestoreStats::default();
-        let err = match stream_and_plan(&stream, dest, &mut |_| true, false, &mut stats) {
+        let err = match collect_all(&stream, dest, |_| true, false, &mut stats) {
             Ok(_) => panic!("expected size-vs-chunks mismatch error"),
             Err(e) => e.to_string(),
         };
@@ -553,7 +611,7 @@ mod tests {
         let stream = serialize_items(&items);
 
         let mut stats = RestoreStats::default();
-        let err = match stream_and_plan(&stream, dest, &mut |_| true, false, &mut stats) {
+        let err = match collect_all(&stream, dest, |_| true, false, &mut stats) {
             Ok(_) => panic!("expected size-vs-chunks mismatch error"),
             Err(e) => e.to_string(),
         };
@@ -561,5 +619,74 @@ mod tests {
             err.contains("chunk sizes sum to"),
             "expected size-vs-chunks mismatch error, got: {err}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // batch boundary tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn stream_and_plan_invokes_flush_on_batch_boundary() {
+        // batch_size = 2, 5 file items → flushes of size 2, 2, 1.
+        let temp = tempdir().unwrap();
+        let dest = &temp.path().canonicalize().unwrap();
+
+        let items: Vec<Item> = (0..5)
+            .map(|i| make_file_item(&format!("f{i}.txt"), vec![(0xA0 + i as u8, 100)]))
+            .collect();
+        let stream = serialize_items(&items);
+
+        let mut sizes: Vec<usize> = Vec::new();
+        let mut stats = RestoreStats::default();
+        stream_and_plan(
+            &stream,
+            dest,
+            &mut |_| true,
+            false,
+            &mut stats,
+            2,
+            |files, _chunks, _verified, _stats| {
+                sizes.push(files.len());
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(sizes, vec![2, 2, 1]);
+    }
+
+    #[test]
+    fn stream_and_plan_final_flush_invoked_with_no_files() {
+        // No regular file items — final flush still invoked once with empty
+        // contents so callers see post-stream verified_dirs for dir-only
+        // restores.
+        let temp = tempdir().unwrap();
+        let dest = &temp.path().canonicalize().unwrap();
+
+        let items = vec![make_dir_item("only-a-dir", 0o755)];
+        let stream = serialize_items(&items);
+
+        let mut flush_calls = 0usize;
+        let mut last_verified: HashSet<PathBuf> = HashSet::new();
+        let mut stats = RestoreStats::default();
+        stream_and_plan(
+            &stream,
+            dest,
+            &mut |_| true,
+            false,
+            &mut stats,
+            100,
+            |files, chunks, verified, _stats| {
+                flush_calls += 1;
+                assert!(files.is_empty());
+                assert!(chunks.is_empty());
+                last_verified.clone_from(verified);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(flush_calls, 1);
+        assert!(last_verified.contains(&dest.join("only-a-dir")));
     }
 }

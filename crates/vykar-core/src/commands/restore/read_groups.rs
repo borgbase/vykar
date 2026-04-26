@@ -1,15 +1,12 @@
 //! Phase 3: coalesce per-chunk targets into pack-aligned `ReadGroup`s. Each
 //! read group maps to a single storage range GET.
 
-use std::collections::{HashMap, HashSet};
-
-use tracing::info;
+use std::collections::HashMap;
 
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
 use vykar_types::pack_id::PackId;
 
-use crate::repo::Repository;
 use smallvec::SmallVec;
 
 use super::plan::{ChunkTargets, WriteTarget};
@@ -97,31 +94,6 @@ where
     }
 
     Ok(groups)
-}
-
-/// Load the chunk index (if not already loaded), filter it to only the needed
-/// chunks, and build read groups.  Shared by the "cache incomplete" and
-/// "no cache" code paths.
-pub(super) fn build_read_groups_via_index(
-    repo: &mut Repository,
-    chunk_targets: HashMap<ChunkId, ChunkTargets>,
-) -> Result<Vec<ReadGroup>> {
-    if repo.chunk_index().is_empty() {
-        repo.load_chunk_index()?;
-    }
-    let needed: HashSet<ChunkId> = chunk_targets.keys().copied().collect();
-    repo.retain_chunk_index(&needed);
-    drop(needed);
-    info!(
-        "loaded filtered chunk index ({} entries)",
-        repo.chunk_index().len()
-    );
-    let index = repo.chunk_index();
-    build_read_groups(chunk_targets, |id| {
-        index
-            .get(id)
-            .map(|e| (e.pack_id, e.pack_offset, e.stored_size))
-    })
 }
 
 #[cfg(test)]

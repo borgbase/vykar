@@ -41,6 +41,14 @@ pub(super) const MAX_OPEN_FILES_PER_GROUP: usize = 16;
 /// syscall count and inode rwsem contention.
 pub(super) const MAX_WRITE_BATCH: usize = 1024 * 1024; // 1 MiB
 
+/// Maximum number of regular-file `PlannedFile` entries kept in memory at
+/// once during a restore.  Each batch goes through plan → read groups →
+/// write → metadata, then is dropped before the next batch begins.  This
+/// keeps peak `PlannedFile` memory bounded regardless of snapshot size — a
+/// 10M-file snapshot no longer requires gigabytes of plan state up front,
+/// and a malicious snapshot cannot DoS the host before any data is read.
+const RESTORE_BATCH_FILES: usize = 100_000;
+
 /// Cap on non-fatal metadata warnings retained in `RestoreStats.warnings`.
 /// Failures past this cap are counted in `warnings_suppressed` only — this
 /// prevents an unbounded `Vec` (and matching unbounded `tracing::warn!`
@@ -197,53 +205,62 @@ where
         e
     };
 
-    // Stream items: create dirs/symlinks immediately, build file plan + chunk targets.
-    let (mut planned_files, chunk_targets, verified_dirs) = plan::stream_and_plan(
+    // Stream items in bounded batches.  Each batch goes through plan → read
+    // groups → write → metadata, then is dropped before the next batch
+    // begins, keeping peak memory bounded by `RESTORE_BATCH_FILES`.
+    // Per-batch metadata application happens inside `temp_root` before the
+    // final rename, so the inode already carries mode/mtime/xattrs by the
+    // time it lands at `dest_root` — no path-based reopen window.
+    let mut total_bytes: u64 = 0;
+    let mut total_files: u64 = 0;
+    plan::stream_and_plan(
         &items_stream,
         &temp_root,
         &mut include_path,
         xattrs_enabled,
         &mut stats,
-    )
-    .map_err(&cleanup)?;
-    drop(items_stream); // free raw bytes before read group building
-    planned_files.shrink_to_fit(); // reclaim amortized-doubling slack (~2x → 1x)
+        RESTORE_BATCH_FILES,
+        |batch_files, batch_chunks, verified_dirs, stats| -> Result<()> {
+            if batch_files.is_empty() {
+                return Ok(());
+            }
 
-    if !planned_files.is_empty() {
-        // Build read groups from chunk targets — always via full index.
-        let mut groups = if !chunk_targets.is_empty() {
-            read_groups::build_read_groups_via_index(&mut repo, chunk_targets).map_err(&cleanup)?
-        } else {
-            Vec::new()
-        };
+            let mut groups = if !batch_chunks.is_empty() {
+                if repo.chunk_index().is_empty() {
+                    repo.load_chunk_index()?;
+                }
+                let index = repo.chunk_index();
+                read_groups::build_read_groups(batch_chunks, |id| {
+                    index
+                        .get(id)
+                        .map(|e| (e.pack_id, e.pack_offset, e.stored_size))
+                })?
+            } else {
+                Vec::new()
+            };
 
-        // Free chunk index memory — all pack locations are now in PlannedBlob structs.
-        // After this point repo is only used for .storage and .crypto.
-        repo.clear_chunk_index();
+            // Sort groups by pack ID (shard-aligned) then offset for sequential I/O.
+            groups.sort_by(|a, b| {
+                a.pack_id
+                    .0
+                    .cmp(&b.pack_id.0)
+                    .then(a.read_start.cmp(&b.read_start))
+            });
 
-        // Sort groups by pack ID (shard-aligned) then offset for sequential I/O.
-        groups.sort_by(|a, b| {
-            a.pack_id
-                .0
-                .cmp(&b.pack_id.0)
-                .then(a.read_start.cmp(&b.read_start))
-        });
+            tracing::debug!(
+                "batch: {} coalesced read groups for {} files",
+                groups.len(),
+                batch_files.len(),
+            );
 
-        tracing::debug!(
-            "planned {} coalesced read groups for {} files",
-            groups.len(),
-            planned_files.len(),
-        );
-
-        // Phase 3: Ensure parent directories exist + create empty files.
-        // Non-empty files are created on first write in Phase 4 (avoids
-        // the double-open: create + set_len here, then reopen for writing).
-        // Safety: parents verified during directory creation are trusted —
-        // this is a single-process operation so no concurrent destination
-        // tampering can occur. Unverified parents still get the full
-        // canonicalize check.
-        let phase3_result: Result<()> = (|| {
-            for pf in &planned_files {
+            // Phase 3: Ensure parent directories exist + create empty files.
+            // Non-empty files are created on first write in Phase 4 (avoids
+            // the double-open: create + set_len here, then reopen for writing).
+            // Safety: parents verified during directory creation are trusted —
+            // this is a single-process operation so no concurrent destination
+            // tampering can occur. Unverified parents still get the full
+            // canonicalize check.
+            for pf in &batch_files {
                 let full_path = temp_root.join(&pf.rel_path);
                 if full_path
                     .parent()
@@ -255,44 +272,37 @@ where
                     std::fs::File::create(&full_path)?;
                 }
             }
+
+            // Phase 4: Parallel restore — download ranges, decrypt, decompress, write.
+            let bytes = parallel::execute_parallel_restore(
+                &batch_files,
+                groups,
+                &repo.storage,
+                repo.crypto.as_ref(),
+                &temp_root,
+                config.limits.restore_concurrency(),
+            )?;
+
+            // Phase 5b: apply per-file metadata in temp_root.
+            finalize::apply_file_metadata(&batch_files, &temp_root, xattrs_enabled, stats);
+
+            total_bytes += bytes;
+            total_files += batch_files.len() as u64;
             Ok(())
-        })();
-        phase3_result.map_err(&cleanup)?;
+        },
+    )
+    .map_err(&cleanup)?;
 
-        // Phase 4: Parallel restore — download ranges, decrypt, decompress, write.
-        let bytes_written = parallel::execute_parallel_restore(
-            &planned_files,
-            groups,
-            &repo.storage,
-            repo.crypto.as_ref(),
-            &temp_root,
-            config.limits.restore_concurrency(),
-        )
-        .map_err(&cleanup)?;
+    drop(items_stream);
+    repo.clear_chunk_index();
 
-        // Phase 5a + 5b: rename temp tree into dest, then apply file metadata.
-        finalize::finalize(
-            &planned_files,
-            &temp_root,
-            &dest_root,
-            xattrs_enabled,
-            &mut stats,
-        )
-        .map_err(&cleanup)?;
+    // Phase 5a: rename temp subtrees into the final destination.  At this
+    // point all file metadata is already on the inodes, so the rename has
+    // no observable TOCTOU window.
+    finalize::move_temp_to_dest(&temp_root, &dest_root).map_err(&cleanup)?;
 
-        stats.files = planned_files.len() as u64;
-        stats.total_bytes = bytes_written;
-    } else {
-        // No files to restore — just move dirs/symlinks from temp root to dest.
-        finalize::finalize(
-            &planned_files,
-            &temp_root,
-            &dest_root,
-            xattrs_enabled,
-            &mut stats,
-        )
-        .map_err(&cleanup)?;
-    }
+    stats.files = total_files;
+    stats.total_bytes = total_bytes;
 
     info!(
         "Restored {} files, {} dirs, {} symlinks ({} bytes)",

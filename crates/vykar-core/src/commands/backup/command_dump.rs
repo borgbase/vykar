@@ -43,10 +43,10 @@ impl DumpProcessGuard {
     fn finish(&mut self) -> Result<(std::process::ExitStatus, Vec<u8>, bool)> {
         // Wait for child to exit (if watchdog fires while we wait, it kills the
         // child, which unblocks wait()).
-        let status = self
-            .child
-            .as_mut()
-            .expect("child already taken")
+        let child = self.child.as_mut().ok_or_else(|| {
+            VykarError::Other("internal: command_dump child already taken (logic bug)".into())
+        })?;
+        let status = child
             .wait()
             .map_err(|e| VykarError::Other(format!("failed to wait on child: {e}")))?;
 
@@ -150,10 +150,10 @@ fn stream_dump_command(
 
         // Stream stdout through chunker.
         let chunk_id_key = *repo.crypto.chunk_id_key();
-        let chunk_stream = chunker::chunk_stream(
-            stdout.expect("stdout was piped"),
-            &repo.config.chunker_params,
-        );
+        let stdout = stdout.ok_or_else(|| {
+            VykarError::Other("internal: command_dump stdout not piped (config bug)".into())
+        })?;
+        let chunk_stream = chunker::chunk_stream(stdout, &repo.config.chunker_params);
 
         let mut chunk_refs = Vec::new();
         let mut total_size: u64 = 0;

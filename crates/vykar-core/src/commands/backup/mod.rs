@@ -34,6 +34,7 @@ use crate::repo::Repository;
 use crate::snapshot::item::Item;
 use crate::snapshot::{SnapshotMeta, SnapshotStats};
 use crate::storage;
+use vykar_common::display::{format_bytes, format_count};
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
 use vykar_types::snapshot_id::SnapshotId;
@@ -776,20 +777,20 @@ pub fn run_with_progress(
         info!(
             "Snapshot '{}' created: {} files, {} errors, {} original, {} compressed, {} deduplicated",
             snapshot_name,
-            stats.nfiles,
-            stats.errors,
-            stats.original_size,
-            stats.compressed_size,
-            stats.deduplicated_size
+            format_count(stats.nfiles),
+            format_count(stats.errors),
+            format_bytes(stats.original_size),
+            format_bytes(stats.compressed_size),
+            format_bytes(stats.deduplicated_size)
         );
     } else {
         info!(
             "Snapshot '{}' created: {} files, {} original, {} compressed, {} deduplicated",
             snapshot_name,
-            stats.nfiles,
-            stats.original_size,
-            stats.compressed_size,
-            stats.deduplicated_size
+            format_count(stats.nfiles),
+            format_bytes(stats.original_size),
+            format_bytes(stats.compressed_size),
+            format_bytes(stats.deduplicated_size)
         );
     }
 

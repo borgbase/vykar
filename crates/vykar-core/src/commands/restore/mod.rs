@@ -10,6 +10,7 @@ use tracing::info;
 
 use crate::config::VykarConfig;
 use crate::platform::fs;
+use vykar_common::display::{format_bytes, format_count};
 use vykar_types::error::{Result, VykarError};
 
 mod finalize;
@@ -305,8 +306,11 @@ where
     stats.total_bytes = total_bytes;
 
     info!(
-        "Restored {} files, {} dirs, {} symlinks ({} bytes)",
-        stats.files, stats.dirs, stats.symlinks, stats.total_bytes
+        "Restored {} files, {} dirs, {} symlinks ({})",
+        format_count(stats.files),
+        format_count(stats.dirs),
+        format_count(stats.symlinks),
+        format_bytes(stats.total_bytes)
     );
 
     if stats.warnings_suppressed > 0 {

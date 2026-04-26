@@ -15,6 +15,7 @@ use crate::compress;
 use crate::repo::format::{unpack_object_expect_with_context_into, ObjectType};
 use vykar_crypto::CryptoEngine;
 use vykar_storage::StorageBackend;
+use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
 use vykar_types::pack_id::PackId;
 
@@ -156,6 +157,7 @@ fn lightest_bucket(bucket_bytes: &[u64]) -> usize {
         .map_or(0, |(i, _)| i)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn execute_parallel_restore(
     files: &[PlannedFile],
     groups: Vec<ReadGroup>,
@@ -163,6 +165,7 @@ pub(super) fn execute_parallel_restore(
     crypto: &dyn CryptoEngine,
     root: &Path,
     restore_concurrency: usize,
+    verify_chunks: bool,
 ) -> Result<u64> {
     if groups.is_empty() {
         return Ok(0);
@@ -173,6 +176,7 @@ pub(super) fn execute_parallel_restore(
 
     let bytes_written = AtomicU64::new(0);
     let cancelled = AtomicBool::new(false);
+    let chunk_id_key = *crypto.chunk_id_key();
 
     std::thread::scope(|s| {
         let mut handles = Vec::with_capacity(buckets.len());
@@ -180,6 +184,7 @@ pub(super) fn execute_parallel_restore(
         for bucket in &buckets {
             let bytes_written = &bytes_written;
             let cancelled = &cancelled;
+            let chunk_id_key = &chunk_id_key;
 
             handles.push(s.spawn(move || -> Result<()> {
                 let mut data_buf = Vec::new();
@@ -201,6 +206,8 @@ pub(super) fn execute_parallel_restore(
                         &mut decrypt_buf,
                         &mut decompress_buf,
                         root,
+                        verify_chunks,
+                        chunk_id_key,
                     ) {
                         cancelled.store(true, Ordering::Release);
                         return Err(e);
@@ -264,6 +271,8 @@ fn process_read_group(
     decrypt_buf: &mut Vec<u8>,
     decompress_buf: &mut Vec<u8>,
     root: &Path,
+    verify_chunks: bool,
+    chunk_id_key: &[u8; 32],
 ) -> Result<()> {
     if cancelled.load(Ordering::Acquire) {
         return Ok(());
@@ -341,6 +350,22 @@ fn process_read_group(
                 blob.expected_size,
                 decompress_buf.len()
             )));
+        }
+
+        if verify_chunks {
+            let actual = ChunkId::compute(chunk_id_key, decompress_buf);
+            if actual != blob.chunk_id {
+                return Err(VykarError::InvalidFormat(format!(
+                    "chunk {} in pack {} (offset {}, size {}) hash mismatch after decrypt: \
+                     expected {}, got {}",
+                    blob.chunk_id,
+                    group.pack_id,
+                    blob.pack_offset,
+                    blob.stored_size,
+                    blob.chunk_id,
+                    actual,
+                )));
+            }
         }
 
         for target in &blob.targets {
@@ -549,6 +574,8 @@ mod tests {
             &mut decrypt_buf,
             &mut decompress_buf,
             temp.path(),
+            false,
+            &test_chunk_id_key(),
         )
         .unwrap_err()
         .to_string();
@@ -611,6 +638,8 @@ mod tests {
             &mut decrypt_buf,
             &mut decompress_buf,
             temp.path(),
+            false,
+            &test_chunk_id_key(),
         )
         .unwrap();
 
@@ -691,6 +720,8 @@ mod tests {
             &mut decrypt_buf,
             &mut decompress_buf,
             temp.path(),
+            false,
+            &test_chunk_id_key(),
         )
         .unwrap();
 
@@ -782,6 +813,8 @@ mod tests {
             &mut decrypt_buf,
             &mut decompress_buf,
             temp.path(),
+            false,
+            &test_chunk_id_key(),
         )
         .unwrap();
 
@@ -853,6 +886,8 @@ mod tests {
             &mut decrypt_buf,
             &mut decompress_buf,
             temp.path(),
+            false,
+            &test_chunk_id_key(),
         )
         .unwrap();
 
@@ -861,5 +896,162 @@ mod tests {
             expected_data.len() as u64
         );
         assert_eq!(std::fs::read(&out).unwrap(), expected_data);
+    }
+
+    /// `--verify` recomputes the keyed chunk ID after decrypt/decompress and
+    /// must accept blobs whose stored chunk_id matches the actual data.
+    #[test]
+    fn process_read_group_verify_accepts_matching_chunk_id() {
+        let temp = tempdir().unwrap();
+        let out = temp.path().join("good.bin");
+
+        let payload = b"verify-good-data";
+        let crypto = PlaintextEngine::new(&test_chunk_id_key());
+        let cid = ChunkId::compute(&test_chunk_id_key(), payload);
+        let packed = pack_blob(cid, payload, &crypto);
+
+        let files = vec![PlannedFile {
+            rel_path: PathBuf::from("good.bin"),
+            total_size: payload.len() as u64,
+            mode: 0o644,
+            mtime: 0,
+            xattrs: None,
+            created: AtomicBool::new(false),
+        }];
+
+        let pack_id = dummy_pack_id(7);
+        let backend = Arc::new(MemoryBackend::new());
+        backend.put(&pack_id.storage_key(), &packed).unwrap();
+        let storage: Arc<dyn StorageBackend> = backend;
+
+        let group = single_blob_group(
+            pack_id,
+            cid,
+            &packed,
+            payload.len() as u32,
+            smallvec::smallvec![WriteTarget {
+                file_idx: 0,
+                file_offset: 0,
+            }],
+        );
+
+        let bytes_written = AtomicU64::new(0);
+        let cancelled = AtomicBool::new(false);
+        let mut data_buf = Vec::new();
+        let mut decrypt_buf = Vec::new();
+        let mut decompress_buf = Vec::new();
+        process_read_group(
+            &group,
+            &files,
+            &storage,
+            &crypto,
+            &bytes_written,
+            &cancelled,
+            &mut data_buf,
+            &mut decrypt_buf,
+            &mut decompress_buf,
+            temp.path(),
+            true,
+            &test_chunk_id_key(),
+        )
+        .unwrap();
+
+        assert_eq!(std::fs::read(&out).unwrap(), payload);
+    }
+
+    /// With `--verify`, a snapshot whose stored chunk_id does not match the
+    /// actual chunk bytes must abort restore with `InvalidFormat`.
+    /// AEAD's `chunk_id` AAD is *not* the same value as the snapshot-recorded
+    /// chunk_id when those two diverge (writer-side bug), so we encrypt under
+    /// the wrong-but-self-consistent AAD to bypass AEAD's check and exercise
+    /// the verify-after-decrypt path.
+    #[test]
+    fn process_read_group_verify_rejects_chunk_id_mismatch() {
+        let temp = tempdir().unwrap();
+        let _out = temp.path().join("bad.bin");
+
+        let payload = b"verify-bad-data";
+        let crypto = PlaintextEngine::new(&test_chunk_id_key());
+        let real_cid = ChunkId::compute(&test_chunk_id_key(), payload);
+        let wrong_cid = dummy_chunk_id(0xEE);
+        assert_ne!(real_cid, wrong_cid);
+        // Encrypt under the wrong (snapshot-recorded) chunk_id as AAD so the
+        // AEAD check still passes — it's the post-decrypt hash recompute that
+        // must catch the divergence.
+        let packed = pack_blob(wrong_cid, payload, &crypto);
+
+        let files = vec![PlannedFile {
+            rel_path: PathBuf::from("bad.bin"),
+            total_size: payload.len() as u64,
+            mode: 0o644,
+            mtime: 0,
+            xattrs: None,
+            created: AtomicBool::new(false),
+        }];
+
+        let pack_id = dummy_pack_id(8);
+        let backend = Arc::new(MemoryBackend::new());
+        backend.put(&pack_id.storage_key(), &packed).unwrap();
+        let storage: Arc<dyn StorageBackend> = backend;
+
+        let group = single_blob_group(
+            pack_id,
+            wrong_cid,
+            &packed,
+            payload.len() as u32,
+            smallvec::smallvec![WriteTarget {
+                file_idx: 0,
+                file_offset: 0,
+            }],
+        );
+
+        let bytes_written = AtomicU64::new(0);
+        let cancelled = AtomicBool::new(false);
+        let mut data_buf = Vec::new();
+        let mut decrypt_buf = Vec::new();
+        let mut decompress_buf = Vec::new();
+        let err = process_read_group(
+            &group,
+            &files,
+            &storage,
+            &crypto,
+            &bytes_written,
+            &cancelled,
+            &mut data_buf,
+            &mut decrypt_buf,
+            &mut decompress_buf,
+            temp.path(),
+            true,
+            &test_chunk_id_key(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("hash mismatch"),
+            "expected hash mismatch error, got: {err}"
+        );
+
+        // Defense-in-depth nature: the same blob restores fine when verify
+        // is disabled, since AEAD already accepted it.
+        let temp2 = tempdir().unwrap();
+        let bytes_written = AtomicU64::new(0);
+        let mut data_buf = Vec::new();
+        let mut decrypt_buf = Vec::new();
+        let mut decompress_buf = Vec::new();
+        process_read_group(
+            &group,
+            &files,
+            &storage,
+            &crypto,
+            &bytes_written,
+            &cancelled,
+            &mut data_buf,
+            &mut decrypt_buf,
+            &mut decompress_buf,
+            temp2.path(),
+            false,
+            &test_chunk_id_key(),
+        )
+        .unwrap();
     }
 }

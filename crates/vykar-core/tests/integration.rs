@@ -393,6 +393,7 @@ fn backup_deduplicates_identical_files_and_extracts_correctly() {
         restore_dir.to_str().unwrap(),
         None,
         config.xattrs.enabled,
+        false,
     )
     .unwrap();
     assert_eq!(extract_stats.files, 2);
@@ -544,6 +545,7 @@ fn backup_and_restore_preserves_file_xattrs_when_enabled() {
         restore_dir.to_str().unwrap(),
         None,
         true,
+        false,
     )
     .unwrap();
 
@@ -1009,6 +1011,7 @@ fn command_dump_backup_and_restore() {
         extract_dir.path().to_str().unwrap(),
         None,
         false,
+        false,
     )
     .unwrap();
 
@@ -1119,6 +1122,7 @@ fn command_dump_mixed_with_files() {
         extract_dir.path().to_str().unwrap(),
         None,
         false,
+        false,
     )
     .unwrap();
 
@@ -1219,6 +1223,7 @@ fn backup_many_small_files_plus_large_file_roundtrip() {
         restore_dir.to_str().unwrap(),
         None,
         false,
+        false,
     )
     .unwrap();
 
@@ -1297,6 +1302,7 @@ fn backup_many_small_files_plus_large_file_roundtrip() {
         restore_dir2.to_str().unwrap(),
         None,
         false,
+        false,
     )
     .unwrap();
 
@@ -1371,6 +1377,7 @@ fn backup_pipeline_threshold_splitting_roundtrip() {
         "snap-threshold",
         restore_dir.to_str().unwrap(),
         None,
+        false,
         false,
     )
     .unwrap();
@@ -1539,6 +1546,7 @@ fn backup_pipeline_mixed_cache_hit_processed_and_large_roundtrip() {
         "snap-mixed-2",
         restore_dir.to_str().unwrap(),
         None,
+        false,
         false,
     )
     .unwrap();

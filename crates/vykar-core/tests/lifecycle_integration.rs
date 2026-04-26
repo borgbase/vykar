@@ -178,6 +178,7 @@ fn lifecycle_delete_compact_check_and_restore() {
         restore_dir.to_str().unwrap(),
         None,
         config.xattrs.enabled,
+        false,
     )
     .unwrap();
     assert_eq!(extract_stats.files, 2);
@@ -265,6 +266,7 @@ fn prune_compact_check_and_restore_kept_snapshots() {
         restore_a.to_str().unwrap(),
         None,
         config.xattrs.enabled,
+        false,
     )
     .unwrap();
     assert_eq!(
@@ -280,6 +282,7 @@ fn prune_compact_check_and_restore_kept_snapshots() {
         restore_b.to_str().unwrap(),
         None,
         config.xattrs.enabled,
+        false,
     )
     .unwrap();
     assert_eq!(
@@ -327,6 +330,7 @@ fn run_encrypted_lifecycle(mode: EncryptionModeConfig, expected_mode: Encryption
         restore_dir.to_str().unwrap(),
         None,
         config.xattrs.enabled,
+        false,
     )
     .unwrap();
     assert_eq!(
@@ -345,6 +349,7 @@ fn run_encrypted_lifecycle(mode: EncryptionModeConfig, expected_mode: Encryption
         tmp.path().join("bad-restore").to_str().unwrap(),
         None,
         config.xattrs.enabled,
+        false,
     );
     assert!(matches!(wrong_extract, Err(VykarError::DecryptionFailed)));
 
@@ -544,6 +549,7 @@ fn restore_falls_back_to_index_on_cache_miss() {
         restore_dir.to_str().unwrap(),
         None,
         false,
+        false,
     )
     .unwrap();
 
@@ -583,6 +589,7 @@ fn restore_works_without_restore_cache() {
         "snap1",
         restore_dir.to_str().unwrap(),
         None,
+        false,
         false,
     )
     .unwrap();

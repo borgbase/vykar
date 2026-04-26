@@ -10,6 +10,7 @@ pub(crate) fn run_restore(
     snapshot_name: String,
     dest: String,
     pattern: Option<String>,
+    verify: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let stats = with_repo_passphrase(config, label, |passphrase| {
         commands::restore::run(
@@ -19,6 +20,7 @@ pub(crate) fn run_restore(
             &dest,
             pattern.as_deref(),
             config.xattrs.enabled,
+            verify,
         )
         .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })
     })?;

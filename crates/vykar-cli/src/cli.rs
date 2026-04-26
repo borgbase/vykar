@@ -125,6 +125,13 @@ pub(crate) enum Commands {
         /// Only restore paths matching this glob pattern
         #[arg(long)]
         pattern: Option<String>,
+
+        /// Recompute the keyed BLAKE2b chunk ID after decryption and abort if
+        /// it doesn't match the snapshot's stored chunk_id. AEAD already
+        /// authenticates ciphertext under the standard threat model, so this
+        /// is defense-in-depth against writer-side bugs only.
+        #[arg(long)]
+        verify: bool,
     },
 
     /// Delete an entire repository permanently

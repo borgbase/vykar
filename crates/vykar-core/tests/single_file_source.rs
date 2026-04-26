@@ -126,6 +126,7 @@ fn backup_and_restore_single_file_source() {
         restore_dir.to_str().unwrap(),
         None,
         false,
+        false,
     )
     .unwrap();
     assert_eq!(stats.files, 1);
@@ -147,6 +148,7 @@ fn backup_and_restore_single_file_source() {
         "snap-v2",
         restore_dir2.to_str().unwrap(),
         None,
+        false,
         false,
     )
     .unwrap();
@@ -183,6 +185,7 @@ fn backup_mixed_file_and_directory_sources() {
         "snap",
         restore_dir.to_str().unwrap(),
         None,
+        false,
         false,
     )
     .unwrap();

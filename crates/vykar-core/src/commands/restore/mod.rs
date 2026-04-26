@@ -71,6 +71,11 @@ pub struct RestoreStats {
 }
 
 /// Run `vykar restore`.
+///
+/// When `verify_chunks` is true, every restored chunk's plaintext is fed
+/// through `ChunkId::compute` and matched against the snapshot's stored
+/// `chunk_id`. AEAD already authenticates ciphertext under the standard
+/// threat model, so this is defense-in-depth against writer-side bugs only.
 pub fn run(
     config: &VykarConfig,
     passphrase: Option<&str>,
@@ -78,6 +83,7 @@ pub fn run(
     dest: &str,
     pattern: Option<&str>,
     xattrs_enabled: bool,
+    verify_chunks: bool,
 ) -> Result<RestoreStats> {
     let filter = pattern
         .map(|p| {
@@ -95,6 +101,7 @@ pub fn run(
         snapshot_name,
         dest,
         xattrs_enabled,
+        verify_chunks,
         move |path| filter.as_ref().is_none_or(|matcher| matcher.is_match(path)),
     )
 }
@@ -110,6 +117,7 @@ pub fn run_selected(
     dest: &str,
     selected_paths: &HashSet<String>,
     xattrs_enabled: bool,
+    verify_chunks: bool,
 ) -> Result<RestoreStats> {
     restore_with_filter(
         config,
@@ -117,6 +125,7 @@ pub fn run_selected(
         snapshot_name,
         dest,
         xattrs_enabled,
+        verify_chunks,
         |path| path_matches_selection(path, selected_paths),
     )
 }
@@ -131,6 +140,7 @@ fn restore_with_filter<F>(
     snapshot_name: &str,
     dest: &str,
     xattrs_enabled: bool,
+    verify_chunks: bool,
     mut include_path: F,
 ) -> Result<RestoreStats>
 where
@@ -282,6 +292,7 @@ where
                 repo.crypto.as_ref(),
                 &temp_root,
                 config.limits.restore_concurrency(),
+                verify_chunks,
             )?;
 
             // Phase 5b: apply per-file metadata in temp_root.

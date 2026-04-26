@@ -124,6 +124,7 @@ fn backup_symlink_to_directory_descends_target() {
         restore_dir.to_str().unwrap(),
         None,
         false,
+        false,
     )
     .unwrap();
 

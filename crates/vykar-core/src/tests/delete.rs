@@ -125,6 +125,7 @@ fn delete_multiple_snapshots_in_single_call() {
         restore_dir.to_str().unwrap(),
         None,
         false,
+        false,
     )
     .unwrap();
     assert_eq!(

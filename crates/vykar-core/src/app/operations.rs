@@ -28,6 +28,10 @@ pub struct RestoreRequest {
     pub snapshot_name: String,
     pub destination: String,
     pub pattern: Option<String>,
+    /// When true, recompute each restored chunk's keyed BLAKE2b ID and abort
+    /// on mismatch. Defense-in-depth against writer-side bugs only — AEAD
+    /// already authenticates ciphertext under the standard threat model.
+    pub verify_chunks: bool,
 }
 
 // ── Hook-aware backup event types ─────────────────────────────────────────
@@ -686,6 +690,7 @@ pub fn restore_snapshot(
         &req.destination,
         req.pattern.as_deref(),
         config.xattrs.enabled,
+        req.verify_chunks,
     )
 }
 
@@ -703,6 +708,7 @@ pub fn restore_selected(
         destination,
         selected_paths,
         config.xattrs.enabled,
+        false,
     )
 }
 

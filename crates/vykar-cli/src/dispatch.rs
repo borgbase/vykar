@@ -252,9 +252,17 @@ pub(crate) fn dispatch_command(
             snapshot,
             dest,
             pattern,
+            verify,
             ..
-        } => cmd::restore::run_restore(cfg, label, snapshot.clone(), dest.clone(), pattern.clone())
-            .map(|()| false),
+        } => cmd::restore::run_restore(
+            cfg,
+            label,
+            snapshot.clone(),
+            dest.clone(),
+            pattern.clone(),
+            *verify,
+        )
+        .map(|()| false),
         Commands::Delete {
             yes_delete_this_repo,
             ..

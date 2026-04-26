@@ -475,6 +475,7 @@ mod backup_restore {
                 restore_dir.to_str().unwrap(),
                 None,
                 config.xattrs.enabled,
+                false,
             )
             .unwrap();
 

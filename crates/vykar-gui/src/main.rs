@@ -24,7 +24,9 @@ mod tray;
 mod tray_state;
 mod view_models;
 mod worker;
-use messages::{log_entry_now, AppCommand, SnapshotRowData, SourceInfoData, UiEvent};
+use messages::{
+    log_entry_now, AppCommand, SnapshotRowData, SnapshotSelection, SourceInfoData, UiEvent,
+};
 use repo_helpers::send_log;
 
 const APP_TITLE: &str = "Vykar Backup";
@@ -192,6 +194,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // snapshot_data stays as Arc<Mutex> — complex Rust struct used by sort_snapshot_table.
     let snapshot_data: Arc<Mutex<Vec<SnapshotRowData>>> = Arc::new(Mutex::new(Vec::new()));
 
+    // Multi-row selection state for the Snapshots table; index-aligned with snapshot_data.
+    let snapshot_selection: Arc<Mutex<SnapshotSelection>> =
+        Arc::new(Mutex::new(SnapshotSelection::default()));
+
     // Raw source data, used to rebuild the per-repo filtered source model
     // when the selected repo changes.
     let source_cache: Arc<Mutex<Vec<SourceInfoData>>> = Arc::new(Mutex::new(Vec::new()));
@@ -206,6 +212,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         ui.as_weak(),
         app_tx.clone(),
         snapshot_data.clone(),
+        snapshot_selection.clone(),
         source_cache.clone(),
         last_gui_state.clone(),
         tray_source_items.clone(),
@@ -220,6 +227,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         app_tx.clone(),
         ui_tx_for_cancel.clone(),
         snapshot_data,
+        snapshot_selection,
         source_cache,
         cancel_requested.clone(),
     );

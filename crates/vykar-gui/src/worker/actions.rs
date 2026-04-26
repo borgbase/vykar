@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, Local, Utc};
 use vykar_core::app::operations;
 use vykar_core::commands;
+use vykar_core::commands::delete::DeleteResult;
 use vykar_core::commands::find::{FileStatus, FindFilter, FindScope};
 
 use crate::messages::{AppCommand, FindResultRow, FindSnapshotGroup, UiEvent};
@@ -93,14 +94,30 @@ pub(super) fn handle_restore_selected(
     end_ui_operation(ctx);
 }
 
-pub(super) fn handle_delete_snapshot(
+pub(super) fn handle_delete_snapshots(
     ctx: &mut WorkerContext,
     repo_name: String,
-    snapshot_name: String,
+    snapshot_names: Vec<String>,
 ) {
+    if snapshot_names.is_empty() {
+        return;
+    }
+
+    let prompt = if snapshot_names.len() == 1 {
+        format!(
+            "Are you sure you want to delete snapshot {} from {repo_name}?",
+            snapshot_names[0]
+        )
+    } else {
+        format!(
+            "Are you sure you want to delete {} snapshots from {repo_name}?\n\nThis is a batch \
+             operation: either all selected snapshots are deleted, or none.",
+            snapshot_names.len()
+        )
+    };
     let confirmed = tinyfiledialogs::message_box_yes_no(
-        "Delete Snapshot",
-        &format!("Are you sure you want to delete snapshot {snapshot_name} from {repo_name}?"),
+        "Delete Snapshots",
+        &prompt,
         tinyfiledialogs::MessageBoxIcon::Question,
         tinyfiledialogs::YesNo::No,
     );
@@ -110,7 +127,12 @@ pub(super) fn handle_delete_snapshot(
         return;
     }
 
-    begin_ui_operation(ctx, "Deleting snapshot...");
+    let status = if snapshot_names.len() == 1 {
+        "Deleting snapshot..."
+    } else {
+        "Deleting snapshots..."
+    };
+    begin_ui_operation(ctx, status);
 
     let repo = match select_repo_or_log(ctx, &ctx.runtime.repos, &repo_name) {
         Some(r) => r,
@@ -129,30 +151,66 @@ pub(super) fn handle_delete_snapshot(
         }
     };
 
-    match operations::delete_snapshot(
+    // Single batch call: validates all names up front and runs under one
+    // maintenance lock (see `commands::delete::run`). Avoids per-row partial
+    // failures and per-row maintenance-lock contention.
+    let names: Vec<&str> = snapshot_names.iter().map(String::as_str).collect();
+    let result: vykar_types::error::Result<DeleteResult> = commands::delete::run(
         &repo.config,
         passphrase.as_deref().map(|s| s.as_str()),
-        &snapshot_name,
-    ) {
+        &names,
+        false,
+        Some(&ctx.cancel_requested),
+    );
+
+    match result {
         Ok(result) => {
-            if let Some(stats) = result.stats.first() {
+            let mut total_chunks = 0u64;
+            let mut total_freed = 0u64;
+            for stats in &result.stats {
+                total_chunks += stats.chunks_deleted;
+                total_freed += stats.space_freed;
+            }
+            if result.stats.len() == 1 {
+                let s = &result.stats[0];
                 send_log(
                     &ctx.ui_tx,
                     format!(
                         "[{repo_name}] Deleted snapshot '{}': {} chunks freed, {} reclaimed",
-                        stats.snapshot_name,
-                        stats.chunks_deleted,
-                        format_bytes(stats.space_freed),
+                        s.snapshot_name,
+                        s.chunks_deleted,
+                        format_bytes(s.space_freed),
                     ),
                 );
             } else {
                 send_log(
                     &ctx.ui_tx,
                     format!(
-                        "[{repo_name}] Deleted snapshot '{snapshot_name}' \
-                         (post-commit cleanup stats unavailable; see warnings)"
+                        "[{repo_name}] Deleted {} snapshots: {} chunks freed, {} reclaimed",
+                        result.stats.len(),
+                        total_chunks,
+                        format_bytes(total_freed),
                     ),
                 );
+            }
+            // Surface any snapshot whose Phase 3 cleanup failed: it is missing
+            // from `stats` but did delete from storage, so users still see it
+            // disappear from the table.
+            let reported: std::collections::HashSet<&str> = result
+                .stats
+                .iter()
+                .map(|s| s.snapshot_name.as_str())
+                .collect();
+            for name in &snapshot_names {
+                if !reported.contains(name.as_str()) {
+                    send_log(
+                        &ctx.ui_tx,
+                        format!(
+                            "[{repo_name}] Deleted snapshot '{name}' \
+                             (post-commit cleanup stats unavailable; see warnings)"
+                        ),
+                    );
+                }
             }
             for w in &result.warnings {
                 send_log(&ctx.ui_tx, format!("[{repo_name}] warning: {w}"));
@@ -163,6 +221,8 @@ pub(super) fn handle_delete_snapshot(
             let _ = ctx.app_tx.send(AppCommand::FetchAllRepoInfo);
         }
         Err(e) => {
+            // Pre-mutation validation failure (e.g. SnapshotNotFound) leaves
+            // the repo untouched — single error covers the whole batch.
             send_log(&ctx.ui_tx, format!("[{repo_name}] delete failed: {e}"));
         }
     }

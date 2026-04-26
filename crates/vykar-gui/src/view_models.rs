@@ -4,7 +4,9 @@ use crossbeam_channel::Sender;
 use slint::{ComponentHandle, Model, ModelRc, SharedString, StandardListViewItem, VecModel};
 use vykar_core::config::ResolvedRepo;
 
-use crate::messages::{FindSnapshotGroup, SnapshotRowData, SourceInfoData, UiEvent};
+use crate::messages::{
+    FindSnapshotGroup, SnapshotRowData, SnapshotSelection, SourceInfoData, UiEvent,
+};
 use crate::repo_helpers::format_repo_name;
 use crate::{AppData, FindSnapshotGroup as UiFindSnapshotGroup, MainWindow, SourceInfo};
 
@@ -48,8 +50,58 @@ pub(crate) fn to_string_model(items: Vec<String>) -> ModelRc<SharedString> {
     ModelRc::new(VecModel::from(shared))
 }
 
+/// Glyph prefixed onto the ID cell when a snapshot row is selected.
+const SELECTED_PREFIX: &str = "● ";
+
+/// Build the snapshot table rows, prefixing the ID cell with a marker glyph
+/// for selected rows. `selected` may be shorter than `data` (treated as
+/// "not selected" for missing indices).
+pub(crate) fn build_snapshot_table_rows(
+    data: &[SnapshotRowData],
+    selected: &[bool],
+) -> Vec<Vec<String>> {
+    data.iter()
+        .enumerate()
+        .map(|(i, d)| {
+            let id = if selected.get(i).copied().unwrap_or(false) {
+                format!("{SELECTED_PREFIX}{}", d.id)
+            } else {
+                d.id.clone()
+            };
+            vec![
+                id,
+                d.hostname.clone(),
+                d.time_str.clone(),
+                d.label.clone(),
+                d.files.clone(),
+                d.size.clone(),
+            ]
+        })
+        .collect()
+}
+
+/// Push the snapshot table data to the UI: AppData id/repo lists, the rows
+/// model (with selection prefix), and the selection count badge.
+pub(crate) fn publish_snapshot_table(
+    ui: &MainWindow,
+    data: &[SnapshotRowData],
+    selection: &SnapshotSelection,
+) {
+    let ids: Vec<String> = data.iter().map(|d| d.id.clone()).collect();
+    let rnames: Vec<String> = data.iter().map(|d| d.repo_name.clone()).collect();
+    ui.global::<AppData>()
+        .set_snapshot_ids(to_string_model(ids));
+    ui.global::<AppData>()
+        .set_snapshot_repo_names(to_string_model(rnames));
+
+    let rows = build_snapshot_table_rows(data, &selection.selected);
+    ui.set_snapshot_rows(to_table_model(rows));
+    ui.set_snapshot_selected_count(selection.count());
+}
+
 pub(crate) fn sort_snapshot_table(
     sd: &Arc<Mutex<Vec<SnapshotRowData>>>,
+    sel: &Arc<Mutex<SnapshotSelection>>,
     ui_weak: &slint::Weak<MainWindow>,
     col_idx: i32,
     ascending: bool,
@@ -85,27 +137,10 @@ pub(crate) fn sort_snapshot_table(
         data.reverse();
     }
 
-    let ids: Vec<String> = data.iter().map(|d| d.id.clone()).collect();
-    let rnames: Vec<String> = data.iter().map(|d| d.repo_name.clone()).collect();
-    ui.global::<AppData>()
-        .set_snapshot_ids(to_string_model(ids));
-    ui.global::<AppData>()
-        .set_snapshot_repo_names(to_string_model(rnames));
-
-    let rows: Vec<Vec<String>> = data
-        .iter()
-        .map(|d| {
-            vec![
-                d.id.clone(),
-                d.hostname.clone(),
-                d.time_str.clone(),
-                d.label.clone(),
-                d.files.clone(),
-                d.size.clone(),
-            ]
-        })
-        .collect();
-    ui.set_snapshot_rows(to_table_model(rows));
+    if let Ok(mut selection) = sel.lock() {
+        selection.reset(data.len());
+        publish_snapshot_table(&ui, &data, &selection);
+    }
 }
 
 pub(crate) fn collect_repo_names(repos: &[ResolvedRepo]) -> Vec<String> {

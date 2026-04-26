@@ -32,6 +32,8 @@ export component MainWindow inherits Window {
 
     // Snapshot table
     in-out property <[[StandardListViewItem]]> snapshot_rows: [];
+    // Number of rows currently selected in the Snapshots table (drives bulk button labels).
+    in-out property <int> snapshot_selected_count: 0;
     // Latest 3 snapshots (4 cols: ID / Time / Files / Size) for the Overview page
     in-out property <[[StandardListViewItem]]> recent_snapshot_rows: [];
 
@@ -79,9 +81,10 @@ export component MainWindow inherits Window {
     callback toggle_repo_source_expanded(/* index */ int);
     callback refresh_snapshots_clicked();
     callback prune_snapshots_clicked();
-    callback restore_selected_snapshot_clicked(/* row */ int);
-    callback delete_selected_snapshot_clicked(/* row */ int);
-    callback mount_selected_snapshot_clicked(/* row */ int);
+    callback restore_selected_snapshot_clicked();
+    callback delete_selected_snapshots_clicked();
+    callback mount_selected_snapshot_clicked();
+    callback snapshot_row_clicked(/* row */ int, /* toggle */ bool, /* range */ bool);
     callback stop_mount_clicked();
     callback open_mount_url_clicked();
     callback snapshot_sort_ascending(/* column */ int);
@@ -254,13 +257,15 @@ export component MainWindow inherits Window {
                 if root.current_page == Page.snapshots: SnapshotsPage {
                     repo_name: root.active_repo.name;
                     snapshot_rows: root.snapshot_rows;
+                    selected_count: root.snapshot_selected_count;
                     operation_busy: root.operation_busy;
                     is_mount_active: root.is_mount_active;
                     refresh_clicked => { root.refresh_snapshots_clicked(); }
                     prune_clicked => { root.prune_snapshots_clicked(); }
-                    restore_row(r) => { root.restore_selected_snapshot_clicked(r); }
-                    delete_row(r) => { root.delete_selected_snapshot_clicked(r); }
-                    mount_row(r) => { root.mount_selected_snapshot_clicked(r); }
+                    restore_selected => { root.restore_selected_snapshot_clicked(); }
+                    delete_selected => { root.delete_selected_snapshots_clicked(); }
+                    mount_selected => { root.mount_selected_snapshot_clicked(); }
+                    row_clicked(r, t, s) => { root.snapshot_row_clicked(r, t, s); }
                     sort_ascending(c) => { root.snapshot_sort_ascending(c); }
                     sort_descending(c) => { root.snapshot_sort_descending(c); }
                 }

@@ -3,14 +3,16 @@ import { VerticalBox, HorizontalBox, Button, StandardTableView, Palette } from "
 export component SnapshotsPage inherits Rectangle {
     in property <string> repo_name;
     in property <[[StandardListViewItem]]> snapshot_rows;
+    in property <int> selected_count;
     in property <bool> operation_busy;
     in property <bool> is_mount_active;
 
     callback refresh_clicked();
     callback prune_clicked();
-    callback restore_row(int);
-    callback delete_row(int);
-    callback mount_row(int);
+    callback restore_selected();
+    callback delete_selected();
+    callback mount_selected();
+    callback row_clicked(/* row */ int, /* toggle */ bool, /* range */ bool);
     callback sort_ascending(int);
     callback sort_descending(int);
 
@@ -54,6 +56,29 @@ export component SnapshotsPage inherits Rectangle {
             rows: root.snapshot_rows;
             sort-ascending(col-idx) => { root.sort_ascending(col-idx); }
             sort-descending(col-idx) => { root.sort_descending(col-idx); }
+            row-pointer-event(idx, ev, pos) => {
+                if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.left) {
+                    root.row_clicked(idx,
+                        ev.modifiers.control || ev.modifiers.meta,
+                        ev.modifiers.shift);
+                }
+            }
+            // Suppress the widget's native single-row highlight: it conflicts
+            // with our own "● " prefix marker. The widget calls set-current-row
+            // on click which writes current-row and fires this callback; a
+            // direct assignment back to -1 bypasses set-current-row so it
+            // doesn't recurse.
+            current-row-changed(r) => {
+                if (r != -1) {
+                    snapshot-table.current-row = -1;
+                }
+            }
+        }
+
+        if root.selected_count > 0: Text {
+            text: root.selected_count + " selected";
+            color: Palette.foreground;
+            font-size: 12px;
         }
 
         HorizontalBox {
@@ -61,18 +86,20 @@ export component SnapshotsPage inherits Rectangle {
             spacing: 8px;
             Button {
                 text: "Restore Selected Snapshot";
-                enabled: !root.operation_busy;
-                clicked => { root.restore_row(snapshot-table.current-row); }
+                enabled: !root.operation_busy && root.selected_count == 1;
+                clicked => { root.restore_selected(); }
             }
             Button {
-                text: "Delete Selected";
-                enabled: !root.operation_busy;
-                clicked => { root.delete_row(snapshot-table.current-row); }
+                text: root.selected_count > 0
+                    ? "Delete " + root.selected_count + " Selected"
+                    : "Delete Selected";
+                enabled: !root.operation_busy && root.selected_count > 0;
+                clicked => { root.delete_selected(); }
             }
             Button {
                 text: "Mount Selected";
-                enabled: !root.operation_busy && !root.is_mount_active;
-                clicked => { root.mount_row(snapshot-table.current-row); }
+                enabled: !root.operation_busy && !root.is_mount_active && root.selected_count == 1;
+                clicked => { root.mount_selected(); }
             }
         }
     }

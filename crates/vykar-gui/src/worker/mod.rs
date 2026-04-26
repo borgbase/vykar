@@ -141,10 +141,10 @@ pub(crate) fn run_worker(
                 dest,
                 paths,
             } => actions::handle_restore_selected(&mut ctx, repo_name, snapshot, dest, paths),
-            AppCommand::DeleteSnapshot {
+            AppCommand::DeleteSnapshots {
                 repo_name,
-                snapshot_name,
-            } => actions::handle_delete_snapshot(&mut ctx, repo_name, snapshot_name),
+                snapshot_names,
+            } => actions::handle_delete_snapshots(&mut ctx, repo_name, snapshot_names),
             AppCommand::PruneRepo { repo_name } => actions::handle_prune_repo(&mut ctx, repo_name),
             AppCommand::FindFiles {
                 repo_name,

@@ -8,12 +8,12 @@ use slint::{ComponentHandle, Model, ModelRc, SharedString, StandardListViewItem,
 use tray_icon::menu::MenuId;
 
 use crate::controllers;
-use crate::messages::{AppCommand, SnapshotRowData, SourceInfoData, UiEvent};
+use crate::messages::{AppCommand, SnapshotRowData, SnapshotSelection, SourceInfoData, UiEvent};
 use crate::state;
 use crate::tray_state;
 use crate::view_models::{
-    build_repo_source_model, current_repo_name, to_find_groups_model, to_string_model,
-    to_table_model,
+    build_repo_source_model, current_repo_name, publish_snapshot_table, to_find_groups_model,
+    to_string_model, to_table_model,
 };
 use crate::{AppData, MainWindow, RepoInfo, SourceInfo};
 
@@ -144,6 +144,7 @@ pub(crate) fn spawn(
     ui_weak: slint::Weak<MainWindow>,
     app_tx: crossbeam_channel::Sender<AppCommand>,
     snapshot_data: Arc<Mutex<Vec<SnapshotRowData>>>,
+    snapshot_selection: Arc<Mutex<SnapshotSelection>>,
     source_cache: Arc<Mutex<Vec<SourceInfoData>>>,
     last_gui_state: Arc<Mutex<Option<state::GuiState>>>,
     tray_source_items: Arc<Mutex<Vec<(MenuId, String)>>>,
@@ -154,6 +155,7 @@ pub(crate) fn spawn(
         while let Ok(event) = ui_rx.recv() {
             let ui_weak = ui_weak.clone();
             let snapshot_data = snapshot_data.clone();
+            let snapshot_selection = snapshot_selection.clone();
             let source_cache = source_cache.clone();
             let app_tx = app_tx.clone();
             let last_gui_state = last_gui_state.clone();
@@ -295,26 +297,6 @@ pub(crate) fn spawn(
                         }
                     }
                     UiEvent::SnapshotTableData { data } => {
-                        let ids: Vec<String> = data.iter().map(|d| d.id.clone()).collect();
-                        let rnames: Vec<String> =
-                            data.iter().map(|d| d.repo_name.clone()).collect();
-                        ui.global::<AppData>()
-                            .set_snapshot_ids(to_string_model(ids));
-                        ui.global::<AppData>()
-                            .set_snapshot_repo_names(to_string_model(rnames));
-                        let rows: Vec<Vec<String>> = data
-                            .iter()
-                            .map(|d| {
-                                vec![
-                                    d.id.clone(),
-                                    d.hostname.clone(),
-                                    d.time_str.clone(),
-                                    d.label.clone(),
-                                    d.files.clone(),
-                                    d.size.clone(),
-                                ]
-                            })
-                            .collect();
                         // Overview table: latest 3, columns ID / Time / Files / Size.
                         // Incoming data is sorted ascending by time, so take from the end
                         // to show newest first.
@@ -331,10 +313,16 @@ pub(crate) fn spawn(
                                 ]
                             })
                             .collect();
+                        let len = data.len();
                         if let Ok(mut sd) = snapshot_data.lock() {
                             *sd = data;
                         }
-                        ui.set_snapshot_rows(to_table_model(rows));
+                        if let (Ok(sd), Ok(mut selection)) =
+                            (snapshot_data.lock(), snapshot_selection.lock())
+                        {
+                            selection.reset(len);
+                            publish_snapshot_table(&ui, &sd, &selection);
+                        }
                         ui.set_recent_snapshot_rows(to_table_model(recent_rows));
                     }
                     UiEvent::SnapshotContentsData {

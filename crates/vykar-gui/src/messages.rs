@@ -38,9 +38,9 @@ pub(crate) enum AppCommand {
         dest: String,
         paths: Vec<String>,
     },
-    DeleteSnapshot {
+    DeleteSnapshots {
         repo_name: String,
-        snapshot_name: String,
+        snapshot_names: Vec<String>,
     },
     PruneRepo {
         repo_name: String,
@@ -71,6 +71,26 @@ pub(crate) struct RepoInfoData {
     pub snapshots: String,
     pub last_snapshot: String,
     pub size: String,
+}
+
+/// Multi-row selection state for the Snapshots table. Indices align with
+/// `snapshot_data` (and thus the rows model). Reset whenever the rows model
+/// is repopulated.
+#[derive(Debug, Default)]
+pub(crate) struct SnapshotSelection {
+    pub selected: Vec<bool>,
+    pub anchor: Option<usize>,
+}
+
+impl SnapshotSelection {
+    pub fn reset(&mut self, len: usize) {
+        self.selected = vec![false; len];
+        self.anchor = None;
+    }
+
+    pub fn count(&self) -> i32 {
+        self.selected.iter().filter(|s| **s).count() as i32
+    }
 }
 
 #[derive(Debug, Clone)]

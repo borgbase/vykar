@@ -196,8 +196,12 @@ where
                                 ))
                             })?;
                 }
+                // Hand the scratch buffer's allocation to the PlannedFile and
+                // re-init scratch — the next sanitize_item_path_into call
+                // resizes the fresh buffer to its needs. This avoids the
+                // per-file PathBuf clone the scratch was meant to eliminate.
                 planned_files.push(PlannedFile {
-                    rel_path: rel_scratch.clone(),
+                    rel_path: std::mem::take(&mut rel_scratch),
                     total_size: file_offset,
                     mode: item.mode,
                     mtime: item.mtime,

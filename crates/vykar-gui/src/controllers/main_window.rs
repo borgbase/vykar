@@ -192,7 +192,7 @@ pub(crate) fn wire_callbacks(
             let confirmed = tinyfiledialogs::message_box_yes_no(
                 "Prune Snapshots",
                 &format!(
-                    "Run prune on {name}? This will delete snapshots not matched by the repository's retention rules."
+                    "Run prune on {name}? This will delete snapshots that fall outside the retention rules for this repository."
                 ),
                 tinyfiledialogs::MessageBoxIcon::Question,
                 tinyfiledialogs::YesNo::No,

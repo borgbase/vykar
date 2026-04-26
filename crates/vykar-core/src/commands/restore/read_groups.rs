@@ -61,19 +61,45 @@ where
         blobs.sort_by_key(|b| b.pack_offset);
 
         let mut iter = blobs.into_iter();
-        let first = iter.next().unwrap(); // pack_blobs only has non-empty vecs
+        let first = iter
+            .next()
+            .expect("invariant: pack_blobs entries are non-empty by construction above");
 
+        let first_end = first
+            .pack_offset
+            .checked_add(first.stored_size as u64)
+            .ok_or_else(|| {
+                VykarError::InvalidFormat(format!(
+                    "pack offset overflow in pack {pack_id}: offset {} + size {}",
+                    first.pack_offset, first.stored_size,
+                ))
+            })?;
         let mut cur = ReadGroup {
             pack_id,
             read_start: first.pack_offset,
-            read_end: first.pack_offset + first.stored_size as u64,
+            read_end: first_end,
             blobs: vec![first],
         };
 
         for blob in iter {
-            let blob_end = blob.pack_offset + blob.stored_size as u64;
+            let blob_end = blob
+                .pack_offset
+                .checked_add(blob.stored_size as u64)
+                .ok_or_else(|| {
+                    VykarError::InvalidFormat(format!(
+                        "pack offset overflow in pack {pack_id}: offset {} + size {}",
+                        blob.pack_offset, blob.stored_size,
+                    ))
+                })?;
             let gap = blob.pack_offset.saturating_sub(cur.read_end);
-            let merged_size = blob_end - cur.read_start;
+            // sort-by-offset gives blob_end >= cur.read_start in practice, but
+            // checked_sub keeps a corrupted index from wrapping silently.
+            let merged_size = blob_end.checked_sub(cur.read_start).ok_or_else(|| {
+                VykarError::InvalidFormat(format!(
+                    "blob ordering violation in pack {pack_id}: blob_end {blob_end} < read_start {}",
+                    cur.read_start,
+                ))
+            })?;
 
             if gap <= MAX_COALESCE_GAP && merged_size <= MAX_READ_SIZE {
                 // Coalesce into the current group.
@@ -141,7 +167,14 @@ mod tests {
                     file_idx,
                     file_offset,
                 });
-                file_offset += chunk_ref.size as u64;
+                file_offset = file_offset
+                    .checked_add(chunk_ref.size as u64)
+                    .ok_or_else(|| {
+                        VykarError::InvalidFormat(format!(
+                            "file offset overflow building plan for {:?}",
+                            item.path
+                        ))
+                    })?;
             }
             if file_offset != item.size {
                 return Err(VykarError::InvalidFormat(format!(
@@ -311,6 +344,33 @@ mod tests {
         let (_files, groups) = plan_reads(&file_items, index_lookup(&index)).unwrap();
         // Separate packs → separate ReadGroups
         assert_eq!(groups.len(), 2);
+    }
+
+    #[test]
+    fn build_read_groups_rejects_offset_overflow() {
+        // A corrupted index returns pack_offset=u64::MAX with stored_size=16.
+        // build_read_groups must surface InvalidFormat instead of wrapping
+        // silently and producing a nonsensical read range.
+        let cid = dummy_chunk_id(0xAA);
+        let pack_id = dummy_pack_id(1);
+        let mut chunk_targets: HashMap<ChunkId, ChunkTargets> = HashMap::new();
+        chunk_targets.insert(
+            cid,
+            ChunkTargets {
+                expected_size: 16,
+                targets: SmallVec::new(),
+            },
+        );
+
+        let lookup = |_id: &ChunkId| Some((pack_id, u64::MAX, 16u32));
+        let err = match build_read_groups(chunk_targets, lookup) {
+            Ok(_) => panic!("expected overflow error"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("pack offset overflow"),
+            "expected overflow error, got: {err}"
+        );
     }
 
     #[test]

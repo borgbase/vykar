@@ -169,6 +169,9 @@ fn stream_dump_command(
                 )),
             })?;
 
+            // FastCDC bounds chunk size at chunker_params.max_size (≤ 16 MiB),
+            // well below u32::MAX — the cast cannot overflow.
+            debug_assert!(chunk.data.len() <= u32::MAX as usize);
             let size = chunk.data.len() as u32;
             total_size += size as u64;
             let chunk_id = ChunkId::compute(&chunk_id_key, &chunk.data);

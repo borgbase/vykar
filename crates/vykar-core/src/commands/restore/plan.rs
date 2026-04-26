@@ -186,7 +186,15 @@ where
                         file_idx,
                         file_offset,
                     });
-                    file_offset += chunk_ref.size as u64;
+                    file_offset =
+                        file_offset
+                            .checked_add(chunk_ref.size as u64)
+                            .ok_or_else(|| {
+                                VykarError::InvalidFormat(format!(
+                                    "file offset overflow building restore plan for {:?}",
+                                    item.path
+                                ))
+                            })?;
                 }
                 planned_files.push(PlannedFile {
                     rel_path: rel_scratch.clone(),

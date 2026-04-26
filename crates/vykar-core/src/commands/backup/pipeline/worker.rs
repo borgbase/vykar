@@ -152,7 +152,15 @@ fn process_file_worker_inner(
 
             // Small file (< min_chunk_size): read whole, single chunk.
             if pre_meta.size < chunker_config.min_size as u64 {
-                let mut data = Vec::with_capacity(pre_meta.size as usize);
+                // On 32-bit hosts a `u64 -> usize` cast would silently truncate
+                // a multi-GiB file's pre-allocation; refuse upfront.
+                let cap = usize::try_from(pre_meta.size).map_err(|_| {
+                    VykarError::Other(format!(
+                        "file {abs_path} too large for this platform: {} bytes",
+                        pre_meta.size,
+                    ))
+                })?;
+                let mut data = Vec::with_capacity(cap);
                 // Hard-cap at pre_meta.size + 1 so an intra-read append can't
                 // grow `data` past budget; the +1 sentinel trips the post-read
                 // `data.len() != pre_meta.size` drift check below.

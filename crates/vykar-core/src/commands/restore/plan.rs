@@ -422,6 +422,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn stream_and_plan_warns_on_absolute_symlink() {
         let temp = tempdir().unwrap();

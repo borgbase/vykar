@@ -1,7 +1,7 @@
 use crate::repo::lock::{
-    acquire_lock, break_lock, cleanup_stale_sessions, clear_all_sessions,
-    default_stale_session_duration, refresh_session, register_session, release_lock,
-    session_marker_key, SessionEntry, SessionGuard, SESSION_STALE_SECS,
+    acquire_lock, break_lock, cleanup_stale_locks_inner, cleanup_stale_sessions,
+    clear_all_sessions, default_stale_session_duration, refresh_session, register_session,
+    release_lock, session_marker_key, SessionEntry, SessionGuard, SESSION_STALE_SECS,
 };
 use crate::testutil::MemoryBackend;
 use chrono::{Duration, Utc};
@@ -64,6 +64,159 @@ fn stale_lock_is_cleaned_up() {
         "stale lock should be removed during acquisition"
     );
     release_lock(&storage, guard).unwrap();
+}
+
+fn lock_key_at(ts: chrono::DateTime<Utc>, suffix: &str) -> String {
+    format!("locks/{:020}-{suffix}.json", ts.timestamp_micros())
+}
+
+fn write_lock_marker(
+    storage: &MemoryBackend,
+    key: &str,
+    hostname: &str,
+    pid: u32,
+    time: chrono::DateTime<Utc>,
+    boot_id: Option<&str>,
+) {
+    let mut value = serde_json::json!({
+        "hostname": hostname,
+        "pid": pid,
+        "time": time.to_rfc3339(),
+    });
+    if let Some(boot_id) = boot_id {
+        value["boot_id"] = serde_json::Value::String(boot_id.to_string());
+    }
+    storage
+        .put(key, serde_json::to_vec(&value).unwrap().as_slice())
+        .unwrap();
+}
+
+#[test]
+fn stale_lock_cleanup_removes_same_host_older_boot() {
+    let storage = MemoryBackend::new();
+    let key = lock_key_at(Utc::now(), "old-boot");
+    write_lock_marker(&storage, &key, "myhost", 123, Utc::now(), Some("boot-a"));
+
+    cleanup_stale_locks_inner(
+        &storage,
+        Duration::hours(6),
+        "myhost",
+        Some("boot-b"),
+        |_| true,
+    )
+    .unwrap();
+
+    assert!(!storage.exists(&key).unwrap());
+}
+
+#[test]
+fn stale_lock_cleanup_removes_dead_same_host_pid() {
+    let storage = MemoryBackend::new();
+    let key = lock_key_at(Utc::now(), "dead-pid");
+    write_lock_marker(&storage, &key, "myhost", 123, Utc::now(), Some("boot-a"));
+
+    cleanup_stale_locks_inner(
+        &storage,
+        Duration::hours(6),
+        "myhost",
+        Some("boot-a"),
+        |_| false,
+    )
+    .unwrap();
+
+    assert!(!storage.exists(&key).unwrap());
+}
+
+#[test]
+fn stale_lock_cleanup_preserves_live_same_host_pid() {
+    let storage = MemoryBackend::new();
+    let key = lock_key_at(Utc::now(), "live-pid");
+    write_lock_marker(&storage, &key, "myhost", 123, Utc::now(), Some("boot-a"));
+
+    cleanup_stale_locks_inner(
+        &storage,
+        Duration::hours(6),
+        "myhost",
+        Some("boot-a"),
+        |_| true,
+    )
+    .unwrap();
+
+    assert!(storage.exists(&key).unwrap());
+}
+
+#[test]
+fn stale_lock_cleanup_preserves_recent_foreign_host() {
+    let storage = MemoryBackend::new();
+    let key = lock_key_at(Utc::now(), "foreign");
+    write_lock_marker(&storage, &key, "otherhost", 123, Utc::now(), Some("boot-a"));
+
+    cleanup_stale_locks_inner(
+        &storage,
+        Duration::hours(6),
+        "myhost",
+        Some("boot-b"),
+        |_| false,
+    )
+    .unwrap();
+
+    assert!(storage.exists(&key).unwrap());
+}
+
+#[test]
+fn stale_lock_cleanup_reaps_malformed_lock_by_key_age() {
+    let storage = MemoryBackend::new();
+    let old = Utc::now() - Duration::hours(7);
+    let key = lock_key_at(old, "malformed");
+    storage.put(&key, b"not-json").unwrap();
+
+    cleanup_stale_locks_inner(
+        &storage,
+        Duration::hours(6),
+        "myhost",
+        Some("boot-a"),
+        |_| true,
+    )
+    .unwrap();
+
+    assert!(!storage.exists(&key).unwrap());
+}
+
+#[test]
+fn stale_lock_cleanup_preserves_recent_old_format_lock() {
+    let storage = MemoryBackend::new();
+    let key = lock_key_at(Utc::now(), "old-format");
+    write_lock_marker(&storage, &key, "otherhost", 123, Utc::now(), None);
+
+    cleanup_stale_locks_inner(
+        &storage,
+        Duration::hours(6),
+        "myhost",
+        Some("boot-a"),
+        |_| false,
+    )
+    .unwrap();
+
+    assert!(storage.exists(&key).unwrap());
+}
+
+#[test]
+fn stale_lock_cleanup_reaps_age_stale_old_format_lock() {
+    let storage = MemoryBackend::new();
+    let old = Utc::now() - Duration::hours(7);
+    let key = lock_key_at(old, "age-stale");
+    write_lock_marker(&storage, &key, "otherhost", 123, old, None);
+
+    cleanup_stale_locks_inner(
+        &storage,
+        Duration::hours(6),
+        "myhost",
+        Some("boot-a"),
+        |_| false,
+    )
+    .unwrap();
+
+    assert!(!storage.exists(&key).unwrap());
 }
 
 #[test]

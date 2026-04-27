@@ -8,12 +8,15 @@ export component AdvancedPage inherits Rectangle {
     in-out property <bool> editor_dirty;
     in property <string> editor_font_family;
     in property <bool> operation_busy;
+    in property <string> selected_repo_name;
 
     callback open_config_clicked();
     callback switch_config_clicked();
     callback reload_config_clicked();
     callback save_clicked();
     callback discard_clicked();
+    callback clear_locks_clicked();
+    callback clear_sessions_clicked();
     callback text_edited(string);
 
     VerticalBox {
@@ -85,6 +88,26 @@ export component AdvancedPage inherits Rectangle {
             text: root.editor_status;
             color: #cc0000;
             wrap: word-wrap;
+        }
+
+        HorizontalBox {
+            padding: 0px;
+            spacing: 8px;
+            Text {
+                text: "Recovery:";
+                vertical-alignment: center;
+                font-weight: 700;
+            }
+            Button {
+                text: "Clear Lock";
+                enabled: !root.operation_busy && root.selected_repo_name != "";
+                clicked => { root.clear_locks_clicked(); }
+            }
+            Button {
+                text: "Clear Sessions";
+                enabled: !root.operation_busy && root.selected_repo_name != "";
+                clicked => { root.clear_sessions_clicked(); }
+            }
         }
     }
 }

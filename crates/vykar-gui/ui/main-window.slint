@@ -74,6 +74,8 @@ export component MainWindow inherits Window {
     callback save_and_apply_clicked();
     callback discard_clicked();
     callback reload_config_clicked();
+    callback clear_locks_clicked();
+    callback clear_sessions_clicked();
     callback backup_repo_clicked(/* index */ int);
     callback backup_source_clicked(/* index */ int);
     callback toggle_source_expanded(/* index */ int);
@@ -298,11 +300,14 @@ export component MainWindow inherits Window {
                     editor_dirty <=> root.editor_dirty;
                     editor_font_family: root.editor_font_family;
                     operation_busy: root.operation_busy;
+                    selected_repo_name: root.active_repo.name;
                     open_config_clicked => { root.open_config_clicked(); }
                     switch_config_clicked => { root.switch_config_clicked(); }
                     reload_config_clicked => { root.reload_config_clicked(); }
                     save_clicked => { root.save_and_apply_clicked(); }
                     discard_clicked => { root.discard_clicked(); }
+                    clear_locks_clicked => { root.clear_locks_clicked(); }
+                    clear_sessions_clicked => { root.clear_sessions_clicked(); }
                     text_edited(new_text) => {
                         root.editor_dirty = (new_text != root.editor_baseline);
                         root.editor_status = "";

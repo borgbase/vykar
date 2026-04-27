@@ -61,6 +61,12 @@ pub(crate) enum AppCommand {
     SaveAndApplyConfig {
         yaml_text: String,
     },
+    ClearRepoLocks {
+        repo_name: String,
+    },
+    ClearRepoSessions {
+        repo_name: String,
+    },
     StartMount {
         repo_name: String,
         snapshot_name: Option<String>,

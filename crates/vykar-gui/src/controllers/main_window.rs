@@ -30,6 +30,37 @@ fn single_selected_index(sel: &Arc<Mutex<SnapshotSelection>>) -> Option<usize> {
     Some(only)
 }
 
+fn wire_recovery_button(
+    ui: &MainWindow,
+    app_tx: &Sender<AppCommand>,
+    register: impl FnOnce(&MainWindow, Box<dyn Fn() + 'static>),
+    dialog_title: &'static str,
+    prompt_template: &'static str,
+    make_command: impl Fn(String) -> AppCommand + 'static,
+) {
+    let tx = app_tx.clone();
+    let ui_weak = ui.as_weak();
+    let cb = Box::new(move || {
+        let Some(ui) = ui_weak.upgrade() else {
+            return;
+        };
+        let Some(repo_name) = current_repo_name(&ui) else {
+            return;
+        };
+        let prompt = prompt_template.replace("{repo}", &repo_name);
+        let confirmed = tinyfiledialogs::message_box_yes_no(
+            dialog_title,
+            &prompt,
+            tinyfiledialogs::MessageBoxIcon::Warning,
+            tinyfiledialogs::YesNo::No,
+        );
+        if confirmed == tinyfiledialogs::YesNo::Yes {
+            let _ = tx.send(make_command(repo_name));
+        }
+    });
+    register(ui, cb);
+}
+
 fn selected_indices(sel: &Arc<Mutex<SnapshotSelection>>, expected: usize) -> Option<Vec<usize>> {
     let guard = sel.lock().ok()?;
     let indices: Vec<usize> = guard
@@ -123,6 +154,24 @@ pub(crate) fn wire_callbacks(
         }
         let _ = tx.send(AppCommand::ReloadConfig);
     });
+
+    wire_recovery_button(
+        ui,
+        &app_tx,
+        |ui, cb| ui.on_clear_locks_clicked(cb),
+        "Clear Repository Lock",
+        "Clear advisory locks for {repo}?\n\nOnly use this if no Vykar operation is currently writing to this repository.",
+        |repo_name| AppCommand::ClearRepoLocks { repo_name },
+    );
+
+    wire_recovery_button(
+        ui,
+        &app_tx,
+        |ui, cb| ui.on_clear_sessions_clicked(cb),
+        "Clear Backup Sessions",
+        "Clear all backup sessions for {repo}?\n\nThis can affect live backups from this or another machine. Only continue if you are sure no backups are running.",
+        |repo_name| AppCommand::ClearRepoSessions { repo_name },
+    );
 
     {
         let tx = app_tx.clone();
@@ -281,7 +330,7 @@ pub(crate) fn wire_callbacks(
             cancel.store(true, Ordering::SeqCst);
             send_log(
                 &ui_tx,
-                "Cancel requested; will stop after current step completes.",
+                "Cancel requested; Vykar will stop when the current file, upload, or storage operation returns.",
             );
         });
     }

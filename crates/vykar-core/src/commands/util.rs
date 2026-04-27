@@ -257,7 +257,11 @@ pub fn with_maintenance_lock<T>(
             }
         }
         Err(e) => {
-            tracing::warn!("failed to clean up stale sessions: {e}");
+            let _ = lock::release_lock(repo.storage.as_ref(), guard);
+            return Err(VykarError::Other(format!(
+                "cannot clean up stale backup sessions (storage error: {e}); \
+                 refusing maintenance to avoid data loss"
+            )));
         }
     }
 

@@ -362,7 +362,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     cancel.store(true, Ordering::SeqCst);
                     send_log(
                         &log_tx,
-                        "Cancel requested; will stop after current step completes.",
+                        "Cancel requested; Vykar will stop when the current file, upload, or storage operation returns.",
                     );
                 } else if event.id == quit_item_id {
                     let _ = log_tx.send(UiEvent::Quit);

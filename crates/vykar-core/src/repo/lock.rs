@@ -16,6 +16,8 @@ struct LockEntry {
     hostname: String,
     pid: u32,
     time: String,
+    #[serde(default)]
+    boot_id: Option<String>,
 }
 
 const LOCKS_PREFIX: &str = "locks/";
@@ -53,6 +55,7 @@ pub fn acquire_lock(storage: &dyn StorageBackend) -> Result<LockGuard> {
         hostname,
         pid,
         time: now.to_rfc3339(),
+        boot_id: crate::platform::boot_id(),
     };
 
     let uuid = format!("{:032x}", rand::random::<u128>());
@@ -126,22 +129,87 @@ fn format_lock_holder(storage: &dyn StorageBackend, lock_key: &str) -> String {
 }
 
 fn cleanup_stale_locks(storage: &dyn StorageBackend, max_age: Duration) -> Result<()> {
+    cleanup_stale_locks_inner(
+        storage,
+        max_age,
+        &crate::platform::hostname(),
+        crate::platform::boot_id().as_deref(),
+        crate::platform::is_pid_alive,
+    )
+}
+
+pub(crate) fn cleanup_stale_locks_inner(
+    storage: &dyn StorageBackend,
+    max_age: Duration,
+    local_hostname: &str,
+    local_boot_id: Option<&str>,
+    pid_alive_fn: impl Fn(u32) -> bool,
+) -> Result<()> {
     let now = Utc::now();
     for key in list_lock_keys(storage)? {
         let Some(data) = storage.get(&key)? else {
             continue;
         };
-        let Ok(entry) = serde_json::from_slice::<LockEntry>(&data) else {
-            continue;
-        };
-        let Ok(acquired) = chrono::DateTime::parse_from_rfc3339(&entry.time) else {
-            continue;
-        };
-        if now.signed_duration_since(acquired.with_timezone(&Utc)) > max_age {
-            let _ = storage.delete(&key);
+        let entry = serde_json::from_slice::<LockEntry>(&data).ok();
+        if should_cleanup_lock(
+            &key,
+            entry.as_ref(),
+            now,
+            max_age,
+            local_hostname,
+            local_boot_id,
+            &pid_alive_fn,
+        ) {
+            storage.delete(&key)?;
         }
     }
     Ok(())
+}
+
+fn should_cleanup_lock(
+    key: &str,
+    entry: Option<&LockEntry>,
+    now: chrono::DateTime<Utc>,
+    max_age: Duration,
+    local_hostname: &str,
+    local_boot_id: Option<&str>,
+    pid_alive_fn: &impl Fn(u32) -> bool,
+) -> bool {
+    if let Some(entry) = entry {
+        let same_host = entry.hostname == local_hostname;
+        if same_host {
+            if let (Some(local), Some(remote)) = (local_boot_id, entry.boot_id.as_deref()) {
+                if local != remote {
+                    return true;
+                }
+            }
+            if !pid_alive_fn(entry.pid) {
+                return true;
+            }
+        }
+    }
+
+    lock_timestamp(entry, key).is_some_and(|acquired| now.signed_duration_since(acquired) > max_age)
+}
+
+fn lock_timestamp(entry: Option<&LockEntry>, key: &str) -> Option<chrono::DateTime<Utc>> {
+    entry
+        .and_then(|entry| {
+            chrono::DateTime::parse_from_rfc3339(&entry.time)
+                .ok()
+                .map(|ts| ts.with_timezone(&Utc))
+        })
+        .or_else(|| lock_key_timestamp(key))
+}
+
+fn lock_key_timestamp(key: &str) -> Option<chrono::DateTime<Utc>> {
+    let raw = key.strip_prefix(LOCKS_PREFIX)?.strip_suffix(".json")?;
+    let (micros, _) = raw.split_once('-')?;
+    if micros.len() != 20 || !micros.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let micros = micros.parse::<i64>().ok()?;
+    chrono::DateTime::<Utc>::from_timestamp_micros(micros)
 }
 
 /// Build a lock fence closure that verifies the lock is still valid.
@@ -195,6 +263,7 @@ fn build_lock_fence_inner(
                 hostname: hostname.clone(),
                 pid,
                 time: Utc::now().to_rfc3339(),
+                boot_id: crate::platform::boot_id(),
             };
             if let Ok(data) = serde_json::to_vec(&entry) {
                 if storage.put(&lock_key, &data).is_ok() {
@@ -554,7 +623,7 @@ pub fn cleanup_stale_sessions(
 
         if is_stale_by_age {
             debug!(session_id, age_hours = %((now - ts.with_timezone(&Utc)).num_hours()), "cleaning stale session");
-            let _ = storage.delete(key);
+            storage.delete(key)?;
             cleaned_ids.insert(session_id.to_string());
             cleaned.push(session_id.to_string());
         } else if is_dead_local {
@@ -563,7 +632,7 @@ pub fn cleanup_stale_sessions(
                 pid = entry.pid,
                 "cleaning session from dead local process"
             );
-            let _ = storage.delete(key);
+            storage.delete(key)?;
             cleaned_ids.insert(session_id.to_string());
             cleaned.push(session_id.to_string());
         } else {
@@ -581,7 +650,7 @@ pub fn cleanup_stale_sessions(
             .and_then(|s| s.strip_suffix(".index"))
         {
             if !surviving_markers.contains(id) && !cleaned_ids.contains(id) {
-                let _ = storage.delete(key);
+                storage.delete(key)?;
             }
         }
     }

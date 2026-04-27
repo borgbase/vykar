@@ -161,6 +161,12 @@ pub(crate) fn run_worker(
             AppCommand::SaveAndApplyConfig { yaml_text } => {
                 config_cmds::handle_save_and_apply_config(&mut ctx, yaml_text)
             }
+            AppCommand::ClearRepoLocks { repo_name } => {
+                config_cmds::handle_clear_repo_locks(&mut ctx, repo_name)
+            }
+            AppCommand::ClearRepoSessions { repo_name } => {
+                config_cmds::handle_clear_repo_sessions(&mut ctx, repo_name)
+            }
             AppCommand::StartMount {
                 repo_name,
                 snapshot_name,

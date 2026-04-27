@@ -2,11 +2,14 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
 use crate::config_helpers;
-use crate::messages::UiEvent;
+use crate::messages::{AppCommand, UiEvent};
 use crate::repo_helpers::send_log;
 use crate::scheduler;
 use crate::view_models::send_structured_data;
+use vykar_core::{repo::lock, storage};
+use vykar_types::error::Result;
 
+use super::shared::select_repo_or_log;
 use super::WorkerContext;
 
 pub(super) fn handle_open_config_file(ctx: &WorkerContext) {
@@ -64,6 +67,66 @@ pub(super) fn handle_save_and_apply_config(ctx: &mut WorkerContext, yaml_text: S
         let _ = ctx.ui_tx.send(UiEvent::ConfigSaveError(
             "Config saved to disk but failed to apply. Check log for details.".into(),
         ));
+    }
+}
+
+pub(super) fn handle_clear_repo_locks(ctx: &mut WorkerContext, repo_name: String) {
+    handle_repo_recovery_action(ctx, repo_name, "lock", "lock marker", lock::break_lock);
+}
+
+pub(super) fn handle_clear_repo_sessions(ctx: &mut WorkerContext, repo_name: String) {
+    handle_repo_recovery_action(
+        ctx,
+        repo_name,
+        "sessions",
+        "session file",
+        lock::clear_all_sessions,
+    );
+}
+
+fn handle_repo_recovery_action<F>(
+    ctx: &mut WorkerContext,
+    repo_name: String,
+    action_label: &str,
+    item_label: &str,
+    action: F,
+) where
+    F: FnOnce(&dyn vykar_core::storage::StorageBackend) -> Result<usize>,
+{
+    let repo = match select_repo_or_log(ctx, &ctx.runtime.repos, &repo_name) {
+        Some(r) => r,
+        None => return,
+    };
+    let backend =
+        match storage::backend_from_config(&repo.config.repository, repo.config.limits.connections)
+        {
+            Ok(b) => b,
+            Err(e) => {
+                send_log(
+                    &ctx.ui_tx,
+                    format!("[{repo_name}] cannot open storage: {e}"),
+                );
+                return;
+            }
+        };
+
+    match action(backend.as_ref()) {
+        Ok(removed) => {
+            send_log(
+                &ctx.ui_tx,
+                format!("[{repo_name}] cleared {removed} {item_label}(s)."),
+            );
+            let _ = ctx.app_tx.send(AppCommand::FetchAllRepoInfo);
+            let _ = ctx.app_tx.send(AppCommand::RefreshSnapshots {
+                repo_selector: repo_name,
+            });
+        }
+        Err(e) => {
+            send_log(
+                &ctx.ui_tx,
+                format!("[{repo_name}] clear {action_label} failed: {e}"),
+            );
+        }
     }
 }
 

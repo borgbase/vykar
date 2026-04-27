@@ -2,6 +2,8 @@ use crate::config::RepositoryConfig;
 use vykar_storage::StorageConfig;
 use vykar_types::error::Result;
 
+pub use vykar_storage::StorageBackend;
+
 /// Convert a [`RepositoryConfig`] into a [`StorageConfig`] for backend construction.
 fn storage_config_from_repo(cfg: &RepositoryConfig) -> StorageConfig {
     StorageConfig {

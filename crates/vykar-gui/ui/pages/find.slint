@@ -55,12 +55,14 @@ export component FindPage inherits Rectangle {
         ScrollView {
             vertical-stretch: 1;
             VerticalLayout {
+                alignment: start;
                 spacing: 12px;
                 if root.groups.length == 0 && root.has_searched && !root.operation_busy: Text {
                     text: "No results.";
                     color: #888888;
                 }
                 for group in root.groups: VerticalLayout {
+                    alignment: start;
                     spacing: 4px;
                     HorizontalLayout {
                         spacing: 8px;

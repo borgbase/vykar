@@ -169,8 +169,6 @@ export component MainWindow inherits Window {
                                     spacing: 0px;
                                     SideBarItem {
                                         text: repo.name;
-                                        selected: root.current_repo_index == idx
-                                            && root.repo_scoped_page;
                                         clicked => {
                                             root.select_repo_and_page(idx,
                                                 root.repo_scoped_page ? root.current_page : Page.overview);

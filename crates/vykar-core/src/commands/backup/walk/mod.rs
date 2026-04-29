@@ -241,6 +241,14 @@ pub(super) enum WalkEntry {
     },
     /// A file that was skipped due to a soft error (permission denied, not found).
     Skipped,
+    /// macOS dataless (FileProvider placeholder) file with no matching entry
+    /// in the local file cache or the parent reuse index. Skipped without
+    /// opening so we never trigger asynchronous hydration. Counted into a
+    /// per-source running total used to emit a single end-of-source summary
+    /// warning.
+    SkippedDataless {
+        path: String,
+    },
     SourceStarted {
         path: String,
     },
@@ -258,7 +266,7 @@ pub(super) fn reserve_budget(entry: &WalkEntry, budget: &ByteBudget) -> Result<u
             budget.acquire(usize::try_from(*file_size).unwrap_or(usize::MAX))
         }
         WalkEntry::FileSegment { len, .. } => budget.acquire(*len as usize),
-        WalkEntry::Skipped => Ok(0),
+        WalkEntry::Skipped | WalkEntry::SkippedDataless { .. } => Ok(0),
         _ => Ok(0),
     }
 }
@@ -480,15 +488,24 @@ fn walked_entry_to_walk_items(
             .into_string()
             .unwrap_or_else(|os| os.to_string_lossy().into_owned());
 
-        let cached_refs =
-            super::resolve_cache_hit(file_cache, parent_reuse_index, &abs_path, &metadata_summary);
-        if let Some(cached_refs) = cached_refs {
-            return WalkItems::One(Some(Ok(WalkEntry::CacheHit {
-                item,
-                abs_path,
-                metadata: metadata_summary,
-                cached_refs,
-            })));
+        match super::resolve_cache_hit(file_cache, parent_reuse_index, &abs_path, &metadata_summary)
+        {
+            super::CacheResolution::Hit(cached_refs) => {
+                return WalkItems::One(Some(Ok(WalkEntry::CacheHit {
+                    item,
+                    abs_path,
+                    metadata: metadata_summary,
+                    cached_refs,
+                })));
+            }
+            super::CacheResolution::SkipDataless => {
+                tracing::debug!(
+                    path = %abs_path,
+                    "skipping dataless cloud-only file (no cache or parent reuse)"
+                );
+                return WalkItems::One(Some(Ok(WalkEntry::SkippedDataless { path: abs_path })));
+            }
+            super::CacheResolution::Miss => {}
         }
 
         let file_size = metadata_summary.size;
@@ -550,6 +567,7 @@ mod tests {
             device: 0,
             inode: 0,
             size: 1024,
+            is_dataless: false,
         }
     }
 

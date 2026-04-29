@@ -249,6 +249,16 @@ pub(super) fn build_transform_pool(max_threads: usize) -> Result<Option<rayon::T
         .map_err(|e| VykarError::Other(format!("failed to create rayon thread pool: {e}")))
 }
 
+/// Status returned by [`process_regular_file_item`] to its caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ProcessOutcome {
+    /// File was committed (chunked or cache-hit).
+    Committed,
+    /// macOS dataless file skipped — caller should increment a per-source
+    /// counter so the end-of-source summary reports the count.
+    SkippedDataless,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn process_regular_file_item(
     repo: &mut Repository,
@@ -266,25 +276,30 @@ pub(super) fn process_regular_file_item(
     dedup_filter: Option<&xorf::Xor8>,
     verbose: bool,
     parent_reuse_index: Option<&ParentReuseIndex>,
-) -> Result<()> {
-    if let Some(cb) = progress.as_deref_mut() {
-        cb(BackupProgressEvent::FileStarted {
-            path: item.path.clone(),
-        });
-    }
-
+) -> Result<ProcessOutcome> {
     // File-level cache: skip read/chunk/compress/encrypt for unchanged files.
     let abs_path = entry_path.to_string_lossy().to_string();
     let file_size = metadata_summary.size;
 
-    let effective_hit = super::resolve_cache_hit(
+    let resolution = super::resolve_cache_hit(
         repo.file_cache(),
         parent_reuse_index,
         &abs_path,
         &metadata_summary,
     );
 
-    if let Some(cached_refs) = effective_hit {
+    if let super::CacheResolution::SkipDataless = resolution {
+        debug!(path = %item.path, "skipping dataless cloud-only file (no cache or parent reuse)");
+        return Ok(ProcessOutcome::SkippedDataless);
+    }
+
+    if let Some(cb) = progress.as_deref_mut() {
+        cb(BackupProgressEvent::FileStarted {
+            path: item.path.clone(),
+        });
+    }
+
+    if let super::CacheResolution::Hit(cached_refs) = resolution {
         super::commit::commit_cache_hit(repo, item, &cached_refs, stats)?;
 
         if verbose {
@@ -310,7 +325,7 @@ pub(super) fn process_regular_file_item(
 
         debug!(path = %item.path, "file cache hit");
         emit_stats_progress(progress, stats, Some(item.path.clone()));
-        return Ok(());
+        return Ok(ProcessOutcome::Committed);
     }
 
     let chunk_id_key = *repo.crypto.chunk_id_key();
@@ -330,6 +345,7 @@ pub(super) fn process_regular_file_item(
     if !fs::metadata_matches(&pre_meta, &metadata_summary) {
         return Err(VykarError::FileChangedDuringRead {
             path: entry_path.to_string_lossy().into_owned(),
+            dataless: pre_meta.is_dataless,
         });
     }
 
@@ -390,6 +406,7 @@ pub(super) fn process_regular_file_item(
         if !fs::metadata_matches(&pre_meta_c, &post_meta) || total_bytes != pre_meta_c.size {
             return Err(VykarError::FileChangedDuringRead {
                 path: entry_path.to_string_lossy().into_owned(),
+                dataless: post_meta.is_dataless,
             });
         }
 
@@ -449,7 +466,7 @@ pub(super) fn process_regular_file_item(
     );
 
     emit_stats_progress(progress, stats, Some(item.path.clone()));
-    Ok(())
+    Ok(ProcessOutcome::Committed)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -487,6 +504,7 @@ pub(super) fn process_source_path(
     let chunk_id_key = *repo.crypto.chunk_id_key();
     let min_chunk_size = repo.config.chunker_params.min_size as u64;
     let mut cross_batch = CrossFileBatch::new();
+    let mut dataless_skipped: u64 = 0;
 
     let inode_walk = InodeSortedWalk::new(
         source,
@@ -530,14 +548,23 @@ pub(super) fn process_source_path(
                 // Flush batch before cache-hit check since it may need walk-order items.
                 let abs_path = entry_path.to_string_lossy().to_string();
 
-                let effective_hit = super::resolve_cache_hit(
+                let resolution = super::resolve_cache_hit(
                     repo.file_cache(),
                     parent_reuse_index,
                     &abs_path,
                     &metadata_summary,
                 );
 
-                if let Some(cached_refs) = effective_hit {
+                if let super::CacheResolution::SkipDataless = resolution {
+                    debug!(
+                        path = %item.path,
+                        "skipping dataless cloud-only file (no cache or parent reuse)"
+                    );
+                    dataless_skipped += 1;
+                    continue;
+                }
+
+                if let super::CacheResolution::Hit(cached_refs) = resolution {
                     // Flush batch to preserve walk order before the cache-hit item.
                     flush_cross_file_batch(
                         &mut cross_batch,
@@ -626,10 +653,15 @@ pub(super) fn process_source_path(
                     // the small-file regime — no separate routing guard is
                     // needed.
                     if !fs::metadata_matches(&pre_meta, &metadata_summary) {
+                        let suffix = if pre_meta.is_dataless {
+                            " (cloud-only file, hydration in progress)"
+                        } else {
+                            ""
+                        };
                         emit_post_commit_warning(
                             progress,
                             format!(
-                                "skipping file '{}': file changed between walk and open",
+                                "skipping file '{}': file changed between walk and open{suffix}",
                                 entry_path.display()
                             ),
                         );
@@ -673,10 +705,15 @@ pub(super) fn process_source_path(
                     if !fs::metadata_matches(&pre_meta, &post_meta)
                         || data.len() as u64 != pre_meta.size
                     {
+                        let suffix = if post_meta.is_dataless {
+                            " (cloud-only file, hydration in progress)"
+                        } else {
+                            ""
+                        };
                         emit_post_commit_warning(
                             progress,
                             format!(
-                                "skipping file '{}': file changed during read",
+                                "skipping file '{}': file changed during read{suffix}",
                                 entry_path.display()
                             ),
                         );
@@ -732,7 +769,7 @@ pub(super) fn process_source_path(
                     verbose,
                 )?;
 
-                if let Err(e) = process_regular_file_item(
+                match process_regular_file_item(
                     repo,
                     &entry_path,
                     metadata_summary,
@@ -749,7 +786,12 @@ pub(super) fn process_source_path(
                     verbose,
                     parent_reuse_index,
                 ) {
-                    if e.is_soft_file_error() {
+                    Ok(ProcessOutcome::Committed) => {}
+                    Ok(ProcessOutcome::SkippedDataless) => {
+                        dataless_skipped += 1;
+                        continue;
+                    }
+                    Err(e) if e.is_soft_file_error() => {
                         emit_post_commit_warning(
                             progress,
                             format!("skipping file '{}': {e}", entry_path.display()),
@@ -757,7 +799,7 @@ pub(super) fn process_source_path(
                         stats.errors += 1;
                         continue;
                     }
-                    return Err(e);
+                    Err(e) => return Err(e),
                 }
             }
         } else {
@@ -806,6 +848,10 @@ pub(super) fn process_source_path(
         dedup_filter,
         verbose,
     )?;
+
+    if dataless_skipped > 0 {
+        super::emit_dataless_summary(progress, dataless_skipped);
+    }
 
     emit_progress(
         progress,

@@ -33,6 +33,7 @@ pub(super) fn test_metadata() -> fs::MetadataSummary {
         device: 0,
         inode: 0,
         size: 1024,
+        is_dataless: false,
     }
 }
 

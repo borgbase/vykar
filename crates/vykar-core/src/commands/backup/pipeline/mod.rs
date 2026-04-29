@@ -89,6 +89,14 @@ pub(super) enum ProcessedEntry {
         /// Pre-formatted reason (avoids carrying `VykarError` across threads).
         reason: String,
     },
+    /// A macOS dataless (FileProvider placeholder) file skipped at walk time
+    /// because neither the local file cache nor the parent reuse index had
+    /// a matching entry. No I/O was performed (no hydration, no read).
+    /// Counted into a per-source running total and surfaced as a single
+    /// end-of-source summary warning.
+    DatalessSkipped {
+        path: String,
+    },
     /// The walker reported a soft error before it could materialize a
     /// path (e.g. directory-iteration `EACCES`). The walker has already
     /// logged the failing path via `tracing::warn!`, so the consumer
@@ -320,6 +328,10 @@ pub(crate) fn run_parallel_pipeline(
         let mut large_file_accum: Option<LargeFileAccum> = None;
         // When segment 0 is skipped, we drain remaining segments silently.
         let mut segments_to_skip: usize = 0;
+        // Per-source running total of dataless cloud-only files skipped
+        // (no parent-reuse hit). Reset on SourceStarted; flushed as a single
+        // summary warning on SourceFinished.
+        let mut dataless_skipped: u64 = 0;
 
         for msg in &result_rx {
             if shutdown.is_some_and(|f| f.load(Ordering::Relaxed)) {
@@ -378,6 +390,13 @@ pub(crate) fn run_parallel_pipeline(
                         // tracing::warn!; surface only the error count.
                         stats.errors += 1;
                     }
+                    Ok(ProcessedEntry::DatalessSkipped { path }) => {
+                        // Walker already emitted a tracing::debug! with the
+                        // path; the consumer just bumps the per-source count
+                        // so the SourceFinished arm can flush the summary.
+                        let _ = path;
+                        dataless_skipped += 1;
+                    }
                     Ok(ProcessedEntry::SegmentSkipped {
                         segment_index,
                         num_segments,
@@ -405,6 +424,20 @@ pub(crate) fn run_parallel_pipeline(
                         }
                     }
                     Ok(entry) => {
+                        // Reset/flush per-source dataless counter around
+                        // source boundaries before delegating to the consumer.
+                        match &entry {
+                            ProcessedEntry::SourceStarted { .. } => {
+                                dataless_skipped = 0;
+                            }
+                            ProcessedEntry::SourceFinished { .. } => {
+                                if dataless_skipped > 0 {
+                                    super::emit_dataless_summary(progress, dataless_skipped);
+                                    dataless_skipped = 0;
+                                }
+                            }
+                            _ => {}
+                        }
                         if let Err(e) = consumer::consume_processed_entry(
                             entry,
                             repo,

@@ -140,8 +140,18 @@ pub enum VykarError {
     #[error("repository identity mismatch: {0}")]
     RepositoryMismatch(String),
 
-    #[error("file changed during read: {path}")]
-    FileChangedDuringRead { path: String },
+    #[error("file changed during read: {path}{}", if *dataless { " (cloud-only file, hydration in progress)" } else { "" })]
+    FileChangedDuringRead {
+        path: String,
+        /// macOS hint: the file was reported dataless on the post-read fstat,
+        /// suggesting hydration is in progress. Surfaced in the message so
+        /// the user can recognize the iCloud Drive / Dropbox / OneDrive case.
+        ///
+        /// Kept structural (rather than inlined into `path`) so consumers
+        /// that round-trip, prefix-strip, or render `path` as a clickable
+        /// link see a clean path; the `Display` impl does the formatting.
+        dataless: bool,
+    },
 
     #[error("{0}")]
     Other(String),
@@ -226,7 +236,29 @@ mod tests {
     fn is_soft_file_error_file_changed_during_read() {
         let err = VykarError::FileChangedDuringRead {
             path: "/tmp/some/file".to_string(),
+            dataless: false,
         };
         assert!(err.is_soft_file_error());
+    }
+
+    #[test]
+    fn file_changed_during_read_appends_dataless_hint() {
+        let err = VykarError::FileChangedDuringRead {
+            path: "/tmp/icloud-doc".to_string(),
+            dataless: true,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("/tmp/icloud-doc"), "msg: {msg}");
+        assert!(msg.contains("cloud-only file"), "msg: {msg}");
+    }
+
+    #[test]
+    fn file_changed_during_read_omits_hint_when_not_dataless() {
+        let err = VykarError::FileChangedDuringRead {
+            path: "/tmp/regular".to_string(),
+            dataless: false,
+        };
+        let msg = err.to_string();
+        assert!(!msg.contains("cloud-only"), "msg: {msg}");
     }
 }

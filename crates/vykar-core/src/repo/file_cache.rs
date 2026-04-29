@@ -403,6 +403,41 @@ impl FileCache {
         }
     }
 
+    /// Look up a dataless (macOS FileProvider placeholder) file. Matches on
+    /// `(device, inode, mtime_ns, size)` and intentionally **ignores ctime**:
+    /// toggling the `SF_DATALESS` flag bumps ctime even when the logical
+    /// content is unchanged, so requiring ctime equality would force every
+    /// dataless file to fall through to the (weaker) parent-reuse path or be
+    /// skipped entirely on the warm-cache path.
+    ///
+    /// This identity is strictly stronger than
+    /// [`ParentReuseIndex::lookup_dataless`]'s `(path, size, mtime)` because
+    /// device+inode pin the on-disk inode rather than just the path string.
+    pub fn lookup_dataless(
+        &self,
+        path: &str,
+        device: u64,
+        inode: u64,
+        mtime_ns: i64,
+        size: u64,
+    ) -> Option<CachedChunks> {
+        if self.active_keys.is_empty() {
+            return None;
+        }
+        let section_key = self.find_section_key(path)?;
+        let section = self.sections.get(section_key)?;
+        let entry = section.entries.get(&hash_path(path))?;
+        if entry.device == device
+            && entry.inode == inode
+            && entry.mtime_ns == mtime_ns
+            && entry.size == size
+        {
+            Some(entry.chunk_refs.clone())
+        } else {
+            None
+        }
+    }
+
     /// Insert or update a file's cache entry in all matching active sections.
     ///
     /// With overlapping roots (e.g. `["/data", "/data/sub"]`), a file under
@@ -856,6 +891,42 @@ impl ParentReuseIndex {
             None
         }
     }
+
+    /// Look up a dataless (macOS FileProvider placeholder) file. Matches on
+    /// `(path_hash, size, mtime)` and intentionally **ignores ctime** because
+    /// `SF_DATALESS` flag toggles bump ctime even when the logical content is
+    /// unchanged; ctime is unreliable across hydration transitions.
+    ///
+    /// Used so a previously backed-up file that has since become dataless
+    /// continues to flow into subsequent snapshots without re-reading the
+    /// (now placeholder) bytes.
+    ///
+    /// # Identity caveat
+    ///
+    /// This identity is weaker than the warm-cache check in
+    /// [`FileCache::lookup_dataless`], which adds device+inode. The failure
+    /// mode this does not catch: a placeholder swapped in at the same path
+    /// with an identical `(size, mtime)` triple inherits the previous file's
+    /// chunks. Adding inode would require a snapshot wire-format change
+    /// (snapshot `Item` does not carry inode) and is out of scope.
+    ///
+    /// The exposure surface is narrow because this path is only hit on a
+    /// cold start where the local file cache section is invalid; warm-cache
+    /// dataless lookups go through the stronger
+    /// `(device, inode, size, mtime)` check first.
+    pub fn lookup_dataless(
+        &self,
+        abs_path: &str,
+        size: u64,
+        mtime_ns: i64,
+    ) -> Option<CachedChunks> {
+        let entry = self.entries.get(&hash_path(abs_path))?;
+        if entry.size == size && entry.mtime_ns == mtime_ns {
+            Some(entry.chunk_refs.clone())
+        } else {
+            None
+        }
+    }
 }
 
 /// Reconstruct the absolute path that the walker will use for cache lookups,
@@ -1070,6 +1141,141 @@ mod tests {
         );
 
         let result = cache.lookup("/tmp/test.txt", 2, 1000, 1234567890, 1234567890, 4096);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn lookup_dataless_ignores_ctime() {
+        let mut cache = FileCache::new();
+        cache.begin_sections(&roots(&["/tmp"]), &[0]);
+        cache.insert(
+            "/tmp/test.txt",
+            1,
+            1000,
+            1234567890,
+            1234567890,
+            4096,
+            sample_chunk_refs(),
+        );
+
+        // (device, inode, mtime, size) match — ctime difference must be
+        // ignored, since SF_DATALESS toggles bump ctime.
+        let result = cache.lookup_dataless("/tmp/test.txt", 1, 1000, 1234567890, 4096);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn lookup_dataless_miss_changed_size() {
+        let mut cache = FileCache::new();
+        cache.begin_sections(&roots(&["/tmp"]), &[0]);
+        cache.insert(
+            "/tmp/test.txt",
+            1,
+            1000,
+            1234567890,
+            1234567890,
+            4096,
+            sample_chunk_refs(),
+        );
+
+        let result = cache.lookup_dataless("/tmp/test.txt", 1, 1000, 1234567890, 8192);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn lookup_dataless_miss_changed_mtime() {
+        let mut cache = FileCache::new();
+        cache.begin_sections(&roots(&["/tmp"]), &[0]);
+        cache.insert(
+            "/tmp/test.txt",
+            1,
+            1000,
+            1234567890,
+            1234567890,
+            4096,
+            sample_chunk_refs(),
+        );
+
+        let result = cache.lookup_dataless("/tmp/test.txt", 1, 1000, 9999999999, 4096);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn lookup_dataless_miss_changed_inode() {
+        let mut cache = FileCache::new();
+        cache.begin_sections(&roots(&["/tmp"]), &[0]);
+        cache.insert(
+            "/tmp/test.txt",
+            1,
+            1000,
+            1234567890,
+            1234567890,
+            4096,
+            sample_chunk_refs(),
+        );
+
+        // Inode change must miss — the placeholder is a different on-disk
+        // inode even if path/size/mtime collide.
+        let result = cache.lookup_dataless("/tmp/test.txt", 1, 2000, 1234567890, 4096);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn lookup_dataless_miss_changed_device() {
+        let mut cache = FileCache::new();
+        cache.begin_sections(&roots(&["/tmp"]), &[0]);
+        cache.insert(
+            "/tmp/test.txt",
+            1,
+            1000,
+            1234567890,
+            1234567890,
+            4096,
+            sample_chunk_refs(),
+        );
+
+        // Device change must miss — same inode number on a different device
+        // is a different file.
+        let result = cache.lookup_dataless("/tmp/test.txt", 2, 1000, 1234567890, 4096);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn lookup_dataless_miss_unknown_path() {
+        let mut cache = FileCache::new();
+        cache.begin_sections(&roots(&["/tmp"]), &[0]);
+        cache.insert(
+            "/tmp/test.txt",
+            1,
+            1000,
+            1234567890,
+            1234567890,
+            4096,
+            sample_chunk_refs(),
+        );
+
+        let result = cache.lookup_dataless("/tmp/other.txt", 1, 1000, 1234567890, 4096);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn lookup_dataless_miss_no_active_section() {
+        let mut cache = FileCache::new();
+        cache.begin_sections(&roots(&["/tmp"]), &[0]);
+        cache.insert(
+            "/tmp/test.txt",
+            1,
+            1000,
+            1234567890,
+            1234567890,
+            4096,
+            sample_chunk_refs(),
+        );
+
+        // Activating an unrelated path leaves no section matching /tmp.
+        assert!(!cache.activate_for_walk_roots(&roots(&["/other"])));
+        let result = cache.lookup_dataless("/tmp/test.txt", 1, 1000, 1234567890, 4096);
         assert!(result.is_none());
     }
 
@@ -1670,6 +1876,79 @@ mod tests {
         assert!(idx
             .lookup(&native_join("/src", "real.txt"), 8192, 2000, 3000)
             .is_some());
+    }
+
+    #[test]
+    fn parent_reuse_index_lookup_dataless_ignores_ctime() {
+        let items = vec![Item {
+            path: "a.txt".into(),
+            entry_type: ItemType::RegularFile,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            user: None,
+            group: None,
+            mtime: 1000,
+            atime: None,
+            ctime: Some(2000),
+            size: 4096,
+            chunks: sample_chunk_refs_vec(),
+            link_target: None,
+            xattrs: None,
+        }];
+
+        let idx = build_parent_index(items, &["/src".into()], false).unwrap();
+        let path = native_join("/src", "a.txt");
+
+        // Matching size + mtime — hit, even with a wildly different ctime
+        // (the dataless flag toggle would bump ctime).
+        assert!(idx.lookup_dataless(&path, 4096, 1000).is_some());
+
+        // Wrong size — miss.
+        assert!(idx.lookup_dataless(&path, 1, 1000).is_none());
+
+        // Wrong mtime — miss.
+        assert!(idx.lookup_dataless(&path, 4096, 9999).is_none());
+
+        // Wrong path — miss.
+        assert!(idx
+            .lookup_dataless(&native_join("/src", "other.txt"), 4096, 1000)
+            .is_none());
+    }
+
+    /// Documents the intentional identity tradeoff for cold-start dataless
+    /// reuse: only `(path, size, mtime)` is checked. Inode is not available
+    /// in `Item` (snapshot wire format) and adding it is out of scope for
+    /// this path. Warm-cache dataless lookups use the stronger
+    /// `(device, inode, size, mtime)` check; this test exists so a future
+    /// reader does not silently tighten the parent-reuse identity without
+    /// also revisiting the wire-format question.
+    #[test]
+    fn parent_reuse_lookup_dataless_matches_on_path_size_mtime_only() {
+        let items = vec![Item {
+            path: "a.txt".into(),
+            entry_type: ItemType::RegularFile,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            user: None,
+            group: None,
+            mtime: 1000,
+            atime: None,
+            ctime: Some(2000),
+            size: 4096,
+            chunks: sample_chunk_refs_vec(),
+            link_target: None,
+            xattrs: None,
+        }];
+
+        let idx = build_parent_index(items, &["/src".into()], false).unwrap();
+        let path = native_join("/src", "a.txt");
+
+        // `(path, size, mtime)` match — hit, even though ctime differs from
+        // what was stored. Intentional: ctime is not part of the dataless
+        // identity check.
+        assert!(idx.lookup_dataless(&path, 4096, 1000).is_some());
     }
 
     #[test]

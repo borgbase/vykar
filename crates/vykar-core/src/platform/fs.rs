@@ -11,6 +11,11 @@ pub struct MetadataSummary {
     pub device: u64,
     pub inode: u64,
     pub size: u64,
+    /// macOS-only: file is a FileProvider dataless placeholder (iCloud Drive,
+    /// Dropbox, OneDrive, etc.). `read()` would trigger asynchronous hydration
+    /// and metadata churn, so the backup walker skips or reuses-from-parent
+    /// instead. Always `false` on non-macOS platforms.
+    pub is_dataless: bool,
 }
 
 /// Stat an open file descriptor and build a `MetadataSummary`.
@@ -26,6 +31,10 @@ pub fn fstat_summary(file: &std::fs::File) -> std::io::Result<MetadataSummary> {
 /// Compares `size`, `mtime_ns`, `ctime_ns`, `device`, and `inode`. On
 /// Windows `device`/`inode` are always `0` (see [`summarize_metadata`]),
 /// so the rename-atop guard is effectively Unix-only.
+///
+/// `is_dataless` is intentionally **not** part of this check — drift
+/// detection is orthogonal to the dataless classification, which is
+/// resolved separately at walk time.
 pub fn metadata_matches(a: &MetadataSummary, b: &MetadataSummary) -> bool {
     a.size == b.size
         && a.mtime_ns == b.mtime_ns
@@ -40,6 +49,22 @@ pub fn summarize_metadata(metadata: &Metadata, file_type: &FileType) -> Metadata
         let _ = file_type;
         use std::os::unix::fs::MetadataExt;
 
+        let is_dataless = {
+            #[cfg(target_os = "macos")]
+            {
+                use std::os::macos::fs::MetadataExt as MacExt;
+                // SF_DATALESS (BSD): inode is a FileProvider placeholder
+                // (iCloud Drive, Dropbox, OneDrive, etc.). Reading the file
+                // would trigger asynchronous hydration via `fileproviderd`.
+                const SF_DATALESS: u32 = 0x40000000;
+                (MacExt::st_flags(metadata) & SF_DATALESS) != 0
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                false
+            }
+        };
+
         MetadataSummary {
             mode: metadata.mode(),
             uid: metadata.uid(),
@@ -49,6 +74,7 @@ pub fn summarize_metadata(metadata: &Metadata, file_type: &FileType) -> Metadata
             device: metadata.dev(),
             inode: metadata.ino(),
             size: metadata.len(),
+            is_dataless,
         }
     }
 
@@ -78,6 +104,7 @@ pub fn summarize_metadata(metadata: &Metadata, file_type: &FileType) -> Metadata
             device: 0,
             inode: 0,
             size: metadata.file_size(),
+            is_dataless: false,
         }
     }
 
@@ -92,6 +119,7 @@ pub fn summarize_metadata(metadata: &Metadata, file_type: &FileType) -> Metadata
             device: 0,
             inode: 0,
             size: metadata.len(),
+            is_dataless: false,
         }
     }
 }
@@ -390,6 +418,7 @@ mod tests {
             device: 333,
             inode: 444,
             size: 555,
+            is_dataless: false,
         };
         assert!(metadata_matches(&base, &base));
 
@@ -421,6 +450,26 @@ mod tests {
         m.uid = 1;
         m.gid = 1;
         assert!(metadata_matches(&base, &m));
+
+        // Flipping is_dataless does NOT break content identity — drift
+        // detection is orthogonal to dataless classification.
+        let mut m = base;
+        m.is_dataless = true;
+        assert!(metadata_matches(&base, &m));
+    }
+
+    /// Non-dataless metadata produces `is_dataless: false` on every platform.
+    /// (Cannot fake `SF_DATALESS` cheaply in a unit test; manual macOS
+    /// verification covers the positive case.)
+    #[test]
+    fn summarize_metadata_marks_normal_files_not_dataless() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plain.txt");
+        std::fs::write(&path, b"hello").unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        let ft = meta.file_type();
+        let summary = summarize_metadata(&meta, &ft);
+        assert!(!summary.is_dataless);
     }
 
     #[test]

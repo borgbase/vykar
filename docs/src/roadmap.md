@@ -12,6 +12,7 @@
 | **JSON output mode** | Structured JSON output for all CLI commands to enable scripting and integration with monitoring tools | Medium |
 | **Per-token permissions** | Expand permissions from full/append-only to also limit reading and maintenance | Medium |
 | **Hardlink & special file support** | Extend `ItemType` with `Hardlink`, `BlockDevice`, `CharDevice`, `Fifo`, `Socket`; inode tracking during walk; `link()`/`mknod` during restore | Medium |
+| **macOS dataless file modes** | Per-source `dataless: skip\|hydrate\|hydrate-evict` to control whether cloud-only files (iCloud Drive, Dropbox, OneDrive, etc.) are skipped, hydrated for backup, or hydrated then evicted via `NSFileProviderManager`. v1 ships skip-with-parent-reuse as the hardcoded default. | Medium |
 | **Nominal snapshot timestamp** | Add optional `time_nominal` to `SnapshotMeta` for the data's real-world timestamp (e.g. ZFS snapshot time), distinct from backup start/end times | Low |
 
 ## Implemented

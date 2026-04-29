@@ -86,6 +86,7 @@ pub(super) fn process_file_worker(
                 if !fs::metadata_matches(&pre_meta, &metadata) {
                     return Err(VykarError::FileChangedDuringRead {
                         path: abs_path.clone(),
+                        dataless: pre_meta.is_dataless,
                     });
                 }
 
@@ -118,6 +119,7 @@ pub(super) fn process_file_worker(
                     {
                         return Err(VykarError::FileChangedDuringRead {
                             path: abs_path.clone(),
+                            dataless: post_meta.is_dataless,
                         });
                     }
 
@@ -170,6 +172,7 @@ pub(super) fn process_file_worker(
                 if !fs::metadata_matches(&pre_meta, &post_meta) || total_bytes != pre_meta.size {
                     return Err(VykarError::FileChangedDuringRead {
                         path: abs_path.clone(),
+                        dataless: post_meta.is_dataless,
                     });
                 }
 
@@ -219,6 +222,7 @@ pub(super) fn process_file_worker(
                 if !fs::metadata_matches(&pre_meta, &metadata) {
                     return Err(VykarError::FileChangedDuringRead {
                         path: abs_path.to_string(),
+                        dataless: pre_meta.is_dataless,
                     });
                 }
 
@@ -259,6 +263,7 @@ pub(super) fn process_file_worker(
                 if !fs::metadata_matches(&pre_meta, &post_meta) {
                     return Err(VykarError::FileChangedDuringRead {
                         path: abs_path.to_string(),
+                        dataless: post_meta.is_dataless,
                     });
                 }
 
@@ -312,6 +317,8 @@ pub(super) fn process_file_worker(
         WalkEntry::NonFile { item } => Ok(ProcessedEntry::NonFile { item }),
 
         WalkEntry::Skipped => Ok(ProcessedEntry::WalkSkip),
+
+        WalkEntry::SkippedDataless { path } => Ok(ProcessedEntry::DatalessSkipped { path }),
 
         WalkEntry::SourceStarted { path } => Ok(ProcessedEntry::SourceStarted { path }),
 

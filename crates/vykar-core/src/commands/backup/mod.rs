@@ -58,27 +58,77 @@ pub(crate) fn normalize_rel_path(path: String) -> String {
     }
 }
 
-/// Resolve a cache hit by checking the file cache, falling back to the parent reuse index.
+/// Outcome of looking up a file in the local file cache and parent reuse index.
+///
+/// Tri-state so the caller can route dataless (cloud-only macOS placeholder)
+/// files into a never-open code path: hit reuses chunks from a prior snapshot
+/// without touching the file, miss-with-dataless skips the file outright
+/// rather than falling through to a normal `read()` which would trigger
+/// asynchronous hydration via `fileproviderd`.
+#[derive(Debug)]
+pub(crate) enum CacheResolution {
+    /// Reuse cached chunks; the file is not opened.
+    Hit(CachedChunks),
+    /// No reuse — caller should open + chunk normally.
+    Miss,
+    /// File is dataless and neither the local file cache nor the parent
+    /// reuse index has a matching entry. Caller must skip the file (no
+    /// hydration, no read).
+    SkipDataless,
+}
+
+/// Resolve a cache hit by checking the file cache, falling back to the parent
+/// reuse index.
+///
+/// Dataless files (`summary.is_dataless == true`) use a ctime-tolerant lookup
+/// path: ctime is dropped from the equality check because `SF_DATALESS` flag
+/// toggles bump ctime even when content is unchanged. They first try the
+/// warm `FileCache` (matches on `(device, inode, size, mtime)`) and then fall
+/// back to the parent-reuse index (matches on `(path, size, mtime)`); if both
+/// miss, the result is `SkipDataless` — **never** `Miss`, so the caller
+/// cannot accidentally read and hydrate.
 fn resolve_cache_hit(
     file_cache: &FileCache,
     parent_reuse_index: Option<&ParentReuseIndex>,
     abs_path: &str,
     summary: &fs::MetadataSummary,
-) -> Option<CachedChunks> {
-    file_cache
-        .lookup(
+) -> CacheResolution {
+    if summary.is_dataless {
+        if let Some(chunks) = file_cache.lookup_dataless(
             abs_path,
             summary.device,
             summary.inode,
             summary.mtime_ns,
-            summary.ctime_ns,
             summary.size,
-        )
-        .or_else(|| {
-            parent_reuse_index.and_then(|idx| {
-                idx.lookup(abs_path, summary.size, summary.mtime_ns, summary.ctime_ns)
-            })
-        })
+        ) {
+            return CacheResolution::Hit(chunks);
+        }
+        return match parent_reuse_index
+            .and_then(|idx| idx.lookup_dataless(abs_path, summary.size, summary.mtime_ns))
+        {
+            Some(chunks) => CacheResolution::Hit(chunks),
+            None => CacheResolution::SkipDataless,
+        };
+    }
+
+    let local = file_cache.lookup(
+        abs_path,
+        summary.device,
+        summary.inode,
+        summary.mtime_ns,
+        summary.ctime_ns,
+        summary.size,
+    );
+    if let Some(chunks) = local {
+        return CacheResolution::Hit(chunks);
+    }
+
+    let parent = parent_reuse_index
+        .and_then(|idx| idx.lookup(abs_path, summary.size, summary.mtime_ns, summary.ctime_ns));
+    match parent {
+        Some(chunks) => CacheResolution::Hit(chunks),
+        None => CacheResolution::Miss,
+    }
 }
 
 pub(crate) fn flush_item_stream_chunk(
@@ -170,6 +220,24 @@ pub(crate) fn emit_progress(
     if let Some(callback) = progress.as_deref_mut() {
         callback(event);
     }
+}
+
+/// Emit the once-per-source summary warning for macOS dataless files that
+/// could not be reused from a parent snapshot. Per-file `tracing::debug!`
+/// lines fire from the walker; this single high-signal line surfaces the
+/// total count to the CLI/GUI so users notice tens-of-GB of cloud-only
+/// content was skipped without flooding the activity log.
+pub(crate) fn emit_dataless_summary(
+    progress: &mut Option<&mut dyn FnMut(BackupProgressEvent)>,
+    skipped: u64,
+) {
+    let count = format_count(skipped);
+    let msg = format!(
+        "dataless: skipped {count} cloud-only files with no prior backup \
+         (run while files are downloaded to back them up)"
+    );
+    warn!("{msg}");
+    emit_progress(progress, BackupProgressEvent::Warning { message: msg });
 }
 
 /// Emit a post-commit warning: `tracing::warn!` + `BackupProgressEvent::Warning`
@@ -847,5 +915,193 @@ mod tests {
         let a = vec!["/a".to_string(), "/b".to_string()];
         let b = vec!["/a".to_string(), "/b".to_string()];
         assert!(source_paths_match(&a, &b));
+    }
+
+    fn dataless_metadata(size: u64, mtime_ns: i64) -> fs::MetadataSummary {
+        fs::MetadataSummary {
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            mtime_ns,
+            // ctime drifts when SF_DATALESS toggles — must NOT influence
+            // the dataless-tolerant lookup.
+            ctime_ns: 999_999,
+            device: 0,
+            inode: 0,
+            size,
+            is_dataless: true,
+        }
+    }
+
+    #[test]
+    fn resolve_cache_hit_dataless_no_parent_returns_skip() {
+        let file_cache = FileCache::new();
+        let summary = dataless_metadata(4096, 1000);
+        let res = resolve_cache_hit(&file_cache, None, "/src/a.txt", &summary);
+        assert!(matches!(res, CacheResolution::SkipDataless));
+    }
+
+    #[test]
+    fn resolve_cache_hit_dataless_with_parent_match_returns_hit() {
+        use crate::repo::file_cache::{ParentReuseBuilder, ParentReusePolicy, ParentReuseRoot};
+        use crate::snapshot::item::{Item, ItemType};
+        use vykar_types::chunk_id::ChunkId;
+
+        let item = Item {
+            path: "a.txt".into(),
+            entry_type: ItemType::RegularFile,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            user: None,
+            group: None,
+            mtime: 1000,
+            atime: None,
+            // Parent ctime differs from the dataless one — the lookup must
+            // ignore ctime and still hit.
+            ctime: Some(2000),
+            size: 4096,
+            chunks: vec![crate::snapshot::item::ChunkRef {
+                id: ChunkId([0xCC; 32]),
+                size: 4096,
+                csize: 2048,
+            }],
+            link_target: None,
+            xattrs: None,
+        };
+        let mut builder = ParentReuseBuilder::new(vec![ParentReuseRoot {
+            abs_root: "/src".into(),
+            policy: ParentReusePolicy::SkipRoot,
+        }]);
+        builder.push(item);
+        let parent_index = builder.finish().unwrap();
+
+        let file_cache = FileCache::new();
+        let summary = dataless_metadata(4096, 1000);
+        let abs = std::path::Path::new("/src")
+            .join("a.txt")
+            .to_string_lossy()
+            .to_string();
+        let res = resolve_cache_hit(&file_cache, Some(&parent_index), &abs, &summary);
+        match res {
+            CacheResolution::Hit(chunks) => assert_eq!(chunks.len(), 1),
+            other => panic!("expected Hit, got {other:?}"),
+        }
+    }
+
+    /// Helper: build a `FileCache` with a single warm dataless-eligible entry
+    /// under `/src` keyed at `abs_path`. The stored ctime is intentionally
+    /// far from any value the caller will pass in `summary.ctime_ns` so that
+    /// any test asserting reuse must be ignoring ctime.
+    fn warm_file_cache_with(
+        abs_path: &str,
+        device: u64,
+        inode: u64,
+        mtime_ns: i64,
+        size: u64,
+    ) -> FileCache {
+        use crate::repo::file_cache::{CachedChunkRef, CachedChunks};
+        use vykar_types::chunk_id::ChunkId;
+
+        let mut cache = FileCache::new();
+        cache.begin_sections(&["/src".to_string()], &[1]);
+        cache.insert(
+            abs_path,
+            device,
+            inode,
+            mtime_ns,
+            // Stored ctime far from the dataless summary's ctime — the
+            // dataless lookup must ignore it.
+            123_456_789,
+            size,
+            CachedChunks::Single(CachedChunkRef {
+                id: ChunkId([0xAB; 32]),
+                size: size as u32,
+            }),
+        );
+        cache
+    }
+
+    #[test]
+    fn resolve_cache_hit_warm_dataless_uses_local_cache() {
+        let abs = std::path::Path::new("/src")
+            .join("a.txt")
+            .to_string_lossy()
+            .to_string();
+        let device = 42;
+        let inode = 7;
+        let mtime_ns = 1_000;
+        let size = 4096;
+
+        let cache = warm_file_cache_with(&abs, device, inode, mtime_ns, size);
+        let mut summary = dataless_metadata(size, mtime_ns);
+        summary.device = device;
+        summary.inode = inode;
+
+        let res = resolve_cache_hit(&cache, None, &abs, &summary);
+        match res {
+            CacheResolution::Hit(chunks) => assert_eq!(chunks.len(), 1),
+            other => panic!("expected Hit from warm cache, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_cache_hit_warm_dataless_falls_back_to_parent() {
+        use crate::repo::file_cache::{ParentReuseBuilder, ParentReusePolicy, ParentReuseRoot};
+        use crate::snapshot::item::{Item, ItemType};
+        use vykar_types::chunk_id::ChunkId;
+
+        // Empty file cache — nothing matches in the warm path.
+        let file_cache = FileCache::new();
+
+        let item = Item {
+            path: "a.txt".into(),
+            entry_type: ItemType::RegularFile,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            user: None,
+            group: None,
+            mtime: 1_000,
+            atime: None,
+            ctime: Some(2_000),
+            size: 4096,
+            chunks: vec![crate::snapshot::item::ChunkRef {
+                id: ChunkId([0xCC; 32]),
+                size: 4096,
+                csize: 2048,
+            }],
+            link_target: None,
+            xattrs: None,
+        };
+        let mut builder = ParentReuseBuilder::new(vec![ParentReuseRoot {
+            abs_root: "/src".into(),
+            policy: ParentReusePolicy::SkipRoot,
+        }]);
+        builder.push(item);
+        let parent_index = builder.finish().unwrap();
+
+        let summary = dataless_metadata(4096, 1_000);
+        let abs = std::path::Path::new("/src")
+            .join("a.txt")
+            .to_string_lossy()
+            .to_string();
+        let res = resolve_cache_hit(&file_cache, Some(&parent_index), &abs, &summary);
+        match res {
+            CacheResolution::Hit(chunks) => assert_eq!(chunks.len(), 1),
+            other => panic!("expected Hit from parent index, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_cache_hit_warm_dataless_skips_when_neither_matches() {
+        let file_cache = FileCache::new();
+        let summary = dataless_metadata(4096, 1_000);
+        let abs = std::path::Path::new("/src")
+            .join("a.txt")
+            .to_string_lossy()
+            .to_string();
+        let res = resolve_cache_hit(&file_cache, None, &abs, &summary);
+        assert!(matches!(res, CacheResolution::SkipDataless));
     }
 }

@@ -67,7 +67,11 @@ impl Item {
                 let sum: u64 = self.chunks.iter().map(|c| c.size as u64).sum();
                 if sum != self.size {
                     return Err(VykarError::InvalidFormat(format!(
-                        "regular file {:?} has size {} but chunk sizes sum to {}",
+                        "regular file {:?} has size {} but chunk sizes sum to {} \
+                         (likely produced by a vykar version before the 2026-04 TOCTOU fix \
+                         when the file changed during backup; run `vykar check --repair` \
+                         to delete the affected snapshot — note repair removes the snapshot, \
+                         it does not rewrite the item)",
                         self.path, self.size, sum
                     )));
                 }
@@ -180,6 +184,7 @@ mod tests {
         item.size = 100;
         let err = item.validate().unwrap_err().to_string();
         assert!(err.contains("chunk sizes sum to"), "got: {err}");
+        assert!(err.contains("vykar check --repair"), "got: {err}");
     }
 
     #[test]

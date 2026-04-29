@@ -171,7 +171,14 @@ pub(crate) fn format_check_progress(event: &commands::check::CheckProgressEvent)
         commands::check::CheckProgressEvent::PacksExistenceProgress {
             checked,
             total_packs,
-        } => eprintln!("  existence: {checked}/{total_packs} packs"),
+            missing,
+        } => {
+            if *missing > 0 {
+                eprintln!("  existence: {checked}/{total_packs} packs ({missing} missing)");
+            } else {
+                eprintln!("  existence: {checked}/{total_packs} packs");
+            }
+        }
         commands::check::CheckProgressEvent::ChunksDataPhaseStarted { total_chunks } => {
             eprintln!("Verifying data integrity of {total_chunks} chunks...");
         }

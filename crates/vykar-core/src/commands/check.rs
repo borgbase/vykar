@@ -274,6 +274,7 @@ pub enum CheckProgressEvent {
     PacksExistenceProgress {
         checked: usize,
         total_packs: usize,
+        missing: usize,
     },
     ChunksDataPhaseStarted {
         total_chunks: usize,
@@ -1078,7 +1079,7 @@ fn integrity_scan(
             },
         );
 
-        let (existence_checked, pack_issues) =
+        let (existence_checked, missing_count, pack_issues) =
             parallel_pack_existence(&repo.storage, &packs_for_existence, concurrency);
         counters.packs_existence_checked = existence_checked;
 
@@ -1102,8 +1103,9 @@ fn integrity_scan(
         emit_progress(
             progress,
             CheckProgressEvent::PacksExistenceProgress {
-                checked: packs_for_existence.len(),
+                checked: existence_checked,
                 total_packs: packs_for_existence.len(),
+                missing: missing_count,
             },
         );
     }
@@ -1150,19 +1152,22 @@ fn integrity_scan(
 }
 
 /// Parallel pack existence check producing IntegrityIssue variants.
-/// Returns `(packs_actually_checked, issues)` — packs with I/O errors are NOT
-/// counted as checked so the summary does not claim complete coverage.
+/// Returns `(packs_actually_checked, missing_count, issues)` — `packs_actually_checked`
+/// counts packs whose existence was definitively resolved (Ok(true) or Ok(false));
+/// packs with I/O errors are NOT counted so the summary does not claim complete coverage.
+/// `missing_count` is the subset of those resolved as Ok(false).
 fn parallel_pack_existence(
     storage: &Arc<dyn StorageBackend>,
     packs: &[(PackId, usize)],
     concurrency: usize,
-) -> (usize, Vec<IntegrityIssue>) {
+) -> (usize, usize, Vec<IntegrityIssue>) {
     if packs.is_empty() {
-        return (0, Vec::new());
+        return (0, 0, Vec::new());
     }
 
     let work_idx = AtomicUsize::new(0);
-    let checked_ok = AtomicUsize::new(0);
+    let present_ok = AtomicUsize::new(0);
+    let missing_count = AtomicUsize::new(0);
     let issues = Mutex::new(Vec::new());
 
     std::thread::scope(|s| {
@@ -1176,10 +1181,10 @@ fn parallel_pack_existence(
                 let pack_key = pack_id.storage_key();
                 match storage.exists(&pack_key) {
                     Ok(true) => {
-                        checked_ok.fetch_add(1, Ordering::Relaxed);
+                        present_ok.fetch_add(1, Ordering::Relaxed);
                     }
                     Ok(false) => {
-                        checked_ok.fetch_add(1, Ordering::Relaxed);
+                        missing_count.fetch_add(1, Ordering::Relaxed);
                         issues
                             .lock()
                             .unwrap()
@@ -1199,10 +1204,9 @@ fn parallel_pack_existence(
         }
     });
 
-    (
-        checked_ok.load(Ordering::Relaxed),
-        issues.into_inner().unwrap(),
-    )
+    let present = present_ok.load(Ordering::Relaxed);
+    let missing = missing_count.load(Ordering::Relaxed);
+    (present + missing, missing, issues.into_inner().unwrap())
 }
 
 /// Parallel verify-data producing IntegrityIssue variants.
@@ -2027,6 +2031,81 @@ mod tests {
             "expected RemoveCorruptSnapshot for invalid item, got: {:?}",
             plan.actions
         );
+    }
+
+    /// Per-pack scripted responses for `exists()`, keyed by storage key.
+    struct ScriptedExistsBackend {
+        responses: std::sync::Mutex<HashMap<String, std::result::Result<bool, String>>>,
+    }
+
+    impl StorageBackend for ScriptedExistsBackend {
+        fn get(&self, _key: &str) -> vykar_types::error::Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+        fn put(&self, _key: &str, _data: &[u8]) -> vykar_types::error::Result<()> {
+            Ok(())
+        }
+        fn delete(&self, _key: &str) -> vykar_types::error::Result<()> {
+            Ok(())
+        }
+        fn exists(&self, key: &str) -> vykar_types::error::Result<bool> {
+            match self.responses.lock().unwrap().get(key) {
+                Some(Ok(b)) => Ok(*b),
+                Some(Err(msg)) => Err(VykarError::Other(msg.clone())),
+                None => Ok(true),
+            }
+        }
+        fn list(&self, _prefix: &str) -> vykar_types::error::Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+        fn get_range(
+            &self,
+            _key: &str,
+            _offset: u64,
+            _length: u64,
+        ) -> vykar_types::error::Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+        fn create_dir(&self, _key: &str) -> vykar_types::error::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn parallel_pack_existence_excludes_io_failures_from_checked_count() {
+        let present = PackId([0x01u8; 32]);
+        let missing = PackId([0x02u8; 32]);
+        let errored = PackId([0x03u8; 32]);
+
+        let mut responses: HashMap<String, std::result::Result<bool, String>> = HashMap::new();
+        responses.insert(present.storage_key(), Ok(true));
+        responses.insert(missing.storage_key(), Ok(false));
+        responses.insert(errored.storage_key(), Err("simulated I/O error".into()));
+
+        let backend: Arc<dyn StorageBackend> = Arc::new(ScriptedExistsBackend {
+            responses: std::sync::Mutex::new(responses),
+        });
+
+        let packs = vec![(present, 1), (missing, 1), (errored, 1)];
+        let (checked, missing_count, issues) = parallel_pack_existence(&backend, &packs, 2);
+
+        // Definitively-resolved packs only: present + missing. The I/O-errored pack
+        // must NOT be counted, otherwise progress overstates coverage.
+        assert_eq!(checked, 2, "checked should exclude I/O-errored packs");
+        assert_eq!(missing_count, 1, "exactly one Ok(false) pack");
+        assert_eq!(
+            issues.len(),
+            2,
+            "expected MissingPack + PackExistenceCheckFailed"
+        );
+        assert!(issues.iter().any(|i| matches!(
+            i,
+            IntegrityIssue::MissingPack { pack_id } if *pack_id == missing
+        )));
+        assert!(issues.iter().any(|i| matches!(
+            i,
+            IntegrityIssue::PackExistenceCheckFailed { pack_id, .. } if *pack_id == errored
+        )));
     }
 
     #[test]

@@ -35,7 +35,7 @@ fn is_eio(_e: &std::io::Error) -> bool {
 }
 
 /// Items chunker config — finer granularity for the item metadata stream.
-pub(super) fn items_chunker_config() -> ChunkerConfig {
+pub(crate) fn items_chunker_config() -> ChunkerConfig {
     ChunkerConfig {
         min_size: 32 * 1024,  // 32 KiB
         avg_size: 128 * 1024, // 128 KiB

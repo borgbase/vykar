@@ -41,7 +41,7 @@ use vykar_types::snapshot_id::SnapshotId;
 
 use std::collections::HashSet;
 
-use walk::items_chunker_config;
+pub(crate) use walk::items_chunker_config;
 
 /// Normalize a relative path to always use `/` as the separator.
 ///

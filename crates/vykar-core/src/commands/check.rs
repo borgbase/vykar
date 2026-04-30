@@ -3,14 +3,19 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::compress;
+use crate::compress::Compression;
 use crate::config::VykarConfig;
 use crate::index::ChunkIndexEntry;
-use crate::repo::format::{unpack_object_expect_with_context, ObjectType};
+use crate::repo::format::{
+    pack_object_with_context, unpack_object_expect_with_context, ObjectType,
+};
+use crate::repo::manifest::SnapshotEntry;
 use crate::repo::pack::{
     read_blob_from_pack, PACK_HEADER_SIZE, PACK_MAGIC, PACK_VERSION_MAX, PACK_VERSION_MIN,
 };
 use crate::repo::{OpenOptions, Repository};
 use crate::snapshot::item::ItemType;
+use crate::snapshot::SnapshotMeta;
 use vykar_crypto::CryptoEngine;
 use vykar_storage::{
     StorageBackend, VerifyBlobRef, VerifyPackRequest, VerifyPacksPlanRequest, VerifyPacksResponse,
@@ -78,6 +83,10 @@ pub enum IntegrityIssue {
     /// File in snapshot references chunk not in index.
     DanglingFileChunk {
         snapshot_name: String,
+        /// 0-based ordinal of this item within the decoded items_stream. Used
+        /// by item-granular repair to locate the exact item to drop without
+        /// relying on `path`, which may be duplicated across items.
+        item_index: usize,
         path: String,
         chunk_id: ChunkId,
     },
@@ -107,6 +116,10 @@ pub enum IntegrityIssue {
     InvalidItem {
         snapshot_id: SnapshotId,
         snapshot_name: Option<String>,
+        /// 0-based ordinal of this item within the decoded items_stream. Used
+        /// by item-granular repair to locate the exact item to drop without
+        /// relying on `item_path`, which may be duplicated across items.
+        item_index: usize,
         item_path: String,
         reason: String,
     },
@@ -144,6 +157,7 @@ impl IntegrityIssue {
                 snapshot_name,
                 path,
                 chunk_id,
+                ..
             } => CheckError {
                 context: format!("snapshot '{snapshot_name}' file '{path}'"),
                 message: format!("chunk {chunk_id} not in index"),
@@ -185,6 +199,7 @@ impl IntegrityIssue {
                 snapshot_name,
                 item_path,
                 reason,
+                ..
             } => {
                 let ctx = match snapshot_name {
                     Some(name) => format!("snapshot '{name}' item '{item_path}'"),
@@ -287,6 +302,18 @@ pub enum RepairAction {
     RemoveDanglingSnapshot {
         snapshot_name: String,
         missing_chunks: usize,
+    },
+    /// Rewrite a snapshot under a new SnapshotId with the listed item ordinals
+    /// dropped. Existing storage blob for `snapshot_id` is removed; the
+    /// rewritten blob is committed at the new id, the manifest entry's name is
+    /// preserved. `dropped_paths` and `reasons` are parallel to `item_indices`
+    /// and exist solely to power user-facing dry-run output.
+    DropItemsFromSnapshot {
+        snapshot_id: SnapshotId,
+        snapshot_name: String,
+        item_indices: Vec<usize>,
+        dropped_paths: Vec<String>,
+        reasons: Vec<String>,
     },
     RebuildRefcounts,
 }
@@ -886,8 +913,25 @@ struct ScanCounters {
 struct ScanResult {
     counters: ScanCounters,
     issues: Vec<IntegrityIssue>,
-    /// Maps each snapshot name to the set of chunk IDs it references.
+    /// Maps each snapshot name to the set of chunk IDs it references
+    /// (item_ptrs and file chunks combined; used by the chunks-to-remove
+    /// dangling-snapshot path).
     snapshot_chunk_refs: HashMap<String, HashSet<ChunkId>>,
+    /// Per-snapshot `item_ptrs` chunks, partitioned out from
+    /// `snapshot_chunk_refs`. Populated whenever the scan reads a snapshot's
+    /// metadata, even if the items_stream subsequently fails to load — so the
+    /// item-ptrs coverage gate has data to fail-closed against.
+    snapshot_item_ptrs: HashMap<SnapshotId, HashSet<ChunkId>>,
+    /// Per-snapshot, per-item file chunk sets. Indexed by 0-based item ordinal
+    /// within the decoded items_stream. Empty inner sets for non-`RegularFile`
+    /// items. Populated only when `collect_chunk_refs == true` AND the
+    /// items_stream walk completes successfully — snapshots whose walk fails
+    /// or skips will be absent from this map (the planner reads that absence
+    /// as "refuse item-level repair").
+    snapshot_per_item_chunks: HashMap<SnapshotId, Vec<HashSet<ChunkId>>>,
+    /// Per-snapshot total item count. Populated in lockstep with
+    /// `snapshot_per_item_chunks`: present iff the items_stream walk completed.
+    snapshot_item_counts: HashMap<SnapshotId, usize>,
     /// Items whose chunks reference a pack confirmed missing in Phase 2.
     /// Empty when no missing packs were detected.
     item_impacts: Vec<ItemImpact>,
@@ -907,6 +951,9 @@ fn integrity_scan(
     let mut counters = ScanCounters::default();
     let mut issues: Vec<IntegrityIssue> = Vec::new();
     let mut snapshot_chunk_refs: HashMap<String, HashSet<ChunkId>> = HashMap::new();
+    let mut snapshot_item_ptrs: HashMap<SnapshotId, HashSet<ChunkId>> = HashMap::new();
+    let mut snapshot_per_item_chunks: HashMap<SnapshotId, Vec<HashSet<ChunkId>>> = HashMap::new();
+    let mut snapshot_item_counts: HashMap<SnapshotId, usize> = HashMap::new();
 
     let is_remote = vykar_storage::parse_repo_url(&config.repository.url)
         .map(|u| !u.is_local())
@@ -1023,7 +1070,14 @@ fn integrity_scan(
         };
 
         // Verify item_ptrs exist in chunk index; optionally collect chunk refs.
+        // `snapshot_item_ptrs` is populated unconditionally (fail-closed input
+        // for the item-ptrs coverage gate), even when `collect_chunk_refs` is
+        // disabled or the items_stream walk later fails.
         for chunk_id in &meta.item_ptrs {
+            snapshot_item_ptrs
+                .entry(entry.id)
+                .or_default()
+                .insert(*chunk_id);
             if opts.collect_chunk_refs {
                 snapshot_chunk_refs
                     .entry(entry.name.clone())
@@ -1058,54 +1112,80 @@ fn integrity_scan(
         };
 
         let mut per_snapshot_items = 0usize;
+        let mut item_index = 0usize;
         let entry_name = entry.name.clone();
         let entry_id = entry.id;
         let collect_refs = opts.collect_chunk_refs;
-        let item_issues: Mutex<Vec<IntegrityIssue>> = Mutex::new(Vec::new());
-        let file_chunk_ids: Mutex<Vec<ChunkId>> = Mutex::new(Vec::new());
-        if let Err(e) = for_each_decoded_item(&items_stream, |item| {
+        let mut item_issues: Vec<IntegrityIssue> = Vec::new();
+        let mut file_chunk_ids: Vec<ChunkId> = Vec::new();
+        let mut per_item_chunks: Vec<HashSet<ChunkId>> = Vec::new();
+        let walk_result = for_each_decoded_item(&items_stream, |item| {
+            let idx = item_index;
+            item_index += 1;
             per_snapshot_items += 1;
             if let Err(e) = item.validate() {
-                item_issues
-                    .lock()
-                    .unwrap()
-                    .push(IntegrityIssue::InvalidItem {
-                        snapshot_id: entry_id,
-                        snapshot_name: Some(entry_name.clone()),
-                        item_path: item.path.clone(),
-                        reason: e.to_string(),
-                    });
+                item_issues.push(IntegrityIssue::InvalidItem {
+                    snapshot_id: entry_id,
+                    snapshot_name: Some(entry_name.clone()),
+                    item_index: idx,
+                    item_path: item.path.clone(),
+                    reason: e.to_string(),
+                });
             }
+            let mut this_item: HashSet<ChunkId> = HashSet::new();
             if item.entry_type == ItemType::RegularFile {
                 for chunk_ref in &item.chunks {
                     if collect_refs {
-                        file_chunk_ids.lock().unwrap().push(chunk_ref.id);
+                        file_chunk_ids.push(chunk_ref.id);
+                        this_item.insert(chunk_ref.id);
                     }
                     if !repo.chunk_index().contains(&chunk_ref.id) {
-                        item_issues
-                            .lock()
-                            .unwrap()
-                            .push(IntegrityIssue::DanglingFileChunk {
-                                snapshot_name: entry_name.clone(),
-                                path: item.path.clone(),
-                                chunk_id: chunk_ref.id,
-                            });
+                        item_issues.push(IntegrityIssue::DanglingFileChunk {
+                            snapshot_name: entry_name.clone(),
+                            item_index: idx,
+                            path: item.path.clone(),
+                            chunk_id: chunk_ref.id,
+                        });
                     }
                 }
             }
+            if collect_refs {
+                debug_assert_eq!(
+                    per_item_chunks.len(),
+                    idx,
+                    "per_item_chunks must mirror item ordinals"
+                );
+                per_item_chunks.push(this_item);
+            }
             Ok(())
-        }) {
+        });
+        let walk_ok = walk_result.is_ok();
+        if let Err(e) = walk_result {
             issues.push(IntegrityIssue::UnreadableSnapshot {
                 snapshot_name: entry.name.clone(),
                 detail: format!("decode items: {e}"),
             });
         }
-        issues.extend(item_issues.into_inner().unwrap());
+        issues.extend(item_issues);
         if collect_refs {
             snapshot_chunk_refs
                 .entry(entry.name.clone())
                 .or_default()
-                .extend(file_chunk_ids.into_inner().unwrap());
+                .extend(file_chunk_ids);
+            // Only publish per-item chunks and item count when the walk
+            // completed: a partial walk would yield a vec shorter than the
+            // true item count, and the planner's data-presence gate must be
+            // able to reject such snapshots from item-level repair.
+            if walk_ok {
+                debug_assert_eq!(per_item_chunks.len(), per_snapshot_items);
+                snapshot_per_item_chunks.insert(entry_id, per_item_chunks);
+                snapshot_item_counts.insert(entry_id, per_snapshot_items);
+            }
+        } else if walk_ok {
+            // collect_chunk_refs disabled (read-only check): we don't need the
+            // per-item chunk sets, but record the count so a future repair
+            // pass can see this snapshot was successfully walked.
+            snapshot_item_counts.insert(entry_id, per_snapshot_items);
         }
 
         counters.items_checked += per_snapshot_items;
@@ -1218,6 +1298,9 @@ fn integrity_scan(
         counters,
         issues,
         snapshot_chunk_refs,
+        snapshot_item_ptrs,
+        snapshot_per_item_chunks,
+        snapshot_item_counts,
         item_impacts,
     })
 }
@@ -1594,48 +1677,48 @@ fn verify_single_chunk(
 /// `snapshot_chunk_refs` maps each snapshot name to the set of chunk IDs it
 /// references (both `item_ptrs` and file-level chunks). This allows the plan
 /// to predict which snapshots become "doomed" after index entries are removed.
+///
+/// Item-level repair (`DropItemsFromSnapshot`) is emitted only when all
+/// coverage gates in [`item_repair_gates`] are satisfied; otherwise the
+/// affected snapshot falls back to whole-snapshot removal via the existing
+/// `RemoveCorruptSnapshot` / `RemoveDanglingSnapshot` paths.
 fn build_repair_plan(
-    issues: &[IntegrityIssue],
+    scan: &ScanResult,
     pack_chunks: &HashMap<PackId, Vec<(ChunkId, ChunkIndexEntry)>>,
-    snapshot_chunk_refs: &HashMap<String, HashSet<ChunkId>>,
+    name_to_id: &HashMap<String, SnapshotId>,
 ) -> RepairPlan {
+    use std::collections::BTreeMap;
+
     let mut actions: Vec<RepairAction> = Vec::new();
     let mut has_data_loss = false;
 
-    // Collect corrupt/invalid snapshot actions
-    let mut corrupt_snapshot_names: HashSet<String> = HashSet::new();
-    for issue in issues {
+    // ------------------------------------------------------------------
+    // Pre-pass: emit InvalidSnapshotKey actions and collect ids of
+    // snapshots that *must* be removed wholesale.
+    // ------------------------------------------------------------------
+    let mut corrupt_snapshot_meta: HashMap<SnapshotId, Option<String>> = HashMap::new();
+    let mut per_snapshot_whole: HashSet<SnapshotId> = HashSet::new();
+    for issue in &scan.issues {
         match issue {
             IntegrityIssue::CorruptSnapshot {
                 snapshot_id,
                 snapshot_name,
-            } if !actions.iter().any(|a| matches!(a, RepairAction::RemoveCorruptSnapshot { snapshot_id: id, .. } if *id == *snapshot_id)) => {
-                // Deduplicate by snapshot_id
-                actions.push(RepairAction::RemoveCorruptSnapshot {
-                    snapshot_id: *snapshot_id,
-                    name: snapshot_name.clone(),
-                });
-                if let Some(name) = snapshot_name {
-                    corrupt_snapshot_names.insert(name.clone());
-                }
-                has_data_loss = true;
+            } => {
+                corrupt_snapshot_meta
+                    .entry(*snapshot_id)
+                    .or_insert_with(|| snapshot_name.clone());
+                per_snapshot_whole.insert(*snapshot_id);
             }
-            IntegrityIssue::InvalidItem {
-                snapshot_id,
-                snapshot_name,
-                ..
-            } if !actions.iter().any(|a| matches!(a, RepairAction::RemoveCorruptSnapshot { snapshot_id: id, .. } if *id == *snapshot_id)) => {
-                // An invalid item dooms its containing snapshot — restore would
-                // either fail or produce incorrect output. Treat the same as a
-                // corrupt snapshot (deduplicated by snapshot_id).
-                actions.push(RepairAction::RemoveCorruptSnapshot {
-                    snapshot_id: *snapshot_id,
-                    name: snapshot_name.clone(),
-                });
-                if let Some(name) = snapshot_name {
-                    corrupt_snapshot_names.insert(name.clone());
+            IntegrityIssue::DanglingItemPtr { snapshot_name, .. }
+            | IntegrityIssue::UnreadableSnapshot { snapshot_name, .. }
+            | IntegrityIssue::SnapshotReadFailed { snapshot_name, .. } => {
+                if let Some(id) = name_to_id.get(snapshot_name) {
+                    per_snapshot_whole.insert(*id);
                 }
-                has_data_loss = true;
+                // If the name isn't resolvable (manifest no longer carries
+                // it), the snapshot is already gone from the manifest's
+                // perspective — the existing chunk-removal path below still
+                // emits RemoveDanglingSnapshot for it.
             }
             IntegrityIssue::InvalidSnapshotKey { storage_key } => {
                 actions.push(RepairAction::RemoveInvalidSnapshotKey {
@@ -1647,9 +1730,74 @@ fn build_repair_plan(
         }
     }
 
-    // Collect missing pack actions (deduplicated)
+    // ------------------------------------------------------------------
+    // Collect candidate item-level drops, keyed by snapshot id, sorted by
+    // item ordinal (BTreeMap → deterministic order in the action).
+    // ------------------------------------------------------------------
+    let mut per_snapshot_drops: HashMap<SnapshotId, BTreeMap<usize, (String, String)>> =
+        HashMap::new();
+
+    for impact in &scan.item_impacts {
+        let mut packs: Vec<PackId> = impact.affected_chunks.iter().map(|(_, p)| *p).collect();
+        packs.sort_by(|a, b| a.0.cmp(&b.0));
+        packs.dedup();
+        let reason = if packs.len() == 1 {
+            format!("chunks in missing pack {}", packs[0])
+        } else {
+            let list = packs
+                .iter()
+                .map(|p| p.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("chunks in missing packs {list}")
+        };
+        per_snapshot_drops
+            .entry(impact.snapshot_id)
+            .or_default()
+            .insert(impact.item_index, (impact.item_path.clone(), reason));
+    }
+
+    for issue in &scan.issues {
+        match issue {
+            IntegrityIssue::InvalidItem {
+                snapshot_id,
+                item_index,
+                item_path,
+                reason,
+                ..
+            } => {
+                per_snapshot_drops.entry(*snapshot_id).or_default().insert(
+                    *item_index,
+                    (item_path.clone(), format!("invalid item: {reason}")),
+                );
+            }
+            IntegrityIssue::DanglingFileChunk {
+                snapshot_name,
+                item_index,
+                path,
+                chunk_id,
+                ..
+            } => {
+                if let Some(id) = name_to_id.get(snapshot_name) {
+                    per_snapshot_drops.entry(*id).or_default().insert(
+                        *item_index,
+                        (path.clone(), format!("missing chunk {chunk_id}")),
+                    );
+                }
+                // If unresolvable, the snapshot's been mutated underneath us;
+                // chunks-to-remove path will doom it.
+            }
+            _ => {}
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Missing-pack and corrupt-pack actions (drives the chunks-to-remove
+    // set used by the planner's surviving-items gate and by the existing
+    // RemoveDanglingSnapshot path).
+    // ------------------------------------------------------------------
     let mut missing_packs: HashSet<PackId> = HashSet::new();
-    for issue in issues {
+    for issue in &scan.issues {
         if let IntegrityIssue::MissingPack { pack_id } = issue {
             missing_packs.insert(*pack_id);
         }
@@ -1663,10 +1811,9 @@ fn build_repair_plan(
         has_data_loss = true;
     }
 
-    // Collect corrupt pack/chunk actions (from --verify-data)
     let mut corrupt_packs: HashSet<PackId> = HashSet::new();
     let mut corrupt_chunks_by_pack: HashMap<PackId, Vec<ChunkId>> = HashMap::new();
-    for issue in issues {
+    for issue in &scan.issues {
         match issue {
             IntegrityIssue::CorruptPackContent { pack_id, .. } => {
                 corrupt_packs.insert(*pack_id);
@@ -1674,7 +1821,6 @@ fn build_repair_plan(
             IntegrityIssue::CorruptChunk {
                 chunk_id, pack_id, ..
             } if !corrupt_packs.contains(pack_id) && !missing_packs.contains(pack_id) => {
-                // Only add as corrupt chunk if the whole pack isn't already corrupt
                 corrupt_chunks_by_pack
                     .entry(*pack_id)
                     .or_default()
@@ -1685,7 +1831,7 @@ fn build_repair_plan(
     }
     for pack_id in &corrupt_packs {
         if missing_packs.contains(pack_id) {
-            continue; // Already handled as dangling
+            continue;
         }
         let chunk_count = pack_chunks.get(pack_id).map_or(0, |c| c.len());
         actions.push(RepairAction::RemoveCorruptPack {
@@ -1702,7 +1848,6 @@ fn build_repair_plan(
         has_data_loss = true;
     }
 
-    // Compute which chunk IDs will be removed from the index by the above actions.
     let mut chunks_to_remove: HashSet<ChunkId> = HashSet::new();
     for pack_id in missing_packs.iter().chain(corrupt_packs.iter()) {
         if let Some(chunks) = pack_chunks.get(pack_id) {
@@ -1717,28 +1862,230 @@ fn build_repair_plan(
         }
     }
 
-    // Source A: snapshots with pre-existing dangling refs (not caused by pack
-    // removal — chunks were already absent from the index at scan time).
+    // ------------------------------------------------------------------
+    // Coverage check: for each snapshot with item-level candidates, prove
+    // that dropping just those items is safe. Any failure → promote to
+    // per_snapshot_whole (whole-snapshot removal).
+    // ------------------------------------------------------------------
+    let drop_ids: Vec<SnapshotId> = per_snapshot_drops.keys().copied().collect();
+    for id in drop_ids {
+        if per_snapshot_whole.contains(&id) {
+            continue;
+        }
+        let drops = &per_snapshot_drops[&id];
+
+        // Gate 0: data-presence.
+        let count = match scan.snapshot_item_counts.get(&id) {
+            Some(c) => *c,
+            None => {
+                per_snapshot_whole.insert(id);
+                continue;
+            }
+        };
+        let per_item = match scan.snapshot_per_item_chunks.get(&id) {
+            Some(v) if v.len() == count => v,
+            _ => {
+                per_snapshot_whole.insert(id);
+                continue;
+            }
+        };
+        if drops.keys().any(|idx| *idx >= count) {
+            per_snapshot_whole.insert(id);
+            continue;
+        }
+
+        // Gate 1: item-count (refuse drops that empty the snapshot).
+        if drops.len() >= count {
+            per_snapshot_whole.insert(id);
+            continue;
+        }
+
+        // Gate 2: item-ptrs disjointness.
+        let item_ptrs_disjoint = match scan.snapshot_item_ptrs.get(&id) {
+            Some(s) => s.is_disjoint(&chunks_to_remove),
+            None => false,
+        };
+        if !item_ptrs_disjoint {
+            per_snapshot_whole.insert(id);
+            continue;
+        }
+
+        // Gate 3: surviving items must not reference any removed chunk.
+        let drop_set: HashSet<usize> = drops.keys().copied().collect();
+        let mut surviving_intersects = false;
+        for (idx, item_chunks) in per_item.iter().enumerate() {
+            if drop_set.contains(&idx) {
+                continue;
+            }
+            if !item_chunks.is_disjoint(&chunks_to_remove) {
+                surviving_intersects = true;
+                break;
+            }
+        }
+        if surviving_intersects {
+            per_snapshot_whole.insert(id);
+            continue;
+        }
+
+        // Sanity: dropped chunks include intersection with chunks_to_remove
+        // for this snapshot. Cheap debug-only check.
+        debug_assert!({
+            let mut dropped_chunks: HashSet<ChunkId> = HashSet::new();
+            for idx in drops.keys() {
+                if let Some(s) = per_item.get(*idx) {
+                    dropped_chunks.extend(s.iter().copied());
+                }
+            }
+            // surviving disjoint already verified — we don't strictly need
+            // dropped to include all impacted chunks of *this* snapshot,
+            // but for a sanity check: if the snapshot's full ref-set
+            // intersects chunks_to_remove, that intersection must be
+            // entirely covered by dropped_chunks plus item_ptrs (which we
+            // proved disjoint above). So intersect with chunks_to_remove
+            // and ensure dropped_chunks ⊇ that intersection.
+            let mut all_file_chunks: HashSet<ChunkId> = HashSet::new();
+            for s in per_item.iter() {
+                all_file_chunks.extend(s.iter().copied());
+            }
+            let needed: HashSet<ChunkId> = all_file_chunks
+                .intersection(&chunks_to_remove)
+                .copied()
+                .collect();
+            needed.is_subset(&dropped_chunks)
+        });
+    }
+
+    // ------------------------------------------------------------------
+    // Emit DropItemsFromSnapshot for snapshots that survived all gates.
+    // Names for these are looked up via the manifest's name→id map (the
+    // planner is given the surviving subset, so each id resolves).
+    // ------------------------------------------------------------------
+    let id_to_name: HashMap<SnapshotId, String> = name_to_id
+        .iter()
+        .map(|(name, id)| (*id, name.clone()))
+        .collect();
+
+    let mut item_repaired_names: HashSet<String> = HashSet::new();
+    let mut item_repaired_ids: HashSet<SnapshotId> = HashSet::new();
+    for (id, drops) in &per_snapshot_drops {
+        if per_snapshot_whole.contains(id) {
+            continue;
+        }
+        let snapshot_name = match id_to_name.get(id) {
+            Some(n) => n.clone(),
+            None => continue, // belt-and-braces: name not in manifest
+        };
+        let item_indices: Vec<usize> = drops.keys().copied().collect();
+        let dropped_paths: Vec<String> = drops.values().map(|(p, _)| p.clone()).collect();
+        let reasons: Vec<String> = drops.values().map(|(_, r)| r.clone()).collect();
+        actions.push(RepairAction::DropItemsFromSnapshot {
+            snapshot_id: *id,
+            snapshot_name: snapshot_name.clone(),
+            item_indices,
+            dropped_paths,
+            reasons,
+        });
+        item_repaired_names.insert(snapshot_name);
+        item_repaired_ids.insert(*id);
+        has_data_loss = true;
+    }
+
+    // ------------------------------------------------------------------
+    // Emit RemoveCorruptSnapshot for ids in per_snapshot_whole that came
+    // from a CorruptSnapshot, OR from an InvalidItem that did not pass the
+    // coverage gates. Snapshots whose whole-snapshot signal is only
+    // `DanglingItemPtr` / `UnreadableSnapshot` / `SnapshotReadFailed` are
+    // covered by the dangling-snapshot path further down — emitting a
+    // RemoveCorruptSnapshot for those would double-act.
+    // ------------------------------------------------------------------
+    let mut corrupt_snapshot_names: HashSet<String> = HashSet::new();
+    let mut emitted_corrupt: HashSet<SnapshotId> = HashSet::new();
+
+    for (id, name) in &corrupt_snapshot_meta {
+        actions.push(RepairAction::RemoveCorruptSnapshot {
+            snapshot_id: *id,
+            name: name.clone(),
+        });
+        if let Some(n) = name {
+            corrupt_snapshot_names.insert(n.clone());
+        }
+        emitted_corrupt.insert(*id);
+        has_data_loss = true;
+    }
+
+    for id in &per_snapshot_whole {
+        if emitted_corrupt.contains(id) {
+            continue;
+        }
+        let invalid_item_name = scan.issues.iter().find_map(|i| match i {
+            IntegrityIssue::InvalidItem {
+                snapshot_id,
+                snapshot_name,
+                ..
+            } if *snapshot_id == *id => Some(snapshot_name.clone()),
+            _ => None,
+        });
+        // Only promote-to-corrupt for snapshots whose only signal was an
+        // InvalidItem. The DanglingItemPtr/Unreadable/Read paths already
+        // emit RemoveDanglingSnapshot via the doomed_missing map below.
+        let has_other_whole = scan.issues.iter().any(|i| {
+            matches!(
+                i,
+                IntegrityIssue::DanglingItemPtr { snapshot_name, .. }
+                | IntegrityIssue::UnreadableSnapshot { snapshot_name, .. }
+                | IntegrityIssue::SnapshotReadFailed { snapshot_name, .. }
+                    if name_to_id.get(snapshot_name) == Some(id)
+            )
+        });
+        if let Some(name_opt) = invalid_item_name {
+            if !has_other_whole {
+                actions.push(RepairAction::RemoveCorruptSnapshot {
+                    snapshot_id: *id,
+                    name: name_opt.clone(),
+                });
+                if let Some(n) = name_opt {
+                    corrupt_snapshot_names.insert(n);
+                }
+                emitted_corrupt.insert(*id);
+                has_data_loss = true;
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // RemoveDanglingSnapshot (existing logic, but suppress when an item-
+    // level repair has been emitted for the same snapshot OR the snapshot
+    // is going to be removed via RemoveCorruptSnapshot).
+    // ------------------------------------------------------------------
     let mut doomed_missing: HashMap<String, usize> = HashMap::new();
-    for issue in issues {
+    for issue in &scan.issues {
         match issue {
-            IntegrityIssue::DanglingItemPtr { snapshot_name, .. }
-            | IntegrityIssue::DanglingFileChunk { snapshot_name, .. } => {
+            IntegrityIssue::DanglingItemPtr { snapshot_name, .. } => {
+                *doomed_missing.entry(snapshot_name.clone()).or_insert(0) += 1;
+            }
+            IntegrityIssue::DanglingFileChunk { snapshot_name, .. } => {
+                // If item-level repair will cover this snapshot, skip:
+                // the rewritten snapshot drops the offending item.
+                if name_to_id
+                    .get(snapshot_name)
+                    .is_some_and(|id| item_repaired_ids.contains(id))
+                {
+                    continue;
+                }
                 *doomed_missing.entry(snapshot_name.clone()).or_insert(0) += 1;
             }
             IntegrityIssue::UnreadableSnapshot { snapshot_name, .. } => {
-                // Can't enumerate chunks → must treat as doomed.
                 doomed_missing.entry(snapshot_name.clone()).or_insert(1);
             }
             _ => {}
         }
     }
 
-    // Source B: snapshots whose chunks will be removed by index cleanup.
     if !chunks_to_remove.is_empty() {
-        for (snap_name, chunk_ids) in snapshot_chunk_refs {
-            if corrupt_snapshot_names.contains(snap_name) {
-                continue; // Already handled as RemoveCorruptSnapshot
+        for (snap_name, chunk_ids) in &scan.snapshot_chunk_refs {
+            if corrupt_snapshot_names.contains(snap_name) || item_repaired_names.contains(snap_name)
+            {
+                continue;
             }
             let newly_missing = chunk_ids
                 .iter()
@@ -1750,10 +2097,9 @@ fn build_repair_plan(
         }
     }
 
-    // Emit RemoveDanglingSnapshot for all doomed snapshots.
     for (snap_name, missing_count) in &doomed_missing {
-        if corrupt_snapshot_names.contains(snap_name) {
-            continue; // Already covered by RemoveCorruptSnapshot
+        if corrupt_snapshot_names.contains(snap_name) || item_repaired_names.contains(snap_name) {
+            continue;
         }
         actions.push(RepairAction::RemoveDanglingSnapshot {
             snapshot_name: snap_name.clone(),
@@ -1828,7 +2174,13 @@ pub fn run_with_repair(
                 .push((*chunk_id, *entry));
         }
 
-        let plan = build_repair_plan(&scan.issues, &pack_chunks, &scan.snapshot_chunk_refs);
+        let name_to_id: HashMap<String, SnapshotId> = repo
+            .manifest()
+            .snapshots
+            .iter()
+            .map(|e| (e.name.clone(), e.id))
+            .collect();
+        let plan = build_repair_plan(&scan, &pack_chunks, &name_to_id);
         let mut errors: Vec<CheckError> = scan.issues.iter().map(|i| i.to_check_error()).collect();
         errors.extend(scan.item_impacts.iter().map(|i| i.to_check_error()));
         let check_result = CheckResult {
@@ -1870,7 +2222,13 @@ pub fn run_with_repair(
                         .push((*chunk_id, *entry));
                 }
 
-                let plan = build_repair_plan(&scan.issues, &pack_chunks, &scan.snapshot_chunk_refs);
+                let name_to_id: HashMap<String, SnapshotId> = repo
+                    .manifest()
+                    .snapshots
+                    .iter()
+                    .map(|e| (e.name.clone(), e.id))
+                    .collect();
+                let plan = build_repair_plan(&scan, &pack_chunks, &name_to_id);
 
                 // If plan has data-loss actions, probe append-only before mutating.
                 if plan.has_data_loss && !probe_deletes_allowed(repo.storage.as_ref()) {
@@ -1908,6 +2266,224 @@ pub fn run_with_repair(
             },
         )
     }
+}
+
+/// In-flight bookkeeping for one snapshot rewrite.
+struct PreparedRewrite {
+    /// Index into `plan.actions` of the originating `DropItemsFromSnapshot`,
+    /// so a successful publish can be reported back via `applied.push`.
+    action_idx: usize,
+    old_id: SnapshotId,
+    new_id: SnapshotId,
+    new_entry: SnapshotEntry,
+    new_packed: Vec<u8>,
+}
+
+/// Build, flush, and publish the snapshot rewrites requested by every
+/// `DropItemsFromSnapshot` action in the plan.
+///
+/// The publish loop intentionally never returns `?`: a partial publication
+/// must not bypass the trailing whole-snapshot deletes or refcount rebuild
+/// in [`execute_repair`]. The only fatal case is "old DELETE failed AND
+/// rollback DELETE also failed" — that returns the typed duplicate-blobs
+/// error so the operator can manually intervene.
+fn apply_item_level_rewrites(
+    repo: &mut Repository,
+    plan: &RepairPlan,
+    applied: &mut Vec<RepairAction>,
+    repair_errors: &mut Vec<String>,
+) -> Result<()> {
+    // Bail out early if there's nothing to do.
+    let has_drops = plan
+        .actions
+        .iter()
+        .any(|a| matches!(a, RepairAction::DropItemsFromSnapshot { .. }));
+    if !has_drops {
+        return Ok(());
+    }
+
+    // 1. Begin a write session so store_chunk can pack new tree chunks.
+    repo.begin_write_session()?;
+
+    // 2. Prepare each rewrite (defer all PUT/DELETE until after Step 4 of
+    //    this routine, mirroring commit_prepare → PUT ordering).
+    let mut prepared: Vec<PreparedRewrite> = Vec::new();
+    for (action_idx, action) in plan.actions.iter().enumerate() {
+        let RepairAction::DropItemsFromSnapshot {
+            snapshot_id,
+            snapshot_name,
+            item_indices,
+            ..
+        } = action
+        else {
+            continue;
+        };
+        match prepare_rewrite(repo, *snapshot_id, snapshot_name, item_indices, action_idx) {
+            Ok(rw) => prepared.push(rw),
+            Err(e) => {
+                repair_errors.push(format!(
+                    "failed to prepare rewrite for snapshot '{snapshot_name}': {e}"
+                ));
+            }
+        }
+    }
+
+    if prepared.is_empty() {
+        // No work survived preparation — close the session via save_state so
+        // any pending state is consistent. The trailing rebuild handles any
+        // orphan chunks store_chunk may have produced.
+        repo.flush_packs()?;
+        repo.save_state()?;
+        return Ok(());
+    }
+
+    // 3. Flush new data/tree packs to storage.
+    repo.flush_packs()?;
+
+    // 4. Persist the chunk index so newly-stored chunks are durable BEFORE
+    //    any snapshot blob references them.
+    repo.save_state()?;
+
+    // 5. Publish each rewrite: PUT new blob, swap manifest, DELETE old.
+    for rw in &prepared {
+        // 5a. PUT new snapshot blob (the new commit point).
+        if let Err(e) = repo.storage.put(&rw.new_id.storage_key(), &rw.new_packed) {
+            repair_errors.push(format!(
+                "failed to publish rewritten snapshot '{}': {e}",
+                rw.new_entry.name
+            ));
+            continue;
+        }
+
+        // 5b. Manifest swap: remove the old name → push the new entry.
+        let removed = repo.manifest_mut().remove_snapshot(&rw.new_entry.name);
+        repo.manifest_mut().snapshots.push(rw.new_entry.clone());
+
+        // 5c. DELETE old blob; on failure, attempt rollback.
+        match repo.storage.delete(&rw.old_id.storage_key()) {
+            Ok(()) => applied.push(plan.actions[rw.action_idx].clone()),
+            Err(e) => {
+                let new_delete = repo.storage.delete(&rw.new_id.storage_key());
+                repo.manifest_mut().remove_snapshot(&rw.new_entry.name);
+                if let Some(prev) = removed {
+                    repo.manifest_mut().snapshots.push(prev);
+                }
+
+                if new_delete.is_err() {
+                    return Err(VykarError::Other(format!(
+                        "repair partially applied: snapshot '{}' has duplicate \
+                         blobs at IDs {} (old) and {} (new); cannot delete either. \
+                         Manual cleanup required, then re-run `vykar check --repair` \
+                         to settle refcounts.",
+                        rw.new_entry.name, rw.old_id, rw.new_id
+                    )));
+                }
+
+                repair_errors.push(format!(
+                    "failed to delete old blob for '{}' after rewrite; \
+                     rolled back: {e}",
+                    rw.new_entry.name
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Re-encode an items_stream with the listed `item_indices` dropped, store
+/// the resulting tree chunks (via the active write session), and pack a
+/// fresh `SnapshotMeta` blob for publication. Does not write the blob.
+fn prepare_rewrite(
+    repo: &mut Repository,
+    snapshot_id: SnapshotId,
+    snapshot_name: &str,
+    item_indices: &[usize],
+    action_idx: usize,
+) -> Result<PreparedRewrite> {
+    use crate::commands::backup::{
+        append_item_to_stream, flush_item_stream_chunk, items_chunker_config,
+    };
+
+    let drop: HashSet<usize> = item_indices.iter().copied().collect();
+
+    let old_meta: SnapshotMeta = load_snapshot_meta(repo, snapshot_name)?;
+    let old_stream = load_snapshot_item_stream(repo, snapshot_name)?;
+
+    let chunker = items_chunker_config();
+    let compression = Compression::default();
+
+    let mut new_item_ptrs: Vec<ChunkId> = Vec::new();
+    let mut buf: Vec<u8> = Vec::new();
+    let mut nfiles: u64 = 0;
+    let mut original_size: u64 = 0;
+    let mut idx: usize = 0;
+
+    let mut kept: usize = 0;
+    for_each_decoded_item(&old_stream, |item| {
+        let here = idx;
+        idx += 1;
+        if drop.contains(&here) {
+            return Ok(());
+        }
+        kept += 1;
+        if item.entry_type == ItemType::RegularFile {
+            nfiles += 1;
+            original_size += item.size;
+        }
+        append_item_to_stream(
+            repo,
+            &mut buf,
+            &mut new_item_ptrs,
+            &item,
+            &chunker,
+            compression,
+        )
+    })?;
+
+    if kept == 0 {
+        return Err(VykarError::Other(format!(
+            "rewrite would empty snapshot '{snapshot_name}' (planner gate bypassed)"
+        )));
+    }
+
+    flush_item_stream_chunk(repo, &mut buf, &mut new_item_ptrs, compression)?;
+
+    // Build new SnapshotMeta. Time fields and source labels mirror the
+    // original so users still see when the data was captured.
+    let mut new_meta = old_meta.clone();
+    new_meta.item_ptrs = new_item_ptrs;
+    new_meta.stats.nfiles = nfiles;
+    new_meta.stats.original_size = original_size;
+    // deduplicated_size: preserved from the old meta (display-only; minor
+    // inflation is acceptable per #123).
+
+    let new_id = SnapshotId::generate();
+    let meta_bytes = rmp_serde::to_vec(&new_meta)?;
+    let new_packed = pack_object_with_context(
+        ObjectType::SnapshotMeta,
+        new_id.as_bytes(),
+        &meta_bytes,
+        repo.crypto.as_ref(),
+    )?;
+
+    let new_entry = SnapshotEntry {
+        id: new_id,
+        name: snapshot_name.to_string(),
+        time: new_meta.time,
+        source_label: new_meta.source_label.clone(),
+        label: new_meta.label.clone(),
+        source_paths: new_meta.source_paths.clone(),
+        hostname: new_meta.hostname.clone(),
+    };
+
+    Ok(PreparedRewrite {
+        action_idx,
+        old_id: snapshot_id,
+        new_id,
+        new_entry,
+        new_packed,
+    })
 }
 
 /// Execute repair actions in the correct order.
@@ -2003,6 +2579,16 @@ fn execute_repair(
             _ => {}
         }
     }
+
+    // Step 4.5: Rewrite snapshots that survived item-level repair gates.
+    // Mirrors `Repository::commit_concurrent_session_with_progress`:
+    // begin_write_session → store_chunk per surviving item → flush_packs →
+    // save_state (persists chunks BEFORE any snapshot blob references them).
+    // Per-action errors are logged and skipped; the trailing rebuild
+    // garbage-collects any orphan chunks. The publish loop deliberately
+    // never short-circuits with `?`: a failed PUT/DELETE must not bypass
+    // Step 5 (whole-snapshot deletes) or Step 6 (refcount rebuild).
+    apply_item_level_rewrites(repo, plan, &mut applied, &mut repair_errors)?;
 
     // Step 5: Delete doomed snapshot blobs FIRST (safe ordering: delete
     // commit-point before adjusting refcounts, matching delete.rs:46-58).
@@ -2155,16 +2741,26 @@ mod tests {
     fn build_repair_plan_treats_invalid_item_as_doomed_snapshot() {
         let snapshot_id = SnapshotId([0x11u8; 32]);
         let snapshot_name = "bad".to_string();
-        let issues = vec![IntegrityIssue::InvalidItem {
-            snapshot_id,
-            snapshot_name: Some(snapshot_name.clone()),
-            item_path: "foo.txt".into(),
-            reason: "regular file has size 10 but chunk sizes sum to 20".into(),
-        }];
+        let scan = ScanResult {
+            counters: ScanCounters::default(),
+            issues: vec![IntegrityIssue::InvalidItem {
+                snapshot_id,
+                snapshot_name: Some(snapshot_name.clone()),
+                item_index: 0,
+                item_path: "foo.txt".into(),
+                reason: "regular file has size 10 but chunk sizes sum to 20".into(),
+            }],
+            snapshot_chunk_refs: HashMap::new(),
+            snapshot_item_ptrs: HashMap::new(),
+            snapshot_per_item_chunks: HashMap::new(),
+            snapshot_item_counts: HashMap::new(),
+            item_impacts: Vec::new(),
+        };
         let pack_chunks: HashMap<PackId, Vec<(ChunkId, ChunkIndexEntry)>> = HashMap::new();
-        let snapshot_chunk_refs: HashMap<String, HashSet<ChunkId>> = HashMap::new();
+        let mut name_to_id: HashMap<String, SnapshotId> = HashMap::new();
+        name_to_id.insert(snapshot_name.clone(), snapshot_id);
 
-        let plan = build_repair_plan(&issues, &pack_chunks, &snapshot_chunk_refs);
+        let plan = build_repair_plan(&scan, &pack_chunks, &name_to_id);
 
         assert!(plan.has_data_loss);
         let has_remove = plan.actions.iter().any(|a| {
@@ -2260,22 +2856,32 @@ mod tests {
     fn build_repair_plan_dedupes_invalid_item_with_corrupt_snapshot() {
         let snapshot_id = SnapshotId([0x22u8; 32]);
         let snapshot_name = "dup".to_string();
-        let issues = vec![
-            IntegrityIssue::CorruptSnapshot {
-                snapshot_id,
-                snapshot_name: Some(snapshot_name.clone()),
-            },
-            IntegrityIssue::InvalidItem {
-                snapshot_id,
-                snapshot_name: Some(snapshot_name.clone()),
-                item_path: "foo.txt".into(),
-                reason: "reason".into(),
-            },
-        ];
+        let scan = ScanResult {
+            counters: ScanCounters::default(),
+            issues: vec![
+                IntegrityIssue::CorruptSnapshot {
+                    snapshot_id,
+                    snapshot_name: Some(snapshot_name.clone()),
+                },
+                IntegrityIssue::InvalidItem {
+                    snapshot_id,
+                    snapshot_name: Some(snapshot_name.clone()),
+                    item_index: 0,
+                    item_path: "foo.txt".into(),
+                    reason: "reason".into(),
+                },
+            ],
+            snapshot_chunk_refs: HashMap::new(),
+            snapshot_item_ptrs: HashMap::new(),
+            snapshot_per_item_chunks: HashMap::new(),
+            snapshot_item_counts: HashMap::new(),
+            item_impacts: Vec::new(),
+        };
         let pack_chunks: HashMap<PackId, Vec<(ChunkId, ChunkIndexEntry)>> = HashMap::new();
-        let snapshot_chunk_refs: HashMap<String, HashSet<ChunkId>> = HashMap::new();
+        let mut name_to_id: HashMap<String, SnapshotId> = HashMap::new();
+        name_to_id.insert(snapshot_name.clone(), snapshot_id);
 
-        let plan = build_repair_plan(&issues, &pack_chunks, &snapshot_chunk_refs);
+        let plan = build_repair_plan(&scan, &pack_chunks, &name_to_id);
 
         let count = plan
             .actions

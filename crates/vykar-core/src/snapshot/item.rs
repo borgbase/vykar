@@ -70,8 +70,8 @@ impl Item {
                         "regular file {:?} has size {} but chunk sizes sum to {} \
                          (likely produced by a vykar version before the 2026-04 TOCTOU fix \
                          when the file changed during backup; run `vykar check --repair` \
-                         to delete the affected snapshot — note repair removes the snapshot, \
-                         it does not rewrite the item)",
+                         to drop the affected item — the snapshot is rewritten under a new \
+                         id and other items are preserved)",
                         self.path, self.size, sum
                     )));
                 }

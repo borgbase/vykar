@@ -290,6 +290,26 @@ fn format_repair_action(action: &RepairAction) -> String {
         } => {
             format!("Remove snapshot '{snapshot_name}' with {missing_chunks} unresolvable chunk(s)")
         }
+        RepairAction::DropItemsFromSnapshot {
+            snapshot_name,
+            item_indices,
+            dropped_paths,
+            reasons,
+            ..
+        } => {
+            const MAX_PATHS: usize = 10;
+            let n = item_indices.len();
+            let mut out = format!(
+                "Drop {n} item(s) from snapshot '{snapshot_name}' (snapshot kept, new id):"
+            );
+            for (path, reason) in dropped_paths.iter().zip(reasons.iter()).take(MAX_PATHS) {
+                out.push_str(&format!("\n      - {path}  ({reason})"));
+            }
+            if n > MAX_PATHS {
+                out.push_str(&format!("\n      ... and {} more", n - MAX_PATHS));
+            }
+            out
+        }
         RepairAction::RebuildRefcounts => "Rebuild chunk refcounts from surviving snapshots".into(),
     }
 }

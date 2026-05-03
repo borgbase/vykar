@@ -307,7 +307,7 @@ pub(super) fn consume_processed_entry(
         // Skipped entries are handled in the consumer loop before reaching here.
         ProcessedEntry::Skipped { .. }
         | ProcessedEntry::SegmentSkipped { .. }
-        | ProcessedEntry::WalkSkip
+        | ProcessedEntry::WalkSkip { .. }
         | ProcessedEntry::DatalessSkipped { .. } => {
             // Not reached: the orchestrator handles these variants before
             // calling into `consume_processed_entry`.

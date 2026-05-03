@@ -170,18 +170,59 @@ fn is_eio(e: &std::io::Error) -> bool {
     }
 }
 
+/// Soft I/O errors that should yield a per-entry skip rather than abort the
+/// backup. Used both at raw-`io::Error` call sites (readlink, read_dir,
+/// File::open, fstat, read_to_end) and as the `VykarError::Io` arm of
+/// [`VykarError::is_soft_file_error`].
+///
+/// Windows-specific cases:
+/// - **Synthetic `read_link` error from std** for unsupported reparse tags
+///   (OneDrive Cloud Files, AppExecLink, dedup, HSM, WSL volume). std emits
+///   `io::Error::new(ErrorKind::Uncategorized, "Unsupported reparse point type")`
+///   with no `raw_os_error`; `Uncategorized` is unstable on stable Rust so we
+///   match by message. If std rewords it, behavior reverts to today's "abort
+///   backup" — safe failure mode.
+/// - **`ERROR_CANT_ACCESS_FILE` and `ERROR_CLOUD_FILE_*` raw codes** that
+///   surface from `File::open` / `read` / `fstat` on cloud placeholders when
+///   the provider can't materialize content. List intentionally narrow;
+///   verified against winerror.h, expand only on concrete user reports.
+pub fn is_soft_backup_io_error(e: &std::io::Error) -> bool {
+    if matches!(
+        e.kind(),
+        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotFound,
+    ) || is_eio(e)
+    {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        // (a) synthetic readlink error — no raw_os_error, message-matched.
+        if e.raw_os_error().is_none() && e.to_string().contains("Unsupported reparse point type") {
+            return true;
+        }
+        // (b) cloud-file / can't-access codes from winerror.h:
+        //     1920 ERROR_CANT_ACCESS_FILE
+        //     362  ERROR_CLOUD_FILE_PROVIDER_NOT_RUNNING
+        //     395  ERROR_CLOUD_FILE_ACCESS_DENIED
+        //     404  ERROR_CLOUD_FILE_PROVIDER_TERMINATED
+        if matches!(
+            e.raw_os_error(),
+            Some(1920) | Some(362) | Some(395) | Some(404)
+        ) {
+            return true;
+        }
+    }
+    false
+}
+
 impl VykarError {
     /// Returns `true` for I/O errors that indicate a file was unreadable
-    /// (permission denied, file vanished, or EIO) **before** any data was
+    /// (permission denied, file vanished, EIO, or a Windows-specific
+    /// unsupported-reparse / cloud-file failure) **before** any data was
     /// committed. These are safe to skip for partial-backup support.
     pub fn is_soft_file_error(&self) -> bool {
         match self {
-            VykarError::Io(e) => {
-                matches!(
-                    e.kind(),
-                    std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotFound
-                ) || is_eio(e)
-            }
+            VykarError::Io(e) => is_soft_backup_io_error(e),
             VykarError::FileChangedDuringRead { .. } => true,
             _ => false,
         }
@@ -193,35 +234,88 @@ mod tests {
     use super::*;
 
     #[test]
-    fn is_soft_file_error_permission_denied() {
-        let err = VykarError::Io(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "permission denied",
-        ));
-        assert!(err.is_soft_file_error());
+    fn soft_io_error_permission_denied() {
+        let e = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+        assert!(is_soft_backup_io_error(&e));
     }
 
     #[test]
-    fn is_soft_file_error_not_found() {
+    fn soft_io_error_not_found() {
+        let e = std::io::Error::new(std::io::ErrorKind::NotFound, "gone");
+        assert!(is_soft_backup_io_error(&e));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn soft_io_error_eio() {
+        let e = std::io::Error::from_raw_os_error(5);
+        assert!(is_soft_backup_io_error(&e));
+    }
+
+    #[test]
+    fn non_soft_io_error() {
+        let e = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused");
+        assert!(!is_soft_backup_io_error(&e));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn soft_io_error_unsupported_reparse_point_message() {
+        // std emits this synthetic error for unsupported reparse tags
+        // (OneDrive Cloud Files, AppExecLink, dedup, HSM) with no raw_os_error.
+        let e = std::io::Error::new(std::io::ErrorKind::Other, "Unsupported reparse point type");
+        assert!(e.raw_os_error().is_none());
+        assert!(is_soft_backup_io_error(&e));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn soft_io_error_cant_access_file() {
+        // ERROR_CANT_ACCESS_FILE — cloud placeholder couldn't be materialized.
+        let e = std::io::Error::from_raw_os_error(1920);
+        assert!(is_soft_backup_io_error(&e));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn soft_io_error_cloud_file_provider_not_running() {
+        let e = std::io::Error::from_raw_os_error(362);
+        assert!(is_soft_backup_io_error(&e));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn soft_io_error_cloud_file_access_denied() {
+        let e = std::io::Error::from_raw_os_error(395);
+        assert!(is_soft_backup_io_error(&e));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn soft_io_error_cloud_file_provider_terminated() {
+        let e = std::io::Error::from_raw_os_error(404);
+        assert!(is_soft_backup_io_error(&e));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn non_soft_io_error_outside_cloud_file_list() {
+        // 361 is just outside the cloud-file range we recognise; treat as hard.
+        let e = std::io::Error::from_raw_os_error(361);
+        assert!(!is_soft_backup_io_error(&e));
+    }
+
+    #[test]
+    fn is_soft_file_error_delegates_to_io_classifier() {
         let err = VykarError::Io(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             "not found",
         ));
         assert!(err.is_soft_file_error());
-    }
 
-    #[test]
-    #[cfg(unix)]
-    fn is_soft_file_error_eio() {
-        let err = VykarError::Io(std::io::Error::from_raw_os_error(5));
-        assert!(err.is_soft_file_error());
-    }
-
-    #[test]
-    fn is_soft_file_error_other_io_is_not_soft() {
         let err = VykarError::Io(std::io::Error::new(
             std::io::ErrorKind::ConnectionRefused,
-            "connection refused",
+            "refused",
         ));
         assert!(!err.is_soft_file_error());
     }

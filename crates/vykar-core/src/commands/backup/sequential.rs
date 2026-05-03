@@ -22,10 +22,11 @@ use super::chunk_process::{classify_chunk, WorkerChunk};
 use super::commit::process_worker_chunks;
 use super::read_source::BackupSource;
 use super::source::ResolvedSource;
-use super::walk::{is_soft_io_error, materialize_item, InodeSortedWalk, Materialized, WalkEvent};
+use super::walk::{materialize_item, InodeSortedWalk, Materialized, WalkEvent};
 use super::{append_item_to_stream, emit_post_commit_warning, emit_progress, emit_stats_progress};
 use super::{with_rollback_checkpoint, BackupProgressEvent, FileStatus};
 use vykar_crypto::CryptoEngine;
+use vykar_types::error::is_soft_backup_io_error;
 
 /// Classify raw data chunks into `WorkerChunk`s, optionally using a rayon pool
 /// for parallel compression/hashing.
@@ -519,8 +520,12 @@ pub(super) fn process_source_path(
 
         let walked = match event_result {
             Ok(WalkEvent::Entry(walked)) => walked,
-            Ok(WalkEvent::Skipped) => {
+            Ok(WalkEvent::Skipped { path, reason }) => {
                 stats.errors += 1;
+                emit_post_commit_warning(
+                    progress,
+                    format!("skipping entry '{}': {reason}", path.display()),
+                );
                 continue;
             }
             Err(e) => return Err(e),
@@ -533,8 +538,12 @@ pub(super) fn process_source_path(
                     abs_path,
                     metadata,
                 }) => (item, abs_path, metadata),
-                Ok(Materialized::SoftError) => {
+                Ok(Materialized::SoftError { path, reason }) => {
                     stats.errors += 1;
+                    emit_post_commit_warning(
+                        progress,
+                        format!("skipping entry '{}': {reason}", path.display()),
+                    );
                     continue;
                 }
                 Ok(Materialized::Unsupported) => continue,
@@ -621,7 +630,7 @@ pub(super) fn process_source_path(
                     let mut file = match std::fs::File::open(&entry_path) {
                         Ok(f) => f,
                         Err(e) => {
-                            if is_soft_io_error(&e) {
+                            if is_soft_backup_io_error(&e) {
                                 emit_post_commit_warning(
                                     progress,
                                     format!("skipping file '{}': {e}", entry_path.display()),
@@ -636,7 +645,7 @@ pub(super) fn process_source_path(
                     let pre_meta = match fs::fstat_summary(&file) {
                         Ok(m) => m,
                         Err(e) => {
-                            if is_soft_io_error(&e) {
+                            if is_soft_backup_io_error(&e) {
                                 emit_post_commit_warning(
                                     progress,
                                     format!("skipping file '{}': {e}", entry_path.display()),
@@ -676,7 +685,7 @@ pub(super) fn process_source_path(
                     // drift check below.
                     let mut reader = std::io::Read::take(&mut file, pre_meta.size + 1);
                     if let Err(e) = std::io::Read::read_to_end(&mut reader, &mut data) {
-                        if is_soft_io_error(&e) {
+                        if is_soft_backup_io_error(&e) {
                             emit_post_commit_warning(
                                 progress,
                                 format!("skipping file '{}': {e}", entry_path.display()),
@@ -690,7 +699,7 @@ pub(super) fn process_source_path(
                     let post_meta = match fs::fstat_summary(&file) {
                         Ok(m) => m,
                         Err(e) => {
-                            if is_soft_io_error(&e) {
+                            if is_soft_backup_io_error(&e) {
                                 emit_post_commit_warning(
                                     progress,
                                     format!("skipping file '{}': {e}", entry_path.display()),

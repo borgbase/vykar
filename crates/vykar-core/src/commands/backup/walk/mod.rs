@@ -16,24 +16,6 @@ use super::source::ResolvedSource;
 mod inode_walk;
 pub(super) use inode_walk::{InodeSortedWalk, WalkEvent, WalkedEntry};
 
-/// Returns `true` for I/O errors safe to skip (permission denied, not found, or EIO).
-pub(super) fn is_soft_io_error(e: &std::io::Error) -> bool {
-    matches!(
-        e.kind(),
-        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotFound
-    ) || is_eio(e)
-}
-
-#[cfg(unix)]
-fn is_eio(e: &std::io::Error) -> bool {
-    e.raw_os_error() == Some(libc::EIO)
-}
-
-#[cfg(not(unix))]
-fn is_eio(_e: &std::io::Error) -> bool {
-    false
-}
-
 /// Items chunker config — finer granularity for the item metadata stream.
 pub(crate) fn items_chunker_config() -> ChunkerConfig {
     ChunkerConfig {
@@ -136,8 +118,10 @@ pub(super) enum Materialized {
         abs_path: PathBuf,
         metadata: fs::MetadataSummary,
     },
-    /// Soft I/O error (e.g. permission denied on readlink) — caller should count as error.
-    SoftError,
+    /// Soft I/O error (e.g. permission denied on readlink, Windows
+    /// unsupported reparse tag) — caller should count as error and surface
+    /// `path` + `reason` in a path-bearing warning.
+    SoftError { path: PathBuf, reason: String },
     /// Unsupported file type (block device, FIFO, etc.) — silent skip.
     Unsupported,
 }
@@ -160,12 +144,16 @@ pub(super) fn materialize_item(walked: WalkedEntry, xattrs_enabled: bool) -> Res
                 Some(target.to_string_lossy().to_string()),
             ),
             Err(e) => {
-                if is_soft_io_error(&e) {
-                    warn!(path = %walked.abs_path.display(), error = %e,
-                          "skipping entry (readlink error)");
-                    return Ok(Materialized::SoftError);
+                if vykar_types::error::is_soft_backup_io_error(&e) {
+                    return Ok(Materialized::SoftError {
+                        path: walked.abs_path.clone(),
+                        reason: format!("readlink failed: {e}"),
+                    });
                 }
-                return Err(VykarError::Other(format!("readlink: {e}")));
+                return Err(VykarError::Other(format!(
+                    "readlink failed for '{}': {e}",
+                    walked.abs_path.display()
+                )));
             }
         }
     } else if file_type.is_file() {
@@ -239,8 +227,14 @@ pub(super) enum WalkEntry {
     NonFile {
         item: Item,
     },
-    /// A file that was skipped due to a soft error (permission denied, not found).
-    Skipped,
+    /// A file that was skipped due to a soft error (permission denied, not
+    /// found, EIO, Windows unsupported reparse, cloud-file). Carries the
+    /// failing path (snapshot/abs string form) and a pre-formatted reason
+    /// so consumers can surface a path-bearing warning.
+    Skipped {
+        path: String,
+        reason: String,
+    },
     /// macOS dataless (FileProvider placeholder) file with no matching entry
     /// in the local file cache or the parent reuse index. Skipped without
     /// opening so we never trigger asynchronous hydration. Counted into a
@@ -266,7 +260,7 @@ pub(super) fn reserve_budget(entry: &WalkEntry, budget: &ByteBudget) -> Result<u
             budget.acquire(usize::try_from(*file_size).unwrap_or(usize::MAX))
         }
         WalkEntry::FileSegment { len, .. } => budget.acquire(*len as usize),
-        WalkEntry::Skipped | WalkEntry::SkippedDataless { .. } => Ok(0),
+        WalkEntry::Skipped { .. } | WalkEntry::SkippedDataless { .. } => Ok(0),
         _ => Ok(0),
     }
 }
@@ -447,7 +441,10 @@ fn walk_source_inode_sorted<'a>(
         };
 
         match event {
-            WalkEvent::Skipped => WalkItems::One(Some(Ok(WalkEntry::Skipped))),
+            WalkEvent::Skipped { path, reason } => WalkItems::One(Some(Ok(WalkEntry::Skipped {
+                path: path.to_string_lossy().into_owned(),
+                reason,
+            }))),
             WalkEvent::Entry(walked) => walked_entry_to_walk_items(
                 walked,
                 xattrs_enabled,
@@ -475,8 +472,11 @@ fn walked_entry_to_walk_items(
             abs_path,
             metadata,
         }) => (item, abs_path, metadata),
-        Ok(Materialized::SoftError) => {
-            return WalkItems::One(Some(Ok(WalkEntry::Skipped)));
+        Ok(Materialized::SoftError { path, reason }) => {
+            return WalkItems::One(Some(Ok(WalkEntry::Skipped {
+                path: path.to_string_lossy().into_owned(),
+                reason,
+            })));
         }
         Ok(Materialized::Unsupported) => return WalkItems::Empty,
         Err(e) => return WalkItems::One(Some(Err(e))),
@@ -688,31 +688,6 @@ mod tests {
     }
 
     #[test]
-    fn soft_io_error_permission_denied() {
-        let e = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
-        assert!(is_soft_io_error(&e));
-    }
-
-    #[test]
-    fn soft_io_error_not_found() {
-        let e = std::io::Error::new(std::io::ErrorKind::NotFound, "gone");
-        assert!(is_soft_io_error(&e));
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn soft_io_error_eio() {
-        let e = std::io::Error::from_raw_os_error(libc::EIO);
-        assert!(is_soft_io_error(&e));
-    }
-
-    #[test]
-    fn non_soft_io_error() {
-        let e = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused");
-        assert!(!is_soft_io_error(&e));
-    }
-
-    #[test]
     fn pathbuf_into_string_matches_to_string_lossy() {
         let paths = ["/tmp/file.txt", "/home/user/Documents/photo.jpg", "/a/b/c"];
         for p in paths {
@@ -841,7 +816,16 @@ mod tests {
         std::fs::remove_file(&link).unwrap();
 
         let result = materialize_item(walked, false).unwrap();
-        assert!(matches!(result, Materialized::SoftError));
+        match result {
+            Materialized::SoftError { path, reason } => {
+                assert_eq!(path, link);
+                assert!(
+                    reason.contains("readlink failed"),
+                    "reason should mention readlink: {reason}"
+                );
+            }
+            other => panic!("expected SoftError, got {other:?}"),
+        }
     }
 
     #[cfg(unix)]
@@ -859,7 +843,13 @@ mod tests {
         let file_cache = FileCache::default();
         let mut items = walked_entry_to_walk_items(walked, false, &file_cache, u64::MAX, None);
         match items.next() {
-            Some(Ok(WalkEntry::Skipped)) => {}
+            Some(Ok(WalkEntry::Skipped { path, reason })) => {
+                assert_eq!(path, link.to_string_lossy());
+                assert!(
+                    reason.contains("readlink failed"),
+                    "reason should mention readlink: {reason}"
+                );
+            }
             _ => panic!("expected WalkEntry::Skipped"),
         }
         assert!(items.next().is_none());

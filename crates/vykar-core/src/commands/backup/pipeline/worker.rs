@@ -316,7 +316,7 @@ pub(super) fn process_file_worker(
 
         WalkEntry::NonFile { item } => Ok(ProcessedEntry::NonFile { item }),
 
-        WalkEntry::Skipped => Ok(ProcessedEntry::WalkSkip),
+        WalkEntry::Skipped { path, reason } => Ok(ProcessedEntry::WalkSkip { path, reason }),
 
         WalkEntry::SkippedDataless { path } => Ok(ProcessedEntry::DatalessSkipped { path }),
 

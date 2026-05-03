@@ -15,13 +15,13 @@ use std::fs::FileType;
 use std::path::{Path, PathBuf};
 
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::platform::fs::{self, MetadataSummary};
-use vykar_types::error::{Result, VykarError};
+use vykar_types::error::{is_soft_backup_io_error, Result, VykarError};
 
 use super::super::source::{ResolvedSource, RootEmission, SourceKind};
-use super::{build_explicit_excludes, is_soft_io_error, should_skip_for_device};
+use super::{build_explicit_excludes, should_skip_for_device};
 
 #[cfg(unix)]
 fn dir_entry_inode(entry: &std::fs::DirEntry) -> u64 {
@@ -97,8 +97,14 @@ pub(super) fn rel_path_from_abs(abs_source: &Path, abs_path: &Path) -> String {
 /// Events yielded by `InodeSortedWalk`.
 pub(in crate::commands::backup) enum WalkEvent {
     Entry(WalkedEntry),
-    /// A soft error occurred (permission denied, not found, EIO).
-    Skipped,
+    /// A soft error occurred (permission denied, not found, EIO, or a
+    /// Windows-specific unsupported-reparse / cloud-file failure). Carries
+    /// the failing path and a pre-formatted reason so consumers can surface
+    /// a path-bearing warning rather than just bumping an opaque counter.
+    Skipped {
+        path: PathBuf,
+        reason: String,
+    },
 }
 
 /// Build a single-event `DirLevel` holding the root `WalkedEntry` for an
@@ -310,10 +316,12 @@ impl InodeSortedWalk {
         let read_dir = match std::fs::read_dir(dir) {
             Ok(rd) => rd,
             Err(e) => {
-                if is_soft_io_error(&e) {
-                    warn!(path = %dir.display(), error = %e, "skipping directory (read_dir error)");
+                if is_soft_backup_io_error(&e) {
                     return Ok(DirLevel {
-                        events: VecDeque::from([WalkEvent::Skipped]),
+                        events: VecDeque::from([WalkEvent::Skipped {
+                            path: dir.to_path_buf(),
+                            reason: format!("read_dir failed: {e}"),
+                        }]),
                         pending_subdirs: VecDeque::new(),
                     });
                 }
@@ -326,14 +334,16 @@ impl InodeSortedWalk {
 
         // Phase 1: Collect raw entries with inode from readdir (free — no stat).
         let mut raw_entries: Vec<RawDirEntry> = Vec::new();
-        let mut skipped_count: usize = 0;
+        // Per-entry readdir failures: the std `ReadDir` iterator yielded an
+        // error before producing the entry name, so we can't name the offending
+        // child — we report the parent directory in each Skipped event instead.
+        let mut deferred_skips: Vec<(PathBuf, String)> = Vec::new();
         for entry_result in read_dir {
             let entry = match entry_result {
                 Ok(e) => e,
                 Err(e) => {
-                    if is_soft_io_error(&e) {
-                        warn!(path = %dir.display(), error = %e, "skipping entry (readdir error)");
-                        skipped_count += 1;
+                    if is_soft_backup_io_error(&e) {
+                        deferred_skips.push((dir.to_path_buf(), format!("readdir failed: {e}")));
                         continue;
                     }
                     return Err(VykarError::Other(format!(
@@ -415,9 +425,11 @@ impl InodeSortedWalk {
             let metadata = match std::fs::symlink_metadata(&raw.path) {
                 Ok(m) => m,
                 Err(e) => {
-                    if is_soft_io_error(&e) {
-                        warn!(path = %raw.path.display(), error = %e, "skipping entry (stat error)");
-                        events.push_back(WalkEvent::Skipped);
+                    if is_soft_backup_io_error(&e) {
+                        events.push_back(WalkEvent::Skipped {
+                            path: raw.path.clone(),
+                            reason: format!("stat failed: {e}"),
+                        });
                         continue;
                     }
                     return Err(VykarError::Other(format!(
@@ -488,9 +500,11 @@ impl InodeSortedWalk {
         }
 
         // Prepend Skipped events for readdir errors from phase 1 so consumers
-        // can increment stats.errors for each lost entry.
-        for _ in 0..skipped_count {
-            events.push_front(WalkEvent::Skipped);
+        // can increment stats.errors for each lost entry. `push_front` reverses
+        // the deferred order, so iterate the deferred list in reverse to keep
+        // the original order intact.
+        for (path, reason) in deferred_skips.into_iter().rev() {
+            events.push_front(WalkEvent::Skipped { path, reason });
         }
 
         Ok(DirLevel {

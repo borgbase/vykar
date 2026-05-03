@@ -97,12 +97,15 @@ pub(super) enum ProcessedEntry {
     DatalessSkipped {
         path: String,
     },
-    /// The walker reported a soft error before it could materialize a
-    /// path (e.g. directory-iteration `EACCES`). The walker has already
-    /// logged the failing path via `tracing::warn!`, so the consumer
-    /// just bumps the error counter without emitting a pathless GUI
+    /// The walker reported a soft error before it could materialize an
+    /// `Item` (e.g. directory-iteration `EACCES`, Windows unsupported
+    /// reparse tag, cloud-file unavailable). Carries the failing path and
+    /// pre-formatted reason so the consumer can emit a path-bearing
     /// warning. Mirrors `sequential.rs` `WalkEvent::Skipped` handling.
-    WalkSkip,
+    WalkSkip {
+        path: String,
+        reason: String,
+    },
     /// A segment of a large file was skipped.
     ///
     /// If `segment_index == 0` nothing was committed. If `segment_index > 0`,
@@ -385,10 +388,12 @@ pub(crate) fn run_parallel_pipeline(
                             format!("skipping file '{path}': {reason}"),
                         );
                     }
-                    Ok(ProcessedEntry::WalkSkip) => {
-                        // Walker already logged the failing path with
-                        // tracing::warn!; surface only the error count.
+                    Ok(ProcessedEntry::WalkSkip { path, reason }) => {
                         stats.errors += 1;
+                        super::emit_post_commit_warning(
+                            progress,
+                            format!("skipping entry '{path}': {reason}"),
+                        );
                     }
                     Ok(ProcessedEntry::DatalessSkipped { path }) => {
                         // Walker already emitted a tracing::debug! with the

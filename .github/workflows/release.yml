@@ -380,6 +380,13 @@ jobs:
           scripts/windows-sign.sh dist/unsigned/*.exe
           rm -f "$ARCHIVE"
           cd dist && zip -j "$(basename "$ARCHIVE" .zip).zip" unsigned/*.exe && cd ..
+      - name: Upload sign-windows screenshots
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sign-windows-screens
+          path: /tmp/sign-screens/
+          if-no-files-found: ignore
       - uses: actions/upload-artifact@v4
         if: env.HAS_SIGNING != ''
         with:

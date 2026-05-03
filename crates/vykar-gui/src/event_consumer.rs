@@ -296,13 +296,15 @@ pub(crate) fn spawn(
                             *cache = items;
                         }
                     }
-                    UiEvent::SnapshotTableData { data } => {
+                    UiEvent::SnapshotTableData { mut data } => {
+                        // Reverse once to newest-first; both the Snapshots table
+                        // (default order) and the Overview "latest 3" consume this
+                        // same canonical order. Column-header clicks on the
+                        // Snapshots table reorder this list in place afterwards.
+                        data.reverse();
                         // Overview table: latest 3, columns ID / Time / Files / Size.
-                        // Incoming data is sorted ascending by time, so take from the end
-                        // to show newest first.
                         let recent_rows: Vec<Vec<String>> = data
                             .iter()
-                            .rev()
                             .take(3)
                             .map(|d| {
                                 vec![

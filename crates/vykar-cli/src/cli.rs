@@ -104,6 +104,10 @@ pub(crate) enum Commands {
         /// Show only the N most recent snapshots
         #[arg(long)]
         last: Option<usize>,
+
+        /// Output data as JSON
+        #[arg(long)]
+        json: bool,
     },
 
     /// Inspect snapshot contents and metadata

@@ -242,8 +242,8 @@ pub(crate) fn dispatch_command(
             shutdown,
             verbose,
         ),
-        Commands::List { source, last, .. } => {
-            cmd::list::run_list(cfg, label, source, *last).map(|()| false)
+        Commands::List { source, last, json, .. } => {
+            cmd::list::run_list(cfg, label, source, json, *last).map(|()| false)
         }
         Commands::Snapshot { command, .. } => {
             cmd::snapshot::run_snapshot_command(command, cfg, label, shutdown).map(|()| false)

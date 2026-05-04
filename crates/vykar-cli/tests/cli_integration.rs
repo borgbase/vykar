@@ -554,6 +554,32 @@ fn cli_snapshot_list_latest_alias() {
 }
 
 #[test]
+fn cli_snapshot_list_json() {
+    let fx = CliFixture::new();
+    write_plain_config(&fx.config_path, &fx.repo_dir);
+
+    let cfg = fx.config_path.to_string_lossy().to_string();
+    let source = fx.source_a.to_string_lossy().to_string();
+
+    fx.run_ok(&["--config", &cfg, "init"]);
+
+    // Snapshot 1: only old.txt
+    std::fs::write(fx.source_a.join("old.txt"), b"old\n").unwrap();
+    fx.run_ok(&["--config", &cfg, "backup", &source]);
+
+    let out = fx.run_ok(&["--config", &cfg, "list", "--json"]);
+    let out_json: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert!(
+        out_json[0]["nfiles"] == 1 && 
+        out_json[0]["source_paths"][0].to_string().contains("source-a") && 
+        out_json[0]["original_size"] == 4 &&
+        out_json[0]["compressed_size"] == 11 &&
+        out_json[0]["deduplicated_size"] == 11,
+        "expected list --json to show valid info, got:\n{out}"
+    );
+}
+
+#[test]
 fn cli_snapshot_info_latest_alias() {
     let fx = CliFixture::new();
     write_plain_config(&fx.config_path, &fx.repo_dir);

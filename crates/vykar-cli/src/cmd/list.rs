@@ -8,10 +8,49 @@ use crate::format::{format_bytes, format_count};
 use crate::passphrase::with_repo_passphrase;
 use crate::table::CliTableTheme;
 
+// use serde_json::Value;
+use chrono::{DateTime, Utc};
+use serde::Serialize;
+use vykar_types::snapshot_id::SnapshotId;
+use vykar_core::repo::manifest::SnapshotEntry;
+use vykar_core::snapshot::SnapshotStats;
+
+#[derive(Serialize)]
+struct SnapshotView {
+    pub name: String,
+    pub id: SnapshotId,
+    pub time: DateTime<Utc>,
+    pub label: String,
+    pub source_paths: Vec<String>,
+    pub hostname: String,
+    pub nfiles: u64,
+    pub original_size: u64,
+    pub compressed_size: u64,
+    pub deduplicated_size: u64,
+}
+
+impl SnapshotView {
+    fn from_entry_stats_tuple(entry: SnapshotEntry, stats: SnapshotStats) -> SnapshotView {
+        Self {
+            name: entry.name,
+            id: entry.id,
+            time: entry.time,
+            label: entry.label,
+            source_paths: entry.source_paths,
+            hostname: entry.hostname,
+            nfiles: stats.nfiles,
+            original_size: stats.original_size,
+            compressed_size: stats.compressed_size,
+            deduplicated_size: stats.deduplicated_size,
+        }
+    }
+}
+
 pub(crate) fn run_list(
     config: &VykarConfig,
     label: Option<&str>,
     source_filter: &[String],
+    json: &bool,
     last: Option<usize>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut snapshots = with_repo_passphrase(config, label, |passphrase| {
@@ -31,8 +70,13 @@ pub(crate) fn run_list(
             snapshots.drain(..len - n);
         }
     }
+
     if snapshots.is_empty() {
-        println!("No snapshots found.");
+        if *json {
+            println!("[]");
+        } else {
+            println!("No snapshots found.");
+        }
         return Ok(());
     }
 
@@ -106,7 +150,16 @@ pub(crate) fn run_list(
             Cell::new(size_col),
         ]);
     }
-    println!("{table}");
+
+    if *json {
+        let snapshot_views: Vec<SnapshotView> = snapshots
+            .into_iter()
+            .map(|(entry, stats)| SnapshotView::from_entry_stats_tuple(entry, stats.unwrap()))
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&snapshot_views)?);
+    } else {
+        println!("{table}");
+    }
 
     Ok(())
 }

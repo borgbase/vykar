@@ -67,8 +67,19 @@ fn startup(ctx: &mut WorkerContext) {
 
     send_structured_data(&ctx.ui_tx, &ctx.runtime.repos);
 
-    if let Ok(text) = std::fs::read_to_string(&ctx.config_display_path) {
-        let _ = ctx.ui_tx.send(UiEvent::ConfigText(text));
+    match std::fs::read_to_string(&ctx.config_display_path) {
+        Ok(text) => {
+            let _ = ctx.ui_tx.send(UiEvent::ConfigText(text));
+        }
+        Err(e) => {
+            send_log(
+                &ctx.ui_tx,
+                format!(
+                    "Could not read config file for editor ({}): {e}",
+                    ctx.config_display_path.display()
+                ),
+            );
+        }
     }
 
     let _ = ctx.app_tx.send(AppCommand::FetchAllRepoInfo);

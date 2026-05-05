@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use crate::config_helpers;
@@ -57,13 +57,13 @@ pub(super) fn handle_save_and_apply_config(ctx: &mut WorkerContext, yaml_text: S
     }
 
     if let Err(msg) = config_helpers::validate_config(&tmp_path) {
-        let _ = std::fs::remove_file(&tmp_path);
+        cleanup_tmp(ctx, &tmp_path);
         let _ = ctx.ui_tx.send(UiEvent::ConfigSaveError(msg));
         return;
     }
 
     if let Err(e) = std::fs::rename(&tmp_path, &config_path) {
-        let _ = std::fs::remove_file(&tmp_path);
+        cleanup_tmp(ctx, &tmp_path);
         let _ = ctx
             .ui_tx
             .send(UiEvent::ConfigSaveError(format!("Rename failed: {e}")));
@@ -78,6 +78,23 @@ pub(super) fn handle_save_and_apply_config(ctx: &mut WorkerContext, yaml_text: S
         let _ = ctx.ui_tx.send(UiEvent::ConfigSaveError(
             "Config saved to disk but failed to apply. Check log for details.".into(),
         ));
+    }
+}
+
+/// Best-effort removal of a save-flow tmp file. A NotFound error is silent
+/// (rename succeeded or a prior cleanup ran); any other failure is logged so
+/// a stuck tmp file (e.g. a still-locked file on Windows) is visible.
+fn cleanup_tmp(ctx: &WorkerContext, path: &Path) {
+    if let Err(e) = std::fs::remove_file(path) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            send_log(
+                &ctx.ui_tx,
+                format!(
+                    "Failed to remove temporary config file {}: {e}",
+                    path.display()
+                ),
+            );
+        }
     }
 }
 

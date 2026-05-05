@@ -1,34 +1,15 @@
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use crossbeam_channel::Sender;
 use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 
 use crate::controllers;
-use crate::messages::{AppCommand, SnapshotRowData, SnapshotSelection, SourceInfoData, UiEvent};
+use crate::messages::{AppCommand, UiEvent};
 use crate::repo_helpers::send_log;
-use crate::view_models::{
-    build_repo_source_model, current_repo_name, publish_snapshot_table, sort_snapshot_table,
-    to_find_groups_model,
-};
-use crate::{AppData, MainWindow, SourceInfo, TreeRowData};
-
-/// Return the row index iff exactly one snapshot is selected. The
-/// single-row buttons (Restore, Mount) are gated on this in the UI but we
-/// re-check here to avoid acting on a stale or racy selection.
-fn single_selected_index(sel: &Arc<Mutex<SnapshotSelection>>) -> Option<usize> {
-    let guard = sel.lock().ok()?;
-    let mut iter = guard
-        .selected
-        .iter()
-        .enumerate()
-        .filter_map(|(i, s)| s.then_some(i));
-    let only = iter.next()?;
-    if iter.next().is_some() {
-        return None;
-    }
-    Some(only)
-}
+use crate::ui_state::{self, SourceModelScope};
+use crate::view_models::to_find_groups_model;
+use crate::{MainWindow, TreeRowData};
 
 fn wire_recovery_button(
     ui: &MainWindow,
@@ -44,7 +25,7 @@ fn wire_recovery_button(
         let Some(ui) = ui_weak.upgrade() else {
             return;
         };
-        let Some(repo_name) = current_repo_name(&ui) else {
+        let Some(repo_name) = ui_state::current_repo_name(&ui) else {
             return;
         };
         let prompt = prompt_template.replace("{repo}", &repo_name);
@@ -61,44 +42,10 @@ fn wire_recovery_button(
     register(ui, cb);
 }
 
-fn selected_indices(sel: &Arc<Mutex<SnapshotSelection>>, expected: usize) -> Option<Vec<usize>> {
-    let guard = sel.lock().ok()?;
-    let indices: Vec<usize> = guard
-        .selected
-        .iter()
-        .enumerate()
-        .filter_map(|(i, s)| s.then_some(i))
-        .collect();
-    (indices.len() == expected).then_some(indices)
-}
-
-/// Toggle the `expanded` flag on a `SourceInfo` row in the given model, which
-/// must be a `VecModel<SourceInfo>`. Rebuilds the model since Slint's
-/// `ModelRc` doesn't expose mutable row access.
-fn toggle_expanded(
-    ui: &MainWindow,
-    idx: i32,
-    getter: fn(&MainWindow) -> ModelRc<SourceInfo>,
-    setter: fn(&MainWindow, ModelRc<SourceInfo>),
-) {
-    let model = getter(ui);
-    let mut items: Vec<SourceInfo> = (0..model.row_count())
-        .filter_map(|i| model.row_data(i))
-        .collect();
-    if let Some(item) = items.get_mut(idx as usize) {
-        item.expanded = !item.expanded;
-    }
-    setter(ui, ModelRc::new(VecModel::from(items)));
-}
-
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn wire_callbacks(
     ui: &MainWindow,
     app_tx: Sender<AppCommand>,
     ui_tx: Sender<UiEvent>,
-    snapshot_data: Arc<Mutex<Vec<SnapshotRowData>>>,
-    snapshot_selection: Arc<Mutex<SnapshotSelection>>,
-    source_cache: Arc<Mutex<Vec<SourceInfoData>>>,
     cancel_requested: Arc<AtomicBool>,
 ) {
     let tx = app_tx.clone();
@@ -175,61 +122,33 @@ pub(crate) fn wire_callbacks(
 
     {
         let tx = app_tx.clone();
-        let ui_weak = ui.as_weak();
         ui.on_backup_repo_clicked(move |idx| {
-            let Some(ui) = ui_weak.upgrade() else {
-                return;
-            };
-            let labels = ui.global::<AppData>().get_repo_labels();
-            if let Some(name) = labels.row_data(idx as usize) {
-                let _ = tx.send(AppCommand::RunBackupRepo {
-                    repo_name: name.to_string(),
-                });
+            if let Some(name) = ui_state::repo_name_at(idx) {
+                let _ = tx.send(AppCommand::RunBackupRepo { repo_name: name });
             }
         });
     }
 
     {
         let tx = app_tx.clone();
-        let ui_weak = ui.as_weak();
         ui.on_backup_source_clicked(move |idx| {
-            let Some(ui) = ui_weak.upgrade() else {
-                return;
-            };
-            let labels = ui.global::<AppData>().get_source_labels();
-            if let Some(label) = labels.row_data(idx as usize) {
+            if let Some(label) = ui_state::source_label_at(idx) {
                 let _ = tx.send(AppCommand::RunBackupSource {
-                    source_label: label.to_string(),
+                    source_label: label,
                 });
             }
         });
     }
 
     {
-        let ui_weak = ui.as_weak();
         ui.on_toggle_source_expanded(move |idx| {
-            if let Some(ui) = ui_weak.upgrade() {
-                toggle_expanded(
-                    &ui,
-                    idx,
-                    MainWindow::get_source_model,
-                    MainWindow::set_source_model,
-                );
-            }
+            ui_state::toggle_source_expanded(SourceModelScope::All, idx);
         });
     }
 
     {
-        let ui_weak = ui.as_weak();
         ui.on_toggle_repo_source_expanded(move |idx| {
-            if let Some(ui) = ui_weak.upgrade() {
-                toggle_expanded(
-                    &ui,
-                    idx,
-                    MainWindow::get_repo_source_model,
-                    MainWindow::set_repo_source_model,
-                );
-            }
+            ui_state::toggle_source_expanded(SourceModelScope::Repo, idx);
         });
     }
 
@@ -255,7 +174,7 @@ pub(crate) fn wire_callbacks(
         let Some(ui) = ui_weak.upgrade() else {
             return;
         };
-        if let Some(name) = current_repo_name(&ui) {
+        if let Some(name) = ui_state::current_repo_name(&ui) {
             let _ = tx.send(AppCommand::RefreshSnapshots {
                 repo_selector: name,
             });
@@ -268,7 +187,7 @@ pub(crate) fn wire_callbacks(
         let Some(ui) = ui_weak.upgrade() else {
             return;
         };
-        if let Some(name) = current_repo_name(&ui) {
+        if let Some(name) = ui_state::current_repo_name(&ui) {
             let confirmed = tinyfiledialogs::message_box_yes_no(
                 "Prune Snapshots",
                 &format!(
@@ -297,7 +216,6 @@ pub(crate) fn wire_callbacks(
     {
         let tx = app_tx.clone();
         let ui_weak = ui.as_weak();
-        let source_cache = source_cache.clone();
         ui.on_select_repo_and_page(move |repo_idx, page| {
             let Some(ui) = ui_weak.upgrade() else {
                 return;
@@ -307,13 +225,8 @@ pub(crate) fn wire_callbacks(
             ui.set_current_page(page);
 
             if repo_idx != prev_repo {
-                let labels = ui.global::<AppData>().get_repo_labels();
-                if let Some(name) = labels.row_data(repo_idx as usize) {
-                    let repo_name = name.to_string();
-                    if let Ok(cache) = source_cache.lock() {
-                        let model = build_repo_source_model(&cache, Some(repo_name.as_str()));
-                        ui.set_repo_source_model(ModelRc::new(VecModel::from(model)));
-                    }
+                if let Some(repo_name) = ui_state::repo_name_at(repo_idx) {
+                    ui_state::refresh_repo_source_model(Some(repo_name.as_str()));
                     let _ = tx.send(AppCommand::RefreshSnapshots {
                         repo_selector: repo_name,
                     });
@@ -344,7 +257,7 @@ pub(crate) fn wire_callbacks(
                 return;
             };
             let pattern = ui.get_find_name_pattern().to_string();
-            let repo = match current_repo_name(&ui) {
+            let repo = match ui_state::current_repo_name(&ui) {
                 Some(n) => n,
                 None => {
                     ui.set_find_status_text("Please select a repository.".into());
@@ -367,103 +280,48 @@ pub(crate) fn wire_callbacks(
 
     // Snapshot sorting callbacks
     {
-        let sd = snapshot_data.clone();
-        let sel = snapshot_selection.clone();
         let ui_weak = ui.as_weak();
         ui.on_snapshot_sort_ascending(move |col_idx| {
-            sort_snapshot_table(&sd, &sel, &ui_weak, col_idx, true);
+            let Some(ui) = ui_weak.upgrade() else {
+                return;
+            };
+            ui_state::sort_snapshots(&ui, col_idx, true);
         });
     }
     {
-        let sd = snapshot_data.clone();
-        let sel = snapshot_selection.clone();
         let ui_weak = ui.as_weak();
         ui.on_snapshot_sort_descending(move |col_idx| {
-            sort_snapshot_table(&sd, &sel, &ui_weak, col_idx, false);
+            let Some(ui) = ui_weak.upgrade() else {
+                return;
+            };
+            ui_state::sort_snapshots(&ui, col_idx, false);
         });
     }
 
     // Snapshot row click — drives multi-row selection.
     {
-        let sd = snapshot_data.clone();
-        let sel = snapshot_selection.clone();
         let ui_weak = ui.as_weak();
         ui.on_snapshot_row_clicked(move |row, toggle, range| {
             let Some(ui) = ui_weak.upgrade() else {
                 return;
             };
-            let Ok(data) = sd.lock() else {
-                return;
-            };
-            let Ok(mut selection) = sel.lock() else {
-                return;
-            };
-            let len = data.len();
-            if row < 0 || (row as usize) >= len {
-                return;
-            }
-            let row = row as usize;
-            // Resize defensively if the table mutated under us.
-            if selection.selected.len() != len {
-                selection.reset(len);
-            }
-
-            if range && selection.anchor.is_some() {
-                let anchor = selection.anchor.unwrap();
-                let (lo, hi) = if anchor <= row {
-                    (anchor, row)
-                } else {
-                    (row, anchor)
-                };
-                for v in selection.selected.iter_mut() {
-                    *v = false;
-                }
-                for v in &mut selection.selected[lo..=hi] {
-                    *v = true;
-                }
-            } else if toggle {
-                if let Some(slot) = selection.selected.get_mut(row) {
-                    *slot = !*slot;
-                }
-                selection.anchor = Some(row);
-            } else {
-                for v in selection.selected.iter_mut() {
-                    *v = false;
-                }
-                if let Some(slot) = selection.selected.get_mut(row) {
-                    *slot = true;
-                }
-                selection.anchor = Some(row);
-            }
-
-            publish_snapshot_table(&ui, &data, &selection);
+            ui_state::click_snapshot_row(&ui, row, toggle, range);
         });
     }
 
     {
         let tx = app_tx.clone();
-        let sel = snapshot_selection.clone();
-        let ui_weak = ui.as_weak();
         ui.on_restore_selected_snapshot_clicked(move || {
-            let Some(ui) = ui_weak.upgrade() else {
+            let Some(snapshot) = ui_state::single_selected_snapshot() else {
                 return;
-            };
-            let Some(r) = single_selected_index(&sel) else {
-                return;
-            };
-            let ids = ui.global::<AppData>().get_snapshot_ids();
-            let rnames = ui.global::<AppData>().get_snapshot_repo_names();
-            let (snap_name, rname) = match (ids.row_data(r), rnames.row_data(r)) {
-                (Some(id), Some(rn)) => (id.to_string(), rn.to_string()),
-                _ => return,
             };
 
             // Clear stale tree data before showing the window for a new snapshot.
             controllers::restore::clear_file_tree();
 
             if let Some(rw) = controllers::restore::ensure_window(&tx) {
-                rw.set_snapshot_name(snap_name.clone().into());
-                rw.set_repo_name(rname.clone().into());
+                rw.set_snapshot_name(snapshot.snapshot_id.clone().into());
+                rw.set_repo_name(snapshot.repo_name.clone().into());
                 rw.set_status_text("Loading contents...".into());
                 rw.set_tree_rows(ModelRc::new(VecModel::<TreeRowData>::default()));
                 rw.set_selection_text("".into());
@@ -472,79 +330,60 @@ pub(crate) fn wire_callbacks(
             }
 
             let _ = tx.send(AppCommand::FetchSnapshotContents {
-                repo_name: rname,
-                snapshot_name: snap_name,
+                repo_name: snapshot.repo_name,
+                snapshot_name: snapshot.snapshot_id,
             });
         });
     }
 
     {
         let tx = app_tx.clone();
-        let sel = snapshot_selection.clone();
         let ui_weak = ui.as_weak();
         ui.on_mount_selected_snapshot_clicked(move || {
             let Some(ui) = ui_weak.upgrade() else {
                 return;
             };
-            let Some(r) = single_selected_index(&sel) else {
+            let Some(snapshot) = ui_state::single_selected_snapshot() else {
                 return;
-            };
-            let ids = ui.global::<AppData>().get_snapshot_ids();
-            let rnames = ui.global::<AppData>().get_snapshot_repo_names();
-            let (snap_name, rname) = match (ids.row_data(r), rnames.row_data(r)) {
-                (Some(id), Some(rn)) => (id.to_string(), rn.to_string()),
-                _ => return,
             };
             // Optimistically mark active so the Mount buttons disable immediately.
             // MountStarted will set the real URL; MountFailed will clear this.
             ui.set_is_mount_active(true);
             let _ = tx.send(AppCommand::StartMount {
-                repo_name: rname,
-                snapshot_name: Some(snap_name),
+                repo_name: snapshot.repo_name,
+                snapshot_name: Some(snapshot.snapshot_id),
             });
         });
     }
 
     {
         let tx = app_tx.clone();
-        let sel = snapshot_selection.clone();
         let ui_tx = ui_tx.clone();
-        let ui_weak = ui.as_weak();
         ui.on_diff_selected_snapshots_clicked(move || {
-            let Some(ui) = ui_weak.upgrade() else {
+            let Some(snapshots) = ui_state::selected_snapshots(2) else {
                 return;
             };
-            let Some(indices) = selected_indices(&sel, 2) else {
-                return;
-            };
-            let ids = ui.global::<AppData>().get_snapshot_ids();
-            let rnames = ui.global::<AppData>().get_snapshot_repo_names();
-            let Some(first_id) = ids.row_data(indices[0]).map(|s| s.to_string()) else {
-                return;
-            };
-            let Some(second_id) = ids.row_data(indices[1]).map(|s| s.to_string()) else {
-                return;
-            };
-            let Some(first_repo) = rnames.row_data(indices[0]).map(|s| s.to_string()) else {
-                return;
-            };
-            let Some(second_repo) = rnames.row_data(indices[1]).map(|s| s.to_string()) else {
-                return;
-            };
-            if first_repo != second_repo {
+            let first = &snapshots[0];
+            let second = &snapshots[1];
+            if first.repo_name != second.repo_name {
                 send_log(&ui_tx, "Cannot diff snapshots from different repositories.");
                 return;
             }
 
             if let Some(dw) = controllers::diff::ensure_window() {
-                controllers::diff::prepare_loading(&dw, &first_repo, &first_id, &second_id);
+                controllers::diff::prepare_loading(
+                    &dw,
+                    &first.repo_name,
+                    &first.snapshot_id,
+                    &second.snapshot_id,
+                );
                 let _ = dw.show();
             }
 
             let _ = tx.send(AppCommand::DiffSnapshots {
-                repo_name: first_repo,
-                snapshot_a: first_id,
-                snapshot_b: second_id,
+                repo_name: first.repo_name.clone(),
+                snapshot_a: first.snapshot_id.clone(),
+                snapshot_b: second.snapshot_id.clone(),
             });
         });
     }
@@ -570,34 +409,10 @@ pub(crate) fn wire_callbacks(
 
     {
         let tx = app_tx;
-        let sel = snapshot_selection;
-        let ui_weak = ui.as_weak();
         ui.on_delete_selected_snapshots_clicked(move || {
-            let Some(ui) = ui_weak.upgrade() else {
-                return;
-            };
-            let Ok(selection) = sel.lock() else {
-                return;
-            };
-            let ids = ui.global::<AppData>().get_snapshot_ids();
-            let rnames = ui.global::<AppData>().get_snapshot_repo_names();
             // Group by repo so each repo's delete runs as a single batch under
             // one maintenance lock (`commands::delete::run`).
-            let mut by_repo: std::collections::BTreeMap<String, Vec<String>> =
-                std::collections::BTreeMap::new();
-            for (i, sel_flag) in selection.selected.iter().enumerate() {
-                if !*sel_flag {
-                    continue;
-                }
-                let (Some(id), Some(rn)) = (ids.row_data(i), rnames.row_data(i)) else {
-                    continue;
-                };
-                by_repo
-                    .entry(rn.to_string())
-                    .or_default()
-                    .push(id.to_string());
-            }
-            for (repo_name, snapshot_names) in by_repo {
+            for (repo_name, snapshot_names) in ui_state::selected_snapshots_by_repo() {
                 let _ = tx.send(AppCommand::DeleteSnapshots {
                     repo_name,
                     snapshot_names,

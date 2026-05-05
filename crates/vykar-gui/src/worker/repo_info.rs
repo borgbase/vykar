@@ -63,13 +63,13 @@ pub(super) fn handle_fetch_all_repo_info(ctx: &mut WorkerContext) {
         ) {
             Ok(stats) => {
                 items.push(RepoInfoData {
-                    name: repo_name.clone(),
-                    url,
-                    snapshots: stats.snapshot_count.to_string(),
-                    last_snapshot: format_last_snapshot(stats.last_snapshot_time),
-                    size: format_bytes(stats.unique_stored_size),
+                    name: repo_name.clone().into(),
+                    url: url.into(),
+                    snapshots: stats.snapshot_count.to_string().into(),
+                    last_snapshot: format_last_snapshot(stats.last_snapshot_time).into(),
+                    size: format_bytes(stats.unique_stored_size).into(),
                 });
-                labels.push(repo_name);
+                labels.push(repo_name.into());
             }
             Err(e) => {
                 if matches!(e, VykarError::RepoNotFound(_)) {
@@ -177,13 +177,14 @@ pub(super) fn handle_fetch_all_repo_info(ctx: &mut WorkerContext) {
                             retry_pass.as_deref().map(|s| s.as_str()),
                         ) {
                             items.push(RepoInfoData {
-                                name: repo_name.clone(),
-                                url: url.clone(),
-                                snapshots: stats.snapshot_count.to_string(),
-                                last_snapshot: format_last_snapshot(stats.last_snapshot_time),
-                                size: format_bytes(stats.unique_stored_size),
+                                name: repo_name.clone().into(),
+                                url: url.clone().into(),
+                                snapshots: stats.snapshot_count.to_string().into(),
+                                last_snapshot: format_last_snapshot(stats.last_snapshot_time)
+                                    .into(),
+                                size: format_bytes(stats.unique_stored_size).into(),
                             });
-                            labels.push(repo_name);
+                            labels.push(repo_name.into());
                         }
                     } else {
                         send_log(
@@ -256,16 +257,16 @@ pub(super) fn handle_refresh_snapshots(ctx: &mut WorkerContext, repo_selector: S
                         None => ("-".to_string(), "-".to_string(), None, None),
                     };
                     data.push(SnapshotRowData {
-                        id: s.name.clone(),
-                        hostname,
-                        time_str: ts.format("%Y-%m-%d %H:%M").to_string(),
-                        label,
-                        files,
-                        size,
+                        id: s.name.clone().into(),
+                        hostname: hostname.into(),
+                        time_str: ts.format("%Y-%m-%d %H:%M").to_string().into(),
+                        label: label.into(),
+                        files: files.into(),
+                        size: size.into(),
                         nfiles,
                         size_bytes,
                         time_epoch: s.time.timestamp(),
-                        repo_name: repo_name.clone(),
+                        repo_name: repo_name.clone().into(),
                     });
                 }
             }

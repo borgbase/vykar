@@ -1,14 +1,10 @@
-use std::sync::{Arc, Mutex};
-
 use crossbeam_channel::Sender;
-use slint::{ComponentHandle, Model, ModelRc, SharedString, StandardListViewItem, VecModel};
+use slint::{ModelRc, SharedString, StandardListViewItem, VecModel};
 use vykar_core::config::ResolvedRepo;
 
-use crate::messages::{
-    FindSnapshotGroup, SnapshotRowData, SnapshotSelection, SourceInfoData, UiEvent,
-};
+use crate::messages::{FindSnapshotGroup, SourceInfoData, UiEvent};
 use crate::repo_helpers::format_repo_name;
-use crate::{AppData, FindSnapshotGroup as UiFindSnapshotGroup, MainWindow, SourceInfo};
+use crate::{FindSnapshotGroup as UiFindSnapshotGroup, SourceInfo};
 
 pub(crate) fn to_table_model(rows: Vec<Vec<String>>) -> ModelRc<ModelRc<StandardListViewItem>> {
     let outer: Vec<ModelRc<StandardListViewItem>> = rows
@@ -45,111 +41,16 @@ pub(crate) fn to_find_groups_model(groups: Vec<FindSnapshotGroup>) -> ModelRc<Ui
     ModelRc::new(VecModel::from(items))
 }
 
-pub(crate) fn to_string_model(items: Vec<String>) -> ModelRc<SharedString> {
-    let shared: Vec<SharedString> = items.into_iter().map(SharedString::from).collect();
-    ModelRc::new(VecModel::from(shared))
-}
-
-/// Glyph prefixed onto the ID cell when a snapshot row is selected.
-const SELECTED_PREFIX: &str = "● ";
-
-/// Build the snapshot table rows, prefixing the ID cell with a marker glyph
-/// for selected rows. `selected` may be shorter than `data` (treated as
-/// "not selected" for missing indices).
-pub(crate) fn build_snapshot_table_rows(
-    data: &[SnapshotRowData],
-    selected: &[bool],
-) -> Vec<Vec<String>> {
-    data.iter()
-        .enumerate()
-        .map(|(i, d)| {
-            let id = if selected.get(i).copied().unwrap_or(false) {
-                format!("{SELECTED_PREFIX}{}", d.id)
-            } else {
-                d.id.clone()
-            };
-            vec![
-                id,
-                d.time_str.clone(),
-                d.hostname.clone(),
-                d.label.clone(),
-                d.files.clone(),
-                d.size.clone(),
-            ]
-        })
+pub(crate) fn collect_repo_names(repos: &[ResolvedRepo]) -> Vec<SharedString> {
+    repos
+        .iter()
+        .map(|repo| SharedString::from(format_repo_name(repo)))
         .collect()
-}
-
-/// Push the snapshot table data to the UI: AppData id/repo lists, the rows
-/// model (with selection prefix), and the selection count badge.
-pub(crate) fn publish_snapshot_table(
-    ui: &MainWindow,
-    data: &[SnapshotRowData],
-    selection: &SnapshotSelection,
-) {
-    let ids: Vec<String> = data.iter().map(|d| d.id.clone()).collect();
-    let rnames: Vec<String> = data.iter().map(|d| d.repo_name.clone()).collect();
-    ui.global::<AppData>()
-        .set_snapshot_ids(to_string_model(ids));
-    ui.global::<AppData>()
-        .set_snapshot_repo_names(to_string_model(rnames));
-
-    let rows = build_snapshot_table_rows(data, &selection.selected);
-    ui.set_snapshot_rows(to_table_model(rows));
-    ui.set_snapshot_selected_count(selection.count());
-}
-
-pub(crate) fn sort_snapshot_table(
-    sd: &Arc<Mutex<Vec<SnapshotRowData>>>,
-    sel: &Arc<Mutex<SnapshotSelection>>,
-    ui_weak: &slint::Weak<MainWindow>,
-    col_idx: i32,
-    ascending: bool,
-) {
-    let Some(ui) = ui_weak.upgrade() else {
-        return;
-    };
-    let Ok(mut data) = sd.lock() else {
-        return;
-    };
-
-    // Columns: 0=ID, 1=Time, 2=Host, 3=Label, 4=Files, 5=Size
-    match col_idx {
-        0 => data.sort_by(|a, b| a.id.cmp(&b.id)),
-        1 => data.sort_by_key(|a| a.time_epoch),
-        2 => data.sort_by(|a, b| a.hostname.cmp(&b.hostname)),
-        3 => data.sort_by(|a, b| a.label.cmp(&b.label)),
-        4 => data.sort_by(|a, b| match (a.nfiles, b.nfiles) {
-            (Some(a), Some(b)) => a.cmp(&b),
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => std::cmp::Ordering::Equal,
-        }),
-        5 => data.sort_by(|a, b| match (a.size_bytes, b.size_bytes) {
-            (Some(a), Some(b)) => a.cmp(&b),
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => std::cmp::Ordering::Equal,
-        }),
-        _ => return,
-    }
-    if !ascending {
-        data.reverse();
-    }
-
-    if let Ok(mut selection) = sel.lock() {
-        selection.reset(data.len());
-        publish_snapshot_table(&ui, &data, &selection);
-    }
-}
-
-pub(crate) fn collect_repo_names(repos: &[ResolvedRepo]) -> Vec<String> {
-    repos.iter().map(format_repo_name).collect()
 }
 
 pub(crate) fn build_source_model_data(
     repos: &[ResolvedRepo],
-) -> (Vec<SourceInfoData>, Vec<String>) {
+) -> (Vec<SourceInfoData>, Vec<SharedString>) {
     let mut seen = std::collections::HashSet::new();
     let mut items = Vec::new();
     let mut labels = Vec::new();
@@ -213,55 +114,46 @@ pub(crate) fn build_source_model_data(
             }
 
             items.push(SourceInfoData {
-                label: source.label.clone(),
-                paths: source.paths.join(", "),
-                excludes: source.exclude.join(", "),
-                target_repos: target,
+                label: source.label.clone().into(),
+                paths: source.paths.join(", ").into(),
+                excludes: source.exclude.join(", ").into(),
+                target_repos: target.into(),
                 target_repo_names: source.repos.clone(),
-                detail_paths: source.paths.join("\n"),
-                detail_excludes: source.exclude.join("\n"),
-                detail_exclude_if_present: source.exclude_if_present.join("\n"),
-                detail_flags: flags.join(", "),
-                detail_hooks: hooks_lines.join("\n"),
-                detail_retention: retention_parts.join(", "),
+                detail_paths: source.paths.join("\n").into(),
+                detail_excludes: source.exclude.join("\n").into(),
+                detail_exclude_if_present: source.exclude_if_present.join("\n").into(),
+                detail_flags: flags.join(", ").into(),
+                detail_hooks: hooks_lines.join("\n").into(),
+                detail_retention: retention_parts.join(", ").into(),
                 detail_command_dumps: source
                     .command_dumps
                     .iter()
                     .map(|d| format!("{}: {}", d.name, d.command))
                     .collect::<Vec<_>>()
-                    .join("\n"),
+                    .join("\n")
+                    .into(),
             });
-            labels.push(source.label.clone());
+            labels.push(source.label.clone().into());
         }
     }
 
     (items, labels)
 }
 
-/// Look up the currently selected repo name from AppData.repo_labels.
-pub(crate) fn current_repo_name(ui: &MainWindow) -> Option<String> {
-    let idx = ui.get_current_repo_index();
-    if idx < 0 {
-        return None;
-    }
-    let labels = ui.global::<AppData>().get_repo_labels();
-    labels.row_data(idx as usize).map(|s| s.to_string())
-}
-
 fn source_info_from_data(d: &SourceInfoData) -> SourceInfo {
     SourceInfo {
-        label: d.label.clone().into(),
-        paths: d.paths.clone().into(),
-        excludes: d.excludes.clone().into(),
-        target_repos: d.target_repos.clone().into(),
+        label: d.label.clone(),
+        paths: d.paths.clone(),
+        excludes: d.excludes.clone(),
+        target_repos: d.target_repos.clone(),
         expanded: false,
-        detail_paths: d.detail_paths.clone().into(),
-        detail_excludes: d.detail_excludes.clone().into(),
-        detail_exclude_if_present: d.detail_exclude_if_present.clone().into(),
-        detail_flags: d.detail_flags.clone().into(),
-        detail_hooks: d.detail_hooks.clone().into(),
-        detail_retention: d.detail_retention.clone().into(),
-        detail_command_dumps: d.detail_command_dumps.clone().into(),
+        detail_paths: d.detail_paths.clone(),
+        detail_excludes: d.detail_excludes.clone(),
+        detail_exclude_if_present: d.detail_exclude_if_present.clone(),
+        detail_flags: d.detail_flags.clone(),
+        detail_hooks: d.detail_hooks.clone(),
+        detail_retention: d.detail_retention.clone(),
+        detail_command_dumps: d.detail_command_dumps.clone(),
     }
 }
 
@@ -295,18 +187,18 @@ mod tests {
 
     fn source(label: &str, target_repo_names: &[&str]) -> SourceInfoData {
         SourceInfoData {
-            label: label.to_string(),
-            paths: String::new(),
-            excludes: String::new(),
-            target_repos: target_repo_names.join(", "),
+            label: label.into(),
+            paths: SharedString::default(),
+            excludes: SharedString::default(),
+            target_repos: target_repo_names.join(", ").into(),
             target_repo_names: target_repo_names.iter().map(|s| (*s).to_string()).collect(),
-            detail_paths: String::new(),
-            detail_excludes: String::new(),
-            detail_exclude_if_present: String::new(),
-            detail_flags: String::new(),
-            detail_hooks: String::new(),
-            detail_retention: String::new(),
-            detail_command_dumps: String::new(),
+            detail_paths: SharedString::default(),
+            detail_excludes: SharedString::default(),
+            detail_exclude_if_present: SharedString::default(),
+            detail_flags: SharedString::default(),
+            detail_hooks: SharedString::default(),
+            detail_retention: SharedString::default(),
+            detail_command_dumps: SharedString::default(),
         }
     }
 

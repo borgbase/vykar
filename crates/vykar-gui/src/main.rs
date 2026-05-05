@@ -22,11 +22,10 @@ mod scheduler;
 mod state;
 mod tray;
 mod tray_state;
+mod ui_state;
 mod view_models;
 mod worker;
-use messages::{
-    log_entry_now, AppCommand, SnapshotRowData, SnapshotSelection, SourceInfoData, UiEvent,
-};
+use messages::{log_entry_now, AppCommand, UiEvent};
 use repo_helpers::send_log;
 
 const APP_TITLE: &str = "Vykar Backup";
@@ -60,10 +59,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         gui_state.start_in_background.unwrap_or(false),
     ));
 
-    // Last captured GUI state — updated on every window hide so we have a valid
-    // snapshot even if the window is already destroyed when the process exits.
-    let last_gui_state: Arc<Mutex<Option<state::GuiState>>> = Arc::new(Mutex::new(None));
-
     let (app_tx, app_rx) = crossbeam_channel::unbounded::<AppCommand>();
     let (ui_tx, ui_rx) = crossbeam_channel::unbounded::<UiEvent>();
 
@@ -96,12 +91,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(p) = gui_state.last_page {
         ui.set_current_page(state::page_from_i32(p));
     }
-    // Selection is resolved by name once RepoModelData arrives — see
-    // event_consumer. Holding the name here avoids the stale-index bug where
-    // repo filtering (failed loads, reordering, renames) leaves the saved
-    // index pointing at the wrong row.
-    let pending_repo_name: Arc<Mutex<Option<String>>> =
-        Arc::new(Mutex::new(gui_state.last_repo_name.clone()));
+    // Selection is resolved by name once RepoModelData arrives. Holding the
+    // name in UI-thread state avoids the stale-index bug where repo filtering
+    // leaves the saved index pointing at the wrong row.
+    ui_state::install(&ui, gui_state.last_repo_name.clone());
     ui.set_config_path("(loading...)".into());
     ui.set_editor_font_family(
         if cfg!(target_os = "macos") {
@@ -191,33 +184,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // snapshot_data stays as Arc<Mutex> — complex Rust struct used by sort_snapshot_table.
-    let snapshot_data: Arc<Mutex<Vec<SnapshotRowData>>> = Arc::new(Mutex::new(Vec::new()));
-
-    // Multi-row selection state for the Snapshots table; index-aligned with snapshot_data.
-    let snapshot_selection: Arc<Mutex<SnapshotSelection>> =
-        Arc::new(Mutex::new(SnapshotSelection::default()));
-
-    // Raw source data, used to rebuild the per-repo filtered source model
-    // when the selected repo changes.
-    let source_cache: Arc<Mutex<Vec<SourceInfoData>>> = Arc::new(Mutex::new(Vec::new()));
-
     // ── Event consumer ──
 
-    let tray_source_items: Arc<Mutex<Vec<(tray_icon::menu::MenuId, String)>>> =
-        Arc::new(Mutex::new(Vec::new()));
+    let (tray_source_tx, tray_source_rx) =
+        crossbeam_channel::unbounded::<Vec<(tray_icon::menu::MenuId, String)>>();
 
     event_consumer::spawn(
         ui_rx,
         ui.as_weak(),
         app_tx.clone(),
-        snapshot_data.clone(),
-        snapshot_selection.clone(),
-        source_cache.clone(),
-        last_gui_state.clone(),
-        tray_source_items.clone(),
+        tray_source_tx,
         start_in_background_pref.clone(),
-        pending_repo_name.clone(),
     );
 
     // ── Callback wiring ──
@@ -226,9 +203,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         &ui,
         app_tx.clone(),
         ui_tx_for_cancel.clone(),
-        snapshot_data,
-        snapshot_selection,
-        source_cache,
         cancel_requested.clone(),
     );
 
@@ -278,20 +252,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     ui.on_start_in_background_toggled({
         let pref = start_in_background_pref.clone();
         let ui_weak = ui.as_weak();
-        let last = last_gui_state.clone();
-        let pending = pending_repo_name.clone();
         move |checked| {
             pref.store(checked, Ordering::Relaxed);
             // Capture live UI state so we never overwrite config_path / window
             // size with stale or default values.
             if let Some(s) = ui_weak
                 .upgrade()
-                .and_then(|ui| event_consumer::capture_gui_state(&ui, &pref, &pending))
+                .and_then(|ui| event_consumer::capture_gui_state(&ui, &pref))
             {
                 state::save(&s);
-                if let Ok(mut guard) = last.lock() {
-                    *guard = Some(s);
-                }
+                ui_state::set_last_gui_state(s);
             }
         }
     });
@@ -300,16 +270,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     ui.window().on_close_requested({
         let ui_weak = ui.as_weak();
-        let last_gui_state = last_gui_state.clone();
         let pref = start_in_background_pref.clone();
-        let pending = pending_repo_name.clone();
         move || {
             if let Some(ui) = ui_weak.upgrade() {
-                if let Some(s) = event_consumer::capture_gui_state(&ui, &pref, &pending) {
+                if let Some(s) = event_consumer::capture_gui_state(&ui, &pref) {
                     state::save(&s);
-                    if let Ok(mut last) = last_gui_state.lock() {
-                        *last = Some(s);
-                    }
+                    ui_state::set_last_gui_state(s);
                 }
                 ui.invoke_release_focus();
                 let _ = ui.hide();
@@ -320,16 +286,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     ui.on_close_window({
         let ui_weak = ui.as_weak();
-        let last_gui_state = last_gui_state.clone();
         let pref = start_in_background_pref.clone();
-        let pending = pending_repo_name.clone();
         move || {
             if let Some(ui) = ui_weak.upgrade() {
-                if let Some(s) = event_consumer::capture_gui_state(&ui, &pref, &pending) {
+                if let Some(s) = event_consumer::capture_gui_state(&ui, &pref) {
                     state::save(&s);
-                    if let Ok(mut last) = last_gui_state.lock() {
-                        *last = Some(s);
-                    }
+                    ui_state::set_last_gui_state(s);
                 }
                 ui.invoke_release_focus();
                 let _ = ui.hide();
@@ -341,37 +303,50 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     {
         let tx = app_tx.clone();
-        let tray_source_items = tray_source_items.clone();
         let cancel = cancel_requested.clone();
         let log_tx = ui_tx_for_cancel.clone();
         let backup_running = backup_running.clone();
         thread::spawn(move || {
             let menu_rx = MenuEvent::receiver();
-            while let Ok(event) = menu_rx.recv() {
-                if event.id == open_item_id {
-                    // Bypass the worker queue so the tray stays responsive even
-                    // while the worker is busy (e.g. initial FetchAllRepoInfo).
-                    let _ = log_tx.send(UiEvent::ShowWindow);
-                } else if event.id == run_now_item_id {
-                    let _ = tx.send(AppCommand::RunBackupAll { scheduled: false });
-                } else if event.id == cancel_item_id {
-                    if !backup_running.load(Ordering::SeqCst) {
-                        send_log(&log_tx, "No backup running.");
-                        continue;
+            let mut tray_source_items: Vec<(tray_icon::menu::MenuId, String)> = Vec::new();
+            loop {
+                crossbeam_channel::select! {
+                    recv(menu_rx) -> event => {
+                        let Ok(event) = event else {
+                            break;
+                        };
+                        if event.id == open_item_id {
+                            // Bypass the worker queue so the tray stays responsive even
+                            // while the worker is busy (e.g. initial FetchAllRepoInfo).
+                            let _ = log_tx.send(UiEvent::ShowWindow);
+                        } else if event.id == run_now_item_id {
+                            let _ = tx.send(AppCommand::RunBackupAll { scheduled: false });
+                        } else if event.id == cancel_item_id {
+                            if !backup_running.load(Ordering::SeqCst) {
+                                send_log(&log_tx, "No backup running.");
+                                continue;
+                            }
+                            cancel.store(true, Ordering::SeqCst);
+                            send_log(
+                                &log_tx,
+                                "Cancel requested; Vykar will stop when the current file, upload, or storage operation returns.",
+                            );
+                        } else if event.id == quit_item_id {
+                            let _ = log_tx.send(UiEvent::Quit);
+                            break;
+                        } else if let Some((_, label)) =
+                            tray_source_items.iter().find(|(id, _)| *id == event.id)
+                        {
+                            let _ = tx.send(AppCommand::RunBackupSource {
+                                source_label: label.clone(),
+                            });
+                        }
                     }
-                    cancel.store(true, Ordering::SeqCst);
-                    send_log(
-                        &log_tx,
-                        "Cancel requested; Vykar will stop when the current file, upload, or storage operation returns.",
-                    );
-                } else if event.id == quit_item_id {
-                    let _ = log_tx.send(UiEvent::Quit);
-                    break;
-                } else if let Ok(items) = tray_source_items.lock() {
-                    if let Some((_, label)) = items.iter().find(|(id, _)| *id == event.id) {
-                        let _ = tx.send(AppCommand::RunBackupSource {
-                            source_label: label.clone(),
-                        });
+                    recv(tray_source_rx) -> items => {
+                        match items {
+                            Ok(items) => tray_source_items = items,
+                            Err(_) => break,
+                        }
                     }
                 }
             }
@@ -386,9 +361,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Persist GUI state. Eager saves (config change, window hide) cover most
     // paths; this final capture handles Cmd-Q on macOS where the event loop
     // exits without triggering on_close_requested.
-    let final_state =
-        event_consumer::capture_gui_state(&ui, &start_in_background_pref, &pending_repo_name)
-            .or_else(|| last_gui_state.lock().ok().and_then(|g| g.clone()));
+    let final_state = event_consumer::capture_gui_state(&ui, &start_in_background_pref)
+        .or_else(ui_state::last_gui_state);
     if let Some(s) = final_state {
         state::save(&s);
     }

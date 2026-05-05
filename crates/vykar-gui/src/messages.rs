@@ -1,4 +1,5 @@
 use chrono::Local;
+use slint::SharedString;
 use vykar_core::commands::diff::DiffChangeKind;
 use vykar_core::snapshot::item::Item;
 
@@ -78,11 +79,11 @@ pub(crate) enum AppCommand {
 
 #[derive(Debug, Clone)]
 pub(crate) struct RepoInfoData {
-    pub name: String,
-    pub url: String,
-    pub snapshots: String,
-    pub last_snapshot: String,
-    pub size: String,
+    pub name: SharedString,
+    pub url: SharedString,
+    pub snapshots: SharedString,
+    pub last_snapshot: SharedString,
+    pub size: SharedString,
 }
 
 /// Multi-row selection state for the Snapshots table. Indices align with
@@ -107,33 +108,33 @@ impl SnapshotSelection {
 
 #[derive(Debug, Clone)]
 pub(crate) struct SnapshotRowData {
-    pub id: String,
-    pub hostname: String,
-    pub time_str: String,
-    pub label: String,
-    pub files: String,
-    pub size: String,
+    pub id: SharedString,
+    pub hostname: SharedString,
+    pub time_str: SharedString,
+    pub label: SharedString,
+    pub files: SharedString,
+    pub size: SharedString,
     pub nfiles: Option<u64>,
     pub size_bytes: Option<u64>,
     pub time_epoch: i64,
-    pub repo_name: String,
+    pub repo_name: SharedString,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct SourceInfoData {
-    pub label: String,
-    pub paths: String,
-    pub excludes: String,
-    pub target_repos: String,
+    pub label: SharedString,
+    pub paths: SharedString,
+    pub excludes: SharedString,
+    pub target_repos: SharedString,
     /// Resolved list of repo names the source targets. Empty means "all repos".
     pub target_repo_names: Vec<String>,
-    pub detail_paths: String,
-    pub detail_excludes: String,
-    pub detail_exclude_if_present: String,
-    pub detail_flags: String,
-    pub detail_hooks: String,
-    pub detail_retention: String,
-    pub detail_command_dumps: String,
+    pub detail_paths: SharedString,
+    pub detail_excludes: SharedString,
+    pub detail_exclude_if_present: SharedString,
+    pub detail_flags: SharedString,
+    pub detail_hooks: SharedString,
+    pub detail_retention: SharedString,
+    pub detail_command_dumps: SharedString,
 }
 
 #[derive(Debug, Clone)]
@@ -174,14 +175,14 @@ pub(crate) enum UiEvent {
         path: String,
         schedule_brief: String,
     },
-    RepoNames(Vec<String>),
+    RepoNames(Vec<SharedString>),
     RepoModelData {
         items: Vec<RepoInfoData>,
-        labels: Vec<String>,
+        labels: Vec<SharedString>,
     },
     SourceModelData {
         items: Vec<SourceInfoData>,
-        labels: Vec<String>,
+        labels: Vec<SharedString>,
     },
     SnapshotTableData {
         data: Vec<SnapshotRowData>,

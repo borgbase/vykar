@@ -11,6 +11,7 @@ use tiny_http::{Header, Method, Response, Server};
 
 use super::render::render_html;
 use super::status::SharedStatus;
+use crate::error::{CliError, CliResult};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
@@ -18,8 +19,9 @@ pub(crate) fn spawn(
     addr: SocketAddr,
     status: SharedStatus,
     shutdown: &'static AtomicBool,
-) -> Result<std::thread::JoinHandle<()>, Box<dyn std::error::Error>> {
-    let server = Server::http(addr).map_err(|e| format!("HTTP bind {addr} failed: {e}"))?;
+) -> CliResult<std::thread::JoinHandle<()>> {
+    let server =
+        Server::http(addr).map_err(|e| CliError::from(format!("HTTP bind {addr} failed: {e}")))?;
     tracing::info!(%addr, "read-only status page listening");
 
     let handle = std::thread::Builder::new()
@@ -49,10 +51,7 @@ fn run_loop(server: Server, status: SharedStatus, shutdown: &'static AtomicBool)
     tracing::debug!("http thread exiting");
 }
 
-fn handle_request(
-    req: tiny_http::Request,
-    status: &SharedStatus,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn handle_request(req: tiny_http::Request, status: &SharedStatus) -> CliResult<()> {
     if !matches!(req.method(), Method::Get | Method::Head) {
         let resp = Response::from_string("method not allowed").with_status_code(405);
         return Ok(req.respond(resp)?);
@@ -72,10 +71,7 @@ fn header(name: &str, value: &str) -> Header {
         .expect("static header literals are always valid")
 }
 
-fn respond_html(
-    req: tiny_http::Request,
-    status: &SharedStatus,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn respond_html(req: tiny_http::Request, status: &SharedStatus) -> CliResult<()> {
     let snapshot = status.read().expect("status lock poisoned").clone();
     let body = render_html(&snapshot);
     let resp = Response::from_string(body)
@@ -84,10 +80,7 @@ fn respond_html(
     Ok(req.respond(resp)?)
 }
 
-fn respond_json(
-    req: tiny_http::Request,
-    status: &SharedStatus,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn respond_json(req: tiny_http::Request, status: &SharedStatus) -> CliResult<()> {
     let snapshot = status.read().expect("status lock poisoned").clone();
     let body = serde_json::to_string(&snapshot)?;
     let resp = Response::from_string(body)
@@ -96,11 +89,7 @@ fn respond_json(
     Ok(req.respond(resp)?)
 }
 
-fn respond_text(
-    req: tiny_http::Request,
-    code: u16,
-    body: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn respond_text(req: tiny_http::Request, code: u16, body: &str) -> CliResult<()> {
     let resp = Response::from_string(body)
         .with_status_code(code)
         .with_header(header("Content-Type", "text/plain; charset=utf-8"));

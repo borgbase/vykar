@@ -1,5 +1,7 @@
-pub(crate) fn parse_size(s: &str) -> Result<u64, Box<dyn std::error::Error>> {
-    vykar_common::display::parse_size(s).map_err(|e| e.into())
+use crate::error::CliResult;
+
+pub(crate) fn parse_size(s: &str) -> CliResult<u64> {
+    Ok(vykar_common::display::parse_size(s)?)
 }
 
 pub(crate) use vykar_common::display::{format_bytes, format_count};

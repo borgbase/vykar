@@ -4,17 +4,17 @@ use chrono::Utc;
 use vykar_core::config::VykarConfig;
 use vykar_core::repo::lock;
 
+use crate::error::{CliError, CliResult};
+
 pub(crate) fn run_break_lock(
     config: &VykarConfig,
     _label: Option<&str>,
     sessions: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> CliResult<()> {
     let storage =
-        vykar_core::storage::backend_from_config(&config.repository, config.limits.connections)
-            .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
+        vykar_core::storage::backend_from_config(&config.repository, config.limits.connections)?;
 
-    let removed = lock::break_lock(storage.as_ref())
-        .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
+    let removed = lock::break_lock(storage.as_ref())?;
 
     if removed == 0 {
         println!("No locks found.");
@@ -29,11 +29,8 @@ pub(crate) fn run_break_lock(
     Ok(())
 }
 
-fn clear_sessions(
-    storage: &dyn vykar_storage::StorageBackend,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let entries = lock::list_session_entries(storage)
-        .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
+fn clear_sessions(storage: &dyn vykar_storage::StorageBackend) -> CliResult<()> {
+    let entries = lock::list_session_entries(storage)?;
 
     if entries.is_empty() {
         println!("No active sessions found.");
@@ -55,9 +52,9 @@ fn clear_sessions(
     eprintln!("WARNING: Removing sessions may interrupt live backups on other machines.");
 
     if !std::io::stdin().is_terminal() {
-        return Err(
-            "refusing to remove sessions without confirmation in non-interactive mode".into(),
-        );
+        return Err(CliError::from(
+            "refusing to remove sessions without confirmation in non-interactive mode",
+        ));
     }
 
     eprint!("Remove all sessions? [y/N]: ");
@@ -69,8 +66,7 @@ fn clear_sessions(
         return Ok(());
     }
 
-    let removed = lock::clear_all_sessions(storage)
-        .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
+    let removed = lock::clear_all_sessions(storage)?;
     println!("Removed {removed} session file(s).");
     Ok(())
 }

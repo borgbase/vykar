@@ -4,6 +4,10 @@ version = "0.15.0"
 edition = "2021"
 license = "GPL-3.0-only"
 
+[lib]
+name = "vykar_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "vykar"
 path = "src/main.rs"
@@ -19,6 +23,7 @@ vykar-storage.workspace = true
 clap.workspace = true
 serde.workspace = true
 serde_yaml.workspace = true
+thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 comfy-table = "7"

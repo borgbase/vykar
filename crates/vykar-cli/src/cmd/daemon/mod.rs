@@ -15,6 +15,7 @@ use vykar_core::app::RuntimeConfig;
 use vykar_core::config::{self, ConfigSource, EncryptionModeConfig, ResolvedRepo, ScheduleConfig};
 
 use crate::dispatch::{local_repo_unavailable, run_default_actions, warn_if_untrusted_rest};
+use crate::error::{CliError, CliResult};
 use crate::signal::{RELOAD, SHUTDOWN, TRIGGER};
 
 use status::SharedStatus;
@@ -43,13 +44,11 @@ fn release_malloc_arenas() {}
 /// Returns the resolved repos and merged schedule, or an error describing
 /// what went wrong (suitable for both fatal startup errors and non-fatal
 /// reload rejections).
-fn load_daemon_config(
-    source: &ConfigSource,
-) -> Result<(Vec<ResolvedRepo>, ScheduleConfig), Box<dyn std::error::Error>> {
+fn load_daemon_config(source: &ConfigSource) -> CliResult<(Vec<ResolvedRepo>, ScheduleConfig)> {
     let repos = config::load_and_resolve(source.path())?;
 
     if repos.is_empty() {
-        return Err("no repositories configured".into());
+        return Err(CliError::from("no repositories configured"));
     }
 
     let runtime = RuntimeConfig {
@@ -59,9 +58,9 @@ fn load_daemon_config(
     let schedule = runtime.schedule();
 
     if !schedule.enabled {
-        return Err(
-            "schedule.enabled is false; set it to true in your config to use daemon mode".into(),
-        );
+        return Err(CliError::from(
+            "schedule.enabled is false; set it to true in your config to use daemon mode",
+        ));
     }
 
     // Pre-validate passphrases for encrypted repos
@@ -71,13 +70,15 @@ fn load_daemon_config(
             match configured_passphrase(&repo.config) {
                 Ok(Some(_)) => {}
                 Ok(None) => {
-                    return Err(format!(
+                    return Err(CliError::from(format!(
                         "encrypted repository '{label}' has no non-interactive passphrase source; \
                          configure encryption.passcommand, encryption.passphrase, or set VYKAR_PASSPHRASE"
-                    ).into());
+                    )));
                 }
                 Err(e) => {
-                    return Err(format!("failed to validate passphrase for '{label}': {e}").into());
+                    return Err(CliError::from(format!(
+                        "failed to validate passphrase for '{label}': {e}"
+                    )));
                 }
             }
         }
@@ -86,12 +87,10 @@ fn load_daemon_config(
     Ok((runtime.repos, schedule))
 }
 
-pub(crate) fn run_daemon(
-    source: ConfigSource,
-    http_listen: Option<SocketAddr>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let _lock = SchedulerLock::try_acquire()
-        .ok_or("another vykar scheduler is already running (daemon or GUI); exiting")?;
+pub(crate) fn run_daemon(source: ConfigSource, http_listen: Option<SocketAddr>) -> CliResult<()> {
+    let _lock = SchedulerLock::try_acquire().ok_or_else(|| {
+        CliError::from("another vykar scheduler is already running (daemon or GUI); exiting")
+    })?;
 
     let (mut repos, mut schedule) = load_daemon_config(&source)?;
 
@@ -142,7 +141,7 @@ pub(crate) fn run_daemon(
 
     status::touch_process(&status, started_at, Some(next_run));
 
-    let exit_result: Result<(), Box<dyn std::error::Error>> = loop {
+    let exit_result: CliResult<()> = loop {
         if SHUTDOWN.load(Ordering::SeqCst) {
             tracing::info!("shutdown signal received, exiting");
             break Ok(());

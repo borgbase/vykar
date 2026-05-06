@@ -5,24 +5,36 @@ use vykar_core::app::operations::{self, BackupRunEvent};
 use vykar_core::compress::Compression;
 use vykar_core::config::{self, CompressionAlgorithm, ResolvedRepo, SourceEntry};
 
+use crate::error::{CliError, CliResult};
 use crate::format::print_backup_stats;
 use crate::passphrase::with_repo_passphrase;
 use crate::progress::BackupProgressRenderer;
 
+pub(crate) struct BackupRunOpts<'a> {
+    pub user_label: Option<String>,
+    pub compression_override: Option<String>,
+    pub connections: Option<usize>,
+    pub threads: Option<usize>,
+    pub paths: Vec<String>,
+    pub source_filter: &'a [String],
+    pub shutdown: Option<&'a AtomicBool>,
+    pub verbose: u8,
+}
+
 /// Returns `Ok(true)` if the backup completed with partial success (some files skipped),
 /// `Ok(false)` for full success.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn run_backup(
-    repo: &ResolvedRepo,
-    user_label: Option<String>,
-    compression_override: Option<String>,
-    connections: Option<usize>,
-    threads: Option<usize>,
-    paths: Vec<String>,
-    source_filter: &[String],
-    shutdown: Option<&AtomicBool>,
-    verbose: u8,
-) -> Result<bool, Box<dyn std::error::Error>> {
+pub(crate) fn run_backup(repo: &ResolvedRepo, opts: BackupRunOpts<'_>) -> CliResult<bool> {
+    let BackupRunOpts {
+        user_label,
+        compression_override,
+        connections,
+        threads,
+        paths,
+        source_filter,
+        shutdown,
+        verbose,
+    } = opts;
+
     // Clone repo and apply overrides
     let mut repo = repo.clone();
     if let Some(c) = connections {
@@ -39,7 +51,7 @@ pub(crate) fn run_backup(
             "none" => CompressionAlgorithm::None,
             "lz4" => CompressionAlgorithm::Lz4,
             "zstd" => CompressionAlgorithm::Zstd,
-            _ => return Err(format!("unsupported compression: {algo}").into()),
+            _ => return Err(CliError::from(format!("unsupported compression: {algo}"))),
         };
     }
 
@@ -50,11 +62,11 @@ pub(crate) fn run_backup(
         let show_progress = is_tty || verbose > 0;
 
         if !source_filter.is_empty() && !paths.is_empty() {
-            return Err("cannot combine --source with ad-hoc paths".into());
+            return Err(CliError::from("cannot combine --source with ad-hoc paths"));
         }
 
         if user_label.is_some() && paths.is_empty() {
-            return Err("--label can only be used with ad-hoc paths".into());
+            return Err(CliError::from("--label can only be used with ad-hoc paths"));
         }
 
         // Resolve sources — configured, filtered, or synthesized from ad-hoc paths
@@ -81,10 +93,11 @@ pub(crate) fn run_backup(
                 command_dumps: Vec::new(),
             }]
         } else if repo.sources.is_empty() {
-            return Err("no sources configured and no paths specified".into());
+            return Err(CliError::from(
+                "no sources configured and no paths specified",
+            ));
         } else if !source_filter.is_empty() {
-            config::select_sources(&repo.sources, source_filter)
-                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?
+            config::select_sources(&repo.sources, source_filter)?
                 .into_iter()
                 .cloned()
                 .collect()
@@ -124,7 +137,7 @@ pub(crate) fn run_backup(
             r.finish();
         }
 
-        let report = result.map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
+        let report = result?;
 
         let mut had_partial = false;
         for created in &report.created {

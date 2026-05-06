@@ -4,6 +4,7 @@ use std::sync::atomic::AtomicBool;
 use vykar_core::commands;
 use vykar_core::config::VykarConfig;
 
+use crate::error::{CliError, CliResult};
 use crate::format::format_bytes;
 use crate::passphrase::with_repo_passphrase;
 
@@ -13,11 +14,12 @@ pub(crate) fn run_delete(
     snapshot_names: &[String],
     dry_run: bool,
     shutdown: Option<&AtomicBool>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> CliResult<()> {
     let name_refs: Vec<&str> = snapshot_names.iter().map(|s| s.as_str()).collect();
     let result = with_repo_passphrase(config, label, |passphrase| {
-        commands::delete::run(config, passphrase, &name_refs, dry_run, shutdown)
-            .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })
+        Ok(commands::delete::run(
+            config, passphrase, &name_refs, dry_run, shutdown,
+        )?)
     })?;
 
     for stats in &result.stats {
@@ -67,30 +69,29 @@ pub(crate) fn run_delete_repo(
     config: &VykarConfig,
     label: Option<&str>,
     yes_delete_this_repo: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> CliResult<()> {
     // Verify the repo exists before prompting — use list + is_known_repo_key
     // so we detect partially-deleted repos (e.g. config gone but packs remain).
     let backend =
-        vykar_core::storage::backend_from_config(&config.repository, config.limits.connections)
-            .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
-    let all_keys = backend
-        .list("")
-        .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
+        vykar_core::storage::backend_from_config(&config.repository, config.limits.connections)?;
+    let all_keys = backend.list("")?;
     let has_repo_keys = all_keys
         .iter()
         .any(|k| commands::delete_repo::is_known_repo_key(k));
     if !has_repo_keys {
-        return Err(format!("no repository found at '{}'", config.repository.url).into());
+        return Err(CliError::from(format!(
+            "no repository found at '{}'",
+            config.repository.url
+        )));
     }
     drop(backend);
 
     if !yes_delete_this_repo {
         if !std::io::stdin().is_terminal() {
-            return Err(
+            return Err(CliError::from(
                 "refusing to delete repository without confirmation in non-interactive mode; \
-                 use --yes-delete-this-repo to skip the prompt"
-                    .into(),
-            );
+                 use --yes-delete-this-repo to skip the prompt",
+            ));
         }
 
         let repo_name = label.unwrap_or(&config.repository.url);
@@ -110,8 +111,7 @@ pub(crate) fn run_delete_repo(
         }
     }
 
-    let stats = commands::delete_repo::run(config)
-        .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
+    let stats = commands::delete_repo::run(config)?;
 
     let repo_name = label.unwrap_or(&config.repository.url);
 

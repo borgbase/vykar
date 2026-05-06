@@ -3,6 +3,7 @@ use std::sync::atomic::AtomicBool;
 use vykar_core::commands;
 use vykar_core::config::VykarConfig;
 
+use crate::error::CliResult;
 use crate::format::{format_bytes, parse_size};
 use crate::passphrase::with_repo_passphrase;
 
@@ -13,12 +14,13 @@ pub(crate) fn run_compact(
     max_repack_size: Option<String>,
     dry_run: bool,
     shutdown: Option<&AtomicBool>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> CliResult<()> {
     let max_bytes = max_repack_size.map(|s| parse_size(&s)).transpose()?;
 
     let stats = with_repo_passphrase(config, label, |passphrase| {
-        commands::compact::run(config, passphrase, threshold, max_bytes, dry_run, shutdown)
-            .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })
+        Ok(commands::compact::run(
+            config, passphrase, threshold, max_bytes, dry_run, shutdown,
+        )?)
     })?;
 
     if dry_run {

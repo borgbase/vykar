@@ -1,6 +1,7 @@
 use vykar_core::commands;
 use vykar_core::config::VykarConfig;
 
+use crate::error::CliResult;
 use crate::format::format_bytes;
 use crate::passphrase::with_repo_passphrase;
 
@@ -11,9 +12,9 @@ pub(crate) fn run_restore(
     dest: String,
     pattern: Option<String>,
     verify: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> CliResult<()> {
     let stats = with_repo_passphrase(config, label, |passphrase| {
-        commands::restore::run(
+        Ok(commands::restore::run(
             config,
             passphrase,
             &snapshot_name,
@@ -21,8 +22,7 @@ pub(crate) fn run_restore(
             pattern.as_deref(),
             config.xattrs.enabled,
             verify,
-        )
-        .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })
+        )?)
     })?;
 
     println!(

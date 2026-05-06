@@ -3,6 +3,7 @@ use std::sync::{LazyLock, Mutex};
 
 use zeroize::Zeroizing;
 
+use crate::error::{CliError, CliResult};
 use crate::prompt::prompt_hidden;
 use vykar_core::config::{EncryptionModeConfig, VykarConfig};
 
@@ -15,8 +16,8 @@ static PASSPHRASE_CACHE: LazyLock<Mutex<HashMap<String, Option<Zeroizing<String>
 pub(crate) fn with_repo_passphrase<T>(
     config: &VykarConfig,
     label: Option<&str>,
-    action: impl FnOnce(Option<&str>) -> Result<T, Box<dyn std::error::Error>>,
-) -> Result<T, Box<dyn std::error::Error>> {
+    action: impl FnOnce(Option<&str>) -> CliResult<T>,
+) -> CliResult<T> {
     let passphrase = get_passphrase(config, label)?;
     action(passphrase.as_deref().map(|s| s.as_str()))
 }
@@ -24,7 +25,7 @@ pub(crate) fn with_repo_passphrase<T>(
 pub(crate) fn get_passphrase(
     config: &VykarConfig,
     label: Option<&str>,
-) -> Result<Option<Zeroizing<String>>, Box<dyn std::error::Error>> {
+) -> CliResult<Option<Zeroizing<String>>> {
     if config.encryption.mode == EncryptionModeConfig::None {
         return Ok(None);
     }
@@ -61,17 +62,14 @@ pub(crate) fn get_passphrase(
     Ok(Some(pass))
 }
 
-fn configured_passphrase(
-    config: &VykarConfig,
-) -> Result<Option<Zeroizing<String>>, Box<dyn std::error::Error>> {
-    vykar_core::app::passphrase::configured_passphrase(config)
-        .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })
+fn configured_passphrase(config: &VykarConfig) -> CliResult<Option<Zeroizing<String>>> {
+    Ok(vykar_core::app::passphrase::configured_passphrase(config)?)
 }
 
 pub(crate) fn get_init_passphrase(
     config: &VykarConfig,
     label: Option<&str>,
-) -> Result<Option<Zeroizing<String>>, Box<dyn std::error::Error>> {
+) -> CliResult<Option<Zeroizing<String>>> {
     if config.encryption.mode == EncryptionModeConfig::None {
         return Ok(None);
     }
@@ -88,7 +86,7 @@ pub(crate) fn get_init_passphrase(
     let p1 = Zeroizing::new(prompt_hidden(&format!("Enter new passphrase{suffix}: "))?);
     let p2 = Zeroizing::new(prompt_hidden(&format!("Confirm passphrase{suffix}: "))?);
     if *p1 != *p2 {
-        return Err("passphrases do not match".into());
+        return Err(CliError::from("passphrases do not match"));
     }
     Ok(Some(p1))
 }

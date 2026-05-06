@@ -8,6 +8,7 @@ use vykar_core::commands;
 use vykar_core::config::VykarConfig;
 
 use crate::cli::{SnapshotCommand, SortField};
+use crate::error::{CliError, CliResult};
 use crate::format::{format_bytes, parse_size};
 use crate::passphrase::with_repo_passphrase;
 use crate::table::{add_kv_row, CliTableTheme};
@@ -26,7 +27,7 @@ pub(crate) fn run_snapshot_command(
     config: &VykarConfig,
     label: Option<&str>,
     shutdown: Option<&AtomicBool>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> CliResult<()> {
     match command {
         SnapshotCommand::List {
             snapshot,
@@ -36,8 +37,9 @@ pub(crate) fn run_snapshot_command(
             ..
         } => {
             let mut items = with_repo_passphrase(config, label, |passphrase| {
-                commands::list::list_snapshot_items(config, passphrase, snapshot)
-                    .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })
+                Ok(commands::list::list_snapshot_items(
+                    config, passphrase, snapshot,
+                )?)
             })?;
 
             // Apply path filter (empty filter after normalization means "all items")
@@ -110,8 +112,9 @@ pub(crate) fn run_snapshot_command(
         ),
         SnapshotCommand::Info { snapshot, .. } => {
             let meta = with_repo_passphrase(config, label, |passphrase| {
-                commands::list::get_snapshot_meta(config, passphrase, snapshot)
-                    .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })
+                Ok(commands::list::get_snapshot_meta(
+                    config, passphrase, snapshot,
+                )?)
             })?;
 
             let theme = CliTableTheme::detect();
@@ -200,10 +203,11 @@ fn run_snapshot_diff(
     label: Option<&str>,
     snapshot_a: &str,
     snapshot_b: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> CliResult<()> {
     let diff = with_repo_passphrase(config, label, |passphrase| {
-        commands::diff::run(config, passphrase, snapshot_a, snapshot_b)
-            .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })
+        Ok(commands::diff::run(
+            config, passphrase, snapshot_a, snapshot_b,
+        )?)
     })?;
 
     if diff.entries.is_empty() {
@@ -250,7 +254,7 @@ fn run_snapshot_find(
     since: &Option<String>,
     larger: &Option<String>,
     smaller: &Option<String>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> CliResult<()> {
     use commands::find::{FileStatus, FindFilter, FindScope};
     use vykar_core::snapshot::item::ItemType;
 
@@ -267,30 +271,33 @@ fn run_snapshot_find(
             "f" => Ok(ItemType::RegularFile),
             "d" => Ok(ItemType::Directory),
             "l" => Ok(ItemType::Symlink),
-            _ => Err(format!("unknown --type '{t}': use f, d, or l")),
+            _ => Err(CliError::from(format!(
+                "unknown --type '{t}': use f, d, or l"
+            ))),
         })
-        .transpose()
-        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+        .transpose()?;
 
     let since_dt = since
         .as_deref()
-        .map(|s| -> Result<_, Box<dyn std::error::Error>> {
+        .map(|s| -> CliResult<_> {
             if !s.trim().ends_with(|c: char| c.is_ascii_alphabetic()) {
-                return Err(
-                    format!("--since requires a unit suffix (h, d, w, m, y), got '{s}'").into(),
-                );
+                return Err(CliError::from(format!(
+                    "--since requires a unit suffix (h, d, w, m, y), got '{s}'"
+                )));
             }
             let dur = vykar_core::prune::parse_timespan(s)?;
             if dur <= chrono::Duration::zero() {
-                return Err(format!("--since duration must be positive (got '{s}')").into());
+                return Err(CliError::from(format!(
+                    "--since duration must be positive (got '{s}')"
+                )));
             }
             Ok(chrono::Utc::now() - dur)
         })
         .transpose()?;
 
-    let larger_than = larger.as_deref().map(|s| parse_size(s)).transpose()?;
+    let larger_than = larger.as_deref().map(parse_size).transpose()?;
 
-    let smaller_than = smaller.as_deref().map(|s| parse_size(s)).transpose()?;
+    let smaller_than = smaller.as_deref().map(parse_size).transpose()?;
 
     let filter = FindFilter::build(
         path_prefix,
@@ -300,12 +307,10 @@ fn run_snapshot_find(
         since_dt,
         larger_than,
         smaller_than,
-    )
-    .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    )?;
 
     let timelines = with_repo_passphrase(config, label, |passphrase| {
-        commands::find::run(config, passphrase, &scope, &filter)
-            .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })
+        Ok(commands::find::run(config, passphrase, &scope, &filter)?)
     })?;
 
     if timelines.is_empty() {

@@ -2,7 +2,9 @@ use std::io::Write;
 
 use vykar_core::config;
 
-pub(crate) fn run_config_generate(dest: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+use crate::error::{CliError, CliResult};
+
+pub(crate) fn run_config_generate(dest: Option<&str>) -> CliResult<()> {
     let path = match dest {
         Some(d) => std::path::PathBuf::from(d),
         None => pick_config_location()?,
@@ -16,7 +18,10 @@ pub(crate) fn run_config_generate(dest: Option<&str>) -> Result<(), Box<dyn std:
 
     if let Err(err) = write_config_file(&path) {
         if err.kind() == std::io::ErrorKind::AlreadyExists {
-            return Err(format!("file already exists: {}", path.display()).into());
+            return Err(CliError::from(format!(
+                "file already exists: {}",
+                path.display()
+            )));
         }
         return Err(err.into());
     }
@@ -52,7 +57,7 @@ fn new_config_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
         .open(path)
 }
 
-fn pick_config_location() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+fn pick_config_location() -> CliResult<std::path::PathBuf> {
     let search_paths = config::default_config_search_paths();
 
     let descriptions: &[&str] = &[
@@ -85,9 +90,9 @@ fn pick_config_location() -> Result<std::path::PathBuf, Box<dyn std::error::Erro
     } else {
         let n: usize = input
             .parse()
-            .map_err(|_| format!("invalid choice: '{input}'"))?;
+            .map_err(|_| CliError::from(format!("invalid choice: '{input}'")))?;
         if n == 0 || n > search_paths.len() {
-            return Err(format!("choice out of range: {n}").into());
+            return Err(CliError::from(format!("choice out of range: {n}")));
         }
         n - 1
     };

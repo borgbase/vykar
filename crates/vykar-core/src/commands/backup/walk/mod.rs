@@ -185,7 +185,11 @@ pub(super) fn materialize_item(walked: WalkedEntry, xattrs_enabled: bool) -> Res
         xattrs: None,
     };
 
-    if xattrs_enabled {
+    // Skip xattrs on dataless inodes: macOS `getxattr` on FileProvider-managed
+    // attrs round-trips through `fileproviderd`, serializing the single-thread
+    // walker. Dataless entries are either propagated from the parent snapshot
+    // (xattrs come from the cached Item) or routed to SkipDataless.
+    if xattrs_enabled && !metadata_summary.is_dataless {
         item.xattrs = read_item_xattrs(&walked.abs_path);
     }
 
@@ -576,6 +580,69 @@ mod tests {
         assert!(should_skip_for_device(true, 42, 43));
         assert!(!should_skip_for_device(true, 42, 42));
         assert!(!should_skip_for_device(false, 42, 43));
+    }
+
+    /// Regression: dataless inodes must NOT trigger `read_item_xattrs`.
+    /// On macOS, `getxattr` on FileProvider-managed attrs round-trips through
+    /// `fileproviderd` and can stall the (single-threaded) walker for seconds
+    /// per file. Confirms the dataless guard added to `materialize_item` —
+    /// when `is_dataless: true`, the Item must come back with `xattrs: None`
+    /// even when the underlying file has xattrs on disk and `xattrs_enabled`
+    /// is set. The companion `is_dataless: false` case proves the read path
+    /// still fires when not gated.
+    #[cfg(unix)]
+    #[test]
+    fn materialize_item_skips_xattrs_on_dataless() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("placeholder");
+        std::fs::write(&path, b"x").unwrap();
+        // Best-effort xattr write — bail the test if the tempdir's filesystem
+        // doesn't support xattrs (e.g. tmpfs on some Linux configs); the
+        // cross-platform xattrs_supported() flag does not detect that case.
+        if xattr::set(&path, "user.vykar_test", b"v").is_err() {
+            return;
+        }
+
+        let real_meta = std::fs::symlink_metadata(&path).unwrap();
+        let file_type = real_meta.file_type();
+        let mut summary = fs::summarize_metadata(&real_meta, &file_type);
+        summary.is_dataless = true;
+
+        let walked = inode_walk::WalkedEntry {
+            abs_path: path.clone(),
+            metadata: summary,
+            file_type,
+            snapshot_path: "placeholder".into(),
+        };
+
+        match materialize_item(walked, true).unwrap() {
+            Materialized::Entry { item, .. } => {
+                assert!(
+                    item.xattrs.is_none(),
+                    "dataless inodes must not be xattr-read",
+                );
+            }
+            other => panic!("expected Entry, got {other:?}"),
+        }
+
+        // Sanity: same file with `is_dataless: false` must populate xattrs.
+        let mut summary_warm = fs::summarize_metadata(&real_meta, &file_type);
+        summary_warm.is_dataless = false;
+        let walked_warm = inode_walk::WalkedEntry {
+            abs_path: path,
+            metadata: summary_warm,
+            file_type,
+            snapshot_path: "placeholder".into(),
+        };
+        match materialize_item(walked_warm, true).unwrap() {
+            Materialized::Entry { item, .. } => {
+                assert!(
+                    item.xattrs.is_some(),
+                    "warm files with xattrs_enabled must populate xattrs",
+                );
+            }
+            other => panic!("expected Entry, got {other:?}"),
+        }
     }
 
     #[test]

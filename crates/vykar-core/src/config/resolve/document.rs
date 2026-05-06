@@ -77,7 +77,7 @@ impl RepositoryEntry {
             allow_insecure_http: self.allow_insecure_http,
             min_pack_size: self.min_pack_size.unwrap_or_else(default_min_pack_size),
             max_pack_size: self.max_pack_size.unwrap_or_else(default_max_pack_size),
-            retry: self.retry.clone().unwrap_or_default(),
+            retry: self.retry.unwrap_or_default(),
             s3_soft_delete: self.s3_soft_delete,
         }
     }

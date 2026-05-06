@@ -17,7 +17,7 @@ fn storage_config_from_repo(cfg: &RepositoryConfig) -> StorageConfig {
         sftp_timeout: cfg.sftp_timeout,
         access_token: cfg.access_token.clone(),
         allow_insecure_http: cfg.allow_insecure_http,
-        retry: cfg.retry.clone(),
+        retry: cfg.retry,
         s3_soft_delete: cfg.s3_soft_delete,
     }
 }

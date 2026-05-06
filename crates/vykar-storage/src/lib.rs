@@ -40,6 +40,15 @@ pub use vykar_protocol::{
 
 /// Abstract key-value storage for repository objects.
 /// Keys are `/`-separated string paths (e.g. "packs/ab/ab01cd02...").
+///
+/// # Runtime invariant
+///
+/// The trait surface is synchronous, but implementors (notably the SFTP
+/// backend) may drive async I/O internally via `tokio::runtime::Runtime::block_on`.
+/// Callers must therefore **not** invoke these methods from inside a tokio
+/// runtime context — doing so panics with "Cannot start a runtime from within a
+/// runtime." If you need to call a `StorageBackend` from async code, dispatch
+/// through `tokio::task::spawn_blocking`.
 #[allow(clippy::missing_errors_doc)]
 pub trait StorageBackend: Send + Sync {
     /// Read an object by key. Returns `None` if not found.
@@ -369,7 +378,7 @@ pub struct StorageConfig {
 }
 
 /// Retry configuration for remote storage backends (S3, SFTP, REST).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RetryConfig {
     /// Maximum number of retry attempts (0 = no retries).
@@ -445,7 +454,7 @@ pub fn backend_from_config(cfg: &StorageConfig) -> Result<Box<dyn StorageBackend
                 &endpoint,
                 access_key_id,
                 secret_access_key,
-                cfg.retry.clone(),
+                cfg.retry,
                 cfg.s3_soft_delete,
             )?))
         }
@@ -464,7 +473,7 @@ pub fn backend_from_config(cfg: &StorageConfig) -> Result<Box<dyn StorageBackend
             cfg.sftp_known_hosts.as_deref(),
             cfg.max_connections,
             cfg.sftp_timeout,
-            cfg.retry.clone(),
+            cfg.retry,
         )?)),
         #[cfg(not(feature = "backend-sftp"))]
         ParsedUrl::Sftp { .. } => Err(VykarError::UnsupportedBackend(
@@ -473,9 +482,7 @@ pub fn backend_from_config(cfg: &StorageConfig) -> Result<Box<dyn StorageBackend
         ParsedUrl::Rest { url } => {
             let token = cfg.access_token.as_deref();
             Ok(Box::new(rest_backend::RestBackend::new(
-                &url,
-                token,
-                cfg.retry.clone(),
+                &url, token, cfg.retry,
             )?))
         }
     }

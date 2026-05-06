@@ -74,7 +74,7 @@ pub(super) fn build_repair_plan(
 
     for impact in &scan.item_impacts {
         let mut packs: Vec<PackId> = impact.affected_chunks.iter().map(|(_, p)| *p).collect();
-        packs.sort_by_key(|a| a.0);
+        packs.sort_by_key(|a| *a.as_bytes());
         packs.dedup();
         let reason = if let [only] = packs.as_slice() {
             format!("chunks in missing pack {only}")
@@ -463,7 +463,7 @@ mod tests {
 
     #[test]
     fn build_repair_plan_treats_invalid_item_as_doomed_snapshot() {
-        let snapshot_id = SnapshotId([0x11u8; 32]);
+        let snapshot_id = SnapshotId::from_bytes([0x11u8; 32]);
         let snapshot_name = "bad".to_string();
         let scan = ScanResult {
             counters: ScanCounters::default(),
@@ -503,7 +503,7 @@ mod tests {
 
     #[test]
     fn build_repair_plan_dedupes_invalid_item_with_corrupt_snapshot() {
-        let snapshot_id = SnapshotId([0x22u8; 32]);
+        let snapshot_id = SnapshotId::from_bytes([0x22u8; 32]);
         let snapshot_name = "dup".to_string();
         let scan = ScanResult {
             counters: ScanCounters::default(),

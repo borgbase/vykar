@@ -165,7 +165,7 @@ impl Repository {
         let compressed = compress::compress(compression, data)?;
         let packed = pack_object_with_context(
             ObjectType::ChunkData,
-            &chunk_id.0,
+            chunk_id.as_bytes(),
             &compressed,
             self.crypto.as_ref(),
         )?;
@@ -307,7 +307,7 @@ impl Repository {
         // Encrypt and wrap in repo object envelope
         let packed = pack_object_with_context(
             ObjectType::ChunkData,
-            &chunk_id.0,
+            chunk_id.as_bytes(),
             &compressed,
             self.crypto.as_ref(),
         )?;

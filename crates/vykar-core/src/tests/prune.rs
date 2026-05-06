@@ -54,7 +54,7 @@ fn make_snapshots(count: usize) -> Vec<SnapshotEntry> {
     (0..count)
         .map(|i| SnapshotEntry {
             name: format!("backup-{i}"),
-            id: SnapshotId([i as u8; 32]),
+            id: SnapshotId::from_bytes([i as u8; 32]),
             time: now - Duration::hours(i as i64),
             source_label: String::new(),
             label: String::new(),
@@ -104,7 +104,7 @@ fn empty_snapshots_returns_empty() {
 fn snap_at(name: &str, time: DateTime<Utc>) -> SnapshotEntry {
     SnapshotEntry {
         name: name.to_string(),
-        id: SnapshotId([0; 32]),
+        id: SnapshotId::from_bytes([0; 32]),
         time,
         source_label: String::new(),
         label: String::new(),

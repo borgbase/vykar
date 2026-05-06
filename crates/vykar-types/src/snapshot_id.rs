@@ -4,9 +4,14 @@ use std::fmt;
 
 /// A 32-byte snapshot identifier (random).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct SnapshotId(pub [u8; 32]);
+pub struct SnapshotId([u8; 32]);
 
 impl SnapshotId {
+    /// Wrap a 32-byte array as a `SnapshotId`. Any 32-byte value is a valid ID.
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
     /// Generate a random snapshot ID.
     pub fn generate() -> Self {
         let mut buf = [0u8; 32];

@@ -44,15 +44,17 @@ fn seed_pack_scan() {
 
     // Pack with two small blobs via PackWriter
     let mut pw = PackWriter::new(PackType::Data, usize::MAX);
-    pw.add_blob(ChunkId([1; 32]), vec![0xDE, 0xAD]).unwrap();
-    pw.add_blob(ChunkId([2; 32]), vec![0xBE, 0xEF, 0x42])
+    pw.add_blob(ChunkId::from_bytes([1; 32]), vec![0xDE, 0xAD])
+        .unwrap();
+    pw.add_blob(ChunkId::from_bytes([2; 32]), vec![0xBE, 0xEF, 0x42])
         .unwrap();
     let sealed = pw.seal().unwrap();
     write_seed("fuzz_pack_scan", "two_blobs", sealed.data.as_slice());
 
     // Pack with a single larger blob
     let mut pw = PackWriter::new(PackType::Data, usize::MAX);
-    pw.add_blob(ChunkId([3; 32]), vec![0x42; 256]).unwrap();
+    pw.add_blob(ChunkId::from_bytes([3; 32]), vec![0x42; 256])
+        .unwrap();
     let sealed = pw.seal().unwrap();
     write_seed("fuzz_pack_scan", "one_large_blob", sealed.data.as_slice());
 }
@@ -87,7 +89,7 @@ fn seed_snapshot_meta() {
         time_end: t,
         chunker_params: Default::default(),
         comment: "fuzz seed".into(),
-        item_ptrs: vec![ChunkId([0xAA; 32])],
+        item_ptrs: vec![ChunkId::from_bytes([0xAA; 32])],
         stats: Default::default(),
         source_label: "test".into(),
         source_paths: vec!["/tmp/test".into()],
@@ -139,7 +141,7 @@ fn seed_item_stream() {
             ctime: None,
             size: 1024,
             chunks: vec![ChunkRef {
-                id: ChunkId([0xCC; 32]),
+                id: ChunkId::from_bytes([0xCC; 32]),
                 size: 1024,
                 csize: 512,
             }],
@@ -207,7 +209,7 @@ fn seed_file_cache_decode() {
         1234567890,
         4096,
         vec![ChunkRef {
-            id: ChunkId([0xDD; 32]),
+            id: ChunkId::from_bytes([0xDD; 32]),
             size: 4096,
             csize: 2048,
         }],

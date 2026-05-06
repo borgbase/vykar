@@ -165,7 +165,7 @@ mod tests {
         let mut item = empty_item();
         let mut stats = SnapshotStats::default();
         let phantom = CachedChunks::Single(CachedChunkRef {
-            id: ChunkId([0x77; 32]),
+            id: ChunkId::from_bytes([0x77; 32]),
             size: 42,
         });
 

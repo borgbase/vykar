@@ -157,7 +157,7 @@ mod tests {
 
     fn chunk(size: u32) -> ChunkRef {
         ChunkRef {
-            id: ChunkId([0u8; 32]),
+            id: ChunkId::from_bytes([0u8; 32]),
             size,
             csize: size,
         }

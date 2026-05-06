@@ -962,7 +962,7 @@ mod tests {
             ctime: Some(2000),
             size: 4096,
             chunks: vec![crate::snapshot::item::ChunkRef {
-                id: ChunkId([0xCC; 32]),
+                id: ChunkId::from_bytes([0xCC; 32]),
                 size: 4096,
                 csize: 2048,
             }],
@@ -1015,7 +1015,7 @@ mod tests {
             123_456_789,
             size,
             CachedChunks::Single(CachedChunkRef {
-                id: ChunkId([0xAB; 32]),
+                id: ChunkId::from_bytes([0xAB; 32]),
                 size: size as u32,
             }),
         );
@@ -1067,7 +1067,7 @@ mod tests {
             ctime: Some(2_000),
             size: 4096,
             chunks: vec![crate::snapshot::item::ChunkRef {
-                id: ChunkId([0xCC; 32]),
+                id: ChunkId::from_bytes([0xCC; 32]),
                 size: 4096,
                 csize: 2048,
             }],

@@ -253,8 +253,8 @@ where
             // Sort groups by pack ID (shard-aligned) then offset for sequential I/O.
             groups.sort_by(|a, b| {
                 a.pack_id
-                    .0
-                    .cmp(&b.pack_id.0)
+                    .as_bytes()
+                    .cmp(b.pack_id.as_bytes())
                     .then(a.read_start.cmp(&b.read_start))
             });
 

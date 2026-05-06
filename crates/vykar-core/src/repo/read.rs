@@ -75,7 +75,7 @@ impl Repository {
         let compressed = unpack_object_expect_with_context(
             &blob_data,
             ObjectType::ChunkData,
-            &chunk_id.0,
+            chunk_id.as_bytes(),
             self.crypto.as_ref(),
         )?;
         let plaintext = compress::decompress(&compressed)?;
@@ -223,7 +223,7 @@ impl Repository {
                 let compressed = unpack_object_expect_with_context(
                     blob_data,
                     ObjectType::ChunkData,
-                    &blob.chunk_id.0,
+                    blob.chunk_id.as_bytes(),
                     self.crypto.as_ref(),
                 )?;
                 let plaintext = compress::decompress(&compressed)?;

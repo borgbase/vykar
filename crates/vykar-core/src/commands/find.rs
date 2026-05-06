@@ -481,8 +481,8 @@ mod tests {
 
     #[test]
     fn annotate_detects_added_modified_unchanged() {
-        let id_a = ChunkId([1u8; 32]);
-        let id_b = ChunkId([2u8; 32]);
+        let id_a = ChunkId::from_bytes([1u8; 32]);
+        let id_b = ChunkId::from_bytes([2u8; 32]);
         let now = Utc::now();
 
         let hits = vec![

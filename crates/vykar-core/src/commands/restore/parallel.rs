@@ -324,7 +324,7 @@ fn process_read_group(
         unpack_object_expect_with_context_into(
             raw,
             ObjectType::ChunkData,
-            &blob.chunk_id.0,
+            blob.chunk_id.as_bytes(),
             crypto,
             decrypt_buf,
         )
@@ -540,7 +540,7 @@ mod tests {
         let crypto = PlaintextEngine::new(&test_chunk_id_key());
         let packed = pack_object_with_context(
             ObjectType::ChunkData,
-            &dummy_chunk_id(0xAA).0,
+            dummy_chunk_id(0xAA).as_bytes(),
             &compressed,
             &crypto,
         )

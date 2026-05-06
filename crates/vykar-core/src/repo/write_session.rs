@@ -693,8 +693,8 @@ mod tests {
         crypto: &dyn CryptoEngine,
         key: &str,
     ) -> (PackId, ChunkId) {
-        let pack_id = PackId([0x11; 32]);
-        let chunk_id = ChunkId([0x22; 32]);
+        let pack_id = PackId::from_bytes([0x11; 32]);
+        let chunk_id = ChunkId::from_bytes([0x22; 32]);
 
         // Create the pack file so verification passes.
         let pack_key = pack_id.storage_key();
@@ -942,7 +942,7 @@ mod tests {
 
         // Pre-populate the chunk index so recovery yields 0 new chunks.
         let mut chunk_index = ChunkIndex::new();
-        chunk_index.add(chunk_id, 100, PackId([0x11; 32]), 0);
+        chunk_index.add(chunk_id, 100, PackId::from_bytes([0x11; 32]), 0);
 
         let mut ws = WriteSessionState::new(1024, 1024, 1);
         ws.session_id = "current".to_string();

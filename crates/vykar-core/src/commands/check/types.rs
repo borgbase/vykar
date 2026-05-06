@@ -206,7 +206,7 @@ impl ItemImpact {
     /// Render this impact as a user-facing CheckError.
     pub fn to_check_error(&self) -> CheckError {
         let mut packs: Vec<PackId> = self.affected_chunks.iter().map(|(_, p)| *p).collect();
-        packs.sort_by_key(|a| a.0);
+        packs.sort_by_key(|a| *a.as_bytes());
         packs.dedup();
 
         let message = if let [only] = packs.as_slice() {

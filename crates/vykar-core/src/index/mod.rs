@@ -460,11 +460,11 @@ mod tests {
     use super::*;
 
     fn make_chunk_id(byte: u8) -> ChunkId {
-        ChunkId([byte; 32])
+        ChunkId::from_bytes([byte; 32])
     }
 
     fn make_pack_id(byte: u8) -> PackId {
-        PackId([byte; 32])
+        PackId::from_bytes([byte; 32])
     }
 
     #[test]
@@ -514,7 +514,7 @@ mod tests {
 
         // Both packs present (order may differ)
         let mut pack_ids: Vec<PackId> = restored_wire.iter().map(|e| e.pack_id).collect();
-        pack_ids.sort_by_key(|p| p.0);
+        pack_ids.sort_by_key(|p| *p.as_bytes());
         assert_eq!(pack_ids, vec![pack1, pack2]);
     }
 

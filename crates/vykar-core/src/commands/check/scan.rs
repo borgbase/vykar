@@ -24,11 +24,11 @@ use vykar_types::snapshot_id::SnapshotId;
 /// issuing individual range reads.
 const BATCH_THRESHOLD: usize = 3;
 
-/// Returns `true` if the error is a transient I/O or storage failure (not proven
+/// Returns `true` if the error is a transient I/O failure (not proven
 /// corruption). Crypto, deserialization, format, and decompression errors are
 /// considered evidence of corruption.
 fn is_transient_io(err: &VykarError) -> bool {
-    matches!(err, VykarError::Storage(_) | VykarError::Io(_))
+    matches!(err, VykarError::Io(_))
 }
 
 // ---------------------------------------------------------------------------
@@ -796,18 +796,22 @@ fn verify_single_chunk(
     raw: &[u8],
     issues: &mut Vec<IntegrityIssue>,
 ) -> usize {
-    let compressed =
-        match unpack_object_expect_with_context(raw, ObjectType::ChunkData, &chunk_id.0, crypto) {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                issues.push(IntegrityIssue::CorruptChunk {
-                    chunk_id: *chunk_id,
-                    pack_id: *pack_id,
-                    detail: format!("decrypt failed: {e}"),
-                });
-                return 0;
-            }
-        };
+    let compressed = match unpack_object_expect_with_context(
+        raw,
+        ObjectType::ChunkData,
+        chunk_id.as_bytes(),
+        crypto,
+    ) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            issues.push(IntegrityIssue::CorruptChunk {
+                chunk_id: *chunk_id,
+                pack_id: *pack_id,
+                detail: format!("decrypt failed: {e}"),
+            });
+            return 0;
+        }
+    };
 
     let plaintext = match compress::decompress(&compressed) {
         Ok(data) => data,
@@ -878,9 +882,9 @@ mod tests {
 
     #[test]
     fn parallel_pack_existence_excludes_io_failures_from_checked_count() {
-        let present = PackId([0x01u8; 32]);
-        let missing = PackId([0x02u8; 32]);
-        let errored = PackId([0x03u8; 32]);
+        let present = PackId::from_bytes([0x01u8; 32]);
+        let missing = PackId::from_bytes([0x02u8; 32]);
+        let errored = PackId::from_bytes([0x03u8; 32]);
 
         let mut responses: HashMap<String, std::result::Result<bool, String>> = HashMap::new();
         responses.insert(present.storage_key(), Ok(true));

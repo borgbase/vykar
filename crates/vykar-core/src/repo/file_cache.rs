@@ -338,7 +338,7 @@ impl FileCache {
             self.sections.insert(
                 root.clone(),
                 CacheSection {
-                    anchor_snapshot_id: SnapshotId([0u8; 32]),
+                    anchor_snapshot_id: SnapshotId::from_bytes([0u8; 32]),
                     entries: HashMap::with_capacity(hint),
                 },
             );
@@ -690,7 +690,7 @@ impl FileCache {
                 for (key, section) in &cache.sections {
                     info!(
                         key,
-                        anchor = %hex::encode(&section.anchor_snapshot_id.0[..8]),
+                        anchor = %hex::encode(&section.anchor_snapshot_id.as_bytes()[..8]),
                         entries = section.entries.len(),
                         "file cache section"
                     );
@@ -965,7 +965,7 @@ mod tests {
 
     fn sample_chunk_refs() -> CachedChunks {
         CachedChunks::Single(CachedChunkRef {
-            id: ChunkId([0xAA; 32]),
+            id: ChunkId::from_bytes([0xAA; 32]),
             size: 1024,
         })
     }
@@ -973,7 +973,7 @@ mod tests {
     /// Raw Vec variant for constructing `Item` structs in tests.
     fn sample_chunk_refs_vec() -> Vec<ChunkRef> {
         vec![ChunkRef {
-            id: ChunkId([0xAA; 32]),
+            id: ChunkId::from_bytes([0xAA; 32]),
             size: 1024,
             csize: 512,
         }]
@@ -1358,8 +1358,8 @@ mod tests {
     #[test]
     fn invalidate_missing_snapshots() {
         let mut cache = FileCache::new();
-        let id_a = SnapshotId([0xAA; 32]);
-        let id_b = SnapshotId([0xBB; 32]);
+        let id_a = SnapshotId::from_bytes([0xAA; 32]);
+        let id_b = SnapshotId::from_bytes([0xBB; 32]);
 
         let key_a = "/a".to_string();
         let key_b = "/b".to_string();
@@ -1389,7 +1389,7 @@ mod tests {
     fn activate_for_walk_roots_finds_sections() {
         let mut cache = FileCache::new();
         cache.begin_sections(&roots(&["/data", "/config"]), &[0, 0]);
-        cache.finalize_sections(SnapshotId([0x11; 32]));
+        cache.finalize_sections(SnapshotId::from_bytes([0x11; 32]));
 
         // Both paths activate.
         assert!(cache.activate_for_walk_roots(&roots(&["/data", "/config"])));
@@ -1407,7 +1407,7 @@ mod tests {
         let mut cache = FileCache::new();
         cache.begin_sections(&roots(&["/data"]), &[0]);
         cache.insert("/data/a.txt", 1, 1, 1, 1, 100, sample_chunk_refs());
-        cache.finalize_sections(SnapshotId([0x22; 32]));
+        cache.finalize_sections(SnapshotId::from_bytes([0x22; 32]));
 
         // Activate by the same path (regardless of what label was used).
         assert!(cache.activate_for_walk_roots(&roots(&["/data"])));
@@ -1417,8 +1417,8 @@ mod tests {
     #[test]
     fn merge_section_replaces_only_target() {
         let mut cache = FileCache::new();
-        let id_a = SnapshotId([0xAA; 32]);
-        let id_b = SnapshotId([0xBB; 32]);
+        let id_a = SnapshotId::from_bytes([0xAA; 32]);
+        let id_b = SnapshotId::from_bytes([0xBB; 32]);
 
         let key_a = "/a".to_string();
         let key_b = "/b".to_string();
@@ -1444,8 +1444,8 @@ mod tests {
     #[test]
     fn merge_section_overwrites_same_paths() {
         let mut cache = FileCache::new();
-        let id_old = SnapshotId([0xAA; 32]);
-        let id_new = SnapshotId([0xBB; 32]);
+        let id_old = SnapshotId::from_bytes([0xAA; 32]);
+        let id_new = SnapshotId::from_bytes([0xBB; 32]);
         let key = "/data".to_string();
 
         cache.sections.insert(
@@ -1472,14 +1472,17 @@ mod tests {
         let mut cache = FileCache::new();
         cache.begin_sections(&roots(&["/src"]), &[0]);
         cache.insert("/src/a.txt", 1, 1, 1, 1, 100, sample_chunk_refs());
-        cache.finalize_sections(SnapshotId([0x42; 32]));
+        cache.finalize_sections(SnapshotId::from_bytes([0x42; 32]));
 
         let taken = cache.take_active_sections();
         assert_eq!(taken.len(), 1);
         let (key, section) = &taken[0];
         assert_eq!(key, "/src");
         assert_eq!(section.entries.len(), 1);
-        assert_eq!(section.anchor_snapshot_id, SnapshotId([0x42; 32]));
+        assert_eq!(
+            section.anchor_snapshot_id,
+            SnapshotId::from_bytes([0x42; 32])
+        );
         assert!(cache.sections.is_empty());
     }
 
@@ -1489,7 +1492,7 @@ mod tests {
         cache.begin_sections(&roots(&["/a", "/b"]), &[0, 0]);
         cache.insert("/a/f.txt", 1, 1, 1, 1, 100, sample_chunk_refs());
         cache.insert("/b/g.txt", 1, 2, 2, 2, 200, sample_chunk_refs());
-        cache.finalize_sections(SnapshotId([0x42; 32]));
+        cache.finalize_sections(SnapshotId::from_bytes([0x42; 32]));
 
         let taken = cache.take_active_sections();
         assert_eq!(taken.len(), 2);
@@ -1521,7 +1524,7 @@ mod tests {
                 sample_chunk_refs(),
             );
         }
-        cache.finalize_sections(SnapshotId([0xDD; 32]));
+        cache.finalize_sections(SnapshotId::from_bytes([0xDD; 32]));
 
         let key = "/tmp".to_string();
         let plaintext = encode_plaintext_v2(&cache);
@@ -1530,7 +1533,10 @@ mod tests {
         assert!(decoded.sections.contains_key(&key));
         let section = &decoded.sections[&key];
         assert_eq!(section.entries.len(), 10);
-        assert_eq!(section.anchor_snapshot_id, SnapshotId([0xDD; 32]));
+        assert_eq!(
+            section.anchor_snapshot_id,
+            SnapshotId::from_bytes([0xDD; 32])
+        );
     }
 
     #[test]
@@ -1592,27 +1598,27 @@ mod tests {
             1,
             100,
             CachedChunks::Single(CachedChunkRef {
-                id: ChunkId([0xAA; 32]),
+                id: ChunkId::from_bytes([0xAA; 32]),
                 size: 100,
             }),
         );
         // Many-chunk entry.
         let many = CachedChunks::from_vec(vec![
             CachedChunkRef {
-                id: ChunkId([0xBB; 32]),
+                id: ChunkId::from_bytes([0xBB; 32]),
                 size: 200,
             },
             CachedChunkRef {
-                id: ChunkId([0xCC; 32]),
+                id: ChunkId::from_bytes([0xCC; 32]),
                 size: 300,
             },
             CachedChunkRef {
-                id: ChunkId([0xDD; 32]),
+                id: ChunkId::from_bytes([0xDD; 32]),
                 size: 400,
             },
         ]);
         cache.insert("/tmp/many.txt", 1, 11, 2, 2, 900, many);
-        cache.finalize_sections(SnapshotId([0xEE; 32]));
+        cache.finalize_sections(SnapshotId::from_bytes([0xEE; 32]));
 
         let plaintext = encode_plaintext_v2(&cache);
         let mut decoded = FileCache::decode_from_plaintext(&plaintext).unwrap();
@@ -1621,12 +1627,12 @@ mod tests {
         let one = decoded.lookup("/tmp/one.txt", 1, 10, 1, 1, 100).unwrap();
         assert!(matches!(one, CachedChunks::Single(_)));
         assert_eq!(one.len(), 1);
-        assert_eq!(one.as_slice()[0].id, ChunkId([0xAA; 32]));
+        assert_eq!(one.as_slice()[0].id, ChunkId::from_bytes([0xAA; 32]));
 
         let many = decoded.lookup("/tmp/many.txt", 1, 11, 2, 2, 900).unwrap();
         assert!(matches!(many, CachedChunks::Many(_)));
         assert_eq!(many.len(), 3);
-        assert_eq!(many.as_slice()[2].id, ChunkId([0xDD; 32]));
+        assert_eq!(many.as_slice()[2].id, ChunkId::from_bytes([0xDD; 32]));
     }
 
     #[test]
@@ -1638,12 +1644,12 @@ mod tests {
         struct Wrap(#[serde(with = "cached_chunks_serde")] CachedChunks);
 
         let single = CachedChunks::Single(CachedChunkRef {
-            id: ChunkId([0x33; 32]),
+            id: ChunkId::from_bytes([0x33; 32]),
             size: 42,
         });
         let wrapped_bytes = rmp_serde::to_vec(&Wrap(single)).unwrap();
         let vec_bytes = rmp_serde::to_vec(&vec![CachedChunkRef {
-            id: ChunkId([0x33; 32]),
+            id: ChunkId::from_bytes([0x33; 32]),
             size: 42,
         }])
         .unwrap();
@@ -1675,7 +1681,7 @@ mod tests {
                 x ^= x >> 27;
                 chunk.copy_from_slice(&x.to_le_bytes());
             }
-            ChunkId(out)
+            ChunkId::from_bytes(out)
         }
 
         let mut cache = FileCache::new();
@@ -1694,7 +1700,7 @@ mod tests {
                 }),
             );
         }
-        cache.finalize_sections(SnapshotId([0x99; 32]));
+        cache.finalize_sections(SnapshotId::from_bytes([0x99; 32]));
 
         let bytes = encode_plaintext_v2(&cache);
         assert!(
@@ -2120,7 +2126,7 @@ mod tests {
         cache.begin_sections(&roots(&["/a", "/b"]), &[0, 0]);
         cache.insert("/a/f.txt", 1, 1, 1, 1, 100, sample_chunk_refs());
         cache.insert("/b/g.txt", 1, 2, 2, 2, 200, sample_chunk_refs());
-        cache.finalize_sections(SnapshotId([0x11; 32]));
+        cache.finalize_sections(SnapshotId::from_bytes([0x11; 32]));
 
         // Simulate persistence round-trip.
         let plaintext = encode_plaintext_v2(&cache);
@@ -2144,7 +2150,7 @@ mod tests {
         cache.begin_sections(&roots(&["/a", "/b"]), &[0, 0]);
         cache.insert("/a/f.txt", 1, 1, 1, 1, 100, sample_chunk_refs());
         cache.insert("/b/g.txt", 1, 2, 2, 2, 200, sample_chunk_refs());
-        cache.finalize_sections(SnapshotId([0x11; 32]));
+        cache.finalize_sections(SnapshotId::from_bytes([0x11; 32]));
 
         let plaintext = encode_plaintext_v2(&cache);
         let mut cache = FileCache::decode_from_plaintext(&plaintext).unwrap();
@@ -2171,11 +2177,11 @@ mod tests {
         cache.begin_sections(&roots(&["/data", "/data/sub"]), &[0, 0]);
 
         let refs_a = CachedChunks::Single(CachedChunkRef {
-            id: ChunkId([0xAA; 32]),
+            id: ChunkId::from_bytes([0xAA; 32]),
             size: 100,
         });
         let refs_b = CachedChunks::Single(CachedChunkRef {
-            id: ChunkId([0xBB; 32]),
+            id: ChunkId::from_bytes([0xBB; 32]),
             size: 200,
         });
 
@@ -2184,15 +2190,15 @@ mod tests {
 
         // Lookup routes to longest-prefix section.
         let hit = cache.lookup("/data/sub/foo.txt", 1, 1, 1, 1, 100).unwrap();
-        assert_eq!(hit.as_slice()[0].id, ChunkId([0xAA; 32]));
+        assert_eq!(hit.as_slice()[0].id, ChunkId::from_bytes([0xAA; 32]));
         let hit = cache.lookup("/data/other.txt", 1, 2, 2, 2, 200).unwrap();
-        assert_eq!(hit.as_slice()[0].id, ChunkId([0xBB; 32]));
+        assert_eq!(hit.as_slice()[0].id, ChunkId::from_bytes([0xBB; 32]));
 
         // Insert wrote to ALL matching sections, so /data/sub/foo.txt is also
         // in the /data section. Verify by switching to /data only.
         assert!(cache.activate_for_walk_roots(&roots(&["/data"])));
         let hit = cache.lookup("/data/sub/foo.txt", 1, 1, 1, 1, 100).unwrap();
-        assert_eq!(hit.as_slice()[0].id, ChunkId([0xAA; 32]));
+        assert_eq!(hit.as_slice()[0].id, ChunkId::from_bytes([0xAA; 32]));
     }
 
     #[test]
@@ -2205,7 +2211,7 @@ mod tests {
         cache.insert("/data/sub/foo.txt", 1, 1, 1, 1, 100, sample_chunk_refs());
         cache.insert("/data/sub/bar.txt", 1, 2, 2, 2, 200, sample_chunk_refs());
         cache.insert("/data/top.txt", 1, 3, 3, 3, 300, sample_chunk_refs());
-        cache.finalize_sections(SnapshotId([0x11; 32]));
+        cache.finalize_sections(SnapshotId::from_bytes([0x11; 32]));
 
         // Persistence round-trip.
         let plaintext = encode_plaintext_v2(&cache);
@@ -2229,7 +2235,7 @@ mod tests {
         cache.begin_sections(&roots(&["/data"]), &[0]);
         cache.insert("/data/sub/foo.txt", 1, 1, 1, 1, 100, sample_chunk_refs());
         cache.insert("/data/top.txt", 1, 2, 2, 2, 200, sample_chunk_refs());
-        cache.finalize_sections(SnapshotId([0x11; 32]));
+        cache.finalize_sections(SnapshotId::from_bytes([0x11; 32]));
 
         let plaintext = encode_plaintext_v2(&cache);
         let mut cache = FileCache::decode_from_plaintext(&plaintext).unwrap();

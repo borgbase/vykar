@@ -65,9 +65,6 @@ impl fmt::Display for ActiveSessionList {
 
 #[derive(Debug, Error)]
 pub enum VykarError {
-    #[error("storage I/O error: {0}")]
-    Storage(#[source] Box<dyn std::error::Error + Send + Sync>),
-
     #[error("repository not found at '{0}'")]
     RepoNotFound(String),
 

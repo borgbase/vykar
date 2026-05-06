@@ -338,8 +338,8 @@ fn test_process_verify_response_duplicate_keys() {
 #[test]
 fn test_server_fallback_no_stale_errors() {
     let storage: Arc<dyn StorageBackend> = Arc::new(TransientFailBackend);
-    let pack_id = PackId([0u8; 32]);
-    let chunk_id = ChunkId([1u8; 32]);
+    let pack_id = PackId::from_bytes([0u8; 32]);
+    let chunk_id = ChunkId::from_bytes([1u8; 32]);
     let entry = ChunkIndexEntry {
         refcount: 1,
         stored_size: 100,
@@ -368,14 +368,14 @@ fn test_verify_pack_full_overflow_offset() {
         LocalBackend::new(&tempfile::tempdir().unwrap().path().to_string_lossy()).unwrap();
     let crypto = vykar_crypto::PlaintextEngine::new(&[0u8; 32]);
     let chunk_id_key = [0u8; 32];
-    let pack_id = PackId([0u8; 32]);
+    let pack_id = PackId::from_bytes([0u8; 32]);
 
     // Create a minimal valid pack file so we get past the header check.
     let pack_data = b"VGERPACK\x01".to_vec(); // 8-byte magic + 1-byte version = 9 bytes
     let pack_key = pack_id.storage_key();
     storage.put(&pack_key, &pack_data).unwrap();
 
-    let chunk_id = ChunkId([1u8; 32]);
+    let chunk_id = ChunkId::from_bytes([1u8; 32]);
     let entry = ChunkIndexEntry {
         refcount: 1,
         stored_size: 10,
@@ -409,14 +409,14 @@ fn test_verify_pack_full_overflow_add() {
         LocalBackend::new(&tempfile::tempdir().unwrap().path().to_string_lossy()).unwrap();
     let crypto = vykar_crypto::PlaintextEngine::new(&[0u8; 32]);
     let chunk_id_key = [0u8; 32];
-    let pack_id = PackId([0u8; 32]);
+    let pack_id = PackId::from_bytes([0u8; 32]);
 
     // Create a minimal valid pack file
     let pack_data = b"VGERPACK\x01".to_vec();
     let pack_key = pack_id.storage_key();
     storage.put(&pack_key, &pack_data).unwrap();
 
-    let chunk_id = ChunkId([2u8; 32]);
+    let chunk_id = ChunkId::from_bytes([2u8; 32]);
     // offset + stored_size overflows usize on 64-bit: usize::MAX - 5 + 10 overflows
     let entry = ChunkIndexEntry {
         refcount: 1,

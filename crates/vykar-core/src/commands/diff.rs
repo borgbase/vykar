@@ -200,7 +200,7 @@ mod tests {
             chunks: chunk_bytes
                 .iter()
                 .map(|b| ChunkRef {
-                    id: ChunkId([*b; 32]),
+                    id: ChunkId::from_bytes([*b; 32]),
                     size: size as u32,
                     csize: size as u32,
                 })
@@ -232,7 +232,7 @@ mod tests {
     fn entry(name: &str, seconds: i64) -> SnapshotEntry {
         SnapshotEntry {
             name: name.to_string(),
-            id: SnapshotId([seconds as u8; 32]),
+            id: SnapshotId::from_bytes([seconds as u8; 32]),
             time: Utc.timestamp_opt(seconds, 0).unwrap(),
             source_label: String::new(),
             label: String::new(),

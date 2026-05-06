@@ -15,7 +15,7 @@ fn make_file_item() -> Item {
         ctime: Some(1_700_000_002_000_000_000),
         size: 4096,
         chunks: vec![ChunkRef {
-            id: ChunkId([0xAA; 32]),
+            id: ChunkId::from_bytes([0xAA; 32]),
             size: 4096,
             csize: 2048,
         }],
@@ -72,7 +72,7 @@ fn item_serde_roundtrip_regular_file() {
     assert_eq!(deserialized.mode, 0o644);
     assert_eq!(deserialized.size, 4096);
     assert_eq!(deserialized.chunks.len(), 1);
-    assert_eq!(deserialized.chunks[0].id, ChunkId([0xAA; 32]));
+    assert_eq!(deserialized.chunks[0].id, ChunkId::from_bytes([0xAA; 32]));
 }
 
 #[test]

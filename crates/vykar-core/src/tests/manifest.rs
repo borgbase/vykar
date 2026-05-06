@@ -6,7 +6,7 @@ use vykar_types::snapshot_id::SnapshotId;
 fn make_entry(name: &str) -> SnapshotEntry {
     SnapshotEntry {
         name: name.to_string(),
-        id: SnapshotId([0u8; 32]),
+        id: SnapshotId::from_bytes([0u8; 32]),
         time: Utc::now(),
         source_label: String::new(),
         label: String::new(),
@@ -18,7 +18,7 @@ fn make_entry(name: &str) -> SnapshotEntry {
 fn make_entry_at(name: &str, offset_secs: i64) -> SnapshotEntry {
     SnapshotEntry {
         name: name.to_string(),
-        id: SnapshotId([0u8; 32]),
+        id: SnapshotId::from_bytes([0u8; 32]),
         time: Utc::now() + Duration::seconds(offset_secs),
         source_label: String::new(),
         label: String::new(),

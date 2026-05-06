@@ -13,11 +13,11 @@ use super::plan::WriteTarget;
 use super::read_groups::{PlannedBlob, ReadGroup};
 
 pub(super) fn dummy_chunk_id(byte: u8) -> ChunkId {
-    ChunkId([byte; 32])
+    ChunkId::from_bytes([byte; 32])
 }
 
 pub(super) fn dummy_pack_id(byte: u8) -> PackId {
-    PackId([byte; 32])
+    PackId::from_bytes([byte; 32])
 }
 
 /// Helper: create a lookup closure from a ChunkIndex.
@@ -114,7 +114,13 @@ pub(super) fn make_file_item_with_size(path: &str, size: u64, chunks: Vec<(u8, u
 /// Helper: compress + encrypt + pack a raw payload into a RepoObj blob.
 pub(super) fn pack_blob(chunk_id: ChunkId, data: &[u8], crypto: &dyn CryptoEngine) -> Vec<u8> {
     let compressed = crate::compress::compress(Compression::None, data).unwrap();
-    pack_object_with_context(ObjectType::ChunkData, &chunk_id.0, &compressed, crypto).unwrap()
+    pack_object_with_context(
+        ObjectType::ChunkData,
+        chunk_id.as_bytes(),
+        &compressed,
+        crypto,
+    )
+    .unwrap()
 }
 
 /// Build a single-blob ReadGroup from the given packed bytes.

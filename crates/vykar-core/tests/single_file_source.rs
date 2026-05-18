@@ -203,8 +203,16 @@ fn backup_mixed_file_and_directory_sources() {
     let strip_root = |p: &Path| -> std::path::PathBuf {
         let mut out = std::path::PathBuf::new();
         for c in p.components() {
-            if let std::path::Component::Normal(part) = c {
-                out.push(part);
+            match c {
+                std::path::Component::Normal(part) => out.push(part),
+                #[cfg(windows)]
+                std::path::Component::Prefix(prefix) => {
+                    let s = prefix.as_os_str().to_string_lossy();
+                    if let Some(letter) = s.strip_suffix(':') {
+                        out.push(letter);
+                    }
+                }
+                _ => {}
             }
         }
         out

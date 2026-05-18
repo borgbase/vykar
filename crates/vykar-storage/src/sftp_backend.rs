@@ -18,7 +18,7 @@ use russh::client;
 use russh::keys::known_hosts::{known_host_keys_path, learn_known_hosts_path};
 use russh::keys::ssh_key;
 use russh::keys::{load_secret_key, PrivateKey, PrivateKeyWithHashAlg};
-use russh_sftp::client::SftpSession;
+use russh_sftp::client::{Config as SftpConfig, SftpSession};
 use russh_sftp::protocol::{OpenFlags, StatusCode};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
@@ -453,7 +453,11 @@ impl SftpBackend {
             .request_subsystem(true, "sftp")
             .await
             .map_err(|e| ssh_retry_error("request sftp subsystem", &params.host, params.port, e))?;
-        let sftp = SftpSession::new_opts(channel.into_stream(), Some(params.sftp_timeout_secs))
+        let sftp_cfg = SftpConfig {
+            request_timeout_secs: params.sftp_timeout_secs,
+            ..SftpConfig::default()
+        };
+        let sftp = SftpSession::new_with_config(channel.into_stream(), sftp_cfg)
             .await
             .map_err(|e| {
                 sftp_retry_error(

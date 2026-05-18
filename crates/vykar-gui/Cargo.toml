@@ -19,8 +19,8 @@ vykar-common.workspace = true
 vykar-types.workspace = true
 tokio = { workspace = true, features = ["sync"] }
 opener = "0.8"
-slint = { version = "1.15", default-features = false, features = ["std", "compat-1-2", "backend-winit", "renderer-skia", "accessibility"] }
-tray-icon = "0.22"
+slint = { version = "1.16", default-features = false, features = ["std", "compat-1-2", "backend-winit", "renderer-skia", "accessibility"] }
+tray-icon = "0.22.2"
 crossbeam-channel.workspace = true
 tinyfiledialogs = "3"
 chrono.workspace = true
@@ -42,7 +42,7 @@ objc2 = "0.6"
 objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSResponder", "NSWindow"] }
 
 [build-dependencies]
-slint-build = "1.15"
+slint-build = "1.16"
 winresource = "0.1"
 
 [dev-dependencies]

@@ -52,7 +52,7 @@ jobs:
     # If bumped, update MIN_GLIBC_MAJOR/MIN_GLIBC_MINOR in docs/src/install.sh.
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -76,7 +76,7 @@ jobs:
           ARCHIVE="vykar-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
           tar -czf "${ARCHIVE}" -C target/release vykar vykar-server vykar-gui
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: linux-x86_64-unknown-linux-gnu
           path: vykar-*.tar.gz
@@ -87,10 +87,10 @@ jobs:
     needs: build-linux
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Download Linux build artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: linux-x86_64-unknown-linux-gnu
           path: dist
@@ -142,7 +142,7 @@ jobs:
             VERSION="${GITHUB_REF_NAME}"
           fi
           mv ./*.AppImage "vykar-gui-${VERSION}-x86_64.AppImage"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: linux-x86_64-appimage
           path: vykar-gui-*.AppImage
@@ -152,7 +152,7 @@ jobs:
     if: github.event_name != 'workflow_dispatch' || github.event.inputs.build_linux == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-musl
@@ -176,7 +176,7 @@ jobs:
           ARCHIVE="vykar-${VERSION}-x86_64-unknown-linux-musl.tar.gz"
           tar -czf "${ARCHIVE}" -C target/x86_64-unknown-linux-musl/release vykar vykar-server
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: linux-x86_64-unknown-linux-musl
           path: vykar-*.tar.gz
@@ -186,7 +186,7 @@ jobs:
     if: github.event_name != 'workflow_dispatch' || github.event.inputs.build_linux == 'true'
     runs-on: ubuntu-22.04-arm
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -208,7 +208,7 @@ jobs:
           ARCHIVE="vykar-${VERSION}-aarch64-unknown-linux-gnu.tar.gz"
           tar -czf "${ARCHIVE}" -C target/release vykar vykar-server
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: linux-aarch64-unknown-linux-gnu
           path: vykar-*.tar.gz
@@ -218,7 +218,7 @@ jobs:
     if: github.event_name != 'workflow_dispatch' || github.event.inputs.build_linux == 'true'
     runs-on: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-unknown-linux-musl
@@ -242,7 +242,7 @@ jobs:
           ARCHIVE="vykar-${VERSION}-aarch64-unknown-linux-musl.tar.gz"
           tar -czf "${ARCHIVE}" -C target/aarch64-unknown-linux-musl/release vykar vykar-server
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: linux-aarch64-unknown-linux-musl
           path: vykar-*.tar.gz
@@ -255,7 +255,7 @@ jobs:
     env:
       HAS_SIGNING: ${{ secrets.MACOS_CERTIFICATE }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin
@@ -317,7 +317,7 @@ jobs:
           ARCHIVE="vykar-${VERSION}-aarch64-apple-darwin.tar.gz"
           tar -czf "${ARCHIVE}" -C "${RELEASE_DIR}" vykar vykar-server "Vykar Backup.app"
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: macos-aarch64-apple-darwin
           path: vykar-*.tar.gz
@@ -327,7 +327,7 @@ jobs:
     if: github.event_name != 'workflow_dispatch' || github.event.inputs.build_windows == 'true'
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
@@ -348,7 +348,7 @@ jobs:
           $archive = "vykar-$version-x86_64-pc-windows-msvc.zip"
           Compress-Archive -Path "target/x86_64-pc-windows-msvc/release/vykar.exe","target/x86_64-pc-windows-msvc/release/vykar-server.exe","target/x86_64-pc-windows-msvc/release/vykar-gui.exe" -DestinationPath $archive -Force
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: windows-x86_64-pc-windows-msvc
           path: vykar-*.zip
@@ -362,8 +362,8 @@ jobs:
     env:
       HAS_SIGNING: ${{ secrets.CERTUM_CERT_SHA1 }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
         if: env.HAS_SIGNING != ''
         with:
           name: windows-x86_64-pc-windows-msvc
@@ -382,12 +382,12 @@ jobs:
           cd dist && zip -j "$(basename "$ARCHIVE" .zip).zip" unsigned/*.exe && cd ..
       - name: Upload sign-windows screenshots
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: sign-windows-screens
           path: /tmp/sign-screens/
           if-no-files-found: ignore
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: env.HAS_SIGNING != ''
         with:
           name: windows-x86_64-pc-windows-msvc
@@ -409,13 +409,13 @@ jobs:
       - build-macos
       - sign-windows
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           pattern: '{linux,macos,windows}-*'
           merge-multiple: true
       - name: Publish GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: dist/*
 
@@ -427,13 +427,13 @@ jobs:
     permissions:
       packages: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: linux-x86_64-unknown-linux-musl
           path: artifacts/amd64
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: linux-aarch64-unknown-linux-musl
           path: artifacts/arm64
@@ -445,9 +445,9 @@ jobs:
           tar xzf artifacts/arm64/vykar-*.tar.gz -C bin/linux/arm64
           chmod +x bin/linux/*/vykar bin/linux/*/vykar-server
 
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -458,7 +458,7 @@ jobs:
           git fetch --tags
           echo "tag=$(git tag -l 'v*' --sort=-v:refname | head -1 | sed 's/^v//')" >> "$GITHUB_OUTPUT"
       - id: meta-apprise
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ghcr.io/borgbase/vykar
           flavor: |
@@ -469,7 +469,7 @@ jobs:
             type=semver,pattern={{major}},enable=${{ !startsWith(github.ref, 'refs/tags/v0.') }}
             type=raw,value=latest
             type=raw,value=${{ steps.version.outputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' }}
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@v7
         with:
           context: .
           file: Dockerfile.apprise
@@ -479,7 +479,7 @@ jobs:
           labels: ${{ steps.meta-apprise.outputs.labels }}
 
       - id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ghcr.io/borgbase/vykar
           tags: |
@@ -488,7 +488,7 @@ jobs:
             type=semver,pattern={{major}},enable=${{ !startsWith(github.ref, 'refs/tags/v0.') }}
             type=raw,value=latest
             type=raw,value=${{ steps.version.outputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' }}
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@v7
         with:
           context: .
           platforms: linux/amd64,linux/arm64

@@ -4,7 +4,7 @@ use std::sync::atomic::AtomicBool;
 use chrono::Utc;
 
 use crate::config::{RetentionConfig, SourceEntry, VykarConfig};
-use crate::prune::{apply_policy, apply_policy_by_label, PruneDecision};
+use crate::prune::{apply_policy_by_label, PruneDecision};
 use vykar_types::error::{Result, VykarError};
 
 use super::list::load_snapshot_meta;
@@ -75,32 +75,24 @@ pub fn run(
                 .filter_map(|s| s.retention.as_ref().map(|r| (s.label.clone(), r.clone())))
                 .collect();
 
-            let has_sources = !sources.is_empty();
-
-            let decisions = if has_sources {
-                // Label-aware: group by source_label and apply per-source retention
-                if !config.retention.has_any_rule()
-                    && source_retentions.values().all(|r| !r.has_any_rule())
-                {
-                    return Err(VykarError::Config(
+            // Always group by source_label — labels are intrinsic to each
+            // snapshot (recorded at backup time), so retention must apply
+            // per-label regardless of whether the local config has a
+            // `sources:` block. (Issue #138.)
+            if !config.retention.has_any_rule()
+                && source_retentions.values().all(|r| !r.has_any_rule())
+            {
+                return Err(VykarError::Config(
                     "no retention rules configured — set at least one keep_* option in the retention section or per-source".into(),
                 ));
-                }
-                apply_policy_by_label(
-                    &target_snapshots,
-                    &config.retention,
-                    &source_retentions,
-                    now,
-                )?
-            } else {
-                // No sources — fall back to flat policy
-                if !config.retention.has_any_rule() {
-                    return Err(VykarError::Config(
-                    "no retention rules configured — set at least one keep_* option in the retention section".into(),
-                ));
-                }
-                apply_policy(&target_snapshots, &config.retention, now)?
-            };
+            }
+
+            let decisions = apply_policy_by_label(
+                &target_snapshots,
+                &config.retention,
+                &source_retentions,
+                now,
+            )?;
 
             // Build list output
             let mut list_entries = Vec::new();

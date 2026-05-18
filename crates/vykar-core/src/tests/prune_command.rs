@@ -112,6 +112,66 @@ fn prune_source_filter_only_prunes_matching_label() {
     assert!(names.contains(&"snap-b-1"));
 }
 
+/// Regression test for issue #138: when the local config has no `sources:`
+/// block (e.g. a central server running prune against a repo populated by
+/// other clients), prune must still group snapshots by `source_label`. Each
+/// label is its own retention bucket regardless of local config.
+#[test]
+fn prune_groups_by_label_even_without_configured_sources() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = tmp.path().join("repo");
+    let source_a = tmp.path().join("source-a");
+    let source_b = tmp.path().join("source-b");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    std::fs::create_dir_all(&source_a).unwrap();
+    std::fs::create_dir_all(&source_b).unwrap();
+    std::fs::write(source_a.join("a.txt"), b"a").unwrap();
+    std::fs::write(source_b.join("b.txt"), b"b").unwrap();
+
+    let mut config = init_repo(&repo_dir);
+    config.retention = RetentionConfig {
+        keep_last: Some(1),
+        ..RetentionConfig::default()
+    };
+
+    backup_single_source(&config, &source_a, "a", "snap-a");
+    std::thread::sleep(Duration::from_millis(2));
+    backup_single_source(&config, &source_b, "b", "snap-b");
+
+    let (stats, _) = commands::prune::run(&config, None, false, false, &[], &[], None)
+        .expect("prune should succeed without a sources block");
+
+    assert_eq!(stats.pruned, 0);
+    assert_eq!(stats.kept, 2);
+
+    let after = open_local_repo(&repo_dir);
+    let names: Vec<_> = after
+        .manifest()
+        .snapshots
+        .iter()
+        .map(|e| e.name.as_str())
+        .collect();
+    assert!(names.contains(&"snap-a"));
+    assert!(names.contains(&"snap-b"));
+}
+
+/// Without any configured sources, prune still needs a retention rule to do
+/// anything — verify the consolidated guard fires.
+#[test]
+fn prune_errors_without_retention_rules_when_sources_empty() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = tmp.path().join("repo");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+
+    let config = init_repo(&repo_dir);
+    let err = commands::prune::run(&config, None, true, false, &[], &[], None)
+        .err()
+        .unwrap();
+    assert!(
+        matches!(err, VykarError::Config(msg) if msg.contains("no retention rules configured"))
+    );
+}
+
 /// When the snapshot blobs have been deleted from storage (commit point
 /// reached) but Phase 3 refcount cleanup fails, `prune::run` must return
 /// `Ok((stats, _))` with `stats.warnings` populated rather than propagating

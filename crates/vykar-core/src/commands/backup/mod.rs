@@ -379,9 +379,9 @@ pub fn run_with_progress(
     let multi_path = source_paths.len() > 1;
 
     // Resolve every configured source up-front: stat, canonicalize, derive
-    // basename + emission policy, and reject duplicate basenames. This runs
-    // BEFORE opening the repo so any source-validation failure short-circuits
-    // with no session registered.
+    // snapshot prefix + emission policy, and reject equal-prefix or nested-
+    // canonical-root collisions. This runs BEFORE opening the repo so any
+    // source-validation failure short-circuits with no session registered.
     let resolved_sources = source::ResolvedSource::resolve_all(source_paths, multi_path)?;
 
     let _nice_guard = match limits::NiceGuard::apply(config.limits.nice) {

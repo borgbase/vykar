@@ -94,6 +94,17 @@ compression:
 #     label: writing
 #     exclude:
 #       - "*.tmp"
+#
+# Inside a multi-path source, each path's contents are prefixed in the
+# snapshot by its full absolute path (leading `/` stripped on Unix,
+# drive-letter colon dropped and backslashes converted on Windows). This
+# lets paths with the same basename coexist:
+#
+# sources:
+#   - paths:
+#       - /etc
+#       - /var/lib/machines/base/etc
+#     label: etc-everywhere
 
 # Dump-only source (no filesystem paths; label required):
 #

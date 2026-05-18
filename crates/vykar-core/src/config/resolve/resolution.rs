@@ -1440,47 +1440,33 @@ sources:
     }
 
     #[test]
-    fn test_sources_reject_duplicate_basenames_in_multi_path() {
-        let yaml = r#"
+    fn test_sources_accept_duplicate_basenames_in_multi_path() {
+        // Multi-path sources with duplicate basenames are accepted at load
+        // time — disambiguation now happens at ResolvedSource::resolve_all
+        // via the full-path snapshot prefix. (Issue #143.)
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a").join("docs");
+        let b = dir.path().join("b").join("docs");
+        fs::create_dir_all(&a).unwrap();
+        fs::create_dir_all(&b).unwrap();
+        let yaml = format!(
+            r#"
 repositories:
   - url: /tmp/repo
 sources:
   - paths:
-      - /home/user/a/docs
-      - /home/user/b/docs
+      - {}
+      - {}
     label: multi
-"#;
-        let dir = tempfile::tempdir().unwrap();
+"#,
+            a.display(),
+            b.display()
+        );
         let path = dir.path().join("config.yaml");
         fs::write(&path, yaml).unwrap();
 
-        let err = load_and_resolve(&path).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("duplicate basename 'docs'"),
-            "unexpected: {msg}"
-        );
-    }
-
-    #[test]
-    fn test_sources_reject_duplicate_basenames_in_simple_group() {
-        let yaml = r#"
-repositories:
-  - url: /tmp/repo
-sources:
-  - /home/user/a/docs
-  - /home/user/b/docs
-"#;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.yaml");
-        fs::write(&path, yaml).unwrap();
-
-        let err = load_and_resolve(&path).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("duplicate basename 'docs'"),
-            "unexpected: {msg}"
-        );
+        let repos = load_and_resolve(&path).unwrap();
+        assert_eq!(repos[0].sources[0].paths.len(), 2);
     }
 
     #[test]

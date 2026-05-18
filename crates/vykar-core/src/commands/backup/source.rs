@@ -1,9 +1,9 @@
 //! Source-path resolution: classify each configured source as directory or
 //! file, compute its canonical absolute path, choose the snapshot-root emission
-//! policy, and reject unsafe / duplicate basenames. Executed once per backup.
+//! policy, and reject prefix collisions / nested roots. Executed once per backup.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use crate::repo::file_cache::{ParentReusePolicy, ParentReuseRoot};
 use vykar_types::error::{Result, VykarError};
@@ -16,7 +16,7 @@ pub(crate) enum SourceKind {
 }
 
 /// Whether to emit a synthetic root entry for this source and, if so, the
-/// basename to use for the snapshot prefix.
+/// prefix to use for snapshot paths.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RootEmission {
     /// Single-path directory backup — descendants' paths are relative to the
@@ -24,8 +24,8 @@ pub(crate) enum RootEmission {
     SkipRoot,
     /// Multi-path directory backup OR any file source. The walker emits the
     /// real root entry first, and descendants (if any) are prefixed with
-    /// `basename`.
-    EmitRoot { basename: String },
+    /// `prefix`. May be multi-component (e.g. `var/lib/machines/base/etc`).
+    EmitRoot { prefix: String },
 }
 
 /// Resolved source-path state, computed once per backup.
@@ -45,7 +45,7 @@ impl ResolvedSource {
     /// Resolve a single configured source path.
     ///
     /// Stats with [`std::fs::metadata`] (follows symlinks), canonicalizes, and
-    /// derives the basename + policy. No cached metadata is stored — the walker
+    /// derives the prefix + policy. No cached metadata is stored — the walker
     /// re-stats at emission time to avoid a resolve→emission TOCTOU window.
     pub fn resolve(configured: &str, multi_path: bool) -> Result<Self> {
         let configured_path = Path::new(configured);
@@ -73,16 +73,28 @@ impl ResolvedSource {
         });
         let abs_source_str = abs_source.to_string_lossy().to_string();
 
-        let emit_root = multi_path || kind != SourceKind::Directory;
-
-        let policy = if emit_root {
-            let basename = derive_basename(configured_path, &abs_source);
-            if basename.is_empty() {
+        // For single-path single-source files, keep the legacy basename so
+        // `/tmp/hello.txt` continues to land at `hello.txt` (no gratuitous
+        // layout change for the common single-file recipe). For everything
+        // else that needs an EmitRoot (multi-path, or directory in multi
+        // mode), derive the prefix from the absolute configured path so
+        // paths with the same basename can coexist.
+        let policy = if multi_path {
+            let prefix = derive_snapshot_prefix(configured_path, &abs_source);
+            if prefix.is_empty() {
+                return Err(VykarError::Config(format!(
+                    "source has no safe prefix: {configured}"
+                )));
+            }
+            RootEmission::EmitRoot { prefix }
+        } else if kind == SourceKind::File {
+            let prefix = derive_basename(configured_path, &abs_source);
+            if prefix.is_empty() {
                 return Err(VykarError::Config(format!(
                     "source has no safe basename: {configured}"
                 )));
             }
-            RootEmission::EmitRoot { basename }
+            RootEmission::EmitRoot { prefix }
         } else {
             RootEmission::SkipRoot
         };
@@ -102,8 +114,8 @@ impl ResolvedSource {
     pub fn parent_reuse_root(&self) -> ParentReuseRoot {
         let policy = match &self.policy {
             RootEmission::SkipRoot => ParentReusePolicy::SkipRoot,
-            RootEmission::EmitRoot { basename } => ParentReusePolicy::EmitRoot {
-                basename: basename.clone(),
+            RootEmission::EmitRoot { prefix } => ParentReusePolicy::EmitRoot {
+                prefix: prefix.clone(),
             },
         };
         ParentReuseRoot {
@@ -112,21 +124,54 @@ impl ResolvedSource {
         }
     }
 
-    /// Resolve a batch of configured paths. Rejects duplicate basenames across
-    /// `EmitRoot` sources with a single clear error naming both colliding paths.
+    /// Resolve a batch of configured paths. Rejects two failure modes that
+    /// would produce snapshot-path collisions:
+    ///
+    /// 1. Two `EmitRoot` sources resolving to the same snapshot prefix.
+    /// 2. One `EmitRoot` source's canonical root is a strict path-component
+    ///    ancestor of another's — every file under the inner root would
+    ///    appear twice in the snapshot under different prefixes.
     pub fn resolve_all(configured: &[String], multi_path: bool) -> Result<Vec<Self>> {
-        let mut resolved = Vec::with_capacity(configured.len());
-        let mut seen_basenames: HashMap<String, String> = HashMap::new();
+        let mut resolved: Vec<Self> = Vec::with_capacity(configured.len());
+        let mut seen_prefixes: HashMap<String, String> = HashMap::new();
 
         for cfg in configured {
             let source = Self::resolve(cfg, multi_path)?;
-            if let RootEmission::EmitRoot { basename } = &source.policy {
-                if let Some(prev) = seen_basenames.get(basename) {
+            if let RootEmission::EmitRoot { prefix } = &source.policy {
+                if let Some(prev) = seen_prefixes.get(prefix) {
                     return Err(VykarError::Config(format!(
-                        "duplicate source basename '{basename}' — sources {prev} and {cfg} would collide in the snapshot"
+                        "sources {prev} and {cfg} both resolve to snapshot prefix '{prefix}'"
                     )));
                 }
-                seen_basenames.insert(basename.clone(), cfg.clone());
+                // Reject nested canonical roots in either direction. Today
+                // /foo + /foo/bar accidentally avoided collision via differing
+                // basenames but already double-stored every file under
+                // /foo/bar — the new scheme produces real snapshot-path
+                // collisions, so reject explicitly.
+                if matches!(source.policy, RootEmission::EmitRoot { .. }) {
+                    for other in &resolved {
+                        if !matches!(other.policy, RootEmission::EmitRoot { .. }) {
+                            continue;
+                        }
+                        if source.abs_source.strip_prefix(&other.abs_source).is_ok()
+                            && source.abs_source != other.abs_source
+                        {
+                            return Err(VykarError::Config(format!(
+                                "source {cfg} is nested under source {} — backing up both would produce duplicate snapshot entries",
+                                other.configured
+                            )));
+                        }
+                        if other.abs_source.strip_prefix(&source.abs_source).is_ok()
+                            && other.abs_source != source.abs_source
+                        {
+                            return Err(VykarError::Config(format!(
+                                "source {} is nested under source {cfg} — backing up both would produce duplicate snapshot entries",
+                                other.configured
+                            )));
+                        }
+                    }
+                }
+                seen_prefixes.insert(prefix.clone(), cfg.clone());
             }
             resolved.push(source);
         }
@@ -137,15 +182,114 @@ impl ResolvedSource {
 
 /// Prefer the configured spelling for the basename, falling back to the
 /// canonical path's last component when the configured path has no safe name
-/// (e.g. `.`, `..`, or an empty string).
+/// (e.g. `.`, `..`, or an empty string). Explicitly rejects `.` and `..` even
+/// if `Path::file_name` returns them — the restore-time sanitizer rejects any
+/// snapshot path containing those components, so a basename of `..` must never
+/// reach the snapshot.
 fn derive_basename(configured: &Path, abs_source: &Path) -> String {
     if let Some(name) = configured.file_name() {
-        return name.to_string_lossy().to_string();
+        let s = name.to_string_lossy();
+        if is_safe_basename(&s) {
+            return s.to_string();
+        }
     }
     if let Some(name) = abs_source.file_name() {
-        return name.to_string_lossy().to_string();
+        let s = name.to_string_lossy();
+        if is_safe_basename(&s) {
+            return s.to_string();
+        }
     }
     String::new()
+}
+
+fn is_safe_basename(s: &str) -> bool {
+    !s.is_empty() && s != "." && s != ".."
+}
+
+/// Make a configured path absolute (no canonicalize / no symlink follow) and
+/// lexically clean it. Returns None if cleaning would escape the filesystem
+/// root (e.g. `/..`) or produce a path with no name components — caller falls
+/// back to basename.
+fn absolutize_and_clean(p: &Path) -> Option<PathBuf> {
+    let abs = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        std::env::current_dir().ok()?.join(p)
+    };
+    let mut out = PathBuf::new();
+    for component in abs.components() {
+        match component {
+            Component::Prefix(pre) => out.push(pre.as_os_str()),
+            Component::RootDir => out.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !pop_normal(&mut out) {
+                    return None;
+                }
+            }
+            Component::Normal(part) => out.push(part),
+        }
+    }
+    Some(out)
+}
+
+/// Pop the trailing `Normal` component from `out`. Returns false if the
+/// trailing component is not a `Normal` (i.e. only root/prefix remain), so the
+/// caller can detect an attempt to escape the filesystem root via `..`.
+fn pop_normal(out: &mut PathBuf) -> bool {
+    let mut components: Vec<Component> = out.components().collect();
+    match components.last() {
+        Some(Component::Normal(_)) => {
+            components.pop();
+            let mut rebuilt = PathBuf::new();
+            for c in components {
+                match c {
+                    Component::Prefix(pre) => rebuilt.push(pre.as_os_str()),
+                    Component::RootDir => rebuilt.push(c.as_os_str()),
+                    Component::Normal(part) => rebuilt.push(part),
+                    Component::CurDir | Component::ParentDir => {}
+                }
+            }
+            *out = rebuilt;
+            true
+        }
+        _ => false,
+    }
+}
+
+#[cfg(unix)]
+fn derive_snapshot_prefix(configured: &Path, abs_source: &Path) -> String {
+    let abs_clean = match absolutize_and_clean(configured) {
+        Some(p) => p,
+        None => return derive_basename(configured, abs_source),
+    };
+    let s = abs_clean.to_string_lossy();
+    let trimmed = s.strip_prefix('/').unwrap_or(&s).trim_end_matches('/');
+    if trimmed.is_empty() {
+        derive_basename(configured, abs_source)
+    } else {
+        trimmed.to_string()
+    }
+}
+
+#[cfg(windows)]
+fn derive_snapshot_prefix(configured: &Path, abs_source: &Path) -> String {
+    let abs_clean = match absolutize_and_clean(configured) {
+        Some(p) => p,
+        None => return derive_basename(configured, abs_source),
+    };
+    // dunce::simplified strips the \\?\ verbatim prefix if present.
+    let simplified = dunce::simplified(&abs_clean);
+    let s = simplified.to_string_lossy().replace('\\', '/');
+    // Drive letter: "C:/Users/..." → "C/Users/..."
+    // UNC root:    "//server/share/..." → "server/share/..."
+    let s = s.replacen(':', "", 1);
+    let trimmed = s.trim_start_matches('/').trim_end_matches('/');
+    if trimmed.is_empty() {
+        derive_basename(configured, abs_source)
+    } else {
+        trimmed.to_string()
+    }
 }
 
 #[cfg(test)]
@@ -154,6 +298,15 @@ mod tests {
 
     fn cfg(path: &Path) -> String {
         path.to_string_lossy().to_string()
+    }
+
+    /// The expected snapshot prefix for a directory under `tmpdir` whose
+    /// configured absolute form ends in `tail` (e.g. `/data`). Equivalent to
+    /// the absolute path with leading `/` stripped.
+    #[cfg(unix)]
+    fn expected_prefix(abs_path: &Path) -> String {
+        let s = abs_path.to_string_lossy().to_string();
+        s.strip_prefix('/').unwrap_or(&s).to_string()
     }
 
     #[test]
@@ -165,6 +318,7 @@ mod tests {
         assert_eq!(resolved.policy, RootEmission::SkipRoot);
     }
 
+    #[cfg(unix)]
     #[test]
     fn resolve_directory_multi() {
         let tmp = tempfile::tempdir().unwrap();
@@ -174,24 +328,30 @@ mod tests {
         let resolved = ResolvedSource::resolve(&src, true).unwrap();
         assert_eq!(resolved.kind, SourceKind::Directory);
         match resolved.policy {
-            RootEmission::EmitRoot { basename } => assert_eq!(basename, "data"),
+            RootEmission::EmitRoot { prefix } => {
+                assert!(prefix.ends_with("/data"), "got: {prefix}");
+                assert_eq!(prefix, expected_prefix(&dir));
+            }
             _ => panic!("expected EmitRoot"),
         }
     }
 
     #[test]
     fn resolve_file() {
+        // Single-path single-source file: keeps `derive_basename` so
+        // `/tmp/hello.txt` lands at `hello.txt`, not `tmp/hello.txt`.
         let tmp = tempfile::tempdir().unwrap();
         let file = tmp.path().join("hello.txt");
         std::fs::write(&file, b"x").unwrap();
         let resolved = ResolvedSource::resolve(&cfg(&file), false).unwrap();
         assert_eq!(resolved.kind, SourceKind::File);
         match resolved.policy {
-            RootEmission::EmitRoot { basename } => assert_eq!(basename, "hello.txt"),
+            RootEmission::EmitRoot { prefix } => assert_eq!(prefix, "hello.txt"),
             _ => panic!("expected EmitRoot for file"),
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn resolve_file_multi() {
         let tmp = tempfile::tempdir().unwrap();
@@ -200,7 +360,9 @@ mod tests {
         let resolved = ResolvedSource::resolve(&cfg(&file), true).unwrap();
         assert_eq!(resolved.kind, SourceKind::File);
         match resolved.policy {
-            RootEmission::EmitRoot { basename } => assert_eq!(basename, "notes.md"),
+            RootEmission::EmitRoot { prefix } => {
+                assert!(prefix.ends_with("/notes.md"), "got: {prefix}");
+            }
             _ => panic!("expected EmitRoot for file"),
         }
     }
@@ -218,9 +380,13 @@ mod tests {
         let resolved = ResolvedSource::resolve(&cfg(&link), true).unwrap();
         assert_eq!(resolved.kind, SourceKind::Directory);
         assert_eq!(resolved.abs_source, std::fs::canonicalize(&real).unwrap());
-        // Preserves the configured name, not the target name.
+        // The prefix is derived from the configured path (not canonicalized),
+        // so the configured name `docs` wins over the canonical `real-docs`.
         match resolved.policy {
-            RootEmission::EmitRoot { basename } => assert_eq!(basename, "docs"),
+            RootEmission::EmitRoot { prefix } => {
+                assert!(prefix.ends_with("/docs"), "got: {prefix}");
+                assert!(!prefix.contains("real-docs"), "got: {prefix}");
+            }
             _ => panic!("expected EmitRoot"),
         }
     }
@@ -235,10 +401,11 @@ mod tests {
         let link = tmp.path().join("alias");
         unix_fs::symlink(&real, &link).unwrap();
 
+        // Single-source file: still keeps the configured basename.
         let resolved = ResolvedSource::resolve(&cfg(&link), false).unwrap();
         assert_eq!(resolved.kind, SourceKind::File);
         match resolved.policy {
-            RootEmission::EmitRoot { basename } => assert_eq!(basename, "alias"),
+            RootEmission::EmitRoot { prefix } => assert_eq!(prefix, "alias"),
             _ => panic!("expected EmitRoot"),
         }
     }
@@ -255,6 +422,9 @@ mod tests {
         unix_fs::symlink(&shared, &link_a).unwrap();
         unix_fs::symlink(&shared, &link_b).unwrap();
 
+        // Two symlinks pointing at the same target with *distinct* configured
+        // names produce distinct prefixes (ending in `/a` and `/b`), so the
+        // equal-prefix check doesn't fire.
         let resolved = ResolvedSource::resolve_all(&[cfg(&link_a), cfg(&link_b)], true).unwrap();
         assert_eq!(resolved.len(), 2);
     }
@@ -278,6 +448,7 @@ mod tests {
         assert!(matches!(err, VykarError::Config(_)), "got: {err:?}");
     }
 
+    #[cfg(unix)]
     #[test]
     fn resolve_trailing_slash() {
         let tmp = tempfile::tempdir().unwrap();
@@ -287,11 +458,15 @@ mod tests {
         s.push('/');
         let resolved = ResolvedSource::resolve(&s, true).unwrap();
         match resolved.policy {
-            RootEmission::EmitRoot { basename } => assert_eq!(basename, "foo"),
+            RootEmission::EmitRoot { prefix } => {
+                assert!(prefix.ends_with("/foo"), "got: {prefix}");
+                assert!(!prefix.ends_with('/'), "got: {prefix}");
+            }
             _ => panic!("expected EmitRoot"),
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn resolve_dot_source() {
         let _lock = crate::testutil::CWD_LOCK.lock().unwrap();
@@ -303,16 +478,17 @@ mod tests {
 
         let resolved = result.unwrap();
         match resolved.policy {
-            RootEmission::EmitRoot { basename } => {
-                assert!(!basename.is_empty(), "basename should not be empty");
-                assert_ne!(basename, ".");
-                assert_ne!(basename, "..");
-                assert_ne!(basename, "/");
+            RootEmission::EmitRoot { prefix } => {
+                assert!(!prefix.is_empty(), "prefix should not be empty");
+                assert!(!prefix.contains("/./"), "got: {prefix}");
+                assert!(!prefix.contains("/../"), "got: {prefix}");
+                assert!(!prefix.starts_with('/'), "got: {prefix}");
             }
             _ => panic!("expected EmitRoot"),
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn resolve_dotdot_source() {
         let _lock = crate::testutil::CWD_LOCK.lock().unwrap();
@@ -326,9 +502,9 @@ mod tests {
 
         let resolved = result.unwrap();
         match resolved.policy {
-            RootEmission::EmitRoot { basename } => {
-                assert!(!basename.is_empty());
-                assert_ne!(basename, "..");
+            RootEmission::EmitRoot { prefix } => {
+                assert!(!prefix.is_empty());
+                assert!(!prefix.contains(".."), "got: {prefix}");
             }
             _ => panic!("expected EmitRoot"),
         }
@@ -338,7 +514,7 @@ mod tests {
     #[test]
     fn resolve_root_skiproot() {
         // Filesystem root with SkipRoot policy (single-path, directory) is
-        // acceptable because the basename is never consulted.
+        // acceptable because the prefix is never consulted.
         let resolved = ResolvedSource::resolve("/", false).unwrap();
         assert_eq!(resolved.policy, RootEmission::SkipRoot);
     }
@@ -348,29 +524,83 @@ mod tests {
     fn resolve_root_emitroot_rejected() {
         let err = ResolvedSource::resolve("/", true).unwrap_err();
         match err {
-            VykarError::Config(msg) => assert!(msg.contains("no safe basename")),
-            other => panic!("expected Config error, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn resolve_all_rejects_duplicate_basenames() {
-        let tmp1 = tempfile::tempdir().unwrap();
-        let tmp2 = tempfile::tempdir().unwrap();
-        let a = tmp1.path().join("data");
-        let b = tmp2.path().join("data");
-        std::fs::create_dir(&a).unwrap();
-        std::fs::create_dir(&b).unwrap();
-        let err = ResolvedSource::resolve_all(&[cfg(&a), cfg(&b)], true).unwrap_err();
-        match err {
             VykarError::Config(msg) => {
-                assert!(msg.contains("duplicate source basename"), "got: {msg}");
-                assert!(msg.contains("data"), "got: {msg}");
+                assert!(
+                    msg.contains("no safe prefix") || msg.contains("no safe basename"),
+                    "got: {msg}"
+                );
             }
             other => panic!("expected Config error, got {other:?}"),
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn resolve_all_accepts_duplicate_basenames_distinct_parents() {
+        // `/tmp/a/etc` and `/tmp/b/etc` both have basename "etc" but distinct
+        // absolute-path prefixes (`tmp/.../a/etc` vs `tmp/.../b/etc`), so the
+        // new scheme accepts both. This is the issue #143 scenario.
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a").join("etc");
+        let b = tmp.path().join("b").join("etc");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let resolved = ResolvedSource::resolve_all(&[cfg(&a), cfg(&b)], true).unwrap();
+        assert_eq!(resolved.len(), 2);
+        let prefixes: Vec<String> = resolved
+            .iter()
+            .filter_map(|s| match &s.policy {
+                RootEmission::EmitRoot { prefix } => Some(prefix.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_ne!(prefixes[0], prefixes[1]);
+        assert!(prefixes[0].ends_with("/etc"));
+        assert!(prefixes[1].ends_with("/etc"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_all_rejects_equal_prefix() {
+        // Two configured paths that absolutize to the same string (here,
+        // duplicate config entries).
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("data");
+        std::fs::create_dir(&dir).unwrap();
+        let err = ResolvedSource::resolve_all(&[cfg(&dir), cfg(&dir)], true).unwrap_err();
+        match err {
+            VykarError::Config(msg) => {
+                assert!(
+                    msg.contains("snapshot prefix") || msg.contains("nested"),
+                    "got: {msg}"
+                );
+            }
+            other => panic!("expected Config error, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_all_rejects_nested_roots() {
+        // `/tmp/foo` + `/tmp/foo/bar` — bar's contents would be double-stored.
+        let tmp = tempfile::tempdir().unwrap();
+        let outer = tmp.path().join("foo");
+        let inner = outer.join("bar");
+        std::fs::create_dir_all(&inner).unwrap();
+        let err = ResolvedSource::resolve_all(&[cfg(&outer), cfg(&inner)], true).unwrap_err();
+        match err {
+            VykarError::Config(msg) => assert!(msg.contains("nested"), "got: {msg}"),
+            other => panic!("expected Config error, got {other:?}"),
+        }
+        // Symmetric: inner-then-outer also rejected.
+        let err = ResolvedSource::resolve_all(&[cfg(&inner), cfg(&outer)], true).unwrap_err();
+        match err {
+            VykarError::Config(msg) => assert!(msg.contains("nested"), "got: {msg}"),
+            other => panic!("expected Config error, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
     #[test]
     fn resolve_all_distinct_basenames_ok() {
         let tmp = tempfile::tempdir().unwrap();
@@ -380,5 +610,90 @@ mod tests {
         std::fs::create_dir(&b).unwrap();
         let resolved = ResolvedSource::resolve_all(&[cfg(&a), cfg(&b)], true).unwrap();
         assert_eq!(resolved.len(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn derive_snapshot_prefix_collapses_dotdot() {
+        // Lexical normalization collapses `..` components before they become
+        // part of the prefix — required because the restore-time sanitizer
+        // rejects snapshot paths containing `..`.
+        let tmp = tempfile::tempdir().unwrap();
+        let foo = tmp.path().join("foo");
+        let bar = tmp.path().join("bar");
+        std::fs::create_dir(&foo).unwrap();
+        std::fs::create_dir(&bar).unwrap();
+        let cfg_path = foo.join("..").join("bar");
+        let prefix = derive_snapshot_prefix(&cfg_path, &bar);
+        assert!(!prefix.contains(".."), "got: {prefix}");
+        assert!(prefix.ends_with("/bar"), "got: {prefix}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn derive_snapshot_prefix_falls_back_on_root_escape() {
+        // `/..` would escape the root; fall back to derive_basename, which
+        // must never produce `.`, `..`, or any multi-component path —
+        // restore-time sanitization rejects all of these.
+        let prefix = derive_snapshot_prefix(Path::new("/.."), Path::new("/"));
+        assert!(!prefix.contains('/'), "got: {prefix}");
+        assert_ne!(prefix, ".", "got: {prefix}");
+        assert_ne!(prefix, "..", "got: {prefix}");
+        // With the current sanitizing fallback, `/..` produces an empty
+        // prefix so resolve() can surface a clean error.
+        assert!(prefix.is_empty(), "got: {prefix}");
+    }
+
+    #[test]
+    fn derive_basename_rejects_dot_and_dotdot() {
+        // Defensive guard: even if Path::file_name ever returned `.` or `..`,
+        // derive_basename must collapse those to empty so the caller errors
+        // out instead of producing an unrestorable snapshot prefix.
+        assert_eq!(derive_basename(Path::new(".."), Path::new("..")), "");
+        assert_eq!(derive_basename(Path::new("."), Path::new(".")), "");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_dotdot_root_emitroot_rejected() {
+        // `/..` in EmitRoot mode must error — the cleaned prefix is empty
+        // and the basename fallback also rejects it.
+        let err = ResolvedSource::resolve("/..", true).unwrap_err();
+        match err {
+            VykarError::Config(msg) => {
+                assert!(
+                    msg.contains("no safe prefix") || msg.contains("no safe basename"),
+                    "got: {msg}"
+                );
+            }
+            other => panic!("expected Config error, got {other:?}"),
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn derive_snapshot_prefix_windows_drive_letter() {
+        let prefix = derive_snapshot_prefix(
+            Path::new(r"C:\Users\me\docs"),
+            Path::new(r"C:\Users\me\docs"),
+        );
+        assert_eq!(prefix, "C/Users/me/docs");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn derive_snapshot_prefix_windows_unc() {
+        let prefix = derive_snapshot_prefix(
+            Path::new(r"\\server\share\dir"),
+            Path::new(r"\\server\share\dir"),
+        );
+        assert_eq!(prefix, "server/share/dir");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn derive_snapshot_prefix_windows_verbatim() {
+        let prefix = derive_snapshot_prefix(Path::new(r"\\?\C:\foo"), Path::new(r"\\?\C:\foo"));
+        assert_eq!(prefix, "C/foo");
     }
 }

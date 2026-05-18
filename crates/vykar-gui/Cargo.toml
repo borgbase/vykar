@@ -28,7 +28,7 @@ zeroize.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 image = { version = "0.25", default-features = false, features = ["png"] }
-dunce = "1"
+dunce = { workspace = true }
 auto-launch = "0.6"
 
 [target.'cfg(target_os = "linux")'.dependencies]

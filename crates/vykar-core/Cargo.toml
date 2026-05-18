@@ -36,6 +36,7 @@ zstd = "0.13"
 fastcdc = "4"
 
 # Filesystem
+dunce = { workspace = true }
 tempfile.workspace = true
 globset = "0.4"
 ignore = "0.4"

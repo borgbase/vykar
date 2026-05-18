@@ -197,12 +197,26 @@ fn backup_mixed_file_and_directory_sources() {
     )
     .unwrap();
 
+    // Multi-path sources are prefixed by the full configured absolute path
+    // (leading separator stripped). The restored layout therefore mirrors
+    // the original absolute layout under `restore_dir`.
+    let strip_root = |p: &Path| -> std::path::PathBuf {
+        let mut out = std::path::PathBuf::new();
+        for c in p.components() {
+            if let std::path::Component::Normal(part) = c {
+                out.push(part);
+            }
+        }
+        out
+    };
+    let dir_rel = strip_root(&dir);
+    let file_rel = strip_root(&file);
     assert_eq!(
-        std::fs::read(restore_dir.join("dir/inside.txt")).unwrap(),
+        std::fs::read(restore_dir.join(dir_rel).join("inside.txt")).unwrap(),
         b"inside"
     );
     assert_eq!(
-        std::fs::read(restore_dir.join("standalone.txt")).unwrap(),
+        std::fs::read(restore_dir.join(file_rel)).unwrap(),
         b"standalone"
     );
 }

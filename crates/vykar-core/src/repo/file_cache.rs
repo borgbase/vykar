@@ -782,9 +782,10 @@ pub enum ParentReusePolicy {
     /// Descendants are emitted relative to `abs_root`; no synthetic root entry
     /// is present in the snapshot.
     SkipRoot,
-    /// Snapshot paths are prefixed with `basename`; when the item path equals
-    /// `basename` exactly, the "remainder" is empty (file source).
-    EmitRoot { basename: String },
+    /// Snapshot paths are prefixed with `prefix`; when the item path equals
+    /// `prefix` exactly, the "remainder" is empty (file source). The `prefix`
+    /// may be multi-component (e.g. `var/lib/machines/base/etc`).
+    EmitRoot { prefix: String },
 }
 
 /// One root plus its policy, used to invert snapshot item paths back into
@@ -799,12 +800,12 @@ impl ParentReuseRoot {
     fn invert(&self, item_path: &str) -> Option<PathBuf> {
         match &self.policy {
             ParentReusePolicy::SkipRoot => Some(Path::new(&self.abs_root).join(item_path)),
-            ParentReusePolicy::EmitRoot { basename } => {
-                if item_path == basename {
+            ParentReusePolicy::EmitRoot { prefix } => {
+                if item_path == prefix {
                     Some(PathBuf::from(&self.abs_root))
                 } else {
                     item_path
-                        .strip_prefix(basename.as_str())
+                        .strip_prefix(prefix.as_str())
                         .and_then(|r| r.strip_prefix('/'))
                         .map(|rest| Path::new(&self.abs_root).join(rest))
                 }
@@ -828,7 +829,8 @@ impl ParentReuseBuilder {
     /// Create a builder from a list of `ParentReuseRoot`s. Each root carries
     /// the canonical filesystem root plus its emission policy, so inversion
     /// is uniform across SkipRoot / EmitRoot / EmitRoot-with-empty-remainder
-    /// cases.
+    /// cases. Nested canonical roots and equal prefixes are rejected at
+    /// source resolution, so first-match traversal is unambiguous here.
     pub fn new(roots: Vec<ParentReuseRoot>) -> Self {
         Self {
             entries: HashMap::new(),
@@ -938,8 +940,9 @@ impl ParentReuseIndex {
 
 /// Reconstruct the absolute path that the walker will use for cache lookups,
 /// given a snapshot item path and a list of `ParentReuseRoot`s. Returns the
-/// first root that matches — duplicate basenames are rejected up front at
-/// source resolution, so first-match is unambiguous for current snapshots.
+/// first root that matches — equal prefixes and nested canonical roots are
+/// rejected up front at source resolution, so first-match is unambiguous for
+/// current snapshots.
 ///
 /// Uses `Path::join` + `to_string_lossy` to produce the same string form
 /// as the walker's `abs_path.to_string_lossy()`.
@@ -1737,7 +1740,7 @@ mod tests {
     }
 
     /// Helper: build a ParentReuseIndex from a Vec<Item> using the builder.
-    /// Accepts raw source paths and derives ParentReuseRoot (basename =
+    /// Accepts raw source paths and derives ParentReuseRoot (prefix =
     /// last component of the path).
     fn build_parent_index(
         items: Vec<Item>,
@@ -1748,12 +1751,12 @@ mod tests {
             .iter()
             .map(|sp| {
                 let p = Path::new(sp);
-                let basename = p
+                let prefix = p
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_else(|| sp.clone());
                 let policy = if multi_path {
-                    ParentReusePolicy::EmitRoot { basename }
+                    ParentReusePolicy::EmitRoot { prefix }
                 } else {
                     ParentReusePolicy::SkipRoot
                 };
@@ -1998,11 +2001,11 @@ mod tests {
         }
     }
 
-    fn emitroot(abs_root: &str, basename: &str) -> ParentReuseRoot {
+    fn emitroot(abs_root: &str, prefix: &str) -> ParentReuseRoot {
         ParentReuseRoot {
             abs_root: abs_root.to_string(),
             policy: ParentReusePolicy::EmitRoot {
-                basename: basename.to_string(),
+                prefix: prefix.to_string(),
             },
         }
     }
@@ -2086,6 +2089,61 @@ mod tests {
         // A path whose prefix matches no root falls back to item_path as-is.
         let out = reconstruct_abs_path("other/file.txt", &roots);
         assert_eq!(out, "other/file.txt");
+    }
+
+    #[test]
+    fn parent_reuse_multi_component_prefix_inversion() {
+        // Issue #143 layout: paths like /var/lib/machines/base/etc end up
+        // with a multi-component snapshot prefix. invert() must strip the
+        // full prefix and reassemble the abs path correctly.
+        let root = emitroot("/var/lib/machines/base/etc", "var/lib/machines/base/etc");
+        let abs = root.invert("var/lib/machines/base/etc/hosts").unwrap();
+        assert_eq!(
+            abs.to_string_lossy(),
+            native_join("/var/lib/machines/base/etc", "hosts")
+        );
+        // Root entry itself (item_path == prefix).
+        let abs = root.invert("var/lib/machines/base/etc").unwrap();
+        assert_eq!(abs, PathBuf::from("/var/lib/machines/base/etc"));
+        // Paths outside the prefix don't match.
+        assert!(root.invert("var/lib/machines/base/etcXXX").is_none());
+        assert!(root.invert("other/file.txt").is_none());
+    }
+
+    #[test]
+    fn parent_reuse_no_nested_prefixes_invariant() {
+        // Belt-and-suspenders invariant check: ResolvedSource::resolve_all
+        // rejects nested canonical roots up front, so by the time a
+        // ParentReuseBuilder is constructed no two EmitRoot prefixes should
+        // be nested. Verify directly on a representative set.
+        let roots = [
+            emitroot("/mnt/a/etc", "mnt/a/etc"),
+            emitroot("/mnt/b/etc", "mnt/b/etc"),
+            emitroot("/var/log", "var/log"),
+        ];
+        let prefixes: Vec<&str> = roots
+            .iter()
+            .filter_map(|r| match &r.policy {
+                ParentReusePolicy::EmitRoot { prefix } => Some(prefix.as_str()),
+                _ => None,
+            })
+            .collect();
+        for (i, a) in prefixes.iter().enumerate() {
+            for (j, b) in prefixes.iter().enumerate() {
+                if i == j {
+                    continue;
+                }
+                // Neither is a strict path-component prefix of the other.
+                let a_path = Path::new(a);
+                let b_path = Path::new(b);
+                if a_path.strip_prefix(b_path).is_ok() {
+                    assert_eq!(a, b, "prefix {a} is nested under {b}");
+                }
+                if b_path.strip_prefix(a_path).is_ok() {
+                    assert_eq!(a, b, "prefix {b} is nested under {a}");
+                }
+            }
+        }
     }
 
     #[test]

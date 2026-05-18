@@ -52,6 +52,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 crossbeam-channel = "0.5"
 tokio = { version = "1", default-features = false }
 
+# Filesystem
+dunce = "1"
+
 # Testing
 tempfile = "3"
 proptest = "1"

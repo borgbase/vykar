@@ -88,7 +88,7 @@ pub(in crate::commands::backup) struct WalkedEntry {
     pub metadata: MetadataSummary,
     pub file_type: FileType,
     /// Pre-computed snapshot-relative path, including the multi-path / file-
-    /// source basename prefix when `RootEmission::EmitRoot` is in effect.
+    /// source prefix when `RootEmission::EmitRoot` is in effect.
     pub snapshot_path: String,
 }
 
@@ -122,13 +122,13 @@ fn root_entry_level(
     abs_source: &Path,
     file_type: FileType,
     metadata: MetadataSummary,
-    basename: &str,
+    prefix: &str,
 ) -> DirLevel {
     let root_entry = WalkedEntry {
         abs_path: abs_source.to_path_buf(),
         metadata,
         file_type,
-        snapshot_path: basename.to_string(),
+        snapshot_path: prefix.to_string(),
     };
     DirLevel {
         events: VecDeque::from([WalkEvent::Entry(root_entry)]),
@@ -174,7 +174,7 @@ pub(in crate::commands::backup) struct InodeSortedWalk {
     /// Avoids per-directory `statfs()` + `CString` allocation.
     inode_sort_for_source: bool,
     /// Snapshot-root policy: `SkipRoot` (descendants only, relative to
-    /// `abs_source`) or `EmitRoot` (prefix all emitted paths with `basename`).
+    /// `abs_source`) or `EmitRoot` (prefix all emitted paths with `prefix`).
     policy: RootEmission,
 }
 
@@ -279,23 +279,23 @@ impl InodeSortedWalk {
                 let root_level = walk.build_dir_level(&walk.abs_source)?;
                 walk.stack.push(root_level);
             }
-            (RootEmission::EmitRoot { basename }, SourceKind::Directory) => {
+            (RootEmission::EmitRoot { prefix }, SourceKind::Directory) => {
                 let descendants = walk.build_dir_level(&walk.abs_source)?;
                 walk.stack.push(descendants);
                 walk.stack.push(root_entry_level(
                     &walk.abs_source,
                     source_ft,
                     source_summary,
-                    basename,
+                    prefix,
                 ));
             }
-            (RootEmission::EmitRoot { basename }, SourceKind::File) => {
+            (RootEmission::EmitRoot { prefix }, SourceKind::File) => {
                 // Never call read_dir on a file source. This is the regression fix.
                 walk.stack.push(root_entry_level(
                     &walk.abs_source,
                     source_ft,
                     source_summary,
-                    basename,
+                    prefix,
                 ));
             }
         }
@@ -497,7 +497,7 @@ impl InodeSortedWalk {
             let rel = rel_path_from_abs(&self.abs_source, &raw.path);
             let snapshot_path = match &self.policy {
                 RootEmission::SkipRoot => rel,
-                RootEmission::EmitRoot { basename } => format!("{basename}/{rel}"),
+                RootEmission::EmitRoot { prefix } => format!("{prefix}/{rel}"),
             };
 
             events.push_back(WalkEvent::Entry(WalkedEntry {
@@ -1071,17 +1071,20 @@ mod tests {
             .collect();
         assert!(!entries.is_empty());
 
-        // Root entry emitted first with `snapshot_path == "data"`.
-        assert_eq!(entries[0].snapshot_path, "data");
+        // Root entry emitted first; under the new multi-path prefix scheme,
+        // the prefix is the full absolute configured path with leading `/`
+        // stripped (e.g. `tmp/.../data`).
+        let root_prefix = entries[0].snapshot_path.clone();
+        assert!(root_prefix.ends_with("/data"), "got: {root_prefix}");
         assert!(entries[0].file_type.is_dir());
         // Walker's fresh stat at init picks up the post-resolve mutation.
         assert_eq!(entries[0].metadata.mode & 0o777, 0o751);
 
-        // Descendants prefixed with "data/".
+        // Descendants prefixed with `<root_prefix>/`.
         let descendant_paths: Vec<String> = entries[1..]
             .iter()
             .map(|e| e.snapshot_path.clone())
             .collect();
-        assert_eq!(descendant_paths, vec!["data/a.txt"]);
+        assert_eq!(descendant_paths, vec![format!("{root_prefix}/a.txt")]);
     }
 }

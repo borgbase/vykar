@@ -280,7 +280,7 @@ fn derive_snapshot_prefix(configured: &Path, abs_source: &Path) -> String {
     };
     // dunce::simplified strips the \\?\ verbatim prefix if present.
     let simplified = dunce::simplified(&abs_clean);
-    let s = simplified.to_string_lossy().replace('\\', '/');
+    let s = simplified.to_string_lossy().replace('\\', "/");
     // Drive letter: "C:/Users/..." → "C/Users/..."
     // UNC root:    "//server/share/..." → "server/share/..."
     let s = s.replacen(':', "", 1);

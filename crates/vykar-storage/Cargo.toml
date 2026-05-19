@@ -32,7 +32,7 @@ percent-encoding = "2"
 
 # HTTP client (S3 + REST backends)
 rusty-s3 = "0.9.1"
-ureq = { version = "3", features = ["json"] }
+ureq = { workspace = true, features = ["json"] }
 http = "1"
 
 # Logging

@@ -48,6 +48,9 @@ croner = "3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# HTTP client
+ureq = "3"
+
 # Concurrency
 crossbeam-channel = "0.5"
 tokio = { version = "1", default-features = false }

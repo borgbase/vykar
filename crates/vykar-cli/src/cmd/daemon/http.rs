@@ -163,35 +163,47 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        let html = html.unwrap_or_else(|| panic!("no /: {last_err:?}"));
-        assert_eq!(html.status(), 200);
-        let ct = html.header("content-type").unwrap_or_default().to_string();
+        let mut html = html.unwrap_or_else(|| panic!("no /: {last_err:?}"));
+        assert_eq!(html.status().as_u16(), 200);
+        let ct = html
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
         assert!(ct.starts_with("text/html"), "ct = {ct}");
-        let body = html.into_string().unwrap();
+        let body = html.body_mut().read_to_string().unwrap();
         assert!(body.contains("rA"));
 
         let healthz = ureq::get(&format!("{base}/healthz")).call().unwrap();
-        assert_eq!(healthz.status(), 200);
+        assert_eq!(healthz.status().as_u16(), 200);
         assert_eq!(
-            healthz.header("content-type").unwrap_or_default(),
+            healthz
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default(),
             "text/plain; charset=utf-8"
         );
 
-        let json = ureq::get(&format!("{base}/api/status.json"))
+        let mut json = ureq::get(&format!("{base}/api/status.json"))
             .call()
             .unwrap();
-        assert_eq!(json.status(), 200);
+        assert_eq!(json.status().as_u16(), 200);
         assert_eq!(
-            json.header("content-type").unwrap_or_default(),
+            json.headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default(),
             "application/json"
         );
-        let body = json.into_string().unwrap();
+        let body = json.body_mut().read_to_string().unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(parsed["repos"][0]["name"], "rA");
 
         let nope = ureq::get(&format!("{base}/nope")).call();
         match nope {
-            Err(ureq::Error::Status(404, _)) => {}
+            Err(ureq::Error::StatusCode(404)) => {}
             other => panic!("expected 404, got {other:?}"),
         }
 

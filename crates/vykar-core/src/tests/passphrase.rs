@@ -1,3 +1,6 @@
+// Test-only env mutation; SAFETY documented per block.
+#![allow(unsafe_code)]
+
 use std::sync::Mutex;
 
 use zeroize::Zeroizing;
@@ -10,6 +13,8 @@ use super::helpers::make_test_config;
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 fn set_vykar_passphrase(value: Option<&str>) {
+    // SAFETY: callers serialize on `ENV_LOCK` so no other test thread is
+    // reading/writing env concurrently for the duration of this mutation.
     unsafe {
         match value {
             Some(v) => std::env::set_var("VYKAR_PASSPHRASE", v),

@@ -1,3 +1,7 @@
+// libc fchmod/futimens/utimensat for fd- and path-based file metadata writes;
+// SAFETY documented per block.
+#![allow(unsafe_code)]
+
 use std::fs::{FileType, Metadata};
 use std::path::Path;
 
@@ -11,6 +15,36 @@ pub struct MetadataSummary {
     pub device: u64,
     pub inode: u64,
     pub size: u64,
+    /// macOS-only: file is a FileProvider dataless placeholder (iCloud Drive,
+    /// Dropbox, OneDrive, etc.). `read()` would trigger asynchronous hydration
+    /// and metadata churn, so the backup walker skips or reuses-from-parent
+    /// instead. Always `false` on non-macOS platforms.
+    pub is_dataless: bool,
+}
+
+/// Stat an open file descriptor and build a `MetadataSummary`.
+pub fn fstat_summary(file: &std::fs::File) -> std::io::Result<MetadataSummary> {
+    let meta = file.metadata()?;
+    let ft = meta.file_type();
+    Ok(summarize_metadata(&meta, &ft))
+}
+
+/// True iff both summaries identify the same file content & identity.
+///
+/// Used for walk-vs-open and pre-vs-post drift checks during backup.
+/// Compares `size`, `mtime_ns`, `ctime_ns`, `device`, and `inode`. On
+/// Windows `device`/`inode` are always `0` (see [`summarize_metadata`]),
+/// so the rename-atop guard is effectively Unix-only.
+///
+/// `is_dataless` is intentionally **not** part of this check — drift
+/// detection is orthogonal to the dataless classification, which is
+/// resolved separately at walk time.
+pub fn metadata_matches(a: &MetadataSummary, b: &MetadataSummary) -> bool {
+    a.size == b.size
+        && a.mtime_ns == b.mtime_ns
+        && a.ctime_ns == b.ctime_ns
+        && a.device == b.device
+        && a.inode == b.inode
 }
 
 pub fn summarize_metadata(metadata: &Metadata, file_type: &FileType) -> MetadataSummary {
@@ -18,6 +52,22 @@ pub fn summarize_metadata(metadata: &Metadata, file_type: &FileType) -> Metadata
     {
         let _ = file_type;
         use std::os::unix::fs::MetadataExt;
+
+        let is_dataless = {
+            #[cfg(target_os = "macos")]
+            {
+                use std::os::macos::fs::MetadataExt as MacExt;
+                // SF_DATALESS (BSD): inode is a FileProvider placeholder
+                // (iCloud Drive, Dropbox, OneDrive, etc.). Reading the file
+                // would trigger asynchronous hydration via `fileproviderd`.
+                const SF_DATALESS: u32 = 0x4000_0000;
+                (MacExt::st_flags(metadata) & SF_DATALESS) != 0
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                false
+            }
+        };
 
         MetadataSummary {
             mode: metadata.mode(),
@@ -28,6 +78,7 @@ pub fn summarize_metadata(metadata: &Metadata, file_type: &FileType) -> Metadata
             device: metadata.dev(),
             inode: metadata.ino(),
             size: metadata.len(),
+            is_dataless,
         }
     }
 
@@ -57,6 +108,7 @@ pub fn summarize_metadata(metadata: &Metadata, file_type: &FileType) -> Metadata
             device: 0,
             inode: 0,
             size: metadata.file_size(),
+            is_dataless: false,
         }
     }
 
@@ -71,6 +123,7 @@ pub fn summarize_metadata(metadata: &Metadata, file_type: &FileType) -> Metadata
             device: 0,
             inode: 0,
             size: metadata.len(),
+            is_dataless: false,
         }
     }
 }
@@ -102,6 +155,8 @@ pub fn apply_mode_fd(file: &std::fs::File, mode: u32) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::io::AsRawFd;
+        // SAFETY: fd is borrowed from the open `file` and remains valid for
+        // this call; mode is a plain integer with no pointer dereference.
         let ret = unsafe { libc::fchmod(file.as_raw_fd(), mode as libc::mode_t) };
         if ret == 0 {
             Ok(())
@@ -132,6 +187,9 @@ pub fn set_file_mtime_fd(file: &std::fs::File, secs: i64, nanos: u32) -> std::io
                 tv_nsec: nanos as _,
             },
         ];
+        // SAFETY: fd is borrowed from the open `file` (valid for the call);
+        // `times` is a stack-owned 2-element array of timespec — well-defined
+        // input for futimens.
         let ret = unsafe { libc::futimens(file.as_raw_fd(), times.as_ptr()) };
         if ret == 0 {
             Ok(())
@@ -179,7 +237,7 @@ pub fn create_symlink(link_target: &Path, target: &Path) -> std::io::Result<()> 
                 dir_err.kind(),
                 format!(
                     "failed to create symlink as file ({}) and directory ({})",
-                    file_err.unwrap(),
+                    file_err.expect("symlink_file failed before symlink_dir fallback"),
                     dir_err
                 ),
             )),
@@ -216,6 +274,9 @@ pub fn set_file_mtime(path: &Path, secs: i64, nanos: u32) -> std::io::Result<()>
                 tv_nsec: nanos as _,
             },
         ];
+        // SAFETY: `c_path` is a valid NUL-terminated CString owned in this
+        // scope; `times` is a stack-owned 2-element array of timespec; the
+        // flag `0` is a valid utimensat flag set.
         if unsafe { libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), 0) } == 0 {
             Ok(())
         } else {
@@ -353,6 +414,74 @@ mod tests {
         let since_epoch = mtime.duration_since(SystemTime::UNIX_EPOCH).unwrap();
         let diff = (since_epoch.as_secs() as i64 - target_secs).unsigned_abs();
         assert!(diff <= 1, "mtime off by {diff} seconds");
+    }
+
+    /// `metadata_matches` must catch mutations in every guarded field.
+    /// Mutating any one of size / mtime_ns / ctime_ns / device / inode
+    /// should return false; the baseline should return true.
+    #[test]
+    fn metadata_matches_covers_all_fields() {
+        let base = MetadataSummary {
+            mode: 0o644,
+            uid: 100,
+            gid: 100,
+            mtime_ns: 111,
+            ctime_ns: 222,
+            device: 333,
+            inode: 444,
+            size: 555,
+            is_dataless: false,
+        };
+        assert!(metadata_matches(&base, &base));
+
+        let mut m = base;
+        m.size = 1;
+        assert!(!metadata_matches(&base, &m));
+
+        let mut m = base;
+        m.mtime_ns += 1;
+        assert!(!metadata_matches(&base, &m));
+
+        let mut m = base;
+        m.ctime_ns += 1;
+        assert!(!metadata_matches(&base, &m));
+
+        let mut m = base;
+        m.device = 0;
+        assert!(!metadata_matches(&base, &m));
+
+        let mut m = base;
+        m.inode = 0;
+        assert!(!metadata_matches(&base, &m));
+
+        // Changing mode/uid/gid alone does NOT count as a content-identity
+        // change — by design, only size/mtime/ctime/device/inode are
+        // content-identity fields.
+        let mut m = base;
+        m.mode = 0o777;
+        m.uid = 1;
+        m.gid = 1;
+        assert!(metadata_matches(&base, &m));
+
+        // Flipping is_dataless does NOT break content identity — drift
+        // detection is orthogonal to dataless classification.
+        let mut m = base;
+        m.is_dataless = true;
+        assert!(metadata_matches(&base, &m));
+    }
+
+    /// Non-dataless metadata produces `is_dataless: false` on every platform.
+    /// (Cannot fake `SF_DATALESS` cheaply in a unit test; manual macOS
+    /// verification covers the positive case.)
+    #[test]
+    fn summarize_metadata_marks_normal_files_not_dataless() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plain.txt");
+        std::fs::write(&path, b"hello").unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        let ft = meta.file_type();
+        let summary = summarize_metadata(&meta, &ft);
+        assert!(!summary.is_dataless);
     }
 
     #[test]

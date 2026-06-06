@@ -1,5 +1,5 @@
 fn main() {
-    slint_build::compile("ui/app.slint").unwrap();
+    slint_build::compile("ui/app.slint").expect("failed to compile Slint UI");
 
     if std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default() == "windows" {
         let mut res = winresource::WindowsResource::new();

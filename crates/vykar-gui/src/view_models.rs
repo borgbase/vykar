@@ -1,12 +1,10 @@
-use std::sync::{Arc, Mutex};
-
 use crossbeam_channel::Sender;
-use slint::{ComponentHandle, ModelRc, SharedString, StandardListViewItem, VecModel};
+use slint::{ModelRc, SharedString, StandardListViewItem, VecModel};
 use vykar_core::config::ResolvedRepo;
 
-use crate::messages::{SnapshotRowData, SourceInfoData, UiEvent};
+use crate::messages::{FindSnapshotGroup, SourceInfoData, UiEvent};
 use crate::repo_helpers::format_repo_name;
-use crate::{AppData, MainWindow};
+use crate::{FindSnapshotGroup as UiFindSnapshotGroup, SourceInfo};
 
 pub(crate) fn to_table_model(rows: Vec<Vec<String>>) -> ModelRc<ModelRc<StandardListViewItem>> {
     let outer: Vec<ModelRc<StandardListViewItem>> = rows
@@ -22,80 +20,37 @@ pub(crate) fn to_table_model(rows: Vec<Vec<String>>) -> ModelRc<ModelRc<Standard
     ModelRc::new(VecModel::from(outer))
 }
 
-pub(crate) fn to_string_model(items: Vec<String>) -> ModelRc<SharedString> {
-    let shared: Vec<SharedString> = items.into_iter().map(SharedString::from).collect();
-    ModelRc::new(VecModel::from(shared))
-}
-
-pub(crate) fn sort_snapshot_table(
-    sd: &Arc<Mutex<Vec<SnapshotRowData>>>,
-    ui_weak: &slint::Weak<MainWindow>,
-    col_idx: i32,
-    ascending: bool,
-) {
-    let Some(ui) = ui_weak.upgrade() else {
-        return;
-    };
-    let Ok(mut data) = sd.lock() else {
-        return;
-    };
-
-    // Columns: 0=ID, 1=Host, 2=Time, 3=Source, 4=Label, 5=Files, 6=Size
-    match col_idx {
-        0 => data.sort_by(|a, b| a.id.cmp(&b.id)),
-        1 => data.sort_by(|a, b| a.hostname.cmp(&b.hostname)),
-        2 => data.sort_by_key(|a| a.time_epoch),
-        3 => data.sort_by(|a, b| a.source.cmp(&b.source)),
-        4 => data.sort_by(|a, b| a.label.cmp(&b.label)),
-        5 => data.sort_by(|a, b| match (a.nfiles, b.nfiles) {
-            (Some(a), Some(b)) => a.cmp(&b),
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => std::cmp::Ordering::Equal,
-        }),
-        6 => data.sort_by(|a, b| match (a.size_bytes, b.size_bytes) {
-            (Some(a), Some(b)) => a.cmp(&b),
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => std::cmp::Ordering::Equal,
-        }),
-        _ => return,
-    }
-    if !ascending {
-        data.reverse();
-    }
-
-    let ids: Vec<String> = data.iter().map(|d| d.id.clone()).collect();
-    let rnames: Vec<String> = data.iter().map(|d| d.repo_name.clone()).collect();
-    ui.global::<AppData>()
-        .set_snapshot_ids(to_string_model(ids));
-    ui.global::<AppData>()
-        .set_snapshot_repo_names(to_string_model(rnames));
-
-    let rows: Vec<Vec<String>> = data
-        .iter()
-        .map(|d| {
-            vec![
-                d.id.clone(),
-                d.hostname.clone(),
-                d.time_str.clone(),
-                d.source.clone(),
-                d.label.clone(),
-                d.files.clone(),
-                d.size.clone(),
-            ]
+pub(crate) fn to_find_groups_model(groups: Vec<FindSnapshotGroup>) -> ModelRc<UiFindSnapshotGroup> {
+    let items: Vec<UiFindSnapshotGroup> = groups
+        .into_iter()
+        .map(|g| {
+            let row_count = g.rows.len() as i32;
+            let table_rows: Vec<Vec<String>> = g
+                .rows
+                .into_iter()
+                .map(|r| vec![r.path, r.mtime, r.size, r.status])
+                .collect();
+            UiFindSnapshotGroup {
+                snapshot_id: g.snapshot_id.into(),
+                snapshot_time: g.snapshot_time.into(),
+                row_count,
+                rows: to_table_model(table_rows),
+            }
         })
         .collect();
-    ui.set_snapshot_rows(to_table_model(rows));
+    ModelRc::new(VecModel::from(items))
 }
 
-pub(crate) fn collect_repo_names(repos: &[ResolvedRepo]) -> Vec<String> {
-    repos.iter().map(format_repo_name).collect()
+pub(crate) fn collect_repo_names(repos: &[ResolvedRepo]) -> Vec<SharedString> {
+    repos
+        .iter()
+        .map(|repo| SharedString::from(format_repo_name(repo)))
+        .collect()
 }
 
 pub(crate) fn build_source_model_data(
     repos: &[ResolvedRepo],
-) -> (Vec<SourceInfoData>, Vec<String>) {
+) -> (Vec<SourceInfoData>, Vec<SharedString>) {
     let mut seen = std::collections::HashSet::new();
     let mut items = Vec::new();
     let mut labels = Vec::new();
@@ -159,28 +114,64 @@ pub(crate) fn build_source_model_data(
             }
 
             items.push(SourceInfoData {
-                label: source.label.clone(),
-                paths: source.paths.join(", "),
-                excludes: source.exclude.join(", "),
-                target_repos: target,
-                detail_paths: source.paths.join("\n"),
-                detail_excludes: source.exclude.join("\n"),
-                detail_exclude_if_present: source.exclude_if_present.join("\n"),
-                detail_flags: flags.join(", "),
-                detail_hooks: hooks_lines.join("\n"),
-                detail_retention: retention_parts.join(", "),
+                label: source.label.clone().into(),
+                paths: source.paths.join(", ").into(),
+                excludes: source.exclude.join(", ").into(),
+                target_repos: target.into(),
+                target_repo_names: source.repos.clone(),
+                detail_paths: source.paths.join("\n").into(),
+                detail_excludes: source.exclude.join("\n").into(),
+                detail_exclude_if_present: source.exclude_if_present.join("\n").into(),
+                detail_flags: flags.join(", ").into(),
+                detail_hooks: hooks_lines.join("\n").into(),
+                detail_retention: retention_parts.join(", ").into(),
                 detail_command_dumps: source
                     .command_dumps
                     .iter()
                     .map(|d| format!("{}: {}", d.name, d.command))
                     .collect::<Vec<_>>()
-                    .join("\n"),
+                    .join("\n")
+                    .into(),
             });
-            labels.push(source.label.clone());
+            labels.push(source.label.clone().into());
         }
     }
 
     (items, labels)
+}
+
+fn source_info_from_data(d: &SourceInfoData) -> SourceInfo {
+    SourceInfo {
+        label: d.label.clone(),
+        paths: d.paths.clone(),
+        excludes: d.excludes.clone(),
+        target_repos: d.target_repos.clone(),
+        expanded: false,
+        detail_paths: d.detail_paths.clone(),
+        detail_excludes: d.detail_excludes.clone(),
+        detail_exclude_if_present: d.detail_exclude_if_present.clone(),
+        detail_flags: d.detail_flags.clone(),
+        detail_hooks: d.detail_hooks.clone(),
+        detail_retention: d.detail_retention.clone(),
+        detail_command_dumps: d.detail_command_dumps.clone(),
+    }
+}
+
+/// Build the per-repo sources model: those targeting the given repo, or all repos.
+pub(crate) fn build_repo_source_model(
+    items: &[SourceInfoData],
+    current_repo: Option<&str>,
+) -> Vec<SourceInfo> {
+    items
+        .iter()
+        .filter(|d| {
+            d.target_repo_names.is_empty()
+                || current_repo
+                    .map(|r| d.target_repo_names.iter().any(|n| n == r))
+                    .unwrap_or(false)
+        })
+        .map(source_info_from_data)
+        .collect()
 }
 
 pub(crate) fn send_structured_data(ui_tx: &Sender<UiEvent>, repos: &[ResolvedRepo]) {
@@ -188,4 +179,78 @@ pub(crate) fn send_structured_data(ui_tx: &Sender<UiEvent>, repos: &[ResolvedRep
 
     let (items, labels) = build_source_model_data(repos);
     let _ = ui_tx.send(UiEvent::SourceModelData { items, labels });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn source(label: &str, target_repo_names: &[&str]) -> SourceInfoData {
+        SourceInfoData {
+            label: label.into(),
+            paths: SharedString::default(),
+            excludes: SharedString::default(),
+            target_repos: target_repo_names.join(", ").into(),
+            target_repo_names: target_repo_names.iter().map(|s| (*s).to_string()).collect(),
+            detail_paths: SharedString::default(),
+            detail_excludes: SharedString::default(),
+            detail_exclude_if_present: SharedString::default(),
+            detail_flags: SharedString::default(),
+            detail_hooks: SharedString::default(),
+            detail_retention: SharedString::default(),
+            detail_command_dumps: SharedString::default(),
+        }
+    }
+
+    fn labels_of(model: &[SourceInfo]) -> Vec<String> {
+        model.iter().map(|s| s.label.to_string()).collect()
+    }
+
+    #[test]
+    fn empty_target_list_means_all_repos() {
+        // Sources without a targets list appear for every repo, and also when
+        // no repo is selected.
+        let items = vec![source("everywhere", &[])];
+        assert_eq!(
+            labels_of(&build_repo_source_model(&items, None)),
+            ["everywhere"]
+        );
+        assert_eq!(
+            labels_of(&build_repo_source_model(&items, Some("any-repo"))),
+            ["everywhere"]
+        );
+    }
+
+    #[test]
+    fn target_list_filters_by_current_repo() {
+        let items = vec![
+            source("docs", &["main"]),
+            source("photos", &["main", "offsite"]),
+            source("vm", &["offsite"]),
+        ];
+        assert_eq!(
+            labels_of(&build_repo_source_model(&items, Some("main"))),
+            ["docs", "photos"]
+        );
+        assert_eq!(
+            labels_of(&build_repo_source_model(&items, Some("offsite"))),
+            ["photos", "vm"]
+        );
+    }
+
+    #[test]
+    fn unmatched_repo_hides_targeted_sources() {
+        let items = vec![source("docs", &["main"]), source("any", &[])];
+        // "any" is still visible (empty target = all); "docs" is filtered out.
+        assert_eq!(
+            labels_of(&build_repo_source_model(&items, Some("other"))),
+            ["any"]
+        );
+    }
+
+    #[test]
+    fn no_selected_repo_shows_only_untargeted_sources() {
+        let items = vec![source("docs", &["main"]), source("any", &[])];
+        assert_eq!(labels_of(&build_repo_source_model(&items, None)), ["any"]);
+    }
 }

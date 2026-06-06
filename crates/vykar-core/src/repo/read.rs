@@ -75,7 +75,7 @@ impl Repository {
         let compressed = unpack_object_expect_with_context(
             &blob_data,
             ObjectType::ChunkData,
-            &chunk_id.0,
+            chunk_id.as_bytes(),
             self.crypto.as_ref(),
         )?;
         let plaintext = compress::decompress(&compressed)?;
@@ -130,8 +130,8 @@ impl Repository {
         // Drain contiguous completed slots into `out`, advancing the cursor.
         let drain_ready =
             |slots: &mut Vec<Option<Vec<u8>>>, next_emit: &mut usize, out: &mut Vec<u8>| {
-                while *next_emit < slots.len() {
-                    if let Some(data) = slots[*next_emit].take() {
+                while let Some(slot) = slots.get_mut(*next_emit) {
+                    if let Some(data) = slot.take() {
                         out.extend_from_slice(&data);
                         *next_emit += 1;
                     } else {
@@ -155,7 +155,7 @@ impl Repository {
             blobs.sort_by_key(|b| b.pack_offset);
 
             let mut iter = blobs.into_iter();
-            let first = iter.next().unwrap();
+            let first = iter.next().expect("pack blob group is non-empty");
             let mut cur_start = first.pack_offset;
             let mut cur_end = first.pack_offset + first.stored_size as u64;
             let mut cur_blobs = vec![first];
@@ -189,7 +189,13 @@ impl Repository {
         }
 
         // Sort groups so the one containing the earliest-needed slot is first.
-        groups.sort_by_key(|g| g.blobs.iter().map(|b| b.result_idx).min().unwrap());
+        groups.sort_by_key(|g| {
+            g.blobs
+                .iter()
+                .map(|b| b.result_idx)
+                .min()
+                .expect("coalesced group is non-empty")
+        });
 
         // --- Phase 3: read + decrypt + incremental drain ---
         for group in groups {
@@ -211,17 +217,25 @@ impl Repository {
                     )));
                 }
 
-                let blob_data = &raw_data[local_offset..local_end];
+                let blob_data = raw_data
+                    .get(local_offset..local_end)
+                    .expect("local_end <= raw_data.len() (checked above)");
                 let compressed = unpack_object_expect_with_context(
                     blob_data,
                     ObjectType::ChunkData,
-                    &blob.chunk_id.0,
+                    blob.chunk_id.as_bytes(),
                     self.crypto.as_ref(),
                 )?;
                 let plaintext = compress::decompress(&compressed)?;
 
                 self.blob_cache.insert(blob.chunk_id, plaintext.clone());
-                slots[blob.result_idx] = Some(plaintext);
+                let slot = slots.get_mut(blob.result_idx).ok_or_else(|| {
+                    VykarError::Other(format!(
+                        "internal error: read result index {} out of range",
+                        blob.result_idx
+                    ))
+                })?;
+                *slot = Some(plaintext);
 
                 drain_ready(&mut slots, &mut next_emit, out);
             }

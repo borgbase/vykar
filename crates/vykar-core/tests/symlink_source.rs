@@ -6,6 +6,10 @@
 //! symlink itself as a single entry.
 
 #![cfg(unix)]
+#![allow(clippy::unwrap_used)]
+#![allow(clippy::pedantic)]
+// Test-only env mutation; SAFETY per block.
+#![allow(unsafe_code)]
 
 use std::path::Path;
 use std::sync::Once;
@@ -27,6 +31,8 @@ fn init_test_environment() {
         let cache = base.join("cache");
         let _ = std::fs::create_dir_all(&home);
         let _ = std::fs::create_dir_all(&cache);
+        // SAFETY: Once::call_once runs this single-threaded at test-process
+        // startup before any threads are spawned.
         unsafe {
             std::env::set_var("HOME", &home);
             std::env::set_var("XDG_CACHE_HOME", &cache);
@@ -123,6 +129,7 @@ fn backup_symlink_to_directory_descends_target() {
         "snap",
         restore_dir.to_str().unwrap(),
         None,
+        false,
         false,
     )
     .unwrap();

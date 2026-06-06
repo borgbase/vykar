@@ -4,6 +4,11 @@
 //! a file (not a directory) as `source_paths[0]` caused `read_dir` to fail
 //! with ENOTDIR. Covers initial backup, restore, and incremental re-backup.
 
+#![allow(clippy::unwrap_used)]
+#![allow(clippy::pedantic)]
+// Test-only env mutation; SAFETY per block.
+#![allow(unsafe_code)]
+
 use std::path::Path;
 use std::sync::Once;
 
@@ -24,6 +29,8 @@ fn init_test_environment() {
         let cache = base.join("cache");
         let _ = std::fs::create_dir_all(&home);
         let _ = std::fs::create_dir_all(&cache);
+        // SAFETY: Once::call_once runs this single-threaded at test-process
+        // startup before any threads are spawned.
         unsafe {
             std::env::set_var("HOME", &home);
             std::env::set_var("XDG_CACHE_HOME", &cache);
@@ -126,6 +133,7 @@ fn backup_and_restore_single_file_source() {
         restore_dir.to_str().unwrap(),
         None,
         false,
+        false,
     )
     .unwrap();
     assert_eq!(stats.files, 1);
@@ -147,6 +155,7 @@ fn backup_and_restore_single_file_source() {
         "snap-v2",
         restore_dir2.to_str().unwrap(),
         None,
+        false,
         false,
     )
     .unwrap();
@@ -184,15 +193,38 @@ fn backup_mixed_file_and_directory_sources() {
         restore_dir.to_str().unwrap(),
         None,
         false,
+        false,
     )
     .unwrap();
 
+    // Multi-path sources are prefixed by the full configured absolute path
+    // (leading separator stripped). The restored layout therefore mirrors
+    // the original absolute layout under `restore_dir`.
+    let strip_root = |p: &Path| -> std::path::PathBuf {
+        let mut out = std::path::PathBuf::new();
+        for c in p.components() {
+            match c {
+                std::path::Component::Normal(part) => out.push(part),
+                #[cfg(windows)]
+                std::path::Component::Prefix(prefix) => {
+                    let s = prefix.as_os_str().to_string_lossy();
+                    if let Some(letter) = s.strip_suffix(':') {
+                        out.push(letter);
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
+    };
+    let dir_rel = strip_root(&dir);
+    let file_rel = strip_root(&file);
     assert_eq!(
-        std::fs::read(restore_dir.join("dir/inside.txt")).unwrap(),
+        std::fs::read(restore_dir.join(dir_rel).join("inside.txt")).unwrap(),
         b"inside"
     );
     assert_eq!(
-        std::fs::read(restore_dir.join("standalone.txt")).unwrap(),
+        std::fs::read(restore_dir.join(file_rel)).unwrap(),
         b"standalone"
     );
 }

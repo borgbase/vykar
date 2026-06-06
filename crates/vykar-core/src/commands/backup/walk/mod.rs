@@ -6,8 +6,8 @@ use tracing::warn;
 
 use crate::config::ChunkerConfig;
 use crate::platform::fs;
-use crate::repo::file_cache::{FileCache, ParentReuseIndex};
-use crate::snapshot::item::{ChunkRef, Item, ItemType};
+use crate::repo::file_cache::{CachedChunks, FileCache, ParentReuseIndex};
+use crate::snapshot::item::{Item, ItemType};
 use vykar_types::error::{Result, VykarError};
 
 use super::concurrency::ByteBudget;
@@ -16,26 +16,8 @@ use super::source::ResolvedSource;
 mod inode_walk;
 pub(super) use inode_walk::{InodeSortedWalk, WalkEvent, WalkedEntry};
 
-/// Returns `true` for I/O errors safe to skip (permission denied, not found, or EIO).
-pub(super) fn is_soft_io_error(e: &std::io::Error) -> bool {
-    matches!(
-        e.kind(),
-        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotFound
-    ) || is_eio(e)
-}
-
-#[cfg(unix)]
-fn is_eio(e: &std::io::Error) -> bool {
-    e.raw_os_error() == Some(libc::EIO)
-}
-
-#[cfg(not(unix))]
-fn is_eio(_e: &std::io::Error) -> bool {
-    false
-}
-
 /// Items chunker config — finer granularity for the item metadata stream.
-pub(super) fn items_chunker_config() -> ChunkerConfig {
+pub(crate) fn items_chunker_config() -> ChunkerConfig {
     ChunkerConfig {
         min_size: 32 * 1024,  // 32 KiB
         avg_size: 128 * 1024, // 128 KiB
@@ -136,8 +118,10 @@ pub(super) enum Materialized {
         abs_path: PathBuf,
         metadata: fs::MetadataSummary,
     },
-    /// Soft I/O error (e.g. permission denied on readlink) — caller should count as error.
-    SoftError,
+    /// Soft I/O error (e.g. permission denied on readlink, Windows
+    /// unsupported reparse tag) — caller should count as error and surface
+    /// `path` + `reason` in a path-bearing warning.
+    SoftError { path: PathBuf, reason: String },
     /// Unsupported file type (block device, FIFO, etc.) — silent skip.
     Unsupported,
 }
@@ -160,12 +144,16 @@ pub(super) fn materialize_item(walked: WalkedEntry, xattrs_enabled: bool) -> Res
                 Some(target.to_string_lossy().to_string()),
             ),
             Err(e) => {
-                if is_soft_io_error(&e) {
-                    warn!(path = %walked.abs_path.display(), error = %e,
-                          "skipping entry (readlink error)");
-                    return Ok(Materialized::SoftError);
+                if vykar_types::error::is_soft_backup_io_error(&e) {
+                    return Ok(Materialized::SoftError {
+                        path: walked.abs_path.clone(),
+                        reason: format!("readlink failed: {e}"),
+                    });
                 }
-                return Err(VykarError::Other(format!("readlink: {e}")));
+                return Err(VykarError::Other(format!(
+                    "readlink failed for '{}': {e}",
+                    walked.abs_path.display()
+                )));
             }
         }
     } else if file_type.is_file() {
@@ -197,7 +185,18 @@ pub(super) fn materialize_item(walked: WalkedEntry, xattrs_enabled: bool) -> Res
         xattrs: None,
     };
 
-    if xattrs_enabled {
+    // Skip xattrs on dataless inodes: on macOS, `getxattr` for FileProvider-
+    // managed attrs round-trips through `fileproviderd` and serialises this
+    // single-threaded walker. See issue #133 for the diagnosis.
+    //
+    // Trade-off: on the cache-hit path, `lookup_dataless` returns only chunk
+    // refs (not xattrs), so dataless cache hits now record `xattrs: None` in
+    // the new snapshot. Restoring a dataless file therefore loses any
+    // user-set xattrs (Finder tags etc.) it had on the source. This is
+    // deliberate — preserving them would require either re-reading from disk
+    // (defeats the fix) or threading them through ParentReuseIndex (out of
+    // scope; see #133 fix #2).
+    if xattrs_enabled && !metadata_summary.is_dataless {
         item.xattrs = read_item_xattrs(&walked.abs_path);
     }
 
@@ -234,13 +233,27 @@ pub(super) enum WalkEntry {
         item: Item,
         abs_path: String,
         metadata: fs::MetadataSummary,
-        cached_refs: Arc<Vec<ChunkRef>>,
+        cached_refs: CachedChunks,
     },
     NonFile {
         item: Item,
     },
-    /// A file that was skipped due to a soft error (permission denied, not found).
-    Skipped,
+    /// A file that was skipped due to a soft error (permission denied, not
+    /// found, EIO, Windows unsupported reparse, cloud-file). Carries the
+    /// failing path (snapshot/abs string form) and a pre-formatted reason
+    /// so consumers can surface a path-bearing warning.
+    Skipped {
+        path: String,
+        reason: String,
+    },
+    /// macOS dataless (FileProvider placeholder) file with no matching entry
+    /// in the local file cache or the parent reuse index. Skipped without
+    /// opening so we never trigger asynchronous hydration. Counted into a
+    /// per-source running total used to emit a single end-of-source summary
+    /// warning.
+    SkippedDataless {
+        path: String,
+    },
     SourceStarted {
         path: String,
     },
@@ -258,7 +271,7 @@ pub(super) fn reserve_budget(entry: &WalkEntry, budget: &ByteBudget) -> Result<u
             budget.acquire(usize::try_from(*file_size).unwrap_or(usize::MAX))
         }
         WalkEntry::FileSegment { len, .. } => budget.acquire(*len as usize),
-        WalkEntry::Skipped => Ok(0),
+        WalkEntry::Skipped { .. } | WalkEntry::SkippedDataless { .. } => Ok(0),
         _ => Ok(0),
     }
 }
@@ -439,7 +452,10 @@ fn walk_source_inode_sorted<'a>(
         };
 
         match event {
-            WalkEvent::Skipped => WalkItems::One(Some(Ok(WalkEntry::Skipped))),
+            WalkEvent::Skipped { path, reason } => WalkItems::One(Some(Ok(WalkEntry::Skipped {
+                path: path.to_string_lossy().into_owned(),
+                reason,
+            }))),
             WalkEvent::Entry(walked) => walked_entry_to_walk_items(
                 walked,
                 xattrs_enabled,
@@ -467,8 +483,11 @@ fn walked_entry_to_walk_items(
             abs_path,
             metadata,
         }) => (item, abs_path, metadata),
-        Ok(Materialized::SoftError) => {
-            return WalkItems::One(Some(Ok(WalkEntry::Skipped)));
+        Ok(Materialized::SoftError { path, reason }) => {
+            return WalkItems::One(Some(Ok(WalkEntry::Skipped {
+                path: path.to_string_lossy().into_owned(),
+                reason,
+            })));
         }
         Ok(Materialized::Unsupported) => return WalkItems::Empty,
         Err(e) => return WalkItems::One(Some(Err(e))),
@@ -480,15 +499,24 @@ fn walked_entry_to_walk_items(
             .into_string()
             .unwrap_or_else(|os| os.to_string_lossy().into_owned());
 
-        let cached_refs =
-            super::resolve_cache_hit(file_cache, parent_reuse_index, &abs_path, &metadata_summary);
-        if let Some(cached_refs) = cached_refs {
-            return WalkItems::One(Some(Ok(WalkEntry::CacheHit {
-                item,
-                abs_path,
-                metadata: metadata_summary,
-                cached_refs,
-            })));
+        match super::resolve_cache_hit(file_cache, parent_reuse_index, &abs_path, &metadata_summary)
+        {
+            super::CacheResolution::Hit(cached_refs) => {
+                return WalkItems::One(Some(Ok(WalkEntry::CacheHit {
+                    item,
+                    abs_path,
+                    metadata: metadata_summary,
+                    cached_refs,
+                })));
+            }
+            super::CacheResolution::SkipDataless => {
+                tracing::debug!(
+                    path = %abs_path,
+                    "skipping dataless cloud-only file (no cache or parent reuse)"
+                );
+                return WalkItems::One(Some(Ok(WalkEntry::SkippedDataless { path: abs_path })));
+            }
+            super::CacheResolution::Miss => {}
         }
 
         let file_size = metadata_summary.size;
@@ -550,6 +578,7 @@ mod tests {
             device: 0,
             inode: 0,
             size: 1024,
+            is_dataless: false,
         }
     }
 
@@ -558,6 +587,69 @@ mod tests {
         assert!(should_skip_for_device(true, 42, 43));
         assert!(!should_skip_for_device(true, 42, 42));
         assert!(!should_skip_for_device(false, 42, 43));
+    }
+
+    /// Regression: dataless inodes must NOT trigger `read_item_xattrs`.
+    /// On macOS, `getxattr` on FileProvider-managed attrs round-trips through
+    /// `fileproviderd` and can stall the (single-threaded) walker for seconds
+    /// per file. Confirms the dataless guard added to `materialize_item` —
+    /// when `is_dataless: true`, the Item must come back with `xattrs: None`
+    /// even when the underlying file has xattrs on disk and `xattrs_enabled`
+    /// is set. The companion `is_dataless: false` case proves the read path
+    /// still fires when not gated.
+    #[cfg(unix)]
+    #[test]
+    fn materialize_item_skips_xattrs_on_dataless() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("placeholder");
+        std::fs::write(&path, b"x").unwrap();
+        // Best-effort xattr write — bail the test if the tempdir's filesystem
+        // doesn't support xattrs (e.g. tmpfs on some Linux configs); the
+        // cross-platform xattrs_supported() flag does not detect that case.
+        if xattr::set(&path, "user.vykar_test", b"v").is_err() {
+            return;
+        }
+
+        let real_meta = std::fs::symlink_metadata(&path).unwrap();
+        let file_type = real_meta.file_type();
+        let mut summary = fs::summarize_metadata(&real_meta, &file_type);
+        summary.is_dataless = true;
+
+        let walked = inode_walk::WalkedEntry {
+            abs_path: path.clone(),
+            metadata: summary,
+            file_type,
+            snapshot_path: "placeholder".into(),
+        };
+
+        match materialize_item(walked, true).unwrap() {
+            Materialized::Entry { item, .. } => {
+                assert!(
+                    item.xattrs.is_none(),
+                    "dataless inodes must not be xattr-read",
+                );
+            }
+            other => panic!("expected Entry, got {other:?}"),
+        }
+
+        // Sanity: same file with `is_dataless: false` must populate xattrs.
+        let mut summary_warm = fs::summarize_metadata(&real_meta, &file_type);
+        summary_warm.is_dataless = false;
+        let walked_warm = inode_walk::WalkedEntry {
+            abs_path: path,
+            metadata: summary_warm,
+            file_type,
+            snapshot_path: "placeholder".into(),
+        };
+        match materialize_item(walked_warm, true).unwrap() {
+            Materialized::Entry { item, .. } => {
+                assert!(
+                    item.xattrs.is_some(),
+                    "warm files with xattrs_enabled must populate xattrs",
+                );
+            }
+            other => panic!("expected Entry, got {other:?}"),
+        }
     }
 
     #[test]
@@ -667,31 +759,6 @@ mod tests {
         let unix_path = "folder/sub/file.txt".to_string();
         let normalized = super::super::normalize_rel_path(unix_path);
         assert_eq!(normalized, "folder/sub/file.txt");
-    }
-
-    #[test]
-    fn soft_io_error_permission_denied() {
-        let e = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
-        assert!(is_soft_io_error(&e));
-    }
-
-    #[test]
-    fn soft_io_error_not_found() {
-        let e = std::io::Error::new(std::io::ErrorKind::NotFound, "gone");
-        assert!(is_soft_io_error(&e));
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn soft_io_error_eio() {
-        let e = std::io::Error::from_raw_os_error(libc::EIO);
-        assert!(is_soft_io_error(&e));
-    }
-
-    #[test]
-    fn non_soft_io_error() {
-        let e = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused");
-        assert!(!is_soft_io_error(&e));
     }
 
     #[test]
@@ -823,7 +890,16 @@ mod tests {
         std::fs::remove_file(&link).unwrap();
 
         let result = materialize_item(walked, false).unwrap();
-        assert!(matches!(result, Materialized::SoftError));
+        match result {
+            Materialized::SoftError { path, reason } => {
+                assert_eq!(path, link);
+                assert!(
+                    reason.contains("readlink failed"),
+                    "reason should mention readlink: {reason}"
+                );
+            }
+            other => panic!("expected SoftError, got {other:?}"),
+        }
     }
 
     #[cfg(unix)]
@@ -841,7 +917,13 @@ mod tests {
         let file_cache = FileCache::default();
         let mut items = walked_entry_to_walk_items(walked, false, &file_cache, u64::MAX, None);
         match items.next() {
-            Some(Ok(WalkEntry::Skipped)) => {}
+            Some(Ok(WalkEntry::Skipped { path, reason })) => {
+                assert_eq!(path, link.to_string_lossy());
+                assert!(
+                    reason.contains("readlink failed"),
+                    "reason should mention readlink: {reason}"
+                );
+            }
             _ => panic!("expected WalkEntry::Skipped"),
         }
         assert!(items.next().is_none());

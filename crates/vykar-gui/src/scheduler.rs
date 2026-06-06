@@ -1,12 +1,27 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, SystemTime};
 
 use crossbeam_channel::{Receiver, Sender};
 use vykar_core::config::ScheduleConfig;
 
 use crate::messages::{log_entry_now, AppCommand, UiEvent};
+
+// Bounds post-wake latency: after system sleep or a wall-clock jump the loop
+// re-evaluates wall-clock state within this many seconds regardless of how
+// far in the future `next_run` sits.
+const MAX_WAIT: Duration = Duration::from_secs(60);
+
+/// Time to wait before re-checking the scheduler state. Returns `ZERO` if
+/// `next_run` has already passed, otherwise the remaining duration clamped
+/// to [`MAX_WAIT`].
+pub(crate) fn capped_wait(next_run: SystemTime, now: SystemTime) -> Duration {
+    next_run
+        .duration_since(now)
+        .unwrap_or(Duration::ZERO)
+        .min(MAX_WAIT)
+}
 
 #[derive(Debug)]
 pub(crate) struct SchedulerState {
@@ -15,7 +30,7 @@ pub(crate) struct SchedulerState {
     pub every: Duration,
     pub cron: Option<String>,
     pub jitter_seconds: u64,
-    pub next_run: Option<Instant>,
+    pub next_run: Option<SystemTime>,
 }
 
 impl Default for SchedulerState {
@@ -31,16 +46,16 @@ impl Default for SchedulerState {
     }
 }
 
-pub(crate) fn schedule_description(schedule: &ScheduleConfig, paused: bool) -> String {
-    let timing = if let Some(ref cron) = schedule.cron {
-        format!("cron={cron}")
-    } else {
-        format!("every={}", schedule.every.as_deref().unwrap_or("24h"))
-    };
-    format!(
-        "enabled={}, {timing}, on_startup={}, jitter_seconds={}, paused={}",
-        schedule.enabled, schedule.on_startup, schedule.jitter_seconds, paused,
-    )
+/// Terse schedule summary for the Overview metric card: the interval string,
+/// the cron expression, or "Off" when disabled/paused.
+pub(crate) fn schedule_brief(schedule: &ScheduleConfig, paused: bool) -> String {
+    if !schedule.enabled || paused {
+        return "Off".to_string();
+    }
+    if let Some(ref cron) = schedule.cron {
+        return cron.clone();
+    }
+    schedule.every.clone().unwrap_or_else(|| "24h".to_string())
 }
 
 pub(crate) fn spawn_scheduler(
@@ -68,7 +83,7 @@ pub(crate) fn spawn_scheduler(
 
             if state.next_run.is_none() {
                 match compute_scheduler_delay(&state) {
-                    Ok(delay) => state.next_run = Some(Instant::now() + delay),
+                    Ok(delay) => state.next_run = Some(SystemTime::now() + delay),
                     Err(e) => {
                         state.paused = true;
                         state.next_run = None;
@@ -82,8 +97,8 @@ pub(crate) fn spawn_scheduler(
 
             match state.next_run {
                 Some(next) => {
-                    let now = Instant::now();
-                    if now >= next {
+                    let wait = capped_wait(next, SystemTime::now());
+                    if wait.is_zero() {
                         if backup_running.load(Ordering::SeqCst) {
                             // Backup is running and next_run has passed — block
                             // until woken by backup completion to avoid hot-spin.
@@ -96,7 +111,7 @@ pub(crate) fn spawn_scheduler(
                         // Time to run — will be handled below after select.
                         Duration::ZERO
                     } else {
-                        next - now
+                        wait
                     }
                 }
                 None => {
@@ -139,10 +154,12 @@ pub(crate) fn spawn_scheduler(
             }
 
             if let Some(next) = state.next_run {
-                if Instant::now() >= next && !backup_running.load(Ordering::SeqCst) {
+                if capped_wait(next, SystemTime::now()).is_zero()
+                    && !backup_running.load(Ordering::SeqCst)
+                {
                     should_run = true;
                     match compute_scheduler_delay(&state) {
-                        Ok(delay) => state.next_run = Some(Instant::now() + delay),
+                        Ok(delay) => state.next_run = Some(SystemTime::now() + delay),
                         Err(e) => {
                             state.paused = true;
                             state.next_run = None;
@@ -188,11 +205,38 @@ mod tests {
     use super::*;
     use crate::messages::AppCommand;
 
+    #[test]
+    fn capped_wait_now_equals_next_is_zero() {
+        let now = SystemTime::now();
+        assert_eq!(capped_wait(now, now), Duration::ZERO);
+    }
+
+    #[test]
+    fn capped_wait_past_next_run_is_zero() {
+        let now = SystemTime::now();
+        let past = now - Duration::from_secs(3600);
+        assert_eq!(capped_wait(past, now), Duration::ZERO);
+    }
+
+    #[test]
+    fn capped_wait_under_cap_returns_exact_remaining() {
+        let now = SystemTime::now();
+        let future = now + Duration::from_secs(10);
+        assert_eq!(capped_wait(future, now), Duration::from_secs(10));
+    }
+
+    #[test]
+    fn capped_wait_over_cap_is_clamped() {
+        let now = SystemTime::now();
+        let far_future = now + Duration::from_secs(7200);
+        assert_eq!(capped_wait(far_future, now), MAX_WAIT);
+    }
+
     /// Helper: set up scheduler infrastructure for tests.
     fn setup(
         enabled: bool,
         paused: bool,
-        next_run: Option<Instant>,
+        next_run: Option<SystemTime>,
     ) -> (
         Arc<Mutex<SchedulerState>>,
         Arc<AtomicBool>,
@@ -228,10 +272,25 @@ mod tests {
         let (_state, _running, _notify_tx, app_rx) = setup(
             true,
             false,
-            Some(Instant::now() + Duration::from_millis(30)),
+            Some(SystemTime::now() + Duration::from_millis(30)),
         );
 
         // Should fire within a reasonable time.
+        let cmd = app_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(matches!(cmd, AppCommand::RunBackupAll { scheduled: true }));
+    }
+
+    /// Regression test for GitHub #110: after system sleep, `SystemTime` has
+    /// advanced past `next_run` even though a monotonic clock would not have.
+    /// The scheduler must fire promptly rather than wait a full interval.
+    #[test]
+    fn fires_when_next_run_is_in_the_past() {
+        let (_state, _running, _notify_tx, app_rx) = setup(
+            true,
+            false,
+            Some(SystemTime::now() - Duration::from_secs(10)),
+        );
+
         let cmd = app_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         assert!(matches!(cmd, AppCommand::RunBackupAll { scheduled: true }));
     }
@@ -247,7 +306,7 @@ mod tests {
             every: Duration::from_millis(50),
             cron: None,
             jitter_seconds: 0,
-            next_run: Some(Instant::now() - Duration::from_millis(10)),
+            next_run: Some(SystemTime::now() - Duration::from_millis(10)),
         }));
         let backup_running = Arc::new(AtomicBool::new(true));
         let (notify_tx, notify_rx) = crossbeam_channel::bounded::<()>(1);
@@ -290,7 +349,7 @@ mod tests {
         {
             let mut s = state.lock().unwrap();
             s.paused = false;
-            s.next_run = Some(Instant::now() + Duration::from_millis(20));
+            s.next_run = Some(SystemTime::now() + Duration::from_millis(20));
         }
         let _ = notify_tx.try_send(());
 
@@ -310,7 +369,7 @@ mod tests {
         {
             let mut s = state.lock().unwrap();
             s.enabled = true;
-            s.next_run = Some(Instant::now() + Duration::from_millis(20));
+            s.next_run = Some(SystemTime::now() + Duration::from_millis(20));
         }
         let _ = notify_tx.try_send(());
 

@@ -1,3 +1,12 @@
+#![allow(
+    clippy::doc_markdown,
+    clippy::if_not_else,
+    clippy::implicit_hasher,
+    clippy::missing_errors_doc,
+    clippy::redundant_closure_for_method_calls,
+    clippy::too_many_lines
+)]
+
 use std::borrow::Cow;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -28,6 +37,10 @@ pub struct RestoreRequest {
     pub snapshot_name: String,
     pub destination: String,
     pub pattern: Option<String>,
+    /// When true, recompute each restored chunk's keyed BLAKE2b ID and abort
+    /// on mismatch. Defense-in-depth against writer-side bugs only — AEAD
+    /// already authenticates ciphertext under the standard threat model.
+    pub verify_chunks: bool,
 }
 
 // ── Hook-aware backup event types ─────────────────────────────────────────
@@ -102,6 +115,13 @@ pub enum CycleEvent {
         step: CycleStep,
         scope: HookScope,
         warning: String,
+    },
+    /// Non-fatal warning from a cycle step (e.g. prune post-commit refcount
+    /// cleanup failed). `tracing::warn!` has already fired — this is for GUI
+    /// visibility since the GUI does not subscribe to tracing.
+    StepWarning {
+        step: CycleStep,
+        message: String,
     },
 }
 
@@ -423,8 +443,8 @@ pub fn run_full_cycle_for_repo(
                 repo,
                 on_event,
                 &mut steps,
-                |_evt| {
-                    commands::prune::run(
+                |evt| {
+                    let stats = commands::prune::run(
                         config,
                         passphrase,
                         false,
@@ -433,7 +453,17 @@ pub fn run_full_cycle_for_repo(
                         source_filter,
                         shutdown,
                     )
-                    .map(|(stats, _)| stats)
+                    .map(|(stats, _)| stats)?;
+                    // Surface post-commit warnings as cycle events so GUI/CLI
+                    // consumers can log them as persistent entries. tracing
+                    // already fired inside commands::prune::run.
+                    for w in &stats.warnings {
+                        evt(CycleEvent::StepWarning {
+                            step: CycleStep::Prune,
+                            message: w.clone(),
+                        });
+                    }
+                    Ok(stats)
                 },
                 |_| StepOutcome::Ok,
             );
@@ -657,6 +687,15 @@ pub fn list_snapshot_items_with_source_paths(
     commands::list::list_snapshot_items_with_source_paths(config, passphrase, snapshot_name)
 }
 
+pub fn diff_snapshots(
+    config: &VykarConfig,
+    passphrase: Option<&str>,
+    snapshot_a: &str,
+    snapshot_b: &str,
+) -> Result<commands::diff::DiffResult> {
+    commands::diff::run(config, passphrase, snapshot_a, snapshot_b)
+}
+
 pub fn restore_snapshot(
     config: &VykarConfig,
     passphrase: Option<&str>,
@@ -669,6 +708,7 @@ pub fn restore_snapshot(
         &req.destination,
         req.pattern.as_deref(),
         config.xattrs.enabled,
+        req.verify_chunks,
     )
 }
 
@@ -686,6 +726,7 @@ pub fn restore_selected(
         destination,
         selected_paths,
         config.xattrs.enabled,
+        false,
     )
 }
 
@@ -718,7 +759,6 @@ pub fn delete_snapshot(
     config: &VykarConfig,
     passphrase: Option<&str>,
     snapshot_name: &str,
-) -> Result<commands::delete::DeleteStats> {
-    let mut results = commands::delete::run(config, passphrase, &[snapshot_name], false, None)?;
-    Ok(results.remove(0))
+) -> Result<commands::delete::DeleteResult> {
+    commands::delete::run(config, passphrase, &[snapshot_name], false, None)
 }

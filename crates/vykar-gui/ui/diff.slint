@@ -1,0 +1,91 @@
+import { VerticalBox, HorizontalBox, Button, StandardTableView, Palette } from "std-widgets.slint";
+
+export component DiffWindow inherits Window {
+    in-out property <string> repo_name;
+    in-out property <string> snapshot_a;
+    in-out property <string> snapshot_b;
+    in-out property <string> base_snapshot;
+    in-out property <string> target_snapshot;
+    in-out property <string> status_text: "Ready";
+    in-out property <[[StandardListViewItem]]> diff_rows: [];
+
+    callback close_clicked();
+    callback sort_ascending(int);
+    callback sort_descending(int);
+
+    title: "Snapshot Diff";
+    preferred-width: 950px;
+    preferred-height: 600px;
+
+    VerticalBox {
+        padding: 12px;
+        spacing: 8px;
+
+        HorizontalLayout {
+            spacing: 24px;
+            HorizontalLayout {
+                spacing: 4px;
+                Text { text: "Repository:"; vertical-alignment: center; font-weight: 700; }
+                Text { text: root.repo_name; vertical-alignment: center; overflow: elide; }
+            }
+            HorizontalLayout {
+                spacing: 4px;
+                Text { text: "Snapshots:"; vertical-alignment: center; font-weight: 700; }
+                Text {
+                    text: root.base_snapshot != "" && root.target_snapshot != ""
+                        ? root.base_snapshot + " -> " + root.target_snapshot
+                        : root.snapshot_a + " -> " + root.snapshot_b;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+            }
+            Rectangle { horizontal-stretch: 1; }
+        }
+
+        Rectangle {
+            vertical-stretch: 1;
+            border-width: 1px;
+            border-color: Palette.border;
+            border-radius: 4px;
+            background: Palette.alternate-background;
+
+            if root.diff_rows.length == 0: Text {
+                width: parent.width;
+                height: parent.height;
+                text: root.status_text;
+                color: Palette.foreground;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+
+            if root.diff_rows.length > 0: StandardTableView {
+                width: parent.width;
+                height: parent.height;
+                columns: [
+                    { title: "Change", width: 110px },
+                    { title: "Path", horizontal-stretch: 1 },
+                    { title: "Old Size", width: 130px },
+                    { title: "New Size", width: 130px },
+                    { title: "Delta", width: 130px },
+                ];
+                rows: root.diff_rows;
+                sort-ascending(col-idx) => { root.sort_ascending(col-idx); }
+                sort-descending(col-idx) => { root.sort_descending(col-idx); }
+            }
+        }
+
+        HorizontalBox {
+            spacing: 8px;
+            Text {
+                vertical-alignment: center;
+                text: root.status_text;
+                color: Palette.foreground;
+            }
+            Rectangle { horizontal-stretch: 1; }
+            Button {
+                text: "Close";
+                clicked => { root.close_clicked(); }
+            }
+        }
+    }
+}

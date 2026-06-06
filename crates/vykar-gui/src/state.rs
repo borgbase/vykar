@@ -15,6 +15,41 @@ pub struct GuiState {
     /// Whether to start with the window hidden (tray only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub start_in_background: Option<bool>,
+    /// Last active page as ordinal. Maps to `crate::Page` via [`page_from_i32`] /
+    /// [`page_to_i32`]. Stored as i32 so old state files remain readable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_page: Option<i32>,
+    /// Last selected repository name. Resolved to an index after the repo
+    /// model arrives; survives reordering/renaming better than an index.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_repo_name: Option<String>,
+}
+
+/// Convert the persisted ordinal to a `Page`, falling back to `Overview` for
+/// unrecognized values (e.g. state written by a newer version).
+pub fn page_from_i32(i: i32) -> crate::Page {
+    match i {
+        0 => crate::Page::Overview,
+        1 => crate::Page::Snapshots,
+        2 => crate::Page::Find,
+        3 => crate::Page::Sources,
+        4 => crate::Page::Advanced,
+        5 => crate::Page::Log,
+        6 => crate::Page::Settings,
+        _ => crate::Page::Overview,
+    }
+}
+
+pub fn page_to_i32(p: crate::Page) -> i32 {
+    match p {
+        crate::Page::Overview => 0,
+        crate::Page::Snapshots => 1,
+        crate::Page::Find => 2,
+        crate::Page::Sources => 3,
+        crate::Page::Advanced => 4,
+        crate::Page::Log => 5,
+        crate::Page::Settings => 6,
+    }
 }
 
 fn state_file_path() -> Option<PathBuf> {
@@ -56,10 +91,13 @@ mod tests {
             window_width: Some(1100.0),
             window_height: Some(760.0),
             start_in_background: Some(true),
+            last_page: Some(2),
+            last_repo_name: Some("local-backup".into()),
         };
         let json = serde_json::to_string(&state).unwrap();
         let restored: GuiState = serde_json::from_str(&json).unwrap();
         assert_eq!(restored.start_in_background, Some(true));
+        assert_eq!(restored.last_repo_name.as_deref(), Some("local-backup"));
     }
 
     #[test]

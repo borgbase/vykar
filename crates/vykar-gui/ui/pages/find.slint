@@ -1,0 +1,167 @@
+import { VerticalBox, HorizontalBox, Button, LineEdit, ScrollView, Palette } from "std-widgets.slint";
+import { FindSnapshotGroup } from "../components/types.slint";
+
+export component FindPage inherits Rectangle {
+    in property <string> repo_name;
+    in property <bool> operation_busy;
+    in-out property <string> name_pattern;
+    in property <string> status_text;
+    in property <[FindSnapshotGroup]> groups;
+    in property <bool> has_searched;
+
+    callback search_clicked();
+
+    // Column widths shared between the header row and per-result rows so they line up.
+    property <length> col_modified_width: 150px;
+    property <length> col_size_width: 90px;
+    property <length> col_status_width: 100px;
+    property <length> row_h_padding: 8px;
+
+    VerticalBox {
+        padding: 12px;
+        spacing: 8px;
+
+        HorizontalBox {
+            padding: 0px;
+            spacing: 8px;
+            Text {
+                text: root.repo_name != "" ? "Find Files: " + root.repo_name : "Find Files";
+                vertical-alignment: center;
+                font-weight: 700;
+                font-size: 16px;
+                horizontal-stretch: 1;
+            }
+        }
+
+        HorizontalBox {
+            padding: 0px;
+            spacing: 8px;
+            Text {
+                text: "Name pattern:";
+                vertical-alignment: center;
+            }
+            LineEdit {
+                horizontal-stretch: 1;
+                text <=> root.name_pattern;
+                placeholder-text: "*.dng   IMG_*.jpg   **/cyberpunk/**   **/portraits/*.dng";
+                accepted => {
+                    if (!root.operation_busy) {
+                        root.search_clicked();
+                    }
+                }
+            }
+            Button {
+                text: "Search";
+                primary: true;
+                enabled: !root.operation_busy;
+                clicked => { root.search_clicked(); }
+            }
+        }
+
+        Text {
+            text: "Filename matches by default (case-insensitive). Use ** to span folders, * for one segment.";
+            color: #888888;
+            font-size: 11px;
+        }
+
+        // Shared column header — sticky above the scrolling result groups.
+        if root.groups.length > 0: Rectangle {
+            background: Palette.alternate-background;
+            border-radius: 4px;
+            HorizontalLayout {
+                padding-left: root.row_h_padding;
+                padding-right: root.row_h_padding;
+                padding-top: 6px;
+                padding-bottom: 6px;
+                spacing: 8px;
+                Text {
+                    text: "Path";
+                    font-weight: 700;
+                    horizontal-stretch: 1;
+                }
+                Text {
+                    text: "Modified";
+                    font-weight: 700;
+                    width: root.col_modified_width;
+                }
+                Text {
+                    text: "Size";
+                    font-weight: 700;
+                    width: root.col_size_width;
+                    horizontal-alignment: right;
+                }
+                Text {
+                    text: "Status";
+                    font-weight: 700;
+                    width: root.col_status_width;
+                }
+            }
+        }
+
+        ScrollView {
+            vertical-stretch: 1;
+            VerticalLayout {
+                alignment: start;
+                spacing: 12px;
+                if root.groups.length == 0 && root.has_searched && !root.operation_busy: Text {
+                    text: "No results.";
+                    color: #888888;
+                }
+                for group in root.groups: VerticalLayout {
+                    alignment: start;
+                    spacing: 0px;
+                    Text {
+                        text: "Snapshot " + group.snapshot_id + " — " + group.snapshot_time
+                            + " (" + group.row_count + " match" + (group.row_count == 1 ? "" : "es") + ")";
+                        font-weight: 700;
+                    }
+                    for row[i] in group.rows: Rectangle {
+                        background: mod(i, 2) == 0 ? transparent : Palette.alternate-background;
+                        border-radius: 2px;
+                        HorizontalLayout {
+                            padding-left: root.row_h_padding;
+                            padding-right: root.row_h_padding;
+                            padding-top: 4px;
+                            padding-bottom: 4px;
+                            spacing: 8px;
+                            Text {
+                                text: row[0].text;
+                                font-family: "monospace";
+                                horizontal-stretch: 1;
+                                overflow: elide;
+                                vertical-alignment: center;
+                            }
+                            Text {
+                                text: row[1].text;
+                                width: root.col_modified_width;
+                                vertical-alignment: center;
+                            }
+                            Text {
+                                text: row[2].text;
+                                width: root.col_size_width;
+                                horizontal-alignment: right;
+                                vertical-alignment: center;
+                            }
+                            Text {
+                                text: row[3].text;
+                                width: root.col_status_width;
+                                vertical-alignment: center;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        HorizontalBox {
+            padding: 0px;
+            spacing: 8px;
+            Text {
+                vertical-alignment: center;
+                text: root.status_text;
+                color: #666666;
+                horizontal-stretch: 1;
+            }
+        }
+    }
+}

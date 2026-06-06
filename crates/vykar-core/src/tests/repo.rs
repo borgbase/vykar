@@ -130,7 +130,7 @@ fn save_state_persists_index() {
 #[test]
 fn read_missing_chunk_fails() {
     let mut repo = test_repo_plaintext();
-    let fake_id = vykar_types::chunk_id::ChunkId([0xFF; 32]);
+    let fake_id = vykar_types::chunk_id::ChunkId::from_bytes([0xFF; 32]);
     let result = repo.read_chunk(&fake_id);
     assert!(result.is_err());
 }
@@ -343,7 +343,7 @@ fn index_delta_is_empty() {
     assert!(empty.is_empty());
 
     let mut with_bump = IndexDelta::new();
-    with_bump.bump_refcount(&vykar_types::chunk_id::ChunkId([0xAA; 32]));
+    with_bump.bump_refcount(&vykar_types::chunk_id::ChunkId::from_bytes([0xAA; 32]));
     assert!(!with_bump.is_empty());
 }
 

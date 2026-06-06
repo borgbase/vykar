@@ -128,10 +128,9 @@ pub fn compact_repo(
                     break;
                 }
                 let idx = work_idx.fetch_add(1, Ordering::Relaxed);
-                if idx >= discovered.len() {
+                let Some((key, pack_id)) = discovered.get(idx) else {
                     break;
-                }
-                let (ref key, ref pack_id) = discovered[idx];
+                };
 
                 packs_total.fetch_add(1, Ordering::Relaxed);
 
@@ -179,6 +178,10 @@ pub fn compact_repo(
                         continue;
                     }
 
+                    #[allow(
+                        clippy::cast_precision_loss,
+                        reason = "ratio for display, precision loss acceptable"
+                    )]
                     let unused_ratio = if payload > 0 {
                         (dead_bytes as f64 / payload as f64) * 100.0
                     } else {
@@ -197,7 +200,10 @@ pub fn compact_repo(
                         // Sort by offset for deterministic output and sequential reads.
                         live_entries.sort_by_key(|e| e.offset);
 
-                        analyses_mu.lock().unwrap().push(PackAnalysis {
+                        analyses_mu
+                            .lock()
+                            .expect("compact analyses lock not poisoned")
+                            .push(PackAnalysis {
                             pack_id: *pack_id,
                             storage_key: key.clone(),
                             live_entries,
@@ -211,7 +217,10 @@ pub fn compact_repo(
 
                     let payload = pack_size.saturating_sub(pack_header_size);
                     if payload > 0 {
-                        analyses_mu.lock().unwrap().push(PackAnalysis {
+                        analyses_mu
+                            .lock()
+                            .expect("compact analyses lock not poisoned")
+                            .push(PackAnalysis {
                             pack_id: *pack_id,
                             storage_key: key.clone(),
                             live_entries: Vec::new(),
@@ -232,7 +241,9 @@ pub fn compact_repo(
     // Bail before Phase 2 if shutdown was requested during analysis.
     check_interrupted(shutdown)?;
 
-    let mut analyses = analyses_mu.into_inner().unwrap();
+    let mut analyses = analyses_mu
+        .into_inner()
+        .expect("compact analyses lock not poisoned");
 
     if stats.packs_corrupt > 0 {
         tracing::debug!(
@@ -253,6 +264,10 @@ pub fn compact_repo(
 
     if dry_run {
         for a in &selected {
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "ratio for display, precision loss acceptable"
+            )]
             let pct = (a.dead_bytes as f64 / a.total_bytes as f64) * 100.0;
             if a.live_entries.is_empty() {
                 info!(
@@ -320,11 +335,15 @@ pub fn compact_repo(
                     analysis.pack_id
                 ))
             })?;
-        if header.len() != PACK_HEADER_SIZE
+        // Header was just read at exactly PACK_HEADER_SIZE bytes, so the
+        // length-mismatch arm filters everything else; the slicing/indexing
+        // is in-bounds for any input that reaches the magic/version checks.
+        #[allow(clippy::indexing_slicing)]
+        let header_invalid = header.len() != PACK_HEADER_SIZE
             || &header[..8] != PACK_MAGIC
             || header[8] < PACK_VERSION_MIN
-            || header[8] > PACK_VERSION_MAX
-        {
+            || header[8] > PACK_VERSION_MAX;
+        if header_invalid {
             warn!(
                 "Skipping pack {} with invalid header during repack",
                 analysis.pack_id
@@ -362,7 +381,12 @@ pub fn compact_repo(
                     combined.len()
                 )));
             }
-            let on_disk_len = u32::from_le_bytes(combined[..4].try_into().expect("4 bytes"));
+            let (len_bytes, blob_bytes) = combined.split_at(4);
+            let on_disk_len = u32::from_le_bytes(
+                len_bytes
+                    .try_into()
+                    .expect("combined.len() == 4 + entry.length (checked above)"),
+            );
             if on_disk_len != entry.length {
                 return Err(VykarError::Other(format!(
                     "pack {}: blob at offset {} has on-disk length {} but index says {}; \
@@ -370,7 +394,7 @@ pub fn compact_repo(
                     analysis.pack_id, entry.offset, on_disk_len, entry.length,
                 )));
             }
-            let blob_data = combined[4..].to_vec();
+            let blob_data = blob_bytes.to_vec();
 
             writer.add_blob(entry.chunk_id, blob_data)?;
         }
@@ -419,7 +443,10 @@ fn parallel_list_packs(
                 let keys = match storage.list(&prefix) {
                     Ok(k) => k,
                     Err(e) => {
-                        errors.lock().unwrap().push(e);
+                        errors
+                            .lock()
+                            .expect("compact list-pack errors lock not poisoned")
+                            .push(e);
                         continue;
                     }
                 };
@@ -437,18 +464,25 @@ fn parallel_list_packs(
                     }
                 }
                 if !local.is_empty() {
-                    results.lock().unwrap().extend(local);
+                    results
+                        .lock()
+                        .expect("compact list-pack results lock not poisoned")
+                        .extend(local);
                 }
             });
         }
     });
 
-    let errs = errors.into_inner().unwrap();
+    let errs = errors
+        .into_inner()
+        .expect("compact list-pack errors lock not poisoned");
     if let Some(first) = errs.into_iter().next() {
         return Err(first);
     }
 
-    Ok(results.into_inner().unwrap())
+    Ok(results
+        .into_inner()
+        .expect("compact list-pack results lock not poisoned"))
 }
 
 fn select_analyses_by_cap(

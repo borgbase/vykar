@@ -6,9 +6,7 @@ use crate::RetryConfig;
 /// Whether a ureq transport-level error is transient and worth retrying.
 fn is_retryable_transport(err: &ureq::Error) -> bool {
     match err {
-        ureq::Error::Timeout(_) => true,
-        ureq::Error::ConnectionFailed => true,
-        ureq::Error::HostNotFound => true,
+        ureq::Error::Timeout(_) | ureq::Error::ConnectionFailed | ureq::Error::HostNotFound => true,
         ureq::Error::Io(e) => is_retryable_io(e),
         _ => false,
     }
@@ -69,7 +67,7 @@ pub fn retry_http<T>(
             }
         }
     }
-    Err(last_err.unwrap())
+    Err(last_err.expect("retry loop recorded a retryable error"))
 }
 
 /// Classify an HTTP status code for retry purposes.
@@ -110,8 +108,7 @@ impl HttpRetryError {
     /// Whether this error is transient and worth retrying.
     pub fn is_retryable(&self) -> bool {
         match self {
-            HttpRetryError::Transport(_) => true,
-            HttpRetryError::RetryableStatus { .. } => true,
+            HttpRetryError::Transport(_) | HttpRetryError::RetryableStatus { .. } => true,
             HttpRetryError::BodyIo(e) => is_retryable_io(e),
             HttpRetryError::Permanent(_) => false,
         }

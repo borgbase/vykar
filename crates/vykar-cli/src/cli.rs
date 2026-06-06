@@ -1,3 +1,5 @@
+use std::net::SocketAddr;
+
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -129,6 +131,13 @@ pub(crate) enum Commands {
         /// Only restore paths matching this glob pattern
         #[arg(long)]
         pattern: Option<String>,
+
+        /// Recompute the keyed BLAKE2b chunk ID after decryption and abort if
+        /// it doesn't match the snapshot's stored chunk_id. AEAD already
+        /// authenticates ciphertext under the standard threat model, so this
+        /// is defense-in-depth against writer-side bugs only.
+        #[arg(long)]
+        verify: bool,
     },
 
     /// Delete an entire repository permanently
@@ -244,7 +253,15 @@ pub(crate) enum Commands {
     },
 
     /// Run scheduled backups as a foreground daemon
-    Daemon,
+    Daemon {
+        /// Bind a read-only HTTP status page at this address (e.g. 127.0.0.1:7575)
+        #[arg(long = "http-listen", value_name = "ADDR", env = "VYKAR_HTTP_LISTEN")]
+        http_listen: Option<SocketAddr>,
+
+        /// Permit binding --http-listen to a non-loopback address
+        #[arg(long = "http-allow-public", env = "VYKAR_HTTP_ALLOW_PUBLIC")]
+        http_allow_public: bool,
+    },
 
     /// Free repository space by compacting pack files
     Compact {
@@ -299,6 +316,16 @@ pub(crate) enum SnapshotCommand {
         repo: Option<String>,
         /// Snapshot to inspect (name or "latest")
         snapshot: String,
+    },
+    /// Compare changed regular files between two snapshots
+    ///
+    /// Both snapshots must live in the same repository; the repo is probed
+    /// automatically across the configured set.
+    Diff {
+        /// First snapshot to compare (name or "latest")
+        snapshot_a: String,
+        /// Second snapshot to compare (name or "latest")
+        snapshot_b: String,
     },
     /// Delete one or more snapshots
     Delete {
@@ -357,6 +384,7 @@ impl SnapshotCommand {
             | Self::Info { repo, .. }
             | Self::Delete { repo, .. }
             | Self::Find { repo, .. } => repo.as_deref(),
+            Self::Diff { .. } => None,
         }
     }
 }
@@ -376,7 +404,7 @@ impl Commands {
             | Self::BreakLock { repo, .. }
             | Self::Compact { repo, .. } => repo.as_deref(),
             Self::Snapshot { command, .. } => command.repo(),
-            Self::Config { .. } | Self::Daemon => None,
+            Self::Config { .. } | Self::Daemon { .. } => None,
         }
     }
 
@@ -392,7 +420,10 @@ impl Commands {
             } => Some(snapshot),
             Self::Snapshot {
                 command: SnapshotCommand::Delete { snapshots, .. },
-            } if snapshots.len() == 1 => Some(&snapshots[0]),
+            } => match snapshots.as_slice() {
+                [only] => Some(only),
+                _ => None,
+            },
             Self::Mount { snapshot, .. } => snapshot.as_deref(),
             _ => None,
         }
@@ -413,7 +444,7 @@ impl Commands {
             Self::Compact { .. } => "compact",
             Self::Snapshot { .. } => "snapshot",
             Self::Config { .. } => "config",
-            Self::Daemon => "daemon",
+            Self::Daemon { .. } => "daemon",
         }
     }
 }

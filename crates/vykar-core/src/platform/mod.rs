@@ -1,3 +1,6 @@
+// libc::kill liveness probe; SAFETY documented per block.
+#![allow(unsafe_code)]
+
 pub mod fs;
 pub use vykar_common::paths;
 pub mod shell;
@@ -30,6 +33,34 @@ pub fn hostname() -> String {
     #[cfg(windows)]
     {
         std::env::var("COMPUTERNAME").unwrap_or_else(|_| "unknown".into())
+    }
+}
+
+/// Return a stable identifier for the current boot where the OS exposes one.
+///
+/// Linux publishes this at `/proc/sys/kernel/random/boot_id`. Other platforms
+/// return `None`, so callers must treat boot-based stale detection as
+/// unavailable rather than guessing.
+///
+/// Cached for the process lifetime — boot ID is constant once the process
+/// starts, so the underlying read happens at most once.
+pub fn boot_id() -> Option<String> {
+    static CACHED: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    CACHED.get_or_init(read_boot_id).clone()
+}
+
+fn read_boot_id() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
     }
 }
 

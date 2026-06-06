@@ -8,7 +8,7 @@ fn make_id(data: &[u8]) -> ChunkId {
 }
 
 fn dummy_pack_id() -> PackId {
-    PackId([0x00; 32])
+    PackId::from_bytes([0x00; 32])
 }
 
 #[test]
@@ -123,8 +123,8 @@ fn count_distinct_packs() {
     let id1 = make_id(b"chunk1");
     let id2 = make_id(b"chunk2");
     let id3 = make_id(b"chunk3");
-    let pack_a = PackId([0xAA; 32]);
-    let pack_b = PackId([0xBB; 32]);
+    let pack_a = PackId::from_bytes([0xAA; 32]);
+    let pack_b = PackId::from_bytes([0xBB; 32]);
     index.add(id1, 100, pack_a, 0);
     index.add(id2, 200, pack_a, 100);
     index.add(id3, 300, pack_b, 0);

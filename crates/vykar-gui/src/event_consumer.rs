@@ -1,18 +1,18 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use crossbeam_channel::Receiver;
 use slint::{ComponentHandle, Model, ModelRc, SharedString, StandardListViewItem, VecModel};
-use tray_icon::menu::MenuId;
 
 use crate::controllers;
-use crate::messages::{AppCommand, SnapshotRowData, UiEvent};
+use crate::messages::{AppCommand, UiEvent};
 use crate::state;
 use crate::tray_state;
-use crate::view_models::{to_string_model, to_table_model};
-use crate::{AppData, MainWindow, RepoInfo, SourceInfo};
+use crate::ui_state;
+use crate::view_models::to_find_groups_model;
+use crate::{AppData, MainWindow};
 
 thread_local! {
     static LOG_MODEL: RefCell<Option<Rc<VecModel<ModelRc<StandardListViewItem>>>>> = const { RefCell::new(None) };
@@ -26,7 +26,7 @@ fn ensure_log_model(ui: &MainWindow) -> Rc<VecModel<ModelRc<StandardListViewItem
             ui.set_log_rows(ModelRc::from(model.clone()));
             *borrow = Some(model);
         }
-        borrow.as_ref().unwrap().clone()
+        borrow.as_ref().expect("log model initialized").clone()
     })
 }
 
@@ -50,7 +50,7 @@ pub(crate) fn prepend_log_entry(
     if model.row_count() > MAX_LOG_ROWS {
         // Keep the first TRIM_TARGET rows (newest) and drop the rest.
         let keep: Vec<_> = (0..TRIM_TARGET)
-            .map(|i| model.row_data(i).unwrap())
+            .map(|i| model.row_data(i).expect("row index below trim target"))
             .collect();
         model.set_vec(keep);
     }
@@ -59,6 +59,37 @@ pub(crate) fn prepend_log_entry(
 fn append_log_row(ui: &MainWindow, date: &str, timestamp: &str, message: &str) {
     let model = ensure_log_model(ui);
     prepend_log_entry(&model, date, timestamp, message);
+}
+
+/// Clamp `idx` against `len`. Returns `0` for negative or out-of-range indices,
+/// `idx` otherwise. `len == 0` always yields `0`.
+pub(crate) fn clamp_repo_index(idx: i32, len: usize) -> i32 {
+    if len == 0 || idx < 0 || (idx as usize) >= len {
+        0
+    } else {
+        idx
+    }
+}
+
+/// Resolve the selected repo index against the repo labels that actually
+/// loaded. If `pending_name` is set, look it up in `labels` (0 on miss);
+/// otherwise clamp `prev_idx` into range.
+pub(crate) fn resolve_repo_index(
+    labels: &[impl AsRef<str>],
+    prev_idx: i32,
+    pending_name: Option<&str>,
+) -> i32 {
+    if labels.is_empty() {
+        return 0;
+    }
+    if let Some(name) = pending_name {
+        return labels
+            .iter()
+            .position(|label| label.as_ref() == name)
+            .map(|p| p as i32)
+            .unwrap_or(0);
+    }
+    clamp_repo_index(prev_idx, labels.len())
 }
 
 pub(crate) fn capture_gui_state(
@@ -73,7 +104,15 @@ pub(crate) fn capture_gui_state(
     if !scale.is_finite() || scale <= 0.0 {
         return None;
     }
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "window dimensions are small u32 values; f32 mantissa is sufficient"
+    )]
     let w = win_size.width as f32 / scale;
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "window dimensions are small u32 values; f32 mantissa is sufficient"
+    )]
     let h = win_size.height as f32 / scale;
     if !w.is_finite() || !h.is_finite() || w <= 0.0 || h <= 0.0 {
         return None;
@@ -84,11 +123,17 @@ pub(crate) fn capture_gui_state(
     } else {
         Some(config_path_str)
     };
+    // Persist the selected repo by name, not index — survives config reordering
+    // and filtered (failed-to-load) repos. Falls back to any still-pending name
+    // if the model hasn't been populated yet.
+    let last_repo_name = ui_state::current_repo_name(ui).or_else(ui_state::pending_repo_name);
     Some(state::GuiState {
         config_path,
         window_width: Some(w),
         window_height: Some(h),
         start_in_background: Some(start_in_background_pref.load(Ordering::Relaxed)),
+        last_page: Some(state::page_to_i32(ui.get_current_page())),
+        last_repo_name,
     })
 }
 
@@ -96,18 +141,14 @@ pub(crate) fn spawn(
     ui_rx: Receiver<UiEvent>,
     ui_weak: slint::Weak<MainWindow>,
     app_tx: crossbeam_channel::Sender<AppCommand>,
-    snapshot_data: Arc<Mutex<Vec<SnapshotRowData>>>,
-    last_gui_state: Arc<Mutex<Option<state::GuiState>>>,
-    tray_source_items: Arc<Mutex<Vec<(MenuId, String)>>>,
+    tray_source_tx: crossbeam_channel::Sender<Vec<(tray_icon::menu::MenuId, String)>>,
     start_in_background_pref: Arc<AtomicBool>,
 ) {
     std::thread::spawn(move || {
         while let Ok(event) = ui_rx.recv() {
             let ui_weak = ui_weak.clone();
-            let snapshot_data = snapshot_data.clone();
             let app_tx = app_tx.clone();
-            let last_gui_state = last_gui_state.clone();
-            let tray_source_items = tray_source_items.clone();
+            let tray_source_tx = tray_source_tx.clone();
             let start_in_background_pref = start_in_background_pref.clone();
 
             let _ = slint::invoke_from_event_loop(move || {
@@ -124,107 +165,90 @@ pub(crate) fn spawn(
                     } => {
                         append_log_row(&ui, &date, &timestamp, &message);
                     }
-                    UiEvent::ConfigInfo { path, schedule } => {
+                    UiEvent::ConfigInfo {
+                        path,
+                        schedule_brief,
+                    } => {
                         ui.global::<AppData>()
                             .set_active_config_path(path.clone().into());
                         ui.set_config_path(path.into());
-                        ui.set_schedule_text(schedule.into());
+                        ui.set_schedule_brief(schedule_brief.into());
                         // Eagerly persist so Cmd-Q keeps the config path.
                         if let Some(s) = capture_gui_state(&ui, &start_in_background_pref) {
                             state::save(&s);
-                            if let Ok(mut last) = last_gui_state.lock() {
-                                *last = Some(s);
-                            }
+                            ui_state::set_last_gui_state(s);
                         }
                     }
                     UiEvent::RepoNames(names) => {
-                        let first = names.first().cloned().unwrap_or_default();
-                        ui.set_repo_names(to_string_model(names));
-                        // Pre-select first repo in snapshots combo and auto-load
-                        if ui.get_snapshots_repo_combo_value().is_empty() && !first.is_empty() {
-                            ui.set_snapshots_repo_combo_value(first.clone().into());
-                            let _ = app_tx.send(AppCommand::RefreshSnapshots {
-                                repo_selector: first,
-                            });
+                        // RepoNames is derived from the full configured repo list and
+                        // arrives before RepoModelData (which is filtered to repos that
+                        // loaded successfully). Clamp defensively so the index is never
+                        // out-of-range against `names`; the authoritative resolution
+                        // (by repo name) happens when RepoModelData arrives.
+                        let clamped = clamp_repo_index(ui.get_current_repo_index(), names.len());
+                        if clamped != ui.get_current_repo_index() {
+                            ui.set_current_repo_index(clamped);
                         }
                     }
                     UiEvent::RepoModelData { items, labels } => {
                         ui.set_repo_loading(false);
-                        ui.global::<AppData>()
-                            .set_repo_labels(to_string_model(labels));
-                        let model: Vec<RepoInfo> = items
-                            .into_iter()
-                            .map(|d| RepoInfo {
-                                name: d.name.into(),
-                                url: d.url.into(),
-                                snapshots: d.snapshots.into(),
-                                last_snapshot: d.last_snapshot.into(),
-                                size: d.size.into(),
-                            })
-                            .collect();
-                        ui.set_repo_model(ModelRc::new(VecModel::from(model)));
+                        // Resolve the selected repo by name. On first load this consumes
+                        // the persisted last_repo_name; afterward we just clamp the
+                        // current index against the filtered labels.
+                        let pending = ui_state::take_pending_repo_name();
+                        let prev_idx = ui.get_current_repo_index();
+                        let new_idx = resolve_repo_index(&labels, prev_idx, pending.as_deref());
+                        ui_state::replace_repo_model(items, labels);
+                        if new_idx != prev_idx {
+                            ui.set_current_repo_index(new_idx);
+                        }
+
+                        // Rebuild the per-repo source model now that the
+                        // current repo's name is resolvable.
+                        let current_repo = ui_state::current_repo_name(&ui);
+                        ui_state::refresh_repo_source_model(current_repo.as_deref());
+
+                        // Trigger a snapshot refresh for the resolved repo.
+                        if let Some(name) = current_repo {
+                            let _ = app_tx.send(AppCommand::RefreshSnapshots {
+                                repo_selector: name,
+                            });
+                        }
                     }
-                    UiEvent::SourceModelData { items, labels } => {
+                    UiEvent::SourceModelData {
+                        items: source_items,
+                        labels,
+                    } => {
                         // On Linux the tray submenu lives on the GTK thread;
                         // dispatch via idle_add_once to run there.
                         #[cfg(target_os = "linux")]
                         {
                             let tray_labels = labels.clone();
-                            let tsi = tray_source_items.clone();
+                            let tray_source_tx = tray_source_tx.clone();
                             gtk::glib::idle_add_once(move || {
-                                tray_state::rebuild_submenu(&tray_labels, &tsi);
+                                let items = tray_state::rebuild_submenu(&tray_labels);
+                                let _ = tray_source_tx.send(items);
                             });
                         }
                         #[cfg(not(target_os = "linux"))]
-                        tray_state::rebuild_submenu(&labels, &tray_source_items);
+                        {
+                            let items = tray_state::rebuild_submenu(&labels);
+                            let _ = tray_source_tx.send(items);
+                        }
 
-                        ui.global::<AppData>()
-                            .set_source_labels(to_string_model(labels));
-                        let model: Vec<SourceInfo> = items
-                            .into_iter()
-                            .map(|d| SourceInfo {
-                                label: d.label.into(),
-                                paths: d.paths.into(),
-                                excludes: d.excludes.into(),
-                                target_repos: d.target_repos.into(),
-                                expanded: false,
-                                detail_paths: d.detail_paths.into(),
-                                detail_excludes: d.detail_excludes.into(),
-                                detail_exclude_if_present: d.detail_exclude_if_present.into(),
-                                detail_flags: d.detail_flags.into(),
-                                detail_hooks: d.detail_hooks.into(),
-                                detail_retention: d.detail_retention.into(),
-                                detail_command_dumps: d.detail_command_dumps.into(),
-                            })
-                            .collect();
-                        ui.set_source_model(ModelRc::new(VecModel::from(model)));
+                        let current_repo = ui_state::current_repo_name(&ui);
+                        ui_state::replace_source_model(
+                            source_items,
+                            labels,
+                            current_repo.as_deref(),
+                        );
                     }
                     UiEvent::SnapshotTableData { data } => {
-                        let ids: Vec<String> = data.iter().map(|d| d.id.clone()).collect();
-                        let rnames: Vec<String> =
-                            data.iter().map(|d| d.repo_name.clone()).collect();
-                        ui.global::<AppData>()
-                            .set_snapshot_ids(to_string_model(ids));
-                        ui.global::<AppData>()
-                            .set_snapshot_repo_names(to_string_model(rnames));
-                        let rows: Vec<Vec<String>> = data
-                            .iter()
-                            .map(|d| {
-                                vec![
-                                    d.id.clone(),
-                                    d.hostname.clone(),
-                                    d.time_str.clone(),
-                                    d.source.clone(),
-                                    d.label.clone(),
-                                    d.files.clone(),
-                                    d.size.clone(),
-                                ]
-                            })
-                            .collect();
-                        if let Ok(mut sd) = snapshot_data.lock() {
-                            *sd = data;
-                        }
-                        ui.set_snapshot_rows(to_table_model(rows));
+                        // Reverse once to newest-first; both the Snapshots table
+                        // (default order) and the Overview "latest 3" consume this
+                        // same canonical order. Column-header clicks on the
+                        // Snapshots table reorder this list in place afterwards.
+                        ui_state::replace_snapshot_data(&ui, data);
                     }
                     UiEvent::SnapshotContentsData {
                         repo_name,
@@ -247,10 +271,38 @@ pub(crate) fn spawn(
                             controllers::restore::handle_restore_finished(rw, success, message);
                         });
                     }
-                    UiEvent::FindResultsData { rows } => {
-                        controllers::find::with_window(|fw| {
-                            controllers::find::handle_results(fw, rows);
+                    UiEvent::DiffResultsData {
+                        repo_name,
+                        snapshot_a,
+                        snapshot_b,
+                        base_snapshot,
+                        target_snapshot,
+                        rows,
+                        error,
+                    } => {
+                        controllers::diff::with_window(|dw| {
+                            controllers::diff::handle_diff_results(
+                                dw,
+                                controllers::diff::DiffResultsView {
+                                    repo_name,
+                                    snapshot_a,
+                                    snapshot_b,
+                                    base_snapshot,
+                                    target_snapshot,
+                                    rows,
+                                    error,
+                                },
+                            );
                         });
+                    }
+                    UiEvent::FindResultsData { groups } => {
+                        let total: usize = groups.iter().map(|g| g.rows.len()).sum();
+                        let snap_count = groups.len();
+                        ui.set_find_groups(to_find_groups_model(groups));
+                        ui.set_find_has_searched(true);
+                        ui.set_find_status_text(
+                            format!("{total} results across {snap_count} snapshots.").into(),
+                        );
                     }
                     UiEvent::ConfigText(text) => {
                         ui.set_editor_baseline(text.clone().into());
@@ -261,19 +313,18 @@ pub(crate) fn spawn(
                     UiEvent::ConfigSaveError(message) => {
                         ui.set_editor_status(message.into());
                     }
-                    UiEvent::OperationStarted { cancellable } => {
+                    UiEvent::OperationStarted => {
                         ui.set_operation_busy(true);
-                        ui.set_operation_cancellable(cancellable);
                     }
                     UiEvent::OperationFinished => {
                         ui.set_operation_busy(false);
                     }
                     UiEvent::Quit => {
                         if let Some(s) = capture_gui_state(&ui, &start_in_background_pref) {
-                            if let Ok(mut last) = last_gui_state.lock() {
-                                *last = Some(s);
-                            }
+                            ui_state::set_last_gui_state(s);
                         }
+                        // Best-effort: stop any active mount so the listener is released cleanly.
+                        let _ = app_tx.send(AppCommand::StopMount);
                         let _ = slint::quit_event_loop();
                     }
                     UiEvent::ShowWindow => {
@@ -295,9 +346,40 @@ pub(crate) fn spawn(
                             }
                         }
                     }
+                    UiEvent::MountStarted { url } => {
+                        ui.set_is_mount_active(true);
+                        ui.set_mount_url(url.clone().into());
+                        if opener::open_browser(&url).is_err() {
+                            let now = chrono::Local::now();
+                            append_log_row(
+                                &ui,
+                                &now.format("%b %d").to_string(),
+                                &now.format("%H:%M:%S").to_string(),
+                                &format!("Mount running at {url} — open it manually"),
+                            );
+                        }
+                    }
+                    UiEvent::MountStopped => {
+                        ui.set_is_mount_active(false);
+                        ui.set_mount_url("".into());
+                    }
+                    UiEvent::MountFailed { message } => {
+                        ui.set_is_mount_active(false);
+                        ui.set_mount_url("".into());
+                        let now = chrono::Local::now();
+                        append_log_row(
+                            &ui,
+                            &now.format("%b %d").to_string(),
+                            &now.format("%H:%M:%S").to_string(),
+                            &format!("Mount failed: {message}"),
+                        );
+                    }
                     UiEvent::TriggerSnapshotRefresh => {
-                        let sel = ui.get_snapshots_repo_combo_value().to_string();
-                        let _ = app_tx.send(AppCommand::RefreshSnapshots { repo_selector: sel });
+                        if let Some(name) = ui_state::current_repo_name(&ui) {
+                            let _ = app_tx.send(AppCommand::RefreshSnapshots {
+                                repo_selector: name,
+                            });
+                        }
                     }
                 }
             });
@@ -355,5 +437,60 @@ mod tests {
             col_text(&model, TRIM_TARGET - 1, 2),
             format!("msg-{}", MAX_LOG_ROWS + 1 - TRIM_TARGET)
         );
+    }
+
+    fn labels(names: &[&str]) -> Vec<SharedString> {
+        names.iter().map(|s| (*s).into()).collect()
+    }
+
+    #[test]
+    fn clamp_empty_returns_zero() {
+        assert_eq!(clamp_repo_index(0, 0), 0);
+        assert_eq!(clamp_repo_index(5, 0), 0);
+        assert_eq!(clamp_repo_index(-1, 0), 0);
+    }
+
+    #[test]
+    fn clamp_negative_and_out_of_range_fall_back_to_zero() {
+        assert_eq!(clamp_repo_index(-1, 3), 0);
+        assert_eq!(clamp_repo_index(3, 3), 0);
+        assert_eq!(clamp_repo_index(100, 3), 0);
+    }
+
+    #[test]
+    fn clamp_in_range_is_unchanged() {
+        assert_eq!(clamp_repo_index(0, 3), 0);
+        assert_eq!(clamp_repo_index(2, 3), 2);
+    }
+
+    #[test]
+    fn resolve_uses_pending_name_when_present() {
+        let ls = labels(&["alpha", "beta", "gamma"]);
+        // Even if prev_idx would be valid, the pending name wins.
+        assert_eq!(resolve_repo_index(&ls, 0, Some("gamma")), 2);
+        assert_eq!(resolve_repo_index(&ls, 2, Some("alpha")), 0);
+    }
+
+    #[test]
+    fn resolve_pending_name_missing_falls_back_to_zero() {
+        // This is the scenario B2 guards against: persisted repo got filtered out.
+        let ls = labels(&["alpha", "beta"]);
+        assert_eq!(resolve_repo_index(&ls, 1, Some("removed-repo")), 0);
+    }
+
+    #[test]
+    fn resolve_without_pending_clamps_prev_idx() {
+        let ls = labels(&["alpha", "beta"]);
+        // Out of range → 0, in range preserved.
+        assert_eq!(resolve_repo_index(&ls, 5, None), 0);
+        assert_eq!(resolve_repo_index(&ls, -1, None), 0);
+        assert_eq!(resolve_repo_index(&ls, 1, None), 1);
+    }
+
+    #[test]
+    fn resolve_empty_labels_yields_zero() {
+        let empty: Vec<SharedString> = Vec::new();
+        assert_eq!(resolve_repo_index(&empty, 3, Some("anything")), 0);
+        assert_eq!(resolve_repo_index(&empty, 0, None), 0);
     }
 }

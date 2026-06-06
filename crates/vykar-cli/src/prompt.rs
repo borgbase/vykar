@@ -1,3 +1,6 @@
+// Termios / Win32 console mode for hidden passphrase entry; SAFETY documented per block.
+#![allow(unsafe_code)]
+
 use std::io::{self, BufRead, IsTerminal, Write};
 
 pub(crate) fn prompt_hidden(prompt: &str) -> io::Result<String> {
@@ -26,27 +29,22 @@ fn read_hidden_line(buf: &mut String) -> io::Result<()> {
     }
 
     let fd = stdin.as_raw_fd();
-    let mut original = unsafe {
-        // Safe because zeroed memory is immediately initialized by tcgetattr.
-        std::mem::zeroed::<libc::termios>()
-    };
+    // SAFETY: termios is a C POD; the zeroed value is overwritten in full by
+    // tcgetattr below before being read.
+    let mut original = unsafe { std::mem::zeroed::<libc::termios>() };
 
-    if unsafe {
-        // Safe because fd is a valid stdin file descriptor and `original` is writable.
-        libc::tcgetattr(fd, &mut original)
-    } != 0
-    {
+    // SAFETY: fd is a valid stdin file descriptor (stdin is borrowed for the
+    // lifetime of this function), and `original` is exclusively borrowed.
+    if unsafe { libc::tcgetattr(fd, &mut original) } != 0 {
         return Err(io::Error::last_os_error());
     }
 
     let mut no_echo = original;
     no_echo.c_lflag &= !libc::ECHO;
 
-    if unsafe {
-        // Safe because fd is valid and no_echo is a valid termios struct.
-        libc::tcsetattr(fd, libc::TCSANOW, &no_echo)
-    } != 0
-    {
+    // SAFETY: fd is valid and `no_echo` is a fully-initialized termios value
+    // (a copy of the one populated by tcgetattr).
+    if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &no_echo) } != 0 {
         return Err(io::Error::last_os_error());
     }
 
@@ -57,10 +55,10 @@ fn read_hidden_line(buf: &mut String) -> io::Result<()> {
 
     impl Drop for RestoreTermios {
         fn drop(&mut self) {
-            let _ = unsafe {
-                // Safe because values were obtained from a successful tcgetattr call.
-                libc::tcsetattr(self.fd, libc::TCSANOW, &self.original)
-            };
+            // SAFETY: `self.original` was produced by a successful tcgetattr
+            // and `self.fd` was valid for the borrow that constructed this
+            // guard; the guard is dropped before stdin's borrow ends.
+            let _ = unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.original) };
         }
     }
 
@@ -82,10 +80,9 @@ fn read_hidden_line(buf: &mut String) -> io::Result<()> {
         return Ok(());
     }
 
-    let handle = unsafe {
-        // Safe because STD_INPUT_HANDLE is a constant and the API has no Rust-side invariants.
-        GetStdHandle(STD_INPUT_HANDLE)
-    };
+    // SAFETY: STD_INPUT_HANDLE is a constant and GetStdHandle has no
+    // Rust-side preconditions; we validate the returned handle below.
+    let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
 
     if handle.is_null() || handle == INVALID_HANDLE_VALUE {
         stdin.lock().read_line(buf)?;
@@ -93,21 +90,17 @@ fn read_hidden_line(buf: &mut String) -> io::Result<()> {
     }
 
     let mut mode: u32 = 0;
-    if unsafe {
-        // Safe because `handle` is a console handle and `mode` is writable.
-        GetConsoleMode(handle, &mut mode)
-    } == 0
-    {
+    // SAFETY: `handle` was validated above; `mode` is exclusively borrowed
+    // and properly aligned.
+    if unsafe { GetConsoleMode(handle, &mut mode) } == 0 {
         stdin.lock().read_line(buf)?;
         return Ok(());
     }
 
     let new_mode = mode & !ENABLE_ECHO_INPUT;
-    if unsafe {
-        // Safe because `handle` and mode flags come from Win32 console APIs.
-        SetConsoleMode(handle, new_mode)
-    } == 0
-    {
+    // SAFETY: `handle` was validated above; `new_mode` is a u32 derived from
+    // the previous mode, so it is a valid mode value for the console.
+    if unsafe { SetConsoleMode(handle, new_mode) } == 0 {
         return Err(io::Error::last_os_error());
     }
 
@@ -118,10 +111,9 @@ fn read_hidden_line(buf: &mut String) -> io::Result<()> {
 
     impl Drop for RestoreConsoleMode {
         fn drop(&mut self) {
-            let _ = unsafe {
-                // Safe because values were produced by successful console-mode calls.
-                SetConsoleMode(self.handle, self.mode)
-            };
+            // SAFETY: both values came from a successful console-mode round
+            // trip during construction of this guard.
+            let _ = unsafe { SetConsoleMode(self.handle, self.mode) };
         }
     }
 

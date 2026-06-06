@@ -85,7 +85,16 @@ pub fn format_check_status(repo_name: &str, event: &CheckProgressEvent) -> Strin
         CheckProgressEvent::PacksExistenceProgress {
             checked,
             total_packs,
-        } => format!("[{repo_name}] verifying packs ({checked}/{total_packs})..."),
+            missing,
+        } => {
+            if *missing > 0 {
+                format!(
+                    "[{repo_name}] verifying packs ({checked}/{total_packs}, {missing} missing)..."
+                )
+            } else {
+                format!("[{repo_name}] verifying packs ({checked}/{total_packs})...")
+            }
+        }
         CheckProgressEvent::ChunksDataPhaseStarted { total_chunks } => {
             format!("[{repo_name}] verifying data (0/{total_chunks})...")
         }

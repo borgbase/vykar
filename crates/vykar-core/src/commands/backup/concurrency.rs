@@ -50,7 +50,7 @@ impl ByteBudget {
     /// than the budget can still proceed (it just acquires the entire budget
     /// and runs alone). Returns `Err` if the budget has been poisoned.
     pub(super) fn acquire(&self, n: usize) -> Result<usize> {
-        let mut st = self.state.lock().unwrap();
+        let mut st = self.state.lock().expect("ByteBudget mutex not poisoned");
         let n = n.min(st.capacity);
         loop {
             if st.poisoned {
@@ -62,20 +62,23 @@ impl ByteBudget {
                 self.peak_acquired.fetch_max(acquired, Ordering::Relaxed);
                 return Ok(n);
             }
-            st = self.freed.wait(st).unwrap();
+            st = self
+                .freed
+                .wait(st)
+                .expect("ByteBudget freed condvar wait not poisoned");
         }
     }
 
     /// Return `n` bytes to the budget and wake any blocked workers.
     pub(super) fn release(&self, n: usize) {
-        let mut st = self.state.lock().unwrap();
+        let mut st = self.state.lock().expect("ByteBudget mutex not poisoned");
         st.available = (st.available + n).min(st.capacity);
         self.freed.notify_all();
     }
 
     /// Poison the budget so all current and future `acquire` calls return `Err`.
     pub(super) fn poison(&self) {
-        let mut st = self.state.lock().unwrap();
+        let mut st = self.state.lock().expect("ByteBudget mutex not poisoned");
         st.poisoned = true;
         self.freed.notify_all();
     }
@@ -98,7 +101,7 @@ pub(super) struct BudgetGuard<'a> {
 impl<'a> BudgetGuard<'a> {
     /// Acquire `n` bytes from the budget, returning a guard that will release
     /// them on drop if not defused.
-    #[allow(dead_code)] // Used in tests; production code uses from_pre_acquired.
+    #[cfg(test)] // Used in tests; production code uses from_pre_acquired.
     pub(super) fn new(budget: &'a ByteBudget, n: usize) -> Result<Self> {
         let acquired = budget.acquire(n)?;
         Ok(Self {

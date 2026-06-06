@@ -1,3 +1,6 @@
+// Test-only env mutation; SAFETY documented per block.
+#![allow(unsafe_code)]
+
 use std::path::Path;
 use std::sync::Once;
 
@@ -21,6 +24,9 @@ pub fn init_test_environment() {
         let cache = base.join("cache");
         let _ = std::fs::create_dir_all(&home);
         let _ = std::fs::create_dir_all(&cache);
+        // SAFETY: Rust 2024 marks env mutation as unsafe due to process-global
+        // races. This runs once via `Once::call_once` at test-process startup
+        // before any threads are spawned, so the race window is empty.
         unsafe {
             std::env::set_var("HOME", &home);
             std::env::set_var("XDG_CACHE_HOME", &cache);

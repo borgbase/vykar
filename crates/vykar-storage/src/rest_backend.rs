@@ -1,3 +1,12 @@
+#![allow(
+    clippy::duration_suboptimal_units,
+    clippy::map_unwrap_or,
+    clippy::manual_let_else,
+    clippy::missing_errors_doc,
+    clippy::redundant_closure_for_method_calls,
+    clippy::used_underscore_binding
+)]
+
 use std::io::Read;
 use std::time::Duration;
 
@@ -27,8 +36,8 @@ impl RestBackend {
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .http_status_as_error(false)
             .timeout_connect(Some(Duration::from_secs(30)))
-            .timeout_send_body(Some(Duration::from_secs(300)))
-            .timeout_recv_body(Some(Duration::from_secs(300)))
+            .timeout_send_body(Some(Duration::from_secs(5 * 60)))
+            .timeout_recv_body(Some(Duration::from_secs(5 * 60)))
             .build()
             .into();
 
@@ -37,7 +46,7 @@ impl RestBackend {
         Ok(Self {
             base_url: base,
             agent,
-            token: token.map(|t| t.to_string()),
+            token: token.map(str::to_string),
             retry,
         })
     }
@@ -274,8 +283,7 @@ impl RestBackend {
     fn put_bytes(&self, key: &str, data: &[u8]) -> Result<()> {
         let url = self.url(key);
         let checksum = Self::try_extract_pack_hex(key)
-            .map(|h| h.to_string())
-            .unwrap_or_else(|| Self::compute_blake2b_256_hex(data));
+            .map_or_else(|| Self::compute_blake2b_256_hex(data), str::to_string);
         self.retry_call(
             &format!("PUT {key}"),
             || {

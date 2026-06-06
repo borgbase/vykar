@@ -1,6 +1,7 @@
 use std::sync::atomic::Ordering;
 
 use vykar_core::app::operations;
+use vykar_core::commands::backup::BackupProgressEvent;
 use vykar_core::config::{self, ResolvedRepo, SourceEntry};
 use vykar_types::error::Result;
 
@@ -13,9 +14,7 @@ use super::WorkerContext;
 pub(super) fn begin_backup_operation(ctx: &WorkerContext, status_msg: impl Into<String>) {
     ctx.cancel_requested.store(false, Ordering::SeqCst);
     ctx.backup_running.store(true, Ordering::SeqCst);
-    let _ = ctx
-        .ui_tx
-        .send(UiEvent::OperationStarted { cancellable: true });
+    let _ = ctx.ui_tx.send(UiEvent::OperationStarted);
     let _ = ctx.ui_tx.send(UiEvent::Status(status_msg.into()));
 }
 
@@ -28,9 +27,7 @@ pub(super) fn end_backup_operation(ctx: &WorkerContext) {
 
 pub(super) fn begin_ui_operation(ctx: &WorkerContext, status_msg: impl Into<String>) {
     ctx.cancel_requested.store(false, Ordering::SeqCst);
-    let _ = ctx
-        .ui_tx
-        .send(UiEvent::OperationStarted { cancellable: false });
+    let _ = ctx.ui_tx.send(UiEvent::OperationStarted);
     let _ = ctx.ui_tx.send(UiEvent::Status(status_msg.into()));
 }
 
@@ -69,6 +66,9 @@ pub(super) fn run_selection_with_progress(
         Some(&ctx.cancel_requested),
         false,
         Some(&mut |evt| match evt {
+            operations::BackupRunEvent::Backup(BackupProgressEvent::Warning { message }) => {
+                send_log(&ui_tx_progress, format!("[{repo_name}] warning: {message}"));
+            }
             operations::BackupRunEvent::Backup(bpe) => {
                 if let Some(status) = tracker.format(&bpe) {
                     let _ = ui_tx_progress.send(UiEvent::Status(status));

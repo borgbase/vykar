@@ -43,3 +43,32 @@ pub struct SnapshotStats {
     #[serde(default)]
     pub errors: u64,
 }
+
+/// Snapshot of byte-counter fields on `SnapshotStats`, used to roll back
+/// partial commits when a file drifts mid-read.
+///
+/// Only covers the three size counters — `nfiles` is incremented exactly
+/// once on successful commit and `errors` is bumped by the skip path, so
+/// neither needs rollback support.
+#[derive(Clone, Copy)]
+pub struct ByteCounterSnapshot {
+    original_size: u64,
+    compressed_size: u64,
+    deduplicated_size: u64,
+}
+
+impl SnapshotStats {
+    pub fn snapshot_byte_counters(&self) -> ByteCounterSnapshot {
+        ByteCounterSnapshot {
+            original_size: self.original_size,
+            compressed_size: self.compressed_size,
+            deduplicated_size: self.deduplicated_size,
+        }
+    }
+
+    pub fn restore_byte_counters(&mut self, s: ByteCounterSnapshot) {
+        self.original_size = s.original_size;
+        self.compressed_size = s.compressed_size;
+        self.deduplicated_size = s.deduplicated_size;
+    }
+}

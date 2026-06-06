@@ -13,6 +13,10 @@ pub struct LocalBackend {
 
 impl LocalBackend {
     /// Create a backend rooted at the given directory path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if an existing root path cannot be canonicalized.
     pub fn new(root: &str) -> Result<Self> {
         let root_path = PathBuf::from(root);
         // Canonicalize if the path already exists for clearer errors and
@@ -82,6 +86,20 @@ impl LocalBackend {
     fn sync_directory(_dir: &Path) -> Result<()> {
         Ok(())
     }
+
+    fn delete_path_with_sync(
+        path: &Path,
+        sync_directory: impl FnOnce(&Path) -> Result<()>,
+    ) -> Result<()> {
+        match fs::remove_file(path) {
+            Ok(()) => {
+                let dir = path.parent().unwrap_or(Path::new("."));
+                sync_directory(dir)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
 }
 
 impl StorageBackend for LocalBackend {
@@ -109,11 +127,7 @@ impl StorageBackend for LocalBackend {
 
     fn delete(&self, key: &str) -> Result<()> {
         let path = self.resolve(key)?;
-        match fs::remove_file(&path) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e.into()),
-        }
+        Self::delete_path_with_sync(&path, Self::sync_directory)
     }
 
     fn exists(&self, key: &str) -> Result<bool> {
@@ -161,17 +175,19 @@ impl StorageBackend for LocalBackend {
             Err(e) => return Err(e.into()),
         };
         file.seek(SeekFrom::Start(offset))?;
-        let mut buf = vec![0u8; length as usize];
+        let length_usize = usize::try_from(length)
+            .map_err(|_| VykarError::Other(format!("range length too large: {length}")))?;
+        let mut buf = vec![0u8; length_usize];
         let mut filled = 0;
         while filled < buf.len() {
-            match file.read(&mut buf[filled..]) {
+            match file.read(buf.get_mut(filled..).expect("filled <= buf.len()")) {
                 Ok(0) => break,
                 Ok(n) => filled += n,
                 Err(e) => return Err(e.into()),
             }
         }
         buf.truncate(filled);
-        if filled != length as usize {
+        if filled != length_usize {
             return Err(VykarError::Other(format!(
                 "short read on {key} at offset {offset}: expected {length} bytes, got {filled}"
             )));
@@ -197,16 +213,18 @@ impl StorageBackend for LocalBackend {
         };
         file.seek(SeekFrom::Start(offset))?;
         buf.clear();
-        buf.resize(length as usize, 0);
+        let length_usize = usize::try_from(length)
+            .map_err(|_| VykarError::Other(format!("range length too large: {length}")))?;
+        buf.resize(length_usize, 0);
         let mut filled = 0;
         while filled < buf.len() {
-            match file.read(&mut buf[filled..]) {
+            match file.read(buf.get_mut(filled..).expect("filled <= buf.len()")) {
                 Ok(0) => break,
                 Ok(n) => filled += n,
                 Err(e) => return Err(e.into()),
             }
         }
-        if filled != length as usize {
+        if filled != length_usize {
             return Err(VykarError::Other(format!(
                 "short read on {key} at offset {offset}: expected {length} bytes, got {filled}"
             )));
@@ -325,6 +343,49 @@ mod tests {
         // Parent directory "locks" doesn't exist yet — put should create it
         backend.put("locks/abc.json", b"lock").unwrap();
         assert_eq!(backend.get("locks/abc.json").unwrap().unwrap(), b"lock");
+    }
+
+    #[test]
+    fn delete_missing_file_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = LocalBackend::new(dir.path().to_str().unwrap()).unwrap();
+
+        backend.delete("missing").unwrap();
+    }
+
+    #[test]
+    fn delete_removes_file_and_syncs_parent() {
+        use std::cell::Cell;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("marker");
+        fs::write(&path, b"data").unwrap();
+        let synced = Cell::new(false);
+
+        LocalBackend::delete_path_with_sync(&path, |synced_dir| {
+            assert_eq!(synced_dir, dir.path());
+            synced.set(true);
+            Ok(())
+        })
+        .unwrap();
+
+        assert!(synced.get(), "successful delete must sync parent directory");
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn delete_propagates_parent_sync_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("marker");
+        fs::write(&path, b"data").unwrap();
+
+        let err = LocalBackend::delete_path_with_sync(&path, |_dir| {
+            Err(VykarError::Other("sync failed".to_string()))
+        })
+        .unwrap_err();
+
+        assert!(matches!(err, VykarError::Other(msg) if msg == "sync failed"));
+        assert!(!path.exists(), "file removal happened before sync failure");
     }
 
     #[test]

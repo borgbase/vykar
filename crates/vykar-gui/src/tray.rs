@@ -47,7 +47,7 @@ pub(crate) fn build_tray_icon(
     let menu = Menu::new();
 
     let open_item = MenuItem::new(format!("Open {APP_TITLE}"), true, None);
-    let run_now_item = MenuItem::new("Full Backup", true, None);
+    let run_now_item = MenuItem::new("Full Backup Cycle", true, None);
     let source_submenu = Submenu::new("Backup Source", true);
     let cancel_item = MenuItem::new("Cancel Backup", true, None);
     let quit_item = MenuItem::new("Quit", true, None);

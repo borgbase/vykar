@@ -1,6 +1,7 @@
 use std::sync::atomic::Ordering;
 
 use vykar_core::app::operations;
+use vykar_core::commands::backup::BackupProgressEvent;
 use vykar_core::config;
 
 use crate::messages::{AppCommand, UiEvent};
@@ -71,6 +72,9 @@ pub(super) fn handle_backup_all(ctx: &mut WorkerContext, scheduled: bool) {
                         step.command_name()
                     )));
                 }
+                operations::CycleEvent::Backup(BackupProgressEvent::Warning { message }) => {
+                    send_log(&ui_tx_progress, format!("[{rn}] warning: {message}"));
+                }
                 operations::CycleEvent::Backup(evt) => {
                     if let Some(status) = tracker.format(evt) {
                         let _ = ui_tx_progress.send(UiEvent::Status(status));
@@ -81,6 +85,12 @@ pub(super) fn handle_backup_all(ctx: &mut WorkerContext, scheduled: bool) {
                 }
                 operations::CycleEvent::HookWarning { warning, .. } => {
                     send_log(&ui_tx_progress, format!("[{rn}] hook warning: {warning}"));
+                }
+                operations::CycleEvent::StepWarning { step, message } => {
+                    send_log(
+                        &ui_tx_progress,
+                        format!("[{rn}] {} warning: {message}", step.command_name()),
+                    );
                 }
                 _ => {}
             },

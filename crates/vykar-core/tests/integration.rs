@@ -1,3 +1,9 @@
+#![allow(clippy::unwrap_used)]
+#![allow(clippy::pedantic)]
+#![allow(clippy::panic, clippy::indexing_slicing)]
+// Test-only env mutation; SAFETY per block.
+#![allow(unsafe_code)]
+
 use vykar_core::commands;
 use vykar_core::compress::Compression;
 use vykar_core::config::{
@@ -19,6 +25,8 @@ fn init_test_environment() {
         let cache = base.join("cache");
         let _ = std::fs::create_dir_all(&home);
         let _ = std::fs::create_dir_all(&cache);
+        // SAFETY: Once::call_once runs this single-threaded at test-process
+        // startup before any threads are spawned.
         unsafe {
             std::env::set_var("HOME", &home);
             std::env::set_var("XDG_CACHE_HOME", &cache);
@@ -393,6 +401,7 @@ fn backup_deduplicates_identical_files_and_extracts_correctly() {
         restore_dir.to_str().unwrap(),
         None,
         config.xattrs.enabled,
+        false,
     )
     .unwrap();
     assert_eq!(extract_stats.files, 2);
@@ -544,6 +553,7 @@ fn backup_and_restore_preserves_file_xattrs_when_enabled() {
         restore_dir.to_str().unwrap(),
         None,
         true,
+        false,
     )
     .unwrap();
 
@@ -690,7 +700,7 @@ fn file_cache_persists_and_matches_snapshot_items() {
                     ms.size,
                 )
                 .unwrap_or_else(|| panic!("cache should have entry for {}", file_item.path));
-            let cached_ids: Vec<_> = cached_refs.iter().map(|c| c.id).collect();
+            let cached_ids: Vec<_> = cached_refs.as_slice().iter().map(|c| c.id).collect();
             let snap_ids: Vec<_> = file_item.chunks.iter().map(|c| c.id).collect();
             assert_eq!(
                 cached_ids, snap_ids,
@@ -872,7 +882,7 @@ fn file_cache_misses_on_modified_file() {
             ms.size,
         )
         .expect("cache should have entry for modified.bin after re-backup");
-    let cached_ids: Vec<_> = cached_refs.iter().map(|c| c.id).collect();
+    let cached_ids: Vec<_> = cached_refs.as_slice().iter().map(|c| c.id).collect();
     assert_eq!(
         cached_ids, files2["modified.bin"],
         "cache should be updated with new chunks for modified.bin"
@@ -1009,6 +1019,7 @@ fn command_dump_backup_and_restore() {
         extract_dir.path().to_str().unwrap(),
         None,
         false,
+        false,
     )
     .unwrap();
 
@@ -1119,6 +1130,7 @@ fn command_dump_mixed_with_files() {
         extract_dir.path().to_str().unwrap(),
         None,
         false,
+        false,
     )
     .unwrap();
 
@@ -1219,6 +1231,7 @@ fn backup_many_small_files_plus_large_file_roundtrip() {
         restore_dir.to_str().unwrap(),
         None,
         false,
+        false,
     )
     .unwrap();
 
@@ -1297,6 +1310,7 @@ fn backup_many_small_files_plus_large_file_roundtrip() {
         restore_dir2.to_str().unwrap(),
         None,
         false,
+        false,
     )
     .unwrap();
 
@@ -1371,6 +1385,7 @@ fn backup_pipeline_threshold_splitting_roundtrip() {
         "snap-threshold",
         restore_dir.to_str().unwrap(),
         None,
+        false,
         false,
     )
     .unwrap();
@@ -1539,6 +1554,7 @@ fn backup_pipeline_mixed_cache_hit_processed_and_large_roundtrip() {
         "snap-mixed-2",
         restore_dir.to_str().unwrap(),
         None,
+        false,
         false,
     )
     .unwrap();
@@ -2140,10 +2156,19 @@ fn session_guard_blocks_maintenance() {
     // with_maintenance_lock must refuse while the session is active
     let mut repo2 = open_local_repo(&repo_dir);
     let err = with_maintenance_lock(&mut repo2, |_| Ok(())).unwrap_err();
-    assert!(
-        matches!(err, vykar_types::error::VykarError::ActiveSessions(_)),
-        "expected ActiveSessions, got: {err}"
-    );
+    match &err {
+        vykar_types::error::VykarError::ActiveSessions(list) => {
+            assert_eq!(list.0.len(), 1, "exactly one active session expected");
+            let info = &list.0[0];
+            assert_eq!(info.id, session_id);
+            let d = info.details.as_ref().expect("parseable marker");
+            assert!(!d.hostname.is_empty(), "hostname should be populated");
+            assert!(d.pid > 0, "pid should be populated");
+            assert!(!d.age.is_empty(), "age should be populated");
+            assert!(!list.has_malformed());
+        }
+        other => panic!("expected ActiveSessions, got: {other}"),
+    }
 
     // Drop the guard — session deregistered
     drop(guard);
@@ -2151,6 +2176,117 @@ fn session_guard_blocks_maintenance() {
     // Maintenance should now succeed
     let mut repo3 = open_local_repo(&repo_dir);
     with_maintenance_lock(&mut repo3, |_| Ok(())).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Issue #107: stale (>45 min) session markers must be reaped on maintenance
+// ---------------------------------------------------------------------------
+
+#[test]
+fn maintenance_reaps_session_older_than_45_minutes() {
+    use vykar_core::commands::util::with_maintenance_lock;
+    use vykar_core::repo::lock;
+
+    init_test_environment();
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = tmp.path().join("repo");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+
+    // Init a repo.
+    let storage = Box::new(LocalBackend::new(repo_dir.to_str().unwrap()).unwrap());
+    let repo = Repository::init(
+        storage,
+        EncryptionMode::None,
+        ChunkerConfig::default(),
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+    drop(repo);
+
+    // Fabricate a session marker with last_refresh 50 min ago — no live
+    // process owns it, so maintenance must reap it and proceed.
+    let fifty_min_ago = (chrono::Utc::now() - chrono::Duration::minutes(50)).to_rfc3339();
+    let marker = format!(
+        r#"{{"hostname":"ghost","pid":12345,"registered_at":"{fifty_min_ago}","last_refresh":"{fifty_min_ago}"}}"#
+    );
+    let sessions_dir = repo_dir.join("sessions");
+    std::fs::create_dir_all(&sessions_dir).unwrap();
+    let marker_path = sessions_dir.join("stale-session.json");
+    std::fs::write(&marker_path, marker.as_bytes()).unwrap();
+    assert!(marker_path.exists());
+
+    // Maintenance should clean the stale marker and succeed.
+    let mut repo2 = open_local_repo(&repo_dir);
+    with_maintenance_lock(&mut repo2, |_| Ok(())).unwrap();
+
+    assert!(
+        !marker_path.exists(),
+        "stale marker must be reaped by maintenance"
+    );
+    // Sanity: listing sessions should now be empty.
+    let storage = Box::new(LocalBackend::new(repo_dir.to_str().unwrap()).unwrap());
+    let remaining = lock::list_sessions(storage.as_ref()).unwrap();
+    assert!(remaining.is_empty(), "no sessions should remain");
+}
+
+#[test]
+fn maintenance_blocks_on_malformed_session_marker() {
+    use vykar_core::commands::util::with_maintenance_lock;
+
+    init_test_environment();
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = tmp.path().join("repo");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+
+    // Init a repo.
+    let storage = Box::new(LocalBackend::new(repo_dir.to_str().unwrap()).unwrap());
+    let repo = Repository::init(
+        storage,
+        EncryptionMode::None,
+        ChunkerConfig::default(),
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+    drop(repo);
+
+    // Plant a malformed marker — unparseable JSON.
+    let sessions_dir = repo_dir.join("sessions");
+    std::fs::create_dir_all(&sessions_dir).unwrap();
+    let marker_path = sessions_dir.join("corrupt-session.json");
+    std::fs::write(&marker_path, b"this is not json at all").unwrap();
+
+    // Maintenance must fail-close: we can't prove this marker is stale,
+    // so it blocks as an active session with placeholder host/pid.
+    let mut repo2 = open_local_repo(&repo_dir);
+    let err = with_maintenance_lock(&mut repo2, |_| Ok(())).unwrap_err();
+    match &err {
+        vykar_types::error::VykarError::ActiveSessions(list) => {
+            assert_eq!(list.0.len(), 1);
+            let info = &list.0[0];
+            assert_eq!(info.id, "corrupt-session");
+            assert!(
+                info.details.is_none(),
+                "malformed marker must surface as details=None, got: {info:?}"
+            );
+            assert!(list.has_malformed());
+        }
+        other => panic!("expected ActiveSessions for malformed marker, got: {other}"),
+    }
+    // The rendered error must mention the malformed-marker state and the
+    // remediation command.
+    let rendered = err.to_string();
+    assert!(rendered.contains("malformed marker"));
+    assert!(rendered.contains("break-lock --sessions"));
+
+    // Marker must still be on disk — cleanup does not delete it.
+    assert!(
+        marker_path.exists(),
+        "malformed marker must be preserved for operator intervention"
+    );
 }
 
 /// Verify that pipeline (multi-threaded) and sequential (single-threaded) backup

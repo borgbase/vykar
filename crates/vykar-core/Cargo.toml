@@ -1,6 +1,6 @@
 [package]
 name = "vykar-core"
-version = "0.12.15"
+version = "0.16.1"
 edition = "2021"
 license = "GPL-3.0-only"
 
@@ -33,9 +33,10 @@ lz4_flex = "0.13"
 zstd = "0.13"
 
 # Chunking
-fastcdc = "4"
+fastcdc = "4.0.1"
 
 # Filesystem
+dunce = { workspace = true }
 tempfile.workspace = true
 globset = "0.4"
 ignore = "0.4"
@@ -68,7 +69,7 @@ tokio = { workspace = true, features = ["rt-multi-thread"], optional = true }
 dav-server = { version = "0.11", optional = true }
 hyper = { version = "1", features = ["server", "http1"], optional = true }
 hyper-util = { version = "0.1", features = ["tokio"], optional = true }
-lru = { version = "0.17", optional = true }
+lru = { version = "0.18", optional = true }
 bytes = { version = "1", optional = true }
 futures-util = { version = "0.3", optional = true }
 percent-encoding = { version = "2", optional = true }
@@ -76,7 +77,7 @@ percent-encoding = { version = "2", optional = true }
 [features]
 default = []
 backend-sftp = ["vykar-storage/backend-sftp"]
-mount = ["dav-server", "tokio/rt-multi-thread", "tokio/macros", "tokio/signal", "tokio/net", "hyper", "hyper-util", "lru", "bytes", "futures-util", "percent-encoding"]
+mount = ["dav-server", "tokio/rt-multi-thread", "tokio/macros", "tokio/signal", "tokio/net", "tokio/sync", "hyper", "hyper-util", "lru", "bytes", "futures-util", "percent-encoding"]
 
 [dev-dependencies]
 proptest = { workspace = true }
@@ -84,5 +85,5 @@ test-case = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-nix = { version = "0.31", features = ["fs", "hostname", "signal", "process"] }
+nix = { version = "0.31.3", features = ["fs", "hostname", "signal", "process"] }
 xattr = "1"

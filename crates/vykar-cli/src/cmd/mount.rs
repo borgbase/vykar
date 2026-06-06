@@ -2,6 +2,7 @@ use vykar_core::commands;
 use vykar_core::commands::mount::MountProgressEvent;
 use vykar_core::config::VykarConfig;
 
+use crate::error::CliResult;
 use crate::passphrase::with_repo_passphrase;
 
 pub(crate) fn run_mount(
@@ -11,7 +12,7 @@ pub(crate) fn run_mount(
     address: String,
     cache_size: usize,
     source_filter: &[String],
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> CliResult<()> {
     with_repo_passphrase(config, label, |passphrase| {
         let mut on_progress = |event: MountProgressEvent| match event {
             MountProgressEvent::LoadingSnapshots => {
@@ -38,8 +39,9 @@ pub(crate) fn run_mount(
             cache_size,
             source_filter,
             Some(&mut on_progress),
-        )
-        .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })
+            None,
+        )?;
+        Ok(())
     })?;
 
     Ok(())

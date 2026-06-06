@@ -8,13 +8,28 @@ type KeyedBlake2b256 = Blake2bMac<U32>;
 
 /// A 32-byte chunk identifier computed as keyed BLAKE2b-256.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct ChunkId(pub [u8; 32]);
+pub struct ChunkId([u8; 32]);
 
 impl ChunkId {
+    /// Wrap a 32-byte array as a `ChunkId`. Any 32-byte value is a valid ID.
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// Borrow the raw 32 bytes (e.g. for AAD or wire-format writes).
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
     /// Compute a chunk ID using keyed BLAKE2b-256 (BLAKE2b-MAC with 32-byte output).
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the `BLAKE2b` implementation rejects a 32-byte key, which
+    /// would violate this function's fixed-size key contract.
     pub fn compute(key: &[u8; 32], data: &[u8]) -> Self {
         let mut hasher =
-            KeyedBlake2b256::new_from_slice(key).expect("valid 32-byte key for BLAKE2b");
+            KeyedBlake2b256::new_from_slice(key).expect("BLAKE2b accepts 32-byte keys per spec");
         Mac::update(&mut hasher, data);
         let result = hasher.finalize();
         let mut out = [0u8; 32];
@@ -89,7 +104,7 @@ mod tests {
 
     #[test]
     fn shard_prefix_is_first_byte() {
-        let id = ChunkId([0xAB; 32]);
+        let id = ChunkId::from_bytes([0xAB; 32]);
         assert_eq!(id.shard_prefix(), "ab");
     }
 
@@ -98,7 +113,7 @@ mod tests {
         let key = test_chunk_id_key();
         let id = ChunkId::compute(&key, b"");
         assert_eq!(id.to_hex().len(), 64);
-        assert_ne!(id.0, [0u8; 32]);
+        assert_ne!(*id.as_bytes(), [0u8; 32]);
     }
 
     #[test]

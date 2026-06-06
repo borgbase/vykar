@@ -1,9 +1,20 @@
+// LZ4 in-place compression uses raw pointer writes; SAFETY documented per block.
+#![allow(unsafe_code)]
+// Wire-format reads after explicit length checks (`data.is_empty()`,
+// `payload.len() < 4`); the indexing and slicing into `data`/`payload` is
+// unreachable for inputs that pass those guards.
+#![allow(clippy::indexing_slicing)]
+
 use std::io::Read;
 
 use serde::{Deserialize, Serialize};
 
 use crate::config::CompressionAlgorithm;
 use vykar_types::error::{Result, VykarError};
+
+fn read_u32_le(bytes: [u8; 4]) -> u32 {
+    u32::from_le_bytes(bytes)
+}
 
 const TAG_NONE: u8 = 0x00;
 const TAG_LZ4: u8 = 0x01;
@@ -108,7 +119,7 @@ pub fn compress_append(compression: Compression, data: &[u8], buf: &mut Vec<u8>)
                         .map_err(|e| VykarError::Other(format!("zstd init: {e}")))?;
                     *slot = Some((level, cx));
                 }
-                let (_, cx) = slot.as_mut().unwrap();
+                let (_, cx) = slot.as_mut().expect("zstd compressor initialized");
 
                 buf.push(TAG_ZSTD);
                 // Write compressed data directly into buf's spare capacity
@@ -162,7 +173,11 @@ fn decompress_impl(data: &[u8], expected_size: Option<usize>, max_size: u64) -> 
             if payload.len() < 4 {
                 return Err(VykarError::Decompression("lz4: payload too short".into()));
             }
-            let uncompressed_size = u32::from_le_bytes(payload[..4].try_into().unwrap()) as u64;
+            let uncompressed_size = u64::from(read_u32_le(
+                payload[..4]
+                    .try_into()
+                    .expect("payload.len() >= 4 (checked above)"),
+            ));
             if uncompressed_size > max_size {
                 return Err(VykarError::Decompression(format!(
                     "lz4: decompressed size ({uncompressed_size}) exceeds limit of {max_size} bytes"
@@ -187,7 +202,7 @@ fn decompress_impl(data: &[u8], expected_size: Option<usize>, max_size: u64) -> 
                                 VykarError::Decompression(format!("zstd init: {e}"))
                             })?);
                     }
-                    let dx = slot.as_mut().unwrap();
+                    let dx = slot.as_mut().expect("zstd decompressor initialized");
                     // A zero hint means "unknown" — clamp to 1 so bulk::decompress
                     // allocates a minimal buffer rather than returning an empty Vec
                     // for what might be a valid non-empty frame.
@@ -289,7 +304,11 @@ pub fn decompress_into_with_hint(
             if payload.len() < 4 {
                 return Err(VykarError::Decompression("lz4: payload too short".into()));
             }
-            let uncompressed_size = u32::from_le_bytes(payload[..4].try_into().unwrap()) as usize;
+            let uncompressed_size = read_u32_le(
+                payload[..4]
+                    .try_into()
+                    .expect("payload.len() >= 4 (checked above)"),
+            ) as usize;
             if uncompressed_size as u64 > MAX_DECOMPRESS_SIZE {
                 return Err(VykarError::Decompression(format!(
                     "lz4: decompressed size ({uncompressed_size}) exceeds limit of {MAX_DECOMPRESS_SIZE} bytes"
@@ -323,7 +342,7 @@ pub fn decompress_into_with_hint(
                                 VykarError::Decompression(format!("zstd init: {e}"))
                             })?);
                     }
-                    let dx = slot.as_mut().unwrap();
+                    let dx = slot.as_mut().expect("zstd decompressor initialized");
                     let cap = hint.max(1).min(MAX_DECOMPRESS_SIZE as usize);
                     output.clear();
                     output.resize(cap, 0);

@@ -5,15 +5,32 @@ use std::fmt;
 
 /// A 32-byte pack file identifier computed as unkeyed BLAKE2b-256.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct PackId(pub [u8; 32]);
+pub struct PackId([u8; 32]);
 
 impl PackId {
+    /// Wrap a 32-byte array as a `PackId`. Any 32-byte value is a valid ID.
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// Borrow the raw 32 bytes.
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
     /// Compute a pack ID as unkeyed BLAKE2b-256 of the entire pack contents.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the `BLAKE2b` implementation rejects the fixed 32-byte
+    /// output length used by `PackId`.
     pub fn compute(data: &[u8]) -> Self {
-        let mut hasher = Blake2bVar::new(32).expect("valid output size");
+        let mut hasher = Blake2bVar::new(32).expect("BLAKE2b accepts 32-byte output per spec");
         hasher.update(data);
         let mut out = [0u8; 32];
-        hasher.finalize_variable(&mut out).expect("correct length");
+        hasher
+            .finalize_variable(&mut out)
+            .expect("finalize_variable writes the requested 32 bytes");
         PackId(out)
     }
 
@@ -32,7 +49,12 @@ impl PackId {
         format!("packs/{}/{}", self.shard_prefix(), self.to_hex())
     }
 
-    /// Parse a PackId from a 64-character hex string.
+    /// Parse a `PackId` from a 64-character hex string.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `hex_str` is not valid hex or does not decode to
+    /// exactly 32 bytes.
     pub fn from_hex(hex_str: &str) -> std::result::Result<Self, String> {
         let bytes = hex::decode(hex_str).map_err(|e| format!("invalid hex: {e}"))?;
         if bytes.len() != 32 {
@@ -43,7 +65,12 @@ impl PackId {
         Ok(PackId(arr))
     }
 
-    /// Parse a PackId from a storage key path like `packs/ab/<hex>`.
+    /// Parse a `PackId` from a storage key path like `packs/ab/<hex>`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the final path component is not a valid full pack
+    /// ID hex string.
     pub fn from_storage_key(key: &str) -> std::result::Result<Self, String> {
         let hex_str = key
             .rsplit('/')

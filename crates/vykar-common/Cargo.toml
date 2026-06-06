@@ -1,6 +1,6 @@
 [package]
 name = "vykar-common"
-version = "0.12.12"
+version = "0.16.1"
 edition = "2021"
 license = "GPL-3.0-only"
 
@@ -8,4 +8,4 @@ license = "GPL-3.0-only"
 workspace = true
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.31", features = ["user"] }
+nix = { version = "0.31.3", features = ["user"] }

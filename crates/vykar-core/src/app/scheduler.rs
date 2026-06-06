@@ -1,3 +1,6 @@
+// libc::flock for the process-wide scheduler lock; SAFETY documented per block.
+#![allow(unsafe_code)]
+
 use std::fs::File;
 use std::time::Duration;
 
@@ -63,7 +66,9 @@ impl SchedulerLock {
     fn platform_flock(file: File) -> Option<Self> {
         use std::os::unix::io::AsRawFd;
         let fd = file.as_raw_fd();
-        // SAFETY: fd is valid and we pass well-defined flags.
+        // SAFETY: fd belongs to the `file` owned in this scope (still alive
+        // through the call), and the flag set is a valid combination per the
+        // flock(2) contract.
         let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
         if ret == 0 {
             Some(Self { _file: Some(file) })

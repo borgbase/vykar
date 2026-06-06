@@ -640,14 +640,25 @@ fn refcount_rebuild_excludes_doomed_snapshots() {
     // Apply repair
     let result = apply_repair(&config, false);
 
-    // (1) applied has RemoveDanglingSnapshot for snap-A and RebuildRefcounts
-    assert!(
-        has_action(&result.applied, |a| matches!(
+    // (1) applied either drops items from snap-A (preferred) or removes the
+    // whole snapshot — both branches must end with RebuildRefcounts.
+    let drop_items = has_action(&result.applied, |a| {
+        matches!(
+            a,
+            RepairAction::DropItemsFromSnapshot { ref snapshot_name, .. }
+                if snapshot_name == "snap-A"
+        )
+    });
+    let remove_dangling = has_action(&result.applied, |a| {
+        matches!(
             a,
             RepairAction::RemoveDanglingSnapshot { ref snapshot_name, .. }
                 if snapshot_name == "snap-A"
-        )),
-        "expected RemoveDanglingSnapshot for snap-A in applied, got: {:?}",
+        )
+    });
+    assert!(
+        drop_items || remove_dangling,
+        "expected DropItemsFromSnapshot or RemoveDanglingSnapshot for snap-A, got: {:?}",
         result.applied
     );
     assert!(
@@ -659,19 +670,27 @@ fn refcount_rebuild_excludes_doomed_snapshots() {
         result.applied
     );
 
-    // (2) snap-B survives
+    // (2) snap-B survives. snap-A may be retained (when item-level repair
+    // covers it) or removed (when every snap-A item was in the deleted pack).
     let repo = open_local_repo(&repo_dir);
     assert!(
         repo.manifest().find_snapshot("snap-B").is_some(),
         "snap-B should survive the repair"
     );
-    assert!(
-        repo.manifest().find_snapshot("snap-A").is_none(),
-        "snap-A should have been removed"
-    );
+    if drop_items {
+        assert!(
+            repo.manifest().find_snapshot("snap-A").is_some(),
+            "snap-A should be retained under a new id when item-level repair applies"
+        );
+    } else {
+        assert!(
+            repo.manifest().find_snapshot("snap-A").is_none(),
+            "snap-A should have been removed when whole-snapshot repair applies"
+        );
+    }
 
-    // (3) refcounts for snap-B chunks should be exactly 1 (sole surviving snapshot,
-    // non-overlapping content).
+    // (3) refcounts for snap-B chunks should be exactly 1 (non-overlapping
+    // content with snap-A by construction).
     for chunk_id in &snap_b_chunks {
         if let Some(entry) = repo.chunk_index().get(chunk_id) {
             assert_eq!(

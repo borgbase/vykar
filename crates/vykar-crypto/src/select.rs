@@ -103,6 +103,7 @@ fn measure_mib_per_sec(
         return 0.0;
     }
 
+    #[allow(clippy::cast_precision_loss)]
     let total_mib = (payload.len() * iterations) as f64 / (1024.0 * 1024.0);
     total_mib / elapsed
 }
@@ -118,7 +119,9 @@ fn run_once(engine: &dyn CryptoEngine, payload: &[u8], aad: &[u8]) -> bool {
 }
 
 fn benchmark_input(size: usize) -> Vec<u8> {
-    (0..size).map(|i| (i % 251) as u8).collect()
+    (0..size)
+        .map(|i| u8::try_from(i % 251).expect("modulo keeps value below u8::MAX"))
+        .collect()
 }
 
 fn weighted_score(small_mibps: f64, large_mibps: f64) -> f64 {
@@ -152,6 +155,6 @@ mod tests {
     #[test]
     fn weighted_score_favors_small_payloads() {
         let score = weighted_score(500.0, 100.0);
-        assert_eq!(score, 380.0);
+        assert!((score - 380.0).abs() < f64::EPSILON);
     }
 }

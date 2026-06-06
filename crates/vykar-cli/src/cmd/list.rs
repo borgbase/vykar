@@ -4,6 +4,7 @@ use comfy_table::{Cell, CellAlignment};
 use vykar_core::commands;
 use vykar_core::config::VykarConfig;
 
+use crate::error::CliResult;
 use crate::format::{format_bytes, format_count};
 use crate::passphrase::with_repo_passphrase;
 use crate::table::CliTableTheme;
@@ -52,10 +53,11 @@ pub(crate) fn run_list(
     source_filter: &[String],
     json: &bool,
     last: Option<usize>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> CliResult<()> {
     let mut snapshots = with_repo_passphrase(config, label, |passphrase| {
-        commands::list::list_snapshots_with_stats(config, passphrase)
-            .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })
+        Ok(commands::list::list_snapshots_with_stats(
+            config, passphrase,
+        )?)
     })?;
 
     // Filter by source label if requested

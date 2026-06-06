@@ -125,12 +125,20 @@ fn with_repo_lock_keeps_original_action_error_if_release_also_fails() {
 }
 
 #[test]
-fn with_repo_lock_returns_release_error_when_action_succeeds() {
+fn with_repo_lock_succeeds_when_release_fails_after_successful_action() {
+    // Post-commit policy: if the action succeeded, a lock-release failure is
+    // non-fatal (tracing::warn! only). The operation has already committed to
+    // storage; propagating a release error would incorrectly report a failure.
+    // The leaked lock ages out in 6 hours or can be cleared with `vykar
+    // break-lock` — see commands/util.rs run_under_fence.
     let backend = AdvisoryLockBackend::new(true);
     let mut repo = init_repo_with_backend(backend.clone());
 
     let result: Result<()> = with_repo_lock(&mut repo, |_repo| Ok(()));
-    assert!(matches!(result, Err(VykarError::Other(msg)) if msg == "forced release failure"));
+    assert!(
+        result.is_ok(),
+        "release failure must not fail a successful action"
+    );
     assert_eq!(backend.release_calls(), 1);
 }
 

@@ -51,42 +51,14 @@ fn list_snapshot_items_inner(
     let (mut repo, _session_guard) =
         super::util::open_repo_with_read_session(config, passphrase, OpenOptions::new())?;
 
-    // Resolve "latest" or exact snapshot name
     let resolved_name = repo
         .manifest()
         .resolve_snapshot(snapshot_name)?
         .name
         .clone();
 
-    // Load snapshot metadata once — extract both source_paths and item_ptrs
-    // to avoid a redundant second load inside the item-reading path.
-    let meta = load_snapshot_meta(&repo, &resolved_name)?;
-    let source_paths = meta.source_paths;
-    let item_ptrs = meta.item_ptrs;
-
-    // Try restore cache first (avoids loading the full index entirely)
-    if let Some(ref cache) = repo.open_restore_cache() {
-        match resolve_and_read(&mut repo, &item_ptrs, |chunk_id, _repo| {
-            cache
-                .lookup(chunk_id)
-                .ok_or(VykarError::ChunkNotInIndex(*chunk_id))
-        }) {
-            Ok(stream) => {
-                let items = decode_items_stream(&stream)?;
-                return Ok((items, source_paths));
-            }
-            Err(VykarError::ChunkNotInIndex(_)) => {
-                // Restore cache incomplete — fall through to full index
-            }
-            Err(_) => {
-                // Decryption/read error (stale cache) — fall through to full index
-            }
-        }
-    }
-
-    // Fall back to full index load (benefits from blob cache)
-    repo.load_chunk_index()?;
-    let stream = load_item_stream_from_ptrs(&mut repo, &item_ptrs)?;
+    let source_paths = load_snapshot_meta(&repo, &resolved_name)?.source_paths;
+    let stream = load_snapshot_item_stream_cache_first(&mut repo, &resolved_name)?;
     let items = decode_items_stream(&stream)?;
     Ok((items, source_paths))
 }
@@ -155,6 +127,30 @@ pub fn load_snapshot_items(repo: &mut Repository, snapshot_name: &str) -> Result
 pub fn load_snapshot_item_stream(repo: &mut Repository, snapshot_name: &str) -> Result<Vec<u8>> {
     let snapshot_meta = load_snapshot_meta(repo, snapshot_name)?;
     load_item_stream_from_ptrs(repo, &snapshot_meta.item_ptrs)
+}
+
+/// Load the raw item stream bytes for a snapshot, trying the local restore
+/// cache first to avoid downloading the chunk index. Falls back to the full
+/// chunk index (with blob cache) on any cache miss or read/decrypt error.
+pub fn load_snapshot_item_stream_cache_first(
+    repo: &mut Repository,
+    snapshot_name: &str,
+) -> Result<Vec<u8>> {
+    if let Some(cache) = repo.open_restore_cache() {
+        match load_snapshot_item_stream_via_lookup(repo, snapshot_name, |chunk_id| {
+            cache.lookup(chunk_id)
+        }) {
+            Ok(stream) => return Ok(stream),
+            Err(VykarError::ChunkNotInIndex(_)) => {
+                // Restore cache incomplete — fall through to full index
+            }
+            Err(_) => {
+                // Decryption/read error (stale cache) — fall through to full index
+            }
+        }
+    }
+    repo.load_chunk_index()?;
+    load_snapshot_item_stream(repo, snapshot_name)
 }
 
 /// Load item stream using a lookup closure instead of the chunk index.

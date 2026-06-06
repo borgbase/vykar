@@ -7,6 +7,8 @@ mod sequential;
 mod source;
 mod walk;
 
+pub(crate) mod read_source;
+
 pub(crate) use chunk_process::WorkerChunk;
 
 use std::sync::atomic::AtomicBool;
@@ -21,7 +23,9 @@ use std::sync::Arc;
 
 use crate::limits;
 use crate::platform::fs;
-use crate::repo::file_cache::{FileCache, ParentReuseBuilder, ParentReuseIndex, ParentReuseRoot};
+use crate::repo::file_cache::{
+    CachedChunks, FileCache, ParentReuseBuilder, ParentReuseIndex, ParentReuseRoot,
+};
 use crate::repo::format::{pack_object_with_context, ObjectType};
 use crate::repo::lock;
 use crate::repo::manifest::SnapshotEntry;
@@ -30,13 +34,14 @@ use crate::repo::Repository;
 use crate::snapshot::item::Item;
 use crate::snapshot::{SnapshotMeta, SnapshotStats};
 use crate::storage;
+use vykar_common::display::{format_bytes, format_count};
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
 use vykar_types::snapshot_id::SnapshotId;
 
 use std::collections::HashSet;
 
-use walk::items_chunker_config;
+pub(crate) use walk::items_chunker_config;
 
 /// Normalize a relative path to always use `/` as the separator.
 ///
@@ -53,27 +58,77 @@ pub(crate) fn normalize_rel_path(path: String) -> String {
     }
 }
 
-/// Resolve a cache hit by checking the file cache, falling back to the parent reuse index.
+/// Outcome of looking up a file in the local file cache and parent reuse index.
+///
+/// Tri-state so the caller can route dataless (cloud-only macOS placeholder)
+/// files into a never-open code path: hit reuses chunks from a prior snapshot
+/// without touching the file, miss-with-dataless skips the file outright
+/// rather than falling through to a normal `read()` which would trigger
+/// asynchronous hydration via `fileproviderd`.
+#[derive(Debug)]
+pub(crate) enum CacheResolution {
+    /// Reuse cached chunks; the file is not opened.
+    Hit(CachedChunks),
+    /// No reuse — caller should open + chunk normally.
+    Miss,
+    /// File is dataless and neither the local file cache nor the parent
+    /// reuse index has a matching entry. Caller must skip the file (no
+    /// hydration, no read).
+    SkipDataless,
+}
+
+/// Resolve a cache hit by checking the file cache, falling back to the parent
+/// reuse index.
+///
+/// Dataless files (`summary.is_dataless == true`) use a ctime-tolerant lookup
+/// path: ctime is dropped from the equality check because `SF_DATALESS` flag
+/// toggles bump ctime even when content is unchanged. They first try the
+/// warm `FileCache` (matches on `(device, inode, size, mtime)`) and then fall
+/// back to the parent-reuse index (matches on `(path, size, mtime)`); if both
+/// miss, the result is `SkipDataless` — **never** `Miss`, so the caller
+/// cannot accidentally read and hydrate.
 fn resolve_cache_hit(
     file_cache: &FileCache,
     parent_reuse_index: Option<&ParentReuseIndex>,
     abs_path: &str,
     summary: &fs::MetadataSummary,
-) -> Option<Arc<Vec<crate::snapshot::item::ChunkRef>>> {
-    file_cache
-        .lookup(
+) -> CacheResolution {
+    if summary.is_dataless {
+        if let Some(chunks) = file_cache.lookup_dataless(
             abs_path,
             summary.device,
             summary.inode,
             summary.mtime_ns,
-            summary.ctime_ns,
             summary.size,
-        )
-        .or_else(|| {
-            parent_reuse_index.and_then(|idx| {
-                idx.lookup(abs_path, summary.size, summary.mtime_ns, summary.ctime_ns)
-            })
-        })
+        ) {
+            return CacheResolution::Hit(chunks);
+        }
+        return match parent_reuse_index
+            .and_then(|idx| idx.lookup_dataless(abs_path, summary.size, summary.mtime_ns))
+        {
+            Some(chunks) => CacheResolution::Hit(chunks),
+            None => CacheResolution::SkipDataless,
+        };
+    }
+
+    let local = file_cache.lookup(
+        abs_path,
+        summary.device,
+        summary.inode,
+        summary.mtime_ns,
+        summary.ctime_ns,
+        summary.size,
+    );
+    if let Some(chunks) = local {
+        return CacheResolution::Hit(chunks);
+    }
+
+    let parent = parent_reuse_index
+        .and_then(|idx| idx.lookup(abs_path, summary.size, summary.mtime_ns, summary.ctime_ns));
+    match parent {
+        Some(chunks) => CacheResolution::Hit(chunks),
+        None => CacheResolution::Miss,
+    }
 }
 
 pub(crate) fn flush_item_stream_chunk(
@@ -150,6 +205,12 @@ pub enum BackupProgressEvent {
     CommitStage {
         stage: &'static str,
     },
+    /// A non-fatal post-commit issue. The snapshot is durably committed.
+    /// `tracing::warn!` has already fired; this surfaces the warning to the
+    /// progress callback (CLI/GUI) since the GUI does not subscribe to tracing.
+    Warning {
+        message: String,
+    },
 }
 
 pub(crate) fn emit_progress(
@@ -158,6 +219,73 @@ pub(crate) fn emit_progress(
 ) {
     if let Some(callback) = progress.as_deref_mut() {
         callback(event);
+    }
+}
+
+/// Emit the once-per-source summary warning for macOS dataless files that
+/// could not be reused from a parent snapshot. Per-file `tracing::debug!`
+/// lines fire from the walker; this single high-signal line surfaces the
+/// total count to the CLI/GUI so users notice tens-of-GB of cloud-only
+/// content was skipped without flooding the activity log.
+pub(crate) fn emit_dataless_summary(
+    progress: &mut Option<&mut dyn FnMut(BackupProgressEvent)>,
+    skipped: u64,
+) {
+    let count = format_count(skipped);
+    let msg = format!(
+        "dataless: skipped {count} cloud-only files with no prior backup \
+         (run while files are downloaded to back them up)"
+    );
+    warn!("{msg}");
+    emit_progress(progress, BackupProgressEvent::Warning { message: msg });
+}
+
+/// Emit a post-commit warning: `tracing::warn!` + `BackupProgressEvent::Warning`
+/// always happen together. The tracing half reaches stderr (via the tracing
+/// subscriber in the CLI); the progress event half reaches the GUI log panel.
+/// Keeping both sides in one helper prevents drift.
+///
+/// Generic over `F: FnMut(..)` so callers that hold either a concrete closure
+/// (`&mut Option<impl FnMut(..)>`) or a type-erased one
+/// (`&mut Option<&mut dyn FnMut(..)>`) can use it.
+pub(crate) fn emit_post_commit_warning<F: FnMut(BackupProgressEvent)>(
+    progress: &mut Option<F>,
+    msg: String,
+) {
+    warn!("{msg}");
+    if let Some(ref mut cb) = progress {
+        cb(BackupProgressEvent::Warning { message: msg });
+    }
+}
+
+/// Run `body` inside a rollback-guarded scope.
+///
+/// Arms a rollback checkpoint on the repo and snapshots the stats byte
+/// counters. On `Ok` the checkpoint is committed; on `Err` the checkpoint
+/// is rolled back (undoing refcount bumps, dedup inserts, recovered-chunk
+/// promotion, and partial pack writer state) and the stats byte counters
+/// are restored to their pre-scope values.
+///
+/// Closure form because a drop-guard holding `&mut Repository` + `&mut
+/// SnapshotStats` can't compose with bodies that need to pass those same
+/// mutable references to helpers like `flush_regular_file_batch`.
+pub(crate) fn with_rollback_checkpoint<R>(
+    repo: &mut Repository,
+    stats: &mut SnapshotStats,
+    body: impl FnOnce(&mut Repository, &mut SnapshotStats) -> Result<R>,
+) -> Result<R> {
+    let stats_snap = stats.snapshot_byte_counters();
+    repo.begin_rollback_checkpoint()?;
+    match body(repo, stats) {
+        Ok(r) => {
+            repo.commit_rollback_checkpoint();
+            Ok(r)
+        }
+        Err(e) => {
+            repo.abort_rollback_checkpoint();
+            stats.restore_byte_counters(stats_snap);
+            Err(e)
+        }
     }
 }
 
@@ -251,9 +379,9 @@ pub fn run_with_progress(
     let multi_path = source_paths.len() > 1;
 
     // Resolve every configured source up-front: stat, canonicalize, derive
-    // basename + emission policy, and reject duplicate basenames. This runs
-    // BEFORE opening the repo so any source-validation failure short-circuits
-    // with no session registered.
+    // snapshot prefix + emission policy, and reject equal-prefix or nested-
+    // canonical-root collisions. This runs BEFORE opening the repo so any
+    // source-validation failure short-circuits with no session registered.
     let resolved_sources = source::ResolvedSource::resolve_all(source_paths, multi_path)?;
 
     let _nice_guard = match limits::NiceGuard::apply(config.limits.nice) {
@@ -296,7 +424,8 @@ pub fn run_with_progress(
     debug!(session_id, "backup session registered");
 
     // Open repo after session registration (minimizes T0→commit window).
-    // If open fails, deregister the session so it doesn't block maintenance for 72h.
+    // If open fails, deregister the session so it doesn't block maintenance
+    // until the marker ages out (45 min).
     //
     // When there are no filesystem source paths (command-dump-only backup),
     // skip loading the file cache — it's never consulted for command dumps
@@ -329,6 +458,19 @@ pub fn run_with_progress(
             return Err(e);
         }
     };
+
+    // Adopt the session into a guard so the heartbeat thread is independent
+    // of the upload pipeline. The guard is driven explicitly at each exit
+    // site below via `drop(session_guard.take())` so there is exactly one
+    // deregister path (guard Drop: stop-thread → join-thread → deregister).
+    let mut session_guard: Option<lock::SessionGuard> =
+        match lock::SessionGuard::adopt(Arc::clone(&repo.storage), session_id.clone()) {
+            Ok(g) => Some(g),
+            Err(e) => {
+                lock::deregister_session(repo.storage.as_ref(), &session_id);
+                return Err(e);
+            }
+        };
 
     // Wrap Phase 1 in a closure that deregisters the session on error.
     let phase1_result = (|| -> Result<(SnapshotEntry, Vec<u8>, FileCache, SnapshotStats)> {
@@ -631,7 +773,7 @@ pub fn run_with_progress(
             // Do NOT save file cache on abort — the on-disk cache from the last
             // successful run is still valid. Saving here would persist the
             // depleted (invalidated) cache and destroy future cache hits.
-            lock::deregister_session(repo.storage.as_ref(), &session_id);
+            drop(session_guard.take());
             return Err(e);
         }
     };
@@ -654,16 +796,29 @@ pub fn run_with_progress(
             &mut progress,
         );
 
-        // Deregister session while holding the lock.
-        lock::deregister_session(repo.storage.as_ref(), &session_id);
+        // Deregister session while holding the lock. The guard's Drop stops
+        // the heartbeat thread and joins it before the marker is deleted, so
+        // no concurrent refresh_session call can race with this delete.
+        drop(session_guard.take());
 
         repo.clear_lock_fence();
+        let lock_key = guard.key().to_string();
         match lock::release_lock(repo.storage.as_ref(), guard) {
             Ok(()) => {}
             Err(release_err) => {
-                warn!("failed to release repository lock: {release_err}");
                 if result.is_ok() {
-                    return Err(release_err);
+                    emit_post_commit_warning(
+                        &mut progress,
+                        format!(
+                            "snapshot was successfully committed, but releasing the \
+                             repository lock failed: {release_err}. The advisory lock at \
+                             `{lock_key}` may persist; future operations on this repository \
+                             may be blocked for up to 6 hours until automatic stale-lock \
+                             cleanup, or run `vykar break-lock` to clear it manually."
+                        ),
+                    );
+                } else {
+                    warn!("failed to release repository lock: {release_err}");
                 }
             }
         }
@@ -682,7 +837,7 @@ pub fn run_with_progress(
         // run's recover_pending_index() can discover our packs. Must run on
         // ALL Phase 2 failures (lock acquisition, commit, lock release).
         repo.flush_on_abort();
-        lock::deregister_session(repo.storage.as_ref(), &session_id);
+        drop(session_guard.take());
     }
     commit_result?;
 
@@ -690,20 +845,20 @@ pub fn run_with_progress(
         info!(
             "Snapshot '{}' created: {} files, {} errors, {} original, {} compressed, {} deduplicated",
             snapshot_name,
-            stats.nfiles,
-            stats.errors,
-            stats.original_size,
-            stats.compressed_size,
-            stats.deduplicated_size
+            format_count(stats.nfiles),
+            format_count(stats.errors),
+            format_bytes(stats.original_size),
+            format_bytes(stats.compressed_size),
+            format_bytes(stats.deduplicated_size)
         );
     } else {
         info!(
             "Snapshot '{}' created: {} files, {} original, {} compressed, {} deduplicated",
             snapshot_name,
-            stats.nfiles,
-            stats.original_size,
-            stats.compressed_size,
-            stats.deduplicated_size
+            format_count(stats.nfiles),
+            format_bytes(stats.original_size),
+            format_bytes(stats.compressed_size),
+            format_bytes(stats.deduplicated_size)
         );
     }
 
@@ -760,5 +915,193 @@ mod tests {
         let a = vec!["/a".to_string(), "/b".to_string()];
         let b = vec!["/a".to_string(), "/b".to_string()];
         assert!(source_paths_match(&a, &b));
+    }
+
+    fn dataless_metadata(size: u64, mtime_ns: i64) -> fs::MetadataSummary {
+        fs::MetadataSummary {
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            mtime_ns,
+            // ctime drifts when SF_DATALESS toggles — must NOT influence
+            // the dataless-tolerant lookup.
+            ctime_ns: 999_999,
+            device: 0,
+            inode: 0,
+            size,
+            is_dataless: true,
+        }
+    }
+
+    #[test]
+    fn resolve_cache_hit_dataless_no_parent_returns_skip() {
+        let file_cache = FileCache::new();
+        let summary = dataless_metadata(4096, 1000);
+        let res = resolve_cache_hit(&file_cache, None, "/src/a.txt", &summary);
+        assert!(matches!(res, CacheResolution::SkipDataless));
+    }
+
+    #[test]
+    fn resolve_cache_hit_dataless_with_parent_match_returns_hit() {
+        use crate::repo::file_cache::{ParentReuseBuilder, ParentReusePolicy, ParentReuseRoot};
+        use crate::snapshot::item::{Item, ItemType};
+        use vykar_types::chunk_id::ChunkId;
+
+        let item = Item {
+            path: "a.txt".into(),
+            entry_type: ItemType::RegularFile,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            user: None,
+            group: None,
+            mtime: 1000,
+            atime: None,
+            // Parent ctime differs from the dataless one — the lookup must
+            // ignore ctime and still hit.
+            ctime: Some(2000),
+            size: 4096,
+            chunks: vec![crate::snapshot::item::ChunkRef {
+                id: ChunkId::from_bytes([0xCC; 32]),
+                size: 4096,
+                csize: 2048,
+            }],
+            link_target: None,
+            xattrs: None,
+        };
+        let mut builder = ParentReuseBuilder::new(vec![ParentReuseRoot {
+            abs_root: "/src".into(),
+            policy: ParentReusePolicy::SkipRoot,
+        }]);
+        builder.push(item);
+        let parent_index = builder.finish().unwrap();
+
+        let file_cache = FileCache::new();
+        let summary = dataless_metadata(4096, 1000);
+        let abs = std::path::Path::new("/src")
+            .join("a.txt")
+            .to_string_lossy()
+            .to_string();
+        let res = resolve_cache_hit(&file_cache, Some(&parent_index), &abs, &summary);
+        match res {
+            CacheResolution::Hit(chunks) => assert_eq!(chunks.len(), 1),
+            other => panic!("expected Hit, got {other:?}"),
+        }
+    }
+
+    /// Helper: build a `FileCache` with a single warm dataless-eligible entry
+    /// under `/src` keyed at `abs_path`. The stored ctime is intentionally
+    /// far from any value the caller will pass in `summary.ctime_ns` so that
+    /// any test asserting reuse must be ignoring ctime.
+    fn warm_file_cache_with(
+        abs_path: &str,
+        device: u64,
+        inode: u64,
+        mtime_ns: i64,
+        size: u64,
+    ) -> FileCache {
+        use crate::repo::file_cache::{CachedChunkRef, CachedChunks};
+        use vykar_types::chunk_id::ChunkId;
+
+        let mut cache = FileCache::new();
+        cache.begin_sections(&["/src".to_string()], &[1]);
+        cache.insert(
+            abs_path,
+            device,
+            inode,
+            mtime_ns,
+            // Stored ctime far from the dataless summary's ctime — the
+            // dataless lookup must ignore it.
+            123_456_789,
+            size,
+            CachedChunks::Single(CachedChunkRef {
+                id: ChunkId::from_bytes([0xAB; 32]),
+                size: size as u32,
+            }),
+        );
+        cache
+    }
+
+    #[test]
+    fn resolve_cache_hit_warm_dataless_uses_local_cache() {
+        let abs = std::path::Path::new("/src")
+            .join("a.txt")
+            .to_string_lossy()
+            .to_string();
+        let device = 42;
+        let inode = 7;
+        let mtime_ns = 1_000;
+        let size = 4096;
+
+        let cache = warm_file_cache_with(&abs, device, inode, mtime_ns, size);
+        let mut summary = dataless_metadata(size, mtime_ns);
+        summary.device = device;
+        summary.inode = inode;
+
+        let res = resolve_cache_hit(&cache, None, &abs, &summary);
+        match res {
+            CacheResolution::Hit(chunks) => assert_eq!(chunks.len(), 1),
+            other => panic!("expected Hit from warm cache, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_cache_hit_warm_dataless_falls_back_to_parent() {
+        use crate::repo::file_cache::{ParentReuseBuilder, ParentReusePolicy, ParentReuseRoot};
+        use crate::snapshot::item::{Item, ItemType};
+        use vykar_types::chunk_id::ChunkId;
+
+        // Empty file cache — nothing matches in the warm path.
+        let file_cache = FileCache::new();
+
+        let item = Item {
+            path: "a.txt".into(),
+            entry_type: ItemType::RegularFile,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            user: None,
+            group: None,
+            mtime: 1_000,
+            atime: None,
+            ctime: Some(2_000),
+            size: 4096,
+            chunks: vec![crate::snapshot::item::ChunkRef {
+                id: ChunkId::from_bytes([0xCC; 32]),
+                size: 4096,
+                csize: 2048,
+            }],
+            link_target: None,
+            xattrs: None,
+        };
+        let mut builder = ParentReuseBuilder::new(vec![ParentReuseRoot {
+            abs_root: "/src".into(),
+            policy: ParentReusePolicy::SkipRoot,
+        }]);
+        builder.push(item);
+        let parent_index = builder.finish().unwrap();
+
+        let summary = dataless_metadata(4096, 1_000);
+        let abs = std::path::Path::new("/src")
+            .join("a.txt")
+            .to_string_lossy()
+            .to_string();
+        let res = resolve_cache_hit(&file_cache, Some(&parent_index), &abs, &summary);
+        match res {
+            CacheResolution::Hit(chunks) => assert_eq!(chunks.len(), 1),
+            other => panic!("expected Hit from parent index, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_cache_hit_warm_dataless_skips_when_neither_matches() {
+        let file_cache = FileCache::new();
+        let summary = dataless_metadata(4096, 1_000);
+        let abs = std::path::Path::new("/src")
+            .join("a.txt")
+            .to_string_lossy()
+            .to_string();
+        let res = resolve_cache_hit(&file_cache, None, &abs, &summary);
+        assert!(matches!(res, CacheResolution::SkipDataless));
     }
 }

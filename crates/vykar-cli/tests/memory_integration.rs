@@ -1,3 +1,7 @@
+#![allow(clippy::unwrap_used)]
+#![allow(clippy::pedantic)]
+#![allow(clippy::panic, clippy::indexing_slicing, clippy::print_stderr)]
+
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};

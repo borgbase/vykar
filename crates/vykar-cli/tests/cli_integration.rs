@@ -1,3 +1,7 @@
+#![allow(clippy::unwrap_used)]
+#![allow(clippy::pedantic)]
+#![allow(clippy::panic, clippy::indexing_slicing)]
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::Duration;
@@ -602,6 +606,146 @@ fn cli_snapshot_info_latest_alias() {
     assert!(
         out.contains(&snap2_name),
         "expected snapshot info latest to report second snapshot '{snap2_name}', got:\n{out}"
+    );
+}
+
+#[test]
+fn cli_snapshot_diff_reports_file_content_changes() {
+    let fx = CliFixture::new();
+    write_plain_config(&fx.config_path, &fx.repo_dir);
+
+    let cfg = fx.config_path.to_string_lossy().to_string();
+    let source = fx.source_a.to_string_lossy().to_string();
+
+    fx.run_ok(&["--config", &cfg, "init"]);
+
+    std::fs::write(fx.source_a.join("modified.txt"), b"before").unwrap();
+    std::fs::write(fx.source_a.join("removed.txt"), b"removed").unwrap();
+    std::fs::write(fx.source_a.join("unchanged.txt"), b"same").unwrap();
+    let out1 = fx.run_ok(&["--config", &cfg, "backup", &source]);
+    let snap1 = parse_snapshot_name(&out1);
+    std::thread::sleep(Duration::from_millis(10));
+
+    std::fs::write(fx.source_a.join("modified.txt"), b"after-content").unwrap();
+    std::fs::remove_file(fx.source_a.join("removed.txt")).unwrap();
+    std::fs::write(fx.source_a.join("added.txt"), b"added").unwrap();
+    let out2 = fx.run_ok(&["--config", &cfg, "backup", &source]);
+    let snap2 = parse_snapshot_name(&out2);
+
+    let diff = fx.run_ok(&["--config", &cfg, "snapshot", "diff", &snap1, &snap2]);
+    assert!(diff.contains("Added"));
+    assert!(diff.contains("added.txt"));
+    assert!(diff.contains("Removed"));
+    assert!(diff.contains("removed.txt"));
+    assert!(diff.contains("Modified"));
+    assert!(diff.contains("modified.txt"));
+    assert!(!diff.contains("unchanged.txt"));
+
+    let reversed = fx.run_ok(&["--config", &cfg, "snapshot", "diff", &snap2, &snap1]);
+    assert!(reversed.contains("Added"));
+    assert!(reversed.contains("added.txt"));
+    assert!(reversed.contains("Removed"));
+    assert!(reversed.contains("removed.txt"));
+}
+
+#[test]
+fn cli_snapshot_diff_resolves_in_multi_repo_config() {
+    let fx = CliFixture::new();
+    let repo_b = fx._tmp.path().join("repo_b");
+    std::fs::create_dir_all(&repo_b).unwrap();
+
+    let config = format!(
+        "repositories:\n  - url: {}\n    label: repo-a\n  - url: {}\n    label: repo-b\nencryption:\n  mode: none\nsources: []\n",
+        yaml_quote_path(&fx.repo_dir),
+        yaml_quote_path(&repo_b),
+    );
+    std::fs::write(&fx.config_path, config).unwrap();
+    let cfg = fx.config_path.to_string_lossy().to_string();
+    let source = fx.source_a.to_string_lossy().to_string();
+
+    fx.run_ok(&["--config", &cfg, "init", "-R", "repo-a"]);
+    fx.run_ok(&["--config", &cfg, "init", "-R", "repo-b"]);
+
+    // Two snapshots in repo-b only.
+    std::fs::write(fx.source_a.join("modified.txt"), b"before").unwrap();
+    let out1 = fx.run_ok(&["--config", &cfg, "backup", "-R", "repo-b", &source]);
+    let snap1 = parse_snapshot_name(&out1);
+    std::thread::sleep(Duration::from_millis(10));
+    std::fs::write(fx.source_a.join("modified.txt"), b"after").unwrap();
+    std::fs::write(fx.source_a.join("added.txt"), b"added").unwrap();
+    let out2 = fx.run_ok(&["--config", &cfg, "backup", "-R", "repo-b", &source]);
+    let snap2 = parse_snapshot_name(&out2);
+
+    // No -R; auto-probe should find both in repo-b.
+    let diff = fx.run_ok(&["--config", &cfg, "snapshot", "diff", &snap1, &snap2]);
+    assert!(
+        diff.contains("Modified") && diff.contains("modified.txt"),
+        "expected modified row, got:\n{diff}"
+    );
+    assert!(
+        diff.contains("Added") && diff.contains("added.txt"),
+        "expected added row, got:\n{diff}"
+    );
+}
+
+#[test]
+fn cli_snapshot_diff_errors_when_snapshots_in_different_repos() {
+    let fx = CliFixture::new();
+    let repo_b = fx._tmp.path().join("repo_b");
+    std::fs::create_dir_all(&repo_b).unwrap();
+
+    let config = format!(
+        "repositories:\n  - url: {}\n    label: repo-a\n  - url: {}\n    label: repo-b\nencryption:\n  mode: none\nsources: []\n",
+        yaml_quote_path(&fx.repo_dir),
+        yaml_quote_path(&repo_b),
+    );
+    std::fs::write(&fx.config_path, config).unwrap();
+    let cfg = fx.config_path.to_string_lossy().to_string();
+    let source = fx.source_a.to_string_lossy().to_string();
+
+    fx.run_ok(&["--config", &cfg, "init", "-R", "repo-a"]);
+    fx.run_ok(&["--config", &cfg, "init", "-R", "repo-b"]);
+
+    std::fs::write(fx.source_a.join("a.txt"), b"a").unwrap();
+    let out_a = fx.run_ok(&["--config", &cfg, "backup", "-R", "repo-a", &source]);
+    let snap_a = parse_snapshot_name(&out_a);
+
+    std::fs::write(fx.source_a.join("b.txt"), b"b").unwrap();
+    let out_b = fx.run_ok(&["--config", &cfg, "backup", "-R", "repo-b", &source]);
+    let snap_b = parse_snapshot_name(&out_b);
+
+    let (_stdout, stderr) = fx.run_err(&["--config", &cfg, "snapshot", "diff", &snap_a, &snap_b]);
+    assert!(
+        stderr.contains("repo-a") && stderr.contains("repo-b"),
+        "expected error naming both repos, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("same repository"),
+        "expected same-repository error, got:\n{stderr}"
+    );
+}
+
+#[test]
+fn cli_snapshot_diff_empty_diff_reports_no_changes() {
+    let fx = CliFixture::new();
+    write_plain_config(&fx.config_path, &fx.repo_dir);
+
+    let cfg = fx.config_path.to_string_lossy().to_string();
+    let source = fx.source_a.to_string_lossy().to_string();
+
+    fx.run_ok(&["--config", &cfg, "init"]);
+
+    std::fs::write(fx.source_a.join("only.txt"), b"unchanged").unwrap();
+    let out1 = fx.run_ok(&["--config", &cfg, "backup", &source]);
+    let snap1 = parse_snapshot_name(&out1);
+    std::thread::sleep(Duration::from_millis(10));
+    let out2 = fx.run_ok(&["--config", &cfg, "backup", &source]);
+    let snap2 = parse_snapshot_name(&out2);
+
+    let diff = fx.run_ok(&["--config", &cfg, "snapshot", "diff", &snap1, &snap2]);
+    assert!(
+        diff.contains("No file changes found."),
+        "expected 'No file changes found.', got:\n{diff}"
     );
 }
 

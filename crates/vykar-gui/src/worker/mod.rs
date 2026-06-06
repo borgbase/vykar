@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, SystemTime};
 
 use crossbeam_channel::{Receiver, Sender};
 use vykar_core::app;
@@ -15,6 +15,7 @@ use crate::view_models::send_structured_data;
 mod actions;
 mod backup;
 mod config_cmds;
+mod mount;
 mod repo_info;
 mod shared;
 
@@ -33,6 +34,8 @@ pub(super) struct WorkerContext {
 
     pub(super) scheduler_lock_held: bool,
     pub(super) schedule_paused: bool,
+
+    pub(super) mount: Option<mount::MountHandle>,
 }
 
 fn startup(ctx: &mut WorkerContext) {
@@ -48,24 +51,35 @@ fn startup(ctx: &mut WorkerContext) {
             .unwrap_or(Duration::from_secs(24 * 60 * 60));
         state.cron = schedule.cron.clone();
         state.jitter_seconds = schedule.jitter_seconds;
-        state.next_run = Some(Instant::now() + schedule_delay);
+        state.next_run = Some(SystemTime::now() + schedule_delay);
     }
     let _ = ctx.sched_notify_tx.try_send(());
 
-    let schedule_desc = if ctx.scheduler_lock_held {
-        scheduler::schedule_description(&schedule, false)
+    let schedule_brief = if ctx.scheduler_lock_held {
+        scheduler::schedule_brief(&schedule, false)
     } else {
-        "disabled (external scheduler)".to_string()
+        "Off".to_string()
     };
     let _ = ctx.ui_tx.send(UiEvent::ConfigInfo {
         path: ctx.config_display_path.display().to_string(),
-        schedule: schedule_desc,
+        schedule_brief,
     });
 
     send_structured_data(&ctx.ui_tx, &ctx.runtime.repos);
 
-    if let Ok(text) = std::fs::read_to_string(&ctx.config_display_path) {
-        let _ = ctx.ui_tx.send(UiEvent::ConfigText(text));
+    match std::fs::read_to_string(&ctx.config_display_path) {
+        Ok(text) => {
+            let _ = ctx.ui_tx.send(UiEvent::ConfigText(text));
+        }
+        Err(e) => {
+            send_log(
+                &ctx.ui_tx,
+                format!(
+                    "Could not read config file for editor ({}): {e}",
+                    ctx.config_display_path.display()
+                ),
+            );
+        }
     }
 
     let _ = ctx.app_tx.send(AppCommand::FetchAllRepoInfo);
@@ -108,6 +122,7 @@ pub(crate) fn run_worker(
         cancel_requested,
         scheduler_lock_held,
         schedule_paused: !scheduler_lock_held,
+        mount: None,
     };
 
     startup(&mut ctx);
@@ -137,10 +152,16 @@ pub(crate) fn run_worker(
                 dest,
                 paths,
             } => actions::handle_restore_selected(&mut ctx, repo_name, snapshot, dest, paths),
-            AppCommand::DeleteSnapshot {
+            AppCommand::DiffSnapshots {
                 repo_name,
-                snapshot_name,
-            } => actions::handle_delete_snapshot(&mut ctx, repo_name, snapshot_name),
+                snapshot_a,
+                snapshot_b,
+            } => actions::handle_diff_snapshots(&mut ctx, repo_name, snapshot_a, snapshot_b),
+            AppCommand::DeleteSnapshots {
+                repo_name,
+                snapshot_names,
+            } => actions::handle_delete_snapshots(&mut ctx, repo_name, snapshot_names),
+            AppCommand::PruneRepo { repo_name } => actions::handle_prune_repo(&mut ctx, repo_name),
             AppCommand::FindFiles {
                 repo_name,
                 name_pattern,
@@ -151,6 +172,20 @@ pub(crate) fn run_worker(
             AppCommand::SaveAndApplyConfig { yaml_text } => {
                 config_cmds::handle_save_and_apply_config(&mut ctx, yaml_text)
             }
+            AppCommand::ClearRepoLocks { repo_name } => {
+                config_cmds::handle_clear_repo_locks(&mut ctx, repo_name)
+            }
+            AppCommand::ClearRepoSessions { repo_name } => {
+                config_cmds::handle_clear_repo_sessions(&mut ctx, repo_name)
+            }
+            AppCommand::StartMount {
+                repo_name,
+                snapshot_name,
+            } => mount::handle_start_mount(&mut ctx, repo_name, snapshot_name),
+            AppCommand::StopMount => mount::handle_stop_mount(&mut ctx),
         }
     }
+
+    // On worker shutdown, stop any active mount so we don't leak a listener.
+    mount::handle_stop_mount(&mut ctx);
 }

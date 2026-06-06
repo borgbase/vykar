@@ -12,10 +12,17 @@ use vykar_types::error::Result;
 use super::list;
 
 /// Filter criteria (all fields are AND-combined).
+///
+/// `*_glob` patterns containing a `/` are auto-routed to the corresponding
+/// `*_path_glob` field at build time and matched against the full item path
+/// (with `*` not crossing `/`; use `**` to span directories). Patterns
+/// without `/` keep the historical filename-only semantics.
 pub struct FindFilter {
     pub path_prefix: Option<String>,
     pub name_glob: Option<GlobMatcher>,
     pub iname_glob: Option<GlobMatcher>,
+    pub path_glob: Option<GlobMatcher>,
+    pub ipath_glob: Option<GlobMatcher>,
     pub item_type: Option<ItemType>,
     pub since: Option<DateTime<Utc>>,
     pub larger_than: Option<u64>,
@@ -33,34 +40,52 @@ impl FindFilter {
         larger_than: Option<u64>,
         smaller_than: Option<u64>,
     ) -> std::result::Result<Self, String> {
-        let name_glob = name
-            .map(|pat| {
-                globset::GlobBuilder::new(pat)
-                    .build()
-                    .map(|g| g.compile_matcher())
-                    .map_err(|e| format!("invalid --name glob: {e}"))
-            })
-            .transpose()?;
-
-        let iname_glob = iname
-            .map(|pat| {
-                globset::GlobBuilder::new(pat)
-                    .case_insensitive(true)
-                    .build()
-                    .map(|g| g.compile_matcher())
-                    .map_err(|e| format!("invalid --iname glob: {e}"))
-            })
-            .transpose()?;
+        let (name_glob, path_glob) = compile_pattern(name, false, "--name")?;
+        let (iname_glob, ipath_glob) = compile_pattern(iname, true, "--iname")?;
 
         Ok(Self {
             path_prefix,
             name_glob,
             iname_glob,
+            path_glob,
+            ipath_glob,
             item_type,
             since,
             larger_than,
             smaller_than,
         })
+    }
+}
+
+/// Compile a user pattern into either a filename glob or a path glob.
+/// Returns `(filename_glob, path_glob)` — exactly one is `Some` when `pat` is `Some`.
+fn compile_pattern(
+    pat: Option<&str>,
+    case_insensitive: bool,
+    arg_label: &str,
+) -> std::result::Result<(Option<GlobMatcher>, Option<GlobMatcher>), String> {
+    let Some(pat) = pat else {
+        return Ok((None, None));
+    };
+
+    let mut builder = globset::GlobBuilder::new(pat);
+    builder.case_insensitive(case_insensitive);
+
+    if pat.contains('/') {
+        // Path pattern: anchor `*` to a single path segment so users can write
+        // `cyberpunk/*` and `**/IMG_*` with conventional shell-glob semantics.
+        builder.literal_separator(true);
+        let glob = builder
+            .build()
+            .map(|g| g.compile_matcher())
+            .map_err(|e| format!("invalid {arg_label} glob: {e}"))?;
+        Ok((None, Some(glob)))
+    } else {
+        let glob = builder
+            .build()
+            .map(|g| g.compile_matcher())
+            .map_err(|e| format!("invalid {arg_label} glob: {e}"))?;
+        Ok((Some(glob), None))
     }
 }
 
@@ -227,7 +252,7 @@ fn matches_filter(item: &Item, filter: &FindFilter) -> bool {
         }
     }
 
-    // Name glob (case-sensitive)
+    // Name glob (case-sensitive, filename-only)
     if let Some(ref glob) = filter.name_glob {
         let filename = item.path.rsplit('/').next().unwrap_or(&item.path);
         if !glob.is_match(filename) {
@@ -235,10 +260,24 @@ fn matches_filter(item: &Item, filter: &FindFilter) -> bool {
         }
     }
 
-    // Name glob (case-insensitive)
+    // Name glob (case-insensitive, filename-only)
     if let Some(ref glob) = filter.iname_glob {
         let filename = item.path.rsplit('/').next().unwrap_or(&item.path);
         if !glob.is_match(filename) {
+            return false;
+        }
+    }
+
+    // Path glob (case-sensitive, full path)
+    if let Some(ref glob) = filter.path_glob {
+        if !glob.is_match(&item.path) {
+            return false;
+        }
+    }
+
+    // Path glob (case-insensitive, full path)
+    if let Some(ref glob) = filter.ipath_glob {
+        if !glob.is_match(&item.path) {
             return false;
         }
     }
@@ -300,6 +339,8 @@ mod tests {
             path_prefix: None,
             name_glob: None,
             iname_glob: None,
+            path_glob: None,
+            ipath_glob: None,
             item_type: None,
             since: None,
             larger_than: None,
@@ -380,9 +421,68 @@ mod tests {
     }
 
     #[test]
+    fn build_routes_slash_pattern_to_path_glob() {
+        let filter =
+            FindFilter::build(None, Some("cyberpunk/**"), None, None, None, None, None).unwrap();
+        assert!(filter.name_glob.is_none());
+        assert!(filter.path_glob.is_some());
+
+        let item = make_item("cyberpunk/sub/file.txt", 10, 0);
+        assert!(matches_filter(&item, &filter));
+
+        let item = make_item("other/file.txt", 10, 0);
+        assert!(!matches_filter(&item, &filter));
+    }
+
+    #[test]
+    fn build_keeps_filename_only_pattern_as_name_glob() {
+        let filter = FindFilter::build(None, Some("*.dng"), None, None, None, None, None).unwrap();
+        assert!(filter.name_glob.is_some());
+        assert!(filter.path_glob.is_none());
+
+        let item = make_item("Pictures/2026/IMG.dng", 10, 0);
+        assert!(matches_filter(&item, &filter));
+    }
+
+    #[test]
+    fn path_glob_star_does_not_cross_separator() {
+        // `cyberpunk/*` should match direct children but not recurse.
+        let filter =
+            FindFilter::build(None, Some("cyberpunk/*"), None, None, None, None, None).unwrap();
+
+        let direct = make_item("cyberpunk/file.txt", 10, 0);
+        assert!(matches_filter(&direct, &filter));
+
+        let nested = make_item("cyberpunk/sub/file.txt", 10, 0);
+        assert!(!matches_filter(&nested, &filter));
+    }
+
+    #[test]
+    fn path_glob_double_star_spans_directories() {
+        let filter =
+            FindFilter::build(None, Some("**/IMG_570*"), None, None, None, None, None).unwrap();
+
+        let nested = make_item("Pictures/2026/IMG_5701.dng", 10, 0);
+        assert!(matches_filter(&nested, &filter));
+
+        let other = make_item("Pictures/2026/other.dng", 10, 0);
+        assert!(!matches_filter(&other, &filter));
+    }
+
+    #[test]
+    fn ipath_glob_is_case_insensitive() {
+        let filter =
+            FindFilter::build(None, None, Some("**/img_*"), None, None, None, None).unwrap();
+        assert!(filter.ipath_glob.is_some());
+
+        let upper = make_item("Pictures/IMG_001.jpg", 10, 0);
+        assert!(matches_filter(&upper, &filter));
+    }
+
+    #[test]
     fn annotate_detects_added_modified_unchanged() {
-        let id_a = ChunkId([1u8; 32]);
-        let id_b = ChunkId([2u8; 32]);
+        let id_a = ChunkId::from_bytes([1u8; 32]);
+        let id_b = ChunkId::from_bytes([2u8; 32]);
         let now = Utc::now();
 
         let hits = vec![

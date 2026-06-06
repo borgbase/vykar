@@ -1,5 +1,13 @@
+// glibc malloc_trim to release arena pages between cycles; SAFETY documented per block.
+#![allow(unsafe_code)]
+
+mod http;
+mod render;
+mod status;
+
+use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use vykar_core::app::passphrase::configured_passphrase;
 use vykar_core::app::scheduler::{self, SchedulerLock};
@@ -7,7 +15,10 @@ use vykar_core::app::RuntimeConfig;
 use vykar_core::config::{self, ConfigSource, EncryptionModeConfig, ResolvedRepo, ScheduleConfig};
 
 use crate::dispatch::{local_repo_unavailable, run_default_actions, warn_if_untrusted_rest};
+use crate::error::{CliError, CliResult};
 use crate::signal::{RELOAD, SHUTDOWN, TRIGGER};
+
+use status::SharedStatus;
 
 /// Ask the system allocator to return freed memory to the OS.
 ///
@@ -33,13 +44,11 @@ fn release_malloc_arenas() {}
 /// Returns the resolved repos and merged schedule, or an error describing
 /// what went wrong (suitable for both fatal startup errors and non-fatal
 /// reload rejections).
-fn load_daemon_config(
-    source: &ConfigSource,
-) -> Result<(Vec<ResolvedRepo>, ScheduleConfig), Box<dyn std::error::Error>> {
+fn load_daemon_config(source: &ConfigSource) -> CliResult<(Vec<ResolvedRepo>, ScheduleConfig)> {
     let repos = config::load_and_resolve(source.path())?;
 
     if repos.is_empty() {
-        return Err("no repositories configured".into());
+        return Err(CliError::from("no repositories configured"));
     }
 
     let runtime = RuntimeConfig {
@@ -49,9 +58,9 @@ fn load_daemon_config(
     let schedule = runtime.schedule();
 
     if !schedule.enabled {
-        return Err(
-            "schedule.enabled is false; set it to true in your config to use daemon mode".into(),
-        );
+        return Err(CliError::from(
+            "schedule.enabled is false; set it to true in your config to use daemon mode",
+        ));
     }
 
     // Pre-validate passphrases for encrypted repos
@@ -61,13 +70,15 @@ fn load_daemon_config(
             match configured_passphrase(&repo.config) {
                 Ok(Some(_)) => {}
                 Ok(None) => {
-                    return Err(format!(
+                    return Err(CliError::from(format!(
                         "encrypted repository '{label}' has no non-interactive passphrase source; \
                          configure encryption.passcommand, encryption.passphrase, or set VYKAR_PASSPHRASE"
-                    ).into());
+                    )));
                 }
                 Err(e) => {
-                    return Err(format!("failed to validate passphrase for '{label}': {e}").into());
+                    return Err(CliError::from(format!(
+                        "failed to validate passphrase for '{label}': {e}"
+                    )));
                 }
             }
         }
@@ -76,11 +87,23 @@ fn load_daemon_config(
     Ok((runtime.repos, schedule))
 }
 
-pub(crate) fn run_daemon(source: ConfigSource) -> Result<(), Box<dyn std::error::Error>> {
-    let _lock = SchedulerLock::try_acquire()
-        .ok_or("another vykar scheduler is already running (daemon or GUI); exiting")?;
+pub(crate) fn run_daemon(source: ConfigSource, http_listen: Option<SocketAddr>) -> CliResult<()> {
+    let _lock = SchedulerLock::try_acquire().ok_or_else(|| {
+        CliError::from("another vykar scheduler is already running (daemon or GUI); exiting")
+    })?;
 
     let (mut repos, mut schedule) = load_daemon_config(&source)?;
+
+    let started_at = Instant::now();
+    let status = status::new_shared();
+    status::init(&status, &repos, &schedule, started_at);
+    status::refresh_repos(&status, &repos);
+
+    let http_handle = if let Some(addr) = http_listen {
+        Some(http::spawn(addr, status.clone(), &SHUTDOWN)?)
+    } else {
+        None
+    };
 
     if schedule.is_cron() {
         tracing::info!(
@@ -106,19 +129,22 @@ pub(crate) fn run_daemon(source: ConfigSource) -> Result<(), Box<dyn std::error:
         tracing::info!(repo = name, "repository registered");
     }
 
-    // Compute first run time
+    // Compute first run time. Wall-clock so the target survives system sleep
+    // and monotonic-clock freezes (see GitHub #110).
     let mut next_run = if schedule.on_startup {
-        Instant::now()
+        SystemTime::now()
     } else {
         let delay = scheduler::next_run_delay(&schedule)?;
         log_next_run(delay);
-        Instant::now() + delay
+        SystemTime::now() + delay
     };
 
-    loop {
+    status::touch_process(&status, started_at, Some(next_run));
+
+    let exit_result: CliResult<()> = loop {
         if SHUTDOWN.load(Ordering::SeqCst) {
             tracing::info!("shutdown signal received, exiting");
-            return Ok(());
+            break Ok(());
         }
 
         // Check for SIGHUP reload between cycles
@@ -134,6 +160,8 @@ pub(crate) fn run_daemon(source: ConfigSource) -> Result<(), Box<dyn std::error:
                     );
                     repos = new_repos;
                     schedule = new_schedule;
+                    status::init(&status, &repos, &schedule, started_at);
+                    status::refresh_repos(&status, &repos);
 
                     for repo in &repos {
                         let name = repo.label.as_deref().unwrap_or(&repo.config.repository.url);
@@ -143,7 +171,7 @@ pub(crate) fn run_daemon(source: ConfigSource) -> Result<(), Box<dyn std::error:
                     // Recalculate next_run from schedule (ignore on_startup)
                     match scheduler::next_run_delay(&schedule) {
                         Ok(delay) => {
-                            next_run = Instant::now() + delay;
+                            next_run = SystemTime::now() + delay;
                             log_next_run(delay);
                         }
                         Err(e) => {
@@ -167,43 +195,61 @@ pub(crate) fn run_daemon(source: ConfigSource) -> Result<(), Box<dyn std::error:
         if TRIGGER.load(Ordering::SeqCst) {
             TRIGGER.store(false, Ordering::SeqCst);
             tracing::info!("SIGUSR1 received, triggering immediate backup");
-            run_backup_cycle(&repos);
+            run_backup_cycle(&repos, &status);
 
             if SHUTDOWN.load(Ordering::SeqCst) {
                 tracing::info!("shutdown signal received, exiting");
-                return Ok(());
+                break Ok(());
             }
 
             // If the scheduled slot was missed during the ad-hoc cycle, recalculate
             // next_run from now. Otherwise leave next_run untouched — the scheduled
             // cadence is preserved.
-            if Instant::now() >= next_run {
-                let delay = scheduler::next_run_delay(&schedule)?;
-                next_run = Instant::now() + delay;
+            if next_run.duration_since(SystemTime::now()).is_err() {
+                let delay = match scheduler::next_run_delay(&schedule) {
+                    Ok(d) => d,
+                    Err(e) => break Err(e.into()),
+                };
+                next_run = SystemTime::now() + delay;
                 log_next_run(delay);
             }
         }
 
-        if Instant::now() >= next_run {
-            run_backup_cycle(&repos);
+        if next_run.duration_since(SystemTime::now()).is_err() {
+            run_backup_cycle(&repos, &status);
 
             if SHUTDOWN.load(Ordering::SeqCst) {
                 tracing::info!("shutdown signal received, exiting");
-                return Ok(());
+                break Ok(());
             }
 
             // Schedule next run
-            let delay = scheduler::next_run_delay(&schedule)?;
-            next_run = Instant::now() + delay;
+            let delay = match scheduler::next_run_delay(&schedule) {
+                Ok(d) => d,
+                Err(e) => break Err(e.into()),
+            };
+            next_run = SystemTime::now() + delay;
             log_next_run(delay);
         }
 
+        status::touch_process(&status, started_at, Some(next_run));
+
         std::thread::sleep(Duration::from_secs(1));
+    };
+
+    if let Some(handle) = http_handle {
+        // SHUTDOWN is set; the HTTP loop polls it within POLL_INTERVAL.
+        if let Err(e) = handle.join() {
+            tracing::warn!(?e, "http thread panicked");
+        }
     }
+
+    exit_result
 }
 
-fn run_backup_cycle(repos: &[ResolvedRepo]) {
+fn run_backup_cycle(repos: &[ResolvedRepo], status: &SharedStatus) {
     tracing::info!("backup cycle starting");
+    status::record_cycle_start(status);
     let cycle_start = Instant::now();
     let mut had_error = false;
     let mut had_partial = false;
@@ -256,6 +302,11 @@ fn run_backup_cycle(repos: &[ResolvedRepo]) {
         tracing::warn!(duration = ?elapsed, "backup cycle finished with partial success (some files skipped)");
     } else {
         tracing::info!(duration = ?elapsed, "backup cycle finished successfully");
+    }
+
+    status::record_cycle_end(status, elapsed, had_error, had_partial);
+    if !SHUTDOWN.load(Ordering::SeqCst) {
+        status::refresh_repos(status, repos);
     }
 
     // All Repository instances are dropped. Ask glibc to return freed pages.

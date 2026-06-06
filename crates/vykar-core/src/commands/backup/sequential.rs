@@ -1,10 +1,8 @@
-use std::fs::File;
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
 
 use rayon::prelude::*;
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::commands::util::check_interrupted;
 
@@ -13,7 +11,7 @@ use crate::compress::Compression;
 use crate::config::ChunkerConfig;
 use crate::limits::{self, ByteRateLimiter};
 use crate::platform::fs;
-use crate::repo::file_cache::{FileCache, ParentReuseIndex};
+use crate::repo::file_cache::{CachedChunks, FileCache, ParentReuseIndex};
 use crate::repo::Repository;
 use crate::snapshot::item::{Item, ItemType};
 use crate::snapshot::SnapshotStats;
@@ -22,11 +20,13 @@ use vykar_types::error::{Result, VykarError};
 
 use super::chunk_process::{classify_chunk, WorkerChunk};
 use super::commit::process_worker_chunks;
+use super::read_source::BackupSource;
 use super::source::ResolvedSource;
-use super::walk::{is_soft_io_error, materialize_item, InodeSortedWalk, Materialized, WalkEvent};
-use super::{append_item_to_stream, emit_progress, emit_stats_progress};
-use super::{BackupProgressEvent, FileStatus};
+use super::walk::{materialize_item, InodeSortedWalk, Materialized, WalkEvent};
+use super::{append_item_to_stream, emit_post_commit_warning, emit_progress, emit_stats_progress};
+use super::{with_rollback_checkpoint, BackupProgressEvent, FileStatus};
 use vykar_crypto::CryptoEngine;
+use vykar_types::error::is_soft_backup_io_error;
 
 /// Classify raw data chunks into `WorkerChunk`s, optionally using a rayon pool
 /// for parallel compression/hashing.
@@ -221,7 +221,7 @@ fn flush_cross_file_batch(
             file.metadata_summary.mtime_ns,
             file.metadata_summary.ctime_ns,
             file.metadata_summary.size,
-            Arc::new(std::mem::take(&mut item.chunks)),
+            CachedChunks::from_chunk_refs(&item.chunks),
         );
 
         emit_stats_progress(progress, stats, Some(std::mem::take(&mut item.path)));
@@ -250,6 +250,16 @@ pub(super) fn build_transform_pool(max_threads: usize) -> Result<Option<rayon::T
         .map_err(|e| VykarError::Other(format!("failed to create rayon thread pool: {e}")))
 }
 
+/// Status returned by [`process_regular_file_item`] to its caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ProcessOutcome {
+    /// File was committed (chunked or cache-hit).
+    Committed,
+    /// macOS dataless file skipped — caller should increment a per-source
+    /// counter so the end-of-source summary reports the count.
+    SkippedDataless,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn process_regular_file_item(
     repo: &mut Repository,
@@ -267,25 +277,30 @@ pub(super) fn process_regular_file_item(
     dedup_filter: Option<&xorf::Xor8>,
     verbose: bool,
     parent_reuse_index: Option<&ParentReuseIndex>,
-) -> Result<()> {
-    if let Some(cb) = progress.as_deref_mut() {
-        cb(BackupProgressEvent::FileStarted {
-            path: item.path.clone(),
-        });
-    }
-
+) -> Result<ProcessOutcome> {
     // File-level cache: skip read/chunk/compress/encrypt for unchanged files.
     let abs_path = entry_path.to_string_lossy().to_string();
     let file_size = metadata_summary.size;
 
-    let effective_hit = super::resolve_cache_hit(
+    let resolution = super::resolve_cache_hit(
         repo.file_cache(),
         parent_reuse_index,
         &abs_path,
         &metadata_summary,
     );
 
-    if let Some(cached_refs) = effective_hit {
+    if let super::CacheResolution::SkipDataless = resolution {
+        debug!(path = %item.path, "skipping dataless cloud-only file (no cache or parent reuse)");
+        return Ok(ProcessOutcome::SkippedDataless);
+    }
+
+    if let Some(cb) = progress.as_deref_mut() {
+        cb(BackupProgressEvent::FileStarted {
+            path: item.path.clone(),
+        });
+    }
+
+    if let super::CacheResolution::Hit(cached_refs) = resolution {
         super::commit::commit_cache_hit(repo, item, &cached_refs, stats)?;
 
         if verbose {
@@ -311,7 +326,7 @@ pub(super) fn process_regular_file_item(
 
         debug!(path = %item.path, "file cache hit");
         emit_stats_progress(progress, stats, Some(item.path.clone()));
-        return Ok(());
+        return Ok(ProcessOutcome::Committed);
     }
 
     let chunk_id_key = *repo.crypto.chunk_id_key();
@@ -323,58 +338,105 @@ pub(super) fn process_regular_file_item(
     };
     let dedup_before = if verbose { stats.deduplicated_size } else { 0 };
 
-    let file = File::open(entry_path).map_err(VykarError::Io)?;
-    let chunk_stream = chunker::chunk_stream(
-        limits::LimitedReader::new(file, read_limiter),
-        &repo.config.chunker_params,
-    );
-
-    let mut raw_chunks: Vec<Vec<u8>> = Vec::new();
-    let mut pending_bytes: usize = 0;
-
-    for chunk_result in chunk_stream {
-        let chunk = chunk_result.map_err(|e| match e {
-            fastcdc::v2020::Error::IoError(ioe) => VykarError::Io(ioe),
-            other => VykarError::Other(format!(
-                "chunking failed for {}: {other}",
-                entry_path.display()
-            )),
-        })?;
-
-        let data_len = chunk.data.len();
-        pending_bytes = pending_bytes.saturating_add(data_len);
-        raw_chunks.push(chunk.data);
-
-        if pending_bytes >= max_pending_transform_bytes
-            || raw_chunks.len() >= max_pending_file_actions
-        {
-            flush_regular_file_batch(
-                repo,
-                compression,
-                &chunk_id_key,
-                transform_pool,
-                &mut raw_chunks,
-                item,
-                stats,
-                dedup_filter,
-            )?;
-            emit_stats_progress(progress, stats, None);
-            pending_bytes = 0;
-        }
+    // Phase A: open + pre-fstat + walk-to-open drift check. Runs *before*
+    // any checkpoint is armed so soft open/fstat errors leave the tracker
+    // un-armed and nothing needs to roll back.
+    let mut source = BackupSource::open(entry_path).map_err(VykarError::Io)?;
+    let pre_meta = fs::fstat_summary(source.file()).map_err(VykarError::Io)?;
+    if !fs::metadata_matches(&pre_meta, &metadata_summary) {
+        return Err(VykarError::FileChangedDuringRead {
+            path: entry_path.to_string_lossy().into_owned(),
+            dataless: pre_meta.is_dataless,
+        });
     }
 
-    flush_regular_file_batch(
-        repo,
-        compression,
-        &chunk_id_key,
-        transform_pool,
-        &mut raw_chunks,
-        item,
-        stats,
-        dedup_filter,
-    )?;
+    // Phase B: guarded scope. Mid-loop flushes commit refcounts/dedup inserts
+    // into the index; if a drift is detected afterwards, the rollback tracker
+    // undoes them and `stats` byte counters are restored.
+    let pre_meta_c = pre_meta;
+    with_rollback_checkpoint(repo, stats, |repo, stats| {
+        // Hard-cap at pre_meta.size + 1 so an intra-read append can't feed
+        // unbounded bytes through the chunker; the +1 sentinel trips the
+        // post-read `total_bytes != pre_meta_c.size` drift check below, and
+        // the `with_rollback_checkpoint` unwinds any mid-loop flushes.
+        let reader = std::io::Read::take(&mut source, pre_meta_c.size + 1);
+        let chunk_stream = chunker::chunk_stream(
+            limits::LimitedReader::new(reader, read_limiter),
+            &repo.config.chunker_params,
+        );
+
+        let mut raw_chunks: Vec<Vec<u8>> = Vec::new();
+        let mut pending_bytes: usize = 0;
+        let mut total_bytes: u64 = 0;
+
+        for chunk_result in chunk_stream {
+            let chunk = chunk_result.map_err(|e| match e {
+                fastcdc::v2020::Error::IoError(ioe) => VykarError::Io(ioe),
+                other => VykarError::Other(format!(
+                    "chunking failed for {}: {other}",
+                    entry_path.display()
+                )),
+            })?;
+
+            let data_len = chunk.data.len();
+            total_bytes = total_bytes.saturating_add(data_len as u64);
+            pending_bytes = pending_bytes.saturating_add(data_len);
+            raw_chunks.push(chunk.data);
+
+            if pending_bytes >= max_pending_transform_bytes
+                || raw_chunks.len() >= max_pending_file_actions
+            {
+                flush_regular_file_batch(
+                    repo,
+                    compression,
+                    &chunk_id_key,
+                    transform_pool,
+                    &mut raw_chunks,
+                    item,
+                    stats,
+                    dedup_filter,
+                )?;
+                emit_stats_progress(progress, stats, None);
+                pending_bytes = 0;
+            }
+        }
+
+        // Intra-read + short-read drift check. On drift, `?`-bail the error
+        // so `with_rollback_checkpoint` rolls back any partial flushes above.
+        let post_meta = fs::fstat_summary(source.file()).map_err(VykarError::Io)?;
+        if !fs::metadata_matches(&pre_meta_c, &post_meta) || total_bytes != pre_meta_c.size {
+            return Err(VykarError::FileChangedDuringRead {
+                path: entry_path.to_string_lossy().into_owned(),
+                dataless: post_meta.is_dataless,
+            });
+        }
+
+        // Final flush inside the guard so a failure also triggers rollback.
+        flush_regular_file_batch(
+            repo,
+            compression,
+            &chunk_id_key,
+            transform_pool,
+            &mut raw_chunks,
+            item,
+            stats,
+            dedup_filter,
+        )?;
+
+        Ok(())
+    })?;
 
     stats.nfiles += 1;
+
+    // Phase C: replace walk-time metadata with pre_meta (the stat we took
+    // after opening the FD). This guarantees item metadata matches the
+    // chunks we just committed.
+    item.mode = pre_meta.mode;
+    item.uid = pre_meta.uid;
+    item.gid = pre_meta.gid;
+    item.size = pre_meta.size;
+    item.mtime = pre_meta.mtime_ns;
+    item.ctime = Some(pre_meta.ctime_ns);
 
     if verbose {
         let added_bytes = stats.deduplicated_size - dedup_before;
@@ -393,19 +455,19 @@ pub(super) fn process_regular_file_item(
         );
     }
 
-    // Update file cache with the chunks we just stored.
+    // Update file cache from pre_meta so cache keys match the committed chunks.
     new_file_cache.insert(
         &abs_path,
-        metadata_summary.device,
-        metadata_summary.inode,
-        metadata_summary.mtime_ns,
-        metadata_summary.ctime_ns,
-        file_size,
-        Arc::new(item.chunks.clone()),
+        pre_meta.device,
+        pre_meta.inode,
+        pre_meta.mtime_ns,
+        pre_meta.ctime_ns,
+        pre_meta.size,
+        CachedChunks::from_chunk_refs(&item.chunks),
     );
 
     emit_stats_progress(progress, stats, Some(item.path.clone()));
-    Ok(())
+    Ok(ProcessOutcome::Committed)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -443,6 +505,7 @@ pub(super) fn process_source_path(
     let chunk_id_key = *repo.crypto.chunk_id_key();
     let min_chunk_size = repo.config.chunker_params.min_size as u64;
     let mut cross_batch = CrossFileBatch::new();
+    let mut dataless_skipped: u64 = 0;
 
     let inode_walk = InodeSortedWalk::new(
         source,
@@ -457,8 +520,12 @@ pub(super) fn process_source_path(
 
         let walked = match event_result {
             Ok(WalkEvent::Entry(walked)) => walked,
-            Ok(WalkEvent::Skipped) => {
+            Ok(WalkEvent::Skipped { path, reason }) => {
                 stats.errors += 1;
+                emit_post_commit_warning(
+                    progress,
+                    format!("skipping entry '{}': {reason}", path.display()),
+                );
                 continue;
             }
             Err(e) => return Err(e),
@@ -471,8 +538,12 @@ pub(super) fn process_source_path(
                     abs_path,
                     metadata,
                 }) => (item, abs_path, metadata),
-                Ok(Materialized::SoftError) => {
+                Ok(Materialized::SoftError { path, reason }) => {
                     stats.errors += 1;
+                    emit_post_commit_warning(
+                        progress,
+                        format!("skipping entry '{}': {reason}", path.display()),
+                    );
                     continue;
                 }
                 Ok(Materialized::Unsupported) => continue,
@@ -486,14 +557,23 @@ pub(super) fn process_source_path(
                 // Flush batch before cache-hit check since it may need walk-order items.
                 let abs_path = entry_path.to_string_lossy().to_string();
 
-                let effective_hit = super::resolve_cache_hit(
+                let resolution = super::resolve_cache_hit(
                     repo.file_cache(),
                     parent_reuse_index,
                     &abs_path,
                     &metadata_summary,
                 );
 
-                if let Some(cached_refs) = effective_hit {
+                if let super::CacheResolution::SkipDataless = resolution {
+                    debug!(
+                        path = %item.path,
+                        "skipping dataless cloud-only file (no cache or parent reuse)"
+                    );
+                    dataless_skipped += 1;
+                    continue;
+                }
+
+                if let super::CacheResolution::Hit(cached_refs) = resolution {
                     // Flush batch to preserve walk order before the cache-hit item.
                     flush_cross_file_batch(
                         &mut cross_batch,
@@ -543,19 +623,123 @@ pub(super) fn process_source_path(
                     debug!(path = %item.path, "file cache hit (sequential small)");
                     emit_stats_progress(progress, stats, Some(item.path.clone()));
                 } else {
-                    // Cache miss — read and add to batch.
-                    let data = match std::fs::read(&entry_path) {
-                        Ok(d) => d,
+                    // Cache miss — read into batch with TOCTOU drift checks.
+                    // Order is critical: open + pre-fstat + routing guard
+                    // BEFORE Vec::with_capacity so a grown file doesn't
+                    // over-allocate and break the batch memory invariant.
+                    let mut file = match std::fs::File::open(&entry_path) {
+                        Ok(f) => f,
                         Err(e) => {
-                            if is_soft_io_error(&e) {
-                                warn!(path = %entry_path.display(), error = %e, "skipping file (read error)");
+                            if is_soft_backup_io_error(&e) {
+                                emit_post_commit_warning(
+                                    progress,
+                                    format!("skipping file '{}': {e}", entry_path.display()),
+                                );
                                 stats.errors += 1;
                                 continue;
                             }
                             return Err(VykarError::Io(e));
                         }
                     };
-                    cross_batch.add_file(item, data, metadata_summary, abs_path);
+
+                    let pre_meta = match fs::fstat_summary(&file) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            if is_soft_backup_io_error(&e) {
+                                emit_post_commit_warning(
+                                    progress,
+                                    format!("skipping file '{}': {e}", entry_path.display()),
+                                );
+                                stats.errors += 1;
+                                continue;
+                            }
+                            return Err(VykarError::Io(e));
+                        }
+                    };
+
+                    // Walk-to-open drift check. `metadata_matches` enforces
+                    // size equality, so once it passes the file is still in
+                    // the small-file regime — no separate routing guard is
+                    // needed.
+                    if !fs::metadata_matches(&pre_meta, &metadata_summary) {
+                        let suffix = if pre_meta.is_dataless {
+                            " (cloud-only file, hydration in progress)"
+                        } else {
+                            ""
+                        };
+                        emit_post_commit_warning(
+                            progress,
+                            format!(
+                                "skipping file '{}': file changed between walk and open{suffix}",
+                                entry_path.display()
+                            ),
+                        );
+                        stats.errors += 1;
+                        continue;
+                    }
+
+                    let mut data = Vec::with_capacity(pre_meta.size as usize);
+                    // Hard-cap at pre_meta.size + 1 so an intra-read append
+                    // can't grow `data` past the batch's per-file budget; the
+                    // +1 sentinel trips the post-read `data.len() != pre_meta.size`
+                    // drift check below.
+                    let mut reader = std::io::Read::take(&mut file, pre_meta.size + 1);
+                    if let Err(e) = std::io::Read::read_to_end(&mut reader, &mut data) {
+                        if is_soft_backup_io_error(&e) {
+                            emit_post_commit_warning(
+                                progress,
+                                format!("skipping file '{}': {e}", entry_path.display()),
+                            );
+                            stats.errors += 1;
+                            continue;
+                        }
+                        return Err(VykarError::Io(e));
+                    }
+
+                    let post_meta = match fs::fstat_summary(&file) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            if is_soft_backup_io_error(&e) {
+                                emit_post_commit_warning(
+                                    progress,
+                                    format!("skipping file '{}': {e}", entry_path.display()),
+                                );
+                                stats.errors += 1;
+                                continue;
+                            }
+                            return Err(VykarError::Io(e));
+                        }
+                    };
+
+                    if !fs::metadata_matches(&pre_meta, &post_meta)
+                        || data.len() as u64 != pre_meta.size
+                    {
+                        let suffix = if post_meta.is_dataless {
+                            " (cloud-only file, hydration in progress)"
+                        } else {
+                            ""
+                        };
+                        emit_post_commit_warning(
+                            progress,
+                            format!(
+                                "skipping file '{}': file changed during read{suffix}",
+                                entry_path.display()
+                            ),
+                        );
+                        stats.errors += 1;
+                        continue;
+                    }
+
+                    // Replace walk-time metadata on the item with pre_meta
+                    // so the snapshot entry matches the bytes we read.
+                    item.mode = pre_meta.mode;
+                    item.uid = pre_meta.uid;
+                    item.gid = pre_meta.gid;
+                    item.size = pre_meta.size;
+                    item.mtime = pre_meta.mtime_ns;
+                    item.ctime = Some(pre_meta.ctime_ns);
+
+                    cross_batch.add_file(item, data, pre_meta, abs_path);
 
                     if cross_batch.should_flush() {
                         flush_cross_file_batch(
@@ -594,7 +778,7 @@ pub(super) fn process_source_path(
                     verbose,
                 )?;
 
-                if let Err(e) = process_regular_file_item(
+                match process_regular_file_item(
                     repo,
                     &entry_path,
                     metadata_summary,
@@ -611,12 +795,20 @@ pub(super) fn process_source_path(
                     verbose,
                     parent_reuse_index,
                 ) {
-                    if e.is_soft_file_error() {
-                        warn!(path = %entry_path.display(), error = %e, "skipping file");
+                    Ok(ProcessOutcome::Committed) => {}
+                    Ok(ProcessOutcome::SkippedDataless) => {
+                        dataless_skipped += 1;
+                        continue;
+                    }
+                    Err(e) if e.is_soft_file_error() => {
+                        emit_post_commit_warning(
+                            progress,
+                            format!("skipping file '{}': {e}", entry_path.display()),
+                        );
                         stats.errors += 1;
                         continue;
                     }
-                    return Err(e);
+                    Err(e) => return Err(e),
                 }
             }
         } else {
@@ -665,6 +857,10 @@ pub(super) fn process_source_path(
         dedup_filter,
         verbose,
     )?;
+
+    if dataless_skipped > 0 {
+        super::emit_dataless_summary(progress, dataless_skipped);
+    }
 
     emit_progress(
         progress,

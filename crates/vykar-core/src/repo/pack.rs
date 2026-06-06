@@ -281,6 +281,11 @@ pub fn read_blob_from_pack(
 
 /// Forward-scan pack bytes using per-blob length prefixes.
 /// Returns (offset, length) pairs for each blob.
+//
+// Indexing into `pack_data` is gated by `pack_data.len() < PACK_HEADER_SIZE`
+// up-front and `pos + 4 <= blobs_end` / `pos + 4 + blob_len ...` per loop
+// iteration; out-of-bounds is unreachable for inputs that pass those checks.
+#[allow(clippy::indexing_slicing)]
 pub fn scan_pack_blobs_bytes(pack_data: &[u8]) -> Result<Vec<(u64, u32)>> {
     if pack_data.len() < PACK_HEADER_SIZE {
         return Err(VykarError::InvalidFormat("pack too small".into()));
@@ -344,6 +349,10 @@ pub fn compute_data_pack_target(
 ) -> usize {
     let min = min_pack_size as f64;
     let max = max_pack_size as f64;
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "pack-target sizing; usize range fits f64 mantissa for realistic counts"
+    )]
     let target = min * (num_data_packs as f64 / 50.0).sqrt();
     target.clamp(min, max) as usize
 }
@@ -359,7 +368,7 @@ mod tests {
     use super::*;
 
     fn dummy_chunk_id(byte: u8) -> ChunkId {
-        ChunkId([byte; 32])
+        ChunkId::from_bytes([byte; 32])
     }
 
     #[test]
@@ -378,7 +387,7 @@ mod tests {
             assert!(!w.should_flush(), "should not flush at {i} blobs");
             let mut id_bytes = [0u8; 32];
             id_bytes[0..4].copy_from_slice(&(i as u32).to_le_bytes());
-            w.add_blob(ChunkId(id_bytes), vec![1]).unwrap();
+            w.add_blob(ChunkId::from_bytes(id_bytes), vec![1]).unwrap();
         }
         assert!(w.should_flush());
     }
@@ -469,7 +478,7 @@ mod tests {
         let sealed = w.seal().unwrap();
 
         assert_eq!(sealed.entries.len(), 2);
-        assert!(!sealed.pack_id.0.iter().all(|&b| b == 0));
+        assert!(!sealed.pack_id.as_bytes().iter().all(|&b| b == 0));
         // Writer should be clear now.
         assert!(!w.has_pending());
         assert!(w.buffer.is_none());
@@ -573,7 +582,7 @@ mod tests {
         use crate::testutil::MemoryBackend;
 
         let storage = MemoryBackend::new();
-        let pack_id = PackId([0xAB; 32]);
+        let pack_id = PackId::from_bytes([0xAB; 32]);
 
         // Valid pack with one 2-byte blob, then 3 trailing garbage bytes
         let mut data = Vec::new();
@@ -641,7 +650,7 @@ mod tests {
 
     #[test]
     fn read_blob_from_pack_rejects_short_read() {
-        let pack_id = PackId([0xCD; 32]);
+        let pack_id = PackId::from_bytes([0xCD; 32]);
         let blob_data = vec![0xAB; 100];
 
         let mut storage_data = HashMap::new();

@@ -12,5 +12,10 @@ ENV XDG_CACHE_HOME=/cache
 
 WORKDIR /data
 
+# Default port for the daemon's read-only HTTP status page. Exposing the
+# port does not bind it — opt in by setting VYKAR_HTTP_LISTEN (and, for
+# non-loopback addresses, VYKAR_HTTP_ALLOW_PUBLIC=1).
+EXPOSE 7575
+
 ENTRYPOINT ["vykar"]
 CMD ["daemon"]

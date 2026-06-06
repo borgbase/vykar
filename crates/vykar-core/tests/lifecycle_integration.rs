@@ -1,3 +1,8 @@
+#![allow(clippy::unwrap_used)]
+#![allow(clippy::pedantic)]
+// Test-only env mutation; SAFETY per block.
+#![allow(unsafe_code)]
+
 use std::path::Path;
 use std::sync::Once;
 use std::time::Duration;
@@ -23,6 +28,8 @@ fn init_test_environment() {
         let cache = base.join("cache");
         let _ = std::fs::create_dir_all(&home);
         let _ = std::fs::create_dir_all(&cache);
+        // SAFETY: Once::call_once runs this single-threaded at test-process
+        // startup before any threads are spawned.
         unsafe {
             std::env::set_var("HOME", &home);
             std::env::set_var("XDG_CACHE_HOME", &cache);
@@ -151,9 +158,14 @@ fn lifecycle_delete_compact_check_and_restore() {
     std::fs::write(source_dir.join("new.txt"), b"new file").unwrap();
     backup_source(&config, &source_dir, "src-a", "snap-v2", None);
 
-    let delete_stats = commands::delete::run(&config, None, &["snap-v1"], false, None).unwrap();
-    assert_eq!(delete_stats[0].snapshot_name, "snap-v1");
-    assert!(delete_stats[0].chunks_deleted > 0);
+    let delete_result = commands::delete::run(&config, None, &["snap-v1"], false, None).unwrap();
+    assert!(delete_result.warnings.is_empty());
+    let stats = delete_result
+        .stats
+        .first()
+        .expect("delete returned no stats");
+    assert_eq!(stats.snapshot_name, "snap-v1");
+    assert!(stats.chunks_deleted > 0);
 
     let compact_stats = commands::compact::run(&config, None, 0.0, None, false, None).unwrap();
     assert!(compact_stats.space_freed > 0);
@@ -177,6 +189,7 @@ fn lifecycle_delete_compact_check_and_restore() {
         restore_dir.to_str().unwrap(),
         None,
         config.xattrs.enabled,
+        false,
     )
     .unwrap();
     assert_eq!(extract_stats.files, 2);
@@ -264,6 +277,7 @@ fn prune_compact_check_and_restore_kept_snapshots() {
         restore_a.to_str().unwrap(),
         None,
         config.xattrs.enabled,
+        false,
     )
     .unwrap();
     assert_eq!(
@@ -279,6 +293,7 @@ fn prune_compact_check_and_restore_kept_snapshots() {
         restore_b.to_str().unwrap(),
         None,
         config.xattrs.enabled,
+        false,
     )
     .unwrap();
     assert_eq!(
@@ -326,6 +341,7 @@ fn run_encrypted_lifecycle(mode: EncryptionModeConfig, expected_mode: Encryption
         restore_dir.to_str().unwrap(),
         None,
         config.xattrs.enabled,
+        false,
     )
     .unwrap();
     assert_eq!(
@@ -344,6 +360,7 @@ fn run_encrypted_lifecycle(mode: EncryptionModeConfig, expected_mode: Encryption
         tmp.path().join("bad-restore").to_str().unwrap(),
         None,
         config.xattrs.enabled,
+        false,
     );
     assert!(matches!(wrong_extract, Err(VykarError::DecryptionFailed)));
 
@@ -543,6 +560,7 @@ fn restore_falls_back_to_index_on_cache_miss() {
         restore_dir.to_str().unwrap(),
         None,
         false,
+        false,
     )
     .unwrap();
 
@@ -582,6 +600,7 @@ fn restore_works_without_restore_cache() {
         "snap1",
         restore_dir.to_str().unwrap(),
         None,
+        false,
         false,
     )
     .unwrap();

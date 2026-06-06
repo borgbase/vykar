@@ -16,7 +16,7 @@ use vykar_types::error::{Result, VykarError};
 use vykar_types::pack_id::PackId;
 
 use super::format::{pack_object_with_context, unpack_object_expect_with_context, ObjectType};
-use super::lock::{session_index_key, SessionEntry, SESSIONS_PREFIX};
+use super::lock::{session_index_key, SessionEntry, SESSIONS_PREFIX, SESSION_STALE_SECS};
 use super::pack::{PackType, PackWriter, PackedChunkEntry};
 
 /// Extra upload handles allowed beyond `max_in_flight_uploads` before blocking.
@@ -27,10 +27,6 @@ const JOURNAL_WRITE_INTERVAL: usize = 8;
 
 const DEFAULT_SESSION_ID: &str = "default";
 const PENDING_INDEX_OBJECT_CONTEXT: &[u8] = b"pending_index";
-
-/// Sessions with markers older than this are considered stale for recovery.
-/// 3x the 15-minute refresh interval — if a session missed 2 refreshes, it's dead.
-const RECOVERY_STALE_SECS: i64 = 45 * 60;
 
 /// Result of recovering pending index journals from interrupted sessions.
 pub struct PendingIndexRecovery {
@@ -53,24 +49,29 @@ enum RecoverResult {
 /// Marker state for a session's `.json` file during recovery scanning.
 #[derive(Debug)]
 enum MarkerState {
-    /// Marker exists, parseable, `last_refresh` < RECOVERY_STALE_SECS ago.
+    /// Marker exists, parseable, `last_refresh` within `SESSION_STALE_SECS`.
     Active,
-    /// Marker exists, parseable, `last_refresh` >= RECOVERY_STALE_SECS ago.
+    /// Marker exists, parseable, `last_refresh` strictly older than
+    /// `SESSION_STALE_SECS`.
     Stale,
     /// Marker exists but unreadable or unparseable.
     Unknown,
 }
 
-/// Tracks index mutations during a streaming command dump so they can be
-/// rolled back if the dump command fails mid-stream.
-pub(crate) struct DumpRollbackTracker {
+/// Tracks index mutations between `begin_rollback_checkpoint` and commit so
+/// they can be undone if the guarded scope (command dump, or per-file backup
+/// chunk loop) fails mid-stream.
+///
+/// The primitive is single-slot: only one tracker can be armed at a time.
+/// The backup serial consumer and the dump command never overlap.
+pub(crate) struct RollbackTracker {
     /// Truncation point for IndexDelta.
     pub delta_checkpoint: IndexDeltaCheckpoint,
-    /// ChunkIds inserted into tiered_dedup or dedup_index during this dump.
+    /// ChunkIds inserted into tiered_dedup or dedup_index during this scope.
     pub dedup_inserts: Vec<ChunkId>,
     /// Entries promoted out of recovered_chunks — saved to re-insert on rollback.
     pub promoted_recovered: Vec<(ChunkId, RecoveredChunkEntry)>,
-    /// PackIds added to PendingIndexJournal during this dump.
+    /// PackIds added to PendingIndexJournal during this scope.
     pub journal_pack_ids: Vec<PackId>,
     /// Data pack writer target size at checkpoint time (for reset on rollback).
     pub data_pack_target_size: usize,
@@ -107,7 +108,8 @@ pub(crate) struct WriteSessionState {
     /// `.index` keys to delete after successful commit.
     /// `.json` markers are never deleted here — their lifecycle is managed
     /// exclusively by `deregister_session()` (normal exit) and
-    /// `cleanup_stale_sessions()` (72h threshold, under maintenance lock).
+    /// `cleanup_stale_sessions()` (>45 min since last refresh, under
+    /// maintenance lock).
     pub(crate) recovered_index_keys: Vec<String>,
     /// Number of distinct packs (data + tree) in the persisted index at load time.
     pub(crate) persisted_pack_count: usize,
@@ -116,10 +118,10 @@ pub(crate) struct WriteSessionState {
     /// Session ID for per-session pending_index files.
     /// Defaults to `"default"` for non-backup callers/tests.
     pub(crate) session_id: String,
-    /// Wall-clock time of last session marker refresh (for throttling).
-    pub(crate) last_session_refresh: std::time::Instant,
-    /// Active dump rollback tracker (set during streaming command dumps).
-    pub(crate) dump_tracker: Option<DumpRollbackTracker>,
+    /// Active rollback tracker — set during streaming command dumps and
+    /// during per-file backup chunk loops that need to survive mid-read
+    /// drift detection. Single-slot by design.
+    pub(crate) rollback_tracker: Option<RollbackTracker>,
 }
 
 impl WriteSessionState {
@@ -144,20 +146,7 @@ impl WriteSessionState {
             persisted_pack_count: 0,
             session_packs_flushed: 0,
             session_id: DEFAULT_SESSION_ID.to_string(),
-            last_session_refresh: std::time::Instant::now(),
-            dump_tracker: None,
-        }
-    }
-
-    /// Refresh the session marker if enough time has passed (~15 min).
-    /// No-op when session_id is the default (non-backup callers don't register sessions).
-    pub(crate) fn maybe_refresh_session(&mut self, storage: &dyn StorageBackend) {
-        const REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
-        if self.session_id != DEFAULT_SESSION_ID
-            && self.last_session_refresh.elapsed() >= REFRESH_INTERVAL
-        {
-            crate::repo::lock::refresh_session(storage, &self.session_id);
-            self.last_session_refresh = std::time::Instant::now();
+            rollback_tracker: None,
         }
     }
 
@@ -175,8 +164,8 @@ impl WriteSessionState {
         crypto: &dyn CryptoEngine,
     ) -> Result<()> {
         let mut i = 0;
-        while i < self.pending_uploads.len() {
-            if self.pending_uploads[i].is_finished() {
+        while let Some(slot) = self.pending_uploads.get(i) {
+            if slot.is_finished() {
                 let handle = self.pending_uploads.swap_remove(i);
                 handle
                     .join()
@@ -218,16 +207,14 @@ impl WriteSessionState {
     }
 
     /// Apply backpressure to keep the number of in-flight uploads bounded.
-    /// Also refreshes the session marker if enough time has passed.
+    /// Session-marker refreshes run in a dedicated heartbeat thread owned by
+    /// `SessionGuard`, so this path no longer touches the marker.
     pub(crate) fn cap_pending_uploads(
         &mut self,
         storage: &dyn StorageBackend,
         crypto: &dyn CryptoEngine,
     ) -> Result<()> {
         self.drain_finished_uploads(storage, crypto)?;
-        // Refresh session marker (throttled, ~15 min). Placed here so both
-        // sequential and pipeline modes benefit (both call cap_pending_uploads).
-        self.maybe_refresh_session(storage);
         if self.pending_uploads.len()
             >= self
                 .max_in_flight_uploads
@@ -324,7 +311,7 @@ impl WriteSessionState {
                 if let Some(ref mut delta) = self.index_delta {
                     delta.add_new_entry(chunk_id, stored_size, pack_id, offset, refcount);
                 }
-                if let Some(ref mut tracker) = self.dump_tracker {
+                if let Some(ref mut tracker) = self.rollback_tracker {
                     tracker.dedup_inserts.push(chunk_id);
                 }
             }
@@ -337,19 +324,19 @@ impl WriteSessionState {
                 if let Some(ref mut delta) = self.index_delta {
                     delta.add_new_entry(chunk_id, stored_size, pack_id, offset, refcount);
                 }
-                if let Some(ref mut tracker) = self.dump_tracker {
+                if let Some(ref mut tracker) = self.rollback_tracker {
                     tracker.dedup_inserts.push(chunk_id);
                 }
             }
             false
         } else {
+            // Non-dedup mode: `begin_rollback_checkpoint` asserts a dedup
+            // mode is active, so no tracker can exist here.
+            debug_assert!(self.rollback_tracker.is_none());
             for (chunk_id, stored_size, offset, refcount) in entries {
                 chunk_index.add(chunk_id, stored_size, pack_id, offset);
                 for _ in 1..refcount {
                     chunk_index.increment_refcount(&chunk_id);
-                }
-                if let Some(ref mut tracker) = self.dump_tracker {
-                    tracker.dedup_inserts.push(chunk_id);
                 }
             }
             true
@@ -395,7 +382,7 @@ impl WriteSessionState {
                         match ts {
                             Ok(ts) => {
                                 let age = now.signed_duration_since(ts.with_timezone(&chrono::Utc));
-                                if age.num_seconds() >= RECOVERY_STALE_SECS {
+                                if age.num_seconds() > SESSION_STALE_SECS {
                                     MarkerState::Stale
                                 } else {
                                     MarkerState::Active
@@ -443,7 +430,8 @@ impl WriteSessionState {
                 Ok(RecoverResult::Corrupt) => {
                     // Only delete the corrupt .index — never touch .json markers.
                     // Session marker lifecycle is managed by deregister_session()
-                    // and cleanup_stale_sessions() (72h, under maintenance lock).
+                    // and cleanup_stale_sessions() (>45 min since last_refresh,
+                    // under maintenance lock).
                     warn!(key = %index_key, "corrupt pending index journal, deleting");
                     let _ = storage.delete(index_key);
                 }
@@ -541,7 +529,8 @@ impl WriteSessionState {
         }
 
         let mut recovered = 0usize;
-        for pack_entry in &wire {
+        let pack_count = wire.len();
+        for pack_entry in wire {
             let pack_key = pack_entry.pack_id.storage_key();
             if !known_packs.contains(&pack_key) {
                 warn!(
@@ -569,12 +558,12 @@ impl WriteSessionState {
 
             // Seed journal so re-interruption preserves these entries.
             self.pending_journal
-                .record_pack(pack_entry.pack_id, pack_entry.chunks.clone());
+                .record_pack(pack_entry.pack_id, pack_entry.chunks);
         }
 
         debug!(
             key = %key,
-            packs = wire.len(),
+            packs = pack_count,
             recovered_chunks = recovered,
             "recovered pending_index entries"
         );
@@ -616,17 +605,13 @@ impl WriteSessionState {
         chunk_id: &ChunkId,
         chunk_index: &mut ChunkIndex,
     ) -> Option<(u32, bool)> {
-        // Record for dump rollback before removing from recovered_chunks.
-        if let Some(ref mut tracker) = self.dump_tracker {
-            if let Some(recovered) = self.recovered_chunks.get(chunk_id) {
-                tracker
-                    .promoted_recovered
-                    .push((*chunk_id, recovered.clone()));
-                tracker.dedup_inserts.push(*chunk_id);
-            }
-        }
-
         let entry = self.recovered_chunks.remove(chunk_id)?;
+
+        // Record for rollback now that we own the entry.
+        if let Some(ref mut tracker) = self.rollback_tracker {
+            tracker.promoted_recovered.push((*chunk_id, entry.clone()));
+            tracker.dedup_inserts.push(*chunk_id);
+        }
 
         // Promote into active dedup structure.
         if let Some(ref mut tiered) = self.tiered_dedup {
@@ -705,8 +690,8 @@ mod tests {
         crypto: &dyn CryptoEngine,
         key: &str,
     ) -> (PackId, ChunkId) {
-        let pack_id = PackId([0x11; 32]);
-        let chunk_id = ChunkId([0x22; 32]);
+        let pack_id = PackId::from_bytes([0x11; 32]);
+        let chunk_id = ChunkId::from_bytes([0x22; 32]);
 
         // Create the pack file so verification passes.
         let pack_key = pack_id.storage_key();
@@ -954,7 +939,7 @@ mod tests {
 
         // Pre-populate the chunk index so recovery yields 0 new chunks.
         let mut chunk_index = ChunkIndex::new();
-        chunk_index.add(chunk_id, 100, PackId([0x11; 32]), 0);
+        chunk_index.add(chunk_id, 100, PackId::from_bytes([0x11; 32]), 0);
 
         let mut ws = WriteSessionState::new(1024, 1024, 1);
         ws.session_id = "current".to_string();

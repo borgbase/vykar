@@ -10,18 +10,21 @@
 //! snapshots. All platforms share the same filtering logic (excludes,
 //! gitignore, markers, cross-device).
 
+// libc::statfs to detect filesystems where inode-sorted stat helps; SAFETY per block.
+#![allow(unsafe_code)]
+
 use std::collections::VecDeque;
 use std::fs::FileType;
 use std::path::{Path, PathBuf};
 
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::platform::fs::{self, MetadataSummary};
-use vykar_types::error::{Result, VykarError};
+use vykar_types::error::{is_soft_backup_io_error, Result, VykarError};
 
 use super::super::source::{ResolvedSource, RootEmission, SourceKind};
-use super::{build_explicit_excludes, is_soft_io_error, should_skip_for_device};
+use super::{build_explicit_excludes, should_skip_for_device};
 
 #[cfg(unix)]
 fn dir_entry_inode(entry: &std::fs::DirEntry) -> u64 {
@@ -56,7 +59,13 @@ fn inode_sort_beneficial(path: &Path) -> bool {
             return false;
         }
     };
+    // SAFETY: `libc::statfs` is a C plain-old-data struct of integer fields;
+    // an all-zero bit pattern is a valid (if uninitialized) instance and
+    // statfs(2) overwrites every field on success.
     let mut buf: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `c_path` is a valid NUL-terminated CString owned in this scope;
+    // `&mut buf` is a unique exclusive reference to a properly-aligned statfs
+    // for the kernel to populate.
     let rc = unsafe { libc::statfs(c_path.as_ptr(), &mut buf) };
     if rc != 0 {
         tracing::debug!(path = %path.display(), "statfs failed, disabling inode sort");
@@ -79,7 +88,7 @@ pub(in crate::commands::backup) struct WalkedEntry {
     pub metadata: MetadataSummary,
     pub file_type: FileType,
     /// Pre-computed snapshot-relative path, including the multi-path / file-
-    /// source basename prefix when `RootEmission::EmitRoot` is in effect.
+    /// source prefix when `RootEmission::EmitRoot` is in effect.
     pub snapshot_path: String,
 }
 
@@ -97,8 +106,14 @@ pub(super) fn rel_path_from_abs(abs_source: &Path, abs_path: &Path) -> String {
 /// Events yielded by `InodeSortedWalk`.
 pub(in crate::commands::backup) enum WalkEvent {
     Entry(WalkedEntry),
-    /// A soft error occurred (permission denied, not found, EIO).
-    Skipped,
+    /// A soft error occurred (permission denied, not found, EIO, or a
+    /// Windows-specific unsupported-reparse / cloud-file failure). Carries
+    /// the failing path and a pre-formatted reason so consumers can surface
+    /// a path-bearing warning rather than just bumping an opaque counter.
+    Skipped {
+        path: PathBuf,
+        reason: String,
+    },
 }
 
 /// Build a single-event `DirLevel` holding the root `WalkedEntry` for an
@@ -107,13 +122,13 @@ fn root_entry_level(
     abs_source: &Path,
     file_type: FileType,
     metadata: MetadataSummary,
-    basename: &str,
+    prefix: &str,
 ) -> DirLevel {
     let root_entry = WalkedEntry {
         abs_path: abs_source.to_path_buf(),
         metadata,
         file_type,
-        snapshot_path: basename.to_string(),
+        snapshot_path: prefix.to_string(),
     };
     DirLevel {
         events: VecDeque::from([WalkEvent::Entry(root_entry)]),
@@ -159,7 +174,7 @@ pub(in crate::commands::backup) struct InodeSortedWalk {
     /// Avoids per-directory `statfs()` + `CString` allocation.
     inode_sort_for_source: bool,
     /// Snapshot-root policy: `SkipRoot` (descendants only, relative to
-    /// `abs_source`) or `EmitRoot` (prefix all emitted paths with `basename`).
+    /// `abs_source`) or `EmitRoot` (prefix all emitted paths with `prefix`).
     policy: RootEmission,
 }
 
@@ -264,23 +279,23 @@ impl InodeSortedWalk {
                 let root_level = walk.build_dir_level(&walk.abs_source)?;
                 walk.stack.push(root_level);
             }
-            (RootEmission::EmitRoot { basename }, SourceKind::Directory) => {
+            (RootEmission::EmitRoot { prefix }, SourceKind::Directory) => {
                 let descendants = walk.build_dir_level(&walk.abs_source)?;
                 walk.stack.push(descendants);
                 walk.stack.push(root_entry_level(
                     &walk.abs_source,
                     source_ft,
                     source_summary,
-                    basename,
+                    prefix,
                 ));
             }
-            (RootEmission::EmitRoot { basename }, SourceKind::File) => {
+            (RootEmission::EmitRoot { prefix }, SourceKind::File) => {
                 // Never call read_dir on a file source. This is the regression fix.
                 walk.stack.push(root_entry_level(
                     &walk.abs_source,
                     source_ft,
                     source_summary,
-                    basename,
+                    prefix,
                 ));
             }
         }
@@ -310,10 +325,12 @@ impl InodeSortedWalk {
         let read_dir = match std::fs::read_dir(dir) {
             Ok(rd) => rd,
             Err(e) => {
-                if is_soft_io_error(&e) {
-                    warn!(path = %dir.display(), error = %e, "skipping directory (read_dir error)");
+                if is_soft_backup_io_error(&e) {
                     return Ok(DirLevel {
-                        events: VecDeque::from([WalkEvent::Skipped]),
+                        events: VecDeque::from([WalkEvent::Skipped {
+                            path: dir.to_path_buf(),
+                            reason: format!("read_dir failed: {e}"),
+                        }]),
                         pending_subdirs: VecDeque::new(),
                     });
                 }
@@ -326,14 +343,16 @@ impl InodeSortedWalk {
 
         // Phase 1: Collect raw entries with inode from readdir (free — no stat).
         let mut raw_entries: Vec<RawDirEntry> = Vec::new();
-        let mut skipped_count: usize = 0;
+        // Per-entry readdir failures: the std `ReadDir` iterator yielded an
+        // error before producing the entry name, so we can't name the offending
+        // child — we report the parent directory in each Skipped event instead.
+        let mut deferred_skips: Vec<(PathBuf, String)> = Vec::new();
         for entry_result in read_dir {
             let entry = match entry_result {
                 Ok(e) => e,
                 Err(e) => {
-                    if is_soft_io_error(&e) {
-                        warn!(path = %dir.display(), error = %e, "skipping entry (readdir error)");
-                        skipped_count += 1;
+                    if is_soft_backup_io_error(&e) {
+                        deferred_skips.push((dir.to_path_buf(), format!("readdir failed: {e}")));
                         continue;
                     }
                     return Err(VykarError::Other(format!(
@@ -415,9 +434,11 @@ impl InodeSortedWalk {
             let metadata = match std::fs::symlink_metadata(&raw.path) {
                 Ok(m) => m,
                 Err(e) => {
-                    if is_soft_io_error(&e) {
-                        warn!(path = %raw.path.display(), error = %e, "skipping entry (stat error)");
-                        events.push_back(WalkEvent::Skipped);
+                    if is_soft_backup_io_error(&e) {
+                        events.push_back(WalkEvent::Skipped {
+                            path: raw.path.clone(),
+                            reason: format!("stat failed: {e}"),
+                        });
                         continue;
                     }
                     return Err(VykarError::Other(format!(
@@ -476,7 +497,7 @@ impl InodeSortedWalk {
             let rel = rel_path_from_abs(&self.abs_source, &raw.path);
             let snapshot_path = match &self.policy {
                 RootEmission::SkipRoot => rel,
-                RootEmission::EmitRoot { basename } => format!("{basename}/{rel}"),
+                RootEmission::EmitRoot { prefix } => format!("{prefix}/{rel}"),
             };
 
             events.push_back(WalkEvent::Entry(WalkedEntry {
@@ -488,9 +509,11 @@ impl InodeSortedWalk {
         }
 
         // Prepend Skipped events for readdir errors from phase 1 so consumers
-        // can increment stats.errors for each lost entry.
-        for _ in 0..skipped_count {
-            events.push_front(WalkEvent::Skipped);
+        // can increment stats.errors for each lost entry. `push_front` reverses
+        // the deferred order, so iterate the deferred list in reverse to keep
+        // the original order intact.
+        for (path, reason) in deferred_skips.into_iter().rev() {
+            events.push_front(WalkEvent::Skipped { path, reason });
         }
 
         Ok(DirLevel {
@@ -1048,17 +1071,20 @@ mod tests {
             .collect();
         assert!(!entries.is_empty());
 
-        // Root entry emitted first with `snapshot_path == "data"`.
-        assert_eq!(entries[0].snapshot_path, "data");
+        // Root entry emitted first; under the new multi-path prefix scheme,
+        // the prefix is the full absolute configured path with leading `/`
+        // stripped (e.g. `tmp/.../data`).
+        let root_prefix = entries[0].snapshot_path.clone();
+        assert!(root_prefix.ends_with("/data"), "got: {root_prefix}");
         assert!(entries[0].file_type.is_dir());
         // Walker's fresh stat at init picks up the post-resolve mutation.
         assert_eq!(entries[0].metadata.mode & 0o777, 0o751);
 
-        // Descendants prefixed with "data/".
+        // Descendants prefixed with `<root_prefix>/`.
         let descendant_paths: Vec<String> = entries[1..]
             .iter()
             .map(|e| e.snapshot_path.clone())
             .collect();
-        assert_eq!(descendant_paths, vec!["data/a.txt"]);
+        assert_eq!(descendant_paths, vec![format!("{root_prefix}/a.txt")]);
     }
 }

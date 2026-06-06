@@ -1,3 +1,10 @@
+#![allow(
+    clippy::duration_suboptimal_units,
+    clippy::manual_let_else,
+    clippy::missing_errors_doc,
+    clippy::needless_pass_by_value
+)]
+
 use std::io::Read;
 use std::time::Duration;
 
@@ -474,11 +481,38 @@ impl S3Backend {
 mod tests {
     use super::*;
     use crate::RetryConfig;
-    use std::io::{BufRead, BufReader, Write};
-    use std::net::TcpListener;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::{TcpListener, TcpStream};
     use std::sync::{Arc, Mutex};
 
     // ── Helpers ──────────────────────────────────────────────────────
+
+    /// Read request headers and drain any body indicated by Content-Length.
+    ///
+    /// Draining is load-bearing on Windows: closing a socket with unread
+    /// receive data triggers WSAECONNRESET (os error 10054) on the peer,
+    /// which ureq surfaces as a transport error. Linux tolerates it.
+    fn read_request(reader: &mut BufReader<TcpStream>) -> Vec<String> {
+        let mut lines = Vec::new();
+        let mut content_len = 0usize;
+        let mut line = String::new();
+        loop {
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+            if line.trim().is_empty() {
+                break;
+            }
+            if let Some(val) = line.to_lowercase().strip_prefix("content-length:") {
+                content_len = val.trim().parse().unwrap_or(0);
+            }
+            lines.push(line.trim().to_string());
+        }
+        if content_len > 0 {
+            let mut body = vec![0u8; content_len];
+            reader.read_exact(&mut body).unwrap();
+        }
+        lines
+    }
 
     /// Single-response TCP mock server.
     fn mock_server(response: &str) -> (u16, std::thread::JoinHandle<()>) {
@@ -488,14 +522,7 @@ mod tests {
         let handle = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut line = String::new();
-            loop {
-                line.clear();
-                reader.read_line(&mut line).unwrap();
-                if line.trim().is_empty() {
-                    break;
-                }
-            }
+            read_request(&mut reader);
             stream.write_all(response.as_bytes()).unwrap();
             stream.flush().unwrap();
         });
@@ -510,14 +537,7 @@ mod tests {
             for response in &responses {
                 let (mut stream, _) = listener.accept().unwrap();
                 let mut reader = BufReader::new(stream.try_clone().unwrap());
-                let mut line = String::new();
-                loop {
-                    line.clear();
-                    reader.read_line(&mut line).unwrap();
-                    if line.trim().is_empty() {
-                        break;
-                    }
-                }
+                read_request(&mut reader);
                 stream.write_all(response.as_bytes()).unwrap();
                 stream.flush().unwrap();
                 drop(stream);
@@ -538,17 +558,7 @@ mod tests {
         let handle = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut lines = Vec::new();
-            let mut line = String::new();
-            loop {
-                line.clear();
-                reader.read_line(&mut line).unwrap();
-                if line.trim().is_empty() {
-                    break;
-                }
-                lines.push(line.trim().to_string());
-            }
-            *captured_clone.lock().unwrap() = lines;
+            *captured_clone.lock().unwrap() = read_request(&mut reader);
             stream.write_all(response.as_bytes()).unwrap();
             stream.flush().unwrap();
         });
@@ -572,16 +582,7 @@ mod tests {
             for response in &responses {
                 let (mut stream, _) = listener.accept().unwrap();
                 let mut reader = BufReader::new(stream.try_clone().unwrap());
-                let mut lines = Vec::new();
-                let mut line = String::new();
-                loop {
-                    line.clear();
-                    reader.read_line(&mut line).unwrap();
-                    if line.trim().is_empty() {
-                        break;
-                    }
-                    lines.push(line.trim().to_string());
-                }
+                let lines = read_request(&mut reader);
                 captured_clone.lock().unwrap().push(lines);
                 stream.write_all(response.as_bytes()).unwrap();
                 stream.flush().unwrap();
@@ -1076,33 +1077,7 @@ mod tests {
             "HTTP/1.1 403 Forbidden\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{xml}",
             xml.len()
         );
-        // PUT sends a body, so the mock must drain the full request (headers +
-        // body) before replying; otherwise ureq may get a broken pipe.
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let handle = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut line = String::new();
-            let mut content_len = 0usize;
-            loop {
-                line.clear();
-                reader.read_line(&mut line).unwrap();
-                if line.trim().is_empty() {
-                    break;
-                }
-                if let Some(val) = line.to_lowercase().strip_prefix("content-length:") {
-                    content_len = val.trim().parse().unwrap_or(0);
-                }
-            }
-            // Drain the request body
-            let mut body = vec![0u8; content_len];
-            if content_len > 0 {
-                std::io::Read::read_exact(&mut reader, &mut body).unwrap();
-            }
-            stream.write_all(resp_str.as_bytes()).unwrap();
-            stream.flush().unwrap();
-        });
+        let (port, handle) = mock_server(&resp_str);
         let backend = s3_backend(port, fast_retry(), false);
         let err = backend.put("testkey", b"data").unwrap_err().to_string();
         assert!(err.contains("AccessDenied"), "got: {err}");

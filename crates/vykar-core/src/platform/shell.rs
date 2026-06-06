@@ -1,3 +1,6 @@
+// pre_exec setpgid for shell child process group; SAFETY documented per block.
+#![allow(unsafe_code)]
+
 use std::process::{Command, ExitStatus, Output};
 use std::time::Duration;
 
@@ -160,7 +163,10 @@ pub fn terminate_process_group(pid: u32) {
         use nix::sys::signal::{killpg, Signal};
         use nix::unistd::Pid;
 
-        let pgid = Pid::from_raw(pid as i32);
+        let Ok(pid) = i32::try_from(pid) else {
+            return;
+        };
+        let pgid = Pid::from_raw(pid);
         // Try graceful termination of the entire process group first.
         let _ = killpg(pgid, Signal::SIGTERM);
         std::thread::sleep(Duration::from_millis(200));

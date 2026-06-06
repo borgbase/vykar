@@ -1,4 +1,5 @@
 use crate::compress::Compression;
+use crate::repo::file_cache::CachedChunks;
 use crate::repo::pack::PackType;
 use crate::repo::Repository;
 use crate::snapshot::item::{ChunkRef, Item};
@@ -89,25 +90,96 @@ pub(super) fn process_worker_chunks(
 ///
 /// Uses `reuse_cached_chunk_ref` which correctly handles committed, recovered
 /// (with promotion), and pending chunks. Returns an error if any chunk is
-/// unresolvable — this indicates storage corruption, not a recoverable condition.
+/// unresolvable — this indicates storage corruption, not a recoverable
+/// condition (and must NOT silently fall back to a cache miss, which would
+/// mask repo/index corruption).
+///
+/// `csize` is not carried in the local filecache (see `CachedChunkRef`);
+/// it's hydrated here from the authoritative `stored_size` returned by
+/// `reuse_cached_chunk_ref`.
 ///
 /// Callers handle file-cache insertion themselves (path types differ).
 pub(super) fn commit_cache_hit(
     repo: &mut Repository,
     item: &mut Item,
-    cached_refs: &[ChunkRef],
+    cached_refs: &CachedChunks,
     stats: &mut SnapshotStats,
 ) -> Result<()> {
+    let refs = cached_refs.as_slice();
+    let mut hydrated = Vec::with_capacity(refs.len());
     let mut file_original: u64 = 0;
     let mut file_compressed: u64 = 0;
-    for cr in cached_refs {
+    for cr in refs {
         let stored_size = repo.reuse_cached_chunk_ref(&cr.id)?;
         file_original += cr.size as u64;
         file_compressed += stored_size as u64;
+        hydrated.push(ChunkRef {
+            id: cr.id,
+            size: cr.size,
+            csize: stored_size,
+        });
     }
+    // Commit only after every ref resolved — leaves `item` untouched on
+    // the unresolvable-chunk error path.
+    item.chunks = hydrated;
     stats.nfiles += 1;
     stats.original_size += file_original;
     stats.compressed_size += file_compressed;
-    item.chunks = cached_refs.to_vec();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::repo::file_cache::CachedChunkRef;
+    use crate::snapshot::item::ItemType;
+    use crate::testutil::test_repo_plaintext;
+    use vykar_types::chunk_id::ChunkId;
+
+    fn empty_item() -> Item {
+        Item {
+            path: "ghost.txt".into(),
+            entry_type: ItemType::RegularFile,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            user: None,
+            group: None,
+            mtime: 0,
+            atime: None,
+            ctime: Some(0),
+            size: 42,
+            chunks: Vec::new(),
+            link_target: None,
+            xattrs: None,
+        }
+    }
+
+    #[test]
+    fn commit_cache_hit_errors_on_missing_chunk() {
+        // Missing-chunk semantics: a cached chunk id that isn't resolvable
+        // via `reuse_cached_chunk_ref` must surface as an error, never as
+        // a silent downgrade to a cache miss (that would mask repo/index
+        // corruption). This guards the invariant called out in the plan.
+        let mut repo = test_repo_plaintext();
+        let mut item = empty_item();
+        let mut stats = SnapshotStats::default();
+        let phantom = CachedChunks::Single(CachedChunkRef {
+            id: ChunkId::from_bytes([0x77; 32]),
+            size: 42,
+        });
+
+        let err = commit_cache_hit(&mut repo, &mut item, &phantom, &mut stats)
+            .expect_err("missing chunk must surface as an error");
+        assert!(
+            err.to_string().contains("unresolvable chunk"),
+            "expected 'unresolvable chunk' in error, got: {err}",
+        );
+        // On the error path, nothing should have been attributed to stats
+        // or written into `item.chunks`.
+        assert!(item.chunks.is_empty());
+        assert_eq!(stats.nfiles, 0);
+        assert_eq!(stats.original_size, 0);
+        assert_eq!(stats.compressed_size, 0);
+    }
 }

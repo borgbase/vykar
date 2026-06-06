@@ -165,7 +165,7 @@ impl Repository {
         let compressed = compress::compress(compression, data)?;
         let packed = pack_object_with_context(
             ObjectType::ChunkData,
-            &chunk_id.0,
+            chunk_id.as_bytes(),
             &compressed,
             self.crypto.as_ref(),
         )?;
@@ -267,8 +267,8 @@ impl Repository {
             .collect();
         ws.pending_journal.record_pack(pack_id, journal_chunks);
 
-        // Record pack ID for dump rollback tracking.
-        if let Some(ref mut tracker) = ws.dump_tracker {
+        // Record pack ID for rollback tracking (dump / per-file backup).
+        if let Some(ref mut tracker) = ws.rollback_tracker {
             tracker.journal_pack_ids.push(pack_id);
         }
 
@@ -280,7 +280,7 @@ impl Repository {
         let key = pack_id.storage_key();
         self.write_session
             .as_mut()
-            .unwrap()
+            .expect("write session active while flushing writer")
             .pending_uploads
             .push(std::thread::spawn(move || data.put_to(&*storage, &key)));
 
@@ -307,7 +307,7 @@ impl Repository {
         // Encrypt and wrap in repo object envelope
         let packed = pack_object_with_context(
             ObjectType::ChunkData,
-            &chunk_id.0,
+            chunk_id.as_bytes(),
             &compressed,
             self.crypto.as_ref(),
         )?;
@@ -334,7 +334,7 @@ impl Repository {
         // Wait for all background uploads to complete before returning.
         self.write_session
             .as_mut()
-            .unwrap()
+            .expect("write session active after pending writer flush")
             .wait_pending_uploads(&*self.storage, &*self.crypto)?;
         Ok(())
     }

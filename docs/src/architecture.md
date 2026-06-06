@@ -503,7 +503,7 @@ During the upload phase of a backup, a lightweight JSON marker is written to `se
 
 Each marker contains: hostname, PID, `registered_at`, and `last_refresh`. On registration, the client probes for an active advisory lock (3 retries, 2 s base delay, exponential backoff + 25 % jitter). If the lock is held (maintenance in progress), the session marker is deleted and the backup aborts with `Locked`.
 
-Session markers are refreshed approximately every 15 minutes (`maybe_refresh_session()` called from the upload pipeline). Markers older than 72 hours are treated as stale.
+Each client owns a dedicated heartbeat thread (`SessionGuard` with a 15-minute timer) that refreshes the marker independently of the upload pipeline — so a host that happens to have very long-running uploads still keeps its marker fresh. Markers whose `last_refresh` is strictly older than 45 minutes (three missed heartbeats) are treated as stale.
 
 #### Advisory Lock (exclusive)
 
@@ -515,7 +515,7 @@ Session markers are refreshed approximately every 15 minutes (`maybe_refresh_ses
 
 The advisory lock is used for:
 - **Backup commit phase**: acquired with `acquire_lock_with_retry` (10 attempts, 500 ms base delay, exponential backoff + 25 % jitter). Held only for the brief commit — typically seconds.
-- **Maintenance commands** (`delete`, `prune`, `compact`): acquired via `with_maintenance_lock()`, which additionally cleans stale sessions (72 h), removes companion `.index` journal files and orphaned `.index` files, then checks for remaining active sessions. If any non-stale sessions exist, the lock is released and `VykarError::ActiveSessions` is returned — this prevents compaction from deleting packs that upload-phase backups depend on.
+- **Maintenance commands** (`delete`, `prune`, `compact`): acquired via `with_maintenance_lock()`, which additionally cleans stale session markers (>45 min since `last_refresh`) while preserving their companion `.index` journals so the next backup can recover uploaded-but-uncommitted chunks. Orphaned `.index` files from a *prior* cleanup run (marker already gone) are removed. Then maintenance checks for remaining active sessions — if any non-stale sessions exist (including malformed markers that cannot be proven stale), the lock is released and `VykarError::ActiveSessions` is returned, preventing compaction from deleting packs that upload-phase backups depend on.
 
 #### Command Summary
 
@@ -571,7 +571,7 @@ If a backup is interrupted after packs have been flushed but before commit, thos
 4. After a successful commit, the `sessions/<session_id>.index` blob is deleted
 5. `flush_on_abort()` writes a final journal before exiting, maximizing recovery coverage
 
-If a backup process crashes or is killed without clean shutdown, its session marker (`sessions/<id>.json`) remains on storage. Maintenance commands (`compact`, `delete`, `prune`) will see it via `list_sessions()` and refuse to run until the marker ages out. `cleanup_stale_sessions()` removes markers older than 72 hours along with their companion `.index` journal files. Orphaned `.index` files whose `.json` marker no longer exists are also cleaned up.
+If a backup process crashes or is killed without clean shutdown, its session marker (`sessions/<id>.json`) remains on storage. Maintenance commands (`compact`, `delete`, `prune`) will see it via `list_session_entries()` and refuse to run until the marker ages out. `cleanup_stale_sessions()` removes markers whose `last_refresh` is strictly older than 45 minutes (three missed 15-minute heartbeats). Companion `.index` journals are **preserved** across this cleanup so the next backup can recover any uploaded-but-uncommitted chunks; only `.index` files whose `.json` marker was already absent (orphaned from a prior run) are deleted. Malformed `.json` markers (unparseable JSON or bad timestamps) are left in place and reported as blocking sessions — they require operator intervention (`break-lock --sessions`).
 
 ### Concurrent Multi-Client Backups
 
@@ -579,7 +579,7 @@ Multiple machines or scheduled jobs can back up to the same repository concurren
 
 #### Session Lifecycle
 
-Each backup client registers a session marker at `sessions/<session_id>.json` before opening the repository. The marker is refreshed approximately every 15 minutes during upload (`maybe_refresh_session()` called from the upload pipeline). At commit time, the client acquires the exclusive advisory lock, commits its changes, deregisters the session (while still holding the lock), then releases the lock.
+Each backup client registers a session marker at `sessions/<session_id>.json` before opening the repository. After the repository is open, a dedicated `SessionGuard` heartbeat thread refreshes the marker every 15 minutes, independent of the upload pipeline. At commit time, the client acquires the exclusive advisory lock, commits its changes, deregisters the session (while still holding the lock — the guard's `Drop` stops and joins the heartbeat thread before deleting the marker, so no refresh can race with the delete), then releases the lock.
 
 Each session's crash-recovery journal is co-located at `sessions/<session_id>.index`, keeping all per-session state in a single directory.
 

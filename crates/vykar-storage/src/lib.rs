@@ -1,3 +1,17 @@
+#![forbid(unsafe_code)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::doc_markdown,
+        clippy::expect_used,
+        clippy::format_push_string,
+        clippy::indexing_slicing,
+        clippy::manual_let_else,
+        clippy::panic,
+        clippy::unwrap_used
+    )
+)]
+
 pub mod local_backend;
 pub mod rest_backend;
 pub mod s3_backend;
@@ -26,6 +40,16 @@ pub use vykar_protocol::{
 
 /// Abstract key-value storage for repository objects.
 /// Keys are `/`-separated string paths (e.g. "packs/ab/ab01cd02...").
+///
+/// # Runtime invariant
+///
+/// The trait surface is synchronous, but implementors (notably the SFTP
+/// backend) may drive async I/O internally via `tokio::runtime::Runtime::block_on`.
+/// Callers must therefore **not** invoke these methods from inside a tokio
+/// runtime context — doing so panics with "Cannot start a runtime from within a
+/// runtime." If you need to call a `StorageBackend` from async code, dispatch
+/// through `tokio::task::spawn_blocking`.
+#[allow(clippy::missing_errors_doc)]
 pub trait StorageBackend: Send + Sync {
     /// Read an object by key. Returns `None` if not found.
     fn get(&self, key: &str) -> Result<Option<Vec<u8>>>;
@@ -52,7 +76,7 @@ pub trait StorageBackend: Send + Sync {
     /// Read a byte range from an object into a caller-provided buffer.
     ///
     /// Returns `Ok(true)` when the key exists (buf filled), `Ok(false)` when
-    /// not found (buf cleared). LocalBackend overrides this to read directly
+    /// not found (buf cleared). `LocalBackend` overrides this to read directly
     /// into `buf`, achieving true buffer reuse. Other backends fall through to
     /// `get_range()` + move.
     fn get_range_into(
@@ -62,15 +86,12 @@ pub trait StorageBackend: Send + Sync {
         length: u64,
         buf: &mut Vec<u8>,
     ) -> Result<bool> {
-        match self.get_range(key, offset, length)? {
-            Some(data) => {
-                *buf = data;
-                Ok(true)
-            }
-            None => {
-                buf.clear();
-                Ok(false)
-            }
+        if let Some(data) = self.get_range(key, offset, length)? {
+            *buf = data;
+            Ok(true)
+        } else {
+            buf.clear();
+            Ok(false)
         }
     }
 
@@ -88,7 +109,12 @@ pub trait StorageBackend: Send + Sync {
     /// Backends should override this with a metadata-only operation (e.g.
     /// HTTP HEAD, `stat()`, `fs::metadata`) to avoid downloading the object.
     fn size(&self, key: &str) -> Result<Option<u64>> {
-        Ok(self.get(key)?.map(|v| v.len() as u64))
+        self.get(key)?
+            .map(|v| {
+                u64::try_from(v.len())
+                    .map_err(|_| VykarError::Other("object length does not fit u64".into()))
+            })
+            .transpose()
     }
 
     /// Execute a server-side repack plan when supported by the backend.
@@ -208,6 +234,11 @@ impl ParsedUrl {
 /// - `s3+http://endpoint[:port]/bucket/prefix` -> `S3` over HTTP (unsafe; blocked by default)
 /// - `sftp://[user@]host[:port]/path` -> `Sftp`
 /// - `http(s)://...` -> `Rest`
+///
+/// # Errors
+///
+/// Returns an error when the URL is empty, has an unsupported scheme, or is
+/// missing required scheme-specific parts.
 pub fn parse_repo_url(raw: &str) -> Result<ParsedUrl> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -347,7 +378,7 @@ pub struct StorageConfig {
 }
 
 /// Retry configuration for remote storage backends (S3, SFTP, REST).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RetryConfig {
     /// Maximum number of retry attempts (0 = no retries).
@@ -363,10 +394,10 @@ pub struct RetryConfig {
 
 impl RetryConfig {
     fn default_max_retries() -> usize {
-        3
+        5
     }
     fn default_retry_delay_ms() -> u64 {
-        1000
+        1500
     }
     fn default_retry_max_delay_ms() -> u64 {
         60_000
@@ -384,6 +415,11 @@ impl Default for RetryConfig {
 }
 
 /// Build a storage backend from a `StorageConfig`.
+///
+/// # Errors
+///
+/// Returns an error when the repository URL is invalid, insecure HTTP is not
+/// explicitly allowed, or backend initialization fails.
 pub fn backend_from_config(cfg: &StorageConfig) -> Result<Box<dyn StorageBackend>> {
     let parsed = parse_repo_url(&cfg.url)?;
 
@@ -418,7 +454,7 @@ pub fn backend_from_config(cfg: &StorageConfig) -> Result<Box<dyn StorageBackend
                 &endpoint,
                 access_key_id,
                 secret_access_key,
-                cfg.retry.clone(),
+                cfg.retry,
                 cfg.s3_soft_delete,
             )?))
         }
@@ -437,7 +473,7 @@ pub fn backend_from_config(cfg: &StorageConfig) -> Result<Box<dyn StorageBackend
             cfg.sftp_known_hosts.as_deref(),
             cfg.max_connections,
             cfg.sftp_timeout,
-            cfg.retry.clone(),
+            cfg.retry,
         )?)),
         #[cfg(not(feature = "backend-sftp"))]
         ParsedUrl::Sftp { .. } => Err(VykarError::UnsupportedBackend(
@@ -446,9 +482,7 @@ pub fn backend_from_config(cfg: &StorageConfig) -> Result<Box<dyn StorageBackend
         ParsedUrl::Rest { url } => {
             let token = cfg.access_token.as_deref();
             Ok(Box::new(rest_backend::RestBackend::new(
-                &url,
-                token,
-                cfg.retry.clone(),
+                &url, token, cfg.retry,
             )?))
         }
     }
@@ -726,6 +760,29 @@ mod tests {
         assert!(
             backend.is_ok(),
             "expected HTTP S3 endpoint to be allowed when opted in"
+        );
+    }
+
+    #[test]
+    fn default_retry_reaches_one_minute_average_window() {
+        let cfg = RetryConfig::default();
+        assert_eq!(cfg.max_retries, 5);
+        let mut delay = cfg.retry_delay_ms;
+        let mut base: u64 = 0;
+        let mut avg_x2: u64 = 0;
+        for _ in 0..cfg.max_retries {
+            base += delay;
+            avg_x2 += delay * 3;
+            delay = (delay * 2).min(cfg.retry_max_delay_ms);
+        }
+        let avg_ms = avg_x2 / 2;
+        assert!(
+            base >= 45_000,
+            "default backoff base should span >=45s, got {base}ms"
+        );
+        assert!(
+            (55_000..=85_000).contains(&avg_ms),
+            "expected avg cumulative backoff near 1 minute, got {avg_ms}ms"
         );
     }
 }

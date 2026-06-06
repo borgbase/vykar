@@ -103,6 +103,28 @@ With Docker Compose:
 
     docker compose kill -s USR1 vykar
 
+### Read-only status page
+
+Set `VYKAR_HTTP_LISTEN` (and `VYKAR_HTTP_ALLOW_PUBLIC=1` to bind on `0.0.0.0`) and publish port 7575 to expose a read-only status page in the browser. See [Daemon → Read-only status page](daemon.md#read-only-status-page) for endpoints and bind-safety rules.
+
+    docker run -d \
+      --name vykar-daemon \
+      -p 7575:7575 \
+      -e VYKAR_HTTP_LISTEN=0.0.0.0:7575 \
+      -e VYKAR_HTTP_ALLOW_PUBLIC=1 \
+      -v /path/to/vykar.yaml:/etc/vykar/config.yaml:ro \
+      -v vykar-cache:/cache \
+      ghcr.io/borgbase/vykar
+
+Environment variables recognised by the daemon:
+
+| Variable | Equivalent flag | Purpose |
+|---|---|---|
+| `VYKAR_HTTP_LISTEN` | `--http-listen ADDR` | Bind a read-only HTTP status page (e.g. `0.0.0.0:7575`); unset means disabled |
+| `VYKAR_HTTP_ALLOW_PUBLIC` | `--http-allow-public` | Permit non-loopback bind addresses |
+| `VYKAR_CONFIG` | `--config PATH` | Override config file path |
+| `VYKAR_PASSPHRASE` | — | Repository passphrase (skips interactive prompt) |
+
 ### Notes
 - Use `-it` with `docker run` for interactive commands to get progress bar output (e.g. `docker run --rm -it ...`)
 - Set `--hostname` to a stable name — Docker assigns random hostnames that appear in snapshot metadata

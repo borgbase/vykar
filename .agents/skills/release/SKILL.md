@@ -18,6 +18,7 @@ Run `make pre-commit` first to catch formatting, clippy, and test issues before 
 Update the `version` field in **all** workspace crates and the macOS Info.plist:
 
 - `crates/vykar-types/Cargo.toml`
+- `crates/vykar-common/Cargo.toml`
 - `crates/vykar-crypto/Cargo.toml`
 - `crates/vykar-storage/Cargo.toml`
 - `crates/vykar-protocol/Cargo.toml`

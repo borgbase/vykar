@@ -155,7 +155,7 @@ impl AppState {
         }
     }
 
-    /// Resolve a full file path within the repo, ensuring it stays within data_dir.
+    /// Resolve a full file path within the repo, ensuring it stays within `data_dir`.
     pub fn file_path(&self, key: &str) -> Option<PathBuf> {
         if !is_valid_storage_key(key) {
             return None;
@@ -279,28 +279,35 @@ fn is_valid_storage_key(key: &str) -> bool {
     {
         return false;
     }
-    // Check directory prefixes first.
-    match parts[0] {
+    let Some(first) = parts.first() else {
+        return false;
+    };
+    match *first {
         "keys" | "snapshots" | "locks" | "sessions" | "pending_index" => {
             return (1..=2).contains(&parts.len());
         }
         "packs" => return is_valid_packs_key(&parts),
         _ => {}
     }
-    if vykar_protocol::KNOWN_ROOT_FILES.contains(&parts[0]) {
+    if vykar_protocol::KNOWN_ROOT_FILES.contains(first) {
         return parts.len() == 1;
     }
     false
 }
 
 fn is_valid_packs_key(parts: &[&str]) -> bool {
-    if parts.is_empty() || parts[0] != "packs" {
+    let Some(first) = parts.first() else {
+        return false;
+    };
+    if *first != "packs" {
         return false;
     }
     if parts.len() == 1 {
         return true;
     }
-    let shard = parts[1];
+    let Some(shard) = parts.get(1) else {
+        return false;
+    };
     if shard.len() != 2 || !shard.chars().all(|c| c.is_ascii_hexdigit()) {
         return false;
     }
@@ -308,7 +315,9 @@ fn is_valid_packs_key(parts: &[&str]) -> bool {
         return true;
     }
     if parts.len() == 3 {
-        let pack = parts[2];
+        let Some(pack) = parts.get(2) else {
+            return false;
+        };
         return pack.len() == 64 && pack.chars().all(|c| c.is_ascii_hexdigit());
     }
     false

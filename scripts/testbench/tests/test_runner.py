@@ -11,6 +11,58 @@ from vykar_testbench import benchmarks
 
 
 class ScenarioRunnerTests(unittest.TestCase):
+    def test_run_scenario_stops_after_repeated_verify_diff_mismatch(self) -> None:
+        scenario = {
+            "name": "stop-on-diff",
+            "corpus": {"size_gib": 0.1},
+            "phases": [{"action": "init"}, {"action": "verify"}],
+        }
+
+        phase_results = [
+            {"action": "init", "label": "", "passed": True, "detail": "ok", "duration_sec": 0.01},
+            {
+                "action": "verify",
+                "label": "",
+                "passed": False,
+                "detail": "diff mismatch after retry:\nFiles /src/a and /restore/a differ",
+                "duration_sec": 0.02,
+                "stop_scenario": True,
+            },
+        ]
+
+        with tempfile.TemporaryDirectory() as output_dir:
+            with mock.patch(
+                "vykar_testbench.scenarios.corpus.validate_corpus_mix"
+            ), mock.patch(
+                "vykar_testbench.scenarios.corpus.generate_corpus",
+                return_value={"file_count": 1, "total_bytes": 1024},
+            ), mock.patch(
+                "vykar_testbench.scenarios.cfg.write_vykar_config",
+                return_value="/mnt/repos/scenario-repo",
+            ), mock.patch(
+                "vykar_testbench.scenarios.cfg.ensure_backend_ready"
+            ), mock.patch(
+                "vykar_testbench.scenarios.vykar_cmd.vykar_delete_repo"
+            ), mock.patch(
+                "vykar_testbench.scenarios._run_phase",
+                side_effect=phase_results,
+            ) as run_phase, mock.patch(
+                "vykar_testbench.scenarios.write_aggregate_report"
+            ), mock.patch(
+                "vykar_testbench.scenarios.print_summary"
+            ):
+                passed = scenarios.run_scenario(
+                    scenario,
+                    backend="local",
+                    runs=2,
+                    output_dir=output_dir,
+                    vykar_bin="vykar",
+                    seed=123,
+                )
+
+        self.assertFalse(passed)
+        self.assertEqual(run_phase.call_count, 2)
+
     def test_list_phase_captures_output_without_echoing_header_in_detail(self) -> None:
         list_stdout = (
             "ID        Host                       Source   Label   Date\n"

@@ -50,12 +50,11 @@ fn contextual_aad(tag: u8, context: &[u8]) -> Vec<u8> {
 }
 
 fn parse_object_envelope(data: &[u8]) -> Result<(u8, ObjectType, &[u8])> {
-    if data.is_empty() {
-        return Err(VykarError::InvalidFormat("empty object".into()));
-    }
-    let tag = data[0];
-    let obj_type = ObjectType::from_u8(tag)?;
-    Ok((tag, obj_type, &data[1..]))
+    let (tag, payload) = data
+        .split_first()
+        .ok_or_else(|| VykarError::InvalidFormat("empty object".into()))?;
+    let obj_type = ObjectType::from_u8(*tag)?;
+    Ok((*tag, obj_type, payload))
 }
 
 /// Serialize a typed payload into an encrypted repo object.
@@ -157,11 +156,16 @@ where
         buf.extend_from_slice(&[0u8; 12]);
         // Let the caller write plaintext starting at offset 13
         write_plaintext(&mut buf)?;
-        // Encrypt the plaintext region in-place
-        let plaintext_start = 1 + 12; // after tag + nonce placeholder
+        // Encrypt the plaintext region in-place. The buffer was primed
+        // with `push(tag)` + `extend_from_slice(&[0u8; 12])`, so
+        // `buf.len() >= 13` and `buf[plaintext_start..]` / `buf[1..13]`
+        // are in bounds.
+        let plaintext_start = 1 + 12;
+        #[allow(clippy::indexing_slicing)]
         let (nonce, gcm_tag) =
             crypto.encrypt_in_place_detached(&mut buf[plaintext_start..], aad)?;
         // Fill in the nonce
+        #[allow(clippy::indexing_slicing)]
         buf[1..13].copy_from_slice(&nonce);
         // Append the authentication tag
         buf.extend_from_slice(&gcm_tag);

@@ -16,6 +16,8 @@ struct LockEntry {
     hostname: String,
     pid: u32,
     time: String,
+    #[serde(default)]
+    boot_id: Option<String>,
 }
 
 const LOCKS_PREFIX: &str = "locks/";
@@ -53,6 +55,7 @@ pub fn acquire_lock(storage: &dyn StorageBackend) -> Result<LockGuard> {
         hostname,
         pid,
         time: now.to_rfc3339(),
+        boot_id: crate::platform::boot_id(),
     };
 
     let uuid = format!("{:032x}", rand::random::<u128>());
@@ -77,7 +80,11 @@ pub fn acquire_lock(storage: &dyn StorageBackend) -> Result<LockGuard> {
     }
     if keys.first() != Some(&key) {
         let _ = storage.delete(&key);
-        let holder = format_lock_holder(storage, keys.first().unwrap());
+        let holder = format_lock_holder(
+            storage,
+            keys.first()
+                .expect("lock list contains our key or an older winner"),
+        );
         return Err(VykarError::Locked(holder));
     }
 
@@ -126,22 +133,87 @@ fn format_lock_holder(storage: &dyn StorageBackend, lock_key: &str) -> String {
 }
 
 fn cleanup_stale_locks(storage: &dyn StorageBackend, max_age: Duration) -> Result<()> {
+    cleanup_stale_locks_inner(
+        storage,
+        max_age,
+        &crate::platform::hostname(),
+        crate::platform::boot_id().as_deref(),
+        crate::platform::is_pid_alive,
+    )
+}
+
+pub(crate) fn cleanup_stale_locks_inner(
+    storage: &dyn StorageBackend,
+    max_age: Duration,
+    local_hostname: &str,
+    local_boot_id: Option<&str>,
+    pid_alive_fn: impl Fn(u32) -> bool,
+) -> Result<()> {
     let now = Utc::now();
     for key in list_lock_keys(storage)? {
         let Some(data) = storage.get(&key)? else {
             continue;
         };
-        let Ok(entry) = serde_json::from_slice::<LockEntry>(&data) else {
-            continue;
-        };
-        let Ok(acquired) = chrono::DateTime::parse_from_rfc3339(&entry.time) else {
-            continue;
-        };
-        if now.signed_duration_since(acquired.with_timezone(&Utc)) > max_age {
-            let _ = storage.delete(&key);
+        let entry = serde_json::from_slice::<LockEntry>(&data).ok();
+        if should_cleanup_lock(
+            &key,
+            entry.as_ref(),
+            now,
+            max_age,
+            local_hostname,
+            local_boot_id,
+            &pid_alive_fn,
+        ) {
+            storage.delete(&key)?;
         }
     }
     Ok(())
+}
+
+fn should_cleanup_lock(
+    key: &str,
+    entry: Option<&LockEntry>,
+    now: chrono::DateTime<Utc>,
+    max_age: Duration,
+    local_hostname: &str,
+    local_boot_id: Option<&str>,
+    pid_alive_fn: &impl Fn(u32) -> bool,
+) -> bool {
+    if let Some(entry) = entry {
+        let same_host = entry.hostname == local_hostname;
+        if same_host {
+            if let (Some(local), Some(remote)) = (local_boot_id, entry.boot_id.as_deref()) {
+                if local != remote {
+                    return true;
+                }
+            }
+            if !pid_alive_fn(entry.pid) {
+                return true;
+            }
+        }
+    }
+
+    lock_timestamp(entry, key).is_some_and(|acquired| now.signed_duration_since(acquired) > max_age)
+}
+
+fn lock_timestamp(entry: Option<&LockEntry>, key: &str) -> Option<chrono::DateTime<Utc>> {
+    entry
+        .and_then(|entry| {
+            chrono::DateTime::parse_from_rfc3339(&entry.time)
+                .ok()
+                .map(|ts| ts.with_timezone(&Utc))
+        })
+        .or_else(|| lock_key_timestamp(key))
+}
+
+fn lock_key_timestamp(key: &str) -> Option<chrono::DateTime<Utc>> {
+    let raw = key.strip_prefix(LOCKS_PREFIX)?.strip_suffix(".json")?;
+    let (micros, _) = raw.split_once('-')?;
+    if micros.len() != 20 || !micros.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let micros = micros.parse::<i64>().ok()?;
+    chrono::DateTime::<Utc>::from_timestamp_micros(micros)
 }
 
 /// Build a lock fence closure that verifies the lock is still valid.
@@ -195,6 +267,7 @@ fn build_lock_fence_inner(
                 hostname: hostname.clone(),
                 pid,
                 time: Utc::now().to_rfc3339(),
+                boot_id: crate::platform::boot_id(),
             };
             if let Ok(data) = serde_json::to_vec(&entry) {
                 if storage.put(&lock_key, &data).is_ok() {
@@ -250,8 +323,13 @@ pub fn verify_lock_validity(
 // ── Session markers ──────────────────────────────────────────────────────
 
 pub(crate) const SESSIONS_PREFIX: &str = "sessions/";
-/// Sessions older than this are considered stale and can be reaped.
-const DEFAULT_STALE_SESSION_SECS: i64 = 72 * 60 * 60; // 72 hours
+/// Sessions whose `last_refresh` is strictly older than this threshold are
+/// treated as stale. Shared between maintenance cleanup
+/// ([`cleanup_stale_sessions`]) and pending-index recovery.
+///
+/// Set to 3× the 15-minute session heartbeat interval — two missed refreshes
+/// still keep a session live, a third marks it dead.
+pub(crate) const SESSION_STALE_SECS: i64 = 45 * 60;
 
 /// Storage key for a session's JSON marker: `sessions/<id>.json`.
 pub(crate) fn session_marker_key(session_id: &str) -> String {
@@ -319,6 +397,10 @@ pub fn register_session(storage: &dyn StorageBackend, session_id: &str) -> Resul
 }
 
 /// Deregister a backup session. Best-effort: retries twice on failure.
+///
+/// Performs blocking `std::thread::sleep` between retries. Callers running
+/// inside an async runtime must invoke this via `tokio::task::spawn_blocking`
+/// (see `commands/mount.rs` for the established pattern).
 pub fn deregister_session(storage: &dyn StorageBackend, session_id: &str) {
     let key = session_marker_key(session_id);
     for attempt in 0..3 {
@@ -355,17 +437,17 @@ impl StopSignal {
 
     /// Block up to `timeout`. Returns true immediately if signalled.
     fn wait_timeout(&self, timeout: std::time::Duration) -> bool {
-        let guard = self.mutex.lock().unwrap();
+        let guard = self.mutex.lock().expect("StopSignal mutex not poisoned");
         let (guard, _) = self
             .condvar
             .wait_timeout_while(guard, timeout, |stopped| !*stopped)
-            .unwrap();
+            .expect("StopSignal condvar wait not poisoned");
         *guard
     }
 
     /// Wake the thread immediately.
     fn signal(&self) {
-        *self.mutex.lock().unwrap() = true;
+        *self.mutex.lock().expect("StopSignal mutex not poisoned") = true;
         self.condvar.notify_all();
     }
 }
@@ -433,30 +515,39 @@ impl Drop for SessionGuard {
 }
 
 /// Refresh a session marker's `last_refresh` timestamp. Best-effort.
+///
+/// Deliberately non-resurrecting: if the marker is missing (successfully
+/// read as `None`) we do **not** recreate it. Missing markers indicate the
+/// session has already been deregistered — either cleanly by
+/// [`deregister_session`] or by maintenance that reaped us as stale — and
+/// resurrecting the key would race with that deletion and could confuse
+/// maintenance into seeing a "live" session that no one owns.
+///
+/// On storage read errors we also bail out without writing, so an
+/// inconclusive `Err` read can't overwrite a live marker's fields with
+/// defaults.
 pub fn refresh_session(storage: &dyn StorageBackend, session_id: &str) {
     let key = session_marker_key(session_id);
     let now = Utc::now();
 
-    // Read existing entry to preserve registered_at, or create a fresh one.
-    let entry = match storage.get(&key) {
-        Ok(Some(data)) => {
-            let mut e: SessionEntry =
-                serde_json::from_slice(&data).unwrap_or_else(|_| SessionEntry {
-                    hostname: crate::platform::hostname(),
-                    pid: std::process::id(),
-                    registered_at: now.to_rfc3339(),
-                    last_refresh: now.to_rfc3339(),
-                });
-            e.last_refresh = now.to_rfc3339();
-            e
-        }
-        _ => SessionEntry {
-            hostname: crate::platform::hostname(),
-            pid: std::process::id(),
-            registered_at: now.to_rfc3339(),
-            last_refresh: now.to_rfc3339(),
+    let mut entry: SessionEntry = match storage.get(&key) {
+        Ok(Some(data)) => match serde_json::from_slice::<SessionEntry>(&data) {
+            Ok(e) => e,
+            Err(e) => {
+                warn!(session_id, error = %e, "session marker parse failed; skipping refresh");
+                return;
+            }
         },
+        Ok(None) => {
+            debug!(session_id, "session marker missing; not resurrecting");
+            return;
+        }
+        Err(e) => {
+            warn!(session_id, error = %e, "storage read failed during refresh; skipping");
+            return;
+        }
     };
+    entry.last_refresh = now.to_rfc3339();
 
     let data = match serde_json::to_vec(&entry) {
         Ok(d) => d,
@@ -518,17 +609,20 @@ pub fn cleanup_stale_sessions(
             continue;
         };
         let Ok(entry) = serde_json::from_slice::<SessionEntry>(&data) else {
-            // Unparseable .json — treat as stale. Keep .index for recovery.
-            let _ = storage.delete(key);
-            cleaned_ids.insert(session_id.to_string());
+            // Unparseable .json — we cannot prove this is stale. Preserve it
+            // so `with_maintenance_lock` reports it as a blocking session
+            // (fail-closed). Operator must use `break-lock --sessions` to
+            // force-clear. Also preserve the companion `.index` so its
+            // journal isn't lost.
+            surviving_markers.insert(session_id.to_string());
             continue;
         };
         let ts = chrono::DateTime::parse_from_rfc3339(&entry.last_refresh)
             .or_else(|_| chrono::DateTime::parse_from_rfc3339(&entry.registered_at));
         let Ok(ts) = ts else {
-            // Bad timestamp — treat as stale. Keep .index for recovery.
-            let _ = storage.delete(key);
-            cleaned_ids.insert(session_id.to_string());
+            // Bad timestamp — same treatment: fail-closed, let maintenance
+            // surface it and require operator intervention.
+            surviving_markers.insert(session_id.to_string());
             continue;
         };
 
@@ -537,7 +631,7 @@ pub fn cleanup_stale_sessions(
 
         if is_stale_by_age {
             debug!(session_id, age_hours = %((now - ts.with_timezone(&Utc)).num_hours()), "cleaning stale session");
-            let _ = storage.delete(key);
+            storage.delete(key)?;
             cleaned_ids.insert(session_id.to_string());
             cleaned.push(session_id.to_string());
         } else if is_dead_local {
@@ -546,7 +640,7 @@ pub fn cleanup_stale_sessions(
                 pid = entry.pid,
                 "cleaning session from dead local process"
             );
-            let _ = storage.delete(key);
+            storage.delete(key)?;
             cleaned_ids.insert(session_id.to_string());
             cleaned.push(session_id.to_string());
         } else {
@@ -564,7 +658,7 @@ pub fn cleanup_stale_sessions(
             .and_then(|s| s.strip_suffix(".index"))
         {
             if !surviving_markers.contains(id) && !cleaned_ids.contains(id) {
-                let _ = storage.delete(key);
+                storage.delete(key)?;
             }
         }
     }
@@ -611,6 +705,10 @@ pub fn clear_all_sessions(storage: &dyn StorageBackend) -> Result<usize> {
 
 /// Acquire a repo lock with retry and exponential backoff + jitter.
 /// Returns the lock guard on success, or the last error on failure.
+///
+/// Performs blocking `std::thread::sleep` between attempts. Callers running
+/// inside an async runtime must invoke this via `tokio::task::spawn_blocking`
+/// (see `commands/mount.rs` for the established pattern).
 pub fn acquire_lock_with_retry(
     storage: &dyn StorageBackend,
     max_attempts: usize,
@@ -640,10 +738,34 @@ pub fn acquire_lock_with_retry(
             Err(e) => return Err(e),
         }
     }
-    unreachable!()
+    // Loop only falls through when `max_attempts == 0`; every other path
+    // returns inside the match.
+    Err(VykarError::Other(
+        "acquire_lock_with_retry called with max_attempts == 0".to_string(),
+    ))
 }
 
 /// Default stale session threshold.
 pub fn default_stale_session_duration() -> Duration {
-    Duration::seconds(DEFAULT_STALE_SESSION_SECS)
+    Duration::seconds(SESSION_STALE_SECS)
+}
+
+/// Format the age between `now` and an RFC3339 `timestamp` as a compact
+/// human-readable string (e.g. `"2h"`, `"1d 3h"`, `"42m"`).
+///
+/// Returns `"unknown"` if the timestamp fails to parse.
+pub fn format_age(now: &chrono::DateTime<Utc>, timestamp: &str) -> String {
+    let Ok(ts) = chrono::DateTime::parse_from_rfc3339(timestamp) else {
+        return "unknown".to_string();
+    };
+    let dur = now.signed_duration_since(ts.with_timezone(&Utc));
+    let hours = dur.num_hours();
+    if hours >= 24 {
+        format!("{}d {}h", hours / 24, hours % 24)
+    } else if hours > 0 {
+        format!("{hours}h")
+    } else {
+        let mins = dur.num_minutes().max(0);
+        format!("{mins}m")
+    }
 }

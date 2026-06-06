@@ -136,7 +136,10 @@ impl Repository {
             debug!(?tiered, "tiered dedup mode: using mmap cache");
             // Drop the full index to reclaim memory.
             self.chunk_index = ChunkIndex::new();
-            let ws = self.write_session.as_mut().unwrap();
+            let ws = self
+                .write_session
+                .as_mut()
+                .expect("write session active while enabling tiered dedup");
             ws.tiered_dedup = Some(tiered);
             ws.index_delta = Some(IndexDelta::new());
         } else {
@@ -192,31 +195,29 @@ impl Repository {
         warn!("saving progress for next run\u{2026}");
 
         // Seal and flush any partial data/tree pack writers.
-        if self
-            .write_session
-            .as_ref()
-            .unwrap()
-            .data_pack_writer
-            .has_pending()
-        {
+        // Sample both has_pending() flags before flushing either writer:
+        // the data and tree pack writers are independent, so flushing one
+        // can't change the other's pending state. This avoids reborrowing
+        // `self.write_session` between the two if-checks.
+        let flush_data = ws.data_pack_writer.has_pending();
+        let flush_tree = ws.tree_pack_writer.has_pending();
+
+        if flush_data {
             if let Err(e) = self.flush_writer_async(PackType::Data) {
                 warn!("flush_on_abort: failed to seal data pack: {e}");
             }
         }
-        if self
-            .write_session
-            .as_ref()
-            .unwrap()
-            .tree_pack_writer
-            .has_pending()
-        {
+        if flush_tree {
             if let Err(e) = self.flush_writer_async(PackType::Tree) {
                 warn!("flush_on_abort: failed to seal tree pack: {e}");
             }
         }
 
         // Join all in-flight upload threads so packs land on storage.
-        let ws = self.write_session.as_mut().unwrap();
+        let ws = self
+            .write_session
+            .as_mut()
+            .expect("write session active while flushing abort state");
         for handle in ws.pending_uploads.drain(..) {
             match handle
                 .join()
@@ -231,7 +232,7 @@ impl Repository {
         // Write final pending_index so next run can recover.
         self.write_session
             .as_mut()
-            .unwrap()
+            .expect("write session active while writing abort journal")
             .write_pending_index_best_effort(&*self.storage, &*self.crypto);
 
         // Clear the session so Drop doesn't fire the debug_assert.
@@ -255,13 +256,41 @@ impl Repository {
         WriteSessionState::clear_pending_index(&*self.storage, session_id);
     }
 
-    // --- Dump checkpoint/rollback API ---
+    // --- Rollback checkpoint API ---
+    //
+    // Used by (a) streaming command dumps and (b) per-file backup chunk
+    // loops that must survive mid-read drift detection. Single-slot: the
+    // two callers never overlap (the backup serial consumer arms and
+    // commits before any dump runs, and vice versa).
 
-    /// Begin a dump checkpoint: flush any pending data pack, snapshot the
-    /// current `IndexDelta` state, and arm the rollback tracker so all
-    /// subsequent mutations can be undone if the dump command fails.
-    pub(crate) fn begin_dump_checkpoint(&mut self) -> Result<()> {
-        // Force-flush the data pack writer to isolate dump data.
+    /// Begin a rollback checkpoint: flush any pending data pack, snapshot
+    /// the current `IndexDelta` state, and arm the rollback tracker so all
+    /// subsequent mutations can be undone if the guarded scope fails.
+    ///
+    /// Requires an active dedup mode (tiered or plain). The backup pipeline
+    /// always enables one of these before any callsite, and the rollback
+    /// machinery only tracks mutations that flow through `index_delta`.
+    #[allow(
+        clippy::panic_in_result_fn,
+        reason = "asserts encode programmer invariants on internal state"
+    )]
+    pub(crate) fn begin_rollback_checkpoint(&mut self) -> Result<()> {
+        {
+            let ws = self
+                .write_session
+                .as_ref()
+                .expect("no active write session");
+            assert!(
+                ws.rollback_tracker.is_none(),
+                "begin_rollback_checkpoint called while another checkpoint is armed"
+            );
+            assert!(
+                ws.tiered_dedup.is_some() || ws.dedup_index.is_some(),
+                "begin_rollback_checkpoint requires an active dedup mode"
+            );
+        }
+
+        // Force-flush the data pack writer to isolate the scope's data.
         let has_pending = self
             .write_session
             .as_ref()
@@ -279,10 +308,10 @@ impl Repository {
         let delta_checkpoint = ws
             .index_delta
             .as_ref()
-            .map(|d| d.checkpoint())
-            .unwrap_or_else(crate::index::IndexDeltaCheckpoint::empty);
+            .expect("dedup mode implies index_delta is set")
+            .checkpoint();
         let data_pack_target_size = ws.data_pack_writer.target_size();
-        ws.dump_tracker = Some(write_session::DumpRollbackTracker {
+        ws.rollback_tracker = Some(write_session::RollbackTracker {
             delta_checkpoint,
             dedup_inserts: Vec::new(),
             promoted_recovered: Vec::new(),
@@ -292,73 +321,53 @@ impl Repository {
         Ok(())
     }
 
-    /// Commit a dump checkpoint: discard the rollback tracker (dump succeeded).
-    pub(crate) fn commit_dump_checkpoint(&mut self) {
+    /// Commit a rollback checkpoint: discard the tracker (scope succeeded).
+    pub(crate) fn commit_rollback_checkpoint(&mut self) {
         if let Some(ws) = self.write_session.as_mut() {
-            ws.dump_tracker = None;
+            ws.rollback_tracker = None;
         }
     }
 
-    /// Roll back a dump checkpoint: undo all index mutations that occurred
-    /// since `begin_dump_checkpoint()`. Packs already uploaded to storage
-    /// become orphans cleaned by compact.
-    pub(crate) fn rollback_dump_checkpoint(&mut self) {
-        // Destructure tracker outside the ws borrow scope so we can use
-        // dedup_inserts for chunk_index rollback in non-dedup mode.
-        let (tracker_fields, in_tiered, in_dedup) = {
-            let ws = self
-                .write_session
-                .as_mut()
-                .expect("no active write session");
-            let Some(tracker) = ws.dump_tracker.take() else {
-                return;
-            };
-            let in_tiered = ws.tiered_dedup.is_some();
-            let in_dedup = ws.dedup_index.is_some();
-
-            // 1. Rollback IndexDelta
-            if let Some(ref mut delta) = ws.index_delta {
-                delta.rollback(tracker.delta_checkpoint);
-            }
-
-            // 2. Remove dedup inserts from the active dedup structure
-            if in_tiered {
-                for chunk_id in &tracker.dedup_inserts {
-                    if let Some(ref mut tiered) = ws.tiered_dedup {
-                        tiered.remove(chunk_id);
-                    }
-                }
-            } else if in_dedup {
-                for chunk_id in &tracker.dedup_inserts {
-                    if let Some(ref mut dedup) = ws.dedup_index {
-                        dedup.remove(chunk_id);
-                    }
-                }
-            }
-
-            // 3. Re-insert promoted recovered chunks
-            for (chunk_id, entry) in tracker.promoted_recovered {
-                ws.recovered_chunks.insert(chunk_id, entry);
-            }
-
-            // 4. Remove tracked pack IDs from pending journal
-            for pack_id in &tracker.journal_pack_ids {
-                ws.pending_journal.remove_pack(pack_id);
-            }
-
-            // 5. Reset data pack writer (discards any partial pack buffer)
-            ws.data_pack_writer = PackWriter::new(PackType::Data, tracker.data_pack_target_size);
-
-            (tracker.dedup_inserts, in_tiered, in_dedup)
+    /// Roll back the active checkpoint: undo all index mutations that
+    /// occurred since `begin_rollback_checkpoint()`. Packs already uploaded
+    /// to storage become orphans cleaned by compact.
+    pub(crate) fn abort_rollback_checkpoint(&mut self) {
+        let ws = self
+            .write_session
+            .as_mut()
+            .expect("no active write session");
+        let Some(tracker) = ws.rollback_tracker.take() else {
+            return;
         };
 
-        // 6. Non-dedup mode: entries went directly into chunk_index.
-        //    Must happen after dropping the ws borrow above.
-        if !in_tiered && !in_dedup {
-            for chunk_id in &tracker_fields {
-                self.chunk_index.decrement(chunk_id);
+        // 1. Rollback IndexDelta (always Some when a checkpoint was armed).
+        if let Some(ref mut delta) = ws.index_delta {
+            delta.rollback(tracker.delta_checkpoint);
+        }
+
+        // 2. Remove dedup inserts from the active dedup structure.
+        if let Some(ref mut tiered) = ws.tiered_dedup {
+            for chunk_id in &tracker.dedup_inserts {
+                tiered.remove(chunk_id);
+            }
+        } else if let Some(ref mut dedup) = ws.dedup_index {
+            for chunk_id in &tracker.dedup_inserts {
+                dedup.remove(chunk_id);
             }
         }
+
+        // 3. Re-insert promoted recovered chunks.
+        for (chunk_id, entry) in tracker.promoted_recovered {
+            ws.recovered_chunks.insert(chunk_id, entry);
+        }
+
+        // 4. Remove tracked pack IDs from pending journal.
+        for pack_id in &tracker.journal_pack_ids {
+            ws.pending_journal.remove_pack(pack_id);
+        }
+
+        // 5. Reset data pack writer (discards any partial pack buffer).
+        ws.data_pack_writer = PackWriter::new(PackType::Data, tracker.data_pack_target_size);
     }
 
     /// Promote a recovered chunk into the active dedup structure and index delta.
@@ -385,5 +394,56 @@ impl Repository {
             .expect("no active write session")
             .data_pack_writer
             .target_size()
+    }
+
+    /// True if a rollback checkpoint is currently armed (for testing).
+    pub(crate) fn rollback_tracker_armed(&self) -> bool {
+        self.write_session
+            .as_ref()
+            .and_then(|ws| ws.rollback_tracker.as_ref())
+            .is_some()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::testutil::test_repo_plaintext;
+
+    #[test]
+    fn rollback_checkpoint_armed_and_committed_round_trips() {
+        let mut repo = test_repo_plaintext();
+        repo.enable_dedup_mode();
+        assert!(!repo.rollback_tracker_armed());
+        repo.begin_rollback_checkpoint().unwrap();
+        assert!(repo.rollback_tracker_armed());
+        repo.commit_rollback_checkpoint();
+        assert!(!repo.rollback_tracker_armed());
+    }
+
+    #[test]
+    fn rollback_checkpoint_rollback_clears_tracker() {
+        let mut repo = test_repo_plaintext();
+        repo.enable_dedup_mode();
+        repo.begin_rollback_checkpoint().unwrap();
+        repo.abort_rollback_checkpoint();
+        assert!(!repo.rollback_tracker_armed());
+    }
+
+    #[test]
+    #[should_panic(expected = "begin_rollback_checkpoint called while another checkpoint is armed")]
+    fn cannot_begin_overlapping_rollback_checkpoint() {
+        let mut repo = test_repo_plaintext();
+        repo.enable_dedup_mode();
+        repo.begin_rollback_checkpoint().unwrap();
+        // Second begin must panic via the overlap assertion.
+        let _ = repo.begin_rollback_checkpoint();
+    }
+
+    #[test]
+    #[should_panic(expected = "begin_rollback_checkpoint requires an active dedup mode")]
+    fn begin_rollback_checkpoint_without_dedup_mode_panics() {
+        let mut repo = test_repo_plaintext();
+        // No enable_dedup_mode call — must panic.
+        let _ = repo.begin_rollback_checkpoint();
     }
 }

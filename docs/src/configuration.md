@@ -181,9 +181,11 @@ repositories:
 
 | Field | Default | Values | Description |
 |-------|---------|--------|-------------|
-| `max_retries` | `3` | integer | Maximum retry attempts |
-| `retry_delay_ms` | `1000` | integer (ms) | Initial delay between retries |
+| `max_retries` | `5` | integer | Maximum retry attempts |
+| `retry_delay_ms` | `1500` | integer (ms) | Initial delay between retries |
 | `retry_max_delay_ms` | `60000` | integer (ms) | Maximum delay between retries |
+
+> **Note:** The default (5 retries, ~1 minute of cumulative backoff on average with jitter, up to ~90s worst case) is sized to absorb a brief network gap such as WiFi reconnecting after laptop sleep. Raise `max_retries` further if you run on a flaky link; set it to `0` to fail fast for CI or scripted runs.
 
 ### 3-2-1 backup strategy
 
@@ -239,6 +241,8 @@ sources:
 ```
 
 These directories are backed up together as one snapshot. You cannot use both `path` and `paths` on the same entry.
+
+Inside a multi-path source, each path's contents land in the snapshot under a prefix derived from its full absolute path: leading `/` stripped on Unix, drive-letter colon dropped and backslashes converted to forward slashes on Windows. For example, `/etc` lands at `etc/…`, `/var/lib/machines/base/etc` lands at `var/lib/machines/base/etc/…`, and `C:\Users\me\docs` lands at `C/Users/me/docs/…`. This lets paths with the same basename — `paths: ["/etc", "/var/lib/machines/base/etc"]` — coexist in one source without colliding.
 
 | Field | Default | Values | Description |
 |-------|---------|--------|-------------|

@@ -1,3 +1,6 @@
+// Test-only env mutation; SAFETY documented per block.
+#![allow(unsafe_code)]
+
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::Once;
@@ -21,9 +24,9 @@ pub fn init_test_environment() {
         let _ = std::fs::create_dir_all(&home);
         let _ = std::fs::create_dir_all(&cache);
 
-        // Rust 2024 marks env mutation as unsafe due process-global races.
-        // We do this once at test process startup to keep file-cache writes
-        // under a writable temp root in sandboxed environments.
+        // SAFETY: Rust 2024 marks env mutation as unsafe due to process-global
+        // races. This runs once via `Once::call_once` at test-process startup
+        // before any threads are spawned, so the race window is empty.
         unsafe {
             std::env::set_var("HOME", &home);
             std::env::set_var("XDG_CACHE_HOME", &cache);

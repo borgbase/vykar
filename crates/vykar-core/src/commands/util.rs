@@ -8,9 +8,37 @@ use std::sync::Arc;
 use crate::config::VykarConfig;
 use crate::limits;
 use crate::repo::lock;
+use crate::repo::lock::SessionEntry;
 use crate::repo::{identity, OpenOptions, Repository};
 use crate::storage;
-use vykar_types::error::{Result, VykarError};
+use vykar_types::error::{
+    ActiveSessionDetails, ActiveSessionInfo, ActiveSessionList, Result, VykarError,
+};
+
+/// Build an [`ActiveSessionList`] from raw `list_session_entries` output.
+///
+/// Parseable entries are rendered with host/pid/age; entries with `None`
+/// (malformed JSON) are passed through as `ActiveSessionInfo { details: None }`
+/// so [`ActiveSessionList::Display`] surfaces them to the operator instead
+/// of silently dropping them — the fail-closed policy required by
+/// [`with_maintenance_lock`].
+pub(crate) fn build_active_session_list(
+    entries: Vec<(String, Option<SessionEntry>)>,
+    now: &chrono::DateTime<chrono::Utc>,
+) -> ActiveSessionList {
+    let infos = entries
+        .into_iter()
+        .map(|(id, entry)| ActiveSessionInfo {
+            id,
+            details: entry.map(|e| ActiveSessionDetails {
+                hostname: e.hostname,
+                pid: e.pid,
+                age: lock::format_age(now, &e.last_refresh),
+            }),
+        })
+        .collect();
+    ActiveSessionList(infos)
+}
 
 /// Extract the cache_dir override from config as a PathBuf.
 pub(crate) fn cache_dir_from_config(config: &VykarConfig) -> Option<PathBuf> {
@@ -130,6 +158,23 @@ pub fn with_repo_lock<T>(
 
 /// Shared epilogue for lock-guarded operations: installs a lock fence, runs
 /// the action, performs best-effort cleanup on error, then releases the lock.
+///
+/// # Failure policy
+///
+/// - **Action errors are fatal.** Propagated to the caller as-is; any
+///   subsequent release failure is logged via `tracing::warn!` but does not
+///   replace the original error.
+/// - **Release errors after a successful action are warning-only.** The
+///   action has already committed to storage (e.g. the snapshot blob was
+///   written), so reporting a failure would misrepresent the outcome. A
+///   `tracing::warn!` fires referencing `vykar break-lock` and the 6-hour
+///   stale-lock TTL; the caller receives the action's `Ok` value.
+///
+/// There is no progress sink here, so the release warning is tracing-only —
+/// GUI consumers do not see it. Acceptable trade-off: leaked advisory locks
+/// self-heal in 6 hours and `vykar break-lock` is available for immediate
+/// recovery. Callers that do have a progress sink (backup's commit path)
+/// surface the same warning via `BackupProgressEvent::Warning` instead.
 fn run_under_fence<T>(
     repo: &mut Repository,
     guard: lock::LockGuard,
@@ -145,15 +190,22 @@ fn run_under_fence<T>(
     }
 
     repo.clear_lock_fence();
+    let lock_key = guard.key().to_string();
     match lock::release_lock(repo.storage.as_ref(), guard) {
         Ok(()) => result,
         Err(release_err) => {
             if result.is_err() {
                 tracing::warn!("failed to release repository lock: {release_err}");
-                result
             } else {
-                Err(release_err)
+                tracing::warn!(
+                    "operation completed successfully, but releasing the repository lock \
+                     failed: {release_err}. The advisory lock at `{lock_key}` may persist; \
+                     future operations on this repository may be blocked for up to 6 hours \
+                     until automatic stale-lock cleanup, or run `vykar break-lock` to clear \
+                     it manually."
+                );
             }
+            result
         }
     }
 }
@@ -174,9 +226,12 @@ pub fn with_open_repo_maintenance_lock<T>(
 
 /// Execute a maintenance operation while holding an advisory lock.
 ///
-/// Acquires the lock, cleans up stale sessions (>72h), then refuses to run
-/// if any non-stale sessions remain. This prevents maintenance from deleting
-/// packs that active backups depend on.
+/// Acquires the lock, cleans up stale sessions (>45 min since last refresh),
+/// then refuses to run if any non-stale sessions remain. This prevents
+/// maintenance from deleting packs that active backups depend on. Malformed
+/// markers (unparseable JSON or bad timestamps) are preserved and surfaced
+/// in the blocking list — maintenance will not proceed past them without
+/// operator intervention (`break-lock --sessions`).
 pub fn with_maintenance_lock<T>(
     repo: &mut Repository,
     action: impl FnOnce(&mut Repository) -> Result<T>,
@@ -202,16 +257,23 @@ pub fn with_maintenance_lock<T>(
             }
         }
         Err(e) => {
-            tracing::warn!("failed to clean up stale sessions: {e}");
+            let _ = lock::release_lock(repo.storage.as_ref(), guard);
+            return Err(VykarError::Other(format!(
+                "cannot clean up stale backup sessions (storage error: {e}); \
+                 refusing maintenance to avoid data loss"
+            )));
         }
     }
 
     // Check for active (non-stale) sessions. Fail-closed: if we can't
     // list sessions, refuse to run rather than risk deleting active packs.
-    match lock::list_sessions(repo.storage.as_ref()) {
-        Ok(sessions) if !sessions.is_empty() => {
+    // Malformed markers are surfaced in the blocking list via
+    // `build_active_session_list` — they are NOT silently filtered.
+    match lock::list_session_entries(repo.storage.as_ref()) {
+        Ok(entries) if !entries.is_empty() => {
+            let list = build_active_session_list(entries, &chrono::Utc::now());
             let _ = lock::release_lock(repo.storage.as_ref(), guard);
-            return Err(VykarError::ActiveSessions(sessions));
+            return Err(VykarError::ActiveSessions(list));
         }
         Err(e) => {
             let _ = lock::release_lock(repo.storage.as_ref(), guard);
@@ -225,4 +287,98 @@ pub fn with_maintenance_lock<T>(
 
     // Session checks passed — hand off to the shared fence/flush/release epilogue.
     run_under_fence(repo, guard, action)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(hostname: &str, pid: u32, last_refresh: &str) -> SessionEntry {
+        SessionEntry {
+            hostname: hostname.to_string(),
+            pid,
+            registered_at: last_refresh.to_string(),
+            last_refresh: last_refresh.to_string(),
+        }
+    }
+
+    #[test]
+    fn build_list_formats_parseable_entry() {
+        let now = chrono::Utc::now();
+        let fifteen_min_ago = (now - chrono::Duration::minutes(15)).to_rfc3339();
+        let entries = vec![(
+            "sess1".to_string(),
+            Some(entry("host-a", 7, &fifteen_min_ago)),
+        )];
+
+        let list = build_active_session_list(entries, &now);
+
+        assert_eq!(list.0.len(), 1);
+        let d = list.0[0].details.as_ref().expect("should be parseable");
+        assert_eq!(list.0[0].id, "sess1");
+        assert_eq!(d.hostname, "host-a");
+        assert_eq!(d.pid, 7);
+        assert!(!d.age.is_empty() && d.age != "unknown");
+        assert!(!list.has_malformed());
+    }
+
+    #[test]
+    fn build_list_preserves_malformed_entry() {
+        let now = chrono::Utc::now();
+        let entries = vec![("corrupt".to_string(), None)];
+
+        let list = build_active_session_list(entries, &now);
+
+        assert_eq!(list.0.len(), 1);
+        assert_eq!(list.0[0].id, "corrupt");
+        assert!(list.0[0].details.is_none(), "None must be preserved");
+        assert!(list.has_malformed());
+    }
+
+    #[test]
+    fn build_list_mixed_entries() {
+        let now = chrono::Utc::now();
+        let recent = (now - chrono::Duration::minutes(5)).to_rfc3339();
+        let entries = vec![
+            ("live".to_string(), Some(entry("host-b", 99, &recent))),
+            ("corrupt".to_string(), None),
+        ];
+
+        let list = build_active_session_list(entries, &now);
+
+        assert_eq!(list.0.len(), 2);
+        assert!(list.0[0].details.is_some());
+        assert!(list.0[1].details.is_none());
+        assert!(list.has_malformed());
+    }
+
+    #[test]
+    fn display_includes_remediation_hint() {
+        let now = chrono::Utc::now();
+        let recent = (now - chrono::Duration::minutes(5)).to_rfc3339();
+        let list =
+            build_active_session_list(vec![("s".to_string(), Some(entry("h", 1, &recent)))], &now);
+
+        let rendered = format!("{list}");
+        assert!(
+            rendered.contains("break-lock --sessions"),
+            "display must mention the remediation command, got: {rendered}"
+        );
+        assert!(rendered.contains("host=h"));
+        assert!(rendered.contains("pid=1"));
+    }
+
+    #[test]
+    fn display_malformed_entry_is_not_awkward() {
+        let now = chrono::Utc::now();
+        let list = build_active_session_list(vec![("corrupt".to_string(), None)], &now);
+
+        let rendered = format!("{list}");
+        // Must not produce phrases like "last refresh unknown (malformed marker) ago".
+        assert!(
+            !rendered.contains("last refresh"),
+            "malformed entries should use their own format, got: {rendered}"
+        );
+        assert!(rendered.contains("malformed marker"));
+    }
 }

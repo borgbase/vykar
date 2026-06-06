@@ -8,7 +8,9 @@ use vykar_storage::{parse_repo_url, ParsedUrl};
 
 use crate::cli::Commands;
 use crate::cmd;
+use crate::cmd::backup::BackupRunOpts;
 use crate::cmd::check::{format_check_progress, print_check_summary};
+use crate::error::{CliError, CliResult};
 use crate::format::{format_bytes, print_backup_stats};
 use crate::passphrase::with_repo_passphrase;
 
@@ -39,7 +41,7 @@ pub(crate) fn run_default_actions(
     shutdown: Option<&AtomicBool>,
     verbose: u8,
     source_filter: &[String],
-) -> Result<bool, Box<dyn std::error::Error>> {
+) -> CliResult<bool> {
     let start = std::time::Instant::now();
     let label = repo.label.as_deref();
 
@@ -86,6 +88,12 @@ pub(crate) fn run_default_actions(
                     // HookWarning: tracing::warn! already fired inside log_hook_errors.
                     // Events are for GUI consumers only.
                     CycleEvent::HookWarning { .. } => {}
+                    CycleEvent::StepWarning { step, message } => {
+                        // tracing::warn! already fired inside the step;
+                        // duplicate to stderr so CLI users see the warning
+                        // even without the tracing subscriber.
+                        eprintln!("warning: [{}] {message}", step.command_name());
+                    }
                 }
             },
         );
@@ -99,10 +107,10 @@ pub(crate) fn run_default_actions(
     })?;
 
     print_step_details(&result);
-    print_summary(&result.steps, start)?;
+    print_summary(&result.steps, start);
 
     if result.has_failures() {
-        Err("one or more steps failed".into())
+        Err(CliError::from("one or more steps failed"))
     } else {
         Ok(result.had_partial())
     }
@@ -172,10 +180,7 @@ fn print_step_details(result: &FullCycleResult) {
 }
 
 /// Prints the summary table.
-fn print_summary(
-    steps: &[(CycleStep, StepOutcome)],
-    start: std::time::Instant,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn print_summary(steps: &[(CycleStep, StepOutcome)], start: std::time::Instant) {
     let elapsed = start.elapsed();
 
     eprintln!();
@@ -200,8 +205,6 @@ fn print_summary(
     } else {
         eprintln!("  Duration:    {secs}s");
     }
-
-    Ok(())
 }
 
 /// Returns `Ok(had_partial)` — `true` if backup had soft errors but still succeeded.
@@ -210,7 +213,7 @@ pub(crate) fn dispatch_command(
     repo: &ResolvedRepo,
     shutdown: Option<&AtomicBool>,
     verbose: u8,
-) -> Result<bool, Box<dyn std::error::Error>> {
+) -> CliResult<bool> {
     let cfg = &repo.config;
     let label = repo.label.as_deref();
     let sources = &repo.sources;
@@ -227,14 +230,16 @@ pub(crate) fn dispatch_command(
             ..
         } => cmd::backup::run_backup(
             repo,
-            user_label.clone(),
-            compression.clone(),
-            connections.map(|v| v as usize),
-            threads.map(|v| v as usize),
-            paths.clone(),
-            source,
-            shutdown,
-            verbose,
+            BackupRunOpts {
+                user_label: user_label.clone(),
+                compression_override: compression.clone(),
+                connections: connections.map(usize::from),
+                threads: threads.map(usize::from),
+                paths: paths.clone(),
+                source_filter: source,
+                shutdown,
+                verbose,
+            },
         ),
         Commands::List { source, last, json, .. } => {
             cmd::list::run_list(cfg, label, source, json, *last).map(|()| false)
@@ -246,9 +251,17 @@ pub(crate) fn dispatch_command(
             snapshot,
             dest,
             pattern,
+            verify,
             ..
-        } => cmd::restore::run_restore(cfg, label, snapshot.clone(), dest.clone(), pattern.clone())
-            .map(|()| false),
+        } => cmd::restore::run_restore(
+            cfg,
+            label,
+            snapshot.clone(),
+            dest.clone(),
+            pattern.clone(),
+            *verify,
+        )
+        .map(|()| false),
         Commands::Delete {
             yes_delete_this_repo,
             ..
@@ -309,12 +322,12 @@ pub(crate) fn dispatch_command(
             cmd::compact::run_compact(cfg, label, t, max_repack_size.clone(), *dry_run, shutdown)
                 .map(|()| false)
         }
-        Commands::Config { .. } => {
-            Err("'config' command should be handled before config resolution".into())
-        }
-        Commands::Daemon => {
-            Err("'daemon' command should be handled before per-repo dispatch".into())
-        }
+        Commands::Config { .. } => Err(CliError::from(
+            "'config' command should be handled before config resolution",
+        )),
+        Commands::Daemon { .. } => Err(CliError::from(
+            "'daemon' command should be handled before per-repo dispatch",
+        )),
     }
 }
 

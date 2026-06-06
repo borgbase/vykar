@@ -1,3 +1,6 @@
+// libc::signal / Win32 SetConsoleCtrlHandler for cooperative shutdown; SAFETY per block.
+#![allow(unsafe_code)]
+
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Global shutdown flag. Set to `true` on first SIGINT/SIGTERM.
@@ -18,7 +21,10 @@ pub static TRIGGER: AtomicBool = AtomicBool::new(false);
 pub fn install_signal_handlers() {
     #[cfg(unix)]
     {
-        // Safety: signal handler only sets an atomic bool and restores default handler.
+        // SAFETY: each handler we install only stores an atomic bool (and the
+        // SIGINT/SIGTERM handler restores SIG_DFL via libc::signal). All
+        // operations are async-signal-safe per POSIX; no heap allocation,
+        // locks, or non-reentrant functions are reached.
         unsafe {
             libc::signal(
                 libc::SIGTERM,
@@ -41,6 +47,8 @@ pub fn install_signal_handlers() {
 
     #[cfg(windows)]
     {
+        // SAFETY: SetConsoleCtrlHandler accepts a static function pointer and
+        // an integer flag; no aliasing or lifetime concerns.
         unsafe {
             windows_sys::Win32::System::Console::SetConsoleCtrlHandler(
                 Some(windows_console_handler),
@@ -54,6 +62,8 @@ pub fn install_signal_handlers() {
 extern "C" fn unix_signal_handler(sig: libc::c_int) {
     SHUTDOWN.store(true, Ordering::SeqCst);
     // Restore default handler so a second signal kills immediately
+    // SAFETY: libc::signal with SIG_DFL is async-signal-safe and only
+    // mutates the per-process disposition for `sig`.
     unsafe {
         libc::signal(sig, libc::SIG_DFL);
     }

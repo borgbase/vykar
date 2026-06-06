@@ -1,3 +1,8 @@
+// File-level unsafe_code allow: this file makes libc syscalls (statvfs,
+// quotactl_fd, ioctl). Each `unsafe { }` block has a `// SAFETY:` comment
+// enforced by clippy::undocumented_unsafe_blocks.
+#![allow(unsafe_code)]
+
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering::Relaxed};
 use std::sync::Arc;
@@ -126,15 +131,26 @@ fn available_free_space(path: &Path) -> Option<u64> {
 
     let c_path = CString::new(path.as_os_str().as_bytes()).ok()?;
 
+    // SAFETY: `statvfs` is a C plain-old-data struct of integer fields; an
+    // all-zero bit pattern is a valid (if uninitialized) instance and statvfs
+    // overwrites it in full on success.
     let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
-    let ret = unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) };
+    // SAFETY: `c_path` is a valid NUL-terminated CString owned in this scope;
+    // `addr_of_mut!(stat)` is an exclusive, properly-aligned pointer to a
+    // statvfs the kernel will populate.
+    let ret = unsafe { libc::statvfs(c_path.as_ptr(), std::ptr::addr_of_mut!(stat)) };
     if ret != 0 {
         debug!("statvfs failed: {}", std::io::Error::last_os_error());
         return None;
     }
 
     // Casts needed for cross-platform: types vary between Linux and macOS.
-    #[allow(clippy::unnecessary_cast)]
+    #[allow(
+        clippy::cast_lossless,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::unnecessary_cast
+    )]
     let avail = (stat.f_bavail as u64).checked_mul(stat.f_frsize as u64)?;
     Some(avail.saturating_sub(FREE_SPACE_MARGIN))
 }
@@ -163,6 +179,7 @@ fn detect_fs_quota(data_dir: &Path) -> Option<u64> {
     let fd = file.as_raw_fd();
 
     // Try user quota for the running process
+    // SAFETY: getuid takes no arguments and is always sound; returns plain u32.
     let uid = unsafe { libc::getuid() };
     if let Some(limit) = xfs_get_quota_fd(fd, uid, USRQUOTA) {
         info!(uid, limit, "quota: detected user quota (process uid)");
@@ -251,13 +268,17 @@ fn xfs_get_quota_fd(fd: std::os::unix::io::RawFd, id: u32, quota_type: libc::c_i
     let cmd = qcmd(Q_XGETQUOTA, quota_type);
 
     let mut dq = FsDiskQuota::default();
+    // SAFETY: `fd` is a valid file descriptor from `file.as_raw_fd()` (file
+    // is alive in the calling scope); `&mut dq` is an exclusive, properly
+    // aligned pointer to a `FsDiskQuota` (a #[repr(C)] POD) that the kernel
+    // will populate. The other arguments are integers.
     let ret = unsafe {
         libc::syscall(
             SYS_QUOTACTL_FD,
             fd as libc::c_uint,
             cmd as libc::c_uint,
             id as libc::c_int,
-            &mut dq as *mut FsDiskQuota as *mut libc::c_void,
+            std::ptr::from_mut::<FsDiskQuota>(&mut dq).cast::<libc::c_void>(),
         )
     };
 
@@ -305,11 +326,15 @@ fn get_project_id(path: &Path) -> Option<u32> {
     let file = std::fs::File::open(path).ok()?;
     let mut attr = FsxAttr::default();
 
+    // SAFETY: `file.as_raw_fd()` is valid for the duration of the call
+    // (file outlives the ioctl); FS_IOC_FSGETXATTR writes through the
+    // exclusive `&mut attr` pointer into a #[repr(C)] POD with a known
+    // size matching the kernel's expectation.
     let ret = unsafe {
         libc::ioctl(
             file.as_raw_fd(),
             FS_IOC_FSGETXATTR,
-            &mut attr as *mut FsxAttr,
+            std::ptr::from_mut::<FsxAttr>(&mut attr),
         )
     };
 
@@ -330,6 +355,7 @@ fn format_bytes(bytes: u64) -> String {
     const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
     const MIB: f64 = 1024.0 * 1024.0;
 
+    #[allow(clippy::cast_precision_loss)]
     let b = bytes as f64;
     if b >= GIB {
         format!("{:.1} GiB", b / GIB)

@@ -61,7 +61,7 @@ fn pack_chunk_data(
     let estimate = compressed_size_bound(compression, data.len());
     pack_object_streaming_with_context(
         ObjectType::ChunkData,
-        &chunk_id.0,
+        chunk_id.as_bytes(),
         estimate,
         crypto,
         |buf| compress_append(compression, data, buf),
@@ -96,7 +96,7 @@ mod tests {
             let compressed = unpack_object_expect_with_context(
                 &packed,
                 ObjectType::ChunkData,
-                &chunk_id.0,
+                chunk_id.as_bytes(),
                 &engine,
             )
             .unwrap();
@@ -126,9 +126,13 @@ mod tests {
         for codec in codecs {
             let streaming = pack_chunk_data(&chunk_id, &payload, codec, &engine).unwrap();
             let compressed = compress(codec, &payload).unwrap();
-            let two_step =
-                pack_object_with_context(ObjectType::ChunkData, &chunk_id.0, &compressed, &engine)
-                    .unwrap();
+            let two_step = pack_object_with_context(
+                ObjectType::ChunkData,
+                chunk_id.as_bytes(),
+                &compressed,
+                &engine,
+            )
+            .unwrap();
             // With PlaintextEngine, output must be byte-identical
             assert_eq!(
                 streaming, two_step,
@@ -160,7 +164,7 @@ mod tests {
             let compressed = unpack_object_expect_with_context(
                 &packed,
                 ObjectType::ChunkData,
-                &chunk_id.0,
+                chunk_id.as_bytes(),
                 &engine,
             )
             .unwrap();

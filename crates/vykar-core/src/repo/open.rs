@@ -27,9 +27,11 @@ fn derive_plaintext_chunk_id_key(repo_id: &[u8]) -> [u8; 32] {
     use blake2::digest::{Update, VariableOutput};
     use blake2::Blake2bVar;
     let mut key = [0u8; 32];
-    let mut hasher = Blake2bVar::new(32).unwrap();
+    let mut hasher = Blake2bVar::new(32).expect("valid BLAKE2b output length");
     hasher.update(repo_id);
-    hasher.finalize_variable(&mut key).unwrap();
+    hasher
+        .finalize_variable(&mut key)
+        .expect("output buffer matches BLAKE2b length");
     key
 }
 
@@ -86,7 +88,7 @@ impl Repository {
                     (Arc::new(PlaintextEngine::new(&chunk_id_key)), None)
                 }
                 EncryptionMode::Aes256Gcm => {
-                    let master_key = MasterKey::generate();
+                    let master_key = MasterKey::generate()?;
                     let pass = passphrase.ok_or_else(|| {
                         VykarError::Config("passphrase required for encrypted repository".into())
                     })?;
@@ -98,7 +100,7 @@ impl Repository {
                     (Arc::new(engine), Some(enc_key))
                 }
                 EncryptionMode::Chacha20Poly1305 => {
-                    let master_key = MasterKey::generate();
+                    let master_key = MasterKey::generate()?;
                     let pass = passphrase.ok_or_else(|| {
                         VykarError::Config("passphrase required for encrypted repository".into())
                     })?;
@@ -267,10 +269,10 @@ impl Repository {
 
         // Read advisory index.gen sidecar (cache hint only, not trusted for writes).
         let index_generation = match storage.get("index.gen")? {
-            Some(data) if data.len() == 8 => {
-                u64::from_le_bytes(data[..8].try_into().unwrap_or([0u8; 8]))
-            }
-            _ => 0,
+            Some(data) => <[u8; 8]>::try_from(data.as_slice())
+                .map(u64::from_le_bytes)
+                .unwrap_or(0),
+            None => 0,
         };
 
         // Refresh snapshot list from snapshots/ (replaces manifest load).

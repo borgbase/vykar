@@ -83,7 +83,7 @@ proptest! {
 // ---------------------------------------------------------------------------
 
 fn arb_chunk_id() -> impl Strategy<Value = ChunkId> {
-    prop::array::uniform32(any::<u8>()).prop_map(ChunkId)
+    prop::array::uniform32(any::<u8>()).prop_map(ChunkId::from_bytes)
 }
 
 fn arb_chunk_ref() -> impl Strategy<Value = ChunkRef> {
@@ -254,7 +254,7 @@ proptest! {
 // ---------------------------------------------------------------------------
 
 fn arb_pack_id() -> impl Strategy<Value = PackId> {
-    prop::array::uniform32(any::<u8>()).prop_map(PackId)
+    prop::array::uniform32(any::<u8>()).prop_map(PackId::from_bytes)
 }
 
 proptest! {
@@ -262,7 +262,7 @@ proptest! {
     #[test]
     fn chunk_index_serde_roundtrip(
         entries in prop::collection::hash_map(
-            prop::array::uniform32(any::<u8>()).prop_map(ChunkId),
+            prop::array::uniform32(any::<u8>()).prop_map(ChunkId::from_bytes),
             (1..100u32, 1..16_777_216u32, arb_pack_id(), 0..u32::MAX as u64)
                 .prop_map(|(rc, ss, pid, po)| (rc, ChunkIndexEntry { refcount: 1, stored_size: ss, pack_id: pid, pack_offset: po })),
             0..200,
@@ -475,6 +475,7 @@ mod backup_restore {
                 restore_dir.to_str().unwrap(),
                 None,
                 config.xattrs.enabled,
+                false,
             )
             .unwrap();
 

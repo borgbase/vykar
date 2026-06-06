@@ -15,10 +15,10 @@ use tower_http::trace::TraceLayer;
 
 use crate::state::AppState;
 
-/// Body limit for pack uploads (PUT /{*path}).
+/// Body limit for pack uploads (`PUT /{*path}`).
 const MAX_OBJECT_BODY_BYTES: usize = 512 * 1024 * 1024; // 512 MiB
 /// Body limit for admin JSON requests (POST /?repack, verify-packs, etc.).
-/// Sized so the verify-packs byte-volume cap (MAX_VERIFY_BYTES) is always the
+/// Sized so the verify-packs byte-volume cap (`MAX_VERIFY_BYTES`) is always the
 /// binding constraint, even with very small chunk sizes (~4 KiB → ~24 MiB JSON).
 const MAX_ADMIN_BODY_BYTES: usize = 64 * 1024 * 1024; // 64 MiB
 

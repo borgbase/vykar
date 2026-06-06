@@ -1,3 +1,12 @@
+// memmap2::Mmap::map for read-only cache files; SAFETY documented per block.
+#![allow(unsafe_code)]
+// Wire-format reads against header-validated cache files. Every reader checks
+// `mmap.len() >= HEADER_SIZE` and validates `entry_count` matches the file
+// size before slicing into entries; out-of-bounds is therefore unreachable
+// for well-formed input. Corrupted input is filtered upstream by magic /
+// version / generation checks (callers fall back to a cache miss on `None`).
+#![allow(clippy::indexing_slicing)]
+
 use std::collections::HashMap;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -12,6 +21,14 @@ use crate::repo::file_cache::repo_cache_dir;
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::Result;
 use vykar_types::pack_id::PackId;
+
+fn read_u32_le(bytes: [u8; 4]) -> u32 {
+    u32::from_le_bytes(bytes)
+}
+
+fn read_u64_le(bytes: [u8; 8]) -> u64 {
+    u64::from_le_bytes(bytes)
+}
 
 /// Magic bytes at the start of the dedup cache file.
 // Wire-format constant — DO NOT rename (backward compatibility)
@@ -64,7 +81,7 @@ pub fn build_dedup_cache_to_path(index: &ChunkIndex, generation: u64, path: &Pat
         .iter()
         .map(|(id, entry)| (*id, entry.stored_size))
         .collect();
-    entries.sort_unstable_by_key(|a| a.0 .0);
+    entries.sort_unstable_by_key(|a| *a.0.as_bytes());
 
     let entry_count = entries.len() as u32;
 
@@ -83,7 +100,7 @@ pub fn build_dedup_cache_to_path(index: &ChunkIndex, generation: u64, path: &Pat
 
     // Entries
     for (chunk_id, stored_size) in &entries {
-        w.write_all(&chunk_id.0)?;
+        w.write_all(chunk_id.as_bytes())?;
         w.write_all(&stored_size.to_le_bytes())?;
     }
 
@@ -140,8 +157,12 @@ impl MmapDedupCache {
 
         let file = std::fs::File::open(path).ok()?;
 
-        // SAFETY: we only read the file, and the file is written atomically
-        // (temp + rename) so it's always in a consistent state.
+        // SAFETY: the cache file is treated as read-only — we only read from
+        // the mapping, never write through it. Concurrent modification by
+        // another process would only invalidate cache entries (a recoverable
+        // condition), not produce undefined behavior at the Rust level: we
+        // bound-check every slice access and treat decode failures as a cache
+        // miss.
         let mmap = unsafe { Mmap::map(&file) }.ok()?;
 
         if mmap.len() < HEADER_SIZE {
@@ -155,15 +176,16 @@ impl MmapDedupCache {
             return None;
         }
 
-        // Validate version
-        let version = u32::from_le_bytes(mmap[8..12].try_into().unwrap());
+        // Validate version. HEADER_SIZE check above guarantees these slices.
+        let version = read_u32_le(mmap[8..12].try_into().expect("4-byte slice from header"));
         if version != VERSION {
             debug!(version, "dedup cache: unsupported version");
             return None;
         }
 
         // Validate generation
-        let index_generation = u64::from_le_bytes(mmap[12..20].try_into().unwrap());
+        let index_generation =
+            read_u64_le(mmap[12..20].try_into().expect("8-byte slice from header"));
         if index_generation != expected_generation {
             debug!(
                 cache_gen = index_generation,
@@ -173,7 +195,7 @@ impl MmapDedupCache {
             return None;
         }
 
-        let entry_count = u32::from_le_bytes(mmap[20..24].try_into().unwrap());
+        let entry_count = read_u32_le(mmap[20..24].try_into().expect("4-byte slice from header"));
 
         // Validate file size
         let expected_size = HEADER_SIZE + (entry_count as usize) * ENTRY_SIZE;
@@ -205,7 +227,7 @@ impl MmapDedupCache {
             return None;
         }
 
-        let target = &chunk_id.0;
+        let target = chunk_id.as_bytes();
         let data = &self.mmap[HEADER_SIZE..];
 
         let mut lo: usize = 0;
@@ -219,8 +241,11 @@ impl MmapDedupCache {
             match entry_id.cmp(target.as_slice()) {
                 std::cmp::Ordering::Equal => {
                     let size_offset = offset + 32;
-                    let stored_size =
-                        u32::from_le_bytes(data[size_offset..size_offset + 4].try_into().unwrap());
+                    let stored_size = read_u32_le(
+                        data[size_offset..size_offset + 4]
+                            .try_into()
+                            .expect("4-byte slice within validated entry"),
+                    );
                     return Some(stored_size);
                 }
                 std::cmp::Ordering::Less => lo = mid + 1,
@@ -246,7 +271,11 @@ impl MmapDedupCache {
         let data = &self.mmap[HEADER_SIZE..];
         (0..self.entry_count as usize).map(move |i| {
             let offset = i * ENTRY_SIZE;
-            u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap())
+            read_u64_le(
+                data[offset..offset + 8]
+                    .try_into()
+                    .expect("8-byte slice within validated entry"),
+            )
         })
     }
 }
@@ -258,7 +287,7 @@ impl MmapDedupCache {
 /// Extract the first 8 bytes of a ChunkId as a little-endian u64.
 /// BLAKE2b output has excellent entropy, so this is a high-quality hash key.
 pub(crate) fn chunk_id_to_u64(id: &ChunkId) -> u64 {
-    u64::from_le_bytes(id.0[..8].try_into().unwrap())
+    read_u64_le(id.as_bytes()[..8].try_into().expect("ChunkId is 32 bytes"))
 }
 
 /// Build an Xor8 filter from pre-computed u64 keys.
@@ -432,7 +461,7 @@ pub fn build_restore_cache_to_path(index: &ChunkIndex, generation: u64, path: &P
         .iter()
         .map(|(id, entry)| (*id, entry.stored_size, entry.pack_id, entry.pack_offset))
         .collect();
-    entries.sort_unstable_by_key(|a| a.0 .0);
+    entries.sort_unstable_by_key(|a| *a.0.as_bytes());
 
     let entry_count = entries.len() as u32;
 
@@ -449,9 +478,9 @@ pub fn build_restore_cache_to_path(index: &ChunkIndex, generation: u64, path: &P
 
     // Entries
     for (chunk_id, stored_size, pack_id, pack_offset) in &entries {
-        w.write_all(&chunk_id.0)?;
+        w.write_all(chunk_id.as_bytes())?;
         w.write_all(&stored_size.to_le_bytes())?;
-        w.write_all(&pack_id.0)?;
+        w.write_all(pack_id.as_bytes())?;
         w.write_all(&pack_offset.to_le_bytes())?;
     }
 
@@ -500,7 +529,10 @@ impl MmapRestoreCache {
 
         let file = std::fs::File::open(path).ok()?;
 
-        // SAFETY: we only read the file, and the file is written atomically.
+        // SAFETY: read-only map of an atomically-written cache file (temp +
+        // rename). Concurrent modification by another process can only
+        // invalidate cache entries; all reads are bound-checked and decode
+        // failures fall back to a cache miss.
         let mmap = unsafe { Mmap::map(&file) }.ok()?;
 
         if mmap.len() < RESTORE_HEADER_SIZE {
@@ -513,13 +545,14 @@ impl MmapRestoreCache {
             return None;
         }
 
-        let version = u32::from_le_bytes(mmap[8..12].try_into().unwrap());
+        let version = read_u32_le(mmap[8..12].try_into().expect("4-byte slice from header"));
         if version != RESTORE_VERSION {
             debug!(version, "restore cache: unsupported version");
             return None;
         }
 
-        let index_generation = u64::from_le_bytes(mmap[12..20].try_into().unwrap());
+        let index_generation =
+            read_u64_le(mmap[12..20].try_into().expect("8-byte slice from header"));
         if index_generation != expected_generation {
             debug!(
                 cache_gen = index_generation,
@@ -529,7 +562,7 @@ impl MmapRestoreCache {
             return None;
         }
 
-        let entry_count = u32::from_le_bytes(mmap[20..24].try_into().unwrap());
+        let entry_count = read_u32_le(mmap[20..24].try_into().expect("4-byte slice from header"));
 
         let expected_size = RESTORE_HEADER_SIZE + (entry_count as usize) * RESTORE_ENTRY_SIZE;
         if mmap.len() != expected_size {
@@ -557,7 +590,7 @@ impl MmapRestoreCache {
             return None;
         }
 
-        let target = &chunk_id.0;
+        let target = chunk_id.as_bytes();
         let data = &self.mmap[RESTORE_HEADER_SIZE..];
 
         let mut lo: usize = 0;
@@ -570,13 +603,19 @@ impl MmapRestoreCache {
 
             match entry_id.cmp(target.as_slice()) {
                 std::cmp::Ordering::Equal => {
-                    let stored_size =
-                        u32::from_le_bytes(data[offset + 32..offset + 36].try_into().unwrap());
+                    let stored_size = read_u32_le(
+                        data[offset + 32..offset + 36]
+                            .try_into()
+                            .expect("4-byte slice within validated entry"),
+                    );
                     let mut pack_bytes = [0u8; 32];
                     pack_bytes.copy_from_slice(&data[offset + 36..offset + 68]);
-                    let pack_id = PackId(pack_bytes);
-                    let pack_offset =
-                        u64::from_le_bytes(data[offset + 68..offset + 76].try_into().unwrap());
+                    let pack_id = PackId::from_bytes(pack_bytes);
+                    let pack_offset = read_u64_le(
+                        data[offset + 68..offset + 76]
+                            .try_into()
+                            .expect("8-byte slice within validated entry"),
+                    );
                     return Some((pack_id, pack_offset, stored_size));
                 }
                 std::cmp::Ordering::Less => lo = mid + 1,
@@ -653,6 +692,9 @@ impl MmapFullIndexCache {
         }
 
         let file = std::fs::File::open(path).ok()?;
+        // SAFETY: read-only map of an atomically-written cache file. See
+        // the dedup-cache `open_path` SAFETY comment for the full argument;
+        // the same invariants hold here (bounded reads, miss on corruption).
         let mmap = unsafe { Mmap::map(&file) }.ok()?;
 
         if mmap.len() < FULL_HEADER_SIZE {
@@ -665,13 +707,14 @@ impl MmapFullIndexCache {
             return None;
         }
 
-        let version = u32::from_le_bytes(mmap[8..12].try_into().unwrap());
+        let version = read_u32_le(mmap[8..12].try_into().expect("4-byte slice from header"));
         if version != FULL_VERSION {
             debug!(version, "full index cache: unsupported version");
             return None;
         }
 
-        let index_generation = u64::from_le_bytes(mmap[12..20].try_into().unwrap());
+        let index_generation =
+            read_u64_le(mmap[12..20].try_into().expect("8-byte slice from header"));
         if index_generation != expected_generation {
             debug!(
                 cache_gen = index_generation,
@@ -681,7 +724,7 @@ impl MmapFullIndexCache {
             return None;
         }
 
-        let entry_count = u32::from_le_bytes(mmap[20..24].try_into().unwrap());
+        let entry_count = read_u32_le(mmap[20..24].try_into().expect("4-byte slice from header"));
 
         let expected_size = FULL_HEADER_SIZE + (entry_count as usize) * FULL_ENTRY_SIZE;
         if mmap.len() != expected_size {
@@ -713,16 +756,28 @@ impl MmapFullIndexCache {
         let offset = i * FULL_ENTRY_SIZE;
         let mut chunk_bytes = [0u8; 32];
         chunk_bytes.copy_from_slice(&data[offset..offset + 32]);
-        let refcount = u32::from_le_bytes(data[offset + 32..offset + 36].try_into().unwrap());
-        let stored_size = u32::from_le_bytes(data[offset + 36..offset + 40].try_into().unwrap());
+        let refcount = read_u32_le(
+            data[offset + 32..offset + 36]
+                .try_into()
+                .expect("4-byte slice within validated entry"),
+        );
+        let stored_size = read_u32_le(
+            data[offset + 36..offset + 40]
+                .try_into()
+                .expect("4-byte slice within validated entry"),
+        );
         let mut pack_bytes = [0u8; 32];
         pack_bytes.copy_from_slice(&data[offset + 40..offset + 72]);
-        let pack_offset = u64::from_le_bytes(data[offset + 72..offset + 80].try_into().unwrap());
+        let pack_offset = read_u64_le(
+            data[offset + 72..offset + 80]
+                .try_into()
+                .expect("8-byte slice within validated entry"),
+        );
         FullCacheEntry {
-            chunk_id: ChunkId(chunk_bytes),
+            chunk_id: ChunkId::from_bytes(chunk_bytes),
             refcount,
             stored_size,
-            pack_id: PackId(pack_bytes),
+            pack_id: PackId::from_bytes(pack_bytes),
             pack_offset,
         }
     }
@@ -741,10 +796,10 @@ impl MmapFullIndexCache {
 
 /// Write a single full cache entry to a writer.
 fn write_full_entry(w: &mut BufWriter<std::fs::File>, entry: &FullCacheEntry) -> Result<()> {
-    w.write_all(&entry.chunk_id.0)?;
+    w.write_all(entry.chunk_id.as_bytes())?;
     w.write_all(&entry.refcount.to_le_bytes())?;
     w.write_all(&entry.stored_size.to_le_bytes())?;
-    w.write_all(&entry.pack_id.0)?;
+    w.write_all(entry.pack_id.as_bytes())?;
     w.write_all(&entry.pack_offset.to_le_bytes())?;
     Ok(())
 }
@@ -796,7 +851,7 @@ pub fn build_full_index_cache_to_path(
             pack_offset: e.pack_offset,
         })
         .collect();
-    entries.sort_unstable_by_key(|a| a.chunk_id.0);
+    entries.sort_unstable_by_key(|a| *a.chunk_id.as_bytes());
 
     let entry_count = entries.len() as u32;
     let tmp_path = path.with_extension("tmp");
@@ -831,7 +886,7 @@ pub fn merge_full_index_cache(
 ) -> Result<()> {
     // Sort new entries by ChunkId for merge
     let mut sorted_new: Vec<&crate::index::NewChunkEntry> = delta.new_entries.iter().collect();
-    sorted_new.sort_unstable_by_key(|a| a.chunk_id.0);
+    sorted_new.sort_unstable_by_key(|a| *a.chunk_id.as_bytes());
 
     // Count total entries: old + new (new entries should not overlap with old)
     let total_count = old_cache.entry_count() + sorted_new.len() as u32;
@@ -853,7 +908,8 @@ pub fn merge_full_index_cache(
         } else if new_idx >= sorted_new.len() {
             true
         } else {
-            old_cache.chunk_id_bytes_at(old_idx) <= sorted_new[new_idx].chunk_id.0.as_slice()
+            old_cache.chunk_id_bytes_at(old_idx)
+                <= sorted_new[new_idx].chunk_id.as_bytes().as_slice()
         };
 
         if take_old {
@@ -1095,7 +1151,7 @@ pub fn build_dedup_cache_from_full_cache(
 
     // Stream entries: ChunkId(32) + stored_size(4)
     for entry in cache.iter() {
-        w.write_all(&entry.chunk_id.0)?;
+        w.write_all(entry.chunk_id.as_bytes())?;
         w.write_all(&entry.stored_size.to_le_bytes())?;
     }
 
@@ -1143,9 +1199,9 @@ pub fn build_restore_cache_from_full_cache(
 
     // Stream entries: ChunkId(32) + stored_size(4) + PackId(32) + pack_offset(8)
     for entry in cache.iter() {
-        w.write_all(&entry.chunk_id.0)?;
+        w.write_all(entry.chunk_id.as_bytes())?;
         w.write_all(&entry.stored_size.to_le_bytes())?;
-        w.write_all(&entry.pack_id.0)?;
+        w.write_all(entry.pack_id.as_bytes())?;
         w.write_all(&entry.pack_offset.to_le_bytes())?;
     }
 
@@ -1203,13 +1259,13 @@ pub fn read_index_blob_cache(
         return None;
     }
 
-    let version = u32::from_le_bytes(data[8..12].try_into().unwrap());
+    let version = read_u32_le(data[8..12].try_into().expect("4-byte slice from header"));
     if version != INDEX_BLOB_VERSION {
         debug!(version, "index blob cache: unsupported version");
         return None;
     }
 
-    let generation = u64::from_le_bytes(data[12..20].try_into().unwrap());
+    let generation = read_u64_le(data[12..20].try_into().expect("8-byte slice from header"));
     if generation != expected_generation {
         debug!(
             cache_gen = generation,
@@ -1277,8 +1333,9 @@ mod tests {
 
     #[test]
     fn chunk_id_to_u64_extracts_first_8_bytes() {
-        let mut id = ChunkId([0u8; 32]);
-        id.0[0..8].copy_from_slice(&42u64.to_le_bytes());
+        let mut bytes = [0u8; 32];
+        bytes[0..8].copy_from_slice(&42u64.to_le_bytes());
+        let id = ChunkId::from_bytes(bytes);
         assert_eq!(chunk_id_to_u64(&id), 42);
     }
 
@@ -1298,13 +1355,13 @@ mod tests {
         let path = dir.path().join("dedup_cache");
 
         let mut index = ChunkIndex::new();
-        let pack_id = vykar_types::pack_id::PackId([0x01; 32]);
+        let pack_id = vykar_types::pack_id::PackId::from_bytes([0x01; 32]);
 
         // Insert some test entries
         for i in 0u8..10 {
             let mut id_bytes = [0u8; 32];
             id_bytes[0] = i;
-            let chunk_id = ChunkId(id_bytes);
+            let chunk_id = ChunkId::from_bytes(id_bytes);
             index.add(chunk_id, 100 + i as u32, pack_id, i as u64 * 100);
         }
 
@@ -1322,12 +1379,12 @@ mod tests {
         for i in 0u8..10 {
             let mut id_bytes = [0u8; 32];
             id_bytes[0] = i;
-            let chunk_id = ChunkId(id_bytes);
+            let chunk_id = ChunkId::from_bytes(id_bytes);
             assert_eq!(cache.get_stored_size(&chunk_id), Some(100 + i as u32));
         }
 
         // Look up a non-existent entry
-        let missing = ChunkId([0xEE; 32]);
+        let missing = ChunkId::from_bytes([0xEE; 32]);
         assert_eq!(cache.get_stored_size(&missing), None);
     }
 
@@ -1363,8 +1420,8 @@ mod tests {
         let path = dir.path().join("dedup_cache");
 
         let mut index = ChunkIndex::new();
-        let pack_id = vykar_types::pack_id::PackId([0x01; 32]);
-        let chunk_id = ChunkId([0xAA; 32]);
+        let pack_id = vykar_types::pack_id::PackId::from_bytes([0x01; 32]);
+        let chunk_id = ChunkId::from_bytes([0xAA; 32]);
         index.add(chunk_id, 100, pack_id, 0);
 
         let generation = 42u64;
@@ -1400,13 +1457,13 @@ mod tests {
         let path = dir.path().join("restore_cache");
 
         let mut index = ChunkIndex::new();
-        let pack_a = PackId([0x01; 32]);
-        let pack_b = PackId([0x02; 32]);
+        let pack_a = PackId::from_bytes([0x01; 32]);
+        let pack_b = PackId::from_bytes([0x02; 32]);
 
         for i in 0u8..10 {
             let mut id_bytes = [0u8; 32];
             id_bytes[0] = i;
-            let chunk_id = ChunkId(id_bytes);
+            let chunk_id = ChunkId::from_bytes(id_bytes);
             let pack = if i < 5 { pack_a } else { pack_b };
             index.add(chunk_id, 100 + i as u32, pack, i as u64 * 1000);
         }
@@ -1421,7 +1478,7 @@ mod tests {
         for i in 0u8..10 {
             let mut id_bytes = [0u8; 32];
             id_bytes[0] = i;
-            let chunk_id = ChunkId(id_bytes);
+            let chunk_id = ChunkId::from_bytes(id_bytes);
             let result = cache.lookup(&chunk_id);
             assert!(result.is_some(), "chunk {i} not found in restore cache");
             let (pack_id, pack_offset, stored_size) = result.unwrap();
@@ -1432,7 +1489,7 @@ mod tests {
         }
 
         // Non-existent entry
-        let missing = ChunkId([0xFF; 32]);
+        let missing = ChunkId::from_bytes([0xFF; 32]);
         assert!(cache.lookup(&missing).is_none());
     }
 
@@ -1460,11 +1517,11 @@ mod tests {
     /// Helper: build a test ChunkIndex with the given number of entries.
     fn make_test_index(count: u8) -> ChunkIndex {
         let mut index = ChunkIndex::new();
-        let pack_id = PackId([0x01; 32]);
+        let pack_id = PackId::from_bytes([0x01; 32]);
         for i in 0..count {
             let mut id_bytes = [0u8; 32];
             id_bytes[0] = i;
-            let chunk_id = ChunkId(id_bytes);
+            let chunk_id = ChunkId::from_bytes(id_bytes);
             index.add(chunk_id, 100 + i as u32, pack_id, i as u64 * 100);
         }
         index
@@ -1517,25 +1574,25 @@ mod tests {
 
         // Create a delta with new entries and refcount bumps
         let mut delta = IndexDelta::new();
-        let pack_id = PackId([0x02; 32]);
+        let pack_id = PackId::from_bytes([0x02; 32]);
 
         // Add 3 new entries
         for i in 10u8..13 {
             let mut id_bytes = [0u8; 32];
             id_bytes[0] = i;
-            let chunk_id = ChunkId(id_bytes);
+            let chunk_id = ChunkId::from_bytes(id_bytes);
             delta.add_new_entry(chunk_id, 200 + i as u32, pack_id, i as u64 * 200, 1);
         }
 
         // Bump an existing entry (chunk 0)
-        let existing_id = ChunkId([0u8; 32]);
+        let existing_id = ChunkId::from_bytes([0u8; 32]);
         delta.bump_refcount(&existing_id);
         delta.bump_refcount(&existing_id);
 
         // Bump a session-new entry (chunk 10)
         let mut new_id_bytes = [0u8; 32];
         new_id_bytes[0] = 10;
-        let new_id = ChunkId(new_id_bytes);
+        let new_id = ChunkId::from_bytes(new_id_bytes);
         delta.bump_refcount(&new_id);
 
         // Merge
@@ -1658,7 +1715,7 @@ mod tests {
         w.write_all(&entry_count.to_le_bytes()).unwrap();
         w.write_all(&0u32.to_le_bytes()).unwrap();
         for entry in cache.iter() {
-            w.write_all(&entry.chunk_id.0).unwrap();
+            w.write_all(entry.chunk_id.as_bytes()).unwrap();
             w.write_all(&entry.stored_size.to_le_bytes()).unwrap();
         }
         w.flush().unwrap();
@@ -1673,7 +1730,7 @@ mod tests {
         for i in 0u8..10 {
             let mut id_bytes = [0u8; 32];
             id_bytes[0] = i;
-            let chunk_id = ChunkId(id_bytes);
+            let chunk_id = ChunkId::from_bytes(id_bytes);
             assert_eq!(
                 cache1.get_stored_size(&chunk_id),
                 cache2.get_stored_size(&chunk_id)
@@ -1707,9 +1764,9 @@ mod tests {
         w.write_all(&entry_count.to_le_bytes()).unwrap();
         w.write_all(&0u32.to_le_bytes()).unwrap();
         for entry in cache.iter() {
-            w.write_all(&entry.chunk_id.0).unwrap();
+            w.write_all(entry.chunk_id.as_bytes()).unwrap();
             w.write_all(&entry.stored_size.to_le_bytes()).unwrap();
-            w.write_all(&entry.pack_id.0).unwrap();
+            w.write_all(entry.pack_id.as_bytes()).unwrap();
             w.write_all(&entry.pack_offset.to_le_bytes()).unwrap();
         }
         w.flush().unwrap();
@@ -1724,7 +1781,7 @@ mod tests {
         for i in 0u8..10 {
             let mut id_bytes = [0u8; 32];
             id_bytes[0] = i;
-            let chunk_id = ChunkId(id_bytes);
+            let chunk_id = ChunkId::from_bytes(id_bytes);
             assert_eq!(cache1.lookup(&chunk_id), cache2.lookup(&chunk_id));
         }
     }
@@ -1791,16 +1848,21 @@ mod tests {
 
         // Build a ChunkIndex with a few entries (including multi-refcount).
         let mut index = ChunkIndex::new();
-        let pack = PackId([0x01; 32]);
+        let pack = PackId::from_bytes([0x01; 32]);
         for i in 0u8..5 {
             let mut id = [0u8; 32];
             id[0] = i;
-            index.add(ChunkId(id), 100 + i as u32, pack, i as u64 * 100);
+            index.add(
+                ChunkId::from_bytes(id),
+                100 + i as u32,
+                pack,
+                i as u64 * 100,
+            );
         }
         // Bump one entry's refcount
         let mut bump_id = [0u8; 32];
         bump_id[0] = 2;
-        index.increment_refcount(&ChunkId(bump_id));
+        index.increment_refcount(&ChunkId::from_bytes(bump_id));
 
         let generation = 7777u64;
 
@@ -1826,7 +1888,13 @@ mod tests {
         // Verify round-trip correctness
         assert_eq!(blob.generation, generation);
         assert_eq!(blob.chunks.len(), 5);
-        assert_eq!(blob.chunks.get(&ChunkId(bump_id)).unwrap().refcount, 2);
+        assert_eq!(
+            blob.chunks
+                .get(&ChunkId::from_bytes(bump_id))
+                .unwrap()
+                .refcount,
+            2
+        );
 
         // Verify compact positional encoding: the outer IndexBlob must be
         // serialized as a FixArray (marker 0x92 = 2-element array), not a

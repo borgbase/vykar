@@ -16,6 +16,50 @@ schedule:
   jitter_seconds: 0
 ```
 
+## Read-only status page
+
+The daemon can serve a small read-only HTML page that mirrors the GUI overview — repository list, recent snapshots, sources, last cycle outcome, next scheduled run. It is **disabled by default**; opt in with `--http-listen` (or the `VYKAR_HTTP_LISTEN` environment variable):
+
+```bash
+vykar daemon --http-listen 127.0.0.1:7575
+```
+
+The flag takes a full `host:port` address. There is no implicit default — passing the flag without a value is an error. Port `7575` is the recommended convention but is not assumed.
+
+What the page shows:
+- Process info: hostname, pid, version, uptime, next scheduled run
+- Schedule summary (interval / cron expression / `Off`)
+- Per-repository snapshot count, last snapshot time, total stored size
+- The 10 most recent snapshots across all repositories
+- Configured sources and their target repositories
+- Last cycle: started/finished timestamps, duration, outcome (`ok` / `partial` / `errors`)
+
+The page auto-refreshes every 30 seconds via a `<meta http-equiv="refresh">` tag — no JavaScript, no external assets, no cache. Data is refreshed at process startup, after every backup cycle, and after a SIGHUP reload.
+
+Endpoints:
+- `GET /` — HTML overview
+- `GET /healthz` — `200 OK` plain text, suitable for Docker / Kubernetes liveness probes
+- `GET /api/status.json` — same data as `/`, JSON-serialized
+
+There are no write actions: no "Run Backup" button, no config edits, no authentication. The page is purely an inspection surface.
+
+### Bind safety
+
+Non-loopback bind addresses (anything outside `127.0.0.0/8` and `::1`, including `0.0.0.0` and `::`) are **rejected at startup** unless you also pass `--http-allow-public` (or set `VYKAR_HTTP_ALLOW_PUBLIC=1`):
+
+```bash
+vykar daemon --http-listen 0.0.0.0:7575 --http-allow-public
+```
+
+The page exposes repository names, URLs, snapshot identifiers, and source paths — information that is sensitive on most deployments. The two-flag rule prevents accidentally exposing this on a public interface. If you need to expose it beyond the host, terminate TLS and add authentication in a reverse proxy (nginx, Caddy, Traefik) — vykar speaks plain HTTP only.
+
+```
++----------------+   loopback   +------------+   public TLS   +------+
+| vykar daemon   | <----------- | reverse    | <------------- | user |
+| 127.0.0.1:7575 |              | proxy      |                +------+
++----------------+              +------------+
+```
+
 ## Config reload via SIGHUP
 
 Send `SIGHUP` to the daemon process to reload the configuration file without restarting:
@@ -103,7 +147,35 @@ journalctl -u vykar -f
 
 ### Docker
 
-The default Docker entrypoint runs `vykar daemon`. See [Installing — Docker](install.md#docker) for container setup, volume mounts, and Docker Compose examples. To reload configuration in a running container:
+The default Docker entrypoint runs `vykar daemon`. See [Installing — Docker](install.md#docker) for container setup, volume mounts, and Docker Compose examples.
+
+To enable the read-only status page in Docker, set `VYKAR_HTTP_LISTEN` (and `VYKAR_HTTP_ALLOW_PUBLIC=1` if binding to `0.0.0.0`) and publish port 7575 — the entrypoint and CMD do not need to change:
+
+```bash
+docker run -d --name vykar-daemon \
+  -p 7575:7575 \
+  -e VYKAR_HTTP_LISTEN=0.0.0.0:7575 \
+  -e VYKAR_HTTP_ALLOW_PUBLIC=1 \
+  -v /etc/vykar:/etc/vykar:ro \
+  vykar
+```
+
+Compose equivalent:
+
+```yaml
+services:
+  vykar:
+    image: vykar
+    environment:
+      VYKAR_HTTP_LISTEN: "0.0.0.0:7575"
+      VYKAR_HTTP_ALLOW_PUBLIC: "1"
+    ports:
+      - "7575:7575"
+    volumes:
+      - /etc/vykar:/etc/vykar:ro
+```
+
+To reload configuration in a running container:
 
 ```bash
 docker kill --signal=HUP vykar-daemon

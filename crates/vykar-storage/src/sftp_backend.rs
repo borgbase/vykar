@@ -1,3 +1,14 @@
+#![allow(
+    clippy::duration_suboptimal_units,
+    clippy::elidable_lifetime_names,
+    clippy::map_unwrap_or,
+    clippy::match_same_arms,
+    clippy::missing_errors_doc,
+    clippy::needless_pass_by_value,
+    clippy::redundant_closure_for_method_calls,
+    clippy::ref_option
+)]
+
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
@@ -7,7 +18,7 @@ use russh::client;
 use russh::keys::known_hosts::{known_host_keys_path, learn_known_hosts_path};
 use russh::keys::ssh_key;
 use russh::keys::{load_secret_key, PrivateKey, PrivateKeyWithHashAlg};
-use russh_sftp::client::SftpSession;
+use russh_sftp::client::{Config as SftpConfig, SftpSession};
 use russh_sftp::protocol::{OpenFlags, StatusCode};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
@@ -149,6 +160,24 @@ impl RetryError {
 
 /// Timeout for acquiring a connection from the pool.
 const POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Maximum number of consecutive pool-acquire timeouts within a single storage
+/// operation before we declare the pool wedged and give up. Acts as a fuse for
+/// connection-slot leaks; with `POOL_ACQUIRE_TIMEOUT = 60s`, the worst-case
+/// wait is ~30 minutes.
+const MAX_CONSECUTIVE_POOL_WAITS: usize = 30;
+
+/// Outcome of `acquire_conn` after both pool contention and transport errors
+/// are considered. Splits the two so the caller can apply different policies:
+/// `PoolWait` does not consume the user-visible retry budget.
+#[derive(Debug)]
+enum AcquireError {
+    /// Pool-acquire deadline elapsed without a slot becoming available.
+    /// Indicates pool saturation, not a transport failure.
+    PoolWait,
+    /// Transport-level failure from `connect()` (transient or permanent).
+    Transport(RetryError),
+}
 
 /// RAII guard that returns a connection slot to the pool on drop.
 struct ConnGuard<'a> {
@@ -303,7 +332,7 @@ impl SftpBackend {
         self.pool.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn acquire_conn(&self) -> RetryResult<ConnGuard<'_>> {
+    fn acquire_conn(&self) -> std::result::Result<ConnGuard<'_>, AcquireError> {
         let deadline = Instant::now() + POOL_ACQUIRE_TIMEOUT;
         loop {
             let mut state = self.lock_pool();
@@ -328,16 +357,14 @@ impl SftpBackend {
                     }
                     Err(e) => {
                         self.release_slot();
-                        return Err(e);
+                        return Err(AcquireError::Transport(e));
                     }
                 }
             }
 
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                return Err(RetryError::transient(VykarError::Other(
-                    "timed out waiting for SFTP connection from pool".into(),
-                )));
+                return Err(AcquireError::PoolWait);
             }
 
             let (new_state, _timeout) = self
@@ -426,7 +453,11 @@ impl SftpBackend {
             .request_subsystem(true, "sftp")
             .await
             .map_err(|e| ssh_retry_error("request sftp subsystem", &params.host, params.port, e))?;
-        let sftp = SftpSession::new_opts(channel.into_stream(), Some(params.sftp_timeout_secs))
+        let sftp_cfg = SftpConfig {
+            request_timeout_secs: params.sftp_timeout_secs,
+            ..SftpConfig::default()
+        };
+        let sftp = SftpSession::new_with_config(channel.into_stream(), sftp_cfg)
             .await
             .map_err(|e| {
                 sftp_retry_error(
@@ -444,30 +475,60 @@ impl SftpBackend {
 
     /// Retry a synchronous SFTP operation with exponential backoff + jitter.
     /// The closure receives a pooled `&SftpSession`.
+    ///
+    /// Pool-acquire timeouts are tracked separately from transport retries:
+    /// they do not consume the user-configured retry budget and do not trigger
+    /// the exponential backoff sleep.
     fn retry_op<T>(&self, op_name: &str, f: impl Fn(&SftpSession) -> RetryResult<T>) -> Result<T> {
+        let mut state = RetryState::default();
         let mut delay_ms = self.retry.retry_delay_ms;
+        let mut needs_backoff = false;
 
-        for attempt in 0..=self.retry.max_retries {
-            if attempt > 0 {
+        loop {
+            if needs_backoff {
                 let base = delay_ms.max(1);
                 let jitter = rand::random::<u64>() % base;
                 std::thread::sleep(Duration::from_millis(base + jitter));
                 delay_ms = (base.saturating_mul(2)).min(self.retry.retry_max_delay_ms.max(1));
+                needs_backoff = false;
             }
 
             let guard = match self.acquire_conn() {
-                Ok(guard) => guard,
-                Err(e) => {
-                    if e.retryable && attempt < self.retry.max_retries {
-                        tracing::warn!(
-                            "SFTP {op_name}: connection error (attempt {}/{}), retrying: {}",
-                            attempt + 1,
-                            self.retry.max_retries,
-                            e.err
-                        );
-                        continue;
+                Ok(guard) => {
+                    state.pool_waits_used = 0;
+                    guard
+                }
+                Err(AcquireError::PoolWait) => {
+                    if record_pool_wait(&mut state, MAX_CONSECUTIVE_POOL_WAITS) {
+                        return Err(VykarError::Other(format!(
+                            "SFTP {op_name}: connection pool wedged: no slot released after {} consecutive {}s waits",
+                            MAX_CONSECUTIVE_POOL_WAITS,
+                            POOL_ACQUIRE_TIMEOUT.as_secs(),
+                        )));
                     }
-                    return Err(e.err);
+                    tracing::warn!(
+                        "SFTP {op_name}: waited {}s for connection pool slot (all {} connections busy); still waiting",
+                        POOL_ACQUIRE_TIMEOUT.as_secs(),
+                        self.max_connections,
+                    );
+                    continue;
+                }
+                Err(AcquireError::Transport(e)) => {
+                    state.pool_waits_used = 0;
+                    if !e.retryable {
+                        return Err(e.err);
+                    }
+                    if record_transient(&mut state, self.retry.max_retries) {
+                        return Err(e.err);
+                    }
+                    tracing::warn!(
+                        "SFTP {op_name}: retry {} of {} after connection error: {}",
+                        state.transport_retries_used,
+                        self.retry.max_retries,
+                        e.err,
+                    );
+                    needs_backoff = true;
+                    continue;
                 }
             };
 
@@ -477,28 +538,56 @@ impl SftpBackend {
                     return Ok(val);
                 }
                 Err(e) => {
-                    if e.retryable {
-                        guard.discard();
-                        if attempt < self.retry.max_retries {
-                            tracing::warn!(
-                                "SFTP {op_name}: transient error (attempt {}/{}), retrying: {}",
-                                attempt + 1,
-                                self.retry.max_retries,
-                                e.err
-                            );
-                            continue;
-                        }
+                    if !e.retryable {
+                        guard.release();
                         return Err(e.err);
                     }
-
-                    guard.release();
-                    return Err(e.err);
+                    guard.discard();
+                    if record_transient(&mut state, self.retry.max_retries) {
+                        return Err(e.err);
+                    }
+                    tracing::warn!(
+                        "SFTP {op_name}: retry {} of {} after transient error: {}",
+                        state.transport_retries_used,
+                        self.retry.max_retries,
+                        e.err,
+                    );
+                    needs_backoff = true;
                 }
             }
         }
-
-        unreachable!()
     }
+}
+
+/// State machine bookkeeping for `retry_op`. Split from the loop so the
+/// policy can be unit-tested without needing a real SFTP connection.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct RetryState {
+    transport_retries_used: usize,
+    pool_waits_used: usize,
+}
+
+/// Record a pool-acquire timeout. Returns `true` if the pool appears wedged
+/// and the operation should give up. Pool waits never touch the transport
+/// retry budget.
+///
+/// The caller is expected to reset `state.pool_waits_used` to 0 on any
+/// non-pool-wait outcome (successful acquire or transport error), so the
+/// counter measures *consecutive* pool waits rather than the lifetime total.
+fn record_pool_wait(state: &mut RetryState, max_pool_waits: usize) -> bool {
+    state.pool_waits_used += 1;
+    state.pool_waits_used >= max_pool_waits
+}
+
+/// Record a transient transport failure (from `acquire_conn` or the operation
+/// closure). Returns `true` if the transport retry budget is exhausted and the
+/// caller should propagate the error.
+fn record_transient(state: &mut RetryState, max_retries: usize) -> bool {
+    if state.transport_retries_used >= max_retries {
+        return true;
+    }
+    state.transport_retries_used += 1;
+    false
 }
 
 /// Normalize the configured SFTP root.
@@ -637,7 +726,9 @@ fn verify_or_learn_host_key(
         return Ok(HostKeyState::Learned);
     }
 
-    Err(russh::Error::KeyChanged { line: known[0].0 })
+    Err(russh::Error::KeyChanged {
+        line: known.first().expect("known is non-empty (checked above)").0,
+    })
 }
 
 /// Load SSH private key, trying explicit path first, then default locations.
@@ -999,7 +1090,10 @@ impl StorageBackend for SftpBackend {
                 let mut buf = vec![0u8; requested_len];
                 let mut total = 0;
                 while total < buf.len() {
-                    match file.read(&mut buf[total..]).await {
+                    match file
+                        .read(buf.get_mut(total..).expect("total <= buf.len()"))
+                        .await
+                    {
                         Ok(0) => break,
                         Ok(n) => total += n,
                         Err(e) => return Err(io_retry_error("read_range", &path, e)),
@@ -1172,5 +1266,66 @@ mod tests {
         let err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
         let retry = io_retry_error("write", "/test/path", err);
         assert!(!retry.retryable, "PermissionDenied should not be retryable");
+    }
+
+    #[test]
+    fn record_pool_wait_under_limit_continues() {
+        let mut state = RetryState::default();
+        for i in 1..30 {
+            assert!(!record_pool_wait(&mut state, 30));
+            assert_eq!(state.pool_waits_used, i);
+            assert_eq!(state.transport_retries_used, 0);
+        }
+    }
+
+    #[test]
+    fn record_pool_wait_at_limit_signals_wedged() {
+        let mut state = RetryState {
+            transport_retries_used: 0,
+            pool_waits_used: 29,
+        };
+        assert!(record_pool_wait(&mut state, 30));
+        assert_eq!(state.pool_waits_used, 30);
+        assert_eq!(state.transport_retries_used, 0);
+    }
+
+    #[test]
+    fn record_transient_under_budget_increments_and_continues() {
+        let mut state = RetryState::default();
+        for i in 1..=5 {
+            assert!(!record_transient(&mut state, 5));
+            assert_eq!(state.transport_retries_used, i);
+        }
+    }
+
+    #[test]
+    fn record_transient_at_budget_returns_exhausted_without_increment() {
+        let mut state = RetryState {
+            transport_retries_used: 5,
+            pool_waits_used: 0,
+        };
+        assert!(record_transient(&mut state, 5));
+        assert_eq!(state.transport_retries_used, 5);
+    }
+
+    #[test]
+    fn pool_waits_do_not_consume_transport_budget() {
+        let mut state = RetryState::default();
+        // Interleave many pool waits with the transport retries.
+        for _ in 0..10 {
+            assert!(!record_pool_wait(&mut state, 30));
+            assert_eq!(state.transport_retries_used, 0);
+        }
+        // The full transport budget is still available.
+        for i in 1..=5 {
+            assert!(!record_transient(&mut state, 5));
+            assert_eq!(state.transport_retries_used, i);
+        }
+        // More pool waits in the middle do not free transport slots.
+        for _ in 0..5 {
+            assert!(!record_pool_wait(&mut state, 30));
+        }
+        // The 6th transient attempt exhausts the budget.
+        assert!(record_transient(&mut state, 5));
     }
 }

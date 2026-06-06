@@ -16,6 +16,30 @@ use vykar_crypto::CryptoEngine;
 use vykar_types::error::{Result, VykarError};
 use vykar_types::pack_id::PackId;
 
+/// Emit a `CommitStage` progress event and return a context
+/// (start time, stage name) for later `log_stage_elapsed`.
+fn emit_stage<F>(
+    progress: &mut Option<F>,
+    stage: &'static str,
+) -> (std::time::Instant, &'static str)
+where
+    F: FnMut(crate::commands::backup::BackupProgressEvent),
+{
+    let start = std::time::Instant::now();
+    if let Some(ref mut cb) = progress {
+        cb(crate::commands::backup::BackupProgressEvent::CommitStage { stage });
+    }
+    (start, stage)
+}
+
+fn log_stage_elapsed(ctx: (std::time::Instant, &'static str)) {
+    debug!(
+        stage = ctx.1,
+        elapsed_ms = ctx.0.elapsed().as_millis() as u64,
+        "commit stage complete"
+    );
+}
+
 impl Repository {
     /// Load the chunk index from storage on demand.
     /// Always downloads the remote index blob to get the authenticated generation.
@@ -62,7 +86,10 @@ impl Repository {
 
         // Drop tiered dedup index (releases mmap) before reloading full index.
         // Take delta and dedup_index out of the session for processing.
-        let ws = self.write_session.as_mut().unwrap();
+        let ws = self
+            .write_session
+            .as_mut()
+            .expect("write session active while applying commit");
         ws.tiered_dedup.take();
         let delta = ws.index_delta.take();
         if delta.is_some() {
@@ -230,28 +257,69 @@ impl Repository {
         new_file_cache: &mut file_cache::FileCache,
         progress: &mut Option<impl FnMut(crate::commands::backup::BackupProgressEvent)>,
     ) -> Result<()> {
-        use crate::commands::backup::BackupProgressEvent;
-
-        macro_rules! emit_stage {
-            ($progress:expr, $stage:expr) => {{
-                let stage_start = std::time::Instant::now();
-                if let Some(ref mut cb) = $progress {
-                    cb(BackupProgressEvent::CommitStage { stage: $stage });
+        // 0. Session-existence probe (fail fast, before flushing). If the
+        // marker was reaped by maintenance (e.g. because we missed too many
+        // heartbeats under extreme clock skew), skip the pack flush and
+        // surface the same typed error the later reconcile path would
+        // produce, so callers matching on `StaleChunksDuringCommit` catch
+        // this path too. Inconclusive storage errors fall through — the
+        // reconcile step is still a safety net.
+        let session_id = self
+            .write_session
+            .as_ref()
+            .expect("no active write session")
+            .session_id
+            .clone();
+        if session_id != "default" {
+            let marker_key = super::lock::session_marker_key(&session_id);
+            match self.storage.exists(&marker_key) {
+                Ok(true) => {}
+                Ok(false) => {
+                    warn!(
+                        session_id,
+                        "session marker reaped before commit; retry the backup"
+                    );
+                    return Err(VykarError::StaleChunksDuringCommit);
                 }
-                (stage_start, $stage)
-            }};
+                Err(e) => {
+                    debug!(error = %e, "session-existence probe failed, proceeding to flush");
+                }
+            }
         }
 
-        macro_rules! log_stage_elapsed {
-            ($ctx:expr) => {
-                debug!(
-                    stage = $ctx.1,
-                    elapsed_ms = $ctx.0.elapsed().as_millis() as u64,
-                    "commit stage complete"
-                );
-            };
-        }
+        let deferred_chunk_index_hydrate = self.commit_prepare(&snapshot_entry, progress)?;
 
+        // ---- COMMIT POINT ----
+        let ctx = emit_stage(progress, "write snapshot");
+        self.check_lock_fence()?;
+        self.storage
+            .put(&snapshot_entry.id.storage_key(), &snapshot_packed)?;
+        log_stage_elapsed(ctx);
+        // ---- after this point, no `?` may escape ----
+
+        // Manifest update is a post-commit in-memory op. Keeping it inline keeps
+        // the ordering visible next to the PUT; commit_finalize handles the rest.
+        self.manifest.timestamp = Utc::now();
+        self.manifest.snapshots.push(snapshot_entry);
+
+        self.commit_finalize(new_file_cache, deferred_chunk_index_hydrate, progress);
+        Ok(())
+    }
+
+    /// Pre-commit work up to (but not including) the snapshot PUT:
+    ///   1. Flush packs and join uploads.
+    ///   2. Drop tiered dedup and take the delta from the write session.
+    ///   3. Refresh the snapshot list from storage.
+    ///   4. Enforce snapshot name uniqueness against the fresh list.
+    ///   5. Fetch/decode remote index, reconcile delta, persist index.
+    ///
+    /// Returns `true` when chunk_index hydration should be deferred to
+    /// `commit_finalize` (fast-path case).
+    fn commit_prepare(
+        &mut self,
+        snapshot_entry: &manifest::SnapshotEntry,
+        progress: &mut Option<impl FnMut(crate::commands::backup::BackupProgressEvent)>,
+    ) -> Result<bool> {
         // 1. Flush all pending packs and wait for uploads.
         self.flush_packs()?;
 
@@ -268,9 +336,9 @@ impl Repository {
 
         // 3. Refresh snapshot list (unreadable blobs are skipped — a garbage
         //    snapshot that can't be decrypted cannot conflict with a valid name).
-        let ctx = emit_stage!(progress, "refresh snapshots");
+        let ctx = emit_stage(progress, "refresh snapshots");
         self.refresh_snapshot_list()?;
-        log_stage_elapsed!(ctx);
+        log_stage_elapsed(ctx);
 
         // 4. Check snapshot name uniqueness against fresh list.
         if self.manifest.find_snapshot(&snapshot_entry.name).is_some() {
@@ -283,9 +351,9 @@ impl Repository {
         let mut deferred_chunk_index_hydrate = false;
         if let Some(delta) = delta {
             if !delta.is_empty() {
-                let ctx = emit_stage!(progress, "fetch index");
+                let ctx = emit_stage(progress, "fetch index");
                 let raw_blob = self.fetch_raw_index_blob()?;
-                log_stage_elapsed!(ctx);
+                log_stage_elapsed(ctx);
 
                 // Try fast path: compare raw blob against cached copy.
                 let fast_path_taken = if let Some(ref raw_data) = raw_blob {
@@ -300,21 +368,21 @@ impl Repository {
                     // backup after the remote index has already been updated.
                     deferred_chunk_index_hydrate = true;
                 } else {
-                    let ctx = emit_stage!(progress, "decode index");
+                    let ctx = emit_stage(progress, "decode index");
                     let fresh_index = if let Some(ref raw_data) = raw_blob {
                         Self::decode_raw_index_blob(raw_data, self.crypto.as_ref())?
                     } else {
                         (0, ChunkIndex::new())
                     };
-                    log_stage_elapsed!(ctx);
+                    log_stage_elapsed(ctx);
 
-                    let ctx = emit_stage!(progress, "reconcile");
+                    let ctx = emit_stage(progress, "reconcile");
                     let reconciled = delta.reconcile(&fresh_index.1)?;
-                    log_stage_elapsed!(ctx);
+                    log_stage_elapsed(ctx);
 
-                    let ctx = emit_stage!(progress, "verify packs");
+                    let ctx = emit_stage(progress, "verify packs");
                     self.verify_delta_packs(&reconciled)?;
-                    log_stage_elapsed!(ctx);
+                    log_stage_elapsed(ctx);
 
                     let mut fresh_index = fresh_index.1;
                     reconciled.apply_to(&mut fresh_index);
@@ -322,16 +390,16 @@ impl Repository {
                     self.index_dirty = true;
                     self.index_generation = rand::rng().next_u64();
 
-                    let ctx = emit_stage!(progress, "write index");
+                    let ctx = emit_stage(progress, "write index");
                     self.persist_index()?;
-                    log_stage_elapsed!(ctx);
+                    log_stage_elapsed(ctx);
                 }
             } else if self.rebuild_dedup_cache {
                 // Empty delta but caches need rebuilding (tiered dedup was active).
                 // chunk_index was dropped — reload from remote for cache rebuild.
-                let ctx = emit_stage!(progress, "fetch index");
+                let ctx = emit_stage(progress, "fetch index");
                 self.chunk_index = self.reload_full_index()?;
-                log_stage_elapsed!(ctx);
+                log_stage_elapsed(ctx);
             }
         }
 
@@ -342,23 +410,28 @@ impl Repository {
             self.persist_index()?;
         }
 
-        // 6. Write snapshots/<id> — commit point.
-        let ctx = emit_stage!(progress, "write snapshot");
-        self.check_lock_fence()?;
-        self.storage
-            .put(&snapshot_entry.id.storage_key(), &snapshot_packed)?;
-        log_stage_elapsed!(ctx);
+        Ok(deferred_chunk_index_hydrate)
+    }
 
-        // 7. Update local manifest.
-        self.manifest.timestamp = Utc::now();
-        self.manifest.snapshots.push(snapshot_entry);
-
+    /// Post-commit best-effort work. The `-> ()` return type is load-bearing:
+    /// it statically forbids `?` from escaping a path that runs after the
+    /// snapshot has already been durably committed. All internal failures
+    /// must be reported via `emit_post_commit_warning`.
+    fn commit_finalize(
+        &mut self,
+        new_file_cache: &mut file_cache::FileCache,
+        deferred_chunk_index_hydrate: bool,
+        progress: &mut Option<impl FnMut(crate::commands::backup::BackupProgressEvent)>,
+    ) {
         // Hydrate chunk_index after the commit point (fast-path deferred).
-        // Best-effort: a local cache read failure here is non-fatal since the
-        // remote index is already committed. Falls back to remote reload.
+        // Best-effort: a failure here is non-fatal since the remote index is
+        // already committed. `rebuild_local_caches(true)` (below) derives
+        // caches from the on-disk full_index_cache and does not read
+        // `self.chunk_index`, so leaving it stale is safe. The next Repository
+        // operation calls `reload_full_index` and rehydrates from remote.
         if deferred_chunk_index_hydrate {
             let cd = self.cache_dir_override.as_deref();
-            self.chunk_index = dedup_cache::load_chunk_index_from_full_cache(
+            match dedup_cache::load_chunk_index_from_full_cache(
                 &self.config.id,
                 self.index_generation,
                 cd,
@@ -366,7 +439,22 @@ impl Repository {
             .or_else(|e| {
                 warn!("fast path: local cache hydration failed ({e}), reloading from remote");
                 self.reload_full_index()
-            })?;
+            }) {
+                Ok(idx) => {
+                    self.chunk_index = idx;
+                }
+                Err(e) => {
+                    crate::commands::backup::emit_post_commit_warning(
+                        progress,
+                        format!(
+                            "snapshot was successfully committed, but hydrating the \
+                             in-memory chunk index from local cache and remote storage \
+                             both failed: {e}. The on-disk chunk index is intact; the \
+                             next repository operation will reload it."
+                        ),
+                    );
+                }
+            }
         }
 
         // Merge active sections if any were produced (filesystem backup).
@@ -383,17 +471,25 @@ impl Repository {
         // invalidation that set the dirty flag (e.g., stale sections removed
         // at backup start).
         if let Err(e) = self.save_file_cache_if_dirty() {
-            warn!("failed to save file cache after concurrent commit: {e}");
+            crate::commands::backup::emit_post_commit_warning(
+                progress,
+                format!(
+                    "snapshot was successfully committed, but saving the local file \
+                     cache failed: {e}. The next backup run will fall back to a \
+                     cold-start walk for any affected sources instead of using cached \
+                     metadata."
+                ),
+            );
         }
 
         // Rebuild local caches if needed. When the fast path already wrote the
         // full cache (deferred_chunk_index_hydrate), skip the redundant sort.
-        let ctx = emit_stage!(progress, "rebuild local caches");
+        let ctx = emit_stage(progress, "rebuild local caches");
         if self.rebuild_dedup_cache {
             self.rebuild_local_caches(deferred_chunk_index_hydrate);
             self.rebuild_dedup_cache = false;
         }
-        log_stage_elapsed!(ctx);
+        log_stage_elapsed(ctx);
 
         // Clean up recovered index journals from previous interrupted sessions.
         if let Some(ws) = self.write_session.as_mut() {
@@ -402,8 +498,6 @@ impl Repository {
 
         // Consume write session.
         self.write_session = None;
-
-        Ok(())
     }
 
     /// Verify that all pack_ids referenced by new_entries in a delta actually

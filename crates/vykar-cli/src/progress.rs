@@ -1,3 +1,6 @@
+// libc/Win32 ioctl for terminal width detection; SAFETY documented per block.
+#![allow(unsafe_code)]
+
 use std::io::{self, IsTerminal, Stderr, Write};
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::{Mutex, MutexGuard};
@@ -172,6 +175,17 @@ impl BackupProgressRenderer {
                 }
                 return;
             }
+            commands::backup::BackupProgressEvent::Warning { message } => {
+                // Defensive duplicate of tracing::warn! — guarantees the
+                // warning reaches stderr even without the tracing subscriber.
+                let _guard = acquire_stderr_lock();
+                if self.is_tty {
+                    eprint!("\r\x1b[2K");
+                    self.last_line_len = 0;
+                }
+                eprintln!("warning: {message}");
+                return;
+            }
             commands::backup::BackupProgressEvent::SourceStarted { .. }
             | commands::backup::BackupProgressEvent::SourceFinished { .. } => return,
         }
@@ -250,6 +264,8 @@ fn terminal_columns() -> usize {
 #[cfg(unix)]
 fn terminal_columns_os() -> Option<usize> {
     use libc::{ioctl, winsize, STDERR_FILENO, TIOCGWINSZ};
+    // SAFETY: `winsize` is a C POD; ioctl with TIOCGWINSZ writes the struct
+    // through the `&mut ws` pointer, which is exclusive and properly aligned.
     unsafe {
         let mut ws: winsize = std::mem::zeroed();
         if ioctl(STDERR_FILENO, TIOCGWINSZ, &mut ws) == 0 && ws.ws_col > 0 {
@@ -265,6 +281,9 @@ fn terminal_columns_os() -> Option<usize> {
     use windows_sys::Win32::System::Console::{
         GetConsoleScreenBufferInfo, GetStdHandle, CONSOLE_SCREEN_BUFFER_INFO, STD_ERROR_HANDLE,
     };
+    // SAFETY: GetStdHandle is always sound; CONSOLE_SCREEN_BUFFER_INFO is a
+    // C POD that the kernel populates through the exclusive `&mut info`
+    // pointer.
     unsafe {
         let handle = GetStdHandle(STD_ERROR_HANDLE);
         let mut info: CONSOLE_SCREEN_BUFFER_INFO = std::mem::zeroed();

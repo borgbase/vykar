@@ -38,7 +38,7 @@ zeroize = { version = "1", features = ["derive"] }
 hex = "0.4"
 
 # CLI
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }
@@ -48,9 +48,15 @@ croner = "3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# HTTP client
+ureq = "3"
+
 # Concurrency
 crossbeam-channel = "0.5"
-tokio = "1"
+tokio = { version = "1", default-features = false }
+
+# Filesystem
+dunce = "1"
 
 # Testing
 tempfile = "3"
@@ -58,8 +64,102 @@ proptest = "1"
 test-case = "3"
 
 [workspace.lints.rust]
+unsafe_code = "deny"
 
 [workspace.lints.clippy]
+# Corruption-class — deny. Each can cause silent data loss in a backup tool.
+unwrap_used = "deny"
+panic = "deny"
+panic_in_result_fn = "deny"
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+undocumented_unsafe_blocks = "deny"
+cast_precision_loss = "deny"
+indexing_slicing = "warn"
+
+# Deferred audit lints. `make pre-commit` runs clippy with `-D warnings`, so a
+# workspace lint set to `warn` is commit-blocking. Keep these as explicit
+# allows until the current arithmetic/cast/expect sites are audited and fixed
+# or locally justified.
+cast_possible_truncation = "allow"
+cast_possible_wrap = "allow"
+cast_sign_loss = "allow"
+arithmetic_side_effects = "allow"
+integer_division = "allow"
+expect_used = "allow"
+
+# Style — warn. CI promotes warnings to errors.
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+similar_names = "allow"
+# High-volume noise items — allow workspace-wide.
+uninlined_format_args = "allow"
+items_after_statements = "allow"
+manual_let_else = "allow"
+cast_lossless = "allow"
+# Documentation-style pedantic lints — fire across most public APIs;
+# tracked as a follow-up doc sweep.
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+doc_markdown = "allow"
+# Mechanical pedantic noise that distracts from substance during review.
+redundant_closure_for_method_calls = "allow"
+single_match_else = "allow"
+match_wildcard_for_single_variants = "allow"
+match_same_arms = "allow"
+needless_pass_by_value = "allow"
+needless_raw_string_hashes = "allow"
+range_plus_one = "allow"
+unreadable_literal = "allow"
+used_underscore_binding = "allow"
+wildcard_imports = "allow"
+case_sensitive_file_extension_comparisons = "allow"
+ignore_without_reason = "allow"
+too_many_lines = "allow"
+duration_subsec = "allow"
+duration_suboptimal_units = "allow"
+cloned_instead_of_copied = "allow"
+stable_sort_primitive = "allow"
+map_unwrap_or = "allow"
+default_trait_access = "allow"
+return_self_not_must_use = "allow"
+struct_field_names = "allow"
+struct_excessive_bools = "allow"
+fn_params_excessive_bools = "allow"
+needless_lifetimes = "allow"
+elidable_lifetime_names = "allow"
+ignored_unit_patterns = "allow"
+if_not_else = "allow"
+used_underscore_items = "allow"
+format_push_string = "allow"
+assigning_clones = "allow"
+needless_bool = "allow"
+unnecessary_wraps = "allow"
+implicit_clone = "allow"
+explicit_iter_loop = "allow"
+nonminimal_bool = "allow"
+needless_continue = "allow"
+redundant_else = "allow"
+ref_option = "allow"
+unnecessary_trailing_comma = "allow"
+borrow_as_ptr = "allow"
+unchecked_time_subtraction = "allow"
+unused_self = "allow"
+missing_fields_in_debug = "allow"
+unnecessary_semicolon = "allow"
+inconsistent_struct_constructor = "allow"
+implicit_hasher = "allow"
+match_single_binding = "allow"
+unit_arg = "allow"
+checked_conversions = "allow"
+semicolon_if_nothing_returned = "allow"
+
+# I/O discipline
+print_stdout = "warn"
+print_stderr = "warn"
 
 [profile.release]
 opt-level = 3

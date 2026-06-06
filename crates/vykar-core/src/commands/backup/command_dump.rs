@@ -18,7 +18,10 @@ use crate::snapshot::SnapshotStats;
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
 
-use super::{append_item_to_stream, emit_progress, emit_stats_progress, BackupProgressEvent};
+use super::{
+    append_item_to_stream, emit_progress, emit_stats_progress, with_rollback_checkpoint,
+    BackupProgressEvent,
+};
 
 /// Default timeout for command_dump execution (1 hour).
 pub(super) const COMMAND_DUMP_TIMEOUT: Duration = Duration::from_secs(3600);
@@ -40,10 +43,10 @@ impl DumpProcessGuard {
     fn finish(&mut self) -> Result<(std::process::ExitStatus, Vec<u8>, bool)> {
         // Wait for child to exit (if watchdog fires while we wait, it kills the
         // child, which unblocks wait()).
-        let status = self
-            .child
-            .as_mut()
-            .expect("child already taken")
+        let child = self.child.as_mut().ok_or_else(|| {
+            VykarError::Other("internal: command_dump child already taken (logic bug)".into())
+        })?;
+        let status = child
             .wait()
             .map_err(|e| VykarError::Other(format!("failed to wait on child: {e}")))?;
 
@@ -98,9 +101,7 @@ fn stream_dump_command(
     timeout: Duration,
     progress: &mut Option<&mut dyn FnMut(BackupProgressEvent)>,
 ) -> Result<(Vec<ChunkRef>, u64)> {
-    repo.begin_dump_checkpoint()?;
-
-    let dump_result = (|| -> Result<(Vec<ChunkRef>, u64)> {
+    with_rollback_checkpoint(repo, stats, |repo, stats| {
         // Spawn child with piped stdout and stderr.
         let mut cmd = shell::command_for_script(&dump.command);
         let mut child = cmd
@@ -149,10 +150,10 @@ fn stream_dump_command(
 
         // Stream stdout through chunker.
         let chunk_id_key = *repo.crypto.chunk_id_key();
-        let chunk_stream = chunker::chunk_stream(
-            stdout.expect("stdout was piped"),
-            &repo.config.chunker_params,
-        );
+        let stdout = stdout.ok_or_else(|| {
+            VykarError::Other("internal: command_dump stdout not piped (config bug)".into())
+        })?;
+        let chunk_stream = chunker::chunk_stream(stdout, &repo.config.chunker_params);
 
         let mut chunk_refs = Vec::new();
         let mut total_size: u64 = 0;
@@ -168,6 +169,9 @@ fn stream_dump_command(
                 )),
             })?;
 
+            // FastCDC bounds chunk size at chunker_params.max_size (≤ 16 MiB),
+            // well below u32::MAX — the cast cannot overflow.
+            debug_assert!(chunk.data.len() <= u32::MAX as usize);
             let size = chunk.data.len() as u32;
             total_size += size as u64;
             let chunk_id = ChunkId::compute(&chunk_id_key, &chunk.data);
@@ -227,18 +231,7 @@ fn stream_dump_command(
         }
 
         Ok((chunk_refs, total_size))
-    })();
-
-    match dump_result {
-        Ok(result) => {
-            repo.commit_dump_checkpoint();
-            Ok(result)
-        }
-        Err(e) => {
-            repo.rollback_dump_checkpoint();
-            Err(e)
-        }
-    }
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -374,8 +367,14 @@ mod tests {
     }
 
     /// Helper: set up a repo for streaming dump tests.
+    ///
+    /// The real backup pipeline enables tiered/dedup mode before executing
+    /// command dumps, and `begin_rollback_checkpoint` now asserts that
+    /// invariant — mirror it here.
     fn setup_test_repo() -> Repository {
-        crate::testutil::test_repo_plaintext()
+        let mut repo = crate::testutil::test_repo_plaintext();
+        repo.enable_dedup_mode();
+        repo
     }
 
     #[test]

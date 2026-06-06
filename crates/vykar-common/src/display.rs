@@ -4,13 +4,23 @@ pub fn format_bytes(bytes: u64) -> String {
     const GIB: u64 = MIB * 1024;
 
     if bytes >= GIB {
-        format!("{:.2} GiB", bytes as f64 / GIB as f64)
+        format_unit(bytes, GIB, "GiB")
     } else if bytes >= MIB {
-        format!("{:.2} MiB", bytes as f64 / MIB as f64)
+        format_unit(bytes, MIB, "MiB")
     } else if bytes >= KIB {
-        format!("{:.2} KiB", bytes as f64 / KIB as f64)
+        format_unit(bytes, KIB, "KiB")
     } else {
         format!("{bytes} B")
+    }
+}
+
+fn format_unit(bytes: u64, unit: u64, suffix: &str) -> String {
+    let whole = bytes / unit;
+    let frac = ((bytes % unit) * 100 + unit / 2) / unit;
+    if frac == 100 {
+        format!("{}.00 {suffix}", whole + 1)
+    } else {
+        format!("{whole}.{frac:02} {suffix}")
     }
 }
 
@@ -27,6 +37,19 @@ pub fn format_count(n: u64) -> String {
 }
 
 /// Parse a human-readable size string like "500M", "2G", "1024K" into bytes.
+///
+/// Accepted grammar: `<digits>[.<digits>][KMGTkmgt]`. The optional suffix is
+/// a binary multiplier (K = 1024, M = 1024², G = 1024³, T = 1024⁴). Plain
+/// digits with no suffix are interpreted as bytes.
+///
+/// Scientific notation (e.g. `"1e9"`) is **not** supported; use `"1G"` or
+/// `"1024M"` instead. The parser is integer-based and exact across the full
+/// `u64` range — fractional values are computed without floating point.
+///
+/// # Errors
+///
+/// Returns an error when the string is empty, uses an invalid numeric form, is
+/// negative, or exceeds `u64::MAX` bytes after applying the suffix multiplier.
 pub fn parse_size(s: &str) -> Result<u64, String> {
     let s = s.trim();
     if s.is_empty() {
@@ -49,17 +72,64 @@ pub fn parse_size(s: &str) -> Result<u64, String> {
             .ok_or_else(|| format!("size too large: '{s}'"));
     }
 
-    let num: f64 = num_str
-        .parse()
-        .map_err(|_| format!("invalid size: '{s}'"))?;
-    if !num.is_finite() || num < 0.0 {
-        return Err(format!("invalid size: '{s}'"));
+    parse_decimal_size(num_str, multiplier).map_err(|kind| match kind {
+        DecimalSizeError::Invalid => format!("invalid size: '{s}'"),
+        DecimalSizeError::TooLarge => format!("size too large: '{s}'"),
+    })
+}
+
+enum DecimalSizeError {
+    Invalid,
+    TooLarge,
+}
+
+fn parse_decimal_size(num_str: &str, multiplier: u64) -> Result<u64, DecimalSizeError> {
+    let (whole_str, frac_str) = num_str.split_once('.').ok_or(DecimalSizeError::Invalid)?;
+    if whole_str.starts_with('-') || frac_str.starts_with('-') {
+        return Err(DecimalSizeError::Invalid);
     }
-    let bytes = num * multiplier as f64;
-    if bytes >= 2.0f64.powi(64) {
-        return Err(format!("size too large: '{s}'"));
+    if whole_str.is_empty() && frac_str.is_empty() {
+        return Err(DecimalSizeError::Invalid);
     }
-    Ok(bytes as u64)
+    if !whole_str.chars().all(|c| c.is_ascii_digit())
+        || !frac_str.chars().all(|c| c.is_ascii_digit())
+    {
+        return Err(DecimalSizeError::Invalid);
+    }
+
+    let whole = if whole_str.is_empty() {
+        0
+    } else {
+        whole_str
+            .parse::<u128>()
+            .map_err(|_| DecimalSizeError::TooLarge)?
+    };
+
+    let multiplier = u128::from(multiplier);
+    let whole_bytes = whole
+        .checked_mul(multiplier)
+        .ok_or(DecimalSizeError::TooLarge)?;
+
+    let mut frac_value = 0u128;
+    let mut frac_scale = 1u128;
+    for digit in frac_str.bytes() {
+        frac_value = frac_value
+            .checked_mul(10)
+            .and_then(|v| v.checked_add(u128::from(digit - b'0')))
+            .ok_or(DecimalSizeError::TooLarge)?;
+        frac_scale = frac_scale
+            .checked_mul(10)
+            .ok_or(DecimalSizeError::TooLarge)?;
+    }
+    let frac_bytes = frac_value
+        .checked_mul(multiplier)
+        .ok_or(DecimalSizeError::TooLarge)?
+        / frac_scale;
+
+    let bytes = whole_bytes
+        .checked_add(frac_bytes)
+        .ok_or(DecimalSizeError::TooLarge)?;
+    u64::try_from(bytes).map_err(|_| DecimalSizeError::TooLarge)
 }
 
 /// Return the terminal display width of a single character.
@@ -213,10 +283,7 @@ mod tests {
 
     #[test]
     fn parse_size_fractional() {
-        assert_eq!(
-            parse_size("1.5G").unwrap(),
-            (1.5 * 1024.0 * 1024.0 * 1024.0) as u64
-        );
+        assert_eq!(parse_size("1.5G").unwrap(), 3 * 1024 * 1024 * 1024 / 2);
     }
 
     #[test]
@@ -226,6 +293,14 @@ mod tests {
         assert!(parse_size("-1M").is_err());
         assert!(parse_size("NaN").is_err());
         assert!(parse_size("infG").is_err());
+    }
+
+    #[test]
+    fn parse_size_rejects_scientific_notation() {
+        // Scientific notation is intentionally unsupported — use "1G" / "1024M" instead.
+        assert!(parse_size("1e9").is_err());
+        assert!(parse_size("1.5e3").is_err());
+        assert!(parse_size("1e9G").is_err());
     }
 
     #[test]

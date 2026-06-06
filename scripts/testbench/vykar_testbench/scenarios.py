@@ -295,11 +295,13 @@ def _run_phase(phase: dict, *, ctx: dict) -> dict:
         if not snap_id:
             result["detail"] = "no snapshot to verify"
         else:
-            passed, detail = vykar_cmd.verify_restore(
+            passed, detail, stop_scenario = vykar_cmd.verify_restore(
                 vykar_bin, config_path, repo_label, snap_id, ctx["corpus_dir"], ctx["work_dir"]
             )
             result["passed"] = passed
             result["detail"] = detail
+            if stop_scenario:
+                result["stop_scenario"] = True
 
     elif action == "check":
         r = vykar_cmd.vykar_check(vykar_bin, config_path, repo_label)
@@ -429,6 +431,7 @@ def run_scenario(
 
         phase_results = []
         run_passed = True
+        stop_scenario = False
         t0 = time.monotonic()
 
         try:
@@ -448,6 +451,10 @@ def run_scenario(
 
                 if not pr["passed"]:
                     run_passed = False
+                    if pr.get("stop_scenario"):
+                        stop_scenario = True
+                        _log(f"  [{run_id}] repeated verify diff mismatch; full diff follows")
+                        print(pr["detail"], file=sys.stderr, flush=True)
                     break
 
         except KeyboardInterrupt:
@@ -483,6 +490,9 @@ def run_scenario(
             all_passed = False
 
         _log(f"  Run {run_id}: {'PASS' if run_passed else 'FAIL'} ({duration}s)")
+        if stop_scenario:
+            _log(f"Stopping scenario after run {run_id} due to repeated verify diff mismatch")
+            break
 
     corpus_dir = os.path.join(work_dir, "corpus")
     if os.path.exists(corpus_dir):

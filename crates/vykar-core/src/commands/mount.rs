@@ -114,12 +114,13 @@ fn build_vfs_tree(items: &[Item]) -> VfsNode {
 }
 
 fn insert_into_tree(children: &mut HashMap<String, VfsNode>, components: &[&str], item: &Item) {
-    if components.is_empty() {
-        return;
-    }
+    let (head, tail) = match components.split_first() {
+        Some(parts) => parts,
+        None => return,
+    };
 
-    if components.len() == 1 {
-        let name = components[0].to_string();
+    if tail.is_empty() {
+        let name = (*head).to_string();
         // If this is a directory and one already exists as an intermediate,
         // just update its metadata rather than replacing it (which would lose children).
         if item.entry_type == ItemType::Directory {
@@ -144,7 +145,7 @@ fn insert_into_tree(children: &mut HashMap<String, VfsNode>, components: &[&str]
         };
         children.insert(name, node);
     } else {
-        let dir_name = components[0].to_string();
+        let dir_name = (*head).to_string();
         let entry = children.entry(dir_name).or_insert_with(|| VfsNode::Dir {
             children: HashMap::new(),
             meta: VfsMeta::dir_default(),
@@ -154,7 +155,7 @@ fn insert_into_tree(children: &mut HashMap<String, VfsNode>, components: &[&str]
             ..
         } = entry
         {
-            insert_into_tree(dir_children, &components[1..], item);
+            insert_into_tree(dir_children, tail, item);
         }
     }
 }
@@ -221,6 +222,10 @@ fn format_size(bytes: u64) -> String {
     if bytes == 0 {
         return "0 B".to_string();
     }
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "size formatting for human-readable display"
+    )]
     let mut size = bytes as f64;
     for unit in UNITS {
         if size < 1024.0 {
@@ -389,7 +394,7 @@ fn render_directory_html(path: &str, tree: &VfsNode, is_snapshot_root: bool) -> 
     };
 
     format!(
-        r##"<!DOCTYPE html>
+        r#"<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -498,7 +503,7 @@ footer {{ margin-top: 2rem; font-size: 0.75rem; color: var(--muted); }}
 }})();
 </script>
 </body>
-</html>"##
+</html>"#
     )
 }
 
@@ -703,7 +708,10 @@ impl DavFile for VykarDavFile {
                     let available = chunk_data.len() - start_in_chunk;
                     let to_copy = remaining.min(available);
 
-                    buf.extend_from_slice(&chunk_data[start_in_chunk..start_in_chunk + to_copy]);
+                    let slice = chunk_data
+                        .get(start_in_chunk..start_in_chunk + to_copy)
+                        .expect("start + to_copy <= chunk_data.len() (to_copy <= available)");
+                    buf.extend_from_slice(slice);
 
                     remaining -= to_copy;
                     offset += to_copy as u64;
@@ -794,9 +802,11 @@ pub fn run(
         cache_size,
         source_filter,
         None,
+        None,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn run_with_progress(
     config: &VykarConfig,
     passphrase: Option<&str>,
@@ -805,6 +815,7 @@ pub fn run_with_progress(
     cache_size: usize,
     source_filter: &[String],
     mut progress: Option<&mut dyn FnMut(MountProgressEvent)>,
+    shutdown: Option<Arc<tokio::sync::Notify>>,
 ) -> Result<()> {
     let mut repo = open_repo(
         config,
@@ -858,7 +869,8 @@ pub fn run_with_progress(
     };
 
     let repo = Arc::new(Mutex::new(repo));
-    let cache_size = NonZeroUsize::new(cache_size).unwrap_or(NonZeroUsize::new(256).unwrap());
+    let cache_size = NonZeroUsize::new(cache_size)
+        .unwrap_or_else(|| NonZeroUsize::new(256).expect("literal non-zero cache size"));
     let cache = Arc::new(Mutex::new(LruCache::new(cache_size)));
 
     let tree = Arc::new(tree);
@@ -877,7 +889,17 @@ pub fn run_with_progress(
         .map_err(|e| VykarError::Other(format!("failed to create tokio runtime: {e}")))?;
 
     let is_multi_snapshot = snapshot_name.is_none();
-    rt.block_on(async { serve(handler, tree, address, is_multi_snapshot, &mut progress).await })
+    rt.block_on(async {
+        serve(
+            handler,
+            tree,
+            address,
+            is_multi_snapshot,
+            &mut progress,
+            shutdown,
+        )
+        .await
+    })
 }
 
 async fn serve(
@@ -886,6 +908,7 @@ async fn serve(
     address: &str,
     is_multi_snapshot: bool,
     progress: &mut Option<&mut dyn FnMut(MountProgressEvent)>,
+    shutdown: Option<Arc<tokio::sync::Notify>>,
 ) -> Result<()> {
     let addr: std::net::SocketAddr = address
         .parse()
@@ -894,10 +917,13 @@ async fn serve(
     let listener = TcpListener::bind(addr)
         .await
         .map_err(|e| VykarError::Other(format!("failed to bind to {addr}: {e}")))?;
+    let bound = listener
+        .local_addr()
+        .map_err(|e| VykarError::Other(format!("local_addr failed: {e}")))?;
 
     if let Some(cb) = progress.as_deref_mut() {
         cb(MountProgressEvent::Serving {
-            address: format!("{addr}"),
+            address: format!("{bound}"),
         });
     }
 
@@ -929,7 +955,7 @@ async fn serve(
                                                 .status(200)
                                                 .header("content-type", "text/html; charset=utf-8")
                                                 .body(dav_server::body::Body::from(html))
-                                                .unwrap();
+                                                .expect("static HTML response is valid");
                                             Ok::<_, Infallible>(resp)
                                         }
                                         BrowserAction::Redirect(location) => {
@@ -937,7 +963,7 @@ async fn serve(
                                                 .status(301)
                                                 .header("location", location)
                                                 .body(dav_server::body::Body::from(""))
-                                                .unwrap();
+                                                .expect("redirect response is valid");
                                             Ok::<_, Infallible>(resp)
                                         }
                                         BrowserAction::PassThrough => {
@@ -954,6 +980,17 @@ async fn serve(
                 });
             }
             _ = tokio::signal::ctrl_c() => {
+                if let Some(cb) = progress.as_deref_mut() {
+                    cb(MountProgressEvent::ShuttingDown);
+                }
+                break;
+            }
+            _ = async {
+                match shutdown.as_ref() {
+                    Some(n) => n.notified().await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
                 if let Some(cb) = progress.as_deref_mut() {
                     cb(MountProgressEvent::ShuttingDown);
                 }

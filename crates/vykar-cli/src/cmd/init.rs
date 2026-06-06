@@ -2,12 +2,10 @@ use vykar_core::commands;
 use vykar_core::config::VykarConfig;
 use vykar_core::repo::identity;
 
+use crate::error::CliResult;
 use crate::passphrase::get_init_passphrase;
 
-pub(crate) fn run_init(
-    config: &VykarConfig,
-    label: Option<&str>,
-) -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) fn run_init(config: &VykarConfig, label: Option<&str>) -> CliResult<()> {
     let passphrase = get_init_passphrase(config, label)?;
 
     let repo = commands::init::run(config, passphrase.as_deref().map(|s| s.as_str()))?;

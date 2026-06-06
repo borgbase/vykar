@@ -78,10 +78,10 @@ pub fn parse_interval(raw: &str) -> vykar_types::error::Result<Duration> {
     })?;
 
     let secs = match unit {
-        Some('s') | Some('S') => value,
-        Some('m') | Some('M') => value.saturating_mul(60),
-        Some('h') | Some('H') => value.saturating_mul(60 * 60),
-        Some('d') | Some('D') => value.saturating_mul(60 * 60 * 24),
+        Some('s' | 'S') => value,
+        Some('m' | 'M') => value.saturating_mul(60),
+        Some('h' | 'H') => value.saturating_mul(60 * 60),
+        Some('d' | 'D') => value.saturating_mul(60 * 60 * 24),
         Some(other) => {
             return Err(vykar_types::error::VykarError::Config(format!(
                 "unsupported duration suffix '{other}' in '{raw}' (use s/m/h/d)"

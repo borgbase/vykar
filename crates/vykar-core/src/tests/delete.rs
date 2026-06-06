@@ -31,9 +31,10 @@ fn delete_dry_run_reports_impact_without_mutation() {
     let chunks_before = before.chunk_index().len();
     drop(before);
 
-    let all_stats = commands::delete::run(&config, None, &["snap-delete-dry"], true, None).unwrap();
-    assert_eq!(all_stats.len(), 1);
-    let stats = &all_stats[0];
+    let result = commands::delete::run(&config, None, &["snap-delete-dry"], true, None).unwrap();
+    assert_eq!(result.stats.len(), 1);
+    assert!(result.warnings.is_empty());
+    let stats = &result.stats[0];
     assert_eq!(stats.snapshot_name, "snap-delete-dry");
     assert!(stats.chunks_deleted > 0);
     assert!(stats.space_freed > 0);
@@ -64,10 +65,10 @@ fn delete_snapshot_removes_manifest_entry_and_chunk_refs() {
     assert!(chunks_before > 0);
     drop(before);
 
-    let all_stats =
-        commands::delete::run(&config, None, &["snap-delete-live"], false, None).unwrap();
-    assert_eq!(all_stats.len(), 1);
-    let stats = &all_stats[0];
+    let result = commands::delete::run(&config, None, &["snap-delete-live"], false, None).unwrap();
+    assert_eq!(result.stats.len(), 1);
+    assert!(result.warnings.is_empty());
+    let stats = &result.stats[0];
     assert_eq!(stats.snapshot_name, "snap-delete-live");
     assert!(stats.chunks_deleted > 0);
 
@@ -101,11 +102,11 @@ fn delete_multiple_snapshots_in_single_call() {
     drop(before);
 
     // Delete first two in one call.
-    let all_stats =
-        commands::delete::run(&config, None, &["snap-1", "snap-2"], false, None).unwrap();
-    assert_eq!(all_stats.len(), 2);
-    assert_eq!(all_stats[0].snapshot_name, "snap-1");
-    assert_eq!(all_stats[1].snapshot_name, "snap-2");
+    let result = commands::delete::run(&config, None, &["snap-1", "snap-2"], false, None).unwrap();
+    assert_eq!(result.stats.len(), 2);
+    assert!(result.warnings.is_empty());
+    assert_eq!(result.stats[0].snapshot_name, "snap-1");
+    assert_eq!(result.stats[1].snapshot_name, "snap-2");
 
     let after = open_local_repo(&repo_dir);
     assert!(after.manifest().find_snapshot("snap-1").is_none());
@@ -123,6 +124,7 @@ fn delete_multiple_snapshots_in_single_call() {
         "snap-3",
         restore_dir.to_str().unwrap(),
         None,
+        false,
         false,
     )
     .unwrap();
@@ -178,17 +180,18 @@ fn delete_deduplicates_snapshot_names() {
     drop(before);
 
     // Pass the same name twice — should succeed (deduped to one delete).
-    let all_stats =
+    let result =
         commands::delete::run(&config, None, &["snap-dup", "snap-dup"], false, None).unwrap();
-    assert_eq!(all_stats.len(), 1);
-    assert_eq!(all_stats[0].snapshot_name, "snap-dup");
+    assert_eq!(result.stats.len(), 1);
+    assert!(result.warnings.is_empty());
+    assert_eq!(result.stats[0].snapshot_name, "snap-dup");
 
     let after = open_local_repo(&repo_dir);
     assert!(after.manifest().find_snapshot("snap-dup").is_none());
     assert_eq!(after.chunk_index().len(), 0);
 
     // Verify the freed count matches the original chunk count.
-    assert_eq!(all_stats[0].chunks_deleted, chunks_before as u64);
+    assert_eq!(result.stats[0].chunks_deleted, chunks_before as u64);
 }
 
 #[test]
@@ -209,19 +212,115 @@ fn delete_dry_run_accounts_for_shared_chunks() {
     // Dry-run: delete both. The shared chunks should be counted as freed
     // (they appear in the second snapshot's stats after the first "removed"
     // them from refcount=2 to refcount=1 in the scratch index).
-    let dry_stats =
+    let dry_result =
         commands::delete::run(&config, None, &["snap-a", "snap-b"], true, None).unwrap();
-    assert_eq!(dry_stats.len(), 2);
+    assert_eq!(dry_result.stats.len(), 2);
 
-    let dry_total_freed: u64 = dry_stats.iter().map(|s| s.space_freed).sum();
-    let dry_total_chunks: u64 = dry_stats.iter().map(|s| s.chunks_deleted).sum();
+    let dry_total_freed: u64 = dry_result.stats.iter().map(|s| s.space_freed).sum();
+    let dry_total_chunks: u64 = dry_result.stats.iter().map(|s| s.chunks_deleted).sum();
 
     // Now actually delete both and compare.
-    let real_stats =
+    let real_result =
         commands::delete::run(&config, None, &["snap-a", "snap-b"], false, None).unwrap();
-    let real_total_freed: u64 = real_stats.iter().map(|s| s.space_freed).sum();
-    let real_total_chunks: u64 = real_stats.iter().map(|s| s.chunks_deleted).sum();
+    let real_total_freed: u64 = real_result.stats.iter().map(|s| s.space_freed).sum();
+    let real_total_chunks: u64 = real_result.stats.iter().map(|s| s.chunks_deleted).sum();
 
     assert_eq!(dry_total_chunks, real_total_chunks);
     assert_eq!(dry_total_freed, real_total_freed);
+}
+
+/// When a snapshot's blob has been deleted from storage (commit point
+/// reached) but its Phase 3 refcount cleanup fails, the operation must
+/// return `Ok(DeleteResult)` with the failed snapshot in `warnings` rather
+/// than propagating an error that would falsely suggest the delete failed.
+#[test]
+fn delete_phase3_refcount_failure_returns_warning_not_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = tmp.path().join("repo");
+    let source_dir = tmp.path().join("source");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    std::fs::create_dir_all(&source_dir).unwrap();
+    std::fs::write(source_dir.join("file.txt"), b"refcount-phase3-fault").unwrap();
+
+    let config = init_repo(&repo_dir);
+    backup_single_source(&config, &source_dir, "src", "snap-fail");
+
+    // Remove every pack file so `load_item_stream_from_ptrs` fails in Phase 3
+    // (Phase 2 still succeeds — it only deletes snapshots/<id>).
+    let packs_dir = repo_dir.join("packs");
+    for shard in std::fs::read_dir(&packs_dir).unwrap() {
+        let shard = shard.unwrap().path();
+        if !shard.is_dir() {
+            continue;
+        }
+        for entry in std::fs::read_dir(&shard).unwrap() {
+            let entry = entry.unwrap();
+            std::fs::remove_file(entry.path()).unwrap();
+        }
+    }
+
+    let result = commands::delete::run(&config, None, &["snap-fail"], false, None)
+        .expect("delete must not fail after the commit point — Phase 3 errors become warnings");
+
+    // Phase 2 succeeded (blob is gone), Phase 3 failed (no stats collected).
+    assert!(
+        result.stats.is_empty(),
+        "stats must be empty on Phase 3 failure"
+    );
+    assert!(
+        !result.warnings.is_empty(),
+        "Phase 3 failure must produce a warning"
+    );
+    let combined = result.warnings.join("\n");
+    assert!(
+        combined.contains("snap-fail"),
+        "warning should reference the failing snapshot: {combined}"
+    );
+    assert!(
+        combined.contains("vykar check --repair"),
+        "warning should point operators at the recovery tool: {combined}"
+    );
+
+    // Snapshot blob must actually be gone from storage despite the Phase 3 failure.
+    let after = open_local_repo(&repo_dir);
+    assert!(
+        after.manifest().find_snapshot("snap-fail").is_none(),
+        "snapshot blob should be deleted from storage even when Phase 3 fails"
+    );
+}
+
+/// Regression test for the GUI wrapper: a single-snapshot delete whose Phase 3
+/// fails must surface as `Ok(DeleteResult { stats: [], warnings: [..] })` and
+/// must not panic when callers use `result.stats.first()` to format output.
+#[test]
+fn delete_snapshot_wrapper_handles_empty_stats() {
+    use crate::app::operations;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = tmp.path().join("repo");
+    let source_dir = tmp.path().join("source");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    std::fs::create_dir_all(&source_dir).unwrap();
+    std::fs::write(source_dir.join("file.txt"), b"wrapper-phase3-fault").unwrap();
+
+    let config = init_repo(&repo_dir);
+    backup_single_source(&config, &source_dir, "src", "snap-wrapper");
+
+    // Break Phase 3 by removing all pack files.
+    let packs_dir = repo_dir.join("packs");
+    for shard in std::fs::read_dir(&packs_dir).unwrap() {
+        let shard = shard.unwrap().path();
+        if !shard.is_dir() {
+            continue;
+        }
+        for entry in std::fs::read_dir(&shard).unwrap() {
+            std::fs::remove_file(entry.unwrap().path()).unwrap();
+        }
+    }
+
+    let result = operations::delete_snapshot(&config, None, "snap-wrapper")
+        .expect("delete_snapshot must not fail after commit point");
+    assert!(result.stats.is_empty());
+    assert_eq!(result.warnings.len(), 1);
+    assert!(result.warnings[0].contains("snap-wrapper"));
 }

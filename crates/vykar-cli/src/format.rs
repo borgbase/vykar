@@ -1,5 +1,7 @@
-pub(crate) fn parse_size(s: &str) -> Result<u64, Box<dyn std::error::Error>> {
-    vykar_common::display::parse_size(s).map_err(|e| e.into())
+use crate::error::CliResult;
+
+pub(crate) fn parse_size(s: &str) -> CliResult<u64> {
+    Ok(vykar_common::display::parse_size(s)?)
 }
 
 pub(crate) use vykar_common::display::{format_bytes, format_count};
@@ -29,6 +31,10 @@ pub(crate) fn format_size_with_savings(bytes: u64, reference: u64, label: &str) 
     if reference == 0 {
         return format_bytes(bytes);
     }
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "human-readable savings percentage; exact byte precision is not required"
+    )]
     let pct = (1.0 - bytes as f64 / reference as f64) * 100.0;
     format!("{}  ({:.1}% {label})", format_bytes(bytes), pct)
 }

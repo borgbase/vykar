@@ -1,3 +1,14 @@
+#![forbid(unsafe_code)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic,
+        clippy::unwrap_used
+    )
+)]
+
 pub mod key;
 pub mod select;
 
@@ -7,14 +18,27 @@ use vykar_types::error::Result;
 pub trait CryptoEngine: Send + Sync {
     /// Encrypt plaintext. Returns `[nonce][ciphertext+tag]`.
     /// `aad` is authenticated but not encrypted (e.g., the type tag byte).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when nonce generation, cipher operation, or backend
+    /// validation fails.
     fn encrypt(&self, plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>>;
 
     /// Decrypt data produced by `encrypt`.
     /// `aad` must match what was passed during encryption.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the input is malformed or authentication fails.
     fn decrypt(&self, data: &[u8], aad: &[u8]) -> Result<Vec<u8>>;
 
     /// Encrypt `buffer` in-place and return `(nonce, tag)`.
     /// Avoids allocating a separate ciphertext buffer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when nonce generation or in-place encryption fails.
     fn encrypt_in_place_detached(
         &self,
         buffer: &mut [u8],
@@ -23,6 +47,10 @@ pub trait CryptoEngine: Send + Sync {
 
     /// Decrypt data produced by `encrypt` into a caller-provided buffer.
     /// Reuses existing capacity in `output` to reduce allocation churn.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the input is malformed or authentication fails.
     fn decrypt_into(&self, data: &[u8], aad: &[u8], output: &mut Vec<u8>) -> Result<()> {
         *output = self.decrypt(data, aad)?;
         Ok(())

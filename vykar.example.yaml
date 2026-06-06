@@ -94,6 +94,17 @@ compression:
 #     label: writing
 #     exclude:
 #       - "*.tmp"
+#
+# Inside a multi-path source, each path's contents are prefixed in the
+# snapshot by its full absolute path (leading `/` stripped on Unix,
+# drive-letter colon dropped and backslashes converted on Windows). This
+# lets paths with the same basename coexist:
+#
+# sources:
+#   - paths:
+#       - /etc
+#       - /var/lib/machines/base/etc
+#     label: etc-everywhere
 
 # Dump-only source (no filesystem paths; label required):
 #
@@ -144,8 +155,8 @@ compression:
 #     max_pack_size: 536870912     # 512 MiB
 #
 #     retry:
-#       max_retries: 5
-#       retry_delay_ms: 2000
+#       max_retries: 8             # default is 5 (~1 min avg backoff); raise for very unreliable links
+#       retry_delay_ms: 3000
 #       retry_max_delay_ms: 120000
 #
 #     encryption:

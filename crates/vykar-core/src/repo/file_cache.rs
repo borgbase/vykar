@@ -7,11 +7,25 @@ use blake2::Blake2bVar;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
+use crate::compress;
 use crate::snapshot::item::ChunkRef;
 use vykar_common::paths;
 use vykar_crypto::CryptoEngine;
+use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::Result;
 use vykar_types::snapshot_id::SnapshotId;
+
+/// Filecache on-disk plaintext format marker. The v2 layout is
+/// `[FORMAT_VERSION_BYTE][compress_stream_zstd(msgpack)]`.
+///
+/// The value is chosen so it can never collide with either the three
+/// compression codec tags (`TAG_NONE=0x00`, `TAG_LZ4=0x01`,
+/// `TAG_ZSTD=0x02`) or with any msgpack array/map header byte (the
+/// 0x80–0x8f / 0xdc / 0xdd / 0xde / 0xdf ranges). That makes the
+/// dispatch unambiguous: a legacy v1 plaintext (raw msgpack starting
+/// with a fix-array/fix-map header) can never be misread as v2, and a
+/// v2 plaintext can never be misread as raw compressed data.
+const FORMAT_VERSION_BYTE: u8 = 0x10;
 
 /// Atomic write via temp file + fsync + rename. On error the temp file is
 /// cleaned up automatically (NamedTempFile drops on panic/early return).
@@ -96,23 +110,157 @@ fn hash_path(path: &str) -> PathHash {
     PathHash(out)
 }
 
-/// Serde helper: serialize `Arc<Vec<ChunkRef>>` as a plain sequence (wire-format
-/// unchanged), deserialize via Vec then wrap in Arc.
-mod arc_vec_chunk_refs {
-    use super::*;
-    use serde::{Deserializer, Serializer};
+/// Compact chunk reference used only in the local filecache. Drops the
+/// `csize` field that `ChunkRef` carries — it's recomputed authoritatively
+/// from the repo index at commit time via `reuse_cached_chunk_ref`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct CachedChunkRef {
+    pub id: ChunkId,
+    pub size: u32,
+}
+
+/// Inline-single-chunk container for cached chunk refs. The common case for
+/// million-small-file backups is one chunk per file; `Single` avoids both
+/// the heap allocation and the `Arc` refcount for that path.
+#[derive(Debug, Clone)]
+pub enum CachedChunks {
+    Single(CachedChunkRef),
+    Many(Arc<Vec<CachedChunkRef>>),
+}
+
+impl CachedChunks {
+    /// Build from a `Vec`, picking the inline variant for 1-chunk entries.
+    pub fn from_vec(v: Vec<CachedChunkRef>) -> Self {
+        match v.as_slice() {
+            [only] => CachedChunks::Single(*only),
+            _ => CachedChunks::Many(Arc::new(v)),
+        }
+    }
+
+    /// Build from a snapshot-wire `ChunkRef` slice, dropping `csize` (the
+    /// filecache no longer carries it — it's rehydrated at commit time).
+    ///
+    /// The single-chunk path is intentionally allocation-free: it does not
+    /// build an intermediate `Vec<CachedChunkRef>`, which matters because
+    /// this is the hot insert path for every regular file in a backup.
+    pub fn from_chunk_refs(refs: &[ChunkRef]) -> Self {
+        match refs {
+            [cr] => CachedChunks::Single(CachedChunkRef {
+                id: cr.id,
+                size: cr.size,
+            }),
+            _ => CachedChunks::Many(Arc::new(
+                refs.iter()
+                    .map(|cr| CachedChunkRef {
+                        id: cr.id,
+                        size: cr.size,
+                    })
+                    .collect(),
+            )),
+        }
+    }
+
+    /// Owning counterpart to `from_chunk_refs`, consuming the source `Vec`.
+    /// Same zero-alloc fast path for the single-chunk case — the caller's
+    /// `Vec` is dropped without a second walk.
+    pub fn from_owned_chunk_refs(mut refs: Vec<ChunkRef>) -> Self {
+        if refs.len() == 1 {
+            let cr = refs.pop().expect("checked exactly one chunk ref");
+            CachedChunks::Single(CachedChunkRef {
+                id: cr.id,
+                size: cr.size,
+            })
+        } else {
+            CachedChunks::Many(Arc::new(
+                refs.into_iter()
+                    .map(|cr| CachedChunkRef {
+                        id: cr.id,
+                        size: cr.size,
+                    })
+                    .collect(),
+            ))
+        }
+    }
+
+    pub fn as_slice(&self) -> &[CachedChunkRef] {
+        match self {
+            CachedChunks::Single(r) => std::slice::from_ref(r),
+            CachedChunks::Many(arc) => arc.as_slice(),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.as_slice().is_empty()
+    }
+}
+
+/// Serde codec for `CachedChunks` that serializes both variants as a plain
+/// msgpack sequence of `CachedChunkRef`. Crucially this does NOT add any
+/// enum-variant framing — the wire format is identical to a
+/// `Vec<CachedChunkRef>`. A derived enum `Serialize` would emit a tag and
+/// erase the per-entry byte savings.
+///
+/// The deserializer is a hand-written `SeqAccess` visitor rather than
+/// `Vec::<CachedChunkRef>::deserialize`: for million-entry single-chunk
+/// workloads that avoids a million transient `Vec` allocations on load.
+mod cached_chunks_serde {
+    use super::{Arc, CachedChunkRef, CachedChunks};
+    use serde::de::{Deserializer, SeqAccess, Visitor};
+    use serde::{Serialize, Serializer};
+    use std::fmt;
 
     pub fn serialize<S: Serializer>(
-        v: &Arc<Vec<ChunkRef>>,
+        c: &CachedChunks,
         s: S,
     ) -> std::result::Result<S::Ok, S::Error> {
-        v.as_slice().serialize(s)
+        match c {
+            CachedChunks::Single(r) => [*r][..].serialize(s),
+            CachedChunks::Many(arc) => arc.as_slice().serialize(s),
+        }
+    }
+
+    struct CachedChunksVisitor;
+
+    impl<'de> Visitor<'de> for CachedChunksVisitor {
+        type Value = CachedChunks;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a sequence of CachedChunkRef")
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
+            let Some(first) = seq.next_element::<CachedChunkRef>()? else {
+                // Empty sequence: rare, but preserves round-trip symmetry
+                // with `from_vec(Vec::new())`.
+                return Ok(CachedChunks::Many(Arc::new(Vec::new())));
+            };
+            let Some(second) = seq.next_element::<CachedChunkRef>()? else {
+                return Ok(CachedChunks::Single(first));
+            };
+            // Two or more: allocate using the size hint when available
+            // (msgpack sequences are length-prefixed, so this is exact).
+            let cap = seq.size_hint().unwrap_or(0).saturating_add(2).max(2);
+            let mut v = Vec::with_capacity(cap);
+            v.push(first);
+            v.push(second);
+            while let Some(next) = seq.next_element::<CachedChunkRef>()? {
+                v.push(next);
+            }
+            Ok(CachedChunks::Many(Arc::new(v)))
+        }
     }
 
     pub fn deserialize<'de, D: Deserializer<'de>>(
         d: D,
-    ) -> std::result::Result<Arc<Vec<ChunkRef>>, D::Error> {
-        Vec::<ChunkRef>::deserialize(d).map(Arc::new)
+    ) -> std::result::Result<CachedChunks, D::Error> {
+        d.deserialize_seq(CachedChunksVisitor)
     }
 }
 
@@ -124,8 +272,8 @@ pub struct FileCacheEntry {
     pub mtime_ns: i64,
     pub ctime_ns: i64,
     pub size: u64,
-    #[serde(with = "arc_vec_chunk_refs")]
-    pub chunk_refs: Arc<Vec<ChunkRef>>,
+    #[serde(with = "cached_chunks_serde")]
+    pub chunk_refs: CachedChunks,
 }
 
 /// A per-source section of the file cache, keyed by source paths.
@@ -151,6 +299,15 @@ pub struct FileCache {
     /// `insert`/`lookup`. Sorted by length descending for longest-prefix-match.
     #[serde(skip)]
     active_keys: Vec<String>,
+}
+
+/// Structured outcome of decoding an on-disk cache blob. `load` matches on
+/// this so a rejected-to-empty result does not masquerade as a legitimately
+/// empty decode in the logs.
+enum CacheDecode {
+    Loaded(FileCache),
+    Rejected { reason: &'static str },
+    Malformed { error: String },
 }
 
 impl FileCache {
@@ -181,7 +338,7 @@ impl FileCache {
             self.sections.insert(
                 root.clone(),
                 CacheSection {
-                    anchor_snapshot_id: SnapshotId([0u8; 32]),
+                    anchor_snapshot_id: SnapshotId::from_bytes([0u8; 32]),
                     entries: HashMap::with_capacity(hint),
                 },
             );
@@ -225,7 +382,7 @@ impl FileCache {
         mtime_ns: i64,
         ctime_ns: i64,
         size: u64,
-    ) -> Option<Arc<Vec<ChunkRef>>> {
+    ) -> Option<CachedChunks> {
         if self.active_keys.is_empty() {
             return None;
         }
@@ -239,7 +396,42 @@ impl FileCache {
             && entry.ctime_ns == ctime_ns
             && entry.size == size
         {
-            Some(Arc::clone(&entry.chunk_refs))
+            Some(entry.chunk_refs.clone())
+        } else {
+            None
+        }
+    }
+
+    /// Look up a dataless (macOS FileProvider placeholder) file. Matches on
+    /// `(device, inode, mtime_ns, size)` and intentionally **ignores ctime**:
+    /// toggling the `SF_DATALESS` flag bumps ctime even when the logical
+    /// content is unchanged, so requiring ctime equality would force every
+    /// dataless file to fall through to the (weaker) parent-reuse path or be
+    /// skipped entirely on the warm-cache path.
+    ///
+    /// This identity is strictly stronger than
+    /// [`ParentReuseIndex::lookup_dataless`]'s `(path, size, mtime)` because
+    /// device+inode pin the on-disk inode rather than just the path string.
+    pub fn lookup_dataless(
+        &self,
+        path: &str,
+        device: u64,
+        inode: u64,
+        mtime_ns: i64,
+        size: u64,
+    ) -> Option<CachedChunks> {
+        if self.active_keys.is_empty() {
+            return None;
+        }
+        let section_key = self.find_section_key(path)?;
+        let section = self.sections.get(section_key)?;
+        let entry = section.entries.get(&hash_path(path))?;
+        if entry.device == device
+            && entry.inode == inode
+            && entry.mtime_ns == mtime_ns
+            && entry.size == size
+        {
+            Some(entry.chunk_refs.clone())
         } else {
             None
         }
@@ -260,7 +452,7 @@ impl FileCache {
         mtime_ns: i64,
         ctime_ns: i64,
         size: u64,
-        chunk_refs: Arc<Vec<ChunkRef>>,
+        chunk_refs: CachedChunks,
     ) {
         let p = Path::new(path);
         let path_hash = hash_path(path);
@@ -284,7 +476,11 @@ impl FileCache {
         );
         // Insert into all matching sections (handles overlapping roots).
         // Clone for all but the last, move for the last.
-        for key in &matching[..matching.len() - 1] {
+        let head = matching
+            .split_last()
+            .expect("matching is non-empty (asserted above)")
+            .1;
+        for key in head {
             self.sections
                 .get_mut(key)
                 .expect("insert called without active section")
@@ -292,7 +488,11 @@ impl FileCache {
                 .insert(path_hash, entry.clone());
         }
         self.sections
-            .get_mut(matching.last().unwrap())
+            .get_mut(
+                matching
+                    .last()
+                    .expect("insert called without active section"),
+            )
             .expect("insert called without active section")
             .entries
             .insert(path_hash, entry);
@@ -376,47 +576,70 @@ impl FileCache {
         self.sections.values().all(|s| s.entries.is_empty())
     }
 
-    /// Maximum plausible cache entries per byte of plaintext.
-    /// Each serialized entry is at least ~40 bytes (16-byte key + metadata).
+    /// Minimum plaintext bytes per serialized entry. Used as a post-decode
+    /// plausibility ratio (16-byte key + metadata ≥ ~40 bytes).
     const MIN_BYTES_PER_ENTRY: usize = 40;
 
-    /// Decode from msgpack plaintext. Old format (flat HashMap) returns empty
-    /// cache for one-time migration.
+    /// Decode from msgpack plaintext. Old format (flat HashMap) and bogus
+    /// input collapse to an empty cache so the one-time migration path is
+    /// non-fatal.
     ///
-    /// Applies a safety cap: rejects caches that claim more entries than the
-    /// plaintext could possibly encode, preventing allocation bombs from
-    /// corrupted local cache files.
+    /// Thin wrapper over the private `decode_from_plaintext_outcome` helper
+    /// for callers that only need a `FileCache` and can treat rejected and
+    /// malformed input alike as "start fresh".
     pub fn decode_from_plaintext(plaintext: &[u8]) -> Result<Self> {
-        // Reject absurdly large inputs early (256 MiB should cover any real cache).
-        if plaintext.len() > 256 * 1024 * 1024 {
-            debug!(
-                "file cache: plaintext too large ({}), starting fresh",
-                plaintext.len()
-            );
-            return Ok(Self::new());
-        }
+        Ok(match Self::decode_from_plaintext_outcome(plaintext) {
+            CacheDecode::Loaded(cache) => cache,
+            CacheDecode::Rejected { .. } | CacheDecode::Malformed { .. } => Self::new(),
+        })
+    }
 
-        match rmp_serde::from_slice::<FileCache>(plaintext) {
-            Ok(cache) => {
-                // Post-decode sanity: reject if total entry count exceeds what
-                // the plaintext could encode. This catches msgpack containers
-                // with inflated length headers that rmp_serde happened to fill.
-                let max_entries = plaintext.len() / Self::MIN_BYTES_PER_ENTRY;
-                if cache.len() > max_entries {
-                    debug!(
-                        entries = cache.len(),
-                        max_entries,
-                        "file cache: entry count exceeds plausible limit, starting fresh"
-                    );
-                    return Ok(Self::new());
+    /// Structured decode: lets callers distinguish "decoded fine" from
+    /// "rejected to empty" from "malformed input", so log sites aren't
+    /// forced to claim every empty cache was legitimately empty.
+    ///
+    /// The v2 plaintext layout is
+    /// `[FORMAT_VERSION_BYTE][compress_stream_zstd(msgpack)]`. Legacy v1
+    /// blobs, truncated plaintext, or any future version we don't recognise
+    /// all route through `Malformed` and collapse to an empty cache — the
+    /// same UX as cache corruption today.
+    ///
+    /// The ratio check below runs *after* `rmp_serde::from_slice` has
+    /// already allocated, so it doesn't prevent allocation — it only
+    /// catches msgpack containers whose inflated length headers rmp_serde
+    /// happened to fill with garbage.
+    fn decode_from_plaintext_outcome(plaintext: &[u8]) -> CacheDecode {
+        let Some((&first, rest)) = plaintext.split_first() else {
+            return CacheDecode::Malformed {
+                error: "empty plaintext".into(),
+            };
+        };
+        if first != FORMAT_VERSION_BYTE {
+            return CacheDecode::Malformed {
+                error: format!("unrecognised filecache format byte 0x{first:02x}"),
+            };
+        }
+        let raw = match compress::decompress_metadata(rest) {
+            Ok(r) => r,
+            Err(e) => {
+                return CacheDecode::Malformed {
+                    error: format!("decompress: {e}"),
                 }
-                Ok(cache)
             }
-            Err(_) => {
-                // Old format or corrupted — return empty cache.
-                debug!("file cache: failed to decode, starting fresh");
-                Ok(Self::new())
+        };
+        match rmp_serde::from_slice::<FileCache>(&raw) {
+            Ok(cache) => {
+                let max_entries = raw.len() / Self::MIN_BYTES_PER_ENTRY;
+                if cache.len() > max_entries {
+                    return CacheDecode::Rejected {
+                        reason: "entry count exceeds plausible ratio",
+                    };
+                }
+                CacheDecode::Loaded(cache)
             }
+            Err(e) => CacheDecode::Malformed {
+                error: e.to_string(),
+            },
         }
     }
 
@@ -456,8 +679,8 @@ impl FileCache {
                 }
             }
         };
-        match Self::decode_from_plaintext(&plaintext) {
-            Ok(cache) => {
+        match Self::decode_from_plaintext_outcome(&plaintext) {
+            CacheDecode::Loaded(cache) => {
                 let total_entries: usize = cache.sections.values().map(|s| s.entries.len()).sum();
                 info!(
                     sections = cache.sections.len(),
@@ -467,15 +690,29 @@ impl FileCache {
                 for (key, section) in &cache.sections {
                     info!(
                         key,
-                        anchor = %hex::encode(&section.anchor_snapshot_id.0[..8]),
+                        anchor = %hex::encode(&section.anchor_snapshot_id.as_bytes()[..8]),
                         entries = section.entries.len(),
                         "file cache section"
                     );
                 }
                 cache
             }
-            Err(e) => {
-                warn!(error = %e, "file cache: failed to deserialize, starting fresh");
+            CacheDecode::Rejected { reason } => {
+                info!(
+                    path = %path.display(),
+                    plaintext_bytes = plaintext.len(),
+                    reason,
+                    "file cache rejected, starting fresh"
+                );
+                Self::new()
+            }
+            CacheDecode::Malformed { error } => {
+                warn!(
+                    path = %path.display(),
+                    plaintext_bytes = plaintext.len(),
+                    error,
+                    "file cache: failed to deserialize (corrupt or legacy format?), starting fresh"
+                );
                 Self::new()
             }
         }
@@ -500,7 +737,13 @@ impl FileCache {
             b"filecache",
             estimated,
             crypto,
-            |buf| Ok(rmp_serde::encode::write(buf, self)?),
+            |buf| {
+                buf.push(FORMAT_VERSION_BYTE);
+                compress::compress_stream_zstd(buf, 3, |encoder| {
+                    rmp_serde::encode::write(encoder, self)?;
+                    Ok(())
+                })
+            },
         )?;
         debug!(
             entries = self.len(),
@@ -530,7 +773,7 @@ struct ParentEntry {
     mtime_ns: i64,
     ctime_ns: i64,
     size: u64,
-    chunk_refs: Arc<Vec<ChunkRef>>,
+    chunk_refs: CachedChunks,
 }
 
 /// Root emission policy for a single parent-reuse source.
@@ -539,9 +782,10 @@ pub enum ParentReusePolicy {
     /// Descendants are emitted relative to `abs_root`; no synthetic root entry
     /// is present in the snapshot.
     SkipRoot,
-    /// Snapshot paths are prefixed with `basename`; when the item path equals
-    /// `basename` exactly, the "remainder" is empty (file source).
-    EmitRoot { basename: String },
+    /// Snapshot paths are prefixed with `prefix`; when the item path equals
+    /// `prefix` exactly, the "remainder" is empty (file source). The `prefix`
+    /// may be multi-component (e.g. `var/lib/machines/base/etc`).
+    EmitRoot { prefix: String },
 }
 
 /// One root plus its policy, used to invert snapshot item paths back into
@@ -556,12 +800,12 @@ impl ParentReuseRoot {
     fn invert(&self, item_path: &str) -> Option<PathBuf> {
         match &self.policy {
             ParentReusePolicy::SkipRoot => Some(Path::new(&self.abs_root).join(item_path)),
-            ParentReusePolicy::EmitRoot { basename } => {
-                if item_path == basename {
+            ParentReusePolicy::EmitRoot { prefix } => {
+                if item_path == prefix {
                     Some(PathBuf::from(&self.abs_root))
                 } else {
                     item_path
-                        .strip_prefix(basename.as_str())
+                        .strip_prefix(prefix.as_str())
                         .and_then(|r| r.strip_prefix('/'))
                         .map(|rest| Path::new(&self.abs_root).join(rest))
                 }
@@ -585,7 +829,8 @@ impl ParentReuseBuilder {
     /// Create a builder from a list of `ParentReuseRoot`s. Each root carries
     /// the canonical filesystem root plus its emission policy, so inversion
     /// is uniform across SkipRoot / EmitRoot / EmitRoot-with-empty-remainder
-    /// cases.
+    /// cases. Nested canonical roots and equal prefixes are rejected at
+    /// source resolution, so first-match traversal is unambiguous here.
     pub fn new(roots: Vec<ParentReuseRoot>) -> Self {
         Self {
             entries: HashMap::new(),
@@ -612,13 +857,14 @@ impl ParentReuseBuilder {
         };
 
         let abs_path = reconstruct_abs_path(&item.path, &self.roots);
+        let cached = CachedChunks::from_owned_chunk_refs(item.chunks);
         self.entries.insert(
             hash_path(&abs_path),
             ParentEntry {
                 mtime_ns: item.mtime,
                 ctime_ns,
                 size: item.size,
-                chunk_refs: Arc::new(item.chunks),
+                chunk_refs: cached,
             },
         );
         true
@@ -646,10 +892,46 @@ impl ParentReuseIndex {
         size: u64,
         mtime_ns: i64,
         ctime_ns: i64,
-    ) -> Option<Arc<Vec<ChunkRef>>> {
+    ) -> Option<CachedChunks> {
         let entry = self.entries.get(&hash_path(abs_path))?;
         if entry.size == size && entry.mtime_ns == mtime_ns && entry.ctime_ns == ctime_ns {
-            Some(Arc::clone(&entry.chunk_refs))
+            Some(entry.chunk_refs.clone())
+        } else {
+            None
+        }
+    }
+
+    /// Look up a dataless (macOS FileProvider placeholder) file. Matches on
+    /// `(path_hash, size, mtime)` and intentionally **ignores ctime** because
+    /// `SF_DATALESS` flag toggles bump ctime even when the logical content is
+    /// unchanged; ctime is unreliable across hydration transitions.
+    ///
+    /// Used so a previously backed-up file that has since become dataless
+    /// continues to flow into subsequent snapshots without re-reading the
+    /// (now placeholder) bytes.
+    ///
+    /// # Identity caveat
+    ///
+    /// This identity is weaker than the warm-cache check in
+    /// [`FileCache::lookup_dataless`], which adds device+inode. The failure
+    /// mode this does not catch: a placeholder swapped in at the same path
+    /// with an identical `(size, mtime)` triple inherits the previous file's
+    /// chunks. Adding inode would require a snapshot wire-format change
+    /// (snapshot `Item` does not carry inode) and is out of scope.
+    ///
+    /// The exposure surface is narrow because this path is only hit on a
+    /// cold start where the local file cache section is invalid; warm-cache
+    /// dataless lookups go through the stronger
+    /// `(device, inode, size, mtime)` check first.
+    pub fn lookup_dataless(
+        &self,
+        abs_path: &str,
+        size: u64,
+        mtime_ns: i64,
+    ) -> Option<CachedChunks> {
+        let entry = self.entries.get(&hash_path(abs_path))?;
+        if entry.size == size && entry.mtime_ns == mtime_ns {
+            Some(entry.chunk_refs.clone())
         } else {
             None
         }
@@ -658,8 +940,9 @@ impl ParentReuseIndex {
 
 /// Reconstruct the absolute path that the walker will use for cache lookups,
 /// given a snapshot item path and a list of `ParentReuseRoot`s. Returns the
-/// first root that matches — duplicate basenames are rejected up front at
-/// source resolution, so first-match is unambiguous for current snapshots.
+/// first root that matches — equal prefixes and nested canonical roots are
+/// rejected up front at source resolution, so first-match is unambiguous for
+/// current snapshots.
 ///
 /// Uses `Path::join` + `to_string_lossy` to produce the same string form
 /// as the walker's `abs_path.to_string_lossy()`.
@@ -683,21 +966,35 @@ mod tests {
         Path::new(root).join(rel).to_string_lossy().to_string()
     }
 
-    fn sample_chunk_refs() -> Arc<Vec<ChunkRef>> {
-        Arc::new(vec![ChunkRef {
-            id: ChunkId([0xAA; 32]),
+    fn sample_chunk_refs() -> CachedChunks {
+        CachedChunks::Single(CachedChunkRef {
+            id: ChunkId::from_bytes([0xAA; 32]),
             size: 1024,
-            csize: 512,
-        }])
+        })
     }
 
     /// Raw Vec variant for constructing `Item` structs in tests.
     fn sample_chunk_refs_vec() -> Vec<ChunkRef> {
         vec![ChunkRef {
-            id: ChunkId([0xAA; 32]),
+            id: ChunkId::from_bytes([0xAA; 32]),
             size: 1024,
             csize: 512,
         }]
+    }
+
+    /// Encode a cache to the v2 plaintext layout used on disk, without
+    /// encryption. Used by the persistence-roundtrip tests that want to
+    /// exercise `decode_from_plaintext_outcome` without spinning up a
+    /// `CryptoEngine`.
+    fn encode_plaintext_v2(cache: &FileCache) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.push(FORMAT_VERSION_BYTE);
+        crate::compress::compress_stream_zstd(&mut buf, 3, |enc| {
+            rmp_serde::encode::write(enc, cache)?;
+            Ok(())
+        })
+        .unwrap();
+        buf
     }
 
     /// Helper to build a Vec<String> from path literals.
@@ -858,6 +1155,141 @@ mod tests {
     }
 
     #[test]
+    fn lookup_dataless_ignores_ctime() {
+        let mut cache = FileCache::new();
+        cache.begin_sections(&roots(&["/tmp"]), &[0]);
+        cache.insert(
+            "/tmp/test.txt",
+            1,
+            1000,
+            1234567890,
+            1234567890,
+            4096,
+            sample_chunk_refs(),
+        );
+
+        // (device, inode, mtime, size) match — ctime difference must be
+        // ignored, since SF_DATALESS toggles bump ctime.
+        let result = cache.lookup_dataless("/tmp/test.txt", 1, 1000, 1234567890, 4096);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn lookup_dataless_miss_changed_size() {
+        let mut cache = FileCache::new();
+        cache.begin_sections(&roots(&["/tmp"]), &[0]);
+        cache.insert(
+            "/tmp/test.txt",
+            1,
+            1000,
+            1234567890,
+            1234567890,
+            4096,
+            sample_chunk_refs(),
+        );
+
+        let result = cache.lookup_dataless("/tmp/test.txt", 1, 1000, 1234567890, 8192);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn lookup_dataless_miss_changed_mtime() {
+        let mut cache = FileCache::new();
+        cache.begin_sections(&roots(&["/tmp"]), &[0]);
+        cache.insert(
+            "/tmp/test.txt",
+            1,
+            1000,
+            1234567890,
+            1234567890,
+            4096,
+            sample_chunk_refs(),
+        );
+
+        let result = cache.lookup_dataless("/tmp/test.txt", 1, 1000, 9999999999, 4096);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn lookup_dataless_miss_changed_inode() {
+        let mut cache = FileCache::new();
+        cache.begin_sections(&roots(&["/tmp"]), &[0]);
+        cache.insert(
+            "/tmp/test.txt",
+            1,
+            1000,
+            1234567890,
+            1234567890,
+            4096,
+            sample_chunk_refs(),
+        );
+
+        // Inode change must miss — the placeholder is a different on-disk
+        // inode even if path/size/mtime collide.
+        let result = cache.lookup_dataless("/tmp/test.txt", 1, 2000, 1234567890, 4096);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn lookup_dataless_miss_changed_device() {
+        let mut cache = FileCache::new();
+        cache.begin_sections(&roots(&["/tmp"]), &[0]);
+        cache.insert(
+            "/tmp/test.txt",
+            1,
+            1000,
+            1234567890,
+            1234567890,
+            4096,
+            sample_chunk_refs(),
+        );
+
+        // Device change must miss — same inode number on a different device
+        // is a different file.
+        let result = cache.lookup_dataless("/tmp/test.txt", 2, 1000, 1234567890, 4096);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn lookup_dataless_miss_unknown_path() {
+        let mut cache = FileCache::new();
+        cache.begin_sections(&roots(&["/tmp"]), &[0]);
+        cache.insert(
+            "/tmp/test.txt",
+            1,
+            1000,
+            1234567890,
+            1234567890,
+            4096,
+            sample_chunk_refs(),
+        );
+
+        let result = cache.lookup_dataless("/tmp/other.txt", 1, 1000, 1234567890, 4096);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn lookup_dataless_miss_no_active_section() {
+        let mut cache = FileCache::new();
+        cache.begin_sections(&roots(&["/tmp"]), &[0]);
+        cache.insert(
+            "/tmp/test.txt",
+            1,
+            1000,
+            1234567890,
+            1234567890,
+            4096,
+            sample_chunk_refs(),
+        );
+
+        // Activating an unrelated path leaves no section matching /tmp.
+        assert!(!cache.activate_for_walk_roots(&roots(&["/other"])));
+        let result = cache.lookup_dataless("/tmp/test.txt", 1, 1000, 1234567890, 4096);
+        assert!(result.is_none());
+    }
+
+    #[test]
     fn insert_overwrites_existing() {
         let mut cache = FileCache::new();
         cache.begin_sections(&roots(&["/tmp"]), &[0]);
@@ -877,7 +1309,7 @@ mod tests {
             9999999999,
             9999999999,
             8192,
-            Arc::new(vec![]),
+            CachedChunks::from_vec(Vec::new()),
         );
 
         assert_eq!(cache.len(), 1);
@@ -929,8 +1361,8 @@ mod tests {
     #[test]
     fn invalidate_missing_snapshots() {
         let mut cache = FileCache::new();
-        let id_a = SnapshotId([0xAA; 32]);
-        let id_b = SnapshotId([0xBB; 32]);
+        let id_a = SnapshotId::from_bytes([0xAA; 32]);
+        let id_b = SnapshotId::from_bytes([0xBB; 32]);
 
         let key_a = "/a".to_string();
         let key_b = "/b".to_string();
@@ -960,7 +1392,7 @@ mod tests {
     fn activate_for_walk_roots_finds_sections() {
         let mut cache = FileCache::new();
         cache.begin_sections(&roots(&["/data", "/config"]), &[0, 0]);
-        cache.finalize_sections(SnapshotId([0x11; 32]));
+        cache.finalize_sections(SnapshotId::from_bytes([0x11; 32]));
 
         // Both paths activate.
         assert!(cache.activate_for_walk_roots(&roots(&["/data", "/config"])));
@@ -978,7 +1410,7 @@ mod tests {
         let mut cache = FileCache::new();
         cache.begin_sections(&roots(&["/data"]), &[0]);
         cache.insert("/data/a.txt", 1, 1, 1, 1, 100, sample_chunk_refs());
-        cache.finalize_sections(SnapshotId([0x22; 32]));
+        cache.finalize_sections(SnapshotId::from_bytes([0x22; 32]));
 
         // Activate by the same path (regardless of what label was used).
         assert!(cache.activate_for_walk_roots(&roots(&["/data"])));
@@ -988,8 +1420,8 @@ mod tests {
     #[test]
     fn merge_section_replaces_only_target() {
         let mut cache = FileCache::new();
-        let id_a = SnapshotId([0xAA; 32]);
-        let id_b = SnapshotId([0xBB; 32]);
+        let id_a = SnapshotId::from_bytes([0xAA; 32]);
+        let id_b = SnapshotId::from_bytes([0xBB; 32]);
 
         let key_a = "/a".to_string();
         let key_b = "/b".to_string();
@@ -1015,8 +1447,8 @@ mod tests {
     #[test]
     fn merge_section_overwrites_same_paths() {
         let mut cache = FileCache::new();
-        let id_old = SnapshotId([0xAA; 32]);
-        let id_new = SnapshotId([0xBB; 32]);
+        let id_old = SnapshotId::from_bytes([0xAA; 32]);
+        let id_new = SnapshotId::from_bytes([0xBB; 32]);
         let key = "/data".to_string();
 
         cache.sections.insert(
@@ -1043,14 +1475,17 @@ mod tests {
         let mut cache = FileCache::new();
         cache.begin_sections(&roots(&["/src"]), &[0]);
         cache.insert("/src/a.txt", 1, 1, 1, 1, 100, sample_chunk_refs());
-        cache.finalize_sections(SnapshotId([0x42; 32]));
+        cache.finalize_sections(SnapshotId::from_bytes([0x42; 32]));
 
         let taken = cache.take_active_sections();
         assert_eq!(taken.len(), 1);
         let (key, section) = &taken[0];
         assert_eq!(key, "/src");
         assert_eq!(section.entries.len(), 1);
-        assert_eq!(section.anchor_snapshot_id, SnapshotId([0x42; 32]));
+        assert_eq!(
+            section.anchor_snapshot_id,
+            SnapshotId::from_bytes([0x42; 32])
+        );
         assert!(cache.sections.is_empty());
     }
 
@@ -1060,7 +1495,7 @@ mod tests {
         cache.begin_sections(&roots(&["/a", "/b"]), &[0, 0]);
         cache.insert("/a/f.txt", 1, 1, 1, 1, 100, sample_chunk_refs());
         cache.insert("/b/g.txt", 1, 2, 2, 2, 200, sample_chunk_refs());
-        cache.finalize_sections(SnapshotId([0x42; 32]));
+        cache.finalize_sections(SnapshotId::from_bytes([0x42; 32]));
 
         let taken = cache.take_active_sections();
         assert_eq!(taken.len(), 2);
@@ -1092,21 +1527,26 @@ mod tests {
                 sample_chunk_refs(),
             );
         }
-        cache.finalize_sections(SnapshotId([0xDD; 32]));
+        cache.finalize_sections(SnapshotId::from_bytes([0xDD; 32]));
 
         let key = "/tmp".to_string();
-        let plaintext = rmp_serde::to_vec(&cache).unwrap();
+        let plaintext = encode_plaintext_v2(&cache);
         let decoded = FileCache::decode_from_plaintext(&plaintext).unwrap();
         assert_eq!(decoded.sections.len(), 1);
         assert!(decoded.sections.contains_key(&key));
         let section = &decoded.sections[&key];
         assert_eq!(section.entries.len(), 10);
-        assert_eq!(section.anchor_snapshot_id, SnapshotId([0xDD; 32]));
+        assert_eq!(
+            section.anchor_snapshot_id,
+            SnapshotId::from_bytes([0xDD; 32])
+        );
     }
 
     #[test]
-    fn old_format_returns_empty_cache() {
-        // Old flat-map format — should gracefully return empty.
+    fn v1_blob_yields_empty_cache() {
+        // v1-shape plaintext: raw msgpack, no FORMAT_VERSION_BYTE prefix.
+        // A first load after upgrade will trip the version-byte mismatch
+        // and degrade to a one-time cold walk.
         #[derive(Serialize)]
         struct OldFileCache {
             entries: HashMap<String, FileCacheEntry>,
@@ -1130,12 +1570,154 @@ mod tests {
     }
 
     #[test]
+    fn corrupt_after_version_byte_yields_empty_cache() {
+        // Version byte followed by non-zstd garbage must collapse to empty
+        // cache (no panic), same as any other corruption.
+        let mut blob = vec![FORMAT_VERSION_BYTE];
+        blob.extend_from_slice(b"\xFF\xFE\xFD not a zstd frame");
+        let decoded = FileCache::decode_from_plaintext(&blob).unwrap();
+        assert!(decoded.is_empty());
+    }
+
+    #[test]
     fn bogus_data_returns_empty_cache() {
         let garbage = vec![0xFF, 0xFE, 0xFD];
         let result = FileCache::decode_from_plaintext(&garbage);
         assert!(result.is_ok());
         assert!(result.unwrap().is_empty());
     }
+
+    #[test]
+    fn v2_roundtrip_single_and_many_chunks() {
+        let mut cache = FileCache::new();
+        cache.begin_sections(&roots(&["/tmp"]), &[0]);
+
+        // Single-chunk entry.
+        cache.insert(
+            "/tmp/one.txt",
+            1,
+            10,
+            1,
+            1,
+            100,
+            CachedChunks::Single(CachedChunkRef {
+                id: ChunkId::from_bytes([0xAA; 32]),
+                size: 100,
+            }),
+        );
+        // Many-chunk entry.
+        let many = CachedChunks::from_vec(vec![
+            CachedChunkRef {
+                id: ChunkId::from_bytes([0xBB; 32]),
+                size: 200,
+            },
+            CachedChunkRef {
+                id: ChunkId::from_bytes([0xCC; 32]),
+                size: 300,
+            },
+            CachedChunkRef {
+                id: ChunkId::from_bytes([0xDD; 32]),
+                size: 400,
+            },
+        ]);
+        cache.insert("/tmp/many.txt", 1, 11, 2, 2, 900, many);
+        cache.finalize_sections(SnapshotId::from_bytes([0xEE; 32]));
+
+        let plaintext = encode_plaintext_v2(&cache);
+        let mut decoded = FileCache::decode_from_plaintext(&plaintext).unwrap();
+        assert!(decoded.activate_for_walk_roots(&roots(&["/tmp"])));
+
+        let one = decoded.lookup("/tmp/one.txt", 1, 10, 1, 1, 100).unwrap();
+        assert!(matches!(one, CachedChunks::Single(_)));
+        assert_eq!(one.len(), 1);
+        assert_eq!(one.as_slice()[0].id, ChunkId::from_bytes([0xAA; 32]));
+
+        let many = decoded.lookup("/tmp/many.txt", 1, 11, 2, 2, 900).unwrap();
+        assert!(matches!(many, CachedChunks::Many(_)));
+        assert_eq!(many.len(), 3);
+        assert_eq!(many.as_slice()[2].id, ChunkId::from_bytes([0xDD; 32]));
+    }
+
+    #[test]
+    fn cached_chunks_serde_no_enum_framing() {
+        // Guard: the custom codec must emit the same bytes as a plain
+        // `Vec<CachedChunkRef>`. A derived enum Serialize would add a
+        // variant tag, defeating the wire-format compatibility goal.
+        #[derive(Serialize, Deserialize)]
+        struct Wrap(#[serde(with = "cached_chunks_serde")] CachedChunks);
+
+        let single = CachedChunks::Single(CachedChunkRef {
+            id: ChunkId::from_bytes([0x33; 32]),
+            size: 42,
+        });
+        let wrapped_bytes = rmp_serde::to_vec(&Wrap(single)).unwrap();
+        let vec_bytes = rmp_serde::to_vec(&vec![CachedChunkRef {
+            id: ChunkId::from_bytes([0x33; 32]),
+            size: 42,
+        }])
+        .unwrap();
+        assert_eq!(wrapped_bytes, vec_bytes);
+    }
+
+    #[test]
+    fn size_regression_unique_chunks_10k() {
+        // Pessimal 1-chunk-per-file workload: every entry carries a random
+        // PathHash + ChunkId. Target: well under 88 B/entry on disk after
+        // zstd level 3. The 48 B random-bytes floor (16 B PathHash + 32 B
+        // ChunkId) is incompressible; the ~30 B metadata/framing is what
+        // zstd trims.
+        use vykar_types::chunk_id::ChunkId;
+
+        /// Fill all 32 bytes of a ChunkId with a splitmix64 stream seeded
+        /// from `i`. A weaker pattern (only populating the lower half)
+        /// makes the test look artificially good — zstd compresses the
+        /// run of zeroes in the upper 16 B, understating bytes/entry.
+        fn random_id(i: u32) -> ChunkId {
+            let mut out = [0u8; 32];
+            let mut x = (i as u64).wrapping_add(0x9E37_79B9_7F4A_7C15);
+            for chunk in out.chunks_mut(8) {
+                x = x
+                    .wrapping_add(0x9E37_79B9_7F4A_7C15)
+                    .wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                x ^= x >> 30;
+                x = x.wrapping_mul(0x94D0_49BB_1331_11EB);
+                x ^= x >> 27;
+                chunk.copy_from_slice(&x.to_le_bytes());
+            }
+            ChunkId::from_bytes(out)
+        }
+
+        let mut cache = FileCache::new();
+        cache.begin_sections(&roots(&["/r"]), &[10_000]);
+        for i in 0u32..10_000 {
+            cache.insert(
+                &format!("/r/file_{i:08}"),
+                1,
+                i as u64,
+                i as i64,
+                i as i64,
+                4096,
+                CachedChunks::Single(CachedChunkRef {
+                    id: random_id(i),
+                    size: 4096,
+                }),
+            );
+        }
+        cache.finalize_sections(SnapshotId::from_bytes([0x99; 32]));
+
+        let bytes = encode_plaintext_v2(&cache);
+        assert!(
+            bytes.len() <= 880_000,
+            "cache plaintext {} > 88 B/entry budget for 10k unique chunks",
+            bytes.len(),
+        );
+    }
+
+    // Compile-time guards: the inline container must stay cheap and the
+    // entry-level record must not regress in size if fields grow.
+    const _CACHED_CHUNK_REF_SIZE_OK: () = assert!(std::mem::size_of::<CachedChunkRef>() == 36);
+    const _CACHED_CHUNKS_SIZE_OK: () = assert!(std::mem::size_of::<CachedChunks>() <= 48);
+    const _PARENT_ENTRY_SIZE_OK: () = assert!(std::mem::size_of::<ParentEntry>() <= 88);
 
     #[test]
     fn repo_cache_dir_default() {
@@ -1158,7 +1740,7 @@ mod tests {
     }
 
     /// Helper: build a ParentReuseIndex from a Vec<Item> using the builder.
-    /// Accepts raw source paths and derives ParentReuseRoot (basename =
+    /// Accepts raw source paths and derives ParentReuseRoot (prefix =
     /// last component of the path).
     fn build_parent_index(
         items: Vec<Item>,
@@ -1169,12 +1751,12 @@ mod tests {
             .iter()
             .map(|sp| {
                 let p = Path::new(sp);
-                let basename = p
+                let prefix = p
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_else(|| sp.clone());
                 let policy = if multi_path {
-                    ParentReusePolicy::EmitRoot { basename }
+                    ParentReusePolicy::EmitRoot { prefix }
                 } else {
                     ParentReusePolicy::SkipRoot
                 };
@@ -1313,6 +1895,79 @@ mod tests {
     }
 
     #[test]
+    fn parent_reuse_index_lookup_dataless_ignores_ctime() {
+        let items = vec![Item {
+            path: "a.txt".into(),
+            entry_type: ItemType::RegularFile,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            user: None,
+            group: None,
+            mtime: 1000,
+            atime: None,
+            ctime: Some(2000),
+            size: 4096,
+            chunks: sample_chunk_refs_vec(),
+            link_target: None,
+            xattrs: None,
+        }];
+
+        let idx = build_parent_index(items, &["/src".into()], false).unwrap();
+        let path = native_join("/src", "a.txt");
+
+        // Matching size + mtime — hit, even with a wildly different ctime
+        // (the dataless flag toggle would bump ctime).
+        assert!(idx.lookup_dataless(&path, 4096, 1000).is_some());
+
+        // Wrong size — miss.
+        assert!(idx.lookup_dataless(&path, 1, 1000).is_none());
+
+        // Wrong mtime — miss.
+        assert!(idx.lookup_dataless(&path, 4096, 9999).is_none());
+
+        // Wrong path — miss.
+        assert!(idx
+            .lookup_dataless(&native_join("/src", "other.txt"), 4096, 1000)
+            .is_none());
+    }
+
+    /// Documents the intentional identity tradeoff for cold-start dataless
+    /// reuse: only `(path, size, mtime)` is checked. Inode is not available
+    /// in `Item` (snapshot wire format) and adding it is out of scope for
+    /// this path. Warm-cache dataless lookups use the stronger
+    /// `(device, inode, size, mtime)` check; this test exists so a future
+    /// reader does not silently tighten the parent-reuse identity without
+    /// also revisiting the wire-format question.
+    #[test]
+    fn parent_reuse_lookup_dataless_matches_on_path_size_mtime_only() {
+        let items = vec![Item {
+            path: "a.txt".into(),
+            entry_type: ItemType::RegularFile,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            user: None,
+            group: None,
+            mtime: 1000,
+            atime: None,
+            ctime: Some(2000),
+            size: 4096,
+            chunks: sample_chunk_refs_vec(),
+            link_target: None,
+            xattrs: None,
+        }];
+
+        let idx = build_parent_index(items, &["/src".into()], false).unwrap();
+        let path = native_join("/src", "a.txt");
+
+        // `(path, size, mtime)` match — hit, even though ctime differs from
+        // what was stored. Intentional: ctime is not part of the dataless
+        // identity check.
+        assert!(idx.lookup_dataless(&path, 4096, 1000).is_some());
+    }
+
+    #[test]
     fn parent_reuse_index_multi_path() {
         let items = vec![Item {
             path: "home/a.txt".into(),
@@ -1346,11 +2001,11 @@ mod tests {
         }
     }
 
-    fn emitroot(abs_root: &str, basename: &str) -> ParentReuseRoot {
+    fn emitroot(abs_root: &str, prefix: &str) -> ParentReuseRoot {
         ParentReuseRoot {
             abs_root: abs_root.to_string(),
             policy: ParentReusePolicy::EmitRoot {
-                basename: basename.to_string(),
+                prefix: prefix.to_string(),
             },
         }
     }
@@ -1436,6 +2091,90 @@ mod tests {
         assert_eq!(out, "other/file.txt");
     }
 
+    #[test]
+    fn parent_reuse_multi_component_prefix_inversion() {
+        // Issue #143 layout: paths like /var/lib/machines/base/etc end up
+        // with a multi-component snapshot prefix. invert() must strip the
+        // full prefix and reassemble the abs path correctly.
+        let root = emitroot("/var/lib/machines/base/etc", "var/lib/machines/base/etc");
+        let abs = root.invert("var/lib/machines/base/etc/hosts").unwrap();
+        assert_eq!(
+            abs.to_string_lossy(),
+            native_join("/var/lib/machines/base/etc", "hosts")
+        );
+        // Root entry itself (item_path == prefix).
+        let abs = root.invert("var/lib/machines/base/etc").unwrap();
+        assert_eq!(abs, PathBuf::from("/var/lib/machines/base/etc"));
+        // Paths outside the prefix don't match.
+        assert!(root.invert("var/lib/machines/base/etcXXX").is_none());
+        assert!(root.invert("other/file.txt").is_none());
+    }
+
+    #[test]
+    fn parent_reuse_no_nested_prefixes_invariant() {
+        // Belt-and-suspenders invariant check: ResolvedSource::resolve_all
+        // rejects nested canonical roots up front, so by the time a
+        // ParentReuseBuilder is constructed no two EmitRoot prefixes should
+        // be nested. Verify directly on a representative set.
+        let roots = [
+            emitroot("/mnt/a/etc", "mnt/a/etc"),
+            emitroot("/mnt/b/etc", "mnt/b/etc"),
+            emitroot("/var/log", "var/log"),
+        ];
+        let prefixes: Vec<&str> = roots
+            .iter()
+            .filter_map(|r| match &r.policy {
+                ParentReusePolicy::EmitRoot { prefix } => Some(prefix.as_str()),
+                _ => None,
+            })
+            .collect();
+        for (i, a) in prefixes.iter().enumerate() {
+            for (j, b) in prefixes.iter().enumerate() {
+                if i == j {
+                    continue;
+                }
+                // Neither is a strict path-component prefix of the other.
+                let a_path = Path::new(a);
+                let b_path = Path::new(b);
+                if a_path.strip_prefix(b_path).is_ok() {
+                    assert_eq!(a, b, "prefix {a} is nested under {b}");
+                }
+                if b_path.strip_prefix(a_path).is_ok() {
+                    assert_eq!(a, b, "prefix {b} is nested under {a}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn parent_reuse_single_chunk_returns_inline_variant() {
+        // Single-chunk items must round-trip through ParentReuseIndex as
+        // the inline `Single` variant, guaranteeing no heap Vec allocation
+        // on the cold-start parent-reuse path for the dominant 1-chunk case.
+        let items = vec![Item {
+            path: "a.txt".into(),
+            entry_type: ItemType::RegularFile,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            user: None,
+            group: None,
+            mtime: 1000,
+            atime: None,
+            ctime: Some(2000),
+            size: 4096,
+            chunks: sample_chunk_refs_vec(),
+            link_target: None,
+            xattrs: None,
+        }];
+        let idx = build_parent_index(items, &["/src".into()], false).unwrap();
+        let hit = idx.lookup(&native_join("/src", "a.txt"), 4096, 1000, 2000);
+        match hit {
+            Some(CachedChunks::Single(_)) => {}
+            other => panic!("expected CachedChunks::Single, got {other:?}"),
+        }
+    }
+
     // ── Per-path section tests ──────────────────────────────────────────
 
     #[test]
@@ -1445,10 +2184,10 @@ mod tests {
         cache.begin_sections(&roots(&["/a", "/b"]), &[0, 0]);
         cache.insert("/a/f.txt", 1, 1, 1, 1, 100, sample_chunk_refs());
         cache.insert("/b/g.txt", 1, 2, 2, 2, 200, sample_chunk_refs());
-        cache.finalize_sections(SnapshotId([0x11; 32]));
+        cache.finalize_sections(SnapshotId::from_bytes([0x11; 32]));
 
         // Simulate persistence round-trip.
-        let plaintext = rmp_serde::to_vec(&cache).unwrap();
+        let plaintext = encode_plaintext_v2(&cache);
         let mut cache = FileCache::decode_from_plaintext(&plaintext).unwrap();
 
         // Activate with a superset: /a and /b should activate, /c should not.
@@ -1469,9 +2208,9 @@ mod tests {
         cache.begin_sections(&roots(&["/a", "/b"]), &[0, 0]);
         cache.insert("/a/f.txt", 1, 1, 1, 1, 100, sample_chunk_refs());
         cache.insert("/b/g.txt", 1, 2, 2, 2, 200, sample_chunk_refs());
-        cache.finalize_sections(SnapshotId([0x11; 32]));
+        cache.finalize_sections(SnapshotId::from_bytes([0x11; 32]));
 
-        let plaintext = rmp_serde::to_vec(&cache).unwrap();
+        let plaintext = encode_plaintext_v2(&cache);
         let mut cache = FileCache::decode_from_plaintext(&plaintext).unwrap();
 
         // Activate with subset ["/a"].
@@ -1495,31 +2234,29 @@ mod tests {
         let mut cache = FileCache::new();
         cache.begin_sections(&roots(&["/data", "/data/sub"]), &[0, 0]);
 
-        let refs_a = Arc::new(vec![ChunkRef {
-            id: ChunkId([0xAA; 32]),
+        let refs_a = CachedChunks::Single(CachedChunkRef {
+            id: ChunkId::from_bytes([0xAA; 32]),
             size: 100,
-            csize: 50,
-        }]);
-        let refs_b = Arc::new(vec![ChunkRef {
-            id: ChunkId([0xBB; 32]),
+        });
+        let refs_b = CachedChunks::Single(CachedChunkRef {
+            id: ChunkId::from_bytes([0xBB; 32]),
             size: 200,
-            csize: 100,
-        }]);
+        });
 
-        cache.insert("/data/sub/foo.txt", 1, 1, 1, 1, 100, Arc::clone(&refs_a));
-        cache.insert("/data/other.txt", 1, 2, 2, 2, 200, Arc::clone(&refs_b));
+        cache.insert("/data/sub/foo.txt", 1, 1, 1, 1, 100, refs_a.clone());
+        cache.insert("/data/other.txt", 1, 2, 2, 2, 200, refs_b.clone());
 
         // Lookup routes to longest-prefix section.
         let hit = cache.lookup("/data/sub/foo.txt", 1, 1, 1, 1, 100).unwrap();
-        assert_eq!(hit[0].id, ChunkId([0xAA; 32]));
+        assert_eq!(hit.as_slice()[0].id, ChunkId::from_bytes([0xAA; 32]));
         let hit = cache.lookup("/data/other.txt", 1, 2, 2, 2, 200).unwrap();
-        assert_eq!(hit[0].id, ChunkId([0xBB; 32]));
+        assert_eq!(hit.as_slice()[0].id, ChunkId::from_bytes([0xBB; 32]));
 
         // Insert wrote to ALL matching sections, so /data/sub/foo.txt is also
         // in the /data section. Verify by switching to /data only.
         assert!(cache.activate_for_walk_roots(&roots(&["/data"])));
         let hit = cache.lookup("/data/sub/foo.txt", 1, 1, 1, 1, 100).unwrap();
-        assert_eq!(hit[0].id, ChunkId([0xAA; 32]));
+        assert_eq!(hit.as_slice()[0].id, ChunkId::from_bytes([0xAA; 32]));
     }
 
     #[test]
@@ -1532,10 +2269,10 @@ mod tests {
         cache.insert("/data/sub/foo.txt", 1, 1, 1, 1, 100, sample_chunk_refs());
         cache.insert("/data/sub/bar.txt", 1, 2, 2, 2, 200, sample_chunk_refs());
         cache.insert("/data/top.txt", 1, 3, 3, 3, 300, sample_chunk_refs());
-        cache.finalize_sections(SnapshotId([0x11; 32]));
+        cache.finalize_sections(SnapshotId::from_bytes([0x11; 32]));
 
         // Persistence round-trip.
-        let plaintext = rmp_serde::to_vec(&cache).unwrap();
+        let plaintext = encode_plaintext_v2(&cache);
         let mut cache = FileCache::decode_from_plaintext(&plaintext).unwrap();
 
         // Activate with just /data (removed /data/sub from config).
@@ -1556,9 +2293,9 @@ mod tests {
         cache.begin_sections(&roots(&["/data"]), &[0]);
         cache.insert("/data/sub/foo.txt", 1, 1, 1, 1, 100, sample_chunk_refs());
         cache.insert("/data/top.txt", 1, 2, 2, 2, 200, sample_chunk_refs());
-        cache.finalize_sections(SnapshotId([0x11; 32]));
+        cache.finalize_sections(SnapshotId::from_bytes([0x11; 32]));
 
-        let plaintext = rmp_serde::to_vec(&cache).unwrap();
+        let plaintext = encode_plaintext_v2(&cache);
         let mut cache = FileCache::decode_from_plaintext(&plaintext).unwrap();
 
         // Activate with superset ["/data", "/data/sub"].

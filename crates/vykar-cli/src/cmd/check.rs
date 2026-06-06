@@ -4,6 +4,7 @@ use vykar_core::commands;
 use vykar_core::commands::check::{RepairAction, RepairMode, RepairPlan, RepairResult};
 use vykar_core::config::VykarConfig;
 
+use crate::error::{CliError, CliResult};
 use crate::passphrase::with_repo_passphrase;
 
 pub(crate) fn run_check(
@@ -14,13 +15,12 @@ pub(crate) fn run_check(
     repair: bool,
     dry_run: bool,
     yes: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> CliResult<()> {
     if !repair {
         if distrust_server && !verify_data {
-            return Err(
-                "--distrust-server requires --verify-data (flag is meaningless without data verification)"
-                    .into(),
-            );
+            return Err(CliError::from(
+                "--distrust-server requires --verify-data (flag is meaningless without data verification)",
+            ));
         }
         return run_check_readonly(config, label, verify_data, distrust_server);
     }
@@ -29,22 +29,22 @@ pub(crate) fn run_check(
     if dry_run {
         // Plan only: show plan and exit.
         let result = with_repo_passphrase(config, label, |passphrase| {
-            commands::check::run_with_repair(
+            Ok(commands::check::run_with_repair(
                 config,
                 passphrase,
                 verify_data,
                 RepairMode::PlanOnly,
                 Some(&mut make_progress_callback()),
-            )
-            .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })
+            )?)
         })?;
         print_check_summary(&result.check_result);
         print_repair_plan(&result.plan);
         eprintln!("Dry run: no changes applied.");
         if !result.check_result.errors.is_empty() {
-            return Err(
-                format!("check found {} error(s)", result.check_result.errors.len()).into(),
-            );
+            return Err(CliError::from(format!(
+                "check found {} error(s)",
+                result.check_result.errors.len()
+            )));
         }
         return Ok(());
     }
@@ -52,14 +52,13 @@ pub(crate) fn run_check(
     if yes {
         // --yes: apply directly without confirmation.
         let result = with_repo_passphrase(config, label, |passphrase| {
-            commands::check::run_with_repair(
+            Ok(commands::check::run_with_repair(
                 config,
                 passphrase,
                 verify_data,
                 RepairMode::Apply,
                 Some(&mut make_progress_callback()),
-            )
-            .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })
+            )?)
         })?;
         print_check_summary(&result.check_result);
         print_repair_plan(&result.plan);
@@ -69,35 +68,32 @@ pub(crate) fn run_check(
 
     // Interactive: plan first, then confirm, then apply.
     let plan_result = with_repo_passphrase(config, label, |passphrase| {
-        commands::check::run_with_repair(
+        Ok(commands::check::run_with_repair(
             config,
             passphrase,
             verify_data,
             RepairMode::PlanOnly,
             Some(&mut make_progress_callback()),
-        )
-        .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })
+        )?)
     })?;
 
     print_check_summary(&plan_result.check_result);
     print_repair_plan(&plan_result.plan);
 
+    let only_action = plan_result.plan.actions.as_slice();
     if !plan_result.plan.has_data_loss
-        && (plan_result.plan.actions.is_empty()
-            || (plan_result.plan.actions.len() == 1
-                && matches!(plan_result.plan.actions[0], RepairAction::RebuildRefcounts)))
+        && (only_action.is_empty() || matches!(only_action, [RepairAction::RebuildRefcounts]))
     {
         // Tier 1 only — apply without prompt.
         eprintln!("No data-loss actions; applying safe repairs...");
         let result = with_repo_passphrase(config, label, |passphrase| {
-            commands::check::run_with_repair(
+            Ok(commands::check::run_with_repair(
                 config,
                 passphrase,
                 verify_data,
                 RepairMode::Apply,
                 Some(&mut make_progress_callback()),
-            )
-            .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })
+            )?)
         })?;
         print_repair_result(&result);
         return Ok(());
@@ -116,14 +112,13 @@ pub(crate) fn run_check(
 
     // Re-scan and apply under maintenance lock.
     let result = with_repo_passphrase(config, label, |passphrase| {
-        commands::check::run_with_repair(
+        Ok(commands::check::run_with_repair(
             config,
             passphrase,
             verify_data,
             RepairMode::Apply,
             Some(&mut make_progress_callback()),
-        )
-        .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })
+        )?)
     })?;
     print_repair_result(&result);
 
@@ -135,9 +130,9 @@ fn run_check_readonly(
     label: Option<&str>,
     verify_data: bool,
     distrust_server: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> CliResult<()> {
     let result = with_repo_passphrase(config, label, |passphrase| {
-        commands::check::run_with_progress(
+        Ok(commands::check::run_with_progress(
             config,
             passphrase,
             verify_data,
@@ -145,14 +140,16 @@ fn run_check_readonly(
             Some(&mut make_progress_callback()),
             100,   // standalone always 100%
             false, // don't update daemon's full_every timer
-        )
-        .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })
+        )?)
     })?;
 
     print_check_summary(&result);
 
     if !result.errors.is_empty() {
-        return Err(format!("check found {} error(s)", result.errors.len()).into());
+        return Err(CliError::from(format!(
+            "check found {} error(s)",
+            result.errors.len()
+        )));
     }
 
     Ok(())
@@ -171,7 +168,14 @@ pub(crate) fn format_check_progress(event: &commands::check::CheckProgressEvent)
         commands::check::CheckProgressEvent::PacksExistenceProgress {
             checked,
             total_packs,
-        } => eprintln!("  existence: {checked}/{total_packs} packs"),
+            missing,
+        } => {
+            if *missing > 0 {
+                eprintln!("  existence: {checked}/{total_packs} packs ({missing} missing)");
+            } else {
+                eprintln!("  existence: {checked}/{total_packs} packs");
+            }
+        }
         commands::check::CheckProgressEvent::ChunksDataPhaseStarted { total_chunks } => {
             eprintln!("Verifying data integrity of {total_chunks} chunks...");
         }
@@ -282,6 +286,26 @@ fn format_repair_action(action: &RepairAction) -> String {
             missing_chunks,
         } => {
             format!("Remove snapshot '{snapshot_name}' with {missing_chunks} unresolvable chunk(s)")
+        }
+        RepairAction::DropItemsFromSnapshot {
+            snapshot_name,
+            item_indices,
+            dropped_paths,
+            reasons,
+            ..
+        } => {
+            const MAX_PATHS: usize = 10;
+            let n = item_indices.len();
+            let mut out = format!(
+                "Drop {n} item(s) from snapshot '{snapshot_name}' (snapshot kept, new id):"
+            );
+            for (path, reason) in dropped_paths.iter().zip(reasons.iter()).take(MAX_PATHS) {
+                out.push_str(&format!("\n      - {path}  ({reason})"));
+            }
+            if n > MAX_PATHS {
+                out.push_str(&format!("\n      ... and {} more", n - MAX_PATHS));
+            }
+            out
         }
         RepairAction::RebuildRefcounts => "Rebuild chunk refcounts from surviving snapshots".into(),
     }

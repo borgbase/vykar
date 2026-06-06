@@ -1,3 +1,8 @@
+// Indexing into `snapshots` / `times` / `indices` uses indices that originate
+// from `(0..snapshots.len())` (or values pushed alongside a matching iter
+// `enumerate()`); `times.len() == snapshots.len()` is a local invariant.
+#![allow(clippy::indexing_slicing)]
+
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap, HashSet};
 

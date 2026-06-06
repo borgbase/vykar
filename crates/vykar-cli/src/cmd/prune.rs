@@ -3,6 +3,7 @@ use std::sync::atomic::AtomicBool;
 use vykar_core::commands;
 use vykar_core::config::{SourceEntry, VykarConfig};
 
+use crate::error::CliResult;
 use crate::format::format_bytes;
 use crate::passphrase::with_repo_passphrase;
 
@@ -16,9 +17,9 @@ pub(crate) fn run_prune(
     source_filter: &[String],
     compact: bool,
     shutdown: Option<&AtomicBool>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> CliResult<()> {
     let (stats, list_entries) = with_repo_passphrase(config, label, |passphrase| {
-        commands::prune::run(
+        Ok(commands::prune::run(
             config,
             passphrase,
             dry_run,
@@ -26,8 +27,7 @@ pub(crate) fn run_prune(
             sources,
             source_filter,
             shutdown,
-        )
-        .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })
+        )?)
     })?;
 
     if list || dry_run {
@@ -59,6 +59,10 @@ pub(crate) fn run_prune(
             stats.chunks_deleted,
             format_bytes(stats.space_freed),
         );
+    }
+
+    for w in &stats.warnings {
+        eprintln!("warning: {w}");
     }
 
     if compact {

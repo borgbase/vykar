@@ -1,3 +1,12 @@
+// Env removal of VYKAR_PASSPHRASE during single-threaded startup; SAFETY per block.
+#![allow(unsafe_code)]
+#![allow(
+    clippy::duration_suboptimal_units,
+    clippy::missing_errors_doc,
+    clippy::option_option,
+    clippy::redundant_closure_for_method_calls
+)]
+
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -65,7 +74,9 @@ static ENV_PASSPHRASE: Mutex<Option<Option<Zeroizing<String>>>> = Mutex::new(Non
 /// Read `VYKAR_PASSPHRASE` from the process environment on first call,
 /// remove it from the environment, and cache the value for subsequent calls.
 fn take_env_passphrase() -> Option<Zeroizing<String>> {
-    let mut cache = ENV_PASSPHRASE.lock().unwrap();
+    let mut cache = ENV_PASSPHRASE
+        .lock()
+        .expect("passphrase cache lock not poisoned");
     if let Some(ref cached) = *cache {
         return cached.clone();
     }
@@ -73,8 +84,8 @@ fn take_env_passphrase() -> Option<Zeroizing<String>> {
         .ok()
         .filter(|s| !s.is_empty());
     if val.is_some() {
-        // Remove from env to reduce exposure window.
-        // Safety: called during single-threaded startup before any thread pool.
+        // SAFETY: called during single-threaded startup before any thread
+        // pool spawns; no concurrent env reads/writes can race here.
         #[allow(unused_unsafe)]
         unsafe {
             std::env::remove_var("VYKAR_PASSPHRASE");
@@ -88,7 +99,9 @@ fn take_env_passphrase() -> Option<Zeroizing<String>> {
 /// Reset the cached env passphrase. Only used by tests.
 #[cfg(test)]
 pub(crate) fn reset_env_passphrase_cache() {
-    *ENV_PASSPHRASE.lock().unwrap() = None;
+    *ENV_PASSPHRASE
+        .lock()
+        .expect("passphrase cache lock not poisoned") = None;
 }
 
 pub fn resolve_passphrase<F>(

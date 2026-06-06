@@ -26,7 +26,7 @@ pub(crate) fn show_password_dialog(title: &str, message: &str) -> Option<String>
     let message = message.to_string();
 
     if slint::invoke_from_event_loop(move || {
-        let dialog = PasswordDialog::new().unwrap();
+        let dialog = PasswordDialog::new().expect("password dialog component can be created");
         dialog.set_dialog_title(title.into());
         dialog.set_dialog_message(message.into());
 

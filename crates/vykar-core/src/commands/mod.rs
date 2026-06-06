@@ -3,6 +3,7 @@ pub mod check;
 pub mod compact;
 pub mod delete;
 pub mod delete_repo;
+pub mod diff;
 pub mod find;
 pub mod info;
 pub mod init;

@@ -1,6 +1,6 @@
 [package]
 name = "vykar-gui"
-version = "0.12.15"
+version = "0.16.1"
 edition = "2021"
 license = "GPL-3.0-only"
 
@@ -14,11 +14,13 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
-vykar-core = { workspace = true, features = ["backend-sftp"] }
+vykar-core = { workspace = true, features = ["backend-sftp", "mount"] }
 vykar-common.workspace = true
 vykar-types.workspace = true
-slint = { version = "1.15", default-features = false, features = ["std", "compat-1-2", "backend-winit", "renderer-skia", "accessibility"] }
-tray-icon = "0.22"
+tokio = { workspace = true, features = ["sync"] }
+opener = "0.8"
+slint = { version = "~1.15", default-features = false, features = ["std", "compat-1-2", "backend-winit", "renderer-skia", "accessibility"] }
+tray-icon = "0.22.2"
 crossbeam-channel.workspace = true
 tinyfiledialogs = "3"
 chrono.workspace = true
@@ -26,7 +28,7 @@ zeroize.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 image = { version = "0.25", default-features = false, features = ["png"] }
-dunce = "1"
+dunce = { workspace = true }
 auto-launch = "0.6"
 
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -40,5 +42,8 @@ objc2 = "0.6"
 objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSResponder", "NSWindow"] }
 
 [build-dependencies]
-slint-build = "1.15"
+slint-build = "~1.15"
 winresource = "0.1"
+
+[dev-dependencies]
+tempfile = { workspace = true }

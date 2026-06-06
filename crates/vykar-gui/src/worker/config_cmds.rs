@@ -1,18 +1,32 @@
-use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use crate::config_helpers;
-use crate::messages::UiEvent;
+use crate::messages::{AppCommand, UiEvent};
 use crate::repo_helpers::send_log;
 use crate::scheduler;
 use crate::view_models::send_structured_data;
+use vykar_core::{repo::lock, storage};
+use vykar_types::error::Result;
 
+use super::shared::select_repo_or_log;
 use super::WorkerContext;
 
 pub(super) fn handle_open_config_file(ctx: &WorkerContext) {
-    let path = ctx.runtime.source.path().display().to_string();
-    send_log(&ctx.ui_tx, format!("Opening config file: {path}"));
-    let _ = std::process::Command::new("open").arg(&path).spawn();
+    let path = ctx.runtime.source.path();
+    send_log(
+        &ctx.ui_tx,
+        format!("Opening config file: {}", path.display()),
+    );
+    if let Err(e) = opener::open(path) {
+        send_log(
+            &ctx.ui_tx,
+            format!(
+                "Failed to open config file in system editor ({}): {e}",
+                path.display()
+            ),
+        );
+    }
 }
 
 pub(super) fn handle_reload_config(ctx: &mut WorkerContext) {
@@ -35,7 +49,7 @@ pub(super) fn handle_switch_config(ctx: &mut WorkerContext) {
 pub(super) fn handle_save_and_apply_config(ctx: &mut WorkerContext, yaml_text: String) {
     let config_path = ctx.config_display_path.clone();
     let tmp_path = config_path.with_extension("yaml.tmp");
-    if let Err(e) = std::fs::write(&tmp_path, &yaml_text) {
+    if let Err(e) = config_helpers::write_tmp_secure(&tmp_path, yaml_text.as_bytes()) {
         let _ = ctx
             .ui_tx
             .send(UiEvent::ConfigSaveError(format!("Write failed: {e}")));
@@ -43,13 +57,13 @@ pub(super) fn handle_save_and_apply_config(ctx: &mut WorkerContext, yaml_text: S
     }
 
     if let Err(msg) = config_helpers::validate_config(&tmp_path) {
-        let _ = std::fs::remove_file(&tmp_path);
+        cleanup_tmp(ctx, &tmp_path);
         let _ = ctx.ui_tx.send(UiEvent::ConfigSaveError(msg));
         return;
     }
 
     if let Err(e) = std::fs::rename(&tmp_path, &config_path) {
-        let _ = std::fs::remove_file(&tmp_path);
+        cleanup_tmp(ctx, &tmp_path);
         let _ = ctx
             .ui_tx
             .send(UiEvent::ConfigSaveError(format!("Rename failed: {e}")));
@@ -64,6 +78,83 @@ pub(super) fn handle_save_and_apply_config(ctx: &mut WorkerContext, yaml_text: S
         let _ = ctx.ui_tx.send(UiEvent::ConfigSaveError(
             "Config saved to disk but failed to apply. Check log for details.".into(),
         ));
+    }
+}
+
+/// Best-effort removal of a save-flow tmp file. A NotFound error is silent
+/// (rename succeeded or a prior cleanup ran); any other failure is logged so
+/// a stuck tmp file (e.g. a still-locked file on Windows) is visible.
+fn cleanup_tmp(ctx: &WorkerContext, path: &Path) {
+    if let Err(e) = std::fs::remove_file(path) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            send_log(
+                &ctx.ui_tx,
+                format!(
+                    "Failed to remove temporary config file {}: {e}",
+                    path.display()
+                ),
+            );
+        }
+    }
+}
+
+pub(super) fn handle_clear_repo_locks(ctx: &mut WorkerContext, repo_name: String) {
+    handle_repo_recovery_action(ctx, repo_name, "lock", "lock marker", lock::break_lock);
+}
+
+pub(super) fn handle_clear_repo_sessions(ctx: &mut WorkerContext, repo_name: String) {
+    handle_repo_recovery_action(
+        ctx,
+        repo_name,
+        "sessions",
+        "session file",
+        lock::clear_all_sessions,
+    );
+}
+
+fn handle_repo_recovery_action<F>(
+    ctx: &mut WorkerContext,
+    repo_name: String,
+    action_label: &str,
+    item_label: &str,
+    action: F,
+) where
+    F: FnOnce(&dyn vykar_core::storage::StorageBackend) -> Result<usize>,
+{
+    let repo = match select_repo_or_log(ctx, &ctx.runtime.repos, &repo_name) {
+        Some(r) => r,
+        None => return,
+    };
+    let backend =
+        match storage::backend_from_config(&repo.config.repository, repo.config.limits.connections)
+        {
+            Ok(b) => b,
+            Err(e) => {
+                send_log(
+                    &ctx.ui_tx,
+                    format!("[{repo_name}] cannot open storage: {e}"),
+                );
+                return;
+            }
+        };
+
+    match action(backend.as_ref()) {
+        Ok(removed) => {
+            send_log(
+                &ctx.ui_tx,
+                format!("[{repo_name}] cleared {removed} {item_label}(s)."),
+            );
+            let _ = ctx.app_tx.send(AppCommand::FetchAllRepoInfo);
+            let _ = ctx.app_tx.send(AppCommand::RefreshSnapshots {
+                repo_selector: repo_name,
+            });
+        }
+        Err(e) => {
+            send_log(
+                &ctx.ui_tx,
+                format!("[{repo_name}] clear {action_label} failed: {e}"),
+            );
+        }
     }
 }
 
@@ -82,7 +173,12 @@ pub(super) fn apply_config(
             return false;
         }
     };
-    let schedule = repos[0].config.schedule.clone();
+    let schedule = repos
+        .first()
+        .expect("validate_config guarantees at least one repo")
+        .config
+        .schedule
+        .clone();
 
     if update_source {
         use vykar_core::config::ConfigSource;
@@ -104,21 +200,21 @@ pub(super) fn apply_config(
         state.jitter_seconds = schedule.jitter_seconds;
         let delay = vykar_core::app::scheduler::next_run_delay(&schedule)
             .unwrap_or(Duration::from_secs(24 * 60 * 60));
-        state.next_run = Some(Instant::now() + delay);
+        state.next_run = Some(SystemTime::now() + delay);
     }
     let _ = ctx.sched_notify_tx.try_send(());
 
     let canonical = dunce::canonicalize(&config_path).unwrap_or_else(|_| config_path.clone());
     ctx.config_display_path = canonical.clone();
 
-    let schedule_desc = if ctx.scheduler_lock_held {
-        scheduler::schedule_description(&schedule, ctx.schedule_paused)
+    let schedule_brief = if ctx.scheduler_lock_held {
+        scheduler::schedule_brief(&schedule, ctx.schedule_paused)
     } else {
-        "disabled (external scheduler)".to_string()
+        "Off".to_string()
     };
     let _ = ctx.ui_tx.send(UiEvent::ConfigInfo {
         path: canonical.display().to_string(),
-        schedule: schedule_desc,
+        schedule_brief,
     });
     send_structured_data(&ctx.ui_tx, &ctx.runtime.repos);
     let _ = ctx

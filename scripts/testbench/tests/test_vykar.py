@@ -1,4 +1,5 @@
 import subprocess
+import tempfile
 import unittest
 from unittest import mock
 
@@ -93,6 +94,85 @@ class VykarWrapperTests(unittest.TestCase):
         self.assertEqual(result.stdout, "partial stdout")
         self.assertIn("partial stderr", result.stderr)
         self.assertIn("timed out after 3600 seconds", result.stderr)
+
+    def test_verify_restore_retries_diff_once_before_passing(self) -> None:
+        restore_result = subprocess.CompletedProcess(
+            args=["vykar", "restore"],
+            returncode=0,
+            stdout="",
+            stderr="",
+        )
+        first_diff = subprocess.CompletedProcess(
+            args=["diff", "-qr"],
+            returncode=1,
+            stdout="Files source and restore differ\n",
+            stderr="",
+        )
+        second_diff = subprocess.CompletedProcess(
+            args=["diff", "-qr"],
+            returncode=0,
+            stdout="",
+            stderr="",
+        )
+
+        with tempfile.TemporaryDirectory() as work_dir:
+            with mock.patch("vykar_testbench.vykar.vykar_restore", return_value=restore_result), mock.patch(
+                "vykar_testbench.vykar.subprocess.run",
+                side_effect=[first_diff, second_diff],
+            ) as run:
+                passed, detail, stop_scenario = vykar.verify_restore(
+                    "vykar",
+                    "/tmp/config.yaml",
+                    "scenario-simple",
+                    "snap-123",
+                    "/tmp/corpus",
+                    work_dir,
+                )
+
+        self.assertTrue(passed)
+        self.assertEqual(detail, "restore matches corpus after diff retry")
+        self.assertFalse(stop_scenario)
+        self.assertEqual(run.call_count, 2)
+
+    def test_verify_restore_returns_full_second_diff_and_stop_flag(self) -> None:
+        restore_result = subprocess.CompletedProcess(
+            args=["vykar", "restore"],
+            returncode=0,
+            stdout="",
+            stderr="",
+        )
+        first_diff = subprocess.CompletedProcess(
+            args=["diff", "-qr"],
+            returncode=1,
+            stdout="transient mismatch\n",
+            stderr="",
+        )
+        second_diff = subprocess.CompletedProcess(
+            args=["diff", "-qr"],
+            returncode=1,
+            stdout="Files /src/a and /restore/a differ\nOnly in /src: b\n",
+            stderr="",
+        )
+
+        with tempfile.TemporaryDirectory() as work_dir:
+            with mock.patch("vykar_testbench.vykar.vykar_restore", return_value=restore_result), mock.patch(
+                "vykar_testbench.vykar.subprocess.run",
+                side_effect=[first_diff, second_diff],
+            ):
+                passed, detail, stop_scenario = vykar.verify_restore(
+                    "vykar",
+                    "/tmp/config.yaml",
+                    "scenario-simple",
+                    "snap-123",
+                    "/tmp/corpus",
+                    work_dir,
+                )
+
+        self.assertFalse(passed)
+        self.assertTrue(stop_scenario)
+        self.assertIn("diff mismatch after retry:", detail)
+        self.assertIn("Files /src/a and /restore/a differ", detail)
+        self.assertIn("Only in /src: b", detail)
 
 
 if __name__ == "__main__":

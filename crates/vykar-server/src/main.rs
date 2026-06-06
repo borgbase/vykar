@@ -1,3 +1,18 @@
+#![allow(clippy::print_stderr)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::cast_possible_truncation,
+        clippy::doc_markdown,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::manual_let_else,
+        clippy::panic,
+        clippy::single_match_else,
+        clippy::unwrap_used
+    )
+)]
+
 mod config;
 mod error;
 mod handlers;
@@ -125,5 +140,8 @@ async fn async_main(cli: Cli) {
         eprintln!("Error: cannot bind to {listen_addr}: {e}");
         std::process::exit(1);
     });
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(listener, app).await.unwrap_or_else(|e| {
+        eprintln!("Error: server failed: {e}");
+        std::process::exit(1);
+    });
 }

@@ -74,6 +74,7 @@ pub async fn head_object(
 ///
 /// Streams the request body to a temp file to avoid buffering large uploads
 /// in memory. Atomic rename on completion.
+#[allow(clippy::too_many_lines)]
 pub async fn put_object(
     State(state): State<AppState>,
     Path(key): Path<String>,
@@ -106,7 +107,7 @@ pub async fn put_object(
     }
 
     // Track old file size for quota accounting
-    let old_size = existing_meta.as_ref().map_or(0, |m| m.len());
+    let old_size = existing_meta.as_ref().map_or(0, std::fs::Metadata::len);
 
     // Quota pre-check using Content-Length if available
     let quota = state.quota_limit();
@@ -196,11 +197,12 @@ pub async fn put_object(
                     }
                 }
 
+                let chunk = buf.get(..n).expect("n <= buf.len() (just-read bytes)");
                 if let Some(ref mut h) = hasher {
-                    h.update(&buf[..n]);
+                    h.update(chunk);
                 }
 
-                writer.write_all(&buf[..n]).await.map_err(ServerError::from)?;
+                writer.write_all(chunk).await.map_err(ServerError::from)?;
             }
             writer.flush().await.map_err(ServerError::from)?;
             writer.into_inner().sync_data().await.map_err(ServerError::from)?;
@@ -410,15 +412,15 @@ async fn handle_range_read(
         .strip_prefix("bytes=")
         .ok_or_else(|| ServerError::BadRequest("invalid Range header".into()))?;
 
-    let parts: Vec<&str> = range_str.split('-').collect();
-    if parts.len() != 2 {
+    let mut iter = range_str.split('-');
+    let (Some(start_str), Some(end_str), None) = (iter.next(), iter.next(), iter.next()) else {
         return Err(ServerError::BadRequest("invalid Range header".into()));
-    }
+    };
 
-    let start: u64 = parts[0]
+    let start: u64 = start_str
         .parse()
         .map_err(|_| ServerError::BadRequest("invalid range start".into()))?;
-    let end: u64 = parts[1]
+    let end: u64 = end_str
         .parse()
         .map_err(|_| ServerError::BadRequest("invalid range end".into()))?;
     if end < start {

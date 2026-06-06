@@ -4,19 +4,34 @@ use std::sync::atomic::AtomicBool;
 use chrono::Utc;
 
 use crate::config::{RetentionConfig, SourceEntry, VykarConfig};
-use crate::prune::{apply_policy, apply_policy_by_label, PruneDecision};
+use crate::prune::{apply_policy_by_label, PruneDecision};
 use vykar_types::error::{Result, VykarError};
 
-use super::list::{load_item_stream_from_ptrs, load_snapshot_meta};
-use super::snapshot_ops::decrement_snapshot_chunk_refs;
+use super::list::load_snapshot_meta;
+use super::snapshot_ops::{try_cleanup_deleted_snapshot_refs, warn_and_push};
 use super::util::{check_interrupted, with_open_repo_maintenance_lock};
 use crate::repo::OpenOptions;
 
+/// Aggregate result of a prune operation.
+///
+/// Phase 2 (deleting `snapshots/<id>` blobs) is the commit point. After that,
+/// per-snapshot refcount cleanup and `save_state()` are best-effort — failures
+/// are collected into `warnings` rather than propagated as errors, since the
+/// snapshot blobs are already durably removed from storage.
+///
+/// Stats accuracy caveats:
+/// - Partial per-snapshot failures contribute no impact to
+///   `chunks_deleted`/`space_freed`, so aggregate totals may under-report what
+///   was actually freed in-memory. If `save_state()` also fails, totals will
+///   over-report what was persisted remotely (the remote index still shows
+///   the pre-prune refcounts). `vykar check --repair` is the canonical
+///   recovery path for accurate refcount accounting.
 pub struct PruneStats {
     pub kept: usize,
     pub pruned: usize,
     pub chunks_deleted: u64,
     pub space_freed: u64,
+    pub warnings: Vec<String>,
 }
 
 /// Formatted list entry for --list output.
@@ -60,32 +75,24 @@ pub fn run(
                 .filter_map(|s| s.retention.as_ref().map(|r| (s.label.clone(), r.clone())))
                 .collect();
 
-            let has_sources = !sources.is_empty();
-
-            let decisions = if has_sources {
-                // Label-aware: group by source_label and apply per-source retention
-                if !config.retention.has_any_rule()
-                    && source_retentions.values().all(|r| !r.has_any_rule())
-                {
-                    return Err(VykarError::Config(
+            // Always group by source_label — labels are intrinsic to each
+            // snapshot (recorded at backup time), so retention must apply
+            // per-label regardless of whether the local config has a
+            // `sources:` block. (Issue #138.)
+            if !config.retention.has_any_rule()
+                && source_retentions.values().all(|r| !r.has_any_rule())
+            {
+                return Err(VykarError::Config(
                     "no retention rules configured — set at least one keep_* option in the retention section or per-source".into(),
                 ));
-                }
-                apply_policy_by_label(
-                    &target_snapshots,
-                    &config.retention,
-                    &source_retentions,
-                    now,
-                )?
-            } else {
-                // No sources — fall back to flat policy
-                if !config.retention.has_any_rule() {
-                    return Err(VykarError::Config(
-                    "no retention rules configured — set at least one keep_* option in the retention section".into(),
-                ));
-                }
-                apply_policy(&target_snapshots, &config.retention, now)?
-            };
+            }
+
+            let decisions = apply_policy_by_label(
+                &target_snapshots,
+                &config.retention,
+                &source_retentions,
+                now,
+            )?;
 
             // Build list output
             let mut list_entries = Vec::new();
@@ -124,6 +131,7 @@ pub fn run(
                         pruned: to_prune.len(),
                         chunks_deleted: 0,
                         space_freed: 0,
+                        warnings: Vec::new(),
                     },
                     list_entries,
                 ));
@@ -170,18 +178,39 @@ pub fn run(
 
             // Phase 3: Decrement refcounts. Item streams are reconstructed one at a
             // time from packs (still on storage) using the saved item_ptrs.
+            // Per-snapshot failures are best-effort — the blob has already
+            // been deleted and cannot be recovered, so we collect warnings
+            // and continue rather than aborting the batch.
             let mut total_chunks_deleted = 0u64;
             let mut total_space_freed = 0u64;
+            let mut warnings: Vec<String> = Vec::new();
             for target in targets {
-                let items_stream = load_item_stream_from_ptrs(repo, &target.item_ptrs)?;
-                let impact = decrement_snapshot_chunk_refs(repo, &items_stream, &target.item_ptrs)?;
-                total_chunks_deleted += impact.chunks_deleted;
-                total_space_freed += impact.space_freed;
-                repo.manifest_mut().remove_snapshot(&target.snapshot_name);
+                if let Some(impact) = try_cleanup_deleted_snapshot_refs(
+                    repo,
+                    &target.snapshot_name,
+                    &target.item_ptrs,
+                    &mut warnings,
+                ) {
+                    total_chunks_deleted += impact.chunks_deleted;
+                    total_space_freed += impact.space_freed;
+                    repo.manifest_mut().remove_snapshot(&target.snapshot_name);
+                }
             }
 
-            // Single atomic save after all deletions
-            repo.save_state()?;
+            // Single atomic save after all deletions (best-effort).
+            if let Err(e) = repo.save_state() {
+                warn_and_push(
+                    &mut warnings,
+                    format!(
+                        "snapshots were deleted from storage, but persisting refcount \
+                         changes failed: {e}. The chunks_deleted/space_freed totals \
+                         reported reflect intended cleanup that did NOT commit — the \
+                         remote index still shows the original refcounts and the next \
+                         operation will see the pre-prune state. Run `vykar check \
+                         --repair` to recover accurate accounting."
+                    ),
+                );
+            }
 
             Ok((
                 PruneStats {
@@ -189,6 +218,7 @@ pub fn run(
                     pruned: to_prune.len(),
                     chunks_deleted: total_chunks_deleted,
                     space_freed: total_space_freed,
+                    warnings,
                 },
                 list_entries,
             ))

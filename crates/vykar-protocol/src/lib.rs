@@ -3,6 +3,9 @@
 //! This crate is intentionally minimal: DTOs, pack format constants, protocol
 //! versioning, and transport-level validation. No storage I/O, no crypto.
 
+#![forbid(unsafe_code)]
+#![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
+
 use serde::{Deserialize, Serialize};
 
 // ── Pack format constants ──────────────────────────────────────────────────
@@ -48,6 +51,11 @@ pub const MIN_PROTOCOL_VERSION: u32 = 1;
 /// - `version < MIN_PROTOCOL_VERSION` (and != 0) → client too old, reject
 /// - `version > PROTOCOL_VERSION` → client too new, reject
 /// - `MIN_PROTOCOL_VERSION <= version <= PROTOCOL_VERSION` → accepted
+///
+/// # Errors
+///
+/// Returns a message when `version` is older than [`MIN_PROTOCOL_VERSION`] or
+/// newer than [`PROTOCOL_VERSION`].
 pub fn check_protocol_version(version: u32) -> Result<(), String> {
     if version == 0 {
         // Legacy client (pre-versioning). Accept while MIN == 1.
@@ -191,25 +199,33 @@ pub fn is_known_repo_key(key: &str) -> bool {
 
 /// Validate a pack storage key: must be `packs/<2-hex-shard>/<64-hex-id>`.
 pub fn is_valid_pack_key(key: &str) -> bool {
-    let parts: Vec<&str> = key.trim_matches('/').split('/').collect();
-    if parts.len() != 3 || parts[0] != "packs" {
+    let mut iter = key.trim_matches('/').split('/');
+    let (Some(prefix), Some(shard), Some(id), None) =
+        (iter.next(), iter.next(), iter.next(), iter.next())
+    else {
         return false;
-    }
-    parts[1].len() == 2
-        && parts[1].chars().all(|c| c.is_ascii_hexdigit())
-        && parts[2].len() == 64
-        && parts[2].chars().all(|c| c.is_ascii_hexdigit())
+    };
+    prefix == "packs"
+        && shard.len() == 2
+        && shard.chars().all(|c| c.is_ascii_hexdigit())
+        && id.len() == 64
+        && id.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 /// Validate a single blob reference from a wire-format request.
 ///
 /// Returns `Ok(())` on success, `Err(message)` on failure.
 /// `context` appears in error messages (e.g. "operation 3 blob 5").
+///
+/// # Errors
+///
+/// Returns a message when the blob length is zero, exceeds the pack format's
+/// `u32` length field, or when `offset + length` overflows.
 pub fn validate_blob_ref(offset: u64, length: u64, context: &str) -> Result<(), String> {
     if length == 0 {
         return Err(format!("blob length must be > 0 at {context}"));
     }
-    if length > u32::MAX as u64 {
+    if length > u64::from(u32::MAX) {
         return Err(format!("blob length exceeds pack format max at {context}"));
     }
     if offset.checked_add(length).is_none() {
@@ -248,7 +264,7 @@ mod tests {
         let json = serde_json::to_string(&plan).unwrap();
         let deser: VerifyPacksPlanRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(deser.protocol_version, 1);
-        assert_eq!(deser.packs[0].expected_size, 1024);
+        assert_eq!(deser.packs.first().unwrap().expected_size, 1024);
     }
 
     #[test]
@@ -282,7 +298,7 @@ mod tests {
 
     #[test]
     fn validate_blob_ref_rejects_too_large_length() {
-        let err = validate_blob_ref(0, u32::MAX as u64 + 1, "test").unwrap_err();
+        let err = validate_blob_ref(0, u64::from(u32::MAX) + 1, "test").unwrap_err();
         assert!(err.contains("exceeds pack format max"));
     }
 

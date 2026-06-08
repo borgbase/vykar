@@ -360,6 +360,7 @@ fn snapshot_table_row(row: &SnapshotRowData, selected: bool) -> ModelRc<Standard
         row.label.clone(),
         row.files.clone(),
         row.size.clone(),
+        row.added.clone(),
     ])
 }
 
@@ -438,7 +439,7 @@ pub(crate) fn sort_snapshot_data(
     col_idx: i32,
     ascending: bool,
 ) -> bool {
-    // Columns: 0=ID, 1=Time, 2=Host, 3=Label, 4=Files, 5=Size
+    // Columns: 0=ID, 1=Time, 2=Host, 3=Label, 4=Files, 5=Size, 6=Added
     match col_idx {
         0 => data.sort_by(|a, b| a.id.cmp(&b.id)),
         1 => data.sort_by_key(|row| row.time_epoch),
@@ -451,6 +452,12 @@ pub(crate) fn sort_snapshot_data(
             (None, None) => std::cmp::Ordering::Equal,
         }),
         5 => data.sort_by(|a, b| match (a.size_bytes, b.size_bytes) {
+            (Some(a), Some(b)) => a.cmp(&b),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        }),
+        6 => data.sort_by(|a, b| match (a.added_bytes, b.added_bytes) {
             (Some(a), Some(b)) => a.cmp(&b),
             (Some(_), None) => std::cmp::Ordering::Less,
             (None, Some(_)) => std::cmp::Ordering::Greater,
@@ -488,8 +495,13 @@ mod tests {
                 .map(|n| n.to_string())
                 .unwrap_or_else(|| "-".to_string())
                 .into(),
+            added: size_bytes
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "-".to_string())
+                .into(),
             nfiles,
             size_bytes,
+            added_bytes: size_bytes,
             time_epoch,
             repo_name: repo_name.into(),
         }

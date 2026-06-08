@@ -114,8 +114,10 @@ pub(crate) struct SnapshotRowData {
     pub label: SharedString,
     pub files: SharedString,
     pub size: SharedString,
+    pub added: SharedString,
     pub nfiles: Option<u64>,
     pub size_bytes: Option<u64>,
+    pub added_bytes: Option<u64>,
     pub time_epoch: i64,
     pub repo_name: SharedString,
 }

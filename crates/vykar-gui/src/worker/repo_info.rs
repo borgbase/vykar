@@ -247,14 +247,23 @@ pub(super) fn handle_refresh_snapshots(ctx: &mut WorkerContext, repo_selector: S
                     } else {
                         s.hostname.clone()
                     };
-                    let (files, size, nfiles, size_bytes) = match stats {
+                    let (files, size, added, nfiles, size_bytes, added_bytes) = match stats {
                         Some(st) => (
                             format_count(st.nfiles),
+                            format_bytes(st.original_size),
                             format_bytes(st.deduplicated_size),
                             Some(st.nfiles),
+                            Some(st.original_size),
                             Some(st.deduplicated_size),
                         ),
-                        None => ("-".to_string(), "-".to_string(), None, None),
+                        None => (
+                            "-".to_string(),
+                            "-".to_string(),
+                            "-".to_string(),
+                            None,
+                            None,
+                            None,
+                        ),
                     };
                     data.push(SnapshotRowData {
                         id: s.name.clone().into(),
@@ -263,8 +272,10 @@ pub(super) fn handle_refresh_snapshots(ctx: &mut WorkerContext, repo_selector: S
                         label: label.into(),
                         files: files.into(),
                         size: size.into(),
+                        added: added.into(),
                         nfiles,
                         size_bytes,
+                        added_bytes,
                         time_epoch: s.time.timestamp(),
                         repo_name: repo_name.clone().into(),
                     });

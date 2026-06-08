@@ -39,13 +39,16 @@ pub(crate) fn run_list(
     }
 
     let theme = CliTableTheme::detect();
-    let mut table =
-        theme.new_data_table(&["ID", "Date", "Host", "Label", "Source", "Files", "Size"]);
+    let mut table = theme.new_data_table(&[
+        "ID", "Date", "Host", "Label", "Source", "Files", "Size", "Added",
+    ]);
 
-    // Right-align Files and Size columns (indices 5 and 6)
+    // Right-align Files, Size and Added columns (indices 5, 6 and 7)
     let col = table.column_mut(5).expect("Files column");
     col.set_cell_alignment(CellAlignment::Right);
     let col = table.column_mut(6).expect("Size column");
+    col.set_cell_alignment(CellAlignment::Right);
+    let col = table.column_mut(7).expect("Added column");
     col.set_cell_alignment(CellAlignment::Right);
 
     let mut prev_group: Option<(String, String)> = None;
@@ -93,9 +96,13 @@ pub(crate) fn run_list(
             .format("%Y-%m-%d %H:%M")
             .to_string();
 
-        let (files_col, size_col) = match stats {
-            Some(st) => (format_count(st.nfiles), format_bytes(st.deduplicated_size)),
-            None => ("-".to_string(), "-".to_string()),
+        let (files_col, size_col, added_col) = match stats {
+            Some(st) => (
+                format_count(st.nfiles),
+                format_bytes(st.original_size),
+                format_bytes(st.deduplicated_size),
+            ),
+            None => ("-".to_string(), "-".to_string(), "-".to_string()),
         };
 
         table.add_row(vec![
@@ -106,6 +113,7 @@ pub(crate) fn run_list(
             Cell::new(source_col),
             Cell::new(files_col),
             Cell::new(size_col),
+            Cell::new(added_col),
         ]);
     }
     println!("{table}");

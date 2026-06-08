@@ -107,7 +107,8 @@ pub(super) fn rel_path_from_abs(abs_source: &Path, abs_path: &Path) -> String {
 pub(in crate::commands::backup) enum WalkEvent {
     Entry(WalkedEntry),
     /// A soft error occurred (permission denied, not found, EIO, or a
-    /// Windows-specific unsupported-reparse / cloud-file failure). Carries
+    /// Windows-specific unsupported-reparse / cloud-file / locked-file
+    /// (sharing or lock violation) failure). Carries
     /// the failing path and a pre-formatted reason so consumers can surface
     /// a path-bearing warning rather than just bumping an opaque counter.
     Skipped {

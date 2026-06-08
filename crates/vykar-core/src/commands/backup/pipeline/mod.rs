@@ -81,9 +81,10 @@ pub(super) enum ProcessedEntry {
     NonFile {
         item: crate::snapshot::item::Item,
     },
-    /// A file skipped due to a soft error (permission denied, not found,
-    /// or drift detected between walk and open / during read). No data
-    /// was committed for this file.
+    /// A file skipped due to a soft error (e.g. permission denied, not found,
+    /// EIO, Windows cloud-file or locked-file failure, or drift detected
+    /// between walk and open / during read). No data was committed for this
+    /// file.
     Skipped {
         path: String,
         /// Pre-formatted reason (avoids carrying `VykarError` across threads).
@@ -99,7 +100,8 @@ pub(super) enum ProcessedEntry {
     },
     /// The walker reported a soft error before it could materialize an
     /// `Item` (e.g. directory-iteration `EACCES`, Windows unsupported
-    /// reparse tag, cloud-file unavailable). Carries the failing path and
+    /// reparse tag, cloud-file unavailable, locked file held by another
+    /// process). Carries the failing path and
     /// pre-formatted reason so the consumer can emit a path-bearing
     /// warning. Mirrors `sequential.rs` `WalkEvent::Skipped` handling.
     WalkSkip {

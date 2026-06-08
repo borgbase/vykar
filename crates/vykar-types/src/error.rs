@@ -183,6 +183,11 @@ fn is_eio(e: &std::io::Error) -> bool {
 ///   surface from `File::open` / `read` / `fstat` on cloud placeholders when
 ///   the provider can't materialize content. List intentionally narrow;
 ///   verified against winerror.h, expand only on concrete user reports.
+/// - **`ERROR_SHARING_VIOLATION` (32) and `ERROR_LOCK_VIOLATION` (33)** for
+///   files locked by another process — pervasive in a user folder (NTUSER.DAT,
+///   browser/Outlook DBs, app lock files):
+///   - `32  ERROR_SHARING_VIOLATION` — file held open by another process
+///   - `33  ERROR_LOCK_VIOLATION` — byte-range lock held (LockFileEx)
 pub fn is_soft_backup_io_error(e: &std::io::Error) -> bool {
     if matches!(
         e.kind(),
@@ -197,14 +202,16 @@ pub fn is_soft_backup_io_error(e: &std::io::Error) -> bool {
         if e.raw_os_error().is_none() && e.to_string().contains("Unsupported reparse point type") {
             return true;
         }
-        // (b) cloud-file / can't-access codes from winerror.h:
+        // (b) cloud-file / can't-access and sharing/lock codes from winerror.h:
         //     1920 ERROR_CANT_ACCESS_FILE
         //     362  ERROR_CLOUD_FILE_PROVIDER_NOT_RUNNING
         //     395  ERROR_CLOUD_FILE_ACCESS_DENIED
         //     404  ERROR_CLOUD_FILE_PROVIDER_TERMINATED
+        //     32   ERROR_SHARING_VIOLATION (file held open by another process)
+        //     33   ERROR_LOCK_VIOLATION    (byte-range lock held, LockFileEx)
         if matches!(
             e.raw_os_error(),
-            Some(1920) | Some(362) | Some(395) | Some(404)
+            Some(1920) | Some(362) | Some(395) | Some(404) | Some(32) | Some(33)
         ) {
             return true;
         }
@@ -215,8 +222,9 @@ pub fn is_soft_backup_io_error(e: &std::io::Error) -> bool {
 impl VykarError {
     /// Returns `true` for I/O errors that indicate a file was unreadable
     /// (permission denied, file vanished, EIO, or a Windows-specific
-    /// unsupported-reparse / cloud-file failure) **before** any data was
-    /// committed. These are safe to skip for partial-backup support.
+    /// unsupported-reparse / cloud-file / locked-file (sharing or lock
+    /// violation) failure) **before** any data was committed. These are safe to
+    /// skip for partial-backup support.
     pub fn is_soft_file_error(&self) -> bool {
         match self {
             VykarError::Io(e) => is_soft_backup_io_error(e),
@@ -296,8 +304,24 @@ mod tests {
 
     #[test]
     #[cfg(windows)]
-    fn non_soft_io_error_outside_cloud_file_list() {
-        // 361 is just outside the cloud-file range we recognise; treat as hard.
+    fn soft_io_error_sharing_violation() {
+        // ERROR_SHARING_VIOLATION — file held open by another process.
+        let e = std::io::Error::from_raw_os_error(32);
+        assert!(is_soft_backup_io_error(&e));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn soft_io_error_lock_violation() {
+        // ERROR_LOCK_VIOLATION — byte-range lock held (LockFileEx).
+        let e = std::io::Error::from_raw_os_error(33);
+        assert!(is_soft_backup_io_error(&e));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn non_soft_io_error_outside_windows_allowlist() {
+        // 361 is just outside the codes we recognise; treat as hard.
         let e = std::io::Error::from_raw_os_error(361);
         assert!(!is_soft_backup_io_error(&e));
     }

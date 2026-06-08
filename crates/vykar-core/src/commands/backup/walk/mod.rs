@@ -118,9 +118,9 @@ pub(super) enum Materialized {
         abs_path: PathBuf,
         metadata: fs::MetadataSummary,
     },
-    /// Soft I/O error (e.g. permission denied on readlink, Windows
-    /// unsupported reparse tag) — caller should count as error and surface
-    /// `path` + `reason` in a path-bearing warning.
+    /// Soft I/O error from the read_link step (e.g. permission denied on
+    /// readlink, Windows unsupported reparse tag) — caller should count as
+    /// error and surface `path` + `reason` in a path-bearing warning.
     SoftError { path: PathBuf, reason: String },
     /// Unsupported file type (block device, FIFO, etc.) — silent skip.
     Unsupported,
@@ -239,7 +239,8 @@ pub(super) enum WalkEntry {
         item: Item,
     },
     /// A file that was skipped due to a soft error (permission denied, not
-    /// found, EIO, Windows unsupported reparse, cloud-file). Carries the
+    /// found, EIO, Windows unsupported reparse, cloud-file, locked file).
+    /// Carries the
     /// failing path (snapshot/abs string form) and a pre-formatted reason
     /// so consumers can surface a path-bearing warning.
     Skipped {

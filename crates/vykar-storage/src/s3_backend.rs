@@ -134,8 +134,42 @@ fn s3_check_status(
 }
 
 /// Convert an [`HttpRetryError`] into a `VykarError` for S3 operations.
+///
+/// When a PUT exhausts its retries with a connection-close transport error
+/// (broken pipe / connection reset / aborted), append a cautiously-worded hint
+/// listing candidate causes. ureq does not expose which request phase produced
+/// the I/O error, so the wording does not claim it was the body write — only
+/// that the connection closed during the PUT. The cause is genuinely
+/// undetermined (write-scoped credentials, storage cap/account restriction,
+/// provider per-connection limit, or network middleware), so the hint must not
+/// assert that credentials or quota are fine — successful reads do not rule out
+/// a write-scoped permission or quota cause.
 fn s3_error(op: &str, key: &str, err: HttpRetryError) -> VykarError {
-    VykarError::Other(format!("S3 {op} {key}: {err}"))
+    let mut msg = format!("S3 {op} {key}: {err}");
+    if op == "PUT"
+        && matches!(
+            err.transport_io_kind(),
+            Some(
+                std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+            )
+        )
+    {
+        msg.push_str(
+            " — The connection was closed during the PUT request. Possible causes: \
+             bucket permissions or a read/write-scoped key; a storage cap or account \
+             restriction; a provider per-connection/upload limit; or network middleware \
+             (proxy/firewall/ISP/MTU) resetting the connection.",
+        );
+        // Pack uploads are the large, long-lived transfers most exposed to a
+        // mid-transfer reset; other PUTs (locks, index, snapshots, sessions)
+        // are small, so omit the upload-specific clause for them.
+        if key.starts_with("packs/") {
+            msg.push_str(" Large pack uploads are most exposed to mid-transfer resets.");
+        }
+    }
+    VykarError::Other(msg)
 }
 
 #[allow(clippy::result_large_err)]
@@ -1270,5 +1304,91 @@ mod tests {
         });
         assert!(has_md5, "expected content-md5 header, got: {lines:?}");
         handle.join().unwrap();
+    }
+
+    // ── 11. Connection-close hint on exhausted PUT retries ──────────
+
+    /// Build a transport error carrying the given I/O kind, as the retry layer
+    /// produces it after exhausting retries on a connection-close PUT.
+    fn transport(kind: std::io::ErrorKind) -> HttpRetryError {
+        HttpRetryError::Transport(format!("io: {kind:?}"), Some(kind))
+    }
+
+    #[test]
+    fn put_broken_pipe_appends_hint() {
+        let err = transport(std::io::ErrorKind::BrokenPipe);
+        let msg = s3_error("PUT", "index", err).to_string();
+        assert!(
+            msg.contains("connection was closed during the PUT request"),
+            "expected hint, got: {msg}"
+        );
+        assert!(
+            msg.contains("network middleware"),
+            "expected candidate causes, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn put_connection_reset_and_aborted_append_hint() {
+        for kind in [
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::ConnectionAborted,
+        ] {
+            let msg = s3_error("PUT", "index", transport(kind)).to_string();
+            assert!(
+                msg.contains("connection was closed during the PUT request"),
+                "{kind:?}: expected hint, got: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn put_pack_key_gets_upload_specific_clause() {
+        let err = transport(std::io::ErrorKind::BrokenPipe);
+        let msg = s3_error("PUT", "packs/ab/abcdef", err).to_string();
+        assert!(
+            msg.contains("Large pack uploads are most exposed"),
+            "expected upload-specific clause, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn put_non_pack_key_omits_upload_specific_clause() {
+        let err = transport(std::io::ErrorKind::BrokenPipe);
+        let msg = s3_error("PUT", "snapshots/abc", err).to_string();
+        assert!(
+            msg.contains("connection was closed during the PUT request"),
+            "expected hint, got: {msg}"
+        );
+        assert!(
+            !msg.contains("Large pack uploads"),
+            "non-pack key should not get upload-specific clause, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn put_non_close_transport_kind_gets_no_hint() {
+        // A transport error whose kind is not a connection close must not get
+        // the hint — it does not describe the failure. UnexpectedEof is a real
+        // retryable transport kind (unlike a non-retryable kind, which the retry
+        // layer maps to Permanent and never carries in Transport).
+        let err = transport(std::io::ErrorKind::UnexpectedEof);
+        let msg = s3_error("PUT", "packs/ab/abcdef", err).to_string();
+        assert!(
+            !msg.contains("connection was closed"),
+            "non-close kind should not get hint, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn non_put_op_gets_no_hint() {
+        // The same broken-pipe transport error on a GET (or any non-PUT op)
+        // must not get the PUT-specific hint.
+        let err = transport(std::io::ErrorKind::BrokenPipe);
+        let msg = s3_error("GET", "packs/ab/abcdef", err).to_string();
+        assert!(
+            !msg.contains("connection was closed"),
+            "non-PUT op should not get hint, got: {msg}"
+        );
     }
 }

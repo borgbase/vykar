@@ -12,6 +12,17 @@ fn is_retryable_transport(err: &ureq::Error) -> bool {
     }
 }
 
+/// The underlying [`std::io::ErrorKind`] of a ureq transport error, if it was an
+/// I/O error. Used by backends to give phase-specific diagnostics (e.g. a
+/// connection closed mid-PUT). ureq does not expose which request phase produced
+/// the I/O error — only its kind.
+fn transport_io_kind(err: &ureq::Error) -> Option<std::io::ErrorKind> {
+    match err {
+        ureq::Error::Io(e) => Some(e.kind()),
+        _ => None,
+    }
+}
+
 /// Retry a closure that makes an HTTP request, with exponential backoff + jitter.
 ///
 /// Used by S3 and REST backends. The agent must be configured with
@@ -44,7 +55,8 @@ pub fn retry_http<T>(
             Ok(response) => handle_response(response),
             Err(ureq_err) => {
                 if is_retryable_transport(&ureq_err) {
-                    Err(HttpRetryError::Transport(ureq_err.to_string()))
+                    let kind = transport_io_kind(&ureq_err);
+                    Err(HttpRetryError::Transport(ureq_err.to_string(), kind))
                 } else {
                     Err(HttpRetryError::Permanent(ureq_err.to_string()))
                 }
@@ -90,8 +102,10 @@ pub fn classify_status(code: u16, message: String) -> std::result::Result<(), Ht
 /// application error types lives in each backend.
 pub enum HttpRetryError {
     /// Transport-level error (always retryable — non-retryable transport errors
-    /// are converted to `Permanent` before reaching this variant).
-    Transport(String),
+    /// are converted to `Permanent` before reaching this variant). The second
+    /// field carries the underlying [`std::io::ErrorKind`] when the transport
+    /// failure was an I/O error, so backends can add phase-specific hints.
+    Transport(String, Option<std::io::ErrorKind>),
     /// HTTP status that should be retried (429, 5xx).
     RetryableStatus {
         #[allow(dead_code)]
@@ -105,10 +119,22 @@ pub enum HttpRetryError {
 }
 
 impl HttpRetryError {
+    /// The underlying [`std::io::ErrorKind`] for a transport-level I/O error.
+    ///
+    /// Returns `None` for non-transport errors and for transport errors that
+    /// were not I/O errors (timeouts, connection-failed, host-not-found).
+    /// Backends use this to add phase-specific diagnostics.
+    pub fn transport_io_kind(&self) -> Option<std::io::ErrorKind> {
+        match self {
+            HttpRetryError::Transport(_, kind) => *kind,
+            _ => None,
+        }
+    }
+
     /// Whether this error is transient and worth retrying.
     pub fn is_retryable(&self) -> bool {
         match self {
-            HttpRetryError::Transport(_) | HttpRetryError::RetryableStatus { .. } => true,
+            HttpRetryError::Transport(..) | HttpRetryError::RetryableStatus { .. } => true,
             HttpRetryError::BodyIo(e) => is_retryable_io(e),
             HttpRetryError::Permanent(_) => false,
         }
@@ -118,7 +144,7 @@ impl HttpRetryError {
 impl fmt::Display for HttpRetryError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            HttpRetryError::Transport(msg) => write!(f, "transport error: {msg}"),
+            HttpRetryError::Transport(msg, _) => write!(f, "transport error: {msg}"),
             HttpRetryError::RetryableStatus { message, .. } => write!(f, "{message}"),
             HttpRetryError::BodyIo(e) => write!(f, "body read error: {e}"),
             HttpRetryError::Permanent(msg) => write!(f, "{msg}"),
@@ -193,8 +219,38 @@ mod tests {
 
     #[test]
     fn transport_is_retryable() {
-        let err = HttpRetryError::Transport("connection failed".into());
+        let err = HttpRetryError::Transport("connection failed".into(), None);
         assert!(err.is_retryable());
+    }
+
+    #[test]
+    fn retry_http_preserves_transport_io_kind() {
+        // A ureq I/O transport error must reach the caller as a `Transport`
+        // variant carrying the original `io::ErrorKind`, so backends can give
+        // phase-specific diagnostics. Covers the f()-error mapping branch end
+        // to end (not just a hand-built `Transport`).
+        let config = RetryConfig {
+            max_retries: 0,
+            retry_delay_ms: 1,
+            retry_max_delay_ms: 1,
+        };
+        let err = retry_http::<()>(
+            &config,
+            "PUT testkey",
+            "S3",
+            || {
+                Err(ureq::Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "broken pipe",
+                )))
+            },
+            |_resp| Ok(()),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.transport_io_kind(),
+            Some(std::io::ErrorKind::BrokenPipe)
+        );
     }
 
     #[test]

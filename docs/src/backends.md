@@ -89,6 +89,35 @@ repositories:
 | `allow_insecure_http` | Permit `s3+http://` URLs (unsafe; default: `false`) |
 | `s3_soft_delete` | Use soft-delete for S3 Object Lock compatibility (default: `false`) |
 
+### Large object uploads (multipart)
+
+Objects larger than 16 MiB — primarily packs, but also a large `index` — are
+uploaded with the S3 multipart API (16 MiB parts) instead of a single PUT. Each
+part is retried independently, so a connection reset mid-transfer costs one part
+rather than restarting the whole object. This is resilience on flaky or proxied
+links; it needs no configuration and applies to every S3-compatible backend that
+supports multipart uploads (including Backblaze B2's S3 endpoint).
+
+A process crash mid-upload, or a lost response from S3, can occasionally leave an
+*in-progress* multipart upload that vykar never aborts. These carry no completed
+object and are invisible to backups, but some providers bill for the storage held
+by their uploaded parts. Vykar cannot guarantee cleanup of these, so configure an
+**`AbortIncompleteMultipartUpload`** lifecycle rule on the bucket (1–7 days is a
+reasonable window) to expire them automatically:
+
+```bash
+aws s3api put-bucket-lifecycle-configuration \
+  --bucket my-bucket \
+  --lifecycle-configuration '{
+    "Rules": [{
+      "ID": "abort-incomplete-multipart-uploads",
+      "Status": "Enabled",
+      "Filter": {"Prefix": ""},
+      "AbortIncompleteMultipartUpload": {"DaysAfterInitiation": 7}
+    }]
+  }'
+```
+
 ### S3 append-only / ransomware protection
 
 When using S3 directly (without `vykar-server`), a compromised client that has the

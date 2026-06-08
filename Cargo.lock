@@ -8359,6 +8359,7 @@ dependencies = [
  "http",
  "md-5 0.10.6",
  "percent-encoding",
+ "quick-xml",
  "rand 0.9.4",
  "russh",
  "russh-sftp",

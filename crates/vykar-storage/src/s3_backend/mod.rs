@@ -20,6 +20,8 @@ use vykar_types::error::{Result, VykarError};
 
 use crate::StorageBackend;
 
+mod multipart;
+
 /// Duration for presigned URL validity.
 const PRESIGN_DURATION: Duration = Duration::from_secs(3600);
 
@@ -484,6 +486,12 @@ impl StorageBackend for S3Backend {
 impl S3Backend {
     fn put_bytes(&self, key: &str, data: &[u8]) -> Result<()> {
         let full_key = self.full_key(key);
+        // Large objects (packs, or any object over the threshold — e.g. a big
+        // index) are uploaded via the S3 multipart API so a mid-transfer reset
+        // costs one part instead of the whole object.
+        if data.len() > multipart::MULTIPART_THRESHOLD {
+            return self.put_multipart(&full_key, key, data);
+        }
         let content_type = "application/octet-stream";
         // Content-MD5 is required for S3 buckets with Object Lock enabled.
         let content_md5 = base64::engine::general_purpose::STANDARD.encode(Md5::digest(data));
@@ -511,22 +519,77 @@ impl S3Backend {
     }
 }
 
+/// Shared backend/config constructors used by both the core and multipart test
+/// modules (the multipart tests live in `multipart.rs`).
+#[cfg(test)]
+mod test_support {
+    use super::*;
+
+    pub(super) fn no_retry() -> RetryConfig {
+        RetryConfig {
+            max_retries: 0,
+            ..Default::default()
+        }
+    }
+
+    pub(super) fn fast_retry() -> RetryConfig {
+        RetryConfig {
+            max_retries: 2,
+            retry_delay_ms: 1,
+            retry_max_delay_ms: 1,
+        }
+    }
+
+    pub(super) fn s3_backend(port: u16, retry: RetryConfig, soft_delete: bool) -> S3Backend {
+        S3Backend::new(
+            "test-bucket",
+            "us-east-1",
+            "",
+            &format!("http://127.0.0.1:{port}"),
+            "AKID",
+            "SECRET",
+            retry,
+            soft_delete,
+        )
+        .unwrap()
+    }
+
+    pub(super) fn s3_backend_rooted(port: u16, retry: RetryConfig, soft_delete: bool) -> S3Backend {
+        S3Backend::new(
+            "test-bucket",
+            "us-east-1",
+            "backups/vykar",
+            &format!("http://127.0.0.1:{port}"),
+            "AKID",
+            "SECRET",
+            retry,
+            soft_delete,
+        )
+        .unwrap()
+    }
+
+    pub(super) fn s3_error_xml(code: &str, message: &str) -> String {
+        format!("<Error><Code>{code}</Code><Message>{message}</Message></Error>")
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::test_support::*;
     use super::*;
-    use crate::RetryConfig;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::sync::{Arc, Mutex};
 
     // ── Helpers ──────────────────────────────────────────────────────
 
-    /// Read request headers and drain any body indicated by Content-Length.
+    /// Read request headers and drain any body indicated by Content-Length,
+    /// returning both the header lines and the captured body bytes.
     ///
     /// Draining is load-bearing on Windows: closing a socket with unread
     /// receive data triggers WSAECONNRESET (os error 10054) on the peer,
     /// which ureq surfaces as a transport error. Linux tolerates it.
-    fn read_request(reader: &mut BufReader<TcpStream>) -> Vec<String> {
+    fn read_request(reader: &mut BufReader<TcpStream>) -> (Vec<String>, Vec<u8>) {
         let mut lines = Vec::new();
         let mut content_len = 0usize;
         let mut line = String::new();
@@ -541,11 +604,11 @@ mod tests {
             }
             lines.push(line.trim().to_string());
         }
+        let mut body = vec![0u8; content_len];
         if content_len > 0 {
-            let mut body = vec![0u8; content_len];
             reader.read_exact(&mut body).unwrap();
         }
-        lines
+        (lines, body)
     }
 
     /// Single-response TCP mock server.
@@ -571,7 +634,7 @@ mod tests {
             for response in &responses {
                 let (mut stream, _) = listener.accept().unwrap();
                 let mut reader = BufReader::new(stream.try_clone().unwrap());
-                read_request(&mut reader);
+                let _ = read_request(&mut reader);
                 stream.write_all(response.as_bytes()).unwrap();
                 stream.flush().unwrap();
                 drop(stream);
@@ -592,7 +655,7 @@ mod tests {
         let handle = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let mut reader = BufReader::new(stream.try_clone().unwrap());
-            *captured_clone.lock().unwrap() = read_request(&mut reader);
+            *captured_clone.lock().unwrap() = read_request(&mut reader).0;
             stream.write_all(response.as_bytes()).unwrap();
             stream.flush().unwrap();
         });
@@ -616,7 +679,7 @@ mod tests {
             for response in &responses {
                 let (mut stream, _) = listener.accept().unwrap();
                 let mut reader = BufReader::new(stream.try_clone().unwrap());
-                let lines = read_request(&mut reader);
+                let (lines, _) = read_request(&mut reader);
                 captured_clone.lock().unwrap().push(lines);
                 stream.write_all(response.as_bytes()).unwrap();
                 stream.flush().unwrap();
@@ -624,49 +687,6 @@ mod tests {
             }
         });
         (port, captured, handle)
-    }
-
-    fn no_retry() -> RetryConfig {
-        RetryConfig {
-            max_retries: 0,
-            ..Default::default()
-        }
-    }
-
-    fn fast_retry() -> RetryConfig {
-        RetryConfig {
-            max_retries: 2,
-            retry_delay_ms: 1,
-            retry_max_delay_ms: 1,
-        }
-    }
-
-    fn s3_backend(port: u16, retry: RetryConfig, soft_delete: bool) -> S3Backend {
-        S3Backend::new(
-            "test-bucket",
-            "us-east-1",
-            "",
-            &format!("http://127.0.0.1:{port}"),
-            "AKID",
-            "SECRET",
-            retry,
-            soft_delete,
-        )
-        .unwrap()
-    }
-
-    fn s3_backend_rooted(port: u16, retry: RetryConfig, soft_delete: bool) -> S3Backend {
-        S3Backend::new(
-            "test-bucket",
-            "us-east-1",
-            "backups/vykar",
-            &format!("http://127.0.0.1:{port}"),
-            "AKID",
-            "SECRET",
-            retry,
-            soft_delete,
-        )
-        .unwrap()
     }
 
     /// Generate ListBucketResult XML for rusty_s3 parser.
@@ -702,10 +722,6 @@ mod tests {
         }
         xml.push_str("  <EncodingType>url</EncodingType>\n</ListBucketResult>");
         xml
-    }
-
-    fn s3_error_xml(code: &str, message: &str) -> String {
-        format!("<Error><Code>{code}</Code><Message>{message}</Message></Error>")
     }
 
     // ── 1. s3_check_status via GET ──────────────────────────────────

@@ -35,6 +35,10 @@ rusty-s3 = "0.9.1"
 ureq = { workspace = true, features = ["json"] }
 http = "1"
 
+# Parse S3 multipart completion responses (already in the tree via rusty-s3;
+# pin the same minor to avoid a duplicate copy).
+quick-xml = { version = "0.39", features = ["serialize"] }
+
 # Logging
 tracing.workspace = true
 

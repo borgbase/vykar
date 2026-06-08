@@ -18,6 +18,10 @@ export component MainWindow inherits Window {
     in-out property <string> version_text;
     in-out property <[[StandardListViewItem]]> log_rows: [];
 
+    // Clickable-link color, dark-mode aware. Shared by the mount-URL and
+    // update-availability links in the footer.
+    property <color> link_color: Palette.color-scheme == ColorScheme.dark ? #6cb6ff : #0066cc;
+
     // Operation busy state — disables all action buttons
     in-out property <bool> operation_busy: false;
 
@@ -64,6 +68,10 @@ export component MainWindow inherits Window {
     in-out property <bool> is_mount_active: false;
     in-out property <string> mount_url: "";
 
+    // Update-availability state
+    in-out property <bool> update_available: false;
+    in-out property <string> update_url: "";
+
     // Settings tab state
     in-out property <bool> start_at_login: false;
     in-out property <bool> start_in_background: false;
@@ -90,6 +98,7 @@ export component MainWindow inherits Window {
     callback snapshot_row_clicked(/* row */ int, /* toggle */ bool, /* range */ bool);
     callback stop_mount_clicked();
     callback open_mount_url_clicked();
+    callback open_update_url_clicked();
     callback snapshot_sort_ascending(/* column */ int);
     callback snapshot_sort_descending(/* column */ int);
     callback find_search_clicked();
@@ -359,7 +368,7 @@ export component MainWindow inherits Window {
                             alignment: start;
                             Text {
                                 text: root.mount_url;
-                                color: dark ? #6cb6ff : #0066cc;
+                                color: root.link_color;
                                 vertical-alignment: center;
                             }
                         }
@@ -386,6 +395,11 @@ export component MainWindow inherits Window {
                 clicked => { root.cancel_operation_clicked(); }
             }
             Text { text: root.version_text; vertical-alignment: center; color: #888888; }
+            if root.update_available: TouchArea {
+                mouse-cursor: pointer;
+                clicked => { root.open_update_url_clicked(); }
+                Text { text: "(update)"; color: root.link_color; vertical-alignment: center; }
+            }
         }
     }
     }

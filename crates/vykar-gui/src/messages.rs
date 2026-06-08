@@ -225,4 +225,8 @@ pub(crate) enum UiEvent {
     MountFailed {
         message: String,
     },
+    UpdateAvailable {
+        version: String,
+        url: String,
+    },
 }

@@ -374,6 +374,17 @@ pub(crate) fn spawn(
                             &format!("Mount failed: {message}"),
                         );
                     }
+                    UiEvent::UpdateAvailable { version, url } => {
+                        ui.set_update_available(true);
+                        ui.set_update_url(url.into());
+                        let now = chrono::Local::now();
+                        append_log_row(
+                            &ui,
+                            &now.format("%b %d").to_string(),
+                            &now.format("%H:%M:%S").to_string(),
+                            &format!("Update available: v{version}"),
+                        );
+                    }
                     UiEvent::TriggerSnapshotRefresh => {
                         if let Some(name) = ui_state::current_repo_name(&ui) {
                             let _ = app_tx.send(AppCommand::RefreshSnapshots {

@@ -410,6 +410,18 @@ pub(crate) fn wire_callbacks(
     }
 
     {
+        let ui_weak = ui.as_weak();
+        ui.on_open_update_url_clicked(move || {
+            if let Some(ui) = ui_weak.upgrade() {
+                let url = ui.get_update_url().to_string();
+                if !url.is_empty() {
+                    let _ = opener::open_browser(&url);
+                }
+            }
+        });
+    }
+
+    {
         let tx = app_tx;
         ui.on_delete_selected_snapshots_clicked(move || {
             // Group by repo so each repo's delete runs as a single batch under

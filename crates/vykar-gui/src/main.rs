@@ -27,6 +27,7 @@ mod state;
 mod tray;
 mod tray_state;
 mod ui_state;
+mod update_check;
 mod view_models;
 mod worker;
 use messages::{log_entry_now, AppCommand, UiEvent};
@@ -178,6 +179,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let ui_tx_for_cancel = ui_tx.clone();
+
+    // Best-effort, once-per-launch update check. Detached from the worker so the
+    // network call never delays startup commands.
+    let ui_tx_update = ui_tx_for_cancel.clone();
+    thread::spawn(move || {
+        if let Some(info) = update_check::check(env!("CARGO_PKG_VERSION")) {
+            let _ = ui_tx_update.send(UiEvent::UpdateAvailable {
+                version: info.version,
+                url: info.url,
+            });
+        }
+    });
 
     thread::spawn({
         let app_tx = app_tx.clone();

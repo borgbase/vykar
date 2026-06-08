@@ -65,4 +65,4 @@ Categorize the changes into sections (e.g. Features, Performance, Bug Fixes, Inf
 gh release edit v<version> --notes "<release notes>"
 ```
 
-Include a downloads table at the bottom listing each platform artifact.
+Include an "Updating" section showing the install command (```curl -fsSL https://vykar.borgbase.com/install.sh | sh```) with a link to the [quickstart guide](https://vykar.borgbase.com/quickstart#install) for other install options, followed by a downloads table listing each platform artifact.

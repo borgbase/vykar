@@ -275,32 +275,61 @@ pub fn create_symlink(link_target: &Path, target: &Path) -> std::io::Result<()> 
 pub fn set_file_mtime(path: &Path, secs: i64, nanos: u32) -> std::io::Result<()> {
     #[cfg(unix)]
     {
-        use std::ffi::CString;
-        use std::os::unix::ffi::OsStrExt;
-
-        let c_path = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains null")
-        })?;
-        let times = [
-            libc::timespec {
-                tv_sec: 0,
-                tv_nsec: libc::UTIME_OMIT,
-            },
-            libc::timespec {
-                tv_sec: secs as _,
-                tv_nsec: nanos as _,
-            },
-        ];
-        // SAFETY: `c_path` is a valid NUL-terminated CString owned in this
-        // scope; `times` is a stack-owned 2-element array of timespec; the
-        // flag `0` is a valid utimensat flag set.
-        if unsafe { libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), 0) } == 0 {
-            Ok(())
-        } else {
-            Err(std::io::Error::last_os_error())
-        }
+        set_path_mtime(path, secs, nanos, 0)
     }
 
+    #[cfg(not(unix))]
+    {
+        set_path_mtime(path, secs, nanos)
+    }
+}
+
+/// Set a symlink's own mtime without following it (`AT_SYMLINK_NOFOLLOW`).
+/// No-op on non-Unix platforms (no portable symlink-mtime API).
+pub fn set_symlink_mtime(path: &Path, secs: i64, nanos: u32) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        set_path_mtime(path, secs, nanos, libc::AT_SYMLINK_NOFOLLOW)
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = (path, secs, nanos);
+        Ok(())
+    }
+}
+
+/// Path-based mtime write. On Unix, `flags` are passed to `utimensat`
+/// (`0` follows symlinks; `AT_SYMLINK_NOFOLLOW` targets the link itself).
+#[cfg(unix)]
+fn set_path_mtime(path: &Path, secs: i64, nanos: u32, flags: i32) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains null"))?;
+    let times = [
+        libc::timespec {
+            tv_sec: 0,
+            tv_nsec: libc::UTIME_OMIT,
+        },
+        libc::timespec {
+            tv_sec: secs as _,
+            tv_nsec: nanos as _,
+        },
+    ];
+    // SAFETY: `c_path` is a valid NUL-terminated CString owned in this
+    // scope; `times` is a stack-owned 2-element array of timespec; `flags`
+    // is a valid utimensat flag set (0 or AT_SYMLINK_NOFOLLOW).
+    if unsafe { libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), flags) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(unix))]
+fn set_path_mtime(path: &Path, secs: i64, nanos: u32) -> std::io::Result<()> {
     #[cfg(windows)]
     {
         use std::fs::{FileTimes, OpenOptions};
@@ -319,9 +348,105 @@ pub fn set_file_mtime(path: &Path, secs: i64, nanos: u32) -> std::io::Result<()>
         file.set_times(FileTimes::new().set_modified(time))
     }
 
-    #[cfg(not(any(unix, windows)))]
+    #[cfg(not(windows))]
     {
         let _ = (path, secs, nanos);
+        Ok(())
+    }
+}
+
+/// True iff the process's effective uid is 0 (root). The tar/restic-style gate
+/// for whether restore should attempt to reassign ownership. Always `false` on
+/// non-Unix platforms.
+pub fn is_effective_root() -> bool {
+    #[cfg(unix)]
+    {
+        // SAFETY: geteuid is always safe — it takes no arguments, reads no
+        // memory, and cannot fail.
+        unsafe { libc::geteuid() == 0 }
+    }
+
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+/// Reassign ownership of an open file via `fchown` (no path lookup, no symlink
+/// follow concern). No-op on non-Unix.
+pub fn chown_fd(file: &std::fs::File, uid: u32, gid: u32) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        // SAFETY: fd is borrowed from the open `file` and valid for the call;
+        // uid/gid are plain integers.
+        let ret = unsafe { libc::fchown(file.as_raw_fd(), uid as libc::uid_t, gid as libc::gid_t) };
+        if ret == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = (file, uid, gid);
+        Ok(())
+    }
+}
+
+/// Reassign ownership of a path via `chown` (follows symlinks). Used for
+/// directories, where no fd is held. No-op on non-Unix.
+pub fn chown_path(path: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let c_path = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains null")
+        })?;
+        // SAFETY: `c_path` is a valid NUL-terminated CString owned in this
+        // scope; uid/gid are plain integers.
+        let ret = unsafe { libc::chown(c_path.as_ptr(), uid as libc::uid_t, gid as libc::gid_t) };
+        if ret == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = (path, uid, gid);
+        Ok(())
+    }
+}
+
+/// Reassign ownership of a symlink itself via `lchown` (no follow). No-op on
+/// non-Unix.
+pub fn lchown_path(path: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let c_path = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains null")
+        })?;
+        // SAFETY: `c_path` is a valid NUL-terminated CString owned in this
+        // scope; uid/gid are plain integers.
+        let ret = unsafe { libc::lchown(c_path.as_ptr(), uid as libc::uid_t, gid as libc::gid_t) };
+        if ret == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = (path, uid, gid);
         Ok(())
     }
 }

@@ -125,6 +125,83 @@ fn supports_xattrs(dir: &std::path::Path) -> bool {
     supported
 }
 
+/// Probe whether the filesystem accepts a `user.*` xattr set on a *symlink
+/// itself* (no-follow). `supports_xattrs` only probes a regular file; Linux
+/// forbids `user.*` xattrs on symlinks, so this effectively gates symlink-xattr
+/// tests to macOS and skips them cleanly on Linux.
+#[cfg(unix)]
+fn supports_symlink_xattrs(dir: &std::path::Path) -> bool {
+    let link = dir.join(".symlink-xattr-probe");
+    let _ = std::fs::remove_file(&link);
+    if std::os::unix::fs::symlink("probe-target", &link).is_err() {
+        return false;
+    }
+    // `xattr::set` (xattr 1.6.x) is no-follow → operates on the link itself.
+    let ok = xattr::set(&link, xattr_test_name(), b"1").is_ok();
+    let _ = std::fs::remove_file(&link);
+    ok
+}
+
+/// Set a path's mtime (seconds, nanos=0) via `utimensat`. `nofollow` targets a
+/// symlink itself (`AT_SYMLINK_NOFOLLOW`).
+#[cfg(unix)]
+fn set_mtime_secs(path: &std::path::Path, secs: i64, nofollow: bool) {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
+    let times = [
+        libc::timespec {
+            tv_sec: 0,
+            tv_nsec: libc::UTIME_OMIT,
+        },
+        libc::timespec {
+            tv_sec: secs as _,
+            tv_nsec: 0,
+        },
+    ];
+    let flags = if nofollow {
+        libc::AT_SYMLINK_NOFOLLOW
+    } else {
+        0
+    };
+    // SAFETY: c_path is a valid NUL-terminated CString; times is a stack-owned
+    // 2-element timespec array; flags is a valid utimensat flag set.
+    let ret = unsafe { libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), flags) };
+    assert_eq!(ret, 0, "utimensat failed for {}", path.display());
+}
+
+/// Back up `source_dir` under `snapshot_name` with the standard test request.
+#[cfg(unix)]
+fn backup_source(
+    config: &VykarConfig,
+    snapshot_name: &str,
+    source_dir: &std::path::Path,
+    xattrs_enabled: bool,
+) {
+    let source_paths = vec![source_dir.to_string_lossy().to_string()];
+    let exclude_if_present: Vec<String> = Vec::new();
+    let exclude_patterns: Vec<String> = Vec::new();
+    commands::backup::run(
+        config,
+        commands::backup::BackupRequest {
+            snapshot_name,
+            passphrase: None,
+            source_paths: &source_paths,
+            source_label: "source",
+            exclude_patterns: &exclude_patterns,
+            exclude_if_present: &exclude_if_present,
+            one_file_system: true,
+            git_ignore: false,
+            xattrs_enabled,
+            compression: Compression::None,
+            command_dumps: &[],
+            verbose: false,
+        },
+    )
+    .unwrap();
+}
+
 #[test]
 fn init_store_reopen_read() {
     let tmp = tempfile::tempdir().unwrap();
@@ -611,6 +688,293 @@ fn backup_skips_xattrs_when_disabled() {
     let items = commands::list::load_snapshot_items(&mut repo, "snap-no-xattrs").unwrap();
     let item = items.iter().find(|i| i.path == "file.txt").unwrap();
     assert!(item.xattrs.is_none());
+}
+
+// ---------------------------------------------------------------------------
+// Restore metadata fidelity (F1 uid/gid is privileged; F2 dir mtime, F5
+// symlink mtime, deferred dir mode, and xattrs-before-chmod are non-root).
+// ---------------------------------------------------------------------------
+
+/// F2: a directory's captured mtime is restored (it is no longer re-bumped by
+/// child writes, because the deepest-first dir pass sets it last).
+#[test]
+#[cfg(unix)]
+fn backup_and_restore_preserves_directory_mtime() {
+    use std::os::unix::fs::MetadataExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = tmp.path().join("repo");
+    let source_dir = tmp.path().join("source");
+    let inner = source_dir.join("subdir");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    std::fs::create_dir_all(&inner).unwrap();
+    std::fs::write(inner.join("f.txt"), b"hi").unwrap();
+
+    // Set the child first, then the directory, so the source dir's mtime is the
+    // value we expect after restore.
+    let past: i64 = 1_500_000_000; // 2017-07-14
+    set_mtime_secs(&inner.join("f.txt"), past, false);
+    set_mtime_secs(&inner, past, false);
+
+    let config = make_test_config(&repo_dir);
+    commands::init::run(&config, None).unwrap();
+    backup_source(&config, "snap-dirmtime", &source_dir, false);
+
+    let restore_dir = tmp.path().join("restore");
+    commands::restore::run(
+        &config,
+        None,
+        "snap-dirmtime",
+        restore_dir.to_str().unwrap(),
+        None,
+        false,
+        false,
+    )
+    .unwrap();
+
+    let restored = restore_dir.join("subdir");
+    assert_eq!(
+        std::fs::metadata(&restored).unwrap().mtime(),
+        past,
+        "directory mtime not restored"
+    );
+}
+
+/// F5: a symlink's own mtime is restored (proves `AT_SYMLINK_NOFOLLOW`).
+#[test]
+#[cfg(unix)]
+fn backup_and_restore_preserves_symlink_mtime() {
+    use std::os::unix::fs::MetadataExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = tmp.path().join("repo");
+    let source_dir = tmp.path().join("source");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    std::fs::create_dir_all(&source_dir).unwrap();
+    std::os::unix::fs::symlink("some-target", source_dir.join("link")).unwrap();
+
+    let past: i64 = 1_400_000_000; // 2014
+    set_mtime_secs(&source_dir.join("link"), past, true);
+
+    let config = make_test_config(&repo_dir);
+    commands::init::run(&config, None).unwrap();
+    backup_source(&config, "snap-symmtime", &source_dir, false);
+
+    let restore_dir = tmp.path().join("restore");
+    commands::restore::run(
+        &config,
+        None,
+        "snap-symmtime",
+        restore_dir.to_str().unwrap(),
+        None,
+        false,
+        false,
+    )
+    .unwrap();
+
+    let restored = restore_dir.join("link");
+    let meta = std::fs::symlink_metadata(&restored).unwrap();
+    assert!(meta.file_type().is_symlink());
+    assert_eq!(meta.mtime(), past, "symlink mtime not restored (no-follow)");
+}
+
+/// F5 correction: a `user.*` xattr set on the symlink *itself* round-trips onto
+/// the restored symlink and is not applied to the target. Gated on
+/// `supports_symlink_xattrs` → effectively macOS-only.
+#[test]
+#[cfg(unix)]
+fn backup_and_restore_preserves_symlink_xattrs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = tmp.path().join("repo");
+    let source_dir = tmp.path().join("source");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    std::fs::create_dir_all(&source_dir).unwrap();
+
+    if !supports_symlink_xattrs(&source_dir) {
+        return;
+    }
+
+    // A real target file the symlink points at — must NOT receive the xattr.
+    std::fs::write(source_dir.join("target.txt"), b"payload").unwrap();
+    let link = source_dir.join("link");
+    std::os::unix::fs::symlink("target.txt", &link).unwrap();
+    let attr_name = xattr_test_name();
+    let attr_value = b"on-the-link".to_vec();
+    xattr::set(&link, attr_name, &attr_value).unwrap();
+
+    let config = make_test_config(&repo_dir);
+    commands::init::run(&config, None).unwrap();
+    backup_source(&config, "snap-symxattr", &source_dir, true);
+
+    let restore_dir = tmp.path().join("restore");
+    commands::restore::run(
+        &config,
+        None,
+        "snap-symxattr",
+        restore_dir.to_str().unwrap(),
+        None,
+        true,
+        false,
+    )
+    .unwrap();
+
+    let restored_link = restore_dir.join("link");
+    assert!(restored_link
+        .symlink_metadata()
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    // The xattr is on the link.
+    assert_eq!(
+        xattr::get(&restored_link, attr_name).unwrap(),
+        Some(attr_value)
+    );
+    // The target did not receive it.
+    assert_eq!(
+        xattr::get(restore_dir.join("target.txt"), attr_name).unwrap(),
+        None
+    );
+}
+
+/// Deferred dir mode regression: a read-only (`0o555`) directory containing a
+/// file restores without EACCES and lands at the captured mode.
+#[test]
+#[cfg(unix)]
+fn restore_populates_readonly_directory() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = tmp.path().join("repo");
+    let source_dir = tmp.path().join("source");
+    let ro = source_dir.join("ro");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    std::fs::create_dir_all(&ro).unwrap();
+    std::fs::write(ro.join("inside.txt"), b"contents").unwrap();
+    std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    let config = make_test_config(&repo_dir);
+    commands::init::run(&config, None).unwrap();
+    backup_source(&config, "snap-rodir", &source_dir, false);
+
+    let restore_dir = tmp.path().join("restore");
+    commands::restore::run(
+        &config,
+        None,
+        "snap-rodir",
+        restore_dir.to_str().unwrap(),
+        None,
+        false,
+        false,
+    )
+    .unwrap();
+
+    let restored = restore_dir.join("ro");
+    assert_eq!(
+        std::fs::read(restored.join("inside.txt")).unwrap(),
+        b"contents"
+    );
+    let mode = std::fs::metadata(&restored).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o555, "read-only dir final mode not restored");
+}
+
+/// xattrs-before-chmod regression (file): a `0o444` file carrying a `user.*`
+/// xattr restores with BOTH the xattr and the final read-only mode. With
+/// chmod-first the owner gets EACCES on `setxattr` and the xattr is dropped.
+#[test]
+#[cfg(unix)]
+fn restore_readonly_file_keeps_xattr_and_mode() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = tmp.path().join("repo");
+    let source_dir = tmp.path().join("source");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    std::fs::create_dir_all(&source_dir).unwrap();
+
+    if !supports_xattrs(&source_dir) {
+        return;
+    }
+
+    let file = source_dir.join("ro.txt");
+    std::fs::write(&file, b"data").unwrap();
+    let attr_name = xattr_test_name();
+    let attr_value = b"survives-chmod".to_vec();
+    xattr::set(&file, attr_name, &attr_value).unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+    let config = make_test_config(&repo_dir);
+    commands::init::run(&config, None).unwrap();
+    backup_source(&config, "snap-rofile-xattr", &source_dir, true);
+
+    let restore_dir = tmp.path().join("restore");
+    commands::restore::run(
+        &config,
+        None,
+        "snap-rofile-xattr",
+        restore_dir.to_str().unwrap(),
+        None,
+        true,
+        false,
+    )
+    .unwrap();
+
+    let restored = restore_dir.join("ro.txt");
+    assert_eq!(
+        xattr::get(&restored, attr_name).unwrap(),
+        Some(attr_value),
+        "xattr dropped on read-only file (chmod ran before setxattr?)"
+    );
+    let mode = std::fs::metadata(&restored).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o444, "final mode not applied after xattrs");
+}
+
+/// xattrs-before-chmod regression (dir): a `0o555` directory carrying a
+/// `user.*` xattr restores with BOTH the xattr and the final mode.
+#[test]
+#[cfg(unix)]
+fn restore_readonly_dir_keeps_xattr_and_mode() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = tmp.path().join("repo");
+    let source_dir = tmp.path().join("source");
+    let rodir = source_dir.join("rodir");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    std::fs::create_dir_all(&rodir).unwrap();
+
+    if !supports_xattrs(&source_dir) {
+        return;
+    }
+
+    let attr_name = xattr_test_name();
+    let attr_value = b"dir-xattr".to_vec();
+    xattr::set(&rodir, attr_name, &attr_value).unwrap();
+    std::fs::set_permissions(&rodir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    let config = make_test_config(&repo_dir);
+    commands::init::run(&config, None).unwrap();
+    backup_source(&config, "snap-rodir-xattr", &source_dir, true);
+
+    let restore_dir = tmp.path().join("restore");
+    commands::restore::run(
+        &config,
+        None,
+        "snap-rodir-xattr",
+        restore_dir.to_str().unwrap(),
+        None,
+        true,
+        false,
+    )
+    .unwrap();
+
+    let restored = restore_dir.join("rodir");
+    assert_eq!(
+        xattr::get(&restored, attr_name).unwrap(),
+        Some(attr_value),
+        "xattr dropped on read-only dir (chmod ran before setxattr?)"
+    );
+    let mode = std::fs::metadata(&restored).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o555, "final dir mode not applied after xattrs");
 }
 
 #[test]

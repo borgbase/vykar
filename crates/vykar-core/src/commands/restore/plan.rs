@@ -12,7 +12,7 @@ use crate::snapshot::item::ItemType;
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
 
-use super::{apply_item_xattrs, push_metadata_warning, warn_metadata_err, RestoreStats};
+use super::{push_metadata_warning, warn_metadata_err, RestoreStats};
 
 /// Classification of a symlink's stored target for restore-time auditing.
 /// Used to warn the operator when a snapshot carries symlinks that escape the
@@ -52,11 +52,36 @@ pub(super) struct PlannedFile {
     pub(super) total_size: u64,
     pub(super) mode: u32,
     pub(super) mtime: i64,
+    pub(super) uid: u32,
+    pub(super) gid: u32,
     pub(super) xattrs: Option<HashMap<String, Vec<u8>>>,
     /// CAS flag: the first worker to open this file calls `set_len`.
     /// Prevents repeated `ftruncate` syscalls when multiple workers open
     /// the same large file across different read groups.
     pub(super) created: AtomicBool,
+}
+
+/// A directory or symlink node whose ownership/xattrs/mode/mtime are applied in
+/// a deferred, deepest-first pass after all children have landed. `path` is the
+/// absolute temp path (built from `dest_root` == `temp_root`), so finalizers
+/// need no re-join.
+pub(super) struct PlannedNode {
+    pub(super) path: PathBuf,
+    pub(super) mode: u32,
+    pub(super) mtime: i64,
+    pub(super) uid: u32,
+    pub(super) gid: u32,
+    /// `None` when xattrs are disabled for this restore, so the deferred passes
+    /// honor `xattrs_enabled` without needing the flag threaded in.
+    pub(super) xattrs: Option<HashMap<String, Vec<u8>>>,
+}
+
+/// Deferred directory/symlink metadata accumulated during streaming, applied
+/// after the file passes complete (see `finalize::apply_dir_metadata` /
+/// `apply_symlink_metadata`).
+pub(super) struct StreamPlan {
+    pub(super) dirs: Vec<PlannedNode>,
+    pub(super) symlinks: Vec<PlannedNode>,
 }
 
 /// Aggregated write targets and expected logical size for a single chunk.
@@ -98,7 +123,7 @@ pub(super) fn stream_and_plan<F, B>(
     stats: &mut RestoreStats,
     batch_size: usize,
     mut flush_batch: B,
-) -> Result<()>
+) -> Result<StreamPlan>
 where
     F: FnMut(&str) -> bool,
     B: FnMut(
@@ -112,6 +137,8 @@ where
     verified_dirs.insert(dest_root.to_path_buf());
     let mut planned_files: Vec<PlannedFile> = Vec::new();
     let mut chunk_targets: HashMap<ChunkId, ChunkTargets> = HashMap::new();
+    let mut planned_dirs: Vec<PlannedNode> = Vec::new();
+    let mut planned_symlinks: Vec<PlannedNode> = Vec::new();
     let mut rel_scratch = PathBuf::new();
 
     crate::commands::list::for_each_decoded_item(items_stream, |item| {
@@ -126,10 +153,24 @@ where
                 ensure_path_within_root(&target, dest_root)?;
                 std::fs::create_dir_all(&target)?;
                 ensure_path_within_root(&target, dest_root)?;
-                warn_metadata_err(stats, fs::apply_mode(&target, item.mode), &target, "mode");
-                if xattrs_enabled {
-                    apply_item_xattrs(&target, item.xattrs.as_ref(), stats);
-                }
+                // Hold a temporary owner-rwx mode so children can be written
+                // into a captured-read-only dir; setgid/setuid/sticky and all
+                // captured bits are preserved. The final captured mode is
+                // applied later in the deepest-first dir pass.
+                warn_metadata_err(
+                    stats,
+                    fs::apply_mode(&target, item.mode | 0o700),
+                    &target,
+                    "mode",
+                );
+                planned_dirs.push(PlannedNode {
+                    path: target.clone(),
+                    mode: item.mode,
+                    mtime: item.mtime,
+                    uid: item.uid,
+                    gid: item.gid,
+                    xattrs: if xattrs_enabled { item.xattrs } else { None },
+                });
                 verified_dirs.insert(target);
                 stats.dirs += 1;
             }
@@ -159,9 +200,17 @@ where
                     }
                     let _ = std::fs::remove_file(&target);
                     fs::create_symlink(Path::new(link_target), &target)?;
-                    if xattrs_enabled {
-                        apply_item_xattrs(&target, item.xattrs.as_ref(), stats);
-                    }
+                    // xattrs/lchown/mtime are deferred to the symlink pass so
+                    // ownership lands before xattrs (chown clears capabilities)
+                    // and mtime is the last write to the inode.
+                    planned_symlinks.push(PlannedNode {
+                        path: target,
+                        mode: 0,
+                        mtime: item.mtime,
+                        uid: item.uid,
+                        gid: item.gid,
+                        xattrs: if xattrs_enabled { item.xattrs } else { None },
+                    });
                     stats.symlinks += 1;
                 }
             }
@@ -205,6 +254,8 @@ where
                     total_size: file_offset,
                     mode: item.mode,
                     mtime: item.mtime,
+                    uid: item.uid,
+                    gid: item.gid,
                     xattrs: item.xattrs,
                     created: AtomicBool::new(false),
                 });
@@ -221,7 +272,10 @@ where
     // Final flush — always invoked so the caller observes terminal
     // verified_dirs / dir-only restores even if no files remain.
     flush_batch(planned_files, chunk_targets, &verified_dirs, stats)?;
-    Ok(())
+    Ok(StreamPlan {
+        dirs: planned_dirs,
+        symlinks: planned_symlinks,
+    })
 }
 
 /// Validate the restore destination: must be non-existing or empty (after
@@ -915,6 +969,46 @@ mod tests {
         .unwrap();
 
         assert_eq!(sizes, vec![2, 2, 1]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stream_and_plan_staging_dir_mode_preserves_setgid_and_owner_rwx() {
+        // The staged dir must be owner-rwx (writable during population) AND
+        // keep setgid — a bare 0o700 would strip setgid and change non-root gid
+        // inheritance. The deferred node still carries the captured final mode.
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempdir().unwrap();
+        let dest = &temp.path().canonicalize().unwrap();
+
+        let items = vec![make_dir_item("d", 0o2775)];
+        let stream = serialize_items(&items);
+
+        let mut stats = RestoreStats::default();
+        let plan = stream_and_plan(
+            &stream,
+            dest,
+            &mut |_| true,
+            false,
+            &mut stats,
+            usize::MAX,
+            |_files, _chunks, _verified, _stats| Ok(()),
+        )
+        .unwrap();
+
+        let staged = dest.join("d");
+        let mode = std::fs::metadata(&staged).unwrap().permissions().mode();
+        assert_eq!(mode & 0o2000, 0o2000, "setgid lost during population");
+        assert_eq!(
+            mode & 0o700,
+            0o700,
+            "owner-rwx not forced during population"
+        );
+
+        // The captured (final) mode is held on the node, not the staging mode.
+        assert_eq!(plan.dirs.len(), 1);
+        assert_eq!(plan.dirs[0].mode, 0o2775);
     }
 
     #[test]

@@ -236,7 +236,10 @@ where
     // time it lands at `dest_root` — no path-based reopen window.
     let mut total_bytes: u64 = 0;
     let mut total_files: u64 = 0;
-    plan::stream_and_plan(
+    // Ownership is reassigned only under an effective-root restore (tar/restic
+    // gate); non-root restores skip chown entirely (behavior unchanged).
+    let restore_as_root = fs::is_effective_root();
+    let mut plan_out = plan::stream_and_plan(
         &items_stream,
         &temp_root,
         &mut include_path,
@@ -308,7 +311,13 @@ where
             )?;
 
             // Phase 5b: apply per-file metadata + fsync each file in temp_root.
-            finalize::apply_file_metadata(&batch_files, &temp_root, xattrs_enabled, stats)?;
+            finalize::apply_file_metadata(
+                &batch_files,
+                &temp_root,
+                xattrs_enabled,
+                restore_as_root,
+                stats,
+            )?;
 
             total_bytes += bytes;
             total_files += batch_files.len() as u64;
@@ -320,13 +329,47 @@ where
     drop(items_stream);
     repo.clear_chunk_index();
 
-    // Phase 5a: rename temp subtrees into the final destination.  At this
-    // point all file metadata is already on the inodes, so the rename has
-    // no observable TOCTOU window.
+    // Symlink metadata (F1/F5: lchown → xattrs → mtime) is applied while the
+    // links still live in `temp_root` — the no-reopen property holds for the
+    // security-sensitive lchown, and a `rename` never disturbs a symlink's own
+    // metadata.
+    finalize::apply_symlink_metadata(&plan_out.symlinks, restore_as_root, &mut stats);
+
+    // Phase 5a: rename temp subtrees into the final destination.  All file
+    // metadata is already on the inodes, so the rename has no observable TOCTOU
+    // window.  Directories are still at their staging mode (`item.mode | 0o700`,
+    // owner-writable) so a captured read-only top-level dir can be moved: a
+    // cross-parent `rename` of a directory updates its `..` entry and therefore
+    // needs write permission on the directory itself.
     // No `cleanup` here: `move_temp_to_dest` owns finalization cleanup — it
     // rolls a graceful failure back to an empty `dest`, or returns a distinct
     // "remove before retrying" error if even rollback fails.
     finalize::move_temp_to_dest(&temp_root, &dest_root)?;
+
+    // Directory metadata (F1/F2: chown → xattrs → mode → mtime, deepest-first)
+    // is applied *after* the move, for two reasons: the captured restrictive
+    // mode must follow the cross-parent rename above, and a parent's mtime/mode
+    // must be the last write to its inode (after every child, including file
+    // batches, has landed).  Rebase the staged temp paths onto `dest_root`; the
+    // single-process, validated-empty-dest model (see Phase 3) makes the
+    // path-based application safe.
+    //
+    // Crash window (accepted): a SIGKILL between `move_temp_to_dest` and the end
+    // of this pass leaves a *complete* tree at `dest` whose directories still
+    // carry their owner-writable staging mode (`item.mode | 0o700`) and may lack
+    // ownership/xattrs/mtimes.  File data and metadata are intact — only
+    // directory attributes are degraded.  This extends the documented
+    // mid-rename limitation (`move_temp_to_dest`): once any entry has moved,
+    // `dest` is non-empty and a retry is rejected by `validate_and_prepare_dest`
+    // until the operator clears it, so re-running restore into a fresh
+    // destination is the recovery path.  All failures inside the pass itself are
+    // already non-fatal warnings, so a partial pass never aborts the restore.
+    for node in &mut plan_out.dirs {
+        if let Ok(rel) = node.path.strip_prefix(&temp_root) {
+            node.path = dest_root.join(rel);
+        }
+    }
+    finalize::apply_dir_metadata(&mut plan_out.dirs, restore_as_root, &mut stats);
 
     stats.files = total_files;
     stats.total_bytes = total_bytes;

@@ -531,6 +531,8 @@ mod tests {
             total_size: 5,
             mode: 0o644,
             mtime: 0,
+            uid: 0,
+            gid: 0,
             xattrs: None,
             created: AtomicBool::new(true), // pre-created in test
         }];
@@ -611,6 +613,8 @@ mod tests {
             total_size: big_data.len() as u64,
             mode: 0o644,
             mtime: 0,
+            uid: 0,
+            gid: 0,
             xattrs: None,
             created: AtomicBool::new(false),
         }];
@@ -680,6 +684,8 @@ mod tests {
             total_size,
             mode: 0o644,
             mtime: 0,
+            uid: 0,
+            gid: 0,
             xattrs: None,
             created: AtomicBool::new(false),
         }];
@@ -764,6 +770,8 @@ mod tests {
                 total_size: data_a.len() as u64,
                 mode: 0o644,
                 mtime: 0,
+                uid: 0,
+                gid: 0,
                 xattrs: None,
                 created: AtomicBool::new(false),
             },
@@ -772,6 +780,8 @@ mod tests {
                 total_size: data_b.len() as u64,
                 mode: 0o644,
                 mtime: 0,
+                uid: 0,
+                gid: 0,
                 xattrs: None,
                 created: AtomicBool::new(false),
             },
@@ -868,6 +878,8 @@ mod tests {
             total_size: expected_data.len() as u64,
             mode: 0o644,
             mtime: 0,
+            uid: 0,
+            gid: 0,
             xattrs: None,
             created: AtomicBool::new(false),
         }];
@@ -924,6 +936,8 @@ mod tests {
             total_size: payload.len() as u64,
             mode: 0o644,
             mtime: 0,
+            uid: 0,
+            gid: 0,
             xattrs: None,
             created: AtomicBool::new(false),
         }];
@@ -994,6 +1008,8 @@ mod tests {
             total_size: payload.len() as u64,
             mode: 0o644,
             mtime: 0,
+            uid: 0,
+            gid: 0,
             xattrs: None,
             created: AtomicBool::new(false),
         }];

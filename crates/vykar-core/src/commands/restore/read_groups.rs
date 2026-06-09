@@ -191,6 +191,8 @@ mod tests {
                 total_size: file_offset,
                 mode: item.mode,
                 mtime: item.mtime,
+                uid: item.uid,
+                gid: item.gid,
                 xattrs: item.xattrs.clone(),
                 created: AtomicBool::new(false),
             });

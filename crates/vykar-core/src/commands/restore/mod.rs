@@ -4,6 +4,7 @@
 //! is the orchestrator that wires them together and exposes the public API.
 
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsStr;
 use std::path::Path;
 
 use tracing::info;
@@ -49,6 +50,12 @@ pub(super) const MAX_WRITE_BATCH: usize = 1024 * 1024; // 1 MiB
 /// 10M-file snapshot no longer requires gigabytes of plan state up front,
 /// and a malicious snapshot cannot DoS the host before any data is read.
 const RESTORE_BATCH_FILES: usize = 100_000;
+
+/// Vykar-reserved prefix for the hidden directory restore stages writes into
+/// (`{RESTORE_TEMP_PREFIX}{16 lowercase hex}`). A directory matching this exact
+/// shape is owned by Vykar and is swept by `validate_and_prepare_dest` on the
+/// next restore run; see [`is_reserved_temp_dir_name`].
+pub(super) const RESTORE_TEMP_PREFIX: &str = ".vykar-restore-";
 
 /// Cap on non-fatal metadata warnings retained in `RestoreStats.warnings`.
 /// Failures past this cap are counted in `warnings_suppressed` only — this
@@ -205,14 +212,19 @@ where
     // On success we rename top-level entries into dest; on failure we
     // remove_dir_all the temp root so no partial files are left at dest.
     let temp_dir_name = format!(
-        ".vykar-restore-{:016x}",
+        "{}{:016x}",
+        RESTORE_TEMP_PREFIX,
         rand::Rng::random::<u64>(&mut rand::rng())
     );
     let temp_root = dest_root.join(&temp_dir_name);
     std::fs::create_dir_all(&temp_root)?;
 
+    // Cleanup for failures *before* finalization (stream/plan/write errors).
+    // `force_remove_temp_tree` (not `remove_dir_all`) so restrictive `000`
+    // dirs applied during streaming can't make cleanup itself `EACCES`.
+    // Finalization decides its own cleanup (rollback); see `move_temp_to_dest`.
     let cleanup = |e: VykarError| -> VykarError {
-        let _ = std::fs::remove_dir_all(&temp_root);
+        let _ = finalize::force_remove_temp_tree(&temp_root);
         e
     };
 
@@ -295,8 +307,8 @@ where
                 verify_chunks,
             )?;
 
-            // Phase 5b: apply per-file metadata in temp_root.
-            finalize::apply_file_metadata(&batch_files, &temp_root, xattrs_enabled, stats);
+            // Phase 5b: apply per-file metadata + fsync each file in temp_root.
+            finalize::apply_file_metadata(&batch_files, &temp_root, xattrs_enabled, stats)?;
 
             total_bytes += bytes;
             total_files += batch_files.len() as u64;
@@ -311,7 +323,10 @@ where
     // Phase 5a: rename temp subtrees into the final destination.  At this
     // point all file metadata is already on the inodes, so the rename has
     // no observable TOCTOU window.
-    finalize::move_temp_to_dest(&temp_root, &dest_root).map_err(&cleanup)?;
+    // No `cleanup` here: `move_temp_to_dest` owns finalization cleanup — it
+    // rolls a graceful failure back to an empty `dest`, or returns a distinct
+    // "remove before retrying" error if even rollback fails.
+    finalize::move_temp_to_dest(&temp_root, &dest_root)?;
 
     stats.files = total_files;
     stats.total_bytes = total_bytes;
@@ -337,6 +352,25 @@ where
 // ---------------------------------------------------------------------------
 // Helpers shared across submodules
 // ---------------------------------------------------------------------------
+
+/// True only when `name` is [`RESTORE_TEMP_PREFIX`] followed by exactly 16
+/// lowercase hex digits — the strict shape `validate_and_prepare_dest` produces
+/// via `format!("{}{:016x}", ...)`. Near-miss names (wrong length, uppercase,
+/// non-hex, a different suffix) return `false` and are preserved. Whether the
+/// entry is actually a directory is the caller's responsibility (via
+/// `file_type`), so a *file* or symlink bearing this name is never swept.
+pub(super) fn is_reserved_temp_dir_name(name: &OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    let Some(suffix) = name.strip_prefix(RESTORE_TEMP_PREFIX) else {
+        return false;
+    };
+    suffix.len() == 16
+        && suffix
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
 
 /// Check if a path matches the selection set.
 /// A path matches if it's exactly in the set, or any prefix (ancestor) is in the set.
@@ -428,6 +462,26 @@ mod tests {
         assert!(path_matches_selection("docs/notes", &selected));
         assert!(!path_matches_selection("docs/other", &selected));
         assert!(!path_matches_selection("documents", &selected));
+    }
+
+    #[test]
+    fn is_reserved_temp_dir_name_strict_shape() {
+        let ok = |s: &str| is_reserved_temp_dir_name(OsStr::new(s));
+        // Exactly prefix + 16 lowercase hex digits.
+        assert!(ok(".vykar-restore-0123456789abcdef"));
+        assert!(ok(".vykar-restore-ffffffffffffffff"));
+        assert!(ok(".vykar-restore-0000000000000000"));
+        // Wrong length (15 / 17).
+        assert!(!ok(".vykar-restore-0123456789abcde"));
+        assert!(!ok(".vykar-restore-0123456789abcdef0"));
+        // Uppercase / non-hex.
+        assert!(!ok(".vykar-restore-0123456789ABCDEF"));
+        assert!(!ok(".vykar-restore-0123456789abcdeg"));
+        // Different / missing suffix.
+        assert!(!ok(".vykar-restore-notes"));
+        assert!(!ok(".vykar-restore-"));
+        assert!(!ok(".vykar-restore"));
+        assert!(!ok("vykar-restore-0123456789abcdef"));
     }
 
     #[test]

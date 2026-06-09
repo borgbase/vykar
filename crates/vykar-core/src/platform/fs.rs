@@ -218,6 +218,23 @@ pub fn set_file_mtime_fd(file: &std::fs::File, secs: i64, nanos: u32) -> std::io
     }
 }
 
+/// fsync an open directory handle so its newly-created/renamed entries become
+/// durable. Mirrors `LocalBackend::sync_directory`. Fault-unaware leaf: the
+/// restore module owns the injectable wrapper (`finalize::inj_fsync_dir`) that
+/// calls this. No-op on non-Unix (Windows has no portable directory fsync).
+pub fn fsync_dir_file(file: &std::fs::File) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        file.sync_all()
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = file;
+        Ok(())
+    }
+}
+
 pub fn create_symlink(link_target: &Path, target: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {

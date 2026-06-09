@@ -224,17 +224,50 @@ where
     Ok(())
 }
 
-/// Validate the restore destination: must be non-existing or empty.
-/// Creates the directory if it doesn't exist. Returns the canonicalized path.
+/// Validate the restore destination: must be non-existing or empty (after
+/// sweeping any stale Vykar-reserved temp dirs). Creates the directory if it
+/// doesn't exist. Returns the canonicalized path.
+///
+/// F4-a — stale-temp sweep: a killed restore can leave a
+/// `.vykar-restore-<16hex>` directory that would otherwise trip the
+/// non-empty check on the next run. Real directories whose names pass the
+/// strict [`super::is_reserved_temp_dir_name`] shape are removed
+/// (`force_remove_temp_tree`, hard error on failure). Everything else —
+/// near-miss names, non-directory entries named like the pattern, symlinks —
+/// is preserved and still triggers the non-empty error.
+///
+/// Caveat (accepted): two concurrent restores into the same `dest` are already
+/// unsupported (both demand an empty `dest`); the second would sweep the
+/// first's in-flight temp dir.
 pub(super) fn validate_and_prepare_dest(dest: &str) -> Result<PathBuf> {
     let dest_path = Path::new(dest);
     if dest_path.exists() {
-        let is_empty = dest_path
+        // Snapshot entries before mutating the tree — removing entries while
+        // iterating the same `read_dir` is undefined on some filesystems.
+        let entries: Vec<std::fs::DirEntry> = dest_path
             .read_dir()
             .map_err(|e| VykarError::Other(format!("cannot read destination '{}': {e}", dest)))?
-            .next()
-            .is_none();
-        if !is_empty {
+            .collect::<std::io::Result<Vec<_>>>()
+            .map_err(|e| VykarError::Other(format!("cannot read destination '{}': {e}", dest)))?;
+
+        let mut non_temp_remains = false;
+        for entry in &entries {
+            let file_type = entry.file_type().map_err(|e| {
+                VykarError::Other(format!("cannot stat entry in destination '{}': {e}", dest))
+            })?;
+            if file_type.is_dir() && super::is_reserved_temp_dir_name(&entry.file_name()) {
+                super::finalize::force_remove_temp_tree(&entry.path()).map_err(|e| {
+                    VykarError::Other(format!(
+                        "failed to remove stale restore temp dir '{}': {e}",
+                        entry.path().display()
+                    ))
+                })?;
+            } else {
+                non_temp_remains = true;
+            }
+        }
+
+        if non_temp_remains {
             return Err(VykarError::Config(format!(
                 "restore destination '{}' is not empty; use an empty or non-existing directory",
                 dest
@@ -711,6 +744,75 @@ mod tests {
             err.contains("not empty"),
             "expected 'not empty' error, got: {err}"
         );
+    }
+
+    #[test]
+    fn validate_dest_sweeps_lone_reserved_temp_dir() {
+        let temp = tempdir().unwrap();
+        // A valid reserved temp dir (with nested content) is the only entry.
+        let leftover = temp.path().join(".vykar-restore-0123456789abcdef");
+        std::fs::create_dir_all(leftover.join("sub")).unwrap();
+        std::fs::write(leftover.join("sub/f.txt"), b"data").unwrap();
+
+        let dest = validate_and_prepare_dest(temp.path().to_str().unwrap()).unwrap();
+        assert!(dest.is_dir());
+        assert!(!leftover.exists());
+        assert_eq!(std::fs::read_dir(&dest).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn validate_dest_preserves_near_miss_entries() {
+        let temp = tempdir().unwrap();
+        // A genuinely stale reserved temp dir — should be swept.
+        std::fs::create_dir_all(temp.path().join(".vykar-restore-0123456789abcdef")).unwrap();
+        // Near-miss directories — wrong suffix, wrong length.
+        std::fs::create_dir_all(temp.path().join(".vykar-restore-notes")).unwrap();
+        std::fs::create_dir_all(temp.path().join(".vykar-restore-0123456789abcde")).unwrap(); // 15
+        std::fs::create_dir_all(temp.path().join(".vykar-restore-0123456789abcdef0")).unwrap(); // 17
+                                                                                                // A *file* named exactly like the valid pattern — not a directory.
+        std::fs::write(
+            temp.path().join(".vykar-restore-fedcba9876543210"),
+            b"not a dir",
+        )
+        .unwrap();
+
+        let err = validate_and_prepare_dest(temp.path().to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not empty"), "got: {err}");
+        // The valid reserved dir was still swept; the near-misses remain.
+        assert!(!temp.path().join(".vykar-restore-0123456789abcdef").exists());
+        assert!(temp.path().join(".vykar-restore-notes").exists());
+        assert!(temp.path().join(".vykar-restore-0123456789abcde").exists());
+        assert!(temp
+            .path()
+            .join(".vykar-restore-0123456789abcdef0")
+            .exists());
+        assert!(temp
+            .path()
+            .join(".vykar-restore-fedcba9876543210")
+            .is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_dest_preserves_symlink_named_like_pattern() {
+        let temp = tempdir().unwrap();
+        // A symlink whose name matches the valid pattern must not be followed
+        // or swept (file_type does not follow it; is_dir() is false).
+        std::os::unix::fs::symlink("/tmp", temp.path().join(".vykar-restore-aaaaaaaaaaaaaaaa"))
+            .unwrap();
+        let err = validate_and_prepare_dest(temp.path().to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not empty"), "got: {err}");
+        assert!(temp
+            .path()
+            .join(".vykar-restore-aaaaaaaaaaaaaaaa")
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink());
     }
 
     #[test]

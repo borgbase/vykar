@@ -775,3 +775,154 @@ fn apply_refuses_with_active_sessions() {
         "expected ActiveSessions error, got: {err}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 18. F6: crash-orphan index entries / inflated refcounts are reclaimed by
+//     `check --repair` without data loss.
+//
+// Simulates the post-crash state of a backup interrupted between the index PUT
+// and the snapshot PUT: the committed index holds a brand-new chunk no snapshot
+// references (an orphan) plus an inflated refcount from a dedup-bump that landed
+// before the crash. The always-on refcount rebuild recomputes refcounts from the
+// surviving snapshots, dropping the orphan and correcting the inflation — and no
+// live reference is lost.
+// ---------------------------------------------------------------------------
+
+/// Recursively find a file by name under `root` (restore reproduces the source
+/// path tree under the destination, so the file is nested).
+fn find_restored_file(root: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
+    for entry in std::fs::read_dir(root).ok()? {
+        let p = entry.ok()?.path();
+        if p.is_dir() {
+            if let Some(found) = find_restored_file(&p, name) {
+                return Some(found);
+            }
+        } else if p.file_name().and_then(|s| s.to_str()) == Some(name) {
+            return Some(p);
+        }
+    }
+    None
+}
+
+#[test]
+fn repair_reclaims_crash_orphan_index_entries() {
+    use vykar_types::chunk_id::ChunkId;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo_dir, config) = setup_repo(tmp.path());
+
+    // Record a real, snapshot-referenced chunk and its committed refcount.
+    let (existing_id, existing_pack, existing_offset, existing_size, original_refcount) = {
+        let repo = open_local_repo(&repo_dir);
+        let (id, entry) = repo
+            .chunk_index()
+            .iter()
+            .next()
+            .map(|(id, e)| (*id, *e))
+            .expect("backup should have produced at least one chunk");
+        (
+            id,
+            entry.pack_id,
+            entry.pack_offset,
+            entry.stored_size,
+            entry.refcount,
+        )
+    };
+
+    // A brand-new chunk id no snapshot references: simulates a chunk an aborted
+    // backup uploaded and committed to the index before crashing.
+    let orphan_id = ChunkId::from_bytes([0x5a; 32]);
+    assert_ne!(orphan_id, existing_id);
+
+    // Inject the F6 post-crash state and persist it, mimicking the crash window
+    // between the index PUT and the snapshot PUT. chunk_index_mut() auto-marks
+    // the index dirty; save_state() persists it (no-op lock fence on a locally
+    // opened repo).
+    {
+        let mut repo = open_local_repo(&repo_dir);
+        repo.load_chunk_index_uncached().unwrap();
+        // Point the orphan at a real, valid blob location so no structural check
+        // flags it — the only thing wrong is that no snapshot references it.
+        repo.chunk_index_mut()
+            .add(orphan_id, existing_size, existing_pack, existing_offset);
+        // Inflate a live chunk's refcount (a dedup-bump that committed before
+        // the crash).
+        repo.chunk_index_mut()
+            .increment_refcount_by(&existing_id, 3);
+        repo.save_state().unwrap();
+    }
+
+    // Confirm the corrupted state actually persisted.
+    {
+        let repo = open_local_repo(&repo_dir);
+        assert!(
+            repo.chunk_index().contains(&orphan_id),
+            "orphan entry should be present before repair"
+        );
+        assert_eq!(
+            repo.chunk_index().get(&existing_id).unwrap().refcount,
+            original_refcount + 3,
+            "refcount should be inflated before repair"
+        );
+    }
+
+    // `vykar check --repair` (Apply, no verify_data).
+    let result = apply_repair(&config, false);
+
+    // The always-on refcount rebuild ran...
+    assert!(
+        has_action(&result.applied, |a| matches!(
+            a,
+            RepairAction::RebuildRefcounts
+        )),
+        "expected RebuildRefcounts in applied, got: {:?}",
+        result.applied
+    );
+    // ...and the orphan-only repair is non-destructive: no snapshot/pack/chunk
+    // removals were needed.
+    assert!(
+        !result.plan.has_data_loss,
+        "crash-orphan repair should not be data-loss, got plan: {:?}",
+        result.plan.actions
+    );
+
+    // Reopen: the orphan entry is gone and the inflated refcount is corrected.
+    {
+        let repo = open_local_repo(&repo_dir);
+        assert!(
+            !repo.chunk_index().contains(&orphan_id),
+            "rebuild_refcounts should have dropped the orphan index entry"
+        );
+        let entry = repo
+            .chunk_index()
+            .get(&existing_id)
+            .expect("live chunk must survive the rebuild");
+        assert_eq!(
+            entry.refcount, original_refcount,
+            "inflated refcount should be corrected to the snapshot-derived value"
+        );
+        assert!(entry.refcount > 0, "live chunk refcount must stay > 0");
+    }
+
+    // The repo is clean and snap-base still restores byte-identical — no live
+    // reference was lost by the orphan reclamation.
+    assert_clean_after_repair(&config);
+
+    let dest = tmp.path().join("restored_base");
+    std::fs::create_dir_all(&dest).unwrap();
+    commands::restore::run(
+        &config,
+        None,
+        "snap-base",
+        dest.to_str().unwrap(),
+        None,
+        false,
+        false,
+    )
+    .unwrap();
+    let restored =
+        find_restored_file(&dest, "file_00.bin").expect("file_00.bin missing after restore");
+    let got = std::fs::read(&restored).unwrap();
+    let expected = vec![0u8; 4096]; // file_00 == (0).wrapping_mul(37) == 0
+    assert_eq!(got, expected, "snap-base should restore byte-identical");
+}

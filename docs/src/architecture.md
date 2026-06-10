@@ -618,7 +618,7 @@ Each backup session accumulates index mutations in an `IndexDelta`: `new_entries
 
 #### Index Then Snapshot Commit Point
 
-The index is always written before `snapshots/<id>`. A crash between these two writes leaves orphan entries in the index (no snapshot references them) — harmless, cleaned up by the next `compact`. Once `snapshots/<id>` is written, the backup is committed. Delete/prune intentionally invert this ordering: snapshot object first, then index save, so crashes leave inflated refcounts instead of visible snapshots whose chunks were already removed from the index.
+The index is always written before `snapshots/<id>`. A crash between these two writes leaves orphan entries in the index (no snapshot references them) — a bounded, never-data-loss space leak. `compact` alone does **not** reclaim these: it treats any in-index chunk as live, so an orphan still in the index counts toward `live_bytes`. They are reclaimed by `vykar check --repair`, whose always-on refcount rebuild recomputes refcounts from the surviving snapshots and drops index entries no snapshot references; a subsequent `vykar compact` then frees the orphaned pack bytes. Once `snapshots/<id>` is written, the backup is committed. Delete/prune intentionally invert this ordering: snapshot object first, then index save, so crashes leave inflated refcounts instead of visible snapshots whose chunks were already removed from the index.
 
 ### Compact
 

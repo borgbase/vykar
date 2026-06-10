@@ -566,6 +566,110 @@ fn backup_run_with_progress_emits_events_and_final_stats() {
     assert_eq!(final_stats_event.3, stats.deduplicated_size);
 }
 
+/// Backing up a source containing a Unix socket (a file type vykar's data
+/// model can't represent) must warn-only: emit a `Warning` event naming the
+/// socket, but leave `stats.errors == 0` and `is_partial == false` so the
+/// backup still reports full success. Exercised on both the pipeline (default
+/// threads) and sequential (threads = 1) paths, which surface the skip through
+/// different channels.
+#[test]
+#[cfg(unix)]
+fn backup_warns_but_does_not_fail_on_unsupported_special_file() {
+    fn run_case(threads: usize, snapshot_name: &str) {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_dir = tmp.path().join("repo");
+        let source_dir = tmp.path().join("source");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        // A normal file so the snapshot has real content too.
+        std::fs::write(source_dir.join("regular.txt"), b"data").unwrap();
+        // A Unix socket — unrepresentable in vykar's ItemType.
+        let sock_path = source_dir.join("daemon.sock");
+        let listener = match std::os::unix::net::UnixListener::bind(&sock_path) {
+            Ok(l) => l,
+            // Skip when the socket fixture can't be created: restricted
+            // sandbox (EPERM) or a tempdir path too long for the ~104-byte
+            // sun_path limit on macOS (EINVAL).
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::InvalidInput
+                ) =>
+            {
+                return
+            }
+            Err(e) => panic!("unexpected bind error: {e}"),
+        };
+        let _listener = listener;
+
+        let mut config = make_test_config(&repo_dir);
+        config.limits.threads = threads;
+        commands::init::run(&config, None).unwrap();
+
+        let source_paths = vec![source_dir.to_string_lossy().to_string()];
+        let exclude_patterns: Vec<String> = Vec::new();
+        let exclude_if_present: Vec<String> = Vec::new();
+
+        let mut events = Vec::new();
+        let mut on_progress = |event| events.push(event);
+
+        let outcome = commands::backup::run_with_progress(
+            &config,
+            commands::backup::BackupRequest {
+                snapshot_name,
+                passphrase: None,
+                source_paths: &source_paths,
+                source_label: "source",
+                exclude_patterns: &exclude_patterns,
+                exclude_if_present: &exclude_if_present,
+                one_file_system: true,
+                git_ignore: false,
+                xattrs_enabled: config.xattrs.enabled,
+                compression: Compression::None,
+                command_dumps: &[],
+                verbose: false,
+            },
+            Some(&mut on_progress),
+            None,
+        )
+        .unwrap();
+
+        // (a) A per-entry warning naming the socket must have been emitted.
+        let warned = events.iter().any(|event| match event {
+            commands::backup::BackupProgressEvent::Warning { message } => {
+                message.contains("socket") && message.contains("daemon.sock")
+            }
+            _ => false,
+        });
+        assert!(
+            warned,
+            "threads={threads}: expected a Warning event naming the skipped socket, got {events:?}"
+        );
+
+        // (b) The warn-only guarantee: no errors counted, backup not partial.
+        assert_eq!(
+            outcome.stats.errors, 0,
+            "threads={threads}: unsupported special files must not count as errors"
+        );
+        assert!(
+            !outcome.is_partial,
+            "threads={threads}: backup must report full success"
+        );
+
+        // The regular file alongside the socket must still have been backed up.
+        let mut repo = open_local_repo(&repo_dir);
+        let items = commands::list::load_snapshot_items(&mut repo, snapshot_name).unwrap();
+        assert!(
+            items.iter().any(|i| i.path.ends_with("regular.txt")),
+            "threads={threads}: the regular file must still be in the snapshot"
+        );
+    }
+
+    // Pipeline path (threads = 2 forces num_workers > 1) and sequential path
+    // (threads = 1).
+    run_case(2, "snap-socket-pipeline");
+    run_case(1, "snap-socket-sequential");
+}
+
 #[test]
 #[cfg(unix)]
 fn backup_and_restore_preserves_file_xattrs_when_enabled() {

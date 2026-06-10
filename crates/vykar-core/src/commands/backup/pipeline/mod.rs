@@ -98,6 +98,15 @@ pub(super) enum ProcessedEntry {
     DatalessSkipped {
         path: String,
     },
+    /// An entry whose file type vykar can't represent (socket, FIFO,
+    /// block/character device), skipped at walk time. The consumer emits a
+    /// per-entry warn-only message naming the path and type; unlike
+    /// `Skipped`/`WalkSkip` this does **not** increment `stats.errors` or mark
+    /// the backup partial.
+    UnsupportedSkipped {
+        path: String,
+        file_type: &'static str,
+    },
     /// The walker reported a soft error before it could materialize an
     /// `Item` (e.g. directory-iteration `EACCES`, Windows unsupported
     /// reparse tag, cloud-file unavailable, locked file held by another
@@ -403,6 +412,20 @@ pub(crate) fn run_parallel_pipeline(
                         // so the SourceFinished arm can flush the summary.
                         let _ = path;
                         dataless_skipped += 1;
+                    }
+                    Ok(ProcessedEntry::UnsupportedSkipped { path, file_type }) => {
+                        // Warn-only: name the path + type so the omission is
+                        // visible, but do NOT touch stats.errors / is_partial.
+                        // These entries carry no recoverable data in vykar's
+                        // model (no ItemType for them), so an omission is a
+                        // warning, not a failure (cf. tar's "socket ignored",
+                        // rsync's "skipping non-regular file"). Note: borg and
+                        // restic DO model device nodes/FIFOs natively — vykar
+                        // does not, so this is the narrower skip precedent.
+                        super::emit_post_commit_warning(
+                            progress,
+                            format!("skipping unsupported {file_type}: '{path}'"),
+                        );
                     }
                     Ok(ProcessedEntry::SegmentSkipped {
                         segment_index,

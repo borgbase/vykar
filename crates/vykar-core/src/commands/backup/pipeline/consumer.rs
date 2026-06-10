@@ -308,7 +308,8 @@ pub(super) fn consume_processed_entry(
         ProcessedEntry::Skipped { .. }
         | ProcessedEntry::SegmentSkipped { .. }
         | ProcessedEntry::WalkSkip { .. }
-        | ProcessedEntry::DatalessSkipped { .. } => {
+        | ProcessedEntry::DatalessSkipped { .. }
+        | ProcessedEntry::UnsupportedSkipped { .. } => {
             return Err(VykarError::Other(
                 "internal error: skipped backup entry reached consume_processed_entry".into(),
             ));

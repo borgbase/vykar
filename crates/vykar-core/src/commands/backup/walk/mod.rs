@@ -122,8 +122,14 @@ pub(super) enum Materialized {
     /// readlink, Windows unsupported reparse tag) — caller should count as
     /// error and surface `path` + `reason` in a path-bearing warning.
     SoftError { path: PathBuf, reason: String },
-    /// Unsupported file type (block device, FIFO, etc.) — silent skip.
-    Unsupported,
+    /// Unsupported file type (socket, FIFO, block/character device) — vykar's
+    /// data model can't represent it. Carries a human-readable `file_type` label
+    /// so the consumer can emit a path-bearing warn-only skip (not counted as an
+    /// error). `&'static str` keeps the variant small.
+    Unsupported {
+        path: PathBuf,
+        file_type: &'static str,
+    },
 }
 
 /// Assemble an `ItemRawNames` from the optional path and link-target byte
@@ -139,6 +145,32 @@ fn build_raw_names(
         path: path_raw,
         link_target: link_target_raw,
     })
+}
+
+/// Map a non-directory/file/symlink file type to a human-readable label for
+/// the warn-only skip message. On unix, distinguishes socket / FIFO / block
+/// device / character device via `FileTypeExt`; everything else (and all
+/// non-unix entries, where this branch is effectively unreachable) falls back
+/// to a generic label.
+#[cfg(unix)]
+fn classify_unsupported(file_type: std::fs::FileType) -> &'static str {
+    use std::os::unix::fs::FileTypeExt;
+    if file_type.is_socket() {
+        "socket"
+    } else if file_type.is_fifo() {
+        "FIFO"
+    } else if file_type.is_block_device() {
+        "block device"
+    } else if file_type.is_char_device() {
+        "character device"
+    } else {
+        "unsupported file type"
+    }
+}
+
+#[cfg(not(unix))]
+fn classify_unsupported(_file_type: std::fs::FileType) -> &'static str {
+    "unsupported file type"
 }
 
 /// Classify a walked filesystem entry and build an `Item` from its metadata.
@@ -178,7 +210,10 @@ pub(super) fn materialize_item(walked: WalkedEntry, xattrs_enabled: bool) -> Res
     } else if file_type.is_file() {
         (ItemType::RegularFile, None, None)
     } else {
-        return Ok(Materialized::Unsupported);
+        return Ok(Materialized::Unsupported {
+            path: walked.abs_path,
+            file_type: classify_unsupported(file_type),
+        });
     };
 
     let item_ctime = if entry_type == ItemType::RegularFile {
@@ -277,6 +312,16 @@ pub(super) enum WalkEntry {
     SkippedDataless {
         path: String,
     },
+    /// An entry whose file type vykar can't represent (socket, FIFO,
+    /// block/character device). Skipped without opening, with a per-entry
+    /// warning emitted by the consumer. Unlike `Skipped`, this is **not**
+    /// counted as an error and does not mark the backup partial — it mirrors
+    /// the warn-only `SkippedDataless` channel but warns per entry rather than
+    /// as an end-of-source summary.
+    SkippedUnsupported {
+        path: String,
+        file_type: &'static str,
+    },
     SourceStarted {
         path: String,
     },
@@ -294,7 +339,9 @@ pub(super) fn reserve_budget(entry: &WalkEntry, budget: &ByteBudget) -> Result<u
             budget.acquire(usize::try_from(*file_size).unwrap_or(usize::MAX))
         }
         WalkEntry::FileSegment { len, .. } => budget.acquire(*len as usize),
-        WalkEntry::Skipped { .. } | WalkEntry::SkippedDataless { .. } => Ok(0),
+        WalkEntry::Skipped { .. }
+        | WalkEntry::SkippedDataless { .. }
+        | WalkEntry::SkippedUnsupported { .. } => Ok(0),
         _ => Ok(0),
     }
 }
@@ -341,12 +388,14 @@ pub(super) fn build_walk_iter<'a>(
 
 /// Lazy iterator over walk entries for a single filesystem entry.
 ///
-/// Avoids heap allocation for the common zero/single-entry cases.
+/// Avoids heap allocation for the common single-entry case. Every walked entry
+/// yields at least one `WalkEntry` — even skips (soft errors, dataless,
+/// unsupported special files) flow through as a `One(..)` so the consumer can
+/// surface them.
 /// The `Segments` variant lazily yields `FileSegment` entries for large files.
 enum WalkItems {
-    /// No entries (e.g. root entry, special files).
-    Empty,
-    /// Exactly one entry (regular file, directory, symlink, error, cache hit).
+    /// Exactly one entry (regular file, directory, symlink, error, cache hit,
+    /// or a skip variant).
     One(Option<Result<WalkEntry>>),
     /// Large file split into N segments, yielded lazily.
     Segments {
@@ -366,7 +415,6 @@ impl Iterator for WalkItems {
 
     fn next(&mut self) -> Option<Self::Item> {
         match self {
-            WalkItems::Empty => None,
             WalkItems::One(val) => val.take(),
             WalkItems::Segments {
                 item,
@@ -401,7 +449,6 @@ impl Iterator for WalkItems {
 
     fn size_hint(&self) -> (usize, Option<usize>) {
         match self {
-            WalkItems::Empty => (0, Some(0)),
             WalkItems::One(val) => {
                 let n = usize::from(val.is_some());
                 (n, Some(n))
@@ -512,7 +559,12 @@ fn walked_entry_to_walk_items(
                 reason,
             })));
         }
-        Ok(Materialized::Unsupported) => return WalkItems::Empty,
+        Ok(Materialized::Unsupported { path, file_type }) => {
+            return WalkItems::One(Some(Ok(WalkEntry::SkippedUnsupported {
+                path: path.to_string_lossy().into_owned(),
+                file_type,
+            })));
+        }
         Err(e) => return WalkItems::One(Some(Err(e))),
     };
 
@@ -681,13 +733,6 @@ mod tests {
             }
             other => panic!("expected Entry, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn walk_items_empty() {
-        let mut it = WalkItems::Empty;
-        assert_eq!(it.size_hint(), (0, Some(0)));
-        assert!(it.next().is_none());
     }
 
     #[test]
@@ -882,13 +927,52 @@ mod tests {
         let sock_path = tmp.path().join("test.sock");
         let listener = match std::os::unix::net::UnixListener::bind(&sock_path) {
             Ok(l) => l,
-            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => return, // skip in restricted envs
+            // Skip: restricted sandbox (EPERM) or a tempdir path too long for
+            // the ~104-byte sun_path limit on macOS (EINVAL). The socket is
+            // just a fixture, so an un-creatable one means "can't test here".
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::InvalidInput
+                ) =>
+            {
+                return
+            }
             Err(e) => panic!("unexpected bind error: {e}"),
         };
         let _listener = listener;
         let walked = walked_from_path(&sock_path, "test.sock");
         let result = materialize_item(walked, false).unwrap();
-        assert!(matches!(result, Materialized::Unsupported));
+        match result {
+            Materialized::Unsupported { path, file_type } => {
+                assert_eq!(file_type, "socket");
+                assert_eq!(path, sock_path);
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialize_fifo_unsupported() {
+        use nix::sys::stat::Mode;
+        use nix::unistd::mkfifo;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let fifo_path = tmp.path().join("test.fifo");
+        if mkfifo(&fifo_path, Mode::S_IRUSR | Mode::S_IWUSR).is_err() {
+            // mkfifo can fail in restricted sandboxes (e.g. EPERM) — skip there.
+            return;
+        }
+        let walked = walked_from_path(&fifo_path, "test.fifo");
+        let result = materialize_item(walked, false).unwrap();
+        match result {
+            Materialized::Unsupported { path, file_type } => {
+                assert_eq!(file_type, "FIFO");
+                assert_eq!(path, fifo_path);
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
     }
 
     /// A walked entry carrying `snapshot_path_raw` produces an Item whose
@@ -1055,6 +1139,42 @@ mod tests {
                 );
             }
             _ => panic!("expected WalkEntry::Skipped"),
+        }
+        assert!(items.next().is_none());
+    }
+
+    /// An unsupported special file (Unix socket) must flow through the producer
+    /// as a single `SkippedUnsupported` entry carrying the path + type label —
+    /// the warn-only channel that does not count as an error.
+    #[cfg(unix)]
+    #[test]
+    fn walked_entry_to_walk_items_unsupported_yields_skipped_unsupported() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock_path = tmp.path().join("test.sock");
+        let listener = match std::os::unix::net::UnixListener::bind(&sock_path) {
+            Ok(l) => l,
+            // See `materialize_unix_socket_unsupported` for why we skip these.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::InvalidInput
+                ) =>
+            {
+                return
+            }
+            Err(e) => panic!("unexpected bind error: {e}"),
+        };
+        let _listener = listener;
+
+        let walked = walked_from_path(&sock_path, "test.sock");
+        let file_cache = FileCache::default();
+        let mut items = walked_entry_to_walk_items(walked, false, &file_cache, u64::MAX, None);
+        match items.next() {
+            Some(Ok(WalkEntry::SkippedUnsupported { path, file_type })) => {
+                assert_eq!(path, sock_path.to_string_lossy());
+                assert_eq!(file_type, "socket");
+            }
+            _ => panic!("expected WalkEntry::SkippedUnsupported"),
         }
         assert!(items.next().is_none());
     }

@@ -547,7 +547,13 @@ pub(super) fn process_source_path(
                     );
                     continue;
                 }
-                Ok(Materialized::Unsupported) => continue,
+                Ok(Materialized::Unsupported { path, file_type }) => {
+                    emit_post_commit_warning(
+                        progress,
+                        format!("skipping unsupported {file_type}: '{}'", path.display()),
+                    );
+                    continue;
+                }
                 Err(e) => return Err(e),
             };
 

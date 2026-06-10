@@ -320,6 +320,10 @@ pub(super) fn process_file_worker(
 
         WalkEntry::SkippedDataless { path } => Ok(ProcessedEntry::DatalessSkipped { path }),
 
+        WalkEntry::SkippedUnsupported { path, file_type } => {
+            Ok(ProcessedEntry::UnsupportedSkipped { path, file_type })
+        }
+
         WalkEntry::SourceStarted { path } => Ok(ProcessedEntry::SourceStarted { path }),
 
         WalkEntry::SourceFinished { path } => Ok(ProcessedEntry::SourceFinished { path }),

@@ -957,6 +957,197 @@ fn repair_drops_items_rebuilds_refcounts() {
     assert_eq!(got, expected);
 }
 
+/// Rewrite a snapshot's on-disk blob with a bumped `format_version`, leaving
+/// the (frozen) envelope otherwise intact. Used to simulate a snapshot written
+/// by a future vykar.
+fn bump_snapshot_version_on_disk(repo_dir: &std::path::Path, snapshot_name: &str, version: u32) {
+    use crate::repo::format::{pack_object_with_context, ObjectType};
+    let repo = open_local_repo(repo_dir);
+    let entry = repo
+        .manifest()
+        .find_snapshot(snapshot_name)
+        .unwrap()
+        .clone();
+    let mut meta = crate::commands::list::load_snapshot_meta(&repo, snapshot_name).unwrap();
+    meta.format_version = version;
+    let bytes = rmp_serde::to_vec(&meta).unwrap();
+    let packed = pack_object_with_context(
+        ObjectType::SnapshotMeta,
+        entry.id.as_bytes(),
+        &bytes,
+        repo.crypto.as_ref(),
+    )
+    .unwrap();
+    repo.storage.put(&entry.id.storage_key(), &packed).unwrap();
+}
+
+/// A snapshot written by a newer format version is classified as *unsupported*
+/// (not corrupt) by plain `check`, and both repair modes refuse outright.
+#[test]
+fn check_flags_unsupported_version_and_repair_refuses() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = tmp.path().join("repo");
+    let source_dir = tmp.path().join("source");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    std::fs::create_dir_all(&source_dir).unwrap();
+    std::fs::write(source_dir.join("file.txt"), b"future-snapshot").unwrap();
+
+    let config = init_repo(&repo_dir);
+    backup_single_source(&config, &source_dir, "src-a", "snap-future");
+
+    bump_snapshot_version_on_disk(&repo_dir, "snap-future", 999);
+
+    // Plain check: reports it as unsupported, never as corrupt.
+    let res = commands::check::run(&config, None, false, false).unwrap();
+    assert!(
+        res.errors
+            .iter()
+            .any(|e| e.message.contains("newer vykar") && e.message.contains("999")),
+        "expected unsupported-version error, got: {:?}",
+        res.errors
+    );
+    assert!(
+        !res.errors
+            .iter()
+            .any(|e| e.message.contains("corrupt or undecryptable")),
+        "too-new snapshot must not be classified as corrupt: {:?}",
+        res.errors
+    );
+
+    // Both repair modes refuse before producing a plan / mutating anything.
+    let plan_err =
+        commands::check::run_with_repair(&config, None, false, RepairMode::PlanOnly, None)
+            .unwrap_err()
+            .to_string();
+    assert!(plan_err.contains("aborting repair"), "got: {plan_err}");
+
+    let apply_err = commands::check::run_with_repair(&config, None, false, RepairMode::Apply, None)
+        .unwrap_err()
+        .to_string();
+    assert!(apply_err.contains("aborting repair"), "got: {apply_err}");
+}
+
+/// Collect every file under `root` as repo-relative paths, excluding the
+/// transient `locks/` directory (the maintenance lock writes/removes its own
+/// lock file during a repair attempt). Sorted for stable comparison.
+fn collect_repo_files(root: &std::path::Path) -> Vec<String> {
+    fn walk(dir: &std::path::Path, base: &std::path::Path, out: &mut Vec<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            let rel = p.strip_prefix(base).unwrap().to_string_lossy().to_string();
+            if rel == "locks" {
+                continue;
+            }
+            if p.is_dir() {
+                walk(&p, base, out);
+            } else {
+                out.push(rel);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, root, &mut out);
+    out.sort();
+    out
+}
+
+/// `check --repair --apply` against a too-new snapshot must abort *before* the
+/// delete probe or any mutation — leaving every repo object byte-for-byte
+/// untouched (no probe write, no snapshot/pack delete, no index rewrite).
+#[test]
+fn check_repair_apply_writes_nothing_for_unsupported_version() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = tmp.path().join("repo");
+    let source_dir = tmp.path().join("source");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    std::fs::create_dir_all(&source_dir).unwrap();
+    std::fs::write(source_dir.join("file.txt"), b"no-write-on-refuse").unwrap();
+
+    let config = init_repo(&repo_dir);
+    backup_single_source(&config, &source_dir, "src-a", "snap-future");
+    bump_snapshot_version_on_disk(&repo_dir, "snap-future", 999);
+
+    let before = collect_repo_files(&repo_dir);
+
+    let apply_err = commands::check::run_with_repair(&config, None, false, RepairMode::Apply, None)
+        .unwrap_err()
+        .to_string();
+    assert!(apply_err.contains("aborting repair"), "got: {apply_err}");
+
+    let after = collect_repo_files(&repo_dir);
+    assert_eq!(
+        before, after,
+        "repair refusal must not write a probe object, delete snapshots/packs, \
+         or rewrite the index"
+    );
+}
+
+/// A small non-UTF8-named file backed up through the **sequential small-file
+/// fast path** (forced via `threads = 1`) round-trips byte-identically on
+/// restore. This exercises the `resolve_cache_hit` call at that distinct site
+/// (`sequential.rs`), not just the pipeline/normal paths. Self-skips on
+/// filesystems that reject non-UTF8 names (macOS APFS/HFS+); runs on Linux/CI.
+#[cfg(unix)]
+#[test]
+fn small_file_non_utf8_name_round_trips_via_sequential_path() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = tmp.path().join("repo");
+    let source_dir = tmp.path().join("source");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    std::fs::create_dir_all(&source_dir).unwrap();
+
+    let raw_name = b"small-\x80.txt";
+    if std::fs::write(source_dir.join(OsStr::from_bytes(raw_name)), b"x").is_err() {
+        return; // filesystem rejects non-UTF8 names — skip.
+    }
+
+    let mut config = init_repo(&repo_dir);
+    // Force the single-threaded sequential backup path so the small-file fast
+    // path (a separate resolve_cache_hit call site) is exercised.
+    config.limits.threads = 1;
+    backup_single_source(&config, &source_dir, "src-a", "snap-small");
+
+    let dest = tmp.path().join("restored");
+    std::fs::create_dir_all(&dest).unwrap();
+    commands::restore::run(
+        &config,
+        None,
+        "snap-small",
+        dest.to_str().unwrap(),
+        None,
+        false,
+        false,
+    )
+    .unwrap();
+
+    fn contains_name(dir: &std::path::Path, raw: &[u8]) -> bool {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return false;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                if contains_name(&p, raw) {
+                    return true;
+                }
+            } else if p.file_name().map(|n| n.as_bytes() == raw).unwrap_or(false) {
+                return true;
+            }
+        }
+        false
+    }
+    assert!(
+        contains_name(&dest, raw_name),
+        "small non-UTF8 file must restore with a byte-identical name"
+    );
+}
+
 /// Recursively walk `root` looking for a file whose name matches `name`.
 fn walk_find_file(root: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
     for entry in std::fs::read_dir(root).ok()? {

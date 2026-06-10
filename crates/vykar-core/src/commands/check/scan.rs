@@ -134,7 +134,7 @@ pub(super) fn integrity_scan(
                 }
                 Ok(snapshot_id) => match repo.storage.get(key) {
                     Ok(Some(blob)) => {
-                        let is_corrupt = unpack_object_expect_with_context(
+                        let decoded = unpack_object_expect_with_context(
                             &blob,
                             ObjectType::SnapshotMeta,
                             snapshot_id.as_bytes(),
@@ -143,13 +143,27 @@ pub(super) fn integrity_scan(
                         .and_then(|meta_bytes| {
                             rmp_serde::from_slice::<crate::snapshot::SnapshotMeta>(&meta_bytes)
                                 .map_err(|e| VykarError::Other(format!("deserialize: {e}")))
-                        })
-                        .is_err();
-                        if is_corrupt {
-                            issues.push(IntegrityIssue::CorruptSnapshot {
-                                snapshot_id,
-                                snapshot_name: None,
-                            });
+                        });
+                        match decoded {
+                            // A too-new blob deserializes fine (the envelope is
+                            // frozen): classify unsupported, never corrupt.
+                            Ok(meta)
+                                if meta.format_version
+                                    > crate::snapshot::CURRENT_FORMAT_VERSION =>
+                            {
+                                issues.push(IntegrityIssue::UnsupportedSnapshotVersion {
+                                    snapshot_id,
+                                    snapshot_name: None,
+                                    version: meta.format_version,
+                                });
+                            }
+                            Ok(_) => {}
+                            Err(_) => {
+                                issues.push(IntegrityIssue::CorruptSnapshot {
+                                    snapshot_id,
+                                    snapshot_name: None,
+                                });
+                            }
                         }
                     }
                     Ok(None) => {
@@ -203,6 +217,17 @@ pub(super) fn integrity_scan(
 
         let meta = match load_snapshot_meta(repo, &entry.name) {
             Ok(m) => m,
+            Err(VykarError::UnsupportedSnapshotVersion { version }) => {
+                // The envelope decoded — the blob is intact, just too new.
+                // Classify as unsupported (never corrupt) and skip walking
+                // item_ptrs, since we can't trust a future item layout.
+                issues.push(IntegrityIssue::UnsupportedSnapshotVersion {
+                    snapshot_id: entry.id,
+                    snapshot_name: Some(entry.name.clone()),
+                    version,
+                });
+                continue;
+            }
             Err(e) => {
                 if is_transient_io(&e) {
                     issues.push(IntegrityIssue::SnapshotReadFailed {

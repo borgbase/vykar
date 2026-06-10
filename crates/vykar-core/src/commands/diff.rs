@@ -207,6 +207,7 @@ mod tests {
                 .collect(),
             link_target: None,
             xattrs: None,
+            raw_names: None,
         }
     }
 
@@ -226,6 +227,7 @@ mod tests {
             chunks: Vec::new(),
             link_target: (entry_type == ItemType::Symlink).then(|| "target".to_string()),
             xattrs: None,
+            raw_names: None,
         }
     }
 

@@ -92,7 +92,12 @@ fn resolve_cache_hit(
     parent_reuse_index: Option<&ParentReuseIndex>,
     abs_path: &str,
     summary: &fs::MetadataSummary,
+    raw_path: bool,
 ) -> CacheResolution {
+    // The parent-reuse index is keyed on the lossy display path (no inode), so
+    // a non-UTF8 name could collide with a different file's entry — including a
+    // valid-UTF8 name that contains U+FFFD. Bypass it entirely for raw-path
+    // items; the inode-keyed local cache below is still safe.
     if summary.is_dataless {
         if let Some(chunks) = file_cache.lookup_dataless(
             abs_path,
@@ -102,6 +107,9 @@ fn resolve_cache_hit(
             summary.size,
         ) {
             return CacheResolution::Hit(chunks);
+        }
+        if raw_path {
+            return CacheResolution::SkipDataless;
         }
         return match parent_reuse_index
             .and_then(|idx| idx.lookup_dataless(abs_path, summary.size, summary.mtime_ns))
@@ -121,6 +129,10 @@ fn resolve_cache_hit(
     );
     if let Some(chunks) = local {
         return CacheResolution::Hit(chunks);
+    }
+
+    if raw_path {
+        return CacheResolution::Miss;
     }
 
     let parent = parent_reuse_index
@@ -734,6 +746,8 @@ pub fn run_with_progress(
             source_label: source_label.to_string(),
             source_paths: source_paths.to_vec(),
             label: String::new(),
+            ext: None,
+            format_version: crate::snapshot::CURRENT_FORMAT_VERSION,
         };
 
         // Generate snapshot ID and pack the blob (but DO NOT write to storage yet).
@@ -937,7 +951,7 @@ mod tests {
     fn resolve_cache_hit_dataless_no_parent_returns_skip() {
         let file_cache = FileCache::new();
         let summary = dataless_metadata(4096, 1000);
-        let res = resolve_cache_hit(&file_cache, None, "/src/a.txt", &summary);
+        let res = resolve_cache_hit(&file_cache, None, "/src/a.txt", &summary, false);
         assert!(matches!(res, CacheResolution::SkipDataless));
     }
 
@@ -968,6 +982,7 @@ mod tests {
             }],
             link_target: None,
             xattrs: None,
+            raw_names: None,
         };
         let mut builder = ParentReuseBuilder::new(vec![ParentReuseRoot {
             abs_root: "/src".into(),
@@ -982,11 +997,69 @@ mod tests {
             .join("a.txt")
             .to_string_lossy()
             .to_string();
-        let res = resolve_cache_hit(&file_cache, Some(&parent_index), &abs, &summary);
+        let res = resolve_cache_hit(&file_cache, Some(&parent_index), &abs, &summary, false);
         match res {
             CacheResolution::Hit(chunks) => assert_eq!(chunks.len(), 1),
             other => panic!("expected Hit, got {other:?}"),
         }
+    }
+
+    /// A raw-path item must bypass the (lossy-keyed) parent-reuse index on
+    /// lookup: with a matching parent entry, `raw_path=false` hits but
+    /// `raw_path=true` returns `Miss` — the U+FFFD-collision protection.
+    #[test]
+    fn resolve_cache_hit_raw_path_bypasses_parent_reuse() {
+        use crate::repo::file_cache::{ParentReuseBuilder, ParentReusePolicy, ParentReuseRoot};
+        use crate::snapshot::item::{Item, ItemType};
+        use vykar_types::chunk_id::ChunkId;
+
+        let item = Item {
+            path: "a.txt".into(),
+            entry_type: ItemType::RegularFile,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            user: None,
+            group: None,
+            mtime: 1000,
+            atime: None,
+            ctime: Some(2000),
+            size: 4096,
+            chunks: vec![crate::snapshot::item::ChunkRef {
+                id: ChunkId::from_bytes([0xCC; 32]),
+                size: 4096,
+                csize: 2048,
+            }],
+            link_target: None,
+            xattrs: None,
+            raw_names: None,
+        };
+        let mut builder = ParentReuseBuilder::new(vec![ParentReuseRoot {
+            abs_root: "/src".into(),
+            policy: ParentReusePolicy::SkipRoot,
+        }]);
+        builder.push(item);
+        let parent_index = builder.finish().unwrap();
+
+        let file_cache = FileCache::new();
+        let mut summary = dataless_metadata(4096, 1000);
+        summary.is_dataless = false;
+        summary.ctime_ns = 2000;
+        let abs = std::path::Path::new("/src")
+            .join("a.txt")
+            .to_string_lossy()
+            .to_string();
+
+        // Non-raw path: parent reuse hits.
+        match resolve_cache_hit(&file_cache, Some(&parent_index), &abs, &summary, false) {
+            CacheResolution::Hit(chunks) => assert_eq!(chunks.len(), 1),
+            other => panic!("expected Hit, got {other:?}"),
+        }
+        // Raw path: parent reuse bypassed → Miss.
+        assert!(matches!(
+            resolve_cache_hit(&file_cache, Some(&parent_index), &abs, &summary, true),
+            CacheResolution::Miss
+        ));
     }
 
     /// Helper: build a `FileCache` with a single warm dataless-eligible entry
@@ -1038,7 +1111,7 @@ mod tests {
         summary.device = device;
         summary.inode = inode;
 
-        let res = resolve_cache_hit(&cache, None, &abs, &summary);
+        let res = resolve_cache_hit(&cache, None, &abs, &summary, false);
         match res {
             CacheResolution::Hit(chunks) => assert_eq!(chunks.len(), 1),
             other => panic!("expected Hit from warm cache, got {other:?}"),
@@ -1073,6 +1146,7 @@ mod tests {
             }],
             link_target: None,
             xattrs: None,
+            raw_names: None,
         };
         let mut builder = ParentReuseBuilder::new(vec![ParentReuseRoot {
             abs_root: "/src".into(),
@@ -1086,7 +1160,7 @@ mod tests {
             .join("a.txt")
             .to_string_lossy()
             .to_string();
-        let res = resolve_cache_hit(&file_cache, Some(&parent_index), &abs, &summary);
+        let res = resolve_cache_hit(&file_cache, Some(&parent_index), &abs, &summary, false);
         match res {
             CacheResolution::Hit(chunks) => assert_eq!(chunks.len(), 1),
             other => panic!("expected Hit from parent index, got {other:?}"),
@@ -1101,7 +1175,7 @@ mod tests {
             .join("a.txt")
             .to_string_lossy()
             .to_string();
-        let res = resolve_cache_hit(&file_cache, None, &abs, &summary);
+        let res = resolve_cache_hit(&file_cache, None, &abs, &summary, false);
         assert!(matches!(res, CacheResolution::SkipDataless));
     }
 }

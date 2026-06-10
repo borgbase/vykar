@@ -78,6 +78,14 @@ pub enum IntegrityIssue {
         snapshot_name: String,
         detail: String,
     },
+    /// Snapshot was written by a newer format version than this binary
+    /// supports. Distinct from corruption: the envelope decoded fine, so the
+    /// blob is intact and must not be repaired/removed.
+    UnsupportedSnapshotVersion {
+        snapshot_id: SnapshotId,
+        snapshot_name: Option<String>,
+        version: u32,
+    },
     /// Snapshot item failed per-item invariant validation.
     InvalidItem {
         snapshot_id: SnapshotId,
@@ -160,6 +168,23 @@ impl IntegrityIssue {
                 context: format!("snapshot '{snapshot_name}'"),
                 message: format!("I/O error: {detail}"),
             },
+            IntegrityIssue::UnsupportedSnapshotVersion {
+                snapshot_id,
+                snapshot_name,
+                version,
+            } => {
+                let ctx = match snapshot_name {
+                    Some(name) => format!("snapshot '{name}'"),
+                    None => format!("snapshot {snapshot_id}"),
+                };
+                CheckError {
+                    context: ctx,
+                    message: format!(
+                        "written by a newer vykar (format version {version}); \
+                         upgrade vykar to read it — left untouched"
+                    ),
+                }
+            }
             IntegrityIssue::InvalidItem {
                 snapshot_id,
                 snapshot_name,

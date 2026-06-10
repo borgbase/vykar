@@ -2,10 +2,11 @@ use std::collections::{HashMap, HashSet};
 
 use super::repair_apply::{execute_repair, probe_deletes_allowed};
 use super::repair_plan::build_repair_plan;
-use super::scan::{integrity_scan, ScanOptions};
+use super::scan::{integrity_scan, ScanOptions, ScanResult};
 use super::server_verify::try_server_verify;
 use super::types::{
-    CheckError, CheckProgressEvent, CheckResult, RepairMode, RepairResult, ServerVerifyOutcome,
+    CheckError, CheckProgressEvent, CheckResult, IntegrityIssue, RepairMode, RepairResult,
+    ServerVerifyOutcome,
 };
 use crate::config::VykarConfig;
 use crate::index::ChunkIndexEntry;
@@ -247,6 +248,27 @@ fn sample_packs_out(
         .collect()
 }
 
+/// Refuse to build or apply a repair plan when any snapshot is too new to
+/// decode safely. Repair rebuilds refcounts by decoding *every* surviving
+/// snapshot; an unsupported one we cannot interpret would drop live chunk
+/// references (mirrors the `SnapshotReadFailed` guard in `execute_repair`).
+/// Plain `check` (no repair) still *reports* the issue and is unaffected.
+fn refuse_repair_if_unsupported_versions(scan: &ScanResult) -> Result<()> {
+    let count = scan
+        .issues
+        .iter()
+        .filter(|i| matches!(i, IntegrityIssue::UnsupportedSnapshotVersion { .. }))
+        .count();
+    if count > 0 {
+        return Err(VykarError::Other(format!(
+            "aborting repair: {count} snapshot(s) were written by a newer vykar \
+             (unsupported format version); upgrade vykar — repair leaves them untouched \
+             and refuses to rebuild refcounts without decoding them"
+        )));
+    }
+    Ok(())
+}
+
 /// Run `check --repair`.
 pub fn run_with_repair(
     config: &VykarConfig,
@@ -274,6 +296,10 @@ pub fn run_with_repair(
         repo.refresh_snapshot_list()?;
 
         let scan = integrity_scan(&mut repo, config, &scan_opts, &mut progress)?;
+
+        // Refuse before building the plan so a dry-run never presents a
+        // misleading executable RebuildRefcounts plan for a too-new repo.
+        refuse_repair_if_unsupported_versions(&scan)?;
 
         // Build per-pack grouping for plan
         let mut pack_chunks: HashMap<PackId, Vec<(ChunkId, ChunkIndexEntry)>> = HashMap::new();
@@ -321,6 +347,11 @@ pub fn run_with_repair(
                 repo.refresh_snapshot_list()?;
 
                 let scan = integrity_scan(repo, config, &scan_opts, &mut progress)?;
+
+                // Refuse right after the under-lock scan — before the delete
+                // probe and execute_repair — so not even the probe object is
+                // written when a too-new snapshot is present.
+                refuse_repair_if_unsupported_versions(&scan)?;
 
                 // Build per-pack grouping for plan
                 let mut pack_chunks: HashMap<PackId, Vec<(ChunkId, ChunkIndexEntry)>> =

@@ -95,6 +95,12 @@ pub enum VykarError {
     #[error("unsupported repository version: {0}")]
     UnsupportedVersion(u32),
 
+    #[error(
+        "snapshot was written by a newer vykar (format version {version}); \
+         upgrade vykar to read it"
+    )]
+    UnsupportedSnapshotVersion { version: u32 },
+
     #[error("serialization error: {0}")]
     Serialization(#[from] rmp_serde::encode::Error),
 

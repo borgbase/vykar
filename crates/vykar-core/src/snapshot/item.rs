@@ -33,6 +33,30 @@ pub struct Item {
     /// Extended attributes.
     #[serde(default)]
     pub xattrs: Option<HashMap<String, Vec<u8>>>,
+    /// Byte-faithful representations of `path` / `link_target` for entries
+    /// whose names are not valid UTF-8 (Unix only). `path` / `link_target`
+    /// remain the lossy UTF-8 **display** strings; these raw byte fields are
+    /// the source of truth at restore time when present. `None` for the common
+    /// (valid-UTF8) case — one nil byte per entry on the wire. Trailing field
+    /// for backward-readable decode (see `docs/src/format-evolution.md`).
+    #[serde(default)]
+    pub raw_names: Option<ItemRawNames>,
+}
+
+/// Byte-faithful shadow of an `Item`'s name fields, populated only when the
+/// corresponding display string lost information to `to_string_lossy`.
+///
+/// At least one of the two fields is `Some` whenever this struct is present
+/// (enforced by [`Item::validate`]). Each present value is invalid UTF-8 and
+/// `String::from_utf8_lossy(value)` equals the matching display string.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ItemRawNames {
+    /// Raw bytes of the snapshot-relative path when `Item.path` is lossy.
+    #[serde(default, with = "serde_bytes")]
+    pub path: Option<Vec<u8>>,
+    /// Raw bytes of the symlink target when `Item.link_target` is lossy.
+    #[serde(default, with = "serde_bytes")]
+    pub link_target: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,9 +77,40 @@ pub struct ChunkRef {
 }
 
 impl Item {
+    /// The path as raw bytes: the byte-faithful `raw_names.path` when present,
+    /// else the UTF-8 bytes of the lossy display `path`. This is the
+    /// correctness-bearing path for filesystem operations; `self.path` is the
+    /// display/search string only.
+    pub fn path_bytes(&self) -> &[u8] {
+        match self.raw_names.as_ref().and_then(|r| r.path.as_deref()) {
+            Some(raw) => raw,
+            None => self.path.as_bytes(),
+        }
+    }
+
+    /// The symlink target as raw bytes, or `None` for non-symlinks / symlinks
+    /// missing a target. Prefers the byte-faithful `raw_names.link_target`.
+    pub fn link_target_bytes(&self) -> Option<&[u8]> {
+        if let Some(raw) = self
+            .raw_names
+            .as_ref()
+            .and_then(|r| r.link_target.as_deref())
+        {
+            return Some(raw);
+        }
+        self.link_target.as_deref().map(str::as_bytes)
+    }
+
+    /// `true` when this item's path is stored byte-faithfully (non-UTF8 name).
+    /// Used to bypass lossy-display-keyed parent reuse during backup.
+    pub fn has_raw_path(&self) -> bool {
+        self.raw_names.as_ref().is_some_and(|r| r.path.is_some())
+    }
+
     /// Validate per-item invariants. Cross-item invariants (e.g. duplicate
     /// paths) are the caller's responsibility.
     pub fn validate(&self) -> Result<()> {
+        self.validate_raw_names()?;
         match self.entry_type {
             ItemType::RegularFile => {
                 if self.link_target.is_some() {
@@ -101,7 +156,7 @@ impl Item {
                         self.chunks.len()
                     )));
                 }
-                let Some(target) = self.link_target.as_deref() else {
+                let Some(target) = self.link_target_bytes() else {
                     return Err(VykarError::InvalidFormat(format!(
                         "item '{}': symlink missing link_target",
                         self.path
@@ -113,7 +168,7 @@ impl Item {
                         self.path
                     )));
                 }
-                if target.as_bytes().contains(&0) {
+                if target.contains(&0) {
                     return Err(VykarError::InvalidFormat(format!(
                         "item '{}': symlink link_target contains NUL byte",
                         self.path
@@ -126,6 +181,63 @@ impl Item {
                         target.len()
                     )));
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate the optional `raw_names` shadow: when present it must carry at
+    /// least one value, each present value must be genuinely non-UTF8 and its
+    /// lossy render must equal the display shadow, and a raw `link_target`
+    /// requires a symlink that also carries a display `link_target`.
+    fn validate_raw_names(&self) -> Result<()> {
+        let Some(raw) = self.raw_names.as_ref() else {
+            return Ok(());
+        };
+        if raw.path.is_none() && raw.link_target.is_none() {
+            return Err(VykarError::InvalidFormat(format!(
+                "item '{}': raw_names present but carries no values",
+                self.path
+            )));
+        }
+        if let Some(raw_path) = raw.path.as_deref() {
+            if std::str::from_utf8(raw_path).is_ok() {
+                return Err(VykarError::InvalidFormat(format!(
+                    "item '{}': raw_names.path is valid UTF-8 (must only shadow non-UTF8 names)",
+                    self.path
+                )));
+            }
+            if String::from_utf8_lossy(raw_path) != self.path {
+                return Err(VykarError::InvalidFormat(format!(
+                    "item '{}': raw_names.path lossy render does not match display path",
+                    self.path
+                )));
+            }
+        }
+        if let Some(raw_target) = raw.link_target.as_deref() {
+            if self.entry_type != ItemType::Symlink {
+                return Err(VykarError::InvalidFormat(format!(
+                    "item '{}': raw_names.link_target on a non-symlink",
+                    self.path
+                )));
+            }
+            let Some(display_target) = self.link_target.as_deref() else {
+                return Err(VykarError::InvalidFormat(format!(
+                    "item '{}': raw_names.link_target without a display link_target",
+                    self.path
+                )));
+            };
+            if std::str::from_utf8(raw_target).is_ok() {
+                return Err(VykarError::InvalidFormat(format!(
+                    "item '{}': raw_names.link_target is valid UTF-8 (must only shadow non-UTF8 targets)",
+                    self.path
+                )));
+            }
+            if String::from_utf8_lossy(raw_target) != display_target {
+                return Err(VykarError::InvalidFormat(format!(
+                    "item '{}': raw_names.link_target lossy render does not match display target",
+                    self.path
+                )));
             }
         }
         Ok(())
@@ -152,6 +264,7 @@ mod tests {
             chunks: Vec::new(),
             link_target: None,
             xattrs: None,
+            raw_names: None,
         }
     }
 
@@ -268,5 +381,126 @@ mod tests {
         item.link_target = Some("target".into());
         let err = item.validate().unwrap_err().to_string();
         assert!(err.contains("symlink has 1 chunks"), "got: {err}");
+    }
+
+    // -----------------------------------------------------------------------
+    // raw_names round-trip, back-compat, and validation
+    // -----------------------------------------------------------------------
+
+    /// A byte sequence that is invalid UTF-8 (0x80 is a stray continuation byte).
+    const BAD_BYTES: &[u8] = b"bad-\x80-name";
+
+    #[test]
+    fn raw_names_round_trips_through_msgpack() {
+        let mut item = base_item(ItemType::RegularFile, &String::from_utf8_lossy(BAD_BYTES));
+        item.raw_names = Some(ItemRawNames {
+            path: Some(BAD_BYTES.to_vec()),
+            link_target: None,
+        });
+        item.validate().unwrap();
+        let bytes = rmp_serde::to_vec(&item).unwrap();
+        let decoded: Item = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(decoded, item);
+        assert_eq!(decoded.path_bytes(), BAD_BYTES);
+    }
+
+    #[test]
+    fn old_array_without_raw_names_decodes_to_none() {
+        // An Item from a pre-raw_names binary is a positional array with one
+        // fewer element. `#[serde(default)]` must fill `raw_names` with None.
+        #[derive(Serialize)]
+        struct OldItem {
+            path: String,
+            entry_type: ItemType,
+            mode: u32,
+            uid: u32,
+            gid: u32,
+            user: Option<String>,
+            group: Option<String>,
+            mtime: i64,
+            atime: Option<i64>,
+            ctime: Option<i64>,
+            size: u64,
+            chunks: Vec<ChunkRef>,
+            link_target: Option<String>,
+            xattrs: Option<HashMap<String, Vec<u8>>>,
+        }
+        let old = OldItem {
+            path: "a.txt".into(),
+            entry_type: ItemType::RegularFile,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            user: None,
+            group: None,
+            mtime: 0,
+            atime: None,
+            ctime: None,
+            size: 0,
+            chunks: Vec::new(),
+            link_target: None,
+            xattrs: None,
+        };
+        let bytes = rmp_serde::to_vec(&old).unwrap();
+        let decoded: Item = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(decoded.raw_names, None);
+        assert_eq!(decoded.path, "a.txt");
+    }
+
+    #[test]
+    fn validate_rejects_raw_names_with_valid_utf8_path() {
+        let mut item = base_item(ItemType::RegularFile, "ok.txt");
+        item.raw_names = Some(ItemRawNames {
+            path: Some(b"ok.txt".to_vec()),
+            link_target: None,
+        });
+        let err = item.validate().unwrap_err().to_string();
+        assert!(err.contains("valid UTF-8"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_raw_path_lossy_mismatch() {
+        // raw bytes are non-UTF8 but their lossy render does not equal `path`.
+        let mut item = base_item(ItemType::RegularFile, "different");
+        item.raw_names = Some(ItemRawNames {
+            path: Some(BAD_BYTES.to_vec()),
+            link_target: None,
+        });
+        let err = item.validate().unwrap_err().to_string();
+        assert!(err.contains("does not match display path"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_raw_names_with_no_values() {
+        let mut item = base_item(ItemType::RegularFile, "a.txt");
+        item.raw_names = Some(ItemRawNames {
+            path: None,
+            link_target: None,
+        });
+        let err = item.validate().unwrap_err().to_string();
+        assert!(err.contains("carries no values"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_raw_link_target_on_non_symlink() {
+        let mut item = base_item(ItemType::RegularFile, "a.txt");
+        item.raw_names = Some(ItemRawNames {
+            path: None,
+            link_target: Some(BAD_BYTES.to_vec()),
+        });
+        let err = item.validate().unwrap_err().to_string();
+        assert!(err.contains("non-symlink"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_ok_symlink_with_raw_target() {
+        let mut item = base_item(ItemType::Symlink, &String::from_utf8_lossy(BAD_BYTES));
+        item.link_target = Some(String::from_utf8_lossy(BAD_BYTES).into_owned());
+        item.raw_names = Some(ItemRawNames {
+            path: Some(BAD_BYTES.to_vec()),
+            link_target: Some(BAD_BYTES.to_vec()),
+        });
+        item.validate().unwrap();
+        assert_eq!(item.link_target_bytes(), Some(BAD_BYTES));
     }
 }

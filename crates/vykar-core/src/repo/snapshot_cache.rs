@@ -237,6 +237,8 @@ mod tests {
             source_label: "src".into(),
             source_paths: vec!["/data".into()],
             label: String::new(),
+            ext: None,
+            format_version: crate::snapshot::CURRENT_FORMAT_VERSION,
         }
     }
 

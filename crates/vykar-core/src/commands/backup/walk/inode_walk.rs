@@ -87,9 +87,14 @@ pub(in crate::commands::backup) struct WalkedEntry {
     pub abs_path: PathBuf,
     pub metadata: MetadataSummary,
     pub file_type: FileType,
-    /// Pre-computed snapshot-relative path, including the multi-path / file-
-    /// source prefix when `RootEmission::EmitRoot` is in effect.
+    /// Pre-computed snapshot-relative path (lossy UTF-8 **display** form),
+    /// including the multi-path / file-source prefix when
+    /// `RootEmission::EmitRoot` is in effect.
     pub snapshot_path: String,
+    /// Byte-faithful form of `snapshot_path` when any component (the
+    /// `EmitRoot` prefix or the relative path) is not valid UTF-8. `None` for
+    /// the common case. Unix-only; always `None` elsewhere.
+    pub snapshot_path_raw: Option<Vec<u8>>,
 }
 
 /// Derive the snapshot-relative path from an absolute entry path.
@@ -101,6 +106,52 @@ pub(super) fn rel_path_from_abs(abs_source: &Path, abs_path: &Path) -> String {
         .to_string_lossy()
         .to_string();
     crate::commands::backup::normalize_rel_path(rel)
+}
+
+/// Byte-faithful counterpart to [`rel_path_from_abs`]: returns the raw relative
+/// path bytes when the relative path is not valid UTF-8 (Unix only), else
+/// `None`. `normalize_rel_path` is a no-op on Unix so no separator rewrite is
+/// needed. Delegates the `cfg(unix)` byte extraction to the shared
+/// [`crate::platform::fs::non_utf8_bytes`] helper.
+pub(super) fn rel_raw_from_abs(abs_source: &Path, abs_path: &Path) -> Option<Vec<u8>> {
+    let rel = abs_path.strip_prefix(abs_source).unwrap_or(abs_path);
+    crate::platform::fs::non_utf8_bytes(rel)
+}
+
+/// Combine the snapshot-root prefix (per `policy`/`prefix_raw`) with a relative
+/// path into the display string and its byte-faithful shadow. The combined path
+/// is byte-faithful whenever *either* the `EmitRoot` prefix or the relative path
+/// is not valid UTF-8 — built from the canonical bytes of each part (raw if
+/// present, else its UTF-8 bytes) joined by `/`. `SkipRoot` passes the relative
+/// path through unchanged.
+fn join_snapshot_path(
+    policy: &RootEmission,
+    prefix_raw: Option<&[u8]>,
+    rel: String,
+    rel_raw: Option<Vec<u8>>,
+) -> (String, Option<Vec<u8>>) {
+    match policy {
+        RootEmission::SkipRoot => (rel, rel_raw),
+        RootEmission::EmitRoot { prefix } => {
+            let display = format!("{prefix}/{rel}");
+            let raw = if prefix_raw.is_some() || rel_raw.is_some() {
+                let mut v = Vec::new();
+                match prefix_raw {
+                    Some(p) => v.extend_from_slice(p),
+                    None => v.extend_from_slice(prefix.as_bytes()),
+                }
+                v.push(b'/');
+                match rel_raw.as_deref() {
+                    Some(r) => v.extend_from_slice(r),
+                    None => v.extend_from_slice(rel.as_bytes()),
+                }
+                Some(v)
+            } else {
+                None
+            };
+            (display, raw)
+        }
+    }
 }
 
 /// Events yielded by `InodeSortedWalk`.
@@ -124,12 +175,14 @@ fn root_entry_level(
     file_type: FileType,
     metadata: MetadataSummary,
     prefix: &str,
+    prefix_raw: Option<&[u8]>,
 ) -> DirLevel {
     let root_entry = WalkedEntry {
         abs_path: abs_source.to_path_buf(),
         metadata,
         file_type,
         snapshot_path: prefix.to_string(),
+        snapshot_path_raw: prefix_raw.map(|b| b.to_vec()),
     };
     DirLevel {
         events: VecDeque::from([WalkEvent::Entry(root_entry)]),
@@ -177,6 +230,9 @@ pub(in crate::commands::backup) struct InodeSortedWalk {
     /// Snapshot-root policy: `SkipRoot` (descendants only, relative to
     /// `abs_source`) or `EmitRoot` (prefix all emitted paths with `prefix`).
     policy: RootEmission,
+    /// Byte-faithful form of the `EmitRoot` prefix when it is not valid UTF-8
+    /// (Unix only). `None` for `SkipRoot` or a UTF-8 prefix.
+    prefix_raw: Option<Vec<u8>>,
 }
 
 impl InodeSortedWalk {
@@ -271,6 +327,7 @@ impl InodeSortedWalk {
             gitignore_stack,
             inode_sort_for_source,
             policy: source.policy.clone(),
+            prefix_raw: source.prefix_raw.clone(),
         };
 
         // Build the emission order: descendants-first (bottom of stack) so
@@ -288,6 +345,7 @@ impl InodeSortedWalk {
                     source_ft,
                     source_summary,
                     prefix,
+                    source.prefix_raw.as_deref(),
                 ));
             }
             (RootEmission::EmitRoot { prefix }, SourceKind::File) => {
@@ -297,6 +355,7 @@ impl InodeSortedWalk {
                     source_ft,
                     source_summary,
                     prefix,
+                    source.prefix_raw.as_deref(),
                 ));
             }
         }
@@ -319,6 +378,18 @@ impl InodeSortedWalk {
             }
         }
         false
+    }
+
+    /// Combine the snapshot-root prefix (if any) with a relative path, in both
+    /// display and byte-faithful forms. Delegates to the pure
+    /// [`join_snapshot_path`] free function so the joining logic is unit-testable
+    /// without constructing a walker.
+    fn combined_snapshot_path(
+        &self,
+        rel: String,
+        rel_raw: Option<Vec<u8>>,
+    ) -> (String, Option<Vec<u8>>) {
+        join_snapshot_path(&self.policy, self.prefix_raw.as_deref(), rel, rel_raw)
     }
 
     /// Build a DirLevel for the given directory path.
@@ -496,16 +567,15 @@ impl InodeSortedWalk {
             }
 
             let rel = rel_path_from_abs(&self.abs_source, &raw.path);
-            let snapshot_path = match &self.policy {
-                RootEmission::SkipRoot => rel,
-                RootEmission::EmitRoot { prefix } => format!("{prefix}/{rel}"),
-            };
+            let rel_raw = rel_raw_from_abs(&self.abs_source, &raw.path);
+            let (snapshot_path, snapshot_path_raw) = self.combined_snapshot_path(rel, rel_raw);
 
             events.push_back(WalkEvent::Entry(WalkedEntry {
                 abs_path: raw.path,
                 metadata: summary,
                 file_type,
                 snapshot_path,
+                snapshot_path_raw,
             }));
         }
 
@@ -595,6 +665,76 @@ mod tests {
 
     fn resolve_dir(path: &Path) -> ResolvedSource {
         ResolvedSource::resolve(&path.to_string_lossy(), false).unwrap()
+    }
+
+    fn emit_root(prefix: &str) -> RootEmission {
+        RootEmission::EmitRoot {
+            prefix: prefix.to_string(),
+        }
+    }
+
+    #[test]
+    fn join_snapshot_path_skiproot_passes_through() {
+        let (d, r) = join_snapshot_path(&RootEmission::SkipRoot, None, "a/b.txt".into(), None);
+        assert_eq!(d, "a/b.txt");
+        assert_eq!(r, None);
+        // SkipRoot preserves an existing raw shadow verbatim.
+        let (_d, r) = join_snapshot_path(
+            &RootEmission::SkipRoot,
+            None,
+            "x".into(),
+            Some(b"\x80x".to_vec()),
+        );
+        assert_eq!(r, Some(b"\x80x".to_vec()));
+    }
+
+    #[test]
+    fn join_snapshot_path_emitroot_all_utf8_has_no_raw() {
+        let (d, r) = join_snapshot_path(&emit_root("pre"), None, "file.txt".into(), None);
+        assert_eq!(d, "pre/file.txt");
+        assert_eq!(r, None, "neither part is raw → no byte shadow");
+    }
+
+    /// The combined path must be byte-faithful when *only the prefix* is raw,
+    /// joining the raw prefix bytes with the UTF-8 relative bytes.
+    #[test]
+    fn join_snapshot_path_raw_prefix_only() {
+        let prefix_raw = b"\x80pre";
+        let display_prefix = String::from_utf8_lossy(prefix_raw).into_owned();
+        let (d, r) = join_snapshot_path(
+            &emit_root(&display_prefix),
+            Some(prefix_raw),
+            "file.txt".into(),
+            None,
+        );
+        assert_eq!(d, format!("{display_prefix}/file.txt"));
+        assert_eq!(r, Some(b"\x80pre/file.txt".to_vec()));
+    }
+
+    /// And when *only the relative path* is raw, joining the UTF-8 prefix bytes
+    /// with the raw relative bytes.
+    #[test]
+    fn join_snapshot_path_raw_rel_only() {
+        let (d, r) = join_snapshot_path(
+            &emit_root("pre"),
+            None,
+            String::from_utf8_lossy(b"\x80f").into_owned(),
+            Some(b"\x80f".to_vec()),
+        );
+        assert_eq!(d, format!("pre/{}", String::from_utf8_lossy(b"\x80f")));
+        assert_eq!(r, Some(b"pre/\x80f".to_vec()));
+    }
+
+    /// When both parts are raw, both byte shadows are joined.
+    #[test]
+    fn join_snapshot_path_both_raw() {
+        let (_d, r) = join_snapshot_path(
+            &emit_root(&String::from_utf8_lossy(b"\x80p")),
+            Some(b"\x80p"),
+            String::from_utf8_lossy(b"\x80f").into_owned(),
+            Some(b"\x80f".to_vec()),
+        );
+        assert_eq!(r, Some(b"\x80p/\x80f".to_vec()));
     }
 
     #[test]

@@ -21,6 +21,30 @@ mod read_groups;
 #[cfg(test)]
 mod test_support;
 
+/// Scan a decoded item stream for entries carrying a byte-faithful `raw_names`
+/// shadow (non-UTF8 names). Returns `Some((count, first_example_display_path))`
+/// when any are present, else `None`.
+///
+/// Pure (no filesystem access), so the non-Unix preflight can call it *before*
+/// any destination mutation — guaranteeing the abort leaves the filesystem
+/// untouched. Compiled on non-Unix (where the preflight uses it) and in all
+/// test builds (where it is unit-tested cross-platform).
+#[cfg(any(not(unix), test))]
+fn detect_raw_entries(items_stream: &[u8]) -> Result<Option<(usize, String)>> {
+    let mut count = 0usize;
+    let mut example: Option<String> = None;
+    super::list::for_each_decoded_item(items_stream, |item| {
+        if item.raw_names.is_some() {
+            count += 1;
+            if example.is_none() {
+                example = Some(item.path.clone());
+            }
+        }
+        Ok(())
+    })?;
+    Ok(example.map(|e| (count, e)))
+}
+
 // ---------------------------------------------------------------------------
 // Constants for coalesced parallel restore
 // ---------------------------------------------------------------------------
@@ -205,6 +229,27 @@ where
         repo.load_chunk_index()?;
         super::list::load_snapshot_item_stream(&mut repo, &resolved_name)?
     };
+
+    // Byte-faithful restore of non-UTF8 names is Unix-only. On other platforms
+    // run a single read-only metadata pass over the loaded stream *before* any
+    // filesystem mutation (dest prep / temp-root creation) and refuse if the
+    // snapshot carries any raw (non-UTF8) entry. The pass deliberately does not
+    // apply the user filter (the real streaming filter is a stateful FnMut that
+    // cannot be safely re-invoked), so a non-Unix restore is refused if *any*
+    // entry is non-UTF8, even one a filter would exclude — acceptable for this
+    // extreme edge.
+    #[cfg(not(unix))]
+    {
+        if let Some((raw_count, example)) = detect_raw_entries(&items_stream)? {
+            return Err(VykarError::Other(format!(
+                "snapshot contains {raw_count} entr{} with non-UTF8 name(s) \
+                 (e.g. '{}') that cannot be restored byte-faithfully on this \
+                 platform; restore on a Unix host",
+                if raw_count == 1 { "y" } else { "ies" },
+                example
+            )));
+        }
+    }
 
     let dest_root = plan::validate_and_prepare_dest(dest)?;
 
@@ -525,6 +570,62 @@ mod tests {
         assert!(!ok(".vykar-restore-"));
         assert!(!ok(".vykar-restore"));
         assert!(!ok("vykar-restore-0123456789abcdef"));
+    }
+
+    /// The non-Unix preflight's detection helper is pure (no fs) and reports the
+    /// count + first example for raw entries, or `None` when the stream is clean.
+    /// Running it before any destination prep is what makes the non-Unix abort a
+    /// no-write operation; this pins the detection logic on every platform.
+    #[test]
+    fn detect_raw_entries_reports_raw_items_only() {
+        use crate::snapshot::item::{Item, ItemRawNames, ItemType};
+
+        fn item(path: &str, raw: Option<ItemRawNames>) -> Item {
+            Item {
+                path: path.to_string(),
+                entry_type: ItemType::RegularFile,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                user: None,
+                group: None,
+                mtime: 0,
+                atime: None,
+                ctime: None,
+                size: 0,
+                chunks: Vec::new(),
+                link_target: None,
+                xattrs: None,
+                raw_names: raw,
+            }
+        }
+
+        fn encode(items: &[Item]) -> Vec<u8> {
+            let mut buf = Vec::new();
+            for it in items {
+                rmp_serde::encode::write(&mut buf, it).unwrap();
+            }
+            buf
+        }
+
+        // Clean stream → None.
+        let clean = encode(&[item("a.txt", None), item("b.txt", None)]);
+        assert!(detect_raw_entries(&clean).unwrap().is_none());
+
+        // One raw entry among normal ones → Some((1, that path)).
+        let raw_names = ItemRawNames {
+            path: Some(b"r-\x80.bin".to_vec()),
+            link_target: None,
+        };
+        let raw_display = String::from_utf8_lossy(b"r-\x80.bin").into_owned();
+        let mixed = encode(&[
+            item("a.txt", None),
+            item(&raw_display, Some(raw_names)),
+            item("c.txt", None),
+        ]);
+        let (count, example) = detect_raw_entries(&mixed).unwrap().unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(example, raw_display);
     }
 
     #[test]

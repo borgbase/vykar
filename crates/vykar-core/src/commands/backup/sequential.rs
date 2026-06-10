@@ -287,6 +287,7 @@ pub(super) fn process_regular_file_item(
         parent_reuse_index,
         &abs_path,
         &metadata_summary,
+        item.has_raw_path(),
     );
 
     if let super::CacheResolution::SkipDataless = resolution {
@@ -562,6 +563,7 @@ pub(super) fn process_source_path(
                     parent_reuse_index,
                     &abs_path,
                     &metadata_summary,
+                    item.has_raw_path(),
                 );
 
                 if let super::CacheResolution::SkipDataless = resolution {

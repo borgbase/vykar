@@ -17,6 +17,7 @@ vykar-protocol.workspace = true
 
 # Serialization
 serde.workspace = true
+serde_bytes.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
 rmp = "0.8"

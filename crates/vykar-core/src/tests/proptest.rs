@@ -137,6 +137,7 @@ fn arb_file_item() -> impl Strategy<Value = Item> {
                         chunks: vec![],
                         link_target: None,
                         xattrs,
+                        raw_names: None,
                     }
                 } else {
                     let size = chunks.iter().map(|c| c.size as u64).sum();
@@ -155,6 +156,7 @@ fn arb_file_item() -> impl Strategy<Value = Item> {
                         chunks,
                         link_target: None,
                         xattrs,
+                        raw_names: None,
                     }
                 }
             },
@@ -190,6 +192,7 @@ fn arb_dir_item() -> impl Strategy<Value = Item> {
                 chunks: vec![],
                 link_target: None,
                 xattrs,
+                raw_names: None,
             },
         )
 }
@@ -224,6 +227,7 @@ fn arb_symlink_item() -> impl Strategy<Value = Item> {
                 chunks: vec![],
                 link_target: Some(target),
                 xattrs,
+                raw_names: None,
             },
         )
 }

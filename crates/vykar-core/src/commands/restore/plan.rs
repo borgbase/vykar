@@ -8,7 +8,7 @@ use std::sync::atomic::AtomicBool;
 use smallvec::SmallVec;
 
 use crate::platform::fs;
-use crate::snapshot::item::ItemType;
+use crate::snapshot::item::{Item, ItemType};
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
 
@@ -29,8 +29,14 @@ enum SymlinkSafety {
 /// semantics. Assumes snapshots are restored on the same platform they were
 /// captured on (a Linux snapshot is restored on Linux, etc.); cross-platform
 /// restore is unsupported.
+#[cfg(test)]
 fn classify_symlink_target(target: &str) -> SymlinkSafety {
-    let path = Path::new(target);
+    classify_symlink_target_path(Path::new(target))
+}
+
+/// Path-based classifier, so non-UTF8 byte-derived targets are audited with the
+/// same rules as UTF-8 ones.
+fn classify_symlink_target_path(path: &Path) -> SymlinkSafety {
     if path.is_absolute() {
         return SymlinkSafety::Absolute;
     }
@@ -38,6 +44,23 @@ fn classify_symlink_target(target: &str) -> SymlinkSafety {
         return SymlinkSafety::EscapesParent;
     }
     SymlinkSafety::Safe
+}
+
+/// Build the symlink target path, byte-faithfully when the item carries a raw
+/// (non-UTF8) target shadow (Unix), else from the lossy display string.
+fn symlink_target_path(item: &Item) -> PathBuf {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        if let Some(raw) = item
+            .raw_names
+            .as_ref()
+            .and_then(|r| r.link_target.as_deref())
+        {
+            return PathBuf::from(std::ffi::OsStr::from_bytes(raw));
+        }
+    }
+    PathBuf::from(item.link_target.as_deref().unwrap_or_default())
 }
 
 /// Where to write a chunk's decompressed data.
@@ -148,7 +171,7 @@ where
         item.validate()?;
         match item.entry_type {
             ItemType::Directory => {
-                sanitize_item_path_into(&item.path, &mut rel_scratch)?;
+                sanitize_item_into(&item, &mut rel_scratch)?;
                 let target = dest_root.join(&rel_scratch);
                 ensure_path_within_root(&target, dest_root)?;
                 std::fs::create_dir_all(&target)?;
@@ -176,12 +199,14 @@ where
             }
             ItemType::Symlink => {
                 if let Some(ref link_target) = item.link_target {
-                    sanitize_item_path_into(&item.path, &mut rel_scratch)?;
+                    sanitize_item_into(&item, &mut rel_scratch)?;
                     let target = dest_root.join(&rel_scratch);
                     if target.parent().is_none_or(|p| !verified_dirs.contains(p)) {
                         ensure_parent_exists_within_root(&target, dest_root)?;
                     }
-                    match classify_symlink_target(link_target) {
+                    // Byte-faithful target on Unix when the name is non-UTF8.
+                    let link_target_path = symlink_target_path(&item);
+                    match classify_symlink_target_path(&link_target_path) {
                         SymlinkSafety::Safe => {}
                         SymlinkSafety::Absolute => push_metadata_warning(
                             stats,
@@ -199,7 +224,7 @@ where
                         ),
                     }
                     let _ = std::fs::remove_file(&target);
-                    fs::create_symlink(Path::new(link_target), &target)?;
+                    fs::create_symlink(&link_target_path, &target)?;
                     // xattrs/lchown/mtime are deferred to the symlink pass so
                     // ownership lands before xattrs (chown clears capabilities)
                     // and mtime is the last write to the inode.
@@ -215,7 +240,7 @@ where
                 }
             }
             ItemType::RegularFile => {
-                sanitize_item_path_into(&item.path, &mut rel_scratch)?;
+                sanitize_item_into(&item, &mut rel_scratch)?;
                 let file_idx = planned_files.len();
                 let mut file_offset: u64 = 0;
                 for chunk_ref in &item.chunks {
@@ -246,7 +271,7 @@ where
                             })?;
                 }
                 // Hand the scratch buffer's allocation to the PlannedFile and
-                // re-init scratch — the next sanitize_item_path_into call
+                // re-init scratch — the next sanitize_item_into call
                 // resizes the fresh buffer to its needs. This avoids the
                 // per-file PathBuf clone the scratch was meant to eliminate.
                 planned_files.push(PlannedFile {
@@ -367,14 +392,34 @@ fn ensure_path_within_root(path: &Path, root: &Path) -> Result<()> {
     )))
 }
 
-/// Sanitize and write a snapshot item path into a caller-provided scratch buffer.
-/// Reuses the PathBuf allocation across calls (~387K items), avoiding per-item
-/// intermediate PathBuf allocations.
-fn sanitize_item_path_into(raw: &str, out: &mut PathBuf) -> Result<()> {
-    let path = Path::new(raw);
+/// Sanitize and write a snapshot item path into a caller-provided scratch
+/// buffer, reusing the `PathBuf` allocation across calls (~387K items).
+///
+/// Uses the byte-faithful path when
+/// the item carries a non-UTF8 raw shadow (Unix) and the lossy display path
+/// otherwise. The same traversal checks (reject absolute / `..` / root /
+/// prefix) run on both branches — this is security-sensitive.
+fn sanitize_item_into(item: &Item, out: &mut PathBuf) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        if let Some(raw) = item.raw_names.as_ref().and_then(|r| r.path.as_deref()) {
+            return sanitize_path_into(
+                Path::new(std::ffi::OsStr::from_bytes(raw)),
+                &item.path,
+                out,
+            );
+        }
+    }
+    sanitize_path_into(Path::new(&item.path), &item.path, out)
+}
+
+/// Core path sanitizer over an already-built `Path`. `display` is used only for
+/// error messages (the lossy path string).
+fn sanitize_path_into(path: &Path, display: &str, out: &mut PathBuf) -> Result<()> {
     if path.is_absolute() {
         return Err(VykarError::InvalidFormat(format!(
-            "refusing to restore absolute path: {raw}"
+            "refusing to restore absolute path: {display}"
         )));
     }
     out.clear();
@@ -384,14 +429,14 @@ fn sanitize_item_path_into(raw: &str, out: &mut PathBuf) -> Result<()> {
             Component::CurDir => {}
             Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
                 return Err(VykarError::InvalidFormat(format!(
-                    "refusing to restore unsafe path: {raw}"
+                    "refusing to restore unsafe path: {display}"
                 )));
             }
         }
     }
     if out.as_os_str().is_empty() {
         return Err(VykarError::InvalidFormat(format!(
-            "refusing to restore empty path: {raw}"
+            "refusing to restore empty path: {display}"
         )));
     }
     Ok(())
@@ -579,6 +624,126 @@ mod tests {
     fn sanitize_rejects_parent_dir_traversal() {
         let err = sanitize_item_path("../etc/passwd").unwrap_err().to_string();
         assert!(err.contains("unsafe path"));
+    }
+
+    /// Build a regular-file Item carrying a raw (non-UTF8) path shadow.
+    #[cfg(unix)]
+    fn raw_path_item(raw: &[u8]) -> Item {
+        use crate::snapshot::item::{ItemRawNames, ItemType};
+        Item {
+            path: String::from_utf8_lossy(raw).into_owned(),
+            entry_type: ItemType::RegularFile,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            user: None,
+            group: None,
+            mtime: 0,
+            atime: None,
+            ctime: None,
+            size: 0,
+            chunks: Vec::new(),
+            link_target: None,
+            xattrs: None,
+            raw_names: Some(ItemRawNames {
+                path: Some(raw.to_vec()),
+                link_target: None,
+            }),
+        }
+    }
+
+    /// The byte sanitizer runs the same traversal checks as the string one:
+    /// absolute and `..` raw byte paths are rejected; a benign non-UTF8 name is
+    /// accepted and produces the exact bytes.
+    #[cfg(unix)]
+    #[test]
+    fn sanitize_item_into_byte_path_traversal_checks() {
+        use std::os::unix::ffi::OsStrExt;
+        let mut out = PathBuf::new();
+
+        // Absolute byte path → rejected.
+        let abs = raw_path_item(b"/etc/\x80pwd");
+        assert!(sanitize_item_into(&abs, &mut out)
+            .unwrap_err()
+            .to_string()
+            .contains("absolute path"));
+
+        // `..` traversal in bytes → rejected.
+        let dotdot = raw_path_item(b"../\x80escape");
+        assert!(sanitize_item_into(&dotdot, &mut out)
+            .unwrap_err()
+            .to_string()
+            .contains("unsafe path"));
+
+        // Benign non-UTF8 relative name → accepted, exact bytes preserved.
+        let benign = raw_path_item(b"sub/\x80ok.bin");
+        sanitize_item_into(&benign, &mut out).unwrap();
+        assert_eq!(out.as_os_str().as_bytes(), b"sub/\x80ok.bin");
+    }
+
+    /// Two distinct non-UTF8 names restore to two distinct files (no lossy
+    /// merge) — they appear as two separate planned files with the right bytes.
+    #[cfg(unix)]
+    #[test]
+    fn stream_and_plan_distinct_raw_names_two_files() {
+        use std::os::unix::ffi::OsStrExt;
+        let temp = tempdir().unwrap();
+        let dest = &temp.path().canonicalize().unwrap();
+
+        let items = vec![raw_path_item(b"\x80a.bin"), raw_path_item(b"\x80b.bin")];
+        let stream = serialize_items(&items);
+
+        let mut stats = RestoreStats::default();
+        let (planned_files, _chunks, _verified) =
+            collect_all(&stream, dest, |_| true, false, &mut stats).unwrap();
+
+        assert_eq!(planned_files.len(), 2);
+        let mut names: Vec<Vec<u8>> = planned_files
+            .iter()
+            .map(|f| f.rel_path.as_os_str().as_bytes().to_vec())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec![b"\x80a.bin".to_vec(), b"\x80b.bin".to_vec()]);
+    }
+
+    /// A symlink with a non-UTF8 target is created with byte-identical target.
+    #[cfg(unix)]
+    #[test]
+    fn stream_and_plan_raw_symlink_target() {
+        use crate::snapshot::item::{ItemRawNames, ItemType};
+        use std::os::unix::ffi::OsStrExt;
+        let temp = tempdir().unwrap();
+        let dest = &temp.path().canonicalize().unwrap();
+
+        let raw_target = b"target-\x80";
+        let item = Item {
+            path: "link".into(),
+            entry_type: ItemType::Symlink,
+            mode: 0o777,
+            uid: 0,
+            gid: 0,
+            user: None,
+            group: None,
+            mtime: 0,
+            atime: None,
+            ctime: None,
+            size: 0,
+            chunks: Vec::new(),
+            link_target: Some(String::from_utf8_lossy(raw_target).into_owned()),
+            xattrs: None,
+            raw_names: Some(ItemRawNames {
+                path: None,
+                link_target: Some(raw_target.to_vec()),
+            }),
+        };
+        let stream = serialize_items(&[item]);
+
+        let mut stats = RestoreStats::default();
+        collect_all(&stream, dest, |_| true, false, &mut stats).unwrap();
+
+        let link = dest.join("link");
+        let target = std::fs::read_link(&link).unwrap();
+        assert_eq!(target.as_os_str().as_bytes(), raw_target);
     }
 
     // -----------------------------------------------------------------------

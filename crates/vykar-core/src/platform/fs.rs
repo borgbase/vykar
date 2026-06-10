@@ -22,6 +22,24 @@ pub struct MetadataSummary {
     pub is_dataless: bool,
 }
 
+/// The raw OS bytes of a path when it is **not** valid UTF-8 (Unix only), else
+/// `None`. The single home for the "non-UTF8 `Path` → byte shadow" extraction
+/// shared by the backup walker (relative paths and symlink targets); the
+/// `cfg(unix)` split lives here once rather than being copied per call site.
+#[cfg(unix)]
+pub(crate) fn non_utf8_bytes(path: &Path) -> Option<Vec<u8>> {
+    use std::os::unix::ffi::OsStrExt;
+    if path.to_str().is_some() {
+        return None;
+    }
+    Some(path.as_os_str().as_bytes().to_vec())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn non_utf8_bytes(_path: &Path) -> Option<Vec<u8>> {
+    None
+}
+
 /// Stat an open file descriptor and build a `MetadataSummary`.
 pub fn fstat_summary(file: &std::fs::File) -> std::io::Result<MetadataSummary> {
     let meta = file.metadata()?;

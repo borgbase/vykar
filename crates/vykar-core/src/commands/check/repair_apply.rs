@@ -232,6 +232,9 @@ fn prepare_rewrite(
     new_meta.item_ptrs = new_item_ptrs;
     new_meta.stats.nfiles = nfiles;
     new_meta.stats.original_size = original_size;
+    // Stamp the current format version on the rewritten snapshot — the
+    // rewriter never carries forward a legacy 0.
+    new_meta.format_version = crate::snapshot::CURRENT_FORMAT_VERSION;
     // deduplicated_size: preserved from the old meta (display-only; minor
     // inflation is acceptable per #123).
 

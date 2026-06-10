@@ -125,6 +125,22 @@ The type tag identifies the object kind via the `ObjectType` enum:
 
 The type tag byte is always included in AAD (authenticated additional data). For identity-bound objects, AAD also includes a domain-separated object context, binding ciphertext to both object type and identity (for example, `ChunkData` to its `ChunkId`, `SnapshotMeta` to snapshot ID, `ChunkIndex` to `b"index"`, `FileCache` to `b"filecache"`, and `SnapshotCache` to `b"snapshot_cache"`).
 
+### Format Evolution
+
+The on-disk format (config, index, snapshot blobs, the item stream) evolves by an *expand → contract* rule:
+
+- **Expand (anytime):** append a field with `#[serde(default)]`. New binaries still read old snapshots. Already done for `Item.link_target`, `Item.xattrs`, `Item.raw_names`, and `SnapshotMeta.{comment, source_paths, label, ext, format_version}`.
+- **Contract (breaking, batched):** remove or retype a field — only when a larger forced break (crypto, chunking) already requires one; cleanups ride that train rather than justifying a break alone.
+
+Compatibility is **backward-readable, not forward-compatible**: a new binary reads old snapshots, but older binaries are **not** guaranteed to read newer item streams (rmp-serde rejects a longer-than-expected positional array, so an old reader hits a length mismatch on the first extended record). `SnapshotMeta.format_version` (absent/`0` = legacy) is the discriminator; current writers stamp the latest (`CURRENT_FORMAT_VERSION`) and readers reject anything newer than they support. `check` treats a newer snapshot as **unsupported, never corrupt**, and `check --repair` refuses to run while one is present (rebuilding refcounts requires decoding every surviving snapshot).
+
+`SnapshotMeta`'s envelope (the fields up to `format_version`) is **frozen** — its field count never changes and existing fields are never removed or retyped, so `format_version` is always decodable and a future snapshot is recognized rather than mistaken for corruption. All breaking cleanups therefore live in the **item stream**, gated by `format_version`:
+
+- **Paths → bytes.** `Item.path` / `Item.link_target` are UTF-8 `String`; non-UTF8 names are preserved out-of-band in the additive `Item.raw_names` byte field (`path` / `link_target` remain the lossy display strings, the raw bytes are authoritative at restore time on Unix). At the next item-stream version, collapse into one canonical byte field and drop the lossy String shadow.
+- **Xattr names → bytes.** `Item.xattrs` keys are `String`; non-UTF8 xattr names are dropped with a warning today. Retype keys to bytes (niche — names are usually ASCII).
+
+Future snapshot-level metadata goes inside the reserved opaque `ext` blob (parsed per `format_version`) rather than as new outer fields, so the frozen envelope and its discriminator stay intact without a tolerant-envelope rework.
+
 ---
 
 ## Repository Format
@@ -244,6 +260,8 @@ Each `SnapshotEntry` contains: `name`, `id` (32-byte random), `time`, `source_la
 | source_label | String | Config label for the source |
 | source_paths | Vec\<String\> | Directories that were backed up |
 | label | String | Legacy compatibility field; new snapshots currently write `""` |
+| ext | Option\<Vec\<u8\>\> | Reserved opaque extension blob for future snapshot-level metadata; currently always `None` |
+| format_version | u32 | Format discriminator (frozen last field; absent/`0` = legacy, current writers stamp `CURRENT_FORMAT_VERSION`) |
 
 **SnapshotStats** — per-snapshot counters stored inside `SnapshotMeta.stats`.
 
@@ -272,6 +290,7 @@ Each `SnapshotEntry` contains: `name`, `id` (32-byte random), `time`, `source_la
 | chunks | Vec\<ChunkRef\> | Content chunks (regular files only) |
 | link_target | Option\<String\> | Symlink target |
 | xattrs | Option\<HashMap\> | Extended attributes |
+| raw_names | Option\<ItemRawNames\> | Byte-faithful `path` / `link_target` for non-UTF8 names (Unix); `None` for the common UTF-8 case |
 
 **ChunkRef** — reference to a stored chunk, used in `Item.chunks`:
 

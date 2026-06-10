@@ -851,6 +851,12 @@ impl ParentReuseBuilder {
         if item.path.starts_with("vykar-dumps/") {
             return true;
         }
+        // Non-UTF8 paths are keyed lossily here, so a raw item could collide
+        // with a different file (the U+FFFD case). Never index raw items; their
+        // lookups are bypassed too (see `resolve_cache_hit`'s `raw_path`).
+        if item.has_raw_path() {
+            return true;
+        }
         let Some(ctime_ns) = item.ctime else {
             self.legacy_abort = true;
             return false;
@@ -1791,6 +1797,7 @@ mod tests {
                 chunks: sample_chunk_refs_vec(),
                 link_target: None,
                 xattrs: None,
+                raw_names: None,
             },
             Item {
                 path: "dir".into(),
@@ -1807,6 +1814,7 @@ mod tests {
                 chunks: Vec::new(),
                 link_target: None,
                 xattrs: None,
+                raw_names: None,
             },
         ];
 
@@ -1821,6 +1829,60 @@ mod tests {
         assert!(idx.lookup(&path, 4096, 9999, 2000).is_none());
         // Wrong ctime — miss
         assert!(idx.lookup(&path, 4096, 1000, 9999).is_none());
+    }
+
+    /// A raw-path item is never indexed by the parent-reuse builder — its
+    /// lossy path key could collide with a different file (the U+FFFD case).
+    #[test]
+    fn parent_reuse_index_skips_raw_path_item() {
+        use crate::snapshot::item::ItemRawNames;
+        let raw = b"a-\x80.txt".to_vec();
+        let display = String::from_utf8_lossy(&raw).into_owned();
+        let item = Item {
+            path: display.clone(),
+            entry_type: ItemType::RegularFile,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            user: None,
+            group: None,
+            mtime: 1000,
+            atime: None,
+            ctime: Some(2000),
+            size: 4096,
+            chunks: sample_chunk_refs_vec(),
+            link_target: None,
+            xattrs: None,
+            raw_names: Some(ItemRawNames {
+                path: Some(raw),
+                link_target: None,
+            }),
+        };
+        // A normal sibling so the index is non-empty and the builder is valid.
+        let sibling = Item {
+            path: "ok.txt".into(),
+            entry_type: ItemType::RegularFile,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            user: None,
+            group: None,
+            mtime: 1000,
+            atime: None,
+            ctime: Some(2000),
+            size: 4096,
+            chunks: sample_chunk_refs_vec(),
+            link_target: None,
+            xattrs: None,
+            raw_names: None,
+        };
+        let idx = build_parent_index(vec![item, sibling], &["/src".into()], false).unwrap();
+        // The raw item must be absent (its lossy display path is not indexed).
+        let raw_path = native_join("/src", &display);
+        assert!(idx.lookup(&raw_path, 4096, 1000, 2000).is_none());
+        // The normal sibling is still indexed.
+        let ok_path = native_join("/src", "ok.txt");
+        assert!(idx.lookup(&ok_path, 4096, 1000, 2000).is_some());
     }
 
     #[test]
@@ -1840,6 +1902,7 @@ mod tests {
             chunks: sample_chunk_refs_vec(),
             link_target: None,
             xattrs: None,
+            raw_names: None,
         }];
 
         let result = build_parent_index(items, &["/src".into()], false);
@@ -1864,6 +1927,7 @@ mod tests {
                 chunks: sample_chunk_refs_vec(),
                 link_target: None,
                 xattrs: None,
+                raw_names: None,
             },
             Item {
                 path: "real.txt".into(),
@@ -1880,6 +1944,7 @@ mod tests {
                 chunks: sample_chunk_refs_vec(),
                 link_target: None,
                 xattrs: None,
+                raw_names: None,
             },
         ];
 
@@ -1911,6 +1976,7 @@ mod tests {
             chunks: sample_chunk_refs_vec(),
             link_target: None,
             xattrs: None,
+            raw_names: None,
         }];
 
         let idx = build_parent_index(items, &["/src".into()], false).unwrap();
@@ -1956,6 +2022,7 @@ mod tests {
             chunks: sample_chunk_refs_vec(),
             link_target: None,
             xattrs: None,
+            raw_names: None,
         }];
 
         let idx = build_parent_index(items, &["/src".into()], false).unwrap();
@@ -1984,6 +2051,7 @@ mod tests {
             chunks: sample_chunk_refs_vec(),
             link_target: None,
             xattrs: None,
+            raw_names: None,
         }];
 
         let idx =
@@ -2166,6 +2234,7 @@ mod tests {
             chunks: sample_chunk_refs_vec(),
             link_target: None,
             xattrs: None,
+            raw_names: None,
         }];
         let idx = build_parent_index(items, &["/src".into()], false).unwrap();
         let hit = idx.lookup(&native_join("/src", "a.txt"), 4096, 1000, 2000);

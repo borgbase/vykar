@@ -331,6 +331,7 @@ mod tests {
             chunks: vec![],
             link_target: None,
             xattrs: None,
+            raw_names: None,
         }
     }
 

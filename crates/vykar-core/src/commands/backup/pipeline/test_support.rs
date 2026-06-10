@@ -20,6 +20,7 @@ pub(super) fn test_item(path: &str) -> Item {
         chunks: Vec::new(),
         link_target: None,
         xattrs: None,
+        raw_names: None,
     }
 }
 

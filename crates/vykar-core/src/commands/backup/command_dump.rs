@@ -265,6 +265,7 @@ pub(super) fn process_command_dumps(
         chunks: Vec::new(),
         link_target: None,
         xattrs: None,
+        raw_names: None,
     };
     append_item_to_stream(
         repo,
@@ -315,6 +316,7 @@ pub(super) fn process_command_dumps(
             chunks: chunk_refs,
             link_target: None,
             xattrs: None,
+            raw_names: None,
         };
         append_item_to_stream(
             repo,

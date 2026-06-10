@@ -7,7 +7,7 @@ use tracing::warn;
 use crate::config::ChunkerConfig;
 use crate::platform::fs;
 use crate::repo::file_cache::{CachedChunks, FileCache, ParentReuseIndex};
-use crate::snapshot::item::{Item, ItemType};
+use crate::snapshot::item::{Item, ItemRawNames, ItemType};
 use vykar_types::error::{Result, VykarError};
 
 use super::concurrency::ByteBudget;
@@ -126,6 +126,21 @@ pub(super) enum Materialized {
     Unsupported,
 }
 
+/// Assemble an `ItemRawNames` from the optional path and link-target byte
+/// shadows, returning `None` when neither is present (the common case).
+fn build_raw_names(
+    path_raw: Option<Vec<u8>>,
+    link_target_raw: Option<Vec<u8>>,
+) -> Option<ItemRawNames> {
+    if path_raw.is_none() && link_target_raw.is_none() {
+        return None;
+    }
+    Some(ItemRawNames {
+        path: path_raw,
+        link_target: link_target_raw,
+    })
+}
+
 /// Classify a walked filesystem entry and build an `Item` from its metadata.
 ///
 /// Handles file-type classification, symlink target resolution, ctime
@@ -135,14 +150,18 @@ pub(super) fn materialize_item(walked: WalkedEntry, xattrs_enabled: bool) -> Res
     let file_type = walked.file_type;
     let metadata_summary = walked.metadata;
 
-    let (entry_type, link_target) = if file_type.is_dir() {
-        (ItemType::Directory, None)
+    let (entry_type, link_target, link_target_raw) = if file_type.is_dir() {
+        (ItemType::Directory, None, None)
     } else if file_type.is_symlink() {
         match std::fs::read_link(&walked.abs_path) {
-            Ok(target) => (
-                ItemType::Symlink,
-                Some(target.to_string_lossy().to_string()),
-            ),
+            Ok(target) => {
+                let raw = fs::non_utf8_bytes(&target);
+                (
+                    ItemType::Symlink,
+                    Some(target.to_string_lossy().to_string()),
+                    raw,
+                )
+            }
             Err(e) => {
                 if vykar_types::error::is_soft_backup_io_error(&e) {
                     return Ok(Materialized::SoftError {
@@ -157,7 +176,7 @@ pub(super) fn materialize_item(walked: WalkedEntry, xattrs_enabled: bool) -> Res
             }
         }
     } else if file_type.is_file() {
-        (ItemType::RegularFile, None)
+        (ItemType::RegularFile, None, None)
     } else {
         return Ok(Materialized::Unsupported);
     };
@@ -167,6 +186,8 @@ pub(super) fn materialize_item(walked: WalkedEntry, xattrs_enabled: bool) -> Res
     } else {
         None
     };
+
+    let raw_names = build_raw_names(walked.snapshot_path_raw, link_target_raw);
 
     let mut item = Item {
         path: walked.snapshot_path,
@@ -183,6 +204,7 @@ pub(super) fn materialize_item(walked: WalkedEntry, xattrs_enabled: bool) -> Res
         chunks: Vec::new(),
         link_target,
         xattrs: None,
+        raw_names,
     };
 
     // Skip xattrs on dataless inodes: on macOS, `getxattr` for FileProvider-
@@ -500,8 +522,13 @@ fn walked_entry_to_walk_items(
             .into_string()
             .unwrap_or_else(|os| os.to_string_lossy().into_owned());
 
-        match super::resolve_cache_hit(file_cache, parent_reuse_index, &abs_path, &metadata_summary)
-        {
+        match super::resolve_cache_hit(
+            file_cache,
+            parent_reuse_index,
+            &abs_path,
+            &metadata_summary,
+            item.has_raw_path(),
+        ) {
             super::CacheResolution::Hit(cached_refs) => {
                 return WalkItems::One(Some(Ok(WalkEntry::CacheHit {
                     item,
@@ -566,6 +593,7 @@ mod tests {
             chunks: Vec::new(),
             link_target: None,
             xattrs: None,
+            raw_names: None,
         }
     }
 
@@ -621,6 +649,7 @@ mod tests {
             metadata: summary,
             file_type,
             snapshot_path: "placeholder".into(),
+            snapshot_path_raw: None,
         };
 
         match materialize_item(walked, true).unwrap() {
@@ -641,6 +670,7 @@ mod tests {
             metadata: summary_warm,
             file_type,
             snapshot_path: "placeholder".into(),
+            snapshot_path_raw: None,
         };
         match materialize_item(walked_warm, true).unwrap() {
             Materialized::Entry { item, .. } => {
@@ -787,6 +817,7 @@ mod tests {
             metadata: fs::summarize_metadata(&meta, &meta.file_type()),
             file_type: meta.file_type(),
             snapshot_path: snapshot_path.to_string(),
+            snapshot_path_raw: None,
         }
     }
 
@@ -858,6 +889,104 @@ mod tests {
         let walked = walked_from_path(&sock_path, "test.sock");
         let result = materialize_item(walked, false).unwrap();
         assert!(matches!(result, Materialized::Unsupported));
+    }
+
+    /// A walked entry carrying `snapshot_path_raw` produces an Item whose
+    /// `raw_names.path` round-trips the raw bytes, while `path` stays lossy.
+    #[cfg(unix)]
+    #[test]
+    fn materialize_regular_file_captures_raw_path() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let tmp = tempfile::tempdir().unwrap();
+        // Create a file with a non-UTF8 name (0x80 is a stray continuation byte).
+        let raw_name = b"bad-\x80.bin";
+        let path = tmp.path().join(OsStr::from_bytes(raw_name));
+        // Some filesystems (APFS/HFS+ on macOS) reject non-UTF8 names — skip
+        // there; this exercises the Linux path (ext4/xfs) and CI.
+        if std::fs::write(&path, b"x").is_err() {
+            return;
+        }
+        let display = path.file_name().unwrap().to_string_lossy().into_owned();
+
+        let meta = std::fs::symlink_metadata(&path).unwrap();
+        let walked = WalkedEntry {
+            abs_path: path.clone(),
+            metadata: fs::summarize_metadata(&meta, &meta.file_type()),
+            file_type: meta.file_type(),
+            snapshot_path: display.clone(),
+            snapshot_path_raw: Some(raw_name.to_vec()),
+        };
+        match materialize_item(walked, false).unwrap() {
+            Materialized::Entry { item, .. } => {
+                assert_eq!(item.path, display);
+                assert_eq!(item.path_bytes(), raw_name);
+                assert!(item.has_raw_path());
+                item.validate().unwrap();
+            }
+            other => panic!("expected Entry, got {other:?}"),
+        }
+    }
+
+    /// A symlink whose target is non-UTF8 captures `raw_names.link_target`.
+    #[cfg(unix)]
+    #[test]
+    fn materialize_symlink_captures_raw_target() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let raw_target = b"target-\x80";
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(OsStr::from_bytes(raw_target), &link).unwrap();
+
+        let meta = std::fs::symlink_metadata(&link).unwrap();
+        let walked = WalkedEntry {
+            abs_path: link,
+            metadata: fs::summarize_metadata(&meta, &meta.file_type()),
+            file_type: meta.file_type(),
+            snapshot_path: "link".into(),
+            snapshot_path_raw: None,
+        };
+        match materialize_item(walked, false).unwrap() {
+            Materialized::Entry { item, .. } => {
+                assert_eq!(item.entry_type, ItemType::Symlink);
+                assert_eq!(item.link_target_bytes(), Some(&raw_target[..]));
+                assert!(!item.has_raw_path(), "path is UTF-8, only target is raw");
+                item.validate().unwrap();
+            }
+            other => panic!("expected Entry, got {other:?}"),
+        }
+    }
+
+    /// Two distinct non-UTF8 names produce two distinct raw paths (no lossy
+    /// collapse), verified end-to-end through the walker.
+    #[cfg(unix)]
+    #[test]
+    fn walker_distinct_non_utf8_names_stay_distinct() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let a = b"\x80a";
+        let b = b"\x80b";
+        // Skip on filesystems that reject non-UTF8 names (e.g. macOS APFS).
+        if std::fs::write(root.join(OsStr::from_bytes(a)), "1").is_err() {
+            return;
+        }
+        std::fs::write(root.join(OsStr::from_bytes(b)), "2").unwrap();
+
+        let source = ResolvedSource::resolve(&root.to_string_lossy(), false).unwrap();
+        let walk = InodeSortedWalk::new(&source, &[], &[], false, false).unwrap();
+        let mut raws: Vec<Vec<u8>> = Vec::new();
+        for ev in walk {
+            if let Ok(WalkEvent::Entry(walked)) = ev {
+                if let Materialized::Entry { item, .. } = materialize_item(walked, false).unwrap() {
+                    raws.push(item.path_bytes().to_vec());
+                }
+            }
+        }
+        raws.sort();
+        assert_eq!(raws, vec![a.to_vec(), b.to_vec()]);
     }
 
     #[test]

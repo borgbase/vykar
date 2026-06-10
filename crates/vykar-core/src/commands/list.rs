@@ -114,7 +114,13 @@ pub fn load_snapshot_meta(repo: &Repository, snapshot_name: &str) -> Result<Snap
         entry.id.as_bytes(),
         repo.crypto.as_ref(),
     )?;
-    Ok(rmp_serde::from_slice(&meta_bytes)?)
+    let meta: SnapshotMeta = rmp_serde::from_slice(&meta_bytes)?;
+    // Fail closed on snapshots written by a newer format than we support so
+    // every item-reading op (restore, ls, diff, find, mount) refuses rather
+    // than misinterpreting a future layout. Snapshot *listing* reads the
+    // manifest, not this function, so it is unaffected.
+    meta.supported()?;
+    Ok(meta)
 }
 
 /// Load and deserialize all items from a snapshot.
@@ -270,6 +276,7 @@ mod tests {
             chunks: Vec::new(),
             link_target: None,
             xattrs: None,
+            raw_names: None,
         };
 
         let mut bytes = Vec::new();

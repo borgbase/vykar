@@ -39,6 +39,10 @@ pub(crate) struct ResolvedSource {
     pub abs_source_str: String,
     pub kind: SourceKind,
     pub policy: RootEmission,
+    /// Byte-faithful form of the `EmitRoot` prefix when it is not valid UTF-8
+    /// (Unix only). `None` for `SkipRoot`, a UTF-8 prefix, or on non-Unix. The
+    /// `RootEmission::EmitRoot.prefix` string stays the lossy display form.
+    pub prefix_raw: Option<Vec<u8>>,
 }
 
 impl ResolvedSource {
@@ -79,24 +83,32 @@ impl ResolvedSource {
         // else that needs an EmitRoot (multi-path, or directory in multi
         // mode), derive the prefix from the absolute configured path so
         // paths with the same basename can coexist.
-        let policy = if multi_path {
-            let prefix = derive_snapshot_prefix(configured_path, &abs_source);
+        let (policy, prefix_raw) = if multi_path {
+            let mut prefix = derive_snapshot_prefix(configured_path, &abs_source);
             if prefix.is_empty() {
                 return Err(VykarError::Config(format!(
                     "source has no safe prefix: {configured}"
                 )));
             }
-            RootEmission::EmitRoot { prefix }
+            let raw = finalize_raw_prefix(
+                &mut prefix,
+                derive_snapshot_prefix_raw(configured_path, &abs_source),
+            );
+            (RootEmission::EmitRoot { prefix }, raw)
         } else if kind == SourceKind::File {
-            let prefix = derive_basename(configured_path, &abs_source);
+            let mut prefix = derive_basename(configured_path, &abs_source);
             if prefix.is_empty() {
                 return Err(VykarError::Config(format!(
                     "source has no safe basename: {configured}"
                 )));
             }
-            RootEmission::EmitRoot { prefix }
+            let raw = finalize_raw_prefix(
+                &mut prefix,
+                derive_basename_raw(configured_path, &abs_source),
+            );
+            (RootEmission::EmitRoot { prefix }, raw)
         } else {
-            RootEmission::SkipRoot
+            (RootEmission::SkipRoot, None)
         };
 
         Ok(Self {
@@ -105,6 +117,7 @@ impl ResolvedSource {
             abs_source_str,
             kind,
             policy,
+            prefix_raw,
         })
     }
 
@@ -133,12 +146,19 @@ impl ResolvedSource {
     ///    appear twice in the snapshot under different prefixes.
     pub fn resolve_all(configured: &[String], multi_path: bool) -> Result<Vec<Self>> {
         let mut resolved: Vec<Self> = Vec::with_capacity(configured.len());
-        let mut seen_prefixes: HashMap<String, String> = HashMap::new();
+        // Keyed on the *canonical* prefix bytes (raw when non-UTF8, else the
+        // display bytes) so two prefixes that differ only in non-UTF8 bytes are
+        // not conflated by their shared lossy display string.
+        let mut seen_prefixes: HashMap<Vec<u8>, String> = HashMap::new();
 
         for cfg in configured {
             let source = Self::resolve(cfg, multi_path)?;
             if let RootEmission::EmitRoot { prefix } = &source.policy {
-                if let Some(prev) = seen_prefixes.get(prefix) {
+                let prefix_key = source
+                    .prefix_raw
+                    .clone()
+                    .unwrap_or_else(|| prefix.as_bytes().to_vec());
+                if let Some(prev) = seen_prefixes.get(&prefix_key) {
                     return Err(VykarError::Config(format!(
                         "sources {prev} and {cfg} both resolve to snapshot prefix '{prefix}'"
                     )));
@@ -171,7 +191,7 @@ impl ResolvedSource {
                         }
                     }
                 }
-                seen_prefixes.insert(prefix.clone(), cfg.clone());
+                seen_prefixes.insert(prefix_key, cfg.clone());
             }
             resolved.push(source);
         }
@@ -204,6 +224,79 @@ fn derive_basename(configured: &Path, abs_source: &Path) -> String {
 
 fn is_safe_basename(s: &str) -> bool {
     !s.is_empty() && s != "." && s != ".."
+}
+
+/// Promote a derived raw byte prefix to `Some` only when it is genuinely
+/// non-UTF8, and in that case rederive `display` *from* the raw bytes so the
+/// [`crate::snapshot::item::Item::validate`] consistency invariant
+/// (`from_utf8_lossy(raw) == display`) holds **by construction** — the display
+/// string can never drift out of sync with the raw shadow even if the display
+/// derivation later evolves without a matching change to the raw twin. Returns
+/// `None` for UTF-8 prefixes (the common case) and for empty bytes (non-Unix),
+/// leaving `display` untouched.
+fn finalize_raw_prefix(display: &mut String, raw: Vec<u8>) -> Option<Vec<u8>> {
+    if std::str::from_utf8(&raw).is_ok() {
+        return None;
+    }
+    *display = String::from_utf8_lossy(&raw).into_owned();
+    Some(raw)
+}
+
+#[cfg(unix)]
+fn is_safe_basename_bytes(b: &[u8]) -> bool {
+    !b.is_empty() && b != b"." && b != b".."
+}
+
+/// Byte-faithful counterpart to [`derive_basename`].
+#[cfg(unix)]
+fn derive_basename_raw(configured: &Path, abs_source: &Path) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    if let Some(name) = configured.file_name() {
+        let b = name.as_bytes();
+        if is_safe_basename_bytes(b) {
+            return b.to_vec();
+        }
+    }
+    if let Some(name) = abs_source.file_name() {
+        let b = name.as_bytes();
+        if is_safe_basename_bytes(b) {
+            return b.to_vec();
+        }
+    }
+    Vec::new()
+}
+
+#[cfg(not(unix))]
+fn derive_basename_raw(_configured: &Path, _abs_source: &Path) -> Vec<u8> {
+    Vec::new()
+}
+
+/// Byte-faithful counterpart to [`derive_snapshot_prefix`] (Unix). Mirrors the
+/// display derivation exactly so `from_utf8_lossy` of the result equals it:
+/// lexically clean the absolutized path, then strip the leading `/` and any
+/// trailing `/` at the byte level (both ASCII, so byte- and char-stripping
+/// agree).
+#[cfg(unix)]
+fn derive_snapshot_prefix_raw(configured: &Path, abs_source: &Path) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    let abs_clean = match absolutize_and_clean(configured) {
+        Some(p) => p,
+        None => return derive_basename_raw(configured, abs_source),
+    };
+    let bytes = abs_clean.as_os_str().as_bytes();
+    let bytes = bytes.strip_prefix(b"/").unwrap_or(bytes);
+    let trimmed_len = bytes.iter().rposition(|&b| b != b'/').map_or(0, |i| i + 1);
+    let trimmed = bytes.get(..trimmed_len).unwrap_or(bytes);
+    if trimmed.is_empty() {
+        derive_basename_raw(configured, abs_source)
+    } else {
+        trimmed.to_vec()
+    }
+}
+
+#[cfg(not(unix))]
+fn derive_snapshot_prefix_raw(_configured: &Path, _abs_source: &Path) -> Vec<u8> {
+    Vec::new()
 }
 
 /// Make a configured path absolute (no canonicalize / no symlink follow) and

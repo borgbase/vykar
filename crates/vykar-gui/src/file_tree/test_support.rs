@@ -18,6 +18,7 @@ pub(super) fn dir(path: &str) -> Item {
         chunks: Vec::new(),
         link_target: None,
         xattrs: None,
+        raw_names: None,
     }
 }
 
@@ -37,6 +38,7 @@ pub(super) fn file(path: &str, size: u64) -> Item {
         chunks: Vec::new(),
         link_target: None,
         xattrs: None,
+        raw_names: None,
     }
 }
 

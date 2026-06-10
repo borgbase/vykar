@@ -14,6 +14,10 @@ pub struct MetadataSummary {
     pub ctime_ns: i64,
     pub device: u64,
     pub inode: u64,
+    /// Hard-link count. `1` on Windows and the non-unix fallback (where vykar
+    /// treats every file as unlinked). Used by the backup walker to decide
+    /// whether a regular file participates in a hard-link group.
+    pub nlink: u64,
     pub size: u64,
     /// macOS-only: file is a FileProvider dataless placeholder (iCloud Drive,
     /// Dropbox, OneDrive, etc.). `read()` would trigger asynchronous hydration
@@ -95,6 +99,7 @@ pub fn summarize_metadata(metadata: &Metadata, file_type: &FileType) -> Metadata
             ctime_ns: metadata.ctime() * 1_000_000_000 + metadata.ctime_nsec(),
             device: metadata.dev(),
             inode: metadata.ino(),
+            nlink: metadata.nlink(),
             size: metadata.len(),
             is_dataless,
         }
@@ -125,6 +130,7 @@ pub fn summarize_metadata(metadata: &Metadata, file_type: &FileType) -> Metadata
             ctime_ns: windows_filetime_to_unix_ns(metadata.creation_time()),
             device: 0,
             inode: 0,
+            nlink: 1,
             size: metadata.file_size(),
             is_dataless: false,
         }
@@ -140,6 +146,7 @@ pub fn summarize_metadata(metadata: &Metadata, file_type: &FileType) -> Metadata
             ctime_ns: 0,
             device: 0,
             inode: 0,
+            nlink: 1,
             size: metadata.len(),
             is_dataless: false,
         }
@@ -286,6 +293,26 @@ pub fn create_symlink(link_target: &Path, target: &Path) -> std::io::Result<()> 
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "symlink creation is not supported on this platform",
+        ))
+    }
+}
+
+/// Create a hard link at `link` pointing to the same inode as `original`.
+/// Both paths must live on the same filesystem (the restore caller guarantees
+/// this by linking inside its temp root). Returns `Unsupported` on platforms
+/// without a hard-link API.
+pub fn hard_link(original: &Path, link: &Path) -> std::io::Result<()> {
+    #[cfg(any(unix, windows))]
+    {
+        std::fs::hard_link(original, link)
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (original, link);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "hard links are not supported on this platform",
         ))
     }
 }
@@ -589,6 +616,7 @@ mod tests {
             ctime_ns: 222,
             device: 333,
             inode: 444,
+            nlink: 1,
             size: 555,
             is_dataless: false,
         };

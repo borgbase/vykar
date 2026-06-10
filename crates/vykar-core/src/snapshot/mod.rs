@@ -9,8 +9,8 @@ use vykar_types::error::{Result, VykarError};
 
 /// Snapshot format version stamped by the current writer. Absent / `0` means a
 /// legacy snapshot written before the discriminator existed. Readers refuse a
-/// version greater than this (see [`SnapshotMeta::supported`]). See
-/// `docs/src/format-evolution.md`.
+/// version greater than this (see [`SnapshotMeta::supported`]). See the Format
+/// Evolution section of `architecture.md`.
 pub const CURRENT_FORMAT_VERSION: u32 = 1;
 
 /// Metadata for a single snapshot, stored at `snapshots/<id>`.
@@ -40,8 +40,8 @@ pub struct SnapshotMeta {
     pub label: String,
     /// Reserved opaque extension blob — the escape hatch for future
     /// snapshot-level metadata inside a frozen-field-count envelope. Always
-    /// written `None` in this release; never read or validated here. See
-    /// `docs/src/format-evolution.md`.
+    /// written `None` in this release; never read or validated here. See the
+    /// Format Evolution section of `architecture.md`.
     #[serde(default, with = "serde_bytes")]
     pub ext: Option<Vec<u8>>,
     /// Snapshot format version. **Must remain the last field** — the envelope

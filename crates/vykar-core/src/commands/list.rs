@@ -277,6 +277,7 @@ mod tests {
             link_target: None,
             xattrs: None,
             raw_names: None,
+            hardlink: None,
         };
 
         let mut bytes = Vec::new();

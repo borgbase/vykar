@@ -942,6 +942,7 @@ mod tests {
             ctime_ns: 999_999,
             device: 0,
             inode: 0,
+            nlink: 1,
             size,
             is_dataless: true,
         }
@@ -983,6 +984,7 @@ mod tests {
             link_target: None,
             xattrs: None,
             raw_names: None,
+            hardlink: None,
         };
         let mut builder = ParentReuseBuilder::new(vec![ParentReuseRoot {
             abs_root: "/src".into(),
@@ -1033,6 +1035,7 @@ mod tests {
             link_target: None,
             xattrs: None,
             raw_names: None,
+            hardlink: None,
         };
         let mut builder = ParentReuseBuilder::new(vec![ParentReuseRoot {
             abs_root: "/src".into(),
@@ -1147,6 +1150,7 @@ mod tests {
             link_target: None,
             xattrs: None,
             raw_names: None,
+            hardlink: None,
         };
         let mut builder = ParentReuseBuilder::new(vec![ParentReuseRoot {
             abs_root: "/src".into(),

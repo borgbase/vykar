@@ -208,6 +208,7 @@ mod tests {
             link_target: None,
             xattrs: None,
             raw_names: None,
+            hardlink: None,
         }
     }
 
@@ -228,6 +229,7 @@ mod tests {
             link_target: (entry_type == ItemType::Symlink).then(|| "target".to_string()),
             xattrs: None,
             raw_names: None,
+            hardlink: None,
         }
     }
 

@@ -8,11 +8,64 @@ use std::sync::atomic::AtomicBool;
 use smallvec::SmallVec;
 
 use crate::platform::fs;
-use crate::snapshot::item::{Item, ItemType};
+use crate::snapshot::item::{ChunkRef, HardlinkId, Item, ItemType};
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
 
-use super::{push_metadata_warning, warn_metadata_err, RestoreStats};
+use super::{push_metadata_warning, warn_metadata_err, RestoreStats, MAX_HARDLINK_TRACKED};
+
+/// Recorded identity of a hard-link group's representative (the first member
+/// that passed the include filter). Later members of the same group are linked
+/// to it only when their **content** matches — identity is the ordered chunk-id
+/// list (`chunks_fp`), which is authoritative: chunk ids are content-addressed,
+/// so an equal fingerprint means byte-identical content, and a divergence
+/// (inode-number reuse handing the same `(dev, ino)` to a different file)
+/// declines to link and materializes that member from its own chunks instead.
+/// `size` is kept only as a cheap pre-filter. Metadata (mtime/ctime) is
+/// deliberately **not** part of the match: hard links share one inode and
+/// therefore one mtime, so a content match is the genuine-link signal;
+/// requiring an mtime match would false-negative legitimately-linked members
+/// whenever the shared inode's timestamps were touched between reads.
+pub(super) struct RepInfo {
+    pub(super) rel_path: PathBuf,
+    pub(super) size: u64,
+    /// BLAKE2b-256 over the representative's ordered chunk ids — the content
+    /// identity a candidate member must match to be linked rather than
+    /// independently materialized. See [`chunks_fingerprint`].
+    pub(super) chunks_fp: [u8; 32],
+}
+
+/// Fingerprint a file's content as BLAKE2b-256 over its ordered chunk ids.
+/// Chunk ids are content-addressed, so two files with the same fingerprint
+/// have byte-identical content. Used to gate hard-link relinking: only members
+/// whose fingerprint matches their group representative are linked (one inode,
+/// one content); a mismatch — produced by inode-number reuse during the walk —
+/// is materialized independently from its own chunks, never silently replaced
+/// by the representative's content.
+pub(super) fn chunks_fingerprint(chunks: &[ChunkRef]) -> [u8; 32] {
+    use blake2::digest::{Update, VariableOutput};
+    use blake2::Blake2bVar;
+    let mut hasher = Blake2bVar::new(32).expect("BLAKE2b accepts 32-byte output per spec");
+    for c in chunks {
+        hasher.update(c.id.as_bytes());
+    }
+    let mut out = [0u8; 32];
+    hasher
+        .finalize_variable(&mut out)
+        .expect("BLAKE2b accepts 32-byte output per spec");
+    out
+}
+
+/// A non-representative hard-link member queued for relinking after all
+/// representatives are materialized. `uid`/`gid` are carried for the copy
+/// fallback's root-restore chown (`finalize::create_hardlinks`).
+pub(super) struct PendingLink {
+    pub(super) link_rel: PathBuf,
+    pub(super) id: HardlinkId,
+    pub(super) mtime: i64,
+    pub(super) uid: u32,
+    pub(super) gid: u32,
+}
 
 /// Classification of a symlink's stored target for restore-time auditing.
 /// Used to warn the operator when a snapshot carries symlinks that escape the
@@ -145,6 +198,8 @@ pub(super) fn stream_and_plan<F, B>(
     xattrs_enabled: bool,
     stats: &mut RestoreStats,
     batch_size: usize,
+    group_reps: &mut HashMap<HardlinkId, RepInfo>,
+    pending_links: &mut Vec<PendingLink>,
     mut flush_batch: B,
 ) -> Result<StreamPlan>
 where
@@ -163,6 +218,8 @@ where
     let mut planned_dirs: Vec<PlannedNode> = Vec::new();
     let mut planned_symlinks: Vec<PlannedNode> = Vec::new();
     let mut rel_scratch = PathBuf::new();
+    // Emit the bounded-tracking overflow warning at most once per restore.
+    let mut hardlink_cap_warned = false;
 
     crate::commands::list::for_each_decoded_item(items_stream, |item| {
         if !include_path(&item.path) {
@@ -241,6 +298,85 @@ where
             }
             ItemType::RegularFile => {
                 sanitize_item_into(&item, &mut rel_scratch)?;
+
+                // Hard-link grouping. Each node carries its full chunk list, so
+                // anything that is *not* recorded as a pure link falls through
+                // to the normal planned-file path below and materializes from
+                // its own content — the key robustness property: a lone
+                // surviving member of a partially-restored group is just a file.
+                if let Some(id) = item.hardlink {
+                    let tracked = group_reps.len() + pending_links.len();
+                    match group_reps.get(&id) {
+                        // First passing member of this group → representative.
+                        // Record its identity (under the cap) and materialize it
+                        // as a normal file by falling through.
+                        None => {
+                            if tracked < MAX_HARDLINK_TRACKED {
+                                group_reps.insert(
+                                    id,
+                                    RepInfo {
+                                        rel_path: rel_scratch.clone(),
+                                        size: item.size,
+                                        chunks_fp: chunks_fingerprint(&item.chunks),
+                                    },
+                                );
+                            } else if !hardlink_cap_warned {
+                                hardlink_cap_warned = true;
+                                push_metadata_warning(
+                                    stats,
+                                    format!(
+                                        "hard-link tracking limit ({MAX_HARDLINK_TRACKED}) reached; \
+                                         further hard-linked files are restored as independent \
+                                         copies (sharing storage but not inodes)"
+                                    ),
+                                );
+                            }
+                            // fall through → materialize as a normal file.
+                        }
+                        // A representative exists. Link only when identity
+                        // matches and we are still within the tracking budget;
+                        // otherwise materialize this member from its own chunks.
+                        Some(rep) => {
+                            // Content identity is authoritative: equal chunk-id
+                            // fingerprint ⇒ byte-identical content. `size` is a
+                            // cheap pre-check. A mismatch means the same
+                            // `(dev, ino)` was reused for different content
+                            // during the walk — never link it (that would
+                            // discard this member's own content); fall through
+                            // and materialize it independently.
+                            let identity_matches = item.size == rep.size
+                                && chunks_fingerprint(&item.chunks) == rep.chunks_fp;
+                            if identity_matches && tracked < MAX_HARDLINK_TRACKED {
+                                pending_links.push(PendingLink {
+                                    link_rel: std::mem::take(&mut rel_scratch),
+                                    id,
+                                    mtime: item.mtime,
+                                    uid: item.uid,
+                                    gid: item.gid,
+                                });
+                                // Pure link: no chunk_targets, no PlannedFile,
+                                // no metadata application (the shared inode
+                                // already carries the representative's).
+                                return Ok(());
+                            }
+                            if identity_matches && !hardlink_cap_warned {
+                                hardlink_cap_warned = true;
+                                push_metadata_warning(
+                                    stats,
+                                    format!(
+                                        "hard-link tracking limit ({MAX_HARDLINK_TRACKED}) reached; \
+                                         further hard-linked files are restored as independent \
+                                         copies (sharing storage but not inodes)"
+                                    ),
+                                );
+                            }
+                            // Divergent identity (inode reuse / mid-backup
+                            // mutation) or over-cap → fall through to normal
+                            // materialization from this member's own chunks.
+                        }
+                    }
+                }
+
                 let file_idx = planned_files.len();
                 let mut file_offset: u64 = 0;
                 for chunk_ref in &item.chunks {
@@ -496,6 +632,8 @@ mod tests {
         let mut all_files: Vec<PlannedFile> = Vec::new();
         let mut all_chunks: HashMap<ChunkId, ChunkTargets> = HashMap::new();
         let mut all_verified: HashSet<PathBuf> = HashSet::new();
+        let mut group_reps: HashMap<HardlinkId, RepInfo> = HashMap::new();
+        let mut pending_links: Vec<PendingLink> = Vec::new();
         stream_and_plan(
             stream,
             dest,
@@ -503,6 +641,8 @@ mod tests {
             xattrs_enabled,
             stats,
             usize::MAX,
+            &mut group_reps,
+            &mut pending_links,
             |files, chunks, verified, _stats| {
                 all_files.extend(files);
                 for (k, v) in chunks {
@@ -513,6 +653,166 @@ mod tests {
             },
         )?;
         Ok((all_files, all_chunks, all_verified))
+    }
+
+    /// Like `collect_all` but also surfaces the hard-link tracking state
+    /// (`group_reps`, `pending_links`) for plan-level assertions.
+    #[allow(clippy::type_complexity)]
+    fn collect_with_hardlinks<F: FnMut(&str) -> bool>(
+        stream: &[u8],
+        dest: &Path,
+        mut filter: F,
+        stats: &mut RestoreStats,
+    ) -> Result<(
+        Vec<PlannedFile>,
+        HashMap<HardlinkId, RepInfo>,
+        Vec<PendingLink>,
+    )> {
+        let mut all_files: Vec<PlannedFile> = Vec::new();
+        let mut group_reps: HashMap<HardlinkId, RepInfo> = HashMap::new();
+        let mut pending_links: Vec<PendingLink> = Vec::new();
+        stream_and_plan(
+            stream,
+            dest,
+            &mut filter,
+            false,
+            stats,
+            usize::MAX,
+            &mut group_reps,
+            &mut pending_links,
+            |files, _chunks, _verified, _stats| {
+                all_files.extend(files);
+                Ok(())
+            },
+        )?;
+        Ok((all_files, group_reps, pending_links))
+    }
+
+    /// Build a regular-file Item carrying a hard-link group key.
+    fn hardlinked_file_item(path: &str, chunks: Vec<(u8, u32)>, dev: u64, ino: u64) -> Item {
+        let mut item = make_file_item(path, chunks);
+        item.hardlink = Some(HardlinkId { dev, ino });
+        item
+    }
+
+    /// Two members of one group with matching size+mtime: the first is the
+    /// content-bearing representative (a `PlannedFile`); the second is queued in
+    /// `pending_links` and produces no second `PlannedFile`.
+    #[test]
+    fn stream_and_plan_matching_hardlink_member_is_pending_link() {
+        let temp = tempdir().unwrap();
+        let dest = &temp.path().canonicalize().unwrap();
+
+        let rep = hardlinked_file_item("a.txt", vec![(0xAA, 100)], 7, 42);
+        // Identical size+mtime (both 0 / 100 bytes) → genuine link.
+        let link = hardlinked_file_item("b.txt", vec![(0xAA, 100)], 7, 42);
+        let stream = serialize_items(&[rep, link]);
+
+        let mut stats = RestoreStats::default();
+        let (files, group_reps, pending_links) =
+            collect_with_hardlinks(&stream, dest, |_| true, &mut stats).unwrap();
+
+        assert_eq!(files.len(), 1, "only the representative is a PlannedFile");
+        assert_eq!(files[0].rel_path, Path::new("a.txt"));
+        assert_eq!(group_reps.len(), 1);
+        assert_eq!(pending_links.len(), 1);
+        assert_eq!(pending_links[0].link_rel, Path::new("b.txt"));
+        assert_eq!(pending_links[0].id, HardlinkId { dev: 7, ino: 42 });
+    }
+
+    /// Divergence guard (finding 1): two items share a `HardlinkId` but the
+    /// second's size/mtime diverge (simulated inode reuse / mid-backup
+    /// mutation) → it is NOT linked; it is planned as an independent file from
+    /// its own chunks. `pending_links` stays empty.
+    #[test]
+    fn stream_and_plan_divergent_hardlink_member_materialized_independently() {
+        let temp = tempdir().unwrap();
+        let dest = &temp.path().canonicalize().unwrap();
+
+        let rep = hardlinked_file_item("a.txt", vec![(0xAA, 100)], 7, 42);
+        // Same id, but different content size → divergent member.
+        let mut diverged = hardlinked_file_item("b.txt", vec![(0xBB, 200)], 7, 42);
+        diverged.mtime = 999; // and a different mtime
+        let stream = serialize_items(&[rep, diverged]);
+
+        let mut stats = RestoreStats::default();
+        let (files, group_reps, pending_links) =
+            collect_with_hardlinks(&stream, dest, |_| true, &mut stats).unwrap();
+
+        assert_eq!(files.len(), 2, "both members are content-bearing files");
+        assert!(
+            pending_links.is_empty(),
+            "divergent member must not be linked"
+        );
+        assert_eq!(group_reps.len(), 1, "only the representative is recorded");
+    }
+
+    /// Finding 2: two members share a `HardlinkId` **and** the same `size`, but
+    /// carry different content (different chunk ids). The old `size + mtime`
+    /// gate would have linked them and silently discarded the second's content;
+    /// the chunk-fingerprint gate must reject the link and materialize the
+    /// member from its own chunks. This is the precise data-loss case the
+    /// weaker check missed.
+    #[test]
+    fn stream_and_plan_same_size_different_content_not_linked() {
+        let temp = tempdir().unwrap();
+        let dest = &temp.path().canonicalize().unwrap();
+
+        // Identical size (100) and identical mtime (both 0), but different
+        // chunk content (0xAA vs 0xBB) → divergent under the fingerprint gate.
+        let rep = hardlinked_file_item("a.txt", vec![(0xAA, 100)], 7, 42);
+        let collision = hardlinked_file_item("b.txt", vec![(0xBB, 100)], 7, 42);
+        assert_eq!(rep.size, collision.size, "sizes must match for this test");
+        assert_eq!(
+            rep.mtime, collision.mtime,
+            "mtimes must match for this test"
+        );
+        let stream = serialize_items(&[rep, collision]);
+
+        let mut stats = RestoreStats::default();
+        let (files, group_reps, pending_links) =
+            collect_with_hardlinks(&stream, dest, |_| true, &mut stats).unwrap();
+
+        assert_eq!(
+            files.len(),
+            2,
+            "same-size-different-content member must materialize independently"
+        );
+        assert!(
+            pending_links.is_empty(),
+            "differing content must not be linked (would discard the member's own bytes)"
+        );
+        assert_eq!(group_reps.len(), 1, "only the representative is recorded");
+    }
+
+    /// Representative filtered out: when the first group member is excluded by
+    /// the filter, the first *surviving* member becomes the representative and
+    /// self-materializes from its own chunks — no dangling pending link.
+    #[test]
+    fn stream_and_plan_filtered_representative_promotes_survivor() {
+        let temp = tempdir().unwrap();
+        let dest = &temp.path().canonicalize().unwrap();
+
+        let excluded = hardlinked_file_item("excluded/a.txt", vec![(0xAA, 100)], 7, 42);
+        let included = hardlinked_file_item("included/b.txt", vec![(0xAA, 100)], 7, 42);
+        let stream = serialize_items(&[excluded, included]);
+
+        let mut stats = RestoreStats::default();
+        let (files, group_reps, pending_links) =
+            collect_with_hardlinks(&stream, dest, |p| p.starts_with("included"), &mut stats)
+                .unwrap();
+
+        assert_eq!(files.len(), 1, "the survivor self-materializes");
+        assert_eq!(files[0].rel_path, Path::new("included/b.txt"));
+        assert!(
+            pending_links.is_empty(),
+            "no link to a filtered representative"
+        );
+        assert_eq!(group_reps.len(), 1);
+        assert_eq!(
+            group_reps[&HardlinkId { dev: 7, ino: 42 }].rel_path,
+            Path::new("included/b.txt")
+        );
     }
 
     #[test]
@@ -649,6 +949,7 @@ mod tests {
                 path: Some(raw.to_vec()),
                 link_target: None,
             }),
+            hardlink: None,
         }
     }
 
@@ -735,6 +1036,7 @@ mod tests {
                 path: None,
                 link_target: Some(raw_target.to_vec()),
             }),
+            hardlink: None,
         };
         let stream = serialize_items(&[item]);
 
@@ -1119,6 +1421,8 @@ mod tests {
 
         let mut sizes: Vec<usize> = Vec::new();
         let mut stats = RestoreStats::default();
+        let mut group_reps: HashMap<HardlinkId, RepInfo> = HashMap::new();
+        let mut pending_links: Vec<PendingLink> = Vec::new();
         stream_and_plan(
             &stream,
             dest,
@@ -1126,6 +1430,8 @@ mod tests {
             false,
             &mut stats,
             2,
+            &mut group_reps,
+            &mut pending_links,
             |files, _chunks, _verified, _stats| {
                 sizes.push(files.len());
                 Ok(())
@@ -1151,6 +1457,8 @@ mod tests {
         let stream = serialize_items(&items);
 
         let mut stats = RestoreStats::default();
+        let mut group_reps: HashMap<HardlinkId, RepInfo> = HashMap::new();
+        let mut pending_links: Vec<PendingLink> = Vec::new();
         let plan = stream_and_plan(
             &stream,
             dest,
@@ -1158,6 +1466,8 @@ mod tests {
             false,
             &mut stats,
             usize::MAX,
+            &mut group_reps,
+            &mut pending_links,
             |_files, _chunks, _verified, _stats| Ok(()),
         )
         .unwrap();
@@ -1190,6 +1500,8 @@ mod tests {
         let mut flush_calls = 0usize;
         let mut last_verified: HashSet<PathBuf> = HashSet::new();
         let mut stats = RestoreStats::default();
+        let mut group_reps: HashMap<HardlinkId, RepInfo> = HashMap::new();
+        let mut pending_links: Vec<PendingLink> = Vec::new();
         stream_and_plan(
             &stream,
             dest,
@@ -1197,6 +1509,8 @@ mod tests {
             false,
             &mut stats,
             100,
+            &mut group_reps,
+            &mut pending_links,
             |files, chunks, verified, _stats| {
                 flush_calls += 1;
                 assert!(files.is_empty());

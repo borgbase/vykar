@@ -224,6 +224,20 @@ pub(super) fn materialize_item(walked: WalkedEntry, xattrs_enabled: bool) -> Res
 
     let raw_names = build_raw_names(walked.snapshot_path_raw, link_target_raw);
 
+    // Hard-link group key: regular files with more than one link to their inode
+    // carry their source `(dev, ino)` so restore can relink siblings. Each node
+    // still records its full chunk list, so a lone surviving member of a
+    // filtered group self-materializes — we never assume we see all N links.
+    // `nlink` is `1` on Windows/non-unix, so this is naturally Unix-only.
+    let hardlink = if entry_type == ItemType::RegularFile && metadata_summary.nlink > 1 {
+        Some(crate::snapshot::item::HardlinkId {
+            dev: metadata_summary.device,
+            ino: metadata_summary.inode,
+        })
+    } else {
+        None
+    };
+
     let mut item = Item {
         path: walked.snapshot_path,
         entry_type,
@@ -240,6 +254,7 @@ pub(super) fn materialize_item(walked: WalkedEntry, xattrs_enabled: bool) -> Res
         link_target,
         xattrs: None,
         raw_names,
+        hardlink,
     };
 
     // Skip xattrs on dataless inodes: on macOS, `getxattr` for FileProvider-
@@ -646,6 +661,7 @@ mod tests {
             link_target: None,
             xattrs: None,
             raw_names: None,
+            hardlink: None,
         }
     }
 
@@ -658,6 +674,7 @@ mod tests {
             ctime_ns: 0,
             device: 0,
             inode: 0,
+            nlink: 1,
             size: 1024,
             is_dataless: false,
         }
@@ -881,6 +898,99 @@ mod tests {
                 assert!(item.xattrs.is_none());
             }
             other => panic!("expected Entry, got {other:?}"),
+        }
+    }
+
+    /// A regular file with `nlink > 1` materializes with `hardlink: Some`
+    /// carrying its `(dev, ino)`; a single-link file gets `None`.
+    #[cfg(unix)]
+    #[test]
+    fn materialize_regular_file_captures_hardlink() {
+        use crate::snapshot::item::HardlinkId;
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.txt");
+        std::fs::write(&a, b"shared").unwrap();
+        let b = tmp.path().join("b.txt");
+        std::fs::hard_link(&a, &b).unwrap();
+
+        // `a` now has nlink == 2 → hardlink Some.
+        let walked = walked_from_path(&a, "a.txt");
+        match materialize_item(walked, false).unwrap() {
+            Materialized::Entry { item, metadata, .. } => {
+                assert_eq!(
+                    item.hardlink,
+                    Some(HardlinkId {
+                        dev: metadata.device,
+                        ino: metadata.inode
+                    })
+                );
+                assert!(metadata.nlink >= 2);
+            }
+            other => panic!("expected Entry, got {other:?}"),
+        }
+
+        // A lone file → None.
+        let solo = tmp.path().join("solo.txt");
+        std::fs::write(&solo, b"x").unwrap();
+        let walked = walked_from_path(&solo, "solo.txt");
+        match materialize_item(walked, false).unwrap() {
+            Materialized::Entry { item, .. } => assert_eq!(item.hardlink, None),
+            other => panic!("expected Entry, got {other:?}"),
+        }
+    }
+
+    /// A hardlinked file that hits the local file cache still emits
+    /// `hardlink: Some(..)` — the Item is fully materialized (including the
+    /// hardlink key) before the cache check, and the `CacheHit` path carries it
+    /// through untouched.
+    #[cfg(unix)]
+    #[test]
+    fn cache_hit_hardlinked_file_keeps_hardlink() {
+        use crate::repo::file_cache::CachedChunks;
+        use crate::snapshot::item::ChunkRef;
+        use vykar_types::chunk_id::ChunkId;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let a = root.join("a.txt");
+        std::fs::write(&a, b"shared-content").unwrap();
+        let b = root.join("b.txt");
+        std::fs::hard_link(&a, &b).unwrap();
+
+        let meta = std::fs::symlink_metadata(&a).unwrap();
+        let summary = fs::summarize_metadata(&meta, &meta.file_type());
+        assert!(summary.nlink >= 2, "fixture must be hard-linked");
+
+        let abs_path = a.to_string_lossy().into_owned();
+        let cached = CachedChunks::from_chunk_refs(&[ChunkRef {
+            id: ChunkId::from_bytes([0xAB; 32]),
+            size: summary.size as u32,
+            csize: summary.size as u32,
+        }]);
+
+        let mut file_cache = FileCache::new();
+        let root_str = root.to_string_lossy().into_owned();
+        file_cache.begin_sections(&[root_str], &[1]);
+        file_cache.insert(
+            &abs_path,
+            summary.device,
+            summary.inode,
+            summary.mtime_ns,
+            summary.ctime_ns,
+            summary.size,
+            cached,
+        );
+
+        let walked = walked_from_path(&a, "a.txt");
+        let mut items = walked_entry_to_walk_items(walked, false, &file_cache, u64::MAX, None);
+        match items.next() {
+            Some(Ok(WalkEntry::CacheHit { item, .. })) => {
+                assert!(
+                    item.hardlink.is_some(),
+                    "cache-hit hardlinked file must keep hardlink: Some"
+                );
+            }
+            _ => panic!("expected WalkEntry::CacheHit"),
         }
     }
 

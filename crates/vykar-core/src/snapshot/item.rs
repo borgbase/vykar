@@ -37,10 +37,30 @@ pub struct Item {
     /// whose names are not valid UTF-8 (Unix only). `path` / `link_target`
     /// remain the lossy UTF-8 **display** strings; these raw byte fields are
     /// the source of truth at restore time when present. `None` for the common
-    /// (valid-UTF8) case — one nil byte per entry on the wire. Trailing field
-    /// for backward-readable decode (see `docs/src/format-evolution.md`).
+    /// (valid-UTF8) case — one nil byte per entry on the wire. See the Format
+    /// Evolution section of `architecture.md` for the backward-readable decode
+    /// contract that governs trailing optional fields like this one.
     #[serde(default)]
     pub raw_names: Option<ItemRawNames>,
+    /// Hard-link group key for regular files with `nlink > 1` (Unix only),
+    /// else `None`. Set to the source `(dev, ino)` so that all nodes sharing
+    /// one inode can be relinked at restore time. Each node still carries its
+    /// **full** chunk list, so a node whose group siblings were filtered out
+    /// (partial restore) materializes from its own content — we never assume we
+    /// see all N links. Trailing field for backward-readable decode (see the
+    /// Format Evolution section of `architecture.md`); ships under snapshot
+    /// format v1.
+    #[serde(default)]
+    pub hardlink: Option<HardlinkId>,
+}
+
+/// Source `(dev, ino)` identity of a regular file with `nlink > 1`, used to
+/// regroup hard-linked nodes at restore time. `dev` disambiguates the same
+/// `ino` across filesystems within a single snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct HardlinkId {
+    pub dev: u64,
+    pub ino: u64,
 }
 
 /// Byte-faithful shadow of an `Item`'s name fields, populated only when the
@@ -111,6 +131,14 @@ impl Item {
     /// paths) are the caller's responsibility.
     pub fn validate(&self) -> Result<()> {
         self.validate_raw_names()?;
+        // A hard-link group key is only meaningful on regular files (the v1
+        // scope boundary); directories and symlinks must never carry one.
+        if self.hardlink.is_some() && self.entry_type != ItemType::RegularFile {
+            return Err(VykarError::InvalidFormat(format!(
+                "item '{}': hardlink set on a non-regular-file entry",
+                self.path
+            )));
+        }
         match self.entry_type {
             ItemType::RegularFile => {
                 if self.link_target.is_some() {
@@ -265,6 +293,7 @@ mod tests {
             link_target: None,
             xattrs: None,
             raw_names: None,
+            hardlink: None,
         }
     }
 
@@ -502,5 +531,141 @@ mod tests {
         });
         item.validate().unwrap();
         assert_eq!(item.link_target_bytes(), Some(BAD_BYTES));
+    }
+
+    // -----------------------------------------------------------------------
+    // hardlink round-trip, validation, and reader-rejection
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn hardlink_round_trips_through_msgpack() {
+        let mut item = base_item(ItemType::RegularFile, "linked.bin");
+        item.chunks = vec![chunk(64)];
+        item.size = 64;
+        item.hardlink = Some(HardlinkId {
+            dev: 0x1234,
+            ino: 0xABCD,
+        });
+        item.validate().unwrap();
+        let bytes = rmp_serde::to_vec(&item).unwrap();
+        let decoded: Item = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(decoded, item);
+        assert_eq!(
+            decoded.hardlink,
+            Some(HardlinkId {
+                dev: 0x1234,
+                ino: 0xABCD
+            })
+        );
+    }
+
+    #[test]
+    fn validate_rejects_hardlink_on_directory() {
+        let mut item = base_item(ItemType::Directory, "dir");
+        item.hardlink = Some(HardlinkId { dev: 1, ino: 2 });
+        let err = item.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("hardlink set on a non-regular-file entry"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_hardlink_on_symlink() {
+        let mut item = base_item(ItemType::Symlink, "link");
+        item.link_target = Some("target".into());
+        item.hardlink = Some(HardlinkId { dev: 1, ino: 2 });
+        let err = item.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("hardlink set on a non-regular-file entry"),
+            "got: {err}"
+        );
+    }
+
+    /// The reverse of `old_array_without_raw_names_decodes_to_none`: a 16-field
+    /// `Item` (carrying `hardlink`) must **fail** to decode into a 15-field
+    /// struct that lacks it. rmp-serde rejects a longer-than-expected positional
+    /// array, so a pre-hardlink reader refuses the record rather than silently
+    /// mis-decoding it — the mechanism documented in `architecture.md`'s Format
+    /// Evolution section ("an old reader hits a length mismatch").
+    #[test]
+    fn new_array_with_hardlink_rejected_by_pre_hardlink_reader() {
+        // The exact field layout of `Item` *before* the `hardlink` field was
+        // appended (15 positional fields, `raw_names` trailing).
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct PreHardlinkItem {
+            path: String,
+            entry_type: ItemType,
+            mode: u32,
+            uid: u32,
+            gid: u32,
+            user: Option<String>,
+            group: Option<String>,
+            mtime: i64,
+            atime: Option<i64>,
+            ctime: Option<i64>,
+            size: u64,
+            chunks: Vec<ChunkRef>,
+            link_target: Option<String>,
+            xattrs: Option<HashMap<String, Vec<u8>>>,
+            raw_names: Option<ItemRawNames>,
+        }
+
+        let mut item = base_item(ItemType::RegularFile, "linked.bin");
+        item.hardlink = Some(HardlinkId { dev: 1, ino: 2 });
+        let bytes = rmp_serde::to_vec(&item).unwrap();
+
+        let result: std::result::Result<PreHardlinkItem, _> = rmp_serde::from_slice(&bytes);
+        assert!(
+            result.is_err(),
+            "a 16-field Item must not decode into the 15-field pre-hardlink struct"
+        );
+    }
+
+    /// Symmetry with `old_array_without_raw_names_decodes_to_none`: a current
+    /// reader fills `hardlink` with `None` when decoding a 15-field array
+    /// written before the field existed.
+    #[test]
+    fn old_array_without_hardlink_decodes_to_none() {
+        #[derive(Serialize)]
+        struct OldItem {
+            path: String,
+            entry_type: ItemType,
+            mode: u32,
+            uid: u32,
+            gid: u32,
+            user: Option<String>,
+            group: Option<String>,
+            mtime: i64,
+            atime: Option<i64>,
+            ctime: Option<i64>,
+            size: u64,
+            chunks: Vec<ChunkRef>,
+            link_target: Option<String>,
+            xattrs: Option<HashMap<String, Vec<u8>>>,
+            raw_names: Option<ItemRawNames>,
+        }
+        let old = OldItem {
+            path: "a.txt".into(),
+            entry_type: ItemType::RegularFile,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            user: None,
+            group: None,
+            mtime: 0,
+            atime: None,
+            ctime: None,
+            size: 0,
+            chunks: Vec::new(),
+            link_target: None,
+            xattrs: None,
+            raw_names: None,
+        };
+        let bytes = rmp_serde::to_vec(&old).unwrap();
+        let decoded: Item = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(decoded.hardlink, None);
+        assert_eq!(decoded.path, "a.txt");
     }
 }

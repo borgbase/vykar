@@ -55,6 +55,7 @@ pub(super) fn make_file_item(path: &str, chunks: Vec<(u8, u32)>) -> Item {
         link_target: None,
         xattrs: None,
         raw_names: None,
+        hardlink: None,
     }
 }
 
@@ -75,6 +76,7 @@ pub(super) fn make_dir_item(path: &str, mode: u32) -> Item {
         link_target: None,
         xattrs: None,
         raw_names: None,
+        hardlink: None,
     }
 }
 
@@ -95,6 +97,7 @@ pub(super) fn make_symlink_item(path: &str, target: &str) -> Item {
         link_target: Some(target.to_string()),
         xattrs: None,
         raw_names: None,
+        hardlink: None,
     }
 }
 

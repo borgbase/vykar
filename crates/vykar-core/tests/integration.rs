@@ -795,6 +795,320 @@ fn backup_skips_xattrs_when_disabled() {
 }
 
 // ---------------------------------------------------------------------------
+// Hard-link preservation (Unix). Regular files sharing one inode are
+// regrouped at restore so they share an inode again; each node still carries
+// its own chunks, so partial restores and lone-survivor groups degrade to
+// normal files.
+// ---------------------------------------------------------------------------
+
+/// Run a one-shot backup of `sources` into the repo. Helper for the hard-link
+/// tests below.
+#[cfg(unix)]
+fn backup_sources(config: &VykarConfig, snapshot_name: &str, sources: &[String]) {
+    let exclude_if_present: Vec<String> = Vec::new();
+    let exclude_patterns: Vec<String> = Vec::new();
+    commands::backup::run(
+        config,
+        commands::backup::BackupRequest {
+            snapshot_name,
+            passphrase: None,
+            source_paths: sources,
+            source_label: "source",
+            exclude_patterns: &exclude_patterns,
+            exclude_if_present: &exclude_if_present,
+            one_file_system: true,
+            git_ignore: false,
+            xattrs_enabled: false,
+            compression: Compression::None,
+            command_dumps: &[],
+            verbose: false,
+        },
+    )
+    .unwrap();
+}
+
+/// Scenario 1: a 2-link group restores to two paths that share one inode, both
+/// report `nlink == 2`, and content is identical.
+#[test]
+#[cfg(unix)]
+fn backup_and_restore_preserves_hard_links() {
+    use std::os::unix::fs::MetadataExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = tmp.path().join("repo");
+    let source_dir = tmp.path().join("source");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    std::fs::create_dir_all(&source_dir).unwrap();
+
+    let a = source_dir.join("a.txt");
+    std::fs::write(&a, b"hard-linked-content").unwrap();
+    let b = source_dir.join("b.txt");
+    std::fs::hard_link(&a, &b).unwrap();
+
+    let config = make_test_config(&repo_dir);
+    commands::init::run(&config, None).unwrap();
+    let sources = vec![source_dir.to_string_lossy().to_string()];
+    backup_sources(&config, "snap-hl", &sources);
+
+    // Both items carry the same hardlink key.
+    let mut repo = open_local_repo(&repo_dir);
+    let items = commands::list::load_snapshot_items(&mut repo, "snap-hl").unwrap();
+    let a_item = items.iter().find(|i| i.path == "a.txt").unwrap();
+    let b_item = items.iter().find(|i| i.path == "b.txt").unwrap();
+    assert!(a_item.hardlink.is_some());
+    assert_eq!(a_item.hardlink, b_item.hardlink);
+
+    let restore_dir = tmp.path().join("restore");
+    commands::restore::run(
+        &config,
+        None,
+        "snap-hl",
+        restore_dir.to_str().unwrap(),
+        None,
+        false,
+        false,
+    )
+    .unwrap();
+
+    let ra = restore_dir.join("a.txt");
+    let rb = restore_dir.join("b.txt");
+    let ma = std::fs::metadata(&ra).unwrap();
+    let mb = std::fs::metadata(&rb).unwrap();
+    assert_eq!(ma.ino(), mb.ino(), "restored links must share one inode");
+    assert_eq!(ma.nlink(), 2, "shared inode must report nlink == 2");
+    assert_eq!(std::fs::read(&ra).unwrap(), b"hard-linked-content");
+    assert_eq!(std::fs::read(&rb).unwrap(), b"hard-linked-content");
+}
+
+/// Scenario 2: with the representative filtered out by `--pattern`, an included
+/// link still restores correctly from its own chunks (self-materialized).
+#[test]
+#[cfg(unix)]
+fn restore_pattern_excluding_representative_restores_link_from_own_chunks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = tmp.path().join("repo");
+    let source_dir = tmp.path().join("source");
+    std::fs::create_dir_all(repo_dir.as_path()).unwrap();
+    std::fs::create_dir_all(source_dir.join("drop")).unwrap();
+    std::fs::create_dir_all(source_dir.join("keep")).unwrap();
+
+    let a = source_dir.join("drop/a.txt");
+    std::fs::write(&a, b"shared-body").unwrap();
+    let b = source_dir.join("keep/b.txt");
+    std::fs::hard_link(&a, &b).unwrap();
+
+    let config = make_test_config(&repo_dir);
+    commands::init::run(&config, None).unwrap();
+    let sources = vec![source_dir.to_string_lossy().to_string()];
+    backup_sources(&config, "snap-hl-partial", &sources);
+
+    let restore_dir = tmp.path().join("restore");
+    // `*` spans `/` (literal_separator(false)), so "keep*" selects keep/b.txt
+    // and excludes drop/a.txt (the would-be representative).
+    commands::restore::run(
+        &config,
+        None,
+        "snap-hl-partial",
+        restore_dir.to_str().unwrap(),
+        Some("keep*"),
+        false,
+        false,
+    )
+    .unwrap();
+
+    assert!(!restore_dir.join("drop").exists(), "drop/ must be excluded");
+    let rb = restore_dir.join("keep/b.txt");
+    assert_eq!(
+        std::fs::read(&rb).unwrap(),
+        b"shared-body",
+        "the lone surviving member self-materializes"
+    );
+}
+
+/// Scenario 3: a file with `nlink > 1` whose only in-set member is backed up
+/// (its sibling link lives outside the source) restores as a normal standalone
+/// file — there is no group sibling to link to.
+#[test]
+#[cfg(unix)]
+fn restore_single_in_set_hardlink_is_standalone_file() {
+    use std::os::unix::fs::MetadataExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = tmp.path().join("repo");
+    let source_dir = tmp.path().join("source");
+    let outside_dir = tmp.path().join("outside");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    std::fs::create_dir_all(&source_dir).unwrap();
+    std::fs::create_dir_all(&outside_dir).unwrap();
+
+    // The inode has two links, but only `in_set.txt` is under the source.
+    let outside = outside_dir.join("external.txt");
+    std::fs::write(&outside, b"only-one-in-set").unwrap();
+    let in_set = source_dir.join("in_set.txt");
+    std::fs::hard_link(&outside, &in_set).unwrap();
+
+    let config = make_test_config(&repo_dir);
+    commands::init::run(&config, None).unwrap();
+    let sources = vec![source_dir.to_string_lossy().to_string()];
+    backup_sources(&config, "snap-hl-single", &sources);
+
+    // The item records hardlink (nlink > 1) but is the only member in the set.
+    let mut repo = open_local_repo(&repo_dir);
+    let items = commands::list::load_snapshot_items(&mut repo, "snap-hl-single").unwrap();
+    let item = items.iter().find(|i| i.path == "in_set.txt").unwrap();
+    assert!(item.hardlink.is_some());
+
+    let restore_dir = tmp.path().join("restore");
+    commands::restore::run(
+        &config,
+        None,
+        "snap-hl-single",
+        restore_dir.to_str().unwrap(),
+        None,
+        false,
+        false,
+    )
+    .unwrap();
+
+    let restored = restore_dir.join("in_set.txt");
+    assert_eq!(std::fs::read(&restored).unwrap(), b"only-one-in-set");
+    assert_eq!(
+        std::fs::metadata(&restored).unwrap().nlink(),
+        1,
+        "a lone in-set member restores as a standalone file"
+    );
+}
+
+/// Scenario 4: a hard-link group that spans two source roots is relinked after
+/// restore — `(dev, ino)` grouping is plan-global, not per-source. Paths are
+/// prefix-disambiguated under multi-source naming, so we assert on inode
+/// sharing among restored files rather than on exact paths.
+#[test]
+#[cfg(unix)]
+fn restore_relinks_cross_source_hard_link_group() {
+    use std::os::unix::fs::MetadataExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = tmp.path().join("repo");
+    let src_a = tmp.path().join("srcA");
+    let src_b = tmp.path().join("srcB");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    std::fs::create_dir_all(&src_a).unwrap();
+    std::fs::create_dir_all(&src_b).unwrap();
+
+    let a = src_a.join("file.txt");
+    std::fs::write(&a, b"cross-source-body").unwrap();
+    let b = src_b.join("file.txt");
+    std::fs::hard_link(&a, &b).unwrap();
+
+    let config = make_test_config(&repo_dir);
+    commands::init::run(&config, None).unwrap();
+    let sources = vec![
+        src_a.to_string_lossy().to_string(),
+        src_b.to_string_lossy().to_string(),
+    ];
+    backup_sources(&config, "snap-hl-cross", &sources);
+
+    let restore_dir = tmp.path().join("restore");
+    commands::restore::run(
+        &config,
+        None,
+        "snap-hl-cross",
+        restore_dir.to_str().unwrap(),
+        None,
+        false,
+        false,
+    )
+    .unwrap();
+
+    // Collect inodes of every restored regular file with the shared body.
+    let mut inodes = std::collections::HashSet::new();
+    let mut count = 0;
+    for entry in walkdir_files(&restore_dir) {
+        if std::fs::read(&entry).unwrap() == b"cross-source-body" {
+            inodes.insert(std::fs::metadata(&entry).unwrap().ino());
+            count += 1;
+        }
+    }
+    assert_eq!(count, 2, "both cross-source members must be restored");
+    assert_eq!(inodes.len(), 1, "both members must share one inode");
+}
+
+/// Scenario 5: a second backup of an unchanged hard-linked file (a cache hit)
+/// still records `hardlink: Some(..)` and restores as a link.
+#[test]
+#[cfg(unix)]
+fn second_backup_cache_hit_preserves_hard_link() {
+    use std::os::unix::fs::MetadataExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = tmp.path().join("repo");
+    let source_dir = tmp.path().join("source");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    std::fs::create_dir_all(&source_dir).unwrap();
+
+    let a = source_dir.join("a.txt");
+    std::fs::write(&a, b"cache-hit-body").unwrap();
+    let b = source_dir.join("b.txt");
+    std::fs::hard_link(&a, &b).unwrap();
+
+    let config = make_test_config(&repo_dir);
+    commands::init::run(&config, None).unwrap();
+    let sources = vec![source_dir.to_string_lossy().to_string()];
+    backup_sources(&config, "snap-hl-1", &sources);
+    // Second backup of the unchanged tree: file bodies hit the local cache.
+    backup_sources(&config, "snap-hl-2", &sources);
+
+    let mut repo = open_local_repo(&repo_dir);
+    let items = commands::list::load_snapshot_items(&mut repo, "snap-hl-2").unwrap();
+    let a_item = items.iter().find(|i| i.path == "a.txt").unwrap();
+    let b_item = items.iter().find(|i| i.path == "b.txt").unwrap();
+    assert!(
+        a_item.hardlink.is_some() && a_item.hardlink == b_item.hardlink,
+        "cache-hit second backup must still record the hardlink group"
+    );
+
+    let restore_dir = tmp.path().join("restore");
+    commands::restore::run(
+        &config,
+        None,
+        "snap-hl-2",
+        restore_dir.to_str().unwrap(),
+        None,
+        false,
+        false,
+    )
+    .unwrap();
+
+    let ma = std::fs::metadata(restore_dir.join("a.txt")).unwrap();
+    let mb = std::fs::metadata(restore_dir.join("b.txt")).unwrap();
+    assert_eq!(ma.ino(), mb.ino(), "cache-hit restore must still relink");
+}
+
+/// Minimal recursive file walker for the cross-source inode check (avoids a
+/// dev-dependency on the `walkdir` crate in the integration target).
+#[cfg(unix)]
+fn walkdir_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let ft = entry.file_type().unwrap();
+            if ft.is_dir() {
+                stack.push(path);
+            } else if ft.is_file() {
+                out.push(path);
+            }
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Restore metadata fidelity (F1 uid/gid is privileged; F2 dir mtime, F5
 // symlink mtime, deferred dir mode, and xattrs-before-chmod are non-root).
 // ---------------------------------------------------------------------------

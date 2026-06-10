@@ -25,11 +25,19 @@ pub(crate) fn run_restore(
         )?)
     })?;
 
+    // Hard links are only mentioned when present, keeping the common-case
+    // summary unchanged.
+    let hardlinks = if stats.hardlinks > 0 {
+        format!(", {} hard links", stats.hardlinks)
+    } else {
+        String::new()
+    };
     println!(
-        "Restored: {} files, {} dirs, {} symlinks ({})",
+        "Restored: {} files, {} dirs, {} symlinks{} ({})",
         stats.files,
         stats.dirs,
         stats.symlinks,
+        hardlinks,
         format_bytes(stats.total_bytes),
     );
 

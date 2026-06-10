@@ -22,6 +22,7 @@ fn make_file_item() -> Item {
         link_target: None,
         xattrs: None,
         raw_names: None,
+        hardlink: None,
     }
 }
 
@@ -42,6 +43,7 @@ fn make_dir_item() -> Item {
         link_target: None,
         xattrs: None,
         raw_names: None,
+        hardlink: None,
     }
 }
 
@@ -62,6 +64,7 @@ fn make_symlink_item() -> Item {
         link_target: Some("/usr/bin/target".to_string()),
         xattrs: None,
         raw_names: None,
+        hardlink: None,
     }
 }
 

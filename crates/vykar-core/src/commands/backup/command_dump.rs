@@ -266,6 +266,7 @@ pub(super) fn process_command_dumps(
         link_target: None,
         xattrs: None,
         raw_names: None,
+        hardlink: None,
     };
     append_item_to_stream(
         repo,
@@ -317,6 +318,7 @@ pub(super) fn process_command_dumps(
             link_target: None,
             xattrs: None,
             raw_names: None,
+            hardlink: None,
         };
         append_item_to_stream(
             repo,

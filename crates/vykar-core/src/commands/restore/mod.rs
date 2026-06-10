@@ -75,6 +75,17 @@ pub(super) const MAX_WRITE_BATCH: usize = 1024 * 1024; // 1 MiB
 /// and a malicious snapshot cannot DoS the host before any data is read.
 const RESTORE_BATCH_FILES: usize = 100_000;
 
+/// Upper bound on the combined number of hard-link tracking entries
+/// (`group_reps` + `pending_links`) held during a restore. `group_reps` is
+/// inherently `O(distinct hardlinked inodes)` — a link may reference a
+/// representative seen arbitrarily earlier, so the map must persist for the
+/// whole stream. To keep a huge or malicious snapshot from exhausting memory,
+/// tracking stops once this cap is reached: further hard-linked members are
+/// materialized as independent files (always safe — every node carries its own
+/// chunks), degrading only link-sharing, never correctness. Set to a multiple
+/// of [`RESTORE_BATCH_FILES`].
+pub(super) const MAX_HARDLINK_TRACKED: usize = 4 * RESTORE_BATCH_FILES;
+
 /// Vykar-reserved prefix for the hidden directory restore stages writes into
 /// (`{RESTORE_TEMP_PREFIX}{16 lowercase hex}`). A directory matching this exact
 /// shape is owned by Vykar and is swept by `validate_and_prepare_dest` on the
@@ -96,6 +107,15 @@ pub struct RestoreStats {
     pub files: u64,
     pub dirs: u64,
     pub symlinks: u64,
+    /// True hard links created — extra names on a representative's inode
+    /// (`hard_link(2)` succeeded). Disjoint from `files`: representatives count
+    /// in `files`, their links count here.
+    pub hardlinks: u64,
+    /// Members that *could not* be hard-linked (e.g. `EMLINK`, or a filesystem
+    /// without hard-link support) and were restored as independent copies of
+    /// the representative's content — separate inodes, so they are counted as
+    /// `files`, not `hardlinks`. Tracked separately only for transparency.
+    pub hardlink_copies: u64,
     pub total_bytes: u64,
     pub warnings: Vec<String>,
     pub warnings_suppressed: u64,
@@ -284,6 +304,12 @@ where
     // Ownership is reassigned only under an effective-root restore (tar/restic
     // gate); non-root restores skip chown entirely (behavior unchanged).
     let restore_as_root = fs::is_effective_root();
+    // Hard-link grouping state, owned here and threaded into the streaming
+    // planner: `group_reps` maps each hard-link group to its materialized
+    // representative; `pending_links` queues the non-representative members to
+    // relink after all representatives are on disk (see `create_hardlinks`).
+    let mut group_reps: HashMap<crate::snapshot::item::HardlinkId, plan::RepInfo> = HashMap::new();
+    let mut pending_links: Vec<plan::PendingLink> = Vec::new();
     let mut plan_out = plan::stream_and_plan(
         &items_stream,
         &temp_root,
@@ -291,6 +317,8 @@ where
         xattrs_enabled,
         &mut stats,
         RESTORE_BATCH_FILES,
+        &mut group_reps,
+        &mut pending_links,
         |batch_files, batch_chunks, verified_dirs, stats| -> Result<()> {
             if batch_files.is_empty() {
                 return Ok(());
@@ -380,6 +408,25 @@ where
     // metadata.
     finalize::apply_symlink_metadata(&plan_out.symlinks, restore_as_root, &mut stats);
 
+    // Relink hard-link group members now that every representative is written
+    // and still in `temp_root` — both link operands share the temp filesystem,
+    // so the links survive the move below as ordinary directory entries.
+    // `hard_link` bumps only ctime (not preserved), leaving the representative's
+    // restored mtime untouched.
+    // Like the streaming/write phase above, a failure here is *before*
+    // finalization (nothing has been moved into `dest`), so route it through
+    // `cleanup` to remove the populated staging directory. Copy-fallback
+    // siblings physically write bytes; fold them into the restored byte total.
+    total_bytes += finalize::create_hardlinks(
+        &pending_links,
+        &group_reps,
+        &temp_root,
+        xattrs_enabled,
+        restore_as_root,
+        &mut stats,
+    )
+    .map_err(&cleanup)?;
+
     // Phase 5a: rename temp subtrees into the final destination.  All file
     // metadata is already on the inodes, so the rename has no observable TOCTOU
     // window.  Directories are still at their staging mode (`item.mode | 0o700`,
@@ -416,14 +463,18 @@ where
     }
     finalize::apply_dir_metadata(&mut plan_out.dirs, restore_as_root, &mut stats);
 
-    stats.files = total_files;
+    // Copy-fallback siblings are independent inodes, so they are files, not
+    // hard links. They were never `PlannedFile`s (and so are absent from
+    // `total_files`); fold them into the file count here for an honest total.
+    stats.files = total_files + stats.hardlink_copies;
     stats.total_bytes = total_bytes;
 
     info!(
-        "Restored {} files, {} dirs, {} symlinks ({})",
+        "Restored {} files, {} dirs, {} symlinks, {} hard links ({})",
         format_count(stats.files),
         format_count(stats.dirs),
         format_count(stats.symlinks),
+        format_count(stats.hardlinks),
         format_bytes(stats.total_bytes)
     );
 
@@ -597,6 +648,7 @@ mod tests {
                 link_target: None,
                 xattrs: None,
                 raw_names: raw,
+                hardlink: None,
             }
         }
 

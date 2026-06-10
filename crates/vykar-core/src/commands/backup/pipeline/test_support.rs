@@ -21,6 +21,7 @@ pub(super) fn test_item(path: &str) -> Item {
         link_target: None,
         xattrs: None,
         raw_names: None,
+        hardlink: None,
     }
 }
 
@@ -33,6 +34,7 @@ pub(super) fn test_metadata() -> fs::MetadataSummary {
         ctime_ns: 0,
         device: 0,
         inode: 0,
+        nlink: 1,
         size: 1024,
         is_dataless: false,
     }

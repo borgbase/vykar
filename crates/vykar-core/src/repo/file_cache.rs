@@ -1798,6 +1798,7 @@ mod tests {
                 link_target: None,
                 xattrs: None,
                 raw_names: None,
+                hardlink: None,
             },
             Item {
                 path: "dir".into(),
@@ -1815,6 +1816,7 @@ mod tests {
                 link_target: None,
                 xattrs: None,
                 raw_names: None,
+                hardlink: None,
             },
         ];
 
@@ -1857,6 +1859,7 @@ mod tests {
                 path: Some(raw),
                 link_target: None,
             }),
+            hardlink: None,
         };
         // A normal sibling so the index is non-empty and the builder is valid.
         let sibling = Item {
@@ -1875,6 +1878,7 @@ mod tests {
             link_target: None,
             xattrs: None,
             raw_names: None,
+            hardlink: None,
         };
         let idx = build_parent_index(vec![item, sibling], &["/src".into()], false).unwrap();
         // The raw item must be absent (its lossy display path is not indexed).
@@ -1903,6 +1907,7 @@ mod tests {
             link_target: None,
             xattrs: None,
             raw_names: None,
+            hardlink: None,
         }];
 
         let result = build_parent_index(items, &["/src".into()], false);
@@ -1928,6 +1933,7 @@ mod tests {
                 link_target: None,
                 xattrs: None,
                 raw_names: None,
+                hardlink: None,
             },
             Item {
                 path: "real.txt".into(),
@@ -1945,6 +1951,7 @@ mod tests {
                 link_target: None,
                 xattrs: None,
                 raw_names: None,
+                hardlink: None,
             },
         ];
 
@@ -1977,6 +1984,7 @@ mod tests {
             link_target: None,
             xattrs: None,
             raw_names: None,
+            hardlink: None,
         }];
 
         let idx = build_parent_index(items, &["/src".into()], false).unwrap();
@@ -2023,6 +2031,7 @@ mod tests {
             link_target: None,
             xattrs: None,
             raw_names: None,
+            hardlink: None,
         }];
 
         let idx = build_parent_index(items, &["/src".into()], false).unwrap();
@@ -2052,6 +2061,7 @@ mod tests {
             link_target: None,
             xattrs: None,
             raw_names: None,
+            hardlink: None,
         }];
 
         let idx =
@@ -2235,6 +2245,7 @@ mod tests {
             link_target: None,
             xattrs: None,
             raw_names: None,
+            hardlink: None,
         }];
         let idx = build_parent_index(items, &["/src".into()], false).unwrap();
         let hit = idx.lookup(&native_join("/src", "a.txt"), 4096, 1000, 2000);

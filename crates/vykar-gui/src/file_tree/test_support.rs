@@ -19,6 +19,7 @@ pub(super) fn dir(path: &str) -> Item {
         link_target: None,
         xattrs: None,
         raw_names: None,
+        hardlink: None,
     }
 }
 
@@ -39,6 +40,7 @@ pub(super) fn file(path: &str, size: u64) -> Item {
         link_target: None,
         xattrs: None,
         raw_names: None,
+        hardlink: None,
     }
 }
 

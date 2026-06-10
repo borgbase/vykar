@@ -1116,7 +1116,11 @@ mod tests {
                 assert_eq!(item.path, display);
                 assert_eq!(item.path_bytes(), raw_name);
                 assert!(item.has_raw_path());
-                item.validate().unwrap();
+                // Note: no `item.validate()` here — a freshly materialized
+                // regular file carries no chunks yet (chunking is a later
+                // pipeline stage), so the size-vs-chunk-sum check cannot pass.
+                // Raw-path validation is covered by item.rs's
+                // `validate_rejects_raw_path_lossy_mismatch`.
             }
             other => panic!("expected Entry, got {other:?}"),
         }

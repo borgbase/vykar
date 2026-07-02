@@ -2,6 +2,7 @@
 #![allow(unsafe_code)]
 
 mod http;
+mod poll;
 mod render;
 mod status;
 
@@ -18,7 +19,12 @@ use crate::dispatch::{local_repo_unavailable, run_default_actions, warn_if_untru
 use crate::error::{CliError, CliResult};
 use crate::signal::{RELOAD, SHUTDOWN, TRIGGER};
 
+use poll::StatusPoller;
 use status::SharedStatus;
+
+/// How often the daemon runs the cheap snapshot-set change detection poll
+/// between backup cycles (GitHub #159).
+const STATUS_POLL_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Ask the system allocator to return freed memory to the OS.
 ///
@@ -141,6 +147,13 @@ pub(crate) fn run_daemon(source: ConfigSource, http_listen: Option<SocketAddr>) 
 
     status::touch_process(&status, started_at, Some(next_run));
 
+    // Cheap out-of-band change detection between cycles (GitHub #159). Seed the
+    // baseline from current storage so the first poll only fires a refresh on a
+    // genuine change.
+    let mut poller = StatusPoller::new();
+    poller.reset(&repos);
+    let mut next_poll = Instant::now() + STATUS_POLL_INTERVAL;
+
     let exit_result: CliResult<()> = loop {
         if SHUTDOWN.load(Ordering::SeqCst) {
             tracing::info!("shutdown signal received, exiting");
@@ -162,6 +175,8 @@ pub(crate) fn run_daemon(source: ConfigSource, http_listen: Option<SocketAddr>) 
                     schedule = new_schedule;
                     status::init(&status, &repos, &schedule, started_at);
                     status::refresh_repos(&status, &repos);
+                    poller.reset(&repos);
+                    next_poll = Instant::now() + STATUS_POLL_INTERVAL;
 
                     for repo in &repos {
                         let name = repo.label.as_deref().unwrap_or(&repo.config.repository.url);
@@ -202,6 +217,10 @@ pub(crate) fn run_daemon(source: ConfigSource, http_listen: Option<SocketAddr>) 
                 break Ok(());
             }
 
+            // The cycle already ran refresh_repos; re-baseline the poller.
+            poller.reset(&repos);
+            next_poll = Instant::now() + STATUS_POLL_INTERVAL;
+
             // If the scheduled slot was missed during the ad-hoc cycle, recalculate
             // next_run from now. Otherwise leave next_run untouched — the scheduled
             // cadence is preserved.
@@ -230,6 +249,18 @@ pub(crate) fn run_daemon(source: ConfigSource, http_listen: Option<SocketAddr>) 
             };
             next_run = SystemTime::now() + delay;
             log_next_run(delay);
+
+            // The cycle already ran refresh_repos; re-baseline the poller.
+            poller.reset(&repos);
+            next_poll = Instant::now() + STATUS_POLL_INTERVAL;
+        }
+
+        // Between cycles, cheaply detect out-of-band snapshot changes (CLI
+        // delete/prune, backups from other hosts) and run the full status
+        // refresh only when the snapshot set actually changed (GitHub #159).
+        if Instant::now() >= next_poll {
+            poller.poll_and_refresh(&status, &repos);
+            next_poll = Instant::now() + STATUS_POLL_INTERVAL;
         }
 
         status::touch_process(&status, started_at, Some(next_run));

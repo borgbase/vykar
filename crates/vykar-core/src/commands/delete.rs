@@ -161,6 +161,11 @@ pub fn run(
                 );
             }
 
+            // Keep the local snapshot cache consistent with the mutated
+            // manifest (best-effort). Snapshot removal from storage is already
+            // committed, so this only affects local listing freshness.
+            repo.persist_snapshot_cache_from_manifest();
+
             Ok(DeleteResult {
                 stats: all_stats,
                 warnings,

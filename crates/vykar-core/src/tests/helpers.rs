@@ -122,6 +122,30 @@ pub fn open_local_repo(repo_dir: &Path) -> Repository {
     .unwrap()
 }
 
+/// Load the on-disk `SnapshotListCache` for an unencrypted local repo without
+/// going through `Repository::open` (which would heal the cache against the
+/// remote `snapshots/` listing). Lets tests observe what delete/prune persisted
+/// to the cache before any reopen.
+pub fn load_snapshot_cache_from_disk(
+    repo_dir: &Path,
+) -> crate::repo::snapshot_cache::SnapshotListCache {
+    use blake2::digest::{Update, VariableOutput};
+    use blake2::Blake2bVar;
+
+    init_test_environment();
+    let config_data = std::fs::read(repo_dir.join("config")).unwrap();
+    let repo_config: crate::repo::RepoConfig = rmp_serde::from_slice(&config_data).unwrap();
+
+    // Unencrypted repo: chunk_id_key = BLAKE2b(repo_id) (see open.rs).
+    let mut key = [0u8; 32];
+    let mut hasher = Blake2bVar::new(32).unwrap();
+    hasher.update(&repo_config.id);
+    hasher.finalize_variable(&mut key).unwrap();
+    let crypto = vykar_crypto::PlaintextEngine::new(&key);
+
+    crate::repo::snapshot_cache::SnapshotListCache::load(&repo_config.id, &crypto, None)
+}
+
 pub fn backup_single_source(
     config: &VykarConfig,
     source_dir: &Path,

@@ -5,7 +5,8 @@ use crate::config::RetentionConfig;
 use vykar_types::error::VykarError;
 
 use super::helpers::{
-    backup_single_source, init_repo, make_test_config, open_local_repo, source_entry,
+    backup_single_source, init_repo, load_snapshot_cache_from_disk, make_test_config,
+    open_local_repo, source_entry,
 };
 
 #[test]
@@ -153,6 +154,43 @@ fn prune_groups_by_label_even_without_configured_sources() {
         .collect();
     assert!(names.contains(&"snap-a"));
     assert!(names.contains(&"snap-b"));
+}
+
+#[test]
+fn prune_persists_snapshot_cache_immediately() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = tmp.path().join("repo");
+    let source_dir = tmp.path().join("source");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    std::fs::create_dir_all(&source_dir).unwrap();
+    std::fs::write(source_dir.join("f.txt"), b"prune-cache").unwrap();
+
+    let mut config = init_repo(&repo_dir);
+    config.retention = RetentionConfig {
+        keep_last: Some(1),
+        ..RetentionConfig::default()
+    };
+
+    backup_single_source(&config, &source_dir, "src-a", "snap-old");
+    std::thread::sleep(Duration::from_millis(2));
+    backup_single_source(&config, &source_dir, "src-a", "snap-new");
+
+    // Heal the cache so it reflects both snapshots before the prune.
+    drop(open_local_repo(&repo_dir));
+    let before = load_snapshot_cache_from_disk(&repo_dir);
+    assert!(before.entries.values().any(|e| e.name == "snap-old"));
+
+    let (stats, _) = commands::prune::run(&config, None, false, false, &[], &[], None).unwrap();
+    assert_eq!(stats.pruned, 1);
+    assert_eq!(stats.kept, 1);
+
+    // The on-disk cache drops the pruned snapshot immediately, without a reopen.
+    let after = load_snapshot_cache_from_disk(&repo_dir);
+    assert!(
+        !after.entries.values().any(|e| e.name == "snap-old"),
+        "pruned snapshot still present in on-disk cache"
+    );
+    assert!(after.entries.values().any(|e| e.name == "snap-new"));
 }
 
 /// Without any configured sources, prune still needs a retention rule to do

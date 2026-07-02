@@ -641,6 +641,31 @@ impl Repository {
         }
     }
 
+    /// Persist the local snapshot list cache from the current in-memory
+    /// manifest.
+    ///
+    /// Delete/prune mutate `manifest.snapshots` in memory but do not touch the
+    /// persisted `snapshot_list` cache; without this the cache only self-heals
+    /// on the next `open()` via the remote-list retain. Calling this after a
+    /// mutation keeps the local cache consistent immediately.
+    ///
+    /// Best-effort: failures are warned and swallowed, matching
+    /// `refresh_snapshot_cache`'s save behavior — a stale cache is corrected on
+    /// the next open and never affects correctness.
+    pub fn persist_snapshot_cache_from_manifest(&self) {
+        let mut cache = snapshot_cache::SnapshotListCache::default();
+        for entry in &self.manifest.snapshots {
+            cache.entries.insert(entry.id.to_hex(), entry.clone());
+        }
+        if let Err(e) = cache.save(
+            &self.config.id,
+            self.crypto.as_ref(),
+            self.cache_dir_override.as_deref(),
+        ) {
+            warn!("failed to persist snapshot list cache after mutation: {e}");
+        }
+    }
+
     /// Re-list snapshots/ and rebuild the in-memory manifest.
     /// Used by concurrent session commit to get a fresh snapshot list.
     pub fn refresh_snapshot_list(&mut self) -> Result<()> {

@@ -1,7 +1,9 @@
 use crate::commands;
 use vykar_types::error::VykarError;
 
-use super::helpers::{backup_single_source, init_repo, open_local_repo};
+use super::helpers::{
+    backup_single_source, init_repo, load_snapshot_cache_from_disk, open_local_repo,
+};
 
 #[test]
 fn delete_missing_snapshot_returns_snapshot_not_found() {
@@ -75,6 +77,35 @@ fn delete_snapshot_removes_manifest_entry_and_chunk_refs() {
     let after = open_local_repo(&repo_dir);
     assert!(after.manifest().find_snapshot("snap-delete-live").is_none());
     assert_eq!(after.chunk_index().len(), 0);
+}
+
+#[test]
+fn delete_persists_snapshot_cache_immediately() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = tmp.path().join("repo");
+    let source_dir = tmp.path().join("source");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    std::fs::create_dir_all(&source_dir).unwrap();
+    std::fs::write(source_dir.join("file.txt"), b"delete-cache-data").unwrap();
+
+    let config = init_repo(&repo_dir);
+    backup_single_source(&config, &source_dir, "src-a", "snap-cache-del");
+
+    // Opening once heals the local cache from the remote listing, so it now
+    // contains the snapshot. This is the state a stale cache would keep.
+    drop(open_local_repo(&repo_dir));
+    let before = load_snapshot_cache_from_disk(&repo_dir);
+    assert!(before.entries.values().any(|e| e.name == "snap-cache-del"));
+
+    commands::delete::run(&config, None, &["snap-cache-del"], false, None).unwrap();
+
+    // The on-disk cache reflects the deletion immediately — without a reopen
+    // that would run refresh_snapshot_cache's remote-list retain.
+    let after = load_snapshot_cache_from_disk(&repo_dir);
+    assert!(
+        !after.entries.values().any(|e| e.name == "snap-cache-del"),
+        "deleted snapshot still present in on-disk cache"
+    );
 }
 
 #[test]

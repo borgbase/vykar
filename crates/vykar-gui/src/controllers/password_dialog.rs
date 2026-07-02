@@ -10,9 +10,14 @@ thread_local! {
 }
 
 /// Drop the stored dialog handle, releasing the component and its LineEdit state.
+///
+/// Deferred to the event loop so the component is not dropped while one of its
+/// own callbacks is still executing.
 fn drop_handle() {
-    DIALOG_HANDLE.with(|cell| {
-        cell.borrow_mut().take();
+    let _ = slint::invoke_from_event_loop(|| {
+        DIALOG_HANDLE.with(|cell| {
+            cell.borrow_mut().take();
+        });
     });
 }
 
@@ -30,19 +35,26 @@ pub(crate) fn show_password_dialog(title: &str, message: &str) -> Option<String>
         dialog.set_dialog_title(title.into());
         dialog.set_dialog_message(message.into());
 
-        let d = dialog.clone_strong();
+        // Callbacks must capture the dialog weakly: a strong handle stored in a
+        // closure owned by the component itself is a reference cycle that keeps
+        // the native window alive forever (#155).
+        let weak = dialog.as_weak();
         let tx_submit = tx.clone();
         dialog.on_submitted(move |value| {
             let _ = tx_submit.send(Some(value.to_string()));
-            let _ = d.hide();
+            if let Some(d) = weak.upgrade() {
+                let _ = d.hide();
+            }
             drop_handle();
         });
 
-        let d = dialog.clone_strong();
+        let weak = dialog.as_weak();
         let tx_cancel = tx.clone();
         dialog.on_cancelled(move || {
             let _ = tx_cancel.send(None);
-            let _ = d.hide();
+            if let Some(d) = weak.upgrade() {
+                let _ = d.hide();
+            }
             drop_handle();
         });
 

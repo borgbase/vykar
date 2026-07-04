@@ -90,23 +90,26 @@ macro_rules! impl_aead_engine {
 
         impl $crate::CryptoEngine for $engine {
             fn encrypt(&self, plaintext: &[u8], aad: &[u8]) -> vykar_types::error::Result<Vec<u8>> {
-                use rand::RngCore;
+                use rand::Rng;
                 use $crate_path::aead::Aead;
                 let mut rng = rand::rng();
                 let mut nonce_bytes = [0u8; 12];
                 rng.fill_bytes(&mut nonce_bytes);
-                let nonce = $crate_path::Nonce::from_slice(&nonce_bytes);
 
                 let payload = $crate_path::aead::Payload {
                     msg: plaintext,
                     aad,
                 };
-                let ciphertext = self.cipher.encrypt(nonce, payload).map_err(|e| {
-                    vykar_types::error::VykarError::Other(format!(
-                        concat!($label, " encrypt: {}"),
-                        e
-                    ))
-                })?;
+                // aead 0.6: &[u8; 12] -> &Nonce via infallible hybrid-array conversion.
+                let ciphertext = self
+                    .cipher
+                    .encrypt((&nonce_bytes).into(), payload)
+                    .map_err(|e| {
+                        vykar_types::error::VykarError::Other(format!(
+                            concat!($label, " encrypt: {}"),
+                            e
+                        ))
+                    })?;
 
                 // Wire format: [12-byte nonce][ciphertext with appended 16-byte tag]
                 let mut out = Vec::with_capacity(12 + ciphertext.len());
@@ -121,14 +124,16 @@ macro_rules! impl_aead_engine {
                     return Err(vykar_types::error::VykarError::DecryptionFailed);
                 }
                 let (nonce_bytes, ciphertext) = data.split_at(12);
-                let nonce = $crate_path::Nonce::from_slice(nonce_bytes);
+                let nonce_bytes: &[u8; 12] = nonce_bytes
+                    .try_into()
+                    .map_err(|_| vykar_types::error::VykarError::DecryptionFailed)?;
 
                 let payload = $crate_path::aead::Payload {
                     msg: ciphertext,
                     aad,
                 };
                 self.cipher
-                    .decrypt(nonce, payload)
+                    .decrypt(nonce_bytes.into(), payload)
                     .map_err(|_| vykar_types::error::VykarError::DecryptionFailed)
             }
 
@@ -138,18 +143,29 @@ macro_rules! impl_aead_engine {
                 aad: &[u8],
                 output: &mut Vec<u8>,
             ) -> vykar_types::error::Result<()> {
-                use $crate_path::aead::AeadInPlace;
+                use $crate_path::aead::AeadInOut;
                 if data.len() < 12 + 16 {
                     return Err(vykar_types::error::VykarError::DecryptionFailed);
                 }
                 let (nonce_bytes, ct_and_tag) = data.split_at(12);
-                let nonce = $crate_path::Nonce::from_slice(nonce_bytes);
+                let nonce_bytes: &[u8; 12] = nonce_bytes
+                    .try_into()
+                    .map_err(|_| vykar_types::error::VykarError::DecryptionFailed)?;
                 let (ciphertext, tag_bytes) = ct_and_tag.split_at(ct_and_tag.len() - 16);
-                let tag = $crate_path::Tag::from_slice(tag_bytes);
+                let tag_bytes: &[u8; 16] = tag_bytes
+                    .try_into()
+                    .map_err(|_| vykar_types::error::VykarError::DecryptionFailed)?;
+                // aead 0.6: in-place detached decrypt via InOutBuf. ciphertext and
+                // plaintext are equal length, so `output` already has the right size.
                 output.clear();
                 output.extend_from_slice(ciphertext); // reuses existing capacity
                 self.cipher
-                    .decrypt_in_place_detached(nonce, aad, output, tag)
+                    .decrypt_inout_detached(
+                        nonce_bytes.into(),
+                        aad,
+                        output.as_mut_slice().into(),
+                        tag_bytes.into(),
+                    )
                     .map_err(|_| vykar_types::error::VykarError::DecryptionFailed)?;
                 Ok(())
             }
@@ -159,16 +175,15 @@ macro_rules! impl_aead_engine {
                 buffer: &mut [u8],
                 aad: &[u8],
             ) -> vykar_types::error::Result<([u8; 12], [u8; 16])> {
-                use rand::RngCore;
-                use $crate_path::aead::AeadInPlace;
+                use rand::Rng;
+                use $crate_path::aead::AeadInOut;
                 let mut rng = rand::rng();
                 let mut nonce_bytes = [0u8; 12];
                 rng.fill_bytes(&mut nonce_bytes);
-                let nonce = $crate_path::Nonce::from_slice(&nonce_bytes);
 
                 let tag = self
                     .cipher
-                    .encrypt_in_place_detached(nonce, aad, buffer)
+                    .encrypt_inout_detached((&nonce_bytes).into(), aad, buffer.into())
                     .map_err(|e| {
                         vykar_types::error::VykarError::Other(format!(
                             concat!($label, " encrypt_in_place: {}"),

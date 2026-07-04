@@ -10,7 +10,7 @@
 use std::borrow::Cow;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use rand::RngCore;
+use rand::Rng;
 
 use crate::commands;
 use crate::compress::Compression;

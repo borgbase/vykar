@@ -12,8 +12,8 @@ workspace = true
 vykar-types.workspace = true
 
 # Crypto
-aes-gcm = "0.10"
-chacha20poly1305 = "0.10"
+aes-gcm = "0.11"
+chacha20poly1305 = "0.11"
 argon2 = "0.5"
 blake2.workspace = true
 rand.workspace = true

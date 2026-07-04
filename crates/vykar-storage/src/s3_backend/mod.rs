@@ -328,7 +328,13 @@ impl StorageBackend for S3Backend {
                             .as_reader()
                             .read_to_end(&mut body)
                             .map_err(HttpRetryError::BodyIo)?;
-                        ListObjectsV2::parse_response(&body).map_err(|e| {
+                        // rusty-s3 0.10 (instant-xml) parses from &str.
+                        let body = std::str::from_utf8(&body).map_err(|e| {
+                            HttpRetryError::Permanent(format!(
+                                "S3 LIST {prefix}: response was not valid UTF-8: {e}"
+                            ))
+                        })?;
+                        ListObjectsV2::parse_response(body).map_err(|e| {
                             HttpRetryError::Permanent(format!(
                                 "S3 LIST {prefix}: failed to parse response: {e}"
                             ))

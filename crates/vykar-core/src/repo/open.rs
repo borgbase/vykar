@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use chrono::Utc;
-use rand::RngCore;
+use rand::Rng;
 
 use super::file_cache::FileCache;
 use super::format::{pack_object_streaming_with_context, ObjectType};

@@ -1,5 +1,5 @@
 use chrono::Utc;
-use rand::RngCore;
+use rand::Rng;
 use tracing::{debug, warn};
 
 use super::file_cache;

@@ -17,7 +17,7 @@ rmp-serde = "1"
 rmp = "0.8"
 serde = { version = "1", features = ["derive"] }
 chrono = { version = "0.4", features = ["serde"] }
-aes-gcm = "0.10"
+aes-gcm = "0.11"
 
 vykar-core = { path = "../crates/vykar-core", default-features = false }
 vykar-crypto = { path = "../crates/vykar-crypto" }

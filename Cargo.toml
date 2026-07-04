@@ -34,7 +34,7 @@ thiserror = "2"
 
 # Crypto
 blake2 = "0.10"
-rand = "0.9"
+rand = "0.10"
 zeroize = { version = "1", features = ["derive"] }
 hex = "0.4"
 

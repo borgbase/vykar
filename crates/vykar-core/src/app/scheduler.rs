@@ -4,7 +4,7 @@
 use std::fs::File;
 use std::time::Duration;
 
-use rand::Rng;
+use rand::RngExt;
 
 use crate::config::ScheduleConfig;
 use vykar_types::error::{Result, VykarError};

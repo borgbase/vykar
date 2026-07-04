@@ -279,7 +279,7 @@ where
     let temp_dir_name = format!(
         "{}{:016x}",
         RESTORE_TEMP_PREFIX,
-        rand::Rng::random::<u64>(&mut rand::rng())
+        rand::RngExt::random::<u64>(&mut rand::rng())
     );
     let temp_root = dest_root.join(&temp_dir_name);
     std::fs::create_dir_all(&temp_root)?;

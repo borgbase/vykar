@@ -12,7 +12,7 @@ use std::fs;
 use std::path::Path;
 
 use aes_gcm::aead::{Aead, KeyInit};
-use aes_gcm::{Aes256Gcm, Nonce};
+use aes_gcm::Aes256Gcm;
 use vykar_core::compress::{compress, Compression};
 use vykar_core::index::IndexBlob;
 use vykar_core::repo::file_cache::FileCache;
@@ -269,13 +269,12 @@ const OBJECT_CONTEXT_AAD_PREFIX: &[u8] = b"vger:object-context:v1\0";
 fn pack_object_deterministic(obj_type: ObjectType, plaintext: &[u8], aad: &[u8]) -> Vec<u8> {
     let cipher = Aes256Gcm::new_from_slice(&ENC_KEY).unwrap();
     let nonce_bytes = [0u8; 12]; // fixed nonce for determinism
-    let nonce = Nonce::from_slice(&nonce_bytes);
 
     let payload = aes_gcm::aead::Payload {
         msg: plaintext,
         aad,
     };
-    let ciphertext = cipher.encrypt(nonce, payload).unwrap();
+    let ciphertext = cipher.encrypt((&nonce_bytes).into(), payload).unwrap();
 
     let tag = obj_type as u8;
     let mut out = Vec::with_capacity(1 + 12 + ciphertext.len());

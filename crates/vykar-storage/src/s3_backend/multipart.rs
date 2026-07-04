@@ -708,12 +708,15 @@ mod tests {
         )
     }
 
-    /// 2xx `InitiateMultipartUploadResult` carrying `upload_id`.
+    /// 2xx `InitiateMultipartUploadResult` carrying `upload_id`. The
+    /// `xmlns` namespace matches real S3 output; rusty-s3 0.10's instant-xml
+    /// parser enforces it (quick-xml, used through 0.9, ignored namespaces).
     fn mp_create_ok(upload_id: &str) -> MpReply {
         MpReply::Full(mp_http_xml(
             "200 OK",
             &format!(
-                "<?xml version=\"1.0\"?><InitiateMultipartUploadResult>\
+                "<?xml version=\"1.0\"?>\
+                 <InitiateMultipartUploadResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
                  <Bucket>test-bucket</Bucket><Key>k</Key>\
                  <UploadId>{upload_id}</UploadId></InitiateMultipartUploadResult>"
             ),
@@ -876,9 +879,16 @@ mod tests {
                 && !req_line(&cap, 3).contains("uploads=1")
         );
         // Completion XML carries the ETags in part order, quotes preserved.
+        // rusty-s3 0.10 (instant-xml) XML-escapes the ETag's quotes to `&quot;`
+        // (equally valid; S3 decodes it). quick-xml, used through 0.9, emitted
+        // raw `"`.
         let body = String::from_utf8_lossy(&cap[3].1);
-        let p1 = body.find("\"etag-1\"").expect("etag-1 in completion body");
-        let p2 = body.find("\"etag-2\"").expect("etag-2 in completion body");
+        let p1 = body
+            .find("&quot;etag-1&quot;")
+            .expect("etag-1 in completion body");
+        let p2 = body
+            .find("&quot;etag-2&quot;")
+            .expect("etag-2 in completion body");
         assert!(p1 < p2, "ETags must be in part order: {body}");
         assert!(body.contains("<PartNumber>1</PartNumber>"));
         assert!(body.contains("<PartNumber>2</PartNumber>"));

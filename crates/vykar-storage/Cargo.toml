@@ -23,7 +23,7 @@ hex.workspace = true
 rand.workspace = true
 
 # Content-MD5 for S3 Object Lock compatibility
-md-5 = "0.10"
+md-5 = "0.11"
 base64 = "0.22"
 
 # URL parsing
@@ -31,13 +31,14 @@ url = "2"
 percent-encoding = "2"
 
 # HTTP client (S3 + REST backends)
-rusty-s3 = "0.9.1"
+rusty-s3 = "0.10.0"
 ureq = { workspace = true, features = ["json"] }
 http = "1"
 
-# Parse S3 multipart completion responses (already in the tree via rusty-s3;
-# pin the same minor to avoid a duplicate copy).
-quick-xml = { version = "0.39", features = ["serialize"] }
+# Parse S3 multipart completion responses. Standalone direct dep: rusty-s3 0.10
+# moved to instant-xml and no longer pulls quick-xml, so there is no duplicate
+# copy to match.
+quick-xml = { version = "0.41", features = ["serialize"] }
 
 # Logging
 tracing.workspace = true
@@ -49,8 +50,8 @@ tempfile.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread"], optional = true }
 
 # SSH/SFTP
-russh = { version = "0.60.3", default-features = false, features = ["aws-lc-rs"], optional = true }
-russh-sftp = { version = "2.1.2", optional = true }
+russh = { version = "0.62.1", default-features = false, features = ["aws-lc-rs"], optional = true }
+russh-sftp = { version = "2.3.0", optional = true }
 
 [features]
 default = []

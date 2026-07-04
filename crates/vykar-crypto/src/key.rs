@@ -1,7 +1,7 @@
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
 use argon2::Argon2;
-use rand::TryRngCore;
+use rand::TryRng;
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
@@ -77,10 +77,10 @@ impl MasterKey {
     pub fn generate() -> Result<Self> {
         let mut encryption_key = [0u8; 32];
         let mut chunk_id_key = [0u8; 32];
-        rand::rngs::OsRng
+        rand::rngs::SysRng
             .try_fill_bytes(&mut encryption_key)
             .map_err(|e| VykarError::KeyDerivation(format!("OS entropy unavailable: {e}")))?;
-        rand::rngs::OsRng
+        rand::rngs::SysRng
             .try_fill_bytes(&mut chunk_id_key)
             .map_err(|e| VykarError::KeyDerivation(format!("OS entropy unavailable: {e}")))?;
         Ok(Self {
@@ -100,7 +100,7 @@ impl MasterKey {
 
         // Generate salt using OS entropy
         let mut salt = vec![0u8; 32];
-        rand::rngs::OsRng
+        rand::rngs::SysRng
             .try_fill_bytes(&mut salt)
             .map_err(|e| VykarError::KeyDerivation(format!("OS entropy unavailable: {e}")))?;
 
@@ -127,13 +127,12 @@ impl MasterKey {
         let cipher = Aes256Gcm::new_from_slice(wrapping_key.as_ref())
             .map_err(|e| VykarError::KeyDerivation(format!("cipher init: {e}")))?;
         let mut nonce_bytes = [0u8; 12];
-        rand::rngs::OsRng
+        rand::rngs::SysRng
             .try_fill_bytes(&mut nonce_bytes)
             .map_err(|e| VykarError::KeyDerivation(format!("OS entropy unavailable: {e}")))?;
-        let nonce = Nonce::from_slice(&nonce_bytes);
         let ciphertext = cipher
             .encrypt(
-                nonce,
+                (&nonce_bytes).into(),
                 Payload {
                     msg: plaintext.as_ref(),
                     aad: &kdf_aad,
@@ -162,7 +161,7 @@ impl MasterKey {
     pub fn from_encrypted<P: AsRef<[u8]>>(encrypted: &EncryptedKey, passphrase: P) -> Result<Self> {
         let passphrase = passphrase.as_ref();
 
-        // Validate nonce length to avoid panic in Nonce::from_slice
+        // Validate nonce length before the fixed-size conversion below.
         if encrypted.nonce.len() != 12 {
             return Err(VykarError::DecryptionFailed);
         }
@@ -174,7 +173,13 @@ impl MasterKey {
 
         let cipher = Aes256Gcm::new_from_slice(wrapping_key.as_ref())
             .map_err(|_| VykarError::DecryptionFailed)?;
-        let nonce = Nonce::from_slice(&encrypted.nonce);
+        // Length validated above; &[u8; 12] -> &Nonce via infallible conversion.
+        let nonce_bytes: &[u8; 12] = encrypted
+            .nonce
+            .as_slice()
+            .try_into()
+            .map_err(|_| VykarError::DecryptionFailed)?;
+        let nonce: &Nonce<aes_gcm::aead::consts::U12> = nonce_bytes.into();
 
         // Try v1 AAD first, then legacy msgpack AAD, then no AAD
         let plaintext = try_decrypt_with_v1_aad(&cipher, nonce, encrypted)
@@ -305,13 +310,13 @@ fn derive_key_from_passphrase(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::RngCore;
+    use rand::Rng;
 
     const TEST_PASSPHRASE: &str = "test-passphrase-123";
 
     fn make_test_kdf() -> KdfParams {
         let mut salt = vec![0u8; 32];
-        rand::rngs::OsRng
+        rand::rngs::SysRng
             .try_fill_bytes(&mut salt)
             .expect("OS entropy source unavailable");
         KdfParams {
@@ -435,10 +440,9 @@ mod tests {
         let cipher = Aes256Gcm::new_from_slice(wrapping_key.as_ref()).unwrap();
         let mut nonce_bytes = [0u8; 12];
         rand::rng().fill_bytes(&mut nonce_bytes);
-        let nonce = Nonce::from_slice(&nonce_bytes);
         let ciphertext = cipher
             .encrypt(
-                nonce,
+                (&nonce_bytes).into(),
                 Payload {
                     msg: plaintext.as_ref(),
                     aad: &legacy_aad,
@@ -525,9 +529,10 @@ mod tests {
         let cipher = Aes256Gcm::new_from_slice(wrapping_key.as_ref()).unwrap();
         let mut nonce_bytes = [0u8; 12];
         rand::rng().fill_bytes(&mut nonce_bytes);
-        let nonce = Nonce::from_slice(&nonce_bytes);
         // Encrypt with no AAD
-        let ciphertext = cipher.encrypt(nonce, plaintext.as_ref()).unwrap();
+        let ciphertext = cipher
+            .encrypt((&nonce_bytes).into(), plaintext.as_ref())
+            .unwrap();
 
         let encrypted = EncryptedKey {
             kdf,

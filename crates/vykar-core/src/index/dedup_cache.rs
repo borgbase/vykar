@@ -12,6 +12,8 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use blake2::digest::{Update, VariableOutput};
+use blake2::Blake2bVar;
 use memmap2::Mmap;
 use tracing::{debug, warn};
 use xorf::{Filter, Xor8};
@@ -640,7 +642,12 @@ impl MmapRestoreCache {
 const FULL_MAGIC: &[u8; 8] = b"VGFULL\0\0";
 
 /// Current full index cache format version.
-const FULL_VERSION: u32 = 1;
+///
+/// Version 2 appends a 32-byte BLAKE2b-256 checksum trailer over the entry
+/// region. Version 1 caches (no trailer) are rejected by the version check,
+/// so callers fall through to the slow path and rebuild — self-healing, no
+/// migration code.
+const FULL_VERSION: u32 = 2;
 
 /// Size of the full index cache header in bytes.
 const FULL_HEADER_SIZE: usize = 28;
@@ -648,6 +655,11 @@ const FULL_HEADER_SIZE: usize = 28;
 /// Size of each full index cache entry:
 /// ChunkId(32) + refcount(4) + stored_size(4) + PackId(32) + pack_offset(8) = 80.
 const FULL_ENTRY_SIZE: usize = 80;
+
+/// Size of the BLAKE2b-256 content-checksum trailer appended after the last
+/// entry, verified in `open_path` to detect silent corruption of the plaintext
+/// cache before it is promoted to the authoritative remote index.
+const FULL_CHECKSUM_SIZE: usize = 32;
 
 /// Return the local filesystem path for the full index cache file.
 pub fn full_index_cache_path(repo_id: &[u8], cache_dir: Option<&Path>) -> Option<PathBuf> {
@@ -726,13 +738,30 @@ impl MmapFullIndexCache {
 
         let entry_count = read_u32_le(mmap[20..24].try_into().expect("4-byte slice from header"));
 
-        let expected_size = FULL_HEADER_SIZE + (entry_count as usize) * FULL_ENTRY_SIZE;
+        let expected_size =
+            FULL_HEADER_SIZE + (entry_count as usize) * FULL_ENTRY_SIZE + FULL_CHECKSUM_SIZE;
         if mmap.len() != expected_size {
             debug!(
                 actual = mmap.len(),
                 expected = expected_size,
                 "full index cache: file size mismatch"
             );
+            return None;
+        }
+
+        // Verify the content checksum over the entry region. This is the
+        // integrity gate that lets the fast-path commit promote these
+        // plaintext local bytes to the authoritative remote index: a bit flip
+        // anywhere in the entries changes the digest and misses here.
+        let entries_end = mmap.len() - FULL_CHECKSUM_SIZE;
+        let mut hasher = Blake2bVar::new(FULL_CHECKSUM_SIZE).expect("valid output size");
+        Update::update(&mut hasher, &mmap[FULL_HEADER_SIZE..entries_end]);
+        let mut computed = [0u8; FULL_CHECKSUM_SIZE];
+        hasher
+            .finalize_variable(&mut computed)
+            .expect("correct length");
+        if computed != mmap[entries_end..] {
+            debug!("full index cache: checksum mismatch");
             return None;
         }
 
@@ -794,13 +823,37 @@ impl MmapFullIndexCache {
     }
 }
 
-/// Write a single full cache entry to a writer.
-fn write_full_entry(w: &mut BufWriter<std::fs::File>, entry: &FullCacheEntry) -> Result<()> {
-    w.write_all(entry.chunk_id.as_bytes())?;
-    w.write_all(&entry.refcount.to_le_bytes())?;
-    w.write_all(&entry.stored_size.to_le_bytes())?;
-    w.write_all(entry.pack_id.as_bytes())?;
-    w.write_all(&entry.pack_offset.to_le_bytes())?;
+/// Encode a single full cache entry into its 80-byte on-disk representation.
+fn encode_full_entry(entry: &FullCacheEntry) -> [u8; FULL_ENTRY_SIZE] {
+    let mut buf = [0u8; FULL_ENTRY_SIZE];
+    buf[0..32].copy_from_slice(entry.chunk_id.as_bytes());
+    buf[32..36].copy_from_slice(&entry.refcount.to_le_bytes());
+    buf[36..40].copy_from_slice(&entry.stored_size.to_le_bytes());
+    buf[40..72].copy_from_slice(entry.pack_id.as_bytes());
+    buf[72..80].copy_from_slice(&entry.pack_offset.to_le_bytes());
+    buf
+}
+
+/// Write a single full cache entry to a writer, folding it into the running
+/// content-checksum hasher.
+fn write_full_entry(
+    w: &mut BufWriter<std::fs::File>,
+    hasher: &mut Blake2bVar,
+    entry: &FullCacheEntry,
+) -> Result<()> {
+    let buf = encode_full_entry(entry);
+    w.write_all(&buf)?;
+    Update::update(hasher, &buf);
+    Ok(())
+}
+
+/// Append the finalized content-checksum trailer over all entries written so far.
+fn write_full_checksum(w: &mut BufWriter<std::fs::File>, hasher: Blake2bVar) -> Result<()> {
+    let mut digest = [0u8; FULL_CHECKSUM_SIZE];
+    hasher
+        .finalize_variable(&mut digest)
+        .expect("correct length");
+    w.write_all(&digest)?;
     Ok(())
 }
 
@@ -859,9 +912,11 @@ pub fn build_full_index_cache_to_path(
     let mut w = BufWriter::new(file);
 
     write_full_header(&mut w, generation, entry_count)?;
+    let mut hasher = Blake2bVar::new(FULL_CHECKSUM_SIZE).expect("valid output size");
     for entry in &entries {
-        write_full_entry(&mut w, entry)?;
+        write_full_entry(&mut w, &mut hasher, entry)?;
     }
+    write_full_checksum(&mut w, hasher)?;
 
     w.flush()?;
     drop(w);
@@ -896,6 +951,7 @@ pub fn merge_full_index_cache(
     let mut w = BufWriter::new(file);
 
     write_full_header(&mut w, new_generation, total_count)?;
+    let mut hasher = Blake2bVar::new(FULL_CHECKSUM_SIZE).expect("valid output size");
 
     // Two-pointer merge
     let mut old_idx: usize = 0;
@@ -918,7 +974,7 @@ pub fn merge_full_index_cache(
             if let Some(&bump) = delta.refcount_bumps.get(&entry.chunk_id) {
                 entry.refcount += bump;
             }
-            write_full_entry(&mut w, &entry)?;
+            write_full_entry(&mut w, &mut hasher, &entry)?;
             old_idx += 1;
         } else {
             let ne = &sorted_new[new_idx];
@@ -934,10 +990,11 @@ pub fn merge_full_index_cache(
                 pack_id: ne.pack_id,
                 pack_offset: ne.pack_offset,
             };
-            write_full_entry(&mut w, &entry)?;
+            write_full_entry(&mut w, &mut hasher, &entry)?;
             new_idx += 1;
         }
     }
+    write_full_checksum(&mut w, hasher)?;
 
     w.flush()?;
     drop(w);
@@ -1560,6 +1617,80 @@ mod tests {
 
         assert!(MmapFullIndexCache::open_path(&path, 99).is_none());
         assert!(MmapFullIndexCache::open_path(&path, 42).is_some());
+    }
+
+    #[test]
+    fn full_index_cache_entry_corruption_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("full_index_cache");
+
+        let index = make_test_index(5);
+        build_full_index_cache_to_path(&index, 42, &path).unwrap();
+        assert!(MmapFullIndexCache::open_path(&path, 42).is_some());
+
+        // Flip one byte in the first entry (right after the header).
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[FULL_HEADER_SIZE] ^= 0x01;
+        std::fs::write(&path, &bytes).unwrap();
+
+        assert!(
+            MmapFullIndexCache::open_path(&path, 42).is_none(),
+            "a bit flip in the entry region must fail the checksum"
+        );
+    }
+
+    #[test]
+    fn full_index_cache_trailer_corruption_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("full_index_cache");
+
+        let index = make_test_index(5);
+        build_full_index_cache_to_path(&index, 42, &path).unwrap();
+        assert!(MmapFullIndexCache::open_path(&path, 42).is_some());
+
+        // Flip one byte in the checksum trailer.
+        let mut bytes = std::fs::read(&path).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x01;
+        std::fs::write(&path, &bytes).unwrap();
+
+        assert!(
+            MmapFullIndexCache::open_path(&path, 42).is_none(),
+            "a bit flip in the checksum trailer must fail validation"
+        );
+    }
+
+    #[test]
+    fn full_index_cache_v1_format_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("full_index_cache");
+
+        // Hand-write a legacy v1 file: header with version 1, entries, no trailer.
+        let generation = 42u64;
+        let entry_count = 3u32;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(FULL_MAGIC);
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // version 1
+        bytes.extend_from_slice(&generation.to_le_bytes());
+        bytes.extend_from_slice(&entry_count.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // reserved
+        for i in 0..entry_count {
+            let mut id_bytes = [0u8; 32];
+            id_bytes[0] = i as u8;
+            bytes.extend_from_slice(&encode_full_entry(&FullCacheEntry {
+                chunk_id: ChunkId::from_bytes(id_bytes),
+                refcount: 1,
+                stored_size: 100,
+                pack_id: PackId::from_bytes([0x01; 32]),
+                pack_offset: 0,
+            }));
+        }
+        std::fs::write(&path, &bytes).unwrap();
+
+        assert!(
+            MmapFullIndexCache::open_path(&path, generation).is_none(),
+            "a v1-format cache (no checksum trailer) must be rejected"
+        );
     }
 
     #[test]

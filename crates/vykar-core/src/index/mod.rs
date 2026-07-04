@@ -316,20 +316,21 @@ pub struct RecoveredChunkEntry {
     pub pack_offset: u64,
 }
 
-/// Snapshot of `IndexDelta` state for checkpoint/rollback (used by dump streaming).
+/// Marker for a `IndexDelta` rollback checkpoint. Records only the length of
+/// `new_entries` at checkpoint time; refcount bumps are rolled back via the
+/// delta's undo log (armed by `checkpoint()`), so no map snapshot is stored.
+///
+/// Armed per modified regular file in sequential backup, per streamed command
+/// dump, and per segmented large file in pipeline mode.
 #[derive(Debug)]
 pub struct IndexDeltaCheckpoint {
     new_entries_len: usize,
-    refcount_bumps: HashMap<ChunkId, u32>,
 }
 
 impl IndexDeltaCheckpoint {
     /// Create an empty checkpoint (for repos not using dedup mode).
     pub fn empty() -> Self {
-        Self {
-            new_entries_len: 0,
-            refcount_bumps: HashMap::new(),
-        }
+        Self { new_entries_len: 0 }
     }
 }
 
@@ -342,6 +343,11 @@ pub struct IndexDelta {
     pub new_entries: Vec<NewChunkEntry>,
     /// Refcount increments for chunks that already existed in the index.
     pub refcount_bumps: HashMap<ChunkId, u32>,
+    /// Undo log for the armed rollback checkpoint. `Some` ⟺ a checkpoint is
+    /// armed. Maps each in-scope-mutated chunk to its `refcount_bumps` value at
+    /// first touch (`None` = key was absent), so rollback replays exact prior
+    /// state without cloning the whole map.
+    pub(crate) undo_log: Option<HashMap<ChunkId, Option<u32>>>,
 }
 
 /// A new chunk entry recorded during dedup-mode backup.
@@ -364,11 +370,17 @@ impl IndexDelta {
         self.new_entries.is_empty() && self.refcount_bumps.is_empty()
     }
 
-    /// Capture a checkpoint of the current delta state for later rollback.
-    pub fn checkpoint(&self) -> IndexDeltaCheckpoint {
+    /// Arm a rollback checkpoint. Subsequent `refcount_bumps` mutations are
+    /// recorded in an undo log so `rollback()` can restore exact prior state
+    /// without cloning the map.
+    pub fn checkpoint(&mut self) -> IndexDeltaCheckpoint {
+        assert!(
+            self.undo_log.is_none(),
+            "checkpoint() called while another checkpoint is armed"
+        );
+        self.undo_log = Some(HashMap::new());
         IndexDeltaCheckpoint {
             new_entries_len: self.new_entries.len(),
-            refcount_bumps: self.refcount_bumps.clone(),
         }
     }
 
@@ -376,11 +388,35 @@ impl IndexDelta {
     /// that occurred after it was taken.
     pub fn rollback(&mut self, cp: IndexDeltaCheckpoint) {
         self.new_entries.truncate(cp.new_entries_len);
-        self.refcount_bumps = cp.refcount_bumps;
+        // Replay the undo log (empty/absent when the checkpoint was never
+        // armed, e.g. `IndexDeltaCheckpoint::empty()`).
+        if let Some(undo) = self.undo_log.take() {
+            for (id, prev) in undo {
+                match prev {
+                    Some(v) => {
+                        self.refcount_bumps.insert(id, v);
+                    }
+                    None => {
+                        self.refcount_bumps.remove(&id);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Discard the armed checkpoint without rolling back (commit path). The
+    /// in-scope mutations are kept; the undo log is dropped so the next
+    /// `checkpoint()` can arm cleanly.
+    pub fn discard_checkpoint(&mut self) {
+        self.undo_log = None;
     }
 
     /// Record a refcount bump for an existing chunk.
     pub fn bump_refcount(&mut self, id: &ChunkId) {
+        if let Some(undo) = self.undo_log.as_mut() {
+            let prev = self.refcount_bumps.get(id).copied();
+            undo.entry(*id).or_insert(prev);
+        }
         *self.refcount_bumps.entry(*id).or_insert(0) += 1;
     }
 
@@ -659,6 +695,86 @@ mod tests {
         delta.rollback(cp);
         assert!(delta.new_entries.is_empty());
         assert!(delta.refcount_bumps.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "checkpoint() called while another checkpoint is armed")]
+    fn index_delta_overlapping_checkpoints_panic() {
+        let mut delta = IndexDelta::new();
+        let _cp1 = delta.checkpoint();
+        let _cp2 = delta.checkpoint();
+    }
+
+    #[test]
+    fn index_delta_rollback_restores_pre_checkpoint_count() {
+        // A key bumped before the checkpoint, then bumped again in scope, must
+        // roll back to its pre-checkpoint count — not vanish.
+        let mut delta = IndexDelta::new();
+        let chunk = make_chunk_id(1);
+        delta.bump_refcount(&chunk);
+        delta.bump_refcount(&chunk);
+        assert_eq!(delta.refcount_bumps.get(&chunk), Some(&2));
+
+        let cp = delta.checkpoint();
+        delta.bump_refcount(&chunk);
+        assert_eq!(delta.refcount_bumps.get(&chunk), Some(&3));
+
+        delta.rollback(cp);
+        assert_eq!(delta.refcount_bumps.get(&chunk), Some(&2));
+        assert!(delta.undo_log.is_none());
+    }
+
+    #[test]
+    fn index_delta_rollback_removes_key_first_bumped_in_scope() {
+        let mut delta = IndexDelta::new();
+        let chunk = make_chunk_id(1);
+
+        let cp = delta.checkpoint();
+        delta.bump_refcount(&chunk);
+        assert_eq!(delta.refcount_bumps.get(&chunk), Some(&1));
+
+        delta.rollback(cp);
+        assert!(!delta.refcount_bumps.contains_key(&chunk));
+    }
+
+    #[test]
+    fn index_delta_rollback_single_undo_entry_for_repeated_bumps() {
+        // Same key bumped twice in scope records only one undo entry (first
+        // touch), and rollback still removes it cleanly.
+        let mut delta = IndexDelta::new();
+        let chunk = make_chunk_id(1);
+
+        let cp = delta.checkpoint();
+        delta.bump_refcount(&chunk);
+        delta.bump_refcount(&chunk);
+        assert_eq!(delta.refcount_bumps.get(&chunk), Some(&2));
+        assert_eq!(delta.undo_log.as_ref().unwrap().len(), 1);
+
+        delta.rollback(cp);
+        assert!(!delta.refcount_bumps.contains_key(&chunk));
+    }
+
+    #[test]
+    fn index_delta_commit_then_recheckpoint() {
+        // Commit path: discard_checkpoint keeps in-scope bumps and lets a
+        // second checkpoint arm without panicking.
+        let mut delta = IndexDelta::new();
+        let chunk_a = make_chunk_id(1);
+        let chunk_b = make_chunk_id(2);
+
+        let _cp1 = delta.checkpoint();
+        delta.bump_refcount(&chunk_a);
+        // Commit the first scope.
+        delta.discard_checkpoint();
+        assert!(delta.undo_log.is_none());
+        assert_eq!(delta.refcount_bumps.get(&chunk_a), Some(&1));
+
+        // Second checkpoint arms cleanly; its bump survives commit too.
+        let _cp2 = delta.checkpoint();
+        delta.bump_refcount(&chunk_b);
+        delta.discard_checkpoint();
+        assert_eq!(delta.refcount_bumps.get(&chunk_a), Some(&1));
+        assert_eq!(delta.refcount_bumps.get(&chunk_b), Some(&1));
     }
 
     // --- PendingIndexJournal::remove_pack tests ---

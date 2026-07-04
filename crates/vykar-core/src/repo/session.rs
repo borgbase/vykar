@@ -307,7 +307,7 @@ impl Repository {
             .expect("no active write session");
         let delta_checkpoint = ws
             .index_delta
-            .as_ref()
+            .as_mut()
             .expect("dedup mode implies index_delta is set")
             .checkpoint();
         let data_pack_target_size = ws.data_pack_writer.target_size();
@@ -324,7 +324,14 @@ impl Repository {
     /// Commit a rollback checkpoint: discard the tracker (scope succeeded).
     pub(crate) fn commit_rollback_checkpoint(&mut self) {
         if let Some(ws) = self.write_session.as_mut() {
-            ws.rollback_tracker = None;
+            // Only discard the delta's undo log when a tracker was actually
+            // armed (mirrors `begin_rollback_checkpoint`); leave the no-tracker
+            // case untouched.
+            if ws.rollback_tracker.take().is_some() {
+                if let Some(ref mut delta) = ws.index_delta {
+                    delta.discard_checkpoint();
+                }
+            }
         }
     }
 

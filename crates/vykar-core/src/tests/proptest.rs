@@ -618,6 +618,7 @@ mod index_delta {
                     let delta = IndexDelta {
                         new_entries: entries_clone.clone(),
                         refcount_bumps: bump_map.clone(),
+                        undo_log: None,
                     };
                     (delta, entries_clone.clone(), bump_map)
                 })
@@ -711,6 +712,7 @@ mod index_delta {
                         let delta = IndexDelta {
                             new_entries: new_entries.clone(),
                             refcount_bumps: combined_bumps.clone(),
+                            undo_log: None,
                         };
                         (delta, new_entries, combined_bumps)
                     })
@@ -748,6 +750,36 @@ mod index_delta {
                     id, expected_rc, actual.refcount,
                 );
             }
+        }
+
+        /// Undo-log rollback is equivalent to snapshotting the map by clone:
+        /// checkpoint → arbitrary in-scope bumps → rollback restores exactly the
+        /// map (and new_entries length) captured at checkpoint time.
+        #[test]
+        fn checkpoint_rollback_equivalent_to_clone(
+            (mut delta, _entries, _bumps) in arb_index_delta_standalone(),
+            in_scope_bumps in prop::collection::vec(arb_chunk_id(), 0..40),
+            extra_entry_id in arb_chunk_id(),
+        ) {
+            // Model: what a clone-based checkpoint would restore.
+            let expected_bumps = delta.refcount_bumps.clone();
+            let expected_new_len = delta.new_entries.len();
+
+            let cp = delta.checkpoint();
+
+            // Arbitrary in-scope mutations: bumps (some overlapping pre-checkpoint
+            // keys, some brand new) plus a new entry.
+            for id in &in_scope_bumps {
+                delta.bump_refcount(id);
+            }
+            let pack_id = vykar_types::pack_id::PackId::from_bytes([0u8; 32]);
+            delta.add_new_entry(extra_entry_id, 100, pack_id, 0, 1);
+
+            delta.rollback(cp);
+
+            prop_assert_eq!(delta.new_entries.len(), expected_new_len);
+            prop_assert_eq!(&delta.refcount_bumps, &expected_bumps);
+            prop_assert!(delta.undo_log.is_none());
         }
 
         /// After reconcile + apply_to with intentional overlaps, final refcounts are correct.

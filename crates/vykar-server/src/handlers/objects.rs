@@ -106,25 +106,29 @@ pub async fn put_object(
         }
     }
 
-    // Track old file size for quota accounting
+    // Track old file size for quota accounting.
     let old_size = existing_meta.as_ref().map_or(0, std::fs::Metadata::len);
 
-    // Quota pre-check using Content-Length if available
-    let quota = state.quota_limit();
-    if quota > 0 {
-        if let Some(content_length) = headers
-            .get("Content-Length")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse::<u64>().ok())
-        {
-            let used = state.quota_used();
-            if used.saturating_sub(old_size) + content_length > quota {
-                return Err(ServerError::PayloadTooLarge(format!(
-                    "quota exceeded: used {used}, limit {quota}, request {content_length}",
-                )));
-            }
-        }
-    }
+    // Parse Content-Length once (reused for the reservation and the
+    // post-upload size check).
+    let content_length = headers
+        .get("Content-Length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+
+    // Reserve quota headroom up-front. Net accounting: reserve only the growth
+    // over the object being overwritten. A no-Content-Length streaming upload
+    // reserves 0 here and grows per-chunk below. The reservation's Drop releases
+    // on every failure path (write error, CL/checksum mismatch, rename failure,
+    // panic) — no per-site cleanup needed.
+    let mut reservation = state
+        .try_reserve_quota(content_length.map_or(0, |cl| cl.saturating_sub(old_size)))
+        .map_err(|(used, limit)| {
+            ServerError::PayloadTooLarge(format!(
+                "quota exceeded: used {used}, limit {limit}, request {}",
+                content_length.unwrap_or(0)
+            ))
+        })?;
 
     // Parse X-Content-BLAKE2b header
     let is_pack = key.starts_with("packs/");
@@ -148,11 +152,27 @@ pub async fn put_object(
         None => None,
     };
 
-    // Ensure parent directory exists
+    // Ensure parent directory exists. When it had to be created, fsync the new
+    // ancestor chain up to data_dir so the directory entries survive power loss
+    // (rare path — only when missing).
     if let Some(parent) = file_path.parent() {
+        let parent_existed = tokio::fs::try_exists(parent).await.unwrap_or(false);
         tokio::fs::create_dir_all(parent)
             .await
             .map_err(ServerError::from)?;
+        if !parent_existed {
+            let data_dir = state.inner.data_dir.as_path();
+            let mut cursor = Some(parent);
+            while let Some(dir) = cursor {
+                fsync_dir_async(dir.to_path_buf())
+                    .await
+                    .map_err(ServerError::from)?;
+                if dir == data_dir {
+                    break;
+                }
+                cursor = dir.parent();
+            }
+        }
     }
 
     // Generate a unique temp file name
@@ -187,14 +207,17 @@ pub async fn put_object(
 
                 data_len += n as u64;
 
-                // Per-chunk quota enforcement
-                if quota > 0 {
-                    let used = state.quota_used();
-                    if used.saturating_sub(old_size) + data_len > quota {
-                        return Err(ServerError::PayloadTooLarge(format!(
-                            "quota exceeded during upload: used {used}, limit {quota}, written {data_len}",
-                        )));
-                    }
+                // Grow the reservation to cover net growth as the body streams.
+                // No-op once the up-front Content-Length reservation already
+                // covers it (net accounting; overwrites shrink `needed`).
+                let needed = data_len.saturating_sub(old_size);
+                if needed > reservation.remaining() {
+                    let extra = needed - reservation.remaining();
+                    reservation.grow(extra).map_err(|(used, limit)| {
+                        ServerError::PayloadTooLarge(format!(
+                            "quota exceeded during upload: used {used}, limit {limit}, written {data_len}",
+                        ))
+                    })?;
                 }
 
                 let chunk = buf.get(..n).expect("n <= buf.len() (just-read bytes)");
@@ -219,11 +242,7 @@ pub async fn put_object(
     };
 
     // Validate Content-Length if it was present
-    if let Some(content_length) = headers
-        .get("Content-Length")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u64>().ok())
-    {
+    if let Some(content_length) = content_length {
         if data_len != content_length {
             let _ = tokio::fs::remove_file(&temp_path).await;
             return Err(ServerError::BadRequest(format!(
@@ -253,11 +272,23 @@ pub async fn put_object(
         return Err(ServerError::from(e));
     }
 
-    // Update quota
-    if data_len > old_size {
-        state.add_quota_usage(data_len - old_size);
-    } else {
+    // Commit the reservation (moves reserved bytes into committed usage) right
+    // after the rename, before the fsync below: the file is on disk either
+    // way, and skipping the commit on fsync failure would undercount — a retry
+    // of the same key sees old_size == data_len and commits nothing. When the
+    // object shrank, drop the freed bytes from committed usage as well.
+    reservation.commit();
+    if data_len < old_size {
         state.sub_quota_usage(old_size - data_len);
+    }
+
+    // Fsync the parent directory so the rename survives power loss. The
+    // snapshot blob is the client's commit point, so we must not ack until the
+    // rename is durable — a 5xx here is correct; clients retry idempotent PUTs.
+    if let Some(parent) = file_path.parent() {
+        fsync_dir_async(parent.to_path_buf())
+            .await
+            .map_err(ServerError::from)?;
     }
 
     // Detect backup completion: v2 writes snapshots/<id>, v1 writes manifest.
@@ -279,16 +310,30 @@ pub async fn delete_object(
     State(state): State<AppState>,
     Path(key): Path<String>,
 ) -> Result<Response, ServerError> {
-    if state.inner.config.append_only && !key.starts_with("locks/") && !key.starts_with("sessions/")
+    let is_temp = vykar_protocol::is_temp_file(&key);
+
+    // Append-only forbids deleting committed data. Temp files are uncommitted
+    // (interrupted PUTs), and locks/ + sessions/ are ephemeral coordination
+    // state — deleting any of these cannot violate append-only.
+    if state.inner.config.append_only
+        && !is_temp
+        && !key.starts_with("locks/")
+        && !key.starts_with("sessions/")
     {
         return Err(ServerError::Forbidden(
             "append-only: delete not allowed".into(),
         ));
     }
 
-    let file_path = state
-        .file_path(&key)
-        .ok_or_else(|| ServerError::BadRequest("invalid path".into()))?;
+    // Temp names fail the strict key schema, so resolve them with the lenient
+    // cleanup resolver. (This also fixes a latent bug: DELETE of a `.tmp.*` file
+    // always returned 400 because `file_path` rejects temp names.)
+    let file_path = if is_temp {
+        state.file_path_for_cleanup(&key)
+    } else {
+        state.file_path(&key)
+    }
+    .ok_or_else(|| ServerError::BadRequest("invalid path".into()))?;
 
     let old_size = match tokio::fs::metadata(&file_path).await {
         Ok(meta) => meta.len(),
@@ -300,7 +345,14 @@ pub async fn delete_object(
 
     match tokio::fs::remove_file(&file_path).await {
         Ok(()) => {
-            state.sub_quota_usage(old_size);
+            // Temp-file bytes were never committed to `quota_usage` (they live
+            // in `quota_reserved` while the upload runs, released on failure),
+            // so subtracting them would drift usage low — the unsafe direction.
+            // Debris counted by a startup/rescan dir scan is over-counted until
+            // the next rescan instead (safe direction).
+            if !is_temp {
+                state.sub_quota_usage(old_size);
+            }
             Ok(StatusCode::NO_CONTENT.into_response())
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -308,6 +360,13 @@ pub async fn delete_object(
         }
         Err(e) => Err(ServerError::from(e)),
     }
+}
+
+/// Fsync a directory off the async runtime (directory fsync is blocking).
+async fn fsync_dir_async(dir: std::path::PathBuf) -> std::io::Result<()> {
+    tokio::task::spawn_blocking(move || crate::state::fsync_dir(&dir))
+        .await
+        .map_err(|e| std::io::Error::other(e.to_string()))?
 }
 
 async fn stream_full_read(file_path: &std::path::Path, key: &str) -> Result<Response, ServerError> {
@@ -443,9 +502,11 @@ async fn handle_range_read(
     let file_len = file.metadata().await.map_err(ServerError::from)?.len();
 
     if start >= file_len {
-        return Err(ServerError::from(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "range start beyond file size",
+        // 416, not 500. We omit the `Content-Range: bytes */len` header: the
+        // client's retry layer treats 4xx as permanent and doesn't parse it, so
+        // an out-of-range read fails fast instead of retry-looping on a 500.
+        return Err(ServerError::RangeNotSatisfiable(format!(
+            "range start {start} beyond file size {file_len}"
         )));
     }
 
@@ -561,6 +622,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn put_concurrent_quota_race() {
+        // Two concurrent 600-byte PUTs (distinct keys) against a 1000-byte
+        // quota: exactly one succeeds, one is rejected, and committed usage
+        // settles at 600 with no leftover reservation.
+        let (router, state, _tmp) = setup_app(1000);
+
+        let (ra, rb) = tokio::join!(
+            authed_put(router.clone(), CONFIG_PATH, vec![0xAA; 600]),
+            authed_put(router.clone(), "/index", vec![0xBB; 600]),
+        );
+
+        let statuses = [ra.status(), rb.status()];
+        let created = statuses
+            .iter()
+            .filter(|s| **s == StatusCode::CREATED)
+            .count();
+        let rejected = statuses
+            .iter()
+            .filter(|s| **s == StatusCode::PAYLOAD_TOO_LARGE)
+            .count();
+        assert_eq!(created, 1, "exactly one PUT should succeed: {statuses:?}");
+        assert_eq!(
+            rejected, 1,
+            "exactly one PUT should be rejected: {statuses:?}"
+        );
+        assert_eq!(state.quota_used(), 600);
+        assert_eq!(state.quota_reserved(), 0);
+    }
+
+    #[tokio::test]
+    async fn put_cl_mismatch_releases_reservation() {
+        let (router, state, tmp) = setup_app(1000);
+
+        // Reserve 800 via Content-Length, then send only 50 bytes -> mismatch.
+        let resp = authed_put_with_cl(router.clone(), CONFIG_PATH, vec![0xAA; 50], 800).await;
+        assert_status(&resp, StatusCode::BAD_REQUEST);
+        assert_eq!(state.quota_reserved(), 0, "failed PUT releases reservation");
+        assert_no_temp_files(tmp.path());
+
+        // A subsequent full-quota PUT now succeeds.
+        let resp = authed_put(router.clone(), "/index", vec![0xBB; 1000]).await;
+        assert_status(&resp, StatusCode::CREATED);
+        assert_eq!(state.quota_reserved(), 0);
+        assert_eq!(state.quota_used(), 1000);
+    }
+
+    #[tokio::test]
+    async fn put_checksum_mismatch_releases_reservation() {
+        let (router, state, tmp) = setup_app(1000);
+
+        let data = vec![0xDE; 500];
+        let wrong = "a".repeat(64);
+        let real = blake2b_hex(&data);
+        let pack_path = format!("/packs/{}/{}", &real[..2], real);
+
+        let resp = authed_put_with_blake2b(router.clone(), &pack_path, data, &wrong).await;
+        assert_status(&resp, StatusCode::CONFLICT);
+        assert_eq!(
+            state.quota_reserved(),
+            0,
+            "checksum failure releases reservation"
+        );
+        assert_no_temp_files(tmp.path());
+    }
+
+    #[tokio::test]
+    async fn put_no_cl_over_quota_releases_reservation() {
+        let (router, state, tmp) = setup_app(1000);
+
+        // No Content-Length header; body exceeds quota, rejected mid-stream.
+        let resp = super::authed_put_no_cl(router.clone(), CONFIG_PATH, vec![0xAA; 2000]).await;
+        assert_status(&resp, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_no_temp_files(tmp.path());
+        assert_eq!(
+            state.quota_reserved(),
+            0,
+            "mid-stream failure releases reservation"
+        );
+    }
+
+    #[tokio::test]
     async fn put_concurrent_same_key() {
         let (router, _state, tmp) = setup_app(0);
         let data_a = vec![0xAA; 1024];
@@ -599,6 +741,86 @@ mod tests {
 
         // No orphan temp files
         assert_no_temp_files(tmp.path());
+    }
+
+    #[tokio::test]
+    async fn range_beyond_file_returns_416() {
+        use tower::ServiceExt;
+        let (router, _state, _tmp) = setup_app(0);
+        authed_put(router.clone(), CONFIG_PATH, vec![0xAB; 100]).await;
+
+        let req = axum::http::Request::builder()
+            .method("GET")
+            .uri(CONFIG_PATH)
+            .header(
+                "Authorization",
+                format!("Bearer {}", super::super::test_helpers::TEST_TOKEN),
+            )
+            .header("Range", "bytes=200-299")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_status(&resp, StatusCode::RANGE_NOT_SATISFIABLE);
+    }
+
+    #[tokio::test]
+    async fn append_only_delete_temp_file_succeeds() {
+        let (router, _state, tmp) = setup_app_append_only(0);
+        std::fs::write(tmp.path().join(".tmp.config.7"), b"partial").unwrap();
+
+        let resp = authed_delete(router, "/.tmp.config.7").await;
+        assert_status(&resp, StatusCode::NO_CONTENT);
+        assert!(!tmp.path().join(".tmp.config.7").exists());
+    }
+
+    #[tokio::test]
+    async fn append_only_delete_committed_forbidden() {
+        let (router, _state, tmp) = setup_app_append_only(0);
+        std::fs::write(tmp.path().join("config"), b"cfg").unwrap();
+
+        let resp = authed_delete(router, "/config").await;
+        assert_status(&resp, StatusCode::FORBIDDEN);
+        assert!(tmp.path().join("config").exists(), "config must survive");
+    }
+
+    #[tokio::test]
+    async fn put_temp_named_key_rejected() {
+        // A temp-looking name must not be committable: append-only DELETE
+        // treats temp names as uncommitted debris, so a PUT-able temp-named
+        // object would be deletable committed data.
+        let (router, _state, tmp) = setup_app(0);
+        let resp = authed_put(router.clone(), "/snapshots/.tmp.evil.1", b"data".to_vec()).await;
+        assert_status(&resp, StatusCode::BAD_REQUEST);
+        // A trailing slash resolves to the same file and must not bypass the
+        // rejection.
+        let resp = authed_put(router, "/snapshots/.tmp.evil.1/", b"data".to_vec()).await;
+        assert_status(&resp, StatusCode::BAD_REQUEST);
+        assert!(!tmp.path().join("snapshots/.tmp.evil.1").exists());
+    }
+
+    #[tokio::test]
+    async fn append_only_delete_namespaced_temp_debris() {
+        // Interrupted snapshot uploads leave `snapshots/.tmp.<id>.<n>` debris;
+        // it must stay cleanable in append-only mode (PUT can never commit
+        // such a name, so it is always uncommitted).
+        let (router, _state, tmp) = setup_app_append_only(0);
+        std::fs::write(tmp.path().join("snapshots").join(".tmp.abc123.5"), b"x").unwrap();
+
+        let resp = authed_delete(router, "/snapshots/.tmp.abc123.5").await;
+        assert_status(&resp, StatusCode::NO_CONTENT);
+        assert!(!tmp.path().join("snapshots").join(".tmp.abc123.5").exists());
+    }
+
+    #[tokio::test]
+    async fn delete_temp_file_non_append_only() {
+        // Latent-bug fix: DELETE of a `.tmp.*` file used to return 400 because
+        // the strict key schema rejects temp names.
+        let (router, _state, tmp) = setup_app(0);
+        std::fs::write(tmp.path().join(".tmp.index.0"), b"partial").unwrap();
+
+        let resp = authed_delete(router, "/.tmp.index.0").await;
+        assert_status(&resp, StatusCode::NO_CONTENT);
+        assert!(!tmp.path().join(".tmp.index.0").exists());
     }
 
     /// Send an authenticated PUT with a Content-Length that differs from the body.
@@ -643,33 +865,6 @@ mod tests {
         // Verify the final object was not created
         let resp = authed_get(router, CONFIG_PATH).await;
         assert_status(&resp, StatusCode::NOT_FOUND);
-    }
-
-    /// Recursively check that no `.tmp.*` files exist under the given path.
-    fn assert_no_temp_files(dir: &std::path::Path) {
-        for path in walk_file_paths(dir) {
-            let name = path.file_name().unwrap().to_string_lossy();
-            assert!(
-                !name.starts_with(".tmp."),
-                "leftover temp file: {}",
-                path.display()
-            );
-        }
-    }
-
-    fn walk_file_paths(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
-        let mut out = Vec::new();
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    out.extend(walk_file_paths(&path));
-                } else {
-                    out.push(path);
-                }
-            }
-        }
-        out
     }
 
     /// Compute BLAKE2b-256 hex of data (for test convenience).

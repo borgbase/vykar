@@ -16,8 +16,12 @@ pub struct AppState {
 pub struct AppStateInner {
     pub config: ServerSection,
     pub data_dir: PathBuf,
-    /// Quota usage in bytes.
+    /// Committed quota usage in bytes (bytes actually on disk).
     pub quota_usage: AtomicU64,
+    /// In-flight reserved bytes for uploads/repacks not yet committed. Kept
+    /// separate from `quota_usage` so a background rescan of committed usage
+    /// (`rescan_usage`) never clobbers concurrent reservations.
+    pub quota_reserved: AtomicU64,
     /// Auto-detected or explicit quota state.
     pub quota_state: Arc<QuotaState>,
 
@@ -113,6 +117,7 @@ impl AppState {
                 config,
                 data_dir,
                 quota_usage: AtomicU64::new(quota_usage),
+                quota_reserved: AtomicU64::new(0),
                 quota_state,
                 last_backup_at: RwLock::new(None),
             }),
@@ -149,6 +154,7 @@ impl AppState {
                 config,
                 data_dir,
                 quota_usage: AtomicU64::new(quota_usage),
+                quota_reserved: AtomicU64::new(0),
                 quota_state,
                 last_backup_at: RwLock::new(None),
             }),
@@ -201,9 +207,63 @@ impl AppState {
         self.inner.quota_state.limit()
     }
 
-    /// Get current quota usage.
+    /// Get current committed quota usage.
     pub fn quota_used(&self) -> u64 {
         self.inner.quota_usage.load(Ordering::Relaxed)
+    }
+
+    /// Get current in-flight reserved bytes (uploads/repacks not yet committed).
+    #[cfg(test)]
+    pub fn quota_reserved(&self) -> u64 {
+        self.inner.quota_reserved.load(Ordering::Relaxed)
+    }
+
+    /// Reserve `bytes` of quota headroom for an in-flight write.
+    ///
+    /// The predicate is `limit == 0 || used + reserved_after <= limit`, where
+    /// `reserved_after` is the running total of all outstanding reservations
+    /// plus `bytes`. On success returns an RAII [`QuotaReservation`] whose
+    /// `Drop` releases any bytes not committed — so every failure path (write
+    /// error, Content-Length mismatch, checksum mismatch, rename failure,
+    /// panic) releases automatically without per-site cleanup.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err((used, limit))` when the reservation would exceed the quota,
+    /// for composing a 413 response.
+    ///
+    /// Known residual: two concurrent same-key overwrites both reserve their
+    /// full net size, so committed usage can transiently over-count until the
+    /// next `rescan_usage()`. Over-counting is the safe direction (rejects
+    /// rather than admits).
+    pub fn try_reserve_quota(&self, bytes: u64) -> Result<QuotaReservation, (u64, u64)> {
+        let limit = self.quota_limit();
+        if limit == 0 {
+            // Unlimited: track reserved bytes for accounting symmetry.
+            self.inner
+                .quota_reserved
+                .fetch_add(bytes, Ordering::Relaxed);
+            return Ok(QuotaReservation {
+                state: self.clone(),
+                remaining: bytes,
+            });
+        }
+        let used = self.quota_used();
+        let result = self.inner.quota_reserved.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |reserved| {
+                let after = reserved.checked_add(bytes)?;
+                (used.saturating_add(after) <= limit).then_some(after)
+            },
+        );
+        match result {
+            Ok(_) => Ok(QuotaReservation {
+                state: self.clone(),
+                remaining: bytes,
+            }),
+            Err(_) => Err((used, limit)),
+        }
     }
 
     /// Update quota usage after a write.
@@ -227,10 +287,125 @@ impl AppState {
         let mut ts = write_unpoisoned(&self.inner.last_backup_at, "last_backup_at");
         *ts = Some(Utc::now());
 
-        // Refresh quota in the background (fire-and-forget).
-        let qs = self.inner.quota_state.clone();
-        let usage = self.quota_used();
-        tokio::task::spawn_blocking(move || qs.refresh(usage));
+        // Rescan committed usage and refresh quota in the background
+        // (fire-and-forget). Corrects any drift accumulated from the
+        // reservation fast-path (e.g. concurrent same-key overwrites).
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || rescan_usage(&inner));
+    }
+}
+
+/// RAII quota reservation: holds bytes reserved in `quota_reserved` and, on
+/// `Drop`, releases whatever has not been committed. Grown or committed as an
+/// upload streams; see [`AppState::try_reserve_quota`].
+pub struct QuotaReservation {
+    state: AppState,
+    /// Reserved bytes not yet committed to `quota_usage`.
+    remaining: u64,
+}
+
+impl QuotaReservation {
+    /// Reserved bytes not yet committed.
+    pub fn remaining(&self) -> u64 {
+        self.remaining
+    }
+
+    /// Reserve `bytes` more headroom (streaming uploads with no Content-Length).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err((used, limit))` when growing would exceed the quota.
+    pub fn grow(&mut self, bytes: u64) -> Result<(), (u64, u64)> {
+        let limit = self.state.quota_limit();
+        if limit == 0 {
+            self.state
+                .inner
+                .quota_reserved
+                .fetch_add(bytes, Ordering::Relaxed);
+            self.remaining = self.remaining.saturating_add(bytes);
+            return Ok(());
+        }
+        let used = self.state.quota_used();
+        let result = self.state.inner.quota_reserved.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |reserved| {
+                let after = reserved.checked_add(bytes)?;
+                (used.saturating_add(after) <= limit).then_some(after)
+            },
+        );
+        match result {
+            Ok(_) => {
+                self.remaining = self.remaining.saturating_add(bytes);
+                Ok(())
+            }
+            Err(_) => Err((used, limit)),
+        }
+    }
+
+    /// Commit `bytes` from the reservation into committed usage. Used for
+    /// per-operation commits (repack) where the reservation outlives one unit.
+    ///
+    /// Ordering invariant: add to `quota_usage` *before* releasing from
+    /// `quota_reserved`. The in-between state double-counts the bytes, so a
+    /// concurrent reservation can only be falsely rejected (safe direction).
+    /// The reverse order would leave the bytes invisible to both counters,
+    /// letting a concurrent reservation overrun the limit.
+    pub fn commit_partial(&mut self, bytes: u64) {
+        let bytes = bytes.min(self.remaining);
+        self.state.add_quota_usage(bytes);
+        self.release_reserved(bytes);
+        self.remaining -= bytes;
+    }
+
+    /// Commit all remaining reserved bytes into committed usage.
+    /// Same ordering invariant as [`Self::commit_partial`].
+    pub fn commit(mut self) {
+        let bytes = self.remaining;
+        self.state.add_quota_usage(bytes);
+        self.release_reserved(bytes);
+        self.remaining = 0;
+    }
+
+    /// Release `bytes` from `quota_reserved`, saturating at zero.
+    fn release_reserved(&self, bytes: u64) {
+        let _ = self.state.inner.quota_reserved.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |reserved| Some(reserved.saturating_sub(bytes)),
+        );
+    }
+}
+
+impl Drop for QuotaReservation {
+    fn drop(&mut self) {
+        if self.remaining > 0 {
+            self.release_reserved(self.remaining);
+            self.remaining = 0;
+        }
+    }
+}
+
+/// Rescan committed usage from disk and refresh the quota limit. **Blocking** —
+/// call via `spawn_blocking`. In-flight reservations live in `quota_reserved`,
+/// so overwriting `quota_usage` here cannot clobber them.
+pub(crate) fn rescan_usage(inner: &AppStateInner) {
+    let usage = dir_size(&inner.data_dir);
+    inner.quota_usage.store(usage, Ordering::Relaxed);
+    inner.quota_state.refresh(usage);
+}
+
+/// Fsync a directory so renames/creations inside it survive power loss.
+/// No-op on non-Unix (`std::fs::File` cannot open directories on Windows).
+pub(crate) fn fsync_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::fs::File::open(dir)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        Ok(())
     }
 }
 
@@ -266,6 +441,14 @@ fn is_safe_relative_path(key: &str) -> bool {
 
 fn is_valid_storage_key(key: &str) -> bool {
     if key.contains('\0') || key.contains('\\') {
+        return false;
+    }
+    // Temp-file names are never valid committed keys. Append-only mode allows
+    // deleting temp-named files (uncommitted upload debris); if PUT could
+    // commit an object under a temp-looking name (e.g. `snapshots/.tmp.x.1` —
+    // the namespaces below accept any basename), that object would be
+    // deletable in append-only mode, breaking its guarantee.
+    if vykar_protocol::is_temp_file(key) {
         return false;
     }
     let trimmed = key.trim_matches('/');
@@ -360,5 +543,98 @@ mod tests {
     #[test]
     fn rejects_unknown_top_level_keys() {
         assert!(!is_valid_storage_key("unknown"));
+    }
+
+    #[test]
+    fn rejects_temp_named_keys() {
+        // Temp names must never be valid committed keys: append-only mode
+        // allows deleting them, so a PUT-able temp-named object would be
+        // deletable committed data.
+        assert!(!is_valid_storage_key("snapshots/.tmp.evil.1"));
+        assert!(!is_valid_storage_key("keys/.tmp.repokey.0"));
+        assert!(!is_valid_storage_key("snapshots/.repack_tmp.3"));
+        assert!(!is_valid_storage_key(".tmp.config.0"));
+        // Trailing slashes are trimmed during path resolution, so they must
+        // not smuggle a temp name past this check.
+        assert!(!is_valid_storage_key("snapshots/.tmp.evil.1/"));
+    }
+
+    fn test_state(quota: u64) -> (AppState, tempfile::TempDir) {
+        use crate::config::ServerSection;
+        use crate::quota::{QuotaSource, QuotaState};
+
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let data_dir = tmp.path().to_path_buf();
+        let (source, limit) = if quota > 0 {
+            (QuotaSource::Explicit, quota)
+        } else {
+            (QuotaSource::Unlimited, 0)
+        };
+        let quota_state = QuotaState::new(source, limit, true, data_dir.clone());
+        let config = ServerSection {
+            data_dir: data_dir.to_string_lossy().into_owned(),
+            token: "t".to_string(),
+            ..Default::default()
+        };
+        (AppState::new_with_quota(config, quota_state), tmp)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fsync_dir_ok_on_existing_err_on_missing() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        assert!(
+            fsync_dir(tmp.path()).is_ok(),
+            "fsync of existing dir succeeds"
+        );
+        assert!(
+            fsync_dir(&tmp.path().join("nope")).is_err(),
+            "fsync of missing dir errors"
+        );
+    }
+
+    #[test]
+    fn rescan_usage_corrects_drift() {
+        let (state, tmp) = test_state(0);
+        // Put a file of known size on disk (bypassing the write path).
+        std::fs::write(tmp.path().join("config"), vec![0u8; 4096]).unwrap();
+
+        // Seed drift: usage reads far higher than what is actually on disk.
+        state.add_quota_usage(9999);
+        assert_eq!(state.quota_used(), 9999);
+
+        rescan_usage(&state.inner);
+        assert_eq!(state.quota_used(), 4096, "usage should match on-disk size");
+    }
+
+    #[test]
+    fn reservation_release_on_drop() {
+        let (state, _tmp) = test_state(1000);
+        {
+            let _res = state.try_reserve_quota(600).expect("reserve 600");
+            assert_eq!(state.quota_reserved(), 600);
+        }
+        assert_eq!(state.quota_reserved(), 0, "drop releases reservation");
+        assert_eq!(state.quota_used(), 0, "drop does not commit");
+    }
+
+    #[test]
+    fn reservation_commit_moves_to_usage() {
+        let (state, _tmp) = test_state(1000);
+        let res = state.try_reserve_quota(600).expect("reserve 600");
+        res.commit();
+        assert_eq!(state.quota_reserved(), 0);
+        assert_eq!(state.quota_used(), 600);
+    }
+
+    #[test]
+    fn reservation_rejects_over_limit() {
+        let (state, _tmp) = test_state(1000);
+        let _res = state.try_reserve_quota(700).expect("reserve 700");
+        let Err(err) = state.try_reserve_quota(700) else {
+            panic!("second reservation should exceed limit");
+        };
+        assert_eq!(err, (0, 1000), "second reservation exceeds limit");
+        assert_eq!(state.quota_reserved(), 700, "failed reserve adds nothing");
     }
 }

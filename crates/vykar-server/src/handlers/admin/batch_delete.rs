@@ -4,19 +4,34 @@ use axum::response::{IntoResponse, Response};
 use crate::error::ServerError;
 use crate::state::AppState;
 
+/// Maximum keys accepted in one batch-delete request. Clients chunk larger
+/// deletes (see `delete_repo` / `rest_backend::batch_delete_keys`).
+const MAX_BATCH_DELETE_KEYS: usize = 200_000;
+
 pub(super) async fn batch_delete(
     state: AppState,
     body: axum::body::Bytes,
     cleanup_dirs: bool,
 ) -> Result<Response, ServerError> {
-    if state.inner.config.append_only {
-        return Err(ServerError::Forbidden(
-            "append-only: batch-delete not allowed".into(),
-        ));
-    }
-
     let keys: Vec<String> = serde_json::from_slice(&body)
         .map_err(|e| ServerError::BadRequest(format!("invalid JSON: {e}")))?;
+
+    if keys.len() > MAX_BATCH_DELETE_KEYS {
+        return Err(ServerError::BadRequest(format!(
+            "too many keys: {} (max {MAX_BATCH_DELETE_KEYS})",
+            keys.len()
+        )));
+    }
+
+    // Append-only permits batch-delete of temp files only (interrupted-upload
+    // cleanup). Fail fast — name the first committed key and delete nothing.
+    if state.inner.config.append_only {
+        if let Some(key) = keys.iter().find(|k| !vykar_protocol::is_temp_file(k)) {
+            return Err(ServerError::Forbidden(format!(
+                "append-only: cannot batch-delete non-temp key: {key}"
+            )));
+        }
+    }
 
     let state_clone = state.clone();
 
@@ -37,7 +52,10 @@ pub(super) async fn batch_delete(
             if e.kind() != std::io::ErrorKind::NotFound {
                 return Err(ServerError::from(e));
             }
-        } else {
+        } else if !vykar_protocol::is_temp_file(key) {
+            // Temp-file bytes were never committed to `quota_usage` (they live
+            // in `quota_reserved` while the upload runs), so subtracting them
+            // would drift usage low — same rationale as `delete_object`.
             state_clone.sub_quota_usage(old_size);
         }
     }
@@ -143,6 +161,50 @@ mod tests {
         assert!(!tmp.path().join("index.gen").exists());
         assert!(!tmp.path().join(".tmp.config.0").exists());
         assert!(!tmp.path().join(".tmp.index.gen.0").exists());
+    }
+
+    #[tokio::test]
+    async fn append_only_batch_delete_all_temps_ok() {
+        let (router, _state, tmp) = setup_app_append_only(0);
+        std::fs::write(tmp.path().join(".tmp.config.0"), b"x").unwrap();
+        std::fs::write(
+            tmp.path().join("packs").join("ab").join(".tmp.deadbeef.0"),
+            b"y",
+        )
+        .unwrap();
+
+        let keys = serde_json::to_vec(&serde_json::json!([
+            ".tmp.config.0",
+            "packs/ab/.tmp.deadbeef.0"
+        ]))
+        .unwrap();
+        let resp = authed_post(router, "/?batch-delete", keys).await;
+        assert_status(&resp, StatusCode::NO_CONTENT);
+        assert!(!tmp.path().join(".tmp.config.0").exists());
+        assert!(!tmp
+            .path()
+            .join("packs")
+            .join("ab")
+            .join(".tmp.deadbeef.0")
+            .exists());
+    }
+
+    #[tokio::test]
+    async fn append_only_batch_delete_mixed_forbidden_nothing_deleted() {
+        let (router, _state, tmp) = setup_app_append_only(0);
+        std::fs::write(tmp.path().join(".tmp.config.0"), b"x").unwrap();
+        std::fs::write(tmp.path().join("config"), b"cfg").unwrap();
+
+        let keys = serde_json::to_vec(&serde_json::json!([".tmp.config.0", "config"])).unwrap();
+        let resp = authed_post(router, "/?batch-delete", keys).await;
+        assert_status(&resp, StatusCode::FORBIDDEN);
+
+        // Fail-fast: nothing deleted, not even the temp key that preceded it.
+        assert!(
+            tmp.path().join(".tmp.config.0").exists(),
+            "temp must survive"
+        );
+        assert!(tmp.path().join("config").exists(), "committed must survive");
     }
 
     #[tokio::test]

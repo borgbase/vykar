@@ -23,13 +23,21 @@ const MAX_OBJECT_BODY_BYTES: usize = 512 * 1024 * 1024; // 512 MiB
 const MAX_ADMIN_BODY_BYTES: usize = 64 * 1024 * 1024; // 64 MiB
 
 pub fn router(state: AppState) -> Router {
-    // Admin routes — small body limit for JSON payloads.
+    // Admin routes — small body limit for JSON payloads, plus a concurrency
+    // cap. Admin operations (repack, verify-packs) are CPU/IO-heavy; bounding
+    // them protects the server from a pathological plan monopolizing
+    // resources. The per-action timeout lives in admin::dispatch (not a route
+    // layer) so repack — whose interrupted response would strand client index
+    // updates — can be exempted. Object routes are left untouched: 512 MiB
+    // uploads over slow links are legitimate, and slowloris is a reverse-proxy
+    // concern.
     let admin_routes = Router::new()
         .route(
             "/",
             axum::routing::get(admin::repo_dispatch).post(admin::repo_action_dispatch),
         )
-        .layer(DefaultBodyLimit::max(MAX_ADMIN_BODY_BYTES));
+        .layer(DefaultBodyLimit::max(MAX_ADMIN_BODY_BYTES))
+        .layer(tower::limit::GlobalConcurrencyLimitLayer::new(2));
 
     // Storage object routes — large body limit for pack uploads.
     let object_routes = Router::new()
@@ -82,5 +90,22 @@ async fn auth_middleware(
             "invalid or missing token",
         )
             .into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::http::StatusCode;
+
+    use super::test_helpers::{assert_status, authed_get, setup_app};
+
+    #[tokio::test]
+    async fn admin_route_works_through_hardening_layers() {
+        // Confirm the global-concurrency-limit layer on the admin router (and
+        // the per-action timeout in admin::dispatch) don't break a normal
+        // admin request.
+        let (router, _state, _tmp) = setup_app(0);
+        let resp = authed_get(router, "/?stats").await;
+        assert_status(&resp, StatusCode::OK);
     }
 }

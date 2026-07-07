@@ -31,6 +31,13 @@ pub const PACK_VERSION_MIN: u8 = 1;
 /// Always == `PACK_VERSION_CURRENT` (we can read anything we can write).
 pub const PACK_VERSION_MAX: u8 = PACK_VERSION_CURRENT;
 
+// ── Server-side operation caps (shared client ↔ server) ────────────────────
+
+/// Maximum total output bytes a single server-side repack plan may produce.
+/// The server rejects larger plans with 400; the client pre-chunks plans to
+/// stay within this so both sides agree on the boundary.
+pub const MAX_REPACK_OUTPUT_BYTES: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
+
 // ── Protocol version ───────────────────────────────────────────────────────
 
 /// Current protocol version. Sent by clients in requests.
@@ -92,6 +99,23 @@ pub struct RepackOperationRequest {
     pub source_pack: String,
     pub keep_blobs: Vec<RepackBlobRef>,
     pub delete_after: bool,
+}
+
+/// Exact on-disk output size of one repack operation: `PACK_HEADER_SIZE +
+/// Σ(4 + blob.length)`. Delete-only operations (empty `keep_blobs`) produce no
+/// pack, so they count as 0. Saturating.
+///
+/// Shared by the server (plan validation against [`MAX_REPACK_OUTPUT_BYTES`])
+/// and the client (pre-chunking plans), so both sides agree by construction.
+pub fn repack_op_output_size(op: &RepackOperationRequest) -> u64 {
+    if op.keep_blobs.is_empty() {
+        return 0;
+    }
+    let mut total = u64::try_from(PACK_HEADER_SIZE).unwrap_or(u64::MAX);
+    for blob in &op.keep_blobs {
+        total = total.saturating_add(4).saturating_add(blob.length);
+    }
+    total
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -179,9 +203,18 @@ pub const KNOWN_ROOT_DIRS: &[&str] = &[
 
 /// Returns true if `name` matches the server temp-file naming convention
 /// (`.tmp.{target}.{unique_id}`), used for atomic writes.
+///
+/// Also matches the legacy `.repack_tmp.*` prefix so already-deployed repack
+/// debris is still recognized after the prefix was unified to `.tmp.repack.*`.
+///
+/// Trailing slashes are trimmed before extracting the basename: callers use
+/// this on raw request keys, and `snapshots/.tmp.x.1/` must classify the same
+/// as `snapshots/.tmp.x.1` (path resolution trims the slashes too — a
+/// mismatch would let a temp-named key slip through committed-key checks).
 pub fn is_temp_file(name: &str) -> bool {
-    let basename = name.rsplit('/').next().unwrap_or(name);
-    basename.starts_with(".tmp.")
+    let trimmed = name.trim_end_matches('/');
+    let basename = trimmed.rsplit('/').next().unwrap_or(trimmed);
+    basename.starts_with(".tmp.") || basename.starts_with(".repack_tmp.")
 }
 
 /// Returns true if `key` is a known vykar repository storage key.
@@ -402,11 +435,55 @@ mod tests {
     fn temp_files_detected() {
         assert!(is_temp_file(".tmp.config.0"));
         assert!(is_temp_file("packs/ab/.tmp.deadbeef.0"));
+        assert!(is_temp_file(".tmp.repack.0"));
+    }
+
+    #[test]
+    fn legacy_repack_temp_files_detected() {
+        // Debris from before the prefix was unified to `.tmp.repack.*`.
+        assert!(is_temp_file(".repack_tmp.0"));
+        assert!(is_temp_file("packs/ab/.repack_tmp.42"));
+    }
+
+    #[test]
+    fn temp_files_detected_with_trailing_slash() {
+        // Path resolution trims trailing slashes, so classification must too —
+        // otherwise `snapshots/.tmp.x.1/` bypasses committed-key rejection.
+        assert!(is_temp_file(".tmp.config.0/"));
+        assert!(is_temp_file("snapshots/.tmp.evil.1/"));
+        assert!(is_temp_file("packs/ab/.repack_tmp.42//"));
+        assert!(!is_temp_file("config/"));
     }
 
     #[test]
     fn non_temp_files_not_detected() {
         assert!(!is_temp_file("config"));
         assert!(!is_temp_file("tmp.config"));
+    }
+
+    #[test]
+    fn repack_op_output_size_formula() {
+        let op = |blobs: Vec<RepackBlobRef>| RepackOperationRequest {
+            source_pack: "packs/ab/ab".to_string(),
+            keep_blobs: blobs,
+            delete_after: true,
+        };
+        // Delete-only ops produce no pack.
+        assert_eq!(repack_op_output_size(&op(vec![])), 0);
+        // Header + per-blob length prefix + blob bytes.
+        let blobs = vec![
+            RepackBlobRef {
+                offset: 13,
+                length: 100,
+            },
+            RepackBlobRef {
+                offset: 117,
+                length: 25,
+            },
+        ];
+        assert_eq!(
+            repack_op_output_size(&op(blobs)),
+            PACK_HEADER_SIZE as u64 + (4 + 100) + (4 + 25)
+        );
     }
 }

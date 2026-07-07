@@ -49,7 +49,16 @@ pub(super) fn handle_start_mount(
         Some(snap) => {
             match find_repo_for_snapshot(&ctx.runtime.repos, &repo_name, snap, &mut ctx.passphrases)
             {
-                Ok((repo, pass)) => (repo.config.clone(), pass),
+                Ok(PassphraseRun::Ran((repo, pass))) => (repo.config.clone(), pass),
+                Ok(PassphraseRun::Canceled) => {
+                    send_log(
+                        &ctx.ui_tx,
+                        format!("[{repo_name}] passphrase prompt canceled; mount skipped."),
+                    );
+                    // Reset the optimistic is_mount_active set by the UI on click.
+                    let _ = ctx.ui_tx.send(UiEvent::MountStopped);
+                    return;
+                }
                 Err(e) => {
                     guard.fail(format!("[{repo_name}] mount failed: {e}"));
                     let _ = ctx.ui_tx.send(UiEvent::MountFailed {

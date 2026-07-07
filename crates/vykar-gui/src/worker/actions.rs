@@ -32,7 +32,7 @@ pub(super) fn handle_restore_selected(
         &snapshot,
         &mut ctx.passphrases,
     ) {
-        Ok((repo, passphrase)) => {
+        Ok(PassphraseRun::Ran((repo, passphrase))) => {
             let path_set: std::collections::HashSet<String> = paths.into_iter().collect();
             match operations::restore_selected(
                 &repo.config,
@@ -85,6 +85,16 @@ pub(super) fn handle_restore_selected(
                     });
                 }
             }
+        }
+        Ok(PassphraseRun::Canceled) => {
+            send_log(
+                &ctx.ui_tx,
+                format!("[{repo_name}] passphrase prompt canceled; restore skipped."),
+            );
+            let _ = ctx.ui_tx.send(UiEvent::RestoreFinished {
+                success: false,
+                message: "Passphrase required".to_string(),
+            });
         }
         Err(e) => {
             guard.fail(format!("Failed to resolve snapshot: {e}"));

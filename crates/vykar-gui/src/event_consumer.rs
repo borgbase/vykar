@@ -191,6 +191,13 @@ fn apply_repo_model(
     let pending = ui_state::take_pending_repo_name();
     let prev_idx = ctx.ui.get_current_repo_index();
     let new_idx = resolve_repo_index(&labels, prev_idx, pending.as_deref());
+    // Capture the resolved repo's error state before `replace_repo_model` moves
+    // `items`. A failed card must not be auto-re-probed (that would fire a second
+    // passphrase dialog); the user re-probes explicitly via the Retry button.
+    let resolved_has_error = items
+        .get(new_idx as usize)
+        .map(|i| i.has_error)
+        .unwrap_or(false);
     ui_state::replace_repo_model(items, labels);
     if new_idx != prev_idx {
         ctx.ui.set_current_repo_index(new_idx);
@@ -201,11 +208,15 @@ fn apply_repo_model(
     let current_repo = ui_state::current_repo_name(ctx.ui);
     ui_state::refresh_repo_source_model(current_repo.as_deref());
 
-    // Trigger a snapshot refresh for the resolved repo.
+    // Trigger a snapshot refresh for the resolved repo, unless its card is in an
+    // error state. Retry (→ FetchRepoInfo → a fresh RepoModelData with
+    // has_error: false) then naturally re-triggers the refresh on success.
     if let Some(name) = current_repo {
-        let _ = ctx.app_tx.send(AppCommand::RefreshSnapshots {
-            repo_selector: name,
-        });
+        if !resolved_has_error {
+            let _ = ctx.app_tx.send(AppCommand::RefreshSnapshots {
+                repo_selector: name,
+            });
+        }
     }
 }
 

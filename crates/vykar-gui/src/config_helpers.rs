@@ -41,18 +41,19 @@ pub(crate) fn write_tmp_secure(path: &Path, contents: &[u8]) -> io::Result<()> {
     finish_secure_write(file, contents)
 }
 
-/// Load and fully validate a config file: parse YAML, check non-empty, validate schedule.
+/// Load and fully validate a config file: parse YAML and validate the schedule.
+/// An empty (repo-less) config is valid — it lands the UI on the welcome page.
 /// Returns the parsed repos or a human-readable error string.
 pub(crate) fn validate_config(
     config_path: &std::path::Path,
 ) -> Result<Vec<config::ResolvedRepo>, String> {
     let repos = app::load_runtime_config_from_path(config_path).map_err(|e| format!("{e}"))?;
-    let first = repos
-        .first()
-        .ok_or("Config is empty (no repositories defined).")?;
-    // Validate schedule is usable (parses interval or cron)
-    vykar_core::app::scheduler::next_run_delay(&first.config.schedule)
-        .map_err(|e| format!("Invalid schedule: {e}"))?;
+    // Validate the schedule is usable (parses interval or cron) when a repo
+    // defines one; a repo-less config has no schedule to check.
+    if let Some(first) = repos.first() {
+        vykar_core::app::scheduler::next_run_delay(&first.config.schedule)
+            .map_err(|e| format!("Invalid schedule: {e}"))?;
+    }
     Ok(repos)
 }
 
@@ -195,6 +196,19 @@ mod tests {
         #[cfg(unix)]
         assert_eq!(mode_of(&path) & 0o077, 0);
         assert_eq!(std::fs::read(&path).unwrap(), b"template");
+    }
+
+    #[test]
+    fn validate_config_accepts_empty_repo_less_config() {
+        // The starter template defines no repositories; it must validate to an
+        // empty Vec so Reload/Save/Switch land on the welcome page instead of
+        // erroring.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(&path, config::minimal_config_template()).unwrap();
+
+        let repos = validate_config(&path).expect("empty config validates");
+        assert!(repos.is_empty());
     }
 
     #[test]

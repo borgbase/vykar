@@ -42,13 +42,6 @@ fn resolve_passphrase_tracked(
     })
 }
 
-pub(crate) fn resolve_passphrase_for_repo(
-    repo: &ResolvedRepo,
-) -> Result<Option<zeroize::Zeroizing<String>>, VykarError> {
-    let mut from_dialog = false;
-    resolve_passphrase_tracked(repo, "", &mut from_dialog)
-}
-
 /// Outcome of running an operation under [`with_passphrase_retry`].
 pub(crate) enum PassphraseRun<T> {
     /// The operation ran and returned a value.
@@ -56,6 +49,10 @@ pub(crate) enum PassphraseRun<T> {
     /// The repo is encrypted and the user dismissed the passphrase prompt.
     Canceled,
 }
+
+/// A repo located by [`find_repo_for_snapshot`] together with the passphrase
+/// (if any) validated for it — `None` for a plaintext repo.
+pub(crate) type FoundRepo<'a> = (&'a ResolvedRepo, Option<zeroize::Zeroizing<String>>);
 
 /// Run `f` with a resolved passphrase, caching it **only on success**.
 ///
@@ -155,35 +152,36 @@ pub(crate) fn select_repos<'a>(
     Ok(vec![repo])
 }
 
+/// Locate the repo holding `snapshot` and validate its passphrase, routing
+/// through [`with_passphrase_retry`] so a wrong dialog entry re-prompts, bad
+/// values are never cached, and a stale cached value is evicted (self-healing).
+///
+/// Returns [`PassphraseRun::Canceled`] if the user dismisses the prompt for the
+/// matching encrypted repo. Candidate repos whose listing reports
+/// [`VykarError::SnapshotNotFound`] are skipped; other errors propagate.
 pub(crate) fn find_repo_for_snapshot<'a>(
     repos: &'a [ResolvedRepo],
     selector: &str,
     snapshot: &str,
     passphrases: &mut HashMap<String, zeroize::Zeroizing<String>>,
-) -> Result<(&'a ResolvedRepo, Option<zeroize::Zeroizing<String>>), VykarError> {
+) -> Result<PassphraseRun<FoundRepo<'a>>, VykarError> {
     for repo in select_repos(repos, selector)? {
         let key = repo.config.repository.url.clone();
-        // Use the cached (already-validated) passphrase if present; otherwise
-        // resolve without caching yet — only cache after the listing succeeds
-        // so a wrong entry never poisons the cache.
-        let (pass, cached) = match passphrases.get(&key) {
-            Some(existing) => (Some(existing.clone()), true),
-            None => (resolve_passphrase_for_repo(repo)?, false),
-        };
+        let outcome = with_passphrase_retry(repo, passphrases, 3, |pass| {
+            operations::list_snapshot_items(&repo.config, pass, snapshot).map(|_| ())
+        });
 
-        match operations::list_snapshot_items(
-            &repo.config,
-            pass.as_deref().map(|s| s.as_str()),
-            snapshot,
-        ) {
-            Ok(_) => {
-                if !cached {
-                    if let Some(ref v) = pass {
-                        passphrases.insert(key, v.clone());
-                    }
-                }
-                return Ok((repo, pass));
+        match outcome {
+            Ok(PassphraseRun::Ran(())) => {
+                // The passphrase (if any) is now validated and cached; read it
+                // back to hand to the caller. `None` for plaintext repos.
+                let pass = passphrases.get(&key).cloned();
+                return Ok(PassphraseRun::Ran((repo, pass)));
             }
+            // Callers pass a concrete repo name, so multiple candidates are
+            // rare; a canceled prompt aborts the lookup rather than falling
+            // through to the next candidate.
+            Ok(PassphraseRun::Canceled) => return Ok(PassphraseRun::Canceled),
             Err(VykarError::SnapshotNotFound(_)) => continue,
             Err(e) => return Err(e),
         }

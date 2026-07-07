@@ -173,12 +173,9 @@ pub(super) fn apply_config(
             return false;
         }
     };
-    let schedule = repos
-        .first()
-        .expect("validate_config guarantees at least one repo")
-        .config
-        .schedule
-        .clone();
+    // A repo-less config (starter template) has no schedule; the scheduler is
+    // switched off and the Overview shows "Off".
+    let schedule = repos.first().map(|r| r.config.schedule.clone());
 
     if update_source {
         use vykar_core::config::ConfigSource;
@@ -192,26 +189,35 @@ pub(super) fn apply_config(
     ctx.repo_info.clear();
 
     if let Ok(mut state) = ctx.scheduler.lock() {
-        state.enabled = schedule.enabled && ctx.scheduler_lock_held;
-        state.paused = ctx.schedule_paused || !ctx.scheduler_lock_held;
-        state.every = schedule
-            .every_duration()
-            .unwrap_or(Duration::from_secs(24 * 60 * 60));
-        state.cron = schedule.cron.clone();
-        state.jitter_seconds = schedule.jitter_seconds;
-        let delay = vykar_core::app::scheduler::next_run_delay(&schedule)
-            .unwrap_or(Duration::from_secs(24 * 60 * 60));
-        state.next_run = Some(SystemTime::now() + delay);
+        match &schedule {
+            Some(schedule) => {
+                state.enabled = schedule.enabled && ctx.scheduler_lock_held;
+                state.paused = ctx.schedule_paused || !ctx.scheduler_lock_held;
+                state.every = schedule
+                    .every_duration()
+                    .unwrap_or(Duration::from_secs(24 * 60 * 60));
+                state.cron = schedule.cron.clone();
+                state.jitter_seconds = schedule.jitter_seconds;
+                let delay = vykar_core::app::scheduler::next_run_delay(schedule)
+                    .unwrap_or(Duration::from_secs(24 * 60 * 60));
+                state.next_run = Some(SystemTime::now() + delay);
+            }
+            None => {
+                state.enabled = false;
+                state.next_run = None;
+            }
+        }
     }
     let _ = ctx.sched_notify_tx.try_send(());
 
     let canonical = dunce::canonicalize(&config_path).unwrap_or_else(|_| config_path.clone());
     ctx.config_display_path = canonical.clone();
 
-    let schedule_brief = if ctx.scheduler_lock_held {
-        scheduler::schedule_brief(&schedule, ctx.schedule_paused)
-    } else {
-        "Off".to_string()
+    let schedule_brief = match &schedule {
+        Some(schedule) if ctx.scheduler_lock_held => {
+            scheduler::schedule_brief(schedule, ctx.schedule_paused)
+        }
+        _ => "Off".to_string(),
     };
     let _ = ctx.ui_tx.send(UiEvent::ConfigInfo {
         path: canonical.display().to_string(),

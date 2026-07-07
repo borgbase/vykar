@@ -67,9 +67,13 @@ fn error_repo_info(repo_name: &str, url: &str, error: &str) -> RepoInfoData {
     }
 }
 
-/// Probe a single repository and return its card data. Never omits a repo: a
-/// failure (locked/unreachable/wrong passphrase/declined init) yields a
-/// `has_error` card with placeholder metrics so the repo stays in the sidebar.
+/// Probe a single repository and return its card data plus an optional footer
+/// failure reason. Never omits a repo: a failure (locked/unreachable/wrong
+/// passphrase/declined init) yields a `has_error` card with placeholder metrics
+/// so the repo stays in the sidebar. The second tuple element is `Some(reason)`
+/// only for failures that should redden the footer — a canceled passphrase
+/// prompt or a user-declined init is `None` (log-only), matching
+/// `handle_refresh_snapshots` semantics.
 ///
 /// Takes the disjoint context fields it needs (rather than `&mut WorkerContext`)
 /// so callers can iterate `ctx.runtime.repos` while mutating `ctx.passphrases`.
@@ -77,7 +81,7 @@ fn fetch_one_repo_info(
     ui_tx: &crossbeam_channel::Sender<UiEvent>,
     passphrases: &mut HashMap<String, zeroize::Zeroizing<String>>,
     repo: &config::ResolvedRepo,
-) -> RepoInfoData {
+) -> (RepoInfoData, Option<String>) {
     let repo_name = format_repo_name(repo);
     let url = repo.config.repository.url.clone();
 
@@ -90,30 +94,41 @@ fn fetch_one_repo_info(
     });
 
     match outcome {
-        Ok(PassphraseRun::Ran(stats)) => ok_repo_info(&repo_name, &url, &stats),
+        Ok(PassphraseRun::Ran(stats)) => (ok_repo_info(&repo_name, &url, &stats), None),
         Ok(PassphraseRun::Canceled) => {
             send_log(
                 ui_tx,
                 format!("[{repo_name}] passphrase prompt canceled; skipping."),
             );
-            error_repo_info(&repo_name, &url, "Passphrase required")
+            (
+                error_repo_info(&repo_name, &url, "Passphrase required"),
+                None,
+            )
         }
         Err(VykarError::RepoNotFound(_)) => {
             init_repo_interactive(ui_tx, passphrases, repo, &repo_name, &url, probe_pass)
         }
         Err(VykarError::DecryptionFailed) => {
             send_log(ui_tx, format!("[{repo_name}] incorrect passphrase."));
-            error_repo_info(&repo_name, &url, "Incorrect passphrase")
+            (
+                error_repo_info(&repo_name, &url, "Incorrect passphrase"),
+                Some("incorrect passphrase".to_string()),
+            )
         }
         Err(e) => {
             send_log(ui_tx, format!("[{repo_name}] info failed: {e}"));
-            error_repo_info(&repo_name, &url, &format!("{e}"))
+            (
+                error_repo_info(&repo_name, &url, &format!("{e}")),
+                Some(format!("{e}")),
+            )
         }
     }
 }
 
 /// Offer to initialize an uninitialized repo, then re-probe it. Returns the
-/// resulting card (success, declined, or failed).
+/// resulting card (success, declined, or failed) plus an optional footer failure
+/// reason — `None` when the user declines/cancels, `Some` for real failures
+/// (passphrase mismatch, init error, post-init probe error).
 fn init_repo_interactive(
     ui_tx: &crossbeam_channel::Sender<UiEvent>,
     passphrases: &mut HashMap<String, zeroize::Zeroizing<String>>,
@@ -121,7 +136,7 @@ fn init_repo_interactive(
     repo_name: &str,
     url: &str,
     probe_pass: Option<zeroize::Zeroizing<String>>,
-) -> RepoInfoData {
+) -> (RepoInfoData, Option<String>) {
     let confirmed = tinyfiledialogs::message_box_yes_no(
         &format!("{APP_TITLE} - Repository Not Initialized"),
         &format!(
@@ -136,7 +151,7 @@ fn init_repo_interactive(
             ui_tx,
             format!("[{repo_name}] Repository initialization skipped."),
         );
-        return error_repo_info(repo_name, url, "Not initialized");
+        return (error_repo_info(repo_name, url, "Not initialized"), None);
     }
 
     // Resolve the init passphrase following the canonical rule:
@@ -167,7 +182,7 @@ fn init_repo_interactive(
                     ui_tx,
                     format!("[{repo_name}] Init cancelled (no passphrase)."),
                 );
-                return error_repo_info(repo_name, url, "Not initialized");
+                return (error_repo_info(repo_name, url, "Not initialized"), None);
             }
             Some(p1_val) => {
                 let p2 = controllers::password_dialog::show_password_dialog(
@@ -178,7 +193,10 @@ fn init_repo_interactive(
                     Some(ref p2_val) if p2_val == &p1_val => Some(zeroize::Zeroizing::new(p1_val)),
                     _ => {
                         send_log(ui_tx, format!("[{repo_name}] Passphrases do not match."));
-                        return error_repo_info(repo_name, url, "Passphrases did not match");
+                        return (
+                            error_repo_info(repo_name, url, "Passphrases did not match"),
+                            Some("passphrases did not match".to_string()),
+                        );
                     }
                 }
             }
@@ -201,16 +219,22 @@ fn init_repo_interactive(
         }
         Err(init_err) => {
             send_log(ui_tx, format!("[{repo_name}] init failed: {init_err}"));
-            return error_repo_info(repo_name, url, &format!("Init failed: {init_err}"));
+            return (
+                error_repo_info(repo_name, url, &format!("Init failed: {init_err}")),
+                Some(format!("init failed: {init_err}")),
+            );
         }
     }
 
     // Re-probe with the init passphrase to populate the card.
     match vykar_core::commands::info::run(&repo.config, retry_pass.as_deref().map(|s| s.as_str())) {
-        Ok(stats) => ok_repo_info(repo_name, url, &stats),
+        Ok(stats) => (ok_repo_info(repo_name, url, &stats), None),
         Err(e) => {
             send_log(ui_tx, format!("[{repo_name}] info failed after init: {e}"));
-            error_repo_info(repo_name, url, &format!("{e}"))
+            (
+                error_repo_info(repo_name, url, &format!("{e}")),
+                Some(format!("info failed after init: {e}")),
+            )
         }
     }
 }
@@ -231,7 +255,7 @@ fn emit_repo_model(ctx: &WorkerContext) {
 }
 
 pub(super) fn handle_fetch_all_repo_info(ctx: &mut WorkerContext) {
-    let _guard = OpGuard::ui(
+    let mut guard = OpGuard::ui(
         &ctx.ui_tx,
         &ctx.cancel_requested,
         &ctx.operation_running,
@@ -249,6 +273,10 @@ pub(super) fn handle_fetch_all_repo_info(ctx: &mut WorkerContext) {
     }
 
     let total = ctx.runtime.repos.len();
+    // Aggregate per-repo failures into a single `guard.fail` after the loop, so a
+    // partial failure yields a persistent red footer rather than silently
+    // returning to "Idle". Mirrors `handle_refresh_snapshots`.
+    let mut failures: Vec<(String, String)> = Vec::new();
     for (i, repo) in ctx.runtime.repos.iter().enumerate() {
         if ctx.cancel_requested.load(Ordering::SeqCst) {
             send_log(&ctx.ui_tx, "Repository info fetch cancelled.");
@@ -260,16 +288,31 @@ pub(super) fn handle_fetch_all_repo_info(ctx: &mut WorkerContext) {
             repo_name,
             i + 1
         )));
-        let data = fetch_one_repo_info(&ctx.ui_tx, &mut ctx.passphrases, repo);
+        let (data, failure) = fetch_one_repo_info(&ctx.ui_tx, &mut ctx.passphrases, repo);
+        if let Some(reason) = failure {
+            failures.push((repo_name, reason));
+        }
         ctx.repo_info
             .insert(repo.config.repository.url.clone(), data);
+    }
+
+    if !failures.is_empty() {
+        let detail = failures
+            .iter()
+            .map(|(name, reason)| format!("[{name}] {reason}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        guard.fail(format!(
+            "{} of {total} repositories failed to load: {detail}",
+            failures.len()
+        ));
     }
 
     emit_repo_model(ctx);
 }
 
 pub(super) fn handle_fetch_repo_info(ctx: &mut WorkerContext, repo_name: String) {
-    let _guard = OpGuard::ui(
+    let mut guard = OpGuard::ui(
         &ctx.ui_tx,
         &ctx.cancel_requested,
         &ctx.operation_running,
@@ -281,7 +324,10 @@ pub(super) fn handle_fetch_repo_info(ctx: &mut WorkerContext, repo_name: String)
         None => return,
     };
     let url = repo.config.repository.url.clone();
-    let data = fetch_one_repo_info(&ctx.ui_tx, &mut ctx.passphrases, repo);
+    let (data, failure) = fetch_one_repo_info(&ctx.ui_tx, &mut ctx.passphrases, repo);
+    if let Some(reason) = failure {
+        guard.fail(format!("[{repo_name}] {reason}"));
+    }
     ctx.repo_info.insert(url, data);
     emit_repo_model(ctx);
 }
@@ -419,7 +465,7 @@ pub(super) fn handle_fetch_snapshot_contents(
         &snapshot_name,
         &mut ctx.passphrases,
     ) {
-        Ok((repo, passphrase)) => {
+        Ok(PassphraseRun::Ran((repo, passphrase))) => {
             match operations::list_snapshot_items_with_source_paths(
                 &repo.config,
                 passphrase.as_deref().map(|s| s.as_str()),
@@ -447,6 +493,12 @@ pub(super) fn handle_fetch_snapshot_contents(
                     guard.fail(format!("Failed to load snapshot items: {e}"));
                 }
             }
+        }
+        Ok(PassphraseRun::Canceled) => {
+            send_log(
+                &ctx.ui_tx,
+                format!("[{repo_name}] passphrase prompt canceled; skipping."),
+            );
         }
         Err(e) => {
             guard.fail(format!("Failed to resolve snapshot: {e}"));

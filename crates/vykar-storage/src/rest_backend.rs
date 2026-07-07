@@ -606,7 +606,19 @@ impl StorageBackend for RestBackend {
     }
 
     fn batch_delete_keys(&self, keys: &[String]) -> Result<()> {
-        self.batch_delete(keys, true)
+        // Chunk below the server's per-request key cap (200k). cleanup-dirs runs
+        // only on the final chunk, so empty directories are pruned once, after
+        // every key has been removed.
+        const CHUNK: usize = 100_000;
+        if keys.len() <= CHUNK {
+            return self.batch_delete(keys, true);
+        }
+        let mut chunks = keys.chunks(CHUNK).peekable();
+        while let Some(chunk) = chunks.next() {
+            let is_last = chunks.peek().is_none();
+            self.batch_delete(chunk, is_last)?;
+        }
+        Ok(())
     }
 
     fn server_verify_packs(&self, plan: &VerifyPacksPlanRequest) -> Result<VerifyPacksResponse> {

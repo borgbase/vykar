@@ -12,7 +12,10 @@ use crate::repo::pack::{
 };
 use crate::repo::OpenOptions;
 use crate::repo::Repository;
-use vykar_storage::{RepackBlobRef, RepackOperationRequest, RepackPlanRequest, StorageBackend};
+use vykar_storage::{
+    repack_op_output_size, RepackBlobRef, RepackOperationRequest, RepackPlanRequest,
+    StorageBackend, MAX_REPACK_OUTPUT_BYTES,
+};
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
 use vykar_types::pack_id::PackId;
@@ -514,6 +517,11 @@ fn try_server_side_repack(
         return Ok(true);
     }
 
+    let analysis_by_key: HashMap<&str, &PackAnalysis> = analyses
+        .iter()
+        .map(|analysis| (analysis.storage_key.as_str(), *analysis))
+        .collect();
+
     let mut operations = Vec::with_capacity(analyses.len());
     for analysis in analyses {
         operations.push(RepackOperationRequest {
@@ -529,77 +537,215 @@ fn try_server_side_repack(
             delete_after: true,
         });
     }
-    let plan = RepackPlanRequest {
-        operations,
-        protocol_version: vykar_storage::PROTOCOL_VERSION,
-    };
 
-    let response = match repo.storage.server_repack(&plan) {
-        Ok(resp) => resp,
-        Err(VykarError::UnsupportedBackend(_)) => return Ok(false),
-        Err(err) => return Err(err),
-    };
+    // A single operation over the server's output cap cannot be split further
+    // (one source pack = one op) and would be rejected with 400, so fall back
+    // to client-side repack instead of sending a doomed plan. Pack size limits
+    // keep this from happening in practice.
+    if operations
+        .iter()
+        .any(|op| repack_op_output_size(op) > MAX_REPACK_OUTPUT_BYTES)
+    {
+        return Ok(false);
+    }
 
-    let mut completed_by_source: HashMap<String, vykar_storage::RepackOperationResult> = response
-        .completed
-        .into_iter()
-        .map(|op| (op.source_pack.clone(), op))
-        .collect();
+    // Send one server_repack call per batch (batches stay within the server's
+    // output cap; client and server agree via MAX_REPACK_OUTPUT_BYTES), and
+    // apply each batch's results to the index as it completes. The server
+    // deletes source packs as it goes, so results already in hand must be
+    // persisted even when a later batch fails — otherwise the index would keep
+    // pointing at packs the server has already deleted.
+    let mut applied_any = false;
+    let mut first_batch = true;
+    let mut batch_err: Option<VykarError> = None;
 
-    for analysis in analyses {
-        let result = completed_by_source
-            .remove(&analysis.storage_key)
-            .ok_or_else(|| {
-                VykarError::Other(format!(
-                    "server repack response missing operation for {}",
-                    analysis.storage_key
-                ))
-            })?;
-
-        if analysis.live_entries.is_empty() {
-            if result.deleted {
-                stats.packs_deleted_empty += 1;
-                stats.space_freed += analysis.total_bytes;
+    'batches: for batch in chunk_repack_operations(operations) {
+        let plan = RepackPlanRequest {
+            operations: batch,
+            protocol_version: vykar_storage::PROTOCOL_VERSION,
+        };
+        let response = match repo.storage.server_repack(&plan) {
+            Ok(resp) => resp,
+            // Backend capability is stable, so only the first call can discover
+            // server-side repack is unsupported. After a successful batch a
+            // client-side fallback would try to re-read source packs the server
+            // has already deleted, so later errors must propagate instead.
+            Err(VykarError::UnsupportedBackend(_)) if first_batch => return Ok(false),
+            Err(err) => {
+                batch_err = Some(err);
+                break 'batches;
             }
-            continue;
-        }
+        };
+        first_batch = false;
 
-        let new_pack_key = result.new_pack.as_ref().ok_or_else(|| {
-            VykarError::Other(format!(
-                "server repack did not return new pack for {}",
-                analysis.storage_key
-            ))
-        })?;
-        let new_pack_id = PackId::from_storage_key(new_pack_key).map_err(|e| {
-            VykarError::Other(format!(
-                "server repack returned invalid pack key '{new_pack_key}': {e}"
-            ))
-        })?;
-
-        if result.new_offsets.len() != analysis.live_entries.len() {
-            return Err(VykarError::Other(format!(
-                "server repack offsets mismatch for {}: expected {}, got {}",
-                analysis.storage_key,
-                analysis.live_entries.len(),
-                result.new_offsets.len()
-            )));
-        }
-
-        for (entry, new_offset) in analysis.live_entries.iter().zip(result.new_offsets.iter()) {
-            repo.chunk_index_mut().update_location(
-                &entry.chunk_id,
-                new_pack_id,
-                *new_offset,
-                entry.length,
-            );
-        }
-
-        stats.packs_repacked += 1;
-        if result.deleted {
-            stats.space_freed += analysis.dead_bytes;
+        let mut completed_by_source: HashMap<String, vykar_storage::RepackOperationResult> =
+            response
+                .completed
+                .into_iter()
+                .map(|op| (op.source_pack.clone(), op))
+                .collect();
+        for op in &plan.operations {
+            let Some(result) = completed_by_source.remove(&op.source_pack) else {
+                batch_err = Some(VykarError::Other(format!(
+                    "server repack response missing operation for {}",
+                    op.source_pack
+                )));
+                break 'batches;
+            };
+            let analysis = analysis_by_key
+                .get(op.source_pack.as_str())
+                .expect("operation was built from these analyses");
+            if let Err(err) = apply_repack_result(repo, analysis, &result, stats) {
+                batch_err = Some(err);
+                break 'batches;
+            }
+            applied_any = true;
         }
     }
 
-    repo.save_state()?;
-    Ok(true)
+    // Persist index updates for every applied operation, even on a partial
+    // failure — their source packs are already gone server-side.
+    if applied_any || batch_err.is_none() {
+        repo.save_state()?;
+    }
+    match batch_err {
+        Some(err) => Err(err),
+        None => Ok(true),
+    }
+}
+
+/// Apply one completed server-side repack operation to the local chunk index
+/// and stats. Errors (missing/invalid new pack, offsets mismatch) leave the
+/// index untouched for this operation.
+fn apply_repack_result(
+    repo: &mut Repository,
+    analysis: &PackAnalysis,
+    result: &vykar_storage::RepackOperationResult,
+    stats: &mut CompactStats,
+) -> Result<()> {
+    if analysis.live_entries.is_empty() {
+        if result.deleted {
+            stats.packs_deleted_empty += 1;
+            stats.space_freed += analysis.total_bytes;
+        }
+        return Ok(());
+    }
+
+    let new_pack_key = result.new_pack.as_ref().ok_or_else(|| {
+        VykarError::Other(format!(
+            "server repack did not return new pack for {}",
+            analysis.storage_key
+        ))
+    })?;
+    let new_pack_id = PackId::from_storage_key(new_pack_key).map_err(|e| {
+        VykarError::Other(format!(
+            "server repack returned invalid pack key '{new_pack_key}': {e}"
+        ))
+    })?;
+
+    if result.new_offsets.len() != analysis.live_entries.len() {
+        return Err(VykarError::Other(format!(
+            "server repack offsets mismatch for {}: expected {}, got {}",
+            analysis.storage_key,
+            analysis.live_entries.len(),
+            result.new_offsets.len()
+        )));
+    }
+
+    for (entry, new_offset) in analysis.live_entries.iter().zip(result.new_offsets.iter()) {
+        repo.chunk_index_mut().update_location(
+            &entry.chunk_id,
+            new_pack_id,
+            *new_offset,
+            entry.length,
+        );
+    }
+
+    stats.packs_repacked += 1;
+    if result.deleted {
+        stats.space_freed += analysis.dead_bytes;
+    }
+    Ok(())
+}
+
+/// Split repack operations into batches whose summed output stays within
+/// [`MAX_REPACK_OUTPUT_BYTES`]. A single operation over the cap is caught
+/// before batching (client-side repack fallback in `try_server_side_repack`),
+/// so every batch produced here is within the server's limit.
+fn chunk_repack_operations(
+    operations: Vec<RepackOperationRequest>,
+) -> Vec<Vec<RepackOperationRequest>> {
+    let mut batches = Vec::new();
+    let mut current = Vec::new();
+    let mut current_size = 0u64;
+    for op in operations {
+        let size = repack_op_output_size(&op);
+        if !current.is_empty() && current_size.saturating_add(size) > MAX_REPACK_OUTPUT_BYTES {
+            batches.push(std::mem::take(&mut current));
+            current_size = 0;
+        }
+        current_size = current_size.saturating_add(size);
+        current.push(op);
+    }
+    if !current.is_empty() {
+        batches.push(current);
+    }
+    batches
+}
+
+#[cfg(test)]
+mod repack_chunk_tests {
+    use super::chunk_repack_operations;
+    use vykar_storage::{
+        repack_op_output_size, RepackBlobRef, RepackOperationRequest, MAX_REPACK_OUTPUT_BYTES,
+    };
+
+    fn op_with_blob(length: u64) -> RepackOperationRequest {
+        RepackOperationRequest {
+            source_pack: format!("packs/ab/{}", "ab".repeat(32)),
+            keep_blobs: vec![RepackBlobRef { offset: 13, length }],
+            delete_after: true,
+        }
+    }
+
+    #[test]
+    fn empty_input_yields_no_batches() {
+        assert!(chunk_repack_operations(vec![]).is_empty());
+    }
+
+    #[test]
+    fn small_ops_stay_in_one_batch() {
+        let ops = vec![op_with_blob(100), op_with_blob(200), op_with_blob(300)];
+        let batches = chunk_repack_operations(ops);
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].len(), 3);
+    }
+
+    #[test]
+    fn ops_straddling_cap_split_into_batches() {
+        // Two ops each just over half the cap must not share a batch.
+        let half_plus = MAX_REPACK_OUTPUT_BYTES / 2 + 1;
+        let ops = vec![op_with_blob(half_plus), op_with_blob(half_plus)];
+        let batches = chunk_repack_operations(ops);
+        assert_eq!(
+            batches.len(),
+            2,
+            "each op exceeds half the cap -> own batch"
+        );
+        for batch in &batches {
+            let total: u64 = batch.iter().map(repack_op_output_size).sum();
+            assert!(total <= MAX_REPACK_OUTPUT_BYTES, "batch within cap");
+        }
+    }
+
+    #[test]
+    fn single_oversize_op_is_its_own_batch() {
+        let ops = vec![
+            op_with_blob(10),
+            op_with_blob(MAX_REPACK_OUTPUT_BYTES + 1),
+            op_with_blob(10),
+        ];
+        let batches = chunk_repack_operations(ops);
+        assert_eq!(batches.len(), 3, "oversize op isolates the ops around it");
+    }
 }

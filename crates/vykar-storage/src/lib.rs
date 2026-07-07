@@ -33,9 +33,10 @@ use vykar_types::error::{Result, VykarError};
 
 // Re-export wire-format types from vykar-protocol (shared with vykar-server).
 pub use vykar_protocol::{
-    RepackBlobRef, RepackOperationRequest, RepackOperationResult, RepackPlanRequest,
-    RepackResultResponse, VerifyBlobRef, VerifyPackRequest, VerifyPackResult,
-    VerifyPacksPlanRequest, VerifyPacksResponse, PROTOCOL_VERSION,
+    repack_op_output_size, RepackBlobRef, RepackOperationRequest, RepackOperationResult,
+    RepackPlanRequest, RepackResultResponse, VerifyBlobRef, VerifyPackRequest, VerifyPackResult,
+    VerifyPacksPlanRequest, VerifyPacksResponse, MAX_REPACK_OUTPUT_BYTES, PACK_HEADER_SIZE,
+    PROTOCOL_VERSION,
 };
 
 /// Abstract key-value storage for repository objects.

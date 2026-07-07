@@ -3,14 +3,15 @@ use std::sync::atomic::Ordering;
 use vykar_core::app::operations;
 use vykar_core::commands::backup::BackupProgressEvent;
 use vykar_core::config;
+use vykar_types::error::VykarError;
 
 use crate::messages::{AppCommand, UiEvent};
 use crate::progress::{format_check_status, format_step_outcome, BackupStatusTracker};
 use crate::repo_helpers::{
-    format_repo_name, get_or_resolve_passphrase, log_backup_report, send_log,
+    format_repo_name, log_backup_report, send_log, with_passphrase_retry, PassphraseRun,
 };
 
-use super::shared::{begin_backup_operation, end_backup_operation, run_selection_with_progress};
+use super::shared::{run_selection_with_progress, OpGuard};
 use super::WorkerContext;
 
 pub(super) fn handle_backup_all(ctx: &mut WorkerContext, scheduled: bool) {
@@ -19,9 +20,20 @@ pub(super) fn handle_backup_all(ctx: &mut WorkerContext, scheduled: bool) {
     } else {
         "Running backup cycle..."
     };
-    begin_backup_operation(ctx, status);
+    let mut guard = OpGuard::backup(
+        &ctx.ui_tx,
+        &ctx.cancel_requested,
+        &ctx.operation_running,
+        &ctx.backup_running,
+        &ctx.sched_notify_tx,
+        status,
+    );
 
     let mut any_snapshots_created = false;
+    // Per-repo failures, aggregated into a single `guard.fail` after the loop so
+    // a partial failure shows one red status naming the failed repos (rather than
+    // a per-iteration flash that a later success would visually overwrite).
+    let mut failures: Vec<(String, String)> = Vec::new();
     let total = ctx.runtime.repos.len();
     for (i, repo) in ctx.runtime.repos.iter().enumerate() {
         if ctx.cancel_requested.load(Ordering::SeqCst) {
@@ -36,25 +48,41 @@ pub(super) fn handle_backup_all(ctx: &mut WorkerContext, scheduled: bool) {
             i + 1
         )));
 
-        let passphrase = match get_or_resolve_passphrase(repo, &mut ctx.passphrases) {
-            Ok(pass) => pass,
-            Err(e) => {
+        // Validate + cache the passphrase before the cycle (retry on a wrong
+        // dialog entry; a wrong value is never cached). `run_full_cycle_for_repo`
+        // buries decryption failures inside `steps` as a string, so it cannot
+        // drive `with_passphrase_retry` directly — the `info::run` probe does.
+        let outcome = with_passphrase_retry(repo, &mut ctx.passphrases, 3, |pass| {
+            vykar_core::commands::info::run(&repo.config, pass)
+        });
+        let passphrase = match outcome {
+            Ok(PassphraseRun::Ran(_)) => ctx.passphrases.get(&repo.config.repository.url).cloned(),
+            Ok(PassphraseRun::Canceled) => {
                 send_log(
                     &ctx.ui_tx,
-                    format!("[{repo_name}] failed to resolve passphrase: {e}"),
+                    format!("[{repo_name}] passphrase prompt canceled; skipping this repository"),
                 );
                 continue;
             }
+            Err(VykarError::RepoNotFound(_)) => {
+                // An uninitialized repo cannot be backed up; surface it as a
+                // failure rather than crashing the cycle below.
+                send_log(
+                    &ctx.ui_tx,
+                    format!("[{repo_name}] repository not initialized; skipping."),
+                );
+                failures.push((repo_name.clone(), "repository not initialized".to_string()));
+                continue;
+            }
+            Err(e) => {
+                send_log(
+                    &ctx.ui_tx,
+                    format!("[{repo_name}] failed to open repository: {e}"),
+                );
+                failures.push((repo_name.clone(), format!("{e}")));
+                continue;
+            }
         };
-
-        if repo.config.encryption.mode != config::EncryptionModeConfig::None && passphrase.is_none()
-        {
-            send_log(
-                &ctx.ui_tx,
-                format!("[{repo_name}] passphrase prompt canceled; skipping this repository"),
-            );
-            continue;
-        }
 
         let mut tracker = BackupStatusTracker::new(repo_name.clone());
         let ui_tx_progress = ctx.ui_tx.clone();
@@ -108,14 +136,39 @@ pub(super) fn handle_backup_all(ctx: &mut WorkerContext, scheduled: bool) {
                 send_log(&ctx.ui_tx, msg);
             }
         }
+
+        if result.has_failures() {
+            let reason = result
+                .steps
+                .iter()
+                .filter_map(|(step, o)| match o {
+                    operations::StepOutcome::Failed(e) => {
+                        Some(format!("{} failed: {e}", step.command_name()))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            failures.push((repo_name.clone(), reason));
+        }
+    }
+
+    if !failures.is_empty() {
+        let detail = failures
+            .iter()
+            .map(|(name, reason)| format!("[{name}] {reason}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        guard.fail(format!(
+            "Backup failed for {} of {total} repositories: {detail}",
+            failures.len()
+        ));
     }
 
     if any_snapshots_created {
         let _ = ctx.ui_tx.send(UiEvent::TriggerSnapshotRefresh);
         let _ = ctx.app_tx.send(AppCommand::FetchAllRepoInfo);
     }
-
-    end_backup_operation(ctx);
 }
 
 pub(super) fn handle_backup_repo(ctx: &mut WorkerContext, repo_name: String) {
@@ -137,33 +190,21 @@ pub(super) fn handle_backup_repo(ctx: &mut WorkerContext, repo_name: String) {
     };
 
     let rn = format_repo_name(repo);
-    begin_backup_operation(ctx, format!("Running backup for [{rn}]..."));
+    let mut guard = OpGuard::backup(
+        &ctx.ui_tx,
+        &ctx.cancel_requested,
+        &ctx.operation_running,
+        &ctx.backup_running,
+        &ctx.sched_notify_tx,
+        format!("Running backup for [{rn}]..."),
+    );
 
-    let passphrase = match get_or_resolve_passphrase(repo, &mut ctx.passphrases) {
-        Ok(p) => p,
-        Err(e) => {
-            send_log(&ctx.ui_tx, format!("[{rn}] passphrase error: {e}"));
-            end_backup_operation(ctx);
-            return;
-        }
-    };
+    let outcome = with_passphrase_retry(repo, &mut ctx.passphrases, 3, |pass| {
+        run_selection_with_progress(&ctx.ui_tx, &ctx.cancel_requested, repo, &repo.sources, pass)
+    });
 
-    if repo.config.encryption.mode != config::EncryptionModeConfig::None && passphrase.is_none() {
-        send_log(
-            &ctx.ui_tx,
-            format!("[{rn}] passphrase prompt canceled; skipping."),
-        );
-        end_backup_operation(ctx);
-        return;
-    }
-
-    match run_selection_with_progress(
-        ctx,
-        repo,
-        &repo.sources,
-        passphrase.as_deref().map(|s| s.as_str()),
-    ) {
-        Ok(report) => {
+    match outcome {
+        Ok(PassphraseRun::Ran(report)) => {
             if !report.created.is_empty() {
                 let _ = ctx.app_tx.send(AppCommand::RefreshSnapshots {
                     repo_selector: rn.clone(),
@@ -172,10 +213,16 @@ pub(super) fn handle_backup_repo(ctx: &mut WorkerContext, repo_name: String) {
             }
             log_backup_report(&ctx.ui_tx, &rn, &report);
         }
-        Err(e) => send_log(&ctx.ui_tx, format!("[{rn}] backup failed: {e}")),
+        Ok(PassphraseRun::Canceled) => {
+            send_log(
+                &ctx.ui_tx,
+                format!("[{rn}] passphrase prompt canceled; skipping."),
+            );
+        }
+        Err(e) => {
+            guard.fail(format!("[{rn}] backup failed: {e}"));
+        }
     }
-
-    end_backup_operation(ctx);
 }
 
 pub(super) fn handle_backup_source(ctx: &mut WorkerContext, source_label: String) {
@@ -185,12 +232,22 @@ pub(super) fn handle_backup_source(ctx: &mut WorkerContext, source_label: String
         return;
     }
 
-    begin_backup_operation(
-        ctx,
+    let mut guard = OpGuard::backup(
+        &ctx.ui_tx,
+        &ctx.cancel_requested,
+        &ctx.operation_running,
+        &ctx.backup_running,
+        &ctx.sched_notify_tx,
         format!("Running backup for source '{source_label}'..."),
     );
 
     let mut any_backed_up = false;
+    // Repos that actually carry the source (attempted), and per-repo failures
+    // aggregated into a single `guard.fail` after the loop — mirrors
+    // `handle_backup_all` so a partial failure shows one red status naming the
+    // failed repos rather than a misleading all-red state.
+    let mut attempted = 0usize;
+    let mut failures: Vec<(String, String)> = Vec::new();
     let total = ctx.runtime.repos.len();
     for (i, repo) in ctx.runtime.repos.iter().enumerate() {
         if ctx.cancel_requested.load(Ordering::SeqCst) {
@@ -208,6 +265,7 @@ pub(super) fn handle_backup_source(ctx: &mut WorkerContext, source_label: String
         if matching_sources.is_empty() {
             continue;
         }
+        attempted += 1;
 
         let repo_name = format_repo_name(repo);
         let _ = ctx.ui_tx.send(UiEvent::Status(format!(
@@ -216,39 +274,46 @@ pub(super) fn handle_backup_source(ctx: &mut WorkerContext, source_label: String
             i + 1
         )));
 
-        let passphrase = match get_or_resolve_passphrase(repo, &mut ctx.passphrases) {
-            Ok(p) => p,
-            Err(e) => {
-                send_log(&ctx.ui_tx, format!("[{repo_name}] passphrase error: {e}"));
-                continue;
-            }
-        };
-
-        if repo.config.encryption.mode != config::EncryptionModeConfig::None && passphrase.is_none()
-        {
-            send_log(
+        let outcome = with_passphrase_retry(repo, &mut ctx.passphrases, 3, |pass| {
+            run_selection_with_progress(
                 &ctx.ui_tx,
-                format!("[{repo_name}] passphrase prompt canceled; skipping."),
-            );
-            continue;
-        }
+                &ctx.cancel_requested,
+                repo,
+                &matching_sources,
+                pass,
+            )
+        });
 
-        match run_selection_with_progress(
-            ctx,
-            repo,
-            &matching_sources,
-            passphrase.as_deref().map(|s| s.as_str()),
-        ) {
-            Ok(report) => {
+        match outcome {
+            Ok(PassphraseRun::Ran(report)) => {
                 if !report.created.is_empty() {
                     any_backed_up = true;
                 }
                 log_backup_report(&ctx.ui_tx, &repo_name, &report);
             }
+            Ok(PassphraseRun::Canceled) => {
+                send_log(
+                    &ctx.ui_tx,
+                    format!("[{repo_name}] passphrase prompt canceled; skipping."),
+                );
+            }
             Err(e) => {
                 send_log(&ctx.ui_tx, format!("[{repo_name}] backup failed: {e}"));
+                failures.push((repo_name.clone(), format!("{e}")));
             }
         }
+    }
+
+    if !failures.is_empty() {
+        let detail = failures
+            .iter()
+            .map(|(name, reason)| format!("[{name}] {reason}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        guard.fail(format!(
+            "Backup failed for {} of {attempted} repositories with source '{source_label}': {detail}",
+            failures.len()
+        ));
     }
 
     if !any_backed_up {
@@ -260,6 +325,4 @@ pub(super) fn handle_backup_source(ctx: &mut WorkerContext, source_label: String
         let _ = ctx.ui_tx.send(UiEvent::TriggerSnapshotRefresh);
         let _ = ctx.app_tx.send(AppCommand::FetchAllRepoInfo);
     }
-
-    end_backup_operation(ctx);
 }

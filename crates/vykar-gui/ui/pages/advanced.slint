@@ -33,20 +33,24 @@ export component AdvancedPage inherits Rectangle {
                 font-size: 16px;
                 horizontal-stretch: 1;
             }
+            // Config editing stays available even while an operation runs
+            // (e.g. startup repo probing on an unreachable repo). Worker
+            // commands are processed serially, so a queued reload/save applies
+            // safely after the in-flight operation completes.
             Button {
                 text: "Reload";
-                enabled: !root.operation_busy && !root.editor_dirty;
+                enabled: !root.editor_dirty;
                 clicked => { root.reload_config_clicked(); }
             }
             Button {
                 text: "Discard Changes";
-                enabled: root.editor_dirty && !root.operation_busy;
+                enabled: root.editor_dirty;
                 clicked => { root.discard_clicked(); }
             }
             Button {
                 text: "Save and Apply";
                 primary: true;
-                enabled: root.editor_dirty && !root.operation_busy;
+                enabled: root.editor_dirty;
                 clicked => { root.save_clicked(); }
             }
         }

@@ -100,6 +100,45 @@ mod tests {
         assert_eq!(restored.last_repo_name.as_deref(), Some("local-backup"));
     }
 
+    /// Every `Page` variant, in declaration order. Keep in sync with the enum
+    /// in `ui/components/types.slint` and with [`page_from_i32`]/[`page_to_i32`].
+    /// A missing/extra variant here (or a reordered one in the Slint enum) is
+    /// caught by the round-trip below and by the exhaustive `page_to_i32` match.
+    const ALL_PAGES: [crate::Page; 7] = [
+        crate::Page::Overview,
+        crate::Page::Snapshots,
+        crate::Page::Find,
+        crate::Page::Sources,
+        crate::Page::Advanced,
+        crate::Page::Log,
+        crate::Page::Settings,
+    ];
+
+    #[test]
+    fn page_ordinals_round_trip_and_are_contiguous() {
+        for (expected, page) in ALL_PAGES.iter().enumerate() {
+            let ord = page_to_i32(*page);
+            assert_eq!(
+                ord, expected as i32,
+                "page_to_i32 ordinal drifted from declaration order for {page:?}"
+            );
+            assert_eq!(
+                page_from_i32(ord),
+                *page,
+                "page_from_i32/page_to_i32 disagree for {page:?}"
+            );
+        }
+        // Ordinals form a contiguous 0..N with no gaps or duplicates.
+        let ordinals: Vec<i32> = ALL_PAGES.iter().map(|p| page_to_i32(*p)).collect();
+        assert_eq!(ordinals, (0..ALL_PAGES.len() as i32).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn page_from_i32_out_of_range_falls_back_to_overview() {
+        assert_eq!(page_from_i32(-1), crate::Page::Overview);
+        assert_eq!(page_from_i32(999), crate::Page::Overview);
+    }
+
     #[test]
     fn backwards_compat_missing_field() {
         // Old gui_state.json without start_in_background.

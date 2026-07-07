@@ -1,0 +1,56 @@
+import { VerticalBox, Button, Palette } from "std-widgets.slint";
+
+// Shown on first run (or after loading a config with no repositories):
+// explains where the config lives and points at the editor.
+export component WelcomePage inherits Rectangle {
+    in property <string> config_path;
+
+    callback edit_config_clicked();
+
+    VerticalBox {
+        alignment: center;
+        padding: 40px;
+        spacing: 16px;
+
+        HorizontalLayout {
+            alignment: center;
+            Text {
+                text: "No repositories configured";
+                font-size: 20px;
+                font-weight: 700;
+                horizontal-alignment: center;
+            }
+        }
+
+        HorizontalLayout {
+            alignment: center;
+            Text {
+                text: "Vykar backs up your files to one or more repositories.\n"
+                    + "Add at least one repository to your configuration file to get started.";
+                color: #888888;
+                horizontal-alignment: center;
+                wrap: word-wrap;
+            }
+        }
+
+        if root.config_path != "": HorizontalLayout {
+            alignment: center;
+            Text {
+                text: "Configuration file:\n" + root.config_path;
+                font-size: 12px;
+                color: #888888;
+                horizontal-alignment: center;
+                wrap: word-wrap;
+            }
+        }
+
+        HorizontalLayout {
+            alignment: center;
+            Button {
+                text: "Edit configuration";
+                primary: true;
+                clicked => { root.edit_config_clicked(); }
+            }
+        }
+    }
+}

@@ -12,6 +12,11 @@ component MetricCard inherits Rectangle {
     min-height: 70px;
     horizontal-stretch: 1;
 
+    // Hover reveals the full value when the card elides it.
+    if root.value != "": Tooltip {
+        text: @markdown("\{root.caption}: \{root.value}");
+    }
+
     VerticalLayout {
         padding: 10px;
         spacing: 4px;
@@ -37,6 +42,7 @@ export component OverviewPage inherits Rectangle {
     in property <bool> operation_busy;
 
     callback backup_clicked();
+    callback retry_clicked();
     callback view_all_snapshots_clicked();
     callback view_all_sources_clicked();
     callback toggle_source_expanded(int);
@@ -62,15 +68,49 @@ export component OverviewPage inherits Rectangle {
                     Button {
                         text: "Run Backup";
                         primary: true;
-                        enabled: !root.operation_busy;
+                        // A repo that failed to load can't be backed up.
+                        enabled: !root.operation_busy && !root.repo.has_error;
                         clicked => { root.backup_clicked(); }
                     }
                 }
             }
         }
 
+        // Error state: banner + Retry, replacing the metrics/snapshots/sources.
+        if root.repo.has_error: Rectangle {
+            property <bool> dark: Palette.color-scheme == ColorScheme.dark;
+            vertical-stretch: 1;
+            border-width: 1px;
+            border-color: #d32f2f;
+            border-radius: 6px;
+            background: dark ? #3a1f1f : #fdecea;
+            VerticalLayout {
+                padding: 16px;
+                spacing: 10px;
+                alignment: start;
+                Text {
+                    text: "This repository could not be loaded.";
+                    font-weight: 700;
+                    color: #d32f2f;
+                }
+                Text {
+                    text: root.repo.error;
+                    color: Palette.foreground;
+                    wrap: word-wrap;
+                }
+                HorizontalLayout {
+                    alignment: start;
+                    Button {
+                        text: "Retry";
+                        enabled: !root.operation_busy;
+                        clicked => { root.retry_clicked(); }
+                    }
+                }
+            }
+        }
+
         // Metric cards
-        HorizontalLayout {
+        if !root.repo.has_error: HorizontalLayout {
             spacing: 10px;
             MetricCard { caption: "Snapshots"; value: root.repo.snapshots; }
             MetricCard { caption: "Size"; value: root.repo.size; }
@@ -79,7 +119,7 @@ export component OverviewPage inherits Rectangle {
         }
 
         // Recent snapshots
-        VerticalLayout {
+        if !root.repo.has_error: VerticalLayout {
             spacing: 4px;
             HorizontalLayout {
                 Text { text: "Recent snapshots"; font-weight: 700; horizontal-stretch: 1; }
@@ -107,7 +147,7 @@ export component OverviewPage inherits Rectangle {
         }
 
         // Sources going into this repo
-        VerticalLayout {
+        if !root.repo.has_error: VerticalLayout {
             spacing: 4px;
             vertical-stretch: 1;
             HorizontalLayout {

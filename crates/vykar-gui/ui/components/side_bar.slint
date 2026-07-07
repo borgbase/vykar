@@ -20,11 +20,17 @@ export component SideBarItem inherits Rectangle {
     in property <bool> selected;
     in property <string> text;
     in property <int> count: 0;
+    // Optional hover tooltip (e.g. a repo's full URL or its load-error message).
+    in property <string> tooltip_text: "";
 
     callback clicked <=> touch.clicked;
 
     min-height: 28px;
     border-radius: 4px;
+
+    if root.tooltip_text != "": Tooltip {
+        text: @markdown("\{root.tooltip_text}");
+    }
 
     states [
         pressed when touch.pressed: {

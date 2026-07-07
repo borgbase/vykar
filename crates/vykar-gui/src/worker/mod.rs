@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime};
 use crossbeam_channel::{Receiver, Sender};
 use vykar_core::app;
 
-use crate::messages::{AppCommand, UiEvent};
+use crate::messages::{AppCommand, RepoInfoData, UiEvent};
 use crate::repo_helpers::send_log;
 use crate::scheduler;
 use crate::view_models::send_structured_data;
@@ -21,6 +21,9 @@ mod shared;
 
 pub(super) struct WorkerContext {
     pub(super) passphrases: HashMap<String, zeroize::Zeroizing<String>>,
+    /// Last-known per-repo card data, keyed by repository URL. Lets a
+    /// single-repo `FetchRepoInfo` re-emit a full, in-order `RepoModelData`.
+    pub(super) repo_info: HashMap<String, RepoInfoData>,
     pub(super) config_display_path: PathBuf,
     pub(super) runtime: app::RuntimeConfig,
 
@@ -30,6 +33,9 @@ pub(super) struct WorkerContext {
 
     pub(super) scheduler: Arc<Mutex<scheduler::SchedulerState>>,
     pub(super) backup_running: Arc<AtomicBool>,
+    /// Set while any operation (backup *or* UI read) is running. Drives the
+    /// tray "Cancel" item, mirroring the window Cancel button.
+    pub(super) operation_running: Arc<AtomicBool>,
     pub(super) cancel_requested: Arc<AtomicBool>,
 
     pub(super) scheduler_lock_held: bool,
@@ -102,6 +108,7 @@ pub(crate) fn run_worker(
     ui_tx: Sender<UiEvent>,
     scheduler: Arc<Mutex<scheduler::SchedulerState>>,
     backup_running: Arc<AtomicBool>,
+    operation_running: Arc<AtomicBool>,
     cancel_requested: Arc<AtomicBool>,
     runtime: app::RuntimeConfig,
     scheduler_lock_held: bool,
@@ -112,6 +119,7 @@ pub(crate) fn run_worker(
 
     let mut ctx = WorkerContext {
         passphrases: HashMap::new(),
+        repo_info: HashMap::new(),
         config_display_path,
         runtime,
         app_tx,
@@ -119,6 +127,7 @@ pub(crate) fn run_worker(
         sched_notify_tx,
         scheduler,
         backup_running,
+        operation_running,
         cancel_requested,
         scheduler_lock_held,
         schedule_paused: !scheduler_lock_held,
@@ -139,6 +148,9 @@ pub(crate) fn run_worker(
                 backup::handle_backup_source(&mut ctx, source_label)
             }
             AppCommand::FetchAllRepoInfo => repo_info::handle_fetch_all_repo_info(&mut ctx),
+            AppCommand::FetchRepoInfo { repo_name } => {
+                repo_info::handle_fetch_repo_info(&mut ctx, repo_name)
+            }
             AppCommand::RefreshSnapshots { repo_selector } => {
                 repo_info::handle_refresh_snapshots(&mut ctx, repo_selector)
             }

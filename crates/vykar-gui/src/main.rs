@@ -7,14 +7,13 @@
 #![allow(clippy::todo, clippy::unimplemented, clippy::unreachable)]
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
-use std::thread;
 
 use slint::ComponentHandle;
-use tray_icon::menu::MenuEvent;
 
 mod autostart;
+mod bootstrap;
 mod config_helpers;
 mod controllers;
 mod event_consumer;
@@ -31,7 +30,6 @@ mod update_check;
 mod view_models;
 mod worker;
 use messages::{log_entry_now, AppCommand, UiEvent};
-use repo_helpers::send_log;
 
 const APP_TITLE: &str = "Vykar Backup";
 
@@ -81,6 +79,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let scheduler = Arc::new(Mutex::new(scheduler::SchedulerState::default()));
     let backup_running = Arc::new(AtomicBool::new(false));
+    // Set while *any* worker operation runs (backup or UI read); drives the tray
+    // "Cancel" item so it matches the window Cancel button.
+    let operation_running = Arc::new(AtomicBool::new(false));
     let cancel_requested = Arc::new(AtomicBool::new(false));
 
     // Attempt to acquire the process-wide scheduler lock.
@@ -101,117 +102,24 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── Fallible UI / tray initialization (before spawning any threads) ──
 
-    let ui = MainWindow::new()?;
-    if let (Some(w), Some(h)) = (gui_state.window_width, gui_state.window_height) {
-        ui.window().set_size(slint::LogicalSize::new(w, h));
-    }
-    if let Some(p) = gui_state.last_page {
-        ui.set_current_page(state::page_from_i32(p));
-    }
-    // Selection is resolved by name once RepoModelData arrives. Holding the
-    // name in UI-thread state avoids the stale-index bug where repo filtering
-    // leaves the saved index pointing at the wrong row.
-    ui_state::install(&ui, gui_state.last_repo_name.clone());
-    ui.set_config_path("(loading...)".into());
-    ui.set_editor_font_family(
-        if cfg!(target_os = "macos") {
-            "Menlo"
-        } else if cfg!(target_os = "windows") {
-            "Consolas"
-        } else {
-            "DejaVu Sans Mono"
-        }
-        .into(),
-    );
-    ui.set_status_text("Idle".into());
-    ui.set_version_text(format!("v{}", env!("CARGO_PKG_VERSION")).into());
-
-    // Seed the AppData global with the initial config path.
-    ui.global::<AppData>()
-        .set_active_config_path(initial_config_path.into());
-
-    // On Linux, tray-icon requires a running GTK event loop for D-Bus
-    // registration (AppIndicator) and menu signals. Spawn a dedicated thread
-    // that owns the tray icon and runs gtk::main() — fully event-driven,
-    // zero CPU when idle. On other platforms the tray icon lives on the main
-    // thread and no GTK integration is needed.
-    #[cfg(target_os = "linux")]
-    let (open_item_id, run_now_item_id, quit_item_id, cancel_item_id) = {
-        use tray_icon::menu::MenuId;
-        let (ids_tx, ids_rx) =
-            std::sync::mpsc::sync_channel::<Result<(MenuId, MenuId, MenuId, MenuId), String>>(1);
-        thread::spawn(move || {
-            if let Err(e) = gtk::init() {
-                let _ = ids_tx.send(Err(format!("Failed to initialize GTK: {e}")));
-                return;
-            }
-            match tray::build_tray_icon() {
-                Ok((_tray, open_id, run_now_id, quit_id, source_submenu, cancel_id)) => {
-                    tray_state::set_submenu(source_submenu);
-                    let _ = ids_tx.send(Ok((open_id, run_now_id, quit_id, cancel_id)));
-                    gtk::main();
-                }
-                Err(e) => {
-                    let _ = ids_tx.send(Err(format!("failed to initialize tray icon: {e}")));
-                }
-            }
-        });
-        ids_rx
-            .recv()
-            .map_err(|_| "GTK thread exited unexpectedly")??
-    };
-
-    #[cfg(not(target_os = "linux"))]
-    let (_tray_icon, open_item_id, run_now_item_id, quit_item_id, source_submenu, cancel_item_id) =
-        tray::build_tray_icon().map_err(|e| format!("failed to initialize tray icon: {e}"))?;
-
-    #[cfg(not(target_os = "linux"))]
-    tray_state::set_submenu(source_submenu);
+    let ui = bootstrap::init_main_window(&gui_state, initial_config_path)?;
+    let tray = bootstrap::spawn_tray()?;
 
     // ── Background threads (only after all fallible init succeeded) ──
 
-    scheduler::spawn_scheduler(
+    bootstrap::spawn_background_threads(
         app_tx.clone(),
+        app_rx,
         ui_tx.clone(),
-        scheduler.clone(),
+        scheduler,
         backup_running.clone(),
+        operation_running.clone(),
+        cancel_requested.clone(),
+        runtime,
+        scheduler_lock_held,
+        sched_notify_tx,
         sched_notify_rx,
     );
-
-    let ui_tx_for_cancel = ui_tx.clone();
-
-    // Best-effort, once-per-launch update check. Detached from the worker so the
-    // network call never delays startup commands.
-    let ui_tx_update = ui_tx_for_cancel.clone();
-    thread::spawn(move || {
-        if let Some(info) = update_check::check(env!("CARGO_PKG_VERSION")) {
-            let _ = ui_tx_update.send(UiEvent::UpdateAvailable {
-                version: info.version,
-                url: info.url,
-            });
-        }
-    });
-
-    thread::spawn({
-        let app_tx = app_tx.clone();
-        let scheduler = scheduler.clone();
-        let backup_running = backup_running.clone();
-        let cancel_requested = cancel_requested.clone();
-        let sched_notify_tx = sched_notify_tx.clone();
-        move || {
-            worker::run_worker(
-                app_tx,
-                app_rx,
-                ui_tx,
-                scheduler,
-                backup_running,
-                cancel_requested,
-                runtime,
-                scheduler_lock_held,
-                sched_notify_tx,
-            )
-        }
-    });
 
     // ── Event consumer ──
 
@@ -231,156 +139,22 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     controllers::main_window::wire_callbacks(
         &ui,
         app_tx.clone(),
-        ui_tx_for_cancel.clone(),
+        ui_tx.clone(),
         cancel_requested.clone(),
     );
 
-    // ── Settings tab initialization ──
+    // ── Settings tab + window lifecycle + tray event loop ──
 
-    let autostart_on = match autostart::is_enabled() {
-        Ok(v) => v,
-        Err(e) => {
-            let _ = ui_tx_for_cancel.send(messages::log_entry_now(format!(
-                "Could not detect autostart state: {e}"
-            )));
-            false
-        }
-    };
-    ui.set_start_at_login(autostart_on);
-    ui.set_start_in_background(start_in_background_pref.load(Ordering::Relaxed) || autostart_on);
-    ui.set_start_in_background_enabled(!autostart_on);
-
-    // "Start at login" toggle — register/remove OS autostart entry.
-    ui.on_start_at_login_toggled({
-        let ui_weak = ui.as_weak();
-        let ui_tx = ui_tx_for_cancel.clone();
-        let pref = start_in_background_pref.clone();
-        move |checked| {
-            let Some(ui) = ui_weak.upgrade() else { return };
-            if let Err(e) = autostart::set_enabled(checked) {
-                // Revert checkbox to previous state.
-                ui.set_start_at_login(!checked);
-                send_log(&ui_tx, format!("Autostart failed: {e}"));
-                return;
-            }
-            if checked {
-                // Force background on (display only), disable the checkbox.
-                ui.set_start_in_background(true);
-                ui.set_start_in_background_enabled(false);
-                send_log(&ui_tx, "Autostart enabled.");
-            } else {
-                // Restore background checkbox to persisted preference.
-                ui.set_start_in_background(pref.load(Ordering::Relaxed));
-                ui.set_start_in_background_enabled(true);
-                send_log(&ui_tx, "Autostart disabled.");
-            }
-        }
-    });
-
-    // "Start in background" toggle — only reachable when autostart is off.
-    ui.on_start_in_background_toggled({
-        let pref = start_in_background_pref.clone();
-        let ui_weak = ui.as_weak();
-        move |checked| {
-            pref.store(checked, Ordering::Relaxed);
-            // Capture live UI state so we never overwrite config_path / window
-            // size with stale or default values.
-            if let Some(s) = ui_weak
-                .upgrade()
-                .and_then(|ui| event_consumer::capture_gui_state(&ui, &pref))
-            {
-                state::save(&s);
-                ui_state::set_last_gui_state(s);
-            }
-        }
-    });
-
-    // ── Close-to-tray behavior ──
-
-    ui.window().on_close_requested({
-        let ui_weak = ui.as_weak();
-        let pref = start_in_background_pref.clone();
-        move || {
-            if let Some(ui) = ui_weak.upgrade() {
-                if let Some(s) = event_consumer::capture_gui_state(&ui, &pref) {
-                    state::save(&s);
-                    ui_state::set_last_gui_state(s);
-                }
-                ui.invoke_release_focus();
-                let _ = ui.hide();
-            }
-            slint::CloseRequestResponse::HideWindow
-        }
-    });
-
-    ui.on_close_window({
-        let ui_weak = ui.as_weak();
-        let pref = start_in_background_pref.clone();
-        move || {
-            if let Some(ui) = ui_weak.upgrade() {
-                if let Some(s) = event_consumer::capture_gui_state(&ui, &pref) {
-                    state::save(&s);
-                    ui_state::set_last_gui_state(s);
-                }
-                ui.invoke_release_focus();
-                let _ = ui.hide();
-            }
-        }
-    });
-
-    // ── Tray event handler ──
-
-    {
-        let tx = app_tx.clone();
-        let cancel = cancel_requested.clone();
-        let log_tx = ui_tx_for_cancel.clone();
-        let backup_running = backup_running.clone();
-        thread::spawn(move || {
-            let menu_rx = MenuEvent::receiver();
-            let mut tray_source_items: Vec<(tray_icon::menu::MenuId, String)> = Vec::new();
-            loop {
-                crossbeam_channel::select! {
-                    recv(menu_rx) -> event => {
-                        let Ok(event) = event else {
-                            break;
-                        };
-                        if event.id == open_item_id {
-                            // Bypass the worker queue so the tray stays responsive even
-                            // while the worker is busy (e.g. initial FetchAllRepoInfo).
-                            let _ = log_tx.send(UiEvent::ShowWindow);
-                        } else if event.id == run_now_item_id {
-                            let _ = tx.send(AppCommand::RunBackupAll { scheduled: false });
-                        } else if event.id == cancel_item_id {
-                            if !backup_running.load(Ordering::SeqCst) {
-                                send_log(&log_tx, "No backup running.");
-                                continue;
-                            }
-                            cancel.store(true, Ordering::SeqCst);
-                            send_log(
-                                &log_tx,
-                                "Cancel requested; Vykar will stop when the current file, upload, or storage operation returns.",
-                            );
-                        } else if event.id == quit_item_id {
-                            let _ = log_tx.send(UiEvent::Quit);
-                            break;
-                        } else if let Some((_, label)) =
-                            tray_source_items.iter().find(|(id, _)| *id == event.id)
-                        {
-                            let _ = tx.send(AppCommand::RunBackupSource {
-                                source_label: label.clone(),
-                            });
-                        }
-                    }
-                    recv(tray_source_rx) -> items => {
-                        match items {
-                            Ok(items) => tray_source_items = items,
-                            Err(_) => break,
-                        }
-                    }
-                }
-            }
-        });
-    }
+    let autostart_on = bootstrap::wire_settings_tab(&ui, &ui_tx, &start_in_background_pref);
+    bootstrap::wire_window_lifecycle(&ui, &start_in_background_pref);
+    bootstrap::spawn_tray_event_loop(
+        app_tx,
+        ui_tx,
+        cancel_requested,
+        operation_running,
+        &tray,
+        tray_source_rx,
+    );
 
     if !autostart::should_start_hidden(gui_state.start_in_background, autostart_on) {
         ui.show()?;

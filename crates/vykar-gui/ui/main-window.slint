@@ -8,6 +8,7 @@ import { SourcesPage } from "pages/sources.slint";
 import { AdvancedPage } from "pages/advanced.slint";
 import { LogPage } from "pages/log.slint";
 import { SettingsPage } from "pages/settings.slint";
+import { WelcomePage } from "pages/welcome.slint";
 
 export { RepoInfo, SourceInfo, Page, FindSnapshotGroup }
 
@@ -15,6 +16,9 @@ export component MainWindow inherits Window {
     in-out property <string> config_path;
     in-out property <string> schedule_brief;
     in-out property <string> status_text;
+    // Persistent error state: renders the status text red and clickable
+    // (→ Log page). Cleared by the next operation start / status update.
+    in-out property <bool> status_error: false;
     in-out property <string> version_text;
     in-out property <[[StandardListViewItem]]> log_rows: [];
 
@@ -28,6 +32,8 @@ export component MainWindow inherits Window {
     // Repo model — drives the sidebar REPOSITORIES section and overview
     in-out property <bool> repo_loading: true;
     in-out property <[RepoInfo]> repo_model: [];
+    // First-run / empty state: config resolved but no repositories present.
+    property <bool> no_repos: !root.repo_loading && root.repo_model.length == 0;
 
     // Source model
     in-out property <[SourceInfo]> source_model: [];
@@ -85,6 +91,7 @@ export component MainWindow inherits Window {
     callback clear_locks_clicked();
     callback clear_sessions_clicked();
     callback backup_repo_clicked(/* index */ int);
+    callback retry_repo(/* repo_name */ string);
     callback backup_source_clicked(/* index */ int);
     callback toggle_source_expanded(/* index */ int);
     callback backup_repo_source_clicked(/* index */ int);
@@ -97,8 +104,6 @@ export component MainWindow inherits Window {
     callback mount_selected_snapshot_clicked();
     callback snapshot_row_clicked(/* row */ int, /* toggle */ bool, /* range */ bool);
     callback stop_mount_clicked();
-    callback open_mount_url_clicked();
-    callback open_update_url_clicked();
     callback snapshot_sort_ascending(/* column */ int);
     callback snapshot_sort_descending(/* column */ int);
     callback find_search_clicked();
@@ -174,10 +179,19 @@ export component MainWindow inherits Window {
                                     color: #888888;
                                     font-size: 11px;
                                 }
+                                if root.no_repos: Text {
+                                    text: "No repositories configured";
+                                    color: #888888;
+                                    font-size: 11px;
+                                    wrap: word-wrap;
+                                }
                                 for repo[idx] in root.repo_model: VerticalLayout {
                                     spacing: 0px;
                                     SideBarItem {
-                                        text: repo.name;
+                                        // Prefix a warning glyph when the repo failed to load.
+                                        text: repo.has_error ? "⚠  " + repo.name : repo.name;
+                                        // Hover shows the error (if any) or the full repository URL.
+                                        tooltip_text: repo.has_error ? repo.error : repo.url;
                                         clicked => {
                                             root.select_repo_and_page(idx,
                                                 root.repo_scoped_page ? root.current_page : Page.overview);
@@ -249,13 +263,20 @@ export component MainWindow inherits Window {
             Rectangle {
                 horizontal-stretch: 1;
 
-                if root.current_page == Page.overview: OverviewPage {
+                // First-run / empty state replaces the repo-scoped pages.
+                if root.no_repos && root.repo_scoped_page: WelcomePage {
+                    config_path: root.config_path;
+                    edit_config_clicked => { root.select_page(Page.advanced); }
+                }
+
+                if !root.no_repos && root.current_page == Page.overview: OverviewPage {
                     repo: root.active_repo;
                     schedule_brief: root.schedule_brief;
                     source_model: root.repo_source_model;
                     snapshot_rows: root.recent_snapshot_rows;
                     operation_busy: root.operation_busy;
                     backup_clicked => { root.backup_repo_clicked(root.current_repo_index); }
+                    retry_clicked => { root.retry_repo(root.active_repo.name); }
                     view_all_snapshots_clicked => {
                         root.select_repo_and_page(root.current_repo_index, Page.snapshots);
                     }
@@ -264,7 +285,7 @@ export component MainWindow inherits Window {
                     backup_source(i) => { root.backup_repo_source_clicked(i); }
                 }
 
-                if root.current_page == Page.snapshots: SnapshotsPage {
+                if !root.no_repos && root.current_page == Page.snapshots: SnapshotsPage {
                     repo_name: root.active_repo.name;
                     snapshot_rows: root.snapshot_rows;
                     selected_count: root.snapshot_selected_count;
@@ -281,7 +302,7 @@ export component MainWindow inherits Window {
                     sort_descending(c) => { root.snapshot_sort_descending(c); }
                 }
 
-                if root.current_page == Page.find: FindPage {
+                if !root.no_repos && root.current_page == Page.find: FindPage {
                     repo_name: root.active_repo.name;
                     operation_busy: root.operation_busy;
                     name_pattern <=> root.find_name_pattern;
@@ -362,7 +383,7 @@ export component MainWindow inherits Window {
                     }
                     if root.mount_url != "": TouchArea {
                         mouse-cursor: pointer;
-                        clicked => { root.open_mount_url_clicked(); }
+                        clicked => { Platform.open-url(root.mount_url); }
                         horizontal-stretch: 1;
                         HorizontalLayout {
                             alignment: start;
@@ -389,7 +410,25 @@ export component MainWindow inherits Window {
             spacing: 8px;
 
             Text { text: "Status:"; vertical-alignment: center; }
-            Text { text: root.status_text; vertical-alignment: center; horizontal-stretch: 1; }
+            if !root.status_error: Text {
+                text: root.status_text;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+            }
+            // Error: red, clickable → Activity Log (where the detail was logged).
+            if root.status_error: TouchArea {
+                mouse-cursor: pointer;
+                horizontal-stretch: 1;
+                clicked => { root.current_page = Page.log; }
+                HorizontalLayout {
+                    alignment: start;
+                    Text {
+                        text: root.status_text;
+                        color: #d32f2f;
+                        vertical-alignment: center;
+                    }
+                }
+            }
             if root.operation_busy: Button {
                 text: "Cancel";
                 clicked => { root.cancel_operation_clicked(); }
@@ -397,7 +436,7 @@ export component MainWindow inherits Window {
             Text { text: root.version_text; vertical-alignment: center; color: #888888; }
             if root.update_available: TouchArea {
                 mouse-cursor: pointer;
-                clicked => { root.open_update_url_clicked(); }
+                clicked => { Platform.open-url(root.update_url); }
                 Text { text: "(update)"; color: root.link_color; vertical-alignment: center; }
             }
         }

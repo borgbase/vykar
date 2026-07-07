@@ -150,16 +150,7 @@ pub(crate) fn source_label_at(index: i32) -> Option<String> {
 pub(crate) fn replace_repo_model(items: Vec<RepoInfoData>, labels: Vec<SharedString>) {
     with_state_mut(|state| {
         state.repo_labels.set_vec(labels);
-        let repo_rows: Vec<RepoInfo> = items
-            .into_iter()
-            .map(|d| RepoInfo {
-                name: d.name,
-                url: d.url,
-                snapshots: d.snapshots,
-                last_snapshot: d.last_snapshot,
-                size: d.size,
-            })
-            .collect();
+        let repo_rows: Vec<RepoInfo> = items.iter().map(RepoInfo::from).collect();
         state.repo_model.set_vec(repo_rows);
     });
 }
@@ -171,7 +162,8 @@ pub(crate) fn replace_source_model(
 ) {
     with_state_mut(|state| {
         state.source_labels.set_vec(labels);
-        state.source_model.set_vec(build_source_model(&items));
+        let source_rows: Vec<SourceInfo> = items.iter().map(SourceInfo::from).collect();
+        state.source_model.set_vec(source_rows);
         state
             .repo_source_model
             .set_vec(build_repo_source_model(&items, current_repo));
@@ -185,26 +177,6 @@ pub(crate) fn refresh_repo_source_model(current_repo: Option<&str>) {
             .repo_source_model
             .set_vec(build_repo_source_model(&state.source_cache, current_repo));
     });
-}
-
-fn build_source_model(items: &[SourceInfoData]) -> Vec<SourceInfo> {
-    items
-        .iter()
-        .map(|d| SourceInfo {
-            label: d.label.clone(),
-            paths: d.paths.clone(),
-            excludes: d.excludes.clone(),
-            target_repos: d.target_repos.clone(),
-            expanded: false,
-            detail_paths: d.detail_paths.clone(),
-            detail_excludes: d.detail_excludes.clone(),
-            detail_exclude_if_present: d.detail_exclude_if_present.clone(),
-            detail_flags: d.detail_flags.clone(),
-            detail_hooks: d.detail_hooks.clone(),
-            detail_retention: d.detail_retention.clone(),
-            detail_command_dumps: d.detail_command_dumps.clone(),
-        })
-        .collect()
 }
 
 pub(crate) fn toggle_source_expanded(scope: SourceModelScope, idx: i32) -> bool {

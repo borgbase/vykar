@@ -3,12 +3,23 @@ use slint::SharedString;
 use vykar_core::commands::diff::DiffChangeKind;
 use vykar_core::snapshot::item::Item;
 
+/// Current local time formatted as the canonical log-row stamp: `(date, time)`
+/// where `date` is `"%b %d"` and `time` is `"%H:%M:%S"`. Shared by worker log
+/// events (`log_entry_now`) and UI-thread log rows (`event_consumer`).
+pub(crate) fn log_timestamp_now() -> (String, String) {
+    let now = Local::now();
+    (
+        now.format("%b %d").to_string(),
+        now.format("%H:%M:%S").to_string(),
+    )
+}
+
 /// Build a `UiEvent::LogEntry` capturing the current local time for both date and timestamp.
 pub(crate) fn log_entry_now(message: impl Into<String>) -> UiEvent {
-    let now = Local::now();
+    let (date, timestamp) = log_timestamp_now();
     UiEvent::LogEntry {
-        date: now.format("%b %d").to_string(),
-        timestamp: now.format("%H:%M:%S").to_string(),
+        date,
+        timestamp,
         message: message.into(),
     }
 }
@@ -27,6 +38,11 @@ pub(crate) enum AppCommand {
         source_label: String,
     },
     FetchAllRepoInfo,
+    /// Re-probe a single repository (e.g. the Overview "Retry" button after a
+    /// load failure). Re-emits a full `RepoModelData` from cached results.
+    FetchRepoInfo {
+        repo_name: String,
+    },
     RefreshSnapshots {
         repo_selector: String,
     },
@@ -84,6 +100,12 @@ pub(crate) struct RepoInfoData {
     pub snapshots: SharedString,
     pub last_snapshot: SharedString,
     pub size: SharedString,
+    /// True when the repo could not be loaded (locked, unreachable, wrong
+    /// passphrase, declined init). Metric fields hold placeholders in that case.
+    pub has_error: bool,
+    /// Human-readable failure reason shown in the Overview error banner /
+    /// sidebar tooltip; empty when `has_error` is false.
+    pub error: SharedString,
 }
 
 /// Multi-row selection state for the Snapshots table. Indices align with
@@ -168,6 +190,9 @@ pub(crate) struct DiffResultRow {
 #[derive(Debug, Clone)]
 pub(crate) enum UiEvent {
     Status(String),
+    /// Persistent, clickable error state for the status bar. Stays until the
+    /// next `OperationStarted` or `Status`; clicking it navigates to the Log.
+    ErrorStatus(String),
     LogEntry {
         date: String,
         timestamp: String,

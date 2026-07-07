@@ -3,14 +3,13 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, Local, Utc};
 use vykar_core::app::operations;
 use vykar_core::commands;
-use vykar_core::commands::delete::DeleteResult;
 use vykar_core::commands::find::{FileStatus, FindFilter, FindScope};
 
 use crate::messages::{AppCommand, DiffResultRow, FindResultRow, FindSnapshotGroup, UiEvent};
-use crate::repo_helpers::{find_repo_for_snapshot, get_or_resolve_passphrase, send_log};
+use crate::repo_helpers::{find_repo_for_snapshot, send_log, with_passphrase_retry, PassphraseRun};
 use vykar_common::display::format_bytes;
 
-use super::shared::{begin_ui_operation, end_ui_operation, select_repo_or_log};
+use super::shared::{select_repo_or_log, OpGuard};
 use super::WorkerContext;
 
 pub(super) fn handle_restore_selected(
@@ -20,7 +19,12 @@ pub(super) fn handle_restore_selected(
     dest: String,
     paths: Vec<String>,
 ) {
-    begin_ui_operation(ctx, "Restoring selected items...");
+    let mut guard = OpGuard::ui(
+        &ctx.ui_tx,
+        &ctx.cancel_requested,
+        &ctx.operation_running,
+        "Restoring selected items...",
+    );
 
     match find_repo_for_snapshot(
         &ctx.runtime.repos,
@@ -74,7 +78,7 @@ pub(super) fn handle_restore_selected(
                     });
                 }
                 Err(e) => {
-                    send_log(&ctx.ui_tx, format!("Restore failed: {e}"));
+                    guard.fail(format!("Restore failed: {e}"));
                     let _ = ctx.ui_tx.send(UiEvent::RestoreFinished {
                         success: false,
                         message: format!("{e}"),
@@ -83,15 +87,13 @@ pub(super) fn handle_restore_selected(
             }
         }
         Err(e) => {
-            send_log(&ctx.ui_tx, format!("Failed to resolve snapshot: {e}"));
+            guard.fail(format!("Failed to resolve snapshot: {e}"));
             let _ = ctx.ui_tx.send(UiEvent::RestoreFinished {
                 success: false,
                 message: format!("{e}"),
             });
         }
     }
-
-    end_ui_operation(ctx);
 }
 
 pub(super) fn handle_delete_snapshots(
@@ -129,21 +131,17 @@ pub(super) fn handle_delete_snapshots(
     } else {
         "Deleting snapshots..."
     };
-    begin_ui_operation(ctx, status);
+    let mut guard = OpGuard::ui(
+        &ctx.ui_tx,
+        &ctx.cancel_requested,
+        &ctx.operation_running,
+        status,
+    );
 
     let repo = match select_repo_or_log(ctx, &ctx.runtime.repos, &repo_name) {
         Some(r) => r,
         None => {
-            end_ui_operation(ctx);
-            return;
-        }
-    };
-
-    let passphrase = match get_or_resolve_passphrase(repo, &mut ctx.passphrases) {
-        Ok(p) => p,
-        Err(e) => {
-            send_log(&ctx.ui_tx, format!("[{repo_name}] passphrase error: {e}"));
-            end_ui_operation(ctx);
+            guard.fail(format!("No repository matching '{repo_name}'."));
             return;
         }
     };
@@ -152,16 +150,18 @@ pub(super) fn handle_delete_snapshots(
     // maintenance lock (see `commands::delete::run`). Avoids per-row partial
     // failures and per-row maintenance-lock contention.
     let names: Vec<&str> = snapshot_names.iter().map(String::as_str).collect();
-    let result: vykar_types::error::Result<DeleteResult> = commands::delete::run(
-        &repo.config,
-        passphrase.as_deref().map(|s| s.as_str()),
-        &names,
-        false,
-        Some(&ctx.cancel_requested),
-    );
+    let outcome = with_passphrase_retry(repo, &mut ctx.passphrases, 3, |pass| {
+        commands::delete::run(
+            &repo.config,
+            pass,
+            &names,
+            false,
+            Some(&ctx.cancel_requested),
+        )
+    });
 
-    match result {
-        Ok(result) => {
+    match outcome {
+        Ok(PassphraseRun::Ran(result)) => {
             let mut total_chunks = 0u64;
             let mut total_freed = 0u64;
             for stats in &result.stats {
@@ -216,13 +216,18 @@ pub(super) fn handle_delete_snapshots(
             });
             let _ = ctx.app_tx.send(AppCommand::FetchAllRepoInfo);
         }
+        Ok(PassphraseRun::Canceled) => {
+            send_log(
+                &ctx.ui_tx,
+                format!("[{repo_name}] passphrase prompt canceled; skipping."),
+            );
+        }
         Err(e) => {
             // Pre-mutation validation failure (e.g. SnapshotNotFound) leaves
             // the repo untouched — single error covers the whole batch.
-            send_log(&ctx.ui_tx, format!("[{repo_name}] delete failed: {e}"));
+            guard.fail(format!("[{repo_name}] delete failed: {e}"));
         }
     }
-    end_ui_operation(ctx);
 }
 
 fn send_diff_error(
@@ -249,11 +254,17 @@ pub(super) fn handle_diff_snapshots(
     snapshot_a: String,
     snapshot_b: String,
 ) {
-    begin_ui_operation(ctx, "Diffing snapshots...");
+    let mut guard = OpGuard::ui(
+        &ctx.ui_tx,
+        &ctx.cancel_requested,
+        &ctx.operation_running,
+        "Diffing snapshots...",
+    );
 
     let repo = match select_repo_or_log(ctx, &ctx.runtime.repos, &repo_name) {
         Some(r) => r,
         None => {
+            guard.fail(format!("[{repo_name}] repository not found"));
             send_diff_error(
                 ctx,
                 repo_name,
@@ -261,28 +272,16 @@ pub(super) fn handle_diff_snapshots(
                 snapshot_b,
                 "repository not found".to_string(),
             );
-            end_ui_operation(ctx);
             return;
         }
     };
 
-    let passphrase = match get_or_resolve_passphrase(repo, &mut ctx.passphrases) {
-        Ok(p) => p,
-        Err(e) => {
-            send_log(&ctx.ui_tx, format!("[{repo_name}] passphrase error: {e}"));
-            send_diff_error(ctx, repo_name, snapshot_a, snapshot_b, e.to_string());
-            end_ui_operation(ctx);
-            return;
-        }
-    };
+    let outcome = with_passphrase_retry(repo, &mut ctx.passphrases, 3, |pass| {
+        operations::diff_snapshots(&repo.config, pass, &snapshot_a, &snapshot_b)
+    });
 
-    match operations::diff_snapshots(
-        &repo.config,
-        passphrase.as_deref().map(|s| s.as_str()),
-        &snapshot_a,
-        &snapshot_b,
-    ) {
-        Ok(result) => {
+    match outcome {
+        Ok(PassphraseRun::Ran(result)) => {
             let rows: Vec<DiffResultRow> = result
                 .entries
                 .iter()
@@ -313,45 +312,56 @@ pub(super) fn handle_diff_snapshots(
                 error: None,
             });
         }
+        Ok(PassphraseRun::Canceled) => {
+            send_log(
+                &ctx.ui_tx,
+                format!("[{repo_name}] passphrase prompt canceled; skipping."),
+            );
+            send_diff_error(
+                ctx,
+                repo_name,
+                snapshot_a,
+                snapshot_b,
+                "passphrase required".to_string(),
+            );
+        }
         Err(e) => {
-            send_log(&ctx.ui_tx, format!("[{repo_name}] diff failed: {e}"));
+            guard.fail(format!("[{repo_name}] diff failed: {e}"));
             send_diff_error(ctx, repo_name, snapshot_a, snapshot_b, e.to_string());
         }
     }
-
-    end_ui_operation(ctx);
 }
 
 pub(super) fn handle_prune_repo(ctx: &mut WorkerContext, repo_name: String) {
-    begin_ui_operation(ctx, "Pruning snapshots...");
+    let mut guard = OpGuard::ui(
+        &ctx.ui_tx,
+        &ctx.cancel_requested,
+        &ctx.operation_running,
+        "Pruning snapshots...",
+    );
 
     let repo = match select_repo_or_log(ctx, &ctx.runtime.repos, &repo_name) {
         Some(r) => r,
         None => {
-            end_ui_operation(ctx);
+            guard.fail(format!("No repository matching '{repo_name}'."));
             return;
         }
     };
 
-    let passphrase = match get_or_resolve_passphrase(repo, &mut ctx.passphrases) {
-        Ok(p) => p,
-        Err(e) => {
-            send_log(&ctx.ui_tx, format!("[{repo_name}] passphrase error: {e}"));
-            end_ui_operation(ctx);
-            return;
-        }
-    };
+    let outcome = with_passphrase_retry(repo, &mut ctx.passphrases, 3, |pass| {
+        commands::prune::run(
+            &repo.config,
+            pass,
+            false,
+            false,
+            &repo.sources,
+            &[],
+            Some(&ctx.cancel_requested),
+        )
+    });
 
-    match commands::prune::run(
-        &repo.config,
-        passphrase.as_deref().map(|s| s.as_str()),
-        false,
-        false,
-        &repo.sources,
-        &[],
-        Some(&ctx.cancel_requested),
-    ) {
-        Ok((stats, _)) => {
+    match outcome {
+        Ok(PassphraseRun::Ran((stats, _))) => {
             send_log(
                 &ctx.ui_tx,
                 format!(
@@ -370,12 +380,16 @@ pub(super) fn handle_prune_repo(ctx: &mut WorkerContext, repo_name: String) {
             });
             let _ = ctx.app_tx.send(AppCommand::FetchAllRepoInfo);
         }
+        Ok(PassphraseRun::Canceled) => {
+            send_log(
+                &ctx.ui_tx,
+                format!("[{repo_name}] passphrase prompt canceled; skipping."),
+            );
+        }
         Err(e) => {
-            send_log(&ctx.ui_tx, format!("[{repo_name}] prune failed: {e}"));
+            guard.fail(format!("[{repo_name}] prune failed: {e}"));
         }
     }
-
-    end_ui_operation(ctx);
 }
 
 fn format_mtime_nanos(mtime_nanos: i64) -> String {
@@ -391,21 +405,17 @@ fn format_mtime_nanos(mtime_nanos: i64) -> String {
 }
 
 pub(super) fn handle_find_files(ctx: &mut WorkerContext, repo_name: String, name_pattern: String) {
-    begin_ui_operation(ctx, "Searching files...");
+    let mut guard = OpGuard::ui(
+        &ctx.ui_tx,
+        &ctx.cancel_requested,
+        &ctx.operation_running,
+        "Searching files...",
+    );
 
     let repo = match select_repo_or_log(ctx, &ctx.runtime.repos, &repo_name) {
         Some(r) => r,
         None => {
-            end_ui_operation(ctx);
-            return;
-        }
-    };
-
-    let passphrase = match get_or_resolve_passphrase(repo, &mut ctx.passphrases) {
-        Ok(p) => p,
-        Err(e) => {
-            send_log(&ctx.ui_tx, format!("[{repo_name}] passphrase error: {e}"));
-            end_ui_operation(ctx);
+            guard.fail(format!("No repository matching '{repo_name}'."));
             return;
         }
     };
@@ -413,8 +423,7 @@ pub(super) fn handle_find_files(ctx: &mut WorkerContext, repo_name: String, name
     let filter = match FindFilter::build(None, None, Some(&name_pattern), None, None, None, None) {
         Ok(f) => f,
         Err(e) => {
-            send_log(&ctx.ui_tx, format!("Invalid name pattern: {e}"));
-            end_ui_operation(ctx);
+            guard.fail(format!("Invalid name pattern: {e}"));
             return;
         }
     };
@@ -424,13 +433,12 @@ pub(super) fn handle_find_files(ctx: &mut WorkerContext, repo_name: String, name
         last_n: None,
     };
 
-    match vykar_core::commands::find::run(
-        &repo.config,
-        passphrase.as_deref().map(|s| s.as_str()),
-        &scope,
-        &filter,
-    ) {
-        Ok(timelines) => {
+    let outcome = with_passphrase_retry(repo, &mut ctx.passphrases, 3, |pass| {
+        vykar_core::commands::find::run(&repo.config, pass, &scope, &filter)
+    });
+
+    match outcome {
+        Ok(PassphraseRun::Ran(timelines)) => {
             let mut by_snap: BTreeMap<(DateTime<Utc>, String), Vec<FindResultRow>> =
                 BTreeMap::new();
             let mut total_hits: usize = 0;
@@ -477,10 +485,14 @@ pub(super) fn handle_find_files(ctx: &mut WorkerContext, repo_name: String, name
             );
             let _ = ctx.ui_tx.send(UiEvent::FindResultsData { groups });
         }
+        Ok(PassphraseRun::Canceled) => {
+            send_log(
+                &ctx.ui_tx,
+                format!("[{repo_name}] passphrase prompt canceled; skipping."),
+            );
+        }
         Err(e) => {
-            send_log(&ctx.ui_tx, format!("[{repo_name}] find failed: {e}"));
+            guard.fail(format!("[{repo_name}] find failed: {e}"));
         }
     }
-
-    end_ui_operation(ctx);
 }

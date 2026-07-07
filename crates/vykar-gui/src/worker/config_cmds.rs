@@ -189,6 +189,7 @@ pub(super) fn apply_config(
     }
     ctx.runtime.repos = repos;
     ctx.passphrases.clear();
+    ctx.repo_info.clear();
 
     if let Ok(mut state) = ctx.scheduler.lock() {
         state.enabled = schedule.enabled && ctx.scheduler_lock_held;

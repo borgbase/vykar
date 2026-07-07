@@ -35,44 +35,76 @@ export component SnapshotsPage inherits Rectangle {
                 text: "Refresh";
                 enabled: !root.operation_busy;
                 clicked => { root.refresh_clicked(); }
+                Tooltip { text: @markdown("Reload the snapshot list for this repository."); }
             }
             Button {
                 text: "Prune";
                 primary: true;
                 enabled: !root.operation_busy;
                 clicked => { root.prune_clicked(); }
+                Tooltip { text: @markdown("Delete snapshots that fall outside the retention rules."); }
             }
         }
 
-        snapshot-table := StandardTableView {
+        // Right-click a row for the same actions as the toolbar below. Item
+        // enablement mirrors the current selection (Diff needs exactly 2).
+        ContextMenuArea {
             vertical-stretch: 1;
-            columns: [
-                { title: "ID" },
-                { title: "Time", min-width: 150px },
-                { title: "Host" },
-                { title: "Label" },
-                { title: "Files" },
-                { title: "Size" },
-                { title: "Added" },
-            ];
-            rows: root.snapshot_rows;
-            sort-ascending(col-idx) => { root.sort_ascending(col-idx); }
-            sort-descending(col-idx) => { root.sort_descending(col-idx); }
-            row-pointer-event(idx, ev, pos) => {
-                if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.left) {
-                    root.row_clicked(idx,
-                        ev.modifiers.control || ev.modifiers.meta,
-                        ev.modifiers.shift);
+            Menu {
+                MenuItem {
+                    title: "Restore";
+                    enabled: !root.operation_busy && root.selected_count == 1;
+                    activated => { root.restore_selected(); }
+                }
+                MenuItem {
+                    title: "Diff";
+                    enabled: !root.operation_busy && root.selected_count == 2;
+                    activated => { root.diff_selected(); }
+                }
+                MenuItem {
+                    title: "Mount";
+                    enabled: !root.operation_busy && !root.is_mount_active && root.selected_count == 1;
+                    activated => { root.mount_selected(); }
+                }
+                MenuSeparator {}
+                MenuItem {
+                    title: "Delete";
+                    enabled: !root.operation_busy && root.selected_count > 0;
+                    activated => { root.delete_selected(); }
                 }
             }
-            // Suppress the widget's native single-row highlight: it conflicts
-            // with our own "● " prefix marker. The widget calls set-current-row
-            // on click which writes current-row and fires this callback; a
-            // direct assignment back to -1 bypasses set-current-row so it
-            // doesn't recurse.
-            current-row-changed(r) => {
-                if (r != -1) {
-                    snapshot-table.current-row = -1;
+
+            snapshot-table := StandardTableView {
+                width: 100%;
+                height: 100%;
+                columns: [
+                    { title: "ID" },
+                    { title: "Time", min-width: 150px },
+                    { title: "Host" },
+                    { title: "Label" },
+                    { title: "Files" },
+                    { title: "Size" },
+                    { title: "Added" },
+                ];
+                rows: root.snapshot_rows;
+                sort-ascending(col-idx) => { root.sort_ascending(col-idx); }
+                sort-descending(col-idx) => { root.sort_descending(col-idx); }
+                row-pointer-event(idx, ev, pos) => {
+                    if (ev.kind == PointerEventKind.down && ev.button == PointerEventButton.left) {
+                        root.row_clicked(idx,
+                            ev.modifiers.control || ev.modifiers.meta,
+                            ev.modifiers.shift);
+                    }
+                }
+                // Suppress the widget's native single-row highlight: it conflicts
+                // with our own "● " prefix marker. The widget calls set-current-row
+                // on click which writes current-row and fires this callback; a
+                // direct assignment back to -1 bypasses set-current-row so it
+                // doesn't recurse.
+                current-row-changed(r) => {
+                    if (r != -1) {
+                        snapshot-table.current-row = -1;
+                    }
                 }
             }
         }

@@ -2,9 +2,45 @@ use crossbeam_channel::Sender;
 use slint::{ModelRc, SharedString, StandardListViewItem, VecModel};
 use vykar_core::config::ResolvedRepo;
 
-use crate::messages::{FindSnapshotGroup, SourceInfoData, UiEvent};
+use crate::messages::{FindSnapshotGroup, RepoInfoData, SourceInfoData, UiEvent};
 use crate::repo_helpers::format_repo_name;
-use crate::{FindSnapshotGroup as UiFindSnapshotGroup, SourceInfo};
+use crate::{FindSnapshotGroup as UiFindSnapshotGroup, RepoInfo, SourceInfo};
+
+/// Sole conversion site for the repo-card DTO → Slint `RepoInfo`. Phase 2 adds
+/// `has_error` / `error` fields here.
+impl From<&RepoInfoData> for RepoInfo {
+    fn from(d: &RepoInfoData) -> Self {
+        RepoInfo {
+            name: d.name.clone(),
+            url: d.url.clone(),
+            snapshots: d.snapshots.clone(),
+            last_snapshot: d.last_snapshot.clone(),
+            size: d.size.clone(),
+            has_error: d.has_error,
+            error: d.error.clone(),
+        }
+    }
+}
+
+/// Sole conversion site for the source DTO → Slint `SourceInfo`.
+impl From<&SourceInfoData> for SourceInfo {
+    fn from(d: &SourceInfoData) -> Self {
+        SourceInfo {
+            label: d.label.clone(),
+            paths: d.paths.clone(),
+            excludes: d.excludes.clone(),
+            target_repos: d.target_repos.clone(),
+            expanded: false,
+            detail_paths: d.detail_paths.clone(),
+            detail_excludes: d.detail_excludes.clone(),
+            detail_exclude_if_present: d.detail_exclude_if_present.clone(),
+            detail_flags: d.detail_flags.clone(),
+            detail_hooks: d.detail_hooks.clone(),
+            detail_retention: d.detail_retention.clone(),
+            detail_command_dumps: d.detail_command_dumps.clone(),
+        }
+    }
+}
 
 pub(crate) fn to_table_model(rows: Vec<Vec<String>>) -> ModelRc<ModelRc<StandardListViewItem>> {
     let outer: Vec<ModelRc<StandardListViewItem>> = rows
@@ -140,23 +176,6 @@ pub(crate) fn build_source_model_data(
     (items, labels)
 }
 
-fn source_info_from_data(d: &SourceInfoData) -> SourceInfo {
-    SourceInfo {
-        label: d.label.clone(),
-        paths: d.paths.clone(),
-        excludes: d.excludes.clone(),
-        target_repos: d.target_repos.clone(),
-        expanded: false,
-        detail_paths: d.detail_paths.clone(),
-        detail_excludes: d.detail_excludes.clone(),
-        detail_exclude_if_present: d.detail_exclude_if_present.clone(),
-        detail_flags: d.detail_flags.clone(),
-        detail_hooks: d.detail_hooks.clone(),
-        detail_retention: d.detail_retention.clone(),
-        detail_command_dumps: d.detail_command_dumps.clone(),
-    }
-}
-
 /// Build the per-repo sources model: those targeting the given repo, or all repos.
 pub(crate) fn build_repo_source_model(
     items: &[SourceInfoData],
@@ -170,7 +189,7 @@ pub(crate) fn build_repo_source_model(
                     .map(|r| d.target_repo_names.iter().any(|n| n == r))
                     .unwrap_or(false)
         })
-        .map(source_info_from_data)
+        .map(SourceInfo::from)
         .collect()
 }
 

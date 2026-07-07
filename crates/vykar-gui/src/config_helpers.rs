@@ -56,6 +56,17 @@ pub(crate) fn validate_config(
     Ok(repos)
 }
 
+/// Explain why Vykar is exiting when the user declines to pick/create a config,
+/// then terminate. A silent exit here reads as a crash.
+fn exit_no_config() -> ! {
+    tinyfiledialogs::message_box_ok(
+        "Vykar Backup",
+        "No configuration file was selected.\n\nVykar needs a configuration file to run and will now exit.",
+        tinyfiledialogs::MessageBoxIcon::Info,
+    );
+    std::process::exit(0)
+}
+
 pub(crate) fn resolve_or_create_config(
     saved_config_path: Option<&str>,
 ) -> Result<app::RuntimeConfig, Box<dyn std::error::Error>> {
@@ -122,7 +133,7 @@ pub(crate) fn resolve_or_create_config(
             );
             match picked {
                 Some(p) => PathBuf::from(p),
-                None => std::process::exit(0),
+                None => exit_no_config(),
             }
         }
     } else {
@@ -133,7 +144,7 @@ pub(crate) fn resolve_or_create_config(
         );
         match picked {
             Some(p) => PathBuf::from(p),
-            None => std::process::exit(0),
+            None => exit_no_config(),
         }
     };
 

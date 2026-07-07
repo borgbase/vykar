@@ -61,6 +61,14 @@ fn append_log_row(ui: &MainWindow, date: &str, timestamp: &str, message: &str) {
     prepend_log_entry(&model, date, timestamp, message);
 }
 
+/// Append a log row stamped with the current local time. Centralizes the
+/// date/time formatting for UI-thread log rows (shares `messages::log_timestamp_now`
+/// with the worker's `log_entry_now`).
+fn append_log_now(ui: &MainWindow, message: &str) {
+    let (date, timestamp) = crate::messages::log_timestamp_now();
+    append_log_row(ui, &date, &timestamp, message);
+}
+
 /// Clamp `idx` against `len`. Returns `0` for negative or out-of-range indices,
 /// `idx` otherwise. `len == 0` always yields `0`.
 pub(crate) fn clamp_repo_index(idx: i32, len: usize) -> i32 {
@@ -137,6 +145,165 @@ pub(crate) fn capture_gui_state(
     })
 }
 
+/// Borrowed context handed to the per-domain event handlers. Groups the
+/// long-lived channels/handles so handlers stay 2-3 args instead of 6.
+struct EventCtx<'a> {
+    ui: &'a MainWindow,
+    app_tx: &'a crossbeam_channel::Sender<AppCommand>,
+    tray_source_tx: &'a crossbeam_channel::Sender<Vec<(tray_icon::menu::MenuId, String)>>,
+    prefs: &'a AtomicBool,
+}
+
+fn apply_config_info(ctx: &EventCtx, path: String, schedule_brief: String) {
+    ctx.ui
+        .global::<AppData>()
+        .set_active_config_path(path.clone().into());
+    ctx.ui.set_config_path(path.into());
+    ctx.ui.set_schedule_brief(schedule_brief.into());
+    // Eagerly persist so Cmd-Q keeps the config path.
+    if let Some(s) = capture_gui_state(ctx.ui, ctx.prefs) {
+        state::save(&s);
+        ui_state::set_last_gui_state(s);
+    }
+}
+
+fn apply_repo_names(ctx: &EventCtx, names: Vec<SharedString>) {
+    // RepoNames is derived from the full configured repo list and arrives
+    // before RepoModelData (which is filtered to repos that loaded
+    // successfully). Clamp defensively so the index is never out-of-range
+    // against `names`; the authoritative resolution (by repo name) happens
+    // when RepoModelData arrives.
+    let clamped = clamp_repo_index(ctx.ui.get_current_repo_index(), names.len());
+    if clamped != ctx.ui.get_current_repo_index() {
+        ctx.ui.set_current_repo_index(clamped);
+    }
+}
+
+fn apply_repo_model(
+    ctx: &EventCtx,
+    items: Vec<crate::messages::RepoInfoData>,
+    labels: Vec<SharedString>,
+) {
+    ctx.ui.set_repo_loading(false);
+    // Resolve the selected repo by name. On first load this consumes the
+    // persisted last_repo_name; afterward we just clamp the current index
+    // against the filtered labels.
+    let pending = ui_state::take_pending_repo_name();
+    let prev_idx = ctx.ui.get_current_repo_index();
+    let new_idx = resolve_repo_index(&labels, prev_idx, pending.as_deref());
+    ui_state::replace_repo_model(items, labels);
+    if new_idx != prev_idx {
+        ctx.ui.set_current_repo_index(new_idx);
+    }
+
+    // Rebuild the per-repo source model now that the current repo's name is
+    // resolvable.
+    let current_repo = ui_state::current_repo_name(ctx.ui);
+    ui_state::refresh_repo_source_model(current_repo.as_deref());
+
+    // Trigger a snapshot refresh for the resolved repo.
+    if let Some(name) = current_repo {
+        let _ = ctx.app_tx.send(AppCommand::RefreshSnapshots {
+            repo_selector: name,
+        });
+    }
+}
+
+fn apply_source_model(
+    ctx: &EventCtx,
+    source_items: Vec<crate::messages::SourceInfoData>,
+    labels: Vec<SharedString>,
+) {
+    // On Linux the tray submenu lives on the GTK thread; dispatch via
+    // idle_add_once to run there.
+    #[cfg(target_os = "linux")]
+    {
+        let tray_labels = labels.clone();
+        let tray_source_tx = ctx.tray_source_tx.clone();
+        gtk::glib::idle_add_once(move || {
+            let items = tray_state::rebuild_submenu(&tray_labels);
+            let _ = tray_source_tx.send(items);
+        });
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let items = tray_state::rebuild_submenu(&labels);
+        let _ = ctx.tray_source_tx.send(items);
+    }
+
+    let current_repo = ui_state::current_repo_name(ctx.ui);
+    ui_state::replace_source_model(source_items, labels, current_repo.as_deref());
+}
+
+fn apply_find_results(ctx: &EventCtx, groups: Vec<crate::messages::FindSnapshotGroup>) {
+    let total: usize = groups.iter().map(|g| g.rows.len()).sum();
+    let snap_count = groups.len();
+    ctx.ui.set_find_groups(to_find_groups_model(groups));
+    ctx.ui.set_find_has_searched(true);
+    ctx.ui
+        .set_find_status_text(format!("{total} results across {snap_count} snapshots.").into());
+}
+
+fn handle_quit(ctx: &EventCtx) {
+    if let Some(s) = capture_gui_state(ctx.ui, ctx.prefs) {
+        ui_state::set_last_gui_state(s);
+    }
+    // Best-effort: stop any active mount so the listener is released cleanly.
+    let _ = ctx.app_tx.send(AppCommand::StopMount);
+    let _ = slint::quit_event_loop();
+}
+
+fn show_main_window(ctx: &EventCtx) {
+    let _ = ctx.ui.show();
+    #[cfg(target_os = "macos")]
+    {
+        use objc2::MainThreadMarker;
+        use objc2_app_kit::NSApplication;
+        if let Some(mtm) = MainThreadMarker::new() {
+            let app = NSApplication::sharedApplication(mtm);
+            app.unhide(None);
+            for window in app.windows().iter() {
+                if window.isMiniaturized() {
+                    window.deminiaturize(None);
+                }
+                window.makeKeyAndOrderFront(None);
+            }
+            app.activate();
+        }
+    }
+}
+
+fn handle_mount_started(ctx: &EventCtx, url: String) {
+    ctx.ui.set_is_mount_active(true);
+    ctx.ui.set_mount_url(url.clone().into());
+    if opener::open_browser(&url).is_err() {
+        append_log_now(
+            ctx.ui,
+            &format!("Mount running at {url} — open it manually"),
+        );
+    }
+}
+
+fn handle_mount_failed(ctx: &EventCtx, message: String) {
+    ctx.ui.set_is_mount_active(false);
+    ctx.ui.set_mount_url("".into());
+    append_log_now(ctx.ui, &format!("Mount failed: {message}"));
+}
+
+fn handle_update_available(ctx: &EventCtx, version: String, url: String) {
+    ctx.ui.set_update_available(true);
+    ctx.ui.set_update_url(url.into());
+    append_log_now(ctx.ui, &format!("Update available: v{version}"));
+}
+
+fn trigger_snapshot_refresh(ctx: &EventCtx) {
+    if let Some(name) = ui_state::current_repo_name(ctx.ui) {
+        let _ = ctx.app_tx.send(AppCommand::RefreshSnapshots {
+            repo_selector: name,
+        });
+    }
+}
+
 pub(crate) fn spawn(
     ui_rx: Receiver<UiEvent>,
     ui_weak: slint::Weak<MainWindow>,
@@ -155,93 +322,38 @@ pub(crate) fn spawn(
                 let Some(ui) = ui_weak.upgrade() else {
                     return;
                 };
+                let ctx = EventCtx {
+                    ui: &ui,
+                    app_tx: &app_tx,
+                    tray_source_tx: &tray_source_tx,
+                    prefs: &start_in_background_pref,
+                };
 
                 match event {
-                    UiEvent::Status(status) => ui.set_status_text(status.into()),
+                    UiEvent::Status(status) => {
+                        // A fresh status clears any lingering error state.
+                        ui.set_status_error(false);
+                        ui.set_status_text(status.into());
+                    }
+                    UiEvent::ErrorStatus(message) => {
+                        ui.set_status_error(true);
+                        ui.set_status_text(message.into());
+                    }
                     UiEvent::LogEntry {
                         date,
                         timestamp,
                         message,
-                    } => {
-                        append_log_row(&ui, &date, &timestamp, &message);
-                    }
+                    } => append_log_row(&ui, &date, &timestamp, &message),
                     UiEvent::ConfigInfo {
                         path,
                         schedule_brief,
-                    } => {
-                        ui.global::<AppData>()
-                            .set_active_config_path(path.clone().into());
-                        ui.set_config_path(path.into());
-                        ui.set_schedule_brief(schedule_brief.into());
-                        // Eagerly persist so Cmd-Q keeps the config path.
-                        if let Some(s) = capture_gui_state(&ui, &start_in_background_pref) {
-                            state::save(&s);
-                            ui_state::set_last_gui_state(s);
-                        }
-                    }
-                    UiEvent::RepoNames(names) => {
-                        // RepoNames is derived from the full configured repo list and
-                        // arrives before RepoModelData (which is filtered to repos that
-                        // loaded successfully). Clamp defensively so the index is never
-                        // out-of-range against `names`; the authoritative resolution
-                        // (by repo name) happens when RepoModelData arrives.
-                        let clamped = clamp_repo_index(ui.get_current_repo_index(), names.len());
-                        if clamped != ui.get_current_repo_index() {
-                            ui.set_current_repo_index(clamped);
-                        }
-                    }
+                    } => apply_config_info(&ctx, path, schedule_brief),
+                    UiEvent::RepoNames(names) => apply_repo_names(&ctx, names),
                     UiEvent::RepoModelData { items, labels } => {
-                        ui.set_repo_loading(false);
-                        // Resolve the selected repo by name. On first load this consumes
-                        // the persisted last_repo_name; afterward we just clamp the
-                        // current index against the filtered labels.
-                        let pending = ui_state::take_pending_repo_name();
-                        let prev_idx = ui.get_current_repo_index();
-                        let new_idx = resolve_repo_index(&labels, prev_idx, pending.as_deref());
-                        ui_state::replace_repo_model(items, labels);
-                        if new_idx != prev_idx {
-                            ui.set_current_repo_index(new_idx);
-                        }
-
-                        // Rebuild the per-repo source model now that the
-                        // current repo's name is resolvable.
-                        let current_repo = ui_state::current_repo_name(&ui);
-                        ui_state::refresh_repo_source_model(current_repo.as_deref());
-
-                        // Trigger a snapshot refresh for the resolved repo.
-                        if let Some(name) = current_repo {
-                            let _ = app_tx.send(AppCommand::RefreshSnapshots {
-                                repo_selector: name,
-                            });
-                        }
+                        apply_repo_model(&ctx, items, labels)
                     }
-                    UiEvent::SourceModelData {
-                        items: source_items,
-                        labels,
-                    } => {
-                        // On Linux the tray submenu lives on the GTK thread;
-                        // dispatch via idle_add_once to run there.
-                        #[cfg(target_os = "linux")]
-                        {
-                            let tray_labels = labels.clone();
-                            let tray_source_tx = tray_source_tx.clone();
-                            gtk::glib::idle_add_once(move || {
-                                let items = tray_state::rebuild_submenu(&tray_labels);
-                                let _ = tray_source_tx.send(items);
-                            });
-                        }
-                        #[cfg(not(target_os = "linux"))]
-                        {
-                            let items = tray_state::rebuild_submenu(&labels);
-                            let _ = tray_source_tx.send(items);
-                        }
-
-                        let current_repo = ui_state::current_repo_name(&ui);
-                        ui_state::replace_source_model(
-                            source_items,
-                            labels,
-                            current_repo.as_deref(),
-                        );
+                    UiEvent::SourceModelData { items, labels } => {
+                        apply_source_model(&ctx, items, labels)
                     }
                     UiEvent::SnapshotTableData { data } => {
                         // Reverse once to newest-first; both the Snapshots table
@@ -295,103 +407,32 @@ pub(crate) fn spawn(
                             );
                         });
                     }
-                    UiEvent::FindResultsData { groups } => {
-                        let total: usize = groups.iter().map(|g| g.rows.len()).sum();
-                        let snap_count = groups.len();
-                        ui.set_find_groups(to_find_groups_model(groups));
-                        ui.set_find_has_searched(true);
-                        ui.set_find_status_text(
-                            format!("{total} results across {snap_count} snapshots.").into(),
-                        );
-                    }
+                    UiEvent::FindResultsData { groups } => apply_find_results(&ctx, groups),
                     UiEvent::ConfigText(text) => {
                         ui.set_editor_baseline(text.clone().into());
                         ui.set_editor_text(text.into());
                         ui.set_editor_dirty(false);
                         ui.set_editor_status(SharedString::default());
                     }
-                    UiEvent::ConfigSaveError(message) => {
-                        ui.set_editor_status(message.into());
-                    }
+                    UiEvent::ConfigSaveError(message) => ui.set_editor_status(message.into()),
                     UiEvent::OperationStarted => {
+                        // Starting a new operation clears the previous error state.
+                        ui.set_status_error(false);
                         ui.set_operation_busy(true);
                     }
-                    UiEvent::OperationFinished => {
-                        ui.set_operation_busy(false);
-                    }
-                    UiEvent::Quit => {
-                        if let Some(s) = capture_gui_state(&ui, &start_in_background_pref) {
-                            ui_state::set_last_gui_state(s);
-                        }
-                        // Best-effort: stop any active mount so the listener is released cleanly.
-                        let _ = app_tx.send(AppCommand::StopMount);
-                        let _ = slint::quit_event_loop();
-                    }
-                    UiEvent::ShowWindow => {
-                        let _ = ui.show();
-                        #[cfg(target_os = "macos")]
-                        {
-                            use objc2::MainThreadMarker;
-                            use objc2_app_kit::NSApplication;
-                            if let Some(mtm) = MainThreadMarker::new() {
-                                let app = NSApplication::sharedApplication(mtm);
-                                app.unhide(None);
-                                for window in app.windows().iter() {
-                                    if window.isMiniaturized() {
-                                        window.deminiaturize(None);
-                                    }
-                                    window.makeKeyAndOrderFront(None);
-                                }
-                                app.activate();
-                            }
-                        }
-                    }
-                    UiEvent::MountStarted { url } => {
-                        ui.set_is_mount_active(true);
-                        ui.set_mount_url(url.clone().into());
-                        if opener::open_browser(&url).is_err() {
-                            let now = chrono::Local::now();
-                            append_log_row(
-                                &ui,
-                                &now.format("%b %d").to_string(),
-                                &now.format("%H:%M:%S").to_string(),
-                                &format!("Mount running at {url} — open it manually"),
-                            );
-                        }
-                    }
+                    UiEvent::OperationFinished => ui.set_operation_busy(false),
+                    UiEvent::Quit => handle_quit(&ctx),
+                    UiEvent::ShowWindow => show_main_window(&ctx),
+                    UiEvent::MountStarted { url } => handle_mount_started(&ctx, url),
                     UiEvent::MountStopped => {
                         ui.set_is_mount_active(false);
                         ui.set_mount_url("".into());
                     }
-                    UiEvent::MountFailed { message } => {
-                        ui.set_is_mount_active(false);
-                        ui.set_mount_url("".into());
-                        let now = chrono::Local::now();
-                        append_log_row(
-                            &ui,
-                            &now.format("%b %d").to_string(),
-                            &now.format("%H:%M:%S").to_string(),
-                            &format!("Mount failed: {message}"),
-                        );
-                    }
+                    UiEvent::MountFailed { message } => handle_mount_failed(&ctx, message),
                     UiEvent::UpdateAvailable { version, url } => {
-                        ui.set_update_available(true);
-                        ui.set_update_url(url.into());
-                        let now = chrono::Local::now();
-                        append_log_row(
-                            &ui,
-                            &now.format("%b %d").to_string(),
-                            &now.format("%H:%M:%S").to_string(),
-                            &format!("Update available: v{version}"),
-                        );
+                        handle_update_available(&ctx, version, url)
                     }
-                    UiEvent::TriggerSnapshotRefresh => {
-                        if let Some(name) = ui_state::current_repo_name(&ui) {
-                            let _ = app_tx.send(AppCommand::RefreshSnapshots {
-                                repo_selector: name,
-                            });
-                        }
-                    }
+                    UiEvent::TriggerSnapshotRefresh => trigger_snapshot_refresh(&ctx),
                 }
             });
         }
@@ -484,7 +525,9 @@ mod tests {
 
     #[test]
     fn resolve_pending_name_missing_falls_back_to_zero() {
-        // This is the scenario B2 guards against: persisted repo got filtered out.
+        // Failed-to-load repos now stay in the model (with an error card), so a
+        // pending name only misses when the repo was truly removed from config.
+        // In that case we fall back to the first repo.
         let ls = labels(&["alpha", "beta"]);
         assert_eq!(resolve_repo_index(&ls, 1, Some("removed-repo")), 0);
     }

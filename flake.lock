@@ -83,37 +83,37 @@
     "skia-binaries-aarch64-darwin": {
       "flake": false,
       "locked": {
-        "narHash": "sha256-8k2f0muEP5p8RNDSMxVZ3r+LPeufeRvYCC0ZvWg08VY=",
+        "narHash": "sha256-5bZ+FmMwnLwgl10GP5Oapx+uXNGx7a41W6eLiKkvacc=",
         "type": "file",
-        "url": "https://github.com/rust-skia/skia-binaries/releases/download/0.90.0/skia-binaries-da4579b39b75fa2187c5-aarch64-apple-darwin-gl-pdf-textlayout-vulkan.tar.gz"
+        "url": "https://github.com/rust-skia/skia-binaries/releases/download/0.99.0/skia-binaries-a25a0fdb7d90429aa2d1-aarch64-apple-darwin-gl-jpegd-jpege-pdf-textlayout-vulkan.tar.gz"
       },
       "original": {
         "type": "file",
-        "url": "https://github.com/rust-skia/skia-binaries/releases/download/0.90.0/skia-binaries-da4579b39b75fa2187c5-aarch64-apple-darwin-gl-pdf-textlayout-vulkan.tar.gz"
+        "url": "https://github.com/rust-skia/skia-binaries/releases/download/0.99.0/skia-binaries-a25a0fdb7d90429aa2d1-aarch64-apple-darwin-gl-jpegd-jpege-pdf-textlayout-vulkan.tar.gz"
       }
     },
     "skia-binaries-aarch64-linux": {
       "flake": false,
       "locked": {
-        "narHash": "sha256-d6Bcvz8+jRWneN1CKHZ9/630+OHkafGY/kec/uf3hBk=",
+        "narHash": "sha256-tXfDNCfFckRE3XT64+w/5JMKy0cwklAIRMLcCUc0IYU=",
         "type": "file",
-        "url": "https://github.com/rust-skia/skia-binaries/releases/download/0.90.0/skia-binaries-da4579b39b75fa2187c5-aarch64-unknown-linux-gnu-gl-pdf-textlayout-vulkan.tar.gz"
+        "url": "https://github.com/rust-skia/skia-binaries/releases/download/0.99.0/skia-binaries-a25a0fdb7d90429aa2d1-aarch64-unknown-linux-gnu-gl-jpegd-jpege-pdf-textlayout-vulkan.tar.gz"
       },
       "original": {
         "type": "file",
-        "url": "https://github.com/rust-skia/skia-binaries/releases/download/0.90.0/skia-binaries-da4579b39b75fa2187c5-aarch64-unknown-linux-gnu-gl-pdf-textlayout-vulkan.tar.gz"
+        "url": "https://github.com/rust-skia/skia-binaries/releases/download/0.99.0/skia-binaries-a25a0fdb7d90429aa2d1-aarch64-unknown-linux-gnu-gl-jpegd-jpege-pdf-textlayout-vulkan.tar.gz"
       }
     },
     "skia-binaries-x86_64-linux": {
       "flake": false,
       "locked": {
-        "narHash": "sha256-4x3zKy0SbnKHPl9T4for1hObYKuVKN2T83+AIh6HQZs=",
+        "narHash": "sha256-eUb2aJV5bp4gffHKjqBPyjVQF4iyrlg4RWzv2Ny5TVE=",
         "type": "file",
-        "url": "https://github.com/rust-skia/skia-binaries/releases/download/0.90.0/skia-binaries-da4579b39b75fa2187c5-x86_64-unknown-linux-gnu-gl-pdf-textlayout-vulkan.tar.gz"
+        "url": "https://github.com/rust-skia/skia-binaries/releases/download/0.99.0/skia-binaries-a25a0fdb7d90429aa2d1-x86_64-unknown-linux-gnu-gl-jpegd-jpege-pdf-textlayout-vulkan.tar.gz"
       },
       "original": {
         "type": "file",
-        "url": "https://github.com/rust-skia/skia-binaries/releases/download/0.90.0/skia-binaries-da4579b39b75fa2187c5-x86_64-unknown-linux-gnu-gl-pdf-textlayout-vulkan.tar.gz"
+        "url": "https://github.com/rust-skia/skia-binaries/releases/download/0.99.0/skia-binaries-a25a0fdb7d90429aa2d1-x86_64-unknown-linux-gnu-gl-jpegd-jpege-pdf-textlayout-vulkan.tar.gz"
       }
     },
     "systems": {

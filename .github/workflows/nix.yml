@@ -39,6 +39,23 @@ jobs:
 
       - uses: cachix/install-nix-action@v31
 
+      # skia-bindings' build script does NOT validate the archive passed via
+      # SKIA_BINARIES_URL (upstream `// TODO: verify key`), so a stale pin
+      # builds successfully against outdated skia binaries instead of failing.
+      # Enforce the version match explicitly.
+      - name: Check skia-binaries pins match Cargo.lock
+        run: |
+          crate_version=$(grep -A1 'name = "skia-bindings"' Cargo.lock | sed -n 's/^version = "\(.*\)"/\1/p')
+          test -n "$crate_version" || { echo "::error::skia-bindings not found in Cargo.lock"; exit 1; }
+          grep -oE 'https://github.com/rust-skia/skia-binaries/releases/download/[^"]+' flake.nix | while read -r url; do
+            tag=$(echo "$url" | cut -d/ -f8)
+            if [ "$tag" != "$crate_version" ]; then
+              echo "::error::flake.nix pins skia-binaries $tag but Cargo.lock has skia-bindings $crate_version: $url"
+              exit 1
+            fi
+          done
+          echo "All skia-binaries pins match skia-bindings $crate_version"
+
       - name: Verify all pinned flake inputs (all platforms)
         run: nix flake archive
 

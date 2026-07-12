@@ -33,11 +33,29 @@ concurrency:
 jobs:
   nix:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # An uncached build takes ~57 min, and the cache save in the post phase
+    # adds a few more — 60 min is too tight on a cache miss.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v6
 
       - uses: cachix/install-nix-action@v31
+        with:
+          # Keep build-time dependencies (crane's cargo-artifacts derivations,
+          # flake inputs) alive through the cache action's pre-save GC.
+          extra_nix_config: |
+            keep-outputs = true
+            keep-derivations = true
+
+      # No purge inputs: purging needs `actions: write`, and this workflow
+      # runs with a read-only token. GitHub's LRU cache eviction (10 GB per
+      # repo) cleans up stale entries instead.
+      - name: Restore and save Nix store
+        uses: nix-community/cache-nix-action@v7
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.nix', 'flake.lock', '.nix/**', 'Cargo.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+          gc-max-store-size-linux: 6G
 
       # skia-bindings' build script does NOT validate the archive passed via
       # SKIA_BINARIES_URL (upstream `// TODO: verify key`), so a stale pin

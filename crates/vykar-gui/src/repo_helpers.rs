@@ -38,7 +38,11 @@ fn resolve_passphrase_tracked(
         let value = crate::controllers::password_dialog::show_password_dialog_with_error(
             &title, &message, error_line,
         );
-        Ok(value.filter(|v| !v.is_empty()).map(zeroize::Zeroizing::new))
+        // The dialog returns `Some(_)` on submit (including an empty field) and
+        // `None` on cancel/close. An empty string is a valid passphrase — a repo
+        // can be created with one via the CLI — so it must pass through as
+        // `Some("")`; only `None` (dismissed) signals "no passphrase entered".
+        Ok(value.map(zeroize::Zeroizing::new))
     })
 }
 

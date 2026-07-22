@@ -173,6 +173,30 @@ fn is_eio(e: &std::io::Error) -> bool {
     }
 }
 
+/// macOS: returns `true` if the raw OS error is EDEADLK (errno 11,
+/// "Resource deadlock avoided").
+///
+/// A FileProvider dataless (cloud-only) inode returns EDEADLK when
+/// `read_dir`/`open`/`read` would have to synchronously materialize it from a
+/// context that cannot drive `fileproviderd` (e.g. a background `launchd`
+/// backup). The walker already skips descent into directories detected as
+/// dataless at stat time, but a directory can flip to dataless between the
+/// `lstat` and the `read_dir`, and dataless *files* can deadlock on open/read.
+/// Treating EDEADLK as a soft (skip) error keeps the backup running instead of
+/// aborting. Scoped to macOS: on other platforms EDEADLK means a genuine
+/// `fcntl`/`flock` deadlock that should not be silently swallowed.
+fn is_edeadlk(e: &std::io::Error) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        e.raw_os_error() == Some(11)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = e;
+        false
+    }
+}
+
 /// Soft I/O errors that should yield a per-entry skip rather than abort the
 /// backup. Used both at raw-`io::Error` call sites (`readlink`, `read_dir`,
 /// `File::open`, `fstat`, `read_to_end`) and as the `VykarError::Io` arm of
@@ -199,6 +223,7 @@ pub fn is_soft_backup_io_error(e: &std::io::Error) -> bool {
         e.kind(),
         std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotFound,
     ) || is_eio(e)
+        || is_edeadlk(e)
     {
         return true;
     }
@@ -261,6 +286,26 @@ mod tests {
     fn soft_io_error_eio() {
         let e = std::io::Error::from_raw_os_error(5);
         assert!(is_soft_backup_io_error(&e));
+    }
+
+    // Symptom: nightly backups aborted with "readdir error in <dir>: Resource
+    // deadlock avoided (os error 11)" on macOS FileProvider dataless (iCloud
+    // cloud-only) directories. EDEADLK must be a soft skip on macOS so the
+    // backup continues instead of failing the whole run.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn soft_io_error_edeadlk_macos() {
+        let e = std::io::Error::from_raw_os_error(11);
+        assert!(is_soft_backup_io_error(&e));
+    }
+
+    // On non-macOS platforms EDEADLK is a genuine lock deadlock and must NOT be
+    // swallowed as a soft skip.
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn edeadlk_not_soft_off_macos() {
+        let e = std::io::Error::from_raw_os_error(11);
+        assert!(!is_soft_backup_io_error(&e));
     }
 
     #[test]

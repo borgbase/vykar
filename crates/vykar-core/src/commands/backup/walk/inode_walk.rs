@@ -24,7 +24,7 @@ use crate::platform::fs::{self, MetadataSummary};
 use vykar_types::error::{is_soft_backup_io_error, Result, VykarError};
 
 use super::super::source::{ResolvedSource, RootEmission, SourceKind};
-use super::{build_explicit_excludes, should_skip_for_device};
+use super::{build_explicit_excludes, should_descend_into_dir, should_skip_for_device};
 
 #[cfg(unix)]
 fn dir_entry_inode(entry: &std::fs::DirEntry) -> u64 {
@@ -562,8 +562,19 @@ impl InodeSortedWalk {
                 continue;
             }
 
-            if actual_is_dir && !file_type.is_symlink() {
+            // Record the directory inode itself either way (so restore
+            // recreates it), but only queue it for descent when it is a real,
+            // non-symlink, non-dataless directory. Descending into a
+            // FileProvider dataless (iCloud cloud-only) dir calls `read_dir`,
+            // which returns EDEADLK and aborts the whole backup — see
+            // `should_descend_into_dir`.
+            if should_descend_into_dir(actual_is_dir, file_type.is_symlink(), summary.is_dataless) {
                 pending_subdirs.push_back(raw.path.clone());
+            } else if actual_is_dir && !file_type.is_symlink() && summary.is_dataless {
+                debug!(
+                    path = %raw.path.display(),
+                    "skipping descent into dataless cloud-only directory"
+                );
             }
 
             let rel = rel_path_from_abs(&self.abs_source, &raw.path);

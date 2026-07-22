@@ -48,6 +48,23 @@ pub(crate) fn should_skip_for_device(
     one_file_system && source_dev != entry_dev
 }
 
+/// Decide whether the walker should descend into a directory entry.
+///
+/// Descend only into real directories that are not symlinks and not
+/// FileProvider dataless (iCloud cloud-only) placeholders. Calling `read_dir`
+/// on a dataless directory blocks `fileproviderd` trying to materialize the
+/// listing and returns EDEADLK ("Resource deadlock avoided", os error 11),
+/// which aborts the whole backup — so we record the directory inode itself but
+/// never descend into it. On non-macOS platforms `is_dataless` is always
+/// `false`, so this reduces to "descend into non-symlink dirs".
+pub(crate) fn should_descend_into_dir(
+    actual_is_dir: bool,
+    is_symlink: bool,
+    is_dataless: bool,
+) -> bool {
+    actual_is_dir && !is_symlink && !is_dataless
+}
+
 #[cfg(unix)]
 pub(super) fn read_item_xattrs(path: &Path) -> Option<HashMap<String, Vec<u8>>> {
     let names = match xattr::list(path) {
@@ -685,6 +702,21 @@ mod tests {
         assert!(should_skip_for_device(true, 42, 43));
         assert!(!should_skip_for_device(true, 42, 42));
         assert!(!should_skip_for_device(false, 42, 43));
+    }
+
+    /// Regression: descending into a dataless (iCloud cloud-only) directory
+    /// calls `read_dir`, which returns EDEADLK and aborts the whole nightly
+    /// backup. A dataless dir must be recorded but NOT descended into.
+    #[test]
+    fn dataless_directory_is_not_descended() {
+        // Normal directory: descend.
+        assert!(should_descend_into_dir(true, false, false));
+        // Dataless directory: record inode, skip descent (the bug fix).
+        assert!(!should_descend_into_dir(true, false, true));
+        // Symlink to a directory: never descend.
+        assert!(!should_descend_into_dir(true, true, false));
+        // Regular file: nothing to descend into.
+        assert!(!should_descend_into_dir(false, false, false));
     }
 
     /// Regression: dataless inodes must NOT trigger `read_item_xattrs`.

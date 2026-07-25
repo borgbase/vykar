@@ -1,7 +1,8 @@
 use crate::repo::lock::{
     acquire_lock, break_lock, cleanup_stale_locks_inner, cleanup_stale_sessions,
-    clear_all_sessions, default_stale_session_duration, refresh_session, register_session,
-    release_lock, session_marker_key, SessionEntry, SessionGuard, SESSION_STALE_SECS,
+    clear_all_sessions, default_stale_session_duration, format_age, format_age_since,
+    refresh_session, register_session, release_lock, session_marker_key, SessionEntry,
+    SessionGuard, SESSION_STALE_SECS,
 };
 use crate::testutil::MemoryBackend;
 use chrono::{Duration, Utc};
@@ -47,6 +48,97 @@ fn second_lock_is_rejected() {
     assert!(msg.contains("locked"), "unexpected error: {msg}");
 
     release_lock(&storage, first).unwrap();
+}
+
+/// The `Locked` message must be self-diagnosing: who holds the lock, how long
+/// they have held it, and what to do about it (issue #174, where the message
+/// named only host and PID and users could not tell a brief commit apart from
+/// a long prune/compact on another machine).
+#[test]
+fn locked_error_names_holder_age_and_remedy() {
+    let storage = MemoryBackend::new();
+    let first = acquire_lock(&storage).unwrap();
+
+    let msg = acquire_lock(&storage).unwrap_err().to_string();
+    assert!(
+        msg.contains(&crate::platform::hostname()),
+        "message should name the holder's host: {msg}"
+    );
+    assert!(
+        msg.contains(&format!("PID {}", std::process::id())),
+        "message should name the holder's PID: {msg}"
+    );
+    assert!(
+        msg.contains("held for 0s"),
+        "message should report a sub-minute age in seconds: {msg}"
+    );
+    assert!(
+        msg.contains("prune/compact"),
+        "message should name the likely cause: {msg}"
+    );
+    assert!(
+        msg.contains("vykar break-lock"),
+        "message should name the remedy: {msg}"
+    );
+    assert!(
+        !msg.contains("locks/"),
+        "a readable holder should be named by host/PID, not a raw key path: {msg}"
+    );
+
+    release_lock(&storage, first).unwrap();
+}
+
+/// An unreadable lock object is a normal race (the holder may have released it
+/// between our LIST and GET), so we still fail with a usable message naming the
+/// key rather than panicking or losing the remedy.
+#[test]
+fn locked_error_falls_back_to_key_when_holder_unparseable() {
+    let storage = MemoryBackend::new();
+    // Older key so it wins the sort; valid timestamp prefix so stale-lock
+    // cleanup does not reap it.
+    let garbage_key = lock_key_at(Utc::now() - Duration::minutes(1), "garbage");
+    storage.put(&garbage_key, b"not json").unwrap();
+
+    let msg = acquire_lock(&storage).unwrap_err().to_string();
+    assert!(
+        msg.contains(&garbage_key),
+        "message should name the lock key: {msg}"
+    );
+    assert!(
+        msg.contains("vykar break-lock"),
+        "message should still name the remedy: {msg}"
+    );
+}
+
+#[test]
+fn format_age_renders_sub_minute_in_seconds() {
+    let now = Utc::now();
+    assert_eq!(
+        format_age_since(&now, &(now - Duration::seconds(12))),
+        "12s"
+    );
+    assert_eq!(
+        format_age_since(&now, &(now - Duration::seconds(59))),
+        "59s"
+    );
+    assert_eq!(format_age_since(&now, &(now - Duration::seconds(60))), "1m");
+    assert_eq!(
+        format_age_since(&now, &(now - Duration::minutes(42))),
+        "42m"
+    );
+    assert_eq!(format_age_since(&now, &(now - Duration::hours(3))), "3h");
+    assert_eq!(
+        format_age_since(&now, &(now - Duration::hours(27))),
+        "1d 3h"
+    );
+    // Clock skew (timestamp in the future) must not underflow into a negative.
+    assert_eq!(format_age_since(&now, &(now + Duration::seconds(30))), "0s");
+    // The RFC3339 wrapper delegates to the same logic.
+    assert_eq!(
+        format_age(&now, &(now - Duration::seconds(5)).to_rfc3339()),
+        "5s"
+    );
+    assert_eq!(format_age(&now, "not-a-timestamp"), "unknown");
 }
 
 #[test]
@@ -497,30 +589,6 @@ fn clear_all_sessions_returns_zero_when_empty() {
     let storage = MemoryBackend::new();
     let removed = clear_all_sessions(&storage).unwrap();
     assert_eq!(removed, 0);
-}
-
-// --- Lock display and S3 eventual consistency tests ---
-
-#[test]
-fn lock_contention_shows_hostname_and_pid() {
-    let storage = MemoryBackend::new();
-    let first = acquire_lock(&storage).unwrap();
-
-    let second = acquire_lock(&storage);
-    assert!(second.is_err());
-    let err = second.unwrap_err();
-    let msg = err.to_string();
-    // Should contain hostname and PID, not a raw key path.
-    assert!(
-        msg.contains("PID"),
-        "error should contain hostname/PID, got: {msg}"
-    );
-    assert!(
-        !msg.contains("locks/"),
-        "error should not contain raw key path, got: {msg}"
-    );
-
-    release_lock(&storage, first).unwrap();
 }
 
 // --- 45-minute stale threshold tests ---

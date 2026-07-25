@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use vykar_storage::StorageBackend;
-use vykar_types::error::{Result, VykarError};
+use vykar_types::error::{LockHolder, LockHolderDetails, Result, VykarError};
 
 /// A simple advisory lock stored in `locks/<uuid>.json`.
 #[derive(Debug, Serialize, Deserialize)]
@@ -80,7 +80,7 @@ pub fn acquire_lock(storage: &dyn StorageBackend) -> Result<LockGuard> {
     }
     if keys.first() != Some(&key) {
         let _ = storage.delete(&key);
-        let holder = format_lock_holder(
+        let holder = build_lock_holder(
             storage,
             keys.first()
                 .expect("lock list contains our key or an older winner"),
@@ -121,15 +121,36 @@ fn list_lock_keys(storage: &dyn StorageBackend) -> Result<Vec<String>> {
     Ok(keys)
 }
 
-fn format_lock_holder(storage: &dyn StorageBackend, lock_key: &str) -> String {
-    let fallback = lock_key.to_string();
+/// Describe the process holding `lock_key`, for the `Locked` error message.
+///
+/// Falls back to `LockHolder { details: None }` when the lock object cannot be
+/// fetched or decoded — the holder may have released it between our LIST and
+/// this GET, so this is a normal race, not an error.
+fn build_lock_holder(storage: &dyn StorageBackend, lock_key: &str) -> LockHolder {
+    let bare = || LockHolder {
+        key: lock_key.to_string(),
+        details: None,
+    };
     let Some(data) = storage.get(lock_key).ok().flatten() else {
-        return fallback;
+        return bare();
     };
     let Ok(entry) = serde_json::from_slice::<LockEntry>(&data) else {
-        return fallback;
+        return bare();
     };
-    format!("{} (PID {})", entry.hostname, entry.pid)
+    // `lock_timestamp` falls back to the key's microsecond prefix when the
+    // entry's own `time` field is unparseable.
+    let age = lock_timestamp(Some(&entry), lock_key).map_or_else(
+        || "unknown".to_string(),
+        |ts| format_age_since(&Utc::now(), &ts),
+    );
+    LockHolder {
+        key: lock_key.to_string(),
+        details: Some(LockHolderDetails {
+            hostname: entry.hostname,
+            pid: entry.pid,
+            age,
+        }),
+    }
 }
 
 fn cleanup_stale_locks(storage: &dyn StorageBackend, max_age: Duration) -> Result<()> {
@@ -723,10 +744,16 @@ pub fn acquire_lock_with_retry(
                     // Add jitter: ±25%
                     let jitter = (rand::random::<u64>() % (delay / 2)).wrapping_sub(delay / 4);
                     let delay = delay.wrapping_add(jitter).max(100);
+                    // Log the holder compactly — `Display for LockHolder` is the
+                    // user-facing sentence, too verbose for a log field.
+                    let holder_desc = holder.details.as_ref().map_or_else(
+                        || holder.key.clone(),
+                        |d| format!("{} (PID {}, held {})", d.hostname, d.pid, d.age),
+                    );
                     debug!(
                         attempt = attempt + 1,
                         max_attempts,
-                        holder = %holder,
+                        holder = %holder_desc,
                         delay_ms = delay,
                         "lock contention, retrying"
                     );
@@ -751,21 +778,34 @@ pub fn default_stale_session_duration() -> Duration {
 }
 
 /// Format the age between `now` and an RFC3339 `timestamp` as a compact
-/// human-readable string (e.g. `"2h"`, `"1d 3h"`, `"42m"`).
+/// human-readable string (e.g. `"2h"`, `"1d 3h"`, `"42m"`, `"12s"`).
 ///
 /// Returns `"unknown"` if the timestamp fails to parse.
 pub fn format_age(now: &chrono::DateTime<Utc>, timestamp: &str) -> String {
     let Ok(ts) = chrono::DateTime::parse_from_rfc3339(timestamp) else {
         return "unknown".to_string();
     };
-    let dur = now.signed_duration_since(ts.with_timezone(&Utc));
+    format_age_since(now, &ts.with_timezone(&Utc))
+}
+
+/// Same as [`format_age`] but for an already-parsed timestamp.
+///
+/// Sub-minute ages render in seconds: for lock contention the difference
+/// between a few-second commit and a minutes-long compact is the whole signal,
+/// and flooring both to `"0m"` would erase it.
+pub fn format_age_since(now: &chrono::DateTime<Utc>, then: &chrono::DateTime<Utc>) -> String {
+    let dur = now.signed_duration_since(*then);
     let hours = dur.num_hours();
     if hours >= 24 {
         format!("{}d {}h", hours / 24, hours % 24)
     } else if hours > 0 {
         format!("{hours}h")
     } else {
-        let mins = dur.num_minutes().max(0);
-        format!("{mins}m")
+        let mins = dur.num_minutes();
+        if mins > 0 {
+            format!("{mins}m")
+        } else {
+            format!("{}s", dur.num_seconds().max(0))
+        }
     }
 }

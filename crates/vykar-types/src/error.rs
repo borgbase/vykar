@@ -63,6 +63,52 @@ impl fmt::Display for ActiveSessionList {
     }
 }
 
+/// Parsed fields of a lock object, present only when it could be read and
+/// decoded.
+#[derive(Debug, Clone)]
+pub struct LockHolderDetails {
+    pub hostname: String,
+    pub pid: u32,
+    /// Age of the lock's acquisition timestamp, pre-formatted (e.g. `"12s"`,
+    /// `"4m"`). Pre-formatting keeps this type free of chrono so it can live
+    /// in `vykar-types`.
+    pub age: String,
+}
+
+/// Identifies whatever holds the repository's advisory lock.
+///
+/// `details` is `None` when the lock object could not be fetched or parsed —
+/// only its storage key is known.
+#[derive(Debug, Clone)]
+pub struct LockHolder {
+    pub key: String,
+    pub details: Option<LockHolderDetails>,
+}
+
+impl fmt::Display for LockHolder {
+    /// Renders on a single line: this is printed into the cycle summary table
+    /// as `FAILED: {e}` (see `vykar-cli`'s `print_summary`), where multi-line
+    /// output would break the alignment.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.details {
+            Some(d) => write!(
+                f,
+                "repository is locked by {} (PID {}), held for {}. \
+                 Another machine may be running prune/compact, or the lock is stale. \
+                 Wait for it to finish, or run `vykar break-lock` if that process is gone.",
+                d.hostname, d.pid, d.age
+            ),
+            None => write!(
+                f,
+                "repository is locked by another process (lock: {}, holder details unreadable). \
+                 Another machine may be running prune/compact, or the lock is stale. \
+                 Wait for it to finish, or run `vykar break-lock` if that process is gone.",
+                self.key
+            ),
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum VykarError {
     #[error("repository not found at '{0}'")]
@@ -116,8 +162,8 @@ pub enum VykarError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
-    #[error("repository is locked by another process (lock: {0})")]
-    Locked(String),
+    #[error("{0}")]
+    Locked(LockHolder),
 
     #[error("chunk not found in index: {0}")]
     ChunkNotInIndex(crate::chunk_id::ChunkId),

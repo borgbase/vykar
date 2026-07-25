@@ -1168,7 +1168,12 @@ fn collect_repo_files(root: &std::path::Path) -> Vec<String> {
         };
         for entry in entries.flatten() {
             let p = entry.path();
-            let rel = p.strip_prefix(base).unwrap().to_string_lossy().to_string();
+            // Normalise to `/` so assertions on repo keys hold on Windows too.
+            let rel = p
+                .strip_prefix(base)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
             if rel == "locks" {
                 continue;
             }

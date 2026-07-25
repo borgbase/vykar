@@ -364,8 +364,8 @@ pub(super) fn handle_refresh_snapshots(ctx: &mut WorkerContext, repo_selector: S
             operations::list_snapshots_with_stats(&repo.config, pass)
         });
 
-        let mut snapshots = match outcome {
-            Ok(PassphraseRun::Ran(snapshots)) => snapshots,
+        let listing = match outcome {
+            Ok(PassphraseRun::Ran(listing)) => listing,
             Ok(PassphraseRun::Canceled) => {
                 send_log(
                     &ctx.ui_tx,
@@ -383,6 +383,12 @@ pub(super) fn handle_refresh_snapshots(ctx: &mut WorkerContext, repo_selector: S
             }
         };
 
+        // Say so rather than rendering a silently short snapshot table.
+        if let Some(msg) = vykar_core::repo::snapshot_cache::describe_skipped(&listing.hidden) {
+            send_log(&ctx.ui_tx, format!("[{repo_name}] {msg}"));
+        }
+
+        let mut snapshots = listing.snapshots;
         snapshots.sort_by_key(|(s, _)| s.time);
         for (s, stats) in snapshots {
             let ts: DateTime<Local> = s.time.with_timezone(&Local);

@@ -63,22 +63,36 @@ fn list_snapshot_items_inner(
     Ok((items, source_paths))
 }
 
+/// A snapshot listing, plus any snapshot this binary could not read.
+///
+/// `hidden` is the honesty flag: when it is non-empty, `snapshots` is an
+/// incomplete view of the repository and the caller must say so instead of
+/// presenting a silently truncated list.
+#[derive(Debug, Default)]
+pub struct SnapshotListing {
+    pub snapshots: Vec<(SnapshotEntry, Option<crate::snapshot::SnapshotStats>)>,
+    pub hidden: Vec<crate::repo::snapshot_cache::SkippedSnapshot>,
+}
+
 /// List all snapshots with their stats (loaded from snapshot metadata).
 /// Returns `None` for stats when the snapshot blob cannot be read or decrypted.
 pub fn list_snapshots_with_stats(
     config: &VykarConfig,
     passphrase: Option<&str>,
-) -> Result<Vec<(SnapshotEntry, Option<crate::snapshot::SnapshotStats>)>> {
+) -> Result<SnapshotListing> {
     let repo = open_repo(config, passphrase, OpenOptions::new())?;
     let entries = repo.manifest().snapshots.clone();
-    let mut result = Vec::with_capacity(entries.len());
+    let mut snapshots = Vec::with_capacity(entries.len());
     for entry in entries {
         let stats = load_snapshot_meta(&repo, &entry.name)
             .ok()
             .map(|meta| meta.stats);
-        result.push((entry, stats));
+        snapshots.push((entry, stats));
     }
-    Ok(result)
+    Ok(SnapshotListing {
+        snapshots,
+        hidden: repo.skipped_snapshots().to_vec(),
+    })
 }
 
 /// Get metadata for a specific snapshot.
@@ -114,7 +128,19 @@ pub fn load_snapshot_meta(repo: &Repository, snapshot_name: &str) -> Result<Snap
         entry.id.as_bytes(),
         repo.crypto.as_ref(),
     )?;
-    let meta: SnapshotMeta = rmp_serde::from_slice(&meta_bytes)?;
+    // A length mismatch here is a foreign envelope, not corruption: decryption
+    // already authenticated the blob. Report it as such so the user gets the
+    // remedy instead of a raw serde error.
+    let meta: SnapshotMeta = rmp_serde::from_slice(&meta_bytes).map_err(|e| {
+        match crate::repo::snapshot_cache::classify_decode_error(&e, &meta_bytes) {
+            reason @ crate::repo::snapshot_cache::SkipReason::IncompatibleEnvelope { .. } => {
+                VykarError::IncompatibleSnapshotEnvelope {
+                    detail: reason.to_string(),
+                }
+            }
+            _ => VykarError::Deserialization(e),
+        }
+    })?;
     // Fail closed on snapshots written by a newer format than we support so
     // every item-reading op (restore, ls, diff, find, mount) refuses rather
     // than misinterpreting a future layout. Snapshot *listing* reads the

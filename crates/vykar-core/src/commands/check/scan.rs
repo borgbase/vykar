@@ -87,6 +87,37 @@ pub(super) struct ScanResult {
     pub(super) item_impacts: Vec<ItemImpact>,
 }
 
+/// Map a `SnapshotMeta` decode failure to an integrity issue.
+///
+/// Only call this once the AEAD decrypt has succeeded. Authenticated
+/// decryption proves the bytes are intact and the key is right, so a
+/// positional-array length mismatch can only mean the writer used a different
+/// envelope — a newer vykar. Classifying that as
+/// [`IntegrityIssue::IncompatibleSnapshotEnvelope`] rather than
+/// `CorruptSnapshot` is what keeps `check --repair` from deleting another
+/// host's snapshot.
+fn classify_meta_decode_issue(
+    err: &rmp_serde::decode::Error,
+    meta_bytes: &[u8],
+    snapshot_id: SnapshotId,
+    snapshot_name: Option<String>,
+) -> IntegrityIssue {
+    use crate::repo::snapshot_cache::{classify_decode_error, SkipReason};
+    match classify_decode_error(err, meta_bytes) {
+        reason @ SkipReason::IncompatibleEnvelope { .. } => {
+            IntegrityIssue::IncompatibleSnapshotEnvelope {
+                snapshot_id,
+                snapshot_name,
+                detail: reason.to_string(),
+            }
+        }
+        _ => IntegrityIssue::CorruptSnapshot {
+            snapshot_id,
+            snapshot_name,
+        },
+    }
+}
+
 /// Run the integrity scan, producing structured issues.
 ///
 /// `ScanOptions` controls which phases run and which packs are skipped.
@@ -134,35 +165,46 @@ pub(super) fn integrity_scan(
                 }
                 Ok(snapshot_id) => match repo.storage.get(key) {
                     Ok(Some(blob)) => {
-                        let decoded = unpack_object_expect_with_context(
+                        // Keep decrypt and decode failures separate: a decode
+                        // failure *after* a successful decrypt is a version
+                        // skew, not corruption, and repair must not delete it.
+                        match unpack_object_expect_with_context(
                             &blob,
                             ObjectType::SnapshotMeta,
                             snapshot_id.as_bytes(),
                             repo.crypto.as_ref(),
-                        )
-                        .and_then(|meta_bytes| {
-                            rmp_serde::from_slice::<crate::snapshot::SnapshotMeta>(&meta_bytes)
-                                .map_err(|e| VykarError::Other(format!("deserialize: {e}")))
-                        });
-                        match decoded {
-                            // A too-new blob deserializes fine (the envelope is
-                            // frozen): classify unsupported, never corrupt.
-                            Ok(meta)
-                                if meta.format_version
-                                    > crate::snapshot::CURRENT_FORMAT_VERSION =>
-                            {
-                                issues.push(IntegrityIssue::UnsupportedSnapshotVersion {
-                                    snapshot_id,
-                                    snapshot_name: None,
-                                    version: meta.format_version,
-                                });
-                            }
-                            Ok(_) => {}
+                        ) {
                             Err(_) => {
                                 issues.push(IntegrityIssue::CorruptSnapshot {
                                     snapshot_id,
                                     snapshot_name: None,
                                 });
+                            }
+                            Ok(meta_bytes) => {
+                                match rmp_serde::from_slice::<crate::snapshot::SnapshotMeta>(
+                                    &meta_bytes,
+                                ) {
+                                    // A too-new blob whose envelope still
+                                    // matches deserializes fine: classify
+                                    // unsupported, never corrupt.
+                                    Ok(meta)
+                                        if meta.format_version
+                                            > crate::snapshot::CURRENT_FORMAT_VERSION =>
+                                    {
+                                        issues.push(IntegrityIssue::UnsupportedSnapshotVersion {
+                                            snapshot_id,
+                                            snapshot_name: None,
+                                            version: meta.format_version,
+                                        });
+                                    }
+                                    Ok(_) => {}
+                                    Err(e) => issues.push(classify_meta_decode_issue(
+                                        &e,
+                                        &meta_bytes,
+                                        snapshot_id,
+                                        None,
+                                    )),
+                                }
                             }
                         }
                     }
@@ -225,6 +267,17 @@ pub(super) fn integrity_scan(
                     snapshot_id: entry.id,
                     snapshot_name: Some(entry.name.clone()),
                     version,
+                });
+                continue;
+            }
+            Err(VykarError::IncompatibleSnapshotEnvelope { detail }) => {
+                // Decrypt succeeded and only the positional layout differs, so
+                // the blob is intact and was written by a newer vykar. Same
+                // treatment as a too-new format version: report, never repair.
+                issues.push(IntegrityIssue::IncompatibleSnapshotEnvelope {
+                    snapshot_id: entry.id,
+                    snapshot_name: Some(entry.name.clone()),
+                    detail,
                 });
                 continue;
             }

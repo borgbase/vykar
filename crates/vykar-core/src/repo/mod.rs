@@ -140,6 +140,10 @@ pub struct Repository {
     pub storage: Arc<dyn StorageBackend>,
     pub crypto: Arc<dyn CryptoEngine>,
     manifest: Manifest,
+    /// Snapshots present under `snapshots/` that could not be read into the
+    /// manifest. Non-empty means `manifest` is an incomplete view of the
+    /// repository — see [`Repository::skipped_snapshots`].
+    skipped_snapshots: Vec<snapshot_cache::SkippedSnapshot>,
     chunk_index: ChunkIndex,
     pub config: RepoConfig,
     file_cache: FileCache,
@@ -203,6 +207,16 @@ impl Repository {
     /// Read-only access to the manifest.
     pub fn manifest(&self) -> &Manifest {
         &self.manifest
+    }
+
+    /// Snapshots that exist under `snapshots/` but could not be read into the
+    /// manifest — most commonly because they were written by a newer vykar.
+    ///
+    /// A non-empty result means [`Repository::manifest`] is an **incomplete**
+    /// view of the repository. Callers that show a snapshot list to a user must
+    /// surface this rather than rendering a silently truncated list.
+    pub fn skipped_snapshots(&self) -> &[snapshot_cache::SkippedSnapshot] {
+        &self.skipped_snapshots
     }
 
     /// Mutable access to the manifest (in-memory only, never persisted to storage).

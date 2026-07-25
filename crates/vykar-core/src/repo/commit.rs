@@ -671,14 +671,15 @@ impl Repository {
     pub fn refresh_snapshot_list(&mut self) -> Result<()> {
         // Strict I/O: fail on GET errors so a transient failure can't hide an
         // existing snapshot name and allow a duplicate during commit.
-        let entries = snapshot_cache::refresh_snapshot_cache(
+        let refresh = snapshot_cache::refresh_snapshot_cache(
             self.storage.as_ref(),
             self.crypto.as_ref(),
             &self.config.id,
             self.cache_dir_override.as_deref(),
             true, // strict_io: true — commit uniqueness check
         )?;
-        self.manifest = Manifest::from_snapshot_entries(entries);
+        self.skipped_snapshots = refresh.skipped;
+        self.manifest = Manifest::from_snapshot_entries(refresh.entries);
         Ok(())
     }
 

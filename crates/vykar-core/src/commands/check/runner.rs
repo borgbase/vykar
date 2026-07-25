@@ -253,17 +253,30 @@ fn sample_packs_out(
 /// snapshot; an unsupported one we cannot interpret would drop live chunk
 /// references (mirrors the `SnapshotReadFailed` guard in `execute_repair`).
 /// Plain `check` (no repair) still *reports* the issue and is unaffected.
-fn refuse_repair_if_unsupported_versions(scan: &ScanResult) -> Result<()> {
+///
+/// Covers both ways a newer writer can outrun this build: a decodable envelope
+/// stamped with a higher `format_version`, and an envelope whose field count
+/// differs so `format_version` cannot be read at all. The second case is the
+/// dangerous one — without this it lands in `CorruptSnapshot`, and repair
+/// deletes the blob.
+fn refuse_repair_if_unreadable_snapshots(scan: &ScanResult) -> Result<()> {
     let count = scan
         .issues
         .iter()
-        .filter(|i| matches!(i, IntegrityIssue::UnsupportedSnapshotVersion { .. }))
+        .filter(|i| {
+            matches!(
+                i,
+                IntegrityIssue::UnsupportedSnapshotVersion { .. }
+                    | IntegrityIssue::IncompatibleSnapshotEnvelope { .. }
+            )
+        })
         .count();
     if count > 0 {
         return Err(VykarError::Other(format!(
             "aborting repair: {count} snapshot(s) were written by a newer vykar \
-             (unsupported format version); upgrade vykar — repair leaves them untouched \
-             and refuses to rebuild refcounts without decoding them"
+             (unsupported format version or incompatible metadata envelope); \
+             upgrade vykar — repair leaves them untouched and refuses to rebuild \
+             refcounts without decoding them"
         )));
     }
     Ok(())
@@ -299,7 +312,7 @@ pub fn run_with_repair(
 
         // Refuse before building the plan so a dry-run never presents a
         // misleading executable RebuildRefcounts plan for a too-new repo.
-        refuse_repair_if_unsupported_versions(&scan)?;
+        refuse_repair_if_unreadable_snapshots(&scan)?;
 
         // Build per-pack grouping for plan
         let mut pack_chunks: HashMap<PackId, Vec<(ChunkId, ChunkIndexEntry)>> = HashMap::new();
@@ -351,7 +364,7 @@ pub fn run_with_repair(
                 // Refuse right after the under-lock scan — before the delete
                 // probe and execute_repair — so not even the probe object is
                 // written when a too-new snapshot is present.
-                refuse_repair_if_unsupported_versions(&scan)?;
+                refuse_repair_if_unreadable_snapshots(&scan)?;
 
                 // Build per-pack grouping for plan
                 let mut pack_chunks: HashMap<PackId, Vec<(ChunkId, ChunkIndexEntry)>> =

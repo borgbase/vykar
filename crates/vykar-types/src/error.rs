@@ -147,6 +147,14 @@ pub enum VykarError {
     )]
     UnsupportedSnapshotVersion { version: u32 },
 
+    /// The snapshot's positional-array envelope does not match this build's.
+    ///
+    /// Only ever raised after the AEAD decrypt succeeded, which proves the
+    /// bytes are intact and the key is right — so this is a version skew, never
+    /// corruption, and must never be "repaired" by deleting the snapshot.
+    #[error("snapshot metadata is incompatible with this build: {detail}")]
+    IncompatibleSnapshotEnvelope { detail: String },
+
     #[error("serialization error: {0}")]
     Serialization(#[from] rmp_serde::encode::Error),
 

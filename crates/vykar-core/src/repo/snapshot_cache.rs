@@ -1,5 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
@@ -13,6 +14,146 @@ use vykar_types::error::Result;
 use vykar_types::snapshot_id::SnapshotId;
 
 const SNAPSHOT_CACHE_CONTEXT: &[u8] = b"snapshot_cache";
+
+/// Why a snapshot that exists in `snapshots/` was left out of the manifest.
+///
+/// Every variant means the caller's view of the repository is **partial**: the
+/// blob is on the server but this binary could not turn it into an entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SkipReason {
+    /// The stored positional array has a different field count than this build
+    /// reads. The envelope is frozen and a *shorter* array still decodes via
+    /// `#[serde(default)]`, so this can only be a *longer* array — a snapshot
+    /// written by a newer vykar. See the Format Evolution section of
+    /// `architecture.md`.
+    IncompatibleEnvelope { stored_fields: Option<u32> },
+    /// Decrypted and authenticated, but not a decodable `SnapshotMeta`.
+    Undecodable(String),
+    /// Failed AEAD decryption or authentication.
+    Undecryptable(String),
+    /// Listed under `snapshots/` but could not be fetched.
+    Unavailable(String),
+}
+
+impl std::fmt::Display for SkipReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SkipReason::IncompatibleEnvelope { stored_fields } => {
+                match stored_fields {
+                    Some(n) => write!(
+                        f,
+                        "stored envelope has {n} fields, this build reads {}",
+                        crate::snapshot::SNAPSHOT_META_FIELD_COUNT
+                    )?,
+                    None => write!(
+                        f,
+                        "stored envelope does not match the {}-field layout this build reads",
+                        crate::snapshot::SNAPSHOT_META_FIELD_COUNT
+                    )?,
+                }
+                write!(f, " — written by a newer vykar; upgrade vykar on this host")
+            }
+            SkipReason::Undecodable(e) => write!(f, "metadata could not be decoded: {e}"),
+            SkipReason::Undecryptable(e) => write!(f, "could not be decrypted: {e}"),
+            SkipReason::Unavailable(e) => write!(f, "could not be fetched: {e}"),
+        }
+    }
+}
+
+/// A snapshot present on storage that this binary could not read.
+#[derive(Debug, Clone)]
+pub struct SkippedSnapshot {
+    pub id_hex: String,
+    pub reason: SkipReason,
+}
+
+/// Result of a snapshot-list refresh.
+///
+/// A non-empty `skipped` means `entries` is an **incomplete** view of the
+/// repository; callers that present a snapshot list to a user must say so
+/// rather than rendering a silently truncated list.
+#[derive(Debug, Default)]
+pub struct SnapshotRefresh {
+    pub entries: Vec<SnapshotEntry>,
+    pub skipped: Vec<SkippedSnapshot>,
+}
+
+/// One-line summary of an unreadable-snapshot set, or `None` when it is empty.
+///
+/// Returning a formatted string from the core is deliberate and consistent with
+/// `PruneStats.warnings` / `CheckError.message`: it is a value the frontend
+/// chooses where and whether to render, not a print.
+pub fn describe_skipped(skipped: &[SkippedSnapshot]) -> Option<String> {
+    if skipped.is_empty() {
+        return None;
+    }
+    let n = skipped.len();
+    let noun = if n == 1 { "snapshot" } else { "snapshots" };
+    let version_skew = skipped
+        .iter()
+        .filter(|s| matches!(s.reason, SkipReason::IncompatibleEnvelope { .. }))
+        .count();
+    if version_skew == n {
+        Some(format!(
+            "{n} {noun} hidden: written by a newer vykar — upgrade vykar on this \
+             host to see {}",
+            if n == 1 { "it" } else { "them" }
+        ))
+    } else {
+        Some(format!(
+            "{n} {noun} hidden: this build could not read {} (see warnings above)",
+            if n == 1 { "it" } else { "them" }
+        ))
+    }
+}
+
+/// Element count of a msgpack array header, if `bytes` starts with one.
+///
+/// Lets us report how many fields a foreign envelope actually carries;
+/// `rmp_serde`'s `LengthMismatch(n)` reports `len - excess`, i.e. *our* field
+/// count, which the user already knows.
+fn msgpack_array_len(bytes: &[u8]) -> Option<u32> {
+    match *bytes.first()? {
+        b @ 0x90..=0x9f => Some(u32::from(b & 0x0f)),
+        0xdc => bytes
+            .get(1..3)
+            .and_then(|b| <[u8; 2]>::try_from(b).ok())
+            .map(|b| u32::from(u16::from_be_bytes(b))),
+        0xdd => bytes
+            .get(1..5)
+            .and_then(|b| <[u8; 4]>::try_from(b).ok())
+            .map(u32::from_be_bytes),
+        _ => None,
+    }
+}
+
+/// Classify a `SnapshotMeta` decode failure against the raw plaintext.
+///
+/// Callers must only use this once the AEAD decrypt has succeeded — that is
+/// what makes [`SkipReason::IncompatibleEnvelope`] a sound conclusion rather
+/// than a guess about possibly-corrupt bytes.
+pub fn classify_decode_error(err: &rmp_serde::decode::Error, meta_bytes: &[u8]) -> SkipReason {
+    match err {
+        rmp_serde::decode::Error::LengthMismatch(_) => SkipReason::IncompatibleEnvelope {
+            stored_fields: msgpack_array_len(meta_bytes),
+        },
+        other => SkipReason::Undecodable(other.to_string()),
+    }
+}
+
+/// Warn once per process per snapshot ID.
+///
+/// `refresh_snapshot_cache` runs on every `Repository::open()` and a skipped
+/// snapshot is never cached, so without this a single `vykar` run repeats the
+/// same warning for each phase it runs (backup, prune, compact, check).
+fn warn_skip_once(id_hex: &str, reason: &SkipReason) {
+    static WARNED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let warned = WARNED.get_or_init(|| Mutex::new(HashSet::new()));
+    let mut warned = warned.lock().unwrap_or_else(|e| e.into_inner());
+    if warned.insert(id_hex.to_string()) {
+        warn!("snapshot {id_hex}: {reason}. Skipping — this repository listing is incomplete");
+    }
+}
 
 /// Cached snapshot entries, keyed by snapshot ID hex.
 /// Persisted locally at `<cache>/vykar/<repo_id_hex>/snapshot_list`.
@@ -95,8 +236,11 @@ impl SnapshotListCache {
 
 /// Refresh the local snapshot cache by diffing against `snapshots/` on storage.
 ///
-/// Decrypt/deserialize errors are always skipped with a warning — this prevents
-/// a single garbage upload from bricking the repo in append-only mode.
+/// Decrypt/deserialize errors are always skipped — this prevents a single
+/// garbage upload from bricking the repo in append-only mode. Each skip is
+/// recorded in [`SnapshotRefresh::skipped`] so the caller can tell the user the
+/// listing is partial instead of silently returning a truncated list, and is
+/// warned once per process rather than once per repository open.
 ///
 /// When `strict_io` is true, I/O errors (GET failure, listed-but-not-found) are
 /// treated as hard errors. Use this in the commit path where a transient failure
@@ -108,7 +252,9 @@ pub fn refresh_snapshot_cache(
     repo_id: &[u8],
     cache_dir_override: Option<&Path>,
     strict_io: bool,
-) -> Result<Vec<SnapshotEntry>> {
+) -> Result<SnapshotRefresh> {
+    let mut skipped: Vec<SkippedSnapshot> = Vec::new();
+
     // Load existing local cache
     let mut cache = SnapshotListCache::load(repo_id, crypto, cache_dir_override);
 
@@ -155,7 +301,12 @@ pub fn refresh_snapshot_cache(
                         "snapshot {id_hex} listed but not found (strict I/O mode)"
                     )));
                 }
-                warn!("snapshot {id_hex} listed but not found, skipping");
+                let reason = SkipReason::Unavailable("listed but not found".into());
+                warn_skip_once(id_hex, &reason);
+                skipped.push(SkippedSnapshot {
+                    id_hex: id_hex.clone(),
+                    reason,
+                });
                 continue;
             }
             Err(e) => {
@@ -164,7 +315,12 @@ pub fn refresh_snapshot_cache(
                         "failed to fetch snapshot {id_hex}: {e} (strict I/O mode)"
                     )));
                 }
-                warn!("failed to fetch snapshot {id_hex}: {e}, skipping");
+                let reason = SkipReason::Unavailable(e.to_string());
+                warn_skip_once(id_hex, &reason);
+                skipped.push(SkippedSnapshot {
+                    id_hex: id_hex.clone(),
+                    reason,
+                });
                 continue;
             }
         };
@@ -177,7 +333,12 @@ pub fn refresh_snapshot_cache(
         ) {
             Ok(b) => b,
             Err(e) => {
-                warn!("failed to decrypt snapshot {id_hex}: {e}, skipping");
+                let reason = SkipReason::Undecryptable(e.to_string());
+                warn_skip_once(id_hex, &reason);
+                skipped.push(SkippedSnapshot {
+                    id_hex: id_hex.clone(),
+                    reason,
+                });
                 continue;
             }
         };
@@ -185,7 +346,15 @@ pub fn refresh_snapshot_cache(
         let meta: crate::snapshot::SnapshotMeta = match rmp_serde::from_slice(&meta_bytes) {
             Ok(m) => m,
             Err(e) => {
-                warn!("failed to deserialize snapshot {id_hex}: {e}, skipping");
+                // Decryption already succeeded, so the blob is intact and the
+                // key is right — a length mismatch here is a foreign envelope,
+                // never corruption.
+                let reason = classify_decode_error(&e, &meta_bytes);
+                warn_skip_once(id_hex, &reason);
+                skipped.push(SkippedSnapshot {
+                    id_hex: id_hex.clone(),
+                    reason,
+                });
                 continue;
             }
         };
@@ -208,14 +377,20 @@ pub fn refresh_snapshot_cache(
         warn!("failed to save snapshot list cache: {e}");
     }
 
-    Ok(cache.to_entries())
+    // Stable order so a caller rendering the list gets deterministic output.
+    skipped.sort_by(|a, b| a.id_hex.cmp(&b.id_hex));
+
+    Ok(SnapshotRefresh {
+        entries: cache.to_entries(),
+        skipped,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::ChunkerConfig;
-    use crate::snapshot::SnapshotMeta;
+    use crate::snapshot::{SnapshotMeta, SNAPSHOT_META_FIELD_COUNT};
     use crate::testutil::MemoryBackend;
     use vykar_crypto::PlaintextEngine;
 
@@ -256,6 +431,146 @@ mod tests {
                 .unwrap();
         storage.put(&id.storage_key(), &packed).unwrap();
         id
+    }
+
+    /// Store a snapshot whose envelope is one field *longer* than this build's
+    /// — what a future vykar that appended a field to `SnapshotMeta` writes.
+    ///
+    /// It must be longer, not shorter: a shorter array still decodes via
+    /// `#[serde(default)]` (see `old_array_decodes_with_defaults`), so a
+    /// 12-field fixture would silently exercise nothing.
+    fn store_future_snapshot(
+        storage: &dyn StorageBackend,
+        crypto: &dyn CryptoEngine,
+    ) -> SnapshotId {
+        let id = SnapshotId::generate();
+        let meta = make_snapshot_meta("from-the-future");
+        let current = rmp_serde::to_vec(&meta).unwrap();
+
+        // Re-encode as a positional array with one extra trailing element.
+        let expected_header = 0x90 | u8::try_from(SNAPSHOT_META_FIELD_COUNT).unwrap();
+        assert_eq!(
+            current.first().copied(),
+            Some(expected_header),
+            "fixture assumes a {SNAPSHOT_META_FIELD_COUNT}-element fixarray"
+        );
+        let mut future = current.clone();
+        future[0] = 0x90 | u8::try_from(SNAPSHOT_META_FIELD_COUNT + 1).unwrap();
+        future.push(0xC0); // nil — the hypothetical new field
+
+        let packed =
+            pack_object_with_context(ObjectType::SnapshotMeta, id.as_bytes(), &future, crypto)
+                .unwrap();
+        storage.put(&id.storage_key(), &packed).unwrap();
+        id
+    }
+
+    #[test]
+    fn future_envelope_is_reported_not_silently_skipped() {
+        let crypto = test_crypto();
+        let storage = MemoryBackend::new();
+        let cache_dir = tempfile::tempdir().unwrap();
+
+        store_snapshot(&storage, &crypto, "readable");
+        let future_id = store_future_snapshot(&storage, &crypto);
+
+        let refresh = refresh_snapshot_cache(
+            &storage,
+            &crypto,
+            &[0xC1; 16],
+            Some(cache_dir.path()),
+            false,
+        )
+        .expect("a foreign envelope must never be fatal");
+
+        assert_eq!(
+            refresh.entries.len(),
+            1,
+            "the readable snapshot must still list"
+        );
+        assert_eq!(
+            refresh.skipped.len(),
+            1,
+            "the unreadable snapshot must be reported, not silently dropped"
+        );
+        assert_eq!(refresh.skipped[0].id_hex, future_id.to_hex());
+        assert_eq!(
+            refresh.skipped[0].reason,
+            SkipReason::IncompatibleEnvelope {
+                stored_fields: Some(SNAPSHOT_META_FIELD_COUNT + 1)
+            },
+            "a longer envelope after a successful decrypt is version skew, not corruption"
+        );
+    }
+
+    #[test]
+    fn incompatible_envelope_message_names_the_remedy() {
+        let reason = SkipReason::IncompatibleEnvelope {
+            stored_fields: Some(15),
+        };
+        let msg = reason.to_string();
+        assert!(
+            msg.contains("15"),
+            "should name the stored field count: {msg}"
+        );
+        assert!(
+            msg.contains(&SNAPSHOT_META_FIELD_COUNT.to_string()),
+            "should name this build's field count: {msg}"
+        );
+        assert!(
+            msg.contains("upgrade vykar"),
+            "should name the remedy: {msg}"
+        );
+
+        let summary = describe_skipped(&[SkippedSnapshot {
+            id_hex: "ab".into(),
+            reason,
+        }])
+        .expect("a non-empty set must produce a summary");
+        assert!(summary.contains("1 snapshot hidden"), "{summary}");
+        assert!(summary.contains("upgrade vykar"), "{summary}");
+        assert_eq!(describe_skipped(&[]), None, "empty set must stay silent");
+    }
+
+    /// The skipped list is rebuilt on every refresh — only the `warn!` is
+    /// de-duplicated. A caller that opens the repo twice in one process must
+    /// still be told its view is partial the second time.
+    #[test]
+    fn future_envelope_is_reported_on_every_refresh() {
+        let crypto = test_crypto();
+        let storage = MemoryBackend::new();
+        let cache_dir = tempfile::tempdir().unwrap();
+
+        store_future_snapshot(&storage, &crypto);
+
+        for pass in 1..=2 {
+            let refresh = refresh_snapshot_cache(
+                &storage,
+                &crypto,
+                &[0xC2; 16],
+                Some(cache_dir.path()),
+                false,
+            )
+            .unwrap();
+            assert_eq!(
+                refresh.skipped.len(),
+                1,
+                "pass {pass}: a partial view must be reported every time, \
+                 not only on the first open"
+            );
+        }
+    }
+
+    #[test]
+    fn msgpack_array_len_reads_all_header_widths() {
+        assert_eq!(msgpack_array_len(&[0x90]), Some(0));
+        assert_eq!(msgpack_array_len(&[0x9E]), Some(14));
+        assert_eq!(msgpack_array_len(&[0x9F]), Some(15));
+        assert_eq!(msgpack_array_len(&[0xDC, 0x01, 0x00]), Some(256));
+        assert_eq!(msgpack_array_len(&[0xDD, 0, 1, 0, 0]), Some(65536));
+        assert_eq!(msgpack_array_len(&[0xC0]), None, "nil is not an array");
+        assert_eq!(msgpack_array_len(&[]), None);
+        assert_eq!(msgpack_array_len(&[0xDC, 0x01]), None, "truncated header");
     }
 
     #[test]
@@ -329,7 +644,13 @@ mod tests {
             false, // non-strict
         );
         assert!(result.is_ok(), "non-strict should skip GET errors");
-        assert_eq!(result.unwrap().len(), 0, "no snapshots should be loaded");
+        let refresh = result.unwrap();
+        assert_eq!(refresh.entries.len(), 0, "no snapshots should be loaded");
+        assert_eq!(
+            refresh.skipped.len(),
+            1,
+            "the unreachable snapshot must be reported, not silently dropped"
+        );
     }
 
     #[test]
@@ -356,10 +677,22 @@ mod tests {
             "strict_io should skip decrypt errors, got: {:?}",
             result.err()
         );
+        let refresh = result.unwrap();
         assert_eq!(
-            result.unwrap().len(),
+            refresh.entries.len(),
             0,
             "garbage snapshot should be skipped"
+        );
+        assert!(
+            matches!(
+                refresh.skipped.as_slice(),
+                [SkippedSnapshot {
+                    reason: SkipReason::Undecryptable(_),
+                    ..
+                }]
+            ),
+            "a garbage blob is a decrypt failure, not a version skew: {:?}",
+            refresh.skipped
         );
     }
 

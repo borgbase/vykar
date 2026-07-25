@@ -74,6 +74,40 @@ vykar compact --dry-run
 vykar compact
 ```
 
+## Sharing one repository between hosts
+
+Several machines can back up to the same repository, but they should run
+**compatible vykar versions**. Compatibility is backward-readable, not
+forward-compatible: a newer binary reads everything older ones wrote, but an
+older binary cannot read snapshots written by a newer one.
+
+If you see this when listing or backing up:
+
+```
+WARN snapshot 3f9c…: stored envelope has 15 fields, this build reads 14 —
+     written by a newer vykar; upgrade vykar on this host. Skipping —
+     this repository listing is incomplete
+1 snapshot hidden: written by a newer vykar — upgrade vykar on this host to see it
+```
+
+…then another machine using this repository is running a newer vykar than this
+one. Specifically:
+
+- **Nothing is lost or damaged.** The snapshot is intact on the server and
+  fully readable from the up-to-date host. This machine simply cannot decode
+  its metadata, so it leaves it alone.
+- **This host's view of the repository is incomplete.** The hidden snapshots
+  are missing from `vykar list`, and cannot be restored from *this* machine.
+- **The fix is to upgrade vykar on the host printing the warning.** Compare
+  `vykar --version` across your machines and bring the oldest up to date.
+
+Older releases of vykar reported this as a bare deserialization error and
+silently dropped the snapshot from the listing. If you are running a version
+older than 0.17.0 alongside newer ones, do **not** run `vykar check --repair`
+on the older host: it misclassifies the unreadable snapshot as corrupt and
+deletes it. Current versions refuse to repair while any such snapshot is
+present.
+
 ## Related pages
 
 - [Quick Start](quickstart.md)

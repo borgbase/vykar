@@ -172,6 +172,8 @@ impl Repository {
             storage,
             crypto,
             manifest,
+            // Freshly initialized repo — `snapshots/` is empty.
+            skipped_snapshots: Vec::new(),
             chunk_index,
             config: repo_config,
             file_cache: FileCache::new(),
@@ -278,14 +280,15 @@ impl Repository {
         // Refresh snapshot list from snapshots/ (replaces manifest load).
         // Resilient open: skip unreadable snapshots so a single corrupt blob
         // doesn't prevent opening the repo.
-        let snapshot_entries = snapshot_cache::refresh_snapshot_cache(
+        let refresh = snapshot_cache::refresh_snapshot_cache(
             storage.as_ref(),
             crypto.as_ref(),
             &repo_config.id,
             cache_dir.as_deref(),
             false, // strict_io: false — resilient open
         )?;
-        let manifest = Manifest::from_snapshot_entries(snapshot_entries);
+        let skipped_snapshots = refresh.skipped;
+        let manifest = Manifest::from_snapshot_entries(refresh.entries);
 
         // Load file cache from local disk (not from the repo).
         let file_cache = if skip_file_cache {
@@ -298,6 +301,7 @@ impl Repository {
             storage,
             crypto,
             manifest,
+            skipped_snapshots,
             chunk_index: ChunkIndex::new(),
             config: repo_config,
             file_cache,

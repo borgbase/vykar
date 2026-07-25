@@ -86,6 +86,22 @@ pub enum IntegrityIssue {
         snapshot_name: Option<String>,
         version: u32,
     },
+    /// Snapshot metadata is a positional array of a different length than this
+    /// build's `SnapshotMeta`.
+    ///
+    /// Distinct from corruption for the same reason as
+    /// [`IntegrityIssue::UnsupportedSnapshotVersion`], and detected the same
+    /// way round: the AEAD decrypt *succeeded*, proving the blob is intact and
+    /// the key is right, so the only explanation is a newer writer. It must
+    /// never be repaired or removed — doing so destroys another host's
+    /// snapshot. `UnsupportedSnapshotVersion` cannot cover this case because
+    /// reading `format_version` requires a successful decode, which is exactly
+    /// what a length mismatch prevents.
+    IncompatibleSnapshotEnvelope {
+        snapshot_id: SnapshotId,
+        snapshot_name: Option<String>,
+        detail: String,
+    },
     /// Snapshot item failed per-item invariant validation.
     InvalidItem {
         snapshot_id: SnapshotId,
@@ -183,6 +199,20 @@ impl IntegrityIssue {
                         "written by a newer vykar (format version {version}); \
                          upgrade vykar to read it — left untouched"
                     ),
+                }
+            }
+            IntegrityIssue::IncompatibleSnapshotEnvelope {
+                snapshot_id,
+                snapshot_name,
+                detail,
+            } => {
+                let ctx = match snapshot_name {
+                    Some(name) => format!("snapshot '{name}'"),
+                    None => format!("snapshot {snapshot_id}"),
+                };
+                CheckError {
+                    context: ctx,
+                    message: format!("{detail} — left untouched"),
                 }
             }
             IntegrityIssue::InvalidItem {

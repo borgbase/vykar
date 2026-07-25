@@ -1027,6 +1027,137 @@ fn check_flags_unsupported_version_and_repair_refuses() {
     assert!(apply_err.contains("aborting repair"), "got: {apply_err}");
 }
 
+/// Rewrite a snapshot's on-disk blob so its positional envelope carries one
+/// *extra* field — what a future vykar that appended to `SnapshotMeta` writes.
+///
+/// Longer, not shorter: a shorter array still decodes via `#[serde(default)]`,
+/// which is what makes the format backward-readable.
+fn extend_snapshot_envelope_on_disk(repo_dir: &std::path::Path, snapshot_name: &str) {
+    use crate::repo::format::{pack_object_with_context, ObjectType};
+    use crate::snapshot::SNAPSHOT_META_FIELD_COUNT;
+
+    let repo = open_local_repo(repo_dir);
+    let entry = repo
+        .manifest()
+        .find_snapshot(snapshot_name)
+        .unwrap()
+        .clone();
+    let meta = crate::commands::list::load_snapshot_meta(&repo, snapshot_name).unwrap();
+    let mut bytes = rmp_serde::to_vec(&meta).unwrap();
+    assert_eq!(
+        bytes.first().copied(),
+        Some(0x90 | u8::try_from(SNAPSHOT_META_FIELD_COUNT).unwrap()),
+        "fixture assumes a {SNAPSHOT_META_FIELD_COUNT}-element fixarray"
+    );
+    bytes[0] = 0x90 | u8::try_from(SNAPSHOT_META_FIELD_COUNT + 1).unwrap();
+    bytes.push(0xC0); // nil — the hypothetical new field
+
+    let packed = pack_object_with_context(
+        ObjectType::SnapshotMeta,
+        entry.id.as_bytes(),
+        &bytes,
+        repo.crypto.as_ref(),
+    )
+    .unwrap();
+    repo.storage.put(&entry.id.storage_key(), &packed).unwrap();
+}
+
+/// Set up a repo holding exactly one snapshot, whose envelope is one field
+/// longer than this build's — the shape a newer vykar writes.
+///
+/// Uses an isolated local cache so the state matches the real multi-host case:
+/// this host has never successfully read the blob, so the snapshot is absent
+/// from the manifest and the scan reaches its Phase 0 orphan path — the one
+/// that used to classify it `CorruptSnapshot` and delete it.
+fn repo_with_future_envelope_snapshot(
+    tmp: &std::path::Path,
+) -> (crate::config::VykarConfig, std::path::PathBuf) {
+    let repo_dir = tmp.join("repo");
+    let source_dir = tmp.join("source");
+    let cache_dir = tmp.join("cache");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    std::fs::create_dir_all(&source_dir).unwrap();
+    std::fs::write(source_dir.join("file.txt"), b"future-envelope").unwrap();
+
+    let mut config = init_repo(&repo_dir);
+    config.cache_dir = Some(cache_dir.to_string_lossy().to_string());
+    backup_single_source(&config, &source_dir, "src-a", "snap-future");
+    extend_snapshot_envelope_on_disk(&repo_dir, "snap-future");
+    let _ = std::fs::remove_dir_all(&cache_dir);
+    (config, repo_dir)
+}
+
+/// A snapshot whose envelope is *longer* than this build's must be classified
+/// as version skew, never corruption, so repair refuses instead of "repairing"
+/// it by deleting another host's snapshot.
+///
+/// This is the case `UnsupportedSnapshotVersion` structurally cannot cover:
+/// reading `format_version` requires a successful decode, which is exactly what
+/// a length mismatch prevents. Without the dedicated classification the blob
+/// lands in `CorruptSnapshot` and `RemoveCorruptSnapshot` deletes it.
+#[test]
+fn check_repair_refuses_on_incompatible_envelope() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (config, _repo_dir) = repo_with_future_envelope_snapshot(tmp.path());
+
+    for mode in [RepairMode::PlanOnly, RepairMode::Apply] {
+        let err = commands::check::run_with_repair(&config, None, false, mode, None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("aborting repair") && err.contains("newer vykar"),
+            "{mode:?}: repair must refuse and name the cause, got: {err}"
+        );
+    }
+}
+
+/// `check --repair --apply` against an incompatible envelope must leave every
+/// repo object byte-for-byte untouched. This is the data-loss guard: without
+/// the classification the snapshot blob is deleted from storage.
+#[test]
+fn check_repair_apply_writes_nothing_for_incompatible_envelope() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (config, repo_dir) = repo_with_future_envelope_snapshot(tmp.path());
+
+    let before = collect_repo_files(&repo_dir);
+    assert!(
+        before.iter().any(|p| p.starts_with("snapshots/")),
+        "fixture must leave a snapshot blob on disk"
+    );
+
+    let apply_err = commands::check::run_with_repair(&config, None, false, RepairMode::Apply, None)
+        .unwrap_err()
+        .to_string();
+    assert!(apply_err.contains("aborting repair"), "got: {apply_err}");
+
+    let after = collect_repo_files(&repo_dir);
+    assert_eq!(
+        before, after,
+        "repair must not delete a snapshot written by a newer vykar"
+    );
+}
+
+/// The listing path reports the snapshot as hidden rather than returning a
+/// silently truncated list — the user-visible half of issue #175.
+#[test]
+fn listing_reports_incompatible_envelope_as_hidden() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (config, _repo_dir) = repo_with_future_envelope_snapshot(tmp.path());
+
+    let listing = commands::list::list_snapshots_with_stats(&config, None).unwrap();
+    assert!(
+        listing.snapshots.is_empty(),
+        "the unreadable snapshot must not be listed"
+    );
+    assert_eq!(
+        listing.hidden.len(),
+        1,
+        "…but it must be reported as hidden, not silently dropped"
+    );
+    let summary = crate::repo::snapshot_cache::describe_skipped(&listing.hidden).unwrap();
+    assert!(summary.contains("upgrade vykar"), "got: {summary}");
+}
+
 /// Collect every file under `root` as repo-relative paths, excluding the
 /// transient `locks/` directory (the maintenance lock writes/removes its own
 /// lock file during a repair attempt). Sorted for stable comparison.

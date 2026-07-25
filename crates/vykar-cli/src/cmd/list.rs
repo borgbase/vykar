@@ -15,11 +15,22 @@ pub(crate) fn run_list(
     source_filter: &[String],
     last: Option<usize>,
 ) -> CliResult<()> {
-    let mut snapshots = with_repo_passphrase(config, label, |passphrase| {
+    let listing = with_repo_passphrase(config, label, |passphrase| {
         Ok(commands::list::list_snapshots_with_stats(
             config, passphrase,
         )?)
     })?;
+    let mut snapshots = listing.snapshots;
+
+    // Never present a truncated list as if it were complete. Reported before
+    // the empty-list early return below: when the only snapshot in the repo is
+    // one we cannot read, "No snapshots found." is actively misleading. The
+    // filters below must not suppress it either — a hidden snapshot's label is
+    // unknown, so it can never be filtered out safely.
+    let hidden = vykar_core::repo::snapshot_cache::describe_skipped(&listing.hidden);
+    if let Some(ref msg) = hidden {
+        eprintln!("warning: {msg}");
+    }
 
     // Filter by source label if requested
     if !source_filter.is_empty() {
@@ -117,6 +128,12 @@ pub(crate) fn run_list(
         ]);
     }
     println!("{table}");
+
+    // Repeat under the table: on a long listing the pre-table warning has
+    // usually scrolled out of view by the time the user reads the last row.
+    if let Some(ref msg) = hidden {
+        eprintln!("warning: {msg}");
+    }
 
     Ok(())
 }

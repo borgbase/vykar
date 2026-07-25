@@ -292,7 +292,13 @@ pub(crate) fn refresh_repos(status: &SharedStatus, repos: &[ResolvedRepo]) {
         }
 
         match operations::list_snapshots_with_stats(&repo.config, pass_ref) {
-            Ok(mut snapshots) => {
+            Ok(listing) => {
+                if let Some(msg) =
+                    vykar_core::repo::snapshot_cache::describe_skipped(&listing.hidden)
+                {
+                    tracing::warn!(repo = %name, "status refresh: {msg}");
+                }
+                let mut snapshots = listing.snapshots;
                 snapshots.sort_by_key(|(s, _)| s.time);
                 for (s, stats) in snapshots {
                     let ts: DateTime<Local> = s.time.with_timezone(&Local);

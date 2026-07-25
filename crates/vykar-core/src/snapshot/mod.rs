@@ -13,6 +13,16 @@ use vykar_types::error::{Result, VykarError};
 /// Evolution section of `architecture.md`.
 pub const CURRENT_FORMAT_VERSION: u32 = 1;
 
+/// Number of fields in the frozen [`SnapshotMeta`] envelope, pinned by
+/// `snapshot_meta_layout_is_pinned`.
+///
+/// Read paths use this to explain a positional-array length mismatch in terms
+/// the user can act on instead of surfacing a raw serde error. A *shorter*
+/// array still decodes (every field from `comment` on carries
+/// `#[serde(default)]`), so a length mismatch always means a *longer* array —
+/// i.e. a snapshot written by a newer vykar.
+pub const SNAPSHOT_META_FIELD_COUNT: u32 = 14;
+
 /// Metadata for a single snapshot, stored at `snapshots/<id>`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotMeta {
@@ -161,8 +171,6 @@ mod tests {
     fn snapshot_meta_layout_is_pinned() {
         use serde_bytes::ByteBuf;
 
-        const SNAPSHOT_META_FIELD_COUNT: u8 = 14;
-
         // Distinctive values for every field so a swap of two same-typed fields
         // would still change the byte stream / tuple values.
         let t0 = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
@@ -198,7 +206,7 @@ mod tests {
         // Field-count canary (cheap, precise message).
         assert_eq!(
             bytes.first().copied(),
-            Some(0x90 | SNAPSHOT_META_FIELD_COUNT),
+            Some(0x90 | u8::try_from(SNAPSHOT_META_FIELD_COUNT).unwrap()),
             "SnapshotMeta field count changed — the frozen envelope must stay \
              {SNAPSHOT_META_FIELD_COUNT} fields with format_version last and ext before it"
         );

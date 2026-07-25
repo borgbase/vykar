@@ -138,6 +138,33 @@ fn resolve_passphrase_passcommand_handles_shell_quoting() {
     assert_eq!(pass.as_deref().map(String::as_str), Some("hello world"));
 }
 
+#[cfg(not(windows))]
+#[test]
+fn resolve_passphrase_passcommand_gets_null_stdin() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = tmp.path().join("repo");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    let mut config = make_test_config(&repo_dir);
+    config.encryption.mode = EncryptionModeConfig::Aes256Gcm;
+    config.encryption.passphrase = None;
+    // A passcommand that drains stdin must see EOF immediately rather than
+    // block on an inherited descriptor until the 60s timeout (issue #166).
+    config.encryption.passcommand = Some("cat >/dev/null; printf '%s' 'drained'".into());
+    set_vykar_passphrase(None);
+
+    let start = std::time::Instant::now();
+    let pass = resolve_passphrase(&config, None, |_prompt| {
+        Ok(Some(Zeroizing::new("prompt-pass".into())))
+    })
+    .unwrap();
+    assert_eq!(pass.as_deref().map(String::as_str), Some("drained"));
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(10),
+        "passcommand should not have waited on stdin"
+    );
+}
+
 #[test]
 fn resolve_passphrase_passes_prompt_context() {
     let _lock = ENV_LOCK.lock().unwrap();

@@ -1,25 +1,104 @@
 // pre_exec setpgid for shell child process group; SAFETY documented per block.
 #![allow(unsafe_code)]
 
+use std::collections::HashSet;
+use std::ffi::{OsStr, OsString};
+use std::path::PathBuf;
 use std::process::{Command, ExitStatus, Output};
 use std::time::Duration;
+
+/// Directories holding user-installed tools that a desktop-launched process
+/// typically cannot see. A GUI started from Finder/launchd (or a `.desktop`
+/// entry) inherits a minimal `PATH` — on macOS just `/usr/bin:/bin:/usr/sbin:/sbin`
+/// — so an unqualified `passcommand`, hook, or `command_dumps` binary that
+/// resolves fine in the user's terminal fails there. See issue #166.
+#[cfg(target_os = "macos")]
+const EXTRA_PATH_DIRS: &[&str] = &[
+    "/opt/homebrew/bin",
+    "/opt/homebrew/sbin",
+    "/usr/local/bin",
+    "/usr/local/sbin",
+    "/opt/local/bin",
+    "/opt/local/sbin",
+];
+
+#[cfg(all(unix, not(target_os = "macos")))]
+const EXTRA_PATH_DIRS: &[&str] = &["/usr/local/bin", "/usr/local/sbin"];
+
+/// Windows resolves interpreters and tooling through the registry-backed
+/// machine/user `Path`, which a GUI process inherits intact — nothing to add.
+#[cfg(windows)]
+const EXTRA_PATH_DIRS: &[&str] = &[];
+
+/// Prepend `candidates` to `current`, skipping any that are already present.
+///
+/// Returns `None` when nothing would change, so the caller can leave `PATH`
+/// completely untouched. Entries already in `current` keep their relative
+/// order — a terminal-launched process that already exports these directories
+/// sees a byte-identical `PATH`.
+fn build_augmented_path(current: &OsStr, candidates: &[PathBuf]) -> Option<OsString> {
+    // An empty `PATH` splits into a single empty component, which means "the
+    // current directory" to the shell — never synthesize one.
+    let existing: Vec<PathBuf> = if current.is_empty() {
+        Vec::new()
+    } else {
+        std::env::split_paths(current).collect()
+    };
+    let seen: HashSet<&PathBuf> = existing.iter().collect();
+
+    let missing: Vec<&PathBuf> = candidates.iter().filter(|c| !seen.contains(c)).collect();
+    if missing.is_empty() {
+        return None;
+    }
+
+    let joined = missing.into_iter().chain(existing.iter());
+    std::env::join_paths(joined).ok()
+}
+
+/// The [`EXTRA_PATH_DIRS`] that actually exist, plus `$HOME/.local/bin`.
+fn extra_path_dirs() -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = EXTRA_PATH_DIRS.iter().map(PathBuf::from).collect();
+
+    #[cfg(unix)]
+    if let Some(home) = std::env::var_os("HOME") {
+        if !home.is_empty() {
+            dirs.push(PathBuf::from(home).join(".local").join("bin"));
+        }
+    }
+
+    dirs.retain(|d| d.is_dir());
+    dirs
+}
+
+/// `PATH` with the missing user-tool directories prepended, or `None` when the
+/// inherited `PATH` already covers them. Computed once — the `is_dir` probes
+/// run at most once per process.
+fn augmented_path() -> Option<&'static OsStr> {
+    static CACHED: std::sync::OnceLock<Option<OsString>> = std::sync::OnceLock::new();
+    CACHED
+        .get_or_init(|| {
+            let current = std::env::var_os("PATH").unwrap_or_default();
+            build_augmented_path(&current, &extra_path_dirs())
+        })
+        .as_deref()
+}
 
 /// Build a shell command for the current platform.
 /// On Unix, the child is placed in its own process group so that
 /// timeout termination can kill the entire tree.
 pub fn command_for_script(script: &str) -> Command {
     #[cfg(windows)]
-    {
+    let mut cmd = {
         let mut cmd = Command::new("powershell");
         cmd.arg("-NoProfile")
             .arg("-NonInteractive")
             .arg("-Command")
             .arg(script);
         cmd
-    }
+    };
 
     #[cfg(not(windows))]
-    {
+    let mut cmd = {
         let mut cmd = Command::new("sh");
         cmd.arg("-c").arg(script);
         // Place child in its own process group so we can kill the entire tree on timeout.
@@ -34,7 +113,12 @@ pub fn command_for_script(script: &str) -> Command {
             });
         }
         cmd
+    };
+
+    if let Some(path) = augmented_path() {
+        cmd.env("PATH", path);
     }
+    cmd
 }
 
 pub fn run_script(script: &str) -> std::io::Result<Output> {
@@ -203,6 +287,70 @@ use std::os::unix::process::CommandExt;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Split an augmented `PATH` back into components for assertions.
+    fn split(path: &OsStr) -> Vec<PathBuf> {
+        std::env::split_paths(path).collect()
+    }
+
+    fn dirs(paths: &[&str]) -> Vec<PathBuf> {
+        paths.iter().map(PathBuf::from).collect()
+    }
+
+    #[test]
+    fn augmented_path_prepends_missing_dirs_in_order() {
+        let current = std::env::join_paths(dirs(&["/usr/bin", "/bin"])).unwrap();
+        let candidates = dirs(&["/opt/homebrew/bin", "/usr/local/bin"]);
+        let result = build_augmented_path(&current, &candidates).expect("PATH should change");
+        assert_eq!(
+            split(&result),
+            dirs(&["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"]),
+        );
+    }
+
+    #[test]
+    fn augmented_path_skips_dirs_already_present() {
+        // /usr/local/bin is already on PATH: it must not be duplicated, and the
+        // existing entries must keep their relative order.
+        let current = std::env::join_paths(dirs(&["/usr/bin", "/usr/local/bin", "/bin"])).unwrap();
+        let candidates = dirs(&["/opt/homebrew/bin", "/usr/local/bin"]);
+        let result = build_augmented_path(&current, &candidates).expect("PATH should change");
+        assert_eq!(
+            split(&result),
+            dirs(&["/opt/homebrew/bin", "/usr/bin", "/usr/local/bin", "/bin"]),
+        );
+    }
+
+    #[test]
+    fn augmented_path_is_none_when_nothing_to_add() {
+        let current = std::env::join_paths(dirs(&["/opt/homebrew/bin", "/usr/bin"])).unwrap();
+        // Every candidate is already present — a terminal-launched process must
+        // see a byte-identical PATH, so the caller is told to leave it alone.
+        assert!(build_augmented_path(&current, &dirs(&["/opt/homebrew/bin"])).is_none());
+        // Likewise when there are no candidates at all (Windows).
+        assert!(build_augmented_path(&current, &[]).is_none());
+    }
+
+    #[test]
+    fn augmented_path_handles_empty_current_path() {
+        let result =
+            build_augmented_path(OsStr::new(""), &dirs(&["/opt/homebrew/bin"])).expect("some");
+        assert_eq!(
+            split(&result).first(),
+            Some(&PathBuf::from("/opt/homebrew/bin"))
+        );
+    }
+
+    #[test]
+    fn extra_path_dirs_all_exist() {
+        for dir in extra_path_dirs() {
+            assert!(
+                dir.is_dir(),
+                "{} should have been filtered out",
+                dir.display()
+            );
+        }
+    }
 
     #[test]
     fn test_large_stdout_no_deadlock() {

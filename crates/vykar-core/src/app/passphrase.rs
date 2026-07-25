@@ -37,6 +37,11 @@ pub fn configured_passphrase(config: &VykarConfig) -> Result<Option<Zeroizing<St
     if let Some(ref cmd) = config.encryption.passcommand {
         let mut command = shell::command_for_script(cmd);
         command.env_remove("VYKAR_PASSPHRASE");
+        // A passcommand has no meaningful stdin — its *output* is the
+        // passphrase. Inheriting the parent's fd 0 hands a GUI-launched child
+        // whatever launchd left there; redirecting from /dev/null gives any
+        // script that reads stdin a clean EOF instead of a blocking read.
+        command.stdin(std::process::Stdio::null());
         let output = shell::run_command_with_timeout(&mut command, PASSCOMMAND_TIMEOUT)
             .map_err(VykarError::Io)?;
 

@@ -306,3 +306,56 @@ fn sequential_soft_open_error_skips_bad_commits_good() {
         "the readable file should have committed"
     );
 }
+
+/// Regression guard for the dataless-directory classification (#183/#184): an
+/// ordinary unlistable directory (chmod 000) must stay in the generic soft-error
+/// bucket — counted in `stats.errors`, `is_partial == true`, and **not** tallied
+/// as cloud-only content. Without the `is_dataless` half of
+/// `classify_dir_skip`, a macOS `EDEADLK` check could swallow this.
+#[cfg(unix)]
+#[test]
+fn unreadable_directory_is_a_soft_error_not_a_dataless_skip() {
+    use std::os::unix::fs::PermissionsExt;
+    init();
+    let _guard = crate::testutil::CWD_LOCK.lock().unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let src_dir = dir.path().join("src");
+    fs::create_dir_all(&src_dir).unwrap();
+
+    let mut config = crate::tests::helpers::make_test_config(&repo_dir);
+    config.limits.threads = 1;
+    crate::commands::init::run(&config, None).unwrap();
+
+    write_file(&src_dir.join("good.bin"), &vec![0x11u8; 4 * 1024]);
+    let locked = src_dir.join("locked");
+    fs::create_dir(&locked).unwrap();
+    write_file(&locked.join("hidden.bin"), &vec![0x22u8; 4 * 1024]);
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+
+    let outcome = backup_to(&config, &src_dir, "snap");
+
+    // Restore before tempdir drop, otherwise cleanup fails.
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+
+    // SAFETY: geteuid takes no arguments and is always sound; the result is
+    // a plain u32. Root ignores the chmod, so the assertions below don't hold.
+    let is_root = unsafe { libc::geteuid() == 0 };
+    if !is_root {
+        assert!(
+            outcome.stats.errors >= 1,
+            "unlistable directory must count as a soft error"
+        );
+        assert!(outcome.is_partial, "soft errors must mark the run partial");
+    }
+    assert_eq!(
+        outcome.dataless_dirs_skipped, 0,
+        "an EACCES directory is not cloud-only content"
+    );
+    assert_eq!(outcome.dataless_files_skipped, 0);
+    assert!(
+        outcome.stats.nfiles >= 1,
+        "the readable file should have committed"
+    );
+}

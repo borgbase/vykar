@@ -173,12 +173,35 @@ pub(crate) fn append_item_to_stream(
     Ok(())
 }
 
+/// Run-local tally of cloud-only (macOS `FileProvider`) content that could not
+/// be captured, accumulated across all sources of one backup run.
+///
+/// Deliberately **not** part of `SnapshotStats` — see the note on that type for
+/// why these counters cannot live in the snapshot wire format.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct DatalessTally {
+    /// Dataless placeholder files skipped with no prior backup to carry forward.
+    pub files: u64,
+    /// Dataless directories whose listing failed — each one omits a subtree.
+    pub dirs: u64,
+}
+
 /// Result of a backup run, containing stats and partial-success flag.
 #[derive(Debug, Clone)]
 pub struct BackupOutcome {
     pub stats: SnapshotStats,
     /// `true` when one or more files were skipped due to soft errors.
     pub is_partial: bool,
+    /// Cloud-only files omitted from the snapshot because neither the local
+    /// file cache nor the parent snapshot could supply their content. Run-local
+    /// (never persisted) and deliberately **not** folded into `is_partial`:
+    /// a machine with iCloud Drive would then report every nightly run as
+    /// failed forever.
+    pub dataless_files_skipped: u64,
+    /// Cloud-only directories whose listing could not be materialized. Each one
+    /// means an entire subtree is missing from the snapshot. Same reporting
+    /// rules as `dataless_files_skipped`.
+    pub dataless_dirs_skipped: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -234,22 +257,37 @@ pub(crate) fn emit_progress(
     }
 }
 
-/// Emit the once-per-source summary warning for macOS dataless files that
-/// could not be reused from a parent snapshot. Per-file `tracing::debug!`
-/// lines fire from the walker; this single high-signal line surfaces the
-/// total count to the CLI/GUI so users notice tens-of-GB of cloud-only
-/// content was skipped without flooding the activity log.
+/// Emit the once-per-source summary warning(s) for macOS cloud-only content
+/// that could not be captured. Per-entry `tracing::debug!` lines fire from the
+/// walker; these single high-signal lines surface the totals to the CLI/GUI so
+/// users notice tens-of-GB of cloud-only content was skipped without flooding
+/// the activity log.
+///
+/// Up to two clauses are emitted. The directory clause is blunt on purpose:
+/// an unlistable directory omits an unbounded subtree, not one file.
 pub(crate) fn emit_dataless_summary(
     progress: &mut Option<&mut dyn FnMut(BackupProgressEvent)>,
-    skipped: u64,
+    files: u64,
+    dirs: u64,
 ) {
-    let count = format_count(skipped);
-    let msg = format!(
-        "dataless: skipped {count} cloud-only files with no prior backup \
-         (run while files are downloaded to back them up)"
-    );
-    warn!("{msg}");
-    emit_progress(progress, BackupProgressEvent::Warning { message: msg });
+    if files > 0 {
+        let count = format_count(files);
+        let msg = format!(
+            "dataless: skipped {count} cloud-only files with no prior backup \
+             (run while files are downloaded to back them up)"
+        );
+        warn!("{msg}");
+        emit_progress(progress, BackupProgressEvent::Warning { message: msg });
+    }
+    if dirs > 0 {
+        let count = format_count(dirs);
+        let msg = format!(
+            "dataless: {count} cloud-only directories could not be listed — \
+             their contents are absent from this snapshot"
+        );
+        warn!("{msg}");
+        emit_progress(progress, BackupProgressEvent::Warning { message: msg });
+    }
 }
 
 /// Emit a post-commit warning: `tracing::warn!` + `BackupProgressEvent::Warning`
@@ -484,6 +522,12 @@ pub fn run_with_progress(
             }
         };
 
+    // Run-local tally of unreachable cloud-only content. Declared here because
+    // the Phase 1 closure below borrows it while `BackupOutcome` is built after
+    // that closure returns. Never persisted into the snapshot (see
+    // `SnapshotStats`).
+    let mut dataless = DatalessTally::default();
+
     // Wrap Phase 1 in a closure that deregisters the session on error.
     let phase1_result = (|| -> Result<(SnapshotEntry, Vec<u8>, FileCache, SnapshotStats)> {
         // Check snapshot name is unique (best-effort, re-checked at commit).
@@ -675,6 +719,7 @@ pub fn run_with_progress(
                 item_ptrs: &mut item_ptrs,
                 stats: &mut stats,
                 new_file_cache: &mut new_file_cache,
+                dataless: &mut dataless,
             };
             let pipeline_result = pipeline::run_parallel_pipeline(
                 &mut repo,
@@ -713,6 +758,7 @@ pub fn run_with_progress(
                     shutdown,
                     verbose,
                     parent_reuse_index.as_ref(),
+                    &mut dataless,
                 )?;
             }
         }
@@ -876,8 +922,15 @@ pub fn run_with_progress(
         );
     }
 
+    // `is_partial` intentionally ignores the dataless tally: skipped cloud-only
+    // content is reported, not treated as a failure (see `BackupOutcome`).
     let is_partial = stats.errors > 0;
-    Ok(BackupOutcome { stats, is_partial })
+    Ok(BackupOutcome {
+        stats,
+        is_partial,
+        dataless_files_skipped: dataless.files,
+        dataless_dirs_skipped: dataless.dirs,
+    })
 }
 
 /// Order-independent comparison of source path lists.
@@ -929,6 +982,57 @@ mod tests {
         let a = vec!["/a".to_string(), "/b".to_string()];
         let b = vec!["/a".to_string(), "/b".to_string()];
         assert!(source_paths_match(&a, &b));
+    }
+
+    /// Collect the `Warning` messages `emit_dataless_summary` produces for a
+    /// given `(files, dirs)` pair.
+    fn dataless_warnings(files: u64, dirs: u64) -> Vec<String> {
+        let mut msgs: Vec<String> = Vec::new();
+        let mut cb = |evt: BackupProgressEvent| {
+            if let BackupProgressEvent::Warning { message } = evt {
+                msgs.push(message);
+            }
+        };
+        let mut progress: Option<&mut dyn FnMut(BackupProgressEvent)> = Some(&mut cb);
+        emit_dataless_summary(&mut progress, files, dirs);
+        msgs
+    }
+
+    #[test]
+    fn dataless_summary_files_only() {
+        let msgs = dataless_warnings(7, 0);
+        assert_eq!(msgs.len(), 1, "{msgs:?}");
+        assert!(msgs[0].contains("skipped 7 cloud-only files"), "{msgs:?}");
+        assert!(!msgs[0].contains("directories"), "{msgs:?}");
+    }
+
+    /// The directory clause must say the *contents* are gone — each unlistable
+    /// directory omits an unbounded subtree, not one file.
+    #[test]
+    fn dataless_summary_dirs_only() {
+        let msgs = dataless_warnings(0, 3);
+        assert_eq!(msgs.len(), 1, "{msgs:?}");
+        assert!(
+            msgs[0].contains("3 cloud-only directories could not be listed"),
+            "{msgs:?}"
+        );
+        assert!(
+            msgs[0].contains("absent from this snapshot"),
+            "should spell out that the subtree is missing: {msgs:?}"
+        );
+    }
+
+    #[test]
+    fn dataless_summary_both_clauses() {
+        let msgs = dataless_warnings(4, 2);
+        assert_eq!(msgs.len(), 2, "{msgs:?}");
+        assert!(msgs[0].contains("4 cloud-only files"), "{msgs:?}");
+        assert!(msgs[1].contains("2 cloud-only directories"), "{msgs:?}");
+    }
+
+    #[test]
+    fn dataless_summary_silent_when_nothing_skipped() {
+        assert!(dataless_warnings(0, 0).is_empty());
     }
 
     fn dataless_metadata(size: u64, mtime_ns: i64) -> fs::MetadataSummary {

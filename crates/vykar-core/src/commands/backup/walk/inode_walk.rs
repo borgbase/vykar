@@ -21,10 +21,12 @@ use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use tracing::debug;
 
 use crate::platform::fs::{self, MetadataSummary};
-use vykar_types::error::{is_soft_backup_io_error, Result, VykarError};
+use vykar_types::error::{is_fileprovider_deadlock, is_soft_backup_io_error, Result, VykarError};
 
 use super::super::source::{ResolvedSource, RootEmission, SourceKind};
-use super::{build_explicit_excludes, should_skip_for_device};
+use super::{
+    build_explicit_excludes, classify_dir_skip, should_skip_for_device, DatalessKind, DirSkipKind,
+};
 
 #[cfg(unix)]
 fn dir_entry_inode(entry: &std::fs::DirEntry) -> u64 {
@@ -166,6 +168,55 @@ pub(in crate::commands::backup) enum WalkEvent {
         path: PathBuf,
         reason: String,
     },
+    /// A cloud-only (macOS `FileProvider`) directory whose listing could not be
+    /// materialized in this process context. Its whole subtree is absent from
+    /// the snapshot, but this is a tallied omission rather than an error — see
+    /// [`classify_dir_skip`].
+    SkippedDataless {
+        path: PathBuf,
+        kind: DatalessKind,
+    },
+}
+
+/// Returns `true` if `dir` is a macOS `FileProvider` placeholder (dataless).
+/// A failed `lstat` answers "not dataless", which routes the caller to the
+/// visible soft-error channel — the conservative direction.
+fn dir_is_dataless(dir: &Path) -> bool {
+    match std::fs::symlink_metadata(dir) {
+        Ok(m) => {
+            let file_type = m.file_type();
+            fs::summarize_metadata(&m, &file_type).is_dataless
+        }
+        Err(_) => false,
+    }
+}
+
+/// Build the skip event for a directory whose listing failed with a soft I/O
+/// error.
+///
+/// The extra `lstat` fires only when the error is a `FileProvider` deadlock, so
+/// it costs nothing on the ordinary `EACCES` path — and even then only on a
+/// path that has already failed.
+fn dir_skip_event(dir: &Path, e: &std::io::Error, reason: String) -> WalkEvent {
+    let provider_deadlock = is_fileprovider_deadlock(e);
+    // Short-circuits: no stat unless the errno already points at FileProvider.
+    let is_dataless = provider_deadlock && dir_is_dataless(dir);
+    match classify_dir_skip(provider_deadlock, is_dataless) {
+        DirSkipKind::Dataless => {
+            debug!(
+                path = %dir.display(),
+                "cloud-only directory could not be listed; subtree omitted"
+            );
+            WalkEvent::SkippedDataless {
+                path: dir.to_path_buf(),
+                kind: DatalessKind::Directory,
+            }
+        }
+        DirSkipKind::SoftIo => WalkEvent::Skipped {
+            path: dir.to_path_buf(),
+            reason,
+        },
+    }
 }
 
 /// Build a single-event `DirLevel` holding the root `WalkedEntry` for an
@@ -399,10 +450,11 @@ impl InodeSortedWalk {
             Err(e) => {
                 if is_soft_backup_io_error(&e) {
                     return Ok(DirLevel {
-                        events: VecDeque::from([WalkEvent::Skipped {
-                            path: dir.to_path_buf(),
-                            reason: format!("read_dir failed: {e}"),
-                        }]),
+                        events: VecDeque::from([dir_skip_event(
+                            dir,
+                            &e,
+                            format!("read_dir failed: {e}"),
+                        )]),
                         pending_subdirs: VecDeque::new(),
                     });
                 }
@@ -417,14 +469,18 @@ impl InodeSortedWalk {
         let mut raw_entries: Vec<RawDirEntry> = Vec::new();
         // Per-entry readdir failures: the std `ReadDir` iterator yielded an
         // error before producing the entry name, so we can't name the offending
-        // child — we report the parent directory in each Skipped event instead.
-        let mut deferred_skips: Vec<(PathBuf, String)> = Vec::new();
+        // child — we report the parent directory in each skip event instead.
+        let mut deferred_skips: Vec<WalkEvent> = Vec::new();
         for entry_result in read_dir {
             let entry = match entry_result {
                 Ok(e) => e,
                 Err(e) => {
                     if is_soft_backup_io_error(&e) {
-                        deferred_skips.push((dir.to_path_buf(), format!("readdir failed: {e}")));
+                        deferred_skips.push(dir_skip_event(
+                            dir,
+                            &e,
+                            format!("readdir failed: {e}"),
+                        ));
                         continue;
                     }
                     return Err(VykarError::Other(format!(
@@ -579,12 +635,12 @@ impl InodeSortedWalk {
             }));
         }
 
-        // Prepend Skipped events for readdir errors from phase 1 so consumers
-        // can increment stats.errors for each lost entry. `push_front` reverses
-        // the deferred order, so iterate the deferred list in reverse to keep
-        // the original order intact.
-        for (path, reason) in deferred_skips.into_iter().rev() {
-            events.push_front(WalkEvent::Skipped { path, reason });
+        // Prepend skip events for readdir errors from phase 1 so consumers can
+        // account for each lost entry. `push_front` reverses the deferred order,
+        // so iterate the deferred list in reverse to keep the original order
+        // intact.
+        for event in deferred_skips.into_iter().rev() {
+            events.push_front(event);
         }
 
         Ok(DirLevel {

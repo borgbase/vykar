@@ -25,6 +25,12 @@ pub struct BackupSourceResult {
     pub snapshot_name: String,
     pub source_paths: Vec<String>,
     pub stats: crate::snapshot::SnapshotStats,
+    /// Cloud-only (macOS `FileProvider`) files omitted from the snapshot. Run-
+    /// local — not part of `stats`, and never counted as an error. See
+    /// `BackupOutcome`.
+    pub dataless_files_skipped: u64,
+    /// Cloud-only directories that could not be listed; each omits a subtree.
+    pub dataless_dirs_skipped: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -238,6 +244,8 @@ fn run_backup_sources(
             snapshot_name,
             source_paths: source.paths.clone(),
             stats: outcome.stats,
+            dataless_files_skipped: outcome.dataless_files_skipped,
+            dataless_dirs_skipped: outcome.dataless_dirs_skipped,
         });
     }
 

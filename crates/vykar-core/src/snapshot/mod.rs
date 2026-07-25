@@ -77,6 +77,15 @@ impl SnapshotMeta {
     }
 }
 
+/// Per-snapshot counters, persisted at envelope position 8 of [`SnapshotMeta`].
+///
+/// **Frozen at 5 positional msgpack elements.** This type is nested *before*
+/// the `format_version` discriminator, so growing it shifts every later field:
+/// an older vykar would then read a new snapshot as a decode failure —
+/// corruption — instead of a clean newer-version refusal. Run-local counters
+/// (e.g. the macOS dataless file/directory tallies) therefore live on
+/// `BackupOutcome`, not here. Anything that genuinely must be persisted goes in
+/// `SnapshotMeta::ext`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SnapshotStats {
     pub nfiles: u64,

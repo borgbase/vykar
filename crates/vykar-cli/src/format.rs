@@ -27,6 +27,24 @@ pub(crate) fn print_backup_stats(stats: &vykar_core::snapshot::SnapshotStats) {
     }
 }
 
+/// Report cloud-only (macOS `FileProvider`) content that could not be captured.
+///
+/// Printed after the stats line and deliberately kept out of the exit code:
+/// on a machine with iCloud Drive this would otherwise make every run report
+/// partial success forever. The directory line is blunt because each unlistable
+/// directory omits an entire subtree, not a single file.
+pub(crate) fn print_dataless_summary(files: u64, dirs: u64) {
+    if files > 0 {
+        println!("  Cloud-only files skipped (no prior backup): {files}");
+    }
+    if dirs > 0 {
+        println!(
+            "  Cloud-only directories that could not be listed: {dirs} \
+             (their contents are absent from this snapshot)"
+        );
+    }
+}
+
 pub(crate) fn format_size_with_savings(bytes: u64, reference: u64, label: &str) -> String {
     if reference == 0 {
         return format_bytes(bytes);

@@ -48,6 +48,41 @@ pub(crate) fn should_skip_for_device(
     one_file_system && source_dev != entry_dev
 }
 
+/// Which flavour of cloud-only (macOS `FileProvider`) content was skipped.
+/// Files and directories are tallied separately: a skipped file loses one
+/// file's content, a skipped directory loses an unbounded subtree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::commands::backup) enum DatalessKind {
+    File,
+    Directory,
+}
+
+/// How a directory whose listing failed should be reported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DirSkipKind {
+    /// Generic soft I/O error — counted into `stats.errors`, marks the backup
+    /// partial, warned per entry.
+    SoftIo,
+    /// Cloud-only directory that could not be listed — tallied separately and
+    /// summarized at end of source, without touching `stats.errors`.
+    Dataless,
+}
+
+/// Decide how to classify a directory whose listing failed with a soft I/O
+/// error.
+///
+/// Returns `Dataless` only when the error is a `FileProvider` deadlock **and**
+/// the directory really is dataless, so a genuine `flock`/`fcntl` deadlock on
+/// macOS still reports as a visible, counted soft error instead of being
+/// laundered into the quiet dataless bucket.
+pub(crate) fn classify_dir_skip(is_provider_deadlock: bool, dir_is_dataless: bool) -> DirSkipKind {
+    if is_provider_deadlock && dir_is_dataless {
+        DirSkipKind::Dataless
+    } else {
+        DirSkipKind::SoftIo
+    }
+}
+
 #[cfg(unix)]
 pub(super) fn read_item_xattrs(path: &Path) -> Option<HashMap<String, Vec<u8>>> {
     let names = match xattr::list(path) {
@@ -319,13 +354,20 @@ pub(super) enum WalkEntry {
         path: String,
         reason: String,
     },
-    /// macOS dataless (FileProvider placeholder) file with no matching entry
-    /// in the local file cache or the parent reuse index. Skipped without
-    /// opening so we never trigger asynchronous hydration. Counted into a
-    /// per-source running total used to emit a single end-of-source summary
-    /// warning.
+    /// Cloud-only (macOS `FileProvider`) content that could not be captured:
+    ///
+    /// - `DatalessKind::File` — a dataless placeholder file with no matching
+    ///   entry in the local file cache or the parent reuse index. Skipped
+    ///   without opening so we never trigger asynchronous hydration.
+    /// - `DatalessKind::Directory` — a dataless directory whose `read_dir`
+    ///   failed with a `FileProvider` deadlock, so its entire subtree is absent
+    ///   from the snapshot.
+    ///
+    /// Counted into per-source running totals used to emit a single
+    /// end-of-source summary warning; never counted as an error.
     SkippedDataless {
         path: String,
+        kind: DatalessKind,
     },
     /// An entry whose file type vykar can't represent (socket, FIFO,
     /// block/character device). Skipped without opening, with a per-entry
@@ -541,6 +583,12 @@ fn walk_source_inode_sorted<'a>(
                 path: path.to_string_lossy().into_owned(),
                 reason,
             }))),
+            WalkEvent::SkippedDataless { path, kind } => {
+                WalkItems::One(Some(Ok(WalkEntry::SkippedDataless {
+                    path: path.to_string_lossy().into_owned(),
+                    kind,
+                })))
+            }
             WalkEvent::Entry(walked) => walked_entry_to_walk_items(
                 walked,
                 xattrs_enabled,
@@ -609,7 +657,10 @@ fn walked_entry_to_walk_items(
                     path = %abs_path,
                     "skipping dataless cloud-only file (no cache or parent reuse)"
                 );
-                return WalkItems::One(Some(Ok(WalkEntry::SkippedDataless { path: abs_path })));
+                return WalkItems::One(Some(Ok(WalkEntry::SkippedDataless {
+                    path: abs_path,
+                    kind: DatalessKind::File,
+                })));
             }
             super::CacheResolution::Miss => {}
         }
@@ -685,6 +736,18 @@ mod tests {
         assert!(should_skip_for_device(true, 42, 43));
         assert!(!should_skip_for_device(true, 42, 42));
         assert!(!should_skip_for_device(false, 42, 43));
+    }
+
+    /// All four input combinations. The load-bearing case is
+    /// deadlock-but-not-dataless: a genuine `flock`/`fcntl` deadlock on macOS
+    /// must stay a visible, counted soft error rather than be filed as a quiet
+    /// cloud-only omission.
+    #[test]
+    fn classify_dir_skip_requires_both_signals() {
+        assert_eq!(classify_dir_skip(true, true), DirSkipKind::Dataless);
+        assert_eq!(classify_dir_skip(true, false), DirSkipKind::SoftIo);
+        assert_eq!(classify_dir_skip(false, true), DirSkipKind::SoftIo);
+        assert_eq!(classify_dir_skip(false, false), DirSkipKind::SoftIo);
     }
 
     /// Regression: dataless inodes must NOT trigger `read_item_xattrs`.

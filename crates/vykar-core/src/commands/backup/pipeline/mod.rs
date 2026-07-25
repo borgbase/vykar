@@ -27,7 +27,7 @@ use vykar_types::error::{Result, VykarError};
 
 use super::concurrency::ByteBudget;
 use super::source::ResolvedSource;
-use super::walk::{build_walk_iter, reserve_budget, WalkEntry};
+use super::walk::{build_walk_iter, reserve_budget, DatalessKind, WalkEntry};
 use super::BackupProgressEvent;
 
 mod consumer;
@@ -90,13 +90,15 @@ pub(super) enum ProcessedEntry {
         /// Pre-formatted reason (avoids carrying `VykarError` across threads).
         reason: String,
     },
-    /// A macOS dataless (FileProvider placeholder) file skipped at walk time
-    /// because neither the local file cache nor the parent reuse index had
-    /// a matching entry. No I/O was performed (no hydration, no read).
-    /// Counted into a per-source running total and surfaced as a single
-    /// end-of-source summary warning.
+    /// Cloud-only (macOS `FileProvider`) content skipped at walk time: either a
+    /// dataless placeholder file with no cache / parent-reuse match (no I/O was
+    /// performed — no hydration, no read), or a dataless directory whose
+    /// listing could not be materialized, in which case its whole subtree is
+    /// absent. Counted into per-source running totals and surfaced as a single
+    /// end-of-source summary warning; never counted as an error.
     DatalessSkipped {
         path: String,
+        kind: DatalessKind,
     },
     /// An entry whose file type vykar can't represent (socket, FIFO,
     /// block/character device), skipped at walk time. The consumer emits a
@@ -188,6 +190,9 @@ pub(crate) struct PipelineBuffers<'a> {
     pub item_ptrs: &'a mut Vec<ChunkId>,
     pub stats: &'a mut SnapshotStats,
     pub new_file_cache: &'a mut FileCache,
+    /// Run-level tally of unreachable cloud-only content, accumulated across
+    /// sources. Reported at the end of the run; never affects `is_partial`.
+    pub dataless: &'a mut super::DatalessTally,
 }
 
 /// Run the parallel file processing pipeline using crossbeam-channel.
@@ -230,6 +235,7 @@ pub(crate) fn run_parallel_pipeline(
         item_ptrs,
         stats,
         new_file_cache,
+        dataless,
     } = bufs;
     debug_assert!(segment_size > 0, "segment_size must be non-zero");
     debug_assert!(num_workers > 0, "num_workers must be non-zero");
@@ -342,10 +348,11 @@ pub(crate) fn run_parallel_pipeline(
         let mut large_file_accum: Option<LargeFileAccum> = None;
         // When segment 0 is skipped, we drain remaining segments silently.
         let mut segments_to_skip: usize = 0;
-        // Per-source running total of dataless cloud-only files skipped
-        // (no parent-reuse hit). Reset on SourceStarted; flushed as a single
-        // summary warning on SourceFinished.
-        let mut dataless_skipped: u64 = 0;
+        // Per-source running totals of unreachable cloud-only content: files
+        // with no parent-reuse hit, and directories that could not be listed.
+        // Reset on SourceStarted; flushed as summary warnings on SourceFinished.
+        let mut dataless_files: u64 = 0;
+        let mut dataless_dirs: u64 = 0;
 
         for msg in &result_rx {
             if shutdown.is_some_and(|f| f.load(Ordering::Relaxed)) {
@@ -406,12 +413,22 @@ pub(crate) fn run_parallel_pipeline(
                             format!("skipping entry '{path}': {reason}"),
                         );
                     }
-                    Ok(ProcessedEntry::DatalessSkipped { path }) => {
+                    Ok(ProcessedEntry::DatalessSkipped { path, kind }) => {
                         // Walker already emitted a tracing::debug! with the
                         // path; the consumer just bumps the per-source count
-                        // so the SourceFinished arm can flush the summary.
+                        // so the SourceFinished arm can flush the summary, plus
+                        // the run-level tally for the final report.
                         let _ = path;
-                        dataless_skipped += 1;
+                        match kind {
+                            DatalessKind::File => {
+                                dataless_files += 1;
+                                dataless.files += 1;
+                            }
+                            DatalessKind::Directory => {
+                                dataless_dirs += 1;
+                                dataless.dirs += 1;
+                            }
+                        }
                     }
                     Ok(ProcessedEntry::UnsupportedSkipped { path, file_type }) => {
                         // Warn-only: name the path + type so the omission is
@@ -458,11 +475,19 @@ pub(crate) fn run_parallel_pipeline(
                         // source boundaries before delegating to the consumer.
                         match &entry {
                             ProcessedEntry::SourceStarted { .. } => {
-                                dataless_skipped = 0;
+                                dataless_files = 0;
+                                dataless_dirs = 0;
                             }
-                            ProcessedEntry::SourceFinished { .. } if dataless_skipped > 0 => {
-                                super::emit_dataless_summary(progress, dataless_skipped);
-                                dataless_skipped = 0;
+                            ProcessedEntry::SourceFinished { .. }
+                                if dataless_files > 0 || dataless_dirs > 0 =>
+                            {
+                                super::emit_dataless_summary(
+                                    progress,
+                                    dataless_files,
+                                    dataless_dirs,
+                                );
+                                dataless_files = 0;
+                                dataless_dirs = 0;
                             }
                             _ => {}
                         }

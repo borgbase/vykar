@@ -12,6 +12,30 @@ By default, Vykar preserves filesystem extended attributes (`xattrs`). Configure
 
 If some files are unreadable or disappear during the run (for example, permission denied or a file vanishes), Vykar skips those files, still creates the snapshot from everything else, and returns exit code `3` to indicate partial success.
 
+## Cloud-only content on macOS (iCloud Drive, Dropbox, OneDrive)
+
+macOS FileProvider services keep evicted ("dataless") content in the cloud, and reading it would trigger a download. Vykar never forces that download, so two kinds of content can be missing from a snapshot:
+
+- **Cloud-only files.** Their content is carried forward from the parent snapshot when size, mtime and inode all match. When there is no prior backup to carry forward from, the file is omitted.
+- **Cloud-only directories.** In some contexts — notably a backup run from a background `launchd` job — listing such a directory fails outright. Vykar skips it instead of aborting the run, which means **the entire subtree below it is absent from the snapshot**.
+
+Both are counted and reported at the end of the run, for example:
+
+```text
+  Cloud-only files skipped (no prior backup): 128
+  Cloud-only directories that could not be listed: 2 (their contents are absent from this snapshot)
+```
+
+Neither counter affects the exit code: on a machine with iCloud Drive enabled they would otherwise mark every run as partial, permanently.
+
+To capture this content today, materialize it locally before the backup — in Finder, right-click → "Download Now", or from the shell:
+
+```bash
+brctl download ~/Documents/some/path
+```
+
+Interactive runs also list cloud-only directories fine, so a foreground `vykar backup` may capture what a background `launchd` job cannot. Explicit control is planned as the per-source `dataless: skip|hydrate|hydrate-evict` setting — see the [roadmap](roadmap.md).
+
 ## Sources and labels
 
 In its simplest form, sources are just a list of paths:

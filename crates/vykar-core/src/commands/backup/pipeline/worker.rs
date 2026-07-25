@@ -318,7 +318,9 @@ pub(super) fn process_file_worker(
 
         WalkEntry::Skipped { path, reason } => Ok(ProcessedEntry::WalkSkip { path, reason }),
 
-        WalkEntry::SkippedDataless { path } => Ok(ProcessedEntry::DatalessSkipped { path }),
+        WalkEntry::SkippedDataless { path, kind } => {
+            Ok(ProcessedEntry::DatalessSkipped { path, kind })
+        }
 
         WalkEntry::SkippedUnsupported { path, file_type } => {
             Ok(ProcessedEntry::UnsupportedSkipped { path, file_type })

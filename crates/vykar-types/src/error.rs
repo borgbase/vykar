@@ -227,10 +227,35 @@ fn is_eio(e: &std::io::Error) -> bool {
     }
 }
 
+/// macOS: `EDEADLK` (errno 11) from `read_dir`/`open` on a `FileProvider` inode
+/// that would have to be materialized from a context that cannot drive
+/// `fileproviderd` (e.g. a background launchd backup).
+///
+/// Scoped to macOS because errno 11 means something else everywhere else: on
+/// Linux it is `EAGAIN`/`EWOULDBLOCK` (`EDEADLK` there is 35), and masking a
+/// spurious would-block as a skip would hide real bugs.
+///
+/// Raw-errno match rather than a `libc` constant: `vykar-types` has no `libc`
+/// dependency, matching the style of the internal `is_eio` helper.
+pub fn is_fileprovider_deadlock(e: &std::io::Error) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        e.raw_os_error() == Some(11)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = e;
+        false
+    }
+}
+
 /// Soft I/O errors that should yield a per-entry skip rather than abort the
 /// backup. Used both at raw-`io::Error` call sites (`readlink`, `read_dir`,
 /// `File::open`, `fstat`, `read_to_end`) and as the `VykarError::Io` arm of
 /// [`VykarError::is_soft_file_error`].
+///
+/// macOS-specific case: `EDEADLK` raised by a `FileProvider` inode that cannot
+/// be materialized from this process context — see [`is_fileprovider_deadlock`].
 ///
 /// Windows-specific cases:
 /// - **Synthetic `read_link` error from std** for unsupported reparse tags
@@ -253,6 +278,7 @@ pub fn is_soft_backup_io_error(e: &std::io::Error) -> bool {
         e.kind(),
         std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotFound,
     ) || is_eio(e)
+        || is_fileprovider_deadlock(e)
     {
         return true;
     }
@@ -315,6 +341,28 @@ mod tests {
     fn soft_io_error_eio() {
         let e = std::io::Error::from_raw_os_error(5);
         assert!(is_soft_backup_io_error(&e));
+    }
+
+    /// macOS: `EDEADLK` from a FileProvider inode that cannot be materialized
+    /// in this process context (background launchd backup) must be soft so the
+    /// walk skips the entry instead of aborting the whole backup (issue #183).
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn soft_io_error_fileprovider_deadlock_on_macos() {
+        let e = std::io::Error::from_raw_os_error(11);
+        assert!(is_fileprovider_deadlock(&e));
+        assert!(is_soft_backup_io_error(&e));
+    }
+
+    /// Off macOS, errno 11 is never the FileProvider case — it is
+    /// `EAGAIN`/`EWOULDBLOCK` on Linux and a genuine fcntl/flock deadlock on the
+    /// BSDs — so it must stay hard; masking it would hide real bugs.
+    #[test]
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn deadlock_errno_is_not_soft_off_macos() {
+        let e = std::io::Error::from_raw_os_error(11);
+        assert!(!is_fileprovider_deadlock(&e));
+        assert!(!is_soft_backup_io_error(&e));
     }
 
     #[test]

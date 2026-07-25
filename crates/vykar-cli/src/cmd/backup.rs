@@ -6,7 +6,7 @@ use vykar_core::compress::Compression;
 use vykar_core::config::{self, CompressionAlgorithm, ResolvedRepo, SourceEntry};
 
 use crate::error::{CliError, CliResult};
-use crate::format::print_backup_stats;
+use crate::format::{print_backup_stats, print_dataless_summary};
 use crate::passphrase::with_repo_passphrase;
 use crate::progress::BackupProgressRenderer;
 
@@ -156,6 +156,12 @@ pub(crate) fn run_backup(repo: &ResolvedRepo, opts: BackupRunOpts<'_>) -> CliRes
                 created.source_label
             );
             print_backup_stats(stats);
+            // Reported, but deliberately not folded into `had_partial` — see
+            // `print_dataless_summary`.
+            print_dataless_summary(
+                created.dataless_files_skipped,
+                created.dataless_dirs_skipped,
+            );
         }
 
         Ok(had_partial)

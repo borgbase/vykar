@@ -22,7 +22,7 @@ use super::chunk_process::{classify_chunk, WorkerChunk};
 use super::commit::process_worker_chunks;
 use super::read_source::BackupSource;
 use super::source::ResolvedSource;
-use super::walk::{materialize_item, InodeSortedWalk, Materialized, WalkEvent};
+use super::walk::{materialize_item, DatalessKind, InodeSortedWalk, Materialized, WalkEvent};
 use super::{append_item_to_stream, emit_post_commit_warning, emit_progress, emit_stats_progress};
 use super::{with_rollback_checkpoint, BackupProgressEvent, FileStatus};
 use vykar_crypto::CryptoEngine;
@@ -495,6 +495,7 @@ pub(super) fn process_source_path(
     shutdown: Option<&AtomicBool>,
     verbose: bool,
     parent_reuse_index: Option<&ParentReuseIndex>,
+    dataless: &mut super::DatalessTally,
 ) -> Result<()> {
     emit_progress(
         progress,
@@ -506,7 +507,10 @@ pub(super) fn process_source_path(
     let chunk_id_key = *repo.crypto.chunk_id_key();
     let min_chunk_size = repo.config.chunker_params.min_size as u64;
     let mut cross_batch = CrossFileBatch::new();
-    let mut dataless_skipped: u64 = 0;
+    // Per-source counts, flushed as summary warnings at end of source; the
+    // run-level `dataless` tally is bumped alongside them.
+    let mut dataless_files: u64 = 0;
+    let mut dataless_dirs: u64 = 0;
 
     let inode_walk = InodeSortedWalk::new(
         source,
@@ -527,6 +531,22 @@ pub(super) fn process_source_path(
                     progress,
                     format!("skipping entry '{}': {reason}", path.display()),
                 );
+                continue;
+            }
+            // Cloud-only content the walker could not reach. Tallied and
+            // summarized at end of source; never counted as an error, so it
+            // does not mark the backup partial.
+            Ok(WalkEvent::SkippedDataless { kind, .. }) => {
+                match kind {
+                    DatalessKind::File => {
+                        dataless_files += 1;
+                        dataless.files += 1;
+                    }
+                    DatalessKind::Directory => {
+                        dataless_dirs += 1;
+                        dataless.dirs += 1;
+                    }
+                }
                 continue;
             }
             Err(e) => return Err(e),
@@ -577,7 +597,8 @@ pub(super) fn process_source_path(
                         path = %item.path,
                         "skipping dataless cloud-only file (no cache or parent reuse)"
                     );
-                    dataless_skipped += 1;
+                    dataless_files += 1;
+                    dataless.files += 1;
                     continue;
                 }
 
@@ -805,7 +826,8 @@ pub(super) fn process_source_path(
                 ) {
                     Ok(ProcessOutcome::Committed) => {}
                     Ok(ProcessOutcome::SkippedDataless) => {
-                        dataless_skipped += 1;
+                        dataless_files += 1;
+                        dataless.files += 1;
                         continue;
                     }
                     Err(e) if e.is_soft_file_error() => {
@@ -866,8 +888,8 @@ pub(super) fn process_source_path(
         verbose,
     )?;
 
-    if dataless_skipped > 0 {
-        super::emit_dataless_summary(progress, dataless_skipped);
+    if dataless_files > 0 || dataless_dirs > 0 {
+        super::emit_dataless_summary(progress, dataless_files, dataless_dirs);
     }
 
     emit_progress(

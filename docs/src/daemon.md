@@ -100,21 +100,27 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStartPre=+/bin/mkdir -p %h/.cache/vykar %h/.config/vykar
 ExecStart=/usr/local/bin/vykar --config /etc/vykar/config.yaml daemon
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=60
 
+# Writable state, created by systemd before the service starts:
+# /var/cache/vykar (file cache, repository identity pins) and
+# /var/lib/vykar (scheduler lock).
+CacheDirectory=vykar
+StateDirectory=vykar
+Environment=XDG_CACHE_HOME=/var/cache
+Environment=XDG_CONFIG_HOME=/var/lib
+
 # Security hardening
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=%h/.cache/vykar %h/.config/vykar
-# If backing up to a local path, add it here too, e.g.:
-# ReadWritePaths=%h/.cache/vykar %h/.config/vykar /mnt/backup/vykar
 PrivateTmp=true
 PrivateDevices=true
+# If backing up to a local path, make it writable, e.g.:
+# ReadWritePaths=/mnt/backup/vykar
 
 # Passphrase via environment file (optional)
 # EnvironmentFile=/etc/vykar/env
@@ -123,7 +129,13 @@ PrivateDevices=true
 WantedBy=multi-user.target
 ```
 
+> **Do not use `ReadWritePaths=%h/.cache/vykar`**: systemd builds the unit's mount namespace *before* running any `ExecStartPre=` command, and every path in `ReadWritePaths=` must already exist at that point. On a fresh install `~/.cache/vykar` does not, so the unit fails with `Failed to set up mount namespacing … status=226/NAMESPACE` — and an `ExecStartPre=` that creates the directory runs too late to help. `CacheDirectory=`/`StateDirectory=` avoid this: systemd creates those directories itself and makes them writable automatically.
+
+The two `Environment=` lines are what point vykar at them — it follows the XDG base directory spec on Linux. Without them it would use `~/.cache/vykar`, which `ProtectHome=read-only` makes unwritable; the daemon still runs, but silently loses its file cache and repository identity pinning. With `User=` set, the same unit works unchanged — systemd creates the directories owned by that user.
+
 > **Local repositories**: the `ProtectSystem=strict` directive makes the filesystem read-only by default. If any repository target is a local path, add it to `ReadWritePaths` or the backup will fail with "Read-only file system".
+
+> **Snapshot hooks**: `PrivateDevices=true` hides physical block devices and `ProtectSystem=strict` blocks mounting, so the ZFS/Btrfs/LVM snapshot patterns in [Recipes](recipes.md) need both relaxed to work from inside the unit.
 
 Then enable and start:
 

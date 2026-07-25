@@ -88,3 +88,6 @@ test-case = { workspace = true }
 libc = "0.2"
 nix = { version = "0.31.3", features = ["fs", "hostname", "signal", "process"] }
 xattr = "1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console"] }

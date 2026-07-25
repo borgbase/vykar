@@ -350,6 +350,8 @@ encryption:
 - Unix: `sh -c`
 - Windows: `powershell -NoProfile -NonInteractive -Command`
 
+This applies to `hooks` and `command_dumps` as well. On Windows, when vykar itself has no console — the GUI, a scheduled task, a service — the script runs with no console window of its own, so nothing flashes on screen. Run from a terminal, the script inherits that terminal and prints to it as usual.
+
 For `vykar daemon`, encrypted repositories must have a non-interactive passphrase source available (`passcommand`, `passphrase`, or `VYKAR_PASSPHRASE`).
 
 ## Compression

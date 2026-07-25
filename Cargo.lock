@@ -8350,6 +8350,7 @@ dependencies = [
  "vykar-protocol",
  "vykar-storage",
  "vykar-types",
+ "windows-sys 0.61.2",
  "xattr",
  "xorf",
  "zeroize",

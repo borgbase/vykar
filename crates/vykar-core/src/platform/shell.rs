@@ -83,6 +83,26 @@ fn augmented_path() -> Option<&'static OsStr> {
         .as_deref()
 }
 
+/// `CreateProcess` flag: run a console application without giving it a console
+/// window of its own.
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// Whether this process owns a console.
+///
+/// A console-attached parent lends its console to the child, so no window is
+/// created and stdio, Ctrl+C and console APIs all keep working. Without a
+/// console — vykar-gui (`windows_subsystem = "windows"`), a scheduled task, a
+/// service — Windows allocates a fresh one for the child, which is the window
+/// that flashes on every hook or `passcommand`. See issue #149.
+#[cfg(windows)]
+fn parent_has_console() -> bool {
+    // SAFETY: GetConsoleWindow takes no arguments and only reads process state.
+    // The returned window handle is borrowed and never dereferenced or freed.
+    let console = unsafe { windows_sys::Win32::System::Console::GetConsoleWindow() };
+    !console.is_null()
+}
+
 /// Build a shell command for the current platform.
 /// On Unix, the child is placed in its own process group so that
 /// timeout termination can kill the entire tree.
@@ -94,6 +114,11 @@ pub fn command_for_script(script: &str) -> Command {
             .arg("-NonInteractive")
             .arg("-Command")
             .arg(script);
+        // Suppress the console window only where one would actually be created;
+        // from a terminal the child inherits ours and behaves as before.
+        if !parent_has_console() {
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
         cmd
     };
 
@@ -284,6 +309,9 @@ fn terminate_child(child: &mut std::process::Child) {
 #[cfg(not(windows))]
 use std::os::unix::process::CommandExt;
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -408,6 +436,20 @@ mod tests {
         let result = run_script_status_with_timeout(script, Duration::from_secs(5));
         assert!(result.is_ok());
         assert!(result.unwrap().success());
+    }
+
+    /// A child spawned with `CREATE_NO_WINDOW` has no console of its own, but
+    /// still writes to the stdio handles it inherits — the property every hook,
+    /// `passcommand` and `command_dumps` call site relies on. CI's own console
+    /// state decides whether `command_for_script` sets the flag, so set it here
+    /// explicitly to exercise the suppressed path either way.
+    #[cfg(windows)]
+    #[test]
+    fn create_no_window_still_captures_output() {
+        let mut cmd = command_for_script("Write-Output 'hello'");
+        cmd.creation_flags(CREATE_NO_WINDOW);
+        let output = run_command_with_timeout(&mut cmd, Duration::from_secs(10)).unwrap();
+        assert!(String::from_utf8_lossy(&output.stdout).contains("hello"));
     }
 
     #[cfg(unix)]

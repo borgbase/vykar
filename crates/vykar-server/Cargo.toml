@@ -4,6 +4,10 @@ version = "0.18.0"
 edition = "2021"
 license = "GPL-3.0-only"
 
+[lib]
+name = "vykar_server"
+path = "src/lib.rs"
+
 [[bin]]
 name = "vykar-server"
 path = "src/main.rs"

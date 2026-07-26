@@ -1,6 +1,56 @@
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 
+/// Failures that prevent the server from starting.
+///
+/// Deliberately separate from [`ServerError`], which models per-request HTTP
+/// responses (status mapping, body redaction) and has no meaning at startup.
+#[derive(Debug)]
+pub enum StartupError {
+    /// The tokio runtime could not be built.
+    Runtime(std::io::Error),
+    /// `VYKAR_TOKEN` was unset or empty.
+    MissingToken,
+    /// The data directory could not be created.
+    DataDir {
+        path: String,
+        source: std::io::Error,
+    },
+    /// The listen address could not be bound.
+    Bind {
+        addr: String,
+        source: std::io::Error,
+    },
+    /// The server stopped with an error while accepting connections.
+    Serve(std::io::Error),
+}
+
+impl std::fmt::Display for StartupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Runtime(e) => write!(f, "failed to build tokio runtime: {e}"),
+            Self::MissingToken => write!(f, "VYKAR_TOKEN environment variable must be set"),
+            Self::DataDir { path, source } => {
+                write!(f, "cannot create data directory '{path}': {source}")
+            }
+            Self::Bind { addr, source } => write!(f, "cannot bind to {addr}: {source}"),
+            Self::Serve(e) => write!(f, "server failed: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for StartupError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Runtime(e)
+            | Self::DataDir { source: e, .. }
+            | Self::Bind { source: e, .. }
+            | Self::Serve(e) => Some(e),
+            Self::MissingToken => None,
+        }
+    }
+}
+
 /// Server error type that maps to HTTP status codes.
 #[derive(Debug)]
 pub enum ServerError {

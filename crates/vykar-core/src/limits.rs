@@ -11,7 +11,10 @@ use nix::errno::Errno;
 use tracing::warn;
 
 use crate::config::ResourceLimitsConfig;
-use vykar_storage::{RepackPlanRequest, RepackResultResponse, StorageBackend};
+use vykar_storage::{
+    RepackPlanRequest, RepackResultResponse, StorageBackend, VerifyPacksPlanRequest,
+    VerifyPacksResponse,
+};
 use vykar_types::error::Result;
 
 // ── Rate limiting runtime ────────────────────────────────────────────────────
@@ -200,6 +203,19 @@ impl StorageBackend for ThrottledStorageBackend {
     fn batch_delete_keys(&self, keys: &[String]) -> Result<()> {
         self.inner.batch_delete_keys(keys)
     }
+
+    // Server-side operations: the bytes move between the server and its own
+    // storage, never over the client's link, so no limiter is applied. These
+    // forwards are load-bearing — without them the trait defaults would report
+    // `UnsupportedBackend` and silently downgrade a throttled REST repo to
+    // client-side pack verification / local init scaffolding.
+    fn server_verify_packs(&self, plan: &VerifyPacksPlanRequest) -> Result<VerifyPacksResponse> {
+        self.inner.server_verify_packs(plan)
+    }
+
+    fn server_init(&self) -> Result<()> {
+        self.inner.server_init()
+    }
 }
 
 /// Guard that restores process niceness when dropped.
@@ -351,6 +367,86 @@ mod tests {
         assert_eq!(mib_per_sec_to_bytes_per_sec(0), 0);
         assert_eq!(mib_per_sec_to_bytes_per_sec(1), 1024 * 1024);
         assert_eq!(mib_per_sec_to_bytes_per_sec(8), 8 * 1024 * 1024);
+    }
+
+    /// Regression: `ThrottledStorageBackend` must forward the server-side ops.
+    /// Falling through to the trait defaults returns `UnsupportedBackend`, which
+    /// silently disables server-side pack verification and server-side init as
+    /// soon as a bandwidth cap is configured on a REST repo.
+    #[test]
+    fn throttled_backend_forwards_server_side_ops() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct ServerOpRecorder {
+            verify_calls: Arc<AtomicUsize>,
+            init_calls: Arc<AtomicUsize>,
+        }
+
+        impl StorageBackend for ServerOpRecorder {
+            fn get(&self, _key: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn put(&self, _key: &str, _data: &[u8]) -> Result<()> {
+                Ok(())
+            }
+            fn delete(&self, _key: &str) -> Result<()> {
+                Ok(())
+            }
+            fn exists(&self, _key: &str) -> Result<bool> {
+                Ok(false)
+            }
+            fn list(&self, _prefix: &str) -> Result<Vec<String>> {
+                Ok(Vec::new())
+            }
+            fn get_range(&self, _key: &str, _offset: u64, _length: u64) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn create_dir(&self, _key: &str) -> Result<()> {
+                Ok(())
+            }
+            fn server_verify_packs(
+                &self,
+                _plan: &VerifyPacksPlanRequest,
+            ) -> Result<VerifyPacksResponse> {
+                self.verify_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(VerifyPacksResponse {
+                    results: Vec::new(),
+                    truncated: false,
+                })
+            }
+            fn server_init(&self) -> Result<()> {
+                self.init_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let verify_calls = Arc::new(AtomicUsize::new(0));
+        let init_calls = Arc::new(AtomicUsize::new(0));
+        let inner = Box::new(ServerOpRecorder {
+            verify_calls: Arc::clone(&verify_calls),
+            init_calls: Arc::clone(&init_calls),
+        });
+
+        // Non-zero caps, so the wrapper is actually installed.
+        let limits = ResourceLimitsConfig {
+            upload_mib_per_sec: 1,
+            download_mib_per_sec: 1,
+            ..ResourceLimitsConfig::default()
+        };
+        let wrapped = wrap_storage_backend(inner, &limits);
+
+        let plan = VerifyPacksPlanRequest {
+            packs: Vec::new(),
+            protocol_version: vykar_storage::PROTOCOL_VERSION,
+        };
+        let response = wrapped
+            .server_verify_packs(&plan)
+            .expect("verify forwarded");
+        assert!(response.results.is_empty());
+        wrapped.server_init().expect("init forwarded");
+
+        assert_eq!(verify_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(init_calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]

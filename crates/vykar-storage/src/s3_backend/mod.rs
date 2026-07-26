@@ -49,6 +49,7 @@ impl S3Backend {
         secret_access_key: &str,
         retry: RetryConfig,
         soft_delete: bool,
+        max_connections: Option<usize>,
     ) -> Result<Self> {
         let base_url = endpoint.parse().map_err(|e| {
             VykarError::Config(format!("invalid S3 endpoint URL '{endpoint}': {e}"))
@@ -67,11 +68,15 @@ impl S3Backend {
 
         let credentials = Credentials::new(access_key_id, secret_access_key);
 
+        let pool = crate::http_idle_pool_size(max_connections);
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .http_status_as_error(false)
             .timeout_connect(Some(Duration::from_secs(30)))
             .timeout_send_body(Some(Duration::from_secs(300)))
             .timeout_recv_body(Some(Duration::from_secs(300)))
+            .max_idle_connections_per_host(pool)
+            .max_idle_connections(pool)
+            .max_idle_age(crate::HTTP_IDLE_AGE)
             .build()
             .into();
 
@@ -556,6 +561,7 @@ mod test_support {
             "SECRET",
             retry,
             soft_delete,
+            None,
         )
         .unwrap()
     }
@@ -570,6 +576,7 @@ mod test_support {
             "SECRET",
             retry,
             soft_delete,
+            None,
         )
         .unwrap()
     }

@@ -378,6 +378,24 @@ pub struct StorageConfig {
     pub s3_soft_delete: bool,
 }
 
+/// Idle-connection pool size for the HTTP backends, derived from the
+/// repository's `max_connections`.
+///
+/// ureq's defaults (3 idle per host, 10 total) are far below the number of
+/// threads vykar points at a single host: listing and existence checks run at
+/// `listing_concurrency` = `(connections * 3).min(24)`, so anything smaller
+/// throws away connections and pays a fresh TLS handshake per request. Idle
+/// connections are a reuse cache rather than a concurrency cap, so sizing to
+/// the worst-case consumer only costs a few idle sockets. A repository is a
+/// single host, so the per-host and total limits are the same number.
+pub(crate) fn http_idle_pool_size(max_connections: Option<usize>) -> usize {
+    (max_connections.unwrap_or(2) * 3).clamp(4, 24)
+}
+
+/// How long an idle connection may sit in the pool before being discarded.
+/// ureq's 15s default expires connections between phases of a backup.
+pub(crate) const HTTP_IDLE_AGE: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Retry configuration for remote storage backends (S3, SFTP, REST).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -457,6 +475,7 @@ pub fn backend_from_config(cfg: &StorageConfig) -> Result<Box<dyn StorageBackend
                 secret_access_key,
                 cfg.retry,
                 cfg.s3_soft_delete,
+                cfg.max_connections,
             )?))
         }
         #[cfg(feature = "backend-sftp")]
@@ -483,7 +502,10 @@ pub fn backend_from_config(cfg: &StorageConfig) -> Result<Box<dyn StorageBackend
         ParsedUrl::Rest { url } => {
             let token = cfg.access_token.as_deref();
             Ok(Box::new(rest_backend::RestBackend::new(
-                &url, token, cfg.retry,
+                &url,
+                token,
+                cfg.retry,
+                cfg.max_connections,
             )?))
         }
     }
@@ -492,6 +514,16 @@ pub fn backend_from_config(cfg: &StorageConfig) -> Result<Box<dyn StorageBackend
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn idle_pool_covers_listing_concurrency() {
+        // Mirrors `Limits::listing_concurrency(remote)` = (connections * 3).min(24).
+        assert_eq!(http_idle_pool_size(None), 6);
+        assert_eq!(http_idle_pool_size(Some(1)), 4); // floor, not 3
+        assert_eq!(http_idle_pool_size(Some(4)), 12);
+        assert_eq!(http_idle_pool_size(Some(8)), 24);
+        assert_eq!(http_idle_pool_size(Some(64)), 24); // ceiling
+    }
 
     #[test]
     fn test_bare_absolute_path() {

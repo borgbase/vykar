@@ -32,12 +32,21 @@ pub struct RestBackend {
 }
 
 impl RestBackend {
-    pub fn new(base_url: &str, token: Option<&str>, retry: RetryConfig) -> Result<Self> {
+    pub fn new(
+        base_url: &str,
+        token: Option<&str>,
+        retry: RetryConfig,
+        max_connections: Option<usize>,
+    ) -> Result<Self> {
+        let pool = crate::http_idle_pool_size(max_connections);
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .http_status_as_error(false)
             .timeout_connect(Some(Duration::from_secs(30)))
             .timeout_send_body(Some(Duration::from_secs(5 * 60)))
             .timeout_recv_body(Some(Duration::from_secs(5 * 60)))
+            .max_idle_connections_per_host(pool)
+            .max_idle_connections(pool)
+            .max_idle_age(crate::HTTP_IDLE_AGE)
             .build()
             .into();
 
@@ -778,7 +787,7 @@ mod tests {
             body.len()
         );
         let (url, handle) = mock_server(&resp);
-        let backend = RestBackend::new(&url, None, no_retry()).unwrap();
+        let backend = RestBackend::new(&url, None, no_retry(), None).unwrap();
 
         let err = backend
             .get_range("testkey", 10, 50)
@@ -799,7 +808,7 @@ mod tests {
             body.len()
         );
         let (url, handle) = mock_server(&resp);
-        let backend = RestBackend::new(&url, None, no_retry()).unwrap();
+        let backend = RestBackend::new(&url, None, no_retry(), None).unwrap();
 
         let err = backend
             .get_range("testkey", 10, 50)
@@ -852,7 +861,7 @@ mod tests {
             body.len()
         );
         let (url, handle) = mock_server(&resp);
-        let backend = RestBackend::new(&url, None, no_retry()).unwrap();
+        let backend = RestBackend::new(&url, None, no_retry(), None).unwrap();
 
         let err = backend
             .get_range("testkey", 10, 50)
@@ -881,7 +890,7 @@ mod tests {
         );
 
         let (url, handle) = mock_server_multi(vec![truncated_resp, complete_resp]);
-        let backend = RestBackend::new(&url, None, fast_retry()).unwrap();
+        let backend = RestBackend::new(&url, None, fast_retry(), None).unwrap();
 
         let result = backend.get("testkey").unwrap().unwrap();
         assert_eq!(result, full_body);
@@ -936,7 +945,7 @@ mod tests {
             }
         });
 
-        let backend = RestBackend::new(&url, None, fast_retry()).unwrap();
+        let backend = RestBackend::new(&url, None, fast_retry(), None).unwrap();
         let result = backend.get_range("testkey", 10, 50).unwrap().unwrap();
         assert_eq!(result.len(), 50);
         assert!(result.iter().all(|&b| b == 0xAB));
@@ -953,7 +962,7 @@ mod tests {
         );
         // Only provide one response — if it retries it will hang/fail
         let (url, handle) = mock_server(&resp);
-        let backend = RestBackend::new(&url, None, fast_retry()).unwrap();
+        let backend = RestBackend::new(&url, None, fast_retry(), None).unwrap();
 
         let err = backend
             .get_range("testkey", 10, 50)

@@ -8,8 +8,10 @@ license = "GPL-3.0-only"
 workspace = true
 
 [dependencies]
-# Crypto (ChunkId, PackId)
-blake2.workspace = true
+# Crypto (ChunkId, PackId) — SIMD BLAKE2b, byte-identical to RFC 7693.
+# The RustCrypto `blake2` crate is scalar-only on stable, and these two digests
+# are on the hottest path in the tool.
+blake2b_simd = "1"
 
 # Hex encoding
 hex.workspace = true
@@ -23,3 +25,7 @@ rmp-serde.workspace = true
 
 # Error handling
 thiserror.workspace = true
+
+[dev-dependencies]
+# Independent reference implementation for the ChunkId/PackId equivalence tests.
+blake2.workspace = true

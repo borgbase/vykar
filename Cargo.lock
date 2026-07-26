@@ -860,6 +860,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "blake2b_simd"
+version = "1.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b79834656f71332577234b50bfc009996f7449e0c056884e6a02492ded0ca2f3"
+dependencies = [
+ "arrayref",
+ "arrayvec",
+ "constant_time_eq",
+]
+
+[[package]]
 name = "block-buffer"
 version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1357,6 +1368,12 @@ name = "const-oid"
 version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
+
+[[package]]
+name = "constant_time_eq"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 
 [[package]]
 name = "convert_case"
@@ -8363,7 +8380,6 @@ version = "0.18.0"
 dependencies = [
  "aes-gcm",
  "argon2 0.5.3",
- "blake2 0.10.6",
  "chacha20poly1305",
  "rand 0.10.1",
  "rmp-serde",
@@ -8468,6 +8484,7 @@ name = "vykar-types"
 version = "0.18.0"
 dependencies = [
  "blake2 0.10.6",
+ "blake2b_simd",
  "hex",
  "rand 0.10.1",
  "rmp-serde",

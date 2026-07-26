@@ -1,5 +1,3 @@
-use blake2::digest::{Update, VariableOutput};
-use blake2::Blake2bVar;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -20,17 +18,12 @@ impl PackId {
 
     /// Compute a pack ID as unkeyed BLAKE2b-256 of the entire pack contents.
     ///
-    /// # Panics
-    ///
-    /// Panics only if the `BLAKE2b` implementation rejects the fixed 32-byte
-    /// output length used by `PackId`.
+    /// Pack IDs are storage keys for already-written objects, so the digest is
+    /// pinned by known-answer tests — see `compute_known_answers` below.
     pub fn compute(data: &[u8]) -> Self {
-        let mut hasher = Blake2bVar::new(32).expect("BLAKE2b accepts 32-byte output per spec");
-        hasher.update(data);
+        let hash = blake2b_simd::Params::new().hash_length(32).hash(data);
         let mut out = [0u8; 32];
-        hasher
-            .finalize_variable(&mut out)
-            .expect("finalize_variable writes the requested 32 bytes");
+        out.copy_from_slice(hash.as_bytes());
         PackId(out)
     }
 
@@ -89,5 +82,90 @@ impl fmt::Debug for PackId {
 impl fmt::Display for PackId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", &self.to_hex()[..16])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Deterministic filler so the vectors below stay readable.
+    fn pattern(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i % 251) as u8).collect()
+    }
+
+    /// Known-answer vectors for unkeyed BLAKE2b-256.
+    ///
+    /// Pack IDs are storage keys for already-written pack files, so a digest
+    /// change orphans every pack in every existing repository. These pin the
+    /// algorithm across hash-implementation swaps; a failure means the digest
+    /// changed, not that the expectation is stale. The empty-input vector is
+    /// the published BLAKE2b-256 test value.
+    #[test]
+    fn compute_known_answers() {
+        let cases: &[(usize, &str)] = &[
+            (
+                0,
+                "0e5751c026e543b2e8ab2eb06099daa1d1e5df47778f7787faab45cdf12fe3a8",
+            ),
+            (
+                1,
+                "03170a2e7597b7b7e3d84c05391d139a62b157e78786d8c082f29dcf4c111314",
+            ),
+            (
+                127,
+                "f2fe67ff342e21b8f45e8f2e0bcd1d9243245d50ee6c78042e9c491388791c72",
+            ),
+            (
+                128,
+                "c3582f71ebb2be66fa5dd750f80baae97554f3b015663c8be377cfcb2488c1d1",
+            ),
+            (
+                129,
+                "f7f3c46ba2564ff4c4c162da1f5b605f9f1c4aa6a20652a9f9a337c1a2f5b9c9",
+            ),
+            (
+                1000,
+                "b372d0608f720c8c3dd41e9c8eecb10143b41abe520b616607e754bf79c08331",
+            ),
+        ];
+        for (len, expected) in cases {
+            assert_eq!(
+                PackId::compute(&pattern(*len)).to_hex(),
+                *expected,
+                "unkeyed BLAKE2b-256 changed for {len}-byte input"
+            );
+        }
+    }
+
+    /// The active implementation must agree with the RustCrypto `blake2` crate,
+    /// which is kept as a dev-dependency purely as an independent reference.
+    #[test]
+    fn compute_matches_rustcrypto_blake2() {
+        use blake2::digest::{Update, VariableOutput};
+        use blake2::Blake2bVar;
+
+        for len in [0usize, 1, 63, 64, 127, 128, 129, 255, 1000, 4096] {
+            let data = pattern(len);
+            let mut reference = Blake2bVar::new(32).expect("blake2 accepts 32-byte output");
+            reference.update(&data);
+            let mut expected = [0u8; 32];
+            reference
+                .finalize_variable(&mut expected)
+                .expect("finalize_variable writes 32 bytes");
+            assert_eq!(
+                PackId::compute(&data).to_hex(),
+                hex::encode(expected),
+                "divergence from RustCrypto blake2 at {len} bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn storage_key_roundtrip() {
+        let id = PackId::compute(b"pack contents");
+        let key = id.storage_key();
+        assert!(key.starts_with(&format!("packs/{}/", id.shard_prefix())));
+        assert_eq!(PackId::from_storage_key(&key), Ok(id));
     }
 }

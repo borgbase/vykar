@@ -18,7 +18,7 @@ use crate::repo_helpers::{
 use crate::APP_TITLE;
 use vykar_common::display::{format_bytes, format_count};
 
-use super::shared::{select_repo_or_log, OpGuard};
+use super::shared::{select_repo_or_fail, OpGuard};
 use super::WorkerContext;
 
 /// Placeholder shown for metric cells of a repo that failed to load.
@@ -319,7 +319,7 @@ pub(super) fn handle_fetch_repo_info(ctx: &mut WorkerContext, repo_name: String)
         format!("Refreshing [{repo_name}]..."),
     );
 
-    let repo = match select_repo_or_log(ctx, &ctx.runtime.repos, &repo_name) {
+    let repo = match select_repo_or_fail(&mut guard, &ctx.runtime.repos, &repo_name) {
         Some(r) => r,
         None => return,
     };

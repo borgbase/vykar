@@ -4,12 +4,13 @@ use chrono::{DateTime, Local, Utc};
 use vykar_core::app::operations;
 use vykar_core::commands;
 use vykar_core::commands::find::{FileStatus, FindFilter, FindScope};
+use vykar_core::config;
 
 use crate::messages::{AppCommand, DiffResultRow, FindResultRow, FindSnapshotGroup, UiEvent};
 use crate::repo_helpers::{find_repo_for_snapshot, send_log, with_passphrase_retry, PassphraseRun};
 use vykar_common::display::format_bytes;
 
-use super::shared::{select_repo_or_log, OpGuard};
+use super::shared::{select_repo_or_fail, OpGuard};
 use super::WorkerContext;
 
 pub(super) fn handle_restore_selected(
@@ -148,12 +149,9 @@ pub(super) fn handle_delete_snapshots(
         status,
     );
 
-    let repo = match select_repo_or_log(ctx, &ctx.runtime.repos, &repo_name) {
+    let repo = match select_repo_or_fail(&mut guard, &ctx.runtime.repos, &repo_name) {
         Some(r) => r,
-        None => {
-            guard.fail(format!("No repository matching '{repo_name}'."));
-            return;
-        }
+        None => return,
     };
 
     // Single batch call: validates all names up front and runs under one
@@ -271,7 +269,9 @@ pub(super) fn handle_diff_snapshots(
         "Diffing snapshots...",
     );
 
-    let repo = match select_repo_or_log(ctx, &ctx.runtime.repos, &repo_name) {
+    // Plain `select_repo`: the guard is the single logger, with this site's own
+    // message (`select_repo_or_log` would log a second, redundant line).
+    let repo = match config::select_repo(&ctx.runtime.repos, &repo_name) {
         Some(r) => r,
         None => {
             guard.fail(format!("[{repo_name}] repository not found"));
@@ -350,12 +350,9 @@ pub(super) fn handle_prune_repo(ctx: &mut WorkerContext, repo_name: String) {
         "Pruning snapshots...",
     );
 
-    let repo = match select_repo_or_log(ctx, &ctx.runtime.repos, &repo_name) {
+    let repo = match select_repo_or_fail(&mut guard, &ctx.runtime.repos, &repo_name) {
         Some(r) => r,
-        None => {
-            guard.fail(format!("No repository matching '{repo_name}'."));
-            return;
-        }
+        None => return,
     };
 
     let outcome = with_passphrase_retry(repo, &mut ctx.passphrases, 3, |pass| {
@@ -422,12 +419,9 @@ pub(super) fn handle_find_files(ctx: &mut WorkerContext, repo_name: String, name
         "Searching files...",
     );
 
-    let repo = match select_repo_or_log(ctx, &ctx.runtime.repos, &repo_name) {
+    let repo = match select_repo_or_fail(&mut guard, &ctx.runtime.repos, &repo_name) {
         Some(r) => r,
-        None => {
-            guard.fail(format!("No repository matching '{repo_name}'."));
-            return;
-        }
+        None => return,
     };
 
     let filter = match FindFilter::build(None, None, Some(&name_pattern), None, None, None, None) {

@@ -5,7 +5,7 @@ use vykar_core::commands::mount::{self, MountProgressEvent};
 use crate::messages::UiEvent;
 use crate::repo_helpers::{find_repo_for_snapshot, send_log, with_passphrase_retry, PassphraseRun};
 
-use super::shared::{select_repo_or_log, OpGuard};
+use super::shared::OpGuard;
 use super::WorkerContext;
 
 pub(crate) struct MountHandle {
@@ -69,7 +69,9 @@ pub(super) fn handle_start_mount(
             }
         }
         None => {
-            let repo = match select_repo_or_log(ctx, &ctx.runtime.repos, &repo_name) {
+            // Plain `select_repo`: the guard is the single logger here
+            // (`select_repo_or_log` would log a second, redundant line).
+            let repo = match vykar_core::config::select_repo(&ctx.runtime.repos, &repo_name) {
                 Some(r) => r,
                 None => {
                     guard.fail(format!("no repository matching '{repo_name}'"));

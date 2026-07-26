@@ -112,6 +112,10 @@ impl Drop for OpGuard<'_> {
     }
 }
 
+/// Select a repository, logging the miss. For use at sites that hold **no**
+/// [`OpGuard`] — a guarded site must use [`select_repo_or_fail`] (or call
+/// `config::select_repo` directly and `guard.fail` with its own message), since
+/// `OpGuard::fail` already logs and would double-log the same failure.
 pub(super) fn select_repo_or_log<'r>(
     ctx: &WorkerContext,
     repos: &'r [ResolvedRepo],
@@ -121,6 +125,22 @@ pub(super) fn select_repo_or_log<'r>(
         Some(r) => Some(r),
         None => {
             send_log(&ctx.ui_tx, format!("No repository matching '{name}'."));
+            None
+        }
+    }
+}
+
+/// Guard-aware variant: records the miss on the guard, which is the single
+/// logger (and turns the status bar into a persistent error state).
+pub(super) fn select_repo_or_fail<'r>(
+    guard: &mut OpGuard<'_>,
+    repos: &'r [ResolvedRepo],
+    name: &str,
+) -> Option<&'r ResolvedRepo> {
+    match config::select_repo(repos, name) {
+        Some(r) => Some(r),
+        None => {
+            guard.fail(format!("No repository matching '{name}'."));
             None
         }
     }
@@ -229,6 +249,32 @@ mod tests {
             Some(UiEvent::ErrorStatus(s)) if s == "boom"
         ));
         assert!(!op_running.load(Ordering::SeqCst));
+    }
+
+    /// Regression: a guarded repo miss must produce exactly one log line.
+    /// `select_repo_or_log` + `guard.fail` used to log the same failure twice.
+    #[test]
+    fn select_repo_or_fail_logs_the_miss_once() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let cancel = AtomicBool::new(false);
+        let op_running = AtomicBool::new(false);
+        {
+            let mut g = OpGuard::ui(&tx, &cancel, &op_running, "Deleting...");
+            assert!(select_repo_or_fail(&mut g, &[], "missing").is_none());
+        }
+        let events = drain(&rx);
+        let logs: Vec<&String> = events
+            .iter()
+            .filter_map(|e| match e {
+                UiEvent::LogEntry { message, .. } => Some(message),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(logs.len(), 1, "expected a single log line, got {logs:?}");
+        assert!(logs
+            .first()
+            .is_some_and(|m| m.contains("No repository matching 'missing'")));
+        assert!(matches!(events.last(), Some(UiEvent::ErrorStatus(_))));
     }
 
     #[test]

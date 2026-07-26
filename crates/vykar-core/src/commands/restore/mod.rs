@@ -389,6 +389,7 @@ where
                 &temp_root,
                 xattrs_enabled,
                 restore_as_root,
+                config.limits.restore_finalize_concurrency(),
                 stats,
             )?;
 
@@ -540,10 +541,92 @@ pub(super) fn push_metadata_warning(stats: &mut RestoreStats, msg: String) {
     }
 }
 
+/// Join every scoped worker of a fail-fast pass, returning the first error
+/// observed (a worker `Err`, or a panic reported as `panic_msg`) and `Ok(())`
+/// only if all of them succeeded. Any error also raises `cancelled`, so
+/// workers still joining stop claiming work instead of finishing a pass whose
+/// result is already discarded.
+///
+/// Shared by the Phase 4 chunk readers and the Phase 5b finalize workers: both
+/// spawn `Result`-returning threads that poll a shared claim counter and abort
+/// the whole pass on the first hard error.
+pub(super) fn join_workers(
+    handles: Vec<std::thread::ScopedJoinHandle<'_, Result<()>>>,
+    cancelled: &std::sync::atomic::AtomicBool,
+    panic_msg: &str,
+) -> Result<()> {
+    use std::sync::atomic::Ordering;
+
+    let mut first_error: Option<VykarError> = None;
+    for handle in handles {
+        let err = match handle.join() {
+            Ok(Ok(())) => continue,
+            Ok(Err(e)) => e,
+            Err(_panic) => VykarError::Other(panic_msg.to_string()),
+        };
+        cancelled.store(true, Ordering::Release);
+        if first_error.is_none() {
+            first_error = Some(err);
+        }
+    }
+    match first_error {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// Thread-safe wrapper sharing one `RestoreStats` warning budget across the
+/// finalize workers — and across batches, since the caller's stats live for
+/// the whole restore. The lock is claimed only when a warning is actually
+/// recorded, so successful metadata operations stay lock-free and
+/// [`MAX_RESTORE_WARNINGS`] caps both the retained vec *and* the
+/// `tracing::warn!` stream globally, exactly like the serial code did.
+pub(super) struct WarningSink<'a> {
+    stats: std::sync::Mutex<&'a mut RestoreStats>,
+}
+
+impl<'a> WarningSink<'a> {
+    pub(super) fn new(stats: &'a mut RestoreStats) -> Self {
+        Self {
+            stats: std::sync::Mutex::new(stats),
+        }
+    }
+
+    /// Record one warning under the shared budget. Poison is recovered rather
+    /// than propagated: it means another worker panicked, which the driver
+    /// already surfaces as a hard error, and `push_metadata_warning` leaves no
+    /// broken invariant behind — panicking a second worker would only add noise.
+    pub(super) fn push(&self, msg: String) {
+        let mut guard = self.stats.lock().unwrap_or_else(|e| e.into_inner());
+        push_metadata_warning(&mut guard, msg);
+    }
+
+    /// Like [`warn_metadata_err`], but touches the shared budget only on
+    /// `Err` — the `Ok` path never locks.
+    pub(super) fn warn_err<T>(&self, result: std::io::Result<T>, path: &Path, op: &str) {
+        if let Err(e) = result {
+            self.push(format!("failed to apply {op} on {}: {e}", path.display()));
+        }
+    }
+}
+
 pub(super) fn apply_item_xattrs(
     target: &Path,
     xattrs: Option<&HashMap<String, Vec<u8>>>,
     stats: &mut RestoreStats,
+) {
+    apply_item_xattrs_with(target, xattrs, |msg| push_metadata_warning(stats, msg));
+}
+
+/// Closure-based core of [`apply_item_xattrs`], so the parallel finalize
+/// workers can route failures into the shared [`WarningSink`] while the
+/// streaming planner and the deferred dir/symlink passes keep using their
+/// exclusive `&mut RestoreStats`. (Both routes lock per warning, not per call,
+/// so the split is about who owns the stats, not about lock hold time.)
+pub(super) fn apply_item_xattrs_with(
+    target: &Path,
+    xattrs: Option<&HashMap<String, Vec<u8>>>,
+    mut warn: impl FnMut(String),
 ) {
     let Some(xattrs) = xattrs else {
         return;
@@ -559,17 +642,17 @@ pub(super) fn apply_item_xattrs(
 
         #[cfg(unix)]
         if let Err(e) = xattr::set(target, name, value) {
-            push_metadata_warning(
-                stats,
-                format!("failed to apply xattr {name} on {}: {e}", target.display()),
-            );
+            warn(format!(
+                "failed to apply xattr {name} on {}: {e}",
+                target.display()
+            ));
         }
         #[cfg(not(unix))]
         {
             let _ = target;
             let _ = name;
             let _ = value;
-            let _ = stats;
+            let _ = &mut warn;
         }
     }
 }
@@ -692,5 +775,20 @@ mod tests {
         // replacement of an earlier one.
         let suppressed = format!("msg {}", MAX_RESTORE_WARNINGS);
         assert!(!stats.warnings.iter().any(|w| w == &suppressed));
+    }
+
+    #[test]
+    fn warning_sink_shares_one_budget_and_skips_ok_results() {
+        let mut stats = RestoreStats::default();
+        {
+            let sink = WarningSink::new(&mut stats);
+            // Ok results never touch the budget.
+            sink.warn_err(Ok::<(), std::io::Error>(()), Path::new("p"), "mode");
+            for i in 0..MAX_RESTORE_WARNINGS + 5 {
+                sink.push(format!("msg {i}"));
+            }
+        }
+        assert_eq!(stats.warnings.len(), MAX_RESTORE_WARNINGS);
+        assert_eq!(stats.warnings_suppressed, 5);
     }
 }

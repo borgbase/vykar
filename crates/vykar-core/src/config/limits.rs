@@ -133,6 +133,15 @@ impl ResourceLimitsConfig {
         self.connections
     }
 
+    /// Restore finalize (per-file fsync) concurrency: `connections`, floored
+    /// at 2 (benchmarked as the fastest default). `connections` sizes
+    /// *network* parallelism, but finalize is bound by local fsync latency —
+    /// a `connections = 1` config would otherwise re-serialize the
+    /// flush-dominated pass on metadata-heavy restores.
+    pub fn restore_finalize_concurrency(&self) -> usize {
+        self.connections.max(2)
+    }
+
     /// Verify-data concurrency: capped at 4 (each thread holds ~128 MiB).
     pub fn verify_data_concurrency(&self) -> usize {
         self.connections.min(4)

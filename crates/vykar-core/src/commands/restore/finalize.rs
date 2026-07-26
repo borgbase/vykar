@@ -10,10 +10,13 @@ use crate::platform::fs;
 use vykar_types::error::{Result, VykarError};
 
 use super::plan::{PendingLink, PlannedFile, PlannedNode, RepInfo};
-use super::{apply_item_xattrs, push_metadata_warning, warn_metadata_err, RestoreStats};
+use super::{
+    apply_item_xattrs, apply_item_xattrs_with, join_workers, push_metadata_warning,
+    warn_metadata_err, RestoreStats, WarningSink,
+};
 use crate::snapshot::item::HardlinkId;
 use std::collections::HashMap;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 #[cfg(test)]
 use std::cell::{Cell, RefCell};
@@ -24,103 +27,160 @@ use std::cell::{Cell, RefCell};
 /// after `move_temp_to_dest` because `rename(2)` only changes directory
 /// entries, not inodes.  fd-based fchmod/futimens avoid a redundant path
 /// lookup; on fd open failure the path-based call is used as a fallback.
+///
+/// Files are finalized on up to `concurrency` worker threads (`thread::scope` +
+/// [`join_workers`], like the Phase 4 chunk readers): each file's own op order
+/// (chown → xattrs → chmod → mtime → `sync_all`) is unchanged, but order
+/// *across* files is not defined — the files are independent inodes, so no
+/// cross-file ordering was ever load-bearing. The per-file `sync_all` (F3-a)
+/// and its hard-error contract are unchanged; parallelism only overlaps the
+/// flush latencies, which otherwise dominate metadata-heavy restores (one
+/// serial fsync per file made file count the dominant runtime term). All
+/// workers record warnings through one shared [`WarningSink`], so
+/// `MAX_RESTORE_WARNINGS` bounds the log stream globally.
 pub(super) fn apply_file_metadata(
     planned_files: &[PlannedFile],
     temp_root: &Path,
     xattrs_enabled: bool,
     restore_as_root: bool,
+    concurrency: usize,
     stats: &mut RestoreStats,
 ) -> Result<()> {
-    for pf in planned_files {
-        let target_path = temp_root.join(&pf.rel_path);
-        let (mtime_secs, mtime_nanos) = split_unix_nanos(pf.mtime);
+    if planned_files.is_empty() {
+        return Ok(());
+    }
 
-        // Open a writable handle on every platform — needed because the final
-        // `sync_all` (`FlushFileBuffers` on Windows) requires write access, and
-        // opening *before* mode application keeps a to-be-read-only file
-        // writable at open time. A failure here is a hard error: we cannot make
-        // the data durable without it. Self-heals a restrictive-umask
-        // owner-write strip on `PermissionDenied` (chmod 0o600, retry once).
-        let file = open_writable_for_finalize(&target_path)?;
+    let num_threads = concurrency.min(planned_files.len()).max(1);
+    let sink = WarningSink::new(stats);
 
-        // Uniform metadata order: chown → xattrs → chmod → mtime. chown clears
-        // setuid/setgid + `security.capability`, so it must precede xattrs and
-        // the final chmod; xattrs run while the inode is still owner-writable
-        // (before a possibly read-only final mode); the captured mode is
-        // applied last; mtime is last because chown/chmod/setxattr bump ctime,
-        // not mtime.
-        if restore_as_root {
-            warn_metadata_err(
-                stats,
-                fs::chown_fd(&file, pf.uid, pf.gid),
-                &target_path,
-                "owner",
-            );
-            #[cfg(test)]
-            record_op("chown", pf.uid, pf.gid);
+    // Serial fast-path: no thread spawn for a single worker. Since
+    // `restore_finalize_concurrency()` floors at 2, the only production trigger
+    // is a one-file slice (the hardlink copy-fallback call); its real job is to
+    // keep the open/fsync seams on the calling thread so the thread-local test
+    // fault harness below can still reach them.
+    if num_threads == 1 {
+        for pf in planned_files {
+            finalize_one_file(pf, temp_root, xattrs_enabled, restore_as_root, &sink)?;
+        }
+        return Ok(());
+    }
+
+    let next = AtomicUsize::new(0);
+    let cancelled = AtomicBool::new(false);
+
+    std::thread::scope(|s| {
+        let mut handles = Vec::with_capacity(num_threads);
+        for _ in 0..num_threads {
+            let next = &next;
+            let cancelled = &cancelled;
+            let sink = &sink;
+            handles.push(s.spawn(move || -> Result<()> {
+                loop {
+                    if cancelled.load(Ordering::Acquire) {
+                        return Ok(());
+                    }
+                    // Shared claim counter (not static chunking): trivially
+                    // self-balancing against skewed per-file fsync latencies.
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(pf) = planned_files.get(i) else {
+                        return Ok(());
+                    };
+                    if let Err(e) =
+                        finalize_one_file(pf, temp_root, xattrs_enabled, restore_as_root, sink)
+                    {
+                        cancelled.store(true, Ordering::Release);
+                        return Err(e);
+                    }
+                }
+            }));
         }
 
-        // xattrs remain path-based (no fd-based xattr API in std).
-        if xattrs_enabled {
-            apply_item_xattrs(&target_path, pf.xattrs.as_ref(), stats);
-        }
+        join_workers(handles, &cancelled, "restore finalize worker panicked")
+    })
+}
+
+/// Finalize a single restored file: open a writable fd, apply
+/// chown → xattrs → chmod → mtime, then make it durable with `sync_all`.
+/// Warnings go through the shared `sink`, which locks only on failures, so
+/// the successful path stays lock-free across concurrent workers.
+fn finalize_one_file(
+    pf: &PlannedFile,
+    temp_root: &Path,
+    xattrs_enabled: bool,
+    restore_as_root: bool,
+    sink: &WarningSink,
+) -> Result<()> {
+    let target_path = temp_root.join(&pf.rel_path);
+    let (mtime_secs, mtime_nanos) = split_unix_nanos(pf.mtime);
+
+    // Open a writable handle on every platform — needed because the final
+    // `sync_all` (`FlushFileBuffers` on Windows) requires write access, and
+    // opening *before* mode application keeps a to-be-read-only file
+    // writable at open time. A failure here is a hard error: we cannot make
+    // the data durable without it. Self-heals a restrictive-umask
+    // owner-write strip on `PermissionDenied` (chmod 0o600, retry once).
+    let file = open_writable_for_finalize(&target_path)?;
+
+    // Uniform metadata order: chown → xattrs → chmod → mtime. chown clears
+    // setuid/setgid + `security.capability`, so it must precede xattrs and
+    // the final chmod; xattrs run while the inode is still owner-writable
+    // (before a possibly read-only final mode); the captured mode is
+    // applied last; mtime is last because chown/chmod/setxattr bump ctime,
+    // not mtime.
+    if restore_as_root {
+        sink.warn_err(fs::chown_fd(&file, pf.uid, pf.gid), &target_path, "owner");
         #[cfg(test)]
-        record_op("xattr", 0, 0);
+        record_op("chown", pf.uid, pf.gid);
+    }
 
-        // fd-based fchmod/futimens are Unix-only; on other platforms fall
-        // through to the path-based calls to avoid silent no-ops. Only the
-        // *final* failure (after the path-based fallback) is recorded as a
-        // warning — intermediate fd failures that succeed on the fallback are
-        // not user-facing.
-        #[cfg(unix)]
-        {
-            if fs::apply_mode_fd(&file, pf.mode).is_err() {
-                warn_metadata_err(
-                    stats,
-                    fs::apply_mode(&target_path, pf.mode),
-                    &target_path,
-                    "mode",
-                );
-            }
-            if fs::set_file_mtime_fd(&file, mtime_secs, mtime_nanos).is_err() {
-                warn_metadata_err(
-                    stats,
-                    fs::set_file_mtime(&target_path, mtime_secs, mtime_nanos),
-                    &target_path,
-                    "mtime",
-                );
-            }
+    // xattrs remain path-based (no fd-based xattr API in std).
+    if xattrs_enabled {
+        apply_item_xattrs_with(&target_path, pf.xattrs.as_ref(), |msg| sink.push(msg));
+    }
+    #[cfg(test)]
+    record_op("xattr", 0, 0);
+
+    // fd-based fchmod/futimens are Unix-only; on other platforms fall
+    // through to the path-based calls to avoid silent no-ops. Only the
+    // *final* failure (after the path-based fallback) is recorded as a
+    // warning — intermediate fd failures that succeed on the fallback are
+    // not user-facing.
+    #[cfg(unix)]
+    {
+        if fs::apply_mode_fd(&file, pf.mode).is_err() {
+            sink.warn_err(fs::apply_mode(&target_path, pf.mode), &target_path, "mode");
         }
-        #[cfg(not(unix))]
-        {
-            warn_metadata_err(
-                stats,
-                fs::apply_mode(&target_path, pf.mode),
-                &target_path,
-                "mode",
-            );
-            warn_metadata_err(
-                stats,
+        if fs::set_file_mtime_fd(&file, mtime_secs, mtime_nanos).is_err() {
+            sink.warn_err(
                 fs::set_file_mtime(&target_path, mtime_secs, mtime_nanos),
                 &target_path,
                 "mtime",
             );
         }
-        // Recorded outside the cfg blocks so the ordering test (which is not
-        // platform-gated) sees `chmod` then `mtime` on every platform; both
-        // branches apply mode before mtime.
-        #[cfg(test)]
-        {
-            record_op("chmod", 0, 0);
-            record_op("mtime", 0, 0);
-        }
-
-        // F3-a: make file data + inode (size/mode/mtime) durable. `sync_all`
-        // (not `sync_data`) flushes the metadata applied above with the data.
-        inj_fsync_file(&file).map_err(|e| {
-            VykarError::Other(format!("failed to fsync {}: {e}", target_path.display()))
-        })?;
     }
+    #[cfg(not(unix))]
+    {
+        sink.warn_err(fs::apply_mode(&target_path, pf.mode), &target_path, "mode");
+        sink.warn_err(
+            fs::set_file_mtime(&target_path, mtime_secs, mtime_nanos),
+            &target_path,
+            "mtime",
+        );
+    }
+    // Recorded outside the cfg blocks so the ordering test (which is not
+    // platform-gated) sees `chmod` then `mtime` on every platform; both
+    // branches apply mode before mtime.
+    #[cfg(test)]
+    {
+        record_op("chmod", 0, 0);
+        record_op("mtime", 0, 0);
+    }
+
+    // F3-a: make file data + inode (size/mode/mtime) durable. `sync_all`
+    // (not `sync_data`) flushes the metadata applied above with the data.
+    inj_fsync_file(&file).map_err(|e| {
+        VykarError::Other(format!("failed to fsync {}: {e}", target_path.display()))
+    })?;
     Ok(())
 }
 
@@ -351,11 +411,14 @@ pub(super) fn create_hardlinks(
                             xattrs,
                             created: AtomicBool::new(false),
                         };
+                        // Concurrency 1: always a single-file slice on a rare
+                        // fallback path — nothing to parallelize.
                         apply_file_metadata(
                             std::slice::from_ref(&pf),
                             temp_root,
                             xattrs_enabled,
                             restore_as_root,
+                            1,
                             stats,
                         )?;
                         // Separate inode → a file, not a hard link. Its bytes
@@ -733,8 +796,12 @@ fn inj_open_writable(path: &Path) -> io::Result<std::fs::File> {
 // Thread-local fault state (tests only).
 //
 // Thread-locals, not globals+mutex: every injected op runs on the test's own
-// calling thread (the parallel write workers never fsync or rename), so
-// thread-locals isolate unrelated parallel restore tests from each other.
+// calling thread — `move_temp_to_dest`, `create_hardlinks`, and the
+// `apply_file_metadata` serial fast-path (which every single-file call takes)
+// all execute there — so thread-locals isolate unrelated parallel restore
+// tests from each other. The multi-worker finalize path is covered by tests
+// that use real failures (a missing file, unprivileged chown) instead of
+// injected ones.
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -823,7 +890,7 @@ mod tests {
     /// own cleanup (rollback).
     fn finalize_phase(files: &[PlannedFile], temp_root: &Path, dest_root: &Path) -> Result<()> {
         let mut stats = RestoreStats::default();
-        if let Err(e) = apply_file_metadata(files, temp_root, false, false, &mut stats) {
+        if let Err(e) = apply_file_metadata(files, temp_root, false, false, 4, &mut stats) {
             let _ = force_remove_temp_tree(temp_root);
             return Err(e);
         }
@@ -1371,7 +1438,9 @@ mod tests {
         let mut stats = RestoreStats::default();
         // restore_as_root = true exercises the privileged branch even though the
         // test process is unprivileged (fchown fails → warning, op recorded).
-        apply_file_metadata(&files, &temp_root, false, true, &mut stats).unwrap();
+        // A single file takes the serial fast-path, so the trace lands in this
+        // thread's METADATA_OPS.
+        apply_file_metadata(&files, &temp_root, false, true, 4, &mut stats).unwrap();
 
         assert_eq!(recorded_tags(), vec!["chown", "xattr", "chmod", "mtime"]);
         let chown = recorded_ops()
@@ -1493,6 +1562,7 @@ mod tests {
         // Force the FIRST open to PermissionDenied (the umask outcome we cannot
         // reproduce without mutating the global umask); the retry (call 1) opens
         // the real file, which only succeeds because recovery chmod'd it 0o600.
+        // Single file → serial fast-path → the thread-local fault is visible.
         OPEN_WRITABLE_FAULT.with(|c| c.set(Some((0, io::ErrorKind::PermissionDenied))));
 
         // Probe whether this fs accepts a user.* xattr; if so we assert it lands.
@@ -1513,7 +1583,7 @@ mod tests {
 
         let mut stats = RestoreStats::default();
         // (1) reopen recovers → Ok.
-        apply_file_metadata(&files, &temp_root, true, false, &mut stats).unwrap();
+        apply_file_metadata(&files, &temp_root, true, false, 4, &mut stats).unwrap();
         assert_eq!(
             OPEN_WRITABLE_CALLS.with(|c| c.get()),
             2,
@@ -1553,12 +1623,124 @@ mod tests {
 
         let files = [planned("f.txt", 4)];
         let mut stats = RestoreStats::default();
-        let err = apply_file_metadata(&files, &temp_root, false, false, &mut stats).unwrap_err();
+        let err = apply_file_metadata(&files, &temp_root, false, false, 4, &mut stats).unwrap_err();
         assert!(err.to_string().contains("for fsync"), "got: {err}");
         // Open attempted exactly once.
         assert_eq!(OPEN_WRITABLE_CALLS.with(|c| c.get()), 1);
         // No staging chmod occurred (mode unchanged).
         let mode = std::fs::metadata(&fpath).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o642);
+    }
+
+    // -----------------------------------------------------------------------
+    // Parallel finalize (multi-file, multi-worker). Injected faults don't
+    // reach worker threads (thread-local), so these tests use *real* failures.
+    // -----------------------------------------------------------------------
+
+    /// A worker hitting a hard error (here: a planned file missing on disk, so
+    /// the finalize open fails) aborts the whole pass with first-error-wins,
+    /// and the phase-level cleanup sweeps the temp tree.
+    #[test]
+    fn apply_file_metadata_parallel_missing_file_is_hard_error() {
+        let dest = tempdir().unwrap();
+        let dest_root = dest.path();
+        let temp_root = dest_root.join(temp_name());
+        std::fs::create_dir_all(&temp_root).unwrap();
+        let mut files: Vec<PlannedFile> = (0..8)
+            .map(|i| {
+                let rel = format!("f{i}.txt");
+                std::fs::write(temp_root.join(&rel), b"data").unwrap();
+                planned(&rel, 4)
+            })
+            .collect();
+        // Planned but never written — its finalize open fails NotFound.
+        files.push(planned("missing.txt", 4));
+
+        let err = finalize_phase(&files, &temp_root, dest_root).unwrap_err();
+        assert!(err.to_string().contains("for fsync"), "got: {err}");
+        // dest is empty (temp swept by cleanup).
+        assert_eq!(std::fs::read_dir(dest_root).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn apply_file_metadata_parallel_success_finalizes_all() {
+        let dest = tempdir().unwrap();
+        let temp_root = dest.path().join(temp_name());
+        std::fs::create_dir_all(&temp_root).unwrap();
+
+        let files: Vec<PlannedFile> = (0..32)
+            .map(|i| {
+                let rel = format!("f{i}.txt");
+                std::fs::write(temp_root.join(&rel), b"data").unwrap();
+                let mut pf = planned(&rel, 4);
+                // A distinct whole-second mtime per file: proves each index was
+                // claimed and finalized exactly once (a skipped file keeps its
+                // write-time mtime, which cannot match).
+                pf.mtime = (1_600_000_000 + i as i64) * 1_000_000_000;
+                pf.mode = 0o640;
+                pf
+            })
+            .collect();
+
+        let mut stats = RestoreStats::default();
+        apply_file_metadata(&files, &temp_root, false, false, 4, &mut stats).unwrap();
+
+        for (i, pf) in files.iter().enumerate() {
+            let meta = std::fs::metadata(temp_root.join(&pf.rel_path)).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                assert_eq!(meta.mode() & 0o777, 0o640, "{}", pf.rel_path.display());
+                assert_eq!(
+                    meta.mtime(),
+                    1_600_000_000 + i as i64,
+                    "{}",
+                    pf.rel_path.display()
+                );
+            }
+            #[cfg(not(unix))]
+            let _ = (i, meta);
+        }
+        assert!(stats.warnings.is_empty(), "{:?}", stats.warnings);
+    }
+
+    /// Warnings recorded on worker threads share ONE global budget through the
+    /// `WarningSink`: every file yields exactly one chown warning (unprivileged
+    /// fchown fails), the retained vec caps at `MAX_RESTORE_WARNINGS`, and the
+    /// remainder is counted as suppressed — never `cap × workers`.
+    #[cfg(unix)]
+    #[test]
+    fn apply_file_metadata_parallel_warnings_share_global_budget() {
+        // chown as the deterministic warning source only fails unprivileged.
+        if fs::is_effective_root() {
+            return;
+        }
+
+        let dest = tempdir().unwrap();
+        let temp_root = dest.path().join(temp_name());
+        std::fs::create_dir_all(&temp_root).unwrap();
+
+        let cap = super::super::MAX_RESTORE_WARNINGS;
+        let n = cap + 16;
+        let files: Vec<PlannedFile> = (0..n)
+            .map(|i| {
+                let rel = format!("f{i}.txt");
+                std::fs::write(temp_root.join(&rel), b"data").unwrap();
+                let mut pf = planned(&rel, 4);
+                pf.uid = 4242; // fchown → EPERM → one warning per file
+                pf.gid = 4242;
+                pf
+            })
+            .collect();
+
+        let mut stats = RestoreStats::default();
+        // restore_as_root = true exercises the chown branch unprivileged.
+        apply_file_metadata(&files, &temp_root, false, true, 4, &mut stats).unwrap();
+
+        assert_eq!(stats.warnings.len(), cap);
+        assert_eq!(
+            stats.warnings.len() as u64 + stats.warnings_suppressed,
+            n as u64
+        );
     }
 }

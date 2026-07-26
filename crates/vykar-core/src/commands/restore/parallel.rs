@@ -21,7 +21,7 @@ use vykar_types::pack_id::PackId;
 
 use super::plan::PlannedFile;
 use super::read_groups::ReadGroup;
-use super::{MAX_OPEN_FILES_PER_GROUP, MAX_WRITE_BATCH};
+use super::{join_workers, MAX_OPEN_FILES_PER_GROUP, MAX_WRITE_BATCH};
 
 // ---------------------------------------------------------------------------
 // Write accumulator
@@ -232,29 +232,8 @@ pub(super) fn execute_parallel_restore(
             }));
         }
 
-        let mut first_error: Option<VykarError> = None;
-        for handle in handles {
-            match handle.join() {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    cancelled.store(true, Ordering::Release);
-                    if first_error.is_none() {
-                        first_error = Some(e);
-                    }
-                }
-                Err(_panic) => {
-                    cancelled.store(true, Ordering::Release);
-                    if first_error.is_none() {
-                        first_error = Some(VykarError::Other("restore worker panicked".into()));
-                    }
-                }
-            }
-        }
-
-        match first_error {
-            Some(e) => Err(e),
-            None => Ok(bytes_written.load(Ordering::Relaxed)),
-        }
+        join_workers(handles, &cancelled, "restore worker panicked")?;
+        Ok(bytes_written.load(Ordering::Relaxed))
     })
 }
 

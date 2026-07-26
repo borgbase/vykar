@@ -21,7 +21,35 @@ use vykar_types::pack_id::PackId;
 
 use super::plan::PlannedFile;
 use super::read_groups::ReadGroup;
-use super::{join_workers, MAX_OPEN_FILES_PER_GROUP, MAX_WRITE_BATCH};
+use super::{MAX_OPEN_FILES_PER_GROUP, MAX_WRITE_BATCH};
+
+/// Join every scoped worker of a fail-fast pass, returning the first error
+/// observed (a worker `Err`, or a panic reported as `panic_msg`) and `Ok(())`
+/// only if all of them succeeded. Any error also raises `cancelled`, so
+/// workers still joining stop claiming work instead of finishing a pass whose
+/// result is already discarded.
+fn join_workers(
+    handles: Vec<std::thread::ScopedJoinHandle<'_, Result<()>>>,
+    cancelled: &AtomicBool,
+    panic_msg: &str,
+) -> Result<()> {
+    let mut first_error: Option<VykarError> = None;
+    for handle in handles {
+        let err = match handle.join() {
+            Ok(Ok(())) => continue,
+            Ok(Err(e)) => e,
+            Err(_panic) => VykarError::Other(panic_msg.to_string()),
+        };
+        cancelled.store(true, Ordering::Release);
+        if first_error.is_none() {
+            first_error = Some(err);
+        }
+    }
+    match first_error {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Write accumulator

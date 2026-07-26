@@ -26,6 +26,14 @@ use tracing::info;
 use crate::config::{parse_size, ServerSection};
 use crate::state::AppState;
 
+// musl's built-in allocator has a single global lock, which serialises the
+// request handler threads. mimalloc removes that bottleneck on the static
+// Linux builds that back the published images; every other target keeps the
+// system allocator.
+#[cfg(target_env = "musl")]
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[derive(Parser)]
 #[command(name = "vykar-server", version, about = "vykar backup server")]
 struct Cli {

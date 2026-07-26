@@ -59,6 +59,9 @@ tokio = { version = "1", default-features = false }
 # Filesystem
 dunce = "1"
 
+# Allocator (musl only — its default allocator serialises multithreaded work)
+mimalloc = { version = "0.1", default-features = false }
+
 # Testing
 tempfile = "3"
 proptest = "1"

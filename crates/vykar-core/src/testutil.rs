@@ -2,6 +2,7 @@
 #![allow(unsafe_code)]
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::sync::Once;
 
@@ -131,32 +132,53 @@ pub fn test_chunk_id_key() -> [u8; 32] {
     [0xAA; 32]
 }
 
-/// Shared handle to inspect which keys were written via `put()`.
+/// Shared handle to inspect backend traffic: the keys written via `put()` and
+/// the number of `get_range()` calls.
 #[derive(Clone)]
-pub struct PutLog(std::sync::Arc<Mutex<Vec<String>>>);
+pub struct PutLog {
+    puts: std::sync::Arc<Mutex<Vec<String>>>,
+    get_ranges: std::sync::Arc<AtomicU64>,
+}
 
 impl PutLog {
     fn new() -> Self {
-        Self(std::sync::Arc::new(Mutex::new(Vec::new())))
+        Self {
+            puts: std::sync::Arc::new(Mutex::new(Vec::new())),
+            get_ranges: std::sync::Arc::new(AtomicU64::new(0)),
+        }
     }
 
     /// Return all keys that were written via `put()` since the last `clear()`.
     pub fn entries(&self) -> Vec<String> {
-        self.0.lock().unwrap().clone()
+        self.puts.lock().unwrap().clone()
     }
 
-    /// Clear the recorded log.
+    /// Clear the recorded put log. Leaves the `get_range()` counter alone.
     pub fn clear(&self) {
-        self.0.lock().unwrap().clear();
+        self.puts.lock().unwrap().clear();
+    }
+
+    /// Number of `get_range()` calls since the last `reset_get_range_count()`.
+    pub fn get_range_count(&self) -> u64 {
+        self.get_ranges.load(Ordering::Relaxed)
+    }
+
+    /// Reset the `get_range()` counter to zero.
+    pub fn reset_get_range_count(&self) {
+        self.get_ranges.store(0, Ordering::Relaxed);
     }
 
     fn record(&self, key: &str) {
-        self.0.lock().unwrap().push(key.to_string());
+        self.puts.lock().unwrap().push(key.to_string());
+    }
+
+    fn record_get_range(&self) {
+        self.get_ranges.fetch_add(1, Ordering::Relaxed);
     }
 }
 
-/// Storage wrapper that records which keys were passed to `put()`.
-/// Delegates all operations to an inner `MemoryBackend`.
+/// Storage wrapper that records which keys were passed to `put()` and counts
+/// `get_range()` calls. Delegates all operations to an inner `MemoryBackend`.
 /// Use `RecordingBackend::new()` to get the backend and a shared `PutLog`.
 pub struct RecordingBackend {
     inner: MemoryBackend,
@@ -194,6 +216,7 @@ impl StorageBackend for RecordingBackend {
         self.inner.list(prefix)
     }
     fn get_range(&self, key: &str, offset: u64, length: u64) -> Result<Option<Vec<u8>>> {
+        self.log.record_get_range();
         self.inner.get_range(key, offset, length)
     }
     fn create_dir(&self, key: &str) -> Result<()> {

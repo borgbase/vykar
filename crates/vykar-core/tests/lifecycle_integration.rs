@@ -1,136 +1,19 @@
 #![allow(clippy::unwrap_used)]
 #![allow(clippy::pedantic)]
-// Test-only env mutation; SAFETY per block.
-#![allow(unsafe_code)]
 
-use std::path::Path;
-use std::sync::Once;
+mod common;
+
 use std::time::Duration;
 
 use vykar_core::commands;
 use vykar_core::compress::Compression;
-use vykar_core::config::{
-    CheckConfig, ChunkerConfig, CommandDump, CompactConfig, CompressionConfig, EncryptionConfig,
-    EncryptionModeConfig, RepositoryConfig, ResourceLimitsConfig, RetentionConfig, RetryConfig,
-    ScheduleConfig, SourceEntry, SourceHooksConfig, VykarConfig, XattrsConfig,
-};
+use vykar_core::config::{ChunkerConfig, CommandDump, EncryptionModeConfig, RetentionConfig};
 use vykar_core::repo::lock;
 use vykar_core::repo::{EncryptionMode, OpenOptions, Repository};
 use vykar_storage::local_backend::LocalBackend;
 use vykar_types::error::VykarError;
 
-static TEST_ENV_INIT: Once = Once::new();
-
-fn init_test_environment() {
-    TEST_ENV_INIT.call_once(|| {
-        let base = std::env::temp_dir().join(format!("vykar-tests-{}", std::process::id()));
-        let home = base.join("home");
-        let cache = base.join("cache");
-        let _ = std::fs::create_dir_all(&home);
-        let _ = std::fs::create_dir_all(&cache);
-        // SAFETY: Once::call_once runs this single-threaded at test-process
-        // startup before any threads are spawned.
-        unsafe {
-            std::env::set_var("HOME", &home);
-            std::env::set_var("XDG_CACHE_HOME", &cache);
-        }
-    });
-}
-
-fn make_test_config(repo_dir: &Path) -> VykarConfig {
-    init_test_environment();
-
-    VykarConfig {
-        repository: RepositoryConfig {
-            url: repo_dir.to_string_lossy().to_string(),
-            region: None,
-            access_key_id: None,
-            secret_access_key: None,
-            sftp_key: None,
-            sftp_known_hosts: None,
-            sftp_timeout: None,
-            access_token: None,
-            allow_insecure_http: false,
-            min_pack_size: 32 * 1024 * 1024,
-            max_pack_size: 512 * 1024 * 1024,
-            retry: RetryConfig::default(),
-            s3_soft_delete: false,
-        },
-        encryption: EncryptionConfig {
-            mode: EncryptionModeConfig::None,
-            passphrase: None,
-            passcommand: None,
-        },
-        exclude_patterns: Vec::new(),
-        exclude_if_present: Vec::new(),
-        one_file_system: true,
-        git_ignore: false,
-        chunker: ChunkerConfig::default(),
-        compression: CompressionConfig::default(),
-        retention: RetentionConfig::default(),
-        xattrs: XattrsConfig::default(),
-        schedule: ScheduleConfig::default(),
-        limits: ResourceLimitsConfig::default(),
-        compact: CompactConfig::default(),
-        check: CheckConfig::default(),
-        cache_dir: None,
-        trust_repo: false,
-        hostname_override: None,
-    }
-}
-
-fn source_entry(path: &Path, label: &str) -> SourceEntry {
-    SourceEntry {
-        paths: vec![path.to_string_lossy().to_string()],
-        label: label.to_string(),
-        exclude: Vec::new(),
-        exclude_if_present: Vec::new(),
-        one_file_system: true,
-        git_ignore: false,
-        xattrs_enabled: false,
-        hooks: SourceHooksConfig::default(),
-        retention: None,
-        repos: Vec::new(),
-        command_dumps: Vec::new(),
-    }
-}
-
-fn open_local_repo(repo_dir: &Path, passphrase: Option<&str>) -> Repository {
-    let storage = Box::new(LocalBackend::new(repo_dir.to_str().unwrap()).unwrap());
-    Repository::open(storage, passphrase, None, OpenOptions::new().with_index()).unwrap()
-}
-
-fn backup_source(
-    config: &VykarConfig,
-    source_dir: &Path,
-    source_label: &str,
-    snapshot_name: &str,
-    passphrase: Option<&str>,
-) -> vykar_core::snapshot::SnapshotStats {
-    let source_paths = vec![source_dir.to_string_lossy().to_string()];
-    let exclude_if_present: Vec<String> = Vec::new();
-    let exclude_patterns: Vec<String> = Vec::new();
-
-    commands::backup::run(
-        config,
-        commands::backup::BackupRequest {
-            snapshot_name,
-            passphrase,
-            source_paths: &source_paths,
-            source_label,
-            exclude_patterns: &exclude_patterns,
-            exclude_if_present: &exclude_if_present,
-            one_file_system: true,
-            git_ignore: false,
-            xattrs_enabled: config.xattrs.enabled,
-            compression: Compression::None,
-            command_dumps: &[],
-            verbose: false,
-        },
-    )
-    .unwrap()
-    .stats
-}
+use crate::common::{backup_source, make_test_config, open_local_repo, source_entry};
 
 #[test]
 fn lifecycle_delete_compact_check_and_restore() {
@@ -152,11 +35,25 @@ fn lifecycle_delete_compact_check_and_restore() {
     std::fs::write(source_dir.join("data.bin"), &payload_v1).unwrap();
 
     commands::init::run(&config, None).unwrap();
-    backup_source(&config, &source_dir, "src-a", "snap-v1", None);
+    backup_source(
+        &config,
+        &source_dir,
+        "src-a",
+        "snap-v1",
+        None,
+        config.xattrs.enabled,
+    );
 
     std::fs::write(source_dir.join("data.bin"), &payload_v2).unwrap();
     std::fs::write(source_dir.join("new.txt"), b"new file").unwrap();
-    backup_source(&config, &source_dir, "src-a", "snap-v2", None);
+    backup_source(
+        &config,
+        &source_dir,
+        "src-a",
+        "snap-v2",
+        None,
+        config.xattrs.enabled,
+    );
 
     let delete_result = commands::delete::run(&config, None, &["snap-v1"], false, None).unwrap();
     assert!(delete_result.warnings.is_empty());
@@ -227,12 +124,33 @@ fn prune_compact_check_and_restore_kept_snapshots() {
     };
 
     commands::init::run(&config, None).unwrap();
-    backup_source(&config, &source_a, "src-a", "snap-a1", None);
+    backup_source(
+        &config,
+        &source_a,
+        "src-a",
+        "snap-a1",
+        None,
+        config.xattrs.enabled,
+    );
     std::thread::sleep(Duration::from_millis(2));
-    backup_source(&config, &source_b, "src-b", "snap-b1", None);
+    backup_source(
+        &config,
+        &source_b,
+        "src-b",
+        "snap-b1",
+        None,
+        config.xattrs.enabled,
+    );
     std::thread::sleep(Duration::from_millis(2));
     std::fs::write(source_a.join("a.txt"), b"alpha-v2").unwrap();
-    backup_source(&config, &source_a, "src-a", "snap-a2", None);
+    backup_source(
+        &config,
+        &source_a,
+        "src-a",
+        "snap-a2",
+        None,
+        config.xattrs.enabled,
+    );
 
     let sources = vec![
         source_entry(&source_a, "src-a"),
@@ -328,6 +246,7 @@ fn run_encrypted_lifecycle(mode: EncryptionModeConfig, expected_mode: Encryption
         "encrypted-src",
         "snap-secret",
         Some(passphrase),
+        config.xattrs.enabled,
     );
 
     let check = commands::check::run(&config, Some(passphrase), true, false).unwrap();
@@ -392,7 +311,14 @@ fn command_dump_failure_does_not_mutate_repository_state() {
 
     let config = make_test_config(&repo_dir);
     commands::init::run(&config, None).unwrap();
-    backup_source(&config, &source_dir, "src-a", "snap-baseline", None);
+    backup_source(
+        &config,
+        &source_dir,
+        "src-a",
+        "snap-baseline",
+        None,
+        config.xattrs.enabled,
+    );
 
     let before = open_local_repo(&repo_dir, None);
     let snapshots_before = before.manifest().snapshots.len();
@@ -473,7 +399,14 @@ fn backup_fails_when_repository_lock_is_held_by_another_process() {
     lock::release_lock(&storage, guard).unwrap();
     assert!(matches!(blocked, Err(VykarError::Locked(_))));
 
-    backup_source(&config, &source_dir, "src-a", "snap-after-lock", None);
+    backup_source(
+        &config,
+        &source_dir,
+        "src-a",
+        "snap-after-lock",
+        None,
+        config.xattrs.enabled,
+    );
     let repo = open_local_repo(&repo_dir, None);
     assert!(repo.manifest().find_snapshot("snap-after-lock").is_some());
 }
@@ -493,7 +426,14 @@ fn restore_loads_items_via_restore_cache_without_index() {
     let config = make_test_config(&repo_dir);
     commands::init::run(&config, None).unwrap();
     std::fs::write(source_dir.join("file.txt"), b"hello").unwrap();
-    backup_source(&config, &source_dir, "src", "snap1", None);
+    backup_source(
+        &config,
+        &source_dir,
+        "src",
+        "snap1",
+        None,
+        config.xattrs.enabled,
+    );
 
     // Open repo WITHOUT loading the chunk index
     let storage = Box::new(LocalBackend::new(repo_dir.to_str().unwrap()).unwrap());
@@ -530,7 +470,14 @@ fn restore_falls_back_to_index_on_cache_miss() {
     let config = make_test_config(&repo_dir);
     commands::init::run(&config, None).unwrap();
     std::fs::write(source_dir.join("file.txt"), b"hello").unwrap();
-    backup_source(&config, &source_dir, "src", "snap1", None);
+    backup_source(
+        &config,
+        &source_dir,
+        "src",
+        "snap1",
+        None,
+        config.xattrs.enabled,
+    );
 
     // Read repo_id and index_generation
     let repo = open_local_repo(&repo_dir, None);
@@ -582,7 +529,14 @@ fn restore_works_without_restore_cache() {
     let config = make_test_config(&repo_dir);
     commands::init::run(&config, None).unwrap();
     std::fs::write(source_dir.join("file.txt"), b"hello").unwrap();
-    backup_source(&config, &source_dir, "src", "snap1", None);
+    backup_source(
+        &config,
+        &source_dir,
+        "src",
+        "snap1",
+        None,
+        config.xattrs.enabled,
+    );
 
     // Delete the restore cache file
     let repo = open_local_repo(&repo_dir, None);
@@ -645,7 +599,14 @@ fn file_cache_survives_label_rename() {
     commands::init::run(&config, None).unwrap();
 
     // First backup with "old-label".
-    backup_source(&config, &source_dir, "old-label", "snap-old", None);
+    backup_source(
+        &config,
+        &source_dir,
+        "old-label",
+        "snap-old",
+        None,
+        config.xattrs.enabled,
+    );
 
     // Second backup with "new-label", same paths, same files.
     let source_paths = vec![source_dir.to_string_lossy().to_string()];
@@ -719,7 +680,14 @@ fn parent_fallback_survives_label_rename() {
     commands::init::run(&config, None).unwrap();
 
     // First backup with "old-label".
-    backup_source(&config, &source_dir, "old-label", "snap-old", None);
+    backup_source(
+        &config,
+        &source_dir,
+        "old-label",
+        "snap-old",
+        None,
+        config.xattrs.enabled,
+    );
 
     // Delete the local file cache to force a cold start (parent fallback path).
     {
@@ -798,7 +766,14 @@ fn command_dump_only_backup_does_not_load_or_mutate_file_cache() {
 
     // Step 1: filesystem backup to populate the file cache on disk.
     std::fs::write(source_dir.join("data.txt"), b"hello world").unwrap();
-    backup_source(&config, &source_dir, "src-a", "snap-fs", None);
+    backup_source(
+        &config,
+        &source_dir,
+        "src-a",
+        "snap-fs",
+        None,
+        config.xattrs.enabled,
+    );
 
     // Step 2: locate the filecache file and snapshot its contents + mtime.
     let repo = open_local_repo(&repo_dir, None);

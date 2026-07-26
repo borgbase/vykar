@@ -1,38 +1,22 @@
 #![allow(clippy::unwrap_used)]
 #![allow(clippy::pedantic)]
 #![allow(clippy::panic, clippy::indexing_slicing)]
-// Test-only env mutation; SAFETY per block.
+// `set_mtime_secs` calls `utimensat`; SAFETY per block.
 #![allow(unsafe_code)]
+
+mod common;
 
 use vykar_core::commands;
 use vykar_core::compress::Compression;
-use vykar_core::config::{
-    CheckConfig, ChunkerConfig, CompactConfig, CompressionConfig, EncryptionConfig,
-    EncryptionModeConfig, RepositoryConfig, ResourceLimitsConfig, RetentionConfig, RetryConfig,
-    ScheduleConfig, VykarConfig, XattrsConfig,
-};
+use vykar_core::config::{ChunkerConfig, EncryptionModeConfig, VykarConfig};
 use vykar_core::repo::pack::PackType;
 use vykar_core::repo::{EncryptionMode, OpenOptions, Repository};
 use vykar_core::snapshot::item::ItemType;
 use vykar_storage::local_backend::LocalBackend;
 
-static TEST_ENV_INIT: std::sync::Once = std::sync::Once::new();
-
-fn init_test_environment() {
-    TEST_ENV_INIT.call_once(|| {
-        let base = std::env::temp_dir().join(format!("vykar-tests-{}", std::process::id()));
-        let home = base.join("home");
-        let cache = base.join("cache");
-        let _ = std::fs::create_dir_all(&home);
-        let _ = std::fs::create_dir_all(&cache);
-        // SAFETY: Once::call_once runs this single-threaded at test-process
-        // startup before any threads are spawned.
-        unsafe {
-            std::env::set_var("HOME", &home);
-            std::env::set_var("XDG_CACHE_HOME", &cache);
-        }
-    });
-}
+use crate::common::{
+    backup_source, init_test_environment, make_test_config, open_local_repo_cached,
+};
 
 fn init_local_repo(dir: &std::path::Path) -> Repository {
     init_test_environment();
@@ -48,59 +32,6 @@ fn init_local_repo(dir: &std::path::Path) -> Repository {
     .unwrap();
     repo.begin_write_session().unwrap();
     repo
-}
-
-fn open_local_repo(dir: &std::path::Path) -> Repository {
-    init_test_environment();
-    let storage = Box::new(LocalBackend::new(dir.to_str().unwrap()).unwrap());
-    Repository::open(
-        storage,
-        None,
-        None,
-        OpenOptions::new().with_index().with_file_cache(),
-    )
-    .unwrap()
-}
-
-fn make_test_config(repo_dir: &std::path::Path) -> VykarConfig {
-    init_test_environment();
-    VykarConfig {
-        repository: RepositoryConfig {
-            url: repo_dir.to_string_lossy().to_string(),
-            region: None,
-            access_key_id: None,
-            secret_access_key: None,
-            sftp_key: None,
-            sftp_known_hosts: None,
-            sftp_timeout: None,
-            access_token: None,
-            allow_insecure_http: false,
-            min_pack_size: 32 * 1024 * 1024,
-            max_pack_size: 512 * 1024 * 1024,
-            retry: RetryConfig::default(),
-            s3_soft_delete: false,
-        },
-        encryption: EncryptionConfig {
-            mode: EncryptionModeConfig::None,
-            passphrase: None,
-            passcommand: None,
-        },
-        exclude_patterns: Vec::new(),
-        exclude_if_present: Vec::new(),
-        one_file_system: true,
-        git_ignore: false,
-        chunker: ChunkerConfig::default(),
-        compression: CompressionConfig::default(),
-        retention: RetentionConfig::default(),
-        xattrs: XattrsConfig::default(),
-        schedule: ScheduleConfig::default(),
-        limits: ResourceLimitsConfig::default(),
-        compact: CompactConfig::default(),
-        check: CheckConfig::default(),
-        cache_dir: None,
-        trust_repo: false,
-        hostname_override: None,
-    }
 }
 
 #[cfg(unix)]
@@ -171,37 +102,6 @@ fn set_mtime_secs(path: &std::path::Path, secs: i64, nofollow: bool) {
     assert_eq!(ret, 0, "utimensat failed for {}", path.display());
 }
 
-/// Back up `source_dir` under `snapshot_name` with the standard test request.
-#[cfg(unix)]
-fn backup_source(
-    config: &VykarConfig,
-    snapshot_name: &str,
-    source_dir: &std::path::Path,
-    xattrs_enabled: bool,
-) {
-    let source_paths = vec![source_dir.to_string_lossy().to_string()];
-    let exclude_if_present: Vec<String> = Vec::new();
-    let exclude_patterns: Vec<String> = Vec::new();
-    commands::backup::run(
-        config,
-        commands::backup::BackupRequest {
-            snapshot_name,
-            passphrase: None,
-            source_paths: &source_paths,
-            source_label: "source",
-            exclude_patterns: &exclude_patterns,
-            exclude_if_present: &exclude_if_present,
-            one_file_system: true,
-            git_ignore: false,
-            xattrs_enabled,
-            compression: Compression::None,
-            command_dumps: &[],
-            verbose: false,
-        },
-    )
-    .unwrap();
-}
-
 #[test]
 fn init_store_reopen_read() {
     let tmp = tempfile::tempdir().unwrap();
@@ -223,7 +123,7 @@ fn init_store_reopen_read() {
     };
 
     // Reopen and verify
-    let mut repo = open_local_repo(dir);
+    let mut repo = open_local_repo_cached(dir, None);
     assert_eq!(repo.chunk_index().len(), 2);
     let read1 = repo.read_chunk(&id1).unwrap();
     let read2 = repo.read_chunk(&id2).unwrap();
@@ -267,7 +167,7 @@ fn snapshot_list_survives_reopen() {
     .unwrap();
 
     // Reopen and check snapshot list
-    let repo = open_local_repo(&repo_dir);
+    let repo = open_local_repo_cached(&repo_dir, None);
     assert_eq!(repo.manifest().snapshots.len(), 1);
     assert_eq!(repo.manifest().snapshots[0].name, "test-snapshot");
 }
@@ -452,7 +352,7 @@ fn backup_deduplicates_identical_files_and_extracts_correctly() {
     assert!(stats.deduplicated_size > 0);
     assert!(stats.deduplicated_size < stats.compressed_size);
 
-    let mut repo = open_local_repo(&repo_dir);
+    let mut repo = open_local_repo_cached(&repo_dir, None);
     let items = commands::list::load_snapshot_items(&mut repo, "snap-dedup").unwrap();
     let file_items: Vec<_> = items
         .iter()
@@ -656,7 +556,7 @@ fn backup_warns_but_does_not_fail_on_unsupported_special_file() {
         );
 
         // The regular file alongside the socket must still have been backed up.
-        let mut repo = open_local_repo(&repo_dir);
+        let mut repo = open_local_repo_cached(&repo_dir, None);
         let items = commands::list::load_snapshot_items(&mut repo, snapshot_name).unwrap();
         assert!(
             items.iter().any(|i| i.path.ends_with("regular.txt")),
@@ -716,7 +616,7 @@ fn backup_and_restore_preserves_file_xattrs_when_enabled() {
     )
     .unwrap();
 
-    let mut repo = open_local_repo(&repo_dir);
+    let mut repo = open_local_repo_cached(&repo_dir, None);
     let items = commands::list::load_snapshot_items(&mut repo, "snap-xattrs").unwrap();
     let item = items.iter().find(|i| i.path == "file.txt").unwrap();
     let stored = item
@@ -788,7 +688,7 @@ fn backup_skips_xattrs_when_disabled() {
     )
     .unwrap();
 
-    let mut repo = open_local_repo(&repo_dir);
+    let mut repo = open_local_repo_cached(&repo_dir, None);
     let items = commands::list::load_snapshot_items(&mut repo, "snap-no-xattrs").unwrap();
     let item = items.iter().find(|i| i.path == "file.txt").unwrap();
     assert!(item.xattrs.is_none());
@@ -851,7 +751,7 @@ fn backup_and_restore_preserves_hard_links() {
     backup_sources(&config, "snap-hl", &sources);
 
     // Both items carry the same hardlink key.
-    let mut repo = open_local_repo(&repo_dir);
+    let mut repo = open_local_repo_cached(&repo_dir, None);
     let items = commands::list::load_snapshot_items(&mut repo, "snap-hl").unwrap();
     let a_item = items.iter().find(|i| i.path == "a.txt").unwrap();
     let b_item = items.iter().find(|i| i.path == "b.txt").unwrap();
@@ -953,7 +853,7 @@ fn restore_single_in_set_hardlink_is_standalone_file() {
     backup_sources(&config, "snap-hl-single", &sources);
 
     // The item records hardlink (nlink > 1) but is the only member in the set.
-    let mut repo = open_local_repo(&repo_dir);
+    let mut repo = open_local_repo_cached(&repo_dir, None);
     let items = commands::list::load_snapshot_items(&mut repo, "snap-hl-single").unwrap();
     let item = items.iter().find(|i| i.path == "in_set.txt").unwrap();
     assert!(item.hardlink.is_some());
@@ -1059,7 +959,7 @@ fn second_backup_cache_hit_preserves_hard_link() {
     // Second backup of the unchanged tree: file bodies hit the local cache.
     backup_sources(&config, "snap-hl-2", &sources);
 
-    let mut repo = open_local_repo(&repo_dir);
+    let mut repo = open_local_repo_cached(&repo_dir, None);
     let items = commands::list::load_snapshot_items(&mut repo, "snap-hl-2").unwrap();
     let a_item = items.iter().find(|i| i.path == "a.txt").unwrap();
     let b_item = items.iter().find(|i| i.path == "b.txt").unwrap();
@@ -1136,7 +1036,7 @@ fn backup_and_restore_preserves_directory_mtime() {
 
     let config = make_test_config(&repo_dir);
     commands::init::run(&config, None).unwrap();
-    backup_source(&config, "snap-dirmtime", &source_dir, false);
+    backup_source(&config, &source_dir, "source", "snap-dirmtime", None, false);
 
     let restore_dir = tmp.path().join("restore");
     commands::restore::run(
@@ -1176,7 +1076,7 @@ fn backup_and_restore_preserves_symlink_mtime() {
 
     let config = make_test_config(&repo_dir);
     commands::init::run(&config, None).unwrap();
-    backup_source(&config, "snap-symmtime", &source_dir, false);
+    backup_source(&config, &source_dir, "source", "snap-symmtime", None, false);
 
     let restore_dir = tmp.path().join("restore");
     commands::restore::run(
@@ -1222,7 +1122,7 @@ fn backup_and_restore_preserves_symlink_xattrs() {
 
     let config = make_test_config(&repo_dir);
     commands::init::run(&config, None).unwrap();
-    backup_source(&config, "snap-symxattr", &source_dir, true);
+    backup_source(&config, &source_dir, "source", "snap-symxattr", None, true);
 
     let restore_dir = tmp.path().join("restore");
     commands::restore::run(
@@ -1272,7 +1172,7 @@ fn restore_populates_readonly_directory() {
 
     let config = make_test_config(&repo_dir);
     commands::init::run(&config, None).unwrap();
-    backup_source(&config, "snap-rodir", &source_dir, false);
+    backup_source(&config, &source_dir, "source", "snap-rodir", None, false);
 
     let restore_dir = tmp.path().join("restore");
     commands::restore::run(
@@ -1322,7 +1222,14 @@ fn restore_readonly_file_keeps_xattr_and_mode() {
 
     let config = make_test_config(&repo_dir);
     commands::init::run(&config, None).unwrap();
-    backup_source(&config, "snap-rofile-xattr", &source_dir, true);
+    backup_source(
+        &config,
+        &source_dir,
+        "source",
+        "snap-rofile-xattr",
+        None,
+        true,
+    );
 
     let restore_dir = tmp.path().join("restore");
     commands::restore::run(
@@ -1371,7 +1278,14 @@ fn restore_readonly_dir_keeps_xattr_and_mode() {
 
     let config = make_test_config(&repo_dir);
     commands::init::run(&config, None).unwrap();
-    backup_source(&config, "snap-rodir-xattr", &source_dir, true);
+    backup_source(
+        &config,
+        &source_dir,
+        "source",
+        "snap-rodir-xattr",
+        None,
+        true,
+    );
 
     let restore_dir = tmp.path().join("restore");
     commands::restore::run(
@@ -1448,7 +1362,7 @@ fn file_cache_persists_and_matches_snapshot_items() {
 
     // Verify file cache was persisted and its chunk_refs match the snapshot.
     {
-        let mut repo = open_local_repo(&repo_dir);
+        let mut repo = open_local_repo_cached(&repo_dir, None);
         let items = commands::list::load_snapshot_items(&mut repo, "snap-1").unwrap();
         let files: Vec<_> = items
             .iter()
@@ -1512,7 +1426,7 @@ fn file_cache_persists_and_matches_snapshot_items() {
     )
     .unwrap();
 
-    let mut repo = open_local_repo(&repo_dir);
+    let mut repo = open_local_repo_cached(&repo_dir, None);
     let items1 = commands::list::load_snapshot_items(&mut repo, "snap-1").unwrap();
     let items2 = commands::list::load_snapshot_items(&mut repo, "snap-2").unwrap();
     let files1: Vec<_> = items1
@@ -1589,7 +1503,7 @@ fn file_cache_misses_on_modified_file() {
 
     // Collect chunk IDs from the first snapshot.
     let snap1_chunks: std::collections::HashMap<String, Vec<_>> = {
-        let mut repo = open_local_repo(&repo_dir);
+        let mut repo = open_local_repo_cached(&repo_dir, None);
         let items = commands::list::load_snapshot_items(&mut repo, "snap-1").unwrap();
         items
             .iter()
@@ -1622,7 +1536,7 @@ fn file_cache_misses_on_modified_file() {
     )
     .unwrap();
 
-    let mut repo = open_local_repo(&repo_dir);
+    let mut repo = open_local_repo_cached(&repo_dir, None);
     let items2 = commands::list::load_snapshot_items(&mut repo, "snap-2").unwrap();
     let files2: std::collections::HashMap<String, Vec<_>> = items2
         .iter()
@@ -1777,7 +1691,7 @@ fn command_dump_backup_and_restore() {
     assert!(stats.original_size > 0);
 
     // List snapshot contents — verify vykar-dumps/hello.txt appears
-    let mut repo = open_local_repo(repo_dir.path());
+    let mut repo = open_local_repo_cached(repo_dir.path(), None);
     let items = commands::list::load_snapshot_items(&mut repo, "snap-dumps").unwrap();
     let dump_items: Vec<_> = items
         .iter()
@@ -1896,7 +1810,7 @@ fn command_dump_mixed_with_files() {
     // Should have both the real file and the dump
     assert_eq!(stats.nfiles, 2);
 
-    let mut repo = open_local_repo(repo_dir.path());
+    let mut repo = open_local_repo_cached(repo_dir.path(), None);
     let items = commands::list::load_snapshot_items(&mut repo, "snap-mixed").unwrap();
     let has_real = items.iter().any(|i| i.path == "real.txt");
     let has_dump = items.iter().any(|i| i.path == "vykar-dumps/dump.txt");
@@ -1977,7 +1891,7 @@ fn backup_many_small_files_plus_large_file_roundtrip() {
 
     // Verify all items present in the snapshot.
     {
-        let mut repo = open_local_repo(&repo_dir);
+        let mut repo = open_local_repo_cached(&repo_dir, None);
         let items = commands::list::load_snapshot_items(&mut repo, "snap-small-1").unwrap();
         let files: Vec<_> = items
             .iter()
@@ -2055,7 +1969,7 @@ fn backup_many_small_files_plus_large_file_roundtrip() {
 
     // Verify the second snapshot also has correct walk order.
     {
-        let mut repo = open_local_repo(&repo_dir);
+        let mut repo = open_local_repo_cached(&repo_dir, None);
         let items = commands::list::load_snapshot_items(&mut repo, "snap-small-2").unwrap();
         let files: Vec<_> = items
             .iter()
@@ -2238,7 +2152,7 @@ fn backup_pipeline_preserves_walk_order_with_mixed_file_sizes() {
 
     assert_eq!(stats.nfiles, 4);
 
-    let mut repo = open_local_repo(&repo_dir);
+    let mut repo = open_local_repo_cached(&repo_dir, None);
     let items = commands::list::load_snapshot_items(&mut repo, "snap-order").unwrap();
     let mut paths: Vec<_> = items.iter().map(|i| i.path.clone()).collect();
     paths.sort();
@@ -2936,7 +2850,7 @@ fn session_guard_blocks_maintenance() {
         lock::SessionGuard::adopt(std::sync::Arc::clone(&storage), session_id.clone()).unwrap();
 
     // with_maintenance_lock must refuse while the session is active
-    let mut repo2 = open_local_repo(&repo_dir);
+    let mut repo2 = open_local_repo_cached(&repo_dir, None);
     let err = with_maintenance_lock(&mut repo2, |_| Ok(())).unwrap_err();
     match &err {
         vykar_types::error::VykarError::ActiveSessions(list) => {
@@ -2956,7 +2870,7 @@ fn session_guard_blocks_maintenance() {
     drop(guard);
 
     // Maintenance should now succeed
-    let mut repo3 = open_local_repo(&repo_dir);
+    let mut repo3 = open_local_repo_cached(&repo_dir, None);
     with_maintenance_lock(&mut repo3, |_| Ok(())).unwrap();
 }
 
@@ -3000,7 +2914,7 @@ fn maintenance_reaps_session_older_than_45_minutes() {
     assert!(marker_path.exists());
 
     // Maintenance should clean the stale marker and succeed.
-    let mut repo2 = open_local_repo(&repo_dir);
+    let mut repo2 = open_local_repo_cached(&repo_dir, None);
     with_maintenance_lock(&mut repo2, |_| Ok(())).unwrap();
 
     assert!(
@@ -3043,7 +2957,7 @@ fn maintenance_blocks_on_malformed_session_marker() {
 
     // Maintenance must fail-close: we can't prove this marker is stale,
     // so it blocks as an active session with placeholder host/pid.
-    let mut repo2 = open_local_repo(&repo_dir);
+    let mut repo2 = open_local_repo_cached(&repo_dir, None);
     let err = with_maintenance_lock(&mut repo2, |_| Ok(())).unwrap_err();
     match &err {
         vykar_types::error::VykarError::ActiveSessions(list) => {
@@ -3150,7 +3064,7 @@ fn backup_pipeline_and_sequential_parity_symlinks_xattrs() {
     .unwrap();
 
     // Compare item lists — should be identical
-    let mut repo = open_local_repo(&repo_dir);
+    let mut repo = open_local_repo_cached(&repo_dir, None);
     let items_p = commands::list::load_snapshot_items(&mut repo, "snap-pipeline").unwrap();
     let items_s = commands::list::load_snapshot_items(&mut repo, "snap-sequential").unwrap();
 

@@ -1,63 +1,11 @@
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-
 use crate::compress::Compression;
 use crate::repo::pack::PackType;
 use crate::repo::Repository;
-use crate::testutil::{init_test_environment, MemoryBackend};
-use vykar_storage::StorageBackend;
-use vykar_types::error::Result;
+use crate::testutil::{init_test_environment, PutLog, RecordingBackend};
 
-/// Storage wrapper that delegates to `MemoryBackend` and counts `get_range()` calls.
-struct CountingBackend {
-    inner: MemoryBackend,
-    get_range_count: Arc<AtomicU64>,
-}
-
-impl CountingBackend {
-    fn new() -> (Self, Arc<AtomicU64>) {
-        let counter = Arc::new(AtomicU64::new(0));
-        (
-            Self {
-                inner: MemoryBackend::new(),
-                get_range_count: counter.clone(),
-            },
-            counter,
-        )
-    }
-}
-
-impl StorageBackend for CountingBackend {
-    fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
-        self.inner.get(key)
-    }
-    fn put(&self, key: &str, data: &[u8]) -> Result<()> {
-        self.inner.put(key, data)
-    }
-    fn delete(&self, key: &str) -> Result<()> {
-        self.inner.delete(key)
-    }
-    fn exists(&self, key: &str) -> Result<bool> {
-        self.inner.exists(key)
-    }
-    fn list(&self, prefix: &str) -> Result<Vec<String>> {
-        self.inner.list(prefix)
-    }
-    fn get_range(&self, key: &str, offset: u64, length: u64) -> Result<Option<Vec<u8>>> {
-        self.get_range_count.fetch_add(1, Ordering::Relaxed);
-        self.inner.get_range(key, offset, length)
-    }
-    fn create_dir(&self, key: &str) -> Result<()> {
-        self.inner.create_dir(key)
-    }
-    fn put_owned(&self, key: &str, data: Vec<u8>) -> Result<()> {
-        self.inner.put(key, &data)
-    }
-}
-
-fn repo_on_counting_backend() -> (Repository, Arc<AtomicU64>) {
+fn repo_on_counting_backend() -> (Repository, PutLog) {
     init_test_environment();
-    let (backend, counter) = CountingBackend::new();
+    let (backend, log) = RecordingBackend::new();
     let mut repo = Repository::init(
         Box::new(backend),
         crate::repo::EncryptionMode::None,
@@ -68,7 +16,7 @@ fn repo_on_counting_backend() -> (Repository, Arc<AtomicU64>) {
     )
     .expect("init");
     repo.begin_write_session().expect("begin write session");
-    (repo, counter)
+    (repo, log)
 }
 
 /// Store N distinct chunks, flush packs, and return their IDs.
@@ -105,7 +53,7 @@ fn resolve_chunks(
 
 #[test]
 fn adjacent_blobs_coalesce_into_single_read() {
-    let (mut repo, counter) = repo_on_counting_backend();
+    let (mut repo, log) = repo_on_counting_backend();
     let ids = store_chunks(&mut repo, 3);
     let chunks = resolve_chunks(&repo, &ids);
 
@@ -122,17 +70,13 @@ fn adjacent_blobs_coalesce_into_single_read() {
 
     // Clear blob cache so everything must be fetched.
     repo.clear_blob_cache();
-    counter.store(0, Ordering::Relaxed);
+    log.reset_get_range_count();
 
     let mut out = Vec::new();
     repo.read_chunks_coalesced_into(&chunks, &mut out).unwrap();
 
     // Should have been a single coalesced get_range call.
-    assert_eq!(
-        counter.load(Ordering::Relaxed),
-        1,
-        "expected 1 coalesced get_range"
-    );
+    assert_eq!(log.get_range_count(), 1, "expected 1 coalesced get_range");
 
     // Verify output matches reading chunks individually.
     let mut expected = Vec::new();
@@ -144,7 +88,7 @@ fn adjacent_blobs_coalesce_into_single_read() {
 
 #[test]
 fn cache_hits_skip_network() {
-    let (mut repo, counter) = repo_on_counting_backend();
+    let (mut repo, log) = repo_on_counting_backend();
     let ids = store_chunks(&mut repo, 3);
     let chunks = resolve_chunks(&repo, &ids);
 
@@ -153,12 +97,12 @@ fn cache_hits_skip_network() {
         let _ = repo.read_chunk(id).unwrap();
     }
 
-    counter.store(0, Ordering::Relaxed);
+    log.reset_get_range_count();
     let mut out = Vec::new();
     repo.read_chunks_coalesced_into(&chunks, &mut out).unwrap();
 
     assert_eq!(
-        counter.load(Ordering::Relaxed),
+        log.get_range_count(),
         0,
         "expected 0 get_range calls (all cache hits)"
     );
@@ -172,7 +116,7 @@ fn cache_hits_skip_network() {
 
 #[test]
 fn cross_pack_grouping() {
-    let (mut repo, counter) = repo_on_counting_backend();
+    let (mut repo, log) = repo_on_counting_backend();
 
     // Store chunks in separate packs by flushing between each.
     let data_a = b"pack-a-chunk-data-padding-unique-aa";
@@ -197,14 +141,14 @@ fn cross_pack_grouping() {
     );
 
     repo.clear_blob_cache();
-    counter.store(0, Ordering::Relaxed);
+    log.reset_get_range_count();
 
     let mut out = Vec::new();
     repo.read_chunks_coalesced_into(&chunks, &mut out).unwrap();
 
     // One get_range per pack.
     assert_eq!(
-        counter.load(Ordering::Relaxed),
+        log.get_range_count(),
         2,
         "expected 2 get_range calls (one per pack)"
     );
@@ -220,7 +164,7 @@ fn cross_pack_grouping() {
 
 #[test]
 fn output_order_preserved_across_packs() {
-    let (mut repo, _counter) = repo_on_counting_backend();
+    let (mut repo, _log) = repo_on_counting_backend();
 
     // Create chunks in two packs, but request them in interleaved order.
     let (id_a1, _, _) = repo
@@ -267,19 +211,19 @@ fn output_order_preserved_across_packs() {
 
 #[test]
 fn empty_input_is_noop() {
-    let (mut repo, counter) = repo_on_counting_backend();
-    counter.store(0, Ordering::Relaxed);
+    let (mut repo, log) = repo_on_counting_backend();
+    log.reset_get_range_count();
 
     let mut out = Vec::new();
     repo.read_chunks_coalesced_into(&[], &mut out).unwrap();
 
     assert!(out.is_empty());
-    assert_eq!(counter.load(Ordering::Relaxed), 0);
+    assert_eq!(log.get_range_count(), 0);
 }
 
 #[test]
 fn large_gap_splits_into_separate_reads() {
-    let (mut repo, counter) = repo_on_counting_backend();
+    let (mut repo, log) = repo_on_counting_backend();
 
     // Store: small chunk A, large gap chunk (>256 KiB), small chunk B — all in one flush.
     let data_a = b"small-chunk-a-unique-data-xxxxx";
@@ -319,14 +263,14 @@ fn large_gap_splits_into_separate_reads() {
     );
 
     repo.clear_blob_cache();
-    counter.store(0, Ordering::Relaxed);
+    log.reset_get_range_count();
 
     let mut out = Vec::new();
     repo.read_chunks_coalesced_into(&chunks, &mut out).unwrap();
 
     // Gap exceeds threshold — should be 2 separate get_range calls.
     assert_eq!(
-        counter.load(Ordering::Relaxed),
+        log.get_range_count(),
         2,
         "expected 2 get_range calls due to gap split"
     );
@@ -340,7 +284,7 @@ fn large_gap_splits_into_separate_reads() {
 
 #[test]
 fn duplicate_chunk_ids_coalesce_into_single_range_read() {
-    let (mut repo, counter) = repo_on_counting_backend();
+    let (mut repo, log) = repo_on_counting_backend();
     let ids = store_chunks(&mut repo, 2);
     let chunks = resolve_chunks(&repo, &ids);
 
@@ -349,7 +293,7 @@ fn duplicate_chunk_ids_coalesce_into_single_range_read() {
     dup_chunks.extend_from_slice(&chunks);
 
     repo.clear_blob_cache();
-    counter.store(0, Ordering::Relaxed);
+    log.reset_get_range_count();
 
     let mut out = Vec::new();
     repo.read_chunks_coalesced_into(&dup_chunks, &mut out)
@@ -357,7 +301,7 @@ fn duplicate_chunk_ids_coalesce_into_single_range_read() {
 
     // Duplicates sit at the same pack offset and coalesce into one range read.
     assert_eq!(
-        counter.load(Ordering::Relaxed),
+        log.get_range_count(),
         1,
         "duplicates at same offset should coalesce into a single range read"
     );

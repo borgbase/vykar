@@ -8,79 +8,13 @@
 #![cfg(unix)]
 #![allow(clippy::unwrap_used)]
 #![allow(clippy::pedantic)]
-// Test-only env mutation; SAFETY per block.
-#![allow(unsafe_code)]
 
-use std::path::Path;
-use std::sync::Once;
+mod common;
 
 use vykar_core::commands;
 use vykar_core::compress::Compression;
-use vykar_core::config::{
-    CheckConfig, ChunkerConfig, CompactConfig, CompressionConfig, EncryptionConfig,
-    EncryptionModeConfig, RepositoryConfig, ResourceLimitsConfig, RetentionConfig, RetryConfig,
-    ScheduleConfig, VykarConfig, XattrsConfig,
-};
 
-static TEST_ENV_INIT: Once = Once::new();
-
-fn init_test_environment() {
-    TEST_ENV_INIT.call_once(|| {
-        let base = std::env::temp_dir().join(format!("vykar-tests-{}", std::process::id()));
-        let home = base.join("home");
-        let cache = base.join("cache");
-        let _ = std::fs::create_dir_all(&home);
-        let _ = std::fs::create_dir_all(&cache);
-        // SAFETY: Once::call_once runs this single-threaded at test-process
-        // startup before any threads are spawned.
-        unsafe {
-            std::env::set_var("HOME", &home);
-            std::env::set_var("XDG_CACHE_HOME", &cache);
-        }
-    });
-}
-
-fn make_test_config(repo_dir: &Path) -> VykarConfig {
-    init_test_environment();
-
-    VykarConfig {
-        repository: RepositoryConfig {
-            url: repo_dir.to_string_lossy().to_string(),
-            region: None,
-            access_key_id: None,
-            secret_access_key: None,
-            sftp_key: None,
-            sftp_known_hosts: None,
-            sftp_timeout: None,
-            access_token: None,
-            allow_insecure_http: false,
-            min_pack_size: 32 * 1024 * 1024,
-            max_pack_size: 512 * 1024 * 1024,
-            retry: RetryConfig::default(),
-            s3_soft_delete: false,
-        },
-        encryption: EncryptionConfig {
-            mode: EncryptionModeConfig::None,
-            passphrase: None,
-            passcommand: None,
-        },
-        exclude_patterns: Vec::new(),
-        exclude_if_present: Vec::new(),
-        one_file_system: true,
-        git_ignore: false,
-        chunker: ChunkerConfig::default(),
-        compression: CompressionConfig::default(),
-        retention: RetentionConfig::default(),
-        xattrs: XattrsConfig::default(),
-        schedule: ScheduleConfig::default(),
-        limits: ResourceLimitsConfig::default(),
-        compact: CompactConfig::default(),
-        check: CheckConfig::default(),
-        cache_dir: None,
-        trust_repo: false,
-        hostname_override: None,
-    }
-}
+use crate::common::make_test_config;
 
 #[test]
 fn backup_symlink_to_directory_descends_target() {

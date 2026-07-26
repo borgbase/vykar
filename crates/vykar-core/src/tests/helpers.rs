@@ -1,8 +1,4 @@
-// Test-only env mutation; SAFETY documented per block.
-#![allow(unsafe_code)]
-
 use std::path::Path;
-use std::sync::Once;
 
 use crate::commands;
 use crate::compress::Compression;
@@ -15,24 +11,9 @@ use crate::config::{
 use crate::repo::Repository;
 use crate::snapshot::SnapshotStats;
 
-static TEST_ENV_INIT: Once = Once::new();
-
-pub fn init_test_environment() {
-    TEST_ENV_INIT.call_once(|| {
-        let base = std::env::temp_dir().join(format!("vykar-tests-{}", std::process::id()));
-        let home = base.join("home");
-        let cache = base.join("cache");
-        let _ = std::fs::create_dir_all(&home);
-        let _ = std::fs::create_dir_all(&cache);
-        // SAFETY: Rust 2024 marks env mutation as unsafe due to process-global
-        // races. This runs once via `Once::call_once` at test-process startup
-        // before any threads are spawned, so the race window is empty.
-        unsafe {
-            std::env::set_var("HOME", &home);
-            std::env::set_var("XDG_CACHE_HOME", &cache);
-        }
-    });
-}
+// Re-exported so `helpers::init_test_environment()` call sites keep working
+// while a single `Once` governs the whole unit-test binary.
+pub use crate::testutil::init_test_environment;
 
 pub fn make_test_config(repo_dir: &Path) -> VykarConfig {
     init_test_environment();

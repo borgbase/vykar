@@ -932,6 +932,11 @@ async fn serve(
             result = listener.accept() => {
                 let (stream, _) = result
                     .map_err(|e| VykarError::Other(format!("accept error: {e}")))?;
+                // WebDAV clients issue many small request/response pairs; Nagle's
+                // algorithm delays each reply waiting for an ACK.
+                if let Err(e) = stream.set_nodelay(true) {
+                    tracing::debug!("failed to set TCP_NODELAY on WebDAV connection: {e}");
+                }
                 let io = TokioIo::new(stream);
                 let handler = handler.clone();
                 let tree = tree.clone();

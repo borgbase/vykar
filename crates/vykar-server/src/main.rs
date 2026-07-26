@@ -19,6 +19,7 @@ mod handlers;
 mod quota;
 mod state;
 
+use axum::serve::ListenerExt;
 use clap::Parser;
 use tokio::net::TcpListener;
 use tracing::info;
@@ -144,10 +145,20 @@ async fn async_main(cli: Cli) {
     let app = handlers::router(state);
 
     info!("vykar-server listening on {listen_addr}");
-    let listener = TcpListener::bind(&listen_addr).await.unwrap_or_else(|e| {
-        eprintln!("Error: cannot bind to {listen_addr}: {e}");
-        std::process::exit(1);
-    });
+    let listener = TcpListener::bind(&listen_addr)
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("Error: cannot bind to {listen_addr}: {e}");
+            std::process::exit(1);
+        })
+        // Responses are written in several small pieces (headers, then body
+        // frames); Nagle's algorithm holds those back waiting for the client's
+        // ACK, adding a round-trip to every request.
+        .tap_io(|stream| {
+            if let Err(e) = stream.set_nodelay(true) {
+                tracing::debug!("failed to set TCP_NODELAY on incoming connection: {e}");
+            }
+        });
     axum::serve(listener, app).await.unwrap_or_else(|e| {
         eprintln!("Error: server failed: {e}");
         std::process::exit(1);

@@ -6,10 +6,7 @@ use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
 use vykar_types::pack_id::PackId;
 
-// Re-export pack format constants from vykar-protocol.
-pub use vykar_protocol::{
-    PACK_HEADER_SIZE, PACK_MAGIC, PACK_VERSION_CURRENT, PACK_VERSION_MAX, PACK_VERSION_MIN,
-};
+use vykar_protocol::{validate_pack_header, PACK_HEADER_SIZE, PACK_MAGIC, PACK_VERSION_CURRENT};
 
 /// Distinguishes data packs (file content) from tree packs (item-stream metadata).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -282,27 +279,12 @@ pub fn read_blob_from_pack(
 /// Forward-scan pack bytes using per-blob length prefixes.
 /// Returns (offset, length) pairs for each blob.
 //
-// Indexing into `pack_data` is gated by `pack_data.len() < PACK_HEADER_SIZE`
-// up-front and `pos + 4 <= blobs_end` / `pos + 4 + blob_len ...` per loop
-// iteration; out-of-bounds is unreachable for inputs that pass those checks.
+// Indexing into `pack_data` is gated by the header validation up-front and
+// `pos + 4 <= blobs_end` / `pos + 4 + blob_len ...` per loop iteration;
+// out-of-bounds is unreachable for inputs that pass those checks.
 #[allow(clippy::indexing_slicing)]
 pub fn scan_pack_blobs_bytes(pack_data: &[u8]) -> Result<Vec<(u64, u32)>> {
-    if pack_data.len() < PACK_HEADER_SIZE {
-        return Err(VykarError::InvalidFormat("pack too small".into()));
-    }
-
-    // Verify magic
-    if &pack_data[..8] != PACK_MAGIC {
-        return Err(VykarError::InvalidFormat("invalid pack magic".into()));
-    }
-
-    // Verify version
-    let version = pack_data[8];
-    if version < PACK_VERSION_MIN || version > PACK_VERSION_MAX {
-        return Err(VykarError::InvalidFormat(format!(
-            "unsupported pack version {version} (supported: {PACK_VERSION_MIN}..={PACK_VERSION_MAX})"
-        )));
-    }
+    validate_pack_header(pack_data).map_err(VykarError::InvalidFormat)?;
 
     let mut pos = PACK_HEADER_SIZE;
     let blobs_end = pack_data.len();
@@ -562,6 +544,8 @@ mod tests {
             fn create_dir(&self, _: &str) -> Result<()> {
                 Ok(())
             }
+
+            vykar_storage::unsupported_server_ops!();
         }
 
         // Memory variant → put_owned
@@ -646,6 +630,8 @@ mod tests {
         fn create_dir(&self, _key: &str) -> Result<()> {
             Ok(())
         }
+
+        vykar_storage::unsupported_server_ops!();
     }
 
     #[test]

@@ -4,7 +4,7 @@ use test_case::test_case;
 
 use crate::commands;
 use crate::config::VykarConfig;
-use crate::repo::pack::PACK_HEADER_SIZE;
+use vykar_protocol::PACK_HEADER_SIZE;
 
 use super::helpers::{backup_single_source, init_repo, open_local_repo};
 

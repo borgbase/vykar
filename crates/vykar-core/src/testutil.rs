@@ -8,7 +8,7 @@ use std::sync::Once;
 
 use crate::config::ChunkerConfig;
 use crate::repo::{EncryptionMode, Repository};
-use vykar_storage::StorageBackend;
+use vykar_storage::{delegate_storage_backend, InnerBackend, StorageBackend};
 use vykar_types::error::{Result, VykarError};
 
 static TEST_ENV_INIT: Once = Once::new();
@@ -107,6 +107,8 @@ impl StorageBackend for MemoryBackend {
         // No-op for in-memory backend
         Ok(())
     }
+
+    vykar_storage::unsupported_server_ops!();
 }
 
 /// Create a plaintext repository backed by MemoryBackend.
@@ -198,30 +200,39 @@ impl RecordingBackend {
     }
 }
 
-impl StorageBackend for RecordingBackend {
-    fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
-        self.inner.get(key)
+impl InnerBackend for RecordingBackend {
+    fn inner_backend(&self) -> &dyn StorageBackend {
+        &self.inner
     }
+}
+
+delegate_storage_backend! {
+    for RecordingBackend;
+    except [put, get_range, get_range_into, put_owned];
+
     fn put(&self, key: &str, data: &[u8]) -> Result<()> {
         self.log.record(key);
         self.inner.put(key, data)
     }
-    fn delete(&self, key: &str) -> Result<()> {
-        self.inner.delete(key)
-    }
-    fn exists(&self, key: &str) -> Result<bool> {
-        self.inner.exists(key)
-    }
-    fn list(&self, prefix: &str) -> Result<Vec<String>> {
-        self.inner.list(prefix)
-    }
+
     fn get_range(&self, key: &str, offset: u64, length: u64) -> Result<Option<Vec<u8>>> {
         self.log.record_get_range();
         self.inner.get_range(key, offset, length)
     }
-    fn create_dir(&self, key: &str) -> Result<()> {
-        self.inner.create_dir(key)
+
+    // Counted as one range read, same as the `get_range` it used to reach
+    // through the trait default. The restore path reads via this method.
+    fn get_range_into(
+        &self,
+        key: &str,
+        offset: u64,
+        length: u64,
+        buf: &mut Vec<u8>,
+    ) -> Result<bool> {
+        self.log.record_get_range();
+        self.inner.get_range_into(key, offset, length, buf)
     }
+
     fn put_owned(&self, key: &str, data: Vec<u8>) -> Result<()> {
         self.log.record(key);
         self.inner.put(key, &data)

@@ -76,14 +76,8 @@ impl LocalBackend {
         Ok(())
     }
 
-    #[cfg(unix)]
     fn sync_directory(dir: &Path) -> Result<()> {
-        fs::File::open(dir)?.sync_all()?;
-        Ok(())
-    }
-
-    #[cfg(not(unix))]
-    fn sync_directory(_dir: &Path) -> Result<()> {
+        vykar_common::fs::fsync_dir(dir)?;
         Ok(())
     }
 
@@ -237,6 +231,8 @@ impl StorageBackend for LocalBackend {
         fs::create_dir_all(&path)?;
         Ok(())
     }
+
+    crate::unsupported_server_ops!();
 }
 
 impl LocalBackend {

@@ -3,8 +3,8 @@ use std::collections::{HashMap, HashSet};
 use crate::commands;
 use crate::commands::check::{RepairAction, RepairMode, RepairResult};
 use crate::config::VykarConfig;
-use crate::repo::pack::PACK_HEADER_SIZE;
 use crate::snapshot::item::ItemType;
+use vykar_protocol::PACK_HEADER_SIZE;
 
 use super::corruption::{apply_corruption, setup_repo, Corruption};
 use super::helpers::{backup_single_source, init_repo, make_test_config, open_local_repo};

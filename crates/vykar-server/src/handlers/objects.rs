@@ -364,7 +364,7 @@ pub async fn delete_object(
 
 /// Fsync a directory off the async runtime (directory fsync is blocking).
 async fn fsync_dir_async(dir: std::path::PathBuf) -> std::io::Result<()> {
-    tokio::task::spawn_blocking(move || crate::state::fsync_dir(&dir))
+    tokio::task::spawn_blocking(move || vykar_common::fs::fsync_dir(&dir))
         .await
         .map_err(|e| std::io::Error::other(e.to_string()))?
 }

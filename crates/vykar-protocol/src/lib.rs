@@ -31,6 +31,37 @@ pub const PACK_VERSION_MIN: u8 = 1;
 /// Always == `PACK_VERSION_CURRENT` (we can read anything we can write).
 pub const PACK_VERSION_MAX: u8 = PACK_VERSION_CURRENT;
 
+/// Validate a pack file's header bytes: magic, then version range.
+///
+/// Returns the pack's version byte. `hdr` must be at least
+/// [`PACK_HEADER_SIZE`] long; extra bytes (e.g. the whole pack) are ignored.
+/// Shared by the client's pack reader and both server-side verifiers so all
+/// three agree on what a readable pack looks like.
+///
+/// # Errors
+///
+/// Returns a message when `hdr` is too short, the magic does not match, or the
+/// version is outside `PACK_VERSION_MIN..=PACK_VERSION_MAX`.
+pub fn validate_pack_header(hdr: &[u8]) -> Result<u8, String> {
+    let Some(header) = hdr.get(..PACK_HEADER_SIZE) else {
+        return Err("pack too small".to_string());
+    };
+    let (magic, rest) = header.split_at(PACK_MAGIC.len());
+    if magic != PACK_MAGIC {
+        return Err("invalid pack magic".to_string());
+    }
+    // PACK_HEADER_SIZE == PACK_MAGIC.len() + 1, so `rest` holds the version byte.
+    let Some(&version) = rest.first() else {
+        return Err("pack too small".to_string());
+    };
+    if !(PACK_VERSION_MIN..=PACK_VERSION_MAX).contains(&version) {
+        return Err(format!(
+            "unsupported pack version {version} (supported: {PACK_VERSION_MIN}..={PACK_VERSION_MAX})"
+        ));
+    }
+    Ok(version)
+}
+
 // ── Server-side operation caps (shared client ↔ server) ────────────────────
 
 /// Maximum total output bytes a single server-side repack plan may produce.
@@ -319,6 +350,61 @@ mod tests {
         let json = r#"{"pack_key":"packs/ab/cc","expected_blobs":[]}"#;
         let req: VerifyPackRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.expected_size, 0);
+    }
+
+    // ── validate_pack_header ───────────────────────────────────────────
+
+    fn header(version: u8) -> Vec<u8> {
+        let mut hdr = PACK_MAGIC.to_vec();
+        hdr.push(version);
+        hdr
+    }
+
+    #[test]
+    fn validate_pack_header_accepts_current_version() {
+        assert_eq!(
+            validate_pack_header(&header(PACK_VERSION_CURRENT)),
+            Ok(PACK_VERSION_CURRENT)
+        );
+    }
+
+    #[test]
+    fn validate_pack_header_ignores_trailing_pack_bytes() {
+        let mut pack = header(PACK_VERSION_CURRENT);
+        pack.extend_from_slice(&[0xAA; 128]);
+        assert_eq!(validate_pack_header(&pack), Ok(PACK_VERSION_CURRENT));
+    }
+
+    #[test]
+    fn validate_pack_header_rejects_short_input() {
+        for len in 0..PACK_HEADER_SIZE {
+            let mut truncated = header(PACK_VERSION_CURRENT);
+            truncated.truncate(len);
+            let err = validate_pack_header(&truncated).unwrap_err();
+            assert_eq!(err, "pack too small", "len {len}");
+        }
+    }
+
+    #[test]
+    fn validate_pack_header_rejects_bad_magic() {
+        let mut hdr = b"XGERPACK".to_vec();
+        hdr.push(PACK_VERSION_CURRENT);
+        assert_eq!(hdr.len(), PACK_HEADER_SIZE);
+        assert_eq!(
+            validate_pack_header(&hdr).unwrap_err(),
+            "invalid pack magic"
+        );
+    }
+
+    #[test]
+    fn validate_pack_header_rejects_out_of_range_version() {
+        for version in [0u8, PACK_VERSION_MAX + 1, 255] {
+            let err = validate_pack_header(&header(version)).unwrap_err();
+            assert!(
+                err.starts_with(&format!("unsupported pack version {version}")),
+                "got: {err}"
+            );
+        }
     }
 
     // ── validate_blob_ref ──────────────────────────────────────────────

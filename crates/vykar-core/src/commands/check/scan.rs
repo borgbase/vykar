@@ -8,12 +8,11 @@ use crate::compress;
 use crate::config::VykarConfig;
 use crate::index::ChunkIndexEntry;
 use crate::repo::format::{unpack_object_expect_with_context, ObjectType};
-use crate::repo::pack::{
-    read_blob_from_pack, PACK_HEADER_SIZE, PACK_MAGIC, PACK_VERSION_MAX, PACK_VERSION_MIN,
-};
+use crate::repo::pack::read_blob_from_pack;
 use crate::repo::Repository;
 use crate::snapshot::item::ItemType;
 use vykar_crypto::CryptoEngine;
+use vykar_protocol::validate_pack_header;
 use vykar_storage::StorageBackend;
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
@@ -759,13 +758,7 @@ pub(crate) fn verify_pack_full(
         }
     };
 
-    // Validate header — first slice/index is gated by the length check.
-    #[allow(clippy::indexing_slicing)]
-    let header_invalid = pack_data.len() < PACK_HEADER_SIZE
-        || &pack_data[..8] != PACK_MAGIC
-        || pack_data[8] < PACK_VERSION_MIN
-        || pack_data[8] > PACK_VERSION_MAX;
-    if header_invalid {
+    if validate_pack_header(&pack_data).is_err() {
         issues.push(IntegrityIssue::CorruptPackContent {
             pack_id: *pack_id,
             detail: "invalid pack header".into(),
@@ -956,6 +949,8 @@ mod tests {
         fn create_dir(&self, _key: &str) -> vykar_types::error::Result<()> {
             Ok(())
         }
+
+        vykar_storage::unsupported_server_ops!();
     }
 
     #[test]

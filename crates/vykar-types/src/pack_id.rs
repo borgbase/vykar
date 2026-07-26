@@ -1,21 +1,9 @@
-use serde::{Deserialize, Serialize};
-use std::fmt;
-
-/// A 32-byte pack file identifier computed as unkeyed BLAKE2b-256.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct PackId([u8; 32]);
+hash_id! {
+    /// A 32-byte pack file identifier computed as unkeyed BLAKE2b-256.
+    PackId
+}
 
 impl PackId {
-    /// Wrap a 32-byte array as a `PackId`. Any 32-byte value is a valid ID.
-    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
-        Self(bytes)
-    }
-
-    /// Borrow the raw 32 bytes.
-    pub const fn as_bytes(&self) -> &[u8; 32] {
-        &self.0
-    }
-
     /// Compute a pack ID as unkeyed BLAKE2b-256 of the entire pack contents.
     ///
     /// Pack IDs are storage keys for already-written objects, so the digest is
@@ -25,11 +13,6 @@ impl PackId {
         let mut out = [0u8; 32];
         out.copy_from_slice(hash.as_bytes());
         PackId(out)
-    }
-
-    /// Hex-encode the full pack ID.
-    pub fn to_hex(&self) -> String {
-        hex::encode(self.0)
     }
 
     /// First byte as a two-char hex string, used for shard directory.
@@ -70,18 +53,6 @@ impl PackId {
             .next()
             .ok_or_else(|| "empty storage key".to_string())?;
         Self::from_hex(hex_str)
-    }
-}
-
-impl fmt::Debug for PackId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "PackId({})", &self.to_hex()[..16])
-    }
-}
-
-impl fmt::Display for PackId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", &self.to_hex()[..16])
     }
 }
 

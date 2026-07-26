@@ -1,27 +1,16 @@
 use rand::Rng;
-use serde::{Deserialize, Serialize};
-use std::fmt;
 
-/// A 32-byte snapshot identifier (random).
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct SnapshotId([u8; 32]);
+hash_id! {
+    /// A 32-byte snapshot identifier (random).
+    SnapshotId
+}
 
 impl SnapshotId {
-    /// Wrap a 32-byte array as a `SnapshotId`. Any 32-byte value is a valid ID.
-    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
-        Self(bytes)
-    }
-
     /// Generate a random snapshot ID.
     pub fn generate() -> Self {
         let mut buf = [0u8; 32];
         rand::rng().fill_bytes(&mut buf);
         SnapshotId(buf)
-    }
-
-    /// Hex-encode the full snapshot ID.
-    pub fn to_hex(&self) -> String {
-        hex::encode(self.0)
     }
 
     /// Storage key path: `snapshots/<hex>`.
@@ -43,22 +32,5 @@ impl SnapshotId {
         let mut arr = [0u8; 32];
         arr.copy_from_slice(&bytes);
         Ok(SnapshotId(arr))
-    }
-
-    /// Raw bytes for use as AAD context.
-    pub fn as_bytes(&self) -> &[u8; 32] {
-        &self.0
-    }
-}
-
-impl fmt::Debug for SnapshotId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "SnapshotId({})", &self.to_hex()[..16])
-    }
-}
-
-impl fmt::Display for SnapshotId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", &self.to_hex()[..16])
     }
 }

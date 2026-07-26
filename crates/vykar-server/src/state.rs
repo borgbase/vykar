@@ -395,20 +395,6 @@ pub(crate) fn rescan_usage(inner: &AppStateInner) {
     inner.quota_state.refresh(usage);
 }
 
-/// Fsync a directory so renames/creations inside it survive power loss.
-/// No-op on non-Unix (`std::fs::File` cannot open directories on Windows).
-pub(crate) fn fsync_dir(dir: &Path) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        std::fs::File::open(dir)?.sync_all()
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = dir;
-        Ok(())
-    }
-}
-
 fn dir_size(path: &Path) -> u64 {
     let mut total = 0u64;
     if let Ok(entries) = std::fs::read_dir(path) {
@@ -577,20 +563,6 @@ mod tests {
             ..Default::default()
         };
         (AppState::new_with_quota(config, quota_state), tmp)
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn fsync_dir_ok_on_existing_err_on_missing() {
-        let tmp = tempfile::tempdir().expect("create tempdir");
-        assert!(
-            fsync_dir(tmp.path()).is_ok(),
-            "fsync of existing dir succeeds"
-        );
-        assert!(
-            fsync_dir(&tmp.path().join("nope")).is_err(),
-            "fsync of missing dir errors"
-        );
     }
 
     #[test]

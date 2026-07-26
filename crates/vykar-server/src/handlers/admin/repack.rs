@@ -282,7 +282,7 @@ fn execute_repack(
                     let data_dir = state.inner.data_dir.as_path();
                     let mut cursor = Some(parent);
                     while let Some(dir) = cursor {
-                        crate::state::fsync_dir(dir).map_err(|e| {
+                        vykar_common::fs::fsync_dir(dir).map_err(|e| {
                             let _ = std::fs::remove_file(&temp_path);
                             format!("fsync dir: {e}")
                         })?;
@@ -308,7 +308,8 @@ fn execute_repack(
 
             // Fsync the parent so the rename survives power loss before we ack.
             if let Some(parent) = new_pack_path.parent() {
-                crate::state::fsync_dir(parent).map_err(|e| format!("fsync new pack dir: {e}"))?;
+                vykar_common::fs::fsync_dir(parent)
+                    .map_err(|e| format!("fsync new pack dir: {e}"))?;
             }
 
             if op.delete_after {

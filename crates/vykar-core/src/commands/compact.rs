@@ -7,15 +7,14 @@ use tracing::{info, warn};
 
 use super::util::{check_interrupted, open_repo, with_maintenance_lock};
 use crate::config::VykarConfig;
-use crate::repo::pack::{
-    PackType, PackWriter, PACK_HEADER_SIZE, PACK_MAGIC, PACK_VERSION_MAX, PACK_VERSION_MIN,
-};
+use crate::repo::pack::{PackType, PackWriter};
 use crate::repo::OpenOptions;
 use crate::repo::Repository;
-use vykar_storage::{
-    repack_op_output_size, RepackBlobRef, RepackOperationRequest, RepackPlanRequest,
-    StorageBackend, MAX_REPACK_OUTPUT_BYTES,
+use vykar_protocol::{
+    repack_op_output_size, validate_pack_header, RepackBlobRef, RepackOperationRequest,
+    RepackPlanRequest, MAX_REPACK_OUTPUT_BYTES, PACK_HEADER_SIZE,
 };
+use vykar_storage::StorageBackend;
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
 use vykar_types::pack_id::PackId;
@@ -338,15 +337,7 @@ pub fn compact_repo(
                     analysis.pack_id
                 ))
             })?;
-        // Header was just read at exactly PACK_HEADER_SIZE bytes, so the
-        // length-mismatch arm filters everything else; the slicing/indexing
-        // is in-bounds for any input that reaches the magic/version checks.
-        #[allow(clippy::indexing_slicing)]
-        let header_invalid = header.len() != PACK_HEADER_SIZE
-            || &header[..8] != PACK_MAGIC
-            || header[8] < PACK_VERSION_MIN
-            || header[8] > PACK_VERSION_MAX;
-        if header_invalid {
+        if validate_pack_header(&header).is_err() {
             warn!(
                 "Skipping pack {} with invalid header during repack",
                 analysis.pack_id
@@ -562,7 +553,7 @@ fn try_server_side_repack(
     'batches: for batch in chunk_repack_operations(operations) {
         let plan = RepackPlanRequest {
             operations: batch,
-            protocol_version: vykar_storage::PROTOCOL_VERSION,
+            protocol_version: vykar_protocol::PROTOCOL_VERSION,
         };
         let response = match repo.storage.server_repack(&plan) {
             Ok(resp) => resp,
@@ -578,7 +569,7 @@ fn try_server_side_repack(
         };
         first_batch = false;
 
-        let mut completed_by_source: HashMap<String, vykar_storage::RepackOperationResult> =
+        let mut completed_by_source: HashMap<String, vykar_protocol::RepackOperationResult> =
             response
                 .completed
                 .into_iter()
@@ -620,7 +611,7 @@ fn try_server_side_repack(
 fn apply_repack_result(
     repo: &mut Repository,
     analysis: &PackAnalysis,
-    result: &vykar_storage::RepackOperationResult,
+    result: &vykar_protocol::RepackOperationResult,
     stats: &mut CompactStats,
 ) -> Result<()> {
     if analysis.live_entries.is_empty() {
@@ -696,7 +687,7 @@ fn chunk_repack_operations(
 #[cfg(test)]
 mod repack_chunk_tests {
     use super::chunk_repack_operations;
-    use vykar_storage::{
+    use vykar_protocol::{
         repack_op_output_size, RepackBlobRef, RepackOperationRequest, MAX_REPACK_OUTPUT_BYTES,
     };
 

@@ -1170,6 +1170,8 @@ impl StorageBackend for SftpBackend {
         }
         Ok(())
     }
+
+    crate::unsupported_server_ops!();
 }
 
 #[cfg(test)]

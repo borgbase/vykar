@@ -18,8 +18,13 @@ pub mod s3_backend;
 #[cfg(feature = "backend-sftp")]
 pub mod sftp_backend;
 
+mod delegate;
 mod http_util;
 mod retry;
+
+#[doc(hidden)]
+pub use delegate::__macro_support;
+pub use delegate::InnerBackend;
 
 #[cfg(feature = "backend-sftp")]
 pub(crate) mod runtime;
@@ -31,12 +36,10 @@ use url::Url;
 
 use vykar_types::error::{Result, VykarError};
 
-// Re-export wire-format types from vykar-protocol (shared with vykar-server).
-pub use vykar_protocol::{
-    repack_op_output_size, RepackBlobRef, RepackOperationRequest, RepackOperationResult,
-    RepackPlanRequest, RepackResultResponse, VerifyBlobRef, VerifyPackRequest, VerifyPackResult,
-    VerifyPacksPlanRequest, VerifyPacksResponse, MAX_REPACK_OUTPUT_BYTES, PACK_HEADER_SIZE,
-    PROTOCOL_VERSION,
+// Wire-format types used in the `StorageBackend` trait surface. Callers import
+// them from `vykar_protocol` directly.
+use vykar_protocol::{
+    RepackPlanRequest, RepackResultResponse, VerifyPacksPlanRequest, VerifyPacksResponse,
 };
 
 /// Abstract key-value storage for repository objects.
@@ -118,82 +121,48 @@ pub trait StorageBackend: Send + Sync {
             .transpose()
     }
 
+    // ── Capability methods: no defaults, deliberately ──────────────────────
+    //
+    // These four report `UnsupportedBackend` on most backends, and callers
+    // treat that error as "fall back to the client-side path". A default body
+    // here would make a *wrapper* that forgets to forward silently answer
+    // "unsupported" on behalf of a backend that does support the operation —
+    // exactly the bug that disabled server-side pack verification and server
+    // init whenever a bandwidth cap was configured on a REST repo.
+    //
+    // Leaving them required means a new capability method breaks every impl,
+    // including `delegate_storage_backend!`'s inventory, until it is handled.
+    // Backends with no server-side APIs get the bodies from
+    // `unsupported_server_ops!`.
+    //
+    // The methods above may keep defaults: each routes back through this
+    // impl's own `get`/`put`/`get_range`, so inheriting one is correct (at
+    // worst less efficient), never a silent loss of capability.
+
     /// Execute a server-side repack plan when supported by the backend.
-    fn server_repack(&self, _plan: &RepackPlanRequest) -> Result<RepackResultResponse> {
-        Err(VykarError::UnsupportedBackend(
-            "server-side repack API".into(),
-        ))
-    }
+    fn server_repack(&self, plan: &RepackPlanRequest) -> Result<RepackResultResponse>;
 
     /// Batch-delete keys using a backend-native API.
-    fn batch_delete_keys(&self, _keys: &[String]) -> Result<()> {
-        Err(VykarError::UnsupportedBackend("batch delete API".into()))
-    }
+    fn batch_delete_keys(&self, keys: &[String]) -> Result<()>;
 
     /// Server-side pack verification: hash check + header + blob boundary scan.
-    fn server_verify_packs(&self, _plan: &VerifyPacksPlanRequest) -> Result<VerifyPacksResponse> {
-        Err(VykarError::UnsupportedBackend(
-            "server-side verify-packs API".into(),
-        ))
-    }
+    fn server_verify_packs(&self, plan: &VerifyPacksPlanRequest) -> Result<VerifyPacksResponse>;
 
     /// Server-side repository directory scaffolding (keys/, snapshots/, locks/, packs/*).
-    fn server_init(&self) -> Result<()> {
-        Err(VykarError::UnsupportedBackend(
-            "server-side init API".into(),
-        ))
+    fn server_init(&self) -> Result<()>;
+}
+
+// Lets a `Box<Arc<dyn StorageBackend>>` coerce to `Box<dyn StorageBackend>`
+// (used by tests that share one backend between a repository and assertions).
+impl InnerBackend for Arc<dyn StorageBackend> {
+    fn inner_backend(&self) -> &dyn StorageBackend {
+        &**self
     }
 }
 
-impl StorageBackend for Arc<dyn StorageBackend> {
-    fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
-        (**self).get(key)
-    }
-    fn put(&self, key: &str, data: &[u8]) -> Result<()> {
-        (**self).put(key, data)
-    }
-    fn delete(&self, key: &str) -> Result<()> {
-        (**self).delete(key)
-    }
-    fn exists(&self, key: &str) -> Result<bool> {
-        (**self).exists(key)
-    }
-    fn list(&self, prefix: &str) -> Result<Vec<String>> {
-        (**self).list(prefix)
-    }
-    fn get_range(&self, key: &str, offset: u64, length: u64) -> Result<Option<Vec<u8>>> {
-        (**self).get_range(key, offset, length)
-    }
-    fn get_range_into(
-        &self,
-        key: &str,
-        offset: u64,
-        length: u64,
-        buf: &mut Vec<u8>,
-    ) -> Result<bool> {
-        (**self).get_range_into(key, offset, length, buf)
-    }
-    fn create_dir(&self, key: &str) -> Result<()> {
-        (**self).create_dir(key)
-    }
-    fn put_owned(&self, key: &str, data: Vec<u8>) -> Result<()> {
-        (**self).put_owned(key, data)
-    }
-    fn size(&self, key: &str) -> Result<Option<u64>> {
-        (**self).size(key)
-    }
-    fn server_repack(&self, plan: &RepackPlanRequest) -> Result<RepackResultResponse> {
-        (**self).server_repack(plan)
-    }
-    fn batch_delete_keys(&self, keys: &[String]) -> Result<()> {
-        (**self).batch_delete_keys(keys)
-    }
-    fn server_verify_packs(&self, plan: &VerifyPacksPlanRequest) -> Result<VerifyPacksResponse> {
-        (**self).server_verify_packs(plan)
-    }
-    fn server_init(&self) -> Result<()> {
-        (**self).server_init()
-    }
+delegate_storage_backend! {
+    for Arc<dyn StorageBackend>;
+    except [];
 }
 
 /// Parsed repository URL.

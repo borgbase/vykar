@@ -1,21 +1,9 @@
-use serde::{Deserialize, Serialize};
-use std::fmt;
-
-/// A 32-byte chunk identifier computed as keyed BLAKE2b-256.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct ChunkId([u8; 32]);
+hash_id! {
+    /// A 32-byte chunk identifier computed as keyed BLAKE2b-256.
+    ChunkId
+}
 
 impl ChunkId {
-    /// Wrap a 32-byte array as a `ChunkId`. Any 32-byte value is a valid ID.
-    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
-        Self(bytes)
-    }
-
-    /// Borrow the raw 32 bytes (e.g. for AAD or wire-format writes).
-    pub const fn as_bytes(&self) -> &[u8; 32] {
-        &self.0
-    }
-
     /// Compute a chunk ID using keyed BLAKE2b-256 (BLAKE2b-MAC with 32-byte output).
     ///
     /// This is the dedup identity for the whole repository, so the digest is
@@ -30,26 +18,9 @@ impl ChunkId {
         ChunkId(out)
     }
 
-    /// Hex-encode the full chunk ID for use as a storage key.
-    pub fn to_hex(&self) -> String {
-        hex::encode(self.0)
-    }
-
     /// First byte as a two-char hex string, used for shard directory.
     pub fn shard_prefix(&self) -> String {
         hex::encode(&self.0[..1])
-    }
-}
-
-impl fmt::Debug for ChunkId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "ChunkId({})", &self.to_hex()[..16])
-    }
-}
-
-impl fmt::Display for ChunkId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", &self.to_hex()[..16])
     }
 }
 

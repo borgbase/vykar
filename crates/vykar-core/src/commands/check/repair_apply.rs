@@ -501,6 +501,8 @@ mod tests {
         fn create_dir(&self, _key: &str) -> vykar_types::error::Result<()> {
             Ok(())
         }
+
+        vykar_storage::unsupported_server_ops!();
     }
 
     #[test]

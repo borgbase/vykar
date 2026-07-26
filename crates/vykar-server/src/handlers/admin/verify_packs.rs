@@ -3,9 +3,9 @@ use blake2::digest::{Update, VariableOutput};
 use blake2::Blake2bVar;
 
 use vykar_protocol::{
-    check_protocol_version, is_valid_pack_key, validate_blob_ref, VerifyPackRequest,
-    VerifyPackResult, VerifyPacksPlanRequest, VerifyPacksResponse, PACK_HEADER_SIZE, PACK_MAGIC,
-    PACK_VERSION_MAX, PACK_VERSION_MIN,
+    check_protocol_version, is_valid_pack_key, validate_blob_ref, validate_pack_header,
+    VerifyPackRequest, VerifyPackResult, VerifyPacksPlanRequest, VerifyPacksResponse,
+    PACK_HEADER_SIZE,
 };
 
 use crate::error::ServerError;
@@ -210,13 +210,11 @@ fn verify_pack_from_reader<R: std::io::Read>(
         }};
     }
 
-    // 1. Read header (9 bytes: 8 magic + 1 version).
-    let mut header_buf = [0u8; 9];
+    // 1. Read the header (magic + version byte).
+    let mut header_buf = [0u8; PACK_HEADER_SIZE];
     let header_read = read_exact_hashed!(reader, hasher, &mut header_buf);
 
-    let header_valid = header_read == 9
-        && &header_buf[..8] == PACK_MAGIC
-        && (PACK_VERSION_MIN..=PACK_VERSION_MAX).contains(&header_buf[8]);
+    let header_valid = header_read == PACK_HEADER_SIZE && validate_pack_header(&header_buf).is_ok();
 
     // 2. Forward-scan blob boundaries while hashing all remaining bytes.
     let mut blobs_valid = header_valid;

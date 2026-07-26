@@ -5,11 +5,11 @@ use super::types::{
     emit_progress, CheckError, CheckProgressEvent, ProcessedVerifyResult, ServerVerifyOutcome,
 };
 use crate::index::ChunkIndexEntry;
-use crate::repo::pack::PACK_HEADER_SIZE;
-use vykar_storage::{
-    StorageBackend, VerifyBlobRef, VerifyPackRequest, VerifyPacksPlanRequest, VerifyPacksResponse,
-    PROTOCOL_VERSION,
+use vykar_protocol::{
+    VerifyBlobRef, VerifyPackRequest, VerifyPacksPlanRequest, VerifyPacksResponse,
+    PACK_HEADER_SIZE, PROTOCOL_VERSION,
 };
+use vykar_storage::StorageBackend;
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::VykarError;
 use vykar_types::pack_id::PackId;

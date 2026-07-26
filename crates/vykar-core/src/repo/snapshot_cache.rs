@@ -702,7 +702,16 @@ mod tests {
         fail_prefix: String,
     }
 
-    impl StorageBackend for FailGetBackend {
+    impl vykar_storage::InnerBackend for FailGetBackend {
+        fn inner_backend(&self) -> &dyn StorageBackend {
+            &self.inner
+        }
+    }
+
+    vykar_storage::delegate_storage_backend! {
+        for FailGetBackend;
+        except [get];
+
         fn get(&self, key: &str) -> vykar_types::error::Result<Option<Vec<u8>>> {
             if key.starts_with(&self.fail_prefix) {
                 return Err(vykar_types::error::VykarError::Other(
@@ -710,29 +719,6 @@ mod tests {
                 ));
             }
             self.inner.get(key)
-        }
-        fn put(&self, key: &str, data: &[u8]) -> vykar_types::error::Result<()> {
-            self.inner.put(key, data)
-        }
-        fn delete(&self, key: &str) -> vykar_types::error::Result<()> {
-            self.inner.delete(key)
-        }
-        fn exists(&self, key: &str) -> vykar_types::error::Result<bool> {
-            self.inner.exists(key)
-        }
-        fn list(&self, prefix: &str) -> vykar_types::error::Result<Vec<String>> {
-            self.inner.list(prefix)
-        }
-        fn get_range(
-            &self,
-            key: &str,
-            offset: u64,
-            length: u64,
-        ) -> vykar_types::error::Result<Option<Vec<u8>>> {
-            self.inner.get_range(key, offset, length)
-        }
-        fn create_dir(&self, key: &str) -> vykar_types::error::Result<()> {
-            self.inner.create_dir(key)
         }
     }
 }

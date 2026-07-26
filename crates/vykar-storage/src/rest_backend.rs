@@ -27,7 +27,10 @@ pub struct RestBackend {
     /// Base URL, e.g. `https://backup.example.com`
     base_url: String,
     agent: ureq::Agent,
-    token: Option<String>,
+    /// Pre-rendered `Authorization` header value (`Bearer <token>`), or `None`
+    /// for an unauthenticated repository. Rendered once so the hot GET/PUT path
+    /// does not allocate a header string per request.
+    bearer: Option<String>,
     retry: RetryConfig,
 }
 
@@ -55,7 +58,7 @@ impl RestBackend {
         Ok(Self {
             base_url: base,
             agent,
-            token: token.map(str::to_string),
+            bearer: token.map(|t| format!("Bearer {t}")),
             retry,
         })
     }
@@ -63,6 +66,14 @@ impl RestBackend {
     fn url(&self, key: &str) -> String {
         let key = key.trim_start_matches('/');
         format!("{}/{}", self.base_url, key)
+    }
+
+    /// Attach the `Authorization` header when the repository is authenticated.
+    fn authed<B>(&self, req: ureq::RequestBuilder<B>) -> ureq::RequestBuilder<B> {
+        match self.bearer.as_deref() {
+            Some(bearer) => req.header("Authorization", bearer),
+            None => req,
+        }
     }
 
     /// Unified retry wrapper for HTTP calls with response handling.
@@ -75,6 +86,60 @@ impl RestBackend {
         crate::retry::retry_http(&self.retry, op_name, "REST", f, handle_response)
     }
 
+    /// POST `payload` as JSON and deserialize the JSON response body.
+    ///
+    /// Body reads go through a streaming reader rather than `read_json()`,
+    /// whose 10 MB default limit a repack result can exceed.
+    fn post_json<Req: serde::Serialize, Resp: serde::de::DeserializeOwned>(
+        &self,
+        op_name: &str,
+        url: &str,
+        payload: &Req,
+    ) -> Result<Resp> {
+        let body = self
+            .retry_call(
+                op_name,
+                || self.authed(self.agent.post(url)).send_json(payload),
+                |mut resp| {
+                    let status = resp.status().as_u16();
+                    crate::retry::classify_status(
+                        status,
+                        format!("REST {op_name} failed: HTTP {status}"),
+                    )?;
+                    let mut buf = Vec::new();
+                    resp.body_mut()
+                        .as_reader()
+                        .read_to_end(&mut buf)
+                        .map_err(HttpRetryError::BodyIo)?;
+                    Ok(buf)
+                },
+            )
+            .map_err(|e| VykarError::Other(format!("REST {op_name}: {e}")))?;
+        serde_json::from_slice(&body)
+            .map_err(|e| VykarError::Other(format!("REST {op_name} parse: {e}")))
+    }
+
+    /// POST `payload` as JSON, ignoring the response body.
+    fn post_no_content<Req: serde::Serialize>(
+        &self,
+        op_name: &str,
+        url: &str,
+        payload: &Req,
+    ) -> Result<()> {
+        self.retry_call(
+            op_name,
+            || self.authed(self.agent.post(url)).send_json(payload),
+            |resp| {
+                let status = resp.status().as_u16();
+                crate::retry::classify_status(
+                    status,
+                    format!("REST {op_name} failed: HTTP {status}"),
+                )
+            },
+        )
+        .map_err(|e| VykarError::Other(format!("REST {op_name}: {e}")))
+    }
+
     /// Batch delete multiple keys in a single request.
     pub fn batch_delete(&self, keys: &[String], cleanup_dirs: bool) -> Result<()> {
         let url = if cleanup_dirs {
@@ -82,97 +147,19 @@ impl RestBackend {
         } else {
             format!("{}?batch-delete", self.base_url)
         };
-        let payload = keys.to_vec();
-        self.retry_call(
-            "batch-delete",
-            || {
-                let mut req = self.agent.post(&url);
-                if let Some(ref token) = self.token {
-                    req = req.header("Authorization", &format!("Bearer {token}"));
-                }
-                req.send_json(&payload)
-            },
-            |resp| {
-                crate::retry::classify_status(
-                    resp.status().as_u16(),
-                    format!("REST batch-delete failed: HTTP {}", resp.status().as_u16()),
-                )
-            },
-        )
-        .map_err(|e| VykarError::Other(format!("REST batch-delete: {e}")))?;
-        Ok(())
+        self.post_no_content("batch-delete", &url, &keys)
     }
 
     /// Send a verify-packs plan to the server for server-side pack verification.
     pub fn verify_packs(&self, plan: &VerifyPacksPlanRequest) -> Result<VerifyPacksResponse> {
         let url = format!("{}?verify-packs", self.base_url);
-        let body = self
-            .retry_call(
-                "verify-packs",
-                || {
-                    let mut req = self.agent.post(&url);
-                    if let Some(ref token) = self.token {
-                        req = req.header("Authorization", &format!("Bearer {token}"));
-                    }
-                    req.send_json(plan)
-                },
-                |mut resp| {
-                    let status = resp.status().as_u16();
-                    if status >= 400 {
-                        crate::retry::classify_status(
-                            status,
-                            format!("REST verify-packs failed: HTTP {status}"),
-                        )?;
-                    }
-                    let mut buf = Vec::new();
-                    resp.body_mut()
-                        .as_reader()
-                        .read_to_end(&mut buf)
-                        .map_err(HttpRetryError::BodyIo)?;
-                    Ok(buf)
-                },
-            )
-            .map_err(|e| VykarError::Other(format!("REST verify-packs: {e}")))?;
-        let val: VerifyPacksResponse = serde_json::from_slice(&body)
-            .map_err(|e| VykarError::Other(format!("REST verify-packs parse: {e}")))?;
-        Ok(val)
+        self.post_json("verify-packs", &url, plan)
     }
 
     /// Send a repack plan to the server for server-side compaction.
     pub fn repack(&self, plan: &RepackPlanRequest) -> Result<RepackResultResponse> {
         let url = format!("{}?repack", self.base_url);
-        let body = self
-            .retry_call(
-                "repack",
-                || {
-                    let mut req = self.agent.post(&url);
-                    if let Some(ref token) = self.token {
-                        req = req.header("Authorization", &format!("Bearer {token}"));
-                    }
-                    req.send_json(plan)
-                },
-                |mut resp| {
-                    let status = resp.status().as_u16();
-                    if status >= 400 {
-                        crate::retry::classify_status(
-                            status,
-                            format!("REST repack failed: HTTP {status}"),
-                        )?;
-                    }
-                    // Use streaming reader — repack responses can exceed the
-                    // default 10 MB body limit of read_json().
-                    let mut buf = Vec::new();
-                    resp.body_mut()
-                        .as_reader()
-                        .read_to_end(&mut buf)
-                        .map_err(HttpRetryError::BodyIo)?;
-                    Ok(buf)
-                },
-            )
-            .map_err(|e| VykarError::Other(format!("REST repack: {e}")))?;
-        let val: RepackResultResponse = serde_json::from_slice(&body)
-            .map_err(|e| VykarError::Other(format!("REST repack parse: {e}")))?;
-        Ok(val)
+        self.post_json("repack", &url, plan)
     }
 }
 
@@ -261,11 +248,9 @@ impl RestBackend {
         self.retry_call(
             &format!("PUT {key}"),
             || {
-                let mut req = self.agent.put(&url);
-                if let Some(ref token) = self.token {
-                    req = req.header("Authorization", &format!("Bearer {token}"));
-                }
-                req.header("X-Content-BLAKE2b", &checksum).send(data)
+                self.authed(self.agent.put(&url))
+                    .header("X-Content-BLAKE2b", &checksum)
+                    .send(data)
             },
             |resp| {
                 let status = resp.status().as_u16();
@@ -288,13 +273,7 @@ impl StorageBackend for RestBackend {
         let url = self.url(key);
         self.retry_call(
             &format!("GET {key}"),
-            || {
-                let mut req = self.agent.get(&url);
-                if let Some(ref token) = self.token {
-                    req = req.header("Authorization", &format!("Bearer {token}"));
-                }
-                req.call()
-            },
+            || self.authed(self.agent.get(&url)).call(),
             |mut resp| {
                 let status = resp.status().as_u16();
                 if status == 404 {
@@ -325,13 +304,7 @@ impl StorageBackend for RestBackend {
         let url = self.url(key);
         self.retry_call(
             &format!("DELETE {key}"),
-            || {
-                let mut req = self.agent.delete(&url);
-                if let Some(ref token) = self.token {
-                    req = req.header("Authorization", &format!("Bearer {token}"));
-                }
-                req.call()
-            },
+            || self.authed(self.agent.delete(&url)).call(),
             |resp| {
                 let status = resp.status().as_u16();
                 if status == 404 {
@@ -353,13 +326,7 @@ impl StorageBackend for RestBackend {
         let url = self.url(key);
         self.retry_call(
             &format!("HEAD {key}"),
-            || {
-                let mut req = self.agent.head(&url);
-                if let Some(ref token) = self.token {
-                    req = req.header("Authorization", &format!("Bearer {token}"));
-                }
-                req.call()
-            },
+            || self.authed(self.agent.head(&url)).call(),
             |resp| {
                 let status = resp.status().as_u16();
                 if status == 404 {
@@ -381,13 +348,7 @@ impl StorageBackend for RestBackend {
         let url = self.url(key);
         self.retry_call(
             &format!("HEAD {key}"),
-            || {
-                let mut req = self.agent.head(&url);
-                if let Some(ref token) = self.token {
-                    req = req.header("Authorization", &format!("Bearer {token}"));
-                }
-                req.call()
-            },
+            || self.authed(self.agent.head(&url)).call(),
             |resp| {
                 let status = resp.status().as_u16();
                 if status == 404 {
@@ -420,13 +381,7 @@ impl StorageBackend for RestBackend {
         let body = self
             .retry_call(
                 &format!("LIST {prefix}"),
-                || {
-                    let mut req = self.agent.get(&url);
-                    if let Some(ref token) = self.token {
-                        req = req.header("Authorization", &format!("Bearer {token}"));
-                    }
-                    req.call()
-                },
+                || self.authed(self.agent.get(&url)).call(),
                 |mut resp| {
                     let status = resp.status().as_u16();
                     if status >= 400 {
@@ -456,23 +411,13 @@ impl StorageBackend for RestBackend {
             )));
         }
         let url = self.url(key);
-        let end = offset
-            .checked_add(length)
-            .and_then(|n| n.checked_sub(1))
-            .ok_or_else(|| {
-                VykarError::Other(format!(
-                    "REST GET_RANGE {key}: offset {offset} + length {length} overflows u64"
-                ))
-            })?;
-        let range_header = format!("bytes={offset}-{end}");
+        let range_header = crate::http_util::range_header("REST", key, offset, length)?;
         self.retry_call(
             &format!("GET_RANGE {key}"),
             || {
-                let mut req = self.agent.get(&url);
-                if let Some(ref token) = self.token {
-                    req = req.header("Authorization", &format!("Bearer {token}"));
-                }
-                req.header("Range", &range_header).call()
+                self.authed(self.agent.get(&url))
+                    .header("Range", &range_header)
+                    .call()
             },
             |mut resp| {
                 let status = resp.status().as_u16();
@@ -519,30 +464,8 @@ impl StorageBackend for RestBackend {
                     return Err(HttpRetryError::Permanent(e.to_string()));
                 }
 
-                let cap = match usize::try_from(length) {
-                    Ok(c) => c,
-                    Err(_) => {
-                        return Err(HttpRetryError::Permanent(format!(
-                            "REST GET_RANGE {key}: length {length} exceeds platform usize"
-                        )));
-                    }
-                };
-                let mut buf = Vec::with_capacity(cap);
-                resp.body_mut()
-                    .as_reader()
-                    .take(length)
-                    .read_to_end(&mut buf)
-                    .map_err(HttpRetryError::BodyIo)?;
-                if buf.len() != cap {
-                    return Err(HttpRetryError::BodyIo(std::io::Error::new(
-                        std::io::ErrorKind::UnexpectedEof,
-                        format!(
-                            "short read on {key} at offset {offset}: expected {length} bytes, got {}",
-                            buf.len()
-                        ),
-                    )));
-                }
-                Ok(Some(buf))
+                crate::http_util::read_range_body(&mut resp, "REST", key, offset, length)
+                    .map(Some)
             },
         )
         .map_err(|e| VykarError::Other(format!("REST GET_RANGE {key}: {e}")))
@@ -553,13 +476,7 @@ impl StorageBackend for RestBackend {
         let url = format!("{}?mkdir", self.url(key));
         self.retry_call(
             &format!("MKDIR {key}"),
-            || {
-                let mut req = self.agent.post(&url);
-                if let Some(ref token) = self.token {
-                    req = req.header("Authorization", &format!("Bearer {token}"));
-                }
-                req.send(&[] as &[u8])
-            },
+            || self.authed(self.agent.post(&url)).send(&[] as &[u8]),
             |resp| {
                 let status = resp.status().as_u16();
                 if status >= 400 {
@@ -603,13 +520,7 @@ impl StorageBackend for RestBackend {
         let url = format!("{}?init", self.base_url);
         self.retry_call(
             "INIT",
-            || {
-                let mut req = self.agent.post(&url);
-                if let Some(ref token) = self.token {
-                    req = req.header("Authorization", &format!("Bearer {token}"));
-                }
-                req.send(&[] as &[u8])
-            },
+            || self.authed(self.agent.post(&url)).send(&[] as &[u8]),
             |resp| {
                 let status = resp.status().as_u16();
                 if status >= 400 {

@@ -679,17 +679,7 @@ fn inj_fsync_dir(path: &Path) -> io::Result<()> {
         return Err(io::Error::other("injected dest_root fsync failure"));
     }
 
-    #[cfg(unix)]
-    {
-        let dir = std::fs::File::open(path)?;
-        fs::fsync_dir_file(&dir)
-    }
-
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-        Ok(())
-    }
+    vykar_common::fs::fsync_dir(path)
 }
 
 fn inj_rename(from: &Path, to: &Path) -> io::Result<()> {

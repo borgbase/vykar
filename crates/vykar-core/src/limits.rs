@@ -11,10 +11,7 @@ use nix::errno::Errno;
 use tracing::warn;
 
 use crate::config::ResourceLimitsConfig;
-use vykar_storage::{
-    RepackPlanRequest, RepackResultResponse, StorageBackend, VerifyPacksPlanRequest,
-    VerifyPacksResponse,
-};
+use vykar_storage::{delegate_storage_backend, InnerBackend, StorageBackend};
 use vykar_types::error::Result;
 
 // ── Rate limiting runtime ────────────────────────────────────────────────────
@@ -129,7 +126,22 @@ struct ThrottledStorageBackend {
     write_limiter: Option<Arc<ByteRateLimiter>>,
 }
 
-impl StorageBackend for ThrottledStorageBackend {
+impl InnerBackend for ThrottledStorageBackend {
+    fn inner_backend(&self) -> &dyn StorageBackend {
+        &*self.inner
+    }
+}
+
+// Only the byte-moving methods are throttled. Everything else — including the
+// server-side operations, whose bytes never cross the client's link — is
+// forwarded by the macro. The four capability methods have no trait default, so
+// this impl cannot silently answer "unsupported" on behalf of a backend that
+// does support them, which is how `server_verify_packs` and `server_init` came
+// to be disabled on every throttled REST repo.
+delegate_storage_backend! {
+    for ThrottledStorageBackend;
+    except [get, put, get_range, get_range_into, put_owned];
+
     fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
         let out = self.inner.get(key)?;
         if let (Some(limiter), Some(data)) = (self.read_limiter.as_ref(), out.as_ref()) {
@@ -143,18 +155,6 @@ impl StorageBackend for ThrottledStorageBackend {
             limiter.consume(data.len());
         }
         self.inner.put(key, data)
-    }
-
-    fn delete(&self, key: &str) -> Result<()> {
-        self.inner.delete(key)
-    }
-
-    fn exists(&self, key: &str) -> Result<bool> {
-        self.inner.exists(key)
-    }
-
-    fn list(&self, prefix: &str) -> Result<Vec<String>> {
-        self.inner.list(prefix)
     }
 
     fn get_range(&self, key: &str, offset: u64, length: u64) -> Result<Option<Vec<u8>>> {
@@ -181,40 +181,11 @@ impl StorageBackend for ThrottledStorageBackend {
         Ok(found)
     }
 
-    fn create_dir(&self, key: &str) -> Result<()> {
-        self.inner.create_dir(key)
-    }
-
     fn put_owned(&self, key: &str, data: Vec<u8>) -> Result<()> {
         if let Some(limiter) = self.write_limiter.as_ref() {
             limiter.consume(data.len());
         }
         self.inner.put_owned(key, data)
-    }
-
-    fn size(&self, key: &str) -> Result<Option<u64>> {
-        self.inner.size(key)
-    }
-
-    fn server_repack(&self, plan: &RepackPlanRequest) -> Result<RepackResultResponse> {
-        self.inner.server_repack(plan)
-    }
-
-    fn batch_delete_keys(&self, keys: &[String]) -> Result<()> {
-        self.inner.batch_delete_keys(keys)
-    }
-
-    // Server-side operations: the bytes move between the server and its own
-    // storage, never over the client's link, so no limiter is applied. These
-    // forwards are load-bearing — without them the trait defaults would report
-    // `UnsupportedBackend` and silently downgrade a throttled REST repo to
-    // client-side pack verification / local init scaffolding.
-    fn server_verify_packs(&self, plan: &VerifyPacksPlanRequest) -> Result<VerifyPacksResponse> {
-        self.inner.server_verify_packs(plan)
-    }
-
-    fn server_init(&self) -> Result<()> {
-        self.inner.server_init()
     }
 }
 
@@ -361,6 +332,7 @@ fn set_process_nice(value: i32) -> std::result::Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vykar_protocol::{VerifyPacksPlanRequest, VerifyPacksResponse};
 
     #[test]
     fn mib_conversion() {
@@ -418,6 +390,8 @@ mod tests {
                 self.init_calls.fetch_add(1, Ordering::SeqCst);
                 Ok(())
             }
+
+            vykar_storage::unsupported_server_ops!(except [server_verify_packs, server_init]);
         }
 
         let verify_calls = Arc::new(AtomicUsize::new(0));
@@ -437,7 +411,7 @@ mod tests {
 
         let plan = VerifyPacksPlanRequest {
             packs: Vec::new(),
-            protocol_version: vykar_storage::PROTOCOL_VERSION,
+            protocol_version: vykar_protocol::PROTOCOL_VERSION,
         };
         let response = wrapped
             .server_verify_packs(&plan)

@@ -10,3 +10,6 @@ workspace = true
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31.3", features = ["user"] }
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,6 +1,6 @@
 use axum::response::{IntoResponse, Response};
 
-use vykar_protocol::{PACK_MAGIC, PACK_VERSION_MAX, PACK_VERSION_MIN};
+use vykar_protocol::{validate_pack_header, PACK_HEADER_SIZE};
 
 use crate::error::ServerError;
 use crate::state::AppState;
@@ -59,30 +59,22 @@ fn check_structure(repo_dir: &std::path::Path) -> serde_json::Value {
                             let size = meta.len();
                             total_size += size;
 
-                            // Check minimum size: magic(8) + version(1) = 9.
-                            if size < 9 {
+                            if size < PACK_HEADER_SIZE as u64 {
                                 errors.push(format!(
                                     "pack too small ({size} bytes): packs/{shard_name}/{pack_name}"
                                 ));
                             } else {
-                                // Check magic + version (read only 9 bytes).
+                                // Read the header only — magic + version byte.
                                 match std::fs::File::open(pack_entry.path()).and_then(|mut f| {
                                     use std::io::Read;
-                                    let mut hdr = [0u8; 9];
+                                    let mut hdr = [0u8; PACK_HEADER_SIZE];
                                     f.read_exact(&mut hdr)?;
                                     Ok(hdr)
                                 }) {
                                     Ok(hdr) => {
-                                        if &hdr[..8] != PACK_MAGIC {
+                                        if let Err(reason) = validate_pack_header(&hdr) {
                                             errors.push(format!(
-                                                "invalid pack magic: packs/{shard_name}/{pack_name}"
-                                            ));
-                                        } else if !(PACK_VERSION_MIN..=PACK_VERSION_MAX)
-                                            .contains(&hdr[8])
-                                        {
-                                            errors.push(format!(
-                                                "unsupported pack version {}: packs/{shard_name}/{pack_name}",
-                                                hdr[8]
+                                                "{reason}: packs/{shard_name}/{pack_name}"
                                             ));
                                         }
                                     }

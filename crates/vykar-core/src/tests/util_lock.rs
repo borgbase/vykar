@@ -99,6 +99,8 @@ impl StorageBackend for AdvisoryLockBackend {
     fn create_dir(&self, _key: &str) -> Result<()> {
         Ok(())
     }
+
+    vykar_storage::unsupported_server_ops!();
 }
 
 fn init_repo_with_backend(backend: AdvisoryLockBackend) -> Repository {

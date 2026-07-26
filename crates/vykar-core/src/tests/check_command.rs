@@ -7,10 +7,9 @@ use crate::commands::check::{
     RepairAction, RepairMode, ServerVerifyOutcome,
 };
 use crate::index::ChunkIndexEntry;
+use vykar_protocol::{VerifyPackResult, VerifyPacksPlanRequest, VerifyPacksResponse};
 use vykar_storage::local_backend::LocalBackend;
-use vykar_storage::{
-    StorageBackend, VerifyPackResult, VerifyPacksPlanRequest, VerifyPacksResponse,
-};
+use vykar_storage::StorageBackend;
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
 use vykar_types::pack_id::PackId;
@@ -47,6 +46,8 @@ impl StorageBackend for TransientFailBackend {
     fn server_verify_packs(&self, _plan: &VerifyPacksPlanRequest) -> Result<VerifyPacksResponse> {
         Err(VykarError::Other("transient failure".into()))
     }
+
+    vykar_storage::unsupported_server_ops!(except[server_verify_packs]);
 }
 
 #[test]

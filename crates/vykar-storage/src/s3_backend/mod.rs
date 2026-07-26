@@ -392,15 +392,7 @@ impl StorageBackend for S3Backend {
             return Ok(None);
         }
         let full_key = self.full_key(key);
-        let end = offset
-            .checked_add(length)
-            .and_then(|n| n.checked_sub(1))
-            .ok_or_else(|| {
-                VykarError::Other(format!(
-                    "S3 GET_RANGE {key}: offset {offset} + length {length} overflows u64"
-                ))
-            })?;
-        let range_header = format!("bytes={offset}-{end}");
+        let range_header = crate::http_util::range_header("S3", key, offset, length)?;
 
         let mut action = self.bucket.get_object(Some(&self.credentials), &full_key);
         // SigV4 canonicalizes signed header names as lowercase.
@@ -434,30 +426,7 @@ impl StorageBackend for S3Backend {
                         "S3 GET_RANGE {key}: unexpected status {status}"
                     )));
                 }
-                let cap = match usize::try_from(length) {
-                    Ok(c) => c,
-                    Err(_) => {
-                        return Err(HttpRetryError::Permanent(format!(
-                            "S3 GET_RANGE {key}: length {length} exceeds platform usize"
-                        )));
-                    }
-                };
-                let mut buf = Vec::with_capacity(cap);
-                resp.body_mut()
-                    .as_reader()
-                    .take(length)
-                    .read_to_end(&mut buf)
-                    .map_err(HttpRetryError::BodyIo)?;
-                if buf.len() != cap {
-                    return Err(HttpRetryError::BodyIo(std::io::Error::new(
-                        std::io::ErrorKind::UnexpectedEof,
-                        format!(
-                            "short read on {key} at offset {offset}: expected {length} bytes, got {}",
-                            buf.len()
-                        ),
-                    )));
-                }
-                Ok(Some(buf))
+                crate::http_util::read_range_body(&mut resp, "S3", key, offset, length).map(Some)
             },
         )
         .map_err(|e| s3_error("GET_RANGE", key, e))
@@ -491,6 +460,8 @@ impl StorageBackend for S3Backend {
         .map_err(|e| s3_error("MKDIR", key, e))?;
         Ok(())
     }
+
+    crate::unsupported_server_ops!();
 }
 
 #[allow(clippy::result_large_err)]

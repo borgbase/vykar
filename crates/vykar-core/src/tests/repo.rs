@@ -620,6 +620,8 @@ impl vykar_storage::StorageBackend for FailPackUploadsBackend {
     fn create_dir(&self, key: &str) -> vykar_types::error::Result<()> {
         self.inner.create_dir(key)
     }
+
+    vykar_storage::unsupported_server_ops!();
 }
 
 #[test]

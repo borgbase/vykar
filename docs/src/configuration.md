@@ -670,7 +670,7 @@ schedule:
 | `cron` | — | 5-field cron expression | Cron schedule. Mutually exclusive with `every` |
 | `on_startup` | `false` | bool | Run backup immediately when daemon starts |
 | `jitter_seconds` | `0` | integer | Random delay 0–N seconds added to each run |
-| `passphrase_prompt_timeout_seconds` | `300` | integer (seconds) | Timeout for interactive passphrase prompts |
+| `passphrase_prompt_timeout_seconds` | `300` | integer (seconds) | **Deprecated — accepted but ignored.** Interactive passphrase prompts are never timed out |
 
 ### Interval mode
 
@@ -723,8 +723,7 @@ repositories:
 ```
 
 Every field is per-repo, including `on_startup` (only the repos that set it run
-at daemon/GUI startup), `jitter_seconds`, and
-`passphrase_prompt_timeout_seconds`.
+at daemon/GUI startup) and `jitter_seconds`.
 
 Because `enabled` defaults to `false`, an override that sets a cadence without
 `enabled: true` would silently switch that repository off. vykar rejects it:

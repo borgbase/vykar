@@ -175,7 +175,6 @@ fn resolve_passphrase_passes_prompt_context() {
     config.encryption.mode = EncryptionModeConfig::Aes256Gcm;
     config.encryption.passphrase = None;
     config.encryption.passcommand = None;
-    config.schedule.passphrase_prompt_timeout_seconds = 17;
     set_vykar_passphrase(None);
 
     let mut seen_prompt: Option<PassphrasePrompt> = None;
@@ -189,5 +188,4 @@ fn resolve_passphrase_passes_prompt_context() {
     let prompt = seen_prompt.expect("prompt should have been invoked");
     assert_eq!(prompt.repository_label.as_deref(), Some("repo-1"));
     assert_eq!(prompt.repository_url, config.repository.url);
-    assert_eq!(prompt.timeout_seconds, 17);
 }

@@ -75,7 +75,6 @@ schedule:
   every: "24h"
   on_startup: false
   jitter_seconds: 0
-  passphrase_prompt_timeout_seconds: 300
 ```
 
 ## Security

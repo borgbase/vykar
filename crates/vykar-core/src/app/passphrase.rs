@@ -19,11 +19,15 @@ use vykar_types::error::{Result, VykarError};
 /// Default timeout for passcommand execution (60 seconds).
 const PASSCOMMAND_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Context handed to an interactive passphrase prompt callback.
+///
+/// Deliberately carries no timeout: neither the CLI nor the GUI prompt can be
+/// timed out (`schedule.passphrase_prompt_timeout_seconds` is accepted for
+/// config compatibility but ignored).
 #[derive(Debug, Clone)]
 pub struct PassphrasePrompt {
     pub repository_label: Option<String>,
     pub repository_url: String,
-    pub timeout_seconds: u64,
 }
 
 pub fn configured_passphrase(config: &VykarConfig) -> Result<Option<Zeroizing<String>>> {
@@ -128,6 +132,5 @@ where
     prompt(PassphrasePrompt {
         repository_label: label.map(|s| s.to_string()),
         repository_url: config.repository.url.clone(),
-        timeout_seconds: config.schedule.passphrase_prompt_timeout_seconds,
     })
 }

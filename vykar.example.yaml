@@ -242,7 +242,7 @@ compression:
 #   cron: "0 3 * * *"            # OR 5-field cron (mutually exclusive with every)
 #   on_startup: false
 #   jitter_seconds: 0
-#   passphrase_prompt_timeout_seconds: 300
+#   passphrase_prompt_timeout_seconds: 300   # deprecated: accepted but ignored
 
 # Optional resource limits for backup.
 # Bandwidth values are MiB/s (0 = unlimited).

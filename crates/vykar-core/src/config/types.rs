@@ -104,6 +104,9 @@ pub struct ScheduleConfig {
     pub on_startup: bool,
     #[serde(default)]
     pub jitter_seconds: u64,
+    /// Deprecated: accepted but ignored. Interactive passphrase prompts are
+    /// never timed out. Retained so existing configs keep deserializing under
+    /// `deny_unknown_fields`.
     #[serde(default = "default_passphrase_prompt_timeout_seconds")]
     pub passphrase_prompt_timeout_seconds: u64,
 }

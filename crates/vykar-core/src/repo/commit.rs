@@ -216,30 +216,6 @@ impl Repository {
         Ok(())
     }
 
-    /// Commit a concurrent backup session. Called while holding the exclusive lock.
-    ///
-    /// 1. Flush packs and join uploads.
-    /// 2. Take the delta from the write session.
-    /// 3. Refresh snapshot list from storage.
-    /// 4. Check snapshot name uniqueness against fresh list.
-    /// 5. Download fresh remote index, reconcile delta, persist index.
-    /// 6. Write `snapshots/<id>` to storage — **commit point**.
-    /// 7. Update local manifest + snapshot cache.
-    /// 8. Save file cache and consume write session.
-    pub fn commit_concurrent_session(
-        &mut self,
-        snapshot_entry: manifest::SnapshotEntry,
-        snapshot_packed: Vec<u8>,
-        new_file_cache: &mut file_cache::FileCache,
-    ) -> Result<()> {
-        self.commit_concurrent_session_with_progress(
-            snapshot_entry,
-            snapshot_packed,
-            new_file_cache,
-            &mut None::<Box<dyn FnMut(crate::commands::backup::BackupProgressEvent)>>,
-        )
-    }
-
     /// Commit a concurrent backup session with progress reporting.
     ///
     /// 1. Flush packs and join uploads.
@@ -352,7 +328,7 @@ impl Repository {
         if let Some(delta) = delta {
             if !delta.is_empty() {
                 let ctx = emit_stage(progress, "fetch index");
-                let raw_blob = self.fetch_raw_index_blob()?;
+                let raw_blob = self.storage.get("index")?;
                 log_stage_elapsed(ctx);
 
                 // Try fast path: compare raw blob against cached copy.
@@ -370,7 +346,8 @@ impl Repository {
                 } else {
                     let ctx = emit_stage(progress, "decode index");
                     let fresh_index = if let Some(ref raw_data) = raw_blob {
-                        Self::decode_raw_index_blob(raw_data, self.crypto.as_ref())?
+                        let blob = Self::decode_index_blob_full(raw_data, self.crypto.as_ref())?;
+                        (blob.generation, blob.chunks)
                     } else {
                         (0, ChunkIndex::new())
                     };
@@ -709,17 +686,6 @@ impl Repository {
         )?;
         let index_bytes = compress::decompress_metadata(&compressed)?;
         Ok(rmp_serde::from_slice(&index_bytes)?)
-    }
-
-    /// Fetch the raw encrypted index blob from storage without decoding.
-    fn fetch_raw_index_blob(&self) -> Result<Option<Vec<u8>>> {
-        self.storage.get("index")
-    }
-
-    /// Decode an already-fetched raw index blob into (generation, ChunkIndex).
-    fn decode_raw_index_blob(raw: &[u8], crypto: &dyn CryptoEngine) -> Result<(u64, ChunkIndex)> {
-        let blob = Self::decode_index_blob_full(raw, crypto)?;
-        Ok((blob.generation, blob.chunks))
     }
 
     /// Try the fast-path commit: if the remote index blob matches the cached

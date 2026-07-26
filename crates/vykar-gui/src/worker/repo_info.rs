@@ -3,9 +3,8 @@ use std::sync::atomic::Ordering;
 
 use chrono::{DateTime, Local, Utc};
 use slint::SharedString;
-use vykar_core::app::operations;
 use vykar_core::commands::info::InfoStats;
-use vykar_core::commands::init;
+use vykar_core::commands::{init, list};
 use vykar_core::config::{self, EncryptionModeConfig};
 use vykar_types::error::VykarError;
 
@@ -361,7 +360,7 @@ pub(super) fn handle_refresh_snapshots(ctx: &mut WorkerContext, repo_selector: S
         }
         let repo_name = format_repo_name(repo);
         let outcome = with_passphrase_retry(repo, &mut ctx.passphrases, 3, |pass| {
-            operations::list_snapshots_with_stats(&repo.config, pass)
+            list::list_snapshots_with_stats(&repo.config, pass)
         });
 
         let listing = match outcome {
@@ -472,7 +471,7 @@ pub(super) fn handle_fetch_snapshot_contents(
         &mut ctx.passphrases,
     ) {
         Ok(PassphraseRun::Ran((repo, passphrase))) => {
-            match operations::list_snapshot_items_with_source_paths(
+            match list::list_snapshot_items_with_source_paths(
                 &repo.config,
                 passphrase.as_deref().map(|s| s.as_str()),
                 &snapshot_name,

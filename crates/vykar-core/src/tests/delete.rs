@@ -320,13 +320,11 @@ fn delete_phase3_refcount_failure_returns_warning_not_error() {
     );
 }
 
-/// Regression test for the GUI wrapper: a single-snapshot delete whose Phase 3
-/// fails must surface as `Ok(DeleteResult { stats: [], warnings: [..] })` and
-/// must not panic when callers use `result.stats.first()` to format output.
+/// Regression test: a single-snapshot delete whose Phase 3 fails must surface
+/// as `Ok(DeleteResult { stats: [], warnings: [..] })` and must not panic when
+/// callers use `result.stats.first()` to format output.
 #[test]
-fn delete_snapshot_wrapper_handles_empty_stats() {
-    use crate::app::operations;
-
+fn delete_single_snapshot_handles_empty_stats() {
     let tmp = tempfile::tempdir().unwrap();
     let repo_dir = tmp.path().join("repo");
     let source_dir = tmp.path().join("source");
@@ -349,8 +347,8 @@ fn delete_snapshot_wrapper_handles_empty_stats() {
         }
     }
 
-    let result = operations::delete_snapshot(&config, None, "snap-wrapper")
-        .expect("delete_snapshot must not fail after commit point");
+    let result = commands::delete::run(&config, None, &["snap-wrapper"], false, None)
+        .expect("delete must not fail after commit point");
     assert!(result.stats.is_empty());
     assert_eq!(result.warnings.len(), 1);
     assert!(result.warnings[0].contains("snap-wrapper"));

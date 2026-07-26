@@ -11,8 +11,8 @@ use chrono::{DateTime, Local, Utc};
 use serde::Serialize;
 
 use vykar_common::display::{format_bytes, format_count};
-use vykar_core::app::operations;
 use vykar_core::app::passphrase::configured_passphrase;
+use vykar_core::commands::list;
 use vykar_core::config::{ResolvedRepo, ScheduleConfig};
 
 #[derive(Debug, Clone, Serialize)]
@@ -355,7 +355,7 @@ pub(crate) fn refresh_repos(status: &SharedStatus, repos: &[ResolvedRepo]) {
             }
         }
 
-        match operations::list_snapshots_with_stats(&repo.config, pass_ref) {
+        match list::list_snapshots_with_stats(&repo.config, pass_ref) {
             Ok(listing) => {
                 if let Some(msg) =
                     vykar_core::repo::snapshot_cache::describe_skipped(&listing.hidden)

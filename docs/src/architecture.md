@@ -432,7 +432,7 @@ flowchart LR
 
 ```text
 acquire_lock_with_retry(10 attempts, 500ms base, exponential backoff + jitter)
-commit_concurrent_session():
+commit_concurrent_session_with_progress():
   → flush packs/pending uploads (pack flush triggers: target size, 10,000 blobs, or 300s age)
   → refresh snapshot list from snapshots/ (via local snapshot cache diff)
   → check snapshot name uniqueness against fresh list

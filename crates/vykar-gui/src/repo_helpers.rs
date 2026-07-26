@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use crossbeam_channel::Sender;
 use vykar_core::app::{operations, passphrase};
+use vykar_core::commands;
 use vykar_core::config::{self, ResolvedRepo};
 use vykar_types::error::VykarError;
 
@@ -172,7 +173,7 @@ pub(crate) fn find_repo_for_snapshot<'a>(
     for repo in select_repos(repos, selector)? {
         let key = repo.config.repository.url.clone();
         let outcome = with_passphrase_retry(repo, passphrases, 3, |pass| {
-            operations::list_snapshot_items(&repo.config, pass, snapshot).map(|_| ())
+            commands::list::list_snapshot_items(&repo.config, pass, snapshot).map(|_| ())
         });
 
         match outcome {

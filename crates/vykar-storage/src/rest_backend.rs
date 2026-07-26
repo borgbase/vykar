@@ -103,41 +103,6 @@ impl RestBackend {
         Ok(())
     }
 
-    /// Get repository statistics from the server.
-    pub fn stats(&self) -> Result<serde_json::Value> {
-        let url = format!("{}?stats", self.base_url);
-        let body = self
-            .retry_call(
-                "stats",
-                || {
-                    let mut req = self.agent.get(&url);
-                    if let Some(ref token) = self.token {
-                        req = req.header("Authorization", &format!("Bearer {token}"));
-                    }
-                    req.call()
-                },
-                |mut resp| {
-                    let status = resp.status().as_u16();
-                    if status >= 400 {
-                        crate::retry::classify_status(
-                            status,
-                            format!("REST stats: HTTP {status}"),
-                        )?;
-                    }
-                    let mut buf = Vec::new();
-                    resp.body_mut()
-                        .as_reader()
-                        .read_to_end(&mut buf)
-                        .map_err(HttpRetryError::BodyIo)?;
-                    Ok(buf)
-                },
-            )
-            .map_err(|e| VykarError::Other(format!("REST stats: {e}")))?;
-        let val: serde_json::Value = serde_json::from_slice(&body)
-            .map_err(|e| VykarError::Other(format!("REST stats parse: {e}")))?;
-        Ok(val)
-    }
-
     /// Send a verify-packs plan to the server for server-side pack verification.
     pub fn verify_packs(&self, plan: &VerifyPacksPlanRequest) -> Result<VerifyPacksResponse> {
         let url = format!("{}?verify-packs", self.base_url);

@@ -5,20 +5,41 @@ use vykar_types::error::Result;
 pub use vykar_storage::StorageBackend;
 
 /// Convert a [`RepositoryConfig`] into a [`StorageConfig`] for backend construction.
+///
+/// `cfg` is destructured exhaustively (no `..` rest pattern) so that adding a
+/// field to [`RepositoryConfig`] fails to compile here rather than being
+/// silently dropped on the way to the backend.
 fn storage_config_from_repo(cfg: &RepositoryConfig) -> StorageConfig {
+    let RepositoryConfig {
+        url,
+        region,
+        access_key_id,
+        secret_access_key,
+        sftp_key,
+        sftp_known_hosts,
+        sftp_timeout,
+        access_token,
+        allow_insecure_http,
+        // Pack sizing is a repository-format concern, not a transport one.
+        min_pack_size: _,
+        max_pack_size: _,
+        retry,
+        s3_soft_delete,
+    } = cfg;
+
     StorageConfig {
-        url: cfg.url.clone(),
-        region: cfg.region.clone(),
-        access_key_id: cfg.access_key_id.clone(),
-        secret_access_key: cfg.secret_access_key.clone(),
-        sftp_key: cfg.sftp_key.clone(),
-        sftp_known_hosts: cfg.sftp_known_hosts.clone(),
+        url: url.clone(),
+        region: region.clone(),
+        access_key_id: access_key_id.clone(),
+        secret_access_key: secret_access_key.clone(),
+        sftp_key: sftp_key.clone(),
+        sftp_known_hosts: sftp_known_hosts.clone(),
         max_connections: None,
-        sftp_timeout: cfg.sftp_timeout,
-        access_token: cfg.access_token.clone(),
-        allow_insecure_http: cfg.allow_insecure_http,
-        retry: cfg.retry,
-        s3_soft_delete: cfg.s3_soft_delete,
+        sftp_timeout: *sftp_timeout,
+        access_token: access_token.clone(),
+        allow_insecure_http: *allow_insecure_http,
+        retry: *retry,
+        s3_soft_delete: *s3_soft_delete,
     }
 }
 

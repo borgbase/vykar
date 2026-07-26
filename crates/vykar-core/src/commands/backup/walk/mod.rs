@@ -421,7 +421,7 @@ pub(super) fn build_walk_iter<'a>(
             path: source.configured.clone(),
         }));
 
-        let entries = walk_source(
+        let entries = walk_source_inode_sorted(
             source,
             exclude_patterns,
             exclude_if_present,
@@ -518,32 +518,6 @@ impl Iterator for WalkItems {
             }
         }
     }
-}
-
-/// Walk a single resolved source and yield WalkEntry items.
-#[allow(clippy::too_many_arguments)]
-fn walk_source<'a>(
-    source: &'a ResolvedSource,
-    exclude_patterns: &'a [String],
-    exclude_if_present: &'a [String],
-    one_file_system: bool,
-    git_ignore: bool,
-    xattrs_enabled: bool,
-    file_cache: &'a FileCache,
-    segment_size: u64,
-    parent_reuse_index: Option<&'a ParentReuseIndex>,
-) -> Box<dyn Iterator<Item = Result<WalkEntry>> + Send + 'a> {
-    walk_source_inode_sorted(
-        source,
-        exclude_patterns,
-        exclude_if_present,
-        one_file_system,
-        git_ignore,
-        xattrs_enabled,
-        file_cache,
-        segment_size,
-        parent_reuse_index,
-    )
 }
 
 /// Walk a single resolved source using the inode-sorted walker.

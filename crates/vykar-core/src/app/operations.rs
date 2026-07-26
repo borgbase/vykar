@@ -15,8 +15,6 @@ use rand::Rng;
 use crate::commands;
 use crate::compress::Compression;
 use crate::config::{ResolvedRepo, SourceEntry, VykarConfig};
-use crate::repo::manifest::SnapshotEntry;
-use crate::snapshot::item::Item;
 use vykar_types::error::{Result, VykarError};
 
 #[derive(Debug, Clone)]
@@ -36,17 +34,6 @@ pub struct BackupSourceResult {
 #[derive(Debug, Clone, Default)]
 pub struct BackupRunReport {
     pub created: Vec<BackupSourceResult>,
-}
-
-#[derive(Debug, Clone)]
-pub struct RestoreRequest {
-    pub snapshot_name: String,
-    pub destination: String,
-    pub pattern: Option<String>,
-    /// When true, recompute each restored chunk's keyed BLAKE2b ID and abort
-    /// on mismatch. Defense-in-depth against writer-side bugs only — AEAD
-    /// already authenticates ciphertext under the standard threat model.
-    pub verify_chunks: bool,
 }
 
 // ── Hook-aware backup event types ─────────────────────────────────────────
@@ -391,7 +378,12 @@ pub fn run_full_cycle_for_repo(
     // 1. Backup
     if !shutting_down(shutdown) {
         match resolve_cycle_sources(sources, source_filter) {
-            Err(e) => emit_failed(CycleStep::Backup, &e, on_event, &mut steps),
+            Err(e) => emit_terminal(
+                CycleStep::Backup,
+                StepOutcome::Failed(e),
+                on_event,
+                &mut steps,
+            ),
             Ok(effective_sources) => {
                 backup_report = run_hooked_step(
                     CycleStep::Backup,
@@ -442,9 +434,19 @@ pub fn run_full_cycle_for_repo(
                 .any(|s| s.retention.as_ref().is_some_and(|r| r.has_any_rule()));
 
         if !has_retention {
-            emit_skipped(CycleStep::Prune, "no retention rules", on_event, &mut steps);
+            emit_terminal(
+                CycleStep::Prune,
+                StepOutcome::Skipped("no retention rules".into()),
+                on_event,
+                &mut steps,
+            );
         } else if !backup_ok {
-            emit_skipped(CycleStep::Prune, "backup failed", on_event, &mut steps);
+            emit_terminal(
+                CycleStep::Prune,
+                StepOutcome::Skipped("backup failed".into()),
+                on_event,
+                &mut steps,
+            );
         } else {
             prune_stats = run_hooked_step(
                 CycleStep::Prune,
@@ -481,7 +483,12 @@ pub fn run_full_cycle_for_repo(
     // 3. Compact
     if !shutting_down(shutdown) {
         if !backup_ok {
-            emit_skipped(CycleStep::Compact, "backup failed", on_event, &mut steps);
+            emit_terminal(
+                CycleStep::Compact,
+                StepOutcome::Skipped("backup failed".into()),
+                on_event,
+                &mut steps,
+            );
         } else {
             compact_stats = run_hooked_step(
                 CycleStep::Compact,
@@ -625,25 +632,14 @@ fn resolve_cycle_sources<'a>(
         .map(|selected| Cow::Owned(selected.into_iter().cloned().collect()))
 }
 
-fn emit_failed(
+/// Record a step that never ran its action: emit the started/finished pair and
+/// push the terminal outcome.
+fn emit_terminal(
     step: CycleStep,
-    error: &str,
+    outcome: StepOutcome,
     on_event: &mut dyn FnMut(CycleEvent),
     steps: &mut Vec<(CycleStep, StepOutcome)>,
 ) {
-    let outcome = StepOutcome::Failed(error.into());
-    on_event(CycleEvent::StepStarted(step));
-    on_event(CycleEvent::StepFinished(step, outcome.clone()));
-    steps.push((step, outcome));
-}
-
-fn emit_skipped(
-    step: CycleStep,
-    reason: &str,
-    on_event: &mut dyn FnMut(CycleEvent),
-    steps: &mut Vec<(CycleStep, StepOutcome)>,
-) {
-    let outcome = StepOutcome::Skipped(reason.into());
     on_event(CycleEvent::StepStarted(step));
     on_event(CycleEvent::StepFinished(step, outcome.clone()));
     steps.push((step, outcome));
@@ -661,112 +657,4 @@ fn drain_cycle_warnings(
             warning,
         });
     }
-}
-
-// ── Remaining public APIs (unchanged) ────────────────────────────────────
-
-pub fn list_snapshots(
-    config: &VykarConfig,
-    passphrase: Option<&str>,
-) -> Result<Vec<SnapshotEntry>> {
-    commands::list::list_snapshots(config, passphrase)
-}
-
-pub fn list_snapshots_with_stats(
-    config: &VykarConfig,
-    passphrase: Option<&str>,
-) -> Result<commands::list::SnapshotListing> {
-    commands::list::list_snapshots_with_stats(config, passphrase)
-}
-
-pub fn list_snapshot_items(
-    config: &VykarConfig,
-    passphrase: Option<&str>,
-    snapshot_name: &str,
-) -> Result<Vec<Item>> {
-    commands::list::list_snapshot_items(config, passphrase, snapshot_name)
-}
-
-pub fn list_snapshot_items_with_source_paths(
-    config: &VykarConfig,
-    passphrase: Option<&str>,
-    snapshot_name: &str,
-) -> Result<(Vec<Item>, Vec<String>)> {
-    commands::list::list_snapshot_items_with_source_paths(config, passphrase, snapshot_name)
-}
-
-pub fn diff_snapshots(
-    config: &VykarConfig,
-    passphrase: Option<&str>,
-    snapshot_a: &str,
-    snapshot_b: &str,
-) -> Result<commands::diff::DiffResult> {
-    commands::diff::run(config, passphrase, snapshot_a, snapshot_b)
-}
-
-pub fn restore_snapshot(
-    config: &VykarConfig,
-    passphrase: Option<&str>,
-    req: &RestoreRequest,
-) -> Result<commands::restore::RestoreStats> {
-    commands::restore::run(
-        config,
-        passphrase,
-        &req.snapshot_name,
-        &req.destination,
-        req.pattern.as_deref(),
-        config.xattrs.enabled,
-        req.verify_chunks,
-    )
-}
-
-pub fn restore_selected(
-    config: &VykarConfig,
-    passphrase: Option<&str>,
-    snapshot_name: &str,
-    destination: &str,
-    selected_paths: &std::collections::HashSet<String>,
-) -> Result<commands::restore::RestoreStats> {
-    commands::restore::run_selected(
-        config,
-        passphrase,
-        snapshot_name,
-        destination,
-        selected_paths,
-        config.xattrs.enabled,
-        false,
-    )
-}
-
-pub fn check_repo(
-    config: &VykarConfig,
-    passphrase: Option<&str>,
-    verify_data: bool,
-) -> Result<commands::check::CheckResult> {
-    commands::check::run(config, passphrase, verify_data, false)
-}
-
-pub fn check_repo_with_progress(
-    config: &VykarConfig,
-    passphrase: Option<&str>,
-    verify_data: bool,
-    progress: &mut dyn FnMut(commands::check::CheckProgressEvent),
-) -> Result<commands::check::CheckResult> {
-    commands::check::run_with_progress(
-        config,
-        passphrase,
-        verify_data,
-        false,
-        Some(progress),
-        100,
-        false,
-    )
-}
-
-pub fn delete_snapshot(
-    config: &VykarConfig,
-    passphrase: Option<&str>,
-    snapshot_name: &str,
-) -> Result<commands::delete::DeleteResult> {
-    commands::delete::run(config, passphrase, &[snapshot_name], false, None)
 }

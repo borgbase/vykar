@@ -11,11 +11,11 @@ pub use types::{
     RepairMode, RepairPlan, RepairResult,
 };
 
-#[allow(unused_imports)]
+// Re-exported for the crate-level unit tests in `tests::check_command`, which
+// reach these internals through `commands::check`.
+#[cfg(test)]
 pub(crate) use scan::verify_pack_full;
-#[allow(unused_imports)]
+#[cfg(test)]
 pub(crate) use server_verify::{process_verify_response, try_server_verify};
-#[allow(unused_imports)]
-pub(crate) use types::ProcessedVerifyResult;
-#[allow(unused_imports)]
+#[cfg(test)]
 pub(crate) use types::ServerVerifyOutcome;

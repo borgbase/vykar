@@ -125,17 +125,6 @@ pub fn open_repo_with_read_session(
     }
 }
 
-/// Open a repository and execute a mutation while holding an advisory lock.
-pub fn with_open_repo_lock<T>(
-    config: &VykarConfig,
-    passphrase: Option<&str>,
-    opts: OpenOptions,
-    action: impl FnOnce(&mut Repository) -> Result<T>,
-) -> Result<T> {
-    let mut repo = open_repo(config, passphrase, opts)?;
-    with_repo_lock(&mut repo, action)
-}
-
 /// Return `Err(VykarError::Interrupted)` if the shutdown flag is set.
 pub fn check_interrupted(shutdown: Option<&AtomicBool>) -> Result<()> {
     if shutdown.is_some_and(|f| f.load(Ordering::Relaxed)) {
@@ -212,7 +201,7 @@ fn run_under_fence<T>(
 
 /// Open a repository and execute a maintenance operation while holding the lock.
 ///
-/// Unlike `with_open_repo_lock`, this first cleans up stale sessions and
+/// Unlike `with_repo_lock`, this first cleans up stale sessions and
 /// refuses to proceed if active (non-stale) backup sessions exist.
 pub fn with_open_repo_maintenance_lock<T>(
     config: &VykarConfig,

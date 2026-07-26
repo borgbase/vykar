@@ -1,7 +1,6 @@
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, Local, Utc};
-use vykar_core::app::operations;
 use vykar_core::commands;
 use vykar_core::commands::find::{FileStatus, FindFilter, FindScope};
 use vykar_core::config;
@@ -35,12 +34,14 @@ pub(super) fn handle_restore_selected(
     ) {
         Ok(PassphraseRun::Ran((repo, passphrase))) => {
             let path_set: std::collections::HashSet<String> = paths.into_iter().collect();
-            match operations::restore_selected(
+            match commands::restore::run_selected(
                 &repo.config,
                 passphrase.as_deref().map(|s| s.as_str()),
                 &snapshot,
                 &dest,
                 &path_set,
+                repo.config.xattrs.enabled,
+                false, // verify_chunks
             ) {
                 Ok(stats) => {
                     send_log(
@@ -287,7 +288,7 @@ pub(super) fn handle_diff_snapshots(
     };
 
     let outcome = with_passphrase_retry(repo, &mut ctx.passphrases, 3, |pass| {
-        operations::diff_snapshots(&repo.config, pass, &snapshot_a, &snapshot_b)
+        commands::diff::run(&repo.config, pass, &snapshot_a, &snapshot_b)
     });
 
     match outcome {

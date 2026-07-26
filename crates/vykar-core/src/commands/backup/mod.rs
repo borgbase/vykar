@@ -841,8 +841,8 @@ pub fn run_with_progress(
     // ── Phase 2: Commit (exclusive lock) ────────────────────────────────
     //
     // new_file_cache is passed by &mut so the caller retains ownership.
-    // On success, commit_concurrent_session consumes the active section
-    // (merges it into the persistent cache).
+    // On success, commit_concurrent_session_with_progress consumes the active
+    // section (merges it into the persistent cache).
 
     let commit_result = (|| -> Result<()> {
         let guard = lock::acquire_lock_with_retry(repo.storage.as_ref(), 10, 500)?;

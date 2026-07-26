@@ -578,31 +578,13 @@ fn sanitize_path_into(path: &Path, display: &str, out: &mut PathBuf) -> Result<(
     Ok(())
 }
 
+/// Allocating wrapper around the production sanitizer, so traversal tests
+/// exercise `sanitize_path_into` itself rather than a copy of its rules
+/// (house style: `classify_symlink_target`).
 #[cfg(test)]
 fn sanitize_item_path(raw: &str) -> Result<PathBuf> {
-    let path = Path::new(raw);
-    if path.is_absolute() {
-        return Err(VykarError::InvalidFormat(format!(
-            "refusing to restore absolute path: {raw}"
-        )));
-    }
     let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::Normal(part) => out.push(part),
-            Component::CurDir => {}
-            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
-                return Err(VykarError::InvalidFormat(format!(
-                    "refusing to restore unsafe path: {raw}"
-                )));
-            }
-        }
-    }
-    if out.as_os_str().is_empty() {
-        return Err(VykarError::InvalidFormat(format!(
-            "refusing to restore empty path: {raw}"
-        )));
-    }
+    sanitize_path_into(Path::new(raw), raw, &mut out)?;
     Ok(out)
 }
 

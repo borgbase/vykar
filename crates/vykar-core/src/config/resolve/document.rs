@@ -58,6 +58,9 @@ pub struct RepositoryEntry {
     /// Per-repository resource limits (full override of top-level `limits`).
     pub limits: Option<ResourceLimitsConfig>,
 
+    /// Per-repository backup schedule (full override of top-level `schedule`).
+    pub schedule: Option<ScheduleConfig>,
+
     /// Per-repo hooks (optional).
     #[serde(default)]
     pub hooks: Option<HooksConfig>,

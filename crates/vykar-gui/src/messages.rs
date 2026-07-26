@@ -31,6 +31,12 @@ pub(crate) enum AppCommand {
     RunBackupAll {
         scheduled: bool,
     },
+    /// Scheduled full cycle limited to the repositories whose slot came due.
+    /// Distinct from `RunBackupRepo`, which is the manual per-repo button and
+    /// runs only a backup, not the full cycle.
+    RunBackupRepos {
+        repo_names: Vec<String>,
+    },
     RunBackupRepo {
         repo_name: String,
     },

@@ -22,6 +22,10 @@ pub(crate) struct RepoInfo {
     pub snapshots: String,
     pub last_snapshot: String,
     pub size: String,
+    /// This repo's own next scheduled run — repos can have different cadences.
+    /// Stamped by `set_repo_next_runs` and carried across row rebuilds by
+    /// `carry_over_next_runs` (`refresh_repos` does not know the schedule).
+    pub next_run: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -127,6 +131,41 @@ fn schedule_brief(schedule: &ScheduleConfig) -> String {
     schedule.every.clone().unwrap_or_else(|| "24h".to_string())
 }
 
+/// Identity used to decide whether all repos share one cadence. Compares the
+/// parsed interval rather than the raw string, so `60m` and `1h` are the same
+/// schedule rather than a spurious "per-repo".
+fn schedule_key(schedule: &ScheduleConfig) -> (bool, Option<String>, Option<u64>) {
+    (
+        schedule.enabled,
+        schedule.cron.clone(),
+        schedule.every_duration().ok().map(|d| d.as_secs()),
+    )
+}
+
+/// Top-level schedule summary: the shared cadence when every repo agrees,
+/// otherwise `"per-repo"` (the per-repo column carries the detail).
+fn repos_schedule_brief(repos: &[ResolvedRepo]) -> String {
+    let mut schedules = repos.iter().map(|r| &r.config.schedule);
+    let Some(first) = schedules.next() else {
+        return "Off".to_string();
+    };
+    let first_key = schedule_key(first);
+    if schedules.any(|s| schedule_key(s) != first_key) {
+        return "per-repo".to_string();
+    }
+    schedule_brief(first)
+}
+
+fn format_next_run(next_run: Option<SystemTime>) -> String {
+    match next_run {
+        Some(t) => {
+            let dt: DateTime<Local> = t.into();
+            dt.format("%Y-%m-%d %H:%M:%S").to_string()
+        }
+        None => "Off".to_string(),
+    }
+}
+
 fn hostname() -> String {
     std::env::var("HOSTNAME")
         .or_else(|_| std::env::var("COMPUTERNAME"))
@@ -137,12 +176,7 @@ const RECENT_SNAPSHOTS_LIMIT: usize = 10;
 
 /// Initialize the static parts (process info, sources, schedule) once at
 /// daemon startup. Per-repo data is populated by `refresh_repos`.
-pub(crate) fn init(
-    status: &SharedStatus,
-    repos: &[ResolvedRepo],
-    schedule: &ScheduleConfig,
-    started_at: Instant,
-) {
+pub(crate) fn init(status: &SharedStatus, repos: &[ResolvedRepo], started_at: Instant) {
     let mut s = status.write().expect("status lock poisoned");
     s.process = ProcessInfo {
         hostname: hostname(),
@@ -151,11 +185,11 @@ pub(crate) fn init(
         uptime: format_duration(started_at.elapsed()),
         next_run: None,
     };
-    s.schedule_brief = schedule_brief(schedule);
+    s.schedule_brief = repos_schedule_brief(repos);
     s.sources = collect_sources(repos);
 }
 
-/// Refresh process uptime and next-run hint.
+/// Refresh process uptime and the earliest next-run hint (what the loop wakes at).
 pub(crate) fn touch_process(
     status: &SharedStatus,
     started_at: Instant,
@@ -167,6 +201,20 @@ pub(crate) fn touch_process(
         let dt: DateTime<Local> = t.into();
         dt.format("%Y-%m-%d %H:%M:%S").to_string()
     });
+}
+
+/// Stamp each repo row with its own next scheduled run, matched by name.
+/// `refresh_repos` rebuilds the rows, so this is re-applied on every tick.
+pub(crate) fn set_repo_next_runs(
+    status: &SharedStatus,
+    next_runs: &[(String, Option<SystemTime>)],
+) {
+    let mut s = status.write().expect("status lock poisoned");
+    for row in &mut s.repos {
+        if let Some((_, next)) = next_runs.iter().find(|(name, _)| *name == row.name) {
+            row.next_run = format_next_run(*next);
+        }
+    }
 }
 
 fn collect_sources(repos: &[ResolvedRepo]) -> Vec<SourceInfo> {
@@ -252,6 +300,19 @@ fn collect_sources(repos: &[ResolvedRepo]) -> Vec<SourceInfo> {
     items
 }
 
+/// Carry each repo's next-run string across a row rebuild, matched by name.
+///
+/// `refresh_repos` builds fresh rows that do not know the schedule, so without
+/// this the column would drop back to the placeholder until the daemon loop's
+/// next 1s tick re-stamped it — briefly visible in `/api/status.json`.
+fn carry_over_next_runs(new_rows: &mut [RepoInfo], previous: &[RepoInfo]) {
+    for row in new_rows {
+        if let Some(prev) = previous.iter().find(|p| p.name == row.name) {
+            row.next_run.clone_from(&prev.next_run);
+        }
+    }
+}
+
 /// Re-read repo manifests and refresh the per-repo + recent-snapshots fields.
 /// Errors are logged via tracing and that repo's row is skipped.
 pub(crate) fn refresh_repos(status: &SharedStatus, repos: &[ResolvedRepo]) {
@@ -283,6 +344,9 @@ pub(crate) fn refresh_repos(status: &SharedStatus, repos: &[ResolvedRepo]) {
                     snapshots: stats.snapshot_count.to_string(),
                     last_snapshot: format_last_snapshot(stats.last_snapshot_time),
                     size: format_bytes(stats.unique_stored_size),
+                    // Carried over from the previous rows below; only a repo
+                    // that has never been stamped keeps this placeholder.
+                    next_run: "—".to_string(),
                 });
             }
             Err(e) => {
@@ -338,6 +402,7 @@ pub(crate) fn refresh_repos(status: &SharedStatus, repos: &[ResolvedRepo]) {
     all_snapshots.truncate(RECENT_SNAPSHOTS_LIMIT);
 
     let mut s = status.write().expect("status lock poisoned");
+    carry_over_next_runs(&mut repo_rows, &s.repos);
     s.repos = repo_rows;
     s.recent_snapshots = all_snapshots;
 }
@@ -375,4 +440,77 @@ pub(crate) fn record_cycle_end(
     s.last_cycle.duration = Some(format_duration(elapsed));
     s.last_cycle.had_error = had_error;
     s.last_cycle.had_partial = had_partial;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(name: &str, next_run: &str) -> RepoInfo {
+        RepoInfo {
+            name: name.to_string(),
+            url: format!("/backups/{name}"),
+            snapshots: "0".to_string(),
+            last_snapshot: "N/A".to_string(),
+            size: "0 B".to_string(),
+            next_run: next_run.to_string(),
+        }
+    }
+
+    #[test]
+    fn next_run_survives_a_row_rebuild() {
+        let previous = vec![row("nas", "2026-07-25 13:00:00"), row("remote", "Off")];
+        let mut rebuilt = vec![row("remote", "—"), row("nas", "—")];
+
+        carry_over_next_runs(&mut rebuilt, &previous);
+
+        assert_eq!(rebuilt[0].next_run, "Off");
+        assert_eq!(rebuilt[1].next_run, "2026-07-25 13:00:00");
+    }
+
+    #[test]
+    fn unknown_repo_keeps_the_placeholder() {
+        // A repo added by a SIGHUP reload has no previous row; the daemon loop
+        // stamps it within a tick.
+        let previous = vec![row("nas", "2026-07-25 13:00:00")];
+        let mut rebuilt = vec![row("fresh", "—")];
+
+        carry_over_next_runs(&mut rebuilt, &previous);
+
+        assert_eq!(rebuilt[0].next_run, "—");
+    }
+
+    fn sched(enabled: bool, every: Option<&str>, cron: Option<&str>) -> ScheduleConfig {
+        ScheduleConfig {
+            enabled,
+            every: every.map(str::to_string),
+            cron: cron.map(str::to_string),
+            on_startup: false,
+            jitter_seconds: 0,
+            passphrase_prompt_timeout_seconds: 300,
+        }
+    }
+
+    #[test]
+    fn schedule_key_compares_parsed_intervals() {
+        // `60m` and `1h` are the same cadence, not a mixed config.
+        assert_eq!(
+            schedule_key(&sched(true, Some("60m"), None)),
+            schedule_key(&sched(true, Some("1h"), None))
+        );
+        assert_ne!(
+            schedule_key(&sched(true, Some("1h"), None)),
+            schedule_key(&sched(true, Some("1d"), None))
+        );
+        assert_ne!(
+            schedule_key(&sched(true, Some("1h"), None)),
+            schedule_key(&sched(false, Some("1h"), None))
+        );
+    }
+
+    #[test]
+    fn next_run_formats_disabled_as_off() {
+        assert_eq!(format_next_run(None), "Off");
+        assert!(format_next_run(Some(SystemTime::now())).contains('-'));
+    }
 }

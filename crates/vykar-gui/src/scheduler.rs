@@ -23,26 +23,79 @@ pub(crate) fn capped_wait(next_run: SystemTime, now: SystemTime) -> Duration {
         .min(MAX_WAIT)
 }
 
-#[derive(Debug)]
-pub(crate) struct SchedulerState {
-    pub enabled: bool,
-    pub paused: bool,
-    pub every: Duration,
-    pub cron: Option<String>,
-    pub jitter_seconds: u64,
+/// One repository's cadence and its next scheduled run. Repositories can be on
+/// different schedules, so each keeps its own `next_run`.
+#[derive(Debug, Clone)]
+pub(crate) struct RepoSchedule {
+    /// Repository name as produced by `format_repo_name` — the same selector
+    /// `AppCommand::RunBackupRepos` filters on.
+    pub name: String,
+    pub schedule: ScheduleConfig,
+    /// `None` when the repo's schedule is disabled or its cadence is unusable.
     pub next_run: Option<SystemTime>,
 }
 
-impl Default for SchedulerState {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            paused: false,
-            every: Duration::from_secs(24 * 60 * 60),
-            cron: None,
-            jitter_seconds: 0,
-            next_run: None,
+/// Scheduler state shared with the worker. Pause is deliberately global (it is
+/// the user-facing tray/menu toggle); cadence is per repository.
+#[derive(Debug, Default)]
+pub(crate) struct SchedulerState {
+    pub enabled: bool,
+    pub paused: bool,
+    pub repos: Vec<RepoSchedule>,
+}
+
+impl SchedulerState {
+    /// Earliest upcoming run across all repositories.
+    fn earliest(&self) -> Option<SystemTime> {
+        self.repos.iter().filter_map(|r| r.next_run).min()
+    }
+
+    /// Names of the repositories whose slot has arrived, each moved on to its
+    /// next slot (`now + interval` — drift, not the missed fixed slot). The
+    /// second element is the first rescheduling error, if any.
+    fn take_due(
+        &mut self,
+        now: SystemTime,
+    ) -> (Vec<String>, Option<vykar_types::error::VykarError>) {
+        let mut names = Vec::new();
+        let mut error = None;
+        for repo in &mut self.repos {
+            if !repo.schedule.enabled {
+                repo.next_run = None;
+                continue;
+            }
+            match repo.next_run {
+                Some(slot) if slot <= now => {}
+                _ => continue,
+            }
+            names.push(repo.name.clone());
+            match vykar_core::app::scheduler::next_run_delay(&repo.schedule) {
+                Ok(delay) => repo.next_run = Some(now + delay),
+                Err(e) => {
+                    repo.next_run = None;
+                    error.get_or_insert(e);
+                }
+            }
         }
+        (names, error)
+    }
+
+    /// Give every enabled repository without a slot its next one.
+    fn fill_missing_next_runs(
+        &mut self,
+    ) -> std::result::Result<(), vykar_types::error::VykarError> {
+        let now = SystemTime::now();
+        for repo in &mut self.repos {
+            if !repo.schedule.enabled {
+                repo.next_run = None;
+                continue;
+            }
+            if repo.next_run.is_none() {
+                repo.next_run =
+                    Some(now + vykar_core::app::scheduler::next_run_delay(&repo.schedule)?);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -56,6 +109,34 @@ pub(crate) fn schedule_brief(schedule: &ScheduleConfig, paused: bool) -> String 
         return cron.clone();
     }
     schedule.every.clone().unwrap_or_else(|| "24h".to_string())
+}
+
+/// Identity used to decide whether all repos share one cadence. Compares the
+/// parsed interval rather than the raw string, so `60m` and `1h` count as the
+/// same schedule instead of a spurious "per-repo".
+fn schedule_key(schedule: &ScheduleConfig) -> (bool, Option<String>, Option<u64>) {
+    (
+        schedule.enabled,
+        schedule.cron.clone(),
+        schedule.every_duration().ok().map(|d| d.as_secs()),
+    )
+}
+
+/// Overview summary across all repositories: the shared cadence when they
+/// agree, `"per-repo"` when they differ, `"Off"` when paused or repo-less.
+pub(crate) fn repos_schedule_brief(schedules: &[&ScheduleConfig], paused: bool) -> String {
+    if paused {
+        return "Off".to_string();
+    }
+    let mut iter = schedules.iter();
+    let Some(first) = iter.next() else {
+        return "Off".to_string();
+    };
+    let first_key = schedule_key(first);
+    if iter.any(|s| schedule_key(s) != first_key) {
+        return "per-repo".to_string();
+    }
+    schedule_brief(first, paused)
 }
 
 pub(crate) fn spawn_scheduler(
@@ -81,26 +162,20 @@ pub(crate) fn spawn_scheduler(
                 continue;
             }
 
-            if state.next_run.is_none() {
-                match compute_scheduler_delay(&state) {
-                    Ok(delay) => state.next_run = Some(SystemTime::now() + delay),
-                    Err(e) => {
-                        state.paused = true;
-                        state.next_run = None;
-                        let _ = ui_tx.send(log_entry_now(format!(
-                            "Scheduler error: {e}. Scheduling paused — reload config to resume."
-                        )));
-                        continue;
-                    }
-                }
+            if let Err(e) = state.fill_missing_next_runs() {
+                state.paused = true;
+                let _ = ui_tx.send(log_entry_now(format!(
+                    "Scheduler error: {e}. Scheduling paused — reload config to resume."
+                )));
+                continue;
             }
 
-            match state.next_run {
+            match state.earliest() {
                 Some(next) => {
                     let wait = capped_wait(next, SystemTime::now());
                     if wait.is_zero() {
                         if backup_running.load(Ordering::SeqCst) {
-                            // Backup is running and next_run has passed — block
+                            // Backup is running and a slot has passed — block
                             // until woken by backup completion to avoid hot-spin.
                             drop(state);
                             if notify_rx.recv().is_err() {
@@ -115,7 +190,7 @@ pub(crate) fn spawn_scheduler(
                     }
                 }
                 None => {
-                    // No next_run — block until notified.
+                    // Nothing scheduled — block until notified.
                     drop(state);
                     if notify_rx.recv().is_err() {
                         break;
@@ -142,7 +217,7 @@ pub(crate) fn spawn_scheduler(
         }
 
         // Re-check state under lock (may have changed during wait).
-        let mut should_run = false;
+        let mut due_names: Vec<String> = Vec::new();
         {
             let mut state = match scheduler.lock() {
                 Ok(s) => s,
@@ -153,51 +228,28 @@ pub(crate) fn spawn_scheduler(
                 continue;
             }
 
-            if let Some(next) = state.next_run {
-                if capped_wait(next, SystemTime::now()).is_zero()
-                    && !backup_running.load(Ordering::SeqCst)
-                {
-                    should_run = true;
-                    match compute_scheduler_delay(&state) {
-                        Ok(delay) => state.next_run = Some(SystemTime::now() + delay),
-                        Err(e) => {
-                            state.paused = true;
-                            state.next_run = None;
-                            let _ = ui_tx.send(log_entry_now(format!(
-                                "Scheduler error: {e}. Scheduling paused — reload config to resume."
-                            )));
-                        }
-                    }
+            if !backup_running.load(Ordering::SeqCst) {
+                let (names, error) = state.take_due(SystemTime::now());
+                due_names = names;
+                if let Some(e) = error {
+                    state.paused = true;
+                    let _ = ui_tx.send(log_entry_now(format!(
+                        "Scheduler error: {e}. Scheduling paused — reload config to resume."
+                    )));
                 }
             }
         }
 
-        if should_run
+        if !due_names.is_empty()
             && app_tx
-                .send(AppCommand::RunBackupAll { scheduled: true })
+                .send(AppCommand::RunBackupRepos {
+                    repo_names: due_names,
+                })
                 .is_err()
         {
             break;
         }
     });
-}
-
-pub(crate) fn compute_scheduler_delay(
-    state: &SchedulerState,
-) -> std::result::Result<Duration, vykar_types::error::VykarError> {
-    if let Some(ref cron_expr) = state.cron {
-        let tmp = ScheduleConfig {
-            enabled: true,
-            every: None,
-            cron: Some(cron_expr.clone()),
-            on_startup: false,
-            jitter_seconds: state.jitter_seconds,
-            passphrase_prompt_timeout_seconds: 300,
-        };
-        vykar_core::app::scheduler::next_run_delay(&tmp)
-    } else {
-        Ok(state.every + vykar_core::app::scheduler::random_jitter(state.jitter_seconds))
-    }
 }
 
 #[cfg(test)]
@@ -232,6 +284,29 @@ mod tests {
         assert_eq!(capped_wait(far_future, now), MAX_WAIT);
     }
 
+    fn repo_entry(name: &str, every: &str, next_run: Option<SystemTime>) -> RepoSchedule {
+        RepoSchedule {
+            name: name.to_string(),
+            schedule: ScheduleConfig {
+                enabled: true,
+                every: Some(every.to_string()),
+                cron: None,
+                on_startup: false,
+                jitter_seconds: 0,
+                passphrase_prompt_timeout_seconds: 300,
+            },
+            next_run,
+        }
+    }
+
+    /// Assert the command is a scheduled run of exactly `expected` repos.
+    fn assert_runs(cmd: &AppCommand, expected: &[&str]) {
+        let AppCommand::RunBackupRepos { repo_names } = cmd else {
+            unreachable!("expected RunBackupRepos, got {cmd:?}");
+        };
+        assert_eq!(repo_names, expected, "unexpected due set");
+    }
+
     /// Helper: set up scheduler infrastructure for tests.
     fn setup(
         enabled: bool,
@@ -246,10 +321,7 @@ mod tests {
         let state = Arc::new(Mutex::new(SchedulerState {
             enabled,
             paused,
-            every: Duration::from_millis(50),
-            cron: None,
-            jitter_seconds: 0,
-            next_run,
+            repos: vec![repo_entry("repo-a", "1s", next_run)],
         }));
         let backup_running = Arc::new(AtomicBool::new(false));
         let (notify_tx, notify_rx) = crossbeam_channel::bounded::<()>(1);
@@ -277,7 +349,7 @@ mod tests {
 
         // Should fire within a reasonable time.
         let cmd = app_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        assert!(matches!(cmd, AppCommand::RunBackupAll { scheduled: true }));
+        assert_runs(&cmd, &["repo-a"]);
     }
 
     /// Regression test for GitHub #110: after system sleep, `SystemTime` has
@@ -292,7 +364,74 @@ mod tests {
         );
 
         let cmd = app_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        assert!(matches!(cmd, AppCommand::RunBackupAll { scheduled: true }));
+        assert_runs(&cmd, &["repo-a"]);
+    }
+
+    #[test]
+    fn fires_only_for_the_due_repo() {
+        let state = Arc::new(Mutex::new(SchedulerState {
+            enabled: true,
+            paused: false,
+            repos: vec![
+                repo_entry(
+                    "hourly",
+                    "1h",
+                    Some(SystemTime::now() + Duration::from_secs(3600)),
+                ),
+                repo_entry(
+                    "nas",
+                    "1s",
+                    Some(SystemTime::now() + Duration::from_millis(30)),
+                ),
+            ],
+        }));
+        let backup_running = Arc::new(AtomicBool::new(false));
+        let (_notify_tx, notify_rx) = crossbeam_channel::bounded::<()>(1);
+        let (app_tx, app_rx) = crossbeam_channel::unbounded::<AppCommand>();
+        let (ui_tx, _ui_rx) = crossbeam_channel::unbounded::<UiEvent>();
+
+        spawn_scheduler(app_tx, ui_tx, state.clone(), backup_running, notify_rx);
+
+        let cmd = app_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_runs(&cmd, &["nas"]);
+
+        // The hourly repo keeps its distant slot.
+        let s = state.lock().unwrap();
+        assert!(
+            s.repos.first().unwrap().next_run.unwrap()
+                > SystemTime::now() + Duration::from_secs(3000)
+        );
+    }
+
+    #[test]
+    fn disabled_repo_is_never_due() {
+        let mut off = repo_entry(
+            "off",
+            "1s",
+            Some(SystemTime::now() - Duration::from_secs(1)),
+        );
+        off.schedule.enabled = false;
+        let state = Arc::new(Mutex::new(SchedulerState {
+            enabled: true,
+            paused: false,
+            repos: vec![
+                off,
+                repo_entry(
+                    "on",
+                    "1s",
+                    Some(SystemTime::now() + Duration::from_millis(30)),
+                ),
+            ],
+        }));
+        let backup_running = Arc::new(AtomicBool::new(false));
+        let (_notify_tx, notify_rx) = crossbeam_channel::bounded::<()>(1);
+        let (app_tx, app_rx) = crossbeam_channel::unbounded::<AppCommand>();
+        let (ui_tx, _ui_rx) = crossbeam_channel::unbounded::<UiEvent>();
+
+        spawn_scheduler(app_tx, ui_tx, state.clone(), backup_running, notify_rx);
+
+        let cmd = app_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_runs(&cmd, &["on"]);
     }
 
     #[test]
@@ -303,10 +442,11 @@ mod tests {
         let state = Arc::new(Mutex::new(SchedulerState {
             enabled: true,
             paused: false,
-            every: Duration::from_millis(50),
-            cron: None,
-            jitter_seconds: 0,
-            next_run: Some(SystemTime::now() - Duration::from_millis(10)),
+            repos: vec![repo_entry(
+                "repo-a",
+                "1s",
+                Some(SystemTime::now() - Duration::from_millis(10)),
+            )],
         }));
         let backup_running = Arc::new(AtomicBool::new(true));
         let (notify_tx, notify_rx) = crossbeam_channel::bounded::<()>(1);
@@ -333,7 +473,7 @@ mod tests {
         let _ = notify_tx.try_send(());
 
         let cmd = app_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        assert!(matches!(cmd, AppCommand::RunBackupAll { scheduled: true }));
+        assert_runs(&cmd, &["repo-a"]);
     }
 
     #[test]
@@ -349,12 +489,13 @@ mod tests {
         {
             let mut s = state.lock().unwrap();
             s.paused = false;
-            s.next_run = Some(SystemTime::now() + Duration::from_millis(20));
+            s.repos.first_mut().unwrap().next_run =
+                Some(SystemTime::now() + Duration::from_millis(20));
         }
         let _ = notify_tx.try_send(());
 
         let cmd = app_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        assert!(matches!(cmd, AppCommand::RunBackupAll { scheduled: true }));
+        assert_runs(&cmd, &["repo-a"]);
     }
 
     #[test]
@@ -369,11 +510,25 @@ mod tests {
         {
             let mut s = state.lock().unwrap();
             s.enabled = true;
-            s.next_run = Some(SystemTime::now() + Duration::from_millis(20));
+            s.repos.first_mut().unwrap().next_run =
+                Some(SystemTime::now() + Duration::from_millis(20));
         }
         let _ = notify_tx.try_send(());
 
         let cmd = app_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        assert!(matches!(cmd, AppCommand::RunBackupAll { scheduled: true }));
+        assert_runs(&cmd, &["repo-a"]);
+    }
+
+    #[test]
+    fn brief_is_per_repo_when_cadences_differ() {
+        let hourly = repo_entry("a", "1h", None).schedule;
+        let sixty_min = repo_entry("b", "60m", None).schedule;
+        let daily = repo_entry("c", "1d", None).schedule;
+
+        // `60m` and `1h` are the same schedule, not a mixed one.
+        assert_eq!(repos_schedule_brief(&[&hourly, &sixty_min], false), "1h");
+        assert_eq!(repos_schedule_brief(&[&hourly, &daily], false), "per-repo");
+        assert_eq!(repos_schedule_brief(&[&hourly], true), "Off");
+        assert_eq!(repos_schedule_brief(&[], false), "Off");
     }
 }

@@ -48,11 +48,15 @@ pub(crate) fn validate_config(
     config_path: &std::path::Path,
 ) -> Result<Vec<config::ResolvedRepo>, String> {
     let repos = app::load_runtime_config_from_path(config_path).map_err(|e| format!("{e}"))?;
-    // Validate the schedule is usable (parses interval or cron) when a repo
-    // defines one; a repo-less config has no schedule to check.
-    if let Some(first) = repos.first() {
-        vykar_core::app::scheduler::next_run_delay(&first.config.schedule)
-            .map_err(|e| format!("Invalid schedule: {e}"))?;
+    // Every repo can carry its own schedule, so check them all (a repo-less
+    // config has no schedule to check).
+    for repo in &repos {
+        vykar_core::app::scheduler::next_run_delay(&repo.config.schedule).map_err(|e| {
+            format!(
+                "Invalid schedule for '{}': {e}",
+                repo.label.as_deref().unwrap_or(&repo.config.repository.url)
+            )
+        })?;
     }
     Ok(repos)
 }

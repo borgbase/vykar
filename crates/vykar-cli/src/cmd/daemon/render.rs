@@ -203,18 +203,19 @@ pub(crate) fn render_html(status: &DaemonStatus) -> String {
         out.push_str(
             "<table><thead><tr>\
                 <th>Name</th><th>URL</th><th>Snapshots</th>\
-                <th>Last snapshot</th><th>Size</th>\
+                <th>Last snapshot</th><th>Size</th><th>Next run</th>\
              </tr></thead><tbody>",
         );
         for r in &status.repos {
             let _ = write!(
                 out,
-                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
                 esc(&r.name),
                 esc(&r.url),
                 esc(&r.snapshots),
                 esc(&r.last_snapshot),
                 esc(&r.size),
+                esc(&r.next_run),
             );
         }
         out.push_str("</tbody></table>");
@@ -322,6 +323,7 @@ mod tests {
                 snapshots: "3".into(),
                 last_snapshot: "5m ago".into(),
                 size: "1.2 GB".into(),
+                next_run: "2026-04-27 12:00:00".into(),
             }],
             recent_snapshots: vec![SnapshotRow {
                 id: "snap-xyz".into(),

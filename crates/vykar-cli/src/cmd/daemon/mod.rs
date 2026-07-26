@@ -11,9 +11,9 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant, SystemTime};
 
 use vykar_core::app::passphrase::configured_passphrase;
-use vykar_core::app::scheduler::{self, SchedulerLock};
-use vykar_core::app::RuntimeConfig;
+use vykar_core::app::scheduler::{SchedulePlan, SchedulerLock};
 use vykar_core::config::{self, ConfigSource, EncryptionModeConfig, ResolvedRepo, ScheduleConfig};
+use vykar_types::error::VykarError;
 
 use crate::dispatch::{local_repo_unavailable, run_default_actions, warn_if_untrusted_rest};
 use crate::error::{CliError, CliResult};
@@ -46,32 +46,93 @@ fn release_malloc_arenas() {
 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
 fn release_malloc_arenas() {}
 
+/// Repository display name: label when set, otherwise the URL.
+fn repo_name(repo: &ResolvedRepo) -> &str {
+    repo.label.as_deref().unwrap_or(&repo.config.repository.url)
+}
+
+/// Borrow every repository's effective schedule, index-aligned with `repos`.
+fn repo_schedules(repos: &[ResolvedRepo]) -> Vec<&ScheduleConfig> {
+    repos.iter().map(|r| &r.config.schedule).collect()
+}
+
+/// Report per-repository scheduling failures. A repo whose cadence cannot be
+/// computed is dropped from the timer, not fatal — the rest keep running.
+fn log_plan_errors(repos: &[ResolvedRepo], errors: &[(usize, VykarError)]) {
+    for (idx, e) in errors {
+        let name = repos.get(*idx).map(repo_name).unwrap_or("?");
+        tracing::warn!(
+            repo = name,
+            error = %e,
+            "cannot compute next run; this repository will not be scheduled"
+        );
+    }
+}
+
+/// Name the repositories that `on_startup` makes due immediately. Without this
+/// the log jumps from "daemon starting" to the cycle output with nothing in
+/// between — `log_earliest_next_run` stays silent while the earliest slot is
+/// already due.
+fn log_startup_runs(repos: &[ResolvedRepo], plan: &SchedulePlan) {
+    let due: Vec<&str> = plan
+        .due(SystemTime::now())
+        .iter()
+        .filter_map(|&idx| repos.get(idx))
+        .map(repo_name)
+        .collect();
+    if !due.is_empty() {
+        tracing::info!(
+            repos = due.join(", "),
+            "on_startup set; backing up immediately"
+        );
+    }
+}
+
+/// Log the earliest upcoming run across all repositories. Silent when nothing
+/// is scheduled or the earliest slot is already due (it is about to run —
+/// `log_startup_runs` covers that case at startup).
+fn log_earliest_next_run(plan: &SchedulePlan) {
+    if let Some(delay) = plan
+        .next_wake()
+        .and_then(|w| w.duration_since(SystemTime::now()).ok())
+    {
+        log_next_run(delay);
+    }
+}
+
+/// Pair each repository name with its next scheduled run for the status page.
+fn repo_next_runs(
+    repos: &[ResolvedRepo],
+    plan: &SchedulePlan,
+) -> Vec<(String, Option<SystemTime>)> {
+    repos
+        .iter()
+        .enumerate()
+        .map(|(idx, repo)| (repo_name(repo).to_string(), plan.next_run(idx)))
+        .collect()
+}
+
 /// Load and validate daemon config from the given source.
-/// Returns the resolved repos and merged schedule, or an error describing
-/// what went wrong (suitable for both fatal startup errors and non-fatal
-/// reload rejections).
-fn load_daemon_config(source: &ConfigSource) -> CliResult<(Vec<ResolvedRepo>, ScheduleConfig)> {
+/// Returns the resolved repos, or an error describing what went wrong
+/// (suitable for both fatal startup errors and non-fatal reload rejections).
+fn load_daemon_config(source: &ConfigSource) -> CliResult<Vec<ResolvedRepo>> {
     let repos = config::load_and_resolve(source.path())?;
 
     if repos.is_empty() {
         return Err(CliError::from("no repositories configured"));
     }
 
-    let runtime = RuntimeConfig {
-        source: source.clone(),
-        repos,
-    };
-    let schedule = runtime.schedule();
-
-    if !schedule.enabled {
+    if !repos.iter().any(|r| r.config.schedule.enabled) {
         return Err(CliError::from(
-            "schedule.enabled is false; set it to true in your config to use daemon mode",
+            "schedule.enabled is false for all repositories; set it to true in your config \
+             (globally or on a repository) to use daemon mode",
         ));
     }
 
-    // Pre-validate passphrases for encrypted repos
-    for repo in &runtime.repos {
-        let label = repo.label.as_deref().unwrap_or(&repo.config.repository.url);
+    // Pre-validate passphrases for every repo, including those whose schedule is
+    // disabled — they still take part in SIGUSR1 cycles and the status page.
+    for repo in &repos {
+        let label = repo_name(repo);
         if repo.config.encryption.mode != EncryptionModeConfig::None {
             match configured_passphrase(&repo.config) {
                 Ok(Some(_)) => {}
@@ -90,7 +151,7 @@ fn load_daemon_config(source: &ConfigSource) -> CliResult<(Vec<ResolvedRepo>, Sc
         }
     }
 
-    Ok((runtime.repos, schedule))
+    Ok(repos)
 }
 
 pub(crate) fn run_daemon(source: ConfigSource, http_listen: Option<SocketAddr>) -> CliResult<()> {
@@ -98,11 +159,11 @@ pub(crate) fn run_daemon(source: ConfigSource, http_listen: Option<SocketAddr>) 
         CliError::from("another vykar scheduler is already running (daemon or GUI); exiting")
     })?;
 
-    let (mut repos, mut schedule) = load_daemon_config(&source)?;
+    let mut repos = load_daemon_config(&source)?;
 
     let started_at = Instant::now();
     let status = status::new_shared();
-    status::init(&status, &repos, &schedule, started_at);
+    status::init(&status, &repos, started_at);
     status::refresh_repos(&status, &repos);
 
     let http_handle = if let Some(addr) = http_listen {
@@ -111,41 +172,18 @@ pub(crate) fn run_daemon(source: ConfigSource, http_listen: Option<SocketAddr>) 
         None
     };
 
-    if schedule.is_cron() {
-        tracing::info!(
-            repos = repos.len(),
-            cron = schedule.cron.as_deref().unwrap_or(""),
-            on_startup = schedule.on_startup,
-            jitter_seconds = schedule.jitter_seconds,
-            "daemon starting (cron mode)"
-        );
-    } else {
-        let interval = schedule.every_duration()?;
-        tracing::info!(
-            repos = repos.len(),
-            interval = ?interval,
-            on_startup = schedule.on_startup,
-            jitter_seconds = schedule.jitter_seconds,
-            "daemon starting (interval mode)"
-        );
-    }
+    tracing::info!(repos = repos.len(), "daemon starting");
+    log_registered_repos(&repos);
 
-    for repo in &repos {
-        let name = repo.label.as_deref().unwrap_or(&repo.config.repository.url);
-        tracing::info!(repo = name, "repository registered");
-    }
+    // Per-repo next run times. Wall-clock so targets survive system sleep and
+    // monotonic-clock freezes (see GitHub #110).
+    let (mut plan, plan_errors) = SchedulePlan::new(&repo_schedules(&repos), true);
+    log_plan_errors(&repos, &plan_errors);
+    log_startup_runs(&repos, &plan);
+    log_earliest_next_run(&plan);
 
-    // Compute first run time. Wall-clock so the target survives system sleep
-    // and monotonic-clock freezes (see GitHub #110).
-    let mut next_run = if schedule.on_startup {
-        SystemTime::now()
-    } else {
-        let delay = scheduler::next_run_delay(&schedule)?;
-        log_next_run(delay);
-        SystemTime::now() + delay
-    };
-
-    status::touch_process(&status, started_at, Some(next_run));
+    status::touch_process(&status, started_at, plan.next_wake());
+    status::set_repo_next_runs(&status, &repo_next_runs(&repos, &plan));
 
     // Cheap out-of-band change detection between cycles (GitHub #159). Seed the
     // baseline from current storage so the first poll only fires a refresh on a
@@ -166,36 +204,25 @@ pub(crate) fn run_daemon(source: ConfigSource, http_listen: Option<SocketAddr>) 
             tracing::info!("SIGHUP received, reloading configuration");
 
             match load_daemon_config(&source) {
-                Ok((new_repos, new_schedule)) => {
+                Ok(new_repos) => {
                     tracing::info!(
                         repos = new_repos.len(),
                         "configuration reloaded successfully"
                     );
                     repos = new_repos;
-                    schedule = new_schedule;
-                    status::init(&status, &repos, &schedule, started_at);
+                    status::init(&status, &repos, started_at);
                     status::refresh_repos(&status, &repos);
                     poller.reset(&repos);
                     next_poll = Instant::now() + STATUS_POLL_INTERVAL;
 
-                    for repo in &repos {
-                        let name = repo.label.as_deref().unwrap_or(&repo.config.repository.url);
-                        tracing::info!(repo = name, "repository registered");
-                    }
+                    log_registered_repos(&repos);
 
-                    // Recalculate next_run from schedule (ignore on_startup)
-                    match scheduler::next_run_delay(&schedule) {
-                        Ok(delay) => {
-                            next_run = SystemTime::now() + delay;
-                            log_next_run(delay);
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                error = %e,
-                                "failed to compute next run delay after reload, keeping previous schedule"
-                            );
-                        }
-                    }
+                    // Recalculate next runs from the new schedules (ignore on_startup).
+                    let (new_plan, errors) = SchedulePlan::new(&repo_schedules(&repos), false);
+                    plan = new_plan;
+                    log_plan_errors(&repos, &errors);
+                    log_earliest_next_run(&plan);
+                    status::set_repo_next_runs(&status, &repo_next_runs(&repos, &plan));
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -210,7 +237,9 @@ pub(crate) fn run_daemon(source: ConfigSource, http_listen: Option<SocketAddr>) 
         if TRIGGER.load(Ordering::SeqCst) {
             TRIGGER.store(false, Ordering::SeqCst);
             tracing::info!("SIGUSR1 received, triggering immediate backup");
-            run_backup_cycle(&repos, &status);
+            // An ad-hoc trigger runs every repository regardless of cadence.
+            let all: Vec<&ResolvedRepo> = repos.iter().collect();
+            run_backup_cycle(&all, &repos, &status);
 
             if SHUTDOWN.load(Ordering::SeqCst) {
                 tracing::info!("shutdown signal received, exiting");
@@ -221,34 +250,38 @@ pub(crate) fn run_daemon(source: ConfigSource, http_listen: Option<SocketAddr>) 
             poller.reset(&repos);
             next_poll = Instant::now() + STATUS_POLL_INTERVAL;
 
-            // If the scheduled slot was missed during the ad-hoc cycle, recalculate
-            // next_run from now. Otherwise leave next_run untouched — the scheduled
-            // cadence is preserved.
-            if next_run.duration_since(SystemTime::now()).is_err() {
-                let delay = match scheduler::next_run_delay(&schedule) {
-                    Ok(d) => d,
-                    Err(e) => break Err(e.into()),
-                };
-                next_run = SystemTime::now() + delay;
-                log_next_run(delay);
+            // Only slots missed during the ad-hoc cycle are recalculated;
+            // repos whose slot is still ahead keep their configured cadence.
+            let now = SystemTime::now();
+            if !plan.due(now).is_empty() {
+                let errors = plan.reschedule_overdue(&repo_schedules(&repos), now);
+                log_plan_errors(&repos, &errors);
+                log_earliest_next_run(&plan);
             }
         }
 
-        if next_run.duration_since(SystemTime::now()).is_err() {
-            run_backup_cycle(&repos, &status);
+        let due = plan.due(SystemTime::now());
+        if !due.is_empty() {
+            let due_repos: Vec<&ResolvedRepo> =
+                due.iter().filter_map(|&idx| repos.get(idx)).collect();
+            run_backup_cycle(&due_repos, &repos, &status);
 
             if SHUTDOWN.load(Ordering::SeqCst) {
                 tracing::info!("shutdown signal received, exiting");
                 break Ok(());
             }
 
-            // Schedule next run
-            let delay = match scheduler::next_run_delay(&schedule) {
-                Ok(d) => d,
-                Err(e) => break Err(e.into()),
-            };
-            next_run = SystemTime::now() + delay;
-            log_next_run(delay);
+            // Schedule the next run of the repos that just ran.
+            let schedules = repo_schedules(&repos);
+            for idx in due {
+                let Some(schedule) = schedules.get(idx) else {
+                    continue;
+                };
+                if let Some(e) = plan.reschedule(idx, schedule) {
+                    log_plan_errors(&repos, &[(idx, e)]);
+                }
+            }
+            log_earliest_next_run(&plan);
 
             // The cycle already ran refresh_repos; re-baseline the poller.
             poller.reset(&repos);
@@ -263,7 +296,8 @@ pub(crate) fn run_daemon(source: ConfigSource, http_listen: Option<SocketAddr>) 
             next_poll = Instant::now() + STATUS_POLL_INTERVAL;
         }
 
-        status::touch_process(&status, started_at, Some(next_run));
+        status::touch_process(&status, started_at, plan.next_wake());
+        status::set_repo_next_runs(&status, &repo_next_runs(&repos, &plan));
 
         std::thread::sleep(Duration::from_secs(1));
     };
@@ -278,22 +312,44 @@ pub(crate) fn run_daemon(source: ConfigSource, http_listen: Option<SocketAddr>) 
     exit_result
 }
 
-fn run_backup_cycle(repos: &[ResolvedRepo], status: &SharedStatus) {
+/// Log one line per configured repository, including its effective cadence.
+fn log_registered_repos(repos: &[ResolvedRepo]) {
+    for repo in repos {
+        let s = &repo.config.schedule;
+        tracing::info!(
+            repo = repo_name(repo),
+            enabled = s.enabled,
+            cadence = s.cron.as_deref().or(s.every.as_deref()).unwrap_or("24h"),
+            on_startup = s.on_startup,
+            jitter_seconds = s.jitter_seconds,
+            "repository registered"
+        );
+    }
+}
+
+/// Run a backup cycle for the `due` repositories.
+///
+/// `all` is the full configured set: it decides multi-repo presentation (the
+/// `=== Repository ===` headers and the unavailable-local-repo preflight skip,
+/// which must not switch off just because a single repo came due), and it is
+/// what the end-of-cycle status refresh rebuilds its rows from — passing only
+/// the due subset would drop the other repos from the status page.
+fn run_backup_cycle(due: &[&ResolvedRepo], all: &[ResolvedRepo], status: &SharedStatus) {
     tracing::info!("backup cycle starting");
     status::record_cycle_start(status);
     let cycle_start = Instant::now();
     let mut had_error = false;
     let mut had_partial = false;
 
-    let multi = repos.len() > 1;
+    let multi = all.len() > 1;
 
-    for repo in repos {
+    for repo in due {
         if SHUTDOWN.load(Ordering::SeqCst) {
             tracing::info!("shutdown signal received, skipping remaining repos");
             break;
         }
 
-        let name = repo.label.as_deref().unwrap_or(&repo.config.repository.url);
+        let name = repo_name(repo);
 
         // Pre-flight: skip unavailable local repos in multi-repo configs
         if multi {
@@ -337,7 +393,7 @@ fn run_backup_cycle(repos: &[ResolvedRepo], status: &SharedStatus) {
 
     status::record_cycle_end(status, elapsed, had_error, had_partial);
     if !SHUTDOWN.load(Ordering::SeqCst) {
-        status::refresh_repos(status, repos);
+        status::refresh_repos(status, all);
     }
 
     // All Repository instances are dropped. Ask glibc to return freed pages.

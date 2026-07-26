@@ -2,13 +2,12 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
 
 use crossbeam_channel::{Receiver, Sender};
 use vykar_core::app;
 
 use crate::messages::{AppCommand, RepoInfoData, UiEvent};
-use crate::repo_helpers::send_log;
+use crate::repo_helpers::{format_repo_name, send_log};
 use crate::scheduler;
 use crate::view_models::send_structured_data;
 
@@ -45,27 +44,7 @@ pub(super) struct WorkerContext {
 }
 
 fn startup(ctx: &mut WorkerContext) {
-    let schedule = ctx.runtime.schedule();
-    let schedule_delay = vykar_core::app::scheduler::next_run_delay(&schedule)
-        .unwrap_or_else(|_| Duration::from_secs(24 * 60 * 60));
-
-    if let Ok(mut state) = ctx.scheduler.lock() {
-        state.enabled = schedule.enabled && ctx.scheduler_lock_held;
-        state.paused = !ctx.scheduler_lock_held;
-        state.every = schedule
-            .every_duration()
-            .unwrap_or(Duration::from_secs(24 * 60 * 60));
-        state.cron = schedule.cron.clone();
-        state.jitter_seconds = schedule.jitter_seconds;
-        state.next_run = Some(SystemTime::now() + schedule_delay);
-    }
-    let _ = ctx.sched_notify_tx.try_send(());
-
-    let schedule_brief = if ctx.scheduler_lock_held {
-        scheduler::schedule_brief(&schedule, false)
-    } else {
-        "Off".to_string()
-    };
+    let schedule_brief = rebuild_scheduler_state(ctx);
     let _ = ctx.ui_tx.send(UiEvent::ConfigInfo {
         path: ctx.config_display_path.display().to_string(),
         schedule_brief,
@@ -90,14 +69,65 @@ fn startup(ctx: &mut WorkerContext) {
 
     let _ = ctx.app_tx.send(AppCommand::FetchAllRepoInfo);
 
-    if ctx.scheduler_lock_held && schedule.enabled && schedule.on_startup {
-        send_log(
-            &ctx.ui_tx,
-            "Scheduled on-startup backup requested by configuration.",
-        );
-        let _ = ctx
-            .app_tx
-            .send(AppCommand::RunBackupAll { scheduled: true });
+    // `on_startup` is per repository: only the repos that ask for it run now.
+    if ctx.scheduler_lock_held {
+        let on_startup: Vec<String> = ctx
+            .runtime
+            .repos
+            .iter()
+            .filter(|r| r.config.schedule.enabled && r.config.schedule.on_startup)
+            .map(format_repo_name)
+            .collect();
+        if !on_startup.is_empty() {
+            send_log(
+                &ctx.ui_tx,
+                format!(
+                    "Scheduled on-startup backup requested by configuration for: {}",
+                    on_startup.join(", ")
+                ),
+            );
+            let _ = ctx.app_tx.send(AppCommand::RunBackupRepos {
+                repo_names: on_startup,
+            });
+        }
+    }
+}
+
+/// Rebuild the scheduler's per-repo entries from `ctx.runtime.repos` and return
+/// the Overview schedule summary. Shared by startup and config reload so the
+/// two cannot drift apart.
+pub(super) fn rebuild_scheduler_state(ctx: &mut WorkerContext) -> String {
+    let schedules: Vec<&vykar_core::config::ScheduleConfig> = ctx
+        .runtime
+        .repos
+        .iter()
+        .map(|r| &r.config.schedule)
+        .collect();
+    let paused = ctx.schedule_paused || !ctx.scheduler_lock_held;
+
+    if let Ok(mut state) = ctx.scheduler.lock() {
+        state.enabled =
+            ctx.scheduler_lock_held && ctx.runtime.repos.iter().any(|r| r.config.schedule.enabled);
+        state.paused = paused;
+        // `next_run: None` — the scheduler thread computes each repo's first
+        // slot, so a bad cadence surfaces through its pause-and-log path.
+        state.repos = ctx
+            .runtime
+            .repos
+            .iter()
+            .map(|r| scheduler::RepoSchedule {
+                name: format_repo_name(r),
+                schedule: r.config.schedule.clone(),
+                next_run: None,
+            })
+            .collect();
+    }
+    let _ = ctx.sched_notify_tx.try_send(());
+
+    if ctx.scheduler_lock_held {
+        scheduler::repos_schedule_brief(&schedules, paused)
+    } else {
+        "Off".to_string()
     }
 }
 
@@ -140,6 +170,9 @@ pub(crate) fn run_worker(
         match cmd {
             AppCommand::RunBackupAll { scheduled } => {
                 backup::handle_backup_all(&mut ctx, scheduled)
+            }
+            AppCommand::RunBackupRepos { repo_names } => {
+                backup::handle_backup_repos(&mut ctx, repo_names)
             }
             AppCommand::RunBackupRepo { repo_name } => {
                 backup::handle_backup_repo(&mut ctx, repo_name)

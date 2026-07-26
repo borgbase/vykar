@@ -1657,6 +1657,98 @@ fn cli_daemon_sigusr1_preserves_schedule() {
 
 #[test]
 #[cfg(unix)]
+fn cli_daemon_per_repo_schedule_runs_only_due_repo() {
+    let fx = CliFixture::new();
+    let repo_b = fx._tmp.path().join("repo_b");
+    std::fs::create_dir_all(&repo_b).unwrap();
+    std::fs::write(fx.source_a.join("file.txt"), b"content").unwrap();
+
+    // repo-a overrides the global hourly cadence with a 2s one that also fires
+    // at startup; repo-b stays on the global hourly schedule.
+    let config = format!(
+        "repositories:\n  \
+           - url: {}\n    label: repo-a\n    schedule:\n      enabled: true\n      every: \"2s\"\n      on_startup: true\n  \
+           - url: {}\n    label: repo-b\n\
+         encryption:\n  mode: none\n\
+         schedule:\n  enabled: true\n  every: \"1h\"\n\
+         sources:\n  - {}\n",
+        yaml_quote_path(&fx.repo_dir),
+        yaml_quote_path(&repo_b),
+        yaml_quote_path(&fx.source_a),
+    );
+    std::fs::write(&fx.config_path, config).unwrap();
+    let cfg = fx.config_path.to_string_lossy().to_string();
+
+    fx.run_ok(&["--config", &cfg, "init", "-R", "repo-a"]);
+    fx.run_ok(&["--config", &cfg, "init", "-R", "repo-b"]);
+
+    let (mut child, logs) = spawn_daemon(&fx, &cfg);
+
+    assert!(
+        logs.wait_for("next backup scheduled", Duration::from_secs(15)),
+        "daemon should schedule the next per-repo run, got stderr:\n{}",
+        logs.snapshot()
+    );
+    assert!(
+        logs.wait_for("backup cycle finished", Duration::from_secs(15)),
+        "repo-a's on_startup cycle should run, got stderr:\n{}",
+        logs.snapshot()
+    );
+
+    send_signal(&child, "-TERM");
+    wait_for_exit(&mut child, 10);
+
+    let list_a = fx.run_ok(&["--config", &cfg, "list", "-R", "repo-a"]);
+    assert!(
+        list_a.contains("source-a"),
+        "repo-a should have a snapshot from its own 2s schedule, got:\n{list_a}"
+    );
+
+    let list_b = fx.run_ok(&["--config", &cfg, "list", "-R", "repo-b"]);
+    assert!(
+        !list_b.contains("source-a"),
+        "repo-b is on the 1h global schedule and must not have run, got:\n{list_b}"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn cli_daemon_starts_when_only_one_repo_enables_schedule() {
+    let fx = CliFixture::new();
+    let repo_b = fx._tmp.path().join("repo_b");
+    std::fs::create_dir_all(&repo_b).unwrap();
+
+    // Global schedule disabled; a single repo opts in. The daemon must start.
+    let config = format!(
+        "repositories:\n  \
+           - url: {}\n    label: repo-a\n  \
+           - url: {}\n    label: repo-b\n    schedule:\n      enabled: true\n      every: \"1h\"\n\
+         encryption:\n  mode: none\n\
+         schedule:\n  enabled: false\n\
+         sources: []\n",
+        yaml_quote_path(&fx.repo_dir),
+        yaml_quote_path(&repo_b),
+    );
+    std::fs::write(&fx.config_path, config).unwrap();
+    let cfg = fx.config_path.to_string_lossy().to_string();
+
+    fx.run_ok(&["--config", &cfg, "init", "-R", "repo-a"]);
+    fx.run_ok(&["--config", &cfg, "init", "-R", "repo-b"]);
+
+    let (mut child, logs) = spawn_daemon(&fx, &cfg);
+
+    assert!(
+        logs.wait_for("next backup scheduled", Duration::from_secs(15)),
+        "daemon should start when any repo enables its schedule, got stderr:\n{}",
+        logs.snapshot()
+    );
+
+    send_signal(&child, "-TERM");
+    wait_for_exit(&mut child, 10);
+}
+
+#[test]
+#[cfg(unix)]
 fn cli_daemon_trust_repo_rejected() {
     let fx = CliFixture::new();
     let config = format!(

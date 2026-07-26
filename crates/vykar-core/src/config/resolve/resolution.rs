@@ -62,6 +62,25 @@ pub(super) fn resolve_document(
         }
     }
 
+    // Repositories are addressed by label, or by URL when unlabeled — `--repo`,
+    // the GUI selector, the daemon's per-repo schedule rows. Two entries that
+    // resolve to the same name are indistinguishable to all of them, so reject
+    // the collision here. Two *labeled* entries may still share a URL: their
+    // labels tell them apart.
+    let mut seen_names = std::collections::HashSet::new();
+    for entry in &raw.repositories {
+        let name = entry
+            .label
+            .clone()
+            .unwrap_or_else(|| expand_tilde(&entry.url));
+        if !seen_names.insert(name.clone()) {
+            return Err(vykar_types::error::VykarError::Config(format!(
+                "duplicate repository name: '{name}' — repositories are identified by their \
+                 label, or by their url when unlabeled; give each a distinct 'label'"
+            )));
+        }
+    }
+
     // Validate global hooks, schedule, and chunker params
     raw.hooks.validate()?;
     raw.schedule.validate()?;
@@ -77,6 +96,21 @@ pub(super) fn resolve_document(
         }
         if let Some(ref limits) = entry.limits {
             limits.validate()?;
+        }
+        if let Some(ref s) = entry.schedule {
+            s.validate()?;
+            // A per-repo override replaces the global stanza wholesale, and
+            // `enabled` defaults to false — so `schedule: {every: 1h}` on a repo
+            // would silently disable it. The global stanza may legitimately
+            // carry a cadence while disabled (pre-configured, daemon off), so
+            // this check is per-repo only.
+            if !s.enabled && (s.every.is_some() || s.cron.is_some() || s.on_startup) {
+                return Err(vykar_types::error::VykarError::Config(format!(
+                    "repository '{}': schedule sets a cadence but 'enabled' is false; \
+                     set `enabled: true` or remove the override",
+                    entry.label.as_deref().unwrap_or(&entry.url)
+                )));
+            }
         }
     }
 
@@ -167,7 +201,7 @@ pub(super) fn resolve_document(
                     compression: entry.compression.unwrap_or_else(|| raw.compression.clone()),
                     retention: entry.retention.unwrap_or_else(|| raw.retention.clone()),
                     xattrs: raw.xattrs.clone(),
-                    schedule: raw.schedule.clone(),
+                    schedule: entry.schedule.unwrap_or_else(|| raw.schedule.clone()),
                     limits: entry.limits.unwrap_or_else(|| raw.limits.clone()),
                     compact: raw.compact.clone(),
                     check: raw.check.clone(),
@@ -551,6 +585,122 @@ sources:
     }
 
     #[test]
+    fn test_schedule_inherit_and_repo_override() {
+        let yaml = r#"
+schedule:
+  enabled: true
+  every: "1d"
+  jitter_seconds: 30
+
+repositories:
+  - url: /backups/remote
+    label: remote
+  - url: /backups/nas
+    label: nas
+    schedule:
+      enabled: true
+      every: "1h"
+      on_startup: true
+sources:
+  - /home/user
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        fs::write(&path, yaml).unwrap();
+
+        let repos = load_and_resolve(&path).unwrap();
+
+        let remote = &repos[0].config.schedule;
+        assert!(remote.enabled);
+        assert_eq!(remote.every.as_deref(), Some("1d"));
+        assert_eq!(remote.jitter_seconds, 30);
+        assert!(!remote.on_startup);
+
+        // Wholesale override: unset fields fall back to ScheduleConfig defaults,
+        // not to the global stanza.
+        let nas = &repos[1].config.schedule;
+        assert!(nas.enabled);
+        assert_eq!(nas.every.as_deref(), Some("1h"));
+        assert_eq!(nas.jitter_seconds, 0);
+        assert!(nas.on_startup);
+    }
+
+    #[test]
+    fn test_repo_schedule_every_and_cron_rejected() {
+        let yaml = r#"
+repositories:
+  - url: /backups/nas
+    label: nas
+    schedule:
+      enabled: true
+      every: "1h"
+      cron: "0 * * * *"
+sources:
+  - /home/user
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        fs::write(&path, yaml).unwrap();
+
+        let err = load_and_resolve(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("mutually exclusive"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_repo_schedule_cadence_without_enabled_rejected() {
+        let yaml = r#"
+schedule:
+  enabled: true
+  every: "1d"
+
+repositories:
+  - url: /backups/nas
+    label: nas
+    schedule:
+      every: "1h"
+sources:
+  - /home/user
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        fs::write(&path, yaml).unwrap();
+
+        let err = load_and_resolve(&path).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("'enabled' is false") && msg.contains("nas"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_repo_schedule_explicitly_disabled_is_allowed() {
+        // No cadence fields set — the repo simply opts out of the global schedule.
+        let yaml = r#"
+schedule:
+  enabled: true
+  every: "1d"
+
+repositories:
+  - url: /backups/nas
+    label: nas
+    schedule:
+      enabled: false
+sources:
+  - /home/user
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        fs::write(&path, yaml).unwrap();
+
+        let repos = load_and_resolve(&path).unwrap();
+        assert!(!repos[0].config.schedule.enabled);
+    }
+
+    #[test]
     fn test_limits_invalid_nice_rejected() {
         let yaml = r#"
 limits:
@@ -644,6 +794,64 @@ repositories:
             msg.contains("duplicate repository label"),
             "unexpected error: {msg}"
         );
+    }
+
+    #[test]
+    fn test_reject_duplicate_unlabeled_urls() {
+        // Both entries resolve to the name "/backups/a", so `--repo`, the GUI
+        // selector and the daemon's per-repo rows could not tell them apart.
+        let yaml = r#"
+repositories:
+  - url: /backups/a
+  - url: /backups/a
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        fs::write(&path, yaml).unwrap();
+
+        let err = load_and_resolve(&path).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("duplicate repository name") && msg.contains("/backups/a"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_reject_label_colliding_with_unlabeled_url() {
+        let yaml = r#"
+repositories:
+  - url: /backups/a
+  - url: /backups/b
+    label: /backups/a
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        fs::write(&path, yaml).unwrap();
+
+        let err = load_and_resolve(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("duplicate repository name"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_labeled_repos_may_share_a_url() {
+        // Distinct labels disambiguate, so the same URL twice stays legal.
+        let yaml = r#"
+repositories:
+  - url: /backups/a
+    label: docs
+  - url: /backups/a
+    label: media
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        fs::write(&path, yaml).unwrap();
+
+        let repos = load_and_resolve(&path).unwrap();
+        assert_eq!(repos.len(), 2);
     }
 
     #[test]

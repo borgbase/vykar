@@ -2,7 +2,7 @@
 #![allow(unsafe_code)]
 
 use std::fs::File;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use rand::RngExt;
 
@@ -127,9 +127,247 @@ pub fn next_run_delay(schedule: &ScheduleConfig) -> Result<Duration> {
     }
 }
 
+/// Per-repository next-run times, index-aligned with a slice of repositories.
+///
+/// Both schedulers (daemon and GUI) share this so the due-set and next-wake
+/// logic exist in one place. An entry is `None` when the repo's schedule is
+/// disabled *or* unschedulable — a broken cadence on one repo must not stop the
+/// others from running, so construction degrades instead of failing.
+#[derive(Debug, Clone, Default)]
+pub struct SchedulePlan {
+    next_runs: Vec<Option<SystemTime>>,
+}
+
+impl SchedulePlan {
+    /// Build a plan from one schedule per repository, in repository order.
+    ///
+    /// Returns the plan plus the per-index errors of any entry whose next run
+    /// could not be computed; the caller logs them (core never prints). Those
+    /// entries are `None` and simply never fire on the timer.
+    ///
+    /// `honor_on_startup` is false on the SIGHUP/reload path, where a repo's
+    /// `on_startup` must not re-trigger an immediate backup.
+    pub fn new(
+        schedules: &[&ScheduleConfig],
+        honor_on_startup: bool,
+    ) -> (Self, Vec<(usize, VykarError)>) {
+        let now = SystemTime::now();
+        let mut next_runs = Vec::with_capacity(schedules.len());
+        let mut errors = Vec::new();
+
+        for (idx, schedule) in schedules.iter().enumerate() {
+            if !schedule.enabled {
+                next_runs.push(None);
+                continue;
+            }
+            if honor_on_startup && schedule.on_startup {
+                next_runs.push(Some(now));
+                continue;
+            }
+            match next_run_delay(schedule) {
+                Ok(delay) => next_runs.push(Some(now + delay)),
+                Err(e) => {
+                    next_runs.push(None);
+                    errors.push((idx, e));
+                }
+            }
+        }
+
+        (Self { next_runs }, errors)
+    }
+
+    /// The earliest upcoming run across all repositories, or `None` when every
+    /// entry is disabled/unschedulable (the timer then never fires; ad-hoc
+    /// triggers and the status page still work).
+    pub fn next_wake(&self) -> Option<SystemTime> {
+        self.next_runs.iter().flatten().min().copied()
+    }
+
+    /// Indices of the repositories whose next run has arrived.
+    pub fn due(&self, now: SystemTime) -> Vec<usize> {
+        self.next_runs
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, next)| match next {
+                Some(t) if *t <= now => Some(idx),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The next run for one repository, if it has one.
+    pub fn next_run(&self, idx: usize) -> Option<SystemTime> {
+        self.next_runs.get(idx).copied().flatten()
+    }
+
+    pub fn len(&self) -> usize {
+        self.next_runs.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.next_runs.is_empty()
+    }
+
+    /// Move one entry to `now + interval` (drift, not fixed slots). On error the
+    /// entry becomes `None` and the error is returned for the caller to log.
+    ///
+    /// `idx` must index this plan — indices come from [`SchedulePlan::due`], so
+    /// an out-of-range one is a caller bug. It trips a `debug_assert!` and is a
+    /// no-op in release; note that the `None` return then reads as "no error",
+    /// not as "not rescheduled".
+    pub fn reschedule(&mut self, idx: usize, schedule: &ScheduleConfig) -> Option<VykarError> {
+        debug_assert!(
+            idx < self.next_runs.len(),
+            "reschedule index {idx} out of range for {} entries",
+            self.next_runs.len()
+        );
+        let slot = self.next_runs.get_mut(idx)?;
+        if !schedule.enabled {
+            *slot = None;
+            return None;
+        }
+        match next_run_delay(schedule) {
+            Ok(delay) => {
+                *slot = Some(SystemTime::now() + delay);
+                None
+            }
+            Err(e) => {
+                *slot = None;
+                Some(e)
+            }
+        }
+    }
+
+    /// Reschedule only the entries whose slot has already passed, leaving future
+    /// slots untouched. Used after an ad-hoc (SIGUSR1) cycle so the configured
+    /// cadence is preserved when the cycle finished before the next slot.
+    pub fn reschedule_overdue(
+        &mut self,
+        schedules: &[&ScheduleConfig],
+        now: SystemTime,
+    ) -> Vec<(usize, VykarError)> {
+        let mut errors = Vec::new();
+        for idx in self.due(now) {
+            let Some(schedule) = schedules.get(idx) else {
+                continue;
+            };
+            if let Some(e) = self.reschedule(idx, schedule) {
+                errors.push((idx, e));
+            }
+        }
+        errors
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sched(enabled: bool, every: Option<&str>, on_startup: bool) -> ScheduleConfig {
+        ScheduleConfig {
+            enabled,
+            every: every.map(str::to_string),
+            cron: None,
+            on_startup,
+            jitter_seconds: 0,
+            passphrase_prompt_timeout_seconds: 300,
+        }
+    }
+
+    #[test]
+    fn plan_due_set_and_earliest_wake() {
+        let fast = sched(true, Some("1s"), false);
+        let slow = sched(true, Some("1h"), false);
+        let (plan, errors) = SchedulePlan::new(&[&slow, &fast], false);
+        assert!(errors.is_empty());
+
+        let fast_at = plan.next_run(1).unwrap();
+        assert_eq!(plan.next_wake(), Some(fast_at));
+
+        // Before the fast slot nothing is due; after it only the fast repo is.
+        assert!(plan.due(SystemTime::now()).is_empty());
+        assert_eq!(plan.due(fast_at), vec![1]);
+    }
+
+    #[test]
+    fn plan_skips_disabled_entries() {
+        let off = sched(false, Some("1h"), false);
+        let on = sched(true, Some("1h"), false);
+        let (plan, errors) = SchedulePlan::new(&[&off, &on], false);
+        assert!(errors.is_empty());
+        assert!(plan.next_run(0).is_none());
+        assert!(plan.next_run(1).is_some());
+        assert_eq!(plan.next_wake(), plan.next_run(1));
+    }
+
+    #[test]
+    fn plan_honors_on_startup_only_when_asked() {
+        let startup = sched(true, Some("1h"), true);
+        let plain = sched(true, Some("1h"), false);
+
+        let (honored, _) = SchedulePlan::new(&[&startup, &plain], true);
+        assert_eq!(honored.due(SystemTime::now()), vec![0]);
+
+        let (ignored, _) = SchedulePlan::new(&[&startup, &plain], false);
+        assert!(ignored.due(SystemTime::now()).is_empty());
+    }
+
+    #[test]
+    fn plan_reschedule_moves_only_that_entry() {
+        let fast = sched(true, Some("1s"), false);
+        let slow = sched(true, Some("1h"), false);
+        let (mut plan, _) = SchedulePlan::new(&[&fast, &slow], false);
+
+        let slow_before = plan.next_run(1).unwrap();
+        let fast_before = plan.next_run(0).unwrap();
+        assert!(plan.reschedule(0, &fast).is_none());
+
+        assert_eq!(plan.next_run(1), Some(slow_before));
+        assert!(plan.next_run(0).unwrap() >= fast_before);
+    }
+
+    #[test]
+    fn plan_reschedule_overdue_preserves_future_slots() {
+        let overdue = sched(true, Some("1h"), true); // fires immediately
+        let future = sched(true, Some("1h"), false);
+        let (mut plan, _) = SchedulePlan::new(&[&overdue, &future], true);
+
+        let future_before = plan.next_run(1).unwrap();
+        let errors = plan.reschedule_overdue(&[&overdue, &future], SystemTime::now());
+        assert!(errors.is_empty());
+
+        assert_eq!(plan.next_run(1), Some(future_before));
+        assert!(plan.due(SystemTime::now()).is_empty());
+    }
+
+    #[test]
+    fn plan_unschedulable_entry_degrades_to_none() {
+        let bad = ScheduleConfig {
+            enabled: true,
+            every: None,
+            cron: Some("not a cron".into()),
+            on_startup: false,
+            jitter_seconds: 0,
+            passphrase_prompt_timeout_seconds: 300,
+        };
+        let good = sched(true, Some("1h"), false);
+
+        let (plan, errors) = SchedulePlan::new(&[&bad, &good], false);
+        assert!(plan.next_run(0).is_none());
+        assert!(plan.next_run(1).is_some());
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].0, 0);
+    }
+
+    #[test]
+    fn plan_all_disabled_has_no_wake() {
+        let off = sched(false, None, false);
+        let (plan, errors) = SchedulePlan::new(&[&off, &off], true);
+        assert!(errors.is_empty());
+        assert_eq!(plan.len(), 2);
+        assert!(plan.next_wake().is_none());
+        assert!(plan.due(SystemTime::now()).is_empty());
+    }
 
     #[test]
     fn interval_parses_valid_value() {

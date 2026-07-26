@@ -91,10 +91,15 @@ Each entry in the `repositories` list accepts the following fields. `url` is the
 | Field | Default | Values | Description |
 |-------|---------|--------|-------------|
 | `url` | *(required)* | string | Repository URL or local path |
-| `label` | — | string | Human label for `--repo` targeting |
+| `label` | — | string | Human label for `--repo` targeting. Must be unique |
 | `allow_insecure_http` | `false` | bool | Allow plaintext HTTP (required for `http://` and `s3+http://` URLs) |
 | `min_pack_size` | 32 MiB (33554432) | integer (bytes) | Minimum pack file size |
 | `max_pack_size` | 192 MiB (201326592) | integer (bytes) | Maximum pack file size (hard ceiling: 512 MiB) |
+
+Every repository is addressed by its label, or by its URL when it has none —
+`--repo`, the GUI selector, and the daemon's per-repo schedule rows all use that
+name. Two entries that resolve to the same name are rejected at load time. Two
+*labeled* entries may share a URL; their labels tell them apart.
 
 **S3 fields:**
 
@@ -692,7 +697,49 @@ Common cron examples:
 
 Jitter (`jitter_seconds`) applies in both modes. In cron mode, jitter is added after the computed cron tick. Keep jitter small relative to the cron cadence to avoid skipping slots.
 
-When multiple repositories are configured, schedule values are merged: `enabled` and `on_startup` are OR'd across repos, `jitter_seconds` and `passphrase_prompt_timeout_seconds` take the maximum, and `every` uses the shortest interval.
+### Per-repository schedules
+
+Any repository entry may carry its own `schedule:` block. It **replaces** the
+top-level stanza wholesale — there is no field-level merge, so fields you leave
+out fall back to their defaults, not to the global values. This mirrors the
+per-repo `limits`, `retention`, `encryption`, and `compression` overrides.
+
+```yaml
+schedule:
+  enabled: true
+  every: "1d"                 # default for every repository
+
+repositories:
+  - url: sftp://backup@remote/srv/vykar
+    label: remote             # inherits the daily schedule
+
+  - url: /mnt/nas/vykar
+    label: nas
+    schedule:
+      enabled: true           # required — see below
+      every: "1h"
+      on_startup: true
+      jitter_seconds: 120     # not inherited from the global stanza
+```
+
+Every field is per-repo, including `on_startup` (only the repos that set it run
+at daemon/GUI startup), `jitter_seconds`, and
+`passphrase_prompt_timeout_seconds`.
+
+Because `enabled` defaults to `false`, an override that sets a cadence without
+`enabled: true` would silently switch that repository off. vykar rejects it:
+
+```
+repository 'nas': schedule sets a cadence but 'enabled' is false;
+set `enabled: true` or remove the override
+```
+
+To opt one repository out of a global schedule, give it `schedule: {enabled:
+false}` with no cadence fields. The repository stays configured — it is skipped
+by the timer but still included in ad-hoc runs (`SIGUSR1`) and the status page.
+
+The daemon starts as long as **at least one** repository has an enabled
+schedule.
 
 ## Environment Variable Expansion
 

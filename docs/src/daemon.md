@@ -1,6 +1,6 @@
 # Daemon Mode
 
-`vykar daemon` runs scheduled backup cycles as a foreground process. Each cycle executes the default actions (`backup → prune → compact → check`) for all configured repositories, sequentially. The shutdown flag is checked between steps.
+`vykar daemon` runs scheduled backup cycles as a foreground process. Each cycle executes the default actions (`backup → prune → compact → check`) for the repositories that are due, sequentially. The shutdown flag is checked between steps.
 
 - **Scheduling**: sleep-loop with configurable interval (`schedule.every`, e.g. `"6h"`) or cron expression (`schedule.cron`, e.g. `"0 3 * * *"`). Optional random jitter (`jitter_seconds`) spreads load across hosts.
 - **Passphrase**: the daemon validates at startup that all encrypted repos have a non-interactive passphrase source (`passcommand`, `passphrase`, or `VYKAR_PASSPHRASE` env). It cannot prompt interactively.
@@ -16,6 +16,49 @@ schedule:
   jitter_seconds: 0
 ```
 
+## Per-repository cadence
+
+Each repository can override the global stanza with its own `schedule:` block —
+hourly to a local NAS, daily to a remote server. See
+[Per-repository schedules](configuration.md#per-repository-schedules) for the
+config shape and its rules.
+
+```yaml
+schedule:
+  enabled: true
+  every: "1d"
+
+repositories:
+  - url: sftp://backup@remote/srv/vykar
+    label: remote
+  - url: /mnt/nas/vykar
+    label: nas
+    schedule:
+      enabled: true
+      every: "1h"
+```
+
+How the daemon runs this:
+
+- The loop sleeps until the **earliest** upcoming per-repo run, then runs a cycle
+  for only the repositories whose slot has arrived. Each is rescheduled to
+  `now + interval` after it runs (drift, not fixed slots).
+- The daemon starts as long as **at least one** repository has an enabled
+  schedule; otherwise it exits with `schedule.enabled is false for all
+  repositories`.
+- Repositories with a disabled schedule stay loaded: skipped by the timer, but
+  still covered by `SIGUSR1` cycles, the status page, and startup passphrase
+  validation.
+- `on_startup` is per repository — only the repos that set it back up at start.
+- A repository whose cadence cannot be computed is logged as a warning and
+  dropped from the timer; the others keep running.
+
+**Cycles are serial.** A repository that takes three hours to back up delays the
+others' slots for that long — a missed slot fires on the next pass rather than
+being skipped or run in parallel. This was always true; per-repository cadences
+just make it visible. Keep the shortest interval comfortably longer than the
+slowest repository's cycle.
+
 ## Read-only status page
 
 The daemon can serve a small read-only HTML page that mirrors the GUI overview — repository list, recent snapshots, sources, last cycle outcome, next scheduled run. It is **disabled by default**; opt in with `--http-listen` (or the `VYKAR_HTTP_LISTEN` environment variable):
@@ -27,9 +70,9 @@ vykar daemon --http-listen 127.0.0.1:7575
 The flag takes a full `host:port` address. There is no implicit default — passing the flag without a value is an error. Port `7575` is the recommended convention but is not assumed.
 
 What the page shows:
-- Process info: hostname, pid, version, uptime, next scheduled run
-- Schedule summary (interval / cron expression / `Off`)
-- Per-repository snapshot count, last snapshot time, total stored size
+- Process info: hostname, pid, version, uptime, next scheduled run — the **earliest** across repositories, which is what the loop wakes at
+- Schedule summary (interval / cron expression / `Off`, or `per-repo` when repositories have different cadences)
+- Per-repository snapshot count, last snapshot time, total stored size, and that repository's own next run (`Off` when its schedule is disabled)
 - The 10 most recent snapshots across all repositories
 - Configured sources and their target repositories
 - Last cycle: started/finished timestamps, duration, outcome (`ok` / `partial` / `errors`)
@@ -40,6 +83,8 @@ Endpoints:
 - `GET /` — HTML overview
 - `GET /healthz` — `200 OK` plain text, suitable for Docker / Kubernetes liveness probes
 - `GET /api/status.json` — same data as `/`, JSON-serialized
+
+In the JSON, `schedule_brief` carries the cadence shared by all repositories, `"Off"`, or the literal `"per-repo"` when they differ; each entry in `repos` has its own `next_run` string (or `"Off"`).
 
 There are no write actions: no "Run Backup" button, no config edits, no authentication. The page is purely an inspection surface.
 
@@ -70,9 +115,9 @@ kill -HUP $(pidof vykar)
 
 Reload behavior:
 - The reload takes effect **between backup cycles** — a cycle in progress runs to completion first
-- `on_startup` is ignored on reload; `next_run` is recalculated from the schedule relative to now
-- If the new config is **invalid** (parse error, empty repositories, `schedule.enabled: false`, passphrase validation failure), the daemon logs a warning and continues with the previous config
-- If the new config is **valid**, repos and schedule are replaced and the next run time is recalculated
+- `on_startup` is ignored on reload; every repository's next run is recalculated from its schedule relative to now
+- If the new config is **invalid** (parse error, empty repositories, no repository with `schedule.enabled: true`, passphrase validation failure), the daemon logs a warning and continues with the previous config
+- If the new config is **valid**, repos and schedules are replaced and the next run times are recalculated
 
 ## Ad-hoc backup via SIGUSR1
 
@@ -82,8 +127,9 @@ Send `SIGUSR1` to the daemon to trigger an immediate backup cycle:
 kill -USR1 $(pidof vykar)
 ```
 
+- The cycle covers **all** configured repositories, regardless of their individual cadence (including repos whose schedule is disabled)
 - The cycle runs **between scheduled backups** — a cycle in progress runs to completion first, then the triggered cycle starts
-- The existing schedule is **preserved** when the ad-hoc cycle finishes before the next scheduled slot; if it overruns the slot, the next run is recalculated from the current time (same as after any regular cycle)
+- Each repository's existing slot is **preserved** when the ad-hoc cycle finishes before it; only slots the ad-hoc cycle overran are recalculated from the current time (same as after any regular cycle)
 - With systemd: `systemctl kill -s USR1 vykar`
 
 ## Deployment

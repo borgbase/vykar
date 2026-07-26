@@ -171,6 +171,15 @@ compression:
 #       connections: 2
 #       upload_mib_per_sec: 25
 #
+#     # Per-repo schedule: replaces the global `schedule:` block wholesale
+#     # (fields you omit fall back to defaults, not to the global values).
+#     # `enabled: true` is required whenever a cadence is set.
+#     schedule:
+#       enabled: true
+#       every: "1h"
+#       on_startup: false
+#       jitter_seconds: 0
+#
 #     hooks:
 #       before:
 #         - "echo starting offsite backup"
@@ -223,7 +232,9 @@ compression:
 #   keep_monthly: 6
 #   keep_yearly: 2
 
-# Desktop scheduler settings (used by vykar-gui):
+# Scheduler settings (used by `vykar daemon` and vykar-gui).
+# Any repository entry may override this block wholesale — see the per-repo
+# `schedule:` example in the rich repository form above.
 #
 # schedule:
 #   enabled: false

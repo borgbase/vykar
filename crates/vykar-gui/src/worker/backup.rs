@@ -15,6 +15,34 @@ use super::shared::{run_selection_with_progress, OpGuard};
 use super::WorkerContext;
 
 pub(super) fn handle_backup_all(ctx: &mut WorkerContext, scheduled: bool) {
+    run_backup_cycle(ctx, scheduled, None);
+}
+
+/// Scheduled cycle for the repositories whose per-repo slot came due.
+pub(super) fn handle_backup_repos(ctx: &mut WorkerContext, repo_names: Vec<String>) {
+    run_backup_cycle(ctx, true, Some(&repo_names));
+}
+
+/// Indices of the repositories a cycle should cover: all of them, or just the
+/// ones named in `only` (per-repo schedules). Names are matched as produced by
+/// `format_repo_name`. An empty result for a non-empty `only` means the config
+/// changed underneath the scheduler.
+fn select_repo_indices(repos: &[config::ResolvedRepo], only: Option<&[String]>) -> Vec<usize> {
+    match only {
+        Some(names) => repos
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| names.contains(&format_repo_name(r)))
+            .map(|(idx, _)| idx)
+            .collect(),
+        None => (0..repos.len()).collect(),
+    }
+}
+
+/// Run a full cycle over the configured repositories, optionally restricted to
+/// `only` (per-repo schedules). Names are matched as produced by
+/// `format_repo_name`.
+fn run_backup_cycle(ctx: &mut WorkerContext, scheduled: bool, only: Option<&[String]>) {
     let status = if scheduled {
         "Running scheduled backup cycle..."
     } else {
@@ -29,18 +57,38 @@ pub(super) fn handle_backup_all(ctx: &mut WorkerContext, scheduled: bool) {
         status,
     );
 
+    let selected = select_repo_indices(&ctx.runtime.repos, only);
+
+    // A config reload between the scheduler firing and this handler running can
+    // rename or remove a repo. Say so rather than silently doing nothing.
+    if selected.is_empty() {
+        if let Some(names) = only {
+            send_log(
+                &ctx.ui_tx,
+                format!(
+                    "Scheduled backup skipped: no repository matches {} (config changed?).",
+                    names.join(", ")
+                ),
+            );
+        }
+        return;
+    }
+
     let mut any_snapshots_created = false;
     // Per-repo failures, aggregated into a single `guard.fail` after the loop so
     // a partial failure shows one red status naming the failed repos (rather than
     // a per-iteration flash that a later success would visually overwrite).
     let mut failures: Vec<(String, String)> = Vec::new();
-    let total = ctx.runtime.repos.len();
-    for (i, repo) in ctx.runtime.repos.iter().enumerate() {
+    let total = selected.len();
+    for (i, &repo_idx) in selected.iter().enumerate() {
         if ctx.cancel_requested.load(Ordering::SeqCst) {
             send_log(&ctx.ui_tx, "Backup cancelled by user.");
             break;
         }
 
+        let Some(repo) = ctx.runtime.repos.get(repo_idx) else {
+            continue;
+        };
         let repo_name = format_repo_name(repo);
         let _ = ctx.ui_tx.send(UiEvent::Status(format!(
             "[{}] ({}/{total})...",
@@ -324,5 +372,51 @@ pub(super) fn handle_backup_source(ctx: &mut WorkerContext, source_label: String
     } else {
         let _ = ctx.ui_tx.send(UiEvent::TriggerSnapshotRefresh);
         let _ = ctx.app_tx.send(AppCommand::FetchAllRepoInfo);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn two_repos() -> Vec<config::ResolvedRepo> {
+        let yaml = "repositories:\n  \
+                      - url: /backups/nas\n    label: nas\n  \
+                      - url: /backups/remote\n\
+                    encryption:\n  mode: none\nsources: []\n";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(&path, yaml).unwrap();
+        config::load_and_resolve(&path).unwrap()
+    }
+
+    #[test]
+    fn no_filter_selects_every_repo() {
+        let repos = two_repos();
+        assert_eq!(select_repo_indices(&repos, None), vec![0, 1]);
+    }
+
+    #[test]
+    fn filter_selects_only_named_repos() {
+        let repos = two_repos();
+        // Labelled repos match on label, unlabelled ones on URL.
+        assert_eq!(
+            select_repo_indices(&repos, Some(&["nas".to_string()])),
+            vec![0]
+        );
+        assert_eq!(
+            select_repo_indices(&repos, Some(&["/backups/remote".to_string()])),
+            vec![1]
+        );
+    }
+
+    /// A config reload can rename or remove a repo between the scheduler firing
+    /// and the worker handling the command; the cycle must then cover nothing
+    /// (the caller logs it) rather than falling back to every repo.
+    #[test]
+    fn stale_name_selects_nothing() {
+        let repos = two_repos();
+        assert!(select_repo_indices(&repos, Some(&["gone".to_string()])).is_empty());
+        assert!(select_repo_indices(&repos, Some(&[])).is_empty());
     }
 }

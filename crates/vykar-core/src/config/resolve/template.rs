@@ -32,8 +32,8 @@ pub fn minimal_config_template() -> &'static str {
 #   - "/Downloads"                   # Leading / anchors to source root, not filesystem root
 #   # NOTE: absolute paths like "/Users/jane/Movies/TV" do NOT work
 #
-# schedule:
-#   enabled: true
+# schedule:                          # A repository entry may override this
+#   enabled: true                    # wholesale with its own `schedule:` block
 #   every: "24h"
 "#
 }

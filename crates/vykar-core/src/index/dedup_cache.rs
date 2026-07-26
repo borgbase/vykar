@@ -7,7 +7,7 @@
 // version / generation checks (callers fall back to a cache miss on `None`).
 #![allow(clippy::indexing_slicing)]
 
-use std::collections::HashMap;
+use super::hasher::ChunkIdHashMap;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -330,7 +330,7 @@ fn build_xor_filter(cache: &MmapDedupCache) -> Option<Xor8> {
 pub struct TieredDedupIndex {
     xor_filter: Option<Arc<Xor8>>,
     mmap_cache: MmapDedupCache,
-    session_new: HashMap<ChunkId, u32>,
+    session_new: ChunkIdHashMap<u32>,
 }
 
 impl TieredDedupIndex {
@@ -340,7 +340,7 @@ impl TieredDedupIndex {
         Self {
             xor_filter,
             mmap_cache,
-            session_new: HashMap::new(),
+            session_new: ChunkIdHashMap::default(),
         }
     }
 

@@ -1,7 +1,10 @@
 pub mod dedup_cache;
+pub mod hasher;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+
+use hasher::{BuildChunkIdHasher, ChunkIdHashMap};
 
 use serde::{Deserialize, Serialize};
 use tracing::debug;
@@ -32,7 +35,7 @@ pub struct IndexBlobRef<'a> {
 /// Maps chunk_id -> (refcount, stored_size, pack_id, pack_offset).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ChunkIndex {
-    entries: HashMap<ChunkId, ChunkIndexEntry>,
+    entries: ChunkIdHashMap<ChunkIndexEntry>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -46,13 +49,16 @@ pub struct ChunkIndexEntry {
 impl ChunkIndex {
     pub fn new() -> Self {
         Self {
-            entries: HashMap::new(),
+            entries: ChunkIdHashMap::default(),
         }
     }
 
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
-            entries: HashMap::with_capacity(capacity),
+            entries: ChunkIdHashMap::with_capacity_and_hasher(
+                capacity,
+                BuildChunkIdHasher::default(),
+            ),
         }
     }
 
@@ -182,14 +188,14 @@ impl ChunkIndex {
 /// in an `IndexDelta` and merged back into the full index at save time.
 #[derive(Debug)]
 pub struct DedupIndex {
-    entries: HashMap<ChunkId, u32>,
+    entries: ChunkIdHashMap<u32>,
     xor_filter: Option<Arc<Xor8>>,
 }
 
 impl DedupIndex {
     /// Build a dedup index from the full chunk index, keeping only chunk_id → stored_size.
     pub fn from_chunk_index(full: &ChunkIndex) -> Self {
-        let entries: HashMap<ChunkId, u32> = full
+        let entries: ChunkIdHashMap<u32> = full
             .entries
             .iter()
             .map(|(id, entry)| (*id, entry.stored_size))

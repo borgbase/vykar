@@ -5,7 +5,7 @@ description: "Cut a new vykar release: bump versions, tag, push, wait for CI, an
 
 # vykar Release
 
-Release workflow for vykar. The CI pipeline lives in `.github/workflows/release.yml` and triggers on `v*` tags pushed to `main`. It builds binaries for Linux (x86_64), macOS (aarch64), and Windows (x86_64), then publishes a GitHub Release with the artifacts and SHA256 checksums.
+Release workflow for vykar. The CI pipeline lives in `.github/workflows/release.yml` and triggers on `v*` tags pushed to `main`. It builds the release binaries and then publishes a GitHub Release with the artifacts and SHA256 checksums. See `.github/workflows/` for the build matrix and the exact set of targets.
 
 ## Steps
 
@@ -49,7 +49,7 @@ gh run list --limit 5
 gh run watch <run-id> --exit-status
 ```
 
-The workflow builds on three runners (Linux, macOS, Windows), then a `publish` job downloads the artifacts, generates SHA256 checksums, and creates the GitHub Release via `softprops/action-gh-release`.
+Once the build jobs finish, a `publish` job downloads the artifacts, generates SHA256 checksums, and creates the GitHub Release via `softprops/action-gh-release`.
 
 ### 5. Draft release notes
 

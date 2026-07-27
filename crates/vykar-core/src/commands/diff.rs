@@ -186,16 +186,9 @@ mod tests {
 
     fn file(path: &str, size: u64, chunk_bytes: &[u8]) -> Item {
         Item {
-            path: path.to_string(),
-            entry_type: ItemType::RegularFile,
-            mode: 0o644,
             uid: 1000,
             gid: 1000,
-            user: None,
-            group: None,
             mtime: 1,
-            atime: None,
-            ctime: None,
             size,
             chunks: chunk_bytes
                 .iter()
@@ -205,31 +198,19 @@ mod tests {
                     csize: size as u32,
                 })
                 .collect(),
-            link_target: None,
-            xattrs: None,
-            raw_names: None,
-            hardlink: None,
+            ..Item::test_file(path)
         }
     }
 
     fn non_file(path: &str, entry_type: ItemType) -> Item {
         Item {
-            path: path.to_string(),
             entry_type,
             mode: 0o755,
             uid: 1000,
             gid: 1000,
-            user: None,
-            group: None,
             mtime: 1,
-            atime: None,
-            ctime: None,
-            size: 0,
-            chunks: Vec::new(),
             link_target: (entry_type == ItemType::Symlink).then(|| "target".to_string()),
-            xattrs: None,
-            raw_names: None,
-            hardlink: None,
+            ..Item::test_file(path)
         }
     }
 

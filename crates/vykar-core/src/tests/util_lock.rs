@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::commands::util::with_repo_lock;
 use crate::compress::Compression;
-use crate::config::{ChunkerConfig, RepositoryConfig, RetryConfig};
+use crate::config::{ChunkerConfig, RepositoryConfig};
 use crate::repo::pack::PackType;
 use crate::repo::{EncryptionMode, Repository};
 use vykar_storage::StorageBackend;
@@ -151,18 +151,9 @@ fn with_repo_lock_flushes_pending_state_on_action_error() {
     let backend = AdvisoryLockBackend::new(false);
     let small_config = RepositoryConfig {
         url: String::new(),
-        region: None,
-        access_key_id: None,
-        secret_access_key: None,
-        sftp_key: None,
-        sftp_known_hosts: None,
-        sftp_timeout: None,
-        access_token: None,
-        allow_insecure_http: false,
         min_pack_size: 256,
         max_pack_size: 256,
-        retry: RetryConfig::default(),
-        s3_soft_delete: false,
+        ..Default::default()
     };
     let mut repo = Repository::init(
         Box::new(backend.clone()),

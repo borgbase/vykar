@@ -3,10 +3,8 @@ use std::path::Path;
 use crate::commands;
 use crate::compress::Compression;
 use crate::config::{
-    CheckConfig, ChunkerConfig, CompactConfig, CompressionConfig, EncryptionConfig,
-    EncryptionModeConfig, HooksConfig, RepositoryConfig, ResolvedRepo, ResourceLimitsConfig,
-    RetentionConfig, RetryConfig, ScheduleConfig, SourceEntry, SourceHooksConfig, VykarConfig,
-    XattrsConfig,
+    EncryptionConfig, EncryptionModeConfig, HooksConfig, RepositoryConfig, ResolvedRepo,
+    SourceEntry, SourceHooksConfig, VykarConfig,
 };
 use crate::repo::Repository;
 use crate::snapshot::SnapshotStats;
@@ -21,39 +19,17 @@ pub fn make_test_config(repo_dir: &Path) -> VykarConfig {
     VykarConfig {
         repository: RepositoryConfig {
             url: repo_dir.to_string_lossy().to_string(),
-            region: None,
-            access_key_id: None,
-            secret_access_key: None,
-            sftp_key: None,
-            sftp_known_hosts: None,
-            sftp_timeout: None,
-            access_token: None,
-            allow_insecure_http: false,
             min_pack_size: 32 * 1024 * 1024,
             max_pack_size: 512 * 1024 * 1024,
-            retry: RetryConfig::default(),
-            s3_soft_delete: false,
+            ..Default::default()
         },
         encryption: EncryptionConfig {
             mode: EncryptionModeConfig::None,
             passphrase: None,
             passcommand: None,
         },
-        exclude_patterns: Vec::new(),
-        exclude_if_present: Vec::new(),
         one_file_system: true,
-        git_ignore: false,
-        chunker: ChunkerConfig::default(),
-        compression: CompressionConfig::default(),
-        retention: RetentionConfig::default(),
-        xattrs: XattrsConfig::default(),
-        schedule: ScheduleConfig::default(),
-        limits: ResourceLimitsConfig::default(),
-        compact: CompactConfig::default(),
-        check: CheckConfig::default(),
-        cache_dir: None,
-        trust_repo: false,
-        hostname_override: None,
+        ..Default::default()
     }
 }
 
@@ -156,4 +132,67 @@ pub fn backup_single_source(
     )
     .unwrap()
     .stats
+}
+
+/// RAII guard that sets an env var and restores its previous value on drop.
+///
+/// Tests that touch process env must serialize themselves; this only handles
+/// the restore half.
+pub struct EnvGuard {
+    key: &'static str,
+    prev: Option<String>,
+}
+
+impl EnvGuard {
+    pub fn set(key: &'static str, val: &str) -> Self {
+        let prev = std::env::var(key).ok();
+        std::env::set_var(key, val);
+        Self { key, prev }
+    }
+
+    pub fn unset(key: &'static str) -> Self {
+        let prev = std::env::var(key).ok();
+        std::env::remove_var(key);
+        Self { key, prev }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        match &self.prev {
+            Some(v) => std::env::set_var(self.key, v),
+            None => std::env::remove_var(self.key),
+        }
+    }
+}
+
+/// A resolved repo identified only by URL and label — for selector tests, which
+/// never open the repository.
+pub fn make_test_repo(url: &str, label: Option<&str>) -> ResolvedRepo {
+    ResolvedRepo {
+        label: label.map(str::to_string),
+        ..resolved_repo(
+            VykarConfig {
+                repository: RepositoryConfig {
+                    url: url.to_string(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            Vec::new(),
+        )
+    }
+}
+
+/// A source entry with the values `normalize_sources` would produce for a
+/// bare `sources: [/home/<label>]` entry.
+pub fn make_test_source(label: &str) -> SourceEntry {
+    SourceEntry {
+        // Mirrors the serde defaults for a bare source: `one_file_system` off,
+        // xattrs on. `source_entry` above chooses the opposite of both because
+        // it feeds real backups in a sandbox.
+        one_file_system: false,
+        xattrs_enabled: true,
+        ..source_entry(Path::new(&format!("/home/{label}")), label)
+    }
 }

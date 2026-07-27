@@ -1,9 +1,9 @@
 use crossbeam_channel::Sender;
 use slint::{ModelRc, SharedString, StandardListViewItem, VecModel};
+use vykar_core::app::views;
 use vykar_core::config::ResolvedRepo;
 
 use crate::messages::{FindSnapshotGroup, RepoInfoData, SourceInfoData, UiEvent};
-use crate::repo_helpers::format_repo_name;
 use crate::{FindSnapshotGroup as UiFindSnapshotGroup, RepoInfo, SourceInfo};
 
 /// Sole conversion site for the repo-card DTO → Slint `RepoInfo`. Phase 2 adds
@@ -80,97 +80,32 @@ pub(crate) fn to_find_groups_model(groups: Vec<FindSnapshotGroup>) -> ModelRc<Ui
 pub(crate) fn collect_repo_names(repos: &[ResolvedRepo]) -> Vec<SharedString> {
     repos
         .iter()
-        .map(|repo| SharedString::from(format_repo_name(repo)))
+        .map(|repo| SharedString::from(repo.label_or_url().to_string()))
         .collect()
 }
 
 pub(crate) fn build_source_model_data(
     repos: &[ResolvedRepo],
 ) -> (Vec<SourceInfoData>, Vec<SharedString>) {
-    let mut seen = std::collections::HashSet::new();
     let mut items = Vec::new();
     let mut labels = Vec::new();
 
-    for repo in repos {
-        for source in &repo.sources {
-            if !seen.insert(source.label.clone()) {
-                continue;
-            }
-            let target = if source.repos.is_empty() {
-                "(all)".to_string()
-            } else {
-                source.repos.join(", ")
-            };
-            let mut flags = Vec::new();
-            if source.one_file_system {
-                flags.push("one_file_system");
-            }
-            if source.git_ignore {
-                flags.push("git_ignore");
-            }
-            if source.xattrs_enabled {
-                flags.push("xattrs");
-            }
-
-            let mut hooks_lines = Vec::new();
-            for (phase, cmds) in [
-                ("before", &source.hooks.before),
-                ("after", &source.hooks.after),
-                ("failed", &source.hooks.failed),
-                ("finally", &source.hooks.finally),
-            ] {
-                if !cmds.is_empty() {
-                    hooks_lines.push(format!("{}: {}", phase, cmds.join("; ")));
-                }
-            }
-
-            let mut retention_parts = Vec::new();
-            if let Some(ref ret) = source.retention {
-                if let Some(ref v) = ret.keep_within {
-                    retention_parts.push(format!("keep_within: {v}"));
-                }
-                if let Some(v) = ret.keep_last {
-                    retention_parts.push(format!("keep_last: {v}"));
-                }
-                if let Some(v) = ret.keep_hourly {
-                    retention_parts.push(format!("keep_hourly: {v}"));
-                }
-                if let Some(v) = ret.keep_daily {
-                    retention_parts.push(format!("keep_daily: {v}"));
-                }
-                if let Some(v) = ret.keep_weekly {
-                    retention_parts.push(format!("keep_weekly: {v}"));
-                }
-                if let Some(v) = ret.keep_monthly {
-                    retention_parts.push(format!("keep_monthly: {v}"));
-                }
-                if let Some(v) = ret.keep_yearly {
-                    retention_parts.push(format!("keep_yearly: {v}"));
-                }
-            }
-
-            items.push(SourceInfoData {
-                label: source.label.clone().into(),
-                paths: source.paths.join(", ").into(),
-                excludes: source.exclude.join(", ").into(),
-                target_repos: target.into(),
-                target_repo_names: source.repos.clone(),
-                detail_paths: source.paths.join("\n").into(),
-                detail_excludes: source.exclude.join("\n").into(),
-                detail_exclude_if_present: source.exclude_if_present.join("\n").into(),
-                detail_flags: flags.join(", ").into(),
-                detail_hooks: hooks_lines.join("\n").into(),
-                detail_retention: retention_parts.join(", ").into(),
-                detail_command_dumps: source
-                    .command_dumps
-                    .iter()
-                    .map(|d| format!("{}: {}", d.name, d.command))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-                    .into(),
-            });
-            labels.push(source.label.clone().into());
-        }
+    for s in views::collect_source_summaries(repos) {
+        labels.push(SharedString::from(s.label.clone()));
+        items.push(SourceInfoData {
+            label: s.label.into(),
+            paths: s.paths.join(", ").into(),
+            excludes: s.excludes.join(", ").into(),
+            target_repos: s.target_repos.into(),
+            target_repo_names: s.target_repo_names,
+            detail_paths: s.paths.join("\n").into(),
+            detail_excludes: s.excludes.join("\n").into(),
+            detail_exclude_if_present: s.exclude_if_present.join("\n").into(),
+            detail_flags: s.options.join(", ").into(),
+            detail_hooks: s.hooks.join("\n").into(),
+            detail_retention: s.retention.join(", ").into(),
+            detail_command_dumps: s.command_dumps.join("\n").into(),
+        });
     }
 
     (items, labels)

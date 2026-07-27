@@ -3,8 +3,20 @@ use vykar_core::config::ResolvedRepo;
 use crate::error::CliResult;
 use crate::passphrase::with_repo_passphrase;
 
-pub(crate) fn repo_display_name(repo: &ResolvedRepo) -> &str {
-    repo.label.as_deref().unwrap_or(&repo.config.repository.url)
+/// Display name of the repo at a probe-result index. Every index handed here
+/// comes from a classifier in this module, so an out-of-range one is a bug.
+pub(crate) fn repo_name_at<'a>(repos: &[&'a ResolvedRepo], idx: usize) -> &'a str {
+    repos
+        .get(idx)
+        .copied()
+        .expect("dispatch repo index is valid")
+        .label_or_url()
+}
+
+/// [`repo_name_at`] over a list of indices — the shape every "found in
+/// multiple repositories" message needs.
+pub(crate) fn repo_names_at<'a>(repos: &[&'a ResolvedRepo], indices: &[usize]) -> Vec<&'a str> {
+    indices.iter().map(|i| repo_name_at(repos, *i)).collect()
 }
 
 /// Result of probing multiple repos for a snapshot name.
@@ -144,20 +156,8 @@ pub(crate) fn classify_diff_target(
             // matches_a/matches_b are non-empty (checked above), so .first() is Some.
             let a_idx = *matches_a.first().expect("matches_a non-empty");
             let b_idx = *matches_b.first().expect("matches_b non-empty");
-            let a_repo = repo_display_name(
-                repos
-                    .get(a_idx)
-                    .copied()
-                    .expect("diff repo index for snapshot A is valid"),
-            )
-            .to_string();
-            let b_repo = repo_display_name(
-                repos
-                    .get(b_idx)
-                    .copied()
-                    .expect("diff repo index for snapshot B is valid"),
-            )
-            .to_string();
+            let a_repo = repo_name_at(repos, a_idx).to_string();
+            let b_repo = repo_name_at(repos, b_idx).to_string();
             DiffDispatch::DifferentRepos { a_repo, b_repo }
         }
         _ => {

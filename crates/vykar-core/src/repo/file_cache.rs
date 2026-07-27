@@ -1783,40 +1783,16 @@ mod tests {
     fn parent_reuse_index_basic() {
         let items = vec![
             Item {
-                path: "a.txt".into(),
-                entry_type: ItemType::RegularFile,
-                mode: 0o644,
-                uid: 0,
-                gid: 0,
-                user: None,
-                group: None,
                 mtime: 1000,
-                atime: None,
                 ctime: Some(2000),
                 size: 4096,
                 chunks: sample_chunk_refs_vec(),
-                link_target: None,
-                xattrs: None,
-                raw_names: None,
-                hardlink: None,
+                ..Item::test_file("a.txt")
             },
             Item {
-                path: "dir".into(),
                 entry_type: ItemType::Directory,
                 mode: 0o755,
-                uid: 0,
-                gid: 0,
-                user: None,
-                group: None,
-                mtime: 0,
-                atime: None,
-                ctime: None,
-                size: 0,
-                chunks: Vec::new(),
-                link_target: None,
-                xattrs: None,
-                raw_names: None,
-                hardlink: None,
+                ..Item::test_file("dir")
             },
         ];
 
@@ -1918,40 +1894,19 @@ mod tests {
     fn parent_reuse_index_ignores_dumps() {
         let items = vec![
             Item {
-                path: "vykar-dumps/pg_dump".into(),
-                entry_type: ItemType::RegularFile,
-                mode: 0o644,
-                uid: 0,
-                gid: 0,
-                user: None,
-                group: None,
                 mtime: 1000,
-                atime: None,
-                ctime: None, // Dumps have no ctime — should not trip legacy gate
+                // Dumps have no ctime — must not trip the legacy gate.
+                ctime: None,
                 size: 4096,
                 chunks: sample_chunk_refs_vec(),
-                link_target: None,
-                xattrs: None,
-                raw_names: None,
-                hardlink: None,
+                ..Item::test_file("vykar-dumps/pg_dump")
             },
             Item {
-                path: "real.txt".into(),
-                entry_type: ItemType::RegularFile,
-                mode: 0o644,
-                uid: 0,
-                gid: 0,
-                user: None,
-                group: None,
                 mtime: 2000,
-                atime: None,
                 ctime: Some(3000),
                 size: 8192,
                 chunks: sample_chunk_refs_vec(),
-                link_target: None,
-                xattrs: None,
-                raw_names: None,
-                hardlink: None,
+                ..Item::test_file("real.txt")
             },
         ];
 

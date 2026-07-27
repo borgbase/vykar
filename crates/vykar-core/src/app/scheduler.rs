@@ -127,6 +127,49 @@ pub fn next_run_delay(schedule: &ScheduleConfig) -> Result<Duration> {
     }
 }
 
+/// Terse cadence summary for a metric card: the interval string, the cron
+/// expression, or `"Off"` when the schedule is disabled or globally paused.
+#[must_use]
+pub fn schedule_brief(schedule: &ScheduleConfig, paused: bool) -> String {
+    if !schedule.enabled || paused {
+        return "Off".to_string();
+    }
+    if let Some(ref cron) = schedule.cron {
+        return cron.clone();
+    }
+    schedule.every.clone().unwrap_or_else(|| "24h".to_string())
+}
+
+/// Identity used to decide whether all repos share one cadence. Compares the
+/// parsed interval rather than the raw string, so `60m` and `1h` are the same
+/// schedule rather than a spurious "per-repo".
+fn schedule_key(schedule: &ScheduleConfig) -> (bool, Option<String>, Option<u64>) {
+    (
+        schedule.enabled,
+        schedule.cron.clone(),
+        schedule.every_duration().ok().map(|d| d.as_secs()),
+    )
+}
+
+/// Top-level schedule summary: the shared cadence when every repo agrees,
+/// `"per-repo"` when they differ, `"Off"` when paused or repo-less. The
+/// per-repo column carries the detail in the mixed case.
+#[must_use]
+pub fn repos_schedule_brief(schedules: &[&ScheduleConfig], paused: bool) -> String {
+    if paused {
+        return "Off".to_string();
+    }
+    let mut iter = schedules.iter();
+    let Some(first) = iter.next() else {
+        return "Off".to_string();
+    };
+    let first_key = schedule_key(first);
+    if iter.any(|s| schedule_key(s) != first_key) {
+        return "per-repo".to_string();
+    }
+    schedule_brief(first, paused)
+}
+
 /// Per-repository next-run times, index-aligned with a slice of repositories.
 ///
 /// Both schedulers (daemon and GUI) share this so the due-set and next-wake
@@ -272,6 +315,51 @@ mod tests {
             jitter_seconds: 0,
             passphrase_prompt_timeout_seconds: 300,
         }
+    }
+
+    #[test]
+    fn schedule_key_compares_parsed_intervals() {
+        // `60m` and `1h` are the same cadence, not a mixed config.
+        assert_eq!(
+            schedule_key(&sched(true, Some("60m"), false)),
+            schedule_key(&sched(true, Some("1h"), false))
+        );
+        assert_ne!(
+            schedule_key(&sched(true, Some("1h"), false)),
+            schedule_key(&sched(true, Some("1d"), false))
+        );
+        assert_ne!(
+            schedule_key(&sched(true, Some("1h"), false)),
+            schedule_key(&sched(false, Some("1h"), false))
+        );
+    }
+
+    #[test]
+    fn brief_is_per_repo_when_cadences_differ() {
+        let hourly = sched(true, Some("1h"), false);
+        let sixty_min = sched(true, Some("60m"), false);
+        let daily = sched(true, Some("1d"), false);
+
+        assert_eq!(repos_schedule_brief(&[&hourly, &sixty_min], false), "1h");
+        assert_eq!(repos_schedule_brief(&[&hourly, &daily], false), "per-repo");
+        assert_eq!(repos_schedule_brief(&[&hourly], true), "Off");
+        assert_eq!(repos_schedule_brief(&[], false), "Off");
+    }
+
+    #[test]
+    fn brief_prefers_cron_then_every_then_the_default() {
+        let mut cron = sched(true, Some("1h"), false);
+        cron.cron = Some("0 3 * * *".into());
+        assert_eq!(schedule_brief(&cron, false), "0 3 * * *");
+        assert_eq!(
+            schedule_brief(&sched(true, Some("30m"), false), false),
+            "30m"
+        );
+        assert_eq!(schedule_brief(&sched(true, None, false), false), "24h");
+        assert_eq!(
+            schedule_brief(&sched(false, Some("30m"), false), false),
+            "Off"
+        );
     }
 
     #[test]

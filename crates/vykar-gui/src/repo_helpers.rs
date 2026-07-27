@@ -10,12 +10,6 @@ use crate::messages::{log_entry_now, UiEvent};
 use crate::APP_TITLE;
 use vykar_common::display::format_bytes;
 
-pub(crate) fn format_repo_name(repo: &ResolvedRepo) -> String {
-    repo.label
-        .clone()
-        .unwrap_or_else(|| repo.config.repository.url.clone())
-}
-
 /// Resolve a repo passphrase (configured source or interactive prompt),
 /// recording in `from_dialog` whether the value came from the interactive
 /// dialog (retryable) versus a configured source (not retryable). `error_line`,
@@ -25,7 +19,7 @@ fn resolve_passphrase_tracked(
     error_line: &str,
     from_dialog: &mut bool,
 ) -> Result<Option<zeroize::Zeroizing<String>>, VykarError> {
-    let repo_name = format_repo_name(repo);
+    let repo_name = repo.label_or_url().to_string();
     passphrase::resolve_passphrase(&repo.config, repo.label.as_deref(), |prompt| {
         *from_dialog = true;
         let title = format!("{APP_TITLE} - Passphrase ({repo_name})");

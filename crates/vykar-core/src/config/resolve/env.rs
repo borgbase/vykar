@@ -223,8 +223,8 @@ fn byte_offset_to_line_col(input: &str, byte_offset: usize) -> (usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::super::resolution::load_and_resolve;
-    use super::super::test_support::EnvGuard;
     use super::*;
+    use crate::tests::helpers::EnvGuard;
     use crate::testutil::CWD_LOCK;
     use std::collections::HashMap;
     use std::fs;

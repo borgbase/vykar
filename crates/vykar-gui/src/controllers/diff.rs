@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 
 use slint::{ComponentHandle, ModelRc, StandardListViewItem, VecModel};
-use vykar_common::display::format_bytes;
+use vykar_common::display::{format_optional_size, format_size_delta};
 use vykar_core::commands::diff::DiffChangeKind;
 
 use crate::messages::DiffResultRow;
@@ -97,18 +97,6 @@ fn change_label(change: DiffChangeKind) -> &'static str {
         DiffChangeKind::Added => "Added",
         DiffChangeKind::Removed => "Removed",
         DiffChangeKind::Modified => "Modified",
-    }
-}
-
-fn format_optional_size(size: Option<u64>) -> String {
-    size.map(format_bytes).unwrap_or_else(|| "-".to_string())
-}
-
-fn format_size_delta(delta: i64) -> String {
-    match delta.cmp(&0) {
-        std::cmp::Ordering::Less => format!("-{}", format_bytes(delta.unsigned_abs())),
-        std::cmp::Ordering::Equal => format_bytes(0),
-        std::cmp::Ordering::Greater => format!("+{}", format_bytes(delta as u64)),
     }
 }
 

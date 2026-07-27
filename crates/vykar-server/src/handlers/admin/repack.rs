@@ -238,7 +238,7 @@ fn execute_repack(
             drop(temp_file);
 
             // Finalize hash -> pack ID.
-            let pack_id_hex = finalize_blake2b_256_hex(hasher);
+            let pack_id_hex = super::finalize_blake2b_256_hex(hasher);
             let shard = &pack_id_hex[..2];
             let new_pack_key = format!("packs/{shard}/{pack_id_hex}");
 
@@ -369,14 +369,6 @@ fn write_and_hash(
     writer.write_all(data)?;
     hasher.update(data);
     Ok(())
-}
-
-fn finalize_blake2b_256_hex(hasher: Blake2bVar) -> String {
-    let mut out = [0u8; 32];
-    hasher
-        .finalize_variable(&mut out)
-        .expect("valid output buffer length");
-    hex::encode(out)
 }
 
 /// Validate the plan and return its total output size in bytes.

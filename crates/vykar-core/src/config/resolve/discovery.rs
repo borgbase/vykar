@@ -100,8 +100,8 @@ pub fn resolve_config_path(cli_config: Option<&str>) -> Option<ConfigSource> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_support::EnvGuard;
     use super::*;
+    use crate::tests::helpers::EnvGuard;
     use crate::testutil::CWD_LOCK;
     use std::fs;
 

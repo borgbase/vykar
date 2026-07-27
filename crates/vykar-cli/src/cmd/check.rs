@@ -28,15 +28,7 @@ pub(crate) fn run_check(
     // --repair mode
     if dry_run {
         // Plan only: show plan and exit.
-        let result = with_repo_passphrase(config, label, |passphrase| {
-            Ok(commands::check::run_with_repair(
-                config,
-                passphrase,
-                verify_data,
-                RepairMode::PlanOnly,
-                Some(&mut make_progress_callback()),
-            )?)
-        })?;
+        let result = run_repair(config, label, verify_data, RepairMode::PlanOnly)?;
         print_check_summary(&result.check_result);
         print_repair_plan(&result.plan);
         eprintln!("Dry run: no changes applied.");
@@ -51,15 +43,7 @@ pub(crate) fn run_check(
 
     if yes {
         // --yes: apply directly without confirmation.
-        let result = with_repo_passphrase(config, label, |passphrase| {
-            Ok(commands::check::run_with_repair(
-                config,
-                passphrase,
-                verify_data,
-                RepairMode::Apply,
-                Some(&mut make_progress_callback()),
-            )?)
-        })?;
+        let result = run_repair(config, label, verify_data, RepairMode::Apply)?;
         print_check_summary(&result.check_result);
         print_repair_plan(&result.plan);
         print_repair_result(&result);
@@ -67,15 +51,7 @@ pub(crate) fn run_check(
     }
 
     // Interactive: plan first, then confirm, then apply.
-    let plan_result = with_repo_passphrase(config, label, |passphrase| {
-        Ok(commands::check::run_with_repair(
-            config,
-            passphrase,
-            verify_data,
-            RepairMode::PlanOnly,
-            Some(&mut make_progress_callback()),
-        )?)
-    })?;
+    let plan_result = run_repair(config, label, verify_data, RepairMode::PlanOnly)?;
 
     print_check_summary(&plan_result.check_result);
     print_repair_plan(&plan_result.plan);
@@ -86,15 +62,7 @@ pub(crate) fn run_check(
     {
         // Tier 1 only — apply without prompt.
         eprintln!("No data-loss actions; applying safe repairs...");
-        let result = with_repo_passphrase(config, label, |passphrase| {
-            Ok(commands::check::run_with_repair(
-                config,
-                passphrase,
-                verify_data,
-                RepairMode::Apply,
-                Some(&mut make_progress_callback()),
-            )?)
-        })?;
+        let result = run_repair(config, label, verify_data, RepairMode::Apply)?;
         print_repair_result(&result);
         return Ok(());
     }
@@ -111,18 +79,29 @@ pub(crate) fn run_check(
     }
 
     // Re-scan and apply under maintenance lock.
-    let result = with_repo_passphrase(config, label, |passphrase| {
+    let result = run_repair(config, label, verify_data, RepairMode::Apply)?;
+    print_repair_result(&result);
+
+    Ok(())
+}
+
+/// One scan-and-repair pass. `RepairMode::Apply` re-scans from scratch under the
+/// maintenance lock, so an earlier `PlanOnly` pass never carries state forward.
+fn run_repair(
+    config: &VykarConfig,
+    label: Option<&str>,
+    verify_data: bool,
+    mode: RepairMode,
+) -> CliResult<RepairResult> {
+    with_repo_passphrase(config, label, |passphrase| {
         Ok(commands::check::run_with_repair(
             config,
             passphrase,
             verify_data,
-            RepairMode::Apply,
+            mode,
             Some(&mut make_progress_callback()),
         )?)
-    })?;
-    print_repair_result(&result);
-
-    Ok(())
+    })
 }
 
 fn run_check_readonly(

@@ -12,6 +12,7 @@ use crate::error::{CliError, CliResult};
 use crate::format::{format_bytes, parse_size};
 use crate::passphrase::with_repo_passphrase;
 use crate::table::{add_kv_row, CliTableTheme};
+use vykar_common::display::{format_duration_seconds, format_optional_size, format_size_delta};
 
 fn normalize_path_filter(raw: &str) -> String {
     let s = raw.strip_prefix("./").unwrap_or(raw);
@@ -139,13 +140,12 @@ pub(crate) fn run_snapshot_command(
                     .format("%Y-%m-%d %H:%M:%S"),
             );
             let duration = meta.time_end.signed_duration_since(meta.time);
-            let secs = duration.num_seconds();
-            let duration_str = if secs >= 60 {
-                format!("{}m {:02}s", secs / 60, secs % 60)
-            } else {
-                format!("{secs}s")
-            };
-            add_kv_row(&mut t1, theme, "Duration", duration_str);
+            add_kv_row(
+                &mut t1,
+                theme,
+                "Duration",
+                format_duration_seconds(duration.num_seconds()),
+            );
             let effective_label = if meta.label.is_empty() {
                 &meta.source_label
             } else {
@@ -183,18 +183,6 @@ pub(crate) fn run_snapshot_command(
             println!("{t2}");
             Ok(())
         }
-    }
-}
-
-fn format_optional_size(size: Option<u64>) -> String {
-    size.map(format_bytes).unwrap_or_else(|| "-".to_string())
-}
-
-fn format_size_delta(delta: i64) -> String {
-    match delta.cmp(&0) {
-        std::cmp::Ordering::Less => format!("-{}", format_bytes(delta.unsigned_abs())),
-        std::cmp::Ordering::Equal => format_bytes(0),
-        std::cmp::Ordering::Greater => format!("+{}", format_bytes(delta as u64)),
     }
 }
 

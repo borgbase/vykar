@@ -8,7 +8,7 @@ use vykar_types::error::Result;
 
 use crate::messages::UiEvent;
 use crate::progress::BackupStatusTracker;
-use crate::repo_helpers::{format_repo_name, send_log};
+use crate::repo_helpers::{send_log, with_passphrase_retry, PassphraseRun};
 
 use super::WorkerContext;
 
@@ -146,6 +146,64 @@ pub(super) fn select_repo_or_fail<'r>(
     }
 }
 
+/// Logged when the user dismisses a passphrase prompt mid-operation. One
+/// constant so the four conventional handlers cannot drift apart.
+const PASSPHRASE_CANCELLED: &str = "passphrase prompt canceled; skipping.";
+
+/// Guard + repo-select + passphrase-retry scaffold shared by the conventional
+/// worker handlers (delete, diff, prune, find).
+///
+/// The guard lives for the duration of `run`, so a repo miss, a dismissed
+/// prompt, and a failed run are all reported here — exactly once each. On
+/// failure the `Err` carries a short user-facing reason for handlers that also
+/// have to push a result event (diff); handlers with nothing to report simply
+/// drop it.
+///
+/// `run` receives the cancel flag rather than reading it off the context: the
+/// context is mutably borrowed here for the passphrase cache, so a closure
+/// capturing `ctx` would not borrow-check.
+///
+/// Mount deliberately does **not** use this: it interleaves
+/// `UiEvent::MountFailed` / `MountStopped` lifecycle events with every failure
+/// arm and hands the validated passphrase to a spawned thread.
+pub(super) fn with_repo_op<T>(
+    ctx: &mut WorkerContext,
+    repo_name: &str,
+    status: impl Into<String>,
+    label: &str,
+    mut run: impl FnMut(&ResolvedRepo, Option<&str>, &AtomicBool) -> Result<T>,
+) -> std::result::Result<T, String> {
+    let mut guard = OpGuard::ui(
+        &ctx.ui_tx,
+        &ctx.cancel_requested,
+        &ctx.operation_running,
+        status,
+    );
+
+    let Some(repo) = select_repo_or_fail(&mut guard, &ctx.runtime.repos, repo_name) else {
+        return Err("repository not found".to_string());
+    };
+
+    let cancel = &ctx.cancel_requested;
+    let outcome = with_passphrase_retry(repo, &mut ctx.passphrases, 3, |pass| {
+        run(repo, pass, cancel)
+    });
+
+    match outcome {
+        Ok(PassphraseRun::Ran(value)) => Ok(value),
+        // A dismissed prompt is the user's choice, not a failure: log it and
+        // leave the status bar clean.
+        Ok(PassphraseRun::Canceled) => {
+            send_log(&ctx.ui_tx, format!("[{repo_name}] {PASSPHRASE_CANCELLED}"));
+            Err("passphrase required".to_string())
+        }
+        Err(e) => {
+            guard.fail(format!("[{repo_name}] {label} failed: {e}"));
+            Err(e.to_string())
+        }
+    }
+}
+
 pub(super) fn run_selection_with_progress(
     ui_tx: &Sender<UiEvent>,
     cancel_requested: &AtomicBool,
@@ -153,7 +211,7 @@ pub(super) fn run_selection_with_progress(
     sources: &[SourceEntry],
     passphrase: Option<&str>,
 ) -> Result<operations::BackupRunReport> {
-    let repo_name = format_repo_name(repo);
+    let repo_name = repo.label_or_url().to_string();
     let mut tracker = BackupStatusTracker::new(repo_name.clone());
     let ui_tx_progress = ui_tx.clone();
     operations::run_backup_selection(

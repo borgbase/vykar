@@ -132,28 +132,14 @@ pub(super) fn commit_cache_hit(
 mod tests {
     use super::*;
     use crate::repo::file_cache::CachedChunkRef;
-    use crate::snapshot::item::ItemType;
     use crate::testutil::test_repo_plaintext;
     use vykar_types::chunk_id::ChunkId;
 
     fn empty_item() -> Item {
         Item {
-            path: "ghost.txt".into(),
-            entry_type: ItemType::RegularFile,
-            mode: 0o644,
-            uid: 0,
-            gid: 0,
-            user: None,
-            group: None,
-            mtime: 0,
-            atime: None,
             ctime: Some(0),
             size: 42,
-            chunks: Vec::new(),
-            link_target: None,
-            xattrs: None,
-            raw_names: None,
-            hardlink: None,
+            ..Item::test_file("ghost.txt")
         }
     }
 

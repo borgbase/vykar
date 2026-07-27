@@ -317,22 +317,11 @@ mod tests {
 
     fn make_item(path: &str, size: u64, mtime: i64) -> Item {
         Item {
-            path: path.into(),
-            entry_type: ItemType::RegularFile,
-            mode: 0o644,
             uid: 1000,
             gid: 1000,
-            user: None,
-            group: None,
             mtime,
-            atime: None,
-            ctime: None,
             size,
-            chunks: vec![],
-            link_target: None,
-            xattrs: None,
-            raw_names: None,
-            hardlink: None,
+            ..Item::test_file(path)
         }
     }
 

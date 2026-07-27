@@ -11,8 +11,9 @@ use crate::cmd;
 use crate::cmd::backup::BackupRunOpts;
 use crate::cmd::check::{format_check_progress, print_check_summary};
 use crate::error::{CliError, CliResult};
-use crate::format::{format_bytes, print_backup_stats};
+use crate::format::print_backup_stats;
 use crate::passphrase::with_repo_passphrase;
+use vykar_common::display::format_duration_seconds;
 
 pub(crate) fn warn_if_untrusted_rest(config: &VykarConfig, label: Option<&str>) {
     let Ok(parsed) = parse_repo_url(&config.repository.url) else {
@@ -140,35 +141,12 @@ fn print_step_details(result: &FullCycleResult) {
 
     // Prune stats
     if let Some(ref stats) = result.prune_stats {
-        println!(
-            "Pruned {} snapshots (kept {}), freed {} chunks ({})",
-            stats.pruned,
-            stats.kept,
-            stats.chunks_deleted,
-            format_bytes(stats.space_freed),
-        );
+        cmd::prune::print_prune_summary(stats);
     }
 
     // Compact stats
     if let Some(ref stats) = result.compact_stats {
-        println!(
-            "Compaction complete: {} packs repacked, {} empty packs deleted, {} freed",
-            stats.packs_repacked,
-            stats.packs_deleted_empty,
-            format_bytes(stats.space_freed),
-        );
-        if stats.packs_corrupt > 0 {
-            eprintln!(
-                "  Warning: {} corrupt pack(s) found; run `vykar check --verify-data` for details",
-                stats.packs_corrupt,
-            );
-        }
-        if stats.packs_orphan > 0 {
-            eprintln!(
-                "  {} orphan pack(s) (present on disk but not in index)",
-                stats.packs_orphan,
-            );
-        }
+        cmd::compact::print_compact_summary(stats);
     }
 
     // Check results (skip summary if check was skipped — the step outcome table already shows it)
@@ -197,14 +175,10 @@ fn print_summary(steps: &[(CycleStep, StepOutcome)], start: std::time::Instant) 
         }
     }
 
-    let secs = elapsed.as_secs();
-    let mins = secs / 60;
-    let secs = secs % 60;
-    if mins > 0 {
-        eprintln!("  Duration:    {mins}m {secs:02}s");
-    } else {
-        eprintln!("  Duration:    {secs}s");
-    }
+    eprintln!(
+        "  Duration:    {}",
+        format_duration_seconds(elapsed.as_secs() as i64)
+    );
 }
 
 /// Returns `Ok(had_partial)` — `true` if backup had soft errors but still succeeded.

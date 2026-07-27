@@ -51,12 +51,8 @@ pub(crate) fn validate_config(
     // Every repo can carry its own schedule, so check them all (a repo-less
     // config has no schedule to check).
     for repo in &repos {
-        vykar_core::app::scheduler::next_run_delay(&repo.config.schedule).map_err(|e| {
-            format!(
-                "Invalid schedule for '{}': {e}",
-                repo.label.as_deref().unwrap_or(&repo.config.repository.url)
-            )
-        })?;
+        vykar_core::app::scheduler::next_run_delay(&repo.config.schedule)
+            .map_err(|e| format!("Invalid schedule for '{}': {e}", repo.label_or_url()))?;
     }
     Ok(repos)
 }

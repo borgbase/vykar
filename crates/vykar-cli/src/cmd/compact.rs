@@ -33,15 +33,29 @@ pub(crate) fn run_compact(
             stats.blobs_live,
             format_bytes(stats.space_freed),
         );
+        print_compact_warnings(&stats);
     } else {
-        println!(
-            "Compaction complete: {} packs repacked, {} empty packs deleted, {} freed",
-            stats.packs_repacked,
-            stats.packs_deleted_empty,
-            format_bytes(stats.space_freed),
-        );
+        print_compact_summary(&stats);
     }
 
+    Ok(())
+}
+
+/// The completion line plus any pack warnings, shared with the full-cycle
+/// summary in `dispatch`.
+pub(crate) fn print_compact_summary(stats: &commands::compact::CompactStats) {
+    println!(
+        "Compaction complete: {} packs repacked, {} empty packs deleted, {} freed",
+        stats.packs_repacked,
+        stats.packs_deleted_empty,
+        format_bytes(stats.space_freed),
+    );
+    print_compact_warnings(stats);
+}
+
+/// Corrupt/orphan pack notices. Reported after a dry run too — the scan that
+/// finds them happens either way.
+fn print_compact_warnings(stats: &commands::compact::CompactStats) {
     if stats.packs_corrupt > 0 {
         eprintln!(
             "  Warning: {} corrupt pack(s) found; run `vykar check --verify-data` for details",
@@ -54,6 +68,4 @@ pub(crate) fn run_compact(
             stats.packs_orphan,
         );
     }
-
-    Ok(())
 }

@@ -17,6 +17,16 @@ pub struct ResolvedRepo {
     pub sources: Vec<SourceEntry>,
 }
 
+impl ResolvedRepo {
+    /// The repository's display name: its configured label, or the URL when it
+    /// has none. This is also the selector `-R/--repo` and the GUI's
+    /// `RunBackupRepos` match against, so name and selector cannot drift.
+    #[must_use]
+    pub fn label_or_url(&self) -> &str {
+        self.label.as_deref().unwrap_or(&self.config.repository.url)
+    }
+}
+
 /// Load and resolve a config file into one `ResolvedRepo` per repository entry.
 pub fn load_and_resolve(path: &Path) -> vykar_types::error::Result<Vec<ResolvedRepo>> {
     let contents = std::fs::read_to_string(path).map_err(|e| {
@@ -280,8 +290,8 @@ pub fn load_config(path: &Path) -> vykar_types::error::Result<VykarConfig> {
 #[cfg(test)]
 mod tests {
     use super::super::super::defaults::*;
-    use super::super::test_support::{make_test_repo, make_test_source};
     use super::*;
+    use crate::tests::helpers::{make_test_repo, make_test_source};
     use std::fs;
     use vykar_common::paths;
 

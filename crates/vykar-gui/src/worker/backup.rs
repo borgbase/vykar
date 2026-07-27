@@ -7,9 +7,7 @@ use vykar_types::error::VykarError;
 
 use crate::messages::{AppCommand, UiEvent};
 use crate::progress::{format_check_status, format_step_outcome, BackupStatusTracker};
-use crate::repo_helpers::{
-    format_repo_name, log_backup_report, send_log, with_passphrase_retry, PassphraseRun,
-};
+use crate::repo_helpers::{log_backup_report, send_log, with_passphrase_retry, PassphraseRun};
 
 use super::shared::{run_selection_with_progress, OpGuard};
 use super::WorkerContext;
@@ -25,14 +23,14 @@ pub(super) fn handle_backup_repos(ctx: &mut WorkerContext, repo_names: Vec<Strin
 
 /// Indices of the repositories a cycle should cover: all of them, or just the
 /// ones named in `only` (per-repo schedules). Names are matched as produced by
-/// `format_repo_name`. An empty result for a non-empty `only` means the config
+/// `ResolvedRepo::label_or_url`. An empty result for a non-empty `only` means the config
 /// changed underneath the scheduler.
 fn select_repo_indices(repos: &[config::ResolvedRepo], only: Option<&[String]>) -> Vec<usize> {
     match only {
         Some(names) => repos
             .iter()
             .enumerate()
-            .filter(|(_, r)| names.contains(&format_repo_name(r)))
+            .filter(|(_, r)| names.contains(&r.label_or_url().to_string()))
             .map(|(idx, _)| idx)
             .collect(),
         None => (0..repos.len()).collect(),
@@ -41,7 +39,7 @@ fn select_repo_indices(repos: &[config::ResolvedRepo], only: Option<&[String]>) 
 
 /// Run a full cycle over the configured repositories, optionally restricted to
 /// `only` (per-repo schedules). Names are matched as produced by
-/// `format_repo_name`.
+/// `ResolvedRepo::label_or_url`.
 fn run_backup_cycle(ctx: &mut WorkerContext, scheduled: bool, only: Option<&[String]>) {
     let status = if scheduled {
         "Running scheduled backup cycle..."
@@ -89,7 +87,7 @@ fn run_backup_cycle(ctx: &mut WorkerContext, scheduled: bool, only: Option<&[Str
         let Some(repo) = ctx.runtime.repos.get(repo_idx) else {
             continue;
         };
-        let repo_name = format_repo_name(repo);
+        let repo_name = repo.label_or_url().to_string();
         let _ = ctx.ui_tx.send(UiEvent::Status(format!(
             "[{}] ({}/{total})...",
             repo_name,
@@ -237,7 +235,7 @@ pub(super) fn handle_backup_repo(ctx: &mut WorkerContext, repo_name: String) {
         }
     };
 
-    let rn = format_repo_name(repo);
+    let rn = repo.label_or_url().to_string();
     let mut guard = OpGuard::backup(
         &ctx.ui_tx,
         &ctx.cancel_requested,
@@ -315,7 +313,7 @@ pub(super) fn handle_backup_source(ctx: &mut WorkerContext, source_label: String
         }
         attempted += 1;
 
-        let repo_name = format_repo_name(repo);
+        let repo_name = repo.label_or_url().to_string();
         let _ = ctx.ui_tx.send(UiEvent::Status(format!(
             "Backing up [{}] ({}/{total})...",
             repo_name,

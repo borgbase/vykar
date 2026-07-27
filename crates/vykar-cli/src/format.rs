@@ -4,7 +4,7 @@ pub(crate) fn parse_size(s: &str) -> CliResult<u64> {
     Ok(vykar_common::display::parse_size(s)?)
 }
 
-pub(crate) use vykar_common::display::{format_bytes, format_count};
+pub(crate) use vykar_common::display::format_bytes;
 
 pub(crate) fn print_backup_stats(stats: &vykar_core::snapshot::SnapshotStats) {
     if stats.errors > 0 {

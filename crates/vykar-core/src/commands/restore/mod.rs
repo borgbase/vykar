@@ -634,26 +634,12 @@ mod tests {
     /// no-write operation; this pins the detection logic on every platform.
     #[test]
     fn detect_raw_entries_reports_raw_items_only() {
-        use crate::snapshot::item::{Item, ItemRawNames, ItemType};
+        use crate::snapshot::item::{Item, ItemRawNames};
 
         fn item(path: &str, raw: Option<ItemRawNames>) -> Item {
             Item {
-                path: path.to_string(),
-                entry_type: ItemType::RegularFile,
-                mode: 0o644,
-                uid: 0,
-                gid: 0,
-                user: None,
-                group: None,
-                mtime: 0,
-                atime: None,
-                ctime: None,
-                size: 0,
-                chunks: Vec::new(),
-                link_target: None,
-                xattrs: None,
                 raw_names: raw,
-                hardlink: None,
+                ..Item::test_file(path)
             }
         }
 

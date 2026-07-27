@@ -7,7 +7,7 @@ use crossbeam_channel::{Receiver, Sender};
 use vykar_core::app;
 
 use crate::messages::{AppCommand, RepoInfoData, UiEvent};
-use crate::repo_helpers::{format_repo_name, send_log};
+use crate::repo_helpers::send_log;
 use crate::scheduler;
 use crate::view_models::send_structured_data;
 
@@ -76,7 +76,7 @@ fn startup(ctx: &mut WorkerContext) {
             .repos
             .iter()
             .filter(|r| r.config.schedule.enabled && r.config.schedule.on_startup)
-            .map(format_repo_name)
+            .map(|r| r.label_or_url().to_string())
             .collect();
         if !on_startup.is_empty() {
             send_log(
@@ -105,27 +105,32 @@ pub(super) fn rebuild_scheduler_state(ctx: &mut WorkerContext) -> String {
         .collect();
     let paused = ctx.schedule_paused || !ctx.scheduler_lock_held;
 
+    let mut cadence_errors = Vec::new();
     if let Ok(mut state) = ctx.scheduler.lock() {
         state.enabled =
             ctx.scheduler_lock_held && ctx.runtime.repos.iter().any(|r| r.config.schedule.enabled);
         state.paused = paused;
-        // `next_run: None` — the scheduler thread computes each repo's first
-        // slot, so a bad cadence surfaces through its pause-and-log path.
-        state.repos = ctx
-            .runtime
-            .repos
-            .iter()
-            .map(|r| scheduler::RepoSchedule {
-                name: format_repo_name(r),
-                schedule: r.config.schedule.clone(),
-                next_run: None,
-            })
-            .collect();
+        cadence_errors = state.set_repos(
+            ctx.runtime
+                .repos
+                .iter()
+                .map(|r| (r.label_or_url().to_string(), r.config.schedule.clone()))
+                .collect(),
+        );
+    }
+    // Per-repo, never a global pause: an unschedulable cadence drops that one
+    // repo from the timer and leaves the others running, which is what the
+    // shared `SchedulePlan` promises and what the daemon already does.
+    for (repo, e) in cadence_errors {
+        let _ = ctx.ui_tx.send(crate::messages::log_entry_now(format!(
+            "[{repo}] scheduler error: {e}. This repository will not run automatically \
+             until the config is fixed and reloaded."
+        )));
     }
     let _ = ctx.sched_notify_tx.try_send(());
 
     if ctx.scheduler_lock_held {
-        scheduler::repos_schedule_brief(&schedules, paused)
+        app::scheduler::repos_schedule_brief(&schedules, paused)
     } else {
         "Off".to_string()
     }

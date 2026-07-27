@@ -54,6 +54,44 @@ pub struct Item {
     pub hardlink: Option<HardlinkId>,
 }
 
+#[cfg(test)]
+impl Item {
+    /// A zero-length regular file at `path`, for tests.
+    ///
+    /// Test-only on purpose: production code builds `Item`s from real
+    /// filesystem metadata, and a lenient constructor there would make it easy
+    /// to write a snapshot with placeholder ownership or timestamps. Callers
+    /// override what they care about with struct-update syntax:
+    ///
+    /// ```ignore
+    /// Item { size: 1024, entry_type: ItemType::Directory, ..Item::test_file("a") }
+    /// ```
+    ///
+    /// Every field is listed explicitly rather than derived from `Default`:
+    /// `Item` is serialized as a positional msgpack array, so the field set
+    /// staying visible in one place is what keeps the wire layout reviewable.
+    pub(crate) fn test_file(path: &str) -> Self {
+        Self {
+            path: path.to_string(),
+            entry_type: ItemType::RegularFile,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            user: None,
+            group: None,
+            mtime: 0,
+            atime: None,
+            ctime: None,
+            size: 0,
+            chunks: Vec::new(),
+            link_target: None,
+            xattrs: None,
+            raw_names: None,
+            hardlink: None,
+        }
+    }
+}
+
 /// Source `(dev, ino)` identity of a regular file with `nlink > 1`, used to
 /// regroup hard-linked nodes at restore time. `dev` disambiguates the same
 /// `ino` across filesystems within a single snapshot.

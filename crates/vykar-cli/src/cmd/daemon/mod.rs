@@ -46,11 +46,6 @@ fn release_malloc_arenas() {
 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
 fn release_malloc_arenas() {}
 
-/// Repository display name: label when set, otherwise the URL.
-fn repo_name(repo: &ResolvedRepo) -> &str {
-    repo.label.as_deref().unwrap_or(&repo.config.repository.url)
-}
-
 /// Borrow every repository's effective schedule, index-aligned with `repos`.
 fn repo_schedules(repos: &[ResolvedRepo]) -> Vec<&ScheduleConfig> {
     repos.iter().map(|r| &r.config.schedule).collect()
@@ -60,7 +55,10 @@ fn repo_schedules(repos: &[ResolvedRepo]) -> Vec<&ScheduleConfig> {
 /// computed is dropped from the timer, not fatal — the rest keep running.
 fn log_plan_errors(repos: &[ResolvedRepo], errors: &[(usize, VykarError)]) {
     for (idx, e) in errors {
-        let name = repos.get(*idx).map(repo_name).unwrap_or("?");
+        let name = repos
+            .get(*idx)
+            .map(ResolvedRepo::label_or_url)
+            .unwrap_or("?");
         tracing::warn!(
             repo = name,
             error = %e,
@@ -78,7 +76,7 @@ fn log_startup_runs(repos: &[ResolvedRepo], plan: &SchedulePlan) {
         .due(SystemTime::now())
         .iter()
         .filter_map(|&idx| repos.get(idx))
-        .map(repo_name)
+        .map(ResolvedRepo::label_or_url)
         .collect();
     if !due.is_empty() {
         tracing::info!(
@@ -108,7 +106,7 @@ fn repo_next_runs(
     repos
         .iter()
         .enumerate()
-        .map(|(idx, repo)| (repo_name(repo).to_string(), plan.next_run(idx)))
+        .map(|(idx, repo)| (repo.label_or_url().to_string(), plan.next_run(idx)))
         .collect()
 }
 
@@ -132,7 +130,7 @@ fn load_daemon_config(source: &ConfigSource) -> CliResult<Vec<ResolvedRepo>> {
     // Pre-validate passphrases for every repo, including those whose schedule is
     // disabled — they still take part in SIGUSR1 cycles and the status page.
     for repo in &repos {
-        let label = repo_name(repo);
+        let label = repo.label_or_url();
         if repo.config.encryption.mode != EncryptionModeConfig::None {
             match configured_passphrase(&repo.config) {
                 Ok(Some(_)) => {}
@@ -317,7 +315,7 @@ fn log_registered_repos(repos: &[ResolvedRepo]) {
     for repo in repos {
         let s = &repo.config.schedule;
         tracing::info!(
-            repo = repo_name(repo),
+            repo = repo.label_or_url(),
             enabled = s.enabled,
             cadence = s.cron.as_deref().or(s.every.as_deref()).unwrap_or("24h"),
             on_startup = s.on_startup,
@@ -349,7 +347,7 @@ fn run_backup_cycle(due: &[&ResolvedRepo], all: &[ResolvedRepo], status: &Shared
             break;
         }
 
-        let name = repo_name(repo);
+        let name = repo.label_or_url();
 
         // Pre-flight: skip unavailable local repos in multi-repo configs
         if multi {

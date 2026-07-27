@@ -1,46 +1,27 @@
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 
-use chrono::{DateTime, Local, Utc};
 use slint::SharedString;
+use vykar_core::app::passphrase;
+use vykar_core::app::views::{format_last_snapshot, SnapshotRowView};
 use vykar_core::commands::info::InfoStats;
 use vykar_core::commands::{init, list};
-use vykar_core::config::{self, EncryptionModeConfig};
+use vykar_core::config;
 use vykar_types::error::VykarError;
 
 use crate::controllers;
 use crate::messages::{RepoInfoData, SnapshotRowData, UiEvent};
 use crate::repo_helpers::{
-    find_repo_for_snapshot, format_repo_name, select_repos, send_log, with_passphrase_retry,
-    PassphraseRun,
+    find_repo_for_snapshot, select_repos, send_log, with_passphrase_retry, PassphraseRun,
 };
 use crate::APP_TITLE;
-use vykar_common::display::{format_bytes, format_count};
+use vykar_common::display::format_bytes;
 
 use super::shared::{select_repo_or_fail, OpGuard};
 use super::WorkerContext;
 
 /// Placeholder shown for metric cells of a repo that failed to load.
 const METRIC_PLACEHOLDER: &str = "\u{2014}"; // em dash
-
-fn format_last_snapshot(t: Option<DateTime<Utc>>) -> String {
-    let Some(t) = t else {
-        return "N/A".to_string();
-    };
-    let secs = (Utc::now() - t).num_seconds();
-    if secs < 0 {
-        return t.with_timezone(&Local).format("%Y-%m-%d %H:%M").to_string();
-    }
-    if secs < 60 {
-        "just now".to_string()
-    } else if secs < 3600 {
-        format!("{}m ago", secs / 60)
-    } else if secs < 86_400 {
-        format!("{}h ago", secs / 3600)
-    } else {
-        format!("{}d ago", secs / 86_400)
-    }
-}
 
 fn ok_repo_info(repo_name: &str, url: &str, stats: &InfoStats) -> RepoInfoData {
     RepoInfoData {
@@ -81,7 +62,7 @@ fn fetch_one_repo_info(
     passphrases: &mut HashMap<String, zeroize::Zeroizing<String>>,
     repo: &config::ResolvedRepo,
 ) -> (RepoInfoData, Option<String>) {
-    let repo_name = format_repo_name(repo);
+    let repo_name = repo.label_or_url().to_string();
     let url = repo.config.repository.url.clone();
 
     // Stash the passphrase the probe resolved so an uninitialized-repo init can
@@ -153,52 +134,93 @@ fn init_repo_interactive(
         return (error_repo_info(repo_name, url, "Not initialized"), None);
     }
 
-    // Resolve the init passphrase following the canonical rule:
-    //   1. encryption: none → None
-    //   2. Configured source (passphrase / passcommand) → reuse it
-    //   3. Interactive prompt with enter + confirm (init needs confirmation to
-    //      avoid locking the repo behind a typo).
+    // Only a passphrase the probe resolved from a *configured* source
+    // (encryption.passphrase / passcommand) may skip enter-and-confirm; one the
+    // user typed at the probe prompt must not, or a typo there would lock the
+    // new repository behind it.
     let has_configured_source =
         repo.config.encryption.passphrase.is_some() || repo.config.encryption.passcommand.is_some();
-    let init_pass: Option<zeroize::Zeroizing<String>> = if repo.config.encryption.mode
-        == EncryptionModeConfig::None
-    {
-        None
-    } else if has_configured_source {
-        // Reuse the passphrase the probe already resolved from the configured
-        // source (passphrase / passcommand) rather than resolving it again — the
-        // comment above and `fetch_one_repo_info` guarantee it is populated for
-        // an encrypted, configured repo.
+    let pre_resolved = if has_configured_source {
         probe_pass
     } else {
-        let p1 = controllers::password_dialog::show_password_dialog(
-            &format!("{APP_TITLE} - New Passphrase ({repo_name})"),
-            "Enter new passphrase:",
-        );
-        match p1.filter(|v| !v.is_empty()) {
-            None => {
-                send_log(
-                    ui_tx,
-                    format!("[{repo_name}] Init cancelled (no passphrase)."),
-                );
-                return (error_repo_info(repo_name, url, "Not initialized"), None);
-            }
-            Some(p1_val) => {
-                let p2 = controllers::password_dialog::show_password_dialog(
-                    &format!("{APP_TITLE} - Confirm Passphrase ({repo_name})"),
+        None
+    };
+
+    let outcome = passphrase::resolve_init_passphrase(
+        &repo.config,
+        repo.label.as_deref(),
+        pre_resolved,
+        |stage, _ctx| {
+            let (title, message) = match stage {
+                passphrase::InitPromptStage::Enter => (
+                    format!("{APP_TITLE} - New Passphrase ({repo_name})"),
+                    "Enter new passphrase:",
+                ),
+                passphrase::InitPromptStage::Confirm => (
+                    format!("{APP_TITLE} - Confirm Passphrase ({repo_name})"),
                     "Confirm passphrase:",
-                );
-                match p2 {
-                    Some(ref p2_val) if p2_val == &p1_val => Some(zeroize::Zeroizing::new(p1_val)),
-                    _ => {
-                        send_log(ui_tx, format!("[{repo_name}] Passphrases do not match."));
-                        return (
-                            error_repo_info(repo_name, url, "Passphrases did not match"),
-                            Some("passphrases did not match".to_string()),
-                        );
-                    }
-                }
-            }
+                ),
+            };
+            Ok(
+                controllers::password_dialog::show_password_dialog(&title, message)
+                    .map(zeroize::Zeroizing::new),
+            )
+        },
+    );
+
+    let init_pass: Option<zeroize::Zeroizing<String>> = match outcome {
+        Ok(passphrase::InitPassphrase::NotRequired) => None,
+        Ok(passphrase::InitPassphrase::Provided(p)) => Some(p),
+        // Dismissing either dialog, or leaving the first one blank, means "don't
+        // create the repository" — log-only, so the footer stays clean.
+        Ok(passphrase::InitPassphrase::Cancelled) => {
+            send_log(
+                ui_tx,
+                format!("[{repo_name}] Init cancelled (no passphrase)."),
+            );
+            return (error_repo_info(repo_name, url, "Not initialized"), None);
+        }
+        // An empty passphrase from a configured source is a config bug, not a
+        // user gesture: `encryption.passphrase: ""` would otherwise create an
+        // encrypted repo keyed on nothing. Only the blank-dialog case above is
+        // treated as a cancel, and it cannot reach here — a configured source
+        // suppresses the prompt entirely.
+        Err(VykarError::EmptyPassphrase) if has_configured_source => {
+            send_log(
+                ui_tx,
+                format!(
+                    "[{repo_name}] encryption.passphrase / passcommand resolved to an empty \
+                     passphrase; refusing to initialize."
+                ),
+            );
+            return (
+                error_repo_info(repo_name, url, "Empty passphrase configured"),
+                Some("empty passphrase configured".to_string()),
+            );
+        }
+        Err(VykarError::EmptyPassphrase) => {
+            send_log(
+                ui_tx,
+                format!("[{repo_name}] Init cancelled (no passphrase)."),
+            );
+            return (error_repo_info(repo_name, url, "Not initialized"), None);
+        }
+        Err(VykarError::PassphraseMismatch) => {
+            send_log(ui_tx, format!("[{repo_name}] Passphrases do not match."));
+            return (
+                error_repo_info(repo_name, url, "Passphrases did not match"),
+                Some("passphrases did not match".to_string()),
+            );
+        }
+        Err(e) => {
+            send_log(
+                ui_tx,
+                format!("[{repo_name}] passphrase resolution failed: {e}"),
+            );
+            return (
+                error_repo_info(repo_name, url, &format!("{e}")),
+                Some(format!("{e}")),
+            );
         }
     };
 
@@ -268,7 +290,7 @@ pub(super) fn handle_fetch_all_repo_info(ctx: &mut WorkerContext) {
         let url = repo.config.repository.url.clone();
         ctx.repo_info
             .entry(url.clone())
-            .or_insert_with(|| error_repo_info(&format_repo_name(repo), &url, "Not loaded"));
+            .or_insert_with(|| error_repo_info(repo.label_or_url(), &url, "Not loaded"));
     }
 
     let total = ctx.runtime.repos.len();
@@ -281,7 +303,7 @@ pub(super) fn handle_fetch_all_repo_info(ctx: &mut WorkerContext) {
             send_log(&ctx.ui_tx, "Repository info fetch cancelled.");
             break;
         }
-        let repo_name = format_repo_name(repo);
+        let repo_name = repo.label_or_url().to_string();
         let _ = ctx.ui_tx.send(UiEvent::Status(format!(
             "Loading repo info: [{}] ({}/{total})...",
             repo_name,
@@ -358,7 +380,7 @@ pub(super) fn handle_refresh_snapshots(ctx: &mut WorkerContext, repo_selector: S
         if ctx.cancel_requested.load(Ordering::SeqCst) {
             break;
         }
-        let repo_name = format_repo_name(repo);
+        let repo_name = repo.label_or_url().to_string();
         let outcome = with_passphrase_retry(repo, &mut ctx.passphrases, 3, |pass| {
             list::list_snapshots_with_stats(&repo.config, pass)
         });
@@ -390,47 +412,19 @@ pub(super) fn handle_refresh_snapshots(ctx: &mut WorkerContext, repo_selector: S
         let mut snapshots = listing.snapshots;
         snapshots.sort_by_key(|(s, _)| s.time);
         for (s, stats) in snapshots {
-            let ts: DateTime<Local> = s.time.with_timezone(&Local);
-            let label = if s.source_label.is_empty() {
-                "-".to_string()
-            } else {
-                s.source_label.clone()
-            };
-            let hostname = if s.hostname.is_empty() {
-                "-".to_string()
-            } else {
-                s.hostname.clone()
-            };
-            let (files, size, added, nfiles, size_bytes, added_bytes) = match stats {
-                Some(st) => (
-                    format_count(st.nfiles),
-                    format_bytes(st.original_size),
-                    format_bytes(st.deduplicated_size),
-                    Some(st.nfiles),
-                    Some(st.original_size),
-                    Some(st.deduplicated_size),
-                ),
-                None => (
-                    "-".to_string(),
-                    "-".to_string(),
-                    "-".to_string(),
-                    None,
-                    None,
-                    None,
-                ),
-            };
+            let row = SnapshotRowView::new(&s, stats.as_ref());
             data.push(SnapshotRowData {
-                id: s.name.clone().into(),
-                hostname: hostname.into(),
-                time_str: ts.format("%Y-%m-%d %H:%M").to_string().into(),
-                label: label.into(),
-                files: files.into(),
-                size: size.into(),
-                added: added.into(),
-                nfiles,
-                size_bytes,
-                added_bytes,
-                time_epoch: s.time.timestamp(),
+                id: row.id.into(),
+                hostname: row.hostname.into(),
+                time_str: row.time.into(),
+                label: row.label.into(),
+                files: row.files.into(),
+                size: row.size.into(),
+                added: row.added.into(),
+                nfiles: row.nfiles,
+                size_bytes: row.size_bytes,
+                added_bytes: row.added_bytes,
+                time_epoch: row.time_epoch,
                 repo_name: repo_name.clone().into(),
             });
         }
@@ -483,7 +477,7 @@ pub(super) fn handle_fetch_snapshot_contents(
                             "Loaded {} item(s) from snapshot {} in [{}]",
                             items.len(),
                             snapshot_name,
-                            format_repo_name(repo)
+                            repo.label_or_url()
                         ),
                     );
 

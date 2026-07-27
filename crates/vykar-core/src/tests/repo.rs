@@ -411,7 +411,7 @@ fn deferred_hydration_survives_file_cache_save_error() {
 
 #[test]
 fn init_rejects_oversized_max_pack_size() {
-    use crate::config::{RepositoryConfig, RetryConfig};
+    use crate::config::RepositoryConfig;
 
     crate::testutil::init_test_environment();
 
@@ -420,18 +420,9 @@ fn init_rejects_oversized_max_pack_size() {
     // Just over the 512 MiB hard limit — should fail.
     let oversized_config = RepositoryConfig {
         url: String::new(),
-        region: None,
-        access_key_id: None,
-        secret_access_key: None,
-        sftp_key: None,
-        sftp_known_hosts: None,
-        sftp_timeout: None,
-        access_token: None,
-        allow_insecure_http: false,
         min_pack_size: min_pack,
         max_pack_size: 513 * 1024 * 1024,
-        retry: RetryConfig::default(),
-        s3_soft_delete: false,
+        ..Default::default()
     };
 
     let result = Repository::init(
@@ -452,18 +443,9 @@ fn init_rejects_oversized_max_pack_size() {
     // Exactly 512 MiB — should succeed.
     let valid_config = RepositoryConfig {
         url: String::new(),
-        region: None,
-        access_key_id: None,
-        secret_access_key: None,
-        sftp_key: None,
-        sftp_known_hosts: None,
-        sftp_timeout: None,
-        access_token: None,
-        allow_insecure_http: false,
         min_pack_size: min_pack,
         max_pack_size: 512 * 1024 * 1024,
-        retry: RetryConfig::default(),
-        s3_soft_delete: false,
+        ..Default::default()
     };
 
     let result = Repository::init(
@@ -483,7 +465,7 @@ fn init_rejects_oversized_max_pack_size() {
 #[test]
 fn flush_on_abort_writes_pending_index() {
     use crate::compress;
-    use crate::config::{RepositoryConfig, RetryConfig};
+    use crate::config::RepositoryConfig;
     use crate::index::PendingPackEntry;
     use crate::repo::format::{unpack_object_expect_with_context, ObjectType};
 
@@ -492,18 +474,9 @@ fn flush_on_abort_writes_pending_index() {
     // Use tiny pack sizes so a single chunk triggers a flush.
     let small_config = RepositoryConfig {
         url: String::new(),
-        region: None,
-        access_key_id: None,
-        secret_access_key: None,
-        sftp_key: None,
-        sftp_known_hosts: None,
-        sftp_timeout: None,
-        access_token: None,
-        allow_insecure_http: false,
         min_pack_size: 256,
         max_pack_size: 256,
-        retry: RetryConfig::default(),
-        s3_soft_delete: false,
+        ..Default::default()
     };
     let mut repo = Repository::init(
         Box::new(MemoryBackend::new()),
@@ -626,24 +599,15 @@ impl vykar_storage::StorageBackend for FailPackUploadsBackend {
 
 #[test]
 fn flush_on_abort_survives_pack_upload_failure() {
-    use crate::config::{RepositoryConfig, RetryConfig};
+    use crate::config::RepositoryConfig;
 
     crate::testutil::init_test_environment();
 
     let small_config = RepositoryConfig {
         url: String::new(),
-        region: None,
-        access_key_id: None,
-        secret_access_key: None,
-        sftp_key: None,
-        sftp_known_hosts: None,
-        sftp_timeout: None,
-        access_token: None,
-        allow_insecure_http: false,
         min_pack_size: 256,
         max_pack_size: 256,
-        retry: RetryConfig::default(),
-        s3_soft_delete: false,
+        ..Default::default()
     };
     let mut repo = Repository::init(
         Box::new(FailPackUploadsBackend::new()),
@@ -716,24 +680,15 @@ fn open_rejects_oversized_max_pack_size() {
 
 /// Helper: create a plaintext repo with tiny pack sizes for testing pack flushes.
 fn repo_with_small_packs(min_pack: u32, max_pack: u32) -> Repository {
-    use crate::config::{RepositoryConfig, RetryConfig};
+    use crate::config::RepositoryConfig;
 
     crate::testutil::init_test_environment();
 
     let small_config = RepositoryConfig {
         url: String::new(),
-        region: None,
-        access_key_id: None,
-        secret_access_key: None,
-        sftp_key: None,
-        sftp_known_hosts: None,
-        sftp_timeout: None,
-        access_token: None,
-        allow_insecure_http: false,
         min_pack_size: min_pack,
         max_pack_size: max_pack,
-        retry: RetryConfig::default(),
-        s3_soft_delete: false,
+        ..Default::default()
     };
     let mut repo = Repository::init(
         Box::new(MemoryBackend::new()),
@@ -884,25 +839,16 @@ fn save_state_rebases_pack_counters() {
 
 #[test]
 fn cross_session_pending_index_recovery() {
-    use crate::config::{RepositoryConfig, RetryConfig};
+    use crate::config::RepositoryConfig;
 
     crate::testutil::init_test_environment();
 
     // Use tiny pack sizes so chunks trigger pack flushes.
     let small_config = RepositoryConfig {
         url: String::new(),
-        region: None,
-        access_key_id: None,
-        secret_access_key: None,
-        sftp_key: None,
-        sftp_known_hosts: None,
-        sftp_timeout: None,
-        access_token: None,
-        allow_insecure_http: false,
         min_pack_size: 256,
         max_pack_size: 256,
-        retry: RetryConfig::default(),
-        s3_soft_delete: false,
+        ..Default::default()
     };
 
     // Session 1: init repo, store chunks, flush, write pending index, then drop.

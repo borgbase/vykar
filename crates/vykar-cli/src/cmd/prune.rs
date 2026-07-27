@@ -52,13 +52,7 @@ pub(crate) fn run_prune(
             stats.kept, stats.pruned,
         );
     } else {
-        println!(
-            "Pruned {} snapshots (kept {}), freed {} chunks ({})",
-            stats.pruned,
-            stats.kept,
-            stats.chunks_deleted,
-            format_bytes(stats.space_freed),
-        );
+        print_prune_summary(&stats);
     }
 
     for w in &stats.warnings {
@@ -77,4 +71,15 @@ pub(crate) fn run_prune(
     }
 
     Ok(())
+}
+
+/// The one-line prune result, shared with the full-cycle summary in `dispatch`.
+pub(crate) fn print_prune_summary(stats: &commands::prune::PruneStats) {
+    println!(
+        "Pruned {} snapshots (kept {}), freed {} chunks ({})",
+        stats.pruned,
+        stats.kept,
+        stats.chunks_deleted,
+        format_bytes(stats.space_freed),
+    );
 }

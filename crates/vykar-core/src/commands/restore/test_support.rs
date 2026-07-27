@@ -33,16 +33,8 @@ pub(super) fn index_lookup(
 
 pub(super) fn make_file_item(path: &str, chunks: Vec<(u8, u32)>) -> Item {
     Item {
-        path: path.to_string(),
-        entry_type: ItemType::RegularFile,
-        mode: 0o644,
         uid: 1000,
         gid: 1000,
-        user: None,
-        group: None,
-        mtime: 0,
-        atime: None,
-        ctime: None,
         size: chunks.iter().map(|(_, s)| *s as u64).sum(),
         chunks: chunks
             .into_iter()
@@ -52,52 +44,28 @@ pub(super) fn make_file_item(path: &str, chunks: Vec<(u8, u32)>) -> Item {
                 csize: size, // not used by plan_reads
             })
             .collect(),
-        link_target: None,
-        xattrs: None,
-        raw_names: None,
-        hardlink: None,
+        ..Item::test_file(path)
     }
 }
 
 pub(super) fn make_dir_item(path: &str, mode: u32) -> Item {
     Item {
-        path: path.to_string(),
         entry_type: ItemType::Directory,
         mode,
         uid: 1000,
         gid: 1000,
-        user: None,
-        group: None,
-        mtime: 0,
-        atime: None,
-        ctime: None,
-        size: 0,
-        chunks: Vec::new(),
-        link_target: None,
-        xattrs: None,
-        raw_names: None,
-        hardlink: None,
+        ..Item::test_file(path)
     }
 }
 
 pub(super) fn make_symlink_item(path: &str, target: &str) -> Item {
     Item {
-        path: path.to_string(),
         entry_type: ItemType::Symlink,
         mode: 0o777,
         uid: 1000,
         gid: 1000,
-        user: None,
-        group: None,
-        mtime: 0,
-        atime: None,
-        ctime: None,
-        size: 0,
-        chunks: Vec::new(),
         link_target: Some(target.to_string()),
-        xattrs: None,
-        raw_names: None,
-        hardlink: None,
+        ..Item::test_file(path)
     }
 }
 

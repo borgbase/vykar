@@ -5,6 +5,9 @@ use zeroize::Zeroizing;
 
 use crate::error::{CliError, CliResult};
 use crate::prompt::prompt_hidden;
+use vykar_core::app::passphrase::{
+    resolve_init_passphrase, resolve_passphrase, InitPassphrase, InitPromptStage,
+};
 use vykar_core::config::{EncryptionModeConfig, VykarConfig};
 
 /// Process-level passphrase cache keyed by repository URL.
@@ -26,10 +29,6 @@ pub(crate) fn get_passphrase(
     config: &VykarConfig,
     label: Option<&str>,
 ) -> CliResult<Option<Zeroizing<String>>> {
-    if config.encryption.mode == EncryptionModeConfig::None {
-        return Ok(None);
-    }
-
     let cache_key = config.repository.url.clone();
 
     // Check cache first (avoids double interactive prompt during probe+dispatch)
@@ -41,52 +40,49 @@ pub(crate) fn get_passphrase(
         return Ok(cached.clone());
     }
 
-    if let Some(pass) = configured_passphrase(config)? {
-        PASSPHRASE_CACHE
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(cache_key, Some(pass.clone()));
-        return Ok(Some(pass));
-    }
+    let pass = resolve_passphrase(config, label, |ctx| {
+        let prompt = match ctx.repository_label {
+            Some(ref l) => format!("Enter passphrase for '{l}': "),
+            None => "Enter passphrase: ".to_string(),
+        };
+        Ok(Some(Zeroizing::new(prompt_hidden(&prompt)?)))
+    })?;
 
-    // Interactive prompt
-    let prompt = match label {
-        Some(l) => format!("Enter passphrase for '{l}': "),
-        None => "Enter passphrase: ".to_string(),
-    };
-    let pass = Zeroizing::new(prompt_hidden(&prompt)?);
     PASSPHRASE_CACHE
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .insert(cache_key, Some(pass.clone()));
-    Ok(Some(pass))
-}
-
-fn configured_passphrase(config: &VykarConfig) -> CliResult<Option<Zeroizing<String>>> {
-    Ok(vykar_core::app::passphrase::configured_passphrase(config)?)
+        .insert(cache_key, pass.clone());
+    Ok(pass)
 }
 
 pub(crate) fn get_init_passphrase(
     config: &VykarConfig,
     label: Option<&str>,
 ) -> CliResult<Option<Zeroizing<String>>> {
-    if config.encryption.mode == EncryptionModeConfig::None {
-        return Ok(None);
-    }
-    if let Some(pass) = configured_passphrase(config)? {
-        if config.encryption.passphrase.is_some() {
-            tracing::warn!(
-                "using plaintext encryption.passphrase from config; prefer encryption.passcommand or VYKAR_PASSPHRASE"
-            );
-        }
-        return Ok(Some(pass));
+    // `encryption.passphrase` is first in the resolution order, so its presence
+    // on an encrypted repo means it is the value being used.
+    if config.encryption.mode != EncryptionModeConfig::None
+        && config.encryption.passphrase.is_some()
+    {
+        tracing::warn!(
+            "using plaintext encryption.passphrase from config; prefer encryption.passcommand or VYKAR_PASSPHRASE"
+        );
     }
 
     let suffix = label.map(|l| format!(" for '{l}'")).unwrap_or_default();
-    let p1 = Zeroizing::new(prompt_hidden(&format!("Enter new passphrase{suffix}: "))?);
-    let p2 = Zeroizing::new(prompt_hidden(&format!("Confirm passphrase{suffix}: "))?);
-    if *p1 != *p2 {
-        return Err(CliError::from("passphrases do not match"));
+    let outcome = resolve_init_passphrase(config, label, None, |stage, _ctx| {
+        let text = match stage {
+            InitPromptStage::Enter => format!("Enter new passphrase{suffix}: "),
+            InitPromptStage::Confirm => format!("Confirm passphrase{suffix}: "),
+        };
+        Ok(Some(Zeroizing::new(prompt_hidden(&text)?)))
+    })?;
+
+    match outcome {
+        InitPassphrase::NotRequired => Ok(None),
+        InitPassphrase::Provided(p) => Ok(Some(p)),
+        // Unreachable from a terminal: `prompt_hidden` never reports a
+        // cancellation (Ctrl-C terminates the process, EOF is an I/O error).
+        InitPassphrase::Cancelled => Err(CliError::from("passphrase entry cancelled")),
     }
-    Ok(Some(p1))
 }

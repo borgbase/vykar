@@ -15,9 +15,8 @@ use std::sync::Once;
 use vykar_core::commands;
 use vykar_core::compress::Compression;
 use vykar_core::config::{
-    CheckConfig, ChunkerConfig, CompactConfig, CompressionConfig, EncryptionConfig,
-    EncryptionModeConfig, RepositoryConfig, ResourceLimitsConfig, RetentionConfig, RetryConfig,
-    ScheduleConfig, SourceEntry, SourceHooksConfig, VykarConfig, XattrsConfig,
+    EncryptionConfig, EncryptionModeConfig, RepositoryConfig, SourceEntry, SourceHooksConfig,
+    VykarConfig,
 };
 use vykar_core::repo::{OpenOptions, Repository};
 use vykar_core::snapshot::SnapshotStats;
@@ -50,39 +49,17 @@ pub fn make_test_config(repo_dir: &Path) -> VykarConfig {
     VykarConfig {
         repository: RepositoryConfig {
             url: repo_dir.to_string_lossy().to_string(),
-            region: None,
-            access_key_id: None,
-            secret_access_key: None,
-            sftp_key: None,
-            sftp_known_hosts: None,
-            sftp_timeout: None,
-            access_token: None,
-            allow_insecure_http: false,
             min_pack_size: 32 * 1024 * 1024,
             max_pack_size: 512 * 1024 * 1024,
-            retry: RetryConfig::default(),
-            s3_soft_delete: false,
+            ..Default::default()
         },
         encryption: EncryptionConfig {
             mode: EncryptionModeConfig::None,
             passphrase: None,
             passcommand: None,
         },
-        exclude_patterns: Vec::new(),
-        exclude_if_present: Vec::new(),
         one_file_system: true,
-        git_ignore: false,
-        chunker: ChunkerConfig::default(),
-        compression: CompressionConfig::default(),
-        retention: RetentionConfig::default(),
-        xattrs: XattrsConfig::default(),
-        schedule: ScheduleConfig::default(),
-        limits: ResourceLimitsConfig::default(),
-        compact: CompactConfig::default(),
-        check: CheckConfig::default(),
-        cache_dir: None,
-        trust_repo: false,
-        hostname_override: None,
+        ..Default::default()
     }
 }
 

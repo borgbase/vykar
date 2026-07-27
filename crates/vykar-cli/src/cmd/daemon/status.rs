@@ -7,13 +7,15 @@
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
-use chrono::{DateTime, Local, Utc};
+use chrono::{DateTime, Local};
 use serde::Serialize;
 
-use vykar_common::display::{format_bytes, format_count};
+use vykar_common::display::format_bytes;
 use vykar_core::app::passphrase::configured_passphrase;
+use vykar_core::app::scheduler::repos_schedule_brief;
+use vykar_core::app::views::{self, format_last_snapshot};
 use vykar_core::commands::list;
-use vykar_core::config::{ResolvedRepo, ScheduleConfig};
+use vykar_core::config::ResolvedRepo;
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct RepoInfo {
@@ -89,25 +91,6 @@ pub(crate) fn new_shared() -> SharedStatus {
     Arc::new(RwLock::new(DaemonStatus::default()))
 }
 
-fn format_last_snapshot(t: Option<DateTime<Utc>>) -> String {
-    let Some(t) = t else {
-        return "N/A".to_string();
-    };
-    let secs = (Utc::now() - t).num_seconds();
-    if secs < 0 {
-        return t.with_timezone(&Local).format("%Y-%m-%d %H:%M").to_string();
-    }
-    if secs < 60 {
-        "just now".to_string()
-    } else if secs < 3600 {
-        format!("{}m ago", secs / 60)
-    } else if secs < 86_400 {
-        format!("{}h ago", secs / 3600)
-    } else {
-        format!("{}d ago", secs / 86_400)
-    }
-}
-
 fn format_duration(d: Duration) -> String {
     let s = d.as_secs();
     if s < 60 {
@@ -119,41 +102,6 @@ fn format_duration(d: Duration) -> String {
     } else {
         format!("{}d {}h", s / 86_400, (s % 86_400) / 3600)
     }
-}
-
-fn schedule_brief(schedule: &ScheduleConfig) -> String {
-    if !schedule.enabled {
-        return "Off".to_string();
-    }
-    if let Some(ref cron) = schedule.cron {
-        return cron.clone();
-    }
-    schedule.every.clone().unwrap_or_else(|| "24h".to_string())
-}
-
-/// Identity used to decide whether all repos share one cadence. Compares the
-/// parsed interval rather than the raw string, so `60m` and `1h` are the same
-/// schedule rather than a spurious "per-repo".
-fn schedule_key(schedule: &ScheduleConfig) -> (bool, Option<String>, Option<u64>) {
-    (
-        schedule.enabled,
-        schedule.cron.clone(),
-        schedule.every_duration().ok().map(|d| d.as_secs()),
-    )
-}
-
-/// Top-level schedule summary: the shared cadence when every repo agrees,
-/// otherwise `"per-repo"` (the per-repo column carries the detail).
-fn repos_schedule_brief(repos: &[ResolvedRepo]) -> String {
-    let mut schedules = repos.iter().map(|r| &r.config.schedule);
-    let Some(first) = schedules.next() else {
-        return "Off".to_string();
-    };
-    let first_key = schedule_key(first);
-    if schedules.any(|s| schedule_key(s) != first_key) {
-        return "per-repo".to_string();
-    }
-    schedule_brief(first)
 }
 
 fn format_next_run(next_run: Option<SystemTime>) -> String {
@@ -185,7 +133,8 @@ pub(crate) fn init(status: &SharedStatus, repos: &[ResolvedRepo], started_at: In
         uptime: format_duration(started_at.elapsed()),
         next_run: None,
     };
-    s.schedule_brief = repos_schedule_brief(repos);
+    let schedules: Vec<&_> = repos.iter().map(|r| &r.config.schedule).collect();
+    s.schedule_brief = repos_schedule_brief(&schedules, false);
     s.sources = collect_sources(repos);
 }
 
@@ -218,86 +167,21 @@ pub(crate) fn set_repo_next_runs(
 }
 
 fn collect_sources(repos: &[ResolvedRepo]) -> Vec<SourceInfo> {
-    let mut seen = std::collections::HashSet::new();
-    let mut items = Vec::new();
-    for repo in repos {
-        for source in &repo.sources {
-            if !seen.insert(source.label.clone()) {
-                continue;
-            }
-            let target = if source.repos.is_empty() {
-                "(all)".to_string()
-            } else {
-                source.repos.join(", ")
-            };
-
-            let mut options = Vec::new();
-            if source.one_file_system {
-                options.push("one_file_system");
-            }
-            if source.git_ignore {
-                options.push("git_ignore");
-            }
-            if source.xattrs_enabled {
-                options.push("xattrs");
-            }
-
-            let mut hooks_lines = Vec::new();
-            for (phase, cmds) in [
-                ("before", &source.hooks.before),
-                ("after", &source.hooks.after),
-                ("failed", &source.hooks.failed),
-                ("finally", &source.hooks.finally),
-            ] {
-                if !cmds.is_empty() {
-                    hooks_lines.push(format!("{}: {}", phase, cmds.join("; ")));
-                }
-            }
-
-            let mut retention_parts = Vec::new();
-            if let Some(ref ret) = source.retention {
-                if let Some(ref v) = ret.keep_within {
-                    retention_parts.push(format!("keep_within: {v}"));
-                }
-                if let Some(v) = ret.keep_last {
-                    retention_parts.push(format!("keep_last: {v}"));
-                }
-                if let Some(v) = ret.keep_hourly {
-                    retention_parts.push(format!("keep_hourly: {v}"));
-                }
-                if let Some(v) = ret.keep_daily {
-                    retention_parts.push(format!("keep_daily: {v}"));
-                }
-                if let Some(v) = ret.keep_weekly {
-                    retention_parts.push(format!("keep_weekly: {v}"));
-                }
-                if let Some(v) = ret.keep_monthly {
-                    retention_parts.push(format!("keep_monthly: {v}"));
-                }
-                if let Some(v) = ret.keep_yearly {
-                    retention_parts.push(format!("keep_yearly: {v}"));
-                }
-            }
-
-            items.push(SourceInfo {
-                label: source.label.clone(),
-                paths_summary: source.paths.join(", "),
-                target_repos: target,
-                folders: source.paths.clone(),
-                exclusions: source.exclude.clone(),
-                exclude_if_present: source.exclude_if_present.clone(),
-                options: options.join(", "),
-                hooks: hooks_lines,
-                retention: retention_parts.join(", "),
-                command_dumps: source
-                    .command_dumps
-                    .iter()
-                    .map(|d| format!("{}: {}", d.name, d.command))
-                    .collect(),
-            });
-        }
-    }
-    items
+    views::collect_source_summaries(repos)
+        .into_iter()
+        .map(|s| SourceInfo {
+            paths_summary: s.paths.join(", "),
+            label: s.label,
+            target_repos: s.target_repos,
+            folders: s.paths,
+            exclusions: s.excludes,
+            exclude_if_present: s.exclude_if_present,
+            options: s.options.join(", "),
+            hooks: s.hooks,
+            retention: s.retention.join(", "),
+            command_dumps: s.command_dumps,
+        })
+        .collect()
 }
 
 /// Carry each repo's next-run string across a row rebuild, matched by name.
@@ -320,11 +204,7 @@ pub(crate) fn refresh_repos(status: &SharedStatus, repos: &[ResolvedRepo]) {
     let mut all_snapshots: Vec<SnapshotRow> = Vec::new();
 
     for repo in repos {
-        let name = repo
-            .label
-            .as_deref()
-            .unwrap_or(&repo.config.repository.url)
-            .to_string();
+        let name = repo.label_or_url().to_string();
         let url = repo.config.repository.url.clone();
 
         let pass = match configured_passphrase(&repo.config) {
@@ -365,28 +245,14 @@ pub(crate) fn refresh_repos(status: &SharedStatus, repos: &[ResolvedRepo]) {
                 let mut snapshots = listing.snapshots;
                 snapshots.sort_by_key(|(s, _)| s.time);
                 for (s, stats) in snapshots {
-                    let ts: DateTime<Local> = s.time.with_timezone(&Local);
-                    let label = if s.source_label.is_empty() {
-                        "-".to_string()
-                    } else {
-                        s.source_label.clone()
-                    };
-                    let hostname = if s.hostname.is_empty() {
-                        "-".to_string()
-                    } else {
-                        s.hostname.clone()
-                    };
-                    let (files, size) = match stats {
-                        Some(st) => (format_count(st.nfiles), format_bytes(st.deduplicated_size)),
-                        None => ("-".to_string(), "-".to_string()),
-                    };
+                    let row = views::SnapshotRowView::new(&s, stats.as_ref());
                     all_snapshots.push(SnapshotRow {
-                        id: s.name.clone(),
-                        time: ts.format("%Y-%m-%d %H:%M").to_string(),
-                        hostname,
-                        label,
-                        files,
-                        size,
+                        id: row.id,
+                        time: row.time,
+                        hostname: row.hostname,
+                        label: row.label,
+                        files: row.files,
+                        size: row.size,
                         repo_name: name.clone(),
                     });
                 }
@@ -478,34 +344,6 @@ mod tests {
         carry_over_next_runs(&mut rebuilt, &previous);
 
         assert_eq!(rebuilt[0].next_run, "—");
-    }
-
-    fn sched(enabled: bool, every: Option<&str>, cron: Option<&str>) -> ScheduleConfig {
-        ScheduleConfig {
-            enabled,
-            every: every.map(str::to_string),
-            cron: cron.map(str::to_string),
-            on_startup: false,
-            jitter_seconds: 0,
-            passphrase_prompt_timeout_seconds: 300,
-        }
-    }
-
-    #[test]
-    fn schedule_key_compares_parsed_intervals() {
-        // `60m` and `1h` are the same cadence, not a mixed config.
-        assert_eq!(
-            schedule_key(&sched(true, Some("60m"), None)),
-            schedule_key(&sched(true, Some("1h"), None))
-        );
-        assert_ne!(
-            schedule_key(&sched(true, Some("1h"), None)),
-            schedule_key(&sched(true, Some("1d"), None))
-        );
-        assert_ne!(
-            schedule_key(&sched(true, Some("1h"), None)),
-            schedule_key(&sched(false, Some("1h"), None))
-        );
     }
 
     #[test]

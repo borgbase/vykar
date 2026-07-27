@@ -134,3 +134,104 @@ where
         repository_url: config.repository.url.clone(),
     })
 }
+
+/// Which of the two `init` prompts the callback is being asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InitPromptStage {
+    /// "Enter new passphrase".
+    Enter,
+    /// "Confirm passphrase" — must match the [`InitPromptStage::Enter`] value.
+    Confirm,
+}
+
+/// Outcome of resolving the passphrase for a repository that is about to be
+/// initialized.
+///
+/// Cancellation is a distinct variant rather than an error: dismissing the
+/// prompt means "don't create the repository", which no front end should
+/// report as a failure.
+#[derive(Debug)]
+pub enum InitPassphrase {
+    /// `encryption.mode: none` — the repository takes no passphrase.
+    NotRequired,
+    Provided(Zeroizing<String>),
+    /// The user dismissed either prompt.
+    Cancelled,
+}
+
+/// Resolve the passphrase to initialize a repository with.
+///
+/// Resolution order:
+/// 1. `pre_resolved_configured` — a value the caller already obtained from a
+///    **configured** source while probing the repository. Provenance matters:
+///    only `encryption.passphrase` / `encryption.passcommand` qualify, never a
+///    passphrase the user typed at the probe prompt. A probe typo reused here
+///    would lock the new repository behind it, which is exactly what the
+///    enter-and-confirm pair below exists to prevent.
+/// 2. A configured source resolved now, including `VYKAR_PASSPHRASE`. Values
+///    from these sources skip confirmation — there is nothing to mistype.
+/// 3. Interactive enter-and-confirm.
+///
+/// The passphrase must be non-empty **whatever source it came from**, and the
+/// two interactive entries must match; both are reported as typed errors
+/// ([`VykarError::EmptyPassphrase`], [`VykarError::PassphraseMismatch`]) rather
+/// than a generic string. Dismissing *either* prompt yields
+/// [`InitPassphrase::Cancelled`].
+///
+/// The emptiness check covers the configured sources too, not just the prompt:
+/// `encryption.passphrase: ""` deserializes to `Some("")` (the strict-string
+/// deserializer rejects nulls, not empty strings), so without it a config typo
+/// would silently create an encrypted repository whose key is derived from an
+/// empty passphrase.
+pub fn resolve_init_passphrase<F>(
+    config: &VykarConfig,
+    label: Option<&str>,
+    pre_resolved_configured: Option<Zeroizing<String>>,
+    mut prompt: F,
+) -> Result<InitPassphrase>
+where
+    F: FnMut(InitPromptStage, &PassphrasePrompt) -> Result<Option<Zeroizing<String>>>,
+{
+    if config.encryption.mode == EncryptionModeConfig::None {
+        return Ok(InitPassphrase::NotRequired);
+    }
+
+    let provided = |pass: Zeroizing<String>| {
+        if pass.is_empty() {
+            Err(VykarError::EmptyPassphrase)
+        } else {
+            Ok(InitPassphrase::Provided(pass))
+        }
+    };
+
+    if let Some(pass) = pre_resolved_configured {
+        return provided(pass);
+    }
+
+    if let Some(pass) = configured_passphrase(config)? {
+        return provided(pass);
+    }
+
+    let ctx = PassphrasePrompt {
+        repository_label: label.map(|s| s.to_string()),
+        repository_url: config.repository.url.clone(),
+    };
+
+    let Some(first) = prompt(InitPromptStage::Enter, &ctx)? else {
+        return Ok(InitPassphrase::Cancelled);
+    };
+    // Checked before the confirm prompt so a blank first entry does not make
+    // the user type it out twice to learn it was rejected.
+    if first.is_empty() {
+        return Err(VykarError::EmptyPassphrase);
+    }
+
+    let Some(second) = prompt(InitPromptStage::Confirm, &ctx)? else {
+        return Ok(InitPassphrase::Cancelled);
+    };
+    if *first != *second {
+        return Err(VykarError::PassphraseMismatch);
+    }
+
+    provided(first)
+}

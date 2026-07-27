@@ -1,11 +1,10 @@
-use chrono::Local;
 use comfy_table::{Cell, CellAlignment};
 
+use vykar_core::app::views::SnapshotRowView;
 use vykar_core::commands;
 use vykar_core::config::VykarConfig;
 
 use crate::error::CliResult;
-use crate::format::{format_bytes, format_count};
 use crate::passphrase::with_repo_passphrase;
 use crate::table::CliTableTheme;
 
@@ -65,66 +64,33 @@ pub(crate) fn run_list(
     let mut prev_group: Option<(String, String)> = None;
 
     for (entry, stats) in &snapshots {
-        let effective_label = if !entry.label.is_empty() {
-            entry.label.clone()
-        } else if !entry.source_label.is_empty() {
-            entry.source_label.clone()
-        } else {
-            String::new()
-        };
+        let row = SnapshotRowView::new(entry, stats.as_ref());
 
-        let current_group = (entry.hostname.clone(), effective_label.clone());
-
+        // Repeated host/label pairs are blanked so a run of snapshots from one
+        // source reads as a group.
+        let current_group = (row.hostname.clone(), row.label.clone());
         let (host_col, label_col) = if prev_group.as_ref() == Some(&current_group) {
             (String::new(), String::new())
         } else {
-            let host = if entry.hostname.is_empty() {
-                "-".to_string()
-            } else {
-                entry.hostname.clone()
-            };
-            let label = if effective_label.is_empty() {
-                "-".to_string()
-            } else {
-                effective_label.clone()
-            };
-            (host, label)
+            current_group.clone()
         };
-
         prev_group = Some(current_group);
 
-        let source_col = if !entry.source_paths.is_empty() {
-            entry.source_paths.join("\n")
-        } else if !entry.source_label.is_empty() {
-            entry.source_label.clone()
-        } else {
+        let source_col = if row.source_paths.is_empty() {
             "-".to_string()
-        };
-
-        let date_col = entry
-            .time
-            .with_timezone(&Local)
-            .format("%Y-%m-%d %H:%M")
-            .to_string();
-
-        let (files_col, size_col, added_col) = match stats {
-            Some(st) => (
-                format_count(st.nfiles),
-                format_bytes(st.original_size),
-                format_bytes(st.deduplicated_size),
-            ),
-            None => ("-".to_string(), "-".to_string(), "-".to_string()),
+        } else {
+            row.source_paths.join("\n")
         };
 
         table.add_row(vec![
-            Cell::new(&entry.name),
-            Cell::new(date_col),
+            Cell::new(row.id),
+            Cell::new(row.time),
             Cell::new(host_col),
             Cell::new(label_col),
             Cell::new(source_col),
-            Cell::new(files_col),
-            Cell::new(size_col),
-            Cell::new(added_col),
+            Cell::new(row.files),
+            Cell::new(row.size),
+            Cell::new(row.added),
         ]);
     }
     println!("{table}");

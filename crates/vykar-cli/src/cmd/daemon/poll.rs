@@ -24,13 +24,6 @@ pub(crate) struct StatusPoller {
     last_seen: HashMap<String, HashSet<String>>,
 }
 
-fn repo_name(repo: &ResolvedRepo) -> String {
-    repo.label
-        .as_deref()
-        .unwrap_or(&repo.config.repository.url)
-        .to_string()
-}
-
 /// List the `<id>` portion of every `snapshots/<id>` key for a repo, using a
 /// bare storage backend (no passphrase/KDF — same pattern as `break_lock`).
 fn list_snapshot_ids(repo: &ResolvedRepo) -> Result<HashSet<String>> {
@@ -67,7 +60,7 @@ impl StatusPoller {
     pub(crate) fn reset(&mut self, repos: &[ResolvedRepo]) {
         self.last_seen.clear();
         for repo in repos {
-            let name = repo_name(repo);
+            let name = repo.label_or_url().to_string();
             match list_snapshot_ids(repo) {
                 Ok(ids) => {
                     self.last_seen.insert(name, ids);
@@ -92,7 +85,7 @@ impl StatusPoller {
     ) -> bool {
         let mut changed = false;
         for repo in repos {
-            let name = repo_name(repo);
+            let name = repo.label_or_url().to_string();
             match list_snapshot_ids(repo) {
                 Ok(ids) => {
                     if self.record(name, ids) {

@@ -303,7 +303,7 @@ fn verify_pack_from_reader<R: std::io::Read>(
     }
 
     // 4. Finalize hash.
-    let actual_hash = finalize_blake2b_256_hex(hasher);
+    let actual_hash = super::finalize_blake2b_256_hex(hasher);
     let hash_valid = actual_hash == expected_hash;
 
     let error = if let Some(e) = drain_err {
@@ -327,14 +327,6 @@ fn verify_pack_from_reader<R: std::io::Read>(
         blobs_valid,
         error,
     }
-}
-
-fn finalize_blake2b_256_hex(hasher: Blake2bVar) -> String {
-    let mut out = [0u8; 32];
-    hasher
-        .finalize_variable(&mut out)
-        .expect("valid output buffer length");
-    hex::encode(out)
 }
 
 #[cfg(test)]

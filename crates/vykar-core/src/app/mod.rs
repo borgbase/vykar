@@ -7,6 +7,7 @@ pub(crate) mod check_state;
 pub mod operations;
 pub mod passphrase;
 pub mod scheduler;
+pub mod views;
 
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {

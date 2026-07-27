@@ -48,6 +48,33 @@ pub struct VykarConfig {
     pub hostname_override: Option<String>,
 }
 
+impl Default for VykarConfig {
+    /// The config an empty YAML document would deserialize to (bar the
+    /// mandatory `repository.url`). Not derived, for the same reason
+    /// [`RepositoryConfig`]'s impl is not.
+    fn default() -> Self {
+        Self {
+            repository: RepositoryConfig::default(),
+            encryption: EncryptionConfig::default(),
+            exclude_patterns: Vec::new(),
+            exclude_if_present: Vec::new(),
+            one_file_system: default_one_file_system(),
+            git_ignore: false,
+            chunker: ChunkerConfig::default(),
+            compression: CompressionConfig::default(),
+            retention: RetentionConfig::default(),
+            xattrs: XattrsConfig::default(),
+            schedule: ScheduleConfig::default(),
+            limits: ResourceLimitsConfig::default(),
+            compact: CompactConfig::default(),
+            check: CheckConfig::default(),
+            cache_dir: None,
+            trust_repo: false,
+            hostname_override: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RetentionConfig {
@@ -197,6 +224,32 @@ pub struct RepositoryConfig {
     /// preserves previous versions for the configured retention period.
     #[serde(default)]
     pub s3_soft_delete: bool,
+}
+
+impl Default for RepositoryConfig {
+    /// Mirrors the `#[serde(default = …)]` attributes above, so a hand-built
+    /// config and one deserialized from YAML that omits those keys agree.
+    ///
+    /// Written out rather than derived: `#[derive(Default)]` would zero the
+    /// pack sizes, and a zero `min_pack_size`/`max_pack_size` is rejected by
+    /// repository validation.
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            region: None,
+            access_key_id: None,
+            secret_access_key: None,
+            sftp_key: None,
+            sftp_known_hosts: None,
+            sftp_timeout: None,
+            access_token: None,
+            allow_insecure_http: default_allow_insecure_http(),
+            min_pack_size: default_min_pack_size(),
+            max_pack_size: default_max_pack_size(),
+            retry: RetryConfig::default(),
+            s3_soft_delete: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

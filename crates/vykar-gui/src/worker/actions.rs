@@ -3,13 +3,12 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, Local, Utc};
 use vykar_core::commands;
 use vykar_core::commands::find::{FileStatus, FindFilter, FindScope};
-use vykar_core::config;
 
 use crate::messages::{AppCommand, DiffResultRow, FindResultRow, FindSnapshotGroup, UiEvent};
-use crate::repo_helpers::{find_repo_for_snapshot, send_log, with_passphrase_retry, PassphraseRun};
+use crate::repo_helpers::{find_repo_for_snapshot, send_log, PassphraseRun};
 use vykar_common::display::format_bytes;
 
-use super::shared::{select_repo_or_fail, OpGuard};
+use super::shared::{with_repo_op, OpGuard};
 use super::WorkerContext;
 
 pub(super) fn handle_restore_selected(
@@ -143,100 +142,73 @@ pub(super) fn handle_delete_snapshots(
     } else {
         "Deleting snapshots..."
     };
-    let mut guard = OpGuard::ui(
-        &ctx.ui_tx,
-        &ctx.cancel_requested,
-        &ctx.operation_running,
-        status,
-    );
-
-    let repo = match select_repo_or_fail(&mut guard, &ctx.runtime.repos, &repo_name) {
-        Some(r) => r,
-        None => return,
-    };
 
     // Single batch call: validates all names up front and runs under one
     // maintenance lock (see `commands::delete::run`). Avoids per-row partial
-    // failures and per-row maintenance-lock contention.
+    // failures and per-row maintenance-lock contention. A pre-mutation
+    // validation failure (e.g. SnapshotNotFound) leaves the repo untouched, so
+    // one error covers the whole batch.
     let names: Vec<&str> = snapshot_names.iter().map(String::as_str).collect();
-    let outcome = with_passphrase_retry(repo, &mut ctx.passphrases, 3, |pass| {
-        commands::delete::run(
-            &repo.config,
-            pass,
-            &names,
-            false,
-            Some(&ctx.cancel_requested),
-        )
-    });
+    let result = match with_repo_op(ctx, &repo_name, status, "delete", |repo, pass, cancel| {
+        commands::delete::run(&repo.config, pass, &names, false, Some(cancel))
+    }) {
+        Ok(r) => r,
+        Err(_) => return,
+    };
 
-    match outcome {
-        Ok(PassphraseRun::Ran(result)) => {
-            let mut total_chunks = 0u64;
-            let mut total_freed = 0u64;
-            for stats in &result.stats {
-                total_chunks += stats.chunks_deleted;
-                total_freed += stats.space_freed;
-            }
-            if let [s] = result.stats.as_slice() {
-                send_log(
-                    &ctx.ui_tx,
-                    format!(
-                        "[{repo_name}] Deleted snapshot '{}': {} chunks freed, {} reclaimed",
-                        s.snapshot_name,
-                        s.chunks_deleted,
-                        format_bytes(s.space_freed),
-                    ),
-                );
-            } else {
-                send_log(
-                    &ctx.ui_tx,
-                    format!(
-                        "[{repo_name}] Deleted {} snapshots: {} chunks freed, {} reclaimed",
-                        result.stats.len(),
-                        total_chunks,
-                        format_bytes(total_freed),
-                    ),
-                );
-            }
-            // Surface any snapshot whose Phase 3 cleanup failed: it is missing
-            // from `stats` but did delete from storage, so users still see it
-            // disappear from the table.
-            let reported: std::collections::HashSet<&str> = result
-                .stats
-                .iter()
-                .map(|s| s.snapshot_name.as_str())
-                .collect();
-            for name in &snapshot_names {
-                if !reported.contains(name.as_str()) {
-                    send_log(
-                        &ctx.ui_tx,
-                        format!(
-                            "[{repo_name}] Deleted snapshot '{name}' \
-                             (post-commit cleanup stats unavailable; see warnings)"
-                        ),
-                    );
-                }
-            }
-            for w in &result.warnings {
-                send_log(&ctx.ui_tx, format!("[{repo_name}] warning: {w}"));
-            }
-            let _ = ctx.app_tx.send(AppCommand::RefreshSnapshots {
-                repo_selector: repo_name,
-            });
-            let _ = ctx.app_tx.send(AppCommand::FetchAllRepoInfo);
-        }
-        Ok(PassphraseRun::Canceled) => {
+    let mut total_chunks = 0u64;
+    let mut total_freed = 0u64;
+    for stats in &result.stats {
+        total_chunks += stats.chunks_deleted;
+        total_freed += stats.space_freed;
+    }
+    if let [s] = result.stats.as_slice() {
+        send_log(
+            &ctx.ui_tx,
+            format!(
+                "[{repo_name}] Deleted snapshot '{}': {} chunks freed, {} reclaimed",
+                s.snapshot_name,
+                s.chunks_deleted,
+                format_bytes(s.space_freed),
+            ),
+        );
+    } else {
+        send_log(
+            &ctx.ui_tx,
+            format!(
+                "[{repo_name}] Deleted {} snapshots: {} chunks freed, {} reclaimed",
+                result.stats.len(),
+                total_chunks,
+                format_bytes(total_freed),
+            ),
+        );
+    }
+    // Surface any snapshot whose Phase 3 cleanup failed: it is missing
+    // from `stats` but did delete from storage, so users still see it
+    // disappear from the table.
+    let reported: std::collections::HashSet<&str> = result
+        .stats
+        .iter()
+        .map(|s| s.snapshot_name.as_str())
+        .collect();
+    for name in &snapshot_names {
+        if !reported.contains(name.as_str()) {
             send_log(
                 &ctx.ui_tx,
-                format!("[{repo_name}] passphrase prompt canceled; skipping."),
+                format!(
+                    "[{repo_name}] Deleted snapshot '{name}' \
+                     (post-commit cleanup stats unavailable; see warnings)"
+                ),
             );
         }
-        Err(e) => {
-            // Pre-mutation validation failure (e.g. SnapshotNotFound) leaves
-            // the repo untouched — single error covers the whole batch.
-            guard.fail(format!("[{repo_name}] delete failed: {e}"));
-        }
     }
+    for w in &result.warnings {
+        send_log(&ctx.ui_tx, format!("[{repo_name}] warning: {w}"));
+    }
+    let _ = ctx.app_tx.send(AppCommand::RefreshSnapshots {
+        repo_selector: repo_name,
+    });
+    let _ = ctx.app_tx.send(AppCommand::FetchAllRepoInfo);
 }
 
 fn send_diff_error(
@@ -263,141 +235,91 @@ pub(super) fn handle_diff_snapshots(
     snapshot_a: String,
     snapshot_b: String,
 ) {
-    let mut guard = OpGuard::ui(
-        &ctx.ui_tx,
-        &ctx.cancel_requested,
-        &ctx.operation_running,
+    // Diff is the one conventional handler that must also push a result event
+    // on failure, so it consumes `with_repo_op`'s reason string.
+    let result = match with_repo_op(
+        ctx,
+        &repo_name,
         "Diffing snapshots...",
-    );
-
-    // Plain `select_repo`: the guard is the single logger, with this site's own
-    // message (`select_repo_or_log` would log a second, redundant line).
-    let repo = match config::select_repo(&ctx.runtime.repos, &repo_name) {
-        Some(r) => r,
-        None => {
-            guard.fail(format!("[{repo_name}] repository not found"));
-            send_diff_error(
-                ctx,
-                repo_name,
-                snapshot_a,
-                snapshot_b,
-                "repository not found".to_string(),
-            );
+        "diff",
+        |repo, pass, _| commands::diff::run(&repo.config, pass, &snapshot_a, &snapshot_b),
+    ) {
+        Ok(r) => r,
+        Err(reason) => {
+            send_diff_error(ctx, repo_name, snapshot_a, snapshot_b, reason);
             return;
         }
     };
 
-    let outcome = with_passphrase_retry(repo, &mut ctx.passphrases, 3, |pass| {
-        commands::diff::run(&repo.config, pass, &snapshot_a, &snapshot_b)
+    let rows: Vec<DiffResultRow> = result
+        .entries
+        .iter()
+        .map(|entry| DiffResultRow {
+            change: entry.change,
+            path: entry.path.clone(),
+            old_size_bytes: entry.old_size,
+            new_size_bytes: entry.new_size,
+            delta_bytes: entry.size_delta,
+        })
+        .collect();
+    send_log(
+        &ctx.ui_tx,
+        format!(
+            "[{repo_name}] Diff {} -> {}: {} file changes",
+            result.base_snapshot,
+            result.target_snapshot,
+            rows.len(),
+        ),
+    );
+    let _ = ctx.ui_tx.send(UiEvent::DiffResultsData {
+        repo_name,
+        snapshot_a,
+        snapshot_b,
+        base_snapshot: result.base_snapshot,
+        target_snapshot: result.target_snapshot,
+        rows,
+        error: None,
     });
-
-    match outcome {
-        Ok(PassphraseRun::Ran(result)) => {
-            let rows: Vec<DiffResultRow> = result
-                .entries
-                .iter()
-                .map(|entry| DiffResultRow {
-                    change: entry.change,
-                    path: entry.path.clone(),
-                    old_size_bytes: entry.old_size,
-                    new_size_bytes: entry.new_size,
-                    delta_bytes: entry.size_delta,
-                })
-                .collect();
-            send_log(
-                &ctx.ui_tx,
-                format!(
-                    "[{repo_name}] Diff {} -> {}: {} file changes",
-                    result.base_snapshot,
-                    result.target_snapshot,
-                    rows.len(),
-                ),
-            );
-            let _ = ctx.ui_tx.send(UiEvent::DiffResultsData {
-                repo_name,
-                snapshot_a,
-                snapshot_b,
-                base_snapshot: result.base_snapshot,
-                target_snapshot: result.target_snapshot,
-                rows,
-                error: None,
-            });
-        }
-        Ok(PassphraseRun::Canceled) => {
-            send_log(
-                &ctx.ui_tx,
-                format!("[{repo_name}] passphrase prompt canceled; skipping."),
-            );
-            send_diff_error(
-                ctx,
-                repo_name,
-                snapshot_a,
-                snapshot_b,
-                "passphrase required".to_string(),
-            );
-        }
-        Err(e) => {
-            guard.fail(format!("[{repo_name}] diff failed: {e}"));
-            send_diff_error(ctx, repo_name, snapshot_a, snapshot_b, e.to_string());
-        }
-    }
 }
 
 pub(super) fn handle_prune_repo(ctx: &mut WorkerContext, repo_name: String) {
-    let mut guard = OpGuard::ui(
-        &ctx.ui_tx,
-        &ctx.cancel_requested,
-        &ctx.operation_running,
+    let Ok((stats, _)) = with_repo_op(
+        ctx,
+        &repo_name,
         "Pruning snapshots...",
-    );
-
-    let repo = match select_repo_or_fail(&mut guard, &ctx.runtime.repos, &repo_name) {
-        Some(r) => r,
-        None => return,
+        "prune",
+        |repo, pass, cancel| {
+            commands::prune::run(
+                &repo.config,
+                pass,
+                false,
+                false,
+                &repo.sources,
+                &[],
+                Some(cancel),
+            )
+        },
+    ) else {
+        return;
     };
 
-    let outcome = with_passphrase_retry(repo, &mut ctx.passphrases, 3, |pass| {
-        commands::prune::run(
-            &repo.config,
-            pass,
-            false,
-            false,
-            &repo.sources,
-            &[],
-            Some(&ctx.cancel_requested),
-        )
-    });
-
-    match outcome {
-        Ok(PassphraseRun::Ran((stats, _))) => {
-            send_log(
-                &ctx.ui_tx,
-                format!(
-                    "[{repo_name}] Pruned {} snapshots (kept {}), freed {} chunks ({})",
-                    stats.pruned,
-                    stats.kept,
-                    stats.chunks_deleted,
-                    format_bytes(stats.space_freed),
-                ),
-            );
-            for w in &stats.warnings {
-                send_log(&ctx.ui_tx, format!("[{repo_name}] warning: {w}"));
-            }
-            let _ = ctx.app_tx.send(AppCommand::RefreshSnapshots {
-                repo_selector: repo_name,
-            });
-            let _ = ctx.app_tx.send(AppCommand::FetchAllRepoInfo);
-        }
-        Ok(PassphraseRun::Canceled) => {
-            send_log(
-                &ctx.ui_tx,
-                format!("[{repo_name}] passphrase prompt canceled; skipping."),
-            );
-        }
-        Err(e) => {
-            guard.fail(format!("[{repo_name}] prune failed: {e}"));
-        }
+    send_log(
+        &ctx.ui_tx,
+        format!(
+            "[{repo_name}] Pruned {} snapshots (kept {}), freed {} chunks ({})",
+            stats.pruned,
+            stats.kept,
+            stats.chunks_deleted,
+            format_bytes(stats.space_freed),
+        ),
+    );
+    for w in &stats.warnings {
+        send_log(&ctx.ui_tx, format!("[{repo_name}] warning: {w}"));
     }
+    let _ = ctx.app_tx.send(AppCommand::RefreshSnapshots {
+        repo_selector: repo_name,
+    });
+    let _ = ctx.app_tx.send(AppCommand::FetchAllRepoInfo);
 }
 
 fn format_mtime_nanos(mtime_nanos: i64) -> String {
@@ -413,91 +335,72 @@ fn format_mtime_nanos(mtime_nanos: i64) -> String {
 }
 
 pub(super) fn handle_find_files(ctx: &mut WorkerContext, repo_name: String, name_pattern: String) {
-    let mut guard = OpGuard::ui(
-        &ctx.ui_tx,
-        &ctx.cancel_requested,
-        &ctx.operation_running,
-        "Searching files...",
-    );
-
-    let repo = match select_repo_or_fail(&mut guard, &ctx.runtime.repos, &repo_name) {
-        Some(r) => r,
-        None => return,
-    };
-
+    // Built before the operation starts: a bad pattern is a user input error,
+    // not a repository failure, so it never opens a repo.
     let filter = match FindFilter::build(None, None, Some(&name_pattern), None, None, None, None) {
         Ok(f) => f,
         Err(e) => {
-            guard.fail(format!("Invalid name pattern: {e}"));
+            send_log(&ctx.ui_tx, format!("Invalid name pattern: {e}"));
             return;
         }
     };
-
     let scope = FindScope {
         source_label: None,
         last_n: None,
     };
 
-    let outcome = with_passphrase_retry(repo, &mut ctx.passphrases, 3, |pass| {
-        vykar_core::commands::find::run(&repo.config, pass, &scope, &filter)
-    });
+    let Ok(timelines) = with_repo_op(
+        ctx,
+        &repo_name,
+        "Searching files...",
+        "find",
+        |repo, pass, _| commands::find::run(&repo.config, pass, &scope, &filter),
+    ) else {
+        return;
+    };
 
-    match outcome {
-        Ok(PassphraseRun::Ran(timelines)) => {
-            let mut by_snap: BTreeMap<(DateTime<Utc>, String), Vec<FindResultRow>> =
-                BTreeMap::new();
-            let mut total_hits: usize = 0;
-            for tl in &timelines {
-                for ah in &tl.hits {
-                    by_snap
-                        .entry((ah.hit.snapshot_time, ah.hit.snapshot_name.clone()))
-                        .or_default()
-                        .push(FindResultRow {
-                            path: tl.path.clone(),
-                            mtime: format_mtime_nanos(ah.hit.mtime),
-                            size: format_bytes(ah.hit.size),
-                            status: match ah.status {
-                                FileStatus::Added => "Added".to_string(),
-                                FileStatus::Modified => "Modified".to_string(),
-                                FileStatus::Unchanged => "Unchanged".to_string(),
-                            },
-                        });
-                    total_hits += 1;
-                }
-            }
-            // Newest snapshot first.
-            let groups: Vec<FindSnapshotGroup> = by_snap
-                .into_iter()
-                .rev()
-                .map(|((ts, id), rows)| {
-                    let local: DateTime<Local> = ts.with_timezone(&Local);
-                    FindSnapshotGroup {
-                        snapshot_id: id,
-                        snapshot_time: local.format("%Y-%m-%d %H:%M:%S").to_string(),
-                        rows,
-                    }
-                })
-                .collect();
-            send_log(
-                &ctx.ui_tx,
-                format!(
-                    "[{repo_name}] Find '{}': {} paths, {} total hits, {} snapshots",
-                    name_pattern,
-                    timelines.len(),
-                    total_hits,
-                    groups.len(),
-                ),
-            );
-            let _ = ctx.ui_tx.send(UiEvent::FindResultsData { groups });
-        }
-        Ok(PassphraseRun::Canceled) => {
-            send_log(
-                &ctx.ui_tx,
-                format!("[{repo_name}] passphrase prompt canceled; skipping."),
-            );
-        }
-        Err(e) => {
-            guard.fail(format!("[{repo_name}] find failed: {e}"));
+    let mut by_snap: BTreeMap<(DateTime<Utc>, String), Vec<FindResultRow>> = BTreeMap::new();
+    let mut total_hits: usize = 0;
+    for tl in &timelines {
+        for ah in &tl.hits {
+            by_snap
+                .entry((ah.hit.snapshot_time, ah.hit.snapshot_name.clone()))
+                .or_default()
+                .push(FindResultRow {
+                    path: tl.path.clone(),
+                    mtime: format_mtime_nanos(ah.hit.mtime),
+                    size: format_bytes(ah.hit.size),
+                    status: match ah.status {
+                        FileStatus::Added => "Added".to_string(),
+                        FileStatus::Modified => "Modified".to_string(),
+                        FileStatus::Unchanged => "Unchanged".to_string(),
+                    },
+                });
+            total_hits += 1;
         }
     }
+    // Newest snapshot first.
+    let groups: Vec<FindSnapshotGroup> = by_snap
+        .into_iter()
+        .rev()
+        .map(|((ts, id), rows)| {
+            let local: DateTime<Local> = ts.with_timezone(&Local);
+            FindSnapshotGroup {
+                snapshot_id: id,
+                snapshot_time: local.format("%Y-%m-%d %H:%M:%S").to_string(),
+                rows,
+            }
+        })
+        .collect();
+    send_log(
+        &ctx.ui_tx,
+        format!(
+            "[{repo_name}] Find '{}': {} paths, {} total hits, {} snapshots",
+            name_pattern,
+            timelines.len(),
+            total_hits,
+            groups.len(),
+        ),
+    );
+    let _ = ctx.ui_tx.send(UiEvent::FindResultsData { groups });
 }

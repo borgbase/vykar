@@ -24,6 +24,38 @@ fn format_unit(bytes: u64, unit: u64, suffix: &str) -> String {
     }
 }
 
+/// Human duration in whole seconds: `"12s"` below a minute, `"3m 07s"` at or
+/// above one.
+///
+/// Takes a signed count because snapshot metadata durations are computed from
+/// two recorded timestamps and can come out negative when a clock moved
+/// backwards mid-backup; showing `"-1m 30s"` beats silently clamping to zero.
+#[must_use]
+pub fn format_duration_seconds(secs: i64) -> String {
+    if secs.abs() < 60 {
+        return format!("{secs}s");
+    }
+    let sign = if secs < 0 { "-" } else { "" };
+    let abs = secs.unsigned_abs();
+    format!("{sign}{}m {:02}s", abs / 60, abs % 60)
+}
+
+/// A byte count, or `"-"` when unknown.
+#[must_use]
+pub fn format_optional_size(size: Option<u64>) -> String {
+    size.map(format_bytes).unwrap_or_else(|| "-".to_string())
+}
+
+/// A signed byte delta, sign-prefixed (`"+1.50 KiB"`, `"-2.00 MiB"`, `"0 B"`).
+#[must_use]
+pub fn format_size_delta(delta: i64) -> String {
+    match delta.cmp(&0) {
+        std::cmp::Ordering::Less => format!("-{}", format_bytes(delta.unsigned_abs())),
+        std::cmp::Ordering::Equal => format_bytes(0),
+        std::cmp::Ordering::Greater => format!("+{}", format_bytes(delta.unsigned_abs())),
+    }
+}
+
 pub fn format_count(n: u64) -> String {
     let s = n.to_string();
     let mut result = String::with_capacity(s.len() + s.len() / 3);
@@ -211,7 +243,39 @@ pub fn truncate_middle(input: &str, max_cols: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_size, str_display_width, truncate_middle};
+    use super::{
+        format_duration_seconds, format_optional_size, format_size_delta, parse_size,
+        str_display_width, truncate_middle,
+    };
+
+    #[test]
+    fn duration_seconds_switches_to_minutes_at_sixty() {
+        assert_eq!(format_duration_seconds(0), "0s");
+        assert_eq!(format_duration_seconds(59), "59s");
+        assert_eq!(format_duration_seconds(60), "1m 00s");
+        assert_eq!(format_duration_seconds(3607), "60m 07s");
+    }
+
+    #[test]
+    fn duration_seconds_keeps_negative_metadata_durations() {
+        // A clock that moved backwards mid-backup yields a negative duration;
+        // report it rather than clamping it to zero.
+        assert_eq!(format_duration_seconds(-30), "-30s");
+        assert_eq!(format_duration_seconds(-90), "-1m 30s");
+    }
+
+    #[test]
+    fn size_delta_is_sign_prefixed() {
+        assert_eq!(format_size_delta(0), "0 B");
+        assert_eq!(format_size_delta(1536), "+1.50 KiB");
+        assert_eq!(format_size_delta(-1536), "-1.50 KiB");
+    }
+
+    #[test]
+    fn optional_size_falls_back_to_a_dash() {
+        assert_eq!(format_optional_size(None), "-");
+        assert_eq!(format_optional_size(Some(2048)), "2.00 KiB");
+    }
 
     #[test]
     fn truncate_middle_shows_head_and_tail() {

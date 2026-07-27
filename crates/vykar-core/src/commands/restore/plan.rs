@@ -911,27 +911,13 @@ mod tests {
     /// Build a regular-file Item carrying a raw (non-UTF8) path shadow.
     #[cfg(unix)]
     fn raw_path_item(raw: &[u8]) -> Item {
-        use crate::snapshot::item::{ItemRawNames, ItemType};
+        use crate::snapshot::item::ItemRawNames;
         Item {
-            path: String::from_utf8_lossy(raw).into_owned(),
-            entry_type: ItemType::RegularFile,
-            mode: 0o644,
-            uid: 0,
-            gid: 0,
-            user: None,
-            group: None,
-            mtime: 0,
-            atime: None,
-            ctime: None,
-            size: 0,
-            chunks: Vec::new(),
-            link_target: None,
-            xattrs: None,
             raw_names: Some(ItemRawNames {
                 path: Some(raw.to_vec()),
                 link_target: None,
             }),
-            hardlink: None,
+            ..Item::test_file(&String::from_utf8_lossy(raw))
         }
     }
 

@@ -36,27 +36,25 @@ pub(super) async fn repo_stats(state: AppState) -> Result<Response, ServerError>
     .into_response())
 }
 
-fn walk(dir: &std::path::Path, bytes: &mut u64, objects: &mut u64) {
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                walk(&path, bytes, objects);
-            } else if let Ok(meta) = path.metadata() {
+/// Accumulate file count and total size under `dir`, recursively.
+///
+/// Unreadable directories are skipped rather than propagated: this only feeds
+/// an informational stats endpoint, and one bad inode must not fail the whole
+/// report. A file whose metadata cannot be read still counts toward `files`,
+/// contributing zero bytes. (`list.rs` and `objects.rs` deliberately do
+/// propagate — their callers act on the listing.)
+fn walk(dir: &std::path::Path, bytes: &mut u64, files: &mut u64) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            walk(&path, bytes, files);
+        } else {
+            *files += 1;
+            if let Ok(meta) = path.metadata() {
                 *bytes += meta.len();
-                *objects += 1;
-            }
-        }
-    }
-}
-
-fn count_packs(dir: &std::path::Path, count: &mut u64) {
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            if entry.path().is_dir() {
-                count_packs(&entry.path(), count);
-            } else {
-                *count += 1;
             }
         }
     }
@@ -65,14 +63,13 @@ fn count_packs(dir: &std::path::Path, count: &mut u64) {
 fn count_repo_stats(repo_dir: &std::path::Path) -> (u64, u64, u64) {
     let mut total_bytes = 0u64;
     let mut total_objects = 0u64;
-    let mut total_packs = 0u64;
-
     walk(repo_dir, &mut total_bytes, &mut total_objects);
 
-    // Count packs specifically.
+    // Count packs specifically; their byte total is already in `total_bytes`.
+    let mut total_packs = 0u64;
     let packs_dir = repo_dir.join("packs");
     if packs_dir.exists() {
-        count_packs(&packs_dir, &mut total_packs);
+        walk(&packs_dir, &mut 0, &mut total_packs);
     }
 
     (total_bytes, total_objects, total_packs)

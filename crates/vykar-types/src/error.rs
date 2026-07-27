@@ -120,6 +120,12 @@ pub enum VykarError {
     #[error("decryption failed: wrong passphrase or corrupted data")]
     DecryptionFailed,
 
+    #[error("passphrase must not be empty")]
+    EmptyPassphrase,
+
+    #[error("passphrases do not match")]
+    PassphraseMismatch,
+
     #[error("key derivation error: {0}")]
     KeyDerivation(String),
 

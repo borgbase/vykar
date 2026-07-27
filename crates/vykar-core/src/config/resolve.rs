@@ -3,8 +3,6 @@ mod document;
 mod env;
 mod resolution;
 mod template;
-#[cfg(test)]
-mod test_support;
 
 pub use discovery::{default_config_search_paths, resolve_config_path, ConfigSource};
 pub use document::RepositoryEntry;

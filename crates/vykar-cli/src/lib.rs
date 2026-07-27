@@ -38,7 +38,7 @@ use crate::dispatch::{
 };
 use crate::error::{CliError, CliResult};
 use crate::resolve::{
-    classify_diff_target, classify_snapshot_target, repo_display_name, DiffDispatch,
+    classify_diff_target, classify_snapshot_target, repo_name_at, repo_names_at, DiffDispatch,
     SnapshotDispatch,
 };
 
@@ -55,8 +55,36 @@ pub fn run() -> ExitCode {
 
 pub(crate) fn run_cli(cli: Cli) -> ExitCode {
     signal::install_signal_handlers();
+    init_logging(&cli);
 
-    // Initialize logging — auto-upgrade to info for daemon
+    let source = match resolve_config_source(&cli) {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+
+    let all_repos = match load_repos(&cli, &source) {
+        Ok(r) => r,
+        Err(code) => return code,
+    };
+
+    let repo_selector = effective_repo_selector(&cli);
+    let repos: Vec<&ResolvedRepo> = match repo_selector {
+        Some(selector) => {
+            vec![config::select_repo(&all_repos, selector).expect("repo selector was validated")]
+        }
+        None => all_repos.iter().collect(),
+    };
+
+    if let Some(code) = dispatch_targeted(&cli, &repos) {
+        return code;
+    }
+
+    run_all_repos(&cli, &repos, repo_selector.is_some())
+}
+
+/// Initialize tracing. The daemon runs at `info` by default; everything else
+/// stays quiet until `-v` is passed.
+fn init_logging(cli: &Cli) {
     let filter = match cli.verbose {
         0 if matches!(&cli.command, Some(Commands::Daemon { .. })) => "info",
         0 => "warn",
@@ -74,7 +102,37 @@ pub(crate) fn run_cli(cli: Cli) -> ExitCode {
     } else {
         builder.init();
     }
+}
 
+/// Effective `--repo` selector: the subcommand's flag wins over the top-level one.
+fn effective_repo_selector(cli: &Cli) -> Option<&str> {
+    cli.command
+        .as_ref()
+        .and_then(|cmd| cmd.repo())
+        .or(cli.repo.as_deref())
+}
+
+/// Reduce a single-repo command's outcome to an exit code, honoring a shutdown
+/// signal that arrived while it ran.
+fn finish(result: CliResult<bool>) -> ExitCode {
+    if signal::SHUTDOWN.load(Ordering::SeqCst) {
+        eprintln!("Interrupted");
+        return ExitCode::from(EXIT_INTERRUPTED);
+    }
+    match result {
+        Ok(true) => ExitCode::from(EXIT_PARTIAL),
+        Ok(false) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            ExitCode::from(EXIT_ERROR)
+        }
+    }
+}
+
+/// Validate the flags that must be checked before any config is read, run the
+/// commands that own their own config lifecycle, and locate the config file for
+/// everything else. `Err(code)` means the process is finished.
+fn resolve_config_source(cli: &Cli) -> Result<config::ConfigSource, ExitCode> {
     // Reject top-level --repo/--source when a subcommand is present.
     // These flags belong on the subcommand itself (e.g. `vykar backup -R repo`).
     if cli.command.is_some() && (cli.repo.is_some() || !cli.source.is_empty()) {
@@ -82,31 +140,28 @@ pub(crate) fn run_cli(cli: Cli) -> ExitCode {
             "Error: --repo/--source on the bare command cannot be combined with a subcommand.\n\
              Place -R/--repo and -S/--source after the subcommand instead."
         );
-        return ExitCode::from(EXIT_ERROR);
+        return Err(ExitCode::from(EXIT_ERROR));
     }
 
     // Handle `config` subcommand early — no config file needed
     if let Some(Commands::Config { dest }) = &cli.command {
         if let Err(e) = run_config_generate(dest.as_deref()) {
             eprintln!("Error: {e}");
-            return ExitCode::from(EXIT_ERROR);
+            return Err(ExitCode::from(EXIT_ERROR));
         }
-        return ExitCode::SUCCESS;
+        return Err(ExitCode::SUCCESS);
     }
 
     // Resolve config file
-    let source = match config::resolve_config_path(cli.config.as_deref()) {
-        Some(s) => s,
-        None => {
-            eprintln!("Error: no configuration file found.");
-            eprintln!("Searched:");
-            for (path, level) in config::default_config_search_paths() {
-                eprintln!("  {} ({})", path.display(), level);
-            }
-            eprintln!();
-            eprintln!("Run `vykar config` to generate a starter config file.");
-            return ExitCode::from(EXIT_ERROR);
+    let Some(source) = config::resolve_config_path(cli.config.as_deref()) else {
+        eprintln!("Error: no configuration file found.");
+        eprintln!("Searched:");
+        for (path, level) in config::default_config_search_paths() {
+            eprintln!("  {} ({})", path.display(), level);
         }
+        eprintln!();
+        eprintln!("Run `vykar config` to generate a starter config file.");
+        return Err(ExitCode::from(EXIT_ERROR));
     };
 
     tracing::info!("Using config: {source}");
@@ -120,7 +175,7 @@ pub(crate) fn run_cli(cli: Cli) -> ExitCode {
     {
         if cli.trust_repo {
             eprintln!("Error: --trust-repo cannot be used with the daemon command");
-            return ExitCode::from(EXIT_ERROR);
+            return Err(ExitCode::from(EXIT_ERROR));
         }
         if let Some(addr) = http_listen {
             if !addr.ip().is_loopback() && !*http_allow_public {
@@ -128,35 +183,36 @@ pub(crate) fn run_cli(cli: Cli) -> ExitCode {
                     "Error: --http-listen {addr} binds to a non-loopback address; \
                      pass --http-allow-public (or set VYKAR_HTTP_ALLOW_PUBLIC=1) to confirm"
                 );
-                return ExitCode::from(EXIT_ERROR);
+                return Err(ExitCode::from(EXIT_ERROR));
             }
         }
         if let Err(e) = cmd::daemon::run_daemon(source, *http_listen) {
             eprintln!("Error: {e}");
-            return ExitCode::from(EXIT_ERROR);
+            return Err(ExitCode::from(EXIT_ERROR));
         }
-        return ExitCode::SUCCESS;
+        return Err(ExitCode::SUCCESS);
     }
 
+    Ok(source)
+}
+
+/// Load the configured repositories and apply `--repo` / `--trust-repo`.
+/// `Err(code)` means the flags were rejected or the config was unusable.
+fn load_repos(cli: &Cli, source: &config::ConfigSource) -> Result<Vec<ResolvedRepo>, ExitCode> {
     let mut all_repos = match config::load_and_resolve(source.path()) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("Error: {e}");
-            return ExitCode::from(EXIT_ERROR);
+            return Err(ExitCode::from(EXIT_ERROR));
         }
     };
 
     if all_repos.is_empty() {
         eprintln!("Error: no repositories configured. Edit your config file and add a 'repositories' section.");
-        return ExitCode::from(EXIT_ERROR);
+        return Err(ExitCode::from(EXIT_ERROR));
     }
 
-    // Effective --repo selector: subcommand flag takes precedence, then top-level.
-    let repo_selector = cli
-        .command
-        .as_ref()
-        .and_then(|cmd| cmd.repo())
-        .or(cli.repo.as_deref());
+    let repo_selector = effective_repo_selector(cli);
 
     // --trust-repo validation: must target exactly one repo.
     // Rejected for multi-repo without -R (would silently re-pin unrelated
@@ -165,29 +221,26 @@ pub(crate) fn run_cli(cli: Cli) -> ExitCode {
         eprintln!(
             "Error: --trust-repo requires -R / --repo when multiple repositories are configured"
         );
-        return ExitCode::from(EXIT_ERROR);
+        return Err(ExitCode::from(EXIT_ERROR));
     }
 
     // Resolve --repo selector and set --trust-repo on the single targeted repo.
     if let Some(selector) = repo_selector {
-        let found = all_repos
-            .iter()
-            .any(|r| r.label.as_deref() == Some(selector) || r.config.repository.url == selector);
-        if !found {
+        let matches_selector = |r: &ResolvedRepo| {
+            r.label.as_deref() == Some(selector) || r.config.repository.url == selector
+        };
+        if !all_repos.iter().any(matches_selector) {
             eprintln!("Error: no repository matching '{selector}'");
             eprintln!("Available repositories:");
             for r in &all_repos {
                 let label = r.label.as_deref().unwrap_or("-");
                 eprintln!("  {label:12} {}", r.config.repository.url);
             }
-            return ExitCode::from(EXIT_ERROR);
+            return Err(ExitCode::from(EXIT_ERROR));
         }
         if cli.trust_repo {
-            for repo in &mut all_repos {
-                if repo.label.as_deref() == Some(selector) || repo.config.repository.url == selector
-                {
-                    repo.config.trust_repo = true;
-                }
+            for repo in all_repos.iter_mut().filter(|r| matches_selector(r)) {
+                repo.config.trust_repo = true;
             }
         }
     } else if cli.trust_repo {
@@ -198,211 +251,164 @@ pub(crate) fn run_cli(cli: Cli) -> ExitCode {
             .config
             .trust_repo = true;
     }
-    let repos: Vec<&ResolvedRepo> = if let Some(selector) = repo_selector {
-        vec![config::select_repo(&all_repos, selector).expect("repo selector was validated")]
-    } else {
-        all_repos.iter().collect()
-    };
 
-    let multi = repos.len() > 1;
+    Ok(all_repos)
+}
+
+/// Multi-repo dispatch for commands that name a specific snapshot: probe the
+/// repositories, pick the one that actually holds it, and run there. Returns
+/// `None` when the command should fall through to the run-everywhere path.
+fn dispatch_targeted(cli: &Cli, repos: &[&ResolvedRepo]) -> Option<ExitCode> {
+    if repos.len() < 2 {
+        return None;
+    }
 
     // Bulk snapshot delete requires -R when multiple repos are configured,
     // since the smart single-snapshot probe cannot handle multiple names.
-    if multi {
-        if let Some(cli::Commands::Snapshot {
-            command: cli::SnapshotCommand::Delete { snapshots, .. },
-        }) = cli.command.as_ref()
-        {
-            if snapshots.len() > 1 {
-                eprintln!(
-                    "Error: deleting multiple snapshots requires -R / --repo \
-                     when multiple repositories are configured"
-                );
-                return ExitCode::from(EXIT_ERROR);
-            }
+    if let Some(cli::Commands::Snapshot {
+        command: cli::SnapshotCommand::Delete { snapshots, .. },
+    }) = cli.command.as_ref()
+    {
+        if snapshots.len() > 1 {
+            eprintln!(
+                "Error: deleting multiple snapshots requires -R / --repo \
+                 when multiple repositories are configured"
+            );
+            return Some(ExitCode::from(EXIT_ERROR));
         }
     }
 
-    // Smart snapshot diff dispatch in multi-repo configs: probe both snapshot
-    // names and pick the unique containing repo, or error with a helpful
-    // message. Single-repo configs fall through to the default path below.
-    if multi {
-        if let Some(cli::Commands::Snapshot {
-            command:
-                cli::SnapshotCommand::Diff {
-                    snapshot_a,
-                    snapshot_b,
-                },
-        }) = cli.command.as_ref()
-        {
-            for repo in &repos {
-                warn_if_untrusted_rest(&repo.config, repo.label.as_deref());
-            }
-            match classify_diff_target(snapshot_a, snapshot_b, &repos) {
-                DiffDispatch::LatestRequiresRepo => {
-                    eprintln!(
-                        "Error: 'latest' is ambiguous in snapshot diff when multiple repositories \
-                         are configured; rename the snapshot or scope the config"
-                    );
-                    return ExitCode::from(EXIT_ERROR);
-                }
-                DiffDispatch::SnapshotNotFound { snapshot } => {
-                    eprintln!(
-                        "Error: snapshot '{snapshot}' not found in any configured repository"
-                    );
-                    return ExitCode::from(EXIT_ERROR);
-                }
-                DiffDispatch::DifferentRepos { a_repo, b_repo } => {
-                    eprintln!(
-                        "Error: snapshot diff requires both snapshots to live in the same \
-                         repository: '{snapshot_a}' is in '{a_repo}', '{snapshot_b}' is in '{b_repo}'"
-                    );
-                    return ExitCode::from(EXIT_ERROR);
-                }
-                DiffDispatch::Ambiguous {
-                    snapshot,
-                    repos: rs,
-                } => {
-                    let names: Vec<&str> = rs
-                        .iter()
-                        .map(|i| {
-                            repo_display_name(
-                                repos
-                                    .get(*i)
-                                    .copied()
-                                    .expect("dispatch repo index is valid"),
-                            )
-                        })
-                        .collect();
-                    eprintln!(
-                        "Error: snapshot '{snapshot}' is present in multiple repositories: {}. \
-                         Rename the snapshot or scope the config.",
-                        names.join(", ")
-                    );
-                    return ExitCode::from(EXIT_ERROR);
-                }
-                DiffDispatch::ProbeError { errors } => {
-                    eprintln!("Error: could not probe all repositories");
-                    for (i, err) in &errors {
-                        let repo = repos
-                            .get(*i)
-                            .copied()
-                            .expect("dispatch repo index is valid");
-                        eprintln!("  {}:  {err}", repo_display_name(repo));
-                    }
-                    return ExitCode::from(EXIT_ERROR);
-                }
-                DiffDispatch::Unique(idx) => {
-                    let Some(repo) = repos.get(idx).copied() else {
-                        eprintln!("Internal error: diff target repo index out of range");
-                        return ExitCode::from(EXIT_ERROR);
-                    };
-                    let result = run_repo_command(&cli, repo);
-                    if signal::SHUTDOWN.load(Ordering::SeqCst) {
-                        eprintln!("Interrupted");
-                        return ExitCode::from(EXIT_INTERRUPTED);
-                    }
-                    match result {
-                        Ok(true) => return ExitCode::from(EXIT_PARTIAL),
-                        Ok(false) => return ExitCode::SUCCESS,
-                        Err(e) => {
-                            eprintln!("Error: {e}");
-                            return ExitCode::from(EXIT_ERROR);
-                        }
-                    }
-                }
-            }
-        }
+    if let Some(cli::Commands::Snapshot {
+        command:
+            cli::SnapshotCommand::Diff {
+                snapshot_a,
+                snapshot_b,
+            },
+    }) = cli.command.as_ref()
+    {
+        return Some(dispatch_diff(cli, repos, snapshot_a, snapshot_b));
     }
 
-    // Smart snapshot dispatch: when multiple repos are configured and the
-    // command targets a specific snapshot, probe repos to find the one that
-    // actually contains it, rather than running against all repos.
-    if let (true, Some(snap)) = (multi, cli.command.as_ref().and_then(|c| c.snapshot_name())) {
-        // Emit REST/plaintext warnings before probing backends
-        for repo in &repos {
-            warn_if_untrusted_rest(&repo.config, repo.label.as_deref());
-        }
+    let snap = cli.command.as_ref().and_then(|c| c.snapshot_name())?;
+    Some(dispatch_snapshot(cli, repos, snap))
+}
 
-        match classify_snapshot_target(snap, &repos) {
-            SnapshotDispatch::RequireRepo => {
-                eprintln!(
-                    "Error: 'latest' requires -R / --repo when multiple repositories are configured"
-                );
-                return ExitCode::from(EXIT_ERROR);
-            }
-            SnapshotDispatch::NotFound => {
-                eprintln!("Error: snapshot '{snap}' not found in any configured repository");
-                return ExitCode::from(EXIT_ERROR);
-            }
-            SnapshotDispatch::Unique(idx) => {
-                // Single match — dispatch without banner
-                let Some(repo) = repos.get(idx).copied() else {
-                    eprintln!("Internal error: snapshot dispatch index out of range");
-                    return ExitCode::from(EXIT_ERROR);
-                };
-                let result = run_repo_command(&cli, repo);
-                if signal::SHUTDOWN.load(Ordering::SeqCst) {
-                    eprintln!("Interrupted");
-                    return ExitCode::from(EXIT_INTERRUPTED);
-                }
-                match result {
-                    Ok(true) => return ExitCode::from(EXIT_PARTIAL),
-                    Ok(false) => {}
-                    Err(e) => {
-                        eprintln!("Error: {e}");
-                        return ExitCode::from(EXIT_ERROR);
-                    }
-                }
-            }
-            SnapshotDispatch::Ambiguous(indices) => {
-                let names: Vec<&str> = indices
-                    .iter()
-                    .map(|i| {
-                        repo_display_name(
-                            repos
-                                .get(*i)
-                                .copied()
-                                .expect("dispatch repo index is valid"),
-                        )
-                    })
-                    .collect();
-                eprintln!(
-                    "Error: snapshot '{snap}' found in multiple repositories: {}. \
-                     Use -R / --repo to select one.",
-                    names.join(", ")
-                );
-                return ExitCode::from(EXIT_ERROR);
-            }
-            SnapshotDispatch::ProbeError { matches, errors } => {
-                eprintln!("Error: could not probe all repositories");
-                for (i, err) in &errors {
-                    let repo = repos
-                        .get(*i)
-                        .copied()
-                        .expect("dispatch repo index is valid");
-                    eprintln!("  {}:  {err}", repo_display_name(repo));
-                }
-                for i in &matches {
-                    let repo = repos
-                        .get(*i)
-                        .copied()
-                        .expect("dispatch repo index is valid");
-                    eprintln!("  {}:  found '{snap}'", repo_display_name(repo));
-                }
-                eprintln!("Use -R / --repo to target a specific repository.");
-                return ExitCode::from(EXIT_ERROR);
-            }
+/// Probe both snapshot names and run the diff in the single repository that
+/// holds them both, or explain why that could not be determined.
+fn dispatch_diff(
+    cli: &Cli,
+    repos: &[&ResolvedRepo],
+    snapshot_a: &str,
+    snapshot_b: &str,
+) -> ExitCode {
+    // Emit REST/plaintext warnings before probing backends.
+    for repo in repos {
+        warn_if_untrusted_rest(&repo.config, repo.label.as_deref());
+    }
+    match classify_diff_target(snapshot_a, snapshot_b, repos) {
+        DiffDispatch::LatestRequiresRepo => {
+            eprintln!(
+                "Error: \'latest\' is ambiguous in snapshot diff when multiple repositories \
+                 are configured; rename the snapshot or scope the config"
+            );
+            ExitCode::from(EXIT_ERROR)
         }
-        return ExitCode::SUCCESS;
+        DiffDispatch::SnapshotNotFound { snapshot } => {
+            eprintln!("Error: snapshot \'{snapshot}\' not found in any configured repository");
+            ExitCode::from(EXIT_ERROR)
+        }
+        DiffDispatch::DifferentRepos { a_repo, b_repo } => {
+            eprintln!(
+                "Error: snapshot diff requires both snapshots to live in the same \
+                 repository: \'{snapshot_a}\' is in \'{a_repo}\', \'{snapshot_b}\' is in \'{b_repo}\'"
+            );
+            ExitCode::from(EXIT_ERROR)
+        }
+        DiffDispatch::Ambiguous {
+            snapshot,
+            repos: rs,
+        } => {
+            eprintln!(
+                "Error: snapshot \'{snapshot}\' is present in multiple repositories: {}. \
+                 Rename the snapshot or scope the config.",
+                repo_names_at(repos, &rs).join(", ")
+            );
+            ExitCode::from(EXIT_ERROR)
+        }
+        DiffDispatch::ProbeError { errors } => {
+            eprintln!("Error: could not probe all repositories");
+            for (i, err) in &errors {
+                eprintln!("  {}:  {err}", repo_name_at(repos, *i));
+            }
+            ExitCode::from(EXIT_ERROR)
+        }
+        DiffDispatch::Unique(idx) => {
+            let Some(repo) = repos.get(idx).copied() else {
+                eprintln!("Internal error: diff target repo index out of range");
+                return ExitCode::from(EXIT_ERROR);
+            };
+            finish(run_repo_command(cli, repo))
+        }
+    }
+}
+
+/// Probe the repositories for `snap` and run the command in the one that holds
+/// it, or explain why that could not be determined.
+fn dispatch_snapshot(cli: &Cli, repos: &[&ResolvedRepo], snap: &str) -> ExitCode {
+    // Emit REST/plaintext warnings before probing backends.
+    for repo in repos {
+        warn_if_untrusted_rest(&repo.config, repo.label.as_deref());
     }
 
-    // Default path: run against all selected repos
+    match classify_snapshot_target(snap, repos) {
+        SnapshotDispatch::RequireRepo => {
+            eprintln!(
+                "Error: \'latest\' requires -R / --repo when multiple repositories are configured"
+            );
+            ExitCode::from(EXIT_ERROR)
+        }
+        SnapshotDispatch::NotFound => {
+            eprintln!("Error: snapshot \'{snap}\' not found in any configured repository");
+            ExitCode::from(EXIT_ERROR)
+        }
+        SnapshotDispatch::Unique(idx) => {
+            // Single match — dispatch without banner
+            let Some(repo) = repos.get(idx).copied() else {
+                eprintln!("Internal error: snapshot dispatch index out of range");
+                return ExitCode::from(EXIT_ERROR);
+            };
+            finish(run_repo_command(cli, repo))
+        }
+        SnapshotDispatch::Ambiguous(indices) => {
+            eprintln!(
+                "Error: snapshot \'{snap}\' found in multiple repositories: {}. \
+                 Use -R / --repo to select one.",
+                repo_names_at(repos, &indices).join(", ")
+            );
+            ExitCode::from(EXIT_ERROR)
+        }
+        SnapshotDispatch::ProbeError { matches, errors } => {
+            eprintln!("Error: could not probe all repositories");
+            for (i, err) in &errors {
+                eprintln!("  {}:  {err}", repo_name_at(repos, *i));
+            }
+            for i in &matches {
+                eprintln!("  {}:  found \'{snap}\'", repo_name_at(repos, *i));
+            }
+            eprintln!("Use -R / --repo to target a specific repository.");
+            ExitCode::from(EXIT_ERROR)
+        }
+    }
+}
+
+/// Run the command against every selected repository, aggregating the outcome:
+/// any hard error wins over a partial, which wins over success.
+fn run_all_repos(cli: &Cli, repos: &[&ResolvedRepo], repo_explicitly_selected: bool) -> ExitCode {
+    let multi = repos.len() > 1;
     let mut had_error = false;
     let mut had_partial = false;
-    let repo_explicitly_selected = repo_selector.is_some();
 
-    for repo in &repos {
+    for repo in repos {
         if signal::SHUTDOWN.load(Ordering::SeqCst) {
             break;
         }
@@ -414,17 +420,17 @@ pub(crate) fn run_cli(cli: Cli) -> ExitCode {
             if let Some(path) = local_repo_unavailable(repo) {
                 eprintln!(
                     "Warning: skipping '{}' — repository not found at '{path}'",
-                    repo_display_name(repo),
+                    repo.label_or_url(),
                 );
                 continue;
             }
         }
 
         if multi {
-            eprintln!("--- Repository: {} ---", repo_display_name(repo));
+            eprintln!("--- Repository: {} ---", repo.label_or_url());
         }
 
-        let result = run_repo_command(&cli, repo);
+        let result = run_repo_command(cli, repo);
         if signal::SHUTDOWN.load(Ordering::SeqCst) {
             eprintln!("Interrupted");
             return ExitCode::from(EXIT_INTERRUPTED);

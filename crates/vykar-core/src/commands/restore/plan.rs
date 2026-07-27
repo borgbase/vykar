@@ -903,9 +903,49 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_rejects_parent_dir_traversal() {
-        let err = sanitize_item_path("../etc/passwd").unwrap_err().to_string();
-        assert!(err.contains("unsafe path"));
+    fn sanitize_rejects_traversal_and_degenerate_paths() {
+        // Each rejected input must carry the phrase identifying its rule.
+        let rejected = [
+            ("../etc/passwd", "unsafe path"),
+            ("a/../etc/passwd", "unsafe path"),
+            ("", "empty path"),
+            ("./", "empty path"),
+            (".", "empty path"),
+        ];
+        for (raw, phrase) in rejected {
+            let err = sanitize_item_path(raw).unwrap_err().to_string();
+            assert!(err.contains(phrase), "{raw:?}: got {err:?}");
+        }
+
+        // Slash-rooted: absolute on Unix, a bare RootDir component on Windows —
+        // rejected either way.
+        let err = sanitize_item_path("/etc/passwd").unwrap_err().to_string();
+        assert!(
+            err.contains("absolute path") || err.contains("unsafe path"),
+            "got {err:?}"
+        );
+
+        // Drive-prefix components only exist on Windows ("C:x" parses as a
+        // single Normal component on Unix).
+        #[cfg(windows)]
+        {
+            let err = sanitize_item_path("C:evil").unwrap_err().to_string();
+            assert!(err.contains("unsafe path"), "got {err:?}");
+            let err = sanitize_item_path("C:\\evil").unwrap_err().to_string();
+            assert!(err.contains("absolute path"), "got {err:?}");
+        }
+    }
+
+    #[test]
+    fn sanitize_strips_cur_dir_components() {
+        assert_eq!(
+            sanitize_item_path("./a/./b").unwrap(),
+            std::path::PathBuf::from("a/b")
+        );
+        assert_eq!(
+            sanitize_item_path("a/b/").unwrap(),
+            std::path::PathBuf::from("a/b")
+        );
     }
 
     /// Build a regular-file Item carrying a raw (non-UTF8) path shadow.

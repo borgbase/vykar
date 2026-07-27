@@ -35,7 +35,7 @@ test-all:
 doc-check:
 	RUSTDOCFLAGS="-Dwarnings" cargo doc --workspace --no-deps --all-features
 
-pre-commit: fmt-check lint doc-check test
+pre-commit: fmt-check lint doc-check test-all
 
 APP_BUNDLE = target/release/Vykar Backup.app
 

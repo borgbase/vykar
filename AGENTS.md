@@ -4,7 +4,7 @@ Fast, encrypted, deduplicated backup tool in Rust. Two crates: `vykar-core` (lib
 
 ## Verification
 
-`make pre-commit` runs `fmt-check` + `lint` (clippy with `-D warnings`) + `doc-check` + `test` (`cargo test --workspace`). It is slow (~2 minutes). Run it **once** at the end of a change and capture its output to a file so downstream checks can consult the logs instead of re-running:
+`make pre-commit` runs `fmt-check` + `lint` (clippy with `-D warnings`) + `doc-check` + `test-all` (`cargo test --workspace -- --include-ignored`, matching CI). It is slow (~2 minutes). Run it **once** at the end of a change and capture its output to a file so downstream checks can consult the logs instead of re-running:
 
 ```
 make pre-commit 2>&1 | tee /tmp/vykar-pre-commit.log

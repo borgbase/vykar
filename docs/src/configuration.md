@@ -728,7 +728,7 @@ at daemon/GUI startup) and `jitter_seconds`.
 Because `enabled` defaults to `false`, an override that sets a cadence without
 `enabled: true` would silently switch that repository off. vykar rejects it:
 
-```
+```text
 repository 'nas': schedule sets a cadence but 'enabled' is false;
 set `enabled: true` or remove the override
 ```
@@ -786,7 +786,7 @@ sources:
 
 Where `.db.env` contains:
 
-```
+```ini
 DB_USER=myuser
 DB_PASSWORD=s3cret
 DB_DATABASE=myapp

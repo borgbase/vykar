@@ -83,7 +83,7 @@ older binary cannot read snapshots written by a newer one.
 
 If you see this when listing or backing up:
 
-```
+```text
 WARN snapshot 3f9c…: stored envelope has 15 fields, this build reads 14 —
      written by a newer vykar; upgrade vykar on this host. Skipping —
      this repository listing is incomplete

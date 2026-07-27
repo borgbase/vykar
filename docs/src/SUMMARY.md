@@ -27,7 +27,3 @@
 
 - [Setup](server-setup.md)
 - [Internals](server-internals.md)
-
-# Contribute
-
-- [GitHub](https://github.com/borgbase/vykar)

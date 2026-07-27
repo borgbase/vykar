@@ -98,7 +98,7 @@ vykar daemon --http-listen 0.0.0.0:7575 --http-allow-public
 
 The page exposes repository names, URLs, snapshot identifiers, and source paths — information that is sensitive on most deployments. The two-flag rule prevents accidentally exposing this on a public interface. If you need to expose it beyond the host, terminate TLS and add authentication in a reverse proxy (nginx, Caddy, Traefik) — vykar speaks plain HTTP only.
 
-```
+```text
 +----------------+   loopback   +------------+   public TLS   +------+
 | vykar daemon   | <----------- | reverse    | <------------- | user |
 | 127.0.0.1:7575 |              | proxy      |                +------+

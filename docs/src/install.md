@@ -17,79 +17,93 @@ Available as `ghcr.io/borgbase/vykar` on GitHub Container Registry. An `apprise`
 
 Create a `vykar.yaml` for Docker. Source paths must reference `/data/...` (the container mount point):
 
-    repositories:
-      - url: s3://my-bucket/backups
-        access_key_id: "..."
-        secret_access_key: "..."
+```yaml
+repositories:
+  - url: s3://my-bucket/backups
+    access_key_id: "..."
+    secret_access_key: "..."
 
-    sources:
-      - /data/documents
-      - /data/photos
+sources:
+  - /data/documents
+  - /data/photos
 
-    encryption:
-      passphrase: "change-me"
+encryption:
+  passphrase: "change-me"
 
-    retention:
-      keep_daily: 7
-      keep_weekly: 4
+retention:
+  keep_daily: 7
+  keep_weekly: 4
 
-    schedule:
-      enabled: true
-      every: "24h"
-      on_startup: true
+schedule:
+  enabled: true
+  every: "24h"
+  on_startup: true
+```
 
 For a local repository backend, use `/repo` as the repo path and mount a host directory there.
 
 ### Run as daemon
 
-    docker run -d \
-      --name vykar-daemon \
-      --hostname my-server \
-      -v /path/to/vykar.yaml:/etc/vykar/config.yaml:ro \
-      -v /home/user/documents:/data/documents:ro \
-      -v /home/user/photos:/data/photos:ro \
-      -v vykar-cache:/cache \
-      ghcr.io/borgbase/vykar
+```bash
+docker run -d \
+  --name vykar-daemon \
+  --hostname my-server \
+  -v /path/to/vykar.yaml:/etc/vykar/config.yaml:ro \
+  -v /home/user/documents:/data/documents:ro \
+  -v /home/user/photos:/data/photos:ro \
+  -v vykar-cache:/cache \
+  ghcr.io/borgbase/vykar
+```
 
 ### Run ad-hoc commands
 
 With a new container (uses the entrypoint, no need to repeat `vykar`):
 
-    docker run --rm \
-      -v /path/to/vykar.yaml:/etc/vykar/config.yaml:ro \
-      -v vykar-cache:/cache \
-      ghcr.io/borgbase/vykar list
+```bash
+docker run --rm \
+  -v /path/to/vykar.yaml:/etc/vykar/config.yaml:ro \
+  -v vykar-cache:/cache \
+  ghcr.io/borgbase/vykar list
+```
 
 Or exec into a running daemon container:
 
-    docker exec vykar-daemon vykar list
+```bash
+docker exec vykar-daemon vykar list
+```
 
 ### Docker Compose
 
-    services:
-      vykar:
-        image: ghcr.io/borgbase/vykar:latest
-        hostname: my-server
-        restart: unless-stopped
-        environment:
-          - VYKAR_PASSPHRASE
-          - TZ=UTC
-        volumes:
-          - ./vykar.yaml:/etc/vykar/config.yaml:ro
-          - /home/user/documents:/data/documents:ro
-          - vykar-cache:/cache
+```yaml
+services:
+  vykar:
+    image: ghcr.io/borgbase/vykar:latest
+    hostname: my-server
+    restart: unless-stopped
+    environment:
+      - VYKAR_PASSPHRASE
+      - TZ=UTC
     volumes:
-      vykar-cache:
+      - ./vykar.yaml:/etc/vykar/config.yaml:ro
+      - /home/user/documents:/data/documents:ro
+      - vykar-cache:/cache
+volumes:
+  vykar-cache:
+```
 
 ### Reloading configuration
 
 Send `SIGHUP` to the daemon container to reload the config file without restarting:
 
-    docker kill --signal=HUP vykar-daemon
+```bash
+docker kill --signal=HUP vykar-daemon
+```
 
 With Docker Compose:
 
-    docker compose kill -s HUP vykar
+```bash
+docker compose kill -s HUP vykar
+```
 
 The daemon logs whether the reload succeeded or was rejected (invalid config).
 
@@ -97,24 +111,30 @@ The daemon logs whether the reload succeeded or was rejected (invalid config).
 
 Send `SIGUSR1` to trigger an immediate backup cycle without waiting for the next scheduled run:
 
-    docker kill --signal=USR1 vykar-daemon
+```bash
+docker kill --signal=USR1 vykar-daemon
+```
 
 With Docker Compose:
 
-    docker compose kill -s USR1 vykar
+```bash
+docker compose kill -s USR1 vykar
+```
 
 ### Read-only status page
 
 Set `VYKAR_HTTP_LISTEN` (and `VYKAR_HTTP_ALLOW_PUBLIC=1` to bind on `0.0.0.0`) and publish port 7575 to expose a read-only status page in the browser. See [Daemon → Read-only status page](daemon.md#read-only-status-page) for endpoints and bind-safety rules.
 
-    docker run -d \
-      --name vykar-daemon \
-      -p 7575:7575 \
-      -e VYKAR_HTTP_LISTEN=0.0.0.0:7575 \
-      -e VYKAR_HTTP_ALLOW_PUBLIC=1 \
-      -v /path/to/vykar.yaml:/etc/vykar/config.yaml:ro \
-      -v vykar-cache:/cache \
-      ghcr.io/borgbase/vykar
+```bash
+docker run -d \
+  --name vykar-daemon \
+  -p 7575:7575 \
+  -e VYKAR_HTTP_LISTEN=0.0.0.0:7575 \
+  -e VYKAR_HTTP_ALLOW_PUBLIC=1 \
+  -v /path/to/vykar.yaml:/etc/vykar/config.yaml:ro \
+  -v vykar-cache:/cache \
+  ghcr.io/borgbase/vykar
+```
 
 Environment variables recognised by the daemon:
 
@@ -133,10 +153,10 @@ Environment variables recognised by the daemon:
 - Use a named volume for `/cache` to persist the snapshot cache across restarts
 - The `apprise` variant (`ghcr.io/borgbase/vykar:latest-apprise`) includes the Apprise CLI for sending notifications to 100+ services from hooks. See [Notifications with Apprise](configuration.md#notifications-with-apprise).
 - The image includes `curl`, `jq`, and `bash` for use in [hooks](configuration.md#hooks) (e.g. monitoring webhooks, JSON payloads). For additional tools, extend the image:
-      ```dockerfile
-      FROM ghcr.io/borgbase/vykar
-      RUN apk add --no-cache sqlite
-      ```
+  ```dockerfile
+  FROM ghcr.io/borgbase/vykar
+  RUN apk add --no-cache sqlite
+  ```
 - Available for `linux/amd64` and `linux/arm64`
 
 
@@ -144,25 +164,29 @@ Environment variables recognised by the daemon:
 
 An official Ansible role is available for automated deployment on Linux servers:
 
-    ansible-galaxy role install borgbase.vykar
+```bash
+ansible-galaxy role install borgbase.vykar
+```
 
 The `vykar_config` variable accepts your vykar configuration directly as a YAML dict — since both Ansible and vykar use YAML, the config maps one-to-one:
 
-    - hosts: myserver
-      roles:
-        - role: vykar
-          vars:
-            vykar_config:
-              repositories:
-                - url: "/backup/repo"
-              encryption:
-                passphrase: "mysuperduperpassword"
-              sources:
-                - "/home"
-                - "/etc"
-              schedule:
-                enabled: true
-                every: "24h"
+```yaml
+- hosts: myserver
+  roles:
+    - role: vykar
+      vars:
+        vykar_config:
+          repositories:
+            - url: "/backup/repo"
+          encryption:
+            passphrase: "mysuperduperpassword"
+          sources:
+            - "/home"
+            - "/etc"
+          schedule:
+            enabled: true
+            every: "24h"
+```
 
 See the [borgbase.vykar role](https://github.com/borgbase/ansible-role-vykar) for all available variables.
 

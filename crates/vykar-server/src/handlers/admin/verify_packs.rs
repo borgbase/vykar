@@ -155,7 +155,7 @@ fn verify_single_pack(file_path: &std::path::Path, entry: &VerifyPackRequest) ->
 /// buffer sizes to exercise boundary splits.
 #[allow(clippy::too_many_lines)]
 // Bounds for indexing here are enforced by `min(avail.len(), total - filled)`
-// and `header_buf[..8]` length checks; clippy can't prove these.
+// and the fixed `PACK_HEADER_SIZE` buffer length; clippy can't prove these.
 #[allow(clippy::indexing_slicing)]
 fn verify_pack_from_reader<R: std::io::Read>(
     reader: R,

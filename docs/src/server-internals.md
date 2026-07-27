@@ -124,7 +124,6 @@ This complements client-side `vykar check`, which still owns full cryptographic 
 `crates/vykar-storage/src/rest_backend.rs` implements `StorageBackend` with `ureq`. In addition to the trait surface, it exposes helper methods used by client commands:
 
 - `batch_delete()`
-- `stats()`
 - `verify_packs()`
 - `repack()`
 

@@ -145,25 +145,50 @@ pub fn with_repo_lock<T>(
     run_under_fence(repo, guard, action)
 }
 
-/// Shared epilogue for lock-guarded operations: installs a lock fence, runs
-/// the action, performs best-effort cleanup on error, then releases the lock.
+/// Clear the lock fence and release the advisory lock, reporting a failed
+/// release without changing the operation's outcome.
 ///
 /// # Failure policy
 ///
-/// - **Action errors are fatal.** Propagated to the caller as-is; any
-///   subsequent release failure is logged via `tracing::warn!` but does not
-///   replace the original error.
-/// - **Release errors after a successful action are warning-only.** The
-///   action has already committed to storage (e.g. the snapshot blob was
-///   written), so reporting a failure would misrepresent the outcome. A
-///   `tracing::warn!` fires referencing `vykar break-lock` and the 6-hour
-///   stale-lock TTL; the caller receives the action's `Ok` value.
+/// - **After a failed action**, a release failure is `tracing::warn!`-only:
+///   the caller already has a more meaningful error to propagate.
+/// - **After a successful action**, the work is already committed to storage
+///   (e.g. the snapshot blob was written), so a release failure must not be
+///   reported as a failure of the operation. It goes to `on_warning`, which
+///   decides where the user sees it.
 ///
-/// There is no progress sink here, so the release warning is tracing-only —
-/// GUI consumers do not see it. Acceptable trade-off: leaked advisory locks
-/// self-heal in 6 hours and `vykar break-lock` is available for immediate
-/// recovery. Callers that do have a progress sink (backup's commit path)
-/// surface the same warning via `BackupProgressEvent::Warning` instead.
+/// `on_warning` is what lets the two callers differ: `run_under_fence` has no
+/// progress sink and passes `tracing::warn!`, while backup's commit path
+/// passes its `BackupProgressEvent::Warning` emitter so GUI consumers see it
+/// too. Leaked advisory locks self-heal after 6 hours, and `vykar break-lock`
+/// clears them immediately.
+pub(crate) fn clear_fence_and_release(
+    repo: &mut Repository,
+    guard: lock::LockGuard,
+    action_succeeded: bool,
+    on_warning: &mut dyn FnMut(String),
+) {
+    repo.clear_lock_fence();
+    let lock_key = guard.key().to_string();
+    let Err(release_err) = lock::release_lock(repo.storage.as_ref(), guard) else {
+        return;
+    };
+    if !action_succeeded {
+        tracing::warn!("failed to release repository lock: {release_err}");
+        return;
+    }
+    on_warning(format!(
+        "the operation completed successfully, but releasing the repository lock \
+         failed: {release_err}. The advisory lock at `{lock_key}` may persist; \
+         future operations on this repository may be blocked for up to 6 hours \
+         until automatic stale-lock cleanup, or run `vykar break-lock` to clear \
+         it manually."
+    ));
+}
+
+/// Shared epilogue for lock-guarded operations: installs a lock fence, runs
+/// the action, performs best-effort cleanup on error, then releases the lock
+/// via [`clear_fence_and_release`]. Action errors are propagated as-is.
 fn run_under_fence<T>(
     repo: &mut Repository,
     guard: lock::LockGuard,
@@ -178,25 +203,10 @@ fn run_under_fence<T>(
         repo.flush_on_abort();
     }
 
-    repo.clear_lock_fence();
-    let lock_key = guard.key().to_string();
-    match lock::release_lock(repo.storage.as_ref(), guard) {
-        Ok(()) => result,
-        Err(release_err) => {
-            if result.is_err() {
-                tracing::warn!("failed to release repository lock: {release_err}");
-            } else {
-                tracing::warn!(
-                    "operation completed successfully, but releasing the repository lock \
-                     failed: {release_err}. The advisory lock at `{lock_key}` may persist; \
-                     future operations on this repository may be blocked for up to 6 hours \
-                     until automatic stale-lock cleanup, or run `vykar break-lock` to clear \
-                     it manually."
-                );
-            }
-            result
-        }
-    }
+    clear_fence_and_release(repo, guard, result.is_ok(), &mut |msg| {
+        tracing::warn!("{msg}");
+    });
+    result
 }
 
 /// Open a repository and execute a maintenance operation while holding the lock.

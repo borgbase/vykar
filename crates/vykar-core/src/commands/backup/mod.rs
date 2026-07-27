@@ -2,6 +2,7 @@ mod chunk_process;
 mod command_dump;
 mod commit;
 mod concurrency;
+mod drift;
 pub(crate) mod pipeline;
 mod sequential;
 mod source;
@@ -337,6 +338,21 @@ pub(crate) fn with_rollback_checkpoint<R>(
             Err(e)
         }
     }
+}
+
+/// Replace an item's walk-time metadata with the pre-read `fstat`.
+///
+/// Every path that commits file content does this before persisting the
+/// `Item`: the descriptor-based stat is the one the drift checks validated,
+/// so it — not the walk's path-based stat — is what the stored chunks
+/// correspond to.
+pub(crate) fn stamp_item_metadata(item: &mut Item, meta: &fs::MetadataSummary) {
+    item.mode = meta.mode;
+    item.uid = meta.uid;
+    item.gid = meta.gid;
+    item.size = meta.size;
+    item.mtime = meta.mtime_ns;
+    item.ctime = Some(meta.ctime_ns);
 }
 
 pub(crate) fn emit_stats_progress(
@@ -858,30 +874,19 @@ pub fn run_with_progress(
 
         // Deregister session while holding the lock. The guard's Drop stops
         // the heartbeat thread and joins it before the marker is deleted, so
-        // no concurrent refresh_session call can race with this delete.
+        // no concurrent refresh_session call can race with this delete. This
+        // sequencing is why the commit path releases the lock itself instead
+        // of running under `with_repo_lock`.
         drop(session_guard.take());
 
-        repo.clear_lock_fence();
-        let lock_key = guard.key().to_string();
-        match lock::release_lock(repo.storage.as_ref(), guard) {
-            Ok(()) => {}
-            Err(release_err) => {
-                if result.is_ok() {
-                    emit_post_commit_warning(
-                        &mut progress,
-                        format!(
-                            "snapshot was successfully committed, but releasing the \
-                             repository lock failed: {release_err}. The advisory lock at \
-                             `{lock_key}` may persist; future operations on this repository \
-                             may be blocked for up to 6 hours until automatic stale-lock \
-                             cleanup, or run `vykar break-lock` to clear it manually."
-                        ),
-                    );
-                } else {
-                    warn!("failed to release repository lock: {release_err}");
-                }
-            }
-        }
+        crate::commands::util::clear_fence_and_release(
+            &mut repo,
+            guard,
+            result.is_ok(),
+            // Unlike `run_under_fence`, this path has a progress sink, so the
+            // release warning reaches GUI/CLI consumers and not just the log.
+            &mut |msg| emit_post_commit_warning(&mut progress, msg),
+        );
 
         result?;
 

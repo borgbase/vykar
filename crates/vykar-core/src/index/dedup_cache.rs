@@ -1,10 +1,10 @@
 // memmap2::Mmap::map for read-only cache files; SAFETY documented per block.
 #![allow(unsafe_code)]
-// Wire-format reads against header-validated cache files. Every reader checks
-// `mmap.len() >= HEADER_SIZE` and validates `entry_count` matches the file
-// size before slicing into entries; out-of-bounds is therefore unreachable
-// for well-formed input. Corrupted input is filtered upstream by magic /
-// version / generation checks (callers fall back to a cache miss on `None`).
+// Wire-format reads against header-validated cache files. `open_validated`
+// checks `mmap.len() >= header_size` and requires the file length to equal
+// the (overflow-checked) size the header's `entry_count` implies, so entry
+// slicing is in bounds for *any* input that reaches a reader, corrupt or
+// not — a header that doesn't add up is a cache miss (`None`) instead.
 #![allow(clippy::indexing_slicing)]
 
 use super::hasher::ChunkIdHashMap;
@@ -32,6 +32,227 @@ fn read_u64_le(bytes: [u8; 8]) -> u64 {
     u64::from_le_bytes(bytes)
 }
 
+// ---------------------------------------------------------------------------
+// Shared sorted-cache scaffolding
+// ---------------------------------------------------------------------------
+
+/// Static description of one sorted, fixed-entry cache file format.
+///
+/// All three mmap'd caches (dedup, restore, full index) share the same
+/// 28-byte header — magic(8), version(4), generation(8), entry_count(4),
+/// reserved(4) — followed by an array of fixed-size entries, each starting
+/// with a 32-byte `ChunkId`, sorted by those bytes. `trailer_size` covers the
+/// full index cache's 32-byte checksum; the other two have no trailer.
+struct CacheSpec {
+    magic: &'static [u8; 8],
+    version: u32,
+    header_size: usize,
+    entry_size: usize,
+    trailer_size: usize,
+    /// Prefix used in the `debug!` miss messages, e.g. `"dedup cache"`.
+    label: &'static str,
+}
+
+/// A cache file that passed [`CacheSpec::open_validated`].
+struct ValidatedCache {
+    mmap: Mmap,
+    entry_count: u32,
+    generation: u64,
+}
+
+impl CacheSpec {
+    /// Total on-disk size a cache holding `entry_count` entries must have.
+    ///
+    /// Checked throughout: `entry_count` comes from the file header, so it is
+    /// corruption-controlled input. On a 32-bit host `1 << 30` dedup entries
+    /// times the 36-byte entry size wraps to exactly 0, which would let a
+    /// header-only file pass the size check in `open_validated` and leave
+    /// every subsequent entry slice out of bounds. `None` means the header
+    /// describes a file that cannot exist — a malformed cache, i.e. a miss.
+    fn framed_size(&self, entry_count: u32) -> Option<usize> {
+        (entry_count as usize)
+            .checked_mul(self.entry_size)?
+            .checked_add(self.header_size)?
+            .checked_add(self.trailer_size)
+    }
+
+    /// Open, memory-map, and header-validate a cache file.
+    ///
+    /// Returns `None` on any mismatch (missing file, wrong magic / version /
+    /// generation, unexpected file size) — every caller treats that as a
+    /// cache miss and falls back to its slow path. Content-level validation
+    /// (the full index cache's checksum trailer) stays with the caller; this
+    /// only guarantees the file's framing is what the spec describes.
+    fn open_validated(&self, path: &Path, expected_generation: u64) -> Option<ValidatedCache> {
+        // Generation 0 means "no cache ever written".
+        if expected_generation == 0 {
+            return None;
+        }
+
+        let file = std::fs::File::open(path).ok()?;
+
+        // SAFETY: the mapping is read-only — we never write through it — and
+        // the mapped file must not be modified in place for its lifetime.
+        // That is the invariant every writer in this module upholds without
+        // exception: each one builds a sibling temp file and `rename`s it
+        // over the target, which swaps the directory entry and leaves this
+        // inode untouched for as long as we hold it open. Any writer added
+        // here must do the same. Today that is `write_sorted_cache` (dedup
+        // and restore), `build_full_index_cache_to_path`,
+        // `merge_full_index_cache`, and the two streaming derivations
+        // `build_dedup_cache_from_full_cache` /
+        // `build_restore_cache_from_full_cache`. A vykar process racing
+        // another vykar process therefore only ever reads a *stale* mapping,
+        // which the generation check turns into a cache miss.
+        //
+        // In-place truncation by something outside vykar (a stray editor, a
+        // `>` redirect) would fault on access — no amount of bounds checking
+        // can prevent that, so these files are documented as vykar-owned.
+        // They live under the per-repo cache dir and are always rebuildable.
+        let mmap = unsafe { Mmap::map(&file) }.ok()?;
+
+        let label = self.label;
+        if mmap.len() < self.header_size {
+            debug!("{label}: file too small for header");
+            return None;
+        }
+
+        if &mmap[0..8] != self.magic {
+            debug!("{label}: bad magic");
+            return None;
+        }
+
+        // The header_size check above guarantees these fixed-offset slices.
+        let version = read_u32_le(mmap[8..12].try_into().expect("4-byte slice from header"));
+        if version != self.version {
+            debug!(version, "{label}: unsupported version");
+            return None;
+        }
+
+        let generation = read_u64_le(mmap[12..20].try_into().expect("8-byte slice from header"));
+        if generation != expected_generation {
+            debug!(
+                cache_gen = generation,
+                expected_gen = expected_generation,
+                "{label}: generation mismatch"
+            );
+            return None;
+        }
+
+        let entry_count = read_u32_le(mmap[20..24].try_into().expect("4-byte slice from header"));
+
+        let expected_size = self.framed_size(entry_count);
+        if Some(mmap.len()) != expected_size {
+            debug!(
+                actual = mmap.len(),
+                expected = ?expected_size,
+                "{label}: file size mismatch"
+            );
+            return None;
+        }
+
+        debug!(entries = entry_count, generation, "opened {label}");
+
+        Some(ValidatedCache {
+            mmap,
+            entry_count,
+            generation,
+        })
+    }
+
+    /// Binary search the sorted entry array for `chunk_id`.
+    ///
+    /// Returns the matching entry's full byte slice (the 32-byte `ChunkId`
+    /// prefix included); callers decode their own payload fields from it.
+    fn find_entry<'a>(
+        &self,
+        mmap: &'a Mmap,
+        entry_count: u32,
+        chunk_id: &ChunkId,
+    ) -> Option<&'a [u8]> {
+        if entry_count == 0 {
+            return None;
+        }
+
+        let target = chunk_id.as_bytes();
+        let data = &mmap[self.header_size..];
+
+        let mut lo: usize = 0;
+        let mut hi: usize = entry_count as usize;
+
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let offset = mid * self.entry_size;
+            let entry = &data[offset..offset + self.entry_size];
+
+            match entry[..32].cmp(target.as_slice()) {
+                std::cmp::Ordering::Equal => return Some(entry),
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+            }
+        }
+
+        None
+    }
+}
+
+/// Write the shared 28-byte cache header.
+fn write_cache_header(
+    w: &mut BufWriter<std::fs::File>,
+    spec: &CacheSpec,
+    generation: u64,
+    entry_count: u32,
+) -> Result<()> {
+    w.write_all(spec.magic)?;
+    w.write_all(&spec.version.to_le_bytes())?;
+    w.write_all(&generation.to_le_bytes())?;
+    w.write_all(&entry_count.to_le_bytes())?;
+    w.write_all(&0u32.to_le_bytes())?; // reserved
+    Ok(())
+}
+
+/// Write a trailer-less sorted cache file atomically (temp file + rename),
+/// streaming entries through a `BufWriter` so the output is never fully
+/// materialized in memory.
+///
+/// Shared by the dedup and restore writers. The full index cache writer is
+/// deliberately *not* routed through here: it folds a running BLAKE2b
+/// checksum into every entry write and appends it as a trailer.
+fn write_sorted_cache<T>(
+    spec: &CacheSpec,
+    path: &Path,
+    generation: u64,
+    entries: &[T],
+    mut write_entry: impl FnMut(&mut BufWriter<std::fs::File>, &T) -> Result<()>,
+) -> Result<()> {
+    debug_assert_eq!(spec.trailer_size, 0, "write_sorted_cache writes no trailer");
+
+    let entry_count = entries.len() as u32;
+
+    let tmp_path = path.with_extension("tmp");
+    let file = std::fs::File::create(&tmp_path)?;
+    let mut w = BufWriter::new(file);
+
+    write_cache_header(&mut w, spec, generation, entry_count)?;
+    for entry in entries {
+        write_entry(&mut w, entry)?;
+    }
+
+    w.flush()?;
+    drop(w);
+
+    // Atomic rename into place.
+    std::fs::rename(&tmp_path, path)?;
+
+    debug!(
+        entries = entry_count,
+        path = %path.display(),
+        "wrote {}", spec.label
+    );
+
+    Ok(())
+}
+
 /// Magic bytes at the start of the dedup cache file.
 // Wire-format constant — DO NOT rename (backward compatibility)
 const MAGIC: &[u8; 8] = b"VGDEDUP\0";
@@ -44,6 +265,15 @@ const HEADER_SIZE: usize = 28;
 
 /// Size of each entry: 32-byte ChunkId + 4-byte stored_size.
 const ENTRY_SIZE: usize = 36;
+
+const DEDUP_SPEC: CacheSpec = CacheSpec {
+    magic: MAGIC,
+    version: VERSION,
+    header_size: HEADER_SIZE,
+    entry_size: ENTRY_SIZE,
+    trailer_size: 0,
+    label: "dedup cache",
+};
 
 // ---------------------------------------------------------------------------
 // Path helper
@@ -85,40 +315,17 @@ pub fn build_dedup_cache_to_path(index: &ChunkIndex, generation: u64, path: &Pat
         .collect();
     entries.sort_unstable_by_key(|a| *a.0.as_bytes());
 
-    let entry_count = entries.len() as u32;
-
-    // Stream directly to a temp file via BufWriter to avoid a second
-    // in-memory copy of the entire output.
-    let tmp_path = path.with_extension("tmp");
-    let file = std::fs::File::create(&tmp_path)?;
-    let mut w = BufWriter::new(file);
-
-    // Header
-    w.write_all(MAGIC)?;
-    w.write_all(&VERSION.to_le_bytes())?;
-    w.write_all(&generation.to_le_bytes())?;
-    w.write_all(&entry_count.to_le_bytes())?;
-    w.write_all(&0u32.to_le_bytes())?; // reserved
-
-    // Entries
-    for (chunk_id, stored_size) in &entries {
-        w.write_all(chunk_id.as_bytes())?;
-        w.write_all(&stored_size.to_le_bytes())?;
-    }
-
-    w.flush()?;
-    drop(w);
-
-    // Atomic rename into place.
-    std::fs::rename(&tmp_path, path)?;
-
-    debug!(
-        entries = entry_count,
-        path = %path.display(),
-        "wrote dedup cache"
-    );
-
-    Ok(())
+    write_sorted_cache(
+        &DEDUP_SPEC,
+        path,
+        generation,
+        &entries,
+        |w, (chunk_id, stored_size)| {
+            w.write_all(chunk_id.as_bytes())?;
+            w.write_all(&stored_size.to_le_bytes())?;
+            Ok(())
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -153,109 +360,22 @@ impl MmapDedupCache {
 
     /// Open and validate a dedup cache file at an explicit path (used by tests).
     pub fn open_path(path: &Path, expected_generation: u64) -> Option<Self> {
-        if expected_generation == 0 {
-            return None;
-        }
-
-        let file = std::fs::File::open(path).ok()?;
-
-        // SAFETY: the cache file is treated as read-only — we only read from
-        // the mapping, never write through it. Concurrent modification by
-        // another process would only invalidate cache entries (a recoverable
-        // condition), not produce undefined behavior at the Rust level: we
-        // bound-check every slice access and treat decode failures as a cache
-        // miss.
-        let mmap = unsafe { Mmap::map(&file) }.ok()?;
-
-        if mmap.len() < HEADER_SIZE {
-            debug!("dedup cache: file too small for header");
-            return None;
-        }
-
-        // Validate magic
-        if &mmap[0..8] != MAGIC {
-            debug!("dedup cache: bad magic");
-            return None;
-        }
-
-        // Validate version. HEADER_SIZE check above guarantees these slices.
-        let version = read_u32_le(mmap[8..12].try_into().expect("4-byte slice from header"));
-        if version != VERSION {
-            debug!(version, "dedup cache: unsupported version");
-            return None;
-        }
-
-        // Validate generation
-        let index_generation =
-            read_u64_le(mmap[12..20].try_into().expect("8-byte slice from header"));
-        if index_generation != expected_generation {
-            debug!(
-                cache_gen = index_generation,
-                expected_gen = expected_generation,
-                "dedup cache: generation mismatch"
-            );
-            return None;
-        }
-
-        let entry_count = read_u32_le(mmap[20..24].try_into().expect("4-byte slice from header"));
-
-        // Validate file size
-        let expected_size = HEADER_SIZE + (entry_count as usize) * ENTRY_SIZE;
-        if mmap.len() != expected_size {
-            debug!(
-                actual = mmap.len(),
-                expected = expected_size,
-                "dedup cache: file size mismatch"
-            );
-            return None;
-        }
-
-        debug!(
-            entries = entry_count,
-            generation = index_generation,
-            "opened dedup cache"
-        );
-
+        let validated = DEDUP_SPEC.open_validated(path, expected_generation)?;
         Some(Self {
-            mmap,
-            entry_count,
-            index_generation,
+            mmap: validated.mmap,
+            entry_count: validated.entry_count,
+            index_generation: validated.generation,
         })
     }
 
     /// Look up a chunk ID using binary search. Returns the stored_size if found.
     pub fn get_stored_size(&self, chunk_id: &ChunkId) -> Option<u32> {
-        if self.entry_count == 0 {
-            return None;
-        }
-
-        let target = chunk_id.as_bytes();
-        let data = &self.mmap[HEADER_SIZE..];
-
-        let mut lo: usize = 0;
-        let mut hi: usize = self.entry_count as usize;
-
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            let offset = mid * ENTRY_SIZE;
-            let entry_id = &data[offset..offset + 32];
-
-            match entry_id.cmp(target.as_slice()) {
-                std::cmp::Ordering::Equal => {
-                    let size_offset = offset + 32;
-                    let stored_size = read_u32_le(
-                        data[size_offset..size_offset + 4]
-                            .try_into()
-                            .expect("4-byte slice within validated entry"),
-                    );
-                    return Some(stored_size);
-                }
-                std::cmp::Ordering::Less => lo = mid + 1,
-                std::cmp::Ordering::Greater => hi = mid,
-            }
-        }
-
-        None
+        let entry = DEDUP_SPEC.find_entry(&self.mmap, self.entry_count, chunk_id)?;
+        Some(read_u32_le(
+            entry[32..36]
+                .try_into()
+                .expect("4-byte slice within validated entry"),
+        ))
     }
 
     /// Return the index_generation from the cache header.
@@ -434,6 +554,15 @@ const RESTORE_HEADER_SIZE: usize = 28;
 /// 32-byte ChunkId + 4-byte stored_size + 32-byte PackId + 8-byte pack_offset.
 const RESTORE_ENTRY_SIZE: usize = 76;
 
+const RESTORE_SPEC: CacheSpec = CacheSpec {
+    magic: RESTORE_MAGIC,
+    version: RESTORE_VERSION,
+    header_size: RESTORE_HEADER_SIZE,
+    entry_size: RESTORE_ENTRY_SIZE,
+    trailer_size: 0,
+    label: "restore cache",
+};
+
 /// Return the local filesystem path for the restore cache file.
 pub fn restore_cache_path(repo_id: &[u8], cache_dir: Option<&Path>) -> Option<PathBuf> {
     repo_cache_dir(repo_id, cache_dir).map(|d| d.join("restore_cache"))
@@ -465,39 +594,19 @@ pub fn build_restore_cache_to_path(index: &ChunkIndex, generation: u64, path: &P
         .collect();
     entries.sort_unstable_by_key(|a| *a.0.as_bytes());
 
-    let entry_count = entries.len() as u32;
-
-    let tmp_path = path.with_extension("tmp");
-    let file = std::fs::File::create(&tmp_path)?;
-    let mut w = BufWriter::new(file);
-
-    // Header
-    w.write_all(RESTORE_MAGIC)?;
-    w.write_all(&RESTORE_VERSION.to_le_bytes())?;
-    w.write_all(&generation.to_le_bytes())?;
-    w.write_all(&entry_count.to_le_bytes())?;
-    w.write_all(&0u32.to_le_bytes())?; // reserved
-
-    // Entries
-    for (chunk_id, stored_size, pack_id, pack_offset) in &entries {
-        w.write_all(chunk_id.as_bytes())?;
-        w.write_all(&stored_size.to_le_bytes())?;
-        w.write_all(pack_id.as_bytes())?;
-        w.write_all(&pack_offset.to_le_bytes())?;
-    }
-
-    w.flush()?;
-    drop(w);
-
-    std::fs::rename(&tmp_path, path)?;
-
-    debug!(
-        entries = entry_count,
-        path = %path.display(),
-        "wrote restore cache"
-    );
-
-    Ok(())
+    write_sorted_cache(
+        &RESTORE_SPEC,
+        path,
+        generation,
+        &entries,
+        |w, (chunk_id, stored_size, pack_id, pack_offset)| {
+            w.write_all(chunk_id.as_bytes())?;
+            w.write_all(&stored_size.to_le_bytes())?;
+            w.write_all(pack_id.as_bytes())?;
+            w.write_all(&pack_offset.to_le_bytes())?;
+            Ok(())
+        },
+    )
 }
 
 /// Memory-mapped reader over the sorted restore cache binary file.
@@ -525,107 +634,30 @@ impl MmapRestoreCache {
 
     /// Open and validate a restore cache file at an explicit path (used by tests).
     pub fn open_path(path: &Path, expected_generation: u64) -> Option<Self> {
-        if expected_generation == 0 {
-            return None;
-        }
-
-        let file = std::fs::File::open(path).ok()?;
-
-        // SAFETY: read-only map of an atomically-written cache file (temp +
-        // rename). Concurrent modification by another process can only
-        // invalidate cache entries; all reads are bound-checked and decode
-        // failures fall back to a cache miss.
-        let mmap = unsafe { Mmap::map(&file) }.ok()?;
-
-        if mmap.len() < RESTORE_HEADER_SIZE {
-            debug!("restore cache: file too small for header");
-            return None;
-        }
-
-        if &mmap[0..8] != RESTORE_MAGIC {
-            debug!("restore cache: bad magic");
-            return None;
-        }
-
-        let version = read_u32_le(mmap[8..12].try_into().expect("4-byte slice from header"));
-        if version != RESTORE_VERSION {
-            debug!(version, "restore cache: unsupported version");
-            return None;
-        }
-
-        let index_generation =
-            read_u64_le(mmap[12..20].try_into().expect("8-byte slice from header"));
-        if index_generation != expected_generation {
-            debug!(
-                cache_gen = index_generation,
-                expected_gen = expected_generation,
-                "restore cache: generation mismatch"
-            );
-            return None;
-        }
-
-        let entry_count = read_u32_le(mmap[20..24].try_into().expect("4-byte slice from header"));
-
-        let expected_size = RESTORE_HEADER_SIZE + (entry_count as usize) * RESTORE_ENTRY_SIZE;
-        if mmap.len() != expected_size {
-            debug!(
-                actual = mmap.len(),
-                expected = expected_size,
-                "restore cache: file size mismatch"
-            );
-            return None;
-        }
-
-        debug!(
-            entries = entry_count,
-            generation = index_generation,
-            "opened restore cache"
-        );
-
-        Some(Self { mmap, entry_count })
+        let validated = RESTORE_SPEC.open_validated(path, expected_generation)?;
+        Some(Self {
+            mmap: validated.mmap,
+            entry_count: validated.entry_count,
+        })
     }
 
     /// Look up a chunk ID using binary search.
     /// Returns `(pack_id, pack_offset, stored_size)` if found.
     pub fn lookup(&self, chunk_id: &ChunkId) -> Option<(PackId, u64, u32)> {
-        if self.entry_count == 0 {
-            return None;
-        }
-
-        let target = chunk_id.as_bytes();
-        let data = &self.mmap[RESTORE_HEADER_SIZE..];
-
-        let mut lo: usize = 0;
-        let mut hi: usize = self.entry_count as usize;
-
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            let offset = mid * RESTORE_ENTRY_SIZE;
-            let entry_id = &data[offset..offset + 32];
-
-            match entry_id.cmp(target.as_slice()) {
-                std::cmp::Ordering::Equal => {
-                    let stored_size = read_u32_le(
-                        data[offset + 32..offset + 36]
-                            .try_into()
-                            .expect("4-byte slice within validated entry"),
-                    );
-                    let mut pack_bytes = [0u8; 32];
-                    pack_bytes.copy_from_slice(&data[offset + 36..offset + 68]);
-                    let pack_id = PackId::from_bytes(pack_bytes);
-                    let pack_offset = read_u64_le(
-                        data[offset + 68..offset + 76]
-                            .try_into()
-                            .expect("8-byte slice within validated entry"),
-                    );
-                    return Some((pack_id, pack_offset, stored_size));
-                }
-                std::cmp::Ordering::Less => lo = mid + 1,
-                std::cmp::Ordering::Greater => hi = mid,
-            }
-        }
-
-        None
+        let entry = RESTORE_SPEC.find_entry(&self.mmap, self.entry_count, chunk_id)?;
+        let stored_size = read_u32_le(
+            entry[32..36]
+                .try_into()
+                .expect("4-byte slice within validated entry"),
+        );
+        let mut pack_bytes = [0u8; 32];
+        pack_bytes.copy_from_slice(&entry[36..68]);
+        let pack_offset = read_u64_le(
+            entry[68..76]
+                .try_into()
+                .expect("8-byte slice within validated entry"),
+        );
+        Some((PackId::from_bytes(pack_bytes), pack_offset, stored_size))
     }
 
     /// Return the number of entries in the cache.
@@ -660,6 +692,15 @@ const FULL_ENTRY_SIZE: usize = 80;
 /// entry, verified in `open_path` to detect silent corruption of the plaintext
 /// cache before it is promoted to the authoritative remote index.
 const FULL_CHECKSUM_SIZE: usize = 32;
+
+const FULL_SPEC: CacheSpec = CacheSpec {
+    magic: FULL_MAGIC,
+    version: FULL_VERSION,
+    header_size: FULL_HEADER_SIZE,
+    entry_size: FULL_ENTRY_SIZE,
+    trailer_size: FULL_CHECKSUM_SIZE,
+    label: "full index cache",
+};
 
 /// Return the local filesystem path for the full index cache file.
 pub fn full_index_cache_path(repo_id: &[u8], cache_dir: Option<&Path>) -> Option<PathBuf> {
@@ -699,60 +740,15 @@ impl MmapFullIndexCache {
 
     /// Open and validate at an explicit path (used by tests).
     pub fn open_path(path: &Path, expected_generation: u64) -> Option<Self> {
-        if expected_generation == 0 {
-            return None;
-        }
-
-        let file = std::fs::File::open(path).ok()?;
-        // SAFETY: read-only map of an atomically-written cache file. See
-        // the dedup-cache `open_path` SAFETY comment for the full argument;
-        // the same invariants hold here (bounded reads, miss on corruption).
-        let mmap = unsafe { Mmap::map(&file) }.ok()?;
-
-        if mmap.len() < FULL_HEADER_SIZE {
-            debug!("full index cache: file too small for header");
-            return None;
-        }
-
-        if &mmap[0..8] != FULL_MAGIC {
-            debug!("full index cache: bad magic");
-            return None;
-        }
-
-        let version = read_u32_le(mmap[8..12].try_into().expect("4-byte slice from header"));
-        if version != FULL_VERSION {
-            debug!(version, "full index cache: unsupported version");
-            return None;
-        }
-
-        let index_generation =
-            read_u64_le(mmap[12..20].try_into().expect("8-byte slice from header"));
-        if index_generation != expected_generation {
-            debug!(
-                cache_gen = index_generation,
-                expected_gen = expected_generation,
-                "full index cache: generation mismatch"
-            );
-            return None;
-        }
-
-        let entry_count = read_u32_le(mmap[20..24].try_into().expect("4-byte slice from header"));
-
-        let expected_size =
-            FULL_HEADER_SIZE + (entry_count as usize) * FULL_ENTRY_SIZE + FULL_CHECKSUM_SIZE;
-        if mmap.len() != expected_size {
-            debug!(
-                actual = mmap.len(),
-                expected = expected_size,
-                "full index cache: file size mismatch"
-            );
-            return None;
-        }
+        let validated = FULL_SPEC.open_validated(path, expected_generation)?;
+        let mmap = validated.mmap;
 
         // Verify the content checksum over the entry region. This is the
         // integrity gate that lets the fast-path commit promote these
         // plaintext local bytes to the authoritative remote index: a bit flip
-        // anywhere in the entries changes the digest and misses here.
+        // anywhere in the entries changes the digest and misses here. Framing
+        // (including the trailer's presence) was already validated by
+        // `open_validated`; only this cache has content to verify.
         let entries_end = mmap.len() - FULL_CHECKSUM_SIZE;
         let mut hasher = Blake2bVar::new(FULL_CHECKSUM_SIZE).expect("valid output size");
         Update::update(&mut hasher, &mmap[FULL_HEADER_SIZE..entries_end]);
@@ -765,13 +761,10 @@ impl MmapFullIndexCache {
             return None;
         }
 
-        debug!(
-            entries = entry_count,
-            generation = index_generation,
-            "opened full index cache"
-        );
-
-        Some(Self { mmap, entry_count })
+        Some(Self {
+            mmap,
+            entry_count: validated.entry_count,
+        })
     }
 
     /// Return the number of entries.
@@ -863,12 +856,7 @@ fn write_full_header(
     generation: u64,
     entry_count: u32,
 ) -> Result<()> {
-    w.write_all(FULL_MAGIC)?;
-    w.write_all(&FULL_VERSION.to_le_bytes())?;
-    w.write_all(&generation.to_le_bytes())?;
-    w.write_all(&entry_count.to_le_bytes())?;
-    w.write_all(&0u32.to_le_bytes())?; // reserved
-    Ok(())
+    write_cache_header(w, &FULL_SPEC, generation, entry_count)
 }
 
 /// Build the full index cache from a ChunkIndex HashMap.
@@ -1387,6 +1375,27 @@ pub fn write_index_blob_cache(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A header whose `entry_count` describes a file that cannot exist must
+    /// report no valid size rather than wrapping into a plausible one — on a
+    /// 32-bit host the real `DEDUP_SPEC` wraps to 0 at `1 << 30` entries,
+    /// which would validate a header-only file and leave every entry slice
+    /// out of bounds. Reproduced here with an oversized entry size so the
+    /// overflow is exercised on any word size.
+    #[test]
+    fn framed_size_rejects_overflowing_entry_counts() {
+        let spec = CacheSpec {
+            entry_size: usize::MAX / 2,
+            ..DEDUP_SPEC
+        };
+        assert_eq!(spec.framed_size(0), Some(HEADER_SIZE));
+        assert_eq!(spec.framed_size(1), Some(HEADER_SIZE + usize::MAX / 2));
+        assert_eq!(spec.framed_size(2), None, "entries alone overflow");
+        assert_eq!(
+            DEDUP_SPEC.framed_size(3),
+            Some(HEADER_SIZE + 3 * ENTRY_SIZE)
+        );
+    }
 
     #[test]
     fn chunk_id_to_u64_extracts_first_8_bytes() {

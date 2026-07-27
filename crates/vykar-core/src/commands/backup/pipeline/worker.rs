@@ -8,23 +8,21 @@
 //! `Skipped` / `SegmentSkipped` variants here so the consumer can count
 //! them without aborting the whole backup.
 
-use std::io::Read;
 use std::path::Path;
 
 use tracing::warn;
 
-use crate::chunker;
 use crate::compress::Compression;
 use crate::config::ChunkerConfig;
-use crate::limits::{self, ByteRateLimiter};
+use crate::limits::ByteRateLimiter;
 use crate::platform::fs;
 use vykar_crypto::CryptoEngine;
 use vykar_types::chunk_id::ChunkId;
-use vykar_types::error::{Result, VykarError};
+use vykar_types::error::Result;
 
 use super::super::chunk_process::classify_chunk;
 use super::super::concurrency::{BudgetGuard, ByteBudget};
-use super::super::read_source::BackupSource;
+use super::super::drift::{open_checked, read_range_drift_checked, ReadPlan};
 use super::super::walk::WalkEntry;
 use super::ProcessedEntry;
 
@@ -78,103 +76,33 @@ pub(super) fn process_file_worker(
                 // error safety — if we `?`-bail, the guard drops and releases bytes.
                 let guard = BudgetGuard::from_pre_acquired(budget, pre_acquired_bytes);
 
-                let mut source = BackupSource::open(Path::new(&abs_path)).map_err(VykarError::Io)?;
-                let pre_meta = fs::fstat_summary(source.file()).map_err(VykarError::Io)?;
-
-                // Walk-to-open drift check — catches pre-open mutation and
-                // rename-atop (device+inode differ).
-                if !fs::metadata_matches(&pre_meta, &metadata) {
-                    return Err(VykarError::FileChangedDuringRead {
-                        path: abs_path.clone(),
-                        dataless: pre_meta.is_dataless,
-                    });
-                }
+                let (mut source, pre_meta) = open_checked(Path::new(&abs_path), &metadata)?;
 
                 // Small file (< min_chunk_size): read whole, single chunk.
-                if pre_meta.size < chunker_config.min_size as u64 {
-                    // On 32-bit hosts a `u64 -> usize` cast would silently truncate
-                    // a multi-GiB file's pre-allocation; refuse upfront.
-                    let cap = usize::try_from(pre_meta.size).map_err(|_| {
-                        VykarError::Other(format!(
-                            "file {abs_path} too large for this platform: {} bytes",
-                            pre_meta.size,
-                        ))
-                    })?;
-                    let mut data = Vec::with_capacity(cap);
-                    // Hard-cap at pre_meta.size + 1 so an intra-read append can't
-                    // grow `data` past budget; the +1 sentinel trips the post-read
-                    // `data.len() != pre_meta.size` drift check below.
-                    let mut reader = (&mut source).take(pre_meta.size + 1);
-                    if let Some(limiter) = read_limiter {
-                        limits::LimitedReader::new(reader, Some(limiter))
-                            .read_to_end(&mut data)
-                            .map_err(VykarError::Io)?;
-                    } else {
-                        reader.read_to_end(&mut data).map_err(VykarError::Io)?;
-                    }
+                let (plan, capacity) = if pre_meta.size < chunker_config.min_size as u64 {
+                    (ReadPlan::Whole, 1)
+                } else {
+                    (
+                        ReadPlan::Chunked,
+                        estimate_chunk_count(pre_meta.size, chunker_config.avg_size),
+                    )
+                };
 
-                    let post_meta = fs::fstat_summary(source.file()).map_err(VykarError::Io)?;
-                    if !fs::metadata_matches(&pre_meta, &post_meta)
-                        || data.len() as u64 != pre_meta.size
-                    {
-                        return Err(VykarError::FileChangedDuringRead {
-                            path: abs_path.clone(),
-                            dataless: post_meta.is_dataless,
-                        });
-                    }
-
-                    let chunk_id = ChunkId::compute(chunk_id_key, &data);
-                    let worker_chunk =
-                        classify_chunk(chunk_id, data, dedup_filter, compression, crypto)?;
-
-                    let acquired_bytes = guard.defuse();
-                    return Ok((pre_meta, vec![worker_chunk], acquired_bytes));
-                }
-
-                // Medium file: read, chunk via FastCDC, then hash → classify each chunk.
-                let mut total_bytes: u64 = 0;
-                let mut worker_chunks = Vec::with_capacity(estimate_chunk_count(
-                    pre_meta.size,
-                    chunker_config.avg_size,
-                ));
-                {
-                    // Hard-cap at pre_meta.size + 1 so an intra-read append can't
-                    // feed unbounded bytes through the chunker/classifier; the +1
-                    // sentinel trips the post-read `total_bytes != pre_meta.size`
-                    // drift check below.
-                    let reader = (&mut source).take(pre_meta.size + 1);
-                    let chunk_stream = chunker::chunk_stream(
-                        limits::LimitedReader::new(reader, read_limiter),
-                        chunker_config,
-                    );
-
-                    for chunk_result in chunk_stream {
-                        let chunk = chunk_result.map_err(|e| match e {
-                            fastcdc::v2020::Error::IoError(ioe) => VykarError::Io(ioe),
-                            other => VykarError::Other(format!(
-                                "chunking failed for {abs_path}: {other}"
-                            )),
-                        })?;
-
-                        total_bytes = total_bytes.saturating_add(chunk.data.len() as u64);
-                        let chunk_id = ChunkId::compute(chunk_id_key, &chunk.data);
-                        worker_chunks.push(classify_chunk(
-                            chunk_id,
-                            chunk.data,
-                            dedup_filter,
-                            compression,
-                            crypto,
-                        )?);
-                    }
-                }
-
-                let post_meta = fs::fstat_summary(source.file()).map_err(VykarError::Io)?;
-                if !fs::metadata_matches(&pre_meta, &post_meta) || total_bytes != pre_meta.size {
-                    return Err(VykarError::FileChangedDuringRead {
-                        path: abs_path.clone(),
-                        dataless: post_meta.is_dataless,
-                    });
-                }
+                let mut worker_chunks = Vec::with_capacity(capacity);
+                read_range_drift_checked(
+                    &mut source,
+                    &abs_path,
+                    &pre_meta,
+                    plan,
+                    chunker_config,
+                    read_limiter,
+                    |data| {
+                        let chunk_id = ChunkId::compute(chunk_id_key, &data);
+                        worker_chunks
+                            .push(classify_chunk(chunk_id, data, dedup_filter, compression, crypto)?);
+                        Ok(())
+                    },
+                )?;
 
                 let acquired_bytes = guard.defuse();
                 Ok((pre_meta, worker_chunks, acquired_bytes))
@@ -212,60 +140,28 @@ pub(super) fn process_file_worker(
             let work = (|| -> Result<(fs::MetadataSummary, Vec<super::super::chunk_process::WorkerChunk>, usize)> {
                 let guard = BudgetGuard::from_pre_acquired(budget, pre_acquired_bytes);
 
-                let mut source =
-                    BackupSource::open(Path::new(&*abs_path)).map_err(VykarError::Io)?;
-                let pre_meta = fs::fstat_summary(source.file()).map_err(VykarError::Io)?;
-
-                // Walk-to-open drift check. Segmented reads are a plan driven
-                // by walk-time size (`num_segments`/`offset`/`len`). Any drift
-                // invalidates the plan — skip the segment.
-                if !fs::metadata_matches(&pre_meta, &metadata) {
-                    return Err(VykarError::FileChangedDuringRead {
-                        path: abs_path.to_string(),
-                        dataless: pre_meta.is_dataless,
-                    });
-                }
-
-                source.seek_from_start(offset).map_err(VykarError::Io)?;
+                // Segmented reads are a plan driven by walk-time size
+                // (`num_segments`/`offset`/`len`). Any drift — before or
+                // during the read — invalidates the plan, so the segment is
+                // skipped and the consumer rolls back its siblings.
+                let (mut source, pre_meta) = open_checked(Path::new(&*abs_path), &metadata)?;
 
                 let mut worker_chunks =
                     Vec::with_capacity(estimate_chunk_count(len, chunker_config.avg_size));
-                {
-                    let reader = (&mut source).take(len);
-                    let chunk_stream = chunker::chunk_stream(
-                        limits::LimitedReader::new(reader, read_limiter),
-                        chunker_config,
-                    );
-
-                    for chunk_result in chunk_stream {
-                        let chunk = chunk_result.map_err(|e| match e {
-                            fastcdc::v2020::Error::IoError(ioe) => VykarError::Io(ioe),
-                            other => VykarError::Other(format!(
-                                "chunking failed for {abs_path}: {other}"
-                            )),
-                        })?;
-
-                        let chunk_id = ChunkId::compute(chunk_id_key, &chunk.data);
-                        worker_chunks.push(classify_chunk(
-                            chunk_id,
-                            chunk.data,
-                            dedup_filter,
-                            compression,
-                            crypto,
-                        )?);
-                    }
-                }
-
-                // Intra-segment drift check. `file.take(len)` legitimately stops
-                // short, so we don't short-read-guard; the post-fstat catches
-                // mutation of size/mtime/ctime/device/inode.
-                let post_meta = fs::fstat_summary(source.file()).map_err(VykarError::Io)?;
-                if !fs::metadata_matches(&pre_meta, &post_meta) {
-                    return Err(VykarError::FileChangedDuringRead {
-                        path: abs_path.to_string(),
-                        dataless: post_meta.is_dataless,
-                    });
-                }
+                read_range_drift_checked(
+                    &mut source,
+                    &abs_path,
+                    &pre_meta,
+                    ReadPlan::Segment { offset, len },
+                    chunker_config,
+                    read_limiter,
+                    |data| {
+                        let chunk_id = ChunkId::compute(chunk_id_key, &data);
+                        worker_chunks
+                            .push(classify_chunk(chunk_id, data, dedup_filter, compression, crypto)?);
+                        Ok(())
+                    },
+                )?;
 
                 let acquired_bytes = guard.defuse();
                 Ok((pre_meta, worker_chunks, acquired_bytes))

@@ -30,7 +30,7 @@ pub fn try_cleanup_deleted_snapshot_refs(
 ) -> Option<SnapshotChunkImpact> {
     let result = (|| -> Result<SnapshotChunkImpact> {
         let items_stream = list::load_item_stream_from_ptrs(repo, item_ptrs)?;
-        decrement_snapshot_chunk_refs(repo, &items_stream, item_ptrs)
+        decrement_chunk_refs_on_index(repo.chunk_index_mut(), &items_stream, item_ptrs)
     })();
     match result {
         Ok(impact) => Some(impact),
@@ -90,11 +90,30 @@ pub fn decrement_chunk_refs_on_index(
     Ok(impact)
 }
 
-/// Decrement all chunk refs owned by a snapshot and return orphaned-space impact.
-pub fn decrement_snapshot_chunk_refs(
-    repo: &mut Repository,
-    items_stream: &[u8],
-    item_ptrs: &[ChunkId],
-) -> Result<SnapshotChunkImpact> {
-    decrement_chunk_refs_on_index(repo.chunk_index_mut(), items_stream, item_ptrs)
+/// Persist the refcount decrements made after a batch of snapshot blobs was
+/// deleted, and re-sync the local snapshot list cache with the mutated
+/// manifest.
+///
+/// Both steps are past the commit point, so neither can fail the operation:
+/// a `save_state()` error becomes a warning that names `vykar check --repair`
+/// as the recovery path, and the cache refresh is best-effort (a stale cache
+/// only affects local listing freshness and self-heals on the next open).
+///
+/// `op` names the operation in the warning ("delete" / "prune").
+pub fn commit_snapshot_removals(repo: &mut Repository, op: &str, warnings: &mut Vec<String>) {
+    if let Err(e) = repo.save_state() {
+        warn_and_push(
+            warnings,
+            format!(
+                "snapshots were deleted from storage, but persisting refcount \
+                 changes failed: {e}. The chunks_deleted/space_freed totals \
+                 reported reflect intended cleanup that did NOT commit — the \
+                 remote index still shows the original refcounts and the next \
+                 operation will see the pre-{op} state. Run `vykar check \
+                 --repair` to recover accurate accounting."
+            ),
+        );
+    }
+
+    repo.persist_snapshot_cache_from_manifest();
 }

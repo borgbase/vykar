@@ -8,7 +8,7 @@ use crate::prune::{apply_policy_by_label, PruneDecision};
 use vykar_types::error::{Result, VykarError};
 
 use super::list::load_snapshot_meta;
-use super::snapshot_ops::{try_cleanup_deleted_snapshot_refs, warn_and_push};
+use super::snapshot_ops::{commit_snapshot_removals, try_cleanup_deleted_snapshot_refs};
 use super::util::{check_interrupted, with_open_repo_maintenance_lock};
 use crate::repo::OpenOptions;
 
@@ -198,24 +198,7 @@ pub fn run(
             }
 
             // Single atomic save after all deletions (best-effort).
-            if let Err(e) = repo.save_state() {
-                warn_and_push(
-                    &mut warnings,
-                    format!(
-                        "snapshots were deleted from storage, but persisting refcount \
-                         changes failed: {e}. The chunks_deleted/space_freed totals \
-                         reported reflect intended cleanup that did NOT commit — the \
-                         remote index still shows the original refcounts and the next \
-                         operation will see the pre-prune state. Run `vykar check \
-                         --repair` to recover accurate accounting."
-                    ),
-                );
-            }
-
-            // Keep the local snapshot cache consistent with the mutated
-            // manifest (best-effort). Snapshot removal from storage is already
-            // committed, so this only affects local listing freshness.
-            repo.persist_snapshot_cache_from_manifest();
+            commit_snapshot_removals(repo, "prune", &mut warnings);
 
             Ok((
                 PruneStats {

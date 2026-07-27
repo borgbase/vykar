@@ -21,7 +21,8 @@ use vykar_types::error::{Result, VykarError};
 use super::super::commit::{commit_cache_hit, process_worker_chunks};
 use super::super::concurrency::ByteBudget;
 use super::super::{
-    append_item_to_stream, emit_progress, emit_stats_progress, BackupProgressEvent, FileStatus,
+    append_item_to_stream, emit_progress, emit_stats_progress, stamp_item_metadata,
+    BackupProgressEvent, FileStatus,
 };
 use super::segmentation::{validate_segment_accum, LargeFileAccum};
 use super::ProcessedEntry;
@@ -67,14 +68,7 @@ pub(super) fn consume_processed_entry(
 
             stats.nfiles += 1;
 
-            // Replace walk-time metadata with the pre-read fstat values so
-            // the persisted `Item` matches the bytes we just committed.
-            item.mode = pre_meta.mode;
-            item.uid = pre_meta.uid;
-            item.gid = pre_meta.gid;
-            item.size = pre_meta.size;
-            item.mtime = pre_meta.mtime_ns;
-            item.ctime = Some(pre_meta.ctime_ns);
+            stamp_item_metadata(&mut item, &pre_meta);
 
             if verbose {
                 let added_bytes = stats.deduplicated_size - dedup_before;
@@ -181,15 +175,10 @@ pub(super) fn consume_processed_entry(
                 // Commit the checkpoint — all segments landed successfully.
                 repo.commit_rollback_checkpoint();
 
-                // Update item metadata from segment 0's pre_meta (matches
-                // the chunks we committed across all segments).
+                // Segment 0's pre_meta is canonical: it matches the chunks
+                // committed across all segments.
                 let canon = accum.metadata;
-                accum.item.mode = canon.mode;
-                accum.item.uid = canon.uid;
-                accum.item.gid = canon.gid;
-                accum.item.size = canon.size;
-                accum.item.mtime = canon.mtime_ns;
-                accum.item.ctime = Some(canon.ctime_ns);
+                stamp_item_metadata(&mut accum.item, &canon);
 
                 if verbose {
                     let added_bytes = stats.deduplicated_size - accum.dedup_baseline;

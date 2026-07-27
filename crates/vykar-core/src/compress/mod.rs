@@ -155,36 +155,55 @@ pub fn decompress(data: &[u8]) -> Result<Vec<u8>> {
     decompress_with_hint(data, None)
 }
 
-/// Core decompression dispatch shared by `decompress_with_hint` and
-/// `decompress_metadata`.
+/// Core decompression dispatch behind every `decompress*` entry point.
 ///
 /// - `expected_size`: ZSTD hint for bulk decompression. `Some(n)` uses the
 ///   thread-local bulk decompressor; `None` uses streaming.
 /// - `max_size`: Upper bound on decompressed output (bomb protection).
-fn decompress_impl(data: &[u8], expected_size: Option<usize>, max_size: u64) -> Result<Vec<u8>> {
+/// - `output`: cleared, then filled with the plaintext. Callers that hold the
+///   buffer across calls keep their allocation.
+fn decompress_into_impl(
+    data: &[u8],
+    expected_size: Option<usize>,
+    max_size: u64,
+    output: &mut Vec<u8>,
+) -> Result<()> {
     if data.is_empty() {
         return Err(VykarError::Decompression("empty data".into()));
     }
     let tag = data[0];
     let payload = &data[1..];
     match tag {
-        TAG_NONE => Ok(payload.to_vec()),
+        TAG_NONE => {
+            output.clear();
+            output.extend_from_slice(payload);
+            Ok(())
+        }
         TAG_LZ4 => {
             if payload.len() < 4 {
                 return Err(VykarError::Decompression("lz4: payload too short".into()));
             }
-            let uncompressed_size = u64::from(read_u32_le(
+            let uncompressed_size = read_u32_le(
                 payload[..4]
                     .try_into()
                     .expect("payload.len() >= 4 (checked above)"),
-            ));
-            if uncompressed_size > max_size {
+            ) as usize;
+            if uncompressed_size as u64 > max_size {
                 return Err(VykarError::Decompression(format!(
                     "lz4: decompressed size ({uncompressed_size}) exceeds limit of {max_size} bytes"
                 )));
             }
-            lz4_flex::decompress_size_prepended(payload)
-                .map_err(|e| VykarError::Decompression(format!("lz4: {e}")))
+            output.clear();
+            output.resize(uncompressed_size, 0);
+            let written = lz4_flex::block::decompress_into(&payload[4..], output)
+                .map_err(|e| VykarError::Decompression(format!("lz4: {e}")))?;
+            if written != uncompressed_size {
+                return Err(VykarError::Decompression(format!(
+                    "lz4: declared size {uncompressed_size} but decompressed {written} bytes"
+                )));
+            }
+            output.truncate(written);
+            Ok(())
         }
         TAG_ZSTD => {
             if let Some(hint) = expected_size {
@@ -203,40 +222,52 @@ fn decompress_impl(data: &[u8], expected_size: Option<usize>, max_size: u64) -> 
                             })?);
                     }
                     let dx = slot.as_mut().expect("zstd decompressor initialized");
-                    // A zero hint means "unknown" — clamp to 1 so bulk::decompress
-                    // allocates a minimal buffer rather than returning an empty Vec
-                    // for what might be a valid non-empty frame.
-                    let cap = hint.max(1).min(max_size as usize);
-                    let output = dx
-                        .decompress(payload, cap)
+                    // A zero hint means "unknown" — clamp to 1 so the bulk
+                    // decompressor gets a minimal buffer rather than an empty
+                    // one for what might be a valid non-empty frame.
+                    let cap = hint
+                        .max(1)
+                        .min(usize::try_from(max_size).unwrap_or(usize::MAX));
+                    output.clear();
+                    output.resize(cap, 0);
+                    let written = dx
+                        .decompress_to_buffer(payload, output)
                         .map_err(|e| VykarError::Decompression(format!("zstd: {e}")))?;
+                    output.truncate(written);
                     if output.len() as u64 > max_size {
                         return Err(VykarError::Decompression(format!(
                             "zstd: decompressed size exceeds limit of {max_size} bytes",
                         )));
                     }
-                    Ok(output)
+                    Ok(())
                 })
             } else {
                 // Cold path: streaming decoder (handles unknown sizes efficiently)
+                output.clear();
                 let mut decoder = zstd::stream::Decoder::new(std::io::Cursor::new(payload))
                     .map_err(|e| VykarError::Decompression(format!("zstd init: {e}")))?;
-                let mut output = Vec::new();
                 decoder
                     .by_ref()
                     .take(max_size + 1)
-                    .read_to_end(&mut output)
+                    .read_to_end(output)
                     .map_err(|e| VykarError::Decompression(format!("zstd: {e}")))?;
                 if output.len() as u64 > max_size {
                     return Err(VykarError::Decompression(format!(
                         "zstd: decompressed size exceeds limit of {max_size} bytes",
                     )));
                 }
-                Ok(output)
+                Ok(())
             }
         }
         _ => Err(VykarError::UnknownCompressionTag(tag)),
     }
+}
+
+/// Allocating wrapper over [`decompress_into_impl`].
+fn decompress_impl(data: &[u8], expected_size: Option<usize>, max_size: u64) -> Result<Vec<u8>> {
+    let mut output = Vec::new();
+    decompress_into_impl(data, expected_size, max_size, &mut output)?;
+    Ok(output)
 }
 
 /// Decompress data by reading the 1-byte tag prefix and dispatching.
@@ -289,96 +320,7 @@ pub fn decompress_into_with_hint(
     expected_size: Option<usize>,
     output: &mut Vec<u8>,
 ) -> Result<()> {
-    if data.is_empty() {
-        return Err(VykarError::Decompression("empty data".into()));
-    }
-    let tag = data[0];
-    let payload = &data[1..];
-    match tag {
-        TAG_NONE => {
-            output.clear();
-            output.extend_from_slice(payload);
-            Ok(())
-        }
-        TAG_LZ4 => {
-            if payload.len() < 4 {
-                return Err(VykarError::Decompression("lz4: payload too short".into()));
-            }
-            let uncompressed_size = read_u32_le(
-                payload[..4]
-                    .try_into()
-                    .expect("payload.len() >= 4 (checked above)"),
-            ) as usize;
-            if uncompressed_size as u64 > MAX_DECOMPRESS_SIZE {
-                return Err(VykarError::Decompression(format!(
-                    "lz4: decompressed size ({uncompressed_size}) exceeds limit of {MAX_DECOMPRESS_SIZE} bytes"
-                )));
-            }
-            output.clear();
-            output.resize(uncompressed_size, 0);
-            let written = lz4_flex::block::decompress_into(&payload[4..], output)
-                .map_err(|e| VykarError::Decompression(format!("lz4: {e}")))?;
-            if written != uncompressed_size {
-                return Err(VykarError::Decompression(format!(
-                    "lz4: declared size {uncompressed_size} but decompressed {written} bytes"
-                )));
-            }
-            output.truncate(written);
-            Ok(())
-        }
-        TAG_ZSTD => {
-            if let Some(hint) = expected_size {
-                // Hot path (restore): reuse thread-local bulk decompressor
-                use std::cell::RefCell;
-                thread_local! {
-                    static ZSTD_DX_INTO: RefCell<Option<zstd::bulk::Decompressor<'static>>> =
-                        const { RefCell::new(None) };
-                }
-                ZSTD_DX_INTO.with(|cell| {
-                    let mut slot = cell.borrow_mut();
-                    if slot.is_none() {
-                        *slot =
-                            Some(zstd::bulk::Decompressor::new().map_err(|e| {
-                                VykarError::Decompression(format!("zstd init: {e}"))
-                            })?);
-                    }
-                    let dx = slot.as_mut().expect("zstd decompressor initialized");
-                    let cap = hint.max(1).min(MAX_DECOMPRESS_SIZE as usize);
-                    output.clear();
-                    output.resize(cap, 0);
-                    let written = dx
-                        .decompress_to_buffer(payload, output)
-                        .map_err(|e| VykarError::Decompression(format!("zstd: {e}")))?;
-                    output.truncate(written);
-                    if output.len() as u64 > MAX_DECOMPRESS_SIZE {
-                        return Err(VykarError::Decompression(format!(
-                            "zstd: decompressed size exceeds limit of {} bytes",
-                            MAX_DECOMPRESS_SIZE
-                        )));
-                    }
-                    Ok(())
-                })
-            } else {
-                // Cold path: streaming decoder (handles unknown sizes efficiently)
-                output.clear();
-                let mut decoder = zstd::stream::Decoder::new(std::io::Cursor::new(payload))
-                    .map_err(|e| VykarError::Decompression(format!("zstd init: {e}")))?;
-                decoder
-                    .by_ref()
-                    .take(MAX_DECOMPRESS_SIZE + 1)
-                    .read_to_end(output)
-                    .map_err(|e| VykarError::Decompression(format!("zstd: {e}")))?;
-                if output.len() as u64 > MAX_DECOMPRESS_SIZE {
-                    return Err(VykarError::Decompression(format!(
-                        "zstd: decompressed size exceeds limit of {} bytes",
-                        MAX_DECOMPRESS_SIZE
-                    )));
-                }
-                Ok(())
-            }
-        }
-        _ => Err(VykarError::UnknownCompressionTag(tag)),
-    }
+    decompress_into_impl(data, expected_size, MAX_DECOMPRESS_SIZE, output)
 }
 
 #[cfg(test)]

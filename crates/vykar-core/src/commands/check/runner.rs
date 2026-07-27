@@ -5,16 +5,63 @@ use super::repair_plan::build_repair_plan;
 use super::scan::{integrity_scan, ScanOptions, ScanResult};
 use super::server_verify::try_server_verify;
 use super::types::{
-    CheckError, CheckProgressEvent, CheckResult, IntegrityIssue, RepairMode, RepairResult,
-    ServerVerifyOutcome,
+    CheckError, CheckProgressEvent, CheckResult, IntegrityIssue, RepairMode, RepairPlan,
+    RepairResult, ServerVerifyOutcome,
 };
 use crate::config::VykarConfig;
-use crate::index::ChunkIndexEntry;
-use crate::repo::OpenOptions;
+use crate::index::{ChunkIndex, ChunkIndexEntry};
+use crate::repo::{OpenOptions, Repository};
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
 use vykar_types::pack_id::PackId;
 use vykar_types::snapshot_id::SnapshotId;
+
+/// Chunks grouped by the pack that stores them.
+type PackChunks = HashMap<PackId, Vec<(ChunkId, ChunkIndexEntry)>>;
+
+/// Group a chunk index by pack — the shape both the server-verify request and
+/// the repair planner consume.
+fn group_by_pack(index: &ChunkIndex) -> PackChunks {
+    let mut pack_chunks: PackChunks = HashMap::new();
+    for (chunk_id, entry) in index.iter() {
+        pack_chunks
+            .entry(entry.pack_id)
+            .or_default()
+            .push((*chunk_id, *entry));
+    }
+    pack_chunks
+}
+
+/// Build the repair plan for a completed scan. The planner needs a snapshot
+/// name → id map, derived from the manifest the scan ran against.
+fn plan_repair(repo: &Repository, scan: &ScanResult, pack_chunks: &PackChunks) -> RepairPlan {
+    let name_to_id: HashMap<String, SnapshotId> = repo
+        .manifest()
+        .snapshots
+        .iter()
+        .map(|e| (e.name.clone(), e.id))
+        .collect();
+    build_repair_plan(scan, pack_chunks, &name_to_id)
+}
+
+impl From<ScanResult> for CheckResult {
+    /// Project a completed scan into the user-facing result. `run_with_progress`
+    /// folds its server-verify counters and errors in afterwards.
+    fn from(scan: ScanResult) -> Self {
+        let mut errors: Vec<CheckError> = scan.issues.iter().map(|i| i.to_check_error()).collect();
+        errors.extend(scan.item_impacts.iter().map(|i| i.to_check_error()));
+        CheckResult {
+            snapshots_checked: scan.counters.snapshots_checked,
+            items_checked: scan.counters.items_checked,
+            chunks_existence_checked: scan.counters.chunks_existence_checked,
+            packs_existence_checked: scan.counters.packs_existence_checked,
+            chunks_data_verified: scan.counters.chunks_data_verified,
+            errors,
+            item_impacts: scan.item_impacts,
+            skipped: false,
+        }
+    }
+}
 
 /// Run `vykar check`.
 pub fn run(
@@ -88,13 +135,7 @@ pub fn run_with_progress(
     repo.load_chunk_index_uncached()?;
 
     // Build per-pack grouping from chunk index (needed for server verify).
-    let mut pack_chunks: HashMap<PackId, Vec<(ChunkId, ChunkIndexEntry)>> = HashMap::new();
-    for (chunk_id, entry) in repo.chunk_index().iter() {
-        pack_chunks
-            .entry(entry.pack_id)
-            .or_default()
-            .push((*chunk_id, *entry));
-    }
+    let pack_chunks = group_by_pack(repo.chunk_index());
 
     // If sampling (effective < 100), select a subset of packs.
     let sampled_out: HashSet<PackId> = if effective < 100 {
@@ -104,16 +145,15 @@ pub fn run_with_progress(
     };
 
     // Filter pack_chunks for server verify to only include sampled-in packs.
-    let verify_pack_chunks: HashMap<PackId, Vec<(ChunkId, ChunkIndexEntry)>> =
-        if sampled_out.is_empty() {
-            pack_chunks.clone()
-        } else {
-            pack_chunks
-                .iter()
-                .filter(|(pid, _)| !sampled_out.contains(pid))
-                .map(|(pid, chunks)| (*pid, chunks.clone()))
-                .collect()
-        };
+    let verify_pack_chunks: PackChunks = if sampled_out.is_empty() {
+        pack_chunks.clone()
+    } else {
+        pack_chunks
+            .iter()
+            .filter(|(pid, _)| !sampled_out.contains(pid))
+            .map(|(pid, chunks)| (*pid, chunks.clone()))
+            .collect()
+    };
 
     // Try server-side verify for both existence and data checks.
     let server_outcome = if !distrust_server {
@@ -175,21 +215,15 @@ pub fn run_with_progress(
         .map(|c| c.len())
         .sum();
 
-    let mut errors: Vec<CheckError> = srv_errors;
-    errors.extend(scan.issues.iter().map(|i| i.to_check_error()));
-    errors.extend(scan.item_impacts.iter().map(|i| i.to_check_error()));
-
-    let result = CheckResult {
-        snapshots_checked: scan.counters.snapshots_checked,
-        items_checked: scan.counters.items_checked,
-        chunks_existence_checked: scan.counters.chunks_existence_checked + srv_chunks_existence,
-        packs_existence_checked: scan.counters.packs_existence_checked + srv_packs_responded,
-        chunks_data_verified: scan.counters.chunks_data_verified
-            + if verify_data { srv_chunks_verified } else { 0 },
-        errors,
-        item_impacts: scan.item_impacts,
-        skipped: false,
-    };
+    // Fold the server-verify contribution into the scan's projection.
+    let mut result = CheckResult::from(scan);
+    result.chunks_existence_checked += srv_chunks_existence;
+    result.packs_existence_checked += srv_packs_responded;
+    if verify_data {
+        result.chunks_data_verified += srv_chunks_verified;
+    }
+    // Server errors are reported ahead of the local scan's.
+    result.errors.splice(0..0, srv_errors);
 
     // Record full check timestamp if this was a 100% run and succeeded.
     if record_state && effective == 100 && result.errors.is_empty() {
@@ -314,37 +348,10 @@ pub fn run_with_repair(
         // misleading executable RebuildRefcounts plan for a too-new repo.
         refuse_repair_if_unreadable_snapshots(&scan)?;
 
-        // Build per-pack grouping for plan
-        let mut pack_chunks: HashMap<PackId, Vec<(ChunkId, ChunkIndexEntry)>> = HashMap::new();
-        for (chunk_id, entry) in repo.chunk_index().iter() {
-            pack_chunks
-                .entry(entry.pack_id)
-                .or_default()
-                .push((*chunk_id, *entry));
-        }
-
-        let name_to_id: HashMap<String, SnapshotId> = repo
-            .manifest()
-            .snapshots
-            .iter()
-            .map(|e| (e.name.clone(), e.id))
-            .collect();
-        let plan = build_repair_plan(&scan, &pack_chunks, &name_to_id);
-        let mut errors: Vec<CheckError> = scan.issues.iter().map(|i| i.to_check_error()).collect();
-        errors.extend(scan.item_impacts.iter().map(|i| i.to_check_error()));
-        let check_result = CheckResult {
-            snapshots_checked: scan.counters.snapshots_checked,
-            items_checked: scan.counters.items_checked,
-            chunks_existence_checked: scan.counters.chunks_existence_checked,
-            packs_existence_checked: scan.counters.packs_existence_checked,
-            chunks_data_verified: scan.counters.chunks_data_verified,
-            errors,
-            item_impacts: scan.item_impacts,
-            skipped: false,
-        };
+        let plan = plan_repair(&repo, &scan, &group_by_pack(repo.chunk_index()));
 
         Ok(RepairResult {
-            check_result,
+            check_result: scan.into(),
             plan,
             applied: Vec::new(),
             repair_errors: Vec::new(),
@@ -366,23 +373,8 @@ pub fn run_with_repair(
                 // written when a too-new snapshot is present.
                 refuse_repair_if_unreadable_snapshots(&scan)?;
 
-                // Build per-pack grouping for plan
-                let mut pack_chunks: HashMap<PackId, Vec<(ChunkId, ChunkIndexEntry)>> =
-                    HashMap::new();
-                for (chunk_id, entry) in repo.chunk_index().iter() {
-                    pack_chunks
-                        .entry(entry.pack_id)
-                        .or_default()
-                        .push((*chunk_id, *entry));
-                }
-
-                let name_to_id: HashMap<String, SnapshotId> = repo
-                    .manifest()
-                    .snapshots
-                    .iter()
-                    .map(|e| (e.name.clone(), e.id))
-                    .collect();
-                let plan = build_repair_plan(&scan, &pack_chunks, &name_to_id);
+                let pack_chunks = group_by_pack(repo.chunk_index());
+                let plan = plan_repair(repo, &scan, &pack_chunks);
 
                 // If plan has data-loss actions, probe append-only before mutating.
                 if plan.has_data_loss && !probe_deletes_allowed(repo.storage.as_ref()) {
@@ -397,22 +389,8 @@ pub fn run_with_repair(
                 let (applied, repair_errors) =
                     execute_repair(repo, &plan, &scan.issues, &pack_chunks)?;
 
-                let mut errors: Vec<CheckError> =
-                    scan.issues.iter().map(|i| i.to_check_error()).collect();
-                errors.extend(scan.item_impacts.iter().map(|i| i.to_check_error()));
-                let check_result = CheckResult {
-                    snapshots_checked: scan.counters.snapshots_checked,
-                    items_checked: scan.counters.items_checked,
-                    chunks_existence_checked: scan.counters.chunks_existence_checked,
-                    packs_existence_checked: scan.counters.packs_existence_checked,
-                    chunks_data_verified: scan.counters.chunks_data_verified,
-                    errors,
-                    item_impacts: scan.item_impacts,
-                    skipped: false,
-                };
-
                 Ok(RepairResult {
-                    check_result,
+                    check_result: scan.into(),
                     plan,
                     applied,
                     repair_errors,

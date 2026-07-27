@@ -256,6 +256,56 @@ fn intra_read_append_parallel_small_is_skipped_with_warning() {
     );
 }
 
+/// Sequential small-file variant (cross-file batch path): a mid-read append
+/// must skip only the mutated file. Nothing of it may reach the batch — the
+/// whole-file buffer is handed over only after the post-read check passes —
+/// and the sibling small file must still commit in walk order.
+#[cfg(unix)]
+#[test]
+fn intra_read_append_sequential_small_skips_only_the_mutated_file() {
+    init();
+    let _guard = crate::testutil::CWD_LOCK.lock().unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let src_dir = dir.path().join("src");
+    fs::create_dir_all(&src_dir).unwrap();
+
+    let mut config = crate::tests::helpers::make_test_config(&repo_dir);
+    // Sequential path, with both files below min_size so they take the
+    // cross-file batch branch.
+    config.limits.threads = 1;
+    config.chunker.min_size = 32 * 1024;
+    config.chunker.avg_size = 64 * 1024;
+    config.chunker.max_size = 128 * 1024;
+    crate::commands::init::run(&config, None).unwrap();
+
+    let good = src_dir.join("a-good.bin");
+    write_file(&good, &vec![0x11u8; 4 * 1024]);
+    let mutated = src_dir.join("b-mutated.bin");
+    write_file(&mutated, &vec![0x5au8; 4 * 1024]);
+
+    let append_path = mutated.clone();
+    backup::read_source::test_hooks::install_hook(mutated.clone(), 1, move || {
+        let mut f = fs::OpenOptions::new()
+            .append(true)
+            .open(&append_path)
+            .unwrap();
+        f.write_all(&vec![0xaau8; 1024 * 1024]).unwrap();
+        f.sync_all().unwrap();
+    });
+
+    let outcome = backup_to(&config, &src_dir, "snap");
+    backup::read_source::test_hooks::clear_hook();
+
+    assert!(outcome.is_partial, "outcome should be partial");
+    assert_eq!(outcome.stats.errors, 1, "one file should have been skipped");
+    assert_eq!(
+        outcome.stats.nfiles, 1,
+        "the untouched sibling should still have committed"
+    );
+}
+
 /// Mechanism A: a chmod-000 file causes a soft open error in the sequential
 /// path. The pre-checkpoint open-skip branch must count the file and still
 /// commit the sibling — if a rollback tracker were leaked, the next call to

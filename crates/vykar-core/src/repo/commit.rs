@@ -67,6 +67,28 @@ impl Repository {
         Ok(())
     }
 
+    /// Flush pending packs and wait for uploads, then drop the tiered dedup
+    /// index (releasing its mmap before the full index is reloaded) and take
+    /// the session's `IndexDelta` out for processing.
+    ///
+    /// Must only be called when `write_session` is `Some`. The session itself
+    /// stays active: on failure the caller can still run `flush_on_abort()`,
+    /// which does not need the structures taken here.
+    fn flush_and_take_session_delta(&mut self) -> Result<Option<IndexDelta>> {
+        self.flush_packs()?;
+
+        let ws = self
+            .write_session
+            .as_mut()
+            .expect("no active write session");
+        ws.tiered_dedup.take();
+        let delta = ws.index_delta.take();
+        if delta.is_some() {
+            ws.dedup_index = None;
+        }
+        Ok(delta)
+    }
+
     /// Flush pending packs, wait for uploads, and apply the dedup delta from
     /// the active write session. Must only be called when `write_session` is `Some`.
     ///
@@ -81,20 +103,7 @@ impl Repository {
     /// persistence (reduces peak memory when incremental update or cache
     /// rebuild succeeds).
     fn apply_write_session(&mut self) -> Result<bool> {
-        // Flush all pending packs and wait for uploads.
-        self.flush_packs()?;
-
-        // Drop tiered dedup index (releases mmap) before reloading full index.
-        // Take delta and dedup_index out of the session for processing.
-        let ws = self
-            .write_session
-            .as_mut()
-            .expect("write session active while applying commit");
-        ws.tiered_dedup.take();
-        let delta = ws.index_delta.take();
-        if delta.is_some() {
-            ws.dedup_index = None;
-        }
+        let delta = self.flush_and_take_session_delta()?;
 
         let mut deferred_index_load = false;
 
@@ -296,19 +305,8 @@ impl Repository {
         snapshot_entry: &manifest::SnapshotEntry,
         progress: &mut Option<impl FnMut(crate::commands::backup::BackupProgressEvent)>,
     ) -> Result<bool> {
-        // 1. Flush all pending packs and wait for uploads.
-        self.flush_packs()?;
-
-        // 2. Drop tiered dedup, take delta from write session.
-        let ws = self
-            .write_session
-            .as_mut()
-            .expect("no active write session");
-        ws.tiered_dedup.take();
-        let delta = ws.index_delta.take();
-        if delta.is_some() {
-            ws.dedup_index = None;
-        }
+        // 1+2. Flush all pending packs, then take the delta from the session.
+        let delta = self.flush_and_take_session_delta()?;
 
         // 3. Refresh snapshot list (unreadable blobs are skipped — a garbage
         //    snapshot that can't be decrypted cannot conflict with a valid name).
@@ -562,15 +560,25 @@ impl Repository {
                 })
             },
         )?;
+        self.put_index_blob(&index_packed, generation)
+    }
+
+    /// Write an already-packed index blob to storage under the lock fence.
+    ///
+    /// Shared commit epilogue: fence check, the `index` PUT, the advisory
+    /// `index.gen` sidecar, clearing `index_dirty`, and refreshing the local
+    /// raw-blob cache that the next run's fast path compares against. Only
+    /// the `index` PUT is fatal — the sidecar and the cache are best-effort.
+    fn put_index_blob(&mut self, index_packed: &[u8], generation: u64) -> Result<()> {
         self.check_lock_fence()?;
-        self.storage.put("index", &index_packed)?;
+        self.storage.put("index", index_packed)?;
         // Advisory sidecar — best-effort, non-fatal.
         let _ = self.storage.put("index.gen", &generation.to_le_bytes());
         self.index_dirty = false;
 
         // Cache the raw blob for future fast-path checks (best-effort).
         if let Err(e) = dedup_cache::write_index_blob_cache(
-            &index_packed,
+            index_packed,
             generation,
             &self.config.id,
             self.cache_dir_override.as_deref(),
@@ -771,22 +779,7 @@ impl Repository {
             self.crypto.as_ref(),
         )?;
 
-        self.check_lock_fence()?;
-        self.storage.put("index", &index_packed)?;
-        let _ = self
-            .storage
-            .put("index.gen", &self.index_generation.to_le_bytes());
-        self.index_dirty = false;
-
-        // Cache the raw blob for next fast-path check (best-effort).
-        if let Err(e) = dedup_cache::write_index_blob_cache(
-            &index_packed,
-            self.index_generation,
-            &self.config.id,
-            cd,
-        ) {
-            debug!("failed to write index blob cache: {e}");
-        }
+        self.put_index_blob(&index_packed, self.index_generation)?;
         // Dedup/restore cache derivation is deferred to the post-commit
         // rebuild block (after the snapshot write) to minimize lock hold time.
         // rebuild_dedup_cache stays true so the post-commit block picks it up.

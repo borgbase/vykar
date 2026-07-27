@@ -117,7 +117,7 @@ pub(super) fn process_file_worker(
                     acquired_bytes,
                 }),
                 Err(e) if e.is_soft_file_error() => {
-                    let reason = e.to_string();
+                    let reason = super::super::skip_reason(&e);
                     warn!(path = %abs_path, error = %e, "skipping file in pipeline (soft error)");
                     Ok(ProcessedEntry::Skipped {
                         path: abs_path,
@@ -179,7 +179,7 @@ pub(super) fn process_file_worker(
                     num_segments,
                 }),
                 Err(e) if e.is_soft_file_error() => {
-                    let reason = e.to_string();
+                    let reason = super::super::skip_reason(&e);
                     warn!(
                         path = %abs_path,
                         segment_index,

@@ -230,13 +230,13 @@ pub(crate) fn render_html(status: &DaemonStatus) -> String {
         out.push_str(
             "<table><thead><tr>\
                 <th>Time</th><th>Repo</th><th>Snapshot</th>\
-                <th>Hostname</th><th>Label</th><th>Files</th><th>Size</th>\
+                <th>Hostname</th><th>Label</th><th>Files</th><th>Size</th><th>Added</th>\
              </tr></thead><tbody>",
         );
         for s in &status.recent_snapshots {
             let _ = write!(
                 out,
-                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
                 esc(&s.time),
                 esc(&s.repo_name),
                 esc(&s.id),
@@ -244,6 +244,7 @@ pub(crate) fn render_html(status: &DaemonStatus) -> String {
                 esc(&s.label),
                 esc(&s.files),
                 esc(&s.size),
+                esc(&s.added),
             );
         }
         out.push_str("</tbody></table>");
@@ -332,6 +333,7 @@ mod tests {
                 label: "home".into(),
                 files: "1234".into(),
                 size: "500 MB".into(),
+                added: "20 MB".into(),
                 repo_name: "repo-a".into(),
             }],
             sources: vec![SourceInfo {

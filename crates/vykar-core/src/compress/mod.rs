@@ -193,6 +193,21 @@ fn decompress_into_impl(
                     "lz4: decompressed size ({uncompressed_size}) exceeds limit of {max_size} bytes"
                 )));
             }
+            // LZ4 expands each compressed byte to at most 255 output bytes
+            // (match-length extension bytes each add 255), so a declared size
+            // beyond that is corrupt. Rejecting it before the `resize` bounds
+            // the eager zero-fill by the payload we actually hold, instead of
+            // committing up to `max_size` (4 GiB on the metadata path) of
+            // resident memory from a forged 4-byte length header.
+            let max_possible = ((payload.len() - 4) as u64)
+                .saturating_mul(255)
+                .saturating_add(64);
+            if uncompressed_size as u64 > max_possible {
+                return Err(VykarError::Decompression(format!(
+                    "lz4: declared size ({uncompressed_size}) impossible for a {}-byte payload",
+                    payload.len() - 4
+                )));
+            }
             output.clear();
             output.resize(uncompressed_size, 0);
             let written = lz4_flex::block::decompress_into(&payload[4..], output)
@@ -336,6 +351,19 @@ mod tests {
         let mut data = vec![TAG_LZ4];
         data.extend_from_slice(&bomb);
         assert!(decompress(&data).is_err());
+    }
+
+    #[test]
+    fn decompress_rejects_lz4_impossible_declared_size() {
+        // A declared size within the bomb limit but far beyond what the tiny
+        // payload could expand to (max 255x) must be rejected BEFORE the
+        // output buffer is zero-filled to the declared size.
+        let mut forged = (16u32 << 20).to_le_bytes().to_vec(); // declares 16 MiB
+        forged.extend_from_slice(&[0u8; 8]); // 8-byte body: max ~2 KiB output
+        let mut data = vec![TAG_LZ4];
+        data.extend_from_slice(&forged);
+        let err = decompress(&data).unwrap_err().to_string();
+        assert!(err.contains("impossible"), "got {err:?}");
     }
 
     #[test]

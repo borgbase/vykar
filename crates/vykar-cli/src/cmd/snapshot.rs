@@ -4,6 +4,7 @@ use std::sync::atomic::AtomicBool;
 use chrono::Local;
 use comfy_table::{Cell, CellAlignment};
 
+use vykar_core::app::views::SnapshotRowView;
 use vykar_core::commands;
 use vykar_core::config::VykarConfig;
 
@@ -146,11 +147,8 @@ pub(crate) fn run_snapshot_command(
                 "Duration",
                 format_duration_seconds(duration.num_seconds()),
             );
-            let effective_label = if meta.label.is_empty() {
-                &meta.source_label
-            } else {
-                &meta.label
-            };
+            let effective_label =
+                SnapshotRowView::effective_label_parts(&meta.source_label, &meta.label);
             add_kv_row(&mut t1, theme, "Label", effective_label);
             add_kv_row(&mut t1, theme, "Source paths", meta.source_paths.join(", "));
             if !meta.comment.is_empty() {

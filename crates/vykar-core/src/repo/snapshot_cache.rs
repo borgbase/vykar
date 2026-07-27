@@ -710,7 +710,7 @@ mod tests {
 
     vykar_storage::delegate_storage_backend! {
         for FailGetBackend;
-        except [get];
+        except [get, size];
 
         fn get(&self, key: &str) -> vykar_types::error::Result<Option<Vec<u8>>> {
             if key.starts_with(&self.fail_prefix) {
@@ -719,6 +719,12 @@ mod tests {
                 ));
             }
             self.inner.get(key)
+        }
+
+        // Route through the overridden `get` (like the pre-macro trait default
+        // did) so the injected failure also applies to size probes.
+        fn size(&self, key: &str) -> vykar_types::error::Result<Option<u64>> {
+            Ok(self.get(key)?.map(|v| v.len() as u64))
         }
     }
 }

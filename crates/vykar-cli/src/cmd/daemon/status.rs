@@ -38,6 +38,7 @@ pub(crate) struct SnapshotRow {
     pub label: String,
     pub files: String,
     pub size: String,
+    pub added: String,
     pub repo_name: String,
 }
 
@@ -253,6 +254,7 @@ pub(crate) fn refresh_repos(status: &SharedStatus, repos: &[ResolvedRepo]) {
                         label: row.label,
                         files: row.files,
                         size: row.size,
+                        added: row.added,
                         repo_name: name.clone(),
                     });
                 }

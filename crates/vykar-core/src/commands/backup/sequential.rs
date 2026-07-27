@@ -22,7 +22,10 @@ use super::commit::process_worker_chunks;
 use super::drift::{open_checked, read_range_drift_checked, ReadPlan};
 use super::source::ResolvedSource;
 use super::walk::{materialize_item, DatalessKind, InodeSortedWalk, Materialized, WalkEvent};
-use super::{append_item_to_stream, emit_post_commit_warning, emit_progress, emit_stats_progress};
+use super::{
+    append_item_to_stream, emit_post_commit_warning, emit_progress, emit_stats_progress,
+    skip_reason,
+};
 use super::{stamp_item_metadata, with_rollback_checkpoint, BackupProgressEvent, FileStatus};
 use vykar_crypto::CryptoEngine;
 
@@ -655,7 +658,11 @@ pub(super) fn process_source_path(
                         Err(e) if e.is_soft_file_error() => {
                             emit_post_commit_warning(
                                 progress,
-                                format!("skipping file '{}': {e}", entry_path.display()),
+                                format!(
+                                    "skipping file '{}': {}",
+                                    entry_path.display(),
+                                    skip_reason(&e)
+                                ),
                             );
                             stats.errors += 1;
                             continue;
@@ -731,7 +738,11 @@ pub(super) fn process_source_path(
                     Err(e) if e.is_soft_file_error() => {
                         emit_post_commit_warning(
                             progress,
-                            format!("skipping file '{}': {e}", entry_path.display()),
+                            format!(
+                                "skipping file '{}': {}",
+                                entry_path.display(),
+                                skip_reason(&e)
+                            ),
                         );
                         stats.errors += 1;
                         continue;

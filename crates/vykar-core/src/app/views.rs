@@ -165,10 +165,18 @@ impl SnapshotRowView {
     /// those rows render blank.
     #[must_use]
     pub fn effective_label(entry: &SnapshotEntry) -> &str {
-        if entry.source_label.is_empty() {
-            &entry.label
+        Self::effective_label_parts(&entry.source_label, &entry.label)
+    }
+
+    /// [`Self::effective_label`] for callers that hold the two label fields
+    /// without a `SnapshotEntry` (e.g. `SnapshotMeta`), so every surface
+    /// resolves labels by the same rule.
+    #[must_use]
+    pub fn effective_label_parts<'a>(source_label: &'a str, label: &'a str) -> &'a str {
+        if source_label.is_empty() {
+            label
         } else {
-            &entry.source_label
+            source_label
         }
     }
 

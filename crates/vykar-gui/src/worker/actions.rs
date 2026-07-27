@@ -340,7 +340,11 @@ pub(super) fn handle_find_files(ctx: &mut WorkerContext, repo_name: String, name
     let filter = match FindFilter::build(None, None, Some(&name_pattern), None, None, None, None) {
         Ok(f) => f,
         Err(e) => {
-            send_log(&ctx.ui_tx, format!("Invalid name pattern: {e}"));
+            // No OpGuard is in scope yet, so surface the error in the status
+            // bar explicitly — the log line alone is easy to miss.
+            let msg = format!("Invalid name pattern: {e}");
+            send_log(&ctx.ui_tx, msg.clone());
+            let _ = ctx.ui_tx.send(UiEvent::ErrorStatus(msg));
             return;
         }
     };

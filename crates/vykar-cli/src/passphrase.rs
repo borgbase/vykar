@@ -29,6 +29,12 @@ pub(crate) fn get_passphrase(
     config: &VykarConfig,
     label: Option<&str>,
 ) -> CliResult<Option<Zeroizing<String>>> {
+    // Unencrypted repos never have a passphrase — return before touching the
+    // cache so they don't leave a `None` entry keyed by their URL.
+    if config.encryption.mode == EncryptionModeConfig::None {
+        return Ok(None);
+    }
+
     let cache_key = config.repository.url.clone();
 
     // Check cache first (avoids double interactive prompt during probe+dispatch)

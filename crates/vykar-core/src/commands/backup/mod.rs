@@ -309,6 +309,24 @@ pub(crate) fn emit_post_commit_warning<F: FnMut(BackupProgressEvent)>(
     }
 }
 
+/// Render a soft per-file error for a `skipping file '<path>': <reason>`
+/// warning. Drift errors embed the offending path in their `Display`, which
+/// would repeat the path the warning template already names — render those
+/// without it.
+pub(crate) fn skip_reason(e: &VykarError) -> String {
+    match e {
+        VykarError::FileChangedDuringRead { dataless, .. } => {
+            let suffix = if *dataless {
+                " (cloud-only file, hydration in progress)"
+            } else {
+                ""
+            };
+            format!("file changed during read{suffix}")
+        }
+        other => other.to_string(),
+    }
+}
+
 /// Run `body` inside a rollback-guarded scope.
 ///
 /// Arms a rollback checkpoint on the repo and snapshots the stats byte

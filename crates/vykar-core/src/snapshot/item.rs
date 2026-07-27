@@ -63,7 +63,7 @@ impl Item {
     /// to write a snapshot with placeholder ownership or timestamps. Callers
     /// override what they care about with struct-update syntax:
     ///
-    /// ```ignore
+    /// ```text
     /// Item { size: 1024, entry_type: ItemType::Directory, ..Item::test_file("a") }
     /// ```
     ///

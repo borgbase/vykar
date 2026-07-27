@@ -51,7 +51,7 @@ pub mod __macro_support {
 /// ones the backend does implement itself, in trait-declaration order — same
 /// convention as [`crate::delegate_storage_backend!`].
 ///
-/// ```ignore
+/// ```text
 /// impl StorageBackend for LocalBackend {
 ///     // ... data methods ...
 ///     unsupported_server_ops!();
@@ -134,7 +134,7 @@ macro_rules! unsupported_server_ops {
 /// Implement `StorageBackend` for a wrapper by forwarding to its
 /// [`InnerBackend::inner_backend`].
 ///
-/// ```ignore
+/// ```text
 /// impl InnerBackend for Throttled {
 ///     fn inner_backend(&self) -> &dyn StorageBackend { &*self.inner }
 /// }

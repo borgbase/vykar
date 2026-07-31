@@ -203,6 +203,89 @@ systemctl status vykar
 journalctl -u vykar -f
 ```
 
+### launchd (macOS)
+
+Scheduled backups on macOS need **Full Disk Access** (FDA), or vykar silently skips
+everything under `~/Documents`, `~/Desktop`, `~/Library`, and Time Machine volumes.
+Two macOS rules decide whether that grant sticks:
+
+> **Use the bundled binary, not `/usr/local/bin/vykar`.** Apple's position is that FDA
+> "has only ever been *fully* supported for bundled executables" — TCC identifies a
+> client by its `CFBundleIdentifier`, and a bare command-line binary has none. Grants
+> made to a loose binary are keyed by path and code hash instead, and quietly stop
+> applying when the binary is replaced. The macOS archive therefore ships `vykar`
+> inside the app bundle as well (added after v0.19.0).
+
+Install the bundle once, then point launchd at the copy inside it:
+
+```bash
+tar xzf vykar-*-aarch64-apple-darwin.tar.gz
+sudo cp -R "Vykar Backup.app" /Applications/
+"/Applications/Vykar Backup.app/Contents/MacOS/vykar" --version
+```
+
+Grant FDA to **`/Applications/Vykar Backup.app`** in System Settings → Privacy &
+Security → Full Disk Access. The bundled `vykar` inherits the bundle's identity, so the
+grant survives updates as long as the bundle keeps its Developer ID signature.
+
+A per-user agent at `~/Library/LaunchAgents/com.borgbase.vykar.plist`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.borgbase.vykar</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Applications/Vykar Backup.app/Contents/MacOS/vykar</string>
+        <string>--config</string>
+        <string>/Users/USERNAME/.config/vykar/config.yaml</string>
+        <string>daemon</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/Users/USERNAME/Library/Logs/vykar.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/USERNAME/Library/Logs/vykar.log</string>
+</dict>
+</plist>
+```
+
+```bash
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.borgbase.vykar.plist
+launchctl print gui/$(id -u)/com.borgbase.vykar     # state, last exit status
+launchctl bootout gui/$(id -u)/com.borgbase.vykar   # stop and unload
+```
+
+This runs `vykar daemon`, which keeps its own schedule (`schedule.every` or
+`schedule.cron`) in one long-lived process. To have launchd do the scheduling instead,
+replace `daemon` with `backup`, drop `KeepAlive`, and add a `StartCalendarInterval`
+dictionary — but note that a launchd agent only runs while the user is logged in, and a
+missed slot fires at the next login rather than being caught up.
+
+The passphrase must come from `passcommand`, `passphrase`, or `VYKAR_PASSPHRASE`; a
+launchd job cannot answer an interactive prompt. `passcommand` reading from the login
+keychain is the usual choice.
+
+**Do not use cron on macOS.** TCC attributes a cron job's file access to
+`/usr/sbin/cron`, not to the program it runs, so granting FDA to vykar has no effect —
+you would have to grant it to `cron` itself, which hands full disk access to every job
+in every user's crontab.
+
+**Do not ad-hoc sign vykar** (`codesign --sign - /usr/local/bin/vykar`). It replaces the
+Developer ID identity with one whose code hash changes on every update, so the FDA grant
+breaks each time you upgrade and has to be toggled off and on again. If macOS kills
+vykar on launch with `Killed: 9`, the signature is invalid — check with
+`codesign --verify --strict --verbose=2` and reinstall rather than re-signing.
+
+Backups run from a background launchd job also cannot list cloud-only (dataless)
+directories; see [Backup — cloud storage](backup.md) for what that omits.
+
 ### Docker
 
 The default Docker entrypoint runs `vykar daemon`. See [Installing — Docker](install.md#docker) for container setup, volume mounts, and Docker Compose examples.

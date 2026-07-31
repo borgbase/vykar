@@ -178,19 +178,58 @@ download_and_extract() {
     EXTRACTED="${tmpdir}/${BINARY_NAME}"
 }
 
+# --- Code signature check (macOS) -----------------------------------------
+
+# macOS kills binaries whose signature does not validate, with no diagnostic
+# beyond "Killed: 9". Official builds are signed and notarized, so a failure
+# here means the file changed between GitHub and this machine.
+verify_signature() {
+    [ "$(uname -s)" = "Darwin" ] || return 0
+    command -v codesign >/dev/null 2>&1 || return 0
+    codesign --verify --strict "$1" >/dev/null 2>&1 && return 0
+
+    cat >&2 <<EOF
+
+Error: the vykar binary at $1 has an invalid code signature.
+macOS will refuse to run it.
+
+Official macOS builds are signed and notarized, so the file was altered after
+download — antivirus software and intercepting HTTPS proxies are the usual cause.
+
+Do NOT work around this with 'codesign --sign -'. Ad-hoc signing does make the
+binary run, but it replaces vykar's stable signing identity with one that changes
+on every update, which breaks Full Disk Access for scheduled backups.
+
+Retry on a direct connection, or download the release manually from
+https://github.com/borgbase/vykar/releases and check it with:
+  codesign --verify --strict --verbose=2 ./vykar
+EOF
+    exit 1
+}
+
 # --- Install --------------------------------------------------------------
 
 install_binary() {
     local dest="${INSTALL_DIR}/${BINARY_NAME}"
+    local staged="${dest}.new"
 
+    verify_signature "$EXTRACTED"
+
+    # Stage inside the destination directory, then rename. rename(2) is atomic
+    # and swaps the inode rather than writing through a binary that may be
+    # running, which would fail partway and leave an unrunnable file behind.
     if [ -w "$INSTALL_DIR" ]; then
-        cp "$EXTRACTED" "$dest"
-        chmod 755 "$dest"
+        cp "$EXTRACTED" "$staged"
+        chmod 755 "$staged"
+        mv -f "$staged" "$dest"
     else
         log "Installing to ${INSTALL_DIR} requires elevated permissions. Using sudo..."
-        sudo cp "$EXTRACTED" "$dest"
-        sudo chmod 755 "$dest"
+        sudo cp "$EXTRACTED" "$staged"
+        sudo chmod 755 "$staged"
+        sudo mv -f "$staged" "$dest"
     fi
+
+    verify_signature "$dest"
 
     log ""
     log "Installed: $("$dest" --version)"
@@ -222,6 +261,13 @@ main() {
     log ""
 
     prompt_config
+
+    if [ "$(uname -s)" = "Darwin" ]; then
+        log ""
+        log "macOS note: nightly backups need Full Disk Access, which macOS grants"
+        log "reliably only to bundled executables — not to a bare binary on PATH."
+        log "Setup: https://vykar.borgbase.com/daemon#launchd-macos"
+    fi
 
     log ""
     log "Done. Run 'vykar config' to create a starter configuration."

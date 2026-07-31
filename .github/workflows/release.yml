@@ -272,8 +272,21 @@ jobs:
           mkdir -p "${APP_BUNDLE}/Contents/MacOS" "${APP_BUNDLE}/Contents/Resources"
           cp crates/vykar-gui/macos/Info.plist "${APP_BUNDLE}/Contents/"
           cp "${RELEASE_DIR}/vykar-gui" "${APP_BUNDLE}/Contents/MacOS/"
+          # The CLI ships inside the bundle as well. macOS only grants Full Disk
+          # Access reliably to bundled executables, so scheduled launchd jobs must
+          # invoke .../Vykar Backup.app/Contents/MacOS/vykar rather than a bare
+          # binary on PATH. See docs/src/daemon.md.
+          cp "${RELEASE_DIR}/vykar" "${RELEASE_DIR}/vykar-server" "${APP_BUNDLE}/Contents/MacOS/"
           brew install librsvg
           crates/vykar-gui/macos/create-icns.sh docs/src/images/logo-colored-gradient.svg "${APP_BUNDLE}/Contents/Resources/AppIcon.icns"
+      - name: Require signing for published releases
+        if: >-
+          (github.event_name == 'push' || github.event.inputs.publish_release == 'true')
+          && env.HAS_SIGNING == ''
+        run: |
+          echo "::error::MACOS_CERTIFICATE is not available. Unsigned macOS binaries are"
+          echo "::error::killed on launch by the OS, so this release must not be published."
+          exit 1
       - name: Import signing certificate
         if: env.HAS_SIGNING != ''
         env:

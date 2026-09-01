@@ -71,6 +71,33 @@ vykar restore latest /tmp/restored
 
 Restore applies extended attributes (`xattrs`) by default. Control this with the top-level `xattrs.enabled` config setting.
 
+### Restore part of a snapshot
+
+`--pattern` takes a single glob, matched against paths **as they are stored in the snapshot** — exactly what `vykar snapshot list` prints. Check that form before writing a pattern.
+
+```bash
+# See the stored path form first
+vykar snapshot list a1b2c3d4 | head
+
+# Restore one subtree (the directory and everything under it)
+vykar restore a1b2c3d4 /tmp/restored --pattern 'reports*'
+
+# Multi-source snapshot: paths carry the source prefix
+vykar restore a1b2c3d4 /tmp/restored --pattern 'home/user/documents/reports*'
+
+# Every PDF, at any depth
+vykar restore a1b2c3d4 /tmp/restored --pattern '*.pdf'
+```
+
+- Stored paths never begin with `/`. Backing up the single source `/home/user/documents` stores `reports/q1.pdf`; with several sources each path is prefixed with the source's absolute path minus the leading `/`, giving `home/user/documents/reports/q1.pdf`.
+- `*` spans `/`, so `reports*` already selects the whole subtree — no `**` needed, and `*.pdf` matches at any depth. This differs from `snapshot find --name`, where `*` stops at a path separator.
+- The glob must match the whole path. `--pattern 'reports'` restores only the directory itself, empty; use `reports*` to include its contents.
+- Quote the pattern, or your shell expands `*` against the current directory before vykar sees it.
+- Files land under the destination at their full stored path: restoring `home/user/documents/reports*` into `/tmp/restored` gives `/tmp/restored/home/user/documents/reports/`.
+- A pattern that matches nothing is not an error — restore reports `Restored: 0 files, 0 dirs, 0 symlinks`. If you see that, re-check the paths with `vykar snapshot list`.
+
+> **Important:** patterns are matched against snapshot-relative paths, not absolute filesystem paths. `--pattern '/home/user/documents/reports/*'` silently matches nothing. Drop the leading `/` and use the form `vykar snapshot list` shows.
+
 ## Browse via WebDAV and browser UI (mount)
 
 Browse snapshot contents via a local read-only WebDAV server. The same endpoint also serves a built-in HTML browser UI.

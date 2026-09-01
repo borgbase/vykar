@@ -125,6 +125,10 @@ pub(crate) enum Commands {
         dest: String,
 
         /// Only restore paths matching this glob pattern
+        ///
+        /// Matched against snapshot-relative paths as shown by `vykar snapshot
+        /// list`, which never begin with `/`. `*` spans `/`, so `reports*`
+        /// selects `reports` and everything beneath it.
         #[arg(long)]
         pattern: Option<String>,
 

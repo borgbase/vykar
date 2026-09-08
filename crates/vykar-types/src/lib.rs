@@ -6,5 +6,6 @@ mod hash_id;
 
 pub mod chunk_id;
 pub mod error;
+pub mod hash;
 pub mod pack_id;
 pub mod snapshot_id;

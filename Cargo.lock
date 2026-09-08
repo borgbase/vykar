@@ -871,6 +871,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "blake3"
+version = "1.8.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6d9e454fc11f76977dc803893aff6304ed33d6a26efae8696573bea74baa27ae"
+dependencies = [
+ "arrayvec",
+ "cc",
+ "cfg-if",
+ "constant_time_eq",
+ "cpufeatures 0.3.0",
+]
+
+[[package]]
 name = "block-buffer"
 version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8506,10 +8519,12 @@ version = "0.19.1"
 dependencies = [
  "blake2 0.10.6",
  "blake2b_simd",
+ "blake3",
  "hex",
  "rand 0.10.1",
  "rmp-serde",
  "serde",
+ "serde_json",
  "thiserror 2.0.18",
 ]
 

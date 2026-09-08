@@ -1,6 +1,53 @@
+use crate::hash::HashAlgorithm;
+
 hash_id! {
-    /// A 32-byte chunk identifier computed as keyed BLAKE2b-256.
+    /// A 32-byte chunk identifier computed as a keyed 256-bit hash.
     ChunkId
+}
+
+/// The chunk-ID key bundled with the algorithm that consumes it.
+///
+/// The key alone was threaded through the whole chunking path; widening it to
+/// carry the algorithm makes it structurally impossible to compute a chunk ID
+/// without having chosen one, and rules out pairing a v2 repository's key with
+/// v3 hashing.
+///
+/// `Copy` and 33 bytes, so it is passed by value at the hoisting sites.
+#[derive(Clone, Copy)]
+pub struct ChunkHasher {
+    algo: HashAlgorithm,
+    key: [u8; 32],
+}
+
+impl ChunkHasher {
+    pub const fn new(algo: HashAlgorithm, key: [u8; 32]) -> Self {
+        Self { algo, key }
+    }
+
+    pub const fn algorithm(&self) -> HashAlgorithm {
+        self.algo
+    }
+
+    /// The raw 32-byte key.
+    ///
+    /// Needed by the two callers that hash the key itself rather than hashing
+    /// *with* it: the TOFU identity fingerprint and the `check` runner's
+    /// fingerprint comparison.
+    pub const fn key(&self) -> &[u8; 32] {
+        &self.key
+    }
+}
+
+/// Redacting: for an encrypted repository the chunk-ID key is secret key
+/// material from `keys/repokey`, and this type is reachable from structs that
+/// derive `Debug`.
+impl std::fmt::Debug for ChunkHasher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChunkHasher")
+            .field("algo", &self.algo)
+            .field("key", &"<redacted>")
+            .finish()
+    }
 }
 
 impl ChunkId {

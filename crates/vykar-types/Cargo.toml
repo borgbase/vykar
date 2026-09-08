@@ -14,6 +14,11 @@ workspace = true
 # are on the hottest path in the tool.
 blake2b_simd = "1"
 
+# BLAKE3 — the chunk/pack digest for repository format v3. Default features
+# only: `hash`/`keyed_hash` are single-threaded regardless, and the `rayon`
+# feature only affects `update_rayon`/`update_mmap_rayon`, which vykar never calls.
+blake3.workspace = true
+
 # Hex encoding
 hex.workspace = true
 
@@ -30,3 +35,6 @@ thiserror.workspace = true
 [dev-dependencies]
 # Independent reference implementation for the ChunkId/PackId equivalence tests.
 blake2.workspace = true
+
+# JSON is the wire format for `HashAlgorithm` in the REST DTOs.
+serde_json.workspace = true

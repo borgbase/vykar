@@ -1,5 +1,8 @@
 use std::process::ExitCode;
 
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+mod allocator;
+
 // musl's built-in allocator has a single global lock, which serialises the
 // chunking and upload threads. mimalloc removes that bottleneck on the static
 // Linux builds; every other target keeps the system allocator.
@@ -8,5 +11,8 @@ use std::process::ExitCode;
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() -> ExitCode {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    allocator::configure();
+
     vykar_cli::run()
 }

@@ -576,6 +576,14 @@ limits:
 
 `limits.connections` also controls SFTP connection pool size, backup in-flight uploads, and restore reader concurrency. Internal pipeline knobs are now derived automatically from `connections` and `threads`.
 
+On Linux builds linked against glibc, the CLI defaults to two malloc arenas to
+reduce retained memory. To override this process-wide limit, set
+`MALLOC_ARENA_MAX` or `GLIBC_TUNABLES=glibc.malloc.arena_max=N` in the environment
+before starting vykar (not in a config `env_file`). For example,
+`MALLOC_ARENA_MAX=0 vykar backup` restores glibc's automatic arena limit.
+This setting does not apply to musl builds, which use mimalloc, or to other
+platforms.
+
 ## Hooks
 
 Shell commands that run at specific points in the vykar command lifecycle. Hooks can be defined at three levels: global (top-level `hooks:`), per-repository, and per-source.

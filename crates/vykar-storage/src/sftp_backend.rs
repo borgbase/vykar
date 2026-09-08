@@ -82,11 +82,11 @@ struct SshHandler {
 impl client::Handler for SshHandler {
     type Error = russh::Error;
 
-    async fn check_server_key(
+    fn check_server_key(
         &mut self,
         server_public_key: &ssh_key::PublicKey,
-    ) -> std::result::Result<bool, Self::Error> {
-        match verify_or_learn_host_key(
+    ) -> impl std::future::Future<Output = std::result::Result<bool, Self::Error>> + Send {
+        let result = match verify_or_learn_host_key(
             &self.host,
             self.port,
             &self.known_hosts_path,
@@ -111,7 +111,8 @@ impl client::Handler for SshHandler {
                 );
                 Err(e)
             }
-        }
+        };
+        std::future::ready(result)
     }
 }
 

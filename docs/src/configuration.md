@@ -576,13 +576,30 @@ limits:
 
 `limits.connections` also controls SFTP connection pool size, backup in-flight uploads, and restore reader concurrency. Internal pipeline knobs are now derived automatically from `connections` and `threads`.
 
-On Linux builds linked against glibc, the CLI defaults to two malloc arenas to
-reduce retained memory. To override this process-wide limit, set
-`MALLOC_ARENA_MAX` or `GLIBC_TUNABLES=glibc.malloc.arena_max=N` in the environment
-before starting vykar (not in a config `env_file`). For example,
-`MALLOC_ARENA_MAX=0 vykar backup` restores glibc's automatic arena limit.
-This setting does not apply to musl builds, which use mimalloc, or to other
-platforms.
+On Linux builds linked against glibc, the CLI adjusts two process-wide
+allocator settings at startup to reduce retained memory:
+
+| Knob | Value | Environment variable | `GLIBC_TUNABLES` entry |
+| --- | --- | --- | --- |
+| Arena limit | 2 | `MALLOC_ARENA_MAX` | `glibc.malloc.arena_max=N` |
+| mmap threshold | 1 MiB | `MALLOC_MMAP_THRESHOLD_` | `glibc.malloc.mmap_threshold=N` |
+
+Pinning the mmap threshold is the larger of the two. Allocations at or above it
+are served by `mmap` and released to the kernel when freed, rather than retained
+in an arena the backup never reuses. glibc's default is to raise this threshold
+as a program runs — up to 32 MiB — so partway through a backup the multi-MiB
+chunk, blob, and pack buffers stop being released. On a 49 GiB local backup,
+pinning it cut mean peak resident memory by 34%, for about 5% more CPU time and
+3-5% more wall time, and made peak memory far more repeatable run to run. Combined
+with the arena limit, peak resident memory is about 41% below untuned glibc.
+
+Set either variable, in the environment before starting vykar (not in a config
+`env_file`), to hand that knob back to glibc. Note the trailing underscore in
+`MALLOC_MMAP_THRESHOLD_` — that is how glibc spells it. For example,
+`MALLOC_ARENA_MAX=0 vykar backup` restores glibc's automatic arena limit, and
+`MALLOC_MMAP_THRESHOLD_=131072 vykar backup` restores its dynamic threshold.
+Raising the mmap threshold trades memory back for CPU time. These settings do
+not apply to musl builds, which use mimalloc, or to other platforms.
 
 ## Hooks
 

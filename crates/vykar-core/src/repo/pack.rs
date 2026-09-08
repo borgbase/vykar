@@ -110,7 +110,7 @@ impl PackWriter {
 
     /// Initialize the heap-backed pack buffer on first blob.
     fn init_buffer(&mut self) {
-        let mut v = Vec::with_capacity(self.target_size.min(512 * 1024 * 1024));
+        let mut v = Vec::with_capacity(PACK_HEADER_SIZE + self.target_size.min(512 * 1024 * 1024));
         v.extend_from_slice(PACK_MAGIC);
         v.push(PACK_VERSION_CURRENT);
         self.buffer = Some(PackBuffer::Memory(v));
@@ -131,6 +131,13 @@ impl PackWriter {
 
         // Append [4B length LE][encrypted_data] into the buffer.
         let PackBuffer::Memory(v) = self.buffer.as_mut().expect("buffer initialized above");
+        // The blob crossing the target seals this pack. Reserve only its
+        // actual bytes rather than letting Vec double a large buffer that
+        // will immediately move to the upload queue.
+        let additional = 4 + encrypted_blob.len();
+        if self.current_size + additional >= self.target_size {
+            v.reserve_exact(additional);
+        }
         v.extend_from_slice(&blob_len.to_le_bytes());
         v.extend_from_slice(&encrypted_blob);
 
@@ -359,6 +366,25 @@ mod tests {
         assert!(!w.should_flush());
         w.add_blob(dummy_chunk_id(0), vec![0u8; 120]).unwrap();
         assert!(w.should_flush());
+    }
+
+    #[test]
+    fn crossing_target_does_not_double_pack_capacity() {
+        let target = 1024 * 1024;
+        for last_size in [4, 128, target + 1] {
+            let mut w = PackWriter::new(PackType::Data, target);
+            w.add_blob(dummy_chunk_id(1), vec![1; target - 8]).unwrap();
+            assert!(!w.should_flush());
+            w.add_blob(dummy_chunk_id(2), vec![2; last_size]).unwrap();
+            assert!(w.should_flush());
+
+            let sealed = w.seal().unwrap();
+            let SealedData::Memory(data) = sealed.data;
+            assert_eq!(data.len(), PACK_HEADER_SIZE + target + last_size);
+            assert_eq!(data.capacity(), data.len());
+            assert_eq!(scan_pack_blobs_bytes(&data).unwrap().len(), 2);
+            assert_eq!(PackId::compute(&data), sealed.pack_id);
+        }
     }
 
     #[test]

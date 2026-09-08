@@ -637,6 +637,115 @@ fn flush_on_abort_survives_pack_upload_failure() {
     );
 }
 
+/// A pre-BLAKE3 vykar-server advertises no `hashes` in `/health`. `init` must
+/// refuse *before writing anything*, rather than succeeding and leaving a
+/// repository whose first `backup` fails: `init` writes only non-pack keys,
+/// every one of which an old server accepts.
+#[test]
+fn init_refuses_a_v3_repository_against_a_pre_blake3_server() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+
+    crate::testutil::init_test_environment();
+
+    // A pre-BLAKE3 /health body: no `protocol_version`, no `hashes`.
+    let body = r#"{"status":"ok","version":"0.19.1"}"#;
+    let health = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    let not_found = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_string();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let url = format!("http://127.0.0.1:{port}");
+
+    // Serve /health, then record whether anything else was ever requested.
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let handle = std::thread::spawn(move || {
+        listener.set_nonblocking(false).expect("blocking listener");
+        while let Ok((mut stream, _)) = listener.accept() {
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request_line = String::new();
+            reader.read_line(&mut request_line).unwrap_or(0);
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 || line.trim().is_empty() {
+                    break;
+                }
+            }
+            let line = request_line.trim().to_string();
+            let reply = if line.contains("/health") {
+                &health
+            } else {
+                // Everything else 404s, so the repository reads as absent.
+                &not_found
+            };
+            if tx.send(line).is_err() {
+                break;
+            }
+            let _ = stream.write_all(reply.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+
+    let storage = vykar_storage::backend_from_config(&vykar_storage::StorageConfig {
+        url: url.clone(),
+        region: None,
+        access_key_id: None,
+        secret_access_key: None,
+        sftp_key: None,
+        sftp_known_hosts: None,
+        max_connections: None,
+        sftp_timeout: None,
+        access_token: None,
+        allow_insecure_http: true,
+        retry: vykar_storage::RetryConfig {
+            max_retries: 0,
+            ..Default::default()
+        },
+        s3_soft_delete: false,
+    })
+    .expect("REST backend builds");
+
+    let err = Repository::init(
+        storage,
+        EncryptionMode::None,
+        ChunkerConfig::default(),
+        None,
+        Some(&crate::config::RepositoryConfig {
+            url: url.clone(),
+            ..Default::default()
+        }),
+        None,
+    )
+    .err()
+    .expect("init must refuse a pre-BLAKE3 server");
+
+    let message = err.to_string();
+    assert!(
+        message.contains("does not support") && message.contains("0.19.1"),
+        "the error must name the server and its version, got: {message}"
+    );
+    assert!(
+        message.contains("Upgrade the server"),
+        "the error must say what to do, got: {message}"
+    );
+
+    // Nothing beyond the existence check and the probe may have been sent.
+    let mut writes = Vec::new();
+    while let Ok(line) = rx.recv_timeout(std::time::Duration::from_millis(300)) {
+        if line.starts_with("PUT") || line.starts_with("POST") {
+            writes.push(line);
+        }
+    }
+    assert!(
+        writes.is_empty(),
+        "init must write nothing when the probe fails, but sent: {writes:?}"
+    );
+    drop(handle);
+}
+
 #[test]
 fn init_creates_the_current_repository_format() {
     crate::testutil::init_test_environment();

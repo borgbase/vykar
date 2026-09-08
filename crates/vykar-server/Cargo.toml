@@ -20,6 +20,9 @@ workspace = true
 # Internal
 vykar-common.workspace = true
 vykar-protocol.workspace = true
+# `HashAlgorithm` / `Hasher256`: the server must agree with the client on pack
+# digests by construction, so both sides use the same code path.
+vykar-types.workspace = true
 
 # Web framework
 axum = "0.8"

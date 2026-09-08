@@ -8,6 +8,7 @@
 )]
 
 use std::io::Read;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use blake2::digest::{Update, VariableOutput};
@@ -18,9 +19,37 @@ use crate::RetryConfig;
 use vykar_types::error::{Result, VykarError};
 
 use crate::{
-    RepackPlanRequest, RepackResultResponse, StorageBackend, VerifyPacksPlanRequest,
-    VerifyPacksResponse,
+    RepackPlanRequest, RepackResultResponse, ServerCapabilities, StorageBackend,
+    VerifyPacksPlanRequest, VerifyPacksResponse,
 };
+use vykar_types::hash::HashAlgorithm;
+
+/// Read a short prefix of a response body for use in an error message.
+///
+/// Bounded and lossy on purpose: this is diagnostic text appended to an HTTP
+/// status, not data. Returns an empty string when the body is unreadable or
+/// blank so the caller's message degrades to the bare status.
+fn read_body_snippet(resp: &mut http::Response<ureq::Body>) -> String {
+    const MAX: u64 = 512;
+    let mut buf = Vec::new();
+    if resp
+        .body_mut()
+        .as_reader()
+        .take(MAX)
+        .read_to_end(&mut buf)
+        .is_err()
+        || buf.is_empty()
+    {
+        return String::new();
+    }
+    let text = String::from_utf8_lossy(&buf);
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        String::new()
+    } else {
+        format!(": {trimmed}")
+    }
+}
 
 /// HTTP REST backend for remote repository access via vykar-server.
 pub struct RestBackend {
@@ -32,6 +61,16 @@ pub struct RestBackend {
     /// does not allocate a header string per request.
     bearer: Option<String>,
     retry: RetryConfig,
+    /// The repository's content-digest algorithm, bound once by
+    /// `Repository::init`/`open` after the format is resolved.
+    ///
+    /// A `OnceLock` rather than a setter over a `Mutex`/atomic: backends are
+    /// held as `Arc<dyn StorageBackend>`, and bind-once needs to be the
+    /// natural implementation, not a convention. An atomic would prevent a
+    /// data race without preventing uploads from disagreeing with the pack
+    /// writer. Unset means BLAKE2b, which is what every repository used before
+    /// format v3 and what a caller that never binds should get.
+    content_hash: OnceLock<HashAlgorithm>,
 }
 
 impl RestBackend {
@@ -60,6 +99,7 @@ impl RestBackend {
             agent,
             bearer: token.map(|t| format!("Bearer {t}")),
             retry,
+            content_hash: OnceLock::new(),
         })
     }
 
@@ -102,10 +142,16 @@ impl RestBackend {
                 || self.authed(self.agent.post(url)).send_json(payload),
                 |mut resp| {
                     let status = resp.status().as_u16();
-                    crate::retry::classify_status(
-                        status,
-                        format!("REST {op_name} failed: HTTP {status}"),
-                    )?;
+                    if status >= 400 {
+                        // Include the server's own message. Without it a 400
+                        // (e.g. "protocol version 2 not supported") reaches
+                        // the user as a bare "HTTP 400".
+                        let detail = read_body_snippet(&mut resp);
+                        crate::retry::classify_status(
+                            status,
+                            format!("REST {op_name} failed: HTTP {status}{detail}"),
+                        )?;
+                    }
                     let mut buf = Vec::new();
                     resp.body_mut()
                         .as_reader()
@@ -117,6 +163,32 @@ impl RestBackend {
             .map_err(|e| VykarError::Other(format!("REST {op_name}: {e}")))?;
         serde_json::from_slice(&body)
             .map_err(|e| VykarError::Other(format!("REST {op_name} parse: {e}")))
+    }
+
+    /// GET `/health` and parse the server's advertised capabilities.
+    fn fetch_server_capabilities(&self) -> Result<ServerCapabilities> {
+        let url = format!("{}/health", self.base_url);
+        self.retry_call(
+            "health",
+            || self.authed(self.agent.get(&url)).call(),
+            |mut resp| {
+                let status = resp.status().as_u16();
+                if status >= 400 {
+                    crate::retry::classify_status(status, format!("REST health: HTTP {status}"))?;
+                }
+                let mut buf = Vec::new();
+                resp.body_mut()
+                    .as_reader()
+                    .read_to_end(&mut buf)
+                    .map_err(HttpRetryError::BodyIo)?;
+                Ok(buf)
+            },
+        )
+        .map_err(|e| VykarError::Other(format!("REST health: {e}")))
+        .and_then(|body| {
+            serde_json::from_slice(&body)
+                .map_err(|e| VykarError::Other(format!("REST health parse: {e}")))
+        })
     }
 
     /// POST `payload` as JSON, ignoring the response body.
@@ -240,16 +312,36 @@ impl RestBackend {
         hex::encode(out)
     }
 
+    /// The content-digest algorithm this backend was bound to, defaulting to
+    /// BLAKE2b when nothing bound it.
+    fn content_hash(&self) -> HashAlgorithm {
+        self.content_hash.get().copied().unwrap_or_default()
+    }
+
     /// Shared PUT implementation for both borrowed and owned data.
+    ///
+    /// Note what this does for pack keys: it never hashes them. A pack key
+    /// *is* the pack ID, so the hex is lifted straight out of the key — which
+    /// means that for packs only the header *name* changes with the
+    /// algorithm, because the value is already the right digest. Non-pack
+    /// objects are hashed here and stay BLAKE2b unconditionally.
     fn put_bytes(&self, key: &str, data: &[u8]) -> Result<()> {
         let url = self.url(key);
-        let checksum = Self::try_extract_pack_hex(key)
-            .map_or_else(|| Self::compute_blake2b_256_hex(data), str::to_string);
+        let (header, checksum) = match Self::try_extract_pack_hex(key) {
+            Some(pack_hex) => (
+                match self.content_hash() {
+                    HashAlgorithm::Blake2b => "X-Content-BLAKE2b",
+                    HashAlgorithm::Blake3 => "X-Content-BLAKE3",
+                },
+                pack_hex.to_string(),
+            ),
+            None => ("X-Content-BLAKE2b", Self::compute_blake2b_256_hex(data)),
+        };
         self.retry_call(
             &format!("PUT {key}"),
             || {
                 self.authed(self.agent.put(&url))
-                    .header("X-Content-BLAKE2b", &checksum)
+                    .header(header, &checksum)
                     .send(data)
             },
             |resp| {
@@ -516,6 +608,25 @@ impl StorageBackend for RestBackend {
         self.verify_packs(plan)
     }
 
+    fn bind_content_hash(&self, algo: HashAlgorithm) -> Result<()> {
+        match self.content_hash.set(algo) {
+            Ok(()) => Ok(()),
+            // Already bound. The same value is a harmless re-bind (open then
+            // reopen); a different one means two repositories are sharing one
+            // backend, which would upload packs under the wrong header.
+            Err(_) if self.content_hash.get() == Some(&algo) => Ok(()),
+            Err(_) => Err(VykarError::Other(format!(
+                "REST backend already bound to content hash {}, cannot rebind to {}",
+                self.content_hash().as_str(),
+                algo.as_str()
+            ))),
+        }
+    }
+
+    fn server_capabilities(&self) -> Result<ServerCapabilities> {
+        self.fetch_server_capabilities()
+    }
+
     fn server_init(&self) -> Result<()> {
         let url = format!("{}?init", self.base_url);
         self.retry_call(
@@ -585,6 +696,205 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("malformed Content-Range"), "got: {err}");
+    }
+
+    // ── Content-hash binding and capability probe ──────────────────────
+
+    fn json_response(body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        )
+    }
+
+    #[test]
+    fn unbound_backend_defaults_to_blake2b() {
+        let backend = RestBackend::new("http://127.0.0.1:1", None, no_retry(), None).unwrap();
+        assert_eq!(backend.content_hash(), HashAlgorithm::Blake2b);
+    }
+
+    #[test]
+    fn binding_the_same_hash_twice_is_a_no_op() {
+        let backend = RestBackend::new("http://127.0.0.1:1", None, no_retry(), None).unwrap();
+        backend.bind_content_hash(HashAlgorithm::Blake3).unwrap();
+        backend.bind_content_hash(HashAlgorithm::Blake3).unwrap();
+        assert_eq!(backend.content_hash(), HashAlgorithm::Blake3);
+    }
+
+    /// A conflicting rebind means two repositories are sharing one backend,
+    /// which would upload packs under the wrong header. It must not be
+    /// silently accepted, and must not silently switch the algorithm either.
+    #[test]
+    fn conflicting_rebind_is_rejected_and_keeps_the_first_binding() {
+        let backend = RestBackend::new("http://127.0.0.1:1", None, no_retry(), None).unwrap();
+        backend.bind_content_hash(HashAlgorithm::Blake2b).unwrap();
+        let err = backend
+            .bind_content_hash(HashAlgorithm::Blake3)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("already bound"), "got: {err}");
+        assert_eq!(backend.content_hash(), HashAlgorithm::Blake2b);
+    }
+
+    /// A pre-BLAKE3 server answers /health without `hashes`. The client must
+    /// read that as blake2b-only rather than failing to parse the response.
+    #[test]
+    fn legacy_health_response_advertises_blake2b_only() {
+        let (url, handle) = mock_server(&json_response(r#"{"status":"ok","version":"0.19.1"}"#));
+        let backend = RestBackend::new(&url, None, no_retry(), None).unwrap();
+
+        let caps = backend.server_capabilities().unwrap();
+        assert_eq!(caps.version, "0.19.1");
+        assert_eq!(caps.protocol_version, 0);
+        assert!(caps.supports_hash(HashAlgorithm::Blake2b));
+        assert!(
+            !caps.supports_hash(HashAlgorithm::Blake3),
+            "a server that advertises no hashes must not be assumed to do BLAKE3"
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn new_health_response_advertises_blake3() {
+        let (url, handle) = mock_server(&json_response(
+            r#"{"status":"ok","version":"0.20.0","protocol_version":2,"hashes":["blake2b","blake3"]}"#,
+        ));
+        let backend = RestBackend::new(&url, None, no_retry(), None).unwrap();
+
+        let caps = backend.server_capabilities().unwrap();
+        assert_eq!(caps.protocol_version, 2);
+        assert!(caps.supports_hash(HashAlgorithm::Blake3));
+        handle.join().unwrap();
+    }
+
+    /// A *newer* server may advertise an algorithm this binary has never heard
+    /// of. That must not fail deserialization of the whole response.
+    #[test]
+    fn unknown_advertised_hash_does_not_break_parsing() {
+        let (url, handle) = mock_server(&json_response(
+            r#"{"status":"ok","version":"9.9.9","protocol_version":7,"hashes":["blake2b","blake3","future9"]}"#,
+        ));
+        let backend = RestBackend::new(&url, None, no_retry(), None).unwrap();
+
+        let caps = backend.server_capabilities().unwrap();
+        assert!(caps.supports_hash(HashAlgorithm::Blake3));
+        handle.join().unwrap();
+    }
+
+    /// Pack uploads carry the header matching the bound algorithm, and the
+    /// value is the pack key's own hex — `put_bytes` never rehashes a pack.
+    #[test]
+    fn pack_upload_header_follows_the_bound_hash() {
+        for (algo, expected_header) in [
+            (HashAlgorithm::Blake2b, "x-content-blake2b"),
+            (HashAlgorithm::Blake3, "x-content-blake3"),
+        ] {
+            let hex = "ab".to_string() + &"cd".repeat(31);
+            let key = format!("packs/ab/{hex}");
+            let (url, request_line) =
+                capture_request("HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n");
+            let backend = RestBackend::new(&url, None, no_retry(), None).unwrap();
+            backend.bind_content_hash(algo).unwrap();
+
+            backend.put(&key, b"pack bytes").unwrap();
+
+            let request = request_line.join().unwrap().to_ascii_lowercase();
+            assert!(
+                request.contains(&format!("{expected_header}: {hex}")),
+                "{algo}: expected `{expected_header}: {hex}` in request:\n{request}"
+            );
+            let other = match algo {
+                HashAlgorithm::Blake2b => "x-content-blake3",
+                HashAlgorithm::Blake3 => "x-content-blake2b",
+            };
+            assert!(
+                !request.contains(other),
+                "{algo}: both digest headers were sent, which the server rejects:\n{request}"
+            );
+        }
+    }
+
+    /// Non-pack objects are hashed by the client and stay BLAKE2b regardless
+    /// of the repository format.
+    #[test]
+    fn non_pack_upload_stays_blake2b_under_a_blake3_binding() {
+        let (url, request_line) =
+            capture_request("HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n");
+        let backend = RestBackend::new(&url, None, no_retry(), None).unwrap();
+        backend.bind_content_hash(HashAlgorithm::Blake3).unwrap();
+
+        let data = b"repository config bytes";
+        backend.put("config", data).unwrap();
+
+        let request = request_line.join().unwrap().to_ascii_lowercase();
+        assert!(
+            request.contains(&format!(
+                "x-content-blake2b: {}",
+                RestBackend::compute_blake2b_256_hex(data)
+            )),
+            "got:\n{request}"
+        );
+        assert!(!request.contains("x-content-blake3"), "got:\n{request}");
+    }
+
+    /// A 400 must carry the server's own message. Without this the old-server
+    /// rejection reaches the user as a bare "HTTP 400".
+    #[test]
+    fn post_json_4xx_includes_the_server_message() {
+        let body = "protocol version 2 not supported; server supports <= 1";
+        let (url, handle) = mock_server(&format!(
+            "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        ));
+        let backend = RestBackend::new(&url, None, no_retry(), None).unwrap();
+
+        let err = backend
+            .repack(&RepackPlanRequest {
+                operations: Vec::new(),
+                protocol_version: 2,
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("protocol version 2 not supported"),
+            "the server's message must reach the user, got: {err}"
+        );
+        handle.join().unwrap();
+    }
+
+    /// Serve one canned response and hand back the full request text.
+    fn capture_request(response: &str) -> (String, std::thread::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let url = format!("http://127.0.0.1:{port}");
+        let response = response.to_string();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request = String::new();
+            let mut content_length = 0usize;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    content_length = v.trim().parse().unwrap_or(0);
+                }
+                let done = line.trim().is_empty();
+                request.push_str(&line);
+                if done {
+                    break;
+                }
+            }
+            // Drain the body so the client's write completes before we reply.
+            let mut body = vec![0u8; content_length];
+            let _ = std::io::Read::read_exact(&mut reader, &mut body);
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.flush().unwrap();
+            request
+        });
+        (url, handle)
     }
 
     /// Spin up a TCP listener that responds with a canned HTTP response to

@@ -4,14 +4,13 @@ use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use blake2::digest::{Update, VariableOutput};
-use blake2::Blake2bVar;
 use futures_util::TryStreamExt;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufWriter, SeekFrom};
 use tokio_util::io::{ReaderStream, StreamReader};
 
 use crate::error::ServerError;
 use crate::state::AppState;
+use vykar_types::hash::{HashAlgorithm, Hasher256};
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -130,26 +129,48 @@ pub async fn put_object(
             ))
         })?;
 
-    // Parse X-Content-BLAKE2b header
+    // Parse the content-digest header. Two named headers rather than one
+    // generalized `X-Content-Digest: <algo>=<hex>`: the BLAKE2b variant has to
+    // be kept for old-client compatibility either way, so generalizing would
+    // mean two mechanisms for no gain, and the named form keeps the error
+    // message below truthful.
+    //
+    //   BLAKE2b only                -> verify BLAKE2b
+    //   BLAKE3 only                 -> verify BLAKE3
+    //   both                        -> 400 (ambiguous)
+    //   neither, key is "packs/..." -> 400
+    //   neither, non-pack key       -> skip verification
     let is_pack = key.starts_with("packs/");
-    let expected_blake2b = match headers
-        .get("X-Content-BLAKE2b")
-        .and_then(|v| v.to_str().ok())
-    {
-        Some(hex_str) => {
-            if hex_str.len() != 64 || !hex_str.bytes().all(|b| b.is_ascii_hexdigit()) {
-                return Err(ServerError::BadRequest(
-                    "X-Content-BLAKE2b must be 64 hex characters".into(),
-                ));
+    let parse_digest = |name: &str| -> Result<Option<String>, ServerError> {
+        match headers.get(name).and_then(|v| v.to_str().ok()) {
+            Some(hex_str) => {
+                if hex_str.len() != 64 || !hex_str.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return Err(ServerError::BadRequest(format!(
+                        "{name} must be 64 hex characters"
+                    )));
+                }
+                Ok(Some(hex_str.to_ascii_lowercase()))
             }
-            Some(hex_str.to_ascii_lowercase())
+            None => Ok(None),
         }
-        None if is_pack => {
+    };
+    let expected_digest: Option<(HashAlgorithm, String)> = match (
+        parse_digest("X-Content-BLAKE2b")?,
+        parse_digest("X-Content-BLAKE3")?,
+    ) {
+        (Some(_), Some(_)) => {
+            return Err(ServerError::BadRequest(
+                "X-Content-BLAKE2b and X-Content-BLAKE3 are mutually exclusive".into(),
+            ));
+        }
+        (Some(hex_str), None) => Some((HashAlgorithm::Blake2b, hex_str)),
+        (None, Some(hex_str)) => Some((HashAlgorithm::Blake3, hex_str)),
+        (None, None) if is_pack => {
             return Err(ServerError::BadRequest(
                 "X-Content-BLAKE2b header required for pack uploads".into(),
             ));
         }
-        None => None,
+        (None, None) => None,
     };
 
     // Ensure parent directory exists. When it had to be created, fsync the new
@@ -192,9 +213,9 @@ pub async fn put_object(
             .map_err(ServerError::from)?;
         let mut writer = BufWriter::with_capacity(256 * 1024, temp_file);
 
-        let mut hasher = expected_blake2b
+        let mut hasher = expected_digest
             .as_ref()
-            .map(|_| Blake2bVar::new(32).expect("valid output size"));
+            .map(|(algo, _)| Hasher256::new(*algo));
 
         let mut data_len: u64 = 0;
         let mut buf = vec![0u8; 256 * 1024]; // 256 KiB read buffer
@@ -251,17 +272,17 @@ pub async fn put_object(
         }
     }
 
-    // Verify BLAKE2b checksum if header was present
-    if let (Some(expected), Some(hasher)) = (&expected_blake2b, hasher) {
-        let mut actual = [0u8; 32];
-        hasher
-            .finalize_variable(&mut actual)
-            .expect("correct length");
-        let actual_hex = hex::encode(actual);
+    // Verify the content digest if a header was present.
+    if let (Some((algo, expected)), Some(hasher)) = (&expected_digest, hasher) {
+        let actual_hex = hasher.finalize_hex();
         if actual_hex != *expected {
             let _ = tokio::fs::remove_file(&temp_path).await;
+            let name = match algo {
+                HashAlgorithm::Blake2b => "BLAKE2b",
+                HashAlgorithm::Blake3 => "BLAKE3",
+            };
             return Err(ServerError::Conflict(format!(
-                "BLAKE2b checksum mismatch: expected {expected}, got {actual_hex}"
+                "{name} checksum mismatch: expected {expected}, got {actual_hex}"
             )));
         }
     }
@@ -878,6 +899,16 @@ mod tests {
         hex::encode(out)
     }
 
+    /// The BLAKE3 pack ID a client would send for `data`.
+    ///
+    /// Deliberately the *client's* `PackId::compute` rather than the server's
+    /// own hasher: that makes these tests assert client/server agreement
+    /// instead of restating the handler's implementation.
+    fn blake3_hex(data: &[u8]) -> String {
+        vykar_types::pack_id::PackId::compute(data, vykar_types::hash::HashAlgorithm::Blake3)
+            .to_hex()
+    }
+
     /// Send an authenticated PUT with an X-Content-BLAKE2b header.
     async fn authed_put_with_blake2b(
         router: axum::Router,
@@ -885,18 +916,30 @@ mod tests {
         body: Vec<u8>,
         checksum: &str,
     ) -> axum::response::Response {
+        authed_put_with_digests(router, path, body, &[("X-Content-BLAKE2b", checksum)]).await
+    }
+
+    /// Send an authenticated PUT with an arbitrary set of digest headers, so
+    /// the "both present" and "BLAKE3 only" cases are expressible.
+    async fn authed_put_with_digests(
+        router: axum::Router,
+        path: &str,
+        body: Vec<u8>,
+        digests: &[(&str, &str)],
+    ) -> axum::response::Response {
         use tower::ServiceExt;
-        let req = axum::http::Request::builder()
+        let mut builder = axum::http::Request::builder()
             .method("PUT")
             .uri(path)
             .header(
                 "Authorization",
                 format!("Bearer {}", super::super::test_helpers::TEST_TOKEN),
             )
-            .header("Content-Length", body.len().to_string())
-            .header("X-Content-BLAKE2b", checksum)
-            .body(Body::from(body))
-            .unwrap();
+            .header("Content-Length", body.len().to_string());
+        for (name, value) in digests {
+            builder = builder.header(*name, *value);
+        }
+        let req = builder.body(Body::from(body)).unwrap();
         router.oneshot(req).await.unwrap()
     }
 
@@ -1004,5 +1047,128 @@ mod tests {
 
         let resp = authed_put_with_blake2b(router, CONFIG_PATH, data, &wrong).await;
         assert_status(&resp, StatusCode::CONFLICT);
+    }
+
+    // -----------------------------------------------------------------------
+    // BLAKE3 checksum verification tests (repository format v3)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn put_pack_with_valid_blake3_checksum_succeeds() {
+        let (router, _state, _tmp) = setup_app(0);
+        let data = vec![0xDE; 512];
+        let checksum = blake3_hex(&data);
+        let pack_path = format!("/packs/{}/{}", &checksum[..2], checksum);
+
+        let resp =
+            authed_put_with_digests(router, &pack_path, data, &[("X-Content-BLAKE3", &checksum)])
+                .await;
+        assert_status(&resp, StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn put_pack_with_wrong_blake3_checksum_returns_409() {
+        let (router, _state, tmp) = setup_app(0);
+        let data = vec![0xDE; 512];
+        let real = blake3_hex(&data);
+        let wrong = "a".repeat(64);
+        let pack_path = format!("/packs/{}/{}", &real[..2], real);
+
+        let resp = authed_put_with_digests(
+            router.clone(),
+            &pack_path,
+            data,
+            &[("X-Content-BLAKE3", &wrong)],
+        )
+        .await;
+        assert_status(&resp, StatusCode::CONFLICT);
+        let body_text = String::from_utf8_lossy(&body_bytes(resp).await).into_owned();
+        assert!(
+            body_text.contains("BLAKE3 checksum mismatch"),
+            "got: {body_text}"
+        );
+
+        let resp = authed_get(router, &pack_path).await;
+        assert_status(&resp, StatusCode::NOT_FOUND);
+        assert_no_temp_files(tmp.path());
+    }
+
+    /// A BLAKE2b digest must not be accepted under the BLAKE3 header name, and
+    /// vice versa — otherwise a client/server algorithm mismatch would pass
+    /// verification and store a pack under the wrong name.
+    #[tokio::test]
+    async fn digest_headers_are_not_interchangeable() {
+        let (router, _state, _tmp) = setup_app(0);
+        let data = vec![0x5A; 256];
+        let b3 = blake3_hex(&data);
+        let b2 = blake2b_hex(&data);
+        let pack_path = format!("/packs/{}/{}", &b3[..2], b3);
+
+        // BLAKE2b digest sent under the BLAKE3 header.
+        let resp = authed_put_with_digests(
+            router.clone(),
+            &pack_path,
+            data.clone(),
+            &[("X-Content-BLAKE3", &b2)],
+        )
+        .await;
+        assert_status(&resp, StatusCode::CONFLICT);
+
+        // BLAKE3 digest sent under the BLAKE2b header.
+        let resp =
+            authed_put_with_digests(router, &pack_path, data, &[("X-Content-BLAKE2b", &b3)]).await;
+        assert_status(&resp, StatusCode::CONFLICT);
+    }
+
+    /// Both headers at once is ambiguous — which one is authoritative? — so it
+    /// is refused rather than resolved by precedence.
+    #[tokio::test]
+    async fn put_with_both_digest_headers_returns_400() {
+        let (router, _state, tmp) = setup_app(0);
+        let data = vec![0xDE; 512];
+        let b2 = blake2b_hex(&data);
+        let b3 = blake3_hex(&data);
+        let pack_path = format!("/packs/{}/{}", &b3[..2], b3);
+
+        let resp = authed_put_with_digests(
+            router,
+            &pack_path,
+            data,
+            &[("X-Content-BLAKE2b", &b2), ("X-Content-BLAKE3", &b3)],
+        )
+        .await;
+        assert_status(&resp, StatusCode::BAD_REQUEST);
+        let body_text = String::from_utf8_lossy(&body_bytes(resp).await).into_owned();
+        assert!(body_text.contains("mutually exclusive"), "got: {body_text}");
+        assert_no_temp_files(tmp.path());
+    }
+
+    #[tokio::test]
+    async fn put_with_malformed_blake3_checksum_returns_400() {
+        let (router, _state, _tmp) = setup_app(0);
+        let data = vec![0xAB; 128];
+
+        let resp =
+            authed_put_with_digests(router, CONFIG_PATH, data, &[("X-Content-BLAKE3", "abcd")])
+                .await;
+        assert_status(&resp, StatusCode::BAD_REQUEST);
+        let body_text = String::from_utf8_lossy(&body_bytes(resp).await).into_owned();
+        assert!(
+            body_text.contains("X-Content-BLAKE3") && body_text.contains("64 hex characters"),
+            "got: {body_text}"
+        );
+    }
+
+    /// The old-client path must keep working against a new server: this is the
+    /// `old client + v2 repo + new server` row of the compatibility matrix.
+    #[tokio::test]
+    async fn old_style_blake2b_pack_upload_still_succeeds() {
+        let (router, _state, _tmp) = setup_app(0);
+        let data = vec![0x77; 1024];
+        let checksum = blake2b_hex(&data);
+        let pack_path = format!("/packs/{}/{}", &checksum[..2], checksum);
+
+        let resp = authed_put_with_blake2b(router, &pack_path, data, &checksum).await;
+        assert_status(&resp, StatusCode::CREATED);
     }
 }

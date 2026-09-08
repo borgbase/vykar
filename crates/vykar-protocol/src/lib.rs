@@ -7,6 +7,7 @@
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 
 use serde::{Deserialize, Serialize};
+use vykar_types::hash::HashAlgorithm;
 
 // ── Pack format constants ──────────────────────────────────────────────────
 
@@ -115,6 +116,39 @@ pub fn check_protocol_version(version: u32) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+// ── Server capabilities (`GET /health`) ────────────────────────────────────
+
+/// The unauthenticated `GET /health` response.
+///
+/// `protocol_version` and `hashes` are additive: a pre-BLAKE3 server omits
+/// both, which the client reads as "protocol 1, blake2b only". That is what
+/// makes the `init` pre-flight probe able to tell an old server from a new one
+/// without a separate endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerCapabilities {
+    pub status: String,
+    pub version: String,
+    #[serde(default)]
+    pub protocol_version: u32,
+    /// Content-digest algorithms the server can verify, by wire name.
+    ///
+    /// `Vec<String>` rather than `Vec<HashAlgorithm>` deliberately: a *newer*
+    /// server may advertise an algorithm this binary has never heard of, and
+    /// that must not fail deserialization of the whole response.
+    #[serde(default)]
+    pub hashes: Vec<String>,
+}
+
+impl ServerCapabilities {
+    /// Whether the server can verify uploads under `algo`.
+    ///
+    /// BLAKE2b is unconditional: every server that ever existed verifies it,
+    /// and the oldest ones advertise nothing at all.
+    pub fn supports_hash(&self, algo: HashAlgorithm) -> bool {
+        algo == HashAlgorithm::Blake2b || self.hashes.iter().any(|h| h == algo.as_str())
+    }
 }
 
 // ── Repack wire types ──────────────────────────────────────────────────────

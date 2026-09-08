@@ -62,6 +62,11 @@ fn derive_plaintext_chunk_id_key(repo_id: &[u8], format: RepoFormat) -> [u8; 32]
     }
 }
 
+/// Best-effort repository label for the capability-probe error message.
+fn storage_label(repo_config_opts: Option<&RepositoryConfig>) -> String {
+    repo_config_opts.map_or_else(|| "the configured server".to_string(), |c| c.url.clone())
+}
+
 impl Repository {
     /// Initialize a new repository.
     pub fn init(
@@ -148,6 +153,34 @@ impl Repository {
                     (Arc::new(engine), Some(enc_key))
                 }
             };
+
+        // Pre-flight: refuse to create a repository the server cannot serve.
+        //
+        // Load-bearing, because `init` writes only non-pack keys (config,
+        // keys/repokey, index, index.gen) and an old server accepts every one
+        // of them. Without this probe `vykar init` would *succeed* against an
+        // old server and only the first `backup` would fail, leaving a repo
+        // nobody can write to.
+        match storage.server_capabilities() {
+            Ok(caps) => {
+                if !caps.supports_hash(format.chunk_hash()) {
+                    return Err(VykarError::Config(format!(
+                        "vykar-server at {} (version {}) does not support {} repositories \
+                         (format v{}). Upgrade the server to 0.20 or later, or keep using \
+                         an existing repository.",
+                        storage_label(repo_config_opts),
+                        caps.version,
+                        format.chunk_hash().as_str().to_uppercase(),
+                        format.version(),
+                    )));
+                }
+            }
+            // No server behind this backend — nothing to probe.
+            Err(VykarError::UnsupportedBackend(_)) => {}
+            Err(err) => return Err(err),
+        }
+
+        storage.bind_content_hash(format.chunk_hash())?;
 
         // Try server-side init (creates keys/, snapshots/, locks/, packs/* in one request).
         // Placed after all validation and crypto setup so a failure above doesn't
@@ -260,6 +293,11 @@ impl Repository {
         // The single version gate. Everything downstream asks the resolved
         // `RepoFormat`, never the raw integer.
         let format = RepoFormat::from_version(repo_config.version)?;
+
+        // Tell the backend which upload-integrity header to send. It was
+        // constructed before the config could be read, so this is the first
+        // moment the algorithm is known.
+        storage.bind_content_hash(format.chunk_hash())?;
 
         if repo_config.max_pack_size > 512 * 1024 * 1024 {
             return Err(VykarError::Config(format!(

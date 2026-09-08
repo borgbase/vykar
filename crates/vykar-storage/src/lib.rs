@@ -39,8 +39,10 @@ use vykar_types::error::{Result, VykarError};
 // Wire-format types used in the `StorageBackend` trait surface. Callers import
 // them from `vykar_protocol` directly.
 use vykar_protocol::{
-    RepackPlanRequest, RepackResultResponse, VerifyPacksPlanRequest, VerifyPacksResponse,
+    RepackPlanRequest, RepackResultResponse, ServerCapabilities, VerifyPacksPlanRequest,
+    VerifyPacksResponse,
 };
+use vykar_types::hash::HashAlgorithm;
 
 /// Abstract key-value storage for repository objects.
 /// Keys are `/`-separated string paths (e.g. "packs/ab/ab01cd02...").
@@ -123,7 +125,7 @@ pub trait StorageBackend: Send + Sync {
 
     // ── Capability methods: no defaults, deliberately ──────────────────────
     //
-    // These four report `UnsupportedBackend` on most backends, and callers
+    // Most of these report `UnsupportedBackend` on most backends, and callers
     // treat that error as "fall back to the client-side path". A default body
     // here would make a *wrapper* that forgets to forward silently answer
     // "unsupported" on behalf of a backend that does support the operation —
@@ -150,6 +152,29 @@ pub trait StorageBackend: Send + Sync {
 
     /// Server-side repository directory scaffolding (keys/, snapshots/, locks/, packs/*).
     fn server_init(&self) -> Result<()>;
+
+    /// Bind this backend to the repository's content-digest algorithm.
+    ///
+    /// The backend is built by `backend_from_config` before the repository
+    /// `config` has been read, so it has to be told which upload-integrity
+    /// header to send. Binding happens exactly once, immediately after the
+    /// format is resolved.
+    ///
+    /// Idempotent for the same value; a second, *different* binding is a
+    /// programming error and returns an error rather than silently switching
+    /// algorithms mid-run.
+    ///
+    /// Required rather than defaulted for the reason in the note above: a
+    /// default no-op would be inherited by every wrapper and could then
+    /// silently never reach `RestBackend`. Backends with nothing to bind get
+    /// the `Ok(())` body from `unsupported_server_ops!`.
+    fn bind_content_hash(&self, algo: HashAlgorithm) -> Result<()>;
+
+    /// Ask a vykar-server what it supports, before writing anything.
+    ///
+    /// Reports `UnsupportedBackend` for every backend that has no server
+    /// behind it; callers treat that as "nothing to check".
+    fn server_capabilities(&self) -> Result<ServerCapabilities>;
 }
 
 // Lets a `Box<Arc<dyn StorageBackend>>` coerce to `Box<dyn StorageBackend>`

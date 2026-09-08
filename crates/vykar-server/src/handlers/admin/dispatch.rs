@@ -94,10 +94,19 @@ pub async fn repo_action_dispatch(
     ))
 }
 
-/// GET /health - unauthenticated health check.
+/// GET /health - unauthenticated health check and capability advertisement.
+///
+/// `protocol_version` and `hashes` are additive: a pre-BLAKE3 server answers
+/// without them, which is how a new client tells the two apart at `vykar init`
+/// instead of discovering it at the first pack upload.
 pub async fn health() -> impl IntoResponse {
     axum::Json(serde_json::json!({
         "status": "ok",
         "version": env!("CARGO_PKG_VERSION"),
+        "protocol_version": vykar_protocol::PROTOCOL_VERSION,
+        "hashes": [
+            vykar_types::hash::HashAlgorithm::Blake2b.as_str(),
+            vykar_types::hash::HashAlgorithm::Blake3.as_str(),
+        ],
     }))
 }

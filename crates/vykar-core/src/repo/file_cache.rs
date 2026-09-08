@@ -102,6 +102,13 @@ impl<'de> serde::Deserialize<'de> for PathHash {
     }
 }
 
+/// Hash a path to its 16-byte file-cache key.
+///
+/// Deliberately BLAKE2b for every repository format, including v3. Note this is
+/// `Blake2bVar::new(16)`, i.e. BLAKE2b-**128**, which is a different digest
+/// from a truncated BLAKE2b-256 — do not "unify" the two. Changing it would
+/// invalidate every local file cache, and it hashes short path strings where
+/// digest throughput is irrelevant.
 fn hash_path(path: &str) -> PathHash {
     let mut hasher = Blake2bVar::new(16).expect("valid output size");
     hasher.update(path.as_bytes());
@@ -1724,6 +1731,31 @@ mod tests {
     const _CACHED_CHUNK_REF_SIZE_OK: () = assert!(std::mem::size_of::<CachedChunkRef>() == 36);
     const _CACHED_CHUNKS_SIZE_OK: () = assert!(std::mem::size_of::<CachedChunks>() <= 48);
     const _PARENT_ENTRY_SIZE_OK: () = assert!(std::mem::size_of::<ParentEntry>() <= 88);
+
+    /// Pins the 16-byte file-cache path key.
+    ///
+    /// It is BLAKE2b-**128** (`Blake2bVar::new(16)`), not a truncated
+    /// BLAKE2b-256, and stays that way for every repository format. A change
+    /// here silently invalidates every user's local file cache, so this is a
+    /// compatibility assertion, not a stale expectation to regenerate.
+    /// Cross-checked against Python's `hashlib.blake2b(digest_size=16)`.
+    #[test]
+    fn path_hash_known_answer() {
+        assert_eq!(
+            hex::encode(hash_path("/var/lib/vykar/example.bin").0),
+            "448ba6eaa656aeb83627f356e8663e5f"
+        );
+        // Distinct from the first 16 bytes of BLAKE2b-256 over the same input.
+        let mut wide = blake2::Blake2bVar::new(32).unwrap();
+        blake2::digest::Update::update(&mut wide, b"/var/lib/vykar/example.bin");
+        let mut out = [0u8; 32];
+        blake2::digest::VariableOutput::finalize_variable(wide, &mut out).unwrap();
+        assert_ne!(
+            hash_path("/var/lib/vykar/example.bin").0,
+            out[..16],
+            "BLAKE2b-128 must not be conflated with a truncated BLAKE2b-256"
+        );
+    }
 
     #[test]
     fn repo_cache_dir_default() {

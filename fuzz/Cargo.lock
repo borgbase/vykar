@@ -1881,6 +1881,7 @@ name = "vykar-core"
 version = "0.19.1"
 dependencies = [
  "blake2",
+ "blake3",
  "chrono",
  "croner",
  "crossbeam-channel",
@@ -1953,6 +1954,7 @@ name = "vykar-protocol"
 version = "0.19.1"
 dependencies = [
  "serde",
+ "vykar-types",
 ]
 
 [[package]]

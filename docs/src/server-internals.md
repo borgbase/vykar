@@ -24,7 +24,7 @@ The server exposes normal storage-object routes plus a small set of admin query 
 |--------|------|---------|-------|
 | `GET` | `/{*path}` | `get(key)` | Returns `200` + body or `404`. With a `Range` header, this becomes a ranged read and returns `206`. |
 | `HEAD` | `/{*path}` | `exists(key)` | Returns `200` with metadata or `404`. |
-| `PUT` | `/{*path}` | `put(key, data)` | Raw bytes body. REST clients send `X-Content-BLAKE2b`; the server verifies it while streaming the write. |
+| `PUT` | `/{*path}` | `put(key, data)` | Raw bytes body. REST clients send exactly one of `X-Content-BLAKE3` (pack uploads to a format-v3 repository) or `X-Content-BLAKE2b` (format-v2 packs, and every non-pack object regardless of format); the server verifies it while streaming the write. Both headers at once is a 400, and a pack upload with neither is a 400. |
 | `DELETE` | `/{*path}` | `delete(key)` | Returns `204` or `404`. Rejected with `403` in append-only mode. |
 | `GET` | `/{*path}?list` | `list(prefix)` | Returns a JSON array of matching keys. |
 | `POST` | `/{*path}?mkdir` | `create_dir(key)` | Creates directory scaffolding. |
@@ -92,7 +92,7 @@ The client sends a verification plan describing packs and expected blob boundari
 
 - pack header magic and version
 - blob boundaries and length-prefix structure
-- BLAKE2b hash of pack contents
+- the pack's content hash, under the algorithm the plan declares (`"hash": "blake2b" | "blake3"`; absent means blake2b, i.e. a pre-BLAKE3 client)
 
 If the user passes `vykar check --distrust-server`, the client falls back to downloading and verifying data locally.
 
@@ -127,7 +127,15 @@ This complements client-side `vykar check`, which still owns full cryptographic 
 - `verify_packs()`
 - `repack()`
 
-It also sends `X-Content-BLAKE2b` on `PUT` requests and validates `Content-Range` on ranged reads.
+It also sends the content-digest header on `PUT` requests — bound once to the repository's algorithm when the repository is opened — and validates `Content-Range` on ranged reads.
+
+`GET /health` is unauthenticated and advertises what the server supports:
+
+```json
+{"status":"ok","version":"0.20.0","protocol_version":2,"hashes":["blake2b","blake3"]}
+```
+
+`protocol_version` and `hashes` are additive; a pre-BLAKE3 server omits both, which a client reads as "protocol 1, blake2b only". `vykar init` probes this **before writing anything**, because `init` writes only non-pack keys that an old server happily accepts — without the probe, `init` would succeed and only the first `backup` would fail. Requests that declare `"hash": "blake3"` must also declare `protocol_version: 2`, so an old server rejects them outright rather than silently verifying every pack under the wrong algorithm.
 
 Client config:
 

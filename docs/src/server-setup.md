@@ -12,7 +12,7 @@ Dumb storage backends (S3, WebDAV, SFTP) work well for basic backups, but they c
 | Server-side compaction | Client must download and re-upload all live blobs | Server repacks locally on disk from a compact plan |
 | Quota enforcement | Requires external bucket policy/IAM setup | Built-in byte quota checks on writes |
 | Backup freshness monitoring | Requires external polling and parsing | Tracks `last_backup_at` on new snapshot writes |
-| Upload integrity | Relies on backend checksums only | Verifies `X-Content-BLAKE2b` during uploads |
+| Upload integrity | Relies on backend checksums only | Verifies `X-Content-BLAKE3` / `X-Content-BLAKE2b` during uploads |
 | Structural health checks | Client has to fetch data to verify structure | Server validates repository shape directly |
 
 All data remains client-side encrypted. The server never has the encryption key and cannot read backup contents.

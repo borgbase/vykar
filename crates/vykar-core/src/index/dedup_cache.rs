@@ -691,6 +691,11 @@ const FULL_ENTRY_SIZE: usize = 80;
 /// Size of the BLAKE2b-256 content-checksum trailer appended after the last
 /// entry, verified in `open_path` to detect silent corruption of the plaintext
 /// cache before it is promoted to the authoritative remote index.
+///
+/// Deliberately BLAKE2b for every repository format, including v3: the
+/// trailer's format is frozen, and this is local cache validation rather than
+/// repository content. If this ever needs accelerating, a byte-compatible
+/// SIMD BLAKE2b is the independent change to make — not BLAKE3.
 const FULL_CHECKSUM_SIZE: usize = 32;
 
 const FULL_SPEC: CacheSpec = CacheSpec {

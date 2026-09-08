@@ -23,7 +23,7 @@ Rationale:
 
 When `encryption` is set to `none`, vykar uses a `PlaintextEngine` — an identity transform where `encrypt()` and `decrypt()` return data unchanged. AAD is ignored (there is no AEAD construction to bind it to). The format layer detects plaintext mode via `is_encrypting() == false` and uses the shorter wire format: `[1-byte type_tag][plaintext]` (1-byte overhead instead of 29 bytes).
 
-This mode does **not** provide authentication or tamper protection — it is designed for trusted storage where confidentiality is unnecessary. Data integrity against accidental corruption is still provided via keyed BLAKE2b-256 chunk IDs (see [Hashing / Chunk IDs](#hashing--chunk-ids) below).
+This mode does **not** provide authentication or tamper protection — it is designed for trusted storage where confidentiality is unnecessary. Data integrity against accidental corruption is still provided via keyed chunk IDs (see [Hashing / Chunk IDs](#hashing--chunk-ids) below).
 
 ### Key Derivation
 
@@ -34,18 +34,46 @@ Rationale:
 - Argon2id is a modern memory-hard KDF recommended by OWASP and IETF
 - Resists both GPU and ASIC brute-force attacks
 
-In `none` mode no passphrase or key file is needed. The `chunk_id_key` is deterministically derived as `BLAKE2b-256(repo_id)`. Since `repo_id` is stored unencrypted in the repo `config`, this key is not secret — it exists only so that the same keyed hashing path is used in all modes. No `keys/repokey` file is created.
+In `none` mode no passphrase or key file is needed. The `chunk_id_key` is deterministically derived from `repo_id`, and *how* depends on the repository format:
+
+| Format | Derivation |
+|---|---|
+| v2 | `BLAKE2b-256(repo_id)` |
+| v3 | `blake3::derive_key("vykar 2026-01-01 plaintext repository chunk-id key v1", repo_id)` |
+
+`derive_key` rather than a plain `blake3::hash` for domain separation: it is a distinct BLAKE3 mode with its own flag bits, so this key lives in a different domain from chunk digests (keyed mode) and pack digests (unkeyed mode).
+
+Since `repo_id` is stored unencrypted in the repo `config`, this key is not secret in either format — it exists only so that the same keyed hashing path is used in all modes. No `keys/repokey` file is created.
+
+This is the **one** auxiliary hash that follows the repository format, because it *is* the chunk-ID key: a v2 repository must reproduce it byte-identically or lose its entire dedup index.
 
 ### Hashing / Chunk IDs
 
-Keyed BLAKE2b-256 MAC using a `chunk_id_key` derived from the master key.
+A **keyed** 256-bit hash of the chunk plaintext, using a `chunk_id_key` derived from the master key. The algorithm is fixed by the repository format:
 
-Rationale:
+| Format | Chunk ID | Pack ID |
+|---|---|---|
+| v2 | keyed BLAKE2b-256 | unkeyed BLAKE2b-256 |
+| v3 | keyed BLAKE3 | unkeyed BLAKE3 |
+
+Chunk IDs are **always keyed**, in both algorithms. `index/hasher.rs` takes the first eight bytes of the digest as a hash-map bucket key, which is only safe because an attacker who controls chunk content cannot predict the digest; an unkeyed hash here would be a hash-flooding hole. Pack IDs are **always unkeyed**, in both algorithms: a pack ID is a storage key the server must be able to recompute from the bytes alone, without any repository key.
+
+Why a keyed hash at all:
+
 - Prevents content confirmation attacks (an adversary cannot check whether known plaintext exists in the backup without the key)
-- BLAKE2b is faster than SHA-256 in pure software implementations (on CPUs with hardware SHA-256 acceleration — SHA-NI on x86, SHA extensions on ARM — hardware SHA-256 can be faster; BLAKE2b was chosen for consistent performance across all architectures without requiring hardware-specific instruction sets)
 - Trade-off: keyed IDs prevent dedup across different encryption keys (acceptable for vykar's single-key-per-repo model)
 
-In `none` mode the same keyed BLAKE2b-256 construction is used, but the key is derived from the public `repo_id` rather than a secret master key. The MAC therefore acts as a **checksum for corruption detection**, not as authentication against tampering. `vykar check --verify-data` recomputes chunk IDs and compares them to detect bit-rot or storage corruption — this works identically across all encryption modes.
+Why not SHA-256:
+
+- Both BLAKE2b and BLAKE3 are faster than SHA-256 in pure software. On CPUs with hardware SHA-256 acceleration (SHA-NI on x86, SHA extensions on ARM) hardware SHA-256 can beat BLAKE2b, but the BLAKE family gives consistent performance across all architectures without depending on hardware-specific instruction sets.
+
+Why BLAKE3 for new repositories (format v3):
+
+- Hashing is a first-order CPU cost on two paths where dedup skips everything downstream. On a **file-cache miss with mostly-unchanged content** (VM images, databases, mail files) the file is fully re-read, chunked and hashed; chunks that dedup out skip compression, encryption and upload entirely, so per-byte cost there is read + chunk + hash. In `check --verify-data` under `encryption: none`, hashing dominates outright.
+- Within a file (or a 64 MiB segment of a large file) hashing is single-threaded, so per-core hash throughput is the per-segment ceiling. BLAKE3's internal tree mode gives it a large per-core advantage even without multi-threading: measurements in [issue #177](https://github.com/borgbase/vykar/issues/177) show `blake3::keyed_hash` at ~2.15 GB/s against ~1.4 GB/s for keyed BLAKE2b-256 on Apple Silicon, with a wider gap on x86-64.
+- BLAKE3 is used single-threaded (`hash` / `keyed_hash`); vykar never calls `update_rayon`, and parallelism comes from the existing per-file/per-segment workers instead.
+
+In `none` mode the same keyed construction is used, but the key is derived from the public `repo_id` rather than a secret master key. The MAC therefore acts as a **checksum for corruption detection**, not as authentication against tampering. `vykar check --verify-data` recomputes chunk IDs and compares them to detect bit-rot or storage corruption — this works identically across all encryption modes and both formats.
 
 ---
 
@@ -75,7 +103,7 @@ Rationale:
 
 ### Deduplication
 
-Content-addressed deduplication uses keyed `ChunkId` values (BLAKE2b-256 MAC). Identical plaintext produces the same `ChunkId`, so the second copy is not stored; only refcounts are incremented.
+Content-addressed deduplication uses keyed `ChunkId` values (keyed BLAKE2b-256 in format v2, keyed BLAKE3 in v3). Identical plaintext produces the same `ChunkId`, so the second copy is not stored; only refcounts are incremented. Because the algorithm is part of the chunk's identity, **dedup never spans repository formats** — which is also why the format cannot be changed in place.
 
 vykar supports three index modes for dedup lookups:
 
@@ -152,13 +180,42 @@ A snapshot this binary cannot read is **hidden, never damaged**. It is excluded 
 
 Future snapshot-level metadata goes inside the reserved opaque `ext` blob (parsed per `format_version`) rather than as new outer fields, so the frozen envelope and its discriminator stay intact without a tolerant-envelope rework.
 
+#### Repository Versions
+
+`RepoConfig.version` is the *repository layout* version, distinct from `SnapshotMeta.format_version` above. It answers "what must a reader understand to read this repository?" — and today the only thing it varies is the chunk/pack hash:
+
+| `version` | Chunk ID | Pack ID | Written by |
+|---|---|---|---|
+| 2 | keyed BLAKE2b-256 | unkeyed BLAKE2b-256 | up to 0.19 |
+| 3 | keyed BLAKE3 | unkeyed BLAKE3 | 0.20 and later |
+
+A repository's version is fixed at `vykar init` and never changes. Changing the chunk-ID hash changes the dedup identity of every chunk, and changing the pack-ID hash changes every storage key, so there is no in-place upgrade — a v2 repository stays v2 for life and remains fully readable *and writable*. `vykar info` reports both the format and the hash.
+
+There is deliberately **no user-facing choice**: no `--hash` flag, no YAML key. `init` always creates the current format. Two accepted consequences: older binaries cannot open a repository created by 0.20+ (`unsupported repository version: 3`), so a fleet sharing a new repository must upgrade together; and a self-hosted `vykar-server` must be upgraded before a new repository can be created against it (a pre-flight `/health` probe at `init` makes that fail cleanly rather than at the first backup).
+
+**Why there is no stored `hash` field.** `RepoConfig` is serialized as a *positional* msgpack array, and appending a field is not backward-safe in the way `#[serde(default)]` suggests: `#[serde(default)]` rescues *shorter* arrays, but rmp-serde **errors on longer ones** (`array had incorrect length, expected N`) — the same failure mode described for `SnapshotMeta` above. An old binary reading an 8-field config would therefore fail *before* reaching the version gate, turning a clear `unsupported repository version: 3` into a parse error that looks like corruption. So `RepoConfig` stays at exactly seven fields, and the version implies the algorithm. A unit test asserts the msgpack array length so this cannot be undone by accident. Deferring the field is free: whenever a future algorithm forces a v4 bump, it can be appended *then*, since a bumped version is already unreadable by old binaries.
+
+**Why the auxiliary hashes stayed BLAKE2b.** Only chunk IDs and pack IDs follow the format — the two the throughput measurements are about. Everything else in the workspace that hashes is unconditionally BLAKE2b, for every version:
+
+| Digest | Why it stays |
+|---|---|
+| TOFU identity fingerprint | Keeping it fixed preserves every existing pin with zero branching; it hashes key material, not content |
+| Pin and check-state **file names** | Pure URL-to-filename cache keys; changing them orphans local state for no gain |
+| `PathHash` in the file cache | BLAKE2b-**128** (`Blake2bVar::new(16)`), a different digest from a truncated BLAKE2b-256; hashes short path strings |
+| Full-index cache checksum trailer | Frozen local-cache format, not repository content |
+| Hard-link `chunks_fingerprint` | Hashes a chunk-ID list, not content — the speedup would be noise |
+
+Making these version-dependent would add a parameter, a branch and a test axis to each for benefits nothing has measured, and every one is *already* compatible if simply left alone. If the index checksum ever needs acceleration, a byte-compatible SIMD BLAKE2b is the independent change to make.
+
+The single exception is the plaintext-mode `chunk_id_key` derivation, which *is* the chunk-ID key and therefore must follow the format — see [Key Derivation](#key-derivation).
+
 ---
 
 ## Repository Format
 
 ### On-Disk Layout
 
-`RepoConfig.version = 2` describes the current repository layout.
+`RepoConfig.version = 3` is what `vykar init` writes; `version = 2` repositories remain fully readable and writable. See [Repository Versions](#repository-versions).
 
 ```text
 <repo>/
@@ -331,7 +388,7 @@ Chunks are grouped into **pack files** (~32 MiB) instead of being stored as indi
 - Each blob is a complete RepoObj envelope: `[1B type_tag][12B nonce][ciphertext+16B AEAD tag]`
 - Each blob is independently encrypted (can read one chunk without decrypting the whole pack)
 - No trailing per-pack header object — the chunk index already records which blobs reside in which pack at which offset, making a per-pack blob manifest redundant. Pack analysis for compaction enumerates blobs by forward-scanning length prefixes. Trade-off: if the index is lost, rebuilding requires a full sequential scan of all pack data (reading every byte); a trailing header would allow reading just the last N bytes per pack. In practice index loss is rare (single encrypted blob, written atomically) and `check --verify-data` already performs a full pack scan
-- Pack ID = unkeyed BLAKE2b-256 of entire pack contents, stored at `packs/<shard>/<hex_pack_id>`
+- Pack ID = unkeyed hash of the entire pack contents (BLAKE2b-256 in format v2, BLAKE3 in v3), stored at `packs/<shard>/<hex_pack_id>`
 
 #### Data Packs vs Tree Packs
 

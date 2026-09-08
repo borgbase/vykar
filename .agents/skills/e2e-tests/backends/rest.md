@@ -74,6 +74,35 @@ rm -rf /mnt/repos/bench-vykar/vykar-server-data/*
    vykar --config <config> compact -R rest
    ```
 
+## Repository format v3 (BLAKE3)
+
+`vykar init` creates format v3, whose pack IDs are BLAKE3. Build `vykar-server`
+from the same tree as the client — an older server rejects v3 at `init`.
+
+Before running the corpus pass, confirm the wire behaviour:
+
+1. The server advertises BLAKE3:
+   ```bash
+   curl -s http://<server>/health
+   # {"status":"ok","version":"...","protocol_version":2,"hashes":["blake2b","blake3"]}
+   ```
+2. `vykar --config <config> info -R rest` reports `Format v3` and `Hash blake3`.
+3. Pack uploads carry `X-Content-BLAKE3` and non-pack objects still carry
+   `X-Content-BLAKE2b`. Capture with the server at `RUST_LOG=debug`, or via a
+   proxy; every `PUT /packs/...` must have exactly one digest header.
+4. Server-side maintenance runs at `protocol_version: 2`:
+   ```bash
+   vykar --config <config> compact -R rest                # ?repack
+   vykar --config <config> check --verify-data -R rest    # ?verify-packs
+   ```
+   Both must report zero errors. A `hash_valid: false` on every pack means the
+   server verified under the wrong algorithm — record it as a failure, do not
+   retry.
+
+The old-server rejection path is covered deterministically by stub-server unit
+tests (`init_refuses_a_v3_repository_against_a_pre_blake3_server` and the
+`rest_backend` health tests), so this suite does **not** need an old binary.
+
 ## Validation
 
 1. Snapshot exists for label `rest-corpus`
@@ -91,6 +120,9 @@ rm -rf /mnt/repos/bench-vykar/vykar-server-data/*
 - Restore mismatch vs source
 - `vykar check` failures
 - `vykar snapshot delete` or `vykar compact` failures
+- `init` refused with "does not support BLAKE3 repositories" (server too old)
+- `400 ... protocol version 2 not supported` from `?repack` / `?verify-packs`
+- `verify-packs` reporting `hash_valid: false` for *every* pack
 
 ## Cleanup
 

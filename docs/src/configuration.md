@@ -348,7 +348,7 @@ encryption:
 | `passphrase` | — | string (quoted) | Inline passphrase (not recommended for production) |
 | `passcommand` | — | string (quoted) | Shell command that prints the passphrase |
 
-`none` mode requires no passphrase and creates no key file. Data is still checksummed via keyed BLAKE2b-256 chunk IDs to detect storage corruption, but is not authenticated against tampering. See [Architecture — Plaintext Mode](architecture.md#plaintext-mode-none) for details.
+`none` mode requires no passphrase and creates no key file. Data is still checksummed via keyed chunk IDs (BLAKE3 in repository format v3, keyed BLAKE2b-256 in v2) to detect storage corruption, but is not authenticated against tampering. See [Architecture — Plaintext Mode](architecture.md#plaintext-mode-none) for details.
 
 `passcommand` runs through the platform shell:
 

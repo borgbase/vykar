@@ -16,6 +16,9 @@ struct CheckStateFile {
 
 /// Per-repo check state file path.
 /// `<cache_base>/vykar/check.<BLAKE2b-256(url) hex>`
+///
+/// Deliberately BLAKE2b for every repository format, including v3. A pure
+/// URL-to-filename cache key; changing it would orphan local check state.
 fn check_state_path(url: &str, cache_dir: Option<&Path>) -> Option<PathBuf> {
     let base = match cache_dir {
         Some(dir) => Some(dir.to_path_buf()),

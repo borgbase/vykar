@@ -19,6 +19,11 @@ struct PinFile {
 
 /// Compute a 32-byte fingerprint from repo identity and key material.
 /// `BLAKE2b-256(repo_id || chunk_id_key)`
+///
+/// **Deliberately BLAKE2b for every repository format, including v3.** Keeping it fixed
+/// preserves every existing TOFU pin with zero branching, and this hashes key
+/// material rather than content, so the BLAKE3 throughput argument does not
+/// apply. Do not "finish the migration" here.
 pub fn compute_fingerprint(repo_id: &[u8], chunk_id_key: &[u8; 32]) -> [u8; 32] {
     let mut hasher = Blake2bVar::new(32).expect("valid output size");
     hasher.update(repo_id);
@@ -29,7 +34,11 @@ pub fn compute_fingerprint(repo_id: &[u8], chunk_id_key: &[u8; 32]) -> [u8; 32] 
 }
 
 /// Derive the pin file path for a given URL.
-/// `<cache_base>/vykar/pin.<BLAKE2b-256(url) first 16 hex chars>`
+/// `<cache_base>/vykar/pin.<BLAKE2b-256(url), all 32 bytes hex-encoded>`
+///
+/// Deliberately BLAKE2b for every repository format, including v3. This is a pure
+/// URL-to-filename cache key; changing it would orphan every local pin for no
+/// gain.
 fn pin_file_path(url: &str, cache_dir: Option<&Path>) -> Option<PathBuf> {
     let base = match cache_dir {
         Some(dir) => Some(dir.to_path_buf()),

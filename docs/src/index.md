@@ -56,7 +56,7 @@ Vykar is the fastest tool for both backup and restore, with the lowest CPU cost,
 |--------|------|--------|--------|-------|-------|
 | Crypto construction | [v1: AES-CTR + HMAC (E&M); v2: AEAD](https://borgbackup.readthedocs.io/en/stable/internals/security.html) | [AES-CTR + Poly1305 (E-t-M)](https://restic.readthedocs.io/en/stable/100_references.html#keys-encryption-and-mac) | AES-CTR + Poly1305 (Restic-compat) | [AES-GCM / ChaCha20 (AEAD)](https://kopia.io/docs/advanced/architecture/) | AES-GCM / ChaCha20 (AEAD, AAD) |
 | Key derivation | v1: PBKDF2; v2: Argon2 | scrypt (fixed params) | scrypt (Restic-compat) | scrypt | Argon2id (tunable) |
-| Content addressing | Keyed HMAC-SHA-256 / BLAKE2b | [SHA-256](https://restic.readthedocs.io/en/stable/100_references.html#backups-and-deduplication) | SHA-256 (Restic-compat) | Keyed hash (BLAKE2B-256-128 default) | Keyed BLAKE2b-256 MAC |
+| Content addressing | Keyed HMAC-SHA-256 / BLAKE2b | [SHA-256](https://restic.readthedocs.io/en/stable/100_references.html#backups-and-deduplication) | SHA-256 (Restic-compat) | Keyed hash (BLAKE2B-256-128 default) | Keyed BLAKE3 (repo format v3; keyed BLAKE2b-256 in v2) |
 | Key zeroization | Python GC (non-deterministic) | Go GC (non-deterministic) | Rust `zeroize` | Go GC (non-deterministic) | `ZeroizeOnDrop` on all key types |
 | Implementation safety | Python + C extensions | Go (GC, bounds-checked) | Rust (minimal unsafe) | Go (GC, bounds-checked) | Rust (minimal unsafe) |
 

@@ -39,7 +39,14 @@ pub(super) fn classify_chunk(
             return Ok(WorkerChunk::Hashed(HashedChunk { chunk_id, data }));
         }
     }
-    let packed = pack_chunk_data(&chunk_id, &data, compression, crypto)?;
+    let mut packed = pack_chunk_data(&chunk_id, &data, compression, crypto)?;
+    // Compression reserves for the worst case. These buffers can wait for
+    // an entire segment in the pipeline, so retaining input-sized capacity
+    // for compressible chunks wastes substantial memory. Only shrink when
+    // the saving is large enough to justify a possible realloc/copy.
+    if packed.capacity() / 2 > packed.len() && packed.capacity() - packed.len() >= 64 * 1024 {
+        packed.shrink_to_fit();
+    }
     Ok(WorkerChunk::Prepared(PreparedChunk {
         chunk_id,
         uncompressed_size: data.len() as u32,
@@ -74,6 +81,31 @@ mod tests {
     use crate::compress::decompress;
     use crate::repo::format::unpack_object_expect_with_context;
     use vykar_crypto::PlaintextEngine;
+
+    #[test]
+    fn prepared_compressible_chunks_release_excess_capacity() {
+        let engine = PlaintextEngine::new(&[0xAA; 32]);
+        let payload = vec![0x42; 1024 * 1024];
+        let chunk_id = ChunkId::compute(engine.chunk_id_key(), &payload);
+        for compression in [Compression::Lz4, Compression::Zstd { level: 3 }] {
+            let chunk =
+                classify_chunk(chunk_id, payload.clone(), None, compression, &engine).unwrap();
+            let WorkerChunk::Prepared(prepared) = chunk else {
+                panic!("no filter must prepare the chunk");
+            };
+            assert!(prepared.packed.capacity() < payload.len() / 2);
+            assert_eq!(prepared.chunk_id, chunk_id);
+            assert_eq!(prepared.uncompressed_size as usize, payload.len());
+            let compressed = unpack_object_expect_with_context(
+                &prepared.packed,
+                ObjectType::ChunkData,
+                chunk_id.as_bytes(),
+                &engine,
+            )
+            .unwrap();
+            assert_eq!(decompress(&compressed).unwrap(), payload);
+        }
+    }
 
     /// Verify pack_chunk_data output can be unpacked and decompressed to the
     /// original data — i.e., it's wire-compatible with the old

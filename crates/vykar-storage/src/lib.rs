@@ -22,9 +22,9 @@ mod delegate;
 mod http_util;
 mod retry;
 
+pub use delegate::InnerBackend;
 #[doc(hidden)]
 pub use delegate::__macro_support;
-pub use delegate::InnerBackend;
 
 #[cfg(feature = "backend-sftp")]
 pub(crate) mod runtime;

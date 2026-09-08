@@ -240,6 +240,36 @@ fn cli_init_backup_list_restore_info_roundtrip() {
     let info_out = fx.run_ok(&["--config", &cfg, "info"]);
     assert!(info_out.contains("Snapshots"));
     assert!(info_out.contains("Encryption"));
+    // Users hold a mix of v2 and v3 repositories; `info` has to say which.
+    assert!(
+        info_out.contains("Format") && info_out.contains("v3"),
+        "expected a Format row reading v3, got:\n{info_out}"
+    );
+    assert!(
+        info_out.contains("Hash") && info_out.contains("blake3"),
+        "expected a Hash row reading blake3, got:\n{info_out}"
+    );
+}
+
+/// `vykar init` must write format v3 to the repository `config`, read straight
+/// off disk rather than through the library that produced it.
+#[test]
+fn cli_init_writes_repository_format_v3() {
+    let fx = CliFixture::new();
+    write_plain_config(&fx.config_path, &fx.repo_dir);
+    let cfg = fx.config_path.to_string_lossy().to_string();
+
+    fx.run_ok(&["--config", &cfg, "init"]);
+
+    let config_bytes = std::fs::read(fx.repo_dir.join("config")).expect("repo config exists");
+    // RepoConfig is a positional msgpack array; the version is element 0.
+    // 0x97 = fixarray of 7 — the field count the format decision depends on.
+    assert_eq!(
+        config_bytes.first(),
+        Some(&0x97),
+        "RepoConfig must stay a 7-element msgpack array"
+    );
+    assert_eq!(config_bytes.get(1), Some(&3), "init must write version 3");
 }
 
 #[test]

@@ -24,6 +24,13 @@ pub(crate) fn run_info(config: &VykarConfig, label: Option<&str>) -> CliResult<(
     add_kv_row(
         &mut t1,
         theme,
+        "Format",
+        format!("v{}", stats.format.version()),
+    );
+    add_kv_row(&mut t1, theme, "Hash", stats.format.chunk_hash().as_str());
+    add_kv_row(
+        &mut t1,
+        theme,
         "Created",
         stats
             .repo_created

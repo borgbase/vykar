@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 
 use crate::config::VykarConfig;
-use crate::repo::EncryptionMode;
+use crate::repo::{EncryptionMode, RepoFormat};
 use vykar_types::error::Result;
 
 use super::list::load_snapshot_meta;
@@ -21,6 +21,9 @@ pub struct InfoStats {
     pub unique_chunks: usize,
     pub repo_created: DateTime<Utc>,
     pub encryption: EncryptionMode,
+    /// Layout version. Worth showing because users will hold a mix of v2 and
+    /// v3 repositories, and the format determines which binaries can read one.
+    pub format: RepoFormat,
 }
 
 /// Run `vykar info`.
@@ -62,5 +65,6 @@ pub fn run(config: &VykarConfig, passphrase: Option<&str>) -> Result<InfoStats> 
         unique_chunks: repo.chunk_index().len(),
         repo_created: repo.config.created,
         encryption: repo.config.encryption.clone(),
+        format: repo.format(),
     })
 }

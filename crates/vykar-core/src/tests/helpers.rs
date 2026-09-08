@@ -98,7 +98,7 @@ pub fn load_snapshot_cache_from_disk(
     let mut hasher = Blake2bVar::new(32).unwrap();
     hasher.update(&repo_config.id);
     hasher.finalize_variable(&mut key).unwrap();
-    let crypto = vykar_crypto::PlaintextEngine::new(&key);
+    let crypto = vykar_crypto::PlaintextEngine::new(crate::testutil::chunk_hasher_for(key));
 
     crate::repo::snapshot_cache::SnapshotListCache::load(&repo_config.id, &crypto, None)
 }

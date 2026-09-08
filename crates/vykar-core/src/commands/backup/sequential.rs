@@ -14,7 +14,7 @@ use crate::repo::file_cache::{CachedChunks, FileCache, ParentReuseIndex};
 use crate::repo::Repository;
 use crate::snapshot::item::{Item, ItemType};
 use crate::snapshot::SnapshotStats;
-use vykar_types::chunk_id::ChunkId;
+use vykar_types::chunk_id::{ChunkHasher, ChunkId};
 use vykar_types::error::{Result, VykarError};
 
 use super::chunk_process::{classify_chunk, WorkerChunk};
@@ -33,14 +33,14 @@ use vykar_crypto::CryptoEngine;
 /// for parallel compression/hashing.
 fn classify_chunks(
     chunks: Vec<Vec<u8>>,
-    chunk_id_key: &[u8; 32],
+    chunk_hasher: &ChunkHasher,
     dedup_filter: Option<&xorf::Xor8>,
     compression: Compression,
     crypto: &dyn CryptoEngine,
     transform_pool: Option<&rayon::ThreadPool>,
 ) -> Result<Vec<WorkerChunk>> {
     let classify = |data: Vec<u8>| -> Result<WorkerChunk> {
-        let chunk_id = ChunkId::compute(chunk_id_key, &data);
+        let chunk_id = ChunkId::compute(chunk_hasher, &data);
         classify_chunk(chunk_id, data, dedup_filter, compression, crypto)
     };
 
@@ -57,7 +57,7 @@ fn classify_chunks(
 pub(super) fn flush_regular_file_batch(
     repo: &mut Repository,
     compression: Compression,
-    chunk_id_key: &[u8; 32],
+    chunk_hasher: &ChunkHasher,
     transform_pool: Option<&rayon::ThreadPool>,
     raw_chunks: &mut Vec<Vec<u8>>,
     item: &mut Item,
@@ -71,7 +71,7 @@ pub(super) fn flush_regular_file_batch(
     let taken = std::mem::take(raw_chunks);
     let worker_chunks = classify_chunks(
         taken,
-        chunk_id_key,
+        chunk_hasher,
         dedup_filter,
         compression,
         repo.crypto.as_ref(),
@@ -142,7 +142,7 @@ fn flush_cross_file_batch(
     batch: &mut CrossFileBatch,
     repo: &mut Repository,
     compression: Compression,
-    chunk_id_key: &[u8; 32],
+    chunk_hasher: &ChunkHasher,
     transform_pool: Option<&rayon::ThreadPool>,
     items_config: &ChunkerConfig,
     item_stream: &mut Vec<u8>,
@@ -160,7 +160,7 @@ fn flush_cross_file_batch(
     let taken = std::mem::take(&mut batch.raw_chunks);
     let mut worker_chunks = classify_chunks(
         taken,
-        chunk_id_key,
+        chunk_hasher,
         dedup_filter,
         compression,
         repo.crypto.as_ref(),
@@ -331,7 +331,7 @@ pub(super) fn process_regular_file_item(
         return Ok(ProcessOutcome::Committed);
     }
 
-    let chunk_id_key = *repo.crypto.chunk_id_key();
+    let chunk_hasher = repo.crypto.chunk_hasher();
     // Check old cache for new-vs-modified before opening file (avoids borrow conflict).
     let was_in_old_cache = if verbose {
         repo.file_cache().contains(&abs_path)
@@ -374,7 +374,7 @@ pub(super) fn process_regular_file_item(
                     flush_regular_file_batch(
                         repo,
                         compression,
-                        &chunk_id_key,
+                        &chunk_hasher,
                         transform_pool,
                         &mut raw_chunks,
                         item,
@@ -392,7 +392,7 @@ pub(super) fn process_regular_file_item(
         flush_regular_file_batch(
             repo,
             compression,
-            &chunk_id_key,
+            &chunk_hasher,
             transform_pool,
             &mut raw_chunks,
             item,
@@ -474,7 +474,7 @@ pub(super) fn process_source_path(
         },
     );
 
-    let chunk_id_key = *repo.crypto.chunk_id_key();
+    let chunk_hasher = repo.crypto.chunk_hasher();
     let min_chunk_size = repo.config.chunker_params.min_size as u64;
     let mut cross_batch = CrossFileBatch::new();
     // Per-source counts, flushed as summary warnings at end of source; the
@@ -578,7 +578,7 @@ pub(super) fn process_source_path(
                         &mut cross_batch,
                         repo,
                         compression,
-                        &chunk_id_key,
+                        &chunk_hasher,
                         transform_pool,
                         items_config,
                         item_stream,
@@ -680,7 +680,7 @@ pub(super) fn process_source_path(
                             &mut cross_batch,
                             repo,
                             compression,
-                            &chunk_id_key,
+                            &chunk_hasher,
                             transform_pool,
                             items_config,
                             item_stream,
@@ -700,7 +700,7 @@ pub(super) fn process_source_path(
                     &mut cross_batch,
                     repo,
                     compression,
-                    &chunk_id_key,
+                    &chunk_hasher,
                     transform_pool,
                     items_config,
                     item_stream,
@@ -756,7 +756,7 @@ pub(super) fn process_source_path(
                 &mut cross_batch,
                 repo,
                 compression,
-                &chunk_id_key,
+                &chunk_hasher,
                 transform_pool,
                 items_config,
                 item_stream,
@@ -785,7 +785,7 @@ pub(super) fn process_source_path(
         &mut cross_batch,
         repo,
         compression,
-        &chunk_id_key,
+        &chunk_hasher,
         transform_pool,
         items_config,
         item_stream,

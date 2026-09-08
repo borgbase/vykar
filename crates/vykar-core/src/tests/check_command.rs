@@ -367,8 +367,8 @@ fn test_verify_pack_full_overflow_offset() {
     init_test_environment();
     let storage =
         LocalBackend::new(&tempfile::tempdir().unwrap().path().to_string_lossy()).unwrap();
-    let crypto = vykar_crypto::PlaintextEngine::new(&[0u8; 32]);
-    let chunk_id_key = [0u8; 32];
+    let crypto = vykar_crypto::PlaintextEngine::new(crate::testutil::chunk_hasher_for([0u8; 32]));
+    let chunk_hasher = crate::testutil::chunk_hasher_for([0u8; 32]);
     let pack_id = PackId::from_bytes([0u8; 32]);
 
     // Create a minimal valid pack file so we get past the header check.
@@ -388,7 +388,7 @@ fn test_verify_pack_full_overflow_offset() {
     let count = verify_pack_full(
         &storage,
         &crypto,
-        &chunk_id_key,
+        &chunk_hasher,
         &pack_id,
         &[(chunk_id, entry)],
         &mut issues,
@@ -408,8 +408,8 @@ fn test_verify_pack_full_overflow_add() {
     init_test_environment();
     let storage =
         LocalBackend::new(&tempfile::tempdir().unwrap().path().to_string_lossy()).unwrap();
-    let crypto = vykar_crypto::PlaintextEngine::new(&[0u8; 32]);
-    let chunk_id_key = [0u8; 32];
+    let crypto = vykar_crypto::PlaintextEngine::new(crate::testutil::chunk_hasher_for([0u8; 32]));
+    let chunk_hasher = crate::testutil::chunk_hasher_for([0u8; 32]);
     let pack_id = PackId::from_bytes([0u8; 32]);
 
     // Create a minimal valid pack file
@@ -430,7 +430,7 @@ fn test_verify_pack_full_overflow_add() {
     let count = verify_pack_full(
         &storage,
         &crypto,
-        &chunk_id_key,
+        &chunk_hasher,
         &pack_id,
         &[(chunk_id, entry)],
         &mut issues,

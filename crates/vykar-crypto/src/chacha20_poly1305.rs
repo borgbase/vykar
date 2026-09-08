@@ -9,12 +9,16 @@ impl_aead_engine!(
 mod tests {
     use super::*;
     use crate::CryptoEngine;
+    use vykar_types::chunk_id::ChunkHasher;
     use vykar_types::error::VykarError;
+    use vykar_types::hash::HashAlgorithm;
 
     fn test_chacha_engine() -> ChaCha20Poly1305Engine {
         let enc_key = [0x33; 32];
-        let cid_key = [0x44; 32];
-        ChaCha20Poly1305Engine::new(&enc_key, &cid_key)
+        ChaCha20Poly1305Engine::new(
+            &enc_key,
+            ChunkHasher::new(HashAlgorithm::Blake2b, [0x44; 32]),
+        )
     }
 
     #[test]
@@ -81,10 +85,14 @@ mod tests {
     }
 
     #[test]
-    fn chunk_id_key_returns_correct_value() {
+    fn chunk_hasher_returns_correct_value() {
         let enc_key = [0x33; 32];
         let cid_key = [0x44; 32];
-        let engine = ChaCha20Poly1305Engine::new(&enc_key, &cid_key);
-        assert_eq!(engine.chunk_id_key(), &cid_key);
+        let engine = ChaCha20Poly1305Engine::new(
+            &enc_key,
+            ChunkHasher::new(HashAlgorithm::Blake2b, cid_key),
+        );
+        assert_eq!(engine.chunk_hasher().key(), &cid_key);
+        assert_eq!(engine.chunk_hasher().algorithm(), HashAlgorithm::Blake2b);
     }
 }

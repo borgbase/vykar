@@ -248,8 +248,10 @@ fn skipped_result() -> CheckResult {
 
 /// Compute a hex fingerprint from the repo's identity material.
 fn compute_repo_fingerprint(repo: &crate::repo::Repository) -> String {
-    let fp =
-        crate::repo::identity::compute_fingerprint(&repo.config.id, repo.crypto.chunk_id_key());
+    let fp = crate::repo::identity::compute_fingerprint(
+        &repo.config.id,
+        repo.crypto.chunk_hasher().key(),
+    );
     hex::encode(fp)
 }
 

@@ -25,7 +25,7 @@ proptest! {
         cid_key in prop::array::uniform32(any::<u8>()),
         context in prop::collection::vec(any::<u8>(), 0..64),
     ) {
-        let engine = Aes256GcmEngine::new(&enc_key, &cid_key);
+        let engine = Aes256GcmEngine::new(&enc_key, crate::testutil::chunk_hasher_for(cid_key));
         let packed = pack_object_streaming_with_context(
             ObjectType::ChunkData, &context, plaintext.len(), &engine,
             |buf| { buf.extend_from_slice(&plaintext); Ok(()) },
@@ -44,7 +44,7 @@ proptest! {
         cid_key in prop::array::uniform32(any::<u8>()),
         context in prop::collection::vec(any::<u8>(), 0..64),
     ) {
-        let engine = ChaCha20Poly1305Engine::new(&enc_key, &cid_key);
+        let engine = ChaCha20Poly1305Engine::new(&enc_key, crate::testutil::chunk_hasher_for(cid_key));
         let packed = pack_object_streaming_with_context(
             ObjectType::ChunkData, &context, plaintext.len(), &engine,
             |buf| { buf.extend_from_slice(&plaintext); Ok(()) },
@@ -65,7 +65,7 @@ proptest! {
         ctx2 in prop::collection::vec(any::<u8>(), 1..32),
     ) {
         prop_assume!(ctx1 != ctx2);
-        let engine = Aes256GcmEngine::new(&enc_key, &cid_key);
+        let engine = Aes256GcmEngine::new(&enc_key, crate::testutil::chunk_hasher_for(cid_key));
         let packed = pack_object_streaming_with_context(
             ObjectType::ChunkData, &ctx1, plaintext.len(), &engine,
             |buf| { buf.extend_from_slice(&plaintext); Ok(()) },

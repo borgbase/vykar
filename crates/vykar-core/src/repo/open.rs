@@ -20,7 +20,9 @@ use crate::index::{ChunkIndex, IndexBlob};
 use vykar_crypto::key::{EncryptedKey, MasterKey};
 use vykar_crypto::{self as crypto, CryptoEngine, PlaintextEngine};
 use vykar_storage::StorageBackend;
+use vykar_types::chunk_id::ChunkHasher;
 use vykar_types::error::{Result, VykarError};
+use vykar_types::hash::HashAlgorithm;
 
 /// Derive a deterministic chunk_id_key for plaintext repos from the repo ID.
 fn derive_plaintext_chunk_id_key(repo_id: &[u8]) -> [u8; 32] {
@@ -84,8 +86,11 @@ impl Repository {
         let (crypto, encrypted_key): (Arc<dyn CryptoEngine>, Option<EncryptedKey>) =
             match &encryption {
                 EncryptionMode::None => {
-                    let chunk_id_key = derive_plaintext_chunk_id_key(&repo_config.id);
-                    (Arc::new(PlaintextEngine::new(&chunk_id_key)), None)
+                    let chunk_hasher = ChunkHasher::new(
+                        HashAlgorithm::Blake2b,
+                        derive_plaintext_chunk_id_key(&repo_config.id),
+                    );
+                    (Arc::new(PlaintextEngine::new(chunk_hasher)), None)
                 }
                 EncryptionMode::Aes256Gcm => {
                     let master_key = MasterKey::generate()?;
@@ -95,7 +100,7 @@ impl Repository {
                     let enc_key = master_key.to_encrypted(pass)?;
                     let engine = crypto::aes_gcm::Aes256GcmEngine::new(
                         &master_key.encryption_key,
-                        &master_key.chunk_id_key,
+                        ChunkHasher::new(HashAlgorithm::Blake2b, master_key.chunk_id_key),
                     );
                     (Arc::new(engine), Some(enc_key))
                 }
@@ -107,7 +112,7 @@ impl Repository {
                     let enc_key = master_key.to_encrypted(pass)?;
                     let engine = crypto::chacha20_poly1305::ChaCha20Poly1305Engine::new(
                         &master_key.encryption_key,
-                        &master_key.chunk_id_key,
+                        ChunkHasher::new(HashAlgorithm::Blake2b, master_key.chunk_id_key),
                     );
                     (Arc::new(engine), Some(enc_key))
                 }
@@ -234,8 +239,11 @@ impl Repository {
         // Build crypto engine
         let crypto: Arc<dyn CryptoEngine> = match &repo_config.encryption {
             EncryptionMode::None => {
-                let chunk_id_key = derive_plaintext_chunk_id_key(&repo_config.id);
-                Arc::new(PlaintextEngine::new(&chunk_id_key))
+                let chunk_hasher = ChunkHasher::new(
+                    HashAlgorithm::Blake2b,
+                    derive_plaintext_chunk_id_key(&repo_config.id),
+                );
+                Arc::new(PlaintextEngine::new(chunk_hasher))
             }
             EncryptionMode::Aes256Gcm => {
                 let key_data = storage
@@ -248,7 +256,7 @@ impl Repository {
                 let master_key = MasterKey::from_encrypted(&enc_key, pass)?;
                 let engine = crypto::aes_gcm::Aes256GcmEngine::new(
                     &master_key.encryption_key,
-                    &master_key.chunk_id_key,
+                    ChunkHasher::new(HashAlgorithm::Blake2b, master_key.chunk_id_key),
                 );
                 Arc::new(engine)
             }
@@ -263,7 +271,7 @@ impl Repository {
                 let master_key = MasterKey::from_encrypted(&enc_key, pass)?;
                 let engine = crypto::chacha20_poly1305::ChaCha20Poly1305Engine::new(
                     &master_key.encryption_key,
-                    &master_key.chunk_id_key,
+                    ChunkHasher::new(HashAlgorithm::Blake2b, master_key.chunk_id_key),
                 );
                 Arc::new(engine)
             }

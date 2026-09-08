@@ -346,7 +346,7 @@ pub fn compact_repo(
             continue;
         }
 
-        let mut writer = PackWriter::new(PackType::Data, pack_target);
+        let mut writer = PackWriter::new(PackType::Data, pack_target, repo.content_hash());
 
         for entry in &analysis.live_entries {
             // Read the 4-byte length prefix together with the blob data in a

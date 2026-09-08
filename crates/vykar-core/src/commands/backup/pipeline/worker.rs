@@ -17,7 +17,7 @@ use crate::config::ChunkerConfig;
 use crate::limits::ByteRateLimiter;
 use crate::platform::fs;
 use vykar_crypto::CryptoEngine;
-use vykar_types::chunk_id::ChunkId;
+use vykar_types::chunk_id::{ChunkHasher, ChunkId};
 use vykar_types::error::Result;
 
 use super::super::chunk_process::classify_chunk;
@@ -52,7 +52,7 @@ fn estimate_chunk_count(data_len: u64, avg_chunk_size: u32) -> usize {
 #[allow(clippy::too_many_arguments)]
 pub(super) fn process_file_worker(
     entry: WalkEntry,
-    chunk_id_key: &[u8; 32],
+    chunk_hasher: &ChunkHasher,
     crypto: &dyn CryptoEngine,
     compression: Compression,
     chunker_config: &ChunkerConfig,
@@ -97,7 +97,7 @@ pub(super) fn process_file_worker(
                     chunker_config,
                     read_limiter,
                     |data| {
-                        let chunk_id = ChunkId::compute(chunk_id_key, &data);
+                        let chunk_id = ChunkId::compute(chunk_hasher, &data);
                         worker_chunks
                             .push(classify_chunk(chunk_id, data, dedup_filter, compression, crypto)?);
                         Ok(())
@@ -156,7 +156,7 @@ pub(super) fn process_file_worker(
                     chunker_config,
                     read_limiter,
                     |data| {
-                        let chunk_id = ChunkId::compute(chunk_id_key, &data);
+                        let chunk_id = ChunkId::compute(chunk_hasher, &data);
                         worker_chunks
                             .push(classify_chunk(chunk_id, data, dedup_filter, compression, crypto)?);
                         Ok(())

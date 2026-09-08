@@ -12,7 +12,8 @@ pub(crate) fn run_init(config: &VykarConfig, label: Option<&str>) -> CliResult<(
     println!("Repository initialized at: {}", config.repository.url);
     println!("Encryption mode: {}", repo.config.encryption.as_str());
 
-    let fingerprint = identity::compute_fingerprint(&repo.config.id, repo.crypto.chunk_id_key());
+    let fingerprint =
+        identity::compute_fingerprint(&repo.config.id, repo.crypto.chunk_hasher().key());
     eprintln!("Repository fingerprint: {}", hex::encode(fingerprint));
 
     Ok(())

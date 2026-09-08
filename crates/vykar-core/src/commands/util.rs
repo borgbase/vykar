@@ -58,7 +58,7 @@ pub(crate) fn verify_repo_identity(config: &VykarConfig, repo: &Repository) -> R
     identity::verify_or_pin(
         &config.repository.url,
         &repo.config.id,
-        repo.crypto.chunk_id_key(),
+        repo.crypto.chunk_hasher().key(),
         cache_dir_from_config(config).as_deref(),
         config.trust_repo,
     )

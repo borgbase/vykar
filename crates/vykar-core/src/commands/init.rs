@@ -32,7 +32,7 @@ pub fn run(config: &VykarConfig, passphrase: Option<&str>) -> Result<Repository>
     if let Err(e) = identity::verify_or_pin(
         &config.repository.url,
         &repo.config.id,
-        repo.crypto.chunk_id_key(),
+        repo.crypto.chunk_hasher().key(),
         super::util::cache_dir_from_config(config).as_deref(),
         true, // always pin at init (no pre-existing pin to conflict with)
     ) {

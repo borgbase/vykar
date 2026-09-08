@@ -395,7 +395,7 @@ mod tests {
     use vykar_crypto::PlaintextEngine;
 
     fn test_crypto() -> PlaintextEngine {
-        PlaintextEngine::new(&[0xAA; 32])
+        PlaintextEngine::new(crate::testutil::chunk_hasher_for([0xAA; 32]))
     }
 
     fn make_snapshot_meta(name: &str) -> SnapshotMeta {

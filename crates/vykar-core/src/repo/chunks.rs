@@ -158,7 +158,7 @@ impl Repository {
         pack_type: PackType,
     ) -> Result<u32> {
         debug_assert_eq!(
-            ChunkId::compute(self.crypto.chunk_id_key(), data),
+            ChunkId::compute(&self.crypto.chunk_hasher(), data),
             chunk_id,
             "inline commit: chunk_id mismatch"
         );
@@ -295,7 +295,7 @@ impl Repository {
         compression: compress::Compression,
         pack_type: PackType,
     ) -> Result<(ChunkId, u32, bool)> {
-        let chunk_id = ChunkId::compute(self.crypto.chunk_id_key(), data);
+        let chunk_id = ChunkId::compute(&self.crypto.chunk_hasher(), data);
 
         if let Some(stored_size) = self.bump_ref_if_exists(&chunk_id) {
             return Ok((chunk_id, stored_size, false));

@@ -28,6 +28,7 @@ use vykar_crypto::CryptoEngine;
 use vykar_storage::StorageBackend;
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::Result;
+use vykar_types::hash::HashAlgorithm;
 
 use self::file_cache::FileCache;
 use self::manifest::Manifest;
@@ -195,6 +196,13 @@ impl Repository {
         )?;
         self.file_cache_dirty = false;
         Ok(())
+    }
+
+    /// The content-digest algorithm this repository's chunk IDs and pack IDs
+    /// use. Implied by the repository format version and fixed for the life of
+    /// the repository.
+    pub fn content_hash(&self) -> HashAlgorithm {
+        self.crypto.chunk_hasher().algorithm()
     }
 
     // ----- Accessors for private fields -----

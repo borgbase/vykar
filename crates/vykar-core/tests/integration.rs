@@ -2794,19 +2794,25 @@ fn plaintext_chunk_id_key_consistent_across_init_and_open() {
         None,
     )
     .unwrap();
-    let key_init = *repo.crypto.chunk_id_key();
-    let id_init = vykar_types::chunk_id::ChunkId::compute(&key_init, data);
+    let hasher_init = repo.crypto.chunk_hasher();
+    let id_init = vykar_types::chunk_id::ChunkId::compute(&hasher_init, data);
     drop(repo);
 
     // Re-open the same repo and compute the ChunkId for the same data
     let storage = Box::new(LocalBackend::new(repo_dir.to_str().unwrap()).unwrap());
     let repo = Repository::open(storage, None, None, OpenOptions::new()).unwrap();
-    let key_open = *repo.crypto.chunk_id_key();
-    let id_open = vykar_types::chunk_id::ChunkId::compute(&key_open, data);
+    let hasher_open = repo.crypto.chunk_hasher();
+    let id_open = vykar_types::chunk_id::ChunkId::compute(&hasher_open, data);
 
     assert_eq!(
-        key_init, key_open,
-        "chunk_id_key must be identical after init and open"
+        hasher_init.key(),
+        hasher_open.key(),
+        "chunk-ID key must be identical after init and open"
+    );
+    assert_eq!(
+        hasher_init.algorithm(),
+        hasher_open.algorithm(),
+        "chunk-ID algorithm must be identical after init and open"
     );
     assert_eq!(
         id_init, id_open,

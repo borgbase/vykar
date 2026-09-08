@@ -28,7 +28,7 @@ impl Repository {
             self.config.max_pack_size,
         );
         let tree_target = compute_tree_pack_target(self.config.min_pack_size);
-        let mut ws = WriteSessionState::new(data_target, tree_target, 2);
+        let mut ws = WriteSessionState::new(data_target, tree_target, 2, self.content_hash());
         ws.persisted_pack_count = num_packs;
         self.write_session = Some(ws);
         Ok(())
@@ -374,7 +374,11 @@ impl Repository {
         }
 
         // 5. Reset data pack writer (discards any partial pack buffer).
-        ws.data_pack_writer = PackWriter::new(PackType::Data, tracker.data_pack_target_size);
+        // Carry the algorithm over from the writer being replaced rather than
+        // re-deriving it — a reset must not be able to change a pack's name.
+        let hash_algo = ws.data_pack_writer.hash_algorithm();
+        ws.data_pack_writer =
+            PackWriter::new(PackType::Data, tracker.data_pack_target_size, hash_algo);
     }
 
     /// Promote a recovered chunk into the active dedup structure and index delta.

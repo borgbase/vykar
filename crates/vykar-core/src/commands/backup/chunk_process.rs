@@ -84,9 +84,9 @@ mod tests {
 
     #[test]
     fn prepared_compressible_chunks_release_excess_capacity() {
-        let engine = PlaintextEngine::new(&[0xAA; 32]);
+        let engine = PlaintextEngine::new(crate::testutil::chunk_hasher_for([0xAA; 32]));
         let payload = vec![0x42; 1024 * 1024];
-        let chunk_id = ChunkId::compute(engine.chunk_id_key(), &payload);
+        let chunk_id = ChunkId::compute(&engine.chunk_hasher(), &payload);
         for compression in [Compression::Lz4, Compression::Zstd { level: 3 }] {
             let chunk =
                 classify_chunk(chunk_id, payload.clone(), None, compression, &engine).unwrap();
@@ -113,9 +113,9 @@ mod tests {
     #[test]
     fn pack_chunk_data_roundtrip() {
         let key = [0xAA; 32];
-        let engine = PlaintextEngine::new(&key);
+        let engine = PlaintextEngine::new(crate::testutil::chunk_hasher_for(key));
         let payload = b"the quick brown fox jumps over the lazy dog, repeatedly!";
-        let chunk_id = ChunkId::compute(engine.chunk_id_key(), payload);
+        let chunk_id = ChunkId::compute(&engine.chunk_hasher(), payload);
 
         let codecs = [
             Compression::None,
@@ -145,9 +145,9 @@ mod tests {
         use crate::repo::format::pack_object_with_context;
 
         let key = [0xBB; 32];
-        let engine = PlaintextEngine::new(&key);
+        let engine = PlaintextEngine::new(crate::testutil::chunk_hasher_for(key));
         let payload = vec![0x42; 4096];
-        let chunk_id = ChunkId::compute(engine.chunk_id_key(), &payload);
+        let chunk_id = ChunkId::compute(&engine.chunk_hasher(), &payload);
 
         let codecs = [
             Compression::None,
@@ -181,9 +181,9 @@ mod tests {
 
         let enc_key = [0x11; 32];
         let cid_key = [0x22; 32];
-        let engine = Aes256GcmEngine::new(&enc_key, &cid_key);
+        let engine = Aes256GcmEngine::new(&enc_key, crate::testutil::chunk_hasher_for(cid_key));
         let payload = b"encrypted chunk data for context-binding test";
-        let chunk_id = ChunkId::compute(engine.chunk_id_key(), payload);
+        let chunk_id = ChunkId::compute(&engine.chunk_hasher(), payload);
 
         for codec in [
             Compression::None,
@@ -226,9 +226,9 @@ mod tests {
     #[test]
     fn pack_chunk_data_no_realloc() {
         let key = [0xCC; 32];
-        let engine = PlaintextEngine::new(&key);
+        let engine = PlaintextEngine::new(crate::testutil::chunk_hasher_for(key));
         let payload = vec![0x42; 8192];
-        let chunk_id = ChunkId::compute(engine.chunk_id_key(), &payload);
+        let chunk_id = ChunkId::compute(&engine.chunk_hasher(), &payload);
 
         for codec in [
             Compression::None,

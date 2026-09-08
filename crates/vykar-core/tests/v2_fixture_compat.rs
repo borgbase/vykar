@@ -356,7 +356,7 @@ fn v2_fixture_pin_files_still_validate() {
         // BLAKE2b for every repository format. For the plaintext fixture it
         // also pins the derived chunk-ID key, which format v3 changes.
         let fingerprint =
-            identity::compute_fingerprint(&repo.config.id, repo.crypto.chunk_id_key());
+            identity::compute_fingerprint(&repo.config.id, repo.crypto.chunk_hasher().key());
         assert_eq!(
             hex::encode(fingerprint),
             fx.pin_fingerprint,
@@ -381,7 +381,7 @@ fn v2_fixture_pin_files_still_validate() {
         identity::verify_or_pin(
             &url,
             &repo.config.id,
-            repo.crypto.chunk_id_key(),
+            repo.crypto.chunk_hasher().key(),
             Some(&cache),
             false, // no --trust-repo
         )
@@ -398,7 +398,7 @@ fn v2_fixture_pin_files_still_validate() {
             identity::verify_or_pin(
                 &url,
                 &repo.config.id,
-                repo.crypto.chunk_id_key(),
+                repo.crypto.chunk_hasher().key(),
                 Some(&cache),
                 false,
             )

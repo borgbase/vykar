@@ -15,12 +15,13 @@ use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::Aes256Gcm;
 use vykar_core::compress::{compress, Compression};
 use vykar_core::index::IndexBlob;
-use vykar_core::repo::file_cache::FileCache;
+use vykar_core::repo::file_cache::{CachedChunkRef, CachedChunks, FileCache};
 use vykar_core::repo::format::ObjectType;
 use vykar_core::repo::pack::{PackType, PackWriter};
 use vykar_core::snapshot::item::{ChunkRef, Item, ItemType};
 use vykar_core::snapshot::SnapshotMeta;
 use vykar_types::chunk_id::ChunkId;
+use vykar_types::hash::HashAlgorithm;
 
 const CORPUS_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/corpus");
 
@@ -43,7 +44,7 @@ fn seed_pack_scan() {
     write_seed("fuzz_pack_scan", "empty_pack", &header);
 
     // Pack with two small blobs via PackWriter
-    let mut pw = PackWriter::new(PackType::Data, usize::MAX);
+    let mut pw = PackWriter::new(PackType::Data, usize::MAX, HashAlgorithm::Blake2b);
     pw.add_blob(ChunkId::from_bytes([1; 32]), vec![0xDE, 0xAD])
         .unwrap();
     pw.add_blob(ChunkId::from_bytes([2; 32]), vec![0xBE, 0xEF, 0x42])
@@ -52,7 +53,7 @@ fn seed_pack_scan() {
     write_seed("fuzz_pack_scan", "two_blobs", sealed.data.as_slice());
 
     // Pack with a single larger blob
-    let mut pw = PackWriter::new(PackType::Data, usize::MAX);
+    let mut pw = PackWriter::new(PackType::Data, usize::MAX, HashAlgorithm::Blake2b);
     pw.add_blob(ChunkId::from_bytes([3; 32]), vec![0x42; 256])
         .unwrap();
     let sealed = pw.seal().unwrap();
@@ -94,6 +95,8 @@ fn seed_snapshot_meta() {
         source_label: "test".into(),
         source_paths: vec!["/tmp/test".into()],
         label: String::new(),
+        ext: None,
+        format_version: vykar_core::snapshot::CURRENT_FORMAT_VERSION,
     };
     let encoded = rmp_serde::to_vec(&meta).unwrap();
     write_seed("fuzz_msgpack_snapshot_meta", "valid", &encoded);
@@ -112,6 +115,8 @@ fn seed_snapshot_meta() {
         source_label: String::new(),
         source_paths: vec![],
         label: String::new(),
+        ext: None,
+        format_version: vykar_core::snapshot::CURRENT_FORMAT_VERSION,
     };
     let encoded = rmp_serde::to_vec(&minimal).unwrap();
     write_seed("fuzz_msgpack_snapshot_meta", "minimal", &encoded);
@@ -147,6 +152,8 @@ fn seed_item_stream() {
             }],
             link_target: None,
             xattrs: None,
+            raw_names: None,
+            hardlink: None,
         },
         Item {
             path: "/tmp/dir".into(),
@@ -166,6 +173,8 @@ fn seed_item_stream() {
                 "user.test".into(),
                 b"value".to_vec(),
             )])),
+            raw_names: None,
+            hardlink: None,
         },
         Item {
             path: "/tmp/link".into(),
@@ -182,6 +191,8 @@ fn seed_item_stream() {
             chunks: vec![],
             link_target: Some("/tmp/file.txt".into()),
             xattrs: None,
+            raw_names: None,
+            hardlink: None,
         },
     ];
 
@@ -208,11 +219,10 @@ fn seed_file_cache_decode() {
         1234567890,
         1234567890,
         4096,
-        vec![ChunkRef {
+        CachedChunks::from_vec(vec![CachedChunkRef {
             id: ChunkId::from_bytes([0xDD; 32]),
             size: 4096,
-            csize: 2048,
-        }],
+        }]),
     );
     let encoded = rmp_serde::to_vec(&cache).unwrap();
     write_seed("fuzz_file_cache_decode", "current_format", &encoded);

@@ -15,7 +15,7 @@ use crate::compress;
 use crate::repo::format::{unpack_object_expect_with_context_into, ObjectType};
 use vykar_crypto::CryptoEngine;
 use vykar_storage::StorageBackend;
-use vykar_types::chunk_id::ChunkId;
+use vykar_types::chunk_id::{ChunkHasher, ChunkId};
 use vykar_types::error::{Result, VykarError};
 use vykar_types::pack_id::PackId;
 
@@ -209,7 +209,7 @@ pub(super) fn execute_parallel_restore(
 
     let bytes_written = AtomicU64::new(0);
     let cancelled = AtomicBool::new(false);
-    let chunk_id_key = *crypto.chunk_id_key();
+    let chunk_hasher = crypto.chunk_hasher();
 
     std::thread::scope(|s| {
         let mut handles = Vec::with_capacity(buckets.len());
@@ -217,7 +217,7 @@ pub(super) fn execute_parallel_restore(
         for bucket in &buckets {
             let bytes_written = &bytes_written;
             let cancelled = &cancelled;
-            let chunk_id_key = &chunk_id_key;
+            let chunk_hasher = &chunk_hasher;
 
             handles.push(s.spawn(move || -> Result<()> {
                 let mut data_buf = Vec::new();
@@ -240,7 +240,7 @@ pub(super) fn execute_parallel_restore(
                         &mut decompress_buf,
                         root,
                         verify_chunks,
-                        chunk_id_key,
+                        chunk_hasher,
                     ) {
                         cancelled.store(true, Ordering::Release);
                         return Err(e);
@@ -284,7 +284,7 @@ fn process_read_group(
     decompress_buf: &mut Vec<u8>,
     root: &Path,
     verify_chunks: bool,
-    chunk_id_key: &[u8; 32],
+    chunk_hasher: &ChunkHasher,
 ) -> Result<()> {
     if cancelled.load(Ordering::Acquire) {
         return Ok(());
@@ -367,7 +367,7 @@ fn process_read_group(
         }
 
         if verify_chunks {
-            let actual = ChunkId::compute(chunk_id_key, decompress_buf);
+            let actual = ChunkId::compute(chunk_hasher, decompress_buf);
             if actual != blob.chunk_id {
                 return Err(VykarError::InvalidFormat(format!(
                     "chunk {} in pack {} (offset {}, size {}) hash mismatch after decrypt: \
@@ -517,7 +517,7 @@ mod tests {
     };
     use crate::compress::Compression;
     use crate::repo::format::pack_object_with_context;
-    use crate::testutil::{test_chunk_id_key, MemoryBackend};
+    use crate::testutil::{test_chunk_hasher, MemoryBackend};
     use smallvec::SmallVec;
     use std::path::PathBuf;
     use std::sync::atomic::AtomicBool;
@@ -546,7 +546,7 @@ mod tests {
 
         let payload = b"abc";
         let compressed = crate::compress::compress(Compression::None, payload).unwrap();
-        let crypto = PlaintextEngine::new(&test_chunk_id_key());
+        let crypto = PlaintextEngine::new(test_chunk_hasher());
         let packed = pack_object_with_context(
             ObjectType::ChunkData,
             dummy_chunk_id(0xAA).as_bytes(),
@@ -593,7 +593,7 @@ mod tests {
             &mut decompress_buf,
             temp.path(),
             false,
-            &test_chunk_id_key(),
+            &test_chunk_hasher(),
         )
         .unwrap_err()
         .to_string();
@@ -611,7 +611,7 @@ mod tests {
         let out = temp.path().join("big.bin");
 
         let big_data = vec![0xABu8; MAX_WRITE_BATCH + 1024];
-        let crypto = PlaintextEngine::new(&test_chunk_id_key());
+        let crypto = PlaintextEngine::new(test_chunk_hasher());
         let cid = dummy_chunk_id(0x01);
         let packed = pack_blob(cid, &big_data, &crypto);
 
@@ -659,7 +659,7 @@ mod tests {
             &mut decompress_buf,
             temp.path(),
             false,
-            &test_chunk_id_key(),
+            &test_chunk_hasher(),
         )
         .unwrap();
 
@@ -679,7 +679,7 @@ mod tests {
         let chunk_a = vec![0xAAu8; half];
         let chunk_b = vec![0xBBu8; MAX_WRITE_BATCH - half];
 
-        let crypto = PlaintextEngine::new(&test_chunk_id_key());
+        let crypto = PlaintextEngine::new(test_chunk_hasher());
         let cid_a = dummy_chunk_id(0x0A);
         let cid_b = dummy_chunk_id(0x0B);
         let packed_a = pack_blob(cid_a, &chunk_a, &crypto);
@@ -743,7 +743,7 @@ mod tests {
             &mut decompress_buf,
             temp.path(),
             false,
-            &test_chunk_id_key(),
+            &test_chunk_hasher(),
         )
         .unwrap();
 
@@ -765,7 +765,7 @@ mod tests {
         let data_a = vec![0xAAu8; 4096];
         let data_b = vec![0xBBu8; 8192];
 
-        let crypto = PlaintextEngine::new(&test_chunk_id_key());
+        let crypto = PlaintextEngine::new(test_chunk_hasher());
         let cid_a = dummy_chunk_id(0x0A);
         let cid_b = dummy_chunk_id(0x0B);
         let packed_a = pack_blob(cid_a, &data_a, &crypto);
@@ -840,7 +840,7 @@ mod tests {
             &mut decompress_buf,
             temp.path(),
             false,
-            &test_chunk_id_key(),
+            &test_chunk_hasher(),
         )
         .unwrap();
 
@@ -859,7 +859,7 @@ mod tests {
 
         let num_chunks = 8u8;
         let chunk_size = 1024usize; // well under MAX_WRITE_BATCH
-        let crypto = PlaintextEngine::new(&test_chunk_id_key());
+        let crypto = PlaintextEngine::new(test_chunk_hasher());
 
         #[allow(clippy::type_complexity)]
         let mut entries: Vec<(ChunkId, Vec<u8>, u32, SmallVec<[WriteTarget; 1]>)> = Vec::new();
@@ -915,7 +915,7 @@ mod tests {
             &mut decompress_buf,
             temp.path(),
             false,
-            &test_chunk_id_key(),
+            &test_chunk_hasher(),
         )
         .unwrap();
 
@@ -934,8 +934,8 @@ mod tests {
         let out = temp.path().join("good.bin");
 
         let payload = b"verify-good-data";
-        let crypto = PlaintextEngine::new(&test_chunk_id_key());
-        let cid = ChunkId::compute(&test_chunk_id_key(), payload);
+        let crypto = PlaintextEngine::new(test_chunk_hasher());
+        let cid = ChunkId::compute(&test_chunk_hasher(), payload);
         let packed = pack_blob(cid, payload, &crypto);
 
         let files = vec![PlannedFile {
@@ -982,7 +982,7 @@ mod tests {
             &mut decompress_buf,
             temp.path(),
             true,
-            &test_chunk_id_key(),
+            &test_chunk_hasher(),
         )
         .unwrap();
 
@@ -1001,8 +1001,8 @@ mod tests {
         let _out = temp.path().join("bad.bin");
 
         let payload = b"verify-bad-data";
-        let crypto = PlaintextEngine::new(&test_chunk_id_key());
-        let real_cid = ChunkId::compute(&test_chunk_id_key(), payload);
+        let crypto = PlaintextEngine::new(test_chunk_hasher());
+        let real_cid = ChunkId::compute(&test_chunk_hasher(), payload);
         let wrong_cid = dummy_chunk_id(0xEE);
         assert_ne!(real_cid, wrong_cid);
         // Encrypt under the wrong (snapshot-recorded) chunk_id as AAD so the
@@ -1054,7 +1054,7 @@ mod tests {
             &mut decompress_buf,
             temp.path(),
             true,
-            &test_chunk_id_key(),
+            &test_chunk_hasher(),
         )
         .unwrap_err()
         .to_string();
@@ -1082,7 +1082,7 @@ mod tests {
             &mut decompress_buf,
             temp2.path(),
             false,
-            &test_chunk_id_key(),
+            &test_chunk_hasher(),
         )
         .unwrap();
     }

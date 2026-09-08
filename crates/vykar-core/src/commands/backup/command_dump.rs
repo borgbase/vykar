@@ -149,7 +149,7 @@ fn stream_dump_command(
         };
 
         // Stream stdout through chunker.
-        let chunk_id_key = *repo.crypto.chunk_id_key();
+        let chunk_hasher = repo.crypto.chunk_hasher();
         let stdout = stdout.ok_or_else(|| {
             VykarError::Other("internal: command_dump stdout not piped (config bug)".into())
         })?;
@@ -174,7 +174,7 @@ fn stream_dump_command(
             debug_assert!(chunk.data.len() <= u32::MAX as usize);
             let size = chunk.data.len() as u32;
             total_size += size as u64;
-            let chunk_id = ChunkId::compute(&chunk_id_key, &chunk.data);
+            let chunk_id = ChunkId::compute(&chunk_hasher, &chunk.data);
 
             if let Some(csize) = repo.bump_ref_if_exists(&chunk_id) {
                 stats.original_size += size as u64;

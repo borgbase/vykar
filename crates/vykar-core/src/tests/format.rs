@@ -9,7 +9,7 @@ use vykar_types::error::VykarError;
 
 #[test]
 fn roundtrip_plaintext() {
-    let engine = PlaintextEngine::new(&[0xAA; 32]);
+    let engine = PlaintextEngine::new(crate::testutil::chunk_hasher_for([0xAA; 32]));
     let data = b"manifest data here";
     let packed = pack_object(ObjectType::Manifest, data, &engine).unwrap();
     let (obj_type, unpacked) = unpack_object(&packed, &engine).unwrap();
@@ -19,7 +19,7 @@ fn roundtrip_plaintext() {
 
 #[test]
 fn roundtrip_encrypted() {
-    let engine = Aes256GcmEngine::new(&[0x11; 32], &[0x22; 32]);
+    let engine = Aes256GcmEngine::new(&[0x11; 32], crate::testutil::chunk_hasher_for([0x22; 32]));
     let data = b"secret chunk data";
     let packed = pack_object(ObjectType::ChunkData, data, &engine).unwrap();
     let (obj_type, unpacked) = unpack_object(&packed, &engine).unwrap();
@@ -29,7 +29,7 @@ fn roundtrip_encrypted() {
 
 #[test]
 fn type_tag_is_first_byte() {
-    let engine = PlaintextEngine::new(&[0xAA; 32]);
+    let engine = PlaintextEngine::new(crate::testutil::chunk_hasher_for([0xAA; 32]));
     let packed = pack_object(ObjectType::Manifest, b"data", &engine).unwrap();
     assert_eq!(packed[0], ObjectType::Manifest as u8);
 
@@ -39,7 +39,7 @@ fn type_tag_is_first_byte() {
 
 #[test]
 fn wrong_type_tag_encrypted_fails_aad() {
-    let engine = Aes256GcmEngine::new(&[0x11; 32], &[0x22; 32]);
+    let engine = Aes256GcmEngine::new(&[0x11; 32], crate::testutil::chunk_hasher_for([0x22; 32]));
     let data = b"secret";
     let mut packed = pack_object(ObjectType::Manifest, data, &engine).unwrap();
     // Change the type tag byte — AAD mismatch should cause decryption failure
@@ -50,7 +50,7 @@ fn wrong_type_tag_encrypted_fails_aad() {
 
 #[test]
 fn empty_data_fails() {
-    let engine = PlaintextEngine::new(&[0xAA; 32]);
+    let engine = PlaintextEngine::new(crate::testutil::chunk_hasher_for([0xAA; 32]));
     let result = unpack_object(b"", &engine);
     assert!(result.is_err());
     match result.unwrap_err() {
@@ -61,7 +61,7 @@ fn empty_data_fails() {
 
 #[test]
 fn unknown_type_tag_fails() {
-    let engine = PlaintextEngine::new(&[0xAA; 32]);
+    let engine = PlaintextEngine::new(crate::testutil::chunk_hasher_for([0xAA; 32]));
     let result = unpack_object(&[0xFF, 0x01, 0x02], &engine);
     assert!(result.is_err());
     assert!(matches!(
@@ -90,7 +90,7 @@ fn object_type_from_u8_invalid() {
 
 #[test]
 fn unpack_expect_rejects_wrong_object_type() {
-    let engine = PlaintextEngine::new(&[0xAA; 32]);
+    let engine = PlaintextEngine::new(crate::testutil::chunk_hasher_for([0xAA; 32]));
     let packed = pack_object(ObjectType::Manifest, b"data", &engine).unwrap();
 
     let err = unpack_object_expect(&packed, ObjectType::ChunkData, &engine).unwrap_err();
@@ -100,7 +100,7 @@ fn unpack_expect_rejects_wrong_object_type() {
 
 #[test]
 fn pack_object_streaming_roundtrip_plaintext() {
-    let engine = PlaintextEngine::new(&[0xAA; 32]);
+    let engine = PlaintextEngine::new(crate::testutil::chunk_hasher_for([0xAA; 32]));
     let data = b"streaming plaintext data";
     let packed = pack_object_streaming(ObjectType::Manifest, data.len(), &engine, |buf| {
         buf.extend_from_slice(data);
@@ -113,7 +113,7 @@ fn pack_object_streaming_roundtrip_plaintext() {
 
 #[test]
 fn pack_object_streaming_roundtrip_encrypted() {
-    let engine = Aes256GcmEngine::new(&[0x11; 32], &[0x22; 32]);
+    let engine = Aes256GcmEngine::new(&[0x11; 32], crate::testutil::chunk_hasher_for([0x22; 32]));
     let data = b"streaming encrypted data";
     let packed = pack_object_streaming(ObjectType::ChunkIndex, data.len(), &engine, |buf| {
         buf.extend_from_slice(data);
@@ -127,7 +127,7 @@ fn pack_object_streaming_roundtrip_encrypted() {
 #[test]
 fn pack_object_streaming_matches_pack_object() {
     // For plaintext, streaming output should be byte-identical to pack_object
-    let engine = PlaintextEngine::new(&[0xBB; 32]);
+    let engine = PlaintextEngine::new(crate::testutil::chunk_hasher_for([0xBB; 32]));
     let data = b"verify identical output";
     let packed_normal = pack_object(ObjectType::ChunkData, data, &engine).unwrap();
     let packed_streaming =
@@ -141,7 +141,7 @@ fn pack_object_streaming_matches_pack_object() {
 
 #[test]
 fn context_bound_roundtrip_encrypted() {
-    let engine = Aes256GcmEngine::new(&[0x11; 32], &[0x22; 32]);
+    let engine = Aes256GcmEngine::new(&[0x11; 32], crate::testutil::chunk_hasher_for([0x22; 32]));
     let data = b"context-bound payload";
     let context = b"chunk-identity";
     let packed = pack_object_with_context(ObjectType::ChunkData, context, data, &engine).unwrap();
@@ -153,7 +153,7 @@ fn context_bound_roundtrip_encrypted() {
 
 #[test]
 fn context_bound_wrong_context_fails() {
-    let engine = Aes256GcmEngine::new(&[0x11; 32], &[0x22; 32]);
+    let engine = Aes256GcmEngine::new(&[0x11; 32], crate::testutil::chunk_hasher_for([0x22; 32]));
     let packed =
         pack_object_with_context(ObjectType::ChunkData, b"chunk-a", b"ciphertext", &engine)
             .unwrap();
@@ -163,7 +163,7 @@ fn context_bound_wrong_context_fails() {
 
 #[test]
 fn context_bound_unpack_rejects_legacy_object() {
-    let engine = Aes256GcmEngine::new(&[0x11; 32], &[0x22; 32]);
+    let engine = Aes256GcmEngine::new(&[0x11; 32], crate::testutil::chunk_hasher_for([0x22; 32]));
     let packed = pack_object(ObjectType::Manifest, b"legacy-manifest", &engine).unwrap();
     let err =
         unpack_object_expect_with_context(&packed, ObjectType::Manifest, b"manifest", &engine)

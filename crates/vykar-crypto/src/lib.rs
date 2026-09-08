@@ -12,6 +12,7 @@
 pub mod key;
 pub mod select;
 
+use vykar_types::chunk_id::ChunkHasher;
 use vykar_types::error::Result;
 
 /// Trait for encrypting and decrypting repository objects.
@@ -60,8 +61,11 @@ pub trait CryptoEngine: Send + Sync {
     /// `PlaintextEngine` returns false; real ciphers return true.
     fn is_encrypting(&self) -> bool;
 
-    /// The key used for computing chunk IDs (keyed BLAKE2b-256).
-    fn chunk_id_key(&self) -> &[u8; 32];
+    /// The keyed hasher used for computing chunk IDs.
+    ///
+    /// By value: `ChunkHasher` is `Copy` and 33 bytes, and the callers that
+    /// matter hoist it once per run before entering the chunking loop.
+    fn chunk_hasher(&self) -> ChunkHasher;
 }
 
 /// Generate a `CryptoEngine` implementation for an AEAD cipher.
@@ -73,17 +77,20 @@ macro_rules! impl_aead_engine {
         #[doc = concat!($label, " authenticated encryption engine.")]
         pub struct $engine {
             cipher: $crate_path::$cipher,
-            chunk_id_key: [u8; 32],
+            chunk_hasher: ::vykar_types::chunk_id::ChunkHasher,
         }
 
         impl $engine {
-            pub fn new(encryption_key: &[u8; 32], chunk_id_key: &[u8; 32]) -> Self {
+            pub fn new(
+                encryption_key: &[u8; 32],
+                chunk_hasher: ::vykar_types::chunk_id::ChunkHasher,
+            ) -> Self {
                 use $crate_path::aead::KeyInit;
                 let cipher = <$crate_path::$cipher>::new_from_slice(encryption_key)
                     .expect(concat!("valid 32-byte key for ", $label));
                 Self {
                     cipher,
-                    chunk_id_key: *chunk_id_key,
+                    chunk_hasher,
                 }
             }
         }
@@ -200,8 +207,8 @@ macro_rules! impl_aead_engine {
                 true
             }
 
-            fn chunk_id_key(&self) -> &[u8; 32] {
-                &self.chunk_id_key
+            fn chunk_hasher(&self) -> ::vykar_types::chunk_id::ChunkHasher {
+                self.chunk_hasher
             }
         }
     };
@@ -212,14 +219,12 @@ pub mod chacha20_poly1305;
 
 /// No-encryption engine. Still computes deterministic chunk IDs.
 pub struct PlaintextEngine {
-    chunk_id_key: [u8; 32],
+    chunk_hasher: ChunkHasher,
 }
 
 impl PlaintextEngine {
-    pub fn new(chunk_id_key: &[u8; 32]) -> Self {
-        Self {
-            chunk_id_key: *chunk_id_key,
-        }
+    pub fn new(chunk_hasher: ChunkHasher) -> Self {
+        Self { chunk_hasher }
     }
 }
 
@@ -250,8 +255,8 @@ impl CryptoEngine for PlaintextEngine {
         false
     }
 
-    fn chunk_id_key(&self) -> &[u8; 32] {
-        &self.chunk_id_key
+    fn chunk_hasher(&self) -> ChunkHasher {
+        self.chunk_hasher
     }
 }
 
@@ -259,10 +264,15 @@ impl CryptoEngine for PlaintextEngine {
 mod tests {
     use super::*;
 
+    use vykar_types::hash::HashAlgorithm;
+
+    fn hasher(key: [u8; 32]) -> ChunkHasher {
+        ChunkHasher::new(HashAlgorithm::Blake2b, key)
+    }
+
     #[test]
     fn plaintext_encrypt_is_identity() {
-        let key = [0xAA; 32];
-        let engine = PlaintextEngine::new(&key);
+        let engine = PlaintextEngine::new(hasher([0xAA; 32]));
         let data = b"hello plaintext";
         let encrypted = engine.encrypt(data, b"aad").unwrap();
         assert_eq!(encrypted, data);
@@ -270,24 +280,23 @@ mod tests {
 
     #[test]
     fn plaintext_decrypt_is_identity() {
-        let key = [0xAA; 32];
-        let engine = PlaintextEngine::new(&key);
+        let engine = PlaintextEngine::new(hasher([0xAA; 32]));
         let data = b"hello plaintext";
         let decrypted = engine.decrypt(data, b"aad").unwrap();
         assert_eq!(decrypted, data);
     }
 
     #[test]
-    fn plaintext_chunk_id_key() {
+    fn plaintext_chunk_hasher_round_trips() {
         let key = [0xBB; 32];
-        let engine = PlaintextEngine::new(&key);
-        assert_eq!(engine.chunk_id_key(), &key);
+        let engine = PlaintextEngine::new(hasher(key));
+        assert_eq!(engine.chunk_hasher().key(), &key);
+        assert_eq!(engine.chunk_hasher().algorithm(), HashAlgorithm::Blake2b);
     }
 
     #[test]
     fn plaintext_roundtrip_ignores_aad() {
-        let key = [0xCC; 32];
-        let engine = PlaintextEngine::new(&key);
+        let engine = PlaintextEngine::new(hasher([0xCC; 32]));
         let data = b"test data";
         let encrypted = engine.encrypt(data, b"aad1").unwrap();
         let decrypted = engine.decrypt(&encrypted, b"different_aad").unwrap();

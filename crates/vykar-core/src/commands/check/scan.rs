@@ -14,7 +14,7 @@ use crate::snapshot::item::ItemType;
 use vykar_crypto::CryptoEngine;
 use vykar_protocol::validate_pack_header;
 use vykar_storage::StorageBackend;
-use vykar_types::chunk_id::ChunkId;
+use vykar_types::chunk_id::{ChunkHasher, ChunkId};
 use vykar_types::error::{Result, VykarError};
 use vykar_types::pack_id::PackId;
 use vykar_types::snapshot_id::SnapshotId;
@@ -504,7 +504,7 @@ pub(super) fn integrity_scan(
         let (data_count, data_issues) = parallel_verify_data(
             &repo.storage,
             &repo.crypto,
-            repo.crypto.chunk_id_key(),
+            &repo.crypto.chunk_hasher(),
             &packs_vec,
             config.limits.verify_data_concurrency(),
             BATCH_THRESHOLD,
@@ -669,7 +669,7 @@ fn parallel_pack_existence(
 fn parallel_verify_data(
     storage: &Arc<dyn StorageBackend>,
     crypto: &Arc<dyn CryptoEngine>,
-    chunk_id_key: &[u8; 32],
+    chunk_hasher: &ChunkHasher,
     packs: &[(PackId, Vec<(ChunkId, ChunkIndexEntry)>)],
     concurrency: usize,
     batch_threshold: usize,
@@ -695,7 +695,7 @@ fn parallel_verify_data(
                     verify_pack_full(
                         storage.as_ref(),
                         crypto.as_ref(),
-                        chunk_id_key,
+                        chunk_hasher,
                         pack_id,
                         chunks,
                         &mut local_issues,
@@ -704,7 +704,7 @@ fn parallel_verify_data(
                     verify_pack_individual(
                         storage.as_ref(),
                         crypto.as_ref(),
-                        chunk_id_key,
+                        chunk_hasher,
                         pack_id,
                         chunks,
                         &mut local_issues,
@@ -734,7 +734,7 @@ fn parallel_verify_data(
 pub(crate) fn verify_pack_full(
     storage: &dyn StorageBackend,
     crypto: &dyn CryptoEngine,
-    chunk_id_key: &[u8; 32],
+    chunk_hasher: &ChunkHasher,
     pack_id: &PackId,
     chunks: &[(ChunkId, ChunkIndexEntry)],
     issues: &mut Vec<IntegrityIssue>,
@@ -825,7 +825,7 @@ pub(crate) fn verify_pack_full(
         let raw = pack_data
             .get(start..end)
             .expect("end <= pack_data.len() (checked above)");
-        count += verify_single_chunk(crypto, chunk_id_key, chunk_id, pack_id, raw, issues);
+        count += verify_single_chunk(crypto, chunk_hasher, chunk_id, pack_id, raw, issues);
     }
     count
 }
@@ -834,7 +834,7 @@ pub(crate) fn verify_pack_full(
 fn verify_pack_individual(
     storage: &dyn StorageBackend,
     crypto: &dyn CryptoEngine,
-    chunk_id_key: &[u8; 32],
+    chunk_hasher: &ChunkHasher,
     pack_id: &PackId,
     chunks: &[(ChunkId, ChunkIndexEntry)],
     issues: &mut Vec<IntegrityIssue>,
@@ -853,7 +853,7 @@ fn verify_pack_individual(
                 continue;
             }
         };
-        count += verify_single_chunk(crypto, chunk_id_key, chunk_id, pack_id, &raw, issues);
+        count += verify_single_chunk(crypto, chunk_hasher, chunk_id, pack_id, &raw, issues);
     }
     count
 }
@@ -861,7 +861,7 @@ fn verify_pack_individual(
 /// Decrypt, decompress, and recompute ChunkId for one blob. Returns 1 on success, 0 on error.
 fn verify_single_chunk(
     crypto: &dyn CryptoEngine,
-    chunk_id_key: &[u8; 32],
+    chunk_hasher: &ChunkHasher,
     chunk_id: &ChunkId,
     pack_id: &PackId,
     raw: &[u8],
@@ -896,7 +896,7 @@ fn verify_single_chunk(
         }
     };
 
-    let recomputed = ChunkId::compute(chunk_id_key, &plaintext);
+    let recomputed = ChunkId::compute(chunk_hasher, &plaintext);
     if &recomputed != chunk_id {
         issues.push(IntegrityIssue::CorruptChunk {
             chunk_id: *chunk_id,

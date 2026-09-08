@@ -719,9 +719,10 @@ mod tests {
 
     #[test]
     fn compute_blake2b_matches_pack_id() {
+        use vykar_types::hash::HashAlgorithm;
         use vykar_types::pack_id::PackId;
         let data = b"hello world test data for blake2b verification";
-        let pack_id = PackId::compute(data);
+        let pack_id = PackId::compute(data, HashAlgorithm::Blake2b);
         let computed = RestBackend::compute_blake2b_256_hex(data);
         assert_eq!(computed, pack_id.to_hex());
     }

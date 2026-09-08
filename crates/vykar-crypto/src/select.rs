@@ -3,6 +3,8 @@ use std::time::Instant;
 use super::aes_gcm::Aes256GcmEngine;
 use super::chacha20_poly1305::ChaCha20Poly1305Engine;
 use super::CryptoEngine;
+use vykar_types::chunk_id::ChunkHasher;
+use vykar_types::hash::HashAlgorithm;
 
 const SMALL_SIZE: usize = 4 * 1024;
 const LARGE_SIZE: usize = 1024 * 1024;
@@ -48,12 +50,13 @@ pub fn select_best_aead() -> AutoAeadMode {
 
 fn benchmark_candidate(candidate: AutoAeadMode) -> CandidateScore {
     let encryption_key = [0x3Au8; 32];
-    let chunk_id_key = [0xC5u8; 32];
+    // Throwaway hasher: this benchmark only exercises the AEAD, never chunk IDs.
+    let chunk_hasher = ChunkHasher::new(HashAlgorithm::Blake2b, [0xC5u8; 32]);
 
     let engine: Box<dyn CryptoEngine> = match candidate {
-        AutoAeadMode::Aes256Gcm => Box::new(Aes256GcmEngine::new(&encryption_key, &chunk_id_key)),
+        AutoAeadMode::Aes256Gcm => Box::new(Aes256GcmEngine::new(&encryption_key, chunk_hasher)),
         AutoAeadMode::Chacha20Poly1305 => {
-            Box::new(ChaCha20Poly1305Engine::new(&encryption_key, &chunk_id_key))
+            Box::new(ChaCha20Poly1305Engine::new(&encryption_key, chunk_hasher))
         }
     };
 

@@ -1800,7 +1800,8 @@ mod tests {
         let cache = MmapFullIndexCache::open_path(&path, gen).unwrap();
 
         // Serialize via streaming using plaintext engine
-        let engine = vykar_crypto::PlaintextEngine::new(&[0xAA; 32]);
+        let engine =
+            vykar_crypto::PlaintextEngine::new(crate::testutil::chunk_hasher_for([0xAA; 32]));
         let packed = serialize_full_cache_to_packed_object(&cache, &engine).unwrap();
 
         // Decrypt (plaintext), decompress, and deserialize
@@ -2011,7 +2012,8 @@ mod tests {
         let cache = MmapFullIndexCache::open_path(&full_path, generation).unwrap();
 
         // Serialize as IndexBlob envelope via cache
-        let crypto = vykar_crypto::PlaintextEngine::new(&[0xAA; 32]);
+        let crypto =
+            vykar_crypto::PlaintextEngine::new(crate::testutil::chunk_hasher_for([0xAA; 32]));
         let packed = serialize_full_cache_as_index_blob(&cache, generation, &crypto).unwrap();
 
         // Decrypt + decompress

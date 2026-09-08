@@ -4,6 +4,7 @@ use std::time::Instant;
 use vykar_storage::StorageBackend;
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
+use vykar_types::hash::HashAlgorithm;
 use vykar_types::pack_id::PackId;
 
 use vykar_protocol::{validate_pack_header, PACK_HEADER_SIZE, PACK_MAGIC, PACK_VERSION_CURRENT};
@@ -84,6 +85,10 @@ impl SealedData {
 pub struct PackWriter {
     pack_type: PackType,
     target_size: usize,
+    /// The repository's content-digest algorithm, used to name sealed packs.
+    /// Bound at construction so a writer cannot produce a pack ID under an
+    /// algorithm the repository does not use.
+    hash_algo: HashAlgorithm,
     /// Heap-backed buffer. None until first blob.
     buffer: Option<PackBuffer>,
     /// Lightweight metadata per blob (no data — data lives in the buffer).
@@ -96,16 +101,22 @@ pub struct PackWriter {
 }
 
 impl PackWriter {
-    pub fn new(pack_type: PackType, target_size: usize) -> Self {
+    pub fn new(pack_type: PackType, target_size: usize, hash_algo: HashAlgorithm) -> Self {
         Self {
             pack_type,
             target_size,
+            hash_algo,
             buffer: None,
             blob_meta: Vec::new(),
             current_size: 0,
             pending: HashMap::new(),
             first_blob_time: None,
         }
+    }
+
+    /// The content-digest algorithm this writer names its packs with.
+    pub fn hash_algorithm(&self) -> HashAlgorithm {
+        self.hash_algo
     }
 
     /// Initialize the heap-backed pack buffer on first blob.
@@ -236,7 +247,7 @@ impl PackWriter {
         let PackBuffer::Memory(v) = self.buffer.take().expect("buffer was initialized");
         let sealed_data = SealedData::Memory(v);
 
-        let pack_id = PackId::compute(sealed_data.as_slice());
+        let pack_id = PackId::compute(sealed_data.as_slice(), self.hash_algo);
 
         // Clear writer state for reuse
         self.blob_meta.clear();
@@ -362,7 +373,7 @@ mod tests {
 
     #[test]
     fn should_flush_on_size() {
-        let mut w = PackWriter::new(PackType::Data, 100);
+        let mut w = PackWriter::new(PackType::Data, 100, HashAlgorithm::Blake2b);
         assert!(!w.should_flush());
         w.add_blob(dummy_chunk_id(0), vec![0u8; 120]).unwrap();
         assert!(w.should_flush());
@@ -371,26 +382,30 @@ mod tests {
     #[test]
     fn crossing_target_does_not_double_pack_capacity() {
         let target = 1024 * 1024;
-        for last_size in [4, 128, target + 1] {
-            let mut w = PackWriter::new(PackType::Data, target);
-            w.add_blob(dummy_chunk_id(1), vec![1; target - 8]).unwrap();
-            assert!(!w.should_flush());
-            w.add_blob(dummy_chunk_id(2), vec![2; last_size]).unwrap();
-            assert!(w.should_flush());
+        for algo in [HashAlgorithm::Blake2b, HashAlgorithm::Blake3] {
+            for last_size in [4, 128, target + 1] {
+                let mut w = PackWriter::new(PackType::Data, target, algo);
+                w.add_blob(dummy_chunk_id(1), vec![1; target - 8]).unwrap();
+                assert!(!w.should_flush());
+                w.add_blob(dummy_chunk_id(2), vec![2; last_size]).unwrap();
+                assert!(w.should_flush());
 
-            let sealed = w.seal().unwrap();
-            let SealedData::Memory(data) = sealed.data;
-            assert_eq!(data.len(), PACK_HEADER_SIZE + target + last_size);
-            assert_eq!(data.capacity(), data.len());
-            assert_eq!(scan_pack_blobs_bytes(&data).unwrap().len(), 2);
-            assert_eq!(PackId::compute(&data), sealed.pack_id);
+                let sealed = w.seal().unwrap();
+                let SealedData::Memory(data) = sealed.data;
+                assert_eq!(data.len(), PACK_HEADER_SIZE + target + last_size);
+                assert_eq!(data.capacity(), data.len());
+                assert_eq!(scan_pack_blobs_bytes(&data).unwrap().len(), 2);
+                // The sealed pack's name must be its own contents under the
+                // writer's algorithm — the invariant the server also relies on.
+                assert_eq!(PackId::compute(&data, algo), sealed.pack_id);
+            }
         }
     }
 
     #[test]
     fn should_flush_on_blob_count() {
         // Use a very large target size so size-based flush never triggers
-        let mut w = PackWriter::new(PackType::Data, usize::MAX);
+        let mut w = PackWriter::new(PackType::Data, usize::MAX, HashAlgorithm::Blake2b);
         for i in 0..MAX_BLOBS_PER_PACK {
             assert!(!w.should_flush(), "should not flush at {i} blobs");
             let mut id_bytes = [0u8; 32];
@@ -402,7 +417,7 @@ mod tests {
 
     #[test]
     fn seal_resets_first_blob_time() {
-        let mut w = PackWriter::new(PackType::Data, usize::MAX);
+        let mut w = PackWriter::new(PackType::Data, usize::MAX, HashAlgorithm::Blake2b);
         w.add_blob(dummy_chunk_id(0), vec![0u8; 10]).unwrap();
         assert!(w.first_blob_time.is_some());
 
@@ -428,7 +443,7 @@ mod tests {
             0x03, 0x00, 0x00, 0x00, 0xbe, 0xef, 0x42,
         ];
 
-        let mut w = PackWriter::new(PackType::Data, usize::MAX);
+        let mut w = PackWriter::new(PackType::Data, usize::MAX, HashAlgorithm::Blake2b);
         w.add_blob(dummy_chunk_id(0xAA), vec![0xDE, 0xAD]).unwrap();
         w.add_blob(dummy_chunk_id(0xBB), vec![0xBE, 0xEF, 0x42])
             .unwrap();
@@ -455,7 +470,7 @@ mod tests {
             (dummy_chunk_id(3), vec![30u8; 30]),
         ];
 
-        let mut w = PackWriter::new(PackType::Data, usize::MAX);
+        let mut w = PackWriter::new(PackType::Data, usize::MAX, HashAlgorithm::Blake2b);
         for (chunk_id, data) in &blobs {
             w.add_blob(*chunk_id, data.clone()).unwrap();
         }
@@ -479,7 +494,7 @@ mod tests {
     /// Seal clears writer state after success.
     #[test]
     fn seal_clears_state() {
-        let mut w = PackWriter::new(PackType::Data, usize::MAX);
+        let mut w = PackWriter::new(PackType::Data, usize::MAX, HashAlgorithm::Blake2b);
         w.add_blob(dummy_chunk_id(1), vec![0xAA; 100]).unwrap();
         w.add_blob(dummy_chunk_id(2), vec![0xBB; 200]).unwrap();
 
@@ -496,14 +511,14 @@ mod tests {
     /// Both data and tree packs use heap-backed Memory buffers.
     #[test]
     fn data_and_tree_packs_both_use_memory() {
-        let mut data_w = PackWriter::new(PackType::Data, 1024);
+        let mut data_w = PackWriter::new(PackType::Data, 1024, HashAlgorithm::Blake2b);
         data_w.add_blob(dummy_chunk_id(0), vec![0u8; 10]).unwrap();
         assert!(
             matches!(data_w.buffer, Some(PackBuffer::Memory(_))),
             "data pack should use Memory buffer"
         );
 
-        let mut tree_w = PackWriter::new(PackType::Tree, 1024);
+        let mut tree_w = PackWriter::new(PackType::Tree, 1024, HashAlgorithm::Blake2b);
         tree_w.add_blob(dummy_chunk_id(0), vec![0u8; 10]).unwrap();
         assert!(
             matches!(tree_w.buffer, Some(PackBuffer::Memory(_))),
@@ -514,7 +529,7 @@ mod tests {
     /// Validates `current_size` tracks correctly across add → add → seal.
     #[test]
     fn current_size_invariant() {
-        let mut w = PackWriter::new(PackType::Tree, usize::MAX);
+        let mut w = PackWriter::new(PackType::Tree, usize::MAX, HashAlgorithm::Blake2b);
 
         // Add blobs, check invariant after each (Vec path).
         w.add_blob(dummy_chunk_id(1), vec![0xAA; 100]).unwrap();
@@ -711,7 +726,7 @@ mod tests {
 
     #[test]
     fn set_target_size_after_seal() {
-        let mut w = PackWriter::new(PackType::Data, 100);
+        let mut w = PackWriter::new(PackType::Data, 100, HashAlgorithm::Blake2b);
         w.add_blob(dummy_chunk_id(0), vec![0u8; 120]).unwrap();
         assert!(w.should_flush());
 

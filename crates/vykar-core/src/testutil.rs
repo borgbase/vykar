@@ -5,6 +5,8 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::sync::Once;
+use vykar_types::chunk_id::ChunkHasher;
+use vykar_types::hash::HashAlgorithm;
 
 use crate::config::ChunkerConfig;
 use crate::repo::{EncryptionMode, Repository};
@@ -129,9 +131,18 @@ pub fn test_repo_plaintext() -> Repository {
     repo
 }
 
-/// Fixed chunk ID key for deterministic tests.
-pub fn test_chunk_id_key() -> [u8; 32] {
-    [0xAA; 32]
+/// Fixed chunk hasher for deterministic tests.
+///
+/// Pinned to BLAKE2b: these tests assert on stored digests, and format-v3
+/// coverage comes from real v3 repositories, not from a synthetic hasher.
+pub fn test_chunk_hasher() -> ChunkHasher {
+    chunk_hasher_for([0xAA; 32])
+}
+
+/// A BLAKE2b chunk hasher over an explicit key, for tests that assert on a
+/// particular key rather than the fixed one.
+pub fn chunk_hasher_for(key: [u8; 32]) -> ChunkHasher {
+    ChunkHasher::new(HashAlgorithm::Blake2b, key)
 }
 
 /// Shared handle to inspect backend traffic: the keys written via `put()` and

@@ -4,12 +4,16 @@ impl_aead_engine!(Aes256GcmEngine, Aes256Gcm, aes_gcm, "AES-GCM");
 mod tests {
     use super::*;
     use crate::CryptoEngine;
+    use vykar_types::chunk_id::ChunkHasher;
     use vykar_types::error::VykarError;
+    use vykar_types::hash::HashAlgorithm;
 
     fn test_aes_engine() -> Aes256GcmEngine {
         let enc_key = [0x11; 32];
-        let cid_key = [0x22; 32];
-        Aes256GcmEngine::new(&enc_key, &cid_key)
+        Aes256GcmEngine::new(
+            &enc_key,
+            ChunkHasher::new(HashAlgorithm::Blake2b, [0x22; 32]),
+        )
     }
 
     #[test]
@@ -80,11 +84,13 @@ mod tests {
     }
 
     #[test]
-    fn chunk_id_key_returns_correct_value() {
+    fn chunk_hasher_returns_correct_value() {
         let enc_key = [0x11; 32];
         let cid_key = [0x22; 32];
-        let engine = Aes256GcmEngine::new(&enc_key, &cid_key);
-        assert_eq!(engine.chunk_id_key(), &cid_key);
+        let engine =
+            Aes256GcmEngine::new(&enc_key, ChunkHasher::new(HashAlgorithm::Blake2b, cid_key));
+        assert_eq!(engine.chunk_hasher().key(), &cid_key);
+        assert_eq!(engine.chunk_hasher().algorithm(), HashAlgorithm::Blake2b);
     }
 
     #[test]

@@ -239,7 +239,7 @@ pub(crate) fn run_parallel_pipeline(
     } = bufs;
     debug_assert!(segment_size > 0, "segment_size must be non-zero");
     debug_assert!(num_workers > 0, "num_workers must be non-zero");
-    let chunk_id_key = *crypto.chunk_id_key();
+    let chunk_hasher = crypto.chunk_hasher();
     let chunker_config = repo.config.chunker_params.clone();
     let budget = ByteBudget::new(pipeline_buffer_bytes);
 
@@ -317,7 +317,7 @@ pub(crate) fn run_parallel_pipeline(
                 for (idx, entry, pre_acquired) in rx {
                     let result = worker::process_file_worker(
                         entry,
-                        &chunk_id_key,
+                        &chunk_hasher,
                         &**crypto,
                         compression,
                         &chunker_cfg,

@@ -1,10 +1,10 @@
 use crate::index::ChunkIndex;
-use crate::testutil::test_chunk_id_key;
+use crate::testutil::test_chunk_hasher;
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::pack_id::PackId;
 
 fn make_id(data: &[u8]) -> ChunkId {
-    ChunkId::compute(&test_chunk_id_key(), data)
+    ChunkId::compute(&test_chunk_hasher(), data)
 }
 
 fn dummy_pack_id() -> PackId {

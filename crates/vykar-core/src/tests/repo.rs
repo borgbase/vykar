@@ -638,6 +638,68 @@ fn flush_on_abort_survives_pack_upload_failure() {
 }
 
 #[test]
+fn init_creates_the_current_repository_format() {
+    crate::testutil::init_test_environment();
+
+    let repo = Repository::init(
+        Box::new(MemoryBackend::new()),
+        EncryptionMode::None,
+        ChunkerConfig::default(),
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(repo.config.version, 3);
+    assert_eq!(repo.format(), crate::repo::RepoFormat::V3);
+    assert_eq!(
+        repo.content_hash(),
+        vykar_types::hash::HashAlgorithm::Blake3
+    );
+    assert_eq!(
+        repo.crypto.chunk_hasher().algorithm(),
+        vykar_types::hash::HashAlgorithm::Blake3
+    );
+}
+
+/// A repository written by a future vykar must be refused at the version
+/// gate, not decoded with v3 semantics.
+#[test]
+fn open_rejects_an_unknown_repository_version() {
+    crate::testutil::init_test_environment();
+
+    let repo = Repository::init(
+        Box::new(MemoryBackend::new()),
+        EncryptionMode::None,
+        ChunkerConfig::default(),
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+
+    let mut tampered_config = repo.config.clone();
+    tampered_config.version = 4;
+    let tampered_data = rmp_serde::to_vec(&tampered_config).unwrap();
+    repo.storage.put("config", &tampered_data).unwrap();
+
+    let result = Repository::open(
+        Box::new(repo.storage.clone()),
+        None,
+        None,
+        crate::repo::OpenOptions::new(),
+    );
+    match result {
+        Err(vykar_types::error::VykarError::UnsupportedVersion(v)) => assert_eq!(v, 4),
+        other => panic!(
+            "expected UnsupportedVersion(4), got {:?}",
+            other.map(|_| ())
+        ),
+    }
+}
+
+#[test]
 fn open_rejects_oversized_max_pack_size() {
     crate::testutil::init_test_environment();
 

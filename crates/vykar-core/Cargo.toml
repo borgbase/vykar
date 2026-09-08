@@ -26,6 +26,9 @@ rmp-serde.workspace = true
 
 # Crypto
 blake2.workspace = true
+# `derive_key` for the format-v3 plaintext chunk-ID key. Chunk/pack digests
+# themselves live in vykar-types.
+blake3.workspace = true
 rand.workspace = true
 zeroize.workspace = true
 hex.workspace = true

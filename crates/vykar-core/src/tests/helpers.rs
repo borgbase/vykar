@@ -86,19 +86,33 @@ pub fn open_local_repo(repo_dir: &Path) -> Repository {
 pub fn load_snapshot_cache_from_disk(
     repo_dir: &Path,
 ) -> crate::repo::snapshot_cache::SnapshotListCache {
-    use blake2::digest::{Update, VariableOutput};
-    use blake2::Blake2bVar;
+    use crate::repo::RepoFormat;
+    use vykar_types::chunk_id::ChunkHasher;
 
     init_test_environment();
     let config_data = std::fs::read(repo_dir.join("config")).unwrap();
     let repo_config: crate::repo::RepoConfig = rmp_serde::from_slice(&config_data).unwrap();
+    let format = RepoFormat::from_version(repo_config.version).unwrap();
 
-    // Unencrypted repo: chunk_id_key = BLAKE2b(repo_id) (see open.rs).
-    let mut key = [0u8; 32];
-    let mut hasher = Blake2bVar::new(32).unwrap();
-    hasher.update(&repo_config.id);
-    hasher.finalize_variable(&mut key).unwrap();
-    let crypto = vykar_crypto::PlaintextEngine::new(crate::testutil::chunk_hasher_for(key));
+    // Unencrypted repo: the chunk-ID key is derived from repo_id, and *how*
+    // depends on the format — BLAKE2b for v2, `blake3::derive_key` for v3.
+    // This duplicates `open.rs` deliberately: it is the best place to catch a
+    // divergence, so keep the two in step.
+    let key = match format {
+        RepoFormat::V2 => {
+            use blake2::digest::{Update, VariableOutput};
+            use blake2::Blake2bVar;
+            let mut key = [0u8; 32];
+            let mut hasher = Blake2bVar::new(32).unwrap();
+            hasher.update(&repo_config.id);
+            hasher.finalize_variable(&mut key).unwrap();
+            key
+        }
+        RepoFormat::V3 => {
+            blake3::derive_key(crate::repo::PLAINTEXT_CHUNK_ID_KEY_CONTEXT, &repo_config.id)
+        }
+    };
+    let crypto = vykar_crypto::PlaintextEngine::new(ChunkHasher::new(format.chunk_hash(), key));
 
     crate::repo::snapshot_cache::SnapshotListCache::load(&repo_config.id, &crypto, None)
 }

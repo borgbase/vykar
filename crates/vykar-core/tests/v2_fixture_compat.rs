@@ -26,6 +26,7 @@ use vykar_core::config::{EncryptionModeConfig, VykarConfig};
 use vykar_core::repo::file_cache::FileCache;
 use vykar_core::repo::{identity, EncryptionMode, OpenOptions, Repository};
 use vykar_storage::local_backend::LocalBackend;
+use vykar_types::error::VykarError;
 
 use crate::common::{backup_source, make_test_config};
 
@@ -326,6 +327,54 @@ fn v2_fixtures_survive_delete_prune_compact_and_restore() {
             result.errors.is_empty(),
             "{mode}: check --verify-data after maintenance reported {:?}",
             result.errors
+        );
+    }
+}
+
+/// The v2 half of the `{none, aes256gcm} x {v2, v3}` lifecycle matrix that
+/// `lifecycle_integration.rs` covers for v3 (every repo it creates is v3 now).
+/// The encrypted fixtures must still reject a wrong passphrase the same way.
+#[test]
+fn v2_encrypted_fixtures_reject_a_wrong_passphrase() {
+    for mode in MODES {
+        let fx = extract(mode);
+        if fx.passphrase().is_none() {
+            continue; // plaintext fixture: no passphrase to get wrong
+        }
+        let config = fx.config();
+        let wrong = Some("definitely-not-the-fixture-passphrase");
+
+        let storage = Box::new(LocalBackend::new(fx.repo_dir().to_str().unwrap()).unwrap());
+        assert!(
+            matches!(
+                Repository::open(storage, wrong, None, OpenOptions::new()),
+                Err(VykarError::DecryptionFailed)
+            ),
+            "{mode}: opening with a wrong passphrase must fail"
+        );
+
+        assert!(
+            matches!(
+                commands::restore::run(
+                    &config,
+                    wrong,
+                    fx.latest_snapshot(),
+                    fx.root.join("bad-restore").to_str().unwrap(),
+                    None,
+                    config.xattrs.enabled,
+                    false,
+                ),
+                Err(VykarError::DecryptionFailed)
+            ),
+            "{mode}: restoring with a wrong passphrase must fail"
+        );
+
+        assert!(
+            matches!(
+                commands::check::run(&config, wrong, true, false),
+                Err(VykarError::DecryptionFailed)
+            ),
+            "{mode}: check with a wrong passphrase must fail"
         );
     }
 }

@@ -9,8 +9,8 @@ use super::format::{pack_object_streaming_with_context, ObjectType};
 use super::manifest::Manifest;
 use super::snapshot_cache;
 use super::{
-    BlobCache, EncryptionMode, OpenOptions, RepoConfig, Repository, BLOB_CACHE_MAX_BYTES,
-    INDEX_OBJECT_CONTEXT,
+    BlobCache, EncryptionMode, OpenOptions, RepoConfig, RepoFormat, Repository,
+    BLOB_CACHE_MAX_BYTES, INDEX_OBJECT_CONTEXT,
 };
 use crate::compress;
 use crate::config::{
@@ -22,19 +22,44 @@ use vykar_crypto::{self as crypto, CryptoEngine, PlaintextEngine};
 use vykar_storage::StorageBackend;
 use vykar_types::chunk_id::ChunkHasher;
 use vykar_types::error::{Result, VykarError};
-use vykar_types::hash::HashAlgorithm;
 
-/// Derive a deterministic chunk_id_key for plaintext repos from the repo ID.
-fn derive_plaintext_chunk_id_key(repo_id: &[u8]) -> [u8; 32] {
-    use blake2::digest::{Update, VariableOutput};
-    use blake2::Blake2bVar;
-    let mut key = [0u8; 32];
-    let mut hasher = Blake2bVar::new(32).expect("valid BLAKE2b output length");
-    hasher.update(repo_id);
-    hasher
-        .finalize_variable(&mut key)
-        .expect("output buffer matches BLAKE2b length");
-    key
+/// Domain-separation context for the format-v3 plaintext chunk-ID key.
+///
+/// `derive_key` rather than `blake3::hash`: it is a distinct BLAKE3 mode with
+/// its own flag bits, so this key lives in a different domain from the chunk
+/// digests (keyed mode) and the pack digests (unkeyed mode) instead of sharing
+/// one with `blake3::hash`.
+pub(crate) const PLAINTEXT_CHUNK_ID_KEY_CONTEXT: &str =
+    "vykar 2026-01-01 plaintext repository chunk-id key v1";
+
+/// Derive the deterministic chunk-ID key for a plaintext repository.
+///
+/// **Format-dependent, and the only auxiliary hash that is.** This value *is*
+/// the chunk-ID key, so a v2 repository must reproduce it byte-identically or
+/// lose its entire dedup index.
+///
+/// The key is not secret: `repo_id` is stored unencrypted in the repository
+/// `config`. It exists so plaintext repositories use the same keyed hashing
+/// path as encrypted ones, which buys corruption detection, not tamper
+/// resistance.
+fn derive_plaintext_chunk_id_key(repo_id: &[u8], format: RepoFormat) -> [u8; 32] {
+    match format {
+        // Frozen: RustCrypto `Blake2bVar`, exactly as v2 repositories were
+        // written. Do not "modernise" this to blake2b_simd without checking
+        // it byte-for-byte.
+        RepoFormat::V2 => {
+            use blake2::digest::{Update, VariableOutput};
+            use blake2::Blake2bVar;
+            let mut key = [0u8; 32];
+            let mut hasher = Blake2bVar::new(32).expect("valid BLAKE2b output length");
+            hasher.update(repo_id);
+            hasher
+                .finalize_variable(&mut key)
+                .expect("output buffer matches BLAKE2b length");
+            key
+        }
+        RepoFormat::V3 => blake3::derive_key(PLAINTEXT_CHUNK_ID_KEY_CONTEXT, repo_id),
+    }
 }
 
 impl Repository {
@@ -72,8 +97,14 @@ impl Repository {
             )));
         }
 
+        // New repositories are always created at the current format. There is
+        // deliberately no flag and no config key to choose otherwise: the
+        // choice would only ever be "make this repo unreadable by newer
+        // binaries for no benefit".
+        let format = RepoFormat::CURRENT;
+
         let repo_config = RepoConfig {
-            version: 2,
+            version: format.version(),
             id: repo_id,
             chunker_params: chunker_params.clone(),
             encryption: encryption.clone(),
@@ -87,8 +118,8 @@ impl Repository {
             match &encryption {
                 EncryptionMode::None => {
                     let chunk_hasher = ChunkHasher::new(
-                        HashAlgorithm::Blake2b,
-                        derive_plaintext_chunk_id_key(&repo_config.id),
+                        format.chunk_hash(),
+                        derive_plaintext_chunk_id_key(&repo_config.id, format),
                     );
                     (Arc::new(PlaintextEngine::new(chunk_hasher)), None)
                 }
@@ -100,7 +131,7 @@ impl Repository {
                     let enc_key = master_key.to_encrypted(pass)?;
                     let engine = crypto::aes_gcm::Aes256GcmEngine::new(
                         &master_key.encryption_key,
-                        ChunkHasher::new(HashAlgorithm::Blake2b, master_key.chunk_id_key),
+                        ChunkHasher::new(format.chunk_hash(), master_key.chunk_id_key),
                     );
                     (Arc::new(engine), Some(enc_key))
                 }
@@ -112,7 +143,7 @@ impl Repository {
                     let enc_key = master_key.to_encrypted(pass)?;
                     let engine = crypto::chacha20_poly1305::ChaCha20Poly1305Engine::new(
                         &master_key.encryption_key,
-                        ChunkHasher::new(HashAlgorithm::Blake2b, master_key.chunk_id_key),
+                        ChunkHasher::new(format.chunk_hash(), master_key.chunk_id_key),
                     );
                     (Arc::new(engine), Some(enc_key))
                 }
@@ -181,6 +212,7 @@ impl Repository {
             skipped_snapshots: Vec::new(),
             chunk_index,
             config: repo_config,
+            format,
             file_cache: FileCache::new(),
             blob_cache: BlobCache::new(BLOB_CACHE_MAX_BYTES),
             index_generation: 0,
@@ -225,9 +257,9 @@ impl Repository {
             .ok_or_else(|| VykarError::RepoNotFound("config not found".into()))?;
         let repo_config: RepoConfig = rmp_serde::from_slice(&config_data)?;
 
-        if repo_config.version != 2 {
-            return Err(VykarError::UnsupportedVersion(repo_config.version));
-        }
+        // The single version gate. Everything downstream asks the resolved
+        // `RepoFormat`, never the raw integer.
+        let format = RepoFormat::from_version(repo_config.version)?;
 
         if repo_config.max_pack_size > 512 * 1024 * 1024 {
             return Err(VykarError::Config(format!(
@@ -240,8 +272,8 @@ impl Repository {
         let crypto: Arc<dyn CryptoEngine> = match &repo_config.encryption {
             EncryptionMode::None => {
                 let chunk_hasher = ChunkHasher::new(
-                    HashAlgorithm::Blake2b,
-                    derive_plaintext_chunk_id_key(&repo_config.id),
+                    format.chunk_hash(),
+                    derive_plaintext_chunk_id_key(&repo_config.id, format),
                 );
                 Arc::new(PlaintextEngine::new(chunk_hasher))
             }
@@ -256,7 +288,7 @@ impl Repository {
                 let master_key = MasterKey::from_encrypted(&enc_key, pass)?;
                 let engine = crypto::aes_gcm::Aes256GcmEngine::new(
                     &master_key.encryption_key,
-                    ChunkHasher::new(HashAlgorithm::Blake2b, master_key.chunk_id_key),
+                    ChunkHasher::new(format.chunk_hash(), master_key.chunk_id_key),
                 );
                 Arc::new(engine)
             }
@@ -271,7 +303,7 @@ impl Repository {
                 let master_key = MasterKey::from_encrypted(&enc_key, pass)?;
                 let engine = crypto::chacha20_poly1305::ChaCha20Poly1305Engine::new(
                     &master_key.encryption_key,
-                    ChunkHasher::new(HashAlgorithm::Blake2b, master_key.chunk_id_key),
+                    ChunkHasher::new(format.chunk_hash(), master_key.chunk_id_key),
                 );
                 Arc::new(engine)
             }
@@ -312,6 +344,7 @@ impl Repository {
             skipped_snapshots,
             chunk_index: ChunkIndex::new(),
             config: repo_config,
+            format,
             file_cache,
             blob_cache: BlobCache::new(BLOB_CACHE_MAX_BYTES),
             index_generation,

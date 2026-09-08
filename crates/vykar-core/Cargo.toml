@@ -84,6 +84,10 @@ mount = ["dav-server", "tokio/rt-multi-thread", "tokio/macros", "tokio/signal", 
 [dev-dependencies]
 proptest = { workspace = true }
 test-case = { workspace = true }
+# Extracts the frozen repository-format-v2 fixtures (tests/fixtures/*.tar.gz).
+# Crates rather than shelling out to `tar` so the tests run on Windows too.
+tar = "0.4"
+flate2 = "1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

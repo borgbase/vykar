@@ -851,10 +851,7 @@ mod tests {
         let backend = RestBackend::new(&url, None, no_retry(), None).unwrap();
 
         let err = backend
-            .repack(&RepackPlanRequest {
-                operations: Vec::new(),
-                protocol_version: 2,
-            })
+            .repack(&RepackPlanRequest::new(Vec::new(), HashAlgorithm::Blake3))
             .unwrap_err()
             .to_string();
         assert!(

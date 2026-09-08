@@ -161,6 +161,7 @@ pub fn run_with_progress(
             &repo.storage,
             &verify_pack_chunks,
             verify_data,
+            repo.content_hash(),
             &mut progress,
         )
     } else {

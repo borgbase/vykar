@@ -47,7 +47,6 @@ chrono.workspace = true
 
 # Crypto (constant-time compare for auth token)
 subtle = "2"
-blake2.workspace = true
 
 # Streaming
 futures-util = "0.3"
@@ -63,3 +62,7 @@ mimalloc = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# Independent BLAKE2b reference for the upload-digest tests. The server itself
+# no longer hand-rolls a digest — it uses `vykar_types::hash::Hasher256`, the
+# same code path as the client's `PackId::compute`.
+blake2.workspace = true

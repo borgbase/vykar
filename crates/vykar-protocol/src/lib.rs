@@ -73,7 +73,11 @@ pub const MAX_REPACK_OUTPUT_BYTES: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
 // ── Protocol version ───────────────────────────────────────────────────────
 
 /// Current protocol version. Sent by clients in requests.
-pub const PROTOCOL_VERSION: u32 = 1;
+///
+/// Bumped to 2 by BLAKE3 repositories. A new client talking about a *v2*
+/// repository still declares 1, so it keeps working against pre-BLAKE3
+/// servers; only BLAKE3 traffic requires the newer server.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Minimum protocol version the server accepts.
 ///
@@ -183,11 +187,92 @@ pub fn repack_op_output_size(op: &RepackOperationRequest) -> u64 {
     total
 }
 
+/// The protocol version a request must declare to be safe under `hash`.
+///
+/// BLAKE3 requires 2 so an old server refuses the request outright. Silently
+/// ignoring an unknown `hash` field would be actively dangerous: `verify_packs`
+/// would report `hash_valid: false` for *every* pack — a false
+/// whole-repository corruption report — and `repack` would write packs at
+/// BLAKE2b-named keys, breaking the `pack_id == hash(contents)` invariant.
+fn required_protocol_version(hash: HashAlgorithm) -> u32 {
+    match hash {
+        HashAlgorithm::Blake2b => 1,
+        HashAlgorithm::Blake3 => 2,
+    }
+}
+
+/// A server-side repack plan.
+///
+/// `hash` and `protocol_version` are **private with read-only accessors**, and
+/// the only way to build one is [`RepackPlanRequest::new`], which derives the
+/// version from the algorithm. That makes the dangerous pair — BLAKE3 declared
+/// at protocol 1 — unrepresentable in Rust.
+///
+/// `#[non_exhaustive]` would not be a substitute: it blocks external struct
+/// literals but leaves `pub` fields assignable, so
+/// `r.protocol_version = 1` would still compile.
+///
+/// Private fields still deserialize normally, so the server side is
+/// unaffected — but a hand-crafted JSON body can declare any pair, which is
+/// why the server validates the invariant semantically as well.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepackPlanRequest {
     pub operations: Vec<RepackOperationRequest>,
     #[serde(default)]
-    pub protocol_version: u32,
+    hash: HashAlgorithm,
+    #[serde(default)]
+    protocol_version: u32,
+}
+
+impl RepackPlanRequest {
+    pub fn new(operations: Vec<RepackOperationRequest>, hash: HashAlgorithm) -> Self {
+        Self {
+            operations,
+            hash,
+            protocol_version: required_protocol_version(hash),
+        }
+    }
+
+    /// The algorithm the server must name output packs with.
+    pub fn hash(&self) -> HashAlgorithm {
+        self.hash
+    }
+
+    pub fn protocol_version(&self) -> u32 {
+        self.protocol_version
+    }
+
+    /// Whether `hash` and `protocol_version` are a pair this binary would have
+    /// produced. Only a hand-crafted request body can fail this.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the declared version is too low for the
+    /// declared algorithm.
+    pub fn validate_hash_pairing(&self) -> Result<(), String> {
+        validate_hash_pairing(self.hash, self.protocol_version)
+    }
+}
+
+/// Shared by both plan types: a declared algorithm must come with a protocol
+/// version high enough to mean it.
+fn validate_hash_pairing(hash: HashAlgorithm, protocol_version: u32) -> Result<(), String> {
+    let required = required_protocol_version(hash);
+    // Version 0 is a pre-versioning client, which `check_protocol_version`
+    // accepts as 1 — and which by definition predates BLAKE3, so it can only
+    // legitimately pair with the default algorithm.
+    let effective = if protocol_version == 0 {
+        1
+    } else {
+        protocol_version
+    };
+    if effective >= required {
+        return Ok(());
+    }
+    Err(format!(
+        "hash {} requires protocol version >= {required}, but the request declared {protocol_version}",
+        hash.as_str()
+    ))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -223,11 +308,45 @@ pub struct VerifyPackRequest {
 }
 
 /// Batch request to verify multiple packs.
+///
+/// Same construction discipline as [`RepackPlanRequest`]: `hash` and
+/// `protocol_version` are private and derived together.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VerifyPacksPlanRequest {
     pub packs: Vec<VerifyPackRequest>,
     #[serde(default)]
-    pub protocol_version: u32,
+    hash: HashAlgorithm,
+    #[serde(default)]
+    protocol_version: u32,
+}
+
+impl VerifyPacksPlanRequest {
+    pub fn new(packs: Vec<VerifyPackRequest>, hash: HashAlgorithm) -> Self {
+        Self {
+            packs,
+            hash,
+            protocol_version: required_protocol_version(hash),
+        }
+    }
+
+    /// The algorithm the server must recompute pack digests with.
+    pub fn hash(&self) -> HashAlgorithm {
+        self.hash
+    }
+
+    pub fn protocol_version(&self) -> u32 {
+        self.protocol_version
+    }
+
+    /// See [`RepackPlanRequest::validate_hash_pairing`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the declared version is too low for the
+    /// declared algorithm.
+    pub fn validate_hash_pairing(&self) -> Result<(), String> {
+        validate_hash_pairing(self.hash, self.protocol_version)
+    }
 }
 
 /// Result of verifying a single pack file.
@@ -338,18 +457,21 @@ mod tests {
 
     // ── Serde default round-trip ───────────────────────────────────────
 
+    /// A pre-versioning client sends neither field. It must read back as
+    /// "protocol 0, BLAKE2b" — that default is what keeps old clients working.
     #[test]
     fn verify_plan_defaults_without_optional_fields() {
         let json = r#"{"packs":[]}"#;
         let plan: VerifyPacksPlanRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(plan.protocol_version, 0);
+        assert_eq!(plan.protocol_version(), 0);
+        assert_eq!(plan.hash(), HashAlgorithm::Blake2b);
         assert!(plan.packs.is_empty());
     }
 
     #[test]
     fn verify_plan_round_trip_with_all_fields() {
-        let plan = VerifyPacksPlanRequest {
-            packs: vec![VerifyPackRequest {
+        let plan = VerifyPacksPlanRequest::new(
+            vec![VerifyPackRequest {
                 pack_key: "packs/ab/abcd".repeat(5),
                 expected_size: 1024,
                 expected_blobs: vec![VerifyBlobRef {
@@ -357,11 +479,12 @@ mod tests {
                     length: 100,
                 }],
             }],
-            protocol_version: 1,
-        };
+            HashAlgorithm::Blake3,
+        );
         let json = serde_json::to_string(&plan).unwrap();
         let deser: VerifyPacksPlanRequest = serde_json::from_str(&json).unwrap();
-        assert_eq!(deser.protocol_version, 1);
+        assert_eq!(deser.protocol_version(), 2);
+        assert_eq!(deser.hash(), HashAlgorithm::Blake3);
         assert_eq!(deser.packs.first().unwrap().expected_size, 1024);
     }
 
@@ -369,7 +492,58 @@ mod tests {
     fn repack_plan_defaults_without_protocol_version() {
         let json = r#"{"operations":[]}"#;
         let plan: RepackPlanRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(plan.protocol_version, 0);
+        assert_eq!(plan.protocol_version(), 0);
+        assert_eq!(plan.hash(), HashAlgorithm::Blake2b);
+    }
+
+    // ── hash / protocol_version pairing ────────────────────────────────
+
+    /// The whole point of the private fields: the constructors cannot produce
+    /// the dangerous pair, so a caller cannot either.
+    #[test]
+    fn constructors_pair_hash_with_protocol_version() {
+        for (hash, expected) in [(HashAlgorithm::Blake2b, 1u32), (HashAlgorithm::Blake3, 2)] {
+            let repack = RepackPlanRequest::new(Vec::new(), hash);
+            assert_eq!(repack.hash(), hash);
+            assert_eq!(repack.protocol_version(), expected);
+            assert!(repack.validate_hash_pairing().is_ok());
+
+            let verify = VerifyPacksPlanRequest::new(Vec::new(), hash);
+            assert_eq!(verify.hash(), hash);
+            assert_eq!(verify.protocol_version(), expected);
+            assert!(verify.validate_hash_pairing().is_ok());
+        }
+    }
+
+    /// A hand-crafted body can still declare any pair, so the server has to
+    /// check it semantically. BLAKE3 at protocol 1 is the dangerous one.
+    #[test]
+    fn blake3_at_protocol_1_is_rejected() {
+        let json = r#"{"operations":[],"hash":"blake3","protocol_version":1}"#;
+        let plan: RepackPlanRequest = serde_json::from_str(json).unwrap();
+        let err = plan.validate_hash_pairing().unwrap_err();
+        assert!(err.contains("requires protocol version >= 2"), "got: {err}");
+
+        let json = r#"{"packs":[],"hash":"blake3","protocol_version":1}"#;
+        let plan: VerifyPacksPlanRequest = serde_json::from_str(json).unwrap();
+        assert!(plan.validate_hash_pairing().is_err());
+    }
+
+    /// A legacy client declares version 0 and no hash at all; that pairing is
+    /// fine, and must not be caught by the check above.
+    #[test]
+    fn legacy_pairing_is_accepted() {
+        let json = r#"{"operations":[]}"#;
+        let plan: RepackPlanRequest = serde_json::from_str(json).unwrap();
+        assert!(plan.validate_hash_pairing().is_ok());
+    }
+
+    #[test]
+    fn unknown_hash_name_fails_deserialization() {
+        // This is what makes the server return 400 for an unknown algorithm:
+        // nothing else validates the string.
+        let json = r#"{"operations":[],"hash":"blake9","protocol_version":2}"#;
+        assert!(serde_json::from_str::<RepackPlanRequest>(json).is_err());
     }
 
     #[test]

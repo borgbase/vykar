@@ -43,6 +43,15 @@ pub(crate) fn blake2b_256_hex(data: &[u8]) -> String {
     hex::encode(out)
 }
 
+/// The pack ID a client would compute for `data` under `algo`.
+///
+/// Deliberately the client's own `PackId::compute`: these tests assert that
+/// the server names and verifies packs the way the client does, which is the
+/// property that keeps `pack_id == hash(contents)` true across the wire.
+pub(crate) fn pack_id_hex(data: &[u8], algo: vykar_types::hash::HashAlgorithm) -> String {
+    vykar_types::pack_id::PackId::compute(data, algo).to_hex()
+}
+
 pub(crate) fn repack_body(ops: &[serde_json::Value]) -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({ "operations": ops })).unwrap()
 }

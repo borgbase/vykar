@@ -551,10 +551,9 @@ fn try_server_side_repack(
     let mut batch_err: Option<VykarError> = None;
 
     'batches: for batch in chunk_repack_operations(operations) {
-        let plan = RepackPlanRequest {
-            operations: batch,
-            protocol_version: vykar_protocol::PROTOCOL_VERSION,
-        };
+        // The constructor derives `protocol_version` from the algorithm, so a
+        // BLAKE3 plan cannot reach an old server claiming to be protocol 1.
+        let plan = RepackPlanRequest::new(batch, repo.content_hash());
         let response = match repo.storage.server_repack(&plan) {
             Ok(resp) => resp,
             // Backend capability is stable, so only the first call can discover

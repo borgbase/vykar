@@ -352,7 +352,13 @@ fn test_server_fallback_no_stale_errors() {
 
     let mut progress: Option<&mut dyn FnMut(commands::check::CheckProgressEvent)> = None;
 
-    let outcome = try_server_verify(&storage, &pack_chunks, true, &mut progress);
+    let outcome = try_server_verify(
+        &storage,
+        &pack_chunks,
+        true,
+        vykar_types::hash::HashAlgorithm::Blake2b,
+        &mut progress,
+    );
 
     match outcome {
         ServerVerifyOutcome::Fallback => {} // expected

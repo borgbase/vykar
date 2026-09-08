@@ -1,8 +1,7 @@
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 use axum::response::{IntoResponse, Response};
-use blake2::digest::{Update, VariableOutput};
-use blake2::Blake2bVar;
+use vykar_types::hash::Hasher256;
 
 use vykar_protocol::{
     check_protocol_version, is_valid_pack_key, repack_op_output_size, validate_blob_ref,
@@ -87,6 +86,11 @@ fn execute_repack(
     // Source packs to delete in phase B (includes delete-only ops).
     let mut pending_delete: Vec<std::path::PathBuf> = Vec::new();
 
+    // Output packs are named with the algorithm the client declared, so the
+    // `pack_id == hash(contents)` invariant holds for the repository the plan
+    // came from.
+    let hash = plan.hash();
+
     // Resolve every source path up front: fails before any I/O, and gives the
     // rollback below the complete set of paths it must never delete.
     let mut source_paths = Vec::with_capacity(plan.operations.len());
@@ -135,7 +139,7 @@ fn execute_repack(
             let temp_file =
                 std::fs::File::create(&temp_path).map_err(|e| format!("create temp: {e}"))?;
             let mut writer = BufWriter::new(temp_file);
-            let mut hasher = Blake2bVar::new(32).expect("valid output size");
+            let mut hasher = Hasher256::new(hash);
 
             let mut pack_offset: u64 =
                 u64::try_from(PACK_HEADER_SIZE).expect("pack header size fits u64");
@@ -238,7 +242,7 @@ fn execute_repack(
             drop(temp_file);
 
             // Finalize hash -> pack ID.
-            let pack_id_hex = super::finalize_blake2b_256_hex(hasher);
+            let pack_id_hex = hasher.finalize_hex();
             let shard = &pack_id_hex[..2];
             let new_pack_key = format!("packs/{shard}/{pack_id_hex}");
 
@@ -363,7 +367,7 @@ fn execute_repack(
 /// Write data to writer and feed to hasher in one step.
 fn write_and_hash(
     writer: &mut impl std::io::Write,
-    hasher: &mut Blake2bVar,
+    hasher: &mut Hasher256,
     data: &[u8],
 ) -> std::io::Result<()> {
     writer.write_all(data)?;
@@ -378,7 +382,9 @@ fn write_and_hash(
 /// blob lengths are cross-checked against the on-disk length prefixes during
 /// execution, so a declared oversize plan is rejected before any file access.
 fn validate_repack_plan(plan: &RepackPlanRequest) -> Result<u64, ServerError> {
-    check_protocol_version(plan.protocol_version).map_err(ServerError::BadRequest)?;
+    check_protocol_version(plan.protocol_version()).map_err(ServerError::BadRequest)?;
+    plan.validate_hash_pairing()
+        .map_err(ServerError::BadRequest)?;
     if plan.operations.len() > MAX_REPACK_OPS {
         return Err(ServerError::BadRequest(format!(
             "too many repack operations: {} (max {MAX_REPACK_OPS})",
@@ -505,12 +511,91 @@ mod tests {
         let result: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
         let new_pack_key = result["completed"][0]["new_pack"].as_str().unwrap();
 
-        // The pack key is packs/<shard>/<hex>. The hex should be blake2b-256 of contents.
+        // The pack key is packs/<shard>/<hex>. A plan with no `hash` field is
+        // a pre-BLAKE3 client, so the hex must be blake2b-256 of contents.
         let pack_hex = new_pack_key.split('/').next_back().unwrap();
         let new_pack_path = tmp.path().join(new_pack_key);
         let new_pack_data = std::fs::read(&new_pack_path).expect("read new pack");
         let actual_hash = blake2b_256_hex(&new_pack_data);
         assert_eq!(actual_hash, pack_hex);
+    }
+
+    /// The output pack must be named under the algorithm the plan declares, or
+    /// the `pack_id == hash(contents)` invariant breaks for that repository.
+    #[tokio::test]
+    async fn repack_names_output_under_the_declared_hash() {
+        use vykar_types::hash::HashAlgorithm;
+
+        for algo in [HashAlgorithm::Blake2b, HashAlgorithm::Blake3] {
+            let (router, _state, tmp) = setup_app(0);
+            let (pack_bytes, refs) = build_pack(&[b"alpha", b"beta", b"gamma"]);
+            let source_key = write_pack(tmp.path(), &pack_bytes);
+            // Keep a strict subset so the output differs from the source.
+            let keep: Vec<_> = refs.iter().take(2).cloned().collect();
+
+            let body = serde_json::to_vec(&serde_json::json!({
+                "operations": [repack_op(&source_key, &keep, false)],
+                "hash": algo.as_str(),
+                "protocol_version": vykar_protocol::PROTOCOL_VERSION,
+            }))
+            .unwrap();
+            let resp = authed_post(router, "/?repack", body).await;
+            assert_status(&resp, StatusCode::OK);
+
+            let result: serde_json::Value =
+                serde_json::from_slice(&body_bytes(resp).await).unwrap();
+            let new_pack_key = result["completed"][0]["new_pack"].as_str().unwrap();
+            let pack_hex = new_pack_key.split('/').next_back().unwrap();
+            let new_pack_data =
+                std::fs::read(tmp.path().join(new_pack_key)).expect("read new pack");
+            assert_eq!(
+                super::super::test_support::pack_id_hex(&new_pack_data, algo),
+                pack_hex,
+                "{algo}: output pack is not named after its own contents"
+            );
+        }
+    }
+
+    /// A hand-crafted body can declare BLAKE3 at protocol 1. The constructors
+    /// cannot produce that pair, so the server rejects it rather than writing
+    /// packs an old client would then fail to verify.
+    #[tokio::test]
+    async fn repack_rejects_blake3_at_protocol_1() {
+        let (router, _state, tmp) = setup_app(0);
+        let (pack_bytes, refs) = build_pack(&[b"alpha", b"beta"]);
+        let source_key = write_pack(tmp.path(), &pack_bytes);
+
+        let body = serde_json::to_vec(&serde_json::json!({
+            "operations": [repack_op(&source_key, &refs, false)],
+            "hash": "blake3",
+            "protocol_version": 1,
+        }))
+        .unwrap();
+        let resp = authed_post(router, "/?repack", body).await;
+        assert_status(&resp, StatusCode::BAD_REQUEST);
+        let text = String::from_utf8_lossy(&body_bytes(resp).await).into_owned();
+        assert!(
+            text.contains("requires protocol version >= 2"),
+            "got: {text}"
+        );
+    }
+
+    /// An algorithm this binary has never heard of fails deserialization,
+    /// which the framework turns into a 400 without any explicit check.
+    #[tokio::test]
+    async fn repack_rejects_an_unknown_hash() {
+        let (router, _state, tmp) = setup_app(0);
+        let (pack_bytes, refs) = build_pack(&[b"alpha"]);
+        let source_key = write_pack(tmp.path(), &pack_bytes);
+
+        let body = serde_json::to_vec(&serde_json::json!({
+            "operations": [repack_op(&source_key, &refs, false)],
+            "hash": "blake9",
+            "protocol_version": 2,
+        }))
+        .unwrap();
+        let resp = authed_post(router, "/?repack", body).await;
+        assert_status(&resp, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

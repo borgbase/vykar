@@ -1,6 +1,5 @@
 use axum::response::{IntoResponse, Response};
-use blake2::digest::{Update, VariableOutput};
-use blake2::Blake2bVar;
+use vykar_types::hash::{HashAlgorithm, Hasher256};
 
 use vykar_protocol::{
     check_protocol_version, is_valid_pack_key, validate_blob_ref, validate_pack_header,
@@ -34,7 +33,11 @@ pub(super) async fn verify_packs(
 }
 
 fn validate_verify_packs_plan(plan: &VerifyPacksPlanRequest) -> Result<(), ServerError> {
-    check_protocol_version(plan.protocol_version).map_err(ServerError::BadRequest)?;
+    check_protocol_version(plan.protocol_version()).map_err(ServerError::BadRequest)?;
+    // A hand-crafted body can declare any (hash, protocol_version) pair; the
+    // client's constructors cannot. Reject the dangerous one explicitly.
+    plan.validate_hash_pairing()
+        .map_err(ServerError::BadRequest)?;
     if plan.packs.len() > MAX_VERIFY_PACKS {
         return Err(ServerError::BadRequest(format!(
             "too many packs to verify: {} (max {MAX_VERIFY_PACKS})",
@@ -80,6 +83,7 @@ fn validate_verify_packs_plan(plan: &VerifyPacksPlanRequest) -> Result<(), Serve
 }
 
 fn execute_verify_packs(state: &AppState, plan: &VerifyPacksPlanRequest) -> VerifyPacksResponse {
+    let hash = plan.hash();
     let mut results = Vec::with_capacity(plan.packs.len());
     let mut bytes_read: u64 = 0;
     let mut truncated = false;
@@ -114,13 +118,17 @@ fn execute_verify_packs(state: &AppState, plan: &VerifyPacksPlanRequest) -> Veri
             break;
         }
         bytes_read += file_size;
-        results.push(verify_single_pack(&file_path, entry));
+        results.push(verify_single_pack(&file_path, entry, hash));
     }
 
     VerifyPacksResponse { results, truncated }
 }
 
-fn verify_single_pack(file_path: &std::path::Path, entry: &VerifyPackRequest) -> VerifyPackResult {
+fn verify_single_pack(
+    file_path: &std::path::Path,
+    entry: &VerifyPackRequest,
+    hash: HashAlgorithm,
+) -> VerifyPackResult {
     let file = match std::fs::File::open(file_path) {
         Ok(f) => f,
         Err(e) => {
@@ -145,7 +153,7 @@ fn verify_single_pack(file_path: &std::path::Path, entry: &VerifyPackRequest) ->
             };
         }
     };
-    verify_pack_from_reader(file, file_len, entry, 256 * 1024)
+    verify_pack_from_reader(file, file_len, entry, 256 * 1024, hash)
 }
 
 /// Streaming pack verification: computes hash, validates header, and checks
@@ -162,6 +170,7 @@ fn verify_pack_from_reader<R: std::io::Read>(
     file_len: u64,
     entry: &VerifyPackRequest,
     buf_capacity: usize,
+    hash: HashAlgorithm,
 ) -> VerifyPackResult {
     use std::collections::HashSet;
     use std::io::{BufRead, BufReader};
@@ -176,7 +185,7 @@ fn verify_pack_from_reader<R: std::io::Read>(
         .collect();
 
     let mut reader = BufReader::with_capacity(buf_capacity, reader);
-    let mut hasher = Blake2bVar::new(32).expect("valid output size");
+    let mut hasher = Hasher256::new(hash);
 
     // Helper: read_exact through BufReader, feeding every byte to the hasher.
     macro_rules! read_exact_hashed {
@@ -303,7 +312,7 @@ fn verify_pack_from_reader<R: std::io::Read>(
     }
 
     // 4. Finalize hash.
-    let actual_hash = super::finalize_blake2b_256_hex(hasher);
+    let actual_hash = hasher.finalize_hex();
     let hash_valid = actual_hash == expected_hash;
 
     let error = if let Some(e) = drain_err {
@@ -331,11 +340,17 @@ fn verify_pack_from_reader<R: std::io::Read>(
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_support::{blake2b_256_hex, build_pack};
+    use super::super::test_support::{blake2b_256_hex, build_pack, pack_id_hex};
     use super::{verify_pack_from_reader, VerifyPackRequest, VerifyPackResult};
     use vykar_protocol::{
         VerifyBlobRef as ProtoVerifyBlobRef, PACK_HEADER_SIZE, PACK_MAGIC, PACK_VERSION_CURRENT,
     };
+    use vykar_types::hash::HashAlgorithm;
+
+    /// The two algorithms a repository can be in, for the cases where the
+    /// digest is what is under test. Everything else stays on BLAKE2b, since
+    /// header and blob-boundary checks are algorithm-independent.
+    const ALGORITHMS: &[HashAlgorithm] = &[HashAlgorithm::Blake2b, HashAlgorithm::Blake3];
 
     /// Build a VerifyPackRequest from pack bytes and optional expected blobs.
     fn verify_request(pack_bytes: &[u8], expected_blobs: Vec<(u64, u64)>) -> VerifyPackRequest {
@@ -357,8 +372,80 @@ mod tests {
         entry: &VerifyPackRequest,
         buf_size: usize,
     ) -> VerifyPackResult {
+        verify_via_cursor_with(pack_bytes, entry, buf_size, HashAlgorithm::Blake2b)
+    }
+
+    fn verify_via_cursor_with(
+        pack_bytes: &[u8],
+        entry: &VerifyPackRequest,
+        buf_size: usize,
+        hash: HashAlgorithm,
+    ) -> VerifyPackResult {
         let cursor = std::io::Cursor::new(pack_bytes.to_vec());
-        verify_pack_from_reader(cursor, pack_bytes.len() as u64, entry, buf_size)
+        verify_pack_from_reader(cursor, pack_bytes.len() as u64, entry, buf_size, hash)
+    }
+
+    /// Build a request whose `pack_key` names the pack under `algo`.
+    fn verify_request_with(
+        pack_bytes: &[u8],
+        expected_blobs: Vec<(u64, u64)>,
+        algo: HashAlgorithm,
+    ) -> VerifyPackRequest {
+        let hash = pack_id_hex(pack_bytes, algo);
+        let shard = hash.get(..2).expect("64-char hex").to_string();
+        VerifyPackRequest {
+            pack_key: format!("packs/{shard}/{hash}"),
+            expected_size: pack_bytes.len() as u64,
+            expected_blobs: expected_blobs
+                .into_iter()
+                .map(|(offset, length)| ProtoVerifyBlobRef { offset, length })
+                .collect(),
+        }
+    }
+
+    /// The pack digest must verify under whichever algorithm the plan names.
+    #[test]
+    fn verify_valid_pack_under_both_algorithms() {
+        for &algo in ALGORITHMS {
+            let (pack, refs) = build_pack(&[b"hello", b"world"]);
+            let req = verify_request_with(&pack, refs, algo);
+            let result = verify_via_cursor_with(&pack, &req, 256 * 1024, algo);
+            assert!(result.hash_valid, "{algo}: hash should be valid");
+            assert!(result.header_valid, "{algo}: header should be valid");
+            assert!(result.blobs_valid, "{algo}: blobs should be valid");
+            assert!(result.error.is_none(), "{algo}: {:?}", result.error);
+        }
+    }
+
+    #[test]
+    fn verify_corrupt_pack_under_both_algorithms() {
+        for &algo in ALGORITHMS {
+            let (mut pack, refs) = build_pack(&[b"data"]);
+            let req = verify_request_with(&pack, refs, algo);
+            pack[PACK_HEADER_SIZE + 2] ^= 0xff;
+            let result = verify_via_cursor_with(&pack, &req, 256 * 1024, algo);
+            assert!(!result.hash_valid, "{algo}: corruption must be detected");
+        }
+    }
+
+    /// Verifying a BLAKE3-named pack with the BLAKE2b algorithm (and vice
+    /// versa) must fail. This is the failure mode a new client + old server
+    /// would produce for *every* pack — a false whole-repository corruption
+    /// report — which is why BLAKE3 requires protocol version 2.
+    #[test]
+    fn verifying_under_the_wrong_algorithm_fails() {
+        let (pack, refs) = build_pack(&[b"mismatched"]);
+        for (named, verified) in [
+            (HashAlgorithm::Blake3, HashAlgorithm::Blake2b),
+            (HashAlgorithm::Blake2b, HashAlgorithm::Blake3),
+        ] {
+            let req = verify_request_with(&pack, refs.clone(), named);
+            let result = verify_via_cursor_with(&pack, &req, 256 * 1024, verified);
+            assert!(
+                !result.hash_valid,
+                "a {named}-named pack must not verify under {verified}"
+            );
+        }
     }
 
     #[test]
@@ -544,7 +631,7 @@ mod tests {
             expected_size: 100,
             expected_blobs: vec![],
         };
-        let result = super::verify_single_pack(path, &entry);
+        let result = super::verify_single_pack(path, &entry, HashAlgorithm::Blake2b);
         assert!(!result.hash_valid);
         assert!(!result.header_valid);
         assert!(!result.blobs_valid);

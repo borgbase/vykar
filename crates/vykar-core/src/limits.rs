@@ -409,10 +409,8 @@ mod tests {
         };
         let wrapped = wrap_storage_backend(inner, &limits);
 
-        let plan = VerifyPacksPlanRequest {
-            packs: Vec::new(),
-            protocol_version: vykar_protocol::PROTOCOL_VERSION,
-        };
+        let plan =
+            VerifyPacksPlanRequest::new(Vec::new(), vykar_types::hash::HashAlgorithm::Blake3);
         let response = wrapped
             .server_verify_packs(&plan)
             .expect("verify forwarded");

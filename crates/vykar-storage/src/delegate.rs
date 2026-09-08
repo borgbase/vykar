@@ -560,16 +560,16 @@ mod tests {
         w.create_dir("d").unwrap();
         w.put_owned("k", vec![1]).unwrap();
         w.size("k").unwrap();
-        w.server_repack(&vykar_protocol::RepackPlanRequest {
-            operations: Vec::new(),
-            protocol_version: vykar_protocol::PROTOCOL_VERSION,
-        })
+        w.server_repack(&vykar_protocol::RepackPlanRequest::new(
+            Vec::new(),
+            vykar_types::hash::HashAlgorithm::Blake3,
+        ))
         .unwrap();
         w.batch_delete_keys(&[]).unwrap();
-        w.server_verify_packs(&vykar_protocol::VerifyPacksPlanRequest {
-            packs: Vec::new(),
-            protocol_version: vykar_protocol::PROTOCOL_VERSION,
-        })
+        w.server_verify_packs(&vykar_protocol::VerifyPacksPlanRequest::new(
+            Vec::new(),
+            vykar_types::hash::HashAlgorithm::Blake3,
+        ))
         .unwrap();
         w.server_init().unwrap();
         w.bind_content_hash(vykar_types::hash::HashAlgorithm::Blake3)

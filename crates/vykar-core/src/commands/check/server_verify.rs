@@ -6,12 +6,12 @@ use super::types::{
 };
 use crate::index::ChunkIndexEntry;
 use vykar_protocol::{
-    VerifyBlobRef, VerifyPackRequest, VerifyPacksPlanRequest, VerifyPacksResponse,
-    PACK_HEADER_SIZE, PROTOCOL_VERSION,
+    VerifyBlobRef, VerifyPackRequest, VerifyPacksPlanRequest, VerifyPacksResponse, PACK_HEADER_SIZE,
 };
 use vykar_storage::StorageBackend;
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::VykarError;
+use vykar_types::hash::HashAlgorithm;
 use vykar_types::pack_id::PackId;
 
 /// Maximum packs per server-side verify-packs request.
@@ -43,6 +43,7 @@ pub(crate) fn try_server_verify(
     storage: &Arc<dyn StorageBackend>,
     pack_chunks: &HashMap<PackId, Vec<(ChunkId, ChunkIndexEntry)>>,
     verify_data: bool,
+    hash: HashAlgorithm,
     progress: &mut Option<&mut dyn FnMut(CheckProgressEvent)>,
 ) -> ServerVerifyOutcome {
     let total_packs = pack_chunks.len();
@@ -86,7 +87,7 @@ pub(crate) fn try_server_verify(
         let slice = pack_list
             .get(offset..end)
             .expect("offset..end is bounded by the outer/inner while loops");
-        let batch = build_verify_request(slice, verify_data);
+        let batch = build_verify_request(slice, verify_data, hash);
 
         let requested: Vec<(String, usize)> = slice
             .iter()
@@ -166,6 +167,7 @@ pub(crate) fn try_server_verify(
 fn build_verify_request(
     packs: &[(&PackId, &Vec<(ChunkId, ChunkIndexEntry)>)],
     include_blobs: bool,
+    hash: HashAlgorithm,
 ) -> VerifyPacksPlanRequest {
     let packs = packs
         .iter()
@@ -188,10 +190,7 @@ fn build_verify_request(
             }
         })
         .collect();
-    VerifyPacksPlanRequest {
-        packs,
-        protocol_version: PROTOCOL_VERSION,
-    }
+    VerifyPacksPlanRequest::new(packs, hash)
 }
 
 pub(crate) fn process_verify_response(

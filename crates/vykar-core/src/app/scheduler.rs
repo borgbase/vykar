@@ -103,8 +103,7 @@ pub fn random_jitter(jitter_seconds: u64) -> Duration {
 /// Compute the delay until the next cron tick, plus jitter.
 fn next_cron_delay(schedule: &ScheduleConfig) -> Result<Duration> {
     let expr = schedule.cron.as_deref().unwrap_or("");
-    let cron: croner::Cron = expr
-        .parse()
+    let cron = crate::config::parse_cron(expr)
         .map_err(|e| VykarError::Config(format!("schedule.cron: invalid expression: {e}")))?;
 
     let now = chrono::Local::now();

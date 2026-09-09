@@ -25,7 +25,7 @@ rand.workspace = true
 
 # Content-MD5 for S3 Object Lock compatibility
 md-5 = "0.11"
-base64 = "0.22"
+base64 = "0.23"
 
 # URL parsing
 url = "2"
@@ -39,7 +39,7 @@ http = "1"
 # Parse S3 multipart completion responses. Standalone direct dep: rusty-s3 0.10
 # moved to instant-xml and no longer pulls quick-xml, so there is no duplicate
 # copy to match.
-quick-xml = { version = "0.41", features = ["serialize"] }
+quick-xml = { version = "0.42", features = ["serialize"] }
 
 # Logging
 tracing.workspace = true

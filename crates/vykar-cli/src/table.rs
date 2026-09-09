@@ -17,7 +17,7 @@ impl CliTableTheme {
 
     pub(crate) fn new_data_table(self, headers: &[&str]) -> Table {
         let mut table = Table::new();
-        table.load_preset(NOTHING);
+        table.load_style(NOTHING);
         let header_cells: Vec<Cell> = headers.iter().map(|h| self.bold_cell(h)).collect();
         table.set_header(header_cells);
         table
@@ -25,7 +25,7 @@ impl CliTableTheme {
 
     pub(crate) fn new_kv_table(self) -> Table {
         let mut table = Table::new();
-        table.load_preset(NOTHING);
+        table.load_style(NOTHING);
         table
     }
 
@@ -84,8 +84,8 @@ mod tests {
     #[test]
     fn data_table_uses_nothing_preset() {
         let theme = resolve_table_theme(false, false);
-        let mut table = theme.new_data_table(&["A", "B"]);
-        assert_eq!(table.current_style_as_preset(), NOTHING);
+        let table = theme.new_data_table(&["A", "B"]);
+        assert_eq!(table.style(), NOTHING);
     }
 
     #[test]
@@ -93,6 +93,6 @@ mod tests {
         let theme = resolve_table_theme(true, false);
         let mut table = theme.new_kv_table();
         table.add_row(vec!["key", "value"]);
-        assert_eq!(table.current_style_as_preset(), NOTHING);
+        assert_eq!(table.style(), NOTHING);
     }
 }

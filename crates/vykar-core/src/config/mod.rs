@@ -22,5 +22,6 @@ pub use self::resolve::{
     select_repo, select_sources, ConfigSource, RepositoryEntry, ResolvedRepo,
 };
 pub use self::sources::{CommandDump, SourceEntry, SourceInput};
+pub(crate) use self::types::parse_cron;
 pub use self::types::*;
 pub use self::util::{expand_tilde, label_from_path};

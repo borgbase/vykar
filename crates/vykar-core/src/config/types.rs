@@ -171,8 +171,7 @@ impl ScheduleConfig {
         }
 
         if let Some(ref expr) = self.cron {
-            use croner::Cron;
-            expr.parse::<Cron>().map_err(|e| {
+            parse_cron(expr).map_err(|e| {
                 VykarError::Config(format!("schedule.cron: invalid expression '{expr}': {e}"))
             })?;
             // Reject 6-field (with seconds) and 7-field expressions
@@ -326,6 +325,22 @@ impl Default for ChunkerConfig {
             max_size: default_max_size(),
         }
     }
+}
+
+/// Parse a cron expression using vykar's accepted dialect.
+///
+/// croner 4 rejects the bare `N/step` step form (e.g. `5/10`) that croner 3
+/// accepted, in favour of OCPS/vixie-cron compliance. `sloppy_ranges` restores
+/// it so existing user configs keep working across the upgrade. Both the
+/// validation path and the scheduler must parse through here, or a config that
+/// validates could still fail at run time.
+pub(crate) fn parse_cron(
+    expr: &str,
+) -> std::result::Result<croner::Cron, croner::errors::CronError> {
+    croner::parser::CronParser::builder()
+        .sloppy_ranges(true)
+        .build()
+        .parse(expr)
 }
 
 impl ChunkerConfig {
@@ -558,6 +573,19 @@ mod tests {
         let err = schedule(None, Some("bad")).validate().unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("invalid expression"), "got: {msg}");
+    }
+
+    /// croner 4 tightened step parsing to OCPS/vixie-cron rules, which rejects
+    /// the bare `N/step` form. vykar re-enables `sloppy_ranges` so configs
+    /// written against croner 3 keep parsing across the upgrade.
+    #[test]
+    fn validate_accepts_sloppy_step_cron() {
+        for expr in ["5/10 * * * *", "2/5 * * * *", "0 0/6 * * *"] {
+            assert!(
+                schedule(None, Some(expr)).validate().is_ok(),
+                "`{expr}` parsed under croner 3 and must keep parsing"
+            );
+        }
     }
 
     #[test]

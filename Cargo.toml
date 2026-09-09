@@ -44,7 +44,7 @@ clap = { version = "4", features = ["derive", "env"] }
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }
-croner = "3"
+croner = "4"
 
 # Logging
 tracing = "0.1"

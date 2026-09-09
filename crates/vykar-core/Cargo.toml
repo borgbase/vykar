@@ -34,7 +34,7 @@ zeroize.workspace = true
 hex.workspace = true
 
 # Compression
-lz4_flex = "0.13"
+lz4_flex = "0.14"
 zstd = "0.13"
 
 # Chunking

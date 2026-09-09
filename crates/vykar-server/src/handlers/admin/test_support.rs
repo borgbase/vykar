@@ -1,5 +1,4 @@
-use blake2::digest::{Update, VariableOutput};
-use blake2::Blake2bVar;
+use blake2::{Blake2b256, Digest};
 
 use vykar_protocol::PACK_MAGIC;
 
@@ -34,13 +33,9 @@ pub(crate) fn write_pack(tmp: &std::path::Path, pack_bytes: &[u8]) -> String {
 }
 
 pub(crate) fn blake2b_256_hex(data: &[u8]) -> String {
-    let mut hasher = Blake2bVar::new(32).expect("valid output size");
+    let mut hasher = Blake2b256::new();
     hasher.update(data);
-    let mut out = [0u8; 32];
-    hasher
-        .finalize_variable(&mut out)
-        .expect("valid output buffer length");
-    hex::encode(out)
+    hex::encode(hasher.finalize())
 }
 
 /// The pack ID a client would compute for `data` under `algo`.

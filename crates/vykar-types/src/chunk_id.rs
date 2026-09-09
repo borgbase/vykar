@@ -435,14 +435,14 @@ mod tests {
     #[test]
     fn compute_matches_rustcrypto_blake2() {
         use blake2::digest::consts::U32;
-        use blake2::digest::Mac;
+        use blake2::digest::{KeyInit, Mac};
         use blake2::Blake2bMac;
 
         for key in [[0xAA; 32], counting_key(), [0u8; 32]] {
             for len in [0usize, 1, 63, 64, 127, 128, 129, 255, 1000, 4096] {
                 let data = pattern(len);
-                let mut reference =
-                    Blake2bMac::<U32>::new_from_slice(&key).expect("blake2 accepts 32-byte keys");
+                let mut reference = <Blake2bMac<U32> as KeyInit>::new_from_slice(&key)
+                    .expect("blake2 accepts 32-byte keys");
                 Mac::update(&mut reference, &data);
                 let expected = hex::encode(reference.finalize().into_bytes());
                 assert_eq!(

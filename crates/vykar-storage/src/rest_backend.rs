@@ -11,8 +11,7 @@ use std::io::Read;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use blake2::digest::{Update, VariableOutput};
-use blake2::Blake2bVar;
+use blake2::{Blake2b256, Digest};
 
 use crate::retry::HttpRetryError;
 use crate::RetryConfig;
@@ -305,11 +304,9 @@ impl RestBackend {
     /// Compute unkeyed BLAKE2b-256 and return the 64-char hex string.
     /// Used for non-pack objects (manifest, index, snapshots, config).
     fn compute_blake2b_256_hex(data: &[u8]) -> String {
-        let mut hasher = Blake2bVar::new(32).expect("valid output size");
+        let mut hasher = Blake2b256::new();
         hasher.update(data);
-        let mut out = [0u8; 32];
-        hasher.finalize_variable(&mut out).expect("correct length");
-        hex::encode(out)
+        hex::encode(hasher.finalize())
     }
 
     /// The content-digest algorithm this backend was bound to, defaulting to

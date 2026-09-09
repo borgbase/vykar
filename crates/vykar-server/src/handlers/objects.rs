@@ -890,13 +890,10 @@ mod tests {
 
     /// Compute BLAKE2b-256 hex of data (for test convenience).
     fn blake2b_hex(data: &[u8]) -> String {
-        use blake2::digest::{Update, VariableOutput};
-        use blake2::Blake2bVar;
-        let mut hasher = Blake2bVar::new(32).unwrap();
+        use blake2::{Blake2b256, Digest};
+        let mut hasher = Blake2b256::new();
         hasher.update(data);
-        let mut out = [0u8; 32];
-        hasher.finalize_variable(&mut out).unwrap();
-        hex::encode(out)
+        hex::encode(hasher.finalize())
     }
 
     /// The BLAKE3 pack ID a client would send for `data`.

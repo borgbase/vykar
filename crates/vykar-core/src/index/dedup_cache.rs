@@ -12,8 +12,7 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use blake2::digest::{Update, VariableOutput};
-use blake2::Blake2bVar;
+use blake2::{Blake2b256, Digest};
 use memmap2::Mmap;
 use tracing::{debug, warn};
 use xorf::{Filter, Xor8};
@@ -764,13 +763,10 @@ impl MmapFullIndexCache {
         // (including the trailer's presence) was already validated by
         // `open_validated`; only this cache has content to verify.
         let entries_end = mmap.len() - FULL_CHECKSUM_SIZE;
-        let mut hasher = Blake2bVar::new(FULL_CHECKSUM_SIZE).expect("valid output size");
-        Update::update(&mut hasher, &mmap[FULL_HEADER_SIZE..entries_end]);
-        let mut computed = [0u8; FULL_CHECKSUM_SIZE];
-        hasher
-            .finalize_variable(&mut computed)
-            .expect("correct length");
-        if computed != mmap[entries_end..] {
+        let mut hasher = Blake2b256::new();
+        Digest::update(&mut hasher, &mmap[FULL_HEADER_SIZE..entries_end]);
+        let computed = hasher.finalize();
+        if computed[..] != mmap[entries_end..] {
             debug!("full index cache: checksum mismatch");
             return None;
         }
@@ -845,21 +841,18 @@ fn encode_full_entry(entry: &FullCacheEntry) -> [u8; FULL_ENTRY_SIZE] {
 /// content-checksum hasher.
 fn write_full_entry(
     w: &mut BufWriter<std::fs::File>,
-    hasher: &mut Blake2bVar,
+    hasher: &mut Blake2b256,
     entry: &FullCacheEntry,
 ) -> Result<()> {
     let buf = encode_full_entry(entry);
     w.write_all(&buf)?;
-    Update::update(hasher, &buf);
+    Digest::update(hasher, &buf);
     Ok(())
 }
 
 /// Append the finalized content-checksum trailer over all entries written so far.
-fn write_full_checksum(w: &mut BufWriter<std::fs::File>, hasher: Blake2bVar) -> Result<()> {
-    let mut digest = [0u8; FULL_CHECKSUM_SIZE];
-    hasher
-        .finalize_variable(&mut digest)
-        .expect("correct length");
+fn write_full_checksum(w: &mut BufWriter<std::fs::File>, hasher: Blake2b256) -> Result<()> {
+    let digest = hasher.finalize();
     w.write_all(&digest)?;
     Ok(())
 }
@@ -914,7 +907,7 @@ pub fn build_full_index_cache_to_path(
     let mut w = BufWriter::new(file);
 
     write_full_header(&mut w, generation, entry_count)?;
-    let mut hasher = Blake2bVar::new(FULL_CHECKSUM_SIZE).expect("valid output size");
+    let mut hasher = Blake2b256::new();
     for entry in &entries {
         write_full_entry(&mut w, &mut hasher, entry)?;
     }
@@ -953,7 +946,7 @@ pub fn merge_full_index_cache(
     let mut w = BufWriter::new(file);
 
     write_full_header(&mut w, new_generation, total_count)?;
-    let mut hasher = Blake2bVar::new(FULL_CHECKSUM_SIZE).expect("valid output size");
+    let mut hasher = Blake2b256::new();
 
     // Two-pointer merge
     let mut old_idx: usize = 0;

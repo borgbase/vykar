@@ -131,12 +131,10 @@ fn extract(mode: &str) -> Fixture {
 }
 
 fn digest_hex(data: &[u8]) -> String {
-    use blake2::digest::{Update, VariableOutput};
-    let mut hasher = blake2::Blake2bVar::new(32).unwrap();
+    use blake2::{Blake2b256, Digest};
+    let mut hasher = Blake2b256::new();
     hasher.update(data);
-    let mut out = [0u8; 32];
-    hasher.finalize_variable(&mut out).unwrap();
-    hex::encode(out)
+    hex::encode(hasher.finalize())
 }
 
 /// Every regular file under `root`, keyed by its path relative to `root` and
@@ -403,12 +401,10 @@ fn v2_encrypted_fixtures_reject_a_wrong_passphrase() {
 /// `identity::pin_file_path`; the test below proves the derivation still names
 /// the file the implementation reads.
 fn pin_file_name(url: &str) -> String {
-    use blake2::digest::{Update, VariableOutput};
-    let mut hasher = blake2::Blake2bVar::new(32).unwrap();
+    use blake2::{Blake2b256, Digest};
+    let mut hasher = Blake2b256::new();
     hasher.update(url.as_bytes());
-    let mut hash = [0u8; 32];
-    hasher.finalize_variable(&mut hash).unwrap();
-    format!("pin.{}", hex::encode(hash))
+    format!("pin.{}", hex::encode(hasher.finalize()))
 }
 
 #[test]

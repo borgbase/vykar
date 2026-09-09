@@ -46,17 +46,12 @@ pub(super) struct RepInfo {
 /// fingerprint is runtime-only and never persisted, so it is not part of any
 /// repository format.
 pub(super) fn chunks_fingerprint(chunks: &[ChunkRef]) -> [u8; 32] {
-    use blake2::digest::{Update, VariableOutput};
-    use blake2::Blake2bVar;
-    let mut hasher = Blake2bVar::new(32).expect("BLAKE2b accepts 32-byte output per spec");
+    use blake2::{Blake2b256, Digest};
+    let mut hasher = Blake2b256::new();
     for c in chunks {
         hasher.update(c.id.as_bytes());
     }
-    let mut out = [0u8; 32];
-    hasher
-        .finalize_variable(&mut out)
-        .expect("BLAKE2b accepts 32-byte output per spec");
-    out
+    hasher.finalize().into()
 }
 
 /// A non-representative hard-link member queued for relinking after all

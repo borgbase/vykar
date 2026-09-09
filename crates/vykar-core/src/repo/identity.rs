@@ -1,8 +1,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use blake2::digest::{Update, VariableOutput};
-use blake2::Blake2bVar;
+use blake2::{Blake2b256, Digest};
 use serde::{Deserialize, Serialize};
 
 use vykar_common::paths;
@@ -25,12 +24,10 @@ struct PinFile {
 /// material rather than content, so the BLAKE3 throughput argument does not
 /// apply. Do not "finish the migration" here.
 pub fn compute_fingerprint(repo_id: &[u8], chunk_id_key: &[u8; 32]) -> [u8; 32] {
-    let mut hasher = Blake2bVar::new(32).expect("valid output size");
+    let mut hasher = Blake2b256::new();
     hasher.update(repo_id);
     hasher.update(chunk_id_key);
-    let mut out = [0u8; 32];
-    hasher.finalize_variable(&mut out).expect("correct length");
-    out
+    hasher.finalize().into()
 }
 
 /// Derive the pin file path for a given URL.
@@ -45,11 +42,9 @@ fn pin_file_path(url: &str, cache_dir: Option<&Path>) -> Option<PathBuf> {
         None => paths::cache_dir().map(|d| d.join("vykar")),
     };
     base.map(|b| {
-        let mut hasher = Blake2bVar::new(32).expect("valid output size");
+        let mut hasher = Blake2b256::new();
         hasher.update(url.as_bytes());
-        let mut hash = [0u8; 32];
-        hasher.finalize_variable(&mut hash).expect("correct length");
-        b.join(format!("pin.{}", hex::encode(hash)))
+        b.join(format!("pin.{}", hex::encode(hasher.finalize())))
     })
 }
 

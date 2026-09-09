@@ -314,6 +314,29 @@ mod tests {
 
     const TEST_PASSPHRASE: &str = "test-passphrase-123";
 
+    /// Argon2id key derivation is repository format: `keys/repokey` blobs are
+    /// wrapped with this key, so a change makes every existing repository
+    /// unopenable. The round-trip tests cannot catch that — they re-derive
+    /// with the same code on both sides — so pin a known answer at the
+    /// parameters `EncryptedKey::wrap` actually writes (t=3, m=64 MiB, p=4).
+    /// Verified byte-identical across argon2 0.5 and 0.6.
+    #[test]
+    fn derive_key_from_passphrase_known_answer() {
+        let kdf = KdfParams {
+            algorithm: "argon2id".to_string(),
+            time_cost: 3,
+            memory_cost: 65536,
+            parallelism: 4,
+            salt: (0u8..32).collect(),
+        };
+        let key = derive_key_from_passphrase("test-passphrase-123", &kdf).unwrap();
+        assert_eq!(
+            hex::encode(key.as_ref()),
+            "5f35887cb2c78be1ac24320a8c74bf8823c2a6958b4a3d6df0a61dd4a5fa4b61",
+            "Argon2id derivation changed; existing keys/repokey blobs would not unwrap"
+        );
+    }
+
     fn make_test_kdf() -> KdfParams {
         let mut salt = vec![0u8; 32];
         rand::rngs::SysRng

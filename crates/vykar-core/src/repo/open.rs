@@ -44,19 +44,16 @@ const PLAINTEXT_CHUNK_ID_KEY_CONTEXT: &str =
 /// resistance.
 pub(crate) fn derive_plaintext_chunk_id_key(repo_id: &[u8], format: RepoFormat) -> [u8; 32] {
     match format {
-        // Frozen: RustCrypto `Blake2bVar`, exactly as v2 repositories were
+        // Frozen: RustCrypto BLAKE2b-256, exactly as v2 repositories were
         // written. Do not "modernise" this to blake2b_simd without checking
-        // it byte-for-byte.
+        // it byte-for-byte. `Blake2b256` sets the same digest length in the
+        // BLAKE2b parameter block as the `Blake2bVar::new(32)` this replaced,
+        // so the output is unchanged; `v2_fixture_compat` is the guard.
         RepoFormat::V2 => {
-            use blake2::digest::{Update, VariableOutput};
-            use blake2::Blake2bVar;
-            let mut key = [0u8; 32];
-            let mut hasher = Blake2bVar::new(32).expect("valid BLAKE2b output length");
+            use blake2::{Blake2b256, Digest};
+            let mut hasher = Blake2b256::new();
             hasher.update(repo_id);
-            hasher
-                .finalize_variable(&mut key)
-                .expect("output buffer matches BLAKE2b length");
-            key
+            hasher.finalize().into()
         }
         RepoFormat::V3 => blake3::derive_key(PLAINTEXT_CHUNK_ID_KEY_CONTEXT, repo_id),
     }

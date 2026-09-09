@@ -1,8 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use blake2::digest::{Update, VariableOutput};
-use blake2::Blake2bVar;
+use blake2::{Blake2b256, Digest};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -25,11 +24,9 @@ fn check_state_path(url: &str, cache_dir: Option<&Path>) -> Option<PathBuf> {
         None => paths::cache_dir().map(|d| d.join("vykar")),
     };
     base.map(|b| {
-        let mut hasher = Blake2bVar::new(32).expect("valid output size");
+        let mut hasher = Blake2b256::new();
         hasher.update(url.as_bytes());
-        let mut hash = [0u8; 32];
-        hasher.finalize_variable(&mut hash).expect("correct length");
-        b.join(format!("check.{}", hex::encode(hash)))
+        b.join(format!("check.{}", hex::encode(hasher.finalize())))
     })
 }
 

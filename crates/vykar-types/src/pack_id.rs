@@ -193,17 +193,13 @@ mod tests {
     /// kept as a dev-dependency purely as an independent reference.
     #[test]
     fn compute_matches_rustcrypto_blake2() {
-        use blake2::digest::{Update, VariableOutput};
-        use blake2::Blake2bVar;
+        use blake2::{Blake2b256, Digest};
 
         for len in [0usize, 1, 63, 64, 127, 128, 129, 255, 1000, 4096] {
             let data = pattern(len);
-            let mut reference = Blake2bVar::new(32).expect("blake2 accepts 32-byte output");
+            let mut reference = Blake2b256::new();
             reference.update(&data);
-            let mut expected = [0u8; 32];
-            reference
-                .finalize_variable(&mut expected)
-                .expect("finalize_variable writes 32 bytes");
+            let expected = reference.finalize();
             assert_eq!(
                 PackId::compute(&data, HashAlgorithm::Blake2b).to_hex(),
                 hex::encode(expected),

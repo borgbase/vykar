@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 use russh::client;
 use russh::keys::known_hosts::{known_host_keys_path, learn_known_hosts_path};
 use russh::keys::ssh_key;
+use russh::keys::PublicKeyOrCertificate;
 use russh::keys::{load_secret_key, PrivateKey, PrivateKeyWithHashAlg};
 use russh_sftp::client::{Config as SftpConfig, SftpSession};
 use russh_sftp::protocol::{OpenFlags, StatusCode};
@@ -82,10 +83,28 @@ struct SshHandler {
 impl client::Handler for SshHandler {
     type Error = russh::Error;
 
+    /// russh 0.63 widened this to `PublicKeyOrCertificate`. Host certificates
+    /// are rejected rather than flattened with `.public_key()`: flattening
+    /// would pin the certified host key without ever validating the signing
+    /// CA, and vykar's TOFU learning path writes plain keys, so the pin would
+    /// not mean what the trust model says it means. Failing loudly is the
+    /// honest outcome until certificate support is designed deliberately.
     fn check_server_key(
         &mut self,
-        server_public_key: &ssh_key::PublicKey,
+        server_public_key: &PublicKeyOrCertificate,
     ) -> impl std::future::Future<Output = std::result::Result<bool, Self::Error>> + Send {
+        let server_public_key = match server_public_key {
+            PublicKeyOrCertificate::PublicKey { key, .. } => key,
+            PublicKeyOrCertificate::Certificate(_) => {
+                tracing::error!(
+                    host = %self.host,
+                    port = self.port,
+                    "server offered an SSH host certificate, which vykar does not support; \
+                     expected a plain host key"
+                );
+                return std::future::ready(Ok(false));
+            }
+        };
         let result = match verify_or_learn_host_key(
             &self.host,
             self.port,
@@ -793,9 +812,12 @@ fn io_retry_error(op: &str, path: &str, e: std::io::Error) -> RetryError {
             | std::io::ErrorKind::ConnectionReset
             | std::io::ErrorKind::NotConnected
             | std::io::ErrorKind::BrokenPipe
-            // russh-sftp AsyncWrite/AsyncRead wraps all SFTP errors as
-            // ErrorKind::Other, losing the original error type. Default
-            // to retryable — the channel is likely broken anyway.
+            // russh-sftp's AsyncRead/AsyncWrite impls collapse SFTP errors
+            // into io::Error, losing the original type. 3.0 maps `Timeout` to
+            // `TimedOut` and everything else to `Other` (2.x used `Other` for
+            // all of them); both kinds are retryable here, so the mapping
+            // change does not shift classification. Default to retryable —
+            // the channel is likely broken anyway.
             | std::io::ErrorKind::Other
     );
 
@@ -1258,10 +1280,20 @@ mod tests {
 
     #[test]
     fn test_io_retry_error_other_is_retryable() {
-        // russh-sftp wraps all SFTP errors as ErrorKind::Other
+        // russh-sftp collapses non-timeout SFTP errors into ErrorKind::Other
         let err = std::io::Error::other("Timeout");
         let retry = io_retry_error("write", "/test/path", err);
         assert!(retry.retryable, "ErrorKind::Other should be retryable");
+    }
+
+    /// russh-sftp 3.0 maps its `Timeout` error to `ErrorKind::TimedOut`,
+    /// where 2.x collapsed it into `Other`. Both are retryable, so the
+    /// upgrade did not silently make a transient timeout permanent.
+    #[test]
+    fn test_io_retry_error_timed_out_is_retryable() {
+        let err = std::io::Error::from(std::io::ErrorKind::TimedOut);
+        let retry = io_retry_error("read", "/test/path", err);
+        assert!(retry.retryable, "ErrorKind::TimedOut should be retryable");
     }
 
     #[test]

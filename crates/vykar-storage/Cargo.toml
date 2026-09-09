@@ -51,8 +51,8 @@ tempfile.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread"], optional = true }
 
 # SSH/SFTP
-russh = { version = "0.62.1", default-features = false, features = ["aws-lc-rs"], optional = true }
-russh-sftp = { version = "2.3.0", optional = true }
+russh = { version = "0.63", default-features = false, features = ["aws-lc-rs"], optional = true }
+russh-sftp = { version = "3.0", optional = true }
 
 [features]
 default = []

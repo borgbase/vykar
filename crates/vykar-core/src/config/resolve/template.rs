@@ -48,7 +48,7 @@ mod tests {
     fn test_minimal_template_is_valid_yaml() {
         let template = minimal_config_template();
         // Template is valid YAML (everything uncommented is still parseable).
-        let parsed: Result<RawConfig, _> = serde_yaml::from_str(template);
+        let parsed: Result<RawConfig, _> = crate::config::yaml::from_str(template);
         assert!(
             parsed.is_ok(),
             "template should parse as valid YAML: {:?}",

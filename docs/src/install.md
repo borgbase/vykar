@@ -213,7 +213,7 @@ Add your chosen directory (for example, `%USERPROFILE%\bin`) to `PATH` if needed
 
 ## Build from source
 
-Requires Rust 1.88 or later.
+Requires Rust 1.89 or later.
 
 ```bash
 git clone https://github.com/borgbase/vykar.git

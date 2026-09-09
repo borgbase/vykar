@@ -172,13 +172,15 @@ pub(super) struct ConfigDocument {
 pub(super) type RawConfig = ConfigDocument;
 
 /// Pre-parse struct to extract `env_file` before environment variable expansion.
-/// Uses `flatten` + `Value` to ignore all other fields.
+/// The flattened catch-all swallows every other field. It is deliberately not
+/// the YAML crate's own `Value` type: the field is never read, so `IgnoredAny`
+/// keeps this struct independent of whichever parser is in use.
 #[derive(Debug, Deserialize)]
 pub(super) struct EnvFilePre {
     #[serde(default, deserialize_with = "deserialize_string_or_vec")]
     pub(super) env_file: Vec<String>,
     #[serde(flatten)]
-    _rest: serde_yaml::Value,
+    _rest: serde::de::IgnoredAny,
 }
 
 #[cfg(test)]
@@ -326,10 +328,15 @@ sources:
         assert_eq!(repos[0].label.as_deref(), Some("7"));
     }
 
-    /// serde_yaml 0.9 only treats `true`/`false`/`True`/`False`/`TRUE`/`FALSE`
-    /// as booleans. The extended YAML 1.1 boolean literals (`yes`/`no`/`on`/`off`)
-    /// are deserialized as plain strings, so they pass through `StrictString`
-    /// without issue. These tests document that guarantee.
+    /// Only `true`/`false` (and their case variants) are booleans. The extended
+    /// YAML 1.1 boolean literals (`yes`/`no`/`on`/`off`) are deserialized as
+    /// plain strings, so they pass through `StrictString` without issue.
+    ///
+    /// This was serde_yaml 0.9's behaviour for vykar's whole life, and
+    /// `config::yaml` sets serde-saphyr's `strict_booleans` to preserve it —
+    /// serde-saphyr resolves the YAML 1.1 forms as booleans by default. These
+    /// tests are the guard against that regressing and silently changing what
+    /// existing user configs mean.
     #[test]
     fn test_strict_string_allows_yaml11_bool_words_as_strings() {
         for word in ["no", "yes", "on", "off"] {

@@ -846,7 +846,7 @@ fn write_full_entry(
 ) -> Result<()> {
     let buf = encode_full_entry(entry);
     w.write_all(&buf)?;
-    Digest::update(hasher, &buf);
+    Digest::update(hasher, buf);
     Ok(())
 }
 

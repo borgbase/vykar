@@ -26,7 +26,12 @@ vykar-protocol = { path = "crates/vykar-protocol" }
 serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"
 serde_json = "1"
-serde_yaml = "0.9"
+# YAML config parsing. serde_yaml 0.9 is unmaintained (deprecated upstream in
+# March 2024); serde-saphyr is pure Rust over the YAML-1.2 `saphyr` parser and
+# avoids the transpiled-C unsafe-libyaml every serde_yaml fork still carries.
+# Always parse through `config::yaml::from_str`, never `serde_saphyr::from_str`
+# directly — see that module for why `strict_booleans` is not optional.
+serde-saphyr = "1.2"
 rmp-serde = "1"
 
 # Error handling

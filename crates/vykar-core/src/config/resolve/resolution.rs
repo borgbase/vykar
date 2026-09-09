@@ -34,7 +34,7 @@ pub fn load_and_resolve(path: &Path) -> vykar_types::error::Result<Vec<ResolvedR
     })?;
 
     // Pre-parse to extract env_file paths before environment variable expansion.
-    let pre: EnvFilePre = serde_yaml::from_str(&contents).map_err(|e| {
+    let pre: EnvFilePre = crate::config::yaml::from_str(&contents).map_err(|e| {
         vykar_types::error::VykarError::Config(format!("invalid config '{}': {e}", path.display()))
     })?;
 
@@ -48,7 +48,7 @@ pub fn load_and_resolve(path: &Path) -> vykar_types::error::Result<Vec<ResolvedR
     let env_overlay = parse_env_files(path, &env_paths)?;
 
     let expanded = expand_env_placeholders(&contents, path, &env_overlay)?;
-    let raw: ConfigDocument = serde_yaml::from_str(&expanded).map_err(|e| {
+    let raw: ConfigDocument = crate::config::yaml::from_str(&expanded).map_err(|e| {
         vykar_types::error::VykarError::Config(format!("invalid config '{}': {e}", path.display()))
     })?;
 

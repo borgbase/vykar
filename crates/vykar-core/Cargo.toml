@@ -20,7 +20,7 @@ vykar-protocol.workspace = true
 serde.workspace = true
 serde_bytes.workspace = true
 serde_json.workspace = true
-serde_yaml.workspace = true
+serde-saphyr.workspace = true
 rmp = "0.8"
 rmp-serde.workspace = true
 

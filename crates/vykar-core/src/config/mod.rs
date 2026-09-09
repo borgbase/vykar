@@ -6,6 +6,7 @@ mod resolve;
 mod sources;
 mod types;
 mod util;
+mod yaml;
 
 // Re-export config schema types
 pub use self::hooks::HOOK_COMMANDS;

@@ -315,7 +315,7 @@ mod tests {
 
     #[test]
     fn optional_strict_string_rejects_null() {
-        let err = serde_yaml::from_str::<OptionalStrictStringTest>("value: ~")
+        let err = crate::config::yaml::from_str::<OptionalStrictStringTest>("value: ~")
             .unwrap_err()
             .to_string();
         assert!(
@@ -326,13 +326,14 @@ mod tests {
 
     #[test]
     fn optional_strict_string_accepts_string() {
-        let result: OptionalStrictStringTest = serde_yaml::from_str("value: \"hello\"").unwrap();
+        let result: OptionalStrictStringTest =
+            crate::config::yaml::from_str("value: \"hello\"").unwrap();
         assert_eq!(result.value, Some("hello".to_string()));
     }
 
     #[test]
     fn optional_duration_string_rejects_null() {
-        let err = serde_yaml::from_str::<OptionalDurationStringTest>("value: null")
+        let err = crate::config::yaml::from_str::<OptionalDurationStringTest>("value: null")
             .unwrap_err()
             .to_string();
         assert!(
@@ -343,7 +344,7 @@ mod tests {
 
     #[test]
     fn optional_duration_string_rejects_bool() {
-        let err = serde_yaml::from_str::<OptionalDurationStringTest>("value: true")
+        let err = crate::config::yaml::from_str::<OptionalDurationStringTest>("value: true")
             .unwrap_err()
             .to_string();
         assert!(
@@ -354,7 +355,7 @@ mod tests {
 
     #[test]
     fn optional_duration_string_rejects_float() {
-        let err = serde_yaml::from_str::<OptionalDurationStringTest>("value: 3.14")
+        let err = crate::config::yaml::from_str::<OptionalDurationStringTest>("value: 3.14")
             .unwrap_err()
             .to_string();
         assert!(
@@ -365,13 +366,14 @@ mod tests {
 
     #[test]
     fn optional_duration_string_accepts_int() {
-        let result: OptionalDurationStringTest = serde_yaml::from_str("value: 42").unwrap();
+        let result: OptionalDurationStringTest =
+            crate::config::yaml::from_str("value: 42").unwrap();
         assert_eq!(result.value, Some("42".to_string()));
     }
 
     #[test]
     fn optional_vec_strict_string_rejects_null() {
-        let err = serde_yaml::from_str::<OptionalVecStrictStringTest>("value: null")
+        let err = crate::config::yaml::from_str::<OptionalVecStrictStringTest>("value: null")
             .unwrap_err()
             .to_string();
         assert!(

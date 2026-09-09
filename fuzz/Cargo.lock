@@ -1940,14 +1940,14 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vykar-common"
-version = "0.19.1"
+version = "0.20.0"
 dependencies = [
  "nix",
 ]
 
 [[package]]
 name = "vykar-core"
-version = "0.19.1"
+version = "0.20.0"
 dependencies = [
  "blake2",
  "blake3",
@@ -1989,7 +1989,7 @@ dependencies = [
 
 [[package]]
 name = "vykar-crypto"
-version = "0.19.1"
+version = "0.20.0"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -2020,7 +2020,7 @@ dependencies = [
 
 [[package]]
 name = "vykar-protocol"
-version = "0.19.1"
+version = "0.20.0"
 dependencies = [
  "serde",
  "vykar-types",
@@ -2028,7 +2028,7 @@ dependencies = [
 
 [[package]]
 name = "vykar-storage"
-version = "0.19.1"
+version = "0.20.0"
 dependencies = [
  "base64",
  "blake2",
@@ -2052,7 +2052,7 @@ dependencies = [
 
 [[package]]
 name = "vykar-types"
-version = "0.19.1"
+version = "0.20.0"
 dependencies = [
  "blake2b_simd",
  "blake3",

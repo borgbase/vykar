@@ -121,10 +121,8 @@ pub(super) fn read_range_drift_checked(
             whole_file = Some(data);
         }
         ReadPlan::Chunked | ReadPlan::Segment { .. } => {
-            let reader = Read::take(&mut *source, read_limit);
-            for chunk_result in
-                chunker::chunk_stream(limits::LimitedReader::new(reader, limiter), chunker_config)
-            {
+            let reader = limits::LimitedReader::new(&mut *source, limiter).take(read_limit);
+            for chunk_result in chunker::chunk_stream_bounded(reader, chunker_config) {
                 let chunk = chunk_result.map_err(|e| match e {
                     fastcdc::v2020::Error::IoError(ioe) => VykarError::Io(ioe),
                     other => VykarError::Other(format!("chunking failed for {path}: {other}")),

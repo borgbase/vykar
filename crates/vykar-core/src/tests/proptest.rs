@@ -307,11 +307,11 @@ proptest! {
 // ---------------------------------------------------------------------------
 
 mod chunker {
-    use std::io::Cursor;
+    use std::io::{Cursor, Read};
 
     use proptest::prelude::*;
 
-    use crate::chunker::{chunk_data, chunk_stream};
+    use crate::chunker::{chunk_data, chunk_stream, chunk_stream_bounded};
     use crate::config::ChunkerConfig;
 
     /// Generate valid ChunkerConfig values that respect fastcdc's hard bounds:
@@ -405,6 +405,7 @@ mod chunker {
         fn chunker_stream_matches_slice(
             data in prop::collection::vec(any::<u8>(), 0..65536),
             config in arb_chunker_config(),
+            limit in 0..65536u64,
         ) {
             let slice_chunks = chunk_data(&data, &config);
             let stream_chunks: Vec<(usize, usize)> = chunk_stream(Cursor::new(&data), &config)
@@ -414,6 +415,16 @@ mod chunker {
                 })
                 .collect();
             prop_assert_eq!(slice_chunks, stream_chunks);
+
+            let bounded_chunks: Vec<_> =
+                chunk_stream_bounded(Cursor::new(&data).take(limit), &config)
+                    .map(|result| {
+                        let chunk = result.expect("bounded stream chunking should succeed");
+                        (chunk.offset as usize, chunk.length)
+                    })
+                    .collect();
+            let expected = chunk_data(&data[..data.len().min(limit as usize)], &config);
+            prop_assert_eq!(expected, bounded_chunks);
         }
 
         /// Any config from `arb_chunker_config()` passes `validate()`.

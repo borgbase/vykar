@@ -1,4 +1,5 @@
 use crate::hash::HashAlgorithm;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 hash_id! {
     /// A 32-byte chunk identifier computed as a keyed 256-bit hash.
@@ -12,9 +13,13 @@ hash_id! {
 /// without having chosen one, and rules out pairing a v2 repository's key with
 /// v3 hashing.
 ///
-/// `Copy` and 33 bytes, so it is passed by value at the hoisting sites.
-#[derive(Clone, Copy)]
+/// For an encrypted repository the key is secret material from
+/// `keys/repokey`, so the type is not `Copy` and zeroizes the key on drop.
+/// Engines own it and hand out references; worker threads that need an owned
+/// value clone it explicitly.
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct ChunkHasher {
+    #[zeroize(skip)]
     algo: HashAlgorithm,
     key: [u8; 32],
 }
@@ -30,9 +35,9 @@ impl ChunkHasher {
 
     /// The raw 32-byte key.
     ///
-    /// Needed by the two callers that hash the key itself rather than hashing
-    /// *with* it: the TOFU identity fingerprint and the `check` runner's
-    /// fingerprint comparison.
+    /// For the callers that hash the key itself rather than hashing *with*
+    /// it: the TOFU identity fingerprint and the `check` runner's fingerprint
+    /// comparison.
     pub const fn key(&self) -> &[u8; 32] {
         &self.key
     }

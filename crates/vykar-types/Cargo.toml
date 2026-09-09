@@ -32,6 +32,9 @@ rmp-serde.workspace = true
 # Error handling
 thiserror.workspace = true
 
+# ChunkHasher carries the chunk-ID key
+zeroize.workspace = true
+
 [dev-dependencies]
 # Independent reference implementation for the ChunkId/PackId equivalence tests.
 blake2.workspace = true

@@ -63,9 +63,9 @@ pub trait CryptoEngine: Send + Sync {
 
     /// The keyed hasher used for computing chunk IDs.
     ///
-    /// By value: `ChunkHasher` is `Copy` and 33 bytes, and the callers that
-    /// matter hoist it once per run before entering the chunking loop.
-    fn chunk_hasher(&self) -> ChunkHasher;
+    /// By reference: the engine owns the key material and zeroizes it on drop.
+    /// Callers hoist the reference once per run before the chunking loop.
+    fn chunk_hasher(&self) -> &ChunkHasher;
 }
 
 /// Generate a `CryptoEngine` implementation for an AEAD cipher.
@@ -207,8 +207,8 @@ macro_rules! impl_aead_engine {
                 true
             }
 
-            fn chunk_hasher(&self) -> ::vykar_types::chunk_id::ChunkHasher {
-                self.chunk_hasher
+            fn chunk_hasher(&self) -> &::vykar_types::chunk_id::ChunkHasher {
+                &self.chunk_hasher
             }
         }
     };
@@ -255,8 +255,8 @@ impl CryptoEngine for PlaintextEngine {
         false
     }
 
-    fn chunk_hasher(&self) -> ChunkHasher {
-        self.chunk_hasher
+    fn chunk_hasher(&self) -> &ChunkHasher {
+        &self.chunk_hasher
     }
 }
 

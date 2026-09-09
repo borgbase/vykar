@@ -331,7 +331,7 @@ pub(super) fn process_regular_file_item(
         return Ok(ProcessOutcome::Committed);
     }
 
-    let chunk_hasher = repo.crypto.chunk_hasher();
+    let chunk_hasher = repo.crypto.chunk_hasher().clone();
     // Check old cache for new-vs-modified before opening file (avoids borrow conflict).
     let was_in_old_cache = if verbose {
         repo.file_cache().contains(&abs_path)
@@ -474,7 +474,7 @@ pub(super) fn process_source_path(
         },
     );
 
-    let chunk_hasher = repo.crypto.chunk_hasher();
+    let chunk_hasher = repo.crypto.chunk_hasher().clone();
     let min_chunk_size = repo.config.chunker_params.min_size as u64;
     let mut cross_batch = CrossFileBatch::new();
     // Per-source counts, flushed as summary warnings at end of source; the

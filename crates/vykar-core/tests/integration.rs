@@ -2794,14 +2794,14 @@ fn plaintext_chunk_id_key_consistent_across_init_and_open() {
         None,
     )
     .unwrap();
-    let hasher_init = repo.crypto.chunk_hasher();
+    let hasher_init = repo.crypto.chunk_hasher().clone();
     let id_init = vykar_types::chunk_id::ChunkId::compute(&hasher_init, data);
     drop(repo);
 
     // Re-open the same repo and compute the ChunkId for the same data
     let storage = Box::new(LocalBackend::new(repo_dir.to_str().unwrap()).unwrap());
     let repo = Repository::open(storage, None, None, OpenOptions::new()).unwrap();
-    let hasher_open = repo.crypto.chunk_hasher();
+    let hasher_open = repo.crypto.chunk_hasher().clone();
     let id_open = vykar_types::chunk_id::ChunkId::compute(&hasher_open, data);
 
     assert_eq!(

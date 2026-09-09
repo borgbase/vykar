@@ -217,7 +217,6 @@ pub(super) fn execute_parallel_restore(
         for bucket in &buckets {
             let bytes_written = &bytes_written;
             let cancelled = &cancelled;
-            let chunk_hasher = &chunk_hasher;
 
             handles.push(s.spawn(move || -> Result<()> {
                 let mut data_buf = Vec::new();

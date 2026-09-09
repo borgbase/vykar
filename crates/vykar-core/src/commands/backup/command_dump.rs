@@ -149,7 +149,7 @@ fn stream_dump_command(
         };
 
         // Stream stdout through chunker.
-        let chunk_hasher = repo.crypto.chunk_hasher();
+        let chunk_hasher = repo.crypto.chunk_hasher().clone();
         let stdout = stdout.ok_or_else(|| {
             VykarError::Other("internal: command_dump stdout not piped (config bug)".into())
         })?;

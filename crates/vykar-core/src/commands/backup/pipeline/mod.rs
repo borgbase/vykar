@@ -317,7 +317,7 @@ pub(crate) fn run_parallel_pipeline(
                 for (idx, entry, pre_acquired) in rx {
                     let result = worker::process_file_worker(
                         entry,
-                        &chunk_hasher,
+                        chunk_hasher,
                         &**crypto,
                         compression,
                         &chunker_cfg,

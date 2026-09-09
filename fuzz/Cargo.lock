@@ -1992,6 +1992,7 @@ dependencies = [
  "rmp-serde",
  "serde",
  "thiserror",
+ "zeroize",
 ]
 
 [[package]]

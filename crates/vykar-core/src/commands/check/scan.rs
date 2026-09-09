@@ -504,7 +504,7 @@ pub(super) fn integrity_scan(
         let (data_count, data_issues) = parallel_verify_data(
             &repo.storage,
             &repo.crypto,
-            &repo.crypto.chunk_hasher(),
+            repo.crypto.chunk_hasher(),
             &packs_vec,
             config.limits.verify_data_concurrency(),
             BATCH_THRESHOLD,

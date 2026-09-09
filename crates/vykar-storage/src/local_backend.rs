@@ -69,7 +69,7 @@ impl LocalBackend {
         let dir = path.parent().unwrap_or(&self.root);
         let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
         tmp.write_all(data)?;
-        tmp.as_file_mut().sync_all()?;
+        vykar_common::fs::fsync_file(tmp.as_file())?;
         let persisted = tmp.persist(path).map_err(|e| e.error)?;
         drop(persisted);
         Self::sync_directory(dir)?;

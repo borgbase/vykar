@@ -9,7 +9,7 @@ fn finish_secure_write(mut file: std::fs::File, contents: &[u8]) -> io::Result<(
     // apply_mode_fd is a no-op on non-Unix.
     vykar_core::platform::fs::apply_mode_fd(&file, 0o600)?;
     file.write_all(contents)?;
-    file.sync_all()
+    vykar_common::fs::fsync_file(&file)
 }
 
 /// Create a new config file with owner-only permissions (0o600 on Unix).

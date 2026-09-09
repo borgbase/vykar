@@ -249,7 +249,13 @@ pub async fn put_object(
                 writer.write_all(chunk).await.map_err(ServerError::from)?;
             }
             writer.flush().await.map_err(ServerError::from)?;
-            writer.into_inner().sync_data().await.map_err(ServerError::from)?;
+            // fdatasync_file is blocking (and carries the Apple F_FULLFSYNC
+            // fallback), so run it off the runtime the way fsync_dir_async does.
+            let synced = writer.into_inner().into_std().await;
+            tokio::task::spawn_blocking(move || vykar_common::fs::fdatasync_file(&synced))
+                .await
+                .map_err(|e| std::io::Error::other(e.to_string()))?
+                .map_err(ServerError::from)?;
             Ok(())
         }
         .await;

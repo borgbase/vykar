@@ -230,12 +230,12 @@ fn execute_repack(
 
             // Flush the BufWriter and fsync the temp file before rename so its
             // contents survive power loss. into_inner() closes the file handle
-            // (required on Windows before rename); sync_data() persists the bytes.
+            // (required on Windows before rename); fdatasync_file() persists the bytes.
             let temp_file = writer.into_inner().map_err(|e| {
                 let _ = std::fs::remove_file(&temp_path);
                 format!("flush temp: {e}")
             })?;
-            temp_file.sync_data().map_err(|e| {
+            vykar_common::fs::fdatasync_file(&temp_file).map_err(|e| {
                 let _ = std::fs::remove_file(&temp_path);
                 format!("sync temp: {e}")
             })?;

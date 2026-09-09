@@ -33,7 +33,7 @@ pub(crate) fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
     let dir = path.parent().unwrap_or(Path::new("."));
     let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
     tmp.write_all(data)?;
-    tmp.as_file().sync_data()?;
+    vykar_common::fs::fdatasync_file(tmp.as_file())?;
     tmp.persist(path).map_err(|e| e.error)?;
     Ok(())
 }

@@ -34,7 +34,7 @@ pub(crate) fn run_config_generate(dest: Option<&str>) -> CliResult<()> {
 fn write_config_file(path: &std::path::Path) -> std::io::Result<()> {
     let mut file = new_config_file(path)?;
     file.write_all(config::minimal_config_template().as_bytes())?;
-    file.sync_all()?;
+    vykar_common::fs::fsync_file(&file)?;
     Ok(())
 }
 

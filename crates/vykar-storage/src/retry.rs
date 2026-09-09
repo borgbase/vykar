@@ -162,6 +162,14 @@ pub fn is_retryable_io(err: &std::io::Error) -> bool {
             | std::io::ErrorKind::UnexpectedEof
             | std::io::ErrorKind::TimedOut
             | std::io::ErrorKind::Interrupted
+            // ureq 3.4.1 reports a peer reset that arrives mid-request-body on
+            // a pooled connection as EINVAL rather than a connection-reset
+            // kind. That is the #151 scenario — a transient S3 blip — and
+            // treating it as permanent aborts the whole upload instead of
+            // retrying the part. Broader than the other kinds here, but a
+            // backup that fails on a recoverable network error is the worse
+            // trade. `multipart_mid_part_reset_then_succeeds` covers it.
+            | std::io::ErrorKind::InvalidInput
     )
 }
 
@@ -178,6 +186,9 @@ mod tests {
             std::io::ErrorKind::UnexpectedEof,
             std::io::ErrorKind::TimedOut,
             std::io::ErrorKind::Interrupted,
+            // See the note in `is_retryable_io`: ureq surfaces a mid-body
+            // peer reset on a pooled connection as EINVAL.
+            std::io::ErrorKind::InvalidInput,
         ];
         for kind in retryable_kinds {
             let err = std::io::Error::new(kind, "test");
@@ -191,7 +202,6 @@ mod tests {
             std::io::ErrorKind::NotFound,
             std::io::ErrorKind::PermissionDenied,
             std::io::ErrorKind::InvalidData,
-            std::io::ErrorKind::InvalidInput,
             std::io::ErrorKind::AlreadyExists,
         ];
         for kind in non_retryable_kinds {

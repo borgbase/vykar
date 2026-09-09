@@ -135,7 +135,7 @@ pub fn run_with_progress(
     repo.load_chunk_index_uncached()?;
 
     // Build per-pack grouping from chunk index (needed for server verify).
-    let pack_chunks = group_by_pack(repo.chunk_index());
+    let mut pack_chunks = group_by_pack(repo.chunk_index());
 
     // If sampling (effective < 100), select a subset of packs.
     let sampled_out: HashSet<PackId> = if effective < 100 {
@@ -144,22 +144,17 @@ pub fn run_with_progress(
         HashSet::new()
     };
 
-    // Filter pack_chunks for server verify to only include sampled-in packs.
-    let verify_pack_chunks: PackChunks = if sampled_out.is_empty() {
-        pack_chunks.clone()
-    } else {
-        pack_chunks
-            .iter()
-            .filter(|(pid, _)| !sampled_out.contains(pid))
-            .map(|(pid, chunks)| (*pid, chunks.clone()))
-            .collect()
-    };
+    // Server verification and its counters only need sampled-in packs.
+    // Filter in place to avoid copying every chunk's index entry.
+    if !sampled_out.is_empty() {
+        pack_chunks.retain(|pid, _| !sampled_out.contains(pid));
+    }
 
     // Try server-side verify for both existence and data checks.
     let server_outcome = if !distrust_server {
         try_server_verify(
             &repo.storage,
-            &verify_pack_chunks,
+            &pack_chunks,
             verify_data,
             repo.content_hash(),
             &mut progress,
@@ -179,6 +174,16 @@ pub fn run_with_progress(
             } => (verified_packs, packs_responded, chunks_verified, errors),
             ServerVerifyOutcome::Fallback => (HashSet::new(), 0, 0, Vec::new()),
         };
+
+    // Count server-covered chunks before releasing the grouping. The local
+    // scan builds its own grouping, so retaining this one through the scan
+    // would keep another full set of chunk entries alive during verification.
+    let srv_chunks_existence: usize = verified_packs
+        .iter()
+        .filter_map(|p| pack_chunks.get(p))
+        .map(|c| c.len())
+        .sum();
+    drop(pack_chunks);
 
     // Combined skip set: sampled_out + server-verified packs.
     let mut combined_skip = sampled_out;
@@ -208,13 +213,6 @@ pub fn run_with_progress(
         },
         &mut progress,
     )?;
-
-    // Compute server-verified chunk count for existence counter.
-    let srv_chunks_existence: usize = verified_packs
-        .iter()
-        .filter_map(|p| pack_chunks.get(p))
-        .map(|c| c.len())
-        .sum();
 
     // Fold the server-verify contribution into the scan's projection.
     let mut result = CheckResult::from(scan);

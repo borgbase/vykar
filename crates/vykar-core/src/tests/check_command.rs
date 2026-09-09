@@ -76,6 +76,56 @@ fn check_verify_data_flag_controls_data_verification_counters() {
 }
 
 #[test]
+fn sampled_check_preserves_local_fallback_counters() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = tmp.path().join("repo");
+    let source_dir = tmp.path().join("source");
+    std::fs::create_dir_all(&source_dir).unwrap();
+    std::fs::write(source_dir.join("file.txt"), b"sampled-check").unwrap();
+
+    let mut config = init_repo(&repo_dir);
+    config.check.full_every = None;
+    backup_single_source(&config, &source_dir, "src", "sampled-check");
+    let repo = open_local_repo(&repo_dir);
+    let packs: std::collections::HashSet<_> = repo
+        .chunk_index()
+        .iter()
+        .map(|(_, entry)| entry.pack_id)
+        .collect();
+    assert!(
+        packs.len() > 1,
+        "need data and tree packs to exercise sampling"
+    );
+
+    for distrust_server in [false, true] {
+        for verify_data in [false, true] {
+            let result = commands::check::run_with_progress(
+                &config,
+                None,
+                verify_data,
+                distrust_server,
+                None,
+                50,
+                false,
+            )
+            .unwrap();
+            assert!(result.errors.is_empty());
+            assert_eq!(result.snapshots_checked, 1);
+            assert_eq!(result.packs_existence_checked, packs.len().div_ceil(2));
+            assert!(result.chunks_existence_checked > 0);
+            assert_eq!(
+                result.chunks_data_verified,
+                if verify_data {
+                    result.chunks_existence_checked
+                } else {
+                    0
+                }
+            );
+        }
+    }
+}
+
+#[test]
 fn check_reports_missing_pack_file_in_storage() {
     let tmp = tempfile::tempdir().unwrap();
     let repo_dir = tmp.path().join("repo");

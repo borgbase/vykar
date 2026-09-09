@@ -74,6 +74,9 @@ impl Repository {
         repo_config_opts: Option<&RepositoryConfig>,
         cache_dir: Option<PathBuf>,
     ) -> Result<Self> {
+        // Library callers can bypass YAML validation. Reject unsupported
+        // parameters before writing a new repository's immutable config.
+        chunker_params.validate_even_sizes()?;
         let storage: Arc<dyn StorageBackend> = Arc::from(storage);
 
         // Check that the repo doesn't already exist

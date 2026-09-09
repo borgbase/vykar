@@ -344,6 +344,23 @@ pub(crate) fn parse_cron(
 }
 
 impl ChunkerConfig {
+    /// FastCDC 5 requires even parameters. This check does not normalize or
+    /// clamp values, so it is also safe to apply to persisted repository config.
+    pub(crate) fn validate_even_sizes(&self) -> vykar_types::error::Result<()> {
+        for (field, value) in [
+            ("min_size", self.min_size),
+            ("avg_size", self.avg_size),
+            ("max_size", self.max_size),
+        ] {
+            if value % 2 != 0 {
+                return Err(vykar_types::error::VykarError::Config(format!(
+                    "chunker.{field} must be even, got {value}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Clamp `max_size` to `CHUNK_MAX_SIZE_HARD_CAP` with a warning if it
     /// was configured above the cap.
     pub fn validate(&mut self) -> vykar_types::error::Result<()> {
@@ -398,10 +415,7 @@ impl ChunkerConfig {
             )));
         }
 
-        // Odd sizes were accepted before the FastCDC 5 upgrade. The chunker
-        // retains FastCDC 4 for them, so existing configs remain usable.
-
-        Ok(())
+        self.validate_even_sizes()
     }
 }
 
@@ -675,10 +689,9 @@ mod tests {
         assert!(msg.contains("chunker.min_size"), "got: {msg}");
     }
 
-    /// Existing configs may use odd parameters. Preserve them exactly; the
-    /// chunker selects the legacy implementation rather than rounding.
+    /// Reject odd parameters rather than silently changing chunk boundaries.
     #[test]
-    fn chunker_validate_preserves_odd_sizes() {
+    fn chunker_validate_rejects_odd_sizes() {
         for (min, avg, max) in [
             (512 * 1024 + 1, 2 * 1024 * 1024, 8 * 1024 * 1024),
             (512 * 1024, 2 * 1024 * 1024 + 1, 8 * 1024 * 1024),
@@ -689,9 +702,8 @@ mod tests {
                 avg_size: avg,
                 max_size: max,
             };
-            config
-                .validate()
-                .expect("legacy parameters must remain valid");
+            let error = config.validate().unwrap_err();
+            assert!(error.to_string().contains("must be even"));
             assert_eq!(
                 (config.min_size, config.avg_size, config.max_size),
                 (min, avg, max)

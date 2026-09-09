@@ -111,16 +111,17 @@ fn yaml_errors_do_not_print_neighboring_secrets() {
 }
 
 #[test]
-fn config_load_preserves_legacy_odd_chunker_parameters() {
+fn config_load_rejects_odd_chunker_parameters() {
     let dir = tempfile::tempdir().unwrap();
     let config = dir.path().join("vykar.yaml");
     std::fs::write(&config,
         "sources: [/tmp/source]\nrepositories: [{url: /tmp/repo}]\nchunker: {min_size: 257, avg_size: 1025, max_size: 4095}\n"
     ).unwrap();
-    let repos = vykar_core::config::load_and_resolve(&config).unwrap();
-    let chunker = &repos.first().unwrap().config.chunker;
-    assert_eq!(
-        (chunker.min_size, chunker.avg_size, chunker.max_size),
-        (257, 1025, 4095)
+    let error = vykar_core::config::load_and_resolve(&config)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("chunker.min_size must be even, got 257"),
+        "{error}"
     );
 }

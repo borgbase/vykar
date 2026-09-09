@@ -173,6 +173,127 @@ fn snapshot_list_survives_reopen() {
 }
 
 #[test]
+fn init_rejects_odd_chunker_parameters_without_writing_config() {
+    for (min_size, avg_size, max_size) in [(257, 1024, 4096), (256, 1025, 4096), (256, 1024, 4095)]
+    {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = make_test_config(tmp.path());
+        config.chunker = ChunkerConfig {
+            min_size,
+            avg_size,
+            max_size,
+        };
+        let error = commands::init::run(&config, None).err().unwrap();
+        assert!(error.to_string().contains("must be even"), "{error}");
+        assert!(!tmp.path().join("config").exists());
+    }
+}
+
+#[test]
+fn backup_rejects_stored_odd_chunker_parameters_but_restore_still_works() {
+    for (field, chunker) in [
+        (
+            "min_size",
+            ChunkerConfig {
+                min_size: 257,
+                avg_size: 1024,
+                max_size: 4096,
+            },
+        ),
+        (
+            "avg_size",
+            ChunkerConfig {
+                min_size: 256,
+                avg_size: 1025,
+                max_size: 4096,
+            },
+        ),
+        (
+            "max_size",
+            ChunkerConfig {
+                min_size: 256,
+                avg_size: 1024,
+                max_size: 4095,
+            },
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_dir = tmp.path().join("repo");
+        let source_dir = tmp.path().join("source");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let payload = b"existing snapshot remains readable";
+        std::fs::write(source_dir.join("file.txt"), payload).unwrap();
+        let mut config = make_test_config(&repo_dir);
+        commands::init::run(&config, None).unwrap();
+        backup_source(&config, &source_dir, "source", "before", None, false);
+
+        // Simulate parameters written by an older binary in a temporary repo.
+        // The application config deliberately keeps even defaults, proving
+        // that backup checks persisted values rather than just YAML values.
+        let config_path = repo_dir.join("config");
+        let mut stored: vykar_core::repo::RepoConfig =
+            rmp_serde::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+        stored.chunker_params = chunker;
+        let config_bytes = rmp_serde::to_vec(&stored).unwrap();
+        std::fs::write(&config_path, &config_bytes).unwrap();
+
+        let source_paths = vec![source_dir.to_string_lossy().into_owned()];
+        for threads in [1, 2] {
+            config.limits.threads = threads;
+            let error = commands::backup::run(
+                &config,
+                commands::backup::BackupRequest {
+                    snapshot_name: "rejected",
+                    passphrase: None,
+                    source_paths: &source_paths,
+                    source_label: "source",
+                    exclude_patterns: &[],
+                    exclude_if_present: &[],
+                    one_file_system: true,
+                    git_ignore: false,
+                    xattrs_enabled: false,
+                    compression: Compression::None,
+                    command_dumps: &[],
+                    verbose: false,
+                },
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                error.contains(&format!("chunker.{field} must be even")),
+                "{error}"
+            );
+            assert!(error.contains("stored repository"), "{error}");
+            assert_eq!(std::fs::read(&config_path).unwrap(), config_bytes);
+            assert_eq!(
+                std::fs::read_dir(repo_dir.join("sessions"))
+                    .unwrap()
+                    .count(),
+                0,
+                "rejected backup must deregister its session"
+            );
+        }
+
+        let repo = open_local_repo_cached(&repo_dir, None);
+        assert_eq!(repo.manifest().snapshots.len(), 1);
+        assert_eq!(repo.manifest().snapshots[0].name, "before");
+        drop(repo);
+        let dest = tmp.path().join("restored");
+        commands::restore::run(
+            &config,
+            None,
+            "before",
+            dest.to_str().unwrap(),
+            None,
+            false,
+            true,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(dest.join("file.txt")).unwrap(), payload);
+    }
+}
+
+#[test]
 fn init_auto_mode_persists_concrete_encryption_mode() {
     let tmp = tempfile::tempdir().unwrap();
     let repo_dir = tmp.path().join("repo");

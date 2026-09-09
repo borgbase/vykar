@@ -395,6 +395,14 @@ chunker:
 | `avg_size` | 2 MiB (2097152) | integer (bytes) | Average chunk size |
 | `max_size` | 8 MiB (8388608) | integer (bytes, hard cap: 16 MiB) | Maximum chunk size. Clamped to 16 MiB if set higher |
 
+All three sizes must be even. The defaults above have always met this requirement.
+Chunker parameters are stored when a repository is initialized; changing YAML does
+not change an existing repository's parameters. Repositories created with odd
+parameters can still be listed and restored, but new backups are rejected. Use a
+new repository with even parameters for future backups. If your YAML still has
+odd chunker overrides, remove that block to use the defaults and access existing
+snapshots.
+
 ## Exclude Patterns
 
 Vykar uses [gitignore-style](https://git-scm.com/docs/gitignore#_pattern_format) patterns for file exclusion. Patterns can be set globally (`exclude_patterns`) or per-source (`exclude`); both lists are merged at runtime.

@@ -35,10 +35,10 @@ hex.workspace = true
 
 # Compression
 lz4_flex = "0.14"
-zstd = "0.13"
+zstd = "0.14"
 
 # Chunking
-fastcdc = "4.0.1"
+fastcdc = "5.0.0"
 
 # Filesystem
 dunce = { workspace = true }
@@ -54,7 +54,7 @@ croner.workspace = true
 memmap2 = "0.9"
 
 # Probabilistic filter
-xorf = "0.12"
+xorf = "0.13"
 
 # Small-vec optimization
 smallvec = "1"

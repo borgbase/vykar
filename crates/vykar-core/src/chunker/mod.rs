@@ -35,6 +35,16 @@ pub fn chunk_stream<R: Read>(source: R, config: &ChunkerConfig) -> StreamCDC<R> 
 /// The cut points are unchanged: the reduced maximum is still at least the
 /// reader's limit (unless the original maximum was smaller), and the minimum
 /// and average, which determine the cut masks, stay the same.
+///
+/// The derived maximum is rounded *up* to an even value. fastcdc 5 requires
+/// even size parameters, and this one is derived from a reader limit — a file
+/// or segment length — which is odd about half the time. The assertions are
+/// `debug_assert!`, so an odd value would not panic in a release build; it
+/// would chunk with unintended masks instead. Rounding up rather than down is
+/// what keeps the cut points identical: rounding a limit of 1025 down to 1024
+/// would force a cut the unbounded chunker does not make. It cannot exceed
+/// `config.max_size` either, because `ChunkerConfig::validate` rejects odd
+/// sizes, so an odd derived value is always strictly below that even cap.
 pub(crate) fn chunk_stream_bounded<R: Read>(
     source: Take<R>,
     config: &ChunkerConfig,
@@ -44,6 +54,7 @@ pub(crate) fn chunk_stream_bounded<R: Read>(
         .max(u64::from(config.avg_size))
         .max(fastcdc::v2020::MAXIMUM_MIN as u64)
         .min(u64::from(config.max_size)) as usize;
+    let max_size = max_size.next_multiple_of(2);
     StreamCDC::new(
         source,
         config.min_size as usize,

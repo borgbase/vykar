@@ -414,6 +414,16 @@ pub(crate) fn chunk_id_to_u64(id: &ChunkId) -> u64 {
 
 /// Build an Xor8 filter from pre-computed u64 keys.
 /// Returns `None` if the slice is empty or construction fails.
+///
+/// The `catch_unwind` is still warranted after xorf 0.13. `Xor8::from` keeps a
+/// `debug_assert!` that every key is distinct, and these keys are 64-bit
+/// truncations of chunk IDs, so two distinct chunks can collide. 0.13's
+/// construction fix was to BinaryFuse segment-length boundaries, which this
+/// code does not use. It only catches in debug builds — the release profile
+/// sets `panic = "abort"` and compiles the assertion out anyway — but a
+/// missing filter is harmless either way: it is a probabilistic pre-filter, so
+/// falling back to `None` re-checks chunks against the index rather than
+/// losing data.
 pub(crate) fn build_xor_filter_from_keys(keys: &[u64]) -> Option<Xor8> {
     if keys.is_empty() {
         return None;

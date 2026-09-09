@@ -15,25 +15,17 @@ fn repo_root() -> PathBuf {
         .join("..")
 }
 
+/// Loads the file exactly as shipped, with no environment prepared. Users copy
+/// it verbatim, so that is the property worth testing.
+///
+/// This also guards a trap the file documents but once fell into itself: env
+/// expansion rewrites the whole file, comments included, and there is no escape
+/// syntax, so a literal `${VAR}` in a commented-out example makes the config
+/// fail to load whenever that variable is unset.
 #[test]
 fn shipped_example_config_parses() {
-    let source = repo_root().join("vykar.example.yaml");
-    assert!(source.is_file(), "missing {}", source.display());
-    let body = std::fs::read_to_string(&source).unwrap();
-
-    // The example carries `${DB_USER}`-style placeholders inside commented-out
-    // blocks. Env expansion runs before YAML parsing, so those are still
-    // expanded and the file does not load with them unset. Supply them via an
-    // `env_file` overlay so this test covers what it means to — that the
-    // example's actual YAML parses and resolves.
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join(".env"),
-        "DB_USER=u\nDB_PASSWORD=p\nDB_DATABASE=d\n",
-    )
-    .unwrap();
-    let path = dir.path().join("vykar.yaml");
-    std::fs::write(&path, format!("env_file: .env\n{body}")).unwrap();
+    let path = repo_root().join("vykar.example.yaml");
+    assert!(path.is_file(), "missing {}", path.display());
 
     let repos = vykar_core::config::load_and_resolve(&path)
         .unwrap_or_else(|e| panic!("vykar.example.yaml failed to parse: {e}"));

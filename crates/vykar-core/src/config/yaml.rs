@@ -20,5 +20,8 @@ pub(crate) fn from_str<T: DeserializeOwned>(input: &str) -> Result<T, serde_saph
     let mut options = serde_saphyr::Options::default();
     // Only `true`/`false` are booleans — see the module comment.
     options.strict_booleans = true;
+    // Both parsing passes can contain secrets, including expanded env-file
+    // values. Source snippets would print neighboring credentials on errors.
+    options.with_snippet = false;
     serde_saphyr::from_str_with_options(input, options)
 }

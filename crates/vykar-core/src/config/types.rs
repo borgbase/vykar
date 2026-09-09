@@ -398,24 +398,8 @@ impl ChunkerConfig {
             )));
         }
 
-        // fastcdc 5 requires even size parameters. Its checks are
-        // `debug_assert!`, so an odd value would not panic in a release build —
-        // it would chunk with unintended masks, changing chunk identity and
-        // silently breaking dedup against the existing repository. Reject
-        // rather than round: rounding would chunk with parameters the user did
-        // not configure, which is the same silent-divergence problem.
-        for (field, value) in [
-            ("min_size", self.min_size),
-            ("avg_size", self.avg_size),
-            ("max_size", self.max_size),
-        ] {
-            if value % 2 != 0 {
-                return Err(VykarError::Config(format!(
-                    "chunker.{field} must be even, got {value}; \
-                     FastCDC requires even size parameters"
-                )));
-            }
-        }
+        // Odd sizes were accepted before the FastCDC 5 upgrade. The chunker
+        // retains FastCDC 4 for them, so existing configs remain usable.
 
         Ok(())
     }
@@ -691,11 +675,10 @@ mod tests {
         assert!(msg.contains("chunker.min_size"), "got: {msg}");
     }
 
-    /// FastCDC's own even-size checks are `debug_assert!`, so an odd value
-    /// would sail through a release build and chunk with unintended masks,
-    /// silently breaking dedup against the existing repository.
+    /// Existing configs may use odd parameters. Preserve them exactly; the
+    /// chunker selects the legacy implementation rather than rounding.
     #[test]
-    fn chunker_validate_rejects_odd_sizes() {
+    fn chunker_validate_preserves_odd_sizes() {
         for (min, avg, max) in [
             (512 * 1024 + 1, 2 * 1024 * 1024, 8 * 1024 * 1024),
             (512 * 1024, 2 * 1024 * 1024 + 1, 8 * 1024 * 1024),
@@ -706,12 +689,12 @@ mod tests {
                 avg_size: avg,
                 max_size: max,
             };
-            let err = config
+            config
                 .validate()
-                .expect_err("odd chunker size must be rejected");
-            assert!(
-                err.to_string().contains("must be even"),
-                "error should name the evenness requirement, got: {err}"
+                .expect("legacy parameters must remain valid");
+            assert_eq!(
+                (config.min_size, config.avg_size, config.max_size),
+                (min, avg, max)
             );
         }
     }

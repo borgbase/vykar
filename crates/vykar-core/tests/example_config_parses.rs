@@ -70,3 +70,57 @@ repositories:
         "`no`/`off` must stay strings, not become booleans"
     );
 }
+
+#[test]
+fn yaml_errors_do_not_print_neighboring_secrets() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("vykar.yaml");
+    let secret = "SYNTHETIC_SECRET_FOR_YAML_REGRESSION";
+    std::fs::write(
+        dir.path().join(".env"),
+        format!("VYKAR_YAML_REVIEW_SECRET={secret}\n"),
+    )
+    .unwrap();
+
+    for (secret_value, invalid_setting) in [
+        // Syntax error in the first pass, next to a literal secret.
+        (secret, "s3_soft_delete: ["),
+        // Type and unknown-field errors after environment expansion.
+        ("${VYKAR_YAML_REVIEW_SECRET}", "s3_soft_delete: typo"),
+        ("${VYKAR_YAML_REVIEW_SECRET}", "unknown_setting: true"),
+    ] {
+        std::fs::write(&config, format!(
+            "env_file: .env\nsources: [/tmp/source]\nrepositories:\n  - url: /tmp/repo\n    secret_access_key: {secret_value}\n    {invalid_setting}\n"
+        )).unwrap();
+        let error = vykar_core::config::load_and_resolve(&config)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            !error.contains(secret),
+            "error leaked a credential: {error}"
+        );
+        assert!(
+            error.contains(config.to_str().unwrap()),
+            "missing config path: {error}"
+        );
+        assert!(
+            error.contains("line") && error.contains("column"),
+            "missing error location: {error}"
+        );
+    }
+}
+
+#[test]
+fn config_load_preserves_legacy_odd_chunker_parameters() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("vykar.yaml");
+    std::fs::write(&config,
+        "sources: [/tmp/source]\nrepositories: [{url: /tmp/repo}]\nchunker: {min_size: 257, avg_size: 1025, max_size: 4095}\n"
+    ).unwrap();
+    let repos = vykar_core::config::load_and_resolve(&config).unwrap();
+    let chunker = &repos.first().unwrap().config.chunker;
+    assert_eq!(
+        (chunker.min_size, chunker.avg_size, chunker.max_size),
+        (257, 1025, 4095)
+    );
+}

@@ -39,6 +39,8 @@ zstd = "0.14"
 
 # Chunking
 fastcdc = "5.0.0"
+# Preserve chunk boundaries for existing repositories with odd size parameters.
+fastcdc-legacy = { package = "fastcdc", version = "=4.0.1" }
 
 # Filesystem
 dunce = { workspace = true }

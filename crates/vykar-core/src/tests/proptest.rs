@@ -317,10 +317,9 @@ mod chunker {
     /// Generate valid ChunkerConfig values that respect fastcdc's hard bounds:
     /// MINIMUM_MIN=64, AVERAGE_MIN=256, MAXIMUM_MIN=1024.
     ///
-    /// All three sizes are generated as halves and doubled, so they are always
-    /// even. fastcdc 5 requires even size parameters and `ChunkerConfig::validate`
-    /// enforces it, so an odd value is not a valid config to generate. Every
-    /// bound below is itself even, so doubling a half stays inside the range.
+    /// Exercise even and legacy odd average/maximum sizes. Keep the minimum
+    /// even because FastCDC 4's paired scan can cut one byte below an odd
+    /// minimum; exact compatibility for odd minima is tested separately.
     fn arb_chunker_config() -> impl Strategy<Value = ChunkerConfig> {
         // min_size: even values 64–2048
         (32..=1024u32)
@@ -328,18 +327,17 @@ mod chunker {
                 let min_size = half_min * 2; // 64–2048, always even
                 let avg_lo = 256u32.max(min_size * 2);
                 let avg_hi = min_size * 8;
-                (Just(min_size), avg_lo / 2..=avg_hi / 2)
+                (Just(min_size), avg_lo..=avg_hi)
             })
-            .prop_flat_map(|(min_size, half_avg)| {
-                let avg_size = half_avg * 2;
+            .prop_flat_map(|(min_size, avg_size)| {
                 let max_lo = 1024u32.max(avg_size * 2);
                 let max_hi = avg_size * 4;
-                (Just(min_size), Just(avg_size), max_lo / 2..=max_hi / 2)
+                (Just(min_size), Just(avg_size), max_lo..=max_hi)
             })
-            .prop_map(|(min_size, avg_size, half_max)| ChunkerConfig {
+            .prop_map(|(min_size, avg_size, max_size)| ChunkerConfig {
                 min_size,
                 avg_size,
-                max_size: half_max * 2,
+                max_size,
             })
     }
 

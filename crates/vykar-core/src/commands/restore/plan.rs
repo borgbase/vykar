@@ -42,9 +42,9 @@ pub(super) struct RepInfo {
 /// one content); a mismatch — produced by inode-number reuse during the walk —
 /// is materialized independently from its own chunks, never silently replaced
 /// by the representative's content.
-/// Deliberately BLAKE2b for every repository format, including v3. This hashes a
-/// list of chunk IDs rather than content — a few hundred bytes at most — so
-/// the BLAKE3 speedup would be noise.
+/// Deliberately BLAKE2b for every repository format, including v3: the
+/// fingerprint is runtime-only and never persisted, so it is not part of any
+/// repository format.
 pub(super) fn chunks_fingerprint(chunks: &[ChunkRef]) -> [u8; 32] {
     use blake2::digest::{Update, VariableOutput};
     use blake2::Blake2bVar;

@@ -157,5 +157,5 @@ curl http://localhost:8585/health
 Returns JSON like:
 
 ```json
-{"status":"ok","version":"0.1.0"}
+{"status":"ok","version":"0.20.0","protocol_version":2,"hashes":["blake2b","blake3"]}
 ```

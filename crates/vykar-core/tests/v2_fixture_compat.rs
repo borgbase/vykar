@@ -28,7 +28,8 @@ use vykar_core::repo::{identity, EncryptionMode, OpenOptions, Repository};
 use vykar_storage::local_backend::LocalBackend;
 use vykar_types::error::VykarError;
 
-use crate::common::{backup_source, make_test_config};
+use crate::common::{backup_source, exercise_pack_naming, make_test_config};
+use vykar_types::hash::HashAlgorithm;
 
 /// One fixture per encryption mode.
 const MODES: &[&str] = &["none", "aes256gcm", "chacha20poly1305"];
@@ -267,6 +268,22 @@ fn v2_fixtures_accept_a_new_backup_and_still_dedup() {
             after - before < before,
             "{mode}: chunk index nearly doubled ({before} -> {after}) — the \
              new backup re-stored content instead of deduplicating"
+        );
+    }
+}
+
+/// Packs written into a v2 repository today — by backup and by repack — must
+/// still be named by BLAKE2b, or a v2-era binary could not locate them.
+#[test]
+fn v2_fixtures_name_new_packs_by_blake2b() {
+    for mode in MODES {
+        let fx = extract(mode);
+        let config = fx.config();
+        exercise_pack_naming(
+            &config,
+            fx.passphrase(),
+            &fx.source_dir(),
+            HashAlgorithm::Blake2b,
         );
     }
 }

@@ -692,10 +692,9 @@ const FULL_ENTRY_SIZE: usize = 80;
 /// entry, verified in `open_path` to detect silent corruption of the plaintext
 /// cache before it is promoted to the authoritative remote index.
 ///
-/// Deliberately BLAKE2b for every repository format, including v3: the
-/// trailer's format is frozen, and this is local cache validation rather than
-/// repository content. If this ever needs accelerating, a byte-compatible
-/// SIMD BLAKE2b is the independent change to make — not BLAKE3.
+/// Deliberately BLAKE2b for every repository format, including v3: this is
+/// local cache validation rather than repository content, and the cache is
+/// versioned by `FULL_VERSION` independently of the repository format.
 const FULL_CHECKSUM_SIZE: usize = 32;
 
 const FULL_SPEC: CacheSpec = CacheSpec {

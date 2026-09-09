@@ -241,12 +241,17 @@ fn cli_init_backup_list_restore_info_roundtrip() {
     assert!(info_out.contains("Snapshots"));
     assert!(info_out.contains("Encryption"));
     // Users hold a mix of v2 and v3 repositories; `info` has to say which.
+    let has_row = |label: &str, value: &str| {
+        info_out
+            .lines()
+            .any(|l| l.contains(label) && l.contains(value))
+    };
     assert!(
-        info_out.contains("Format") && info_out.contains("v3"),
+        has_row("Format", "v3"),
         "expected a Format row reading v3, got:\n{info_out}"
     );
     assert!(
-        info_out.contains("Hash") && info_out.contains("blake3"),
+        has_row("Hash", "blake3"),
         "expected a Hash row reading blake3, got:\n{info_out}"
     );
 }

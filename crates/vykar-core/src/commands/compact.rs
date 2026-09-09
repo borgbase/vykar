@@ -551,8 +551,9 @@ fn try_server_side_repack(
     let mut batch_err: Option<VykarError> = None;
 
     'batches: for batch in chunk_repack_operations(operations) {
-        // The constructor derives `protocol_version` from the algorithm, so a
-        // BLAKE3 plan cannot reach an old server claiming to be protocol 1.
+        // The constructor derives `protocol_version` from the algorithm, so an
+        // old server rejects a BLAKE3 plan outright instead of verifying the
+        // packs under the wrong algorithm.
         let plan = RepackPlanRequest::new(batch, repo.content_hash());
         let response = match repo.storage.server_repack(&plan) {
             Ok(resp) => resp,

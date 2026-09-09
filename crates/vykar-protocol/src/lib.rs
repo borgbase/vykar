@@ -127,9 +127,9 @@ pub fn check_protocol_version(version: u32) -> Result<(), String> {
 /// The unauthenticated `GET /health` response.
 ///
 /// `protocol_version` and `hashes` are additive: a pre-BLAKE3 server omits
-/// both, which the client reads as "protocol 1, blake2b only". That is what
-/// makes the `init` pre-flight probe able to tell an old server from a new one
-/// without a separate endpoint.
+/// both, so the client sees `protocol_version` 0 and an empty `hashes` list,
+/// i.e. "blake2b only". That is what makes the `init` pre-flight probe able to
+/// tell an old server from a new one without a separate endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerCapabilities {
     pub status: String,

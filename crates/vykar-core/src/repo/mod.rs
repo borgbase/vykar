@@ -10,9 +10,8 @@ pub(crate) mod write_session;
 mod chunks;
 mod commit;
 mod open;
-
 #[cfg(test)]
-pub(crate) use open::PLAINTEXT_CHUNK_ID_KEY_CONTEXT;
+pub(crate) use open::derive_plaintext_chunk_id_key;
 mod read;
 mod session;
 
@@ -453,17 +452,5 @@ mod format_tests {
         assert_eq!(RepoFormat::V2.chunk_hash(), HashAlgorithm::Blake2b);
         assert_eq!(RepoFormat::V3.chunk_hash(), HashAlgorithm::Blake3);
         assert_eq!(RepoFormat::CURRENT, RepoFormat::V3);
-    }
-
-    /// Pins the format-v3 plaintext chunk-ID key derivation. This value *is*
-    /// the dedup identity of every unencrypted v3 repository, so changing it
-    /// silently invalidates their indexes.
-    #[test]
-    fn plaintext_key_derivation_known_answer() {
-        let derived = blake3::derive_key(PLAINTEXT_CHUNK_ID_KEY_CONTEXT, &[0x11u8; 32]);
-        assert_eq!(
-            hex::encode(derived),
-            "947392f5ba41ab94ef39cc84b74bbb5a0c578bf7841b6b6cf76b17ad4a9e5b67"
-        );
     }
 }

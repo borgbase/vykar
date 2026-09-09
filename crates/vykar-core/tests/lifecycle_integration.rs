@@ -13,7 +13,10 @@ use vykar_core::repo::{EncryptionMode, OpenOptions, Repository};
 use vykar_storage::local_backend::LocalBackend;
 use vykar_types::error::VykarError;
 
-use crate::common::{backup_source, make_test_config, open_local_repo, source_entry};
+use crate::common::{
+    backup_source, exercise_pack_naming, make_test_config, open_local_repo, source_entry,
+};
+use vykar_types::hash::HashAlgorithm;
 
 #[test]
 fn lifecycle_delete_compact_check_and_restore() {
@@ -78,6 +81,7 @@ fn lifecycle_delete_compact_check_and_restore() {
             .collect::<Vec<_>>()
     );
 
+    // `verify_chunks` so the restore re-hashes every chunk under BLAKE3.
     let restore_dir = tmp.path().join("restore");
     let extract_stats = commands::restore::run(
         &config,
@@ -86,7 +90,7 @@ fn lifecycle_delete_compact_check_and_restore() {
         restore_dir.to_str().unwrap(),
         None,
         config.xattrs.enabled,
-        false,
+        true,
     )
     .unwrap();
     assert_eq!(extract_stats.files, 2);
@@ -285,6 +289,36 @@ fn run_encrypted_lifecycle(mode: EncryptionModeConfig, expected_mode: Encryption
 
     let wrong_check = commands::check::run(&config, Some(wrong_passphrase), true, false);
     assert!(matches!(wrong_check, Err(VykarError::DecryptionFailed)));
+}
+
+/// Packs written into a v3 repository — by backup and by repack — are named
+/// by their BLAKE3 digest.
+#[test]
+fn v3_pack_names_survive_backup_and_compaction() {
+    for (mode, passphrase) in [
+        (EncryptionModeConfig::None, None),
+        (
+            EncryptionModeConfig::Aes256Gcm,
+            Some("pack-naming-passphrase"),
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_dir = tmp.path().join("repo");
+        let source_dir = tmp.path().join("source");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        std::fs::create_dir_all(&source_dir).unwrap();
+
+        let mut config = make_test_config(&repo_dir);
+        config.encryption.mode = mode;
+        config.chunker = ChunkerConfig {
+            min_size: 8 * 1024,
+            avg_size: 16 * 1024,
+            max_size: 64 * 1024,
+        };
+        commands::init::run(&config, passphrase).unwrap();
+
+        exercise_pack_naming(&config, passphrase, &source_dir, HashAlgorithm::Blake3);
+    }
 }
 
 #[test]

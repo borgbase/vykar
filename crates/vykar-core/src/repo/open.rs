@@ -29,7 +29,7 @@ use vykar_types::error::{Result, VykarError};
 /// its own flag bits, so this key lives in a different domain from the chunk
 /// digests (keyed mode) and the pack digests (unkeyed mode) instead of sharing
 /// one with `blake3::hash`.
-pub(crate) const PLAINTEXT_CHUNK_ID_KEY_CONTEXT: &str =
+const PLAINTEXT_CHUNK_ID_KEY_CONTEXT: &str =
     "vykar 2026-01-01 plaintext repository chunk-id key v1";
 
 /// Derive the deterministic chunk-ID key for a plaintext repository.
@@ -42,7 +42,7 @@ pub(crate) const PLAINTEXT_CHUNK_ID_KEY_CONTEXT: &str =
 /// `config`. It exists so plaintext repositories use the same keyed hashing
 /// path as encrypted ones, which buys corruption detection, not tamper
 /// resistance.
-fn derive_plaintext_chunk_id_key(repo_id: &[u8], format: RepoFormat) -> [u8; 32] {
+pub(crate) fn derive_plaintext_chunk_id_key(repo_id: &[u8], format: RepoFormat) -> [u8; 32] {
     match format {
         // Frozen: RustCrypto `Blake2bVar`, exactly as v2 repositories were
         // written. Do not "modernise" this to blake2b_simd without checking
@@ -393,5 +393,27 @@ impl Repository {
             write_session: None,
             lock_fence: None,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pins the plaintext chunk-ID key derivation for both formats, through
+    /// the production helper. This value *is* the dedup identity of every
+    /// unencrypted repository, so changing either digest silently invalidates
+    /// their indexes. Do not regenerate.
+    #[test]
+    fn plaintext_key_derivation_known_answers() {
+        let repo_id = [0x11u8; 32];
+        assert_eq!(
+            hex::encode(derive_plaintext_chunk_id_key(&repo_id, RepoFormat::V2)),
+            "d4ffaeeac45aa41825e0bc3f875570af061acbf0b950ad752ff0f9463fe13ad5"
+        );
+        assert_eq!(
+            hex::encode(derive_plaintext_chunk_id_key(&repo_id, RepoFormat::V3)),
+            "947392f5ba41ab94ef39cc84b74bbb5a0c578bf7841b6b6cf76b17ad4a9e5b67"
+        );
     }
 }

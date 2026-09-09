@@ -135,7 +135,7 @@ It also sends the content-digest header on `PUT` requests — bound once to the 
 {"status":"ok","version":"0.20.0","protocol_version":2,"hashes":["blake2b","blake3"]}
 ```
 
-`protocol_version` and `hashes` are additive; a pre-BLAKE3 server omits both, which a client reads as "protocol 1, blake2b only". `vykar init` probes this **before writing anything**, because `init` writes only non-pack keys that an old server happily accepts — without the probe, `init` would succeed and only the first `backup` would fail. Requests that declare `"hash": "blake3"` must also declare `protocol_version: 2`, so an old server rejects them outright rather than silently verifying every pack under the wrong algorithm.
+`protocol_version` and `hashes` are additive; a pre-BLAKE3 server omits both, which a client reads as "blake2b only". `vykar init` probes this **before writing anything**, because `init` writes only non-pack keys that an old server happily accepts — without the probe, `init` would succeed and only the first `backup` would fail. Requests that declare `"hash": "blake3"` must also declare `protocol_version: 2`, so an old server rejects them outright rather than silently verifying every pack under the wrong algorithm.
 
 Client config:
 

@@ -167,7 +167,7 @@ pub async fn put_object(
         (None, Some(hex_str)) => Some((HashAlgorithm::Blake3, hex_str)),
         (None, None) if is_pack => {
             return Err(ServerError::BadRequest(
-                "X-Content-BLAKE2b header required for pack uploads".into(),
+                "X-Content-BLAKE2b or X-Content-BLAKE3 header required for pack uploads".into(),
             ));
         }
         (None, None) => None,
@@ -996,7 +996,7 @@ mod tests {
         let body_raw = body_bytes(resp).await;
         let body_text = String::from_utf8_lossy(&body_raw);
         assert!(
-            body_text.contains("X-Content-BLAKE2b header required"),
+            body_text.contains("X-Content-BLAKE2b or X-Content-BLAKE3 header required"),
             "got: {body_text}"
         );
     }

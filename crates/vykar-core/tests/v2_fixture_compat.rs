@@ -26,7 +26,6 @@ use vykar_core::config::{EncryptionModeConfig, VykarConfig};
 use vykar_core::repo::file_cache::FileCache;
 use vykar_core::repo::{identity, EncryptionMode, OpenOptions, Repository};
 use vykar_storage::local_backend::LocalBackend;
-use vykar_types::error::VykarError;
 
 use crate::common::{backup_source, exercise_pack_naming, make_test_config};
 use vykar_types::hash::HashAlgorithm;
@@ -361,38 +360,41 @@ fn v2_encrypted_fixtures_reject_a_wrong_passphrase() {
         let config = fx.config();
         let wrong = Some("definitely-not-the-fixture-passphrase");
 
+        // A frozen v2 fixture predates key redundancy, so it carries a single
+        // copy: the diagnosis says so rather than claiming corroboration.
         let storage = Box::new(LocalBackend::new(fx.repo_dir().to_str().unwrap()).unwrap());
+        let err = Repository::open(storage, wrong, None, OpenOptions::new())
+            .err()
+            .unwrap_or_else(|| panic!("{mode}: opening with a wrong passphrase must fail"));
+        let msg = err.to_string();
         assert!(
-            matches!(
-                Repository::open(storage, wrong, None, OpenOptions::new()),
-                Err(VykarError::DecryptionFailed)
-            ),
-            "{mode}: opening with a wrong passphrase must fail"
+            msg.contains("wrong passphrase, or the stored key is damaged"),
+            "{mode}: unexpected wrong-passphrase message: {msg}"
         );
 
+        let err = commands::restore::run(
+            &config,
+            wrong,
+            fx.latest_snapshot(),
+            fx.root.join("bad-restore").to_str().unwrap(),
+            None,
+            config.xattrs.enabled,
+            false,
+            None,
+        )
+        .err()
+        .unwrap_or_else(|| panic!("{mode}: restoring with a wrong passphrase must fail"));
         assert!(
-            matches!(
-                commands::restore::run(
-                    &config,
-                    wrong,
-                    fx.latest_snapshot(),
-                    fx.root.join("bad-restore").to_str().unwrap(),
-                    None,
-                    config.xattrs.enabled,
-                    false,
-                    None,
-                ),
-                Err(VykarError::DecryptionFailed)
-            ),
-            "{mode}: restoring with a wrong passphrase must fail"
+            err.to_string().contains("wrong passphrase"),
+            "{mode}: unexpected restore message: {err}"
         );
 
+        let err = commands::check::run(&config, wrong, true, false)
+            .err()
+            .unwrap_or_else(|| panic!("{mode}: check with a wrong passphrase must fail"));
         assert!(
-            matches!(
-                commands::check::run(&config, wrong, true, false),
-                Err(VykarError::DecryptionFailed)
-            ),
-            "{mode}: check with a wrong passphrase must fail"
+            err.to_string().contains("wrong passphrase"),
+            "{mode}: unexpected check message: {err}"
         );
     }
 }

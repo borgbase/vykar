@@ -56,10 +56,10 @@ pub(crate) type FoundRepo<'a> = (&'a ResolvedRepo, Option<zeroize::Zeroizing<Str
 /// Run `f` with a resolved passphrase, caching it **only on success**.
 ///
 /// A cached (already-validated) passphrase is used directly. Otherwise the
-/// passphrase is resolved and `f` runs; if `f` returns
-/// [`VykarError::DecryptionFailed`] and the passphrase came from the
-/// interactive dialog, the cache stays clean and the user is re-prompted (up to
-/// `attempts` total). A wrong *configured* passphrase fails immediately. If the
+/// passphrase is resolved and `f` runs; if `f` fails in a way a wrong
+/// passphrase could explain (see [`VykarError::is_passphrase_failure`]) and the
+/// passphrase came from the interactive dialog, the cache stays clean and the
+/// user is re-prompted (up to `attempts` total). A wrong *configured* passphrase fails immediately. If the
 /// user dismisses the prompt for an encrypted repo, returns
 /// [`PassphraseRun::Canceled`].
 pub(crate) fn with_passphrase_retry<T>(
@@ -102,7 +102,7 @@ fn with_passphrase_retry_inner<T>(
     // cache is self-healing rather than permanently poisoned.
     if let Some(cached) = cache.get(key) {
         match f(Some(cached.as_str())) {
-            Err(VykarError::DecryptionFailed) => {
+            Err(ref e) if e.is_passphrase_failure() => {
                 cache.remove(key);
             }
             other => return other.map(PassphraseRun::Ran),
@@ -111,6 +111,7 @@ fn with_passphrase_retry_inner<T>(
 
     let attempts = attempts.max(1);
     let mut error_line = String::new();
+    let mut last_failure: Option<VykarError> = None;
     for attempt in 0..attempts {
         let (pass, from_dialog) = resolve(&error_line)?;
 
@@ -126,15 +127,18 @@ fn with_passphrase_retry_inner<T>(
                 }
                 return Ok(PassphraseRun::Ran(v));
             }
-            Err(VykarError::DecryptionFailed) if from_dialog && attempt + 1 < attempts => {
+            Err(e) if e.is_passphrase_failure() && from_dialog && attempt + 1 < attempts => {
                 error_line = "Incorrect passphrase. Please try again.".to_string();
+                last_failure = Some(e);
             }
             Err(e) => return Err(e),
         }
     }
 
-    // Attempts exhausted after repeated wrong dialog entries.
-    Err(VykarError::DecryptionFailed)
+    // Attempts exhausted after repeated wrong dialog entries. Return the last
+    // real failure so its diagnosis (which key copies were consulted, whether
+    // they corroborated each other) is not flattened away.
+    Err(last_failure.unwrap_or(VykarError::DecryptionFailed))
 }
 
 pub(crate) fn select_repos<'a>(
@@ -284,6 +288,189 @@ mod tests {
         assert!(matches!(result, Err(VykarError::DecryptionFailed)));
         assert_eq!(calls.get(), 1, "configured passphrase is tried once");
         assert!(cache.is_empty(), "failed passphrase must not be cached");
+    }
+
+    /// Regression guard for the retry loop's coupling to the error *type*.
+    ///
+    /// Driven by a real `Repository::open` against a real encrypted
+    /// repository, because the failure this must catch was introduced by
+    /// changing which variant that open returns — a hand-written
+    /// `Err(DecryptionFailed)` stub would have kept passing throughout.
+    fn open_with(repo_dir: &std::path::Path) -> impl FnMut(Option<&str>) -> Result<(), VykarError> {
+        let repo_dir = repo_dir.to_path_buf();
+        move |pass: Option<&str>| {
+            let storage = Box::new(
+                vykar_storage::local_backend::LocalBackend::new(
+                    repo_dir.to_str().expect("temp path is UTF-8"),
+                )
+                .map_err(|e| VykarError::Other(e.to_string()))?,
+            );
+            vykar_core::repo::Repository::open(
+                storage,
+                pass,
+                None,
+                vykar_core::repo::OpenOptions::new(),
+            )
+            .map(|_| ())
+        }
+    }
+
+    /// Build an encrypted repository whose passphrase is `pass`.
+    fn encrypted_repo(tmp: &tempfile::TempDir, pass: &str) -> std::path::PathBuf {
+        let repo_dir = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo_dir).expect("create repo dir");
+        let storage = Box::new(
+            vykar_storage::local_backend::LocalBackend::new(
+                repo_dir.to_str().expect("temp path is UTF-8"),
+            )
+            .expect("local backend"),
+        );
+        vykar_core::repo::Repository::init(
+            storage,
+            vykar_core::repo::EncryptionMode::Aes256Gcm,
+            vykar_core::config::ChunkerConfig::default(),
+            Some(pass),
+            None,
+            None,
+        )
+        .expect("init encrypted repo");
+        repo_dir
+    }
+
+    #[test]
+    fn a_real_wrong_passphrase_open_still_re_prompts() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo_dir = encrypted_repo(&tmp, "right-passphrase");
+
+        let mut cache = HashMap::new();
+        let calls = std::cell::Cell::new(0);
+        let responses = [
+            (Some("wrong-passphrase"), true),
+            (Some("right-passphrase"), true),
+        ];
+        let result = with_passphrase_retry_inner(
+            KEY,
+            true,
+            &mut cache,
+            3,
+            scripted_resolver(&responses, &calls),
+            open_with(&repo_dir),
+        );
+
+        assert!(
+            matches!(result, Ok(PassphraseRun::Ran(()))),
+            "unexpected outcome"
+        );
+        assert_eq!(calls.get(), 2, "a typo must trigger exactly one re-prompt");
+        assert_eq!(cache.get(KEY).map(|z| z.as_str()), Some("right-passphrase"));
+    }
+
+    #[test]
+    fn a_real_wrong_passphrase_open_evicts_a_stale_cached_entry() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo_dir = encrypted_repo(&tmp, "right-passphrase");
+
+        let mut cache = HashMap::new();
+        cache.insert(
+            KEY.to_string(),
+            zeroize::Zeroizing::new("stale-passphrase".to_string()),
+        );
+
+        let calls = std::cell::Cell::new(0);
+        let responses = [(Some("right-passphrase"), true)];
+        let result = with_passphrase_retry_inner(
+            KEY,
+            true,
+            &mut cache,
+            3,
+            scripted_resolver(&responses, &calls),
+            open_with(&repo_dir),
+        );
+
+        assert!(
+            matches!(result, Ok(PassphraseRun::Ran(()))),
+            "unexpected outcome"
+        );
+        assert_eq!(
+            cache.get(KEY).map(|z| z.as_str()),
+            Some("right-passphrase"),
+            "the stale entry must be evicted and replaced, not kept"
+        );
+    }
+
+    /// A failure a wrong passphrase *cannot* explain must not burn retries.
+    ///
+    /// The two copies are corrupted **differently** on purpose: identical bytes
+    /// take the matched-copies path, so a same-bytes fixture would never reach
+    /// the divergent branch where the classification is easiest to get wrong.
+    #[test]
+    fn a_corrupt_key_is_not_treated_as_a_passphrase_problem() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo_dir = encrypted_repo(&tmp, "right-passphrase");
+        let keys = repo_dir.join("keys");
+        std::fs::write(keys.join("repokey"), b"not msgpack at all").expect("corrupt primary");
+        let mut mangled = vykar_crypto::key::inspect_key_blob(
+            &std::fs::read(keys.join("repokey.2")).expect("read secondary"),
+        )
+        .expect("the secondary starts out well-formed");
+        mangled.nonce = vec![0u8; 8];
+        std::fs::write(
+            keys.join("repokey.2"),
+            rmp_serde::to_vec(&mangled).expect("re-encode"),
+        )
+        .expect("corrupt secondary");
+
+        let mut cache = HashMap::new();
+        let calls = std::cell::Cell::new(0);
+        let responses = [(Some("right-passphrase"), true), (Some("again"), true)];
+        let result = with_passphrase_retry_inner(
+            KEY,
+            true,
+            &mut cache,
+            3,
+            scripted_resolver(&responses, &calls),
+            open_with(&repo_dir),
+        );
+
+        let err = result.err().expect("a corrupt key must fail the open");
+        assert!(!err.is_passphrase_failure(), "{err}");
+        assert_eq!(calls.get(), 1, "proven corruption must not re-prompt");
+    }
+
+    /// Argon2 parameters inside every ceiling but below Argon2's own
+    /// `memory >= 8 * parallelism` floor cannot derive a key. That is
+    /// corruption, and must not cost the operator a re-prompt.
+    #[test]
+    fn impossible_argon2_params_are_not_treated_as_a_passphrase_problem() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo_dir = encrypted_repo(&tmp, "right-passphrase");
+        let keys = repo_dir.join("keys");
+        let mut mangled = vykar_crypto::key::inspect_key_blob(
+            &std::fs::read(keys.join("repokey")).expect("read primary"),
+        )
+        .expect("the primary starts out well-formed");
+        mangled.kdf.memory_cost = 1;
+        mangled.kdf.parallelism = 16;
+        let bytes = rmp_serde::to_vec(&mangled).expect("re-encode");
+        for name in ["repokey", "repokey.2"] {
+            std::fs::write(keys.join(name), &bytes).expect("write mangled copy");
+        }
+
+        let mut cache = HashMap::new();
+        let calls = std::cell::Cell::new(0);
+        let responses = [(Some("right-passphrase"), true), (Some("again"), true)];
+        let result = with_passphrase_retry_inner(
+            KEY,
+            true,
+            &mut cache,
+            3,
+            scripted_resolver(&responses, &calls),
+            open_with(&repo_dir),
+        );
+
+        let err = result.err().expect("an underivable key must fail the open");
+        assert!(!err.is_passphrase_failure(), "{err}");
+        assert_eq!(calls.get(), 1, "proven corruption must not re-prompt");
     }
 
     #[test]

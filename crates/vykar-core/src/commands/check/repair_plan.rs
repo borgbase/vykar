@@ -27,6 +27,20 @@ pub(super) fn build_repair_plan(
     let mut actions: Vec<RepairAction> = Vec::new();
     let mut has_data_loss = false;
 
+    // Repository key copies first. Restoring one is pure gain — `check` runs
+    // only after `Repository::open` succeeded, so a key was established and
+    // `key_source` names the stored copy that carries it. Repair therefore
+    // never picks between two candidate keys on a guess; the unresolvable case
+    // fails at open and never reaches a plan.
+    if let Some(ref from) = scan.key_source {
+        for to in &scan.key_copies_to_restore {
+            actions.push(RepairAction::RestoreKeyCopy {
+                from: from.clone(),
+                to: to.clone(),
+            });
+        }
+    }
+
     // ------------------------------------------------------------------
     // Pre-pass: emit InvalidSnapshotKey actions and collect ids of
     // snapshots that *must* be removed wholesale.
@@ -479,6 +493,8 @@ mod tests {
             snapshot_per_item_chunks: HashMap::new(),
             snapshot_item_counts: HashMap::new(),
             item_impacts: Vec::new(),
+            key_source: None,
+            key_copies_to_restore: Vec::new(),
         };
         let pack_chunks: HashMap<PackId, Vec<(ChunkId, ChunkIndexEntry)>> = HashMap::new();
         let mut name_to_id: HashMap<String, SnapshotId> = HashMap::new();
@@ -525,6 +541,8 @@ mod tests {
             snapshot_per_item_chunks: HashMap::new(),
             snapshot_item_counts: HashMap::new(),
             item_impacts: Vec::new(),
+            key_source: None,
+            key_copies_to_restore: Vec::new(),
         };
         let pack_chunks: HashMap<PackId, Vec<(ChunkId, ChunkIndexEntry)>> = HashMap::new();
         let mut name_to_id: HashMap<String, SnapshotId> = HashMap::new();

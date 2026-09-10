@@ -17,6 +17,7 @@ vykar-types.workspace = true
 aes-gcm = "0.11"
 chacha20poly1305 = "0.11"
 argon2 = "0.6"
+subtle = "2"
 rand.workspace = true
 zeroize.workspace = true
 

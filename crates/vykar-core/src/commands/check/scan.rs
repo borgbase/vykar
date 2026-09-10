@@ -53,6 +53,8 @@ pub(super) struct ScanOptions<'a> {
 #[derive(Debug, Default)]
 pub(super) struct ScanCounters {
     pub(super) snapshots_checked: usize,
+    /// `None` for unencrypted repositories, which have no key file.
+    pub(super) key_files_checked: Option<usize>,
     pub(super) items_checked: usize,
     pub(super) chunks_existence_checked: usize,
     pub(super) packs_existence_checked: usize,
@@ -85,6 +87,137 @@ pub(super) struct ScanResult {
     /// Items whose chunks reference a pack confirmed missing in Phase 2.
     /// Empty when no missing packs were detected.
     pub(super) item_impacts: Vec<ItemImpact>,
+    /// The key copy that still holds the bytes which unwrapped at open, and
+    /// the copies that need rewriting from it. Both empty on a healthy
+    /// repository, and `key_source` is `None` when no stored copy matches —
+    /// in which case nothing is repaired, because there is no copy on storage
+    /// to repair *from*.
+    pub(super) key_source: Option<String>,
+    pub(super) key_copies_to_restore: Vec<String>,
+}
+
+/// Outcome of the repository-key phase.
+#[derive(Default)]
+struct KeyScan {
+    /// `None` when the repository is unencrypted.
+    checked: Option<usize>,
+    issues: Vec<IntegrityIssue>,
+    /// The stored copy still holding the bytes that unwrapped at open.
+    source: Option<String>,
+    /// Copies that should be rewritten from `source`. Always empty when
+    /// `source` is `None` — there would be nothing on storage to copy from.
+    to_restore: Vec<String>,
+}
+
+/// What one key copy looks like on this pass.
+enum KeyCopyFinding {
+    /// Byte-identical to the copy that unwrapped at open.
+    Intact,
+    Absent,
+    /// I/O failure — not proven corruption, so never queued for a rewrite.
+    Unreadable(String),
+    /// Present but undecodable.
+    Corrupt(String),
+    /// Present and well-formed, but not the bytes this repository opened with.
+    Foreign,
+}
+
+/// Phase K: re-read both repository key copies and compare them against each
+/// other and against the bytes that unwrapped at open.
+///
+/// **Byte comparison rather than a second unwrap, deliberately.** Unwrapping
+/// again costs another Argon2id derivation (t=3, m=64 MiB, p=4) on every
+/// `check`, and would need the passphrase threaded all the way into the scan.
+/// The blob already unwrapped at open, so comparing bytes proves the stored
+/// objects are still intact at neither cost.
+fn scan_key_copies(repo: &Repository) -> KeyScan {
+    // Unencrypted repositories have no key file at all.
+    let Some(winner) = repo.key_blob() else {
+        return KeyScan::default();
+    };
+
+    let mut checked = 0usize;
+    let mut findings: Vec<(String, KeyCopyFinding)> = Vec::new();
+
+    for storage_key in [crate::repo::KEY_PRIMARY, crate::repo::KEY_SECONDARY] {
+        let finding = match repo.storage.get(storage_key) {
+            Ok(None) => KeyCopyFinding::Absent,
+            Err(e) => KeyCopyFinding::Unreadable(e.to_string()),
+            Ok(Some(bytes)) => {
+                checked += 1;
+                // Screen every fresh read for unambiguous damage — including
+                // the copy that matches, so a defect is never inferred from
+                // the byte comparison alone.
+                match vykar_crypto::key::inspect_key_blob(&bytes) {
+                    Err(defect) => KeyCopyFinding::Corrupt(defect.to_string()),
+                    Ok(_) if bytes == winner => KeyCopyFinding::Intact,
+                    Ok(_) => KeyCopyFinding::Foreign,
+                }
+            }
+        };
+        findings.push((storage_key.to_string(), finding));
+    }
+
+    let source = findings
+        .iter()
+        .find(|(_, f)| matches!(f, KeyCopyFinding::Intact))
+        .map(|(key, _)| key.clone());
+
+    let mut scan = KeyScan {
+        checked: Some(checked),
+        source: source.clone(),
+        ..KeyScan::default()
+    };
+
+    // A copy is queued for rewriting only while some stored copy still holds
+    // the key: with `source == None` there is nothing on storage to repair
+    // *from*, so damage is reported and both copies are left alone.
+    let queue = |scan: &mut KeyScan, storage_key: String| {
+        if source.is_some() {
+            scan.to_restore.push(storage_key);
+        }
+    };
+
+    for (storage_key, finding) in findings {
+        match finding {
+            KeyCopyFinding::Intact => {}
+            KeyCopyFinding::Absent => {
+                scan.issues.push(IntegrityIssue::MissingKeyCopy {
+                    storage_key: storage_key.clone(),
+                });
+                queue(&mut scan, storage_key);
+            }
+            // Not proven corruption, so never rewritten — the object may be
+            // intact and merely unreachable.
+            KeyCopyFinding::Unreadable(detail) => {
+                scan.issues.push(IntegrityIssue::UnreadableKeyCopy {
+                    storage_key,
+                    detail,
+                });
+            }
+            KeyCopyFinding::Corrupt(detail) => {
+                scan.issues.push(IntegrityIssue::CorruptKeyCopy {
+                    storage_key: storage_key.clone(),
+                    detail,
+                });
+                queue(&mut scan, storage_key);
+            }
+            KeyCopyFinding::Foreign => match source {
+                Some(ref good) => {
+                    scan.issues.push(IntegrityIssue::DivergentKeyCopies {
+                        good_key: good.clone(),
+                        bad_key: storage_key.clone(),
+                    });
+                    queue(&mut scan, storage_key);
+                }
+                None => scan.issues.push(IntegrityIssue::CorruptKeyCopy {
+                    storage_key,
+                    detail: "changed since the repository was opened".into(),
+                }),
+            },
+        }
+    }
+    scan
 }
 
 /// Map a `SnapshotMeta` decode failure to an integrity issue.
@@ -148,6 +281,13 @@ pub(super) fn integrity_scan(
         .map(|u| !u.is_local())
         .unwrap_or(false);
     let concurrency = config.limits.listing_concurrency(is_remote);
+
+    // Phase K: repository key copies. Runs before the snapshot passes so a
+    // damaged key file is the first thing reported, and so a healthy run says
+    // out loud that the key was verified.
+    let key_scan = scan_key_copies(repo);
+    counters.key_files_checked = key_scan.checked;
+    issues.extend(key_scan.issues);
 
     // Phase 0: Raw storage scan for corrupted/invalid snapshots not in manifest.
     if opts.detect_orphans {
@@ -562,6 +702,8 @@ pub(super) fn integrity_scan(
         snapshot_per_item_chunks,
         snapshot_item_counts,
         item_impacts,
+        key_source: key_scan.source,
+        key_copies_to_restore: key_scan.to_restore,
     })
 }
 

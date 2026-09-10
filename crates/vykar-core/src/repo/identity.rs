@@ -5,7 +5,14 @@ use blake2::{Blake2b256, Digest};
 use serde::{Deserialize, Serialize};
 
 use vykar_common::paths;
+use vykar_crypto::key::MasterKey;
+use vykar_storage::StorageBackend;
 use vykar_types::error::{Result, VykarError};
+use vykar_types::snapshot_id::SnapshotId;
+
+use super::format::{unpack_object_expect_with_context, ObjectType};
+use super::key::build_engine;
+use super::{RepoConfig, RepoFormat, INDEX_OBJECT_CONTEXT};
 
 /// Pin file format (one per repository URL).
 #[derive(Debug, Serialize, Deserialize)]
@@ -46,6 +53,165 @@ fn pin_file_path(url: &str, cache_dir: Option<&Path>) -> Option<PathBuf> {
         hasher.update(url.as_bytes());
         b.join(format!("pin.{}", hex::encode(hasher.finalize())))
     })
+}
+
+/// Read the pinned fingerprint for `url` without creating one.
+///
+/// The read-only counterpart to [`verify_or_pin`], which must **not** be used
+/// where a key is merely being *evaluated*: it pins on first use, so calling it
+/// with an unproven candidate would turn a key that is about to be rejected
+/// into this client's trusted identity.
+///
+/// Returns `Ok(None)` when no pin exists or the cache directory is
+/// unavailable; a pin file that exists but cannot be read or parsed is an
+/// error, so a tampered pin fails closed rather than reading as "no pin".
+pub fn pinned_fingerprint(url: &str, cache_dir: Option<&Path>) -> Result<Option<String>> {
+    let Some(path) = pin_file_path(url, cache_dir) else {
+        return Ok(None);
+    };
+    match std::fs::read_to_string(&path) {
+        Ok(contents) => {
+            let pin: PinFile = serde_json::from_str(&contents).map_err(|e| {
+                VykarError::Other(format!(
+                    "corrupt identity pin file at {}: {e}",
+                    path.display()
+                ))
+            })?;
+            Ok(Some(pin.fingerprint))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(VykarError::Other(format!(
+            "could not read identity pin file at {}: {e}. \
+             Fix the file permissions or remove the pin file to re-establish trust.",
+            path.display()
+        ))),
+    }
+}
+
+/// Evidence that a candidate master key is *this* repository's real key.
+///
+/// Unwrapping a key blob proves only that the passphrase matches that blob. It
+/// says nothing about which repository the recovered key belongs to: the
+/// wrapped payload carries no repository identifier, so a key from a different
+/// repository that happens to share the passphrase unwraps perfectly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyProof {
+    /// No pin, and the candidate decrypted repository-authored ciphertext.
+    /// Conclusive.
+    AuthenticatedData,
+    /// The candidate's fingerprint matches this client's existing TOFU pin.
+    /// Conclusive for this client; repository data is not consulted.
+    PinMatch,
+    /// The candidate's fingerprint contradicts an existing pin. Disproof.
+    Mismatch,
+    /// No pin, and no repository object was decryptable. Not proof.
+    Unproven,
+}
+
+impl KeyProof {
+    /// Whether this is positive proof the candidate is the repository's key.
+    pub fn is_established(self) -> bool {
+        matches!(self, Self::AuthenticatedData | Self::PinMatch)
+    }
+}
+
+/// How many `snapshots/` blobs to try before giving up on data proof.
+///
+/// Only reached when `index` is missing or undecryptable, and a genuine key
+/// succeeds on the first blob it touches — the bound exists so a wrong key
+/// against a repository with thousands of snapshots does not turn into
+/// thousands of round trips.
+const MAX_SNAPSHOT_PROOF_ATTEMPTS: usize = 64;
+
+/// Weigh a candidate master key against evidence outside the key blob itself.
+///
+/// **The pin is decisive in both directions.** A contradiction is a hard
+/// disproof even when the candidate decrypts this repository's own
+/// ciphertext: that is precisely the case TOFU exists to catch — the
+/// repository at this URL is internally consistent but is not the one this
+/// client trusted, whether legitimately re-initialized or replaced wholesale
+/// by someone who controls the storage. Data proof establishes *that a key
+/// matches this repository's contents*; only the pin establishes *that these
+/// contents are the ones you trusted*. Conversely a matching pin is accepted
+/// without touching storage: it is the strongest evidence this client has,
+/// and the only evidence left when `index` is unreadable.
+///
+/// Only without a pin is repository data consulted — the `index` object that
+/// `init` writes even for an empty repository, then a bounded number of
+/// snapshot blobs.
+///
+/// `url` is optional because [`super::Repository::open`] does not always know
+/// it; without it the pin cannot be consulted and only data proof is available.
+/// Callers that *can* supply a URL must.
+///
+/// # Errors
+///
+/// Only a pin file that exists but cannot be read or parsed is an error;
+/// unreadable repository objects count as absent evidence.
+pub fn prove_key(
+    storage: &dyn StorageBackend,
+    repo_config: &RepoConfig,
+    format: RepoFormat,
+    url: Option<&str>,
+    cache_dir: Option<&Path>,
+    candidate: &MasterKey,
+) -> Result<KeyProof> {
+    let pinned = match url {
+        Some(url) => pinned_fingerprint(url, cache_dir)?,
+        None => None,
+    };
+    if let Some(pinned) = pinned {
+        let candidate_fp = hex::encode(compute_fingerprint(
+            &repo_config.id,
+            &candidate.chunk_id_key,
+        ));
+        return Ok(if pinned == candidate_fp {
+            KeyProof::PinMatch
+        } else {
+            KeyProof::Mismatch
+        });
+    }
+
+    let engine = build_engine(&repo_config.encryption, format, candidate)?;
+
+    if let Ok(Some(blob)) = storage.get("index") {
+        if unpack_object_expect_with_context(
+            &blob,
+            ObjectType::ChunkIndex,
+            INDEX_OBJECT_CONTEXT,
+            engine.as_ref(),
+        )
+        .is_ok()
+        {
+            return Ok(KeyProof::AuthenticatedData);
+        }
+    }
+
+    if let Ok(keys) = storage.list("snapshots/") {
+        for key in keys.iter().take(MAX_SNAPSHOT_PROOF_ATTEMPTS) {
+            let Some(id_hex) = key.strip_prefix("snapshots/") else {
+                continue;
+            };
+            let Ok(snapshot_id) = SnapshotId::from_hex(id_hex) else {
+                continue;
+            };
+            let Ok(Some(blob)) = storage.get(key) else {
+                continue;
+            };
+            if unpack_object_expect_with_context(
+                &blob,
+                ObjectType::SnapshotMeta,
+                snapshot_id.as_bytes(),
+                engine.as_ref(),
+            )
+            .is_ok()
+            {
+                return Ok(KeyProof::AuthenticatedData);
+            }
+        }
+    }
+
+    Ok(KeyProof::Unproven)
 }
 
 /// Verify the repository identity against a locally pinned fingerprint,

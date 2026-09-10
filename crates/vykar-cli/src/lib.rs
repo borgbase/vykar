@@ -263,6 +263,22 @@ fn dispatch_targeted(cli: &Cli, repos: &[&ResolvedRepo]) -> Option<ExitCode> {
         return None;
     }
 
+    // A key belongs to exactly one repository. `key export` across several
+    // would concatenate armor blocks (to stdout) or overwrite one file (with
+    // `-o`), and `key import` carries one repository's key. Refused here,
+    // before any repository is opened, so nothing is touched.
+    if let Some(cli::Commands::Key { command }) = cli.command.as_ref() {
+        let sub = match command {
+            cli::KeyCommand::Export { .. } => "export",
+            cli::KeyCommand::Import { .. } => "import",
+        };
+        eprintln!(
+            "Error: `key {sub}` requires -R / --repo when multiple repositories are \
+             configured — a key belongs to exactly one repository."
+        );
+        return Some(ExitCode::from(EXIT_ERROR));
+    }
+
     // Bulk snapshot delete requires -R when multiple repos are configured,
     // since the smart single-snapshot probe cannot handle multiple names.
     if let Some(cli::Commands::Snapshot {

@@ -518,6 +518,9 @@ pub fn run_with_progress(
             .with_index()
             .with_file_cache()
     };
+    let opts = opts
+        .with_repo_url(config.repository.url.clone())
+        .trust_repo(config.trust_repo);
     let open_result = Repository::open(backend, passphrase, cache_dir, opts);
     let mut repo = match open_result {
         Ok(r) => {

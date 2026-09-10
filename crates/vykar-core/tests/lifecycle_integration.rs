@@ -276,9 +276,19 @@ fn run_encrypted_lifecycle(mode: EncryptionModeConfig, expected_mode: Encryption
         payload
     );
 
+    // The headline diagnosis: two intact, byte-identical copies plus a failed
+    // unwrap is *weighted* evidence for a wrong passphrase, and the wording
+    // must stay hedged — see `key_copies` tests for the full guard.
     let storage = Box::new(LocalBackend::new(repo_dir.to_str().unwrap()).unwrap());
     let wrong_open = Repository::open(storage, Some(wrong_passphrase), None, OpenOptions::new());
-    assert!(matches!(wrong_open, Err(VykarError::DecryptionFailed)));
+    let msg = wrong_open
+        .err()
+        .expect("wrong passphrase must fail")
+        .to_string();
+    assert!(
+        msg.contains("likely incorrect passphrase; both key copies match"),
+        "unexpected wrong-passphrase message: {msg}"
+    );
 
     let wrong_extract = commands::restore::run(
         &config,
@@ -290,10 +300,18 @@ fn run_encrypted_lifecycle(mode: EncryptionModeConfig, expected_mode: Encryption
         false,
         None,
     );
-    assert!(matches!(wrong_extract, Err(VykarError::DecryptionFailed)));
+    let msg = wrong_extract.expect_err("restore must fail").to_string();
+    assert!(
+        msg.contains("likely incorrect passphrase"),
+        "unexpected restore message: {msg}"
+    );
 
     let wrong_check = commands::check::run(&config, Some(wrong_passphrase), true, false);
-    assert!(matches!(wrong_check, Err(VykarError::DecryptionFailed)));
+    let msg = wrong_check.expect_err("check must fail").to_string();
+    assert!(
+        msg.contains("likely incorrect passphrase"),
+        "unexpected check message: {msg}"
+    );
 }
 
 /// Packs written into a v3 repository — by backup and by repack — are named

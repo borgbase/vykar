@@ -211,6 +211,12 @@ pub(crate) enum Commands {
         repo: Option<String>,
     },
 
+    /// Export or restore the repository key
+    Key {
+        #[command(subcommand)]
+        command: KeyCommand,
+    },
+
     /// Generate a minimal configuration file
     Config {
         /// Destination path (skips interactive prompt)
@@ -288,6 +294,48 @@ pub(crate) enum SortField {
     Name,
     Size,
     Mtime,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum KeyCommand {
+    /// Print the repository key as an armored text block
+    ///
+    /// The key stays passphrase-protected — there is deliberately no way to
+    /// export the unwrapped master key. Store the output in the same
+    /// password-manager entry as the repository passphrase: both are required,
+    /// and neither can be recovered from the other.
+    Export {
+        /// Select repository by label or path
+        #[arg(short = 'R', long = "repo")]
+        repo: Option<String>,
+        /// Write to this file (mode 0600 on Unix) instead of stdout
+        #[arg(short = 'o', long)]
+        output: Option<String>,
+    },
+    /// Restore the repository key from a `vykar key export`
+    ///
+    /// Works on a repository that can no longer be opened, which is exactly
+    /// when it is needed.
+    Import {
+        /// Select repository by label or path
+        #[arg(short = 'R', long = "repo")]
+        repo: Option<String>,
+        /// Path to the export, or `-` to read stdin
+        file: String,
+        /// Import a key that could not be verified, and replace a copy that
+        /// holds a different key. Does **not** override a key the local
+        /// identity pin contradicts — use --trust-repo for that.
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+impl KeyCommand {
+    pub(crate) fn repo(&self) -> Option<&str> {
+        match self {
+            Self::Export { repo, .. } | Self::Import { repo, .. } => repo.as_deref(),
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -404,6 +452,7 @@ impl Commands {
             | Self::BreakLock { repo, .. }
             | Self::Compact { repo, .. } => repo.as_deref(),
             Self::Snapshot { command, .. } => command.repo(),
+            Self::Key { command, .. } => command.repo(),
             Self::Config { .. } | Self::Daemon { .. } => None,
         }
     }
@@ -443,6 +492,7 @@ impl Commands {
             Self::BreakLock { .. } => "break-lock",
             Self::Compact { .. } => "compact",
             Self::Snapshot { .. } => "snapshot",
+            Self::Key { .. } => "key",
             Self::Config { .. } => "config",
             Self::Daemon { .. } => "daemon",
         }

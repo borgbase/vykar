@@ -20,6 +20,8 @@ Below is a list of all available commands. Each command and subcommand provides 
 | `vykar daemon` | Run scheduled backup cycles in the foreground. See [Daemon Mode](daemon.md). |
 | `vykar check` | Verify repository integrity (`--verify-data` for full content verification) |
 | `vykar info` | Show repository statistics (snapshot counts and size totals) |
+| `vykar key export` | Print the passphrase-protected repository key as an armored text block for safekeeping |
+| `vykar key import` | Restore the repository key from an export — works on a repository that can no longer be opened |
 | `vykar compact` | Free space by repacking pack files after delete/prune |
 | `vykar mount` | Browse snapshots via a local read-only WebDAV server and built-in browser UI |
 

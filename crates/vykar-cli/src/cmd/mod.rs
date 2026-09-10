@@ -6,6 +6,7 @@ pub(crate) mod daemon;
 pub(crate) mod delete;
 pub(crate) mod info;
 pub(crate) mod init;
+pub(crate) mod key;
 pub(crate) mod list;
 pub(crate) mod mount;
 pub(crate) mod prune;

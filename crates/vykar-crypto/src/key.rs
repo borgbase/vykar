@@ -1,8 +1,11 @@
+use std::fmt;
+
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
 use argon2::Argon2;
 use rand::TryRng;
 use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use vykar_types::error::{Result, VykarError};
@@ -48,27 +51,115 @@ const MAX_MEMORY_KIB: u32 = 524_288; // 512 MiB
 const MIN_SALT_LEN: usize = 16;
 const MAX_SALT_LEN: usize = 64;
 
-/// Validate KDF parameters are within safe bounds.
-fn validate_kdf_params(kdf: &KdfParams) -> Result<()> {
-    if kdf.algorithm != "argon2id" {
-        return Err(VykarError::DecryptionFailed);
+/// Plausible length bounds for the wrapped-payload ciphertext.
+///
+/// `MasterKeyPayload` deliberately carries no `serde_bytes`, so its two
+/// 32-byte `Vec<u8>` fields serialize as msgpack *integer arrays*: one byte
+/// per value below 0x80, two bytes otherwise. The plaintext is a 1-byte array
+/// header plus two 3-byte array headers plus 64..=128 encoded bytes, i.e.
+/// 71..=135; GCM adds a 16-byte tag. An exact length check is therefore
+/// impossible — this loose range is the tightest screen available.
+const MIN_WRAPPED_PAYLOAD_LEN: usize = 71 + 16;
+const MAX_WRAPPED_PAYLOAD_LEN: usize = 135 + 16;
+
+/// An unambiguous defect in a stored key blob.
+///
+/// Every variant is detectable *without* the passphrase, which is the point:
+/// a blob that trips one of these is corrupt, and saying so beats blaming the
+/// operator's typing. A blob that passes all of them and still fails to
+/// unwrap is the genuinely ambiguous case — wrong passphrase, or damage inside
+/// the authenticated payload, which AEAD cannot tell apart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyBlobDefect {
+    /// msgpack framing damaged — the bytes are not an `EncryptedKey` at all.
+    Framing(String),
+    /// KDF parameters outside the accepted bounds.
+    KdfParams,
+    /// Nonce is not the 12 bytes AES-256-GCM requires.
+    NonceLength(usize),
+    /// Wrapped payload cannot hold a 64-byte master key at any encoding length.
+    PayloadLength(usize),
+}
+
+impl fmt::Display for KeyBlobDefect {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Framing(detail) => write!(f, "damaged msgpack framing ({detail})"),
+            Self::KdfParams => write!(f, "key-derivation parameters out of range"),
+            Self::NonceLength(len) => write!(f, "nonce is {len} bytes, expected 12"),
+            Self::PayloadLength(len) => write!(
+                f,
+                "wrapped key is {len} bytes, expected {MIN_WRAPPED_PAYLOAD_LEN}-{MAX_WRAPPED_PAYLOAD_LEN}"
+            ),
+        }
     }
-    if kdf.time_cost == 0 || kdf.time_cost > MAX_TIME_COST {
-        return Err(VykarError::DecryptionFailed);
+}
+
+/// Decode a stored key blob and screen it for unambiguous corruption.
+///
+/// This runs no key derivation and needs no passphrase, so it is cheap enough
+/// to apply to every copy on every open, and it works on legacy single-copy
+/// repositories where there is nothing to corroborate against.
+///
+/// # Errors
+///
+/// Returns the specific [`KeyBlobDefect`] found. A successful return means
+/// only that the blob is *well-formed* — it says nothing about whether it
+/// unwraps.
+pub fn inspect_key_blob(bytes: &[u8]) -> std::result::Result<EncryptedKey, KeyBlobDefect> {
+    let key: EncryptedKey =
+        rmp_serde::from_slice(bytes).map_err(|e| KeyBlobDefect::Framing(e.to_string()))?;
+    validate(&key)?;
+    Ok(key)
+}
+
+/// Every structural check a key blob must pass before key derivation is
+/// attempted. Shared by [`inspect_key_blob`] and [`MasterKey::from_encrypted`]
+/// so the two can never disagree about what counts as well-formed.
+fn validate(key: &EncryptedKey) -> std::result::Result<(), KeyBlobDefect> {
+    let kdf = &key.kdf;
+    // `Params::new` never sees the algorithm string, so it is checked here.
+    if kdf.algorithm != "argon2id"
+        || kdf.time_cost == 0
+        || kdf.time_cost > MAX_TIME_COST
+        || kdf.parallelism == 0
+        || kdf.parallelism > MAX_PARALLELISM
+        || kdf.memory_cost == 0
+        || kdf.memory_cost > MAX_MEMORY_KIB
+        || kdf.salt.len() < MIN_SALT_LEN
+        || kdf.salt.len() > MAX_SALT_LEN
+    {
+        return Err(KeyBlobDefect::KdfParams);
     }
-    if kdf.parallelism == 0 || kdf.parallelism > MAX_PARALLELISM {
-        return Err(VykarError::DecryptionFailed);
+    // Argon2's own invariants (notably `memory_cost >= 8 * parallelism`), so
+    // a blob that cannot be derived from is reported as corrupt here rather
+    // than surfacing as a derivation failure later.
+    if argon2::Params::new(kdf.memory_cost, kdf.time_cost, kdf.parallelism, Some(32)).is_err() {
+        return Err(KeyBlobDefect::KdfParams);
     }
-    if kdf.memory_cost == 0 || kdf.memory_cost > MAX_MEMORY_KIB {
-        return Err(VykarError::DecryptionFailed);
+    if key.nonce.len() != 12 {
+        return Err(KeyBlobDefect::NonceLength(key.nonce.len()));
     }
-    if kdf.salt.len() < MIN_SALT_LEN || kdf.salt.len() > MAX_SALT_LEN {
-        return Err(VykarError::DecryptionFailed);
+    let payload_len = key.encrypted_payload.len();
+    if !(MIN_WRAPPED_PAYLOAD_LEN..=MAX_WRAPPED_PAYLOAD_LEN).contains(&payload_len) {
+        return Err(KeyBlobDefect::PayloadLength(payload_len));
     }
     Ok(())
 }
 
 impl MasterKey {
+    /// Compare two master keys in constant time over
+    /// `encryption_key || chunk_id_key`.
+    ///
+    /// This is secret material, so no early-exit `memcmp`: the caller uses it
+    /// to decide whether two divergent key copies wrap the *same* key, and a
+    /// timing side channel there would leak the key a byte at a time.
+    pub fn ct_eq(&self, other: &Self) -> bool {
+        let a = self.encryption_key.ct_eq(&other.encryption_key);
+        let b = self.chunk_id_key.ct_eq(&other.chunk_id_key);
+        (a & b).into()
+    }
+
     /// Generate a new random master key using OS entropy.
     ///
     /// # Errors
@@ -161,13 +252,7 @@ impl MasterKey {
     pub fn from_encrypted<P: AsRef<[u8]>>(encrypted: &EncryptedKey, passphrase: P) -> Result<Self> {
         let passphrase = passphrase.as_ref();
 
-        // Validate nonce length before the fixed-size conversion below.
-        if encrypted.nonce.len() != 12 {
-            return Err(VykarError::DecryptionFailed);
-        }
-
-        // Validate KDF parameters are within safe bounds
-        validate_kdf_params(&encrypted.kdf)?;
+        validate(encrypted).map_err(|_| VykarError::DecryptionFailed)?;
 
         let wrapping_key = derive_key_from_passphrase(passphrase, &encrypted.kdf)?;
 
@@ -353,15 +438,16 @@ mod tests {
 
     #[test]
     fn test_kdf_memory_limit_boundary() {
-        let mut kdf = make_test_kdf();
-        kdf.memory_cost = MAX_MEMORY_KIB;
-        assert!(validate_kdf_params(&kdf).is_ok());
+        let mut key = EncryptedKey {
+            kdf: make_test_kdf(),
+            nonce: vec![0u8; 12],
+            encrypted_payload: vec![0u8; MIN_WRAPPED_PAYLOAD_LEN],
+        };
+        key.kdf.memory_cost = MAX_MEMORY_KIB;
+        assert!(validate(&key).is_ok());
 
-        kdf.memory_cost = MAX_MEMORY_KIB + 1;
-        assert!(matches!(
-            validate_kdf_params(&kdf),
-            Err(VykarError::DecryptionFailed)
-        ));
+        key.kdf.memory_cost = MAX_MEMORY_KIB + 1;
+        assert_eq!(validate(&key), Err(KeyBlobDefect::KdfParams));
     }
 
     #[test]
@@ -534,6 +620,148 @@ mod tests {
 
         assert_eq!(key.encryption_key, decrypted.encryption_key);
         assert_eq!(key.chunk_id_key, decrypted.chunk_id_key);
+    }
+
+    fn wrapped(passphrase: &str) -> Vec<u8> {
+        let key = MasterKey::generate().unwrap();
+        rmp_serde::to_vec(&key.to_encrypted(passphrase).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn inspect_accepts_a_freshly_wrapped_blob() {
+        let bytes = wrapped(TEST_PASSPHRASE);
+        assert!(inspect_key_blob(&bytes).is_ok());
+    }
+
+    /// The payload bounds are reasoned from the msgpack encoding rather than
+    /// measured, so pin them against the payload the writer actually
+    /// serializes. Exercised over the serialized plaintext plus the GCM tag
+    /// so the sweep costs no Argon2id derivations.
+    #[test]
+    fn wrapped_payload_length_stays_within_the_screened_range() {
+        const GCM_TAG_LEN: usize = 16;
+        // The extremes: every byte below 0x80 (1 byte each) and every byte at
+        // or above it (2 bytes each), plus a random draw in between.
+        let mut extremes = vec![
+            MasterKey {
+                encryption_key: [0x00; 32],
+                chunk_id_key: [0x7f; 32],
+            },
+            MasterKey {
+                encryption_key: [0x80; 32],
+                chunk_id_key: [0xff; 32],
+            },
+        ];
+        for _ in 0..32 {
+            extremes.push(MasterKey::generate().unwrap());
+        }
+
+        for key in &extremes {
+            let payload = MasterKeyPayload {
+                encryption_key: key.encryption_key.to_vec(),
+                chunk_id_key: key.chunk_id_key.to_vec(),
+            };
+            let len = rmp_serde::to_vec(&payload).unwrap().len() + GCM_TAG_LEN;
+            assert!(
+                (MIN_WRAPPED_PAYLOAD_LEN..=MAX_WRAPPED_PAYLOAD_LEN).contains(&len),
+                "wrapped payload of {len} bytes falls outside the screened range"
+            );
+        }
+    }
+
+    #[test]
+    fn inspect_reports_damaged_framing() {
+        let defect = inspect_key_blob(b"not msgpack at all").unwrap_err();
+        assert!(matches!(defect, KeyBlobDefect::Framing(_)), "{defect:?}");
+    }
+
+    #[test]
+    fn inspect_reports_bad_kdf_params() {
+        let key = MasterKey::generate().unwrap();
+        let encrypted = key.to_encrypted(TEST_PASSPHRASE).unwrap();
+
+        let mut over_ceiling = encrypted.clone();
+        over_ceiling.kdf.memory_cost = u32::MAX;
+
+        // Inside every ceiling, but below Argon2's own `m >= 8p` floor. Only
+        // `Params::new` catches this; the bounds checks alone let it through.
+        let mut too_little_memory = encrypted.clone();
+        too_little_memory.kdf.memory_cost = 1;
+        too_little_memory.kdf.parallelism = 16;
+
+        let mut wrong_algorithm = encrypted;
+        wrong_algorithm.kdf.algorithm = "scrypt".into();
+
+        for bad in [over_ceiling, too_little_memory, wrong_algorithm] {
+            let bytes = rmp_serde::to_vec(&bad).unwrap();
+            assert_eq!(
+                inspect_key_blob(&bytes).unwrap_err(),
+                KeyBlobDefect::KdfParams
+            );
+            // And the unwrap path agrees rather than reaching key derivation.
+            assert!(matches!(
+                MasterKey::from_encrypted(&bad, TEST_PASSPHRASE),
+                Err(VykarError::DecryptionFailed)
+            ));
+        }
+    }
+
+    #[test]
+    fn inspect_reports_short_nonce() {
+        let key = MasterKey::generate().unwrap();
+        let mut encrypted = key.to_encrypted(TEST_PASSPHRASE).unwrap();
+        encrypted.nonce = vec![0u8; 8];
+        let bytes = rmp_serde::to_vec(&encrypted).unwrap();
+        assert_eq!(
+            inspect_key_blob(&bytes).unwrap_err(),
+            KeyBlobDefect::NonceLength(8)
+        );
+    }
+
+    #[test]
+    fn inspect_reports_out_of_range_payload() {
+        let key = MasterKey::generate().unwrap();
+        let mut encrypted = key.to_encrypted(TEST_PASSPHRASE).unwrap();
+        encrypted.encrypted_payload.truncate(32);
+        let bytes = rmp_serde::to_vec(&encrypted).unwrap();
+        assert_eq!(
+            inspect_key_blob(&bytes).unwrap_err(),
+            KeyBlobDefect::PayloadLength(32)
+        );
+    }
+
+    /// A truncated payload that survives the length screen is exactly the
+    /// ambiguous case: `from_encrypted` must still fail closed.
+    #[test]
+    fn well_formed_but_tampered_payload_still_fails_to_unwrap() {
+        let key = MasterKey::generate().unwrap();
+        let mut encrypted = key.to_encrypted(TEST_PASSPHRASE).unwrap();
+        encrypted.encrypted_payload[0] ^= 0xff;
+        let bytes = rmp_serde::to_vec(&encrypted).unwrap();
+        assert!(inspect_key_blob(&bytes).is_ok(), "defect must be ambiguous");
+        assert!(matches!(
+            MasterKey::from_encrypted(&encrypted, TEST_PASSPHRASE),
+            Err(VykarError::DecryptionFailed)
+        ));
+    }
+
+    #[test]
+    fn ct_eq_matches_structural_equality() {
+        let a = MasterKey::generate().unwrap();
+        let b = MasterKey::generate().unwrap();
+        let a_again = MasterKey {
+            encryption_key: a.encryption_key,
+            chunk_id_key: a.chunk_id_key,
+        };
+        assert!(a.ct_eq(&a_again));
+        assert!(!a.ct_eq(&b));
+
+        // Differing in only one half must not compare equal.
+        let half = MasterKey {
+            encryption_key: a.encryption_key,
+            chunk_id_key: b.chunk_id_key,
+        };
+        assert!(!a.ct_eq(&half));
     }
 
     #[test]

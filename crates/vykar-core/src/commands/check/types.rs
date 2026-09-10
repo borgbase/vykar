@@ -15,6 +15,10 @@ pub struct CheckError {
 #[derive(Debug)]
 pub struct CheckResult {
     pub snapshots_checked: usize,
+    /// Repository key copies read back and compared. Reported even on a clean
+    /// run — a `check` that *says* the key was verified is most of the point.
+    /// `None` for unencrypted repositories, which have no key file.
+    pub key_files_checked: Option<usize>,
     pub items_checked: usize,
     pub chunks_existence_checked: usize,
     pub packs_existence_checked: usize,
@@ -102,6 +106,17 @@ pub enum IntegrityIssue {
         snapshot_name: Option<String>,
         detail: String,
     },
+    /// A key copy is present but undecodable, or has changed since open.
+    CorruptKeyCopy { storage_key: String, detail: String },
+    /// A key copy could not be read. Not proven corruption, so repair leaves
+    /// it alone.
+    UnreadableKeyCopy { storage_key: String, detail: String },
+    /// The copies disagree; `good_key` is this repository's key and
+    /// `bad_key` is not.
+    DivergentKeyCopies { good_key: String, bad_key: String },
+    /// Only one copy exists — a repository created before redundancy, or one
+    /// where the backfill has never been able to land.
+    MissingKeyCopy { storage_key: String },
     /// Snapshot item failed per-item invariant validation.
     InvalidItem {
         snapshot_id: SnapshotId,
@@ -215,6 +230,40 @@ impl IntegrityIssue {
                     message: format!("{detail} — left untouched"),
                 }
             }
+            IntegrityIssue::CorruptKeyCopy {
+                storage_key,
+                detail,
+            } => CheckError {
+                context: "repository key".into(),
+                message: format!(
+                    "{storage_key}: {detail} — run `vykar check --repair` to rewrite it \
+                     from the good copy"
+                ),
+            },
+            IntegrityIssue::UnreadableKeyCopy {
+                storage_key,
+                detail,
+            } => CheckError {
+                context: "repository key".into(),
+                message: format!(
+                    "{storage_key} could not be read ({detail}) — fix access to it; it is \
+                     not rewritten, since it may be intact"
+                ),
+            },
+            IntegrityIssue::DivergentKeyCopies { good_key, bad_key } => CheckError {
+                context: "repository key".into(),
+                message: format!(
+                    "{bad_key} disagrees with {good_key}, which holds this repository's key \
+                     — run `vykar check --repair` to rewrite it"
+                ),
+            },
+            IntegrityIssue::MissingKeyCopy { storage_key } => CheckError {
+                context: "repository key".into(),
+                message: format!(
+                    "{storage_key} is missing, so the repository key exists in only one copy \
+                     — run `vykar check --repair` to restore the redundant copy"
+                ),
+            },
             IntegrityIssue::InvalidItem {
                 snapshot_id,
                 snapshot_name,
@@ -316,6 +365,13 @@ pub enum RepairAction {
     RemoveDanglingSnapshot {
         snapshot_name: String,
         missing_chunks: usize,
+    },
+    /// Rewrite one key copy from the other. Never data-loss: `check` only runs
+    /// after `Repository::open` succeeded, so a key was established and `from`
+    /// is the copy that carries it.
+    RestoreKeyCopy {
+        from: String,
+        to: String,
     },
     /// Rewrite a snapshot under a new SnapshotId with the listed item ordinals
     /// dropped. Existing storage blob for `snapshot_id` is removed; the

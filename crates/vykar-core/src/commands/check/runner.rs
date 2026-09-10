@@ -54,6 +54,7 @@ impl From<ScanResult> for CheckResult {
         errors.extend(scan.item_impacts.iter().map(|i| i.to_check_error()));
         CheckResult {
             snapshots_checked: scan.counters.snapshots_checked,
+            key_files_checked: scan.counters.key_files_checked,
             items_checked: scan.counters.items_checked,
             chunks_existence_checked: scan.counters.chunks_existence_checked,
             packs_existence_checked: scan.counters.packs_existence_checked,
@@ -257,6 +258,7 @@ pub fn run_with_progress(
 fn skipped_result() -> CheckResult {
     CheckResult {
         snapshots_checked: 0,
+        key_files_checked: None,
         items_checked: 0,
         chunks_existence_checked: 0,
         packs_existence_checked: 0,
@@ -359,11 +361,14 @@ pub fn run_with_repair(
     };
 
     if mode == RepairMode::PlanOnly {
-        // PlanOnly: read session, no lock, purely read-only.
+        // PlanOnly: read session, no lock, purely read-only. `skip_key_backfill`
+        // is what keeps that promise: the dry run prints "no changes applied",
+        // and a key-copy backfill firing during the open underneath would make
+        // that statement false.
         let (mut repo, _session_guard) = crate::commands::util::open_repo_with_read_session(
             config,
             passphrase,
-            OpenOptions::new(),
+            OpenOptions::new().skip_key_backfill(),
         )?;
         repo.load_chunk_index_uncached()?;
         repo.refresh_snapshot_list()?;

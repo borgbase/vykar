@@ -86,6 +86,32 @@ impl CliFixture {
         (stdout(&output), stderr(&output))
     }
 
+    /// Like [`Self::run`], but with `VYKAR_PASSPHRASE` set for encrypted
+    /// repositories.
+    fn run_encrypted(&self, args: &[&str], passphrase: &str) -> Output {
+        let mut cmd = Command::new(vykar_binary_path());
+        cmd.args(args);
+        cmd.env("HOME", &self.home_dir);
+        cmd.env("XDG_CACHE_HOME", &self.cache_dir);
+        cmd.env("XDG_CONFIG_HOME", &self.config_home);
+        cmd.env("NO_COLOR", "1");
+        cmd.env("VYKAR_PASSPHRASE", passphrase);
+        cmd.output().unwrap()
+    }
+
+    fn run_encrypted_ok(&self, args: &[&str], passphrase: &str) -> Output {
+        let output = self.run_encrypted(args, passphrase);
+        if !output.status.success() {
+            panic!(
+                "command failed: {:?}\nstdout:\n{}\nstderr:\n{}",
+                args,
+                stdout(&output),
+                stderr(&output)
+            );
+        }
+        output
+    }
+
     fn run_with_stdin(&self, args: &[&str], stdin_data: &str) -> Output {
         use std::io::Write;
         use std::process::Stdio;
@@ -2046,5 +2072,666 @@ fn cli_multi_repo_init_not_skipped() {
     assert!(
         repo_b.join("config").exists(),
         "repo-b should be initialized"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `vykar key export` / `vykar key import`
+// ---------------------------------------------------------------------------
+
+const KEY_PASS: &str = "cli-key-command-passphrase";
+
+fn write_encrypted_config(config_path: &Path, repo_dir: &Path) {
+    let config = format!(
+        "repositories:\n  - url: {}\nencryption:\n  mode: aes256gcm\nsources: []\n",
+        yaml_quote_path(repo_dir)
+    );
+    std::fs::write(config_path, config).unwrap();
+}
+
+/// An initialized, encrypted repository plus its config path.
+fn encrypted_fixture() -> (CliFixture, String) {
+    let fx = CliFixture::new();
+    write_encrypted_config(&fx.config_path, &fx.repo_dir);
+    let cfg = fx.config_path.to_string_lossy().to_string();
+    fx.run_encrypted_ok(&["--config", &cfg, "init"], KEY_PASS);
+    (fx, cfg)
+}
+
+/// Every identity pin this fixture's client wrote. The cache root is
+/// platform-dependent, so look in both places.
+fn pin_paths(fx: &CliFixture) -> Vec<PathBuf> {
+    let candidates = [
+        fx.cache_dir.join("vykar"),
+        fx.home_dir.join("Library").join("Caches").join("vykar"),
+    ];
+    let mut out = Vec::new();
+    for dir in candidates {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if entry.file_name().to_string_lossy().starts_with("pin.") {
+                out.push(entry.path());
+            }
+        }
+    }
+    out
+}
+
+/// Decode the base64 body of an armored export back to the stored key blob.
+fn armor_body(armor: &str) -> Vec<u8> {
+    use base64::Engine;
+    let body: String = armor
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.starts_with("-----") && !l.starts_with("repository:") && !l.is_empty())
+        .collect();
+    base64::engine::general_purpose::STANDARD
+        .decode(body.as_bytes())
+        .unwrap()
+}
+
+/// Delete every identity pin this fixture's client wrote. The cache root is
+/// platform-dependent (`$XDG_CACHE_HOME/vykar` on Linux,
+/// `$HOME/Library/Caches/vykar` on macOS), so try both. Returns how many were
+/// removed.
+fn forget_pins(fx: &CliFixture) -> usize {
+    let candidates = [
+        fx.cache_dir.join("vykar"),
+        fx.home_dir.join("Library").join("Caches").join("vykar"),
+    ];
+    let mut removed = 0;
+    for dir in candidates {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if entry.file_name().to_string_lossy().starts_with("pin.") {
+                std::fs::remove_file(entry.path()).unwrap();
+                removed += 1;
+            }
+        }
+    }
+    removed
+}
+
+fn repo_id_hex(repo_dir: &Path) -> String {
+    let data = std::fs::read(repo_dir.join("config")).unwrap();
+    let config: vykar_core::repo::RepoConfig = rmp_serde::from_slice(&data).unwrap();
+    hex::encode(&config.id)
+}
+
+#[test]
+fn cli_key_export_writes_the_armor_to_stdout() {
+    let (fx, cfg) = encrypted_fixture();
+    let output = fx.run_encrypted_ok(&["--config", &cfg, "key", "export"], KEY_PASS);
+
+    // The armor is the *result*, so it must survive `2>/dev/null` — and it
+    // must be the only thing on stdout, so it can be piped straight into a
+    // password manager.
+    let out = stdout(&output);
+    assert!(
+        out.starts_with("-----BEGIN VYKAR REPOSITORY KEY-----\n"),
+        "{out}"
+    );
+    assert!(
+        out.ends_with("-----END VYKAR REPOSITORY KEY-----\n"),
+        "{out}"
+    );
+    assert!(
+        out.contains(&format!("repository: {}", repo_id_hex(&fx.repo_dir))),
+        "{out}"
+    );
+
+    // Status goes to stderr, and never the armor.
+    let err = stderr(&output);
+    assert!(err.contains("Verified"), "{err}");
+    assert!(!err.contains("BEGIN VYKAR REPOSITORY KEY"), "{err}");
+}
+
+#[test]
+fn cli_key_export_refuses_an_unencrypted_repository() {
+    let fx = CliFixture::new();
+    write_plain_config(&fx.config_path, &fx.repo_dir);
+    let cfg = fx.config_path.to_string_lossy().to_string();
+    fx.run_ok(&["--config", &cfg, "init"]);
+
+    let (_out, err) = fx.run_err(&["--config", &cfg, "key", "export"]);
+    assert!(err.contains("unencrypted"), "{err}");
+}
+
+#[test]
+fn cli_key_import_restores_a_repository_that_can_no_longer_be_opened() {
+    let (fx, cfg) = encrypted_fixture();
+    let export_path = fx.repo_dir.parent().unwrap().join("repokey.txt");
+    fx.run_encrypted_ok(
+        &[
+            "--config",
+            &cfg,
+            "key",
+            "export",
+            "-o",
+            export_path.to_str().unwrap(),
+        ],
+        KEY_PASS,
+    );
+
+    for name in ["repokey", "repokey.2"] {
+        std::fs::remove_file(fx.repo_dir.join("keys").join(name)).unwrap();
+    }
+    let opened = fx.run_encrypted(&["--config", &cfg, "list"], KEY_PASS);
+    assert!(!opened.status.success(), "the repo must be unopenable now");
+
+    let out = fx.run_encrypted_ok(
+        &[
+            "--config",
+            &cfg,
+            "key",
+            "import",
+            export_path.to_str().unwrap(),
+        ],
+        KEY_PASS,
+    );
+    let out = stdout(&out);
+    assert!(out.contains("keys/repokey: created"), "{out}");
+    assert!(out.contains("keys/repokey.2: created"), "{out}");
+
+    fx.run_encrypted_ok(&["--config", &cfg, "list"], KEY_PASS);
+}
+
+#[test]
+fn cli_key_import_leaves_a_matching_primary_untouched() {
+    let (fx, cfg) = encrypted_fixture();
+    let export_path = fx.repo_dir.parent().unwrap().join("repokey.txt");
+    fx.run_encrypted_ok(
+        &[
+            "--config",
+            &cfg,
+            "key",
+            "export",
+            "-o",
+            export_path.to_str().unwrap(),
+        ],
+        KEY_PASS,
+    );
+    std::fs::remove_file(fx.repo_dir.join("keys").join("repokey.2")).unwrap();
+
+    let out = stdout(&fx.run_encrypted_ok(
+        &[
+            "--config",
+            &cfg,
+            "key",
+            "import",
+            export_path.to_str().unwrap(),
+        ],
+        KEY_PASS,
+    ));
+    assert!(
+        out.contains("keys/repokey: already correct, left untouched"),
+        "{out}"
+    );
+    assert!(out.contains("keys/repokey.2: created"), "{out}");
+}
+
+/// A key from a *different* repository, wrapped under the same passphrase,
+/// unwraps perfectly — and with the `repository:` header rewritten, the paste
+/// check passes too. Only `prove_key` catches it, and `--force` must not
+/// push it through.
+#[test]
+fn cli_key_import_refuses_a_foreign_key_even_with_force() {
+    let (victim, victim_cfg) = encrypted_fixture();
+    let (attacker, attacker_cfg) = encrypted_fixture();
+
+    let foreign =
+        stdout(&attacker.run_encrypted_ok(&["--config", &attacker_cfg, "key", "export"], KEY_PASS));
+    // Rewrite the header so the repository-id check cannot be what refuses it.
+    let disguised: String = foreign
+        .lines()
+        .map(|line| {
+            if line.starts_with("repository:") {
+                format!("repository: {}", repo_id_hex(&victim.repo_dir))
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let path = victim.repo_dir.parent().unwrap().join("foreign.txt");
+    std::fs::write(&path, format!("{disguised}\n")).unwrap();
+
+    let refused = victim.run_encrypted(
+        &[
+            "--config",
+            &victim_cfg,
+            "key",
+            "import",
+            path.to_str().unwrap(),
+        ],
+        KEY_PASS,
+    );
+    assert!(!refused.status.success(), "the import must be refused");
+    let err = stderr(&refused);
+    assert!(err.contains("refusing to import"), "{err}");
+
+    // --force does not override a pin contradiction.
+    let forced = victim.run_encrypted(
+        &[
+            "--config",
+            &victim_cfg,
+            "key",
+            "import",
+            path.to_str().unwrap(),
+            "--force",
+        ],
+        KEY_PASS,
+    );
+    assert!(!forced.status.success(), "--force must not override this");
+    assert!(
+        stderr(&forced).contains("--force does not override"),
+        "{}",
+        stderr(&forced)
+    );
+
+    // And the victim's own key is untouched.
+    victim.run_encrypted_ok(&["--config", &victim_cfg, "list"], KEY_PASS);
+}
+
+/// Restoring a key copy is tier-1: it applies without the `type 'repair'`
+/// prompt, because `check` only runs once a key has been established.
+#[test]
+fn cli_check_repair_heals_a_key_copy_without_prompting() {
+    let (fx, cfg) = encrypted_fixture();
+    let good = std::fs::read(fx.repo_dir.join("keys").join("repokey")).unwrap();
+    std::fs::write(fx.repo_dir.join("keys").join("repokey.2"), b"garbage").unwrap();
+
+    let output = fx.run_encrypted_ok(&["--config", &cfg, "check", "--repair"], KEY_PASS);
+    let out = stdout(&output);
+    assert!(
+        out.contains("Restore repository key copy keys/repokey.2"),
+        "{out}"
+    );
+    assert!(
+        stderr(&output).contains("No data-loss actions; applying safe repairs"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(
+        std::fs::read(fx.repo_dir.join("keys").join("repokey.2")).unwrap(),
+        good
+    );
+}
+
+#[test]
+fn cli_check_summary_reports_the_key_copies() {
+    let (fx, cfg) = encrypted_fixture();
+    let out = stdout(&fx.run_encrypted_ok(&["--config", &cfg, "check"], KEY_PASS));
+    assert!(out.contains("Check complete: 2 key copies"), "{out}");
+}
+
+/// Nothing left to prove the key against — no pin on this client, and no
+/// decryptable repository object. Refused by default; `--force` is the
+/// override for *this case only*.
+#[test]
+fn cli_key_import_unproven_key_needs_force() {
+    let (fx, cfg) = encrypted_fixture();
+    let export_path = fx.repo_dir.parent().unwrap().join("repokey.txt");
+    fx.run_encrypted_ok(
+        &[
+            "--config",
+            &cfg,
+            "key",
+            "export",
+            "-o",
+            export_path.to_str().unwrap(),
+        ],
+        KEY_PASS,
+    );
+
+    // Remove every piece of evidence: the repository's own ciphertext...
+    std::fs::remove_file(fx.repo_dir.join("index")).unwrap();
+    for entry in std::fs::read_dir(fx.repo_dir.join("snapshots"))
+        .unwrap()
+        .flatten()
+    {
+        std::fs::remove_file(entry.path()).unwrap();
+    }
+    // ...and this client's identity pin.
+    let removed = forget_pins(&fx);
+    assert!(removed > 0, "expected `init` to have pinned the identity");
+    for name in ["repokey", "repokey.2"] {
+        std::fs::remove_file(fx.repo_dir.join("keys").join(name)).unwrap();
+    }
+
+    let refused = fx.run_encrypted(
+        &[
+            "--config",
+            &cfg,
+            "key",
+            "import",
+            export_path.to_str().unwrap(),
+        ],
+        KEY_PASS,
+    );
+    assert!(!refused.status.success(), "an unproven key must be refused");
+    assert!(
+        stderr(&refused).contains("could not be verified"),
+        "{}",
+        stderr(&refused)
+    );
+
+    let forced = fx.run_encrypted_ok(
+        &[
+            "--config",
+            &cfg,
+            "key",
+            "import",
+            export_path.to_str().unwrap(),
+            "--force",
+        ],
+        KEY_PASS,
+    );
+    assert!(
+        stderr(&forced).contains("importing an unverified key"),
+        "{}",
+        stderr(&forced)
+    );
+    assert!(fx.repo_dir.join("keys").join("repokey").exists());
+    assert!(fx.repo_dir.join("keys").join("repokey.2").exists());
+}
+
+/// **Export must not pick "the first copy that unwraps".**
+///
+/// A planted primary that shares the passphrase unwraps perfectly. Ordinary
+/// commands resolve the divergence and open off the genuine secondary; an
+/// export that skipped that resolution would write out the planted key and
+/// print success, producing a recovery backup that restores nothing.
+#[test]
+fn cli_key_export_exports_the_genuine_copy_not_a_planted_one() {
+    let (fx, cfg) = encrypted_fixture();
+    let keys = fx.repo_dir.join("keys");
+    let genuine = std::fs::read(keys.join("repokey")).unwrap();
+
+    // Plant a foreign key, wrapped under the same passphrase, as the primary.
+    let (attacker, attacker_cfg) = encrypted_fixture();
+    let foreign = armor_body(&stdout(
+        &attacker.run_encrypted_ok(&["--config", &attacker_cfg, "key", "export"], KEY_PASS),
+    ));
+    assert_ne!(foreign, genuine);
+    std::fs::write(keys.join("repokey"), &foreign).unwrap();
+
+    // Ordinary commands still work — they open off the genuine secondary.
+    fx.run_encrypted_ok(&["--config", &cfg, "list"], KEY_PASS);
+
+    let exported = armor_body(&stdout(
+        &fx.run_encrypted_ok(&["--config", &cfg, "key", "export"], KEY_PASS),
+    ));
+    assert_eq!(
+        exported, genuine,
+        "export must resolve the divergence, not take the first copy that unwraps"
+    );
+}
+
+/// `.mode()` only applies at creation, so an export over an existing
+/// world-readable file has to tighten it explicitly.
+#[cfg(unix)]
+#[test]
+fn cli_key_export_tightens_permissions_on_an_existing_file() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (fx, cfg) = encrypted_fixture();
+    let dest = fx.repo_dir.parent().unwrap().join("preexisting.txt");
+    std::fs::write(&dest, "stale contents").unwrap();
+    std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    fx.run_encrypted_ok(
+        &[
+            "--config",
+            &cfg,
+            "key",
+            "export",
+            "-o",
+            dest.to_str().unwrap(),
+        ],
+        KEY_PASS,
+    );
+
+    let mode = std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "export must not leave a 0644 key file behind");
+    assert!(std::fs::read_to_string(&dest)
+        .unwrap()
+        .contains("BEGIN VYKAR REPOSITORY KEY"));
+}
+
+/// **`--trust-repo` must re-pin.** It waives the pin to authorize the import;
+/// leaving the stale pin behind makes the very next ordinary command fail, so
+/// the import looks like it did nothing.
+#[test]
+fn cli_key_import_with_trust_repo_updates_the_pin() {
+    let (fx, cfg) = encrypted_fixture();
+    let export_path = fx.repo_dir.parent().unwrap().join("repokey.txt");
+    fx.run_encrypted_ok(
+        &[
+            "--config",
+            &cfg,
+            "key",
+            "export",
+            "-o",
+            export_path.to_str().unwrap(),
+        ],
+        KEY_PASS,
+    );
+
+    // Point the pin at an identity this repository does not have.
+    let pins = pin_paths(&fx);
+    assert_eq!(pins.len(), 1, "init must have pinned the identity");
+    let mut pin: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&pins[0]).unwrap()).unwrap();
+    pin["fingerprint"] = serde_json::Value::String("00".repeat(32));
+    std::fs::write(&pins[0], serde_json::to_string_pretty(&pin).unwrap()).unwrap();
+
+    // Without --trust-repo the import is refused, and the pin is untouched.
+    let refused = fx.run_encrypted(
+        &[
+            "--config",
+            &cfg,
+            "key",
+            "import",
+            export_path.to_str().unwrap(),
+        ],
+        KEY_PASS,
+    );
+    assert!(!refused.status.success());
+    assert!(
+        stderr(&refused).contains("--trust-repo"),
+        "{}",
+        stderr(&refused)
+    );
+    let after_refusal: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&pins[0]).unwrap()).unwrap();
+    assert_eq!(
+        after_refusal["fingerprint"], pin["fingerprint"],
+        "a refused import must leave the pin untouched"
+    );
+
+    // With --trust-repo it succeeds — and the next ordinary command must work.
+    fx.run_encrypted_ok(
+        &[
+            "--config",
+            &cfg,
+            "--trust-repo",
+            "key",
+            "import",
+            export_path.to_str().unwrap(),
+        ],
+        KEY_PASS,
+    );
+    fx.run_encrypted_ok(&["--config", &cfg, "list"], KEY_PASS);
+}
+
+/// **A key belongs to exactly one repository.** Without `-R`, `key export`
+/// would concatenate armor blocks (which `import` cannot read back) or
+/// overwrite one `-o` file; `key import` carries one repository's key. Refused
+/// before any repository is opened — no passphrase is even asked for.
+#[test]
+fn cli_key_commands_refuse_multiple_repositories_without_repo_flag() {
+    let fx = CliFixture::new();
+    let repo_b = fx.repo_dir.parent().unwrap().join("repo-b");
+    std::fs::create_dir_all(&repo_b).unwrap();
+    let config = format!(
+        "repositories:\n  - url: {}\n  - url: {}\nencryption:\n  mode: aes256gcm\nsources: []\n",
+        yaml_quote_path(&fx.repo_dir),
+        yaml_quote_path(&repo_b),
+    );
+    std::fs::write(&fx.config_path, config).unwrap();
+    let cfg = fx.config_path.to_string_lossy().to_string();
+    fx.run_encrypted_ok(&["--config", &cfg, "init"], KEY_PASS);
+
+    let dest = fx.repo_dir.parent().unwrap().join("all-keys.txt");
+    // No passphrase in the environment: were a repository opened, the failure
+    // would be about the passphrase, not about `-R`.
+    for args in [
+        vec!["--config", cfg.as_str(), "key", "export"],
+        vec![
+            "--config",
+            cfg.as_str(),
+            "key",
+            "export",
+            "-o",
+            dest.to_str().unwrap(),
+        ],
+        vec![
+            "--config",
+            cfg.as_str(),
+            "key",
+            "import",
+            dest.to_str().unwrap(),
+        ],
+    ] {
+        let (out, err) = fx.run_err(&args);
+        assert!(err.contains("requires -R"), "{args:?}: {err}");
+        assert!(!err.contains("passphrase"), "refused after opening: {err}");
+        assert!(!out.contains("BEGIN VYKAR"), "{args:?}: {out}");
+    }
+    assert!(
+        !dest.exists(),
+        "a refused export must not touch the destination"
+    );
+
+    // Scoped to one repository each, the keys round-trip into the right repo.
+    let a = fx.repo_dir.to_str().unwrap().to_string();
+    let b = repo_b.to_str().unwrap().to_string();
+    let dest_a = fx.repo_dir.parent().unwrap().join("key-a.txt");
+    let dest_b = fx.repo_dir.parent().unwrap().join("key-b.txt");
+    for (repo, dest) in [(&a, &dest_a), (&b, &dest_b)] {
+        fx.run_encrypted_ok(
+            &[
+                "--config",
+                &cfg,
+                "key",
+                "export",
+                "-R",
+                repo,
+                "-o",
+                dest.to_str().unwrap(),
+            ],
+            KEY_PASS,
+        );
+        for name in ["repokey", "repokey.2"] {
+            std::fs::remove_file(Path::new(repo).join("keys").join(name)).unwrap();
+        }
+    }
+    assert_ne!(
+        armor_body(&std::fs::read_to_string(&dest_a).unwrap()),
+        armor_body(&std::fs::read_to_string(&dest_b).unwrap()),
+    );
+    for (repo, dest) in [(&a, &dest_a), (&b, &dest_b)] {
+        fx.run_encrypted_ok(
+            &[
+                "--config",
+                &cfg,
+                "key",
+                "import",
+                "-R",
+                repo,
+                dest.to_str().unwrap(),
+            ],
+            KEY_PASS,
+        );
+        fx.run_encrypted_ok(&["--config", &cfg, "list", "-R", repo], KEY_PASS);
+    }
+}
+
+/// Degraded key copies are reported on stderr for *every* command, not only
+/// by `key export`: the default log filter is `warn`, so an ordinary `list`
+/// tells the operator to run `check --repair`. Export additionally names
+/// the damaged copy in its status line.
+#[test]
+fn cli_degraded_key_copies_warn_on_stderr() {
+    let (fx, cfg) = encrypted_fixture();
+    let keys = fx.repo_dir.join("keys");
+    std::fs::write(keys.join("repokey.2"), b"garbage").unwrap();
+
+    let listed = fx.run_encrypted_ok(&["--config", &cfg, "list"], KEY_PASS);
+    let err = stderr(&listed);
+    assert!(
+        err.contains("keys/repokey.2 disagrees with keys/repokey"),
+        "{err}"
+    );
+    assert!(err.contains("check --repair"), "{err}");
+
+    let exported = fx.run_encrypted_ok(&["--config", &cfg, "key", "export"], KEY_PASS);
+    let err = stderr(&exported);
+    assert!(err.contains("keys/repokey.2 disagrees"), "{err}");
+    assert!(stdout(&exported).starts_with("-----BEGIN"));
+
+    // A missing copy is named too.
+    std::fs::remove_file(keys.join("repokey.2")).unwrap();
+    let exported = fx.run_encrypted_ok(&["--config", &cfg, "key", "export"], KEY_PASS);
+    let err = stderr(&exported);
+    assert!(err.contains("keys/repokey.2 is missing"), "{err}");
+}
+
+/// **`--trust-repo` must reach export's divergence resolution.** With a stale
+/// pin and divergent copies, consulting the pin during selection rejects both
+/// candidates before `verify_or_pin` ever gets to accept the new identity —
+/// so `key export` would fail on a repository `list` opens fine.
+#[test]
+fn cli_key_export_honours_trust_repo_when_copies_diverge() {
+    let (fx, cfg) = encrypted_fixture();
+    let keys = fx.repo_dir.join("keys");
+    let genuine = std::fs::read(keys.join("repokey")).unwrap();
+
+    // Divergent copies: a planted foreign key as the secondary.
+    let (attacker, attacker_cfg) = encrypted_fixture();
+    let foreign = armor_body(&stdout(
+        &attacker.run_encrypted_ok(&["--config", &attacker_cfg, "key", "export"], KEY_PASS),
+    ));
+    std::fs::write(keys.join("repokey.2"), &foreign).unwrap();
+
+    // ...plus a pin that contradicts this repository's identity.
+    let pins = pin_paths(&fx);
+    assert_eq!(pins.len(), 1);
+    let mut pin: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&pins[0]).unwrap()).unwrap();
+    pin["fingerprint"] = serde_json::Value::String("00".repeat(32));
+    std::fs::write(&pins[0], serde_json::to_string_pretty(&pin).unwrap()).unwrap();
+
+    // Baseline: the stale pin blocks both, with and without divergence.
+    let refused = fx.run_encrypted(&["--config", &cfg, "key", "export"], KEY_PASS);
+    assert!(
+        !refused.status.success(),
+        "a stale pin must block the export"
+    );
+
+    // `--trust-repo` gets through — the same way `list` does.
+    fx.run_encrypted_ok(&["--config", &cfg, "--trust-repo", "list"], KEY_PASS);
+    let exported = armor_body(&stdout(&fx.run_encrypted_ok(
+        &["--config", &cfg, "--trust-repo", "key", "export"],
+        KEY_PASS,
+    )));
+    assert_eq!(
+        exported, genuine,
+        "--trust-repo must resolve the divergence, not export the planted copy"
     );
 }

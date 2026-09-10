@@ -34,10 +34,13 @@ rand.workspace = true
 zeroize.workspace = true
 tiny_http = "0.12"
 serde_json.workspace = true
+base64 = "0.23"
 
 [dev-dependencies]
 tempfile.workspace = true
 ureq.workspace = true
+# `cli_integration` decodes the repository `config` to read its id.
+rmp-serde.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

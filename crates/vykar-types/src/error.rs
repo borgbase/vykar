@@ -109,6 +109,39 @@ impl fmt::Display for LockHolder {
     }
 }
 
+impl VykarError {
+    /// Whether a wrong passphrase is still a live explanation for this error.
+    ///
+    /// Passphrase retry prompts and cached-passphrase eviction key off this,
+    /// so **every** ambiguous authentication failure must be listed: a new
+    /// variant left out here silently stops callers from re-prompting, and
+    /// leaves a stale cached passphrase in place.
+    pub fn is_passphrase_failure(&self) -> bool {
+        matches!(
+            self,
+            Self::DecryptionFailed | Self::RepositoryKeyUnwrapFailed(_)
+        )
+    }
+
+    /// Whether a failed write or delete looks like the backend *refusing* it
+    /// on policy — append-only mode, a read-only mount, missing permissions —
+    /// rather than a transient fault.
+    ///
+    /// Backends surface this only as a message, so this is a heuristic.
+    /// Callers use it to decide whether to add a hint; the message shown
+    /// must keep the backend's own reason, because a 403 is not proof of
+    /// append-only mode.
+    pub fn is_write_refusal(&self) -> bool {
+        let msg = self.to_string().to_lowercase();
+        msg.contains("append-only")
+            || msg.contains("immutable")
+            || msg.contains("read-only")
+            || msg.contains("forbidden")
+            || msg.contains("permission")
+            || msg.contains("403")
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum VykarError {
     #[error("repository not found at '{0}'")]
@@ -119,6 +152,18 @@ pub enum VykarError {
 
     #[error("decryption failed: wrong passphrase or corrupted data")]
     DecryptionFailed,
+
+    /// The repository key could not be unwrapped, and the cause is genuinely
+    /// ambiguous — wrong passphrase, or damage inside the authenticated
+    /// payload, which AEAD cannot tell apart.
+    ///
+    /// Carries the full diagnosis (which copies were consulted, whether they
+    /// corroborated each other) while staying a *typed* authentication
+    /// failure, so passphrase re-prompting and cached-passphrase eviction keep
+    /// working. Classify a failure here only when a wrong passphrase is still
+    /// a live explanation; proven corruption belongs in another variant.
+    #[error("{0}")]
+    RepositoryKeyUnwrapFailed(String),
 
     #[error("passphrase must not be empty")]
     EmptyPassphrase,

@@ -6,7 +6,7 @@ use vykar_core::app::operations::{self, CycleEvent, CycleStep, FullCycleResult, 
 use vykar_core::config::{EncryptionModeConfig, ResolvedRepo, VykarConfig};
 use vykar_storage::{parse_repo_url, ParsedUrl};
 
-use crate::cli::Commands;
+use crate::cli::{Commands, KeyCommand};
 use crate::cmd;
 use crate::cmd::backup::BackupRunOpts;
 use crate::cmd::check::{format_check_progress, print_check_summary};
@@ -270,6 +270,14 @@ pub(crate) fn dispatch_command(
         )
         .map(|()| false),
         Commands::Info { .. } => cmd::info::run_info(cfg, label).map(|()| false),
+        Commands::Key { command, .. } => match command {
+            KeyCommand::Export { output, .. } => {
+                cmd::key::run_key_export(cfg, label, output.as_deref()).map(|()| false)
+            }
+            KeyCommand::Import { file, force, .. } => {
+                cmd::key::run_key_import(cfg, label, file, *force).map(|()| false)
+            }
+        },
         Commands::Mount {
             snapshot,
             source,

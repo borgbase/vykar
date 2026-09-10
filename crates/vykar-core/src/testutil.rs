@@ -40,12 +40,24 @@ pub fn init_test_environment() {
 /// In-memory storage backend for testing. Thread-safe via Mutex.
 pub struct MemoryBackend {
     data: Mutex<HashMap<String, Vec<u8>>>,
+    /// Refuse to overwrite an existing object, the way an append-only
+    /// vykar-server does.
+    append_only: bool,
 }
 
 impl MemoryBackend {
     pub fn new() -> Self {
         Self {
             data: Mutex::new(HashMap::new()),
+            append_only: false,
+        }
+    }
+
+    /// A backend that permits creation but refuses to overwrite.
+    pub fn append_only() -> Self {
+        Self {
+            append_only: true,
+            ..Self::new()
         }
     }
 }
@@ -58,6 +70,11 @@ impl StorageBackend for MemoryBackend {
 
     fn put(&self, key: &str, data: &[u8]) -> Result<()> {
         let mut map = self.data.lock().unwrap();
+        if self.append_only && map.contains_key(key) {
+            return Err(VykarError::Other(format!(
+                "403 Forbidden: repository is append-only, {key} already exists"
+            )));
+        }
         map.insert(key.to_string(), data.to_vec());
         Ok(())
     }

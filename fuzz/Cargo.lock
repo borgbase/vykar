@@ -1997,6 +1997,7 @@ dependencies = [
  "rand 0.10.2",
  "rmp-serde",
  "serde",
+ "subtle",
  "tracing",
  "vykar-types",
  "zeroize",

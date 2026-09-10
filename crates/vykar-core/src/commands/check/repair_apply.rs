@@ -21,20 +21,8 @@ use vykar_types::snapshot_id::SnapshotId;
 pub(super) fn probe_deletes_allowed(storage: &dyn StorageBackend) -> bool {
     match storage.delete("snapshots/.repair-probe") {
         Ok(()) => true,
-        Err(ref e) => {
-            let msg = e.to_string().to_lowercase();
-            if msg.contains("permission")
-                || msg.contains("forbidden")
-                || msg.contains("403")
-                || msg.contains("read-only")
-                || msg.contains("append-only")
-            {
-                false
-            } else {
-                // Transient/not-found errors → assume deletes are allowed
-                true
-            }
-        }
+        // Transient/not-found errors → assume deletes are allowed.
+        Err(ref e) => !e.is_write_refusal(),
     }
 }
 
@@ -266,6 +254,48 @@ fn prepare_rewrite(
     })
 }
 
+/// Rewrite each key copy named by a [`RepairAction::RestoreKeyCopy`] from the
+/// key this repository opened with.
+///
+/// The bytes written are [`Repository::key_blob`], not a fresh read of the
+/// source copy: the scan established `from` as byte-identical to it, but
+/// nothing holds that between scan and write, and the verified bytes are
+/// already in hand. `from` is kept on the action for the plan printout.
+///
+/// Creating a missing copy succeeds even on an append-only server, which
+/// blocks overwrites but not creations. *Replacing* a divergent copy is an
+/// overwrite and will be refused there.
+fn restore_key_copies(
+    repo: &mut Repository,
+    plan: &RepairPlan,
+    applied: &mut Vec<RepairAction>,
+    repair_errors: &mut Vec<String>,
+) {
+    for action in &plan.actions {
+        let RepairAction::RestoreKeyCopy { to, .. } = action else {
+            continue;
+        };
+        let Some(bytes) = repo.key_blob() else {
+            repair_errors.push(format!(
+                "cannot restore {to}: this repository has no key to restore it from"
+            ));
+            continue;
+        };
+        match repo.storage.put(to, bytes) {
+            Ok(()) => {
+                tracing::info!("restored repository key copy {to}");
+                applied.push(action.clone());
+            }
+            Err(e) if e.is_write_refusal() => repair_errors.push(format!(
+                "could not write {to}: the backend refused the write: {e}. If the \
+                 repository is append-only or read-only, remove {to} there manually or \
+                 restore the key with `vykar key import`."
+            )),
+            Err(e) => repair_errors.push(format!("failed to restore key copy {to}: {e}")),
+        }
+    }
+}
+
 /// Execute repair actions in the correct order.
 pub(super) fn execute_repair(
     repo: &mut Repository,
@@ -291,6 +321,11 @@ pub(super) fn execute_repair(
 
     let mut applied: Vec<RepairAction> = Vec::new();
     let mut repair_errors: Vec<String> = Vec::new();
+
+    // Step 0: Restore damaged or missing repository key copies. First, because
+    // it is the one repair that only ever adds redundancy, and a failure here
+    // must not be masked by whatever the snapshot passes do next.
+    restore_key_copies(repo, plan, &mut applied, &mut repair_errors);
 
     // Step 1: Remove corrupted snapshot blobs from storage.
     // If any delete fails, abort before refcount rebuild — we cannot enumerate
@@ -471,6 +506,82 @@ pub(super) fn execute_repair(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::check::repair_plan::build_repair_plan;
+    use crate::commands::check::scan::{integrity_scan, ScanOptions};
+    use crate::config::ChunkerConfig;
+    use crate::repo::{EncryptionMode, KEY_PRIMARY, KEY_SECONDARY};
+    use crate::testutil::MemoryBackend;
+
+    /// **Repair writes the verified bytes, not a fresh read of the source.**
+    ///
+    /// The scan established `from` as byte-identical to the key that
+    /// unwrapped at open, but nothing holds that between scan and write. If
+    /// the source copy changes in between, the copy being restored must still
+    /// receive the key this repository opened with — and the changed source
+    /// must be left alone, because nothing has established what it now holds.
+    #[test]
+    fn restore_key_copy_writes_the_opened_key_even_if_the_source_changed() {
+        let mut repo = crate::repo::Repository::init(
+            Box::new(MemoryBackend::new()),
+            EncryptionMode::Aes256Gcm,
+            ChunkerConfig::default(),
+            Some("repair-writes-key-blob"),
+            None,
+            None,
+        )
+        .unwrap();
+        let opened_with = repo.key_blob().unwrap().to_vec();
+        repo.storage.put(KEY_SECONDARY, b"garbage").unwrap();
+
+        let config = crate::tests::helpers::make_test_config(std::path::Path::new("/mem"));
+        let opts = ScanOptions {
+            collect_chunk_refs: true,
+            detect_orphans: false,
+            verify_data: false,
+            skip_packs: None,
+            snapshot_sample_percent: None,
+        };
+        let scan = integrity_scan(&mut repo, &config, &opts, &mut None, None).unwrap();
+        let plan = build_repair_plan(&scan, &HashMap::new(), &HashMap::new());
+        assert!(
+            plan.actions.iter().any(|a| matches!(
+                a,
+                RepairAction::RestoreKeyCopy { from, to }
+                    if from == KEY_PRIMARY && to == KEY_SECONDARY
+            )),
+            "{:?}",
+            plan.actions
+        );
+
+        // Between scan and write, the source copy is replaced with a
+        // different, well-formed blob.
+        let swapped = rmp_serde::to_vec(
+            &vykar_crypto::key::MasterKey::generate()
+                .unwrap()
+                .to_encrypted("someone-else")
+                .unwrap(),
+        )
+        .unwrap();
+        repo.storage.put(KEY_PRIMARY, &swapped).unwrap();
+
+        let (applied, errors) =
+            execute_repair(&mut repo, &plan, &scan.issues, &HashMap::new()).unwrap();
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(applied
+            .iter()
+            .any(|a| matches!(a, RepairAction::RestoreKeyCopy { .. })));
+
+        assert_eq!(
+            repo.storage.get(KEY_SECONDARY).unwrap().unwrap(),
+            opened_with,
+            "the restored copy must hold the key this repository opened with"
+        );
+        assert_eq!(
+            repo.storage.get(KEY_PRIMARY).unwrap().unwrap(),
+            swapped,
+            "the changed source must not be touched"
+        );
+    }
 
     struct ForbiddenDeleteBackend;
 

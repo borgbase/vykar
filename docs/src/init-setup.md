@@ -35,6 +35,46 @@ The passphrase is requested interactively at init time. You can also supply it v
 - `passcommand` in the config (e.g. `passcommand: "pass show vykar"`)
 - `passphrase` in the config
 
+## Back up your repository key
+
+The passphrase alone is not enough to open an encrypted repository.
+
+The master key is 64 bytes of random data generated at `init`; it is **not**
+derived from your passphrase. The passphrase only derives a wrapping key
+(Argon2id) that encrypts the master key, and the result — about 180 bytes — is
+what lives at `keys/repokey` inside the repository. **Both are required, and
+neither can be recovered from the other.** If the key blob is gone, the data is
+gone, even with the correct passphrase.
+
+Export it once and store it in the same password-manager entry as the
+passphrase:
+
+```sh
+vykar key export -R main -o vykar-repokey-main.txt
+```
+
+The export is a small armored text block, and it stays passphrase-protected —
+there is deliberately no way to export the unwrapped master key. `key export`
+unwraps the key before printing it, so it doubles as a check that your
+passphrase and key file still work together. Without `-o` the block goes to
+stdout, ready to pipe into a password manager. One export holds one
+repository's key, so with several repositories configured `key export` and
+`key import` require `-R`.
+
+To restore it — including into a repository that can no longer be opened,
+which is exactly when you need it:
+
+```sh
+vykar key import -R main vykar-repokey-main.txt
+```
+
+vykar also keeps a **second copy of the key inside the repository**
+(`keys/repokey.2`), written at `init` and backfilled into older repositories
+the next time they are opened. If one copy rots, vykar opens off the other and
+`vykar check --repair` rewrites the damaged one. That covers bit rot and
+localized corruption — **not** loss of the storage as a whole, so it
+complements an off-repository copy rather than replacing one.
+
 ## Configure repositories and sources
 
 Set the repository URL and the directories to back up:

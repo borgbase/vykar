@@ -8457,6 +8457,7 @@ dependencies = [
 name = "vykar-cli"
 version = "0.20.0"
 dependencies = [
+ "base64 0.23.1",
  "chrono",
  "clap",
  "comfy-table",
@@ -8464,6 +8465,7 @@ dependencies = [
  "libc",
  "mimalloc",
  "rand 0.10.2",
+ "rmp-serde",
  "serde",
  "serde_json",
  "tempfile",
@@ -8553,6 +8555,7 @@ dependencies = [
  "rand 0.10.2",
  "rmp-serde",
  "serde",
+ "subtle",
  "tracing",
  "vykar-types",
  "zeroize",
@@ -8571,6 +8574,7 @@ dependencies = [
  "objc2 0.6.4",
  "objc2-app-kit 0.3.2",
  "opener",
+ "rmp-serde",
  "serde",
  "serde_json",
  "slint",
@@ -8582,6 +8586,8 @@ dependencies = [
  "ureq",
  "vykar-common",
  "vykar-core",
+ "vykar-crypto",
+ "vykar-storage",
  "vykar-types",
  "winreg",
  "winresource",

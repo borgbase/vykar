@@ -59,10 +59,7 @@ pub(crate) fn run_check(
     print_check_summary(&plan_result.check_result);
     print_repair_plan(&plan_result.plan);
 
-    let only_action = plan_result.plan.actions.as_slice();
-    if !plan_result.plan.has_data_loss
-        && (only_action.is_empty() || matches!(only_action, [RepairAction::RebuildRefcounts]))
-    {
+    if !plan_result.plan.has_data_loss && plan_result.plan.actions.iter().all(is_safe_action) {
         // Tier 1 only — apply without prompt.
         eprintln!("No data-loss actions; applying safe repairs...");
         let result = run_repair(config, label, verify_data, RepairMode::Apply, shutdown)?;
@@ -192,8 +189,15 @@ pub(crate) fn print_check_summary(result: &commands::check::CheckResult) {
         println!();
     }
 
+    // Unencrypted repositories have no key file; "0 key copies" would read
+    // like a finding.
+    let key_copies = match result.key_files_checked {
+        Some(n) => format!("{n} key copies, "),
+        None => String::new(),
+    };
     println!(
-        "Check complete: {} snapshots, {} items, {} packs existence-checked ({} chunks), {} chunks data-verified, {} errors",
+        "Check complete: {}{} snapshots, {} items, {} packs existence-checked ({} chunks), {} chunks data-verified, {} errors",
+        key_copies,
         result.snapshots_checked,
         result.items_checked,
         result.packs_existence_checked,
@@ -201,6 +205,21 @@ pub(crate) fn print_check_summary(result: &commands::check::CheckResult) {
         result.chunks_data_verified,
         result.errors.len(),
     );
+}
+
+/// Tier-1 actions: applied without the `type 'repair'` prompt because they
+/// cannot lose data.
+///
+/// `RestoreKeyCopy` qualifies because `check` only runs after
+/// `Repository::open` succeeded — a key was therefore established, and the
+/// action copies it onto a copy that is missing or provably not it. The
+/// unresolvable case, where two candidate keys cannot be told apart, fails at
+/// open and never reaches a repair plan at all.
+fn is_safe_action(action: &RepairAction) -> bool {
+    matches!(
+        action,
+        RepairAction::RebuildRefcounts | RepairAction::RestoreKeyCopy { .. }
+    )
 }
 
 fn print_repair_plan(plan: &RepairPlan) {
@@ -212,11 +231,8 @@ fn print_repair_plan(plan: &RepairPlan) {
     println!("\nRepair plan:");
 
     // Tier 1 (safe)
-    let safe_actions: Vec<&RepairAction> = plan
-        .actions
-        .iter()
-        .filter(|a| matches!(a, RepairAction::RebuildRefcounts))
-        .collect();
+    let safe_actions: Vec<&RepairAction> =
+        plan.actions.iter().filter(|a| is_safe_action(a)).collect();
     if !safe_actions.is_empty() {
         println!("  Safe:");
         for a in safe_actions {
@@ -225,11 +241,8 @@ fn print_repair_plan(plan: &RepairPlan) {
     }
 
     // Tier 2 (data loss)
-    let loss_actions: Vec<&RepairAction> = plan
-        .actions
-        .iter()
-        .filter(|a| !matches!(a, RepairAction::RebuildRefcounts))
-        .collect();
+    let loss_actions: Vec<&RepairAction> =
+        plan.actions.iter().filter(|a| !is_safe_action(a)).collect();
     if !loss_actions.is_empty() {
         println!("  Will remove (data loss):");
         for a in &loss_actions {
@@ -240,6 +253,9 @@ fn print_repair_plan(plan: &RepairPlan) {
 
 fn format_repair_action(action: &RepairAction) -> String {
     match action {
+        RepairAction::RestoreKeyCopy { from, to } => {
+            format!("Restore repository key copy {to} from {from}")
+        }
         RepairAction::RemoveCorruptSnapshot {
             name, snapshot_id, ..
         } => match name {

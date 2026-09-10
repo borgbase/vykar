@@ -6,11 +6,12 @@ use rand::Rng;
 
 use super::file_cache::FileCache;
 use super::format::{pack_object_streaming_with_context, ObjectType};
+use super::key::{self, KeyProofCtx};
 use super::manifest::Manifest;
 use super::snapshot_cache;
 use super::{
     BlobCache, EncryptionMode, OpenOptions, RepoConfig, RepoFormat, Repository,
-    BLOB_CACHE_MAX_BYTES, INDEX_OBJECT_CONTEXT,
+    BLOB_CACHE_MAX_BYTES, INDEX_OBJECT_CONTEXT, KEY_PRIMARY, KEY_SECONDARY,
 };
 use crate::compress;
 use crate::config::{
@@ -18,7 +19,7 @@ use crate::config::{
 };
 use crate::index::{ChunkIndex, IndexBlob};
 use vykar_crypto::key::{EncryptedKey, MasterKey};
-use vykar_crypto::{self as crypto, CryptoEngine, PlaintextEngine};
+use vykar_crypto::{CryptoEngine, PlaintextEngine};
 use vykar_storage::StorageBackend;
 use vykar_types::chunk_id::ChunkHasher;
 use vykar_types::error::{Result, VykarError};
@@ -128,29 +129,13 @@ impl Repository {
                     );
                     (Arc::new(PlaintextEngine::new(chunk_hasher)), None)
                 }
-                EncryptionMode::Aes256Gcm => {
+                mode => {
                     let master_key = MasterKey::generate()?;
                     let pass = passphrase.ok_or_else(|| {
                         VykarError::Config("passphrase required for encrypted repository".into())
                     })?;
                     let enc_key = master_key.to_encrypted(pass)?;
-                    let engine = crypto::aes_gcm::Aes256GcmEngine::new(
-                        &master_key.encryption_key,
-                        ChunkHasher::new(format.chunk_hash(), master_key.chunk_id_key),
-                    );
-                    (Arc::new(engine), Some(enc_key))
-                }
-                EncryptionMode::Chacha20Poly1305 => {
-                    let master_key = MasterKey::generate()?;
-                    let pass = passphrase.ok_or_else(|| {
-                        VykarError::Config("passphrase required for encrypted repository".into())
-                    })?;
-                    let enc_key = master_key.to_encrypted(pass)?;
-                    let engine = crypto::chacha20_poly1305::ChaCha20Poly1305Engine::new(
-                        &master_key.encryption_key,
-                        ChunkHasher::new(format.chunk_hash(), master_key.chunk_id_key),
-                    );
-                    (Arc::new(engine), Some(enc_key))
+                    (key::build_engine(mode, format, &master_key)?, Some(enc_key))
                 }
             };
 
@@ -195,13 +180,21 @@ impl Repository {
         let config_data = rmp_serde::to_vec(&repo_config)?;
         storage.put("config", &config_data)?;
 
-        // Store encrypted key if applicable
+        // Store encrypted key if applicable, in two copies.
+        //
+        // The same serialized bytes go to both keys, deliberately: a second
+        // `to_encrypted` call would produce a different salt and nonce, and
+        // comparing the two copies byte-for-byte is what makes corruption
+        // distinguishable from a wrong passphrase later.
+        let mut key_blob: Option<Vec<u8>> = None;
         if let Some(enc_key) = &encrypted_key {
             if !server_did_init {
                 storage.create_dir("keys/")?;
             }
             let key_data = rmp_serde::to_vec(enc_key)?;
-            storage.put("keys/repokey", &key_data)?;
+            storage.put(KEY_PRIMARY, &key_data)?;
+            storage.put(KEY_SECONDARY, &key_data)?;
+            key_blob = Some(key_data);
         }
 
         // Store empty IndexBlob (compressed with ZSTD)
@@ -255,6 +248,7 @@ impl Repository {
             cache_dir_override: cache_dir,
             write_session: None,
             lock_fence: None,
+            key_blob,
         })
     }
 
@@ -269,7 +263,7 @@ impl Repository {
         cache_dir: Option<PathBuf>,
         opts: OpenOptions,
     ) -> Result<Self> {
-        let mut repo = Self::open_inner(storage, passphrase, cache_dir, !opts.load_file_cache)?;
+        let mut repo = Self::open_inner(storage, passphrase, cache_dir, &opts)?;
         if opts.load_index {
             repo.load_chunk_index()?;
         }
@@ -280,8 +274,9 @@ impl Repository {
         storage: Box<dyn StorageBackend>,
         passphrase: Option<&str>,
         cache_dir: Option<PathBuf>,
-        skip_file_cache: bool,
+        opts: &OpenOptions,
     ) -> Result<Self> {
+        let skip_file_cache = !opts.load_file_cache;
         let storage: Arc<dyn StorageBackend> = Arc::from(storage);
 
         // Read config
@@ -306,46 +301,43 @@ impl Repository {
             )));
         }
 
-        // Build crypto engine
-        let crypto: Arc<dyn CryptoEngine> = match &repo_config.encryption {
-            EncryptionMode::None => {
-                let chunk_hasher = ChunkHasher::new(
-                    format.chunk_hash(),
-                    derive_plaintext_chunk_id_key(&repo_config.id, format),
-                );
-                Arc::new(PlaintextEngine::new(chunk_hasher))
-            }
-            EncryptionMode::Aes256Gcm => {
-                let key_data = storage
-                    .get("keys/repokey")?
-                    .ok_or_else(|| VykarError::InvalidFormat("missing keys/repokey".into()))?;
-                let enc_key: EncryptedKey = rmp_serde::from_slice(&key_data)?;
-                let pass = passphrase.ok_or_else(|| {
-                    VykarError::Config("passphrase required for encrypted repository".into())
-                })?;
-                let master_key = MasterKey::from_encrypted(&enc_key, pass)?;
-                let engine = crypto::aes_gcm::Aes256GcmEngine::new(
-                    &master_key.encryption_key,
-                    ChunkHasher::new(format.chunk_hash(), master_key.chunk_id_key),
-                );
-                Arc::new(engine)
-            }
-            EncryptionMode::Chacha20Poly1305 => {
-                let key_data = storage
-                    .get("keys/repokey")?
-                    .ok_or_else(|| VykarError::InvalidFormat("missing keys/repokey".into()))?;
-                let enc_key: EncryptedKey = rmp_serde::from_slice(&key_data)?;
-                let pass = passphrase.ok_or_else(|| {
-                    VykarError::Config("passphrase required for encrypted repository".into())
-                })?;
-                let master_key = MasterKey::from_encrypted(&enc_key, pass)?;
-                let engine = crypto::chacha20_poly1305::ChaCha20Poly1305Engine::new(
-                    &master_key.encryption_key,
-                    ChunkHasher::new(format.chunk_hash(), master_key.chunk_id_key),
-                );
-                Arc::new(engine)
-            }
-        };
+        // Build crypto engine. `key::load_master_key` is the single place the
+        // key copies are read, so corroboration, diagnosis and backfill live
+        // in exactly one place.
+        let (crypto, key_blob): (Arc<dyn CryptoEngine>, Option<Vec<u8>>) =
+            match &repo_config.encryption {
+                EncryptionMode::None => {
+                    let chunk_hasher = ChunkHasher::new(
+                        format.chunk_hash(),
+                        derive_plaintext_chunk_id_key(&repo_config.id, format),
+                    );
+                    (Arc::new(PlaintextEngine::new(chunk_hasher)), None)
+                }
+                mode => {
+                    let ctx = KeyProofCtx {
+                        repo_config: &repo_config,
+                        format,
+                        // `--trust-repo` waives the pin, so the pin must not be
+                        // consulted at all in that case.
+                        url: if opts.trust_repo {
+                            None
+                        } else {
+                            opts.repo_url.as_deref()
+                        },
+                        cache_dir: cache_dir.as_deref(),
+                    };
+                    let loaded = key::load_master_key(
+                        storage.as_ref(),
+                        passphrase,
+                        &ctx,
+                        !opts.skip_key_backfill,
+                    )?;
+                    (
+                        key::build_engine(mode, format, &loaded.master_key)?,
+                        Some(loaded.blob),
+                    )
+                }
+            };
 
         // Read advisory index.gen sidecar (cache hint only, not trusted for writes).
         let index_generation = match storage.get("index.gen")? {
@@ -392,6 +384,7 @@ impl Repository {
             cache_dir_override: cache_dir,
             write_session: None,
             lock_fence: None,
+            key_blob,
         })
     }
 }

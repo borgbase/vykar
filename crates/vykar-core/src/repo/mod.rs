@@ -9,7 +9,9 @@ pub(crate) mod write_session;
 
 mod chunks;
 mod commit;
+mod key;
 mod open;
+pub use key::{select_repository_key, LoadedKey};
 #[cfg(test)]
 pub(crate) use open::derive_plaintext_chunk_id_key;
 mod read;
@@ -126,6 +128,39 @@ const BLOB_CACHE_MAX_BYTES: usize = 32 * 1024 * 1024; // 32 MiB
 
 const INDEX_OBJECT_CONTEXT: &[u8] = b"index";
 
+/// The repository key, stored twice.
+///
+/// Both objects hold the **same serialized bytes**, not two independent wraps:
+/// a second `MasterKey::to_encrypted` would pick a fresh salt and nonce, and
+/// being able to compare the two copies byte-for-byte is the entire point.
+/// Neither is ever rewritten in place on a read path — `check --repair` heals
+/// a damaged copy, visibly.
+pub const KEY_PRIMARY: &str = "keys/repokey";
+/// The redundant copy of [`KEY_PRIMARY`]. Absent on repositories created
+/// before redundancy existed, until an open backfills it.
+pub const KEY_SECONDARY: &str = "keys/repokey.2";
+
+/// What the two key copies looked like when the repository was opened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyCopyState {
+    /// Unencrypted repository — there is no key file.
+    NotApplicable,
+    /// Both copies present and byte-identical.
+    Matched,
+    /// Exactly one copy was usable. `missing` names the other — either absent,
+    /// or present but unreadable. An absent copy is backfilled best-effort;
+    /// an unreadable one may be intact and is never overwritten.
+    OneMissing { missing: &'static str },
+    /// The copies differ. `good` was established as this repository's key;
+    /// `bad` was not. Deliberately not self-healed at open: rewriting a key
+    /// file is an overwrite, which append-only servers refuse outright, and
+    /// silently overwriting a key on a read path is the wrong default anyway.
+    Divergent {
+        good: &'static str,
+        bad: &'static str,
+    },
+}
+
 /// FIFO blob cache bounded by total weight in bytes.
 /// Caches decrypted+decompressed chunks to avoid redundant storage reads.
 struct BlobCache {
@@ -194,6 +229,16 @@ impl EncryptionMode {
 pub struct OpenOptions {
     pub load_index: bool,
     pub load_file_cache: bool,
+    /// Repository URL, when the caller knows it. Only the identity pin needs
+    /// it, and `Repository::open` itself has no other way to learn it.
+    pub repo_url: Option<String>,
+    /// Accept a key whose fingerprint contradicts the local identity pin.
+    /// Mirrors `--trust-repo`, the single deliberate escape hatch.
+    pub trust_repo: bool,
+    /// Suppress the best-effort backfill of a missing key copy. Set by
+    /// `check --repair --dry-run`, which prints "no changes applied" and must
+    /// not have written one underneath that statement.
+    pub skip_key_backfill: bool,
 }
 
 impl OpenOptions {
@@ -206,6 +251,18 @@ impl OpenOptions {
     }
     pub fn with_file_cache(mut self) -> Self {
         self.load_file_cache = true;
+        self
+    }
+    pub fn with_repo_url(mut self, url: impl Into<String>) -> Self {
+        self.repo_url = Some(url.into());
+        self
+    }
+    pub fn trust_repo(mut self, trust: bool) -> Self {
+        self.trust_repo = trust;
+        self
+    }
+    pub fn skip_key_backfill(mut self) -> Self {
+        self.skip_key_backfill = true;
         self
     }
 }
@@ -247,9 +304,19 @@ pub struct Repository {
     write_session: Option<WriteSessionState>,
     /// Lock fence: called before persisting index/manifest to verify the lock is still valid.
     lock_fence: Option<Arc<dyn Fn() -> Result<()> + Send + Sync>>,
+    /// The key-copy bytes that actually unwrapped at open. `check` compares
+    /// the stored objects against these instead of unwrapping again, which
+    /// would cost another Argon2id derivation and need the passphrase threaded
+    /// into the scan. `None` for unencrypted repositories.
+    key_blob: Option<Vec<u8>>,
 }
 
 impl Repository {
+    /// The key blob that unwrapped at open, if this repository is encrypted.
+    pub fn key_blob(&self) -> Option<&[u8]> {
+        self.key_blob.as_deref()
+    }
+
     /// Mark the chunk index as needing persistence on the next `save_state()`.
     pub fn mark_index_dirty(&mut self) {
         self.index_dirty = true;

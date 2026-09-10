@@ -88,8 +88,8 @@ fn fetch_one_repo_info(
         Err(VykarError::RepoNotFound(_)) => {
             init_repo_interactive(ui_tx, passphrases, repo, &repo_name, &url, probe_pass)
         }
-        Err(VykarError::DecryptionFailed) => {
-            send_log(ui_tx, format!("[{repo_name}] incorrect passphrase."));
+        Err(ref e) if e.is_passphrase_failure() => {
+            send_log(ui_tx, format!("[{repo_name}] incorrect passphrase: {e}"));
             (
                 error_repo_info(&repo_name, &url, "Incorrect passphrase"),
                 Some("incorrect passphrase".to_string()),

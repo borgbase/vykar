@@ -7,6 +7,7 @@ pub mod diff;
 pub mod find;
 pub mod info;
 pub mod init;
+pub mod key;
 pub mod list;
 #[cfg(feature = "mount")]
 pub mod mount;

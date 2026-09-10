@@ -50,3 +50,8 @@ winresource = "0.1"
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# Real `Repository::open` in the passphrase-retry regression tests, and
+# hand-built malformed key blobs for the corruption case.
+vykar-storage.workspace = true
+vykar-crypto.workspace = true
+rmp-serde.workspace = true

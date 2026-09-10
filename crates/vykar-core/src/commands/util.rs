@@ -64,6 +64,17 @@ pub(crate) fn verify_repo_identity(config: &VykarConfig, repo: &Repository) -> R
     )
 }
 
+/// Attach the identity context `Repository::open` cannot derive on its own.
+///
+/// The URL is what lets the key loader consult the local identity pin, and
+/// `trust_repo` is the deliberate waiver of it. Applied in one place so every
+/// core open path gets both; caller-set flags such as `skip_key_backfill` are
+/// preserved.
+fn with_identity_context(opts: OpenOptions, config: &VykarConfig) -> OpenOptions {
+    opts.with_repo_url(config.repository.url.clone())
+        .trust_repo(config.trust_repo)
+}
+
 /// Open a repository from config using the standard backend resolver.
 pub fn open_repo(
     config: &VykarConfig,
@@ -71,6 +82,7 @@ pub fn open_repo(
     opts: OpenOptions,
 ) -> Result<Repository> {
     let connections = config.limits.connections;
+    let opts = with_identity_context(opts, config);
     let backend = storage::backend_from_config(&config.repository, connections)?;
     let backend = limits::wrap_storage_backend(backend, &config.limits);
     let repo = Repository::open(backend, passphrase, cache_dir_from_config(config), opts)
@@ -88,6 +100,7 @@ pub fn open_repo_with_read_session(
     opts: OpenOptions,
 ) -> Result<(Repository, lock::SessionGuard)> {
     let connections = config.limits.connections;
+    let opts = with_identity_context(opts, config);
     let backend = storage::backend_from_config(&config.repository, connections)?;
     let backend = limits::wrap_storage_backend(backend, &config.limits);
 

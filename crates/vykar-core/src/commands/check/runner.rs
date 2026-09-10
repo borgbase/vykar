@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::AtomicBool;
 
 use super::repair_apply::{execute_repair, probe_deletes_allowed};
 use super::repair_plan::build_repair_plan;
@@ -8,6 +9,7 @@ use super::types::{
     CheckError, CheckProgressEvent, CheckResult, IntegrityIssue, RepairMode, RepairPlan,
     RepairResult, ServerVerifyOutcome,
 };
+use crate::commands::util::check_interrupted;
 use crate::config::VykarConfig;
 use crate::index::{ChunkIndex, ChunkIndexEntry};
 use crate::repo::{OpenOptions, Repository};
@@ -78,6 +80,7 @@ pub fn run(
         None,
         100,
         false,
+        None,
     )
 }
 
@@ -86,6 +89,7 @@ pub fn run(
 /// `max_percent`: percentage of packs/snapshots to check (0–100). 100 = full check.
 /// `record_state`: if true and a full (100%) check succeeds, record the timestamp
 ///   in the local check state file. Standalone CLI passes false; daemon/GUI passes true.
+#[allow(clippy::too_many_arguments)]
 pub fn run_with_progress(
     config: &VykarConfig,
     passphrase: Option<&str>,
@@ -94,7 +98,13 @@ pub fn run_with_progress(
     mut progress: Option<&mut dyn FnMut(CheckProgressEvent)>,
     max_percent: u8,
     record_state: bool,
+    shutdown: Option<&AtomicBool>,
 ) -> Result<CheckResult> {
+    // Entry guard: on an empty repository every loop below runs zero
+    // iterations, so without this a pre-set flag would return a clean `Ok` and
+    // record success for work that never ran.
+    check_interrupted(shutdown)?;
+
     let cache_dir = config.cache_dir.as_deref().map(std::path::Path::new);
     let full_every_dur = config.check.full_every_duration();
 
@@ -158,10 +168,14 @@ pub fn run_with_progress(
             verify_data,
             repo.content_hash(),
             &mut progress,
+            shutdown,
         )
     } else {
         ServerVerifyOutcome::Fallback
     };
+    // `try_server_verify` returns an outcome rather than a `Result`, so a
+    // cancellation mid-batch needs raising explicitly here.
+    check_interrupted(shutdown)?;
 
     let (verified_packs, srv_packs_responded, srv_chunks_verified, srv_errors) =
         match server_outcome {
@@ -212,6 +226,7 @@ pub fn run_with_progress(
             snapshot_sample_percent,
         },
         &mut progress,
+        shutdown,
     )?;
 
     // Fold the server-verify contribution into the scan's projection.
@@ -223,6 +238,13 @@ pub fn run_with_progress(
     }
     // Server errors are reported ahead of the local scan's.
     result.errors.splice(0..0, srv_errors);
+
+    // Completion guard, before the success timestamp *and* before the result
+    // is handed back. An aborted-but-clean-so-far scan has an empty `errors`
+    // vec, so an extra `&&` term here would still return `Ok(partial_result)` —
+    // which the cycle orchestrator maps to `StepOutcome::Ok` and the CLI prints
+    // as a completed summary. Cancellation must be an error, not a short `Ok`.
+    check_interrupted(shutdown)?;
 
     // Record full check timestamp if this was a 100% run and succeeded.
     if record_state && effective == 100 && result.errors.is_empty() {
@@ -324,7 +346,10 @@ pub fn run_with_repair(
     verify_data: bool,
     mode: RepairMode,
     mut progress: Option<&mut dyn FnMut(CheckProgressEvent)>,
+    shutdown: Option<&AtomicBool>,
 ) -> Result<RepairResult> {
+    check_interrupted(shutdown)?;
+
     let scan_opts = ScanOptions {
         collect_chunk_refs: true,
         detect_orphans: true,
@@ -343,13 +368,18 @@ pub fn run_with_repair(
         repo.load_chunk_index_uncached()?;
         repo.refresh_snapshot_list()?;
 
-        let scan = integrity_scan(&mut repo, config, &scan_opts, &mut progress)?;
+        let scan = integrity_scan(&mut repo, config, &scan_opts, &mut progress, shutdown)?;
 
         // Refuse before building the plan so a dry-run never presents a
         // misleading executable RebuildRefcounts plan for a too-new repo.
         refuse_repair_if_unreadable_snapshots(&scan)?;
 
         let plan = plan_repair(&repo, &scan, &group_by_pack(repo.chunk_index()));
+
+        // PlanOnly is cancellable end to end, and `plan_repair` is unguarded
+        // CPU work over the scan; without this the CLI would print a plan built
+        // from a cancelled run as though it were complete.
+        check_interrupted(shutdown)?;
 
         Ok(RepairResult {
             check_result: scan.into(),
@@ -367,7 +397,7 @@ pub fn run_with_repair(
                 repo.load_chunk_index_uncached()?;
                 repo.refresh_snapshot_list()?;
 
-                let scan = integrity_scan(repo, config, &scan_opts, &mut progress)?;
+                let scan = integrity_scan(repo, config, &scan_opts, &mut progress, shutdown)?;
 
                 // Refuse right after the under-lock scan — before the delete
                 // probe and execute_repair — so not even the probe object is
@@ -385,6 +415,14 @@ pub fn run_with_repair(
                             .into(),
                     ));
                 }
+
+                // Mutation boundary. Everything above — the scan, the plan, the
+                // append-only probe — is cancellable; from here on `execute_repair`
+                // deletes immutable snapshot objects and rewrites the index, with
+                // no resumable mid-state, so it and the read path beneath it
+                // (`repair_apply`) deliberately do not poll the flag. This is the
+                // last point at which aborting is free.
+                check_interrupted(shutdown)?;
 
                 // Execute the repair
                 let (applied, repair_errors) =

@@ -86,7 +86,7 @@ fn load_regular_file_map(
     repo: &mut Repository,
     snapshot_name: &str,
 ) -> Result<BTreeMap<String, FileSig>> {
-    let stream = super::list::load_snapshot_item_stream_cache_first(repo, snapshot_name)?;
+    let stream = super::list::load_snapshot_item_stream_cache_first(repo, snapshot_name, None)?;
     let mut map = BTreeMap::new();
     super::list::for_each_decoded_item(&stream, |item| {
         if item.entry_type == ItemType::RegularFile {

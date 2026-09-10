@@ -185,7 +185,7 @@ fn prepare_rewrite(
     let drop: HashSet<usize> = item_indices.iter().copied().collect();
 
     let old_meta: SnapshotMeta = load_snapshot_meta(repo, snapshot_name)?;
-    let old_stream = load_snapshot_item_stream(repo, snapshot_name)?;
+    let old_stream = load_snapshot_item_stream(repo, snapshot_name, None)?;
 
     let chunker = items_chunker_config();
     let compression = Compression::default();
@@ -431,7 +431,7 @@ pub(super) fn execute_repair(
         }
 
         // Count file chunks
-        let items_stream = match load_snapshot_item_stream(repo, &entry.name) {
+        let items_stream = match load_snapshot_item_stream(repo, &entry.name, None) {
             Ok(s) => s,
             Err(e) => {
                 return Err(VykarError::Other(format!(

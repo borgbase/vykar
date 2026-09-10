@@ -6,9 +6,11 @@
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
 
 use tracing::info;
 
+use crate::commands::util::check_interrupted;
 use crate::config::VykarConfig;
 use crate::platform::fs;
 use vykar_common::display::{format_bytes, format_count};
@@ -127,6 +129,7 @@ pub struct RestoreStats {
 /// through `ChunkId::compute` and matched against the snapshot's stored
 /// `chunk_id`. AEAD already authenticates ciphertext under the standard
 /// threat model, so this is defense-in-depth against writer-side bugs only.
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     config: &VykarConfig,
     passphrase: Option<&str>,
@@ -135,6 +138,7 @@ pub fn run(
     pattern: Option<&str>,
     xattrs_enabled: bool,
     verify_chunks: bool,
+    shutdown: Option<&AtomicBool>,
 ) -> Result<RestoreStats> {
     let filter = pattern
         .map(|p| {
@@ -154,6 +158,7 @@ pub fn run(
         xattrs_enabled,
         verify_chunks,
         move |path| filter.as_ref().is_none_or(|matcher| matcher.is_match(path)),
+        shutdown,
     )
 }
 
@@ -161,6 +166,7 @@ pub fn run(
 ///
 /// An item is included if its path exactly matches an entry in `selected_paths`,
 /// or if any prefix of its path matches (i.e. a parent directory was selected).
+#[allow(clippy::too_many_arguments)]
 pub fn run_selected(
     config: &VykarConfig,
     passphrase: Option<&str>,
@@ -169,6 +175,7 @@ pub fn run_selected(
     selected_paths: &HashSet<String>,
     xattrs_enabled: bool,
     verify_chunks: bool,
+    shutdown: Option<&AtomicBool>,
 ) -> Result<RestoreStats> {
     restore_with_filter(
         config,
@@ -178,6 +185,7 @@ pub fn run_selected(
         xattrs_enabled,
         verify_chunks,
         |path| path_matches_selection(path, selected_paths),
+        shutdown,
     )
 }
 
@@ -185,6 +193,7 @@ pub fn run_selected(
 // Core restore logic — phased approach
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn restore_with_filter<F>(
     config: &VykarConfig,
     passphrase: Option<&str>,
@@ -193,10 +202,12 @@ fn restore_with_filter<F>(
     xattrs_enabled: bool,
     verify_chunks: bool,
     mut include_path: F,
+    shutdown: Option<&AtomicBool>,
 ) -> Result<RestoreStats>
 where
     F: FnMut(&str) -> bool,
 {
+    check_interrupted(shutdown)?;
     let (mut repo, _session_guard) = super::util::open_repo_with_read_session(
         config,
         passphrase,
@@ -235,19 +246,27 @@ where
     // is available, read tree-pack chunks via the cache to avoid loading the
     // full chunk index.
     let items_stream = if let Some(ref cache) = restore_cache {
-        match super::list::load_snapshot_item_stream_via_lookup(&mut repo, &resolved_name, |id| {
-            cache.lookup(id)
-        }) {
+        match super::list::load_snapshot_item_stream_via_lookup(
+            &mut repo,
+            &resolved_name,
+            |id| cache.lookup(id),
+            shutdown,
+        ) {
             Ok(stream) => stream,
+            // A cancellation is not a stale cache: falling through here would
+            // load the full index and start a second read. Nothing has been
+            // written yet (`temp_root` does not exist), so plain propagation
+            // leaves the filesystem untouched.
+            Err(e @ VykarError::Interrupted) => return Err(e),
             Err(_) => {
                 info!("restore cache incomplete or stale, falling back to full index");
                 repo.load_chunk_index()?;
-                super::list::load_snapshot_item_stream(&mut repo, &resolved_name)?
+                super::list::load_snapshot_item_stream(&mut repo, &resolved_name, shutdown)?
             }
         }
     } else {
         repo.load_chunk_index()?;
-        super::list::load_snapshot_item_stream(&mut repo, &resolved_name)?
+        super::list::load_snapshot_item_stream(&mut repo, &resolved_name, shutdown)?
     };
 
     // Byte-faithful restore of non-UTF8 names is Unix-only. On other platforms
@@ -319,7 +338,9 @@ where
         RESTORE_BATCH_FILES,
         &mut group_reps,
         &mut pending_links,
+        shutdown,
         |batch_files, batch_chunks, verified_dirs, stats| -> Result<()> {
+            check_interrupted(shutdown)?;
             if batch_files.is_empty() {
                 return Ok(());
             }
@@ -359,7 +380,14 @@ where
             // this is a single-process operation so no concurrent destination
             // tampering can occur. Unverified parents still get the full
             // canonicalize check.
+            // Per-file poll: each iteration can canonicalize a parent and
+            // create a file, and the loop runs up to `RESTORE_BATCH_FILES`
+            // times — a snapshot of empty files is restored entirely here, with
+            // no Phase 4 work to poll on its behalf.
             for pf in &batch_files {
+                check_interrupted(shutdown)?;
+                #[cfg(test)]
+                fault_staging_loop(shutdown);
                 let full_path = temp_root.join(&pf.rel_path);
                 if full_path
                     .parent()
@@ -381,6 +409,7 @@ where
                 &temp_root,
                 config.limits.restore_concurrency(),
                 verify_chunks,
+                shutdown,
             )?;
 
             // Phase 5b: apply per-file metadata in temp_root.
@@ -390,6 +419,7 @@ where
                 xattrs_enabled,
                 restore_as_root,
                 stats,
+                shutdown,
             )?;
 
             total_bytes += bytes;
@@ -406,7 +436,8 @@ where
     // links still live in `temp_root` — the no-reopen property holds for the
     // security-sensitive lchown, and a `rename` never disturbs a symlink's own
     // metadata.
-    finalize::apply_symlink_metadata(&plan_out.symlinks, restore_as_root, &mut stats);
+    finalize::apply_symlink_metadata(&plan_out.symlinks, restore_as_root, &mut stats, shutdown)
+        .map_err(&cleanup)?;
 
     // Relink hard-link group members now that every representative is written
     // and still in `temp_root` — both link operands share the temp filesystem,
@@ -424,6 +455,7 @@ where
         xattrs_enabled,
         restore_as_root,
         &mut stats,
+        shutdown,
     )
     .map_err(&cleanup)?;
 
@@ -436,6 +468,17 @@ where
     // No `cleanup` here: `move_temp_to_dest` owns finalization cleanup — it
     // rolls a graceful failure back to an empty `dest`, or returns a distinct
     // "remove before retrying" error if even rollback fails.
+    //
+    // Last cancellable point. The metadata/hard-link passes above poll
+    // `shutdown` per item, but a flag raised during the *final* batch's passes
+    // would otherwise go unobserved and publish the staging tree anyway; this
+    // guard turns that into a clean abort with `dest` left empty. Once
+    // `move_temp_to_dest` is entered there is no resumable mid-state, so it
+    // (and the post-publication `apply_dir_metadata` pass) deliberately do not
+    // poll the flag.
+    #[cfg(test)]
+    fault_pre_publish_shutdown(&temp_root, shutdown);
+    check_interrupted(shutdown).map_err(&cleanup)?;
     finalize::move_temp_to_dest(&temp_root, &dest_root)?;
 
     // Directory metadata (F1/F2: chown → xattrs → mode → mtime, deepest-first)
@@ -579,6 +622,118 @@ pub(super) fn apply_item_xattrs(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Pre-publish cancellation fault (tests only).
+//
+// The final `flush_batch` runs *before* `for_each_decoded_item` returns, so a
+// filter-driven cancel on the last item is always caught by the per-item guard
+// and can never reach the window between "staging complete" and "rename into
+// dest". This hook opens that window deliberately: it fires once, records how
+// much was staged, and raises the shutdown flag. Thread-local for the same
+// reason as `finalize`'s fault state — the restore orchestration is a serial
+// pass on the test's own thread.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+thread_local! {
+    /// While set, the pre-publish guard's cancellation point fires.
+    static FAULT_PRE_PUBLISH_CANCEL: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    /// Regular files present under `temp_root` when the fault last fired.
+    static PRE_PUBLISH_STAGED_FILES: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    /// `Some(n)` raises the shutdown flag on the n-th staging-loop iteration.
+    static FAULT_CANCEL_AT_STAGED_FILE: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+    /// Staging-loop iterations run since the fault was armed.
+    static STAGING_LOOP_ITERATIONS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+struct PrePublishFaultGuard;
+
+#[cfg(test)]
+impl PrePublishFaultGuard {
+    /// Fire the cancellation point between "staging complete" and the rename.
+    fn arm_pre_publish() -> Self {
+        FAULT_PRE_PUBLISH_CANCEL.with(|c| c.set(true));
+        PRE_PUBLISH_STAGED_FILES.with(|c| c.set(0));
+        PrePublishFaultGuard
+    }
+
+    /// Raise the shutdown flag on the `n`-th (0-based) staging-loop iteration,
+    /// simulating a signal that arrives while Phase 3 is creating files.
+    fn arm_staging_cancel(n: usize) -> Self {
+        FAULT_CANCEL_AT_STAGED_FILE.with(|c| c.set(Some(n)));
+        STAGING_LOOP_ITERATIONS.with(|c| c.set(0));
+        PrePublishFaultGuard
+    }
+
+    /// Number of staged files observed when the pre-publish fault fired.
+    fn staged_files(&self) -> usize {
+        PRE_PUBLISH_STAGED_FILES.with(std::cell::Cell::get)
+    }
+
+    /// Number of staging-loop iterations that actually ran.
+    fn staging_iterations(&self) -> usize {
+        STAGING_LOOP_ITERATIONS.with(std::cell::Cell::get)
+    }
+}
+
+#[cfg(test)]
+impl Drop for PrePublishFaultGuard {
+    fn drop(&mut self) {
+        FAULT_PRE_PUBLISH_CANCEL.with(|c| c.set(false));
+        PRE_PUBLISH_STAGED_FILES.with(|c| c.set(0));
+        FAULT_CANCEL_AT_STAGED_FILE.with(|c| c.set(None));
+        STAGING_LOOP_ITERATIONS.with(|c| c.set(0));
+    }
+}
+
+#[cfg(test)]
+fn fault_pre_publish_shutdown(temp_root: &Path, shutdown: Option<&AtomicBool>) {
+    if !FAULT_PRE_PUBLISH_CANCEL.with(std::cell::Cell::get) {
+        return;
+    }
+    PRE_PUBLISH_STAGED_FILES.with(|c| c.set(count_staged_files(temp_root)));
+    if let Some(flag) = shutdown {
+        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Counts staging-loop iterations and, when armed, raises the shutdown flag on
+/// the chosen one. Called *after* that iteration's guard, so the armed
+/// iteration still completes and the following one is the first to abort.
+#[cfg(test)]
+fn fault_staging_loop(shutdown: Option<&AtomicBool>) {
+    let idx = STAGING_LOOP_ITERATIONS.with(|c| {
+        let v = c.get();
+        c.set(v + 1);
+        v
+    });
+    if FAULT_CANCEL_AT_STAGED_FILE.with(std::cell::Cell::get) == Some(idx) {
+        if let Some(flag) = shutdown {
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+#[cfg(test)]
+fn count_staged_files(root: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|e| match e.file_type() {
+            Ok(ft) if ft.is_dir() => count_staged_files(&e.path()),
+            Ok(ft) if ft.is_file() => 1,
+            _ => 0,
+        })
+        .sum()
+}
+
 /// If `result` is `Err`, record a metadata warning describing the failure.
 pub(super) fn warn_metadata_err<T>(
     stats: &mut RestoreStats,
@@ -669,6 +824,197 @@ mod tests {
         let (count, example) = detect_raw_entries(&mixed).unwrap().unwrap();
         assert_eq!(count, 1);
         assert_eq!(example, raw_display);
+    }
+
+    // -----------------------------------------------------------------------
+    // Cancellation
+    // -----------------------------------------------------------------------
+
+    /// Like [`restore_fixture`] but every source file is zero-length, so the
+    /// whole restore happens in the Phase 3 staging loop and Phase 4 has no
+    /// read groups at all.
+    fn restore_fixture_empty_files(
+        tmp: &Path,
+        files: usize,
+    ) -> (crate::config::VykarConfig, std::path::PathBuf) {
+        let repo_dir = tmp.join("repo");
+        let source_dir = tmp.join("source");
+        let dest = tmp.join("dest");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        std::fs::create_dir_all(&source_dir).unwrap();
+
+        let config = crate::tests::helpers::init_repo(&repo_dir);
+        for i in 0..files {
+            std::fs::write(source_dir.join(format!("e{i:03}.txt")), b"").unwrap();
+        }
+        crate::tests::helpers::backup_single_source(&config, &source_dir, "src", "snap-cancel");
+        (config, dest)
+    }
+
+    /// Repo + populated source + empty destination, ready for a restore.
+    fn restore_fixture(
+        tmp: &Path,
+        files: usize,
+    ) -> (crate::config::VykarConfig, std::path::PathBuf) {
+        let repo_dir = tmp.join("repo");
+        let source_dir = tmp.join("source");
+        let dest = tmp.join("dest");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        std::fs::create_dir_all(&source_dir).unwrap();
+
+        let config = crate::tests::helpers::init_repo(&repo_dir);
+        for i in 0..files {
+            std::fs::write(
+                source_dir.join(format!("f{i}.txt")),
+                format!("restore-cancel-payload-{i}"),
+            )
+            .unwrap();
+        }
+        crate::tests::helpers::backup_single_source(&config, &source_dir, "src", "snap-cancel");
+        (config, dest)
+    }
+
+    /// `dest` holds nothing at all — in particular no `.vykar-restore-<16 hex>`
+    /// staging directory, which is what a killed restore leaves behind.
+    fn assert_dest_clean(dest: &Path) {
+        let entries: Vec<String> = std::fs::read_dir(dest)
+            .map(|it| {
+                it.flatten()
+                    .filter_map(|e| e.file_name().into_string().ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            entries.is_empty(),
+            "destination must be empty after a cancelled restore, found: {entries:?}"
+        );
+        assert!(
+            !entries
+                .iter()
+                .any(|n| is_reserved_temp_dir_name(OsStr::new(n))),
+            "a staging directory survived: {entries:?}"
+        );
+    }
+
+    /// Cancelling part-way through the item stream aborts the restore and leaves
+    /// the destination untouched. The filter closure is the injection point: it
+    /// runs once per item, so raising the flag on the third item cancels
+    /// deterministically mid-stream through the real code path.
+    #[test]
+    fn restore_cancelled_mid_stream_leaves_destination_clean() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (config, dest) = restore_fixture(tmp.path(), 8);
+
+        let flag = AtomicBool::new(false);
+        let mut seen = 0usize;
+        let err = restore_with_filter(
+            &config,
+            None,
+            "snap-cancel",
+            dest.to_str().unwrap(),
+            false,
+            false,
+            |_path| {
+                seen += 1;
+                if seen == 3 {
+                    flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                true
+            },
+            Some(&flag),
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(err, VykarError::Interrupted),
+            "expected Interrupted, got: {err}"
+        );
+        // Exactly three: the walk must stop at the very next item, not run the
+        // stream to completion and only notice at the batch boundary. The
+        // snapshot has 9 items (8 files + the source directory), so a missing
+        // per-item guard shows up here as `seen == 9`.
+        assert_eq!(
+            seen, 3,
+            "cancellation must be observed between files, not per batch"
+        );
+        assert_dest_clean(&dest);
+    }
+
+    /// A signal arriving *during* Phase 3 must stop the staging loop at the next
+    /// file, not let it create the rest of the batch first. A snapshot of empty
+    /// files is restored entirely in this loop — there are no read groups, so
+    /// Phase 4 never runs and cannot poll on its behalf.
+    ///
+    /// The assertion is on the iteration count, not just the error: the
+    /// `flush_batch` entry guard already turns a flag raised *before* the batch
+    /// into `Interrupted`, so an error alone would pass with the per-file guard
+    /// deleted. Without it the loop runs all 12 iterations.
+    #[test]
+    fn restore_cancelled_during_staging_stops_at_next_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (config, dest) = restore_fixture_empty_files(tmp.path(), 12);
+
+        let fault = PrePublishFaultGuard::arm_staging_cancel(4);
+        let flag = AtomicBool::new(false);
+        let err = restore_with_filter(
+            &config,
+            None,
+            "snap-cancel",
+            dest.to_str().unwrap(),
+            false,
+            false,
+            |_path| true,
+            Some(&flag),
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(err, VykarError::Interrupted),
+            "expected Interrupted, got: {err}"
+        );
+        assert_eq!(
+            fault.staging_iterations(),
+            5,
+            "the staging loop must abort at the file after the signal"
+        );
+        assert_dest_clean(&dest);
+    }
+
+    /// The window a filter-driven cancel can never reach: staging is complete
+    /// and the only thing left is the rename into `dest`. The final
+    /// `flush_batch` runs *after* `for_each_decoded_item` returns, so a flag set
+    /// on the last item is caught by that closure's own guard — hence the
+    /// injection hook. Deleting the pre-publish guard makes this test fail with
+    /// a fully populated `dest`.
+    #[test]
+    fn restore_cancelled_after_staging_does_not_publish() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (config, dest) = restore_fixture(tmp.path(), 8);
+
+        let fault = PrePublishFaultGuard::arm_pre_publish();
+        let flag = AtomicBool::new(false);
+        let err = restore_with_filter(
+            &config,
+            None,
+            "snap-cancel",
+            dest.to_str().unwrap(),
+            false,
+            false,
+            |_path| true,
+            Some(&flag),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            fault.staged_files(),
+            8,
+            "the staging tree must be fully populated at the moment of injection"
+        );
+        assert!(
+            matches!(err, VykarError::Interrupted),
+            "expected Interrupted, got: {err}"
+        );
+        assert_dest_clean(&dest);
     }
 
     #[test]

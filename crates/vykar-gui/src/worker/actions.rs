@@ -41,6 +41,9 @@ pub(super) fn handle_restore_selected(
                 &path_set,
                 repo.config.xattrs.enabled,
                 false, // verify_chunks
+                // Taken after `OpGuard::ui`, which resets the flag at
+                // operation start (see `with_repo_op`).
+                Some(&ctx.cancel_requested),
             ) {
                 Ok(stats) => {
                     send_log(

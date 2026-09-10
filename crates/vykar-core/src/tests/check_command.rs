@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::commands;
@@ -107,6 +108,7 @@ fn sampled_check_preserves_local_fallback_counters() {
                 None,
                 50,
                 false,
+                None,
             )
             .unwrap();
             assert!(result.errors.is_empty());
@@ -219,6 +221,7 @@ fn check_with_progress_emits_phase_events() {
         Some(&mut on_progress),
         100,
         false,
+        None,
     )
     .unwrap();
     assert!(result.errors.is_empty());
@@ -408,6 +411,7 @@ fn test_server_fallback_no_stale_errors() {
         true,
         vykar_types::hash::HashAlgorithm::Blake2b,
         &mut progress,
+        None,
     );
 
     match outcome {
@@ -562,7 +566,7 @@ fn pick_data_only_pack(
     let mut affected: Vec<(String, String, usize, vykar_types::snapshot_id::SnapshotId)> =
         Vec::new();
     for entry in &entries {
-        let stream = load_snapshot_item_stream(&mut repo, &entry.name).unwrap();
+        let stream = load_snapshot_item_stream(&mut repo, &entry.name, None).unwrap();
         let mut idx: usize = 0;
         for_each_decoded_item(&stream, |item| {
             let i = idx;
@@ -704,7 +708,8 @@ fn check_repair_dry_run_includes_item_impact() {
     assert!(!expected_items.is_empty());
 
     let result =
-        commands::check::run_with_repair(&config, None, false, RepairMode::PlanOnly, None).unwrap();
+        commands::check::run_with_repair(&config, None, false, RepairMode::PlanOnly, None, None)
+            .unwrap();
 
     assert!(
         !result.check_result.item_impacts.is_empty(),
@@ -769,7 +774,8 @@ fn repair_drops_items_via_missing_pack_keeps_snapshot() {
     std::fs::remove_file(repo_dir.join(deleted_pack.storage_key())).unwrap();
 
     let result =
-        commands::check::run_with_repair(&config, None, false, RepairMode::Apply, None).unwrap();
+        commands::check::run_with_repair(&config, None, false, RepairMode::Apply, None, None)
+            .unwrap();
 
     let drop_actions: Vec<_> = result
         .applied
@@ -814,6 +820,7 @@ fn repair_drops_items_via_missing_pack_keeps_snapshot() {
         None,
         false,
         false,
+        None,
     )
     .unwrap();
     for name in &file_names {
@@ -854,7 +861,8 @@ fn repair_falls_back_to_whole_snapshot_when_all_items_affected() {
     std::fs::remove_file(repo_dir.join(deleted_pack.storage_key())).unwrap();
 
     let result =
-        commands::check::run_with_repair(&config, None, false, RepairMode::Apply, None).unwrap();
+        commands::check::run_with_repair(&config, None, false, RepairMode::Apply, None, None)
+            .unwrap();
 
     let has_drop = result
         .applied
@@ -899,7 +907,8 @@ fn repair_dry_run_emits_drop_items_from_snapshot() {
     std::fs::remove_file(repo_dir.join(deleted_pack.storage_key())).unwrap();
 
     let result =
-        commands::check::run_with_repair(&config, None, false, RepairMode::PlanOnly, None).unwrap();
+        commands::check::run_with_repair(&config, None, false, RepairMode::PlanOnly, None, None)
+            .unwrap();
 
     let drops: Vec<&RepairAction> = result
         .plan
@@ -976,7 +985,8 @@ fn repair_drops_items_rebuilds_refcounts() {
     std::fs::remove_file(repo_dir.join(deleted_pack.storage_key())).unwrap();
 
     let result =
-        commands::check::run_with_repair(&config, None, false, RepairMode::Apply, None).unwrap();
+        commands::check::run_with_repair(&config, None, false, RepairMode::Apply, None, None)
+            .unwrap();
     assert!(result
         .applied
         .iter()
@@ -1006,6 +1016,7 @@ fn repair_drops_items_rebuilds_refcounts() {
         None,
         false,
         false,
+        None,
     )
     .unwrap();
     let restored = walk_find_file(&dest, "z.bin").expect("z.bin missing after restore");
@@ -1073,14 +1084,15 @@ fn check_flags_unsupported_version_and_repair_refuses() {
 
     // Both repair modes refuse before producing a plan / mutating anything.
     let plan_err =
-        commands::check::run_with_repair(&config, None, false, RepairMode::PlanOnly, None)
+        commands::check::run_with_repair(&config, None, false, RepairMode::PlanOnly, None, None)
             .unwrap_err()
             .to_string();
     assert!(plan_err.contains("aborting repair"), "got: {plan_err}");
 
-    let apply_err = commands::check::run_with_repair(&config, None, false, RepairMode::Apply, None)
-        .unwrap_err()
-        .to_string();
+    let apply_err =
+        commands::check::run_with_repair(&config, None, false, RepairMode::Apply, None, None)
+            .unwrap_err()
+            .to_string();
     assert!(apply_err.contains("aborting repair"), "got: {apply_err}");
 }
 
@@ -1158,7 +1170,7 @@ fn check_repair_refuses_on_incompatible_envelope() {
     let (config, _repo_dir) = repo_with_future_envelope_snapshot(tmp.path());
 
     for mode in [RepairMode::PlanOnly, RepairMode::Apply] {
-        let err = commands::check::run_with_repair(&config, None, false, mode, None)
+        let err = commands::check::run_with_repair(&config, None, false, mode, None, None)
             .unwrap_err()
             .to_string();
         assert!(
@@ -1182,9 +1194,10 @@ fn check_repair_apply_writes_nothing_for_incompatible_envelope() {
         "fixture must leave a snapshot blob on disk"
     );
 
-    let apply_err = commands::check::run_with_repair(&config, None, false, RepairMode::Apply, None)
-        .unwrap_err()
-        .to_string();
+    let apply_err =
+        commands::check::run_with_repair(&config, None, false, RepairMode::Apply, None, None)
+            .unwrap_err()
+            .to_string();
     assert!(apply_err.contains("aborting repair"), "got: {apply_err}");
 
     let after = collect_repo_files(&repo_dir);
@@ -1265,9 +1278,10 @@ fn check_repair_apply_writes_nothing_for_unsupported_version() {
 
     let before = collect_repo_files(&repo_dir);
 
-    let apply_err = commands::check::run_with_repair(&config, None, false, RepairMode::Apply, None)
-        .unwrap_err()
-        .to_string();
+    let apply_err =
+        commands::check::run_with_repair(&config, None, false, RepairMode::Apply, None, None)
+            .unwrap_err()
+            .to_string();
     assert!(apply_err.contains("aborting repair"), "got: {apply_err}");
 
     let after = collect_repo_files(&repo_dir);
@@ -1316,6 +1330,7 @@ fn small_file_non_utf8_name_round_trips_via_sequential_path() {
         None,
         false,
         false,
+        None,
     )
     .unwrap();
 
@@ -1355,4 +1370,326 @@ fn walk_find_file(root: &std::path::Path, name: &str) -> Option<std::path::PathB
         }
     }
     None
+}
+
+// ---------------------------------------------------------------------------
+// Cancellation
+//
+// The progress callback is the lever here: it is `FnMut`, so a test closure can
+// raise the shutdown flag on a chosen event and drive a precise cancellation
+// point through the real code path with no mock backend.
+//
+// Scope note, so a later reader does not over-read these tests: cancellation is
+// designed to surface as `Err(VykarError::Interrupted)` from *every* exit, so
+// the individual re-raise guards inside `scan.rs` (which stop a cancellation
+// being reclassified as an `UnreadableSnapshot` issue) are defence in depth and
+// are not independently observable through the public API — a run that reaches
+// them still returns `Interrupted` via the next loop-head or the scan's final
+// guard. What these tests do pin is the outer contract: a cancelled check is an
+// error, never a short `Ok`, and never a corruption report.
+// ---------------------------------------------------------------------------
+
+/// Repo with one source and `snapshots` snapshots, plus a scratch cache dir.
+fn repo_for_cancel_tests(
+    tmp: &std::path::Path,
+    snapshots: usize,
+) -> (crate::config::VykarConfig, std::path::PathBuf) {
+    let repo_dir = tmp.join("repo");
+    let source_dir = tmp.join("source");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    std::fs::create_dir_all(&source_dir).unwrap();
+
+    let config = init_repo(&repo_dir);
+    for i in 0..snapshots {
+        std::fs::write(source_dir.join(format!("file{i}.txt")), format!("data-{i}")).unwrap();
+        backup_single_source(&config, &source_dir, "src-a", &format!("snap-{i}"));
+    }
+    (config, repo_dir)
+}
+
+/// Files the check-state writer would have created under an explicit cache dir.
+fn check_state_files(cache_dir: &std::path::Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(cache_dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| n.starts_with("check."))
+        .collect()
+}
+
+fn assert_interrupted<T: std::fmt::Debug>(result: Result<T>) {
+    match result {
+        Err(VykarError::Interrupted) => {}
+        Err(e) => panic!("expected Interrupted, got error: {e}"),
+        Ok(v) => panic!("expected Interrupted, got Ok({v:?})"),
+    }
+}
+
+/// Cancelling on the first `SnapshotStarted` aborts the scan mid-Phase-1.
+#[test]
+fn check_cancelled_mid_scan_returns_interrupted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (config, _repo_dir) = repo_for_cancel_tests(tmp.path(), 2);
+
+    let flag = AtomicBool::new(false);
+    let mut cb = |evt: commands::check::CheckProgressEvent| {
+        if matches!(
+            evt,
+            commands::check::CheckProgressEvent::SnapshotStarted { .. }
+        ) {
+            flag.store(true, Ordering::Relaxed);
+        }
+    };
+
+    let result = commands::check::run_with_progress(
+        &config,
+        None,
+        false,
+        false,
+        Some(&mut cb),
+        100,
+        false,
+        Some(&flag),
+    );
+    assert_interrupted(result);
+}
+
+/// The awkward case: the flag is raised by a callback fired *after* the last
+/// loop-level poll. With `verify_data = false` nothing downstream of
+/// `PacksExistenceProgress` polls again, so only the guard at the end of
+/// `integrity_scan` can catch this.
+#[test]
+fn check_cancelled_on_late_callback_returns_interrupted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (config, _repo_dir) = repo_for_cancel_tests(tmp.path(), 1);
+
+    let flag = AtomicBool::new(false);
+    let mut cb = |evt: commands::check::CheckProgressEvent| {
+        if matches!(
+            evt,
+            commands::check::CheckProgressEvent::PacksExistenceProgress { .. }
+        ) {
+            flag.store(true, Ordering::Relaxed);
+        }
+    };
+
+    let result = commands::check::run_with_progress(
+        &config,
+        None,
+        false,
+        false,
+        Some(&mut cb),
+        100,
+        false,
+        Some(&flag), // verify_data = false: no later phase polls the flag
+    );
+    assert_interrupted(result);
+}
+
+/// An interrupted 100% check must not stamp "full check succeeded" — doing so
+/// would suppress the next real full check for the whole `full_every` interval.
+/// Paired with a control run so the assertion cannot pass vacuously.
+#[test]
+fn interrupted_check_does_not_record_full_check() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut config, _repo_dir) = repo_for_cancel_tests(tmp.path(), 1);
+
+    // Control: an uninterrupted 100% run with record_state does write the file.
+    let control_cache = tmp.path().join("cache-control");
+    std::fs::create_dir_all(&control_cache).unwrap();
+    config.cache_dir = Some(control_cache.to_string_lossy().into_owned());
+    let control =
+        commands::check::run_with_progress(&config, None, false, false, None, 100, true, None)
+            .unwrap();
+    assert!(control.errors.is_empty(), "control run must be clean");
+    assert_eq!(
+        check_state_files(&control_cache).len(),
+        1,
+        "control run should have recorded a full check"
+    );
+
+    // Interrupted: same settings, fresh cache dir, cancelled mid-scan.
+    let cancel_cache = tmp.path().join("cache-cancel");
+    std::fs::create_dir_all(&cancel_cache).unwrap();
+    config.cache_dir = Some(cancel_cache.to_string_lossy().into_owned());
+
+    let flag = AtomicBool::new(false);
+    let mut cb = |evt: commands::check::CheckProgressEvent| {
+        if matches!(
+            evt,
+            commands::check::CheckProgressEvent::SnapshotStarted { .. }
+        ) {
+            flag.store(true, Ordering::Relaxed);
+        }
+    };
+    let result = commands::check::run_with_progress(
+        &config,
+        None,
+        false,
+        false,
+        Some(&mut cb),
+        100,
+        true,
+        Some(&flag),
+    );
+    assert_interrupted(result);
+
+    assert!(
+        check_state_files(&cancel_cache).is_empty(),
+        "interrupted check must not record a full-check timestamp"
+    );
+    // Fingerprint is irrelevant with no state file: the lookup fails open.
+    assert!(
+        crate::app::check_state::full_check_is_due(
+            &config.repository.url,
+            "any-fingerprint",
+            Some(&cancel_cache),
+            std::time::Duration::from_secs(60 * 60 * 24 * 60),
+        ),
+        "a full check must still be due after an interrupted run"
+    );
+}
+
+/// On an empty repository every loop runs zero iterations, so a pre-set flag
+/// must not produce a clean `Ok` that records success for work that never ran.
+///
+/// The second half is the part that isolates the *entry* guard: with
+/// `max_percent = 0` and no `full_every`, `run_with_progress` returns before it
+/// even opens the repository, so no scan-level guard can be reached.
+#[test]
+fn pre_cancelled_check_on_empty_repository_returns_interrupted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = tmp.path().join("repo");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    let mut config = init_repo(&repo_dir);
+    let cache = tmp.path().join("cache");
+    std::fs::create_dir_all(&cache).unwrap();
+    config.cache_dir = Some(cache.to_string_lossy().into_owned());
+
+    let flag = AtomicBool::new(true);
+    let result = commands::check::run_with_progress(
+        &config,
+        None,
+        false,
+        false,
+        None,
+        100,
+        true,
+        Some(&flag),
+    );
+    assert_interrupted(result);
+    assert!(
+        check_state_files(&cache).is_empty(),
+        "a check that never ran must not record success"
+    );
+
+    // Pre-open early exit: without the entry guard this returns Ok(skipped).
+    config.check.full_every = None;
+    let result =
+        commands::check::run_with_progress(&config, None, false, false, None, 0, true, Some(&flag));
+    assert_interrupted(result);
+}
+
+/// Phase 2b re-walks every snapshot's item stream when packs are missing. A
+/// cancel there must abort rather than hand back a silently truncated
+/// `item_impacts` list.
+#[test]
+fn missing_pack_rescan_is_cancellable() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (config, repo_dir) = repo_for_cancel_tests(tmp.path(), 1);
+
+    // Delete one pack so `missing_packs` is non-empty and Phase 2b runs.
+    let pack_path = {
+        let repo = open_local_repo(&repo_dir);
+        let pack_id = repo
+            .chunk_index()
+            .iter()
+            .next()
+            .expect("repo has at least one indexed chunk")
+            .1
+            .pack_id;
+        repo_dir.join(pack_id.storage_key())
+    };
+    std::fs::remove_file(&pack_path).unwrap();
+
+    // Raised once pack existence has resolved, i.e. just before Phase 2b.
+    let flag = AtomicBool::new(false);
+    let mut cb = |evt: commands::check::CheckProgressEvent| {
+        if matches!(
+            evt,
+            commands::check::CheckProgressEvent::PacksExistenceProgress { .. }
+        ) {
+            flag.store(true, Ordering::Relaxed);
+        }
+    };
+    let result = commands::check::run_with_progress(
+        &config,
+        None,
+        false,
+        false,
+        Some(&mut cb),
+        100,
+        false,
+        Some(&flag),
+    );
+    assert_interrupted(result);
+}
+
+/// Repair is cancellable up to the mutation boundary and inert past it.
+///
+/// What this covers: the entry guard, in both `PlanOnly` and apply mode. What it
+/// does **not** cover: the post-`plan_repair` guard, which is defence in depth
+/// and not independently isolable without another injection hook.
+#[test]
+fn repair_aborts_before_mutating() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (config, repo_dir) = repo_for_cancel_tests(tmp.path(), 1);
+
+    let flag = AtomicBool::new(true);
+    assert_interrupted(commands::check::run_with_repair(
+        &config,
+        None,
+        false,
+        RepairMode::PlanOnly,
+        None,
+        Some(&flag),
+    ));
+
+    // Apply mode: nothing about the repository may change.
+    let snapshots_before = sorted_dir_listing(&repo_dir.join("snapshots"));
+    let index_before = std::fs::read(repo_dir.join("index")).unwrap();
+
+    assert_interrupted(commands::check::run_with_repair(
+        &config,
+        None,
+        false,
+        RepairMode::Apply,
+        None,
+        Some(&flag),
+    ));
+
+    assert_eq!(
+        snapshots_before,
+        sorted_dir_listing(&repo_dir.join("snapshots")),
+        "snapshot list must be unchanged"
+    );
+    assert_eq!(
+        index_before,
+        std::fs::read(repo_dir.join("index")).unwrap(),
+        "index must be byte-identical"
+    );
+}
+
+fn sorted_dir_listing(dir: &std::path::Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .map(|it| {
+            it.flatten()
+                .filter_map(|e| e.file_name().into_string().ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
 }

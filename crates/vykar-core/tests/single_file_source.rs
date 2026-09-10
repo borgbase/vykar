@@ -71,6 +71,7 @@ fn backup_and_restore_single_file_source() {
         None,
         false,
         false,
+        None,
     )
     .unwrap();
     assert_eq!(stats.files, 1);
@@ -94,6 +95,7 @@ fn backup_and_restore_single_file_source() {
         None,
         false,
         false,
+        None,
     )
     .unwrap();
     assert_eq!(
@@ -131,6 +133,7 @@ fn backup_mixed_file_and_directory_sources() {
         None,
         false,
         false,
+        None,
     )
     .unwrap();
 

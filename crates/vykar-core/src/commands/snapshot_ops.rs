@@ -29,7 +29,7 @@ pub fn try_cleanup_deleted_snapshot_refs(
     warnings: &mut Vec<String>,
 ) -> Option<SnapshotChunkImpact> {
     let result = (|| -> Result<SnapshotChunkImpact> {
-        let items_stream = list::load_item_stream_from_ptrs(repo, item_ptrs)?;
+        let items_stream = list::load_item_stream_from_ptrs(repo, item_ptrs, None)?;
         decrement_chunk_refs_on_index(repo.chunk_index_mut(), &items_stream, item_ptrs)
     })();
     match result {

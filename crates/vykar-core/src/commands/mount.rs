@@ -828,7 +828,7 @@ pub fn run_with_progress(
         cb(MountProgressEvent::LoadingSnapshots);
     }
     let tree = if let Some(name) = snapshot_name {
-        let items = list_cmd::load_snapshot_items(&mut repo, name)?;
+        let items = list_cmd::load_snapshot_items(&mut repo, name, None)?;
         if let Some(ref mut cb) = progress {
             cb(MountProgressEvent::SnapshotLoaded {
                 name: name.to_string(),
@@ -849,7 +849,7 @@ pub fn run_with_progress(
                 .collect()
         };
         for entry in &entries {
-            let items = list_cmd::load_snapshot_items(&mut repo, &entry.name)?;
+            let items = list_cmd::load_snapshot_items(&mut repo, &entry.name, None)?;
             if let Some(ref mut cb) = progress {
                 cb(MountProgressEvent::SnapshotLoaded {
                     name: entry.name.clone(),

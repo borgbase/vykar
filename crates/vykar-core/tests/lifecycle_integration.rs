@@ -91,6 +91,7 @@ fn lifecycle_delete_compact_check_and_restore() {
         None,
         config.xattrs.enabled,
         true,
+        None,
     )
     .unwrap();
     assert_eq!(extract_stats.files, 2);
@@ -200,6 +201,7 @@ fn prune_compact_check_and_restore_kept_snapshots() {
         None,
         config.xattrs.enabled,
         false,
+        None,
     )
     .unwrap();
     assert_eq!(
@@ -216,6 +218,7 @@ fn prune_compact_check_and_restore_kept_snapshots() {
         None,
         config.xattrs.enabled,
         false,
+        None,
     )
     .unwrap();
     assert_eq!(
@@ -265,6 +268,7 @@ fn run_encrypted_lifecycle(mode: EncryptionModeConfig, expected_mode: Encryption
         None,
         config.xattrs.enabled,
         false,
+        None,
     )
     .unwrap();
     assert_eq!(
@@ -284,6 +288,7 @@ fn run_encrypted_lifecycle(mode: EncryptionModeConfig, expected_mode: Encryption
         None,
         config.xattrs.enabled,
         false,
+        None,
     );
     assert!(matches!(wrong_extract, Err(VykarError::DecryptionFailed)));
 
@@ -479,9 +484,13 @@ fn restore_loads_items_via_restore_cache_without_index() {
         .expect("restore cache should exist after backup");
 
     // Load items via cache — should succeed without loading full index
-    let items =
-        commands::list::load_snapshot_items_via_lookup(&mut repo, "snap1", |id| cache.lookup(id))
-            .unwrap();
+    let items = commands::list::load_snapshot_items_via_lookup(
+        &mut repo,
+        "snap1",
+        |id| cache.lookup(id),
+        None,
+    )
+    .unwrap();
 
     assert!(!items.is_empty());
     assert!(items.iter().any(|i| i.path.contains("file.txt")));
@@ -542,6 +551,7 @@ fn restore_falls_back_to_index_on_cache_miss() {
         None,
         false,
         false,
+        None,
     )
     .unwrap();
 
@@ -590,6 +600,7 @@ fn restore_works_without_restore_cache() {
         None,
         false,
         false,
+        None,
     )
     .unwrap();
 

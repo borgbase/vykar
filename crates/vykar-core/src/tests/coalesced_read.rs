@@ -1,7 +1,13 @@
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
+
+use vykar_storage::{delegate_storage_backend, InnerBackend, StorageBackend};
+use vykar_types::error::{Result, VykarError};
+
 use crate::compress::Compression;
 use crate::repo::pack::PackType;
 use crate::repo::Repository;
-use crate::testutil::{init_test_environment, PutLog, RecordingBackend};
+use crate::testutil::{init_test_environment, MemoryBackend, PutLog, RecordingBackend};
 
 fn repo_on_counting_backend() -> (Repository, PutLog) {
     init_test_environment();
@@ -73,7 +79,8 @@ fn adjacent_blobs_coalesce_into_single_read() {
     log.reset_get_range_count();
 
     let mut out = Vec::new();
-    repo.read_chunks_coalesced_into(&chunks, &mut out).unwrap();
+    repo.read_chunks_coalesced_into(&chunks, &mut out, None)
+        .unwrap();
 
     // Should have been a single coalesced get_range call.
     assert_eq!(log.get_range_count(), 1, "expected 1 coalesced get_range");
@@ -99,7 +106,8 @@ fn cache_hits_skip_network() {
 
     log.reset_get_range_count();
     let mut out = Vec::new();
-    repo.read_chunks_coalesced_into(&chunks, &mut out).unwrap();
+    repo.read_chunks_coalesced_into(&chunks, &mut out, None)
+        .unwrap();
 
     assert_eq!(
         log.get_range_count(),
@@ -144,7 +152,8 @@ fn cross_pack_grouping() {
     log.reset_get_range_count();
 
     let mut out = Vec::new();
-    repo.read_chunks_coalesced_into(&chunks, &mut out).unwrap();
+    repo.read_chunks_coalesced_into(&chunks, &mut out, None)
+        .unwrap();
 
     // One get_range per pack.
     assert_eq!(
@@ -197,7 +206,8 @@ fn output_order_preserved_across_packs() {
     repo.clear_blob_cache();
 
     let mut out = Vec::new();
-    repo.read_chunks_coalesced_into(&chunks, &mut out).unwrap();
+    repo.read_chunks_coalesced_into(&chunks, &mut out, None)
+        .unwrap();
 
     let mut expected = Vec::new();
     expected.extend_from_slice(&repo.read_chunk(&id_a1).unwrap());
@@ -215,7 +225,8 @@ fn empty_input_is_noop() {
     log.reset_get_range_count();
 
     let mut out = Vec::new();
-    repo.read_chunks_coalesced_into(&[], &mut out).unwrap();
+    repo.read_chunks_coalesced_into(&[], &mut out, None)
+        .unwrap();
 
     assert!(out.is_empty());
     assert_eq!(log.get_range_count(), 0);
@@ -266,7 +277,8 @@ fn large_gap_splits_into_separate_reads() {
     log.reset_get_range_count();
 
     let mut out = Vec::new();
-    repo.read_chunks_coalesced_into(&chunks, &mut out).unwrap();
+    repo.read_chunks_coalesced_into(&chunks, &mut out, None)
+        .unwrap();
 
     // Gap exceeds threshold — should be 2 separate get_range calls.
     assert_eq!(
@@ -296,7 +308,7 @@ fn duplicate_chunk_ids_coalesce_into_single_range_read() {
     log.reset_get_range_count();
 
     let mut out = Vec::new();
-    repo.read_chunks_coalesced_into(&dup_chunks, &mut out)
+    repo.read_chunks_coalesced_into(&dup_chunks, &mut out, None)
         .unwrap();
 
     // Duplicates sit at the same pack offset and coalesce into one range read.
@@ -315,4 +327,134 @@ fn duplicate_chunk_ids_coalesce_into_single_range_read() {
     expected.extend_from_slice(&c0);
     expected.extend_from_slice(&c1);
     assert_eq!(out, expected);
+}
+
+// ---------------------------------------------------------------------------
+// Cancellation
+// ---------------------------------------------------------------------------
+
+/// Backend that raises a shared cancellation flag from *inside* the first
+/// `get_range`, and counts how many range reads were issued. Lets a test prove
+/// the read loop polls between storage requests rather than only at entry.
+struct CancelOnFirstReadBackend {
+    inner: MemoryBackend,
+    flag: Arc<AtomicBool>,
+    reads: Arc<AtomicUsize>,
+}
+
+impl InnerBackend for CancelOnFirstReadBackend {
+    fn inner_backend(&self) -> &dyn StorageBackend {
+        &self.inner
+    }
+}
+
+delegate_storage_backend! {
+    for CancelOnFirstReadBackend;
+    except [get_range];
+
+    fn get_range(&self, key: &str, offset: u64, length: u64) -> Result<Option<Vec<u8>>> {
+        self.reads.fetch_add(1, Ordering::Relaxed);
+        self.flag.store(true, Ordering::Relaxed);
+        self.inner.get_range(key, offset, length)
+    }
+}
+
+/// Build a repo on the cancelling backend and store one chunk per pack, so the
+/// coalescer produces one read group (and therefore one `get_range`) per chunk.
+fn repo_with_cancelling_backend(
+    packs: usize,
+) -> (
+    Repository,
+    Arc<AtomicBool>,
+    Arc<AtomicUsize>,
+    Vec<vykar_types::chunk_id::ChunkId>,
+) {
+    init_test_environment();
+    let flag = Arc::new(AtomicBool::new(false));
+    let reads = Arc::new(AtomicUsize::new(0));
+    let backend = CancelOnFirstReadBackend {
+        inner: MemoryBackend::new(),
+        flag: Arc::clone(&flag),
+        reads: Arc::clone(&reads),
+    };
+    let mut repo = Repository::init(
+        Box::new(backend),
+        crate::repo::EncryptionMode::None,
+        crate::config::ChunkerConfig::default(),
+        None,
+        None,
+        None,
+    )
+    .expect("init");
+    repo.begin_write_session().expect("begin write session");
+
+    let mut ids = Vec::with_capacity(packs);
+    for i in 0..packs {
+        let data = format!("cancel-chunk-{i:04}-padding-to-make-it-unique");
+        let (id, _, _) = repo
+            .store_chunk(data.as_bytes(), Compression::None, PackType::Tree)
+            .unwrap();
+        repo.flush_packs().unwrap();
+        ids.push(id);
+    }
+    repo.clear_blob_cache();
+    reads.store(0, Ordering::Relaxed);
+    (repo, flag, reads, ids)
+}
+
+/// Cancelling during the *first* of several range reads must abort the read
+/// with `Interrupted` after exactly that one request. The pair of assertions is
+/// the point: `Err` alone would also hold for an entry-only check, and a read
+/// count of one alone would also hold for a loop that never polls at all.
+#[test]
+fn coalesced_read_cancels_between_range_reads() {
+    let (mut repo, flag, reads, ids) = repo_with_cancelling_backend(3);
+    let chunks = resolve_chunks(&repo, &ids);
+    assert_eq!(
+        chunks
+            .iter()
+            .map(|c| c.1)
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        3,
+        "expected one pack (and so one read group) per chunk"
+    );
+    assert!(!flag.load(Ordering::Relaxed), "flag must start clear");
+
+    let mut out = Vec::new();
+    let err = repo
+        .read_chunks_coalesced_into(&chunks, &mut out, Some(&flag))
+        .unwrap_err();
+
+    assert!(
+        matches!(err, VykarError::Interrupted),
+        "expected Interrupted, got: {err}"
+    );
+    assert_eq!(
+        reads.load(Ordering::Relaxed),
+        1,
+        "the loop must poll between range reads, not run to completion"
+    );
+}
+
+/// A flag that is already set issues no storage request at all. Kept separate
+/// from the mid-loop test: a pre-set flag trips the first loop-head check
+/// before any read, so on its own it cannot demonstrate mid-loop cancellation.
+#[test]
+fn pre_cancelled_coalesced_read_issues_no_request() {
+    let (mut repo, flag, reads, ids) = repo_with_cancelling_backend(3);
+    let chunks = resolve_chunks(&repo, &ids);
+    flag.store(true, Ordering::Relaxed);
+
+    let mut out = Vec::new();
+    let err = repo
+        .read_chunks_coalesced_into(&chunks, &mut out, Some(&flag))
+        .unwrap_err();
+
+    assert!(
+        matches!(err, VykarError::Interrupted),
+        "expected Interrupted, got: {err}"
+    );
+    assert_eq!(reads.load(Ordering::Relaxed), 0, "expected no range reads");
+    assert!(out.is_empty(), "nothing may be emitted");
 }

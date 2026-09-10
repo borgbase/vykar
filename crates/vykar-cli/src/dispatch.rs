@@ -234,6 +234,7 @@ pub(crate) fn dispatch_command(
             dest.clone(),
             pattern.clone(),
             *verify,
+            shutdown,
         )
         .map(|()| false),
         Commands::Delete {
@@ -265,6 +266,7 @@ pub(crate) fn dispatch_command(
             *repair,
             *dry_run,
             *yes,
+            shutdown,
         )
         .map(|()| false),
         Commands::Info { .. } => cmd::info::run_info(cfg, label).map(|()| false),

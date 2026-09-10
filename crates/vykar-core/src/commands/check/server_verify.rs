@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use super::types::{
@@ -45,6 +46,7 @@ pub(crate) fn try_server_verify(
     verify_data: bool,
     hash: HashAlgorithm,
     progress: &mut Option<&mut dyn FnMut(CheckProgressEvent)>,
+    shutdown: Option<&AtomicBool>,
 ) -> ServerVerifyOutcome {
     let total_packs = pack_chunks.len();
     if total_packs == 0 {
@@ -69,6 +71,11 @@ pub(crate) fn try_server_verify(
 
     let mut offset = 0;
     while offset < pack_list.len() {
+        // Break between round-trips. The partial result is kept; the caller
+        // re-raises the cancellation via `check_interrupted` before using it.
+        if shutdown.is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed)) {
+            break;
+        }
         // Compute batch end respecting both pack count and byte volume.
         // The `end < pack_list.len()` guard makes `pack_list[end]` and
         // `pack_list[offset..end]` in-bounds throughout this block.

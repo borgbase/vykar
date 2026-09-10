@@ -1,3 +1,5 @@
+use std::sync::atomic::AtomicBool;
+
 use vykar_core::commands;
 use vykar_core::config::VykarConfig;
 
@@ -5,6 +7,7 @@ use crate::error::CliResult;
 use crate::format::format_bytes;
 use crate::passphrase::with_repo_passphrase;
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_restore(
     config: &VykarConfig,
     label: Option<&str>,
@@ -12,6 +15,7 @@ pub(crate) fn run_restore(
     dest: String,
     pattern: Option<String>,
     verify: bool,
+    shutdown: Option<&AtomicBool>,
 ) -> CliResult<()> {
     let stats = with_repo_passphrase(config, label, |passphrase| {
         Ok(commands::restore::run(
@@ -22,6 +26,7 @@ pub(crate) fn run_restore(
             pattern.as_deref(),
             config.xattrs.enabled,
             verify,
+            shutdown,
         )?)
     })?;
 

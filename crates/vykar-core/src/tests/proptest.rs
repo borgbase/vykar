@@ -510,6 +510,7 @@ mod backup_restore {
                 None,
                 config.xattrs.enabled,
                 false,
+                None,
             )
             .unwrap();
 

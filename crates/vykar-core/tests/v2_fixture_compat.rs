@@ -198,6 +198,7 @@ fn v2_fixtures_restore_byte_identical() {
             None,
             config.xattrs.enabled,
             true, // verify chunk IDs: the point of the exercise
+            None,
         )
         .unwrap();
 
@@ -329,6 +330,7 @@ fn v2_fixtures_survive_delete_prune_compact_and_restore() {
             None,
             config.xattrs.enabled,
             true,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -378,6 +380,7 @@ fn v2_encrypted_fixtures_reject_a_wrong_passphrase() {
                     None,
                     config.xattrs.enabled,
                     false,
+                    None,
                 ),
                 Err(VykarError::DecryptionFailed)
             ),

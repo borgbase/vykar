@@ -259,6 +259,7 @@ pub fn exercise_pack_naming(
         None,
         xattrs,
         true,
+        None,
     )
     .unwrap();
     assert_eq!(std::fs::read(dest.join("pn-keep.bin")).unwrap(), keep);

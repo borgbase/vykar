@@ -6,6 +6,7 @@ use std::fs::OpenOptions;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::commands::util::check_interrupted;
 use crate::platform::fs;
 use vykar_types::error::{Result, VykarError};
 
@@ -47,8 +48,13 @@ pub(super) fn apply_file_metadata(
     xattrs_enabled: bool,
     restore_as_root: bool,
     stats: &mut RestoreStats,
+    shutdown: Option<&AtomicBool>,
 ) -> Result<()> {
+    // Per-file poll: the pass is short per file but runs up to
+    // `RESTORE_BATCH_FILES` times, each opening an fd and applying
+    // chown -> xattrs -> chmod -> mtime.
     for pf in planned_files {
+        check_interrupted(shutdown)?;
         finalize_one_file(pf, temp_root, xattrs_enabled, restore_as_root, stats)?;
     }
     Ok(())
@@ -195,13 +201,16 @@ pub(super) fn apply_dir_metadata(
 }
 
 /// Symlink metadata pass (F1/F5). No chmod — symlink permission bits are
-/// ignored on Linux. Order: lchown → xattrs → mtime. Infallible (warnings).
+/// ignored on Linux. Order: lchown → xattrs → mtime. Individual metadata
+/// failures are non-fatal (warnings); the only `Err` is a cancellation.
 pub(super) fn apply_symlink_metadata(
     symlinks: &[PlannedNode],
     restore_as_root: bool,
     stats: &mut RestoreStats,
-) {
+    shutdown: Option<&AtomicBool>,
+) -> Result<()> {
     for s in symlinks {
+        check_interrupted(shutdown)?;
         if restore_as_root {
             warn_metadata_err(
                 stats,
@@ -225,6 +234,7 @@ pub(super) fn apply_symlink_metadata(
         #[cfg(test)]
         record_op("mtime", 0, 0);
     }
+    Ok(())
 }
 
 /// Relink hard-link group members to their representatives. Runs after all
@@ -282,9 +292,13 @@ pub(super) fn create_hardlinks(
     xattrs_enabled: bool,
     restore_as_root: bool,
     stats: &mut RestoreStats,
+    shutdown: Option<&AtomicBool>,
 ) -> Result<u64> {
     let mut copied_bytes: u64 = 0;
+    // Per-link poll: not a cheap metadata pass — the EMLINK fallback copies the
+    // representative's whole content for each link it cannot make.
     for link in pending_links {
+        check_interrupted(shutdown)?;
         let Some(rep) = group_reps.get(&link.id) else {
             // A link is only ever queued after its representative is recorded,
             // and representatives are never evicted — so this is unreachable.
@@ -383,6 +397,7 @@ pub(super) fn create_hardlinks(
                             xattrs_enabled,
                             restore_as_root,
                             stats,
+                            shutdown,
                         )?;
                         // Separate inode → a file, not a hard link. Its bytes
                         // were physically written, so they count toward
@@ -840,7 +855,7 @@ mod tests {
     /// own cleanup (rollback).
     fn finalize_phase(files: &[PlannedFile], temp_root: &Path, dest_root: &Path) -> Result<()> {
         let mut stats = RestoreStats::default();
-        if let Err(e) = apply_file_metadata(files, temp_root, false, false, &mut stats) {
+        if let Err(e) = apply_file_metadata(files, temp_root, false, false, &mut stats, None) {
             let _ = force_remove_temp_tree(temp_root);
             return Err(e);
         }
@@ -1044,7 +1059,16 @@ mod tests {
         }];
 
         let mut stats = RestoreStats::default();
-        create_hardlinks(&pending, &group_reps, &temp_root, false, false, &mut stats).unwrap();
+        create_hardlinks(
+            &pending,
+            &group_reps,
+            &temp_root,
+            false,
+            false,
+            &mut stats,
+            None,
+        )
+        .unwrap();
 
         assert_eq!(stats.hardlinks, 1);
         let a_ino = std::fs::metadata(temp_root.join("a.txt")).unwrap().ino();
@@ -1077,9 +1101,17 @@ mod tests {
         }];
 
         let mut stats = RestoreStats::default();
-        let err = create_hardlinks(&pending, &group_reps, &temp_root, false, false, &mut stats)
-            .unwrap_err()
-            .to_string();
+        let err = create_hardlinks(
+            &pending,
+            &group_reps,
+            &temp_root,
+            false,
+            false,
+            &mut stats,
+            None,
+        )
+        .unwrap_err()
+        .to_string();
         assert_eq!(stats.hardlinks, 0);
         assert!(err.contains("no recorded representative"), "got: {err}");
     }
@@ -1122,7 +1154,15 @@ mod tests {
         }];
 
         let mut stats = RestoreStats::default();
-        let result = create_hardlinks(&pending, &group_reps, &temp_root, false, false, &mut stats);
+        let result = create_hardlinks(
+            &pending,
+            &group_reps,
+            &temp_root,
+            false,
+            false,
+            &mut stats,
+            None,
+        );
 
         assert!(result.is_err(), "escaping parent must be rejected");
         assert_eq!(stats.hardlinks, 0);
@@ -1176,8 +1216,16 @@ mod tests {
 
         let mut stats = RestoreStats::default();
         // xattrs_enabled = true so the copy carries the rep's xattrs.
-        let copied =
-            create_hardlinks(&pending, &group_reps, &temp_root, true, false, &mut stats).unwrap();
+        let copied = create_hardlinks(
+            &pending,
+            &group_reps,
+            &temp_root,
+            true,
+            false,
+            &mut stats,
+            None,
+        )
+        .unwrap();
 
         // Counted as a copy, not a hard link.
         assert_eq!(stats.hardlink_copies, 1);
@@ -1253,7 +1301,16 @@ mod tests {
         }];
 
         let mut stats = RestoreStats::default();
-        create_hardlinks(&pending, &group_reps, &temp_root, false, false, &mut stats).unwrap();
+        create_hardlinks(
+            &pending,
+            &group_reps,
+            &temp_root,
+            false,
+            false,
+            &mut stats,
+            None,
+        )
+        .unwrap();
 
         // The external file was never written through the symlink.
         assert_eq!(std::fs::read(&secret).unwrap(), b"DO-NOT-OVERWRITE");
@@ -1311,9 +1368,17 @@ mod tests {
         }];
 
         let mut stats = RestoreStats::default();
-        let err = create_hardlinks(&pending, &group_reps, &temp_root, false, false, &mut stats)
-            .unwrap_err()
-            .to_string();
+        let err = create_hardlinks(
+            &pending,
+            &group_reps,
+            &temp_root,
+            false,
+            false,
+            &mut stats,
+            None,
+        )
+        .unwrap_err()
+        .to_string();
 
         assert!(err.contains("was replaced before relinking"), "got: {err}");
         // External data was neither read into a copy nor linked.
@@ -1370,7 +1435,7 @@ mod tests {
         let mut stats = RestoreStats::default();
         // restore_as_root = true exercises the privileged branch even though the
         // test process is unprivileged (fchown fails → warning, op recorded).
-        apply_file_metadata(&files, &temp_root, false, true, &mut stats).unwrap();
+        apply_file_metadata(&files, &temp_root, false, true, &mut stats, None).unwrap();
 
         assert_eq!(recorded_tags(), vec!["chown", "xattr", "chmod", "mtime"]);
         let chown = recorded_ops()
@@ -1427,7 +1492,7 @@ mod tests {
             xattrs: None,
         }];
         let mut stats = RestoreStats::default();
-        apply_symlink_metadata(&syms, true, &mut stats);
+        apply_symlink_metadata(&syms, true, &mut stats, None).unwrap();
 
         // No chmod for symlinks.
         assert_eq!(recorded_tags(), vec!["lchown", "xattr", "mtime"]);
@@ -1512,7 +1577,7 @@ mod tests {
 
         let mut stats = RestoreStats::default();
         // (1) reopen recovers → Ok.
-        apply_file_metadata(&files, &temp_root, true, false, &mut stats).unwrap();
+        apply_file_metadata(&files, &temp_root, true, false, &mut stats, None).unwrap();
         assert_eq!(
             OPEN_WRITABLE_CALLS.with(|c| c.get()),
             2,
@@ -1552,7 +1617,8 @@ mod tests {
 
         let files = [planned("f.txt", 4)];
         let mut stats = RestoreStats::default();
-        let err = apply_file_metadata(&files, &temp_root, false, false, &mut stats).unwrap_err();
+        let err =
+            apply_file_metadata(&files, &temp_root, false, false, &mut stats, None).unwrap_err();
         assert!(err.to_string().contains("to apply metadata"), "got: {err}");
         // Open attempted exactly once.
         assert_eq!(OPEN_WRITABLE_CALLS.with(|c| c.get()), 1);
@@ -1612,7 +1678,7 @@ mod tests {
             .collect();
 
         let mut stats = RestoreStats::default();
-        apply_file_metadata(&files, &temp_root, false, false, &mut stats).unwrap();
+        apply_file_metadata(&files, &temp_root, false, false, &mut stats, None).unwrap();
 
         for (i, pf) in files.iter().enumerate() {
             let meta = std::fs::metadata(temp_root.join(&pf.rel_path)).unwrap();
@@ -1663,7 +1729,7 @@ mod tests {
 
         let mut stats = RestoreStats::default();
         // restore_as_root = true exercises the chown branch unprivileged.
-        apply_file_metadata(&files, &temp_root, false, true, &mut stats).unwrap();
+        apply_file_metadata(&files, &temp_root, false, true, &mut stats, None).unwrap();
 
         assert_eq!(stats.warnings.len(), cap);
         assert_eq!(

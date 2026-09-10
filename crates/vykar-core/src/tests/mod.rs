@@ -23,4 +23,5 @@ mod prune;
 mod prune_command;
 mod repair;
 mod repo;
+mod restore_cancel;
 mod util_lock;

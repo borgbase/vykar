@@ -98,7 +98,8 @@ pub fn run(
 
                 for target in &targets {
                     check_interrupted(shutdown)?;
-                    let items_stream = load_item_stream_from_ptrs(repo, &target.item_ptrs)?;
+                    let items_stream =
+                        load_item_stream_from_ptrs(repo, &target.item_ptrs, shutdown)?;
                     let impact = decrement_chunk_refs_on_index(
                         &mut scratch,
                         &items_stream,

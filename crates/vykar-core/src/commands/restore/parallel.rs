@@ -11,6 +11,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
+use crate::commands::util::check_interrupted;
 use crate::compress;
 use crate::repo::format::{unpack_object_expect_with_context_into, ObjectType};
 use vykar_crypto::CryptoEngine;
@@ -22,6 +23,14 @@ use vykar_types::pack_id::PackId;
 use super::plan::PlannedFile;
 use super::read_groups::ReadGroup;
 use super::{MAX_OPEN_FILES_PER_GROUP, MAX_WRITE_BATCH};
+
+/// Relaxed poll of the external cancellation flag. Kept separate from the
+/// local `cancelled` flag, which is the failure-propagation channel: this one
+/// is raised by the user (Ctrl-C, GUI Cancel) and is checked at the same two
+/// points, so cancellation granularity is one storage request.
+fn is_shutting_down(shutdown: Option<&AtomicBool>) -> bool {
+    shutdown.is_some_and(|f| f.load(Ordering::Relaxed))
+}
 
 /// Join every scoped worker of a fail-fast pass, returning the first error
 /// observed (a worker `Err`, or a panic reported as `panic_msg`) and `Ok(())`
@@ -199,7 +208,9 @@ pub(super) fn execute_parallel_restore(
     root: &Path,
     restore_concurrency: usize,
     verify_chunks: bool,
+    shutdown: Option<&AtomicBool>,
 ) -> Result<u64> {
+    check_interrupted(shutdown)?;
     if groups.is_empty() {
         return Ok(0);
     }
@@ -240,6 +251,7 @@ pub(super) fn execute_parallel_restore(
                         root,
                         verify_chunks,
                         chunk_hasher,
+                        shutdown,
                     ) {
                         cancelled.store(true, Ordering::Release);
                         return Err(e);
@@ -260,6 +272,10 @@ pub(super) fn execute_parallel_restore(
         }
 
         join_workers(handles, &cancelled, "restore worker panicked")?;
+        // Workers return `Ok(())` when they stop early, so a cancellation would
+        // otherwise surface as a short but successful byte count — and the
+        // caller would go on to publish a partial tree.
+        check_interrupted(shutdown)?;
         Ok(bytes_written.load(Ordering::Relaxed))
     })
 }
@@ -284,8 +300,9 @@ fn process_read_group(
     root: &Path,
     verify_chunks: bool,
     chunk_hasher: &ChunkHasher,
+    shutdown: Option<&AtomicBool>,
 ) -> Result<()> {
-    if cancelled.load(Ordering::Acquire) {
+    if cancelled.load(Ordering::Acquire) || is_shutting_down(shutdown) {
         return Ok(());
     }
 
@@ -307,7 +324,7 @@ fn process_read_group(
     let mut pw = PendingWrite::new();
 
     for blob in &group.blobs {
-        if cancelled.load(Ordering::Acquire) {
+        if cancelled.load(Ordering::Acquire) || is_shutting_down(shutdown) {
             // Dropping `pw` loses buffered data, but the caller will
             // clean up the temp restore root on error/cancellation so
             // no partial files reach the final destination.
@@ -593,6 +610,7 @@ mod tests {
             temp.path(),
             false,
             &test_chunk_hasher(),
+            None,
         )
         .unwrap_err()
         .to_string();
@@ -659,6 +677,7 @@ mod tests {
             temp.path(),
             false,
             &test_chunk_hasher(),
+            None,
         )
         .unwrap();
 
@@ -743,6 +762,7 @@ mod tests {
             temp.path(),
             false,
             &test_chunk_hasher(),
+            None,
         )
         .unwrap();
 
@@ -840,6 +860,7 @@ mod tests {
             temp.path(),
             false,
             &test_chunk_hasher(),
+            None,
         )
         .unwrap();
 
@@ -915,6 +936,7 @@ mod tests {
             temp.path(),
             false,
             &test_chunk_hasher(),
+            None,
         )
         .unwrap();
 
@@ -982,6 +1004,7 @@ mod tests {
             temp.path(),
             true,
             &test_chunk_hasher(),
+            None,
         )
         .unwrap();
 
@@ -1054,6 +1077,7 @@ mod tests {
             temp.path(),
             true,
             &test_chunk_hasher(),
+            None,
         )
         .unwrap_err()
         .to_string();
@@ -1082,7 +1106,190 @@ mod tests {
             temp2.path(),
             false,
             &test_chunk_hasher(),
+            None,
         )
         .unwrap();
+    }
+
+    /// Backend that raises a shared cancellation flag from inside the range read
+    /// the restore pool uses, simulating a signal that lands once workers are
+    /// already running.
+    struct CancelOnReadBackend {
+        inner: MemoryBackend,
+        flag: Arc<AtomicBool>,
+    }
+
+    impl vykar_storage::InnerBackend for CancelOnReadBackend {
+        fn inner_backend(&self) -> &dyn StorageBackend {
+            &self.inner
+        }
+    }
+
+    vykar_storage::delegate_storage_backend! {
+        for CancelOnReadBackend;
+        except [get_range_into];
+
+        fn get_range_into(
+            &self,
+            key: &str,
+            offset: u64,
+            length: u64,
+            buf: &mut Vec<u8>,
+        ) -> vykar_types::error::Result<bool> {
+            self.flag.store(true, Ordering::Relaxed);
+            self.inner.get_range_into(key, offset, length, buf)
+        }
+    }
+
+    /// One pack holding one chunk, plus the `PlannedFile` and `ReadGroup` that
+    /// target it. Returns the packed bytes so the caller can build the group.
+    fn one_chunk_pack(crypto: &PlaintextEngine, payload: &[u8]) -> (PackId, Vec<u8>) {
+        let compressed = crate::compress::compress(Compression::None, payload).unwrap();
+        let packed = pack_object_with_context(
+            ObjectType::ChunkData,
+            dummy_chunk_id(0xC1).as_bytes(),
+            &compressed,
+            crypto,
+        )
+        .unwrap();
+        (dummy_pack_id(3), packed)
+    }
+
+    fn one_file_plan(payload_len: u64) -> Vec<PlannedFile> {
+        vec![PlannedFile {
+            rel_path: PathBuf::from("out.bin"),
+            total_size: payload_len,
+            mode: 0o644,
+            mtime: 0,
+            uid: 0,
+            gid: 0,
+            xattrs: None,
+            created: AtomicBool::new(false),
+        }]
+    }
+
+    /// A flag raised *while the pool is running* must surface as `Interrupted`.
+    ///
+    /// This is the post-join guard specifically: the flag starts clear, so the
+    /// entry guard passes and workers do start. They then observe the flag and
+    /// return `Ok(())` early, which without the post-join guard would hand back
+    /// a short byte count as success — and the caller would publish a partial
+    /// tree.
+    #[test]
+    fn execute_parallel_restore_cancelled_mid_pool_returns_interrupted() {
+        let temp = tempdir().unwrap();
+        let out = temp.path().join("out.bin");
+
+        let payload = b"parallel-cancel-payload";
+        let crypto = PlaintextEngine::new(test_chunk_hasher());
+        let (pack_id, packed) = one_chunk_pack(&crypto, payload);
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let inner = MemoryBackend::new();
+        inner.put(&pack_id.storage_key(), &packed).unwrap();
+        let storage: Arc<dyn StorageBackend> = Arc::new(CancelOnReadBackend {
+            inner,
+            flag: Arc::clone(&shutdown),
+        });
+
+        let files = one_file_plan(payload.len() as u64);
+        let groups = vec![single_blob_group(
+            pack_id,
+            dummy_chunk_id(0xC1),
+            &packed,
+            payload.len() as u32,
+            smallvec::smallvec![WriteTarget {
+                file_idx: 0,
+                file_offset: 0,
+            }],
+        )];
+
+        assert!(!shutdown.load(Ordering::Relaxed), "flag must start clear");
+        let err = execute_parallel_restore(
+            &files,
+            groups,
+            &storage,
+            &crypto,
+            temp.path(),
+            2,
+            false,
+            Some(&shutdown),
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(err, VykarError::Interrupted),
+            "expected Interrupted, got: {err}"
+        );
+        assert!(
+            shutdown.load(Ordering::Relaxed),
+            "the backend should have raised the flag mid-pool"
+        );
+        assert!(!out.exists(), "no data may have been written");
+    }
+
+    /// A pre-set shutdown flag must abort the pool with `Interrupted` before any
+    /// worker starts. Kept separate from the mid-pool test above: this one exits
+    /// at the entry guard and so cannot exercise the post-join guard.
+    #[test]
+    fn execute_parallel_restore_pre_cancelled_returns_interrupted() {
+        let temp = tempdir().unwrap();
+        let out = temp.path().join("out.bin");
+
+        let payload = b"parallel-cancel-payload";
+        let compressed = crate::compress::compress(Compression::None, payload).unwrap();
+        let crypto = PlaintextEngine::new(test_chunk_hasher());
+        let packed = pack_object_with_context(
+            ObjectType::ChunkData,
+            dummy_chunk_id(0xC1).as_bytes(),
+            &compressed,
+            &crypto,
+        )
+        .unwrap();
+
+        let pack_id = dummy_pack_id(3);
+        let backend = Arc::new(MemoryBackend::new());
+        backend.put(&pack_id.storage_key(), &packed).unwrap();
+        let storage: Arc<dyn StorageBackend> = backend;
+
+        let files = vec![PlannedFile {
+            rel_path: PathBuf::from("out.bin"),
+            total_size: payload.len() as u64,
+            mode: 0o644,
+            mtime: 0,
+            uid: 0,
+            gid: 0,
+            xattrs: None,
+            created: AtomicBool::new(false),
+        }];
+        let groups = vec![single_blob_group(
+            pack_id,
+            dummy_chunk_id(0xC1),
+            &packed,
+            payload.len() as u32,
+            smallvec::smallvec![WriteTarget {
+                file_idx: 0,
+                file_offset: 0,
+            }],
+        )];
+
+        let shutdown = AtomicBool::new(true);
+        let err = execute_parallel_restore(
+            &files,
+            groups,
+            &storage,
+            &crypto,
+            temp.path(),
+            2,
+            false,
+            Some(&shutdown),
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(err, VykarError::Interrupted),
+            "expected Interrupted, got: {err}"
+        );
+        assert!(!out.exists(), "no data may have been written");
     }
 }

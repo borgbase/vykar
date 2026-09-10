@@ -7,6 +7,7 @@ use std::sync::atomic::AtomicBool;
 
 use smallvec::SmallVec;
 
+use crate::commands::util::check_interrupted;
 use crate::platform::fs;
 use crate::snapshot::item::{ChunkRef, HardlinkId, Item, ItemType};
 use vykar_types::chunk_id::ChunkId;
@@ -198,6 +199,7 @@ pub(super) fn stream_and_plan<F, B>(
     batch_size: usize,
     group_reps: &mut HashMap<HardlinkId, RepInfo>,
     pending_links: &mut Vec<PendingLink>,
+    shutdown: Option<&AtomicBool>,
     mut flush_batch: B,
 ) -> Result<StreamPlan>
 where
@@ -220,6 +222,10 @@ where
     let mut hardlink_cap_warned = false;
 
     crate::commands::list::for_each_decoded_item(items_stream, |item| {
+        // Per-item poll: this is what makes "stop between files" real, since
+        // `RESTORE_BATCH_FILES` batch boundaries are far too coarse. A relaxed
+        // load is negligible against per-item decode + filesystem work.
+        check_interrupted(shutdown)?;
         if !include_path(&item.path) {
             return Ok(());
         }
@@ -623,6 +629,7 @@ mod tests {
             usize::MAX,
             &mut group_reps,
             &mut pending_links,
+            None,
             |files, chunks, verified, _stats| {
                 all_files.extend(files);
                 for (k, v) in chunks {
@@ -660,6 +667,7 @@ mod tests {
             usize::MAX,
             &mut group_reps,
             &mut pending_links,
+            None,
             |files, _chunks, _verified, _stats| {
                 all_files.extend(files);
                 Ok(())
@@ -1438,6 +1446,7 @@ mod tests {
             2,
             &mut group_reps,
             &mut pending_links,
+            None,
             |files, _chunks, _verified, _stats| {
                 sizes.push(files.len());
                 Ok(())
@@ -1474,6 +1483,7 @@ mod tests {
             usize::MAX,
             &mut group_reps,
             &mut pending_links,
+            None,
             |_files, _chunks, _verified, _stats| Ok(()),
         )
         .unwrap();
@@ -1517,6 +1527,7 @@ mod tests {
             100,
             &mut group_reps,
             &mut pending_links,
+            None,
             |files, chunks, verified, _stats| {
                 flush_calls += 1;
                 assert!(files.is_empty());

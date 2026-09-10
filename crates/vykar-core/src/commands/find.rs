@@ -163,16 +163,19 @@ pub fn run(
 
         // Try restore cache path, fall back to full index
         let items_stream = if let Some(ref cache) = restore_cache {
-            match list::load_snapshot_item_stream_via_lookup(&mut repo, &snapshot_name, |id| {
-                cache.lookup(id)
-            }) {
+            match list::load_snapshot_item_stream_via_lookup(
+                &mut repo,
+                &snapshot_name,
+                |id| cache.lookup(id),
+                None,
+            ) {
                 Ok(s) => s,
                 Err(_) => {
                     // Restore cache incomplete or stale — fall back to full index
                     restore_cache = None;
                     repo.load_chunk_index()?;
                     index_loaded = true;
-                    list::load_snapshot_item_stream(&mut repo, &snapshot_name)?
+                    list::load_snapshot_item_stream(&mut repo, &snapshot_name, None)?
                 }
             }
         } else {
@@ -180,7 +183,7 @@ pub fn run(
                 repo.load_chunk_index()?;
                 index_loaded = true;
             }
-            list::load_snapshot_item_stream(&mut repo, &snapshot_name)?
+            list::load_snapshot_item_stream(&mut repo, &snapshot_name, None)?
         };
 
         list::for_each_decoded_item(&items_stream, |item| {

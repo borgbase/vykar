@@ -658,11 +658,15 @@ pub fn run_with_progress(
                         .map(|s| s.parent_reuse_root())
                         .collect();
                     let mut builder = ParentReuseBuilder::new(parent_roots);
-                    let stream_result =
-                        super::list::for_each_snapshot_item(&mut repo, &parent_name, |item| {
+                    let stream_result = super::list::for_each_snapshot_item(
+                        &mut repo,
+                        &parent_name,
+                        shutdown,
+                        |item| {
                             builder.push(item);
                             Ok(())
-                        });
+                        },
+                    );
                     match stream_result {
                         Ok(()) => {
                             parent_reuse_index = builder.finish();

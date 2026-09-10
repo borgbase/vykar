@@ -281,6 +281,7 @@ fn repair_fixes_corruption(corruption: Corruption) {
         true, // verify_data
         commands::check::RepairMode::Apply,
         None,
+        None,
     )
     .unwrap();
 
@@ -316,6 +317,7 @@ fn repair_not_possible_err_path(corruption: Corruption) {
         None,
         true,
         commands::check::RepairMode::Apply,
+        None,
         None,
     );
     assert!(

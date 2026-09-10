@@ -1,6 +1,9 @@
+use std::sync::atomic::AtomicBool;
+
 use super::format::{unpack_object_expect_with_context, ObjectType};
 use super::pack::read_blob_from_pack;
 use super::{BlobCache, Repository};
+use crate::commands::util::check_interrupted;
 use crate::compress;
 use crate::index::dedup_cache;
 use vykar_types::chunk_id::ChunkId;
@@ -97,10 +100,14 @@ impl Repository {
     /// Output is appended to `out` in the same order as `chunks`.
     /// Cache hits are served from `blob_cache`; misses are grouped by pack and
     /// coalesced into large range reads to minimise HTTP round-trips.
+    ///
+    /// `shutdown` is polled between range reads, so a cancellation is observed
+    /// within one storage round-trip rather than after the whole stream.
     pub fn read_chunks_coalesced_into(
         &mut self,
         chunks: &[(ChunkId, PackId, u64, u32)],
         out: &mut Vec<u8>,
+        shutdown: Option<&AtomicBool>,
     ) -> Result<()> {
         if chunks.is_empty() {
             return Ok(());
@@ -199,6 +206,7 @@ impl Repository {
 
         // --- Phase 3: read + decrypt + incremental drain ---
         for group in groups {
+            check_interrupted(shutdown)?;
             let pack_key = group.pack_id.storage_key();
             let read_len = group.read_end - group.read_start;
 

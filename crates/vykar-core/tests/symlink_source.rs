@@ -65,6 +65,7 @@ fn backup_symlink_to_directory_descends_target() {
         None,
         false,
         false,
+        None,
     )
     .unwrap();
 

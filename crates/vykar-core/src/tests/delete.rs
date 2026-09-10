@@ -157,6 +157,7 @@ fn delete_multiple_snapshots_in_single_call() {
         None,
         false,
         false,
+        None,
     )
     .unwrap();
     assert_eq!(

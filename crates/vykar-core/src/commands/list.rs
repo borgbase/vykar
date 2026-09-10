@@ -1,3 +1,5 @@
+use std::sync::atomic::AtomicBool;
+
 use serde::Deserialize;
 
 use crate::config::VykarConfig;
@@ -10,7 +12,7 @@ use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
 use vykar_types::pack_id::PackId;
 
-use super::util::open_repo;
+use super::util::{check_interrupted, open_repo};
 use crate::repo::OpenOptions;
 
 /// List all snapshots in the repository.
@@ -58,7 +60,7 @@ fn list_snapshot_items_inner(
         .clone();
 
     let source_paths = load_snapshot_meta(&repo, &resolved_name)?.source_paths;
-    let stream = load_snapshot_item_stream_cache_first(&mut repo, &resolved_name)?;
+    let stream = load_snapshot_item_stream_cache_first(&mut repo, &resolved_name, None)?;
     let items = decode_items_stream(&stream)?;
     Ok((items, source_paths))
 }
@@ -150,15 +152,23 @@ pub fn load_snapshot_meta(repo: &Repository, snapshot_name: &str) -> Result<Snap
 }
 
 /// Load and deserialize all items from a snapshot.
-pub fn load_snapshot_items(repo: &mut Repository, snapshot_name: &str) -> Result<Vec<Item>> {
-    let items_stream = load_snapshot_item_stream(repo, snapshot_name)?;
+pub fn load_snapshot_items(
+    repo: &mut Repository,
+    snapshot_name: &str,
+    shutdown: Option<&AtomicBool>,
+) -> Result<Vec<Item>> {
+    let items_stream = load_snapshot_item_stream(repo, snapshot_name, shutdown)?;
     decode_items_stream(&items_stream)
 }
 
 /// Load the raw concatenated item stream bytes for a snapshot.
-pub fn load_snapshot_item_stream(repo: &mut Repository, snapshot_name: &str) -> Result<Vec<u8>> {
+pub fn load_snapshot_item_stream(
+    repo: &mut Repository,
+    snapshot_name: &str,
+    shutdown: Option<&AtomicBool>,
+) -> Result<Vec<u8>> {
     let snapshot_meta = load_snapshot_meta(repo, snapshot_name)?;
-    load_item_stream_from_ptrs(repo, &snapshot_meta.item_ptrs)
+    load_item_stream_from_ptrs(repo, &snapshot_meta.item_ptrs, shutdown)
 }
 
 /// Load the raw item stream bytes for a snapshot, trying the local restore
@@ -167,12 +177,19 @@ pub fn load_snapshot_item_stream(repo: &mut Repository, snapshot_name: &str) -> 
 pub fn load_snapshot_item_stream_cache_first(
     repo: &mut Repository,
     snapshot_name: &str,
+    shutdown: Option<&AtomicBool>,
 ) -> Result<Vec<u8>> {
     if let Some(cache) = repo.open_restore_cache() {
-        match load_snapshot_item_stream_via_lookup(repo, snapshot_name, |chunk_id| {
-            cache.lookup(chunk_id)
-        }) {
+        match load_snapshot_item_stream_via_lookup(
+            repo,
+            snapshot_name,
+            |chunk_id| cache.lookup(chunk_id),
+            shutdown,
+        ) {
             Ok(stream) => return Ok(stream),
+            // A cancellation is not a stale cache — re-raise it instead of
+            // falling through, which would load the full index and retry.
+            Err(e @ VykarError::Interrupted) => return Err(e),
             Err(VykarError::ChunkNotInIndex(_)) => {
                 // Restore cache incomplete — fall through to full index
             }
@@ -182,7 +199,7 @@ pub fn load_snapshot_item_stream_cache_first(
         }
     }
     repo.load_chunk_index()?;
-    load_snapshot_item_stream(repo, snapshot_name)
+    load_snapshot_item_stream(repo, snapshot_name, shutdown)
 }
 
 /// Load item stream using a lookup closure instead of the chunk index.
@@ -191,32 +208,51 @@ pub fn load_snapshot_item_stream_via_lookup<L>(
     repo: &mut Repository,
     snapshot_name: &str,
     lookup: L,
+    shutdown: Option<&AtomicBool>,
 ) -> Result<Vec<u8>>
 where
     L: Fn(&ChunkId) -> Option<(PackId, u64, u32)>,
 {
     let snapshot_meta = load_snapshot_meta(repo, snapshot_name)?;
-    resolve_and_read(repo, &snapshot_meta.item_ptrs, |chunk_id, _repo| {
-        lookup(chunk_id).ok_or(VykarError::ChunkNotInIndex(*chunk_id))
-    })
+    resolve_and_read(
+        repo,
+        &snapshot_meta.item_ptrs,
+        |chunk_id, _repo| lookup(chunk_id).ok_or(VykarError::ChunkNotInIndex(*chunk_id)),
+        shutdown,
+    )
 }
 
 /// Load the raw concatenated item stream bytes from chunk pointers using the chunk index.
-pub fn load_item_stream_from_ptrs(repo: &mut Repository, item_ptrs: &[ChunkId]) -> Result<Vec<u8>> {
-    resolve_and_read(repo, item_ptrs, |chunk_id, repo| {
-        let entry = *repo
-            .chunk_index()
-            .get(chunk_id)
-            .ok_or_else(|| VykarError::Other(format!("chunk not found: {chunk_id}")))?;
-        Ok((entry.pack_id, entry.pack_offset, entry.stored_size))
-    })
+pub fn load_item_stream_from_ptrs(
+    repo: &mut Repository,
+    item_ptrs: &[ChunkId],
+    shutdown: Option<&AtomicBool>,
+) -> Result<Vec<u8>> {
+    resolve_and_read(
+        repo,
+        item_ptrs,
+        |chunk_id, repo| {
+            let entry = *repo
+                .chunk_index()
+                .get(chunk_id)
+                .ok_or_else(|| VykarError::Other(format!("chunk not found: {chunk_id}")))?;
+            Ok((entry.pack_id, entry.pack_offset, entry.stored_size))
+        },
+        shutdown,
+    )
 }
 
 /// Resolve chunk locations and read them via coalesced range reads.
-fn resolve_and_read<R>(repo: &mut Repository, item_ptrs: &[ChunkId], resolve: R) -> Result<Vec<u8>>
+fn resolve_and_read<R>(
+    repo: &mut Repository,
+    item_ptrs: &[ChunkId],
+    resolve: R,
+    shutdown: Option<&AtomicBool>,
+) -> Result<Vec<u8>>
 where
     R: Fn(&ChunkId, &Repository) -> Result<(PackId, u64, u32)>,
 {
+    check_interrupted(shutdown)?;
     let chunks: Vec<(ChunkId, PackId, u64, u32)> = item_ptrs
         .iter()
         .map(|chunk_id| {
@@ -226,7 +262,7 @@ where
         .collect::<Result<_>>()?;
 
     let mut items_stream = Vec::new();
-    repo.read_chunks_coalesced_into(&chunks, &mut items_stream)?;
+    repo.read_chunks_coalesced_into(&chunks, &mut items_stream, shutdown)?;
     Ok(items_stream)
 }
 
@@ -235,11 +271,12 @@ pub fn load_snapshot_items_via_lookup<L>(
     repo: &mut Repository,
     snapshot_name: &str,
     lookup: L,
+    shutdown: Option<&AtomicBool>,
 ) -> Result<Vec<Item>>
 where
     L: Fn(&ChunkId) -> Option<(PackId, u64, u32)>,
 {
-    let items_stream = load_snapshot_item_stream_via_lookup(repo, snapshot_name, lookup)?;
+    let items_stream = load_snapshot_item_stream_via_lookup(repo, snapshot_name, lookup, shutdown)?;
     decode_items_stream(&items_stream)
 }
 
@@ -265,9 +302,10 @@ pub fn for_each_decoded_item(
 pub fn for_each_snapshot_item(
     repo: &mut Repository,
     snapshot_name: &str,
+    shutdown: Option<&AtomicBool>,
     visit: impl FnMut(Item) -> Result<()>,
 ) -> Result<()> {
-    let items_stream = load_snapshot_item_stream(repo, snapshot_name)?;
+    let items_stream = load_snapshot_item_stream(repo, snapshot_name, shutdown)?;
     for_each_decoded_item(&items_stream, visit)
 }
 

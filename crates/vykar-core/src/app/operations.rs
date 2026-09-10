@@ -527,6 +527,7 @@ pub fn run_full_cycle_for_repo(
                     Some(&mut |check_evt| evt(CycleEvent::Check(check_evt))),
                     check_max_percent,
                     true, // record_state: daemon/GUI updates the full_every timer
+                    shutdown,
                 )
             },
             |result| {

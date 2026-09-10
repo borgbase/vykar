@@ -646,8 +646,8 @@ impl StorageBackend for RestBackend {
 mod tests {
     use super::*;
     use crate::RetryConfig;
-    use std::io::{BufRead, BufReader, Write};
-    use std::net::TcpListener;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::{TcpListener, TcpStream};
 
     #[test]
     fn validate_content_range_accepts_valid_header() {
@@ -867,28 +867,36 @@ mod tests {
         let handle = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut request = String::new();
-            let mut content_length = 0usize;
-            loop {
-                let mut line = String::new();
-                reader.read_line(&mut line).unwrap();
-                if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
-                    content_length = v.trim().parse().unwrap_or(0);
-                }
-                let done = line.trim().is_empty();
-                request.push_str(&line);
-                if done {
-                    break;
-                }
-            }
-            // Drain the body so the client's write completes before we reply.
-            let mut body = vec![0u8; content_length];
-            let _ = std::io::Read::read_exact(&mut reader, &mut body);
+            let request = read_request(&mut reader);
             stream.write_all(response.as_bytes()).unwrap();
             stream.flush().unwrap();
             request
         });
         (url, handle)
+    }
+
+    /// Read the request head and drain the body by Content-Length, returning
+    /// the raw head. Draining matters: closing a socket with unread inbound
+    /// bytes sends RST, and Windows then discards any response the client has
+    /// not read yet (os errors 10053/10054).
+    fn read_request(reader: &mut BufReader<TcpStream>) -> String {
+        let mut request = String::new();
+        let mut content_length = 0usize;
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                content_length = v.trim().parse().unwrap_or(0);
+            }
+            let done = line.trim().is_empty();
+            request.push_str(&line);
+            if done {
+                break;
+            }
+        }
+        let mut body = vec![0u8; content_length];
+        let _ = reader.read_exact(&mut body);
+        request
     }
 
     /// Spin up a TCP listener that responds with a canned HTTP response to
@@ -900,17 +908,8 @@ mod tests {
         let response = response.to_string();
         let handle = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            // Consume the request
             let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut line = String::new();
-            loop {
-                line.clear();
-                reader.read_line(&mut line).unwrap();
-                if line.trim().is_empty() {
-                    break;
-                }
-            }
-            // Send the canned response
+            read_request(&mut reader);
             stream.write_all(response.as_bytes()).unwrap();
             stream.flush().unwrap();
         });
@@ -927,14 +926,7 @@ mod tests {
             for response in &responses {
                 let (mut stream, _) = listener.accept().unwrap();
                 let mut reader = BufReader::new(stream.try_clone().unwrap());
-                let mut line = String::new();
-                loop {
-                    line.clear();
-                    reader.read_line(&mut line).unwrap();
-                    if line.trim().is_empty() {
-                        break;
-                    }
-                }
+                read_request(&mut reader);
                 stream.write_all(response.as_bytes()).unwrap();
                 stream.flush().unwrap();
                 // Drop stream to close connection (important for truncation tests)

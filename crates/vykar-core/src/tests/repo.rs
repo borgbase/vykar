@@ -650,12 +650,15 @@ fn init_refuses_a_v3_repository_against_a_pre_blake3_server() {
 
     // A pre-BLAKE3 /health body: no `protocol_version`, no `hashes`.
     let body = r#"{"status":"ok","version":"0.19.1"}"#;
+    // `Connection: close` keeps ureq from pooling a socket this mock is about
+    // to drop; reusing it would race the FIN and fail on Windows (10054).
     let health = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         body.len(),
         body
     );
-    let not_found = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_string();
+    let not_found =
+        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let url = format!("http://127.0.0.1:{port}");
@@ -668,12 +671,20 @@ fn init_refuses_a_v3_repository_against_a_pre_blake3_server() {
             let mut reader = BufReader::new(stream.try_clone().unwrap());
             let mut request_line = String::new();
             reader.read_line(&mut request_line).unwrap_or(0);
+            let mut content_length = 0usize;
             loop {
                 let mut line = String::new();
                 if reader.read_line(&mut line).unwrap_or(0) == 0 || line.trim().is_empty() {
                     break;
                 }
+                if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    content_length = v.trim().parse().unwrap_or(0);
+                }
             }
+            // Drain the body: closing with unread bytes sends RST, which on
+            // Windows discards the reply before the client reads it.
+            let mut body = vec![0u8; content_length];
+            let _ = std::io::Read::read_exact(&mut reader, &mut body);
             let line = request_line.trim().to_string();
             let reply = if line.contains("/health") {
                 &health

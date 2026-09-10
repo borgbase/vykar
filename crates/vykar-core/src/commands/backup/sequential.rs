@@ -41,7 +41,13 @@ fn classify_chunks(
 ) -> Result<Vec<WorkerChunk>> {
     let classify = |data: Vec<u8>| -> Result<WorkerChunk> {
         let chunk_id = ChunkId::compute(chunk_hasher, &data);
-        classify_chunk(chunk_id, data, dedup_filter, compression, crypto)
+        classify_chunk(
+            chunk_id,
+            std::borrow::Cow::Owned(data),
+            dedup_filter,
+            compression,
+            crypto,
+        )
     };
 
     let results: Vec<Result<WorkerChunk>> = if let Some(pool) = transform_pool {
@@ -366,7 +372,8 @@ pub(super) fn process_regular_file_item(
             read_limiter,
             |data| {
                 pending_bytes = pending_bytes.saturating_add(data.len());
-                raw_chunks.push(data);
+                // Deferred batch transformation needs to retain the bytes.
+                raw_chunks.push(data.into_owned());
 
                 if pending_bytes >= max_pending_transform_bytes
                     || raw_chunks.len() >= max_pending_file_actions
@@ -645,7 +652,7 @@ pub(super) fn process_source_path(
                                 &repo.config.chunker_params,
                                 None,
                                 |buf| {
-                                    data = Some(buf);
+                                    data = Some(buf.into_owned());
                                     Ok(())
                                 },
                             )

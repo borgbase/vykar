@@ -13,6 +13,7 @@
 //! `is_soft_file_error()` classifies as skippable: callers turn it into a
 //! per-file warning instead of aborting the backup.
 
+use std::borrow::Cow;
 use std::io::Read;
 use std::path::Path;
 
@@ -72,6 +73,10 @@ pub(super) fn open_checked(
 /// `path` is only used for error messages. `pre_meta` must be the `fstat`
 /// returned by [`open_checked`].
 ///
+/// Streaming plans lend chunks from a buffer owned by this read. That buffer
+/// is dropped before returning, so workers do not retain it while queueing
+/// results or processing cache hits. Whole-file plans transfer ownership.
+///
 /// Streaming plans call `on_chunk` as chunks are produced, so a drift
 /// detected afterwards can leave partial work behind — those callers are
 /// responsible for rolling it back (see `with_rollback_checkpoint`).
@@ -84,7 +89,7 @@ pub(super) fn read_range_drift_checked(
     plan: ReadPlan,
     chunker_config: &ChunkerConfig,
     limiter: Option<&ByteRateLimiter>,
-    mut on_chunk: impl FnMut(Vec<u8>) -> Result<()>,
+    mut on_chunk: impl FnMut(Cow<'_, [u8]>) -> Result<()>,
 ) -> Result<()> {
     // For whole-file plans the read is hard-capped at `size + 1`: an
     // intra-read append then trips the exact-byte-count check below instead
@@ -122,13 +127,10 @@ pub(super) fn read_range_drift_checked(
         }
         ReadPlan::Chunked | ReadPlan::Segment { .. } => {
             let reader = limits::LimitedReader::new(&mut *source, limiter).take(read_limit);
-            for chunk_result in chunker::chunk_stream_bounded(reader, chunker_config) {
-                let chunk = chunk_result.map_err(|e| match e {
-                    fastcdc::v2020::Error::IoError(ioe) => VykarError::Io(ioe),
-                    other => VykarError::Other(format!("chunking failed for {path}: {other}")),
-                })?;
-                total_bytes = total_bytes.saturating_add(chunk.data.len() as u64);
-                on_chunk(chunk.data)?;
+            let mut chunks = chunker::ChunkReader::new(reader, chunker_config);
+            while let Some(chunk) = chunks.next_chunk().map_err(VykarError::Io)? {
+                total_bytes = total_bytes.saturating_add(chunk.len() as u64);
+                on_chunk(Cow::Borrowed(chunk))?;
             }
         }
     }
@@ -143,7 +145,7 @@ pub(super) fn read_range_drift_checked(
     }
 
     if let Some(data) = whole_file {
-        on_chunk(data)?;
+        on_chunk(Cow::Owned(data))?;
     }
 
     Ok(())

@@ -1,6 +1,6 @@
 use std::io::{Cursor, Read};
 
-use crate::chunker::{chunk_data, chunk_stream, chunk_stream_bounded};
+use crate::chunker::{chunk_data, chunk_stream, chunk_stream_bounded, ChunkReader};
 use crate::config::ChunkerConfig;
 
 fn test_config() -> ChunkerConfig {
@@ -269,4 +269,63 @@ fn cut_points_match_pinned_vectors_at_small_params() {
     let data = seeded_data(0x0123_4567_89ab_cdef, 100 * 1024);
     let chunks = chunk_data(&data, &test_config());
     assert_eq!(chunks, GOLDEN_SMALL_PARAMS);
+}
+
+#[test]
+fn scoped_chunk_reader_handles_short_and_interrupted_reads() {
+    struct TrickleReader<R> {
+        inner: R,
+        interrupt_next: bool,
+    }
+    impl<R: Read> Read for TrickleReader<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.interrupt_next {
+                self.interrupt_next = false;
+                return Err(std::io::ErrorKind::Interrupted.into());
+            }
+            self.interrupt_next = true;
+            let n = buf.len().min(1);
+            self.inner.read(&mut buf[..n])
+        }
+    }
+
+    let config = test_config();
+    let data = seeded_data(1909, 20_000);
+    for limit in [0, 1, 3001, 4096, 8193, 25_000] {
+        let mut source = Cursor::new(&data);
+        let trickle = TrickleReader {
+            inner: &mut source,
+            interrupt_next: true,
+        };
+        let mut reader = ChunkReader::new(trickle.take(limit as u64), &config);
+        let mut actual = Vec::new();
+        let mut offset = 0;
+        while let Some(chunk) = reader.next_chunk().unwrap() {
+            assert_eq!(chunk, &data[offset..offset + chunk.len()]);
+            actual.push((offset, chunk.len()));
+            offset += chunk.len();
+        }
+        assert!(reader.next_chunk().unwrap().is_none());
+        let end = limit.min(data.len());
+        assert_eq!(actual, chunk_data(&data[..end], &config));
+        assert_eq!(source.position(), end as u64);
+    }
+}
+
+#[test]
+fn scoped_chunk_reader_propagates_read_errors() {
+    struct FailedReader;
+    impl Read for FailedReader {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::ErrorKind::PermissionDenied.into())
+        }
+    }
+
+    let data = vec![0x42; 1000];
+    let source = Cursor::new(&data).chain(FailedReader).take(2000);
+    let mut reader = ChunkReader::new(source, &test_config());
+    assert_eq!(
+        reader.next_chunk().unwrap_err().kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
 }

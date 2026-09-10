@@ -311,7 +311,7 @@ mod chunker {
 
     use proptest::prelude::*;
 
-    use crate::chunker::{chunk_data, chunk_stream, chunk_stream_bounded};
+    use crate::chunker::{chunk_data, chunk_stream, chunk_stream_bounded, ChunkReader};
     use crate::config::ChunkerConfig;
 
     /// Generate valid ChunkerConfig values that respect fastcdc's hard bounds:
@@ -429,7 +429,17 @@ mod chunker {
                     })
                     .collect();
             let expected = chunk_data(&data[..data.len().min(limit as usize)], &config);
-            prop_assert_eq!(expected, bounded_chunks);
+            prop_assert_eq!(&expected, &bounded_chunks);
+
+            let mut reader = ChunkReader::new(Cursor::new(&data).take(limit), &config);
+            let mut borrowed_chunks = Vec::new();
+            let mut offset = 0;
+            while let Some(chunk) = reader.next_chunk().expect("bounded reader should succeed") {
+                prop_assert_eq!(chunk, &data[offset..offset + chunk.len()]);
+                borrowed_chunks.push((offset, chunk.len()));
+                offset += chunk.len();
+            }
+            prop_assert_eq!(expected, borrowed_chunks);
         }
 
         /// Any config from `arb_chunker_config()` passes `validate()`.

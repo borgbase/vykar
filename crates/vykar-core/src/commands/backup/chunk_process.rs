@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use crate::compress::{compress_append, compressed_size_bound, Compression};
 use crate::repo::format::{pack_object_streaming_with_context, ObjectType};
 use vykar_crypto::CryptoEngine;
@@ -25,9 +27,14 @@ pub(crate) enum WorkerChunk {
 }
 
 /// Classify a single chunk: hash → xor filter check → transform or hash-only.
+///
+/// `data` is usually a slice lent by the chunker's read buffer; it is only
+/// copied into an owned `Vec` on the hash-only path, which has to keep the raw
+/// bytes for the filter false-positive fallback. The transform path reads it
+/// in place.
 pub(super) fn classify_chunk(
     chunk_id: ChunkId,
-    data: Vec<u8>,
+    data: Cow<'_, [u8]>,
     dedup_filter: Option<&xorf::Xor8>,
     compression: Compression,
     crypto: &dyn CryptoEngine,
@@ -36,7 +43,10 @@ pub(super) fn classify_chunk(
         use xorf::Filter;
         let key = crate::index::dedup_cache::chunk_id_to_u64(&chunk_id);
         if filter.contains(&key) {
-            return Ok(WorkerChunk::Hashed(HashedChunk { chunk_id, data }));
+            return Ok(WorkerChunk::Hashed(HashedChunk {
+                chunk_id,
+                data: data.into_owned(),
+            }));
         }
     }
     let mut packed = pack_chunk_data(&chunk_id, &data, compression, crypto)?;
@@ -83,13 +93,42 @@ mod tests {
     use vykar_crypto::PlaintextEngine;
 
     #[test]
+    fn borrowed_filter_hit_retains_bytes_after_reader_buffer_changes() {
+        let engine = PlaintextEngine::new(crate::testutil::chunk_hasher_for([0xAA; 32]));
+        let mut payload = vec![0x42; 1024];
+        let chunk_id = ChunkId::compute(engine.chunk_hasher(), &payload);
+        let key = crate::index::dedup_cache::chunk_id_to_u64(&chunk_id);
+        let filter = xorf::Xor8::from(std::slice::from_ref(&key));
+        let result = classify_chunk(
+            chunk_id,
+            Cow::Borrowed(&payload),
+            Some(&filter),
+            Compression::Lz4,
+            &engine,
+        )
+        .unwrap();
+        payload.fill(0);
+        let WorkerChunk::Hashed(chunk) = result else {
+            panic!("filter hit must retain raw data for fallback");
+        };
+        assert_eq!(chunk.chunk_id, chunk_id);
+        assert_eq!(chunk.data, vec![0x42; 1024]);
+    }
+
+    #[test]
     fn prepared_compressible_chunks_release_excess_capacity() {
         let engine = PlaintextEngine::new(crate::testutil::chunk_hasher_for([0xAA; 32]));
         let payload = vec![0x42; 1024 * 1024];
         let chunk_id = ChunkId::compute(engine.chunk_hasher(), &payload);
         for compression in [Compression::Lz4, Compression::Zstd { level: 3 }] {
-            let chunk =
-                classify_chunk(chunk_id, payload.clone(), None, compression, &engine).unwrap();
+            let chunk = classify_chunk(
+                chunk_id,
+                Cow::Borrowed(&payload),
+                None,
+                compression,
+                &engine,
+            )
+            .unwrap();
             let WorkerChunk::Prepared(prepared) = chunk else {
                 panic!("no filter must prepare the chunk");
             };

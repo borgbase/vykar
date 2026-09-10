@@ -13,6 +13,13 @@ members = [
 exclude = ["fuzz"]
 resolver = "2"
 
+[workspace.package]
+version = "0.20.0"
+edition = "2021"
+rust-version = "1.98"
+license = "GPL-3.0-only"
+publish = false
+
 [workspace.dependencies]
 # Internal crates
 vykar-types = { path = "crates/vykar-types" }

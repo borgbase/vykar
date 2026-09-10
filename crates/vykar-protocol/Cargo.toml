@@ -1,9 +1,10 @@
 [package]
 name = "vykar-protocol"
-version = "0.20.0"
-edition = "2021"
-license = "GPL-3.0-only"
-publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
 
 [lints]
 workspace = true

@@ -15,17 +15,10 @@ Run `make pre-commit` first to catch formatting, clippy, and test issues before 
 
 ### 2. Bump version
 
-Update the `version` field in **all** workspace crates and the macOS Info.plist:
+All nine crates inherit `version` from `[workspace.package]`, so there are only
+two places to update:
 
-- `crates/vykar-types/Cargo.toml`
-- `crates/vykar-common/Cargo.toml`
-- `crates/vykar-crypto/Cargo.toml`
-- `crates/vykar-storage/Cargo.toml`
-- `crates/vykar-protocol/Cargo.toml`
-- `crates/vykar-core/Cargo.toml`
-- `crates/vykar-cli/Cargo.toml`
-- `crates/vykar-server/Cargo.toml`
-- `crates/vykar-gui/Cargo.toml`
+- `Cargo.toml` — the `version` field under `[workspace.package]`
 - `crates/vykar-gui/macos/Info.plist` (update both `CFBundleVersion` and `CFBundleShortVersionString`)
 
 Run `cargo check` to regenerate `Cargo.lock` with the new versions.

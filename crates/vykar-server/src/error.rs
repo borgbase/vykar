@@ -16,6 +16,10 @@ pub enum StartupError {
         path: String,
         source: std::io::Error,
     },
+    /// SIGINT/SIGTERM handlers could not be installed. Treated as fatal: a
+    /// partially registered set would leave one signal swallowed for the life
+    /// of the process, since tokio never uninstalls a handler.
+    Signals(std::io::Error),
     /// The listen address could not be bound.
     Bind {
         addr: String,
@@ -33,6 +37,7 @@ impl std::fmt::Display for StartupError {
             Self::DataDir { path, source } => {
                 write!(f, "cannot create data directory '{path}': {source}")
             }
+            Self::Signals(e) => write!(f, "failed to install signal handlers: {e}"),
             Self::Bind { addr, source } => write!(f, "cannot bind to {addr}: {source}"),
             Self::Serve(e) => write!(f, "server failed: {e}"),
         }
@@ -43,6 +48,7 @@ impl std::error::Error for StartupError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Runtime(e)
+            | Self::Signals(e)
             | Self::DataDir { source: e, .. }
             | Self::Bind { source: e, .. }
             | Self::Serve(e) => Some(e),

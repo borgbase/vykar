@@ -51,6 +51,13 @@ export VYKAR_TOKEN="some-secret-token"
 vykar-server --data-dir /var/lib/vykar --append-only --quota 10G
 ```
 
+On `SIGINT` (Ctrl-C) or `SIGTERM` the server stops accepting new connections,
+lets in-flight requests finish, then exits with status 0. A second signal exits
+immediately (status 130 for `SIGINT`, 143 for `SIGTERM`). There is no built-in
+drain deadline, so a stalled upload holds the process until the second signal
+or the supervisor's stop timeout (Docker defaults to 10 s, systemd
+`TimeoutStopSec` to 90 s) sends `SIGKILL`.
+
 ## Run as a systemd service
 
 Create an environment file at `/etc/vykar/vykar-server.env` with restricted permissions:

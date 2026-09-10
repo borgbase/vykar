@@ -22,7 +22,7 @@ pub mod state;
 use axum::serve::ListenerExt;
 use clap::Parser;
 use tokio::net::TcpListener;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::config::{parse_size, ServerSection};
 use crate::error::StartupError;
@@ -131,23 +131,108 @@ async fn serve(cli: Cli) -> Result<(), StartupError> {
 
     let app = handlers::router(state);
 
-    info!("vykar-server listening on {listen_addr}");
+    // Install before bind so the handlers are live by the time the readiness
+    // line below is printed.
+    let signals = ShutdownSignals::install().map_err(StartupError::Signals)?;
+
     let listener = TcpListener::bind(&listen_addr)
         .await
         .map_err(|source| StartupError::Bind {
             addr: listen_addr.clone(),
             source,
-        })?
-        // Responses are written in several small pieces (headers, then body
-        // frames); Nagle's algorithm holds those back waiting for the client's
-        // ACK, adding a round-trip to every request.
-        .tap_io(|stream| {
-            if let Err(e) = stream.set_nodelay(true) {
-                tracing::debug!("failed to set TCP_NODELAY on incoming connection: {e}");
-            }
-        });
+        })?;
+    let bound_addr = listener
+        .local_addr()
+        .map_or(listen_addr, |addr| addr.to_string());
+    info!("vykar-server listening on {bound_addr}");
+
+    // Responses are written in several small pieces (headers, then body
+    // frames); Nagle's algorithm holds those back waiting for the client's
+    // ACK, adding a round-trip to every request.
+    let listener = listener.tap_io(|stream| {
+        if let Err(e) = stream.set_nodelay(true) {
+            tracing::debug!("failed to set TCP_NODELAY on incoming connection: {e}");
+        }
+    });
 
     axum::serve(listener, app)
+        .with_graceful_shutdown(signals.wait())
         .await
         .map_err(StartupError::Serve)
+}
+
+/// Persistent SIGINT/SIGTERM streams (Ctrl-C on Windows).
+///
+/// Constructed synchronously so registration happens before the listener is
+/// bound. The streams stay alive across both signals: the first one starts a
+/// graceful drain, the second exits immediately, mirroring the CLI convention.
+struct ShutdownSignals {
+    #[cfg(unix)]
+    interrupt: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    terminate: tokio::signal::unix::Signal,
+    #[cfg(windows)]
+    ctrl_c: tokio::signal::windows::CtrlC,
+}
+
+/// Which signal arrived, with its name for logging and its conventional
+/// death-by-signal exit code (128 + signal number).
+#[derive(Clone, Copy)]
+struct Received {
+    name: &'static str,
+    exit_code: i32,
+}
+
+impl ShutdownSignals {
+    fn install() -> std::io::Result<Self> {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            Ok(Self {
+                interrupt: signal(SignalKind::interrupt())?,
+                terminate: signal(SignalKind::terminate())?,
+            })
+        }
+        #[cfg(windows)]
+        {
+            Ok(Self {
+                ctrl_c: tokio::signal::windows::ctrl_c()?,
+            })
+        }
+    }
+
+    async fn next(&mut self) -> Received {
+        #[cfg(unix)]
+        {
+            tokio::select! {
+                _ = self.interrupt.recv() => Received { name: "SIGINT", exit_code: 130 },
+                _ = self.terminate.recv() => Received { name: "SIGTERM", exit_code: 143 },
+            }
+        }
+        #[cfg(windows)]
+        {
+            self.ctrl_c.recv().await;
+            Received {
+                name: "Ctrl-C",
+                exit_code: 130,
+            }
+        }
+    }
+
+    /// Resolve on the first signal, which tells axum to stop accepting and
+    /// drain in-flight requests. A second signal exits the process at once.
+    async fn wait(mut self) {
+        let first = self.next().await;
+        info!(
+            "received {}; finishing in-flight requests before exit",
+            first.name
+        );
+        // The streams were already polled once, so a signal delivered before
+        // this task is first polled is buffered rather than lost.
+        tokio::spawn(async move {
+            let second = self.next().await;
+            warn!("received second {}; exiting immediately", second.name);
+            std::process::exit(second.exit_code);
+        });
+    }
 }

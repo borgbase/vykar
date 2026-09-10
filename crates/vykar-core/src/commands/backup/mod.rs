@@ -468,13 +468,9 @@ pub fn run_with_progress(
     // source-validation failure short-circuits with no session registered.
     let resolved_sources = source::ResolvedSource::resolve_all(source_paths, multi_path)?;
 
-    let _nice_guard = match limits::NiceGuard::apply(config.limits.nice) {
-        Ok(guard) => guard,
-        Err(e) => {
-            warn!("could not apply limits.nice={}: {e}", config.limits.nice);
-            None
-        }
-    };
+    if let Err(e) = limits::apply_process_nice(config.limits.nice) {
+        warn!("could not apply limits.nice={}: {e}", config.limits.nice);
+    }
     let max_pending_transform_bytes = config.limits.transform_batch_bytes();
     let max_pending_file_actions = config.limits.max_pending_actions();
     let upload_concurrency = config.limits.upload_concurrency();

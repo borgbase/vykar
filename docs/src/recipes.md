@@ -331,6 +331,12 @@ limits:
 
 - `threads: 1` keeps backup transforms mostly sequential.
 - `nice: 19` lowers CPU scheduling priority on Unix; it is ignored on Windows.
+  The value is applied to every thread and never lowered again (that needs
+  `CAP_SYS_NICE` or a raised `RLIMIT_NICE` on Linux, root on macOS), so the
+  daemon and GUI keep it for the rest of their lifetime, and with several
+  repositories the highest configured value wins. To keep the daemon or GUI at
+  its own priority between runs, leave `nice` at `0` and run backups as separate
+  `vykar backup` processes under `nice -n 19` or a systemd `Nice=` setting.
 - `connections: 1` minimizes backend parallelism (SFTP pool, upload concurrency, restore readers).
 - `upload_mib_per_sec` and `download_mib_per_sec` cap backend throughput in MiB/s.
 - If this is too slow, raise `upload_mib_per_sec` first, then increase `connections`.

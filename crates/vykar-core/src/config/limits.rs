@@ -23,7 +23,8 @@ pub struct ResourceLimitsConfig {
     /// 0 = auto: local repos use ceil(cores/2) clamped to [2, 4]; remote repos use min(cores, 12). 1 = sequential.
     #[serde(default)]
     pub threads: usize,
-    /// Unix process niceness target (-20..19). 0 = unchanged.
+    /// Unix process niceness target (-20..19). 0 = unchanged. Applied to every
+    /// thread for the rest of the process lifetime; never lowered again.
     #[serde(default)]
     pub nice: i32,
     /// Upload bandwidth cap in MiB/s. 0 = unlimited.

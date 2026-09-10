@@ -578,11 +578,23 @@ limits:
 |-------|---------|--------|-------------|
 | `connections` | `2` | integer, 1–16 | Parallel backend operations; also controls upload/restore concurrency |
 | `threads` | `0` | integer, 0–128 | CPU worker threads. `0` = auto: local repos use ceil(cores/2) clamped to [2, 4]; remote repos use min(cores, 12). `1` = mostly sequential. Also available as `--threads` on the `backup` subcommand |
-| `nice` | `0` | integer, -20–19 | Unix process niceness. `0` = unchanged. Ignored on Windows |
+| `nice` | `0` | integer, -20–19 | Unix process niceness. `0` = unchanged. Applied to every thread of the process and never lowered again (see below). Ignored on Windows |
 | `upload_mib_per_sec` | `0` | integer (MiB/s) | Upload bandwidth cap. `0` = unlimited |
 | `download_mib_per_sec` | `0` | integer (MiB/s) | Download bandwidth cap. `0` = unlimited |
 
 `limits.connections` also controls SFTP connection pool size, backup in-flight uploads, and restore reader concurrency. Internal pipeline knobs are now derived automatically from `connections` and `threads`.
+
+`limits.nice` is a one-way ratchet. Lowering the nice value again needs
+`CAP_SYS_NICE` or a raised `RLIMIT_NICE` on Linux and root on macOS, which an
+unprivileged process does not have, so the value is applied to every thread and
+never restored. For a single `vykar backup` run this is irrelevant. The daemon
+and the GUI run backups in-process and therefore keep the value for the rest of
+their lifetime; with several repositories, the highest configured `nice` wins.
+A thread already at or above the target is left alone, so a lower value in a
+later run does not fail. If the daemon or GUI should keep its own priority
+between runs, leave `limits.nice` at `0` and schedule backups as separate
+`vykar backup` processes (systemd timer or cron) under `Nice=` or `nice -n`,
+which gives per-backup priority.
 
 On Linux builds linked against glibc, the CLI adjusts two process-wide
 allocator settings at startup to reduce retained memory:

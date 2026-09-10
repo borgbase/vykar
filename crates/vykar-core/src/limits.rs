@@ -8,7 +8,6 @@ use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use nix::errno::Errno;
-use tracing::warn;
 
 use crate::config::ResourceLimitsConfig;
 use vykar_storage::{delegate_storage_backend, InnerBackend, StorageBackend};
@@ -189,48 +188,26 @@ delegate_storage_backend! {
     }
 }
 
-/// Guard that restores process niceness when dropped.
-pub struct NiceGuard {
+/// Set the nice value of every thread in this process. One-way: unprivileged
+/// processes cannot lower nice again, so nothing is restored afterwards.
+pub fn apply_process_nice(target_nice: i32) -> std::result::Result<(), String> {
+    if target_nice == 0 {
+        return Ok(());
+    }
+
     #[cfg(unix)]
-    previous_nice: i32,
-}
+    {
+        set_process_nice(target_nice)
+    }
 
-impl NiceGuard {
-    pub fn apply(target_nice: i32) -> std::result::Result<Option<Self>, String> {
-        if target_nice == 0 {
-            return Ok(None);
-        }
-
-        #[cfg(unix)]
-        {
-            let previous = get_process_nice()?;
-            set_process_nice(target_nice)?;
-            Ok(Some(Self {
-                previous_nice: previous,
-            }))
-        }
-
-        #[cfg(not(unix))]
-        {
-            let _ = target_nice;
-            Err("limits.nice is not supported on this platform".to_string())
-        }
+    #[cfg(not(unix))]
+    {
+        tracing::debug!("limits.nice={target_nice} ignored: not supported on this platform");
+        Ok(())
     }
 }
 
-impl Drop for NiceGuard {
-    fn drop(&mut self) {
-        #[cfg(unix)]
-        if let Err(err) = set_process_nice(self.previous_nice) {
-            warn!(
-                "failed to restore process niceness to {}: {err}",
-                self.previous_nice
-            );
-        }
-    }
-}
-
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "linux")))]
 fn get_process_nice() -> std::result::Result<i32, String> {
     Errno::clear();
     // SAFETY: getpriority with PRIO_PROCESS/0 reads the calling thread's nice value.
@@ -246,6 +223,15 @@ fn get_process_nice() -> std::result::Result<i32, String> {
     Ok(value)
 }
 
+// Nice is a one-way ratchet here: a thread is only touched when its current
+// nice is below the target. Lowering nice needs CAP_SYS_NICE or a raised
+// RLIMIT_NICE on Linux (root on macOS), which an unprivileged backup process
+// does not have, so the value is never restored — a long-lived daemon or GUI
+// keeps the highest value any repository requested so far. Skipping threads
+// that are already at or above the target keeps a second apply with a lower
+// value (per-repository override, or a process started under `nice -n`) from
+// failing with EACCES.
+//
 // On Linux, `setpriority(PRIO_PROCESS, 0, …)` only renices the calling thread —
 // NPTL stores the nice value per task, not per process, despite POSIX wording.
 // To match user expectations we walk /proc/self/task and renice every TID.
@@ -276,6 +262,32 @@ fn set_process_nice(value: i32) -> std::result::Result<(), String> {
         };
 
         Errno::clear();
+        // SAFETY: getpriority with PRIO_PROCESS and a TID reads that task's
+        // nice value. No pointer arguments; errno is cleared beforehand to
+        // distinguish a -1 return from an error.
+        let current = unsafe { nix::libc::getpriority(nix::libc::PRIO_PROCESS, tid as u32) };
+        if current == -1 {
+            let errno = Errno::last_raw();
+            // ESRCH: thread exited between readdir and getpriority — benign.
+            if errno == nix::libc::ESRCH {
+                continue;
+            }
+            if errno != 0 {
+                let msg = format!(
+                    "getpriority(tid={tid}) failed: {}",
+                    std::io::Error::from_raw_os_error(errno)
+                );
+                tracing::warn!("{msg}");
+                last_err = Some(msg);
+                continue;
+            }
+        }
+        if current >= value {
+            applied += 1;
+            continue;
+        }
+
+        Errno::clear();
         // SAFETY: setpriority with PRIO_PROCESS and a TID adjusts that task's
         // nice value. No pointer arguments; the value is range-checked by the
         // kernel.
@@ -294,7 +306,7 @@ fn set_process_nice(value: i32) -> std::result::Result<(), String> {
                     std::io::Error::from_raw_os_error(errno)
                 )
             };
-            warn!("{msg}");
+            tracing::warn!("{msg}");
             last_err = Some(msg);
             continue;
         }
@@ -312,6 +324,9 @@ fn set_process_nice(value: i32) -> std::result::Result<(), String> {
 
 #[cfg(all(unix, not(target_os = "linux")))]
 fn set_process_nice(value: i32) -> std::result::Result<(), String> {
+    if get_process_nice()? >= value {
+        return Ok(());
+    }
     Errno::clear();
     // SAFETY: setpriority with PRIO_PROCESS/0 adjusts the calling process's nice value.
     // No pointer arguments; the value parameter is range-checked by the kernel.
@@ -430,27 +445,31 @@ mod tests {
         assert_eq!(limits.download_mib_per_sec, 0);
     }
 
-    // Regression for issue #119: NiceGuard::apply must renice every thread of
-    // the calling process on Linux, not just the calling task.
+    // Regression for issue #119: apply_process_nice must renice every thread
+    // of the calling process on Linux, not just the calling task. Also covers
+    // issue #187: re-applying the same or a lower value must succeed without
+    // touching threads that are already at or above the target.
     //
     // Marked `#[ignore]` because:
     //   1. setpriority is process-wide — running this concurrently with the
     //      rest of the unit-test binary would renice unrelated test threads.
     //   2. Default RLIMIT_NICE on most Linux setups forbids unprivileged
-    //      processes from lowering their own nice value, so a clean restore
-    //      after the test cannot be guaranteed; the elevated nice would leak
-    //      into later tests in the same binary.
-    // Run manually with: cargo test -p vykar-core --lib -- --ignored nice_guard
+    //      processes from lowering their own nice value, so the elevated nice
+    //      leaks into later tests in the same binary.
+    // Run manually with: cargo test -p vykar-core --lib -- --ignored apply_process_nice
     #[cfg(target_os = "linux")]
     #[test]
     #[ignore = "process-wide setpriority; run manually with --ignored"]
-    fn nice_guard_renices_all_threads() {
+    fn apply_process_nice_renices_all_threads() {
         use std::sync::{Arc, Barrier};
         use std::thread;
 
-        // Read this thread's nice and apply a higher (lower-priority) value so
-        // we don't need CAP_SYS_NICE. We never restore to a lower nice in this
-        // test, so RLIMIT_NICE cannot trip the assertion.
+        // Both targets are nonzero so neither call takes the `target == 0`
+        // early return; the second is lower to exercise the raise-only path.
+        let hi = 19;
+        let lo = 10;
+
+        // Raising nice never needs CAP_SYS_NICE, so this works unprivileged.
         // SAFETY: Errno::clear is a thread-local store; getpriority with
         // PRIO_PROCESS/0 reads the calling thread's nice value with no pointer
         // arguments.
@@ -458,8 +477,7 @@ mod tests {
             Errno::clear();
             nix::libc::getpriority(nix::libc::PRIO_PROCESS, 0)
         };
-        let target = start + 1;
-        if target > 19 {
+        if start >= hi {
             // Already at the maximum nice — nothing to test.
             return;
         }
@@ -487,37 +505,38 @@ mod tests {
 
         park.wait(); // all worker threads have registered their TID
 
-        // Forget the guard so Drop doesn't try to restore (the restore would
-        // attempt to lower nice and may be blocked by RLIMIT_NICE in some envs).
-        let guard = NiceGuard::apply(target).expect("apply").expect("non-noop");
-        std::mem::forget(guard);
+        let assert_all_at = |expected: i32, what: &str| {
+            for tid in tids.lock().unwrap().iter().copied() {
+                Errno::clear();
+                // SAFETY: getpriority with PRIO_PROCESS and a TID reads that
+                // task's nice value; no pointer arguments.
+                let actual = unsafe { nix::libc::getpriority(nix::libc::PRIO_PROCESS, tid as u32) };
+                let errno = Errno::last_raw();
+                assert!(
+                    !(actual == -1 && errno != 0),
+                    "getpriority(tid={tid}) failed: errno={errno}"
+                );
+                assert_eq!(actual, expected, "thread {tid} wrong after {what}");
+            }
+            // Also verify the calling thread.
+            // SAFETY: getpriority with PRIO_PROCESS/0 reads the calling
+            // thread's nice value; no pointer arguments.
+            let calling = unsafe { nix::libc::getpriority(nix::libc::PRIO_PROCESS, 0) };
+            assert_eq!(calling, expected, "calling thread wrong after {what}");
+        };
 
-        for tid in tids.lock().unwrap().iter().copied() {
-            Errno::clear();
-            // SAFETY: getpriority with PRIO_PROCESS and a TID reads that
-            // task's nice value; no pointer arguments.
-            let actual = unsafe { nix::libc::getpriority(nix::libc::PRIO_PROCESS, tid as u32) };
-            let errno = Errno::last_raw();
-            assert!(
-                !(actual == -1 && errno != 0),
-                "getpriority(tid={tid}) failed: errno={errno}"
-            );
-            assert_eq!(actual, target, "thread {tid} not reniced");
-        }
+        apply_process_nice(hi).expect("apply hi");
+        assert_all_at(hi, "apply");
 
-        // Also verify the calling thread.
-        // SAFETY: getpriority with PRIO_PROCESS/0 reads the calling thread's
-        // nice value; no pointer arguments.
-        let calling = unsafe { nix::libc::getpriority(nix::libc::PRIO_PROCESS, 0) };
-        assert_eq!(calling, target, "calling thread not reniced");
+        // Repeat and lower: both are no-ops that must not fail with EACCES.
+        apply_process_nice(hi).expect("re-apply hi");
+        assert_all_at(hi, "re-apply");
+        apply_process_nice(lo).expect("apply lo");
+        assert_all_at(hi, "apply lower");
 
         release.wait();
         for h in handles {
             h.join().unwrap();
         }
-
-        // Best-effort restore (may fail under tight RLIMIT_NICE; that's fine,
-        // the test only asserts the apply path).
-        let _ = set_process_nice(start);
     }
 }

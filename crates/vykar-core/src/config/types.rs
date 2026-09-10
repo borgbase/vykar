@@ -488,7 +488,7 @@ impl CompactConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CheckConfig {
     /// Percentage of packs/snapshots to verify per cycle (0–100).
@@ -496,25 +496,9 @@ pub struct CheckConfig {
     #[serde(default)]
     pub max_percent: u8,
     /// Run a full 100% check on this interval (e.g. "60d").
-    /// Overrides max_percent to 100 when due.
-    #[serde(
-        default = "default_check_full_every",
-        deserialize_with = "deserialize_optional_duration_string"
-    )]
+    /// Unset = no periodic full check. Overrides max_percent to 100 when due.
+    #[serde(default, deserialize_with = "deserialize_optional_duration_string")]
     pub full_every: Option<String>,
-}
-
-fn default_check_full_every() -> Option<String> {
-    Some("60d".to_string())
-}
-
-impl Default for CheckConfig {
-    fn default() -> Self {
-        Self {
-            max_percent: 0,
-            full_every: default_check_full_every(),
-        }
-    }
 }
 
 impl CheckConfig {
@@ -625,8 +609,8 @@ mod tests {
     fn check_config_defaults() {
         let cfg = CheckConfig::default();
         assert_eq!(cfg.max_percent, 0);
-        assert_eq!(cfg.full_every.as_deref(), Some("60d"));
-        assert!(cfg.full_every_duration().is_some());
+        assert!(cfg.full_every.is_none());
+        assert!(cfg.full_every_duration().is_none());
     }
 
     #[test]

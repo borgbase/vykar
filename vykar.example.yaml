@@ -261,13 +261,13 @@ compression:
 #   upload_mib_per_sec: 0          # Upload bandwidth cap
 #   download_mib_per_sec: 0        # Download bandwidth cap
 
-# Integrity check settings (used by scheduled/daemon cycles).
+# Integrity check settings (used by bare `vykar`, `vykar daemon` and GUI backup runs).
 # Standalone `vykar check` always runs 100% regardless of these settings.
 #
 # check:
 #   max_percent: 0                 # % of packs/snapshots to verify per cycle (0-100, default: 0)
 #                                  # 0 = skip partial checks; only full_every triggers checks
-#   full_every: "60d"              # run full 100% check on this interval (default: 60d)
+#   full_every: "60d"              # run full 100% check on this interval (default: unset = never)
 #                                  # overrides max_percent to 100 when due
 
 # See docs/src/configuration.md for full option reference.

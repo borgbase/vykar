@@ -549,7 +549,7 @@ compact:
 
 ## Check
 
-Control the integrity check step during scheduled/daemon backup cycles. Standalone `vykar check` always runs a full 100% check regardless of these settings.
+Control the integrity check step of the full cycle — bare `vykar`, `vykar daemon`, and GUI backup runs. Standalone `vykar check` always runs a full 100% check regardless of these settings.
 
 ```yaml
 check:
@@ -560,9 +560,9 @@ check:
 | Field | Default | Values | Description |
 |-------|---------|--------|-------------|
 | `max_percent` | `0` | integer, 0–100 | % of packs/snapshots to verify per scheduled cycle. `0` = skip partial checks |
-| `full_every` | `"60d"` | duration string (`s`/`m`/`h`/`d`) or `null` | Full 100% check interval. Overrides `max_percent` when due. `null` disables periodic full checks |
+| `full_every` | *(unset)* | duration string (`s`/`m`/`h`/`d`) | Full 100% check interval. Overrides `max_percent` when due. Omit the field to disable periodic full checks |
 
-**How it works:** On each daemon/GUI cycle, vykar checks a local timestamp file to determine whether a full check is due. If `full_every` is due (or the timestamp is missing/corrupt), a full 100% check runs and the timestamp is updated. Otherwise, if `max_percent > 0`, a random sample of that percentage of packs and snapshots is verified. If `max_percent` is 0 and `full_every` is not yet due, the check step is skipped entirely (no index loaded).
+**How it works:** A full 100% check runs only when `full_every` is set and due — which includes the case where its timestamp file is missing, corrupt, or belongs to a different repository — and the timestamp is then updated. Otherwise, if `max_percent > 0`, a random sample of that percentage of packs and snapshots is verified. With neither set (the default), the check step is skipped without opening the repository.
 
 Standalone `vykar check` always runs at 100% and does not update the daemon's timer — manual checks don't reset the schedule.
 

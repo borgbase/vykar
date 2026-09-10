@@ -35,6 +35,10 @@ pub fn minimal_config_template() -> &'static str {
 # schedule:                          # A repository entry may override this
 #   enabled: true                    # wholesale with its own `schedule:` block
 #   every: "24h"
+#
+# check:                             # Integrity check during a full `vykar` cycle,
+#   max_percent: 10                  # `vykar daemon`, or a GUI backup run.
+#   full_every: "60d"                # Sample 10% each cycle; 100% check every 60 days.
 "#
 }
 

@@ -532,7 +532,13 @@ pub fn run_full_cycle_for_repo(
             },
             |result| {
                 if result.skipped {
-                    StepOutcome::Skipped("check not due".into())
+                    let reason =
+                        if check_max_percent == 0 && config.check.full_every_duration().is_none() {
+                            "check not configured"
+                        } else {
+                            "check not due"
+                        };
+                    StepOutcome::Skipped(reason.into())
                 } else if result.errors.is_empty() {
                     StepOutcome::Ok
                 } else {

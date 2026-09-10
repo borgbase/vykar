@@ -8,7 +8,7 @@ craneLib.buildPackage (
   // {
     cargoArtifacts = common.cargoArtifactsCore;
     pname = "vykar";
-    version = (pkgs.lib.importTOML ../crates/vykar-cli/Cargo.toml).package.version;
+    inherit (common) version;
 
     cargoExtraArgs = "--package vykar-cli";
 

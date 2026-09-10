@@ -4,6 +4,9 @@
   skiaBinaries,
 }:
 let
+  # Versions live in [workspace.package]; crate manifests inherit them.
+  version = (pkgs.lib.importTOML ../Cargo.toml).workspace.package.version;
+
   src = pkgs.lib.cleanSourceWith {
     src = craneLib.path ./..;
     filter =
@@ -90,7 +93,7 @@ let
     argsCore
     // {
       pname = "vykar-core-deps";
-      version = (pkgs.lib.importTOML ../crates/vykar-core/Cargo.toml).package.version;
+      inherit version;
       cargoExtraArgs = "--workspace --exclude vykar-gui";
     }
   );
@@ -99,12 +102,13 @@ let
     argsGui
     // {
       pname = "vykar-gui-deps";
-      version = (pkgs.lib.importTOML ../crates/vykar-gui/Cargo.toml).package.version;
+      inherit version;
     }
   );
 in
 {
   inherit
+    version
     src
 
     nativeBuildInputsCore

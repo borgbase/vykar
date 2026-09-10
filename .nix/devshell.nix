@@ -23,6 +23,6 @@ pkgs.mkShell {
   env = common.envCore // common.envGui;
 
   shellHook = ''
-    echo "vykar ${(pkgs.lib.importTOML ../crates/vykar-core/Cargo.toml).package.version} dev shell — $(rustc --version)"
+    echo "vykar ${common.version} dev shell — $(rustc --version)"
   '';
 }

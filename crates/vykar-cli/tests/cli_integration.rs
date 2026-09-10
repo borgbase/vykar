@@ -2,6 +2,7 @@
 #![allow(clippy::pedantic)]
 #![allow(clippy::panic, clippy::indexing_slicing)]
 
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::Duration;
@@ -51,13 +52,27 @@ impl CliFixture {
         }
     }
 
+    /// Environment that keeps a run inside this fixture's temp dirs. `HOME`
+    /// and the XDG vars cover Linux and macOS; Windows resolves the same
+    /// lookups through `USERPROFILE`/`LOCALAPPDATA`/`APPDATA` (see
+    /// `vykar_common::paths`), so both sets are always set — without them a
+    /// Windows run reads and writes the developer's real profile.
+    fn test_env(&self) -> [(&str, &OsStr); 7] {
+        [
+            ("HOME", self.home_dir.as_os_str()),
+            ("USERPROFILE", self.home_dir.as_os_str()),
+            ("XDG_CACHE_HOME", self.cache_dir.as_os_str()),
+            ("LOCALAPPDATA", self.cache_dir.as_os_str()),
+            ("XDG_CONFIG_HOME", self.config_home.as_os_str()),
+            ("APPDATA", self.config_home.as_os_str()),
+            ("NO_COLOR", OsStr::new("1")),
+        ]
+    }
+
     fn run(&self, args: &[&str]) -> Output {
         let mut cmd = Command::new(vykar_binary_path());
         cmd.args(args);
-        cmd.env("HOME", &self.home_dir);
-        cmd.env("XDG_CACHE_HOME", &self.cache_dir);
-        cmd.env("XDG_CONFIG_HOME", &self.config_home);
-        cmd.env("NO_COLOR", "1");
+        cmd.envs(self.test_env());
         cmd.output().unwrap()
     }
 
@@ -91,10 +106,7 @@ impl CliFixture {
     fn run_encrypted(&self, args: &[&str], passphrase: &str) -> Output {
         let mut cmd = Command::new(vykar_binary_path());
         cmd.args(args);
-        cmd.env("HOME", &self.home_dir);
-        cmd.env("XDG_CACHE_HOME", &self.cache_dir);
-        cmd.env("XDG_CONFIG_HOME", &self.config_home);
-        cmd.env("NO_COLOR", "1");
+        cmd.envs(self.test_env());
         cmd.env("VYKAR_PASSPHRASE", passphrase);
         cmd.output().unwrap()
     }
@@ -119,10 +131,7 @@ impl CliFixture {
         let mut child = Command::new(vykar_binary_path());
         child
             .args(args)
-            .env("HOME", &self.home_dir)
-            .env("XDG_CACHE_HOME", &self.cache_dir)
-            .env("XDG_CONFIG_HOME", &self.config_home)
-            .env("NO_COLOR", "1")
+            .envs(self.test_env())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -926,10 +935,7 @@ fn cli_daemon_encrypted_without_passphrase_fails() {
     // Ensure no env passphrase leaks in from the test runner
     let output = Command::new(vykar_binary_path())
         .args(["--config", &cfg, "daemon"])
-        .env("HOME", &fx.home_dir)
-        .env("XDG_CACHE_HOME", &fx.cache_dir)
-        .env("XDG_CONFIG_HOME", &fx.config_home)
-        .env("NO_COLOR", "1")
+        .envs(fx.test_env())
         .env_remove("VYKAR_PASSPHRASE")
         .output()
         .unwrap();
@@ -961,10 +967,7 @@ fn cli_daemon_on_startup_and_shutdown() {
     // Spawn daemon as a background process
     let mut child = Command::new(vykar_binary_path())
         .args(["--config", &cfg, "daemon"])
-        .env("HOME", &fx.home_dir)
-        .env("XDG_CACHE_HOME", &fx.cache_dir)
-        .env("XDG_CONFIG_HOME", &fx.config_home)
-        .env("NO_COLOR", "1")
+        .envs(fx.test_env())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -1029,10 +1032,7 @@ fn cli_daemon_second_instance_rejected_by_scheduler_lock() {
     // Spawn the first daemon — it should acquire the scheduler lock.
     let mut first = Command::new(vykar_binary_path())
         .args(["--config", &cfg, "daemon"])
-        .env("HOME", &fx.home_dir)
-        .env("XDG_CACHE_HOME", &fx.cache_dir)
-        .env("XDG_CONFIG_HOME", &fx.config_home)
-        .env("NO_COLOR", "1")
+        .envs(fx.test_env())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -1050,10 +1050,7 @@ fn cli_daemon_second_instance_rejected_by_scheduler_lock() {
     // Spawn the second daemon — it should fail immediately with the lock error.
     let second_output = Command::new(vykar_binary_path())
         .args(["--config", &cfg, "daemon"])
-        .env("HOME", &fx.home_dir)
-        .env("XDG_CACHE_HOME", &fx.cache_dir)
-        .env("XDG_CONFIG_HOME", &fx.config_home)
-        .env("NO_COLOR", "1")
+        .envs(fx.test_env())
         .output()
         .unwrap();
 
@@ -1342,10 +1339,7 @@ fn spawn_daemon(fx: &CliFixture, cfg: &str) -> (std::process::Child, LogCollecto
 
     let mut child = Command::new(vykar_binary_path())
         .args(["--config", cfg, "daemon"])
-        .env("HOME", &fx.home_dir)
-        .env("XDG_CACHE_HOME", &fx.cache_dir)
-        .env("XDG_CONFIG_HOME", &fx.config_home)
-        .env("NO_COLOR", "1")
+        .envs(fx.test_env())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -1821,10 +1815,7 @@ fn cli_daemon_trust_repo_rejected() {
 
     let output = Command::new(vykar_binary_path())
         .args(["--trust-repo", "--config", &cfg, "daemon"])
-        .env("HOME", &fx.home_dir)
-        .env("XDG_CACHE_HOME", &fx.cache_dir)
-        .env("XDG_CONFIG_HOME", &fx.config_home)
-        .env("NO_COLOR", "1")
+        .envs(fx.test_env())
         .output()
         .unwrap();
 
@@ -1845,10 +1836,7 @@ fn cli_daemon_empty_config_startup_rejected() {
 
     let output = Command::new(vykar_binary_path())
         .args(["--config", &cfg, "daemon"])
-        .env("HOME", &fx.home_dir)
-        .env("XDG_CACHE_HOME", &fx.cache_dir)
-        .env("XDG_CONFIG_HOME", &fx.config_home)
-        .env("NO_COLOR", "1")
+        .envs(fx.test_env())
         .output()
         .unwrap();
 

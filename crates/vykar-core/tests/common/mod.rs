@@ -40,6 +40,10 @@ pub fn init_test_environment() {
         unsafe {
             std::env::set_var("HOME", &home);
             std::env::set_var("XDG_CACHE_HOME", &cache);
+            // Windows reads these instead; without them the cache lands in the
+            // real user profile.
+            std::env::set_var("USERPROFILE", &home);
+            std::env::set_var("LOCALAPPDATA", &cache);
         }
     });
 }

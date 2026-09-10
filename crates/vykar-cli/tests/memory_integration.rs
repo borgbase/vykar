@@ -2,6 +2,7 @@
 #![allow(clippy::pedantic)]
 #![allow(clippy::panic, clippy::indexing_slicing, clippy::print_stderr)]
 
+use std::ffi::OsStr;
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -54,12 +55,23 @@ impl CliFixture {
         }
     }
 
+    /// See `cli_integration`: Windows resolves home and cache through
+    /// `USERPROFILE`/`LOCALAPPDATA`, not `HOME`/`XDG_CACHE_HOME`, so both sets
+    /// are set to keep the run out of the developer's real profile.
+    fn test_env(&self) -> [(&str, &OsStr); 5] {
+        [
+            ("HOME", self.home_dir.as_os_str()),
+            ("USERPROFILE", self.home_dir.as_os_str()),
+            ("XDG_CACHE_HOME", self.cache_dir.as_os_str()),
+            ("LOCALAPPDATA", self.cache_dir.as_os_str()),
+            ("NO_COLOR", OsStr::new("1")),
+        ]
+    }
+
     fn run(&self, args: &[&str]) -> Output {
         let mut cmd = Command::new(vykar_binary_path());
         cmd.args(args);
-        cmd.env("HOME", &self.home_dir);
-        cmd.env("XDG_CACHE_HOME", &self.cache_dir);
-        cmd.env("NO_COLOR", "1");
+        cmd.envs(self.test_env());
         cmd.output().unwrap()
     }
 
@@ -79,9 +91,7 @@ impl CliFixture {
     fn run_monitored(&self, args: &[&str]) -> MonitoredOutput {
         let mut cmd = Command::new(vykar_binary_path());
         cmd.args(args);
-        cmd.env("HOME", &self.home_dir);
-        cmd.env("XDG_CACHE_HOME", &self.cache_dir);
-        cmd.env("NO_COLOR", "1");
+        cmd.envs(self.test_env());
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
 

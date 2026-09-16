@@ -13,6 +13,7 @@
     )
 )]
 
+mod cleanup;
 pub mod config;
 pub mod error;
 pub mod handlers;
@@ -128,6 +129,20 @@ async fn serve(cli: Cli) -> Result<(), StartupError> {
 
     let listen_addr = config.listen.clone();
     let state = AppState::new(config, cli.quota);
+
+    // Periodic rescan + debris sweep. `record_backup` alone is not enough:
+    // fresh (<24 h) debris counted at startup can be what blocks the next
+    // backup from completing, so nothing would ever re-run the scan and the
+    // debris would never age out. Idle servers have the same problem.
+    let sweeper_state = state.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(cleanup::SWEEP_INTERVAL);
+        tick.tick().await; // first tick fires immediately; startup already scanned
+        loop {
+            tick.tick().await;
+            sweeper_state.rescan_in_background();
+        }
+    });
 
     let app = handlers::router(state);
 

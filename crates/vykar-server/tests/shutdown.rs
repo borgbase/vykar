@@ -133,14 +133,14 @@ impl Server {
             let in_flight = std::fs::read_dir(&snapshots).ok().is_some_and(|entries| {
                 entries
                     .flatten()
-                    .any(|e| e.file_name().to_string_lossy().starts_with(".tmp.hold."))
+                    .any(|e| vykar_protocol::is_temp_file(&e.file_name().to_string_lossy()))
             });
             if in_flight {
                 return stream;
             }
             assert!(
                 Instant::now() < deadline,
-                "handler did not create snapshots/.tmp.hold.* within {TIMEOUT:?}"
+                "handler did not create snapshots/.tmp.* within {TIMEOUT:?}"
             );
             std::thread::sleep(Duration::from_millis(20));
         }

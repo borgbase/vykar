@@ -4,6 +4,7 @@ use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use chrono::{DateTime, Utc};
 
+use crate::cleanup::{scan_usage, TEMP_DEBRIS_MAX_AGE};
 use crate::config::ServerSection;
 use crate::quota::{self, QuotaState};
 
@@ -103,8 +104,9 @@ impl AppState {
             std::process::exit(1);
         }
 
-        // Initialize quota usage by scanning data_dir
-        let quota_usage = dir_size(&data_dir);
+        // Initialize quota usage by scanning data_dir, sweeping aged temp
+        // debris (crash leftovers) on the way so it never enters usage.
+        let (quota_usage, _) = scan_usage(&data_dir, Some(TEMP_DEBRIS_MAX_AGE));
 
         // Detect quota
         let (source, limit) = quota::detect_quota(&data_dir, explicit_quota, quota_usage);
@@ -147,7 +149,7 @@ impl AppState {
             std::process::exit(1);
         }
 
-        let quota_usage = dir_size(&data_dir);
+        let (quota_usage, _) = scan_usage(&data_dir, Some(TEMP_DEBRIS_MAX_AGE));
 
         Self {
             inner: Arc::new(AppStateInner {
@@ -287,9 +289,15 @@ impl AppState {
         let mut ts = write_unpoisoned(&self.inner.last_backup_at, "last_backup_at");
         *ts = Some(Utc::now());
 
-        // Rescan committed usage and refresh quota in the background
-        // (fire-and-forget). Corrects any drift accumulated from the
-        // reservation fast-path (e.g. concurrent same-key overwrites).
+        // Corrects any drift accumulated from the reservation fast-path
+        // (e.g. concurrent same-key overwrites).
+        self.rescan_in_background();
+    }
+
+    /// Rescan committed usage, sweep aged temp debris and refresh the quota
+    /// limit in the background (fire-and-forget). Called after every completed
+    /// backup and from the periodic loop in `lib.rs`.
+    pub fn rescan_in_background(&self) {
         let inner = self.inner.clone();
         tokio::task::spawn_blocking(move || rescan_usage(&inner));
     }
@@ -386,28 +394,14 @@ impl Drop for QuotaReservation {
     }
 }
 
-/// Rescan committed usage from disk and refresh the quota limit. **Blocking** —
-/// call via `spawn_blocking`. In-flight reservations live in `quota_reserved`,
-/// so overwriting `quota_usage` here cannot clobber them.
+/// Rescan committed usage from disk (sweeping aged temp debris) and refresh
+/// the quota limit. **Blocking** — call via `spawn_blocking`. In-flight
+/// reservations live in `quota_reserved`, so overwriting `quota_usage` here
+/// cannot clobber them.
 pub(crate) fn rescan_usage(inner: &AppStateInner) {
-    let usage = dir_size(&inner.data_dir);
+    let (usage, _) = scan_usage(&inner.data_dir, Some(TEMP_DEBRIS_MAX_AGE));
     inner.quota_usage.store(usage, Ordering::Relaxed);
     inner.quota_state.refresh(usage);
-}
-
-fn dir_size(path: &Path) -> u64 {
-    let mut total = 0u64;
-    if let Ok(entries) = std::fs::read_dir(path) {
-        for entry in entries.flatten() {
-            let p = entry.path();
-            if p.is_dir() {
-                total += dir_size(&p);
-            } else if let Ok(meta) = p.metadata() {
-                total += meta.len();
-            }
-        }
-    }
-    total
 }
 
 /// Path-traversal safety check without schema enforcement. Rejects null bytes,
@@ -577,6 +571,53 @@ mod tests {
 
         rescan_usage(&state.inner);
         assert_eq!(state.quota_used(), 4096, "usage should match on-disk size");
+    }
+
+    /// Write-mode handle for both steps: Windows `SetFileTime` needs
+    /// `FILE_WRITE_ATTRIBUTES`, which a read-only handle lacks.
+    fn write_aged_temp(path: &Path, len: usize) {
+        use std::io::Write;
+        let mut f = std::fs::File::create(path).unwrap();
+        f.write_all(&vec![0u8; len]).unwrap();
+        f.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(25 * 3600))
+            .unwrap();
+    }
+
+    #[test]
+    fn startup_scan_sweeps_aged_temp_debris() {
+        use crate::config::ServerSection;
+        use crate::quota::{QuotaSource, QuotaState};
+
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("packs/ab")).unwrap();
+        std::fs::write(tmp.path().join("config"), vec![0u8; 100]).unwrap();
+        let debris = tmp.path().join("packs/ab/.tmp.deadbeef.3");
+        write_aged_temp(&debris, 4096);
+
+        let quota_state =
+            QuotaState::new(QuotaSource::Unlimited, 0, true, tmp.path().to_path_buf());
+        let config = ServerSection {
+            data_dir: tmp.path().to_string_lossy().into_owned(),
+            token: "t".to_string(),
+            ..Default::default()
+        };
+        let state = AppState::new_with_quota(config, quota_state);
+
+        assert!(!debris.exists(), "startup sweep removes aged debris");
+        assert_eq!(state.quota_used(), 100, "swept bytes excluded from usage");
+    }
+
+    #[test]
+    fn rescan_sweeps_aged_temp_debris() {
+        let (state, tmp) = test_state(0);
+        std::fs::write(tmp.path().join("config"), vec![0u8; 100]).unwrap();
+        let debris = tmp.path().join(".tmp.index.9");
+        write_aged_temp(&debris, 4096);
+
+        rescan_usage(&state.inner);
+
+        assert!(!debris.exists(), "rescan removes aged debris");
+        assert_eq!(state.quota_used(), 100);
     }
 
     #[test]

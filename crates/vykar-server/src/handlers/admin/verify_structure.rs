@@ -19,6 +19,7 @@ fn check_structure(repo_dir: &std::path::Path) -> serde_json::Value {
     let mut errors: Vec<String> = Vec::new();
     let mut pack_count = 0u64;
     let mut total_size = 0u64;
+    let mut temp_files = 0u64;
 
     // Check required files.
     for required in &["config", "index", "keys/repokey"] {
@@ -44,6 +45,13 @@ fn check_structure(repo_dir: &std::path::Path) -> serde_json::Value {
                 if let Ok(packs) = std::fs::read_dir(shard_entry.path()) {
                     for pack_entry in packs.flatten() {
                         let pack_name = pack_entry.file_name().to_string_lossy().to_string();
+                        // Upload/repack debris is not a pack: report it as a
+                        // count, not as a malformed pack. The server sweeps it
+                        // once it is older than `TEMP_DEBRIS_MAX_AGE`.
+                        if vykar_protocol::is_temp_file(&pack_name) {
+                            temp_files += 1;
+                            continue;
+                        }
                         pack_count += 1;
 
                         // Verify pack name is 64-char hex.
@@ -106,5 +114,37 @@ fn check_structure(repo_dir: &std::path::Path) -> serde_json::Value {
         "pack_count": pack_count,
         "total_size": total_size,
         "stale_locks": stale_locks,
+        "temp_files": temp_files,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::http::StatusCode;
+
+    use super::super::test_support::{build_pack, write_pack};
+    use crate::handlers::test_helpers::*;
+
+    #[tokio::test]
+    async fn temp_debris_is_counted_not_reported_as_error() {
+        let (router, _state, tmp) = setup_app(0);
+        std::fs::write(tmp.path().join("config"), b"cfg").unwrap();
+        std::fs::write(tmp.path().join("index"), b"idx").unwrap();
+        std::fs::write(tmp.path().join("keys/repokey"), b"key").unwrap();
+
+        let (pack_bytes, _) = build_pack(&[b"hello"]);
+        let key = write_pack(tmp.path(), &pack_bytes);
+        let shard_dir = tmp.path().join(&key).parent().unwrap().to_path_buf();
+        std::fs::write(shard_dir.join(".tmp.abcdef.0"), b"partial upload").unwrap();
+
+        let resp = authed_get(router, "/?verify-structure").await;
+        assert_status(&resp, StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+
+        assert_eq!(json["ok"], true, "{json}");
+        assert!(json["errors"].as_array().unwrap().is_empty(), "{json}");
+        assert_eq!(json["pack_count"], 1);
+        assert_eq!(json["total_size"], pack_bytes.len() as u64);
+        assert_eq!(json["temp_files"], 1);
+    }
 }

@@ -122,17 +122,23 @@ pub fn assert_status(response: &axum::response::Response, expected: StatusCode) 
     );
 }
 
-/// Recursively assert no server temp files remain under `dir`. Checks both the
-/// current `.tmp.*` prefix and the legacy `.repack_tmp.*` prefix.
+/// Recursively assert no server temp files remain under `dir`.
 pub fn assert_no_temp_files(dir: &std::path::Path) {
-    for path in walk_file_paths(dir) {
-        let name = path.file_name().unwrap().to_string_lossy();
-        assert!(
-            !name.starts_with(".tmp.") && !name.starts_with(".repack_tmp."),
-            "leftover temp file: {}",
-            path.display()
-        );
-    }
+    let leftovers = temp_file_paths(dir);
+    assert!(leftovers.is_empty(), "leftover temp files: {leftovers:?}");
+}
+
+/// Recursively count server temp files (current `.tmp.*` and legacy
+/// `.repack_tmp.*` prefixes) under `dir`.
+pub fn temp_file_count(dir: &std::path::Path) -> usize {
+    temp_file_paths(dir).len()
+}
+
+fn temp_file_paths(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    walk_file_paths(dir)
+        .into_iter()
+        .filter(|p| vykar_protocol::is_temp_file(&p.file_name().unwrap().to_string_lossy()))
+        .collect()
 }
 
 /// Recursively collect every file path under `dir`.

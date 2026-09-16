@@ -1,5 +1,3 @@
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-
 use axum::response::{IntoResponse, Response};
 use vykar_types::hash::Hasher256;
 
@@ -11,8 +9,6 @@ use vykar_protocol::{
 
 use crate::error::ServerError;
 use crate::state::{AppState, QuotaReservation};
-
-static REPACK_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 const MAX_REPACK_OPS: usize = 10_000;
 const MAX_KEEP_BLOBS_PER_OP: usize = 200_000;
@@ -128,16 +124,19 @@ fn execute_repack(
                 .map_err(|e| format!("stat {}: {e}", op.source_pack))?
                 .len();
 
-            // Create temp file for streaming write.
-            let temp_id = REPACK_TEMP_COUNTER.fetch_add(1, Relaxed);
-            // Use the unified `.tmp.` prefix so `vykar_protocol::is_temp_file`
-            // recognizes repack debris everywhere (cleanup, append-only delete).
-            let temp_path = source_path.with_file_name(format!(".tmp.repack.{temp_id}"));
+            // Create temp file for streaming write, next to the source pack.
+            // `temp_path` is the RAII owner: it unlinks on drop, which is the
+            // only cleanup path (every `?` below, and a panic unwinding
+            // through this closure, go through it). The unified `.tmp.` prefix
+            // keeps `vykar_protocol::is_temp_file` recognising repack debris.
+            let source_dir = source_path
+                .parent()
+                .ok_or_else(|| format!("no parent dir for {}", op.source_pack))?;
+            let (temp_file, temp_path) = crate::cleanup::create_temp_in(source_dir)
+                .map_err(|e| format!("create temp: {e}"))?;
 
             // Write new pack to temp file. Collect write errors so we can
             // drop the file handle before cleanup (required on Windows).
-            let temp_file =
-                std::fs::File::create(&temp_path).map_err(|e| format!("create temp: {e}"))?;
             let mut writer = BufWriter::new(temp_file);
             let mut hasher = Hasher256::new(hash);
 
@@ -224,21 +223,16 @@ fn execute_repack(
 
             if let Err(e) = write_result {
                 drop(writer);
-                let _ = std::fs::remove_file(&temp_path);
                 return Err(e);
             }
 
             // Flush the BufWriter and fsync the temp file before rename so its
             // contents survive power loss. into_inner() closes the file handle
             // (required on Windows before rename); fdatasync_file() persists the bytes.
-            let temp_file = writer.into_inner().map_err(|e| {
-                let _ = std::fs::remove_file(&temp_path);
-                format!("flush temp: {e}")
-            })?;
-            vykar_common::fs::fdatasync_file(&temp_file).map_err(|e| {
-                let _ = std::fs::remove_file(&temp_path);
-                format!("sync temp: {e}")
-            })?;
+            let temp_file = writer
+                .into_inner()
+                .map_err(|e| format!("flush temp: {e}"))?;
+            vykar_common::fs::fdatasync_file(&temp_file).map_err(|e| format!("sync temp: {e}"))?;
             drop(temp_file);
 
             // Finalize hash -> pack ID.
@@ -246,10 +240,9 @@ fn execute_repack(
             let shard = &pack_id_hex[..2];
             let new_pack_key = format!("packs/{shard}/{pack_id_hex}");
 
-            let new_pack_path = state.file_path(&new_pack_key).ok_or_else(|| {
-                let _ = std::fs::remove_file(&temp_path);
-                "invalid new pack path".to_string()
-            })?;
+            let new_pack_path = state
+                .file_path(&new_pack_key)
+                .ok_or_else(|| "invalid new pack path".to_string())?;
 
             // Content-addressed identity: if the target already exists, its
             // bytes already are exactly this op's output — whether it is the
@@ -260,7 +253,7 @@ fn execute_repack(
             // already be referenced by the client index, so rollback removal
             // would destroy live data.
             if new_pack_path == *source_path || new_pack_path.exists() {
-                let _ = std::fs::remove_file(&temp_path);
+                drop(temp_path);
                 let deletes_source = op.delete_after && new_pack_path != *source_path;
                 if deletes_source {
                     pending_delete.push(source_path.clone());
@@ -277,19 +270,13 @@ fn execute_repack(
 
             if let Some(parent) = new_pack_path.parent() {
                 let parent_existed = parent.exists();
-                std::fs::create_dir_all(parent).map_err(|e| {
-                    let _ = std::fs::remove_file(&temp_path);
-                    format!("mkdir: {e}")
-                })?;
+                std::fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?;
                 // Fsync the newly-created ancestor chain up to data_dir (rare path).
                 if !parent_existed {
                     let data_dir = state.inner.data_dir.as_path();
                     let mut cursor = Some(parent);
                     while let Some(dir) = cursor {
-                        vykar_common::fs::fsync_dir(dir).map_err(|e| {
-                            let _ = std::fs::remove_file(&temp_path);
-                            format!("fsync dir: {e}")
-                        })?;
+                        vykar_common::fs::fsync_dir(dir).map_err(|e| format!("fsync dir: {e}"))?;
                         if dir == data_dir {
                             break;
                         }
@@ -298,10 +285,11 @@ fn execute_repack(
                 }
             }
 
-            std::fs::rename(&temp_path, &new_pack_path).map_err(|e| {
-                let _ = std::fs::remove_file(&temp_path);
-                format!("rename new pack: {e}")
-            })?;
+            // `persist` consumes the owner; on failure the temp is dropped
+            // (unlinked) along with the error.
+            temp_path
+                .persist(&new_pack_path)
+                .map_err(|e| format!("rename new pack: {}", e.error))?;
 
             // Commit accounting immediately after the rename: the bytes are on
             // disk even if the fsync below fails, and undercounting is the unsafe

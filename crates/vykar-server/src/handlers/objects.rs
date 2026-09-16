@@ -1,5 +1,3 @@
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -11,8 +9,6 @@ use tokio_util::io::{ReaderStream, StreamReader};
 use crate::error::ServerError;
 use crate::state::AppState;
 use vykar_types::hash::{HashAlgorithm, Hasher256};
-
-static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(serde::Deserialize, Default)]
 pub struct ObjectQuery {
@@ -73,6 +69,10 @@ pub async fn head_object(
 ///
 /// Streams the request body to a temp file to avoid buffering large uploads
 /// in memory. Atomic rename on completion.
+///
+/// Cancellation-safe: hyper drops this future when the client disconnects
+/// mid-upload, so the temp file is owned by a `tempfile::TempPath` whose Drop
+/// unlinks it. That is the *only* cleanup path — no per-site `remove_file`.
 #[allow(clippy::too_many_lines)]
 pub async fn put_object(
     State(state): State<AppState>,
@@ -176,30 +176,31 @@ pub async fn put_object(
     // Ensure parent directory exists. When it had to be created, fsync the new
     // ancestor chain up to data_dir so the directory entries survive power loss
     // (rare path — only when missing).
-    if let Some(parent) = file_path.parent() {
-        let parent_existed = tokio::fs::try_exists(parent).await.unwrap_or(false);
-        tokio::fs::create_dir_all(parent)
-            .await
-            .map_err(ServerError::from)?;
-        if !parent_existed {
-            let data_dir = state.inner.data_dir.as_path();
-            let mut cursor = Some(parent);
-            while let Some(dir) = cursor {
-                fsync_dir_async(dir.to_path_buf())
-                    .await
-                    .map_err(ServerError::from)?;
-                if dir == data_dir {
-                    break;
-                }
-                cursor = dir.parent();
+    let parent = file_path
+        .parent()
+        .ok_or_else(|| ServerError::BadRequest("invalid path".into()))?;
+    let parent_existed = tokio::fs::try_exists(parent).await.unwrap_or(false);
+    tokio::fs::create_dir_all(parent)
+        .await
+        .map_err(ServerError::from)?;
+    if !parent_existed {
+        let data_dir = state.inner.data_dir.as_path();
+        let mut cursor = Some(parent);
+        while let Some(dir) = cursor {
+            fsync_dir_async(dir.to_path_buf())
+                .await
+                .map_err(ServerError::from)?;
+            if dir == data_dir {
+                break;
             }
+            cursor = dir.parent();
         }
     }
 
-    // Generate a unique temp file name
-    let unique_id = TEMP_COUNTER.fetch_add(1, Relaxed);
-    let file_name = file_path.file_name().unwrap_or_default().to_string_lossy();
-    let temp_path = file_path.with_file_name(format!(".tmp.{file_name}.{unique_id}"));
+    // `temp_path` is the RAII owner. It lives outside the write block below
+    // so the file handle is dropped before the path is unlinked (Windows).
+    let (temp_file, temp_path) =
+        crate::cleanup::create_temp_in(parent).map_err(ServerError::from)?;
 
     // Stream body to temp file. The write block scopes writer/reader so
     // file handles are closed before rename (required on Windows).
@@ -208,9 +209,7 @@ pub async fn put_object(
         let stream = TryStreamExt::map_err(stream, std::io::Error::other);
         let mut reader = StreamReader::new(stream);
 
-        let temp_file = tokio::fs::File::create(&temp_path)
-            .await
-            .map_err(ServerError::from)?;
+        let temp_file = tokio::fs::File::from_std(temp_file);
         let mut writer = BufWriter::with_capacity(256 * 1024, temp_file);
 
         let mut hasher = expected_digest
@@ -260,10 +259,7 @@ pub async fn put_object(
         }
         .await;
 
-        if let Err(e) = write_result {
-            let _ = tokio::fs::remove_file(&temp_path).await;
-            return Err(e);
-        }
+        write_result?;
 
         (data_len, hasher)
     };
@@ -271,7 +267,6 @@ pub async fn put_object(
     // Validate Content-Length if it was present
     if let Some(content_length) = content_length {
         if data_len != content_length {
-            let _ = tokio::fs::remove_file(&temp_path).await;
             return Err(ServerError::BadRequest(format!(
                 "upload size mismatch: Content-Length {content_length}, received {data_len}"
             )));
@@ -282,7 +277,6 @@ pub async fn put_object(
     if let (Some((algo, expected)), Some(hasher)) = (&expected_digest, hasher) {
         let actual_hex = hasher.finalize_hex();
         if actual_hex != *expected {
-            let _ = tokio::fs::remove_file(&temp_path).await;
             let name = match algo {
                 HashAlgorithm::Blake2b => "BLAKE2b",
                 HashAlgorithm::Blake3 => "BLAKE3",
@@ -293,11 +287,12 @@ pub async fn put_object(
         }
     }
 
-    // Atomic rename temp → final path (file handle already closed)
-    if let Err(e) = tokio::fs::rename(&temp_path, &file_path).await {
-        let _ = tokio::fs::remove_file(&temp_path).await;
-        return Err(ServerError::from(e));
-    }
+    // Atomic rename temp → final path (file handle already closed). `persist`
+    // consumes the owner, so nothing is unlinked afterwards; on failure the
+    // temp is still dropped (and unlinked) with the error.
+    temp_path
+        .persist(&file_path)
+        .map_err(|e| ServerError::from(e.error))?;
 
     // Commit the reservation (moves reserved bytes into committed usage) right
     // after the rename, before the fsync below: the file is on disk either
@@ -312,11 +307,9 @@ pub async fn put_object(
     // Fsync the parent directory so the rename survives power loss. The
     // snapshot blob is the client's commit point, so we must not ack until the
     // rename is durable — a 5xx here is correct; clients retry idempotent PUTs.
-    if let Some(parent) = file_path.parent() {
-        fsync_dir_async(parent.to_path_buf())
-            .await
-            .map_err(ServerError::from)?;
-    }
+    fsync_dir_async(parent.to_path_buf())
+        .await
+        .map_err(ServerError::from)?;
 
     // Detect backup completion: v2 writes snapshots/<id>, v1 writes manifest.
     // Remove the manifest branch once v1 clients are retired.
@@ -727,6 +720,87 @@ mod tests {
             0,
             "mid-stream failure releases reservation"
         );
+    }
+
+    /// Start a PUT whose body never completes and drive it until the handler
+    /// has created its temp file. Returns the parked handler future.
+    ///
+    /// Dropping the returned future is exactly what hyper does to a handler
+    /// when the client disconnects mid-upload; this exercises the handler's
+    /// cancellation safety, not the network path itself.
+    async fn start_stalled_put(
+        router: axum::Router,
+        path: &str,
+        data_dir: &std::path::Path,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        use futures_util::StreamExt;
+        use std::time::{Duration, Instant};
+        use tower::ServiceExt;
+
+        let stream = futures_util::stream::once(async {
+            Ok::<_, std::io::Error>(axum::body::Bytes::from(vec![0x41; 4096]))
+        })
+        .chain(futures_util::stream::pending());
+        let req = axum::http::Request::builder()
+            .method("PUT")
+            .uri(path)
+            .header(
+                "Authorization",
+                format!("Bearer {}", super::super::test_helpers::TEST_TOKEN),
+            )
+            .body(Body::from_stream(stream))
+            .unwrap();
+        let mut fut: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> =
+            Box::pin(async move {
+                let _ = router.oneshot(req).await;
+            });
+
+        // Poll for the observable state rather than sleeping a fixed time.
+        // This doubles as the positive control: it fails if the temp file
+        // never appears.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while temp_file_count(data_dir) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "handler never created its temp file"
+            );
+            let _ = tokio::time::timeout(Duration::from_millis(10), &mut fut).await;
+        }
+        fut
+    }
+
+    #[tokio::test]
+    async fn put_cancelled_midstream_leaves_no_temp_file() {
+        let (router, _state, tmp) = setup_app(0);
+
+        let fut = start_stalled_put(router, CONFIG_PATH, tmp.path()).await;
+        assert_eq!(temp_file_count(tmp.path()), 1);
+
+        drop(fut); // the cancellation
+
+        // TempPath::drop is sync, so no wait is needed.
+        assert_no_temp_files(tmp.path());
+        assert!(!tmp.path().join("config").exists(), "nothing committed");
+    }
+
+    #[tokio::test]
+    async fn put_cancelled_midstream_releases_reservation() {
+        let (router, state, tmp) = setup_app(1_000_000);
+
+        let fut = start_stalled_put(router, CONFIG_PATH, tmp.path()).await;
+        assert!(
+            state.quota_reserved() > 0,
+            "streaming upload has grown its reservation"
+        );
+
+        drop(fut);
+
+        assert_eq!(
+            state.quota_reserved(),
+            0,
+            "cancellation releases reservation"
+        );
+        assert_eq!(state.quota_used(), 0, "nothing committed");
     }
 
     #[tokio::test]

@@ -58,11 +58,14 @@ hex.workspace = true
 # System calls (statvfs, quotactl)
 libc = "0.2"
 
+# RAII temp files for atomic PUT/repack writes (unlinked on drop, so a
+# cancelled handler future leaves no debris)
+tempfile.workspace = true
+
 [target.'cfg(target_env = "musl")'.dependencies]
 mimalloc = { workspace = true }
 
 [dev-dependencies]
-tempfile = { workspace = true }
 # Independent BLAKE2b reference for the upload-digest tests. The server itself
 # no longer hand-rolls a digest — it uses `vykar_types::hash::Hasher256`, the
 # same code path as the client's `PackId::compute`.

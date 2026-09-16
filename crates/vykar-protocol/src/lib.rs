@@ -385,8 +385,13 @@ pub const KNOWN_ROOT_DIRS: &[&str] = &[
     "pending_index",
 ];
 
-/// Returns true if `name` matches the server temp-file naming convention
-/// (`.tmp.{target}.{unique_id}`), used for atomic writes.
+/// Prefix of every temp file written next to its final destination for an
+/// atomic rename (server PUT/repack, local backend). Shared with
+/// [`is_temp_file`] so the writer and the matcher cannot drift.
+pub const TEMP_FILE_PREFIX: &str = ".tmp.";
+
+/// Returns true if `name` matches the temp-file naming convention
+/// ([`TEMP_FILE_PREFIX`] followed by a random suffix), used for atomic writes.
 ///
 /// Also matches the legacy `.repack_tmp.*` prefix so already-deployed repack
 /// debris is still recognized after the prefix was unified to `.tmp.repack.*`.
@@ -398,7 +403,7 @@ pub const KNOWN_ROOT_DIRS: &[&str] = &[
 pub fn is_temp_file(name: &str) -> bool {
     let trimmed = name.trim_end_matches('/');
     let basename = trimmed.rsplit('/').next().unwrap_or(trimmed);
-    basename.starts_with(".tmp.") || basename.starts_with(".repack_tmp.")
+    basename.starts_with(TEMP_FILE_PREFIX) || basename.starts_with(".repack_tmp.")
 }
 
 /// Returns true if `key` is a known vykar repository storage key.

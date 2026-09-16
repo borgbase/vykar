@@ -67,7 +67,12 @@ impl LocalBackend {
     /// into place. This ensures readers never see a partial/corrupt file.
     fn atomic_write(&self, path: &Path, data: &[u8]) -> Result<()> {
         let dir = path.parent().unwrap_or(&self.root);
-        let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+        // `.tmp.` prefix so SIGKILL debris is recognised by
+        // `vykar_protocol::is_temp_file` (and thus cleaned by `delete-repo`).
+        let mut tmp = tempfile::Builder::new()
+            .prefix(vykar_protocol::TEMP_FILE_PREFIX)
+            .rand_bytes(16)
+            .tempfile_in(dir)?;
         tmp.write_all(data)?;
         vykar_common::fs::fsync_file(tmp.as_file())?;
         let persisted = tmp.persist(path).map_err(|e| e.error)?;

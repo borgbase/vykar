@@ -59,7 +59,6 @@ let
       atk
 
       # Tray icon
-      xdotool
       libayatana-appindicator
     ];
 

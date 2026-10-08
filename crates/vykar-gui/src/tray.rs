@@ -75,10 +75,15 @@ pub(crate) fn build_tray_icon(
     let icon =
         Icon::from_rgba(logo_img.into_raw(), w, h).map_err(|e| format!("tray icon error: {e}"))?;
 
-    let tray = TrayIconBuilder::new()
+    let tray_builder = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
-        .with_tooltip(APP_TITLE)
-        .with_icon_templated(icon)
+        .with_tooltip(APP_TITLE);
+    #[cfg(target_os = "macos")]
+    let tray_builder = tray_builder.with_icon_templated(icon);
+    #[cfg(not(target_os = "macos"))]
+    let tray_builder = tray_builder.with_icon(icon);
+
+    let tray = tray_builder
         .build()
         .map_err(|e| format!("tray icon build failed: {e}"))?;
 

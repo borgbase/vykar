@@ -7,9 +7,8 @@ use crate::config::{RetentionConfig, SourceEntry, VykarConfig};
 use crate::prune::{apply_policy_by_label, PruneDecision};
 use vykar_types::error::{Result, VykarError};
 
-use super::list::load_snapshot_meta;
-use super::snapshot_ops::{commit_snapshot_removals, try_cleanup_deleted_snapshot_refs};
-use super::util::{check_interrupted, with_open_repo_maintenance_lock};
+use super::snapshot_ops::{prepare_removal_targets, remove_snapshots};
+use super::util::with_open_repo_maintenance_lock;
 use crate::repo::OpenOptions;
 
 /// Aggregate result of a prune operation.
@@ -140,65 +139,11 @@ pub fn run(
             // Process oldest first
             to_prune.reverse();
 
-            // Phase 1: Load snapshot keys and item_ptrs BEFORE deleting anything.
-            // Only metadata is retained — item streams are loaded lazily in Phase 3
-            // to avoid holding all pruned snapshots' items in memory at once.
-            struct PruneTarget {
-                snapshot_name: String,
-                snapshot_key: String,
-                item_ptrs: Vec<vykar_types::chunk_id::ChunkId>,
-            }
-            let mut targets: Vec<PruneTarget> = Vec::with_capacity(to_prune.len());
-            for snapshot_name in &to_prune {
-                check_interrupted(shutdown)?;
-                let snapshot_key = repo
-                    .manifest()
-                    .find_snapshot(snapshot_name)
-                    .map(|e| e.id.storage_key())
-                    .ok_or_else(|| VykarError::SnapshotNotFound(snapshot_name.clone()))?;
-                let snapshot_meta = load_snapshot_meta(repo, snapshot_name)?;
-                targets.push(PruneTarget {
-                    snapshot_name: snapshot_name.clone(),
-                    snapshot_key,
-                    item_ptrs: snapshot_meta.item_ptrs,
-                });
-            }
-
-            // Phase 2: Delete all pruned snapshot objects FIRST (commit point).
-            for target in &targets {
-                check_interrupted(shutdown)?;
-                repo.check_lock_fence()?;
-                repo.storage.delete(&target.snapshot_key).map_err(|e| {
-                    VykarError::Other(format!(
-                        "failed to delete snapshot object {}: {e}",
-                        target.snapshot_name
-                    ))
-                })?;
-            }
-
-            // Phase 3: Decrement refcounts. Item streams are reconstructed one at a
-            // time from packs (still on storage) using the saved item_ptrs.
-            // Per-snapshot failures are best-effort — the blob has already
-            // been deleted and cannot be recovered, so we collect warnings
-            // and continue rather than aborting the batch.
-            let mut total_chunks_deleted = 0u64;
-            let mut total_space_freed = 0u64;
+            let targets = prepare_removal_targets(repo, &to_prune, shutdown)?;
             let mut warnings: Vec<String> = Vec::new();
-            for target in targets {
-                if let Some(impact) = try_cleanup_deleted_snapshot_refs(
-                    repo,
-                    &target.snapshot_name,
-                    &target.item_ptrs,
-                    &mut warnings,
-                ) {
-                    total_chunks_deleted += impact.chunks_deleted;
-                    total_space_freed += impact.space_freed;
-                    repo.manifest_mut().remove_snapshot(&target.snapshot_name);
-                }
-            }
-
-            // Single atomic save after all deletions (best-effort).
-            commit_snapshot_removals(repo, "prune", &mut warnings);
+            let removed = remove_snapshots(repo, targets, "prune", shutdown, &mut warnings)?;
+            let total_chunks_deleted = removed.iter().map(|r| r.impact.chunks_deleted).sum();
+            let total_space_freed = removed.iter().map(|r| r.impact.space_freed).sum();
 
             Ok((
                 PruneStats {

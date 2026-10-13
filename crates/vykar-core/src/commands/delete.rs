@@ -1,12 +1,11 @@
 use std::collections::HashSet;
 use std::sync::atomic::AtomicBool;
 
-use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::Result;
 
-use super::list::{load_item_stream_from_ptrs, load_snapshot_meta};
+use super::list::load_item_stream_from_ptrs;
 use super::snapshot_ops::{
-    commit_snapshot_removals, decrement_chunk_refs_on_index, try_cleanup_deleted_snapshot_refs,
+    decrement_chunk_refs_on_index, prepare_removal_targets, remove_snapshots,
 };
 use super::util::{check_interrupted, with_open_repo_maintenance_lock};
 use crate::repo::OpenOptions;
@@ -60,34 +59,7 @@ pub fn run(
         passphrase,
         OpenOptions::new().with_index(),
         |repo| {
-            // Validate all snapshots exist before any mutation.
-            for name in &unique_names {
-                repo.manifest().find_snapshot(name).ok_or_else(|| {
-                    vykar_types::error::VykarError::SnapshotNotFound((*name).into())
-                })?;
-            }
-
-            // Phase 1: Capture lightweight metadata (keys + item_ptrs only).
-            struct DeleteTarget {
-                snapshot_name: String,
-                snapshot_key: String,
-                item_ptrs: Vec<ChunkId>,
-            }
-            let mut targets: Vec<DeleteTarget> = Vec::with_capacity(unique_names.len());
-            for name in &unique_names {
-                check_interrupted(shutdown)?;
-                let snapshot_key = repo
-                    .manifest()
-                    .find_snapshot(name)
-                    .map(|e| e.id.storage_key())
-                    .expect("validated above");
-                let snapshot_meta = load_snapshot_meta(repo, name)?;
-                targets.push(DeleteTarget {
-                    snapshot_name: name.to_string(),
-                    snapshot_key,
-                    item_ptrs: snapshot_meta.item_ptrs,
-                });
-            }
+            let targets = prepare_removal_targets(repo, &unique_names, shutdown)?;
 
             if dry_run {
                 // Scratch-index simulation: clone the real index and run
@@ -119,36 +91,15 @@ pub fn run(
                 });
             }
 
-            // Phase 2: Delete snapshot blobs (commit point).
-            for target in &targets {
-                check_interrupted(shutdown)?;
-                repo.check_lock_fence()?;
-                repo.storage.delete(&target.snapshot_key)?;
-            }
-
-            // Phase 3: Decrement refcounts with lazy item-stream loading.
-            // Per-snapshot failures are best-effort — the blob has already
-            // been deleted and cannot be recovered, so we collect warnings
-            // and continue rather than aborting the batch.
-            let mut all_stats = Vec::with_capacity(targets.len());
             let mut warnings: Vec<String> = Vec::new();
-            for target in targets {
-                if let Some(impact) = try_cleanup_deleted_snapshot_refs(
-                    repo,
-                    &target.snapshot_name,
-                    &target.item_ptrs,
-                    &mut warnings,
-                ) {
-                    repo.manifest_mut().remove_snapshot(&target.snapshot_name);
-                    all_stats.push(DeleteStats {
-                        snapshot_name: target.snapshot_name,
-                        chunks_deleted: impact.chunks_deleted,
-                        space_freed: impact.space_freed,
-                    });
-                }
-            }
-
-            commit_snapshot_removals(repo, "delete", &mut warnings);
+            let all_stats = remove_snapshots(repo, targets, "delete", shutdown, &mut warnings)?
+                .into_iter()
+                .map(|r| DeleteStats {
+                    snapshot_name: r.snapshot_name,
+                    chunks_deleted: r.impact.chunks_deleted,
+                    space_freed: r.impact.space_freed,
+                })
+                .collect();
 
             Ok(DeleteResult {
                 stats: all_stats,

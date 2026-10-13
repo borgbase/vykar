@@ -1,11 +1,14 @@
+use std::sync::atomic::AtomicBool;
+
 use tracing::warn;
 
 use crate::index::ChunkIndex;
 use crate::repo::Repository;
 use vykar_types::chunk_id::ChunkId;
-use vykar_types::error::Result;
+use vykar_types::error::{Result, VykarError};
 
 use super::list;
+use super::util::check_interrupted;
 
 /// Append `msg` to `warnings` and emit `tracing::warn!` for it. Both actions
 /// always happen together: warnings are the surface-visible half, tracing is
@@ -116,4 +119,101 @@ pub fn commit_snapshot_removals(repo: &mut Repository, op: &str, warnings: &mut 
     }
 
     repo.persist_snapshot_cache_from_manifest();
+}
+
+/// A snapshot resolved for removal. Only constructed by
+/// [`prepare_removal_targets`]; the storage key stays private so callers must
+/// go through [`remove_snapshots`] to delete the blob.
+pub struct RemovalTarget {
+    pub snapshot_name: String,
+    snapshot_key: String,
+    pub item_ptrs: Vec<ChunkId>,
+}
+
+pub struct RemovedSnapshot {
+    pub snapshot_name: String,
+    pub impact: SnapshotChunkImpact,
+}
+
+/// Phase 1: resolve storage keys and `item_ptrs` for every name. No mutation.
+///
+/// All names are resolved against the manifest before any metadata GET, so an
+/// unknown name fails fast with `SnapshotNotFound`. Only metadata is retained —
+/// item streams are loaded lazily in Phase 3 to bound memory.
+pub fn prepare_removal_targets<S: AsRef<str>>(
+    repo: &mut Repository,
+    names: &[S],
+    shutdown: Option<&AtomicBool>,
+) -> Result<Vec<RemovalTarget>> {
+    let keys = names
+        .iter()
+        .map(|name| {
+            let name = name.as_ref();
+            repo.manifest()
+                .find_snapshot(name)
+                .map(|e| e.id.storage_key())
+                .ok_or_else(|| VykarError::SnapshotNotFound(name.into()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut targets = Vec::with_capacity(names.len());
+    for (name, snapshot_key) in names.iter().zip(keys) {
+        check_interrupted(shutdown)?;
+        let name = name.as_ref();
+        let snapshot_meta = list::load_snapshot_meta(repo, name)?;
+        targets.push(RemovalTarget {
+            snapshot_name: name.to_string(),
+            snapshot_key,
+            item_ptrs: snapshot_meta.item_ptrs,
+        });
+    }
+    Ok(targets)
+}
+
+/// Delete the snapshot blobs, then decrement refcounts and persist.
+///
+/// Phase 2 deletes every `snapshots/<id>` blob (fenced by the maintenance
+/// lock) and is the commit point: any error aborts before refcounts change,
+/// leaving them inflated (safe). Phase 3 is best-effort — the blobs are
+/// already gone, so per-snapshot refcount failures are appended to
+/// `warnings` and the snapshot is left in the manifest. Only snapshots whose
+/// cleanup succeeded are returned.
+///
+/// `op` names the operation in warnings ("delete" / "prune").
+pub fn remove_snapshots(
+    repo: &mut Repository,
+    targets: Vec<RemovalTarget>,
+    op: &str,
+    shutdown: Option<&AtomicBool>,
+    warnings: &mut Vec<String>,
+) -> Result<Vec<RemovedSnapshot>> {
+    for target in &targets {
+        check_interrupted(shutdown)?;
+        repo.check_lock_fence()?;
+        repo.storage.delete(&target.snapshot_key).map_err(|e| {
+            VykarError::Other(format!(
+                "failed to delete snapshot object {}: {e}",
+                target.snapshot_name
+            ))
+        })?;
+    }
+
+    let mut removed = Vec::with_capacity(targets.len());
+    for target in targets {
+        if let Some(impact) = try_cleanup_deleted_snapshot_refs(
+            repo,
+            &target.snapshot_name,
+            &target.item_ptrs,
+            warnings,
+        ) {
+            repo.manifest_mut().remove_snapshot(&target.snapshot_name);
+            removed.push(RemovedSnapshot {
+                snapshot_name: target.snapshot_name,
+                impact,
+            });
+        }
+    }
+
+    commit_snapshot_removals(repo, op, warnings);
+    Ok(removed)
 }

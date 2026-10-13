@@ -16,3 +16,8 @@ fuzz/target/
 
 # Personal direnv config
 .envrc
+
+# Agent tooling
+.claude/settings.local.json
+.claude/worktrees/
+.DS_Store

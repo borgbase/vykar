@@ -41,4 +41,4 @@ nix develop
 
 If you use [direnv](https://direnv.net/), add `use flake` to a local `.envrc` file for automatic shell activation.
 
-See [CLAUDE.md](CLAUDE.md) for the full project structure and architecture overview.
+See [AGENTS.md](AGENTS.md) for the full project structure and architecture overview.

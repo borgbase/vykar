@@ -23,35 +23,35 @@ The test server provides:
 **Installed tools**: `vykar`, `vykar-server`, `rclone`, `docker`, `podman`, database clients (pg, mariadb, mongo).
 Install missing packages with `sudo apt-get install ...`.
 
-## Sub-skills
+## Scenarios
 
-Run each sub-skill to execute a specific test area. Results go to `~/runtime/`.
+Each scenario is described in the linked file; read it before running that test area. Results go to `~/runtime/`.
 
 ### Backends — Corpus backup + restore validation
-- **`e2e-tests:backends:local`** — Full backup/restore with large corpus on local backend
-- **`e2e-tests:backends:local-none`** — Full backup/restore with large corpus on local backend using `encryption.mode: none`
-- **`e2e-tests:backends:rest`** — Backup/restore against local `vykar-server` REST backend
-- **`e2e-tests:backends:s3`** — Backup/restore with small corpus on S3 backend
-- **`e2e-tests:backends:sftp`** — Backup/restore with small corpus on SFTP backend (timeout-bounded)
-- **`e2e-tests:backends:interrupt-minimal`** — Interrupt `backup` mid-run and verify resume + restore integrity across `local`, `rest`, `s3` (local MinIO), and `sftp`
+- **`backends/local.md`** — Full backup/restore with large corpus on local backend
+- **`local-none`** — Full backup/restore with large corpus on local backend using `encryption.mode: none`
+- **`backends/rest.md`** — Backup/restore against local `vykar-server` REST backend
+- **`backends/s3.md`** — Backup/restore with small corpus on S3 backend
+- **`backends/sftp.md`** — Backup/restore with small corpus on SFTP backend (timeout-bounded)
+- **`interrupt-minimal`** — Interrupt `backup` mid-run and verify resume + restore integrity across `local`, `rest`, `s3` (local MinIO), and `sftp`
 
 ### Databases — Hooks and command_dumps patterns (large realistic data)
-- **`e2e-tests:databases:postgres`** — PostgreSQL with hooks dump and command_dumps variants on ~10 GiB randomized schema
-- **`e2e-tests:databases:mariadb`** — MariaDB with hooks dump and command_dumps variants on ~10 GiB randomized schema
-- **`e2e-tests:databases:mongodb`** — MongoDB with command_dumps (mongodump --archive) on ~2.5 GiB randomized collections
+- **`databases/postgres.md`** — PostgreSQL with hooks dump and command_dumps variants on ~10 GiB randomized schema
+- **`databases/mariadb.md`** — MariaDB with hooks dump and command_dumps variants on ~10 GiB randomized schema
+- **`databases/mongodb.md`** — MongoDB with command_dumps (mongodump --archive) on ~2.5 GiB randomized collections
 
 ### Containers — Volume backups and container integration
-- **`e2e-tests:containers:docker`** — Static volumes, downtime hooks, DB exec dumps via Docker
-- **`e2e-tests:containers:podman`** — Same scenarios using Podman commands
+- **`containers/docker.md`** — Static volumes, downtime hooks, DB exec dumps via Docker
+- **`containers/podman.md`** — Same scenarios using Podman commands
 
 ### Filesystems — Snapshot hooks patterns
-- **`e2e-tests:filesystems:btrfs`** — Btrfs read-only subvolume snapshot hooks
-- **`e2e-tests:filesystems:zfs`** — ZFS dataset snapshot hooks via .zfs/snapshot path
-- **`e2e-tests:filesystems:vm-image`** — Ubuntu cloud image mutate+backup dedupe validation via guestmount/chroot
+- **`filesystems/btrfs.md`** — Btrfs read-only subvolume snapshot hooks
+- **`filesystems/zfs.md`** — ZFS dataset snapshot hooks via .zfs/snapshot path
+- **`filesystems/vm-image.md`** — Ubuntu cloud image mutate+backup dedupe validation via guestmount/chroot
 
 ### Benchmarks
-- **`e2e-tests:benchmarks`** — Compare vykar performance against restic and rustic (use `benchmarks.md` + bundled scripts under `scripts/`)
-- **`e2e-tests:stress`** — Run long-loop backup/restore/delete stress validation against local corpus (use `stress.md` + `scripts/stress.sh`)
+- **`benchmarks.md`** — Compare vykar performance against restic and rustic (uses bundled scripts under `scripts/`)
+- **`stress.md`** — Run long-loop backup/restore/delete stress validation against local corpus (uses `scripts/stress.sh`)
 
 ## Recommended Execution Order
 
@@ -84,7 +84,7 @@ export VYKAR_PASSPHRASE=123    # non-interactive passphrase
 - Record resulting size and table/collection counts in scenario logs/reports.
 
 ### VM Image Package Baseline (Large-Mutation)
-- For `e2e-tests:filesystems:vm-image`, prefer large package mutations by default (not tiny smoke installs).
+- For `filesystems/vm-image.md`, prefer large package mutations by default (not tiny smoke installs).
 - Ubuntu desktop-class package to use: `ubuntu-desktop-minimal` (primary).
 - Optional heavier variant when disk space allows: `ubuntu-desktop`.
 - Recommended phase split for online VM-image tests:
@@ -98,7 +98,7 @@ export VYKAR_PASSPHRASE=123    # non-interactive passphrase
 3. Keep each scenario in a separate config file to avoid source overlap
 4. Reference repos by label: `-R local`, `-R rest`, `-R s3`, `-R sftp`
 5. Include one dedicated local-backend scenario with `encryption.mode: none`; treat it as a required backend validation, not an optional smoke test
-6. For the `e2e-tests:backends:local-none` scenario, set:
+6. For the `local-none` scenario, set:
    - `encryption.mode: none`
    - omit `encryption.passphrase` / `VYKAR_PASSPHRASE`
    - keep the same backup/list/restore/diff validation standard as encrypted local runs
@@ -106,7 +106,7 @@ export VYKAR_PASSPHRASE=123    # non-interactive passphrase
    - `access_token: "<token>"`
    - `allow_insecure_http: true`
    - do not append `/<repo-name>` in single-repo mode
-8. For `e2e-tests:backends:interrupt-minimal`, use a dedicated config file and point S3 to local MinIO:
+8. For `interrupt-minimal`, use a dedicated config file and point S3 to local MinIO:
    - `url: "s3+http://127.0.0.1:9000/vykar-stress/<run-id>"`
    - `allow_insecure_http: true`
    - `region: "us-east-1"`
@@ -195,7 +195,7 @@ Status rules:
 - `BLOCKED`: timeout (`rc=124`) on timeout-bounded steps.
 
 ### Deliverables
-Each sub-skill should produce:
+Each scenario should produce:
 1. Scenario-specific config file saved under `~/runtime/`
 2. Log file under `~/runtime/logs/`
 3. Pass/fail summary report under `~/runtime/reports/`

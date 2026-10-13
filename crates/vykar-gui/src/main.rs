@@ -24,7 +24,6 @@ mod repo_helpers;
 mod scheduler;
 mod state;
 mod tray;
-mod tray_state;
 mod ui_state;
 mod update_check;
 mod view_models;
@@ -103,7 +102,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // ── Fallible UI / tray initialization (before spawning any threads) ──
 
     let ui = bootstrap::init_main_window(&gui_state, initial_config_path)?;
-    let tray = bootstrap::spawn_tray()?;
+    let tray_ready = bootstrap::setup_tray(
+        &app_tx,
+        &ui_tx,
+        cancel_requested.clone(),
+        operation_running.clone(),
+    )?;
 
     // ── Background threads (only after all fallible init succeeded) ──
 
@@ -113,7 +117,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         ui_tx.clone(),
         scheduler,
         backup_running.clone(),
-        operation_running.clone(),
+        operation_running,
         cancel_requested.clone(),
         runtime,
         scheduler_lock_held,
@@ -123,43 +127,32 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── Event consumer ──
 
-    let (tray_source_tx, tray_source_rx) =
-        crossbeam_channel::unbounded::<Vec<(tray_icon::menu::MenuId, String)>>();
-
     event_consumer::spawn(
         ui_rx,
         ui.as_weak(),
         app_tx.clone(),
-        tray_source_tx,
         start_in_background_pref.clone(),
     );
 
     // ── Callback wiring ──
 
-    controllers::main_window::wire_callbacks(
-        &ui,
-        app_tx.clone(),
-        ui_tx.clone(),
-        cancel_requested.clone(),
-    );
+    controllers::main_window::wire_callbacks(&ui, app_tx, ui_tx.clone(), cancel_requested);
 
-    // ── Settings tab + window lifecycle + tray event loop ──
+    // ── Settings tab + window lifecycle ──
 
     let autostart_on = bootstrap::wire_settings_tab(&ui, &ui_tx, &start_in_background_pref);
-    bootstrap::wire_window_lifecycle(&ui, &start_in_background_pref);
-    bootstrap::spawn_tray_event_loop(
-        app_tx,
-        ui_tx,
-        cancel_requested,
-        operation_running,
-        &tray,
-        tray_source_rx,
-    );
+    bootstrap::wire_window_lifecycle(&ui, &ui_tx, &start_in_background_pref);
 
-    if !autostart::should_start_hidden(gui_state.start_in_background, autostart_on) {
+    if !tray_ready {
+        let _ = ui_tx.send(log_entry_now(
+            "No system tray host found; the tray icon will appear once one starts.",
+        ));
+    }
+    if !tray_ready || !autostart::should_start_hidden(gui_state.start_in_background, autostart_on) {
         ui.show()?;
     }
     slint::run_event_loop_until_quit()?;
+    tray::shutdown();
 
     // Persist GUI state. Eager saves (config change, window hide) cover most
     // paths; this final capture handles Cmd-Q on macOS where the event loop

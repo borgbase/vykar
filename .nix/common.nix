@@ -49,18 +49,6 @@ let
       libxrandr
       libxi
       libxcb
-
-      # GTK3 stack
-      gtk3
-      glib
-      pango
-      cairo
-      gdk-pixbuf
-      atk
-
-      # Tray icon
-      xdotool
-      libayatana-appindicator
     ];
 
   envCore = {

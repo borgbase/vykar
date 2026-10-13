@@ -21,8 +21,7 @@ vykar-common.workspace = true
 vykar-types.workspace = true
 tokio = { workspace = true, features = ["sync"] }
 opener = "0.8"
-slint = { version = "~1.17", default-features = false, features = ["std", "compat-1-2", "backend-winit", "renderer-skia", "accessibility"] }
-tray-icon = "0.26"
+slint = { version = "~1.18", default-features = false, features = ["std", "compat-1-2", "backend-winit", "renderer-skia", "accessibility", "system-tray"] }
 crossbeam-channel.workspace = true
 tinyfiledialogs = "3"
 chrono.workspace = true
@@ -35,17 +34,20 @@ dunce = { workspace = true }
 auto-launch = "0.6"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-gtk = "0.18"
+# Already in the tree via Slint's ksni tray; used to wait for an SNI host.
+zbus = { version = "5", default-features = false, features = ["async-io"] }
+futures-lite = "2"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 winreg = "0.56"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader", "Win32_UI_WindowsAndMessaging"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSResponder", "NSWindow"] }
 
 [build-dependencies]
-slint-build = "~1.17"
+slint-build = "~1.18"
 winresource = "0.1"
 
 [dev-dependencies]

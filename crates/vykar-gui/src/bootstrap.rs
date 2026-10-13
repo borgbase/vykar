@@ -1,7 +1,6 @@
 //! Startup wiring extracted from `main::run`: window init, tray creation,
-//! background threads, settings-tab and window-lifecycle callbacks, and the
-//! tray menu-event loop. `run` orchestrates these; each function owns one
-//! coherent slice of startup.
+//! background threads, and settings-tab and window-lifecycle callbacks. `run`
+//! orchestrates these; each function owns one coherent slice of startup.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -9,13 +8,12 @@ use std::thread;
 
 use crossbeam_channel::{Receiver, Sender};
 use slint::ComponentHandle;
-use tray_icon::menu::{MenuEvent, MenuId};
 use vykar_core::app;
 
 use crate::messages::{log_entry_now, AppCommand, UiEvent};
 use crate::repo_helpers::send_log;
-use crate::{autostart, event_consumer, scheduler, state, ui_state, update_check, worker};
-use crate::{AppData, MainWindow};
+use crate::{autostart, event_consumer, scheduler, state, tray, ui_state, update_check, worker};
+use crate::{AppData, MainWindow, VykarTray};
 
 /// Create the main window and seed its initial (pre-worker) state.
 pub(crate) fn init_main_window(
@@ -54,80 +52,114 @@ pub(crate) fn init_main_window(
     Ok(ui)
 }
 
-/// Menu IDs (and, off Linux, the live tray-icon handle) produced by
-/// [`spawn_tray`]. The `_tray_icon` field keeps the icon alive for the process
-/// lifetime on platforms where it lives on the main thread; on Linux the icon
-/// is owned by the dedicated GTK thread instead.
-pub(crate) struct TrayHandles {
-    pub open_item_id: MenuId,
-    pub run_now_item_id: MenuId,
-    pub quit_item_id: MenuId,
-    pub cancel_item_id: MenuId,
-    #[cfg(not(target_os = "linux"))]
-    _tray_icon: tray_icon::TrayIcon,
-}
-
-/// Build the tray icon and return its menu IDs.
-///
-/// On Linux, tray-icon requires a running GTK event loop for D-Bus
-/// registration (AppIndicator) and menu signals; a dedicated thread owns the
-/// tray icon and runs `gtk::main()` — event-driven, zero CPU when idle. On
-/// other platforms the icon lives on the main thread (returned in
-/// [`TrayHandles`] to stay alive).
-pub(crate) fn spawn_tray() -> Result<TrayHandles, Box<dyn std::error::Error>> {
-    #[cfg(target_os = "linux")]
-    let handles = {
-        let (ids_tx, ids_rx) =
-            std::sync::mpsc::sync_channel::<Result<(MenuId, MenuId, MenuId, MenuId), String>>(1);
-        thread::spawn(move || {
-            if let Err(e) = gtk::init() {
-                let _ = ids_tx.send(Err(format!("Failed to initialize GTK: {e}")));
+/// Wire the tray menu. Callbacks run on the Slint event loop and only send
+/// messages or flip atomics, so the tray stays responsive while the worker is
+/// busy.
+fn wire_tray(
+    tray: &VykarTray,
+    app_tx: &Sender<AppCommand>,
+    ui_tx: &Sender<UiEvent>,
+    cancel_requested: &Arc<AtomicBool>,
+    operation_running: &Arc<AtomicBool>,
+) {
+    tray.on_open_clicked({
+        let ui_tx = ui_tx.clone();
+        move || {
+            let _ = ui_tx.send(UiEvent::ShowWindow);
+        }
+    });
+    tray.on_run_all_clicked({
+        let app_tx = app_tx.clone();
+        move || {
+            let _ = app_tx.send(AppCommand::RunBackupAll { scheduled: false });
+        }
+    });
+    tray.on_run_source_clicked({
+        let app_tx = app_tx.clone();
+        move |label| {
+            let _ = app_tx.send(AppCommand::RunBackupSource {
+                source_label: label.to_string(),
+            });
+        }
+    });
+    tray.on_cancel_clicked({
+        let ui_tx = ui_tx.clone();
+        let cancel_requested = cancel_requested.clone();
+        let operation_running = operation_running.clone();
+        move || {
+            // Mirror the window Cancel button: active whenever *any*
+            // operation (backup or UI read) is running.
+            if !operation_running.load(Ordering::SeqCst) {
+                send_log(&ui_tx, "No operation running.");
                 return;
             }
-            match crate::tray::build_tray_icon() {
-                Ok((_tray, open_id, run_now_id, quit_id, source_submenu, cancel_id)) => {
-                    crate::tray_state::set_submenu(source_submenu);
-                    let _ = ids_tx.send(Ok((open_id, run_now_id, quit_id, cancel_id)));
-                    gtk::main();
-                }
-                Err(e) => {
-                    let _ = ids_tx.send(Err(format!("failed to initialize tray icon: {e}")));
-                }
+            cancel_requested.store(true, Ordering::SeqCst);
+            send_log(
+                &ui_tx,
+                "Cancel requested; Vykar will stop when the current file, upload, or storage operation returns.",
+            );
+        }
+    });
+    tray.on_quit_clicked({
+        let ui_tx = ui_tx.clone();
+        move || {
+            let _ = ui_tx.send(UiEvent::Quit);
+        }
+    });
+}
+
+/// Create the tray. Returns whether it is up now; on Linux it is created later
+/// if no StatusNotifierItem host is running yet. Construction errors abort
+/// startup, as before.
+pub(crate) fn setup_tray(
+    app_tx: &Sender<AppCommand>,
+    ui_tx: &Sender<UiEvent>,
+    cancel_requested: Arc<AtomicBool>,
+    operation_running: Arc<AtomicBool>,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    tray::set_factory({
+        let app_tx = app_tx.clone();
+        let ui_tx = ui_tx.clone();
+        move || {
+            let tray = tray::build_tray()?;
+            wire_tray(
+                &tray,
+                &app_tx,
+                &ui_tx,
+                &cancel_requested,
+                &operation_running,
+            );
+            Ok(tray)
+        }
+    });
+
+    #[cfg(target_os = "linux")]
+    if !tray::linux::watcher_present() {
+        let ui_tx = ui_tx.clone();
+        thread::spawn(move || {
+            if let Err(e) = tray::linux::wait_for_watcher() {
+                send_log(&ui_tx, format!("System tray unavailable: {e}"));
+                return;
             }
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Err(e) = tray::create() {
+                    send_log(&ui_tx, format!("Failed to create tray icon: {e}"));
+                }
+            });
         });
-        let (open_item_id, run_now_item_id, quit_item_id, cancel_item_id) = ids_rx
-            .recv()
-            .map_err(|_| "GTK thread exited unexpectedly")??;
-        TrayHandles {
-            open_item_id,
-            run_now_item_id,
-            quit_item_id,
-            cancel_item_id,
-        }
-    };
+        return Ok(false);
+    }
 
-    #[cfg(not(target_os = "linux"))]
-    let handles = {
-        let (
-            tray_icon,
-            open_item_id,
-            run_now_item_id,
-            quit_item_id,
-            source_submenu,
-            cancel_item_id,
-        ) = crate::tray::build_tray_icon()
-            .map_err(|e| format!("failed to initialize tray icon: {e}"))?;
-        crate::tray_state::set_submenu(source_submenu);
-        TrayHandles {
-            open_item_id,
-            run_now_item_id,
-            quit_item_id,
-            cancel_item_id,
-            _tray_icon: tray_icon,
-        }
-    };
+    tray::create().map_err(|e| format!("failed to initialize tray icon: {e}"))?;
 
-    Ok(handles)
+    #[cfg(target_os = "windows")]
+    tray::windows::spawn_taskbar_listener(|| {
+        let _ = slint::invoke_from_event_loop(|| {
+            let _ = tray::create();
+        });
+    });
+
+    Ok(true)
 }
 
 /// Spawn the scheduler, the once-per-launch update check, and the worker.
@@ -252,12 +284,23 @@ pub(crate) fn wire_settings_tab(
 }
 
 /// Wire close-to-tray behavior: both the window-manager close and the in-app
-/// Ctrl/Cmd-W path persist GUI state and hide (rather than quit) the window.
-pub(crate) fn wire_window_lifecycle(ui: &MainWindow, start_in_background_pref: &Arc<AtomicBool>) {
+/// Ctrl/Cmd-W path persist GUI state and hide (rather than quit) the window,
+/// or quit if no tray icon exists yet.
+pub(crate) fn wire_window_lifecycle(
+    ui: &MainWindow,
+    ui_tx: &Sender<UiEvent>,
+    start_in_background_pref: &Arc<AtomicBool>,
+) {
     ui.window().on_close_requested({
         let ui_weak = ui.as_weak();
         let pref = start_in_background_pref.clone();
+        let ui_tx = ui_tx.clone();
         move || {
+            // Without a tray there would be no way back to a hidden window.
+            if !tray::is_installed() {
+                let _ = ui_tx.send(UiEvent::Quit);
+                return slint::CloseRequestResponse::KeepWindowShown;
+            }
             if let Some(ui) = ui_weak.upgrade() {
                 if let Some(s) = event_consumer::capture_gui_state(&ui, &pref) {
                     state::save(&s);
@@ -273,7 +316,12 @@ pub(crate) fn wire_window_lifecycle(ui: &MainWindow, start_in_background_pref: &
     ui.on_close_window({
         let ui_weak = ui.as_weak();
         let pref = start_in_background_pref.clone();
+        let ui_tx = ui_tx.clone();
         move || {
+            if !tray::is_installed() {
+                let _ = ui_tx.send(UiEvent::Quit);
+                return;
+            }
             if let Some(ui) = ui_weak.upgrade() {
                 if let Some(s) = event_consumer::capture_gui_state(&ui, &pref) {
                     state::save(&s);
@@ -281,73 +329,6 @@ pub(crate) fn wire_window_lifecycle(ui: &MainWindow, start_in_background_pref: &
                 }
                 ui.invoke_release_focus();
                 let _ = ui.hide();
-            }
-        }
-    });
-}
-
-/// Spawn the tray menu-event loop. Runs on its own thread so the tray stays
-/// responsive even while the worker is busy.
-pub(crate) fn spawn_tray_event_loop(
-    app_tx: Sender<AppCommand>,
-    ui_tx: Sender<UiEvent>,
-    cancel_requested: Arc<AtomicBool>,
-    operation_running: Arc<AtomicBool>,
-    tray: &TrayHandles,
-    tray_source_rx: Receiver<Vec<(MenuId, String)>>,
-) {
-    let open_item_id = tray.open_item_id.clone();
-    let run_now_item_id = tray.run_now_item_id.clone();
-    let cancel_item_id = tray.cancel_item_id.clone();
-    let quit_item_id = tray.quit_item_id.clone();
-
-    thread::spawn(move || {
-        let tx = app_tx;
-        let cancel = cancel_requested;
-        let log_tx = ui_tx;
-        let menu_rx = MenuEvent::receiver();
-        let mut tray_source_items: Vec<(MenuId, String)> = Vec::new();
-        loop {
-            crossbeam_channel::select! {
-                recv(menu_rx) -> event => {
-                    let Ok(event) = event else {
-                        break;
-                    };
-                    if event.id == open_item_id {
-                        // Bypass the worker queue so the tray stays responsive even
-                        // while the worker is busy (e.g. initial FetchAllRepoInfo).
-                        let _ = log_tx.send(UiEvent::ShowWindow);
-                    } else if event.id == run_now_item_id {
-                        let _ = tx.send(AppCommand::RunBackupAll { scheduled: false });
-                    } else if event.id == cancel_item_id {
-                        // Mirror the window Cancel button: active whenever *any*
-                        // operation (backup or UI read) is running.
-                        if !operation_running.load(Ordering::SeqCst) {
-                            send_log(&log_tx, "No operation running.");
-                            continue;
-                        }
-                        cancel.store(true, Ordering::SeqCst);
-                        send_log(
-                            &log_tx,
-                            "Cancel requested; Vykar will stop when the current file, upload, or storage operation returns.",
-                        );
-                    } else if event.id == quit_item_id {
-                        let _ = log_tx.send(UiEvent::Quit);
-                        break;
-                    } else if let Some((_, label)) =
-                        tray_source_items.iter().find(|(id, _)| *id == event.id)
-                    {
-                        let _ = tx.send(AppCommand::RunBackupSource {
-                            source_label: label.clone(),
-                        });
-                    }
-                }
-                recv(tray_source_rx) -> items => {
-                    match items {
-                        Ok(items) => tray_source_items = items,
-                        Err(_) => break,
-                    }
-                }
             }
         }
     });

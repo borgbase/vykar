@@ -9,7 +9,6 @@ use slint::{ComponentHandle, Model, ModelRc, SharedString, StandardListViewItem,
 use crate::controllers;
 use crate::messages::{AppCommand, UiEvent};
 use crate::state;
-use crate::tray_state;
 use crate::ui_state;
 use crate::view_models::to_find_groups_model;
 use crate::{AppData, MainWindow};
@@ -150,7 +149,6 @@ pub(crate) fn capture_gui_state(
 struct EventCtx<'a> {
     ui: &'a MainWindow,
     app_tx: &'a crossbeam_channel::Sender<AppCommand>,
-    tray_source_tx: &'a crossbeam_channel::Sender<Vec<(tray_icon::menu::MenuId, String)>>,
     prefs: &'a AtomicBool,
 }
 
@@ -225,22 +223,7 @@ fn apply_source_model(
     source_items: Vec<crate::messages::SourceInfoData>,
     labels: Vec<SharedString>,
 ) {
-    // On Linux the tray submenu lives on the GTK thread; dispatch via
-    // idle_add_once to run there.
-    #[cfg(target_os = "linux")]
-    {
-        let tray_labels = labels.clone();
-        let tray_source_tx = ctx.tray_source_tx.clone();
-        gtk::glib::idle_add_once(move || {
-            let items = tray_state::rebuild_submenu(&tray_labels);
-            let _ = tray_source_tx.send(items);
-        });
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let items = tray_state::rebuild_submenu(&labels);
-        let _ = ctx.tray_source_tx.send(items);
-    }
+    crate::tray::set_source_labels(labels.clone());
 
     let current_repo = ui_state::current_repo_name(ctx.ui);
     ui_state::replace_source_model(source_items, labels, current_repo.as_deref());
@@ -319,14 +302,12 @@ pub(crate) fn spawn(
     ui_rx: Receiver<UiEvent>,
     ui_weak: slint::Weak<MainWindow>,
     app_tx: crossbeam_channel::Sender<AppCommand>,
-    tray_source_tx: crossbeam_channel::Sender<Vec<(tray_icon::menu::MenuId, String)>>,
     start_in_background_pref: Arc<AtomicBool>,
 ) {
     std::thread::spawn(move || {
         while let Ok(event) = ui_rx.recv() {
             let ui_weak = ui_weak.clone();
             let app_tx = app_tx.clone();
-            let tray_source_tx = tray_source_tx.clone();
             let start_in_background_pref = start_in_background_pref.clone();
 
             let _ = slint::invoke_from_event_loop(move || {
@@ -336,7 +317,6 @@ pub(crate) fn spawn(
                 let ctx = EventCtx {
                     ui: &ui,
                     app_tx: &app_tx,
-                    tray_source_tx: &tray_source_tx,
                     prefs: &start_in_background_pref,
                 };
 
@@ -430,8 +410,12 @@ pub(crate) fn spawn(
                         // Starting a new operation clears the previous error state.
                         ui.set_status_error(false);
                         ui.set_operation_busy(true);
+                        crate::tray::set_operation_busy(true);
                     }
-                    UiEvent::OperationFinished => ui.set_operation_busy(false),
+                    UiEvent::OperationFinished => {
+                        ui.set_operation_busy(false);
+                        crate::tray::set_operation_busy(false);
+                    }
                     UiEvent::Quit => handle_quit(&ctx),
                     UiEvent::ShowWindow => show_main_window(&ctx),
                     UiEvent::MountStarted { url } => handle_mount_started(&ctx, url),

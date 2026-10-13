@@ -1,0 +1,68 @@
+import { Palette } from "std-widgets.slint";
+
+export component VykarTray inherits SystemTrayIcon {
+    in property <string> app-title;
+    // Dark glyph for light bars, and its inverted twin for dark bars.
+    in property <image> light-icon;
+    in property <image> dark-icon;
+    // 0 = follow Palette, 1 = force light, 2 = force dark. Windows sets this
+    // from the taskbar theme, which can differ from the app theme.
+    in property <int> scheme-override: 0;
+    in property <[string]> source-labels;
+    in property <bool> operation-busy: false;
+
+    callback open-clicked();
+    callback run-all-clicked();
+    callback run-source-clicked(string);
+    callback cancel-clicked();
+    callback quit-clicked();
+
+    tooltip: app-title;
+    icon: (scheme-override == 2 || (scheme-override == 0 && Palette.color-scheme == ColorScheme.dark)) ? dark-icon : light-icon;
+
+    // Left-click on Windows/Linux; macOS always pops the menu instead.
+    clicked => {
+        open-clicked();
+    }
+
+    Menu {
+        MenuItem {
+            title: "Open " + app-title;
+            activated => {
+                open-clicked();
+            }
+        }
+
+        MenuItem {
+            title: "Full Backup Cycle";
+            activated => {
+                run-all-clicked();
+            }
+        }
+
+        Menu {
+            title: "Backup Source";
+            for label in source-labels: MenuItem {
+                title: label;
+                activated => {
+                    run-source-clicked(label);
+                }
+            }
+        }
+
+        // Hidden rather than disabled: macOS ignores `enabled` on tray menus.
+        if operation-busy: MenuItem {
+            title: "Cancel Backup";
+            activated => {
+                cancel-clicked();
+            }
+        }
+
+        MenuItem {
+            title: "Quit";
+            activated => {
+                quit-clicked();
+            }
+        }
+    }
+}

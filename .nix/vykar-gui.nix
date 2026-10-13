@@ -25,12 +25,9 @@ craneLib.buildPackage (
             pkgs.wayland
             pkgs.libxkbcommon
             pkgs.fontconfig
-            pkgs.gtk3
-            pkgs.libayatana-appindicator
           ]
         } \
-        --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.zenity ]} \
-        --prefix XDG_DATA_DIRS : "${pkgs.gtk3}/share/gsettings-schemas/${pkgs.gtk3.name}:${pkgs.gsettings-desktop-schemas}/share/gsettings-schemas/${pkgs.gsettings-desktop-schemas.name}"
+        --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.zenity ]}
     '';
 
     meta = {

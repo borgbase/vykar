@@ -12,22 +12,22 @@
     #
     # To update after a skia-bindings bump:
     #   1. Find the new version tag at https://github.com/rust-skia/skia-binaries/releases that matches the skia-bindings version in Cargo.lock.
-    #   2. Update the version (e.g. 0.99.0) and binary hash in each URL below.
+    #   2. Update the version (e.g. 0.153.3) and binary hash in each URL below.
     #      The hash component in the filename corresponds to the crate source hash and changes with each skia-bindings release.
     #   3. Run `nix flake update` to re-fetch and update the locks.
     skia-binaries-x86_64-linux = {
       type = "file";
-      url = "https://github.com/rust-skia/skia-binaries/releases/download/0.99.0/skia-binaries-a25a0fdb7d90429aa2d1-x86_64-unknown-linux-gnu-gl-jpegd-jpege-pdf-textlayout-vulkan.tar.gz";
+      url = "https://github.com/rust-skia/skia-binaries/releases/download/0.153.3/skia-binaries-b7f043e0b1e2a850e702-x86_64-unknown-linux-gnu-ganesh-gl-jpegd-jpege-pdf-vulkan.tar.gz";
       flake = false;
     };
     skia-binaries-aarch64-linux = {
       type = "file";
-      url = "https://github.com/rust-skia/skia-binaries/releases/download/0.99.0/skia-binaries-a25a0fdb7d90429aa2d1-aarch64-unknown-linux-gnu-gl-jpegd-jpege-pdf-textlayout-vulkan.tar.gz";
+      url = "https://github.com/rust-skia/skia-binaries/releases/download/0.153.3/skia-binaries-b7f043e0b1e2a850e702-aarch64-unknown-linux-gnu-ganesh-gl-jpegd-jpege-pdf-vulkan.tar.gz";
       flake = false;
     };
     skia-binaries-aarch64-darwin = {
       type = "file";
-      url = "https://github.com/rust-skia/skia-binaries/releases/download/0.99.0/skia-binaries-a25a0fdb7d90429aa2d1-aarch64-apple-darwin-gl-jpegd-jpege-pdf-textlayout-vulkan.tar.gz";
+      url = "https://github.com/rust-skia/skia-binaries/releases/download/0.153.3/skia-binaries-b7f043e0b1e2a850e702-aarch64-apple-darwin-ganesh-gl-jpegd-jpege-metal-pdf.tar.gz";
       flake = false;
     };
   };

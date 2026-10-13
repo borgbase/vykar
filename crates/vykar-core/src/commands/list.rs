@@ -1,8 +1,10 @@
 use std::sync::atomic::AtomicBool;
 
 use serde::Deserialize;
+use tracing::info;
 
 use crate::config::VykarConfig;
+use crate::index::dedup_cache::MmapRestoreCache;
 use crate::repo::format::{unpack_object_expect_with_context, ObjectType};
 use crate::repo::manifest::SnapshotEntry;
 use crate::repo::Repository;
@@ -60,7 +62,7 @@ fn list_snapshot_items_inner(
         .clone();
 
     let source_paths = load_snapshot_meta(&repo, &resolved_name)?.source_paths;
-    let stream = load_snapshot_item_stream_cache_first(&mut repo, &resolved_name, None)?;
+    let stream = ItemStreamReader::new(&repo).load(&mut repo, &resolved_name, None)?;
     let items = decode_items_stream(&stream)?;
     Ok((items, source_paths))
 }
@@ -171,35 +173,60 @@ pub fn load_snapshot_item_stream(
     load_item_stream_from_ptrs(repo, &snapshot_meta.item_ptrs, shutdown)
 }
 
-/// Load the raw item stream bytes for a snapshot, trying the local restore
-/// cache first to avoid downloading the chunk index. Falls back to the full
-/// chunk index (with blob cache) on any cache miss or read/decrypt error.
-pub fn load_snapshot_item_stream_cache_first(
-    repo: &mut Repository,
-    snapshot_name: &str,
-    shutdown: Option<&AtomicBool>,
-) -> Result<Vec<u8>> {
-    if let Some(cache) = repo.open_restore_cache() {
-        match load_snapshot_item_stream_via_lookup(
-            repo,
-            snapshot_name,
-            |chunk_id| cache.lookup(chunk_id),
-            shutdown,
-        ) {
-            Ok(stream) => return Ok(stream),
-            // A cancellation is not a stale cache — re-raise it instead of
-            // falling through, which would load the full index and retry.
-            Err(e @ VykarError::Interrupted) => return Err(e),
-            Err(VykarError::ChunkNotInIndex(_)) => {
-                // Restore cache incomplete — fall through to full index
-            }
-            Err(_) => {
-                // Decryption/read error (stale cache) — fall through to full index
-            }
+/// Item-stream reader for one read-only operation: tries the local restore
+/// cache first to avoid downloading the chunk index, and falls back to the
+/// full index (loaded at most once) on any cache miss or read/decrypt error.
+pub struct ItemStreamReader {
+    restore_cache: Option<MmapRestoreCache>,
+    index_loaded: bool,
+}
+
+impl ItemStreamReader {
+    pub fn new(repo: &Repository) -> Self {
+        Self {
+            restore_cache: repo.open_restore_cache(),
+            index_loaded: false,
         }
     }
-    repo.load_chunk_index()?;
-    load_snapshot_item_stream(repo, snapshot_name, shutdown)
+
+    /// Load the raw item stream bytes for `snapshot_name`.
+    pub fn load(
+        &mut self,
+        repo: &mut Repository,
+        snapshot_name: &str,
+        shutdown: Option<&AtomicBool>,
+    ) -> Result<Vec<u8>> {
+        if let Some(cache) = &self.restore_cache {
+            match load_snapshot_item_stream_via_lookup(
+                repo,
+                snapshot_name,
+                |chunk_id| cache.lookup(chunk_id),
+                shutdown,
+            ) {
+                Ok(stream) => return Ok(stream),
+                // A cancellation is not a stale cache — re-raise it instead of
+                // falling through, which would load the full index and retry.
+                Err(e @ VykarError::Interrupted) => return Err(e),
+                Err(e) => {
+                    // The cache is generation-pinned, so a miss means it is
+                    // incomplete or corrupt; drop it once the index is needed.
+                    info!("restore cache incomplete or stale, falling back to full index: {e}");
+                    self.restore_cache = None;
+                }
+            }
+        }
+        self.ensure_index(repo)?;
+        load_snapshot_item_stream(repo, snapshot_name, shutdown)
+    }
+
+    /// Load the full chunk index unless this reader already did.
+    pub fn ensure_index(&mut self, repo: &mut Repository) -> Result<()> {
+        if !self.index_loaded {
+            repo.load_chunk_index()?;
+            self.index_loaded = true;
+        }
+        Ok(())
+    }
 }
 
 /// Load item stream using a lookup closure instead of the chunk index.

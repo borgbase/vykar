@@ -3,6 +3,8 @@
 
 mod common;
 
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use vykar_core::commands;
@@ -11,6 +13,7 @@ use vykar_core::config::{ChunkerConfig, CommandDump, EncryptionModeConfig, Reten
 use vykar_core::repo::lock;
 use vykar_core::repo::{EncryptionMode, OpenOptions, Repository};
 use vykar_storage::local_backend::LocalBackend;
+use vykar_storage::{InnerBackend, StorageBackend};
 use vykar_types::error::VykarError;
 
 use crate::common::{
@@ -627,6 +630,145 @@ fn restore_works_without_restore_cache() {
         std::fs::read_to_string(restore_dir.join("file.txt")).unwrap(),
         "hello"
     );
+}
+
+/// Counts GETs of the remote `index` blob.
+struct IndexGetCounter {
+    inner: LocalBackend,
+    index_gets: Arc<AtomicUsize>,
+}
+
+impl InnerBackend for IndexGetCounter {
+    fn inner_backend(&self) -> &dyn StorageBackend {
+        &self.inner
+    }
+}
+
+vykar_storage::delegate_storage_backend! {
+    for IndexGetCounter;
+    except [get];
+
+    fn get(&self, key: &str) -> vykar_types::error::Result<Option<Vec<u8>>> {
+        if key == "index" {
+            self.index_gets.fetch_add(1, Ordering::Relaxed);
+        }
+        self.inner.get(key)
+    }
+}
+
+/// Back up `snap1` and `snap2` (distinct content) and return the repo ID and
+/// index generation.
+fn two_snapshot_repo(tmp: &std::path::Path) -> (vykar_core::config::VykarConfig, Vec<u8>, u64) {
+    let repo_dir = tmp.join("repo");
+    let source_dir = tmp.join("source");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    std::fs::create_dir_all(&source_dir).unwrap();
+
+    let config = make_test_config(&repo_dir);
+    commands::init::run(&config, None).unwrap();
+    std::fs::write(source_dir.join("a.txt"), b"first").unwrap();
+    backup_source(
+        &config,
+        &source_dir,
+        "src",
+        "snap1",
+        None,
+        config.xattrs.enabled,
+    );
+    std::fs::write(source_dir.join("b.txt"), b"second").unwrap();
+    backup_source(
+        &config,
+        &source_dir,
+        "src",
+        "snap2",
+        None,
+        config.xattrs.enabled,
+    );
+
+    let repo = open_local_repo(&repo_dir, None);
+    let ids = (repo.config.id.clone(), repo.index_generation());
+    drop(repo);
+    (config, ids.0, ids.1)
+}
+
+fn open_counting_repo(repo_dir: &std::path::Path) -> (Repository, Arc<AtomicUsize>) {
+    let index_gets = Arc::new(AtomicUsize::new(0));
+    let storage = Box::new(IndexGetCounter {
+        inner: LocalBackend::new(repo_dir.to_str().unwrap()).unwrap(),
+        index_gets: index_gets.clone(),
+    });
+    let repo = Repository::open(storage, None, None, OpenOptions::new()).unwrap();
+    index_gets.store(0, Ordering::Relaxed);
+    (repo, index_gets)
+}
+
+fn stream_paths(stream: &[u8]) -> Vec<String> {
+    let mut paths = Vec::new();
+    commands::list::for_each_decoded_item(stream, |item| {
+        paths.push(item.path);
+        Ok(())
+    })
+    .unwrap();
+    paths
+}
+
+#[test]
+fn item_stream_reader_loads_index_once_across_snapshots() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_config, repo_id, _) = two_snapshot_repo(tmp.path());
+    let cache_path =
+        vykar_core::index::dedup_cache::restore_cache_path(&repo_id, None).expect("cache path");
+    std::fs::remove_file(&cache_path).unwrap();
+
+    let (mut repo, index_gets) = open_counting_repo(&tmp.path().join("repo"));
+    let mut reader = commands::list::ItemStreamReader::new(&repo);
+    let s1 = reader.load(&mut repo, "snap1", None).unwrap();
+    let s2 = reader.load(&mut repo, "snap2", None).unwrap();
+
+    assert!(!stream_paths(&s1).iter().any(|p| p.contains("b.txt")));
+    assert!(stream_paths(&s2).iter().any(|p| p.contains("b.txt")));
+    assert_eq!(index_gets.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn item_stream_reader_falls_back_once_on_empty_cache() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_config, repo_id, generation) = two_snapshot_repo(tmp.path());
+    // Valid generation but no entries: every lookup misses.
+    let cache_path =
+        vykar_core::index::dedup_cache::restore_cache_path(&repo_id, None).expect("cache path");
+    vykar_core::index::dedup_cache::build_restore_cache_to_path(
+        &vykar_core::index::ChunkIndex::new(),
+        generation,
+        &cache_path,
+    )
+    .unwrap();
+
+    let (mut repo, index_gets) = open_counting_repo(&tmp.path().join("repo"));
+    let mut reader = commands::list::ItemStreamReader::new(&repo);
+    let s1 = reader.load(&mut repo, "snap1", None).unwrap();
+    let s2 = reader.load(&mut repo, "snap2", None).unwrap();
+
+    assert!(stream_paths(&s1).iter().any(|p| p.contains("a.txt")));
+    assert!(stream_paths(&s2).iter().any(|p| p.contains("b.txt")));
+    assert_eq!(index_gets.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn item_stream_reader_propagates_interrupt_without_fallback() {
+    let tmp = tempfile::tempdir().unwrap();
+    two_snapshot_repo(tmp.path());
+
+    let (mut repo, index_gets) = open_counting_repo(&tmp.path().join("repo"));
+    let mut reader = commands::list::ItemStreamReader::new(&repo);
+    let shutdown = AtomicBool::new(true);
+    let err = reader
+        .load(&mut repo, "snap1", Some(&shutdown))
+        .unwrap_err();
+
+    assert!(matches!(err, VykarError::Interrupted), "got {err:?}");
+    assert_eq!(index_gets.load(Ordering::Relaxed), 0);
+    assert!(repo.chunk_index().is_empty());
 }
 
 // ---------------------------------------------------------------------------

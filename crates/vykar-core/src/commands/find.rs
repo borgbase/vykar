@@ -150,9 +150,7 @@ pub fn run(
         }
     }
 
-    // Try restore cache first
-    let mut restore_cache = repo.open_restore_cache();
-    let mut index_loaded = false;
+    let mut reader = list::ItemStreamReader::new(&repo);
 
     // Collect hits per path
     let mut hits_by_path: BTreeMap<String, Vec<FindHit>> = BTreeMap::new();
@@ -161,30 +159,7 @@ pub fn run(
         let snapshot_name = entry.name.clone();
         let snapshot_time = entry.time;
 
-        // Try restore cache path, fall back to full index
-        let items_stream = if let Some(ref cache) = restore_cache {
-            match list::load_snapshot_item_stream_via_lookup(
-                &mut repo,
-                &snapshot_name,
-                |id| cache.lookup(id),
-                None,
-            ) {
-                Ok(s) => s,
-                Err(_) => {
-                    // Restore cache incomplete or stale — fall back to full index
-                    restore_cache = None;
-                    repo.load_chunk_index()?;
-                    index_loaded = true;
-                    list::load_snapshot_item_stream(&mut repo, &snapshot_name, None)?
-                }
-            }
-        } else {
-            if !index_loaded {
-                repo.load_chunk_index()?;
-                index_loaded = true;
-            }
-            list::load_snapshot_item_stream(&mut repo, &snapshot_name, None)?
-        };
+        let items_stream = reader.load(&mut repo, &snapshot_name, None)?;
 
         list::for_each_decoded_item(&items_stream, |item| {
             if matches_filter(&item, filter) {

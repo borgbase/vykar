@@ -229,9 +229,6 @@ where
         xattrs_enabled
     };
 
-    // Try to open the mmap restore cache before loading the index.
-    let restore_cache = repo.open_restore_cache();
-
     // Resolve "latest" or exact snapshot name
     let resolved_name = repo
         .manifest()
@@ -242,32 +239,12 @@ where
         info!("Resolved '{}' to snapshot {}", snapshot_name, resolved_name);
     }
 
-    // Load raw item stream bytes (not decoded Items).  When the restore cache
-    // is available, read tree-pack chunks via the cache to avoid loading the
-    // full chunk index.
-    let items_stream = if let Some(ref cache) = restore_cache {
-        match super::list::load_snapshot_item_stream_via_lookup(
-            &mut repo,
-            &resolved_name,
-            |id| cache.lookup(id),
-            shutdown,
-        ) {
-            Ok(stream) => stream,
-            // A cancellation is not a stale cache: falling through here would
-            // load the full index and start a second read. Nothing has been
-            // written yet (`temp_root` does not exist), so plain propagation
-            // leaves the filesystem untouched.
-            Err(e @ VykarError::Interrupted) => return Err(e),
-            Err(_) => {
-                info!("restore cache incomplete or stale, falling back to full index");
-                repo.load_chunk_index()?;
-                super::list::load_snapshot_item_stream(&mut repo, &resolved_name, shutdown)?
-            }
-        }
-    } else {
-        repo.load_chunk_index()?;
-        super::list::load_snapshot_item_stream(&mut repo, &resolved_name, shutdown)?
-    };
+    // Load raw item stream bytes (not decoded Items), via the restore cache
+    // when possible to avoid loading the full chunk index. An interruption
+    // propagates before anything is written (`temp_root` does not exist yet),
+    // leaving the filesystem untouched.
+    let mut items = super::list::ItemStreamReader::new(&repo);
+    let items_stream = items.load(&mut repo, &resolved_name, shutdown)?;
 
     // Byte-faithful restore of non-UTF8 names is Unix-only. On other platforms
     // run a single read-only metadata pass over the loaded stream *before* any
@@ -346,9 +323,7 @@ where
             }
 
             let mut groups = if !batch_chunks.is_empty() {
-                if repo.chunk_index().is_empty() {
-                    repo.load_chunk_index()?;
-                }
+                items.ensure_index(&mut repo)?;
                 let index = repo.chunk_index();
                 read_groups::build_read_groups(batch_chunks, |id| {
                     index

@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use super::list::ItemStreamReader;
 use crate::config::VykarConfig;
 use crate::repo::manifest::SnapshotEntry;
 use crate::repo::{OpenOptions, Repository};
@@ -51,8 +52,9 @@ pub fn run(
     ensure_distinct_snapshots(&entry_a, &entry_b)?;
 
     let (base, target) = order_snapshots(entry_a, entry_b);
-    let base_map = load_regular_file_map(&mut repo, &base.name)?;
-    let target_map = load_regular_file_map(&mut repo, &target.name)?;
+    let mut reader = ItemStreamReader::new(&repo);
+    let base_map = load_regular_file_map(&mut repo, &mut reader, &base.name)?;
+    let target_map = load_regular_file_map(&mut repo, &mut reader, &target.name)?;
 
     Ok(DiffResult {
         base_snapshot: base.name,
@@ -84,9 +86,10 @@ fn ensure_distinct_snapshots(snapshot_a: &SnapshotEntry, snapshot_b: &SnapshotEn
 
 fn load_regular_file_map(
     repo: &mut Repository,
+    reader: &mut ItemStreamReader,
     snapshot_name: &str,
 ) -> Result<BTreeMap<String, FileSig>> {
-    let stream = super::list::load_snapshot_item_stream_cache_first(repo, snapshot_name, None)?;
+    let stream = reader.load(repo, snapshot_name, None)?;
     let mut map = BTreeMap::new();
     super::list::for_each_decoded_item(&stream, |item| {
         if item.entry_type == ItemType::RegularFile {

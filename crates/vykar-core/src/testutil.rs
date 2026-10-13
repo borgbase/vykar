@@ -15,6 +15,35 @@ use vykar_types::error::{Result, VykarError};
 
 static TEST_ENV_INIT: Once = Once::new();
 
+/// Hook command that creates (or touches) `path`.
+pub fn cmd_touch(path: &std::path::Path) -> String {
+    #[cfg(windows)]
+    {
+        let escaped = path.display().to_string().replace('\'', "''");
+        format!("New-Item -Path '{escaped}' -ItemType File -Force | Out-Null")
+    }
+
+    #[cfg(not(windows))]
+    {
+        format!("touch '{}'", path.display())
+    }
+}
+
+/// Hook command that appends `value` (a raw shell word, may contain hook
+/// variables like `{error}`) as a line to `path`.
+pub fn cmd_append(path: &std::path::Path, value: &str) -> String {
+    #[cfg(windows)]
+    {
+        let escaped = path.display().to_string().replace('\'', "''");
+        format!("Add-Content -Path '{escaped}' -Value {value}")
+    }
+
+    #[cfg(not(windows))]
+    {
+        format!("echo {value} >> '{}'", path.display())
+    }
+}
+
 /// Tests that mutate process-global state (CWD, env vars) must hold this lock.
 /// Shared across all test modules (inode_walk, resolve, etc.).
 pub static CWD_LOCK: Mutex<()> = Mutex::new(());

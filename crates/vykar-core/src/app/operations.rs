@@ -268,22 +268,7 @@ pub fn run_backup_selection(
     on_event: Option<&mut dyn FnMut(BackupRunEvent)>,
 ) -> Result<BackupRunReport> {
     let config = &repo.config;
-    let label = repo.label.as_deref();
-    let has_hooks = !repo.global_hooks.is_empty() || !repo.repo_hooks.is_empty();
     let mut on_event = on_event;
-
-    if !has_hooks {
-        return run_backup_sources(
-            config,
-            sources,
-            passphrase,
-            label,
-            shutdown,
-            verbose,
-            &mut on_event,
-        );
-    }
-
     let mut ctx = crate::hooks::HookContext {
         command: "backup".to_string(),
         repository: config.repository.url.clone(),
@@ -294,38 +279,20 @@ pub fn run_backup_selection(
         warnings: Vec::new(),
     };
 
-    // 1. Before hooks (fatal — run_before returns Err on failure)
-    if let Err(e) = crate::hooks::run_before(&repo.global_hooks, &repo.repo_hooks, &mut ctx) {
-        ctx.error = Some(e.to_string());
-        crate::hooks::run_after_or_failed(&repo.global_hooks, &repo.repo_hooks, &mut ctx, false);
-        crate::hooks::run_finally(&repo.global_hooks, &repo.repo_hooks, &mut ctx);
-        drain_backup_warnings(&mut ctx, &mut on_event, &HookScope::Repo);
-        return Err(e);
-    }
+    // Source hooks run inside run_backup_sources.
+    let result =
+        crate::hooks::run_with_hooks(&repo.global_hooks, &repo.repo_hooks, &mut ctx, || {
+            run_backup_sources(
+                config,
+                sources,
+                passphrase,
+                repo.label.as_deref(),
+                shutdown,
+                verbose,
+                &mut on_event,
+            )
+        });
     drain_backup_warnings(&mut ctx, &mut on_event, &HookScope::Repo);
-
-    // 2. Backup (source hooks handled inside run_backup_sources)
-    let result = run_backup_sources(
-        config,
-        sources,
-        passphrase,
-        label,
-        shutdown,
-        verbose,
-        &mut on_event,
-    );
-
-    // 3. After/Failed + Finally
-    let success = result.is_ok();
-    if let Err(ref e) = result {
-        if ctx.error.is_none() {
-            ctx.error = Some(e.to_string());
-        }
-    }
-    crate::hooks::run_after_or_failed(&repo.global_hooks, &repo.repo_hooks, &mut ctx, success);
-    crate::hooks::run_finally(&repo.global_hooks, &repo.repo_hooks, &mut ctx);
-    drain_backup_warnings(&mut ctx, &mut on_event, &HookScope::Repo);
-
     result
 }
 
@@ -559,7 +526,7 @@ pub fn run_full_cycle_for_repo(
 
 /// Run a single cycle step with the full hook lifecycle.
 /// Returns Some(value) on success/partial, None on failure or before-hook abort.
-fn run_hooked_step<T>(
+pub(crate) fn run_hooked_step<T>(
     step: CycleStep,
     repo: &ResolvedRepo,
     on_event: &mut dyn FnMut(CycleEvent),
@@ -567,8 +534,7 @@ fn run_hooked_step<T>(
     action: impl FnOnce(&mut dyn FnMut(CycleEvent)) -> Result<T>,
     classify: impl FnOnce(&T) -> StepOutcome,
 ) -> Option<T> {
-    let has_hooks = !repo.global_hooks.is_empty() || !repo.repo_hooks.is_empty();
-    let mut hook_ctx = has_hooks.then(|| crate::hooks::HookContext {
+    let mut ctx = crate::hooks::HookContext {
         command: step.command_name().to_string(),
         repository: repo.config.repository.url.clone(),
         label: repo.label.clone(),
@@ -576,50 +542,30 @@ fn run_hooked_step<T>(
         source_label: None,
         source_paths: None,
         warnings: Vec::new(),
-    });
+    };
 
     on_event(CycleEvent::StepStarted(step));
 
-    // Before hooks (fatal — abort step on failure)
-    if let Some(ref mut ctx) = hook_ctx {
-        if let Err(e) = crate::hooks::run_before(&repo.global_hooks, &repo.repo_hooks, ctx) {
-            ctx.error = Some(e.to_string());
-            crate::hooks::run_after_or_failed(&repo.global_hooks, &repo.repo_hooks, ctx, false);
-            crate::hooks::run_finally(&repo.global_hooks, &repo.repo_hooks, ctx);
-            drain_cycle_warnings(ctx, step, on_event);
-            let outcome = StepOutcome::Failed(e.to_string());
-            on_event(CycleEvent::StepFinished(step, outcome.clone()));
-            steps.push((step, outcome));
-            return None;
-        }
-        drain_cycle_warnings(ctx, step, on_event);
-    }
+    // A classified failure (e.g. check with errors) fires `failed` hooks;
+    // Skipped and Partial count as success and fire `after`.
+    let result = crate::hooks::run_lifecycle(
+        crate::hooks::HookPhases::Repo {
+            global: &repo.global_hooks,
+            repo: &repo.repo_hooks,
+        },
+        &mut ctx,
+        || action(on_event).map(|v| (classify(&v), v)),
+        |r| match r {
+            Err(e) => Some(e.to_string()),
+            Ok((o, _)) => o.error_msg().map(str::to_owned),
+        },
+    );
+    drain_cycle_warnings(&mut ctx, step, on_event);
 
-    // Action
-    let result = action(on_event);
-
-    // Classify outcome + After/Failed/Finally hooks
     let (outcome, value) = match result {
-        std::result::Result::Ok(val) => {
-            let o = classify(&val);
-            (o, Some(val))
-        }
-        Err(e) => (StepOutcome::Failed(e.to_string()), None),
+        Err(e) | Ok(Err(e)) => (StepOutcome::Failed(e.to_string()), None),
+        Ok(Ok((o, v))) => (o, Some(v)),
     };
-
-    if let Some(ref mut ctx) = hook_ctx {
-        // Skipped is not a failure — treat it as success for the hook lifecycle
-        // so that `after` hooks fire (not `failed`), and `finally` always runs.
-        let success = outcome.is_success() || matches!(outcome, StepOutcome::Skipped(_));
-        if let Some(msg) = outcome.error_msg() {
-            if ctx.error.is_none() {
-                ctx.error = Some(msg.to_string());
-            }
-        }
-        crate::hooks::run_after_or_failed(&repo.global_hooks, &repo.repo_hooks, ctx, success);
-        crate::hooks::run_finally(&repo.global_hooks, &repo.repo_hooks, ctx);
-        drain_cycle_warnings(ctx, step, on_event);
-    }
 
     on_event(CycleEvent::StepFinished(step, outcome.clone()));
     steps.push((step, outcome));

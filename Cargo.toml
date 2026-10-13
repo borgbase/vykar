@@ -138,6 +138,8 @@ ignore_without_reason = "allow"
 too_many_lines = "allow"
 duration_subsec = "allow"
 duration_suboptimal_units = "allow"
+# New in clippy 1.99; the `assert_eq!(x, [] as [T; 0])` rewrites read worse.
+assert_is_empty = "allow"
 cloned_instead_of_copied = "allow"
 stable_sort_primitive = "allow"
 map_unwrap_or = "allow"

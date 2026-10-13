@@ -160,7 +160,7 @@ pub(crate) fn select_repos<'a>(
 /// values are never cached, and a stale cached value is evicted (self-healing).
 ///
 /// Returns [`PassphraseRun::Canceled`] if the user dismisses the prompt for the
-/// matching encrypted repo. Candidate repos whose listing reports
+/// matching encrypted repo. Candidate repos whose metadata lookup reports
 /// [`VykarError::SnapshotNotFound`] are skipped; other errors propagate.
 pub(crate) fn find_repo_for_snapshot<'a>(
     repos: &'a [ResolvedRepo],
@@ -171,7 +171,7 @@ pub(crate) fn find_repo_for_snapshot<'a>(
     for repo in select_repos(repos, selector)? {
         let key = repo.config.repository.url.clone();
         let outcome = with_passphrase_retry(repo, passphrases, 3, |pass| {
-            commands::list::list_snapshot_items(&repo.config, pass, snapshot).map(|_| ())
+            commands::list::get_snapshot_meta(&repo.config, pass, snapshot).map(|_| ())
         });
 
         match outcome {

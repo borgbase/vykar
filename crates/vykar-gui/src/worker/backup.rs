@@ -7,7 +7,10 @@ use vykar_types::error::VykarError;
 
 use crate::messages::{AppCommand, UiEvent};
 use crate::progress::{format_check_status, format_step_outcome, BackupStatusTracker};
-use crate::repo_helpers::{log_backup_report, send_log, with_passphrase_retry, PassphraseRun};
+use crate::repo_helpers::{
+    classify_init_target, log_backup_report, send_log, with_passphrase_retry, InitTarget,
+    PassphraseRun,
+};
 
 use super::shared::{run_selection_with_progress, OpGuard};
 use super::WorkerContext;
@@ -113,11 +116,21 @@ fn run_backup_cycle(ctx: &mut WorkerContext, scheduled: bool, only: Option<&[Str
             Err(VykarError::RepoNotFound(_)) => {
                 // An uninitialized repo cannot be backed up; surface it as a
                 // failure rather than crashing the cycle below.
-                send_log(
-                    &ctx.ui_tx,
-                    format!("[{repo_name}] repository not initialized; skipping."),
-                );
-                failures.push((repo_name.clone(), "repository not initialized".to_string()));
+                let (log, reason) = if classify_init_target(&repo.config.repository.url)
+                    == InitTarget::Unavailable
+                {
+                    (
+                        "repository path not available (drive not connected?); skipping.",
+                        "repository not available",
+                    )
+                } else {
+                    (
+                        "repository not initialized; skipping.",
+                        "repository not initialized",
+                    )
+                };
+                send_log(&ctx.ui_tx, format!("[{repo_name}] {log}"));
+                failures.push((repo_name.clone(), reason.to_string()));
                 continue;
             }
             Err(e) => {

@@ -12,7 +12,8 @@ use vykar_types::error::VykarError;
 use crate::controllers;
 use crate::messages::{RepoInfoData, SnapshotRowData, UiEvent};
 use crate::repo_helpers::{
-    find_repo_for_snapshot, select_repos, send_log, with_passphrase_retry, PassphraseRun,
+    classify_init_target, find_repo_for_snapshot, select_repos, send_log, with_passphrase_retry,
+    InitTarget, PassphraseRun,
 };
 use crate::APP_TITLE;
 use vykar_common::display::format_bytes;
@@ -85,9 +86,43 @@ fn fetch_one_repo_info(
                 None,
             )
         }
-        Err(VykarError::RepoNotFound(_)) => {
-            init_repo_interactive(ui_tx, passphrases, repo, &repo_name, &url, probe_pass)
-        }
+        Err(VykarError::RepoNotFound(_)) => match classify_init_target(&url) {
+            InitTarget::Remote | InitTarget::Offerable => {
+                init_repo_interactive(ui_tx, passphrases, repo, &repo_name, &url, probe_pass)
+            }
+            // Expected for removable drives: log only, keep the footer clean.
+            InitTarget::Unavailable => {
+                send_log(
+                    ui_tx,
+                    format!("[{repo_name}] repository path not available (drive not connected?)."),
+                );
+                (
+                    error_repo_info(&repo_name, &url, "Not available (drive not connected?)"),
+                    None,
+                )
+            }
+            InitTarget::NotEmpty => {
+                send_log(
+                    ui_tx,
+                    format!("[{repo_name}] folder is not empty and not a vykar repository."),
+                );
+                (
+                    error_repo_info(
+                        &repo_name,
+                        &url,
+                        "Folder not empty – not a vykar repository",
+                    ),
+                    Some("folder not empty – not a vykar repository".to_string()),
+                )
+            }
+            InitTarget::Invalid(reason) => {
+                send_log(
+                    ui_tx,
+                    format!("[{repo_name}] invalid repository path: {reason}"),
+                );
+                (error_repo_info(&repo_name, &url, &reason), Some(reason))
+            }
+        },
         Err(ref e) if e.is_passphrase_failure() => {
             send_log(ui_tx, format!("[{repo_name}] incorrect passphrase: {e}"));
             (

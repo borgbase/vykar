@@ -222,9 +222,130 @@ pub(crate) fn log_backup_report(
     }
 }
 
+/// Whether a repo that reported `RepoNotFound` is a sensible target for an
+/// init offer. Only local paths are inspected; remote backends report an
+/// unreachable host as a connection error, never as `RepoNotFound`.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum InitTarget {
+    Remote,
+    Offerable,
+    /// Root and its parent are missing — most likely an unplugged drive or an
+    /// unmounted share.
+    Unavailable,
+    /// Root exists and holds files, but no vykar `config`.
+    NotEmpty,
+    Invalid(String),
+}
+
+/// OS-generated files that don't make a directory "non-empty" for init.
+const IGNORED_DIR_ENTRIES: &[&str] = &[".DS_Store", "Thumbs.db", "desktop.ini"];
+
+pub(crate) fn classify_init_target(url: &str) -> InitTarget {
+    let path = match vykar_core::storage::parse_repo_url(url) {
+        Ok(vykar_core::storage::ParsedUrl::Local { path }) => path,
+        _ => return InitTarget::Remote,
+    };
+    let root = std::path::Path::new(&path);
+
+    match std::fs::metadata(root) {
+        Ok(meta) if meta.is_dir() => match std::fs::read_dir(root) {
+            Ok(entries) => {
+                let has_content = entries.filter_map(Result::ok).any(|e| {
+                    !IGNORED_DIR_ENTRIES
+                        .iter()
+                        .any(|ignored| e.file_name() == *ignored)
+                });
+                if has_content {
+                    InitTarget::NotEmpty
+                } else {
+                    InitTarget::Offerable
+                }
+            }
+            Err(e) => InitTarget::Invalid(format!("cannot read {path}: {e}")),
+        },
+        Ok(_) => InitTarget::Invalid(format!("{path} is not a directory")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // A bare relative name ("repo") has an empty parent — the cwd.
+            let parent_exists = match root.parent() {
+                Some(p) if p.as_os_str().is_empty() => true,
+                Some(p) => p.is_dir(),
+                None => true,
+            };
+            if parent_exists {
+                InitTarget::Offerable
+            } else {
+                InitTarget::Unavailable
+            }
+        }
+        Err(e) => InitTarget::Invalid(format!("cannot access {path}: {e}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod init_target {
+        use super::*;
+
+        fn classify(path: &std::path::Path) -> InitTarget {
+            classify_init_target(path.to_str().unwrap())
+        }
+
+        #[test]
+        fn missing_root_and_parent_is_unavailable() {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().join("volume").join("repo");
+            assert_eq!(classify(&root), InitTarget::Unavailable);
+        }
+
+        #[test]
+        fn missing_root_with_existing_parent_is_offerable() {
+            let tmp = tempfile::tempdir().unwrap();
+            assert_eq!(classify(&tmp.path().join("repo")), InitTarget::Offerable);
+        }
+
+        #[test]
+        fn empty_dir_is_offerable() {
+            let tmp = tempfile::tempdir().unwrap();
+            assert_eq!(classify(tmp.path()), InitTarget::Offerable);
+        }
+
+        #[test]
+        fn dir_with_only_os_metadata_is_offerable() {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(tmp.path().join(".DS_Store"), b"x").unwrap();
+            std::fs::write(tmp.path().join("Thumbs.db"), b"x").unwrap();
+            assert_eq!(classify(tmp.path()), InitTarget::Offerable);
+        }
+
+        #[test]
+        fn dir_with_unrelated_file_is_not_empty() {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(tmp.path().join("notes.txt"), b"x").unwrap();
+            assert_eq!(classify(tmp.path()), InitTarget::NotEmpty);
+        }
+
+        #[test]
+        fn regular_file_root_is_invalid() {
+            let tmp = tempfile::tempdir().unwrap();
+            let file = tmp.path().join("repo");
+            std::fs::write(&file, b"x").unwrap();
+            assert!(matches!(classify(&file), InitTarget::Invalid(_)));
+        }
+
+        #[test]
+        fn remote_urls_are_remote() {
+            assert_eq!(
+                classify_init_target("s3://s3.example.com/bucket/repo"),
+                InitTarget::Remote
+            );
+            assert_eq!(
+                classify_init_target("sftp://user@host/backups/repo"),
+                InitTarget::Remote
+            );
+        }
+    }
 
     const KEY: &str = "repo://test";
 

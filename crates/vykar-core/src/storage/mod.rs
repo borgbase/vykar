@@ -2,7 +2,7 @@ use crate::config::RepositoryConfig;
 use vykar_storage::StorageConfig;
 use vykar_types::error::Result;
 
-pub use vykar_storage::StorageBackend;
+pub use vykar_storage::{parse_repo_url, ParsedUrl, StorageBackend};
 
 /// Convert a [`RepositoryConfig`] into a [`StorageConfig`] for backend construction.
 ///

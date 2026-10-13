@@ -245,7 +245,7 @@ pub fn exercise_pack_naming(
     );
 
     let deleted = commands::delete::run(config, passphrase, &["pn-a"], false, None).unwrap();
-    assert!(deleted.warnings.is_empty(), "{:?}", deleted.warnings);
+    assert_eq!(deleted.warnings.len(), 0, "{:?}", deleted.warnings);
 
     let compact = commands::compact::run(config, passphrase, 0.0, None, false, None).unwrap();
     assert!(

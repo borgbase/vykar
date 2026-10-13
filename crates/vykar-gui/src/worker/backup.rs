@@ -427,7 +427,10 @@ mod tests {
     #[test]
     fn stale_name_selects_nothing() {
         let repos = two_repos();
-        assert!(select_repo_indices(&repos, Some(&["gone".to_string()])).is_empty());
-        assert!(select_repo_indices(&repos, Some(&[])).is_empty());
+        assert_eq!(
+            select_repo_indices(&repos, Some(&["gone".to_string()])).len(),
+            0
+        );
+        assert_eq!(select_repo_indices(&repos, Some(&[])).len(), 0);
     }
 }

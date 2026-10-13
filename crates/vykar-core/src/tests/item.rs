@@ -88,7 +88,7 @@ fn item_serde_roundtrip_directory() {
     let deserialized: Item = rmp_serde::from_slice(&serialized).unwrap();
     assert_eq!(deserialized.path, "home/user");
     assert_eq!(deserialized.entry_type, ItemType::Directory);
-    assert!(deserialized.chunks.is_empty());
+    assert_eq!(deserialized.chunks.len(), 0);
 }
 
 #[test]

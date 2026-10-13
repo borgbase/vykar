@@ -701,7 +701,7 @@ mod repack_chunk_tests {
 
     #[test]
     fn empty_input_yields_no_batches() {
-        assert!(chunk_repack_operations(vec![]).is_empty());
+        assert_eq!(chunk_repack_operations(vec![]).len(), 0);
     }
 
     #[test]

@@ -1334,7 +1334,7 @@ mod tests {
     #[test]
     fn empty_cache() {
         let cache = FileCache::new();
-        assert!(cache.is_empty());
+        assert_eq!(cache.len(), 0);
         assert_eq!(cache.len(), 0);
     }
 
@@ -1496,7 +1496,7 @@ mod tests {
             section.anchor_snapshot_id,
             SnapshotId::from_bytes([0x42; 32])
         );
-        assert!(cache.sections.is_empty());
+        assert_eq!(cache.sections.len(), 0);
     }
 
     #[test]
@@ -1509,7 +1509,7 @@ mod tests {
 
         let taken = cache.take_active_sections();
         assert_eq!(taken.len(), 2);
-        assert!(cache.sections.is_empty());
+        assert_eq!(cache.sections.len(), 0);
     }
 
     #[test]
@@ -1576,7 +1576,7 @@ mod tests {
         let old = OldFileCache { entries };
         let plaintext = rmp_serde::to_vec(&old).unwrap();
         let decoded = FileCache::decode_from_plaintext(&plaintext).unwrap();
-        assert!(decoded.is_empty());
+        assert_eq!(decoded.len(), 0);
     }
 
     #[test]
@@ -1586,7 +1586,7 @@ mod tests {
         let mut blob = vec![FORMAT_VERSION_BYTE];
         blob.extend_from_slice(b"\xFF\xFE\xFD not a zstd frame");
         let decoded = FileCache::decode_from_plaintext(&blob).unwrap();
-        assert!(decoded.is_empty());
+        assert_eq!(decoded.len(), 0);
     }
 
     #[test]
@@ -1594,7 +1594,7 @@ mod tests {
         let garbage = vec![0xFF, 0xFE, 0xFD];
         let result = FileCache::decode_from_plaintext(&garbage);
         assert!(result.is_ok());
-        assert!(result.unwrap().is_empty());
+        assert_eq!(result.unwrap().len(), 0);
     }
 
     #[test]

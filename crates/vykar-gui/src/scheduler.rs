@@ -261,7 +261,7 @@ mod tests {
                 .map(|(name, every, on)| ((*name).to_string(), sched(every, *on)))
                 .collect(),
         );
-        assert!(errors.is_empty(), "unexpected cadence errors: {errors:?}");
+        assert_eq!(errors.len(), 0, "unexpected cadence errors: {errors:?}");
         Arc::new(Mutex::new(state))
     }
 

@@ -251,7 +251,7 @@ impl AppState {
             });
         }
         let used = self.quota_used();
-        let result = self.inner.quota_reserved.fetch_update(
+        let result = self.inner.quota_reserved.try_update(
             Ordering::Relaxed,
             Ordering::Relaxed,
             |reserved| {
@@ -275,11 +275,11 @@ impl AppState {
 
     /// Update quota usage after a delete.
     pub fn sub_quota_usage(&self, bytes: u64) {
-        // Use fetch_update for saturating subtraction
+        // Use try_update for saturating subtraction.
         let _ =
             self.inner
                 .quota_usage
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                     Some(current.saturating_sub(bytes))
                 });
     }
@@ -334,7 +334,7 @@ impl QuotaReservation {
             return Ok(());
         }
         let used = self.state.quota_used();
-        let result = self.state.inner.quota_reserved.fetch_update(
+        let result = self.state.inner.quota_reserved.try_update(
             Ordering::Relaxed,
             Ordering::Relaxed,
             |reserved| {
@@ -377,7 +377,7 @@ impl QuotaReservation {
 
     /// Release `bytes` from `quota_reserved`, saturating at zero.
     fn release_reserved(&self, bytes: u64) {
-        let _ = self.state.inner.quota_reserved.fetch_update(
+        let _ = self.state.inner.quota_reserved.try_update(
             Ordering::Relaxed,
             Ordering::Relaxed,
             |reserved| Some(reserved.saturating_sub(bytes)),

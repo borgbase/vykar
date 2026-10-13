@@ -366,13 +366,13 @@ mod tests {
         let fast = sched(true, Some("1s"), false);
         let slow = sched(true, Some("1h"), false);
         let (plan, errors) = SchedulePlan::new(&[&slow, &fast], false);
-        assert!(errors.is_empty());
+        assert_eq!(errors.len(), 0);
 
         let fast_at = plan.next_run(1).unwrap();
         assert_eq!(plan.next_wake(), Some(fast_at));
 
         // Before the fast slot nothing is due; after it only the fast repo is.
-        assert!(plan.due(SystemTime::now()).is_empty());
+        assert_eq!(plan.due(SystemTime::now()).len(), 0);
         assert_eq!(plan.due(fast_at), vec![1]);
     }
 
@@ -381,7 +381,7 @@ mod tests {
         let off = sched(false, Some("1h"), false);
         let on = sched(true, Some("1h"), false);
         let (plan, errors) = SchedulePlan::new(&[&off, &on], false);
-        assert!(errors.is_empty());
+        assert_eq!(errors.len(), 0);
         assert!(plan.next_run(0).is_none());
         assert!(plan.next_run(1).is_some());
         assert_eq!(plan.next_wake(), plan.next_run(1));
@@ -396,7 +396,7 @@ mod tests {
         assert_eq!(honored.due(SystemTime::now()), vec![0]);
 
         let (ignored, _) = SchedulePlan::new(&[&startup, &plain], false);
-        assert!(ignored.due(SystemTime::now()).is_empty());
+        assert_eq!(ignored.due(SystemTime::now()).len(), 0);
     }
 
     #[test]
@@ -421,10 +421,10 @@ mod tests {
 
         let future_before = plan.next_run(1).unwrap();
         let errors = plan.reschedule_overdue(&[&overdue, &future], SystemTime::now());
-        assert!(errors.is_empty());
+        assert_eq!(errors.len(), 0);
 
         assert_eq!(plan.next_run(1), Some(future_before));
-        assert!(plan.due(SystemTime::now()).is_empty());
+        assert_eq!(plan.due(SystemTime::now()).len(), 0);
     }
 
     #[test]
@@ -450,10 +450,10 @@ mod tests {
     fn plan_all_disabled_has_no_wake() {
         let off = sched(false, None, false);
         let (plan, errors) = SchedulePlan::new(&[&off, &off], true);
-        assert!(errors.is_empty());
+        assert_eq!(errors.len(), 0);
         assert_eq!(plan.len(), 2);
         assert!(plan.next_wake().is_none());
-        assert!(plan.due(SystemTime::now()).is_empty());
+        assert_eq!(plan.due(SystemTime::now()).len(), 0);
     }
 
     #[test]

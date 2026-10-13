@@ -512,7 +512,7 @@ mod tests {
     #[test]
     fn pending_journal_round_trip() {
         let mut journal = PendingIndexJournal::new();
-        assert!(journal.is_empty());
+        assert_eq!(journal.len(), 0);
         assert_eq!(journal.len(), 0);
 
         let pack1 = make_pack_id(1);
@@ -543,7 +543,7 @@ mod tests {
         );
 
         assert_eq!(journal.len(), 2);
-        assert!(!journal.is_empty());
+        assert_ne!(journal.len(), 0);
 
         // Serialize → deserialize round-trip
         let wire = journal.to_wire();
@@ -604,7 +604,7 @@ mod tests {
 
         let reconciled = delta.reconcile(&fresh).unwrap();
         // new_entries should be empty (converted to bump)
-        assert!(reconciled.new_entries.is_empty());
+        assert_eq!(reconciled.new_entries.len(), 0);
         // refcount_bumps should have chunk_a with count=1
         assert_eq!(reconciled.refcount_bumps.get(&chunk_a), Some(&1));
     }
@@ -636,7 +636,7 @@ mod tests {
         delta.bump_refcount(&chunk_a);
 
         let reconciled = delta.reconcile(&fresh).unwrap();
-        assert!(reconciled.new_entries.is_empty());
+        assert_eq!(reconciled.new_entries.len(), 0);
         assert_eq!(reconciled.refcount_bumps.get(&chunk_a), Some(&1));
     }
 
@@ -699,8 +699,8 @@ mod tests {
         let mut delta = IndexDelta::new();
         delta.add_new_entry(make_chunk_id(1), 100, make_pack_id(1), 0, 1);
         delta.rollback(cp);
-        assert!(delta.new_entries.is_empty());
-        assert!(delta.refcount_bumps.is_empty());
+        assert_eq!(delta.new_entries.len(), 0);
+        assert_eq!(delta.refcount_bumps.len(), 0);
     }
 
     #[test]

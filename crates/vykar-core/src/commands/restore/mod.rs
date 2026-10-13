@@ -402,7 +402,7 @@ where
             Ok(())
         },
     )
-    .map_err(&cleanup)?;
+    .map_err(cleanup)?;
 
     drop(items_stream);
     repo.clear_chunk_index();
@@ -412,7 +412,7 @@ where
     // security-sensitive lchown, and a `rename` never disturbs a symlink's own
     // metadata.
     finalize::apply_symlink_metadata(&plan_out.symlinks, restore_as_root, &mut stats, shutdown)
-        .map_err(&cleanup)?;
+        .map_err(cleanup)?;
 
     // Relink hard-link group members now that every representative is written
     // and still in `temp_root` — both link operands share the temp filesystem,
@@ -432,7 +432,7 @@ where
         &mut stats,
         shutdown,
     )
-    .map_err(&cleanup)?;
+    .map_err(cleanup)?;
 
     // Phase 5a: rename temp subtrees into the final destination.  All file
     // metadata is already on the inodes, so the rename has no observable TOCTOU
@@ -453,7 +453,7 @@ where
     // poll the flag.
     #[cfg(test)]
     fault_pre_publish_shutdown(&temp_root, shutdown);
-    check_interrupted(shutdown).map_err(&cleanup)?;
+    check_interrupted(shutdown).map_err(cleanup)?;
     finalize::move_temp_to_dest(&temp_root, &dest_root)?;
 
     // Directory metadata (F1/F2: chown → xattrs → mode → mtime, deepest-first)

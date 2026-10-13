@@ -378,7 +378,7 @@ fn cleanup_stale_sessions_preserves_active_index() {
         pid_always_alive,
     )
     .unwrap();
-    assert!(cleaned.is_empty());
+    assert_eq!(cleaned.len(), 0);
     assert!(storage.exists("sessions/sess1.json").unwrap());
     assert!(
         storage.exists("sessions/sess1.index").unwrap(),
@@ -428,7 +428,7 @@ fn cleanup_stale_sessions_removes_orphaned_index() {
         pid_always_alive,
     )
     .unwrap();
-    assert!(cleaned.is_empty(), "no .json marker to report as cleaned");
+    assert_eq!(cleaned.len(), 0, "no .json marker to report as cleaned");
     assert!(
         !storage.exists("sessions/orphan.index").unwrap(),
         "orphaned .index should be deleted"
@@ -455,7 +455,7 @@ fn cleanup_stale_sessions_skips_non_json_files() {
         pid_always_alive,
     )
     .unwrap();
-    assert!(cleaned.is_empty());
+    assert_eq!(cleaned.len(), 0);
     assert!(
         storage.exists("sessions/active.index").unwrap(),
         ".index should not be treated as unparseable .json"
@@ -495,7 +495,7 @@ fn cleanup_preserves_alive_local_session() {
 
     let cleaned =
         cleanup_stale_sessions(&storage, Duration::hours(72), "myhost", |_pid| true).unwrap();
-    assert!(cleaned.is_empty());
+    assert_eq!(cleaned.len(), 0);
     assert!(storage.exists("sessions/local-alive.json").unwrap());
 }
 
@@ -551,7 +551,7 @@ fn cleanup_second_pass_removes_orphan_index_from_prior_run() {
         pid_always_alive,
     )
     .unwrap();
-    assert!(cleaned.is_empty());
+    assert_eq!(cleaned.len(), 0);
     assert!(
         !storage.exists("sessions/prior.index").unwrap(),
         ".index should be deleted on second cleanup (grace period expired)"
@@ -613,7 +613,7 @@ fn cleanup_keeps_session_at_44_minutes() {
         pid_always_alive,
     )
     .unwrap();
-    assert!(cleaned.is_empty(), "44-min session must not be reaped");
+    assert_eq!(cleaned.len(), 0, "44-min session must not be reaped");
     assert!(storage.exists("sessions/fresh.json").unwrap());
 }
 
@@ -652,7 +652,7 @@ fn cleanup_preserves_malformed_marker() {
 
     // Malformed markers are not reported as "cleaned" and must NOT be
     // deleted — they fail-close maintenance until an operator clears them.
-    assert!(cleaned.is_empty());
+    assert_eq!(cleaned.len(), 0);
     assert!(
         storage.exists("sessions/bad.json").unwrap(),
         "malformed .json must be preserved so maintenance surfaces it"
@@ -678,7 +678,7 @@ fn cleanup_preserves_marker_with_bad_timestamp() {
     )
     .unwrap();
 
-    assert!(cleaned.is_empty());
+    assert_eq!(cleaned.len(), 0);
     assert!(
         storage.exists("sessions/bad-ts.json").unwrap(),
         "marker with unparseable timestamp must survive cleanup"

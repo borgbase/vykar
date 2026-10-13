@@ -30,7 +30,7 @@ fn make_entry_at(name: &str, offset_secs: i64) -> SnapshotEntry {
 #[test]
 fn new_manifest_has_no_snapshots() {
     let m = Manifest::new();
-    assert!(m.snapshots.is_empty());
+    assert_eq!(m.snapshots.len(), 0);
     assert_eq!(m.version, 1);
 }
 

@@ -1266,7 +1266,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert!(!entries.is_empty());
+        assert_ne!(entries.len(), 0);
 
         // Root entry emitted first; under the new multi-path prefix scheme,
         // the prefix is the full absolute configured path with leading `/`

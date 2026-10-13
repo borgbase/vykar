@@ -905,7 +905,7 @@ mod tests {
         collect_all(&stream, dest, |_| true, false, &mut stats).unwrap();
 
         assert_eq!(stats.symlinks, 1);
-        assert!(stats.warnings.is_empty(), "got: {:?}", stats.warnings);
+        assert_eq!(stats.warnings.len(), 0, "got: {:?}", stats.warnings);
     }
 
     #[test]
@@ -1530,8 +1530,8 @@ mod tests {
             None,
             |files, chunks, verified, _stats| {
                 flush_calls += 1;
-                assert!(files.is_empty());
-                assert!(chunks.is_empty());
+                assert_eq!(files.len(), 0);
+                assert_eq!(chunks.len(), 0);
                 last_verified.clone_from(verified);
                 Ok(())
             },

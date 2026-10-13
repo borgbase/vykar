@@ -66,7 +66,7 @@ mod tests {
     #[test]
     fn resolve_exe_path_fallback() {
         let get = |_: &str| Err(std::env::VarError::NotPresent);
-        assert!(!resolve_exe_path_with(get).unwrap().is_empty());
+        assert_ne!(resolve_exe_path_with(get).unwrap(), "");
     }
 
     #[test]

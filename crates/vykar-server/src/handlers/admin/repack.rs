@@ -822,7 +822,7 @@ mod tests {
         let op = &result["completed"][0];
         assert!(op["new_pack"].is_null());
         assert!(op["deleted"].as_bool().unwrap());
-        assert!(op["new_offsets"].as_array().unwrap().is_empty());
+        assert_eq!(op["new_offsets"].as_array().unwrap().len(), 0);
 
         assert!(!source_path.exists(), "source pack not deleted");
         assert!(

@@ -315,7 +315,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let backend = LocalBackend::new(dir.path().to_str().unwrap()).unwrap();
         let keys = backend.list("no_such_dir").unwrap();
-        assert!(keys.is_empty());
+        assert_eq!(keys, Vec::<String>::new());
     }
 
     #[test]

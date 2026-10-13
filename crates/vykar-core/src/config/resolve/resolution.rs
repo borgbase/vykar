@@ -782,7 +782,7 @@ repositories: []
         fs::write(&path, yaml).unwrap();
 
         let result = load_and_resolve(&path).unwrap();
-        assert!(result.is_empty(), "expected empty vec for repositories: []");
+        assert_eq!(result.len(), 0, "expected empty vec for repositories: []");
     }
 
     #[test]
@@ -958,7 +958,7 @@ repositories:
         let sources = vec![make_test_source("docs")];
 
         let result = select_sources(&sources, &[]).unwrap();
-        assert!(result.is_empty());
+        assert_eq!(result.len(), 0);
     }
 }
 
@@ -990,7 +990,7 @@ hooks:
         assert_eq!(repos[0].global_hooks.get_hooks("before_backup").len(), 1);
         assert_eq!(repos[0].global_hooks.get_hooks("finally_backup").len(), 1);
         assert_eq!(repos[0].global_hooks.get_hooks("after").len(), 1);
-        assert!(repos[0].global_hooks.get_hooks("before").is_empty());
+        assert_eq!(repos[0].global_hooks.get_hooks("before").len(), 0);
     }
 
     #[test]
@@ -1004,8 +1004,8 @@ repositories:
         fs::write(&path, yaml).unwrap();
 
         let repos = load_and_resolve(&path).unwrap();
-        assert!(repos[0].global_hooks.is_empty());
-        assert!(repos[0].repo_hooks.is_empty());
+        assert_eq!(repos[0].global_hooks.hooks.len(), 0);
+        assert_eq!(repos[0].repo_hooks.hooks.len(), 0);
     }
 
     #[test]
@@ -1025,7 +1025,7 @@ repositories:
         fs::write(&path, yaml).unwrap();
 
         let repos = load_and_resolve(&path).unwrap();
-        assert!(repos[0].global_hooks.is_empty());
+        assert_eq!(repos[0].global_hooks.hooks.len(), 0);
         assert_eq!(repos[0].repo_hooks.get_hooks("before").len(), 1);
         assert_eq!(repos[0].repo_hooks.get_hooks("finally").len(), 1);
     }
@@ -1330,13 +1330,13 @@ sources:
         fs::write(&path, yaml).unwrap();
 
         let repos = load_and_resolve(&path).unwrap();
-        assert!(repos[0].config.exclude_if_present.is_empty());
+        assert_eq!(repos[0].config.exclude_if_present.len(), 0);
         assert!(!repos[0].config.one_file_system);
         assert!(!repos[0].config.git_ignore);
         assert!(repos[0].config.xattrs.enabled);
 
         let src = &repos[0].sources[0];
-        assert!(src.exclude_if_present.is_empty());
+        assert_eq!(src.exclude_if_present.len(), 0);
         assert!(!src.one_file_system);
         assert!(!src.git_ignore);
         assert!(src.xattrs_enabled);
@@ -1452,8 +1452,8 @@ sources:
         let hooks = &repos[0].sources[0].hooks;
         assert_eq!(hooks.before, vec!["echo single"]);
         assert_eq!(hooks.after, vec!["echo first", "echo second"]);
-        assert!(hooks.failed.is_empty());
-        assert!(hooks.finally.is_empty());
+        assert_eq!(hooks.failed.len(), 0);
+        assert_eq!(hooks.finally.len(), 0);
     }
 
     #[test]
@@ -1494,7 +1494,7 @@ repositories:
         fs::write(&path, yaml).unwrap();
 
         let repos = load_and_resolve(&path).unwrap();
-        assert!(repos[0].sources.is_empty());
+        assert_eq!(repos[0].sources.len(), 0);
     }
 
     #[test]
@@ -1815,7 +1815,7 @@ sources:
 
         let repos = load_and_resolve(&path).unwrap();
         let source = &repos[0].sources[0];
-        assert!(source.paths.is_empty());
+        assert_eq!(source.paths.len(), 0);
         assert_eq!(source.label, "databases");
         assert_eq!(source.command_dumps.len(), 1);
     }

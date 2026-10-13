@@ -484,7 +484,7 @@ fn backup_deduplicates_identical_files_and_extracts_correctly() {
 
     let first_ids: Vec<_> = file_items[0].chunks.iter().map(|c| c.id).collect();
     let second_ids: Vec<_> = file_items[1].chunks.iter().map(|c| c.id).collect();
-    assert!(!first_ids.is_empty());
+    assert_ne!(first_ids.len(), 0);
     assert_eq!(first_ids, second_ids);
 
     for chunk_id in first_ids {
@@ -3005,9 +3005,9 @@ fn session_guard_blocks_maintenance() {
             let info = &list.0[0];
             assert_eq!(info.id, session_id);
             let d = info.details.as_ref().expect("parseable marker");
-            assert!(!d.hostname.is_empty(), "hostname should be populated");
+            assert_ne!(d.hostname, "", "hostname should be populated");
             assert!(d.pid > 0, "pid should be populated");
-            assert!(!d.age.is_empty(), "age should be populated");
+            assert_ne!(d.age, "", "age should be populated");
             assert!(!list.has_malformed());
         }
         other => panic!("expected ActiveSessions, got: {other}"),
@@ -3071,7 +3071,7 @@ fn maintenance_reaps_session_older_than_45_minutes() {
     // Sanity: listing sessions should now be empty.
     let storage = Box::new(LocalBackend::new(repo_dir.to_str().unwrap()).unwrap());
     let remaining = lock::list_sessions(storage.as_ref()).unwrap();
-    assert!(remaining.is_empty(), "no sessions should remain");
+    assert_eq!(remaining.len(), 0, "no sessions should remain");
 }
 
 #[test]

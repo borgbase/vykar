@@ -62,7 +62,7 @@ fn lifecycle_delete_compact_check_and_restore() {
     );
 
     let delete_result = commands::delete::run(&config, None, &["snap-v1"], false, None).unwrap();
-    assert!(delete_result.warnings.is_empty());
+    assert_eq!(delete_result.warnings.len(), 0);
     let stats = delete_result
         .stats
         .first()
@@ -181,7 +181,7 @@ fn prune_compact_check_and_restore_kept_snapshots() {
     );
 
     let check = commands::check::run(&config, None, true, false).unwrap();
-    assert!(check.errors.is_empty());
+    assert_eq!(check.errors.len(), 0);
 
     let repo = open_local_repo(&repo_dir, None);
     let names: Vec<_> = repo
@@ -260,7 +260,7 @@ fn run_encrypted_lifecycle(mode: EncryptionModeConfig, expected_mode: Encryption
     );
 
     let check = commands::check::run(&config, Some(passphrase), true, false).unwrap();
-    assert!(check.errors.is_empty());
+    assert_eq!(check.errors.len(), 0);
 
     let restore_dir = tmp.path().join("restore");
     commands::restore::run(
@@ -513,7 +513,7 @@ fn restore_loads_items_via_restore_cache_without_index() {
     )
     .unwrap();
 
-    assert!(!items.is_empty());
+    assert_ne!(items.len(), 0);
     assert!(items.iter().any(|i| i.path.contains("file.txt")));
 
     // The chunk index must still be empty — never loaded

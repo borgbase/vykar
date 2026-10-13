@@ -35,7 +35,7 @@ fn delete_dry_run_reports_impact_without_mutation() {
 
     let result = commands::delete::run(&config, None, &["snap-delete-dry"], true, None).unwrap();
     assert_eq!(result.stats.len(), 1);
-    assert!(result.warnings.is_empty());
+    assert_eq!(result.warnings.len(), 0);
     let stats = &result.stats[0];
     assert_eq!(stats.snapshot_name, "snap-delete-dry");
     assert!(stats.chunks_deleted > 0);
@@ -69,7 +69,7 @@ fn delete_snapshot_removes_manifest_entry_and_chunk_refs() {
 
     let result = commands::delete::run(&config, None, &["snap-delete-live"], false, None).unwrap();
     assert_eq!(result.stats.len(), 1);
-    assert!(result.warnings.is_empty());
+    assert_eq!(result.warnings.len(), 0);
     let stats = &result.stats[0];
     assert_eq!(stats.snapshot_name, "snap-delete-live");
     assert!(stats.chunks_deleted > 0);
@@ -135,7 +135,7 @@ fn delete_multiple_snapshots_in_single_call() {
     // Delete first two in one call.
     let result = commands::delete::run(&config, None, &["snap-1", "snap-2"], false, None).unwrap();
     assert_eq!(result.stats.len(), 2);
-    assert!(result.warnings.is_empty());
+    assert_eq!(result.warnings.len(), 0);
     assert_eq!(result.stats[0].snapshot_name, "snap-1");
     assert_eq!(result.stats[1].snapshot_name, "snap-2");
 
@@ -144,7 +144,7 @@ fn delete_multiple_snapshots_in_single_call() {
     assert!(after.manifest().find_snapshot("snap-2").is_none());
     assert!(after.manifest().find_snapshot("snap-3").is_some());
     // snap-3 still has chunks
-    assert!(!after.chunk_index().is_empty());
+    assert_ne!(after.chunk_index().len(), 0);
     drop(after);
 
     // Restore snap-3 and verify its data is intact (catches over-decrement).
@@ -215,7 +215,7 @@ fn delete_deduplicates_snapshot_names() {
     let result =
         commands::delete::run(&config, None, &["snap-dup", "snap-dup"], false, None).unwrap();
     assert_eq!(result.stats.len(), 1);
-    assert!(result.warnings.is_empty());
+    assert_eq!(result.warnings.len(), 0);
     assert_eq!(result.stats[0].snapshot_name, "snap-dup");
 
     let after = open_local_repo(&repo_dir);
@@ -350,7 +350,7 @@ fn delete_single_snapshot_handles_empty_stats() {
 
     let result = commands::delete::run(&config, None, &["snap-wrapper"], false, None)
         .expect("delete must not fail after commit point");
-    assert!(result.stats.is_empty());
+    assert_eq!(result.stats.len(), 0);
     assert_eq!(result.warnings.len(), 1);
     assert!(result.warnings[0].contains("snap-wrapper"));
 }

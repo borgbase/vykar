@@ -398,7 +398,7 @@ mod tests {
             &mut None,
         )
         .unwrap();
-        assert!(!refs.is_empty());
+        assert_ne!(refs.len(), 0);
         assert!(total_size > 0);
     }
 
@@ -443,7 +443,7 @@ mod tests {
             &mut None,
         )
         .unwrap();
-        assert!(refs.is_empty());
+        assert_eq!(refs.len(), 0);
         assert_eq!(total_size, 0);
     }
 

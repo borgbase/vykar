@@ -340,11 +340,12 @@ fn index_delta_is_empty() {
     use crate::index::IndexDelta;
 
     let empty = IndexDelta::new();
-    assert!(empty.is_empty());
+    assert_eq!(empty.new_entries.len(), 0);
+    assert_eq!(empty.refcount_bumps.len(), 0);
 
     let mut with_bump = IndexDelta::new();
     with_bump.bump_refcount(&vykar_types::chunk_id::ChunkId::from_bytes([0xAA; 32]));
-    assert!(!with_bump.is_empty());
+    assert_ne!(with_bump.refcount_bumps.len(), 0);
 }
 
 /// Compute the file cache path the same way `FileCache::cache_path` does.
@@ -372,7 +373,7 @@ fn deferred_hydration_survives_file_cache_save_error() {
     // Start a new write session and enable dedup mode (drops full index, activates deferred hydration path)
     repo.begin_write_session().unwrap();
     repo.enable_dedup_mode();
-    assert!(repo.chunk_index().is_empty());
+    assert_eq!(repo.chunk_index().len(), 0);
 
     // Mark file_cache dirty so save_state() will attempt file_cache.save()
     repo.mark_file_cache_dirty();

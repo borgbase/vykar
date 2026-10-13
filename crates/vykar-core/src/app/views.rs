@@ -305,7 +305,7 @@ mod tests {
             (row.nfiles, row.size_bytes, row.added_bytes),
             (None, None, None)
         );
-        assert!(row.source_paths.is_empty());
+        assert_eq!(row.source_paths.len(), 0);
     }
 
     #[test]

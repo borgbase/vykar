@@ -39,7 +39,7 @@ fn run_backup_selection_returns_created_source_report() {
     assert_eq!(report.created[0].source_label, "src-a");
     assert_eq!(report.created[0].source_paths.len(), 1);
     assert!(report.created[0].stats.nfiles > 0);
-    assert!(!report.created[0].snapshot_name.is_empty());
+    assert_ne!(report.created[0].snapshot_name, "");
 }
 
 fn hooked_repo(log: &std::path::Path) -> crate::config::ResolvedRepo {

@@ -165,7 +165,7 @@ mod tests {
         );
         // On the error path, nothing should have been attributed to stats
         // or written into `item.chunks`.
-        assert!(item.chunks.is_empty());
+        assert_eq!(item.chunks.len(), 0);
         assert_eq!(stats.nfiles, 0);
         assert_eq!(stats.original_size, 0);
         assert_eq!(stats.compressed_size, 0);

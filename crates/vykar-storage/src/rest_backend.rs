@@ -50,6 +50,32 @@ fn read_body_snippet(resp: &mut http::Response<ureq::Body>) -> String {
     }
 }
 
+/// Phase timeouts for [`RestBackend`]. `Default` uses the crate constants;
+/// tests shrink them to exercise stalled servers.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct HttpTimeouts {
+    pub resolve: Duration,
+    pub send_request: Duration,
+    /// Response-header wait for data operations (agent default).
+    pub recv_response: Duration,
+    /// Response-header wait for admin actions that run server-side work.
+    pub admin: Duration,
+    /// Response-header wait for server-side repack.
+    pub repack: Duration,
+}
+
+impl Default for HttpTimeouts {
+    fn default() -> Self {
+        Self {
+            resolve: crate::HTTP_RESOLVE_TIMEOUT,
+            send_request: crate::HTTP_SEND_REQUEST_TIMEOUT,
+            recv_response: crate::HTTP_RECV_RESPONSE_TIMEOUT,
+            admin: crate::HTTP_ADMIN_RECV_RESPONSE_TIMEOUT,
+            repack: crate::HTTP_REPACK_RECV_RESPONSE_TIMEOUT,
+        }
+    }
+}
+
 /// HTTP REST backend for remote repository access via vykar-server.
 pub struct RestBackend {
     /// Base URL, e.g. `https://backup.example.com`
@@ -60,6 +86,7 @@ pub struct RestBackend {
     /// does not allocate a header string per request.
     bearer: Option<String>,
     retry: RetryConfig,
+    timeouts: HttpTimeouts,
     /// The repository's content-digest algorithm, bound once by
     /// `Repository::init`/`open` after the format is resolved.
     ///
@@ -79,10 +106,29 @@ impl RestBackend {
         retry: RetryConfig,
         max_connections: Option<usize>,
     ) -> Result<Self> {
+        Self::with_timeouts(
+            base_url,
+            token,
+            retry,
+            max_connections,
+            HttpTimeouts::default(),
+        )
+    }
+
+    pub(crate) fn with_timeouts(
+        base_url: &str,
+        token: Option<&str>,
+        retry: RetryConfig,
+        max_connections: Option<usize>,
+        timeouts: HttpTimeouts,
+    ) -> Result<Self> {
         let pool = crate::http_idle_pool_size(max_connections);
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .http_status_as_error(false)
+            .timeout_resolve(Some(timeouts.resolve))
             .timeout_connect(Some(Duration::from_secs(30)))
+            .timeout_send_request(Some(timeouts.send_request))
+            .timeout_recv_response(Some(timeouts.recv_response))
             .timeout_send_body(Some(Duration::from_secs(5 * 60)))
             .timeout_recv_body(Some(Duration::from_secs(5 * 60)))
             .max_idle_connections_per_host(pool)
@@ -98,6 +144,7 @@ impl RestBackend {
             agent,
             bearer: token.map(|t| format!("Bearer {t}")),
             retry,
+            timeouts,
             content_hash: OnceLock::new(),
         })
     }
@@ -115,6 +162,15 @@ impl RestBackend {
         }
     }
 
+    /// Override the response-header wait for a request whose server-side work
+    /// runs before the headers are sent.
+    fn recv_response_within<B>(
+        req: ureq::RequestBuilder<B>,
+        timeout: Duration,
+    ) -> ureq::RequestBuilder<B> {
+        req.config().timeout_recv_response(Some(timeout)).build()
+    }
+
     /// Unified retry wrapper for HTTP calls with response handling.
     fn retry_call<T>(
         &self,
@@ -122,7 +178,17 @@ impl RestBackend {
         f: impl Fn() -> std::result::Result<http::Response<ureq::Body>, ureq::Error>,
         handle_response: impl Fn(http::Response<ureq::Body>) -> std::result::Result<T, HttpRetryError>,
     ) -> std::result::Result<T, HttpRetryError> {
-        crate::retry::retry_http(&self.retry, op_name, "REST", f, handle_response)
+        self.retry_call_with(&self.retry, op_name, f, handle_response)
+    }
+
+    fn retry_call_with<T>(
+        &self,
+        retry: &RetryConfig,
+        op_name: &str,
+        f: impl Fn() -> std::result::Result<http::Response<ureq::Body>, ureq::Error>,
+        handle_response: impl Fn(http::Response<ureq::Body>) -> std::result::Result<T, HttpRetryError>,
+    ) -> std::result::Result<T, HttpRetryError> {
+        crate::retry::retry_http(retry, op_name, "REST", f, handle_response)
     }
 
     /// POST `payload` as JSON and deserialize the JSON response body.
@@ -134,11 +200,17 @@ impl RestBackend {
         op_name: &str,
         url: &str,
         payload: &Req,
+        recv_response: Duration,
+        retry: &RetryConfig,
     ) -> Result<Resp> {
         let body = self
-            .retry_call(
+            .retry_call_with(
+                retry,
                 op_name,
-                || self.authed(self.agent.post(url)).send_json(payload),
+                || {
+                    let req = self.authed(self.agent.post(url));
+                    Self::recv_response_within(req, recv_response).send_json(payload)
+                },
                 |mut resp| {
                     let status = resp.status().as_u16();
                     if status >= 400 {
@@ -196,10 +268,14 @@ impl RestBackend {
         op_name: &str,
         url: &str,
         payload: &Req,
+        recv_response: Duration,
     ) -> Result<()> {
         self.retry_call(
             op_name,
-            || self.authed(self.agent.post(url)).send_json(payload),
+            || {
+                let req = self.authed(self.agent.post(url));
+                Self::recv_response_within(req, recv_response).send_json(payload)
+            },
             |resp| {
                 let status = resp.status().as_u16();
                 crate::retry::classify_status(
@@ -218,19 +294,26 @@ impl RestBackend {
         } else {
             format!("{}?batch-delete", self.base_url)
         };
-        self.post_no_content("batch-delete", &url, &keys)
+        self.post_no_content("batch-delete", &url, &keys, self.timeouts.admin)
     }
 
     /// Send a verify-packs plan to the server for server-side pack verification.
     pub fn verify_packs(&self, plan: &VerifyPacksPlanRequest) -> Result<VerifyPacksResponse> {
         let url = format!("{}?verify-packs", self.base_url);
-        self.post_json("verify-packs", &url, plan)
+        self.post_json("verify-packs", &url, plan, self.timeouts.admin, &self.retry)
     }
 
     /// Send a repack plan to the server for server-side compaction.
+    ///
+    /// Not retried: a retry after a timeout could stall the caller for hours.
+    /// The next compact run retries instead.
     pub fn repack(&self, plan: &RepackPlanRequest) -> Result<RepackResultResponse> {
         let url = format!("{}?repack", self.base_url);
-        self.post_json("repack", &url, plan)
+        let retry = RetryConfig {
+            max_retries: 0,
+            ..self.retry
+        };
+        self.post_json("repack", &url, plan, self.timeouts.repack, &retry)
     }
 }
 
@@ -470,7 +553,10 @@ impl StorageBackend for RestBackend {
         let body = self
             .retry_call(
                 &format!("LIST {prefix}"),
-                || self.authed(self.agent.get(&url)).call(),
+                || {
+                    let req = self.authed(self.agent.get(&url));
+                    Self::recv_response_within(req, self.timeouts.admin).call()
+                },
                 |mut resp| {
                     let status = resp.status().as_u16();
                     if status >= 400 {
@@ -628,7 +714,10 @@ impl StorageBackend for RestBackend {
         let url = format!("{}?init", self.base_url);
         self.retry_call(
             "INIT",
-            || self.authed(self.agent.post(&url)).send(&[] as &[u8]),
+            || {
+                let req = self.authed(self.agent.post(&url));
+                Self::recv_response_within(req, self.timeouts.admin).send(&[] as &[u8])
+            },
             |resp| {
                 let status = resp.status().as_u16();
                 if status >= 400 {
@@ -934,6 +1023,83 @@ mod tests {
             }
         });
         (url, handle)
+    }
+
+    /// A server that accepts connections and drains requests but never
+    /// responds. Sockets stay open until the returned stop flag is set; the
+    /// join handle yields the number of accepted connections.
+    fn stalled_server() -> (
+        String,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        std::thread::JoinHandle<usize>,
+    ) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let stop_flag = stop.clone();
+        let handle = std::thread::spawn(move || {
+            let mut held = Vec::new();
+            while !stop_flag.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        stream.set_nonblocking(false).unwrap();
+                        let mut reader = BufReader::new(stream.try_clone().unwrap());
+                        read_request(&mut reader);
+                        held.push(stream);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(e) => panic!("accept failed: {e}"),
+                }
+            }
+            held.len()
+        });
+        (url, stop, handle)
+    }
+
+    fn short_timeouts() -> HttpTimeouts {
+        let t = Duration::from_millis(200);
+        HttpTimeouts {
+            resolve: t,
+            send_request: t,
+            recv_response: t,
+            admin: t,
+            repack: t,
+        }
+    }
+
+    #[test]
+    fn recv_response_timeout_unblocks_stalled_server() {
+        let (url, stop, handle) = stalled_server();
+        let backend =
+            RestBackend::with_timeouts(&url, None, no_retry(), None, short_timeouts()).unwrap();
+
+        let start = std::time::Instant::now();
+        let result = backend.get("testkey");
+        let elapsed = start.elapsed();
+
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        handle.join().unwrap();
+        assert!(result.is_err(), "stalled GET must fail, got {result:?}");
+        assert!(elapsed < Duration::from_secs(2), "took {elapsed:?}");
+    }
+
+    #[test]
+    fn repack_is_not_retried_on_timeout() {
+        let (url, stop, handle) = stalled_server();
+        let backend =
+            RestBackend::with_timeouts(&url, None, fast_retry(), None, short_timeouts()).unwrap();
+
+        let plan = RepackPlanRequest::new(vec![], HashAlgorithm::Blake3);
+        let result = backend.repack(&plan);
+
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let accepted = handle.join().unwrap();
+        assert!(result.is_err(), "stalled repack must fail");
+        assert_eq!(accepted, 1, "repack must not be retried");
     }
 
     fn no_retry() -> RetryConfig {

@@ -71,7 +71,10 @@ impl S3Backend {
         let pool = crate::http_idle_pool_size(max_connections);
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .http_status_as_error(false)
+            .timeout_resolve(Some(crate::HTTP_RESOLVE_TIMEOUT))
             .timeout_connect(Some(Duration::from_secs(30)))
+            .timeout_send_request(Some(crate::HTTP_SEND_REQUEST_TIMEOUT))
+            .timeout_recv_response(Some(crate::HTTP_RECV_RESPONSE_TIMEOUT))
             .timeout_send_body(Some(Duration::from_secs(300)))
             .timeout_recv_body(Some(Duration::from_secs(300)))
             .max_idle_connections_per_host(pool)

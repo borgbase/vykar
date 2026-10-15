@@ -390,6 +390,29 @@ pub(crate) fn http_idle_pool_size(max_connections: Option<usize>) -> usize {
 /// ureq's 15s default expires connections between phases of a backup.
 pub(crate) const HTTP_IDLE_AGE: std::time::Duration = std::time::Duration::from_secs(60);
 
+// HTTP phase timeouts for REST and S3. ureq leaves request-header writes and
+// the wait for response headers unbounded by default, so a pooled connection
+// whose peer silently vanished would block forever. These values aim for
+// "never infinite", not fast failure.
+
+/// DNS resolution of a new connection.
+pub(crate) const HTTP_RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Writing request headers (the body has its own budget).
+pub(crate) const HTTP_SEND_REQUEST_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(30);
+/// Waiting for response headers on plain data operations.
+pub(crate) const HTTP_RECV_RESPONSE_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(5 * 60);
+/// Waiting for response headers on vykar-server admin actions. Coupled to the
+/// server's `ADMIN_ACTION_TIMEOUT` (600s) plus margin; raise both together.
+pub(crate) const HTTP_ADMIN_RECV_RESPONSE_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(11 * 60);
+/// Waiting for a server-side repack result. A finite deadline is only safe
+/// because compact deletes source packs itself after persisting the index; a
+/// timed-out repack leaves orphan new packs, never dangling index entries.
+pub(crate) const HTTP_REPACK_RECV_RESPONSE_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(60 * 60);
+
 /// Retry configuration for remote storage backends (S3, SFTP, REST).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

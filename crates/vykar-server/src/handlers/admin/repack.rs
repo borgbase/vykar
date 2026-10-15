@@ -62,8 +62,10 @@ pub(super) async fn repack(
 /// leaving the client unable to point its index at the new packs.
 ///
 /// Residual window: a crash (or lost success response) between phase B and
-/// the client receiving the results still strands deleted sources; closing
-/// that fully would need a client-driven delete protocol.
+/// the client receiving the results still strands deleted sources. Current
+/// clients avoid it by sending `delete_after: false` and deleting sources
+/// themselves after persisting the index; the server-side delete remains for
+/// older clients.
 #[allow(clippy::too_many_lines)]
 fn execute_repack(
     state: &AppState,

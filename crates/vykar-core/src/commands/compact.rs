@@ -1,5 +1,5 @@
 use std::cmp::Reverse;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 
@@ -513,6 +513,9 @@ fn try_server_side_repack(
         .map(|analysis| (analysis.storage_key.as_str(), *analysis))
         .collect();
 
+    // The server never deletes: sources are removed below, after the index
+    // pointing at their replacements is persisted. A lost or timed-out
+    // response therefore leaves only unreferenced new packs behind.
     let mut operations = Vec::with_capacity(analyses.len());
     for analysis in analyses {
         operations.push(RepackOperationRequest {
@@ -525,7 +528,7 @@ fn try_server_side_repack(
                     length: entry.length as u64,
                 })
                 .collect(),
-            delete_after: true,
+            delete_after: false,
         });
     }
 
@@ -541,16 +544,15 @@ fn try_server_side_repack(
     }
 
     // Send one server_repack call per batch (batches stay within the server's
-    // output cap; client and server agree via MAX_REPACK_OUTPUT_BYTES), and
-    // apply each batch's results to the index as it completes. The server
-    // deletes source packs as it goes, so results already in hand must be
-    // persisted even when a later batch fails — otherwise the index would keep
-    // pointing at packs the server has already deleted.
-    let mut applied_any = false;
+    // output cap; client and server agree via MAX_REPACK_OUTPUT_BYTES). Each
+    // batch is applied, persisted, and only then are its sources deleted, so a
+    // crash at any point leaves the index consistent.
     let mut first_batch = true;
-    let mut batch_err: Option<VykarError> = None;
+    // Packs returned as some op's new pack carry live data and must never be
+    // deleted as a source (the server may return the source itself).
+    let mut result_packs: HashSet<String> = HashSet::new();
 
-    'batches: for batch in chunk_repack_operations(operations) {
+    for batch in chunk_repack_operations(operations) {
         // The constructor derives `protocol_version` from the algorithm, so an
         // old server rejects a BLAKE3 plan outright instead of verifying the
         // packs under the wrong algorithm.
@@ -559,55 +561,87 @@ fn try_server_side_repack(
             Ok(resp) => resp,
             // Backend capability is stable, so only the first call can discover
             // server-side repack is unsupported. After a successful batch a
-            // client-side fallback would try to re-read source packs the server
-            // has already deleted, so later errors must propagate instead.
+            // client-side fallback would redo work already applied.
             Err(VykarError::UnsupportedBackend(_)) if first_batch => return Ok(false),
-            Err(err) => {
-                batch_err = Some(err);
-                break 'batches;
-            }
+            Err(err) => return Err(err),
         };
         first_batch = false;
 
+        result_packs.extend(
+            response
+                .completed
+                .iter()
+                .filter_map(|op| op.new_pack.clone()),
+        );
         let mut completed_by_source: HashMap<String, vykar_protocol::RepackOperationResult> =
             response
                 .completed
                 .into_iter()
                 .map(|op| (op.source_pack.clone(), op))
                 .collect();
+
+        let mut applied: Vec<&PackAnalysis> = Vec::with_capacity(plan.operations.len());
+        let mut batch_err: Option<VykarError> = None;
         for op in &plan.operations {
             let Some(result) = completed_by_source.remove(&op.source_pack) else {
                 batch_err = Some(VykarError::Other(format!(
                     "server repack response missing operation for {}",
                     op.source_pack
                 )));
-                break 'batches;
+                break;
             };
             let analysis = analysis_by_key
                 .get(op.source_pack.as_str())
                 .expect("operation was built from these analyses");
             if let Err(err) = apply_repack_result(repo, analysis, &result, stats) {
                 batch_err = Some(err);
-                break 'batches;
+                break;
             }
-            applied_any = true;
+            applied.push(analysis);
+        }
+
+        if applied.is_empty() {
+            if let Some(err) = batch_err {
+                return Err(err);
+            }
+            continue;
+        }
+        repo.save_state()?;
+
+        // A failed delete leaves an unreferenced source behind (wasted space,
+        // not an inconsistency). Finish this batch's deletes, then stop: on an
+        // append-only server every later batch would only grow the repo.
+        let mut delete_err: Option<VykarError> = None;
+        for analysis in applied {
+            if result_packs.contains(&analysis.storage_key) {
+                continue;
+            }
+            match repo.storage.delete(&analysis.storage_key) {
+                Ok(()) if analysis.live_entries.is_empty() => {
+                    stats.packs_deleted_empty += 1;
+                    stats.space_freed += analysis.total_bytes;
+                }
+                Ok(()) => stats.space_freed += analysis.dead_bytes,
+                Err(err) => {
+                    warn!(
+                        "Failed to delete repacked source pack {}: {err}",
+                        analysis.pack_id
+                    );
+                    delete_err.get_or_insert(err);
+                }
+            }
+        }
+        if let Some(err) = batch_err.or(delete_err) {
+            return Err(err);
         }
     }
 
-    // Persist index updates for every applied operation, even on a partial
-    // failure — their source packs are already gone server-side.
-    if applied_any || batch_err.is_none() {
-        repo.save_state()?;
-    }
-    match batch_err {
-        Some(err) => Err(err),
-        None => Ok(true),
-    }
+    Ok(true)
 }
 
 /// Apply one completed server-side repack operation to the local chunk index
 /// and stats. Errors (missing/invalid new pack, offsets mismatch) leave the
-/// index untouched for this operation.
+/// index untouched for this operation. Source deletion is the caller's job.
 fn apply_repack_result(
     repo: &mut Repository,
     analysis: &PackAnalysis,
@@ -615,10 +649,6 @@ fn apply_repack_result(
     stats: &mut CompactStats,
 ) -> Result<()> {
     if analysis.live_entries.is_empty() {
-        if result.deleted {
-            stats.packs_deleted_empty += 1;
-            stats.space_freed += analysis.total_bytes;
-        }
         return Ok(());
     }
 
@@ -653,9 +683,6 @@ fn apply_repack_result(
     }
 
     stats.packs_repacked += 1;
-    if result.deleted {
-        stats.space_freed += analysis.dead_bytes;
-    }
     Ok(())
 }
 
@@ -695,7 +722,7 @@ mod repack_chunk_tests {
         RepackOperationRequest {
             source_pack: format!("packs/ab/{}", "ab".repeat(32)),
             keep_blobs: vec![RepackBlobRef { offset: 13, length }],
-            delete_after: true,
+            delete_after: false,
         }
     }
 

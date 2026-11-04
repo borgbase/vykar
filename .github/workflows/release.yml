@@ -364,7 +364,7 @@ jobs:
     name: sign-windows
     if: github.event_name != 'workflow_dispatch' || github.event.inputs.build_windows == 'true'
     needs: build-windows
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     environment: release
     env:
       HAS_SIGNING: ${{ secrets.CERTUM_CERT_SHA1 }}

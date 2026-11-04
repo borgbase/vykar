@@ -247,8 +247,9 @@ fn handle_quit(ctx: &EventCtx) {
     let _ = slint::quit_event_loop();
 }
 
-fn show_main_window(ctx: &EventCtx) {
-    let _ = ctx.ui.show();
+/// Show the main window if hidden and bring it to the front.
+pub(crate) fn raise_main_window(ui: &MainWindow) {
+    let _ = ui.show();
     #[cfg(target_os = "macos")]
     {
         use objc2::MainThreadMarker;
@@ -417,7 +418,7 @@ pub(crate) fn spawn(
                         crate::tray::set_operation_busy(false);
                     }
                     UiEvent::Quit => handle_quit(&ctx),
-                    UiEvent::ShowWindow => show_main_window(&ctx),
+                    UiEvent::ShowWindow => raise_main_window(&ui),
                     UiEvent::MountStarted { url } => handle_mount_started(&ctx, url),
                     UiEvent::MountStopped => {
                         ui.set_is_mount_active(false);

@@ -102,6 +102,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // ── Fallible UI / tray initialization (before spawning any threads) ──
 
     let ui = bootstrap::init_main_window(&gui_state, initial_config_path)?;
+    controllers::password_dialog::install(&ui);
     let tray_ready = bootstrap::setup_tray(
         &app_tx,
         &ui_tx,

@@ -9,6 +9,7 @@ import { AdvancedPage } from "pages/advanced.slint";
 import { LogPage } from "pages/log.slint";
 import { SettingsPage } from "pages/settings.slint";
 import { WelcomePage } from "pages/welcome.slint";
+import { PasswordPrompt } from "password-prompt.slint";
 
 export { RepoInfo, SourceInfo, Page, FindSnapshotGroup }
 
@@ -83,6 +84,21 @@ export component MainWindow inherits Window {
     in-out property <bool> start_in_background: false;
     in-out property <bool> start_in_background_enabled: true;
 
+    // Passphrase prompt
+    in property <string> password_prompt_title;
+    in property <string> password_prompt_message;
+    in property <string> password_prompt_error;
+    callback password_submitted(/* passphrase */ string);
+    callback password_cancelled();
+
+    public function show_password_prompt() {
+        password_prompt.show();
+    }
+
+    public function close_password_prompt() {
+        password_prompt.close();
+    }
+
     callback open_config_clicked();
     callback switch_config_clicked();
     callback save_and_apply_clicked();
@@ -137,6 +153,22 @@ export component MainWindow inherits Window {
     title: root.window_title;
     preferred-width: 1100px;
     preferred-height: 760px;
+
+    password_prompt := PasswordPrompt {
+        host-width: root.width;
+        host-height: root.height;
+        prompt-title: root.password_prompt_title;
+        prompt-message: root.password_prompt_message;
+        error-text: root.password_prompt_error;
+        submitted(value) => {
+            root.password_submitted(value);
+            password_prompt.close();
+        }
+        cancelled => {
+            root.password_cancelled();
+            password_prompt.close();
+        }
+    }
 
     focus-sink := FocusScope {
         key-pressed(event) => {

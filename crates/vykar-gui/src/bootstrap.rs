@@ -10,6 +10,7 @@ use crossbeam_channel::{Receiver, Sender};
 use slint::ComponentHandle;
 use vykar_core::app;
 
+use crate::controllers::password_dialog;
 use crate::messages::{log_entry_now, AppCommand, UiEvent};
 use crate::repo_helpers::send_log;
 use crate::{autostart, event_consumer, scheduler, state, tray, ui_state, update_check, worker};
@@ -302,6 +303,7 @@ pub(crate) fn wire_window_lifecycle(
                 return slint::CloseRequestResponse::KeepWindowShown;
             }
             if let Some(ui) = ui_weak.upgrade() {
+                password_dialog::cancel_pending(&ui);
                 if let Some(s) = event_consumer::capture_gui_state(&ui, &pref) {
                     state::save(&s);
                     ui_state::set_last_gui_state(s);
@@ -323,6 +325,7 @@ pub(crate) fn wire_window_lifecycle(
                 return;
             }
             if let Some(ui) = ui_weak.upgrade() {
+                password_dialog::cancel_pending(&ui);
                 if let Some(s) = event_consumer::capture_gui_state(&ui, &pref) {
                     state::save(&s);
                     ui_state::set_last_gui_state(s);

@@ -344,7 +344,12 @@ limits:
 
 ## Network-Aware Backups
 
-A `before_backup` hook that exits non-zero skips the backup. This lets you restrict backups to specific networks without any changes to Vykar itself.
+A `before_backup` hook that exits `75` [skips the run](configuration.md#skipping-a-run) without reporting an error: no `failed` hooks, exit code `0`, no red status in the GUI. This lets you restrict backups to specific networks without any changes to Vykar itself. Any other non-zero exit also stops the backup, but counts as a failure.
+
+> **Operator precedence:** `||` binds to the whole pipeline before it, so `a | grep -q b || exit 75` works as expected. Two forms need care:
+>
+> - `! a | grep -q b || exit 75` is fine: `!` negates the whole pipeline.
+> - `[ x ] && [ y ] || exit 75` also exits `75` when the `&&` list fails at any point, which is what these recipes want. Anything added after `exit 75` with `;` or `&&` changes that, so wrap the test in `{ ...; }` if you extend it.
 
 
 ### WiFi SSID filtering
@@ -358,6 +363,7 @@ hooks:
   before_backup: >-
     networksetup -getairportnetwork en0
     | grep -q 'HomeNetwork'
+    || exit 75
 ```
 
 **Linux (NetworkManager):**
@@ -367,6 +373,7 @@ hooks:
   before_backup: >-
     nmcli -t -f active,ssid dev wifi
     | grep -q '^yes:HomeNetwork$'
+    || exit 75
 ```
 
 Multiple allowed SSIDs:
@@ -376,6 +383,7 @@ hooks:
   before_backup: >-
     nmcli -t -f active,ssid dev wifi
     | grep -qE '^yes:(HomeNetwork|OfficeNetwork)$'
+    || exit 75
 ```
 
 Inverted logic — run on any network *except* a blocklist:
@@ -385,6 +393,7 @@ hooks:
   before_backup: >-
     ! nmcli -t -f active,ssid dev wifi
     | grep -q '^yes:CoffeeShopWiFi$'
+    || exit 75
 ```
 
 
@@ -401,6 +410,7 @@ hooks:
     | grep -m1 GENERAL.METERED
     | cut -d: -f2);
     [ "$METERED" != "yes" ] && [ "$METERED" != "guess-yes" ]
+    || exit 75
 ```
 
 NetworkManager reports four values: `yes` (explicitly metered), `guess-yes` (heuristic, e.g. Android hotspot), `no`, and `unknown`. The hook above skips on both `yes` and `guess-yes`.
@@ -412,6 +422,7 @@ hooks:
   before_backup: >-
     ! networkctl status
     | grep -qi 'metered.*yes'
+    || exit 75
 ```
 
 > **Note:** macOS has no CLI-exposed metered attribute. Use SSID filtering instead.

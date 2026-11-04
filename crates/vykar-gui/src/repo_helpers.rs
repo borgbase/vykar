@@ -202,9 +202,18 @@ pub(crate) fn log_backup_report(
     repo_name: &str,
     report: &operations::BackupRunReport,
 ) {
-    if report.created.is_empty() {
+    if report.created.is_empty() && report.skipped.is_empty() {
         send_log(ui_tx, format!("[{repo_name}] no snapshots created"));
         return;
+    }
+    for skipped in &report.skipped {
+        send_log(
+            ui_tx,
+            format!(
+                "[{repo_name}] source {} skipped: {}",
+                skipped.label, skipped.reason
+            ),
+        );
     }
     for created in &report.created {
         send_log(

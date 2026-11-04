@@ -163,6 +163,9 @@ pub(crate) fn run_backup(repo: &ResolvedRepo, opts: BackupRunOpts<'_>) -> CliRes
                 created.dataless_dirs_skipped,
             );
         }
+        for skipped in &report.skipped {
+            eprintln!("Skipped source '{}': {}", skipped.label, skipped.reason);
+        }
 
         Ok(had_partial)
     })

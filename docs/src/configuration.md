@@ -651,7 +651,7 @@ sources:
 
 | Hook       | Command-specific (global/repo only) | Runs when                        | Failure behavior       |
 |------------|--------------------------------------|----------------------------------|------------------------|
-| `before`   | `before_<cmd>`                       | Before the command               | Aborts the command     |
+| `before`   | `before_<cmd>`                       | Before the command               | Aborts the command; exit `75` [skips it quietly](#skipping-a-run) |
 | `after`    | `after_<cmd>`                        | After success only               | Logged, doesn't affect result |
 | `failed`   | `failed_<cmd>`                       | After failure only               | Logged, doesn't affect result |
 | `finally`  | `finally_<cmd>`                      | Always, regardless of outcome    | Logged, doesn't affect result |
@@ -666,9 +666,48 @@ Hooks only run for `backup`, `prune`, `check`, and `compact`. The bare form (`be
    On failure: `failed` hooks run (same order)
 4. `finally` hooks always run last (same order)
 
-If a `before` hook fails, the command is skipped and both `failed` and `finally` hooks still run.
+If a `before` hook fails, the command is skipped and both `failed` and `finally` hooks still run. If it exits `75` instead, only `finally` hooks run — see [Skipping a run](#skipping-a-run).
 
 Each hook key maps to a shell command (string) or list of commands.
+
+### Skipping a run
+
+A `before` hook that exits `75` asks vykar to skip the command without reporting an error. Use it for conditions that are expected, such as being away from your home network. Any other non-zero exit is still a failure.
+
+```yaml
+hooks:
+  before_backup: nmcli -t -f active,ssid dev wifi | grep -q '^yes:HomeNetwork$' || exit 75
+```
+
+Exit `75` is only honoured in `before` hooks, at the global, repository or source level:
+
+| Situation | Result |
+|-----------|--------|
+| Remaining `before` hooks | Not run |
+| The command | Not run |
+| `after` / `failed` hooks | Not run |
+| `finally` hooks | Run, with `{error}` empty — an earlier `before` hook may have set up state they clean up |
+| Exit `75` in `after` / `failed` / `finally` | Ordinary hook warning; the skip is ignored |
+| Hook killed by a signal or timed out | Still an error |
+
+What each surface reports:
+
+| Surface | Result |
+|---------|--------|
+| `vykar backup` / `prune` / `compact` / `check` | `Skipped: <reason>` on stderr, exit code `0`. With several repositories, an error or partial result in another one takes priority |
+| `vykar` (default cycle) | The summary shows `skipped (<reason>)`, exit code `0` |
+| Cycle, `backup` skipped | `prune`, `compact` and `check` are skipped too, so nothing connects to the repository |
+| Cycle, a later step skipped (e.g. `before_prune`) | Only that step is skipped |
+| One source skipped | Other sources continue, repository `after` hooks run, and the skip is reported |
+| Every selected source skipped | Treated as a repository-level skip: no repository `after` / `failed` hooks, `finally` hooks run |
+| Daemon | Logged at INFO. The cycle outcome is `skipped` only when every attempted repository skipped; otherwise it follows the repositories that ran. No early retry: the next attempt is the normal schedule |
+| GUI | Log line, no red status, no failure entry |
+
+> **Monitoring:** a skip exits `0`, so `vykar backup && ping` reports success even though no snapshot was created. Ping from an `after_backup` hook instead, which does not run on a skip.
+
+> **Daemon status refresh:** a skip stops the cycle from connecting, but the daemon's status refresh (at startup, after each cycle) and its 60-second snapshot poll still contact every repository, whatever the hooks say. For an unreachable repository this logs warnings, and because the startup refresh runs before the first cycle, it can delay that cycle by several minutes.
+
+> **Passphrases:** the CLI and daemon resolve the passphrase before hooks run. That does not connect to the repository, but a `passcommand` that needs the network can still fail before a skip hook gets to run. GUI scheduled cycles run `before` hooks first.
 
 ### Variable substitution
 

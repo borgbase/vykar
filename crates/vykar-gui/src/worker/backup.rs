@@ -1,9 +1,12 @@
+use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 
+use crossbeam_channel::Sender;
 use vykar_core::app::operations;
 use vykar_core::commands::backup::BackupProgressEvent;
 use vykar_core::config;
 use vykar_types::error::VykarError;
+use zeroize::Zeroizing;
 
 use crate::messages::{AppCommand, UiEvent};
 use crate::progress::{format_check_status, format_step_outcome, BackupStatusTracker};
@@ -37,6 +40,41 @@ fn select_repo_indices(repos: &[config::ResolvedRepo], only: Option<&[String]>) 
             .map(|(idx, _)| idx)
             .collect(),
         None => (0..repos.len()).collect(),
+    }
+}
+
+/// Passphrase step of a cycle, run after the `before` hooks pass so a skip hook
+/// sees neither a dialog nor a connection. Validates and caches the passphrase
+/// (retrying a wrong dialog entry; a wrong value is never cached).
+/// The cycle buries decryption failures inside `steps` as a string, so it cannot
+/// drive `with_passphrase_retry` directly — the `info::run` probe does.
+fn resolve_cycle_passphrase(
+    repo: &config::ResolvedRepo,
+    passphrases: &mut HashMap<String, Zeroizing<String>>,
+    ui_tx: &Sender<UiEvent>,
+) -> Result<Option<Zeroizing<String>>, VykarError> {
+    let outcome = with_passphrase_retry(repo, passphrases, 3, |pass| {
+        vykar_core::commands::info::run(&repo.config, pass)
+    });
+    match outcome {
+        Ok(PassphraseRun::Ran(_)) => Ok(passphrases.get(&repo.config.repository.url).cloned()),
+        Ok(PassphraseRun::Canceled) => {
+            Err(VykarError::Skipped("passphrase prompt canceled".into()))
+        }
+        Err(VykarError::RepoNotFound(_)) => {
+            let (log, reason) =
+                if classify_init_target(&repo.config.repository.url) == InitTarget::Unavailable {
+                    (
+                        "repository path not available (drive not connected?)",
+                        "repository not available",
+                    )
+                } else {
+                    ("repository not initialized", "repository not initialized")
+                };
+            send_log(ui_tx, format!("[{}] {log}", repo.label_or_url()));
+            Err(VykarError::Other(reason.to_string()))
+        }
+        Err(e) => Err(VykarError::Other(format!("failed to open repository: {e}"))),
     }
 }
 
@@ -97,58 +135,14 @@ fn run_backup_cycle(ctx: &mut WorkerContext, scheduled: bool, only: Option<&[Str
             i + 1
         )));
 
-        // Validate + cache the passphrase before the cycle (retry on a wrong
-        // dialog entry; a wrong value is never cached). `run_full_cycle_for_repo`
-        // buries decryption failures inside `steps` as a string, so it cannot
-        // drive `with_passphrase_retry` directly — the `info::run` probe does.
-        let outcome = with_passphrase_retry(repo, &mut ctx.passphrases, 3, |pass| {
-            vykar_core::commands::info::run(&repo.config, pass)
-        });
-        let passphrase = match outcome {
-            Ok(PassphraseRun::Ran(_)) => ctx.passphrases.get(&repo.config.repository.url).cloned(),
-            Ok(PassphraseRun::Canceled) => {
-                send_log(
-                    &ctx.ui_tx,
-                    format!("[{repo_name}] passphrase prompt canceled; skipping this repository"),
-                );
-                continue;
-            }
-            Err(VykarError::RepoNotFound(_)) => {
-                // An uninitialized repo cannot be backed up; surface it as a
-                // failure rather than crashing the cycle below.
-                let (log, reason) = if classify_init_target(&repo.config.repository.url)
-                    == InitTarget::Unavailable
-                {
-                    (
-                        "repository path not available (drive not connected?); skipping.",
-                        "repository not available",
-                    )
-                } else {
-                    (
-                        "repository not initialized; skipping.",
-                        "repository not initialized",
-                    )
-                };
-                send_log(&ctx.ui_tx, format!("[{repo_name}] {log}"));
-                failures.push((repo_name.clone(), reason.to_string()));
-                continue;
-            }
-            Err(e) => {
-                send_log(
-                    &ctx.ui_tx,
-                    format!("[{repo_name}] failed to open repository: {e}"),
-                );
-                failures.push((repo_name.clone(), format!("{e}")));
-                continue;
-            }
-        };
-
         let mut tracker = BackupStatusTracker::new(repo_name.clone());
         let ui_tx_progress = ctx.ui_tx.clone();
         let rn = repo_name.clone();
-        let result = operations::run_full_cycle_for_repo(
+        let passphrases = &mut ctx.passphrases;
+        let ui_tx = &ctx.ui_tx;
+        let result = operations::run_full_cycle_with_passphrase_source(
             repo,
-            passphrase.as_deref().map(|s| s.as_str()),
+            &mut || resolve_cycle_passphrase(repo, passphrases, ui_tx),
             Some(&ctx.cancel_requested),
             false,
             &[],
@@ -278,6 +272,9 @@ pub(super) fn handle_backup_repo(ctx: &mut WorkerContext, repo_name: String) {
                 format!("[{rn}] passphrase prompt canceled; skipping."),
             );
         }
+        Err(VykarError::Skipped(reason)) => {
+            send_log(&ctx.ui_tx, format!("[{rn}] backup skipped: {reason}"));
+        }
         Err(e) => {
             guard.fail(format!("[{rn}] backup failed: {e}"));
         }
@@ -356,6 +353,12 @@ pub(super) fn handle_backup_source(ctx: &mut WorkerContext, source_label: String
                     format!("[{repo_name}] passphrase prompt canceled; skipping."),
                 );
             }
+            Err(VykarError::Skipped(reason)) => {
+                send_log(
+                    &ctx.ui_tx,
+                    format!("[{repo_name}] backup skipped: {reason}"),
+                );
+            }
             Err(e) => {
                 send_log(&ctx.ui_tx, format!("[{repo_name}] backup failed: {e}"));
                 failures.push((repo_name.clone(), format!("{e}")));
@@ -375,14 +378,14 @@ pub(super) fn handle_backup_source(ctx: &mut WorkerContext, source_label: String
         ));
     }
 
-    if !any_backed_up {
+    if any_backed_up {
+        let _ = ctx.ui_tx.send(UiEvent::TriggerSnapshotRefresh);
+        let _ = ctx.app_tx.send(AppCommand::FetchAllRepoInfo);
+    } else if attempted == 0 {
         send_log(
             &ctx.ui_tx,
             format!("No repositories found with source '{source_label}'."),
         );
-    } else {
-        let _ = ctx.ui_tx.send(UiEvent::TriggerSnapshotRefresh);
-        let _ = ctx.app_tx.send(AppCommand::FetchAllRepoInfo);
     }
 }
 
@@ -419,6 +422,155 @@ mod tests {
             select_repo_indices(&repos, Some(&["/backups/remote".to_string()])),
             vec![1]
         );
+    }
+
+    struct Harness {
+        ctx: WorkerContext,
+        ui_rx: crossbeam_channel::Receiver<UiEvent>,
+        _tmp: tempfile::TempDir,
+        // Held so sends on the context's channels keep succeeding.
+        _app_rx: crossbeam_channel::Receiver<AppCommand>,
+        _sched_rx: crossbeam_channel::Receiver<()>,
+    }
+
+    /// A worker whose only repo does not exist, so anything past the `before`
+    /// hook would surface as an error.
+    fn harness(before_backup: &str) -> Harness {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("volume").join("repo");
+        let source = tmp.path().join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        let yaml = format!(
+            "repositories:\n  - url: '{}'\n    label: nas\n\
+             encryption:\n  mode: none\n\
+             hooks:\n  before_backup: {before_backup}\n\
+             sources:\n  - path: '{}'\n    label: src\n",
+            repo.display(),
+            source.display(),
+        );
+        let path = tmp.path().join("config.yaml");
+        std::fs::write(&path, yaml).unwrap();
+
+        let (ui_tx, ui_rx) = crossbeam_channel::unbounded();
+        let (app_tx, app_rx) = crossbeam_channel::unbounded();
+        let (sched_notify_tx, sched_rx) = crossbeam_channel::bounded(1);
+        let ctx = WorkerContext {
+            passphrases: HashMap::new(),
+            repo_info: HashMap::new(),
+            config_display_path: path.clone(),
+            runtime: vykar_core::app::RuntimeConfig {
+                repos: config::load_and_resolve(&path).unwrap(),
+                source: config::ConfigSource::CliArg(path),
+            },
+            app_tx,
+            ui_tx,
+            sched_notify_tx,
+            scheduler: Default::default(),
+            backup_running: Default::default(),
+            operation_running: Default::default(),
+            cancel_requested: Default::default(),
+            scheduler_lock_held: true,
+            schedule_paused: false,
+            mount: None,
+        };
+        Harness {
+            ctx,
+            ui_rx,
+            _tmp: tmp,
+            _app_rx: app_rx,
+            _sched_rx: sched_rx,
+        }
+    }
+
+    /// Log lines and red-status messages emitted so far.
+    fn drain(rx: &crossbeam_channel::Receiver<UiEvent>) -> (Vec<String>, Vec<String>) {
+        let (mut logs, mut errors) = (Vec::new(), Vec::new());
+        for event in rx.try_iter() {
+            match event {
+                UiEvent::LogEntry { message, .. } => logs.push(message),
+                UiEvent::ErrorStatus(message) => errors.push(message),
+                _ => {}
+            }
+        }
+        (logs, errors)
+    }
+
+    type Handler = fn(&mut WorkerContext);
+
+    const HANDLERS: [(&str, Handler); 3] = [
+        ("cycle", |ctx| handle_backup_all(ctx, true)),
+        ("repo", |ctx| handle_backup_repo(ctx, "nas".to_string())),
+        ("source", |ctx| handle_backup_source(ctx, "src".to_string())),
+    ];
+
+    #[test]
+    fn hook_skip_is_logged_and_not_a_failure() {
+        for (name, handler) in HANDLERS {
+            let mut h = harness("exit 75");
+            handler(&mut h.ctx);
+            let (logs, errors) = drain(&h.ui_rx);
+
+            assert!(errors.is_empty(), "{name}: {errors:?}");
+            assert!(
+                logs.iter().any(|l| l.contains("requested skip")),
+                "{name}: {logs:?}"
+            );
+            assert!(
+                !logs.iter().any(|l| l.contains("No repositories found")),
+                "{name}: {logs:?}"
+            );
+            assert!(
+                !logs.iter().any(|l| l.contains("FAILED")),
+                "{name}: {logs:?}"
+            );
+        }
+    }
+
+    /// Guards the test above: the same setup does go red without the skip code.
+    #[test]
+    fn other_hook_exit_codes_are_still_failures() {
+        for (name, handler) in HANDLERS {
+            let mut h = harness("exit 3");
+            handler(&mut h.ctx);
+            let (_, errors) = drain(&h.ui_rx);
+            assert_eq!(errors.len(), 1, "{name}: {errors:?}");
+        }
+    }
+
+    /// With the hook passing, the probe runs inside the cycle: an unavailable
+    /// repo fails the backup step once and the later steps stay quiet.
+    #[test]
+    fn unavailable_repo_fails_the_cycle_once() {
+        let mut h = harness("exit 0");
+        handle_backup_all(&mut h.ctx, true);
+        let (logs, errors) = drain(&h.ui_rx);
+
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("repository not available")),
+            "{errors:?}"
+        );
+        assert!(logs.iter().any(|l| l.contains("drive not connected")));
+        assert_eq!(logs.iter().filter(|l| l.contains("FAILED")).count(), 1);
+    }
+
+    #[test]
+    fn log_backup_report_reports_skipped_sources() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let report = operations::BackupRunReport {
+            created: Vec::new(),
+            skipped: vec![operations::SkippedSource {
+                label: "src".to_string(),
+                reason: "not home".to_string(),
+            }],
+        };
+
+        log_backup_report(&tx, "nas", &report);
+
+        let (logs, _) = drain(&rx);
+        assert_eq!(logs, vec!["[nas] source src skipped: not home"]);
     }
 
     /// A config reload can rename or remove a repo between the scheduler firing

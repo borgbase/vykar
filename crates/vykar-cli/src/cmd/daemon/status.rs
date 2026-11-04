@@ -288,20 +288,29 @@ pub(crate) fn record_cycle_start(status: &SharedStatus) {
     };
 }
 
+/// `all_skipped` means every attempted repo was skipped by a hook, so the cycle
+/// produced no backups and must not read as `ok`.
+fn cycle_outcome(had_error: bool, had_partial: bool, all_skipped: bool) -> &'static str {
+    if had_error {
+        "errors"
+    } else if had_partial {
+        "partial"
+    } else if all_skipped {
+        "skipped"
+    } else {
+        "ok"
+    }
+}
+
 pub(crate) fn record_cycle_end(
     status: &SharedStatus,
     elapsed: Duration,
     had_error: bool,
     had_partial: bool,
+    all_skipped: bool,
 ) {
     let now: DateTime<Local> = Local::now();
-    let outcome = if had_error {
-        "errors"
-    } else if had_partial {
-        "partial"
-    } else {
-        "ok"
-    };
+    let outcome = cycle_outcome(had_error, had_partial, all_skipped);
     let mut s = status.write().expect("status lock poisoned");
     s.last_cycle.finished_at = Some(now.format("%Y-%m-%d %H:%M:%S").to_string());
     s.last_cycle.outcome = outcome.to_string();
@@ -323,6 +332,15 @@ mod tests {
             size: "0 B".to_string(),
             next_run: next_run.to_string(),
         }
+    }
+
+    #[test]
+    fn cycle_outcome_precedence() {
+        assert_eq!(cycle_outcome(true, true, true), "errors");
+        assert_eq!(cycle_outcome(true, false, false), "errors");
+        assert_eq!(cycle_outcome(false, true, true), "partial");
+        assert_eq!(cycle_outcome(false, false, true), "skipped");
+        assert_eq!(cycle_outcome(false, false, false), "ok");
     }
 
     #[test]

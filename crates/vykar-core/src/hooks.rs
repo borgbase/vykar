@@ -9,6 +9,11 @@ use vykar_types::error::{Result, VykarError};
 /// Default timeout for hook command execution (5 minutes).
 const HOOK_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Exit code a `before` hook uses to skip the action without reporting an error.
+/// Not 3 (vykar's own partial-success code, and curl's "URL malformed"); 75 is
+/// also what borgmatic uses for this.
+const HOOK_SKIP_EXIT_CODE: i32 = 75;
+
 /// Context passed to hook commands via environment variables and variable substitution.
 pub(crate) struct HookContext {
     pub command: String,
@@ -21,6 +26,16 @@ pub(crate) struct HookContext {
     /// to surface via events (GUI) or tracing (CLI). `log_hook_errors` always
     /// fires `tracing::warn!` AND pushes here so no warning is ever lost.
     pub(crate) warnings: Vec<String>,
+}
+
+/// How a lifecycle judges the action's result.
+pub(crate) enum Verdict {
+    /// Fire `after`.
+    Success,
+    /// Fire `failed`; the message becomes `{error}`.
+    Failed(String),
+    /// The action chose not to run: fire neither `after` nor `failed`.
+    Skipped,
 }
 
 /// Which hook lists a lifecycle runs.
@@ -89,10 +104,13 @@ fn run_repo_phase(global: &HooksConfig, repo: &HooksConfig, phase: &str, ctx: &m
 /// Run the full hook lifecycle around an action:
 ///
 /// 1. `before` hooks — failure skips the action, sets `ctx.error`, runs
-///    `failed` + `finally` and returns `Err`.
+///    `failed` + `finally` and returns `Err`. An exit with
+///    [`HOOK_SKIP_EXIT_CODE`] skips the remaining `before` hooks and the action,
+///    runs `finally` only, leaves `ctx.error` unset and returns
+///    `Err(VykarError::Skipped)`.
 /// 2. The action.
-/// 3. `failed` if `failure(&r)` returns `Some` (which also becomes `{error}`),
-///    otherwise `after`.
+/// 3. As judged by `verdict(&r)`: `after`, `failed` (with the message as
+///    `{error}`), or neither for [`Verdict::Skipped`].
 /// 4. `finally`, always.
 ///
 /// `after` / `failed` / `finally` failures are non-fatal: they are pushed to
@@ -102,26 +120,36 @@ pub(crate) fn run_lifecycle<R>(
     phases: HookPhases<'_>,
     ctx: &mut HookContext,
     action: impl FnOnce() -> R,
-    failure: impl FnOnce(&R) -> Option<String>,
+    verdict: impl FnOnce(&R) -> Verdict,
 ) -> Result<R> {
     if !HOOK_COMMANDS.contains(&ctx.command.as_str()) || phases.is_empty() {
         return Ok(action());
     }
 
-    if let Err(e) = phases.before(ctx) {
-        ctx.error = Some(e.to_string());
-        phases.after_or_failed(ctx, false);
-        phases.finally(ctx);
-        return Err(e);
+    match phases.before(ctx) {
+        Ok(()) => {}
+        Err(VykarError::Skipped(reason)) => {
+            tracing::info!("Skipping {}: {reason}", ctx.command);
+            phases.finally(ctx);
+            return Err(VykarError::Skipped(reason));
+        }
+        Err(e) => {
+            ctx.error = Some(e.to_string());
+            phases.after_or_failed(ctx, false);
+            phases.finally(ctx);
+            return Err(e);
+        }
     }
 
     let r = action();
-    let error = failure(&r);
-    let success = error.is_none();
-    if let Some(msg) = error {
-        ctx.error.get_or_insert(msg);
+    match verdict(&r) {
+        Verdict::Success => phases.after_or_failed(ctx, true),
+        Verdict::Failed(msg) => {
+            ctx.error.get_or_insert(msg);
+            phases.after_or_failed(ctx, false);
+        }
+        Verdict::Skipped => {}
     }
-    phases.after_or_failed(ctx, success);
     phases.finally(ctx);
     Ok(r)
 }
@@ -133,7 +161,12 @@ pub(crate) fn run_with_hooks<T>(
     ctx: &mut HookContext,
     action: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
-    run_lifecycle(HookPhases::Repo { global, repo }, ctx, action, err_string)?
+    run_lifecycle(
+        HookPhases::Repo { global, repo },
+        ctx,
+        action,
+        result_verdict,
+    )?
 }
 
 /// [`run_lifecycle`] with source-level hooks around a fallible action.
@@ -142,11 +175,15 @@ pub(crate) fn run_source_hooks<T>(
     ctx: &mut HookContext,
     action: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
-    run_lifecycle(HookPhases::Source(hooks), ctx, action, err_string)?
+    run_lifecycle(HookPhases::Source(hooks), ctx, action, result_verdict)?
 }
 
-fn err_string<T>(r: &Result<T>) -> Option<String> {
-    r.as_ref().err().map(ToString::to_string)
+fn result_verdict<T>(r: &Result<T>) -> Verdict {
+    match r {
+        Ok(_) => Verdict::Success,
+        Err(VykarError::Skipped(_)) => Verdict::Skipped,
+        Err(e) => Verdict::Failed(e.to_string()),
+    }
 }
 
 fn run_hook_list(cmds: &[String], ctx: &HookContext) -> Result<()> {
@@ -186,6 +223,12 @@ fn execute_hook_command(cmd: &str, ctx: &HookContext) -> Result<()> {
     // goes directly to the user's terminal (better UX than capturing).
     let status = shell::run_command_status_with_timeout(&mut child, HOOK_TIMEOUT)
         .map_err(|e| VykarError::Hook(format!("failed to execute hook '{cmd}': {e}")))?;
+
+    if status.code() == Some(HOOK_SKIP_EXIT_CODE) {
+        return Err(VykarError::Skipped(format!(
+            "hook '{cmd}' requested skip (exit {HOOK_SKIP_EXIT_CODE})"
+        )));
+    }
 
     if !status.success() {
         let code = status
@@ -250,7 +293,12 @@ fn source_paths_separator() -> &'static str {
 
 fn log_hook_errors(result: Result<()>, ctx: &mut HookContext) {
     if let Err(e) = result {
-        let msg = e.to_string();
+        let msg = match e {
+            VykarError::Skipped(reason) => {
+                format!("{reason}; ignored, skip is only honoured in before hooks")
+            }
+            e => e.to_string(),
+        };
         tracing::warn!("Hook warning: {msg}");
         ctx.warnings.push(msg);
     }
@@ -595,7 +643,13 @@ mod tests {
             },
             &mut ctx,
             || 2usize,
-            |n| (*n > 0).then(|| format!("check found {n} error(s)")),
+            |n| {
+                if *n > 0 {
+                    Verdict::Failed(format!("check found {n} error(s)"))
+                } else {
+                    Verdict::Success
+                }
+            },
         );
 
         assert_eq!(r.unwrap(), 2);
@@ -729,5 +783,177 @@ mod tests {
         assert!(!after_marker.exists());
         assert!(failed_marker.exists());
         assert!(finally_marker.exists());
+    }
+
+    // `exit 75` means the same in `sh` and PowerShell.
+    const CMD_SKIP: &str = "exit 75";
+
+    #[test]
+    fn test_before_skip_runs_only_finally() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("log");
+        let after = cmd_append(&log, "after");
+        let failed = cmd_append(&log, "failed");
+        let finally = cmd_append(&log, "finally:{error}:");
+
+        let global = hooks_from(&[
+            ("before", vec![CMD_SKIP]),
+            ("after", vec![after.as_str()]),
+            ("failed", vec![failed.as_str()]),
+            ("finally", vec![finally.as_str()]),
+        ]);
+        let repo = HooksConfig::default();
+        let mut ctx = make_ctx("backup");
+        let mut action_ran = false;
+
+        let result = run_with_hooks(&global, &repo, &mut ctx, || {
+            action_ran = true;
+            Ok(())
+        });
+
+        assert!(matches!(result, Err(VykarError::Skipped(_))));
+        assert!(!action_ran);
+        assert!(ctx.error.is_none());
+        assert!(ctx.warnings.is_empty());
+        let lines = read_lines(&log);
+        assert_eq!(lines.len(), 1, "only finally runs: {lines:?}");
+        assert!(lines[0].starts_with("finally:"), "{lines:?}");
+        assert!(!lines[0].contains("skip"), "{{error}} is empty: {lines:?}");
+    }
+
+    #[test]
+    fn test_before_skip_stops_later_before_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("log");
+        let same_list = cmd_append(&log, "same_list");
+        let later_key = cmd_append(&log, "later_key");
+
+        let global = hooks_from(&[
+            ("before", vec![CMD_SKIP, same_list.as_str()]),
+            ("before_backup", vec![later_key.as_str()]),
+        ]);
+        let repo = HooksConfig::default();
+        let mut ctx = make_ctx("backup");
+
+        let result = run_with_hooks(&global, &repo, &mut ctx, || Ok(()));
+
+        assert!(matches!(result, Err(VykarError::Skipped(_))));
+        assert!(read_lines(&log).is_empty());
+    }
+
+    #[test]
+    fn test_skip_outside_before_is_a_warning_with_a_note() {
+        for phase in ["after", "finally"] {
+            let global = hooks_from(&[(phase, vec![CMD_SKIP])]);
+            let repo = HooksConfig::default();
+            let mut ctx = make_ctx("backup");
+
+            let result = run_with_hooks(&global, &repo, &mut ctx, || Ok(42));
+
+            assert_eq!(result.unwrap(), 42, "{phase}");
+            assert_eq!(ctx.warnings.len(), 1, "{phase}");
+            assert!(ctx.warnings[0].contains("only honoured"), "{phase}");
+        }
+
+        let global = hooks_from(&[("failed", vec![CMD_SKIP])]);
+        let repo = HooksConfig::default();
+        let mut ctx = make_ctx("backup");
+
+        let result: Result<()> = run_with_hooks(&global, &repo, &mut ctx, || {
+            Err(VykarError::Other("boom".into()))
+        });
+
+        assert!(matches!(result, Err(VykarError::Other(_))));
+        assert_eq!(ctx.warnings.len(), 1);
+        assert!(ctx.warnings[0].contains("only honoured"));
+    }
+
+    #[test]
+    fn test_other_exit_codes_still_fail() {
+        for code in ["exit 3", "exit 74", "exit 76"] {
+            let dir = tempfile::tempdir().unwrap();
+            let marker = dir.path().join("failed_ran");
+            let failed = cmd_touch(&marker);
+            let global = hooks_from(&[("before", vec![code]), ("failed", vec![failed.as_str()])]);
+            let repo = HooksConfig::default();
+            let mut ctx = make_ctx("backup");
+
+            let result = run_with_hooks(&global, &repo, &mut ctx, || Ok(()));
+
+            assert!(matches!(result, Err(VykarError::Hook(_))), "{code}");
+            assert!(marker.exists(), "{code} fires failed hooks");
+            assert!(ctx.error.is_some(), "{code}");
+        }
+    }
+
+    #[test]
+    fn test_action_skip_fires_only_finally() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("log");
+        let after = cmd_append(&log, "after");
+        let failed = cmd_append(&log, "failed");
+        let finally = cmd_append(&log, "finally");
+
+        let global = hooks_from(&[
+            ("after", vec![after.as_str()]),
+            ("failed", vec![failed.as_str()]),
+            ("finally", vec![finally.as_str()]),
+        ]);
+        let repo = HooksConfig::default();
+        let mut ctx = make_ctx("backup");
+
+        let result: Result<()> = run_with_hooks(&global, &repo, &mut ctx, || {
+            Err(VykarError::Skipped("nothing to do".into()))
+        });
+
+        assert!(matches!(result, Err(VykarError::Skipped(_))));
+        assert!(ctx.error.is_none());
+        assert_eq!(read_lines(&log), vec!["finally"]);
+    }
+
+    #[test]
+    fn test_source_before_skip_runs_only_finally() {
+        let dir = tempfile::tempdir().unwrap();
+        let later_marker = dir.path().join("later_ran");
+        let after_marker = dir.path().join("after_ran");
+        let failed_marker = dir.path().join("failed_ran");
+        let finally_marker = dir.path().join("finally_ran");
+
+        let hooks = SourceHooksConfig {
+            before: vec![CMD_SKIP.to_string(), cmd_touch(&later_marker)],
+            after: vec![cmd_touch(&after_marker)],
+            failed: vec![cmd_touch(&failed_marker)],
+            finally: vec![cmd_touch(&finally_marker)],
+        };
+        let mut ctx = make_ctx("backup");
+        let mut action_ran = false;
+
+        let result = run_source_hooks(&hooks, &mut ctx, || {
+            action_ran = true;
+            Ok(())
+        });
+
+        assert!(matches!(result, Err(VykarError::Skipped(_))));
+        assert!(!action_ran);
+        assert!(!later_marker.exists());
+        assert!(!after_marker.exists());
+        assert!(!failed_marker.exists());
+        assert!(finally_marker.exists());
+        assert!(ctx.error.is_none());
+    }
+
+    #[test]
+    fn test_source_skip_outside_before_is_a_warning() {
+        let hooks = SourceHooksConfig {
+            after: vec![CMD_SKIP.to_string()],
+            ..Default::default()
+        };
+        let mut ctx = make_ctx("backup");
+
+        let result = run_source_hooks(&hooks, &mut ctx, || Ok(42));
+
+        assert_eq!(result.unwrap(), 42);
+        assert_eq!(ctx.warnings.len(), 1);
+        assert!(ctx.warnings[0].contains("only honoured"));
     }
 }

@@ -482,12 +482,13 @@ fn run_all_repos(cli: &Cli, repos: &[&ResolvedRepo], repo_explicitly_selected: b
 }
 
 /// Execute the CLI command (or default actions) against one repo.
-/// Returns `Ok(had_partial)` where `true` means backup had soft errors.
+/// Returns `Ok(had_partial)` where `true` means backup had soft errors. A skip
+/// requested by a hook is reported here and counts as success.
 fn run_repo_command(cli: &Cli, repo: &ResolvedRepo) -> CliResult<bool> {
     warn_if_untrusted_rest(&repo.config, repo.label.as_deref());
 
     let shutdown = Some(&signal::SHUTDOWN as &std::sync::atomic::AtomicBool);
-    match &cli.command {
+    let result = match &cli.command {
         Some(cmd) => {
             if matches!(cmd, Commands::Backup { .. }) {
                 // Backup: hooks handled by run_backup_selection in core
@@ -505,6 +506,14 @@ fn run_repo_command(cli: &Cli, repo: &ResolvedRepo) -> CliResult<bool> {
                     .map_err(CliError::from)
             }
         }
-        None => run_default_actions(repo, shutdown, cli.verbose, &cli.source),
+        None => run_default_actions(repo, shutdown, cli.verbose, &cli.source).map(|o| o.partial),
+    };
+
+    match result {
+        Err(CliError::Vykar(vykar_types::error::VykarError::Skipped(reason))) => {
+            eprintln!("Skipped: {reason}");
+            Ok(false)
+        }
+        other => other,
     }
 }

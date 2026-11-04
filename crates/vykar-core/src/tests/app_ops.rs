@@ -1,7 +1,12 @@
+use std::cell::Cell;
+
+use zeroize::Zeroizing;
+
 use crate::app::operations::{
-    run_backup_selection, run_hooked_step, CycleEvent, CycleStep, StepOutcome,
+    run_backup_selection, run_full_cycle_for_repo, run_full_cycle_with_passphrase_source,
+    run_hooked_step, CycleEvent, CycleStep, FullCycleResult, StepOutcome,
 };
-use crate::config::HooksConfig;
+use crate::config::{HooksConfig, ResolvedRepo, SourceHooksConfig};
 use crate::testutil::cmd_append;
 use vykar_types::error::VykarError;
 
@@ -173,4 +178,277 @@ fn hooked_step_before_failure_skips_action_and_warns_before_finish() {
             CycleEvent::StepFinished(CycleStep::Prune, StepOutcome::Failed(_)),
         ]
     ));
+}
+
+// ── Quiet hook skip (exit 75) ───────────────────────────────────────────────
+
+const CMD_SKIP: &str = "exit 75";
+
+fn hooks(pairs: &[(&str, &str)]) -> HooksConfig {
+    HooksConfig {
+        hooks: pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), vec![v.to_string()]))
+            .collect(),
+    }
+}
+
+/// A real local repo with one small source directory per label.
+fn local_repo(tmp: &tempfile::TempDir, labels: &[&str]) -> ResolvedRepo {
+    let repo_dir = tmp.path().join("repo");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    let config = init_repo(&repo_dir);
+    let sources = labels
+        .iter()
+        .map(|label| {
+            let dir = tmp.path().join(label);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("a.txt"), label.as_bytes()).unwrap();
+            source_entry(&dir, label)
+        })
+        .collect();
+    resolved_repo(config, sources)
+}
+
+fn run_cycle(repo: &ResolvedRepo) -> FullCycleResult {
+    run_full_cycle_for_repo(repo, None, None, false, &[], &mut |_| {})
+}
+
+fn outcome(result: &FullCycleResult, step: CycleStep) -> &StepOutcome {
+    &result
+        .steps
+        .iter()
+        .find(|(s, _)| *s == step)
+        .unwrap_or_else(|| panic!("no outcome for {}", step.command_name()))
+        .1
+}
+
+#[test]
+fn cycle_before_backup_skip_skips_every_step() {
+    let tmp = tempfile::tempdir().unwrap();
+    let log = tmp.path().join("log");
+    let mut repo = local_repo(&tmp, &["src"]);
+    let before_check = cmd_append(&log, "before_check");
+    repo.repo_hooks = hooks(&[
+        ("before_backup", CMD_SKIP),
+        ("before_check", before_check.as_str()),
+    ]);
+
+    let result = run_cycle(&repo);
+
+    assert_eq!(result.steps.len(), 4);
+    assert!(result
+        .steps
+        .iter()
+        .all(|(_, o)| matches!(o, StepOutcome::Skipped(_))));
+    assert!(!result.has_failures());
+    assert!(result.backup_skipped().is_some());
+    assert!(result.backup_report.is_none());
+    assert!(
+        log_lines(&log).is_empty(),
+        "skipped steps run no hooks either"
+    );
+}
+
+#[test]
+fn cycle_before_prune_skip_only_skips_prune() {
+    let tmp = tempfile::tempdir().unwrap();
+    let log = tmp.path().join("log");
+    let mut repo = local_repo(&tmp, &["src"]);
+    repo.config.retention.keep_last = Some(5);
+    let before_compact = cmd_append(&log, "before_compact");
+    let before_check = cmd_append(&log, "before_check");
+    repo.repo_hooks = hooks(&[
+        ("before_prune", CMD_SKIP),
+        ("before_compact", before_compact.as_str()),
+        ("before_check", before_check.as_str()),
+    ]);
+
+    let result = run_cycle(&repo);
+
+    assert!(matches!(
+        outcome(&result, CycleStep::Backup),
+        StepOutcome::Ok
+    ));
+    assert!(matches!(
+        outcome(&result, CycleStep::Prune),
+        StepOutcome::Skipped(reason) if reason.contains("requested skip")
+    ));
+    assert!(matches!(
+        outcome(&result, CycleStep::Compact),
+        StepOutcome::Ok
+    ));
+    assert!(!result.has_failures(), "{:?}", result.steps);
+    assert!(result.backup_skipped().is_none());
+    assert_eq!(log_lines(&log), vec!["before_compact", "before_check"]);
+}
+
+#[test]
+fn one_skipped_source_still_backs_up_the_other() {
+    let tmp = tempfile::tempdir().unwrap();
+    let log = tmp.path().join("log");
+    let mut repo = local_repo(&tmp, &["kept", "gated"]);
+    repo.sources[1].hooks = SourceHooksConfig {
+        before: vec![CMD_SKIP.to_string()],
+        ..Default::default()
+    };
+    let after = cmd_append(&log, "after");
+    let failed = cmd_append(&log, "failed");
+    repo.repo_hooks = hooks(&[("after", after.as_str()), ("failed", failed.as_str())]);
+
+    let report = run_backup_selection(&repo, &repo.sources, None, None, false, None).unwrap();
+
+    assert_eq!(report.created.len(), 1);
+    assert_eq!(report.created[0].source_label, "kept");
+    assert_eq!(report.skipped.len(), 1);
+    assert_eq!(report.skipped[0].label, "gated");
+    assert_eq!(log_lines(&log), vec!["after"]);
+}
+
+#[test]
+fn all_sources_skipped_is_a_repo_level_skip() {
+    let tmp = tempfile::tempdir().unwrap();
+    let log = tmp.path().join("log");
+    let mut repo = local_repo(&tmp, &["one", "two"]);
+    for source in &mut repo.sources {
+        source.hooks = SourceHooksConfig {
+            before: vec![CMD_SKIP.to_string()],
+            ..Default::default()
+        };
+    }
+    let after = cmd_append(&log, "after");
+    let failed = cmd_append(&log, "failed");
+    let finally = cmd_append(&log, "finally");
+    repo.repo_hooks = hooks(&[
+        ("after", after.as_str()),
+        ("failed", failed.as_str()),
+        ("finally", finally.as_str()),
+    ]);
+
+    let err = run_backup_selection(&repo, &repo.sources, None, None, false, None)
+        .err()
+        .unwrap();
+
+    match err {
+        VykarError::Skipped(reason) => {
+            assert!(
+                reason.contains("'one'") && reason.contains("'two'"),
+                "{reason}"
+            );
+        }
+        other => panic!("expected a skip, got {other}"),
+    }
+    assert_eq!(log_lines(&log), vec!["finally"]);
+}
+
+#[test]
+fn resolver_not_called_when_backup_is_skipped() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut repo = local_repo(&tmp, &["src"]);
+    repo.repo_hooks = hooks(&[("before_backup", CMD_SKIP)]);
+    let calls = Cell::new(0);
+
+    let result = run_full_cycle_with_passphrase_source(
+        &repo,
+        &mut || {
+            calls.set(calls.get() + 1);
+            Ok(None)
+        },
+        None,
+        false,
+        &[],
+        &mut |_| {},
+    );
+
+    assert_eq!(calls.get(), 0);
+    assert!(result.backup_skipped().is_some());
+}
+
+#[test]
+fn resolver_runs_once_after_before_hooks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let marker = tmp.path().join("before_ran");
+    let mut repo = local_repo(&tmp, &["src"]);
+    let before_cmd = crate::testutil::cmd_touch(&marker);
+    repo.repo_hooks = hooks(&[("before_backup", before_cmd.as_str())]);
+    let calls = Cell::new(0);
+
+    let result = run_full_cycle_with_passphrase_source(
+        &repo,
+        &mut || {
+            assert!(marker.exists(), "before hooks run first");
+            calls.set(calls.get() + 1);
+            Ok(None::<Zeroizing<String>>)
+        },
+        None,
+        false,
+        &[],
+        &mut |_| {},
+    );
+
+    assert!(!result.has_failures(), "{:?}", result.steps);
+    assert_eq!(calls.get(), 1, "memoized across backup, compact and check");
+}
+
+#[test]
+fn resolver_failure_is_reported_once_and_fires_failed_hooks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let log = tmp.path().join("log");
+    let mut repo = local_repo(&tmp, &["src"]);
+    let failed = cmd_append(&log, "failed");
+    let finally = cmd_append(&log, "finally");
+    repo.repo_hooks = hooks(&[("failed", failed.as_str()), ("finally", finally.as_str())]);
+    let calls = Cell::new(0);
+
+    let result = run_full_cycle_with_passphrase_source(
+        &repo,
+        &mut || {
+            calls.set(calls.get() + 1);
+            Err(VykarError::Other("no route to host".into()))
+        },
+        None,
+        false,
+        &[],
+        &mut |_| {},
+    );
+
+    assert_eq!(calls.get(), 1);
+    assert!(matches!(
+        outcome(&result, CycleStep::Backup),
+        StepOutcome::Failed(e) if e.contains("no route to host")
+    ));
+    assert!(matches!(
+        outcome(&result, CycleStep::Check),
+        StepOutcome::Skipped(_)
+    ));
+    assert!(result.has_failures());
+    assert_eq!(log_lines(&log), vec!["failed", "finally"]);
+}
+
+#[test]
+fn canceled_resolver_skips_the_cycle_without_failure() {
+    let tmp = tempfile::tempdir().unwrap();
+    let log = tmp.path().join("log");
+    let mut repo = local_repo(&tmp, &["src"]);
+    let after = cmd_append(&log, "after");
+    let failed = cmd_append(&log, "failed");
+    let finally = cmd_append(&log, "finally");
+    repo.repo_hooks = hooks(&[
+        ("after", after.as_str()),
+        ("failed", failed.as_str()),
+        ("finally", finally.as_str()),
+    ]);
+
+    let result = run_full_cycle_with_passphrase_source(
+        &repo,
+        &mut || Err(VykarError::Skipped("passphrase prompt canceled".into())),
+        None,
+        false,
+        &[],
+        &mut |_| {},
+    );
+
+    assert!(!result.has_failures());
+    assert_eq!(result.backup_skipped(), Some("passphrase prompt canceled"));
+    assert_eq!(log_lines(&log), vec!["finally"]);
 }

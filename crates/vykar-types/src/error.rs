@@ -233,6 +233,12 @@ pub enum VykarError {
     #[error("hook error: {0}")]
     Hook(String),
 
+    /// The operation was deliberately not run, e.g. a `before` hook asked for a
+    /// skip or a passphrase prompt was dismissed. Not a failure: callers report
+    /// it without firing `failed` hooks or returning an error status.
+    #[error("skipped: {0}")]
+    Skipped(String),
+
     #[error("operation interrupted by signal")]
     Interrupted,
 

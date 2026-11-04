@@ -36,13 +36,20 @@ pub(crate) fn warn_if_untrusted_rest(config: &VykarConfig, label: Option<&str>) 
     }
 }
 
-/// Returns `Ok(had_partial)` — `true` if backup had soft errors but still succeeded.
+/// How a default-actions cycle ended, when no step failed.
+pub(crate) struct CycleOutcome {
+    /// Backup had soft errors but still succeeded.
+    pub partial: bool,
+    /// Why the backup step (and so the whole cycle) was skipped, if it was.
+    pub skipped: Option<String>,
+}
+
 pub(crate) fn run_default_actions(
     repo: &ResolvedRepo,
     shutdown: Option<&AtomicBool>,
     verbose: u8,
     source_filter: &[String],
-) -> CliResult<bool> {
+) -> CliResult<CycleOutcome> {
     let start = std::time::Instant::now();
     let label = repo.label.as_deref();
 
@@ -113,7 +120,10 @@ pub(crate) fn run_default_actions(
     if result.has_failures() {
         Err(CliError::from("one or more steps failed"))
     } else {
-        Ok(result.had_partial())
+        Ok(CycleOutcome {
+            partial: result.had_partial(),
+            skipped: result.backup_skipped().map(str::to_owned),
+        })
     }
 }
 
@@ -136,6 +146,9 @@ fn print_step_details(result: &FullCycleResult) {
                 );
             }
             print_backup_stats(stats);
+        }
+        for skipped in &report.skipped {
+            eprintln!("Skipped source '{}': {}", skipped.label, skipped.reason);
         }
     }
 

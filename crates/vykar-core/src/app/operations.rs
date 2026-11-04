@@ -11,6 +11,7 @@ use std::borrow::Cow;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use rand::Rng;
+use zeroize::Zeroizing;
 
 use crate::commands;
 use crate::compress::Compression;
@@ -31,9 +32,17 @@ pub struct BackupSourceResult {
     pub dataless_dirs_skipped: u64,
 }
 
+/// A source whose `before` hook asked for a skip.
+#[derive(Debug, Clone)]
+pub struct SkippedSource {
+    pub label: String,
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct BackupRunReport {
     pub created: Vec<BackupSourceResult>,
+    pub skipped: Vec<SkippedSource>,
 }
 
 // ── Hook-aware backup event types ─────────────────────────────────────────
@@ -140,6 +149,58 @@ impl FullCycleResult {
             .iter()
             .any(|(step, o)| matches!((step, o), (CycleStep::Backup, StepOutcome::Partial)))
     }
+
+    /// Why the backup step was skipped, if it was. Only a hook or a dismissed
+    /// passphrase prompt does this, and the rest of the cycle is skipped with it.
+    pub fn backup_skipped(&self) -> Option<&str> {
+        self.steps.iter().find_map(|(step, o)| match (step, o) {
+            (CycleStep::Backup, StepOutcome::Skipped(reason)) => Some(reason.as_str()),
+            _ => None,
+        })
+    }
+}
+
+/// Resolves a cycle's passphrase on first use, at most once, so that nothing
+/// (including a prompt or a connection) happens before the `before` hooks pass.
+struct LazyPassphrase<'a> {
+    resolve: &'a mut dyn FnMut() -> Result<Option<Zeroizing<String>>>,
+    state: PassphraseState,
+}
+
+enum PassphraseState {
+    Unresolved,
+    Resolved(Option<Zeroizing<String>>),
+    /// The error went to the step that asked first; `VykarError` is not `Clone`.
+    Failed,
+}
+
+impl<'a> LazyPassphrase<'a> {
+    fn new(resolve: &'a mut dyn FnMut() -> Result<Option<Zeroizing<String>>>) -> Self {
+        Self {
+            resolve,
+            state: PassphraseState::Unresolved,
+        }
+    }
+
+    fn failed(&self) -> bool {
+        matches!(self.state, PassphraseState::Failed)
+    }
+
+    fn get(&mut self) -> Result<Option<&str>> {
+        if matches!(self.state, PassphraseState::Unresolved) {
+            match (self.resolve)() {
+                Ok(pass) => self.state = PassphraseState::Resolved(pass),
+                Err(e) => {
+                    self.state = PassphraseState::Failed;
+                    return Err(e);
+                }
+            }
+        }
+        match &self.state {
+            PassphraseState::Resolved(pass) => Ok(pass.as_deref().map(String::as_str)),
+            _ => Err(VykarError::Other("passphrase unavailable".into())),
+        }
+    }
 }
 
 fn generate_snapshot_name() -> String {
@@ -201,7 +262,7 @@ fn run_backup_sources(
             }
         };
 
-        let outcome = if source.hooks.has_any() {
+        let result = if source.hooks.has_any() {
             let mut ctx = crate::hooks::HookContext {
                 command: "backup".to_string(),
                 repository: config.repository.url.clone(),
@@ -221,9 +282,21 @@ fn run_backup_sources(
             // Drain accumulated warnings into events (tracing already fired)
             drain_backup_warnings(&mut ctx, on_event, &scope);
 
-            result?
+            result
         } else {
-            run_backup(on_event)?
+            run_backup(on_event)
+        };
+
+        let outcome = match result {
+            Ok(outcome) => outcome,
+            Err(VykarError::Skipped(reason)) => {
+                report.skipped.push(SkippedSource {
+                    label: source.label.clone(),
+                    reason,
+                });
+                continue;
+            }
+            Err(e) => return Err(e),
         };
 
         report.created.push(BackupSourceResult {
@@ -234,6 +307,17 @@ fn run_backup_sources(
             dataless_files_skipped: outcome.dataless_files_skipped,
             dataless_dirs_skipped: outcome.dataless_dirs_skipped,
         });
+    }
+
+    // Nothing ran, so to the repo-level lifecycle this is a skip, not a success.
+    if report.created.is_empty() && !report.skipped.is_empty() {
+        let reasons = report
+            .skipped
+            .iter()
+            .map(|s| format!("source '{}': {}", s.label, s.reason))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(VykarError::Skipped(reasons));
     }
 
     Ok(report)
@@ -332,6 +416,30 @@ pub fn run_full_cycle_for_repo(
     source_filter: &[String],
     on_event: &mut dyn FnMut(CycleEvent),
 ) -> FullCycleResult {
+    run_full_cycle_with_passphrase_source(
+        repo,
+        &mut || Ok(passphrase.map(|p| Zeroizing::new(p.to_string()))),
+        shutdown,
+        verbose,
+        source_filter,
+        on_event,
+    )
+}
+
+/// [`run_full_cycle_for_repo`] for callers whose passphrase step is expensive or
+/// connects to the repository. `resolve` runs inside the first action that needs
+/// it, after that step's `before` hooks pass, and at most once per cycle: a
+/// failure is not retried. Returning `Err(VykarError::Skipped)` skips the step
+/// without reporting an error.
+pub fn run_full_cycle_with_passphrase_source(
+    repo: &ResolvedRepo,
+    resolve: &mut dyn FnMut() -> Result<Option<Zeroizing<String>>>,
+    shutdown: Option<&AtomicBool>,
+    verbose: bool,
+    source_filter: &[String],
+    on_event: &mut dyn FnMut(CycleEvent),
+) -> FullCycleResult {
+    let mut passphrase = LazyPassphrase::new(resolve);
     let config = &repo.config;
     let sources = &repo.sources;
     let shutting_down = |s: Option<&AtomicBool>| s.is_some_and(|f| f.load(Ordering::SeqCst));
@@ -361,7 +469,7 @@ pub fn run_full_cycle_for_repo(
                         run_backup_sources(
                             config,
                             &effective_sources,
-                            passphrase,
+                            passphrase.get()?,
                             repo.label.as_deref(),
                             shutdown,
                             verbose,
@@ -392,6 +500,13 @@ pub fn run_full_cycle_for_repo(
     let backup_ok = steps
         .iter()
         .any(|(s, o)| matches!(s, CycleStep::Backup) && o.is_success());
+    let backup_skipped = steps
+        .iter()
+        .any(|(s, o)| matches!((s, o), (CycleStep::Backup, StepOutcome::Skipped(_))));
+
+    // A skipped backup must not connect at all: the skip usually means the
+    // repository is unreachable, so the later steps would only produce errors.
+    let backup_skip_outcome = || StepOutcome::Skipped("backup skipped".into());
 
     // 2. Prune
     if !shutting_down(shutdown) {
@@ -400,7 +515,14 @@ pub fn run_full_cycle_for_repo(
                 .iter()
                 .any(|s| s.retention.as_ref().is_some_and(|r| r.has_any_rule()));
 
-        if !has_retention {
+        if backup_skipped {
+            emit_terminal(
+                CycleStep::Prune,
+                backup_skip_outcome(),
+                on_event,
+                &mut steps,
+            );
+        } else if !has_retention {
             emit_terminal(
                 CycleStep::Prune,
                 StepOutcome::Skipped("no retention rules".into()),
@@ -423,7 +545,7 @@ pub fn run_full_cycle_for_repo(
                 |evt| {
                     let stats = commands::prune::run(
                         config,
-                        passphrase,
+                        passphrase.get()?,
                         false,
                         false,
                         sources,
@@ -449,7 +571,14 @@ pub fn run_full_cycle_for_repo(
 
     // 3. Compact
     if !shutting_down(shutdown) {
-        if !backup_ok {
+        if backup_skipped {
+            emit_terminal(
+                CycleStep::Compact,
+                backup_skip_outcome(),
+                on_event,
+                &mut steps,
+            );
+        } else if !backup_ok {
             emit_terminal(
                 CycleStep::Compact,
                 StepOutcome::Skipped("backup failed".into()),
@@ -465,7 +594,7 @@ pub fn run_full_cycle_for_repo(
                 |_evt| {
                     commands::compact::run(
                         config,
-                        passphrase,
+                        passphrase.get()?,
                         config.compact.threshold,
                         None,
                         false,
@@ -480,39 +609,57 @@ pub fn run_full_cycle_for_repo(
     // 4. Check (metadata-only, with sampling support)
     if !shutting_down(shutdown) {
         let check_max_percent = config.check.max_percent;
-        check_result = run_hooked_step(
-            CycleStep::Check,
-            repo,
-            on_event,
-            &mut steps,
-            |evt| {
-                commands::check::run_with_progress(
-                    config,
-                    passphrase,
-                    false,
-                    false,
-                    Some(&mut |check_evt| evt(CycleEvent::Check(check_evt))),
-                    check_max_percent,
-                    true, // record_state: daemon/GUI updates the full_every timer
-                    shutdown,
-                )
-            },
-            |result| {
-                if result.skipped {
-                    let reason =
-                        if check_max_percent == 0 && config.check.full_every_duration().is_none() {
+        if backup_skipped {
+            emit_terminal(
+                CycleStep::Check,
+                backup_skip_outcome(),
+                on_event,
+                &mut steps,
+            );
+        } else if passphrase.failed() {
+            // The backup step already reported why; don't repeat the same error.
+            emit_terminal(
+                CycleStep::Check,
+                StepOutcome::Skipped("backup failed".into()),
+                on_event,
+                &mut steps,
+            );
+        } else {
+            check_result = run_hooked_step(
+                CycleStep::Check,
+                repo,
+                on_event,
+                &mut steps,
+                |evt| {
+                    commands::check::run_with_progress(
+                        config,
+                        passphrase.get()?,
+                        false,
+                        false,
+                        Some(&mut |check_evt| evt(CycleEvent::Check(check_evt))),
+                        check_max_percent,
+                        true, // record_state: daemon/GUI updates the full_every timer
+                        shutdown,
+                    )
+                },
+                |result| {
+                    if result.skipped {
+                        let reason = if check_max_percent == 0
+                            && config.check.full_every_duration().is_none()
+                        {
                             "check not configured"
                         } else {
                             "check not due"
                         };
-                    StepOutcome::Skipped(reason.into())
-                } else if result.errors.is_empty() {
-                    StepOutcome::Ok
-                } else {
-                    StepOutcome::Failed(format!("check found {} error(s)", result.errors.len()))
-                }
-            },
-        );
+                        StepOutcome::Skipped(reason.into())
+                    } else if result.errors.is_empty() {
+                        StepOutcome::Ok
+                    } else {
+                        StepOutcome::Failed(format!("check found {} error(s)", result.errors.len()))
+                    }
+                },
+            );
+        }
     }
 
     FullCycleResult {
@@ -525,7 +672,7 @@ pub fn run_full_cycle_for_repo(
 }
 
 /// Run a single cycle step with the full hook lifecycle.
-/// Returns Some(value) on success/partial, None on failure or before-hook abort.
+/// Returns Some(value) on success/partial, None on failure, skip or before-hook abort.
 pub(crate) fn run_hooked_step<T>(
     step: CycleStep,
     repo: &ResolvedRepo,
@@ -546,8 +693,9 @@ pub(crate) fn run_hooked_step<T>(
 
     on_event(CycleEvent::StepStarted(step));
 
-    // A classified failure (e.g. check with errors) fires `failed` hooks;
-    // Skipped and Partial count as success and fire `after`.
+    // A classified failure (e.g. check with errors) fires `failed` hooks. A step
+    // that ran and classified itself Skipped (check not due) or Partial counts as
+    // success and fires `after`; `Err(Skipped)` means it never ran and fires neither.
     let result = crate::hooks::run_lifecycle(
         crate::hooks::HookPhases::Repo {
             global: &repo.global_hooks,
@@ -556,13 +704,20 @@ pub(crate) fn run_hooked_step<T>(
         &mut ctx,
         || action(on_event).map(|v| (classify(&v), v)),
         |r| match r {
-            Err(e) => Some(e.to_string()),
-            Ok((o, _)) => o.error_msg().map(str::to_owned),
+            Err(VykarError::Skipped(_)) => crate::hooks::Verdict::Skipped,
+            Err(e) => crate::hooks::Verdict::Failed(e.to_string()),
+            Ok((o, _)) => match o.error_msg() {
+                Some(msg) => crate::hooks::Verdict::Failed(msg.to_owned()),
+                None => crate::hooks::Verdict::Success,
+            },
         },
     );
     drain_cycle_warnings(&mut ctx, step, on_event);
 
     let (outcome, value) = match result {
+        Err(VykarError::Skipped(reason)) | Ok(Err(VykarError::Skipped(reason))) => {
+            (StepOutcome::Skipped(reason), None)
+        }
         Err(e) | Ok(Err(e)) => (StepOutcome::Failed(e.to_string()), None),
         Ok(Ok((o, v))) => (o, Some(v)),
     };

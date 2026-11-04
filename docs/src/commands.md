@@ -32,3 +32,5 @@ Below is a list of all available commands. Each command and subcommand provides 
 - `3`: Partial success (backup completed, but one or more files were skipped)
 
 `vykar backup` and the default `vykar` workflow can return `3` when a backup succeeds with skipped unreadable/missing files.
+
+A `before` hook that exits `75` [skips the run](configuration.md#skipping-a-run), and that exits `0`. So `vykar backup && ping` reports success with no new snapshot; for monitoring, ping from an `after_backup` hook instead.

@@ -75,7 +75,7 @@ What the page shows:
 - Per-repository snapshot count, last snapshot time, total stored size, and that repository's own next run (`Off` when its schedule is disabled)
 - The 10 most recent snapshots across all repositories
 - Configured sources and their target repositories
-- Last cycle: started/finished timestamps, duration, outcome (`ok` / `partial` / `errors`)
+- Last cycle: started/finished timestamps, duration, outcome (`ok` / `partial` / `errors` / `skipped`). `skipped` means every attempted repository was [skipped by a hook](configuration.md#skipping-a-run)
 
 The page auto-refreshes every 30 seconds via a `<meta http-equiv="refresh">` tag — no JavaScript, no external assets, no cache. Data is refreshed at process startup, after every backup cycle, and after a SIGHUP reload.
 

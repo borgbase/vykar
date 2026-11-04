@@ -338,6 +338,8 @@ fn run_backup_cycle(due: &[&ResolvedRepo], all: &[ResolvedRepo], status: &Shared
     let cycle_start = Instant::now();
     let mut had_error = false;
     let mut had_partial = false;
+    let mut attempted = 0usize;
+    let mut skipped = 0usize;
 
     let multi = all.len() > 1;
 
@@ -366,11 +368,16 @@ fn run_backup_cycle(due: &[&ResolvedRepo], all: &[ResolvedRepo], status: &Shared
 
         warn_if_untrusted_rest(&repo.config, repo.label.as_deref());
 
+        attempted += 1;
         match run_default_actions(repo, Some(&SHUTDOWN), 0, &[]) {
-            Ok(partial) => {
-                if partial {
+            Ok(outcome) => {
+                if outcome.partial {
                     tracing::warn!(repo = name, "backup cycle partial: some files were skipped");
                     had_partial = true;
+                }
+                if let Some(reason) = outcome.skipped {
+                    tracing::info!(repo = name, reason, "backup cycle skipped");
+                    skipped += 1;
                 }
             }
             Err(e) => {
@@ -381,15 +388,18 @@ fn run_backup_cycle(due: &[&ResolvedRepo], all: &[ResolvedRepo], status: &Shared
     }
 
     let elapsed = cycle_start.elapsed();
+    let all_skipped = attempted > 0 && skipped == attempted;
     if had_error {
         tracing::warn!(duration = ?elapsed, "backup cycle finished with errors");
     } else if had_partial {
         tracing::warn!(duration = ?elapsed, "backup cycle finished with partial success (some files skipped)");
+    } else if all_skipped {
+        tracing::info!(duration = ?elapsed, "backup cycle finished: every repository was skipped");
     } else {
         tracing::info!(duration = ?elapsed, "backup cycle finished successfully");
     }
 
-    status::record_cycle_end(status, elapsed, had_error, had_partial);
+    status::record_cycle_end(status, elapsed, had_error, had_partial, all_skipped);
     if !SHUTDOWN.load(Ordering::SeqCst) {
         status::refresh_repos(status, all);
     }

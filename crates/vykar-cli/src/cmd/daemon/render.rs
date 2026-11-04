@@ -52,6 +52,7 @@ header .meta { color: var(--muted); font-size: 0.85rem; }
 .outcome-ok { color: var(--ok); }
 .outcome-partial { color: var(--warn); }
 .outcome-errors { color: var(--err); }
+.outcome-skipped { color: var(--muted); }
 section { margin-bottom: 1.5rem; }
 section h2 { font-size: 0.9rem; text-transform: uppercase; letter-spacing: 0.05em;
   color: var(--muted); margin: 0 0 0.5rem; font-weight: 600; }
@@ -140,6 +141,7 @@ pub(crate) fn render_html(status: &DaemonStatus) -> String {
         "ok" => "outcome-ok",
         "partial" => "outcome-partial",
         "errors" => "outcome-errors",
+        "skipped" => "outcome-skipped",
         _ => "",
     };
 

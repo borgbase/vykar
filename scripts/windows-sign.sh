@@ -162,7 +162,7 @@ WX=$(xdotool getwindowgeometry --shell "$WINDOW_ID" 2>/dev/null | grep X= | cut 
 WY=$(xdotool getwindowgeometry --shell "$WINDOW_ID" 2>/dev/null | grep Y= | cut -d= -f2 || echo 0)
 WW=$(xdotool getwindowgeometry --shell "$WINDOW_ID" 2>/dev/null | grep WIDTH= | cut -d= -f2 || echo 800)
 WH=$(xdotool getwindowgeometry --shell "$WINDOW_ID" 2>/dev/null | grep HEIGHT= | cut -d= -f2 || echo 600)
-xdotool mousemove "$((WX + WW / 2))" "$((WY + WH * 30 / 100))"
+xdotool mousemove "$((WX + WW / 2))" "$((WY + WH * 55 / 100))"
 xdotool click 1
 sleep 0.5
 xdotool key ctrl+a

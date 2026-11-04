@@ -80,6 +80,7 @@ impl S3Backend {
             .max_idle_connections_per_host(pool)
             .max_idle_connections(pool)
             .max_idle_age(crate::HTTP_IDLE_AGE)
+            .tls_config(crate::http_tls_config())
             .build()
             .into();
 

@@ -34,7 +34,7 @@ percent-encoding = "2"
 
 # HTTP client (S3 + REST backends)
 rusty-s3 = "0.11"
-ureq = { workspace = true, features = ["json"] }
+ureq = { workspace = true, features = ["json", "platform-verifier"] }
 http = "1"
 
 # Parse S3 multipart completion responses. Standalone direct dep: rusty-s3 uses

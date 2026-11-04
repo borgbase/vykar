@@ -390,6 +390,18 @@ pub(crate) fn http_idle_pool_size(max_connections: Option<usize>) -> usize {
 /// ureq's 15s default expires connections between phases of a backup.
 pub(crate) const HTTP_IDLE_AGE: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// TLS settings for the REST and S3 agents.
+///
+/// Repositories are often self-hosted behind an internal CA, so verify against
+/// the OS trust store rather than ureq's bundled Mozilla roots. There is no
+/// fallback to those roots: a Linux host with no CA bundle fails with a clear
+/// error instead of quietly trusting a different set of authorities.
+pub(crate) fn http_tls_config() -> ureq::tls::TlsConfig {
+    ureq::tls::TlsConfig::builder()
+        .root_certs(ureq::tls::RootCerts::PlatformVerifier)
+        .build()
+}
+
 // HTTP phase timeouts for REST and S3. ureq leaves request-header writes and
 // the wait for response headers unbounded by default, so a pooled connection
 // whose peer silently vanished would block forever. These values aim for
@@ -531,6 +543,14 @@ pub fn backend_from_config(cfg: &StorageConfig) -> Result<Box<dyn StorageBackend
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn http_tls_uses_platform_verifier() {
+        assert!(matches!(
+            http_tls_config().root_certs(),
+            ureq::tls::RootCerts::PlatformVerifier
+        ));
+    }
 
     #[test]
     fn idle_pool_covers_listing_concurrency() {

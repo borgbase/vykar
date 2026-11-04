@@ -26,6 +26,14 @@ repositories:
 
 Use plaintext HTTP only on trusted local/dev networks.
 
+### TLS certificates
+
+REST and S3 connections verify server certificates against the operating system's trust store, so a private CA that your OS already trusts works without extra configuration.
+
+- **macOS and Windows:** verification uses the OS certificate APIs, including any revocation checks they perform.
+- **Linux:** certificates are loaded from the system CA bundle. Install your distribution's `ca-certificates` package; minimal containers often omit it. Without a bundle, HTTPS connections fail, including those to public endpoints, with `No CA certificates were loaded from the system`.
+- **Custom bundle on Linux:** set `SSL_CERT_FILE` to a PEM file, or `SSL_CERT_DIR` to a directory of certificates.
+
 ## Local filesystem
 
 Store backups on a local or mounted disk. No extra configuration needed.

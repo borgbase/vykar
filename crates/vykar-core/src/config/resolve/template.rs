@@ -63,4 +63,31 @@ mod tests {
         let result = resolve_document(raw).unwrap();
         assert!(result.is_empty(), "expected empty vec for template config");
     }
+
+    /// Uncommenting a section header but not its children leaves a YAML null.
+    /// Existing configs rely on that meaning "use the defaults", and serde-saphyr
+    /// 2.x rejects it, so this guards any future bump.
+    #[test]
+    fn test_blank_sections_parse_as_defaults() {
+        let yaml = "\
+repositories:
+  # - url: /path/to/repo
+sources:
+  # - /path/to/source
+encryption:
+  # passphrase: secret
+retention:
+  # keep_daily: 7
+compression:
+schedule:
+limits:
+compact:
+check:
+hooks:
+xattrs:
+";
+        let parsed: Result<RawConfig, _> = crate::config::yaml::from_str(yaml);
+        assert!(parsed.is_ok(), "blank sections: {:?}", parsed.err());
+        assert!(resolve_document(parsed.unwrap()).unwrap().is_empty());
+    }
 }

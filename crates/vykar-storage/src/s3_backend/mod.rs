@@ -336,7 +336,7 @@ impl StorageBackend for S3Backend {
                             .as_reader()
                             .read_to_end(&mut body)
                             .map_err(HttpRetryError::BodyIo)?;
-                        // rusty-s3 0.10 (instant-xml) parses from &str.
+                        // rusty-s3 (instant-xml) parses from &str.
                         let body = std::str::from_utf8(&body).map_err(|e| {
                             HttpRetryError::Permanent(format!(
                                 "S3 LIST {prefix}: response was not valid UTF-8: {e}"
@@ -352,9 +352,10 @@ impl StorageBackend for S3Backend {
                 .map_err(|e| s3_error("LIST", prefix, e))?;
 
             for obj in &parsed.contents {
-                // rusty_s3 sends encoding-type=url; some S3-compatible backends
-                // (e.g. Garage) URL-encode keys in the response. Decode here —
-                // for backends that don't encode, this is a no-op.
+                // rusty_s3 sends encoding-type=url and decodes the keys itself when
+                // the response echoes EncodingType. This covers backends (e.g.
+                // Garage) that encode keys without echoing it; vykar's own keys
+                // contain no `%`, so it is a no-op for already-decoded ones.
                 let key = percent_decode_str(&obj.key)
                     .decode_utf8()
                     .map_err(|e| VykarError::Other(format!("S3 LIST: invalid UTF-8 in key: {e}")))?
@@ -364,7 +365,9 @@ impl StorageBackend for S3Backend {
                     continue;
                 }
                 // Skip zero-byte tombstones (soft-deleted objects).
-                if self.soft_delete && obj.size == 0 {
+                // rusty-s3 reports Size as optional; only a known zero is a tombstone,
+                // so a server omitting Size can never hide a live key.
+                if self.soft_delete && obj.size == Some(0) {
                     continue;
                 }
                 // Strip root prefix to return relative keys
@@ -709,6 +712,13 @@ mod tests {
         }
         xml.push_str("  <EncodingType>url</EncodingType>\n</ListBucketResult>");
         xml
+    }
+
+    fn http_ok(body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
     }
 
     // ── 1. s3_check_status via GET ──────────────────────────────────
@@ -1088,6 +1098,143 @@ mod tests {
         let keys = backend.list("snapshots/").unwrap();
         assert_eq!(keys, vec!["snapshots/live"]);
         handle.join().unwrap();
+    }
+
+    /// A soft-delete tombstone is a *known* zero size. rusty-s3 0.11 made Size
+    /// optional, and a server omitting it must not hide a live key.
+    #[test]
+    fn list_soft_delete_keeps_key_with_missing_size() {
+        let xml = list_xml(&[("snapshots/tomb", 0), ("snapshots/nosize", 100)], None)
+            .replace("<Size>100</Size>", "");
+        assert!(
+            !xml.contains("<Size>100"),
+            "fixture should drop Size: {xml}"
+        );
+        let resp = http_ok(&xml);
+        let (port, handle) = mock_server(&resp);
+        let backend = s3_backend(port, no_retry(), true);
+        let keys = backend.list("snapshots/").unwrap();
+        assert_eq!(keys, vec!["snapshots/nosize"]);
+        handle.join().unwrap();
+    }
+
+    /// AWS/MinIO form-encode: a literal `+` arrives as `%2B`, a space as `+`.
+    /// Our own decode runs after rusty-s3's, so check the two don't compound.
+    #[test]
+    fn list_decodes_form_encoded_keys_once() {
+        let xml = list_xml(&[("snapshots/a%2Bb", 100), ("snapshots/c+d", 100)], None);
+        let resp = http_ok(&xml);
+        let (port, handle) = mock_server(&resp);
+        let backend = s3_backend(port, no_retry(), false);
+        let keys = backend.list("snapshots/").unwrap();
+        assert_eq!(keys, vec!["snapshots/a+b", "snapshots/c d"]);
+        handle.join().unwrap();
+    }
+
+    /// A root containing `+` or a space keeps its length through decoding, so
+    /// stripping it by byte count still yields the relative key.
+    #[test]
+    fn list_with_root_containing_plus_strips_prefix() {
+        let xml = list_xml(&[("back%2Bups/snapshots/abc", 100)], None);
+        let resp = http_ok(&xml);
+        let (port, handle) = mock_server(&resp);
+        let backend = S3Backend::new(
+            "test-bucket",
+            "us-east-1",
+            "back+ups",
+            &format!("http://127.0.0.1:{port}"),
+            "AKID",
+            "SECRET",
+            no_retry(),
+            false,
+            None,
+        )
+        .unwrap();
+        let keys = backend.list("snapshots/").unwrap();
+        assert_eq!(keys, vec!["snapshots/abc"]);
+        handle.join().unwrap();
+    }
+
+    /// A truncated page may be empty; only IsTruncated=false ends the listing.
+    #[test]
+    fn list_follows_token_through_empty_page() {
+        let xml1 = list_xml(&[("snapshots/abc", 100)], Some("tok1"));
+        let xml2 = list_xml(&[], Some("tok2"));
+        let xml3 = list_xml(&[("snapshots/def", 200)], None);
+        let (port, captured, handle) =
+            mock_server_capture_multi(vec![http_ok(&xml1), http_ok(&xml2), http_ok(&xml3)]);
+        let backend = s3_backend(port, no_retry(), false);
+        let keys = backend.list("snapshots/").unwrap();
+        assert_eq!(keys, vec!["snapshots/abc", "snapshots/def"]);
+        assert_eq!(captured.lock().unwrap().len(), 3);
+        handle.join().unwrap();
+    }
+
+    /// Stopping here would silently under-report keys, which is how a backup
+    /// tool loses track of data. It has to be an error.
+    #[test]
+    fn list_truncated_without_token_is_an_error() {
+        let xml = list_xml(&[("snapshots/abc", 100)], None).replace(
+            "<IsTruncated>false</IsTruncated>",
+            "<IsTruncated>true</IsTruncated>",
+        );
+        let resp = http_ok(&xml);
+        let (port, handle) = mock_server(&resp);
+        let backend = s3_backend(port, no_retry(), false);
+        let err = backend.list("snapshots/").unwrap_err().to_string();
+        assert!(err.contains("failed to parse response"), "got: {err}");
+        handle.join().unwrap();
+    }
+
+    /// A token alongside IsTruncated=false must not start another request: the
+    /// mock accepts one connection, so a second page would fail the listing.
+    #[test]
+    fn list_complete_page_ignores_stray_token() {
+        let xml = list_xml(&[("snapshots/abc", 100)], Some("stale")).replace(
+            "<IsTruncated>true</IsTruncated>",
+            "<IsTruncated>false</IsTruncated>",
+        );
+        let resp = http_ok(&xml);
+        let (port, handle) = mock_server(&resp);
+        let backend = s3_backend(port, no_retry(), false);
+        let keys = backend.list("snapshots/").unwrap();
+        assert_eq!(keys, vec!["snapshots/abc"]);
+        handle.join().unwrap();
+    }
+
+    /// Servers that omit IsTruncated still paginate on the token alone.
+    #[test]
+    fn list_follows_token_when_is_truncated_absent() {
+        let xml1 = list_xml(&[("snapshots/abc", 100)], Some("tok1"))
+            .replace("<IsTruncated>true</IsTruncated>\n", "");
+        let xml2 = list_xml(&[("snapshots/def", 200)], None)
+            .replace("<IsTruncated>false</IsTruncated>\n", "");
+        assert!(!xml1.contains("IsTruncated") && !xml2.contains("IsTruncated"));
+        let (port, handle) = mock_server_multi(vec![http_ok(&xml1), http_ok(&xml2)]);
+        let backend = s3_backend(port, no_retry(), false);
+        let keys = backend.list("snapshots/").unwrap();
+        assert_eq!(keys, vec!["snapshots/abc", "snapshots/def"]);
+        handle.join().unwrap();
+    }
+
+    /// The endpoint is always scheme://host[:port], so path-style URLs must stay
+    /// `/<bucket>/<key>`, and the signed `host` must include a non-default port.
+    #[test]
+    fn signed_url_is_path_style_with_host_signed() {
+        let backend = s3_backend(9000, no_retry(), false);
+        let url = backend
+            .bucket
+            .get_object(Some(&backend.credentials), "packs/ab/cd")
+            .sign(PRESIGN_DURATION);
+        assert_eq!(url.host_str(), Some("127.0.0.1"));
+        assert_eq!(url.port(), Some(9000));
+        assert_eq!(url.path(), "/test-bucket/packs/ab/cd");
+        assert!(
+            url.query()
+                .unwrap_or_default()
+                .contains("X-Amz-SignedHeaders=host"),
+            "got: {url}"
+        );
     }
 
     // ── 6. PUT / DELETE status ──────────────────────────────────────

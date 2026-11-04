@@ -33,13 +33,12 @@ url = "2"
 percent-encoding = "2"
 
 # HTTP client (S3 + REST backends)
-rusty-s3 = "0.10.0"
+rusty-s3 = "0.11"
 ureq = { workspace = true, features = ["json"] }
 http = "1"
 
-# Parse S3 multipart completion responses. Standalone direct dep: rusty-s3 0.10
-# moved to instant-xml and no longer pulls quick-xml, so there is no duplicate
-# copy to match.
+# Parse S3 multipart completion responses. Standalone direct dep: rusty-s3 uses
+# instant-xml and does not pull quick-xml, so there is no duplicate copy to match.
 quick-xml = { version = "0.42", features = ["serialize"] }
 
 # Logging
@@ -52,7 +51,7 @@ tempfile.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread"], optional = true }
 
 # SSH/SFTP
-russh = { version = "0.63", default-features = false, features = ["aws-lc-rs"], optional = true }
+russh = { version = "0.65.1", default-features = false, features = ["aws-lc-rs"], optional = true }
 russh-sftp = { version = "3.0", optional = true }
 
 [features]

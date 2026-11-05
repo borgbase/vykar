@@ -14,7 +14,7 @@ fn dummy_pack_id() -> PackId {
 #[test]
 fn new_index_is_empty() {
     let index = ChunkIndex::new();
-    assert!(index.is_empty());
+    assert_eq!(index.len(), 0);
     assert_eq!(index.len(), 0);
 }
 
@@ -70,7 +70,7 @@ fn decrement_to_zero_removes_entry() {
     let result = index.decrement(&id);
     assert_eq!(result, Some((0, 100)));
     assert!(!index.contains(&id));
-    assert!(index.is_empty());
+    assert_eq!(index.len(), 0);
 }
 
 #[test]

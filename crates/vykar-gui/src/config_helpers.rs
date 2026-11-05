@@ -208,7 +208,7 @@ mod tests {
         std::fs::write(&path, config::minimal_config_template()).unwrap();
 
         let repos = validate_config(&path).expect("empty config validates");
-        assert!(repos.is_empty());
+        assert_eq!(repos.len(), 0);
     }
 
     #[test]

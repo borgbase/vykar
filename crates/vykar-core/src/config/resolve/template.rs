@@ -61,7 +61,7 @@ mod tests {
         // With repositories commented out, resolve_document should return an empty vec.
         let raw = parsed.unwrap();
         let result = resolve_document(raw).unwrap();
-        assert!(result.is_empty(), "expected empty vec for template config");
+        assert_eq!(result.len(), 0, "expected empty vec for template config");
     }
 
     /// Uncommenting a section header but not its children leaves a YAML null.

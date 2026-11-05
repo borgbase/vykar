@@ -566,7 +566,7 @@ mod tests {
 
         let (applied, errors) =
             execute_repair(&mut repo, &plan, &scan.issues, &HashMap::new()).unwrap();
-        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(errors.len(), 0, "{errors:?}");
         assert!(applied
             .iter()
             .any(|a| matches!(a, RepairAction::RestoreKeyCopy { .. })));

@@ -64,13 +64,13 @@ fn check_verify_data_flag_controls_data_verification_counters() {
     backup_single_source(&config, &source_dir, "src-a", "snap-check-verify");
 
     let without_verify = commands::check::run(&config, None, false, false).unwrap();
-    assert!(without_verify.errors.is_empty());
+    assert_eq!(without_verify.errors.len(), 0);
     assert_eq!(without_verify.chunks_data_verified, 0);
     assert!(without_verify.chunks_existence_checked > 0);
     assert!(without_verify.packs_existence_checked > 0);
 
     let with_verify = commands::check::run(&config, None, true, false).unwrap();
-    assert!(with_verify.errors.is_empty());
+    assert_eq!(with_verify.errors.len(), 0);
     assert!(with_verify.chunks_data_verified > 0);
     assert!(with_verify.chunks_existence_checked > 0);
     assert!(with_verify.packs_existence_checked > 0);
@@ -111,7 +111,7 @@ fn sampled_check_preserves_local_fallback_counters() {
                 None,
             )
             .unwrap();
-            assert!(result.errors.is_empty());
+            assert_eq!(result.errors.len(), 0);
             assert_eq!(result.snapshots_checked, 1);
             assert_eq!(result.packs_existence_checked, packs.len().div_ceil(2));
             assert!(result.chunks_existence_checked > 0);
@@ -224,8 +224,8 @@ fn check_with_progress_emits_phase_events() {
         None,
     )
     .unwrap();
-    assert!(result.errors.is_empty());
-    assert!(!events.is_empty());
+    assert_eq!(result.errors.len(), 0);
+    assert_ne!(events.len(), 0);
     assert!(events.iter().any(|e| matches!(
         e,
         commands::check::CheckProgressEvent::SnapshotStarted { .. }
@@ -257,7 +257,7 @@ fn check_deduplicates_pack_existence_checks() {
     backup_single_source(&config, &source_dir, "src-dedup", "snap-dedup");
 
     let result = commands::check::run(&config, None, false, false).unwrap();
-    assert!(result.errors.is_empty());
+    assert_eq!(result.errors.len(), 0);
     assert!(result.chunks_existence_checked > 0);
     assert!(result.packs_existence_checked > 0);
     // Multiple chunks should share packs, so packs checked < chunks checked
@@ -386,7 +386,7 @@ fn test_process_verify_response_duplicate_keys() {
     );
     assert_eq!(result.packs_passed, 1);
     assert_eq!(result.chunks_verified, 5, "chunks counted only once");
-    assert!(errors.is_empty());
+    assert_eq!(errors.len(), 0);
 }
 
 #[test]
@@ -654,7 +654,7 @@ fn check_reports_items_affected_by_missing_pack() {
     for impact in &result.item_impacts {
         assert_eq!(impact.snapshot_id, snapshot_id);
         assert_eq!(impact.snapshot_name, "snap-impact");
-        assert!(!impact.affected_chunks.is_empty());
+        assert_ne!(impact.affected_chunks.len(), 0);
         // Every chunk in this impact must point at the deleted pack.
         for (_chunk_id, pack_id) in &impact.affected_chunks {
             assert_eq!(*pack_id, deleted_pack);
@@ -705,7 +705,7 @@ fn check_repair_dry_run_includes_item_impact() {
 
     let (deleted_pack, expected_items) = pick_data_only_pack(&repo_dir);
     std::fs::remove_file(repo_dir.join(deleted_pack.storage_key())).unwrap();
-    assert!(!expected_items.is_empty());
+    assert_ne!(expected_items.len(), 0);
 
     let result =
         commands::check::run_with_repair(&config, None, false, RepairMode::PlanOnly, None, None)
@@ -730,7 +730,7 @@ fn check_repair_dry_run_includes_item_impact() {
             .collect::<Vec<_>>()
     );
     // No repair was applied (PlanOnly mode).
-    assert!(result.applied.is_empty());
+    assert_eq!(result.applied.len(), 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -759,7 +759,7 @@ fn repair_drops_items_via_missing_pack_keeps_snapshot() {
     backup_single_source(&config, &source_dir, "src-drop", "snap-drop");
 
     let (deleted_pack, expected_items) = pick_data_only_pack(&repo_dir);
-    assert!(!expected_items.is_empty());
+    assert_ne!(expected_items.len(), 0);
     // Only run the test when *some* but not *all* items would be dropped —
     // otherwise the planner would correctly fall back to whole-snapshot.
     assert!(
@@ -903,7 +903,8 @@ fn repair_dry_run_emits_drop_items_from_snapshot() {
     backup_single_source(&config, &source_dir, "src-pln", "snap-pln");
 
     let (deleted_pack, expected_items) = pick_data_only_pack(&repo_dir);
-    assert!(!expected_items.is_empty() && expected_items.len() < 3);
+    assert_ne!(expected_items.len(), 0);
+    assert!(expected_items.len() < 3);
     std::fs::remove_file(repo_dir.join(deleted_pack.storage_key())).unwrap();
 
     let result =
@@ -939,7 +940,7 @@ fn repair_dry_run_emits_drop_items_from_snapshot() {
         }
     }
     // PlanOnly should not have applied anything.
-    assert!(result.applied.is_empty());
+    assert_eq!(result.applied.len(), 0);
 }
 
 /// Two snapshots reference distinct file data; dropping items from one must
@@ -970,7 +971,7 @@ fn repair_drops_items_rebuilds_refcounts() {
     backup_single_source(&config, &source_b, "src-b", "snap-b");
 
     let (deleted_pack, expected_items) = pick_data_only_pack(&repo_dir);
-    assert!(!expected_items.is_empty());
+    assert_ne!(expected_items.len(), 0);
     // Filter to the snapshot we actually want to mutate. The picker may pick
     // any data-only pack; require the affected items to all be in snap-a so
     // the test asserts hold.
@@ -1503,7 +1504,7 @@ fn interrupted_check_does_not_record_full_check() {
     let control =
         commands::check::run_with_progress(&config, None, false, false, None, 100, true, None)
             .unwrap();
-    assert!(control.errors.is_empty(), "control run must be clean");
+    assert_eq!(control.errors.len(), 0, "control run must be clean");
     assert_eq!(
         check_state_files(&control_cache).len(),
         1,

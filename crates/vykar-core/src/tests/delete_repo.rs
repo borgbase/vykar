@@ -18,7 +18,7 @@ fn delete_repo_removes_local_directory() {
 
     let stats = commands::delete_repo::run(&config).unwrap();
     assert!(stats.keys_deleted > 0);
-    assert!(stats.unknown_entries.is_empty());
+    assert_eq!(stats.unknown_entries.len(), 0);
     assert!(stats.root_removed);
     assert!(!repo_dir.exists());
 }
@@ -101,7 +101,7 @@ fn delete_repo_handles_partial_repo() {
     // delete_repo should still succeed because packs/snapshots/keys remain
     let stats = commands::delete_repo::run(&config).unwrap();
     assert!(stats.keys_deleted > 0, "should have deleted remaining keys");
-    assert!(stats.unknown_entries.is_empty());
+    assert_eq!(stats.unknown_entries.len(), 0);
     assert!(stats.root_removed, "repo dir should be fully removed");
     assert!(!repo_dir.exists());
 }
@@ -165,7 +165,7 @@ fn delete_repo_deletes_all_nested_keys() {
 
     let stats = commands::delete_repo::run(&config).unwrap();
     assert_eq!(stats.keys_deleted, all_keys_before.len() as u64);
-    assert!(stats.unknown_entries.is_empty());
+    assert_eq!(stats.unknown_entries.len(), 0);
     assert!(stats.root_removed);
     assert!(!repo_dir.exists());
 }

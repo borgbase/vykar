@@ -429,7 +429,7 @@ mod tests {
         let response = wrapped
             .server_verify_packs(&plan)
             .expect("verify forwarded");
-        assert!(response.results.is_empty());
+        assert_eq!(response.results.len(), 0);
         wrapped.server_init().expect("init forwarded");
 
         assert_eq!(verify_calls.load(Ordering::SeqCst), 1);

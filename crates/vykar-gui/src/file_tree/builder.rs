@@ -220,7 +220,7 @@ mod tests {
         assert_eq!(tree.roots.len(), 1);
         let root = &tree.arena[tree.roots[0]];
         assert_eq!(root.name, "adam");
-        assert!(root.item_paths.is_empty(), "root should be synthetic");
+        assert_eq!(root.item_paths.len(), 0, "root should be synthetic");
 
         let docs = find_node(&tree, "adam/Documents").unwrap();
         assert_eq!(docs.item_paths, vec!["Documents"]);
@@ -411,10 +411,10 @@ mod tests {
         assert!(root_names.contains(&"var"));
 
         let home = find_node(&tree, "home").unwrap();
-        assert!(home.item_paths.is_empty(), "home should be synthetic");
+        assert_eq!(home.item_paths.len(), 0, "home should be synthetic");
 
         let var = find_node(&tree, "var").unwrap();
-        assert!(var.item_paths.is_empty(), "var should be synthetic");
+        assert_eq!(var.item_paths.len(), 0, "var should be synthetic");
 
         let user = find_node(&tree, "home/user").unwrap();
         assert_eq!(user.item_paths, vec!["user"]);

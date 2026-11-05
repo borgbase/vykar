@@ -142,7 +142,7 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
 
         assert_eq!(json["ok"], true, "{json}");
-        assert!(json["errors"].as_array().unwrap().is_empty(), "{json}");
+        assert_eq!(json["errors"].as_array().unwrap().len(), 0, "{json}");
         assert_eq!(json["pack_count"], 1);
         assert_eq!(json["total_size"], pack_bytes.len() as u64);
         assert_eq!(json["temp_files"], 1);

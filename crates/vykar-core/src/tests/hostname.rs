@@ -45,6 +45,6 @@ fn backup_whitespace_hostname_falls_back_to_default() {
     let repo = helpers::open_local_repo(repo_dir.path());
     let entry = repo.manifest().find_snapshot("snap-ws").unwrap();
     // Should fall back to short_hostname(), not be whitespace
-    assert!(!entry.hostname.trim().is_empty());
+    assert_ne!(entry.hostname.trim(), "");
     assert!(!entry.hostname.contains('.') || entry.hostname == "unknown");
 }

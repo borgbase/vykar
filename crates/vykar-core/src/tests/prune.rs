@@ -98,7 +98,7 @@ fn empty_snapshots_returns_empty() {
         ..Default::default()
     };
     let results = apply_policy(&[], &policy, Utc::now()).unwrap();
-    assert!(results.is_empty());
+    assert_eq!(results.len(), 0);
 }
 
 fn snap_at(name: &str, time: DateTime<Utc>) -> SnapshotEntry {

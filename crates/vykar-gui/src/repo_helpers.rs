@@ -417,7 +417,7 @@ mod tests {
         );
         assert!(matches!(result, Err(VykarError::DecryptionFailed)));
         assert_eq!(calls.get(), 1, "configured passphrase is tried once");
-        assert!(cache.is_empty(), "failed passphrase must not be cached");
+        assert_eq!(cache.len(), 0, "failed passphrase must not be cached");
     }
 
     /// Regression guard for the retry loop's coupling to the error *type*.
@@ -617,7 +617,7 @@ mod tests {
             |_pass| unreachable!("f must not run when the prompt is dismissed"),
         );
         assert!(matches!(result, Ok(PassphraseRun::Canceled)));
-        assert!(cache.is_empty());
+        assert_eq!(cache.len(), 0);
     }
 
     #[test]
@@ -684,7 +684,7 @@ mod tests {
         );
         assert!(matches!(result, Err(VykarError::DecryptionFailed)));
         assert_eq!(calls.get(), 3, "should prompt exactly `attempts` times");
-        assert!(cache.is_empty());
+        assert_eq!(cache.len(), 0);
     }
 
     #[test]
@@ -704,6 +704,6 @@ mod tests {
             },
         );
         assert!(matches!(result, Ok(PassphraseRun::Ran("done"))));
-        assert!(cache.is_empty(), "None passphrase is never cached");
+        assert_eq!(cache.len(), 0, "None passphrase is never cached");
     }
 }

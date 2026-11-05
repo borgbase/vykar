@@ -1074,7 +1074,7 @@ mod tests {
 
     #[test]
     fn dataless_summary_silent_when_nothing_skipped() {
-        assert!(dataless_warnings(0, 0).is_empty());
+        assert_eq!(dataless_warnings(0, 0).len(), 0);
     }
 
     fn dataless_metadata(size: u64, mtime_ns: i64) -> fs::MetadataSummary {

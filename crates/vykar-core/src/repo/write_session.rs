@@ -104,6 +104,8 @@ pub(crate) struct WriteSessionState {
     pub(crate) pending_journal: PendingIndexJournal,
     /// Number of packs in journal when last written to storage (for debouncing).
     pub(crate) pending_journal_last_written: usize,
+    /// Journal revision last written successfully (`None` = never written).
+    pub(crate) pending_journal_written_rev: Option<u64>,
     /// Chunks recovered from a previous interrupted session's `pending_index`.
     pub(crate) recovered_chunks: StdHashMap<ChunkId, RecoveredChunkEntry>,
     /// `.index` keys to delete after successful commit.
@@ -143,6 +145,7 @@ impl WriteSessionState {
             index_delta: None,
             pending_journal: PendingIndexJournal::new(),
             pending_journal_last_written: 0,
+            pending_journal_written_rev: None,
             recovered_chunks: StdHashMap::new(),
             recovered_index_keys: Vec::new(), // only .index keys, never .json
             persisted_pack_count: 0,
@@ -198,8 +201,12 @@ impl WriteSessionState {
                 }
             }
         }
-        // Final flush of journal before returning (best-effort).
-        if !self.pending_journal.is_empty() {
+        // Final flush of journal before returning (best-effort). Skipped when
+        // unchanged since the last successful write, so a repeated flush
+        // (Phase 1 drain, then commit) does not PUT the journal twice.
+        if !self.pending_journal.is_empty()
+            && self.pending_journal_written_rev != Some(self.pending_journal.revision())
+        {
             self.write_pending_index_best_effort(storage, crypto);
         }
         match first_err {
@@ -259,6 +266,7 @@ impl WriteSessionState {
         match self.write_pending_index(storage, crypto) {
             Ok(()) => {
                 self.pending_journal_last_written = self.pending_journal.len();
+                self.pending_journal_written_rev = Some(self.pending_journal.revision());
             }
             Err(e) => {
                 warn!("failed to write pending_index: {e}");
@@ -993,5 +1001,147 @@ mod tests {
             "stale .json must not be deleted by cleanup"
         );
         assert!(ws.recovered_index_keys.is_empty(), "keys should be drained");
+    }
+
+    // ── Journal dirty guard ──────────────────────────────────────────────
+
+    /// Counts journal PUTs; optionally fails the next one.
+    struct JournalCountingBackend {
+        inner: MemoryBackend,
+        journal_puts: std::sync::atomic::AtomicUsize,
+        fail_next: std::sync::atomic::AtomicBool,
+    }
+
+    impl JournalCountingBackend {
+        fn new() -> Self {
+            Self {
+                inner: MemoryBackend::new(),
+                journal_puts: Default::default(),
+                fail_next: Default::default(),
+            }
+        }
+    }
+
+    impl vykar_storage::InnerBackend for JournalCountingBackend {
+        fn inner_backend(&self) -> &dyn StorageBackend {
+            &self.inner
+        }
+    }
+
+    vykar_storage::delegate_storage_backend! {
+        for JournalCountingBackend;
+        except [put];
+
+        fn put(&self, key: &str, data: &[u8]) -> Result<()> {
+            use std::sync::atomic::Ordering;
+            if key.ends_with(".index") {
+                if self.fail_next.swap(false, Ordering::SeqCst) {
+                    return Err(VykarError::Other("injected journal failure".into()));
+                }
+                self.journal_puts.fetch_add(1, Ordering::SeqCst);
+            }
+            self.inner.put(key, data)
+        }
+    }
+
+    fn journal_session() -> WriteSessionState {
+        init_test_environment();
+        let mut ws = WriteSessionState::new(1 << 20, 1 << 20, 2, HashAlgorithm::Blake2b);
+        ws.session_id = "s1".to_string();
+        ws
+    }
+
+    fn chunk(b: u8) -> Vec<PendingChunkEntry> {
+        vec![PendingChunkEntry {
+            chunk_id: ChunkId::from_bytes([b; 32]),
+            stored_size: 10,
+            pack_offset: 0,
+        }]
+    }
+
+    fn journal_puts(storage: &JournalCountingBackend) -> usize {
+        storage
+            .journal_puts
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn stored_pack_ids(storage: &dyn StorageBackend, crypto: &dyn CryptoEngine) -> Vec<PackId> {
+        let data = storage.get(&session_index_key("s1")).unwrap().unwrap();
+        let compressed = unpack_object_expect_with_context(
+            &data,
+            ObjectType::PendingIndex,
+            PENDING_INDEX_OBJECT_CONTEXT,
+            crypto,
+        )
+        .unwrap();
+        let serialized = compress::decompress_metadata(&compressed).unwrap();
+        let wire: Vec<PendingPackEntry> = rmp_serde::from_slice(&serialized).unwrap();
+        wire.into_iter().map(|e| e.pack_id).collect()
+    }
+
+    #[test]
+    fn wait_pending_uploads_skips_unchanged_journal() {
+        let storage = JournalCountingBackend::new();
+        let crypto = test_crypto();
+        let mut ws = journal_session();
+        ws.pending_journal
+            .record_pack(PackId::from_bytes([1; 32]), chunk(1));
+
+        ws.wait_pending_uploads(&storage, &crypto).unwrap();
+        ws.wait_pending_uploads(&storage, &crypto).unwrap();
+        assert_eq!(journal_puts(&storage), 1);
+    }
+
+    #[test]
+    fn wait_pending_uploads_retries_after_failed_journal_write() {
+        let storage = JournalCountingBackend::new();
+        let crypto = test_crypto();
+        let mut ws = journal_session();
+        ws.pending_journal
+            .record_pack(PackId::from_bytes([1; 32]), chunk(1));
+
+        storage
+            .fail_next
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        ws.wait_pending_uploads(&storage, &crypto).unwrap();
+        assert_eq!(journal_puts(&storage), 0);
+
+        ws.wait_pending_uploads(&storage, &crypto).unwrap();
+        assert_eq!(journal_puts(&storage), 1);
+    }
+
+    #[test]
+    fn wait_pending_uploads_rewrites_after_remove_and_record() {
+        let storage = JournalCountingBackend::new();
+        let crypto = test_crypto();
+        let mut ws = journal_session();
+        let a = PackId::from_bytes([1; 32]);
+        let b = PackId::from_bytes([2; 32]);
+        ws.pending_journal.record_pack(a, chunk(1));
+        ws.wait_pending_uploads(&storage, &crypto).unwrap();
+
+        // Same length, different content.
+        ws.pending_journal.remove_pack(&a);
+        ws.pending_journal.record_pack(b, chunk(2));
+        ws.wait_pending_uploads(&storage, &crypto).unwrap();
+
+        assert_eq!(journal_puts(&storage), 2);
+        assert_eq!(stored_pack_ids(&storage, &crypto), vec![b]);
+    }
+
+    #[test]
+    fn journal_revision_tracks_mutations() {
+        let mut j = PendingIndexJournal::new();
+        let r0 = j.revision();
+        j.record_pack(PackId::from_bytes([1; 32]), chunk(1));
+        let r1 = j.revision();
+        assert_ne!(r0, r1);
+        j.remove_pack(&PackId::from_bytes([1; 32]));
+        assert_ne!(r1, j.revision());
+
+        j.record_pack(PackId::from_bytes([3; 32]), chunk(3));
+        let back = PendingIndexJournal::from_wire(j.to_wire());
+        assert_eq!(back.len(), 1);
+        assert_eq!(back.to_wire()[0].pack_id, PackId::from_bytes([3; 32]));
     }
 }

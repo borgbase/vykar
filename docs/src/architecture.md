@@ -493,6 +493,10 @@ begin_write_session(session_id) → journal key = sessions/<session_id>.index
           (64 MiB × effective threads, clamped to 64 MiB..1 GiB)
       → sequential fallback path (effective worker threads == 1)
   → serialize items incrementally into item-stream chunks (tree packs)
+  → throughout: packs are sealed and uploaded in the background when a writer
+    reaches its target size, 10,000 blobs, or 300s age
+  → final flush (unconditional): seal partial pack writers, join all in-flight
+    uploads, write sessions/<id>.index
   → pack SnapshotMeta in memory (do not write snapshots/<id> yet)
 ```
 
@@ -508,9 +512,10 @@ flowchart LR
 ```
 
 ```text
-acquire_lock_with_retry(10 attempts, 500ms base, exponential backoff + jitter)
+acquire_lock_with_deadline(COMMIT_LOCK_MAX_WAIT = 10 min, 500ms base, exponential backoff + jitter,
+                           interruptible by Ctrl-C)
 commit_concurrent_session_with_progress():
-  → flush packs/pending uploads (pack flush triggers: target size, 10,000 blobs, or 300s age)
+  → flush packs (no-op safety net: Phase 1 already drained uploads)
   → refresh snapshot list from snapshots/ (via local snapshot cache diff)
   → check snapshot name uniqueness against fresh list
   → if delta is non-empty:
@@ -621,7 +626,7 @@ Each client owns a dedicated heartbeat thread (`SessionGuard` with a 15-minute t
 - **Recovery**: `vykar break-lock` forcibly removes stale lock objects when interrupted processes leave lock conflicts
 
 The advisory lock is used for:
-- **Backup commit phase**: acquired with `acquire_lock_with_retry` (10 attempts, 500 ms base delay, exponential backoff + 25 % jitter). Held only for the brief commit — typically seconds.
+- **Backup commit phase**: acquired with `acquire_lock_with_deadline`, which retries (500 ms base delay, exponential backoff + 25 % jitter) for up to `COMMIT_LOCK_MAX_WAIT` (10 minutes) and is interruptible by Ctrl-C. Waiters do not queue, so the bound is soft when several commits contend. The lock is held only for the brief commit — typically seconds, since all packs are uploaded before it is taken.
 - **Maintenance commands** (`delete`, `prune`, `compact`): acquired via `with_maintenance_lock()`, which additionally cleans stale session markers (>45 min since `last_refresh`) while preserving their companion `.index` journals so the next backup can recover uploaded-but-uncommitted chunks. Orphaned `.index` files from a *prior* cleanup run (marker already gone) are removed. Then maintenance checks for remaining active sessions — if any non-stale sessions exist (including malformed markers that cannot be proven stale), the lock is released and `VykarError::ActiveSessions` is returned, preventing compaction from deleting packs that upload-phase backups depend on.
 
 #### Command Summary

@@ -415,8 +415,24 @@ pub fn run(config: &VykarConfig, req: BackupRequest<'_>) -> Result<BackupOutcome
 pub fn run_with_progress(
     config: &VykarConfig,
     req: BackupRequest<'_>,
+    progress: Option<&mut dyn FnMut(BackupProgressEvent)>,
+    shutdown: Option<&AtomicBool>,
+) -> Result<BackupOutcome> {
+    run_impl(config, req, progress, shutdown, None)
+}
+
+/// Wraps the storage backend before the backup uses it (tests only).
+pub(crate) type BackendWrapper<'a> =
+    &'a dyn Fn(Box<dyn vykar_storage::StorageBackend>) -> Box<dyn vykar_storage::StorageBackend>;
+
+/// [`run_with_progress`] with an optional backend wrapper, so tests can
+/// observe or fault-inject storage traffic.
+pub(crate) fn run_impl(
+    config: &VykarConfig,
+    req: BackupRequest<'_>,
     mut progress: Option<&mut dyn FnMut(BackupProgressEvent)>,
     shutdown: Option<&AtomicBool>,
+    wrap_backend: Option<BackendWrapper<'_>>,
 ) -> Result<BackupOutcome> {
     let snapshot_name = req.snapshot_name;
     let passphrase = req.passphrase;
@@ -493,11 +509,18 @@ pub fn run_with_progress(
 
     let backend = storage::backend_from_config(&config.repository, upload_concurrency)?;
     let backend = limits::wrap_storage_backend(backend, &config.limits);
+    let backend = match wrap_backend {
+        Some(wrap) => wrap(backend),
+        None => backend,
+    };
 
     // Generate a unique session ID for this backup.
     let session_id = format!("{:032x}", rand::random::<u128>());
 
     // ── Phase 1: Register session and upload (no lock) ──────────────────
+    //
+    // Ends with all packs durable in storage (and recorded in the session's
+    // pending_index journal), so Phase 2 has no uploads left to wait for.
 
     // Register session marker and probe for maintenance lock.
     lock::register_session(backend.as_ref(), &session_id)?;
@@ -820,6 +843,17 @@ pub fn run_with_progress(
 
         flush_item_stream_chunk(&mut repo, &mut item_stream, &mut item_ptrs, compression)?;
 
+        // Seal partial packs and wait for every upload here, without the lock,
+        // so Phase 2 holds it only for the index/snapshot writes.
+        emit_progress(
+            &mut progress,
+            BackupProgressEvent::CommitStage {
+                stage: "upload packs",
+            },
+        );
+        repo.flush_packs()?;
+        check_interrupted(shutdown)?;
+
         let time_end = Utc::now();
 
         // Build snapshot metadata.
@@ -898,7 +932,20 @@ pub fn run_with_progress(
     // section (merges it into the persistent cache).
 
     let commit_result = (|| -> Result<()> {
-        let guard = lock::acquire_lock_with_retry(repo.storage.as_ref(), 10, 500)?;
+        let guard = lock::acquire_lock_with_deadline(
+            repo.storage.as_ref(),
+            lock::COMMIT_LOCK_MAX_WAIT,
+            500,
+            shutdown,
+            |_| {
+                emit_progress(
+                    &mut progress,
+                    BackupProgressEvent::CommitStage {
+                        stage: "waiting for commit lock",
+                    },
+                );
+            },
+        )?;
         let fence = lock::build_lock_fence(&guard, Arc::clone(&repo.storage));
         repo.set_lock_fence(fence);
 

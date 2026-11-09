@@ -272,6 +272,10 @@ pub struct PendingPackEntry {
 #[derive(Debug, Default)]
 pub struct PendingIndexJournal {
     packs: HashMap<PackId, PendingPackEntry>,
+    /// Bumped on every mutation; not serialized. Used to skip rewriting an
+    /// unchanged journal (length alone is not enough: removal + insertion
+    /// leaves it unchanged).
+    revision: u64,
 }
 
 impl PendingIndexJournal {
@@ -291,6 +295,12 @@ impl PendingIndexJournal {
     /// Remove a pack from the journal (used by dump rollback).
     pub fn remove_pack(&mut self, pack_id: &PackId) {
         self.packs.remove(pack_id);
+        self.revision += 1;
+    }
+
+    /// Mutation counter, for dirty tracking by journal writers.
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
 
     /// Record a pack and its chunk entries. Replaces any previous entry for
@@ -298,6 +308,7 @@ impl PendingIndexJournal {
     pub fn record_pack(&mut self, pack_id: PackId, chunks: Vec<PendingChunkEntry>) {
         self.packs
             .insert(pack_id, PendingPackEntry { pack_id, chunks });
+        self.revision += 1;
     }
 
     /// Serialize to the wire format (`Vec<PendingPackEntry>`).
@@ -308,7 +319,7 @@ impl PendingIndexJournal {
     /// Deserialize from the wire format.
     pub fn from_wire(entries: Vec<PendingPackEntry>) -> Self {
         let packs = entries.into_iter().map(|e| (e.pack_id, e)).collect();
-        Self { packs }
+        Self { packs, revision: 0 }
     }
 }
 

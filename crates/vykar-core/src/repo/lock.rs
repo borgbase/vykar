@@ -1,11 +1,11 @@
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::SystemTime;
 
 use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use vykar_storage::StorageBackend;
 use vykar_types::error::{LockHolder, LockHolderDetails, Result, VykarError};
@@ -724,6 +724,22 @@ pub fn clear_all_sessions(storage: &dyn StorageBackend) -> Result<usize> {
     Ok(removed)
 }
 
+/// Exponential backoff (cap 2^5 × base) with ±25 % jitter, minimum 100 ms.
+fn backoff_delay(attempt: usize, base_delay_ms: u64) -> u64 {
+    let delay = base_delay_ms * (1 << attempt.min(5));
+    let jitter = (rand::random::<u64>() % (delay / 2).max(1)).wrapping_sub(delay / 4);
+    delay.wrapping_add(jitter).max(100)
+}
+
+/// Compact holder description for log fields — `Display for LockHolder` is
+/// the user-facing sentence, too verbose for a log field.
+fn describe_holder(holder: &LockHolder) -> String {
+    holder.details.as_ref().map_or_else(
+        || holder.key.clone(),
+        |d| format!("{} (PID {}, held {})", d.hostname, d.pid, d.age),
+    )
+}
+
 /// Acquire a repo lock with retry and exponential backoff + jitter.
 /// Returns the lock guard on success, or the last error on failure.
 ///
@@ -740,20 +756,11 @@ pub fn acquire_lock_with_retry(
             Ok(guard) => return Ok(guard),
             Err(VykarError::Locked(holder)) => {
                 if attempt + 1 < max_attempts {
-                    let delay = base_delay_ms * (1 << attempt.min(5));
-                    // Add jitter: ±25%
-                    let jitter = (rand::random::<u64>() % (delay / 2)).wrapping_sub(delay / 4);
-                    let delay = delay.wrapping_add(jitter).max(100);
-                    // Log the holder compactly — `Display for LockHolder` is the
-                    // user-facing sentence, too verbose for a log field.
-                    let holder_desc = holder.details.as_ref().map_or_else(
-                        || holder.key.clone(),
-                        |d| format!("{} (PID {}, held {})", d.hostname, d.pid, d.age),
-                    );
+                    let delay = backoff_delay(attempt, base_delay_ms);
                     debug!(
                         attempt = attempt + 1,
                         max_attempts,
-                        holder = %holder_desc,
+                        holder = %describe_holder(&holder),
                         delay_ms = delay,
                         "lock contention, retrying"
                     );
@@ -770,6 +777,94 @@ pub fn acquire_lock_with_retry(
     Err(VykarError::Other(
         "acquire_lock_with_retry called with max_attempts == 0".to_string(),
     ))
+}
+
+/// How long a backup commit waits for the repository lock.
+///
+/// While our session marker exists, maintenance cannot hold the lock for long
+/// (`with_maintenance_lock` refuses on active sessions), so legitimate holders
+/// are other backups' commits, which are short because packs are uploaded
+/// before the lock is taken. A crashed holder's lock is only reaped after 6 h,
+/// so waiting longer than this would mostly be waiting on a dead process.
+pub const COMMIT_LOCK_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// Longest single sleep between `shutdown` checks.
+const LOCK_WAIT_SLICE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Acquire a repo lock, retrying with backoff until `max_wait` has elapsed.
+///
+/// `shutdown` is checked before every attempt (including the first) and
+/// during sleeps; when set, returns `Interrupted`. After the deadline one
+/// final attempt is always made, so this never gives up early.
+///
+/// `on_contended` is called once, on the first `Locked` result. The holder it
+/// receives is a hint: `acquire_lock` writes its own key before listing, so the
+/// oldest key seen may be another waiter's transient probe rather than the
+/// actual holder.
+///
+/// Caveats:
+/// - The deadline bounds waiting, not storage calls: a slow `acquire_lock`
+///   round-trip (stale-lock sweep + PUT + LIST + DELETE) can overrun it.
+/// - No fairness: each attempt uses a fresh timestamped key, so waiters do not
+///   queue and a later arrival can win. With several commits queued the
+///   deadline is a soft bound.
+///
+/// Blocks the calling thread; see [`acquire_lock_with_retry`] for async callers.
+pub fn acquire_lock_with_deadline(
+    storage: &dyn StorageBackend,
+    max_wait: std::time::Duration,
+    base_delay_ms: u64,
+    shutdown: Option<&AtomicBool>,
+    mut on_contended: impl FnMut(&LockHolder),
+) -> Result<LockGuard> {
+    let interrupted = || shutdown.is_some_and(|f| f.load(Ordering::Relaxed));
+    let start = std::time::Instant::now();
+    let deadline = start + max_wait;
+    let mut attempt: usize = 0;
+    loop {
+        if interrupted() {
+            return Err(VykarError::Interrupted);
+        }
+        let holder = match acquire_lock(storage) {
+            Ok(guard) => return Ok(guard),
+            Err(VykarError::Locked(holder)) => holder,
+            Err(e) => return Err(e),
+        };
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return Err(VykarError::Locked(holder));
+        }
+        let delay = std::time::Duration::from_millis(backoff_delay(attempt, base_delay_ms))
+            .min(deadline - now);
+        if attempt == 0 {
+            info!(
+                oldest_key_from = %describe_holder(&holder),
+                max_wait_secs = max_wait.as_secs(),
+                "lock contended; waiting"
+            );
+            on_contended(&holder);
+        } else {
+            debug!(
+                attempt = attempt + 1,
+                oldest_key_from = %describe_holder(&holder),
+                delay_ms = delay.as_millis() as u64,
+                waited_ms = now.duration_since(start).as_millis() as u64,
+                "lock still contended, retrying"
+            );
+        }
+        let wake = now + delay;
+        loop {
+            let now = std::time::Instant::now();
+            if now >= wake {
+                break;
+            }
+            if interrupted() {
+                return Err(VykarError::Interrupted);
+            }
+            std::thread::sleep((wake - now).min(LOCK_WAIT_SLICE));
+        }
+        attempt += 1;
+    }
 }
 
 /// Default stale session threshold.

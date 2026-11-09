@@ -71,6 +71,10 @@ impl Repository {
     /// index (releasing its mmap before the full index is reloaded) and take
     /// the session's `IndexDelta` out for processing.
     ///
+    /// On the concurrent backup path Phase 1 has normally drained uploads
+    /// already, so the flush here is a no-op safety net; for
+    /// `apply_write_session` it is the real flush.
+    ///
     /// Must only be called when `write_session` is `Some`. The session itself
     /// stays active: on failure the caller can still run `flush_on_abort()`,
     /// which does not need the structures taken here.

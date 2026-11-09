@@ -747,3 +747,95 @@ fn session_guard_drop_stops_thread_before_deregister() {
         "SessionGuard::drop must deregister after joining the heartbeat thread"
     );
 }
+
+// ── acquire_lock_with_deadline ───────────────────────────────────────────
+
+mod deadline {
+    use crate::repo::lock::{acquire_lock, acquire_lock_with_deadline, release_lock};
+    use crate::testutil::MemoryBackend;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    use vykar_storage::StorageBackend;
+    use vykar_types::error::VykarError;
+
+    #[test]
+    fn deadline_waits_for_release() {
+        let storage = Arc::new(MemoryBackend::new());
+        let held = acquire_lock(&*storage).unwrap();
+        let releaser = {
+            let storage = Arc::clone(&storage);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_secs(1));
+                release_lock(&*storage, held).unwrap();
+            })
+        };
+
+        let mut contended = 0;
+        let guard =
+            acquire_lock_with_deadline(&*storage, Duration::from_secs(30), 100, None, |_| {
+                contended += 1
+            })
+            .unwrap();
+        releaser.join().unwrap();
+        assert_eq!(contended, 1);
+        release_lock(&*storage, guard).unwrap();
+    }
+
+    #[test]
+    fn deadline_times_out_after_budget() {
+        let storage = MemoryBackend::new();
+        let _held = acquire_lock(&storage).unwrap();
+        let start = Instant::now();
+        let err =
+            acquire_lock_with_deadline(&storage, Duration::from_millis(300), 500, None, |_| {})
+                .unwrap_err();
+        let elapsed = start.elapsed();
+        assert!(matches!(err, VykarError::Locked(_)), "got {err:?}");
+        assert!(
+            elapsed >= Duration::from_millis(250) && elapsed <= Duration::from_secs(3),
+            "elapsed {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn deadline_interrupted_before_first_attempt() {
+        let storage = MemoryBackend::new();
+        let flag = AtomicBool::new(true);
+        let err =
+            acquire_lock_with_deadline(&storage, Duration::from_secs(30), 500, Some(&flag), |_| {})
+                .unwrap_err();
+        assert!(matches!(err, VykarError::Interrupted), "got {err:?}");
+        assert!(storage.list("locks/").unwrap().is_empty());
+    }
+
+    #[test]
+    fn deadline_interrupted_during_contention() {
+        let storage = MemoryBackend::new();
+        let _held = acquire_lock(&storage).unwrap();
+        let flag = Arc::new(AtomicBool::new(false));
+        let setter = {
+            let flag = Arc::clone(&flag);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(200));
+                flag.store(true, Ordering::Relaxed);
+            })
+        };
+        let start = Instant::now();
+        let err = acquire_lock_with_deadline(
+            &storage,
+            Duration::from_secs(600),
+            500,
+            Some(&flag),
+            |_| {},
+        )
+        .unwrap_err();
+        setter.join().unwrap();
+        assert!(matches!(err, VykarError::Interrupted), "got {err:?}");
+        assert!(
+            start.elapsed() < Duration::from_millis(1200),
+            "{:?}",
+            start.elapsed()
+        );
+    }
+}

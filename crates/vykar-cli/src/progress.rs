@@ -178,12 +178,7 @@ impl BackupProgressRenderer {
             commands::backup::BackupProgressEvent::Warning { message } => {
                 // Defensive duplicate of tracing::warn! — guarantees the
                 // warning reaches stderr even without the tracing subscriber.
-                let _guard = acquire_stderr_lock();
-                if self.is_tty {
-                    eprint!("\r\x1b[2K");
-                    self.last_line_len = 0;
-                }
-                eprintln!("warning: {message}");
+                self.print_line(&format!("warning: {message}"));
                 return;
             }
             commands::backup::BackupProgressEvent::SourceStarted { .. }
@@ -193,6 +188,16 @@ impl BackupProgressRenderer {
         if self.is_tty {
             self.render(false);
         }
+    }
+
+    /// Print a whole line to stderr, clearing the progress line first.
+    pub(crate) fn print_line(&mut self, line: &str) {
+        let _guard = acquire_stderr_lock();
+        if self.is_tty {
+            eprint!("\r\x1b[2K");
+            self.last_line_len = 0;
+        }
+        eprintln!("{line}");
     }
 
     pub(crate) fn finish(&mut self) {

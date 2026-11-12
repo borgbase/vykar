@@ -4,6 +4,7 @@ use std::sync::atomic::AtomicBool;
 use vykar_core::app::operations::{self, BackupRunEvent};
 use vykar_core::compress::Compression;
 use vykar_core::config::{self, CompressionAlgorithm, ResolvedRepo, SourceEntry};
+use vykar_types::error::VykarError;
 
 use crate::error::{CliError, CliResult};
 use crate::format::{print_backup_stats, print_dataless_summary};
@@ -116,12 +117,14 @@ pub(crate) fn run_backup(repo: &ResolvedRepo, opts: BackupRunOpts<'_>) -> CliRes
             }
             // HookWarning: no action — tracing::warn! already fired
             BackupRunEvent::HookWarning { .. } => {}
-        };
-
-        let progress: Option<&mut dyn FnMut(BackupRunEvent)> = if show_progress {
-            Some(&mut callback)
-        } else {
-            None
+            // Always printed, even without progress: the run may still end in `Err`.
+            BackupRunEvent::SourceFailed { label, error } => {
+                let line = format!("Error: source '{label}': {error}");
+                match renderer {
+                    Some(ref mut r) => r.print_line(&line),
+                    None => eprintln!("{line}"),
+                }
+            }
         };
 
         let result = operations::run_backup_selection(
@@ -130,7 +133,7 @@ pub(crate) fn run_backup(repo: &ResolvedRepo, opts: BackupRunOpts<'_>) -> CliRes
             passphrase,
             shutdown,
             verbose >= 1,
-            progress,
+            Some(&mut callback),
         );
 
         if let Some(ref mut r) = renderer {
@@ -165,6 +168,20 @@ pub(crate) fn run_backup(repo: &ResolvedRepo, opts: BackupRunOpts<'_>) -> CliRes
         }
         for skipped in &report.skipped {
             eprintln!("Skipped source '{}': {}", skipped.label, skipped.reason);
+        }
+        if let Some(aborted) = &report.aborted {
+            crate::format::print_aborted_run(aborted);
+            if aborted.interrupted {
+                return Err(VykarError::Interrupted.into());
+            }
+        }
+
+        if report.failure_summary().is_some() {
+            let failed = report.failed.len() + usize::from(report.aborted.is_some());
+            return Err(CliError::from(format!(
+                "{failed} of {} source(s) failed",
+                sources.len()
+            )));
         }
 
         Ok(had_partial)

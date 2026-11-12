@@ -170,6 +170,7 @@ pub(crate) fn run_with_hooks<T>(
 }
 
 /// [`run_lifecycle`] with source-level hooks around a fallible action.
+#[cfg(test)]
 pub(crate) fn run_source_hooks<T>(
     hooks: &SourceHooksConfig,
     ctx: &mut HookContext,
@@ -178,7 +179,7 @@ pub(crate) fn run_source_hooks<T>(
     run_lifecycle(HookPhases::Source(hooks), ctx, action, result_verdict)?
 }
 
-fn result_verdict<T>(r: &Result<T>) -> Verdict {
+pub(crate) fn result_verdict<T>(r: &Result<T>) -> Verdict {
     match r {
         Ok(_) => Verdict::Success,
         Err(VykarError::Skipped(_)) => Verdict::Skipped,

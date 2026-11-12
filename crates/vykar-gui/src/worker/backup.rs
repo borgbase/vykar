@@ -265,6 +265,9 @@ pub(super) fn handle_backup_repo(ctx: &mut WorkerContext, repo_name: String) {
                 let _ = ctx.app_tx.send(AppCommand::FetchAllRepoInfo);
             }
             log_backup_report(&ctx.ui_tx, &rn, &report);
+            if let Some(summary) = report.failure_summary() {
+                guard.fail(format!("[{rn}] backup failed: {summary}"));
+            }
         }
         Ok(PassphraseRun::Canceled) => {
             send_log(
@@ -346,6 +349,9 @@ pub(super) fn handle_backup_source(ctx: &mut WorkerContext, source_label: String
                     any_backed_up = true;
                 }
                 log_backup_report(&ctx.ui_tx, &repo_name, &report);
+                if let Some(summary) = report.failure_summary() {
+                    failures.push((repo_name.clone(), summary));
+                }
             }
             Ok(PassphraseRun::Canceled) => {
                 send_log(
@@ -565,6 +571,7 @@ mod tests {
                 label: "src".to_string(),
                 reason: "not home".to_string(),
             }],
+            ..Default::default()
         };
 
         log_backup_report(&tx, "nas", &report);

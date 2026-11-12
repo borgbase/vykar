@@ -425,56 +425,84 @@ pub fn run_with_progress(
 pub(crate) type BackendWrapper<'a> =
     &'a dyn Fn(Box<dyn vykar_storage::StorageBackend>) -> Box<dyn vykar_storage::StorageBackend>;
 
+/// Where a backup failed, decided at the call site because error variants
+/// don't identify scope (a corrupt key is `Other`, bad stored chunker params
+/// are `Config` like a missing source).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FailureScope {
+    /// Before any repository I/O: the source itself is unusable.
+    Source,
+    /// Repository open, upload or commit (including interrupts).
+    Repository,
+}
+
 /// [`run_with_progress`] with an optional backend wrapper, so tests can
 /// observe or fault-inject storage traffic.
 pub(crate) fn run_impl(
     config: &VykarConfig,
     req: BackupRequest<'_>,
-    mut progress: Option<&mut dyn FnMut(BackupProgressEvent)>,
+    progress: Option<&mut dyn FnMut(BackupProgressEvent)>,
     shutdown: Option<&AtomicBool>,
     wrap_backend: Option<BackendWrapper<'_>>,
 ) -> Result<BackupOutcome> {
-    let snapshot_name = req.snapshot_name;
-    let passphrase = req.passphrase;
+    run_scoped(config, req, progress, shutdown, wrap_backend).map_err(|(_, e)| e)
+}
+
+/// [`run_impl`] that also reports whether a failure was source-local.
+pub(crate) fn run_scoped(
+    config: &VykarConfig,
+    req: BackupRequest<'_>,
+    progress: Option<&mut dyn FnMut(BackupProgressEvent)>,
+    shutdown: Option<&AtomicBool>,
+    wrap_backend: Option<BackendWrapper<'_>>,
+) -> std::result::Result<BackupOutcome, (FailureScope, VykarError)> {
+    let prepared = prepare(config, &req).map_err(|e| (FailureScope::Source, e))?;
+    run_against_repo(config, &req, prepared, progress, shutdown, wrap_backend)
+        .map_err(|e| (FailureScope::Repository, e))
+}
+
+/// Source-local setup that touches no repository state.
+struct Prepared<'a> {
+    xattrs_enabled: bool,
+    exclude_patterns: std::borrow::Cow<'a, [String]>,
+    resolved_sources: Vec<source::ResolvedSource>,
+    max_pending_transform_bytes: usize,
+    max_pending_file_actions: usize,
+    upload_concurrency: usize,
+    num_workers: usize,
+    use_pipeline: bool,
+    transform_pool: Option<rayon::ThreadPool>,
+}
+
+fn prepare<'a>(config: &VykarConfig, req: &BackupRequest<'a>) -> Result<Prepared<'a>> {
     let source_paths = req.source_paths;
-    let source_label = req.source_label;
-    let exclude_if_present = req.exclude_if_present;
-    let one_file_system = req.one_file_system;
-    let git_ignore = req.git_ignore;
+    let command_dumps = req.command_dumps;
     let xattrs_enabled = if req.xattrs_enabled && !fs::xattrs_supported() {
         warn!("xattrs requested but not supported on this platform; continuing without xattrs");
         false
     } else {
         req.xattrs_enabled
     };
-    let compression = req.compression;
-    let command_dumps = req.command_dumps;
-    // Verbose per-file events only make sense when there is a callback to receive them.
-    let verbose = req.verbose && progress.is_some();
 
     if source_paths.is_empty() && command_dumps.is_empty() {
         return Err(VykarError::Other(
             "no source paths or command dumps specified".into(),
         ));
     }
-    if one_file_system && !cfg!(unix) {
+    if req.one_file_system && !cfg!(unix) {
         warn!("one_file_system filtering has limited support on this platform");
     }
 
     // When command dumps are active, exclude the vykar-dumps/ directory from
     // the filesystem walk to prevent duplicate paths in the snapshot.
-    let exclude_patterns: &[String];
-    let _owned_excludes;
-    if !command_dumps.is_empty() {
+    let exclude_patterns = if command_dumps.is_empty() {
+        std::borrow::Cow::Borrowed(req.exclude_patterns)
+    } else {
         let mut v = req.exclude_patterns.to_vec();
         v.push("/vykar-dumps".to_string());
-        _owned_excludes = v;
-        exclude_patterns = &_owned_excludes;
         warn!("excluding vykar-dumps/ from filesystem walk (reserved for command dump output)");
-    } else {
-        _owned_excludes = Vec::new();
-        exclude_patterns = req.exclude_patterns;
-    }
+        std::borrow::Cow::Owned(v)
+    };
 
     let multi_path = source_paths.len() > 1;
 
@@ -487,9 +515,6 @@ pub(crate) fn run_impl(
     if let Err(e) = limits::apply_process_nice(config.limits.nice) {
         warn!("could not apply limits.nice={}: {e}", config.limits.nice);
     }
-    let max_pending_transform_bytes = config.limits.transform_batch_bytes();
-    let max_pending_file_actions = config.limits.max_pending_actions();
-    let upload_concurrency = config.limits.upload_concurrency();
 
     // Resolve effective worker count before building the rayon pool so we
     // can right-size it in pipeline mode (avoids 2× thread oversubscription).
@@ -506,6 +531,51 @@ pub(crate) fn run_impl(
     } else {
         sequential::build_transform_pool(num_workers)?
     };
+
+    Ok(Prepared {
+        xattrs_enabled,
+        exclude_patterns,
+        resolved_sources,
+        max_pending_transform_bytes: config.limits.transform_batch_bytes(),
+        max_pending_file_actions: config.limits.max_pending_actions(),
+        upload_concurrency: config.limits.upload_concurrency(),
+        num_workers,
+        use_pipeline,
+        transform_pool,
+    })
+}
+
+fn run_against_repo(
+    config: &VykarConfig,
+    req: &BackupRequest<'_>,
+    prepared: Prepared<'_>,
+    mut progress: Option<&mut dyn FnMut(BackupProgressEvent)>,
+    shutdown: Option<&AtomicBool>,
+    wrap_backend: Option<BackendWrapper<'_>>,
+) -> Result<BackupOutcome> {
+    let snapshot_name = req.snapshot_name;
+    let passphrase = req.passphrase;
+    let source_paths = req.source_paths;
+    let source_label = req.source_label;
+    let exclude_if_present = req.exclude_if_present;
+    let one_file_system = req.one_file_system;
+    let git_ignore = req.git_ignore;
+    let compression = req.compression;
+    let command_dumps = req.command_dumps;
+    // Verbose per-file events only make sense when there is a callback to receive them.
+    let verbose = req.verbose && progress.is_some();
+    let Prepared {
+        xattrs_enabled,
+        exclude_patterns,
+        resolved_sources,
+        max_pending_transform_bytes,
+        max_pending_file_actions,
+        upload_concurrency,
+        num_workers,
+        use_pipeline,
+        transform_pool,
+    } = prepared;
+    let exclude_patterns: &[String] = &exclude_patterns;
 
     let backend = storage::backend_from_config(&config.repository, upload_concurrency)?;
     let backend = limits::wrap_storage_backend(backend, &config.limits);

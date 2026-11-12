@@ -202,7 +202,11 @@ pub(crate) fn log_backup_report(
     repo_name: &str,
     report: &operations::BackupRunReport,
 ) {
-    if report.created.is_empty() && report.skipped.is_empty() {
+    if report.created.is_empty()
+        && report.skipped.is_empty()
+        && report.failed.is_empty()
+        && report.aborted.is_none()
+    {
         send_log(ui_tx, format!("[{repo_name}] no snapshots created"));
         return;
     }
@@ -214,6 +218,33 @@ pub(crate) fn log_backup_report(
                 skipped.label, skipped.reason
             ),
         );
+    }
+    for failed in &report.failed {
+        send_log(
+            ui_tx,
+            format!(
+                "[{repo_name}] source {} failed: {}",
+                failed.label, failed.error
+            ),
+        );
+    }
+    if let Some(aborted) = &report.aborted {
+        let what = if aborted.interrupted {
+            "interrupted"
+        } else {
+            "stopped"
+        };
+        let mut line = format!(
+            "[{repo_name}] backup {what} at source {}: {}",
+            aborted.label, aborted.error
+        );
+        if !aborted.not_attempted.is_empty() {
+            line.push_str(&format!(
+                " (not attempted: {})",
+                aborted.not_attempted.join(", ")
+            ));
+        }
+        send_log(ui_tx, line);
     }
     for created in &report.created {
         send_log(

@@ -150,6 +150,12 @@ fn print_step_details(result: &FullCycleResult) {
         for skipped in &report.skipped {
             eprintln!("Skipped source '{}': {}", skipped.label, skipped.reason);
         }
+        for failed in &report.failed {
+            eprintln!("Failed source '{}': {}", failed.label, failed.error);
+        }
+        if let Some(aborted) = &report.aborted {
+            crate::format::print_aborted_run(aborted);
+        }
     }
 
     // Prune stats

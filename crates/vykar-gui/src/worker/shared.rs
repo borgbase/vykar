@@ -235,6 +235,12 @@ pub(super) fn run_selection_with_progress(
                     format!("[{repo_name}] hook warning: {warning}"),
                 );
             }
+            operations::BackupRunEvent::SourceFailed { label, error } => {
+                send_log(
+                    &ui_tx_progress,
+                    format!("[{repo_name}] source {label} failed: {error}"),
+                );
+            }
         }),
     )
 }

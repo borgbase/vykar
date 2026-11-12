@@ -39,10 +39,46 @@ pub struct SkippedSource {
     pub reason: String,
 }
 
+/// A source that failed on its own (e.g. its path is missing) while the run
+/// went on to the next source.
+#[derive(Debug, Clone)]
+pub struct FailedSource {
+    pub label: String,
+    pub error: String,
+}
+
+/// A repository-level failure or interrupt that stopped the run after at
+/// least one snapshot had been created.
+#[derive(Debug, Clone)]
+pub struct AbortedRun {
+    pub label: String,
+    pub error: String,
+    pub interrupted: bool,
+    /// Sources after `label` that were never started.
+    pub not_attempted: Vec<String>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct BackupRunReport {
     pub created: Vec<BackupSourceResult>,
     pub skipped: Vec<SkippedSource>,
+    pub failed: Vec<FailedSource>,
+    pub aborted: Option<AbortedRun>,
+}
+
+impl BackupRunReport {
+    /// `Some` when any source failed or the run was aborted; the run then
+    /// counts as failed even though `created` holds snapshots.
+    pub fn failure_summary(&self) -> Option<String> {
+        let parts: Vec<String> = self
+            .failed
+            .iter()
+            .map(|f| (&f.label, &f.error))
+            .chain(self.aborted.iter().map(|a| (&a.label, &a.error)))
+            .map(|(label, error)| format!("source '{label}': {error}"))
+            .collect();
+        (!parts.is_empty()).then(|| parts.join("; "))
+    }
 }
 
 // ── Hook-aware backup event types ─────────────────────────────────────────
@@ -60,6 +96,9 @@ pub enum BackupRunEvent {
     Backup(commands::backup::BackupProgressEvent),
     /// A non-fatal hook failure (tracing::warn! already fired — this adds GUI visibility).
     HookWarning { scope: HookScope, warning: String },
+    /// A source failed and the run moved on (tracing::error! already fired).
+    /// Emitted immediately, so it is visible even if the run later returns `Err`.
+    SourceFailed { label: String, error: String },
 }
 
 // ── Full-cycle types ────────────────────────────────────────────────────────
@@ -213,6 +252,12 @@ fn generate_snapshot_name() -> String {
 
 /// Run backup for each source, executing source-level hooks.
 /// Emits BackupRunEvent for progress and hook lifecycle.
+///
+/// A source-local failure is recorded and the loop continues. A repository
+/// failure or interrupt stops it: with no snapshot created yet the error is
+/// returned unchanged, otherwise it is recorded in `aborted`. `Ok` is returned
+/// only when at least one snapshot was created, i.e. the repository opened
+/// with `passphrase`.
 fn run_backup_sources(
     config: &VykarConfig,
     sources: &[SourceEntry],
@@ -222,6 +267,8 @@ fn run_backup_sources(
     verbose: bool,
     on_event: &mut Option<&mut dyn FnMut(BackupRunEvent)>,
 ) -> Result<BackupRunReport> {
+    use commands::backup::FailureScope;
+
     if sources.is_empty() {
         return Err(VykarError::Config(
             "no sources configured for this repository".into(),
@@ -232,11 +279,12 @@ fn run_backup_sources(
         Compression::from_algorithm(config.compression.algorithm, config.compression.zstd_level);
 
     let mut report = BackupRunReport::default();
+    let mut first_failure: Option<VykarError> = None;
 
-    for source in sources {
+    for (idx, source) in sources.iter().enumerate() {
         let snapshot_name = generate_snapshot_name();
 
-        let run_backup = |on_event: &mut Option<&mut dyn FnMut(BackupRunEvent)>| -> Result<_> {
+        let run_backup = |on_event: &mut Option<&mut dyn FnMut(BackupRunEvent)>| {
             let req = commands::backup::BackupRequest {
                 snapshot_name: &snapshot_name,
                 passphrase,
@@ -256,13 +304,15 @@ fn run_backup_sources(
                 let mut backup_cb = |bpe| {
                     cb(BackupRunEvent::Backup(bpe));
                 };
-                commands::backup::run_with_progress(config, req, Some(&mut backup_cb), shutdown)
+                commands::backup::run_scoped(config, req, Some(&mut backup_cb), shutdown, None)
             } else {
-                commands::backup::run_with_progress(config, req, None, shutdown)
+                commands::backup::run_scoped(config, req, None, shutdown, None)
             }
         };
 
-        let result = if source.hooks.has_any() {
+        let result = if shutdown.is_some_and(|f| f.load(Ordering::SeqCst)) {
+            Err((FailureScope::Repository, VykarError::Interrupted))
+        } else if source.hooks.has_any() {
             let mut ctx = crate::hooks::HookContext {
                 command: "backup".to_string(),
                 repository: config.repository.url.clone(),
@@ -276,27 +326,71 @@ fn run_backup_sources(
                 label: source.label.clone(),
             };
 
-            let result =
-                crate::hooks::run_source_hooks(&source.hooks, &mut ctx, || run_backup(on_event));
+            let outer = crate::hooks::run_lifecycle(
+                crate::hooks::HookPhases::Source(&source.hooks),
+                &mut ctx,
+                || run_backup(on_event),
+                |r| match r {
+                    Ok(_) => crate::hooks::Verdict::Success,
+                    Err((_, VykarError::Skipped(_))) => crate::hooks::Verdict::Skipped,
+                    Err((_, e)) => crate::hooks::Verdict::Failed(e.to_string()),
+                },
+            );
 
             // Drain accumulated warnings into events (tracing already fired)
             drain_backup_warnings(&mut ctx, on_event, &scope);
 
-            result
+            // An outer error is a before-hook failure or skip: source-local.
+            outer.unwrap_or_else(|e| Err((FailureScope::Source, e)))
         } else {
             run_backup(on_event)
         };
 
         let outcome = match result {
             Ok(outcome) => outcome,
-            Err(VykarError::Skipped(reason)) => {
+            Err((_, VykarError::Skipped(reason))) => {
                 report.skipped.push(SkippedSource {
                     label: source.label.clone(),
                     reason,
                 });
                 continue;
             }
-            Err(e) => return Err(e),
+            Err((FailureScope::Source, e)) => {
+                let error = e.to_string();
+                tracing::error!("backup of source '{}' failed: {error}", source.label);
+                if let Some(cb) = on_event {
+                    cb(BackupRunEvent::SourceFailed {
+                        label: source.label.clone(),
+                        error: error.clone(),
+                    });
+                }
+                report.failed.push(FailedSource {
+                    label: source.label.clone(),
+                    error,
+                });
+                first_failure.get_or_insert(e);
+                continue;
+            }
+            Err((FailureScope::Repository, e)) => {
+                // Nothing to keep: return the typed error so passphrase retry
+                // and interrupt handling still recognise it.
+                if report.created.is_empty() {
+                    return Err(e);
+                }
+                let error = e.to_string();
+                tracing::error!("backup stopped at source '{}': {error}", source.label);
+                report.aborted = Some(AbortedRun {
+                    label: source.label.clone(),
+                    error,
+                    interrupted: matches!(e, VykarError::Interrupted),
+                    not_attempted: sources
+                        .iter()
+                        .skip(idx + 1)
+                        .map(|s| s.label.clone())
+                        .collect(),
+                });
+                return Ok(report);
+            }
         };
 
         report.created.push(BackupSourceResult {
@@ -309,18 +403,38 @@ fn run_backup_sources(
         });
     }
 
-    // Nothing ran, so to the repo-level lifecycle this is a skip, not a success.
-    if report.created.is_empty() && !report.skipped.is_empty() {
-        let reasons = report
-            .skipped
-            .iter()
-            .map(|s| format!("source '{}': {}", s.label, s.reason))
-            .collect::<Vec<_>>()
-            .join("; ");
-        return Err(VykarError::Skipped(reasons));
+    if !report.created.is_empty() {
+        return Ok(report);
     }
 
-    Ok(report)
+    // Nothing was created, so the repository may never have opened: never
+    // return `Ok` here, or a caller could cache an unchecked passphrase.
+    if let Some(first) = first_failure {
+        if report.failed.len() == 1 && report.skipped.is_empty() {
+            return Err(first);
+        }
+        let mut parts: Vec<String> = report
+            .failed
+            .iter()
+            .map(|f| format!("source '{}': {}", f.label, f.error))
+            .collect();
+        parts.extend(
+            report
+                .skipped
+                .iter()
+                .map(|s| format!("source '{}' skipped: {}", s.label, s.reason)),
+        );
+        return Err(VykarError::Other(parts.join("; ")));
+    }
+
+    // Only skips: to the repo-level lifecycle this is a skip, not a success.
+    let reasons = report
+        .skipped
+        .iter()
+        .map(|s| format!("source '{}': {}", s.label, s.reason))
+        .collect::<Vec<_>>()
+        .join("; ");
+    Err(VykarError::Skipped(reasons))
 }
 
 /// Drain accumulated warnings from HookContext into BackupRunEvent.
@@ -364,8 +478,13 @@ pub fn run_backup_selection(
     };
 
     // Source hooks run inside run_backup_sources.
-    let result =
-        crate::hooks::run_with_hooks(&repo.global_hooks, &repo.repo_hooks, &mut ctx, || {
+    let outer = crate::hooks::run_lifecycle(
+        crate::hooks::HookPhases::Repo {
+            global: &repo.global_hooks,
+            repo: &repo.repo_hooks,
+        },
+        &mut ctx,
+        || {
             run_backup_sources(
                 config,
                 sources,
@@ -375,9 +494,15 @@ pub fn run_backup_selection(
                 verbose,
                 &mut on_event,
             )
-        });
+        },
+        |r| match r.as_ref().map(BackupRunReport::failure_summary) {
+            Ok(Some(summary)) => crate::hooks::Verdict::Failed(summary),
+            _ => crate::hooks::result_verdict(r),
+        },
+    );
+    // Drain before flattening so before/failed/finally warnings always arrive.
     drain_backup_warnings(&mut ctx, &mut on_event, &HookScope::Repo);
-    result
+    outer.and_then(|r| r)
 }
 
 // ── Public hook wrapper for CLI standalone commands ───────────────────────
@@ -482,11 +607,21 @@ pub fn run_full_cycle_with_passphrase_source(
                                         warning,
                                     });
                                 }
+                                BackupRunEvent::SourceFailed { label, error } => {
+                                    evt(CycleEvent::StepWarning {
+                                        step: CycleStep::Backup,
+                                        message: format!("source '{label}': {error}"),
+                                    });
+                                }
                             }),
                         )
                     },
                     |report| {
-                        if report.created.iter().any(|s| s.stats.errors > 0) {
+                        // Failed keeps the report, so created snapshots still
+                        // print, while prune/compact skip as "backup failed".
+                        if let Some(summary) = report.failure_summary() {
+                            StepOutcome::Failed(summary)
+                        } else if report.created.iter().any(|s| s.stats.errors > 0) {
                             StepOutcome::Partial
                         } else {
                             StepOutcome::Ok
@@ -672,7 +807,8 @@ pub fn run_full_cycle_with_passphrase_source(
 }
 
 /// Run a single cycle step with the full hook lifecycle.
-/// Returns Some(value) on success/partial, None on failure, skip or before-hook abort.
+/// Returns Some(value) whenever the action returned `Ok` (even if `classify`
+/// judged it Failed), None on error, skip or before-hook abort.
 pub(crate) fn run_hooked_step<T>(
     step: CycleStep,
     repo: &ResolvedRepo,

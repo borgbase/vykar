@@ -27,6 +27,19 @@ pub(crate) fn print_backup_stats(stats: &vykar_core::snapshot::SnapshotStats) {
     }
 }
 
+/// Report a run stopped by a repository error or interrupt after some snapshots.
+pub(crate) fn print_aborted_run(aborted: &vykar_core::app::operations::AbortedRun) {
+    let what = if aborted.interrupted {
+        "Interrupted"
+    } else {
+        "Backup stopped"
+    };
+    eprintln!("{what} at source '{}': {}", aborted.label, aborted.error);
+    if !aborted.not_attempted.is_empty() {
+        eprintln!("  Not attempted: {}", aborted.not_attempted.join(", "));
+    }
+}
+
 /// Report cloud-only (macOS `FileProvider`) content that could not be captured.
 ///
 /// Printed after the stats line and deliberately kept out of the exit code:

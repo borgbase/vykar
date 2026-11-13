@@ -13,10 +13,10 @@ use std::sync::Arc;
 
 use crate::commands::util::check_interrupted;
 use crate::compress;
-use crate::repo::format::{unpack_object_expect_with_context_into, ObjectType};
+use crate::repo::format::{unpack_object_expect_with_context_into, verify_chunk_id, ObjectType};
 use vykar_crypto::CryptoEngine;
 use vykar_storage::StorageBackend;
-use vykar_types::chunk_id::{ChunkHasher, ChunkId};
+use vykar_types::chunk_id::ChunkHasher;
 use vykar_types::error::{Result, VykarError};
 use vykar_types::pack_id::PackId;
 
@@ -382,20 +382,16 @@ fn process_read_group(
             )));
         }
 
-        if verify_chunks {
-            let actual = ChunkId::compute(chunk_hasher, decompress_buf);
-            if actual != blob.chunk_id {
-                return Err(VykarError::InvalidFormat(format!(
-                    "chunk {} in pack {} (offset {}, size {}) hash mismatch after decrypt: \
-                     expected {}, got {}",
-                    blob.chunk_id,
-                    group.pack_id,
-                    blob.pack_offset,
-                    blob.stored_size,
-                    blob.chunk_id,
-                    actual,
-                )));
-            }
+        // Without AEAD, the chunk ID is the only checksum on chunk data.
+        if verify_chunks || !crypto.is_encrypting() {
+            verify_chunk_id(
+                chunk_hasher,
+                &blob.chunk_id,
+                decompress_buf,
+                &group.pack_id,
+                blob.pack_offset,
+                blob.stored_size,
+            )?;
         }
 
         for target in &blob.targets {
@@ -527,7 +523,8 @@ mod tests {
     use crate::commands::restore::plan::WriteTarget;
     use crate::commands::restore::read_groups::PlannedBlob;
     use crate::commands::restore::test_support::{
-        dummy_chunk_id, dummy_pack_id, multi_blob_group, pack_blob, single_blob_group, stage_files,
+        chunk_id_of, dummy_chunk_id, dummy_pack_id, multi_blob_group, pack_blob, single_blob_group,
+        stage_files,
     };
     use crate::compress::Compression;
     use crate::repo::format::pack_object_with_context;
@@ -537,6 +534,7 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
     use tempfile::tempdir;
+    use vykar_crypto::aes_gcm::Aes256GcmEngine;
     use vykar_crypto::PlaintextEngine;
     use vykar_types::chunk_id::ChunkId;
 
@@ -626,7 +624,7 @@ mod tests {
 
         let big_data = vec![0xABu8; MAX_WRITE_BATCH + 1024];
         let crypto = PlaintextEngine::new(test_chunk_hasher());
-        let cid = dummy_chunk_id(0x01);
+        let cid = chunk_id_of(&big_data);
         let packed = pack_blob(cid, &big_data, &crypto);
 
         let files = vec![PlannedFile {
@@ -695,8 +693,8 @@ mod tests {
         let chunk_b = vec![0xBBu8; MAX_WRITE_BATCH - half];
 
         let crypto = PlaintextEngine::new(test_chunk_hasher());
-        let cid_a = dummy_chunk_id(0x0A);
-        let cid_b = dummy_chunk_id(0x0B);
+        let cid_a = chunk_id_of(&chunk_a);
+        let cid_b = chunk_id_of(&chunk_b);
         let packed_a = pack_blob(cid_a, &chunk_a, &crypto);
         let packed_b = pack_blob(cid_b, &chunk_b, &crypto);
 
@@ -782,8 +780,8 @@ mod tests {
         let data_b = vec![0xBBu8; 8192];
 
         let crypto = PlaintextEngine::new(test_chunk_hasher());
-        let cid_a = dummy_chunk_id(0x0A);
-        let cid_b = dummy_chunk_id(0x0B);
+        let cid_a = chunk_id_of(&data_a);
+        let cid_b = chunk_id_of(&data_b);
         let packed_a = pack_blob(cid_a, &data_a, &crypto);
         let packed_b = pack_blob(cid_b, &data_b, &crypto);
 
@@ -883,7 +881,7 @@ mod tests {
         for i in 0u8..num_chunks {
             let data = vec![0x10 + i; chunk_size];
             expected_data.extend_from_slice(&data);
-            let cid = dummy_chunk_id(0x10 + i);
+            let cid = chunk_id_of(&data);
             let packed = pack_blob(cid, &data, &crypto);
             entries.push((
                 cid,
@@ -943,7 +941,7 @@ mod tests {
         assert_eq!(std::fs::read(&out).unwrap(), expected_data);
     }
 
-    /// `--verify` recomputes the keyed chunk ID after decrypt/decompress and
+    /// `--verify` recomputes the keyed chunk ID after decode and
     /// must accept blobs whose stored chunk_id matches the actual data.
     #[test]
     fn process_read_group_verify_accepts_matching_chunk_id() {
@@ -1007,25 +1005,45 @@ mod tests {
         assert_eq!(std::fs::read(&out).unwrap(), payload);
     }
 
-    /// With `--verify`, a snapshot whose stored chunk_id does not match the
-    /// actual chunk bytes must abort restore with `InvalidFormat`.
-    /// AEAD's `chunk_id` AAD is *not* the same value as the snapshot-recorded
-    /// chunk_id when those two diverge (writer-side bug), so we encrypt under
-    /// the wrong-but-self-consistent AAD to bypass AEAD's check and exercise
-    /// the verify-after-decrypt path.
+    /// Run `process_read_group` on fresh scratch buffers; returns bytes written.
+    fn run_group(
+        group: &ReadGroup,
+        files: &[PlannedFile],
+        storage: &Arc<dyn StorageBackend>,
+        crypto: &dyn CryptoEngine,
+        root: &std::path::Path,
+        verify_chunks: bool,
+    ) -> Result<u64> {
+        let bytes_written = AtomicU64::new(0);
+        process_read_group(
+            group,
+            files,
+            storage,
+            crypto,
+            &bytes_written,
+            &AtomicBool::new(false),
+            &mut Vec::new(),
+            &mut Vec::new(),
+            &mut Vec::new(),
+            root,
+            verify_chunks,
+            crypto.chunk_hasher(),
+            None,
+        )?;
+        Ok(bytes_written.load(Ordering::Relaxed))
+    }
+
+    /// Encrypted repo: a blob whose stored chunk_id disagrees with its bytes
+    /// (writer-side bug) passes AEAD, because it was sealed under that same
+    /// wrong ID as AAD. Only `--verify` catches it; without it the blob
+    /// restores, so hashing stays opt-in when encrypting.
     #[test]
     fn process_read_group_verify_rejects_chunk_id_mismatch() {
-        let temp = tempdir().unwrap();
-        let _out = temp.path().join("bad.bin");
-
         let payload = b"verify-bad-data";
-        let crypto = PlaintextEngine::new(test_chunk_hasher());
-        let real_cid = ChunkId::compute(&test_chunk_hasher(), payload);
+        let crypto = Aes256GcmEngine::new(&[0x11; 32], test_chunk_hasher());
+        let real_cid = ChunkId::compute(crypto.chunk_hasher(), payload);
         let wrong_cid = dummy_chunk_id(0xEE);
         assert_ne!(real_cid, wrong_cid);
-        // Encrypt under the wrong (snapshot-recorded) chunk_id as AAD so the
-        // AEAD check still passes — it's the post-decrypt hash recompute that
-        // must catch the divergence.
         let packed = pack_blob(wrong_cid, payload, &crypto);
 
         let files = vec![PlannedFile {
@@ -1054,58 +1072,76 @@ mod tests {
             }],
         );
 
+        let temp = tempdir().unwrap();
         stage_files(temp.path(), &files);
-        let bytes_written = AtomicU64::new(0);
-        let cancelled = AtomicBool::new(false);
-        let mut data_buf = Vec::new();
-        let mut decrypt_buf = Vec::new();
-        let mut decompress_buf = Vec::new();
-        let err = process_read_group(
-            &group,
-            &files,
-            &storage,
-            &crypto,
-            &bytes_written,
-            &cancelled,
-            &mut data_buf,
-            &mut decrypt_buf,
-            &mut decompress_buf,
-            temp.path(),
-            true,
-            &test_chunk_hasher(),
-            None,
-        )
-        .unwrap_err()
-        .to_string();
+        let err = run_group(&group, &files, &storage, &crypto, temp.path(), true).unwrap_err();
         assert!(
-            err.contains("hash mismatch"),
+            matches!(&err, VykarError::InvalidFormat(m) if m.contains("hash mismatch")),
             "expected hash mismatch error, got: {err}"
         );
 
-        // Defense-in-depth nature: the same blob restores fine when verify
-        // is disabled, since AEAD already accepted it.
         let temp2 = tempdir().unwrap();
         stage_files(temp2.path(), &files);
-        let bytes_written = AtomicU64::new(0);
-        let mut data_buf = Vec::new();
-        let mut decrypt_buf = Vec::new();
-        let mut decompress_buf = Vec::new();
-        process_read_group(
-            &group,
-            &files,
-            &storage,
-            &crypto,
-            &bytes_written,
-            &cancelled,
-            &mut data_buf,
-            &mut decrypt_buf,
-            &mut decompress_buf,
-            temp2.path(),
-            false,
-            &test_chunk_hasher(),
-            None,
-        )
-        .unwrap();
+        run_group(&group, &files, &storage, &crypto, temp2.path(), false).unwrap();
+        assert_eq!(
+            std::fs::read(temp2.path().join("bad.bin")).unwrap(),
+            payload
+        );
+    }
+
+    /// Plaintext repo: a flipped payload byte survives decode (no AEAD, no
+    /// compression, same length) and must be caught by the always-on chunk ID
+    /// check even with `verify_chunks = false`.
+    #[test]
+    fn process_read_group_plaintext_rejects_corrupt_payload_without_verify() {
+        let payload = b"plaintext-payload-that-gets-corrupted";
+        let crypto = PlaintextEngine::new(test_chunk_hasher());
+        let cid = chunk_id_of(payload);
+        let mut packed = pack_blob(cid, payload, &crypto);
+        let pos = packed
+            .windows(payload.len())
+            .position(|w| w == payload)
+            .expect("plaintext payload is stored verbatim");
+        packed[pos + payload.len() / 2] ^= 0x01;
+
+        let files = vec![PlannedFile {
+            rel_path: PathBuf::from("bad.bin"),
+            total_size: payload.len() as u64,
+            mode: 0o644,
+            mtime: 0,
+            uid: 0,
+            gid: 0,
+            xattrs: None,
+        }];
+
+        let pack_id = dummy_pack_id(10);
+        let backend = Arc::new(MemoryBackend::new());
+        backend.put(&pack_id.storage_key(), &packed).unwrap();
+        let storage: Arc<dyn StorageBackend> = backend;
+
+        let group = single_blob_group(
+            pack_id,
+            cid,
+            &packed,
+            payload.len() as u32,
+            smallvec::smallvec![WriteTarget {
+                file_idx: 0,
+                file_offset: 0,
+            }],
+        );
+
+        let temp = tempdir().unwrap();
+        stage_files(temp.path(), &files);
+        let err = run_group(&group, &files, &storage, &crypto, temp.path(), false).unwrap_err();
+        assert!(
+            matches!(&err, VykarError::InvalidFormat(m) if m.contains("hash mismatch")),
+            "expected hash mismatch error, got: {err}"
+        );
+        assert_eq!(
+            std::fs::read(temp.path().join("bad.bin")).unwrap(),
+            vec![0u8; payload.len()],
+            "nothing may be written for a corrupt chunk"
+        );
     }
 
     /// `write_buf` never follows a symlink at the leaf (`O_NOFOLLOW`), even

@@ -1,6 +1,6 @@
 use std::sync::atomic::AtomicBool;
 
-use super::format::{unpack_object_expect_with_context, ObjectType};
+use super::format::{unpack_object_expect_with_context, verify_chunk_id, ObjectType};
 use super::pack::read_blob_from_pack;
 use super::{BlobCache, Repository};
 use crate::commands::util::check_interrupted;
@@ -82,6 +82,16 @@ impl Repository {
             self.crypto.as_ref(),
         )?;
         let plaintext = compress::decompress(&compressed)?;
+        if !self.crypto.is_encrypting() {
+            verify_chunk_id(
+                self.crypto.chunk_hasher(),
+                chunk_id,
+                &plaintext,
+                pack_id,
+                pack_offset,
+                stored_size,
+            )?;
+        }
 
         self.blob_cache.insert(*chunk_id, plaintext.clone());
         Ok(plaintext)
@@ -204,7 +214,9 @@ impl Repository {
                 .expect("coalesced group is non-empty")
         });
 
-        // --- Phase 3: read + decrypt + incremental drain ---
+        // --- Phase 3: read + decode + incremental drain ---
+        // Without AEAD, the chunk ID is the only checksum on chunk data.
+        let verify = !self.crypto.is_encrypting();
         for group in groups {
             check_interrupted(shutdown)?;
             let pack_key = group.pack_id.storage_key();
@@ -235,6 +247,16 @@ impl Repository {
                     self.crypto.as_ref(),
                 )?;
                 let plaintext = compress::decompress(&compressed)?;
+                if verify {
+                    verify_chunk_id(
+                        self.crypto.chunk_hasher(),
+                        &blob.chunk_id,
+                        &plaintext,
+                        &group.pack_id,
+                        blob.pack_offset,
+                        blob.stored_size,
+                    )?;
+                }
 
                 self.blob_cache.insert(blob.chunk_id, plaintext.clone());
                 let slot = slots.get_mut(blob.result_idx).ok_or_else(|| {

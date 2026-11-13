@@ -458,3 +458,59 @@ fn pre_cancelled_coalesced_read_issues_no_request() {
     assert_eq!(reads.load(Ordering::Relaxed), 0, "expected no range reads");
     assert!(out.is_empty(), "nothing may be emitted");
 }
+
+/// Flip one byte of `data` inside its stored blob in a plaintext repo. With no
+/// compression and no AEAD the blob stays decodable at the same length, so only
+/// the chunk ID check can notice.
+fn flip_byte_in_stored_chunk(repo: &Repository, id: &vykar_types::chunk_id::ChunkId, data: &[u8]) {
+    let entry = *repo.chunk_index().get(id).unwrap();
+    let key = entry.pack_id.storage_key();
+    let mut pack = repo.storage.get(&key).unwrap().unwrap();
+    let start = entry.pack_offset as usize;
+    let blob = &pack[start..start + entry.stored_size as usize];
+    let pos = blob
+        .windows(data.len())
+        .position(|w| w == data)
+        .expect("plaintext chunk is stored verbatim");
+    pack[start + pos + data.len() / 2] ^= 0x01;
+    repo.storage.put(&key, &pack).unwrap();
+}
+
+#[test]
+fn plaintext_read_chunk_rejects_corrupt_blob_and_does_not_cache_it() {
+    let mut repo = crate::testutil::test_repo_plaintext();
+    let data = b"plaintext-chunk-that-will-be-corrupted-on-disk";
+    let (id, _, _) = repo
+        .store_chunk(data, Compression::None, PackType::Tree)
+        .unwrap();
+    repo.flush_packs().unwrap();
+    flip_byte_in_stored_chunk(&repo, &id, data);
+    repo.clear_blob_cache();
+
+    for attempt in 0..2 {
+        let err = repo.read_chunk(&id).unwrap_err();
+        assert!(
+            matches!(&err, VykarError::InvalidFormat(m) if m.contains("hash mismatch")),
+            "attempt {attempt}: expected hash mismatch, got: {err}"
+        );
+    }
+}
+
+#[test]
+fn plaintext_coalesced_read_rejects_corrupt_blob() {
+    let mut repo = crate::testutil::test_repo_plaintext();
+    let ids = store_chunks(&mut repo, 3);
+    let corrupt = "chunk-data-0001-padding-to-make-it-unique";
+    flip_byte_in_stored_chunk(&repo, &ids[1], corrupt.as_bytes());
+    repo.clear_blob_cache();
+
+    let chunks = resolve_chunks(&repo, &ids);
+    let mut out = Vec::new();
+    let err = repo
+        .read_chunks_coalesced_into(&chunks, &mut out, None)
+        .unwrap_err();
+    assert!(
+        matches!(&err, VykarError::InvalidFormat(m) if m.contains("hash mismatch")),
+        "expected hash mismatch, got: {err}"
+    );
+}

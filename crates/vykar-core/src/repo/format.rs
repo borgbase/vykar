@@ -1,5 +1,7 @@
 use vykar_crypto::CryptoEngine;
+use vykar_types::chunk_id::{ChunkHasher, ChunkId};
 use vykar_types::error::{Result, VykarError};
+use vykar_types::pack_id::PackId;
 
 /// Domain-separation marker for object identity binding in AEAD AAD.
 // Wire-format constant — DO NOT rename (backward compatibility)
@@ -251,6 +253,28 @@ pub fn unpack_object_expect_with_context_into(
         return Err(VykarError::InvalidFormat(format!(
             "unexpected object type: expected {:?}, got {:?}",
             expected_type, obj_type
+        )));
+    }
+    Ok(())
+}
+
+/// Recompute a decoded chunk's ID and compare it to the ID it was stored under.
+///
+/// Mandatory on read paths when the engine does not encrypt: without an AEAD
+/// tag, the keyed chunk ID is the only checksum on chunk data.
+pub(crate) fn verify_chunk_id(
+    hasher: &ChunkHasher,
+    expected: &ChunkId,
+    plaintext: &[u8],
+    pack_id: &PackId,
+    pack_offset: u64,
+    stored_size: u32,
+) -> Result<()> {
+    let actual = ChunkId::compute(hasher, plaintext);
+    if actual != *expected {
+        return Err(VykarError::InvalidFormat(format!(
+            "chunk {expected} in pack {pack_id} (offset {pack_offset}, size {stored_size}) \
+             hash mismatch after decode: expected {expected}, got {actual}"
         )));
     }
     Ok(())

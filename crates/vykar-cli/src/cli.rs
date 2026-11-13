@@ -132,10 +132,10 @@ pub(crate) enum Commands {
         #[arg(long)]
         pattern: Option<String>,
 
-        /// Recompute the keyed BLAKE2b chunk ID after decryption and abort if
-        /// it doesn't match the snapshot's stored chunk_id. AEAD already
-        /// authenticates ciphertext under the standard threat model, so this
-        /// is defense-in-depth against writer-side bugs only.
+        /// Recompute each chunk's keyed ID after decoding and abort if it
+        /// doesn't match the snapshot's stored chunk_id. Always on for
+        /// unencrypted repositories; for encrypted ones AEAD already
+        /// authenticates the data, so this only guards against writer-side bugs.
         #[arg(long)]
         verify: bool,
     },

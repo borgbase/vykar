@@ -565,6 +565,55 @@ fn cli_check_verify_data_detects_tampered_pack() {
     assert!(stdout_err.contains("missing from storage"));
 }
 
+/// Plaintext repos verify chunk IDs on every read, so a same-length bit flip in
+/// a pack fails `restore` even without `--verify`.
+#[test]
+fn cli_restore_detects_flipped_byte_in_plaintext_pack() {
+    let fx = CliFixture::new();
+    let config = format!(
+        "repositories:\n  - url: {}\nencryption:\n  mode: none\ncompression:\n  algorithm: none\nsources: []\n",
+        yaml_quote_path(&fx.repo_dir)
+    );
+    std::fs::write(&fx.config_path, config).unwrap();
+    let content = b"plaintext-pack-corruption-marker-0123456789abcdef\n";
+    std::fs::write(fx.source_a.join("flip.txt"), content).unwrap();
+
+    let cfg = fx.config_path.to_string_lossy().to_string();
+    let source = fx.source_a.to_string_lossy().to_string();
+    let restore = fx._tmp.path().join("restore-flip");
+    let restore_str = restore.to_string_lossy().to_string();
+
+    fx.run_ok(&["--config", &cfg, "init"]);
+    fx.run_ok(&["--config", &cfg, "backup", &source]);
+
+    let pack_path = std::fs::read_dir(fx.repo_dir.join("packs"))
+        .unwrap()
+        .flatten()
+        .flat_map(|shard| std::fs::read_dir(shard.path()).unwrap().flatten())
+        .map(|e| e.path())
+        .find(|p| {
+            std::fs::read(p)
+                .unwrap()
+                .windows(content.len())
+                .any(|w| w == content)
+        })
+        .expect("uncompressed plaintext content must appear verbatim in a pack");
+    let mut pack = std::fs::read(&pack_path).unwrap();
+    let pos = pack
+        .windows(content.len())
+        .position(|w| w == content)
+        .unwrap();
+    pack[pos + content.len() / 2] ^= 0x01;
+    std::fs::write(&pack_path, pack).unwrap();
+
+    let (_stdout, stderr) = fx.run_err(&["--config", &cfg, "restore", "latest", &restore_str]);
+    assert!(
+        stderr.contains("hash mismatch"),
+        "expected hash mismatch diagnostic, got:\n{stderr}"
+    );
+    assert!(!restore.join("flip.txt").exists());
+}
+
 #[test]
 fn cli_restore_latest_alias() {
     let fx = CliFixture::new();

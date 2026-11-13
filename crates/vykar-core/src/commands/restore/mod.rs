@@ -125,10 +125,11 @@ pub struct RestoreStats {
 
 /// Run `vykar restore`.
 ///
-/// When `verify_chunks` is true, every restored chunk's plaintext is fed
-/// through `ChunkId::compute` and matched against the snapshot's stored
-/// `chunk_id`. AEAD already authenticates ciphertext under the standard
-/// threat model, so this is defense-in-depth against writer-side bugs only.
+/// Every restored chunk's plaintext is matched against its stored `chunk_id`
+/// via `ChunkId::compute` when `verify_chunks` is true, and always for
+/// unencrypted repositories (no AEAD tag there). For encrypted repositories
+/// AEAD already authenticates the data, so `verify_chunks` only guards against
+/// writer-side bugs.
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     config: &VykarConfig,

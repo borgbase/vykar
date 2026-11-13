@@ -6,7 +6,7 @@
 //! loss. The sweep removes that debris during the directory walk the server
 //! already does for quota accounting.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use tracing::{info, warn};
@@ -124,6 +124,62 @@ fn walk(dir: &Path, sweep_older_than: Option<Duration>, usage: &mut u64, swept: 
     }
 }
 
+/// Remove every temp file in the repository's namespace regardless of age,
+/// returning the removed paths. Used by delete-repo (`cleanup-dirs`):
+/// listings hide temps, so the client cannot name them. Only files in
+/// `data_dir` itself and under [`vykar_protocol::KNOWN_ROOT_DIRS`] are
+/// touched; symlinks are not followed. Quota is left alone because temp bytes
+/// never enter `quota_usage`.
+pub(crate) fn purge_temp_files(data_dir: &Path) -> Vec<PathBuf> {
+    let mut removed = Vec::new();
+    let Ok(entries) = std::fs::read_dir(data_dir) else {
+        return removed;
+    };
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        let name = entry.file_name();
+        if file_type.is_dir() {
+            if vykar_protocol::KNOWN_ROOT_DIRS.contains(&&*name.to_string_lossy()) {
+                purge_walk(&entry.path(), &mut removed);
+            }
+        } else if file_type.is_file() {
+            purge_file(&entry, &mut removed);
+        }
+    }
+    removed
+}
+
+fn purge_walk(dir: &Path, removed: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        let path = entry.path();
+        if file_type.is_dir() {
+            purge_walk(&path, removed);
+        } else if file_type.is_file() {
+            purge_file(&entry, removed);
+        }
+    }
+}
+
+fn purge_file(entry: &std::fs::DirEntry, removed: &mut Vec<PathBuf>) {
+    if !vykar_protocol::is_temp_file(&entry.file_name().to_string_lossy()) {
+        return;
+    }
+    let path = entry.path();
+    match std::fs::remove_file(&path) {
+        Ok(()) => removed.push(path),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => warn!(path = %path.display(), "failed to remove temp file: {e}"),
+    }
+}
+
 /// mtime-based, so a slow-but-live upload (which touches mtime on every
 /// write) measures time since its last byte. A future mtime (clock skew)
 /// yields `Err` from `elapsed()` and counts as not aged.
@@ -189,6 +245,29 @@ mod tests {
             100 + 1000 + 50,
             "swept bytes excluded, fresh temp counted"
         );
+    }
+
+    #[test]
+    fn purge_removes_all_temps_regardless_of_age() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        make_tree(root);
+        let fresh = root.join("packs/ab/.tmp.fresh");
+        let old = root.join(".tmp.config.0");
+        std::fs::write(&fresh, [0u8; 5]).unwrap();
+        write_aged(&old, &[0u8; 5], Duration::from_secs(25 * 3600));
+        let foreign = root.join("other-app/.tmp.cache");
+        std::fs::create_dir_all(foreign.parent().unwrap()).unwrap();
+        std::fs::write(&foreign, [0u8; 5]).unwrap();
+
+        let mut removed = purge_temp_files(root);
+        removed.sort();
+
+        assert_eq!(removed, vec![old.clone(), fresh.clone()]);
+        assert!(!fresh.exists() && !old.exists());
+        assert!(foreign.exists(), "outside the repo namespace");
+        assert!(root.join("config").exists());
+        assert!(root.join("packs/ab").join("a".repeat(64)).exists());
     }
 
     #[cfg(unix)]

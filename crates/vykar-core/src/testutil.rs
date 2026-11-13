@@ -299,3 +299,53 @@ delegate_storage_backend! {
         self.inner.put(key, &data)
     }
 }
+
+/// Pack-upload fault injection: `put_owned` fails for keys in `fail`, and the
+/// first pack upload of a [`Self::gated`] backend blocks until the gate's
+/// sender fires (or is dropped).
+pub struct PackUploadBackend {
+    inner: std::sync::Arc<dyn StorageBackend>,
+    pub fail: Mutex<std::collections::HashSet<String>>,
+    gate: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+}
+
+impl PackUploadBackend {
+    pub fn new(inner: std::sync::Arc<dyn StorageBackend>) -> Self {
+        Self {
+            inner,
+            fail: Default::default(),
+            gate: Default::default(),
+        }
+    }
+
+    pub fn gated(inner: std::sync::Arc<dyn StorageBackend>) -> (Self, std::sync::mpsc::Sender<()>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let backend = Self::new(inner);
+        *backend.gate.lock().unwrap() = Some(rx);
+        (backend, tx)
+    }
+}
+
+impl InnerBackend for PackUploadBackend {
+    fn inner_backend(&self) -> &dyn StorageBackend {
+        &*self.inner
+    }
+}
+
+delegate_storage_backend! {
+    for PackUploadBackend;
+    except [put_owned];
+
+    fn put_owned(&self, key: &str, data: Vec<u8>) -> Result<()> {
+        if key.starts_with("packs/") {
+            let gate = self.gate.lock().unwrap().take();
+            if let Some(rx) = gate {
+                let _ = rx.recv();
+            }
+        }
+        if self.fail.lock().unwrap().contains(key) {
+            return Err(VykarError::Other("injected pack upload failure".into()));
+        }
+        self.inner.put_owned(key, data)
+    }
+}

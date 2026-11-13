@@ -123,6 +123,9 @@ fn delete_repo_handles_temp_files() {
     // Plant server temp files at root level (from interrupted PUTs)
     std::fs::write(repo_dir.join(".tmp.config.0"), b"partial config").unwrap();
     std::fs::write(repo_dir.join(".tmp.manifest.0"), b"partial manifest").unwrap();
+    // A shard holding nothing but a temp file must still be removed.
+    std::fs::create_dir_all(repo_dir.join("packs/ab")).unwrap();
+    std::fs::write(repo_dir.join("packs/ab/.tmp.abcd.0"), b"partial pack").unwrap();
 
     let stats = commands::delete_repo::run(&config).unwrap();
     assert!(stats.keys_deleted > 0);
@@ -168,4 +171,19 @@ fn delete_repo_deletes_all_nested_keys() {
     assert!(stats.unknown_entries.is_empty());
     assert!(stats.root_removed);
     assert!(!repo_dir.exists());
+}
+
+#[test]
+fn delete_repo_keeps_temp_named_files_in_unknown_dirs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = tmp.path().join("repo");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    let config = init_repo(&repo_dir);
+    let foreign = repo_dir.join("other-app/.tmp.cache");
+    std::fs::create_dir_all(foreign.parent().unwrap()).unwrap();
+    std::fs::write(&foreign, b"not ours").unwrap();
+
+    let stats = commands::delete_repo::run(&config).unwrap();
+    assert!(foreign.exists());
+    assert!(!stats.root_removed);
 }

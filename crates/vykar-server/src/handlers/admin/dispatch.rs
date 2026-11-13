@@ -48,6 +48,7 @@ pub struct RepoQuery {
     #[serde(rename = "verify-packs")]
     pub verify_packs: Option<String>,
     pub list: Option<String>,
+    pub sized: Option<String>,
 }
 
 /// GET / - dispatches based on query parameter.
@@ -62,7 +63,7 @@ pub async fn repo_dispatch(
         return with_admin_timeout(verify_structure(state)).await;
     }
     if query.list.is_some() {
-        return with_admin_timeout(repo_list_all(state)).await;
+        return with_admin_timeout(repo_list_all(state, query.sized.is_some())).await;
     }
     Err(ServerError::BadRequest(
         "missing query parameter (stats, verify-structure, list)".into(),

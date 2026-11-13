@@ -527,7 +527,11 @@ fn flush_on_abort_writes_pending_index() {
     )
     .unwrap();
     let serialized = compress::decompress_metadata(&compressed).unwrap();
-    let entries: Vec<PendingPackEntry> = rmp_serde::from_slice(&serialized).unwrap();
+    let entries: Vec<PendingPackEntry> =
+        match crate::index::decode_pending_journal(&serialized).unwrap() {
+            crate::index::DecodedJournal::V2(entries) => entries,
+            other => panic!("expected a v2 journal, got {other:?}"),
+        };
 
     // Should have 2 packs: the first (auto-flushed) and the partial (sealed by abort).
     assert_eq!(
@@ -627,13 +631,14 @@ fn flush_on_abort_survives_pack_upload_failure() {
         .unwrap();
 
     // flush_on_abort should not panic even though upload threads fail.
-    // It should still attempt to write pending_index (which targets a non-pack key).
     repo.flush_on_abort();
 
-    // sessions/default.index should exist because put("sessions/default.index", ..) succeeds.
+    // A pack is journaled only after its upload is confirmed. Every upload
+    // failed, so the journal is empty and nothing is written: a journal
+    // naming a failed pack would let the next backup adopt a damaged pack.
     assert!(
-        repo.storage.exists("sessions/default.index").unwrap(),
-        "sessions/default.index should be written even when pack uploads fail"
+        !repo.storage.exists("sessions/default.index").unwrap(),
+        "failed pack uploads must not be journaled"
     );
 }
 

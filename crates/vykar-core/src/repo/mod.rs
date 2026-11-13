@@ -11,6 +11,7 @@ mod chunks;
 mod commit;
 mod key;
 mod open;
+mod pack_recovery;
 pub use key::{select_repository_key, LoadedKey};
 #[cfg(test)]
 pub(crate) use open::derive_plaintext_chunk_id_key;

@@ -218,14 +218,9 @@ impl Repository {
             .write_session
             .as_mut()
             .expect("write session active while flushing abort state");
-        for handle in ws.pending_uploads.drain(..) {
-            match handle
-                .join()
-                .map_err(|_| VykarError::Other("pack upload thread panicked".into()))
-                .and_then(|r| r)
-            {
-                Ok(()) => {}
-                Err(e) => warn!("flush_on_abort: upload thread failed: {e}"),
+        for upload in std::mem::take(&mut ws.pending_uploads) {
+            if let Err(e) = ws.finish_upload(upload) {
+                warn!("flush_on_abort: upload thread failed: {e}");
             }
         }
 
@@ -368,9 +363,16 @@ impl Repository {
             ws.recovered_chunks.insert(chunk_id, entry);
         }
 
-        // 4. Remove tracked pack IDs from pending journal.
+        // 4. Remove tracked packs from the pending journal, and keep uploads
+        // still in flight from journaling them when they complete.
         for pack_id in &tracker.journal_pack_ids {
             ws.pending_journal.remove_pack(pack_id);
+        }
+        let rolled_back: std::collections::HashSet<_> = tracker.journal_pack_ids.iter().collect();
+        for upload in &mut ws.pending_uploads {
+            if rolled_back.contains(&upload.pack_id) {
+                upload.journal = false;
+            }
         }
 
         // 5. Reset data pack writer (discards any partial pack buffer).
@@ -456,5 +458,85 @@ mod tests {
         let mut repo = test_repo_plaintext();
         // No enable_dedup_mode call — must panic.
         let _ = repo.begin_rollback_checkpoint();
+    }
+
+    /// A finished upload is journaled on the next stored chunk, not only when
+    /// the next pack is sealed.
+    #[test]
+    fn finished_upload_is_journaled_before_next_seal() {
+        use crate::compress::Compression;
+        use crate::repo::pack::PackType;
+
+        let mut repo = test_repo_plaintext();
+        repo.enable_dedup_mode();
+        repo.store_chunk(b"first pack chunk", Compression::None, PackType::Data)
+            .unwrap();
+        repo.flush_writer_async(PackType::Data).unwrap();
+        let pack_id = repo.write_session.as_ref().unwrap().pending_uploads[0].pack_id;
+        while !repo.write_session.as_ref().unwrap().pending_uploads[0]
+            .handle
+            .is_finished()
+        {
+            std::thread::yield_now();
+        }
+
+        repo.store_chunk(b"next chunk", Compression::None, PackType::Data)
+            .unwrap();
+
+        let ws = repo.write_session.as_ref().unwrap();
+        assert!(ws.pending_uploads.is_empty());
+        assert!(ws
+            .pending_journal
+            .to_wire()
+            .iter()
+            .any(|e| e.pack_id == pack_id));
+        repo.write_session = None;
+    }
+
+    /// A pack sealed inside a checkpoint whose upload finishes only after the
+    /// rollback must not be journaled: its chunks were rolled back.
+    #[test]
+    fn rollback_keeps_in_flight_upload_out_of_journal() {
+        use crate::compress::Compression;
+        use crate::repo::pack::PackType;
+
+        let mut repo = test_repo_plaintext();
+        repo.enable_dedup_mode();
+        let (gated, tx) =
+            crate::testutil::PackUploadBackend::gated(std::sync::Arc::clone(&repo.storage));
+        repo.storage = std::sync::Arc::new(gated);
+
+        repo.begin_rollback_checkpoint().unwrap();
+        repo.store_chunk(b"rolled back chunk", Compression::None, PackType::Data)
+            .unwrap();
+        repo.flush_writer_async(PackType::Data).unwrap();
+        let pack_id = {
+            let ws = repo.write_session.as_ref().unwrap();
+            assert_eq!(ws.pending_uploads.len(), 1);
+            assert!(
+                !ws.pending_uploads[0].handle.is_finished(),
+                "upload is gated"
+            );
+            ws.pending_uploads[0].pack_id
+        };
+
+        repo.abort_rollback_checkpoint();
+        tx.send(()).unwrap();
+        repo.flush_packs().unwrap();
+
+        let ws = repo.write_session.as_ref().unwrap();
+        assert!(ws.pending_uploads.is_empty());
+        assert!(
+            ws.pending_journal
+                .to_wire()
+                .iter()
+                .all(|e| e.pack_id != pack_id),
+            "rolled-back pack must not be journaled"
+        );
+        assert!(
+            repo.storage.exists(&pack_id.storage_key()).unwrap(),
+            "the upload still completes; the pack is an orphan for compact"
+        );
+        repo.write_session = None;
     }
 }

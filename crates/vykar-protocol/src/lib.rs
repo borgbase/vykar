@@ -122,6 +122,16 @@ pub fn check_protocol_version(version: u32) -> Result<(), String> {
     Ok(())
 }
 
+// ── Sized listing (`GET ?list&sized`) ─────────────────────────────────────
+
+/// One entry of a `?list&sized` response. Servers that predate the `sized`
+/// parameter ignore it and return plain key strings instead.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SizedKey {
+    pub key: String,
+    pub size: u64,
+}
+
 // ── Server capabilities (`GET /health`) ────────────────────────────────────
 
 /// The unauthenticated `GET /health` response.
@@ -404,6 +414,17 @@ pub fn is_temp_file(name: &str) -> bool {
     let trimmed = name.trim_end_matches('/');
     let basename = trimmed.rsplit('/').next().unwrap_or(trimmed);
     basename.starts_with(TEMP_FILE_PREFIX) || basename.starts_with(".repack_tmp.")
+}
+
+/// Returns true if `key` is a temp file in the repository's own namespace: at
+/// the root or under one of [`KNOWN_ROOT_DIRS`]. Sweeps use this so they never
+/// touch files in foreign subdirectories, which delete-repo preserves.
+pub fn is_repo_temp_file(key: &str) -> bool {
+    is_temp_file(key)
+        && match key.trim_start_matches('/').split_once('/') {
+            None => true,
+            Some((top, _)) => KNOWN_ROOT_DIRS.contains(&top),
+        }
 }
 
 /// Returns true if `key` is a known vykar repository storage key.
@@ -703,6 +724,16 @@ mod tests {
         for f in KNOWN_ROOT_FILES {
             assert!(is_known_repo_key(f), "{f} should be known");
         }
+    }
+
+    #[test]
+    fn repo_temp_file_only_in_repo_namespace() {
+        assert!(is_repo_temp_file(".tmp.index.0"));
+        assert!(is_repo_temp_file("packs/ab/.tmp.x"));
+        assert!(is_repo_temp_file("snapshots/.repack_tmp.y"));
+        assert!(!is_repo_temp_file("other-app/.tmp.cache"));
+        assert!(!is_repo_temp_file("other-app/packs/.tmp.cache"));
+        assert!(!is_repo_temp_file("packs/ab/abcd"));
     }
 
     #[test]

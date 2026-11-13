@@ -236,9 +236,10 @@ fn early_flush_failure_aborts_cleanly() {
     assert!(repo_keys(&config, "snapshots/").is_empty());
     assert!(repo_keys(&config, "locks/").is_empty());
     let sessions = repo_keys(&config, "sessions/");
+    // Every pack upload failed, and only confirmed uploads are journaled.
     assert!(
-        sessions.iter().any(|k| k.ends_with(".index")),
-        "journal should be kept for recovery: {sessions:?}"
+        !sessions.iter().any(|k| k.ends_with(".index")),
+        "failed packs must not be journaled: {sessions:?}"
     );
     assert!(
         !sessions.iter().any(|k| k.ends_with(".json")),

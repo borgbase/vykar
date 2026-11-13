@@ -6,8 +6,8 @@ use tracing::{debug, warn};
 use crate::compress;
 use crate::index::dedup_cache::TieredDedupIndex;
 use crate::index::{
-    ChunkIndex, DedupIndex, IndexDelta, IndexDeltaCheckpoint, PendingIndexJournal,
-    RecoveredChunkEntry,
+    decode_pending_journal, encode_pending_journal, ChunkIndex, DecodedJournal, DedupIndex,
+    IndexDelta, IndexDeltaCheckpoint, PendingChunkEntry, PendingIndexJournal, RecoveredChunkEntry,
 };
 use vykar_crypto::CryptoEngine;
 use vykar_storage::StorageBackend;
@@ -19,6 +19,7 @@ use vykar_types::pack_id::PackId;
 use super::format::{pack_object_with_context, unpack_object_expect_with_context, ObjectType};
 use super::lock::{session_index_key, SessionEntry, SESSIONS_PREFIX, SESSION_STALE_SECS};
 use super::pack::{PackType, PackWriter, PackedChunkEntry};
+use super::pack_recovery::verify_journal_packs;
 
 /// Extra upload handles allowed beyond `max_in_flight_uploads` before blocking.
 const UPLOAD_QUEUE_HEADROOM: usize = 2;
@@ -45,6 +46,22 @@ enum RecoverResult {
     Corrupt,
     /// Successfully recovered N chunk entries (may be 0 if all already indexed).
     Ok(usize),
+    /// Versioned journal from a newer binary. Left in storage untouched so
+    /// that binary can still recover it.
+    UnknownVersion,
+    /// Unversioned journal from an older binary, which listed packs before
+    /// their upload was confirmed. Not trusted; deleted.
+    Legacy,
+}
+
+/// A background pack upload plus what to journal once it is confirmed.
+pub(crate) struct PendingUpload {
+    pub(crate) pack_id: PackId,
+    pub(crate) journal_chunks: Vec<PendingChunkEntry>,
+    /// Cleared by rollback: the pack is still uploaded (an orphan for
+    /// compact) but must not enter the journal.
+    pub(crate) journal: bool,
+    pub(crate) handle: JoinHandle<Result<()>>,
 }
 
 /// Marker state for a session's `.json` file during recovery scanning.
@@ -88,8 +105,9 @@ pub(crate) struct WriteSessionState {
     pub(crate) data_pack_writer: PackWriter,
     /// Pack writer for item-stream metadata chunks.
     pub(crate) tree_pack_writer: PackWriter,
-    /// Background pack upload threads waiting to be joined.
-    pub(crate) pending_uploads: Vec<JoinHandle<Result<()>>>,
+    /// Background pack uploads waiting to be joined. A pack enters
+    /// `pending_journal` only after its upload returns `Ok`.
+    pub(crate) pending_uploads: Vec<PendingUpload>,
     /// Configurable limit for in-flight background pack uploads.
     pub(crate) max_in_flight_uploads: usize,
     /// Lightweight dedup-only index used during backup to save memory.
@@ -162,6 +180,24 @@ impl WriteSessionState {
 
     // --- Upload management ---
 
+    /// Join one upload and journal its pack if it succeeded and was not
+    /// rolled back. A failed upload is never journaled.
+    pub(crate) fn finish_upload(&mut self, upload: PendingUpload) -> Result<()> {
+        let PendingUpload {
+            pack_id,
+            journal_chunks,
+            journal,
+            handle,
+        } = upload;
+        handle
+            .join()
+            .map_err(|_| VykarError::Other("pack upload thread panicked".into()))??;
+        if journal {
+            self.pending_journal.record_pack(pack_id, journal_chunks);
+        }
+        Ok(())
+    }
+
     /// Join all finished upload threads, propagating the first error.
     pub(crate) fn drain_finished_uploads(
         &mut self,
@@ -170,11 +206,9 @@ impl WriteSessionState {
     ) -> Result<()> {
         let mut i = 0;
         while let Some(slot) = self.pending_uploads.get(i) {
-            if slot.is_finished() {
-                let handle = self.pending_uploads.swap_remove(i);
-                handle
-                    .join()
-                    .map_err(|_| VykarError::Other("pack upload thread panicked".into()))??;
+            if slot.handle.is_finished() {
+                let upload = self.pending_uploads.swap_remove(i);
+                self.finish_upload(upload)?;
             } else {
                 i += 1;
             }
@@ -190,15 +224,9 @@ impl WriteSessionState {
         crypto: &dyn CryptoEngine,
     ) -> Result<()> {
         let mut first_err: Option<VykarError> = None;
-        for handle in self.pending_uploads.drain(..) {
-            let res = handle
-                .join()
-                .map_err(|_| VykarError::Other("pack upload thread panicked".into()))
-                .and_then(|r| r);
-            if first_err.is_none() {
-                if let Err(e) = res {
-                    first_err = Some(e);
-                }
+        for upload in std::mem::take(&mut self.pending_uploads) {
+            if let Err(e) = self.finish_upload(upload) {
+                first_err.get_or_insert(e);
             }
         }
         // Final flush of journal before returning (best-effort). Skipped when
@@ -230,10 +258,8 @@ impl WriteSessionState {
                 .saturating_add(UPLOAD_QUEUE_HEADROOM)
         {
             // All slots + buffer full — block on one handle.
-            let handle = self.pending_uploads.swap_remove(0);
-            handle
-                .join()
-                .map_err(|_| VykarError::Other("pack upload thread panicked".into()))??;
+            let upload = self.pending_uploads.swap_remove(0);
+            self.finish_upload(upload)?;
             self.maybe_write_pending_index(storage, crypto);
         }
         Ok(())
@@ -281,7 +307,7 @@ impl WriteSessionState {
         crypto: &dyn CryptoEngine,
     ) -> Result<()> {
         let wire = self.pending_journal.to_wire();
-        let serialized = rmp_serde::to_vec(&wire)?;
+        let serialized = encode_pending_journal(&wire)?;
         let compressed = compress::compress(compress::Compression::Zstd { level: 3 }, &serialized)?;
         let packed = pack_object_with_context(
             ObjectType::PendingIndex,
@@ -445,7 +471,15 @@ impl WriteSessionState {
                     warn!(key = %index_key, "corrupt pending index journal, deleting");
                     let _ = storage.delete(index_key);
                 }
-                Ok(RecoverResult::NotFound) => {}
+                Ok(RecoverResult::Legacy) => {
+                    warn!(
+                        key = %index_key,
+                        "discarding pending index journal from an older vykar version; \
+                         its chunks will be uploaded again"
+                    );
+                    let _ = storage.delete(index_key);
+                }
+                Ok(RecoverResult::NotFound | RecoverResult::UnknownVersion) => {}
                 Err(e) => {
                     warn!(key = %index_key, error = %e, "failed to recover pending index, skipping");
                 }
@@ -499,8 +533,16 @@ impl WriteSessionState {
             }
         };
 
-        let wire: Vec<crate::index::PendingPackEntry> = match rmp_serde::from_slice(&serialized) {
-            Ok(w) => w,
+        let wire = match decode_pending_journal(&serialized) {
+            Ok(DecodedJournal::V2(w)) => w,
+            Ok(DecodedJournal::Legacy) => return Ok(RecoverResult::Legacy),
+            Ok(DecodedJournal::Unknown(v)) => {
+                warn!(
+                    "pending_index {key}: journal version {v} not understood by this binary; \
+                     leaving it in place"
+                );
+                return Ok(RecoverResult::UnknownVersion);
+            }
             Err(e) => {
                 warn!(key = %key, error = %e, "pending_index: deserialize failed");
                 return Ok(RecoverResult::Corrupt);
@@ -513,40 +555,14 @@ impl WriteSessionState {
             "found pending index from interrupted session, verifying packs\u{2026}"
         );
 
-        // Batch-verify pack existence by listing shard directories instead of
-        // issuing one HEAD request per pack (significant speedup for REST/S3).
-        let shards: std::collections::HashSet<String> = wire
-            .iter()
-            .map(|e| format!("packs/{}", e.pack_id.shard_prefix()))
-            .collect();
-        let mut known_packs: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for shard in &shards {
-            match storage.list(shard) {
-                Ok(keys) => known_packs.extend(keys),
-                Err(e) => {
-                    warn!("pending_index: failed to list {shard}: {e}, falling back to per-pack checks");
-                    for entry in &wire {
-                        if format!("packs/{}", entry.pack_id.shard_prefix()) == *shard
-                            && storage
-                                .exists(&entry.pack_id.storage_key())
-                                .unwrap_or(false)
-                        {
-                            known_packs.insert(entry.pack_id.storage_key());
-                        }
-                    }
-                }
-            }
-        }
+        let accepted = verify_journal_packs(storage, &wire);
 
         let mut recovered = 0usize;
         let pack_count = wire.len();
         for pack_entry in wire {
-            let pack_key = pack_entry.pack_id.storage_key();
-            if !known_packs.contains(&pack_key) {
-                warn!(
-                    pack_id = %pack_entry.pack_id,
-                    "pending_index: pack missing from storage, skipping"
-                );
+            // Rejected packs were already logged by `verify_journal_packs`
+            // and are not re-seeded into this session's journal.
+            if !accepted.contains(&pack_entry.pack_id) {
                 continue;
             }
 
@@ -685,7 +701,7 @@ mod tests {
     use crate::index::{ChunkIndex, PendingChunkEntry, PendingPackEntry};
     use crate::repo::format::{pack_object_with_context, ObjectType};
     use crate::repo::lock::{session_index_key, session_marker_key, SessionEntry};
-    use crate::testutil::{init_test_environment, MemoryBackend};
+    use crate::testutil::{init_test_environment, MemoryBackend, PackUploadBackend};
     use vykar_crypto::PlaintextEngine;
 
     /// Create a PlaintextEngine for tests.
@@ -693,32 +709,50 @@ mod tests {
         PlaintextEngine::new(crate::testutil::chunk_hasher_for([0xAA; 32]))
     }
 
-    /// Write a valid pending index journal to storage at the given key.
-    /// Returns the PackId and ChunkId used.
-    fn write_valid_journal(
+    #[derive(Clone, Copy)]
+    enum Wire {
+        V2,
+        Legacy,
+    }
+
+    /// A self-consistent pack: `PackId` is the hash of its bytes and its one
+    /// chunk ends exactly at the end of the object.
+    fn fake_pack(seed: u8) -> (PackId, Vec<u8>, PendingPackEntry) {
+        let data: Vec<u8> = (0..64u8).map(|i| i.wrapping_mul(seed)).collect();
+        let pack_id = PackId::compute(&data, HashAlgorithm::Blake2b);
+        let entry = PendingPackEntry {
+            pack_id,
+            chunks: vec![PendingChunkEntry {
+                chunk_id: ChunkId::from_bytes([seed; 32]),
+                stored_size: 64 - 13,
+                pack_offset: 13,
+            }],
+        };
+        (pack_id, data, entry)
+    }
+
+    fn put_journal(
         storage: &dyn StorageBackend,
         crypto: &dyn CryptoEngine,
         key: &str,
-    ) -> (PackId, ChunkId) {
-        let pack_id = PackId::from_bytes([0x11; 32]);
-        let chunk_id = ChunkId::from_bytes([0x22; 32]);
+        entries: &[PendingPackEntry],
+        wire: Wire,
+    ) {
+        let serialized = match wire {
+            Wire::V2 => encode_pending_journal(entries).unwrap(),
+            Wire::Legacy => rmp_serde::to_vec(entries).unwrap(),
+        };
+        put_journal_bytes(storage, crypto, key, &serialized);
+    }
 
-        // Create the pack file so verification passes.
-        let pack_key = pack_id.storage_key();
-        storage.put(&pack_key, b"fake pack data").unwrap();
-
-        let entries = vec![PendingPackEntry {
-            pack_id,
-            chunks: vec![PendingChunkEntry {
-                chunk_id,
-                stored_size: 100,
-                pack_offset: 0,
-            }],
-        }];
-
-        let serialized = rmp_serde::to_vec(&entries).unwrap();
+    fn put_journal_bytes(
+        storage: &dyn StorageBackend,
+        crypto: &dyn CryptoEngine,
+        key: &str,
+        serialized: &[u8],
+    ) {
         let compressed =
-            compress::compress(compress::Compression::Zstd { level: 3 }, &serialized).unwrap();
+            compress::compress(compress::Compression::Zstd { level: 3 }, serialized).unwrap();
         let packed = pack_object_with_context(
             ObjectType::PendingIndex,
             PENDING_INDEX_OBJECT_CONTEXT,
@@ -727,8 +761,40 @@ mod tests {
         )
         .unwrap();
         storage.put(key, &packed).unwrap();
+    }
 
+    /// Write a journal naming one intact pack (stored as well).
+    fn write_journal(
+        storage: &dyn StorageBackend,
+        crypto: &dyn CryptoEngine,
+        key: &str,
+        wire: Wire,
+    ) -> (PackId, ChunkId) {
+        let (pack_id, data, entry) = fake_pack(0x11);
+        storage.put(&pack_id.storage_key(), &data).unwrap();
+        let chunk_id = entry.chunks[0].chunk_id;
+        put_journal(storage, crypto, key, &[entry], wire);
         (pack_id, chunk_id)
+    }
+
+    /// Write a valid (v2) pending index journal to storage at the given key.
+    /// Returns the PackId and ChunkId used.
+    fn write_valid_journal(
+        storage: &dyn StorageBackend,
+        crypto: &dyn CryptoEngine,
+        key: &str,
+    ) -> (PackId, ChunkId) {
+        write_journal(storage, crypto, key, Wire::V2)
+    }
+
+    fn recover_from(storage: &dyn StorageBackend) -> (WriteSessionState, PendingIndexRecovery) {
+        let crypto = test_crypto();
+        let mut ws = WriteSessionState::new(1024, 1024, 1, HashAlgorithm::Blake2b);
+        ws.session_id = "current".to_string();
+        let recovery = ws
+            .recover_pending_index(storage, &crypto, &ChunkIndex::new())
+            .unwrap();
+        (ws, recovery)
     }
 
     /// Write a session marker JSON with a specific last_refresh time.
@@ -1075,8 +1141,10 @@ mod tests {
         )
         .unwrap();
         let serialized = compress::decompress_metadata(&compressed).unwrap();
-        let wire: Vec<PendingPackEntry> = rmp_serde::from_slice(&serialized).unwrap();
-        wire.into_iter().map(|e| e.pack_id).collect()
+        match decode_pending_journal(&serialized).unwrap() {
+            DecodedJournal::V2(wire) => wire.into_iter().map(|e| e.pack_id).collect(),
+            other => panic!("session journal must be v2, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1143,5 +1211,230 @@ mod tests {
         let back = PendingIndexJournal::from_wire(j.to_wire());
         assert_eq!(back.len(), 1);
         assert_eq!(back.to_wire()[0].pack_id, PackId::from_bytes([3; 32]));
+    }
+
+    // ── Recovery verification ────────────────────────────────────────────
+
+    #[test]
+    fn v2_journal_with_exact_length_is_recovered() {
+        init_test_environment();
+        let storage = MemoryBackend::new();
+        let crypto = test_crypto();
+        let (pack_id, chunk_id) =
+            write_journal(&storage, &crypto, &session_index_key("old"), Wire::V2);
+
+        let (ws, recovery) = recover_from(&storage);
+        assert_eq!(recovery.recovered_chunks, 1);
+        assert_eq!(ws.recovered_chunks[&chunk_id].pack_id, pack_id);
+        assert_eq!(ws.pending_journal.len(), 1, "recovered pack is re-seeded");
+    }
+
+    #[test]
+    fn v2_journal_with_short_pack_is_skipped_and_not_reseeded() {
+        init_test_environment();
+        let storage = MemoryBackend::new();
+        let crypto = test_crypto();
+        let (pack_id, data, entry) = fake_pack(0x11);
+        storage
+            .put(&pack_id.storage_key(), &data[..data.len() - 1])
+            .unwrap();
+        put_journal(
+            &storage,
+            &crypto,
+            &session_index_key("old"),
+            &[entry],
+            Wire::V2,
+        );
+
+        let (ws, recovery) = recover_from(&storage);
+        assert_eq!(recovery.recovered_chunks, 0);
+        assert!(ws.recovered_chunks.is_empty());
+        assert!(
+            ws.pending_journal.is_empty(),
+            "skipped pack must not be re-seeded"
+        );
+        // The journal itself was processed and will be cleaned up.
+        assert_eq!(recovery.recovered_sessions, vec!["old"]);
+    }
+
+    #[test]
+    fn v2_journal_trusts_length_without_reading_content() {
+        // Same-length but different bytes: v2 skips the content check.
+        init_test_environment();
+        let storage = MemoryBackend::new();
+        let crypto = test_crypto();
+        let (pack_id, mut data, entry) = fake_pack(0x11);
+        data[20] ^= 0xFF;
+        storage.put(&pack_id.storage_key(), &data).unwrap();
+        put_journal(
+            &storage,
+            &crypto,
+            &session_index_key("old"),
+            &[entry],
+            Wire::V2,
+        );
+
+        let (_ws, recovery) = recover_from(&storage);
+        assert_eq!(recovery.recovered_chunks, 1);
+    }
+
+    #[test]
+    fn legacy_journal_is_discarded_even_with_intact_pack() {
+        init_test_environment();
+        let storage = MemoryBackend::new();
+        let crypto = test_crypto();
+        let key = session_index_key("old");
+        write_journal(&storage, &crypto, &key, Wire::Legacy);
+
+        let (ws, recovery) = recover_from(&storage);
+        assert_eq!(recovery.recovered_chunks, 0);
+        assert!(recovery.recovered_sessions.is_empty());
+        assert!(ws.recovered_chunks.is_empty());
+        assert!(ws.pending_journal.is_empty());
+        assert!(!storage.exists(&key).unwrap(), "legacy journal is deleted");
+    }
+
+    #[test]
+    fn overflowing_pack_offset_is_skipped_without_panic() {
+        init_test_environment();
+        let storage = MemoryBackend::new();
+        let crypto = test_crypto();
+        let (pack_id, data, mut entry) = fake_pack(0x11);
+        storage.put(&pack_id.storage_key(), &data).unwrap();
+        entry.chunks[0].pack_offset = u64::MAX - 1;
+        put_journal(
+            &storage,
+            &crypto,
+            &session_index_key("old"),
+            &[entry],
+            Wire::V2,
+        );
+
+        let (_ws, recovery) = recover_from(&storage);
+        assert_eq!(recovery.recovered_chunks, 0);
+    }
+
+    /// `MemoryBackend` uses the default `list_sized` (no sizes); this wrapper
+    /// counts `size()` calls to prove the fallback path is taken.
+    struct SizeCountingBackend {
+        inner: MemoryBackend,
+        size_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl vykar_storage::InnerBackend for SizeCountingBackend {
+        fn inner_backend(&self) -> &dyn StorageBackend {
+            &self.inner
+        }
+    }
+
+    vykar_storage::delegate_storage_backend! {
+        for SizeCountingBackend;
+        except [size];
+
+        fn size(&self, key: &str) -> Result<Option<u64>> {
+            self.size_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.size(key)
+        }
+    }
+
+    #[test]
+    fn unsized_listing_falls_back_to_size() {
+        init_test_environment();
+        let storage = SizeCountingBackend {
+            inner: MemoryBackend::new(),
+            size_calls: Default::default(),
+        };
+        let crypto = test_crypto();
+        write_journal(&storage, &crypto, &session_index_key("old"), Wire::V2);
+        assert!(storage
+            .list_sized("packs/")
+            .unwrap()
+            .iter()
+            .all(|o| o.size.is_none()));
+
+        let (_ws, recovery) = recover_from(&storage);
+        assert_eq!(recovery.recovered_chunks, 1);
+        assert_eq!(
+            storage.size_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+    }
+
+    #[test]
+    fn unknown_journal_version_is_left_in_place() {
+        init_test_environment();
+        let storage = MemoryBackend::new();
+        let crypto = test_crypto();
+        let (pack_id, data, entry) = fake_pack(0x11);
+        storage.put(&pack_id.storage_key(), &data).unwrap();
+        let key = session_index_key("future");
+        let serialized = rmp_serde::to_vec(&(3u8, vec![entry])).unwrap();
+        put_journal_bytes(&storage, &crypto, &key, &serialized);
+
+        let (mut ws, recovery) = recover_from(&storage);
+        assert_eq!(recovery.recovered_chunks, 0);
+        assert!(recovery.recovered_sessions.is_empty());
+        assert!(!ws.recovered_index_keys.contains(&key));
+        assert!(storage.exists(&key).unwrap(), "kept after recovery");
+
+        ws.cleanup_recovered_indices(&storage);
+        assert!(storage.exists(&key).unwrap(), "kept after cleanup");
+    }
+
+    // ── Upload confirmation ──────────────────────────────────────────────
+
+    fn spawn_upload(storage: &std::sync::Arc<PackUploadBackend>, seed: u8) -> PendingUpload {
+        let (pack_id, data, entry) = fake_pack(seed);
+        let storage = std::sync::Arc::clone(storage);
+        PendingUpload {
+            pack_id,
+            journal_chunks: entry.chunks,
+            journal: true,
+            handle: std::thread::spawn(move || storage.put_owned(&pack_id.storage_key(), data)),
+        }
+    }
+
+    #[test]
+    fn failed_uploads_are_never_journaled() {
+        let storage = std::sync::Arc::new(PackUploadBackend::new(std::sync::Arc::new(
+            MemoryBackend::new(),
+        )));
+        let crypto = test_crypto();
+        let mut ws = journal_session();
+        let (bad, _, _) = fake_pack(2);
+        storage.fail.lock().unwrap().insert(bad.storage_key());
+
+        ws.pending_uploads.push(spawn_upload(&storage, 1));
+        ws.pending_uploads.push(spawn_upload(&storage, 2));
+        ws.pending_uploads.push(spawn_upload(&storage, 3));
+
+        // What `flush_on_abort` does: join everything, warn on failure.
+        for upload in std::mem::take(&mut ws.pending_uploads) {
+            let _ = ws.finish_upload(upload);
+        }
+        ws.write_pending_index_best_effort(&*storage, &crypto);
+
+        let mut journaled = stored_pack_ids(&*storage, &crypto);
+        journaled.sort_by_key(|p| *p.as_bytes());
+        let mut expected = vec![fake_pack(1).0, fake_pack(3).0];
+        expected.sort_by_key(|p| *p.as_bytes());
+        assert_eq!(journaled, expected);
+    }
+
+    #[test]
+    fn wait_pending_uploads_journals_only_after_success() {
+        let storage = std::sync::Arc::new(PackUploadBackend::new(std::sync::Arc::new(
+            MemoryBackend::new(),
+        )));
+        let crypto = test_crypto();
+        let mut ws = journal_session();
+        let (bad, _, _) = fake_pack(2);
+        storage.fail.lock().unwrap().insert(bad.storage_key());
+        ws.pending_uploads.push(spawn_upload(&storage, 1));
+        ws.pending_uploads.push(spawn_upload(&storage, 2));
+
+        assert!(ws.wait_pending_uploads(&*storage, &crypto).is_err());
+        assert_eq!(stored_pack_ids(&*storage, &crypto), vec![fake_pack(1).0]);
     }
 }

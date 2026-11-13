@@ -323,6 +323,52 @@ impl PendingIndexJournal {
     }
 }
 
+/// Wire version written by [`encode_pending_journal`]. Version 2 journals
+/// list only packs whose upload was confirmed (atomic publish), so recovery
+/// can trust them after a size check. Unversioned (legacy) journals were
+/// written before that guarantee and are discarded.
+pub const PENDING_JOURNAL_VERSION: u8 = 2;
+
+/// A decoded `pending_index` journal, tagged by wire version.
+#[derive(Debug)]
+pub enum DecodedJournal {
+    /// Bare `Vec<PendingPackEntry>` from binaries before the version marker.
+    Legacy,
+    V2(Vec<PendingPackEntry>),
+    /// `[v, ...]` with a version this binary does not understand.
+    Unknown(u8),
+}
+
+/// Serialize journal entries as the positional tuple
+/// `(PENDING_JOURNAL_VERSION, entries)`, i.e. msgpack `[2, [...]]`.
+///
+/// An older binary expects a bare array of entries; this shape fails its
+/// decode, so it treats the journal as corrupt and re-uploads the chunks.
+pub fn encode_pending_journal(
+    entries: &[PendingPackEntry],
+) -> Result<Vec<u8>, rmp_serde::encode::Error> {
+    rmp_serde::to_vec(&(PENDING_JOURNAL_VERSION, entries))
+}
+
+/// Decode a journal written by any version. `Err` means neither the
+/// versioned nor the legacy shape matched.
+///
+/// A versioned journal starts with a msgpack fixarray header followed by a
+/// positive-fixint version. A legacy journal is an array of entry arrays, so
+/// its second byte is an array header, never a fixint. Only the header is
+/// inspected, so a future version with a different body shape is still
+/// recognised as versioned.
+pub fn decode_pending_journal(bytes: &[u8]) -> Result<DecodedJournal, rmp_serde::decode::Error> {
+    if let [0x91..=0x9f, version @ 0x00..=0x7f, ..] = *bytes {
+        if version != PENDING_JOURNAL_VERSION {
+            return Ok(DecodedJournal::Unknown(version));
+        }
+        let (_, entries): (u8, Vec<PendingPackEntry>) = rmp_serde::from_slice(bytes)?;
+        return Ok(DecodedJournal::V2(entries));
+    }
+    rmp_serde::from_slice::<Vec<PendingPackEntry>>(bytes).map(|_| DecodedJournal::Legacy)
+}
+
 /// Lightweight entry for recovered chunks (from a previous interrupted session).
 /// Lives in `Repository::recovered_chunks` until promoted into the active dedup
 /// structure on a dedup hit.
@@ -569,6 +615,77 @@ mod tests {
         let mut pack_ids: Vec<PackId> = restored_wire.iter().map(|e| e.pack_id).collect();
         pack_ids.sort_by_key(|p| *p.as_bytes());
         assert_eq!(pack_ids, vec![pack1, pack2]);
+    }
+
+    fn sample_entries() -> Vec<PendingPackEntry> {
+        vec![PendingPackEntry {
+            pack_id: make_pack_id(1),
+            chunks: vec![PendingChunkEntry {
+                chunk_id: make_chunk_id(10),
+                stored_size: 100,
+                pack_offset: 13,
+            }],
+        }]
+    }
+
+    #[test]
+    fn pending_journal_v2_round_trip() {
+        let bytes = encode_pending_journal(&sample_entries()).unwrap();
+        // msgpack: fixarray(2), positive fixint 2, ...
+        assert_eq!(&bytes[..2], &[0x92, 0x02]);
+        match decode_pending_journal(&bytes).unwrap() {
+            DecodedJournal::V2(entries) => {
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].pack_id, make_pack_id(1));
+            }
+            other => panic!("expected V2, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pending_journal_legacy_decodes_as_legacy() {
+        // 16 entries switch to the array16 header (0xdc).
+        for n in [0, 1, 2, 3, 16] {
+            let entries: Vec<PendingPackEntry> = (0..n)
+                .map(|i| PendingPackEntry {
+                    pack_id: make_pack_id(i),
+                    chunks: Vec::new(),
+                })
+                .collect();
+            let bytes = rmp_serde::to_vec(&entries).unwrap();
+            match decode_pending_journal(&bytes).unwrap() {
+                DecodedJournal::Legacy => {}
+                other => panic!("expected Legacy for {n} entries, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn pending_journal_unknown_version_is_not_decoded() {
+        let bytes = rmp_serde::to_vec(&(3u8, sample_entries())).unwrap();
+        assert!(matches!(
+            decode_pending_journal(&bytes).unwrap(),
+            DecodedJournal::Unknown(3)
+        ));
+        // A future body shape is still recognised as versioned.
+        let bytes = rmp_serde::to_vec(&(7u8, "something else", 42u32)).unwrap();
+        assert!(matches!(
+            decode_pending_journal(&bytes).unwrap(),
+            DecodedJournal::Unknown(7)
+        ));
+    }
+
+    #[test]
+    fn pending_journal_v2_rejected_by_legacy_reader() {
+        // What a pre-v2 binary does with a v2 journal: a decode error, which
+        // it handles as a corrupt journal (deleted, chunks re-uploaded).
+        let bytes = encode_pending_journal(&sample_entries()).unwrap();
+        assert!(rmp_serde::from_slice::<Vec<PendingPackEntry>>(&bytes).is_err());
+    }
+
+    #[test]
+    fn pending_journal_garbage_is_error() {
+        assert!(decode_pending_journal(b"\xc1garbage").is_err());
     }
 
     #[test]

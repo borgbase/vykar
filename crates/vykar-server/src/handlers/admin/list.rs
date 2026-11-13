@@ -1,35 +1,42 @@
-use axum::response::{IntoResponse, Response};
+use axum::response::Response;
+
+use vykar_protocol::SizedKey;
 
 use crate::error::ServerError;
+use crate::handlers::objects::list_response;
 use crate::state::AppState;
 
-/// GET /?list - list all keys in the repository.
-pub(super) async fn repo_list_all(state: AppState) -> Result<Response, ServerError> {
+/// GET /?list - list all keys in the repository; `&sized` adds sizes.
+pub(super) async fn repo_list_all(state: AppState, sized: bool) -> Result<Response, ServerError> {
     let data_dir = state.inner.data_dir.clone();
 
-    let keys = tokio::task::spawn_blocking(move || -> std::io::Result<Vec<String>> {
+    let keys = tokio::task::spawn_blocking(move || -> std::io::Result<Vec<SizedKey>> {
         let mut keys = Vec::new();
         list_all_recursive(&data_dir, &data_dir, &mut keys)?;
-        keys.sort();
+        keys.sort_by(|a, b| a.key.cmp(&b.key));
         Ok(keys)
     })
     .await
     .map_err(|e| ServerError::Internal(e.to_string()))?
     .map_err(ServerError::from)?;
 
-    Ok(axum::Json(keys).into_response())
+    Ok(list_response(keys, sized))
 }
 
 /// Recursively list all files under `dir`, producing keys relative to `root`.
 fn list_all_recursive(
     dir: &std::path::Path,
     root: &std::path::Path,
-    out: &mut Vec<String>,
+    out: &mut Vec<SizedKey>,
 ) -> std::io::Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
-        if path.is_dir() {
+        // Follows symlinks, matching HEAD; an entry gone mid-walk is skipped.
+        let Ok(meta) = std::fs::metadata(&path) else {
+            continue;
+        };
+        if meta.is_dir() {
             list_all_recursive(&path, root, out)?;
         } else if let Ok(rel) = path.strip_prefix(root) {
             // Use forward slashes for storage keys regardless of platform.
@@ -38,7 +45,12 @@ fn list_all_recursive(
                 .map(|c| c.to_string_lossy())
                 .collect::<Vec<_>>()
                 .join("/");
-            out.push(key);
+            if !vykar_protocol::is_temp_file(&key) {
+                out.push(SizedKey {
+                    key,
+                    size: meta.len(),
+                });
+            }
         }
     }
     Ok(())
@@ -75,5 +87,42 @@ mod tests {
             keys.contains(&"index.gen".to_string()),
             "expected 'index.gen' in {keys:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn list_sized_reports_sizes_and_hides_temps() {
+        let (router, _state, tmp) = setup_app(0);
+        std::fs::write(tmp.path().join("config"), b"cfg").unwrap();
+        let pack = "packs/ab/".to_string() + &"ab".repeat(32);
+        std::fs::write(tmp.path().join(&pack), vec![0u8; 1234]).unwrap();
+        std::fs::write(tmp.path().join("packs/ab/.tmp.x.0"), b"partial").unwrap();
+
+        let expected = vec![
+            vykar_protocol::SizedKey {
+                key: "config".into(),
+                size: 3,
+            },
+            vykar_protocol::SizedKey {
+                key: pack.clone(),
+                size: 1234,
+            },
+        ];
+
+        let resp = authed_get(router.clone(), "/?list&sized").await;
+        assert_status(&resp, StatusCode::OK);
+        let keys: Vec<vykar_protocol::SizedKey> =
+            serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(keys, expected);
+
+        let resp = authed_get(router.clone(), "/packs?list&sized").await;
+        assert_status(&resp, StatusCode::OK);
+        let keys: Vec<vykar_protocol::SizedKey> =
+            serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(keys, expected[1..]);
+
+        // Without `sized`, bare keys as before.
+        let resp = authed_get(router, "/packs?list").await;
+        let keys: Vec<String> = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(keys, vec![pack]);
     }
 }

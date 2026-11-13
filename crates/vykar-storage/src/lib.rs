@@ -60,7 +60,31 @@ pub trait StorageBackend: Send + Sync {
     /// Read an object by key. Returns `None` if not found.
     fn get(&self, key: &str) -> Result<Option<Vec<u8>>>;
 
-    /// Write an object. Overwrites if it already exists.
+    /// Write an object, replacing any existing one.
+    ///
+    /// # Visibility (all backends)
+    ///
+    /// Publication is atomic: a reader observes either the complete previous
+    /// object (or absence, if the key was absent) or the complete new one —
+    /// never a prefix or a mix. After `Ok` the new object is visible.
+    ///
+    /// After `Err` the outcome is **unknown**: the key may hold the complete
+    /// old object, the complete new one (e.g. a lost acknowledgement), or
+    /// nothing only if it was absent before. Callers must not treat `Err` as
+    /// "not published"; retrying the same `put` is the correct response.
+    ///
+    /// Backends that stage writes in temp files name them with
+    /// [`vykar_protocol::TEMP_FILE_PREFIX`] so [`Self::list`] hides them and
+    /// [`Self::remove_stale_temp_files`] can sweep them.
+    ///
+    /// # Durability (best effort, per backend)
+    ///
+    /// Survival of a server power loss is separate from visibility:
+    /// - Local and the REST server fsync the file and its directory.
+    /// - SFTP fsyncs the file via `fsync@openssh.com` when the server supports
+    ///   it. Directories cannot be fsynced over SFTP, so a power loss right
+    ///   after the rename may lose the rename.
+    /// - S3 is durable once acknowledged.
     fn put(&self, key: &str, data: &[u8]) -> Result<()>;
 
     /// Delete an object.
@@ -70,6 +94,8 @@ pub trait StorageBackend: Send + Sync {
     fn exists(&self, key: &str) -> Result<bool>;
 
     /// List all keys under a prefix. Returns full key paths.
+    ///
+    /// Never returns temp files ([`vykar_protocol::is_temp_file`]).
     fn list(&self, prefix: &str) -> Result<Vec<String>>;
 
     /// Read a byte range from an object. Returns `None` if not found.
@@ -104,8 +130,9 @@ pub trait StorageBackend: Send + Sync {
     /// Create a directory marker (no-op for flat object stores).
     fn create_dir(&self, key: &str) -> Result<()>;
 
-    /// Write an object from an owned buffer. Backends can override to avoid
-    /// an extra copy when the caller already owns the data.
+    /// Write an object from an owned buffer, with the same contract as
+    /// [`Self::put`]. Backends can override to avoid an extra copy when the
+    /// caller already owns the data.
     fn put_owned(&self, key: &str, data: Vec<u8>) -> Result<()> {
         self.put(key, &data)
     }
@@ -123,6 +150,17 @@ pub trait StorageBackend: Send + Sync {
             .transpose()
     }
 
+    /// Like [`Self::list`], plus each object's size when the backend's listing
+    /// reports it cheaply. `size: None` means "not reported", not "absent";
+    /// callers that need it fall back to [`Self::size`].
+    fn list_sized(&self, prefix: &str) -> Result<Vec<ListedObject>> {
+        Ok(self
+            .list(prefix)?
+            .into_iter()
+            .map(|key| ListedObject { key, size: None })
+            .collect())
+    }
+
     // ── Capability methods: no defaults, deliberately ──────────────────────
     //
     // Most of these report `UnsupportedBackend` on most backends, and callers
@@ -138,13 +176,40 @@ pub trait StorageBackend: Send + Sync {
     // `unsupported_server_ops!`.
     //
     // The methods above may keep defaults: each routes back through this
-    // impl's own `get`/`put`/`get_range`, so inheriting one is correct (at
+    // impl's own `get`/`put`/`get_range`/`list`, so inheriting one is correct (at
     // worst less efficient), never a silent loss of capability.
+
+    /// Delete temp files ([`vykar_protocol::is_repo_temp_file`]) last
+    /// modified at least `older_than` ago (`Duration::ZERO` = all), in the
+    /// repository's own namespace: the root and the
+    /// [`vykar_protocol::KNOWN_ROOT_DIRS`] trees, never foreign
+    /// subdirectories. Age is measured against the storage's clock, not the
+    /// client's. A file the storage refuses to delete is logged and skipped;
+    /// returns how many were removed.
+    ///
+    /// Callers must hold the maintenance lock, except delete-repo with
+    /// `Duration::ZERO`: it destroys the repository, so a concurrent backup
+    /// fails regardless, and a lock write could block deleting a full or
+    /// read-only repository.
+    ///
+    /// Required for the reason in the note above: a default `Ok(0)` would let
+    /// a wrapper silently skip the sweep. Backends that never leave
+    /// client-side temp files (S3) get `Ok(0)` from `unsupported_server_ops!`;
+    /// `RestBackend` returns it explicitly, since the server sweeps its own
+    /// (and purges every temp file when delete-repo sends
+    /// `batch-delete&cleanup-dirs`).
+    fn remove_stale_temp_files(&self, older_than: std::time::Duration) -> Result<usize>;
 
     /// Execute a server-side repack plan when supported by the backend.
     fn server_repack(&self, plan: &RepackPlanRequest) -> Result<RepackResultResponse>;
 
     /// Batch-delete keys using a backend-native API.
+    ///
+    /// **For delete-repo only.** `RestBackend` sends `cleanup-dirs` with the
+    /// final request, which prunes empty directories and purges every temp
+    /// file in the repository, including those of a backup still in flight.
+    /// A caller that deletes keys in a repository that stays live (compact,
+    /// prune) must use [`Self::delete`] or add a variant without the purge.
     fn batch_delete_keys(&self, keys: &[String]) -> Result<()>;
 
     /// Server-side pack verification: hash check + header + blob boundary scan.
@@ -175,6 +240,13 @@ pub trait StorageBackend: Send + Sync {
     /// Reports `UnsupportedBackend` for every backend that has no server
     /// behind it; callers treat that as "nothing to check".
     fn server_capabilities(&self) -> Result<ServerCapabilities>;
+}
+
+/// One entry of [`StorageBackend::list_sized`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListedObject {
+    pub key: String,
+    pub size: Option<u64>,
 }
 
 // Lets a `Box<Arc<dyn StorageBackend>>` coerce to `Box<dyn StorageBackend>`
@@ -538,6 +610,18 @@ pub fn backend_from_config(cfg: &StorageConfig) -> Result<Box<dyn StorageBackend
             )?))
         }
     }
+}
+
+/// A temp file is stale once it is at least `older_than` old by the storage
+/// server's clock. An mtime in the future is never stale.
+pub(crate) fn is_stale(
+    server_now: std::time::SystemTime,
+    modified: std::time::SystemTime,
+    older_than: std::time::Duration,
+) -> bool {
+    server_now
+        .duration_since(modified)
+        .is_ok_and(|age| age >= older_than)
 }
 
 #[cfg(test)]

@@ -9,10 +9,11 @@
     clippy::ref_option
 )]
 
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use russh::client;
 use russh::keys::known_hosts::{known_host_keys_path, learn_known_hosts_path};
@@ -24,7 +25,7 @@ use russh_sftp::protocol::{OpenFlags, StatusCode};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 use crate::RetryConfig;
-use crate::StorageBackend;
+use crate::{ListedObject, StorageBackend};
 use vykar_common::paths;
 use vykar_types::error::{Result, VykarError};
 
@@ -56,6 +57,10 @@ const MIN_SFTP_TIMEOUT_SECS: u64 = 5;
 /// Maximum per-request SFTP timeout in seconds (5 minutes).
 /// Prevents a single stuck request from blocking retries for an unreasonable time.
 const MAX_SFTP_TIMEOUT_SECS: u64 = 300;
+
+/// Upper bound on best-effort cleanup of a temp file after a failed upload.
+/// The connection may already be dead; the compact sweep removes leftovers.
+const TEMP_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// SSH keepalive interval. Detects dead connections within ~90s (30s × max 3)
 /// and keeps NAT mappings alive.
@@ -932,19 +937,40 @@ fn validate_range_length(length: u64) -> RetryResult<usize> {
     })
 }
 
-/// Recursively list all files under a directory, returning keys relative to root.
+/// Recursively list all files under a directory, returning keys relative to
+/// root with the sizes reported by `readdir`. Temp files are skipped.
 async fn list_recursive(
     sftp: &SftpSession,
     dir_path: &str,
     root: &str,
-) -> RetryResult<Vec<String>> {
-    let mut keys = Vec::new();
+) -> RetryResult<Vec<ListedObject>> {
+    let mut out = Vec::new();
+    walk_files(sftp, dir_path, root, |key, meta| {
+        if !vykar_protocol::is_temp_file(key) {
+            out.push(ListedObject {
+                key: key.to_string(),
+                size: meta.size,
+            });
+        }
+    })
+    .await?;
+    Ok(out)
+}
+
+/// Visit every non-directory entry under `dir_path` with its key relative to
+/// `root` and its `readdir` attributes. A missing directory is empty.
+async fn walk_files(
+    sftp: &SftpSession,
+    dir_path: &str,
+    root: &str,
+    mut visit: impl FnMut(&str, &russh_sftp::client::fs::Metadata),
+) -> RetryResult<()> {
     let mut dirs_to_visit = vec![dir_path.to_string()];
 
     while let Some(current_dir) = dirs_to_visit.pop() {
         let entries = match sftp.read_dir(&current_dir).await {
             Ok(entries) => entries,
-            Err(e) if is_not_found(&e) => return Ok(keys),
+            Err(e) if is_not_found(&e) => continue,
             Err(e) => return Err(sftp_retry_error("readdir", &current_dir, e)),
         };
 
@@ -954,8 +980,8 @@ async fn list_recursive(
                 continue;
             }
             let full = posix_join(&current_dir, &name);
-            let file_type = entry.metadata().file_type();
-            if file_type.is_dir() {
+            let meta = entry.metadata();
+            if meta.file_type().is_dir() {
                 dirs_to_visit.push(full);
             } else {
                 let key = full
@@ -963,13 +989,188 @@ async fn list_recursive(
                     .unwrap_or(&full)
                     .trim_start_matches('/');
                 if !key.is_empty() {
-                    keys.push(key.to_string());
+                    visit(key, &meta);
                 }
             }
         }
     }
 
-    Ok(keys)
+    Ok(())
+}
+
+/// Like [`walk_files`] from `root`, but only the repository's own namespace:
+/// files in `root` itself and everything under
+/// [`vykar_protocol::KNOWN_ROOT_DIRS`]. Foreign subdirectories are not entered.
+async fn walk_repo_files(
+    sftp: &SftpSession,
+    root: &str,
+    mut visit: impl FnMut(&str, &russh_sftp::client::fs::Metadata),
+) -> RetryResult<()> {
+    let entries = match sftp.read_dir(root).await {
+        Ok(entries) => entries,
+        Err(e) if is_not_found(&e) => return Ok(()),
+        Err(e) => return Err(sftp_retry_error("readdir", root, e)),
+    };
+    for entry in entries {
+        let name = entry.file_name();
+        let meta = entry.metadata();
+        if meta.file_type().is_dir() {
+            if vykar_protocol::KNOWN_ROOT_DIRS.contains(&name.as_str()) {
+                walk_files(sftp, &posix_join(root, &name), root, &mut visit).await?;
+            }
+        } else if name != "." && name != ".." {
+            visit(&name, &meta);
+        }
+    }
+    Ok(())
+}
+
+/// Temp path next to `path`: `<parent>/.tmp.<basename>.<16 hex>`. A fresh
+/// random suffix per attempt keeps retries from colliding with debris.
+fn temp_path_for(path: &str) -> String {
+    let (parent, base) = path.rsplit_once('/').unwrap_or(("", path));
+    format!(
+        "{parent}/{}{base}.{:016x}",
+        vykar_protocol::TEMP_FILE_PREFIX,
+        rand::random::<u64>()
+    )
+}
+
+async fn remove_temp_best_effort(sftp: &SftpSession, tmp: &str) {
+    match tokio::time::timeout(TEMP_CLEANUP_TIMEOUT, sftp.remove_file(tmp)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) if is_not_found(&e) => {}
+        Ok(Err(e)) => tracing::debug!(path = %tmp, "SFTP temp cleanup failed: {e}"),
+        Err(_) => tracing::debug!(path = %tmp, "SFTP temp cleanup timed out"),
+    }
+}
+
+/// The server's current time: the mtime of a freshly created probe file.
+/// `None` when the server reports no mtime. The probe carries the temp prefix,
+/// so a later sweep removes it if the cleanup here fails.
+async fn server_now(sftp: &SftpSession, root: &str) -> RetryResult<Option<SystemTime>> {
+    let probe = temp_path_for(&join_root_key(root, "sweep-probe"));
+    let created: RetryResult<()> = async {
+        let mut file = sftp
+            .open_with_flags(
+                &probe,
+                OpenFlags::CREATE | OpenFlags::EXCLUDE | OpenFlags::WRITE,
+            )
+            .await
+            .map_err(|e| sftp_retry_error("create", &probe, e))?;
+        file.shutdown()
+            .await
+            .map_err(|e| io_retry_error("close", &probe, e))?;
+        Ok(())
+    }
+    .await;
+    let meta = match created {
+        Ok(()) => sftp
+            .metadata(&probe)
+            .await
+            .map_err(|e| sftp_retry_error("stat", &probe, e)),
+        Err(e) => Err(e),
+    };
+    remove_temp_best_effort(sftp, &probe).await;
+    Ok(meta?.modified().ok())
+}
+
+/// One attempt of an atomic upload: write `data` to the fresh temp file `tmp`,
+/// then `posix-rename` it over `path`. `path` is never removed, so a failure
+/// leaves either the old object or the new one in place.
+async fn atomic_put(
+    sftp: &SftpSession,
+    path: &str,
+    tmp: &str,
+    ensure_parent: Option<&str>,
+    data: &[u8],
+) -> RetryResult<()> {
+    if let Some(parent) = ensure_parent {
+        mkdir_p(sftp, parent).await?;
+    }
+
+    let written: RetryResult<()> = async {
+        let mut file = sftp
+            .open_with_flags(
+                tmp,
+                OpenFlags::CREATE | OpenFlags::EXCLUDE | OpenFlags::WRITE,
+            )
+            .await
+            .map_err(|e| sftp_retry_error("create", tmp, e))?;
+        file.write_all(data)
+            .await
+            .map_err(|e| io_retry_error("write", tmp, e))?;
+        // Drains write acks and sends fsync@openssh.com when supported.
+        file.flush()
+            .await
+            .map_err(|e| io_retry_error("flush", tmp, e))?;
+        file.shutdown()
+            .await
+            .map_err(|e| io_retry_error("close", tmp, e))?;
+        Ok(())
+    }
+    .await;
+    if let Err(e) = written {
+        remove_temp_best_effort(sftp, tmp).await;
+        return Err(e);
+    }
+
+    match sftp.posix_rename(tmp, path).await {
+        Ok(()) => Ok(()),
+        // The server answered and refused: nothing was published.
+        Err(e @ russh_sftp::client::error::Error::Status(_)) => {
+            remove_temp_best_effort(sftp, tmp).await;
+            Err(sftp_retry_error("rename", path, e))
+        }
+        // No answer: the rename may or may not have happened. Re-publishing
+        // the same bytes under a new temp name is idempotent.
+        Err(e) => Err(RetryError::transient(VykarError::Other(format!(
+            "SFTP rename '{tmp}' -> '{path}': {e}"
+        )))),
+    }
+}
+
+impl SftpBackend {
+    fn put_arc(&self, key: &str, data: Arc<Vec<u8>>) -> Result<()> {
+        let path = self.full_path(key);
+        let parent = path
+            .rsplit_once('/')
+            .map(|(p, _)| p)
+            .filter(|p| !p.is_empty());
+        let ensure_parent = parent.filter(|p| !self.is_known_dir(p));
+        // Temp name of the previous attempt. Its own cleanup ran on a session
+        // that may have been dead, and a rename with no reply leaves the temp
+        // by design, so the next attempt retries the removal on its fresh
+        // connection. A temp left by the final attempt waits for compact.
+        let prev_tmp: RefCell<Option<String>> = RefCell::new(None);
+        self.retry_op(&format!("PUT {key}"), |sftp| {
+            // Atomic uploads need an overwriting rename. Plain SSH_FXP_RENAME
+            // does not replace an existing target on OpenSSH, and a
+            // delete-then-rename fallback would open a window with no object
+            // at all. Checked before anything is created; reads still work.
+            if !sftp.supports_posix_rename() {
+                return Err(RetryError::permanent(VykarError::UnsupportedBackend(
+                    format!(
+                        "SFTP server {}:{} does not support posix-rename@openssh.com, which \
+                         vykar requires for atomic uploads (OpenSSH's sftp-server provides it)",
+                        self.params.host, self.params.port
+                    ),
+                )));
+            }
+            let tmp = temp_path_for(&path);
+            let prev = prev_tmp.replace(Some(tmp.clone()));
+            ASYNC_RUNTIME.block_on(async {
+                if let Some(prev) = prev {
+                    remove_temp_best_effort(sftp, &prev).await;
+                }
+                atomic_put(sftp, &path, &tmp, ensure_parent, &data).await
+            })
+        })?;
+        if let Some(parent) = ensure_parent {
+            self.mark_dir_known(parent);
+        }
+        Ok(())
+    }
 }
 
 impl StorageBackend for SftpBackend {
@@ -993,53 +1194,7 @@ impl StorageBackend for SftpBackend {
     }
 
     fn put(&self, key: &str, data: &[u8]) -> Result<()> {
-        let path = self.full_path(key);
-        let parent_known = match path.rsplit_once('/').map(|(p, _)| p) {
-            Some(p) if !p.is_empty() => self.is_known_dir(p),
-            _ => true,
-        };
-        let data = Arc::new(data.to_vec());
-        self.retry_op(&format!("PUT {key}"), |sftp| {
-            let data = data.clone();
-            ASYNC_RUNTIME.block_on(async {
-                // Ensure parent directory exists (skip if already cached).
-                if !parent_known {
-                    if let Some(parent) = path.rsplit_once('/').map(|(p, _)| p) {
-                        if !parent.is_empty() {
-                            mkdir_p(sftp, parent).await?;
-                        }
-                    }
-                }
-
-                let mut file = sftp
-                    .open_with_flags(
-                        &path,
-                        OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE,
-                    )
-                    .await
-                    .map_err(|e| sftp_retry_error("create", &path, e))?;
-
-                file.write_all(data.as_ref())
-                    .await
-                    .map_err(|e| io_retry_error("write", &path, e))?;
-                file.flush()
-                    .await
-                    .map_err(|e| io_retry_error("flush", &path, e))?;
-                file.shutdown()
-                    .await
-                    .map_err(|e| io_retry_error("close", &path, e))?;
-                Ok(())
-            })
-        })?;
-        // Cache parent dir on success.
-        if !parent_known {
-            if let Some(parent) = path.rsplit_once('/').map(|(p, _)| p) {
-                if !parent.is_empty() {
-                    self.mark_dir_known(parent);
-                }
-            }
-        }
-        Ok(())
+        self.put_arc(key, Arc::new(data.to_vec()))
     }
 
     fn delete(&self, key: &str) -> Result<()> {
@@ -1087,11 +1242,11 @@ impl StorageBackend for SftpBackend {
     }
 
     fn list(&self, prefix: &str) -> Result<Vec<String>> {
-        let dir_path = self.full_path(prefix);
-        let root = self.params.root.clone();
-        self.retry_op(&format!("LIST {prefix}"), |sftp| {
-            ASYNC_RUNTIME.block_on(list_recursive(sftp, &dir_path, &root))
-        })
+        Ok(self
+            .list_sized(prefix)?
+            .into_iter()
+            .map(|o| o.key)
+            .collect())
     }
 
     fn get_range(&self, key: &str, offset: u64, length: u64) -> Result<Option<Vec<u8>>> {
@@ -1146,56 +1301,79 @@ impl StorageBackend for SftpBackend {
     }
 
     fn put_owned(&self, key: &str, data: Vec<u8>) -> Result<()> {
-        let path = self.full_path(key);
-        let parent_known = match path.rsplit_once('/').map(|(p, _)| p) {
-            Some(p) if !p.is_empty() => self.is_known_dir(p),
-            _ => true,
-        };
-        // Wrap the owned Vec directly — no clone needed.
-        let data = Arc::new(data);
-        self.retry_op(&format!("PUT {key}"), |sftp| {
-            let data = data.clone();
+        self.put_arc(key, Arc::new(data))
+    }
+
+    fn list_sized(&self, prefix: &str) -> Result<Vec<ListedObject>> {
+        let dir_path = self.full_path(prefix);
+        let root = self.params.root.clone();
+        self.retry_op(&format!("LIST {prefix}"), |sftp| {
+            ASYNC_RUNTIME.block_on(list_recursive(sftp, &dir_path, &root))
+        })
+    }
+
+    fn remove_stale_temp_files(&self, older_than: Duration) -> Result<usize> {
+        let root = self.params.root.clone();
+        let removed = std::sync::atomic::AtomicUsize::new(0);
+        self.retry_op("SWEEP temp files", |sftp| {
             ASYNC_RUNTIME.block_on(async {
-                if !parent_known {
-                    if let Some(parent) = path.rsplit_once('/').map(|(p, _)| p) {
-                        if !parent.is_empty() {
-                            mkdir_p(sftp, parent).await?;
+                // Ages are measured against the server's clock: comparing a
+                // server mtime with the client clock deletes live temps when
+                // the client runs ahead.
+                let cutoff_clock = if older_than.is_zero() {
+                    None
+                } else {
+                    match server_now(sftp, &root).await? {
+                        Some(now) => Some(now),
+                        None => {
+                            tracing::debug!("SFTP server returned no mtime; skipping temp sweep");
+                            return Ok(());
                         }
                     }
+                };
+                let mut stale = Vec::new();
+                walk_repo_files(sftp, &root, |key, meta| {
+                    if !vykar_protocol::is_repo_temp_file(key) {
+                        return;
+                    }
+                    let stale_entry = match cutoff_clock {
+                        None => true,
+                        Some(now) => meta
+                            .modified()
+                            .is_ok_and(|modified| crate::is_stale(now, modified, older_than)),
+                    };
+                    if stale_entry {
+                        stale.push(key.to_string());
+                    }
+                })
+                .await?;
+                for key in stale {
+                    let path = join_root_key(&root, &key);
+                    match sftp.remove_file(&path).await {
+                        Ok(()) => {
+                            removed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        Err(e) if is_not_found(&e) => {}
+                        // The server refused (e.g. permissions): one stuck
+                        // file must not fail the sweep, and with it
+                        // delete-repo. Transport errors still retry.
+                        Err(russh_sftp::client::error::Error::Status(status)) => {
+                            tracing::warn!(path = %path, "cannot remove temp file: {status:?}");
+                        }
+                        Err(e) => return Err(sftp_retry_error("delete", &path, e)),
+                    }
                 }
-
-                let mut file = sftp
-                    .open_with_flags(
-                        &path,
-                        OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE,
-                    )
-                    .await
-                    .map_err(|e| sftp_retry_error("create", &path, e))?;
-
-                file.write_all(data.as_ref())
-                    .await
-                    .map_err(|e| io_retry_error("write", &path, e))?;
-                file.flush()
-                    .await
-                    .map_err(|e| io_retry_error("flush", &path, e))?;
-                file.shutdown()
-                    .await
-                    .map_err(|e| io_retry_error("close", &path, e))?;
                 Ok(())
             })
         })?;
-        if !parent_known {
-            if let Some(parent) = path.rsplit_once('/').map(|(p, _)| p) {
-                if !parent.is_empty() {
-                    self.mark_dir_known(parent);
-                }
-            }
-        }
-        Ok(())
+        Ok(removed.into_inner())
     }
 
-    crate::unsupported_server_ops!();
+    crate::unsupported_server_ops!(except[remove_stale_temp_files]);
 }
+
+#[cfg(test)]
+mod fault_server;
 
 #[cfg(test)]
 mod tests {
@@ -1362,5 +1540,199 @@ mod tests {
         }
         // The 6th transient attempt exhausts the budget.
         assert!(record_transient(&mut state, 5));
+    }
+
+    // ── Atomic upload against an in-process server with injected faults ──
+
+    use fault_server::FaultServer;
+    use std::sync::atomic::Ordering;
+
+    fn read(server: &FaultServer, key: &str) -> Vec<u8> {
+        std::fs::read(server.path(key)).unwrap()
+    }
+
+    #[test]
+    fn reads_work_without_posix_rename_but_put_refuses() {
+        let server = FaultServer::start();
+        backend_put_seed(&server);
+        server
+            .faults
+            .hide_posix_rename
+            .store(true, Ordering::SeqCst);
+        let backend = server.backend(3);
+
+        assert_eq!(backend.get("index").unwrap().unwrap(), b"old index");
+        assert_eq!(backend.list("").unwrap(), vec!["index".to_string()]);
+        assert!(backend.exists("index").unwrap());
+        assert_eq!(backend.size("index").unwrap(), Some(9));
+
+        let err = backend.put("index", b"new").unwrap_err();
+        assert!(matches!(err, VykarError::UnsupportedBackend(_)), "{err}");
+        assert!(err.to_string().contains("posix-rename"), "{err}");
+        assert_eq!(read(&server, "index"), b"old index");
+        assert!(server.temps_next_to("index").is_empty());
+    }
+
+    #[test]
+    fn is_stale_uses_given_clock() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let hour = Duration::from_secs(3600);
+        assert!(crate::is_stale(now, now - hour, hour));
+        assert!(crate::is_stale(now, now - 2 * hour, hour));
+        assert!(!crate::is_stale(
+            now,
+            now - hour + Duration::from_secs(1),
+            hour
+        ));
+        assert!(
+            !crate::is_stale(now, now + hour, hour),
+            "future mtime is never stale"
+        );
+        assert!(crate::is_stale(now, now, Duration::ZERO));
+    }
+
+    #[test]
+    fn sweep_uses_server_clock_not_client_clock() {
+        let server = FaultServer::start();
+        // Server clock two hours behind the client: by the client clock a
+        // fresh temp would look two hours old.
+        server.faults.mtime_skew_secs.store(-7200, Ordering::SeqCst);
+        std::fs::write(server.path(".tmp.index.0123456789abcdef"), b"live").unwrap();
+
+        let backend = server.backend(0);
+        assert_eq!(
+            backend
+                .remove_stale_temp_files(Duration::from_secs(3600))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            server.temps_next_to("index"),
+            vec![".tmp.index.0123456789abcdef".to_string()],
+            "live temp kept and probe removed"
+        );
+    }
+
+    #[test]
+    fn put_replaces_existing_object_without_debris() {
+        let server = FaultServer::start();
+        let backend = server.backend(0);
+        backend.put("index", b"old index").unwrap();
+        backend.put("index", b"new index bytes").unwrap();
+        backend
+            .put_owned("packs/ab/abcd", vec![7; 100_000])
+            .unwrap();
+
+        assert_eq!(read(&server, "index"), b"new index bytes");
+        assert_eq!(read(&server, "packs/ab/abcd"), vec![7; 100_000]);
+        assert!(server.temps_next_to("index").is_empty());
+        assert!(server.temps_next_to("packs/ab/abcd").is_empty());
+        assert_eq!(backend.get("index").unwrap().unwrap(), b"new index bytes");
+    }
+
+    #[test]
+    fn refused_rename_keeps_old_object_and_removes_temp() {
+        let server = FaultServer::start();
+        let backend = server.backend(3);
+        backend.put("index", b"old index").unwrap();
+
+        server.faults.refuse_rename.store(true, Ordering::SeqCst);
+        assert!(backend.put("index", b"new index").is_err());
+
+        assert_eq!(read(&server, "index"), b"old index");
+        assert!(server.temps_next_to("index").is_empty());
+    }
+
+    #[test]
+    fn lost_rename_reply_is_retried_to_success() {
+        let server = FaultServer::start();
+        let backend = server.backend(3);
+        backend.put("index", b"old index").unwrap();
+
+        server
+            .faults
+            .drop_rename_reply_once
+            .store(true, Ordering::SeqCst);
+        backend.put("index", b"new index").unwrap();
+
+        assert_eq!(read(&server, "index"), b"new index");
+        // One rename whose reply was lost, one from the retry, plus the seed.
+        assert_eq!(server.faults.renames.load(Ordering::SeqCst), 3);
+        assert!(server.temps_next_to("index").is_empty());
+    }
+
+    #[test]
+    fn dropped_connection_mid_write_leaves_destination_untouched() {
+        let server = FaultServer::start();
+        backend_put_seed(&server);
+
+        server
+            .faults
+            .drop_on_write_once
+            .store(true, Ordering::SeqCst);
+        let backend = server.backend(0);
+        assert!(backend.put("index", b"new index").is_err());
+
+        assert_eq!(read(&server, "index"), b"old index");
+        let temps = server.temps_next_to("index");
+        assert_eq!(temps.len(), 1, "{temps:?}");
+        assert!(temps[0].starts_with(".tmp.index."), "{temps:?}");
+
+        // Listing hides the debris; the sweep removes it.
+        let backend = server.backend(0);
+        let listed = backend.list_sized("").unwrap();
+        assert_eq!(
+            listed,
+            vec![ListedObject {
+                key: "index".into(),
+                size: Some(9)
+            }]
+        );
+        assert_eq!(
+            backend
+                .remove_stale_temp_files(Duration::from_secs(3600))
+                .unwrap(),
+            0,
+            "fresh debris is kept"
+        );
+        assert_eq!(backend.remove_stale_temp_files(Duration::ZERO).unwrap(), 1);
+        assert!(server.temps_next_to("index").is_empty());
+        assert_eq!(read(&server, "index"), b"old index");
+    }
+
+    #[test]
+    fn retry_removes_temp_left_by_dropped_connection() {
+        let server = FaultServer::start();
+        backend_put_seed(&server);
+
+        server
+            .faults
+            .drop_on_write_once
+            .store(true, Ordering::SeqCst);
+        let backend = server.backend(3);
+        backend.put("index", b"new index").unwrap();
+
+        assert_eq!(read(&server, "index"), b"new index");
+        assert!(server.temps_next_to("index").is_empty());
+    }
+
+    #[test]
+    fn sweep_leaves_foreign_directories_alone() {
+        let server = FaultServer::start();
+        backend_put_seed(&server);
+        let foreign = server.path("other-app/.tmp.cache");
+        std::fs::create_dir_all(foreign.parent().unwrap()).unwrap();
+        std::fs::write(&foreign, b"x").unwrap();
+        std::fs::create_dir_all(server.path("packs/ab")).unwrap();
+        std::fs::write(server.path("packs/ab/.tmp.x.0"), b"x").unwrap();
+
+        let backend = server.backend(0);
+        assert_eq!(backend.remove_stale_temp_files(Duration::ZERO).unwrap(), 1);
+        assert!(foreign.exists());
+        assert!(server.temps_next_to("packs/ab/x").is_empty());
+    }
+
+    fn backend_put_seed(server: &FaultServer) {
+        server.backend(0).put("index", b"old index").unwrap();
     }
 }

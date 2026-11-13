@@ -414,3 +414,51 @@ mod server_side {
         assert_eq!(log.events(), ["repack", "put index", "put index.gen"]);
     }
 }
+
+/// Records `remove_stale_temp_files` calls.
+struct SweepRecorder {
+    inner: std::sync::Arc<dyn vykar_storage::StorageBackend>,
+    calls: std::sync::Mutex<Vec<std::time::Duration>>,
+}
+
+impl vykar_storage::InnerBackend for SweepRecorder {
+    fn inner_backend(&self) -> &dyn vykar_storage::StorageBackend {
+        &*self.inner
+    }
+}
+
+vykar_storage::delegate_storage_backend! {
+    for SweepRecorder;
+    except [remove_stale_temp_files];
+
+    fn remove_stale_temp_files(
+        &self,
+        older_than: std::time::Duration,
+    ) -> vykar_types::error::Result<usize> {
+        self.calls.lock().unwrap().push(older_than);
+        Ok(2)
+    }
+}
+
+#[test]
+fn compact_sweeps_temp_files_once_and_never_on_dry_run() {
+    for dry_run in [true, false] {
+        let mut repo = test_repo_plaintext();
+        store_two_chunks(&mut repo);
+        let recorder = std::sync::Arc::new(SweepRecorder {
+            inner: std::sync::Arc::clone(&repo.storage),
+            calls: Default::default(),
+        });
+        repo.storage = recorder.clone();
+
+        let stats = compact_repo(&mut repo, 10.0, None, dry_run, 4, None).unwrap();
+        let calls = recorder.calls.lock().unwrap().clone();
+        if dry_run {
+            assert!(calls.is_empty(), "dry run must not sweep");
+            assert_eq!(stats.temp_files_removed, 0);
+        } else {
+            assert_eq!(calls, vec![std::time::Duration::from_secs(3600)]);
+            assert_eq!(stats.temp_files_removed, 2);
+        }
+    }
+}

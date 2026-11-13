@@ -18,7 +18,7 @@ use crate::retry::HttpRetryError;
 use crate::RetryConfig;
 use vykar_types::error::{Result, VykarError};
 
-use crate::StorageBackend;
+use crate::{ListedObject, StorageBackend};
 
 mod multipart;
 
@@ -308,6 +308,14 @@ impl StorageBackend for S3Backend {
     }
 
     fn list(&self, prefix: &str) -> Result<Vec<String>> {
+        Ok(self
+            .list_sized(prefix)?
+            .into_iter()
+            .map(|o| o.key)
+            .collect())
+    }
+
+    fn list_sized(&self, prefix: &str) -> Result<Vec<ListedObject>> {
         let full_prefix = self.full_key(prefix);
         let root_prefix_len = if self.root.is_empty() {
             0
@@ -372,11 +380,15 @@ impl StorageBackend for S3Backend {
                     continue;
                 }
                 // Strip root prefix to return relative keys
-                if root_prefix_len > 0 && key.len() > root_prefix_len {
-                    keys.push(key[root_prefix_len..].to_string());
+                let key = if root_prefix_len > 0 && key.len() > root_prefix_len {
+                    key[root_prefix_len..].to_string()
                 } else {
-                    keys.push(key);
-                }
+                    key
+                };
+                keys.push(ListedObject {
+                    key,
+                    size: obj.size,
+                });
             }
 
             match parsed.next_continuation_token {
@@ -1018,6 +1030,32 @@ mod tests {
         let backend = s3_backend(port, no_retry(), false);
         let keys = backend.list("snapshots/").unwrap();
         assert_eq!(keys, vec!["snapshots/abc", "snapshots/def"]);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn list_sized_single_page_reports_sizes() {
+        let xml = list_xml(&[("snapshots/abc", 100), ("snapshots/def", 200)], None);
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{xml}",
+            xml.len()
+        );
+        let (port, handle) = mock_server(&resp);
+        let backend = s3_backend(port, no_retry(), false);
+        let listed = backend.list_sized("snapshots/").unwrap();
+        assert_eq!(
+            listed,
+            vec![
+                ListedObject {
+                    key: "snapshots/abc".into(),
+                    size: Some(100)
+                },
+                ListedObject {
+                    key: "snapshots/def".into(),
+                    size: Some(200)
+                },
+            ]
+        );
         handle.join().unwrap();
     }
 

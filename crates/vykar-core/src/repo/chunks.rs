@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use super::format::{pack_object_with_context, ObjectType};
 use super::pack::{self, compute_data_pack_target, PackType, SealedPack};
+use super::write_session::PendingUpload;
 use super::Repository;
 use crate::compress;
 use crate::index::PendingChunkEntry;
@@ -198,6 +199,16 @@ impl Repository {
 
         if should_flush {
             self.flush_writer_async(pack_type)?;
+        } else {
+            // Journal confirmed packs as soon as their upload finishes rather
+            // than at the next seal, so a SIGKILL loses as little as possible.
+            let ws = self
+                .write_session
+                .as_mut()
+                .expect("no active write session");
+            if ws.pending_uploads.iter().any(|u| u.handle.is_finished()) {
+                ws.drain_finished_uploads(&*self.storage, &*self.crypto)?;
+            }
         }
 
         Ok(stored_size)
@@ -265,9 +276,8 @@ impl Repository {
                 },
             )
             .collect();
-        ws.pending_journal.record_pack(pack_id, journal_chunks);
-
-        // Record pack ID for rollback tracking (dump / per-file backup).
+        // Record pack ID for rollback tracking (dump / per-file backup). The
+        // journal entry itself waits for the upload to be confirmed.
         if let Some(ref mut tracker) = ws.rollback_tracker {
             tracker.journal_pack_ids.push(pack_id);
         }
@@ -282,7 +292,12 @@ impl Repository {
             .as_mut()
             .expect("write session active while flushing writer")
             .pending_uploads
-            .push(std::thread::spawn(move || data.put_to(&*storage, &key)));
+            .push(PendingUpload {
+                pack_id,
+                journal_chunks,
+                journal: true,
+                handle: std::thread::spawn(move || data.put_to(&*storage, &key)),
+            });
 
         Ok(())
     }

@@ -4,7 +4,7 @@ use std::path::{Component, Path, PathBuf};
 
 use vykar_types::error::{Result, VykarError};
 
-use crate::StorageBackend;
+use crate::{ListedObject, StorageBackend};
 
 /// Storage backend for local filesystem using `std::fs` directly.
 pub struct LocalBackend {
@@ -149,21 +149,63 @@ impl StorageBackend for LocalBackend {
     }
 
     fn list(&self, prefix: &str) -> Result<Vec<String>> {
-        let dir = if prefix.is_empty() {
-            self.root.clone()
-        } else {
-            self.resolve(prefix)?
-        };
-        match fs::metadata(&dir) {
-            Ok(meta) if meta.is_dir() => {
-                let mut keys = Vec::new();
-                self.list_recursive(&dir, &mut keys)?;
-                Ok(keys)
-            }
-            Ok(_) => Ok(Vec::new()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-            Err(e) => Err(e.into()),
+        Ok(self
+            .list_entries(prefix, false)?
+            .into_iter()
+            .map(|o| o.key)
+            .collect())
+    }
+
+    fn list_sized(&self, prefix: &str) -> Result<Vec<ListedObject>> {
+        self.list_entries(prefix, true)
+    }
+
+    fn remove_stale_temp_files(&self, older_than: std::time::Duration) -> Result<usize> {
+        if !self.root.is_dir() {
+            return Ok(0);
         }
+        // On a network mount the mtime comes from the file server, so "now"
+        // must too.
+        let now = if older_than.is_zero() {
+            None
+        } else {
+            match self.storage_now()? {
+                Some(now) => Some(now),
+                None => {
+                    tracing::debug!("storage reported no mtime; skipping temp sweep");
+                    return Ok(0);
+                }
+            }
+        };
+        let mut removed = 0;
+        self.walk_repo_files(&mut |entry, key| {
+            if !vykar_protocol::is_repo_temp_file(key) {
+                return Ok(());
+            }
+            if let Some(now) = now {
+                // A concurrent `put` may rename its temp file away mid-walk.
+                let modified = match entry.metadata().and_then(|m| m.modified()) {
+                    Ok(m) => m,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                    Err(e) => {
+                        tracing::warn!(key, "cannot stat temp file, skipping: {e}");
+                        return Ok(());
+                    }
+                };
+                if !crate::is_stale(now, modified, older_than) {
+                    return Ok(());
+                }
+            }
+            // One undeletable file must not fail the sweep (and with it
+            // delete-repo); it is logged and left for the next run.
+            match fs::remove_file(entry.path()) {
+                Ok(()) => removed += 1,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => tracing::warn!(key, "cannot remove temp file: {e}"),
+            }
+            Ok(())
+        })?;
+        Ok(removed)
     }
 
     fn get_range(&self, key: &str, offset: u64, length: u64) -> Result<Option<Vec<u8>>> {
@@ -237,27 +279,98 @@ impl StorageBackend for LocalBackend {
         Ok(())
     }
 
-    crate::unsupported_server_ops!();
+    crate::unsupported_server_ops!(except[remove_stale_temp_files]);
 }
 
 impl LocalBackend {
-    /// Recursively list all files under `dir`, adding their paths relative to
-    /// `self.root` as `/`-separated keys.
-    fn list_recursive(&self, dir: &std::path::Path, keys: &mut Vec<String>) -> Result<()> {
+    fn list_entries(&self, prefix: &str, with_size: bool) -> Result<Vec<ListedObject>> {
+        let dir = if prefix.is_empty() {
+            self.root.clone()
+        } else {
+            self.resolve(prefix)?
+        };
+        match fs::metadata(&dir) {
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => return Ok(Vec::new()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        }
+        let mut out = Vec::new();
+        self.walk_files(&dir, &mut |entry, key| {
+            if vykar_protocol::is_temp_file(key) {
+                return Ok(());
+            }
+            let size = if with_size {
+                match entry.metadata() {
+                    Ok(meta) => Some(meta.len()),
+                    // Deleted between `read_dir` and the stat.
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                    Err(e) => return Err(e.into()),
+                }
+            } else {
+                None
+            };
+            out.push(ListedObject {
+                key: key.to_string(),
+                size,
+            });
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    /// The storage's current time: the mtime of a freshly created probe file
+    /// in the root. The probe carries the temp prefix, so a later sweep
+    /// removes it if the cleanup here fails.
+    fn storage_now(&self) -> Result<Option<std::time::SystemTime>> {
+        let probe = tempfile::Builder::new()
+            .prefix(&format!("{}sweep-probe.", vykar_protocol::TEMP_FILE_PREFIX))
+            .rand_bytes(16)
+            .tempfile_in(&self.root)?;
+        Ok(probe.as_file().metadata()?.modified().ok())
+    }
+
+    /// Visit regular files in the repository's own namespace: the root's
+    /// files and everything under [`vykar_protocol::KNOWN_ROOT_DIRS`].
+    /// Foreign subdirectories are not entered.
+    fn walk_repo_files(
+        &self,
+        visit: &mut dyn FnMut(&fs::DirEntry, &str) -> Result<()>,
+    ) -> Result<()> {
+        for entry in fs::read_dir(&self.root)? {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if file_type.is_file() {
+                visit(&entry, &name)?;
+            } else if file_type.is_dir() && vykar_protocol::KNOWN_ROOT_DIRS.contains(&&*name) {
+                self.walk_files(&entry.path(), visit)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Recursively visit all regular files under `dir`, passing each entry and
+    /// its `/`-separated key relative to `self.root`.
+    fn walk_files(
+        &self,
+        dir: &Path,
+        visit: &mut dyn FnMut(&fs::DirEntry, &str) -> Result<()>,
+    ) -> Result<()> {
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
             let file_type = entry.file_type()?;
             if file_type.is_dir() {
-                self.list_recursive(&entry.path(), keys)?;
+                self.walk_files(&entry.path(), visit)?;
             } else if file_type.is_file() {
                 if let Ok(rel) = entry.path().strip_prefix(&self.root) {
-                    // Convert to `/`-separated key to match repository storage keys.
                     let key = rel
                         .components()
                         .map(|c| c.as_os_str().to_string_lossy())
                         .collect::<Vec<_>>()
                         .join("/");
-                    keys.push(key);
+                    visit(&entry, &key)?;
                 }
             }
         }
@@ -412,6 +525,134 @@ mod tests {
                 "snapshots/snap1",
             ]
         );
+    }
+
+    #[test]
+    fn list_and_list_sized_hide_temp_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = LocalBackend::new(dir.path().to_str().unwrap()).unwrap();
+        backend.put("index", b"12345").unwrap();
+        backend.put("packs/ab/pack1", b"pp").unwrap();
+        fs::write(dir.path().join(".tmp.index.0123"), b"partial").unwrap();
+        fs::write(dir.path().join("packs/ab/.tmp.pack1.abcd"), b"x").unwrap();
+
+        let mut keys = backend.list("").unwrap();
+        keys.sort();
+        assert_eq!(keys, vec!["index", "packs/ab/pack1"]);
+
+        let mut sized = backend.list_sized("").unwrap();
+        sized.sort_by(|a, b| a.key.cmp(&b.key));
+        assert_eq!(
+            sized,
+            vec![
+                ListedObject {
+                    key: "index".into(),
+                    size: Some(5)
+                },
+                ListedObject {
+                    key: "packs/ab/pack1".into(),
+                    size: Some(2)
+                },
+            ]
+        );
+        assert_eq!(backend.list("packs/").unwrap(), vec!["packs/ab/pack1"]);
+    }
+
+    #[test]
+    fn remove_stale_temp_files_respects_age_and_walks_subdirs() {
+        use std::time::{Duration, SystemTime};
+
+        let dir = tempfile::tempdir().unwrap();
+        let backend = LocalBackend::new(dir.path().to_str().unwrap()).unwrap();
+        backend.put("index", b"i").unwrap();
+        backend.put("packs/ab/pack1", b"p").unwrap();
+
+        let old = SystemTime::now() - Duration::from_secs(2 * 3600);
+        let stale = [
+            ".tmp.index.1",
+            "keys/.tmp.repokey.2",
+            "snapshots/.tmp.s.3",
+            "packs/ab/.tmp.pack1.4",
+        ];
+        for rel in stale {
+            let path = dir.path().join(rel);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, b"x").unwrap();
+            fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
+        let fresh = dir.path().join("packs/ab/.tmp.pack1.5");
+        fs::write(&fresh, b"x").unwrap();
+
+        let removed = backend
+            .remove_stale_temp_files(Duration::from_secs(3600))
+            .unwrap();
+        assert_eq!(removed, stale.len());
+        for rel in stale {
+            assert!(!dir.path().join(rel).exists(), "{rel} should be swept");
+        }
+        assert!(fresh.exists(), "fresh temp file must survive");
+        assert!(dir.path().join("index").exists());
+        assert!(dir.path().join("packs/ab/pack1").exists());
+    }
+
+    #[test]
+    fn sweep_leaves_foreign_directories_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = LocalBackend::new(dir.path().to_str().unwrap()).unwrap();
+        backend.put("index", b"i").unwrap();
+        let foreign = dir.path().join("other-app/.tmp.cache");
+        fs::create_dir_all(foreign.parent().unwrap()).unwrap();
+        fs::write(&foreign, b"x").unwrap();
+        fs::write(dir.path().join(".tmp.index.1"), b"x").unwrap();
+
+        assert_eq!(
+            backend
+                .remove_stale_temp_files(std::time::Duration::ZERO)
+                .unwrap(),
+            1
+        );
+        assert!(foreign.exists(), "files outside the repo namespace survive");
+        assert!(!dir.path().join(".tmp.index.1").exists());
+        // The clock probe leaves nothing behind.
+        assert_eq!(
+            backend
+                .remove_stale_temp_files(std::time::Duration::from_secs(3600))
+                .unwrap(),
+            0
+        );
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sweep_continues_past_undeletable_temp_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let backend = LocalBackend::new(dir.path().to_str().unwrap()).unwrap();
+        let locked = dir.path().join("packs/aa");
+        fs::create_dir_all(&locked).unwrap();
+        fs::write(locked.join(".tmp.stuck"), b"x").unwrap();
+        fs::create_dir_all(dir.path().join("packs/bb")).unwrap();
+        fs::write(dir.path().join("packs/bb/.tmp.free"), b"x").unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).unwrap();
+        // Root ignores directory mode bits; nothing to test then.
+        if fs::File::create(locked.join("probe")).is_ok() {
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+            return;
+        }
+
+        let removed = backend.remove_stale_temp_files(std::time::Duration::ZERO);
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(removed.unwrap(), 1);
+        assert!(locked.join(".tmp.stuck").exists());
+        assert!(!dir.path().join("packs/bb/.tmp.free").exists());
     }
 
     #[test]

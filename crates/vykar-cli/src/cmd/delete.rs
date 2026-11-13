@@ -139,7 +139,8 @@ pub(crate) fn run_delete_repo(
     if stats.is_local && !stats.root_removed && stats.unknown_entries.is_empty() {
         eprintln!(
             "Note: repository directory '{}' could not be fully removed; \
-             it may contain empty directories or other non-file entries.",
+             it may contain empty directories, other non-file entries, or temp-named \
+             files ('.tmp.*') in directories vykar does not manage.",
             config.repository.url
         );
     }

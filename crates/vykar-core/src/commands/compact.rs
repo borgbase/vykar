@@ -29,7 +29,11 @@ pub struct CompactStats {
     pub space_freed: u64,
     pub packs_corrupt: u64,
     pub packs_orphan: u64,
+    /// Stale `.tmp.*` upload debris removed by the sweep.
+    pub temp_files_removed: u64,
 }
+
+const STALE_TEMP_FILE_AGE: std::time::Duration = std::time::Duration::from_secs(3600);
 
 /// A live blob entry with its location in the source pack.
 struct LiveEntry {
@@ -106,6 +110,15 @@ pub fn compact_repo(
             entry.stored_size,
             entry.pack_offset,
         ));
+    }
+
+    // Sweep upload debris once, from the root, before listing shards. Temp
+    // files younger than this may belong to a live upload.
+    if !dry_run {
+        match repo.storage.remove_stale_temp_files(STALE_TEMP_FILE_AGE) {
+            Ok(n) => stats.temp_files_removed = n as u64,
+            Err(e) => tracing::warn!("compact: failed to sweep stale temp files: {e}"),
+        }
     }
 
     // Discover all packs on disk (256 LIST calls, parallelized).

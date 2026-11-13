@@ -2,7 +2,7 @@
 //! "unsupported" bodies for leaves.
 //!
 //! Every wrapper that holds an inner backend (rate limiter, test recorder, the
-//! `Arc<dyn StorageBackend>` coercion impl) has to forward all 16 trait methods,
+//! `Arc<dyn StorageBackend>` coercion impl) has to forward all 18 trait methods,
 //! and hand-written forwards rot — a forgotten one disabled server-side pack
 //! verification and server init on any throttled REST repo.
 //!
@@ -11,15 +11,16 @@
 //! * [`crate::delegate_storage_backend!`] holds the forwarding inventory in one
 //!   place. A wrapper implements [`InnerBackend`], names the methods it writes by
 //!   hand, and gets forwards for the rest.
-//! * The trait's four capability methods (`server_repack`, `batch_delete_keys`,
-//!   `server_verify_packs`, `server_init`) have **no defaults**, so the inventory
-//!   cannot silently fall behind the trait: adding a fifth breaks every impl,
-//!   this macro included, until it is handled. Leaves that support none of them
-//!   use [`crate::unsupported_server_ops!`].
+//! * The trait's seven capability methods (`remove_stale_temp_files`,
+//!   `server_repack`, `batch_delete_keys`, `server_verify_packs`, `server_init`,
+//!   `bind_content_hash`, `server_capabilities`) have **no defaults**, so the
+//!   inventory cannot silently fall behind the trait: adding an eighth breaks
+//!   every impl, this macro included, until it is handled. Leaves get bodies
+//!   for the ones they do not implement from [`crate::unsupported_server_ops!`].
 //!
 //! What is *not* guarded: a new method with a default body. Wrappers would
 //! inherit it, which is safe by construction for the defaults that exist today
-//! (each routes back through the wrapper's own `get`/`put`/`get_range`), but a
+//! (each routes back through the wrapper's own `get`/`put`/`get_range`/`list`), but a
 //! future default that reports a capability must be added as a required method
 //! instead — see the comment on the trait.
 
@@ -47,9 +48,10 @@ pub mod __macro_support {
 }
 
 /// Implement the capability methods for a backend with no vykar-server behind
-/// it: `UnsupportedBackend` for the server-side APIs, and a no-op for
+/// it: `UnsupportedBackend` for the server-side APIs, a no-op for
 /// `bind_content_hash` (nothing to bind — only `RestBackend` sends a
-/// content-digest header).
+/// content-digest header), and `Ok(0)` for `remove_stale_temp_files` (for
+/// backends that leave no client-side temp files; Local and SFTP implement it).
 ///
 /// Used inside an `impl StorageBackend for _` block. `except [...]` names the
 /// ones the backend does implement itself, in trait-declaration order — same
@@ -68,8 +70,8 @@ macro_rules! unsupported_server_ops {
     };
     (except [$($except:ident),* $(,)?]) => {
         $crate::unsupported_server_ops!(@emit
-            [server_repack batch_delete_keys server_verify_packs server_init
-             bind_content_hash server_capabilities]
+            [remove_stale_temp_files server_repack batch_delete_keys server_verify_packs
+             server_init bind_content_hash server_capabilities]
             [$($except)*]);
     };
 
@@ -79,6 +81,19 @@ macro_rules! unsupported_server_ops {
             "unsupported_server_ops!: `except` entries must be capability methods \
              listed in trait-declaration order"
         );
+    };
+
+    (@emit [remove_stale_temp_files $($rest:ident)*] [remove_stale_temp_files $($except:ident)*]) => {
+        $crate::unsupported_server_ops!(@emit [$($rest)*] [$($except)*]);
+    };
+    (@emit [remove_stale_temp_files $($rest:ident)*] [$($except:ident)*]) => {
+        fn remove_stale_temp_files(
+            &self,
+            _older_than: std::time::Duration,
+        ) -> $crate::__macro_support::Result<usize> {
+            Ok(0)
+        }
+        $crate::unsupported_server_ops!(@emit [$($rest)*] [$($except)*]);
     };
 
     (@emit [server_repack $($rest:ident)*] [server_repack $($except:ident)*]) => {
@@ -195,11 +210,36 @@ macro_rules! delegate_storage_backend {
 
             $crate::delegate_storage_backend!(@forward
                 [get put delete exists list get_range get_range_into create_dir
-                 put_owned size server_repack batch_delete_keys
+                 put_owned size list_sized remove_stale_temp_files
+                 server_repack batch_delete_keys
                  server_verify_packs server_init bind_content_hash
                  server_capabilities]
                 [$($except)*]);
         }
+        $crate::delegate_storage_backend!(@check_list [$($except)*] [] []);
+    };
+
+    // ── Guard: overriding `list` requires overriding `list_sized` ─────────
+    //
+    // Otherwise the generated `list_sized` forwards straight to the inner
+    // backend, silently bypassing whatever the `list` override intercepts.
+
+    (@check_list [] [] $sized:tt) => {};
+    (@check_list [] [list] [list_sized]) => {};
+    (@check_list [] [list] []) => {
+        compile_error!(
+            "delegate_storage_backend!: a wrapper that overrides `list` must also \
+             override `list_sized`, or sized listings bypass it"
+        );
+    };
+    (@check_list [list $($rest:ident)*] [] $sized:tt) => {
+        $crate::delegate_storage_backend!(@check_list [$($rest)*] [list] $sized);
+    };
+    (@check_list [list_sized $($rest:ident)*] $list:tt []) => {
+        $crate::delegate_storage_backend!(@check_list [$($rest)*] $list [list_sized]);
+    };
+    (@check_list [$other:ident $($rest:ident)*] $list:tt $sized:tt) => {
+        $crate::delegate_storage_backend!(@check_list [$($rest)*] $list $sized);
     };
 
     // ── Muncher ────────────────────────────────────────────────────────────
@@ -324,6 +364,32 @@ macro_rules! delegate_storage_backend {
     (@forward [size $($rest:ident)*] [$($except:ident)*]) => {
         fn size(&self, key: &str) -> $crate::__macro_support::Result<Option<u64>> {
             $crate::InnerBackend::inner_backend(self).size(key)
+        }
+        $crate::delegate_storage_backend!(@forward [$($rest)*] [$($except)*]);
+    };
+
+    (@forward [list_sized $($rest:ident)*] [list_sized $($except:ident)*]) => {
+        $crate::delegate_storage_backend!(@forward [$($rest)*] [$($except)*]);
+    };
+    (@forward [list_sized $($rest:ident)*] [$($except:ident)*]) => {
+        fn list_sized(
+            &self,
+            prefix: &str,
+        ) -> $crate::__macro_support::Result<Vec<$crate::ListedObject>> {
+            $crate::InnerBackend::inner_backend(self).list_sized(prefix)
+        }
+        $crate::delegate_storage_backend!(@forward [$($rest)*] [$($except)*]);
+    };
+
+    (@forward [remove_stale_temp_files $($rest:ident)*] [remove_stale_temp_files $($except:ident)*]) => {
+        $crate::delegate_storage_backend!(@forward [$($rest)*] [$($except)*]);
+    };
+    (@forward [remove_stale_temp_files $($rest:ident)*] [$($except:ident)*]) => {
+        fn remove_stale_temp_files(
+            &self,
+            older_than: ::std::time::Duration,
+        ) -> $crate::__macro_support::Result<usize> {
+            $crate::InnerBackend::inner_backend(self).remove_stale_temp_files(older_than)
         }
         $crate::delegate_storage_backend!(@forward [$($rest)*] [$($except)*]);
     };
@@ -468,6 +534,14 @@ mod tests {
             self.hit();
             Ok(None)
         }
+        fn list_sized(&self, _prefix: &str) -> Result<Vec<crate::ListedObject>> {
+            self.hit();
+            Ok(Vec::new())
+        }
+        fn remove_stale_temp_files(&self, _older_than: std::time::Duration) -> Result<usize> {
+            self.hit();
+            Ok(0)
+        }
         fn server_repack(
             &self,
             _plan: &vykar_protocol::RepackPlanRequest,
@@ -535,7 +609,7 @@ mod tests {
     ///
     /// This covers the methods that *have* trait defaults — for those a
     /// forgotten forward compiles, so only a call-count assertion catches it.
-    /// The four capability methods are covered by the compiler instead (no
+    /// The seven capability methods are covered by the compiler instead (no
     /// default ⇒ a missing forward is an error), which is what keeps the
     /// inventory from drifting behind the trait.
     #[test]
@@ -560,6 +634,9 @@ mod tests {
         w.create_dir("d").unwrap();
         w.put_owned("k", vec![1]).unwrap();
         w.size("k").unwrap();
+        w.list_sized("p").unwrap();
+        w.remove_stale_temp_files(std::time::Duration::ZERO)
+            .unwrap();
         w.server_repack(&vykar_protocol::RepackPlanRequest::new(
             Vec::new(),
             vykar_types::hash::HashAlgorithm::Blake3,
@@ -576,7 +653,7 @@ mod tests {
             .unwrap();
         w.server_capabilities().unwrap();
 
-        // 16 trait methods, 15 of them forwarded.
-        assert_eq!(w.inner.calls.load(Ordering::SeqCst), 15);
+        // 18 trait methods, 17 of them forwarded.
+        assert_eq!(w.inner.calls.load(Ordering::SeqCst), 17);
     }
 }

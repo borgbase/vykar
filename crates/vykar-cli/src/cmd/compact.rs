@@ -68,4 +68,10 @@ fn print_compact_warnings(stats: &commands::compact::CompactStats) {
             stats.packs_orphan,
         );
     }
+    if stats.temp_files_removed > 0 {
+        eprintln!(
+            "  Removed {} stale temp file(s) from interrupted uploads",
+            stats.temp_files_removed,
+        );
+    }
 }

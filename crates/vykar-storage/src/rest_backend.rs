@@ -18,7 +18,7 @@ use crate::RetryConfig;
 use vykar_types::error::{Result, VykarError};
 
 use crate::{
-    RepackPlanRequest, RepackResultResponse, ServerCapabilities, StorageBackend,
+    ListedObject, RepackPlanRequest, RepackResultResponse, ServerCapabilities, StorageBackend,
     VerifyPacksPlanRequest, VerifyPacksResponse,
 };
 use vykar_types::hash::HashAlgorithm;
@@ -441,6 +441,42 @@ impl RestBackend {
     }
 }
 
+impl RestBackend {
+    /// GET a listing; `sized` adds `&sized` (see [`vykar_protocol::SizedKey`]).
+    fn fetch_listing(&self, prefix: &str, sized: bool) -> Result<Vec<u8>> {
+        let query = if sized { "list&sized" } else { "list" };
+        let prefix = prefix.trim_start_matches('/');
+        let url = if prefix.is_empty() {
+            format!("{}?{query}", self.base_url)
+        } else {
+            format!("{}?{query}", self.url(prefix))
+        };
+        self.retry_call(
+            &format!("LIST {prefix}"),
+            || {
+                let req = self.authed(self.agent.get(&url));
+                Self::recv_response_within(req, self.timeouts.admin).call()
+            },
+            |mut resp| {
+                let status = resp.status().as_u16();
+                if status >= 400 {
+                    crate::retry::classify_status(
+                        status,
+                        format!("REST LIST {prefix}: HTTP {status}"),
+                    )?;
+                }
+                let mut buf = Vec::new();
+                resp.body_mut()
+                    .as_reader()
+                    .read_to_end(&mut buf)
+                    .map_err(HttpRetryError::BodyIo)?;
+                Ok(buf)
+            },
+        )
+        .map_err(|e| VykarError::Other(format!("REST LIST {prefix}: {e}")))
+    }
+}
+
 impl StorageBackend for RestBackend {
     fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
         let url = self.url(key);
@@ -545,39 +581,37 @@ impl StorageBackend for RestBackend {
     }
 
     fn list(&self, prefix: &str) -> Result<Vec<String>> {
-        let prefix = prefix.trim_start_matches('/');
-        let url = if prefix.is_empty() {
-            format!("{}?list", self.base_url)
-        } else {
-            format!("{}?list", self.url(prefix))
-        };
-        let body = self
-            .retry_call(
-                &format!("LIST {prefix}"),
-                || {
-                    let req = self.authed(self.agent.get(&url));
-                    Self::recv_response_within(req, self.timeouts.admin).call()
-                },
-                |mut resp| {
-                    let status = resp.status().as_u16();
-                    if status >= 400 {
-                        crate::retry::classify_status(
-                            status,
-                            format!("REST LIST {prefix}: HTTP {status}"),
-                        )?;
-                    }
-                    let mut buf = Vec::new();
-                    resp.body_mut()
-                        .as_reader()
-                        .read_to_end(&mut buf)
-                        .map_err(HttpRetryError::BodyIo)?;
-                    Ok(buf)
-                },
-            )
-            .map_err(|e| VykarError::Other(format!("REST LIST {prefix}: {e}")))?;
-        let keys: Vec<String> = serde_json::from_slice(&body)
+        // Plain listing: sizes would roughly double large pack listings only
+        // to be discarded.
+        let body = self.fetch_listing(prefix, false)?;
+        serde_json::from_slice(&body)
+            .map_err(|e| VykarError::Other(format!("REST LIST parse: {e}")))
+    }
+
+    fn list_sized(&self, prefix: &str) -> Result<Vec<ListedObject>> {
+        let body = self.fetch_listing(prefix, true)?;
+        // A server that predates `sized` ignores it and returns bare keys.
+        #[derive(serde::Deserialize)]
+        #[serde(untagged)]
+        enum Listing {
+            Sized(Vec<vykar_protocol::SizedKey>),
+            Plain(Vec<String>),
+        }
+        let listing: Listing = serde_json::from_slice(&body)
             .map_err(|e| VykarError::Other(format!("REST LIST parse: {e}")))?;
-        Ok(keys)
+        Ok(match listing {
+            Listing::Sized(keys) => keys
+                .into_iter()
+                .map(|k| ListedObject {
+                    key: k.key,
+                    size: Some(k.size),
+                })
+                .collect(),
+            Listing::Plain(keys) => keys
+                .into_iter()
+                .map(|key| ListedObject { key, size: None })
+                .collect(),
+        })
     }
 
     fn get_range(&self, key: &str, offset: u64, length: u64) -> Result<Option<Vec<u8>>> {
@@ -666,6 +700,11 @@ impl StorageBackend for RestBackend {
         )
         .map_err(|e| VykarError::Other(format!("REST MKDIR {key}: {e}")))?;
         Ok(())
+    }
+
+    fn remove_stale_temp_files(&self, _older_than: std::time::Duration) -> Result<usize> {
+        // The server sweeps its own temp files.
+        Ok(0)
     }
 
     fn server_repack(&self, plan: &RepackPlanRequest) -> Result<RepackResultResponse> {
@@ -946,6 +985,52 @@ mod tests {
             "the server's message must reach the user, got: {err}"
         );
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn list_requests_plain_listing() {
+        let (url, request) = capture_request(&json_response(r#"["config"]"#));
+        let backend = RestBackend::new(&url, None, no_retry(), None).unwrap();
+        assert_eq!(backend.list("").unwrap(), vec!["config".to_string()]);
+        let request = request.join().unwrap();
+        assert!(request.starts_with("GET /?list "), "got:\n{request}");
+    }
+
+    #[test]
+    fn list_sized_parses_sized_and_plain_listings() {
+        let (url, request) = capture_request(&json_response(r#"[{"key":"packs/ab/x","size":42}]"#));
+        let backend = RestBackend::new(&url, None, no_retry(), None).unwrap();
+        assert_eq!(
+            backend.list_sized("packs").unwrap(),
+            vec![ListedObject {
+                key: "packs/ab/x".into(),
+                size: Some(42)
+            }]
+        );
+        let request = request.join().unwrap();
+        assert!(
+            request.starts_with("GET /packs?list&sized "),
+            "got:\n{request}"
+        );
+
+        // An old server ignores `sized` and returns bare keys.
+        let (url, request) = capture_request(&json_response(r#"["config","index"]"#));
+        let backend = RestBackend::new(&url, None, no_retry(), None).unwrap();
+        assert_eq!(
+            backend.list_sized("").unwrap(),
+            vec![
+                ListedObject {
+                    key: "config".into(),
+                    size: None
+                },
+                ListedObject {
+                    key: "index".into(),
+                    size: None
+                },
+            ]
+        );
+        let request = request.join().unwrap();
+        assert!(request.starts_with("GET /?list&sized "), "got:\n{request}");
     }
 
     /// Serve one canned response and hand back the full request text.

@@ -62,18 +62,38 @@ pub(super) async fn batch_delete(
 
     if cleanup_dirs {
         let data_dir = &state_clone.inner.data_dir;
+        // Listings hide temp files, so the client cannot name them; purge
+        // them here so their directories can go too. Never in append-only
+        // mode: an empty key list passes the guard above, and the purge would
+        // destroy other clients' in-flight uploads. (Delete-repo cannot get
+        // this far there anyway; it fails on its first committed key.)
+        //
+        // Otherwise the server cannot know whether a concurrent PUT is live
+        // (delete-repo takes no lock). Unlinking its temp file only fails that
+        // PUT (`persist` hits NotFound, the client retries), the same outcome
+        // as the 24 h sweep catching a stalled upload; and the repository it
+        // targets is being deleted anyway.
+        let purged = if state_clone.inner.config.append_only {
+            Vec::new()
+        } else {
+            let purge_dir = data_dir.clone();
+            tokio::task::spawn_blocking(move || crate::cleanup::purge_temp_files(&purge_dir))
+                .await
+                .map_err(|e| ServerError::Internal(format!("temp purge task failed: {e}")))?
+        };
         let mut dirs: std::collections::BTreeSet<std::path::PathBuf> =
             std::collections::BTreeSet::new();
-        for key in &keys {
-            if let Some(p) = state_clone.file_path_for_cleanup(key) {
-                let mut cur = p.parent().map(std::path::Path::to_path_buf);
-                while let Some(d) = cur {
-                    if d == *data_dir || !d.starts_with(data_dir) {
-                        break;
-                    }
-                    dirs.insert(d.clone());
-                    cur = d.parent().map(std::path::Path::to_path_buf);
+        let deleted = keys
+            .iter()
+            .filter_map(|key| state_clone.file_path_for_cleanup(key));
+        for p in deleted.chain(purged) {
+            let mut cur = p.parent().map(std::path::Path::to_path_buf);
+            while let Some(d) = cur {
+                if d == *data_dir || !d.starts_with(data_dir) {
+                    break;
                 }
+                dirs.insert(d.clone());
+                cur = d.parent().map(std::path::Path::to_path_buf);
             }
         }
         // Sort deepest-first so children are removed before parents.
@@ -240,6 +260,44 @@ mod tests {
             !data_dir.join("snapshots").exists(),
             "snapshots dir should be removed"
         );
+    }
+
+    #[tokio::test]
+    async fn batch_delete_cleanup_dirs_purges_unlisted_temps() {
+        let (router, _state, tmp) = setup_app(0);
+        let data_dir = tmp.path();
+
+        std::fs::write(data_dir.join("config"), b"cfg").unwrap();
+        std::fs::write(data_dir.join(".tmp.config.0"), b"partial").unwrap();
+        // packs/ab holds only a temp file; no committed key names it.
+        std::fs::write(data_dir.join("packs/ab/.tmp.deadbeef.0"), b"partial").unwrap();
+        // Leave packs/ab as the only shard so packs/ can go too.
+        for entry in std::fs::read_dir(data_dir.join("packs")).unwrap() {
+            let path = entry.unwrap().path();
+            if path.file_name().unwrap() != "ab" {
+                std::fs::remove_dir(path).unwrap();
+            }
+        }
+
+        let keys = serde_json::to_vec(&serde_json::json!(["config"])).unwrap();
+        let resp = authed_post(router.clone(), "/?batch-delete&cleanup-dirs", keys).await;
+        assert_status(&resp, StatusCode::NO_CONTENT);
+
+        assert!(!data_dir.join(".tmp.config.0").exists());
+        assert!(!data_dir.join("packs/ab").exists());
+        assert!(!data_dir.join("packs").exists());
+    }
+
+    #[tokio::test]
+    async fn append_only_cleanup_dirs_does_not_purge_temps() {
+        let (router, _state, tmp) = setup_app_append_only(0);
+        let live = tmp.path().join("packs/ab/.tmp.inflight.0");
+        std::fs::write(&live, b"uploading").unwrap();
+
+        let keys = serde_json::to_vec(&serde_json::json!([])).unwrap();
+        let resp = authed_post(router, "/?batch-delete&cleanup-dirs", keys).await;
+        assert_status(&resp, StatusCode::NO_CONTENT);
+        assert!(live.exists(), "another client's upload must survive");
     }
 
     #[tokio::test]

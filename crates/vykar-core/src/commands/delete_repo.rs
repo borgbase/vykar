@@ -20,28 +20,26 @@ pub struct DeleteRepoStats {
 pub fn run(config: &VykarConfig) -> Result<DeleteRepoStats> {
     let backend = backend_from_config(&config.repository, config.limits.connections)?;
 
-    // List all keys in the repo (recursive on all backends)
-    let all_keys = backend.list("")?;
-
-    // Partition into known vykar keys and unknown entries
-    let mut known = Vec::new();
-    let mut unknown = Vec::new();
-    for key in &all_keys {
-        if is_known_repo_key(key) {
-            known.push(key.clone());
-        } else {
-            unknown.push(key.clone());
-        }
-    }
+    let (known, unknown): (Vec<String>, Vec<String>) = backend
+        .list("")?
+        .into_iter()
+        .partition(|k| is_known_repo_key(k));
 
     // If there are no known repo keys at all, this isn't a vykar repository
     if known.is_empty() {
         return Err(VykarError::RepoNotFound(config.repository.url.clone()));
     }
 
-    let keys_deleted = known.len() as u64;
+    // No maintenance lock, deliberately: taking one is a write, which would
+    // block deleting a repo on a full disk/quota or a read-only backend, and
+    // it would buy nothing — deleting the repository breaks a concurrent
+    // backup regardless of whether its temp files go too.
+    //
+    // `list` hides temp files from interrupted uploads; sweep them regardless
+    // of age so the directories can be removed. Runs before deleting known keys:
+    // if the sweep fails, the repo is still intact and a rerun retries it.
+    let temps_deleted = backend.remove_stale_temp_files(std::time::Duration::ZERO)?;
 
-    // Delete only known keys
     match backend.batch_delete_keys(&known) {
         Ok(()) => {}
         Err(VykarError::UnsupportedBackend(_)) => {
@@ -51,6 +49,7 @@ pub fn run(config: &VykarConfig) -> Result<DeleteRepoStats> {
         }
         Err(e) => return Err(e),
     }
+    let keys_deleted = (known.len() + temps_deleted) as u64;
 
     let parsed = parse_repo_url(&config.repository.url)?;
     let mut root_removed = false;

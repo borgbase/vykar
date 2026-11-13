@@ -451,8 +451,8 @@ fn process_read_group(
     Ok(())
 }
 
-/// Write `buf` to the target file at `offset`.  Opens/creates the file handle
-/// on first access and calls CAS `set_len`.  Increments `bytes_written`.
+/// Write `buf` to the target file at `offset`.  Opens the (already staged)
+/// file on first access.  Increments `bytes_written`.
 fn write_buf(
     buf: &[u8],
     file_idx: usize,
@@ -467,23 +467,21 @@ fn write_buf(
             .get(file_idx)
             .ok_or_else(|| VykarError::Other(format!("file_idx {file_idx} out of range")))?;
         let full_path = root.join(&pf.rel_path);
-        // Create-on-first-write: truncate(false) prevents one worker from
-        // destroying another worker's writes to the same file.
-        let handle = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&full_path)
-            .map_err(|e| {
-                VykarError::Other(format!(
-                    "failed to open {} for writing: {e}",
-                    full_path.display()
-                ))
-            })?;
-        // CAS: only the first opener calls set_len (ftruncate).
-        if !pf.created.swap(true, Ordering::AcqRel) {
-            handle.set_len(pf.total_size)?;
+        // Staging already created and sized the file; never create or
+        // truncate here, and never follow a symlink at the leaf.
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.custom_flags(libc::O_NOFOLLOW);
         }
+        let handle = opts.open(&full_path).map_err(|e| {
+            VykarError::Other(format!(
+                "failed to open {} for writing: {e}",
+                full_path.display()
+            ))
+        })?;
         file_handles.insert(file_idx, handle);
     }
     let fh = file_handles
@@ -529,7 +527,7 @@ mod tests {
     use crate::commands::restore::plan::WriteTarget;
     use crate::commands::restore::read_groups::PlannedBlob;
     use crate::commands::restore::test_support::{
-        dummy_chunk_id, dummy_pack_id, multi_blob_group, pack_blob, single_blob_group,
+        dummy_chunk_id, dummy_pack_id, multi_blob_group, pack_blob, single_blob_group, stage_files,
     };
     use crate::compress::Compression;
     use crate::repo::format::pack_object_with_context;
@@ -557,7 +555,6 @@ mod tests {
             uid: 0,
             gid: 0,
             xattrs: None,
-            created: AtomicBool::new(true), // pre-created in test
         }];
 
         let payload = b"abc";
@@ -640,7 +637,6 @@ mod tests {
             uid: 0,
             gid: 0,
             xattrs: None,
-            created: AtomicBool::new(false),
         }];
 
         let pack_id = dummy_pack_id(1);
@@ -659,6 +655,7 @@ mod tests {
             }],
         );
 
+        stage_files(temp.path(), &files);
         let bytes_written = AtomicU64::new(0);
         let cancelled = AtomicBool::new(false);
         let mut data_buf = Vec::new();
@@ -712,7 +709,6 @@ mod tests {
             uid: 0,
             gid: 0,
             xattrs: None,
-            created: AtomicBool::new(false),
         }];
 
         let pack_id = dummy_pack_id(2);
@@ -744,6 +740,7 @@ mod tests {
         backend.put(&pack_id.storage_key(), &pack_data).unwrap();
         let storage: Arc<dyn StorageBackend> = backend;
 
+        stage_files(temp.path(), &files);
         let bytes_written = AtomicU64::new(0);
         let cancelled = AtomicBool::new(false);
         let mut data_buf = Vec::new();
@@ -799,7 +796,6 @@ mod tests {
                 uid: 0,
                 gid: 0,
                 xattrs: None,
-                created: AtomicBool::new(false),
             },
             PlannedFile {
                 rel_path: PathBuf::from("b.bin"),
@@ -809,7 +805,6 @@ mod tests {
                 uid: 0,
                 gid: 0,
                 xattrs: None,
-                created: AtomicBool::new(false),
             },
         ];
 
@@ -842,6 +837,7 @@ mod tests {
         backend.put(&pack_id.storage_key(), &pack_data).unwrap();
         let storage: Arc<dyn StorageBackend> = backend;
 
+        stage_files(temp.path(), &files);
         let bytes_written = AtomicU64::new(0);
         let cancelled = AtomicBool::new(false);
         let mut data_buf = Vec::new();
@@ -908,7 +904,6 @@ mod tests {
             uid: 0,
             gid: 0,
             xattrs: None,
-            created: AtomicBool::new(false),
         }];
 
         let pack_id = dummy_pack_id(4);
@@ -918,6 +913,7 @@ mod tests {
         backend.put(&pack_id.storage_key(), &pack_data).unwrap();
         let storage: Arc<dyn StorageBackend> = backend;
 
+        stage_files(temp.path(), &files);
         let bytes_written = AtomicU64::new(0);
         let cancelled = AtomicBool::new(false);
         let mut data_buf = Vec::new();
@@ -967,7 +963,6 @@ mod tests {
             uid: 0,
             gid: 0,
             xattrs: None,
-            created: AtomicBool::new(false),
         }];
 
         let pack_id = dummy_pack_id(7);
@@ -986,6 +981,7 @@ mod tests {
             }],
         );
 
+        stage_files(temp.path(), &files);
         let bytes_written = AtomicU64::new(0);
         let cancelled = AtomicBool::new(false);
         let mut data_buf = Vec::new();
@@ -1040,7 +1036,6 @@ mod tests {
             uid: 0,
             gid: 0,
             xattrs: None,
-            created: AtomicBool::new(false),
         }];
 
         let pack_id = dummy_pack_id(8);
@@ -1059,6 +1054,7 @@ mod tests {
             }],
         );
 
+        stage_files(temp.path(), &files);
         let bytes_written = AtomicU64::new(0);
         let cancelled = AtomicBool::new(false);
         let mut data_buf = Vec::new();
@@ -1089,6 +1085,7 @@ mod tests {
         // Defense-in-depth nature: the same blob restores fine when verify
         // is disabled, since AEAD already accepted it.
         let temp2 = tempdir().unwrap();
+        stage_files(temp2.path(), &files);
         let bytes_written = AtomicU64::new(0);
         let mut data_buf = Vec::new();
         let mut decrypt_buf = Vec::new();
@@ -1109,6 +1106,35 @@ mod tests {
             None,
         )
         .unwrap();
+    }
+
+    /// `write_buf` never follows a symlink at the leaf (`O_NOFOLLOW`), even
+    /// without staging in front of it.
+    #[cfg(unix)]
+    #[test]
+    fn write_buf_does_not_follow_symlink_leaf() {
+        let temp = tempdir().unwrap();
+        let victim = temp.path().join("victim");
+        std::fs::write(&victim, b"untouched").unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        std::os::unix::fs::symlink(&victim, root.join("x")).unwrap();
+
+        let files = vec![PlannedFile {
+            rel_path: PathBuf::from("x"),
+            total_size: 4,
+            mode: 0o644,
+            mtime: 0,
+            uid: 0,
+            gid: 0,
+            xattrs: None,
+        }];
+        let mut handles = LruHandles::new();
+        let bytes_written = AtomicU64::new(0);
+        let res = write_buf(b"evil", 0, 0, &mut handles, &files, &bytes_written, &root);
+        assert!(res.is_err(), "write through a symlink leaf must fail");
+        assert_eq!(std::fs::read(&victim).unwrap(), b"untouched");
+        assert_eq!(bytes_written.load(Ordering::Relaxed), 0);
     }
 
     /// Backend that raises a shared cancellation flag from inside the range read
@@ -1164,7 +1190,6 @@ mod tests {
             uid: 0,
             gid: 0,
             xattrs: None,
-            created: AtomicBool::new(false),
         }]
     }
 
@@ -1260,7 +1285,6 @@ mod tests {
             uid: 0,
             gid: 0,
             xattrs: None,
-            created: AtomicBool::new(false),
         }];
         let groups = vec![single_blob_group(
             pack_id,

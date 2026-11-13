@@ -130,10 +130,6 @@ pub(super) struct PlannedFile {
     pub(super) uid: u32,
     pub(super) gid: u32,
     pub(super) xattrs: Option<HashMap<String, Vec<u8>>>,
-    /// CAS flag: the first worker to open this file calls `set_len`.
-    /// Prevents repeated `ftruncate` syscalls when multiple workers open
-    /// the same large file across different read groups.
-    pub(super) created: AtomicBool,
 }
 
 /// A directory or symlink node whose ownership/xattrs/mode/mtime are applied in
@@ -235,7 +231,17 @@ where
                 sanitize_item_into(&item, &mut rel_scratch)?;
                 let target = dest_root.join(&rel_scratch);
                 ensure_path_within_root(&target, dest_root)?;
-                std::fs::create_dir_all(&target)?;
+                // A declared dir may only land on nothing or on an implicit
+                // parent created for an earlier child. `create_dir_all` alone
+                // would follow a symlink at `target` and accept it as a dir.
+                match std::fs::symlink_metadata(&target) {
+                    Ok(md) if md.is_dir() && !verified_dirs.contains(&target) => {}
+                    Ok(_) => return Err(conflicting_entries(&rel_scratch)),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        std::fs::create_dir_all(&target)?;
+                    }
+                    Err(e) => return Err(e.into()),
+                }
                 ensure_path_within_root(&target, dest_root)?;
                 // Hold a temporary owner-rwx mode so children can be written
                 // into a captured-read-only dir; setgid/setuid/sticky and all
@@ -284,8 +290,14 @@ where
                             ),
                         ),
                     }
-                    let _ = std::fs::remove_file(&target);
-                    fs::create_symlink(&link_target_path, &target)?;
+                    // Never replace an existing entry: a duplicate path aborts.
+                    fs::create_symlink(&link_target_path, &target).map_err(|e| {
+                        if e.kind() == std::io::ErrorKind::AlreadyExists {
+                            conflicting_entries(&rel_scratch)
+                        } else {
+                            e.into()
+                        }
+                    })?;
                     // xattrs/lchown/mtime are deferred to the symlink pass so
                     // ownership lands before xattrs (chown clears capabilities)
                     // and mtime is the last write to the inode.
@@ -422,7 +434,6 @@ where
                     uid: item.uid,
                     gid: item.gid,
                     xattrs: item.xattrs,
-                    created: AtomicBool::new(false),
                 });
                 if planned_files.len() >= batch_size {
                     let batch_files = std::mem::take(&mut planned_files);
@@ -498,6 +509,73 @@ pub(super) fn validate_and_prepare_dest(dest: &str) -> Result<PathBuf> {
     dest_path
         .canonicalize()
         .map_err(|e| VykarError::Other(format!("invalid destination '{}': {e}", dest)))
+}
+
+pub(super) fn conflicting_entries(rel_path: &Path) -> VykarError {
+    VykarError::InvalidFormat(format!(
+        "snapshot contains conflicting entries at '{}'",
+        rel_path.display()
+    ))
+}
+
+/// Phase 3: create every planned file of a batch, empty or not, exactly once.
+///
+/// `O_CREAT|O_EXCL` (`CREATE_NEW` on Windows) never follows a symlink and fails
+/// on any existing entry, so a snapshot that holds two entries at the same path
+/// aborts here instead of writing through whatever the first one left behind.
+/// Later opens (Phase 4 data, Phase 5b metadata) only open existing files, with
+/// `O_NOFOLLOW` on Unix as a second guard.
+///
+/// Non-empty files pay one extra open/ftruncate/close here, negligible next to
+/// the range download, so that no later phase ever has to create a file.
+///
+/// Parents verified during directory creation are trusted (single-process
+/// restore, no concurrent tampering); unverified parents get the full
+/// canonicalize check. Polls `shutdown` per file: a snapshot of empty files is
+/// restored entirely here, with no Phase 4 work to poll on its behalf.
+pub(super) fn stage_batch_files(
+    files: &[PlannedFile],
+    temp_root: &Path,
+    verified_dirs: &HashSet<PathBuf>,
+    shutdown: Option<&AtomicBool>,
+) -> Result<()> {
+    for pf in files {
+        check_interrupted(shutdown)?;
+        #[cfg(test)]
+        super::fault_staging_loop(shutdown);
+        let full_path = temp_root.join(&pf.rel_path);
+        if full_path
+            .parent()
+            .is_none_or(|p| !verified_dirs.contains(p))
+        {
+            ensure_parent_exists_within_root(&full_path, temp_root)?;
+        }
+        let file = create_exclusive(&full_path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                conflicting_entries(&pf.rel_path)
+            } else {
+                VykarError::Other(format!("failed to create {}: {e}", full_path.display()))
+            }
+        })?;
+        // The creation mode is umask-filtered; force owner rw so Phase 4 and
+        // 5b can reopen it for writing. The captured mode lands in 5b.
+        fs::apply_mode_fd(&file, 0o600)?;
+        if pf.total_size > 0 {
+            file.set_len(pf.total_size)?;
+        }
+    }
+    Ok(())
+}
+
+fn create_exclusive(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    opts.open(path)
 }
 
 pub(super) fn ensure_parent_exists_within_root(target: &Path, root: &Path) -> Result<()> {
@@ -1540,5 +1618,184 @@ mod tests {
 
         assert_eq!(flush_calls, 1);
         assert!(last_verified.contains(&dest.join("only-a-dir")));
+    }
+
+    // -----------------------------------------------------------------------
+    // Duplicate-path conflicts
+    // -----------------------------------------------------------------------
+
+    /// Plan + stage `items` into `<base>/dest` with the given batch size.
+    /// `<base>/outside/victim` exists as a write target a symlink can aim at.
+    struct ConflictFixture {
+        _temp: tempfile::TempDir,
+        dest: PathBuf,
+        victim: PathBuf,
+    }
+
+    const VICTIM_BYTES: &[u8] = b"victim-original";
+
+    fn conflict_fixture() -> ConflictFixture {
+        let temp = tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let dest = base.join("dest");
+        std::fs::create_dir(&dest).unwrap();
+        std::fs::create_dir(base.join("outside")).unwrap();
+        let victim = base.join("outside/victim");
+        std::fs::write(&victim, VICTIM_BYTES).unwrap();
+        ConflictFixture {
+            _temp: temp,
+            dest,
+            victim,
+        }
+    }
+
+    fn plan_and_stage(items: &[Item], dest: &Path, batch_size: usize) -> Result<StreamPlan> {
+        let stream = serialize_items(items);
+        let mut stats = RestoreStats::default();
+        let mut group_reps: HashMap<HardlinkId, RepInfo> = HashMap::new();
+        let mut pending_links: Vec<PendingLink> = Vec::new();
+        stream_and_plan(
+            &stream,
+            dest,
+            &mut |_| true,
+            false,
+            &mut stats,
+            batch_size,
+            &mut group_reps,
+            &mut pending_links,
+            None,
+            |files, _chunks, verified, _stats| stage_batch_files(&files, dest, verified, None),
+        )
+    }
+
+    fn assert_conflict(res: Result<StreamPlan>, rel: &str) {
+        let err = match res {
+            Ok(_) => panic!("expected a conflict at '{rel}'"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains(&format!("conflicting entries at '{rel}'")),
+            "got: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    fn victim_link(fx_victim: &Path) -> Item {
+        make_symlink_item("x", fx_victim.to_str().unwrap())
+    }
+
+    /// The reported finding: file then symlink at one path, one batch.
+    #[cfg(unix)]
+    #[test]
+    fn conflict_file_then_symlink_same_batch() {
+        let fx = conflict_fixture();
+        let items = vec![
+            make_file_item("x", vec![(0xAA, 100)]),
+            victim_link(&fx.victim),
+        ];
+        assert_conflict(plan_and_stage(&items, &fx.dest, usize::MAX), "x");
+        assert_eq!(std::fs::read(&fx.victim).unwrap(), VICTIM_BYTES);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn conflict_symlink_then_file() {
+        let fx = conflict_fixture();
+        let items = vec![
+            victim_link(&fx.victim),
+            make_file_item("x", vec![(0xAA, 100)]),
+        ];
+        assert_conflict(plan_and_stage(&items, &fx.dest, usize::MAX), "x");
+        assert_eq!(std::fs::read(&fx.victim).unwrap(), VICTIM_BYTES);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn conflict_empty_file_then_symlink() {
+        let fx = conflict_fixture();
+        let items = vec![
+            make_file_item_with_size("x", 0, vec![]),
+            victim_link(&fx.victim),
+        ];
+        assert_conflict(plan_and_stage(&items, &fx.dest, usize::MAX), "x");
+        assert_eq!(std::fs::read(&fx.victim).unwrap(), VICTIM_BYTES);
+    }
+
+    /// File staged in batch 1; the symlink in batch 2 must not replace it.
+    #[cfg(unix)]
+    #[test]
+    fn conflict_file_then_symlink_across_batches() {
+        let fx = conflict_fixture();
+        let items = vec![
+            make_file_item("x", vec![(0xAA, 100)]),
+            victim_link(&fx.victim),
+        ];
+        assert_conflict(plan_and_stage(&items, &fx.dest, 1), "x");
+        assert_eq!(std::fs::read(&fx.victim).unwrap(), VICTIM_BYTES);
+        assert!(std::fs::symlink_metadata(fx.dest.join("x"))
+            .unwrap()
+            .is_file());
+    }
+
+    #[test]
+    fn conflict_file_then_file() {
+        let fx = conflict_fixture();
+        let items = vec![
+            make_file_item("x", vec![(0xAA, 100)]),
+            make_file_item("x", vec![(0xBB, 50)]),
+        ];
+        assert_conflict(plan_and_stage(&items, &fx.dest, usize::MAX), "x");
+    }
+
+    /// A declared dir must not land on a symlink: `create_dir_all` would follow
+    /// it and the dir's mode would be applied to the link target.
+    #[cfg(unix)]
+    #[test]
+    fn conflict_dir_onto_symlink_to_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let fx = conflict_fixture();
+        let items = vec![
+            make_dir_item("d", 0o750),
+            make_symlink_item("x", "d"),
+            make_dir_item("x", 0o777),
+        ];
+        assert_conflict(plan_and_stage(&items, &fx.dest, usize::MAX), "x");
+        let mode = std::fs::metadata(fx.dest.join("d"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o750, "'d' must keep its own staging mode");
+    }
+
+    #[test]
+    fn conflict_dir_then_dir() {
+        let fx = conflict_fixture();
+        let items = vec![make_dir_item("x", 0o755), make_dir_item("x", 0o755)];
+        assert_conflict(plan_and_stage(&items, &fx.dest, usize::MAX), "x");
+    }
+
+    #[test]
+    fn conflict_dir_onto_file() {
+        let fx = conflict_fixture();
+        let items = vec![
+            make_file_item("x", vec![(0xAA, 100)]),
+            make_dir_item("x", 0o755),
+        ];
+        assert_conflict(plan_and_stage(&items, &fx.dest, 1), "x");
+    }
+
+    /// An implicit parent created for an earlier child may still be declared.
+    #[test]
+    fn implicit_parent_then_declared_dir_is_not_a_conflict() {
+        let fx = conflict_fixture();
+        let items = vec![
+            make_file_item("a/f", vec![(0xAA, 100)]),
+            make_dir_item("a", 0o755),
+        ];
+        let plan = plan_and_stage(&items, &fx.dest, usize::MAX).unwrap();
+        assert_eq!(plan.dirs.len(), 1);
+        let md = std::fs::symlink_metadata(fx.dest.join("a/f")).unwrap();
+        assert!(md.is_file());
+        assert_eq!(md.len(), 100, "staging sizes non-empty files");
     }
 }

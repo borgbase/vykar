@@ -132,7 +132,6 @@ mod tests {
     use crate::index::ChunkIndex;
     use crate::snapshot::item::Item;
     use std::path::PathBuf;
-    use std::sync::atomic::AtomicBool;
 
     /// Plan reads using a lookup closure that returns `(pack_id, pack_offset, stored_size)`.
     /// The closure abstracts over ChunkIndex vs MmapRestoreCache.
@@ -194,7 +193,6 @@ mod tests {
                 uid: item.uid,
                 gid: item.gid,
                 xattrs: item.xattrs.clone(),
-                created: AtomicBool::new(false),
             });
         }
 

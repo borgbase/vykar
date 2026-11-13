@@ -279,6 +279,9 @@ where
     );
     let temp_root = dest_root.join(&temp_dir_name);
     std::fs::create_dir_all(&temp_root)?;
+    // Staging is private to this process; don't let a umask that strips
+    // owner-write make it unwritable.
+    fs::apply_mode(&temp_root, 0o700)?;
 
     // Cleanup for failures *before* finalization (stream/plan/write errors).
     // `force_remove_temp_tree` (not `remove_dir_all`) so restrictive `000`
@@ -348,32 +351,8 @@ where
                 batch_files.len(),
             );
 
-            // Phase 3: Ensure parent directories exist + create empty files.
-            // Non-empty files are created on first write in Phase 4 (avoids
-            // the double-open: create + set_len here, then reopen for writing).
-            // Safety: parents verified during directory creation are trusted —
-            // this is a single-process operation so no concurrent destination
-            // tampering can occur. Unverified parents still get the full
-            // canonicalize check.
-            // Per-file poll: each iteration can canonicalize a parent and
-            // create a file, and the loop runs up to `RESTORE_BATCH_FILES`
-            // times — a snapshot of empty files is restored entirely here, with
-            // no Phase 4 work to poll on its behalf.
-            for pf in &batch_files {
-                check_interrupted(shutdown)?;
-                #[cfg(test)]
-                fault_staging_loop(shutdown);
-                let full_path = temp_root.join(&pf.rel_path);
-                if full_path
-                    .parent()
-                    .is_none_or(|p| !verified_dirs.contains(p))
-                {
-                    plan::ensure_parent_exists_within_root(&full_path, &temp_root)?;
-                }
-                if pf.total_size == 0 {
-                    std::fs::File::create(&full_path)?;
-                }
-            }
+            // Phase 3: create every file of the batch exclusively.
+            plan::stage_batch_files(&batch_files, &temp_root, verified_dirs, shutdown)?;
 
             // Phase 4: Parallel restore — download ranges, decrypt, decompress, write.
             let bytes = parallel::execute_parallel_restore(
@@ -681,7 +660,7 @@ fn fault_pre_publish_shutdown(temp_root: &Path, shutdown: Option<&AtomicBool>) {
 /// the chosen one. Called *after* that iteration's guard, so the armed
 /// iteration still completes and the following one is the first to abort.
 #[cfg(test)]
-fn fault_staging_loop(shutdown: Option<&AtomicBool>) {
+pub(super) fn fault_staging_loop(shutdown: Option<&AtomicBool>) {
     let idx = STAGING_LOOP_ITERATIONS.with(|c| {
         let v = c.get();
         c.set(v + 1);
@@ -1004,5 +983,53 @@ mod tests {
         // replacement of an earlier one.
         let suppressed = format!("msg {}", MAX_RESTORE_WARNINGS);
         assert!(!stats.warnings.iter().any(|w| w == &suppressed));
+    }
+
+    /// A umask that strips owner-write must not break restore: staging forces
+    /// `0o600` on each new file so Phase 4 can reopen it. Runs in a child
+    /// process so the runner's umask is untouched.
+    #[cfg(unix)]
+    #[test]
+    #[allow(unsafe_code)]
+    fn restore_under_owner_write_stripping_umask() {
+        const CHILD_ENV: &str = "VYKAR_TEST_UMASK_CHILD";
+        const NAME: &str = "commands::restore::tests::restore_under_owner_write_stripping_umask";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            if fs::is_effective_root() {
+                // Root bypasses DAC; the test would prove nothing.
+                return;
+            }
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--nocapture", "--include-ignored"])
+                .env(CHILD_ENV, "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "child restore failed: {status}");
+            return;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (config, dest) = restore_fixture(tmp.path(), 4);
+        // `dest` is the caller's; only the restore's own creations are tested.
+        std::fs::create_dir(&dest).unwrap();
+        // SAFETY: umask only swaps the process file-creation mask.
+        unsafe { libc::umask(0o277) };
+        let res = restore_with_filter(
+            &config,
+            None,
+            "snap-cancel",
+            dest.to_str().unwrap(),
+            false,
+            false,
+            |_path| true,
+            None,
+        );
+        // SAFETY: as above.
+        unsafe { libc::umask(0o022) };
+        res.unwrap();
+        for i in 0..4 {
+            let got = std::fs::read(dest.join(format!("f{i}.txt"))).unwrap();
+            assert_eq!(got, format!("restore-cancel-payload-{i}").into_bytes());
+        }
     }
 }

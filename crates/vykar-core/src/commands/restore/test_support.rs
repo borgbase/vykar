@@ -9,7 +9,9 @@ use vykar_crypto::CryptoEngine;
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::pack_id::PackId;
 
-use super::plan::WriteTarget;
+use std::path::Path;
+
+use super::plan::{PlannedFile, WriteTarget};
 use super::read_groups::{PlannedBlob, ReadGroup};
 
 pub(super) fn dummy_chunk_id(byte: u8) -> ChunkId {
@@ -147,4 +149,13 @@ pub(super) fn multi_blob_group(
         blobs,
     };
     (pack_data, group)
+}
+
+/// Create and size each planned file under `root`, as Phase 3 staging would
+/// (without its parent containment checks).
+pub(super) fn stage_files(root: &Path, files: &[PlannedFile]) {
+    for pf in files {
+        let f = std::fs::File::create_new(root.join(&pf.rel_path)).unwrap();
+        f.set_len(pf.total_size).unwrap();
+    }
 }

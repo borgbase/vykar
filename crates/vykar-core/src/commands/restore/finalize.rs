@@ -23,8 +23,9 @@ use std::cell::{Cell, RefCell};
 /// while they still live inside `temp_root`.  Doing this before the final
 /// rename closes a path-based reopen window — the inode keeps its metadata
 /// after `move_temp_to_dest` because `rename(2)` only changes directory
-/// entries, not inodes.  fd-based fchmod/futimens avoid a redundant path
-/// lookup; on fd open failure the path-based call is used as a fallback.
+/// entries, not inodes.  On Unix, mode and mtime go through the fd only — a
+/// path-based retry would follow a symlink at the leaf and adds nothing for the
+/// regular file already open.
 ///
 /// Serial: each file costs a handful of cheap metadata syscalls, so there is
 /// nothing to overlap. Restored files are *not* fsync'd — a restored tree is a
@@ -105,29 +106,23 @@ fn finalize_one_file(
     #[cfg(test)]
     record_op("xattr", 0, 0);
 
-    // fd-based fchmod/futimens are Unix-only; on other platforms fall
-    // through to the path-based calls to avoid silent no-ops. Only the
-    // *final* failure (after the path-based fallback) is recorded as a
-    // warning — intermediate fd failures that succeed on the fallback are
-    // not user-facing.
+    // fd-based fchmod/futimens are Unix-only; other platforms use the
+    // path-based calls (the leaf is a regular file staging created). On Unix
+    // an fd failure is recorded as-is: a path retry would follow the leaf.
     #[cfg(unix)]
     {
-        if fs::apply_mode_fd(&file, pf.mode).is_err() {
-            warn_metadata_err(
-                stats,
-                fs::apply_mode(&target_path, pf.mode),
-                &target_path,
-                "mode",
-            );
-        }
-        if fs::set_file_mtime_fd(&file, mtime_secs, mtime_nanos).is_err() {
-            warn_metadata_err(
-                stats,
-                fs::set_file_mtime(&target_path, mtime_secs, mtime_nanos),
-                &target_path,
-                "mtime",
-            );
-        }
+        warn_metadata_err(
+            stats,
+            fs::apply_mode_fd(&file, pf.mode),
+            &target_path,
+            "mode",
+        );
+        warn_metadata_err(
+            stats,
+            fs::set_file_mtime_fd(&file, mtime_secs, mtime_nanos),
+            &target_path,
+            "mtime",
+        );
     }
     #[cfg(not(unix))]
     {
@@ -276,12 +271,12 @@ pub(super) fn apply_symlink_metadata(
 /// **unconditionally** (not gated on `!parent.exists()`). A pre-existing parent
 /// can be a symlink the snapshot planted that resolves outside the restore root;
 /// skipping the check there would let `hard_link`/`copy` write through it. The
-/// link's own final component is defended too: any pre-existing entry there is
-/// unlinked (no-follow) before linking, and the copy fallback creates a fresh
-/// file (`O_EXCL`, never following a symlink) — otherwise a planted symlink at
-/// the link's exact path would make `hard_link` fail `EEXIST` and the copy
-/// write through it. A containment violation is fatal, matching the normal-file
-/// path's `ensure_path_within_root`.
+/// link's own final component is never replaced: any pre-existing entry there
+/// (a snapshot with two entries at one path) makes `hard_link` fail `EEXIST`,
+/// which aborts the restore as a conflict instead of falling back to a copy.
+/// The copy fallback itself creates a fresh file (`O_EXCL`, never following a
+/// symlink) as a backstop. A containment violation is fatal, matching the
+/// normal-file path's `ensure_path_within_root`.
 ///
 /// Returns the number of bytes physically written by copy fallbacks (a true
 /// hard link writes none), so the caller can fold them into `total_bytes`.
@@ -314,9 +309,8 @@ pub(super) fn create_hardlinks(
 
         // The representative is resolved by *path* at finalize time, so guard
         // against a malformed snapshot that replaced it between planning and
-        // now: a later same-path item can overwrite it — in particular the
-        // symlink arm unlinks the file and plants a symlink in its place. Were
-        // that allowed to stand, `copy_into_new`'s source `File::open` would
+        // now. Planning and staging refuse to replace an existing entry, so
+        // this is a backstop. Were a replacement allowed to stand, `copy_into_new`'s source `File::open` would
         // follow the symlink and read external host data into the restore, and
         // `hard_link` would link the symlink itself. Require the exact regular
         // file we materialized (type + size); anything else is a corrupt
@@ -346,19 +340,15 @@ pub(super) fn create_hardlinks(
         // a link target whose parent we cannot prove is contained.
         super::plan::ensure_parent_exists_within_root(&link_abs, temp_root)?;
 
-        // Defend the link's own final component: a malformed snapshot can place
-        // a symlink item at this exact path. `hard_link(2)` would then fail
-        // `EEXIST` and the copy fallback, opening with create+truncate, would
-        // follow the symlink and write through it (possibly outside temp_root).
-        // Unlink any pre-existing entry first — `remove_file` operates on the
-        // symlink itself, it does not follow — so both the link and the copy act
-        // on an absent destination. (A real directory here can't be removed this
-        // way; the link/copy then fail and we abort below, never escaping.)
-        let _ = std::fs::remove_file(&link_abs);
-
+        // An existing entry at the link's own path means the snapshot holds
+        // two entries there. Abort; never unlink it, and never let the copy
+        // fallback run against it.
         match inj_hard_link(&rep_abs, &link_abs) {
             Ok(()) => {
                 stats.hardlinks += 1;
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                return Err(super::plan::conflicting_entries(&link.link_rel));
             }
             Err(link_err) => {
                 // Fallback: independent copy of the representative's content.
@@ -389,7 +379,6 @@ pub(super) fn create_hardlinks(
                             uid: link.uid,
                             gid: link.gid,
                             xattrs,
-                            created: AtomicBool::new(false),
                         };
                         apply_file_metadata(
                             std::slice::from_ref(&pf),
@@ -413,6 +402,9 @@ pub(super) fn create_hardlinks(
                                 rep.rel_path.display()
                             ),
                         );
+                    }
+                    Err(copy_err) if copy_err.kind() == io::ErrorKind::AlreadyExists => {
+                        return Err(super::plan::conflicting_entries(&link.link_rel));
                     }
                     Err(copy_err) => {
                         // Both paths failed: the requested content cannot be
@@ -449,7 +441,7 @@ fn rep_mode_on_disk(rep_abs: &Path) -> u32 {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        std::fs::metadata(rep_abs)
+        std::fs::symlink_metadata(rep_abs)
             .map(|m| m.mode())
             .unwrap_or(0o644)
     }
@@ -517,10 +509,10 @@ fn read_xattrs_map(rep_abs: &Path, stats: &mut RestoreStats) -> Option<HashMap<S
 }
 
 /// Open `path` writable for the finalize metadata pass, self-healing on a
-/// restrictive-umask owner-write strip. `write_buf` and the empty-file
-/// `File::create` create files with the default mode filtered by the process
-/// umask, so an exotic owner-write-stripping umask (e.g. `0o277`) yields a
-/// `0o400` file and this reopen fails `EACCES`. On `PermissionDenied` only, a
+/// restrictive-umask owner-write strip. Staging forces `0o600` on every file it
+/// creates, but the hard-link copy fallback creates its file with the default
+/// mode filtered by the process umask, so an exotic owner-write-stripping umask
+/// (e.g. `0o277`) yields a `0o400` file and this reopen fails `EACCES`. On `PermissionDenied` only, a
 /// path chmod (not umask-filtered) grants `0o600` and the open is retried once;
 /// the caller's final fchmod still applies the captured mode. Zero cost on
 /// normal umasks (first open succeeds).
@@ -758,7 +750,16 @@ fn inj_open_writable(path: &Path) -> io::Result<std::fs::File> {
             }
         }
     }
-    OpenOptions::new().write(true).open(path)
+    let mut opts = OpenOptions::new();
+    opts.write(true);
+    // Never follow a symlink at the leaf: a symlink fails `ELOOP`, so the
+    // `PermissionDenied` self-heal only ever chmods a regular file.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    opts.open(path)
 }
 
 // ---------------------------------------------------------------------------
@@ -820,7 +821,6 @@ fn split_unix_nanos(total_nanos: i64) -> (i64, u32) {
 mod tests {
     use super::*;
     use std::path::PathBuf;
-    use std::sync::atomic::AtomicBool;
     use tempfile::tempdir;
 
     /// Reserved-shape temp dir name for a test staging root inside `dest`.
@@ -838,7 +838,6 @@ mod tests {
             uid: 0,
             gid: 0,
             xattrs: None,
-            created: AtomicBool::new(true),
         }
     }
 
@@ -1256,29 +1255,23 @@ mod tests {
         }
     }
 
-    /// Finding 1: a symlink planted at the link's *exact* path must not be
-    /// followed by the copy fallback. `hard_link` is forced to fail so the copy
-    /// path runs; the pre-existing symlink (pointing at an external file) must
-    /// be unlinked first and the copy created fresh — the external file is left
-    /// untouched and the link path becomes a regular file with the rep's bytes.
+    /// Plant a symlink to an external secret at the link's exact path, run
+    /// `create_hardlinks`, and return its error plus the secret's path.
     #[cfg(unix)]
-    #[test]
-    fn create_hardlinks_copy_fallback_does_not_follow_symlink_at_dest() {
+    fn hardlink_onto_planted_symlink(force_copy: bool) -> (VykarError, PathBuf, tempfile::TempDir) {
         let _guard = FaultGuard;
-        FAULT_HARD_LINK.with(|c| c.set(true)); // force the copy fallback
+        FAULT_HARD_LINK.with(|c| c.set(force_copy));
 
         let dest = tempdir().unwrap();
         let base = dest.path().canonicalize().unwrap();
         let temp_root = base.join(temp_name());
         std::fs::create_dir_all(&temp_root).unwrap();
 
-        // External file the planted symlink targets — must survive untouched.
         let outside = base.join("outside");
         std::fs::create_dir_all(&outside).unwrap();
         let secret = outside.join("secret.txt");
         std::fs::write(&secret, b"DO-NOT-OVERWRITE").unwrap();
 
-        // Representative content + a symlink planted at the link's own path.
         std::fs::write(temp_root.join("a.txt"), b"rep-content").unwrap();
         std::os::unix::fs::symlink(&secret, temp_root.join("b.txt")).unwrap();
 
@@ -1301,7 +1294,7 @@ mod tests {
         }];
 
         let mut stats = RestoreStats::default();
-        create_hardlinks(
+        let err = create_hardlinks(
             &pending,
             &group_reps,
             &temp_root,
@@ -1310,22 +1303,79 @@ mod tests {
             &mut stats,
             None,
         )
-        .unwrap();
-
-        // The external file was never written through the symlink.
-        assert_eq!(std::fs::read(&secret).unwrap(), b"DO-NOT-OVERWRITE");
-        // The link path is now a real regular file (not a symlink) with the
-        // representative's content.
-        let link_abs = temp_root.join("b.txt");
+        .unwrap_err();
         assert!(
-            !std::fs::symlink_metadata(&link_abs)
+            std::fs::symlink_metadata(temp_root.join("b.txt"))
                 .unwrap()
                 .file_type()
                 .is_symlink(),
-            "planted symlink must have been replaced by a regular file"
+            "the existing entry must not be unlinked"
         );
-        assert_eq!(std::fs::read(&link_abs).unwrap(), b"rep-content");
-        assert_eq!(stats.hardlink_copies, 1);
+        assert_eq!(stats.hardlink_copies, 0);
+        (err, secret, dest)
+    }
+
+    /// A symlink at the link's exact path (two snapshot entries at one path)
+    /// aborts the restore. With `hard_link` forced to fail, the copy fallback's
+    /// `O_EXCL` refuses the existing entry, and the secret stays untouched.
+    #[cfg(unix)]
+    #[test]
+    fn create_hardlinks_copy_fallback_does_not_follow_symlink_at_dest() {
+        let (err, secret, _dest) = hardlink_onto_planted_symlink(true);
+        assert!(
+            err.to_string().contains("conflicting entries at 'b.txt'"),
+            "got: {err}"
+        );
+        assert_eq!(std::fs::read(&secret).unwrap(), b"DO-NOT-OVERWRITE");
+    }
+
+    /// Without the fault, `hard_link` itself fails `EEXIST`, which aborts as a
+    /// conflict and never reaches the copy fallback.
+    #[cfg(unix)]
+    #[test]
+    fn create_hardlinks_eexist_aborts_without_copy_fallback() {
+        let (err, secret, _dest) = hardlink_onto_planted_symlink(false);
+        assert!(
+            err.to_string().contains("conflicting entries at 'b.txt'"),
+            "got: {err}"
+        );
+        assert_eq!(std::fs::read(&secret).unwrap(), b"DO-NOT-OVERWRITE");
+    }
+
+    /// The metadata pass never follows a symlink at a file's leaf: `O_NOFOLLOW`
+    /// fails the open, and the target's mode and mtime stay unchanged.
+    #[cfg(unix)]
+    #[test]
+    fn apply_file_metadata_does_not_follow_symlink_leaf() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dest = tempdir().unwrap();
+        let base = dest.path().canonicalize().unwrap();
+        let temp_root = base.join(temp_name());
+        std::fs::create_dir_all(&temp_root).unwrap();
+        let victim = base.join("victim");
+        std::fs::write(&victim, b"victim").unwrap();
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let before = std::fs::metadata(&victim).unwrap();
+        std::os::unix::fs::symlink(&victim, temp_root.join("x")).unwrap();
+
+        let mut pf = planned("x", 6);
+        pf.mode = 0o4777;
+        pf.mtime = 1_000_000_000;
+        let mut stats = RestoreStats::default();
+        let res = apply_file_metadata(
+            std::slice::from_ref(&pf),
+            &temp_root,
+            false,
+            false,
+            &mut stats,
+            None,
+        );
+        assert!(res.is_err(), "open through a symlink leaf must fail");
+        let after = std::fs::metadata(&victim).unwrap();
+        assert_eq!(after.mode(), before.mode());
+        assert_eq!(after.mtime(), before.mtime());
+        assert_eq!(after.mtime_nsec(), before.mtime_nsec());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"victim");
     }
 
     /// Finding (representative replacement): a malformed snapshot replaces the

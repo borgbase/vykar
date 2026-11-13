@@ -252,7 +252,7 @@ fn prune_phase3_refcount_failure_returns_warning_not_error() {
 
     // One snapshot was pruned (blob deleted) but its Phase 3 cleanup failed.
     assert_eq!(stats.pruned, 1);
-    assert!(!stats.warnings.is_empty(), "expected a Phase 3 warning");
+    assert_ne!(stats.warnings.len(), 0, "expected a Phase 3 warning");
     let combined = stats.warnings.join("\n");
     assert!(
         combined.contains("vykar check --repair"),

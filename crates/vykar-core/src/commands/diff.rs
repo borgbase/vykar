@@ -297,7 +297,7 @@ mod tests {
             ],
         );
 
-        assert!(entries.is_empty());
+        assert_eq!(entries.len(), 0);
     }
 
     #[test]

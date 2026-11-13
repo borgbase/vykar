@@ -835,8 +835,8 @@ mod tests {
             recovery.recovered_chunks, 0,
             "should skip active session's journal"
         );
-        assert!(recovery.recovered_sessions.is_empty());
-        assert!(ws.recovered_index_keys.is_empty());
+        assert_eq!(recovery.recovered_sessions.len(), 0);
+        assert_eq!(ws.recovered_index_keys.len(), 0);
     }
 
     #[test]
@@ -863,8 +863,8 @@ mod tests {
             recovery.recovered_chunks, 0,
             "should skip session with unknown marker state"
         );
-        assert!(recovery.recovered_sessions.is_empty());
-        assert!(ws.recovered_index_keys.is_empty());
+        assert_eq!(recovery.recovered_sessions.len(), 0);
+        assert_eq!(ws.recovered_index_keys.len(), 0);
     }
 
     #[test]
@@ -1000,7 +1000,7 @@ mod tests {
             storage.exists(&stale_json).unwrap(),
             "stale .json must not be deleted by cleanup"
         );
-        assert!(ws.recovered_index_keys.is_empty(), "keys should be drained");
+        assert_eq!(ws.recovered_index_keys.len(), 0, "keys should be drained");
     }
 
     // ── Journal dirty guard ──────────────────────────────────────────────

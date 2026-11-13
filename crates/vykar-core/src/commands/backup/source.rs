@@ -572,7 +572,7 @@ mod tests {
         let resolved = result.unwrap();
         match resolved.policy {
             RootEmission::EmitRoot { prefix } => {
-                assert!(!prefix.is_empty(), "prefix should not be empty");
+                assert_ne!(prefix, "", "prefix should not be empty");
                 assert!(!prefix.contains("/./"), "got: {prefix}");
                 assert!(!prefix.contains("/../"), "got: {prefix}");
                 assert!(!prefix.starts_with('/'), "got: {prefix}");
@@ -596,7 +596,7 @@ mod tests {
         let resolved = result.unwrap();
         match resolved.policy {
             RootEmission::EmitRoot { prefix } => {
-                assert!(!prefix.is_empty());
+                assert_ne!(prefix, "");
                 assert!(!prefix.contains(".."), "got: {prefix}");
             }
             _ => panic!("expected EmitRoot"),
@@ -734,7 +734,7 @@ mod tests {
         assert_ne!(prefix, "..", "got: {prefix}");
         // With the current sanitizing fallback, `/..` produces an empty
         // prefix so resolve() can surface a clean error.
-        assert!(prefix.is_empty(), "got: {prefix}");
+        assert_eq!(prefix, "", "got: {prefix}");
     }
 
     #[test]

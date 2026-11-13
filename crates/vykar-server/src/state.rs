@@ -275,7 +275,7 @@ impl AppState {
 
     /// Update quota usage after a delete.
     pub fn sub_quota_usage(&self, bytes: u64) {
-        // Use fetch_update for saturating subtraction
+        // Use try_update for saturating subtraction.
         let _ =
             self.inner
                 .quota_usage

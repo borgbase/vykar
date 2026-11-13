@@ -470,7 +470,7 @@ mod tests {
         let plan: VerifyPacksPlanRequest = serde_json::from_str(json).unwrap();
         assert_eq!(plan.protocol_version(), 0);
         assert_eq!(plan.hash(), HashAlgorithm::Blake2b);
-        assert!(plan.packs.is_empty());
+        assert_eq!(plan.packs.len(), 0);
     }
 
     #[test]

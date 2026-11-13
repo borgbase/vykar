@@ -330,7 +330,8 @@ mod tests {
         assert_eq!(list.0[0].id, "sess1");
         assert_eq!(d.hostname, "host-a");
         assert_eq!(d.pid, 7);
-        assert!(!d.age.is_empty() && d.age != "unknown");
+        assert_ne!(d.age, "");
+        assert_ne!(d.age, "unknown");
         assert!(!list.has_malformed());
     }
 

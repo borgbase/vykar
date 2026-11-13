@@ -1696,7 +1696,7 @@ mod tests {
             #[cfg(not(unix))]
             let _ = (i, meta);
         }
-        assert!(stats.warnings.is_empty(), "{:?}", stats.warnings);
+        assert_eq!(stats.warnings.len(), 0, "{:?}", stats.warnings);
     }
 
     /// Warnings respect the global budget: every file yields exactly one chown

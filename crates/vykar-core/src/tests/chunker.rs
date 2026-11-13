@@ -70,7 +70,7 @@ fn small_data_single_chunk() {
 fn empty_data_no_chunks() {
     let config = test_config();
     let chunks = chunk_data(b"", &config);
-    assert!(chunks.is_empty());
+    assert_eq!(chunks.len(), 0);
 }
 
 #[test]

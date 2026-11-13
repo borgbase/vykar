@@ -228,7 +228,7 @@ fn empty_input_is_noop() {
     repo.read_chunks_coalesced_into(&[], &mut out, None)
         .unwrap();
 
-    assert!(out.is_empty());
+    assert_eq!(out.len(), 0);
     assert_eq!(log.get_range_count(), 0);
 }
 
@@ -456,5 +456,5 @@ fn pre_cancelled_coalesced_read_issues_no_request() {
         "expected Interrupted, got: {err}"
     );
     assert_eq!(reads.load(Ordering::Relaxed), 0, "expected no range reads");
-    assert!(out.is_empty(), "nothing may be emitted");
+    assert_eq!(out.len(), 0, "nothing may be emitted");
 }

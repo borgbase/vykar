@@ -125,7 +125,7 @@ pub fn assert_status(response: &axum::response::Response, expected: StatusCode) 
 /// Recursively assert no server temp files remain under `dir`.
 pub fn assert_no_temp_files(dir: &std::path::Path) {
     let leftovers = temp_file_paths(dir);
-    assert!(leftovers.is_empty(), "leftover temp files: {leftovers:?}");
+    assert_eq!(leftovers.len(), 0, "leftover temp files: {leftovers:?}");
 }
 
 /// Recursively count server temp files (current `.tmp.*` and legacy

@@ -654,7 +654,7 @@ fn unencrypted_repositories_skip_the_key_phase() {
     let result = commands::check::run(&config, None, false, false).unwrap();
     assert_eq!(result.key_files_checked, None);
     assert!(!repo_dir.join("keys").join("repokey").exists());
-    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    assert_eq!(result.errors.len(), 0, "{:?}", result.errors);
 }
 
 // ---------------------------------------------------------------------------
@@ -757,7 +757,7 @@ fn a_contradicting_pin_beats_self_consistent_repository_data() {
 fn proving_a_key_never_writes_a_pin() {
     let fx = Fixture::new();
     fx.forget_pin();
-    assert!(fx.pin_files().is_empty());
+    assert_eq!(fx.pin_files().len(), 0);
 
     let foreign = {
         let encrypted = vykar_crypto::key::inspect_key_blob(&foreign_key_blob()).unwrap();
@@ -1003,7 +1003,7 @@ fn a_provable_genuine_key_still_wins_against_a_planted_copy() {
         .open_with(ATTACKER_PASS)
         .err()
         .expect("the planted key is not provable, so it must not open the repository");
-    assert!(!err.to_string().is_empty());
+    assert_ne!(err.to_string(), "");
 
     // No pin may have been created for the planted key.
     assert!(

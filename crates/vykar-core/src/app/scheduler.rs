@@ -106,14 +106,21 @@ fn next_cron_delay(schedule: &ScheduleConfig) -> Result<Duration> {
     let cron = crate::config::parse_cron(expr)
         .map_err(|e| VykarError::Config(format!("schedule.cron: invalid expression: {e}")))?;
 
-    let now = chrono::Local::now();
-    let next = cron
-        .find_next_occurrence(&now, false)
-        .map_err(|e| VykarError::Config(format!("schedule.cron: no next occurrence: {e}")))?;
-
-    let delay = (next - now).to_std().unwrap_or(Duration::from_secs(60));
-
+    let delay = cron_delay_at(&cron, &chrono::Local::now())?;
     Ok(delay + random_jitter(schedule.jitter_seconds))
+}
+
+/// Delay from `now` until the next cron tick strictly after it.
+fn cron_delay_at<Tz: chrono::TimeZone>(
+    cron: &croner::Cron,
+    now: &chrono::DateTime<Tz>,
+) -> Result<Duration> {
+    let next = cron
+        .find_next_occurrence(now, false)
+        .map_err(|e| VykarError::Config(format!("schedule.cron: no next occurrence: {e}")))?;
+    Ok((next - now.clone())
+        .to_std()
+        .unwrap_or(Duration::from_secs(60)))
 }
 
 /// Unified entry point: returns the delay until the next scheduled run.
@@ -495,6 +502,28 @@ mod tests {
     }
 
     #[test]
+    fn cron_delay_at_handles_boundaries() {
+        use chrono::{TimeZone, Utc};
+
+        let cron = crate::config::parse_cron("*/5 * * * *").unwrap();
+        let at = |h, m, s| Utc.with_ymd_and_hms(2026, 1, 15, h, m, s).unwrap();
+        let ms = chrono::Duration::milliseconds;
+
+        let mid = cron_delay_at(&cron, &at(8, 27, 30)).unwrap();
+        assert_eq!(mid, Duration::from_secs(150));
+
+        // Sub-second delays are valid; `as_secs()` would truncate this to 0.
+        let just_before = cron_delay_at(&cron, &(at(8, 29, 59) + ms(400))).unwrap();
+        assert_eq!(just_before, Duration::from_millis(600));
+
+        let on_boundary = cron_delay_at(&cron, &at(8, 30, 0)).unwrap();
+        assert_eq!(on_boundary, Duration::from_secs(300));
+
+        let just_after = cron_delay_at(&cron, &(at(8, 30, 0) + ms(500))).unwrap();
+        assert_eq!(just_after, Duration::from_millis(299_500));
+    }
+
+    #[test]
     fn cron_next_run_is_positive() {
         let schedule = ScheduleConfig {
             enabled: true,
@@ -506,8 +535,8 @@ mod tests {
         };
 
         let delay = next_run_delay(&schedule).unwrap();
-        assert!(delay.as_secs() > 0);
-        assert!(delay.as_secs() <= 5 * 60);
+        assert!(delay > Duration::ZERO);
+        assert!(delay <= Duration::from_secs(5 * 60));
     }
 
     #[test]
@@ -522,8 +551,8 @@ mod tests {
         };
 
         let delay = next_run_delay(&schedule).unwrap();
-        // Should be positive (cron delay + up to 60s jitter)
-        assert!(delay.as_secs() > 0);
+        assert!(delay > Duration::ZERO);
+        assert!(delay <= Duration::from_secs(24 * 3600 + 60));
     }
 
     #[test]

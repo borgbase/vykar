@@ -61,6 +61,8 @@ pub(crate) struct PendingUpload {
     /// Cleared by rollback: the pack is still uploaded (an orphan for
     /// compact) but must not enter the journal.
     pub(crate) journal: bool,
+    /// Heap bytes held by the sealed pack until the upload thread returns.
+    pub(crate) bytes: usize,
     pub(crate) handle: JoinHandle<Result<()>>,
 }
 
@@ -110,6 +112,12 @@ pub(crate) struct WriteSessionState {
     pub(crate) pending_uploads: Vec<PendingUpload>,
     /// Configurable limit for in-flight background pack uploads.
     pub(crate) max_in_flight_uploads: usize,
+    /// Also bound sealed-but-unwritten packs by bytes: the queued packs plus
+    /// the one about to be sealed may not exceed the current data-pack
+    /// target, so at most one sealed pack waits while the next one fills.
+    /// Enabled for local repositories, where a write rarely overlaps
+    /// usefully with the next seal; see `cap_pending_uploads`.
+    pub(crate) cap_pending_upload_bytes: bool,
     /// Lightweight dedup-only index used during backup to save memory.
     /// When active, `chunk_index` on Repository is empty.
     pub(crate) dedup_index: Option<DedupIndex>,
@@ -158,6 +166,7 @@ impl WriteSessionState {
             tree_pack_writer: PackWriter::new(PackType::Tree, tree_target, hash_algo),
             pending_uploads: Vec::new(),
             max_in_flight_uploads,
+            cap_pending_upload_bytes: false,
             dedup_index: None,
             tiered_dedup: None,
             index_delta: None,
@@ -188,6 +197,7 @@ impl WriteSessionState {
             journal_chunks,
             journal,
             handle,
+            ..
         } = upload;
         handle
             .join()
@@ -250,6 +260,7 @@ impl WriteSessionState {
         &mut self,
         storage: &dyn StorageBackend,
         crypto: &dyn CryptoEngine,
+        incoming: usize,
     ) -> Result<()> {
         self.drain_finished_uploads(storage, crypto)?;
         if self.pending_uploads.len()
@@ -261,6 +272,28 @@ impl WriteSessionState {
             let upload = self.pending_uploads.swap_remove(0);
             self.finish_upload(upload)?;
             self.maybe_write_pending_index(storage, crypto);
+        }
+        // Byte cap on sealed-but-unwritten packs. `incoming` is the buffer
+        // about to be sealed. The count limit above allows 4 sealed packs of
+        // up to the 192 MiB target each; when the disk falls behind, they
+        // pile up and peak RSS jumps by one pack per straggler. An empty
+        // queue never blocks, so one upload is always in flight.
+        if self.cap_pending_upload_bytes {
+            let cap = self.data_pack_writer.target_size();
+            let mut blocked = false;
+            while !self.pending_uploads.is_empty() {
+                let pending: usize = self.pending_uploads.iter().map(|u| u.bytes).sum();
+                if pending.saturating_add(incoming) <= cap {
+                    break;
+                }
+                // Block on the oldest upload (FIFO).
+                let upload = self.pending_uploads.remove(0);
+                self.finish_upload(upload)?;
+                blocked = true;
+            }
+            if blocked {
+                self.maybe_write_pending_index(storage, crypto);
+            }
         }
         Ok(())
     }
@@ -1391,8 +1424,77 @@ mod tests {
             pack_id,
             journal_chunks: entry.chunks,
             journal: true,
+            bytes: 0,
             handle: std::thread::spawn(move || storage.put_owned(&pack_id.storage_key(), data)),
         }
+    }
+
+    /// An upload that holds `bytes` and completes only when `release` fires.
+    fn gated_upload(
+        storage: &std::sync::Arc<PackUploadBackend>,
+        seed: u8,
+        bytes: usize,
+    ) -> (PendingUpload, std::sync::mpsc::Sender<()>) {
+        let (pack_id, data, entry) = fake_pack(seed);
+        let storage = std::sync::Arc::clone(storage);
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let upload = PendingUpload {
+            pack_id,
+            journal_chunks: entry.chunks,
+            journal: true,
+            bytes,
+            handle: std::thread::spawn(move || {
+                let _ = gate.recv();
+                storage.put_owned(&pack_id.storage_key(), data)
+            }),
+        };
+        (upload, release)
+    }
+
+    #[test]
+    fn byte_cap_blocks_until_queued_pack_is_written() {
+        let storage = std::sync::Arc::new(PackUploadBackend::new(std::sync::Arc::new(
+            MemoryBackend::new(),
+        )));
+        let crypto = test_crypto();
+        let mut ws = journal_session();
+        let target = ws.data_pack_writer.target_size();
+
+        // Disabled: a queued pack plus the incoming one may exceed the
+        // target; only the count limit applies.
+        let (upload, release) = gated_upload(&storage, 1, target);
+        ws.pending_uploads.push(upload);
+        ws.cap_pending_uploads(&*storage, &crypto, target).unwrap();
+        assert_eq!(ws.pending_uploads.len(), 1);
+        release.send(()).unwrap();
+        ws.wait_pending_uploads(&*storage, &crypto).unwrap();
+
+        // Enabled: the same call waits for the queued pack to be written.
+        ws.cap_pending_upload_bytes = true;
+        let (upload, release) = gated_upload(&storage, 2, target);
+        ws.pending_uploads.push(upload);
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            release.send(()).unwrap();
+        });
+        let start = std::time::Instant::now();
+        ws.cap_pending_uploads(&*storage, &crypto, target).unwrap();
+        assert!(start.elapsed() >= std::time::Duration::from_millis(100));
+        assert!(ws.pending_uploads.is_empty());
+        releaser.join().unwrap();
+
+        // A pack that fits next to the queued one does not block.
+        let (upload, release) = gated_upload(&storage, 3, target / 4);
+        ws.pending_uploads.push(upload);
+        ws.cap_pending_uploads(&*storage, &crypto, target / 2)
+            .unwrap();
+        assert_eq!(ws.pending_uploads.len(), 1);
+        release.send(()).unwrap();
+        ws.wait_pending_uploads(&*storage, &crypto).unwrap();
+
+        // An empty queue never blocks, even for an oversized pack.
+        ws.cap_pending_uploads(&*storage, &crypto, 4 * target)
+            .unwrap();
     }
 
     #[test]

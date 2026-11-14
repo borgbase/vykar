@@ -69,6 +69,12 @@ impl SealedData {
         v.as_slice()
     }
 
+    /// Heap bytes held by this sealed pack (buffer capacity, not length).
+    pub fn capacity(&self) -> usize {
+        let SealedData::Memory(v) = self;
+        v.capacity()
+    }
+
     /// Upload pack data via `put_owned` (zero-copy for backends that support owned buffers).
     pub fn put_to(self, storage: &dyn StorageBackend, key: &str) -> Result<()> {
         let SealedData::Memory(v) = self;
@@ -214,6 +220,14 @@ impl PackWriter {
 
     pub fn pack_type(&self) -> PackType {
         self.pack_type
+    }
+
+    /// Heap bytes held by the in-progress buffer (0 before the first blob).
+    pub fn buffer_capacity(&self) -> usize {
+        match &self.buffer {
+            Some(PackBuffer::Memory(v)) => v.capacity(),
+            None => 0,
+        }
     }
 
     /// The target pack size in bytes.

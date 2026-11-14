@@ -469,6 +469,7 @@ struct Prepared<'a> {
     max_pending_transform_bytes: usize,
     max_pending_file_actions: usize,
     upload_concurrency: usize,
+    is_local: bool,
     num_workers: usize,
     use_pipeline: bool,
     transform_pool: Option<rayon::ThreadPool>,
@@ -539,6 +540,7 @@ fn prepare<'a>(config: &VykarConfig, req: &BackupRequest<'a>) -> Result<Prepared
         max_pending_transform_bytes: config.limits.transform_batch_bytes(),
         max_pending_file_actions: config.limits.max_pending_actions(),
         upload_concurrency: config.limits.upload_concurrency(),
+        is_local,
         num_workers,
         use_pipeline,
         transform_pool,
@@ -571,6 +573,7 @@ fn run_against_repo(
         max_pending_transform_bytes,
         max_pending_file_actions,
         upload_concurrency,
+        is_local,
         num_workers,
         use_pipeline,
         transform_pool,
@@ -827,6 +830,10 @@ fn run_against_repo(
 
         // Apply configurable upload concurrency.
         repo.set_max_in_flight_uploads(upload_concurrency);
+        // Local writes gain little from queueing several sealed packs, and
+        // each one holds a full pack buffer. Remote backends keep the count
+        // limit only, so slow round trips still overlap.
+        repo.set_cap_pending_upload_bytes(is_local);
 
         let pipeline_depth = config.limits.effective_pipeline_depth();
         let pipeline_buffer_bytes = config.limits.pipeline_buffer_for_workers(num_workers);

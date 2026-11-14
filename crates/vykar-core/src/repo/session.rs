@@ -68,11 +68,20 @@ impl Repository {
     }
 
     /// Apply backpressure to keep the number of in-flight uploads bounded.
-    pub(super) fn cap_pending_uploads(&mut self) -> Result<()> {
+    pub(super) fn cap_pending_uploads(&mut self, incoming: usize) -> Result<()> {
         self.write_session
             .as_mut()
             .expect("no active write session")
-            .cap_pending_uploads(&*self.storage, &*self.crypto)
+            .cap_pending_uploads(&*self.storage, &*self.crypto, incoming)
+    }
+
+    /// Bound sealed-but-unwritten packs by bytes as well as by count
+    /// (see `WriteSessionState::cap_pending_upload_bytes`).
+    pub fn set_cap_pending_upload_bytes(&mut self, enabled: bool) {
+        self.write_session
+            .as_mut()
+            .expect("no active write session")
+            .cap_pending_upload_bytes = enabled;
     }
 
     /// Set the maximum number of in-flight background pack uploads.

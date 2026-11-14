@@ -238,7 +238,17 @@ impl Repository {
     /// thread. `pack_id` is `Copy` so it's used in both places.
     pub(super) fn flush_writer_async(&mut self, pack_type: PackType) -> Result<()> {
         // Keep upload fan-out bounded to avoid excessive memory/thread pressure.
-        self.cap_pending_uploads()?;
+        let incoming = {
+            let ws = self
+                .write_session
+                .as_ref()
+                .expect("no active write session");
+            match pack_type {
+                PackType::Data => ws.data_pack_writer.buffer_capacity(),
+                PackType::Tree => ws.tree_pack_writer.buffer_capacity(),
+            }
+        };
+        self.cap_pending_uploads(incoming)?;
 
         let ws = self
             .write_session
@@ -286,6 +296,7 @@ impl Repository {
 
         self.apply_sealed_entries(pack_id, entries);
 
+        let bytes = data.capacity();
         let storage = Arc::clone(&self.storage);
         let key = pack_id.storage_key();
         self.write_session
@@ -296,6 +307,7 @@ impl Repository {
                 pack_id,
                 journal_chunks,
                 journal: true,
+                bytes,
                 handle: std::thread::spawn(move || data.put_to(&*storage, &key)),
             });
 

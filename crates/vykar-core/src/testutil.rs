@@ -349,3 +349,81 @@ delegate_storage_backend! {
         self.inner.put_owned(key, data)
     }
 }
+
+/// A storage operation observed by [`HookBackend`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Op {
+    Put,
+    Delete,
+    List,
+}
+
+type OpHook = Box<dyn Fn(Op, &str) + Send + Sync>;
+
+/// Wraps a shared `MemoryBackend` and calls a test-supplied hook (with the key,
+/// or the prefix for `list`) before every `put`/`delete`/`list`, so a test can
+/// park a thread at a chosen operation. Every such op is logged.
+pub struct HookBackend {
+    inner: std::sync::Arc<MemoryBackend>,
+    hook: OpHook,
+    log: Mutex<Vec<(Op, String)>>,
+}
+
+impl HookBackend {
+    pub fn new(
+        inner: std::sync::Arc<MemoryBackend>,
+        hook: impl Fn(Op, &str) + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            inner,
+            hook: Box::new(hook),
+            log: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Operations seen so far, in call order.
+    pub fn ops(&self) -> Vec<(Op, String)> {
+        self.log.lock().unwrap().clone()
+    }
+
+    fn before(&self, op: Op, key: &str) {
+        self.log.lock().unwrap().push((op, key.to_string()));
+        (self.hook)(op, key);
+    }
+}
+
+impl InnerBackend for HookBackend {
+    fn inner_backend(&self) -> &dyn StorageBackend {
+        &*self.inner
+    }
+}
+
+delegate_storage_backend! {
+    for HookBackend;
+    except [put, delete, list, put_owned, list_sized];
+
+    fn put(&self, key: &str, data: &[u8]) -> Result<()> {
+        self.before(Op::Put, key);
+        self.inner.put(key, data)
+    }
+
+    fn delete(&self, key: &str) -> Result<()> {
+        self.before(Op::Delete, key);
+        self.inner.delete(key)
+    }
+
+    fn list(&self, prefix: &str) -> Result<Vec<String>> {
+        self.before(Op::List, prefix);
+        self.inner.list(prefix)
+    }
+
+    fn put_owned(&self, key: &str, data: Vec<u8>) -> Result<()> {
+        self.before(Op::Put, key);
+        self.inner.put(key, &data)
+    }
+
+    fn list_sized(&self, prefix: &str) -> Result<Vec<vykar_storage::ListedObject>> {
+        self.before(Op::List, prefix);
+        self.inner.list_sized(prefix)
+    }
+}

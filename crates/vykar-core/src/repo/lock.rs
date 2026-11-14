@@ -44,11 +44,24 @@ impl LockGuard {
 }
 
 /// Acquire an advisory lock on the repository.
+///
+/// The lock is held only if, after our PUT, a LIST shows our key and no other.
+/// Any other key means we lose, regardless of timestamps, so a client with a
+/// skewed clock cannot jump an established holder. If two contenders PUT
+/// concurrently, both see each other and both back off.
+///
+/// Relies on the [`StorageBackend::list`] contract: a LIST reflects every PUT
+/// that completed before it started, including other clients' PUTs.
 pub fn acquire_lock(storage: &dyn StorageBackend) -> Result<LockGuard> {
     let hostname = crate::platform::hostname();
     let pid = std::process::id();
 
-    cleanup_stale_locks(storage, Duration::seconds(DEFAULT_STALE_LOCK_SECS))?;
+    // Don't publish a key while a holder exists: waiters would otherwise
+    // collide with each other on every retry.
+    let held = cleanup_stale_locks(storage, Duration::seconds(DEFAULT_STALE_LOCK_SECS))?;
+    if let Some(holder_key) = held.first() {
+        return Err(VykarError::Locked(build_lock_holder(storage, holder_key)));
+    }
 
     let now = Utc::now();
     let entry = LockEntry {
@@ -59,7 +72,9 @@ pub fn acquire_lock(storage: &dyn StorageBackend) -> Result<LockGuard> {
     };
 
     let uuid = format!("{:032x}", rand::random::<u128>());
-    // Timestamp prefix keeps older lock keys sorted first.
+    // The timestamp prefix is not used for ordering. It is kept because older
+    // clients still order by it, and stale reaping falls back to it when the
+    // entry body is unreadable.
     let ts = now.timestamp_micros();
     let key = format!("{LOCKS_PREFIX}{ts:020}-{uuid}.json");
     let data = serde_json::to_vec(&entry)
@@ -67,7 +82,6 @@ pub fn acquire_lock(storage: &dyn StorageBackend) -> Result<LockGuard> {
 
     storage.put(&key, &data)?;
 
-    // Determine lock winner deterministically: oldest key wins.
     let mut keys = list_lock_keys(storage)?;
     keys.sort();
     if !keys.contains(&key) {
@@ -78,14 +92,9 @@ pub fn acquire_lock(storage: &dyn StorageBackend) -> Result<LockGuard> {
             "lock acquisition failed: written lock key not returned by LIST".into(),
         ));
     }
-    if keys.first() != Some(&key) {
+    if let Some(other) = keys.iter().find(|k| **k != key) {
         let _ = storage.delete(&key);
-        let holder = build_lock_holder(
-            storage,
-            keys.first()
-                .expect("lock list contains our key or an older winner"),
-        );
-        return Err(VykarError::Locked(holder));
+        return Err(VykarError::Locked(build_lock_holder(storage, other)));
     }
 
     Ok(LockGuard {
@@ -153,7 +162,21 @@ fn build_lock_holder(storage: &dyn StorageBackend, lock_key: &str) -> LockHolder
     }
 }
 
-fn cleanup_stale_locks(storage: &dyn StorageBackend, max_age: Duration) -> Result<()> {
+/// Fail with `Locked` if any non-stale lock is present. Writes no lock key.
+///
+/// Safe against a concurrent maintenance lock without taking one: the caller
+/// writes its session marker before this LIST, and maintenance writes its lock
+/// before listing sessions, so at least one of the two sees the other.
+fn probe_unlocked(storage: &dyn StorageBackend) -> Result<()> {
+    let held = cleanup_stale_locks(storage, Duration::seconds(DEFAULT_STALE_LOCK_SECS))?;
+    match held.first() {
+        Some(key) => Err(VykarError::Locked(build_lock_holder(storage, key))),
+        None => Ok(()),
+    }
+}
+
+/// Remove stale locks and return the keys that remain.
+fn cleanup_stale_locks(storage: &dyn StorageBackend, max_age: Duration) -> Result<Vec<String>> {
     cleanup_stale_locks_inner(
         storage,
         max_age,
@@ -169,8 +192,9 @@ pub(crate) fn cleanup_stale_locks_inner(
     local_hostname: &str,
     local_boot_id: Option<&str>,
     pid_alive_fn: impl Fn(u32) -> bool,
-) -> Result<()> {
+) -> Result<Vec<String>> {
     let now = Utc::now();
+    let mut surviving = Vec::new();
     for key in list_lock_keys(storage)? {
         let Some(data) = storage.get(&key)? else {
             continue;
@@ -186,9 +210,12 @@ pub(crate) fn cleanup_stale_locks_inner(
             &pid_alive_fn,
         ) {
             storage.delete(&key)?;
+        } else {
+            surviving.push(key);
         }
     }
-    Ok(())
+    surviving.sort();
+    Ok(surviving)
 }
 
 fn should_cleanup_lock(
@@ -238,6 +265,11 @@ fn lock_key_timestamp(key: &str) -> Option<chrono::DateTime<Utc>> {
 }
 
 /// Build a lock fence closure that verifies the lock is still valid.
+///
+/// Another client can only acquire the lock once our key is gone, so the
+/// existence check detects loss of the lock at the next check. It is
+/// detection, not prevention: a storage write already in flight when the key
+/// is removed (`break-lock`, stale reaping) still completes.
 ///
 /// The returned closure checks:
 /// 1. The lock file still exists on storage (not cleaned up by another client).
@@ -377,13 +409,26 @@ pub struct SessionEntry {
     pub last_refresh: String,
 }
 
-/// Register a backup session. Writes a session marker and probes the lock
-/// to ensure no maintenance operation is in progress.
+/// Register a backup session. Writes a session marker, then checks (without
+/// writing a lock key) that no maintenance operation holds the lock.
 ///
 /// If a lock is held (maintenance or another commit), retries briefly
 /// (another backup's commit phase is typically seconds). If still locked
 /// after retries, deletes the marker and returns `Err(Locked)`.
+///
+/// Performs blocking `std::thread::sleep` between attempts. Callers running
+/// inside an async runtime must invoke this via `tokio::task::spawn_blocking`
+/// (see `commands/mount.rs` for the established pattern).
 pub fn register_session(storage: &dyn StorageBackend, session_id: &str) -> Result<()> {
+    register_session_inner(storage, session_id, 3, 2000)
+}
+
+pub(crate) fn register_session_inner(
+    storage: &dyn StorageBackend,
+    session_id: &str,
+    max_attempts: usize,
+    base_delay_ms: u64,
+) -> Result<()> {
     let key = session_marker_key(session_id);
     let now = Utc::now();
     let entry = SessionEntry {
@@ -396,16 +441,8 @@ pub fn register_session(storage: &dyn StorageBackend, session_id: &str) -> Resul
         .map_err(|e| VykarError::Other(format!("session serialize: {e}")))?;
     storage.put(&key, &data)?;
 
-    // Probe: make sure no maintenance lock is held.
-    // Uses the same jittered backoff as commit-phase lock acquisition.
-    match acquire_lock_with_retry(storage, 3, 2000) {
-        Ok(guard) => {
-            // No lock held — release our probe immediately and proceed.
-            if let Err(e) = release_lock(storage, guard) {
-                warn!(session_id, error = %e, "failed to release probe lock, aborting registration");
-                let _ = storage.delete(&key);
-                return Err(e);
-            }
+    match retry_while_locked(max_attempts, base_delay_ms, || probe_unlocked(storage)) {
+        Ok(()) => {
             debug!(session_id, "session registered, no active lock");
             Ok(())
         }
@@ -740,20 +777,17 @@ fn describe_holder(holder: &LockHolder) -> String {
     )
 }
 
-/// Acquire a repo lock with retry and exponential backoff + jitter.
-/// Returns the lock guard on success, or the last error on failure.
-///
-/// Performs blocking `std::thread::sleep` between attempts. Callers running
-/// inside an async runtime must invoke this via `tokio::task::spawn_blocking`
-/// (see `commands/mount.rs` for the established pattern).
-pub fn acquire_lock_with_retry(
-    storage: &dyn StorageBackend,
+/// Run `op` until it returns something other than `Locked`, with exponential
+/// backoff + jitter between attempts. Returns the last `Locked` when attempts
+/// run out. Blocks the calling thread.
+fn retry_while_locked<T>(
     max_attempts: usize,
     base_delay_ms: u64,
-) -> Result<LockGuard> {
+    mut op: impl FnMut() -> Result<T>,
+) -> Result<T> {
     for attempt in 0..max_attempts {
-        match acquire_lock(storage) {
-            Ok(guard) => return Ok(guard),
+        match op() {
+            Ok(v) => return Ok(v),
             Err(VykarError::Locked(holder)) => {
                 if attempt + 1 < max_attempts {
                     let delay = backoff_delay(attempt, base_delay_ms);
@@ -775,7 +809,7 @@ pub fn acquire_lock_with_retry(
     // Loop only falls through when `max_attempts == 0`; every other path
     // returns inside the match.
     Err(VykarError::Other(
-        "acquire_lock_with_retry called with max_attempts == 0".to_string(),
+        "retry_while_locked called with max_attempts == 0".to_string(),
     ))
 }
 
@@ -798,18 +832,19 @@ const LOCK_WAIT_SLICE: std::time::Duration = std::time::Duration::from_millis(50
 /// final attempt is always made, so this never gives up early.
 ///
 /// `on_contended` is called once, on the first `Locked` result. The holder it
-/// receives is a hint: `acquire_lock` writes its own key before listing, so the
-/// oldest key seen may be another waiter's transient probe rather than the
-/// actual holder.
+/// receives is a hint. `acquire_lock` does not write a key while one is
+/// present, so it is usually the real holder, but a contender that PUT in the
+/// same window, or an old client's transient key, can still be reported.
 ///
 /// Caveats:
 /// - The deadline bounds waiting, not storage calls: a slow `acquire_lock`
 ///   round-trip (stale-lock sweep + PUT + LIST + DELETE) can overrun it.
-/// - No fairness: each attempt uses a fresh timestamped key, so waiters do not
-///   queue and a later arrival can win. With several commits queued the
-///   deadline is a soft bound.
+/// - No fairness: waiters do not queue and a later arrival can win. Two
+///   contenders that PUT in the same window both back off. With several
+///   commits queued the deadline is a soft bound.
 ///
-/// Blocks the calling thread; see [`acquire_lock_with_retry`] for async callers.
+/// Blocks the calling thread. Callers running inside an async runtime must
+/// invoke this via `tokio::task::spawn_blocking`.
 pub fn acquire_lock_with_deadline(
     storage: &dyn StorageBackend,
     max_wait: std::time::Duration,

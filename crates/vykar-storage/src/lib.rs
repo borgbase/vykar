@@ -96,6 +96,18 @@ pub trait StorageBackend: Send + Sync {
     /// List all keys under a prefix. Returns full key paths.
     ///
     /// Never returns temp files ([`vykar_protocol::is_temp_file`]).
+    ///
+    /// # Consistency
+    ///
+    /// A LIST must reflect every PUT and DELETE that completed before it
+    /// started, **including those made by other clients**. Repository locking
+    /// (PUT own key, then LIST for others) depends on this. What provides it:
+    /// - S3: AWS guarantees strong read-after-write and list consistency.
+    ///   S3-compatible services must provide the same; not all are verified.
+    /// - vykar-server: a single process over a local directory.
+    /// - Local and SFTP: only as consistent as the filesystem underneath. A
+    ///   repository on NFS/SMB with directory or attribute caching can serve a
+    ///   stale listing (RFC 8881 §10.8.2), which breaks locking.
     fn list(&self, prefix: &str) -> Result<Vec<String>>;
 
     /// Read a byte range from an object. Returns `None` if not found.

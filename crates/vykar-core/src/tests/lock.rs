@@ -94,8 +94,7 @@ fn locked_error_names_holder_age_and_remedy() {
 #[test]
 fn locked_error_falls_back_to_key_when_holder_unparseable() {
     let storage = MemoryBackend::new();
-    // Older key so it wins the sort; valid timestamp prefix so stale-lock
-    // cleanup does not reap it.
+    // Valid timestamp prefix so stale-lock cleanup does not reap it.
     let garbage_key = lock_key_at(Utc::now() - Duration::minutes(1), "garbage");
     storage.put(&garbage_key, b"not json").unwrap();
 
@@ -163,7 +162,7 @@ fn lock_key_at(ts: chrono::DateTime<Utc>, suffix: &str) -> String {
 }
 
 fn write_lock_marker(
-    storage: &MemoryBackend,
+    storage: &dyn StorageBackend,
     key: &str,
     hostname: &str,
     pid: u32,
@@ -837,5 +836,333 @@ mod deadline {
             "{:?}",
             start.elapsed()
         );
+    }
+}
+
+// ── Clock-independent exclusion ──────────────────────────────────────────
+
+mod exclusion {
+    use super::{lock_key_at, write_lock_marker};
+    use crate::commands::util::with_maintenance_lock;
+    use crate::config::ChunkerConfig;
+    use crate::repo::lock::{
+        acquire_lock, register_session_inner, release_lock, session_marker_key,
+    };
+    use crate::repo::{EncryptionMode, Repository};
+    use crate::testutil::{HookBackend, MemoryBackend, Op, RecordingBackend};
+    use chrono::Utc;
+    use std::collections::HashSet;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{mpsc, Arc, Barrier, Condvar, Mutex};
+    use std::time::{Duration, Instant};
+    use vykar_storage::StorageBackend;
+    use vykar_types::error::VykarError;
+
+    fn lock_puts(entries: &[String]) -> usize {
+        entries.iter().filter(|k| k.starts_with("locks/")).count()
+    }
+
+    fn foreign_lock(storage: &dyn StorageBackend, ts: chrono::DateTime<Utc>) -> String {
+        let key = lock_key_at(ts, "foreign");
+        write_lock_marker(storage, &key, "otherhost", 4242, Utc::now(), None);
+        key
+    }
+
+    fn locked_key(err: VykarError) -> String {
+        match err {
+            VykarError::Locked(holder) => holder.key,
+            other => panic!("expected Locked, got {other:?}"),
+        }
+    }
+
+    fn on_thread(name: &str) -> bool {
+        std::thread::current().name() == Some(name)
+    }
+
+    /// Parks the hooked thread once: signals `reached`, then blocks until
+    /// [`Park::release`].
+    struct Park {
+        reached: Mutex<mpsc::Sender<()>>,
+        open: Mutex<bool>,
+        cv: Condvar,
+        fired: AtomicBool,
+    }
+
+    impl Park {
+        fn new() -> (Arc<Self>, mpsc::Receiver<()>) {
+            let (tx, rx) = mpsc::channel();
+            let park = Arc::new(Self {
+                reached: Mutex::new(tx),
+                open: Mutex::new(false),
+                cv: Condvar::new(),
+                fired: AtomicBool::new(false),
+            });
+            (park, rx)
+        }
+
+        fn park_once(&self) {
+            if self.fired.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            let _ = self.reached.lock().unwrap().send(());
+            let mut open = self.open.lock().unwrap();
+            while !*open {
+                open = self.cv.wait(open).unwrap();
+            }
+        }
+
+        fn release(&self) {
+            *self.open.lock().unwrap() = true;
+            self.cv.notify_all();
+        }
+    }
+
+    fn repo_over(storage: HookBackend) -> Repository {
+        crate::testutil::init_test_environment();
+        Repository::init(
+            Box::new(storage),
+            EncryptionMode::None,
+            ChunkerConfig::default(),
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+    }
+
+    /// A holder keyed in the future (its clock is ahead of ours) must still
+    /// block us: ordering by key would let us "win".
+    #[test]
+    fn newer_foreign_key_blocks_acquisition() {
+        let storage = MemoryBackend::new();
+        let foreign = foreign_lock(&storage, Utc::now() + chrono::Duration::minutes(1));
+
+        assert_eq!(locked_key(acquire_lock(&storage).unwrap_err()), foreign);
+        assert_eq!(storage.list("locks/").unwrap(), vec![foreign]);
+    }
+
+    #[test]
+    fn contended_acquire_issues_no_put() {
+        let (storage, log) = RecordingBackend::new();
+        foreign_lock(&storage, Utc::now() - chrono::Duration::minutes(1));
+        log.clear();
+
+        assert!(matches!(acquire_lock(&storage), Err(VykarError::Locked(_))));
+        assert_eq!(lock_puts(&log.entries()), 0, "{:?}", log.entries());
+    }
+
+    #[test]
+    fn register_session_probe_issues_no_lock_put() {
+        let (storage, log) = RecordingBackend::new();
+        register_session_inner(&storage, "free", 1, 10).unwrap();
+        assert!(storage.exists(&session_marker_key("free")).unwrap());
+        assert_eq!(lock_puts(&log.entries()), 0, "{:?}", log.entries());
+
+        let held = acquire_lock(&storage).unwrap();
+        log.clear();
+        let err = register_session_inner(&storage, "blocked", 1, 10).unwrap_err();
+        assert_eq!(locked_key(err), held.key());
+        assert!(!storage.exists(&session_marker_key("blocked")).unwrap());
+        assert_eq!(lock_puts(&log.entries()), 0, "{:?}", log.entries());
+        release_lock(&storage, held).unwrap();
+    }
+
+    /// Both contenders pass the pre-check and PUT before either LISTs: each
+    /// sees the other's key, so both must back off. DELETEs are held until both
+    /// have listed (a thread reaching DELETE has finished its LIST), with a
+    /// timeout so a winner fails the test instead of hanging it.
+    #[test]
+    fn simultaneous_acquires_both_back_off() {
+        let inner = Arc::new(MemoryBackend::new());
+        let put_barrier = Arc::new(Barrier::new(2));
+        let list_barrier = Arc::new(Barrier::new(2));
+        let deleting = Arc::new((Mutex::new(0usize), Condvar::new()));
+        let wrote: Arc<Mutex<HashSet<std::thread::ThreadId>>> = Arc::default();
+        let storage = Arc::new(HookBackend::new(Arc::clone(&inner), {
+            let (put_barrier, list_barrier) = (Arc::clone(&put_barrier), Arc::clone(&list_barrier));
+            move |op, key| {
+                if !key.starts_with("locks/") {
+                    return;
+                }
+                let me = std::thread::current().id();
+                match op {
+                    Op::Put => {
+                        put_barrier.wait();
+                        wrote.lock().unwrap().insert(me);
+                    }
+                    Op::List => {
+                        let after_put = wrote.lock().unwrap().remove(&me);
+                        if after_put {
+                            list_barrier.wait();
+                        }
+                    }
+                    Op::Delete => {
+                        let (count, cv) = &*deleting;
+                        let mut n = count.lock().unwrap();
+                        *n += 1;
+                        cv.notify_all();
+                        let _ = cv
+                            .wait_timeout_while(n, Duration::from_secs(5), |n| *n < 2)
+                            .unwrap();
+                    }
+                }
+            }
+        }));
+
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let storage = Arc::clone(&storage);
+                std::thread::spawn(move || acquire_lock(&*storage))
+            })
+            .collect();
+        for h in handles {
+            let res = h.join().unwrap();
+            assert!(matches!(res, Err(VykarError::Locked(_))), "got {res:?}");
+        }
+        let lock_put_count = storage
+            .ops()
+            .iter()
+            .filter(|(op, k)| *op == Op::Put && k.starts_with("locks/"))
+            .count();
+        assert_eq!(lock_put_count, 2);
+        assert!(inner.list("locks/").unwrap().is_empty());
+    }
+
+    /// A foreign key with a *later* timestamp appears after our pre-check but
+    /// before our LIST. We must lose to it.
+    #[test]
+    fn late_key_after_precheck_blocks() {
+        let inner = Arc::new(MemoryBackend::new());
+        let late = lock_key_at(Utc::now() + chrono::Duration::minutes(1), "late");
+        let storage = HookBackend::new(Arc::clone(&inner), {
+            let inner = Arc::clone(&inner);
+            let late = late.clone();
+            let fired = AtomicBool::new(false);
+            move |op, key| {
+                if op == Op::Put && key.starts_with("locks/") && !fired.swap(true, Ordering::SeqCst)
+                {
+                    write_lock_marker(&*inner, &late, "otherhost", 4242, Utc::now(), None);
+                }
+            }
+        });
+
+        assert_eq!(locked_key(acquire_lock(&storage).unwrap_err()), late);
+        assert_eq!(inner.list("locks/").unwrap(), vec![late]);
+    }
+
+    /// Session marker is written, then the session parks before its probe
+    /// LIST. Maintenance must see the marker and refuse.
+    #[test]
+    fn session_registered_first_blocks_maintenance() {
+        let inner = Arc::new(MemoryBackend::new());
+        let (park, reached) = Park::new();
+        let mut repo = repo_over(HookBackend::new(Arc::clone(&inner), {
+            let park = Arc::clone(&park);
+            move |op, key| {
+                if op == Op::List && key == "locks/" && on_thread("session") {
+                    park.park_once();
+                }
+            }
+        }));
+        let storage = Arc::clone(&repo.storage);
+        let session = std::thread::Builder::new()
+            .name("session".into())
+            .spawn(move || register_session_inner(&*storage, "s1", 1, 10))
+            .unwrap();
+        reached.recv_timeout(Duration::from_secs(10)).unwrap();
+
+        let mut ran = false;
+        let err = with_maintenance_lock(&mut repo, |_| {
+            ran = true;
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(matches!(err, VykarError::ActiveSessions(_)), "got {err:?}");
+        assert!(!ran);
+        assert!(inner.list("locks/").unwrap().is_empty());
+
+        park.release();
+        session.join().unwrap().unwrap();
+        assert!(inner.exists(&session_marker_key("s1")).unwrap());
+    }
+
+    /// Maintenance holds the lock and parks before listing sessions. A session
+    /// registering now must see the lock and back out.
+    #[test]
+    fn maintenance_lock_first_blocks_session() {
+        let inner = Arc::new(MemoryBackend::new());
+        let (park, reached) = Park::new();
+        let mut repo = repo_over(HookBackend::new(Arc::clone(&inner), {
+            let park = Arc::clone(&park);
+            move |op, key| {
+                if op == Op::List && key == "sessions/" && on_thread("maint") {
+                    park.park_once();
+                }
+            }
+        }));
+        let storage = Arc::clone(&repo.storage);
+        let maint = std::thread::Builder::new()
+            .name("maint".into())
+            .spawn(move || {
+                let mut ran = false;
+                let res = with_maintenance_lock(&mut repo, |_| {
+                    ran = true;
+                    Ok(())
+                });
+                (res, ran)
+            })
+            .unwrap();
+        reached.recv_timeout(Duration::from_secs(10)).unwrap();
+
+        let err = register_session_inner(&*storage, "s2", 1, 10).unwrap_err();
+        assert!(matches!(err, VykarError::Locked(_)), "got {err:?}");
+        assert!(!inner.exists(&session_marker_key("s2")).unwrap());
+
+        park.release();
+        let (res, ran) = maint.join().unwrap();
+        res.unwrap();
+        assert!(ran);
+        assert!(inner.list("locks/").unwrap().is_empty());
+    }
+
+    /// Unforced smoke test: mutual exclusion and liveness under contention.
+    #[test]
+    fn lock_is_mutually_exclusive_under_threads() {
+        let storage = Arc::new(MemoryBackend::new());
+        let inside = Arc::new(AtomicUsize::new(0));
+        let max_inside = Arc::new(AtomicUsize::new(0));
+        let deadline = Instant::now() + Duration::from_secs(30);
+
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let (storage, inside, max_inside) = (
+                    Arc::clone(&storage),
+                    Arc::clone(&inside),
+                    Arc::clone(&max_inside),
+                );
+                std::thread::spawn(move || loop {
+                    match acquire_lock(&*storage) {
+                        Ok(guard) => {
+                            let n = inside.fetch_add(1, Ordering::SeqCst) + 1;
+                            max_inside.fetch_max(n, Ordering::SeqCst);
+                            std::thread::sleep(Duration::from_millis(2));
+                            inside.fetch_sub(1, Ordering::SeqCst);
+                            release_lock(&*storage, guard).unwrap();
+                            return;
+                        }
+                        Err(VykarError::Locked(_)) => {
+                            assert!(Instant::now() < deadline, "thread starved");
+                            std::thread::sleep(Duration::from_micros(rand::random::<u64>() % 3000));
+                        }
+                        Err(e) => panic!("unexpected error: {e}"),
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(max_inside.load(Ordering::SeqCst), 1);
+        assert!(storage.list("locks/").unwrap().is_empty());
     }
 }

@@ -1,8 +1,8 @@
 //! Backup Phase 1 must leave every pack durable before Phase 2 takes the
 //! commit lock, so the lock is never held across pack uploads.
 //!
-//! The first `locks/` PUT of every backup is the `register_session` probe; the
-//! commit lock is any `locks/` PUT after that.
+//! The `register_session` probe only lists `locks/`, so every `locks/` PUT is
+//! the commit lock.
 
 use std::fs;
 use std::path::Path;
@@ -199,11 +199,12 @@ fn uploads_complete_before_commit_lock() {
     );
     let commit_lock = events
         .iter()
-        .rposition(|e| *e == Event::LockPut)
+        .position(|e| *e == Event::LockPut)
         .expect("commit lock PUT");
-    assert!(
-        events.iter().filter(|e| **e == Event::LockPut).count() >= 2,
-        "expected registration probe + commit lock: {events:?}"
+    assert_eq!(
+        events.iter().filter(|e| **e == Event::LockPut).count(),
+        1,
+        "expected exactly one locks/ PUT (the commit lock): {events:?}"
     );
     assert!(
         !events[commit_lock..]
@@ -230,8 +231,8 @@ fn early_flush_failure_aborts_cleanly() {
     let events = shared.events.lock().unwrap().clone();
     assert_eq!(
         events.iter().filter(|e| **e == Event::LockPut).count(),
-        1,
-        "only the registration probe may touch locks/: {events:?}"
+        0,
+        "a backup that never commits must not PUT to locks/: {events:?}"
     );
     assert!(repo_keys(&config, "snapshots/").is_empty());
     assert!(repo_keys(&config, "locks/").is_empty());

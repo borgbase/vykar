@@ -5,10 +5,19 @@ use super::pack::{self, compute_data_pack_target, PackType, SealedPack};
 use super::write_session::PendingUpload;
 use super::Repository;
 use crate::compress;
-use crate::index::dedup_cache::DedupPrefilter;
-use crate::index::PendingChunkEntry;
+use crate::index::dedup_cache::{DedupPrefilter, TieredHit};
+use crate::index::{IndexDelta, PendingChunkEntry};
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
+
+/// Record the refcount bump for a tiered-dedup hit: by cache position for
+/// chunks in the mmap'd dedup cache, by key for chunks created this session.
+fn bump_tiered_hit(delta: &mut IndexDelta, chunk_id: &ChunkId, hit: TieredHit) {
+    match hit {
+        TieredHit::Cached { position, .. } => delta.bump_cached_refcount(chunk_id, position),
+        TieredHit::SessionNew { .. } => delta.bump_refcount(chunk_id),
+    }
+}
 
 impl Repository {
     /// Resolve a cache-hit chunk reference by bumping its refcount.
@@ -46,11 +55,11 @@ impl Repository {
                 .as_mut()
                 .expect("no active write session");
             if let Some(ref tiered) = ws.tiered_dedup {
-                if let Some(stored_size) = tiered.get_stored_size(chunk_id) {
+                if let Some(hit) = tiered.find(chunk_id) {
                     if let Some(ref mut delta) = ws.index_delta {
-                        delta.bump_refcount(chunk_id);
+                        bump_tiered_hit(delta, chunk_id, hit);
                     }
-                    return Some(stored_size);
+                    return Some(hit.stored_size());
                 }
                 true
             } else if let Some(ref dedup) = ws.dedup_index {
@@ -93,11 +102,11 @@ impl Repository {
                 .as_mut()
                 .expect("no active write session");
             if let Some(ref tiered) = ws.tiered_dedup {
-                if let Some(stored_size) = tiered.get_stored_size_skip_filter(chunk_id) {
+                if let Some(hit) = tiered.find_skip_filter(chunk_id) {
                     if let Some(ref mut delta) = ws.index_delta {
-                        delta.bump_refcount(chunk_id);
+                        bump_tiered_hit(delta, chunk_id, hit);
                     }
-                    return Some(stored_size);
+                    return Some(hit.stored_size());
                 }
                 true
             } else {
@@ -116,7 +125,10 @@ impl Repository {
     /// A worker confirmed `chunk_id` in the pre-session mmap tier through
     /// `prefilter` (`PrefilterVerdict::Present`): record the reference.
     ///
-    /// No second lookup is needed. The verdict came from the very mapping the
+    /// No second lookup is needed: `cache_position` is where the worker found
+    /// the chunk, and the bump is recorded against it (the positional table
+    /// re-checks that the entry there is `chunk_id` and otherwise records the
+    /// bump by key). The verdict came from the very mapping the
     /// active `TieredDedupIndex` resolves against (checked by identity), and
     /// that tier is immutable for the session — nothing removes pre-session
     /// entries (`remove` and rollback only touch `session_new`), and a chunk in
@@ -129,6 +141,7 @@ impl Repository {
         &mut self,
         chunk_id: &ChunkId,
         stored_size: u32,
+        cache_position: u32,
         prefilter: &DedupPrefilter,
     ) -> Result<()> {
         let ws = self
@@ -150,14 +163,17 @@ impl Repository {
                 ))
             })?;
         debug_assert_eq!(
-            tiered.get_stored_size_skip_filter(chunk_id),
-            Some(stored_size),
-            "pre-session hit must resolve to the worker's stored size"
+            tiered.find_skip_filter(chunk_id),
+            Some(TieredHit::Cached {
+                position: cache_position,
+                stored_size,
+            }),
+            "pre-session hit must resolve to the worker's cache entry"
         );
         let delta = ws.index_delta.as_mut().ok_or_else(|| {
             VykarError::Other("BUG: tiered dedup mode without an index delta".into())
         })?;
-        delta.bump_refcount(chunk_id);
+        delta.bump_cached_refcount(chunk_id, cache_position);
         Ok(())
     }
 

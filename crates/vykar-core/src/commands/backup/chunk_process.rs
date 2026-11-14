@@ -25,6 +25,9 @@ pub(crate) struct ExistingChunk {
     pub(crate) chunk_id: ChunkId,
     pub(crate) uncompressed_size: u32,
     pub(crate) stored_size: u32,
+    /// Position of the chunk in the mmap'd dedup cache, so the consumer can
+    /// record the refcount bump without a second lookup.
+    pub(crate) cache_position: u32,
 }
 
 /// Result of worker-side classify.
@@ -59,11 +62,15 @@ pub(super) fn classify_chunk(
 ) -> Result<WorkerChunk> {
     match prefilter.map(|p| p.lookup(&chunk_id)) {
         None | Some(PrefilterVerdict::Absent) => {}
-        Some(PrefilterVerdict::Present { stored_size }) => {
+        Some(PrefilterVerdict::Present {
+            stored_size,
+            position,
+        }) => {
             return Ok(WorkerChunk::Existing(ExistingChunk {
                 chunk_id,
                 uncompressed_size: data.len() as u32,
                 stored_size,
+                cache_position: position,
             }));
         }
         Some(PrefilterVerdict::Unconfirmed) => {

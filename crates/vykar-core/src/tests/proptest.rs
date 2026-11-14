@@ -645,6 +645,7 @@ mod index_delta {
                     let delta = IndexDelta {
                         new_entries: entries_clone.clone(),
                         refcount_bumps: bump_map.clone(),
+                        cached_bumps: None,
                         undo_log: None,
                     };
                     (delta, entries_clone.clone(), bump_map)
@@ -739,6 +740,7 @@ mod index_delta {
                         let delta = IndexDelta {
                             new_entries: new_entries.clone(),
                             refcount_bumps: combined_bumps.clone(),
+                            cached_bumps: None,
                             undo_log: None,
                         };
                         (delta, new_entries, combined_bumps)

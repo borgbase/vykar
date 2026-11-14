@@ -8,6 +8,7 @@
 #![allow(clippy::indexing_slicing)]
 
 use super::hasher::ChunkIdHashMap;
+use std::collections::HashMap;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -169,6 +170,18 @@ impl CacheSpec {
         entry_count: u32,
         chunk_id: &ChunkId,
     ) -> Option<&'a [u8]> {
+        self.find_entry_with_position(mmap, entry_count, chunk_id)
+            .map(|(_, entry)| entry)
+    }
+
+    /// [`find_entry`](Self::find_entry), also returning the entry's index in
+    /// the sorted array.
+    fn find_entry_with_position<'a>(
+        &self,
+        mmap: &'a Mmap,
+        entry_count: u32,
+        chunk_id: &ChunkId,
+    ) -> Option<(u32, &'a [u8])> {
         if entry_count == 0 {
             return None;
         }
@@ -185,7 +198,8 @@ impl CacheSpec {
             let entry = &data[offset..offset + self.entry_size];
 
             match entry[..32].cmp(target.as_slice()) {
-                std::cmp::Ordering::Equal => return Some(entry),
+                // `mid < entry_count`, so it fits in u32.
+                std::cmp::Ordering::Equal => return Some((mid as u32, entry)),
                 std::cmp::Ordering::Less => lo = mid + 1,
                 std::cmp::Ordering::Greater => hi = mid,
             }
@@ -377,6 +391,46 @@ impl MmapDedupCache {
         ))
     }
 
+    /// Look up a chunk ID using binary search. Returns the entry's position in
+    /// the sorted array together with its stored_size.
+    ///
+    /// The position is what [`IndexDelta`] records refcount bumps against
+    /// (see [`crate::index::CachedBumps`]); it is only meaningful for this
+    /// cache instance.
+    pub fn find_with_position(&self, chunk_id: &ChunkId) -> Option<(u32, u32)> {
+        let (position, entry) =
+            DEDUP_SPEC.find_entry_with_position(&self.mmap, self.entry_count, chunk_id)?;
+        let stored_size = read_u32_le(
+            entry[32..36]
+                .try_into()
+                .expect("4-byte slice within validated entry"),
+        );
+        Some((position, stored_size))
+    }
+
+    /// The 32 `ChunkId` bytes of the entry at `position`.
+    ///
+    /// Panics if `position >= entry_count()`.
+    pub(crate) fn chunk_id_bytes_at(&self, position: u32) -> &[u8] {
+        assert!(
+            position < self.entry_count,
+            "dedup cache position out of range"
+        );
+        let offset = HEADER_SIZE + position as usize * ENTRY_SIZE;
+        &self.mmap[offset..offset + 32]
+    }
+
+    /// The `ChunkId` of the entry at `position`.
+    ///
+    /// Panics if `position >= entry_count()`.
+    pub(crate) fn chunk_id_at(&self, position: u32) -> ChunkId {
+        ChunkId::from_bytes(
+            self.chunk_id_bytes_at(position)
+                .try_into()
+                .expect("32-byte ChunkId slice"),
+        )
+    }
+
     /// Return the index_generation from the cache header.
     pub fn generation(&self) -> u64 {
         self.index_generation
@@ -457,8 +511,9 @@ pub(crate) enum PrefilterVerdict {
     /// false negatives), or a filter false positive the mmap tier ruled out.
     /// It may still be a chunk added earlier in this session.
     Absent,
-    /// Confirmed in the immutable pre-session mmap tier.
-    Present { stored_size: u32 },
+    /// Confirmed in the immutable pre-session mmap tier, at `position` in its
+    /// sorted entry array (what the consumer records the refcount bump by).
+    Present { stored_size: u32, position: u32 },
     /// Filter hit with no authoritative set to confirm it against (the
     /// non-tiered `DedupIndex` fallback, whose map the write session owns).
     Unconfirmed,
@@ -495,8 +550,11 @@ impl DedupPrefilter {
             return PrefilterVerdict::Absent;
         }
         match self.presession {
-            Some(ref cache) => match cache.get_stored_size(id) {
-                Some(stored_size) => PrefilterVerdict::Present { stored_size },
+            Some(ref cache) => match cache.find_with_position(id) {
+                Some((position, stored_size)) => PrefilterVerdict::Present {
+                    stored_size,
+                    position,
+                },
                 None => PrefilterVerdict::Absent,
             },
             None => PrefilterVerdict::Unconfirmed,
@@ -521,10 +579,30 @@ impl DedupPrefilter {
 /// 3. mmap binary search — confirms filter hit, returns stored_size (OS-paged, near-zero RSS)
 pub struct TieredDedupIndex {
     xor_filter: Option<Arc<Xor8>>,
-    /// Shared with backup workers through [`DedupPrefilter`]. Never mutated:
-    /// the mapping is read-only and `remove` only touches `session_new`.
+    /// Shared with backup workers through [`DedupPrefilter`] and with the
+    /// session's [`IndexDelta`], which records refcount bumps by position in
+    /// this cache and resolves them back to chunk IDs at commit. Never
+    /// mutated: the mapping is read-only and `remove` only touches
+    /// `session_new`.
     mmap_cache: Arc<MmapDedupCache>,
     session_new: ChunkIdHashMap<u32>,
+}
+
+/// Where a [`TieredDedupIndex`] lookup found a chunk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TieredHit {
+    /// Created earlier in this session (`session_new` tier).
+    SessionNew { stored_size: u32 },
+    /// Present in the mmap'd dedup cache at `position`.
+    Cached { position: u32, stored_size: u32 },
+}
+
+impl TieredHit {
+    pub fn stored_size(self) -> u32 {
+        match self {
+            Self::SessionNew { stored_size } | Self::Cached { stored_size, .. } => stored_size,
+        }
+    }
 }
 
 impl TieredDedupIndex {
@@ -555,6 +633,12 @@ impl TieredDedupIndex {
         Arc::ptr_eq(&self.mmap_cache, cache)
     }
 
+    /// The mmap'd cache tier, for building a positional [`IndexDelta`]
+    /// (`IndexDelta::with_cached_bumps`).
+    pub(crate) fn mmap_cache(&self) -> &Arc<MmapDedupCache> {
+        &self.mmap_cache
+    }
+
     /// Check if a chunk exists in any tier.
     pub fn contains(&self, id: &ChunkId) -> bool {
         self.get_stored_size(id).is_some()
@@ -562,9 +646,14 @@ impl TieredDedupIndex {
 
     /// Look up a chunk's stored size across all tiers.
     pub fn get_stored_size(&self, id: &ChunkId) -> Option<u32> {
+        self.find(id).map(TieredHit::stored_size)
+    }
+
+    /// Look up a chunk across all tiers, reporting which tier hit.
+    pub fn find(&self, id: &ChunkId) -> Option<TieredHit> {
         // Tier 1: session-new chunks
-        if let Some(&size) = self.session_new.get(id) {
-            return Some(size);
+        if let Some(&stored_size) = self.session_new.get(id) {
+            return Some(TieredHit::SessionNew { stored_size });
         }
 
         // Tier 2: xor filter (probabilistic negative)
@@ -577,16 +666,31 @@ impl TieredDedupIndex {
         }
 
         // Tier 3: mmap binary search (confirms filter hit or used when no filter)
-        self.mmap_cache.get_stored_size(id)
+        self.find_cached(id)
     }
 
     /// Look up stored size, skipping the xor filter tier.
     /// Caller already checked the xor filter (hit) — go straight to session_new → mmap.
     pub fn get_stored_size_skip_filter(&self, id: &ChunkId) -> Option<u32> {
-        if let Some(&size) = self.session_new.get(id) {
-            return Some(size);
+        self.find_skip_filter(id).map(TieredHit::stored_size)
+    }
+
+    /// [`find`](Self::find) without the xor filter tier (caller already
+    /// checked it and got a hit).
+    pub fn find_skip_filter(&self, id: &ChunkId) -> Option<TieredHit> {
+        if let Some(&stored_size) = self.session_new.get(id) {
+            return Some(TieredHit::SessionNew { stored_size });
         }
-        self.mmap_cache.get_stored_size(id)
+        self.find_cached(id)
+    }
+
+    fn find_cached(&self, id: &ChunkId) -> Option<TieredHit> {
+        self.mmap_cache
+            .find_with_position(id)
+            .map(|(position, stored_size)| TieredHit::Cached {
+                position,
+                stored_size,
+            })
     }
 
     /// Look up stored size in session_new only.
@@ -1004,7 +1108,16 @@ pub fn build_full_index_cache_to_path(
 
 /// Two-pointer merge of an existing full cache with a sorted IndexDelta.
 /// Produces a new cache file at `out_path` with the given generation.
-/// O(buffer) heap — no HashMap materialization.
+/// O(buffer) heap — no HashMap materialization in the normal case.
+///
+/// The delta's positional bumps ([`IndexDelta::cached_bumps`]) index the
+/// session's dedup cache, not `old_cache`. They are applied by position when
+/// the two agree: same entry count, identical chunk ID at every bumped
+/// position, and `old_cache` strictly sorted (so a chunk ID occupies exactly
+/// one position). The last two are checked during the merge itself; if either
+/// fails the output is discarded and rewritten with the positional bumps
+/// resolved to chunk IDs, which is exactly the keyed merge. The result is the
+/// same as if every bump had been recorded by key.
 pub fn merge_full_index_cache(
     old_cache: &MmapFullIndexCache,
     delta: &IndexDelta,
@@ -1015,6 +1128,66 @@ pub fn merge_full_index_cache(
     let mut sorted_new: Vec<&crate::index::NewChunkEntry> = delta.new_entries.iter().collect();
     sorted_new.sort_unstable_by_key(|a| *a.chunk_id.as_bytes());
 
+    let cached = delta.cached_bumps.as_ref().filter(|c| !c.is_empty());
+    let positional = match cached {
+        None => Some(CachedBumpSource::None),
+        Some(c) if c.len() == old_cache.entry_count() as usize => {
+            Some(CachedBumpSource::Positional(c))
+        }
+        Some(_) => None,
+    };
+    if let Some(source) = positional {
+        if write_merged_full_cache(
+            old_cache,
+            delta,
+            &sorted_new,
+            &source,
+            new_generation,
+            out_path,
+        )? {
+            return Ok(());
+        }
+    }
+
+    let cached = cached.expect("only positional bumps can fail the merge");
+    debug!("full index cache merge: dedup cache positions do not match, merging by chunk ID");
+    let mut keyed: HashMap<ChunkId, u32> = HashMap::new();
+    for (id, count) in cached.iter_nonzero() {
+        *keyed.entry(id).or_insert(0) += count;
+    }
+    let merged = write_merged_full_cache(
+        old_cache,
+        delta,
+        &sorted_new,
+        &CachedBumpSource::Keyed(keyed),
+        new_generation,
+        out_path,
+    )?;
+    debug_assert!(merged, "keyed merge cannot be rejected");
+    Ok(())
+}
+
+/// How [`write_merged_full_cache`] looks up the delta's positional bumps.
+enum CachedBumpSource<'a> {
+    /// No positional bumps.
+    None,
+    /// Apply `counts[i]` to `old_cache` entry `i` (validated while merging).
+    Positional(&'a crate::index::CachedBumps),
+    /// Positional bumps resolved to chunk IDs.
+    Keyed(HashMap<ChunkId, u32>),
+}
+
+/// One merge pass. Returns `Ok(false)` — with the temp file left for the
+/// retry to overwrite — when `CachedBumpSource::Positional` turns out not to
+/// line up with `old_cache`.
+fn write_merged_full_cache(
+    old_cache: &MmapFullIndexCache,
+    delta: &IndexDelta,
+    sorted_new: &[&crate::index::NewChunkEntry],
+    cached: &CachedBumpSource<'_>,
+    new_generation: u64,
+    out_path: &Path,
+) -> Result<bool> {
     // Count total entries: old + new (new entries should not overlap with old)
     let total_count = old_cache.entry_count() + sorted_new.len() as u32;
 
@@ -1025,10 +1198,21 @@ pub fn merge_full_index_cache(
     write_full_header(&mut w, new_generation, total_count)?;
     let mut hasher = Blake2b256::new();
 
+    let keyed_bump = |id: &ChunkId| -> u32 {
+        let mut bump = delta.refcount_bumps.get(id).copied().unwrap_or(0);
+        if let CachedBumpSource::Keyed(map) = cached {
+            bump += map.get(id).copied().unwrap_or(0);
+        }
+        bump
+    };
+
     // Two-pointer merge
     let mut old_idx: usize = 0;
     let old_count = old_cache.entry_count() as usize;
     let mut new_idx: usize = 0;
+    // Positional bump of the last old entry written. New entries sharing its
+    // chunk ID get it too, matching what a keyed lookup would return for them.
+    let mut last_old_positional: u32 = 0;
 
     while old_idx < old_count || new_idx < sorted_new.len() {
         let take_old = if old_idx >= old_count {
@@ -1043,17 +1227,34 @@ pub fn merge_full_index_cache(
         if take_old {
             let mut entry = old_cache.entry_at(old_idx);
             // Apply refcount bump if any
-            if let Some(&bump) = delta.refcount_bumps.get(&entry.chunk_id) {
-                entry.refcount += bump;
+            entry.refcount += keyed_bump(&entry.chunk_id);
+            last_old_positional = 0;
+            if let CachedBumpSource::Positional(bumps) = cached {
+                let key = old_cache.chunk_id_bytes_at(old_idx);
+                if old_idx > 0 && old_cache.chunk_id_bytes_at(old_idx - 1) >= key {
+                    return Ok(false);
+                }
+                let count = bumps.count_at(old_idx);
+                if count != 0 {
+                    if bumps.cache().chunk_id_bytes_at(old_idx as u32) != key {
+                        return Ok(false);
+                    }
+                    entry.refcount += count;
+                    last_old_positional = count;
+                }
             }
             write_full_entry(&mut w, &mut hasher, &entry)?;
             old_idx += 1;
         } else {
             let ne = &sorted_new[new_idx];
-            let mut refcount = ne.refcount;
             // Apply refcount bump for session-new chunks
-            if let Some(&bump) = delta.refcount_bumps.get(&ne.chunk_id) {
-                refcount += bump;
+            let mut refcount = ne.refcount + keyed_bump(&ne.chunk_id);
+            // A positional bump belongs to an old entry; with `<=` above an
+            // old entry with the same ID is always written just before.
+            if old_idx > 0
+                && old_cache.chunk_id_bytes_at(old_idx - 1) == ne.chunk_id.as_bytes().as_slice()
+            {
+                refcount += last_old_positional;
             }
             let entry = FullCacheEntry {
                 chunk_id: ne.chunk_id,
@@ -1077,7 +1278,7 @@ pub fn merge_full_index_cache(
         path = %out_path.display(),
         "wrote merged full index cache"
     );
-    Ok(())
+    Ok(true)
 }
 
 /// Load a ChunkIndex HashMap from the local full index cache.

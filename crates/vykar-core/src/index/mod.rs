@@ -1,9 +1,11 @@
+pub mod cached_bumps;
 pub mod dedup_cache;
 pub mod hasher;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+pub use cached_bumps::CachedBumps;
 use hasher::{BuildChunkIdHasher, ChunkIdHashMap};
 
 use serde::{Deserialize, Serialize};
@@ -381,7 +383,8 @@ pub struct RecoveredChunkEntry {
 
 /// Marker for a `IndexDelta` rollback checkpoint. Records only the length of
 /// `new_entries` at checkpoint time; refcount bumps are rolled back via the
-/// delta's undo log (armed by `checkpoint()`), so no map snapshot is stored.
+/// delta's undo log and the positional journal in `cached_bumps` (both armed
+/// by `checkpoint()`), so no map snapshot is stored.
 ///
 /// Armed per modified regular file in sequential backup, per streamed command
 /// dump, and per segmented large file in pipeline mode.
@@ -404,8 +407,15 @@ impl IndexDeltaCheckpoint {
 pub struct IndexDelta {
     /// New chunk entries added during this session.
     pub new_entries: Vec<NewChunkEntry>,
-    /// Refcount increments for chunks that already existed in the index.
+    /// Refcount increments recorded by chunk ID: chunks created earlier in
+    /// this session, chunks found through the non-tiered `DedupIndex`, and
+    /// bumps whose position could not be used (see `bump_cached_refcount`).
     pub refcount_bumps: HashMap<ChunkId, u32>,
+    /// Refcount increments for chunks of the tiered mode's mmap'd dedup
+    /// cache, by cache position (`None` outside tiered mode). The logical
+    /// bump for a chunk is its `refcount_bumps` value plus its count here;
+    /// every consumer below adds both.
+    pub cached_bumps: Option<CachedBumps>,
     /// Undo log for the armed rollback checkpoint. `Some` ⟺ a checkpoint is
     /// armed. Maps each in-scope-mutated chunk to its `refcount_bumps` value at
     /// first touch (`None` = key was absent), so rollback replays exact prior
@@ -428,9 +438,20 @@ impl IndexDelta {
         Self::default()
     }
 
+    /// A delta that records bumps for chunks of `cache` by position
+    /// (tiered dedup mode).
+    pub fn with_cached_bumps(cache: Arc<dedup_cache::MmapDedupCache>) -> Self {
+        Self {
+            cached_bumps: Some(CachedBumps::new(cache)),
+            ..Self::default()
+        }
+    }
+
     /// Returns true if this delta contains no mutations.
     pub fn is_empty(&self) -> bool {
-        self.new_entries.is_empty() && self.refcount_bumps.is_empty()
+        self.new_entries.is_empty()
+            && self.refcount_bumps.is_empty()
+            && self.cached_bumps.as_ref().is_none_or(CachedBumps::is_empty)
     }
 
     /// Arm a rollback checkpoint. Subsequent `refcount_bumps` mutations are
@@ -442,6 +463,9 @@ impl IndexDelta {
             "checkpoint() called while another checkpoint is armed"
         );
         self.undo_log = Some(HashMap::new());
+        if let Some(cached) = self.cached_bumps.as_mut() {
+            cached.checkpoint();
+        }
         IndexDeltaCheckpoint {
             new_entries_len: self.new_entries.len(),
         }
@@ -465,6 +489,9 @@ impl IndexDelta {
                 }
             }
         }
+        if let Some(cached) = self.cached_bumps.as_mut() {
+            cached.rollback();
+        }
     }
 
     /// Discard the armed checkpoint without rolling back (commit path). The
@@ -472,9 +499,28 @@ impl IndexDelta {
     /// `checkpoint()` can arm cleanly.
     pub fn discard_checkpoint(&mut self) {
         self.undo_log = None;
+        if let Some(cached) = self.cached_bumps.as_mut() {
+            cached.discard_checkpoint();
+        }
     }
 
-    /// Record a refcount bump for an existing chunk.
+    /// Record a refcount bump for a chunk found at `position` in the tiered
+    /// mode's mmap'd dedup cache. Falls back to the keyed map when this delta
+    /// has no positional table or the position does not hold `id`, so the
+    /// recorded logical bump is the same either way.
+    pub fn bump_cached_refcount(&mut self, id: &ChunkId, position: u32) {
+        if let Some(cached) = self.cached_bumps.as_mut() {
+            if cached.bump(position, id) {
+                return;
+            }
+            // Unreachable while positions come from `TieredDedupIndex::find*`
+            // on the cache this table was built from; the keyed fallback
+            // keeps the count exact if that ever stops holding.
+        }
+        self.bump_refcount(id);
+    }
+
+    /// Record a refcount bump for an existing chunk by key.
     pub fn bump_refcount(&mut self, id: &ChunkId) {
         if let Some(undo) = self.undo_log.as_mut() {
             let prev = self.refcount_bumps.get(id).copied();
@@ -522,8 +568,17 @@ impl IndexDelta {
 
         // Verify all bump targets still exist.
         let new_entry_ids: HashSet<ChunkId> = self.new_entries.iter().map(|e| e.chunk_id).collect();
-        for chunk_id in self.refcount_bumps.keys() {
-            if !fresh_index.contains(chunk_id) && !new_entry_ids.contains(chunk_id) {
+        let is_stale = |chunk_id: &ChunkId| {
+            !fresh_index.contains(chunk_id) && !new_entry_ids.contains(chunk_id)
+        };
+        if self.refcount_bumps.keys().any(is_stale) {
+            return Err(vykar_types::error::VykarError::StaleChunksDuringCommit);
+        }
+        if let Some(cached) = self.cached_bumps.as_ref() {
+            if cached
+                .iter_nonzero()
+                .any(|(chunk_id, _)| is_stale(&chunk_id))
+            {
                 return Err(vykar_types::error::VykarError::StaleChunksDuringCommit);
             }
         }
@@ -550,6 +605,11 @@ impl IndexDelta {
         // Apply refcount bumps for pre-existing chunks
         for (id, count) in self.refcount_bumps {
             index.increment_refcount_by(&id, count);
+        }
+        if let Some(cached) = self.cached_bumps {
+            for (id, count) in cached.iter_nonzero() {
+                index.increment_refcount_by(&id, count);
+            }
         }
     }
 }

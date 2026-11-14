@@ -152,6 +152,10 @@ impl Repository {
         ) {
             let tiered = TieredDedupIndex::new(mmap_cache);
             debug!(?tiered, "tiered dedup mode: using mmap cache");
+            // Bumps for chunks already in the cache are recorded by position
+            // in this same cache instance (`bump_ref_*` in chunks.rs).
+            let index_delta =
+                IndexDelta::with_cached_bumps(std::sync::Arc::clone(tiered.mmap_cache()));
             // Drop the full index to reclaim memory.
             self.chunk_index = ChunkIndex::new();
             let ws = self
@@ -159,7 +163,7 @@ impl Repository {
                 .as_mut()
                 .expect("write session active while enabling tiered dedup");
             ws.tiered_dedup = Some(tiered);
-            ws.index_delta = Some(IndexDelta::new());
+            ws.index_delta = Some(index_delta);
         } else {
             debug!("tiered dedup mode: no valid cache, falling back to DedupIndex");
             self.enable_dedup_mode();
@@ -439,17 +443,31 @@ impl Repository {
             .write_session
             .as_mut()
             .expect("no active write session");
-        ws.tiered_dedup = Some(TieredDedupIndex::new(cache));
-        ws.index_delta = Some(IndexDelta::new());
+        let tiered = TieredDedupIndex::new(cache);
+        ws.index_delta = Some(IndexDelta::with_cached_bumps(std::sync::Arc::clone(
+            tiered.mmap_cache(),
+        )));
+        ws.tiered_dedup = Some(tiered);
     }
 
-    /// Refcount bumps recorded in the index delta for `id` (for testing).
+    /// Refcount bumps recorded in the index delta for `id`, by key or by
+    /// dedup-cache position (for testing).
     pub(crate) fn delta_refcount_bump(&self, id: &ChunkId) -> u32 {
-        self.write_session
+        let Some(delta) = self
+            .write_session
             .as_ref()
             .and_then(|ws| ws.index_delta.as_ref())
-            .and_then(|d| d.refcount_bumps.get(id).copied())
-            .unwrap_or(0)
+        else {
+            return 0;
+        };
+        let keyed = delta.refcount_bumps.get(id).copied().unwrap_or(0);
+        let positional = delta.cached_bumps.as_ref().map_or(0, |cached| {
+            cached
+                .cache()
+                .find_with_position(id)
+                .map_or(0, |(position, _)| cached.count_at(position as usize))
+        });
+        keyed + positional
     }
 
     /// True if a rollback checkpoint is currently armed (for testing).

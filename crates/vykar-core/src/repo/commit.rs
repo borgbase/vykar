@@ -68,8 +68,9 @@ impl Repository {
     }
 
     /// Flush pending packs and wait for uploads, then drop the tiered dedup
-    /// index (releasing its mmap before the full index is reloaded) and take
-    /// the session's `IndexDelta` out for processing.
+    /// index and take the session's `IndexDelta` out for processing. The
+    /// delta's positional bumps keep the dedup cache mapped until they are
+    /// applied; everything else in the tiered index is released here.
     ///
     /// On the concurrent backup path Phase 1 has normally drained uploads
     /// already, so the flush here is a no-op safety net; for

@@ -63,7 +63,12 @@ pub(super) fn process_worker_chunks(
                         existing.chunk_id
                     ))
                 })?;
-                repo.bump_ref_presession_hit(&existing.chunk_id, existing.stored_size, prefilter)?;
+                repo.bump_ref_presession_hit(
+                    &existing.chunk_id,
+                    existing.stored_size,
+                    existing.cache_position,
+                    prefilter,
+                )?;
                 let size = existing.uncompressed_size;
                 let csize = existing.stored_size;
                 stats.original_size += size as u64;

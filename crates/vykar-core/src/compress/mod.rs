@@ -5,6 +5,8 @@
 // unreachable for inputs that pass those guards.
 #![allow(clippy::indexing_slicing)]
 
+pub(crate) mod presize;
+
 use std::io::Read;
 
 use serde::{Deserialize, Serialize};
@@ -319,8 +321,15 @@ pub fn decompress_metadata(data: &[u8]) -> Result<Vec<u8>> {
 /// [`decompress_metadata`]. LZ4 and uncompressed payloads fall back to the
 /// buffered path.
 ///
+/// Maps that opt into `presize` are pre-sized from their length prefix,
+/// within a budget proportional to `data.len()`.
+///
 /// Returns the value and the decompressed size in bytes.
 pub fn decode_metadata_msgpack<T: serde::de::DeserializeOwned>(data: &[u8]) -> Result<(T, u64)> {
+    presize::with_input_budget(data.len(), || decode_metadata_msgpack_inner(data))
+}
+
+fn decode_metadata_msgpack_inner<T: serde::de::DeserializeOwned>(data: &[u8]) -> Result<(T, u64)> {
     if data.first() != Some(&TAG_ZSTD) {
         let raw = decompress_metadata(data)?;
         let value = rmp_serde::from_slice(&raw)?;

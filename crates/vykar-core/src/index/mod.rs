@@ -37,7 +37,19 @@ pub struct IndexBlobRef<'a> {
 /// Maps chunk_id -> (refcount, stored_size, pack_id, pack_offset).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ChunkIndex {
+    #[serde(deserialize_with = "deserialize_entries")]
     entries: ChunkIdHashMap<ChunkIndexEntry>,
+}
+
+/// Pre-size the entry table from the msgpack length prefix so a large index
+/// is allocated once instead of grown by doubling (old and new table both
+/// live at each rehash). Every entry carries a distinct 32-byte chunk ID — a
+/// keyed digest, incompressible — so a genuine index costs at least 32 input
+/// bytes per entry; see [`crate::compress::presize`] for the bound.
+fn deserialize_entries<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<ChunkIdHashMap<ChunkIndexEntry>, D::Error> {
+    crate::compress::presize::deserialize_hash_map(deserializer, std::mem::size_of::<ChunkId>())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -1020,6 +1032,34 @@ mod tests {
         // Remove non-existent pack — no-op
         journal.remove_pack(&make_pack_id(99));
         assert_eq!(journal.len(), 2);
+    }
+
+    #[test]
+    fn index_blob_metadata_decode_presizes_entries() {
+        let mut chunks = ChunkIndex::new();
+        for i in 0..30_000u32 {
+            let mut id = [0u8; 32];
+            id[..4].copy_from_slice(&i.to_le_bytes());
+            id[31] = 0x5a;
+            chunks.add(ChunkId::from_bytes(id), i, make_pack_id(1), u64::from(i));
+        }
+        let blob = IndexBlobRef {
+            generation: 7,
+            chunks: &chunks,
+        };
+        let encoded = rmp_serde::to_vec(&blob).unwrap();
+        let compressed =
+            crate::compress::compress(crate::compress::Compression::Zstd { level: 3 }, &encoded)
+                .unwrap();
+        let (restored, _): (IndexBlob, u64) =
+            crate::compress::decode_metadata_msgpack(&compressed).unwrap();
+        assert_eq!(restored.generation, 7);
+        assert_eq!(restored.chunks.len(), chunks.len());
+        // Allocated once at the exact size rather than grown by doubling.
+        assert_eq!(
+            restored.chunks.entries.capacity(),
+            ChunkIndex::with_capacity(chunks.len()).entries.capacity()
+        );
     }
 
     #[test]

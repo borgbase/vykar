@@ -287,6 +287,7 @@ pub struct CacheSection {
     /// The snapshot ID that anchors this section's validity.
     pub anchor_snapshot_id: SnapshotId,
     /// The actual cached entries.
+    #[serde(deserialize_with = "deserialize_section_entries")]
     pub(crate) entries: HashMap<PathHash, FileCacheEntry>,
 }
 
@@ -378,6 +379,17 @@ fn merge_retained(
         }
         (inserted, carried)
     }
+}
+
+/// Pre-size a section's table from the msgpack length prefix so it is
+/// allocated once instead of grown by doubling (old and new table both live
+/// at each rehash). Keys are distinct 16-byte path hashes — incompressible —
+/// so a genuine section costs at least 16 input bytes per entry; see
+/// [`compress::presize`] for the bound.
+fn deserialize_section_entries<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<HashMap<PathHash, FileCacheEntry>, D::Error> {
+    compress::presize::deserialize_hash_map(deserializer, std::mem::size_of::<PathHash>())
 }
 
 /// Maps path hashes to their cached metadata and chunk references,
@@ -821,8 +833,8 @@ impl FileCache {
     /// all route through `Malformed` and collapse to an empty cache — the
     /// same UX as cache corruption today.
     ///
-    /// The ratio check below runs *after* `rmp_serde::from_slice` has
-    /// already allocated, so it doesn't prevent allocation — it only
+    /// The ratio check below runs *after* decoding has already allocated,
+    /// so it doesn't prevent allocation — it only
     /// catches msgpack containers whose inflated length headers rmp_serde
     /// happened to fill with garbage.
     fn decode_from_plaintext_outcome(plaintext: &[u8]) -> CacheDecode {
@@ -836,17 +848,12 @@ impl FileCache {
                 error: format!("unrecognised filecache format byte 0x{first:02x}"),
             };
         }
-        let raw = match compress::decompress_metadata(rest) {
-            Ok(r) => r,
-            Err(e) => {
-                return CacheDecode::Malformed {
-                    error: format!("decompress: {e}"),
-                }
-            }
-        };
-        match rmp_serde::from_slice::<FileCache>(&raw) {
-            Ok(cache) => {
-                let max_entries = raw.len() / Self::MIN_BYTES_PER_ENTRY;
+        // Decode straight out of the zstd stream: the decompressed msgpack
+        // (larger than the cache itself) is never materialized.
+        match compress::decode_metadata_msgpack::<FileCache>(rest) {
+            Ok((cache, raw_len)) => {
+                let max_entries =
+                    usize::try_from(raw_len).unwrap_or(usize::MAX) / Self::MIN_BYTES_PER_ENTRY;
                 if cache.len() > max_entries {
                     return CacheDecode::Rejected {
                         reason: "entry count exceeds plausible ratio",
@@ -2130,6 +2137,54 @@ mod tests {
         blob.extend_from_slice(b"\xFF\xFE\xFD not a zstd frame");
         let decoded = FileCache::decode_from_plaintext(&blob).unwrap();
         assert!(decoded.is_empty());
+    }
+
+    #[test]
+    fn decoded_sections_are_presized_from_length_prefix() {
+        let mut cache = FileCache::new();
+        cache.begin_sections(&roots(&["/a", "/b"]), &[0, 0]);
+        for i in 0..20_000 {
+            cache.insert(&format!("/a/f{i}"), 1, i, 1, 1, 10, sample_chunk_refs());
+            if i % 4 == 0 {
+                cache.insert(&format!("/b/f{i}"), 1, i, 1, 1, 10, sample_chunk_refs());
+            }
+        }
+        cache.finalize_sections(SnapshotId::from_bytes([0xEE; 32]));
+        let decoded = FileCache::decode_from_plaintext(&encode_plaintext_v2(&cache)).unwrap();
+        assert_eq!(decoded.len(), 25_000);
+        for (key, n) in [("/a", 20_000), ("/b", 5_000)] {
+            let entries = &decoded.sections[key].entries;
+            assert_eq!(entries.len(), n);
+            // Allocated once at the exact size rather than grown by doubling
+            // from serde's cautious hint.
+            assert_eq!(
+                entries.capacity(),
+                HashMap::<PathHash, FileCacheEntry>::with_capacity(n).capacity()
+            );
+        }
+    }
+
+    #[test]
+    fn forged_section_length_yields_empty_cache() {
+        // A section map whose length prefix claims u32::MAX entries must be a
+        // clean decode failure (bounded pre-size), not an allocation abort.
+        let mut cache = FileCache::new();
+        cache.begin_sections(&roots(&["/a"]), &[0]);
+        let mut msgpack = rmp_serde::to_vec(&cache).unwrap();
+        // The empty entries map (fixmap 0x80) is the last byte.
+        assert_eq!(msgpack.pop(), Some(0x80));
+        msgpack.push(0xdf);
+        msgpack.extend_from_slice(&u32::MAX.to_be_bytes());
+        let mut blob = vec![FORMAT_VERSION_BYTE];
+        crate::compress::compress_stream_zstd(&mut blob, 3, |enc| {
+            std::io::Write::write_all(enc, &msgpack)?;
+            Ok(())
+        })
+        .unwrap();
+        assert!(matches!(
+            FileCache::decode_from_plaintext_outcome(&blob),
+            CacheDecode::Malformed { .. }
+        ));
     }
 
     #[test]

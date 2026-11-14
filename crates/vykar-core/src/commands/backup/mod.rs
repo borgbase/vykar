@@ -915,6 +915,19 @@ fn run_against_repo(
                 )?;
             }
         }
+        // The walk was the last reader of the loaded cache's sections for
+        // these roots. Free them now instead of at commit, so the old and new
+        // caches are not both resident while the commit allocates its
+        // buffers. This changes only memory, not what is saved:
+        // `begin_sections` created a write-cache section for every root, so
+        // `commit_finalize` overwrites each dropped key via `merge_section`,
+        // and a failed backup never saves the file cache (see the Phase 1
+        // abort path below).
+        if !source_paths.is_empty() {
+            let dropped = repo.file_cache_mut().drop_sections(&canonical_roots);
+            debug!(dropped, "released loaded file cache sections after walk");
+        }
+
         // Bail before committing if shutdown was requested during the walk.
         check_interrupted(shutdown)?;
 

@@ -533,6 +533,21 @@ impl FileCache {
             .collect()
     }
 
+    /// Remove the sections for `roots` from the persistent (read) cache and
+    /// deactivate lookups. Returns the number of entries released. Used once
+    /// the backup walk no longer needs them: commit replaces exactly these
+    /// keys via `merge_section`, and sections for other roots are kept.
+    pub fn drop_sections(&mut self, roots: &[String]) -> usize {
+        self.active_keys.clear();
+        let mut dropped = 0;
+        for root in roots {
+            if let Some(section) = self.sections.remove(root) {
+                dropped += section.entries.len();
+            }
+        }
+        dropped
+    }
+
     /// Replace one section in the persistent cache, leaving others untouched.
     pub fn merge_section(&mut self, label: &str, section: CacheSection) {
         self.sections.insert(label.to_string(), section);
@@ -1497,6 +1512,23 @@ mod tests {
             SnapshotId::from_bytes([0x42; 32])
         );
         assert!(cache.sections.is_empty());
+    }
+
+    #[test]
+    fn drop_sections_releases_only_the_given_roots() {
+        let mut cache = FileCache::new();
+        cache.begin_sections(&roots(&["/a", "/b"]), &[0, 0]);
+        cache.insert("/a/f.txt", 1, 1, 1, 1, 100, sample_chunk_refs());
+        cache.insert("/a/g.txt", 1, 2, 2, 2, 100, sample_chunk_refs());
+        cache.insert("/b/h.txt", 1, 3, 3, 3, 200, sample_chunk_refs());
+        cache.finalize_sections(SnapshotId::from_bytes([0x42; 32]));
+
+        assert_eq!(cache.drop_sections(&roots(&["/a", "/missing"])), 2);
+        assert!(!cache.sections.contains_key("/a"));
+        assert_eq!(cache.section_len("/b"), 1);
+        // Lookups are deactivated, so nothing can hit the dropped section.
+        assert!(cache.take_active_sections().is_empty());
+        assert_eq!(cache.section_len("/b"), 1);
     }
 
     #[test]

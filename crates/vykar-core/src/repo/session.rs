@@ -126,8 +126,8 @@ impl Repository {
     /// Switch to tiered dedup mode for minimal memory usage during backup.
     ///
     /// Tries to open a local mmap'd dedup cache validated against the manifest's
-    /// `index_generation`. On success: builds an xor filter, drops the full
-    /// `ChunkIndex`, and routes all lookups through the three-tier structure
+    /// `index_generation`. On success: drops the full `ChunkIndex`, builds an
+    /// xor filter over the cache's keys, and routes all lookups through the three-tier structure
     /// (~12 MB RSS for 10M chunks instead of ~680 MB).
     ///
     /// On failure (no cache, stale generation, corrupt file): falls back to the
@@ -150,14 +150,19 @@ impl Repository {
             generation,
             self.cache_dir_override.as_deref(),
         ) {
+            // Drop the full index to reclaim memory *before* building the xor
+            // filter: filter construction needs scratch space of the same
+            // order as the index itself, and nothing on this path reads the
+            // index again (the mmap cache now answers every lookup). The
+            // fallback below still has the index because it only runs when
+            // the cache failed to open.
+            self.chunk_index = ChunkIndex::new();
             let tiered = TieredDedupIndex::new(mmap_cache);
             debug!(?tiered, "tiered dedup mode: using mmap cache");
             // Bumps for chunks already in the cache are recorded by position
             // in this same cache instance (`bump_ref_*` in chunks.rs).
             let index_delta =
                 IndexDelta::with_cached_bumps(std::sync::Arc::clone(tiered.mmap_cache()));
-            // Drop the full index to reclaim memory.
-            self.chunk_index = ChunkIndex::new();
             let ws = self
                 .write_session
                 .as_mut()

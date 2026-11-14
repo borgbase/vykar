@@ -162,8 +162,13 @@ impl ChunkIndex {
 
     /// Count distinct pack IDs across all entries.
     pub fn count_distinct_packs(&self) -> usize {
-        let packs: std::collections::HashSet<PackId> =
-            self.entries.values().map(|e| e.pack_id).collect();
+        // Insert one by one rather than `collect()`: collecting pre-sizes the
+        // set to the *chunk* count (the iterator's exact size hint), while it
+        // only ever holds the pack count — hundreds of times fewer.
+        let mut packs: HashSet<PackId> = HashSet::new();
+        for entry in self.entries.values() {
+            packs.insert(entry.pack_id);
+        }
         packs.len()
     }
 

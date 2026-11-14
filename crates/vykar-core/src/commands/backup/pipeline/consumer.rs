@@ -219,6 +219,7 @@ pub(super) fn consume_processed_entry(
             abs_path,
             metadata,
             cached_refs,
+            retained,
         } => {
             if let Some(cb) = progress.as_deref_mut() {
                 cb(BackupProgressEvent::FileStarted {
@@ -248,8 +249,9 @@ pub(super) fn consume_processed_entry(
                 compression,
             )?;
 
-            new_file_cache.insert(
+            new_file_cache.insert_cache_hit(
                 &abs_path,
+                retained,
                 metadata.device,
                 metadata.inode,
                 metadata.mtime_ns,

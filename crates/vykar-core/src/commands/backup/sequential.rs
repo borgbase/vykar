@@ -309,7 +309,7 @@ pub(super) fn process_regular_file_item(
         });
     }
 
-    if let super::CacheResolution::Hit(cached_refs) = resolution {
+    if let super::CacheResolution::Hit(cached_refs, retained) = resolution {
         super::commit::commit_cache_hit(repo, item, &cached_refs, stats)?;
 
         if verbose {
@@ -323,8 +323,9 @@ pub(super) fn process_regular_file_item(
             );
         }
 
-        new_file_cache.insert(
+        new_file_cache.insert_cache_hit(
             &abs_path,
+            retained,
             metadata_summary.device,
             metadata_summary.inode,
             metadata_summary.mtime_ns,
@@ -580,7 +581,7 @@ pub(super) fn process_source_path(
                     continue;
                 }
 
-                if let super::CacheResolution::Hit(cached_refs) = resolution {
+                if let super::CacheResolution::Hit(cached_refs, retained) = resolution {
                     // Flush batch to preserve walk order before the cache-hit item.
                     flush_cross_file_batch(
                         &mut cross_batch,
@@ -617,8 +618,9 @@ pub(super) fn process_source_path(
                         );
                     }
 
-                    new_file_cache.insert(
+                    new_file_cache.insert_cache_hit(
                         &abs_path,
+                        retained,
                         metadata_summary.device,
                         metadata_summary.inode,
                         metadata_summary.mtime_ns,

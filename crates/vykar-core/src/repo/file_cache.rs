@@ -55,7 +55,8 @@ pub(crate) fn repo_cache_dir(repo_id: &[u8], cache_dir_override: Option<&Path>) 
 }
 
 /// 16-byte BLAKE2b hash of a file path, used as a compact HashMap key.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// `Ord` only serves the sorted retained-hit list (see `RetainedHit`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct PathHash([u8; 16]);
 
 impl serde::Serialize for PathHash {
@@ -289,6 +290,96 @@ pub struct CacheSection {
     pub(crate) entries: HashMap<PathHash, FileCacheEntry>,
 }
 
+/// Proof that a read-cache lookup matched the stored entry on every metadata
+/// field (`device`, `inode`, `mtime_ns`, `ctime_ns`, `size`) and returned its
+/// chunk refs unchanged. The entry a backup writes for such a file is then
+/// identical to the loaded one, so the write cache records only this path
+/// hash and keeps the loaded entry instead of building a second copy (see
+/// [`FileCache::insert_cache_hit`] and [`FileCache::absorb_read_sections`]).
+///
+/// Produced only by [`FileCache::lookup_retainable`]. Hits that do not come
+/// from the read cache (parent-reuse index) or that do not compare every
+/// field (dataless lookups ignore ctime) carry no token and are inserted.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RetainedHit(PathHash);
+
+/// Write-cache bookkeeping for one section's retained hits (runtime only).
+#[derive(Debug, Clone, Default)]
+struct RetainedHits {
+    /// Path hashes of read-cache hits, in walk order (may repeat).
+    hashes: Vec<PathHash>,
+    /// Entry count of the loaded section for this root: the size today's
+    /// code pre-sized the write map to. Used to grow the miss map in one
+    /// step when a run turns out to be mostly misses.
+    loaded_len: usize,
+}
+
+impl RetainedHits {
+    /// Called before inserting a miss. Once the misses outnumber the hits
+    /// and reach 1/16 of the loaded section, the run is mostly changed
+    /// files: grow the map to the loaded size in one step, as the old
+    /// pre-sized map was, rather than doubling up to it (each doubling holds
+    /// the old and the new table at once). Earlier triggering is cheap even
+    /// when wrong: an untouched reservation costs address space, not RSS.
+    fn reserve_for_miss(&self, entries: &mut HashMap<PathHash, FileCacheEntry>) {
+        let misses = entries.len();
+        if misses == entries.capacity()
+            && misses > self.hashes.len()
+            && misses >= self.loaded_len / 16
+            && self.loaded_len > misses
+        {
+            entries.reserve(self.loaded_len - misses);
+        }
+    }
+}
+
+/// Build one section's final entry map for `absorb_read_sections`: the
+/// `loaded` entries whose key is in `hits`, overlaid with `inserted`.
+/// Returns the map and the number of loaded entries kept.
+///
+/// The smaller side is folded into the larger allocation, so a mostly
+/// unchanged tree reuses the loaded table and a mostly changed one reuses
+/// the insert table, with no extra table in either case.
+fn merge_retained(
+    loaded: Option<HashMap<PathHash, FileCacheEntry>>,
+    mut hits: Vec<PathHash>,
+    inserted: HashMap<PathHash, FileCacheEntry>,
+) -> (HashMap<PathHash, FileCacheEntry>, usize) {
+    let Some(mut kept) = loaded else {
+        // Hits only come from a loaded section, which nothing removes
+        // before this point.
+        debug_assert!(hits.is_empty(), "retained hits without a loaded section");
+        if !hits.is_empty() {
+            warn!(
+                hits = hits.len(),
+                "file cache: retained hits without a loaded section; those files will be re-read next run"
+            );
+        }
+        return (inserted, 0);
+    };
+    if hits.is_empty() {
+        return (inserted, 0);
+    }
+    hits.sort_unstable();
+    kept.retain(|key, _| hits.binary_search(key).is_ok());
+    drop(hits);
+    let carried = kept.len();
+    if kept.capacity() >= inserted.capacity() {
+        // Plain inserts, not `extend`: its size-hint reservation could
+        // reallocate a table whose freed slots already fit the inserts.
+        for (key, entry) in inserted {
+            kept.insert(key, entry);
+        }
+        (kept, carried)
+    } else {
+        let mut inserted = inserted;
+        for (key, entry) in kept {
+            inserted.entry(key).or_insert(entry);
+        }
+        (inserted, carried)
+    }
+}
+
 /// Maps path hashes to their cached metadata and chunk references,
 /// scoped by individual canonicalized source paths.
 ///
@@ -303,6 +394,11 @@ pub struct FileCache {
     /// `insert`/`lookup`. Sorted by length descending for longest-prefix-match.
     #[serde(skip)]
     active_keys: Vec<String>,
+    /// Runtime-only, **write** cache: per active section, the read-cache hits
+    /// whose loaded entries are carried over by `absorb_read_sections`
+    /// instead of being re-inserted into `sections`.
+    #[serde(skip)]
+    retained_hits: BTreeMap<String, RetainedHits>,
 }
 
 /// Structured outcome of decoding an on-disk cache blob. `load` matches on
@@ -319,6 +415,7 @@ impl FileCache {
         Self {
             sections: BTreeMap::new(),
             active_keys: Vec::new(),
+            retained_hits: BTreeMap::new(),
         }
     }
 
@@ -334,16 +431,30 @@ impl FileCache {
     }
 
     /// Start new sections for the given canonicalized roots on the **write** cache.
-    /// Creates one section per root (pre-sized via `capacity_hints`) and sets all as active.
+    /// Creates one section per root and sets all as active.
+    ///
+    /// `capacity_hints` are the entry counts of the loaded (read-cache)
+    /// sections for the same roots. They pre-size the retained-hit list, not
+    /// the entry map: on an incremental run most files are retained hits, so
+    /// the map holds only the misses. If misses come to outnumber hits, the
+    /// map grows straight to the hint (see `insert`).
     pub fn begin_sections(&mut self, roots: &[String], capacity_hints: &[usize]) {
         assert_eq!(roots.len(), capacity_hints.len());
         self.active_keys.clear();
+        self.retained_hits.clear();
         for (root, &hint) in roots.iter().zip(capacity_hints.iter()) {
             self.sections.insert(
                 root.clone(),
                 CacheSection {
                     anchor_snapshot_id: SnapshotId::from_bytes([0u8; 32]),
-                    entries: HashMap::with_capacity(hint),
+                    entries: HashMap::new(),
+                },
+            );
+            self.retained_hits.insert(
+                root.clone(),
+                RetainedHits {
+                    hashes: Vec::with_capacity(hint),
+                    loaded_len: hint,
                 },
             );
             self.active_keys.push(root.clone());
@@ -387,6 +498,23 @@ impl FileCache {
         ctime_ns: i64,
         size: u64,
     ) -> Option<CachedChunks> {
+        self.lookup_retainable(path, device, inode, mtime_ns, ctime_ns, size)
+            .map(|(chunks, _)| chunks)
+    }
+
+    /// [`lookup`](Self::lookup) that also returns a [`RetainedHit`] for the
+    /// matched entry. The comparison below covers every metadata field of
+    /// `FileCacheEntry`, which is what makes the token sound: an entry built
+    /// from these arguments plus the returned chunk refs equals the stored one.
+    pub(crate) fn lookup_retainable(
+        &self,
+        path: &str,
+        device: u64,
+        inode: u64,
+        mtime_ns: i64,
+        ctime_ns: i64,
+        size: u64,
+    ) -> Option<(CachedChunks, RetainedHit)> {
         if self.active_keys.is_empty() {
             return None;
         }
@@ -400,7 +528,7 @@ impl FileCache {
             && entry.ctime_ns == ctime_ns
             && entry.size == size
         {
-            Some(entry.chunk_refs.clone())
+            Some((entry.chunk_refs.clone(), RetainedHit(key)))
         } else {
             None
         }
@@ -468,38 +596,119 @@ impl FileCache {
             size,
             chunk_refs,
         };
-        let matching: Vec<String> = self
+        let mut matching = self
             .active_keys
             .iter()
             .filter(|key| p.starts_with(key.as_str()))
-            .cloned()
-            .collect();
+            .peekable();
         assert!(
-            !matching.is_empty(),
+            matching.peek().is_some(),
             "insert called without matching active section"
         );
         // Insert into all matching sections (handles overlapping roots).
         // Clone for all but the last, move for the last.
-        let head = matching
-            .split_last()
-            .expect("matching is non-empty (asserted above)")
-            .1;
-        for key in head {
-            self.sections
-                .get_mut(key)
+        while let Some(key) = matching.next() {
+            let entries = &mut self
+                .sections
+                .get_mut(key.as_str())
                 .expect("insert called without active section")
-                .entries
-                .insert(path_hash, entry.clone());
+                .entries;
+            if let Some(retained) = self.retained_hits.get(key.as_str()) {
+                retained.reserve_for_miss(entries);
+            }
+            if matching.peek().is_some() {
+                entries.insert(path_hash, entry.clone());
+            } else {
+                entries.insert(path_hash, entry);
+                break;
+            }
         }
-        self.sections
-            .get_mut(
-                matching
-                    .last()
-                    .expect("insert called without active section"),
-            )
-            .expect("insert called without active section")
-            .entries
-            .insert(path_hash, entry);
+    }
+
+    /// Record a cache hit on the **write** cache.
+    ///
+    /// With a [`RetainedHit`] and exactly one matching active section, only
+    /// the path hash is recorded: the loaded entry is carried over by
+    /// [`absorb_read_sections`](Self::absorb_read_sections), and is equal to
+    /// what [`insert`](Self::insert) would store (see `RetainedHit`). The
+    /// read lookup picks the longest matching key among the loaded sections,
+    /// which are a subset of this cache's roots, so with a single matching
+    /// root the hit is known to come from that root's loaded section. Any
+    /// other case (no token, overlapping or duplicated roots) falls back to
+    /// a plain `insert` of the hit's entry, as before.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn insert_cache_hit(
+        &mut self,
+        path: &str,
+        retained: Option<RetainedHit>,
+        device: u64,
+        inode: u64,
+        mtime_ns: i64,
+        ctime_ns: i64,
+        size: u64,
+        chunk_refs: CachedChunks,
+    ) {
+        if let Some(RetainedHit(path_hash)) = retained {
+            let p = Path::new(path);
+            let mut matching = self
+                .active_keys
+                .iter()
+                .filter(|key| p.starts_with(key.as_str()));
+            if let (Some(key), None) = (matching.next(), matching.next()) {
+                if let (Some(section), Some(hits)) = (
+                    self.sections.get_mut(key.as_str()),
+                    self.retained_hits.get_mut(key.as_str()),
+                ) {
+                    // Last write wins, as with `insert`: drop an entry this run
+                    // already wrote for the same path so it cannot shadow the
+                    // retained one at absorb time.
+                    section.entries.remove(&path_hash);
+                    hits.hashes.push(path_hash);
+                    return;
+                }
+            }
+        }
+        self.insert(path, device, inode, mtime_ns, ctime_ns, size, chunk_refs);
+    }
+
+    /// Complete the active **write**-cache sections after the walk, taking
+    /// the loaded sections for the same roots out of the **read** cache
+    /// `read` (whose lookups are deactivated).
+    ///
+    /// Each resulting section holds the loaded entries of its retained hits
+    /// plus every entry inserted during the run, the latter winning on a
+    /// shared key (`insert_cache_hit` removes earlier inserts, so a key in
+    /// both was inserted after the hit). That is exactly the section the
+    /// previous re-insert-everything code built. Loaded entries for files
+    /// that were not retained hits (deleted, excluded, changed, skipped, or
+    /// inserted instead) are dropped. Sections of `read` for other roots are
+    /// left alone, and commit replaces exactly these keys via
+    /// `merge_section`.
+    ///
+    /// Must run after the walk: it is the last reader of the loaded
+    /// sections. A failed backup never saves the file cache, so `read`
+    /// being depleted afterwards only affects memory.
+    ///
+    /// Returns the number of loaded entries carried over.
+    pub(crate) fn absorb_read_sections(&mut self, read: &mut FileCache) -> usize {
+        read.active_keys.clear();
+        let mut retained_hits = std::mem::take(&mut self.retained_hits);
+        let mut carried = 0;
+        for key in &self.active_keys {
+            let Some(section) = self.sections.get_mut(key) else {
+                continue;
+            };
+            let loaded = read.sections.remove(key).map(|s| s.entries);
+            let hits = retained_hits
+                .remove(key)
+                .map(|r| r.hashes)
+                .unwrap_or_default();
+            let inserted = std::mem::take(&mut section.entries);
+            let (entries, n) = merge_retained(loaded, hits, inserted);
+            carried += n;
+            section.entries = entries;
+        }
+        carried
     }
 
     /// Check if the active section has an entry for this path.
@@ -527,25 +736,14 @@ impl FileCache {
 
     /// Extract all finalized active sections for merging into the persistent cache.
     pub fn take_active_sections(&mut self) -> Vec<(String, CacheSection)> {
+        debug_assert!(
+            self.retained_hits.values().all(|r| r.hashes.is_empty()),
+            "take_active_sections: retained hits were never absorbed"
+        );
         let keys = std::mem::take(&mut self.active_keys);
         keys.into_iter()
             .filter_map(|key| self.sections.remove(&key).map(|s| (key, s)))
             .collect()
-    }
-
-    /// Remove the sections for `roots` from the persistent (read) cache and
-    /// deactivate lookups. Returns the number of entries released. Used once
-    /// the backup walk no longer needs them: commit replaces exactly these
-    /// keys via `merge_section`, and sections for other roots are kept.
-    pub fn drop_sections(&mut self, roots: &[String]) -> usize {
-        self.active_keys.clear();
-        let mut dropped = 0;
-        for root in roots {
-            if let Some(section) = self.sections.remove(root) {
-                dropped += section.entries.len();
-            }
-        }
-        dropped
     }
 
     /// Replace one section in the persistent cache, leaving others untouched.
@@ -1515,20 +1713,333 @@ mod tests {
     }
 
     #[test]
-    fn drop_sections_releases_only_the_given_roots() {
-        let mut cache = FileCache::new();
-        cache.begin_sections(&roots(&["/a", "/b"]), &[0, 0]);
-        cache.insert("/a/f.txt", 1, 1, 1, 1, 100, sample_chunk_refs());
-        cache.insert("/a/g.txt", 1, 2, 2, 2, 100, sample_chunk_refs());
-        cache.insert("/b/h.txt", 1, 3, 3, 3, 200, sample_chunk_refs());
-        cache.finalize_sections(SnapshotId::from_bytes([0x42; 32]));
+    fn absorb_moves_only_the_backed_up_roots_out_of_the_read_cache() {
+        // Read cache with sections /a, /b; this run backs up /a and /new.
+        let mut read = FileCache::new();
+        read.begin_sections(&roots(&["/a", "/b"]), &[0, 0]);
+        read.insert("/a/f.txt", 1, 1, 1, 1, 100, sample_chunk_refs());
+        read.insert("/a/g.txt", 1, 2, 2, 2, 100, sample_chunk_refs());
+        read.insert("/b/h.txt", 1, 3, 3, 3, 200, sample_chunk_refs());
+        read.finalize_sections(SnapshotId::from_bytes([0x42; 32]));
+        read.activate_for_walk_roots(&roots(&["/a", "/new"]));
 
-        assert_eq!(cache.drop_sections(&roots(&["/a", "/missing"])), 2);
-        assert!(!cache.sections.contains_key("/a"));
-        assert_eq!(cache.section_len("/b"), 1);
-        // Lookups are deactivated, so nothing can hit the dropped section.
-        assert!(cache.take_active_sections().is_empty());
-        assert_eq!(cache.section_len("/b"), 1);
+        let mut write = FileCache::new();
+        write.begin_sections(&roots(&["/a", "/new"]), &[2, 0]);
+        let (chunks, hit) = read
+            .lookup_retainable("/a/f.txt", 1, 1, 1, 1, 100)
+            .expect("unchanged file hits");
+        write.insert_cache_hit("/a/f.txt", Some(hit), 1, 1, 1, 1, 100, chunks);
+        // The hit is only recorded, not copied.
+        assert_eq!(write.section_len("/a"), 0);
+        write.insert("/new/n.txt", 1, 9, 9, 9, 10, sample_chunk_refs());
+
+        assert_eq!(write.absorb_read_sections(&mut read), 1);
+        // /a/g.txt was not walked (deleted): gone. /a/f.txt carried over.
+        assert_eq!(write.section_len("/a"), 1);
+        assert!(write.sections["/a"]
+            .entries
+            .contains_key(&hash_path("/a/f.txt")));
+        assert_eq!(write.section_len("/new"), 1);
+        // Read cache: /a moved out, /b (not part of this run) kept, lookups off.
+        assert!(!read.sections.contains_key("/a"));
+        assert_eq!(read.section_len("/b"), 1);
+        assert!(read.lookup("/b/h.txt", 1, 3, 3, 3, 200).is_none());
+
+        write.finalize_sections(SnapshotId::from_bytes([0x43; 32]));
+        let taken = write.take_active_sections();
+        assert_eq!(taken.len(), 2);
+        assert!(taken
+            .iter()
+            .all(|(_, s)| s.anchor_snapshot_id == SnapshotId::from_bytes([0x43; 32])));
+    }
+
+    /// Comparable view of a section: key -> every stored field.
+    type SectionView = BTreeMap<PathHash, (u64, u64, i64, i64, u64, Vec<CachedChunkRef>)>;
+
+    fn section_view(cache: &FileCache, key: &str) -> Option<SectionView> {
+        cache.sections.get(key).map(|s| {
+            s.entries
+                .iter()
+                .map(|(k, e)| {
+                    (
+                        *k,
+                        (
+                            e.device,
+                            e.inode,
+                            e.mtime_ns,
+                            e.ctime_ns,
+                            e.size,
+                            e.chunk_refs.as_slice().to_vec(),
+                        ),
+                    )
+                })
+                .collect()
+        })
+    }
+
+    /// Deterministic xorshift so a failure reproduces from the printed seed.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    fn random_refs(rng: &mut Rng) -> CachedChunks {
+        let n = 1 + rng.below(3) as usize;
+        CachedChunks::from_vec(
+            (0..n)
+                .map(|_| {
+                    let mut id = [0u8; 32];
+                    id[..8].copy_from_slice(&rng.next().to_le_bytes());
+                    CachedChunkRef {
+                        id: ChunkId::from_bytes(id),
+                        size: rng.below(1 << 20) as u32,
+                    }
+                })
+                .collect(),
+        )
+    }
+
+    /// One file's metadata as the walk sees it.
+    #[derive(Clone)]
+    struct Meta {
+        device: u64,
+        inode: u64,
+        mtime_ns: i64,
+        ctime_ns: i64,
+        size: u64,
+    }
+
+    /// Feed one randomized backup walk over a loaded cache through both the
+    /// previous code path (every walked file, hit or not, `insert`ed into a
+    /// fresh write cache; loaded sections dropped afterwards) and the
+    /// retained-hit path (`insert_cache_hit` + `absorb_read_sections`). The
+    /// sections must be identical field by field for every root.
+    fn check_retained_matches_reinsert(seed: u64, read_roots: &[&str], walk_roots: &[&str]) {
+        let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+        let walk_roots = roots(walk_roots);
+        // Paths under each walk root (overlapping roots share some).
+        let mut paths: Vec<String> = Vec::new();
+        for (r, root) in walk_roots.iter().enumerate() {
+            let root = root.trim_end_matches('/');
+            for i in 0..40 {
+                paths.push(format!("{root}/f{r}_{i}"));
+            }
+        }
+        paths.sort();
+        paths.dedup();
+
+        // Loaded cache: a section per `read_roots`, plus one for a root this
+        // run does not back up.
+        let mut all_read_roots = roots(read_roots);
+        all_read_roots.push("/other".into());
+        let mut read = FileCache::new();
+        read.begin_sections(&all_read_roots, &vec![0; all_read_roots.len()]);
+        let mut loaded_meta: HashMap<String, Meta> = HashMap::new();
+        for path in &paths {
+            let p = Path::new(path);
+            if !read.active_keys.iter().any(|k| p.starts_with(k)) || rng.below(5) == 0 {
+                continue; // no loaded entry: a new file
+            }
+            let m = Meta {
+                device: 1 + rng.below(2),
+                inode: rng.next(),
+                mtime_ns: rng.next() as i64,
+                ctime_ns: rng.next() as i64,
+                size: 1 + rng.below(1 << 30),
+            };
+            let refs = random_refs(&mut rng);
+            read.insert(
+                path, m.device, m.inode, m.mtime_ns, m.ctime_ns, m.size, refs,
+            );
+            loaded_meta.insert(path.clone(), m);
+        }
+        read.insert("/other/x", 1, 1, 1, 1, 1, sample_chunk_refs());
+        read.finalize_sections(SnapshotId::from_bytes([0x10; 32]));
+        // Round-trip so the read cache is a loaded one, as in a backup.
+        let mut read = FileCache::decode_from_plaintext(&encode_plaintext_v2(&read)).unwrap();
+        read.activate_for_walk_roots(&walk_roots);
+        let other_before = section_view(&read, "/other");
+
+        let hints: Vec<usize> = walk_roots.iter().map(|r| read.section_len(r)).collect();
+        let mut old = FileCache::new();
+        old.begin_sections(&walk_roots, &hints);
+        let mut new = FileCache::new();
+        new.begin_sections(&walk_roots, &hints);
+
+        // Arbitrary walk order; a few paths are visited twice to pin
+        // last-write-wins between hits and inserts.
+        let mut events: Vec<String> = paths.clone();
+        for _ in 0..8 {
+            let i = rng.below(paths.len() as u64) as usize;
+            events.push(paths[i].clone());
+        }
+        for i in (1..events.len()).rev() {
+            let j = rng.below(i as u64 + 1) as usize;
+            events.swap(i, j);
+        }
+
+        for path in &events {
+            let loaded = loaded_meta.get(path).cloned();
+            match rng.below(8) {
+                // Deleted, excluded or skipped (soft error, drift): no insert.
+                0 => continue,
+                // Changed: one field the lookup compares differs, or new.
+                1 | 2 => {
+                    let mut m = loaded.unwrap_or(Meta {
+                        device: 1,
+                        inode: rng.next(),
+                        mtime_ns: 0,
+                        ctime_ns: 0,
+                        size: 1,
+                    });
+                    match rng.below(5) {
+                        0 => m.device += 1,
+                        1 => m.inode = m.inode.wrapping_add(1),
+                        2 => m.mtime_ns = m.mtime_ns.wrapping_add(1),
+                        3 => m.ctime_ns = m.ctime_ns.wrapping_add(1),
+                        _ => m.size += 1,
+                    }
+                    assert!(read
+                        .lookup_retainable(path, m.device, m.inode, m.mtime_ns, m.ctime_ns, m.size)
+                        .is_none());
+                    let refs = random_refs(&mut rng);
+                    let (d, i, mt, ct, sz) = (m.device, m.inode, m.mtime_ns, m.ctime_ns, m.size);
+                    old.insert(path, d, i, mt, ct, sz, refs.clone());
+                    new.insert(path, d, i, mt, ct, sz, refs);
+                }
+                // A hit not taken from the read cache (parent reuse, or a
+                // dataless lookup with a fresh ctime): no token.
+                3 => {
+                    let m = loaded.unwrap_or(Meta {
+                        device: 2,
+                        inode: 5,
+                        mtime_ns: 6,
+                        ctime_ns: 7,
+                        size: 8,
+                    });
+                    let ct = m.ctime_ns.wrapping_add(rng.below(2) as i64);
+                    let refs = random_refs(&mut rng);
+                    let (d, i, mt, sz) = (m.device, m.inode, m.mtime_ns, m.size);
+                    old.insert(path, d, i, mt, ct, sz, refs.clone());
+                    new.insert_cache_hit(path, None, d, i, mt, ct, sz, refs);
+                }
+                // Unchanged: an exact read-cache hit, when there is an entry.
+                _ => {
+                    let Some(m) = loaded else { continue };
+                    let (d, i, mt, ct, sz) = (m.device, m.inode, m.mtime_ns, m.ctime_ns, m.size);
+                    let (refs, hit) = read
+                        .lookup_retainable(path, d, i, mt, ct, sz)
+                        .expect("unchanged file must hit");
+                    old.insert(path, d, i, mt, ct, sz, refs.clone());
+                    new.insert_cache_hit(path, Some(hit), d, i, mt, ct, sz, refs);
+                }
+            }
+        }
+
+        new.absorb_read_sections(&mut read);
+        for root in &walk_roots {
+            assert_eq!(
+                section_view(&new, root),
+                section_view(&old, root),
+                "seed {seed}, roots {walk_roots:?}: section {root} differs"
+            );
+            assert!(
+                !read.sections.contains_key(root),
+                "seed {seed}: {root} kept"
+            );
+        }
+        assert_eq!(section_view(&read, "/other"), other_before);
+        let anchor = SnapshotId::from_bytes([0x77; 32]);
+        old.finalize_sections(anchor);
+        new.finalize_sections(anchor);
+        let old_taken = old.take_active_sections();
+        let new_taken = new.take_active_sections();
+        assert_eq!(old_taken.len(), new_taken.len());
+        for ((ok, os), (nk, ns)) in old_taken.iter().zip(&new_taken) {
+            assert_eq!(ok, nk);
+            assert_eq!(os.anchor_snapshot_id, ns.anchor_snapshot_id);
+        }
+    }
+
+    #[test]
+    fn retained_hits_match_reinsert_randomized() {
+        let layouts: &[(&[&str], &[&str])] = &[
+            // Warm cache for every root.
+            (&["/a", "/b"], &["/a", "/b"]),
+            // Partial activation: /b is new this run.
+            (&["/a"], &["/a", "/b"]),
+            // Cold start: nothing loaded.
+            (&[], &["/a"]),
+            // Overlapping roots, loaded for both or only the outer one.
+            (&["/data", "/data/sub"], &["/data", "/data/sub"]),
+            (&["/data"], &["/data", "/data/sub"]),
+            // The same canonical root twice.
+            (&["/a"], &["/a", "/a"]),
+            // Filesystem root.
+            (&["/"], &["/"]),
+        ];
+        for seed in 1..=60u64 {
+            for (read_roots, walk_roots) in layouts {
+                check_retained_matches_reinsert(seed, read_roots, walk_roots);
+            }
+        }
+    }
+
+    #[test]
+    fn hit_after_insert_of_same_path_wins() {
+        let mut read = FileCache::new();
+        read.begin_sections(&roots(&["/a"]), &[0]);
+        read.insert("/a/f", 1, 1, 1, 1, 10, sample_chunk_refs());
+        read.activate_for_walk_roots(&roots(&["/a"]));
+
+        let mut write = FileCache::new();
+        write.begin_sections(&roots(&["/a"]), &[1]);
+        write.insert("/a/f", 9, 9, 9, 9, 99, sample_chunk_refs());
+        let (refs, hit) = read.lookup_retainable("/a/f", 1, 1, 1, 1, 10).unwrap();
+        write.insert_cache_hit("/a/f", Some(hit), 1, 1, 1, 1, 10, refs);
+        write.absorb_read_sections(&mut read);
+        let e = &write.sections["/a"].entries[&hash_path("/a/f")];
+        assert_eq!((e.device, e.inode, e.size), (1, 1, 10));
+    }
+
+    #[test]
+    fn mostly_misses_grow_the_write_map_to_the_loaded_size() {
+        let mut write = FileCache::new();
+        write.begin_sections(&roots(&["/a"]), &[100_000]);
+        for i in 0..20_000u64 {
+            write.insert(&format!("/a/f{i}"), 1, i, 1, 1, 1, sample_chunk_refs());
+        }
+        // Reserved in one step instead of doubling up to it.
+        assert!(write.sections["/a"].entries.capacity() >= 100_000);
+
+        // With hits keeping pace, misses stay in a small map.
+        let mut read = FileCache::new();
+        read.begin_sections(&roots(&["/a"]), &[0]);
+        for i in 0..2_000u64 {
+            read.insert(&format!("/a/h{i}"), 1, i, 1, 1, 1, sample_chunk_refs());
+        }
+        read.activate_for_walk_roots(&roots(&["/a"]));
+        let mut write = FileCache::new();
+        write.begin_sections(&roots(&["/a"]), &[100_000]);
+        for i in 0..2_000u64 {
+            let path = format!("/a/h{i}");
+            let (refs, hit) = read.lookup_retainable(&path, 1, i, 1, 1, 1).unwrap();
+            write.insert_cache_hit(&path, Some(hit), 1, i, 1, 1, 1, refs);
+            write.insert(&format!("/a/m{i}"), 1, i, 1, 1, 1, sample_chunk_refs());
+        }
+        assert!(write.sections["/a"].entries.capacity() < 100_000);
+        assert_eq!(write.absorb_read_sections(&mut read), 2_000);
+        assert_eq!(write.section_len("/a"), 4_000);
     }
 
     #[test]
@@ -2418,17 +2929,19 @@ mod tests {
 
     #[test]
     fn begin_sections_applies_capacity_hints() {
-        // Each root gets its own pre-sized section from the capacity hint.
+        // The hint pre-sizes each root's retained-hit list; the entry map,
+        // which holds only misses, starts empty.
         let mut cache = FileCache::new();
         cache.begin_sections(&roots(&["/data", "/data/sub"]), &[100, 50]);
 
-        // Verify capacity was applied before any inserts.
-        assert!(cache.sections["/data"].entries.capacity() >= 100);
-        assert!(cache.sections["/data/sub"].entries.capacity() >= 50);
+        assert!(cache.retained_hits["/data"].hashes.capacity() >= 100);
+        assert!(cache.retained_hits["/data/sub"].hashes.capacity() >= 50);
+        assert_eq!(cache.sections["/data"].entries.capacity(), 0);
 
-        // Zero hint produces a minimal allocation (same as cold start).
+        // Zero hint produces no allocation (same as cold start).
         let mut cache2 = FileCache::new();
         cache2.begin_sections(&roots(&["/x"]), &[0]);
         assert_eq!(cache2.sections["/x"].entries.capacity(), 0);
+        assert_eq!(cache2.retained_hits["/x"].hashes.capacity(), 0);
     }
 }

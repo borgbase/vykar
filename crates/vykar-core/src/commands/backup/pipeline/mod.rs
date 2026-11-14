@@ -19,7 +19,7 @@ use crate::config::ChunkerConfig;
 use crate::index::dedup_cache::DedupPrefilter;
 use crate::limits::ByteRateLimiter;
 use crate::platform::fs;
-use crate::repo::file_cache::{CachedChunks, FileCache, ParentReuseIndex};
+use crate::repo::file_cache::{CachedChunks, FileCache, ParentReuseIndex, RetainedHit};
 use crate::repo::Repository;
 use crate::snapshot::SnapshotStats;
 use vykar_crypto::CryptoEngine;
@@ -77,6 +77,8 @@ pub(super) enum ProcessedEntry {
         abs_path: String,
         metadata: fs::MetadataSummary,
         cached_refs: CachedChunks,
+        /// Set for exact local-cache hits (see `RetainedHit`).
+        retained: Option<RetainedHit>,
     },
     /// Non-file item (directory, symlink, zero-size file).
     NonFile {

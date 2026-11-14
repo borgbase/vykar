@@ -25,7 +25,7 @@ use std::sync::Arc;
 use crate::limits;
 use crate::platform::fs;
 use crate::repo::file_cache::{
-    CachedChunks, FileCache, ParentReuseBuilder, ParentReuseIndex, ParentReuseRoot,
+    CachedChunks, FileCache, ParentReuseBuilder, ParentReuseIndex, ParentReuseRoot, RetainedHit,
 };
 use crate::repo::format::{pack_object_with_context, ObjectType};
 use crate::repo::lock;
@@ -68,8 +68,10 @@ pub(crate) fn normalize_rel_path(path: String) -> String {
 /// asynchronous hydration via `fileproviderd`.
 #[derive(Debug)]
 pub(crate) enum CacheResolution {
-    /// Reuse cached chunks; the file is not opened.
-    Hit(CachedChunks),
+    /// Reuse cached chunks; the file is not opened. The token is present
+    /// when the chunks come from an exact match in the local file cache, so
+    /// the write cache can keep the loaded entry instead of a copy.
+    Hit(CachedChunks, Option<RetainedHit>),
     /// No reuse — caller should open + chunk normally.
     Miss,
     /// File is dataless and neither the local file cache nor the parent
@@ -107,7 +109,9 @@ fn resolve_cache_hit(
             summary.mtime_ns,
             summary.size,
         ) {
-            return CacheResolution::Hit(chunks);
+            // ctime was not compared, so the entry written for this file can
+            // differ from the loaded one: no retain token.
+            return CacheResolution::Hit(chunks, None);
         }
         if raw_path {
             return CacheResolution::SkipDataless;
@@ -115,12 +119,12 @@ fn resolve_cache_hit(
         return match parent_reuse_index
             .and_then(|idx| idx.lookup_dataless(abs_path, summary.size, summary.mtime_ns))
         {
-            Some(chunks) => CacheResolution::Hit(chunks),
+            Some(chunks) => CacheResolution::Hit(chunks, None),
             None => CacheResolution::SkipDataless,
         };
     }
 
-    let local = file_cache.lookup(
+    let local = file_cache.lookup_retainable(
         abs_path,
         summary.device,
         summary.inode,
@@ -128,8 +132,8 @@ fn resolve_cache_hit(
         summary.ctime_ns,
         summary.size,
     );
-    if let Some(chunks) = local {
-        return CacheResolution::Hit(chunks);
+    if let Some((chunks, retained)) = local {
+        return CacheResolution::Hit(chunks, Some(retained));
     }
 
     if raw_path {
@@ -139,7 +143,7 @@ fn resolve_cache_hit(
     let parent = parent_reuse_index
         .and_then(|idx| idx.lookup(abs_path, summary.size, summary.mtime_ns, summary.ctime_ns));
     match parent {
-        Some(chunks) => CacheResolution::Hit(chunks),
+        Some(chunks) => CacheResolution::Hit(chunks, None),
         None => CacheResolution::Miss,
     }
 }
@@ -810,7 +814,8 @@ fn run_against_repo(
         let items_config = items_chunker_config();
         let mut new_file_cache = FileCache::new();
 
-        // Prepare write cache: pre-size sections from loaded cache to avoid resize doublings.
+        // Prepare write cache: the loaded sections' sizes pre-size the
+        // retained-hit lists (see `begin_sections`).
         if !source_paths.is_empty() {
             let capacity_hints: Vec<usize> = canonical_roots
                 .iter()
@@ -920,16 +925,22 @@ fn run_against_repo(
             }
         }
         // The walk was the last reader of the loaded cache's sections for
-        // these roots. Free them now instead of at commit, so the old and new
-        // caches are not both resident while the commit allocates its
-        // buffers. This changes only memory, not what is saved:
-        // `begin_sections` created a write-cache section for every root, so
-        // `commit_finalize` overwrites each dropped key via `merge_section`,
-        // and a failed backup never saves the file cache (see the Phase 1
-        // abort path below).
+        // these roots. Move them into the write cache now: during the walk
+        // the write cache recorded only the path hashes of exact hits, so
+        // keeping their loaded entries (and dropping the rest) completes it
+        // without a second full table. Doing it here instead of at commit
+        // also means the old and new caches are never both resident while
+        // the commit allocates its buffers. What is saved does not change
+        // (see `absorb_read_sections`): `begin_sections` created a
+        // write-cache section for every root, so `commit_finalize`
+        // overwrites each moved key via `merge_section`, and a failed backup
+        // never saves the file cache (see the Phase 1 abort path below).
         if !source_paths.is_empty() {
-            let dropped = repo.file_cache_mut().drop_sections(&canonical_roots);
-            debug!(dropped, "released loaded file cache sections after walk");
+            let carried = new_file_cache.absorb_read_sections(repo.file_cache_mut());
+            debug!(
+                carried,
+                "moved unchanged entries of the loaded file cache into the new one"
+            );
         }
 
         // Bail before committing if shutdown was requested during the walk.
@@ -1288,7 +1299,10 @@ mod tests {
             .to_string();
         let res = resolve_cache_hit(&file_cache, Some(&parent_index), &abs, &summary, false);
         match res {
-            CacheResolution::Hit(chunks) => assert_eq!(chunks.len(), 1),
+            CacheResolution::Hit(chunks, retained) => {
+                assert_eq!(chunks.len(), 1);
+                assert!(retained.is_none(), "only exact local hits are retainable");
+            }
             other => panic!("expected Hit, got {other:?}"),
         }
     }
@@ -1342,7 +1356,10 @@ mod tests {
 
         // Non-raw path: parent reuse hits.
         match resolve_cache_hit(&file_cache, Some(&parent_index), &abs, &summary, false) {
-            CacheResolution::Hit(chunks) => assert_eq!(chunks.len(), 1),
+            CacheResolution::Hit(chunks, retained) => {
+                assert_eq!(chunks.len(), 1);
+                assert!(retained.is_none(), "only exact local hits are retainable");
+            }
             other => panic!("expected Hit, got {other:?}"),
         }
         // Raw path: parent reuse bypassed → Miss.
@@ -1403,9 +1420,41 @@ mod tests {
 
         let res = resolve_cache_hit(&cache, None, &abs, &summary, false);
         match res {
-            CacheResolution::Hit(chunks) => assert_eq!(chunks.len(), 1),
+            CacheResolution::Hit(chunks, retained) => {
+                assert_eq!(chunks.len(), 1);
+                assert!(retained.is_none(), "only exact local hits are retainable");
+            }
             other => panic!("expected Hit from warm cache, got {other:?}"),
         }
+    }
+
+    /// An exact (non-dataless) local hit carries a retain token, unlike the
+    /// dataless hit above, whose lookup does not compare ctime.
+    #[test]
+    fn resolve_cache_hit_exact_local_hit_is_retainable() {
+        let abs = std::path::Path::new("/src")
+            .join("a.txt")
+            .to_string_lossy()
+            .to_string();
+        let cache = warm_file_cache_with(&abs, 42, 7, 1_000, 4096);
+        let mut summary = dataless_metadata(4096, 1_000);
+        summary.device = 42;
+        summary.inode = 7;
+        summary.ctime_ns = 123_456_789;
+        summary.is_dataless = false;
+        match resolve_cache_hit(&cache, None, &abs, &summary, false) {
+            CacheResolution::Hit(chunks, retained) => {
+                assert_eq!(chunks.len(), 1);
+                assert!(retained.is_some());
+            }
+            other => panic!("expected Hit, got {other:?}"),
+        }
+        // Any differing compared field is a miss, never a retained hit.
+        summary.ctime_ns += 1;
+        assert!(matches!(
+            resolve_cache_hit(&cache, None, &abs, &summary, false),
+            CacheResolution::Miss
+        ));
     }
 
     #[test]
@@ -1453,7 +1502,10 @@ mod tests {
             .to_string();
         let res = resolve_cache_hit(&file_cache, Some(&parent_index), &abs, &summary, false);
         match res {
-            CacheResolution::Hit(chunks) => assert_eq!(chunks.len(), 1),
+            CacheResolution::Hit(chunks, retained) => {
+                assert_eq!(chunks.len(), 1);
+                assert!(retained.is_none(), "only exact local hits are retainable");
+            }
             other => panic!("expected Hit from parent index, got {other:?}"),
         }
     }

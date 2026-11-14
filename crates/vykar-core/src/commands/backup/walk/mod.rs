@@ -6,7 +6,7 @@ use tracing::warn;
 
 use crate::config::ChunkerConfig;
 use crate::platform::fs;
-use crate::repo::file_cache::{CachedChunks, FileCache, ParentReuseIndex};
+use crate::repo::file_cache::{CachedChunks, FileCache, ParentReuseIndex, RetainedHit};
 use crate::snapshot::item::{Item, ItemRawNames, ItemType};
 use vykar_types::error::{Result, VykarError};
 
@@ -341,6 +341,8 @@ pub(super) enum WalkEntry {
         abs_path: String,
         metadata: fs::MetadataSummary,
         cached_refs: CachedChunks,
+        /// Set for exact local-cache hits (see `RetainedHit`).
+        retained: Option<RetainedHit>,
     },
     NonFile {
         item: Item,
@@ -618,12 +620,13 @@ fn walked_entry_to_walk_items(
             &metadata_summary,
             item.has_raw_path(),
         ) {
-            super::CacheResolution::Hit(cached_refs) => {
+            super::CacheResolution::Hit(cached_refs, retained) => {
                 return WalkItems::One(Some(Ok(WalkEntry::CacheHit {
                     item,
                     abs_path,
                     metadata: metadata_summary,
                     cached_refs,
+                    retained,
                 })));
             }
             super::CacheResolution::SkipDataless => {

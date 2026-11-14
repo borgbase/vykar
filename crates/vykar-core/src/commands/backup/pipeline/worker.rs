@@ -204,11 +204,13 @@ pub(super) fn process_file_worker(
             abs_path,
             metadata,
             cached_refs,
+            retained,
         } => Ok(ProcessedEntry::CacheHit {
             item,
             abs_path,
             metadata,
             cached_refs,
+            retained,
         }),
 
         WalkEntry::NonFile { item } => Ok(ProcessedEntry::NonFile { item }),

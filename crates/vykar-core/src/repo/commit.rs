@@ -335,21 +335,28 @@ impl Repository {
                 log_stage_elapsed(ctx);
 
                 // Try fast path: compare raw blob against cached copy.
-                let fast_path_taken = if let Some(ref raw_data) = raw_blob {
-                    self.try_fast_path_commit(raw_data, &delta, progress)?
-                } else {
-                    false
-                };
+                let fast_path_cache = raw_blob
+                    .as_deref()
+                    .and_then(|raw_data| self.fast_path_full_cache(raw_data));
 
-                if fast_path_taken {
+                if let Some((old_cache, full_cache_path)) = fast_path_cache {
+                    // The remote blob was only needed for the comparison; the
+                    // new blob is serialized from the merged full cache. Free
+                    // it before the merge and serialization peak.
+                    drop(raw_blob);
+                    self.fast_path_commit(old_cache, &full_cache_path, delta, progress)?;
                     // chunk_index hydration deferred until after the snapshot
                     // commit point so a local cache error can't abort the
                     // backup after the remote index has already been updated.
                     deferred_chunk_index_hydrate = true;
                 } else {
                     let ctx = emit_stage(progress, "decode index");
-                    let fresh_index = if let Some(ref raw_data) = raw_blob {
-                        let blob = Self::decode_index_blob_full(raw_data, self.crypto.as_ref())?;
+                    let fresh_index = if let Some(raw_data) = raw_blob {
+                        // Free the ciphertext before building the index from
+                        // the plaintext (as `reload_full_index_with_generation`).
+                        let compressed = Self::unpack_index_blob(&raw_data, self.crypto.as_ref())?;
+                        drop(raw_data);
+                        let blob = Self::decode_unpacked_index_blob(&compressed)?;
                         (blob.generation, blob.chunks)
                     } else {
                         (0, ChunkIndex::new())
@@ -708,11 +715,6 @@ impl Repository {
         Ok((blob.generation, blob.chunks))
     }
 
-    /// Decrypt, decompress, and deserialize an index blob into an `IndexBlob`.
-    fn decode_index_blob_full(index_data: &[u8], crypto: &dyn CryptoEngine) -> Result<IndexBlob> {
-        Self::decode_unpacked_index_blob(&Self::unpack_index_blob(index_data, crypto)?)
-    }
-
     /// Decrypt an index blob, returning its still-compressed payload.
     fn unpack_index_blob(index_data: &[u8], crypto: &dyn CryptoEngine) -> Result<Vec<u8>> {
         unpack_object_expect_with_context(
@@ -729,48 +731,64 @@ impl Repository {
         Ok(compress::decode_metadata_msgpack(compressed)?.0)
     }
 
-    /// Try the fast-path commit: if the remote index blob matches the cached
-    /// copy, skip decode + reconcile. Uses AEAD ciphertext comparison —
-    /// identical ciphertext guarantees identical plaintext.
+    /// Fast-path precondition: the remote index blob is byte-identical to the
+    /// locally cached copy (AEAD ciphertext comparison — identical ciphertext
+    /// guarantees identical plaintext), and the full index cache for the
+    /// current generation is present.
     ///
-    /// On success: merges the full index cache, persists the merged index to
-    /// storage, and caches the raw blob. Local dedup/restore cache derivation
-    /// and `chunk_index` hydration are left to the caller (after the snapshot
-    /// commit point) so that local-only failures cannot abort a committed backup.
-    ///
-    /// Returns `true` if the fast path was taken.
-    fn try_fast_path_commit(
-        &mut self,
+    /// Returns the opened full cache and its path when the fast path can be
+    /// taken, `None` to fall through to the slow path. Has no side effects,
+    /// so a `None` leaves the slow path exactly as if it ran alone.
+    fn fast_path_full_cache(
+        &self,
         raw_blob: &[u8],
-        delta: &IndexDelta,
-        progress: &mut Option<impl FnMut(crate::commands::backup::BackupProgressEvent)>,
-    ) -> Result<bool> {
-        use crate::commands::backup::BackupProgressEvent;
-
+    ) -> Option<(dedup_cache::MmapFullIndexCache, std::path::PathBuf)> {
         let cd = self.cache_dir_override.as_deref();
-        let cached = dedup_cache::read_index_blob_cache(&self.config.id, self.index_generation, cd);
-        let Some(cached_blob) = cached else {
-            debug!("fast path: no cached index blob, falling through to slow path");
-            return Ok(false);
-        };
-
-        if raw_blob != cached_blob.as_slice() {
-            debug!("fast path: remote index changed, falling through to slow path");
-            return Ok(false);
+        // Compared by streaming the cache file, so no second copy of the blob
+        // is materialized next to `raw_blob`.
+        if !dedup_cache::index_blob_cache_matches(
+            &self.config.id,
+            self.index_generation,
+            cd,
+            raw_blob,
+        ) {
+            debug!(
+                "fast path: cached index blob missing or different, falling through to slow path"
+            );
+            return None;
         }
 
         // Index unchanged — try to open the full index cache for merge.
         let Some(full_cache_path) = dedup_cache::full_index_cache_path(&self.config.id, cd) else {
             debug!("fast path: no cache dir, falling through to slow path");
-            return Ok(false);
+            return None;
         };
 
-        let old_cache =
-            dedup_cache::MmapFullIndexCache::open_path(&full_cache_path, self.index_generation);
-        let Some(old_cache) = old_cache else {
+        let Some(old_cache) =
+            dedup_cache::MmapFullIndexCache::open_path(&full_cache_path, self.index_generation)
+        else {
             debug!("fast path: full index cache missing or stale, falling through to slow path");
-            return Ok(false);
+            return None;
         };
+        Some((old_cache, full_cache_path))
+    }
+
+    /// Fast-path commit, once [`Self::fast_path_full_cache`] established that
+    /// the remote index is unchanged: skip decode + reconcile, merge the full
+    /// index cache with the delta, persist the merged index to storage, and
+    /// cache the raw blob.
+    ///
+    /// Local dedup/restore cache derivation and `chunk_index` hydration are
+    /// left to the caller (after the snapshot commit point) so that local-only
+    /// failures cannot abort a committed backup.
+    fn fast_path_commit(
+        &mut self,
+        old_cache: dedup_cache::MmapFullIndexCache,
+        full_cache_path: &std::path::Path,
+        delta: IndexDelta,
+        progress: &mut Option<impl FnMut(crate::commands::backup::BackupProgressEvent)>,
+    ) -> Result<()> {
+        use crate::commands::backup::BackupProgressEvent;
 
         if let Some(ref mut cb) = progress {
             cb(BackupProgressEvent::CommitStage {
@@ -781,7 +799,7 @@ impl Repository {
 
         // Verify packs before merging.
         let ctx_start = std::time::Instant::now();
-        self.verify_delta_packs(delta)?;
+        self.verify_delta_packs(&delta)?;
         debug!(
             stage = "verify packs",
             elapsed_ms = ctx_start.elapsed().as_millis() as u64,
@@ -793,17 +811,20 @@ impl Repository {
         let new_cache_path = full_cache_path.with_extension("merged");
         dedup_cache::merge_full_index_cache(
             &old_cache,
-            delta,
+            &delta,
             self.index_generation,
             &new_cache_path,
         )?;
         // Drop the mmap BEFORE renaming — on Windows, mapped files block replacement.
         drop(old_cache);
-        std::fs::rename(&new_cache_path, &full_cache_path)?;
+        // The delta is fully applied; drop it (and the dedup cache mapping
+        // its positional bumps hold) before serializing the merged index.
+        drop(delta);
+        std::fs::rename(&new_cache_path, full_cache_path)?;
 
         // Serialize the merged cache as the new index blob and persist.
         let merged_cache =
-            dedup_cache::MmapFullIndexCache::open_path(&full_cache_path, self.index_generation)
+            dedup_cache::MmapFullIndexCache::open_path(full_cache_path, self.index_generation)
                 .ok_or_else(|| VykarError::Other("failed to reopen merged cache".into()))?;
 
         let index_packed = dedup_cache::serialize_full_cache_as_index_blob(
@@ -822,6 +843,6 @@ impl Repository {
             "fast-path commit complete"
         );
 
-        Ok(true)
+        Ok(())
     }
 }

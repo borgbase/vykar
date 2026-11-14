@@ -1566,52 +1566,89 @@ pub fn index_blob_cache_path(repo_id: &[u8], cache_dir: Option<&Path>) -> Option
     repo_cache_dir(repo_id, cache_dir).map(|d| d.join("index_blob"))
 }
 
-/// Read the cached index blob if it exists and matches the expected generation.
-/// Returns `None` on any error (missing file, wrong magic/version/generation).
-pub fn read_index_blob_cache(
+/// Whether the cached index blob for `expected_generation` is byte-identical
+/// to `blob` (the ciphertext just fetched from storage).
+///
+/// Streams the cache file through a small buffer instead of reading it into
+/// memory, so the fast-path commit never holds a second copy of the index
+/// blob next to the remote one. Returns `false` on any error (missing file,
+/// wrong magic/version/generation, length or content mismatch).
+pub fn index_blob_cache_matches(
     repo_id: &[u8],
     expected_generation: u64,
     cache_dir: Option<&Path>,
-) -> Option<Vec<u8>> {
+    blob: &[u8],
+) -> bool {
+    use std::io::Read;
+
     if expected_generation == 0 {
-        return None;
+        return false;
     }
-    let path = index_blob_cache_path(repo_id, cache_dir)?;
-    let data = std::fs::read(&path).ok()?;
+    let Some(path) = index_blob_cache_path(repo_id, cache_dir) else {
+        return false;
+    };
+    let Ok(mut file) = std::fs::File::open(&path) else {
+        return false;
+    };
 
-    if data.len() < INDEX_BLOB_HEADER_SIZE {
+    let mut header = [0u8; INDEX_BLOB_HEADER_SIZE];
+    if file.read_exact(&mut header).is_err() {
         debug!("index blob cache: file too small for header");
-        return None;
+        return false;
     }
-
-    if &data[0..8] != INDEX_BLOB_MAGIC {
+    if &header[0..8] != INDEX_BLOB_MAGIC {
         debug!("index blob cache: bad magic");
-        return None;
+        return false;
     }
-
-    let version = read_u32_le(data[8..12].try_into().expect("4-byte slice from header"));
+    let version = read_u32_le(header[8..12].try_into().expect("4-byte slice from header"));
     if version != INDEX_BLOB_VERSION {
         debug!(version, "index blob cache: unsupported version");
-        return None;
+        return false;
     }
-
-    let generation = read_u64_le(data[12..20].try_into().expect("8-byte slice from header"));
+    let generation = read_u64_le(header[12..20].try_into().expect("8-byte slice from header"));
     if generation != expected_generation {
         debug!(
             cache_gen = generation,
             expected_gen = expected_generation,
             "index blob cache: generation mismatch"
         );
-        return None;
+        return false;
     }
 
-    debug!(
-        generation,
-        blob_bytes = data.len() - INDEX_BLOB_HEADER_SIZE,
-        "index blob cache hit"
-    );
+    // Length first: a mismatch is decided without reading the payload.
+    // The metadata is taken from the open handle, so it describes the same
+    // inode the reads below see even if the file is replaced concurrently.
+    let expected_len = (INDEX_BLOB_HEADER_SIZE + blob.len()) as u64;
+    match file.metadata() {
+        Ok(meta) if meta.len() == expected_len => {}
+        Ok(meta) => {
+            debug!(
+                cache_bytes = meta.len().saturating_sub(INDEX_BLOB_HEADER_SIZE as u64),
+                blob_bytes = blob.len(),
+                "index blob cache: length mismatch"
+            );
+            return false;
+        }
+        Err(_) => return false,
+    }
 
-    Some(data[INDEX_BLOB_HEADER_SIZE..].to_vec())
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut rest = blob;
+    while !rest.is_empty() {
+        let n = rest.len().min(buf.len());
+        if file.read_exact(&mut buf[..n]).is_err() || buf[..n] != rest[..n] {
+            debug!("index blob cache: content mismatch");
+            return false;
+        }
+        rest = &rest[n..];
+    }
+    // Trailing bytes would mean the file grew after the length check.
+    if !matches!(file.read(&mut buf[..1]), Ok(0)) {
+        return false;
+    }
+
+    debug!(generation, blob_bytes = blob.len(), "index blob cache hit");
+    true
 }
 
 /// Write the raw index blob to the local cache with the given generation.
@@ -2223,12 +2260,93 @@ mod tests {
         let generation = 42u64;
         let blob = b"some encrypted index data here";
 
-        // Write
         write_index_blob_cache(blob, generation, &repo_id, Some(dir.path())).unwrap();
 
-        // Read back
-        let cached = read_index_blob_cache(&repo_id, generation, Some(dir.path()));
-        assert_eq!(cached.as_deref(), Some(blob.as_slice()));
+        assert!(index_blob_cache_matches(
+            &repo_id,
+            generation,
+            Some(dir.path()),
+            blob
+        ));
+    }
+
+    #[test]
+    fn index_blob_cache_rejects_different_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_id = [0xBAu8; 32];
+        let blob = b"some encrypted index data here";
+        write_index_blob_cache(blob, 42, &repo_id, Some(dir.path())).unwrap();
+        let cd = Some(dir.path());
+
+        // Same length, one byte differs (also at the very end).
+        let mut flipped = blob.to_vec();
+        flipped[3] ^= 1;
+        assert!(!index_blob_cache_matches(&repo_id, 42, cd, &flipped));
+        let mut last = blob.to_vec();
+        *last.last_mut().unwrap() ^= 1;
+        assert!(!index_blob_cache_matches(&repo_id, 42, cd, &last));
+        // Prefix and extension of the cached blob.
+        assert!(!index_blob_cache_matches(
+            &repo_id,
+            42,
+            cd,
+            &blob[..blob.len() - 1]
+        ));
+        let mut longer = blob.to_vec();
+        longer.push(0);
+        assert!(!index_blob_cache_matches(&repo_id, 42, cd, &longer));
+        assert!(!index_blob_cache_matches(&repo_id, 42, cd, b""));
+    }
+
+    #[test]
+    fn index_blob_cache_matches_blob_larger_than_read_buffer() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_id = [0xBCu8; 32];
+        // Spans several 64 KiB read chunks with a partial tail.
+        let blob: Vec<u8> = (0..200_001u32).map(|i| (i * 31 % 251) as u8).collect();
+        write_index_blob_cache(&blob, 7, &repo_id, Some(dir.path())).unwrap();
+        assert!(index_blob_cache_matches(
+            &repo_id,
+            7,
+            Some(dir.path()),
+            &blob
+        ));
+
+        let mut tail = blob.clone();
+        tail[150_000] ^= 0xff;
+        assert!(!index_blob_cache_matches(
+            &repo_id,
+            7,
+            Some(dir.path()),
+            &tail
+        ));
+    }
+
+    #[test]
+    fn index_blob_cache_rejects_corrupt_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_id = [0xBDu8; 32];
+        let blob = b"payload";
+        write_index_blob_cache(blob, 42, &repo_id, Some(dir.path())).unwrap();
+        let path = index_blob_cache_path(&repo_id, Some(dir.path())).unwrap();
+
+        let mut data = std::fs::read(&path).unwrap();
+        data[0] ^= 1;
+        std::fs::write(&path, &data).unwrap();
+        assert!(!index_blob_cache_matches(
+            &repo_id,
+            42,
+            Some(dir.path()),
+            blob
+        ));
+
+        std::fs::write(&path, &data[..10]).unwrap();
+        assert!(!index_blob_cache_matches(
+            &repo_id,
+            42,
+            Some(dir.path()),
+            blob
+        ));
     }
 
     #[test]
@@ -2239,14 +2357,24 @@ mod tests {
 
         write_index_blob_cache(blob, 42, &repo_id, Some(dir.path())).unwrap();
 
-        assert!(read_index_blob_cache(&repo_id, 99, Some(dir.path())).is_none());
-        assert!(read_index_blob_cache(&repo_id, 42, Some(dir.path())).is_some());
+        assert!(!index_blob_cache_matches(
+            &repo_id,
+            99,
+            Some(dir.path()),
+            blob
+        ));
+        assert!(index_blob_cache_matches(
+            &repo_id,
+            42,
+            Some(dir.path()),
+            blob
+        ));
     }
 
     #[test]
     fn index_blob_cache_rejects_generation_zero() {
         let repo_id = [0xDDu8; 32];
-        assert!(read_index_blob_cache(&repo_id, 0, None).is_none());
+        assert!(!index_blob_cache_matches(&repo_id, 0, None, b"x"));
     }
 
     #[test]

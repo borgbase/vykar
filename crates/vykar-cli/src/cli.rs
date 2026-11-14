@@ -132,12 +132,20 @@ pub(crate) enum Commands {
         #[arg(long)]
         pattern: Option<String>,
 
-        /// Recompute each chunk's keyed ID after decoding and abort if it
-        /// doesn't match the snapshot's stored chunk_id. Always on for
-        /// unencrypted repositories; for encrypted ones AEAD already
+        /// Recompute each chunk's keyed ID after decoding and treat a
+        /// mismatch with the snapshot's stored chunk_id as damaged data. Always
+        /// on for unencrypted repositories; for encrypted ones AEAD already
         /// authenticates the data, so this only guards against writer-side bugs.
         #[arg(long)]
         verify: bool,
+
+        /// Skip files whose data cannot be read or decoded instead of aborting
+        ///
+        /// Damaged files are left out of the destination entirely and listed
+        /// on stderr; everything that is restored is fully verified. Exits
+        /// with status 3 if any file was skipped.
+        #[arg(long)]
+        continue_on_error: bool,
     },
 
     /// Delete an entire repository permanently

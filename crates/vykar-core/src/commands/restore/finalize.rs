@@ -11,9 +11,11 @@ use crate::platform::fs;
 use vykar_types::error::{Result, VykarError};
 
 use super::plan::{PendingLink, PlannedFile, PlannedNode, RepInfo};
-use super::{apply_item_xattrs, push_metadata_warning, warn_metadata_err, RestoreStats};
+use super::{
+    apply_item_xattrs, push_damaged, push_metadata_warning, warn_metadata_err, RestoreStats,
+};
 use crate::snapshot::item::HardlinkId;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicBool;
 
 #[cfg(test)]
@@ -278,14 +280,22 @@ pub(super) fn apply_symlink_metadata(
 /// symlink) as a backstop. A containment violation is fatal, matching the
 /// normal-file path's `ensure_path_within_root`.
 ///
+/// Continue mode: a link whose representative is a tombstone (damaged) shares
+/// its chunks and is therefore damaged too. It still claims its name with an
+/// `O_EXCL` placeholder, so any other entry at that path — staged before, or a
+/// later pending link — aborts as a conflict exactly as in strict mode. The
+/// placeholder joins `tombstones` and is swept before publish.
+///
 /// Returns the number of bytes physically written by copy fallbacks (a true
 /// hard link writes none), so the caller can fold them into `total_bytes`.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn create_hardlinks(
     pending_links: &[PendingLink],
     group_reps: &HashMap<HardlinkId, RepInfo>,
     temp_root: &Path,
     xattrs_enabled: bool,
     restore_as_root: bool,
+    tombstones: &mut HashSet<PathBuf>,
     stats: &mut RestoreStats,
     shutdown: Option<&AtomicBool>,
 ) -> Result<u64> {
@@ -306,6 +316,24 @@ pub(super) fn create_hardlinks(
         };
         let rep_abs = temp_root.join(&rep.rel_path);
         let link_abs = temp_root.join(&link.link_rel);
+
+        if tombstones.contains(&rep.rel_path) {
+            super::plan::ensure_parent_exists_within_root(&link_abs, temp_root)?;
+            super::plan::create_exclusive(&link_abs).map_err(|e| {
+                if e.kind() == io::ErrorKind::AlreadyExists {
+                    super::plan::conflicting_entries(&link.link_rel)
+                } else {
+                    VykarError::Other(format!("failed to create {}: {e}", link_abs.display()))
+                }
+            })?;
+            tombstones.insert(link.link_rel.clone());
+            push_damaged(
+                stats,
+                link.link_rel.clone(),
+                format!("hard link to damaged file '{}'", rep.rel_path.display()),
+            );
+            continue;
+        }
 
         // The representative is resolved by *path* at finalize time, so guard
         // against a malformed snapshot that replaced it between planning and
@@ -1064,6 +1092,7 @@ mod tests {
             &temp_root,
             false,
             false,
+            &mut HashSet::new(),
             &mut stats,
             None,
         )
@@ -1106,6 +1135,7 @@ mod tests {
             &temp_root,
             false,
             false,
+            &mut HashSet::new(),
             &mut stats,
             None,
         )
@@ -1159,6 +1189,7 @@ mod tests {
             &temp_root,
             false,
             false,
+            &mut HashSet::new(),
             &mut stats,
             None,
         );
@@ -1221,6 +1252,7 @@ mod tests {
             &temp_root,
             true,
             false,
+            &mut HashSet::new(),
             &mut stats,
             None,
         )
@@ -1300,6 +1332,7 @@ mod tests {
             &temp_root,
             false,
             false,
+            &mut HashSet::new(),
             &mut stats,
             None,
         )
@@ -1340,6 +1373,139 @@ mod tests {
             "got: {err}"
         );
         assert_eq!(std::fs::read(&secret).unwrap(), b"DO-NOT-OVERWRITE");
+    }
+
+    // -----------------------------------------------------------------------
+    // Continue mode: links to damaged representatives
+    // -----------------------------------------------------------------------
+
+    /// Staging root with healthy rep `c.txt` and damaged (tombstoned) reps
+    /// `a.txt` and `d.txt`. Ids: 1 → a, 2 → c, 3 → d.
+    struct DamagedFixture {
+        _dest: tempfile::TempDir,
+        temp_root: PathBuf,
+        group_reps: HashMap<HardlinkId, RepInfo>,
+        tombstones: HashSet<PathBuf>,
+    }
+
+    fn hid(n: u64) -> HardlinkId {
+        HardlinkId { dev: 1, ino: n }
+    }
+
+    fn damaged_fixture() -> DamagedFixture {
+        let dest = tempdir().unwrap();
+        let temp_root = dest.path().canonicalize().unwrap().join(temp_name());
+        std::fs::create_dir_all(&temp_root).unwrap();
+        std::fs::write(temp_root.join("a.txt"), b"").unwrap();
+        std::fs::write(temp_root.join("c.txt"), b"healthy").unwrap();
+        std::fs::write(temp_root.join("d.txt"), b"").unwrap();
+        let rep = |p: &str, size| RepInfo {
+            rel_path: PathBuf::from(p),
+            size,
+            chunks_fp: [0u8; 32],
+        };
+        let group_reps = HashMap::from([
+            (hid(1), rep("a.txt", 9)),
+            (hid(2), rep("c.txt", 7)),
+            (hid(3), rep("d.txt", 9)),
+        ]);
+        let tombstones = HashSet::from([PathBuf::from("a.txt"), PathBuf::from("d.txt")]);
+        DamagedFixture {
+            _dest: dest,
+            temp_root,
+            group_reps,
+            tombstones,
+        }
+    }
+
+    fn link(rel: &str, id: HardlinkId) -> PendingLink {
+        PendingLink {
+            link_rel: PathBuf::from(rel),
+            id,
+            mtime: 0,
+            uid: 0,
+            gid: 0,
+        }
+    }
+
+    fn run_links(fx: &mut DamagedFixture, links: &[PendingLink]) -> (Result<u64>, RestoreStats) {
+        let mut stats = RestoreStats::default();
+        let res = create_hardlinks(
+            links,
+            &fx.group_reps,
+            &fx.temp_root,
+            false,
+            false,
+            &mut fx.tombstones,
+            &mut stats,
+            None,
+        );
+        (res, stats)
+    }
+
+    fn assert_conflict_at_b(res: Result<u64>) {
+        let err = res.unwrap_err().to_string();
+        assert!(err.contains("conflicting entries at 'b.txt'"), "got: {err}");
+    }
+
+    #[test]
+    fn damaged_link_free_path_is_reported_and_tombstoned() {
+        let mut fx = damaged_fixture();
+        let (res, stats) = run_links(&mut fx, &[link("sub/b.txt", hid(1))]);
+        res.unwrap();
+        assert_eq!(stats.hardlinks, 0);
+        assert_eq!(stats.damaged_total, 1);
+        assert_eq!(stats.damaged[0].path, PathBuf::from("sub/b.txt"));
+        assert!(stats.damaged[0].reason.contains("a.txt"));
+        assert!(fx.tombstones.contains(Path::new("sub/b.txt")));
+        assert_eq!(
+            std::fs::metadata(fx.temp_root.join("sub/b.txt"))
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+
+    #[test]
+    fn damaged_link_onto_staged_file_conflicts() {
+        let mut fx = damaged_fixture();
+        std::fs::write(fx.temp_root.join("b.txt"), b"other").unwrap();
+        let (res, _) = run_links(&mut fx, &[link("b.txt", hid(1))]);
+        assert_conflict_at_b(res);
+        assert_eq!(std::fs::read(fx.temp_root.join("b.txt")).unwrap(), b"other");
+    }
+
+    #[test]
+    fn damaged_and_healthy_link_at_same_path_conflict_in_either_order() {
+        for links in [
+            [link("b.txt", hid(1)), link("b.txt", hid(2))],
+            [link("b.txt", hid(2)), link("b.txt", hid(1))],
+        ] {
+            let mut fx = damaged_fixture();
+            let (res, _) = run_links(&mut fx, &links);
+            assert_conflict_at_b(res);
+        }
+    }
+
+    #[test]
+    fn two_damaged_links_at_same_path_conflict() {
+        let mut fx = damaged_fixture();
+        let (res, _) = run_links(&mut fx, &[link("b.txt", hid(1)), link("b.txt", hid(3))]);
+        assert_conflict_at_b(res);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn damaged_link_rejects_symlinked_parent_escape() {
+        let mut fx = damaged_fixture();
+        let outside = fx.temp_root.parent().unwrap().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, fx.temp_root.join("evil")).unwrap();
+        let (res, stats) = run_links(&mut fx, &[link("evil/b.txt", hid(1))]);
+        let err = res.unwrap_err().to_string();
+        assert!(err.contains("outside destination"), "got: {err}");
+        assert_eq!(stats.damaged_total, 0);
+        assert!(!outside.join("b.txt").exists());
     }
 
     /// The metadata pass never follows a symlink at a file's leaf: `O_NOFOLLOW`
@@ -1424,6 +1590,7 @@ mod tests {
             &temp_root,
             false,
             false,
+            &mut HashSet::new(),
             &mut stats,
             None,
         )

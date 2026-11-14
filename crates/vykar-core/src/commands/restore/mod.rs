@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
 use tracing::info;
@@ -100,6 +100,10 @@ pub(super) const RESTORE_TEMP_PREFIX: &str = ".vykar-restore-";
 /// stream) when the destination filesystem rejects every metadata call.
 const MAX_RESTORE_WARNINGS: usize = 64;
 
+/// Cap on damaged paths listed in `RestoreStats.damaged`; `damaged_total`
+/// stays exact past it.
+const MAX_DAMAGED_REPORTED: usize = 10_000;
+
 // ---------------------------------------------------------------------------
 // Public entry points
 // ---------------------------------------------------------------------------
@@ -121,6 +125,31 @@ pub struct RestoreStats {
     pub total_bytes: u64,
     pub warnings: Vec<String>,
     pub warnings_suppressed: u64,
+    /// Entries left out because their data could not be read (continue mode
+    /// only). Capped at `MAX_DAMAGED_REPORTED`; none of them is in `dest`.
+    pub damaged: Vec<DamagedFile>,
+    /// Exact number of damaged entries, including those past the cap.
+    pub damaged_total: u64,
+}
+
+/// A file omitted from a continue-on-error restore.
+#[derive(Debug, Clone)]
+pub struct DamagedFile {
+    /// Snapshot-relative path.
+    pub path: PathBuf,
+    pub reason: String,
+}
+
+/// Knobs for [`run_with_options`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RestoreOptions {
+    pub xattrs_enabled: bool,
+    /// Recompute chunk IDs even for encrypted repositories.
+    pub verify_chunks: bool,
+    /// Omit files whose data cannot be read or decoded, and report them in
+    /// [`RestoreStats::damaged`], instead of aborting the whole restore.
+    /// Everything that lands in `dest` is still fully read and verified.
+    pub continue_on_error: bool,
 }
 
 /// Run `vykar restore`.
@@ -141,6 +170,32 @@ pub fn run(
     verify_chunks: bool,
     shutdown: Option<&AtomicBool>,
 ) -> Result<RestoreStats> {
+    let opts = RestoreOptions {
+        xattrs_enabled,
+        verify_chunks,
+        continue_on_error: false,
+    };
+    run_with_options(
+        config,
+        passphrase,
+        snapshot_name,
+        dest,
+        pattern,
+        opts,
+        shutdown,
+    )
+}
+
+/// Run `vykar restore` with explicit [`RestoreOptions`].
+pub fn run_with_options(
+    config: &VykarConfig,
+    passphrase: Option<&str>,
+    snapshot_name: &str,
+    dest: &str,
+    pattern: Option<&str>,
+    opts: RestoreOptions,
+    shutdown: Option<&AtomicBool>,
+) -> Result<RestoreStats> {
     let filter = pattern
         .map(|p| {
             globset::GlobBuilder::new(p)
@@ -156,8 +211,7 @@ pub fn run(
         passphrase,
         snapshot_name,
         dest,
-        xattrs_enabled,
-        verify_chunks,
+        opts,
         move |path| filter.as_ref().is_none_or(|matcher| matcher.is_match(path)),
         shutdown,
     )
@@ -183,8 +237,11 @@ pub fn run_selected(
         passphrase,
         snapshot_name,
         dest,
-        xattrs_enabled,
-        verify_chunks,
+        RestoreOptions {
+            xattrs_enabled,
+            verify_chunks,
+            continue_on_error: false,
+        },
         |path| path_matches_selection(path, selected_paths),
         shutdown,
     )
@@ -200,8 +257,7 @@ fn restore_with_filter<F>(
     passphrase: Option<&str>,
     snapshot_name: &str,
     dest: &str,
-    xattrs_enabled: bool,
-    verify_chunks: bool,
+    opts: RestoreOptions,
     mut include_path: F,
     shutdown: Option<&AtomicBool>,
 ) -> Result<RestoreStats>
@@ -218,6 +274,11 @@ where
     // directly via storage.get_range(), so the cache only serves the small
     // item-stream tree-pack chunks. 2 MiB is plenty.
     repo.set_blob_cache_max_bytes(2 * 1024 * 1024);
+    let RestoreOptions {
+        xattrs_enabled,
+        verify_chunks,
+        continue_on_error,
+    } = opts;
     let mut stats = RestoreStats::default();
     let xattrs_enabled = if xattrs_enabled && !fs::xattrs_supported() {
         push_metadata_warning(
@@ -310,6 +371,11 @@ where
     // relink after all representatives are on disk (see `create_hardlinks`).
     let mut group_reps: HashMap<crate::snapshot::item::HardlinkId, plan::RepInfo> = HashMap::new();
     let mut pending_links: Vec<plan::PendingLink> = Vec::new();
+    // Continue mode: relative paths of damaged entries. Each keeps its
+    // `O_EXCL`-created name as a zero-length placeholder until just before
+    // publish, so a later entry at the same path still aborts as a conflict
+    // exactly as in strict mode. Removed by `sweep_tombstones`.
+    let mut tombstones: HashSet<PathBuf> = HashSet::new();
     let mut plan_out = plan::stream_and_plan(
         &items_stream,
         &temp_root,
@@ -320,19 +386,35 @@ where
         &mut group_reps,
         &mut pending_links,
         shutdown,
-        |batch_files, batch_chunks, verified_dirs, stats| -> Result<()> {
+        |mut batch_files, mut batch_chunks, verified_dirs, stats| -> Result<()> {
             check_interrupted(shutdown)?;
             if batch_files.is_empty() {
                 return Ok(());
             }
 
+            let failures = continue_on_error.then(parallel::BatchFailures::default);
             let mut groups = if !batch_chunks.is_empty() {
                 items.ensure_index(&mut repo)?;
                 let index = repo.chunk_index();
+                if let Some(f) = &failures {
+                    batch_chunks.retain(|id, ct| {
+                        let present = index.get(id).is_some();
+                        if !present {
+                            f.record(&ct.targets, &VykarError::ChunkNotInIndex(*id));
+                        }
+                        present
+                    });
+                }
                 read_groups::build_read_groups(batch_chunks, |id| {
                     index
                         .get(id)
                         .map(|e| (e.pack_id, e.pack_offset, e.stored_size))
+                })
+                .map_err(|e| match e {
+                    VykarError::ChunkNotInIndex(_) => {
+                        VykarError::RestoreSourceUnreadable(Box::new(e))
+                    }
+                    e => e,
                 })?
             } else {
                 Vec::new()
@@ -365,7 +447,25 @@ where
                 config.limits.restore_concurrency(),
                 verify_chunks,
                 shutdown,
-            )?;
+                failures.as_ref(),
+            )
+            .map_err(restore_error)?;
+
+            let failed = failures
+                .map(parallel::BatchFailures::into_map)
+                .unwrap_or_default();
+            let bytes = if failed.is_empty() {
+                bytes
+            } else {
+                discard_damaged(
+                    &mut batch_files,
+                    &failed,
+                    &temp_root,
+                    &mut tombstones,
+                    stats,
+                )?;
+                batch_files.iter().map(|pf| pf.total_size).sum()
+            };
 
             // Phase 5b: apply per-file metadata in temp_root.
             finalize::apply_file_metadata(
@@ -409,10 +509,17 @@ where
         &temp_root,
         xattrs_enabled,
         restore_as_root,
+        &mut tombstones,
         &mut stats,
         shutdown,
     )
     .map_err(cleanup)?;
+
+    // Remove the damaged placeholders now that no later entry can be staged
+    // at their paths. A failure must abort: publishing would put an empty file
+    // at a path reported as damaged. Directory mtimes are unaffected, as
+    // `apply_dir_metadata` runs after the move.
+    sweep_tombstones(&temp_root, &tombstones, shutdown).map_err(cleanup)?;
 
     // Phase 5a: rename temp subtrees into the final destination.  All file
     // metadata is already on the inodes, so the rename has no observable TOCTOU
@@ -487,8 +594,87 @@ where
             stats.warnings_suppressed
         );
     }
+    if stats.damaged_total > 0 {
+        info!(
+            "{} damaged entries were not restored",
+            format_count(stats.damaged_total)
+        );
+    }
 
     Ok(stats)
+}
+
+/// Surface a worker-pass error: source failures are wrapped so the caller can
+/// tell "repository data unreadable" apart; everything else is returned as is.
+fn restore_error(e: parallel::ReadError) -> VykarError {
+    match e {
+        parallel::ReadError::Source(e) => VykarError::RestoreSourceUnreadable(Box::new(e)),
+        parallel::ReadError::Fatal(e) => e,
+    }
+}
+
+/// Continue mode: truncate every damaged file of a batch to a zero-length
+/// tombstone, record it, and drop it from `batch_files` so no metadata is
+/// applied to it. Any failure here is fatal.
+fn discard_damaged(
+    batch_files: &mut Vec<plan::PlannedFile>,
+    failed: &HashMap<usize, String>,
+    temp_root: &Path,
+    tombstones: &mut HashSet<PathBuf>,
+    stats: &mut RestoreStats,
+) -> Result<()> {
+    let mut indices: Vec<usize> = failed.keys().copied().collect();
+    indices.sort_unstable();
+    for idx in indices {
+        let pf = batch_files
+            .get(idx)
+            .ok_or_else(|| VykarError::Other(format!("file_idx {idx} out of range")))?;
+        let full_path = temp_root.join(&pf.rel_path);
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.custom_flags(libc::O_NOFOLLOW);
+        }
+        opts.open(&full_path)
+            .and_then(|f| f.set_len(0))
+            .map_err(|e| {
+                VykarError::Other(format!(
+                    "failed to discard damaged file {}: {e}",
+                    full_path.display()
+                ))
+            })?;
+        let reason = failed.get(&idx).cloned().unwrap_or_default();
+        push_damaged(stats, pf.rel_path.clone(), reason);
+        tombstones.insert(pf.rel_path.clone());
+    }
+    let mut idx = 0;
+    batch_files.retain(|_| {
+        let keep = !failed.contains_key(&idx);
+        idx += 1;
+        keep
+    });
+    Ok(())
+}
+
+/// Remove every tombstone left by continue mode. Polls `shutdown`.
+fn sweep_tombstones(
+    temp_root: &Path,
+    tombstones: &HashSet<PathBuf>,
+    shutdown: Option<&AtomicBool>,
+) -> Result<()> {
+    for rel in tombstones {
+        check_interrupted(shutdown)?;
+        let path = temp_root.join(rel);
+        std::fs::remove_file(&path).map_err(|e| {
+            VykarError::Other(format!(
+                "failed to remove placeholder for damaged file {}: {e}",
+                path.display()
+            ))
+        })?;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -529,6 +715,16 @@ fn path_matches_selection(path: &str, selected: &HashSet<String>) -> bool {
         }
     }
     false
+}
+
+/// Record an entry omitted as damaged. The first `MAX_DAMAGED_REPORTED` are
+/// listed; `damaged_total` counts all of them.
+pub(super) fn push_damaged(stats: &mut RestoreStats, path: PathBuf, reason: String) {
+    stats.damaged_total += 1;
+    if stats.damaged.len() < MAX_DAMAGED_REPORTED {
+        tracing::debug!("damaged: {}: {reason}", path.display());
+        stats.damaged.push(DamagedFile { path, reason });
+    }
 }
 
 /// Record a non-fatal metadata failure. Up to `MAX_RESTORE_WARNINGS` are
@@ -867,8 +1063,7 @@ mod tests {
             None,
             "snap-cancel",
             dest.to_str().unwrap(),
-            false,
-            false,
+            RestoreOptions::default(),
             |_path| {
                 seen += 1;
                 if seen == 3 {
@@ -916,8 +1111,7 @@ mod tests {
             None,
             "snap-cancel",
             dest.to_str().unwrap(),
-            false,
-            false,
+            RestoreOptions::default(),
             |_path| true,
             Some(&flag),
         )
@@ -953,8 +1147,7 @@ mod tests {
             None,
             "snap-cancel",
             dest.to_str().unwrap(),
-            false,
-            false,
+            RestoreOptions::default(),
             |_path| true,
             Some(&flag),
         )
@@ -970,6 +1163,61 @@ mod tests {
             "expected Interrupted, got: {err}"
         );
         assert_dest_clean(&dest);
+    }
+
+    #[test]
+    fn restore_error_wraps_only_source_failures() {
+        let src = restore_error(parallel::ReadError::Source(VykarError::InvalidFormat(
+            "hash mismatch".into(),
+        )));
+        assert!(
+            matches!(&src, VykarError::RestoreSourceUnreadable(inner)
+                if matches!(&**inner, VykarError::InvalidFormat(m) if m == "hash mismatch")),
+            "got: {src:?}"
+        );
+        let fatal = restore_error(parallel::ReadError::Fatal(VykarError::Io(
+            std::io::Error::other("disk full"),
+        )));
+        assert!(
+            matches!(&fatal, VykarError::Io(e) if e.to_string() == "disk full"),
+            "got: {fatal:?}"
+        );
+    }
+
+    #[test]
+    fn push_damaged_caps_list_but_counts_all() {
+        let mut stats = RestoreStats::default();
+        for i in 0..MAX_DAMAGED_REPORTED + 2 {
+            push_damaged(&mut stats, PathBuf::from(format!("f{i}")), "bad".into());
+        }
+        assert_eq!(stats.damaged.len(), MAX_DAMAGED_REPORTED);
+        assert_eq!(stats.damaged_total, MAX_DAMAGED_REPORTED as u64 + 2);
+    }
+
+    #[test]
+    fn sweep_tombstones_removes_every_placeholder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir(root.join("d")).unwrap();
+        let tombstones: HashSet<PathBuf> = ["a", "d/b"].iter().map(PathBuf::from).collect();
+        for t in &tombstones {
+            std::fs::write(root.join(t), b"").unwrap();
+        }
+        std::fs::write(root.join("keep"), b"x").unwrap();
+        sweep_tombstones(root, &tombstones, None).unwrap();
+        assert!(!root.join("a").exists());
+        assert!(!root.join("d/b").exists());
+        assert!(root.join("keep").exists());
+    }
+
+    /// A placeholder that cannot be removed must abort rather than be
+    /// published at a path reported as damaged.
+    #[test]
+    fn sweep_tombstones_failure_is_fatal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tombstones: HashSet<PathBuf> = [PathBuf::from("gone")].into();
+        let err = sweep_tombstones(tmp.path(), &tombstones, None).unwrap_err();
+        assert!(err.to_string().contains("placeholder"), "got: {err}");
     }
 
     #[test]
@@ -1020,8 +1268,7 @@ mod tests {
             None,
             "snap-cancel",
             dest.to_str().unwrap(),
-            false,
-            false,
+            RestoreOptions::default(),
             |_path| true,
             None,
         );

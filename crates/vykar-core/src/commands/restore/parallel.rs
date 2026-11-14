@@ -9,7 +9,7 @@ use std::io::{Seek, Write as IoWrite};
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::commands::util::check_interrupted;
 use crate::compress;
@@ -20,8 +20,8 @@ use vykar_types::chunk_id::ChunkHasher;
 use vykar_types::error::{Result, VykarError};
 use vykar_types::pack_id::PackId;
 
-use super::plan::PlannedFile;
-use super::read_groups::ReadGroup;
+use super::plan::{PlannedFile, WriteTarget};
+use super::read_groups::{PlannedBlob, ReadGroup};
 use super::{MAX_OPEN_FILES_PER_GROUP, MAX_WRITE_BATCH};
 
 /// Relaxed poll of the external cancellation flag. Kept separate from the
@@ -32,29 +32,104 @@ fn is_shutting_down(shutdown: Option<&AtomicBool>) -> bool {
     shutdown.is_some_and(|f| f.load(Ordering::Relaxed))
 }
 
-/// Join every scoped worker of a fail-fast pass, returning the first error
-/// observed (a worker `Err`, or a panic reported as `panic_msg`) and `Ok(())`
-/// only if all of them succeeded. Any error also raises `cancelled`, so
-/// workers still joining stop claiming work instead of finishing a pass whose
-/// result is already discarded.
+/// A restore-worker failure, classified by where it came from.
+///
+/// `Source` is repository data that could not be read or decoded; continue
+/// mode downgrades it to a damaged file. `Fatal` is everything else
+/// (destination I/O, interrupts, internal errors). The wrapped error is the
+/// untouched original in both cases.
+#[derive(Debug)]
+pub(super) enum ReadError {
+    Source(VykarError),
+    Fatal(VykarError),
+}
+
+impl ReadError {
+    /// Classify a source-side failure. An interrupt is never downgraded.
+    fn source(e: VykarError) -> Self {
+        if matches!(e, VykarError::Interrupted) {
+            Self::Fatal(e)
+        } else {
+            Self::Source(e)
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn into_inner(self) -> VykarError {
+        match self {
+            Self::Source(e) | Self::Fatal(e) => e,
+        }
+    }
+}
+
+/// Unclassified errors (every `?` on a write path) are fatal by default.
+impl From<VykarError> for ReadError {
+    fn from(e: VykarError) -> Self {
+        Self::Fatal(e)
+    }
+}
+
+/// Continue-mode sink: file index → first reason it is damaged. Touched only
+/// on the failure path.
+#[derive(Default)]
+pub(super) struct BatchFailures(Mutex<HashMap<usize, String>>);
+
+impl BatchFailures {
+    pub(super) fn record(&self, targets: &[WriteTarget], reason: &VykarError) {
+        let reason = reason.to_string();
+        let mut map = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for t in targets {
+            map.entry(t.file_idx).or_insert_with(|| reason.clone());
+        }
+    }
+
+    pub(super) fn into_map(self) -> HashMap<usize, String> {
+        self.0
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// Pick the error to report from every failed worker: the first `Fatal` in
+/// join order if any, otherwise the first `Source`. When a destination failure
+/// and a corruption coincide, the destination error is the one a rerun would
+/// hit again, so it must not be reported as an unreadable source.
+fn select_error(errors: Vec<ReadError>) -> Option<ReadError> {
+    let mut first_source = None;
+    for e in errors {
+        match e {
+            ReadError::Fatal(_) => return Some(e),
+            ReadError::Source(_) if first_source.is_none() => first_source = Some(e),
+            ReadError::Source(_) => {}
+        }
+    }
+    first_source
+}
+
+/// Join every scoped worker, returning the error chosen by [`select_error`]
+/// (a panic counts as `Fatal`, reported as `panic_msg`) and `Ok(())` only if
+/// all of them succeeded. Any error also raises `cancelled`, so workers still
+/// joining stop claiming work instead of finishing a pass whose result is
+/// already discarded.
 fn join_workers(
-    handles: Vec<std::thread::ScopedJoinHandle<'_, Result<()>>>,
+    handles: Vec<std::thread::ScopedJoinHandle<'_, std::result::Result<(), ReadError>>>,
     cancelled: &AtomicBool,
     panic_msg: &str,
-) -> Result<()> {
-    let mut first_error: Option<VykarError> = None;
+) -> std::result::Result<(), ReadError> {
+    let mut errors = Vec::new();
     for handle in handles {
         let err = match handle.join() {
             Ok(Ok(())) => continue,
             Ok(Err(e)) => e,
-            Err(_panic) => VykarError::Other(panic_msg.to_string()),
+            Err(_panic) => ReadError::Fatal(VykarError::Other(panic_msg.to_string())),
         };
         cancelled.store(true, Ordering::Release);
-        if first_error.is_none() {
-            first_error = Some(err);
-        }
+        errors.push(err);
     }
-    match first_error {
+    match select_error(errors) {
         Some(e) => Err(e),
         None => Ok(()),
     }
@@ -199,6 +274,11 @@ fn lightest_bucket(bucket_bytes: &[u64]) -> usize {
         .map_or(0, |(i, _)| i)
 }
 
+/// Run every read group across a scoped worker pool.
+///
+/// With `failures` set (continue mode), source-side failures are recorded
+/// against the files they affect and the pass carries on; without it the first
+/// one stops the pass as `ReadError::Source`.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn execute_parallel_restore(
     files: &[PlannedFile],
@@ -209,7 +289,8 @@ pub(super) fn execute_parallel_restore(
     restore_concurrency: usize,
     verify_chunks: bool,
     shutdown: Option<&AtomicBool>,
-) -> Result<u64> {
+    failures: Option<&BatchFailures>,
+) -> std::result::Result<u64, ReadError> {
     check_interrupted(shutdown)?;
     if groups.is_empty() {
         return Ok(0);
@@ -229,7 +310,7 @@ pub(super) fn execute_parallel_restore(
             let bytes_written = &bytes_written;
             let cancelled = &cancelled;
 
-            handles.push(s.spawn(move || -> Result<()> {
+            handles.push(s.spawn(move || -> std::result::Result<(), ReadError> {
                 let mut data_buf = Vec::new();
                 let mut decrypt_buf = Vec::new();
                 let mut decompress_buf = Vec::new();
@@ -252,6 +333,7 @@ pub(super) fn execute_parallel_restore(
                         verify_chunks,
                         chunk_hasher,
                         shutdown,
+                        failures,
                     ) {
                         cancelled.store(true, Ordering::Release);
                         return Err(e);
@@ -280,12 +362,51 @@ pub(super) fn execute_parallel_restore(
     })
 }
 
+/// Per-pass state shared by every blob a worker decodes and writes.
+struct BlobCtx<'a> {
+    files: &'a [PlannedFile],
+    crypto: &'a dyn CryptoEngine,
+    bytes_written: &'a AtomicU64,
+    cancelled: &'a AtomicBool,
+    root: &'a Path,
+    verify_chunks: bool,
+    chunk_hasher: &'a ChunkHasher,
+    shutdown: Option<&'a AtomicBool>,
+    failures: Option<&'a BatchFailures>,
+}
+
+impl BlobCtx<'_> {
+    fn stopping(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire) || is_shutting_down(self.shutdown)
+    }
+
+    /// Record a source-side failure for `targets` in continue mode, or turn it
+    /// into the error that stops the pass in strict mode.
+    fn source_failure(
+        &self,
+        targets: &[WriteTarget],
+        e: VykarError,
+    ) -> std::result::Result<(), ReadError> {
+        match (self.failures, ReadError::source(e)) {
+            (Some(f), ReadError::Source(e)) => {
+                f.record(targets, &e);
+                Ok(())
+            }
+            (_, err) => Err(err),
+        }
+    }
+}
+
 /// Process a single coalesced read group: download the range, decrypt and
 /// decompress each blob, then write the plaintext data to target files.
 ///
 /// `data_buf`, `decrypt_buf`, and `decompress_buf` are caller-owned scratch
 /// buffers reused across groups within the same thread, reducing per-group
 /// allocation churn. The caller caps retained capacity at 2 MiB between groups.
+///
+/// In continue mode a failed group read is retried blob by blob: a short read
+/// is an `Err` by the storage contract, so otherwise one truncated pack would
+/// take down every blob of a 16 MiB coalesced group.
 #[allow(clippy::too_many_arguments)]
 fn process_read_group(
     group: &ReadGroup,
@@ -301,97 +422,148 @@ fn process_read_group(
     verify_chunks: bool,
     chunk_hasher: &ChunkHasher,
     shutdown: Option<&AtomicBool>,
-) -> Result<()> {
-    if cancelled.load(Ordering::Acquire) || is_shutting_down(shutdown) {
+    failures: Option<&BatchFailures>,
+) -> std::result::Result<(), ReadError> {
+    let ctx = BlobCtx {
+        files,
+        crypto,
+        bytes_written,
+        cancelled,
+        root,
+        verify_chunks,
+        chunk_hasher,
+        shutdown,
+        failures,
+    };
+    if ctx.stopping() {
         return Ok(());
     }
 
     let pack_key = group.pack_id.storage_key();
     let read_len = group.read_end - group.read_start;
 
-    if !storage.get_range_into(&pack_key, group.read_start, read_len, data_buf)? {
-        return Err(VykarError::Other(format!(
-            "pack not found: {}",
-            group.pack_id
-        )));
+    match storage.get_range_into(&pack_key, group.read_start, read_len, data_buf) {
+        Ok(true) => process_blobs(
+            &ctx,
+            &group.pack_id,
+            group.read_start,
+            &group.blobs,
+            data_buf,
+            decrypt_buf,
+            decompress_buf,
+        ),
+        Ok(false) => {
+            if failures.is_none() {
+                return Err(ReadError::source(pack_not_found(&group.pack_id)));
+            }
+            for blob in &group.blobs {
+                ctx.source_failure(&blob.targets, pack_not_found(&group.pack_id))?;
+            }
+            Ok(())
+        }
+        Err(e) => {
+            if failures.is_none() || matches!(e, VykarError::Interrupted) {
+                return Err(ReadError::source(e));
+            }
+            if let [blob] = &group.blobs[..] {
+                return ctx.source_failure(&blob.targets, e);
+            }
+            // Blobs are sorted by offset, so a truncated pack fails on every
+            // blob from the cut onwards; stopping after a short run of
+            // failures keeps that salvage while bounding a backend outage to
+            // 1 + MAX_CONSECUTIVE_BLOB_READ_ERRORS requests per group.
+            let mut consecutive = 0;
+            for (i, blob) in group.blobs.iter().enumerate() {
+                if ctx.stopping() {
+                    return Ok(());
+                }
+                let err = match storage.get_range_into(
+                    &pack_key,
+                    blob.pack_offset,
+                    u64::from(blob.stored_size),
+                    data_buf,
+                ) {
+                    Ok(true) => {
+                        consecutive = 0;
+                        process_blobs(
+                            &ctx,
+                            &group.pack_id,
+                            blob.pack_offset,
+                            std::slice::from_ref(blob),
+                            data_buf,
+                            decrypt_buf,
+                            decompress_buf,
+                        )?;
+                        continue;
+                    }
+                    Ok(false) => pack_not_found(&group.pack_id),
+                    Err(e) => e,
+                };
+                consecutive += 1;
+                if consecutive < MAX_CONSECUTIVE_BLOB_READ_ERRORS {
+                    ctx.source_failure(&blob.targets, err)?;
+                    continue;
+                }
+                let msg = format!(
+                    "{err} (rest of the read group not retried after \
+                     {consecutive} consecutive failures)"
+                );
+                ctx.source_failure(&blob.targets, err)?;
+                for rest in group.blobs.get(i + 1..).unwrap_or_default() {
+                    ctx.source_failure(&rest.targets, VykarError::Other(msg.clone()))?;
+                }
+                return Ok(());
+            }
+            Ok(())
+        }
     }
-    let data = &data_buf[..];
+}
 
+/// Per-blob retries of a failed group read stop after this many consecutive
+/// storage failures; the remaining blobs of the group are marked damaged.
+const MAX_CONSECUTIVE_BLOB_READ_ERRORS: usize = 3;
+
+fn pack_not_found(pack_id: &PackId) -> VykarError {
+    VykarError::Other(format!("pack not found: {pack_id}"))
+}
+
+/// Decode and write `blobs`, all located in `data`, which holds the pack bytes
+/// starting at `read_start`.
+fn process_blobs(
+    ctx: &BlobCtx<'_>,
+    pack_id: &PackId,
+    read_start: u64,
+    blobs: &[PlannedBlob],
+    data: &[u8],
+    decrypt_buf: &mut Vec<u8>,
+    decompress_buf: &mut Vec<u8>,
+) -> std::result::Result<(), ReadError> {
+    let (files, bytes_written, root) = (ctx.files, ctx.bytes_written, ctx.root);
     let mut file_handles = LruHandles::new();
 
     // Write accumulator — batches consecutive same-file writes into one syscall.
     // Pre-allocated to MAX_WRITE_BATCH; reused across sequences within this group.
     let mut pw = PendingWrite::new();
 
-    for blob in &group.blobs {
-        if cancelled.load(Ordering::Acquire) || is_shutting_down(shutdown) {
+    for blob in blobs {
+        if ctx.stopping() {
             // Dropping `pw` loses buffered data, but the caller will
             // clean up the temp restore root on error/cancellation so
             // no partial files reach the final destination.
             return Ok(());
         }
 
-        let local_offset = (blob.pack_offset - group.read_start) as usize;
-        let local_end = local_offset + blob.stored_size as usize;
-
-        if local_end > data.len() {
-            return Err(VykarError::Other(format!(
-                "blob extends beyond downloaded range in pack {}",
-                group.pack_id
-            )));
-        }
-
-        let raw = data
-            .get(local_offset..local_end)
-            .expect("local_end <= data.len() (checked above)");
-        unpack_object_expect_with_context_into(
-            raw,
-            ObjectType::ChunkData,
-            blob.chunk_id.as_bytes(),
-            crypto,
+        if let Err(e) = decode_blob(
+            ctx,
+            pack_id,
+            read_start,
+            blob,
+            data,
             decrypt_buf,
-        )
-        .map_err(|e| {
-            VykarError::Other(format!(
-                "chunk {} in pack {} (offset {}, size {}): {e}",
-                blob.chunk_id, group.pack_id, blob.pack_offset, blob.stored_size
-            ))
-        })?;
-        compress::decompress_into_with_hint(
-            decrypt_buf,
-            Some(blob.expected_size as usize),
             decompress_buf,
-        )
-        .map_err(|e| {
-            VykarError::Other(format!(
-                "chunk {} in pack {} (offset {}, size {}): {e}",
-                blob.chunk_id, group.pack_id, blob.pack_offset, blob.stored_size
-            ))
-        })?;
-
-        if decompress_buf.len() != blob.expected_size as usize {
-            return Err(VykarError::InvalidFormat(format!(
-                "chunk {} in pack {} (offset {}, size {}) size mismatch after restore decode: \
-                 expected {} bytes, got {} bytes",
-                blob.chunk_id,
-                group.pack_id,
-                blob.pack_offset,
-                blob.stored_size,
-                blob.expected_size,
-                decompress_buf.len()
-            )));
-        }
-
-        // Without AEAD, the chunk ID is the only checksum on chunk data.
-        if verify_chunks || !crypto.is_encrypting() {
-            verify_chunk_id(
-                chunk_hasher,
-                &blob.chunk_id,
-                decompress_buf,
-                &group.pack_id,
-                blob.pack_offset,
-                blob.stored_size,
-            )?;
+        ) {
+            ctx.source_failure(&blob.targets, e)?;
+            continue;
         }
 
         for target in &blob.targets {
@@ -444,6 +616,77 @@ fn process_read_group(
     // Flush any remaining pending write.
     flush_pending(&mut pw, &mut file_handles, files, bytes_written, root)?;
 
+    Ok(())
+}
+
+/// Unpack, decompress and verify one blob into `decompress_buf`. Every error
+/// here is source-side.
+fn decode_blob(
+    ctx: &BlobCtx<'_>,
+    pack_id: &PackId,
+    read_start: u64,
+    blob: &PlannedBlob,
+    data: &[u8],
+    decrypt_buf: &mut Vec<u8>,
+    decompress_buf: &mut Vec<u8>,
+) -> Result<()> {
+    let local_offset = (blob.pack_offset - read_start) as usize;
+    let local_end = local_offset + blob.stored_size as usize;
+
+    let raw = data.get(local_offset..local_end).ok_or_else(|| {
+        VykarError::Other(format!(
+            "blob extends beyond downloaded range in pack {pack_id}"
+        ))
+    })?;
+    unpack_object_expect_with_context_into(
+        raw,
+        ObjectType::ChunkData,
+        blob.chunk_id.as_bytes(),
+        ctx.crypto,
+        decrypt_buf,
+    )
+    .map_err(|e| {
+        VykarError::Other(format!(
+            "chunk {} in pack {} (offset {}, size {}): {e}",
+            blob.chunk_id, pack_id, blob.pack_offset, blob.stored_size
+        ))
+    })?;
+    compress::decompress_into_with_hint(
+        decrypt_buf,
+        Some(blob.expected_size as usize),
+        decompress_buf,
+    )
+    .map_err(|e| {
+        VykarError::Other(format!(
+            "chunk {} in pack {} (offset {}, size {}): {e}",
+            blob.chunk_id, pack_id, blob.pack_offset, blob.stored_size
+        ))
+    })?;
+
+    if decompress_buf.len() != blob.expected_size as usize {
+        return Err(VykarError::InvalidFormat(format!(
+            "chunk {} in pack {} (offset {}, size {}) size mismatch after restore decode: \
+             expected {} bytes, got {} bytes",
+            blob.chunk_id,
+            pack_id,
+            blob.pack_offset,
+            blob.stored_size,
+            blob.expected_size,
+            decompress_buf.len()
+        )));
+    }
+
+    // Without AEAD, the chunk ID is the only checksum on chunk data.
+    if ctx.verify_chunks || !ctx.crypto.is_encrypting() {
+        verify_chunk_id(
+            ctx.chunk_hasher,
+            &blob.chunk_id,
+            decompress_buf,
+            pack_id,
+            blob.pack_offset,
+            blob.stored_size,
+        )?;
+    }
     Ok(())
 }
 
@@ -606,7 +849,9 @@ mod tests {
             false,
             &test_chunk_hasher(),
             None,
+            None,
         )
+        .map_err(ReadError::into_inner)
         .unwrap_err()
         .to_string();
         assert!(
@@ -672,6 +917,7 @@ mod tests {
             temp.path(),
             false,
             &test_chunk_hasher(),
+            None,
             None,
         )
         .unwrap();
@@ -757,6 +1003,7 @@ mod tests {
             temp.path(),
             false,
             &test_chunk_hasher(),
+            None,
             None,
         )
         .unwrap();
@@ -855,6 +1102,7 @@ mod tests {
             false,
             &test_chunk_hasher(),
             None,
+            None,
         )
         .unwrap();
 
@@ -931,6 +1179,7 @@ mod tests {
             false,
             &test_chunk_hasher(),
             None,
+            None,
         )
         .unwrap();
 
@@ -999,6 +1248,7 @@ mod tests {
             true,
             &test_chunk_hasher(),
             None,
+            None,
         )
         .unwrap();
 
@@ -1029,7 +1279,9 @@ mod tests {
             verify_chunks,
             crypto.chunk_hasher(),
             None,
-        )?;
+            None,
+        )
+        .map_err(ReadError::into_inner)?;
         Ok(bytes_written.load(Ordering::Relaxed))
     }
 
@@ -1275,7 +1527,9 @@ mod tests {
             2,
             false,
             Some(&shutdown),
+            None,
         )
+        .map_err(ReadError::into_inner)
         .unwrap_err();
 
         assert!(
@@ -1343,7 +1597,9 @@ mod tests {
             2,
             false,
             Some(&shutdown),
+            None,
         )
+        .map_err(ReadError::into_inner)
         .unwrap_err();
 
         assert!(
@@ -1351,5 +1607,400 @@ mod tests {
             "expected Interrupted, got: {err}"
         );
         assert!(!out.exists(), "no data may have been written");
+    }
+
+    // -----------------------------------------------------------------------
+    // Error classification and continue-on-error
+    // -----------------------------------------------------------------------
+
+    fn file(name: &str, size: u64) -> PlannedFile {
+        PlannedFile {
+            rel_path: PathBuf::from(name),
+            total_size: size,
+            mode: 0o644,
+            mtime: 0,
+            uid: 0,
+            gid: 0,
+            xattrs: None,
+        }
+    }
+
+    fn target(file_idx: usize) -> SmallVec<[WriteTarget; 1]> {
+        smallvec::smallvec![WriteTarget {
+            file_idx,
+            file_offset: 0,
+        }]
+    }
+
+    /// Flip one payload byte of a plaintext packed blob (same length, so only
+    /// the chunk-ID check catches it).
+    fn corrupt(packed: &mut [u8], payload: &[u8]) {
+        let pos = packed
+            .windows(payload.len())
+            .position(|w| w == payload)
+            .expect("plaintext payload is stored verbatim");
+        packed[pos + payload.len() / 2] ^= 0x01;
+    }
+
+    /// A plaintext pack with one blob per payload, blob `i` targeting file `i`.
+    /// Blobs listed in `corrupt_idx` have a flipped byte.
+    fn pack_of(
+        pack_id: PackId,
+        payloads: &[&[u8]],
+        corrupt_idx: &[usize],
+    ) -> (Vec<u8>, ReadGroup, Vec<PlannedFile>) {
+        let crypto = PlaintextEngine::new(test_chunk_hasher());
+        let entries = payloads
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let cid = chunk_id_of(p);
+                let mut packed = pack_blob(cid, p, &crypto);
+                if corrupt_idx.contains(&i) {
+                    corrupt(&mut packed, p);
+                }
+                (cid, packed, p.len() as u32, target(i))
+            })
+            .collect();
+        let (data, group) = multi_blob_group(pack_id, entries);
+        let files = payloads
+            .iter()
+            .enumerate()
+            .map(|(i, p)| file(&format!("f{i}.bin"), p.len() as u64))
+            .collect();
+        (data, group, files)
+    }
+
+    fn storage_with(entries: &[(PackId, &[u8])]) -> Arc<dyn StorageBackend> {
+        let backend = Arc::new(MemoryBackend::new());
+        for (id, data) in entries {
+            backend.put(&id.storage_key(), data).unwrap();
+        }
+        backend
+    }
+
+    fn run_group_with(
+        group: &ReadGroup,
+        files: &[PlannedFile],
+        storage: &Arc<dyn StorageBackend>,
+        root: &std::path::Path,
+        failures: Option<&BatchFailures>,
+    ) -> std::result::Result<(), ReadError> {
+        let crypto = PlaintextEngine::new(test_chunk_hasher());
+        process_read_group(
+            group,
+            files,
+            storage,
+            &crypto,
+            &AtomicU64::new(0),
+            &AtomicBool::new(false),
+            &mut Vec::new(),
+            &mut Vec::new(),
+            &mut Vec::new(),
+            root,
+            false,
+            crypto.chunk_hasher(),
+            None,
+            failures,
+        )
+    }
+
+    fn failed_indices(f: BatchFailures) -> Vec<usize> {
+        let mut v: Vec<usize> = f.into_map().into_keys().collect();
+        v.sort_unstable();
+        v
+    }
+
+    #[test]
+    fn strict_decode_failure_is_source() {
+        let pack_id = dummy_pack_id(0x20);
+        let (data, group, files) = pack_of(pack_id, &[b"payload-strict-decode"], &[0]);
+        let storage = storage_with(&[(pack_id, &data)]);
+        let temp = tempdir().unwrap();
+        stage_files(temp.path(), &files);
+        let err = run_group_with(&group, &files, &storage, temp.path(), None).unwrap_err();
+        assert!(
+            matches!(&err, ReadError::Source(VykarError::InvalidFormat(m)) if m.contains("hash mismatch")),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn strict_missing_pack_is_source() {
+        let pack_id = dummy_pack_id(0x21);
+        let (_data, group, files) = pack_of(pack_id, &[b"payload-missing-pack"], &[]);
+        let storage = storage_with(&[]);
+        let temp = tempdir().unwrap();
+        stage_files(temp.path(), &files);
+        let err = run_group_with(&group, &files, &storage, temp.path(), None).unwrap_err();
+        assert!(
+            matches!(&err, ReadError::Source(e) if e.to_string().contains("pack not found")),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn missing_staged_file_is_fatal_in_both_modes() {
+        let pack_id = dummy_pack_id(0x22);
+        let (data, group, files) = pack_of(pack_id, &[b"payload-unstaged"], &[]);
+        let storage = storage_with(&[(pack_id, &data)]);
+        let temp = tempdir().unwrap();
+        // Not staged: the write path's open fails.
+        let err = run_group_with(&group, &files, &storage, temp.path(), None).unwrap_err();
+        assert!(matches!(err, ReadError::Fatal(_)), "got: {err:?}");
+
+        let failures = BatchFailures::default();
+        let err =
+            run_group_with(&group, &files, &storage, temp.path(), Some(&failures)).unwrap_err();
+        assert!(matches!(err, ReadError::Fatal(_)), "got: {err:?}");
+        assert!(failed_indices(failures).is_empty());
+    }
+
+    #[test]
+    fn interrupted_is_never_source() {
+        assert!(matches!(
+            ReadError::source(VykarError::Interrupted),
+            ReadError::Fatal(VykarError::Interrupted)
+        ));
+        assert!(matches!(
+            ReadError::source(VykarError::Other("x".into())),
+            ReadError::Source(_)
+        ));
+    }
+
+    #[test]
+    fn select_error_prefers_fatal_then_first_source() {
+        let src = |m: &str| ReadError::Source(VykarError::Other(m.into()));
+        let fatal = || ReadError::Fatal(VykarError::Other("fatal".into()));
+        let msg = |e: Option<ReadError>| e.unwrap().into_inner().to_string();
+
+        assert!(matches!(
+            select_error(vec![src("a"), fatal()]),
+            Some(ReadError::Fatal(_))
+        ));
+        assert!(matches!(
+            select_error(vec![fatal(), src("a")]),
+            Some(ReadError::Fatal(_))
+        ));
+        let first = select_error(vec![src("a"), src("b")]);
+        assert!(matches!(first, Some(ReadError::Source(_))));
+        assert_eq!(msg(first), "a");
+        assert!(select_error(Vec::new()).is_none());
+    }
+
+    /// Holds every range read until both workers have issued one, then fails
+    /// it: `panic_key` panics (a `Fatal` worker failure), any other key returns
+    /// a storage error (`Source`). Both failures happen with no cancellation
+    /// check in between, so neither worker can stop the other early.
+    struct BarrierBackend {
+        inner: MemoryBackend,
+        barrier: std::sync::Barrier,
+        panic_key: String,
+    }
+
+    impl vykar_storage::InnerBackend for BarrierBackend {
+        fn inner_backend(&self) -> &dyn StorageBackend {
+            &self.inner
+        }
+    }
+
+    vykar_storage::delegate_storage_backend! {
+        for BarrierBackend;
+        except [get_range_into];
+
+        fn get_range_into(
+            &self,
+            key: &str,
+            _offset: u64,
+            _length: u64,
+            _buf: &mut Vec<u8>,
+        ) -> vykar_types::error::Result<bool> {
+            self.barrier.wait();
+            if key == self.panic_key {
+                simulated_worker_panic();
+            }
+            Err(VykarError::Other("simulated read error".into()))
+        }
+    }
+
+    fn simulated_worker_panic() -> ! {
+        panic!("simulated worker failure")
+    }
+
+    /// A source failure and a fatal failure in concurrent workers must surface
+    /// as the fatal one, in either join order.
+    #[test]
+    fn concurrent_source_and_fatal_failure_reports_fatal() {
+        for swap in [false, true] {
+            let crypto = PlaintextEngine::new(test_chunk_hasher());
+            let (pack_src, pack_fatal) = (dummy_pack_id(0x30), dummy_pack_id(0x31));
+            let storage: Arc<dyn StorageBackend> = Arc::new(BarrierBackend {
+                inner: MemoryBackend::new(),
+                barrier: std::sync::Barrier::new(2),
+                panic_key: pack_fatal.storage_key(),
+            });
+            let files = vec![file("a.bin", 8), file("b.bin", 8)];
+            let temp = tempdir().unwrap();
+            stage_files(temp.path(), &files);
+
+            let packed = [0u8; 16];
+            let mut groups = vec![
+                single_blob_group(pack_src, dummy_chunk_id(1), &packed, 8, target(0)),
+                single_blob_group(pack_fatal, dummy_chunk_id(2), &packed, 8, target(1)),
+            ];
+            if swap {
+                groups.reverse();
+            }
+            // The barrier needs both groups in separate workers; fail rather
+            // than hang if partitioning ever puts them together.
+            let sizes: Vec<u64> = groups.iter().map(|g| g.read_end - g.read_start).collect();
+            let probe = sizes
+                .iter()
+                .map(|&n| ReadGroup {
+                    pack_id: dummy_pack_id(0),
+                    read_start: 0,
+                    read_end: n,
+                    blobs: Vec::new(),
+                })
+                .collect();
+            assert_eq!(
+                partition_groups(probe, 2).len(),
+                2,
+                "groups must not share a worker"
+            );
+            let err = execute_parallel_restore(
+                &files,
+                groups,
+                &storage,
+                &crypto,
+                temp.path(),
+                2,
+                false,
+                None,
+                None,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(&err, ReadError::Fatal(e) if e.to_string().contains("panicked")),
+                "swap={swap}: got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn continue_records_only_the_corrupt_blobs_targets() {
+        let pack_id = dummy_pack_id(0x40);
+        let payloads: [&[u8]; 3] = [
+            b"payload-zero-intact",
+            b"payload-one-corrupt",
+            b"payload-two-intact",
+        ];
+        let (data, group, files) = pack_of(pack_id, &payloads, &[1]);
+        let storage = storage_with(&[(pack_id, &data)]);
+        let temp = tempdir().unwrap();
+        stage_files(temp.path(), &files);
+
+        let failures = BatchFailures::default();
+        run_group_with(&group, &files, &storage, temp.path(), Some(&failures)).unwrap();
+        let map = failures.into_map();
+        assert_eq!(map.keys().copied().collect::<Vec<_>>(), vec![1]);
+        assert!(map[&1].contains("hash mismatch"), "got: {}", map[&1]);
+        assert_eq!(
+            std::fs::read(temp.path().join("f0.bin")).unwrap(),
+            payloads[0]
+        );
+        assert_eq!(
+            std::fs::read(temp.path().join("f2.bin")).unwrap(),
+            payloads[2]
+        );
+    }
+
+    #[test]
+    fn continue_missing_pack_records_every_target() {
+        let pack_id = dummy_pack_id(0x41);
+        let payloads: [&[u8]; 2] = [b"payload-missing-a", b"payload-missing-b"];
+        let (_data, group, files) = pack_of(pack_id, &payloads, &[]);
+        let storage = storage_with(&[]);
+        let temp = tempdir().unwrap();
+        stage_files(temp.path(), &files);
+
+        let failures = BatchFailures::default();
+        run_group_with(&group, &files, &storage, temp.path(), Some(&failures)).unwrap();
+        assert_eq!(failed_indices(failures), vec![0, 1]);
+    }
+
+    /// The coalesced read fails as a short read; the per-blob retry still
+    /// salvages every blob that lies before the truncation point.
+    #[test]
+    fn continue_truncated_pack_salvages_leading_blobs() {
+        let pack_id = dummy_pack_id(0x42);
+        let payloads: [&[u8]; 3] = [
+            b"payload-before-cut",
+            b"payload-across-cut",
+            b"payload-after-cut",
+        ];
+        let (data, group, files) = pack_of(pack_id, &payloads, &[]);
+        let cut = (group.blobs[1].pack_offset + 4) as usize;
+        let storage = storage_with(&[(pack_id, &data[..cut])]);
+        let temp = tempdir().unwrap();
+        stage_files(temp.path(), &files);
+
+        // Strict mode: the whole group fails as unreadable source.
+        let err = run_group_with(&group, &files, &storage, temp.path(), None).unwrap_err();
+        assert!(matches!(err, ReadError::Source(_)), "got: {err:?}");
+
+        let failures = BatchFailures::default();
+        run_group_with(&group, &files, &storage, temp.path(), Some(&failures)).unwrap();
+        assert_eq!(failed_indices(failures), vec![1, 2]);
+        assert_eq!(
+            std::fs::read(temp.path().join("f0.bin")).unwrap(),
+            payloads[0]
+        );
+    }
+
+    #[test]
+    fn continue_shared_chunk_damages_every_file_using_it() {
+        let pack_id = dummy_pack_id(0x43);
+        let payload = b"payload-shared-and-corrupt";
+        let (data, mut group, _) = pack_of(pack_id, &[payload], &[0]);
+        group.blobs[0].targets.push(WriteTarget {
+            file_idx: 1,
+            file_offset: 0,
+        });
+        let files = vec![
+            file("a.bin", payload.len() as u64),
+            file("b.bin", payload.len() as u64),
+        ];
+        let storage = storage_with(&[(pack_id, &data)]);
+        let temp = tempdir().unwrap();
+        stage_files(temp.path(), &files);
+
+        let failures = BatchFailures::default();
+        run_group_with(&group, &files, &storage, temp.path(), Some(&failures)).unwrap();
+        assert_eq!(failed_indices(failures), vec![0, 1]);
+    }
+
+    /// A backend that fails every read (an outage) costs the coalesced read
+    /// plus a bounded number of per-blob retries, not one request per blob.
+    #[test]
+    fn continue_outage_bounds_per_blob_retries() {
+        let pack_id = dummy_pack_id(0x44);
+        let payloads: Vec<Vec<u8>> = (0..10u8).map(|i| vec![i; 64]).collect();
+        let refs: Vec<&[u8]> = payloads.iter().map(Vec::as_slice).collect();
+        let (_data, group, files) = pack_of(pack_id, &refs, &[]);
+        let (backend, log) = crate::testutil::RecordingBackend::new();
+        // One byte: every range read past offset 0 is a short read (`Err`).
+        backend.put(&pack_id.storage_key(), &[0u8]).unwrap();
+        let storage: Arc<dyn StorageBackend> = Arc::new(backend);
+        let temp = tempdir().unwrap();
+        stage_files(temp.path(), &files);
+
+        let failures = BatchFailures::default();
+        run_group_with(&group, &files, &storage, temp.path(), Some(&failures)).unwrap();
+        assert_eq!(failed_indices(failures), (0..10).collect::<Vec<_>>());
+        assert_eq!(
+            log.get_range_count(),
+            1 + MAX_CONSECUTIVE_BLOB_READ_ERRORS as u64
+        );
     }
 }

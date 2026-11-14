@@ -245,6 +245,7 @@ pub(crate) fn dispatch_command(
             dest,
             pattern,
             verify,
+            continue_on_error,
             ..
         } => cmd::restore::run_restore(
             cfg,
@@ -253,9 +254,9 @@ pub(crate) fn dispatch_command(
             dest.clone(),
             pattern.clone(),
             *verify,
+            *continue_on_error,
             shutdown,
-        )
-        .map(|()| false),
+        ),
         Commands::Delete {
             yes_delete_this_repo,
             ..

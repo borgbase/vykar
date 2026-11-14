@@ -614,6 +614,78 @@ fn cli_restore_detects_flipped_byte_in_plaintext_pack() {
     assert!(!restore.join("flip.txt").exists());
 }
 
+/// Strict restore of a damaged repo exits 1 with a hint; `--continue-on-error`
+/// restores the intact file, lists the damaged one and exits 3.
+#[test]
+fn cli_restore_continue_on_error_skips_damaged_file() {
+    let fx = CliFixture::new();
+    let config = format!(
+        "repositories:\n  - url: {}\nencryption:\n  mode: none\ncompression:\n  algorithm: none\nsources: []\n",
+        yaml_quote_path(&fx.repo_dir)
+    );
+    std::fs::write(&fx.config_path, config).unwrap();
+    let content = b"continue-on-error-corruption-marker-0123456789abcdef\n";
+    std::fs::write(fx.source_a.join("bad.txt"), content).unwrap();
+    std::fs::write(fx.source_a.join("good.txt"), b"intact content\n").unwrap();
+
+    let cfg = fx.config_path.to_string_lossy().to_string();
+    let source = fx.source_a.to_string_lossy().to_string();
+    fx.run_ok(&["--config", &cfg, "init"]);
+    fx.run_ok(&["--config", &cfg, "backup", &source]);
+
+    let pack_path = std::fs::read_dir(fx.repo_dir.join("packs"))
+        .unwrap()
+        .flatten()
+        .flat_map(|shard| std::fs::read_dir(shard.path()).unwrap().flatten())
+        .map(|e| e.path())
+        .find(|p| {
+            std::fs::read(p)
+                .unwrap()
+                .windows(content.len())
+                .any(|w| w == content)
+        })
+        .unwrap();
+    let mut pack = std::fs::read(&pack_path).unwrap();
+    let pos = pack
+        .windows(content.len())
+        .position(|w| w == content)
+        .unwrap();
+    pack[pos + content.len() / 2] ^= 0x01;
+    std::fs::write(&pack_path, pack).unwrap();
+
+    let strict = fx._tmp.path().join("restore-strict");
+    let strict_str = strict.to_string_lossy().to_string();
+    let out = fx.run(&["--config", &cfg, "restore", "latest", &strict_str]);
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(1), "stderr:\n{err}");
+    assert!(err.contains("no restored files were published"), "{err}");
+    assert!(err.contains("hint: --continue-on-error"), "{err}");
+
+    let lenient = fx._tmp.path().join("restore-continue");
+    let lenient_str = lenient.to_string_lossy().to_string();
+    let out = fx.run(&[
+        "--config",
+        &cfg,
+        "restore",
+        "latest",
+        &lenient_str,
+        "--continue-on-error",
+    ]);
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(3), "stderr:\n{err}");
+    let damaged: Vec<&str> = err.lines().filter(|l| l.starts_with("damaged: ")).collect();
+    assert_eq!(damaged.len(), 1, "{err}");
+    assert!(damaged[0].contains("bad.txt") && damaged[0].contains("hash mismatch"));
+    assert!(
+        !lenient.join("bad.txt").exists(),
+        "damaged file must be absent"
+    );
+    assert_eq!(
+        std::fs::read(lenient.join("good.txt")).unwrap(),
+        b"intact content\n"
+    );
+}
+
 #[test]
 fn cli_restore_latest_alias() {
     let fx = CliFixture::new();

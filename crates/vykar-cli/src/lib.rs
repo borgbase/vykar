@@ -44,7 +44,8 @@ use crate::resolve::{
 
 /// Exit code: hard error (backup failed, config error, etc.).
 pub(crate) const EXIT_ERROR: u8 = 1;
-/// Exit code: partial success (backup completed but some files were skipped).
+/// Exit code: partial success (backup completed but some files were skipped,
+/// or `restore --continue-on-error` left out damaged files).
 pub(crate) const EXIT_PARTIAL: u8 = 3;
 /// Exit code: cooperative shutdown via signal (SIGINT/SIGTERM).
 pub(crate) const EXIT_INTERRUPTED: u8 = 130;

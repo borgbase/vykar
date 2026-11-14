@@ -98,6 +98,27 @@ vykar restore a1b2c3d4 /tmp/restored --pattern '*.pdf'
 
 > **Important:** patterns are matched against snapshot-relative paths, not absolute filesystem paths. `--pattern '/home/user/documents/reports/*'` silently matches nothing. Drop the leading `/` and use the form `vykar snapshot list` shows.
 
+## Restore from a damaged repository
+
+By default a restore is all-or-nothing: if any chunk cannot be read or decoded, the run aborts with `no restored files were published` and the destination stays empty.
+
+To salvage everything that is still intact, add `--continue-on-error`:
+
+```bash
+vykar restore latest /tmp/restored --continue-on-error
+```
+
+- A file counts as damaged when any of its chunks is missing from the index, its pack is missing or unreadable (including a truncated pack), or a chunk fails to decrypt, decompress or verify. A chunk shared by several files damages all of them, and every hard link to a damaged file is damaged too.
+- Damaged files are left out of the destination entirely, never written partially or as an empty placeholder. Everything that is restored has been fully read and verified.
+- Each damaged file is printed on stderr as `damaged: <path>: <reason>`, followed by a count. At most 10,000 are listed; the count is always exact.
+- The exit status is `3` when at least one file was skipped, and `0` when none was.
+- Destination-side failures (disk full, permission errors), a damaged snapshot item list, and conflicting entries in the snapshot still abort the run.
+- Remote storage errors count as damage too: an SFTP or S3 outage in the middle of a run produces a long damaged list and exit status 3 rather than an abort. Re-run the restore once the backend is reachable.
+
+Afterwards, run `vykar check --verify-data` to find out what else in the repository is affected.
+
+The desktop app always restores strictly; use the command line to restore around damage.
+
 ## Browse via WebDAV and browser UI (mount)
 
 Browse snapshot contents via a local read-only WebDAV server. The same endpoint also serves a built-in HTML browser UI.

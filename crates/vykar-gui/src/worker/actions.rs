@@ -7,6 +7,7 @@ use vykar_core::commands::find::{FileStatus, FindFilter, FindScope};
 use crate::messages::{AppCommand, DiffResultRow, FindResultRow, FindSnapshotGroup, UiEvent};
 use crate::repo_helpers::{find_repo_for_snapshot, send_log, PassphraseRun};
 use vykar_common::display::format_bytes;
+use vykar_types::error::VykarError;
 
 use super::shared::{with_repo_op, OpGuard};
 use super::WorkerContext;
@@ -82,10 +83,18 @@ pub(super) fn handle_restore_selected(
                     });
                 }
                 Err(e) => {
-                    guard.fail(format!("Restore failed: {e}"));
+                    let message = if matches!(e, VykarError::RestoreSourceUnreadable(_)) {
+                        format!(
+                            "{e}. To restore the intact files, run \
+                             `vykar restore --continue-on-error` from the command line."
+                        )
+                    } else {
+                        e.to_string()
+                    };
+                    guard.fail(format!("Restore failed: {message}"));
                     let _ = ctx.ui_tx.send(UiEvent::RestoreFinished {
                         success: false,
-                        message: format!("{e}"),
+                        message,
                     });
                 }
             }

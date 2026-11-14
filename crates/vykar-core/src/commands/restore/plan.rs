@@ -567,7 +567,7 @@ pub(super) fn stage_batch_files(
     Ok(())
 }
 
-fn create_exclusive(path: &Path) -> std::io::Result<std::fs::File> {
+pub(super) fn create_exclusive(path: &Path) -> std::io::Result<std::fs::File> {
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);
     #[cfg(unix)]
@@ -1797,5 +1797,51 @@ mod tests {
         let md = std::fs::symlink_metadata(fx.dest.join("a/f")).unwrap();
         assert!(md.is_file());
         assert_eq!(md.len(), 100, "staging sizes non-empty files");
+    }
+
+    /// Continue mode: plan + stage with every file treated as damaged, i.e.
+    /// truncated to a tombstone right after its batch, as the orchestrator does.
+    fn plan_and_tombstone(items: &[Item], dest: &Path) -> Result<StreamPlan> {
+        let stream = serialize_items(items);
+        let mut stats = RestoreStats::default();
+        let mut group_reps: HashMap<HardlinkId, RepInfo> = HashMap::new();
+        let mut pending_links: Vec<PendingLink> = Vec::new();
+        let mut tombstones: HashSet<PathBuf> = HashSet::new();
+        stream_and_plan(
+            &stream,
+            dest,
+            &mut |_| true,
+            false,
+            &mut stats,
+            1,
+            &mut group_reps,
+            &mut pending_links,
+            None,
+            |mut files, _chunks, verified, stats| {
+                stage_batch_files(&files, dest, verified, None)?;
+                let failed = (0..files.len())
+                    .map(|i| (i, "damaged".to_string()))
+                    .collect();
+                super::super::discard_damaged(&mut files, &failed, dest, &mut tombstones, stats)
+            },
+        )
+    }
+
+    /// A dropped file keeps its name as a tombstone, so a later file, symlink
+    /// or directory at the same path still aborts, as in strict mode.
+    #[test]
+    fn conflict_after_damaged_file_is_still_detected() {
+        let later = [
+            make_file_item("x", vec![(0xBB, 50)]),
+            make_symlink_item("x", "elsewhere"),
+            make_dir_item("x", 0o755),
+        ];
+        for item in later {
+            let fx = conflict_fixture();
+            let items = vec![make_file_item("x", vec![(0xAA, 100)]), item];
+            assert_conflict(plan_and_tombstone(&items, &fx.dest), "x");
+            let md = std::fs::symlink_metadata(fx.dest.join("x")).unwrap();
+            assert!(md.is_file() && md.len() == 0, "the tombstone must stay");
+        }
     }
 }

@@ -29,8 +29,8 @@ Below is a list of all available commands. Each command and subcommand provides 
 
 - `0`: Success
 - `1`: Error (command failed)
-- `3`: Partial success (backup completed, but one or more files were skipped)
+- `3`: Partial success (backup or restore completed, but one or more files were skipped)
 
-`vykar backup` and the default `vykar` workflow can return `3` when a backup succeeds with skipped unreadable/missing files.
+`vykar backup` and the default `vykar` workflow can return `3` when a backup succeeds with skipped unreadable/missing files. `vykar restore --continue-on-error` returns `3` when it left out damaged files (see [Restore from a damaged repository](restore.md#restore-from-a-damaged-repository)).
 
 A `before` hook that exits `75` [skips the run](configuration.md#skipping-a-run), and that exits `0`. So `vykar backup && ping` reports success with no new snapshot; for monitoring, ping from an `after_backup` hook instead.

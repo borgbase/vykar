@@ -227,6 +227,12 @@ pub enum VykarError {
     #[error("chunk not found in index: {0}")]
     ChunkNotInIndex(crate::chunk_id::ChunkId),
 
+    /// A restore aborted because repository data it needed could not be read
+    /// or decoded. The inner error is the original failure. Nothing was moved
+    /// into the destination; removing the staging tree is best-effort.
+    #[error("{0}; no restored files were published")]
+    RestoreSourceUnreadable(#[source] Box<VykarError>),
+
     #[error("decompression error: {0}")]
     Decompression(String),
 

@@ -1,8 +1,8 @@
-# Initialize and Set Up a Repository
+# Configure and Initialize
 
 ## Generate a configuration file
 
-Create a starter config
+Create a starter config:
 
 ```bash
 vykar config
@@ -14,16 +14,23 @@ Or write it to a specific path:
 vykar config --dest ~/.config/vykar/config.yaml
 ```
 
-## Repository format
+See [Config file locations](configuration.md#config-file-locations) for where vykar looks for it.
 
-`vykar init` always creates a **format v3** repository, whose chunk and pack IDs use BLAKE3. There is no flag or config key to choose otherwise. `vykar info` reports the format and hash of any repository.
+## Configure repositories and sources
 
-Existing **format v2** repositories (created by vykar 0.19 and earlier, using BLAKE2b) stay v2 for life and remain fully readable and writable — nothing needs migrating. The hash is part of every chunk's dedup identity and every pack's storage key, so it cannot be changed in place.
+Set the repository URL and the directories to back up:
 
-Two things to know before creating a new repository:
+```yaml
+repositories:
+  - label: "main"
+    url: "/backup/repo"
 
-- **Older vykar binaries cannot open it** (`unsupported repository version: 3`). If several machines share one repository, upgrade them together — or keep using the existing repository, which needs no coordination at all.
-- **A self-hosted `vykar-server` must be upgraded first** (0.20 or later). `init` checks this up front and refuses with a clear message rather than creating a repository whose first backup would fail.
+sources:
+  - "/home/user/documents"
+  - "/home/user/photos"
+```
+
+The URL selects the backend — a local path, S3, SFTP, or a REST server. See [Storage Backends](backends.md) for remote repositories and [Configuration](configuration.md) for all available options.
 
 ## Encryption
 
@@ -34,6 +41,35 @@ The passphrase is requested interactively at init time. You can also supply it v
 - `VYKAR_PASSPHRASE` environment variable
 - `passcommand` in the config (e.g. `passcommand: "pass show vykar"`)
 - `passphrase` in the config
+
+## Initialize the repository
+
+```bash
+vykar init
+```
+
+This creates the repository structure at the configured URL. For encrypted repositories, you will be prompted to enter a passphrase.
+
+If your config has multiple repositories, use `--repo` / `-R` to initialize one entry at a time:
+
+```bash
+vykar init --repo main
+```
+
+## Validate
+
+Confirm the repository was created:
+
+```bash
+vykar info
+```
+
+Run a first backup and check results:
+
+```bash
+vykar backup
+vykar list
+```
 
 ## Back up your repository key
 
@@ -75,52 +111,15 @@ the next time they are opened. If one copy rots, vykar opens off the other and
 localized corruption — **not** loss of the storage as a whole, so it
 complements an off-repository copy rather than replacing one.
 
-## Configure repositories and sources
+## Repository format
 
-Set the repository URL and the directories to back up:
+`vykar init` always creates a **format v3** repository, whose chunk and pack IDs use BLAKE3. There is no flag or config key to choose otherwise. `vykar info` reports the format and hash of any repository.
 
-```yaml
-repositories:
-  - label: "main"
-    url: "/backup/repo"
+Existing **format v2** repositories (created by vykar 0.19 and earlier, using BLAKE2b) stay v2 for life and remain fully readable and writable — nothing needs migrating. The hash is part of every chunk's dedup identity and every pack's storage key, so it cannot be changed in place.
 
-sources:
-  - "/home/user/documents"
-  - "/home/user/photos"
-```
+This matters in two situations:
 
-See [Configuration](configuration.md) for all available options.
+- **Older vykar binaries cannot open a v3 repository** (`unsupported repository version: 3`). If several machines share one repository, upgrade them together — or keep using the existing repository, which needs no coordination at all.
+- **A self-hosted `vykar-server` must be upgraded first** (0.20 or later). `init` checks this up front and refuses with a clear message rather than creating a repository whose first backup would fail.
 
-## Initialize the repository
-
-```bash
-vykar init
-```
-
-This creates the repository structure at the configured URL. For encrypted repositories, you will be prompted to enter a passphrase.
-
-If your config has multiple repositories, use `--repo` / `-R` to initialize one entry at a time:
-
-```bash
-vykar init --repo main
-```
-
-## Validate
-
-Confirm the repository was created:
-
-```bash
-vykar info
-```
-
-Run a first backup and check results:
-
-```bash
-vykar backup
-vykar list
-```
-
-## Next steps
-
-- [Make a Backup](backup.md)
-- [Configuration](configuration.md)
+Next: [Back Up](backup.md)

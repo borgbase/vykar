@@ -67,4 +67,8 @@ Restore files from a snapshot to a directory:
 vykar restore a1b2c3d4 /tmp/restored
 ```
 
-For backup options, snapshot browsing, and maintenance tasks, see the [workflow guides](backup.md).
+## Next steps
+
+- [Back up your repository key](init-setup.md#back-up-your-repository-key) -- the passphrase alone cannot open an encrypted repository
+- [Schedule backups](daemon.md) -- run unattended with systemd, launchd, or Docker
+- [Back Up](backup.md), [Restore](restore.md), and [Maintain the Repository](maintenance.md) cover each step in detail

@@ -450,15 +450,17 @@ hooks:
   after_backup:
     - >-
       apprise -t "Backup complete"
-      -b "vykar {command} finished for {repository}"
+      -b "vykar $VYKAR_COMMAND finished for $VYKAR_REPOSITORY"
       "gotify://hostname/token"
       "slack://tokenA/tokenB/tokenC"
   failed:
     - >-
       apprise -t "Backup failed"
-      -b "vykar {command} failed for {repository}: {error}"
+      -b "vykar $VYKAR_COMMAND failed for $VYKAR_REPOSITORY: $VYKAR_ERROR"
       "gotify://hostname/token"
 ```
+
+The message bodies use the `VYKAR_*` environment variables rather than `{placeholders}`, because a placeholder [must not appear inside quotes](configuration.md#variable-substitution).
 
 Common service URL examples:
 

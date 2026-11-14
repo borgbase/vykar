@@ -4,6 +4,13 @@ Vykar includes a desktop GUI for managing repositories, running backups, and bro
 
 [![Vykar GUI](images/gui-screenshot.png)](images/gui-screenshot.png)
 
+- Run backups on demand
+- List snapshots, browse their contents, and restore files
+- Run in the system tray with periodic background backups
+- Uses the same `vykar.yaml` as the CLI and auto-reloads config changes
+
+Background backups follow the [`schedule`](configuration.md#schedule) section of the config. On Linux and macOS the GUI and `vykar daemon` share one scheduler lock, so only one of them schedules at a time. On Windows that lock is not implemented yet — run only one of the two there, or both will schedule backups.
+
 ## Installing
 
 ### macOS

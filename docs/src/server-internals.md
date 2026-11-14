@@ -25,7 +25,7 @@ The server exposes normal storage-object routes plus a small set of admin query 
 | `GET` | `/{*path}` | `get(key)` | Returns `200` + body or `404`. With a `Range` header, this becomes a ranged read and returns `206`. |
 | `HEAD` | `/{*path}` | `exists(key)` | Returns `200` with metadata or `404`. |
 | `PUT` | `/{*path}` | `put(key, data)` | Raw bytes body. REST clients send exactly one of `X-Content-BLAKE3` (pack uploads to a format-v3 repository) or `X-Content-BLAKE2b` (format-v2 packs, and every non-pack object regardless of format); the server verifies it while streaming the write. Both headers at once is a 400, and a pack upload with neither is a 400. |
-| `DELETE` | `/{*path}` | `delete(key)` | Returns `204` or `404`. Rejected with `403` in append-only mode. |
+| `DELETE` | `/{*path}` | `delete(key)` | Returns `204` or `404`. Rejected with `403` in append-only mode, except for `locks/*`, `sessions/*` and temporary upload files. |
 | `GET` | `/{*path}?list` | `list(prefix)` | Returns a JSON array of matching keys. |
 | `POST` | `/{*path}?mkdir` | `create_dir(key)` | Creates directory scaffolding. |
 
@@ -53,7 +53,7 @@ All routes except `GET /health` require `Authorization: Bearer <token>`. The tok
 
 When `append_only = true`:
 
-- `DELETE` on any object path returns `403 Forbidden`
+- `DELETE` returns `403 Forbidden`, except for `locks/*`, `sessions/*`, and leftover temporary upload files — ephemeral coordination state and uncommitted data, whose removal cannot violate append-only
 - `PUT` to an existing key returns `403` **unless** the key is on the mutable-allowlist
 - Mutable-allowlist: `index`, `index.gen`, `locks/*`, `sessions/*` — these may be overwritten freely
 - All other keys (`config`, `keys/*`, `snapshots/*`, `packs/*`) are immutable once written
@@ -94,7 +94,7 @@ The client sends a verification plan describing packs and expected blob boundari
 - blob boundaries and length-prefix structure
 - the pack's content hash, under the algorithm the plan declares (`"hash": "blake2b" | "blake3"`; absent means blake2b, i.e. a pre-BLAKE3 client)
 
-If the user passes `vykar check --distrust-server`, the client falls back to downloading and verifying data locally.
+The server holds no keys, so this proves each pack is the object the client uploaded and is structurally sound; it does not decrypt chunks or recompute chunk IDs. Packs the server reports as verified are skipped by the client, including under `--verify-data`. To download and verify every chunk locally instead, pass `vykar check --verify-data --distrust-server` (`--distrust-server` is only accepted together with `--verify-data`).
 
 ## Server-Side Repack
 

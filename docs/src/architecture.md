@@ -1,6 +1,6 @@
 # Architecture
 
-Technical reference for vykar's cryptographic, chunking, compression, concurrency, and repository-layout design decisions.
+Technical reference for vykar's cryptographic, chunking, compression, concurrency, and repository-layout design decisions. The test strategy is described in [Testing](testing.md).
 
 ---
 
@@ -92,7 +92,7 @@ Why BLAKE3 for new repositories (format v3):
 - Within a file (or a 64 MiB segment of a large file) hashing is single-threaded, so per-core hash throughput is the per-segment ceiling. BLAKE3's internal tree mode gives it a large per-core advantage even without multi-threading: measurements in [issue #177](https://github.com/borgbase/vykar/issues/177) show `blake3::keyed_hash` at ~2.15 GB/s against ~1.4 GB/s for keyed BLAKE2b-256 on Apple Silicon, with a wider gap on x86-64.
 - BLAKE3 is used single-threaded (`hash` / `keyed_hash`); vykar never calls `update_rayon`, and parallelism comes from the existing per-file/per-segment workers instead.
 
-In `none` mode the same keyed construction is used, but the key is derived from the public `repo_id` rather than a secret master key. The MAC therefore acts as a **checksum for corruption detection**, not as authentication against tampering. Because there is no AEAD tag, every chunk read in `none` mode (restore, list, diff, mount) recomputes the chunk ID and fails on a mismatch. `vykar check --verify-data` recomputes chunk IDs and compares them to detect bit-rot or storage corruption — this works identically across all encryption modes and both formats.
+In `none` mode the same keyed construction is used, but the key is derived from the public `repo_id` rather than a secret master key. The MAC therefore acts as a **checksum for corruption detection**, not as authentication against tampering. Because there is no AEAD tag, every chunk read in `none` mode (restore, list, diff, mount) recomputes the chunk ID and fails on a mismatch. `vykar check --verify-data` recomputes chunk IDs and compares them to detect bit-rot or storage corruption — this works identically across all encryption modes and both formats. The exception is a REST repository whose server supports pack verification: packs the server verifies (structure and pack hash, without any key) are skipped by the client, so their chunk IDs are not recomputed unless `--distrust-server` is added.
 
 ---
 
@@ -174,9 +174,9 @@ The type tag byte is always included in AAD (authenticated additional data). For
 
 ### Format Evolution
 
-The on-disk format (config, index, snapshot blobs, the item stream) evolves by an *expand → contract* rule:
+The **item stream** evolves by an *expand → contract* rule. The rule does not apply to the two frozen structures: `RepoConfig` stays at exactly seven fields (see [Repository Versions](#repository-versions)), and the `SnapshotMeta` envelope has been frozen since 0.17 (below) — new snapshot-level metadata goes into its `ext` blob instead.
 
-- **Expand (anytime):** append a field with `#[serde(default)]`. New binaries still read old snapshots. Already done for `Item.link_target`, `Item.xattrs`, `Item.raw_names`, `Item.hardlink`, and `SnapshotMeta.{comment, source_paths, label, ext, format_version}`. `Item.hardlink` ships under format **v1** (no bump), alongside the `format_version` envelope field itself — both landed together in **0.17.0**, so there is a single "0.17 introduces format v1" story rather than two versions in the wild. That release took the `SnapshotMeta` envelope from 12 fields to 14, which is why a pre-0.17 binary reports `array had incorrect length, expected 12` against a 0.17+ snapshot.
+- **Expand:** append a field with `#[serde(default)]`. New binaries still read old snapshots; older binaries cannot read the new ones (see below), so an expansion is still a one-way step for a shared repository. Already done for `Item.link_target`, `Item.xattrs`, `Item.raw_names`, `Item.hardlink`, and `SnapshotMeta.{comment, source_paths, label, ext, format_version}`. `Item.hardlink` ships under format **v1** (no bump), alongside the `format_version` envelope field itself — both landed together in **0.17.0**, so there is a single "0.17 introduces format v1" story rather than two versions in the wild. That release took the `SnapshotMeta` envelope from 12 fields to 14, which is why a pre-0.17 binary reports `array had incorrect length, expected 12` against a 0.17+ snapshot.
 - **Contract (breaking, batched):** remove or retype a field — only when a larger forced break (crypto, chunking) already requires one; cleanups ride that train rather than justifying a break alone.
 
 Compatibility is **backward-readable, not forward-compatible**: a new binary reads old snapshots, but older binaries are **not** guaranteed to read newer item streams (rmp-serde rejects a longer-than-expected positional array, so an old reader hits a length mismatch on the first extended record). `SnapshotMeta.format_version` (absent/`0` = legacy) is the discriminator; current writers stamp the latest (`CURRENT_FORMAT_VERSION`) and readers reject anything newer than they support. `check` treats a newer snapshot as **unsupported, never corrupt**, and `check --repair` refuses to run while one is present (rebuilding refcounts requires decoding every surviving snapshot).
@@ -316,7 +316,7 @@ flowchart LR
 
 | Field | Type | Description |
 |-------|------|-------------|
-| refcount | u32 | Number of snapshots referencing this chunk |
+| refcount | u32 | Number of references to this chunk across all snapshots. Every occurrence counts, including repeats within one snapshot |
 | stored_size | u32 | Size in bytes as stored (compressed + encrypted) |
 | pack_id | PackId | Which pack file contains this chunk |
 | pack_offset | u64 | Byte offset within the pack file |
@@ -388,7 +388,7 @@ Each `SnapshotEntry` contains: `name`, `id` (32-byte random), `time`, `source_la
 | size | u32 | Uncompressed (original) size |
 | csize | u32 | Stored size (compressed + encrypted) |
 
-`csize` is stored per-reference so the restore path can pass it as a size hint to the ZSTD bulk decompressor, avoiding the overhead of a streaming decoder. Without it, each chunk decompression would either need an index lookup or fall back to the slower streaming path.
+The uncompressed `size` is stored per-reference so the restore path can pass it as a size hint to the ZSTD bulk decompressor, avoiding the overhead of a streaming decoder, and then validate the decoded length against it. The chunk index holds only the stored size, so without this field each decompression would fall back to the slower streaming path.
 
 ### Pack Files
 
@@ -561,11 +561,13 @@ flowchart LR
     resolve --> cache{"Restore cache<br/>valid?"}
     cache -- yes --> items1["Load items<br/>via cache"]
     cache -- no --> items2["Load full index<br/>+ items"]
-    items1 --> decode["Stream-decode<br/>two passes"]
+    items1 --> decode["Stream-decode<br/>into file batches"]
     items2 --> decode
     decode --> plan["Plan coalesced<br/>read groups"]
     plan --> read["Parallel reads<br/>decrypt + write"]
-    read --> meta["Restore metadata"]
+    read --> meta["File metadata"]
+    meta -- next batch --> decode
+    meta --> publish["Relink, publish<br/>to destination"]
 ```
 
 ```text
@@ -575,16 +577,24 @@ open repository without index (`open_without_index`)
   → load item stream:
     → preferred: lookup tree-pack chunk locations via restore cache
     → fallback: load full index and read item stream normally
-  → stream-decode items in two passes:
-    → pass 1 create directories
-    → pass 2 create symlinks and plan file chunk writes
-  → build coalesced pack read groups via the full index
-  → parallel coalesced range reads by pack/offset
-    (merge when gap <= 256 KiB and merged range <= 16 MiB)
-    → `limits.connections` reader workers fetch groups, decrypt + decompress-with-size-hint chunks
-    → validate plaintext size and write to all targets (max 16 open files per worker)
-  → restore file metadata (mode, mtime, optional xattrs)
+  → create a hidden staging directory inside the destination (`.vykar-restore-<hex>`)
+  → stream-decode items once:
+    → directories and symlinks are created in staging as they are decoded
+    → regular files accumulate into bounded batches (100,000 files)
+  → for each batch:
+    → build coalesced pack read groups via the full index
+    → create the batch's files exclusively
+    → parallel coalesced range reads by pack/offset
+      (merge when gap <= 256 KiB and merged range <= 16 MiB)
+      → `limits.connections` reader workers fetch groups, decrypt + decompress-with-size-hint chunks
+      → validate plaintext size and write to all targets (max 16 open files per worker)
+    → apply file metadata (mode, mtime, optional xattrs), then drop the batch
+  → apply symlink metadata and relink hard-link groups, still in staging
+  → rename the staged tree into the destination
+  → apply directory metadata, deepest first
 ```
+
+Everything is written inside the staging directory, so a failed restore leaves the destination empty. Batching bounds plan memory by batch size rather than by snapshot size; the cost is that a chunk shared by files in different batches is downloaded once per batch.
 
 ### Item Stream
 
@@ -685,7 +695,7 @@ This design means `delete` is fast (just index updates), while space reclamation
 If a backup is interrupted after packs have been flushed but before commit, those packs would be orphaned. The **pending index journal** prevents re-uploading their data on the next run:
 
 1. During backup, every 8 data-pack flushes, vykar writes a `sessions/<session_id>.index` blob to storage containing pack→chunk mappings for all flushed packs in this session
-2. On the next backup with the same session ID, if the journal exists, packs are batch-verified by listing shard directories (avoiding per-pack HEAD requests on REST/S3 backends)
+2. The next backup — under its own, new session ID — scans `sessions/` for journals left by other sessions. A journal is recovered when its `.json` marker is missing (orphaned) or stale; journals of active sessions, and the backup's own, are skipped. Recovered packs are batch-verified by listing shard directories (avoiding per-pack HEAD requests on REST/S3 backends)
 3. Verified chunks are promoted into the dedup structures so subsequent dedup checks find them
 4. After a successful commit, the `sessions/<session_id>.index` blob is deleted
 5. `flush_on_abort()` writes a final journal before exiting, maximizing recovery coverage
@@ -814,84 +824,23 @@ Internal backup pipeline knobs are derived automatically:
 - `pipeline_buffer_bytes = clamp(threads_effective * 64 MiB, 64 MiB..1 GiB)`
 - `segment_size = 64 MiB`, `transform_batch = 32 MiB`, `max_pending_actions = 8192`
 
----
+### Allocator tuning
 
-## Testing
+On Linux builds linked against glibc, the CLI adjusts two process-wide allocator settings at startup to reduce retained memory: the arena limit (`MALLOC_ARENA_MAX`, set to 2) and the mmap threshold (`MALLOC_MMAP_THRESHOLD_`, pinned to 1 MiB).
 
-A single bug in serialization, encryption, or refcount tracking can silently destroy data. vykar's testing strategy uses layered tiers so that each tier catches a different class of defect — from logic errors in individual functions through emergent failures in multi-step workflows across storage backends.
+Pinning the mmap threshold is the larger of the two. Allocations at or above it
+are served by `mmap` and released to the kernel when freed, rather than retained
+in an arena the backup never reuses. glibc's default is to raise this threshold
+as a program runs — up to 32 MiB — so partway through a backup the multi-MiB
+chunk, blob, and pack buffers stop being released. On a 49 GiB local backup,
+pinning it cut mean peak resident memory by 34%, for about 5% more CPU time and
+3-5% more wall time, and made peak memory far more repeatable run to run. Combined
+with the arena limit, peak resident memory is about 41% below untuned glibc.
 
-### Unit Tests
-
-~190 tests across 21 modules in `vykar-core`, covering each subsystem in isolation. Fast feedback (seconds), deterministic, no I/O side effects beyond tempdirs.
-
-| Category | Focus |
-|----------|-------|
-| Format & serialization | RepoObj envelope round-trips, pack header parsing, item serde |
-| Chunk index | Add/remove/refcount/generation, dedup-only and tiered modes |
-| Locking | Advisory lock acquire/release, stale cleanup, fence detection |
-| Prune & retention | Policy evaluation (keep-last, keep-daily/weekly/monthly/yearly) |
-| Repair | Plan-only vs apply modes, post-repair cleanliness assertions |
-| Compact | Pack analysis, repack candidate selection, crash-safety ordering |
-| Snapshot lifecycle | Manifest operations, delete ordering, multi-source configs |
-
-### Property Tests
-
-7 `proptest` blocks, each running 1000 random cases. These catch edge cases that hand-written examples miss — off-by-one in chunk boundaries, subtle serde field-order regressions, or nonce/context-binding failures in AEAD. Regressions are reproducible via proptest's seed persistence.
-
-| Property | Invariant verified |
-|----------|--------------------|
-| Encryption round-trip | `decrypt(encrypt(P, ctx), ctx) == P` for both AES-256-GCM and ChaCha20-Poly1305; wrong-context decryption fails |
-| Item serde round-trip | Arbitrary files, directories, and symlinks survive msgpack positional encode/decode |
-| ChunkIndex serde round-trip | Varying refcounts, pack offsets, and generation numbers survive encode/decode |
-| Chunker completeness & determinism | No gaps or overlaps; same input always produces same boundaries; size bounds respected; stream and slice APIs agree |
-| Backup-restore round-trip | Arbitrary nested file trees (empty, small, large files; nested directories) restore byte-identical |
-| Compression round-trip | `decompress(compress(codec, data)) == data` for all codecs (None, LZ4, ZSTD); output within size bound |
-| IndexDelta state-machine | Refcount conservation after apply and after reconcile-then-apply with concurrent overlaps |
-
-### Matrix Tests
-
-9 corruption types tested against detection, repair, and resilience paths using `test-case` parametrization. Each corruption is applied to a known-good repository, then `check`, `repair`, and follow-up `backup` are run with assertions on the outcome.
-
-| Corruption | `check` detects | `repair` fixes | Backup succeeds after |
-|------------|:-:|:-:|:-:|
-| BitFlipInPack | yes (Ok + errors) | yes | yes |
-| BitFlipInBlob | yes (Ok + errors) | yes | yes |
-| TruncatePack | yes (Ok + errors) | yes | yes |
-| ZeroFillRegion | yes (Ok + errors) | yes | yes |
-| DeletePack | yes (Ok + errors) | yes | yes |
-| CorruptSnapshot | yes (Ok + errors) | yes | yes |
-| DeleteIndex | yes (Ok + errors) | — | — |
-| TruncateIndex | yes (Err) | not possible (Err) | — |
-| CorruptConfig | yes (Err) | not possible (Err) | — |
-
-### Fuzz Tests
-
-7 coverage-guided fuzz targets via `cargo-fuzz` (libFuzzer). Each target feeds adversarial byte sequences into a parser, deserializer, or decrypt path, mutating from committed corpus seeds toward crashes, hangs, and OOM. Complements proptest by running for hours/days and optimizing for code-path coverage rather than round-trip invariants.
-
-| Target | Function under test | Risk surface |
-|--------|-------------------|--------------|
-| `fuzz_pack_scan` | `scan_pack_blobs_bytes` | Integer overflow in length fields, truncated frames |
-| `fuzz_decompress` | `decompress` + `decompress_metadata` | Decompression bombs, corrupt LZ4/Zstd frames |
-| `fuzz_msgpack_snapshot_meta` | `from_slice::<SnapshotMeta>` | Large collection size declarations |
-| `fuzz_msgpack_index_blob` | `from_slice::<IndexBlob>` | Massive chunk index allocation |
-| `fuzz_item_stream` | `for_each_decoded_item` | Streaming framing via `Deserializer::position()`, EOF handling |
-| `fuzz_file_cache_decode` | `FileCache::decode_from_plaintext` | Manual msgpack marker parsing, allocation cap, legacy fallback |
-| `fuzz_unpack_object` | `unpack_object` + `unpack_object_expect_with_context` | AEAD envelope parse, nonce extraction, context/AAD wiring, tag authentication |
-
-Corpus seeds are committed and deterministic. CI runs each target for 300 seconds weekly on nightly (`make fuzz-check` replays the corpus without new fuzzing for fast regression checks).
-
-### Integration Tests
-
-End-to-end tests at two levels:
-
-- **In-process** (`vykar-core/tests/`, ~2600 lines): init → backup → list → restore → delete → prune → compact → check cycles exercising the `commands` API directly. Covers encryption modes, multi-source configs, lifecycle transitions, concurrent session logic, and crash-recovery journal round-trips.
-- **CLI-level** (`vykar-cli/tests/`, ~1300 lines): spawn the `vykar` binary and assert on exit codes, stdout/stderr, and restored file content. Covers config parsing, multi-repo selection, and end-to-end command syntax.
-- **Memory regression**: backup and restore of a controlled corpus with RSS sampling; asserts peak RSS stays below fixed caps (512 MiB backup, 384 MiB restore) to catch memory regressions in the pipeline.
-
-### Scenario & Stress Tests
-
-YAML-driven scenario runner (`scripts/testbench`) executes multi-phase workflows against all four storage backends (local, REST, S3/MinIO, SFTP).
-
-- **Scenarios**: configurable corpus (mixed file types, sizes up to 2 GB), phases including `init → backup → verify (restore + diff) → check → churn → prune → compact → cleanup`. Churn simulation applies configurable adds, deletes, and modifications with growth caps to test incremental backup and dedup correctness over time.
-- **Stress mode**: up to 1000 iterations of `backup → list → restore → verify → delete → compact → prune` with periodic `check` and optional `check --verify-data`. Catches state-accumulation bugs (leaking refcounts, index bloat, stale cache entries) that only manifest after many cycles.
-- **Multi-backend coverage**: ensures storage-abstraction bugs do not hide behind the local filesystem.
+Setting either variable in the environment before starting vykar overrides that
+knob: `MALLOC_ARENA_MAX=0 vykar backup` restores glibc's automatic arena limit,
+and `MALLOC_MMAP_THRESHOLD_=<bytes>` pins the threshold at a value of your choice.
+Raising it trades memory back for CPU time. No setting restores glibc's *dynamic*
+threshold: any explicit value, whether vykar's or one from the environment,
+switches the adjustment off. See
+[Configuration → Limits](configuration.md#limits) for the user-facing summary.

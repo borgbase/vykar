@@ -1,4 +1,4 @@
-# Restore a Backup
+# Restore
 
 ## Locate snapshots
 
@@ -29,12 +29,12 @@ vykar snapshot list a1b2c3d4 --path src
 
 # Sort listing by size (name, size, mtime)
 vykar snapshot list a1b2c3d4 --sort size
-```
 
-## Inspect snapshot metadata
-
-```bash
+# Show snapshot metadata (time, source, sizes)
 vykar snapshot info a1b2c3d4
+
+# Compare changed files between two snapshots
+vykar snapshot diff a1b2c3d4 latest
 ```
 
 ## Find files across snapshots
@@ -98,6 +98,24 @@ vykar restore a1b2c3d4 /tmp/restored --pattern '*.pdf'
 
 > **Important:** patterns are matched against snapshot-relative paths, not absolute filesystem paths. `--pattern '/home/user/documents/reports/*'` silently matches nothing. Drop the leading `/` and use the form `vykar snapshot list` shows.
 
+## Browse via WebDAV and browser UI (mount)
+
+Browse snapshot contents via a local read-only WebDAV server. The same endpoint also serves a built-in HTML browser UI.
+
+```bash
+# Serve all snapshots (default: http://127.0.0.1:8080)
+vykar mount
+
+# Serve a single snapshot
+vykar mount --snapshot a1b2c3d4
+
+# Only snapshots from a specific source
+vykar mount --source docs
+
+# Custom listen address
+vykar mount --address 127.0.0.1:9090
+```
+
 ## Restore from a damaged repository
 
 By default a restore is all-or-nothing: if any chunk cannot be read or decoded, the run aborts with `no restored files were published` and the destination stays empty.
@@ -119,25 +137,4 @@ Afterwards, run `vykar check --verify-data` to find out what else in the reposit
 
 The desktop app always restores strictly; use the command line to restore around damage.
 
-## Browse via WebDAV and browser UI (mount)
-
-Browse snapshot contents via a local read-only WebDAV server. The same endpoint also serves a built-in HTML browser UI.
-
-```bash
-# Serve all snapshots (default: http://127.0.0.1:8080)
-vykar mount
-
-# Serve a single snapshot
-vykar mount --snapshot a1b2c3d4
-
-# Only snapshots from a specific source
-vykar mount --source docs
-
-# Custom listen address
-vykar mount --address 127.0.0.1:9090
-```
-
-## Related pages
-
-- [Quick Start](quickstart.md)
-- [Make a Backup](backup.md)
+Next: [Schedule Backups](daemon.md)

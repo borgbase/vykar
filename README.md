@@ -8,17 +8,16 @@ Inspired by [BorgBackup](https://github.com/borgbackup/borg/), [Borgmatic](https
 
 ## Features
 
-- **Storage backends** — local filesystem, S3 (any compatible provider), SFTP, dedicated REST server
-- **Encryption** with AES-256-GCM or ChaCha20-Poly1305 (auto-selected) and Argon2id key derivation
-- **YAML-based configuration** with multiple repositories, hooks, and command dumps for monitoring and database backups
-- **Deduplication** via FastCDC content-defined chunking with a memory-optimized engine (tiered dedup index + mmap-backed pack assembly)
-- **Compression** with LZ4 or Zstandard
-- **Built-in WebDAV and desktop GUI** to browse and restore snapshots
-- **REST server** with append-only enforcement, quotas, and server-side compaction
-- **Concurrent multi-client backups** — multiple machines back up to the same repository simultaneously; only the brief commit phase is serialized
-- **Built-in scheduling** via `vykar daemon` — runs backup cycles on a configurable interval (no cron needed), with an optional [read-only HTTP status page](docs/src/daemon.md#read-only-status-page)
-- **Resource limits** for worker threads, backend connections, and upload/download bandwidth
-- **Cross-platform** — Linux, macOS, and Windows
+- **Fast** — fastest backup and restore of the tools we benchmarked, at the lowest CPU cost
+- **Encrypted by default** — client-side AES-256-GCM or ChaCha20-Poly1305; the storage never sees your keys
+- **Deduplicated and compressed** — content-defined chunking with LZ4 or Zstandard keeps incremental backups small
+- **One YAML file** — repositories, sources, retention, excludes, and schedule, with hooks for monitoring and command dumps for databases
+- **Storage backends** — local filesystem, S3 (any compatible provider), SFTP, or the dedicated REST server
+- **Verifiable** — full or sampled integrity checks, repair, a redundant repository key, and restore that salvages around damage
+- **Append-only storage** — REST server with append-only enforcement, quotas, and server-side compaction, or S3 Object Lock
+- **Find and restore** — search files across snapshots, browse via built-in WebDAV and web UI, or use the desktop GUI
+- **Runs unattended** — built-in scheduler (interval or cron) with a [read-only HTTP status page](docs/src/daemon.md#read-only-status-page), resource limits, and concurrent backups from multiple machines
+- **Cross-platform** — Linux, macOS, and Windows; single binary, Docker image, Ansible role
 
 
 ## Benchmarks

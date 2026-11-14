@@ -6,6 +6,25 @@ Vykar is driven by a YAML configuration file. Generate a starter config with:
 vykar config
 ```
 
+## Top-level keys
+
+| Key | Purpose | Section |
+|-----|---------|---------|
+| `repositories` | Where backups are stored | [Repositories](#repositories) |
+| `sources` | What to back up | [Sources](#sources) |
+| `encryption` | Mode and passphrase source | [Encryption](#encryption) |
+| `compression` | Algorithm and level | [Compression](#compression) |
+| `chunker` | Chunk size parameters | [Chunker](#chunker) |
+| `exclude_patterns`, `exclude_if_present`, `one_file_system`, `git_ignore`, `xattrs` | What to leave out | [Exclude Patterns](#exclude-patterns) |
+| `retention` | Which snapshots `prune` keeps | [Retention](#retention) |
+| `compact`, `check` | Maintenance steps of the full cycle | [Compact](#compact), [Check](#check) |
+| `limits` | Threads, connections, bandwidth, niceness | [Limits](#limits) |
+| `hooks` | Shell commands around each step | [Hooks](#hooks) |
+| `schedule` | Daemon and GUI scheduling | [Schedule](#schedule) |
+| `hostname` | Hostname recorded in snapshots | [Hostname](#hostname) |
+| `env_file` | `.env` files for `${VAR}` expansion | [Environment Variable Expansion](#environment-variable-expansion) |
+| `cache_dir` | Local cache location | [Config file locations](#config-file-locations) |
+
 ## Config file locations
 
 Vykar automatically finds config files in this order:
@@ -15,10 +34,10 @@ Vykar automatically finds config files in this order:
 3. `./vykar.yaml` (project)
 4. User config dir + `vykar/config.yaml`:
    - Unix: `$XDG_CONFIG_HOME/vykar/config.yaml` or `~/.config/vykar/config.yaml`
-   - Windows: `%APPDATA%\\vykar\\config.yaml`
+   - Windows: `%APPDATA%\vykar\config.yaml`
 5. System config:
    - Unix: `/etc/vykar/config.yaml`
-   - Windows: `%PROGRAMDATA%\\vykar\\config.yaml`
+   - Windows: `%PROGRAMDATA%\vykar\config.yaml`
 
 You can also set `VYKAR_PASSPHRASE` to supply the passphrase non-interactively.
 
@@ -106,8 +125,8 @@ name. Two entries that resolve to the same name are rejected at load time. Two
 | Field | Default | Values | Description |
 |-------|---------|--------|-------------|
 | `region` | — | string | S3 region (defaults to `us-east-1` at runtime) |
-| `access_key_id` | — | string | S3 access key ID |
-| `secret_access_key` | — | string | S3 secret access key |
+| `access_key_id` | — | string | S3 access key ID (required for S3) |
+| `secret_access_key` | — | string | S3 secret access key (required for S3) |
 | `s3_soft_delete` | `false` | bool | Use soft delete for S3 Object Lock compatibility |
 
 **SFTP fields:**
@@ -126,17 +145,7 @@ name. Two entries that resolve to the same name are rejected at load time. Two
 
 Per-repo override sections (optional, replace top-level when set): `encryption`, `compression`, `retention`, `limits`. Per-repo-only section: `retry`. Per-repo `hooks` are additive — both global and repo hooks are kept and executed in the order described in [Execution order](#execution-order).
 
-See [Storage Backends](backends.md) for all backend-specific options.
-
-For remote repositories, transport is HTTPS-first by default. To intentionally use plaintext HTTP (for local/dev setups), set:
-
-```yaml
-repositories:
-  - url: "http://localhost:8484"
-    allow_insecure_http: true
-```
-
-For S3-compatible HTTP endpoints, use `s3+http://...` URLs with `allow_insecure_http: true`.
+See [Storage Backends](backends.md) for URL formats and examples per backend, and [Transport security](backends.md#transport-security) for plaintext HTTP and TLS certificates.
 
 ### Multiple repositories
 
@@ -165,6 +174,8 @@ repositories:
 
 When `limits` is set on a repository entry, it replaces top-level `limits` for that repository.
 
+> **Tip:** Configuring both a local and a remote repository gives you a [3-2-1 backup](https://en.wikipedia.org/wiki/Backup#3-2-1_rule) setup: three copies of your data (the original files, the local backup, and the remote backup), on two different media types, with one copy offsite. The example above already achieves this.
+
 By default, commands operate on all repositories. Use `--repo` / `-R` to target a single one:
 
 ```bash
@@ -191,10 +202,6 @@ repositories:
 | `retry_max_delay_ms` | `60000` | integer (ms) | Maximum delay between retries |
 
 > **Note:** The default (5 retries, ~1 minute of cumulative backoff on average with jitter, up to ~90s worst case) is sized to absorb a brief network gap such as WiFi reconnecting after laptop sleep. Raise `max_retries` further if you run on a flaky link; set it to `0` to fail fast for CI or scripted runs.
-
-### 3-2-1 backup strategy
-
-> **Tip:** Configuring both a local and a remote repository gives you a [3-2-1 backup](https://en.wikipedia.org/wiki/Backup#3-2-1_rule) setup: three copies of your data (the original files, the local backup, and the remote backup), on two different media types, with one copy offsite. The example above already achieves this.
 
 ## Sources
 
@@ -294,19 +301,7 @@ Per-source fields that override globals: `exclude`, `exclude_if_present`, `one_f
 
 ### Command Dumps
 
-Capture the stdout of shell commands directly into your backup. Useful for database dumps, API exports, or any generated data that doesn't live as a regular file on disk.
-
-```yaml
-sources:
-  - label: databases
-    command_dumps:
-      - name: postgres.sql
-        command: pg_dump -U myuser mydb
-      - name: redis.rdb
-        command: redis-cli --rdb -
-```
-
-Each source with `command_dumps` produces its own snapshot. An explicit `label` is required.
+Capture the stdout of shell commands directly into your backup. See [Back Up → Command dumps](backup.md#command-dumps) for an introduction. Each source with `command_dumps` produces its own snapshot, and an explicit `label` is required.
 
 | Field | Default | Values | Description |
 |-------|---------|--------|-------------|
@@ -330,7 +325,7 @@ sources:
 
 If a dump command exits with non-zero status, the backup is aborted. Any chunks already uploaded to packs remain on disk but are not added to the index; they are reclaimed on the next `vykar compact` run.
 
-See [Backup — Command dumps](backup.md#command-dumps) for more details and [Recipes](recipes.md) for PostgreSQL, MySQL, MongoDB, and Docker examples.
+See [Recipes](recipes.md) for PostgreSQL, MySQL, MongoDB, and Docker examples.
 
 ## Encryption
 
@@ -604,22 +599,7 @@ allocator settings at startup to reduce retained memory:
 | Arena limit | 2 | `MALLOC_ARENA_MAX` | `glibc.malloc.arena_max=N` |
 | mmap threshold | 1 MiB | `MALLOC_MMAP_THRESHOLD_` | `glibc.malloc.mmap_threshold=N` |
 
-Pinning the mmap threshold is the larger of the two. Allocations at or above it
-are served by `mmap` and released to the kernel when freed, rather than retained
-in an arena the backup never reuses. glibc's default is to raise this threshold
-as a program runs — up to 32 MiB — so partway through a backup the multi-MiB
-chunk, blob, and pack buffers stop being released. On a 49 GiB local backup,
-pinning it cut mean peak resident memory by 34%, for about 5% more CPU time and
-3-5% more wall time, and made peak memory far more repeatable run to run. Combined
-with the arena limit, peak resident memory is about 41% below untuned glibc.
-
-Set either variable, in the environment before starting vykar (not in a config
-`env_file`), to hand that knob back to glibc. Note the trailing underscore in
-`MALLOC_MMAP_THRESHOLD_` — that is how glibc spells it. For example,
-`MALLOC_ARENA_MAX=0 vykar backup` restores glibc's automatic arena limit, and
-`MALLOC_MMAP_THRESHOLD_=131072 vykar backup` restores its dynamic threshold.
-Raising the mmap threshold trades memory back for CPU time. These settings do
-not apply to musl builds, which use mimalloc, or to other platforms.
+Together these cut peak resident memory by roughly 40% for a few percent more CPU time; see [Architecture → Allocator tuning](architecture.md#allocator-tuning) for the measurements. To override a knob, set its variable in the environment before starting vykar (not in a config `env_file`) — for example `MALLOC_ARENA_MAX=0 vykar backup` restores glibc's automatic arena limit. Note the trailing underscore in `MALLOC_MMAP_THRESHOLD_`. These settings do not apply to musl builds, which use mimalloc, or to other platforms.
 
 ## Hooks
 
@@ -711,7 +691,7 @@ What each surface reports:
 
 ### Variable substitution
 
-Hook commands support `{variable}` placeholders that are replaced before execution. Values are automatically shell-escaped.
+Hook commands support `{variable}` placeholders that are replaced before execution. Each placeholder expands to a complete, shell-quoted word.
 
 | Variable         | Description                                  |
 |------------------|----------------------------------------------|
@@ -728,11 +708,15 @@ The same values are also exported as environment variables: `VYKAR_COMMAND`, `VY
 
 ```yaml
 hooks:
-  failed:
-    - 'notify-send "vykar {command} failed: {error}"'
   after_backup:
-    - 'echo "Backed up {source_label} to {repository}"'
+    - 'echo Backed up {source_label} to {repository}'
+  failed:
+    - 'notify-send "vykar $VYKAR_COMMAND failed: $VYKAR_ERROR"'
 ```
+
+> **Never put a placeholder inside your own quotes.** The value arrives already single-quoted, so `"failed: {error}"` becomes `"failed: 'the message'"` — inside double quotes those single quotes are literal characters and protect nothing, and a `$(...)` or backtick in the value is executed by the shell. Use a placeholder only as a standalone argument (`logger {error}`). To embed a value in a longer string, use the environment variable inside double quotes instead, as in the `failed` hook above.
+>
+> Write `$VYKAR_ERROR`, not `${VYKAR_ERROR}`: the braced form is [expanded by vykar](#environment-variable-expansion) when the config is loaded, before the hook exists. On Windows, hooks run in PowerShell, where the variables are `$env:VYKAR_ERROR` and so on.
 
 See [Recipes](recipes.md) for practical hook examples: database dumps, filesystem snapshots, network-aware backups, and monitoring notifications.
 

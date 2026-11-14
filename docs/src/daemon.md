@@ -1,20 +1,21 @@
-# Daemon Mode
+# Schedule Backups
 
 `vykar daemon` runs scheduled backup cycles as a foreground process. Each cycle executes the default actions (`backup → prune → compact → check`) for the repositories that are due, sequentially. The shutdown flag is checked between steps.
 
-- **Scheduling**: sleep-loop with configurable interval (`schedule.every`, e.g. `"6h"`) or cron expression (`schedule.cron`, e.g. `"0 3 * * *"`). Optional random jitter (`jitter_seconds`) spreads load across hosts.
+- **Scheduling**: a fixed interval (`schedule.every`) or a cron expression (`schedule.cron`), with optional random jitter. See [Configuration → Schedule](configuration.md#schedule) for all fields.
 - **Passphrase**: the daemon validates at startup that all encrypted repos have a non-interactive passphrase source (`passcommand`, `passphrase`, or `VYKAR_PASSPHRASE` env). It cannot prompt interactively.
-- **Scheduler lock**: the daemon and GUI share a process-wide scheduler lock under the local config directory so only one scheduler is active at a time. On Unix this uses `flock(2)` and is released automatically on process exit.
+- **Scheduler lock**: the daemon and GUI share a process-wide scheduler lock under the local config directory so only one scheduler is active at a time. On Unix this uses `flock(2)` and is released automatically on process exit. On Windows the lock is not implemented yet, so do not run the daemon and the GUI side by side there.
 
-Configuration:
+A minimal schedule:
+
 ```yaml
 schedule:
   enabled: true
   every: "6h"                  # fixed interval
   # cron: "0 3 * * *"         # OR 5-field cron (mutually exclusive with every)
-  on_startup: false
-  jitter_seconds: 0
 ```
+
+The [desktop GUI](gui.md) uses the same `schedule` block when it runs in the tray.
 
 ## Per-repository cadence
 
@@ -284,7 +285,7 @@ vykar on launch with `Killed: 9`, the signature is invalid — check with
 `codesign --verify --strict --verbose=2` and reinstall rather than re-signing.
 
 Backups run from a background launchd job also cannot list cloud-only (dataless)
-directories; see [Backup — cloud storage](backup.md) for what that omits.
+directories; see [Cloud-only content on macOS](backup.md#cloud-only-content-on-macos-icloud-drive-dropbox-onedrive) for what that omits.
 
 ### Docker
 
@@ -298,7 +299,7 @@ docker run -d --name vykar-daemon \
   -e VYKAR_HTTP_LISTEN=0.0.0.0:7575 \
   -e VYKAR_HTTP_ALLOW_PUBLIC=1 \
   -v /etc/vykar:/etc/vykar:ro \
-  vykar
+  ghcr.io/borgbase/vykar
 ```
 
 Compose equivalent:
@@ -306,7 +307,7 @@ Compose equivalent:
 ```yaml
 services:
   vykar:
-    image: vykar
+    image: ghcr.io/borgbase/vykar
     environment:
       VYKAR_HTTP_LISTEN: "0.0.0.0:7575"
       VYKAR_HTTP_ALLOW_PUBLIC: "1"
@@ -315,6 +316,15 @@ services:
     volumes:
       - /etc/vykar:/etc/vykar:ro
 ```
+
+Environment variables recognised by the daemon:
+
+| Variable | Equivalent flag | Purpose |
+|---|---|---|
+| `VYKAR_HTTP_LISTEN` | `--http-listen ADDR` | Bind a read-only HTTP status page (e.g. `0.0.0.0:7575`); unset means disabled |
+| `VYKAR_HTTP_ALLOW_PUBLIC` | `--http-allow-public` | Permit non-loopback bind addresses |
+| `VYKAR_CONFIG` | `--config PATH` | Override config file path |
+| `VYKAR_PASSPHRASE` | — | Repository passphrase (skips interactive prompt) |
 
 To reload configuration in a running container:
 
@@ -331,3 +341,5 @@ docker kill --signal=USR1 vykar-daemon
 # or with Compose:
 docker compose kill -s USR1 vykar
 ```
+
+Next: [Maintain the Repository](maintenance.md)

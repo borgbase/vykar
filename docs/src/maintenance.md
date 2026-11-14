@@ -1,30 +1,29 @@
-# Maintenance
+# Maintain the Repository
 
-## Delete a snapshot
-
-```bash
-# Delete a specific snapshot by ID
-vykar snapshot delete a1b2c3d4
-```
-
-## Delete a repository
-
-Permanently delete an entire repository and all its snapshots.
-
-```bash
-# Interactive confirmation (prompts you to type "delete")
-vykar delete
-
-# Non-interactive (for scripting)
-vykar delete --yes-delete-this-repo
-```
+Running `vykar` with no subcommand, the [daemon](daemon.md), and the desktop GUI all run the full cycle: `backup`, then `prune`, `compact`, and `check`. The commands below run each step on its own.
 
 ## Prune old snapshots
 
-Apply the retention policy defined in your configuration to remove expired snapshots. Optionally `compact` the repository after pruning.
+Apply the [retention policy](configuration.md#retention) defined in your configuration to remove expired snapshots. Optionally `compact` the repository after pruning.
 
 ```bash
+# Preview which snapshots would be kept and pruned, with reasons
+vykar prune --dry-run --list
+
+# Prune and reclaim space
 vykar prune --compact
+```
+
+## Compact (reclaim space)
+
+After `delete` or `prune`, blob data remains in pack files. Run `compact` to rewrite packs and reclaim disk space.
+
+```bash
+# Preview what would be repacked
+vykar compact --dry-run
+
+# Repack to reclaim space
+vykar compact
 ```
 
 ## Verify repository integrity
@@ -36,6 +35,8 @@ vykar check
 # Full data verification (reads and verifies every chunk)
 vykar check --verify-data
 ```
+
+How much the scheduled cycle checks is set by the [`check`](configuration.md#check) config section.
 
 ### Repair
 
@@ -62,16 +63,37 @@ chunk as live. `vykar check --repair` recomputes refcounts from the surviving
 snapshots and drops the orphan entries; a follow-up `vykar compact` then reclaims
 the disk space.
 
-## Compact (reclaim space)
-
-After `delete` or `prune`, blob data remains in pack files. Run `compact` to rewrite packs and reclaim disk space.
+## Delete a snapshot
 
 ```bash
-# Preview what would be repacked
-vykar compact --dry-run
+# Delete a specific snapshot by ID
+vykar snapshot delete a1b2c3d4
 
-# Repack to reclaim space
-vykar compact
+# Preview without deleting
+vykar snapshot delete a1b2c3d4 --dry-run
+```
+
+## Delete a repository
+
+Permanently delete an entire repository and all its snapshots.
+
+```bash
+# Interactive confirmation (prompts you to type "delete")
+vykar delete
+
+# Non-interactive (for scripting)
+vykar delete --yes-delete-this-repo
+```
+
+## Remove stale locks
+
+A process that was killed can leave its repository lock behind, which blocks later operations with a lock conflict. Once you are sure no vykar process is still using the repository, remove it:
+
+```bash
+vykar break-lock
+
+# Also remove session markers left by crashed backups
+vykar break-lock --sessions
 ```
 
 ## Sharing one repository between hosts
@@ -110,6 +132,5 @@ present.
 
 ## Related pages
 
-- [Quick Start](quickstart.md)
 - [Server Setup](server-setup.md) (server-side compaction)
-- [Architecture](architecture.md) (compact algorithm details)
+- [Architecture](architecture.md#compact) (compact algorithm details)

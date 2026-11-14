@@ -41,13 +41,13 @@ Snapshots get auto-generated IDs. Labels like `personal` or `databases` represen
 
 ```bash
 vykar list -S databases --last 5
-vykar restore --source personal latest
+vykar mount -S personal
 ```
 
 
 ## Encryption by default
 
-Encryption is always on. Vykar auto-selects AES-256-GCM or ChaCha20-Poly1305 based on hardware support. Chunk IDs use keyed hashing to prevent content fingerprinting against the repository.
+Encryption is on unless you explicitly disable it. Vykar auto-selects AES-256-GCM or ChaCha20-Poly1305 based on hardware support. Chunk IDs use keyed hashing to prevent content fingerprinting against the repository.
 
 
 ## The repository is untrusted
@@ -72,7 +72,7 @@ Common operations are short top-level commands. Everything targeting a specific 
 ```bash
 vykar backup
 vykar list
-vykar snapshot find -name "*.xlsx"
+vykar snapshot find --name "*.xlsx"
 vykar snapshot diff a3f7c2 b8d4e1
 ```
 

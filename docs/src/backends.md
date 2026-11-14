@@ -1,6 +1,6 @@
 # Storage Backends
 
-The repository URL in your config determines which backend is used.
+The repository URL in your config determines which backend is used. All backends are included in the pre-built binaries. Every repository field, with defaults, is listed in [Configuration → Repositories](configuration.md#repositories).
 
 | Backend | URL example |
 |---------|-------------|
@@ -87,15 +87,7 @@ repositories:
     allow_insecure_http: true
 ```
 
-### S3 configuration options
-
-| Field | Description |
-|-------|-------------|
-| `region` | AWS region (default: `us-east-1`) |
-| `access_key_id` | Access key ID (required) |
-| `secret_access_key` | Secret access key (required) |
-| `allow_insecure_http` | Permit `s3+http://` URLs (unsafe; default: `false`) |
-| `s3_soft_delete` | Use soft-delete for S3 Object Lock compatibility (default: `false`) |
+To run without `s3:DeleteObject` permission, see [S3 append-only / ransomware protection](#s3-append-only--ransomware-protection) below.
 
 ### Large object uploads (multipart)
 
@@ -126,7 +118,39 @@ aws s3api put-bucket-lifecycle-configuration \
   }'
 ```
 
-### S3 append-only / ransomware protection
+## SFTP
+
+Store backups on a remote server via SFTP. Uses a native [russh](https://github.com/Eugeny/russh) implementation (pure Rust SSH/SFTP) — no system `ssh` binary required. Works on all platforms including Windows.
+
+Host keys are verified with an OpenSSH `known_hosts` file. Unknown hosts use TOFU (trust-on-first-use): the first key is stored, and later key changes fail connection.
+
+```yaml
+repositories:
+  - label: "nas"
+    url: "sftp://backup@nas.local/backups/vykar"
+    # sftp_key: "/home/user/.ssh/id_rsa"  # Path to private key (optional)
+    # sftp_known_hosts: "/home/user/.ssh/known_hosts"  # Optional known_hosts path
+    # sftp_timeout: 30         # Per-request timeout in seconds (default: 30, range: 5–300)
+```
+
+URL format: `sftp://[user@]host[:port]/path`. Default port is 22.
+
+The server must support the `posix-rename@openssh.com` extension. Vykar uploads each object to a temporary file and renames it over the destination, so an interrupted upload never leaves a partial object in place. OpenSSH's `sftp-server` provides the extension. On servers that do not advertise it, reads (restore, list, check) still work, but every write fails with an error naming the missing extension.
+
+## REST (vykar-server)
+
+Store backups on a dedicated [vykar-server](server-setup.md) instance via HTTP/HTTPS. The server provides append-only enforcement, quotas, lock management, and server-side compaction.
+
+```yaml
+repositories:
+  - label: "server"
+    url: "https://backup.example.com"
+    access_token: "my-secret-token"          # Bearer token for authentication
+```
+
+See [Server Setup](server-setup.md) for how to set up and configure the server.
+
+## S3 append-only / ransomware protection
 
 When using S3 directly (without `vykar-server`), a compromised client that has the
 S3 credentials can delete or overwrite any object in the bucket. S3 Object Lock
@@ -138,7 +162,7 @@ permission by replacing deletes with zero-byte tombstone overwrites.
 For full application-level append-only enforcement (rejects both overwrites and
 deletes of immutable keys), use [vykar-server](server-setup.md) instead.
 
-#### Setup
+### Setup
 
 Three components work together:
 
@@ -148,7 +172,7 @@ Three components work together:
    `s3:DeleteObject` permission
 3. **S3 lifecycle rule** — automatically cleans up non-current (expired) versions
 
-#### Step 1: Create a bucket with Object Lock
+### Step 1: Create a bucket with Object Lock
 
 Object Lock can be enabled on a new or existing bucket (existing buckets must have
 versioning enabled first).
@@ -193,7 +217,7 @@ you have this many days to detect the attack and restore from the previous versi
 
 Object Lock automatically enables bucket versioning.
 
-#### Step 2: Add a lifecycle rule for cleanup
+### Step 2: Add a lifecycle rule for cleanup
 
 Without a lifecycle rule, non-current versions accumulate indefinitely. Add a rule
 to expire them after the retention period:
@@ -221,7 +245,7 @@ aws s3api put-bucket-lifecycle-configuration \
 Set `NoncurrentDays` to match your Object Lock retention period. Versions that are
 still locked will not be deleted — S3 respects the lock.
 
-#### Step 3: Enable soft-delete in vykar
+### Step 3: Enable soft-delete in vykar
 
 ```yaml
 repositories:
@@ -246,11 +270,15 @@ The backup client needs `s3:PutObject`, `s3:GetObject`, and `s3:ListBucket` — 
 Lock and versioning enabled. On a plain bucket without versioning, the zero-byte
 overwrite is irreversible — the original data is lost.
 
-#### Recovery after an attack
+### Recovery after an attack
 
 If a compromised client has overwritten objects with garbage, the original versions
 are preserved as non-current versions in S3. To recover, restore the pre-attack
 versions using the AWS CLI.
+
+The examples below assume the repository lives under the `vykar/` prefix, as in
+the URL `s3://…/my-backup-bucket/vykar`. Use your own repository prefix, and keep
+it on every command so nothing else in the bucket is touched.
 
 **1. Identify affected objects.** List versions of a specific key to find the good
 version:
@@ -258,8 +286,8 @@ version:
 ```bash
 aws s3api list-object-versions \
   --bucket my-backup-bucket \
-  --prefix "packs/ab/" \
-  --query 'Versions[?Key==`packs/ab/PACK_ID`].[VersionId,LastModified,Size]' \
+  --prefix "vykar/packs/ab/" \
+  --query 'Versions[?Key==`vykar/packs/ab/PACK_ID`].[VersionId,LastModified,Size]' \
   --output table
 ```
 
@@ -271,35 +299,58 @@ size from before the attack timestamp are the ones to restore.
 ```bash
 aws s3api copy-object \
   --bucket my-backup-bucket \
-  --key "packs/ab/PACK_ID" \
-  --copy-source "my-backup-bucket/packs/ab/PACK_ID?versionId=VERSION_ID"
+  --key "vykar/packs/ab/PACK_ID" \
+  --copy-source "my-backup-bucket/vykar/packs/ab/PACK_ID?versionId=VERSION_ID"
 ```
 
-**3. Restore all objects to a point in time.** To bulk-restore the latest good
-version of every object modified after a known-good timestamp:
+**3. Restore all affected objects to a point in time.** Only objects whose
+*current* version was written during or after the attack should be rolled back.
+An object whose current version predates the attack is healthy — rolling back
+`index`, for example, would hide snapshots that are still intact. The script
+therefore selects per key, and only then picks the newest pre-attack version
+(requires `jq`):
 
 ```bash
-# For each key, find the most recent non-current version before the attack
-# timestamp and copy it back as the current version.
+BUCKET=my-backup-bucket
+PREFIX=vykar/                    # repository prefix, with trailing slash
+ATTACK=2025-01-15T00:00:00       # UTC, start of the attack
+
 aws s3api list-object-versions \
-  --bucket my-backup-bucket \
-  --query 'Versions[?LastModified<`2025-01-15T00:00:00Z` && !IsLatest].[Key,VersionId,LastModified]' \
-  --output text \
-| sort -k1,1 -k3,3r \
-| awk '!seen[$1]++ {print $1, $2}' \
-| while read -r key version_id; do
-    aws s3api copy-object \
-      --bucket my-backup-bucket \
-      --key "$key" \
-      --copy-source "my-backup-bucket/${key}?versionId=${version_id}"
-  done
+  --bucket "$BUCKET" --prefix "$PREFIX" --output json > versions.json
+
+# Keys whose current version dates from the attack, with the newest version
+# from before it.
+jq -r --arg t "$ATTACK" '
+  [.Versions[]?] | group_by(.Key)[]
+  | select(any(.[]; .IsLatest and .LastModified >= $t))
+  | [.[] | select(.LastModified < $t)] | max_by(.LastModified)
+  | select(. != null) | [.Key, .VersionId, .LastModified, .Size] | @tsv
+' versions.json > restore.tsv
 ```
 
-The `sort | awk` pipeline selects only the latest version per key — it sorts by key
-then by timestamp (newest first), and `awk` keeps only the first occurrence of each
-key.
+Review `restore.tsv` before changing anything, then apply it:
 
-After restoring, verify the repository with `vykar check` before restoring data.
+```bash
+while IFS=$'\t' read -r key version_id _; do
+  aws s3api copy-object \
+    --bucket "$BUCKET" \
+    --key "$key" \
+    --copy-source "$BUCKET/${key}?versionId=${version_id}"
+done < restore.tsv
+```
+
+Objects first created during or after the attack have no earlier version and are
+left alone. List them to decide what to do with each — they may be legitimate
+snapshots and packs from other clients, or attacker-written data:
+
+```bash
+jq -r --arg t "$ATTACK" '
+  [.Versions[]?] | group_by(.Key)[]
+  | select(all(.[]; .LastModified >= $t)) | .[0].Key
+' versions.json
+```
+
+After restoring, verify the repository with `vykar check --verify-data` before restoring data.
 
 The recovery commands require `s3:ListBucketVersions` (to list versions),
 `s3:GetObjectVersion` (to read a specific version via `?versionId=`), and
@@ -307,7 +358,7 @@ The recovery commands require `s3:ListBucketVersions` (to list versions),
 `s3:ListBucketVersions` or `s3:GetObjectVersion` during normal operation — use
 separate admin credentials for recovery.
 
-#### Limitations
+### Limitations
 
 This setup provides a **deletion delay**, not strict immutability. A compromised
 client can still overwrite objects with garbage. The protection is that the previous
@@ -316,52 +367,3 @@ detected in time.
 
 For stronger guarantees, use [vykar-server --append-only](server-setup.md), which
 rejects both overwrites and deletes of immutable keys at the application layer.
-
-## SFTP
-
-Store backups on a remote server via SFTP. Uses a native [russh](https://github.com/Eugeny/russh) implementation (pure Rust SSH/SFTP) — no system `ssh` binary required. Works on all platforms including Windows.
-
-Host keys are verified with an OpenSSH `known_hosts` file. Unknown hosts use TOFU (trust-on-first-use): the first key is stored, and later key changes fail connection.
-
-```yaml
-repositories:
-  - label: "nas"
-    url: "sftp://backup@nas.local/backups/vykar"
-    # sftp_key: "/home/user/.ssh/id_rsa"  # Path to private key (optional)
-    # sftp_known_hosts: "/home/user/.ssh/known_hosts"  # Optional known_hosts path
-    # sftp_timeout: 30         # Per-request timeout in seconds (default: 30, range: 5–300)
-```
-
-URL format: `sftp://[user@]host[:port]/path`. Default port is 22.
-
-The server must support the `posix-rename@openssh.com` extension. Vykar uploads each object to a temporary file and renames it over the destination, so an interrupted upload never leaves a partial object in place. OpenSSH's `sftp-server` provides the extension. On servers that do not advertise it, reads (restore, list, check) still work, but every write fails with an error naming the missing extension.
-
-### SFTP configuration options
-
-| Field | Description |
-|-------|-------------|
-| `sftp_key` | Path to SSH private key (auto-detects `~/.ssh/id_ed25519`, `id_rsa`, `id_ecdsa`) |
-| `sftp_known_hosts` | Path to OpenSSH `known_hosts` file (default: `~/.ssh/known_hosts`) |
-| `sftp_timeout` | Per-request SFTP timeout in seconds (default: `30`, clamped to `5..=300`) |
-
-## REST (vykar-server)
-
-Store backups on a dedicated [vykar-server](server-setup.md) instance via HTTP/HTTPS. The server provides append-only enforcement, quotas, lock management, and server-side compaction.
-
-```yaml
-repositories:
-  - label: "server"
-    url: "https://backup.example.com"
-    access_token: "my-secret-token"          # Bearer token for authentication
-```
-
-### REST configuration options
-
-| Field | Description |
-|-------|-------------|
-| `access_token` | Bearer token sent as `Authorization: Bearer <token>` |
-| `allow_insecure_http` | Permit `http://` REST URLs (unsafe; default: `false`) |
-
-See [Server Setup](server-setup.md) for how to set up and configure the server.
-
-All backends are included in pre-built binaries from the [releases page](https://github.com/borgbase/vykar/releases).

@@ -1,4 +1,4 @@
-# Setup
+# Server Setup
 
 Vykar includes a dedicated backup server for secure, policy-enforced remote backups. TLS is typically handled by a reverse proxy such as nginx or Caddy.
 
@@ -60,9 +60,10 @@ or the supervisor's stop timeout (Docker defaults to 10 s, systemd
 
 ## Run as a systemd service
 
-Create an environment file at `/etc/vykar/vykar-server.env` with restricted permissions:
+Create a dedicated system account for the server, then an environment file at `/etc/vykar/vykar-server.env` with restricted permissions:
 
 ```bash
+sudo useradd --system --home-dir /var/lib/vykar --shell /usr/sbin/nologin vykar
 sudo mkdir -p /etc/vykar
 echo 'VYKAR_TOKEN=some-secret-token' | sudo tee /etc/vykar/vykar-server.env
 sudo chmod 600 /etc/vykar/vykar-server.env
@@ -89,7 +90,8 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
 ProtectHome=true
-ReadWritePaths=/var/lib/vykar
+# systemd creates /var/lib/vykar, owned by the service user
+StateDirectory=vykar
 
 [Install]
 WantedBy=multi-user.target
@@ -152,7 +154,26 @@ sources:
   - "/home/user/documents"
 ```
 
-All standard repository commands (`init`, `backup`, `list`, `info`, `restore`, `delete`, `prune`, `check`, `compact`) work over REST without changing the CLI workflow.
+All standard repository commands work over REST without changing the CLI workflow. Against a server started with `--append-only`, the ones that remove data are refused — see below.
+
+## Maintenance on an append-only server
+
+`--append-only` rejects every request that deletes or overwrites committed data, so these commands fail with `403 Forbidden`:
+
+- `vykar snapshot delete` and `vykar prune`
+- `vykar compact`
+- `vykar check --repair`
+- `vykar delete`
+
+`init`, `backup`, `list`, `info`, `restore`, `mount`, and `check` (without `--repair`) work as usual. In the full cycle (bare `vykar`, the daemon, the GUI), a configured `retention` makes the prune step fail on every run. Leave `retention` out of the backup clients' config — the cycle then skips pruning.
+
+Retention therefore has to be applied from a trusted machine during a maintenance window:
+
+1. Stop the server and start it again **without** `--append-only`, with a different `VYKAR_TOKEN` so the regular backup clients cannot use the window.
+2. From the trusted machine, with that token as `access_token`, run `vykar prune --compact`.
+3. Restart the server with `--append-only` and the original token.
+
+Backups in progress are interrupted by each restart.
 
 ## Health check
 

@@ -1,4 +1,4 @@
-# Installing
+# Install
 
 ## Quick install
 
@@ -9,9 +9,31 @@ curl -fsSL https://vykar.borgbase.com/install.sh | sh
 Or download the latest release for your platform from the [releases page](https://github.com/borgbase/vykar/releases).
 
 
+## Pre-built binaries
+
+Extract the archive and place the `vykar` binary somewhere on your `PATH`:
+
+```bash
+# Example for Linux/macOS
+tar xzf vykar-*.tar.gz
+sudo cp vykar /usr/local/bin/
+```
+
+For Windows CLI releases:
+
+```powershell
+Expand-Archive vykar-*.zip -DestinationPath .
+Move-Item .\vykar.exe "$env:USERPROFILE\bin\vykar.exe"
+```
+
+Add your chosen directory (for example, `%USERPROFILE%\bin`) to `PATH` if needed.
+
+The desktop app is packaged separately per platform — see [Desktop GUI](gui.md).
+
+
 ## Docker
 
-Available as `ghcr.io/borgbase/vykar` on GitHub Container Registry. An `apprise` variant (`ghcr.io/borgbase/vykar:latest-apprise`) is also available with the [Apprise](https://github.com/caronc/apprise) CLI pre-installed for [hook notifications](configuration.md#notifications-with-apprise).
+Available as `ghcr.io/borgbase/vykar` on GitHub Container Registry. An `apprise` variant (`ghcr.io/borgbase/vykar:latest-apprise`) is also available with the [Apprise](https://github.com/caronc/apprise) CLI pre-installed for [hook notifications](recipes.md#apprise-multi-service).
 
 ### Config file
 
@@ -19,7 +41,8 @@ Create a `vykar.yaml` for Docker. Source paths must reference `/data/...` (the c
 
 ```yaml
 repositories:
-  - url: s3://my-bucket/backups
+  - url: s3://s3.us-east-1.amazonaws.com/my-bucket/backups
+    region: us-east-1
     access_key_id: "..."
     secret_access_key: "..."
 
@@ -91,59 +114,9 @@ volumes:
   vykar-cache:
 ```
 
-### Reloading configuration
+### Signals and status page
 
-Send `SIGHUP` to the daemon container to reload the config file without restarting:
-
-```bash
-docker kill --signal=HUP vykar-daemon
-```
-
-With Docker Compose:
-
-```bash
-docker compose kill -s HUP vykar
-```
-
-The daemon logs whether the reload succeeded or was rejected (invalid config).
-
-### Triggering a backup
-
-Send `SIGUSR1` to trigger an immediate backup cycle without waiting for the next scheduled run:
-
-```bash
-docker kill --signal=USR1 vykar-daemon
-```
-
-With Docker Compose:
-
-```bash
-docker compose kill -s USR1 vykar
-```
-
-### Read-only status page
-
-Set `VYKAR_HTTP_LISTEN` (and `VYKAR_HTTP_ALLOW_PUBLIC=1` to bind on `0.0.0.0`) and publish port 7575 to expose a read-only status page in the browser. See [Daemon → Read-only status page](daemon.md#read-only-status-page) for endpoints and bind-safety rules.
-
-```bash
-docker run -d \
-  --name vykar-daemon \
-  -p 7575:7575 \
-  -e VYKAR_HTTP_LISTEN=0.0.0.0:7575 \
-  -e VYKAR_HTTP_ALLOW_PUBLIC=1 \
-  -v /path/to/vykar.yaml:/etc/vykar/config.yaml:ro \
-  -v vykar-cache:/cache \
-  ghcr.io/borgbase/vykar
-```
-
-Environment variables recognised by the daemon:
-
-| Variable | Equivalent flag | Purpose |
-|---|---|---|
-| `VYKAR_HTTP_LISTEN` | `--http-listen ADDR` | Bind a read-only HTTP status page (e.g. `0.0.0.0:7575`); unset means disabled |
-| `VYKAR_HTTP_ALLOW_PUBLIC` | `--http-allow-public` | Permit non-loopback bind addresses |
-| `VYKAR_CONFIG` | `--config PATH` | Override config file path |
-| `VYKAR_PASSPHRASE` | — | Repository passphrase (skips interactive prompt) |
+Reloading the config (`SIGHUP`), triggering a backup (`SIGUSR1`), and the read-only status page are covered in [Schedule Backups → Docker](daemon.md#docker).
 
 ### Notes
 - Use `-it` with `docker run` for interactive commands to get progress bar output (e.g. `docker run --rm -it ...`)
@@ -151,7 +124,7 @@ Environment variables recognised by the daemon:
 - Mount source directories under `/data/` and reference them as `/data/...` in the config
 - For encryption, use `VYKAR_PASSPHRASE` env var or Docker secrets via `passcommand: "cat /run/secrets/vykar_passphrase"`
 - Use a named volume for `/cache` to persist the snapshot cache across restarts
-- The `apprise` variant (`ghcr.io/borgbase/vykar:latest-apprise`) includes the Apprise CLI for sending notifications to 100+ services from hooks. See [Notifications with Apprise](configuration.md#notifications-with-apprise).
+- The `apprise` variant (`ghcr.io/borgbase/vykar:latest-apprise`) includes the Apprise CLI for sending notifications to 100+ services from hooks. See [Notifications with Apprise](recipes.md#apprise-multi-service).
 - The image includes `curl`, `jq`, and `bash` for use in [hooks](configuration.md#hooks) (e.g. monitoring webhooks, JSON payloads). For additional tools, extend the image:
   ```dockerfile
   FROM ghcr.io/borgbase/vykar
@@ -191,26 +164,6 @@ The `vykar_config` variable accepts your vykar configuration directly as a YAML 
 See the [borgbase.vykar role](https://github.com/borgbase/ansible-role-vykar) for all available variables.
 
 
-## Pre-built binaries
-
-Extract the archive and place the `vykar` binary somewhere on your `PATH`:
-
-```bash
-# Example for Linux/macOS
-tar xzf vykar-*.tar.gz
-sudo cp vykar /usr/local/bin/
-```
-
-For Windows CLI releases:
-
-```powershell
-Expand-Archive vykar-*.zip -DestinationPath .
-Move-Item .\vykar.exe "$env:USERPROFILE\\bin\\vykar.exe"
-```
-
-Add your chosen directory (for example, `%USERPROFILE%\bin`) to `PATH` if needed.
-
-
 ## Build from source
 
 Requires Rust 1.98 or later.
@@ -218,8 +171,10 @@ Requires Rust 1.98 or later.
 ```bash
 git clone https://github.com/borgbase/vykar.git
 cd vykar
-cargo build --release
+cargo build --release -p vykar-cli
 ```
+
+This builds only the command-line tool. A bare `cargo build --release` builds the whole workspace, including the desktop GUI, which needs extra development packages on Linux — see [Desktop GUI](gui.md#linux). Use `-p vykar-server` for the [REST server](server-setup.md).
 
 The binary is at `target/release/vykar`. Copy it to a directory on your `PATH`:
 
@@ -227,12 +182,12 @@ The binary is at `target/release/vykar`. Copy it to a directory on your `PATH`:
 cp target/release/vykar /usr/local/bin/
 ```
 
+
 ## Verify installation
 
 ```bash
 vykar --version
 ```
 
-## Next steps
 
-- [Initialize and Set Up a Repository](init-setup.md)
+Next: [Configure and Initialize](init-setup.md)

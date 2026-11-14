@@ -5,25 +5,33 @@
 
 # Usage
 
-- [Installing](install.md)
-- [Desktop GUI](gui.md)
-- [Initialize and Set Up a Repository](init-setup.md)
+- [Install](install.md)
+- [Configure and Initialize](init-setup.md)
 - [Storage Backends](backends.md)
-- [Make a Backup](backup.md)
-- [Restore a Backup](restore.md)
-- [Maintenance](maintenance.md)
-- [Backup Recipes](recipes.md)
-- [Daemon Mode](daemon.md)
+- [Back Up](backup.md)
+- [Restore](restore.md)
+- [Schedule Backups](daemon.md)
+- [Maintain the Repository](maintenance.md)
+- [Desktop GUI](gui.md)
+- [Recipes](recipes.md)
+
+# Server
+
+- [Setup](server-setup.md)
 
 # Reference
 
 - [Configuration](configuration.md)
 - [Command Reference](commands.md)
+
+# Background
+
+- [Comparison](comparison.md)
 - [Design Goals](goals.md)
-- [Architecture](architecture.md)
 - [Roadmap](roadmap.md)
 
-# Server
+# Internals
 
-- [Setup](server-setup.md)
-- [Internals](server-internals.md)
+- [Architecture](architecture.md)
+- [Server Internals](server-internals.md)
+- [Testing](testing.md)

@@ -402,39 +402,11 @@ impl Repository {
         deferred_chunk_index_hydrate: bool,
         progress: &mut Option<impl FnMut(crate::commands::backup::BackupProgressEvent)>,
     ) {
-        // Hydrate chunk_index after the commit point (fast-path deferred).
-        // Best-effort: a failure here is non-fatal since the remote index is
-        // already committed. `rebuild_local_caches(true)` (below) derives
-        // caches from the on-disk full_index_cache and does not read
-        // `self.chunk_index`, so leaving it stale is safe. The next Repository
-        // operation calls `reload_full_index` and rehydrates from remote.
-        if deferred_chunk_index_hydrate {
-            let cd = self.cache_dir_override.as_deref();
-            match dedup_cache::load_chunk_index_from_full_cache(
-                &self.config.id,
-                self.index_generation,
-                cd,
-            )
-            .or_else(|e| {
-                warn!("fast path: local cache hydration failed ({e}), reloading from remote");
-                self.reload_full_index()
-            }) {
-                Ok(idx) => {
-                    self.chunk_index = idx;
-                }
-                Err(e) => {
-                    crate::commands::backup::emit_post_commit_warning(
-                        progress,
-                        format!(
-                            "snapshot was successfully committed, but hydrating the \
-                             in-memory chunk index from local cache and remote storage \
-                             both failed: {e}. The on-disk chunk index is intact; the \
-                             next repository operation will reload it."
-                        ),
-                    );
-                }
-            }
-        }
+        // The fast path deferred `chunk_index` hydration past the commit
+        // point. It runs last (below): neither the file-cache save nor
+        // `rebuild_local_caches(true)` reads `self.chunk_index`, so doing it
+        // first would only keep the hydrated index alive next to the file
+        // cache's serialization buffer and raise the commit's peak memory.
 
         // Merge active sections if any were produced (filesystem backup).
         // Dump-only runs produce no active sections and skip this block.
@@ -462,13 +434,19 @@ impl Repository {
         }
 
         // Rebuild local caches if needed. When the fast path already wrote the
-        // full cache (deferred_chunk_index_hydrate), skip the redundant sort.
+        // full cache (deferred_chunk_index_hydrate), skip the redundant sort;
+        // the derivation then streams the on-disk full_index_cache and does
+        // not read `self.chunk_index`, which is not hydrated yet.
         let ctx = emit_stage(progress, "rebuild local caches");
         if self.rebuild_dedup_cache {
             self.rebuild_local_caches(deferred_chunk_index_hydrate);
             self.rebuild_dedup_cache = false;
         }
         log_stage_elapsed(ctx);
+
+        if deferred_chunk_index_hydrate {
+            self.hydrate_deferred_chunk_index(progress);
+        }
 
         // Clean up recovered index journals from previous interrupted sessions.
         if let Some(ws) = self.write_session.as_mut() {
@@ -477,6 +455,45 @@ impl Repository {
 
         // Consume write session.
         self.write_session = None;
+    }
+
+    /// Restore `self.chunk_index` after a fast-path commit, which never
+    /// decoded the index: from the merged local full_index_cache, falling
+    /// back to the remote index.
+    ///
+    /// Best-effort: a failure here is non-fatal since the remote index is
+    /// already committed; it leaves `chunk_index` stale and the next
+    /// Repository operation calls `reload_full_index` and rehydrates from
+    /// remote.
+    fn hydrate_deferred_chunk_index(
+        &mut self,
+        progress: &mut Option<impl FnMut(crate::commands::backup::BackupProgressEvent)>,
+    ) {
+        let cd = self.cache_dir_override.as_deref();
+        match dedup_cache::load_chunk_index_from_full_cache(
+            &self.config.id,
+            self.index_generation,
+            cd,
+        )
+        .or_else(|e| {
+            warn!("fast path: local cache hydration failed ({e}), reloading from remote");
+            self.reload_full_index()
+        }) {
+            Ok(idx) => {
+                self.chunk_index = idx;
+            }
+            Err(e) => {
+                crate::commands::backup::emit_post_commit_warning(
+                    progress,
+                    format!(
+                        "snapshot was successfully committed, but hydrating the \
+                         in-memory chunk index from local cache and remote storage \
+                         both failed: {e}. The on-disk chunk index is intact; the \
+                         next repository operation will reload it."
+                    ),
+                );
+            }
+        }
     }
 
     /// Verify that all pack_ids referenced by new_entries in a delta actually

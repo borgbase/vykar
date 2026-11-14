@@ -8,6 +8,7 @@ use crate::commands::util::check_interrupted;
 
 use crate::compress::Compression;
 use crate::config::ChunkerConfig;
+use crate::index::dedup_cache::DedupPrefilter;
 use crate::limits::ByteRateLimiter;
 use crate::platform::fs;
 use crate::repo::file_cache::{CachedChunks, FileCache, ParentReuseIndex};
@@ -34,7 +35,7 @@ use vykar_crypto::CryptoEngine;
 fn classify_chunks(
     chunks: Vec<Vec<u8>>,
     chunk_hasher: &ChunkHasher,
-    dedup_filter: Option<&xorf::Xor8>,
+    prefilter: Option<&DedupPrefilter>,
     compression: Compression,
     crypto: &dyn CryptoEngine,
     transform_pool: Option<&rayon::ThreadPool>,
@@ -44,7 +45,7 @@ fn classify_chunks(
         classify_chunk(
             chunk_id,
             std::borrow::Cow::Owned(data),
-            dedup_filter,
+            prefilter,
             compression,
             crypto,
         )
@@ -68,7 +69,7 @@ pub(super) fn flush_regular_file_batch(
     raw_chunks: &mut Vec<Vec<u8>>,
     item: &mut Item,
     stats: &mut SnapshotStats,
-    dedup_filter: Option<&xorf::Xor8>,
+    prefilter: Option<&DedupPrefilter>,
 ) -> Result<()> {
     if raw_chunks.is_empty() {
         return Ok(());
@@ -78,12 +79,12 @@ pub(super) fn flush_regular_file_batch(
     let worker_chunks = classify_chunks(
         taken,
         chunk_hasher,
-        dedup_filter,
+        prefilter,
         compression,
         repo.crypto.as_ref(),
         transform_pool,
     )?;
-    process_worker_chunks(repo, item, worker_chunks, stats, compression, dedup_filter)
+    process_worker_chunks(repo, item, worker_chunks, stats, compression, prefilter)
 }
 
 /// Tracks a small file pending in the cross-file batch.
@@ -156,7 +157,7 @@ fn flush_cross_file_batch(
     stats: &mut SnapshotStats,
     new_file_cache: &mut FileCache,
     progress: &mut Option<&mut dyn FnMut(BackupProgressEvent)>,
-    dedup_filter: Option<&xorf::Xor8>,
+    prefilter: Option<&DedupPrefilter>,
     verbose: bool,
 ) -> Result<()> {
     if batch.is_empty() {
@@ -167,7 +168,7 @@ fn flush_cross_file_batch(
     let mut worker_chunks = classify_chunks(
         taken,
         chunk_hasher,
-        dedup_filter,
+        prefilter,
         compression,
         repo.crypto.as_ref(),
         transform_pool,
@@ -190,7 +191,7 @@ fn flush_cross_file_batch(
             worker_chunks.drain(..file.chunk_count),
             stats,
             compression,
-            dedup_filter,
+            prefilter,
         )?;
 
         stats.nfiles += 1;
@@ -281,7 +282,7 @@ pub(super) fn process_regular_file_item(
     progress: &mut Option<&mut dyn FnMut(BackupProgressEvent)>,
     max_pending_transform_bytes: usize,
     max_pending_file_actions: usize,
-    dedup_filter: Option<&xorf::Xor8>,
+    prefilter: Option<&DedupPrefilter>,
     verbose: bool,
     parent_reuse_index: Option<&ParentReuseIndex>,
 ) -> Result<ProcessOutcome> {
@@ -386,7 +387,7 @@ pub(super) fn process_regular_file_item(
                         &mut raw_chunks,
                         item,
                         stats,
-                        dedup_filter,
+                        prefilter,
                     )?;
                     emit_stats_progress(progress, stats, None);
                     pending_bytes = 0;
@@ -404,7 +405,7 @@ pub(super) fn process_regular_file_item(
             &mut raw_chunks,
             item,
             stats,
-            dedup_filter,
+            prefilter,
         )?;
 
         Ok(())
@@ -468,7 +469,7 @@ pub(super) fn process_source_path(
     read_limiter: Option<&ByteRateLimiter>,
     transform_pool: Option<&rayon::ThreadPool>,
     progress: &mut Option<&mut dyn FnMut(BackupProgressEvent)>,
-    dedup_filter: Option<&xorf::Xor8>,
+    prefilter: Option<&DedupPrefilter>,
     shutdown: Option<&AtomicBool>,
     verbose: bool,
     parent_reuse_index: Option<&ParentReuseIndex>,
@@ -593,7 +594,7 @@ pub(super) fn process_source_path(
                         stats,
                         new_file_cache,
                         progress,
-                        dedup_filter,
+                        prefilter,
                         verbose,
                     )?;
 
@@ -695,7 +696,7 @@ pub(super) fn process_source_path(
                             stats,
                             new_file_cache,
                             progress,
-                            dedup_filter,
+                            prefilter,
                             verbose,
                         )?;
                     }
@@ -715,7 +716,7 @@ pub(super) fn process_source_path(
                     stats,
                     new_file_cache,
                     progress,
-                    dedup_filter,
+                    prefilter,
                     verbose,
                 )?;
 
@@ -732,7 +733,7 @@ pub(super) fn process_source_path(
                     progress,
                     max_pending_transform_bytes,
                     max_pending_file_actions,
-                    dedup_filter,
+                    prefilter,
                     verbose,
                     parent_reuse_index,
                 ) {
@@ -771,7 +772,7 @@ pub(super) fn process_source_path(
                 stats,
                 new_file_cache,
                 progress,
-                dedup_filter,
+                prefilter,
                 verbose,
             )?;
         }
@@ -800,7 +801,7 @@ pub(super) fn process_source_path(
         stats,
         new_file_cache,
         progress,
-        dedup_filter,
+        prefilter,
         verbose,
     )?;
 

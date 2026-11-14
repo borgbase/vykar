@@ -447,6 +447,69 @@ fn build_xor_filter(cache: &MmapDedupCache) -> Option<Xor8> {
 }
 
 // ---------------------------------------------------------------------------
+// DedupPrefilter — worker-side, read-only view of the pre-session chunk set
+// ---------------------------------------------------------------------------
+
+/// What a backup worker learned about a chunk from the [`DedupPrefilter`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PrefilterVerdict {
+    /// Not in the pre-session chunk set: a filter miss (xor filters have no
+    /// false negatives), or a filter false positive the mmap tier ruled out.
+    /// It may still be a chunk added earlier in this session.
+    Absent,
+    /// Confirmed in the immutable pre-session mmap tier.
+    Present { stored_size: u32 },
+    /// Filter hit with no authoritative set to confirm it against (the
+    /// non-tiered `DedupIndex` fallback, whose map the write session owns).
+    Unconfirmed,
+}
+
+/// Read-only dedup state that parallel backup workers can query without the
+/// repository: the xor filter and, in tiered mode, the mmap'd pre-session
+/// cache it was built from. Cheap to clone (two `Arc`s).
+///
+/// Confirming a filter hit in the worker lets it drop the raw chunk bytes
+/// immediately instead of holding them until the consumer resolves the hit.
+/// Sound because the mmap tier is immutable for the whole session — it is
+/// never written through, `TieredDedupIndex::remove` and rollback only touch
+/// `session_new` — so a chunk present here is still present when the
+/// consumer bumps its refcount (see `Repository::bump_ref_presession_hit`).
+#[derive(Clone)]
+pub(crate) struct DedupPrefilter {
+    filter: Arc<Xor8>,
+    presession: Option<Arc<MmapDedupCache>>,
+}
+
+impl DedupPrefilter {
+    /// A filter without an authoritative set: hits stay [`PrefilterVerdict::Unconfirmed`].
+    pub(crate) fn filter_only(filter: Arc<Xor8>) -> Self {
+        Self {
+            filter,
+            presession: None,
+        }
+    }
+
+    /// Classify `id` against the pre-session chunk set.
+    pub(crate) fn lookup(&self, id: &ChunkId) -> PrefilterVerdict {
+        if !self.filter.contains(&chunk_id_to_u64(id)) {
+            return PrefilterVerdict::Absent;
+        }
+        match self.presession {
+            Some(ref cache) => match cache.get_stored_size(id) {
+                Some(stored_size) => PrefilterVerdict::Present { stored_size },
+                None => PrefilterVerdict::Absent,
+            },
+            None => PrefilterVerdict::Unconfirmed,
+        }
+    }
+
+    /// The mmap tier `Present` verdicts came from, if any.
+    pub(crate) fn presession_cache(&self) -> Option<&Arc<MmapDedupCache>> {
+        self.presession.as_ref()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // TieredDedupIndex
 // ---------------------------------------------------------------------------
 
@@ -458,7 +521,9 @@ fn build_xor_filter(cache: &MmapDedupCache) -> Option<Xor8> {
 /// 3. mmap binary search — confirms filter hit, returns stored_size (OS-paged, near-zero RSS)
 pub struct TieredDedupIndex {
     xor_filter: Option<Arc<Xor8>>,
-    mmap_cache: MmapDedupCache,
+    /// Shared with backup workers through [`DedupPrefilter`]. Never mutated:
+    /// the mapping is read-only and `remove` only touches `session_new`.
+    mmap_cache: Arc<MmapDedupCache>,
     session_new: ChunkIdHashMap<u32>,
 }
 
@@ -468,14 +533,26 @@ impl TieredDedupIndex {
         let xor_filter = build_xor_filter(&mmap_cache).map(Arc::new);
         Self {
             xor_filter,
-            mmap_cache,
+            mmap_cache: Arc::new(mmap_cache),
             session_new: ChunkIdHashMap::default(),
         }
     }
 
-    /// Return a shared reference to the pre-built xor filter (if any).
-    pub(crate) fn xor_filter(&self) -> Option<Arc<Xor8>> {
-        self.xor_filter.clone()
+    /// Worker-side prefilter that can confirm filter hits against the
+    /// immutable mmap tier. `None` when no xor filter was built.
+    pub(crate) fn prefilter(&self) -> Option<DedupPrefilter> {
+        let filter = self.xor_filter.clone()?;
+        Some(DedupPrefilter {
+            filter,
+            presession: Some(Arc::clone(&self.mmap_cache)),
+        })
+    }
+
+    /// True if `cache` is this index's mmap tier (the very same mapping, not
+    /// merely an equal file), so a worker's lookup in it is a lookup in the
+    /// set this index resolves against.
+    pub(crate) fn is_backed_by(&self, cache: &Arc<MmapDedupCache>) -> bool {
+        Arc::ptr_eq(&self.mmap_cache, cache)
     }
 
     /// Check if a chunk exists in any tier.

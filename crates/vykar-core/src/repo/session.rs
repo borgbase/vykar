@@ -3,7 +3,7 @@ use tracing::{debug, warn};
 use super::pack::{compute_data_pack_target, compute_tree_pack_target, PackType, PackWriter};
 use super::write_session::{self, WriteSessionState};
 use super::Repository;
-use crate::index::dedup_cache::{self, TieredDedupIndex};
+use crate::index::dedup_cache::{self, DedupPrefilter, TieredDedupIndex};
 use crate::index::{ChunkIndex, DedupIndex, IndexDelta};
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
@@ -157,15 +157,21 @@ impl Repository {
         }
     }
 
-    /// Return the pre-built xor filter from whichever dedup mode is active.
-    /// Returns `None` when no dedup mode or no write session is active.
-    pub fn dedup_filter(&self) -> Option<std::sync::Arc<xorf::Xor8>> {
+    /// Return the worker-side prefilter for whichever dedup mode is active.
+    /// Returns `None` when no dedup mode or no write session is active, or the
+    /// mode has no xor filter.
+    ///
+    /// In tiered mode the prefilter also carries the immutable mmap tier, so
+    /// workers can confirm filter hits themselves. The `DedupIndex` fallback
+    /// only shares the filter: its map is owned and mutated by the session,
+    /// so its hits stay unconfirmed until the consumer resolves them.
+    pub(crate) fn dedup_prefilter(&self) -> Option<DedupPrefilter> {
         let ws = self.write_session.as_ref()?;
         if let Some(ref tiered) = ws.tiered_dedup {
-            return tiered.xor_filter();
+            return tiered.prefilter();
         }
         if let Some(ref dedup) = ws.dedup_index {
-            return dedup.xor_filter();
+            return dedup.xor_filter().map(DedupPrefilter::filter_only);
         }
         None
     }
@@ -416,6 +422,25 @@ impl Repository {
             .expect("no active write session")
             .data_pack_writer
             .target_size()
+    }
+
+    /// Enter tiered dedup mode over an explicit mmap cache (for testing).
+    pub(crate) fn enable_tiered_dedup_mode_with(&mut self, cache: dedup_cache::MmapDedupCache) {
+        let ws = self
+            .write_session
+            .as_mut()
+            .expect("no active write session");
+        ws.tiered_dedup = Some(TieredDedupIndex::new(cache));
+        ws.index_delta = Some(IndexDelta::new());
+    }
+
+    /// Refcount bumps recorded in the index delta for `id` (for testing).
+    pub(crate) fn delta_refcount_bump(&self, id: &ChunkId) -> u32 {
+        self.write_session
+            .as_ref()
+            .and_then(|ws| ws.index_delta.as_ref())
+            .and_then(|d| d.refcount_bumps.get(id).copied())
+            .unwrap_or(0)
     }
 
     /// True if a rollback checkpoint is currently armed (for testing).

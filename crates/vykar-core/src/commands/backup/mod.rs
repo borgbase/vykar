@@ -797,7 +797,7 @@ fn run_against_repo(
         // Switch to tiered dedup mode to minimize memory during backup.
         repo.enable_tiered_dedup_mode();
 
-        let dedup_filter = repo.dedup_filter();
+        let prefilter = repo.dedup_prefilter();
 
         let time_start = Utc::now();
         let mut stats = SnapshotStats::default();
@@ -862,7 +862,7 @@ fn run_against_repo(
                 segment_size,
                 items_config: &items_config,
                 pipeline_buffer_bytes,
-                dedup_filter: dedup_filter.as_deref(),
+                prefilter: prefilter.as_ref(),
                 shutdown,
                 verbose,
                 parent_reuse_index: parent_reuse_index.as_ref(),
@@ -907,7 +907,7 @@ fn run_against_repo(
                     None, // no source-file read limiter
                     transform_pool.as_ref(),
                     &mut progress,
-                    dedup_filter.as_deref(),
+                    prefilter.as_ref(),
                     shutdown,
                     verbose,
                     parent_reuse_index.as_ref(),

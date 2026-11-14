@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use crate::compress::Compression;
 use crate::config::ChunkerConfig;
+use crate::index::dedup_cache::DedupPrefilter;
 use crate::limits::ByteRateLimiter;
 use crate::platform::fs;
 use crate::repo::file_cache::{CachedChunks, FileCache, ParentReuseIndex};
@@ -178,7 +179,7 @@ pub(crate) struct PipelineCtx<'a> {
     pub segment_size: u64,
     pub items_config: &'a ChunkerConfig,
     pub pipeline_buffer_bytes: usize,
-    pub dedup_filter: Option<&'a xorf::Xor8>,
+    pub prefilter: Option<&'a DedupPrefilter>,
     pub shutdown: Option<&'a AtomicBool>,
     pub verbose: bool,
     pub parent_reuse_index: Option<&'a ParentReuseIndex>,
@@ -225,7 +226,7 @@ pub(crate) fn run_parallel_pipeline(
         segment_size,
         items_config,
         pipeline_buffer_bytes,
-        dedup_filter,
+        prefilter,
         shutdown,
         verbose,
         parent_reuse_index,
@@ -324,7 +325,7 @@ pub(crate) fn run_parallel_pipeline(
                         read_limiter,
                         budget_ref,
                         pre_acquired,
-                        dedup_filter,
+                        prefilter,
                     );
                     let msg = match result {
                         Ok(processed) => PipelineResult::Ok(idx, Box::new(processed)),
@@ -502,7 +503,7 @@ pub(crate) fn run_parallel_pipeline(
                             compression,
                             progress,
                             &budget,
-                            dedup_filter,
+                            prefilter,
                             &mut large_file_accum,
                             file_cache,
                             verbose,

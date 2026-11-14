@@ -5,6 +5,7 @@ use super::pack::{self, compute_data_pack_target, PackType, SealedPack};
 use super::write_session::PendingUpload;
 use super::Repository;
 use crate::compress;
+use crate::index::dedup_cache::DedupPrefilter;
 use crate::index::PendingChunkEntry;
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
@@ -112,7 +113,57 @@ impl Repository {
         self.bump_ref_if_exists(chunk_id)
     }
 
-    /// Prefilter said "definitely doesn't exist" — tiered: session_new → pending only.
+    /// A worker confirmed `chunk_id` in the pre-session mmap tier through
+    /// `prefilter` (`PrefilterVerdict::Present`): record the reference.
+    ///
+    /// No second lookup is needed. The verdict came from the very mapping the
+    /// active `TieredDedupIndex` resolves against (checked by identity), and
+    /// that tier is immutable for the session — nothing removes pre-session
+    /// entries (`remove` and rollback only touch `session_new`), and a chunk in
+    /// it is never also in `session_new` or the recovered set, because every
+    /// path consults the mmap before committing or promoting a chunk.
+    ///
+    /// Errors, rather than recording a possibly dangling reference, if the
+    /// prefilter does not belong to the active tiered index.
+    pub(crate) fn bump_ref_presession_hit(
+        &mut self,
+        chunk_id: &ChunkId,
+        stored_size: u32,
+        prefilter: &DedupPrefilter,
+    ) -> Result<()> {
+        let ws = self
+            .write_session
+            .as_mut()
+            .expect("no active write session");
+        let tiered = ws
+            .tiered_dedup
+            .as_ref()
+            .filter(|t| {
+                prefilter
+                    .presession_cache()
+                    .is_some_and(|c| t.is_backed_by(c))
+            })
+            .ok_or_else(|| {
+                VykarError::Other(format!(
+                    "BUG: pre-session dedup hit for chunk {chunk_id} does not match \
+                     the active tiered dedup index"
+                ))
+            })?;
+        debug_assert_eq!(
+            tiered.get_stored_size_skip_filter(chunk_id),
+            Some(stored_size),
+            "pre-session hit must resolve to the worker's stored size"
+        );
+        let delta = ws.index_delta.as_mut().ok_or_else(|| {
+            VykarError::Other("BUG: tiered dedup mode without an index delta".into())
+        })?;
+        delta.bump_refcount(chunk_id);
+        Ok(())
+    }
+
+    /// Prefilter said "not in the pre-session set" (`PrefilterVerdict::Absent`:
+    /// a filter miss, or a false positive the worker ruled out in the mmap) —
+    /// tiered: session_new → recovered → pending only.
     /// Non-tiered: falls through to bump_ref_if_exists.
     pub fn bump_ref_prefilter_miss(&mut self, chunk_id: &ChunkId) -> Option<u32> {
         let is_tiered = {

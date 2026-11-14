@@ -14,6 +14,7 @@ use tracing::warn;
 
 use crate::compress::Compression;
 use crate::config::ChunkerConfig;
+use crate::index::dedup_cache::DedupPrefilter;
 use crate::limits::ByteRateLimiter;
 use crate::platform::fs;
 use vykar_crypto::CryptoEngine;
@@ -59,7 +60,7 @@ pub(super) fn process_file_worker(
     read_limiter: Option<&ByteRateLimiter>,
     budget: &ByteBudget,
     pre_acquired_bytes: usize,
-    dedup_filter: Option<&xorf::Xor8>,
+    prefilter: Option<&DedupPrefilter>,
 ) -> Result<ProcessedEntry> {
     match entry {
         WalkEntry::File {
@@ -99,7 +100,7 @@ pub(super) fn process_file_worker(
                     |data| {
                         let chunk_id = ChunkId::compute(chunk_hasher, &data);
                         worker_chunks
-                            .push(classify_chunk(chunk_id, data, dedup_filter, compression, crypto)?);
+                            .push(classify_chunk(chunk_id, data, prefilter, compression, crypto)?);
                         Ok(())
                     },
                 )?;
@@ -158,7 +159,7 @@ pub(super) fn process_file_worker(
                     |data| {
                         let chunk_id = ChunkId::compute(chunk_hasher, &data);
                         worker_chunks
-                            .push(classify_chunk(chunk_id, data, dedup_filter, compression, crypto)?);
+                            .push(classify_chunk(chunk_id, data, prefilter, compression, crypto)?);
                         Ok(())
                     },
                 )?;

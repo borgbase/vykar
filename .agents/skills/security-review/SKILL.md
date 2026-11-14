@@ -103,7 +103,7 @@ Hooks (`before_backup`, `after`, `failed`, etc.) execute arbitrary shell command
 
 **What to check:**
 
-- **Variable injection in hooks.** Hook templates use variables like `{error}`, `{label}`, `{repository}`. If these are interpolated directly into shell commands, an attacker who controls the error message or label name can inject shell commands. Example: a malicious repository could return an error containing `$(rm -rf /)`. Variables must be shell-escaped or passed via environment variables only (not interpolated into the command string).
+- **Variable injection in hooks.** Hook values (`VYKAR_ERROR`, `VYKAR_LABEL`, `VYKAR_REPOSITORY`, …) reach the shell through environment variables only, set in `hook_env`; the command text is run exactly as configured. Nothing derived from a run may be interpolated into the command string: an error message can carry text from a malicious repository or a file name, e.g. `$(rm -rf /)`. The old `{error}`-style placeholders are rejected at config load (`REMOVED_PLACEHOLDERS`); check that no new code path formats values into a script.
 - **Shell command construction.** Flag any hook implementation that shells out through `sh -c`/`bash -c`/`cmd /c` with untrusted input. Prefer direct argument passing where possible, or strict escaping plus allowlists for dynamic values.
 - **Hook execution environment.** Check that hooks:
   - Run with the same privileges as vykar (not elevated)

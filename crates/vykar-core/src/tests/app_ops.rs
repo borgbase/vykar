@@ -8,7 +8,7 @@ use crate::app::operations::{
     run_hooked_step, BackupRunEvent, CycleEvent, CycleStep, FullCycleResult, StepOutcome,
 };
 use crate::config::{HooksConfig, ResolvedRepo, SourceHooksConfig};
-use crate::testutil::cmd_append;
+use crate::testutil::{cmd_append, env_word};
 use vykar_types::error::VykarError;
 
 use super::helpers::{init_repo, make_test_repo, resolved_repo, source_entry};
@@ -53,9 +53,15 @@ fn hooked_repo(log: &std::path::Path) -> crate::config::ResolvedRepo {
     repo.repo_hooks = HooksConfig {
         hooks: [
             ("after", cmd_append(log, "after")),
-            ("failed", cmd_append(log, "failed:{error}")),
+            (
+                "failed",
+                cmd_append(log, &env_word("failed:", "VYKAR_ERROR", "")),
+            ),
             ("after_check", cmd_append(log, "after_check")),
-            ("failed_check", cmd_append(log, "failed_check:{error}")),
+            (
+                "failed_check",
+                cmd_append(log, &env_word("failed_check:", "VYKAR_ERROR", "")),
+            ),
         ]
         .into_iter()
         .map(|(k, v)| (k.to_string(), vec![v]))
@@ -647,7 +653,7 @@ fn partial_failure_fires_repo_failed_hook_naming_the_source() {
     let mut repo = local_repo(&tmp, &["gone", "ok"]);
     break_source(&mut repo, 0);
     let after = cmd_append(&log, "after");
-    let failed = cmd_append(&log, "failed:{error}");
+    let failed = cmd_append(&log, &env_word("failed:", "VYKAR_ERROR", ""));
     repo.repo_hooks = hooks(&[("after", after.as_str()), ("failed", failed.as_str())]);
 
     let report = run_backup_selection(&repo, &repo.sources, None, None, false, None).unwrap();

@@ -460,7 +460,7 @@ hooks:
       "gotify://hostname/token"
 ```
 
-The message bodies use the `VYKAR_*` environment variables rather than `{placeholders}`, because a placeholder [must not appear inside quotes](configuration.md#variable-substitution).
+The message bodies use the [hook variables](configuration.md#hook-variables), kept inside double quotes.
 
 Common service URL examples:
 

@@ -29,8 +29,22 @@ pub fn cmd_touch(path: &std::path::Path) -> String {
     }
 }
 
-/// Hook command that appends `value` (a raw shell word, may contain hook
-/// variables like `{error}`) as a line to `path`.
+/// A shell word that expands to `prefix`, the value of environment variable
+/// `var`, then `suffix`.
+pub fn env_word(prefix: &str, var: &str, suffix: &str) -> String {
+    #[cfg(windows)]
+    {
+        format!("\"{prefix}$($env:{var}){suffix}\"")
+    }
+
+    #[cfg(not(windows))]
+    {
+        format!("{prefix}\"${var}\"{suffix}")
+    }
+}
+
+/// Hook command that appends `value` (a raw shell word, see [`env_word`]) as a
+/// line to `path`.
 pub fn cmd_append(path: &std::path::Path, value: &str) -> String {
     #[cfg(windows)]
     {

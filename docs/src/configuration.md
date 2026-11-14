@@ -666,7 +666,7 @@ Exit `75` is only honoured in `before` hooks, at the global, repository or sourc
 | Remaining `before` hooks | Not run |
 | The command | Not run |
 | `after` / `failed` hooks | Not run |
-| `finally` hooks | Run, with `{error}` empty — an earlier `before` hook may have set up state they clean up |
+| `finally` hooks | Run, with `VYKAR_ERROR` empty — an earlier `before` hook may have set up state they clean up |
 | Exit `75` in `after` / `failed` / `finally` | Ordinary hook warning; the skip is ignored |
 | Hook killed by a signal or timed out | Still an error |
 
@@ -689,34 +689,32 @@ What each surface reports:
 
 > **Passphrases:** the CLI and daemon resolve the passphrase before hooks run. That does not connect to the repository, but a `passcommand` that needs the network can still fail before a skip hook gets to run. GUI scheduled cycles run `before` hooks first.
 
-### Variable substitution
+### Hook variables
 
-Hook commands support `{variable}` placeholders that are replaced before execution. Each placeholder expands to a complete, shell-quoted word.
+Every hook receives details about the run as environment variables. All six are always set, and are empty when they have no value.
 
-| Variable         | Description                                  |
-|------------------|----------------------------------------------|
-| `{command}`      | The vykar command name (e.g. `backup`, `prune`) |
-| `{repository}`   | Repository URL                               |
-| `{label}`        | Repository label (empty if unset)            |
-| `{error}`        | Error message (empty if no error)            |
-| `{source_label}` | Source label (empty if unset)                |
-| `{source_path}`  | Source path list (Unix `:`, Windows `;`)     |
-
-The same values are also exported as environment variables: `VYKAR_COMMAND`, `VYKAR_REPOSITORY`, `VYKAR_LABEL`, `VYKAR_ERROR`, `VYKAR_SOURCE_LABEL`, `VYKAR_SOURCE_PATH`.
-
-`{source_path}` / `VYKAR_SOURCE_PATH` joins multiple paths with `:` on Unix and `;` on Windows.
+| Variable             | Description                                  |
+|----------------------|----------------------------------------------|
+| `VYKAR_COMMAND`      | The vykar command name (e.g. `backup`, `prune`) |
+| `VYKAR_REPOSITORY`   | Repository URL                               |
+| `VYKAR_LABEL`        | Repository label                             |
+| `VYKAR_ERROR`        | Error message, empty if there was no error   |
+| `VYKAR_SOURCE_LABEL` | Source label, in per-source hooks            |
+| `VYKAR_SOURCE_PATH`  | Source paths, in per-source hooks, joined with `:` on Unix and `;` on Windows |
 
 ```yaml
 hooks:
   after_backup:
-    - 'echo Backed up {source_label} to {repository}'
+    - 'echo "Backed up to $VYKAR_REPOSITORY"'
   failed:
     - 'notify-send "vykar $VYKAR_COMMAND failed: $VYKAR_ERROR"'
 ```
 
-> **Never put a placeholder inside your own quotes.** The value arrives already single-quoted, so `"failed: {error}"` becomes `"failed: 'the message'"` — inside double quotes those single quotes are literal characters and protect nothing, and a `$(...)` or backtick in the value is executed by the shell. Use a placeholder only as a standalone argument (`logger {error}`). To embed a value in a longer string, use the environment variable inside double quotes instead, as in the `failed` hook above.
->
-> Write `$VYKAR_ERROR`, not `${VYKAR_ERROR}`: the braced form is [expanded by vykar](#environment-variable-expansion) when the config is loaded, before the hook exists. On Windows, hooks run in PowerShell, where the variables are `$env:VYKAR_ERROR` and so on.
+Always use the variables inside double quotes. Unquoted, `sh` splits the value into separate words and expands wildcards in it, and an error message is not text you control.
+
+Write `$VYKAR_ERROR`, not `${VYKAR_ERROR}`: the braced form is [expanded by vykar](#environment-variable-expansion) when the config is loaded, before the hook exists. On Windows, hooks run in PowerShell, where the variables are `$env:VYKAR_ERROR` and so on.
+
+Earlier versions also replaced `{error}`-style placeholders in the command text. They are no longer supported: vykar refuses to load a config whose hooks contain one, and the error names the variable to use instead.
 
 See [Recipes](recipes.md) for practical hook examples: database dumps, filesystem snapshots, network-aware backups, and monitoring notifications.
 

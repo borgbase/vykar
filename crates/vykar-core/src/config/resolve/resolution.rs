@@ -136,6 +136,7 @@ pub(super) fn resolve_document(
     // Check for duplicate source labels
     let mut source_labels = std::collections::HashSet::new();
     for src in &all_sources {
+        src.hooks.validate(&src.label)?;
         if !source_labels.insert(&src.label) {
             return Err(vykar_types::error::VykarError::Config(format!(
                 "duplicate source label: '{}'",
@@ -1046,6 +1047,67 @@ hooks:
         let err = load_and_resolve(&path).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("invalid hook key"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn test_hooks_reject_placeholders_at_every_level() {
+        let global = r#"
+repositories:
+  - url: /tmp/repo
+hooks:
+  failed: logger {error}
+"#;
+        let per_repo = r#"
+repositories:
+  - url: /tmp/repo
+    hooks:
+      failed:
+        - "notify-send 'vykar failed: {error}'"
+"#;
+        let per_source = r#"
+repositories:
+  - url: /tmp/repo
+sources:
+  - path: /home/user
+    label: docs
+    hooks:
+      failed: 'notify-send "vykar failed: {error}"'
+"#;
+        for (yaml, location) in [
+            (global, "hook 'failed'"),
+            (per_repo, "hook 'failed'"),
+            (per_source, "source 'docs': hook 'failed'"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("config.yaml");
+            fs::write(&path, yaml).unwrap();
+
+            let msg = load_and_resolve(&path).unwrap_err().to_string();
+            assert!(msg.contains(location), "unexpected error: {msg}");
+            assert!(msg.contains("{error}"), "unexpected error: {msg}");
+            assert!(msg.contains("VYKAR_ERROR"), "unexpected error: {msg}");
+        }
+    }
+
+    #[test]
+    fn test_hooks_accept_env_vars() {
+        let yaml = r#"
+repositories:
+  - url: /tmp/repo
+hooks:
+  after_backup: 'echo "Backed up to $VYKAR_REPOSITORY"'
+  failed: 'notify-send "vykar $VYKAR_COMMAND failed: $VYKAR_ERROR"'
+sources:
+  - path: /home/user
+    label: docs
+    hooks:
+      failed: 'logger "$VYKAR_SOURCE_LABEL: $VYKAR_ERROR"'
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        fs::write(&path, yaml).unwrap();
+
+        load_and_resolve(&path).unwrap();
     }
 
     #[test]

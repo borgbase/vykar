@@ -39,9 +39,9 @@ compression:
 #
 # hooks:
 #   before_backup:
-#     - "echo starting backup for {repository}"
+#     - 'echo "starting backup for $VYKAR_REPOSITORY"'
 #   failed:
-#     - "notify-send 'vykar {command} failed: {error}'"
+#     - 'notify-send "vykar $VYKAR_COMMAND failed: $VYKAR_ERROR"'
 
 # --- Sources (what to back up) ----------------------------------------------
 

@@ -14,7 +14,7 @@ const HOOK_TIMEOUT: Duration = Duration::from_secs(300);
 /// also what borgmatic uses for this.
 const HOOK_SKIP_EXIT_CODE: i32 = 75;
 
-/// Context passed to hook commands via environment variables and variable substitution.
+/// Context passed to hook commands via environment variables.
 pub(crate) struct HookContext {
     pub command: String,
     pub repository: String,
@@ -32,7 +32,7 @@ pub(crate) struct HookContext {
 pub(crate) enum Verdict {
     /// Fire `after`.
     Success,
-    /// Fire `failed`; the message becomes `{error}`.
+    /// Fire `failed`; the message becomes `VYKAR_ERROR`.
     Failed(String),
     /// The action chose not to run: fire neither `after` nor `failed`.
     Skipped,
@@ -110,7 +110,7 @@ fn run_repo_phase(global: &HooksConfig, repo: &HooksConfig, phase: &str, ctx: &m
 ///    `Err(VykarError::Skipped)`.
 /// 2. The action.
 /// 3. As judged by `verdict(&r)`: `after`, `failed` (with the message as
-///    `{error}`), or neither for [`Verdict::Skipped`].
+///    `VYKAR_ERROR`), or neither for [`Verdict::Skipped`].
 /// 4. `finally`, always.
 ///
 /// `after` / `failed` / `finally` failures are non-fatal: they are pushed to
@@ -195,30 +195,13 @@ fn run_hook_list(cmds: &[String], ctx: &HookContext) -> Result<()> {
 }
 
 fn execute_hook_command(cmd: &str, ctx: &HookContext) -> Result<()> {
-    let expanded = substitute_variables(cmd, ctx);
     tracing::info!("Running hook: {cmd}");
 
-    let mut child = shell::command_for_script(&expanded);
+    // Values reach the hook through the environment only, never through the
+    // command text, so nothing in them is parsed by the shell.
+    let mut child = shell::command_for_script(cmd);
     child.env_remove("VYKAR_PASSPHRASE");
-
-    // Set environment variables
-    child.env("VYKAR_COMMAND", &ctx.command);
-    child.env("VYKAR_REPOSITORY", &ctx.repository);
-    if let Some(ref label) = ctx.label {
-        child.env("VYKAR_LABEL", label);
-    }
-    if let Some(ref error) = ctx.error {
-        child.env("VYKAR_ERROR", error);
-    }
-    if let Some(ref source_label) = ctx.source_label {
-        child.env("VYKAR_SOURCE_LABEL", source_label);
-    }
-    if let Some(ref source_paths) = ctx.source_paths {
-        child.env(
-            "VYKAR_SOURCE_PATH",
-            source_paths.join(source_paths_separator()),
-        );
-    }
+    child.envs(hook_env(ctx));
 
     // Use the non-capturing variant: hooks inherit stdout/stderr so output
     // goes directly to the user's terminal (better UX than capturing).
@@ -242,42 +225,25 @@ fn execute_hook_command(cmd: &str, ctx: &HookContext) -> Result<()> {
     Ok(())
 }
 
-fn substitute_variables(cmd: &str, ctx: &HookContext) -> String {
-    let mut result = cmd.replace("{command}", &shell_escape(&ctx.command));
-    result = result.replace("{repository}", &shell_escape(&ctx.repository));
-    result = result.replace("{label}", &shell_escape(ctx.label.as_deref().unwrap_or("")));
-    result = result.replace("{error}", &shell_escape(ctx.error.as_deref().unwrap_or("")));
-    result = result.replace(
-        "{source_label}",
-        &shell_escape(ctx.source_label.as_deref().unwrap_or("")),
-    );
-    let source_path_str = ctx
+/// Every variable is always set, empty when it has no value, so a hook never
+/// sees one inherited from vykar's own environment.
+fn hook_env(ctx: &HookContext) -> [(&'static str, String); 6] {
+    let source_path = ctx
         .source_paths
         .as_ref()
         .map(|ps| ps.join(source_paths_separator()))
         .unwrap_or_default();
-    result = result.replace("{source_path}", &shell_escape(&source_path_str));
-    result
-}
-
-fn shell_escape(input: &str) -> String {
-    #[cfg(windows)]
-    {
-        if input.is_empty() {
-            return "''".to_string();
-        }
-        let escaped = input.replace('\'', "''");
-        return format!("'{escaped}'");
-    }
-
-    #[cfg(not(windows))]
-    {
-        if input.is_empty() {
-            return "''".to_string();
-        }
-        let escaped = input.replace('\'', "'\"'\"'");
-        format!("'{escaped}'")
-    }
+    [
+        ("VYKAR_COMMAND", ctx.command.clone()),
+        ("VYKAR_REPOSITORY", ctx.repository.clone()),
+        ("VYKAR_LABEL", ctx.label.clone().unwrap_or_default()),
+        ("VYKAR_ERROR", ctx.error.clone().unwrap_or_default()),
+        (
+            "VYKAR_SOURCE_LABEL",
+            ctx.source_label.clone().unwrap_or_default(),
+        ),
+        ("VYKAR_SOURCE_PATH", source_path),
+    ]
 }
 
 fn source_paths_separator() -> &'static str {
@@ -308,7 +274,7 @@ fn log_hook_errors(result: Result<()>, ctx: &mut HookContext) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::{cmd_append, cmd_touch};
+    use crate::testutil::{cmd_append, cmd_touch, env_word};
 
     fn make_ctx(command: &str) -> HookContext {
         HookContext {
@@ -364,58 +330,71 @@ mod tests {
     }
 
     #[test]
-    fn test_variable_substitution() {
+    fn test_hook_env_sets_every_variable() {
         let ctx = HookContext {
             command: "backup".into(),
             repository: "/mnt/nas".into(),
             label: Some("nas".into()),
             error: Some("disk full".into()),
             source_label: Some("docs".into()),
-            source_paths: Some(vec!["/home/user/docs".into()]),
-            warnings: Vec::new(),
-        };
-        let result = substitute_variables(
-            "echo {command} {repository} {label} {error} {source_label} {source_path}",
-            &ctx,
-        );
-        assert_eq!(
-            result,
-            "echo 'backup' '/mnt/nas' 'nas' 'disk full' 'docs' '/home/user/docs'"
-        );
-    }
-
-    #[test]
-    fn test_variable_substitution_multi_paths() {
-        let ctx = HookContext {
-            command: "backup".into(),
-            repository: "/mnt/nas".into(),
-            label: Some("nas".into()),
-            error: None,
-            source_label: Some("default".into()),
             source_paths: Some(vec!["/home/user/docs".into(), "/home/user/photos".into()]),
             warnings: Vec::new(),
         };
-        let result = substitute_variables("paths={source_path}", &ctx);
-        let expected_sep = if cfg!(windows) { ";" } else { ":" };
+        let sep = source_paths_separator();
         assert_eq!(
-            result,
-            format!("paths='/home/user/docs{expected_sep}/home/user/photos'")
+            hook_env(&ctx),
+            [
+                ("VYKAR_COMMAND", "backup".to_string()),
+                ("VYKAR_REPOSITORY", "/mnt/nas".to_string()),
+                ("VYKAR_LABEL", "nas".to_string()),
+                ("VYKAR_ERROR", "disk full".to_string()),
+                ("VYKAR_SOURCE_LABEL", "docs".to_string()),
+                (
+                    "VYKAR_SOURCE_PATH",
+                    format!("/home/user/docs{sep}/home/user/photos")
+                ),
+            ]
         );
     }
 
     #[test]
-    fn test_variable_substitution_missing_optionals() {
-        let ctx = HookContext {
-            command: "backup".into(),
-            repository: "/tmp/repo".into(),
-            label: None,
-            error: None,
-            source_label: None,
-            source_paths: None,
-            warnings: Vec::new(),
-        };
-        let result = substitute_variables("cmd={command} label={label} err={error}", &ctx);
-        assert_eq!(result, "cmd='backup' label='' err=''");
+    fn test_hook_env_sets_absent_values_to_empty() {
+        let mut ctx = make_ctx("backup");
+        ctx.label = None;
+        let env = hook_env(&ctx);
+        for name in [
+            "VYKAR_LABEL",
+            "VYKAR_ERROR",
+            "VYKAR_SOURCE_LABEL",
+            "VYKAR_SOURCE_PATH",
+        ] {
+            let value = env
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, v)| v.as_str());
+            assert_eq!(value, Some(""), "{name}");
+        }
+    }
+
+    #[test]
+    fn test_error_text_is_not_evaluated_by_the_shell() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("log");
+        let marker = dir.path().join("injected");
+        let payload = format!("$({}) `{}`", cmd_touch(&marker), cmd_touch(&marker));
+        let failed = cmd_append(&log, &env_word("", "VYKAR_ERROR", ""));
+
+        let global = hooks_from(&[("failed", vec![failed.as_str()])]);
+        let repo = HooksConfig::default();
+        let mut ctx = make_ctx("backup");
+
+        let result: Result<()> =
+            run_with_hooks(&global, &repo, &mut ctx, || Err(VykarError::Other(payload)));
+
+        assert!(result.is_err());
+        assert!(ctx.warnings.is_empty(), "{:?}", ctx.warnings);
+        assert!(!marker.exists(), "the error text was executed");
+        assert_eq!(read_lines(&log).len(), 1);
     }
 
     #[test]
@@ -628,7 +607,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("log");
         let after_cmd = cmd_append(&log, "after");
-        let failed_cmd = cmd_append(&log, "{error}");
+        let failed_cmd = cmd_append(&log, &env_word("", "VYKAR_ERROR", ""));
 
         let global = hooks_from(&[
             ("after", vec![after_cmd.as_str()]),
@@ -742,7 +721,7 @@ mod tests {
     fn test_before_error_reaches_failed_hooks() {
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("log");
-        let failed_cmd = cmd_append(&log, "{error}");
+        let failed_cmd = cmd_append(&log, &env_word("", "VYKAR_ERROR", ""));
 
         let global = hooks_from(&[
             ("before", vec![cmd_false()]),
@@ -795,7 +774,7 @@ mod tests {
         let log = dir.path().join("log");
         let after = cmd_append(&log, "after");
         let failed = cmd_append(&log, "failed");
-        let finally = cmd_append(&log, "finally:{error}:");
+        let finally = cmd_append(&log, &env_word("finally:", "VYKAR_ERROR", ":"));
 
         let global = hooks_from(&[
             ("before", vec![CMD_SKIP]),
@@ -819,7 +798,7 @@ mod tests {
         let lines = read_lines(&log);
         assert_eq!(lines.len(), 1, "only finally runs: {lines:?}");
         assert!(lines[0].starts_with("finally:"), "{lines:?}");
-        assert!(!lines[0].contains("skip"), "{{error}} is empty: {lines:?}");
+        assert_eq!(lines[0], "finally::", "VYKAR_ERROR is empty: {lines:?}");
     }
 
     #[test]

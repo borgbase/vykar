@@ -43,7 +43,21 @@ uv run --project scripts/testbench stress --iterations 50 --check-every 5 --veri
 ```bash
 uv run --project scripts/testbench profile --mode backup --backend local
 uv run --project scripts/testbench profile --mode backup --profiler perf --skip-build
+uv run --project scripts/testbench profile --mode backup-incremental --skip-build
 ```
+
+`backup` profiles a backup of the whole corpus into a repo seeded with `snapshot-1`; `backup-incremental` re-runs a backup of an unchanged corpus (repo open, cache-hit walk, commit).
+
+### `mem-ab` — interleaved A/B peak-RSS comparison
+
+Peak RSS drifts between sweeps and varies run to run, so binaries are only comparable within one sweep. `mem-ab` runs every variant once per round, rotates the order, restores the same repository and cache snapshot before each run, and reports medians plus round-paired deltas against the first variant. Run it with two copies of the same binary first to see the noise floor.
+
+```bash
+uv run --project scripts/testbench mem-ab --variant base=/path/to/vykar-base --variant cand=target/profiling/vykar
+uv run --project scripts/testbench mem-ab --variant base=a --variant cand=b --workload incremental --rounds 8
+```
+
+Sweeps take a host-wide lock (`/tmp/vykar-mem-ab.lock`), so concurrent invocations queue instead of perturbing each other.
 
 ## Tests
 

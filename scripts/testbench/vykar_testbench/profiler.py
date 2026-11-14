@@ -38,8 +38,8 @@ def main() -> None:
     parser.add_argument(
         "--mode",
         required=True,
-        choices=["backup", "restore", "compact", "prune", "check"],
-        help="profiling mode",
+        choices=["backup", "backup-incremental", "restore", "compact", "prune", "check"],
+        help="profiling mode (backup-incremental re-runs a backup of an unchanged source)",
     )
     parser.add_argument(
         "--backend",
@@ -223,6 +223,13 @@ def main() -> None:
     if args.mode == "backup":
         setup_reset_and_init()
         setup_backup(snapshot_label, seed_source_path)
+        profile_cmd = [vykar_bin, "--config", config_path, "backup", "-R", repo_label, "-l", snapshot_label, source_path]
+
+    elif args.mode == "backup-incremental":
+        # Same source, nothing changed: profiles repo open, the cache-hit walk
+        # and the commit rather than chunking and pack writes.
+        setup_reset_and_init()
+        setup_backup(snapshot_label, source_path)
         profile_cmd = [vykar_bin, "--config", config_path, "backup", "-R", repo_label, "-l", snapshot_label, source_path]
 
     elif args.mode == "restore":

@@ -680,24 +680,35 @@ impl Repository {
 
     /// Reload the full chunk index + generation from storage.
     fn reload_full_index_with_generation(&self) -> Result<(u64, ChunkIndex)> {
-        if let Some(index_data) = self.storage.get("index")? {
-            let blob = Self::decode_index_blob_full(&index_data, self.crypto.as_ref())?;
-            Ok((blob.generation, blob.chunks))
-        } else {
-            Ok((0, ChunkIndex::new()))
-        }
+        let Some(index_data) = self.storage.get("index")? else {
+            return Ok((0, ChunkIndex::new()));
+        };
+        // Free the ciphertext before building the index from the plaintext.
+        let compressed = Self::unpack_index_blob(&index_data, self.crypto.as_ref())?;
+        drop(index_data);
+        let blob = Self::decode_unpacked_index_blob(&compressed)?;
+        Ok((blob.generation, blob.chunks))
     }
 
     /// Decrypt, decompress, and deserialize an index blob into an `IndexBlob`.
     fn decode_index_blob_full(index_data: &[u8], crypto: &dyn CryptoEngine) -> Result<IndexBlob> {
-        let compressed = unpack_object_expect_with_context(
+        Self::decode_unpacked_index_blob(&Self::unpack_index_blob(index_data, crypto)?)
+    }
+
+    /// Decrypt an index blob, returning its still-compressed payload.
+    fn unpack_index_blob(index_data: &[u8], crypto: &dyn CryptoEngine) -> Result<Vec<u8>> {
+        unpack_object_expect_with_context(
             index_data,
             ObjectType::ChunkIndex,
             INDEX_OBJECT_CONTEXT,
             crypto,
-        )?;
-        let index_bytes = compress::decompress_metadata(&compressed)?;
-        Ok(rmp_serde::from_slice(&index_bytes)?)
+        )
+    }
+
+    /// Decompress and deserialize an index payload without materializing
+    /// the decompressed msgpack (see [`compress::decode_metadata_msgpack`]).
+    fn decode_unpacked_index_blob(compressed: &[u8]) -> Result<IndexBlob> {
+        Ok(compress::decode_metadata_msgpack(compressed)?.0)
     }
 
     /// Try the fast-path commit: if the remote index blob matches the cached

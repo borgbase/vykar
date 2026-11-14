@@ -308,6 +308,60 @@ pub fn decompress_metadata(data: &[u8]) -> Result<Vec<u8>> {
     decompress_impl(data, None, MAX_METADATA_DECOMPRESS_SIZE)
 }
 
+/// Decode a msgpack value directly from a compressed metadata payload.
+///
+/// Equivalent to `rmp_serde::from_slice(&decompress_metadata(data)?)`, but
+/// for ZSTD the plaintext is never materialized: msgpack is decoded straight
+/// out of the streaming decoder. For a large chunk index this avoids holding
+/// the full decompressed msgpack (tens of MiB) alongside the structure being
+/// built from it. The frame is still read to its end after decoding, so a
+/// malformed or truncated frame and the size limit are rejected exactly as in
+/// [`decompress_metadata`]. LZ4 and uncompressed payloads fall back to the
+/// buffered path.
+///
+/// Returns the value and the decompressed size in bytes.
+pub fn decode_metadata_msgpack<T: serde::de::DeserializeOwned>(data: &[u8]) -> Result<(T, u64)> {
+    if data.first() != Some(&TAG_ZSTD) {
+        let raw = decompress_metadata(data)?;
+        let value = rmp_serde::from_slice(&raw)?;
+        return Ok((value, raw.len() as u64));
+    }
+    let decoder = zstd::stream::Decoder::new(std::io::Cursor::new(&data[1..]))
+        .map_err(|e| VykarError::Decompression(format!("zstd init: {e}")))?;
+    // rmp-serde issues many tiny reads; each would otherwise be a separate
+    // ZSTD_decompressStream call.
+    let mut reader = CountingReader {
+        inner: std::io::BufReader::with_capacity(
+            64 * 1024,
+            decoder.take(MAX_METADATA_DECOMPRESS_SIZE + 1),
+        ),
+        count: 0,
+    };
+    let value = rmp_serde::from_read(&mut reader)?;
+    std::io::copy(&mut reader, &mut std::io::sink())
+        .map_err(|e| VykarError::Decompression(format!("zstd: {e}")))?;
+    if reader.count > MAX_METADATA_DECOMPRESS_SIZE {
+        return Err(VykarError::Decompression(format!(
+            "zstd: decompressed size exceeds limit of {MAX_METADATA_DECOMPRESS_SIZE} bytes",
+        )));
+    }
+    Ok((value, reader.count))
+}
+
+/// `Read` adapter that counts the bytes passed through it.
+struct CountingReader<R> {
+    inner: R,
+    count: u64,
+}
+
+impl<R: Read> Read for CountingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.count += n as u64;
+        Ok(n)
+    }
+}
+
 /// Stream-compress data into `buf` using ZSTD. Prepends the codec tag byte.
 /// The `write_data` callback should write uncompressed data into the encoder.
 pub fn compress_stream_zstd<F>(buf: &mut Vec<u8>, level: i32, write_data: F) -> Result<()>
@@ -523,6 +577,37 @@ mod tests {
         // decompress_metadata() should succeed (4 GiB limit)
         let decompressed = decompress_metadata(&compressed).unwrap();
         assert_eq!(decompressed, payload);
+    }
+
+    #[test]
+    fn decode_metadata_msgpack_matches_buffered_decode_all_codecs() {
+        let value: std::collections::BTreeMap<String, Vec<u64>> = (0..2000)
+            .map(|i| (format!("key-{i}"), (0..i % 17).collect()))
+            .collect();
+        let encoded = rmp_serde::to_vec(&value).unwrap();
+        for codec in [
+            Compression::None,
+            Compression::Lz4,
+            Compression::Zstd { level: 3 },
+        ] {
+            let compressed = compress(codec, &encoded).unwrap();
+            let (decoded, size): (std::collections::BTreeMap<String, Vec<u64>>, u64) =
+                decode_metadata_msgpack(&compressed).unwrap();
+            assert_eq!(decoded, value, "{codec:?}");
+            assert_eq!(size, encoded.len() as u64, "{codec:?}");
+        }
+    }
+
+    #[test]
+    fn decode_metadata_msgpack_rejects_truncated_zstd_tail() {
+        // A frame truncated after the msgpack value must still be rejected,
+        // as the buffered path would: the frame is read to its end.
+        let mut encoded = rmp_serde::to_vec(&vec![7u64; 1000]).unwrap();
+        encoded.extend((0..200_000u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8));
+        let mut compressed = compress(Compression::Zstd { level: 3 }, &encoded).unwrap();
+        compressed.truncate(compressed.len() - 16);
+        assert!(decompress_metadata(&compressed).is_err());
+        assert!(decode_metadata_msgpack::<Vec<u64>>(&compressed).is_err());
     }
 
     #[test]

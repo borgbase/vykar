@@ -337,37 +337,97 @@ fn decode_metadata_msgpack_inner<T: serde::de::DeserializeOwned>(data: &[u8]) ->
     }
     let decoder = zstd::stream::Decoder::new(std::io::Cursor::new(&data[1..]))
         .map_err(|e| VykarError::Decompression(format!("zstd init: {e}")))?;
-    // rmp-serde issues many tiny reads; each would otherwise be a separate
-    // ZSTD_decompressStream call.
-    let mut reader = CountingReader {
-        inner: std::io::BufReader::with_capacity(
-            64 * 1024,
-            decoder.take(MAX_METADATA_DECOMPRESS_SIZE + 1),
-        ),
-        count: 0,
-    };
+    let mut reader = MsgpackStreamReader::new(decoder.take(MAX_METADATA_DECOMPRESS_SIZE + 1));
     let value = rmp_serde::from_read(&mut reader)?;
-    std::io::copy(&mut reader, &mut std::io::sink())
+    let total = reader
+        .drain()
         .map_err(|e| VykarError::Decompression(format!("zstd: {e}")))?;
-    if reader.count > MAX_METADATA_DECOMPRESS_SIZE {
+    if total > MAX_METADATA_DECOMPRESS_SIZE {
         return Err(VykarError::Decompression(format!(
             "zstd: decompressed size exceeds limit of {MAX_METADATA_DECOMPRESS_SIZE} bytes",
         )));
     }
-    Ok((value, reader.count))
+    Ok((value, total))
 }
 
-/// `Read` adapter that counts the bytes passed through it.
-struct CountingReader<R> {
+/// Buffered reader tuned for rmp-serde, which issues a `read_exact` for every
+/// marker byte and every short field: millions of 1-32 byte reads for a large
+/// index or file cache. `std::io::BufReader` (plus a counting wrapper) costs
+/// enough per call that streaming decode ran ~1.6x slower than decoding a
+/// buffered slice; here the in-buffer case is a bounds check and a copy.
+/// Counts the bytes pulled from `inner` (at refill), so after [`Self::drain`]
+/// the total is the full decompressed size.
+struct MsgpackStreamReader<R> {
     inner: R,
-    count: u64,
+    buf: Box<[u8]>,
+    pos: usize,
+    filled: usize,
+    total: u64,
 }
 
-impl<R: Read> Read for CountingReader<R> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let n = self.inner.read(buf)?;
-        self.count += n as u64;
+impl<R: Read> MsgpackStreamReader<R> {
+    const CAPACITY: usize = 64 * 1024;
+
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            buf: vec![0u8; Self::CAPACITY].into_boxed_slice(),
+            pos: 0,
+            filled: 0,
+            total: 0,
+        }
+    }
+
+    /// Refill the (fully consumed) buffer; returns the bytes read, 0 at EOF.
+    fn refill(&mut self) -> std::io::Result<usize> {
+        let n = loop {
+            match self.inner.read(&mut self.buf) {
+                Ok(n) => break n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        };
+        self.pos = 0;
+        self.filled = n;
+        self.total += n as u64;
         Ok(n)
+    }
+
+    /// Read `inner` to its end (so a truncated or malformed frame tail is
+    /// still detected) and return the total number of bytes it produced.
+    fn drain(mut self) -> std::io::Result<u64> {
+        while self.refill()? != 0 {}
+        Ok(self.total)
+    }
+}
+
+impl<R: Read> Read for MsgpackStreamReader<R> {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        if self.pos == self.filled && self.refill()? == 0 {
+            return Ok(0);
+        }
+        let n = out.len().min(self.filled - self.pos);
+        out[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
+    }
+
+    #[inline]
+    fn read_exact(&mut self, out: &mut [u8]) -> std::io::Result<()> {
+        if self.filled - self.pos >= out.len() {
+            let end = self.pos + out.len();
+            out.copy_from_slice(&self.buf[self.pos..end]);
+            self.pos = end;
+            return Ok(());
+        }
+        let mut rest = out;
+        while !rest.is_empty() {
+            match self.read(rest)? {
+                0 => return Err(std::io::ErrorKind::UnexpectedEof.into()),
+                n => rest = &mut rest[n..],
+            }
+        }
+        Ok(())
     }
 }
 
@@ -605,6 +665,33 @@ mod tests {
             assert_eq!(decoded, value, "{codec:?}");
             assert_eq!(size, encoded.len() as u64, "{codec:?}");
         }
+    }
+
+    #[test]
+    fn msgpack_stream_reader_reads_across_refills_and_counts() {
+        let data: Vec<u8> = (0..400_000u32).map(|i| (i * 7 + i / 3) as u8).collect();
+        let mut r = MsgpackStreamReader::new(&data[..]);
+        let mut out = Vec::new();
+        // Mixed exact reads straddling the 64 KiB buffer boundary.
+        let mut sizes = [1usize, 3, 32, 7, 65_535, 2, 100_000].iter().cycle();
+        while out.len() < 250_000 {
+            let n = *sizes.next().unwrap();
+            let mut chunk = vec![0u8; n];
+            r.read_exact(&mut chunk).unwrap();
+            out.extend_from_slice(&chunk);
+        }
+        let mut tail = vec![0u8; 10];
+        let n = r.read(&mut tail).unwrap();
+        out.extend_from_slice(&tail[..n]);
+        assert_eq!(out[..], data[..out.len()]);
+        assert_eq!(r.drain().unwrap(), data.len() as u64);
+
+        let mut short = MsgpackStreamReader::new(&data[..10]);
+        let mut buf = [0u8; 11];
+        assert_eq!(
+            short.read_exact(&mut buf).unwrap_err().kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
     }
 
     #[test]

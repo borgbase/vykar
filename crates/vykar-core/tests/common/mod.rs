@@ -151,9 +151,13 @@ pub fn assert_pack_names(repo_dir: &Path, algo: HashAlgorithm) {
     let mut visited = 0usize;
     for shard in std::fs::read_dir(repo_dir.join("packs")).unwrap() {
         let shard = shard.unwrap().path();
-        if !shard.is_dir() {
-            continue;
-        }
+        // Local backups stage packs as `packs/.tmp.*`; a finished operation
+        // must have renamed or removed every one.
+        assert!(
+            shard.is_dir(),
+            "unexpected file {} directly under packs/",
+            shard.display()
+        );
         let shard_name = shard.file_name().unwrap().to_string_lossy().into_owned();
         for pack in std::fs::read_dir(&shard).unwrap() {
             let pack = pack.unwrap().path();

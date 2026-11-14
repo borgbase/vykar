@@ -149,6 +149,25 @@ pub trait StorageBackend: Send + Sync {
         self.put(key, &data)
     }
 
+    /// Start writing an object incrementally, for callers that only learn
+    /// its key once every byte is written (a pack is named by the hash of
+    /// its contents). The bytes are staged under the directory key `prefix`
+    /// (e.g. `"packs"`), and [`StagedPut::commit`] must name a key below it.
+    ///
+    /// Returns `Ok(None)` when the backend cannot stage writes; the caller
+    /// then buffers the object and uses [`Self::put_owned`]. That is the
+    /// default, and the right answer for every backend whose upload needs the
+    /// whole object up front (S3, SFTP, REST).
+    ///
+    /// A wrapper that intercepts `put`/`put_owned` (rate limiting, test
+    /// recorders) must also decide what to do here, or staged objects bypass
+    /// it; [`crate::delegate_storage_backend!`] refuses to compile a wrapper
+    /// that overrides one without the other. Returning `Ok(None)` keeps every
+    /// object on the `put` path the wrapper already intercepts.
+    fn begin_staged_put(&self, _prefix: &str) -> Result<Option<Box<dyn StagedPut>>> {
+        Ok(None)
+    }
+
     /// Return the size in bytes of an object. Returns `None` if not found.
     ///
     /// Backends should override this with a metadata-only operation (e.g.
@@ -189,7 +208,9 @@ pub trait StorageBackend: Send + Sync {
     //
     // The methods above may keep defaults: each routes back through this
     // impl's own `get`/`put`/`get_range`/`list`, so inheriting one is correct (at
-    // worst less efficient), never a silent loss of capability.
+    // worst less efficient), never a silent loss of capability. The one
+    // exception, `begin_staged_put`, defaults to `Ok(None)` ("buffer and
+    // `put` instead"), which is likewise only ever less efficient.
 
     /// Delete temp files ([`vykar_protocol::is_repo_temp_file`]) last
     /// modified at least `older_than` ago (`Duration::ZERO` = all), in the
@@ -252,6 +273,23 @@ pub trait StorageBackend: Send + Sync {
     /// Reports `UnsupportedBackend` for every backend that has no server
     /// behind it; callers treat that as "nothing to check".
     fn server_capabilities(&self) -> Result<ServerCapabilities>;
+}
+
+/// An object being written incrementally; see
+/// [`StorageBackend::begin_staged_put`].
+///
+/// Nothing is visible under any key until [`Self::commit`] returns `Ok`.
+/// Dropping it uncommitted discards the staged bytes. A crash leaves at most a
+/// [`vykar_protocol::TEMP_FILE_PREFIX`] file that
+/// [`StorageBackend::remove_stale_temp_files`] sweeps.
+pub trait StagedPut: Send {
+    /// Append `data` to the object.
+    fn append(&mut self, data: &[u8]) -> Result<()>;
+
+    /// Publish everything appended under `key`, with the visibility and
+    /// durability contract of [`StorageBackend::put`]: after `Ok` the object
+    /// is complete and as durable as a `put` of the same bytes would be.
+    fn commit(self: Box<Self>, key: &str) -> Result<()>;
 }
 
 /// One entry of [`StorageBackend::list_sized`].

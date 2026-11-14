@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use vykar_storage::StorageBackend;
+use vykar_storage::{StagedPut, StorageBackend};
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
-use vykar_types::hash::HashAlgorithm;
+use vykar_types::hash::{HashAlgorithm, Hasher256};
 use vykar_types::pack_id::PackId;
 
 use vykar_protocol::{validate_pack_header, PACK_HEADER_SIZE, PACK_MAGIC, PACK_VERSION_CURRENT};
@@ -37,9 +37,24 @@ pub type PackedChunkEntry = (ChunkId, u32, u64, u32);
 /// Result of flushing a pack to storage: (pack_id, chunk entries).
 pub type FlushedPackResult = (PackId, Vec<PackedChunkEntry>);
 
-/// Buffer backing a pack writer — heap-allocated Vec<u8>.
+/// Storage directory key that staged packs are written under (the final key
+/// is `packs/<shard>/<id>`, below it).
+const PACK_STAGING_PREFIX: &str = "packs";
+
+/// Where a pack writer's bytes go while the pack fills.
 enum PackBuffer {
+    /// Heap buffer, uploaded whole once sealed.
     Memory(Vec<u8>),
+    /// Streamed to the backend as blobs arrive (local repositories), hashed
+    /// on the way so the pack ID is known at seal without the bytes.
+    Staged {
+        object: Box<dyn StagedPut>,
+        hasher: Hasher256,
+    },
+    /// A staged append failed. The partial pack was discarded, so blobs the
+    /// writer already accepted (and handed out as dedup hits) can never be
+    /// stored; every later `add_blob` and `seal` fails.
+    Failed,
 }
 
 /// A sealed pack ready for upload. Destructurable so callers can split ownership
@@ -50,9 +65,13 @@ pub struct SealedPack {
     pub data: SealedData,
 }
 
-/// Sealed pack data — heap-backed buffer ready for upload.
+/// Sealed pack data ready for upload.
 pub enum SealedData {
+    /// Heap buffer holding the whole pack.
     Memory(Vec<u8>),
+    /// Every byte already written to the backend's staging area; uploading
+    /// is the backend's commit (fsync + rename for local repositories).
+    Staged(Box<dyn StagedPut>),
 }
 
 // Compile-time assertion: SealedData must be Send for thread::spawn upload.
@@ -64,30 +83,59 @@ const _: () = {
 };
 
 impl SealedData {
-    pub fn as_slice(&self) -> &[u8] {
-        let SealedData::Memory(v) = self;
-        v.as_slice()
+    /// The whole pack, when it is heap-buffered (`None` once staged: those
+    /// bytes are only in the backend's temp file).
+    pub fn as_bytes(&self) -> Option<&[u8]> {
+        match self {
+            SealedData::Memory(v) => Some(v),
+            SealedData::Staged(_) => None,
+        }
     }
 
     /// Heap bytes held by this sealed pack (buffer capacity, not length).
+    /// A staged pack lives in the backend's staging file, not on the heap;
+    /// its small write buffer is not counted.
     pub fn capacity(&self) -> usize {
-        let SealedData::Memory(v) = self;
-        v.capacity()
+        match self {
+            SealedData::Memory(v) => v.capacity(),
+            SealedData::Staged(_) => 0,
+        }
     }
 
-    /// Upload pack data via `put_owned` (zero-copy for backends that support owned buffers).
+    /// Upload pack data: `put_owned` for a heap buffer (zero-copy for
+    /// backends that support owned buffers), `commit` for a staged one.
     pub fn put_to(self, storage: &dyn StorageBackend, key: &str) -> Result<()> {
-        let SealedData::Memory(v) = self;
-        storage.put_owned(key, v)
+        match self {
+            SealedData::Memory(v) => storage.put_owned(key, v),
+            SealedData::Staged(object) => object.commit(key),
+        }
+    }
+}
+
+fn failed_writer_error() -> VykarError {
+    VykarError::Other("pack writer is unusable after an earlier write failure".into())
+}
+
+/// A failed append to a staged pack. Reported as `Other`, not `Io`: an EIO or
+/// permission error from the *repository* must not look like the per-file
+/// source read errors that `is_soft_file_error` lets the backup skip.
+fn staged_write_error(e: VykarError) -> VykarError {
+    match e {
+        VykarError::Io(io) => VykarError::Other(format!("writing pack to repository: {io}")),
+        other => other,
     }
 }
 
 /// Accumulates encrypted blobs and flushes them as pack files.
 ///
-/// All pack types use heap-allocated `Vec<u8>` buffers. Previous versions used
-/// writable file-backed mmap (`MmapMut`) for data packs, but this caused
-/// `D`-state hangs and `balance_dirty_pages` stalls on some systems (e.g.
-/// TrueNAS/musl), so it was removed in favour of simple heap buffers.
+/// By default the pack is assembled in a heap `Vec<u8>`. When the caller
+/// passes a backend to [`Self::add_blob_to`] that can stage writes (local
+/// repositories), the bytes are streamed to a temp file instead, so neither
+/// the filling pack nor the sealed one waiting for its fsync occupies the
+/// heap. That is plain `write(2)` from the caller's thread; an earlier
+/// version backed data packs with a writable file mmap (`MmapMut`), which
+/// caused `D`-state hangs and `balance_dirty_pages` stalls on some systems
+/// (e.g. TrueNAS/musl) and was removed.
 pub struct PackWriter {
     pack_type: PackType,
     target_size: usize,
@@ -95,7 +143,7 @@ pub struct PackWriter {
     /// Bound at construction so a writer cannot produce a pack ID under an
     /// algorithm the repository does not use.
     hash_algo: HashAlgorithm,
-    /// Heap-backed buffer. None until first blob.
+    /// Pack bytes so far. None until first blob.
     buffer: Option<PackBuffer>,
     /// Lightweight metadata per blob (no data — data lives in the buffer).
     blob_meta: Vec<BlobMeta>,
@@ -125,40 +173,93 @@ impl PackWriter {
         self.hash_algo
     }
 
-    /// Initialize the heap-backed pack buffer on first blob.
-    fn init_buffer(&mut self) {
+    /// Initialize the pack buffer on first blob: staged in `stage` if given
+    /// and able to, otherwise on the heap.
+    fn init_buffer(&mut self, stage: Option<&dyn StorageBackend>) -> Result<()> {
+        let header = [PACK_MAGIC.as_slice(), &[PACK_VERSION_CURRENT]].concat();
+        if let Some(storage) = stage {
+            if let Some(mut object) = storage
+                .begin_staged_put(PACK_STAGING_PREFIX)
+                .map_err(staged_write_error)?
+            {
+                object.append(&header).map_err(staged_write_error)?;
+                let mut hasher = Hasher256::new(self.hash_algo);
+                hasher.update(&header);
+                self.buffer = Some(PackBuffer::Staged { object, hasher });
+                return Ok(());
+            }
+        }
         let mut v = Vec::with_capacity(PACK_HEADER_SIZE + self.target_size.min(512 * 1024 * 1024));
-        v.extend_from_slice(PACK_MAGIC);
-        v.push(PACK_VERSION_CURRENT);
+        v.extend_from_slice(&header);
         self.buffer = Some(PackBuffer::Memory(v));
+        Ok(())
     }
 
-    /// Add an encrypted blob to the pack buffer. Returns the offset within the pack
-    /// where the blob data starts (after the 4-byte length prefix).
+    /// Add an encrypted blob to a heap-buffered pack. Returns the offset
+    /// within the pack where the blob data starts (after the 4-byte length
+    /// prefix).
     pub fn add_blob(&mut self, chunk_id: ChunkId, encrypted_blob: Vec<u8>) -> Result<u64> {
+        self.add_blob_to(None, chunk_id, encrypted_blob)
+    }
+
+    /// Like [`Self::add_blob`], but a pack started by this call is streamed
+    /// to `stage` when it supports staged writes
+    /// ([`StorageBackend::begin_staged_put`]). The choice is made per pack,
+    /// at its first blob; the pack's bytes and ID are identical either way.
+    ///
+    /// A failed staged write leaves the writer unusable: the blobs it holds
+    /// may already be referenced as dedup hits, so the error must end the
+    /// backup rather than be skipped like a per-file error.
+    pub fn add_blob_to(
+        &mut self,
+        stage: Option<&dyn StorageBackend>,
+        chunk_id: ChunkId,
+        encrypted_blob: Vec<u8>,
+    ) -> Result<u64> {
+        if matches!(self.buffer, Some(PackBuffer::Failed)) {
+            return Err(failed_writer_error());
+        }
         let blob_len = encrypted_blob.len() as u32;
 
         // On first blob: initialize the buffer.
         if self.blob_meta.is_empty() {
-            self.init_buffer();
+            self.init_buffer(stage)?;
         }
 
         // Offset accounts for: pack header + bytes already buffered + this blob's 4B len prefix.
         let offset = PACK_HEADER_SIZE as u64 + self.current_size as u64 + 4;
+        let additional = 4 + encrypted_blob.len();
 
         // Append [4B length LE][encrypted_data] into the buffer.
-        let PackBuffer::Memory(v) = self.buffer.as_mut().expect("buffer initialized above");
-        // The blob crossing the target seals this pack. Reserve only its
-        // actual bytes rather than letting Vec double a large buffer that
-        // will immediately move to the upload queue.
-        let additional = 4 + encrypted_blob.len();
-        if self.current_size + additional >= self.target_size {
-            v.reserve_exact(additional);
+        let len_prefix = blob_len.to_le_bytes();
+        match self.buffer.as_mut().expect("buffer initialized above") {
+            PackBuffer::Memory(v) => {
+                // The blob crossing the target seals this pack. Reserve only
+                // its actual bytes rather than letting Vec double a large
+                // buffer that will immediately move to the upload queue.
+                if self.current_size + additional >= self.target_size {
+                    v.reserve_exact(additional);
+                }
+                v.extend_from_slice(&len_prefix);
+                v.extend_from_slice(&encrypted_blob);
+            }
+            PackBuffer::Staged { object, hasher } => {
+                let written = object
+                    .append(&len_prefix)
+                    .and_then(|()| object.append(&encrypted_blob));
+                if let Err(e) = written {
+                    // Drops the staged object, which removes its temp file.
+                    self.buffer = Some(PackBuffer::Failed);
+                    return Err(staged_write_error(e));
+                }
+                hasher.update(&len_prefix);
+                hasher.update(&encrypted_blob);
+            }
+            // Rejected on entry; kept total rather than asserted.
+            PackBuffer::Failed => return Err(failed_writer_error()),
         }
-        v.extend_from_slice(&blob_len.to_le_bytes());
-        v.extend_from_slice(&encrypted_blob);
 
-        self.current_size += 4 + encrypted_blob.len();
+        self.current_size += additional;
 
         if self.first_blob_time.is_none() {
             self.first_blob_time = Some(Instant::now());
@@ -222,11 +323,12 @@ impl PackWriter {
         self.pack_type
     }
 
-    /// Heap bytes held by the in-progress buffer (0 before the first blob).
+    /// Heap bytes held by the in-progress buffer (0 before the first blob,
+    /// and for a staged pack, whose bytes are in the backend's temp file).
     pub fn buffer_capacity(&self) -> usize {
         match &self.buffer {
             Some(PackBuffer::Memory(v)) => v.capacity(),
-            None => 0,
+            Some(PackBuffer::Staged { .. } | PackBuffer::Failed) | None => 0,
         }
     }
 
@@ -243,6 +345,9 @@ impl PackWriter {
     /// Seal the pack: compute PackId, return a `SealedPack` that can be
     /// destructured for upload.
     pub fn seal(&mut self) -> Result<SealedPack> {
+        if matches!(self.buffer, Some(PackBuffer::Failed)) {
+            return Err(failed_writer_error());
+        }
         if self.blob_meta.is_empty() {
             return Err(VykarError::Other("cannot seal empty pack writer".into()));
         }
@@ -258,10 +363,18 @@ impl PackWriter {
             results.push((meta.chunk_id, meta.stored_size, offset, refcount));
         }
 
-        let PackBuffer::Memory(v) = self.buffer.take().expect("buffer was initialized");
-        let sealed_data = SealedData::Memory(v);
-
-        let pack_id = PackId::compute(sealed_data.as_slice(), self.hash_algo);
+        let (pack_id, sealed_data) = match self.buffer.take().expect("buffer was initialized") {
+            PackBuffer::Memory(v) => (PackId::compute(&v, self.hash_algo), SealedData::Memory(v)),
+            PackBuffer::Staged { object, hasher } => (
+                PackId::from_bytes(hasher.finalize()),
+                SealedData::Staged(object),
+            ),
+            // Rejected on entry; kept total rather than asserted.
+            PackBuffer::Failed => {
+                self.buffer = Some(PackBuffer::Failed);
+                return Err(failed_writer_error());
+            }
+        };
 
         // Clear writer state for reuse
         self.blob_meta.clear();
@@ -284,7 +397,11 @@ impl PackWriter {
             entries,
             data,
         } = self.seal()?;
-        storage.put(&pack_id.storage_key(), data.as_slice())?;
+        let key = pack_id.storage_key();
+        match data {
+            SealedData::Memory(v) => storage.put(&key, &v)?,
+            staged @ SealedData::Staged(_) => staged.put_to(storage, &key)?,
+        }
         Ok((pack_id, entries))
     }
 }
@@ -385,6 +502,194 @@ mod tests {
         ChunkId::from_bytes([byte; 32])
     }
 
+    fn memory_bytes(data: &SealedData) -> &[u8] {
+        data.as_bytes().expect("expected a heap-buffered pack")
+    }
+
+    /// Blob sets exercising the edge cases of both paths: one blob, many
+    /// tiny ones, empty blobs, a blob larger than the local write buffer, and
+    /// a last blob that crosses the target.
+    fn blob_sets(target: usize) -> Vec<Vec<Vec<u8>>> {
+        vec![
+            vec![vec![0xAB; 1]],
+            (0..300u32)
+                .map(|i| vec![i as u8; (i % 7) as usize])
+                .collect(),
+            vec![vec![], vec![1, 2, 3], vec![]],
+            vec![(0..200_000u32).map(|i| (i % 251) as u8).collect()],
+            vec![vec![5; target - 8], vec![6; 4096]],
+        ]
+    }
+
+    /// The staged path must write exactly the bytes, offsets and pack ID the
+    /// heap path does, under both hash algorithms: the pack ID is a storage
+    /// key and the server recomputes it from the bytes.
+    #[test]
+    fn staged_pack_is_byte_identical_to_buffered_pack() {
+        use vykar_storage::local_backend::LocalBackend;
+
+        let target = 1024 * 1024;
+        for algo in [HashAlgorithm::Blake2b, HashAlgorithm::Blake3] {
+            for blobs in blob_sets(target) {
+                let dir = tempfile::tempdir().unwrap();
+                let local = LocalBackend::new(dir.path().to_str().unwrap()).unwrap();
+
+                let mut heap = PackWriter::new(PackType::Data, target, algo);
+                let mut staged = PackWriter::new(PackType::Data, target, algo);
+                for (i, blob) in blobs.iter().enumerate() {
+                    let mut id = [0u8; 32];
+                    id[..4].copy_from_slice(&(i as u32).to_le_bytes());
+                    let id = ChunkId::from_bytes(id);
+                    let a = heap.add_blob(id, blob.clone()).unwrap();
+                    let b = staged.add_blob_to(Some(&local), id, blob.clone()).unwrap();
+                    assert_eq!(a, b, "offsets diverge");
+                    assert_eq!(heap.should_flush(), staged.should_flush());
+                }
+                assert!(matches!(staged.buffer, Some(PackBuffer::Staged { .. })));
+                assert_eq!(staged.buffer_capacity(), 0);
+
+                let heap = heap.seal().unwrap();
+                let staged = staged.seal().unwrap();
+                assert_eq!(heap.pack_id, staged.pack_id, "{algo:?}");
+                assert_eq!(heap.entries, staged.entries);
+                assert!(matches!(staged.data, SealedData::Staged(_)));
+                assert_eq!(staged.data.capacity(), 0);
+
+                let bytes = memory_bytes(&heap.data).to_vec();
+                assert_eq!(PackId::compute(&bytes, algo), staged.pack_id);
+                let key = staged.pack_id.storage_key();
+                staged.data.put_to(&local, &key).unwrap();
+                assert_eq!(local.get(&key).unwrap().unwrap(), bytes);
+                assert_eq!(
+                    scan_pack_blobs(&local, &staged.pack_id).unwrap().len(),
+                    blobs.len()
+                );
+            }
+        }
+    }
+
+    /// A backend that cannot stage keeps the writer on the heap path.
+    #[test]
+    fn non_staging_backend_buffers_in_memory() {
+        let storage = crate::testutil::MemoryBackend::new();
+        let mut w = PackWriter::new(PackType::Data, 1024, HashAlgorithm::Blake3);
+        w.add_blob_to(Some(&storage), dummy_chunk_id(1), vec![1; 10])
+            .unwrap();
+        assert!(matches!(w.buffer, Some(PackBuffer::Memory(_))));
+        assert!(matches!(w.seal().unwrap().data, SealedData::Memory(_)));
+    }
+
+    /// Stages into an object whose appends start failing after `ok_appends`.
+    struct FailingStageBackend {
+        ok_appends: usize,
+        dropped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    struct FailingStagedPut {
+        remaining: usize,
+        dropped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Drop for FailingStagedPut {
+        fn drop(&mut self) {
+            self.dropped
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl StagedPut for FailingStagedPut {
+        fn append(&mut self, _data: &[u8]) -> Result<()> {
+            if self.remaining == 0 {
+                // EIO: soft when it comes from a source file.
+                return Err(VykarError::Io(std::io::Error::from_raw_os_error(5)));
+            }
+            self.remaining -= 1;
+            Ok(())
+        }
+        fn commit(self: Box<Self>, _key: &str) -> Result<()> {
+            Err(VykarError::Other(
+                "a failed pack must never be committed".into(),
+            ))
+        }
+    }
+
+    impl StorageBackend for FailingStageBackend {
+        fn get(&self, _: &str) -> Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+        fn put(&self, _: &str, _: &[u8]) -> Result<()> {
+            Ok(())
+        }
+        fn delete(&self, _: &str) -> Result<()> {
+            Ok(())
+        }
+        fn exists(&self, _: &str) -> Result<bool> {
+            Ok(false)
+        }
+        fn list(&self, _: &str) -> Result<Vec<String>> {
+            Ok(vec![])
+        }
+        fn get_range(&self, _: &str, _: u64, _: u64) -> Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+        fn create_dir(&self, _: &str) -> Result<()> {
+            Ok(())
+        }
+        fn begin_staged_put(&self, prefix: &str) -> Result<Option<Box<dyn StagedPut>>> {
+            if prefix != PACK_STAGING_PREFIX {
+                return Err(VykarError::Other(format!("unexpected prefix {prefix}")));
+            }
+            Ok(Some(Box::new(FailingStagedPut {
+                remaining: self.ok_appends,
+                dropped: std::sync::Arc::clone(&self.dropped),
+            })))
+        }
+
+        vykar_storage::unsupported_server_ops!();
+    }
+
+    /// A failed append poisons the writer, discards the staged object, and
+    /// is not an error a backup could skip as a per-file read failure.
+    #[test]
+    fn staged_write_failure_poisons_writer() {
+        // 0: the header append fails; 4: header, blob 1 (prefix + payload)
+        // and blob 2's prefix succeed, then blob 2's payload fails.
+        for ok_appends in [0, 4] {
+            let backend = FailingStageBackend {
+                ok_appends,
+                dropped: Default::default(),
+            };
+            let mut w = PackWriter::new(PackType::Data, usize::MAX, HashAlgorithm::Blake3);
+            if ok_appends > 0 {
+                w.add_blob_to(Some(&backend), dummy_chunk_id(1), vec![1; 10])
+                    .unwrap();
+            }
+            let err = w
+                .add_blob_to(Some(&backend), dummy_chunk_id(2), vec![2; 10])
+                .unwrap_err();
+            assert!(!err.is_soft_file_error(), "{err}");
+            assert!(
+                err.to_string().contains("writing pack to repository"),
+                "{err}"
+            );
+            assert!(
+                backend.dropped.load(std::sync::atomic::Ordering::SeqCst),
+                "staged object is discarded on failure"
+            );
+            assert!(w.get_pending_stored_size(&dummy_chunk_id(2)).is_none());
+
+            if ok_appends > 0 {
+                // Accepted blobs cannot be stored any more: sealing fails
+                // instead of producing a pack without them, and so does any
+                // later blob, even on the heap path.
+                assert!(w.has_pending());
+                assert!(w.seal().is_err());
+                assert!(w.add_blob(dummy_chunk_id(3), vec![3]).is_err());
+                assert!(w.seal().is_err());
+            }
+        }
+    }
+
     #[test]
     fn should_flush_on_size() {
         let mut w = PackWriter::new(PackType::Data, 100, HashAlgorithm::Blake2b);
@@ -405,7 +710,9 @@ mod tests {
                 assert!(w.should_flush());
 
                 let sealed = w.seal().unwrap();
-                let SealedData::Memory(data) = sealed.data;
+                let SealedData::Memory(data) = sealed.data else {
+                    panic!("no stage given, so the pack is heap-buffered");
+                };
                 assert_eq!(data.len(), PACK_HEADER_SIZE + target + last_size);
                 assert_eq!(data.capacity(), data.len());
                 assert_eq!(scan_pack_blobs_bytes(&data).unwrap().len(), 2);
@@ -465,7 +772,7 @@ mod tests {
         let sealed = w.seal().unwrap();
 
         assert_eq!(
-            sealed.data.as_slice(),
+            memory_bytes(&sealed.data),
             EXPECTED,
             "pack wire format regression"
         );
@@ -493,7 +800,7 @@ mod tests {
 
         // Store the pack so scan_pack_blobs can access it.
         storage
-            .put(&sealed.pack_id.storage_key(), sealed.data.as_slice())
+            .put(&sealed.pack_id.storage_key(), memory_bytes(&sealed.data))
             .unwrap();
 
         // Verify scan_pack_blobs returns matching (offset, length) pairs.

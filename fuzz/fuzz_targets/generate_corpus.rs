@@ -50,14 +50,22 @@ fn seed_pack_scan() {
     pw.add_blob(ChunkId::from_bytes([2; 32]), vec![0xBE, 0xEF, 0x42])
         .unwrap();
     let sealed = pw.seal().unwrap();
-    write_seed("fuzz_pack_scan", "two_blobs", sealed.data.as_slice());
+    write_seed(
+        "fuzz_pack_scan",
+        "two_blobs",
+        sealed.data.as_bytes().expect("heap-buffered pack"),
+    );
 
     // Pack with a single larger blob
     let mut pw = PackWriter::new(PackType::Data, usize::MAX, HashAlgorithm::Blake2b);
     pw.add_blob(ChunkId::from_bytes([3; 32]), vec![0x42; 256])
         .unwrap();
     let sealed = pw.seal().unwrap();
-    write_seed("fuzz_pack_scan", "one_large_blob", sealed.data.as_slice());
+    write_seed(
+        "fuzz_pack_scan",
+        "one_large_blob",
+        sealed.data.as_bytes().expect("heap-buffered pack"),
+    );
 }
 
 fn seed_decompress() {

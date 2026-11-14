@@ -4,7 +4,12 @@ use std::path::{Component, Path, PathBuf};
 
 use vykar_types::error::{Result, VykarError};
 
-use crate::{ListedObject, StorageBackend};
+use crate::{ListedObject, StagedPut, StorageBackend};
+
+/// Write buffer of a staged object. Its appends are a 4-byte length prefix
+/// followed by a blob of typically hundreds of KiB, which bypasses the buffer,
+/// so this only coalesces the small writes.
+const STAGED_WRITE_BUFFER: usize = 64 * 1024;
 
 /// Storage backend for local filesystem using `std::fs` directly.
 pub struct LocalBackend {
@@ -81,6 +86,23 @@ impl LocalBackend {
         Ok(())
     }
 
+    /// Create a `.tmp.`-prefixed temp file in `dir`, creating `dir` if needed.
+    fn temp_file_in(dir: &Path) -> std::io::Result<tempfile::NamedTempFile> {
+        let create = || {
+            tempfile::Builder::new()
+                .prefix(vykar_protocol::TEMP_FILE_PREFIX)
+                .rand_bytes(16)
+                .tempfile_in(dir)
+        };
+        match create() {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir_all(dir)?;
+                create()
+            }
+            other => other,
+        }
+    }
+
     fn sync_directory(dir: &Path) -> Result<()> {
         vykar_common::fs::fsync_dir(dir)?;
         Ok(())
@@ -127,6 +149,22 @@ impl StorageBackend for LocalBackend {
     fn delete(&self, key: &str) -> Result<()> {
         let path = self.resolve(key)?;
         Self::delete_path_with_sync(&path, Self::sync_directory)
+    }
+
+    /// Stage into a temp file directly in `prefix`'s directory. For packs that
+    /// is `packs/`, one level above the shard directory the final name lands
+    /// in: the shard is only known once the content hash is, and `packs/` is
+    /// on the same filesystem, so `commit` is a plain rename. `packs/` lies
+    /// in `KNOWN_ROOT_DIRS`, so `remove_stale_temp_files` sweeps crash debris.
+    fn begin_staged_put(&self, prefix: &str) -> Result<Option<Box<dyn StagedPut>>> {
+        let prefix = prefix.trim_end_matches('/');
+        let dir = self.resolve(prefix)?;
+        let file = Self::temp_file_in(&dir)?;
+        Ok(Some(Box::new(LocalStagedPut {
+            root: self.root.clone(),
+            prefix: format!("{prefix}/"),
+            file: std::io::BufWriter::with_capacity(STAGED_WRITE_BUFFER, file),
+        })))
     }
 
     fn exists(&self, key: &str) -> Result<bool> {
@@ -280,6 +318,52 @@ impl StorageBackend for LocalBackend {
     }
 
     crate::unsupported_server_ops!(except[remove_stale_temp_files]);
+}
+
+/// A temp file being filled by [`LocalBackend::begin_staged_put`]. Dropping
+/// it uncommitted deletes the file (`NamedTempFile`'s drop).
+struct LocalStagedPut {
+    root: PathBuf,
+    /// The staging directory key with a trailing `/`; committed keys must
+    /// start with it so the rename never leaves this directory's tree.
+    prefix: String,
+    file: std::io::BufWriter<tempfile::NamedTempFile>,
+}
+
+impl StagedPut for LocalStagedPut {
+    fn append(&mut self, data: &[u8]) -> Result<()> {
+        self.file.write_all(data)?;
+        Ok(())
+    }
+
+    /// The same steps as `atomic_write` after its `write_all`: fsync the
+    /// file, rename it to its final name, fsync the destination directory.
+    /// The staging directory is not fsynced: should a crash lose the
+    /// rename's removal of the temp name, the leftover is `.tmp.` debris for
+    /// the sweep, never a visible object.
+    fn commit(self: Box<Self>, key: &str) -> Result<()> {
+        LocalBackend::validate_key(key)?;
+        if !key.starts_with(&self.prefix) {
+            return Err(VykarError::Other(format!(
+                "staged object under '{}' cannot be committed as '{key}'",
+                self.prefix
+            )));
+        }
+        let path = self.root.join(key);
+        let dir = path.parent().unwrap_or(&self.root).to_path_buf();
+        let tmp = self.file.into_inner().map_err(|e| e.into_error())?;
+        vykar_common::fs::fsync_file(tmp.as_file())?;
+        let persisted = match tmp.persist(&path) {
+            Ok(f) => f,
+            Err(e) if e.error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir_all(&dir)?;
+                e.file.persist(&path).map_err(|e| e.error)?
+            }
+            Err(e) => return Err(e.error.into()),
+        };
+        drop(persisted);
+        LocalBackend::sync_directory(&dir)
+    }
 }
 
 impl LocalBackend {
@@ -653,6 +737,96 @@ mod tests {
         assert_eq!(removed.unwrap(), 1);
         assert!(locked.join(".tmp.stuck").exists());
         assert!(!dir.path().join("packs/bb/.tmp.free").exists());
+    }
+
+    /// Files under `rel` (recursively), as `/`-joined keys.
+    fn files_under(root: &Path, rel: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.join(rel)];
+        while let Some(dir) = stack.pop() {
+            let Ok(rd) = fs::read_dir(&dir) else { continue };
+            for entry in rd {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else {
+                    let rel = path.strip_prefix(root).unwrap();
+                    out.push(rel.to_string_lossy().replace('\\', "/"));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn staged_put_commits_under_final_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = LocalBackend::new(dir.path().to_str().unwrap()).unwrap();
+
+        let mut staged = backend.begin_staged_put("packs").unwrap().unwrap();
+        staged.append(b"head").unwrap();
+        // Larger than the write buffer, so it bypasses it.
+        let big = vec![7u8; STAGED_WRITE_BUFFER + 3];
+        staged.append(&big).unwrap();
+        staged.append(b"tail").unwrap();
+
+        // While open, only a hidden temp file directly in `packs/` exists.
+        let staging = files_under(dir.path(), "packs");
+        assert_eq!(staging.len(), 1);
+        assert!(staging[0].starts_with("packs/.tmp."), "{staging:?}");
+        assert!(vykar_protocol::is_repo_temp_file(&staging[0]));
+        assert!(backend.list("packs/").unwrap().is_empty());
+
+        // The shard directory does not exist yet; commit creates it.
+        staged.commit("packs/ab/abcdef").unwrap();
+        let mut expected = b"head".to_vec();
+        expected.extend_from_slice(&big);
+        expected.extend_from_slice(b"tail");
+        assert_eq!(backend.get("packs/ab/abcdef").unwrap().unwrap(), expected);
+        assert_eq!(files_under(dir.path(), "packs"), vec!["packs/ab/abcdef"]);
+    }
+
+    #[test]
+    fn dropped_staged_put_leaves_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = LocalBackend::new(dir.path().to_str().unwrap()).unwrap();
+        let mut staged = backend.begin_staged_put("packs").unwrap().unwrap();
+        staged.append(&[1u8; 100]).unwrap();
+        drop(staged);
+        assert!(files_under(dir.path(), "packs").is_empty());
+    }
+
+    #[test]
+    fn staged_put_rejects_key_outside_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = LocalBackend::new(dir.path().to_str().unwrap()).unwrap();
+        for key in ["index", "packsx/ab/cd", "packs/../index", "/packs/ab/cd"] {
+            let mut staged = backend.begin_staged_put("packs").unwrap().unwrap();
+            staged.append(b"x").unwrap();
+            assert!(staged.commit(key).is_err(), "{key} must be rejected");
+        }
+        assert!(files_under(dir.path(), "packs").is_empty());
+        assert!(!dir.path().join("index").exists());
+        assert!(backend.begin_staged_put("../escape").is_err());
+    }
+
+    #[test]
+    #[cfg(unix)] // the forgotten handle stays open; Windows may refuse the delete
+    fn stale_staged_temp_is_swept() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = LocalBackend::new(dir.path().to_str().unwrap()).unwrap();
+        let mut staged = backend.begin_staged_put("packs").unwrap().unwrap();
+        staged.append(b"partial").unwrap();
+        // Simulate a crash: the temp file survives the process.
+        std::mem::forget(staged);
+        assert_eq!(
+            backend
+                .remove_stale_temp_files(std::time::Duration::ZERO)
+                .unwrap(),
+            1
+        );
+        assert!(files_under(dir.path(), "packs").is_empty());
     }
 
     #[test]

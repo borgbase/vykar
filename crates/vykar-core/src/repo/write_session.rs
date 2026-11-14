@@ -61,7 +61,8 @@ pub(crate) struct PendingUpload {
     /// Cleared by rollback: the pack is still uploaded (an orphan for
     /// compact) but must not enter the journal.
     pub(crate) journal: bool,
-    /// Heap bytes held by the sealed pack until the upload thread returns.
+    /// Heap bytes held by the sealed pack until the upload thread returns
+    /// (0 for a staged pack, whose bytes are already in a temp file).
     pub(crate) bytes: usize,
     pub(crate) handle: JoinHandle<Result<()>>,
 }
@@ -118,6 +119,11 @@ pub(crate) struct WriteSessionState {
     /// Enabled for local repositories, where a write rarely overlaps
     /// usefully with the next seal; see `cap_pending_uploads`.
     pub(crate) cap_pending_upload_bytes: bool,
+    /// Stream data packs into the backend's staging area as they fill
+    /// instead of buffering them on the heap, when the backend supports it
+    /// (`StorageBackend::begin_staged_put`; local repositories). A staged
+    /// pack holds no heap, so it counts 0 against the byte cap above.
+    pub(crate) stream_data_packs: bool,
     /// Lightweight dedup-only index used during backup to save memory.
     /// When active, `chunk_index` on Repository is empty.
     pub(crate) dedup_index: Option<DedupIndex>,
@@ -167,6 +173,7 @@ impl WriteSessionState {
             pending_uploads: Vec::new(),
             max_in_flight_uploads,
             cap_pending_upload_bytes: false,
+            stream_data_packs: false,
             dedup_index: None,
             tiered_dedup: None,
             index_delta: None,
@@ -1129,7 +1136,15 @@ mod tests {
 
     vykar_storage::delegate_storage_backend! {
         for JournalCountingBackend;
-        except [put];
+        except [put, begin_staged_put];
+
+        // Keep packs on the intercepted `put` path.
+        fn begin_staged_put(
+            &self,
+            _prefix: &str,
+        ) -> Result<Option<Box<dyn vykar_storage::StagedPut>>> {
+            Ok(None)
+        }
 
         fn put(&self, key: &str, data: &[u8]) -> Result<()> {
             use std::sync::atomic::Ordering;

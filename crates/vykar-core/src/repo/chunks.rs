@@ -240,11 +240,15 @@ impl Repository {
                 .write_session
                 .as_mut()
                 .expect("no active write session");
-            let writer = match pack_type {
-                PackType::Data => &mut ws.data_pack_writer,
-                PackType::Tree => &mut ws.tree_pack_writer,
+            // Tree packs are small (<= 4 MiB) and stay on the heap.
+            let (writer, stage) = match pack_type {
+                PackType::Data => (
+                    &mut ws.data_pack_writer,
+                    ws.stream_data_packs.then_some(&*self.storage),
+                ),
+                PackType::Tree => (&mut ws.tree_pack_writer, None),
             };
-            writer.add_blob(chunk_id, packed)?;
+            writer.add_blob_to(stage, chunk_id, packed)?;
             writer.should_flush()
         };
 
@@ -285,8 +289,9 @@ impl Repository {
     /// The index is updated immediately; the upload proceeds in a separate thread.
     ///
     /// The `SealedPack` is destructured: `entries` consumed on the main thread
-    /// for index updates, `data` (owning the mmap or Vec) moved into the upload
-    /// thread. `pack_id` is `Copy` so it's used in both places.
+    /// for index updates, `data` (the heap buffer, or the staged temp file
+    /// whose fsync + rename is the upload) moved into the upload thread.
+    /// `pack_id` is `Copy` so it's used in both places.
     pub(super) fn flush_writer_async(&mut self, pack_type: PackType) -> Result<()> {
         // Keep upload fan-out bounded to avoid excessive memory/thread pressure.
         let incoming = {

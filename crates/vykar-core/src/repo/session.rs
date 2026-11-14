@@ -84,6 +84,15 @@ impl Repository {
             .cap_pending_upload_bytes = enabled;
     }
 
+    /// Stream data packs to the backend while they fill, where it supports
+    /// that (see `WriteSessionState::stream_data_packs`).
+    pub fn set_stream_data_packs(&mut self, enabled: bool) {
+        self.write_session
+            .as_mut()
+            .expect("no active write session")
+            .stream_data_packs = enabled;
+    }
+
     /// Set the maximum number of in-flight background pack uploads.
     pub fn set_max_in_flight_uploads(&mut self, n: usize) {
         self.write_session
@@ -525,6 +534,94 @@ mod tests {
             .iter()
             .any(|e| e.pack_id == pack_id));
         repo.write_session = None;
+    }
+
+    /// Files directly in `<root>/packs`, i.e. staging temp files.
+    fn staging_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(root.join("packs"))
+            .map(|rd| {
+                rd.map(|e| e.unwrap().path())
+                    .filter(|p| p.is_file())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// On a local backend a streamed data pack holds no heap, is published
+    /// under its content hash by the upload thread, and is journaled only
+    /// after that; tree packs stay buffered.
+    #[test]
+    fn streamed_data_pack_is_committed_then_journaled() {
+        use crate::compress::Compression;
+        use crate::repo::pack::PackType;
+        use vykar_types::pack_id::PackId;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut repo = test_repo_plaintext();
+        repo.storage = std::sync::Arc::new(
+            vykar_storage::local_backend::LocalBackend::new(dir.path().to_str().unwrap()).unwrap(),
+        );
+        repo.enable_dedup_mode();
+        repo.set_stream_data_packs(true);
+
+        repo.store_chunk(b"streamed chunk", Compression::None, PackType::Data)
+            .unwrap();
+        repo.store_chunk(b"tree chunk", Compression::None, PackType::Tree)
+            .unwrap();
+        {
+            let ws = repo.write_session.as_ref().unwrap();
+            assert_eq!(ws.data_pack_writer.buffer_capacity(), 0);
+            assert!(ws.tree_pack_writer.buffer_capacity() > 0);
+        }
+        assert_eq!(staging_files(dir.path()).len(), 1, "data pack is staged");
+
+        repo.flush_writer_async(PackType::Data).unwrap();
+        let (pack_id, bytes) = {
+            let ws = repo.write_session.as_ref().unwrap();
+            (ws.pending_uploads[0].pack_id, ws.pending_uploads[0].bytes)
+        };
+        assert_eq!(bytes, 0, "a staged pack counts no heap bytes");
+
+        repo.flush_packs().unwrap();
+        assert!(staging_files(dir.path()).is_empty());
+        let stored = repo.storage.get(&pack_id.storage_key()).unwrap().unwrap();
+        assert_eq!(PackId::compute(&stored, repo.content_hash()), pack_id);
+        let ws = repo.write_session.as_ref().unwrap();
+        assert!(ws
+            .pending_journal
+            .to_wire()
+            .iter()
+            .any(|e| e.pack_id == pack_id));
+        repo.write_session = None;
+    }
+
+    /// Rolling back a checkpoint, or dropping the session, discards the
+    /// partially written staged pack and leaves no temp file behind.
+    #[test]
+    fn discarded_staged_pack_leaves_no_temp_file() {
+        use crate::compress::Compression;
+        use crate::repo::pack::PackType;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut repo = test_repo_plaintext();
+        repo.storage = std::sync::Arc::new(
+            vykar_storage::local_backend::LocalBackend::new(dir.path().to_str().unwrap()).unwrap(),
+        );
+        repo.enable_dedup_mode();
+        repo.set_stream_data_packs(true);
+
+        repo.begin_rollback_checkpoint().unwrap();
+        repo.store_chunk(b"rolled back", Compression::None, PackType::Data)
+            .unwrap();
+        assert_eq!(staging_files(dir.path()).len(), 1);
+        repo.abort_rollback_checkpoint();
+        assert!(staging_files(dir.path()).is_empty());
+
+        repo.store_chunk(b"abandoned", Compression::None, PackType::Data)
+            .unwrap();
+        assert_eq!(staging_files(dir.path()).len(), 1);
+        repo.write_session = None;
+        assert!(staging_files(dir.path()).is_empty());
     }
 
     /// A pack sealed inside a checkpoint whose upload finishes only after the

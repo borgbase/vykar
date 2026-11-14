@@ -139,7 +139,7 @@ impl InnerBackend for ThrottledStorageBackend {
 // to be disabled on every throttled REST repo.
 delegate_storage_backend! {
     for ThrottledStorageBackend;
-    except [get, put, get_range, get_range_into, put_owned];
+    except [get, put, get_range, get_range_into, put_owned, begin_staged_put];
 
     fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
         let out = self.inner.get(key)?;
@@ -185,6 +185,13 @@ delegate_storage_backend! {
             limiter.consume(data.len());
         }
         self.inner.put_owned(key, data)
+    }
+
+    // A staged pack is written from the backup's consumer thread, where
+    // throttling would stall chunk processing instead of one upload thread.
+    // Keep throttled repositories on the buffered `put_owned` path above.
+    fn begin_staged_put(&self, _prefix: &str) -> Result<Option<Box<dyn vykar_storage::StagedPut>>> {
+        Ok(None)
     }
 }
 

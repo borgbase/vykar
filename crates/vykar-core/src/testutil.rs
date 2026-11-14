@@ -283,7 +283,15 @@ impl InnerBackend for RecordingBackend {
 
 delegate_storage_backend! {
     for RecordingBackend;
-    except [put, get_range, get_range_into, put_owned];
+    except [put, get_range, get_range_into, put_owned, begin_staged_put];
+
+    // Keep packs on the intercepted `put` path. Recorded puts must see every pack.
+    fn begin_staged_put(
+        &self,
+        _prefix: &str,
+    ) -> Result<Option<Box<dyn vykar_storage::StagedPut>>> {
+        Ok(None)
+    }
 
     fn put(&self, key: &str, data: &[u8]) -> Result<()> {
         self.log.record(key);
@@ -348,7 +356,15 @@ impl InnerBackend for PackUploadBackend {
 
 delegate_storage_backend! {
     for PackUploadBackend;
-    except [put_owned];
+    except [put_owned, begin_staged_put];
+
+    // Keep packs on the intercepted `put` path. Gating and fault injection act on `put_owned`.
+    fn begin_staged_put(
+        &self,
+        _prefix: &str,
+    ) -> Result<Option<Box<dyn vykar_storage::StagedPut>>> {
+        Ok(None)
+    }
 
     fn put_owned(&self, key: &str, data: Vec<u8>) -> Result<()> {
         if key.starts_with("packs/") {
@@ -414,7 +430,15 @@ impl InnerBackend for HookBackend {
 
 delegate_storage_backend! {
     for HookBackend;
-    except [put, delete, list, put_owned, list_sized];
+    except [put, delete, list, put_owned, begin_staged_put, list_sized];
+
+    // Keep packs on the intercepted `put` path. Hooks fire on `put`.
+    fn begin_staged_put(
+        &self,
+        _prefix: &str,
+    ) -> Result<Option<Box<dyn vykar_storage::StagedPut>>> {
+        Ok(None)
+    }
 
     fn put(&self, key: &str, data: &[u8]) -> Result<()> {
         self.before(Op::Put, key);

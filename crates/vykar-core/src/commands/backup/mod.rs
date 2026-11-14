@@ -683,6 +683,10 @@ fn run_against_repo(
         // Activate write session with per-session pending_index.
         repo.begin_write_session()?;
         repo.set_write_session_id(session_id.clone());
+        // Data packs go straight to a temp file in the repository where the
+        // backend can do that (local), instead of holding up to two pack
+        // buffers (filling + sealed) on the heap. Other backends ignore it.
+        repo.set_stream_data_packs(true);
 
         // Recover chunk→pack mappings from a previous interrupted session.
         match repo.recover_pending_index() {

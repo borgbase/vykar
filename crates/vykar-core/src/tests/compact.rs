@@ -212,7 +212,15 @@ mod server_side {
 
     delegate_storage_backend! {
         for ServerRepackBackend;
-        except [put, delete, put_owned, server_repack];
+        except [put, delete, put_owned, begin_staged_put, server_repack];
+
+        // Keep packs on the intercepted `put` path.
+        fn begin_staged_put(
+            &self,
+            _prefix: &str,
+        ) -> Result<Option<Box<dyn vykar_storage::StagedPut>>> {
+            Ok(None)
+        }
 
         fn put(&self, key: &str, data: &[u8]) -> Result<()> {
             self.log.push(format!("put {key}"));

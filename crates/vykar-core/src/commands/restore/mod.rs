@@ -744,8 +744,8 @@ fn discard_damaged(
                 ))
             })?;
         let reason = failed.get(&idx).cloned().unwrap_or_default();
-        push_damaged(stats, pf.rel_path.clone(), reason);
-        tombstones.insert(pf.rel_path.clone());
+        push_damaged(stats, pf.rel_path.to_path_buf(), reason);
+        tombstones.insert(pf.rel_path.to_path_buf());
     }
     let mut idx = 0;
     batch_files.retain(|_| {

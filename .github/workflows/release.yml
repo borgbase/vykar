@@ -244,7 +244,7 @@ jobs:
   build-macos:
     name: macos-aarch64-apple-darwin
     if: github.event_name != 'workflow_dispatch' || github.event.inputs.build_macos == 'true'
-    runs-on: macos-14
+    runs-on: macos-15
     environment: release
     env:
       HAS_SIGNING: ${{ secrets.MACOS_CERTIFICATE }}

@@ -56,32 +56,15 @@ where
 
     // For each pack: sort blobs by offset, then coalesce into ReadGroups.
     let mut groups: Vec<ReadGroup> = Vec::new();
+    // (blob count, read_start, read_end) of each group of the current pack.
+    let mut spans: Vec<(usize, u64, u64)> = Vec::new();
 
     for (pack_id, mut blobs) in pack_blobs {
         blobs.sort_by_key(|b| b.pack_offset);
 
-        let mut iter = blobs.into_iter();
-        let first = iter
-            .next()
-            .expect("invariant: pack_blobs entries are non-empty by construction above");
-
-        let first_end = first
-            .pack_offset
-            .checked_add(first.stored_size as u64)
-            .ok_or_else(|| {
-                VykarError::InvalidFormat(format!(
-                    "pack offset overflow in pack {pack_id}: offset {} + size {}",
-                    first.pack_offset, first.stored_size,
-                ))
-            })?;
-        let mut cur = ReadGroup {
-            pack_id,
-            read_start: first.pack_offset,
-            read_end: first_end,
-            blobs: vec![first],
-        };
-
-        for blob in iter {
+        // Pass 1: find the group boundaries.
+        spans.clear();
+        for blob in &blobs {
             let blob_end = blob
                 .pack_offset
                 .checked_add(blob.stored_size as u64)
@@ -91,32 +74,40 @@ where
                         blob.pack_offset, blob.stored_size,
                     ))
                 })?;
-            let gap = blob.pack_offset.saturating_sub(cur.read_end);
-            // sort-by-offset gives blob_end >= cur.read_start in practice, but
-            // checked_sub keeps a corrupted index from wrapping silently.
-            let merged_size = blob_end.checked_sub(cur.read_start).ok_or_else(|| {
-                VykarError::InvalidFormat(format!(
-                    "blob ordering violation in pack {pack_id}: blob_end {blob_end} < read_start {}",
-                    cur.read_start,
-                ))
-            })?;
-
-            if gap <= MAX_COALESCE_GAP && merged_size <= MAX_READ_SIZE {
-                // Coalesce into the current group.
-                cur.read_end = blob_end;
-                cur.blobs.push(blob);
-            } else {
-                // Start a new group.
-                groups.push(cur);
-                cur = ReadGroup {
-                    pack_id,
-                    read_start: blob.pack_offset,
-                    read_end: blob_end,
-                    blobs: vec![blob],
-                };
+            if let Some((len, read_start, read_end)) = spans.last_mut() {
+                let gap = blob.pack_offset.saturating_sub(*read_end);
+                // sort-by-offset gives blob_end >= read_start in practice, but
+                // checked_sub keeps a corrupted index from wrapping silently.
+                let merged_size = blob_end.checked_sub(*read_start).ok_or_else(|| {
+                    VykarError::InvalidFormat(format!(
+                        "blob ordering violation in pack {pack_id}: blob_end {blob_end} < read_start {read_start}",
+                    ))
+                })?;
+                if gap <= MAX_COALESCE_GAP && merged_size <= MAX_READ_SIZE {
+                    // Coalesce into the current group.
+                    *len += 1;
+                    *read_end = blob_end;
+                    continue;
+                }
             }
+            // Start a new group.
+            spans.push((1, blob.pack_offset, blob_end));
         }
-        groups.push(cur);
+
+        // Pass 2: move the blobs into exactly sized per-group vectors. The
+        // groups live until their worker has processed them, so push-growth
+        // slack here would be held for most of the batch.
+        let mut iter = blobs.into_iter();
+        for &(len, read_start, read_end) in &spans {
+            let mut group_blobs = Vec::with_capacity(len);
+            group_blobs.extend(iter.by_ref().take(len));
+            groups.push(ReadGroup {
+                pack_id,
+                read_start,
+                read_end,
+                blobs: group_blobs,
+            });
+        }
     }
 
     Ok(groups)
@@ -277,6 +268,40 @@ mod tests {
         let (_files, groups) = plan_reads(&file_items, index_lookup(&index)).unwrap();
         // Should be split because merged_size > MAX_READ_SIZE
         assert_eq!(groups.len(), 2);
+    }
+
+    #[test]
+    fn read_groups_are_exactly_sized_and_ordered() {
+        let pack = dummy_pack_id(1);
+        let mut index = ChunkIndex::new();
+        // Three adjacent blobs, then one past MAX_COALESCE_GAP, inserted out
+        // of offset order.
+        index.add(dummy_chunk_id(0xCC), 100, pack, 1208);
+        index.add(dummy_chunk_id(0xAA), 100, pack, 1000);
+        index.add(dummy_chunk_id(0xDD), 100, pack, 1308 + MAX_COALESCE_GAP + 1);
+        index.add(dummy_chunk_id(0xBB), 100, pack, 1104);
+
+        let item = make_file_item(
+            "a.txt",
+            vec![(0xAA, 200), (0xBB, 200), (0xCC, 200), (0xDD, 200)],
+        );
+        let file_items = vec![(&item, PathBuf::from("/tmp/out/a.txt"))];
+
+        let (_files, mut groups) = plan_reads(&file_items, index_lookup(&index)).unwrap();
+        groups.sort_by_key(|g| g.read_start);
+        assert_eq!(groups.len(), 2);
+        let offsets: Vec<Vec<u64>> = groups
+            .iter()
+            .map(|g| g.blobs.iter().map(|b| b.pack_offset).collect())
+            .collect();
+        assert_eq!(
+            offsets,
+            vec![vec![1000, 1104, 1208], vec![1308 + MAX_COALESCE_GAP + 1]]
+        );
+        assert_eq!((groups[0].read_start, groups[0].read_end), (1000, 1308));
+        for g in &groups {
+            assert_eq!(g.blobs.capacity(), g.blobs.len());
+        }
     }
 
     #[test]

@@ -1867,5 +1867,10 @@ mod tests {
     fn plan_entry_sizes() {
         assert_eq!(std::mem::size_of::<PlannedFile>(), 56);
         assert_eq!(std::mem::size_of::<PlannedNode>(), 56);
+        assert_eq!(std::mem::size_of::<ChunkTargets>(), 32);
+        assert_eq!(
+            std::mem::size_of::<super::super::read_groups::PlannedBlob>(),
+            72
+        );
     }
 }

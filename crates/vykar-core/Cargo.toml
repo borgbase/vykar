@@ -58,7 +58,8 @@ memmap2 = "0.9"
 xorf = "0.13"
 
 # Small-vec optimization
-smallvec = "1"
+# `union` drops the inline/heap tag: SmallVec<[WriteTarget; 1]> is 24 bytes, not 32.
+smallvec = { version = "1", features = ["union"] }
 
 # Error handling
 thiserror.workspace = true

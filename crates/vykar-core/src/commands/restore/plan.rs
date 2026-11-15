@@ -116,6 +116,7 @@ fn symlink_target_path(item: &Item) -> PathBuf {
 }
 
 /// Where to write a chunk's decompressed data.
+#[derive(Clone)]
 pub(super) struct WriteTarget {
     pub(super) file_idx: usize,
     pub(super) file_offset: u64,

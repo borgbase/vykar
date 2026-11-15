@@ -8,13 +8,15 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::commands::util::check_interrupted;
 use crate::config::VykarConfig;
 use crate::platform::fs;
 use vykar_common::display::{format_bytes, format_count};
+use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
+use vykar_types::pack_id::PackId;
 
 mod finalize;
 mod parallel;
@@ -392,41 +394,39 @@ where
                 return Ok(());
             }
 
-            let failures = continue_on_error.then(parallel::BatchFailures::default);
-            let mut groups = if !batch_chunks.is_empty() {
-                items.ensure_index(&mut repo)?;
-                let index = repo.chunk_index();
-                if let Some(f) = &failures {
+            if !batch_chunks.is_empty() {
+                // Resolve through the mmap'd restore cache (already resident
+                // for the item stream) and load the heap index only if the
+                // cache is absent or lacks a chunk of this batch.
+                items.ensure_resolvable(&mut repo, batch_chunks.keys())?;
+            }
+            // Cached locations can be stale even when every chunk is present
+            // (the cache is pinned to the advisory `index.gen`), so a blob
+            // that cannot be read at one is not declared unreadable yet: the
+            // pass collects such blobs and they are re-resolved through the
+            // index below. Strict mode therefore finishes the batch before
+            // reporting a source error while the cache is in use.
+            let via_cache = !batch_chunks.is_empty() && items.uses_restore_cache();
+            let failures = if via_cache {
+                Some(parallel::BatchFailures::deferring())
+            } else {
+                continue_on_error.then(parallel::BatchFailures::default)
+            };
+            let groups = if batch_chunks.is_empty() {
+                Vec::new()
+            } else {
+                let (items, repo) = (&items, &repo);
+                if let (true, Some(f)) = (continue_on_error, &failures) {
                     batch_chunks.retain(|id, ct| {
-                        let present = index.get(id).is_some();
+                        let present = items.lookup(repo, id).is_some();
                         if !present {
                             f.record(&ct.targets, &VykarError::ChunkNotInIndex(*id));
                         }
                         present
                     });
                 }
-                read_groups::build_read_groups(batch_chunks, |id| {
-                    index
-                        .get(id)
-                        .map(|e| (e.pack_id, e.pack_offset, e.stored_size))
-                })
-                .map_err(|e| match e {
-                    VykarError::ChunkNotInIndex(_) => {
-                        VykarError::RestoreSourceUnreadable(Box::new(e))
-                    }
-                    e => e,
-                })?
-            } else {
-                Vec::new()
+                sorted_read_groups(batch_chunks, |id| items.lookup(repo, id))?
             };
-
-            // Sort groups by pack ID (shard-aligned) then offset for sequential I/O.
-            groups.sort_by(|a, b| {
-                a.pack_id
-                    .as_bytes()
-                    .cmp(b.pack_id.as_bytes())
-                    .then(a.read_start.cmp(&b.read_start))
-            });
 
             tracing::debug!(
                 "batch: {} coalesced read groups for {} files",
@@ -451,9 +451,79 @@ where
             )
             .map_err(restore_error)?;
 
-            let failed = failures
-                .map(parallel::BatchFailures::into_map)
+            let (mut failed, unread) = failures
+                .map(parallel::BatchFailures::into_parts)
                 .unwrap_or_default();
+            let mut bytes = bytes;
+            if !unread.is_empty() {
+                // Blobs that failed at cached locations. Drop the cache for
+                // the rest of the restore and ask the index: a blob it places
+                // elsewhere was only stale in the cache and is read again from
+                // there; any other failure is final, as without a cache.
+                let index_ok = match items.fall_back_to_index(&mut repo) {
+                    Ok(()) => true,
+                    Err(e @ VykarError::Interrupted) => return Err(e),
+                    Err(e) => {
+                        warn!(
+                            "{} chunk(s) unreadable at restore-cache locations and the \
+                             chunk index could not be loaded to re-resolve them: {e}",
+                            unread.len()
+                        );
+                        false
+                    }
+                };
+                let mut moved: HashMap<ChunkId, plan::ChunkTargets> = HashMap::new();
+                for blob in unread {
+                    let cached = (blob.pack_id, blob.pack_offset, blob.stored_size);
+                    let relocated = index_ok
+                        && items
+                            .lookup(&repo, &blob.chunk_id)
+                            .is_some_and(|loc| loc != cached);
+                    if relocated {
+                        moved.insert(
+                            blob.chunk_id,
+                            plan::ChunkTargets {
+                                expected_size: blob.expected_size,
+                                targets: blob.targets,
+                            },
+                        );
+                    } else if continue_on_error {
+                        let reason = blob.error.to_string();
+                        for t in &blob.targets {
+                            failed.entry(t.file_idx).or_insert_with(|| reason.clone());
+                        }
+                    } else {
+                        return Err(VykarError::RestoreSourceUnreadable(Box::new(blob.error)));
+                    }
+                }
+                if !moved.is_empty() {
+                    info!(
+                        "restore cache was stale: reading {} chunk(s) again at their \
+                         chunk-index locations",
+                        moved.len()
+                    );
+                    let retry_failures = continue_on_error.then(parallel::BatchFailures::default);
+                    let groups = sorted_read_groups(moved, |id| items.lookup(&repo, id))?;
+                    bytes += parallel::execute_parallel_restore(
+                        &batch_files,
+                        groups,
+                        &repo.storage,
+                        repo.crypto.as_ref(),
+                        &temp_root,
+                        config.limits.restore_concurrency(),
+                        verify_chunks,
+                        shutdown,
+                        retry_failures.as_ref(),
+                    )
+                    .map_err(restore_error)?;
+                    for (idx, reason) in retry_failures
+                        .map(parallel::BatchFailures::into_map)
+                        .unwrap_or_default()
+                    {
+                        failed.entry(idx).or_insert(reason);
+                    }
+                }
+            }
             let bytes = if failed.is_empty() {
                 bytes
             } else {
@@ -606,6 +676,29 @@ where
 
 /// Surface a worker-pass error: source failures are wrapped so the caller can
 /// tell "repository data unreadable" apart; everything else is returned as is.
+/// Coalesce `chunk_targets` into read groups at the locations `lookup` gives,
+/// sorted by pack ID (shard-aligned) then offset for sequential I/O.
+fn sorted_read_groups<L>(
+    chunk_targets: HashMap<ChunkId, plan::ChunkTargets>,
+    lookup: L,
+) -> Result<Vec<read_groups::ReadGroup>>
+where
+    L: Fn(&ChunkId) -> Option<(PackId, u64, u32)>,
+{
+    let mut groups =
+        read_groups::build_read_groups(chunk_targets, lookup).map_err(|e| match e {
+            VykarError::ChunkNotInIndex(_) => VykarError::RestoreSourceUnreadable(Box::new(e)),
+            e => e,
+        })?;
+    groups.sort_by(|a, b| {
+        a.pack_id
+            .as_bytes()
+            .cmp(b.pack_id.as_bytes())
+            .then(a.read_start.cmp(&b.read_start))
+    });
+    Ok(groups)
+}
+
 fn restore_error(e: parallel::ReadError) -> VykarError {
     match e {
         parallel::ReadError::Source(e) => VykarError::RestoreSourceUnreadable(Box::new(e)),

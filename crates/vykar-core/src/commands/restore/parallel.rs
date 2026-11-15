@@ -16,9 +16,10 @@ use crate::compress;
 use crate::repo::format::{
     unpack_object_expect_with_context_in_place, verify_chunk_id, ObjectType,
 };
+use smallvec::SmallVec;
 use vykar_crypto::CryptoEngine;
 use vykar_storage::{RangeReader, StorageBackend};
-use vykar_types::chunk_id::ChunkHasher;
+use vykar_types::chunk_id::{ChunkHasher, ChunkId};
 use vykar_types::error::{Result, VykarError};
 use vykar_types::pack_id::PackId;
 
@@ -71,16 +72,45 @@ impl From<VykarError> for ReadError {
     }
 }
 
-/// Continue-mode sink: file index → first reason it is damaged. Touched only
-/// on the failure path.
+/// A blob that could not be read or decoded at the location it was planned
+/// with, kept whole so the caller can re-resolve and retry it (see
+/// [`BatchFailures::deferring`]).
+pub(super) struct UnreadBlob {
+    pub(super) chunk_id: ChunkId,
+    pub(super) pack_id: PackId,
+    pub(super) pack_offset: u64,
+    pub(super) stored_size: u32,
+    pub(super) expected_size: u32,
+    pub(super) targets: SmallVec<[WriteTarget; 1]>,
+    pub(super) error: VykarError,
+}
+
+/// Sink for source-side failures that do not stop the pass. Touched only on
+/// the failure path.
+///
+/// In continue mode it maps file index → first reason the file is damaged.
+/// A [`deferring`](Self::deferring) sink instead keeps each failed blob, so
+/// the caller can decide whether the failure is final: blob locations taken
+/// from the restore cache may be stale, and only the chunk index can tell.
 #[derive(Default)]
-pub(super) struct BatchFailures(Mutex<HashMap<usize, String>>);
+pub(super) struct BatchFailures {
+    damaged: Mutex<HashMap<usize, String>>,
+    deferred: Option<Mutex<Vec<UnreadBlob>>>,
+}
 
 impl BatchFailures {
+    /// A sink that collects failed blobs instead of marking files damaged.
+    pub(super) fn deferring() -> Self {
+        Self {
+            damaged: Mutex::default(),
+            deferred: Some(Mutex::default()),
+        }
+    }
+
     pub(super) fn record(&self, targets: &[WriteTarget], reason: &VykarError) {
         let reason = reason.to_string();
         let mut map = self
-            .0
+            .damaged
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         for t in targets {
@@ -88,10 +118,41 @@ impl BatchFailures {
         }
     }
 
+    /// Record that `blob` of `pack_id` failed with `error`.
+    fn record_blob(&self, pack_id: &PackId, blob: &PlannedBlob, error: VykarError) {
+        match &self.deferred {
+            Some(deferred) => deferred
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(UnreadBlob {
+                    chunk_id: blob.chunk_id,
+                    pack_id: *pack_id,
+                    pack_offset: blob.pack_offset,
+                    stored_size: blob.stored_size,
+                    expected_size: blob.expected_size,
+                    targets: blob.targets.clone(),
+                    error,
+                }),
+            None => self.record(&blob.targets, &error),
+        }
+    }
+
     pub(super) fn into_map(self) -> HashMap<usize, String> {
-        self.0
-            .into_inner()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.into_parts().0
+    }
+
+    /// The damaged-file map and the deferred blobs (empty unless
+    /// [`deferring`](Self::deferring)).
+    pub(super) fn into_parts(self) -> (HashMap<usize, String>, Vec<UnreadBlob>) {
+        use std::sync::PoisonError;
+        (
+            self.damaged
+                .into_inner()
+                .unwrap_or_else(PoisonError::into_inner),
+            self.deferred
+                .map(|d| d.into_inner().unwrap_or_else(PoisonError::into_inner))
+                .unwrap_or_default(),
+        )
     }
 }
 
@@ -278,9 +339,10 @@ fn lightest_bucket(bucket_bytes: &[u64]) -> usize {
 
 /// Run every read group across a scoped worker pool.
 ///
-/// With `failures` set (continue mode), source-side failures are recorded
-/// against the files they affect and the pass carries on; without it the first
-/// one stops the pass as `ReadError::Source`.
+/// With `failures` set, source-side failures are recorded in it (against the
+/// files they affect in continue mode, or blob by blob for a deferring sink)
+/// and the pass carries on; without it the first one stops the pass as
+/// `ReadError::Source`.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn execute_parallel_restore(
     files: &[PlannedFile],
@@ -384,16 +446,17 @@ impl BlobCtx<'_> {
         self.cancelled.load(Ordering::Acquire) || is_shutting_down(self.shutdown)
     }
 
-    /// Record a source-side failure for `targets` in continue mode, or turn it
-    /// into the error that stops the pass in strict mode.
+    /// Record a source-side failure of `blob` in the failure sink, or turn it
+    /// into the error that stops the pass when there is none (strict mode).
     fn source_failure(
         &self,
-        targets: &[WriteTarget],
+        pack_id: &PackId,
+        blob: &PlannedBlob,
         e: VykarError,
     ) -> std::result::Result<(), ReadError> {
         match (self.failures, ReadError::source(e)) {
             (Some(f), ReadError::Source(e)) => {
-                f.record(targets, &e);
+                f.record_blob(pack_id, blob, e);
                 Ok(())
             }
             (_, err) => Err(err),
@@ -413,7 +476,7 @@ impl BlobCtx<'_> {
 /// Blobs are decrypted in place inside `data_buf`. The caller caps retained
 /// buffer capacity at 2 MiB between groups.
 ///
-/// In continue mode a failed group read is retried blob by blob: a short read
+/// With a failure sink (continue mode, or a deferring sink) a failed group read is retried blob by blob: a short read
 /// is an `Err` by the storage contract, so otherwise one truncated pack would
 /// take down every blob of a 16 MiB coalesced group. A read that fails part
 /// way through a streamed group keeps the blobs already written, records the
@@ -476,7 +539,7 @@ fn process_read_group(
                 return Err(ReadError::source(pack_not_found(&group.pack_id)));
             }
             for blob in &group.blobs {
-                ctx.source_failure(&blob.targets, pack_not_found(&group.pack_id))?;
+                ctx.source_failure(&group.pack_id, blob, pack_not_found(&group.pack_id))?;
             }
             return Ok(());
         }
@@ -498,7 +561,7 @@ fn process_read_group(
                 .blobs
                 .get(i)
                 .ok_or_else(|| VykarError::Other("failed blob index out of range".into()))?;
-            ctx.source_failure(&blob.targets, err)?;
+            ctx.source_failure(&group.pack_id, blob, err)?;
             (group.blobs.get(i + 1..).unwrap_or_default(), 1)
         }
         None => (&group.blobs[..], 0),
@@ -560,16 +623,16 @@ fn retry_blobs_one_by_one(
         };
         consecutive += 1;
         if consecutive < MAX_CONSECUTIVE_BLOB_READ_ERRORS {
-            ctx.source_failure(&blob.targets, err)?;
+            ctx.source_failure(pack_id, blob, err)?;
             continue;
         }
         let msg = format!(
             "{err} (rest of the read group not retried after \
              {consecutive} consecutive failures)"
         );
-        ctx.source_failure(&blob.targets, err)?;
+        ctx.source_failure(pack_id, blob, err)?;
         for rest in blobs.get(i + 1..).unwrap_or_default() {
-            ctx.source_failure(&rest.targets, VykarError::Other(msg.clone()))?;
+            ctx.source_failure(pack_id, rest, VykarError::Other(msg.clone()))?;
         }
         return Ok(());
     }
@@ -624,7 +687,7 @@ fn process_blobs(
         };
 
         if let Err(e) = decode_blob(ctx, pack_id, blob, raw, decompress_buf) {
-            ctx.source_failure(&blob.targets, e)?;
+            ctx.source_failure(pack_id, blob, e)?;
             continue;
         }
 
@@ -1992,6 +2055,35 @@ mod tests {
         let failures = BatchFailures::default();
         run_group_with(&group, &files, &storage, temp.path(), Some(&failures)).unwrap();
         assert_eq!(failed_indices(failures), vec![0, 1]);
+    }
+
+    /// A deferring sink keeps the failed blobs, with the location they were
+    /// read at, instead of marking their files damaged.
+    #[test]
+    fn deferring_sink_collects_failed_blobs_with_their_locations() {
+        let pack_id = dummy_pack_id(0x45);
+        let payloads: [&[u8]; 2] = [b"payload-deferred-a", b"payload-deferred-b"];
+        let (_data, group, files) = pack_of(pack_id, &payloads, &[]);
+        let storage = storage_with(&[]);
+        let temp = tempdir().unwrap();
+        stage_files(temp.path(), &files);
+
+        let failures = BatchFailures::deferring();
+        run_group_with(&group, &files, &storage, temp.path(), Some(&failures)).unwrap();
+        let (damaged, mut unread) = failures.into_parts();
+        assert!(damaged.is_empty());
+        unread.sort_by_key(|b| b.pack_offset);
+        assert_eq!(unread.len(), group.blobs.len());
+        for (got, want) in unread.iter().zip(&group.blobs) {
+            assert_eq!(got.chunk_id, want.chunk_id);
+            assert_eq!(got.pack_id, pack_id);
+            assert_eq!(
+                (got.pack_offset, got.stored_size, got.expected_size),
+                (want.pack_offset, want.stored_size, want.expected_size)
+            );
+            assert_eq!(got.targets.len(), want.targets.len());
+            assert!(got.error.to_string().contains("pack not found"));
+        }
     }
 
     /// The coalesced read fails as a short read; the per-blob retry still

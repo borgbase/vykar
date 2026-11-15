@@ -227,6 +227,67 @@ impl ItemStreamReader {
         }
         Ok(())
     }
+
+    /// Prepare [`Self::lookup`] for `ids`: keep resolving through the restore
+    /// cache when it holds every one of them, otherwise drop the cache and
+    /// load the full index (once; later calls keep using the index).
+    ///
+    /// The cache is generation-pinned, so a miss means it is incomplete or
+    /// corrupt — not that the chunk is gone. Falling back *before* a caller
+    /// declares a chunk missing keeps an incomplete cache from marking files
+    /// damaged.
+    ///
+    /// This only checks presence. The pin is the advisory `index.gen`, so a
+    /// cache can hold every chunk and still be stale (locations of packs a
+    /// compaction has since rewritten); a caller that fails to read a chunk
+    /// at a cached location must call [`Self::fall_back_to_index`] and
+    /// resolve it again before treating the chunk as unreadable.
+    pub fn ensure_resolvable<'a>(
+        &mut self,
+        repo: &mut Repository,
+        ids: impl IntoIterator<Item = &'a ChunkId>,
+    ) -> Result<()> {
+        if let Some(cache) = &self.restore_cache {
+            match ids.into_iter().find(|id| cache.lookup(id).is_none()) {
+                None => return Ok(()),
+                Some(missing) => {
+                    info!("restore cache lacks chunk {missing}, falling back to full index");
+                    self.restore_cache = None;
+                }
+            }
+        }
+        self.ensure_index(repo)
+    }
+
+    /// Stop using the restore cache and load the full index, which serves
+    /// every later [`Self::lookup`].
+    pub fn fall_back_to_index(&mut self, repo: &mut Repository) -> Result<()> {
+        self.restore_cache = None;
+        self.ensure_index(repo)
+    }
+
+    /// Resolve a chunk to `(pack_id, pack_offset, stored_size)` through the
+    /// restore cache, or through the full index once the cache was dropped.
+    /// Call [`Self::ensure_resolvable`] first.
+    pub fn lookup(&self, repo: &Repository, id: &ChunkId) -> Option<(PackId, u64, u32)> {
+        match &self.restore_cache {
+            Some(cache) => cache.lookup(id),
+            None => repo
+                .chunk_index()
+                .get(id)
+                .map(|e| (e.pack_id, e.pack_offset, e.stored_size)),
+        }
+    }
+
+    /// Whether lookups are still served by the restore cache.
+    pub fn uses_restore_cache(&self) -> bool {
+        self.restore_cache.is_some()
+    }
+
+    /// Whether this reader loaded the full chunk index.
+    pub fn index_loaded(&self) -> bool {
+        self.index_loaded
+    }
 }
 
 /// Load item stream using a lookup closure instead of the chunk index.

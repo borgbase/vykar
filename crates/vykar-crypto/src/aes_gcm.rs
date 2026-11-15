@@ -101,4 +101,43 @@ mod tests {
         let decrypted = engine.decrypt(&encrypted, aad).unwrap();
         assert_eq!(decrypted, b"");
     }
+
+    #[test]
+    fn decrypt_in_place_matches_decrypt() {
+        let engine = test_aes_engine();
+        let big = vec![0x5A; 70_000];
+        for data in [&b""[..], b"secret message", &big] {
+            let aad = b"type_tag";
+            let mut encrypted = engine.encrypt(data, aad).unwrap();
+            let plaintext = engine.decrypt_in_place(&mut encrypted, aad).unwrap();
+            assert_eq!(plaintext, data);
+        }
+    }
+
+    #[test]
+    fn decrypt_in_place_rejects_bad_input() {
+        let engine = test_aes_engine();
+        let encrypted = engine.encrypt(b"secret message", b"aad").unwrap();
+        let mut wrong_aad = encrypted.clone();
+        assert!(matches!(
+            engine.decrypt_in_place(&mut wrong_aad, b"other"),
+            Err(VykarError::DecryptionFailed)
+        ));
+        let mut corrupted = encrypted.clone();
+        corrupted[14] ^= 0xFF;
+        assert!(matches!(
+            engine.decrypt_in_place(&mut corrupted, b"aad"),
+            Err(VykarError::DecryptionFailed)
+        ));
+        let mut tag_flipped = encrypted;
+        *tag_flipped.last_mut().unwrap() ^= 0x01;
+        assert!(matches!(
+            engine.decrypt_in_place(&mut tag_flipped, b"aad"),
+            Err(VykarError::DecryptionFailed)
+        ));
+        assert!(matches!(
+            engine.decrypt_in_place(&mut [0u8; 27], b"aad"),
+            Err(VykarError::DecryptionFailed)
+        ));
+    }
 }

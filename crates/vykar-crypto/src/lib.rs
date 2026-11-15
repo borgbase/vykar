@@ -59,6 +59,27 @@ pub trait CryptoEngine: Send + Sync {
         Ok(())
     }
 
+    /// Decrypt data produced by `encrypt` in place, returning the plaintext
+    /// as a subslice of `data`. Avoids a second buffer the size of the object.
+    ///
+    /// On error the contents of `data` are unspecified (an AEAD may have
+    /// decrypted unauthenticated bytes into it); callers must discard them.
+    ///
+    /// The default decrypts into a new buffer and copies the plaintext back;
+    /// the AEAD engines and `PlaintextEngine` override it without a copy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the input is malformed or authentication fails.
+    fn decrypt_in_place<'a>(&self, data: &'a mut [u8], aad: &[u8]) -> Result<&'a mut [u8]> {
+        let plaintext = self.decrypt(data, aad)?;
+        let out = data
+            .get_mut(..plaintext.len())
+            .ok_or(vykar_types::error::VykarError::DecryptionFailed)?;
+        out.copy_from_slice(&plaintext);
+        Ok(out)
+    }
+
     /// Whether this engine actually encrypts data.
     /// `PlaintextEngine` returns false; real ciphers return true.
     fn is_encrypting(&self) -> bool;
@@ -179,6 +200,35 @@ macro_rules! impl_aead_engine {
                 Ok(())
             }
 
+            fn decrypt_in_place<'a>(
+                &self,
+                data: &'a mut [u8],
+                aad: &[u8],
+            ) -> vykar_types::error::Result<&'a mut [u8]> {
+                use $crate_path::aead::AeadInOut;
+                if data.len() < 12 + 16 {
+                    return Err(vykar_types::error::VykarError::DecryptionFailed);
+                }
+                let (nonce_bytes, ct_and_tag) = data.split_at_mut(12);
+                let nonce_bytes: &[u8; 12] = (&*nonce_bytes)
+                    .try_into()
+                    .map_err(|_| vykar_types::error::VykarError::DecryptionFailed)?;
+                let tag_at = ct_and_tag.len() - 16;
+                let (ciphertext, tag_bytes) = ct_and_tag.split_at_mut(tag_at);
+                let tag_bytes: &[u8; 16] = (&*tag_bytes)
+                    .try_into()
+                    .map_err(|_| vykar_types::error::VykarError::DecryptionFailed)?;
+                self.cipher
+                    .decrypt_inout_detached(
+                        nonce_bytes.into(),
+                        aad,
+                        (&mut *ciphertext).into(),
+                        tag_bytes.into(),
+                    )
+                    .map_err(|_| vykar_types::error::VykarError::DecryptionFailed)?;
+                Ok(ciphertext)
+            }
+
             fn encrypt_in_place_detached(
                 &self,
                 buffer: &mut [u8],
@@ -245,6 +295,10 @@ impl CryptoEngine for PlaintextEngine {
         Ok(())
     }
 
+    fn decrypt_in_place<'a>(&self, data: &'a mut [u8], _aad: &[u8]) -> Result<&'a mut [u8]> {
+        Ok(data)
+    }
+
     fn encrypt_in_place_detached(
         &self,
         _buffer: &mut [u8],
@@ -303,5 +357,55 @@ mod tests {
         let encrypted = engine.encrypt(data, b"aad1").unwrap();
         let decrypted = engine.decrypt(&encrypted, b"different_aad").unwrap();
         assert_eq!(decrypted, data);
+    }
+
+    #[test]
+    fn plaintext_decrypt_in_place_is_identity() {
+        let engine = PlaintextEngine::new(hasher([0xCC; 32]));
+        let mut data = b"test data".to_vec();
+        let ptr = data.as_ptr();
+        let out = engine.decrypt_in_place(&mut data, b"aad").unwrap();
+        assert_eq!(out, b"test data");
+        assert_eq!(out.as_ptr(), ptr);
+    }
+
+    /// An engine that relies on the trait's default `decrypt_in_place`.
+    struct DefaultInPlace(crate::aes_gcm::Aes256GcmEngine);
+
+    impl CryptoEngine for DefaultInPlace {
+        fn encrypt(&self, plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
+            self.0.encrypt(plaintext, aad)
+        }
+        fn decrypt(&self, data: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
+            self.0.decrypt(data, aad)
+        }
+        fn encrypt_in_place_detached(
+            &self,
+            buffer: &mut [u8],
+            aad: &[u8],
+        ) -> Result<([u8; 12], [u8; 16])> {
+            self.0.encrypt_in_place_detached(buffer, aad)
+        }
+        fn is_encrypting(&self) -> bool {
+            true
+        }
+        fn chunk_hasher(&self) -> &ChunkHasher {
+            self.0.chunk_hasher()
+        }
+    }
+
+    #[test]
+    fn default_decrypt_in_place_copies_plaintext_back() {
+        let engine = DefaultInPlace(crate::aes_gcm::Aes256GcmEngine::new(
+            &[0x11; 32],
+            hasher([0x22; 32]),
+        ));
+        let mut encrypted = engine.encrypt(b"default path", b"aad").unwrap();
+        assert_eq!(
+            engine.decrypt_in_place(&mut encrypted, b"aad").unwrap(),
+            b"default path"
+        );
+        let mut encrypted = engine.encrypt(b"default path", b"aad").unwrap();
+        assert!(engine.decrypt_in_place(&mut encrypted, b"bad").is_err());
     }
 }

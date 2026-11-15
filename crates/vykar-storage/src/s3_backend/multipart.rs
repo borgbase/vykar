@@ -8,6 +8,8 @@
 //! `PRESIGN_DURATION`.
 
 use std::io::Read;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex, OnceLock};
 
 use base64::Engine;
 use md5::{Digest, Md5};
@@ -40,6 +42,74 @@ const S3_MAX_PART_SIZE: usize = 5 * 1024 * 1024 * 1024;
 const CREATE_MPU: &str = "CREATE_MPU";
 const COMPLETE_MPU: &str = "COMPLETE_MPU";
 const ABORT_MPU: &str = "ABORT_MPU";
+
+/// Env override for the backend-wide part concurrency. Hidden tuning knob for
+/// benchmarking; not a supported configuration surface.
+const PART_CONCURRENCY_ENV: &str = "VYKAR_S3_PART_CONCURRENCY";
+/// Upper bound on the backend-wide part concurrency (also caps the env override).
+const MAX_PART_CONCURRENCY: usize = 64;
+
+/// Backend-wide number of concurrent part PUTs, derived from the repository's
+/// `max_connections` (default 2).
+///
+/// One stream at 40 ms RTT is capped near 100 MiB/s by its send window, and
+/// every part pays ~1 RTT of fixed turnaround, so throughput scales with the
+/// number of concurrent streams rather than with the number of packs in
+/// flight. Core keeps `connections + 2` packs in flight; parts of each pack
+/// upload in parallel, bounded across all packs by this many slots.
+pub(super) fn part_concurrency(max_connections: Option<usize>) -> usize {
+    if let Some(n) = std::env::var(PART_CONCURRENCY_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+    {
+        return n.clamp(1, MAX_PART_CONCURRENCY);
+    }
+    (max_connections.unwrap_or(2) * 4).clamp(4, 32)
+}
+
+/// Counting semaphore bounding the in-flight part PUTs across every multipart
+/// upload of one backend.
+pub(super) struct PartSlots {
+    free: Mutex<usize>,
+    cv: Condvar,
+    capacity: usize,
+}
+
+impl PartSlots {
+    pub(super) fn new(capacity: usize) -> Self {
+        let capacity = capacity.max(1);
+        Self {
+            free: Mutex::new(capacity),
+            cv: Condvar::new(),
+            capacity,
+        }
+    }
+
+    pub(super) fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    fn acquire(&self) -> PartSlot<'_> {
+        let mut free = self.free.lock().unwrap_or_else(|e| e.into_inner());
+        while *free == 0 {
+            free = self.cv.wait(free).unwrap_or_else(|e| e.into_inner());
+        }
+        *free -= 1;
+        PartSlot(self)
+    }
+}
+
+/// RAII permit from [`PartSlots::acquire`]; released on drop (including unwind).
+struct PartSlot<'a>(&'a PartSlots);
+
+impl Drop for PartSlot<'_> {
+    fn drop(&mut self) {
+        let mut free = self.0.free.lock().unwrap_or_else(|e| e.into_inner());
+        *free += 1;
+        drop(free);
+        self.0.cv.notify_one();
+    }
+}
 
 #[allow(clippy::result_large_err)]
 impl S3Backend {
@@ -198,8 +268,12 @@ impl S3Backend {
         }
     }
 
-    /// Upload every part sequentially, then complete. Any part failure means the
-    /// object was never committed (complete never ran) → not ambiguous.
+    /// Upload every part, up to [`PartSlots`] at a time across the backend, then
+    /// complete. Workers claim part indices in ascending order; the first
+    /// failure stops new parts from starting and the scope joins every worker
+    /// before returning, so the caller's abort runs only after all in-flight
+    /// parts have stopped. Any part failure means complete never ran → not
+    /// ambiguous.
     fn upload_parts_and_complete(
         &self,
         full_key: &str,
@@ -208,26 +282,73 @@ impl S3Backend {
         part_size: usize,
         upload_id: &str,
     ) -> std::result::Result<(), MultipartFailure> {
-        let mut etags: Vec<String> = Vec::new();
-        for (i, chunk) in data.chunks(part_size).enumerate() {
+        let chunks: Vec<&[u8]> = data.chunks(part_size).collect();
+        let etags: Vec<OnceLock<String>> = (0..chunks.len()).map(|_| OnceLock::new()).collect();
+        let next = AtomicUsize::new(0);
+        let failed = AtomicBool::new(false);
+        // Lowest-numbered part failure wins, matching what a sequential upload
+        // would have reported.
+        let failure: Mutex<Option<(usize, MultipartFailure)>> = Mutex::new(None);
+
+        let worker = || loop {
+            let i = next.fetch_add(1, Ordering::Relaxed);
+            let (Some(&chunk), Some(etag_slot)) = (chunks.get(i), etags.get(i)) else {
+                return;
+            };
+            if failed.load(Ordering::Acquire) {
+                return;
+            }
+            let _slot = self.part_slots.acquire();
+            if failed.load(Ordering::Acquire) {
+                return;
+            }
             // part_size is derived to keep the count <= S3_MAX_PARTS (<= u16::MAX).
             let part_number = u16::try_from(i + 1).expect("part count bounded by S3_MAX_PARTS");
-            match self.upload_part(full_key, key, part_number, upload_id, chunk)? {
-                PartOutcome::Uploaded(etag) => etags.push(etag),
-                // The MPU expired or was aborted out from under us. A fresh MPU can
-                // recover, so restart at the outer loop.
-                PartOutcome::NoSuchUpload => {
-                    return Err(MultipartFailure {
-                        kind: MultipartFailureKind::Retryable,
-                        ambiguous: false,
-                        err: VykarError::Other(format!(
-                            "S3 PUT {key}: NoSuchUpload uploading part {part_number}; \
-                             the multipart upload no longer exists"
-                        )),
-                    })
+            let err = match self.upload_part(full_key, key, part_number, upload_id, chunk) {
+                Ok(PartOutcome::Uploaded(etag)) => {
+                    etag_slot
+                        .set(etag)
+                        .expect("each part index is claimed once");
+                    continue;
                 }
+                // The MPU expired or was aborted out from under us. A fresh MPU
+                // can recover, so restart at the outer loop.
+                Ok(PartOutcome::NoSuchUpload) => MultipartFailure {
+                    kind: MultipartFailureKind::Retryable,
+                    ambiguous: false,
+                    err: VykarError::Other(format!(
+                        "S3 PUT {key}: NoSuchUpload uploading part {part_number}; \
+                         the multipart upload no longer exists"
+                    )),
+                },
+                Err(f) => f,
+            };
+            failed.store(true, Ordering::Release);
+            let mut first = failure.lock().unwrap_or_else(|e| e.into_inner());
+            if first.as_ref().is_none_or(|(j, _)| i < *j) {
+                *first = Some((i, err));
             }
+            return;
+        };
+
+        let workers = self.part_slots.capacity().min(chunks.len());
+        std::thread::scope(|s| {
+            for _ in 1..workers {
+                s.spawn(worker);
+            }
+            worker();
+        });
+
+        if let Some((_, err)) = failure.into_inner().unwrap_or_else(|e| e.into_inner()) {
+            return Err(err);
         }
+        let etags: Vec<String> = etags
+            .into_iter()
+            .map(|e| {
+                e.into_inner()
+                    .expect("every part uploaded when none failed")
+            })
+            .collect();
         self.complete_mpu(full_key, key, &etags, upload_id)
     }
 
@@ -1416,5 +1537,218 @@ mod tests {
             "an abort failure must not replace the original upload error: {err}"
         );
         handle.join().unwrap();
+    }
+
+    // ── Parallel parts (concurrency-safe mock) ─────────────────────
+
+    /// One request seen by [`ConcurrentMock`]: request line, body, and the
+    /// times the server started reading it / finished replying.
+    struct SeenRequest {
+        line: String,
+        body: Vec<u8>,
+        start: std::time::Instant,
+        end: std::time::Instant,
+    }
+
+    /// Mock S3 that serves every connection on its own thread and answers by
+    /// request kind, so parts may arrive in any order and overlap. Each part
+    /// handler holds its response until `rendezvous` parts are in flight (or a
+    /// 2 s timeout), which makes overlap deterministic when it is possible.
+    struct ConcurrentMock {
+        port: u16,
+        seen: Arc<Mutex<Vec<SeenRequest>>>,
+        max_in_flight: Arc<Mutex<usize>>,
+    }
+
+    /// The raw response of a [`MpReply::Full`] reply.
+    fn mp_full(reply: MpReply) -> String {
+        match reply {
+            MpReply::Full(r) => r,
+            MpReply::ResetAfterBody(_) | MpReply::NoResponse => String::new(),
+        }
+    }
+
+    fn concurrent_mock(rendezvous: usize, fail_part: Option<u16>) -> ConcurrentMock {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let max_in_flight = Arc::new(Mutex::new(0usize));
+        let in_flight = Arc::new((Mutex::new(0usize), std::sync::Condvar::new()));
+        let (seen2, max2) = (Arc::clone(&seen), Arc::clone(&max_in_flight));
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let (seen, max_in_flight, in_flight) = (
+                    Arc::clone(&seen2),
+                    Arc::clone(&max2),
+                    Arc::clone(&in_flight),
+                );
+                std::thread::spawn(move || {
+                    let start = std::time::Instant::now();
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut lines = Vec::new();
+                    let mut content_len = 0usize;
+                    let mut line = String::new();
+                    loop {
+                        line.clear();
+                        if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                            return;
+                        }
+                        if line.trim().is_empty() {
+                            break;
+                        }
+                        if let Some(v) = line.to_lowercase().strip_prefix("content-length:") {
+                            content_len = v.trim().parse().unwrap_or(0);
+                        }
+                        lines.push(line.trim().to_string());
+                    }
+                    let mut body = vec![0u8; content_len];
+                    reader.read_exact(&mut body).unwrap();
+                    let req = lines[0].clone();
+                    let part: Option<u16> = req
+                        .split(['?', '&', ' '])
+                        .find_map(|kv| kv.strip_prefix("partNumber=").and_then(|n| n.parse().ok()));
+                    let response = if let Some(n) = part {
+                        let (count, cv) = &*in_flight;
+                        let mut c = count.lock().unwrap();
+                        *c += 1;
+                        {
+                            let mut m = max_in_flight.lock().unwrap();
+                            *m = (*m).max(*c);
+                        }
+                        cv.notify_all();
+                        let deadline = start + std::time::Duration::from_secs(2);
+                        while *c < rendezvous {
+                            let now = std::time::Instant::now();
+                            if now >= deadline {
+                                break;
+                            }
+                            c = cv.wait_timeout(c, deadline - now).unwrap().0;
+                        }
+                        drop(c);
+                        // Give the other in-flight parts a moment before replying
+                        // so a failing part overlaps them.
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                        *count.lock().unwrap() -= 1;
+                        if Some(n) == fail_part {
+                            mp_http_xml("403 Forbidden", &s3_error_xml("AccessDenied", "no"))
+                        } else {
+                            format!(
+                                "HTTP/1.1 200 OK\r\nETag: \"etag-{n}\"\r\n\
+                                 Content-Length: 0\r\nConnection: close\r\n\r\n"
+                            )
+                        }
+                    } else if req.starts_with("POST ") && req.contains("uploads=1") {
+                        mp_full(mp_create_ok("u1"))
+                    } else if req.starts_with("POST ") {
+                        mp_full(mp_complete_ok())
+                    } else {
+                        "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_string()
+                    };
+                    // Record before replying: the client cannot act on this
+                    // response (e.g. send the abort) before `end`.
+                    seen.lock().unwrap().push(SeenRequest {
+                        line: req,
+                        body,
+                        start,
+                        end: std::time::Instant::now(),
+                    });
+                    let _ = stream.write_all(response.as_bytes());
+                    let _ = stream.flush();
+                });
+            }
+        });
+        ConcurrentMock {
+            port,
+            seen,
+            max_in_flight,
+        }
+    }
+
+    #[test]
+    fn multipart_parallel_parts_overlap_and_complete_in_order() {
+        let mock = concurrent_mock(4, None);
+        let backend = s3_backend_concurrent(mock.port, no_retry(), false);
+        assert!(backend.part_slots.capacity() >= 4);
+        // 4 parts: three full 16 MiB parts + a 1-byte tail.
+        let data = vec![3u8; 3 * MULTIPART_PART_SIZE + 1];
+        backend.put("packs/ab/obj", &data).unwrap();
+        assert_eq!(*mock.max_in_flight.lock().unwrap(), 4, "all parts overlap");
+        let seen = mock.seen.lock().unwrap();
+        let parts: Vec<&SeenRequest> = seen
+            .iter()
+            .filter(|r| r.line.contains("partNumber="))
+            .collect();
+        assert_eq!(parts.len(), 4);
+        let complete = seen
+            .iter()
+            .find(|r| r.line.starts_with("POST ") && r.line.contains("uploadId="))
+            .expect("complete sent");
+        assert!(parts.iter().all(|p| p.end <= complete.start));
+        let body = String::from_utf8_lossy(&complete.body);
+        let pos: Vec<usize> = (1..=4)
+            .map(|n| body.find(&format!("&quot;etag-{n}&quot;")).unwrap())
+            .collect();
+        assert!(pos.windows(2).all(|w| w[0] < w[1]), "ETag order: {body}");
+        for n in 1..=4 {
+            assert!(body.contains(&format!("<PartNumber>{n}</PartNumber>")));
+        }
+    }
+
+    #[test]
+    fn multipart_part_slots_bound_in_flight_parts() {
+        let mock = concurrent_mock(2, None);
+        let mut backend = s3_backend_concurrent(mock.port, no_retry(), false);
+        backend.part_slots = PartSlots::new(2);
+        backend
+            .put("packs/ab/obj", &vec![1u8; 4 * MULTIPART_PART_SIZE])
+            .unwrap();
+        assert_eq!(*mock.max_in_flight.lock().unwrap(), 2);
+    }
+
+    #[test]
+    fn multipart_parallel_part_failure_aborts_after_all_parts_stop() {
+        let mock = concurrent_mock(3, Some(2));
+        let backend = s3_backend_concurrent(mock.port, no_retry(), false);
+        let err = backend
+            .put("packs/ab/obj", &vec![0u8; 2 * MULTIPART_PART_SIZE + 1])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("AccessDenied"), "got: {err}");
+        // The abort is sent by the client after the response it waits on, so
+        // wait for the server threads to record it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline
+            && !mock
+                .seen
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|r| r.line.starts_with("DELETE "))
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let seen = mock.seen.lock().unwrap();
+        assert!(
+            !seen
+                .iter()
+                .any(|r| r.line.starts_with("POST ") && r.line.contains("uploadId=")),
+            "no complete after a part failure"
+        );
+        let abort = seen
+            .iter()
+            .find(|r| r.line.starts_with("DELETE "))
+            .expect("abort sent");
+        for p in seen.iter().filter(|r| r.line.contains("partNumber=")) {
+            assert!(p.end <= abort.start, "abort only after every part stopped");
+        }
+        assert_eq!(mp_creates_seen(&seen), 1, "permanent failure: no restart");
+    }
+
+    fn mp_creates_seen(seen: &[SeenRequest]) -> usize {
+        seen.iter()
+            .filter(|r| r.line.starts_with("POST ") && r.line.contains("uploads=1"))
+            .count()
     }
 }

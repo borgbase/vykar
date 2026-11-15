@@ -35,6 +35,8 @@ pub struct S3Backend {
     /// When true, `delete()` overwrites with a zero-byte tombstone instead of
     /// issuing a real DELETE. For S3 Object Lock compatibility.
     soft_delete: bool,
+    /// Backend-wide bound on concurrent multipart part PUTs.
+    part_slots: multipart::PartSlots,
 }
 
 #[allow(clippy::result_large_err)]
@@ -68,7 +70,11 @@ impl S3Backend {
 
         let credentials = Credentials::new(access_key_id, secret_access_key);
 
-        let pool = crate::http_idle_pool_size(max_connections);
+        let part_concurrency = multipart::part_concurrency(max_connections);
+        // Keep every part stream pooled plus a few for control requests
+        // (create/complete, locks, index), so a part never pays a fresh
+        // connection (cold congestion window, TLS handshake).
+        let pool = crate::http_idle_pool_size(max_connections).max(part_concurrency + 4);
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .http_status_as_error(false)
             .timeout_resolve(Some(crate::HTTP_RESOLVE_TIMEOUT))
@@ -94,6 +100,7 @@ impl S3Backend {
             retry,
             root,
             soft_delete,
+            part_slots: multipart::PartSlots::new(part_concurrency),
         })
     }
 
@@ -541,7 +548,18 @@ mod test_support {
         }
     }
 
+    /// Backend for the scripted (strictly sequential) mock servers: one part in
+    /// flight so requests arrive in a deterministic order.
     pub(super) fn s3_backend(port: u16, retry: RetryConfig, soft_delete: bool) -> S3Backend {
+        sequential_parts(s3_backend_concurrent(port, retry, soft_delete))
+    }
+
+    /// Backend with the default (parallel) part concurrency.
+    pub(super) fn s3_backend_concurrent(
+        port: u16,
+        retry: RetryConfig,
+        soft_delete: bool,
+    ) -> S3Backend {
         S3Backend::new(
             "test-bucket",
             "us-east-1",
@@ -557,18 +575,25 @@ mod test_support {
     }
 
     pub(super) fn s3_backend_rooted(port: u16, retry: RetryConfig, soft_delete: bool) -> S3Backend {
-        S3Backend::new(
-            "test-bucket",
-            "us-east-1",
-            "backups/vykar",
-            &format!("http://127.0.0.1:{port}"),
-            "AKID",
-            "SECRET",
-            retry,
-            soft_delete,
-            None,
+        sequential_parts(
+            S3Backend::new(
+                "test-bucket",
+                "us-east-1",
+                "backups/vykar",
+                &format!("http://127.0.0.1:{port}"),
+                "AKID",
+                "SECRET",
+                retry,
+                soft_delete,
+                None,
+            )
+            .unwrap(),
         )
-        .unwrap()
+    }
+
+    fn sequential_parts(mut backend: S3Backend) -> S3Backend {
+        backend.part_slots = super::multipart::PartSlots::new(1);
+        backend
     }
 
     pub(super) fn s3_error_xml(code: &str, message: &str) -> String {

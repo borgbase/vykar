@@ -431,16 +431,33 @@ impl<R: Read> Read for MsgpackStreamReader<R> {
     }
 }
 
+/// Staging buffer in front of the streaming ZSTD encoder (about
+/// `ZSTD_CStreamInSize`). rmp-serde emits one `write_all` per marker byte and
+/// short field; without this, each of those is a separate
+/// `ZSTD_compressStream` FFI call.
+const ZSTD_STREAM_INPUT_BUFFER: usize = 128 << 10;
+
+/// Writer handed to the [`compress_stream_zstd`] callback: a buffered ZSTD
+/// encoder appending to the output `Vec`.
+pub type ZstdStreamWriter<'a> =
+    std::io::BufWriter<zstd::stream::write::Encoder<'static, &'a mut Vec<u8>>>;
+
 /// Stream-compress data into `buf` using ZSTD. Prepends the codec tag byte.
-/// The `write_data` callback should write uncompressed data into the encoder.
+/// The `write_data` callback should write uncompressed data into the writer;
+/// small writes are batched before they reach the encoder.
 pub fn compress_stream_zstd<F>(buf: &mut Vec<u8>, level: i32, write_data: F) -> Result<()>
 where
-    F: FnOnce(&mut zstd::stream::write::Encoder<&mut Vec<u8>>) -> Result<()>,
+    F: FnOnce(&mut ZstdStreamWriter<'_>) -> Result<()>,
 {
     buf.push(TAG_ZSTD);
-    let mut encoder = zstd::stream::write::Encoder::new(&mut *buf, level)
+    let encoder = zstd::stream::write::Encoder::new(&mut *buf, level)
         .map_err(|e| VykarError::Other(format!("zstd init: {e}")))?;
-    write_data(&mut encoder)?;
+    let mut writer = std::io::BufWriter::with_capacity(ZSTD_STREAM_INPUT_BUFFER, encoder);
+    write_data(&mut writer)?;
+    // `into_inner` flushes the staged bytes into the encoder.
+    let encoder = writer
+        .into_inner()
+        .map_err(|e| VykarError::Other(format!("zstd write: {}", e.error())))?;
     encoder
         .finish()
         .map_err(|e| VykarError::Other(format!("zstd finish: {e}")))?;
@@ -853,6 +870,37 @@ mod tests {
         assert_eq!(&buf[..prefix.len()], prefix);
         let decompressed = decompress(&buf[prefix.len()..]).unwrap();
         assert_eq!(decompressed, payload);
+    }
+
+    #[test]
+    fn compress_stream_zstd_mixed_write_sizes_roundtrip() {
+        // Tiny writes (staged), a write larger than the staging buffer
+        // (passed through), and tiny writes again: the stream must decode to
+        // exactly the concatenation, in order.
+        use std::io::Write;
+        let mut expected = Vec::new();
+        let mut buf = Vec::new();
+        compress_stream_zstd(&mut buf, 3, |w| {
+            for i in 0..100_000u32 {
+                let b = [(i % 251) as u8];
+                w.write_all(&b)?;
+                expected.extend_from_slice(&b);
+            }
+            let big: Vec<u8> = (0..(ZSTD_STREAM_INPUT_BUFFER * 3 + 17))
+                .map(|i| (i * 7 % 256) as u8)
+                .collect();
+            w.write_all(&big)?;
+            expected.extend_from_slice(&big);
+            for i in 0..1000u32 {
+                let b = i.to_le_bytes();
+                w.write_all(&b)?;
+                expected.extend_from_slice(&b);
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(buf[0], TAG_ZSTD);
+        assert_eq!(decompress(&buf).unwrap(), expected);
     }
 
     #[test]

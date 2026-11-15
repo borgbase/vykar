@@ -643,7 +643,7 @@ where
     // already non-fatal warnings, so a partial pass never aborts the restore.
     for node in &mut plan_out.dirs {
         if let Ok(rel) = node.path.strip_prefix(&temp_root) {
-            node.path = dest_root.join(rel);
+            node.path = dest_root.join(rel).into();
         }
     }
     finalize::apply_dir_metadata(&mut plan_out.dirs, restore_as_root, &mut stats);

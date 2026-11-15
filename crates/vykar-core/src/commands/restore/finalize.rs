@@ -1672,7 +1672,7 @@ mod tests {
         std::fs::create_dir_all(&d).unwrap();
 
         let mut dirs = vec![PlannedNode {
-            path: d,
+            path: d.into(),
             mode: 0o755,
             mtime: 0,
             uid: 11,
@@ -1701,7 +1701,7 @@ mod tests {
         std::os::unix::fs::symlink("target", &link).unwrap();
 
         let syms = vec![PlannedNode {
-            path: link,
+            path: link.into(),
             mode: 0,
             mtime: 0,
             uid: 33,
@@ -1728,7 +1728,7 @@ mod tests {
         std::fs::create_dir_all(dest.path().join("a/b/c")).unwrap();
 
         let node = |rel: &str| PlannedNode {
-            path: dest.path().join(rel),
+            path: dest.path().join(rel).into(),
             mode: 0o755,
             mtime: 0,
             uid: 0,
@@ -1740,7 +1740,7 @@ mod tests {
         let mut stats = RestoreStats::default();
         apply_dir_metadata(&mut dirs, false, &mut stats);
 
-        let order: Vec<_> = dirs.iter().map(|d| d.path.clone()).collect();
+        let order: Vec<_> = dirs.iter().map(|d| d.path.to_path_buf()).collect();
         assert_eq!(order[0], dest.path().join("a/b/c"));
         assert_eq!(order[2], dest.path().join("a"));
     }

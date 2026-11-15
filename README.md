@@ -1,14 +1,23 @@
 # Vykar Backup
 
-A fast, encrypted, deduplicated backup tool written in Rust centered around a friendly YAML config file.
+The fastest and most resource-efficient encrypted, deduplicated backup tool we have benchmarked. Written in Rust and centered around a friendly YAML config file.
 
 Inspired by [BorgBackup](https://github.com/borgbackup/borg/), [Borgmatic](https://torsion.org/borgmatic/), [Restic](https://github.com/restic/restic), and [Rustic](https://github.com/rustic-rs/rustic). Vykar uses its own on-disk format and is not compatible with Borg or Restic repositories.
 
 **⚠️ Don't use for production backups yet, but do test it along other backup tools.**
 
+## Benchmarks
+
+On a 49 GiB / 367k-file corpus, Vykar backs up 1.4x faster than the next-fastest tool (2.4x faster than Restic) and uses the least CPU and the least memory of all tools tested — for both backup and restore.
+
+![Backup Tool Benchmark: Vykar is fastest with the lowest CPU and memory use compared to Restic, Rustic, Borg and Kopia](docs/src/images/benchmark.summary.png)
+
+All benchmarks were run 5x on the same idle Intel i7-6700 CPU @ 3.40GHz machine with 2x Samsung PM981 NVMe drives, with results averaged across all runs. Compression settings were chosen to keep resulting repository sizes comparable. The sample corpus is a mix of small and large files with varying compressibility. See [detailed results](docs/src/images/summary.json) or our [benchmark script](https://github.com/borgbase/vykar/tree/main/scripts) for full details.
+
+
 ## Features
 
-- **Fast** — fastest backup and restore of the tools we benchmarked, at the lowest CPU cost
+- **Fast and lean** — fastest backup and restore of the tools we benchmarked, with the lowest CPU and memory use
 - **Encrypted by default** — client-side AES-256-GCM or ChaCha20-Poly1305; the storage never sees your keys
 - **Deduplicated and compressed** — content-defined chunking with LZ4 or Zstandard keeps incremental backups small
 - **One YAML file** — repositories, sources, retention, excludes, and schedule, with hooks for monitoring and command dumps for databases
@@ -18,15 +27,6 @@ Inspired by [BorgBackup](https://github.com/borgbackup/borg/), [Borgmatic](https
 - **Find and restore** — search files across snapshots, browse via built-in WebDAV and web UI, or use the desktop GUI
 - **Runs unattended** — built-in scheduler (interval or cron) with a [read-only HTTP status page](docs/src/daemon.md#read-only-status-page), resource limits, and concurrent backups from multiple machines
 - **Cross-platform** — Linux, macOS, and Windows; single binary, Docker image, Ansible role
-
-
-## Benchmarks
-
-Vykar leads in both speed and CPU efficiency, while maintaining competitive memory usage.
-
-![Backup Tool Benchmark](docs/src/images/benchmark.summary.png)
-
-All benchmarks were run on the same idle Intel i7-6700 CPU @ 3.40GHz machine with 2x Samsung PM981 NVMe drives. Compression settings were chosen to keep resulting repository sizes comparable. The sample corpus is a mix of small and large files with varying compressibility. See our [benchmark script](https://github.com/borgbase/vykar/tree/main/scripts) for full details.
 
 
 ## Quick start

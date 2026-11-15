@@ -912,7 +912,7 @@ def generate_chart_with_deps(
                 label.set_color(VYKAR)
                 label.set_fontweight("bold")
         ax_top.set_xticks([])
-        ax_top.set_title("Peak Memory (MB)  (↓ lower is better)", fontsize=10, color="#cfd8dc", pad=10)
+        ax_top.set_title("Peak Memory (MiB)  (↓ lower is better)", fontsize=10, color="#cfd8dc", pad=10)
 
         for ax in (ax_top, ax_bot):
             ax.set_axisbelow(True)

@@ -1,10 +1,19 @@
-Vykar is a fast, encrypted, deduplicated backup tool written in Rust. It's centered around a simple YAML config format and includes a desktop GUI and WebDAV server to browse snapshots. More about [design goals](goals.md).
+Vykar is the fastest and most resource-efficient encrypted, deduplicated backup tool we have benchmarked, written in Rust. It's centered around a simple YAML config format and includes a desktop GUI and WebDAV server to browse snapshots. More about [design goals](goals.md).
 
 ⚠️ **Do not use for production backups yet, but do test it along other backup tools.**
 
+## Benchmarks
+
+On a 49 GiB / 367k-file corpus, Vykar backs up 1.4x faster than the next-fastest tool (2.4x faster than Restic) and uses the least CPU and the least memory of all tools tested -- for both backup and restore.
+
+[![Backup Tool Benchmark: Vykar is fastest with the lowest CPU and memory use compared to Restic, Rustic, Borg and Kopia](images/benchmark.summary.png)](images/benchmark.summary.png)
+
+<small>All benchmarks were run 5x on the same idle Intel i7-6700 CPU @ 3.40GHz machine with 2x Samsung PM981 NVMe drives, with results averaged across all runs. Compression settings were chosen to keep resulting repository sizes comparable. The sample corpus is a mix of small and large files with varying compressibility. See [detailed results](images/summary.json) or our [benchmark script](https://github.com/borgbase/vykar/tree/main/scripts) for full details.</small>
+
+
 ## Features
 
-- **Fast** -- fastest backup and restore of the tools we benchmarked, at the lowest CPU cost
+- **Fast and lean** -- fastest backup and restore of the tools we benchmarked, with the lowest CPU and memory use
 - **Encrypted by default** -- client-side AES-256-GCM or ChaCha20-Poly1305; the storage never sees your keys
 - **Deduplicated and compressed** -- content-defined chunking with LZ4 or Zstandard keeps incremental backups small
 - **One YAML file** -- repositories, sources, retention, excludes, and schedule, with hooks for monitoring and command dumps for databases
@@ -32,15 +41,6 @@ Once you're up and running:
 - [Schedule backups](daemon.md) -- run unattended with systemd, launchd, or Docker
 - [Maintain your repository](maintenance.md) -- prune old snapshots, check integrity, compact packs
 - [Explore backup recipes](recipes.md) -- common patterns for databases, containers, and filesystems
-
-
-## Benchmarks
-
-Vykar is the fastest tool for both backup and restore, with the lowest CPU cost, while maintaining competitive memory usage.
-
-[![Backup Tool Benchmark](images/benchmark.summary.png)](images/benchmark.summary.png)
-
-<small>All benchmarks were run 5x on the same idle Intel i7-6700 CPU @ 3.40GHz machine with 2x Samsung PM981 NVMe drives, with results averaged across all runs. Compression settings were chosen to keep resulting repository sizes comparable. The sample corpus is a mix of small and large files with varying compressibility. See [detailed results](images/summary.json) or our [benchmark script](https://github.com/borgbase/vykar/tree/main/scripts) for full details.</small>
 
 
 ## How it compares

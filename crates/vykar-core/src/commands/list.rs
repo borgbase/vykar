@@ -1,15 +1,20 @@
-use std::sync::atomic::AtomicBool;
+use std::io::{BufRead, Read};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use serde::Deserialize;
 use tracing::info;
 
+use crate::compress;
 use crate::config::VykarConfig;
 use crate::index::dedup_cache::MmapRestoreCache;
-use crate::repo::format::{unpack_object_expect_with_context, ObjectType};
+use crate::repo::format::{unpack_object_expect_with_context, verify_chunk_id, ObjectType};
 use crate::repo::manifest::SnapshotEntry;
 use crate::repo::Repository;
 use crate::snapshot::item::Item;
 use crate::snapshot::SnapshotMeta;
+use vykar_crypto::CryptoEngine;
+use vykar_storage::StorageBackend;
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
 use vykar_types::pack_id::PackId;
@@ -179,6 +184,10 @@ pub fn load_snapshot_item_stream(
 pub struct ItemStreamReader {
     restore_cache: Option<MmapRestoreCache>,
     index_loaded: bool,
+    /// Raised by a [`LazyItemStream`] of this reader when a cached location
+    /// turned out to be unreadable mid-stream: the cache must not serve any
+    /// further lookup.
+    cache_distrusted: Arc<AtomicBool>,
 }
 
 impl ItemStreamReader {
@@ -186,6 +195,7 @@ impl ItemStreamReader {
         Self {
             restore_cache: repo.open_restore_cache(),
             index_loaded: false,
+            cache_distrusted: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -219,6 +229,81 @@ impl ItemStreamReader {
         load_snapshot_item_stream(repo, snapshot_name, shutdown)
     }
 
+    /// Open the item stream of `snapshot_name` for lazy, chunk-at-a-time
+    /// decoding (see [`LazyItemStream`]) instead of materializing it.
+    ///
+    /// Chunk locations are resolved up front, through the restore cache when
+    /// it holds every item-stream chunk, else through the full index (loaded
+    /// at most once). The first range read happens here, so a cancellation or
+    /// an unreadable stream head fails before the caller mutates anything.
+    pub fn open_lazy<'a>(
+        &mut self,
+        repo: &mut Repository,
+        snapshot_name: &str,
+        shutdown: Option<&'a AtomicBool>,
+    ) -> Result<LazyItemStream<'a>> {
+        check_interrupted(shutdown)?;
+        let meta = load_snapshot_meta(repo, snapshot_name)?;
+        let mut chunks = None;
+        if let Some(cache) = &self.restore_cache {
+            let resolved: std::result::Result<Vec<ChunkLoc>, ChunkId> = meta
+                .item_ptrs
+                .iter()
+                .map(|id| {
+                    cache
+                        .lookup(id)
+                        .map(|(pack_id, offset, size)| (*id, pack_id, offset, size))
+                        .ok_or(*id)
+                })
+                .collect();
+            match resolved {
+                Ok(c) => chunks = Some(c),
+                Err(missing) => {
+                    info!(
+                        "restore cache lacks item-stream chunk {missing}, falling back to full index"
+                    );
+                    self.restore_cache = None;
+                }
+            }
+        }
+        let from_cache = chunks.is_some();
+        let chunks = match chunks {
+            Some(c) => c,
+            None => {
+                self.ensure_index(repo)?;
+                resolve_from_index(repo.chunk_index(), &meta.item_ptrs)?
+            }
+        };
+
+        let mut stream = LazyItemStream {
+            storage: Arc::clone(&repo.storage),
+            crypto: Arc::clone(&repo.crypto),
+            shutdown,
+            chunks,
+            from_cache,
+            cache_distrusted: Arc::clone(&self.cache_distrusted),
+            window_max: LAZY_WINDOW_MAX,
+            next: 0,
+            window: Vec::new(),
+            window_start: 0,
+            window_end: 0,
+            cur: Vec::new(),
+            pos: 0,
+            error: None,
+            reads: 0,
+            done: false,
+        };
+        if let Err(e) = stream.fill_buf() {
+            return Err(stream.error.take().unwrap_or(VykarError::Io(e)));
+        }
+        if from_cache && !stream.from_cache {
+            // The stream head was unreadable at the cached coordinates: stop
+            // trusting the cache for the caller's own lookups too.
+            self.restore_cache = None;
+        }
+        Ok(stream)
+    }
+
     /// Load the full chunk index unless this reader already did.
     pub fn ensure_index(&mut self, repo: &mut Repository) -> Result<()> {
         if !self.index_loaded {
@@ -247,6 +332,10 @@ impl ItemStreamReader {
         repo: &mut Repository,
         ids: impl IntoIterator<Item = &'a ChunkId>,
     ) -> Result<()> {
+        if self.cache_distrusted.load(Ordering::Relaxed) && self.restore_cache.is_some() {
+            info!("restore cache had an unreadable item-stream location, using the full index");
+            self.restore_cache = None;
+        }
         if let Some(cache) = &self.restore_cache {
             match ids.into_iter().find(|id| cache.lookup(id).is_none()) {
                 None => return Ok(()),
@@ -287,6 +376,305 @@ impl ItemStreamReader {
     /// Whether this reader loaded the full chunk index.
     pub fn index_loaded(&self) -> bool {
         self.index_loaded
+    }
+}
+
+/// `(chunk_id, pack_id, pack_offset, stored_size)` of one item-stream chunk.
+type ChunkLoc = (ChunkId, PackId, u64, u32);
+
+/// Upper bound on one range read of [`LazyItemStream`]. Smaller than the
+/// eager reader's 16 MiB coalescing cap because the raw window stays resident
+/// while its chunks are decoded; item-stream chunks average 128 KiB
+/// plaintext, so one window still spans dozens of them.
+const LAZY_WINDOW_MAX: u64 = 4 * 1024 * 1024;
+
+/// Largest gap between two stream-consecutive chunks of one pack that is
+/// still read through rather than split into two range reads.
+const LAZY_WINDOW_GAP: u64 = 256 * 1024;
+
+fn resolve_from_index(index: &crate::index::ChunkIndex, ids: &[ChunkId]) -> Result<Vec<ChunkLoc>> {
+    ids.iter()
+        .map(|id| {
+            let e = index
+                .get(id)
+                .ok_or_else(|| VykarError::Other(format!("chunk not found: {id}")))?;
+            Ok((*id, e.pack_id, e.pack_offset, e.stored_size))
+        })
+        .collect()
+}
+
+/// A snapshot's item stream read on demand: only the current range read
+/// (at most `LAZY_WINDOW_MAX`, 4 MiB) and the plaintext of the chunk being decoded
+/// are resident, instead of the whole decompressed stream. Items may straddle
+/// chunk boundaries; the [`BufRead`] impl hides them.
+///
+/// Holds its own storage and crypto handles so the caller can keep using the
+/// repository mutably while the stream is being consumed. Every chunk is
+/// authenticated (AEAD) or, for unencrypted repositories, checked against its
+/// chunk ID, exactly like [`Repository::read_chunks_coalesced_into`].
+///
+/// When the locations came from the restore cache and a chunk cannot be read
+/// or decoded at them, the remaining locations are re-resolved once through a
+/// freshly downloaded full index (dropped right after) and the read retried.
+pub struct LazyItemStream<'a> {
+    storage: Arc<dyn StorageBackend>,
+    crypto: Arc<dyn CryptoEngine>,
+    shutdown: Option<&'a AtomicBool>,
+    chunks: Vec<ChunkLoc>,
+    from_cache: bool,
+    /// Shared with the [`ItemStreamReader`]; raised on a cache fallback.
+    cache_distrusted: Arc<AtomicBool>,
+    /// Range-read cap; [`LAZY_WINDOW_MAX`] outside tests.
+    window_max: u64,
+    /// Index into `chunks` of the next chunk to decode.
+    next: usize,
+    /// Raw bytes of the current range read, starting at pack offset
+    /// `window_start` and covering `chunks[next..window_end]`.
+    window: Vec<u8>,
+    window_start: u64,
+    window_end: usize,
+    /// Plaintext of the chunk being decoded and the read position in it.
+    cur: Vec<u8>,
+    pos: usize,
+    /// The repository error behind the last failed read; `io::Error` cannot
+    /// carry it through the msgpack decoder, so it is recovered from here.
+    error: Option<VykarError>,
+    /// Range reads issued, for the end-of-stream debug line.
+    reads: usize,
+    done: bool,
+}
+
+impl<'a> LazyItemStream<'a> {
+    /// A stream over explicit chunk locations with a custom range-read cap,
+    /// for tests that exercise window and chunk boundaries.
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        repo: &Repository,
+        chunks: Vec<ChunkLoc>,
+        from_cache: bool,
+        window_max: u64,
+        shutdown: Option<&'a AtomicBool>,
+    ) -> Self {
+        Self {
+            storage: Arc::clone(&repo.storage),
+            crypto: Arc::clone(&repo.crypto),
+            shutdown,
+            chunks,
+            from_cache,
+            cache_distrusted: Arc::new(AtomicBool::new(false)),
+            window_max,
+            next: 0,
+            window: Vec::new(),
+            window_start: 0,
+            window_end: 0,
+            cur: Vec::new(),
+            pos: 0,
+            error: None,
+            reads: 0,
+            done: false,
+        }
+    }
+
+    /// Whether a cached location failed and the stream fell back to the index.
+    #[cfg(test)]
+    pub(crate) fn cache_distrusted(&self) -> bool {
+        self.cache_distrusted.load(Ordering::Relaxed)
+    }
+
+    /// Call `visit` for each item in stream order.
+    pub fn for_each_item(&mut self, visit: impl FnMut(Item) -> Result<()>) -> Result<()> {
+        let result = for_each_item_in(&mut *self, visit);
+        result.map_err(|e| self.error.take().unwrap_or(e))
+    }
+
+    /// Pick the range read that starts at chunk `first`: it extends over the
+    /// following stream chunks while they sit forward in the same pack, with
+    /// gaps of at most [`LAZY_WINDOW_GAP`], up to [`LAZY_WINDOW_MAX`] bytes.
+    /// Returns `(start, end, end_chunk)`.
+    fn plan_window(&self, first: usize) -> Result<(PackId, u64, u64, usize)> {
+        let overflow = |pack: &PackId| {
+            VykarError::InvalidFormat(format!("pack offset overflow in item stream (pack {pack})"))
+        };
+        let &(_, pack, start, size) = self
+            .chunks
+            .get(first)
+            .ok_or_else(|| VykarError::Other("item stream window out of range".into()))?;
+        let mut end = start
+            .checked_add(u64::from(size))
+            .ok_or_else(|| overflow(&pack))?;
+        let mut next = first + 1;
+        while let Some(&(_, p, offset, size)) = self.chunks.get(next) {
+            if p != pack || offset < end {
+                break;
+            }
+            let blob_end = offset
+                .checked_add(u64::from(size))
+                .ok_or_else(|| overflow(&pack))?;
+            if offset - end > LAZY_WINDOW_GAP || blob_end - start > self.window_max {
+                break;
+            }
+            end = blob_end;
+            next += 1;
+        }
+        Ok((pack, start, end, next))
+    }
+
+    /// Decode `chunks[next]` into `cur`, fetching a new window first if the
+    /// chunk is not in the current one.
+    fn try_load_next(&mut self) -> Result<()> {
+        let idx = self.next;
+        if idx >= self.window_end {
+            // Free the consumed window before fetching the next one.
+            self.window = Vec::new();
+            check_interrupted(self.shutdown)?;
+            let (pack, start, end, end_chunk) = self.plan_window(idx)?;
+            self.window = self
+                .storage
+                .get_range(&pack.storage_key(), start, end - start)?
+                .ok_or_else(|| VykarError::Other(format!("pack not found: {pack}")))?;
+            self.window_start = start;
+            self.window_end = end_chunk;
+            self.reads += 1;
+        }
+        let &(chunk_id, pack_id, offset, stored_size) = self
+            .chunks
+            .get(idx)
+            .ok_or_else(|| VykarError::Other("item stream chunk out of range".into()))?;
+        let blob = usize::try_from(offset - self.window_start)
+            .ok()
+            .and_then(|local| {
+                self.window
+                    .get(local..local.checked_add(stored_size as usize)?)
+            })
+            .ok_or_else(|| {
+                VykarError::Other(format!(
+                    "blob extends beyond downloaded range in pack {pack_id}"
+                ))
+            })?;
+        let compressed = unpack_object_expect_with_context(
+            blob,
+            ObjectType::ChunkData,
+            chunk_id.as_bytes(),
+            self.crypto.as_ref(),
+        )?;
+        let plaintext = compress::decompress(&compressed)?;
+        // Without AEAD, the chunk ID is the only checksum on chunk data.
+        if !self.crypto.is_encrypting() {
+            verify_chunk_id(
+                self.crypto.chunk_hasher(),
+                &chunk_id,
+                &plaintext,
+                &pack_id,
+                offset,
+                stored_size,
+            )?;
+        }
+        self.cur = plaintext;
+        self.pos = 0;
+        self.next += 1;
+        Ok(())
+    }
+
+    fn load_next(&mut self) -> Result<()> {
+        match self.try_load_next() {
+            Ok(()) => Ok(()),
+            // A cancellation is not a stale cache.
+            Err(e @ VykarError::Interrupted) => Err(e),
+            Err(e) if self.from_cache => {
+                info!("restore cache location unreadable, falling back to full index: {e}");
+                self.from_cache = false;
+                self.cache_distrusted.store(true, Ordering::Relaxed);
+                let (_, index) =
+                    Repository::fetch_full_index(self.storage.as_ref(), self.crypto.as_ref())?;
+                let rest = self.chunks.get(self.next..).unwrap_or_default();
+                let ids: Vec<ChunkId> = rest.iter().map(|c| c.0).collect();
+                let resolved = resolve_from_index(&index, &ids)?;
+                drop(index);
+                self.chunks.truncate(self.next);
+                self.chunks.extend(resolved);
+                self.window = Vec::new();
+                self.window_end = self.next;
+                self.try_load_next()
+            }
+            Err(e) => Err(e),
+        }
+    }
+}
+
+impl BufRead for LazyItemStream<'_> {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        while self.pos >= self.cur.len() {
+            if self.next >= self.chunks.len() {
+                self.cur = Vec::new();
+                self.window = Vec::new();
+                self.pos = 0;
+                if !self.done {
+                    self.done = true;
+                    tracing::debug!(
+                        "item stream: {} chunks in {} range reads",
+                        self.chunks.len(),
+                        self.reads
+                    );
+                }
+                break;
+            }
+            if let Err(e) = self.load_next() {
+                let msg = e.to_string();
+                self.error = Some(e);
+                // Not `ErrorKind::Interrupted`: rmp-serde retries those.
+                return Err(std::io::Error::other(msg));
+            }
+        }
+        Ok(self.cur.get(self.pos..).unwrap_or_default())
+    }
+
+    fn consume(&mut self, amt: usize) {
+        self.pos = self.pos.saturating_add(amt).min(self.cur.len());
+    }
+}
+
+impl Read for LazyItemStream<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let avail = self.fill_buf()?;
+        let n = avail.len().min(buf.len());
+        if let (Some(dst), Some(src)) = (buf.get_mut(..n), avail.get(..n)) {
+            dst.copy_from_slice(src);
+        }
+        self.consume(n);
+        Ok(n)
+    }
+}
+
+/// Decode concatenated msgpack items from `reader` until it is exhausted.
+fn for_each_item_in<R: BufRead>(
+    reader: R,
+    mut visit: impl FnMut(Item) -> Result<()>,
+) -> Result<()> {
+    let mut de = rmp_serde::Deserializer::new(reader);
+    // Between items the decoder holds no peeked marker, so an empty buffer
+    // here is a clean end of stream.
+    while !de.get_mut().fill_buf()?.is_empty() {
+        let item = Item::deserialize(&mut de)?;
+        visit(item)?;
+    }
+    Ok(())
+}
+
+/// Anything restore can stream items from: a materialized item stream or a
+/// [`LazyItemStream`].
+pub trait ItemSource {
+    fn for_each_item(self, visit: impl FnMut(Item) -> Result<()>) -> Result<()>;
+}
+
+impl<T: AsRef<[u8]> + ?Sized> ItemSource for &T {
+    fn for_each_item(self, visit: impl FnMut(Item) -> Result<()>) -> Result<()> {
+        for_each_decoded_item(self.as_ref(), visit)
+    }
+}
+
+impl ItemSource for &mut LazyItemStream<'_> {
+    fn for_each_item(self, visit: impl FnMut(Item) -> Result<()>) -> Result<()> {
+        LazyItemStream::for_each_item(self, visit)
     }
 }
 

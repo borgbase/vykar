@@ -188,7 +188,7 @@ pub(super) struct ChunkTargets {
 /// transactional.
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
 pub(super) fn stream_and_plan<F, B>(
-    items_stream: &[u8],
+    items: impl crate::commands::list::ItemSource,
     dest_root: &Path,
     include_path: &mut F,
     xattrs_enabled: bool,
@@ -218,7 +218,7 @@ where
     // Emit the bounded-tracking overflow warning at most once per restore.
     let mut hardlink_cap_warned = false;
 
-    crate::commands::list::for_each_decoded_item(items_stream, |item| {
+    items.for_each_item(|item| {
         // Per-item poll: this is what makes "stop between files" real, since
         // `RESTORE_BATCH_FILES` batch boundaries are far too coarse. A relaxed
         // load is negligible against per-item decode + filesystem work.

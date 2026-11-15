@@ -754,6 +754,49 @@ fn restore_falls_back_to_index_when_cache_lacks_data_chunk() {
     }
 }
 
+#[test]
+fn restore_falls_back_to_index_when_cached_item_stream_location_is_wrong() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (config, repo_id, generation, data_chunk) = one_file_repo(tmp.path());
+    let repo_dir = tmp.path().join("repo");
+
+    // A complete cache whose item-stream entries point at the data chunk's
+    // bytes: every lookup hits, but the stream cannot be read there.
+    let repo = open_local_repo(&repo_dir, None);
+    let item_ptrs = commands::list::load_snapshot_meta(&repo, "snap1")
+        .unwrap()
+        .item_ptrs;
+    let mut index = repo.chunk_index().clone();
+    let data = *index.get(&data_chunk).unwrap();
+    for id in &item_ptrs {
+        assert!(index.update_location(id, data.pack_id, data.pack_offset, data.stored_size));
+    }
+    drop(repo);
+    let cache_path =
+        vykar_core::index::dedup_cache::restore_cache_path(&repo_id, None).expect("cache path");
+    vykar_core::index::dedup_cache::build_restore_cache_to_path(&index, generation, &cache_path)
+        .unwrap();
+
+    let restore_dir = tmp.path().join("restore");
+    let stats = commands::restore::run(
+        &config,
+        None,
+        "snap1",
+        restore_dir.to_str().unwrap(),
+        None,
+        false,
+        false,
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(stats.files, 1);
+    assert_eq!(
+        std::fs::read_to_string(restore_dir.join("file.txt")).unwrap(),
+        "hello"
+    );
+}
+
 /// A restore cache that holds every chunk but places the data chunk
 /// somewhere it is not: in a pack that no longer exists (what a cache left
 /// behind by another client's compaction looks like when the advisory
@@ -866,6 +909,66 @@ fn restore_reports_unreadable_data_chunk_with_restore_cache_in_use() {
                 "got: {err:?}"
             );
         }
+    }
+}
+
+#[test]
+fn restore_streams_a_multi_chunk_item_stream() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = tmp.path().join("repo");
+    let source_dir = tmp.path().join("source");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    let config = make_test_config(&repo_dir);
+    commands::init::run(&config, None).unwrap();
+    // Enough entries for an item stream of several 32-512 KiB chunks.
+    const N: usize = 6000;
+    for d in 0..20 {
+        let dir = source_dir.join(format!("dir-{d:02}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        for f in 0..N / 20 {
+            std::fs::write(dir.join(format!("file-{f:04}.txt")), format!("{d}/{f}")).unwrap();
+        }
+    }
+    backup_source(
+        &config,
+        &source_dir,
+        "src",
+        "snap1",
+        None,
+        config.xattrs.enabled,
+    );
+    let repo = open_local_repo(&repo_dir, None);
+    let ptrs = commands::list::load_snapshot_meta(&repo, "snap1")
+        .unwrap()
+        .item_ptrs
+        .len();
+    assert!(ptrs > 1, "expected a multi-chunk item stream, got {ptrs}");
+    drop(repo);
+
+    let restore_dir = tmp.path().join("restore");
+    let stats = commands::restore::run(
+        &config,
+        None,
+        "snap1",
+        restore_dir.to_str().unwrap(),
+        None,
+        false,
+        false,
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(stats.files, N as u64);
+    for (d, f) in [(0, 0), (7, 123), (19, N / 20 - 1)] {
+        assert_eq!(
+            std::fs::read_to_string(
+                restore_dir
+                    .join(format!("dir-{d:02}"))
+                    .join(format!("file-{f:04}.txt"))
+            )
+            .unwrap(),
+            format!("{d}/{f}")
+        );
     }
 }
 

@@ -12,6 +12,7 @@ mod commit;
 mod key;
 mod open;
 mod pack_recovery;
+mod pack_verify;
 pub use key::{select_repository_key, LoadedKey};
 #[cfg(test)]
 pub(crate) use open::derive_plaintext_chunk_id_key;
@@ -310,12 +311,21 @@ pub struct Repository {
     /// would cost another Argon2id derivation and need the passphrase threaded
     /// into the scan. `None` for unencrypted repositories.
     key_blob: Option<Vec<u8>>,
+    /// Independent read-only requests the commit may issue at once (pack
+    /// verification). 1 = serial; backup sets it from `limits.connections`.
+    request_concurrency: usize,
 }
 
 impl Repository {
     /// The key blob that unwrapped at open, if this repository is encrypted.
     pub fn key_blob(&self) -> Option<&[u8]> {
         self.key_blob.as_deref()
+    }
+
+    /// Set how many independent read-only requests the commit may issue at
+    /// once (see `request_concurrency`). Clamped to at least 1.
+    pub fn set_request_concurrency(&mut self, n: usize) {
+        self.request_concurrency = n.max(1);
     }
 
     /// Mark the chunk index as needing persistence on the next `save_state()`.

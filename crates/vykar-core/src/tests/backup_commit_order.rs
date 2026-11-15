@@ -48,6 +48,9 @@ struct Shared {
     gate: Option<Arc<Gate>>,
     pack_entered: Option<Arc<Mutex<mpsc::Sender<()>>>>,
     fail_packs: bool,
+    /// Delete one stored pack just before the commit lock is taken, as a
+    /// concurrent compact would after reaping this session's marker.
+    delete_pack_at_lock: bool,
 }
 
 struct ObservingBackend {
@@ -63,6 +66,15 @@ impl ObservingBackend {
     fn put_with(&self, key: &str, put: impl FnOnce() -> Result<()>) -> Result<()> {
         if key.starts_with("locks/") {
             self.record(Event::LockPut);
+            if self.shared.delete_pack_at_lock {
+                let victim = self
+                    .inner
+                    .list("packs/")?
+                    .into_iter()
+                    .find(|k| !k.ends_with('/'))
+                    .expect("a stored pack to delete");
+                self.inner.delete(&victim)?;
+            }
             return put();
         }
         if !key.starts_with("packs/") {
@@ -254,4 +266,85 @@ fn early_flush_failure_aborts_cleanly() {
         !sessions.iter().any(|k| k.ends_with(".json")),
         "session marker should be removed: {sessions:?}"
     );
+}
+
+fn assert_missing_pack_fails_commit(config: &crate::config::VykarConfig, src: &Path) {
+    let packs_before = repo_keys(config, "packs/").len();
+    let shared = Shared {
+        delete_pack_at_lock: true,
+        ..Default::default()
+    };
+    let err = run_backup(config, src, &shared).unwrap_err().to_string();
+    assert!(
+        err.contains("missing from storage"),
+        "expected the missing-pack commit error, got: {err}"
+    );
+    assert_eq!(packs_before, 0, "the repository starts empty");
+    assert!(
+        repo_keys(config, "snapshots/").is_empty(),
+        "no snapshot may be committed over a missing pack"
+    );
+    assert!(repo_keys(config, "locks/").is_empty());
+}
+
+/// Few session packs: verified with one `exists()` per pack.
+#[test]
+fn pack_deleted_before_commit_fails_backup_few_packs() {
+    let (_dir, config, src) = setup();
+    assert_missing_pack_fails_commit(&config, &src);
+}
+
+/// Many session packs (one chunk per pack): verified by listing.
+#[test]
+fn pack_deleted_before_commit_fails_backup_many_packs() {
+    crate::testutil::init_test_environment();
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let src = dir.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    for i in 0..80u32 {
+        let body: Vec<u8> = (0..512u32)
+            .map(|j| (i.wrapping_mul(31) ^ j) as u8)
+            .collect();
+        fs::write(
+            src.join(format!("f{i}.bin")),
+            [&i.to_le_bytes()[..], &body].concat(),
+        )
+        .unwrap();
+    }
+    let mut config = crate::tests::helpers::make_test_config(&repo_dir);
+    config.repository.min_pack_size = 1;
+    config.repository.max_pack_size = 4 * 1024;
+    crate::commands::init::run(&config, None).unwrap();
+
+    assert_missing_pack_fails_commit(&config, &src);
+}
+
+/// The same many-pack backup commits when nothing is deleted, and every
+/// session pack it verified is present.
+#[test]
+fn many_pack_backup_commits() {
+    crate::testutil::init_test_environment();
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let src = dir.path().join("src");
+    fs::create_dir_all(&src).unwrap();
+    for i in 0..80u32 {
+        fs::write(
+            src.join(format!("f{i}.bin")),
+            format!("file {i} {}", "x".repeat(400)),
+        )
+        .unwrap();
+    }
+    let mut config = crate::tests::helpers::make_test_config(&repo_dir);
+    config.repository.min_pack_size = 1;
+    config.repository.max_pack_size = 4 * 1024;
+    crate::commands::init::run(&config, None).unwrap();
+
+    run_backup(&config, &src, &Shared::default()).unwrap();
+    assert!(
+        repo_keys(&config, "packs/").len() >= 32,
+        "expected one pack per chunk"
+    );
+    assert_eq!(repo_keys(&config, "snapshots/").len(), 1);
 }

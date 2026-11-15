@@ -506,64 +506,22 @@ impl Repository {
 
     /// Verify that all pack_ids referenced by new_entries in a delta actually
     /// exist on storage. Returns an error if any are missing.
+    ///
+    /// Every pack is checked; only the request pattern adapts (see
+    /// `pack_verify`), with up to `request_concurrency` requests in flight.
     fn verify_delta_packs(&self, delta: &IndexDelta) -> Result<()> {
-        const BATCH_VERIFY_THRESHOLD: usize = 32;
-
         let pack_ids: std::collections::HashSet<PackId> =
             delta.new_entries.iter().map(|e| e.pack_id).collect();
-
-        let shards: std::collections::HashSet<String> = pack_ids
-            .iter()
-            .map(|id| format!("packs/{}", id.shard_prefix()))
-            .collect();
-
-        if pack_ids.len() >= BATCH_VERIFY_THRESHOLD && pack_ids.len() > shards.len() {
-            // Many packs — batch-verify via shard listing.
-            let mut known_packs: std::collections::HashSet<String> =
-                std::collections::HashSet::new();
-            let mut fallback_shards: std::collections::HashSet<String> =
-                std::collections::HashSet::new();
-
-            for shard in &shards {
-                match self.storage.list(shard) {
-                    Ok(keys) => known_packs.extend(keys),
-                    Err(_) => {
-                        fallback_shards.insert(shard.clone());
-                    }
-                }
-            }
-
-            for pack_id in &pack_ids {
-                let shard_dir = format!("packs/{}", pack_id.shard_prefix());
-                if fallback_shards.contains(&shard_dir) {
-                    // list() failed for this shard — fall back to per-pack exists() with ? propagation.
-                    let key = pack_id.storage_key();
-                    if !self.storage.exists(&key)? {
-                        return Err(VykarError::Other(format!(
-                            "commit failed: pack {} missing from storage (stale session or concurrent deletion)",
-                            pack_id
-                        )));
-                    }
-                } else if !known_packs.contains(&pack_id.storage_key()) {
-                    return Err(VykarError::Other(format!(
-                        "commit failed: pack {} missing from storage (stale session or concurrent deletion)",
-                        pack_id
-                    )));
-                }
-            }
-        } else {
-            // Few packs — per-pack exists() is cheaper than listing entire shards.
-            for pack_id in &pack_ids {
-                let key = pack_id.storage_key();
-                if !self.storage.exists(&key)? {
-                    return Err(VykarError::Other(format!(
-                        "commit failed: pack {} missing from storage (stale session or concurrent deletion)",
-                        pack_id
-                    )));
-                }
-            }
-        }
-        Ok(())
+        let persisted_packs = self
+            .write_session
+            .as_ref()
+            .map_or(0, |ws| ws.persisted_pack_count);
+        super::pack_verify::verify_packs_present(
+            self.storage.as_ref(),
+            &pack_ids,
+            persisted_packs,
+            self.request_concurrency,
+        )
     }
 
     /// Serialize, encrypt, and write the IndexBlob (generation + chunks) to storage.

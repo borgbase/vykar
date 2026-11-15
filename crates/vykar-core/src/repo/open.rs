@@ -249,6 +249,7 @@ impl Repository {
             write_session: None,
             lock_fence: None,
             key_blob,
+            request_concurrency: 1,
         })
     }
 
@@ -385,6 +386,7 @@ impl Repository {
             write_session: None,
             lock_fence: None,
             key_blob,
+            request_concurrency: 1,
         })
     }
 }

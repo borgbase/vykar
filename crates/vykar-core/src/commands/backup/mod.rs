@@ -623,7 +623,10 @@ fn run_against_repo(
         .trust_repo(config.trust_repo);
     let open_result = Repository::open(backend, passphrase, cache_dir, opts);
     let mut repo = match open_result {
-        Ok(r) => {
+        Ok(mut r) => {
+            // Commit-time pack verification may overlap its read-only requests
+            // up to the backend's listing width (the warm HTTP pool).
+            r.set_request_concurrency(config.limits.listing_concurrency(!is_local));
             if let Err(e) = super::util::verify_repo_identity(config, &r) {
                 if let Ok(cleanup) = storage::backend_from_config(&config.repository, 1) {
                     lock::deregister_session(cleanup.as_ref(), &session_id);

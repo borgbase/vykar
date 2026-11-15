@@ -59,6 +59,15 @@ uv run --project scripts/testbench mem-ab --variant base=a --variant cand=b --wo
 
 Sweeps take a host-wide lock (`/tmp/vykar-mem-ab.lock`), so concurrent invocations queue instead of perturbing each other.
 
+`--workload both` (the default) means the two backup workloads. `--workload restore` backs up the whole `--source` once and measures `vykar restore -R mem-ab latest <dest>`. The repository is not copied per run (restore does not change it); only the small cache directory is reset, and `<dest>` (`--restore-dest`, default `$RUNTIME_ROOT/mem-ab-restore-dest`, so not on `/mnt/repos`) is recreated empty before and deleted after every run. `--reuse-work-dir` (implies `--keep`) reuses a work dir seeded by an earlier restore sweep, or seeds it if absent:
+
+```bash
+uv run --project scripts/testbench mem-ab --workload restore --work-dir /mnt/repos/mem-ab-restore --reuse-work-dir \
+  --variant base=~/runtime/restore-mem/bin/vykar-base --variant cand=target/profiling/vykar --rounds 5
+```
+
+Every run also polls `/proc/<pid>/status` every 50 ms: `results.tsv` gains peak VmRSS/RssAnon/RssFile/RssShmem/Threads columns, the summary shows median peak RssAnon and RssFile+RssShmem, and `<workload>.r<N>.<variant>.timeline.tsv` holds the samples. Polled peaks can miss spikes shorter than the interval; `maxrss_kb` (from `wait4`) stays the exact total.
+
 ## Tests
 
 ```bash

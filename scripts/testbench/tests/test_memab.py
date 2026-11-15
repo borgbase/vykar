@@ -46,5 +46,48 @@ class SummarizeTests(unittest.TestCase):
         self.assertNotIn("incremental", text)
 
 
+class WorkloadSelectionTests(unittest.TestCase):
+    def test_both_means_the_backup_workloads(self) -> None:
+        self.assertEqual(memab.selected_workloads("both"), ["full", "incremental"])
+        self.assertEqual(memab.selected_workloads("restore"), ["restore"])
+
+
+class ProcStatusTests(unittest.TestCase):
+    STATUS = (
+        "Name:\tvykar\nVmHWM:\t  300000 kB\nVmRSS:\t  250000 kB\nRssAnon:\t  200000 kB\n"
+        "RssFile:\t   49000 kB\nRssShmem:\t    1000 kB\nVmSwap:\t       0 kB\nThreads:\t5\n"
+    )
+
+    def test_parses_sampled_fields_only(self) -> None:
+        self.assertEqual(
+            memab.parse_proc_status(self.STATUS),
+            {"VmHWM": 300000, "VmRSS": 250000, "RssAnon": 200000, "RssFile": 49000, "RssShmem": 1000, "Threads": 5},
+        )
+        # A zombie's status has no memory fields.
+        self.assertEqual(memab.parse_proc_status("Name:\tvykar\nState:\tZ (zombie)\n"), {})
+
+    def test_peak_is_per_field_max_ignoring_time(self) -> None:
+        samples = [{"t_ms": 0, "RssAnon": 5, "RssFile": 9}, {"t_ms": 50, "RssAnon": 7}, {"t_ms": 100, "RssAnon": 6, "RssFile": 1}]
+        self.assertEqual(memab.peak_of(samples), {"RssAnon": 7, "RssFile": 9})
+
+
+class RestoreDestTests(unittest.TestCase):
+    def test_rejects_overlap_with_protected_dirs(self) -> None:
+        for dest in ("/data/corpus", "/data/corpus/sub", "/data", "/"):
+            with self.assertRaises(ValueError):
+                memab.check_restore_dest(dest, ["/data/corpus", "/mnt/repos/w"])
+        memab.check_restore_dest("/data/corpus-dest", ["/data/corpus", "/mnt/repos/w"])
+
+
+class SpaceShortfallTests(unittest.TestCase):
+    def test_needs_on_one_filesystem_add_up(self) -> None:
+        free = {"a": 100, "b": 100}
+        dev = {"/x/1": "a", "/x/2": "a", "/y": "b"}
+        kw = dict(margin=1.0, free=lambda p: free[dev[p]], device=lambda p: dev[p])
+        self.assertEqual(memab.space_shortfall({"/x/1": 60, "/y": 60}, **kw), "")
+        msg = memab.space_shortfall({"/x/1": 60, "/x/2": 60}, **kw)
+        self.assertIn("/x/1, /x/2", msg)
+
+
 if __name__ == "__main__":
     unittest.main()

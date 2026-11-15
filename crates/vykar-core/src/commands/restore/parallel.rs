@@ -13,7 +13,9 @@ use std::sync::{Arc, Mutex};
 
 use crate::commands::util::check_interrupted;
 use crate::compress;
-use crate::repo::format::{unpack_object_expect_with_context_into, verify_chunk_id, ObjectType};
+use crate::repo::format::{
+    unpack_object_expect_with_context_in_place, verify_chunk_id, ObjectType,
+};
 use vykar_crypto::CryptoEngine;
 use vykar_storage::{RangeReader, StorageBackend};
 use vykar_types::chunk_id::ChunkHasher;
@@ -140,8 +142,8 @@ fn join_workers(
 // ---------------------------------------------------------------------------
 
 /// Groups the write accumulator state (buffer, target file, start offset)
-/// into a single struct.  One instance is created per `process_read_group`
-/// call; its allocation is reused across all sequences within that group.
+/// into a single struct.  One instance per worker thread; its allocation is
+/// reused across every sequence of every group the thread processes.
 struct PendingWrite {
     file_idx: usize, // usize::MAX = no active sequence
     start: u64,
@@ -312,8 +314,10 @@ pub(super) fn execute_parallel_restore(
 
             handles.push(s.spawn(move || -> std::result::Result<(), ReadError> {
                 let mut data_buf = Vec::new();
-                let mut decrypt_buf = Vec::new();
                 let mut decompress_buf = Vec::new();
+                // One write accumulator for the thread, not one 1 MiB
+                // allocation per group.
+                let mut pw = PendingWrite::new();
 
                 for group in bucket {
                     if cancelled.load(Ordering::Acquire) {
@@ -327,8 +331,8 @@ pub(super) fn execute_parallel_restore(
                         bytes_written,
                         cancelled,
                         &mut data_buf,
-                        &mut decrypt_buf,
                         &mut decompress_buf,
+                        &mut pw,
                         root,
                         verify_chunks,
                         chunk_hasher,
@@ -342,7 +346,7 @@ pub(super) fn execute_parallel_restore(
                     // Cap retained buffer capacity to avoid permanent high-water
                     // marks from outlier-large groups/blobs (~50 MiB RSS savings).
                     const BUF_KEEP_CAP: usize = 2 * 1024 * 1024;
-                    for buf in [&mut data_buf, &mut decrypt_buf, &mut decompress_buf] {
+                    for buf in [&mut data_buf, &mut decompress_buf] {
                         buf.clear();
                         if buf.capacity() > BUF_KEEP_CAP {
                             buf.shrink_to(BUF_KEEP_CAP);
@@ -404,9 +408,10 @@ impl BlobCtx<'_> {
 /// fetch it whole (the default) buffer it in `data_buf`; `LocalBackend`
 /// streams it, so `data_buf` only ever holds one stored blob.
 ///
-/// `data_buf`, `decrypt_buf`, and `decompress_buf` are caller-owned scratch
-/// buffers reused across groups within the same thread, reducing per-group
-/// allocation churn. The caller caps retained capacity at 2 MiB between groups.
+/// `data_buf`, `decompress_buf` and `pw` are caller-owned scratch state reused
+/// across groups within the same thread, reducing per-group allocation churn.
+/// Blobs are decrypted in place inside `data_buf`. The caller caps retained
+/// buffer capacity at 2 MiB between groups.
 ///
 /// In continue mode a failed group read is retried blob by blob: a short read
 /// is an `Err` by the storage contract, so otherwise one truncated pack would
@@ -422,8 +427,8 @@ fn process_read_group(
     bytes_written: &AtomicU64,
     cancelled: &AtomicBool,
     data_buf: &mut Vec<u8>,
-    decrypt_buf: &mut Vec<u8>,
     decompress_buf: &mut Vec<u8>,
+    pw: &mut PendingWrite,
     root: &Path,
     verify_chunks: bool,
     chunk_hasher: &ChunkHasher,
@@ -459,8 +464,8 @@ fn process_read_group(
                 &group.pack_id,
                 &group.blobs,
                 &mut *reader,
-                decrypt_buf,
                 decompress_buf,
+                pw,
             )? {
                 None => return Ok(()),
                 Some((i, e)) => (e, Some(i)),
@@ -506,8 +511,8 @@ fn process_read_group(
         rest,
         consecutive,
         data_buf,
-        decrypt_buf,
         decompress_buf,
+        pw,
     )
 }
 
@@ -523,8 +528,8 @@ fn retry_blobs_one_by_one(
     blobs: &[PlannedBlob],
     mut consecutive: usize,
     data_buf: &mut Vec<u8>,
-    decrypt_buf: &mut Vec<u8>,
     decompress_buf: &mut Vec<u8>,
+    pw: &mut PendingWrite,
 ) -> std::result::Result<(), ReadError> {
     for (i, blob) in blobs.iter().enumerate() {
         if ctx.stopping() {
@@ -541,8 +546,8 @@ fn retry_blobs_one_by_one(
                 pack_id,
                 std::slice::from_ref(blob),
                 &mut *reader,
-                decrypt_buf,
                 decompress_buf,
+                pw,
             )? {
                 None => {
                     consecutive = 0;
@@ -591,19 +596,20 @@ fn process_blobs(
     pack_id: &PackId,
     blobs: &[PlannedBlob],
     reader: &mut dyn RangeReader,
-    decrypt_buf: &mut Vec<u8>,
     decompress_buf: &mut Vec<u8>,
+    pw: &mut PendingWrite,
 ) -> std::result::Result<Option<(usize, VykarError)>, ReadError> {
     let (files, bytes_written, root) = (ctx.files, ctx.bytes_written, ctx.root);
     let mut file_handles = LruHandles::new();
 
-    // Write accumulator — batches consecutive same-file writes into one syscall.
-    // Pre-allocated to MAX_WRITE_BATCH; reused across sequences within this group.
-    let mut pw = PendingWrite::new();
+    // Write accumulator — batches consecutive same-file writes into one
+    // syscall. Owned by the worker thread; anything an earlier call left
+    // behind on a stop is dropped here, never written.
+    pw.reset();
 
     for (i, blob) in blobs.iter().enumerate() {
         if ctx.stopping() {
-            // Dropping `pw` loses buffered data, but the caller will
+            // Abandoning `pw` loses buffered data, but the caller will
             // clean up the temp restore root on error/cancellation so
             // no partial files reach the final destination.
             return Ok(None);
@@ -612,12 +618,12 @@ fn process_blobs(
         let raw = match reader.read_at(blob.pack_offset, blob.stored_size as usize) {
             Ok(raw) => raw,
             Err(e) => {
-                flush_pending(&mut pw, &mut file_handles, files, bytes_written, root)?;
+                flush_pending(pw, &mut file_handles, files, bytes_written, root)?;
                 return Ok(Some((i, e)));
             }
         };
 
-        if let Err(e) = decode_blob(ctx, pack_id, blob, raw, decrypt_buf, decompress_buf) {
+        if let Err(e) = decode_blob(ctx, pack_id, blob, raw, decompress_buf) {
             ctx.source_failure(&blob.targets, e)?;
             continue;
         }
@@ -645,7 +651,7 @@ fn process_blobs(
                 }
             } else {
                 // Flush any active pending write first.
-                flush_pending(&mut pw, &mut file_handles, files, bytes_written, root)?;
+                flush_pending(pw, &mut file_handles, files, bytes_written, root)?;
 
                 if contiguous || decompress_buf.len() >= MAX_WRITE_BATCH {
                     // Contiguous overflow or standalone large chunk — write
@@ -670,27 +676,25 @@ fn process_blobs(
     }
 
     // Flush any remaining pending write.
-    flush_pending(&mut pw, &mut file_handles, files, bytes_written, root)?;
+    flush_pending(pw, &mut file_handles, files, bytes_written, root)?;
 
     Ok(None)
 }
 
-/// Unpack, decompress and verify one stored blob (`raw`) into
-/// `decompress_buf`. Every error here is source-side.
+/// Unpack (decrypting in place inside `raw`), decompress and verify one stored
+/// blob into `decompress_buf`. Every error here is source-side.
 fn decode_blob(
     ctx: &BlobCtx<'_>,
     pack_id: &PackId,
     blob: &PlannedBlob,
-    raw: &[u8],
-    decrypt_buf: &mut Vec<u8>,
+    raw: &mut [u8],
     decompress_buf: &mut Vec<u8>,
 ) -> Result<()> {
-    unpack_object_expect_with_context_into(
+    let compressed = unpack_object_expect_with_context_in_place(
         raw,
         ObjectType::ChunkData,
         blob.chunk_id.as_bytes(),
         ctx.crypto,
-        decrypt_buf,
     )
     .map_err(|e| {
         VykarError::Other(format!(
@@ -699,7 +703,7 @@ fn decode_blob(
         ))
     })?;
     compress::decompress_into_with_hint(
-        decrypt_buf,
+        compressed,
         Some(blob.expected_size as usize),
         decompress_buf,
     )
@@ -880,7 +884,6 @@ mod tests {
         let bytes_written = AtomicU64::new(0);
         let cancelled = AtomicBool::new(false);
         let mut data_buf = Vec::new();
-        let mut decrypt_buf = Vec::new();
         let mut decompress_buf = Vec::new();
         let err = process_read_group(
             &group,
@@ -890,8 +893,8 @@ mod tests {
             &bytes_written,
             &cancelled,
             &mut data_buf,
-            &mut decrypt_buf,
             &mut decompress_buf,
+            &mut PendingWrite::new(),
             temp.path(),
             false,
             &test_chunk_hasher(),
@@ -949,7 +952,6 @@ mod tests {
         let bytes_written = AtomicU64::new(0);
         let cancelled = AtomicBool::new(false);
         let mut data_buf = Vec::new();
-        let mut decrypt_buf = Vec::new();
         let mut decompress_buf = Vec::new();
         process_read_group(
             &group,
@@ -959,8 +961,8 @@ mod tests {
             &bytes_written,
             &cancelled,
             &mut data_buf,
-            &mut decrypt_buf,
             &mut decompress_buf,
+            &mut PendingWrite::new(),
             temp.path(),
             false,
             &test_chunk_hasher(),
@@ -1035,7 +1037,6 @@ mod tests {
         let bytes_written = AtomicU64::new(0);
         let cancelled = AtomicBool::new(false);
         let mut data_buf = Vec::new();
-        let mut decrypt_buf = Vec::new();
         let mut decompress_buf = Vec::new();
         process_read_group(
             &group,
@@ -1045,8 +1046,8 @@ mod tests {
             &bytes_written,
             &cancelled,
             &mut data_buf,
-            &mut decrypt_buf,
             &mut decompress_buf,
+            &mut PendingWrite::new(),
             temp.path(),
             false,
             &test_chunk_hasher(),
@@ -1133,7 +1134,6 @@ mod tests {
         let bytes_written = AtomicU64::new(0);
         let cancelled = AtomicBool::new(false);
         let mut data_buf = Vec::new();
-        let mut decrypt_buf = Vec::new();
         let mut decompress_buf = Vec::new();
         process_read_group(
             &group,
@@ -1143,8 +1143,8 @@ mod tests {
             &bytes_written,
             &cancelled,
             &mut data_buf,
-            &mut decrypt_buf,
             &mut decompress_buf,
+            &mut PendingWrite::new(),
             temp.path(),
             false,
             &test_chunk_hasher(),
@@ -1210,7 +1210,6 @@ mod tests {
         let bytes_written = AtomicU64::new(0);
         let cancelled = AtomicBool::new(false);
         let mut data_buf = Vec::new();
-        let mut decrypt_buf = Vec::new();
         let mut decompress_buf = Vec::new();
         process_read_group(
             &group,
@@ -1220,8 +1219,8 @@ mod tests {
             &bytes_written,
             &cancelled,
             &mut data_buf,
-            &mut decrypt_buf,
             &mut decompress_buf,
+            &mut PendingWrite::new(),
             temp.path(),
             false,
             &test_chunk_hasher(),
@@ -1279,7 +1278,6 @@ mod tests {
         let bytes_written = AtomicU64::new(0);
         let cancelled = AtomicBool::new(false);
         let mut data_buf = Vec::new();
-        let mut decrypt_buf = Vec::new();
         let mut decompress_buf = Vec::new();
         process_read_group(
             &group,
@@ -1289,8 +1287,8 @@ mod tests {
             &bytes_written,
             &cancelled,
             &mut data_buf,
-            &mut decrypt_buf,
             &mut decompress_buf,
+            &mut PendingWrite::new(),
             temp.path(),
             true,
             &test_chunk_hasher(),
@@ -1321,7 +1319,7 @@ mod tests {
             &AtomicBool::new(false),
             &mut Vec::new(),
             &mut Vec::new(),
-            &mut Vec::new(),
+            &mut PendingWrite::new(),
             root,
             verify_chunks,
             crypto.chunk_hasher(),
@@ -1753,7 +1751,7 @@ mod tests {
             &AtomicBool::new(false),
             &mut Vec::new(),
             &mut Vec::new(),
-            &mut Vec::new(),
+            &mut PendingWrite::new(),
             root,
             false,
             crypto.chunk_hasher(),
@@ -2297,5 +2295,106 @@ mod tests {
             std::fs::read(temp.path().join("f0.bin")).unwrap(),
             payloads[0]
         );
+    }
+
+    /// Encrypted, zstd-compressed blobs decrypted in place inside the streamed
+    /// read buffer, on `LocalBackend`, with one scratch state reused across
+    /// two groups. A tampered blob fails AEAD and only its file is damaged.
+    #[test]
+    fn encrypted_streamed_groups_decrypt_in_place() {
+        let crypto = Aes256GcmEngine::new(&[0x11; 32], test_chunk_hasher());
+        let payloads: Vec<Vec<u8>> = (0..4u8)
+            .map(|i| {
+                let mut p = format!("encrypted-payload-{i}-")
+                    .repeat(40_000)
+                    .into_bytes();
+                p.truncate(MAX_WRITE_BATCH / 2 + usize::from(i) * 1000);
+                p
+            })
+            .collect();
+        let pack_id = dummy_pack_id(0x60);
+        let entries = payloads
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let cid = ChunkId::compute(crypto.chunk_hasher(), p);
+                let compressed =
+                    crate::compress::compress(Compression::Zstd { level: 3 }, p).unwrap();
+                let packed = pack_object_with_context(
+                    ObjectType::ChunkData,
+                    cid.as_bytes(),
+                    &compressed,
+                    &crypto,
+                )
+                .unwrap();
+                (cid, packed, p.len() as u32, target(i))
+            })
+            .collect();
+        let (mut data, group) = multi_blob_group(pack_id, entries);
+        let files: Vec<PlannedFile> = payloads
+            .iter()
+            .enumerate()
+            .map(|(i, p)| file(&format!("f{i}.bin"), p.len() as u64))
+            .collect();
+        // Second group: blob 2 alone, tampered (one ciphertext byte).
+        let tampered = dummy_pack_id(0x61);
+        // First group: blobs 0, 1, 3 (blob 2 is a gap).
+        let mut group1 = group;
+        let b2 = group1.blobs.remove(2);
+        let mut tampered_data = data.clone();
+        tampered_data[b2.pack_offset as usize + 20] ^= 0x01;
+        let group2 = ReadGroup {
+            pack_id: tampered,
+            read_start: b2.pack_offset,
+            read_end: b2.pack_offset + u64::from(b2.stored_size),
+            blobs: vec![b2],
+        };
+
+        let repo = tempdir().unwrap();
+        let local =
+            vykar_storage::local_backend::LocalBackend::new(repo.path().to_str().unwrap()).unwrap();
+        local.put(&pack_id.storage_key(), &data).unwrap();
+        local.put(&tampered.storage_key(), &tampered_data).unwrap();
+        data.clear();
+        let storage: Arc<dyn StorageBackend> = Arc::new(local);
+        let temp = tempdir().unwrap();
+        stage_files(temp.path(), &files);
+
+        let failures = BatchFailures::default();
+        let (mut data_buf, mut decompress_buf, mut pw) =
+            (Vec::new(), Vec::new(), PendingWrite::new());
+        for g in [&group1, &group2] {
+            process_read_group(
+                g,
+                &files,
+                &storage,
+                &crypto,
+                &AtomicU64::new(0),
+                &AtomicBool::new(false),
+                &mut data_buf,
+                &mut decompress_buf,
+                &mut pw,
+                temp.path(),
+                false,
+                crypto.chunk_hasher(),
+                None,
+                Some(&failures),
+            )
+            .unwrap();
+        }
+        let map = failures.into_map();
+        assert_eq!(map.keys().copied().collect::<Vec<_>>(), vec![2]);
+        assert!(
+            map[&2].contains("decryption failed") || map[&2].contains("Decryption"),
+            "got: {}",
+            map[&2]
+        );
+        for i in [0, 1, 3] {
+            assert_eq!(
+                std::fs::read(temp.path().join(format!("f{i}.bin"))).unwrap(),
+                payloads[i],
+                "blob {i}"
+            );
+        }
     }
 }

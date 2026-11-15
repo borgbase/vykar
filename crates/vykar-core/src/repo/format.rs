@@ -258,6 +258,30 @@ pub fn unpack_object_expect_with_context_into(
     Ok(())
 }
 
+/// Context-bound variant that decrypts in place, returning the plaintext as a
+/// subslice of `data`. On error `data` holds unspecified bytes.
+pub fn unpack_object_expect_with_context_in_place<'a>(
+    data: &'a mut [u8],
+    expected_type: ObjectType,
+    context: &[u8],
+    crypto: &dyn CryptoEngine,
+) -> Result<&'a mut [u8]> {
+    let (tag, payload) = data
+        .split_first_mut()
+        .ok_or_else(|| VykarError::InvalidFormat("empty object".into()))?;
+    let obj_type = ObjectType::from_u8(*tag)?;
+    let aad = contextual_aad(*tag, context);
+    // Always run AEAD before checking type (must decrypt to authenticate).
+    let plaintext = crypto.decrypt_in_place(payload, &aad)?;
+    if obj_type != expected_type {
+        return Err(VykarError::InvalidFormat(format!(
+            "unexpected object type: expected {:?}, got {:?}",
+            expected_type, obj_type
+        )));
+    }
+    Ok(plaintext)
+}
+
 /// Recompute a decoded chunk's ID and compare it to the ID it was stored under.
 ///
 /// Mandatory on read paths when the engine does not encrypt: without an AEAD

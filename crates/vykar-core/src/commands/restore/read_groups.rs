@@ -192,7 +192,7 @@ mod tests {
                 mtime: item.mtime,
                 uid: item.uid,
                 gid: item.gid,
-                xattrs: item.xattrs.clone(),
+                xattrs: item.xattrs.clone().map(Box::new),
             });
         }
 

@@ -103,7 +103,7 @@ fn finalize_one_file(
 
     // xattrs remain path-based (no fd-based xattr API in std).
     if xattrs_enabled {
-        apply_item_xattrs(&target_path, pf.xattrs.as_ref(), stats);
+        apply_item_xattrs(&target_path, pf.xattrs.as_deref(), stats);
     }
     #[cfg(test)]
     record_op("xattr", 0, 0);
@@ -179,7 +179,7 @@ pub(super) fn apply_dir_metadata(
         }
         // `xattrs` is already `None` when the restore disabled xattrs, so this
         // honors `xattrs_enabled` without a flag.
-        apply_item_xattrs(&d.path, d.xattrs.as_ref(), stats);
+        apply_item_xattrs(&d.path, d.xattrs.as_deref(), stats);
         #[cfg(test)]
         record_op("xattr", 0, 0);
         warn_metadata_err(stats, fs::apply_mode(&d.path, d.mode), &d.path, "mode");
@@ -218,7 +218,7 @@ pub(super) fn apply_symlink_metadata(
             #[cfg(test)]
             record_op("lchown", s.uid, s.gid);
         }
-        apply_item_xattrs(&s.path, s.xattrs.as_ref(), stats);
+        apply_item_xattrs(&s.path, s.xattrs.as_deref(), stats);
         #[cfg(test)]
         record_op("xattr", 0, 0);
         let (secs, nanos) = split_unix_nanos(s.mtime);
@@ -395,7 +395,7 @@ pub(super) fn create_hardlinks(
                         // in this metadata pass is fatal, same as for a normal
                         // file.
                         let xattrs = if xattrs_enabled {
-                            read_xattrs_map(&rep_abs, stats)
+                            read_xattrs_map(&rep_abs, stats).map(Box::new)
                         } else {
                             None
                         };
@@ -1789,7 +1789,7 @@ mod tests {
         pf.mode = 0o400; // captured final mode is read-only
         let mut x = HashMap::new();
         x.insert("user.vykar.test".to_string(), b"v".to_vec());
-        pf.xattrs = Some(x);
+        pf.xattrs = Some(Box::new(x));
         let files = [pf];
 
         let mut stats = RestoreStats::default();

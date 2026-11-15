@@ -130,8 +130,14 @@ pub(super) struct PlannedFile {
     pub(super) mtime: i64,
     pub(super) uid: u32,
     pub(super) gid: u32,
-    pub(super) xattrs: Option<HashMap<String, Vec<u8>>>,
+    /// Boxed: most files carry no xattrs, and an inline `HashMap` would add
+    /// 40 bytes to each of up to `RESTORE_BATCH_FILES` entries. `None` when
+    /// xattrs are disabled for this restore.
+    pub(super) xattrs: Option<Box<Xattrs>>,
 }
+
+/// Extended attributes of one restored entry.
+pub(super) type Xattrs = HashMap<String, Vec<u8>>;
 
 /// A directory or symlink node whose ownership/xattrs/mode/mtime are applied in
 /// a deferred, deepest-first pass after all children have landed. `path` is the
@@ -144,8 +150,9 @@ pub(super) struct PlannedNode {
     pub(super) uid: u32,
     pub(super) gid: u32,
     /// `None` when xattrs are disabled for this restore, so the deferred passes
-    /// honor `xattrs_enabled` without needing the flag threaded in.
-    pub(super) xattrs: Option<HashMap<String, Vec<u8>>>,
+    /// honor `xattrs_enabled` without needing the flag threaded in. Boxed like
+    /// [`PlannedFile::xattrs`].
+    pub(super) xattrs: Option<Box<Xattrs>>,
 }
 
 /// Deferred directory/symlink metadata accumulated during streaming, applied
@@ -160,6 +167,12 @@ pub(super) struct StreamPlan {
 pub(super) struct ChunkTargets {
     pub(super) expected_size: u32,
     pub(super) targets: SmallVec<[WriteTarget; 1]>,
+}
+
+/// Keep an item's xattrs only when this restore applies them; the finalizers
+/// skip xattrs entirely when they are disabled.
+fn boxed_xattrs(xattrs: Option<Xattrs>, xattrs_enabled: bool) -> Option<Box<Xattrs>> {
+    xattrs.filter(|_| xattrs_enabled).map(Box::new)
 }
 
 /// Stream items from raw bytes: create dirs/symlinks immediately, accumulate
@@ -260,7 +273,7 @@ where
                     mtime: item.mtime,
                     uid: item.uid,
                     gid: item.gid,
-                    xattrs: if xattrs_enabled { item.xattrs } else { None },
+                    xattrs: boxed_xattrs(item.xattrs, xattrs_enabled),
                 });
                 verified_dirs.insert(target);
                 stats.dirs += 1;
@@ -308,7 +321,7 @@ where
                         mtime: item.mtime,
                         uid: item.uid,
                         gid: item.gid,
-                        xattrs: if xattrs_enabled { item.xattrs } else { None },
+                        xattrs: boxed_xattrs(item.xattrs, xattrs_enabled),
                     });
                     stats.symlinks += 1;
                 }
@@ -434,7 +447,7 @@ where
                     mtime: item.mtime,
                     uid: item.uid,
                     gid: item.gid,
-                    xattrs: item.xattrs,
+                    xattrs: boxed_xattrs(item.xattrs, xattrs_enabled),
                 });
                 if planned_files.len() >= batch_size {
                     let batch_files = std::mem::take(&mut planned_files);
@@ -1844,5 +1857,14 @@ mod tests {
             let md = std::fs::symlink_metadata(fx.dest.join("x")).unwrap();
             assert!(md.is_file() && md.len() == 0, "the tombstone must stay");
         }
+    }
+
+    /// Plan state is held for up to `RESTORE_BATCH_FILES` files (and every
+    /// directory of the restore), so per-entry size is a memory budget.
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn plan_entry_sizes() {
+        assert_eq!(std::mem::size_of::<PlannedFile>(), 64);
+        assert_eq!(std::mem::size_of::<PlannedNode>(), 56);
     }
 }

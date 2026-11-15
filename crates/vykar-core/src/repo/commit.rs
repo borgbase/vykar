@@ -705,11 +705,21 @@ impl Repository {
 
     /// Reload the full chunk index + generation from storage.
     fn reload_full_index_with_generation(&self) -> Result<(u64, ChunkIndex)> {
-        let Some(index_data) = self.storage.get("index")? else {
+        Self::fetch_full_index(self.storage.as_ref(), self.crypto.as_ref())
+    }
+
+    /// Download and decode the full chunk index + generation using only the
+    /// storage and crypto handles, for readers that cannot borrow the
+    /// repository. Does not touch the repository's own index.
+    pub(crate) fn fetch_full_index(
+        storage: &dyn vykar_storage::StorageBackend,
+        crypto: &dyn CryptoEngine,
+    ) -> Result<(u64, ChunkIndex)> {
+        let Some(index_data) = storage.get("index")? else {
             return Ok((0, ChunkIndex::new()));
         };
         // Free the ciphertext before building the index from the plaintext.
-        let compressed = Self::unpack_index_blob(&index_data, self.crypto.as_ref())?;
+        let compressed = Self::unpack_index_blob(&index_data, crypto)?;
         drop(index_data);
         let blob = Self::decode_unpacked_index_blob(&compressed)?;
         Ok((blob.generation, blob.chunks))

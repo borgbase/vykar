@@ -25,7 +25,7 @@ mod read_groups;
 #[cfg(test)]
 mod test_support;
 
-/// Scan a decoded item stream for entries carrying a byte-faithful `raw_names`
+/// Scan an item stream for entries carrying a byte-faithful `raw_names`
 /// shadow (non-UTF8 names). Returns `Some((count, first_example_display_path))`
 /// when any are present, else `None`.
 ///
@@ -34,10 +34,10 @@ mod test_support;
 /// untouched. Compiled on non-Unix (where the preflight uses it) and in all
 /// test builds (where it is unit-tested cross-platform).
 #[cfg(any(not(unix), test))]
-fn detect_raw_entries(items_stream: &[u8]) -> Result<Option<(usize, String)>> {
+fn detect_raw_entries(items: impl super::list::ItemSource) -> Result<Option<(usize, String)>> {
     let mut count = 0usize;
     let mut example: Option<String> = None;
-    super::list::for_each_decoded_item(items_stream, |item| {
+    items.for_each_item(|item| {
         if item.raw_names.is_some() {
             count += 1;
             if example.is_none() {
@@ -303,24 +303,28 @@ where
         info!("Resolved '{}' to snapshot {}", snapshot_name, resolved_name);
     }
 
-    // Load raw item stream bytes (not decoded Items), via the restore cache
-    // when possible to avoid loading the full chunk index. An interruption
-    // propagates before anything is written (`temp_root` does not exist yet),
-    // leaving the filesystem untouched.
+    // The item stream is read lazily, one range read at a time, while it is
+    // planned and restored (see `LazyItemStream`), via the restore cache when
+    // possible to avoid loading the full chunk index. Opening it performs the
+    // first read, so an interruption or an unreadable stream head propagates
+    // before anything is written (`temp_root` does not exist yet), leaving the
+    // filesystem untouched. A failure further into the stream surfaces from
+    // `stream_and_plan` and is cleaned up like any other mid-restore error.
     let mut items = super::list::ItemStreamReader::new(&repo);
-    let items_stream = items.load(&mut repo, &resolved_name, shutdown)?;
 
     // Byte-faithful restore of non-UTF8 names is Unix-only. On other platforms
-    // run a single read-only metadata pass over the loaded stream *before* any
-    // filesystem mutation (dest prep / temp-root creation) and refuse if the
-    // snapshot carries any raw (non-UTF8) entry. The pass deliberately does not
+    // run a separate read-only metadata pass over the whole stream *before*
+    // any filesystem mutation (dest prep / temp-root creation) and refuse if
+    // the snapshot carries any raw (non-UTF8) entry. The stream is not kept, so
+    // this pass reads it once more than on Unix. It deliberately does not
     // apply the user filter (the real streaming filter is a stateful FnMut that
     // cannot be safely re-invoked), so a non-Unix restore is refused if *any*
     // entry is non-UTF8, even one a filter would exclude — acceptable for this
     // extreme edge.
     #[cfg(not(unix))]
     {
-        if let Some((raw_count, example)) = detect_raw_entries(&items_stream)? {
+        let mut preflight = items.open_lazy(&mut repo, &resolved_name, shutdown)?;
+        if let Some((raw_count, example)) = detect_raw_entries(&mut preflight)? {
             return Err(VykarError::Other(format!(
                 "snapshot contains {raw_count} entr{} with non-UTF8 name(s) \
                  (e.g. '{}') that cannot be restored byte-faithfully on this \
@@ -330,6 +334,7 @@ where
             )));
         }
     }
+    let mut item_stream = items.open_lazy(&mut repo, &resolved_name, shutdown)?;
 
     let dest_root = plan::validate_and_prepare_dest(dest)?;
 
@@ -379,7 +384,7 @@ where
     // exactly as in strict mode. Removed by `sweep_tombstones`.
     let mut tombstones: HashSet<PathBuf> = HashSet::new();
     let mut plan_out = plan::stream_and_plan(
-        &items_stream,
+        &mut item_stream,
         &temp_root,
         &mut include_path,
         xattrs_enabled,
@@ -554,7 +559,7 @@ where
     )
     .map_err(cleanup)?;
 
-    drop(items_stream);
+    drop(item_stream);
     repo.clear_chunk_index();
 
     // Symlink metadata (F1/F5: lchown → xattrs → mtime) is applied while the

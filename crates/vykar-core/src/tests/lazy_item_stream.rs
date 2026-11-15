@@ -1,0 +1,202 @@
+//! `LazyItemStream`: the item stream decoded chunk by chunk, with items
+//! straddling chunk and range-read boundaries.
+
+use std::sync::atomic::AtomicBool;
+
+use vykar_types::chunk_id::ChunkId;
+use vykar_types::error::VykarError;
+use vykar_types::pack_id::PackId;
+
+use crate::commands::list::{for_each_decoded_item, LazyItemStream};
+use crate::compress::Compression;
+use crate::repo::pack::PackType;
+use crate::repo::Repository;
+use crate::snapshot::item::{Item, ItemType};
+use crate::testutil::{init_test_environment, PutLog, RecordingBackend};
+
+type Loc = (ChunkId, PackId, u64, u32);
+
+fn repo_on_counting_backend() -> (Repository, PutLog) {
+    init_test_environment();
+    let (backend, log) = RecordingBackend::new();
+    let mut repo = Repository::init(
+        Box::new(backend),
+        crate::repo::EncryptionMode::None,
+        crate::config::ChunkerConfig::default(),
+        None,
+        None,
+        None,
+    )
+    .expect("init");
+    repo.begin_write_session().expect("begin write session");
+    (repo, log)
+}
+
+fn item(i: usize) -> Item {
+    Item {
+        path: format!("dir/file-{i:05}-{}", "x".repeat(i % 37)),
+        entry_type: ItemType::RegularFile,
+        mode: 0o644,
+        uid: 1000,
+        gid: 1000,
+        user: None,
+        group: None,
+        mtime: i as i64,
+        atime: None,
+        ctime: None,
+        size: 0,
+        chunks: Vec::new(),
+        link_target: None,
+        xattrs: None,
+        raw_names: None,
+        hardlink: None,
+    }
+}
+
+/// Encode `n` items, cut the stream every `cut` bytes (so items straddle the
+/// cuts), store each piece as a tree chunk and return the stream plus the
+/// chunk locations in stream order.
+fn stored_stream(repo: &mut Repository, n: usize, cut: usize) -> (Vec<u8>, Vec<Loc>) {
+    let mut stream = Vec::new();
+    for i in 0..n {
+        stream.extend_from_slice(&rmp_serde::to_vec(&item(i)).unwrap());
+    }
+    let ids: Vec<ChunkId> = stream
+        .chunks(cut)
+        .map(|piece| {
+            repo.store_chunk(piece, Compression::None, PackType::Tree)
+                .unwrap()
+                .0
+        })
+        .collect();
+    repo.flush_packs().unwrap();
+    let locs = ids
+        .iter()
+        .map(|id| {
+            let e = *repo.chunk_index().get(id).unwrap();
+            (*id, e.pack_id, e.pack_offset, e.stored_size)
+        })
+        .collect();
+    (stream, locs)
+}
+
+fn paths_of(stream: &mut LazyItemStream<'_>) -> vykar_types::error::Result<Vec<String>> {
+    let mut paths = Vec::new();
+    stream.for_each_item(|item| {
+        paths.push(item.path);
+        Ok(())
+    })?;
+    Ok(paths)
+}
+
+fn eager_paths(stream: &[u8]) -> Vec<String> {
+    let mut paths = Vec::new();
+    for_each_decoded_item(stream, |item| {
+        paths.push(item.path);
+        Ok(())
+    })
+    .unwrap();
+    paths
+}
+
+#[test]
+fn lazy_stream_matches_eager_decode_across_windows() {
+    let (mut repo, log) = repo_on_counting_backend();
+    // 33-byte cuts: almost every item straddles a chunk boundary.
+    let (stream, locs) = stored_stream(&mut repo, 500, 33);
+    assert!(locs.len() > 100);
+    let expected = eager_paths(&stream);
+    assert_eq!(expected.len(), 500);
+
+    // Uncapped windows: one range read per run of chunks that sit forward in
+    // the same pack (dedup'd pieces point back to earlier blobs).
+    let pack_runs = 1 + locs
+        .windows(2)
+        .filter(|w| w[0].1 != w[1].1 || w[1].2 < w[0].2 + u64::from(w[0].3))
+        .count();
+    log.reset_get_range_count();
+    let mut lazy = LazyItemStream::for_test(&repo, locs.clone(), false, u64::MAX, None);
+    assert_eq!(paths_of(&mut lazy).unwrap(), expected);
+    assert_eq!(log.get_range_count() as usize, pack_runs);
+
+    // A window cap of ~4 chunks: many range reads, same items.
+    let cap = u64::from(locs[0].3) * 4;
+    log.reset_get_range_count();
+    let mut lazy = LazyItemStream::for_test(&repo, locs.clone(), false, cap, None);
+    assert_eq!(paths_of(&mut lazy).unwrap(), expected);
+    let reads = log.get_range_count() as usize;
+    assert!(
+        reads >= locs.len() / 5 && reads > pack_runs,
+        "expected one read per ~4 chunks, got {reads} for {} chunks",
+        locs.len()
+    );
+}
+
+#[test]
+fn lazy_stream_empty_is_empty() {
+    let (repo, log) = repo_on_counting_backend();
+    let mut lazy = LazyItemStream::for_test(&repo, Vec::new(), false, u64::MAX, None);
+    assert!(paths_of(&mut lazy).unwrap().is_empty());
+    assert_eq!(log.get_range_count(), 0);
+}
+
+#[test]
+fn lazy_stream_surfaces_chunk_id_mismatch_not_a_decode_error() {
+    let (mut repo, _log) = repo_on_counting_backend();
+    let (_stream, mut locs) = stored_stream(&mut repo, 200, 64);
+    // Point chunk 3's location at chunk 4's bytes: on a plaintext repo only
+    // the chunk-ID check can notice.
+    let (_, p, o, s) = locs[4];
+    locs[3] = (locs[3].0, p, o, s);
+    let mut lazy = LazyItemStream::for_test(&repo, locs, false, u64::MAX, None);
+    let err = paths_of(&mut lazy).unwrap_err();
+    assert!(
+        matches!(err, VykarError::InvalidFormat(_)),
+        "expected the chunk-ID mismatch, got {err:?}"
+    );
+}
+
+#[test]
+fn lazy_stream_polls_shutdown_between_range_reads() {
+    let (mut repo, log) = repo_on_counting_backend();
+    let (_stream, locs) = stored_stream(&mut repo, 300, 64);
+    let cap = u64::from(locs[0].3) * 2;
+    let shutdown = AtomicBool::new(false);
+    let mut lazy = LazyItemStream::for_test(&repo, locs, false, cap, Some(&shutdown));
+    log.reset_get_range_count();
+    let mut seen = 0usize;
+    let err = lazy
+        .for_each_item(|_| {
+            seen += 1;
+            shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        })
+        .unwrap_err();
+    assert!(matches!(err, VykarError::Interrupted), "got {err:?}");
+    assert!(seen >= 1);
+    assert_eq!(
+        log.get_range_count(),
+        1,
+        "no read after the flag was raised"
+    );
+}
+
+#[test]
+fn lazy_stream_from_cache_falls_back_to_index_on_bad_location() {
+    let (mut repo, _log) = repo_on_counting_backend();
+    let (stream, mut locs) = stored_stream(&mut repo, 200, 64);
+    repo.save_state().unwrap();
+    // A cached location that decodes to the wrong chunk.
+    let (_, p, o, s) = locs[2];
+    locs[5] = (locs[5].0, p, o, s);
+
+    let mut lazy = LazyItemStream::for_test(&repo, locs.clone(), true, u64::MAX, None);
+    assert!(!lazy.cache_distrusted());
+    assert_eq!(paths_of(&mut lazy).unwrap(), eager_paths(&stream));
+    // The reader that opened the stream must stop using the cache as well.
+    assert!(lazy.cache_distrusted());
+
+    // Without the cache origin there is no fallback: the error surfaces.
+    let mut lazy = LazyItemStream::for_test(&repo, locs, false, u64::MAX, None);
+    assert!(paths_of(&mut lazy).is_err());
+}

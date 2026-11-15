@@ -122,9 +122,11 @@ impl S3Backend {
     /// give up — uniformly for content-addressed packs and mutable keys.
     pub(super) fn put_multipart(&self, full_key: &str, key: &str, data: &[u8]) -> Result<()> {
         let part_size = derive_part_size(data.len(), key)?;
+        // Built once: part digests survive a whole-MPU restart.
+        let parts = Parts::new(data, part_size);
         let mut last_err: Option<VykarError> = None;
         for _attempt in 0..MULTIPART_MAX_ATTEMPTS {
-            match self.try_one_multipart(full_key, key, data, part_size) {
+            match self.try_one_multipart(full_key, key, &parts) {
                 Ok(()) => return Ok(()),
                 Err(MultipartFailure {
                     kind,
@@ -185,21 +187,32 @@ impl S3Backend {
 
     /// Run one full multipart upload. Aborts its own `upload_id` (best-effort) on
     /// any failure after creation. Create failures have no `upload_id` to abort.
+    ///
+    /// Part digests are computed in order on a helper thread while
+    /// `CreateMultipartUpload` is in flight, so the first parts start sending as
+    /// soon as the upload id arrives; part workers hash any part the helper has
+    /// not reached yet themselves.
     fn try_one_multipart(
         &self,
         full_key: &str,
         key: &str,
-        data: &[u8],
-        part_size: usize,
+        parts: &Parts<'_>,
     ) -> std::result::Result<(), MultipartFailure> {
-        let upload_id = self.create_mpu(full_key, key)?;
-        match self.upload_parts_and_complete(full_key, key, data, part_size, &upload_id) {
-            Ok(()) => Ok(()),
-            Err(failure) => {
-                self.abort_mpu(full_key, key, &upload_id);
-                Err(failure)
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                for i in 0..parts.len() {
+                    parts.get(i);
+                }
+            });
+            let upload_id = self.create_mpu(full_key, key)?;
+            match self.upload_parts_and_complete(full_key, key, parts, &upload_id) {
+                Ok(()) => Ok(()),
+                Err(failure) => {
+                    self.abort_mpu(full_key, key, &upload_id);
+                    Err(failure)
+                }
             }
-        }
+        })
     }
 
     /// `CreateMultipartUpload` (POST). Returns the `upload_id` on success.
@@ -278,12 +291,10 @@ impl S3Backend {
         &self,
         full_key: &str,
         key: &str,
-        data: &[u8],
-        part_size: usize,
+        parts: &Parts<'_>,
         upload_id: &str,
     ) -> std::result::Result<(), MultipartFailure> {
-        let chunks: Vec<&[u8]> = data.chunks(part_size).collect();
-        let etags: Vec<OnceLock<String>> = (0..chunks.len()).map(|_| OnceLock::new()).collect();
+        let etags: Vec<OnceLock<String>> = (0..parts.len()).map(|_| OnceLock::new()).collect();
         let next = AtomicUsize::new(0);
         let failed = AtomicBool::new(false);
         // Lowest-numbered part failure wins, matching what a sequential upload
@@ -292,37 +303,40 @@ impl S3Backend {
 
         let worker = || loop {
             let i = next.fetch_add(1, Ordering::Relaxed);
-            let (Some(&chunk), Some(etag_slot)) = (chunks.get(i), etags.get(i)) else {
+            let (Some((chunk, content_md5)), Some(etag_slot)) = (parts.get(i), etags.get(i)) else {
                 return;
             };
             if failed.load(Ordering::Acquire) {
                 return;
             }
+            // The digest above is computed before taking a slot, so a slot (and
+            // its pooled connection) never idles while a part is hashed.
             let _slot = self.part_slots.acquire();
             if failed.load(Ordering::Acquire) {
                 return;
             }
             // part_size is derived to keep the count <= S3_MAX_PARTS (<= u16::MAX).
             let part_number = u16::try_from(i + 1).expect("part count bounded by S3_MAX_PARTS");
-            let err = match self.upload_part(full_key, key, part_number, upload_id, chunk) {
-                Ok(PartOutcome::Uploaded(etag)) => {
-                    etag_slot
-                        .set(etag)
-                        .expect("each part index is claimed once");
-                    continue;
-                }
-                // The MPU expired or was aborted out from under us. A fresh MPU
-                // can recover, so restart at the outer loop.
-                Ok(PartOutcome::NoSuchUpload) => MultipartFailure {
-                    kind: MultipartFailureKind::Retryable,
-                    ambiguous: false,
-                    err: VykarError::Other(format!(
-                        "S3 PUT {key}: NoSuchUpload uploading part {part_number}; \
+            let err =
+                match self.upload_part(full_key, key, part_number, upload_id, chunk, content_md5) {
+                    Ok(PartOutcome::Uploaded(etag)) => {
+                        etag_slot
+                            .set(etag)
+                            .expect("each part index is claimed once");
+                        continue;
+                    }
+                    // The MPU expired or was aborted out from under us. A fresh MPU
+                    // can recover, so restart at the outer loop.
+                    Ok(PartOutcome::NoSuchUpload) => MultipartFailure {
+                        kind: MultipartFailureKind::Retryable,
+                        ambiguous: false,
+                        err: VykarError::Other(format!(
+                            "S3 PUT {key}: NoSuchUpload uploading part {part_number}; \
                          the multipart upload no longer exists"
-                    )),
-                },
-                Err(f) => f,
-            };
+                        )),
+                    },
+                    Err(f) => f,
+                };
             failed.store(true, Ordering::Release);
             let mut first = failure.lock().unwrap_or_else(|e| e.into_inner());
             if first.as_ref().is_none_or(|(j, _)| i < *j) {
@@ -331,7 +345,7 @@ impl S3Backend {
             return;
         };
 
-        let workers = self.part_slots.capacity().min(chunks.len());
+        let workers = self.part_slots.capacity().min(parts.len());
         std::thread::scope(|s| {
             for _ in 1..workers {
                 s.spawn(worker);
@@ -360,13 +374,12 @@ impl S3Backend {
         part_number: u16,
         upload_id: &str,
         chunk: &[u8],
+        content_md5: &str,
     ) -> std::result::Result<PartOutcome, MultipartFailure> {
-        // Per-part Content-MD5 — integrity / Object-Lock parity with the single PUT.
-        let content_md5 = base64::engine::general_purpose::STANDARD.encode(Md5::digest(chunk));
         let mut action =
             self.bucket
                 .upload_part(Some(&self.credentials), full_key, part_number, upload_id);
-        action.headers_mut().insert("content-md5", &content_md5);
+        action.headers_mut().insert("content-md5", content_md5);
         let url = action.sign(PRESIGN_DURATION);
 
         let result = self.retry_call(
@@ -374,7 +387,7 @@ impl S3Backend {
             || {
                 self.agent
                     .put(url.as_str())
-                    .header("content-md5", &content_md5)
+                    .header("content-md5", content_md5)
                     .send(chunk)
             },
             |mut resp| {
@@ -583,6 +596,36 @@ impl S3Backend {
                  until an AbortIncompleteMultipartUpload lifecycle rule cleans it up): {e}"
             );
         }
+    }
+}
+
+/// The parts of one multipart object and their lazily computed Content-MD5s.
+struct Parts<'a> {
+    chunks: Vec<&'a [u8]>,
+    md5: Vec<OnceLock<String>>,
+}
+
+impl<'a> Parts<'a> {
+    fn new(data: &'a [u8], part_size: usize) -> Self {
+        let chunks: Vec<&[u8]> = data.chunks(part_size).collect();
+        let md5 = chunks.iter().map(|_| OnceLock::new()).collect();
+        Self { chunks, md5 }
+    }
+
+    fn len(&self) -> usize {
+        self.chunks.len()
+    }
+
+    /// Part `i` (0-based) and its base64 Content-MD5 — integrity / Object-Lock
+    /// parity with the single PUT. Hashes on first use; a concurrent caller for
+    /// the same part waits for that digest instead of hashing again.
+    fn get(&self, i: usize) -> Option<(&'a [u8], &str)> {
+        let chunk = *self.chunks.get(i)?;
+        let md5 = self
+            .md5
+            .get(i)?
+            .get_or_init(|| base64::engine::general_purpose::STANDARD.encode(Md5::digest(chunk)));
+        Some((chunk, md5))
     }
 }
 

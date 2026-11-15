@@ -102,8 +102,7 @@ pub(in crate::commands::backup) struct WalkedEntry {
 /// Derive the snapshot-relative path from an absolute entry path.
 /// Uses `abs_source` (the canonicalized walk root) for `strip_prefix`.
 pub(super) fn rel_path_from_abs(abs_source: &Path, abs_path: &Path) -> String {
-    let rel = abs_path
-        .strip_prefix(abs_source)
+    let rel = fs::strip_path_prefix(abs_path, abs_source)
         .unwrap_or(abs_path)
         .to_string_lossy()
         .to_string();
@@ -116,7 +115,7 @@ pub(super) fn rel_path_from_abs(abs_source: &Path, abs_path: &Path) -> String {
 /// needed. Delegates the `cfg(unix)` byte extraction to the shared
 /// [`crate::platform::fs::non_utf8_bytes`] helper.
 pub(super) fn rel_raw_from_abs(abs_source: &Path, abs_path: &Path) -> Option<Vec<u8>> {
-    let rel = abs_path.strip_prefix(abs_source).unwrap_or(abs_path);
+    let rel = fs::strip_path_prefix(abs_path, abs_source).unwrap_or(abs_path);
     crate::platform::fs::non_utf8_bytes(rel)
 }
 
@@ -510,9 +509,9 @@ impl InodeSortedWalk {
         raw_entries.retain(|raw| {
             // raw.path is absolute (we walk abs_source), strip abs_source
             // to get a relative path for exclude-pattern matching.
-            let rel = match raw.path.strip_prefix(&self.abs_source) {
-                Ok(r) => r,
-                Err(_) => return false,
+            let rel = match fs::strip_path_prefix(&raw.path, &self.abs_source) {
+                Some(r) => r,
+                None => return false,
             };
 
             let is_dir = raw.is_dir_hint.unwrap_or(false);
@@ -582,9 +581,9 @@ impl InodeSortedWalk {
 
             // Post-stat: re-check filters if d_type was unknown or actual type differs.
             if raw.is_dir_hint.is_none() || raw.is_dir_hint != Some(actual_is_dir) {
-                let rel = match raw.path.strip_prefix(&self.abs_source) {
-                    Ok(r) => r,
-                    Err(_) => continue,
+                let rel = match fs::strip_path_prefix(&raw.path, &self.abs_source) {
+                    Some(r) => r,
+                    None => continue,
                 };
 
                 if self

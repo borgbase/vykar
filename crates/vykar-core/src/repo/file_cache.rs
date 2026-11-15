@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use crate::compress;
+use crate::platform::fs::path_starts_with;
 use crate::snapshot::item::ChunkRef;
 use vykar_common::paths;
 use vykar_crypto::CryptoEngine;
@@ -433,12 +434,13 @@ impl FileCache {
 
     /// Find the section key for a given path by longest-prefix-match.
     /// Iterates `active_keys` (sorted longest first), returns the first key
-    /// where `Path::new(path).starts_with(key)`.
+    /// where `Path::new(path).starts_with(key)` (via the byte-level fast path
+    /// [`path_starts_with`], which gives the same answer).
     fn find_section_key(&self, path: &str) -> Option<&str> {
         let p = Path::new(path);
         self.active_keys
             .iter()
-            .find(|key| p.starts_with(key.as_str()))
+            .find(|key| path_starts_with(p, Path::new(key.as_str())))
             .map(|s| s.as_str())
     }
 
@@ -611,7 +613,7 @@ impl FileCache {
         let mut matching = self
             .active_keys
             .iter()
-            .filter(|key| p.starts_with(key.as_str()))
+            .filter(|key| path_starts_with(p, Path::new(key.as_str())))
             .peekable();
         assert!(
             matching.peek().is_some(),
@@ -665,7 +667,7 @@ impl FileCache {
             let mut matching = self
                 .active_keys
                 .iter()
-                .filter(|key| p.starts_with(key.as_str()));
+                .filter(|key| path_starts_with(p, Path::new(key.as_str())));
             if let (Some(key), None) = (matching.next(), matching.next()) {
                 if let (Some(section), Some(hits)) = (
                     self.sections.get_mut(key.as_str()),

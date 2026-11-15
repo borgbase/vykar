@@ -44,6 +44,66 @@ pub(crate) fn non_utf8_bytes(_path: &Path) -> Option<Vec<u8>> {
     None
 }
 
+/// `Path::starts_with` with a byte-level fast path on Unix.
+///
+/// The backup walk asks this once or more per file with the same few source
+/// roots, and the component-wise comparison (both paths re-parsed into
+/// `Components` each time) is measurable there. When `path`'s bytes start
+/// with `base`'s bytes and the match ends on a separator boundary, every
+/// component of `base` is also a component of `path` in the same position,
+/// so the answer is `true`; anything else (including `/a/b` vs `/a/bc`, or a
+/// `base` with a trailing separator that `path` lacks) is decided by the std
+/// comparison. Non-Unix platforms always use the std comparison, keeping
+/// their prefix/verbatim-path semantics untouched.
+#[inline]
+pub(crate) fn path_starts_with(path: &Path, base: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let (p, b) = (path.as_os_str().as_bytes(), base.as_os_str().as_bytes());
+        if let Some(rest) = p.strip_prefix(b) {
+            if rest.is_empty() || rest.first() == Some(&b'/') || b.last() == Some(&b'/') {
+                return true;
+            }
+        }
+    }
+    path.starts_with(base)
+}
+
+/// `Path::strip_prefix` with a byte-level fast path on Unix.
+///
+/// Same idea as [`path_starts_with`]. The fast path only answers when the
+/// result is unambiguous: the remainder after the separator boundary is
+/// returned verbatim, which equals std's result unless it starts with a `.`
+/// component or ends in a separator / `.` component (std trims those); those
+/// rare shapes, and every non-match, go to `Path::strip_prefix`.
+#[inline]
+pub(crate) fn strip_path_prefix<'a>(path: &'a Path, base: &Path) -> Option<&'a Path> {
+    #[cfg(unix)]
+    {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let (p, b) = (path.as_os_str().as_bytes(), base.as_os_str().as_bytes());
+        // An empty `base` keeps a leading root (`"/a"` minus `""` is `"/a"`),
+        // so it is left to std.
+        if let (false, Some(mut rest)) = (b.is_empty(), p.strip_prefix(b)) {
+            if rest.is_empty() || rest.first() == Some(&b'/') || b.last() == Some(&b'/') {
+                while let Some(r) = rest.strip_prefix(b"/") {
+                    rest = r;
+                }
+                let ambiguous = rest == b"."
+                    || rest.starts_with(b"./")
+                    || rest.ends_with(b"/")
+                    || rest.ends_with(b"/.");
+                if !ambiguous {
+                    return Some(Path::new(OsStr::from_bytes(rest)));
+                }
+            }
+        }
+    }
+    path.strip_prefix(base).ok()
+}
+
 /// Stat an open file descriptor and build a `MetadataSummary`.
 pub fn fstat_summary(file: &std::fs::File) -> std::io::Result<MetadataSummary> {
     let meta = file.metadata()?;
@@ -487,6 +547,82 @@ pub fn xattrs_supported() -> bool {
 mod tests {
     use super::*;
     use std::time::SystemTime;
+
+    /// The fast paths must agree with std on every shape, including roots that
+    /// are byte prefixes of each other, `/`, trailing separators, `.`/`..`
+    /// components, doubled separators and relative paths.
+    #[test]
+    fn path_prefix_helpers_match_std() {
+        let samples = [
+            "",
+            "/",
+            "//",
+            "/a",
+            "/a/",
+            "/a//",
+            "/a/b",
+            "/a/b/",
+            "/a/bc",
+            "/a/bc/d",
+            "/a/b/c",
+            "/a/b//c",
+            "/a/b/c/",
+            "/a/b/c/.",
+            "/a/b/./c",
+            "/a/b/.",
+            "/a/b/..",
+            "/a/b/../c",
+            "/a/b/.c",
+            "/a/b.",
+            "/a/b./c",
+            "/a/./b",
+            "/a/./b/c",
+            "/a//b/c",
+            "/a/b/c/d/e.txt",
+            ".",
+            "./",
+            "./a",
+            "a",
+            "a/",
+            "a/b",
+            "ab",
+            "..",
+            "../a",
+            "/a/b/c//",
+        ];
+        for p in samples {
+            for b in samples {
+                let (pp, bp) = (Path::new(p), Path::new(b));
+                assert_eq!(
+                    path_starts_with(pp, bp),
+                    pp.starts_with(bp),
+                    "starts_with({p:?}, {b:?})"
+                );
+                assert_eq!(
+                    strip_path_prefix(pp, bp),
+                    pp.strip_prefix(bp).ok(),
+                    "strip_prefix({p:?}, {b:?})"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_prefix_helpers_handle_non_utf8() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let base = Path::new(OsStr::from_bytes(b"/src/\x80dir"));
+        let child = Path::new(OsStr::from_bytes(b"/src/\x80dir/f\xff.txt"));
+        let sibling = Path::new(OsStr::from_bytes(b"/src/\x80dirx/f"));
+        assert!(path_starts_with(child, base));
+        assert!(!path_starts_with(sibling, base));
+        assert_eq!(
+            strip_path_prefix(child, base),
+            Some(Path::new(OsStr::from_bytes(b"f\xff.txt")))
+        );
+        assert_eq!(strip_path_prefix(sibling, base), None);
+    }
 
     #[test]
     fn set_file_mtime_roundtrips() {

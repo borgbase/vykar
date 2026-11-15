@@ -2,7 +2,7 @@
 //! "unsupported" bodies for leaves.
 //!
 //! Every wrapper that holds an inner backend (rate limiter, test recorder, the
-//! `Arc<dyn StorageBackend>` coercion impl) has to forward all 19 trait methods,
+//! `Arc<dyn StorageBackend>` coercion impl) has to forward all 20 trait methods,
 //! and hand-written forwards rot — a forgotten one disabled server-side pack
 //! verification and server init on any throttled REST repo.
 //!
@@ -209,7 +209,7 @@ macro_rules! delegate_storage_backend {
             $($custom)*
 
             $crate::delegate_storage_backend!(@forward
-                [get put delete exists list get_range get_range_into create_dir
+                [get put delete exists list get_range get_range_into open_range create_dir
                  put_owned begin_staged_put size list_sized remove_stale_temp_files
                  server_repack batch_delete_keys
                  server_verify_packs server_init bind_content_hash
@@ -218,6 +218,32 @@ macro_rules! delegate_storage_backend {
         }
         $crate::delegate_storage_backend!(@check_list [$($except)*] [] []);
         $crate::delegate_storage_backend!(@check_put [$($except)*] [] []);
+        $crate::delegate_storage_backend!(@check_range [$($except)*] [] []);
+    };
+
+    // ── Guard: overriding `get_range_into` requires `open_range` ──────────
+    //
+    // A forwarded `open_range` hands out the inner backend's reader, which
+    // never passes through the wrapper's `get_range_into` override (rate
+    // limit, request counter, fault injection). `vykar_storage::buffered_range`
+    // with `self` keeps every read on the intercepted path.
+
+    (@check_range [] [] $open:tt) => {};
+    (@check_range [] [get_range_into] [open_range]) => {};
+    (@check_range [] [get_range_into] []) => {
+        compile_error!(
+            "delegate_storage_backend!: a wrapper that overrides `get_range_into` \
+             must also override `open_range`, or streamed range reads bypass it"
+        );
+    };
+    (@check_range [get_range_into $($rest:ident)*] [] $open:tt) => {
+        $crate::delegate_storage_backend!(@check_range [$($rest)*] [get_range_into] $open);
+    };
+    (@check_range [open_range $($rest:ident)*] $into:tt []) => {
+        $crate::delegate_storage_backend!(@check_range [$($rest)*] $into [open_range]);
+    };
+    (@check_range [$other:ident $($rest:ident)*] $into:tt $open:tt) => {
+        $crate::delegate_storage_backend!(@check_range [$($rest)*] $into $open);
     };
 
     // ── Guard: overriding `put`/`put_owned` requires `begin_staged_put` ───
@@ -363,6 +389,24 @@ macro_rules! delegate_storage_backend {
             buf: &mut Vec<u8>,
         ) -> $crate::__macro_support::Result<bool> {
             $crate::InnerBackend::inner_backend(self).get_range_into(key, offset, length, buf)
+        }
+        $crate::delegate_storage_backend!(@forward [$($rest)*] [$($except)*]);
+    };
+
+    (@forward [open_range $($rest:ident)*] [open_range $($except:ident)*]) => {
+        $crate::delegate_storage_backend!(@forward [$($rest)*] [$($except)*]);
+    };
+    (@forward [open_range $($rest:ident)*] [$($except:ident)*]) => {
+        fn open_range<'__range>(
+            &self,
+            key: &str,
+            offset: u64,
+            length: u64,
+            buf: &'__range mut Vec<u8>,
+        ) -> $crate::__macro_support::Result<
+            Option<Box<dyn $crate::RangeReader + '__range>>,
+        > {
+            $crate::InnerBackend::inner_backend(self).open_range(key, offset, length, buf)
         }
         $crate::delegate_storage_backend!(@forward [$($rest)*] [$($except)*]);
     };
@@ -564,6 +608,16 @@ mod tests {
             self.hit();
             Ok(false)
         }
+        fn open_range<'a>(
+            &self,
+            _key: &str,
+            _offset: u64,
+            _length: u64,
+            _buf: &'a mut Vec<u8>,
+        ) -> Result<Option<Box<dyn crate::RangeReader + 'a>>> {
+            self.hit();
+            Ok(None)
+        }
         fn create_dir(&self, _key: &str) -> Result<()> {
             self.hit();
             Ok(())
@@ -677,6 +731,7 @@ mod tests {
         w.list("p").unwrap();
         w.get_range("k", 0, 1).unwrap();
         w.get_range_into("k", 0, 1, &mut Vec::new()).unwrap();
+        assert!(w.open_range("k", 0, 1, &mut Vec::new()).unwrap().is_none());
         w.create_dir("d").unwrap();
         w.put_owned("k", vec![1]).unwrap();
         assert!(w.begin_staged_put("p").unwrap().is_none());
@@ -700,7 +755,7 @@ mod tests {
             .unwrap();
         w.server_capabilities().unwrap();
 
-        // 19 trait methods, 18 of them forwarded.
-        assert_eq!(w.inner.calls.load(Ordering::SeqCst), 18);
+        // 20 trait methods, 19 of them forwarded.
+        assert_eq!(w.inner.calls.load(Ordering::SeqCst), 19);
     }
 }

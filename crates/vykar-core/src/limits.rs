@@ -139,7 +139,7 @@ impl InnerBackend for ThrottledStorageBackend {
 // to be disabled on every throttled REST repo.
 delegate_storage_backend! {
     for ThrottledStorageBackend;
-    except [get, put, get_range, get_range_into, put_owned, begin_staged_put];
+    except [get, put, get_range, get_range_into, open_range, put_owned, begin_staged_put];
 
     fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
         let out = self.inner.get(key)?;
@@ -178,6 +178,18 @@ delegate_storage_backend! {
             }
         }
         Ok(found)
+    }
+
+    // Buffer through the throttled `get_range_into` above, so a throttled
+    // range costs the same tokens (gaps included) as before streaming reads.
+    fn open_range<'a>(
+        &self,
+        key: &str,
+        offset: u64,
+        length: u64,
+        buf: &'a mut Vec<u8>,
+    ) -> Result<Option<Box<dyn vykar_storage::RangeReader + 'a>>> {
+        vykar_storage::buffered_range(self, key, offset, length, buf)
     }
 
     fn put_owned(&self, key: &str, data: Vec<u8>) -> Result<()> {

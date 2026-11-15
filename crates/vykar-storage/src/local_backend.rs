@@ -4,7 +4,7 @@ use std::path::{Component, Path, PathBuf};
 
 use vykar_types::error::{Result, VykarError};
 
-use crate::{ListedObject, StagedPut, StorageBackend};
+use crate::{ListedObject, RangeCursor, RangeReader, StagedPut, StorageBackend};
 
 /// Write buffer of a staged object. Its appends are a 4-byte length prefix
 /// followed by a blob of typically hundreds of KiB, which bypasses the buffer,
@@ -311,6 +311,39 @@ impl StorageBackend for LocalBackend {
         Ok(true)
     }
 
+    /// Read each piece straight from the file instead of buffering the range.
+    /// The object size is checked here, so a truncated object fails before
+    /// any piece is handed out, as it does with `get_range_into`.
+    fn open_range<'a>(
+        &self,
+        key: &str,
+        offset: u64,
+        length: u64,
+        buf: &'a mut Vec<u8>,
+    ) -> Result<Option<Box<dyn RangeReader + 'a>>> {
+        let path = self.resolve(key)?;
+        buf.clear();
+        let file = match fs::File::open(&path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let cursor = RangeCursor::new(offset, length)?;
+        let size = file.metadata()?.len();
+        if size < offset.saturating_add(length) {
+            return Err(VykarError::Other(format!(
+                "short read on {key} at offset {offset}: expected {length} bytes, got {}",
+                size.saturating_sub(offset)
+            )));
+        }
+        Ok(Some(Box::new(LocalRange {
+            file,
+            key: key.to_string(),
+            cursor,
+            buf,
+        })))
+    }
+
     fn create_dir(&self, key: &str) -> Result<()> {
         let path = self.resolve(key.trim_end_matches('/'))?;
         fs::create_dir_all(&path)?;
@@ -318,6 +351,64 @@ impl StorageBackend for LocalBackend {
     }
 
     crate::unsupported_server_ops!(except[remove_stale_temp_files]);
+}
+
+/// A range opened by [`LocalBackend::open_range`]: each piece is one
+/// positional read into the caller's buffer.
+struct LocalRange<'a> {
+    file: fs::File,
+    key: String,
+    cursor: RangeCursor,
+    buf: &'a mut Vec<u8>,
+}
+
+impl RangeReader for LocalRange<'_> {
+    fn read_at(&mut self, offset: u64, len: usize) -> Result<&mut [u8]> {
+        self.cursor.advance(offset, len)?;
+        self.buf.clear();
+        self.buf.resize(len, 0);
+        let filled = read_full_at(&mut self.file, self.buf, offset)?;
+        if filled != len {
+            return Err(VykarError::Other(format!(
+                "short read on {} at offset {offset}: expected {len} bytes, got {filled}",
+                self.key
+            )));
+        }
+        Ok(self.buf.as_mut_slice())
+    }
+}
+
+/// Fill `buf` from `file` at `offset`, stopping early only at end of file.
+/// Returns the number of bytes read.
+fn read_full_at(file: &mut fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        let mut filled = 0;
+        while let Some(rest) = buf.get_mut(filled..).filter(|r| !r.is_empty()) {
+            match file.read_at(rest, offset + filled as u64) {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(filled)
+    }
+    #[cfg(not(unix))]
+    {
+        file.seek(SeekFrom::Start(offset))?;
+        let mut filled = 0;
+        while let Some(rest) = buf.get_mut(filled..).filter(|r| !r.is_empty()) {
+            match file.read(rest) {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(filled)
+    }
 }
 
 /// A temp file being filled by [`LocalBackend::begin_staged_put`]. Dropping
@@ -863,5 +954,136 @@ mod tests {
         let result = backend.get("contested").unwrap().unwrap();
         // Result must be exactly one of the two full payloads — never a mixture
         assert!(result == payload_a || result == payload_b);
+    }
+
+    // ── open_range: the streaming override and the buffered default ────────
+
+    /// A 1000-byte object whose byte `i` is `i % 251`, in a fresh repo dir.
+    fn range_fixture() -> (tempfile::TempDir, LocalBackend, Vec<u8>) {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = LocalBackend::new(dir.path().to_str().unwrap()).unwrap();
+        let data: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8).collect();
+        backend.put("packs/ab/obj", &data).unwrap();
+        (dir, backend, data)
+    }
+
+    /// Read `pieces` from `[offset, offset+length)` with the local override or
+    /// the buffered default, returning each piece's bytes.
+    fn read_pieces(
+        backend: &LocalBackend,
+        buffered: bool,
+        key: &str,
+        offset: u64,
+        length: u64,
+        pieces: &[(u64, usize)],
+    ) -> Result<Option<Vec<Vec<u8>>>> {
+        let mut buf = Vec::new();
+        let reader = if buffered {
+            crate::buffered_range(backend, key, offset, length, &mut buf)?
+        } else {
+            backend.open_range(key, offset, length, &mut buf)?
+        };
+        let Some(mut reader) = reader else {
+            return Ok(None);
+        };
+        let mut out = Vec::new();
+        for &(off, len) in pieces {
+            out.push(reader.read_at(off, len)?.to_vec());
+        }
+        Ok(Some(out))
+    }
+
+    #[test]
+    fn open_range_reads_pieces_and_skips_gaps() {
+        let (_dir, backend, data) = range_fixture();
+        // Range [100, 900); pieces with gaps before, between and after.
+        let pieces = [(100, 10), (150, 50), (200, 1), (500, 300), (850, 50)];
+        for buffered in [false, true] {
+            let got = read_pieces(&backend, buffered, "packs/ab/obj", 100, 800, &pieces)
+                .unwrap()
+                .unwrap();
+            for (&(off, len), bytes) in pieces.iter().zip(&got) {
+                let off = off as usize;
+                assert_eq!(
+                    bytes,
+                    &data[off..off + len],
+                    "buffered={buffered} piece at {off}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn open_range_missing_key_is_none() {
+        let (_dir, backend, _) = range_fixture();
+        for buffered in [false, true] {
+            let got = read_pieces(&backend, buffered, "packs/ab/missing", 0, 10, &[(0, 10)]);
+            assert!(got.unwrap().is_none(), "buffered={buffered}");
+        }
+    }
+
+    #[test]
+    fn open_range_past_end_of_object_fails_at_open() {
+        let (_dir, backend, _) = range_fixture();
+        for buffered in [false, true] {
+            let mut buf = Vec::new();
+            let err = if buffered {
+                crate::buffered_range(&backend, "packs/ab/obj", 900, 200, &mut buf).err()
+            } else {
+                backend.open_range("packs/ab/obj", 900, 200, &mut buf).err()
+            };
+            let err = err
+                .expect("short object must fail before any piece")
+                .to_string();
+            assert!(err.contains("short read"), "buffered={buffered}: {err}");
+        }
+    }
+
+    #[test]
+    fn open_range_rejects_pieces_outside_or_backwards() {
+        let (_dir, backend, _) = range_fixture();
+        for buffered in [false, true] {
+            let key = "packs/ab/obj";
+            // Before the range start.
+            assert!(read_pieces(&backend, buffered, key, 100, 100, &[(50, 10)]).is_err());
+            // Past the range end.
+            assert!(read_pieces(&backend, buffered, key, 100, 100, &[(150, 51)]).is_err());
+            // Overlapping the previous piece.
+            assert!(
+                read_pieces(&backend, buffered, key, 100, 100, &[(100, 20), (110, 5)]).is_err()
+            );
+            // Adjacent pieces and an empty piece are fine.
+            let got = read_pieces(
+                &backend,
+                buffered,
+                key,
+                100,
+                100,
+                &[(100, 20), (120, 0), (120, 80)],
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(got.iter().map(Vec::len).collect::<Vec<_>>(), [20, 0, 80]);
+        }
+    }
+
+    #[test]
+    fn open_range_object_truncated_after_open_is_short_read() {
+        let (dir, backend, _) = range_fixture();
+        let mut buf = Vec::new();
+        let mut reader = backend
+            .open_range("packs/ab/obj", 0, 1000, &mut buf)
+            .unwrap()
+            .unwrap();
+        assert_eq!(reader.read_at(0, 100).unwrap().len(), 100);
+        // Shrink the object under the open reader: the next piece is short.
+        let f = fs::OpenOptions::new()
+            .write(true)
+            .open(dir.path().join("packs/ab/obj"))
+            .unwrap();
+        f.set_len(600).unwrap();
+        let err = reader.read_at(500, 200).unwrap_err().to_string();
+        assert!(err.contains("short read"), "{err}");
+        assert!(err.contains("expected 200 bytes, got 100"), "{err}");
     }
 }

@@ -15,7 +15,7 @@ use crate::commands::util::check_interrupted;
 use crate::compress;
 use crate::repo::format::{unpack_object_expect_with_context_into, verify_chunk_id, ObjectType};
 use vykar_crypto::CryptoEngine;
-use vykar_storage::StorageBackend;
+use vykar_storage::{RangeReader, StorageBackend};
 use vykar_types::chunk_id::ChunkHasher;
 use vykar_types::error::{Result, VykarError};
 use vykar_types::pack_id::PackId;
@@ -397,8 +397,12 @@ impl BlobCtx<'_> {
     }
 }
 
-/// Process a single coalesced read group: download the range, decrypt and
-/// decompress each blob, then write the plaintext data to target files.
+/// Process a single coalesced read group: open the range, then read, decrypt
+/// and decompress it blob by blob and write the plaintext to target files.
+///
+/// The range is one [`StorageBackend::open_range`] request. Backends that
+/// fetch it whole (the default) buffer it in `data_buf`; `LocalBackend`
+/// streams it, so `data_buf` only ever holds one stored blob.
 ///
 /// `data_buf`, `decrypt_buf`, and `decompress_buf` are caller-owned scratch
 /// buffers reused across groups within the same thread, reducing per-group
@@ -406,7 +410,9 @@ impl BlobCtx<'_> {
 ///
 /// In continue mode a failed group read is retried blob by blob: a short read
 /// is an `Err` by the storage contract, so otherwise one truncated pack would
-/// take down every blob of a 16 MiB coalesced group.
+/// take down every blob of a 16 MiB coalesced group. A read that fails part
+/// way through a streamed group keeps the blobs already written, records the
+/// blob whose read failed, and retries the rest one by one.
 #[allow(clippy::too_many_arguments)]
 fn process_read_group(
     group: &ReadGroup,
@@ -442,81 +448,127 @@ fn process_read_group(
     let pack_key = group.pack_id.storage_key();
     let read_len = group.read_end - group.read_start;
 
-    match storage.get_range_into(&pack_key, group.read_start, read_len, data_buf) {
-        Ok(true) => process_blobs(
-            &ctx,
-            &group.pack_id,
-            group.read_start,
-            &group.blobs,
-            data_buf,
-            decrypt_buf,
-            decompress_buf,
-        ),
-        Ok(false) => {
+    // `failed_at`: index of the blob whose own read failed (a streamed piece,
+    // or the only blob of the group); `None` when the group request failed as
+    // a whole.
+    let (err, failed_at) = match storage.open_range(&pack_key, group.read_start, read_len, data_buf)
+    {
+        Ok(Some(mut reader)) => {
+            match process_blobs(
+                &ctx,
+                &group.pack_id,
+                &group.blobs,
+                &mut *reader,
+                decrypt_buf,
+                decompress_buf,
+            )? {
+                None => return Ok(()),
+                Some((i, e)) => (e, Some(i)),
+            }
+        }
+        Ok(None) => {
             if failures.is_none() {
                 return Err(ReadError::source(pack_not_found(&group.pack_id)));
             }
             for blob in &group.blobs {
                 ctx.source_failure(&blob.targets, pack_not_found(&group.pack_id))?;
             }
-            Ok(())
+            return Ok(());
         }
-        Err(e) => {
-            if failures.is_none() || matches!(e, VykarError::Interrupted) {
-                return Err(ReadError::source(e));
-            }
-            if let [blob] = &group.blobs[..] {
-                return ctx.source_failure(&blob.targets, e);
-            }
-            // Blobs are sorted by offset, so a truncated pack fails on every
-            // blob from the cut onwards; stopping after a short run of
-            // failures keeps that salvage while bounding a backend outage to
-            // 1 + MAX_CONSECUTIVE_BLOB_READ_ERRORS requests per group.
-            let mut consecutive = 0;
-            for (i, blob) in group.blobs.iter().enumerate() {
-                if ctx.stopping() {
-                    return Ok(());
-                }
-                let err = match storage.get_range_into(
-                    &pack_key,
-                    blob.pack_offset,
-                    u64::from(blob.stored_size),
-                    data_buf,
-                ) {
-                    Ok(true) => {
-                        consecutive = 0;
-                        process_blobs(
-                            &ctx,
-                            &group.pack_id,
-                            blob.pack_offset,
-                            std::slice::from_ref(blob),
-                            data_buf,
-                            decrypt_buf,
-                            decompress_buf,
-                        )?;
-                        continue;
-                    }
-                    Ok(false) => pack_not_found(&group.pack_id),
-                    Err(e) => e,
-                };
-                consecutive += 1;
-                if consecutive < MAX_CONSECUTIVE_BLOB_READ_ERRORS {
-                    ctx.source_failure(&blob.targets, err)?;
+        Err(e) => (e, (group.blobs.len() == 1).then_some(0)),
+    };
+
+    if failures.is_none() || matches!(err, VykarError::Interrupted) {
+        return Err(ReadError::source(err));
+    }
+    // Blobs are sorted by offset, so a truncated pack fails on every blob
+    // from the cut onwards; stopping after a short run of failures keeps that
+    // salvage while bounding a backend outage to
+    // 1 + MAX_CONSECUTIVE_BLOB_READ_ERRORS requests per group.
+    let (rest, consecutive) = match failed_at {
+        // That blob's read already failed once: record it rather than
+        // repeating the same request, and count it towards the bound.
+        Some(i) => {
+            let blob = group
+                .blobs
+                .get(i)
+                .ok_or_else(|| VykarError::Other("failed blob index out of range".into()))?;
+            ctx.source_failure(&blob.targets, err)?;
+            (group.blobs.get(i + 1..).unwrap_or_default(), 1)
+        }
+        None => (&group.blobs[..], 0),
+    };
+    retry_blobs_one_by_one(
+        &ctx,
+        storage,
+        &pack_key,
+        &group.pack_id,
+        rest,
+        consecutive,
+        data_buf,
+        decrypt_buf,
+        decompress_buf,
+    )
+}
+
+/// Continue-mode salvage: read `blobs` with one request each, recording the
+/// ones that fail. `consecutive` is the run of read failures just before
+/// `blobs[0]`.
+#[allow(clippy::too_many_arguments)]
+fn retry_blobs_one_by_one(
+    ctx: &BlobCtx<'_>,
+    storage: &Arc<dyn StorageBackend>,
+    pack_key: &str,
+    pack_id: &PackId,
+    blobs: &[PlannedBlob],
+    mut consecutive: usize,
+    data_buf: &mut Vec<u8>,
+    decrypt_buf: &mut Vec<u8>,
+    decompress_buf: &mut Vec<u8>,
+) -> std::result::Result<(), ReadError> {
+    for (i, blob) in blobs.iter().enumerate() {
+        if ctx.stopping() {
+            return Ok(());
+        }
+        let err = match storage.open_range(
+            pack_key,
+            blob.pack_offset,
+            u64::from(blob.stored_size),
+            data_buf,
+        ) {
+            Ok(Some(mut reader)) => match process_blobs(
+                ctx,
+                pack_id,
+                std::slice::from_ref(blob),
+                &mut *reader,
+                decrypt_buf,
+                decompress_buf,
+            )? {
+                None => {
+                    consecutive = 0;
                     continue;
                 }
-                let msg = format!(
-                    "{err} (rest of the read group not retried after \
-                     {consecutive} consecutive failures)"
-                );
-                ctx.source_failure(&blob.targets, err)?;
-                for rest in group.blobs.get(i + 1..).unwrap_or_default() {
-                    ctx.source_failure(&rest.targets, VykarError::Other(msg.clone()))?;
-                }
-                return Ok(());
-            }
-            Ok(())
+                Some((_, e)) => e,
+            },
+            Ok(None) => pack_not_found(pack_id),
+            Err(e) => e,
+        };
+        consecutive += 1;
+        if consecutive < MAX_CONSECUTIVE_BLOB_READ_ERRORS {
+            ctx.source_failure(&blob.targets, err)?;
+            continue;
         }
+        let msg = format!(
+            "{err} (rest of the read group not retried after \
+             {consecutive} consecutive failures)"
+        );
+        ctx.source_failure(&blob.targets, err)?;
+        for rest in blobs.get(i + 1..).unwrap_or_default() {
+            ctx.source_failure(&rest.targets, VykarError::Other(msg.clone()))?;
+        }
+        return Ok(());
     }
+    Ok(())
 }
 
 /// Per-blob retries of a failed group read stop after this many consecutive
@@ -527,17 +579,21 @@ fn pack_not_found(pack_id: &PackId) -> VykarError {
     VykarError::Other(format!("pack not found: {pack_id}"))
 }
 
-/// Decode and write `blobs`, all located in `data`, which holds the pack bytes
-/// starting at `read_start`.
+/// Read, decode and write `blobs` from `reader`, an open range of the pack
+/// covering all of them.
+///
+/// Returns `Ok(Some((i, e)))` when reading blob `i` failed: every blob before
+/// it has been handled (written, or recorded as damaged) and flushed, none
+/// from `i` on has been touched. The caller decides between stopping and
+/// salvaging. Decode failures are handled here, per blob.
 fn process_blobs(
     ctx: &BlobCtx<'_>,
     pack_id: &PackId,
-    read_start: u64,
     blobs: &[PlannedBlob],
-    data: &[u8],
+    reader: &mut dyn RangeReader,
     decrypt_buf: &mut Vec<u8>,
     decompress_buf: &mut Vec<u8>,
-) -> std::result::Result<(), ReadError> {
+) -> std::result::Result<Option<(usize, VykarError)>, ReadError> {
     let (files, bytes_written, root) = (ctx.files, ctx.bytes_written, ctx.root);
     let mut file_handles = LruHandles::new();
 
@@ -545,23 +601,23 @@ fn process_blobs(
     // Pre-allocated to MAX_WRITE_BATCH; reused across sequences within this group.
     let mut pw = PendingWrite::new();
 
-    for blob in blobs {
+    for (i, blob) in blobs.iter().enumerate() {
         if ctx.stopping() {
             // Dropping `pw` loses buffered data, but the caller will
             // clean up the temp restore root on error/cancellation so
             // no partial files reach the final destination.
-            return Ok(());
+            return Ok(None);
         }
 
-        if let Err(e) = decode_blob(
-            ctx,
-            pack_id,
-            read_start,
-            blob,
-            data,
-            decrypt_buf,
-            decompress_buf,
-        ) {
+        let raw = match reader.read_at(blob.pack_offset, blob.stored_size as usize) {
+            Ok(raw) => raw,
+            Err(e) => {
+                flush_pending(&mut pw, &mut file_handles, files, bytes_written, root)?;
+                return Ok(Some((i, e)));
+            }
+        };
+
+        if let Err(e) = decode_blob(ctx, pack_id, blob, raw, decrypt_buf, decompress_buf) {
             ctx.source_failure(&blob.targets, e)?;
             continue;
         }
@@ -616,28 +672,19 @@ fn process_blobs(
     // Flush any remaining pending write.
     flush_pending(&mut pw, &mut file_handles, files, bytes_written, root)?;
 
-    Ok(())
+    Ok(None)
 }
 
-/// Unpack, decompress and verify one blob into `decompress_buf`. Every error
-/// here is source-side.
+/// Unpack, decompress and verify one stored blob (`raw`) into
+/// `decompress_buf`. Every error here is source-side.
 fn decode_blob(
     ctx: &BlobCtx<'_>,
     pack_id: &PackId,
-    read_start: u64,
     blob: &PlannedBlob,
-    data: &[u8],
+    raw: &[u8],
     decrypt_buf: &mut Vec<u8>,
     decompress_buf: &mut Vec<u8>,
 ) -> Result<()> {
-    let local_offset = (blob.pack_offset - read_start) as usize;
-    let local_end = local_offset + blob.stored_size as usize;
-
-    let raw = data.get(local_offset..local_end).ok_or_else(|| {
-        VykarError::Other(format!(
-            "blob extends beyond downloaded range in pack {pack_id}"
-        ))
-    })?;
     unpack_object_expect_with_context_into(
         raw,
         ObjectType::ChunkData,
@@ -1441,7 +1488,17 @@ mod tests {
 
     vykar_storage::delegate_storage_backend! {
         for CancelOnReadBackend;
-        except [get_range_into];
+        except [get_range_into, open_range];
+
+        fn open_range<'a>(
+            &self,
+            key: &str,
+            offset: u64,
+            length: u64,
+            buf: &'a mut Vec<u8>,
+        ) -> vykar_types::error::Result<Option<Box<dyn vykar_storage::RangeReader + 'a>>> {
+            vykar_storage::buffered_range(self, key, offset, length, buf)
+        }
 
         fn get_range_into(
             &self,
@@ -1806,7 +1863,17 @@ mod tests {
 
     vykar_storage::delegate_storage_backend! {
         for BarrierBackend;
-        except [get_range_into];
+        except [get_range_into, open_range];
+
+        fn open_range<'a>(
+            &self,
+            key: &str,
+            offset: u64,
+            length: u64,
+            buf: &'a mut Vec<u8>,
+        ) -> vykar_types::error::Result<Option<Box<dyn vykar_storage::RangeReader + 'a>>> {
+            vykar_storage::buffered_range(self, key, offset, length, buf)
+        }
 
         fn get_range_into(
             &self,
@@ -2001,6 +2068,234 @@ mod tests {
         assert_eq!(
             log.get_range_count(),
             1 + MAX_CONSECUTIVE_BLOB_READ_ERRORS as u64
+        );
+    }
+
+    // ── Streamed ranges (`open_range`) ────────────────────────────────────
+
+    /// Serves ranges from memory piece by piece, failing every `read_at` at an
+    /// offset in `fail` (only during the first `fail_opens` opens; later
+    /// opens, i.e. retries, succeed), and counts opened ranges.
+    struct StreamFailBackend {
+        inner: MemoryBackend,
+        fail: Vec<u64>,
+        fail_opens: usize,
+        opens: std::sync::atomic::AtomicUsize,
+    }
+
+    struct FailingReader<'a> {
+        inner: Box<dyn RangeReader + 'a>,
+        fail: Vec<u64>,
+    }
+
+    impl RangeReader for FailingReader<'_> {
+        fn read_at(&mut self, offset: u64, len: usize) -> Result<&mut [u8]> {
+            if self.fail.contains(&offset) {
+                return Err(VykarError::Other(format!(
+                    "simulated read error at {offset}"
+                )));
+            }
+            self.inner.read_at(offset, len)
+        }
+    }
+
+    impl vykar_storage::InnerBackend for StreamFailBackend {
+        fn inner_backend(&self) -> &dyn StorageBackend {
+            &self.inner
+        }
+    }
+
+    vykar_storage::delegate_storage_backend! {
+        for StreamFailBackend;
+        except [open_range];
+
+        fn open_range<'a>(
+            &self,
+            key: &str,
+            offset: u64,
+            length: u64,
+            buf: &'a mut Vec<u8>,
+        ) -> Result<Option<Box<dyn RangeReader + 'a>>> {
+            let n = self.opens.fetch_add(1, Ordering::SeqCst);
+            let fail = if n < self.fail_opens {
+                self.fail.clone()
+            } else {
+                Vec::new()
+            };
+            Ok(self
+                .inner
+                .open_range(key, offset, length, buf)?
+                .map(|inner| Box::new(FailingReader { inner, fail }) as Box<dyn RangeReader + 'a>))
+        }
+    }
+
+    fn stream_fail_storage(
+        pack_id: PackId,
+        data: &[u8],
+        group: &ReadGroup,
+        fail_blobs: &[usize],
+        fail_opens: usize,
+    ) -> Arc<StreamFailBackend> {
+        let inner = MemoryBackend::new();
+        inner.put(&pack_id.storage_key(), data).unwrap();
+        Arc::new(StreamFailBackend {
+            inner,
+            fail: fail_blobs
+                .iter()
+                .map(|&i| group.blobs[i].pack_offset)
+                .collect(),
+            fail_opens,
+            opens: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    fn payloads(n: u8) -> Vec<Vec<u8>> {
+        (0..n)
+            .map(|i| format!("streamed-payload-{i:02}").into_bytes())
+            .collect()
+    }
+
+    /// A streamed read that fails part way through a group, once: the blobs
+    /// before it stay written, the failed blob is recorded (its own read
+    /// already failed, so it is not repeated), and the rest are salvaged with
+    /// one request each.
+    #[test]
+    fn continue_mid_group_read_failure_salvages_the_rest() {
+        let pack_id = dummy_pack_id(0x50);
+        let payloads = payloads(4);
+        let refs: Vec<&[u8]> = payloads.iter().map(Vec::as_slice).collect();
+        let (data, group, files) = pack_of(pack_id, &refs, &[]);
+        let backend = stream_fail_storage(pack_id, &data, &group, &[1], 1);
+        let storage: Arc<dyn StorageBackend> = backend.clone();
+        let temp = tempdir().unwrap();
+        stage_files(temp.path(), &files);
+
+        let failures = BatchFailures::default();
+        run_group_with(&group, &files, &storage, temp.path(), Some(&failures)).unwrap();
+        let map = failures.into_map();
+        assert_eq!(map.keys().copied().collect::<Vec<_>>(), vec![1]);
+        assert!(map[&1].contains("simulated read error"), "got: {}", map[&1]);
+        for i in [0, 2, 3] {
+            assert_eq!(
+                std::fs::read(temp.path().join(format!("f{i}.bin"))).unwrap(),
+                payloads[i],
+                "blob {i}"
+            );
+        }
+        // The group, then blobs 2 and 3 alone.
+        assert_eq!(backend.opens.load(Ordering::SeqCst), 3);
+    }
+
+    /// A mid-group failure that persists counts towards the consecutive
+    /// bound: blob 1 (streamed), 2 and 3 (retried) fail, 4 and 5 are recorded
+    /// without a request. Every damaged file is recorded exactly once.
+    #[test]
+    fn continue_mid_group_outage_bounds_retries() {
+        let pack_id = dummy_pack_id(0x51);
+        let payloads = payloads(6);
+        let refs: Vec<&[u8]> = payloads.iter().map(Vec::as_slice).collect();
+        let (data, group, files) = pack_of(pack_id, &refs, &[]);
+        let backend = stream_fail_storage(pack_id, &data, &group, &[1, 2, 3, 4, 5], usize::MAX);
+        let storage: Arc<dyn StorageBackend> = backend.clone();
+        let temp = tempdir().unwrap();
+        stage_files(temp.path(), &files);
+
+        let failures = BatchFailures::default();
+        run_group_with(&group, &files, &storage, temp.path(), Some(&failures)).unwrap();
+        let map = failures.into_map();
+        let mut keys: Vec<usize> = map.keys().copied().collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec![1, 2, 3, 4, 5]);
+        assert!(map[&5].contains("not retried"), "got: {}", map[&5]);
+        assert_eq!(
+            std::fs::read(temp.path().join("f0.bin")).unwrap(),
+            payloads[0]
+        );
+        assert_eq!(
+            backend.opens.load(Ordering::SeqCst),
+            MAX_CONSECUTIVE_BLOB_READ_ERRORS
+        );
+    }
+
+    /// Strict mode: a mid-group read failure stops the pass as `Source`.
+    #[test]
+    fn strict_mid_group_read_failure_is_source() {
+        let pack_id = dummy_pack_id(0x52);
+        let payloads = payloads(3);
+        let refs: Vec<&[u8]> = payloads.iter().map(Vec::as_slice).collect();
+        let (data, group, files) = pack_of(pack_id, &refs, &[]);
+        let storage: Arc<dyn StorageBackend> = stream_fail_storage(pack_id, &data, &group, &[2], 1);
+        let temp = tempdir().unwrap();
+        stage_files(temp.path(), &files);
+
+        let err = run_group_with(&group, &files, &storage, temp.path(), None).unwrap_err();
+        assert!(
+            matches!(&err, ReadError::Source(e) if e.to_string().contains("simulated read error")),
+            "got: {err:?}"
+        );
+    }
+
+    /// The streaming `LocalBackend` path end to end: a group whose blobs have
+    /// gaps between them (an unrequested blob in the middle and at the end).
+    #[test]
+    fn local_backend_streamed_group_skips_gaps() {
+        let pack_id = dummy_pack_id(0x53);
+        let payloads = payloads(5);
+        let refs: Vec<&[u8]> = payloads.iter().map(Vec::as_slice).collect();
+        let (data, mut group, files) = pack_of(pack_id, &refs, &[]);
+        // Request blobs 0, 2 and 3 only; 1 and 4 become gaps / trailing bytes.
+        group.blobs.remove(4);
+        group.blobs.remove(1);
+        group.read_end = group.blobs[2].pack_offset + u64::from(group.blobs[2].stored_size);
+
+        let repo = tempdir().unwrap();
+        let local =
+            vykar_storage::local_backend::LocalBackend::new(repo.path().to_str().unwrap()).unwrap();
+        local.put(&pack_id.storage_key(), &data).unwrap();
+        let storage: Arc<dyn StorageBackend> = Arc::new(local);
+        let temp = tempdir().unwrap();
+        stage_files(temp.path(), &files);
+
+        run_group_with(&group, &files, &storage, temp.path(), None).unwrap();
+        for i in [0, 2, 3] {
+            assert_eq!(
+                std::fs::read(temp.path().join(format!("f{i}.bin"))).unwrap(),
+                payloads[i],
+                "blob {i}"
+            );
+        }
+    }
+
+    /// A truncated pack on `LocalBackend` fails at open (size check), before
+    /// any blob is written, so continue mode salvages exactly as on the
+    /// buffered path.
+    #[test]
+    fn local_backend_truncated_pack_salvages_leading_blobs() {
+        let pack_id = dummy_pack_id(0x54);
+        let payloads = payloads(3);
+        let refs: Vec<&[u8]> = payloads.iter().map(Vec::as_slice).collect();
+        let (data, group, files) = pack_of(pack_id, &refs, &[]);
+        let cut = (group.blobs[1].pack_offset + 4) as usize;
+
+        let repo = tempdir().unwrap();
+        let local =
+            vykar_storage::local_backend::LocalBackend::new(repo.path().to_str().unwrap()).unwrap();
+        local.put(&pack_id.storage_key(), &data[..cut]).unwrap();
+        let storage: Arc<dyn StorageBackend> = Arc::new(local);
+        let temp = tempdir().unwrap();
+        stage_files(temp.path(), &files);
+
+        let err = run_group_with(&group, &files, &storage, temp.path(), None).unwrap_err();
+        assert!(
+            matches!(&err, ReadError::Source(e) if e.to_string().contains("short read")),
+            "got: {err:?}"
+        );
+        let failures = BatchFailures::default();
+        run_group_with(&group, &files, &storage, temp.path(), Some(&failures)).unwrap();
+        assert_eq!(failed_indices(failures), vec![1, 2]);
+        assert_eq!(
+            std::fs::read(temp.path().join("f0.bin")).unwrap(),
+            payloads[0]
         );
     }
 }

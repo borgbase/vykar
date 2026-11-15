@@ -139,6 +139,41 @@ pub trait StorageBackend: Send + Sync {
         }
     }
 
+    /// Open a byte range of an object for reading piece by piece with
+    /// [`RangeReader::read_at`], as one logical range request.
+    ///
+    /// Returns `Ok(None)` when the key does not exist (`buf` cleared). `buf`
+    /// is the caller's scratch buffer: the reader keeps the bytes it hands out
+    /// there, so its capacity is reused across ranges.
+    ///
+    /// The default buffers the whole range with [`Self::get_range_into`]
+    /// (see [`buffered_range`]), so backends that fetch a range in one request
+    /// keep exactly their request pattern and error behaviour.
+    /// `LocalBackend` overrides it to read each piece straight from the file,
+    /// which bounds the buffer to the largest piece instead of the range.
+    ///
+    /// The short-read contract still holds: reading a piece that the object
+    /// cannot fully supply is an error, never a truncated slice. Backends that
+    /// know the object size should fail at open, before any piece is handed
+    /// out, so a truncated object fails the same way it does on the buffered
+    /// path.
+    ///
+    /// A wrapper that intercepts `get_range_into` (rate limiting, test
+    /// recorders, fault injection) must also decide what to do here, or
+    /// streamed reads bypass it; [`crate::delegate_storage_backend!`] refuses
+    /// to compile a wrapper that overrides one without the other. Calling
+    /// [`buffered_range`] with `self` routes every read through the wrapper's
+    /// own `get_range_into`.
+    fn open_range<'a>(
+        &self,
+        key: &str,
+        offset: u64,
+        length: u64,
+        buf: &'a mut Vec<u8>,
+    ) -> Result<Option<Box<dyn RangeReader + 'a>>> {
+        buffered_range(self, key, offset, length, buf)
+    }
+
     /// Create a directory marker (no-op for flat object stores).
     fn create_dir(&self, key: &str) -> Result<()>;
 
@@ -290,6 +325,109 @@ pub trait StagedPut: Send {
     /// durability contract of [`StorageBackend::put`]: after `Ok` the object
     /// is complete and as durable as a `put` of the same bytes would be.
     fn commit(self: Box<Self>, key: &str) -> Result<()>;
+}
+
+/// Sequential access to a range opened by [`StorageBackend::open_range`].
+pub trait RangeReader {
+    /// Return the `len` bytes at absolute object offset `offset`.
+    ///
+    /// Pieces must lie inside the opened range and must not go backwards:
+    /// `offset` is at or after the end of the previous piece. Bytes between
+    /// two pieces are skipped. The slice stays valid until the next call; it
+    /// is mutable so callers can decode in place.
+    ///
+    /// A piece that cannot be read in full is an error.
+    fn read_at(&mut self, offset: u64, len: usize) -> Result<&mut [u8]>;
+}
+
+/// [`StorageBackend::open_range`] by buffering the whole range with one
+/// [`StorageBackend::get_range_into`] call on `backend`, then serving pieces
+/// out of `buf`. The trait default, and the implementation for wrappers that
+/// intercept `get_range_into`.
+///
+/// # Errors
+///
+/// Whatever `get_range_into` returns.
+pub fn buffered_range<'a, B: StorageBackend + ?Sized>(
+    backend: &B,
+    key: &str,
+    offset: u64,
+    length: u64,
+    buf: &'a mut Vec<u8>,
+) -> Result<Option<Box<dyn RangeReader + 'a>>> {
+    if !backend.get_range_into(key, offset, length, buf)? {
+        return Ok(None);
+    }
+    Ok(Some(Box::new(BufferedRange {
+        buf,
+        cursor: RangeCursor::new(offset, length)?,
+    })))
+}
+
+/// Position of a [`RangeReader`] inside its opened range; enforces the
+/// in-range, forward-only contract of [`RangeReader::read_at`].
+#[derive(Debug, Clone, Copy)]
+pub struct RangeCursor {
+    start: u64,
+    end: u64,
+    pos: u64,
+}
+
+impl RangeCursor {
+    /// A cursor at the start of `[offset, offset + length)`.
+    ///
+    /// # Errors
+    ///
+    /// When the range end overflows `u64`.
+    pub fn new(offset: u64, length: u64) -> Result<Self> {
+        let end = offset
+            .checked_add(length)
+            .ok_or_else(|| VykarError::Other(format!("range overflows: {offset}+{length}")))?;
+        Ok(Self {
+            start: offset,
+            end,
+            pos: offset,
+        })
+    }
+
+    /// Validate the next piece and advance past it. Returns the piece's
+    /// offset relative to the start of the range.
+    ///
+    /// # Errors
+    ///
+    /// When the piece goes backwards or leaves the range.
+    pub fn advance(&mut self, offset: u64, len: usize) -> Result<u64> {
+        let piece_end = u64::try_from(len)
+            .ok()
+            .and_then(|l| offset.checked_add(l))
+            .filter(|&e| offset >= self.pos && e <= self.end)
+            .ok_or_else(|| {
+                VykarError::Other(format!(
+                    "range read {offset}+{len} outside [{}, {}) or before {}",
+                    self.start, self.end, self.pos
+                ))
+            })?;
+        self.pos = piece_end;
+        Ok(offset - self.start)
+    }
+}
+
+struct BufferedRange<'a> {
+    buf: &'a mut Vec<u8>,
+    cursor: RangeCursor,
+}
+
+impl RangeReader for BufferedRange<'_> {
+    fn read_at(&mut self, offset: u64, len: usize) -> Result<&mut [u8]> {
+        let rel = self.cursor.advance(offset, len)?;
+        let rel = usize::try_from(rel)
+            .map_err(|_| VykarError::Other(format!("range offset too large: {rel}")))?;
+        // `get_range_into` filled exactly `length` bytes, and the cursor keeps
+        // every piece inside that length.
+        self.buf
+            .get_mut(rel..rel + len)
+            .ok_or_else(|| VykarError::Other("range piece beyond buffered bytes".into()))
+    }
 }
 
 /// One entry of [`StorageBackend::list_sized`].

@@ -283,7 +283,7 @@ impl InnerBackend for RecordingBackend {
 
 delegate_storage_backend! {
     for RecordingBackend;
-    except [put, get_range, get_range_into, put_owned, begin_staged_put];
+    except [put, get_range, get_range_into, open_range, put_owned, begin_staged_put];
 
     // Keep packs on the intercepted `put` path. Recorded puts must see every pack.
     fn begin_staged_put(
@@ -314,6 +314,17 @@ delegate_storage_backend! {
     ) -> Result<bool> {
         self.log.record_get_range();
         self.inner.get_range_into(key, offset, length, buf)
+    }
+
+    // One recorded range read per opened range, through `get_range_into`.
+    fn open_range<'a>(
+        &self,
+        key: &str,
+        offset: u64,
+        length: u64,
+        buf: &'a mut Vec<u8>,
+    ) -> Result<Option<Box<dyn vykar_storage::RangeReader + 'a>>> {
+        vykar_storage::buffered_range(self, key, offset, length, buf)
     }
 
     fn put_owned(&self, key: &str, data: Vec<u8>) -> Result<()> {

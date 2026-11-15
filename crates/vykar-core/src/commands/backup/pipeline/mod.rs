@@ -1,7 +1,9 @@
 //! Parallel file processing pipeline (crossbeam-channel).
 //!
 //! Walk → bounded work channel → N worker threads → bounded result channel
-//! → reorder buffer → sequential consumer.
+//! → reorder buffer → sequential consumer. Entries that need no file read
+//! (cache hits, non-file items, skips) skip the workers: the walk thread
+//! sends them straight to the result channel in batches.
 //!
 //! This file is the orchestrator: it owns the `thread::scope`, the channels,
 //! the `ByteBudget`, and the reorder buffer / skip-drain state machine that
@@ -145,16 +147,87 @@ pub(super) enum ProcessedEntry {
 /// Result from the pipeline's internal channels.
 ///
 /// Workers send `Ok` or `WorkerErr` (both carrying a sequence index for
-/// reordering). The walk thread sends `WalkErr` for fail-fast errors that
-/// need no reordering.
+/// reordering). The walk thread sends `Batch` for runs of entries that need
+/// no file read, and `WalkErr` for fail-fast errors that need no reordering.
 enum PipelineResult {
     /// Successful processing — `(seq_idx, entry)`.
     Ok(usize, Box<ProcessedEntry>),
     /// Worker error — `(seq_idx, error)`. Delivered in order via the
     /// reorder buffer so earlier successes are committed first.
     WorkerErr(usize, VykarError),
+    /// Consecutive entries converted by the walk thread itself (cache hits,
+    /// non-file items, walk-time skips, source markers) — `(first_seq_idx,
+    /// entries)`, covering `first_seq_idx..first_seq_idx + entries.len()`.
+    /// Skipping the worker hop for these avoids two channel crossings per
+    /// entry, which dominate an incremental backup where nearly every file
+    /// is a cache hit.
+    Batch(usize, Vec<ProcessedEntry>),
     /// Walk-thread error — no index, triggers immediate fail-fast.
     WalkErr(VykarError),
+}
+
+/// Maximum entries per [`PipelineResult::Batch`]. Bounds both the consumer's
+/// wait for the first entry of a batch and the memory a full result channel
+/// holds (`result_cap` batches).
+const WALK_BATCH_CAP: usize = 128;
+
+/// A reorder-buffer slot: one worker result or one walk-thread batch.
+enum PendingSlot {
+    One(std::result::Result<Box<ProcessedEntry>, VykarError>),
+    Batch(Vec<ProcessedEntry>),
+}
+
+/// Reorders out-of-order pipeline results back into walk (sequence) order.
+///
+/// Every sequence index is covered by exactly one slot: a single worker
+/// result, or a position inside a batch keyed by its first index.
+struct ReorderBuffer {
+    next_expected: usize,
+    pending: BTreeMap<usize, PendingSlot>,
+    /// Remaining entries of the batch being drained; the next one has
+    /// sequence index `next_expected`.
+    current: std::vec::IntoIter<ProcessedEntry>,
+}
+
+impl ReorderBuffer {
+    fn new() -> Self {
+        Self {
+            next_expected: 0,
+            pending: BTreeMap::new(),
+            current: Vec::new().into_iter(),
+        }
+    }
+
+    fn insert_one(
+        &mut self,
+        idx: usize,
+        result: std::result::Result<Box<ProcessedEntry>, VykarError>,
+    ) {
+        self.pending.insert(idx, PendingSlot::One(result));
+    }
+
+    fn insert_batch(&mut self, first_idx: usize, entries: Vec<ProcessedEntry>) {
+        if !entries.is_empty() {
+            self.pending.insert(first_idx, PendingSlot::Batch(entries));
+        }
+    }
+
+    /// Next result in sequence order, or `None` if it has not arrived yet.
+    fn pop_ready(&mut self) -> Option<std::result::Result<ProcessedEntry, VykarError>> {
+        loop {
+            if let Some(entry) = self.current.next() {
+                self.next_expected += 1;
+                return Some(Ok(entry));
+            }
+            match self.pending.remove(&self.next_expected)? {
+                PendingSlot::One(result) => {
+                    self.next_expected += 1;
+                    return Some(result.map(|entry| *entry));
+                }
+                PendingSlot::Batch(entries) => self.current = entries.into_iter(),
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -278,6 +351,24 @@ pub(crate) fn run_parallel_pipeline(
                 parent_reuse_index,
             );
 
+            // Entries needing no file read are converted here and sent to
+            // the consumer in batches. The open batch holds sequence indices
+            // the consumer may need before it can release budget, so it MUST
+            // be flushed before any `reserve_budget` call (which can block)
+            // and before sending a work item; also at walk end / on error.
+            let mut batch: Vec<ProcessedEntry> = Vec::new();
+            let mut batch_start: usize = 0;
+            // Returns false if the consumer is gone.
+            let flush = |batch: &mut Vec<ProcessedEntry>, batch_start: usize| -> bool {
+                if batch.is_empty() {
+                    return true;
+                }
+                let entries = std::mem::take(batch);
+                walk_result_tx
+                    .send(PipelineResult::Batch(batch_start, entries))
+                    .is_ok()
+            };
+
             let mut seq_idx: usize = 0;
             for entry_result in walk_iter {
                 if shutdown.is_some_and(|f| f.load(Ordering::Relaxed)) {
@@ -285,6 +376,25 @@ pub(crate) fn run_parallel_pipeline(
                 }
                 match entry_result {
                     Ok(entry) => {
+                        let entry = match worker::into_processed_without_read(entry) {
+                            Ok(processed) => {
+                                if batch.is_empty() {
+                                    batch_start = seq_idx;
+                                    batch.reserve_exact(WALK_BATCH_CAP);
+                                }
+                                batch.push(processed);
+                                seq_idx += 1;
+                                if batch.len() >= WALK_BATCH_CAP && !flush(&mut batch, batch_start)
+                                {
+                                    return;
+                                }
+                                continue;
+                            }
+                            Err(entry) => entry,
+                        };
+                        if !flush(&mut batch, batch_start) {
+                            return;
+                        }
                         let acquired = match reserve_budget(&entry, budget_ref) {
                             Ok(n) => n,
                             Err(_) => {
@@ -301,12 +411,16 @@ pub(crate) fn run_parallel_pipeline(
                         seq_idx += 1;
                     }
                     Err(e) => {
-                        // Walk error: fail-fast, no index needed.
-                        let _ = walk_result_tx.send(PipelineResult::WalkErr(e));
+                        // Walk error: fail-fast, no index needed. Deliver
+                        // the entries walked before it first.
+                        if flush(&mut batch, batch_start) {
+                            let _ = walk_result_tx.send(PipelineResult::WalkErr(e));
+                        }
                         return;
                     }
                 }
             }
+            let _ = flush(&mut batch, batch_start);
             // work_tx drops here → workers drain remaining items and exit.
         });
 
@@ -344,9 +458,7 @@ pub(crate) fn run_parallel_pipeline(
         drop(result_tx);
 
         // --- Stage C: Consumer with reorder buffer ---
-        let mut next_expected: usize = 0;
-        let mut pending: BTreeMap<usize, std::result::Result<ProcessedEntry, VykarError>> =
-            BTreeMap::new();
+        let mut reorder = ReorderBuffer::new();
         let mut consume_err: Option<VykarError> = None;
         let mut large_file_accum: Option<LargeFileAccum> = None;
         // When segment 0 is skipped, we drain remaining segments silently.
@@ -364,11 +476,10 @@ pub(crate) fn run_parallel_pipeline(
                 break;
             }
             match msg {
-                PipelineResult::Ok(idx, entry) => {
-                    pending.insert(idx, Ok(*entry));
-                }
-                PipelineResult::WorkerErr(idx, e) => {
-                    pending.insert(idx, Err(e));
+                PipelineResult::Ok(idx, entry) => reorder.insert_one(idx, Ok(entry)),
+                PipelineResult::WorkerErr(idx, e) => reorder.insert_one(idx, Err(e)),
+                PipelineResult::Batch(first_idx, entries) => {
+                    reorder.insert_batch(first_idx, entries);
                 }
                 PipelineResult::WalkErr(e) => {
                     if e.is_soft_file_error() {
@@ -387,10 +498,8 @@ pub(crate) fn run_parallel_pipeline(
                 }
             }
 
-            // Drain consecutive entries starting from next_expected.
-            while let Some(result) = pending.remove(&next_expected) {
-                next_expected += 1;
-
+            // Drain consecutive entries in sequence order.
+            while let Some(result) = reorder.pop_ready() {
                 // Draining remaining segments of a skipped file.
                 if segments_to_skip > 0 {
                     if let Ok(ProcessedEntry::FileSegment { acquired_bytes, .. }) = &result {
@@ -731,8 +840,8 @@ mod tests {
                     PipelineResult::Ok(idx, entry) => {
                         pending.insert(idx, *entry);
                     }
-                    PipelineResult::WorkerErr(_, _) => {
-                        panic!("workers do not produce errors in this test")
+                    PipelineResult::WorkerErr(_, _) | PipelineResult::Batch(..) => {
+                        panic!("not produced in this test")
                     }
                     PipelineResult::WalkErr(e) => {
                         budget_ref.poison();
@@ -867,5 +976,93 @@ mod tests {
             "full budget should be available after panic cleanup"
         );
         budget.release(200);
+    }
+
+    fn source_marker(i: usize) -> ProcessedEntry {
+        ProcessedEntry::SourceStarted {
+            path: format!("e{i}"),
+        }
+    }
+
+    fn marker_index(r: std::result::Result<ProcessedEntry, VykarError>) -> String {
+        match r {
+            Ok(ProcessedEntry::SourceStarted { path }) => path,
+            Ok(_) => panic!("unexpected entry"),
+            Err(e) => format!("err:{e}"),
+        }
+    }
+
+    /// Batches and single results arriving out of order must come back in
+    /// exact sequence order, with batches advancing by their length.
+    #[test]
+    fn reorder_buffer_interleaves_batches_and_singles() {
+        let mut r = ReorderBuffer::new();
+        // Layout: [0..3) batch, 3 single, 4 error, [5..7) batch, 7 single.
+        r.insert_one(7, Ok(Box::new(source_marker(7))));
+        r.insert_batch(5, vec![source_marker(5), source_marker(6)]);
+        assert!(r.pop_ready().is_none());
+        r.insert_one(3, Ok(Box::new(source_marker(3))));
+        assert!(r.pop_ready().is_none());
+        r.insert_batch(0, (0..3).map(source_marker).collect());
+        let got: Vec<String> = std::iter::from_fn(|| r.pop_ready())
+            .map(marker_index)
+            .collect();
+        assert_eq!(got, ["e0", "e1", "e2", "e3"]);
+        r.insert_one(4, Err(VykarError::Other("boom".into())));
+        let got: Vec<String> = std::iter::from_fn(|| r.pop_ready())
+            .map(marker_index)
+            .collect();
+        assert_eq!(got, ["err:boom", "e5", "e6", "e7"]);
+        assert_eq!(r.next_expected, 8);
+        // An empty batch covers no index and must not stall the buffer.
+        r.insert_batch(8, Vec::new());
+        r.insert_one(8, Ok(Box::new(source_marker(8))));
+        assert_eq!(r.pop_ready().map(marker_index).as_deref(), Some("e8"));
+        assert!(r.pop_ready().is_none());
+    }
+
+    /// The walk thread converts every non-read entry itself; File and
+    /// FileSegment must be handed back for the workers.
+    #[test]
+    fn into_processed_without_read_splits_read_entries() {
+        use test_support::test_metadata;
+        let file = WalkEntry::File {
+            item: test_item("a"),
+            abs_path: "/a".into(),
+            metadata: test_metadata(),
+            file_size: 1024,
+        };
+        assert!(matches!(
+            worker::into_processed_without_read(file),
+            Err(WalkEntry::File { .. })
+        ));
+        let seg = WalkEntry::FileSegment {
+            item: None,
+            abs_path: Arc::from("/b"),
+            metadata: test_metadata(),
+            segment_index: 1,
+            num_segments: 2,
+            offset: 0,
+            len: 10,
+        };
+        assert!(matches!(
+            worker::into_processed_without_read(seg),
+            Err(WalkEntry::FileSegment { .. })
+        ));
+        let nonfile = WalkEntry::NonFile {
+            item: test_item("d"),
+        };
+        assert!(matches!(
+            worker::into_processed_without_read(nonfile),
+            Ok(ProcessedEntry::NonFile { .. })
+        ));
+        let skipped = WalkEntry::Skipped {
+            path: "p".into(),
+            reason: "r".into(),
+        };
+        assert!(matches!(
+            worker::into_processed_without_read(skipped),
+            Ok(ProcessedEntry::WalkSkip { .. })
+        ));
     }
 }

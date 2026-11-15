@@ -19,7 +19,7 @@ use crate::limits::ByteRateLimiter;
 use crate::platform::fs;
 use vykar_crypto::CryptoEngine;
 use vykar_types::chunk_id::{ChunkHasher, ChunkId};
-use vykar_types::error::Result;
+use vykar_types::error::{Result, VykarError};
 
 use super::super::chunk_process::classify_chunk;
 use super::super::concurrency::{BudgetGuard, ByteBudget};
@@ -199,36 +199,57 @@ pub(super) fn process_file_worker(
             }
         }
 
+        // The walk thread converts these itself; kept for completeness.
+        other => match into_processed_without_read(other) {
+            Ok(processed) => Ok(processed),
+            Err(_) => Err(VykarError::Other(
+                "internal: file entry not handled by worker".into(),
+            )),
+        },
+    }
+}
+
+/// Convert a walk entry that needs no file read (cache hit, non-file item,
+/// walk-time skip, source marker) straight into its `ProcessedEntry`.
+///
+/// Returns the entry unchanged as `Err` for `File` / `FileSegment`, which
+/// need a worker. Used by both the worker and the walk thread, which sends
+/// these entries to the consumer in batches without a worker hop.
+#[allow(clippy::result_large_err)] // `Err` hands the entry back unchanged; same size as `Ok`.
+pub(super) fn into_processed_without_read(
+    entry: WalkEntry,
+) -> std::result::Result<ProcessedEntry, WalkEntry> {
+    Ok(match entry {
+        e @ (WalkEntry::File { .. } | WalkEntry::FileSegment { .. }) => return Err(e),
+
         WalkEntry::CacheHit {
             item,
             abs_path,
             metadata,
             cached_refs,
             retained,
-        } => Ok(ProcessedEntry::CacheHit {
+        } => ProcessedEntry::CacheHit {
             item,
             abs_path,
             metadata,
             cached_refs,
             retained,
-        }),
+        },
 
-        WalkEntry::NonFile { item } => Ok(ProcessedEntry::NonFile { item }),
+        WalkEntry::NonFile { item } => ProcessedEntry::NonFile { item },
 
-        WalkEntry::Skipped { path, reason } => Ok(ProcessedEntry::WalkSkip { path, reason }),
+        WalkEntry::Skipped { path, reason } => ProcessedEntry::WalkSkip { path, reason },
 
-        WalkEntry::SkippedDataless { path, kind } => {
-            Ok(ProcessedEntry::DatalessSkipped { path, kind })
-        }
+        WalkEntry::SkippedDataless { path, kind } => ProcessedEntry::DatalessSkipped { path, kind },
 
         WalkEntry::SkippedUnsupported { path, file_type } => {
-            Ok(ProcessedEntry::UnsupportedSkipped { path, file_type })
+            ProcessedEntry::UnsupportedSkipped { path, file_type }
         }
 
-        WalkEntry::SourceStarted { path } => Ok(ProcessedEntry::SourceStarted { path }),
+        WalkEntry::SourceStarted { path } => ProcessedEntry::SourceStarted { path },
 
-        WalkEntry::SourceFinished { path } => Ok(ProcessedEntry::SourceFinished { path }),
-    }
+        WalkEntry::SourceFinished { path } => ProcessedEntry::SourceFinished { path },
+    })
 }
 
 #[cfg(test)]

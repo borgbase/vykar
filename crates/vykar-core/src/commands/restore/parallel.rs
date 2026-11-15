@@ -370,7 +370,10 @@ pub(super) fn execute_parallel_restore(
     std::thread::scope(|s| {
         let mut handles = Vec::with_capacity(buckets.len());
 
-        for bucket in &buckets {
+        // Each worker owns its bucket and drops every group (and its blob
+        // list) as soon as it is processed, instead of the whole batch's plan
+        // staying alive until the slowest worker finishes.
+        for bucket in buckets {
             let bytes_written = &bytes_written;
             let cancelled = &cancelled;
 
@@ -386,7 +389,7 @@ pub(super) fn execute_parallel_restore(
                         return Ok(());
                     }
                     if let Err(e) = process_read_group(
-                        group,
+                        &group,
                         files,
                         storage,
                         crypto,

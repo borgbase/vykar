@@ -4,6 +4,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 use smallvec::SmallVec;
 
@@ -144,9 +145,10 @@ pub(super) type Xattrs = HashMap<String, Vec<u8>>;
 /// A directory or symlink node whose ownership/xattrs/mode/mtime are applied in
 /// a deferred, deepest-first pass after all children have landed. `path` is the
 /// absolute temp path (built from `dest_root` == `temp_root`), so finalizers
-/// need no re-join.
+/// need no re-join. A directory's path is shared with its [`VerifiedDirs`]
+/// entry rather than stored twice.
 pub(super) struct PlannedNode {
-    pub(super) path: PathBuf,
+    pub(super) path: Arc<Path>,
     pub(super) mode: u32,
     pub(super) mtime: i64,
     pub(super) uid: u32,
@@ -156,6 +158,10 @@ pub(super) struct PlannedNode {
     /// [`PlannedFile::xattrs`].
     pub(super) xattrs: Option<Box<Xattrs>>,
 }
+
+/// Absolute temp paths of the directories this restore created or validated
+/// (plus the root); lookups take a plain `&Path`.
+pub(super) type VerifiedDirs = HashSet<Arc<Path>>;
 
 /// Deferred directory/symlink metadata accumulated during streaming, applied
 /// after the file passes complete (see `finalize::apply_dir_metadata` /
@@ -219,12 +225,12 @@ where
     B: FnMut(
         Vec<PlannedFile>,
         HashMap<ChunkId, ChunkTargets>,
-        &HashSet<PathBuf>,
+        &VerifiedDirs,
         &mut RestoreStats,
     ) -> Result<()>,
 {
-    let mut verified_dirs: HashSet<PathBuf> = HashSet::new();
-    verified_dirs.insert(dest_root.to_path_buf());
+    let mut verified_dirs = VerifiedDirs::new();
+    verified_dirs.insert(Arc::from(dest_root));
     let mut planned_files: Vec<PlannedFile> = Vec::new();
     let mut chunk_targets: HashMap<ChunkId, ChunkTargets> = HashMap::new();
     let mut planned_dirs: Vec<PlannedNode> = Vec::new();
@@ -251,7 +257,7 @@ where
                 // parent created for an earlier child. `create_dir_all` alone
                 // would follow a symlink at `target` and accept it as a dir.
                 match std::fs::symlink_metadata(&target) {
-                    Ok(md) if md.is_dir() && !verified_dirs.contains(&target) => {}
+                    Ok(md) if md.is_dir() && !verified_dirs.contains(target.as_path()) => {}
                     Ok(_) => return Err(conflicting_entries(&rel_scratch)),
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                         std::fs::create_dir_all(&target)?;
@@ -269,8 +275,9 @@ where
                     &target,
                     "mode",
                 );
+                let target: Arc<Path> = Arc::from(target);
                 planned_dirs.push(PlannedNode {
-                    path: target.clone(),
+                    path: Arc::clone(&target),
                     mode: item.mode,
                     mtime: item.mtime,
                     uid: item.uid,
@@ -318,7 +325,7 @@ where
                     // ownership lands before xattrs (chown clears capabilities)
                     // and mtime is the last write to the inode.
                     planned_symlinks.push(PlannedNode {
-                        path: target,
+                        path: Arc::from(target),
                         mode: 0,
                         mtime: item.mtime,
                         uid: item.uid,
@@ -551,7 +558,7 @@ pub(super) fn conflicting_entries(rel_path: &Path) -> VykarError {
 pub(super) fn stage_batch_files(
     files: &[PlannedFile],
     temp_root: &Path,
-    verified_dirs: &HashSet<PathBuf>,
+    verified_dirs: &VerifiedDirs,
     shutdown: Option<&AtomicBool>,
 ) -> Result<()> {
     for pf in files {
@@ -706,11 +713,11 @@ mod tests {
     ) -> Result<(
         Vec<PlannedFile>,
         HashMap<ChunkId, ChunkTargets>,
-        HashSet<PathBuf>,
+        VerifiedDirs,
     )> {
         let mut all_files: Vec<PlannedFile> = Vec::new();
         let mut all_chunks: HashMap<ChunkId, ChunkTargets> = HashMap::new();
-        let mut all_verified: HashSet<PathBuf> = HashSet::new();
+        let mut all_verified = VerifiedDirs::new();
         let mut group_reps: HashMap<HardlinkId, RepInfo> = HashMap::new();
         let mut pending_links: Vec<PendingLink> = Vec::new();
         stream_and_plan(
@@ -1287,7 +1294,7 @@ mod tests {
 
         // Directory exists and is in verified_dirs.
         assert!(dest.join("mydir").is_dir());
-        assert!(verified_dirs.contains(&dest.join("mydir")));
+        assert!(verified_dirs.contains(dest.join("mydir").as_path()));
 
         // Symlink was created and points to the right target.
         let link_path = dest.join("mydir/link");
@@ -1337,7 +1344,7 @@ mod tests {
 
         // Directory exists with correct mode.
         assert!(dest.join("mydir").is_dir());
-        assert!(verified_dirs.contains(&dest.join("mydir")));
+        assert!(verified_dirs.contains(dest.join("mydir").as_path()));
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1607,7 +1614,7 @@ mod tests {
         let stream = serialize_items(&items);
 
         let mut flush_calls = 0usize;
-        let mut last_verified: HashSet<PathBuf> = HashSet::new();
+        let mut last_verified = VerifiedDirs::new();
         let mut stats = RestoreStats::default();
         let mut group_reps: HashMap<HardlinkId, RepInfo> = HashMap::new();
         let mut pending_links: Vec<PendingLink> = Vec::new();
@@ -1632,7 +1639,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(flush_calls, 1);
-        assert!(last_verified.contains(&dest.join("only-a-dir")));
+        assert!(last_verified.contains(dest.join("only-a-dir").as_path()));
     }
 
     // -----------------------------------------------------------------------
@@ -1866,7 +1873,7 @@ mod tests {
     #[cfg(target_pointer_width = "64")]
     fn plan_entry_sizes() {
         assert_eq!(std::mem::size_of::<PlannedFile>(), 56);
-        assert_eq!(std::mem::size_of::<PlannedNode>(), 56);
+        assert_eq!(std::mem::size_of::<PlannedNode>(), 48);
         assert_eq!(std::mem::size_of::<ChunkTargets>(), 32);
         assert_eq!(
             std::mem::size_of::<super::super::read_groups::PlannedBlob>(),

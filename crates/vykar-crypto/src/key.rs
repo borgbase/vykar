@@ -10,6 +10,8 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use vykar_types::error::{Result, VykarError};
 
+use crate::kdf_memory::KdfMemory;
+
 /// The master key material — never stored in plaintext on disk.
 /// Automatically zeroized on drop to prevent key material from lingering in memory.
 #[derive(Zeroize, ZeroizeOnDrop)]
@@ -383,11 +385,19 @@ fn derive_key_from_passphrase(
 ) -> Result<Zeroizing<[u8; 32]>> {
     let params = argon2::Params::new(kdf.memory_cost, kdf.time_cost, kdf.parallelism, Some(32))
         .map_err(|e| VykarError::KeyDerivation(format!("argon2 params: {e}")))?;
+    let mut memory = KdfMemory::new(params.block_count()).map_err(|e| {
+        VykarError::KeyDerivation(format!("argon2: out of memory for KDF buffer: {e}"))
+    })?;
     let argon2 = Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
 
     let mut output = Zeroizing::new([0u8; 32]);
     argon2
-        .hash_password_into(passphrase.as_ref(), &kdf.salt, output.as_mut())
+        .hash_password_into_with_memory(
+            passphrase.as_ref(),
+            &kdf.salt,
+            output.as_mut(),
+            memory.as_blocks_mut(),
+        )
         .map_err(|e| VykarError::KeyDerivation(format!("argon2 hash: {e}")))?;
     Ok(output)
 }

@@ -1,4 +1,5 @@
-#![forbid(unsafe_code)]
+// The only exception is the KDF work buffer in `kdf_memory`.
+#![deny(unsafe_code)]
 #![cfg_attr(
     test,
     allow(
@@ -9,6 +10,7 @@
     )
 )]
 
+mod kdf_memory;
 pub mod key;
 pub mod select;
 

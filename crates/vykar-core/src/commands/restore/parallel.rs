@@ -903,7 +903,7 @@ mod tests {
         file.set_len(5).unwrap();
 
         let files = vec![PlannedFile {
-            rel_path: PathBuf::from("out.bin"),
+            rel_path: PathBuf::from("out.bin").into(),
             total_size: 5,
             mode: 0o644,
             mtime: 0,
@@ -986,7 +986,7 @@ mod tests {
         let packed = pack_blob(cid, &big_data, &crypto);
 
         let files = vec![PlannedFile {
-            rel_path: PathBuf::from("big.bin"),
+            rel_path: PathBuf::from("big.bin").into(),
             total_size: big_data.len() as u64,
             mode: 0o644,
             mtime: 0,
@@ -1058,7 +1058,7 @@ mod tests {
 
         let total_size = (chunk_a.len() + chunk_b.len()) as u64;
         let files = vec![PlannedFile {
-            rel_path: PathBuf::from("exact.bin"),
+            rel_path: PathBuf::from("exact.bin").into(),
             total_size,
             mode: 0o644,
             mtime: 0,
@@ -1145,7 +1145,7 @@ mod tests {
 
         let files = vec![
             PlannedFile {
-                rel_path: PathBuf::from("a.bin"),
+                rel_path: PathBuf::from("a.bin").into(),
                 total_size: data_a.len() as u64,
                 mode: 0o644,
                 mtime: 0,
@@ -1154,7 +1154,7 @@ mod tests {
                 xattrs: None,
             },
             PlannedFile {
-                rel_path: PathBuf::from("b.bin"),
+                rel_path: PathBuf::from("b.bin").into(),
                 total_size: data_b.len() as u64,
                 mode: 0o644,
                 mtime: 0,
@@ -1253,7 +1253,7 @@ mod tests {
         }
 
         let files = vec![PlannedFile {
-            rel_path: PathBuf::from("batched.bin"),
+            rel_path: PathBuf::from("batched.bin").into(),
             total_size: expected_data.len() as u64,
             mode: 0o644,
             mtime: 0,
@@ -1312,7 +1312,7 @@ mod tests {
         let packed = pack_blob(cid, payload, &crypto);
 
         let files = vec![PlannedFile {
-            rel_path: PathBuf::from("good.bin"),
+            rel_path: PathBuf::from("good.bin").into(),
             total_size: payload.len() as u64,
             mode: 0o644,
             mtime: 0,
@@ -1407,7 +1407,7 @@ mod tests {
         let packed = pack_blob(wrong_cid, payload, &crypto);
 
         let files = vec![PlannedFile {
-            rel_path: PathBuf::from("bad.bin"),
+            rel_path: PathBuf::from("bad.bin").into(),
             total_size: payload.len() as u64,
             mode: 0o644,
             mtime: 0,
@@ -1465,7 +1465,7 @@ mod tests {
         packed[pos + payload.len() / 2] ^= 0x01;
 
         let files = vec![PlannedFile {
-            rel_path: PathBuf::from("bad.bin"),
+            rel_path: PathBuf::from("bad.bin").into(),
             total_size: payload.len() as u64,
             mode: 0o644,
             mtime: 0,
@@ -1517,7 +1517,7 @@ mod tests {
         std::os::unix::fs::symlink(&victim, root.join("x")).unwrap();
 
         let files = vec![PlannedFile {
-            rel_path: PathBuf::from("x"),
+            rel_path: PathBuf::from("x").into(),
             total_size: 4,
             mode: 0o644,
             mtime: 0,
@@ -1589,7 +1589,7 @@ mod tests {
 
     fn one_file_plan(payload_len: u64) -> Vec<PlannedFile> {
         vec![PlannedFile {
-            rel_path: PathBuf::from("out.bin"),
+            rel_path: PathBuf::from("out.bin").into(),
             total_size: payload_len,
             mode: 0o644,
             mtime: 0,
@@ -1686,7 +1686,7 @@ mod tests {
         let storage: Arc<dyn StorageBackend> = backend;
 
         let files = vec![PlannedFile {
-            rel_path: PathBuf::from("out.bin"),
+            rel_path: PathBuf::from("out.bin").into(),
             total_size: payload.len() as u64,
             mode: 0o644,
             mtime: 0,
@@ -1733,7 +1733,7 @@ mod tests {
 
     fn file(name: &str, size: u64) -> PlannedFile {
         PlannedFile {
-            rel_path: PathBuf::from(name),
+            rel_path: PathBuf::from(name).into(),
             total_size: size,
             mode: 0o644,
             mtime: 0,

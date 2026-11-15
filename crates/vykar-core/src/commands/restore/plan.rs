@@ -124,7 +124,9 @@ pub(super) struct WriteTarget {
 
 /// Output file metadata for post-restore attribute application.
 pub(super) struct PlannedFile {
-    pub(super) rel_path: PathBuf,
+    /// `Box<Path>`, not `PathBuf`: an exact-size allocation (no growth slack)
+    /// and 8 bytes smaller per entry.
+    pub(super) rel_path: Box<Path>,
     pub(super) total_size: u64,
     pub(super) mode: u32,
     pub(super) mtime: i64,
@@ -436,12 +438,11 @@ where
                                 ))
                             })?;
                 }
-                // Hand the scratch buffer's allocation to the PlannedFile and
-                // re-init scratch — the next sanitize_item_into call
-                // resizes the fresh buffer to its needs. This avoids the
-                // per-file PathBuf clone the scratch was meant to eliminate.
+                // One exact-size copy of the scratch path, which keeps its
+                // allocation for the next item (handing the scratch buffer
+                // over instead would keep its push-growth slack per file).
                 planned_files.push(PlannedFile {
-                    rel_path: std::mem::take(&mut rel_scratch),
+                    rel_path: rel_scratch.as_path().into(),
                     total_size: file_offset,
                     mode: item.mode,
                     mtime: item.mtime,
@@ -793,7 +794,7 @@ mod tests {
             collect_with_hardlinks(&stream, dest, |_| true, &mut stats).unwrap();
 
         assert_eq!(files.len(), 1, "only the representative is a PlannedFile");
-        assert_eq!(files[0].rel_path, Path::new("a.txt"));
+        assert_eq!(*files[0].rel_path, *Path::new("a.txt"));
         assert_eq!(group_reps.len(), 1);
         assert_eq!(pending_links.len(), 1);
         assert_eq!(pending_links[0].link_rel, Path::new("b.txt"));
@@ -883,7 +884,7 @@ mod tests {
                 .unwrap();
 
         assert_eq!(files.len(), 1, "the survivor self-materializes");
-        assert_eq!(files[0].rel_path, Path::new("included/b.txt"));
+        assert_eq!(*files[0].rel_path, *Path::new("included/b.txt"));
         assert!(
             pending_links.is_empty(),
             "no link to a filtered representative"
@@ -1180,7 +1181,7 @@ mod tests {
 
         // File is in planned_files.
         assert_eq!(planned_files.len(), 1);
-        assert_eq!(planned_files[0].rel_path, Path::new("mydir/a.txt"));
+        assert_eq!(*planned_files[0].rel_path, *Path::new("mydir/a.txt"));
         assert_eq!(chunk_targets.len(), 1);
     }
 
@@ -1214,7 +1215,7 @@ mod tests {
 
         // Only the included file is planned.
         assert_eq!(planned_files.len(), 1);
-        assert_eq!(planned_files[0].rel_path, Path::new("included/a.txt"));
+        assert_eq!(*planned_files[0].rel_path, *Path::new("included/a.txt"));
     }
 
     #[test]
@@ -1350,7 +1351,7 @@ mod tests {
 
         // File is in planned_files.
         assert_eq!(planned_files.len(), 1);
-        assert_eq!(planned_files[0].rel_path, Path::new("mydir/a.txt"));
+        assert_eq!(*planned_files[0].rel_path, *Path::new("mydir/a.txt"));
         assert_eq!(chunk_targets.len(), 1);
         assert_eq!(stats.dirs, 1);
     }
@@ -1864,7 +1865,7 @@ mod tests {
     #[test]
     #[cfg(target_pointer_width = "64")]
     fn plan_entry_sizes() {
-        assert_eq!(std::mem::size_of::<PlannedFile>(), 64);
+        assert_eq!(std::mem::size_of::<PlannedFile>(), 56);
         assert_eq!(std::mem::size_of::<PlannedNode>(), 56);
     }
 }

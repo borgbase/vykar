@@ -186,7 +186,7 @@ mod tests {
                 )));
             }
             files.push(PlannedFile {
-                rel_path: target_path.clone(),
+                rel_path: target_path.as_path().into(),
                 total_size: file_offset,
                 mode: item.mode,
                 mtime: item.mtime,

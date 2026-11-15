@@ -400,7 +400,7 @@ pub(super) fn create_hardlinks(
                             None
                         };
                         let pf = PlannedFile {
-                            rel_path: link.link_rel.clone(),
+                            rel_path: link.link_rel.as_path().into(),
                             total_size: 0, // unused by apply_file_metadata
                             mode: rep_mode_on_disk(&rep_abs),
                             mtime: link.mtime,
@@ -859,7 +859,7 @@ mod tests {
     /// Build a `PlannedFile` for a file already written at `temp_root/rel`.
     fn planned(rel: &str, size: u64) -> PlannedFile {
         PlannedFile {
-            rel_path: PathBuf::from(rel),
+            rel_path: PathBuf::from(rel).into(),
             total_size: size,
             mode: 0o644,
             mtime: 0,

@@ -314,6 +314,11 @@ pub struct Repository {
     /// Independent read-only requests the commit may issue at once (pack
     /// verification). 1 = serial; backup sets it from `limits.connections`.
     request_concurrency: usize,
+    /// The advisory `index.gen` PUT that follows an index write, running in
+    /// the background so it overlaps the next request (the commit's fence
+    /// check). Joined by the next index write, by `save_state`, after the
+    /// commit's fence check, and on drop.
+    index_sidecar_write: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Repository {
@@ -457,6 +462,7 @@ impl Repository {
 
 impl Drop for Repository {
     fn drop(&mut self) {
+        self.join_index_sidecar_write();
         if self.write_session.is_some() {
             warn!("Repository dropped with active write session");
         }

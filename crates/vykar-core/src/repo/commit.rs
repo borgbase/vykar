@@ -250,6 +250,8 @@ impl Repository {
             .or_else(|_| self.reload_full_index())?;
         }
 
+        self.join_index_sidecar_write();
+
         // Now propagate any file cache save error
         fc_result?;
 
@@ -363,7 +365,11 @@ impl Repository {
 
         // ---- COMMIT POINT ----
         let ctx = emit_stage(progress, "write snapshot");
-        self.check_lock_fence()?;
+        // The fence check overlaps the index.gen PUT the index write left
+        // running; both finish before the snapshot PUT.
+        let fenced = self.check_lock_fence();
+        self.join_index_sidecar_write();
+        fenced?;
         self.storage
             .put(&snapshot_entry.id.storage_key(), &snapshot_packed)?;
         log_stage_elapsed(ctx);
@@ -653,10 +659,24 @@ impl Repository {
     /// raw-blob cache that the next run's fast path compares against. Only
     /// the `index` PUT is fatal — the sidecar and the cache are best-effort.
     fn put_index_blob(&mut self, index_packed: &[u8], generation: u64) -> Result<()> {
+        self.join_index_sidecar_write();
         self.check_lock_fence()?;
         self.storage.put("index", index_packed)?;
-        // Advisory sidecar — best-effort, non-fatal.
-        let _ = self.storage.put("index.gen", &generation.to_le_bytes());
+        // Advisory sidecar — best-effort, non-fatal — written in the
+        // background so its round trip overlaps the caller's next request.
+        // It still starts only after the index PUT succeeded.
+        let storage = std::sync::Arc::clone(&self.storage);
+        let spawned = std::thread::Builder::new()
+            .name("index-gen".into())
+            .spawn(move || {
+                let _ = storage.put("index.gen", &generation.to_le_bytes());
+            });
+        match spawned {
+            Ok(handle) => self.index_sidecar_write = Some(handle),
+            Err(_) => {
+                let _ = self.storage.put("index.gen", &generation.to_le_bytes());
+            }
+        }
         self.index_dirty = false;
 
         // Cache the raw blob for future fast-path checks (best-effort).
@@ -669,6 +689,13 @@ impl Repository {
             debug!("failed to write index blob cache: {e}");
         }
         Ok(())
+    }
+
+    /// Wait for the background `index.gen` write, if one is running.
+    pub(super) fn join_index_sidecar_write(&mut self) {
+        if let Some(handle) = self.index_sidecar_write.take() {
+            let _ = handle.join();
+        }
     }
 
     /// Rebuild all local caches: full index cache (1 sort), then derive

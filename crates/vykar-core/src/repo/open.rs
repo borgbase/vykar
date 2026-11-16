@@ -250,6 +250,7 @@ impl Repository {
             lock_fence: None,
             key_blob,
             request_concurrency: 1,
+            index_sidecar_write: None,
         })
     }
 
@@ -419,6 +420,7 @@ impl Repository {
             lock_fence: None,
             key_blob,
             request_concurrency: 1,
+            index_sidecar_write: None,
         };
         Ok((repo, file_cache_load))
     }

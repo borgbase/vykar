@@ -252,7 +252,7 @@ compression:
 
 # Optional resource limits for backup.
 # Bandwidth values are MiB/s (0 = unlimited).
-# threads=0 means auto mode: local repos use ceil(cores/2) clamped to [2, 4]; remote repos use min(cores, 12).
+# threads=0 means auto mode: local repos use ceil(cores/2) clamped to [2, 4]; remote repos use min(cores, 4).
 #
 # limits:
 #   connections: 2                 # Parallel backend ops (1-16)

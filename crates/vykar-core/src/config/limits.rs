@@ -4,8 +4,11 @@ use vykar_types::error::{Result, VykarError};
 
 /// Default number of parallel backend connections.
 const DEFAULT_CONNECTIONS: usize = 2;
-/// Auto mode cap for backup worker threads (`threads: 0`).
-const AUTO_THREADS_MAX: usize = 12;
+/// Auto mode cap for backup worker threads with a remote repository
+/// (`threads: 0`). Each worker adds 64 MiB to the pipeline buffer; four
+/// already produce well above what a remote upload sustains, so more only
+/// queue data in memory while the uploads catch up.
+const AUTO_THREADS_MAX_REMOTE: usize = 4;
 
 /// Minimum value for `limits.threads` (0 = auto).
 pub const THREADS_MIN: usize = 0;
@@ -20,7 +23,7 @@ pub struct ResourceLimitsConfig {
     #[serde(default = "default_connections")]
     pub connections: usize,
     /// CPU worker threads for backup transforms.
-    /// 0 = auto: local repos use ceil(cores/2) clamped to [2, 4]; remote repos use min(cores, 12). 1 = sequential.
+    /// 0 = auto: local repos use ceil(cores/2) clamped to [2, 4]; remote repos use min(cores, 4). 1 = sequential.
     #[serde(default)]
     pub threads: usize,
     /// Unix process niceness target (-20..19). 0 = unchanged. Applied to every
@@ -76,8 +79,8 @@ impl ResourceLimitsConfig {
 
     /// Auto-resolved backup worker count, accounting for backend locality.
     /// Local repos are I/O-bound and benefit from fewer workers to reduce
-    /// channel contention. Remote repos keep higher parallelism for
-    /// overlapping compress/encrypt with network I/O.
+    /// channel contention. Remote repos are upload-bound: more workers than
+    /// the uploads can drain only fill the pipeline buffer.
     pub fn effective_backup_threads(&self, is_local: bool) -> usize {
         if self.threads > 0 {
             return self.threads;
@@ -149,7 +152,7 @@ fn auto_backup_threads(cores: usize, is_local: bool) -> usize {
             cores.div_ceil(2).clamp(2, 4)
         }
     } else {
-        cores.min(AUTO_THREADS_MAX)
+        cores.min(AUTO_THREADS_MAX_REMOTE)
     }
 }
 
@@ -170,8 +173,9 @@ mod tests {
     fn auto_backup_threads_remote() {
         assert_eq!(auto_backup_threads(1, false), 1);
         assert_eq!(auto_backup_threads(2, false), 2);
-        assert_eq!(auto_backup_threads(8, false), 8);
-        assert_eq!(auto_backup_threads(24, false), 12);
+        assert_eq!(auto_backup_threads(4, false), 4);
+        assert_eq!(auto_backup_threads(8, false), 4);
+        assert_eq!(auto_backup_threads(24, false), 4);
     }
 
     #[test]

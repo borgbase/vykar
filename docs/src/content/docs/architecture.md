@@ -821,7 +821,7 @@ limits:
 ```
 
 Internal backup pipeline knobs are derived automatically:
-- `threads_effective = threads == 0 ? (local ? ceil(cores/2)∈[2,4] : min(cores, 12)) : threads`
+- `threads_effective = threads == 0 ? (local ? ceil(cores/2)∈[2,4] : min(cores, 4)) : threads`
 - `pipeline_depth = max(connections, 2)`
 - `pipeline_buffer_bytes = clamp(threads_effective * 64 MiB, 64 MiB..1 GiB)`
 - `segment_size = 64 MiB`, `transform_batch = 32 MiB`, `max_pending_actions = 8192`

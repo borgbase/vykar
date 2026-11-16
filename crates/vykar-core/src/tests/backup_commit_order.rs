@@ -348,3 +348,31 @@ fn many_pack_backup_commits() {
     );
     assert_eq!(repo_keys(&config, "snapshots/").len(), 1);
 }
+
+/// The commit records the new snapshot in the local snapshot list cache, so
+/// the next open does not have to download its blob again.
+#[test]
+fn commit_persists_snapshot_cache_immediately() {
+    use crate::tests::helpers::{backup_single_source, load_snapshot_cache_from_disk};
+
+    let (dir, config, src) = setup();
+    let repo_dir = dir.path().join("repo");
+
+    backup_single_source(&config, &src, "src-a", "snap-1");
+    let after_first = load_snapshot_cache_from_disk(&repo_dir);
+    assert!(
+        after_first.entries.values().any(|e| e.name == "snap-1"),
+        "committed snapshot missing from on-disk cache"
+    );
+
+    std::thread::sleep(Duration::from_millis(2));
+    backup_single_source(&config, &src, "src-a", "snap-2");
+    let after_second = load_snapshot_cache_from_disk(&repo_dir);
+    let mut names: Vec<_> = after_second
+        .entries
+        .values()
+        .map(|e| e.name.clone())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["snap-1", "snap-2"]);
+}

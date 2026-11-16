@@ -291,6 +291,10 @@ impl Repository {
         // the ordering visible next to the PUT; commit_finalize handles the rest.
         self.manifest.timestamp = Utc::now();
         self.manifest.snapshots.push(snapshot_entry);
+        // Keep the local snapshot list cache in step with the commit, so the
+        // next open does not re-download this snapshot's blob. Best-effort:
+        // the cache is pruned against `snapshots/` on every open.
+        self.persist_snapshot_cache_from_manifest();
 
         self.commit_finalize(new_file_cache, deferred_chunk_index_hydrate, progress);
         Ok(())
@@ -616,10 +620,11 @@ impl Repository {
     /// Persist the local snapshot list cache from the current in-memory
     /// manifest.
     ///
-    /// Delete/prune mutate `manifest.snapshots` in memory but do not touch the
-    /// persisted `snapshot_list` cache; without this the cache only self-heals
-    /// on the next `open()` via the remote-list retain. Calling this after a
-    /// mutation keeps the local cache consistent immediately.
+    /// Commit, delete and prune mutate `manifest.snapshots` in memory but do
+    /// not touch the persisted `snapshot_list` cache; without this the cache
+    /// only self-heals on the next `open()` (the remote-list retain drops
+    /// removed entries, and added ones are re-downloaded). Calling this after
+    /// a mutation keeps the local cache consistent immediately.
     ///
     /// Best-effort: failures are warned and swallowed, matching
     /// `refresh_snapshot_cache`'s save behavior — a stale cache is corrected on

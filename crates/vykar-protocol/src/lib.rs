@@ -132,6 +132,17 @@ pub struct SizedKey {
     pub size: u64,
 }
 
+// ── Batch object sizes (`POST /<dir>?sizes`) ──────────────────────────────
+
+/// Most keys one `POST /<dir>?sizes` request may name. Clients split larger
+/// batches; the server rejects a request above it with 400.
+///
+/// The request body is a JSON array of full keys, every one below `<dir>/`;
+/// the response is a JSON array of the same length and order holding each
+/// object's size in bytes, or `null` when it does not exist. A server that
+/// predates the endpoint answers 400, which clients treat as "unsupported".
+pub const MAX_OBJECT_SIZES_KEYS: usize = 100_000;
+
 // ── Server capabilities (`GET /health`) ────────────────────────────────────
 
 /// The unauthenticated `GET /health` response.

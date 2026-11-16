@@ -308,6 +308,18 @@ pub trait StorageBackend: Send + Sync {
     /// Reports `UnsupportedBackend` for every backend that has no server
     /// behind it; callers treat that as "nothing to check".
     fn server_capabilities(&self) -> Result<ServerCapabilities>;
+
+    /// The size of each of `keys` (`None` = absent), in order, from as few
+    /// requests as the backend can manage — one per directory on a
+    /// vykar-server instead of one `HEAD` per key. Every key must lie inside
+    /// a directory (`packs/ab/...`, not `index`).
+    ///
+    /// Reports `UnsupportedBackend` when the backend has no batch API (every
+    /// backend but REST) or the server predates it; callers then fall back to
+    /// per-key or per-directory requests. Required for the reason in the note
+    /// above: a wrapper inheriting an "unsupported" default would silently
+    /// cost a commit one request per pack shard.
+    fn object_sizes(&self, keys: &[String]) -> Result<Vec<Option<u64>>>;
 }
 
 /// An object being written incrementally; see

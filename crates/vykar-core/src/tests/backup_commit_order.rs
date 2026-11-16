@@ -51,6 +51,11 @@ struct Shared {
     /// Delete one stored pack just before the commit lock is taken, as a
     /// concurrent compact would after reaping this session's marker.
     delete_pack_at_lock: bool,
+    /// Answer `object_sizes` like a vykar-server with `?sizes` does, so the
+    /// commit verifies its packs with one batch instead of per-pack requests.
+    batch_sizes: bool,
+    /// Number of `object_sizes` batches answered.
+    batches: Arc<Mutex<usize>>,
 }
 
 struct ObservingBackend {
@@ -105,7 +110,7 @@ impl InnerBackend for ObservingBackend {
 
 delegate_storage_backend! {
     for ObservingBackend;
-    except [put, put_owned, begin_staged_put];
+    except [put, put_owned, begin_staged_put, object_sizes];
 
     // Keep packs on the intercepted `put` path. The recorded order must include every pack write.
     fn begin_staged_put(
@@ -121,6 +126,14 @@ delegate_storage_backend! {
 
     fn put_owned(&self, key: &str, data: Vec<u8>) -> Result<()> {
         self.put_with(key, || self.inner.put_owned(key, data))
+    }
+
+    fn object_sizes(&self, keys: &[String]) -> Result<Vec<Option<u64>>> {
+        if !self.shared.batch_sizes {
+            return self.inner.object_sizes(keys);
+        }
+        *self.shared.batches.lock().unwrap() += 1;
+        keys.iter().map(|k| self.inner.size(k)).collect()
     }
 }
 
@@ -269,9 +282,18 @@ fn early_flush_failure_aborts_cleanly() {
 }
 
 fn assert_missing_pack_fails_commit(config: &crate::config::VykarConfig, src: &Path) {
+    assert_missing_pack_fails_commit_with(config, src, false);
+}
+
+fn assert_missing_pack_fails_commit_with(
+    config: &crate::config::VykarConfig,
+    src: &Path,
+    batch_sizes: bool,
+) {
     let packs_before = repo_keys(config, "packs/").len();
     let shared = Shared {
         delete_pack_at_lock: true,
+        batch_sizes,
         ..Default::default()
     };
     let err = run_backup(config, src, &shared).unwrap_err().to_string();
@@ -292,6 +314,23 @@ fn assert_missing_pack_fails_commit(config: &crate::config::VykarConfig, src: &P
 fn pack_deleted_before_commit_fails_backup_few_packs() {
     let (_dir, config, src) = setup();
     assert_missing_pack_fails_commit(&config, &src);
+}
+
+/// A backend with a batch size API (vykar-server `?sizes`) verifies every
+/// session pack with one request and still refuses to commit over a pack
+/// deleted after Phase 1.
+#[test]
+fn pack_deleted_before_commit_fails_backup_batch_sizes() {
+    let (_dir, config, src) = setup();
+    assert_missing_pack_fails_commit_with(&config, &src, true);
+
+    let shared = Shared {
+        batch_sizes: true,
+        ..Default::default()
+    };
+    run_backup(&config, &src, &shared).unwrap();
+    assert_eq!(*shared.batches.lock().unwrap(), 1, "one batch per commit");
+    assert_eq!(repo_keys(&config, "snapshots/").len(), 1);
 }
 
 /// Many session packs (one chunk per pack): verified by listing.

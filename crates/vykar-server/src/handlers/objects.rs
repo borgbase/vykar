@@ -17,6 +17,8 @@ pub struct ObjectQuery {
     /// With `list`: return [`vykar_protocol::SizedKey`] entries instead of bare keys.
     pub sized: Option<String>,
     pub mkdir: Option<String>,
+    /// POST: report the sizes of a JSON list of keys (see `object_sizes`).
+    pub sizes: Option<String>,
 }
 
 /// GET /{*path} — if ?list present, list keys; otherwise read object.
@@ -441,11 +443,21 @@ async fn stream_full_read(file_path: &std::path::Path, key: &str) -> Result<Resp
 }
 
 /// POST /{*path}?mkdir — create directory.
+/// POST /{*path}?sizes — sizes of a JSON list of keys below `path`.
 pub async fn post_object(
     State(state): State<AppState>,
     Path(key): Path<String>,
     Query(query): Query<ObjectQuery>,
+    headers: HeaderMap,
+    body: Body,
 ) -> Result<Response, ServerError> {
+    // The raw body, not `Bytes`: object routes allow 512 MiB bodies, and a
+    // `Bytes` extractor would buffer that much for every POST before the
+    // handler runs. Only `?sizes` reads its body, under its own cap.
+    if query.sizes.is_some() {
+        let body = read_sizes_body(&headers, body).await?;
+        return object_sizes(state, &key, &body).await;
+    }
     if query.mkdir.is_some() {
         let dir_path = state
             .file_path(&key)
@@ -457,6 +469,115 @@ pub async fn post_object(
     }
 
     Ok(StatusCode::BAD_REQUEST.into_response())
+}
+
+/// Cap on a `POST ?sizes` body. Object routes accept 512 MiB bodies (pack
+/// uploads); a key list at [`vykar_protocol::MAX_OBJECT_SIZES_KEYS`] is
+/// ~8 MiB of JSON.
+const MAX_SIZES_BODY_BYTES: usize = 32 * 1024 * 1024;
+
+/// Most a `?sizes` body buffer reserves up front from `Content-Length`. The
+/// header is only a claim: a client can declare the full cap and send nothing,
+/// and there is no read timeout, so reserving the declared length would commit
+/// up to the cap per stalled request. Beyond this the buffer grows as bytes
+/// arrive; real bodies are ~20 KB, ~8 MiB at most.
+const SIZES_BODY_INITIAL_CAPACITY: usize = 1024 * 1024;
+
+/// Initial capacity of the `?sizes` body buffer for a declared length.
+fn sizes_body_initial_capacity(content_length: Option<u64>) -> usize {
+    content_length.map_or(0, |len| {
+        usize::try_from(len)
+            .unwrap_or(usize::MAX)
+            .min(SIZES_BODY_INITIAL_CAPACITY)
+    })
+}
+
+/// Read a `?sizes` request body, refusing (413) one larger than
+/// [`MAX_SIZES_BODY_BYTES`] — up front from `Content-Length` when the client
+/// sends one, else as soon as the streamed body crosses the cap — so at most
+/// the cap is ever buffered.
+async fn read_sizes_body(headers: &HeaderMap, body: Body) -> Result<Vec<u8>, ServerError> {
+    let too_large = |len: u64| {
+        ServerError::PayloadTooLarge(format!(
+            "sizes request body is at least {len} bytes (limit {MAX_SIZES_BODY_BYTES})"
+        ))
+    };
+    let content_length = headers
+        .get("Content-Length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    if let Some(len) = content_length {
+        if len > MAX_SIZES_BODY_BYTES as u64 {
+            return Err(too_large(len));
+        }
+    }
+    let mut buf = Vec::with_capacity(sizes_body_initial_capacity(content_length));
+    let mut stream = body.into_data_stream();
+    while let Some(chunk) = stream
+        .try_next()
+        .await
+        .map_err(|e| ServerError::BadRequest(format!("reading sizes request: {e}")))?
+    {
+        let len = buf.len() + chunk.len();
+        if len > MAX_SIZES_BODY_BYTES {
+            return Err(too_large(len as u64));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
+
+/// Answer `POST /<dir>?sizes`: the size of every requested key, `null` for
+/// an absent one, in request order (see
+/// [`vykar_protocol::MAX_OBJECT_SIZES_KEYS`]).
+///
+/// One request replaces a `HEAD` per key (or a listing per directory) for a
+/// client that needs to know which of many objects exist, e.g. the packs a
+/// backup is about to commit. Sizes follow symlinks and count only regular
+/// files, matching what `list` reports. A stat error other than "not found"
+/// fails the whole request: reporting such an object as absent would turn an
+/// I/O problem into a false "missing" verdict.
+async fn object_sizes(state: AppState, dir: &str, body: &[u8]) -> Result<Response, ServerError> {
+    let keys: Vec<String> = serde_json::from_slice(body)
+        .map_err(|e| ServerError::BadRequest(format!("invalid sizes request: {e}")))?;
+    if keys.len() > vykar_protocol::MAX_OBJECT_SIZES_KEYS {
+        return Err(ServerError::BadRequest(format!(
+            "sizes request names {} keys (limit {})",
+            keys.len(),
+            vykar_protocol::MAX_OBJECT_SIZES_KEYS
+        )));
+    }
+    let dir_prefix = format!("{}/", dir.trim_matches('/'));
+    let mut paths = Vec::with_capacity(keys.len());
+    for key in &keys {
+        if !key.starts_with(&dir_prefix) || vykar_protocol::is_temp_file(key) {
+            return Err(ServerError::BadRequest(format!(
+                "sizes: key {key:?} is not an object below {dir_prefix}"
+            )));
+        }
+        let path = state
+            .file_path(key)
+            .ok_or_else(|| ServerError::BadRequest(format!("sizes: invalid key {key:?}")))?;
+        paths.push(path);
+    }
+    drop(keys);
+
+    let sizes = tokio::task::spawn_blocking(move || {
+        paths
+            .iter()
+            .map(|path| match std::fs::metadata(path) {
+                Ok(meta) if meta.is_file() => Ok(Some(meta.len())),
+                Ok(_) => Ok(None),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(e),
+            })
+            .collect::<std::io::Result<Vec<Option<u64>>>>()
+    })
+    .await
+    .map_err(|e| ServerError::Internal(e.to_string()))?
+    .map_err(ServerError::from)?;
+
+    Ok(axum::Json(sizes).into_response())
 }
 
 async fn list_keys(state: AppState, prefix: &str, sized: bool) -> Result<Response, ServerError> {
@@ -609,6 +730,181 @@ mod tests {
     use super::super::test_helpers::*;
 
     const CONFIG_PATH: &str = "/config";
+
+    fn pack_key(byte: u8) -> String {
+        format!("packs/{byte:02x}/{}", hex::encode([byte; 32]))
+    }
+
+    /// Store a pack file directly in the data dir (no checksum header needed).
+    fn store_pack(tmp: &tempfile::TempDir, byte: u8, len: usize) -> String {
+        let key = pack_key(byte);
+        let path = tmp.path().join(&key);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, vec![0u8; len]).unwrap();
+        key
+    }
+
+    async fn post_sizes(router: axum::Router, keys: &[String]) -> axum::response::Response {
+        authed_post(router, "/packs?sizes", serde_json::to_vec(keys).unwrap()).await
+    }
+
+    #[tokio::test]
+    async fn sizes_reports_present_and_absent_in_order() {
+        let (router, _state, tmp) = setup_app(0);
+        let a = store_pack(&tmp, 0x0a, 10);
+        let b = store_pack(&tmp, 0xb0, 7);
+        let absent = pack_key(0xcc);
+        let resp = post_sizes(router, &[b.clone(), absent, a.clone(), b]).await;
+        assert_status(&resp, StatusCode::OK);
+        let sizes: Vec<Option<u64>> = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(sizes, vec![Some(7), None, Some(10), Some(7)]);
+    }
+
+    #[tokio::test]
+    async fn sizes_rejects_keys_outside_the_directory() {
+        let (router, _state, _tmp) = setup_app(0);
+        for bad in ["index", "snapshots/x", "packs/../config", "packsx/ab/cd"] {
+            let resp = post_sizes(router.clone(), &[bad.to_string()]).await;
+            assert_status(&resp, StatusCode::BAD_REQUEST);
+        }
+    }
+
+    #[tokio::test]
+    async fn sizes_rejects_oversized_and_malformed_requests() {
+        let (router, _state, _tmp) = setup_app(0);
+        let too_many = vec![pack_key(1); vykar_protocol::MAX_OBJECT_SIZES_KEYS + 1];
+        let resp = post_sizes(router.clone(), &too_many).await;
+        assert_status(&resp, StatusCode::BAD_REQUEST);
+        let resp = authed_post(router, "/packs?sizes", b"{not json".to_vec()).await;
+        assert_status(&resp, StatusCode::BAD_REQUEST);
+    }
+
+    fn authed_request(method: &str, uri: &str) -> axum::http::request::Builder {
+        axum::http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("Authorization", format!("Bearer {TEST_TOKEN}"))
+    }
+
+    /// An over-cap `?sizes` body is refused with 413 whether the client
+    /// declares its length or streams it, without buffering past the cap.
+    #[tokio::test]
+    async fn sizes_rejects_a_body_over_the_cap() {
+        use futures_util::StreamExt;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tower::ServiceExt;
+        let (router, _state, _tmp) = setup_app(0);
+        let cap = super::MAX_SIZES_BODY_BYTES;
+
+        // Declared too large: refused from the header. The body never ends,
+        // so this would time out if the handler tried to read it.
+        let req = authed_request("POST", "/packs?sizes")
+            .header("Content-Length", (cap + 1).to_string())
+            .body(Body::from_stream(futures_util::stream::pending::<
+                Result<axum::body::Bytes, std::io::Error>,
+            >()))
+            .unwrap();
+        let resp = tokio::time::timeout(Duration::from_secs(10), router.clone().oneshot(req))
+            .await
+            .expect("over-cap Content-Length must be refused without reading the body")
+            .unwrap();
+        assert_status(&resp, StatusCode::PAYLOAD_TOO_LARGE);
+
+        // No Content-Length: refused once the stream crosses the cap. The
+        // body is twice the cap; reading stops one chunk past it.
+        const CHUNK: usize = 1024 * 1024;
+        let pulled = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&pulled);
+        let chunk = axum::body::Bytes::from(vec![b' '; CHUNK]);
+        let stream = futures_util::stream::repeat_with(move || {
+            counter.fetch_add(CHUNK, Ordering::Relaxed);
+            Ok::<_, std::io::Error>(chunk.clone())
+        })
+        .take(2 * cap / CHUNK);
+        let req = authed_request("POST", "/packs?sizes")
+            .body(Body::from_stream(stream))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_status(&resp, StatusCode::PAYLOAD_TOO_LARGE);
+        let pulled = pulled.load(Ordering::Relaxed);
+        assert!(pulled <= cap + CHUNK, "read {pulled} bytes, cap {cap}");
+    }
+
+    /// A `?sizes` body of exactly the cap is accepted, with its length
+    /// declared or streamed: `[]` padded with whitespace to the cap, sent in
+    /// 1 MiB chunks so the test itself holds only one chunk.
+    #[tokio::test]
+    async fn sizes_accepts_a_body_at_the_cap() {
+        use tower::ServiceExt;
+        let (router, _state, _tmp) = setup_app(0);
+        let cap = super::MAX_SIZES_BODY_BYTES;
+        const CHUNK: usize = 1024 * 1024;
+        let spaces = axum::body::Bytes::from(vec![b' '; CHUNK]);
+        let body = || {
+            let mut first = vec![b' '; CHUNK];
+            first[..2].copy_from_slice(b"[]");
+            let rest = std::iter::repeat_n(spaces.clone(), cap / CHUNK - 1);
+            let chunks = std::iter::once(axum::body::Bytes::from(first))
+                .chain(rest)
+                .map(Ok::<_, std::io::Error>);
+            Body::from_stream(futures_util::stream::iter(chunks))
+        };
+
+        for declared in [true, false] {
+            let mut req = authed_request("POST", "/packs?sizes");
+            if declared {
+                req = req.header("Content-Length", cap.to_string());
+            }
+            let resp = router
+                .clone()
+                .oneshot(req.body(body()).unwrap())
+                .await
+                .unwrap();
+            assert_status(&resp, StatusCode::OK);
+            assert_eq!(body_bytes(resp).await, b"[]", "declared: {declared}");
+        }
+    }
+
+    #[test]
+    fn sizes_body_initial_capacity_is_bounded() {
+        use super::{sizes_body_initial_capacity as cap_for, SIZES_BODY_INITIAL_CAPACITY};
+        assert_eq!(cap_for(None), 0);
+        assert_eq!(cap_for(Some(0)), 0);
+        assert_eq!(cap_for(Some(20_000)), 20_000);
+        let limit = SIZES_BODY_INITIAL_CAPACITY as u64;
+        assert_eq!(cap_for(Some(limit)), SIZES_BODY_INITIAL_CAPACITY);
+        assert_eq!(cap_for(Some(limit + 1)), SIZES_BODY_INITIAL_CAPACITY);
+        let at_cap = super::MAX_SIZES_BODY_BYTES as u64;
+        assert_eq!(cap_for(Some(at_cap)), SIZES_BODY_INITIAL_CAPACITY);
+        assert_eq!(cap_for(Some(u64::MAX)), SIZES_BODY_INITIAL_CAPACITY);
+    }
+
+    /// `?mkdir` ignores a request body (clients send none, but one must not
+    /// be buffered or break the request).
+    #[tokio::test]
+    async fn mkdir_creates_directory_with_or_without_a_body() {
+        let (router, _state, tmp) = setup_app(0);
+        let resp = authed_post(router.clone(), "/snapshots/a?mkdir", Vec::new()).await;
+        assert_status(&resp, StatusCode::CREATED);
+        assert!(tmp.path().join("snapshots/a").is_dir());
+        let resp = authed_post(router, "/snapshots/b?mkdir", vec![0x41; 4096]).await;
+        assert_status(&resp, StatusCode::CREATED);
+        assert!(tmp.path().join("snapshots/b").is_dir());
+    }
+
+    /// A directory under a pack key is not an object.
+    #[tokio::test]
+    async fn sizes_reports_directories_as_absent() {
+        let (router, _state, tmp) = setup_app(0);
+        let key = pack_key(0x42);
+        std::fs::create_dir_all(tmp.path().join(&key)).unwrap();
+        let resp = post_sizes(router, &[key]).await;
+        assert_status(&resp, StatusCode::OK);
+        let sizes: Vec<Option<u64>> = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(sizes, vec![None]);
+    }
 
     #[tokio::test]
     async fn put_then_get_round_trip() {

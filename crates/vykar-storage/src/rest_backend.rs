@@ -8,6 +8,7 @@
 )]
 
 use std::io::Read;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -97,6 +98,9 @@ pub struct RestBackend {
     /// writer. Unset means BLAKE2b, which is what every repository used before
     /// format v3 and what a caller that never binds should get.
     content_hash: OnceLock<HashAlgorithm>,
+    /// Set once the server has answered `?sizes` as an unknown request, so a
+    /// process probes an old server at most once.
+    sizes_unsupported: AtomicBool,
 }
 
 impl RestBackend {
@@ -147,6 +151,7 @@ impl RestBackend {
             retry,
             timeouts,
             content_hash: OnceLock::new(),
+            sizes_unsupported: AtomicBool::new(false),
         })
     }
 
@@ -302,6 +307,57 @@ impl RestBackend {
     pub fn verify_packs(&self, plan: &VerifyPacksPlanRequest) -> Result<VerifyPacksResponse> {
         let url = format!("{}?verify-packs", self.base_url);
         self.post_json("verify-packs", &url, plan, self.timeouts.admin, &self.retry)
+    }
+
+    /// One `POST /<dir>?sizes` for keys that all lie below `dir`.
+    ///
+    /// `Ok(None)` when the server does not know the endpoint: a server that
+    /// predates it answers 400 (its `POST` handler only knows `?mkdir`), and
+    /// 404/405/501 cover a proxy that refuses the request.
+    fn post_sizes(&self, dir: &str, keys: &[String]) -> Result<Option<Vec<Option<u64>>>> {
+        let url = format!("{}?sizes", self.url(dir));
+        let op_name = format!("SIZES {dir}/");
+        let body = self
+            .retry_call(
+                &op_name,
+                || {
+                    let req = self.authed(self.agent.post(&url));
+                    Self::recv_response_within(req, self.timeouts.admin).send_json(keys)
+                },
+                |mut resp| {
+                    let status = resp.status().as_u16();
+                    if matches!(status, 400 | 404 | 405 | 501) {
+                        return Ok(None);
+                    }
+                    if status >= 400 {
+                        let detail = read_body_snippet(&mut resp);
+                        crate::retry::classify_status(
+                            status,
+                            format!("REST {op_name} failed: HTTP {status}{detail}"),
+                        )?;
+                    }
+                    let mut buf = Vec::new();
+                    resp.body_mut()
+                        .as_reader()
+                        .read_to_end(&mut buf)
+                        .map_err(HttpRetryError::BodyIo)?;
+                    Ok(Some(buf))
+                },
+            )
+            .map_err(|e| VykarError::Other(format!("REST {op_name}: {e}")))?;
+        let Some(body) = body else {
+            return Ok(None);
+        };
+        let sizes: Vec<Option<u64>> = serde_json::from_slice(&body)
+            .map_err(|e| VykarError::Other(format!("REST {op_name} parse: {e}")))?;
+        if sizes.len() != keys.len() {
+            return Err(VykarError::Other(format!(
+                "REST {op_name}: server answered {} sizes for {} keys",
+                sizes.len(),
+                keys.len()
+            )));
+        }
+        Ok(Some(sizes))
     }
 
     /// Send a repack plan to the server for server-side compaction.
@@ -750,6 +806,38 @@ impl StorageBackend for RestBackend {
         self.fetch_server_capabilities()
     }
 
+    fn object_sizes(&self, keys: &[String]) -> Result<Vec<Option<u64>>> {
+        let unsupported = || VykarError::UnsupportedBackend("batch object sizes API".into());
+        if self.sizes_unsupported.load(Ordering::Relaxed) {
+            return Err(unsupported());
+        }
+        // One request per run of keys sharing a top-level directory (packs
+        // are all below `packs/`), split at the server's per-request cap.
+        let mut sizes = Vec::with_capacity(keys.len());
+        let mut rest = keys;
+        while let Some(first) = rest.first() {
+            let dir = first.split_once('/').map(|(dir, _)| dir).ok_or_else(|| {
+                VykarError::Other(format!(
+                    "REST object_sizes: key {first:?} is not inside a directory"
+                ))
+            })?;
+            let prefix = format!("{dir}/");
+            let run = rest
+                .iter()
+                .take(vykar_protocol::MAX_OBJECT_SIZES_KEYS)
+                .take_while(|k| k.starts_with(&prefix))
+                .count();
+            let (batch_keys, tail) = rest.split_at(run);
+            let Some(batch) = self.post_sizes(dir, batch_keys)? else {
+                self.sizes_unsupported.store(true, Ordering::Relaxed);
+                return Err(unsupported());
+            };
+            sizes.extend(batch);
+            rest = tail;
+        }
+        Ok(sizes)
+    }
+
     fn server_init(&self) -> Result<()> {
         let url = format!("{}?init", self.base_url);
         self.retry_call(
@@ -1031,6 +1119,41 @@ mod tests {
         );
         let request = request.join().unwrap();
         assert!(request.starts_with("GET /?list&sized "), "got:\n{request}");
+    }
+
+    #[test]
+    fn object_sizes_posts_one_request_per_directory() {
+        let (url, request) = capture_request(&json_response("[7,null]"));
+        let backend = RestBackend::new(&url, None, no_retry(), None).unwrap();
+        let keys = vec!["packs/ab/x".to_string(), "packs/cd/y".to_string()];
+        assert_eq!(backend.object_sizes(&keys).unwrap(), vec![Some(7), None]);
+        let request = request.join().unwrap();
+        assert!(request.starts_with("POST /packs?sizes "), "got:\n{request}");
+    }
+
+    /// An old server answers the unknown `?sizes` POST with 400. That is
+    /// "unsupported" (the caller falls back), and it is remembered, so the
+    /// probe costs one request per process.
+    #[test]
+    fn object_sizes_on_an_old_server_is_unsupported_and_remembered() {
+        let (url, server) = mock_server("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n");
+        let backend = RestBackend::new(&url, None, no_retry(), None).unwrap();
+        let keys = vec!["packs/ab/x".to_string()];
+        for _ in 0..2 {
+            let err = backend.object_sizes(&keys).unwrap_err();
+            assert!(matches!(err, VykarError::UnsupportedBackend(_)), "{err}");
+        }
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn object_sizes_rejects_a_short_answer() {
+        let (url, server) = mock_server(&json_response("[7]"));
+        let backend = RestBackend::new(&url, None, no_retry(), None).unwrap();
+        let keys = vec!["packs/ab/x".to_string(), "packs/ab/y".to_string()];
+        let err = backend.object_sizes(&keys).unwrap_err().to_string();
+        assert!(err.contains("1 sizes for 2 keys"), "{err}");
+        server.join().unwrap();
     }
 
     /// Serve one canned response and hand back the full request text.

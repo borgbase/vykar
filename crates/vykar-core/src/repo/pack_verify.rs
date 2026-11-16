@@ -6,6 +6,11 @@
 //! **every** pack. Only the request pattern is chosen here — never which packs
 //! are checked. Each strategy issues independent read-only requests, so they
 //! may run concurrently without changing what is verified.
+//!
+//! A backend with a batch size API (vykar-server's `?sizes`) answers for all
+//! packs in one request. Without one — any other backend, an old server, or
+//! a failed batch request — the per-pack or per-shard strategies run instead,
+//! so the batch path can only make verification cheaper, never weaker.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -91,6 +96,12 @@ pub(crate) fn verify_packs_present_with(
     if pack_ids.is_empty() {
         return Ok(());
     }
+    // A forced strategy (tests) skips the batch to exercise the fallbacks.
+    if force.is_none() {
+        if let Some(result) = verify_batch(storage, pack_ids) {
+            return result;
+        }
+    }
     let mut by_shard: HashMap<String, Vec<PackId>> = HashMap::new();
     for id in pack_ids {
         by_shard.entry(id.shard_prefix()).or_default().push(*id);
@@ -117,6 +128,38 @@ pub(crate) fn verify_packs_present_with(
             run_bounded(width, &groups, |(shard, ids)| {
                 verify_shard(storage, shard, ids)
             })
+        }
+    }
+}
+
+/// Check every pack with one [`StorageBackend::object_sizes`] batch.
+///
+/// `None` when the batch gave no answer (unsupported, or the request failed):
+/// the caller then verifies with per-pack or per-shard requests, so an error
+/// here never counts as "present". An answer is authoritative: a pack it
+/// reports absent fails the commit, as a failed `exists()` would.
+fn verify_batch(storage: &dyn StorageBackend, pack_ids: &HashSet<PackId>) -> Option<Result<()>> {
+    let ids: Vec<PackId> = pack_ids.iter().copied().collect();
+    let keys: Vec<String> = ids.iter().map(PackId::storage_key).collect();
+    match storage.object_sizes(&keys) {
+        Ok(sizes) if sizes.len() == ids.len() => Some(
+            match ids.iter().zip(&sizes).find(|(_, size)| size.is_none()) {
+                Some((id, _)) => Err(missing(id)),
+                None => Ok(()),
+            },
+        ),
+        Ok(sizes) => {
+            debug!(
+                expected = ids.len(),
+                got = sizes.len(),
+                "batch pack sizes answered the wrong count, falling back"
+            );
+            None
+        }
+        Err(VykarError::UnsupportedBackend(_)) => None,
+        Err(e) => {
+            debug!(error = %e, "batch pack sizes failed, falling back");
+            None
         }
     }
 }
@@ -209,13 +252,17 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use vykar_storage::{delegate_storage_backend, InnerBackend};
 
-    /// Counts requests and can fail listings or `exists()`.
+    /// Counts requests and can fail listings or `exists()`. With `batch` it
+    /// also answers `object_sizes` (one request), which `fail_batch` fails.
     struct Probe {
         inner: MemoryBackend,
         fail_list: bool,
         fail_exists: bool,
+        batch: bool,
+        fail_batch: bool,
         lists: AtomicUsize,
         exists: AtomicUsize,
+        batches: AtomicUsize,
     }
 
     impl Probe {
@@ -224,8 +271,18 @@ mod tests {
                 inner: MemoryBackend::new(),
                 fail_list: false,
                 fail_exists: false,
+                batch: false,
+                fail_batch: false,
                 lists: AtomicUsize::new(0),
                 exists: AtomicUsize::new(0),
+                batches: AtomicUsize::new(0),
+            }
+        }
+
+        fn with_batch() -> Self {
+            Self {
+                batch: true,
+                ..Self::new()
             }
         }
     }
@@ -238,7 +295,7 @@ mod tests {
 
     delegate_storage_backend! {
         for Probe;
-        except [exists, list, list_sized];
+        except [exists, list, list_sized, object_sizes];
 
         fn list(&self, prefix: &str) -> Result<Vec<String>> {
             self.lists.fetch_add(1, Ordering::SeqCst);
@@ -262,6 +319,17 @@ mod tests {
                 return Err(VykarError::Other("injected exists failure".into()));
             }
             self.inner.exists(key)
+        }
+
+        fn object_sizes(&self, keys: &[String]) -> Result<Vec<Option<u64>>> {
+            if !self.batch {
+                return Err(VykarError::UnsupportedBackend("probe".into()));
+            }
+            self.batches.fetch_add(1, Ordering::SeqCst);
+            if self.fail_batch {
+                return Err(VykarError::Other("injected batch failure".into()));
+            }
+            keys.iter().map(|k| self.inner.size(k)).collect()
         }
     }
 
@@ -353,6 +421,57 @@ mod tests {
         verify_packs_present_with(&storage, &ids, 0, 6, Some(Strategy::ShardLists)).unwrap();
         assert_eq!(storage.lists.load(Ordering::SeqCst), 40);
         assert_eq!(storage.exists.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn batch_checks_every_pack_in_one_request() {
+        let storage = Probe::with_batch();
+        let ids = stored(&storage, 100);
+        verify_packs_present(&storage, &ids, 0, 6).unwrap();
+        assert_eq!(storage.batches.load(Ordering::SeqCst), 1);
+        assert_eq!(storage.lists.load(Ordering::SeqCst), 0);
+        assert_eq!(storage.exists.load(Ordering::SeqCst), 0);
+
+        let gone = pack(37);
+        storage.inner.delete(&gone.storage_key()).unwrap();
+        let err = verify_packs_present(&storage, &ids, 0, 6)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(&format!("pack {gone} missing from storage")),
+            "{err}"
+        );
+        // An absent pack is the batch's verdict, not a reason to re-check.
+        assert_eq!(storage.lists.load(Ordering::SeqCst), 0);
+        assert_eq!(storage.exists.load(Ordering::SeqCst), 0);
+    }
+
+    /// A failed batch never counts as "present": verification falls back to
+    /// the per-shard/per-pack requests, which still catch a missing pack.
+    #[test]
+    fn failed_batch_falls_back_to_full_verification() {
+        let mut storage = Probe::with_batch();
+        storage.fail_batch = true;
+        let ids = stored(&storage, 100);
+        verify_packs_present(&storage, &ids, 0, 6).unwrap();
+        assert_eq!(storage.batches.load(Ordering::SeqCst), 1);
+        assert!(storage.lists.load(Ordering::SeqCst) + storage.exists.load(Ordering::SeqCst) > 0);
+
+        storage.inner.delete(&pack(3).storage_key()).unwrap();
+        let err = verify_packs_present(&storage, &ids, 0, 6)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("missing from storage"), "{err}");
+    }
+
+    /// Without a batch API the cost model's requests run, as before.
+    #[test]
+    fn unsupported_batch_uses_the_cost_model() {
+        let storage = Probe::new();
+        let ids = stored(&storage, 100);
+        verify_packs_present(&storage, &ids, 0, 6).unwrap();
+        assert_eq!(storage.batches.load(Ordering::SeqCst), 0);
+        assert_eq!(storage.lists.load(Ordering::SeqCst), 40);
     }
 
     #[test]

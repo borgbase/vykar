@@ -2,7 +2,7 @@
 //! "unsupported" bodies for leaves.
 //!
 //! Every wrapper that holds an inner backend (rate limiter, test recorder, the
-//! `Arc<dyn StorageBackend>` coercion impl) has to forward all 20 trait methods,
+//! `Arc<dyn StorageBackend>` coercion impl) has to forward all 21 trait methods,
 //! and hand-written forwards rot — a forgotten one disabled server-side pack
 //! verification and server init on any throttled REST repo.
 //!
@@ -11,11 +11,12 @@
 //! * [`crate::delegate_storage_backend!`] holds the forwarding inventory in one
 //!   place. A wrapper implements [`InnerBackend`], names the methods it writes by
 //!   hand, and gets forwards for the rest.
-//! * The trait's seven capability methods (`remove_stale_temp_files`,
+//! * The trait's eight capability methods (`remove_stale_temp_files`,
 //!   `server_repack`, `batch_delete_keys`, `server_verify_packs`, `server_init`,
-//!   `bind_content_hash`, `server_capabilities`) have **no defaults**, so the
-//!   inventory cannot silently fall behind the trait: adding an eighth breaks
-//!   every impl, this macro included, until it is handled. Leaves get bodies
+//!   `bind_content_hash`, `server_capabilities`, `object_sizes`) have **no
+//!   defaults**, so the inventory cannot silently fall behind the trait:
+//!   adding a ninth breaks every impl, this macro included, until it is
+//!   handled. Leaves get bodies
 //!   for the ones they do not implement from [`crate::unsupported_server_ops!`].
 //!
 //! What is *not* guarded: a new method with a default body. Wrappers would
@@ -71,7 +72,7 @@ macro_rules! unsupported_server_ops {
     (except [$($except:ident),* $(,)?]) => {
         $crate::unsupported_server_ops!(@emit
             [remove_stale_temp_files server_repack batch_delete_keys server_verify_packs
-             server_init bind_content_hash server_capabilities]
+             server_init bind_content_hash server_capabilities object_sizes]
             [$($except)*]);
     };
 
@@ -179,6 +180,21 @@ macro_rules! unsupported_server_ops {
         }
         $crate::unsupported_server_ops!(@emit [$($rest)*] [$($except)*]);
     };
+
+    (@emit [object_sizes $($rest:ident)*] [object_sizes $($except:ident)*]) => {
+        $crate::unsupported_server_ops!(@emit [$($rest)*] [$($except)*]);
+    };
+    (@emit [object_sizes $($rest:ident)*] [$($except:ident)*]) => {
+        fn object_sizes(
+            &self,
+            _keys: &[String],
+        ) -> $crate::__macro_support::Result<Vec<Option<u64>>> {
+            Err($crate::__macro_support::VykarError::UnsupportedBackend(
+                "batch object sizes API".into(),
+            ))
+        }
+        $crate::unsupported_server_ops!(@emit [$($rest)*] [$($except)*]);
+    };
 }
 
 /// Implement `StorageBackend` for a wrapper by forwarding to its
@@ -213,7 +229,7 @@ macro_rules! delegate_storage_backend {
                  put_owned begin_staged_put size list_sized remove_stale_temp_files
                  server_repack batch_delete_keys
                  server_verify_packs server_init bind_content_hash
-                 server_capabilities]
+                 server_capabilities object_sizes]
                 [$($except)*]);
         }
         $crate::delegate_storage_backend!(@check_list [$($except)*] [] []);
@@ -550,6 +566,19 @@ macro_rules! delegate_storage_backend {
         }
         $crate::delegate_storage_backend!(@forward [$($rest)*] [$($except)*]);
     };
+
+    (@forward [object_sizes $($rest:ident)*] [object_sizes $($except:ident)*]) => {
+        $crate::delegate_storage_backend!(@forward [$($rest)*] [$($except)*]);
+    };
+    (@forward [object_sizes $($rest:ident)*] [$($except:ident)*]) => {
+        fn object_sizes(
+            &self,
+            keys: &[String],
+        ) -> $crate::__macro_support::Result<Vec<Option<u64>>> {
+            $crate::InnerBackend::inner_backend(self).object_sizes(keys)
+        }
+        $crate::delegate_storage_backend!(@forward [$($rest)*] [$($except)*]);
+    };
 }
 
 #[cfg(test)]
@@ -682,6 +711,10 @@ mod tests {
                 hashes: Vec::new(),
             })
         }
+        fn object_sizes(&self, keys: &[String]) -> Result<Vec<Option<u64>>> {
+            self.hit();
+            Ok(vec![None; keys.len()])
+        }
     }
 
     struct Wrapper {
@@ -709,7 +742,7 @@ mod tests {
     ///
     /// This covers the methods that *have* trait defaults — for those a
     /// forgotten forward compiles, so only a call-count assertion catches it.
-    /// The seven capability methods are covered by the compiler instead (no
+    /// The eight capability methods are covered by the compiler instead (no
     /// default ⇒ a missing forward is an error), which is what keeps the
     /// inventory from drifting behind the trait.
     #[test]
@@ -754,8 +787,9 @@ mod tests {
         w.bind_content_hash(vykar_types::hash::HashAlgorithm::Blake3)
             .unwrap();
         w.server_capabilities().unwrap();
+        w.object_sizes(&["packs/00/k".into()]).unwrap();
 
-        // 20 trait methods, 19 of them forwarded.
-        assert_eq!(w.inner.calls.load(Ordering::SeqCst), 19);
+        // 21 trait methods, 20 of them forwarded.
+        assert_eq!(w.inner.calls.load(Ordering::SeqCst), 20);
     }
 }

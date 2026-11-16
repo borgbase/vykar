@@ -30,6 +30,7 @@ The server exposes normal storage-object routes plus a small set of admin query 
 | `DELETE` | `/{*path}` | `delete(key)` | Returns `204` or `404`. Rejected with `403` in append-only mode, except for `locks/*`, `sessions/*` and temporary upload files. |
 | `GET` | `/{*path}?list` | `list(prefix)` | Returns a JSON array of matching keys. |
 | `POST` | `/{*path}?mkdir` | `create_dir(key)` | Creates directory scaffolding. |
+| `POST` | `/{*path}?sizes` | `object_sizes(keys)` | Body: a JSON array of up to 100,000 full keys, all below `{path}/`. Returns a JSON array of the same length with each object's size in bytes, or `null` when it is absent. A backup commit uses it to verify all its packs (`POST /packs?sizes`) in one request; servers that predate it answer `400`, and the client falls back to per-shard listings or `HEAD`s. |
 
 ### Admin routes
 

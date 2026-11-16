@@ -133,7 +133,7 @@ impl InnerBackend for ThrottledStorageBackend {
 
 // Only the byte-moving methods are throttled. Everything else — including the
 // server-side operations, whose bytes never cross the client's link — is
-// forwarded by the macro. The four capability methods have no trait default, so
+// forwarded by the macro. The capability methods have no trait default, so
 // this impl cannot silently answer "unsupported" on behalf of a backend that
 // does support them, which is how `server_verify_packs` and `server_init` came
 // to be disabled on every throttled REST repo.
@@ -386,6 +386,7 @@ mod tests {
         struct ServerOpRecorder {
             verify_calls: Arc<AtomicUsize>,
             init_calls: Arc<AtomicUsize>,
+            sizes_calls: Arc<AtomicUsize>,
         }
 
         impl StorageBackend for ServerOpRecorder {
@@ -424,15 +425,25 @@ mod tests {
                 self.init_calls.fetch_add(1, Ordering::SeqCst);
                 Ok(())
             }
+            fn object_sizes(&self, keys: &[String]) -> Result<Vec<Option<u64>>> {
+                self.sizes_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(vec![Some(1); keys.len()])
+            }
 
-            vykar_storage::unsupported_server_ops!(except [server_verify_packs, server_init]);
+            vykar_storage::unsupported_server_ops!(except [
+                server_verify_packs,
+                server_init,
+                object_sizes
+            ]);
         }
 
         let verify_calls = Arc::new(AtomicUsize::new(0));
         let init_calls = Arc::new(AtomicUsize::new(0));
+        let sizes_calls = Arc::new(AtomicUsize::new(0));
         let inner = Box::new(ServerOpRecorder {
             verify_calls: Arc::clone(&verify_calls),
             init_calls: Arc::clone(&init_calls),
+            sizes_calls: Arc::clone(&sizes_calls),
         });
 
         // Non-zero caps, so the wrapper is actually installed.
@@ -450,9 +461,14 @@ mod tests {
             .expect("verify forwarded");
         assert!(response.results.is_empty());
         wrapped.server_init().expect("init forwarded");
+        let sizes = wrapped
+            .object_sizes(&["packs/00/x".to_string()])
+            .expect("object_sizes forwarded");
+        assert_eq!(sizes, vec![Some(1)]);
 
         assert_eq!(verify_calls.load(Ordering::SeqCst), 1);
         assert_eq!(init_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(sizes_calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]

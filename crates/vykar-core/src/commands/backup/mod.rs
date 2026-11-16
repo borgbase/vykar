@@ -1057,18 +1057,51 @@ fn run_against_repo(
         let fence = lock::build_lock_fence(&guard, Arc::clone(&repo.storage));
         repo.set_lock_fence(fence);
 
+        // Once the snapshot is committed, deregister the session and delete
+        // its journal on a helper thread while the commit finishes its local
+        // post-commit work (file cache save, cache rebuilds), instead of
+        // after it. The lock is still held throughout and released only
+        // after that thread is joined, below: deregistration happens under
+        // the lock as before, and the local caches are still rebuilt under
+        // it. The guard's Drop stops the heartbeat thread and joins it
+        // before the marker is deleted, so no concurrent refresh_session
+        // call can race with this delete. This sequencing is why the commit
+        // path releases the lock itself instead of running under
+        // `with_repo_lock`.
+        let repo_storage = Arc::clone(&repo.storage);
+        let mut cleanup: Option<std::thread::JoinHandle<()>> = None;
         let result = repo.commit_concurrent_session_with_progress(
             snapshot_entry,
             snapshot_packed,
             &mut new_file_cache,
             &mut progress,
+            || {
+                let guard = session_guard.take();
+                let storage = Arc::clone(&repo_storage);
+                let session_id = session_id.clone();
+                let spawned = std::thread::Builder::new()
+                    .name("session-cleanup".into())
+                    .spawn(move || {
+                        drop(guard);
+                        // All entries are in the persisted index now. Best-effort —
+                        // a stale journal is harmless.
+                        crate::repo::write_session::WriteSessionState::clear_pending_index(
+                            storage.as_ref(),
+                            &session_id,
+                        );
+                    });
+                match spawned {
+                    Ok(handle) => cleanup = Some(handle),
+                    Err(e) => warn!("failed to spawn session cleanup thread: {e}"),
+                }
+            },
         );
-
-        // Deregister session while holding the lock. The guard's Drop stops
-        // the heartbeat thread and joins it before the marker is deleted, so
-        // no concurrent refresh_session call can race with this delete. This
-        // sequencing is why the commit path releases the lock itself instead
-        // of running under `with_repo_lock`.
+        let journal_cleared = cleanup.is_some();
+        if let Some(handle) = cleanup.take() {
+            let _ = handle.join();
+        }
+        // Not reached by the helper (failed commit, or no thread): the same
+        // cleanup, inline.
         drop(session_guard.take());
 
         crate::commands::util::clear_fence_and_release(
@@ -1081,10 +1114,9 @@ fn run_against_repo(
         );
 
         result?;
-
-        // Clean up the pending_index now that all entries are in the persisted
-        // index. Best-effort — a stale pending_index is harmless.
-        repo.clear_pending_index(&session_id);
+        if !journal_cleared {
+            repo.clear_pending_index(&session_id);
+        }
 
         Ok(())
     })();

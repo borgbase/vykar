@@ -271,12 +271,19 @@ impl Repository {
     /// 6. Write `snapshots/<id>` to storage — **commit point**.
     /// 7. Update local manifest + snapshot cache.
     /// 8. Save file cache and consume write session.
+    ///
+    /// `on_commit_point` runs right after step 6 succeeded, before the
+    /// local post-commit work of steps 7-8, so the caller can start remote
+    /// cleanup that only a committed session may do (deregistering it,
+    /// deleting its journal) while that work runs. No journal write of this
+    /// session is in flight when it is called.
     pub fn commit_concurrent_session_with_progress(
         &mut self,
         snapshot_entry: manifest::SnapshotEntry,
         snapshot_packed: Vec<u8>,
         new_file_cache: &mut file_cache::FileCache,
         progress: &mut Option<impl FnMut(crate::commands::backup::BackupProgressEvent)>,
+        on_commit_point: impl FnOnce(),
     ) -> Result<()> {
         // The reads that start the commit are independent of each other. The
         // fresh remote index (megabytes; only fetched when there is a delta
@@ -361,6 +368,13 @@ impl Repository {
             .put(&snapshot_entry.id.storage_key(), &snapshot_packed)?;
         log_stage_elapsed(ctx);
         // ---- after this point, no `?` may escape ----
+
+        // A journal PUT landing after the caller deleted the journal would
+        // resurrect it, so none may still be running.
+        if let Some(ws) = self.write_session.as_mut() {
+            ws.join_journal_write();
+        }
+        on_commit_point();
 
         // Manifest update is a post-commit in-memory op. Keeping it inline keeps
         // the ordering visible next to the PUT; commit_finalize handles the rest.

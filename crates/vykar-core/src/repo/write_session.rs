@@ -477,7 +477,7 @@ impl WriteSessionState {
 
     /// Wait for the background journal write, if any, and record its
     /// outcome. Best-effort like every journal write: failures are logged.
-    fn join_journal_write(&mut self) {
+    pub(crate) fn join_journal_write(&mut self) {
         let Some(write) = self.journal_write.take() else {
             return;
         };

@@ -20,6 +20,10 @@ enum Event {
     PackPutStart,
     PackPutEnd,
     LockPut,
+    SnapshotPut,
+    MarkerDelete,
+    JournalDelete,
+    LockDelete,
 }
 
 #[derive(Default)]
@@ -82,6 +86,9 @@ impl ObservingBackend {
             }
             return put();
         }
+        if key.starts_with("snapshots/") {
+            self.record(Event::SnapshotPut);
+        }
         if !key.starts_with("packs/") {
             return put();
         }
@@ -110,7 +117,7 @@ impl InnerBackend for ObservingBackend {
 
 delegate_storage_backend! {
     for ObservingBackend;
-    except [put, put_owned, begin_staged_put, object_sizes];
+    except [put, delete, put_owned, begin_staged_put, object_sizes];
 
     // Keep packs on the intercepted `put` path. The recorded order must include every pack write.
     fn begin_staged_put(
@@ -122,6 +129,17 @@ delegate_storage_backend! {
 
     fn put(&self, key: &str, data: &[u8]) -> Result<()> {
         self.put_with(key, || self.inner.put(key, data))
+    }
+
+    fn delete(&self, key: &str) -> Result<()> {
+        if key.starts_with("locks/") {
+            self.record(Event::LockDelete);
+        } else if key.starts_with("sessions/") && key.ends_with(".json") {
+            self.record(Event::MarkerDelete);
+        } else if key.starts_with("sessions/") && key.ends_with(".index") {
+            self.record(Event::JournalDelete);
+        }
+        self.inner.delete(key)
     }
 
     fn put_owned(&self, key: &str, data: Vec<u8>) -> Result<()> {
@@ -386,6 +404,38 @@ fn many_pack_backup_commits() {
         "expected one pack per chunk"
     );
     assert_eq!(repo_keys(&config, "snapshots/").len(), 1);
+}
+
+/// After the commit point the session is deregistered and its journal
+/// deleted (on a helper thread, alongside the local post-commit work), and
+/// only then is the commit lock released. Nothing is left behind.
+#[test]
+fn commit_cleans_up_session_before_releasing_lock() {
+    let (_dir, config, src) = setup();
+    let shared = Shared::default();
+    run_backup(&config, &src, &shared).unwrap();
+
+    let events = shared.events.lock().unwrap().clone();
+    let pos = |e: Event| {
+        events
+            .iter()
+            .position(|x| *x == e)
+            .unwrap_or_else(|| panic!("{e:?} missing: {events:?}"))
+    };
+    assert!(
+        pos(Event::SnapshotPut) < pos(Event::MarkerDelete),
+        "{events:?}"
+    );
+    assert!(
+        pos(Event::MarkerDelete) < pos(Event::JournalDelete),
+        "{events:?}"
+    );
+    assert!(
+        pos(Event::JournalDelete) < pos(Event::LockDelete),
+        "{events:?}"
+    );
+    assert!(repo_keys(&config, "sessions/").is_empty());
+    assert!(repo_keys(&config, "locks/").is_empty());
 }
 
 /// The commit records the new snapshot in the local snapshot list cache, so

@@ -4,7 +4,7 @@ title: "Desktop GUI"
 
 Vykar includes a desktop GUI for managing repositories, running backups, and browsing/restoring snapshots. It is built with [Slint](https://slint.dev/).
 
-[![Vykar GUI](/images/gui-screenshot.png)](/images/gui-screenshot.png)
+[![Vykar GUI](/images/gui-screenshot.webp)](/images/gui-screenshot.webp)
 
 - Run backups on demand
 - List snapshots, browse their contents, and restore files

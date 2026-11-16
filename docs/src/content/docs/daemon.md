@@ -2,6 +2,11 @@
 title: "Schedule Backups"
 ---
 
+<figure>
+<a href="/images/daemon-status-page.webp"><img src="/images/daemon-status-page.webp" width="2198" height="1512" alt="Vykar daemon read-only status page" /></a>
+<figcaption>The daemon's optional <a href="#read-only-status-page">read-only status page</a>: a basic overview of backup status on server machines.</figcaption>
+</figure>
+
 `vykar daemon` runs scheduled backup cycles as a foreground process. Each cycle executes the default actions (`backup → prune → compact → check`) for the repositories that are due, sequentially. The shutdown flag is checked between steps.
 
 - **Scheduling**: a fixed interval (`schedule.every`) or a cron expression (`schedule.cron`), with optional random jitter. See [Configuration → Schedule](/configuration#schedule) for all fields.

@@ -55,7 +55,7 @@ See the [full documentation](https://vykar.borgbase.com) for storage backends, r
 ## Desktop UI
 
 <p align="center">
-  <img src="docs/public/images/gui-screenshot.png" alt="Vykar GUI" width="380">
+  <img src="docs/public/images/gui-screenshot.webp" alt="Vykar GUI" width="380">
 </p>
 
 `vykar-gui` is a Slint-based desktop app that uses `vykar-core` directly (it does not shell out to the CLI).

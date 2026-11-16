@@ -2,7 +2,6 @@ use std::sync::Arc;
 
 use super::format::{pack_object_with_context, ObjectType};
 use super::pack::{self, compute_data_pack_target, PackType, SealedPack};
-use super::write_session::PendingUpload;
 use super::Repository;
 use crate::compress;
 use crate::index::dedup_cache::{DedupPrefilter, TieredHit};
@@ -374,13 +373,8 @@ impl Repository {
         self.write_session
             .as_mut()
             .expect("write session active while flushing writer")
-            .pending_uploads
-            .push(PendingUpload {
-                pack_id,
-                journal_chunks,
-                journal: true,
-                bytes,
-                handle: std::thread::spawn(move || data.put_to(&*storage, &key)),
+            .spawn_upload(pack_id, journal_chunks, bytes, move || {
+                data.put_to(&*storage, &key)
             });
 
         Ok(())

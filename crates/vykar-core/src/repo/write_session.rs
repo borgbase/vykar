@@ -56,6 +56,8 @@ enum RecoverResult {
 
 /// A background pack upload plus what to journal once it is confirmed.
 pub(crate) struct PendingUpload {
+    /// Sent on the session's completion channel when the thread finishes.
+    seq: u64,
     pub(crate) pack_id: PackId,
     pub(crate) journal_chunks: Vec<PendingChunkEntry>,
     /// Cleared by rollback: the pack is still uploaded (an orphan for
@@ -65,6 +67,21 @@ pub(crate) struct PendingUpload {
     /// (0 for a staged pack, whose bytes are already in a temp file).
     pub(crate) bytes: usize,
     pub(crate) handle: JoinHandle<Result<()>>,
+}
+
+/// Announces an upload thread's completion on drop, so the send also happens
+/// when the upload panics (dev/test builds unwind).
+struct UploadDone {
+    tx: crossbeam_channel::Sender<u64>,
+    seq: u64,
+}
+
+impl Drop for UploadDone {
+    fn drop(&mut self) {
+        // The receiver lives as long as the session; a closed channel only
+        // means nobody is waiting any more.
+        let _ = self.tx.send(self.seq);
+    }
 }
 
 /// Marker state for a session's `.json` file during recovery scanning.
@@ -108,9 +125,15 @@ pub(crate) struct WriteSessionState {
     pub(crate) data_pack_writer: PackWriter,
     /// Pack writer for item-stream metadata chunks.
     pub(crate) tree_pack_writer: PackWriter,
-    /// Background pack uploads waiting to be joined. A pack enters
-    /// `pending_journal` only after its upload returns `Ok`.
+    /// Background pack uploads waiting to be joined, in no particular
+    /// order. A pack enters `pending_journal` only after its upload returns
+    /// `Ok`.
     pub(crate) pending_uploads: Vec<PendingUpload>,
+    /// Upload threads send their `seq` here as they finish, so a blocked
+    /// caller wakes on whichever upload completes first.
+    upload_done_tx: crossbeam_channel::Sender<u64>,
+    upload_done_rx: crossbeam_channel::Receiver<u64>,
+    next_upload_seq: u64,
     /// Configurable limit for in-flight background pack uploads.
     pub(crate) max_in_flight_uploads: usize,
     /// Also bound sealed-but-unwritten packs by bytes: the queued packs plus
@@ -167,10 +190,14 @@ impl WriteSessionState {
         max_in_flight_uploads: usize,
         hash_algo: HashAlgorithm,
     ) -> Self {
+        let (upload_done_tx, upload_done_rx) = crossbeam_channel::unbounded();
         Self {
             data_pack_writer: PackWriter::new(PackType::Data, data_target, hash_algo),
             tree_pack_writer: PackWriter::new(PackType::Tree, tree_target, hash_algo),
             pending_uploads: Vec::new(),
+            upload_done_tx,
+            upload_done_rx,
+            next_upload_seq: 0,
             max_in_flight_uploads,
             cap_pending_upload_bytes: false,
             stream_data_packs: false,
@@ -195,6 +222,65 @@ impl WriteSessionState {
     }
 
     // --- Upload management ---
+
+    /// Run `upload` on a background thread and queue it for joining.
+    /// `bytes` is the heap the upload holds until it returns.
+    pub(crate) fn spawn_upload<F>(
+        &mut self,
+        pack_id: PackId,
+        journal_chunks: Vec<PendingChunkEntry>,
+        bytes: usize,
+        upload: F,
+    ) where
+        F: FnOnce() -> Result<()> + Send + 'static,
+    {
+        let seq = self.next_upload_seq;
+        self.next_upload_seq += 1;
+        let done = UploadDone {
+            tx: self.upload_done_tx.clone(),
+            seq,
+        };
+        let handle = std::thread::spawn(move || {
+            let _done = done;
+            upload()
+        });
+        self.pending_uploads.push(PendingUpload {
+            seq,
+            pack_id,
+            journal_chunks,
+            journal: true,
+            bytes,
+            handle,
+        });
+    }
+
+    /// Block until any queued upload finishes, then join and journal it.
+    /// No-op when nothing is queued.
+    fn finish_any_upload(&mut self) -> Result<()> {
+        loop {
+            if self.pending_uploads.is_empty() {
+                return Ok(());
+            }
+            if let Some(i) = self
+                .pending_uploads
+                .iter()
+                .position(|u| u.handle.is_finished())
+            {
+                let upload = self.pending_uploads.swap_remove(i);
+                return self.finish_upload(upload);
+            }
+            // Every queued upload sends exactly once; messages from uploads
+            // already joined elsewhere are skipped.
+            let seq = self
+                .upload_done_rx
+                .recv()
+                .map_err(|_| VykarError::Other("upload completion channel closed".into()))?;
+            if let Some(i) = self.pending_uploads.iter().position(|u| u.seq == seq) {
+                let upload = self.pending_uploads.swap_remove(i);
+                return self.finish_upload(upload);
+            }
+        }
+    }
 
     /// Join one upload and journal its pack if it succeeded and was not
     /// rolled back. A failed upload is never journaled.
@@ -246,6 +332,8 @@ impl WriteSessionState {
                 first_err.get_or_insert(e);
             }
         }
+        // All joined, so all have sent: drop their stale completions.
+        while self.upload_done_rx.try_recv().is_ok() {}
         // Final flush of journal before returning (best-effort). Skipped when
         // unchanged since the last successful write, so a repeated flush
         // (Phase 1 drain, then commit) does not PUT the journal twice.
@@ -275,9 +363,8 @@ impl WriteSessionState {
                 .max_in_flight_uploads
                 .saturating_add(UPLOAD_QUEUE_HEADROOM)
         {
-            // All slots + buffer full — block on one handle.
-            let upload = self.pending_uploads.swap_remove(0);
-            self.finish_upload(upload)?;
+            // All slots + buffer full — wait for the first one to finish.
+            self.finish_any_upload()?;
             self.maybe_write_pending_index(storage, crypto);
         }
         // Byte cap on sealed-but-unwritten packs. `incoming` is the buffer
@@ -293,9 +380,8 @@ impl WriteSessionState {
                 if pending.saturating_add(incoming) <= cap {
                     break;
                 }
-                // Block on the oldest upload (FIFO).
-                let upload = self.pending_uploads.remove(0);
-                self.finish_upload(upload)?;
+                // Wait for whichever queued upload finishes first.
+                self.finish_any_upload()?;
                 blocked = true;
             }
             if blocked {
@@ -1494,38 +1580,34 @@ mod tests {
 
     // ── Upload confirmation ──────────────────────────────────────────────
 
-    fn spawn_upload(storage: &std::sync::Arc<PackUploadBackend>, seed: u8) -> PendingUpload {
+    fn spawn_upload(
+        ws: &mut WriteSessionState,
+        storage: &std::sync::Arc<PackUploadBackend>,
+        seed: u8,
+    ) {
         let (pack_id, data, entry) = fake_pack(seed);
         let storage = std::sync::Arc::clone(storage);
-        PendingUpload {
-            pack_id,
-            journal_chunks: entry.chunks,
-            journal: true,
-            bytes: 0,
-            handle: std::thread::spawn(move || storage.put_owned(&pack_id.storage_key(), data)),
-        }
+        ws.spawn_upload(pack_id, entry.chunks, 0, move || {
+            storage.put_owned(&pack_id.storage_key(), data)
+        });
     }
 
-    /// An upload that holds `bytes` and completes only when `release` fires.
+    /// Queue an upload that holds `bytes` and completes only when the
+    /// returned sender fires.
     fn gated_upload(
+        ws: &mut WriteSessionState,
         storage: &std::sync::Arc<PackUploadBackend>,
         seed: u8,
         bytes: usize,
-    ) -> (PendingUpload, std::sync::mpsc::Sender<()>) {
+    ) -> std::sync::mpsc::Sender<()> {
         let (pack_id, data, entry) = fake_pack(seed);
         let storage = std::sync::Arc::clone(storage);
         let (release, gate) = std::sync::mpsc::channel::<()>();
-        let upload = PendingUpload {
-            pack_id,
-            journal_chunks: entry.chunks,
-            journal: true,
-            bytes,
-            handle: std::thread::spawn(move || {
-                let _ = gate.recv();
-                storage.put_owned(&pack_id.storage_key(), data)
-            }),
-        };
-        (upload, release)
+        ws.spawn_upload(pack_id, entry.chunks, bytes, move || {
+            let _ = gate.recv();
+            storage.put_owned(&pack_id.storage_key(), data)
+        });
+        release
     }
 
     #[test]
@@ -1539,8 +1621,7 @@ mod tests {
 
         // Disabled: a queued pack plus the incoming one may exceed the
         // target; only the count limit applies.
-        let (upload, release) = gated_upload(&storage, 1, target);
-        ws.pending_uploads.push(upload);
+        let release = gated_upload(&mut ws, &storage, 1, target);
         ws.cap_pending_uploads(&*storage, &crypto, target).unwrap();
         assert_eq!(ws.pending_uploads.len(), 1);
         release.send(()).unwrap();
@@ -1548,8 +1629,7 @@ mod tests {
 
         // Enabled: the same call waits for the queued pack to be written.
         ws.cap_pending_upload_bytes = true;
-        let (upload, release) = gated_upload(&storage, 2, target);
-        ws.pending_uploads.push(upload);
+        let release = gated_upload(&mut ws, &storage, 2, target);
         let releaser = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(100));
             release.send(()).unwrap();
@@ -1561,8 +1641,7 @@ mod tests {
         releaser.join().unwrap();
 
         // A pack that fits next to the queued one does not block.
-        let (upload, release) = gated_upload(&storage, 3, target / 4);
-        ws.pending_uploads.push(upload);
+        let release = gated_upload(&mut ws, &storage, 3, target / 4);
         ws.cap_pending_uploads(&*storage, &crypto, target / 2)
             .unwrap();
         assert_eq!(ws.pending_uploads.len(), 1);
@@ -1584,9 +1663,9 @@ mod tests {
         let (bad, _, _) = fake_pack(2);
         storage.fail.lock().unwrap().insert(bad.storage_key());
 
-        ws.pending_uploads.push(spawn_upload(&storage, 1));
-        ws.pending_uploads.push(spawn_upload(&storage, 2));
-        ws.pending_uploads.push(spawn_upload(&storage, 3));
+        spawn_upload(&mut ws, &storage, 1);
+        spawn_upload(&mut ws, &storage, 2);
+        spawn_upload(&mut ws, &storage, 3);
 
         // What `flush_on_abort` does: join everything, warn on failure.
         for upload in std::mem::take(&mut ws.pending_uploads) {
@@ -1610,10 +1689,53 @@ mod tests {
         let mut ws = journal_session();
         let (bad, _, _) = fake_pack(2);
         storage.fail.lock().unwrap().insert(bad.storage_key());
-        ws.pending_uploads.push(spawn_upload(&storage, 1));
-        ws.pending_uploads.push(spawn_upload(&storage, 2));
+        spawn_upload(&mut ws, &storage, 1);
+        spawn_upload(&mut ws, &storage, 2);
 
         assert!(ws.wait_pending_uploads(&*storage, &crypto).is_err());
         assert_eq!(stored_pack_ids(&*storage, &crypto), vec![fake_pack(1).0]);
+    }
+
+    /// With every upload slot taken, the consumer resumes as soon as any
+    /// upload finishes — not only when the oldest (or an arbitrary) one does.
+    #[test]
+    fn count_cap_wakes_on_first_finished_upload() {
+        let storage = std::sync::Arc::new(PackUploadBackend::new(std::sync::Arc::new(
+            MemoryBackend::new(),
+        )));
+        let crypto = test_crypto();
+        let mut ws = journal_session();
+        let slots = ws.max_in_flight_uploads + UPLOAD_QUEUE_HEADROOM;
+        let mut gates: Vec<_> = (1..=slots as u8)
+            .map(|seed| gated_upload(&mut ws, &storage, seed, 0))
+            .collect();
+        let last = gates.pop().unwrap();
+        last.send(()).unwrap();
+        // Releases the rest once the cap returns, or after a timeout so a
+        // regression fails the assertions below instead of hanging.
+        let (returned, wait) = std::sync::mpsc::channel::<()>();
+        let watchdog = std::thread::spawn(move || {
+            let _ = wait.recv_timeout(std::time::Duration::from_secs(10));
+            for gate in gates {
+                let _ = gate.send(());
+            }
+        });
+
+        let start = std::time::Instant::now();
+        ws.cap_pending_uploads(&*storage, &crypto, 0).unwrap();
+        returned.send(()).unwrap();
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(ws.pending_uploads.len(), slots - 1);
+        let journaled: Vec<PackId> = ws
+            .pending_journal
+            .to_wire()
+            .iter()
+            .map(|e| e.pack_id)
+            .collect();
+        assert_eq!(journaled, vec![fake_pack(slots as u8).0]);
+
+        watchdog.join().unwrap();
+        ws.wait_pending_uploads(&*storage, &crypto).unwrap();
+        assert_eq!(ws.pending_journal.len(), slots);
     }
 }

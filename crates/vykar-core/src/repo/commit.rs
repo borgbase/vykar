@@ -57,7 +57,19 @@ impl Repository {
     /// concurrent writer put there since. The sidecar is never trusted for
     /// writes either way.
     pub(super) fn load_chunk_index_with_sidecar(&mut self, sidecar: Option<u64>) -> Result<()> {
-        let (gen, index) = self.reload_full_index_with_generation()?;
+        let index = self.reload_full_index_with_generation()?;
+        self.install_chunk_index(index, sidecar);
+        Ok(())
+    }
+
+    /// Install an index fetched with [`Self::fetch_full_index`] *after*
+    /// `sidecar` was read, as [`Self::load_chunk_index_with_sidecar`] does.
+    ///
+    /// The order matters for the rewrite below: a sidecar read after the
+    /// index could already hold a concurrent writer's newer generation, and
+    /// "fixing" it to this older one would clobber it.
+    pub(super) fn install_chunk_index(&mut self, index: (u64, ChunkIndex), sidecar: Option<u64>) {
+        let (gen, index) = index;
         self.index_generation = gen;
         self.chunk_index = index;
         if sidecar != Some(gen) {
@@ -65,7 +77,6 @@ impl Repository {
             let _ = self.storage.put("index.gen", &gen.to_le_bytes());
         }
         self.rebase_pack_target_from_index();
-        Ok(())
     }
 
     /// Load the chunk index from storage, bypassing the local blob cache.
@@ -691,7 +702,15 @@ impl Repository {
         storage: &dyn vykar_storage::StorageBackend,
         crypto: &dyn CryptoEngine,
     ) -> Result<(u64, ChunkIndex)> {
-        let Some(index_data) = storage.get("index")? else {
+        Self::decode_full_index(storage.get("index")?, crypto)
+    }
+
+    /// Decode a fetched `index` object (`None` = absent: generation 0, empty).
+    pub(crate) fn decode_full_index(
+        index_data: Option<Vec<u8>>,
+        crypto: &dyn CryptoEngine,
+    ) -> Result<(u64, ChunkIndex)> {
+        let Some(index_data) = index_data else {
             return Ok((0, ChunkIndex::new()));
         };
         // Free the ciphertext before building the index from the plaintext.

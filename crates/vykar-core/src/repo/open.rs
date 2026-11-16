@@ -264,22 +264,36 @@ impl Repository {
         cache_dir: Option<PathBuf>,
         opts: OpenOptions,
     ) -> Result<Self> {
-        let mut repo = Self::open_inner(storage, passphrase, cache_dir, &opts)?;
-        if opts.load_index {
-            // `index_generation` still holds the `index.gen` hint read above.
+        let (mut repo, file_cache_load) = Self::open_inner(storage, passphrase, cache_dir, &opts)?;
+        // The index GET overlaps the file cache load (local disk), which
+        // runs on its own thread; it is decoded only after that load has
+        // finished, so the two never hold their transient buffers at once.
+        let raw_index = opts.load_index.then(|| repo.storage.get("index"));
+        if let Some(handle) = file_cache_load {
+            repo.file_cache = handle
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        }
+        if let Some(raw_index) = raw_index {
+            let index = Self::decode_full_index(raw_index?, repo.crypto.as_ref())?;
+            // `index_generation` still holds the `index.gen` hint read in
+            // `open_inner`, before the index GET.
             let sidecar = repo.index_generation;
-            repo.load_chunk_index_with_sidecar(Some(sidecar))?;
+            repo.install_chunk_index(index, Some(sidecar));
         }
         Ok(repo)
     }
 
+    /// Open the repository. With `opts.load_file_cache` the local file
+    /// cache is loaded on a helper thread that the caller joins: it reads
+    /// only local disk, so it overlaps the remaining round trips of open.
+    #[allow(clippy::type_complexity)]
     fn open_inner(
         storage: Box<dyn StorageBackend>,
         passphrase: Option<&str>,
         cache_dir: Option<PathBuf>,
         opts: &OpenOptions,
-    ) -> Result<Self> {
-        let skip_file_cache = !opts.load_file_cache;
+    ) -> Result<(Self, Option<std::thread::JoinHandle<FileCache>>)> {
         let storage: Arc<dyn StorageBackend> = Arc::from(storage);
 
         // Read config
@@ -342,6 +356,28 @@ impl Repository {
                 }
             };
 
+        // Load the file cache from local disk (not from the repo) while the
+        // round trips below run. Spawned only now that the crypto engine
+        // that decrypts it exists.
+        let file_cache_load = if opts.load_file_cache {
+            let crypto = Arc::clone(&crypto);
+            let repo_id = repo_config.id.clone();
+            let cache_dir = cache_dir.clone();
+            let spawned = std::thread::Builder::new()
+                .name("file-cache-load".into())
+                .spawn(move || FileCache::load(&repo_id, crypto.as_ref(), cache_dir.as_deref()));
+            match spawned {
+                Ok(handle) => Some(handle),
+                Err(e) => {
+                    return Err(VykarError::Other(format!(
+                        "failed to spawn file cache load thread: {e}"
+                    )))
+                }
+            }
+        } else {
+            None
+        };
+
         // Read advisory index.gen sidecar (cache hint only, not trusted for writes).
         let index_generation = match storage.get("index.gen")? {
             Some(data) => <[u8; 8]>::try_from(data.as_slice())
@@ -363,14 +399,7 @@ impl Repository {
         let skipped_snapshots = refresh.skipped;
         let manifest = Manifest::from_snapshot_entries(refresh.entries);
 
-        // Load file cache from local disk (not from the repo).
-        let file_cache = if skip_file_cache {
-            FileCache::new()
-        } else {
-            FileCache::load(&repo_config.id, crypto.as_ref(), cache_dir.as_deref())
-        };
-
-        Ok(Repository {
+        let repo = Repository {
             storage,
             crypto,
             manifest,
@@ -378,7 +407,8 @@ impl Repository {
             chunk_index: ChunkIndex::new(),
             config: repo_config,
             format,
-            file_cache,
+            // Filled in by `open` from `file_cache_load`.
+            file_cache: FileCache::new(),
             blob_cache: BlobCache::new(BLOB_CACHE_MAX_BYTES),
             index_generation,
             index_dirty: false,
@@ -389,13 +419,83 @@ impl Repository {
             lock_fence: None,
             key_blob,
             request_concurrency: 1,
-        })
+        };
+        Ok((repo, file_cache_load))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::MemoryBackend;
+    use std::sync::Mutex;
+    use vykar_storage::{delegate_storage_backend, InnerBackend};
+
+    /// Logs every `get` key in call order.
+    struct GetLog {
+        inner: Arc<dyn StorageBackend>,
+        gets: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl InnerBackend for GetLog {
+        fn inner_backend(&self) -> &dyn StorageBackend {
+            &*self.inner
+        }
+    }
+
+    delegate_storage_backend! {
+        for GetLog;
+        except [get];
+
+        fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+            self.gets.lock().unwrap().push(key.to_string());
+            self.inner.get(key)
+        }
+    }
+
+    /// With `with_index`, the index is still fetched after the `index.gen`
+    /// hint it is compared against (see `install_chunk_index`), and it is
+    /// installed with its generation.
+    #[test]
+    fn open_with_index_reads_the_sidecar_before_the_index() {
+        crate::testutil::init_test_environment();
+        let inner: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+        Repository::init(
+            Box::new(Arc::clone(&inner)),
+            EncryptionMode::None,
+            ChunkerConfig::default(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        // Make the sidecar disagree, so the open must repair it.
+        inner.put("index.gen", &7u64.to_le_bytes()).unwrap();
+
+        let gets = Arc::new(Mutex::new(Vec::new()));
+        let storage = Box::new(GetLog {
+            inner: Arc::clone(&inner),
+            gets: Arc::clone(&gets),
+        });
+        let cache = tempfile::tempdir().unwrap();
+        let repo = Repository::open(
+            storage,
+            None,
+            Some(cache.path().to_path_buf()),
+            OpenOptions::new().with_index(),
+        )
+        .unwrap();
+
+        let gets = gets.lock().unwrap().clone();
+        let pos = |k: &str| gets.iter().position(|g| g == k).expect(k);
+        assert!(pos("index.gen") < pos("index"), "{gets:?}");
+        assert_eq!(repo.index_generation, 0);
+        assert_eq!(
+            inner.get("index.gen").unwrap().unwrap(),
+            0u64.to_le_bytes(),
+            "the stale sidecar is rewritten to the index's generation"
+        );
+    }
 
     /// Pins the plaintext chunk-ID key derivation for both formats, through
     /// the production helper. This value *is* the dedup identity of every

@@ -53,6 +53,10 @@ header .meta { color: var(--muted); font-size: 0.85rem; }
 .outcome-partial { color: var(--warn); }
 .outcome-errors { color: var(--err); }
 .outcome-skipped { color: var(--muted); }
+.state-ok { color: var(--ok); }
+.state-error { color: var(--err); }
+.state-skipped, .state-pending { color: var(--muted); }
+.asof { color: var(--muted); font-size: 0.75rem; }
 section { margin-bottom: 1.5rem; }
 section h2 { font-size: 0.9rem; text-transform: uppercase; letter-spacing: 0.05em;
   color: var(--muted); margin: 0 0 0.5rem; font-weight: 600; }
@@ -205,19 +209,37 @@ pub(crate) fn render_html(status: &DaemonStatus) -> String {
         out.push_str(
             "<table><thead><tr>\
                 <th>Name</th><th>URL</th><th>Snapshots</th>\
-                <th>Last snapshot</th><th>Size</th><th>Next run</th>\
+                <th>Last snapshot</th><th>Size</th><th>Next run</th><th>Status</th>\
              </tr></thead><tbody>",
         );
         for r in &status.repos {
+            let state_class = match r.state.as_str() {
+                "ok" => "state-ok",
+                "error" => "state-error",
+                "skipped" => "state-skipped",
+                _ => "state-pending",
+            };
+            let asof = if r.refreshed_at == "—" {
+                String::new()
+            } else {
+                format!(
+                    " <span class=\"asof\">as of {}</span>",
+                    esc(&r.refreshed_at)
+                )
+            };
             let _ = write!(
                 out,
-                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td>\
+                 <td><span class=\"{}\">{}</span>{}</td></tr>",
                 esc(&r.name),
                 esc(&r.url),
                 esc(&r.snapshots),
                 esc(&r.last_snapshot),
                 esc(&r.size),
                 esc(&r.next_run),
+                state_class,
+                esc(&r.state),
+                asof,
             );
         }
         out.push_str("</tbody></table>");
@@ -327,6 +349,8 @@ mod tests {
                 last_snapshot: "5m ago".into(),
                 size: "1.2 GB".into(),
                 next_run: "2026-04-27 12:00:00".into(),
+                state: "error".into(),
+                refreshed_at: "2026-04-27 09:58:31".into(),
             }],
             recent_snapshots: vec![SnapshotRow {
                 id: "snap-xyz".into(),
@@ -369,6 +393,20 @@ mod tests {
         assert!(html.contains("home"));
         assert!(html.contains("0 * * * *"));
         assert!(html.contains("host1"));
+    }
+
+    #[test]
+    fn repo_row_shows_state_and_freshness() {
+        let html = render_html(&fixture());
+        assert!(html.contains("<span class=\"state-error\">error</span>"));
+        assert!(html.contains("as of 2026-04-27 09:58:31"));
+
+        let mut s = fixture();
+        s.repos[0].state = "pending".into();
+        s.repos[0].refreshed_at = "—".into();
+        let html = render_html(&s);
+        assert!(html.contains("<span class=\"state-pending\">pending</span>"));
+        assert!(!html.contains("as of"));
     }
 
     #[test]

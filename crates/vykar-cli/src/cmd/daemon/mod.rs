@@ -5,9 +5,12 @@ mod http;
 mod poll;
 mod render;
 mod status;
+mod worker;
 
 use std::net::SocketAddr;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::Sender;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use vykar_core::app::passphrase::configured_passphrase;
@@ -19,12 +22,7 @@ use crate::dispatch::{local_repo_unavailable, run_default_actions, warn_if_untru
 use crate::error::{CliError, CliResult};
 use crate::signal::{RELOAD, SHUTDOWN, TRIGGER};
 
-use poll::StatusPoller;
 use status::SharedStatus;
-
-/// How often the daemon runs the cheap snapshot-set change detection poll
-/// between backup cycles (GitHub #159).
-const STATUS_POLL_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Ask the system allocator to return freed memory to the OS.
 ///
@@ -33,7 +31,7 @@ const STATUS_POLL_INTERVAL: Duration = Duration::from_secs(60);
 /// in arena free lists. `malloc_trim(0)` tells glibc to release those
 /// pages via madvise/munmap.
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
-fn release_malloc_arenas() {
+pub(super) fn release_malloc_arenas() {
     extern "C" {
         fn malloc_trim(pad: libc::size_t) -> libc::c_int;
     }
@@ -44,7 +42,7 @@ fn release_malloc_arenas() {
 }
 
 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
-fn release_malloc_arenas() {}
+pub(super) fn release_malloc_arenas() {}
 
 /// Borrow every repository's effective schedule, index-aligned with `repos`.
 fn repo_schedules(repos: &[ResolvedRepo]) -> Vec<&ScheduleConfig> {
@@ -162,7 +160,6 @@ pub(crate) fn run_daemon(source: ConfigSource, http_listen: Option<SocketAddr>) 
     let started_at = Instant::now();
     let status = status::new_shared();
     status::init(&status, &repos, started_at);
-    status::refresh_repos(&status, &repos);
 
     let http_handle = if let Some(addr) = http_listen {
         Some(http::spawn(addr, status.clone(), &SHUTDOWN)?)
@@ -180,15 +177,16 @@ pub(crate) fn run_daemon(source: ConfigSource, http_listen: Option<SocketAddr>) 
     log_startup_runs(&repos, &plan);
     log_earliest_next_run(&plan);
 
+    // Status I/O runs on its own thread (GitHub #206). When a cycle is due at
+    // startup, hold the worker off until it ends so hook-skipped repos are
+    // never contacted.
+    let cycle_running = Arc::new(AtomicBool::new(!plan.due(SystemTime::now()).is_empty()));
+    let status_tx = worker::spawn(status.clone(), cycle_running.clone(), &SHUTDOWN)
+        .map_err(|e| CliError::from(format!("failed to spawn status worker: {e}")))?;
+    send_configure(&status_tx, &repos);
+
     status::touch_process(&status, started_at, plan.next_wake());
     status::set_repo_next_runs(&status, &repo_next_runs(&repos, &plan));
-
-    // Cheap out-of-band change detection between cycles (GitHub #159). Seed the
-    // baseline from current storage so the first poll only fires a refresh on a
-    // genuine change.
-    let mut poller = StatusPoller::new();
-    poller.reset(&repos);
-    let mut next_poll = Instant::now() + STATUS_POLL_INTERVAL;
 
     let exit_result: CliResult<()> = loop {
         if SHUTDOWN.load(Ordering::SeqCst) {
@@ -209,9 +207,7 @@ pub(crate) fn run_daemon(source: ConfigSource, http_listen: Option<SocketAddr>) 
                     );
                     repos = new_repos;
                     status::init(&status, &repos, started_at);
-                    status::refresh_repos(&status, &repos);
-                    poller.reset(&repos);
-                    next_poll = Instant::now() + STATUS_POLL_INTERVAL;
+                    send_configure(&status_tx, &repos);
 
                     log_registered_repos(&repos);
 
@@ -237,16 +233,12 @@ pub(crate) fn run_daemon(source: ConfigSource, http_listen: Option<SocketAddr>) 
             tracing::info!("SIGUSR1 received, triggering immediate backup");
             // An ad-hoc trigger runs every repository regardless of cadence.
             let all: Vec<&ResolvedRepo> = repos.iter().collect();
-            run_backup_cycle(&all, &repos, &status);
+            run_cycle(&all, &repos, &status, &status_tx, &cycle_running);
 
             if SHUTDOWN.load(Ordering::SeqCst) {
                 tracing::info!("shutdown signal received, exiting");
                 break Ok(());
             }
-
-            // The cycle already ran refresh_repos; re-baseline the poller.
-            poller.reset(&repos);
-            next_poll = Instant::now() + STATUS_POLL_INTERVAL;
 
             // Only slots missed during the ad-hoc cycle are recalculated;
             // repos whose slot is still ahead keep their configured cadence.
@@ -262,7 +254,7 @@ pub(crate) fn run_daemon(source: ConfigSource, http_listen: Option<SocketAddr>) 
         if !due.is_empty() {
             let due_repos: Vec<&ResolvedRepo> =
                 due.iter().filter_map(|&idx| repos.get(idx)).collect();
-            run_backup_cycle(&due_repos, &repos, &status);
+            run_cycle(&due_repos, &repos, &status, &status_tx, &cycle_running);
 
             if SHUTDOWN.load(Ordering::SeqCst) {
                 tracing::info!("shutdown signal received, exiting");
@@ -280,18 +272,6 @@ pub(crate) fn run_daemon(source: ConfigSource, http_listen: Option<SocketAddr>) 
                 }
             }
             log_earliest_next_run(&plan);
-
-            // The cycle already ran refresh_repos; re-baseline the poller.
-            poller.reset(&repos);
-            next_poll = Instant::now() + STATUS_POLL_INTERVAL;
-        }
-
-        // Between cycles, cheaply detect out-of-band snapshot changes (CLI
-        // delete/prune, backups from other hosts) and run the full status
-        // refresh only when the snapshot set actually changed (GitHub #159).
-        if Instant::now() >= next_poll {
-            poller.poll_and_refresh(&status, &repos);
-            next_poll = Instant::now() + STATUS_POLL_INTERVAL;
         }
 
         status::touch_process(&status, started_at, plan.next_wake());
@@ -300,6 +280,8 @@ pub(crate) fn run_daemon(source: ConfigSource, http_listen: Option<SocketAddr>) 
         std::thread::sleep(Duration::from_secs(1));
     };
 
+    // The status worker is not joined: it may be inside a connect timeout, and
+    // it exits on its own once it sees SHUTDOWN.
     if let Some(handle) = http_handle {
         // SHUTDOWN is set; the HTTP loop polls it within POLL_INTERVAL.
         if let Err(e) = handle.join() {
@@ -325,14 +307,51 @@ fn log_registered_repos(repos: &[ResolvedRepo]) {
     }
 }
 
+fn send_configure(tx: &Sender<worker::Msg>, repos: &[ResolvedRepo]) {
+    if tx
+        .send(worker::Msg::Configure(Arc::new(repos.to_vec())))
+        .is_err()
+    {
+        tracing::warn!("status worker is gone; status page will not update");
+    }
+}
+
+/// Run a cycle with status I/O held off, then tell the worker which repos ran
+/// and which were skipped. The message goes first so the worker applies the
+/// skip marks before it is allowed to do I/O again.
+fn run_cycle(
+    due: &[&ResolvedRepo],
+    all: &[ResolvedRepo],
+    status: &SharedStatus,
+    status_tx: &Sender<worker::Msg>,
+    cycle_running: &AtomicBool,
+) {
+    cycle_running.store(true, Ordering::SeqCst);
+    let report = run_backup_cycle(due, all, status);
+    let _ = status_tx.send(worker::Msg::CycleDone {
+        ran: report.ran,
+        skipped: report.skipped,
+    });
+    cycle_running.store(false, Ordering::SeqCst);
+}
+
+/// Repositories a cycle reached, by name. Repos not reached because of
+/// `SHUTDOWN` are in neither list.
+struct CycleReport {
+    ran: Vec<String>,
+    skipped: Vec<String>,
+}
+
 /// Run a backup cycle for the `due` repositories.
 ///
 /// `all` is the full configured set: it decides multi-repo presentation (the
 /// `=== Repository ===` headers and the unavailable-local-repo preflight skip,
-/// which must not switch off just because a single repo came due), and it is
-/// what the end-of-cycle status refresh rebuilds its rows from — passing only
-/// the due subset would drop the other repos from the status page.
-fn run_backup_cycle(due: &[&ResolvedRepo], all: &[ResolvedRepo], status: &SharedStatus) {
+/// which must not switch off just because a single repo came due).
+fn run_backup_cycle(
+    due: &[&ResolvedRepo],
+    all: &[ResolvedRepo],
+    status: &SharedStatus,
+) -> CycleReport {
     tracing::info!("backup cycle starting");
     status::record_cycle_start(status);
     let cycle_start = Instant::now();
@@ -340,6 +359,10 @@ fn run_backup_cycle(due: &[&ResolvedRepo], all: &[ResolvedRepo], status: &Shared
     let mut had_partial = false;
     let mut attempted = 0usize;
     let mut skipped = 0usize;
+    let mut report = CycleReport {
+        ran: Vec::new(),
+        skipped: Vec::new(),
+    };
 
     let multi = all.len() > 1;
 
@@ -355,6 +378,7 @@ fn run_backup_cycle(due: &[&ResolvedRepo], all: &[ResolvedRepo], status: &Shared
         if multi {
             if let Some(path) = local_repo_unavailable(repo) {
                 tracing::info!(repo = name, path, "skipping unavailable repository");
+                report.skipped.push(name.to_string());
                 continue;
             }
         }
@@ -378,11 +402,15 @@ fn run_backup_cycle(due: &[&ResolvedRepo], all: &[ResolvedRepo], status: &Shared
                 if let Some(reason) = outcome.skipped {
                     tracing::info!(repo = name, reason, "backup cycle skipped");
                     skipped += 1;
+                    report.skipped.push(name.to_string());
+                } else {
+                    report.ran.push(name.to_string());
                 }
             }
             Err(e) => {
                 tracing::error!(repo = name, error = %e, "backup cycle failed for repo");
                 had_error = true;
+                report.ran.push(name.to_string());
             }
         }
     }
@@ -400,14 +428,12 @@ fn run_backup_cycle(due: &[&ResolvedRepo], all: &[ResolvedRepo], status: &Shared
     }
 
     status::record_cycle_end(status, elapsed, had_error, had_partial, all_skipped);
-    if !SHUTDOWN.load(Ordering::SeqCst) {
-        status::refresh_repos(status, all);
-    }
 
     // All Repository instances are dropped. Ask glibc to return freed pages.
     if !SHUTDOWN.load(Ordering::SeqCst) {
         release_malloc_arenas();
     }
+    report
 }
 
 fn log_next_run(delay: Duration) {

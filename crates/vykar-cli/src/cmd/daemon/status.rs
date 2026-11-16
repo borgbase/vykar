@@ -1,8 +1,9 @@
 //! Shared, read-only status snapshot served by the daemon's HTTP page.
 //!
-//! The daemon thread refreshes this struct after every backup cycle; the
-//! HTTP thread renders it. All fields are formatted strings ready for HTML
-//! or JSON; no repo I/O happens during request handling.
+//! The daemon thread owns the process, schedule and cycle fields; the status
+//! worker (`worker.rs`) owns the per-repo rows and recent snapshots and
+//! publishes them here. The HTTP thread renders it. All fields are formatted
+//! strings ready for HTML or JSON; no repo I/O happens during request handling.
 
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime};
@@ -16,6 +17,7 @@ use vykar_core::app::scheduler::repos_schedule_brief;
 use vykar_core::app::views::{self, format_last_snapshot};
 use vykar_core::commands::list;
 use vykar_core::config::ResolvedRepo;
+use vykar_types::error::Result;
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct RepoInfo {
@@ -26,8 +28,28 @@ pub(crate) struct RepoInfo {
     pub size: String,
     /// This repo's own next scheduled run — repos can have different cadences.
     /// Stamped by `set_repo_next_runs` and carried across row rebuilds by
-    /// `carry_over_next_runs` (`refresh_repos` does not know the schedule).
+    /// `carry_over_next_runs` (the status worker does not know the schedule).
     pub next_run: String,
+    /// Freshness of the row: `pending`, `ok`, `skipped` or `error`.
+    pub state: String,
+    /// When the row was last fetched successfully; "—" until then.
+    pub refreshed_at: String,
+}
+
+impl RepoInfo {
+    /// Row shown for a repo whose status has not been fetched yet.
+    pub(crate) fn placeholder(repo: &ResolvedRepo) -> Self {
+        Self {
+            name: repo.label_or_url().to_string(),
+            url: repo.config.repository.url.clone(),
+            snapshots: "—".to_string(),
+            last_snapshot: "—".to_string(),
+            size: "—".to_string(),
+            next_run: "—".to_string(),
+            state: "pending".to_string(),
+            refreshed_at: "—".to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -121,10 +143,12 @@ fn hostname() -> String {
         .unwrap_or_else(|_| "unknown".to_string())
 }
 
-const RECENT_SNAPSHOTS_LIMIT: usize = 10;
+pub(crate) const RECENT_SNAPSHOTS_LIMIT: usize = 10;
 
-/// Initialize the static parts (process info, sources, schedule) once at
-/// daemon startup. Per-repo data is populated by `refresh_repos`.
+/// Initialize the static parts (process info, sources, schedule) at startup
+/// and on reload, and seed one row per repo so `set_repo_next_runs` has rows
+/// to stamp before the status worker publishes. Rows whose name and URL are
+/// unchanged are kept; the worker owns their contents from then on.
 pub(crate) fn init(status: &SharedStatus, repos: &[ResolvedRepo], started_at: Instant) {
     let mut s = status.write().expect("status lock poisoned");
     s.process = ProcessInfo {
@@ -137,6 +161,20 @@ pub(crate) fn init(status: &SharedStatus, repos: &[ResolvedRepo], started_at: In
     let schedules: Vec<&_> = repos.iter().map(|r| &r.config.schedule).collect();
     s.schedule_brief = repos_schedule_brief(&schedules, false);
     s.sources = collect_sources(repos);
+    s.repos = seed_rows(repos, &s.repos);
+}
+
+fn seed_rows(repos: &[ResolvedRepo], previous: &[RepoInfo]) -> Vec<RepoInfo> {
+    repos
+        .iter()
+        .map(|repo| {
+            previous
+                .iter()
+                .find(|p| p.name == repo.label_or_url() && p.url == repo.config.repository.url)
+                .cloned()
+                .unwrap_or_else(|| RepoInfo::placeholder(repo))
+        })
+        .collect()
 }
 
 /// Refresh process uptime and the earliest next-run hint (what the loop wakes at).
@@ -154,7 +192,7 @@ pub(crate) fn touch_process(
 }
 
 /// Stamp each repo row with its own next scheduled run, matched by name.
-/// `refresh_repos` rebuilds the rows, so this is re-applied on every tick.
+/// The status worker rebuilds the rows, so this is re-applied on every tick.
 pub(crate) fn set_repo_next_runs(
     status: &SharedStatus,
     next_runs: &[(String, Option<SystemTime>)],
@@ -187,7 +225,7 @@ fn collect_sources(repos: &[ResolvedRepo]) -> Vec<SourceInfo> {
 
 /// Carry each repo's next-run string across a row rebuild, matched by name.
 ///
-/// `refresh_repos` builds fresh rows that do not know the schedule, so without
+/// The status worker builds rows that do not know the schedule, so without
 /// this the column would drop back to the placeholder until the daemon loop's
 /// next 1s tick re-stamped it — briefly visible in `/api/status.json`.
 fn carry_over_next_runs(new_rows: &mut [RepoInfo], previous: &[RepoInfo]) {
@@ -198,81 +236,63 @@ fn carry_over_next_runs(new_rows: &mut [RepoInfo], previous: &[RepoInfo]) {
     }
 }
 
-/// Re-read repo manifests and refresh the per-repo + recent-snapshots fields.
-/// Errors are logged via tracing and that repo's row is skipped.
-pub(crate) fn refresh_repos(status: &SharedStatus, repos: &[ResolvedRepo]) {
-    let mut repo_rows: Vec<RepoInfo> = Vec::new();
-    let mut all_snapshots: Vec<SnapshotRow> = Vec::new();
+/// Read one repo's summary row and its newest `RECENT_SNAPSHOTS_LIMIT`
+/// snapshots. The returned row has `state`/`refreshed_at` unset; the caller
+/// stamps them.
+pub(crate) fn fetch_repo(repo: &ResolvedRepo) -> Result<(RepoInfo, Vec<SnapshotRow>)> {
+    let name = repo.label_or_url().to_string();
+    let pass = configured_passphrase(&repo.config)?;
+    let pass_ref = pass.as_deref().map(|s| s.as_str());
 
-    for repo in repos {
-        let name = repo.label_or_url().to_string();
-        let url = repo.config.repository.url.clone();
+    let stats = vykar_core::commands::info::run(&repo.config, pass_ref)?;
+    let info = RepoInfo {
+        name: name.clone(),
+        url: repo.config.repository.url.clone(),
+        snapshots: stats.snapshot_count.to_string(),
+        last_snapshot: format_last_snapshot(stats.last_snapshot_time),
+        size: format_bytes(stats.unique_stored_size),
+        next_run: "—".to_string(),
+        state: String::new(),
+        refreshed_at: String::new(),
+    };
 
-        let pass = match configured_passphrase(&repo.config) {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::warn!(repo = %name, error = %e, "status refresh: passphrase resolution failed");
-                continue;
-            }
-        };
-        let pass_ref = pass.as_deref().map(|s| s.as_str());
-
-        match vykar_core::commands::info::run(&repo.config, pass_ref) {
-            Ok(stats) => {
-                repo_rows.push(RepoInfo {
-                    name: name.clone(),
-                    url,
-                    snapshots: stats.snapshot_count.to_string(),
-                    last_snapshot: format_last_snapshot(stats.last_snapshot_time),
-                    size: format_bytes(stats.unique_stored_size),
-                    // Carried over from the previous rows below; only a repo
-                    // that has never been stamped keeps this placeholder.
-                    next_run: "—".to_string(),
-                });
-            }
-            Err(e) => {
-                tracing::warn!(repo = %name, error = %e, "status refresh: info failed");
-                continue;
-            }
-        }
-
-        match list::list_snapshots_with_stats(&repo.config, pass_ref) {
-            Ok(listing) => {
-                if let Some(msg) =
-                    vykar_core::repo::snapshot_cache::describe_skipped(&listing.hidden)
-                {
-                    tracing::warn!(repo = %name, "status refresh: {msg}");
-                }
-                let mut snapshots = listing.snapshots;
-                snapshots.sort_by_key(|(s, _)| s.time);
-                for (s, stats) in snapshots {
-                    let row = views::SnapshotRowView::new(&s, stats.as_ref());
-                    all_snapshots.push(SnapshotRow {
-                        id: row.id,
-                        time: row.time,
-                        hostname: row.hostname,
-                        label: row.label,
-                        files: row.files,
-                        size: row.size,
-                        added: row.added,
-                        repo_name: name.clone(),
-                    });
-                }
-            }
-            Err(e) => {
-                tracing::warn!(repo = %name, error = %e, "status refresh: snapshot listing failed");
-            }
-        }
+    let listing = list::list_snapshots_with_stats(&repo.config, pass_ref)?;
+    if let Some(msg) = vykar_core::repo::snapshot_cache::describe_skipped(&listing.hidden) {
+        tracing::warn!(repo = %name, "status refresh: {msg}");
     }
+    let mut snapshots = listing.snapshots;
+    snapshots.sort_by_key(|(s, _)| std::cmp::Reverse(s.time));
+    snapshots.truncate(RECENT_SNAPSHOTS_LIMIT);
+    let rows = snapshots
+        .into_iter()
+        .map(|(s, stats)| {
+            let row = views::SnapshotRowView::new(&s, stats.as_ref());
+            SnapshotRow {
+                id: row.id,
+                time: row.time,
+                hostname: row.hostname,
+                label: row.label,
+                files: row.files,
+                size: row.size,
+                added: row.added,
+                repo_name: name.clone(),
+            }
+        })
+        .collect();
+    Ok((info, rows))
+}
 
-    // Most recent first across all repos.
-    all_snapshots.sort_by(|a, b| b.time.cmp(&a.time));
-    all_snapshots.truncate(RECENT_SNAPSHOTS_LIMIT);
+/// Replace the per-repo rows and the recent-snapshot list. `snapshots` holds
+/// each repo's own list; they are merged newest first and truncated.
+pub(crate) fn publish(status: &SharedStatus, mut rows: Vec<RepoInfo>, snapshots: Vec<SnapshotRow>) {
+    let mut recent = snapshots;
+    recent.sort_by(|a, b| b.time.cmp(&a.time));
+    recent.truncate(RECENT_SNAPSHOTS_LIMIT);
 
     let mut s = status.write().expect("status lock poisoned");
-    carry_over_next_runs(&mut repo_rows, &s.repos);
-    s.repos = repo_rows;
-    s.recent_snapshots = all_snapshots;
+    carry_over_next_runs(&mut rows, &s.repos);
+    s.repos = rows;
+    s.recent_snapshots = recent;
 }
 
 pub(crate) fn record_cycle_start(status: &SharedStatus) {
@@ -331,7 +351,88 @@ mod tests {
             last_snapshot: "N/A".to_string(),
             size: "0 B".to_string(),
             next_run: next_run.to_string(),
+            state: "ok".to_string(),
+            refreshed_at: "—".to_string(),
         }
+    }
+
+    fn snap(repo: &str, time: &str) -> SnapshotRow {
+        SnapshotRow {
+            id: format!("{repo}-{time}"),
+            time: time.to_string(),
+            hostname: "h".to_string(),
+            label: "l".to_string(),
+            files: "1".to_string(),
+            size: "1 B".to_string(),
+            added: "1 B".to_string(),
+            repo_name: repo.to_string(),
+        }
+    }
+
+    fn resolved(label: &str, url: &str) -> ResolvedRepo {
+        let mut config = vykar_core::config::VykarConfig::default();
+        config.repository.url = url.to_string();
+        ResolvedRepo {
+            label: Some(label.to_string()),
+            config,
+            global_hooks: Default::default(),
+            repo_hooks: Default::default(),
+            sources: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn init_seeds_rows_so_next_run_stamps_land() {
+        let status = new_shared();
+        init(&status, &[resolved("a", "/a")], Instant::now());
+        set_repo_next_runs(&status, &[("a".to_string(), None)]);
+
+        let s = status.read().unwrap();
+        assert_eq!(s.repos.len(), 1);
+        assert_eq!(s.repos[0].state, "pending");
+        assert_eq!(s.repos[0].next_run, "Off");
+    }
+
+    #[test]
+    fn seed_rows_keeps_same_name_and_url_only() {
+        let mut kept = row("a", "Off");
+        kept.url = "/a".to_string();
+        let mut moved = row("b", "Off");
+        moved.url = "/b-old".to_string();
+        let previous = vec![kept, moved, row("gone", "Off")];
+
+        let rows = seed_rows(&[resolved("a", "/a"), resolved("b", "/b-new")], &previous);
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            (rows[0].state.as_str(), rows[0].next_run.as_str()),
+            ("ok", "Off")
+        );
+        assert_eq!(
+            (rows[1].state.as_str(), rows[1].url.as_str()),
+            ("pending", "/b-new")
+        );
+    }
+
+    #[test]
+    fn publish_merges_snapshots_and_carries_next_run() {
+        let status = new_shared();
+        status.write().unwrap().repos = vec![row("a", "2026-07-25 13:00:00")];
+
+        let mut snaps: Vec<SnapshotRow> = (0..8)
+            .map(|i| snap("a", &format!("2026-01-0{} 00:00", i + 1)))
+            .collect();
+        snaps.extend((0..8).map(|i| snap("b", &format!("2026-02-0{} 00:00", i + 1))));
+
+        publish(&status, vec![row("a", "—"), row("b", "—")], snaps);
+
+        let s = status.read().unwrap();
+        assert_eq!(s.repos[0].next_run, "2026-07-25 13:00:00");
+        assert_eq!(s.repos[1].next_run, "—");
+        assert_eq!(s.recent_snapshots.len(), RECENT_SNAPSHOTS_LIMIT);
+        assert_eq!(s.recent_snapshots[0].time, "2026-02-08 00:00");
+        assert!(s.recent_snapshots[..8].iter().all(|r| r.repo_name == "b"));
+        assert_eq!(s.recent_snapshots[8].time, "2026-01-08 00:00");
     }
 
     #[test]

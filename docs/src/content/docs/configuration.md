@@ -687,7 +687,7 @@ What each surface reports:
 
 > **Monitoring:** a skip exits `0`, so `vykar backup && ping` reports success even though no snapshot was created. Ping from an `after_backup` hook instead, which does not run on a skip.
 
-> **Daemon status refresh:** a skip stops the cycle from connecting, but the daemon's status refresh (at startup, after each cycle) and its 60-second snapshot poll still contact every repository, whatever the hooks say. For an unreachable repository this logs warnings, and because the startup refresh runs before the first cycle, it can delay that cycle by several minutes.
+> **Daemon status refresh:** the status page is refreshed in the background and never delays the page or a backup cycle. A repository whose last cycle was skipped is not contacted until its next cycle runs. A repository that fails a status connect is marked `error` and not contacted again until its next cycle or a configuration reload (`SIGHUP`). Status calls do not retry. One case remains: without `on_startup`, each repository gets one status connect attempt at startup, because its hook has not run yet. Each row on the page shows its state (`pending`, `ok`, `skipped`, `error`) and when it was last refreshed.
 
 > **Passphrases:** the CLI and daemon resolve the passphrase before hooks run. That does not connect to the repository, but a `passcommand` that needs the network can still fail before a skip hook gets to run. GUI scheduled cycles run `before` hooks first.
 

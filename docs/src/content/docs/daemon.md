@@ -2,11 +2,6 @@
 title: "Schedule Backups"
 ---
 
-<figure>
-<a href="/images/daemon-status-page.webp"><img src="/images/daemon-status-page.webp" width="2198" height="1512" alt="Vykar daemon read-only status page" /></a>
-<figcaption>The daemon's optional <a href="#read-only-status-page">read-only status page</a>: a basic overview of backup status on server machines.</figcaption>
-</figure>
-
 `vykar daemon` runs scheduled backup cycles as a foreground process. Each cycle executes the default actions (`backup → prune → compact → check`) for the repositories that are due, sequentially. The shutdown flag is checked between steps.
 
 - **Scheduling**: a fixed interval (`schedule.every`) or a cron expression (`schedule.cron`), with optional random jitter. See [Configuration → Schedule](/configuration#schedule) for all fields.
@@ -69,6 +64,11 @@ slowest repository's cycle.
 
 ## Read-only status page
 
+<figure>
+<a href="/images/daemon-status-page.webp"><img src="/images/daemon-status-page.webp" width="2198" height="1512" alt="Vykar daemon read-only status page" /></a>
+<figcaption>The daemon's optional read-only status page: a basic overview of backup status on server machines.</figcaption>
+</figure>
+
 The daemon can serve a small read-only HTML page that mirrors the GUI overview — repository list, recent snapshots, sources, last cycle outcome, next scheduled run. It is **disabled by default**; opt in with `--http-listen` (or the `VYKAR_HTTP_LISTEN` environment variable):
 
 ```bash
@@ -80,19 +80,19 @@ The flag takes a full `host:port` address. There is no implicit default — pass
 What the page shows:
 - Process info: hostname, pid, version, uptime, next scheduled run — the **earliest** across repositories, which is what the loop wakes at
 - Schedule summary (interval / cron expression / `Off`, or `per-repo` when repositories have different cadences)
-- Per-repository snapshot count, last snapshot time, total stored size, and that repository's own next run (`Off` when its schedule is disabled)
+- Per-repository snapshot count, last snapshot time, total stored size, that repository's own next run (`Off` when its schedule is disabled), and a status: `pending` (not fetched yet), `ok`, `skipped` (its last cycle was skipped by a hook) or `error` (the last status fetch failed; the previous numbers are kept), with the time the row was last refreshed
 - The 10 most recent snapshots across all repositories
 - Configured sources and their target repositories
 - Last cycle: started/finished timestamps, duration, outcome (`ok` / `partial` / `errors` / `skipped`). `skipped` means every attempted repository was [skipped by a hook](/configuration#skipping-a-run)
 
-The page auto-refreshes every 30 seconds via a `<meta http-equiv="refresh">` tag — no JavaScript, no external assets, no cache. Data is refreshed at process startup, after every backup cycle, and after a SIGHUP reload.
+The page auto-refreshes every 30 seconds via a `<meta http-equiv="refresh">` tag — no JavaScript, no external assets, no cache. Repository data is refreshed in the background, so a slow or unreachable repository never delays the page or a backup cycle: after each cycle for the repositories that ran, on a SIGHUP reload for new or failed repositories, and when a 60-second check finds the set of snapshots changed (for example after a `delete` or `prune` from the CLI). At startup each repository is fetched once, after the first cycle when `on_startup` is set. Repositories in `skipped` or `error` are not contacted again until their next cycle. See [Daemon status refresh](/configuration#skipping-a-run).
 
 Endpoints:
 - `GET /` — HTML overview
 - `GET /healthz` — `200 OK` plain text, suitable for Docker / Kubernetes liveness probes
 - `GET /api/status.json` — same data as `/`, JSON-serialized
 
-In the JSON, `schedule_brief` carries the cadence shared by all repositories, `"Off"`, or the literal `"per-repo"` when they differ; each entry in `repos` has its own `next_run` string (or `"Off"`).
+In the JSON, `schedule_brief` carries the cadence shared by all repositories, `"Off"`, or the literal `"per-repo"` when they differ; each entry in `repos` has its own `next_run` string (or `"Off"`), a `state` (`pending` / `ok` / `skipped` / `error`) and `refreshed_at` (`"—"` until the first successful fetch).
 
 There are no write actions: no "Run Backup" button, no config edits, no authentication. The page is purely an inspection surface.
 

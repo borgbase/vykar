@@ -133,6 +133,8 @@ mod tests {
                 last_snapshot: "N/A".into(),
                 size: "0 B".into(),
                 next_run: "2026-04-27 12:00:00".into(),
+                state: "ok".into(),
+                refreshed_at: "2026-04-27 11:00:00".into(),
             }],
             recent_snapshots: vec![],
             sources: vec![],

@@ -32,6 +32,13 @@ where
     (start, stage)
 }
 
+/// Join a scoped helper thread, re-raising its panic on the caller.
+fn join_scoped<T>(handle: std::thread::ScopedJoinHandle<'_, T>) -> T {
+    handle
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+}
+
 fn log_stage_elapsed(ctx: (std::time::Instant, &'static str)) {
     debug!(
         stage = ctx.1,
@@ -271,37 +278,81 @@ impl Repository {
         new_file_cache: &mut file_cache::FileCache,
         progress: &mut Option<impl FnMut(crate::commands::backup::BackupProgressEvent)>,
     ) -> Result<()> {
-        // 0. Session-existence probe (fail fast, before flushing). If the
-        // marker was reaped by maintenance (e.g. because we missed too many
-        // heartbeats under extreme clock skew), skip the pack flush and
-        // surface the same typed error the later reconcile path would
-        // produce, so callers matching on `StaleChunksDuringCommit` catch
-        // this path too. Inconclusive storage errors fall through — the
-        // reconcile step is still a safety net.
+        // The reads that start the commit are independent of each other. The
+        // fresh remote index (megabytes; only fetched when there is a delta
+        // to merge into it) is fetched on this thread while a helper thread
+        // refreshes the snapshot list and then probes the session marker, so
+        // the small round trips hide behind the large one. The index GET is
+        // issued at once, while the helper is still loading the local
+        // snapshot cache, so it takes the pooled connection that already
+        // carried the open's index GET: a fresh connection starts with a
+        // small receive window and takes about twice as long for the index.
+        // All of these are reads under the commit lock; every write still
+        // follows them. Results are judged in the old order: probe, flush,
+        // snapshot list and name check, index.
         let session_id = self
             .write_session
             .as_ref()
             .expect("no active write session")
             .session_id
             .clone();
-        if session_id != "default" {
-            let marker_key = super::lock::session_marker_key(&session_id);
-            match self.storage.exists(&marker_key) {
-                Ok(true) => {}
-                Ok(false) => {
-                    warn!(
-                        session_id,
-                        "session marker reaped before commit; retry the backup"
+        let taken = self.flush_and_take_session_delta();
+        let fetch_index = matches!(&taken, Ok(Some(delta)) if !delta.is_empty());
+        let marker_key =
+            (session_id != "default").then(|| super::lock::session_marker_key(&session_id));
+        let storage = self.storage.as_ref();
+        let crypto = self.crypto.as_ref();
+        let repo_id = self.config.id.as_slice();
+        let cache_dir = self.cache_dir_override.as_deref();
+        let ctx = emit_stage(progress, "refresh snapshots");
+        let (side, prefetched) = std::thread::scope(|scope| {
+            let side = taken.is_ok().then(|| {
+                scope.spawn(move || {
+                    // Strict I/O: fail on GET errors so a transient failure
+                    // can't hide an existing snapshot name and allow a
+                    // duplicate during commit.
+                    let refresh = snapshot_cache::refresh_snapshot_cache(
+                        storage, crypto, repo_id, cache_dir, true,
                     );
-                    return Err(VykarError::StaleChunksDuringCommit);
-                }
-                Err(e) => {
-                    debug!(error = %e, "session-existence probe failed, proceeding to flush");
-                }
+                    let marker = marker_key.map(|key| storage.exists(&key));
+                    (refresh, marker)
+                })
+            });
+            let prefetched = fetch_index.then(|| storage.get("index"));
+            (side.map(join_scoped), prefetched)
+        });
+        log_stage_elapsed(ctx);
+        let (refreshed, marker) = match side {
+            Some((refresh, marker)) => (Some(refresh), marker),
+            None => (None, None),
+        };
+
+        // Session-existence probe. If the marker was reaped by maintenance
+        // (e.g. because we missed too many heartbeats under extreme clock
+        // skew), surface the same typed error the later reconcile path
+        // would produce, so callers matching on `StaleChunksDuringCommit`
+        // catch this path too. Inconclusive storage errors fall through —
+        // the reconcile step is still a safety net.
+        match marker {
+            Some(Ok(false)) => {
+                warn!(
+                    session_id,
+                    "session marker reaped before commit; retry the backup"
+                );
+                return Err(VykarError::StaleChunksDuringCommit);
             }
+            Some(Err(e)) => {
+                debug!(error = %e, "session-existence probe failed, proceeding");
+            }
+            Some(Ok(true)) | None => {}
+        }
+        let delta = taken?;
+        if let Some(refresh) = refreshed {
+            self.apply_snapshot_refresh(refresh?);
         }
 
-        let deferred_chunk_index_hydrate = self.commit_prepare(&snapshot_entry, progress)?;
+        let deferred_chunk_index_hydrate =
+            self.commit_prepare(&snapshot_entry, delta, prefetched, progress)?;
 
         // ---- COMMIT POINT ----
         let ctx = emit_stage(progress, "write snapshot");
@@ -324,29 +375,23 @@ impl Repository {
         Ok(())
     }
 
-    /// Pre-commit work up to (but not including) the snapshot PUT:
-    ///   1. Flush packs and join uploads.
-    ///   2. Drop tiered dedup and take the delta from the write session.
-    ///   3. Refresh the snapshot list from storage.
+    /// Pre-commit work up to (but not including) the snapshot PUT, once the
+    /// caller has flushed packs, taken the session `delta`, refreshed the
+    /// snapshot list (unreadable blobs are skipped — a garbage snapshot
+    /// that can't be decrypted cannot conflict with a valid name) and, for
+    /// a non-empty delta, fetched the raw remote `index` (`prefetched`):
     ///   4. Enforce snapshot name uniqueness against the fresh list.
-    ///   5. Fetch/decode remote index, reconcile delta, persist index.
+    ///   5. Decode remote index, reconcile delta, persist index.
     ///
     /// Returns `true` when chunk_index hydration should be deferred to
     /// `commit_finalize` (fast-path case).
     fn commit_prepare(
         &mut self,
         snapshot_entry: &manifest::SnapshotEntry,
+        delta: Option<IndexDelta>,
+        prefetched: Option<Result<Option<Vec<u8>>>>,
         progress: &mut Option<impl FnMut(crate::commands::backup::BackupProgressEvent)>,
     ) -> Result<bool> {
-        // 1+2. Flush all pending packs, then take the delta from the session.
-        let delta = self.flush_and_take_session_delta()?;
-
-        // 3. Refresh snapshot list (unreadable blobs are skipped — a garbage
-        //    snapshot that can't be decrypted cannot conflict with a valid name).
-        let ctx = emit_stage(progress, "refresh snapshots");
-        self.refresh_snapshot_list()?;
-        log_stage_elapsed(ctx);
-
         // 4. Check snapshot name uniqueness against fresh list.
         if self.manifest.find_snapshot(&snapshot_entry.name).is_some() {
             return Err(VykarError::SnapshotAlreadyExists(
@@ -359,7 +404,10 @@ impl Repository {
         if let Some(delta) = delta {
             if !delta.is_empty() {
                 let ctx = emit_stage(progress, "fetch index");
-                let raw_blob = self.storage.get("index")?;
+                let raw_blob = match prefetched {
+                    Some(fetched) => fetched?,
+                    None => self.storage.get("index")?,
+                };
                 log_stage_elapsed(ctx);
 
                 // Try fast path: compare raw blob against cached copy.
@@ -538,18 +586,24 @@ impl Repository {
     /// Every pack is checked; only the request pattern adapts (see
     /// `pack_verify`), with up to `request_concurrency` requests in flight.
     fn verify_delta_packs(&self, delta: &IndexDelta) -> Result<()> {
-        let pack_ids: std::collections::HashSet<PackId> =
-            delta.new_entries.iter().map(|e| e.pack_id).collect();
-        let persisted_packs = self
-            .write_session
-            .as_ref()
-            .map_or(0, |ws| ws.persisted_pack_count);
         super::pack_verify::verify_packs_present(
             self.storage.as_ref(),
-            &pack_ids,
-            persisted_packs,
+            &Self::delta_pack_ids(delta),
+            self.persisted_pack_count(),
             self.request_concurrency,
         )
+    }
+
+    /// The packs a delta's new entries live in.
+    fn delta_pack_ids(delta: &IndexDelta) -> std::collections::HashSet<PackId> {
+        delta.new_entries.iter().map(|e| e.pack_id).collect()
+    }
+
+    /// Packs already in the repository, a cost hint for `pack_verify`.
+    fn persisted_pack_count(&self) -> usize {
+        self.write_session
+            .as_ref()
+            .map_or(0, |ws| ws.persisted_pack_count)
     }
 
     /// Serialize, encrypt, and write the IndexBlob (generation + chunks) to storage.
@@ -679,9 +733,14 @@ impl Repository {
             self.cache_dir_override.as_deref(),
             true, // strict_io: true — commit uniqueness check
         )?;
+        self.apply_snapshot_refresh(refresh);
+        Ok(())
+    }
+
+    /// Replace the in-memory manifest with a fresh snapshot listing.
+    fn apply_snapshot_refresh(&mut self, refresh: snapshot_cache::SnapshotRefresh) {
         self.skipped_snapshots = refresh.skipped;
         self.manifest = Manifest::from_snapshot_entries(refresh.entries);
-        Ok(())
     }
 
     /// Reload the full chunk index from storage (always downloads from remote).
@@ -802,41 +861,66 @@ impl Repository {
         }
         let fast_start = std::time::Instant::now();
 
-        // Verify packs before merging.
-        let ctx_start = std::time::Instant::now();
-        self.verify_delta_packs(&delta)?;
-        debug!(
-            stage = "verify packs",
-            elapsed_ms = ctx_start.elapsed().as_millis() as u64,
-            "commit stage complete"
-        );
-
-        // Merge old cache + delta into new full cache.
-        self.index_generation = rand::rng().next_u64();
+        // Verify the session's packs while the merged cache is built and
+        // serialized: the check is network-bound, the merge local. The
+        // merged cache stays at its temporary path until the check passed,
+        // so a failed check leaves the local full cache and the in-memory
+        // generation exactly as they were; nothing remote is written before
+        // the join.
+        let pack_ids = Self::delta_pack_ids(&delta);
+        let persisted_packs = self.persisted_pack_count();
+        let width = self.request_concurrency;
+        let generation = rand::rng().next_u64();
         let new_cache_path = full_cache_path.with_extension("merged");
-        dedup_cache::merge_full_index_cache(
-            &old_cache,
-            &delta,
-            self.index_generation,
-            &new_cache_path,
-        )?;
-        // Drop the mmap BEFORE renaming — on Windows, mapped files block replacement.
-        drop(old_cache);
-        // The delta is fully applied; drop it (and the dedup cache mapping
-        // its positional bumps hold) before serializing the merged index.
-        drop(delta);
+        let storage = self.storage.as_ref();
+        let crypto = self.crypto.as_ref();
+        let (verified, built) = std::thread::scope(|scope| {
+            let verify = scope.spawn(|| {
+                let ctx_start = std::time::Instant::now();
+                let r = super::pack_verify::verify_packs_present(
+                    storage,
+                    &pack_ids,
+                    persisted_packs,
+                    width,
+                );
+                debug!(
+                    stage = "verify packs",
+                    elapsed_ms = ctx_start.elapsed().as_millis() as u64,
+                    "commit stage complete"
+                );
+                r
+            });
+            let built = (|| {
+                dedup_cache::merge_full_index_cache(
+                    &old_cache,
+                    &delta,
+                    generation,
+                    &new_cache_path,
+                )?;
+                // Drop the mmap BEFORE renaming — on Windows, mapped files
+                // block replacement.
+                drop(old_cache);
+                // The delta is fully applied; drop it (and the dedup cache
+                // mapping its positional bumps hold) before serializing.
+                drop(delta);
+                // Serialize the merged cache as the new index blob. The
+                // mapping is dropped again before the rename below.
+                let merged_cache =
+                    dedup_cache::MmapFullIndexCache::open_path(&new_cache_path, generation)
+                        .ok_or_else(|| VykarError::Other("failed to reopen merged cache".into()))?;
+                dedup_cache::serialize_full_cache_as_index_blob(&merged_cache, generation, crypto)
+            })();
+            (join_scoped(verify), built)
+        });
+        let index_packed = match verified.and(built) {
+            Ok(packed) => packed,
+            Err(e) => {
+                let _ = std::fs::remove_file(&new_cache_path);
+                return Err(e);
+            }
+        };
         std::fs::rename(&new_cache_path, full_cache_path)?;
-
-        // Serialize the merged cache as the new index blob and persist.
-        let merged_cache =
-            dedup_cache::MmapFullIndexCache::open_path(full_cache_path, self.index_generation)
-                .ok_or_else(|| VykarError::Other("failed to reopen merged cache".into()))?;
-
-        let index_packed = dedup_cache::serialize_full_cache_as_index_blob(
-            &merged_cache,
-            self.index_generation,
-            self.crypto.as_ref(),
-        )?;
+        self.index_generation = generation;
 
         self.put_index_blob(&index_packed, self.index_generation)?;
         // Dedup/restore cache derivation is deferred to the post-commit

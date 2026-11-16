@@ -212,6 +212,12 @@ pub async fn put_object(
         let stream = TryStreamExt::map_err(stream, std::io::Error::other);
         let mut reader = StreamReader::new(stream);
 
+        // A second handle (same open file description) for the writeback
+        // kicks below, which run on the blocking pool while the body streams.
+        let writeback_file = std::sync::Arc::new(temp_file.try_clone().map_err(ServerError::from)?);
+        let mut since_writeback: u64 = 0;
+        let mut writeback_task: Option<tokio::task::JoinHandle<()>> = None;
+
         let temp_file = tokio::fs::File::from_std(temp_file);
         let mut writer = BufWriter::with_capacity(256 * 1024, temp_file);
 
@@ -249,6 +255,29 @@ pub async fn put_object(
                 }
 
                 writer.write_all(chunk).await.map_err(ServerError::from)?;
+
+                // Start writeback of what has been written so far, so the
+                // final fdatasync does not have to flush the whole upload
+                // while the client waits. At most one kick is in flight; a
+                // skipped one is covered by the next, which spans the file.
+                since_writeback += n as u64;
+                if crate::writeback::SUPPORTED
+                    && since_writeback >= crate::writeback::WRITEBACK_INTERVAL
+                    && writeback_task
+                        .as_ref()
+                        .is_none_or(tokio::task::JoinHandle::is_finished)
+                {
+                    since_writeback = 0;
+                    let file = std::sync::Arc::clone(&writeback_file);
+                    writeback_task = Some(tokio::task::spawn_blocking(move || {
+                        crate::writeback::start_writeback(&file);
+                    }));
+                }
+            }
+            // Wait for a still-running kick so no task outlives the upload
+            // holding a handle to the temp file.
+            if let Some(task) = writeback_task.take() {
+                let _ = task.await;
             }
             writer.flush().await.map_err(ServerError::from)?;
             // fdatasync_file is blocking (and carries the Apple F_FULLFSYNC

@@ -1181,3 +1181,80 @@ fn load_chunk_index_overwrites_stale_index_gen() {
         "index.gen should be overwritten with the authenticated generation"
     );
 }
+
+/// Records `put` keys over a local repository.
+struct PutKeyLog {
+    inner: Box<dyn vykar_storage::StorageBackend>,
+    puts: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl vykar_storage::InnerBackend for PutKeyLog {
+    fn inner_backend(&self) -> &dyn vykar_storage::StorageBackend {
+        &*self.inner
+    }
+}
+
+vykar_storage::delegate_storage_backend! {
+    for PutKeyLog;
+    except [put, begin_staged_put];
+
+    fn begin_staged_put(
+        &self,
+        _prefix: &str,
+    ) -> vykar_types::error::Result<Option<Box<dyn vykar_storage::StagedPut>>> {
+        Ok(None)
+    }
+
+    fn put(&self, key: &str, data: &[u8]) -> vykar_types::error::Result<()> {
+        self.puts.lock().unwrap().push(key.to_string());
+        self.inner.put(key, data)
+    }
+}
+
+fn open_logging_puts(repo_dir: &std::path::Path) -> (Repository, Vec<String>) {
+    let puts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let storage = Box::new(PutKeyLog {
+        inner: Box::new(
+            vykar_storage::local_backend::LocalBackend::new(repo_dir.to_str().unwrap()).unwrap(),
+        ),
+        puts: std::sync::Arc::clone(&puts),
+    });
+    let repo = Repository::open(
+        storage,
+        None,
+        None,
+        crate::repo::OpenOptions::new().with_index(),
+    )
+    .unwrap();
+    let puts = puts.lock().unwrap().clone();
+    (repo, puts)
+}
+
+/// Opening with the index rewrites `index.gen` only when the sidecar does not
+/// already hold the authenticated generation.
+#[test]
+fn open_rewrites_index_gen_only_when_stale() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = tmp.path().join("repo");
+    let src = tmp.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("f.txt"), b"index gen").unwrap();
+    let config = crate::tests::helpers::init_repo(&repo_dir);
+    crate::tests::helpers::backup_single_source(&config, &src, "src", "snap");
+
+    let (repo, puts) = open_logging_puts(&repo_dir);
+    let real_gen = repo.index_generation();
+    assert_ne!(real_gen, 0);
+    assert!(
+        !puts.iter().any(|k| k == "index.gen"),
+        "sidecar already current, must not be rewritten: {puts:?}"
+    );
+    drop(repo);
+
+    std::fs::write(repo_dir.join("index.gen"), 12345u64.to_le_bytes()).unwrap();
+    let (repo, puts) = open_logging_puts(&repo_dir);
+    assert_eq!(repo.index_generation(), real_gen);
+    assert!(puts.iter().any(|k| k == "index.gen"), "{puts:?}");
+    let gen = std::fs::read(repo_dir.join("index.gen")).unwrap();
+    assert_eq!(u64::from_le_bytes(gen.try_into().unwrap()), real_gen);
+}

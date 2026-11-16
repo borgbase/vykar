@@ -46,11 +46,24 @@ impl Repository {
     /// Can be called after opening without `load_index` to lazily load the index.
     /// Also recalculates the data pack writer target from the loaded index.
     pub fn load_chunk_index(&mut self) -> Result<()> {
+        self.load_chunk_index_with_sidecar(None)
+    }
+
+    /// [`Self::load_chunk_index`], given the `index.gen` value this process
+    /// just read (`Some`, with 0 standing for absent, as open reads it). The
+    /// advisory sidecar is rewritten only when it differs from the
+    /// authenticated generation: rewriting an equal value changes nothing,
+    /// and skipping it can only avoid clobbering a newer value that a
+    /// concurrent writer put there since. The sidecar is never trusted for
+    /// writes either way.
+    pub(super) fn load_chunk_index_with_sidecar(&mut self, sidecar: Option<u64>) -> Result<()> {
         let (gen, index) = self.reload_full_index_with_generation()?;
         self.index_generation = gen;
         self.chunk_index = index;
-        // Best-effort rewrite index.gen
-        let _ = self.storage.put("index.gen", &gen.to_le_bytes());
+        if sidecar != Some(gen) {
+            // Best-effort rewrite index.gen
+            let _ = self.storage.put("index.gen", &gen.to_le_bytes());
+        }
         self.rebase_pack_target_from_index();
         Ok(())
     }

@@ -266,7 +266,9 @@ impl Repository {
     ) -> Result<Self> {
         let mut repo = Self::open_inner(storage, passphrase, cache_dir, &opts)?;
         if opts.load_index {
-            repo.load_chunk_index()?;
+            // `index_generation` still holds the `index.gen` hint read above.
+            let sidecar = repo.index_generation;
+            repo.load_chunk_index_with_sidecar(Some(sidecar))?;
         }
         Ok(repo)
     }

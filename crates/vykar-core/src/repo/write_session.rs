@@ -440,7 +440,25 @@ impl WriteSessionState {
         let all_keys = storage.list(SESSIONS_PREFIX)?;
         let now = chrono::Utc::now();
 
-        // Build marker state map from .json keys.
+        // Collect .index keys, skip our own session.
+        let my_key = self.pending_index_key();
+        let index_keys: Vec<(String, String)> = all_keys
+            .iter()
+            .filter_map(|key| {
+                let session_id = key
+                    .strip_prefix(SESSIONS_PREFIX)
+                    .and_then(|s| s.strip_suffix(".index"))?;
+                Some((key.clone(), session_id.to_string()))
+            })
+            .filter(|(key, _)| *key != my_key)
+            .collect();
+
+        // Build the marker state map from .json keys. Only markers of the
+        // sessions collected above are ever consulted, so only those are
+        // fetched — a marker without a foreign journal (our own included)
+        // cannot change the outcome.
+        let journal_sessions: std::collections::HashSet<&str> =
+            index_keys.iter().map(|(_, id)| id.as_str()).collect();
         let mut marker_states: StdHashMap<String, MarkerState> = StdHashMap::new();
         for key in &all_keys {
             let Some(session_id) = key
@@ -449,6 +467,9 @@ impl WriteSessionState {
             else {
                 continue;
             };
+            if !journal_sessions.contains(session_id) {
+                continue;
+            }
             let state = match storage.get(key) {
                 Ok(Some(data)) => match serde_json::from_slice::<SessionEntry>(&data) {
                     Ok(entry) => {
@@ -473,19 +494,6 @@ impl WriteSessionState {
             };
             marker_states.insert(session_id.to_string(), state);
         }
-
-        // Collect .index keys, skip our own session.
-        let my_key = self.pending_index_key();
-        let index_keys: Vec<(String, String)> = all_keys
-            .iter()
-            .filter_map(|key| {
-                let session_id = key
-                    .strip_prefix(SESSIONS_PREFIX)
-                    .and_then(|s| s.strip_suffix(".index"))?;
-                Some((key.clone(), session_id.to_string()))
-            })
-            .filter(|(key, _)| *key != my_key)
-            .collect();
 
         let mut total_recovered = 0usize;
         let mut recovered_sessions = Vec::new();
@@ -971,6 +979,60 @@ mod tests {
         );
         assert!(recovery.recovered_sessions.is_empty());
         assert!(ws.recovered_index_keys.is_empty());
+    }
+
+    /// Records every `get` key, to show which markers recovery fetches.
+    struct GetLoggingBackend {
+        inner: MemoryBackend,
+        gets: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl vykar_storage::InnerBackend for GetLoggingBackend {
+        fn inner_backend(&self) -> &dyn StorageBackend {
+            &self.inner
+        }
+    }
+
+    vykar_storage::delegate_storage_backend! {
+        for GetLoggingBackend;
+        except [get];
+
+        fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+            self.gets.lock().unwrap().push(key.to_string());
+            self.inner.get(key)
+        }
+    }
+
+    /// Recovery reads only the markers of foreign sessions that have a
+    /// journal; a marker without one (our own included) is never fetched,
+    /// and the stale / active classification of the others is unchanged.
+    #[test]
+    fn recovery_fetches_only_markers_with_foreign_journals() {
+        init_test_environment();
+        let storage = GetLoggingBackend {
+            inner: MemoryBackend::new(),
+            gets: Default::default(),
+        };
+        let crypto = test_crypto();
+        write_session_marker(&storage, "current", &fresh_timestamp());
+        write_session_marker(&storage, "other", &fresh_timestamp());
+        write_session_marker(&storage, "active", &fresh_timestamp());
+        write_valid_journal(&storage, &crypto, &session_index_key("active"));
+        write_session_marker(&storage, "stale", &stale_timestamp());
+        write_valid_journal(&storage, &crypto, &session_index_key("stale"));
+
+        let (ws, recovery) = recover_from(&storage);
+        assert_eq!(recovery.recovered_sessions, vec!["stale"]);
+        assert_eq!(ws.recovered_index_keys, vec![session_index_key("stale")]);
+
+        let gets = storage.gets.lock().unwrap().clone();
+        let mut markers: Vec<&String> = gets.iter().filter(|k| k.ends_with(".json")).collect();
+        markers.sort();
+        assert_eq!(
+            markers,
+            [&session_marker_key("active"), &session_marker_key("stale")],
+            "all GETs: {gets:?}"
+        );
     }
 
     #[test]

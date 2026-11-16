@@ -307,6 +307,12 @@ impl Repository {
         // `RepoFormat`, never the raw integer.
         let format = RepoFormat::from_version(repo_config.version)?;
 
+        if opts.require_encryption && repo_config.encryption == EncryptionMode::None {
+            return Err(VykarError::PlaintextRepository(
+                opts.repo_url.clone().unwrap_or_default(),
+            ));
+        }
+
         // Tell the backend which upload-integrity header to send. It was
         // constructed before the config could be read, so this is the first
         // moment the algorithm is known.

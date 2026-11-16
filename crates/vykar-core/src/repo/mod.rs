@@ -241,6 +241,10 @@ pub struct OpenOptions {
     /// `check --repair --dry-run`, which prints "no changes applied" and must
     /// not have written one underneath that statement.
     pub skip_key_backfill: bool,
+    /// Refuse a repository whose config says it is unencrypted. The repo
+    /// config is unauthenticated, so only the client's own config may opt
+    /// into plaintext.
+    pub require_encryption: bool,
 }
 
 impl OpenOptions {
@@ -265,6 +269,10 @@ impl OpenOptions {
     }
     pub fn skip_key_backfill(mut self) -> Self {
         self.skip_key_backfill = true;
+        self
+    }
+    pub fn require_encryption(mut self, require: bool) -> Self {
+        self.require_encryption = require;
         self
     }
 }

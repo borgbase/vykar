@@ -5,7 +5,7 @@ use tracing::info;
 
 use std::sync::Arc;
 
-use crate::config::VykarConfig;
+use crate::config::{EncryptionModeConfig, VykarConfig};
 use crate::limits;
 use crate::repo::lock;
 use crate::repo::lock::SessionEntry;
@@ -67,12 +67,15 @@ pub(crate) fn verify_repo_identity(config: &VykarConfig, repo: &Repository) -> R
 /// Attach the identity context `Repository::open` cannot derive on its own.
 ///
 /// The URL is what lets the key loader consult the local identity pin, and
-/// `trust_repo` is the deliberate waiver of it. Applied in one place so every
-/// core open path gets both; caller-set flags such as `skip_key_backfill` are
-/// preserved.
-fn with_identity_context(opts: OpenOptions, config: &VykarConfig) -> OpenOptions {
+/// `trust_repo` is the deliberate waiver of it. The configured encryption mode
+/// decides whether a plaintext repository is acceptable: the repository's own
+/// config is unauthenticated and must not be able to downgrade the client.
+/// Applied in one place so every core open path gets all three; caller-set
+/// flags such as `skip_key_backfill` are preserved.
+pub(crate) fn with_identity_context(opts: OpenOptions, config: &VykarConfig) -> OpenOptions {
     opts.with_repo_url(config.repository.url.clone())
         .trust_repo(config.trust_repo)
+        .require_encryption(config.encryption.mode != EncryptionModeConfig::None)
 }
 
 /// Open a repository from config using the standard backend resolver.

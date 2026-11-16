@@ -260,6 +260,12 @@ pub enum VykarError {
     #[error("repository identity mismatch: {0}")]
     RepositoryMismatch(String),
 
+    #[error(
+        "repository at '{0}' is unencrypted, but this client's config requires encryption; \
+         refusing to use it. If the repository is meant to be unencrypted, set `encryption.mode: none`."
+    )]
+    PlaintextRepository(String),
+
     #[error("file changed during read: {path}{}", if *dataless { " (cloud-only file, hydration in progress)" } else { "" })]
     FileChangedDuringRead {
         path: String,

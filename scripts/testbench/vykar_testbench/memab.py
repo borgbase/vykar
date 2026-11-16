@@ -33,6 +33,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 import yaml
@@ -143,10 +144,21 @@ class ProcPoller:
     Peaks are only as fine as the interval; ru_maxrss stays the exact total.
     """
 
-    def __init__(self, pid: int, timeline_path: str | None, interval: float = POLL_INTERVAL_S) -> None:
+    def __init__(
+        self,
+        pid: int,
+        timeline_path: str | None,
+        interval: float = POLL_INTERVAL_S,
+        extra: Callable[[], dict[str, int]] | None = None,
+        extra_fields: tuple[str, ...] = (),
+    ) -> None:
         self.pid = pid
         self.interval = interval
         self.timeline_path = timeline_path
+        # Optional extra per-sample probe (e.g. a network byte counter); its
+        # keys are listed in `extra_fields` so the timeline gets columns for them.
+        self.extra = extra
+        self.fields = (*STATUS_FIELDS, *extra_fields)
         self.samples: list[dict[str, int]] = []
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -165,6 +177,8 @@ class ProcPoller:
                 break
             if not sample:  # zombie: the status file no longer carries memory fields
                 break
+            if self.extra is not None:
+                sample.update(self.extra())
             sample["t_ms"] = int((time.monotonic() - self._start) * 1000)
             self.samples.append(sample)
             self._stop.wait(self.interval)
@@ -174,29 +188,49 @@ class ProcPoller:
         self._thread.join()
         if self.timeline_path:
             with open(self.timeline_path, "w") as f:
-                f.write("t_ms\t" + "\t".join(STATUS_FIELDS) + "\n")
+                f.write("t_ms\t" + "\t".join(self.fields) + "\n")
                 for s in self.samples:
-                    f.write(f"{s['t_ms']}\t" + "\t".join(str(s.get(k, "")) for k in STATUS_FIELDS) + "\n")
+                    f.write(f"{s['t_ms']}\t" + "\t".join(str(s.get(k, "")) for k in self.fields) + "\n")
         return peak_of(self.samples)
 
 
 def run_measured(
-    argv: list[str], env: dict[str, str], log_path: str, timeline_path: str | None = None
+    argv: list[str],
+    env: dict[str, str],
+    log_path: str,
+    timeline_path: str | None = None,
+    *,
+    interval: float = POLL_INTERVAL_S,
+    extra: Callable[[], dict[str, int]] | None = None,
+    extra_fields: tuple[str, ...] = (),
+    samples_out: list[dict[str, int]] | None = None,
 ) -> tuple[int, int, float, float, float, dict[str, int]]:
     """Run `argv`, returning (returncode, maxrss_kb, wall_s, user_s, sys_s, poller peaks).
 
     Uses `wait4` so the figures cover exactly this child, not earlier ones.
     The poller reads the still-unreaped child, so it never races a reused pid.
+    `extra`/`extra_fields` add probe columns to every sample (see `ProcPoller`);
+    `samples_out`, if given, receives the raw samples. If this process is
+    interrupted (Ctrl-C, SIGTERM -> SystemExit) the child is killed and reaped
+    before the exception propagates, so cleanup never races a live backup.
     """
     with open(log_path, "w") as log:
         start = time.monotonic()
         proc = subprocess.Popen(argv, env=env, stdout=log, stderr=subprocess.STDOUT)
-        poller = ProcPoller(proc.pid, timeline_path)
+        poller = ProcPoller(proc.pid, timeline_path, interval, extra, extra_fields)
         poller.start()
-        # Wait for exit without reaping, so the poller can never read a
-        # recycled pid; then reap with wait4 for the rusage.
-        os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOWAIT)
+        try:
+            # Wait for exit without reaping, so the poller can never read a
+            # recycled pid; then reap with wait4 for the rusage.
+            os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOWAIT)
+        except BaseException:
+            proc.kill()
+            proc.wait()
+            poller.stop()
+            raise
         peaks = poller.stop()
+        if samples_out is not None:
+            samples_out.extend(poller.samples)
         _, status, usage = os.wait4(proc.pid, 0)
         wall = time.monotonic() - start
     proc.returncode = os.waitstatus_to_exitcode(status)
@@ -252,17 +286,30 @@ def _copy_tree(src: str, dst: str) -> None:
     subprocess.run(["cp", "-a", "--reflink=auto", src, dst], check=True)
 
 
-def _write_config(path: str, repo_dir: str, cache_dir: str, source: str, args: argparse.Namespace) -> None:
-    defaults = cfg.load_defaults()
-    cfg.write_vykar_config(path, backend="local", repo_label=REPO_LABEL, corpus_path=source, repo_url=repo_dir, defaults=defaults)
+def write_bench_config(
+    path: str,
+    *,
+    backend: str,
+    repo_label: str,
+    repo_url: str,
+    cache_dir: str,
+    source: str,
+    threads: int | None,
+    connections: int | None,
+    defaults: cfg.Defaults | None = None,
+) -> None:
+    """`config.write_vykar_config` plus an explicit cache dir and limits overrides."""
+    defaults = defaults or cfg.load_defaults()
+    cfg.write_vykar_config(path, backend=backend, repo_label=repo_label, corpus_path=source,
+                           repo_url=repo_url, defaults=defaults)
     with open(path) as f:
         data = yaml.safe_load(f)
     data["cache_dir"] = cache_dir
-    limits: dict = {}
-    if args.threads is not None:
-        limits["threads"] = args.threads
-    if args.connections is not None:
-        limits["connections"] = args.connections
+    limits: dict = dict(data.get("limits") or {})
+    if threads is not None:
+        limits["threads"] = threads
+    if connections is not None:
+        limits["connections"] = connections
     if limits:
         data["limits"] = limits
     with open(path, "w") as f:
@@ -417,7 +464,8 @@ def main() -> None:
             shutil.rmtree(work)
         os.makedirs(work)
     # Rewritten every sweep so --threads/--connections apply to a reused repo too.
-    _write_config(config_path, repo_dir, cache_dir, source, args)
+    write_bench_config(config_path, backend="local", repo_label=REPO_LABEL, repo_url=repo_dir, cache_dir=cache_dir,
+                       source=source, threads=args.threads, connections=args.connections, defaults=defaults)
 
     base_env = os.environ.copy()
     base_env["VYKAR_PASSPHRASE"] = defaults.passphrase

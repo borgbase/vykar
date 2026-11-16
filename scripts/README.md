@@ -68,6 +68,24 @@ uv run --project scripts/testbench mem-ab --workload restore --work-dir /mnt/rep
 
 Every run also polls `/proc/<pid>/status` every 50 ms: `results.tsv` gains peak VmRSS/RssAnon/RssFile/RssShmem/Threads columns, the summary shows median peak RssAnon and RssFile+RssShmem, and `<workload>.r<N>.<variant>.timeline.tsv` holds the samples. Polled peaks can miss spikes shorter than the interval; `maxrss_kb` (from `wait4`) stays the exact total.
 
+### `net-ab` — interleaved A/B over a shaped network link
+
+Runs `vykar backup` against a network backend with simulated WAN latency on loopback and compares binaries the same way `mem-ab` does (each variant once per round, order rotated, medians plus round-paired deltas against the first variant). `--backend` is `s3` (MinIO), `rest` (vykar-server), `sftp` (sshd) or `local` (unshaped reference). Every run gets a fresh repository (`init` + timed `backup`, plus a timed no-change backup with `--incremental`), which is deleted afterwards.
+
+```bash
+uv run --project scripts/testbench net-ab --backend s3 --variant base=/path/to/vykar-base --variant cand=target/release/vykar
+uv run --project scripts/testbench net-ab --backend sftp --variant base=a --variant cand=b --rounds 5 --delay-ms 20 --rate 1gbit
+uv run --project scripts/testbench net-ab --backend rest --variant base=a --variant cand=a --variant-conn cand=8 --incremental
+```
+
+- **Shaping**: only the backend's TCP port (taken from the repository URL: MinIO 9000, `REST_URL` 8585, `SFTP_PORT` 22 by default) is routed through netem on `lo` (prio qdisc with 4 bands, u32 sport/dport filters into band 4). `--delay-ms` is per direction, so RTT = 2x (default 20 → 40 ms RTT); `--rate` adds a netem rate limit. `--delay-ms 0` adds no delay but still routes the port through a count-only `pfifo` so bandwidth is measured. The `local` backend never touches `tc`. Uses passwordless `sudo /sbin/tc`; IPv4 loopback endpoints only.
+- **netem state** is read first and put back on exit, also on error, Ctrl-C and SIGTERM (`--keep-netem` leaves the shaping in place). An unshaped `lo` gets its qdisc removed; an existing setup in the same layout is rebuilt with its port, delay and rate. Any other qdisc on `lo` makes `net-ab` refuse to run.
+- **Locking**: takes `/tmp/vykar-s3bench.lock` and then `/tmp/vykar-mem-ab.lock`, so it queues behind (and blocks) `mem-ab` and other benchmarks that take either lock.
+- **Repositories**: `s3` uses `s3+http://<endpoint>/<--s3-bucket>/net-ab/<run-id>/<run>` (endpoint as in `config.resolve_repo_url`); the bucket (default `vykar-net-ab`) is created if missing and removed at the end if `net-ab` created it and it is empty; cleanup deletes the objects under the run's prefix. `rest`: vykar-server serves one repository, so the server must be empty — `net-ab` refuses otherwise, or with `--rest-stash-existing` downloads a small pack-less repository into the out dir, and re-creates it (layout + objects) at the end; cleanup is `vykar delete` plus deleting whatever the run left. `sftp` uses `$SFTP_BASE_DIR/net-ab-sftp/<run-id>/<run>`; on loopback the run directory is removed locally (a `vykar delete` over a 40 ms SFTP link takes minutes), otherwise with `vykar delete`. `local` repos and every run's cache live in `--work-dir` (default `/mnt/repos/net-ab/<run-id>`), removed at the end.
+- **Measurements** (per run, in `--out`, default `$RUNTIME_ROOT/net-ab/<stamp>`): wall, user/sys CPU and `ru_maxrss` from `wait4`; peak RssAnon and threads from a 100 ms `/proc` poller; the shaped band's byte counter (both directions, that port only) sampled every 100 ms into `r<N>.<variant>.timeline.tsv` and ~250 ms MiB/s buckets in `.bw.tsv`, summarised as mean / p10 / p50 / p90 / max / cv / idle fraction over the active span, plus `avg_mibs` = bytes / wall. `results.json` holds all runs, `summary.txt` the table. Binaries that honour `$VYKAR_HTTP_TRACE` (a measurement-only patch, not in the tree) get a per-request summary in `results.json`; an empty or missing trace (always for SFTP) is ignored.
+
+**Socket buffer limits.** At 40 ms RTT a TCP connection can move at most window / RTT. MinIO pins its buffers with `SO_RCVBUF`, which the kernel caps at `net.core.rmem_max`; with the Debian default (212992) every S3 measurement is capped at ~21 MiB/s until `net.core.rmem_max` (and `wmem_max`) are raised to 4194304. `net-ab` warns, without changing anything, when `net.core.rmem_max`, `net.core.wmem_max` or the `tcp_rmem`/`tcp_wmem` maxima are below 4 MiB while latency is on. To raise them for a session: `sudo sysctl -w net.core.rmem_max=4194304 net.core.wmem_max=4194304`. SFTP is additionally bounded by the SSH channel window the server advertises (OpenSSH: 2 MiB) per connection.
+
 ## Tests
 
 ```bash

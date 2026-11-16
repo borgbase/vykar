@@ -97,7 +97,7 @@ Completion first seals the assembled file — renames it away from the temp name
 
 Uploads idle for an hour are abandoned: their temp file is removed and their reservation released (checked whenever an upload starts and on the hourly sweep). The registry is in memory, so a server restart orphans an in-progress upload; its completion then answers `404` and the temp file is swept as ordinary debris after 24 hours. Temp files are hidden from listings and purged by delete-repo like every other temp file.
 
-The client splits packs larger than 16 MiB into equal parts of at most 16 MiB and keeps at most `4 × connections` (4..32) part requests in flight across all packs. Any failure of the part path makes the client send that pack as a whole `PUT`; a `4xx` refusal also turns the part path off for the rest of the run. Servers that do not advertise the capability only ever see whole-object `PUT`s, and old clients never call the new endpoints.
+The client splits packs larger than 16 MiB into equal parts of at most 16 MiB and keeps at most `4 × connections` (4..32) part requests in flight across all packs. A failed part makes the client send that pack as a whole `PUT`; a `4xx` refusal also turns the part path off for the rest of the run. Once one completion has succeeded, a backup frees each pack's buffer as soon as its last part is acknowledged, while the server hashes and fsyncs it: a completion that then still fails after its retries (for example `404` after a server restart) fails the backup instead of falling back to a whole `PUT`. Until then a failed completion falls back as well. Servers that do not advertise the capability only ever see whole-object `PUT`s, and old clients never call the new endpoints.
 
 ## Backup Freshness Monitoring
 

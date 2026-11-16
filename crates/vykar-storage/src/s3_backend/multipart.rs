@@ -131,9 +131,7 @@ impl S3Backend {
             ))
         })?;
         if key.starts_with("packs/") {
-            // Content-addressed: the key IS the content id, so an object of the
-            // right size at this key is necessarily this pack. HEAD suffices.
-            Ok(self.size(key)? == Some(expected))
+            self.reconcile_pack(key, expected)
         } else {
             // Mutable key: size alone can't prove the bytes are ours (a prior
             // same-size object could exist). Only an exact byte compare does.
@@ -143,19 +141,109 @@ impl S3Backend {
         }
     }
 
+    /// [`reconcile`](Self::reconcile) for a content-addressed pack, which
+    /// needs only its size: the key IS the content id, so an object of the
+    /// right size at this key is necessarily this pack. HEAD suffices.
+    fn reconcile_pack(&self, key: &str, expected: u64) -> Result<bool> {
+        Ok(self.size(key)? == Some(expected))
+    }
+
+    /// [`put_multipart`](Self::put_multipart) for an owned pack buffer, which
+    /// is released once every part is acknowledged, before the completion:
+    /// that request (the store assembling and persisting the object) is the
+    /// slow end of the upload and needs no object bytes.
+    ///
+    /// The price is the second whole-MPU attempt, which needs the bytes: it
+    /// still covers create and part failures, but a completion that fails
+    /// after its in-place retries (and is not reconciled as committed by its
+    /// size, all a `packs/` key needs) is returned as the upload's error.
+    pub(super) fn put_multipart_owned(
+        &self,
+        full_key: &str,
+        key: &str,
+        data: Vec<u8>,
+    ) -> Result<()> {
+        debug_assert!(key.starts_with("packs/"), "size-only reconcile");
+        let part_size = derive_part_size(data.len(), key)?;
+        let expected = u64::try_from(data.len()).map_err(|e| {
+            VykarError::Other(format!(
+                "S3 multipart {key}: object size {} not representable as u64: {e}",
+                data.len()
+            ))
+        })?;
+        let (upload_id, etags) = {
+            // Built once: part digests survive a whole-MPU restart.
+            let parts = Parts::new(&data, part_size);
+            let mut attempt = 0;
+            loop {
+                attempt += 1;
+                match self.send_multipart(full_key, key, &parts) {
+                    Ok(sent) => break sent,
+                    // Create and part failures are never ambiguous: complete
+                    // has not run, so there is nothing to reconcile.
+                    Err(MultipartFailure { kind, err, .. }) => {
+                        if kind == MultipartFailureKind::Permanent
+                            || attempt >= MULTIPART_MAX_ATTEMPTS
+                        {
+                            return Err(err);
+                        }
+                    }
+                }
+            }
+        };
+        drop(data);
+        let Err(MultipartFailure { err, ambiguous, .. }) =
+            self.complete_mpu(full_key, key, &etags, &upload_id)
+        else {
+            return Ok(());
+        };
+        self.abort_mpu(full_key, key, &upload_id);
+        if ambiguous {
+            match self.reconcile_pack(key, expected) {
+                Ok(true) => return Ok(()),
+                Ok(false) => {}
+                Err(e) => tracing::warn!(
+                    "S3 multipart {key}: reconcile inconclusive after ambiguous completion: {e}"
+                ),
+            }
+        }
+        Err(VykarError::Other(format!(
+            "{err} (the pack buffer was already released, so the upload cannot be restarted)"
+        )))
+    }
+
     /// Run one full multipart upload. Aborts its own `upload_id` (best-effort) on
     /// any failure after creation. Create failures have no `upload_id` to abort.
-    ///
-    /// Part digests are computed in order on a helper thread while
-    /// `CreateMultipartUpload` is in flight, so the first parts start sending as
-    /// soon as the upload id arrives; part workers hash any part the helper has
-    /// not reached yet themselves.
     fn try_one_multipart(
         &self,
         full_key: &str,
         key: &str,
         parts: &Parts<'_>,
     ) -> std::result::Result<(), MultipartFailure> {
+        let (upload_id, etags) = self.send_multipart(full_key, key, parts)?;
+        match self.complete_mpu(full_key, key, &etags, &upload_id) {
+            Ok(()) => Ok(()),
+            Err(failure) => {
+                self.abort_mpu(full_key, key, &upload_id);
+                Err(failure)
+            }
+        }
+    }
+
+    /// Create a multipart upload and send every part: its `upload_id` and the
+    /// parts' ETags, ready to complete. Aborts its own `upload_id`
+    /// (best-effort) on a part failure.
+    ///
+    /// Part digests are computed in order on a helper thread while
+    /// `CreateMultipartUpload` is in flight, so the first parts start sending as
+    /// soon as the upload id arrives; part workers hash any part the helper has
+    /// not reached yet themselves.
+    fn send_multipart(
+        &self,
+        full_key: &str,
+        key: &str,
+        parts: &Parts<'_>,
+    ) -> std::result::Result<(String, Vec<String>), MultipartFailure> {
         std::thread::scope(|s| {
             s.spawn(|| {
                 for i in 0..parts.len() {
@@ -163,8 +251,8 @@ impl S3Backend {
                 }
             });
             let upload_id = self.create_mpu(full_key, key)?;
-            match self.upload_parts_and_complete(full_key, key, parts, &upload_id) {
-                Ok(()) => Ok(()),
+            match self.upload_parts(full_key, key, parts, &upload_id) {
+                Ok(etags) => Ok((upload_id, etags)),
                 Err(failure) => {
                     self.abort_mpu(full_key, key, &upload_id);
                     Err(failure)
@@ -239,19 +327,19 @@ impl S3Backend {
         }
     }
 
-    /// Upload every part, up to [`PartSlots`] at a time across the backend, then
-    /// complete. Workers claim part indices in ascending order; the first
-    /// failure stops new parts from starting and the scope joins every worker
-    /// before returning, so the caller's abort runs only after all in-flight
-    /// parts have stopped. Any part failure means complete never ran → not
-    /// ambiguous.
-    fn upload_parts_and_complete(
+    /// Upload every part, up to [`PartSlots`] at a time across the backend;
+    /// their ETags in part order. Workers claim part indices in ascending
+    /// order; the first failure stops new parts from starting and the scope
+    /// joins every worker before returning, so the caller's abort runs only
+    /// after all in-flight parts have stopped. Any part failure means complete
+    /// never ran → not ambiguous.
+    fn upload_parts(
         &self,
         full_key: &str,
         key: &str,
         parts: &Parts<'_>,
         upload_id: &str,
-    ) -> std::result::Result<(), MultipartFailure> {
+    ) -> std::result::Result<Vec<String>, MultipartFailure> {
         let etags: Vec<OnceLock<String>> = (0..parts.len()).map(|_| OnceLock::new()).collect();
         let next = AtomicUsize::new(0);
         let failed = AtomicBool::new(false);
@@ -314,14 +402,13 @@ impl S3Backend {
         if let Some((_, err)) = failure.into_inner().unwrap_or_else(|e| e.into_inner()) {
             return Err(err);
         }
-        let etags: Vec<String> = etags
+        Ok(etags
             .into_iter()
             .map(|e| {
                 e.into_inner()
                     .expect("every part uploaded when none failed")
             })
-            .collect();
-        self.complete_mpu(full_key, key, &etags, upload_id)
+            .collect())
     }
 
     /// `UploadPart` (PUT). Returns the part's `ETag` (quotes preserved) on success.
@@ -499,7 +586,10 @@ impl S3Backend {
         );
 
         match result {
-            Ok(CompleteOutcome::Success) => Ok(()),
+            Ok(CompleteOutcome::Success) => {
+                self.multipart_proven.store(true, Ordering::Relaxed);
+                Ok(())
+            }
             Ok(CompleteOutcome::Failed {
                 kind,
                 ambiguous: amb,
@@ -1215,6 +1305,104 @@ mod tests {
         backend
             .put("packs/ab/obj", &vec![0u8; MULTIPART_DATA_LEN])
             .unwrap();
+        handle.join().unwrap();
+    }
+
+    // ── put_owned: buffer released before the completion ───────────────
+
+    /// Until a completion has succeeded, `put_owned` keeps the buffer through
+    /// it, so a completion failure still restarts with a fresh upload.
+    #[test]
+    fn owned_unproven_completion_failure_restarts() {
+        let (port, captured, handle) = mock_server_script(vec![
+            mp_create_ok("u1"),
+            mp_part_ok("\"e1\""),
+            mp_part_ok("\"e2\""),
+            mp_err("404 Not Found", "NoSuchUpload"), // complete
+            mp_status("204 No Content"),             // abort
+            mp_status("404 Not Found"),              // reconcile HEAD: absent
+            mp_create_ok("u2"),
+            mp_part_ok("\"e1\""),
+            mp_part_ok("\"e2\""),
+            mp_complete_ok(),
+        ]);
+        let backend = s3_backend(port, no_retry(), false);
+        backend
+            .put_owned("packs/ab/obj", vec![0u8; MULTIPART_DATA_LEN])
+            .unwrap();
+        assert!(backend.multipart_proven.load(Ordering::Relaxed));
+        assert_eq!(mp_creates(&captured.lock().unwrap()), 2);
+        handle.join().unwrap();
+    }
+
+    /// Once proven, a completion that fails (and is not reconciled) is the
+    /// upload's error: the buffer is gone, so no second upload is created.
+    #[test]
+    fn owned_proven_completion_failure_is_an_error() {
+        let (port, captured, handle) = mock_server_script(vec![
+            mp_create_ok("u1"),
+            mp_part_ok("\"e1\""),
+            mp_part_ok("\"e2\""),
+            mp_err("404 Not Found", "NoSuchUpload"), // complete
+            mp_status("204 No Content"),             // abort
+            mp_status("404 Not Found"),              // reconcile HEAD: absent
+        ]);
+        let backend = s3_backend(port, no_retry(), false);
+        backend.multipart_proven.store(true, Ordering::Relaxed);
+        let err = backend
+            .put_owned("packs/ab/obj", vec![0u8; MULTIPART_DATA_LEN])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("NoSuchUpload") && err.contains("released"),
+            "got: {err}"
+        );
+        let cap = captured.lock().unwrap();
+        assert_eq!(mp_creates(&cap), 1);
+        assert!(req_line(&cap, cap.len() - 1).starts_with("HEAD "));
+        drop(cap);
+        handle.join().unwrap();
+    }
+
+    /// An ambiguous completion after the release still reconciles by size.
+    #[test]
+    fn owned_proven_lost_completion_reconciles_via_head() {
+        let (port, _captured, handle) = mock_server_script(vec![
+            mp_create_ok("u1"),
+            mp_part_ok("\"e1\""),
+            mp_part_ok("\"e2\""),
+            mp_truncated_2xx(),              // complete: body cut → ambiguous
+            mp_status("204 No Content"),     // abort
+            mp_head_len(MULTIPART_DATA_LEN), // reconcile HEAD: present, right size
+        ]);
+        let backend = s3_backend(port, no_retry(), false);
+        backend.multipart_proven.store(true, Ordering::Relaxed);
+        backend
+            .put_owned("packs/ab/obj", vec![0u8; MULTIPART_DATA_LEN])
+            .unwrap();
+        handle.join().unwrap();
+    }
+
+    /// A part failure happens while the buffer is still held, so the second
+    /// attempt is still available.
+    #[test]
+    fn owned_proven_part_failure_restarts() {
+        let (port, captured, handle) = mock_server_script(vec![
+            mp_create_ok("u1"),
+            mp_part_ok("\"e1\""),
+            mp_status("503 Service Unavailable"), // part 2
+            mp_status("204 No Content"),          // abort
+            mp_create_ok("u2"),
+            mp_part_ok("\"e1\""),
+            mp_part_ok("\"e2\""),
+            mp_complete_ok(),
+        ]);
+        let backend = s3_backend(port, no_retry(), false);
+        backend.multipart_proven.store(true, Ordering::Relaxed);
+        backend
+            .put_owned("packs/ab/obj", vec![0u8; MULTIPART_DATA_LEN])
+            .unwrap();
+        assert_eq!(mp_creates(&captured.lock().unwrap()), 2);
         handle.join().unwrap();
     }
 

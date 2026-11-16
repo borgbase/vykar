@@ -80,12 +80,7 @@ impl PartsFailure {
 
 impl RestBackend {
     /// Upload pack `data` (stored at `key`, content digest `pack_hex`) in
-    /// parts, then complete it.
-    ///
-    /// Workers claim part indices in ascending order; the first failure stops
-    /// new parts from starting, and every worker is joined before the
-    /// completion is sent, so the server never sees a completion racing a part
-    /// of the same upload. The caller falls back to a whole PUT on `Err`.
+    /// parts, then complete it. The caller falls back to a whole PUT on `Err`.
     pub(super) fn put_pack_in_parts(
         &self,
         key: &str,
@@ -93,6 +88,21 @@ impl RestBackend {
         digest_header: &str,
         data: &[u8],
     ) -> std::result::Result<(), PartsFailure> {
+        let token = self.send_pack_parts(key, data)?;
+        self.complete_pack_parts(key, pack_hex, digest_header, &token)
+    }
+
+    /// Send every part of pack `data`; the upload token on success.
+    ///
+    /// Workers claim part indices in ascending order; the first failure stops
+    /// new parts from starting, and every worker is joined before this
+    /// returns, so the server never sees a completion racing a part of the
+    /// same upload.
+    pub(super) fn send_pack_parts(
+        &self,
+        key: &str,
+        data: &[u8],
+    ) -> std::result::Result<String, PartsFailure> {
         let slots: &PartSlots = &self.part_slots;
         let token = new_token();
         let ranges = part_ranges(data.len(), self.part_size);
@@ -145,13 +155,25 @@ impl RestBackend {
             }
             worker();
         });
-        if let Some((_, f)) = failure.into_inner().unwrap_or_else(|e| e.into_inner()) {
-            return Err(f);
+        match failure.into_inner().unwrap_or_else(|e| e.into_inner()) {
+            Some((_, f)) => Err(f),
+            None => Ok(token),
         }
+    }
 
-        // Retrying is safe: once committed, the server answers a repeated
-        // completion from the stored object's digest.
-        let url = format!("{base}?complete&upload={token}");
+    /// Complete the part upload `token` of pack `key`. Needs no pack bytes,
+    /// so `put_owned` releases its buffer before calling this.
+    ///
+    /// Retrying is safe: once committed, the server answers a repeated
+    /// completion from the stored object's digest.
+    pub(super) fn complete_pack_parts(
+        &self,
+        key: &str,
+        pack_hex: &str,
+        digest_header: &str,
+        token: &str,
+    ) -> std::result::Result<(), PartsFailure> {
+        let url = format!("{}?complete&upload={token}", self.url(key));
         self.retry_call(
             &format!("COMPLETE {key}"),
             || {
@@ -164,7 +186,9 @@ impl RestBackend {
                 crate::retry::classify_status(status, format!("REST COMPLETE {key}: HTTP {status}"))
             },
         )
-        .map_err(|e| PartsFailure::from_http("complete", &e))
+        .map_err(|e| PartsFailure::from_http("complete", &e))?;
+        self.parts_proven.store(true, Ordering::Relaxed);
+        Ok(())
     }
 }
 

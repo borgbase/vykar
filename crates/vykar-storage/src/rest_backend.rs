@@ -110,6 +110,10 @@ pub struct RestBackend {
     pack_parts: OnceLock<bool>,
     /// Set when the part path failed permanently; later packs use whole PUTs.
     parts_disabled: AtomicBool,
+    /// Set by the first completed part upload. Until then a part upload
+    /// keeps its whole-PUT fallback through the completion (see
+    /// [`StorageBackend::put_owned`]).
+    parts_proven: AtomicBool,
     /// Backend-wide budget of concurrent part PUTs.
     part_slots: crate::http_util::PartSlots,
     /// Target part size; packs at or below it are sent whole.
@@ -171,6 +175,7 @@ impl RestBackend {
             sizes_unsupported: AtomicBool::new(false),
             pack_parts: OnceLock::new(),
             parts_disabled: AtomicBool::new(false),
+            parts_proven: AtomicBool::new(false),
             part_slots: crate::http_util::PartSlots::new(part_concurrency),
             part_size: parts::part_size(),
         })
@@ -493,7 +498,37 @@ impl RestBackend {
         self.content_hash.get().copied().unwrap_or_default()
     }
 
-    /// Shared PUT implementation for both borrowed and owned data.
+    /// The digest header naming a pack's content hash.
+    fn pack_digest_header(&self) -> &'static str {
+        match self.content_hash() {
+            HashAlgorithm::Blake2b => "X-Content-BLAKE2b",
+            HashAlgorithm::Blake3 => "X-Content-BLAKE3",
+        }
+    }
+
+    /// Whether a pack of `len` bytes goes up in parts.
+    fn pack_parts_for(&self, len: usize) -> bool {
+        len > self.part_size && self.pack_parts_enabled()
+    }
+
+    /// Log a part upload that will be retried as a whole PUT, and turn the
+    /// part path off if the failure would recur.
+    fn note_parts_failure(&self, key: &str, failure: &parts::PartsFailure) {
+        if failure.permanent {
+            self.parts_disabled.store(true, Ordering::Relaxed);
+        }
+        tracing::warn!(
+            "REST PUT {key}: part upload failed ({}); sending the pack whole{}",
+            failure.message,
+            if failure.permanent {
+                ", and every later one"
+            } else {
+                ""
+            }
+        );
+    }
+
+    /// Shared PUT implementation for borrowed data.
     ///
     /// Note what this does for pack keys: it never hashes them. A pack key
     /// *is* the pack ID, so the hex is lifted straight out of the key — which
@@ -501,42 +536,30 @@ impl RestBackend {
     /// algorithm, because the value is already the right digest. Non-pack
     /// objects are hashed here and stay BLAKE2b unconditionally.
     fn put_bytes(&self, key: &str, data: &[u8]) -> Result<()> {
-        let url = self.url(key);
         let (header, checksum) = match Self::try_extract_pack_hex(key) {
             Some(pack_hex) => {
-                let header = match self.content_hash() {
-                    HashAlgorithm::Blake2b => "X-Content-BLAKE2b",
-                    HashAlgorithm::Blake3 => "X-Content-BLAKE3",
-                };
-                if data.len() > self.part_size && self.pack_parts_enabled() {
+                let header = self.pack_digest_header();
+                if self.pack_parts_for(data.len()) {
                     match self.put_pack_in_parts(key, pack_hex, header, data) {
                         Ok(()) => return Ok(()),
-                        Err(failure) => {
-                            if failure.permanent {
-                                self.parts_disabled.store(true, Ordering::Relaxed);
-                            }
-                            tracing::warn!(
-                                "REST PUT {key}: part upload failed ({}); \
-                                 sending the pack whole{}",
-                                failure.message,
-                                if failure.permanent {
-                                    ", and every later one"
-                                } else {
-                                    ""
-                                }
-                            );
-                        }
+                        Err(failure) => self.note_parts_failure(key, &failure),
                     }
                 }
                 (header, pack_hex.to_string())
             }
             None => ("X-Content-BLAKE2b", Self::compute_blake2b_256_hex(data)),
         };
+        self.put_whole(key, header, &checksum, data)
+    }
+
+    /// One whole-object PUT carrying its content digest.
+    fn put_whole(&self, key: &str, header: &str, checksum: &str, data: &[u8]) -> Result<()> {
+        let url = self.url(key);
         self.retry_call(
             &format!("PUT {key}"),
             || {
                 self.authed(self.agent.put(&url))
-                    .header(header, &checksum)
+                    .header(header, checksum)
                     .send(data)
             },
             |resp| {
@@ -621,6 +644,48 @@ impl StorageBackend for RestBackend {
 
     fn put(&self, key: &str, data: &[u8]) -> Result<()> {
         self.put_bytes(key, data)
+    }
+
+    /// Like `put`, except that a pack sent in parts releases its buffer once
+    /// every part is acknowledged, before the completion request: the server
+    /// then hashes, fsyncs and publishes the assembled file, which is the
+    /// slow end of the upload, and nothing in it needs the bytes.
+    ///
+    /// The cost is the fallback: a completion that still fails after its
+    /// in-place retries can no longer be retried as a whole PUT, so it is
+    /// returned as the upload's error (the pack is not stored; the backup
+    /// fails rather than claiming it). A failure during the part phase still
+    /// falls back as `put` does, and until one completion has succeeded on
+    /// this backend the buffer is kept through it, so a server or proxy that
+    /// accepts parts but refuses completions still gets whole PUTs.
+    fn put_owned(&self, key: &str, data: Vec<u8>) -> Result<()> {
+        let Some(pack_hex) = Self::try_extract_pack_hex(key) else {
+            return self.put_bytes(key, &data);
+        };
+        if !self.parts_proven.load(Ordering::Relaxed) || !self.pack_parts_for(data.len()) {
+            return self.put_bytes(key, &data);
+        }
+        let header = self.pack_digest_header();
+        match self.send_pack_parts(key, &data) {
+            Ok(token) => {
+                drop(data);
+                self.complete_pack_parts(key, pack_hex, header, &token)
+                    .map_err(|failure| {
+                        if failure.permanent {
+                            self.parts_disabled.store(true, Ordering::Relaxed);
+                        }
+                        VykarError::Other(format!(
+                            "REST PUT {key}: {} (the pack buffer was already \
+                             released, so it cannot be resent whole)",
+                            failure.message
+                        ))
+                    })
+            }
+            Err(failure) => {
+                self.note_parts_failure(key, &failure);
+                self.put_whole(key, header, pack_hex, &data)
+            }
+        }
     }
 
     fn delete(&self, key: &str) -> Result<()> {
@@ -1514,6 +1579,85 @@ mod tests {
         assert_eq!(count(&seen, is_part), 3);
         assert_eq!(count(&seen, is_whole), 1);
         assert!(is_whole(seen.last().unwrap()));
+    }
+
+    /// `put_owned` keeps the whole-PUT fallback through the completion until
+    /// one completion has succeeded on the backend.
+    #[test]
+    fn owned_put_keeps_the_fallback_until_a_completion_succeeded() {
+        let (url, seen) = routing_server(pack_routes(
+            HEALTH_PARTS,
+            "204 No Content",
+            "404 Not Found",
+            "201 Created",
+        ));
+        let backend = parts_backend(&url, no_retry());
+        let (key, data) = test_pack(3000);
+        backend.put_owned(&key, data).unwrap();
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(count(&seen, is_part), 3);
+        assert!(is_whole(seen.last().unwrap()), "{seen:#?}");
+    }
+
+    /// Once completions are known to work, `put_owned` releases the buffer
+    /// before completing, so a failed completion is the upload's error and
+    /// is never answered with a whole PUT.
+    #[test]
+    fn owned_put_after_a_completion_surfaces_a_failed_completion() {
+        let complete_ok = std::sync::Arc::new(AtomicBool::new(true));
+        let flag = std::sync::Arc::clone(&complete_ok);
+        let (url, seen) = routing_server(move |line: &str| {
+            if line.starts_with("GET /health") {
+                json_response(HEALTH_PARTS)
+            } else if line.starts_with("PUT ") && line.contains("upload=") {
+                empty("204 No Content")
+            } else if line.starts_with("POST ") && line.contains("?complete") {
+                if flag.load(Ordering::Relaxed) {
+                    empty("201 Created")
+                } else {
+                    empty("404 Not Found")
+                }
+            } else {
+                empty("201 Created")
+            }
+        });
+        let backend = parts_backend(&url, no_retry());
+        let (key, data) = test_pack(3000);
+        backend.put_owned(&key, data).unwrap();
+
+        let (key2, data2) = test_pack(3500);
+        backend.put_owned(&key2, data2).unwrap();
+        complete_ok.store(false, Ordering::Relaxed);
+        let (key3, data3) = test_pack(4000);
+        let err = backend.put_owned(&key3, data3).unwrap_err().to_string();
+        assert!(
+            err.contains("404") && err.contains("released"),
+            "got: {err}"
+        );
+
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(count(&seen, is_whole), 0, "{seen:#?}");
+        assert_eq!(count(&seen, |s| s.line.contains("?complete")), 3);
+        assert_eq!(count(&seen, |s| is_part(s) && s.line.contains(&key3)), 4);
+    }
+
+    /// A part failure still falls back to a whole PUT from `put_owned`,
+    /// with the buffer still held.
+    #[test]
+    fn owned_put_part_failure_falls_back() {
+        let (url, seen) = routing_server(pack_routes(
+            HEALTH_PARTS,
+            "503 Service Unavailable",
+            "201 Created",
+            "201 Created",
+        ));
+        let backend = parts_backend(&url, no_retry());
+        backend.parts_proven.store(true, Ordering::Relaxed);
+        let (key, data) = test_pack(3500);
+        backend.put_owned(&key, data).unwrap();
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(count(&seen, is_whole), 1, "{seen:#?}");
+        assert_eq!(count(&seen, |s| s.line.contains("?complete")), 0);
     }
 
     /// When the fallback PUT fails too, its error is what the caller sees.

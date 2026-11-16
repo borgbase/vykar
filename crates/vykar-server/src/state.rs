@@ -7,6 +7,7 @@ use chrono::{DateTime, Utc};
 use crate::cleanup::{scan_usage, TEMP_DEBRIS_MAX_AGE};
 use crate::config::ServerSection;
 use crate::quota::{self, QuotaState};
+use crate::uploads::PartUploads;
 
 /// Shared application state, wrapped in Arc for axum handlers.
 #[derive(Clone)]
@@ -28,6 +29,9 @@ pub struct AppStateInner {
 
     /// Last backup timestamp (updated on new snapshot write).
     pub last_backup_at: RwLock<Option<DateTime<Utc>>>,
+
+    /// In-progress pack part uploads (see `crate::uploads`).
+    pub part_uploads: PartUploads,
 }
 
 pub(crate) fn read_unpoisoned<'a, T>(
@@ -122,6 +126,7 @@ impl AppState {
                 quota_reserved: AtomicU64::new(0),
                 quota_state,
                 last_backup_at: RwLock::new(None),
+                part_uploads: PartUploads::default(),
             }),
         }
     }
@@ -159,6 +164,7 @@ impl AppState {
                 quota_reserved: AtomicU64::new(0),
                 quota_state,
                 last_backup_at: RwLock::new(None),
+                part_uploads: PartUploads::default(),
             }),
         }
     }

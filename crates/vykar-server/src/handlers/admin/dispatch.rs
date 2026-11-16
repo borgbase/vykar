@@ -109,5 +109,6 @@ pub async fn health() -> impl IntoResponse {
             vykar_types::hash::HashAlgorithm::Blake2b.as_str(),
             vykar_types::hash::HashAlgorithm::Blake3.as_str(),
         ],
+        "pack_parts": true,
     }))
 }

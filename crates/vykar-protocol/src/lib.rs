@@ -164,6 +164,12 @@ pub struct ServerCapabilities {
     /// that must not fail deserialization of the whole response.
     #[serde(default)]
     pub hashes: Vec<String>,
+    /// The server accepts pack uploads in parts (`PUT packs/..?upload=..&offset=..&total=..`,
+    /// then `POST packs/..?complete&upload=..`), so a client can send one pack
+    /// over several connections. Absent on older servers, which a client reads
+    /// as "whole-object PUT only".
+    #[serde(default)]
+    pub pack_parts: bool,
 }
 
 impl ServerCapabilities {
@@ -174,6 +180,22 @@ impl ServerCapabilities {
     pub fn supports_hash(&self, algo: HashAlgorithm) -> bool {
         algo == HashAlgorithm::Blake2b || self.hashes.iter().any(|h| h == algo.as_str())
     }
+}
+
+// ── Pack part uploads ──────────────────────────────────────────────────────
+
+/// Length of a part-upload token: lowercase hex, chosen by the client per
+/// upload attempt (128 random bits).
+pub const PART_UPLOAD_TOKEN_LEN: usize = 32;
+
+/// Whether `token` is a well-formed part-upload token. The server builds a
+/// file name from it, so anything but [`PART_UPLOAD_TOKEN_LEN`] lowercase hex
+/// characters is refused.
+pub fn is_valid_upload_token(token: &str) -> bool {
+    token.len() == PART_UPLOAD_TOKEN_LEN
+        && token
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 // ── Repack wire types ──────────────────────────────────────────────────────
@@ -768,6 +790,30 @@ mod tests {
     fn unknown_keys_rejected() {
         assert!(!is_known_repo_key("random_file"));
         assert!(!is_known_repo_key("data/something"));
+    }
+
+    // ── Server capabilities / part uploads ────────────────────────────
+
+    #[test]
+    fn capabilities_without_pack_parts_default_to_false() {
+        let caps: ServerCapabilities =
+            serde_json::from_str(r#"{"status":"ok","version":"0.20.0","protocol_version":2}"#)
+                .unwrap();
+        assert!(!caps.pack_parts);
+        let caps: ServerCapabilities = serde_json::from_str(
+            r#"{"status":"ok","version":"0.21.0","protocol_version":2,"pack_parts":true}"#,
+        )
+        .unwrap();
+        assert!(caps.pack_parts);
+    }
+
+    #[test]
+    fn upload_token_validation() {
+        assert!(is_valid_upload_token(&"0123456789abcdef".repeat(2)));
+        assert!(!is_valid_upload_token(&"0123456789ABCDEF".repeat(2)));
+        assert!(!is_valid_upload_token("abc"));
+        assert!(!is_valid_upload_token(&"g".repeat(32)));
+        assert!(!is_valid_upload_token(&format!("{}/", "a".repeat(31))));
     }
 
     // ── is_temp_file ──────────────────────────────────────────────────

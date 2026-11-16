@@ -31,6 +31,8 @@ The server exposes normal storage-object routes plus a small set of admin query 
 | `GET` | `/{*path}?list` | `list(prefix)` | Returns a JSON array of matching keys. |
 | `POST` | `/{*path}?mkdir` | `create_dir(key)` | Creates directory scaffolding. |
 | `POST` | `/{*path}?sizes` | `object_sizes(keys)` | Body: a JSON array of up to 100,000 full keys, all below `{path}/`. Returns a JSON array of the same length with each object's size in bytes, or `null` when it is absent. A backup commit uses it to verify all its packs (`POST /packs?sizes`) in one request; servers that predate it answer `400`, and the client falls back to per-shard listings or `HEAD`s. |
+| `PUT` | `/packs/<xx>/<id>?upload=<token>&offset=<n>&total=<size>` | `put(key, data)`, one part | One part of a pack upload; see [Pack uploads in parts](#pack-uploads-in-parts). Returns `204`. |
+| `POST` | `/packs/<xx>/<id>?complete&upload=<token>` | `put(key, data)`, completion | Verifies the assembled pack against the digest header, makes it durable and publishes it. Returns `201`/`204`. |
 
 ### Admin routes
 
@@ -44,7 +46,7 @@ The server exposes normal storage-object routes plus a small set of admin query 
 | `GET` | `/?stats` | Repository size, object count, pack count, `last_backup_at`, and quota info |
 | `GET` | `/?verify-structure` | Structural repository validation |
 | `GET` | `/?list` | List all keys in the repository |
-| `GET` | `/health` | Unauthenticated liveness endpoint returning `status` and `version` |
+| `GET` | `/health` | Unauthenticated liveness endpoint returning `status`, `version` and the capabilities below |
 
 There are no dedicated `/locks` endpoints. Clients store lock and session objects through the normal object API (`locks/*`, `sessions/*`).
 
@@ -58,6 +60,7 @@ When `append_only = true`:
 
 - `DELETE` returns `403 Forbidden`, except for `locks/*`, `sessions/*`, and leftover temporary upload files — ephemeral coordination state and uncommitted data, whose removal cannot violate append-only
 - `PUT` to an existing key returns `403` **unless** the key is on the mutable-allowlist
+- A part upload of an existing pack is refused with `403` at its first part; a completion that finds the pack already present succeeds only if the stored object carries the expected digest (nothing is overwritten), and fsyncs the directory before answering
 - Mutable-allowlist: `index`, `index.gen`, `locks/*`, `sessions/*` — these may be overwritten freely
 - All other keys (`config`, `keys/*`, `snapshots/*`, `packs/*`) are immutable once written
 - `/?batch-delete` is rejected
@@ -82,6 +85,17 @@ The stats response includes:
   "quota_source": "Explicit"
 }
 ```
+
+## Pack Uploads in Parts
+
+Over a long-RTT link one TCP stream is capped by its window (about 100 MiB/s at 40 ms), and a whole-object `PUT` keeps one pack on one stream. Servers that advertise `"pack_parts": true` in `/health` also accept a pack in parts, so the client can send one pack over several connections:
+
+1. `PUT /packs/<xx>/<id>?upload=<token>&offset=<n>&total=<size>` — one per part, in any order and concurrently. `token` is 32 lowercase hex characters the client picks per upload; `Content-Length` is required and `offset + length` must not exceed `total`. Each part is a positioned write into the temp file `packs/<xx>/.tmp.<id>.<token>`, so resending a part is harmless and parts are retried like any other request. The first part reserves quota for the whole `total`; the reservation is held across requests until completion.
+2. `POST /packs/<xx>/<id>?complete&upload=<token>` with `X-Content-BLAKE3` or `X-Content-BLAKE2b`. The server hashes the assembled file (from the page cache, off the async runtime), checks its size against `total` and its digest, fdatasyncs it, renames it to its final name and fsyncs the directory **before** answering — the same durability contract as a whole-object `PUT`. A size mismatch is `400`, a digest mismatch `409`; both discard the upload. A completion that finds no upload but a stored object with the expected digest fsyncs the directory and answers `204`, so retrying after a lost response succeeds without acking a rename that is not yet durable (the first completion may have failed or not finished its directory fsync). An unknown upload is `404`; a completion while a part request is still being written is `503` (retryable).
+
+Completion first seals the assembled file — renames it away from the temp name — and only then hashes it. For the whole completion, from the moment it takes the upload until it has answered (verified, published and synced, or failed, or been cancelled by the client disconnecting), a part or a second completion for the same upload is answered `503` (retryable) instead of opening or creating a file, so no new request can write into the bytes being verified or seal other bytes under the name being published. That window lasts as long as the hash and fdatasync of the pack. A retried completion that arrives after it gets `204` if the first one published the pack (the stored digest matches) and `404` if it failed. The client joins every part request before completing, so it only meets these `503`s when a timed-out attempt of its own is still being processed. A stale part that the server receives only after the completion has ended starts a fresh upload under the temp name that nothing completes; it cannot touch the committed pack, and it holds its quota reservation until it is abandoned (below).
+
+Uploads idle for an hour are abandoned: their temp file is removed and their reservation released (checked whenever an upload starts and on the hourly sweep). The registry is in memory, so a server restart orphans an in-progress upload; its completion then answers `404` and the temp file is swept as ordinary debris after 24 hours. Temp files are hidden from listings and purged by delete-repo like every other temp file.
 
 ## Backup Freshness Monitoring
 
@@ -135,10 +149,10 @@ It also sends the content-digest header on `PUT` requests — bound once to the 
 `GET /health` is unauthenticated and advertises what the server supports:
 
 ```json
-{"status":"ok","version":"0.20.0","protocol_version":2,"hashes":["blake2b","blake3"]}
+{"status":"ok","version":"0.20.0","protocol_version":2,"hashes":["blake2b","blake3"],"pack_parts":true}
 ```
 
-`protocol_version` and `hashes` are additive; a pre-BLAKE3 server omits both, which a client reads as "blake2b only". `vykar init` probes this **before writing anything**, because `init` writes only non-pack keys that an old server happily accepts — without the probe, `init` would succeed and only the first `backup` would fail. Requests that declare `"hash": "blake3"` must also declare `protocol_version: 2`, so an old server rejects them outright rather than silently verifying every pack under the wrong algorithm.
+`pack_parts` advertises [pack uploads in parts](#pack-uploads-in-parts). All three fields are additive: a pre-BLAKE3 server omits `protocol_version` and `hashes`, which a client reads as "blake2b only", and a server without part support omits `pack_parts`. `vykar init` probes this **before writing anything**, because `init` writes only non-pack keys that an old server happily accepts — without the probe, `init` would succeed and only the first `backup` would fail. Requests that declare `"hash": "blake3"` must also declare `protocol_version: 2`, so an old server rejects them outright rather than silently verifying every pack under the wrong algorithm.
 
 Client config:
 

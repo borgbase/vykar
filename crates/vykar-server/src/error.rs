@@ -66,6 +66,8 @@ pub enum ServerError {
     BadRequest(String),
     Conflict(String),
     RangeNotSatisfiable(String),
+    /// Transient refusal (503); clients retry.
+    ServiceUnavailable(String),
     Internal(String),
 }
 
@@ -78,6 +80,7 @@ impl std::fmt::Display for ServerError {
             Self::BadRequest(msg) => write!(f, "bad request: {msg}"),
             Self::Conflict(msg) => write!(f, "conflict: {msg}"),
             Self::RangeNotSatisfiable(msg) => write!(f, "range not satisfiable: {msg}"),
+            Self::ServiceUnavailable(msg) => write!(f, "service unavailable: {msg}"),
             Self::Internal(msg) => write!(f, "internal error: {msg}"),
         }
     }
@@ -92,6 +95,7 @@ impl IntoResponse for ServerError {
             Self::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
             Self::Conflict(msg) => (StatusCode::CONFLICT, msg.clone()),
             Self::RangeNotSatisfiable(msg) => (StatusCode::RANGE_NOT_SATISFIABLE, msg.clone()),
+            Self::ServiceUnavailable(msg) => (StatusCode::SERVICE_UNAVAILABLE, msg.clone()),
             Self::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),
         };
         // Log the full message server-side.

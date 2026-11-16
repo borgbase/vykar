@@ -19,6 +19,7 @@ pub mod error;
 pub mod handlers;
 pub mod quota;
 pub mod state;
+mod uploads;
 mod writeback;
 
 use axum::serve::ListenerExt;
@@ -141,6 +142,10 @@ async fn serve(cli: Cli) -> Result<(), StartupError> {
         tick.tick().await; // first tick fires immediately; startup already scanned
         loop {
             tick.tick().await;
+            sweeper_state
+                .inner
+                .part_uploads
+                .expire(uploads::PART_UPLOAD_IDLE_TTL);
             sweeper_state.rescan_in_background();
         }
     });

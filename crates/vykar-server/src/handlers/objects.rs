@@ -19,6 +19,12 @@ pub struct ObjectQuery {
     pub mkdir: Option<String>,
     /// POST: report the sizes of a JSON list of keys (see `object_sizes`).
     pub sizes: Option<String>,
+    /// Part upload token (`PUT ...?upload=<token>&offset=<n>&total=<n>`, and
+    /// `POST ...?complete&upload=<token>`); see `super::parts`.
+    pub upload: Option<String>,
+    pub offset: Option<u64>,
+    pub total: Option<u64>,
+    pub complete: Option<String>,
 }
 
 /// GET /{*path} — if ?list present, list keys; otherwise read object.
@@ -82,9 +88,14 @@ pub async fn head_object(
 pub async fn put_object(
     State(state): State<AppState>,
     Path(key): Path<String>,
+    Query(query): Query<ObjectQuery>,
     headers: HeaderMap,
     body: axum::body::Body,
 ) -> Result<Response, ServerError> {
+    if let Some(token) = query.upload.as_deref() {
+        return super::parts::put_part(state, &key, token, &query, &headers, body).await;
+    }
+
     let file_path = state
         .file_path(&key)
         .ok_or_else(|| ServerError::BadRequest("invalid path".into()))?;
@@ -134,73 +145,12 @@ pub async fn put_object(
             ))
         })?;
 
-    // Parse the content-digest header. Two named headers rather than one
-    // generalized `X-Content-Digest: <algo>=<hex>`: the BLAKE2b variant has to
-    // be kept for old-client compatibility either way, so generalizing would
-    // mean two mechanisms for no gain, and the named form keeps the error
-    // message below truthful.
-    //
-    //   BLAKE2b only                -> verify BLAKE2b
-    //   BLAKE3 only                 -> verify BLAKE3
-    //   both                        -> 400 (ambiguous)
-    //   neither, key is "packs/..." -> 400
-    //   neither, non-pack key       -> skip verification
-    let is_pack = key.starts_with("packs/");
-    let parse_digest = |name: &str| -> Result<Option<String>, ServerError> {
-        match headers.get(name).and_then(|v| v.to_str().ok()) {
-            Some(hex_str) => {
-                if hex_str.len() != 64 || !hex_str.bytes().all(|b| b.is_ascii_hexdigit()) {
-                    return Err(ServerError::BadRequest(format!(
-                        "{name} must be 64 hex characters"
-                    )));
-                }
-                Ok(Some(hex_str.to_ascii_lowercase()))
-            }
-            None => Ok(None),
-        }
-    };
-    let expected_digest: Option<(HashAlgorithm, String)> = match (
-        parse_digest("X-Content-BLAKE2b")?,
-        parse_digest("X-Content-BLAKE3")?,
-    ) {
-        (Some(_), Some(_)) => {
-            return Err(ServerError::BadRequest(
-                "X-Content-BLAKE2b and X-Content-BLAKE3 are mutually exclusive".into(),
-            ));
-        }
-        (Some(hex_str), None) => Some((HashAlgorithm::Blake2b, hex_str)),
-        (None, Some(hex_str)) => Some((HashAlgorithm::Blake3, hex_str)),
-        (None, None) if is_pack => {
-            return Err(ServerError::BadRequest(
-                "X-Content-BLAKE2b or X-Content-BLAKE3 header required for pack uploads".into(),
-            ));
-        }
-        (None, None) => None,
-    };
+    let expected_digest = parse_expected_digest(&headers, key.starts_with("packs/"))?;
 
-    // Ensure parent directory exists. When it had to be created, fsync the new
-    // ancestor chain up to data_dir so the directory entries survive power loss
-    // (rare path — only when missing).
     let parent = file_path
         .parent()
         .ok_or_else(|| ServerError::BadRequest("invalid path".into()))?;
-    let parent_existed = tokio::fs::try_exists(parent).await.unwrap_or(false);
-    tokio::fs::create_dir_all(parent)
-        .await
-        .map_err(ServerError::from)?;
-    if !parent_existed {
-        let data_dir = state.inner.data_dir.as_path();
-        let mut cursor = Some(parent);
-        while let Some(dir) = cursor {
-            fsync_dir_async(dir.to_path_buf())
-                .await
-                .map_err(ServerError::from)?;
-            if dir == data_dir {
-                break;
-            }
-            cursor = dir.parent();
-        }
-    }
+    ensure_parent_dir(&state, parent).await?;
 
     // `temp_path` is the RAII owner. It lives outside the write block below
     // so the file handle is dropped before the path is unlinked (Windows).
@@ -311,13 +261,7 @@ pub async fn put_object(
     if let (Some((algo, expected)), Some(hasher)) = (&expected_digest, hasher) {
         let actual_hex = hasher.finalize_hex();
         if actual_hex != *expected {
-            let name = match algo {
-                HashAlgorithm::Blake2b => "BLAKE2b",
-                HashAlgorithm::Blake3 => "BLAKE3",
-            };
-            return Err(ServerError::Conflict(format!(
-                "{name} checksum mismatch: expected {expected}, got {actual_hex}"
-            )));
+            return Err(digest_mismatch(*algo, expected, &actual_hex));
         }
     }
 
@@ -416,8 +360,90 @@ pub async fn delete_object(
     }
 }
 
+/// Parse the content-digest header. Two named headers rather than one
+/// generalized `X-Content-Digest: <algo>=<hex>`: the BLAKE2b variant has to be
+/// kept for old-client compatibility either way, so generalizing would mean
+/// two mechanisms for no gain, and the named form keeps the error message
+/// below truthful.
+///
+///   BLAKE2b only                -> verify BLAKE2b
+///   BLAKE3 only                 -> verify BLAKE3
+///   both                        -> 400 (ambiguous)
+///   neither, `is_pack`          -> 400
+///   neither, non-pack key       -> skip verification
+pub(crate) fn parse_expected_digest(
+    headers: &HeaderMap,
+    is_pack: bool,
+) -> Result<Option<(HashAlgorithm, String)>, ServerError> {
+    let parse_digest = |name: &str| -> Result<Option<String>, ServerError> {
+        match headers.get(name).and_then(|v| v.to_str().ok()) {
+            Some(hex_str) => {
+                if hex_str.len() != 64 || !hex_str.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return Err(ServerError::BadRequest(format!(
+                        "{name} must be 64 hex characters"
+                    )));
+                }
+                Ok(Some(hex_str.to_ascii_lowercase()))
+            }
+            None => Ok(None),
+        }
+    };
+    match (
+        parse_digest("X-Content-BLAKE2b")?,
+        parse_digest("X-Content-BLAKE3")?,
+    ) {
+        (Some(_), Some(_)) => Err(ServerError::BadRequest(
+            "X-Content-BLAKE2b and X-Content-BLAKE3 are mutually exclusive".into(),
+        )),
+        (Some(hex_str), None) => Ok(Some((HashAlgorithm::Blake2b, hex_str))),
+        (None, Some(hex_str)) => Ok(Some((HashAlgorithm::Blake3, hex_str))),
+        (None, None) if is_pack => Err(ServerError::BadRequest(
+            "X-Content-BLAKE2b or X-Content-BLAKE3 header required for pack uploads".into(),
+        )),
+        (None, None) => Ok(None),
+    }
+}
+
+/// The 409 for a content digest that does not match.
+pub(crate) fn digest_mismatch(algo: HashAlgorithm, expected: &str, actual: &str) -> ServerError {
+    let name = match algo {
+        HashAlgorithm::Blake2b => "BLAKE2b",
+        HashAlgorithm::Blake3 => "BLAKE3",
+    };
+    ServerError::Conflict(format!(
+        "{name} checksum mismatch: expected {expected}, got {actual}"
+    ))
+}
+
+/// Ensure `parent` exists. When it had to be created, fsync the new ancestor
+/// chain up to `data_dir` so the directory entries survive power loss (rare
+/// path — only when missing).
+pub(crate) async fn ensure_parent_dir(
+    state: &AppState,
+    parent: &std::path::Path,
+) -> Result<(), ServerError> {
+    let parent_existed = tokio::fs::try_exists(parent).await.unwrap_or(false);
+    tokio::fs::create_dir_all(parent)
+        .await
+        .map_err(ServerError::from)?;
+    if !parent_existed {
+        let data_dir = state.inner.data_dir.as_path();
+        let mut cursor = Some(parent);
+        while let Some(dir) = cursor {
+            fsync_dir_async(dir.to_path_buf())
+                .await
+                .map_err(ServerError::from)?;
+            if dir == data_dir {
+                break;
+            }
+            cursor = dir.parent();
+        }
+    }
+    Ok(())
+}
+
 /// Fsync a directory off the async runtime (directory fsync is blocking).
-async fn fsync_dir_async(dir: std::path::PathBuf) -> std::io::Result<()> {
+pub(crate) async fn fsync_dir_async(dir: std::path::PathBuf) -> std::io::Result<()> {
     tokio::task::spawn_blocking(move || vykar_common::fs::fsync_dir(&dir))
         .await
         .map_err(|e| std::io::Error::other(e.to_string()))?
@@ -444,6 +470,7 @@ async fn stream_full_read(file_path: &std::path::Path, key: &str) -> Result<Resp
 
 /// POST /{*path}?mkdir — create directory.
 /// POST /{*path}?sizes — sizes of a JSON list of keys below `path`.
+/// `POST /{*path}?complete&upload=<token>` — finish a part upload.
 pub async fn post_object(
     State(state): State<AppState>,
     Path(key): Path<String>,
@@ -458,6 +485,14 @@ pub async fn post_object(
         let body = read_sizes_body(&headers, body).await?;
         return object_sizes(state, &key, &body).await;
     }
+    if query.complete.is_some() {
+        let token = query
+            .upload
+            .as_deref()
+            .ok_or_else(|| ServerError::BadRequest("complete requires an upload token".into()))?;
+        return super::parts::complete_upload(state, &key, token, &headers).await;
+    }
+
     if query.mkdir.is_some() {
         let dir_path = state
             .file_path(&key)

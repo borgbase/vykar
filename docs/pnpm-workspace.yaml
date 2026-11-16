@@ -1,0 +1,31 @@
+# Supply-chain hardening for the docs toolchain (same policy as our other pnpm projects).
+
+# Main registry pin. npmjs is the default anyway; this documents it.
+registries:
+  default: https://registry.npmjs.org/
+
+# Cooldown: ignore versions published less than 48 hours ago, and fail closed —
+# error instead of silently downgrading, and don't wave a package through when
+# the registry omits its publish time.
+minimumReleaseAge: 2880
+minimumReleaseAgeStrict: true
+minimumReleaseAgeIgnoreMissingTime: false
+
+# Fail if a version has weaker publish trust (trusted publisher > provenance > none)
+# than an earlier release — the stolen-token takeover pattern. Waive a reviewed case
+# by exact version in trustPolicyExclude.
+trustPolicy: no-downgrade
+trustPolicyExcludePrune: true
+
+# Build-script approvals: true runs a package's install scripts, false skips them.
+# No current dependency needs one; strictDepBuilds makes any new one fail until decided here.
+allowBuilds: {}
+
+# Fail on any undecided build script instead of warning.
+strictDepBuilds: true
+
+# Fail `pnpm run`/`pnpm exec` fast if node_modules is out of sync with the lockfile.
+verifyDepsBeforeRun: error
+
+# Only direct deps may use exotic sources (git/tarball URLs).
+blockExoticSubdeps: true

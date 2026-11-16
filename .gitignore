@@ -1,10 +1,7 @@
 /target
-/docs/book
-/.cloudflare-tools
 /dist
 __pycache__
 *.egg-info
-docs/src/https*
 .zed
 proptest-regressions/
 fuzz/artifacts/
@@ -21,3 +18,4 @@ fuzz/target/
 .claude/settings.local.json
 .claude/worktrees/
 .DS_Store
+/.cloudflare-tools

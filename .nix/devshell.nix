@@ -11,8 +11,8 @@ pkgs.mkShell {
       rustToolchain
 
       # docs
-      pkgs.mdbook
-      pkgs.mdbook-mermaid
+      pkgs.nodejs_24
+      pkgs.pnpm
 
       # fuzzing
       pkgs.cargo-fuzz

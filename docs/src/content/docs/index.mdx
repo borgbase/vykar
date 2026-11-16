@@ -1,0 +1,69 @@
+---
+title: Vykar Backup
+description: Vykar is the fastest and most resource-efficient encrypted, deduplicated backup tool we have benchmarked, written in Rust.
+template: splash
+hero:
+  tagline: >-
+    <p>The fastest and most resource-efficient encrypted, deduplicated backup tool we have benchmarked, written in Rust.
+    Centered around a simple YAML config format, with a desktop GUI and WebDAV server to browse snapshots.</p>
+    <p class="hero-warning">⚠️ Do not use for production backups yet, but do test it along other backup tools.</p>
+  image:
+    html: '<a href="/gui"><img class="hero-shot" src="/images/gui-screenshot.png" width="1800" height="1283" alt="Vykar desktop GUI: repository overview with the Restore Snapshot dialog open" /></a>'
+  actions:
+    - text: Quick Start
+      link: /quickstart
+      icon: right-arrow
+    - text: Install
+      link: /install
+      variant: minimal
+    - text: Design goals
+      link: /goals
+      variant: minimal
+---
+
+<div class="home-cols">
+<div>
+
+## Features
+
+- **Fast and lean** -- fastest backup and restore we benchmarked, with the lowest CPU and memory use
+- **Encrypted by default** -- client-side encryption; the storage never sees your keys
+- **Deduplicated and compressed** -- FastCDC chunking with BLAKE3 IDs, compressed with LZ4 or Zstandard
+- **One YAML file** -- repositories, sources, retention, schedule and hooks in one place
+- **Storage backends** -- local, S3, SFTP, or the dedicated REST server
+- **Append-only storage** -- enforced by the REST server or S3 Object Lock
+
+</div>
+<div>
+
+## Benchmarks
+
+On a 49 GiB / 367k-file corpus, Vykar backs up 1.4x faster than the next-fastest tool (2.4x faster than Restic) and uses the least CPU and the least memory of all tools tested -- for both backup and restore.
+
+[![Backup Tool Benchmark: Vykar is fastest with the lowest CPU and memory use compared to Restic, Rustic, Borg and Kopia](/images/benchmark.summary.png)](/images/benchmark.summary.png)
+
+<small>All benchmarks were run 5x on the same idle Intel i7-6700 CPU @ 3.40GHz machine with 2x Samsung PM981 NVMe drives, with results averaged across all runs. Compression settings were chosen to keep resulting repository sizes comparable. The sample corpus is a mix of small and large files with varying compressibility. See [detailed results](/images/summary.json) or our [benchmark script](https://github.com/borgbase/vykar/tree/main/scripts) for full details.</small>
+
+</div>
+</div>
+
+## Get Started
+
+```bash
+curl -fsSL https://vykar.borgbase.com/install.sh | sh
+```
+
+Then follow the **[Quick Start guide](/quickstart)** to create a config and run your first backup in under 5 minutes. Other install methods (pre-built binaries, Docker, Ansible) are covered in [Install](/install).
+
+Once you're up and running:
+
+- [Configure storage backends](/backends) -- connect S3, SFTP, or the REST server
+- [Set up hooks and command dumps](/configuration#hooks) -- run scripts before/after backups, capture database dumps
+- [Browse and restore snapshots](/restore) -- list, search, and restore files
+- [Schedule backups](/daemon) -- run unattended with systemd, launchd, or Docker
+- [Maintain your repository](/maintenance) -- prune old snapshots, check integrity, compact packs
+- [Explore backup recipes](/recipes) -- common patterns for databases, containers, and filesystems
+
+## How it compares
+
+Vykar builds on ideas from Borg, Borgmatic, Restic, and Rustic. Where those tools rely on wrappers for configuration, scheduling, and hooks, Vykar ships them in one binary, alongside AEAD encryption with keyed content addressing and a server that enforces append-only access. See the [comparison with Borg, Restic, Rustic, and Kopia](/comparison) for a feature-by-feature breakdown.

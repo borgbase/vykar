@@ -1,0 +1,62 @@
+---
+import { Icon } from '@astrojs/starlight/components';
+import { repo, stars as starsPromise, formatStars } from '../lib/github';
+
+// Fetched at build time; Pages rebuilds on every push, so the count stays reasonably fresh.
+const stars = await starsPromise;
+const formatted = stars === undefined ? undefined : formatStars(stars);
+---
+
+<a class="cta" href="https://www.borgbase.com">Get 10 GB Free Backup Hosting</a>
+<a class="gh" href={`https://github.com/${repo}`} aria-label={formatted ? `GitHub, ${stars} stars` : 'GitHub'}>
+	<Icon name="github" size="1.1rem" />
+	{
+		formatted && (
+			<span class="stars">
+				<Icon name="star" size="0.85rem" />
+				{formatted}
+			</span>
+		)
+	}
+</a>
+
+<style>
+	.cta,
+	.gh {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.4rem;
+		padding: 0.4rem 0.9rem;
+		border-radius: 0.375rem;
+		font-size: var(--sl-text-sm);
+		font-weight: 600;
+		text-decoration: none;
+		white-space: nowrap;
+	}
+	.cta {
+		background: #fb8c00;
+		color: #fff;
+	}
+	.cta:hover {
+		background: #e65100;
+		color: #fff;
+	}
+	.gh {
+		color: var(--sl-color-white);
+		border: 1px solid var(--sl-color-gray-5);
+	}
+	.gh:hover {
+		border-color: var(--sl-color-gray-3);
+		color: var(--sl-color-white);
+	}
+	.stars {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.2rem;
+	}
+	@media (max-width: 50rem) {
+		.cta {
+			display: none;
+		}
+	}
+</style>

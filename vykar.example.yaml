@@ -270,4 +270,4 @@ compression:
 #   full_every: "60d"              # run full 100% check on this interval (default: unset = never)
 #                                  # overrides max_percent to 100 when due
 
-# See docs/src/configuration.md for full option reference.
+# See docs/src/content/docs/configuration.md (https://vykar.borgbase.com/configuration) for full option reference.

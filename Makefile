@@ -4,7 +4,6 @@
 	doc-check \
 	docs-build \
 	docs-serve \
-	docs-test \
 	fmt \
 	fmt-check \
 	fuzz \
@@ -45,7 +44,7 @@ appimage:
 
 app:
 	cargo build --release -p vykar-gui
-	crates/vykar-gui/macos/create-icns.sh docs/src/images/logo-colored-gradient.svg target/AppIcon.icns
+	crates/vykar-gui/macos/create-icns.sh docs/public/images/logo-colored-gradient.svg target/AppIcon.icns
 	mkdir -p "$(APP_BUNDLE)/Contents/MacOS" "$(APP_BUNDLE)/Contents/Resources"
 	cp crates/vykar-gui/macos/Info.plist "$(APP_BUNDLE)/Contents/"
 	cp target/release/vykar-gui "$(APP_BUNDLE)/Contents/MacOS/"
@@ -66,10 +65,7 @@ fuzz-check:
 	done
 
 docs-build:
-	mdbook build docs
+	cd docs && pnpm install --frozen-lockfile && pnpm build
 
 docs-serve:
-	mdbook serve docs --open
-
-docs-test:
-	mdbook test docs
+	cd docs && pnpm install --frozen-lockfile && pnpm dev --open

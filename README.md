@@ -10,9 +10,9 @@ Inspired by [BorgBackup](https://github.com/borgbackup/borg/), [Borgmatic](https
 
 On a 49 GiB / 367k-file corpus, Vykar backs up 1.4x faster than the next-fastest tool (2.4x faster than Restic) and uses the least CPU and the least memory of all tools tested — for both backup and restore.
 
-![Backup Tool Benchmark: Vykar is fastest with the lowest CPU and memory use compared to Restic, Rustic, Borg and Kopia](docs/src/images/benchmark.summary.png)
+![Backup Tool Benchmark: Vykar is fastest with the lowest CPU and memory use compared to Restic, Rustic, Borg and Kopia](docs/public/images/benchmark.summary.png)
 
-All benchmarks were run 5x on the same idle Intel i7-6700 CPU @ 3.40GHz machine with 2x Samsung PM981 NVMe drives, with results averaged across all runs. Compression settings were chosen to keep resulting repository sizes comparable. The sample corpus is a mix of small and large files with varying compressibility. See [detailed results](docs/src/images/summary.json) or our [benchmark script](https://github.com/borgbase/vykar/tree/main/scripts) for full details.
+All benchmarks were run 5x on the same idle Intel i7-6700 CPU @ 3.40GHz machine with 2x Samsung PM981 NVMe drives, with results averaged across all runs. Compression settings were chosen to keep resulting repository sizes comparable. The sample corpus is a mix of small and large files with varying compressibility. See [detailed results](docs/public/images/summary.json) or our [benchmark script](https://github.com/borgbase/vykar/tree/main/scripts) for full details.
 
 
 ## Features
@@ -25,7 +25,7 @@ All benchmarks were run 5x on the same idle Intel i7-6700 CPU @ 3.40GHz machine 
 - **Verifiable** — full or sampled integrity checks, repair, a redundant repository key, and restore that salvages around damage
 - **Append-only storage** — REST server with append-only enforcement, quotas, and server-side compaction, or S3 Object Lock
 - **Find and restore** — search files across snapshots, browse via built-in WebDAV and web UI, or use the desktop GUI
-- **Runs unattended** — built-in scheduler (interval or cron) with a [read-only HTTP status page](docs/src/daemon.md#read-only-status-page), resource limits, and concurrent backups from multiple machines
+- **Runs unattended** — built-in scheduler (interval or cron) with a [read-only HTTP status page](docs/src/content/docs/daemon.md#read-only-status-page), resource limits, and concurrent backups from multiple machines
 - **Cross-platform** — Linux, macOS, and Windows; single binary, Docker image, Ansible role
 
 
@@ -55,7 +55,7 @@ See the [full documentation](https://vykar.borgbase.com) for storage backends, r
 ## Desktop UI
 
 <p align="center">
-  <img src="docs/src/images/gui-screenshot.png" alt="Vykar GUI" width="380">
+  <img src="docs/public/images/gui-screenshot.png" alt="Vykar GUI" width="380">
 </p>
 
 `vykar-gui` is a Slint-based desktop app that uses `vykar-core` directly (it does not shell out to the CLI).

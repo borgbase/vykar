@@ -49,7 +49,7 @@ jobs:
     name: linux-x86_64-unknown-linux-gnu
     if: github.event_name != 'workflow_dispatch' || github.event.inputs.build_linux == 'true'
     # Pinned to Ubuntu 24.04 (glibc 2.39). vykar-gui (Slint) needs newer system libs.
-    # If bumped, update MIN_GLIBC_MAJOR/MIN_GLIBC_MINOR in docs/src/install.sh.
+    # If bumped, update MIN_GLIBC_MAJOR/MIN_GLIBC_MINOR in docs/public/install.sh.
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
@@ -269,10 +269,10 @@ jobs:
           # The CLI ships inside the bundle as well. macOS only grants Full Disk
           # Access reliably to bundled executables, so scheduled launchd jobs must
           # invoke .../Vykar Backup.app/Contents/MacOS/vykar rather than a bare
-          # binary on PATH. See docs/src/daemon.md.
+          # binary on PATH. See docs/src/content/docs/daemon.md.
           cp "${RELEASE_DIR}/vykar" "${RELEASE_DIR}/vykar-server" "${APP_BUNDLE}/Contents/MacOS/"
           brew install librsvg
-          crates/vykar-gui/macos/create-icns.sh docs/src/images/logo-colored-gradient.svg "${APP_BUNDLE}/Contents/Resources/AppIcon.icns"
+          crates/vykar-gui/macos/create-icns.sh docs/public/images/logo-colored-gradient.svg "${APP_BUNDLE}/Contents/Resources/AppIcon.icns"
       - name: Require signing for published releases
         if: >-
           (github.event_name == 'push' || github.event.inputs.publish_release == 'true')

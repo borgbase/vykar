@@ -1,7 +1,7 @@
 default_install_hook_types = ["pre-commit", "pre-push"]
 
 # Exclude vendored, generated, and binary corpus files
-exclude = '(^docs/mermaid\.min\.js$|^docs/src/images/|^fuzz/corpus/)'
+exclude = '(^docs/public/images/|^docs/pnpm-lock\.yaml$|^fuzz/corpus/)'
 
 # --- File hygiene (built-in, fast) ---
 [[repos]]

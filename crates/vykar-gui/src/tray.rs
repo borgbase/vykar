@@ -103,7 +103,7 @@ fn to_slint_image(img: &image::RgbaImage) -> Image {
 
 /// Build an unwired `VykarTray` with icons and theme set.
 pub(crate) fn build_tray() -> Result<VykarTray, String> {
-    let logo_bytes = include_bytes!("../../../docs/src/images/logo_simple.png");
+    let logo_bytes = include_bytes!("../../../docs/public/images/logo_simple.png");
     let mut logo_img = image::load_from_memory(logo_bytes)
         .map_err(|e| format!("failed to decode logo: {e}"))?
         .resize(44, 44, image::imageops::FilterType::Lanczos3)

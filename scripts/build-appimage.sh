@@ -22,7 +22,7 @@ cp "${BINARY}" "${APPDIR}/usr/bin/vykar-gui"
 chmod +x "${APPDIR}/usr/bin/vykar-gui"
 
 # --- Generate 256x256 icon from SVG (same source as macOS .icns) ---
-SVG_SRC="${REPO_ROOT}/docs/src/images/logo-colored-gradient.svg"
+SVG_SRC="${REPO_ROOT}/docs/public/images/logo-colored-gradient.svg"
 ICON_OUT="${APPDIR}/usr/share/icons/hicolor/256x256/apps/vykar-gui.png"
 rsvg-convert --width=256 --height=256 \
     "${SVG_SRC}" -o "${ICON_OUT}"

@@ -726,10 +726,7 @@ mod tests {
         let (router, state, tmp) = setup_app(0);
         let (data, _id, path) = pack(6000);
         put_part(&router, &path, TOKEN, &data, 0..1000).await;
-        let temp = crate::handlers::test_helpers::walk_file_paths(&state.inner.data_dir)
-            .into_iter()
-            .find(|p| vykar_protocol::is_temp_file(&p.to_string_lossy()))
-            .unwrap();
+        let temp = crate::handlers::test_helpers::find_temp_file(&state.inner.data_dir);
         // Forget the upload without unlinking, as a restart would.
         let leaked = state.inner.part_uploads.take(&temp);
         let crate::uploads::Take::Owned(completion) = leaked else {
@@ -791,10 +788,7 @@ mod tests {
         let (router, state, tmp) = setup_app(1_000_000);
         let (data, id, path) = pack(6000);
         upload_all(&router, &path, TOKEN, &data).await;
-        let temp = crate::handlers::test_helpers::walk_file_paths(&state.inner.data_dir)
-            .into_iter()
-            .find(|p| vykar_protocol::is_temp_file(&p.to_string_lossy()))
-            .unwrap();
+        let temp = crate::handlers::test_helpers::find_temp_file(&state.inner.data_dir);
         let before = std::fs::read(&temp).unwrap();
 
         // A completion that has taken the upload but not sealed it yet.
@@ -835,10 +829,7 @@ mod tests {
 
         for publish in [false, true] {
             upload_all(&router, &path, TOKEN, &data).await;
-            let temp = crate::handlers::test_helpers::walk_file_paths(&state.inner.data_dir)
-                .into_iter()
-                .find(|p| vykar_protocol::is_temp_file(&p.to_string_lossy()))
-                .unwrap();
+            let temp = crate::handlers::test_helpers::find_temp_file(&state.inner.data_dir);
             let sealed = std::path::PathBuf::from(format!("{}.sealed", temp.display()));
 
             // A completion that has sealed the file and is verifying it.

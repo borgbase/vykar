@@ -134,6 +134,14 @@ pub fn temp_file_count(dir: &std::path::Path) -> usize {
     temp_file_paths(dir).len()
 }
 
+/// The one server temp file under `dir`. Panics if there is none.
+pub fn find_temp_file(dir: &std::path::Path) -> std::path::PathBuf {
+    temp_file_paths(dir)
+        .into_iter()
+        .next()
+        .expect("no temp file")
+}
+
 fn temp_file_paths(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     walk_file_paths(dir)
         .into_iter()

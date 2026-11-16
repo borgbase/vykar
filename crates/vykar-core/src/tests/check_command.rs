@@ -1356,6 +1356,82 @@ fn small_file_non_utf8_name_round_trips_via_sequential_path() {
     );
 }
 
+/// Non-empty non-UTF8-named files backed up through the **parallel pipeline**
+/// (both a whole-file `File` entry and a segmented `FileSegment` entry) are
+/// read from their real OS path, not the lossy display string (issue #210).
+/// Self-skips on filesystems that reject non-UTF8 names.
+#[cfg(unix)]
+#[test]
+fn non_utf8_names_round_trip_via_pipeline() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = tmp.path().join("repo");
+    let source_dir = tmp.path().join("source");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    std::fs::create_dir_all(&source_dir).unwrap();
+
+    let small_name = b"small-\x80.txt";
+    let small_data = b"non-utf8 pipeline contents".repeat(100);
+    if std::fs::write(source_dir.join(OsStr::from_bytes(small_name)), &small_data).is_err() {
+        return; // filesystem rejects non-UTF8 names — skip.
+    }
+    // One byte over the fixed 64 MiB segment size → two segments. Sparse, so
+    // cheap to create; the tail marker checks the second segment's bytes.
+    let big_name = b"big-\xff.bin";
+    let big_len = 64 * 1024 * 1024 + 1;
+    {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut f = std::fs::File::create(source_dir.join(OsStr::from_bytes(big_name))).unwrap();
+        f.set_len(big_len).unwrap();
+        f.seek(SeekFrom::End(-1)).unwrap();
+        f.write_all(b"Z").unwrap();
+    }
+
+    let mut config = init_repo(&repo_dir);
+    config.limits.threads = 2;
+    let stats = backup_single_source(&config, &source_dir, "src-a", "snap-pipe");
+    assert_eq!(stats.errors, 0, "no file may be skipped");
+
+    let dest = tmp.path().join("restored");
+    std::fs::create_dir_all(&dest).unwrap();
+    commands::restore::run(
+        &config,
+        None,
+        "snap-pipe",
+        dest.to_str().unwrap(),
+        None,
+        false,
+        false,
+        None,
+    )
+    .unwrap();
+
+    fn find_raw(dir: &std::path::Path, raw: &[u8]) -> Option<std::path::PathBuf> {
+        for e in std::fs::read_dir(dir).ok()?.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                if let Some(found) = find_raw(&p, raw) {
+                    return Some(found);
+                }
+            } else if p.file_name().is_some_and(|n| n.as_bytes() == raw) {
+                return Some(p);
+            }
+        }
+        None
+    }
+
+    let small = find_raw(&dest, small_name).expect("small non-UTF8 file restored");
+    assert_eq!(std::fs::read(small).unwrap(), small_data);
+
+    let big = find_raw(&dest, big_name).expect("segmented non-UTF8 file restored");
+    let restored = std::fs::read(big).unwrap();
+    assert_eq!(restored.len() as u64, big_len);
+    assert_eq!(restored.last(), Some(&b'Z'));
+    assert!(restored[..restored.len() - 1].iter().all(|&b| b == 0));
+}
+
 /// Recursively walk `root` looking for a file whose name matches `name`.
 fn walk_find_file(root: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
     for entry in std::fs::read_dir(root).ok()? {

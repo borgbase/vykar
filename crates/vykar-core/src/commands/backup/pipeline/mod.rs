@@ -1132,7 +1132,7 @@ mod tests {
         ));
         let seg = WalkEntry::FileSegment {
             item: None,
-            abs_path: Arc::from("/b"),
+            abs_path: Arc::from(std::path::Path::new("/b")),
             metadata: test_metadata(),
             segment_index: 1,
             num_segments: 2,

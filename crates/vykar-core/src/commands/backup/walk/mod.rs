@@ -320,16 +320,18 @@ pub(super) fn materialize_item(walked: WalkedEntry, xattrs_enabled: bool) -> Res
 
 /// Walk entry produced by the sequential walk phase.
 pub(super) enum WalkEntry {
+    /// `File` and `FileSegment` carry the real OS path: on Unix it may be
+    /// non-UTF-8, and the lossy display string would not open.
     File {
         item: Item,
-        abs_path: String,
+        abs_path: PathBuf,
         metadata: fs::MetadataSummary,
         file_size: u64,
     },
     FileSegment {
         /// Only present for segment 0; `None` for continuations.
         item: Option<Item>,
-        abs_path: Arc<str>,
+        abs_path: Arc<Path>,
         metadata: fs::MetadataSummary,
         segment_index: usize,
         num_segments: usize,
@@ -387,6 +389,14 @@ pub(super) enum WalkEntry {
     SourceFinished {
         path: String,
     },
+}
+
+/// Lossy `String` form of a path, reusing the buffer when it is valid UTF-8.
+/// Used for file-cache keys and display; never for opening the file.
+pub(super) fn into_lossy_string(path: PathBuf) -> String {
+    path.into_os_string()
+        .into_string()
+        .unwrap_or_else(|os| os.to_string_lossy().into_owned())
 }
 
 /// Acquire budget for a walk entry before dispatching to a worker.
@@ -460,7 +470,7 @@ enum WalkItems {
     Segments {
         /// Moved into segment 0; `None` for continuations.
         item: Option<Item>,
-        abs_path: Arc<str>,
+        abs_path: Arc<Path>,
         metadata: fs::MetadataSummary,
         segment_size: u64,
         file_size: u64,
@@ -608,28 +618,25 @@ fn walked_entry_to_walk_items(
     };
 
     if item.entry_type == ItemType::RegularFile && metadata_summary.size > 0 {
-        let abs_path = abs_path
-            .into_os_string()
-            .into_string()
-            .unwrap_or_else(|os| os.to_string_lossy().into_owned());
-
-        match super::resolve_cache_hit(
+        let resolution = super::resolve_cache_hit(
             file_cache,
             parent_reuse_index,
-            &abs_path,
+            &abs_path.to_string_lossy(),
             &metadata_summary,
             item.has_raw_path(),
-        ) {
+        );
+        match resolution {
             super::CacheResolution::Hit(cached_refs, retained) => {
                 return WalkItems::One(Some(Ok(WalkEntry::CacheHit {
                     item,
-                    abs_path,
+                    abs_path: into_lossy_string(abs_path),
                     metadata: metadata_summary,
                     cached_refs,
                     retained,
                 })));
             }
             super::CacheResolution::SkipDataless => {
+                let abs_path = into_lossy_string(abs_path);
                 tracing::debug!(
                     path = %abs_path,
                     "skipping dataless cloud-only file (no cache or parent reuse)"
@@ -645,7 +652,7 @@ fn walked_entry_to_walk_items(
         let file_size = metadata_summary.size;
         if file_size > segment_size {
             let num_segments = file_size.div_ceil(segment_size) as usize;
-            let abs_path: Arc<str> = abs_path.into();
+            let abs_path: Arc<Path> = abs_path.into();
             WalkItems::Segments {
                 item: Some(item),
                 abs_path,
@@ -795,7 +802,7 @@ mod tests {
         let meta = test_metadata();
         let mut it = WalkItems::Segments {
             item: Some(test_item("big")),
-            abs_path: "/tmp/big".into(),
+            abs_path: Path::new("/tmp/big").into(),
             metadata: meta,
             segment_size: 100,
             file_size: 250,
@@ -886,10 +893,7 @@ mod tests {
         for p in paths {
             let pb = std::path::PathBuf::from(p);
             let expected = pb.to_string_lossy().to_string();
-            let actual = pb
-                .into_os_string()
-                .into_string()
-                .unwrap_or_else(|os| os.to_string_lossy().into_owned());
+            let actual = into_lossy_string(pb);
             assert_eq!(actual, expected, "mismatch for path {p}");
         }
     }

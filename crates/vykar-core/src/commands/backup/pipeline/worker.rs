@@ -8,7 +8,7 @@
 //! `Skipped` / `SegmentSkipped` variants here so the consumer can count
 //! them without aborting the whole backup.
 
-use std::path::Path;
+use std::sync::Arc;
 
 use tracing::warn;
 
@@ -24,7 +24,7 @@ use vykar_types::error::{Result, VykarError};
 use super::super::chunk_process::classify_chunk;
 use super::super::concurrency::{BudgetGuard, ByteBudget};
 use super::super::drift::{open_checked, read_range_drift_checked, ReadPlan};
-use super::super::walk::WalkEntry;
+use super::super::walk::{into_lossy_string, WalkEntry};
 use super::ProcessedEntry;
 
 /// Estimate the number of chunks a file will produce, for pre-sizing Vecs.
@@ -69,15 +69,14 @@ pub(super) fn process_file_worker(
             metadata,
             file_size: _,
         } => {
-            // Borrow `abs_path` inside the closure — keeping it owned by the
-            // outer scope means we can move it into either the success
-            // (`ProcessedFile`) or skip (`Skipped`) variant without a clone.
+            // Open via the real OS path (may be non-UTF-8 on Unix); the lossy
+            // string is only the cache key / display form, built after the read.
             let work = (|| -> Result<(fs::MetadataSummary, Vec<super::super::chunk_process::WorkerChunk>, usize)> {
                 // Budget was pre-acquired by the walk thread. Wrap in a guard for
                 // error safety — if we `?`-bail, the guard drops and releases bytes.
                 let guard = BudgetGuard::from_pre_acquired(budget, pre_acquired_bytes);
 
-                let (mut source, pre_meta) = open_checked(Path::new(&abs_path), &metadata)?;
+                let (mut source, pre_meta) = open_checked(&abs_path, &metadata)?;
 
                 // Small file (< min_chunk_size): read whole, single chunk.
                 let (plan, capacity) = if pre_meta.size < chunker_config.min_size as u64 {
@@ -92,7 +91,7 @@ pub(super) fn process_file_worker(
                 let mut worker_chunks = Vec::with_capacity(capacity);
                 read_range_drift_checked(
                     &mut source,
-                    &abs_path,
+                    &abs_path.to_string_lossy(),
                     &pre_meta,
                     plan,
                     chunker_config,
@@ -108,6 +107,7 @@ pub(super) fn process_file_worker(
                 let acquired_bytes = guard.defuse();
                 Ok((pre_meta, worker_chunks, acquired_bytes))
             })();
+            let abs_path = into_lossy_string(abs_path);
 
             match work {
                 Ok((pre_meta, chunks, acquired_bytes)) => Ok(ProcessedEntry::ProcessedFile {
@@ -145,13 +145,13 @@ pub(super) fn process_file_worker(
                 // (`num_segments`/`offset`/`len`). Any drift — before or
                 // during the read — invalidates the plan, so the segment is
                 // skipped and the consumer rolls back its siblings.
-                let (mut source, pre_meta) = open_checked(Path::new(&*abs_path), &metadata)?;
+                let (mut source, pre_meta) = open_checked(&abs_path, &metadata)?;
 
                 let mut worker_chunks =
                     Vec::with_capacity(estimate_chunk_count(len, chunker_config.avg_size));
                 read_range_drift_checked(
                     &mut source,
-                    &abs_path,
+                    &abs_path.to_string_lossy(),
                     &pre_meta,
                     ReadPlan::Segment { offset, len },
                     chunker_config,
@@ -167,6 +167,7 @@ pub(super) fn process_file_worker(
                 let acquired_bytes = guard.defuse();
                 Ok((pre_meta, worker_chunks, acquired_bytes))
             })();
+            let abs_path: Arc<str> = Arc::from(abs_path.to_string_lossy());
 
             match work {
                 Ok((pre_meta, chunks, acquired_bytes)) => Ok(ProcessedEntry::FileSegment {
@@ -187,7 +188,6 @@ pub(super) fn process_file_worker(
                         error = %e,
                         "skipping segmented file in pipeline (soft error)"
                     );
-                    // abs_path is `Arc<str>`; cloning it is a refcount bump.
                     Ok(ProcessedEntry::SegmentSkipped {
                         segment_index,
                         num_segments,

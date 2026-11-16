@@ -726,7 +726,7 @@ mod tests {
         let (router, state, tmp) = setup_app(0);
         let (data, _id, path) = pack(6000);
         put_part(&router, &path, TOKEN, &data, 0..1000).await;
-        let temp = crate::handlers::test_helpers::walk_file_paths(tmp.path())
+        let temp = crate::handlers::test_helpers::walk_file_paths(&state.inner.data_dir)
             .into_iter()
             .find(|p| vykar_protocol::is_temp_file(&p.to_string_lossy()))
             .unwrap();
@@ -791,7 +791,7 @@ mod tests {
         let (router, state, tmp) = setup_app(1_000_000);
         let (data, id, path) = pack(6000);
         upload_all(&router, &path, TOKEN, &data).await;
-        let temp = crate::handlers::test_helpers::walk_file_paths(tmp.path())
+        let temp = crate::handlers::test_helpers::walk_file_paths(&state.inner.data_dir)
             .into_iter()
             .find(|p| vykar_protocol::is_temp_file(&p.to_string_lossy()))
             .unwrap();
@@ -835,7 +835,7 @@ mod tests {
 
         for publish in [false, true] {
             upload_all(&router, &path, TOKEN, &data).await;
-            let temp = crate::handlers::test_helpers::walk_file_paths(tmp.path())
+            let temp = crate::handlers::test_helpers::walk_file_paths(&state.inner.data_dir)
                 .into_iter()
                 .find(|p| vykar_protocol::is_temp_file(&p.to_string_lossy()))
                 .unwrap();

@@ -467,7 +467,14 @@ mod backup_restore {
             "[a-z]{1,6}\\.[a-z]{1,3}",
             "[a-z]{1,4}/[a-z]{1,6}\\.[a-z]{1,3}",
             "[a-z]{1,4}/[a-z]{1,4}/[a-z]{1,6}\\.[a-z]{1,3}",
-        ];
+        ]
+        // Windows reserves these device names, even with an extension.
+        .prop_filter("Windows reserved name", |p: &String| {
+            p.split('/').all(|c| {
+                let stem = c.split('.').next().unwrap_or(c);
+                !matches!(stem, "con" | "prn" | "aux" | "nul")
+            })
+        });
         prop::collection::hash_map(
             path_strategy,
             prop_oneof![

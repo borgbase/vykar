@@ -28,6 +28,9 @@ pub(super) struct ByteBudget {
 pub(super) struct BudgetState {
     pub(super) available: usize,
     pub(super) capacity: usize,
+    /// Bytes of capacity temporarily lent to something else (sealed packs
+    /// waiting on upload slots, see [`ByteBudget::set_debt`]).
+    pub(super) debt: usize,
     pub(super) poisoned: bool,
 }
 
@@ -37,6 +40,7 @@ impl ByteBudget {
             state: Mutex::new(BudgetState {
                 available: capacity,
                 capacity,
+                debt: 0,
                 poisoned: false,
             }),
             freed: Condvar::new(),
@@ -49,6 +53,10 @@ impl ByteBudget {
     /// If `n > capacity`, it is clamped to `capacity` so a single file larger
     /// than the budget can still proceed (it just acquires the entire budget
     /// and runs alone). Returns `Err` if the budget has been poisoned.
+    ///
+    /// While a debt is set, the effective capacity is `capacity - debt`; a
+    /// request is still granted whenever nothing is held, so a debt can
+    /// throttle the pipeline but never stall it.
     pub(super) fn acquire(&self, n: usize) -> Result<usize> {
         let mut st = self.state.lock().expect("ByteBudget mutex not poisoned");
         let n = n.min(st.capacity);
@@ -56,7 +64,9 @@ impl ByteBudget {
             if st.poisoned {
                 return Err(VykarError::Other("pipeline budget poisoned".into()));
             }
-            if st.available >= n {
+            let held = st.capacity - st.available;
+            let effective = st.capacity.saturating_sub(st.debt);
+            if st.available >= n && (held == 0 || held + n <= effective) {
                 st.available -= n;
                 let acquired = st.capacity - st.available;
                 self.peak_acquired.fetch_max(acquired, Ordering::Relaxed);
@@ -74,6 +84,17 @@ impl ByteBudget {
         let mut st = self.state.lock().expect("ByteBudget mutex not poisoned");
         st.available = (st.available + n).min(st.capacity);
         self.freed.notify_all();
+    }
+
+    /// Lend `debt` bytes of the capacity to other memory the caller holds,
+    /// replacing any previous debt. Lowering the debt wakes blocked waiters.
+    pub(super) fn set_debt(&self, debt: usize) {
+        let mut st = self.state.lock().expect("ByteBudget mutex not poisoned");
+        let lowered = debt < st.debt;
+        st.debt = debt;
+        if lowered {
+            self.freed.notify_all();
+        }
     }
 
     /// Poison the budget so all current and future `acquire` calls return `Err`.
@@ -268,6 +289,41 @@ mod tests {
             peak.load(Ordering::SeqCst),
             cap
         );
+    }
+
+    #[test]
+    fn byte_budget_debt_lowers_effective_capacity() {
+        let budget = ByteBudget::new(100);
+        budget.set_debt(60);
+        // Nothing held: the floor grants even a request above capacity - debt.
+        assert_eq!(budget.acquire(50).unwrap(), 50);
+        // 50 held, effective capacity 40: further requests must wait.
+        let blocked = |b: &Arc<ByteBudget>, n: usize| {
+            let b2 = Arc::clone(b);
+            let h = std::thread::spawn(move || b2.acquire(n).unwrap());
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            h
+        };
+        let budget = Arc::new(budget);
+        let h = blocked(&budget, 10);
+        assert!(!h.is_finished(), "debt must hold the request back");
+        // Lowering the debt wakes the waiter (50 + 10 <= 100 - 30).
+        budget.set_debt(30);
+        assert_eq!(h.join().unwrap(), 10);
+
+        // Raise the debt again: 60 held > effective 0, blocked until
+        // everything is released (floor), not until the debt clears.
+        budget.set_debt(100);
+        let h = blocked(&budget, 20);
+        assert!(!h.is_finished());
+        budget.release(10);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(!h.is_finished(), "still holding 50");
+        budget.release(50);
+        assert_eq!(h.join().unwrap(), 20);
+        budget.release(20);
+        budget.set_debt(0);
+        assert_eq!(budget.acquire(100).unwrap(), 100);
     }
 
     #[test]

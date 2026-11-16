@@ -473,6 +473,35 @@ impl WriteSessionState {
         Ok(())
     }
 
+    /// Pipeline budget to lend to the upload queue: half the heap bytes of
+    /// sealed packs whose upload has not returned yet, beyond what the
+    /// upload slots themselves hold (`max_in_flight_uploads` packs of the
+    /// current data-pack target). The backup pipeline subtracts this from
+    /// its byte budget, so the slack queued behind a slow link is not held
+    /// a second time as processed pipeline output.
+    ///
+    /// Half, not all: the pipeline's lead is what refills the queue when an
+    /// upload returns. Lending the full slack measured -22% peak RSS but
+    /// +11% wall on REST at 40 ms RTT; half kept wall within 1.5%.
+    ///
+    /// Always 0 when the byte cap above already bounds the queue (local).
+    pub(crate) fn upload_slack_bytes(&self) -> usize {
+        if self.cap_pending_upload_bytes {
+            return 0;
+        }
+        // A finished upload thread has already dropped its buffer.
+        let pending: usize = self
+            .pending_uploads
+            .iter()
+            .filter(|u| !u.handle.is_finished())
+            .map(|u| u.bytes)
+            .sum();
+        let in_slots = self
+            .max_in_flight_uploads
+            .saturating_mul(self.data_pack_writer.target_size());
+        pending.saturating_sub(in_slots) / 2
+    }
+
     // --- Journal writes ---
 
     /// Start a background journal write once `JOURNAL_WRITE_INTERVAL` new
@@ -1868,6 +1897,41 @@ mod tests {
         // An empty queue never blocks, even for an oversized pack.
         ws.cap_pending_uploads(&dyn_storage, &dyn_crypto, 4 * target)
             .unwrap();
+    }
+
+    #[test]
+    fn upload_slack_counts_unfinished_packs_beyond_the_slots() {
+        let storage = std::sync::Arc::new(PackUploadBackend::new(std::sync::Arc::new(
+            MemoryBackend::new(),
+        )));
+        let crypto = test_crypto();
+        let mut ws = journal_session();
+        ws.max_in_flight_uploads = 2;
+        let target = ws.data_pack_writer.target_size();
+
+        // Within the slots: nothing to lend.
+        let r1 = gated_upload(&mut ws, &storage, 1, target);
+        let r2 = gated_upload(&mut ws, &storage, 2, target);
+        assert_eq!(ws.upload_slack_bytes(), 0);
+        // Two packs queued behind the slots: half of them is lent.
+        let r3 = gated_upload(&mut ws, &storage, 3, target);
+        let r4 = gated_upload(&mut ws, &storage, 4, target);
+        assert_eq!(ws.upload_slack_bytes(), target);
+        // A finished (not yet joined) upload no longer counts.
+        r1.send(()).unwrap();
+        let start = std::time::Instant::now();
+        while ws.upload_slack_bytes() != target / 2 {
+            assert!(start.elapsed() < std::time::Duration::from_secs(10));
+            std::thread::yield_now();
+        }
+        // The local byte cap bounds the queue itself: never lend.
+        ws.cap_pending_upload_bytes = true;
+        assert_eq!(ws.upload_slack_bytes(), 0);
+
+        for r in [r2, r3, r4] {
+            r.send(()).unwrap();
+        }
+        ws.wait_pending_uploads(&*storage, &crypto).unwrap();
     }
 
     #[test]

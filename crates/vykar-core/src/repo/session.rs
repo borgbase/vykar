@@ -75,6 +75,14 @@ impl Repository {
             .cap_pending_uploads(&self.storage, &self.crypto, incoming)
     }
 
+    /// Pipeline budget to lend to the upload queue (see
+    /// `WriteSessionState::upload_slack_bytes`); 0 without a write session.
+    pub(crate) fn upload_slack_bytes(&self) -> usize {
+        self.write_session
+            .as_ref()
+            .map_or(0, |ws| ws.upload_slack_bytes())
+    }
+
     /// Bound sealed-but-unwritten packs by bytes as well as by count
     /// (see `WriteSessionState::cap_pending_upload_bytes`).
     pub fn set_cap_pending_upload_bytes(&mut self, enabled: bool) {

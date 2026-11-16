@@ -468,6 +468,7 @@ pub(crate) fn run_parallel_pipeline(
         // Reset on SourceStarted; flushed as summary warnings on SourceFinished.
         let mut dataless_files: u64 = 0;
         let mut dataless_dirs: u64 = 0;
+        let mut last_debt: usize = 0;
 
         for msg in &result_rx {
             if shutdown.is_some_and(|f| f.load(Ordering::Relaxed)) {
@@ -623,6 +624,10 @@ pub(crate) fn run_parallel_pipeline(
                             consume_err = Some(e);
                             break;
                         }
+                        // Committing may have sealed a pack (and waited in
+                        // `cap_pending_uploads`); re-lend the upload queue's
+                        // slack so the walk does not refill the budget on top.
+                        update_debt(repo, &budget, &mut last_debt);
                     }
                     Err(e) => {
                         if e.is_soft_file_error() {
@@ -658,6 +663,8 @@ pub(crate) fn run_parallel_pipeline(
             if consume_err.is_some() {
                 break;
             }
+            // Uploads may also finish while the consumer waits for results.
+            update_debt(repo, &budget, &mut last_debt);
         }
 
         // Drop receiver to unblock any workers stuck on result_tx.send().
@@ -692,6 +699,17 @@ pub(crate) fn run_parallel_pipeline(
 
         Ok(())
     })
+}
+
+/// Lend the upload queue's slack (sealed packs beyond the in-flight slots)
+/// out of the pipeline budget. Remote repositories only: local ones bound
+/// the queue by bytes already, so the slack is always 0 there.
+fn update_debt(repo: &Repository, budget: &ByteBudget, last_debt: &mut usize) {
+    let debt = repo.upload_slack_bytes();
+    if debt != *last_debt {
+        budget.set_debt(debt);
+        *last_debt = debt;
+    }
 }
 
 #[cfg(test)]
@@ -783,6 +801,82 @@ mod tests {
         assert!(
             completed.load(Ordering::SeqCst),
             "pipeline deadlocked — did not complete within {timeout:?}"
+        );
+        handle.join().unwrap();
+    }
+
+    /// A debt set by the consumer (even one at or above the whole capacity,
+    /// and never lowered while workers are busy) must only throttle the
+    /// walk, never deadlock it: with nothing held, the floor admits the
+    /// next item. Same topology as the test above.
+    #[test]
+    fn pipeline_no_deadlock_with_budget_debt() {
+        use std::sync::atomic::AtomicBool;
+        use std::time::Duration;
+
+        let completed = Arc::new(AtomicBool::new(false));
+        let completed2 = Arc::clone(&completed);
+
+        let handle = std::thread::spawn(move || {
+            let budget = ByteBudget::new(200);
+            let num_workers = 4;
+            let (work_tx, work_rx) =
+                crossbeam_channel::bounded::<(usize, usize, usize)>(num_workers * 2);
+            let (result_tx, result_rx) =
+                crossbeam_channel::bounded::<(usize, usize)>(num_workers + 4);
+
+            std::thread::scope(|s| {
+                let budget_ref = &budget;
+                // Debt larger than the capacity before anything is acquired.
+                budget_ref.set_debt(1000);
+
+                s.spawn(move || {
+                    for i in 0..20 {
+                        let acquired = budget_ref.acquire(70).unwrap();
+                        work_tx.send((i, acquired, i)).unwrap();
+                    }
+                });
+
+                for _ in 0..num_workers {
+                    let rx = work_rx.clone();
+                    let tx = result_tx.clone();
+                    s.spawn(move || {
+                        for (idx, acquired, delay_key) in &rx {
+                            if delay_key % 4 == 0 {
+                                std::thread::sleep(Duration::from_millis(5));
+                            }
+                            let _ = tx.send((idx, acquired));
+                        }
+                    });
+                }
+                drop(work_rx);
+                drop(result_tx);
+
+                let mut next_expected = 0usize;
+                let mut pending: BTreeMap<usize, usize> = BTreeMap::new();
+                for (idx, acquired) in &result_rx {
+                    pending.insert(idx, acquired);
+                    while let Some(acq) = pending.remove(&next_expected) {
+                        budget_ref.release(acq);
+                        // Debt swings between none, partial and total.
+                        budget_ref.set_debt([0, 150, 1000][next_expected % 3]);
+                        next_expected += 1;
+                    }
+                }
+                assert_eq!(next_expected, 20, "all items should be consumed");
+            });
+
+            completed2.store(true, Ordering::SeqCst);
+        });
+
+        let timeout = Duration::from_secs(10);
+        let start = std::time::Instant::now();
+        while start.elapsed() < timeout && !completed.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            completed.load(Ordering::SeqCst),
+            "pipeline deadlocked under budget debt within {timeout:?}"
         );
         handle.join().unwrap();
     }

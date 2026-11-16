@@ -29,15 +29,17 @@ pub(crate) enum Strategy {
     Exists,
     /// One `list("packs/<xx>")` per touched shard.
     ShardLists,
-    /// One recursive `list("packs/")` for the whole repository.
-    FlatList,
 }
 
 /// Pick the strategy with the fewest sequential round trips when `width`
 /// requests run at once. `repo_packs` estimates the packs in the repository
 /// (persisted plus this session's); it only steers cost, never correctness.
-/// Ties go to the request that returns less data: `exists` before shard
-/// listings before the flat listing.
+/// Ties go to `exists`, which returns less data.
+///
+/// A recursive `list("packs/")` is deliberately not a candidate: it is one
+/// paginated request on S3, but a serial walk of all 256 shard directories
+/// on SFTP (tens of seconds at WAN latency), and nothing here can tell the
+/// two apart.
 pub(crate) fn choose_strategy(
     packs: usize,
     shards: usize,
@@ -51,14 +53,10 @@ pub(crate) fn choose_strategy(
         .div_ceil(LIST_PAGE_KEYS)
         .max(1);
     let shard_rounds = shards.div_ceil(width).saturating_mul(pages_per_shard);
-    // A paginated listing follows continuation tokens, so its pages are serial.
-    let flat_rounds = repo_packs.div_ceil(LIST_PAGE_KEYS).max(1);
-    if exists_rounds <= shard_rounds && exists_rounds <= flat_rounds {
+    if exists_rounds <= shard_rounds {
         Strategy::Exists
-    } else if shard_rounds <= flat_rounds {
-        Strategy::ShardLists
     } else {
-        Strategy::FlatList
+        Strategy::ShardLists
     }
 }
 
@@ -119,27 +117,6 @@ pub(crate) fn verify_packs_present_with(
             run_bounded(width, &groups, |(shard, ids)| {
                 verify_shard(storage, shard, ids)
             })
-        }
-        Strategy::FlatList => {
-            drop(by_shard);
-            match storage.list("packs/") {
-                Ok(keys) => {
-                    let mut expected: HashMap<String, PackId> =
-                        pack_ids.iter().map(|id| (id.storage_key(), *id)).collect();
-                    for key in &keys {
-                        expected.remove(key.as_str());
-                    }
-                    match expected.values().next() {
-                        Some(id) => Err(missing(id)),
-                        None => Ok(()),
-                    }
-                }
-                Err(e) => {
-                    debug!(error = %e, "flat pack listing failed, falling back to exists()");
-                    let ids: Vec<PackId> = pack_ids.iter().copied().collect();
-                    check_exists(storage, &ids, width)
-                }
-            }
         }
     }
 }
@@ -306,7 +283,7 @@ mod tests {
             .collect()
     }
 
-    const ALL: [Strategy; 3] = [Strategy::Exists, Strategy::ShardLists, Strategy::FlatList];
+    const ALL: [Strategy; 2] = [Strategy::Exists, Strategy::ShardLists];
 
     #[test]
     fn all_present_passes_every_strategy() {
@@ -345,18 +322,14 @@ mod tests {
         let mut storage = Probe::new();
         storage.fail_list = true;
         let ids = stored(&storage, 100);
-        for s in [Strategy::ShardLists, Strategy::FlatList] {
-            verify_packs_present_with(&storage, &ids, 0, 6, Some(s)).unwrap();
-        }
-        assert_eq!(storage.exists.load(Ordering::SeqCst), 200);
+        verify_packs_present_with(&storage, &ids, 0, 6, Some(Strategy::ShardLists)).unwrap();
+        assert_eq!(storage.exists.load(Ordering::SeqCst), 100);
 
         storage.inner.delete(&pack(3).storage_key()).unwrap();
-        for s in [Strategy::ShardLists, Strategy::FlatList] {
-            let err = verify_packs_present_with(&storage, &ids, 0, 6, Some(s))
-                .unwrap_err()
-                .to_string();
-            assert!(err.contains("missing from storage"), "{s:?}: {err}");
-        }
+        let err = verify_packs_present_with(&storage, &ids, 0, 6, Some(Strategy::ShardLists))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("missing from storage"), "{err}");
     }
 
     #[test]
@@ -384,15 +357,14 @@ mod tests {
 
     #[test]
     fn cost_model() {
-        // Full backup into an empty repo: one flat page beats 157 shards.
-        assert_eq!(choose_strategy(245, 157, 245, 6), Strategy::FlatList);
+        // Full backup: 157 shard listings need fewer rounds than 245 HEADs.
+        assert_eq!(choose_strategy(245, 157, 245, 6), Strategy::ShardLists);
         // Incremental with a couple of packs: a single round of HEADs.
         assert_eq!(choose_strategy(2, 2, 10_000, 6), Strategy::Exists);
         assert_eq!(choose_strategy(1, 1, 1, 1), Strategy::Exists);
-        // Large repository, many new packs: shard listings.
-        assert_eq!(choose_strategy(245, 157, 100_000, 6), Strategy::ShardLists);
-        // Serial width keeps the shard listing where it wins.
-        assert_eq!(choose_strategy(245, 157, 50_000, 1), Strategy::FlatList);
-        assert_eq!(choose_strategy(245, 157, 200_000, 1), Strategy::ShardLists);
+        // One pack per shard: HEADs tie with listings and win.
+        assert_eq!(choose_strategy(40, 40, 40, 6), Strategy::Exists);
+        // Shards so full that each listing paginates: HEADs.
+        assert_eq!(choose_strategy(245, 157, 1_000_000, 6), Strategy::Exists);
     }
 }

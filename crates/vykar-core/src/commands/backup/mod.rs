@@ -952,14 +952,17 @@ fn run_against_repo(
         flush_item_stream_chunk(&mut repo, &mut item_stream, &mut item_ptrs, compression)?;
 
         // Seal partial packs and wait for every upload here, without the lock,
-        // so Phase 2 holds it only for the index/snapshot writes.
+        // so Phase 2 holds it only for the index/snapshot writes. The final
+        // journal write overlaps taking the lock; the commit's own flush
+        // joins it (and retries it inline if it failed) before anything
+        // else, and long before the journal is deleted.
         emit_progress(
             &mut progress,
             BackupProgressEvent::CommitStage {
                 stage: "upload packs",
             },
         );
-        repo.flush_packs()?;
+        repo.flush_packs_journal_in_background()?;
         check_interrupted(shutdown)?;
 
         let time_end = Utc::now();

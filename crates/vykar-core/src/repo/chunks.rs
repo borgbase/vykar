@@ -412,6 +412,19 @@ impl Repository {
     /// Flush all pending pack writes and wait for background uploads.
     /// No-op when no write session is active.
     pub fn flush_packs(&mut self) -> Result<()> {
+        self.flush_packs_inner(false)
+    }
+
+    /// [`Self::flush_packs`], but the session journal's final write is left
+    /// running in the background (see
+    /// `WriteSessionState::wait_pending_uploads_journal_in_background`):
+    /// every pack is durable on return, the journal follows. The next
+    /// `flush_packs` joins it.
+    pub fn flush_packs_journal_in_background(&mut self) -> Result<()> {
+        self.flush_packs_inner(true)
+    }
+
+    fn flush_packs_inner(&mut self, background_journal: bool) -> Result<()> {
         let Some(ws) = self.write_session.as_ref() else {
             return Ok(());
         };
@@ -425,10 +438,14 @@ impl Repository {
             self.flush_writer_async(PackType::Tree)?;
         }
         // Wait for all background uploads to complete before returning.
-        self.write_session
+        let ws = self
+            .write_session
             .as_mut()
-            .expect("write session active after pending writer flush")
-            .wait_pending_uploads(&*self.storage, &*self.crypto)?;
-        Ok(())
+            .expect("write session active after pending writer flush");
+        if background_journal {
+            ws.wait_pending_uploads_journal_in_background(&self.storage, &self.crypto)
+        } else {
+            ws.wait_pending_uploads(&*self.storage, &*self.crypto)
+        }
     }
 }

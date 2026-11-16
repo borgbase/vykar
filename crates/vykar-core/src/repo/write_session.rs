@@ -377,6 +377,38 @@ impl WriteSessionState {
         storage: &dyn StorageBackend,
         crypto: &dyn CryptoEngine,
     ) -> Result<()> {
+        let result = self.join_all_uploads();
+        // Final flush of journal before returning (best-effort). Skipped when
+        // unchanged since the last successful write, so a repeated flush
+        // (Phase 1 drain, then commit) does not PUT the journal twice.
+        if self.journal_needs_write() {
+            self.write_pending_index_best_effort(storage, crypto);
+        }
+        result
+    }
+
+    /// [`Self::wait_pending_uploads`], but the final journal write runs in
+    /// the background like the debounced ones, so the caller can go on
+    /// (backup: take the commit lock) during its round trip.
+    ///
+    /// The next `wait_pending_uploads` (the commit's own flush) joins it and
+    /// rewrites the journal synchronously if it failed; dropping the session
+    /// joins it too. So it can never land after the journal was deleted.
+    pub(crate) fn wait_pending_uploads_journal_in_background(
+        &mut self,
+        storage: &Arc<dyn StorageBackend>,
+        crypto: &Arc<dyn CryptoEngine>,
+    ) -> Result<()> {
+        let result = self.join_all_uploads();
+        if self.journal_needs_write() {
+            self.start_journal_write(storage, crypto);
+        }
+        result
+    }
+
+    /// Join every queued upload (journaling the successful ones) and any
+    /// background journal write; the first upload error, if any.
+    fn join_all_uploads(&mut self) -> Result<()> {
         let mut first_err: Option<VykarError> = None;
         for upload in std::mem::take(&mut self.pending_uploads) {
             if let Err(e) = self.finish_upload(upload) {
@@ -386,18 +418,16 @@ impl WriteSessionState {
         // All joined, so all have sent: drop their stale completions.
         while self.upload_done_rx.try_recv().is_ok() {}
         self.join_journal_write();
-        // Final flush of journal before returning (best-effort). Skipped when
-        // unchanged since the last successful write, so a repeated flush
-        // (Phase 1 drain, then commit) does not PUT the journal twice.
-        if !self.pending_journal.is_empty()
-            && self.pending_journal_written_rev != Some(self.pending_journal.revision())
-        {
-            self.write_pending_index_best_effort(storage, crypto);
-        }
         match first_err {
             Some(e) => Err(e),
             None => Ok(()),
         }
+    }
+
+    /// Whether the journal holds packs not yet in a successful write.
+    fn journal_needs_write(&self) -> bool {
+        !self.pending_journal.is_empty()
+            && self.pending_journal_written_rev != Some(self.pending_journal.revision())
     }
 
     /// Apply backpressure to keep the number of in-flight uploads bounded.
@@ -461,18 +491,29 @@ impl WriteSessionState {
             }
             self.join_journal_write();
         }
-        let current = self.pending_journal.len();
-        if current >= self.pending_journal_last_written + JOURNAL_WRITE_INTERVAL {
-            let wire = self.pending_journal.to_wire();
-            let key = self.pending_index_key();
-            let storage = Arc::clone(storage);
-            let crypto = Arc::clone(crypto);
-            self.journal_write = Some(JournalWrite {
-                revision: self.pending_journal.revision(),
-                len: current,
-                handle: std::thread::spawn(move || write_journal(&wire, &key, &*storage, &*crypto)),
-            });
+        if self.pending_journal.len() >= self.pending_journal_last_written + JOURNAL_WRITE_INTERVAL
+        {
+            self.start_journal_write(storage, crypto);
         }
+    }
+
+    /// Start writing the current journal state on a background thread.
+    /// The caller must have joined any previous write.
+    fn start_journal_write(
+        &mut self,
+        storage: &Arc<dyn StorageBackend>,
+        crypto: &Arc<dyn CryptoEngine>,
+    ) {
+        debug_assert!(self.journal_write.is_none());
+        let wire = self.pending_journal.to_wire();
+        let key = self.pending_index_key();
+        let storage = Arc::clone(storage);
+        let crypto = Arc::clone(crypto);
+        self.journal_write = Some(JournalWrite {
+            revision: self.pending_journal.revision(),
+            len: self.pending_journal.len(),
+            handle: std::thread::spawn(move || write_journal(&wire, &key, &*storage, &*crypto)),
+        });
     }
 
     /// Wait for the background journal write, if any, and record its
@@ -1466,6 +1507,41 @@ mod tests {
 
         assert_eq!(journal_puts(&storage), 2);
         assert_eq!(stored_pack_ids(&storage, &crypto), vec![b]);
+    }
+
+    /// Phase 1's final flush writes the journal in the background; the
+    /// commit's flush joins it and does not write it again, or rewrites it
+    /// synchronously when the background write failed.
+    #[test]
+    fn background_final_journal_write_is_joined_by_the_next_flush() {
+        let storage = Arc::new(JournalCountingBackend::new());
+        let dyn_storage: Arc<dyn StorageBackend> = storage.clone();
+        let crypto: Arc<dyn CryptoEngine> = Arc::new(test_crypto());
+        let mut ws = journal_session();
+        ws.pending_journal
+            .record_pack(PackId::from_bytes([1; 32]), chunk(1));
+
+        ws.wait_pending_uploads_journal_in_background(&dyn_storage, &crypto)
+            .unwrap();
+        assert!(ws.journal_write.is_some(), "final write runs in background");
+        ws.wait_pending_uploads(&*storage, &*crypto).unwrap();
+        assert!(ws.journal_write.is_none());
+        assert_eq!(journal_puts(&storage), 1);
+
+        ws.pending_journal
+            .record_pack(PackId::from_bytes([2; 32]), chunk(2));
+        storage
+            .fail_next
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        ws.wait_pending_uploads_journal_in_background(&dyn_storage, &crypto)
+            .unwrap();
+        ws.wait_pending_uploads(&*storage, &*crypto).unwrap();
+        assert_eq!(journal_puts(&storage), 2, "failed write retried inline");
+        assert_eq!(
+            stored_pack_ids(&*storage, &*crypto).len(),
+            2,
+            "journal holds both packs"
+        );
     }
 
     fn record_packs(ws: &mut WriteSessionState, seeds: std::ops::Range<u8>) {

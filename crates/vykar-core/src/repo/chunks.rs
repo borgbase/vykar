@@ -277,7 +277,7 @@ impl Repository {
                 .as_mut()
                 .expect("no active write session");
             if ws.pending_uploads.iter().any(|u| u.handle.is_finished()) {
-                ws.drain_finished_uploads(&*self.storage, &*self.crypto)?;
+                ws.drain_finished_uploads(&self.storage, &self.crypto)?;
             }
         }
 

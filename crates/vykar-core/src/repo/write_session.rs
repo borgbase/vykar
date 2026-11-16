@@ -1,4 +1,5 @@
 use std::collections::HashMap as StdHashMap;
+use std::sync::Arc;
 use std::thread::JoinHandle;
 
 use tracing::{debug, warn};
@@ -7,7 +8,8 @@ use crate::compress;
 use crate::index::dedup_cache::TieredDedupIndex;
 use crate::index::{
     decode_pending_journal, encode_pending_journal, ChunkIndex, DecodedJournal, DedupIndex,
-    IndexDelta, IndexDeltaCheckpoint, PendingChunkEntry, PendingIndexJournal, RecoveredChunkEntry,
+    IndexDelta, IndexDeltaCheckpoint, PendingChunkEntry, PendingIndexJournal, PendingPackEntry,
+    RecoveredChunkEntry,
 };
 use vykar_crypto::CryptoEngine;
 use vykar_storage::StorageBackend;
@@ -82,6 +84,15 @@ impl Drop for UploadDone {
         // means nobody is waiting any more.
         let _ = self.tx.send(self.seq);
     }
+}
+
+/// A debounced journal PUT running in the background, so the consumer
+/// keeps sealing and starting pack uploads during the round trip.
+struct JournalWrite {
+    /// Journal revision and pack count captured in the payload.
+    revision: u64,
+    len: usize,
+    handle: JoinHandle<Result<()>>,
 }
 
 /// Marker state for a session's `.json` file during recovery scanning.
@@ -161,6 +172,10 @@ pub(crate) struct WriteSessionState {
     pub(crate) pending_journal_last_written: usize,
     /// Journal revision last written successfully (`None` = never written).
     pub(crate) pending_journal_written_rev: Option<u64>,
+    /// At most one background journal write. Every synchronous write joins
+    /// it first, and a new one starts only after it was joined, so a newer
+    /// payload is never overwritten by an older one.
+    journal_write: Option<JournalWrite>,
     /// Chunks recovered from a previous interrupted session's `pending_index`.
     pub(crate) recovered_chunks: StdHashMap<ChunkId, RecoveredChunkEntry>,
     /// `.index` keys to delete after successful commit.
@@ -180,6 +195,41 @@ pub(crate) struct WriteSessionState {
     /// during per-file backup chunk loops that need to survive mid-read
     /// drift detection. Single-slot by design.
     pub(crate) rollback_tracker: Option<RollbackTracker>,
+}
+
+/// Serialize, compress, encrypt, and write a pending index journal.
+fn write_journal(
+    wire: &[PendingPackEntry],
+    key: &str,
+    storage: &dyn StorageBackend,
+    crypto: &dyn CryptoEngine,
+) -> Result<()> {
+    let serialized = encode_pending_journal(wire)?;
+    let compressed = compress::compress(compress::Compression::Zstd { level: 3 }, &serialized)?;
+    let packed = pack_object_with_context(
+        ObjectType::PendingIndex,
+        PENDING_INDEX_OBJECT_CONTEXT,
+        &compressed,
+        crypto,
+    )?;
+    storage.put(key, &packed)?;
+    debug!(
+        packs = wire.len(),
+        bytes = packed.len(),
+        key = %key,
+        "wrote pending_index to storage"
+    );
+    Ok(())
+}
+
+impl Drop for WriteSessionState {
+    /// Never leave a journal PUT running past the session: it could land
+    /// after the session's journal was deleted.
+    fn drop(&mut self) {
+        if let Some(write) = self.journal_write.take() {
+            let _ = write.handle.join();
+        }
+    }
 }
 
 impl WriteSessionState {
@@ -207,6 +257,7 @@ impl WriteSessionState {
             pending_journal: PendingIndexJournal::new(),
             pending_journal_last_written: 0,
             pending_journal_written_rev: None,
+            journal_write: None,
             recovered_chunks: StdHashMap::new(),
             recovered_index_keys: Vec::new(), // only .index keys, never .json
             persisted_pack_count: 0,
@@ -304,8 +355,8 @@ impl WriteSessionState {
     /// Join all finished upload threads, propagating the first error.
     pub(crate) fn drain_finished_uploads(
         &mut self,
-        storage: &dyn StorageBackend,
-        crypto: &dyn CryptoEngine,
+        storage: &Arc<dyn StorageBackend>,
+        crypto: &Arc<dyn CryptoEngine>,
     ) -> Result<()> {
         let mut i = 0;
         while let Some(slot) = self.pending_uploads.get(i) {
@@ -334,6 +385,7 @@ impl WriteSessionState {
         }
         // All joined, so all have sent: drop their stale completions.
         while self.upload_done_rx.try_recv().is_ok() {}
+        self.join_journal_write();
         // Final flush of journal before returning (best-effort). Skipped when
         // unchanged since the last successful write, so a repeated flush
         // (Phase 1 drain, then commit) does not PUT the journal twice.
@@ -353,8 +405,8 @@ impl WriteSessionState {
     /// `SessionGuard`, so this path no longer touches the marker.
     pub(crate) fn cap_pending_uploads(
         &mut self,
-        storage: &dyn StorageBackend,
-        crypto: &dyn CryptoEngine,
+        storage: &Arc<dyn StorageBackend>,
+        crypto: &Arc<dyn CryptoEngine>,
         incoming: usize,
     ) -> Result<()> {
         self.drain_finished_uploads(storage, crypto)?;
@@ -393,15 +445,49 @@ impl WriteSessionState {
 
     // --- Journal writes ---
 
-    /// Write the pending index journal to storage (debounced helper).
+    /// Start a background journal write once `JOURNAL_WRITE_INTERVAL` new
+    /// packs are confirmed (debounced helper). While one is in flight, no
+    /// second one starts; the next call after it lands writes the newer
+    /// state. A failed write leaves its revision unwritten, so the next call
+    /// retries.
     pub(crate) fn maybe_write_pending_index(
         &mut self,
-        storage: &dyn StorageBackend,
-        crypto: &dyn CryptoEngine,
+        storage: &Arc<dyn StorageBackend>,
+        crypto: &Arc<dyn CryptoEngine>,
     ) {
+        if let Some(write) = &self.journal_write {
+            if !write.handle.is_finished() {
+                return;
+            }
+            self.join_journal_write();
+        }
         let current = self.pending_journal.len();
         if current >= self.pending_journal_last_written + JOURNAL_WRITE_INTERVAL {
-            self.write_pending_index_best_effort(storage, crypto);
+            let wire = self.pending_journal.to_wire();
+            let key = self.pending_index_key();
+            let storage = Arc::clone(storage);
+            let crypto = Arc::clone(crypto);
+            self.journal_write = Some(JournalWrite {
+                revision: self.pending_journal.revision(),
+                len: current,
+                handle: std::thread::spawn(move || write_journal(&wire, &key, &*storage, &*crypto)),
+            });
+        }
+    }
+
+    /// Wait for the background journal write, if any, and record its
+    /// outcome. Best-effort like every journal write: failures are logged.
+    fn join_journal_write(&mut self) {
+        let Some(write) = self.journal_write.take() else {
+            return;
+        };
+        match write.handle.join() {
+            Ok(Ok(())) => {
+                self.pending_journal_last_written = write.len;
+                self.pending_journal_written_rev = Some(write.revision);
+            }
+            Ok(Err(e)) => warn!("failed to write pending_index: {e}"),
+            Err(_) => warn!("pending_index writer thread panicked"),
         }
     }
 
@@ -412,6 +498,7 @@ impl WriteSessionState {
         storage: &dyn StorageBackend,
         crypto: &dyn CryptoEngine,
     ) {
+        self.join_journal_write();
         if self.pending_journal.is_empty() {
             return;
         }
@@ -432,24 +519,12 @@ impl WriteSessionState {
         storage: &dyn StorageBackend,
         crypto: &dyn CryptoEngine,
     ) -> Result<()> {
-        let wire = self.pending_journal.to_wire();
-        let serialized = encode_pending_journal(&wire)?;
-        let compressed = compress::compress(compress::Compression::Zstd { level: 3 }, &serialized)?;
-        let packed = pack_object_with_context(
-            ObjectType::PendingIndex,
-            PENDING_INDEX_OBJECT_CONTEXT,
-            &compressed,
+        write_journal(
+            &self.pending_journal.to_wire(),
+            &self.pending_index_key(),
+            storage,
             crypto,
-        )?;
-        let key = self.pending_index_key();
-        storage.put(&key, &packed)?;
-        debug!(
-            packs = wire.len(),
-            bytes = packed.len(),
-            key = %key,
-            "wrote pending_index to storage"
-        );
-        Ok(())
+        )
     }
 
     // --- Sealed entry dispatch ---
@@ -1393,6 +1468,68 @@ mod tests {
         assert_eq!(stored_pack_ids(&storage, &crypto), vec![b]);
     }
 
+    fn record_packs(ws: &mut WriteSessionState, seeds: std::ops::Range<u8>) {
+        for b in seeds {
+            ws.pending_journal
+                .record_pack(PackId::from_bytes([b; 32]), chunk(b));
+        }
+    }
+
+    /// The debounced journal write runs in the background; the final write
+    /// joins it first and then stores the newest state.
+    #[test]
+    fn background_journal_write_is_joined_before_final_write() {
+        let storage = Arc::new(JournalCountingBackend::new());
+        let dyn_storage: Arc<dyn StorageBackend> = storage.clone();
+        let crypto: Arc<dyn CryptoEngine> = Arc::new(test_crypto());
+        let mut ws = journal_session();
+        record_packs(&mut ws, 1..1 + JOURNAL_WRITE_INTERVAL as u8);
+        ws.maybe_write_pending_index(&dyn_storage, &crypto);
+        assert!(
+            ws.journal_write.is_some(),
+            "debounced write runs in background"
+        );
+        // Confirmed while the write is in flight: must still reach storage.
+        record_packs(&mut ws, 100..100 + JOURNAL_WRITE_INTERVAL as u8);
+
+        ws.wait_pending_uploads(&*storage, &*crypto).unwrap();
+        assert!(ws.journal_write.is_none());
+        assert_eq!(
+            ws.pending_journal_written_rev,
+            Some(ws.pending_journal.revision())
+        );
+        assert_eq!(
+            stored_pack_ids(&*storage, &*crypto).len(),
+            2 * JOURNAL_WRITE_INTERVAL
+        );
+    }
+
+    /// A failed background write leaves its revision unwritten, so the next
+    /// debounced call (or the final write) retries.
+    #[test]
+    fn failed_background_journal_write_is_retried() {
+        let storage = Arc::new(JournalCountingBackend::new());
+        let dyn_storage: Arc<dyn StorageBackend> = storage.clone();
+        let crypto: Arc<dyn CryptoEngine> = Arc::new(test_crypto());
+        let mut ws = journal_session();
+        storage
+            .fail_next
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        record_packs(&mut ws, 1..1 + JOURNAL_WRITE_INTERVAL as u8);
+        ws.maybe_write_pending_index(&dyn_storage, &crypto);
+        ws.join_journal_write();
+        assert_eq!(journal_puts(&storage), 0);
+        assert_eq!(ws.pending_journal_written_rev, None);
+
+        ws.maybe_write_pending_index(&dyn_storage, &crypto);
+        ws.join_journal_write();
+        assert_eq!(journal_puts(&storage), 1);
+        assert_eq!(
+            ws.pending_journal_written_rev,
+            Some(ws.pending_journal.revision())
+        );
+    }
+
     #[test]
     fn journal_revision_tracks_mutations() {
         let mut j = PendingIndexJournal::new();
@@ -1616,13 +1753,16 @@ mod tests {
             MemoryBackend::new(),
         )));
         let crypto = test_crypto();
+        let dyn_storage: Arc<dyn StorageBackend> = storage.clone();
+        let dyn_crypto: Arc<dyn CryptoEngine> = Arc::new(test_crypto());
         let mut ws = journal_session();
         let target = ws.data_pack_writer.target_size();
 
         // Disabled: a queued pack plus the incoming one may exceed the
         // target; only the count limit applies.
         let release = gated_upload(&mut ws, &storage, 1, target);
-        ws.cap_pending_uploads(&*storage, &crypto, target).unwrap();
+        ws.cap_pending_uploads(&dyn_storage, &dyn_crypto, target)
+            .unwrap();
         assert_eq!(ws.pending_uploads.len(), 1);
         release.send(()).unwrap();
         ws.wait_pending_uploads(&*storage, &crypto).unwrap();
@@ -1635,21 +1775,22 @@ mod tests {
             release.send(()).unwrap();
         });
         let start = std::time::Instant::now();
-        ws.cap_pending_uploads(&*storage, &crypto, target).unwrap();
+        ws.cap_pending_uploads(&dyn_storage, &dyn_crypto, target)
+            .unwrap();
         assert!(start.elapsed() >= std::time::Duration::from_millis(100));
         assert!(ws.pending_uploads.is_empty());
         releaser.join().unwrap();
 
         // A pack that fits next to the queued one does not block.
         let release = gated_upload(&mut ws, &storage, 3, target / 4);
-        ws.cap_pending_uploads(&*storage, &crypto, target / 2)
+        ws.cap_pending_uploads(&dyn_storage, &dyn_crypto, target / 2)
             .unwrap();
         assert_eq!(ws.pending_uploads.len(), 1);
         release.send(()).unwrap();
         ws.wait_pending_uploads(&*storage, &crypto).unwrap();
 
         // An empty queue never blocks, even for an oversized pack.
-        ws.cap_pending_uploads(&*storage, &crypto, 4 * target)
+        ws.cap_pending_uploads(&dyn_storage, &dyn_crypto, 4 * target)
             .unwrap();
     }
 
@@ -1704,6 +1845,8 @@ mod tests {
             MemoryBackend::new(),
         )));
         let crypto = test_crypto();
+        let dyn_storage: Arc<dyn StorageBackend> = storage.clone();
+        let dyn_crypto: Arc<dyn CryptoEngine> = Arc::new(test_crypto());
         let mut ws = journal_session();
         let slots = ws.max_in_flight_uploads + UPLOAD_QUEUE_HEADROOM;
         let mut gates: Vec<_> = (1..=slots as u8)
@@ -1722,7 +1865,8 @@ mod tests {
         });
 
         let start = std::time::Instant::now();
-        ws.cap_pending_uploads(&*storage, &crypto, 0).unwrap();
+        ws.cap_pending_uploads(&dyn_storage, &dyn_crypto, 0)
+            .unwrap();
         returned.send(()).unwrap();
         assert!(start.elapsed() < std::time::Duration::from_secs(5));
         assert_eq!(ws.pending_uploads.len(), slots - 1);

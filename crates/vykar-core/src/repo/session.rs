@@ -72,7 +72,7 @@ impl Repository {
         self.write_session
             .as_mut()
             .expect("no active write session")
-            .cap_pending_uploads(&*self.storage, &*self.crypto, incoming)
+            .cap_pending_uploads(&self.storage, &self.crypto, incoming)
     }
 
     /// Bound sealed-but-unwritten packs by bytes as well as by count

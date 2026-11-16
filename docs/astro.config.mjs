@@ -39,6 +39,14 @@ export default defineConfig({
 				{ tag: 'meta', attrs: { name: 'twitter:card', content: 'summary_large_image' } },
 				{ tag: 'meta', attrs: { name: 'twitter:image', content: ogImage } },
 				{ tag: 'meta', attrs: { name: 'twitter:image:alt', content: 'Vykar Backup Logo' } },
+				{
+					tag: 'script',
+					attrs: {
+						defer: true,
+						src: 'https://stats.snapdragon.cc/script.js',
+						'data-website-id': 'ed5f57fc-0177-4b98-9b12-5b295b9faf83',
+					},
+				},
 			],
 			plugins: [starlightLinksValidator()],
 			sidebar: [

@@ -97,6 +97,8 @@ Completion first seals the assembled file — renames it away from the temp name
 
 Uploads idle for an hour are abandoned: their temp file is removed and their reservation released (checked whenever an upload starts and on the hourly sweep). The registry is in memory, so a server restart orphans an in-progress upload; its completion then answers `404` and the temp file is swept as ordinary debris after 24 hours. Temp files are hidden from listings and purged by delete-repo like every other temp file.
 
+The client splits packs larger than 16 MiB into equal parts of at most 16 MiB and keeps at most `4 × connections` (4..32) part requests in flight across all packs. Any failure of the part path makes the client send that pack as a whole `PUT`; a `4xx` refusal also turns the part path off for the rest of the run. Servers that do not advertise the capability only ever see whole-object `PUT`s, and old clients never call the new endpoints.
+
 ## Backup Freshness Monitoring
 
 The server updates `last_backup_at` when it observes a new `snapshots/*` key being written for the first time. This marks the completion of a backup commit.
@@ -152,7 +154,7 @@ It also sends the content-digest header on `PUT` requests — bound once to the 
 {"status":"ok","version":"0.20.0","protocol_version":2,"hashes":["blake2b","blake3"],"pack_parts":true}
 ```
 
-`pack_parts` advertises [pack uploads in parts](#pack-uploads-in-parts). All three fields are additive: a pre-BLAKE3 server omits `protocol_version` and `hashes`, which a client reads as "blake2b only", and a server without part support omits `pack_parts`. `vykar init` probes this **before writing anything**, because `init` writes only non-pack keys that an old server happily accepts — without the probe, `init` would succeed and only the first `backup` would fail. Requests that declare `"hash": "blake3"` must also declare `protocol_version: 2`, so an old server rejects them outright rather than silently verifying every pack under the wrong algorithm.
+`pack_parts` advertises [pack uploads in parts](#pack-uploads-in-parts); the client probes it lazily, on the first pack large enough to split, so a backup that uploads nothing pays no extra round trip. All three fields are additive: a pre-BLAKE3 server omits `protocol_version` and `hashes`, which a client reads as "blake2b only", and a server without part support omits `pack_parts`. `vykar init` probes this **before writing anything**, because `init` writes only non-pack keys that an old server happily accepts — without the probe, `init` would succeed and only the first `backup` would fail. Requests that declare `"hash": "blake3"` must also declare `protocol_version: 2`, so an old server rejects them outright rather than silently verifying every pack under the wrong algorithm.
 
 Client config:
 

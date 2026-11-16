@@ -7,6 +7,8 @@
     clippy::used_underscore_binding
 )]
 
+mod parts;
+
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
@@ -101,6 +103,17 @@ pub struct RestBackend {
     /// Set once the server has answered `?sizes` as an unknown request, so a
     /// process probes an old server at most once.
     sizes_unsupported: AtomicBool,
+    /// Whether the server accepts pack uploads in parts, from `/health`.
+    /// Probed on the first pack large enough to split (or recorded by an
+    /// explicit [`StorageBackend::server_capabilities`] call), so a backup
+    /// that uploads nothing pays no extra round trip.
+    pack_parts: OnceLock<bool>,
+    /// Set when the part path failed permanently; later packs use whole PUTs.
+    parts_disabled: AtomicBool,
+    /// Backend-wide budget of concurrent part PUTs.
+    part_slots: crate::http_util::PartSlots,
+    /// Target part size; packs at or below it are sent whole.
+    part_size: usize,
 }
 
 impl RestBackend {
@@ -126,7 +139,11 @@ impl RestBackend {
         max_connections: Option<usize>,
         timeouts: HttpTimeouts,
     ) -> Result<Self> {
-        let pool = crate::http_idle_pool_size(max_connections);
+        let part_concurrency = parts::part_concurrency(max_connections);
+        // Part streams plus a few control connections stay pooled: ureq hands
+        // out the oldest idle connection, and a part sent on a fresh one pays
+        // a handshake and slow start.
+        let pool = crate::http_idle_pool_size(max_connections).max(part_concurrency + 4);
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .http_status_as_error(false)
             .timeout_resolve(Some(timeouts.resolve))
@@ -152,6 +169,10 @@ impl RestBackend {
             timeouts,
             content_hash: OnceLock::new(),
             sizes_unsupported: AtomicBool::new(false),
+            pack_parts: OnceLock::new(),
+            parts_disabled: AtomicBool::new(false),
+            part_slots: crate::http_util::PartSlots::new(part_concurrency),
+            part_size: parts::part_size(),
         })
     }
 
@@ -449,6 +470,23 @@ impl RestBackend {
         hex::encode(hasher.finalize())
     }
 
+    /// Whether packs go up in parts: the server advertised `pack_parts` and
+    /// the path has not failed permanently. The first call probes `/health`;
+    /// a failed probe counts as "not supported".
+    fn pack_parts_enabled(&self) -> bool {
+        if self.parts_disabled.load(Ordering::Relaxed) {
+            return false;
+        }
+        *self.pack_parts.get_or_init(|| {
+            self.fetch_server_capabilities()
+                .map(|caps| caps.pack_parts)
+                .unwrap_or_else(|e| {
+                    tracing::debug!("REST: capability probe failed, uploading packs whole: {e}");
+                    false
+                })
+        })
+    }
+
     /// The content-digest algorithm this backend was bound to, defaulting to
     /// BLAKE2b when nothing bound it.
     fn content_hash(&self) -> HashAlgorithm {
@@ -465,13 +503,33 @@ impl RestBackend {
     fn put_bytes(&self, key: &str, data: &[u8]) -> Result<()> {
         let url = self.url(key);
         let (header, checksum) = match Self::try_extract_pack_hex(key) {
-            Some(pack_hex) => (
-                match self.content_hash() {
+            Some(pack_hex) => {
+                let header = match self.content_hash() {
                     HashAlgorithm::Blake2b => "X-Content-BLAKE2b",
                     HashAlgorithm::Blake3 => "X-Content-BLAKE3",
-                },
-                pack_hex.to_string(),
-            ),
+                };
+                if data.len() > self.part_size && self.pack_parts_enabled() {
+                    match self.put_pack_in_parts(key, pack_hex, header, data) {
+                        Ok(()) => return Ok(()),
+                        Err(failure) => {
+                            if failure.permanent {
+                                self.parts_disabled.store(true, Ordering::Relaxed);
+                            }
+                            tracing::warn!(
+                                "REST PUT {key}: part upload failed ({}); \
+                                 sending the pack whole{}",
+                                failure.message,
+                                if failure.permanent {
+                                    ", and every later one"
+                                } else {
+                                    ""
+                                }
+                            );
+                        }
+                    }
+                }
+                (header, pack_hex.to_string())
+            }
             None => ("X-Content-BLAKE2b", Self::compute_blake2b_256_hex(data)),
         };
         self.retry_call(
@@ -803,7 +861,9 @@ impl StorageBackend for RestBackend {
     }
 
     fn server_capabilities(&self) -> Result<ServerCapabilities> {
-        self.fetch_server_capabilities()
+        let caps = self.fetch_server_capabilities()?;
+        let _ = self.pack_parts.set(caps.pack_parts);
+        Ok(caps)
     }
 
     fn object_sizes(&self, keys: &[String]) -> Result<Vec<Option<u64>>> {
@@ -1154,6 +1214,339 @@ mod tests {
         let err = backend.object_sizes(&keys).unwrap_err().to_string();
         assert!(err.contains("1 sizes for 2 keys"), "{err}");
         server.join().unwrap();
+    }
+
+    // ── Pack part uploads ──────────────────────────────────────────────
+
+    /// One request as a [`routing_server`] saw it.
+    #[derive(Debug, Clone)]
+    struct Seen {
+        /// `METHOD /path?query`
+        line: String,
+        head: String,
+        body: Vec<u8>,
+    }
+
+    type Routes = dyn Fn(&str) -> String + Send + Sync;
+
+    /// A keep-alive HTTP server that answers each request with `route(line)`
+    /// (line = `METHOD /path?query`) on a thread per connection, recording
+    /// every request.
+    fn routing_server(
+        route: impl Fn(&str) -> String + Send + Sync + 'static,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<Seen>>>) {
+        use std::sync::{Arc, Mutex};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let seen: Arc<Mutex<Vec<Seen>>> = Arc::default();
+        let route: Arc<Routes> = Arc::new(route);
+        let log = seen.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let log = log.clone();
+                let route = route.clone();
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    loop {
+                        let mut head = String::new();
+                        let mut content_length = 0usize;
+                        loop {
+                            let mut line = String::new();
+                            if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                                return;
+                            }
+                            if let Some(v) =
+                                line.to_ascii_lowercase().strip_prefix("content-length:")
+                            {
+                                content_length = v.trim().parse().unwrap_or(0);
+                            }
+                            let done = line.trim().is_empty();
+                            head.push_str(&line);
+                            if done {
+                                break;
+                            }
+                        }
+                        let mut body = vec![0u8; content_length];
+                        if reader.read_exact(&mut body).is_err() {
+                            return;
+                        }
+                        let line = head
+                            .lines()
+                            .next()
+                            .unwrap_or("")
+                            .rsplit_once(' ')
+                            .map_or("", |(l, _)| l)
+                            .to_string();
+                        let response = route(&line);
+                        log.lock().unwrap().push(Seen { line, head, body });
+                        if stream.write_all(response.as_bytes()).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (url, seen)
+    }
+
+    fn empty(status: &str) -> String {
+        format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\n\r\n")
+    }
+
+    const HEALTH_PARTS: &str = r#"{"status":"ok","version":"0.21.0","protocol_version":2,"hashes":["blake2b","blake3"],"pack_parts":true}"#;
+    const HEALTH_OLD: &str =
+        r#"{"status":"ok","version":"0.20.0","protocol_version":2,"hashes":["blake2b","blake3"]}"#;
+
+    /// Route: `/health` answers `health`; part PUTs and completions get
+    /// `part` / `complete`; whole PUTs get `whole`.
+    fn pack_routes(
+        health: &'static str,
+        part: &'static str,
+        complete: &'static str,
+        whole: &'static str,
+    ) -> impl Fn(&str) -> String + Send + Sync + 'static {
+        move |line| {
+            if line.starts_with("GET /health") {
+                json_response(health)
+            } else if line.starts_with("PUT ") && line.contains("upload=") {
+                empty(part)
+            } else if line.starts_with("POST ") && line.contains("?complete") {
+                empty(complete)
+            } else {
+                empty(whole)
+            }
+        }
+    }
+
+    fn test_pack(len: usize) -> (String, Vec<u8>) {
+        let data: Vec<u8> = (0..len).map(|i| (i % 253) as u8).collect();
+        let hex = vykar_types::pack_id::PackId::compute(&data, HashAlgorithm::Blake3).to_hex();
+        (format!("packs/{}/{hex}", &hex[..2]), data)
+    }
+
+    fn parts_backend(url: &str, retry: RetryConfig) -> RestBackend {
+        let mut backend = RestBackend::new(url, None, retry, None).unwrap();
+        backend.part_size = 1000;
+        backend.bind_content_hash(HashAlgorithm::Blake3).unwrap();
+        backend
+    }
+
+    fn count(seen: &[Seen], pred: impl Fn(&Seen) -> bool) -> usize {
+        seen.iter().filter(|s| pred(s)).count()
+    }
+    fn is_part(s: &Seen) -> bool {
+        s.line.starts_with("PUT ") && s.line.contains("upload=")
+    }
+    fn is_whole(s: &Seen) -> bool {
+        s.line.starts_with("PUT ") && !s.line.contains('?')
+    }
+
+    #[test]
+    fn pack_goes_up_in_parts_when_the_server_advertises_them() {
+        let (url, seen) = routing_server(pack_routes(
+            HEALTH_PARTS,
+            "204 No Content",
+            "201 Created",
+            "500 Internal Server Error",
+        ));
+        let backend = parts_backend(&url, no_retry());
+        let (key, data) = test_pack(3500);
+        backend.put(&key, &data).unwrap();
+
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(count(&seen, |s| s.line.starts_with("GET /health")), 1);
+        assert_eq!(count(&seen, is_whole), 0, "{seen:#?}");
+        // 4 near-equal parts, each body the matching slice of the pack.
+        let mut parts: Vec<(usize, Vec<u8>)> = seen
+            .iter()
+            .filter(|s| is_part(s))
+            .map(|s| {
+                assert!(s.line.contains("&total=3500"), "{}", s.line);
+                let offset = s.line.split("offset=").nth(1).unwrap();
+                let offset: usize = offset.split('&').next().unwrap().parse().unwrap();
+                (offset, s.body.clone())
+            })
+            .collect();
+        parts.sort();
+        assert_eq!(parts.len(), 4);
+        let mut assembled = Vec::new();
+        for (offset, body) in &parts {
+            assert_eq!(*offset, assembled.len());
+            assembled.extend_from_slice(body);
+        }
+        assert_eq!(assembled, data);
+        // One token for the whole upload, and the completion carries the
+        // pack's digest under the repository's header.
+        let token = |line: &str| line.split("upload=").nth(1).unwrap()[..32].to_string();
+        let tokens: std::collections::HashSet<String> = seen
+            .iter()
+            .filter(|s| s.line.contains("upload="))
+            .map(|s| token(&s.line))
+            .collect();
+        assert_eq!(tokens.len(), 1);
+        let completion = seen.iter().find(|s| s.line.contains("?complete")).unwrap();
+        let hex = key.rsplit('/').next().unwrap();
+        assert!(
+            completion
+                .head
+                .to_ascii_lowercase()
+                .contains(&format!("x-content-blake3: {hex}")),
+            "{}",
+            completion.head
+        );
+        assert_eq!(
+            seen.last().unwrap().line,
+            completion.line,
+            "completion comes after every part"
+        );
+    }
+
+    #[test]
+    fn old_server_gets_whole_puts_and_is_probed_once() {
+        let (url, seen) = routing_server(pack_routes(
+            HEALTH_OLD,
+            "500 Internal Server Error",
+            "500 Internal Server Error",
+            "201 Created",
+        ));
+        let backend = parts_backend(&url, no_retry());
+        for len in [3000, 4000] {
+            let (key, data) = test_pack(len);
+            backend.put(&key, &data).unwrap();
+        }
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(count(&seen, |s| s.line.starts_with("GET /health")), 1);
+        assert_eq!(count(&seen, is_whole), 2);
+        assert_eq!(count(&seen, |s| s.line.contains("upload=")), 0);
+    }
+
+    /// Small packs and non-pack objects never trigger the probe.
+    #[test]
+    fn small_objects_skip_the_probe() {
+        let (url, seen) = routing_server(pack_routes(
+            HEALTH_PARTS,
+            "204 No Content",
+            "201 Created",
+            "201 Created",
+        ));
+        let backend = parts_backend(&url, no_retry());
+        let (key, data) = test_pack(1000);
+        backend.put(&key, &data).unwrap();
+        backend.put("index", &[0u8; 5000]).unwrap();
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2, "{seen:#?}");
+        assert_eq!(count(&seen, is_whole), 2);
+    }
+
+    #[test]
+    fn explicit_capability_call_is_reused() {
+        let (url, seen) = routing_server(pack_routes(
+            HEALTH_PARTS,
+            "204 No Content",
+            "201 Created",
+            "201 Created",
+        ));
+        let backend = parts_backend(&url, no_retry());
+        assert!(backend.server_capabilities().unwrap().pack_parts);
+        let (key, data) = test_pack(3000);
+        backend.put(&key, &data).unwrap();
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(count(&seen, |s| s.line.starts_with("GET /health")), 1);
+        assert_eq!(count(&seen, is_part), 3);
+    }
+
+    /// A refused part (4xx) falls back to a whole PUT and turns the part
+    /// path off for the rest of the backend's life.
+    #[test]
+    fn refused_part_falls_back_and_disables_parts() {
+        let (url, seen) = routing_server(pack_routes(
+            HEALTH_PARTS,
+            "400 Bad Request",
+            "201 Created",
+            "201 Created",
+        ));
+        let backend = parts_backend(&url, no_retry());
+        let (key, data) = test_pack(3000);
+        backend.put(&key, &data).unwrap();
+        let (key2, data2) = test_pack(4000);
+        backend.put(&key2, &data2).unwrap();
+
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(count(&seen, is_whole), 2);
+        assert_eq!(count(&seen, |s| s.line.contains("?complete")), 0);
+        let second_pack_parts = count(&seen, |s| is_part(s) && s.line.contains(&key2));
+        assert_eq!(second_pack_parts, 0, "parts disabled after a refusal");
+    }
+
+    /// A transient failure (5xx after retries) falls back for that pack only.
+    #[test]
+    fn transient_part_failure_falls_back_for_that_pack_only() {
+        let (url, seen) = routing_server(pack_routes(
+            HEALTH_PARTS,
+            "503 Service Unavailable",
+            "201 Created",
+            "201 Created",
+        ));
+        let backend = parts_backend(&url, no_retry());
+        let (key, data) = test_pack(3000);
+        backend.put(&key, &data).unwrap();
+        let (key2, data2) = test_pack(4000);
+        backend.put(&key2, &data2).unwrap();
+
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(count(&seen, is_whole), 2);
+        assert!(count(&seen, |s| is_part(s) && s.line.contains(&key2)) > 0);
+    }
+
+    #[test]
+    fn failed_completion_falls_back_to_a_whole_put() {
+        let (url, seen) = routing_server(pack_routes(
+            HEALTH_PARTS,
+            "204 No Content",
+            "404 Not Found",
+            "201 Created",
+        ));
+        let backend = parts_backend(&url, no_retry());
+        let (key, data) = test_pack(3000);
+        backend.put(&key, &data).unwrap();
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(count(&seen, is_part), 3);
+        assert_eq!(count(&seen, is_whole), 1);
+        assert!(is_whole(seen.last().unwrap()));
+    }
+
+    /// When the fallback PUT fails too, its error is what the caller sees.
+    #[test]
+    fn fallback_failure_is_surfaced() {
+        let (url, _seen) = routing_server(pack_routes(
+            HEALTH_PARTS,
+            "413 Payload Too Large",
+            "201 Created",
+            "413 Payload Too Large",
+        ));
+        let backend = parts_backend(&url, no_retry());
+        let (key, data) = test_pack(3000);
+        let err = backend.put(&key, &data).unwrap_err().to_string();
+        assert!(err.contains("413"), "got: {err}");
+    }
+
+    /// A failed probe is "not supported", never an upload error.
+    #[test]
+    fn failed_probe_means_whole_puts() {
+        let (url, seen) = routing_server(|line: &str| {
+            if line.starts_with("GET /health") {
+                empty("500 Internal Server Error")
+            } else {
+                empty("201 Created")
+            }
+        });
+        let backend = parts_backend(&url, no_retry());
+        let (key, data) = test_pack(3000);
+        backend.put(&key, &data).unwrap();
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(count(&seen, is_whole), 1);
+        assert_eq!(count(&seen, |s| s.line.contains("upload=")), 0);
     }
 
     /// Serve one canned response and hand back the full request text.

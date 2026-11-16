@@ -1,4 +1,5 @@
 use std::io::Read;
+use std::sync::{Condvar, Mutex};
 
 use vykar_types::error::{Result, VykarError};
 
@@ -73,6 +74,50 @@ pub fn extract_content_length(headers: &http::HeaderMap, context: &str) -> Resul
         .map_err(|_| VykarError::Other(format!("{context}: non-ASCII Content-Length header")))?;
     val.parse::<u64>()
         .map_err(|_| VykarError::Other(format!("{context}: invalid Content-Length header: {val}")))
+}
+
+/// Counting semaphore bounding the in-flight part uploads across every
+/// multipart (S3) or part (REST) upload of one backend.
+pub(crate) struct PartSlots {
+    free: Mutex<usize>,
+    cv: Condvar,
+    capacity: usize,
+}
+
+impl PartSlots {
+    pub(crate) fn new(capacity: usize) -> Self {
+        let capacity = capacity.max(1);
+        Self {
+            free: Mutex::new(capacity),
+            cv: Condvar::new(),
+            capacity,
+        }
+    }
+
+    pub(crate) fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    pub(crate) fn acquire(&self) -> PartSlot<'_> {
+        let mut free = self.free.lock().unwrap_or_else(|e| e.into_inner());
+        while *free == 0 {
+            free = self.cv.wait(free).unwrap_or_else(|e| e.into_inner());
+        }
+        *free -= 1;
+        PartSlot(self)
+    }
+}
+
+/// RAII permit from [`PartSlots::acquire`]; released on drop (including unwind).
+pub(crate) struct PartSlot<'a>(&'a PartSlots);
+
+impl Drop for PartSlot<'_> {
+    fn drop(&mut self) {
+        let mut free = self.0.free.lock().unwrap_or_else(|e| e.into_inner());
+        *free += 1;
+        drop(free);
+        self.0.cv.notify_one();
+    }
 }
 
 #[cfg(test)]

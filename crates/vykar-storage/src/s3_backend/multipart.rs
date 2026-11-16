@@ -9,7 +9,7 @@
 
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Condvar, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 
 use base64::Engine;
 use md5::{Digest, Md5};
@@ -67,49 +67,7 @@ pub(super) fn part_concurrency(max_connections: Option<usize>) -> usize {
     (max_connections.unwrap_or(2) * 4).clamp(4, 32)
 }
 
-/// Counting semaphore bounding the in-flight part PUTs across every multipart
-/// upload of one backend.
-pub(super) struct PartSlots {
-    free: Mutex<usize>,
-    cv: Condvar,
-    capacity: usize,
-}
-
-impl PartSlots {
-    pub(super) fn new(capacity: usize) -> Self {
-        let capacity = capacity.max(1);
-        Self {
-            free: Mutex::new(capacity),
-            cv: Condvar::new(),
-            capacity,
-        }
-    }
-
-    pub(super) fn capacity(&self) -> usize {
-        self.capacity
-    }
-
-    fn acquire(&self) -> PartSlot<'_> {
-        let mut free = self.free.lock().unwrap_or_else(|e| e.into_inner());
-        while *free == 0 {
-            free = self.cv.wait(free).unwrap_or_else(|e| e.into_inner());
-        }
-        *free -= 1;
-        PartSlot(self)
-    }
-}
-
-/// RAII permit from [`PartSlots::acquire`]; released on drop (including unwind).
-struct PartSlot<'a>(&'a PartSlots);
-
-impl Drop for PartSlot<'_> {
-    fn drop(&mut self) {
-        let mut free = self.0.free.lock().unwrap_or_else(|e| e.into_inner());
-        *free += 1;
-        drop(free);
-        self.0.cv.notify_one();
-    }
-}
+pub(super) use crate::http_util::PartSlots;
 
 #[allow(clippy::result_large_err)]
 impl S3Backend {

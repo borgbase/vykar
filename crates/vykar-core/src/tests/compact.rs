@@ -154,6 +154,82 @@ fn count_all_packs(repo: &crate::repo::Repository) -> usize {
     count
 }
 
+fn repo_on_recording_backend(sized: bool) -> (crate::repo::Repository, crate::testutil::PutLog) {
+    use crate::testutil::RecordingBackend;
+    crate::testutil::init_test_environment();
+    let (backend, log) = if sized {
+        RecordingBackend::with_sized_listing()
+    } else {
+        RecordingBackend::new()
+    };
+    let mut repo = crate::repo::Repository::init(
+        Box::new(backend),
+        crate::repo::EncryptionMode::None,
+        crate::config::ChunkerConfig::default(),
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+    repo.begin_write_session(&crate::repo::WriteSessionOptions::default())
+        .unwrap();
+    (repo, log)
+}
+
+/// Compact takes pack sizes from a sized listing and calls `size()` only for
+/// packs listed without one (old REST servers); the analysis is identical.
+#[test]
+fn compact_sizes_packs_from_the_listing() {
+    for dead in [false, true] {
+        let mut runs = Vec::new();
+        for sized in [true, false] {
+            let (mut repo, log) = repo_on_recording_backend(sized);
+            // A data and a tree chunk land in two packs.
+            let (data_id, _, _) = repo
+                .store_chunk(
+                    b"data-chunk-for-listing-test",
+                    Compression::None,
+                    PackType::Data,
+                )
+                .unwrap();
+            repo.store_chunk(
+                b"tree-chunk-for-listing-test",
+                Compression::None,
+                PackType::Tree,
+            )
+            .unwrap();
+            repo.save_state().unwrap();
+            if dead {
+                repo.chunk_index_mut().decrement(&data_id);
+                repo.save_state().unwrap();
+            }
+            let packs = count_all_packs(&repo) as u64;
+            assert!(packs >= 2, "packs {packs}");
+
+            log.reset_metadata_counts();
+            let stats = compact_repo(&mut repo, 10.0, None, dead, 4, None).unwrap();
+            let ctx = format!("sized={sized} dead={dead}");
+            assert_eq!(log.sized_list_count(), 256, "{ctx}");
+            assert_eq!(log.list_count(), 0, "{ctx}");
+            let expected_sizes = if sized { 0 } else { packs };
+            assert_eq!(log.size_count(), expected_sizes, "{ctx}");
+            runs.push((
+                stats.packs_total,
+                stats.packs_corrupt,
+                stats.packs_orphan,
+                stats.blobs_live,
+                stats.packs_repacked,
+                stats.packs_deleted_empty,
+                stats.space_freed,
+            ));
+        }
+        assert_eq!(runs[0], runs[1], "dead={dead}");
+        if dead {
+            assert!(runs[0].6 > 0, "dry run reports dead space: {:?}", runs[0]);
+        }
+    }
+}
+
 mod server_side {
     use std::sync::{Arc, Mutex};
 

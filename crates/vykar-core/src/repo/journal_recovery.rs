@@ -69,13 +69,14 @@ pub(crate) struct RecoveryTarget<'a> {
 /// Active sessions and sessions with unreadable markers are skipped.
 ///
 /// Must be called inside the repo lock, before `enable_tiered_dedup_mode()`.
-/// Returns the total number of recovered chunk entries. `width` bounds the
-/// concurrent pack size lookups (see `pack_recovery`).
+/// Returns the total number of recovered chunk entries. `persisted_packs` and
+/// `width` steer the pack lookups (see `pack_lookup`).
 pub(crate) fn recover_pending_index(
     storage: &dyn StorageBackend,
     crypto: &dyn CryptoEngine,
     chunk_index: &ChunkIndex,
     own_session_id: &str,
+    persisted_packs: usize,
     width: usize,
     target: &mut RecoveryTarget<'_>,
 ) -> Result<PendingIndexRecovery> {
@@ -146,7 +147,15 @@ pub(crate) fn recover_pending_index(
             Some(MarkerState::Unknown) => continue,
         };
 
-        match recover_single_index(storage, crypto, chunk_index, index_key, width, target) {
+        match recover_single_index(
+            storage,
+            crypto,
+            chunk_index,
+            index_key,
+            persisted_packs,
+            width,
+            target,
+        ) {
             Ok(RecoverResult::Ok(n)) => {
                 target.recovered_index_keys.push(index_key.clone());
                 recovered_sessions.push(session_id.clone());
@@ -194,6 +203,7 @@ fn recover_single_index(
     crypto: &dyn CryptoEngine,
     chunk_index: &ChunkIndex,
     key: &str,
+    persisted_packs: usize,
     width: usize,
     target: &mut RecoveryTarget<'_>,
 ) -> Result<RecoverResult> {
@@ -245,7 +255,7 @@ fn recover_single_index(
         "found pending index from interrupted session, verifying packs\u{2026}"
     );
 
-    let accepted = verify_journal_packs(storage, &wire, width);
+    let accepted = verify_journal_packs(storage, &wire, persisted_packs, width);
 
     let mut recovered = 0usize;
     let pack_count = wire.len();
@@ -810,51 +820,121 @@ mod tests {
         assert_eq!(recovery.recovered_chunks, 0);
     }
 
-    /// `MemoryBackend` uses the default `list_sized` (no sizes); this wrapper
-    /// counts `size()` calls to prove the fallback path is taken.
-    struct SizeCountingBackend {
+    /// Counts `size()` calls and listings under `packs/`. `MemoryBackend`
+    /// uses the default `list_sized` (no sizes).
+    struct LookupCountingBackend {
         inner: MemoryBackend,
         size_calls: std::sync::atomic::AtomicUsize,
+        pack_lists: std::sync::atomic::AtomicUsize,
     }
 
-    impl vykar_storage::InnerBackend for SizeCountingBackend {
+    impl LookupCountingBackend {
+        fn new() -> Self {
+            Self {
+                inner: MemoryBackend::new(),
+                size_calls: Default::default(),
+                pack_lists: Default::default(),
+            }
+        }
+
+        fn count_pack_list(&self, prefix: &str) {
+            if prefix.starts_with("packs/") {
+                self.pack_lists
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        fn counts(&self) -> (usize, usize) {
+            let load =
+                |c: &std::sync::atomic::AtomicUsize| c.load(std::sync::atomic::Ordering::SeqCst);
+            (load(&self.pack_lists), load(&self.size_calls))
+        }
+    }
+
+    impl vykar_storage::InnerBackend for LookupCountingBackend {
         fn inner_backend(&self) -> &dyn StorageBackend {
             &self.inner
         }
     }
 
     vykar_storage::delegate_storage_backend! {
-        for SizeCountingBackend;
-        except [size];
+        for LookupCountingBackend;
+        except [list, size, list_sized];
 
         fn size(&self, key: &str) -> Result<Option<u64>> {
             self.size_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.inner.size(key)
         }
+
+        fn list(&self, prefix: &str) -> Result<Vec<String>> {
+            self.count_pack_list(prefix);
+            self.inner.list(prefix)
+        }
+
+        fn list_sized(&self, prefix: &str) -> Result<Vec<vykar_storage::ListedObject>> {
+            self.count_pack_list(prefix);
+            self.inner.list_sized(prefix)
+        }
     }
 
+    /// A single pack is sized with one `size()`: the cost model picks
+    /// per-pack lookups over a shard listing (one round either way).
     #[test]
-    fn unsized_listing_falls_back_to_size() {
+    fn single_pack_is_sized_with_one_size_call() {
         init_test_environment();
-        let storage = SizeCountingBackend {
-            inner: MemoryBackend::new(),
-            size_calls: Default::default(),
-        };
+        let storage = LookupCountingBackend::new();
         let crypto = test_crypto();
         write_journal(&storage, &crypto, &session_index_key("old"), Wire::V2);
-        assert!(storage
-            .list_sized("packs/")
-            .unwrap()
-            .iter()
-            .all(|o| o.size.is_none()));
 
         let (_ws, recovery) = recover_from(&storage);
         assert_eq!(recovery.recovered_chunks, 1);
-        assert_eq!(
-            storage.size_calls.load(std::sync::atomic::Ordering::SeqCst),
-            1
-        );
+        assert_eq!(storage.counts(), (0, 1));
+    }
+
+    /// `persisted_pack_count` reaches the pack lookup: three packs in one
+    /// shard are listed in an empty repository, but sized one by one when
+    /// the repository is large (each shard listing would paginate). The
+    /// `3` case fails if the count is swapped with the width (1 here).
+    #[test]
+    fn persisted_pack_count_steers_journal_pack_lookups() {
+        init_test_environment();
+        for (persisted, expected) in [(0, (1, 3)), (3, (1, 3)), (1_000_000, (0, 3))] {
+            let storage = LookupCountingBackend::new();
+            let crypto = test_crypto();
+            let entries: Vec<PendingPackEntry> = (0..3u8)
+                .map(|i| {
+                    let mut b = [0x11u8; 32];
+                    b[1] = i;
+                    let pack_id = PackId::from_bytes(b);
+                    storage.put(&pack_id.storage_key(), &[0u8; 64]).unwrap();
+                    PendingPackEntry {
+                        pack_id,
+                        chunks: vec![crate::index::PendingChunkEntry {
+                            chunk_id: ChunkId::from_bytes([i; 32]),
+                            stored_size: 64 - 13,
+                            pack_offset: 13,
+                        }],
+                    }
+                })
+                .collect();
+            put_journal(
+                &storage,
+                &crypto,
+                &session_index_key("old"),
+                &entries,
+                Wire::V2,
+            );
+
+            let mut ws = WriteSessionState::new(1024, 1024, 1, HashAlgorithm::Blake2b);
+            ws.session_id = "current".to_string();
+            ws.persisted_pack_count = persisted;
+            let recovery = ws
+                .recover_pending_index(&storage, &crypto, &ChunkIndex::new(), 1)
+                .unwrap();
+            assert_eq!(recovery.recovered_chunks, 3, "{persisted}");
+            assert_eq!(storage.counts(), expected, "{persisted}");
+        }
     }
 
     #[test]

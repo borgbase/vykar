@@ -119,10 +119,11 @@ pub fn compact_repo(
         }
     }
 
-    // Discover all packs on disk (256 LIST calls, parallelized).
+    // Discover all packs on disk (256 sized LIST calls, parallelized).
     let discovered = parallel_list_packs(repo.storage.as_ref(), concurrency)?;
 
-    // For each discovered pack, compute live/dead space using size() + index.
+    // For each discovered pack, compute live/dead space from its size and the
+    // index. The size comes from the listing; `size()` only where it has none.
     let pack_header_size = PACK_HEADER_SIZE as u64;
 
     let analyses_mu: Mutex<Vec<PackAnalysis>> = Mutex::new(Vec::new());
@@ -132,23 +133,27 @@ pub fn compact_repo(
     let blobs_live = AtomicU64::new(0);
 
     let storage = repo.storage.as_ref();
-    crate::repo::bounded::for_each_bounded(concurrency, &discovered, shutdown, |(key, pack_id)| {
+    crate::repo::bounded::for_each_bounded(concurrency, &discovered, shutdown, |p: &ListedPack| {
         packs_total.fetch_add(1, Ordering::Relaxed);
+        let (key, pack_id) = (&p.key, &p.pack_id);
 
-        // Get pack size via metadata-only call (HEAD, stat, fs::metadata).
-        let pack_size = match storage.size(key) {
-            Ok(Some(sz)) => sz,
-            Ok(None) => {
-                // Pack disappeared between list and size.
-                warn!("Pack {} disappeared before size check, skipping", pack_id);
-                packs_corrupt.fetch_add(1, Ordering::Relaxed);
-                return;
-            }
-            Err(e) => {
-                warn!("Skipping pack {} (size check failed): {}", pack_id, e);
-                packs_corrupt.fetch_add(1, Ordering::Relaxed);
-                return;
-            }
+        // Sized listings (S3, SFTP, local, REST >= 0.22) need no extra request.
+        let pack_size = match p.size {
+            Some(sz) => sz,
+            None => match storage.size(key) {
+                Ok(Some(sz)) => sz,
+                Ok(None) => {
+                    // Pack disappeared between list and size.
+                    warn!("Pack {} disappeared before size check, skipping", pack_id);
+                    packs_corrupt.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+                Err(e) => {
+                    warn!("Skipping pack {} (size check failed): {}", pack_id, e);
+                    packs_corrupt.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+            },
         };
 
         let index_entries = per_pack_lookup.get(pack_id);
@@ -414,18 +419,28 @@ pub fn compact_repo(
     Ok(stats)
 }
 
-/// Discover all pack files across 256 shard directories, in parallel.
+/// A pack found by [`parallel_list_packs`]; `size` is `None` when the
+/// listing did not report it.
+struct ListedPack {
+    key: String,
+    pack_id: PackId,
+    size: Option<u64>,
+}
+
+/// Discover all pack files across 256 shard directories, in parallel, with
+/// their sizes where the backend's listing reports them.
 fn parallel_list_packs(
     storage: &dyn StorageBackend,
     concurrency: usize,
-) -> Result<Vec<(String, PackId)>> {
-    let results: Mutex<Vec<(String, PackId)>> = Mutex::new(Vec::new());
+) -> Result<Vec<ListedPack>> {
+    let results: Mutex<Vec<ListedPack>> = Mutex::new(Vec::new());
     let errors: Mutex<Vec<VykarError>> = Mutex::new(Vec::new());
     let shards: Vec<u16> = (0..256).collect();
 
+    // Not cancellable: `shutdown` is honoured by the analysis that follows.
     crate::repo::bounded::for_each_bounded(concurrency, &shards, None, |&shard| {
         let prefix = format!("packs/{:02x}/", shard);
-        let keys = match storage.list(&prefix) {
+        let objects = match storage.list_sized(&prefix) {
             Ok(k) => k,
             Err(e) => {
                 errors
@@ -437,12 +452,16 @@ fn parallel_list_packs(
         };
 
         let mut local = Vec::new();
-        for key in keys {
+        for vykar_storage::ListedObject { key, size } in objects {
             if key.ends_with('/') {
                 continue;
             }
             match PackId::from_storage_key(&key) {
-                Ok(id) => local.push((key, id)),
+                Ok(id) => local.push(ListedPack {
+                    key,
+                    pack_id: id,
+                    size,
+                }),
                 Err(e) => {
                     warn!("Skipping invalid pack key '{}': {}", key, e);
                 }

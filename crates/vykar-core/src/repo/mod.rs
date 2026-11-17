@@ -16,6 +16,7 @@ mod chunks;
 mod commit;
 mod key;
 mod open;
+mod pack_lookup;
 mod pack_recovery;
 mod pack_verify;
 pub use key::{select_repository_key, LoadedKey};

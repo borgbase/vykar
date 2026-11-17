@@ -218,12 +218,15 @@ pub fn chunk_hasher_for(key: [u8; 32]) -> ChunkHasher {
     ChunkHasher::new(HashAlgorithm::Blake2b, key)
 }
 
-/// Shared handle to inspect backend traffic: the keys written via `put()` and
-/// the number of `get_range()` calls.
+/// Shared handle to inspect backend traffic: keys written via `put()`, and
+/// counts of `get_range()`, `list()`, `list_sized()` and `size()` calls.
 #[derive(Clone)]
 pub struct PutLog {
     puts: std::sync::Arc<Mutex<Vec<String>>>,
     get_ranges: std::sync::Arc<AtomicU64>,
+    lists: std::sync::Arc<AtomicU64>,
+    sized_lists: std::sync::Arc<AtomicU64>,
+    sizes: std::sync::Arc<AtomicU64>,
 }
 
 impl PutLog {
@@ -231,6 +234,28 @@ impl PutLog {
         Self {
             puts: std::sync::Arc::new(Mutex::new(Vec::new())),
             get_ranges: std::sync::Arc::new(AtomicU64::new(0)),
+            lists: std::sync::Arc::new(AtomicU64::new(0)),
+            sized_lists: std::sync::Arc::new(AtomicU64::new(0)),
+            sizes: std::sync::Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    pub fn list_count(&self) -> u64 {
+        self.lists.load(Ordering::Relaxed)
+    }
+
+    pub fn sized_list_count(&self) -> u64 {
+        self.sized_lists.load(Ordering::Relaxed)
+    }
+
+    pub fn size_count(&self) -> u64 {
+        self.sizes.load(Ordering::Relaxed)
+    }
+
+    /// Reset the `list()`, `list_sized()` and `size()` counters.
+    pub fn reset_metadata_counts(&self) {
+        for c in [&self.lists, &self.sized_lists, &self.sizes] {
+            c.store(0, Ordering::Relaxed);
         }
     }
 
@@ -269,6 +294,7 @@ impl PutLog {
 pub struct RecordingBackend {
     inner: MemoryBackend,
     log: PutLog,
+    sized_listing: bool,
 }
 
 impl RecordingBackend {
@@ -278,6 +304,19 @@ impl RecordingBackend {
             Self {
                 inner: MemoryBackend::new(),
                 log: log.clone(),
+                sized_listing: false,
+            },
+            log,
+        )
+    }
+
+    /// Like [`Self::new`], but `list_sized` reports sizes (as S3/SFTP/local do).
+    pub fn with_sized_listing() -> (Self, PutLog) {
+        let (backend, log) = Self::new();
+        (
+            Self {
+                sized_listing: true,
+                ..backend
             },
             log,
         )
@@ -292,7 +331,36 @@ impl InnerBackend for RecordingBackend {
 
 delegate_storage_backend! {
     for RecordingBackend;
-    except [put, get_range, get_range_into, open_range, put_owned, begin_staged_put, profile];
+    except [
+        put, list, get_range, get_range_into, open_range, put_owned, begin_staged_put, size,
+        list_sized, profile,
+    ];
+
+    fn list(&self, prefix: &str) -> Result<Vec<String>> {
+        self.log.lists.fetch_add(1, Ordering::Relaxed);
+        self.inner.list(prefix)
+    }
+
+    // Sizes for `sized_listing` come from the inner backend, uncounted.
+    fn list_sized(&self, prefix: &str) -> Result<Vec<vykar_storage::ListedObject>> {
+        self.log.sized_lists.fetch_add(1, Ordering::Relaxed);
+        if !self.sized_listing {
+            return self.inner.list_sized(prefix);
+        }
+        self.inner
+            .list(prefix)?
+            .into_iter()
+            .map(|key| {
+                let size = self.inner.size(&key)?;
+                Ok(vykar_storage::ListedObject { key, size })
+            })
+            .collect()
+    }
+
+    fn size(&self, key: &str) -> Result<Option<u64>> {
+        self.log.sizes.fetch_add(1, Ordering::Relaxed);
+        self.inner.size(key)
+    }
 
     // Keep packs on the intercepted `put` path. Recorded puts must see every pack.
     fn begin_staged_put(

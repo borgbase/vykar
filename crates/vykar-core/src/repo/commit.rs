@@ -596,7 +596,8 @@ impl Repository {
     /// exist on storage. Returns an error if any are missing.
     ///
     /// Every pack is checked; only the request pattern adapts (see
-    /// `pack_verify`), with up to the backend's request width in flight.
+    /// `pack_verify`, `pack_lookup`), with up to the backend's request width
+    /// in flight.
     fn verify_delta_packs(&self, delta: &IndexDelta) -> Result<()> {
         super::pack_verify::verify_packs_present(
             self.storage.as_ref(),
@@ -611,7 +612,7 @@ impl Repository {
         delta.new_entries.iter().map(|e| e.pack_id).collect()
     }
 
-    /// Packs already in the repository, a cost hint for `pack_verify`.
+    /// Packs already in the repository, a cost hint for `pack_lookup`.
     fn persisted_pack_count(&self) -> usize {
         self.write_session
             .as_ref()

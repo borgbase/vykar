@@ -340,6 +340,7 @@ impl WriteSessionState {
             crypto,
             chunk_index,
             &self.session_id,
+            self.persisted_pack_count,
             width,
             &mut RecoveryTarget {
                 recovered_chunks: &mut self.recovered_chunks,

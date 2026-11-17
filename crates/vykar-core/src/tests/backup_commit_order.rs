@@ -358,7 +358,7 @@ fn assert_missing_pack_fails_commit_with(
     assert!(repo_keys(config, "locks/").is_empty());
 }
 
-/// Few session packs: verified with one `exists()` per pack.
+/// Few session packs: verified with one `size()` per pack.
 #[test]
 fn pack_deleted_before_commit_fails_backup_few_packs() {
     let (_dir, config, src) = setup();
@@ -388,7 +388,7 @@ fn pack_deleted_before_commit_fails_backup_batch_sizes() {
     assert_eq!(repo_keys(&config, "snapshots/").len(), 1);
 }
 
-/// Many session packs (one chunk per pack): verified by listing.
+/// Many session packs (one chunk per pack): verified by shard listings.
 #[test]
 fn pack_deleted_before_commit_fails_backup_many_packs() {
     crate::testutil::init_test_environment();

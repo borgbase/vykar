@@ -1,113 +1,26 @@
 use std::collections::HashMap as StdHashMap;
 use std::sync::Arc;
-use std::thread::JoinHandle;
 
-use tracing::{debug, warn};
-
-use crate::compress;
 use crate::index::dedup_cache::TieredDedupIndex;
 use crate::index::{
-    decode_pending_journal, encode_pending_journal, ChunkIndex, DecodedJournal, DedupIndex,
-    IndexDelta, IndexDeltaCheckpoint, PendingChunkEntry, PendingIndexJournal, PendingPackEntry,
+    ChunkIndex, DedupIndex, IndexDelta, IndexDeltaCheckpoint, PendingChunkEntry,
     RecoveredChunkEntry,
 };
 use vykar_crypto::CryptoEngine;
 use vykar_storage::StorageBackend;
 use vykar_types::chunk_id::ChunkId;
-use vykar_types::error::{Result, VykarError};
+use vykar_types::error::Result;
 use vykar_types::hash::HashAlgorithm;
 use vykar_types::pack_id::PackId;
 
-use super::format::{pack_object_with_context, unpack_object_expect_with_context, ObjectType};
-use super::lock::{session_index_key, SessionEntry, SESSIONS_PREFIX, SESSION_STALE_SECS};
+use super::journal_recovery::{self, PendingIndexRecovery, RecoveryTarget};
 use super::pack::{PackType, PackWriter, PackedChunkEntry};
-use super::pack_recovery::verify_journal_packs;
-
-/// Extra upload handles allowed beyond `max_in_flight_uploads` before blocking.
-const UPLOAD_QUEUE_HEADROOM: usize = 2;
-
-/// Number of new packs between debounced `pending_index` writes.
-const JOURNAL_WRITE_INTERVAL: usize = 8;
+use super::session_journal::SessionJournal;
+use super::upload_queue::{PendingUpload, UploadQueue};
 
 pub(super) const DEFAULT_SESSION_ID: &str = "default";
 /// `max_in_flight_uploads` of a new session, until `apply_upload_limits`.
 pub(super) const INITIAL_MAX_IN_FLIGHT_UPLOADS: usize = 2;
-const PENDING_INDEX_OBJECT_CONTEXT: &[u8] = b"pending_index";
-
-/// Result of recovering pending index journals from interrupted sessions.
-pub struct PendingIndexRecovery {
-    /// Total number of chunk entries recovered.
-    pub recovered_chunks: usize,
-    /// Session IDs whose journals were successfully recovered.
-    pub recovered_sessions: Vec<String>,
-}
-
-/// Result of attempting to recover a single session's pending index journal.
-enum RecoverResult {
-    /// No journal data found at key.
-    NotFound,
-    /// Journal was corrupt (decrypt/decompress/deserialize failed).
-    Corrupt,
-    /// Successfully recovered N chunk entries (may be 0 if all already indexed).
-    Ok(usize),
-    /// Versioned journal from a newer binary. Left in storage untouched so
-    /// that binary can still recover it.
-    UnknownVersion,
-    /// Unversioned journal from an older binary, which listed packs before
-    /// their upload was confirmed. Not trusted; deleted.
-    Legacy,
-}
-
-/// A background pack upload plus what to journal once it is confirmed.
-pub(crate) struct PendingUpload {
-    /// Sent on the session's completion channel when the thread finishes.
-    seq: u64,
-    pub(crate) pack_id: PackId,
-    pub(crate) journal_chunks: Vec<PendingChunkEntry>,
-    /// Cleared by rollback: the pack is still uploaded (an orphan for
-    /// compact) but must not enter the journal.
-    pub(crate) journal: bool,
-    /// Heap bytes held by the sealed pack until the upload thread returns
-    /// (0 for a staged pack, whose bytes are already in a temp file).
-    pub(crate) bytes: usize,
-    pub(crate) handle: JoinHandle<Result<()>>,
-}
-
-/// Announces an upload thread's completion on drop, so the send also happens
-/// when the upload panics (dev/test builds unwind).
-struct UploadDone {
-    tx: crossbeam_channel::Sender<u64>,
-    seq: u64,
-}
-
-impl Drop for UploadDone {
-    fn drop(&mut self) {
-        // The receiver lives as long as the session; a closed channel only
-        // means nobody is waiting any more.
-        let _ = self.tx.send(self.seq);
-    }
-}
-
-/// A debounced journal PUT running in the background, so the consumer
-/// keeps sealing and starting pack uploads during the round trip.
-struct JournalWrite {
-    /// Journal revision and pack count captured in the payload.
-    revision: u64,
-    len: usize,
-    handle: JoinHandle<Result<()>>,
-}
-
-/// Marker state for a session's `.json` file during recovery scanning.
-#[derive(Debug)]
-enum MarkerState {
-    /// Marker exists, parseable, `last_refresh` within `SESSION_STALE_SECS`.
-    Active,
-    /// Marker exists, parseable, `last_refresh` strictly older than
-    /// `SESSION_STALE_SECS`.
-    Stale,
-    /// Marker exists but unreadable or unparseable.
-    Unknown,
-}
 
 /// Tracks index mutations between `begin_rollback_checkpoint` and commit so
 /// they can be undone if the guarded scope (command dump, or per-file backup
@@ -130,35 +43,26 @@ pub(crate) struct RollbackTracker {
 
 /// Write-path state that is active during a backup session.
 ///
-/// Groups pack assembly, upload queue, dedup mode, crash recovery journal,
-/// and pack sizing counters — all transient state that only exists while
-/// chunks are being written.
+/// Composes the pack writers, the upload queue, the session's crash-recovery
+/// journal, the dedup / index-delta / rollback state and the chunks recovered
+/// from interrupted sessions — all transient state that only exists while
+/// chunks are being written. It wires each confirmed upload into the journal.
 pub(crate) struct WriteSessionState {
+    /// Crash-recovery journal of confirmed packs and its writes. Declared
+    /// first so its `Drop` (joining a background write) runs before any other
+    /// field is dropped, as `WriteSessionState`'s own `Drop` used to.
+    pub(crate) journal: SessionJournal,
     /// Pack writer for file content chunks.
     pub(crate) data_pack_writer: PackWriter,
     /// Pack writer for item-stream metadata chunks.
     pub(crate) tree_pack_writer: PackWriter,
-    /// Background pack uploads waiting to be joined, in no particular
-    /// order. A pack enters `pending_journal` only after its upload returns
-    /// `Ok`.
-    pub(crate) pending_uploads: Vec<PendingUpload>,
-    /// Upload threads send their `seq` here as they finish, so a blocked
-    /// caller wakes on whichever upload completes first.
-    upload_done_tx: crossbeam_channel::Sender<u64>,
-    upload_done_rx: crossbeam_channel::Receiver<u64>,
-    next_upload_seq: u64,
-    /// Configurable limit for in-flight background pack uploads.
-    pub(crate) max_in_flight_uploads: usize,
-    /// Also bound sealed-but-unwritten packs by bytes: the queued packs plus
-    /// the one about to be sealed may not exceed the current data-pack
-    /// target, so at most one sealed pack waits while the next one fills.
-    /// Enabled for local repositories, where a write rarely overlaps
-    /// usefully with the next seal; see `cap_pending_uploads`.
-    pub(crate) cap_pending_upload_bytes: bool,
+    /// Background pack uploads; a pack enters `journal` only after its
+    /// upload returns `Ok`.
+    pub(crate) uploads: UploadQueue,
     /// Stream data packs into the backend's staging area as they fill
     /// instead of buffering them on the heap, when the backend supports it
     /// (`StorageBackend::begin_staged_put`; local repositories). A staged
-    /// pack holds no heap, so it counts 0 against the byte cap above.
+    /// pack holds no heap, so it counts 0 against the upload byte cap.
     pub(crate) stream_data_packs: bool,
     /// Lightweight dedup-only index used during backup to save memory.
     /// When active, `chunk_index` on Repository is empty.
@@ -168,16 +72,6 @@ pub(crate) struct WriteSessionState {
     pub(crate) tiered_dedup: Option<TieredDedupIndex>,
     /// Tracks index mutations while in dedup mode, applied at save time.
     pub(crate) index_delta: Option<IndexDelta>,
-    /// Journal of chunk→pack mappings for packs flushed in the current session.
-    pub(crate) pending_journal: PendingIndexJournal,
-    /// Number of packs in journal when last written to storage (for debouncing).
-    pub(crate) pending_journal_last_written: usize,
-    /// Journal revision last written successfully (`None` = never written).
-    pub(crate) pending_journal_written_rev: Option<u64>,
-    /// At most one background journal write. Every synchronous write joins
-    /// it first, and a new one starts only after it was joined, so a newer
-    /// payload is never overwritten by an older one.
-    journal_write: Option<JournalWrite>,
     /// Chunks recovered from a previous interrupted session's `pending_index`.
     pub(crate) recovered_chunks: StdHashMap<ChunkId, RecoveredChunkEntry>,
     /// `.index` keys to delete after successful commit.
@@ -199,39 +93,16 @@ pub(crate) struct WriteSessionState {
     pub(crate) rollback_tracker: Option<RollbackTracker>,
 }
 
-/// Serialize, compress, encrypt, and write a pending index journal.
-fn write_journal(
-    wire: &[PendingPackEntry],
-    key: &str,
-    storage: &dyn StorageBackend,
-    crypto: &dyn CryptoEngine,
-) -> Result<()> {
-    let serialized = encode_pending_journal(wire)?;
-    let compressed = compress::compress(compress::Compression::Zstd { level: 3 }, &serialized)?;
-    let packed = pack_object_with_context(
-        ObjectType::PendingIndex,
-        PENDING_INDEX_OBJECT_CONTEXT,
-        &compressed,
-        crypto,
-    )?;
-    storage.put(key, &packed)?;
-    debug!(
-        packs = wire.len(),
-        bytes = packed.len(),
-        key = %key,
-        "wrote pending_index to storage"
-    );
-    Ok(())
+/// Borrow the active write session from the `Repository::write_session` field.
+#[track_caller]
+pub(super) fn active(ws: &Option<WriteSessionState>) -> &WriteSessionState {
+    ws.as_ref().expect("no active write session")
 }
 
-impl Drop for WriteSessionState {
-    /// Never leave a journal PUT running past the session: it could land
-    /// after the session's journal was deleted.
-    fn drop(&mut self) {
-        if let Some(write) = self.journal_write.take() {
-            let _ = write.handle.join();
-        }
-    }
+/// Mutably borrow the active write session from the `Repository::write_session` field.
+#[track_caller]
+pub(super) fn active_mut(ws: &mut Option<WriteSessionState>) -> &mut WriteSessionState {
+    ws.as_mut().expect("no active write session")
 }
 
 impl WriteSessionState {
@@ -242,24 +113,15 @@ impl WriteSessionState {
         max_in_flight_uploads: usize,
         hash_algo: HashAlgorithm,
     ) -> Self {
-        let (upload_done_tx, upload_done_rx) = crossbeam_channel::unbounded();
         Self {
+            journal: SessionJournal::new(),
             data_pack_writer: PackWriter::new(PackType::Data, data_target, hash_algo),
             tree_pack_writer: PackWriter::new(PackType::Tree, tree_target, hash_algo),
-            pending_uploads: Vec::new(),
-            upload_done_tx,
-            upload_done_rx,
-            next_upload_seq: 0,
-            max_in_flight_uploads,
-            cap_pending_upload_bytes: false,
+            uploads: UploadQueue::new(max_in_flight_uploads),
             stream_data_packs: false,
             dedup_index: None,
             tiered_dedup: None,
             index_delta: None,
-            pending_journal: PendingIndexJournal::new(),
-            pending_journal_last_written: 0,
-            pending_journal_written_rev: None,
-            journal_write: None,
             recovered_chunks: StdHashMap::new(),
             recovered_index_keys: Vec::new(), // only .index keys, never .json
             persisted_pack_count: 0,
@@ -268,13 +130,6 @@ impl WriteSessionState {
             rollback_tracker: None,
         }
     }
-
-    /// Return the storage key for this session's pending_index.
-    fn pending_index_key(&self) -> String {
-        session_index_key(&self.session_id)
-    }
-
-    // --- Upload management ---
 
     /// Run `upload` on a background thread and queue it for joining.
     /// `bytes` is the heap the upload holds until it returns.
@@ -287,69 +142,14 @@ impl WriteSessionState {
     ) where
         F: FnOnce() -> Result<()> + Send + 'static,
     {
-        let seq = self.next_upload_seq;
-        self.next_upload_seq += 1;
-        let done = UploadDone {
-            tx: self.upload_done_tx.clone(),
-            seq,
-        };
-        let handle = std::thread::spawn(move || {
-            let _done = done;
-            upload()
-        });
-        self.pending_uploads.push(PendingUpload {
-            seq,
-            pack_id,
-            journal_chunks,
-            journal: true,
-            bytes,
-            handle,
-        });
-    }
-
-    /// Block until any queued upload finishes, then join and journal it.
-    /// No-op when nothing is queued.
-    fn finish_any_upload(&mut self) -> Result<()> {
-        loop {
-            if self.pending_uploads.is_empty() {
-                return Ok(());
-            }
-            if let Some(i) = self
-                .pending_uploads
-                .iter()
-                .position(|u| u.handle.is_finished())
-            {
-                let upload = self.pending_uploads.swap_remove(i);
-                return self.finish_upload(upload);
-            }
-            // Every queued upload sends exactly once; messages from uploads
-            // already joined elsewhere are skipped.
-            let seq = self
-                .upload_done_rx
-                .recv()
-                .map_err(|_| VykarError::Other("upload completion channel closed".into()))?;
-            if let Some(i) = self.pending_uploads.iter().position(|u| u.seq == seq) {
-                let upload = self.pending_uploads.swap_remove(i);
-                return self.finish_upload(upload);
-            }
-        }
+        self.uploads.spawn(pack_id, journal_chunks, bytes, upload);
     }
 
     /// Join one upload and journal its pack if it succeeded and was not
     /// rolled back. A failed upload is never journaled.
     pub(crate) fn finish_upload(&mut self, upload: PendingUpload) -> Result<()> {
-        let PendingUpload {
-            pack_id,
-            journal_chunks,
-            journal,
-            handle,
-            ..
-        } = upload;
-        handle
-            .join()
-            .map_err(|_| VykarError::Other("pack upload thread panicked".into()))??;
-        if journal {
-            self.pending_journal.record_pack(pack_id, journal_chunks);
+        if let Some((pack_id, chunks)) = UploadQueue::finish(upload)? {
+            self.journal.entries.record_pack(pack_id, chunks);
         }
         Ok(())
     }
@@ -360,15 +160,9 @@ impl WriteSessionState {
         storage: &Arc<dyn StorageBackend>,
         crypto: &Arc<dyn CryptoEngine>,
     ) -> Result<()> {
-        let mut i = 0;
-        while let Some(slot) = self.pending_uploads.get(i) {
-            if slot.handle.is_finished() {
-                let upload = self.pending_uploads.swap_remove(i);
-                self.finish_upload(upload)?;
-            } else {
-                i += 1;
-            }
-        }
+        let journal = &mut self.journal.entries;
+        self.uploads
+            .drain_finished(|id, chunks| journal.record_pack(id, chunks))?;
         self.maybe_write_pending_index(storage, crypto);
         Ok(())
     }
@@ -383,7 +177,7 @@ impl WriteSessionState {
         // Final flush of journal before returning (best-effort). Skipped when
         // unchanged since the last successful write, so a repeated flush
         // (Phase 1 drain, then commit) does not PUT the journal twice.
-        if self.journal_needs_write() {
+        if self.journal.needs_write() {
             self.write_pending_index_best_effort(storage, crypto);
         }
         result
@@ -402,8 +196,8 @@ impl WriteSessionState {
         crypto: &Arc<dyn CryptoEngine>,
     ) -> Result<()> {
         let result = self.join_all_uploads();
-        if self.journal_needs_write() {
-            self.start_journal_write(storage, crypto);
+        if self.journal.needs_write() {
+            self.journal.start_write(&self.session_id, storage, crypto);
         }
         result
     }
@@ -411,25 +205,12 @@ impl WriteSessionState {
     /// Join every queued upload (journaling the successful ones) and any
     /// background journal write; the first upload error, if any.
     fn join_all_uploads(&mut self) -> Result<()> {
-        let mut first_err: Option<VykarError> = None;
-        for upload in std::mem::take(&mut self.pending_uploads) {
-            if let Err(e) = self.finish_upload(upload) {
-                first_err.get_or_insert(e);
-            }
-        }
-        // All joined, so all have sent: drop their stale completions.
-        while self.upload_done_rx.try_recv().is_ok() {}
+        let journal = &mut self.journal.entries;
+        let result = self
+            .uploads
+            .join_all(|id, chunks| journal.record_pack(id, chunks));
         self.join_journal_write();
-        match first_err {
-            Some(e) => Err(e),
-            None => Ok(()),
-        }
-    }
-
-    /// Whether the journal holds packs not yet in a successful write.
-    fn journal_needs_write(&self) -> bool {
-        !self.pending_journal.is_empty()
-            && self.pending_journal_written_rev != Some(self.pending_journal.revision())
+        result
     }
 
     /// Apply backpressure to keep the number of in-flight uploads bounded.
@@ -442,125 +223,45 @@ impl WriteSessionState {
         incoming: usize,
     ) -> Result<()> {
         self.drain_finished_uploads(storage, crypto)?;
-        if self.pending_uploads.len()
-            >= self
-                .max_in_flight_uploads
-                .saturating_add(UPLOAD_QUEUE_HEADROOM)
+        let journal = &mut self.journal.entries;
+        if self
+            .uploads
+            .wait_below_count_cap(|id, chunks| journal.record_pack(id, chunks))?
         {
-            // All slots + buffer full — wait for the first one to finish.
-            self.finish_any_upload()?;
             self.maybe_write_pending_index(storage, crypto);
         }
-        // Byte cap on sealed-but-unwritten packs. `incoming` is the buffer
-        // about to be sealed. The count limit above allows 4 sealed packs of
-        // up to the 192 MiB target each; when the disk falls behind, they
-        // pile up and peak RSS jumps by one pack per straggler. An empty
-        // queue never blocks, so one upload is always in flight.
-        if self.cap_pending_upload_bytes {
-            let cap = self.data_pack_writer.target_size();
-            let mut blocked = false;
-            while !self.pending_uploads.is_empty() {
-                let pending: usize = self.pending_uploads.iter().map(|u| u.bytes).sum();
-                if pending.saturating_add(incoming) <= cap {
-                    break;
-                }
-                // Wait for whichever queued upload finishes first.
-                self.finish_any_upload()?;
-                blocked = true;
-            }
-            if blocked {
-                self.maybe_write_pending_index(storage, crypto);
-            }
+        let cap = self.data_pack_writer.target_size();
+        let journal = &mut self.journal.entries;
+        if self
+            .uploads
+            .wait_below_byte_cap(incoming, cap, |id, chunks| journal.record_pack(id, chunks))?
+        {
+            self.maybe_write_pending_index(storage, crypto);
         }
         Ok(())
     }
 
-    /// Pipeline budget to lend to the upload queue: half the heap bytes of
-    /// sealed packs whose upload has not returned yet, beyond what the
-    /// upload slots themselves hold (`max_in_flight_uploads` packs of the
-    /// current data-pack target). The backup pipeline subtracts this from
-    /// its byte budget, so the slack queued behind a slow link is not held
-    /// a second time as processed pipeline output.
-    ///
-    /// Half, not all: the pipeline's lead is what refills the queue when an
-    /// upload returns. Lending the full slack measured -22% peak RSS but
-    /// +11% wall on REST at 40 ms RTT; half kept wall within 1.5%.
-    ///
-    /// Always 0 when the byte cap above already bounds the queue (local).
+    /// Pipeline budget to lend to the upload queue; see
+    /// `UploadQueue::slack_bytes`.
     pub(crate) fn upload_slack_bytes(&self) -> usize {
-        if self.cap_pending_upload_bytes {
-            return 0;
-        }
-        // A finished upload thread has already dropped its buffer.
-        let pending: usize = self
-            .pending_uploads
-            .iter()
-            .filter(|u| !u.handle.is_finished())
-            .map(|u| u.bytes)
-            .sum();
-        let in_slots = self
-            .max_in_flight_uploads
-            .saturating_mul(self.data_pack_writer.target_size());
-        pending.saturating_sub(in_slots) / 2
+        self.uploads
+            .slack_bytes(self.data_pack_writer.target_size())
     }
 
-    // --- Journal writes ---
-
-    /// Start a background journal write once `JOURNAL_WRITE_INTERVAL` new
-    /// packs are confirmed (debounced helper). While one is in flight, no
-    /// second one starts; the next call after it lands writes the newer
-    /// state. A failed write leaves its revision unwritten, so the next call
-    /// retries.
+    /// Start a background journal write once enough new packs are
+    /// confirmed; see `SessionJournal::maybe_write`.
     pub(crate) fn maybe_write_pending_index(
         &mut self,
         storage: &Arc<dyn StorageBackend>,
         crypto: &Arc<dyn CryptoEngine>,
     ) {
-        if let Some(write) = &self.journal_write {
-            if !write.handle.is_finished() {
-                return;
-            }
-            self.join_journal_write();
-        }
-        if self.pending_journal.len() >= self.pending_journal_last_written + JOURNAL_WRITE_INTERVAL
-        {
-            self.start_journal_write(storage, crypto);
-        }
-    }
-
-    /// Start writing the current journal state on a background thread.
-    /// The caller must have joined any previous write.
-    fn start_journal_write(
-        &mut self,
-        storage: &Arc<dyn StorageBackend>,
-        crypto: &Arc<dyn CryptoEngine>,
-    ) {
-        debug_assert!(self.journal_write.is_none());
-        let wire = self.pending_journal.to_wire();
-        let key = self.pending_index_key();
-        let storage = Arc::clone(storage);
-        let crypto = Arc::clone(crypto);
-        self.journal_write = Some(JournalWrite {
-            revision: self.pending_journal.revision(),
-            len: self.pending_journal.len(),
-            handle: std::thread::spawn(move || write_journal(&wire, &key, &*storage, &*crypto)),
-        });
+        self.journal.maybe_write(&self.session_id, storage, crypto);
     }
 
     /// Wait for the background journal write, if any, and record its
     /// outcome. Best-effort like every journal write: failures are logged.
     pub(crate) fn join_journal_write(&mut self) {
-        let Some(write) = self.journal_write.take() else {
-            return;
-        };
-        match write.handle.join() {
-            Ok(Ok(())) => {
-                self.pending_journal_last_written = write.len;
-                self.pending_journal_written_rev = Some(write.revision);
-            }
-            Ok(Err(e)) => warn!("failed to write pending_index: {e}"),
-            Err(_) => warn!("pending_index writer thread panicked"),
-        }
+        self.journal.join_write();
     }
 
     /// Serialize and write the pending index journal to storage.
@@ -570,33 +271,8 @@ impl WriteSessionState {
         storage: &dyn StorageBackend,
         crypto: &dyn CryptoEngine,
     ) {
-        self.join_journal_write();
-        if self.pending_journal.is_empty() {
-            return;
-        }
-        match self.write_pending_index(storage, crypto) {
-            Ok(()) => {
-                self.pending_journal_last_written = self.pending_journal.len();
-                self.pending_journal_written_rev = Some(self.pending_journal.revision());
-            }
-            Err(e) => {
-                warn!("failed to write pending_index: {e}");
-            }
-        }
-    }
-
-    /// Serialize, compress, encrypt, and write the pending index journal to storage.
-    fn write_pending_index(
-        &self,
-        storage: &dyn StorageBackend,
-        crypto: &dyn CryptoEngine,
-    ) -> Result<()> {
-        write_journal(
-            &self.pending_journal.to_wire(),
-            &self.pending_index_key(),
-            storage,
-            crypto,
-        )
+        self.journal
+            .write_best_effort(&self.session_id, storage, crypto);
     }
 
     // --- Sealed entry dispatch ---
@@ -652,254 +328,31 @@ impl WriteSessionState {
         }
     }
 
-    // --- Recovery ---
-
-    /// Recover chunk→pack mappings from previous interrupted sessions'
-    /// `pending_index` files. Scans all `.index` files under `sessions/`,
-    /// classifying each by its companion `.json` marker state.
-    ///
-    /// A journal is recoverable if it is **orphaned** (no companion `.json`)
-    /// or **stale** (companion `.json` has `last_refresh` older than 45 min).
-    /// Active sessions and sessions with unreadable markers are skipped.
-    ///
-    /// Must be called inside the repo lock, before `enable_tiered_dedup_mode()`.
-    /// Returns the total number of recovered chunk entries.
+    /// Recover chunk→pack mappings from interrupted sessions' journals into
+    /// this session; see `journal_recovery::recover_pending_index`.
     pub(crate) fn recover_pending_index(
         &mut self,
         storage: &dyn StorageBackend,
         crypto: &dyn CryptoEngine,
         chunk_index: &ChunkIndex,
     ) -> Result<PendingIndexRecovery> {
-        let all_keys = storage.list(SESSIONS_PREFIX)?;
-        let now = chrono::Utc::now();
-
-        // Collect .index keys, skip our own session.
-        let my_key = self.pending_index_key();
-        let index_keys: Vec<(String, String)> = all_keys
-            .iter()
-            .filter_map(|key| {
-                let session_id = key
-                    .strip_prefix(SESSIONS_PREFIX)
-                    .and_then(|s| s.strip_suffix(".index"))?;
-                Some((key.clone(), session_id.to_string()))
-            })
-            .filter(|(key, _)| *key != my_key)
-            .collect();
-
-        // Build the marker state map from .json keys. Only markers of the
-        // sessions collected above are ever consulted, so only those are
-        // fetched — a marker without a foreign journal (our own included)
-        // cannot change the outcome.
-        let journal_sessions: std::collections::HashSet<&str> =
-            index_keys.iter().map(|(_, id)| id.as_str()).collect();
-        let mut marker_states: StdHashMap<String, MarkerState> = StdHashMap::new();
-        for key in &all_keys {
-            let Some(session_id) = key
-                .strip_prefix(SESSIONS_PREFIX)
-                .and_then(|s| s.strip_suffix(".json"))
-            else {
-                continue;
-            };
-            if !journal_sessions.contains(session_id) {
-                continue;
-            }
-            let state = match storage.get(key) {
-                Ok(Some(data)) => match serde_json::from_slice::<SessionEntry>(&data) {
-                    Ok(entry) => {
-                        let ts = chrono::DateTime::parse_from_rfc3339(&entry.last_refresh).or_else(
-                            |_| chrono::DateTime::parse_from_rfc3339(&entry.registered_at),
-                        );
-                        match ts {
-                            Ok(ts) => {
-                                let age = now.signed_duration_since(ts.with_timezone(&chrono::Utc));
-                                if age.num_seconds() > SESSION_STALE_SECS {
-                                    MarkerState::Stale
-                                } else {
-                                    MarkerState::Active
-                                }
-                            }
-                            Err(_) => MarkerState::Unknown,
-                        }
-                    }
-                    Err(_) => MarkerState::Unknown,
-                },
-                _ => MarkerState::Unknown,
-            };
-            marker_states.insert(session_id.to_string(), state);
-        }
-
-        let mut total_recovered = 0usize;
-        let mut recovered_sessions = Vec::new();
-        for (index_key, session_id) in &index_keys {
-            match marker_states.get(session_id) {
-                None => {}                     // orphan — no .json, recoverable
-                Some(MarkerState::Stale) => {} // stale — recoverable
-                Some(MarkerState::Active) => continue,
-                Some(MarkerState::Unknown) => continue,
-            };
-
-            match self.recover_single_index(storage, crypto, chunk_index, index_key) {
-                Ok(RecoverResult::Ok(n)) => {
-                    self.recovered_index_keys.push(index_key.clone());
-                    recovered_sessions.push(session_id.clone());
-                    total_recovered += n;
-                }
-                Ok(RecoverResult::Corrupt) => {
-                    // Only delete the corrupt .index — never touch .json markers.
-                    // Session marker lifecycle is managed by deregister_session()
-                    // and cleanup_stale_sessions() (>45 min since last_refresh,
-                    // under maintenance lock).
-                    warn!(key = %index_key, "corrupt pending index journal, deleting");
-                    let _ = storage.delete(index_key);
-                }
-                Ok(RecoverResult::Legacy) => {
-                    warn!(
-                        key = %index_key,
-                        "discarding pending index journal from an older vykar version; \
-                         its chunks will be uploaded again"
-                    );
-                    let _ = storage.delete(index_key);
-                }
-                Ok(RecoverResult::NotFound | RecoverResult::UnknownVersion) => {}
-                Err(e) => {
-                    warn!(key = %index_key, error = %e, "failed to recover pending index, skipping");
-                }
-            }
-        }
-
-        if total_recovered > 0 {
-            warn!(
-                recovered_chunks = total_recovered,
-                journals = self.recovered_index_keys.len(),
-                "recovered pending index entries from interrupted sessions"
-            );
-        }
-        Ok(PendingIndexRecovery {
-            recovered_chunks: total_recovered,
-            recovered_sessions,
-        })
-    }
-
-    /// Attempt to recover a single session's pending index journal.
-    fn recover_single_index(
-        &mut self,
-        storage: &dyn StorageBackend,
-        crypto: &dyn CryptoEngine,
-        chunk_index: &ChunkIndex,
-        key: &str,
-    ) -> Result<RecoverResult> {
-        let data = match storage.get(key)? {
-            Some(d) => d,
-            None => return Ok(RecoverResult::NotFound),
-        };
-
-        let compressed = match unpack_object_expect_with_context(
-            &data,
-            ObjectType::PendingIndex,
-            PENDING_INDEX_OBJECT_CONTEXT,
+        journal_recovery::recover_pending_index(
+            storage,
             crypto,
-        ) {
-            Ok(c) => c,
-            Err(e) => {
-                warn!(key = %key, error = %e, "pending_index: decrypt failed");
-                return Ok(RecoverResult::Corrupt);
-            }
-        };
-
-        let serialized = match compress::decompress_metadata(&compressed) {
-            Ok(s) => s,
-            Err(e) => {
-                warn!(key = %key, error = %e, "pending_index: decompress failed");
-                return Ok(RecoverResult::Corrupt);
-            }
-        };
-
-        let wire = match decode_pending_journal(&serialized) {
-            Ok(DecodedJournal::V2(w)) => w,
-            Ok(DecodedJournal::Legacy) => return Ok(RecoverResult::Legacy),
-            Ok(DecodedJournal::Unknown(v)) => {
-                warn!(
-                    "pending_index {key}: journal version {v} not understood by this binary; \
-                     leaving it in place"
-                );
-                return Ok(RecoverResult::UnknownVersion);
-            }
-            Err(e) => {
-                warn!(key = %key, error = %e, "pending_index: deserialize failed");
-                return Ok(RecoverResult::Corrupt);
-            }
-        };
-
-        debug!(
-            key = %key,
-            packs = wire.len(),
-            "found pending index from interrupted session, verifying packs\u{2026}"
-        );
-
-        let accepted = verify_journal_packs(storage, &wire);
-
-        let mut recovered = 0usize;
-        let pack_count = wire.len();
-        for pack_entry in wire {
-            // Rejected packs were already logged by `verify_journal_packs`
-            // and are not re-seeded into this session's journal.
-            if !accepted.contains(&pack_entry.pack_id) {
-                continue;
-            }
-
-            for chunk in &pack_entry.chunks {
-                // Only add if not already in the chunk index (e.g. from a
-                // successful prior save that didn't delete pending_index).
-                if !chunk_index.contains(&chunk.chunk_id) {
-                    self.recovered_chunks.insert(
-                        chunk.chunk_id,
-                        RecoveredChunkEntry {
-                            stored_size: chunk.stored_size,
-                            pack_id: pack_entry.pack_id,
-                            pack_offset: chunk.pack_offset,
-                        },
-                    );
-                    recovered += 1;
-                }
-            }
-
-            // Seed journal so re-interruption preserves these entries.
-            self.pending_journal
-                .record_pack(pack_entry.pack_id, pack_entry.chunks);
-        }
-
-        debug!(
-            key = %key,
-            packs = pack_count,
-            recovered_chunks = recovered,
-            "recovered pending_index entries"
-        );
-        Ok(RecoverResult::Ok(recovered))
-    }
-
-    /// Best-effort delete of the session's pending index file from storage.
-    pub(crate) fn clear_pending_index(storage: &dyn StorageBackend, session_id: &str) {
-        let key = session_index_key(session_id);
-        match storage.delete(&key) {
-            Ok(()) => {
-                debug!(key = %key, "cleared pending_index from storage");
-            }
-            Err(e) => {
-                warn!(key = %key, "failed to clear pending_index: {e}");
-            }
-        }
+            chunk_index,
+            &self.session_id,
+            &mut RecoveryTarget {
+                recovered_chunks: &mut self.recovered_chunks,
+                recovered_index_keys: &mut self.recovered_index_keys,
+                journal: &mut self.journal.entries,
+            },
+        )
     }
 
     /// Delete recovered `.index` files from storage after successful commit.
-    /// Never deletes `.json` markers — their lifecycle is managed by
-    /// `deregister_session()` and `cleanup_stale_sessions()`.
-    /// Best-effort: logs on failure.
+    /// Never deletes `.json` markers. Best-effort: logs on failure.
     pub(crate) fn cleanup_recovered_indices(&mut self, storage: &dyn StorageBackend) {
-        for index_key in self.recovered_index_keys.drain(..) {
-            if let Err(e) = storage.delete(&index_key) {
-                warn!(key = %index_key, error = %e, "failed to delete recovered index journal");
-            }
-        }
+        journal_recovery::delete_recovered_indices(storage, &mut self.recovered_index_keys);
     }
 
     /// Promote a recovered chunk into the active dedup structure and index delta.
@@ -976,29 +429,28 @@ impl WriteSessionState {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::compress;
-    use crate::index::{ChunkIndex, PendingChunkEntry, PendingPackEntry};
-    use crate::repo::format::{pack_object_with_context, ObjectType};
-    use crate::repo::lock::{session_index_key, session_marker_key, SessionEntry};
+    use crate::index::{
+        decode_pending_journal, DecodedJournal, PendingIndexJournal, PendingPackEntry,
+    };
+    use crate::repo::format::{unpack_object_expect_with_context, ObjectType};
+    use crate::repo::lock::session_index_key;
+    use crate::repo::session_journal::{JOURNAL_WRITE_INTERVAL, PENDING_INDEX_OBJECT_CONTEXT};
+    use crate::repo::upload_queue::UPLOAD_QUEUE_HEADROOM;
     use crate::testutil::{init_test_environment, MemoryBackend, PackUploadBackend};
     use vykar_crypto::PlaintextEngine;
+    use vykar_types::error::VykarError;
 
     /// Create a PlaintextEngine for tests.
-    fn test_crypto() -> PlaintextEngine {
+    pub(in crate::repo) fn test_crypto() -> PlaintextEngine {
         PlaintextEngine::new(crate::testutil::chunk_hasher_for([0xAA; 32]))
-    }
-
-    #[derive(Clone, Copy)]
-    enum Wire {
-        V2,
-        Legacy,
     }
 
     /// A self-consistent pack: `PackId` is the hash of its bytes and its one
     /// chunk ends exactly at the end of the object.
-    fn fake_pack(seed: u8) -> (PackId, Vec<u8>, PendingPackEntry) {
+    pub(in crate::repo) fn fake_pack(seed: u8) -> (PackId, Vec<u8>, PendingPackEntry) {
         let data: Vec<u8> = (0..64u8).map(|i| i.wrapping_mul(seed)).collect();
         let pack_id = PackId::compute(&data, HashAlgorithm::Blake2b);
         let entry = PendingPackEntry {
@@ -1010,398 +462,6 @@ mod tests {
             }],
         };
         (pack_id, data, entry)
-    }
-
-    fn put_journal(
-        storage: &dyn StorageBackend,
-        crypto: &dyn CryptoEngine,
-        key: &str,
-        entries: &[PendingPackEntry],
-        wire: Wire,
-    ) {
-        let serialized = match wire {
-            Wire::V2 => encode_pending_journal(entries).unwrap(),
-            Wire::Legacy => rmp_serde::to_vec(entries).unwrap(),
-        };
-        put_journal_bytes(storage, crypto, key, &serialized);
-    }
-
-    fn put_journal_bytes(
-        storage: &dyn StorageBackend,
-        crypto: &dyn CryptoEngine,
-        key: &str,
-        serialized: &[u8],
-    ) {
-        let compressed =
-            compress::compress(compress::Compression::Zstd { level: 3 }, serialized).unwrap();
-        let packed = pack_object_with_context(
-            ObjectType::PendingIndex,
-            PENDING_INDEX_OBJECT_CONTEXT,
-            &compressed,
-            crypto,
-        )
-        .unwrap();
-        storage.put(key, &packed).unwrap();
-    }
-
-    /// Write a journal naming one intact pack (stored as well).
-    fn write_journal(
-        storage: &dyn StorageBackend,
-        crypto: &dyn CryptoEngine,
-        key: &str,
-        wire: Wire,
-    ) -> (PackId, ChunkId) {
-        let (pack_id, data, entry) = fake_pack(0x11);
-        storage.put(&pack_id.storage_key(), &data).unwrap();
-        let chunk_id = entry.chunks[0].chunk_id;
-        put_journal(storage, crypto, key, &[entry], wire);
-        (pack_id, chunk_id)
-    }
-
-    /// Write a valid (v2) pending index journal to storage at the given key.
-    /// Returns the PackId and ChunkId used.
-    fn write_valid_journal(
-        storage: &dyn StorageBackend,
-        crypto: &dyn CryptoEngine,
-        key: &str,
-    ) -> (PackId, ChunkId) {
-        write_journal(storage, crypto, key, Wire::V2)
-    }
-
-    fn recover_from(storage: &dyn StorageBackend) -> (WriteSessionState, PendingIndexRecovery) {
-        let crypto = test_crypto();
-        let mut ws = WriteSessionState::new(1024, 1024, 1, HashAlgorithm::Blake2b);
-        ws.session_id = "current".to_string();
-        let recovery = ws
-            .recover_pending_index(storage, &crypto, &ChunkIndex::new())
-            .unwrap();
-        (ws, recovery)
-    }
-
-    /// Write a session marker JSON with a specific last_refresh time.
-    fn write_session_marker(storage: &dyn StorageBackend, session_id: &str, last_refresh: &str) {
-        let key = session_marker_key(session_id);
-        let entry = SessionEntry {
-            hostname: "test".to_string(),
-            pid: 1234,
-            registered_at: last_refresh.to_string(),
-            last_refresh: last_refresh.to_string(),
-        };
-        let data = serde_json::to_vec(&entry).unwrap();
-        storage.put(&key, &data).unwrap();
-    }
-
-    fn stale_timestamp() -> String {
-        let stale = chrono::Utc::now() - chrono::Duration::hours(2);
-        stale.to_rfc3339()
-    }
-
-    fn fresh_timestamp() -> String {
-        chrono::Utc::now().to_rfc3339()
-    }
-
-    #[test]
-    fn recover_orphan_index_from_different_session() {
-        init_test_environment();
-        let storage = MemoryBackend::new();
-        let crypto = test_crypto();
-        let chunk_index = ChunkIndex::new();
-
-        // Write a valid journal for session "old" with no .json marker.
-        let index_key = session_index_key("old");
-        let (_pack_id, _chunk_id) = write_valid_journal(&storage, &crypto, &index_key);
-
-        // Create a WriteSessionState with a different session ID.
-        let mut ws = WriteSessionState::new(1024, 1024, 1, HashAlgorithm::Blake2b);
-        ws.session_id = "new".to_string();
-
-        let recovery = ws
-            .recover_pending_index(&storage, &crypto, &chunk_index)
-            .unwrap();
-        assert!(
-            recovery.recovered_chunks > 0,
-            "should recover chunks from orphan journal"
-        );
-        assert_eq!(recovery.recovered_sessions, vec!["old"]);
-        assert_eq!(ws.recovered_index_keys.len(), 1);
-        assert_eq!(ws.recovered_index_keys[0], index_key);
-    }
-
-    #[test]
-    fn recover_stale_index() {
-        init_test_environment();
-        let storage = MemoryBackend::new();
-        let crypto = test_crypto();
-        let chunk_index = ChunkIndex::new();
-
-        // Write a stale .json marker and companion .index.
-        write_session_marker(&storage, "stale", &stale_timestamp());
-        let index_key = session_index_key("stale");
-        write_valid_journal(&storage, &crypto, &index_key);
-
-        let mut ws = WriteSessionState::new(1024, 1024, 1, HashAlgorithm::Blake2b);
-        ws.session_id = "current".to_string();
-
-        let recovery = ws
-            .recover_pending_index(&storage, &crypto, &chunk_index)
-            .unwrap();
-        assert!(
-            recovery.recovered_chunks > 0,
-            "should recover chunks from stale session"
-        );
-        assert_eq!(recovery.recovered_sessions, vec!["stale"]);
-        assert_eq!(ws.recovered_index_keys.len(), 1);
-        assert_eq!(ws.recovered_index_keys[0], index_key);
-        // .json marker must NOT be tracked for deletion — it's managed by
-        // deregister_session() / cleanup_stale_sessions() only.
-        assert!(
-            storage.exists(&session_marker_key("stale")).unwrap(),
-            "stale .json marker must not be deleted by recovery"
-        );
-    }
-
-    #[test]
-    fn skip_active_session_index() {
-        init_test_environment();
-        let storage = MemoryBackend::new();
-        let crypto = test_crypto();
-        let chunk_index = ChunkIndex::new();
-
-        // Write an active (fresh) .json marker and companion .index.
-        write_session_marker(&storage, "active", &fresh_timestamp());
-        let index_key = session_index_key("active");
-        write_valid_journal(&storage, &crypto, &index_key);
-
-        let mut ws = WriteSessionState::new(1024, 1024, 1, HashAlgorithm::Blake2b);
-        ws.session_id = "current".to_string();
-
-        let recovery = ws
-            .recover_pending_index(&storage, &crypto, &chunk_index)
-            .unwrap();
-        assert_eq!(
-            recovery.recovered_chunks, 0,
-            "should skip active session's journal"
-        );
-        assert!(recovery.recovered_sessions.is_empty());
-        assert!(ws.recovered_index_keys.is_empty());
-    }
-
-    #[test]
-    fn skip_unknown_marker_session_index() {
-        init_test_environment();
-        let storage = MemoryBackend::new();
-        let crypto = test_crypto();
-        let chunk_index = ChunkIndex::new();
-
-        // Write invalid JSON as the session marker.
-        storage
-            .put(&session_marker_key("bad"), b"not valid json")
-            .unwrap();
-        let index_key = session_index_key("bad");
-        write_valid_journal(&storage, &crypto, &index_key);
-
-        let mut ws = WriteSessionState::new(1024, 1024, 1, HashAlgorithm::Blake2b);
-        ws.session_id = "current".to_string();
-
-        let recovery = ws
-            .recover_pending_index(&storage, &crypto, &chunk_index)
-            .unwrap();
-        assert_eq!(
-            recovery.recovered_chunks, 0,
-            "should skip session with unknown marker state"
-        );
-        assert!(recovery.recovered_sessions.is_empty());
-        assert!(ws.recovered_index_keys.is_empty());
-    }
-
-    /// Records every `get` key, to show which markers recovery fetches.
-    struct GetLoggingBackend {
-        inner: MemoryBackend,
-        gets: std::sync::Mutex<Vec<String>>,
-    }
-
-    impl vykar_storage::InnerBackend for GetLoggingBackend {
-        fn inner_backend(&self) -> &dyn StorageBackend {
-            &self.inner
-        }
-    }
-
-    vykar_storage::delegate_storage_backend! {
-        for GetLoggingBackend;
-        except [get];
-
-        fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
-            self.gets.lock().unwrap().push(key.to_string());
-            self.inner.get(key)
-        }
-    }
-
-    /// Recovery reads only the markers of foreign sessions that have a
-    /// journal; a marker without one (our own included) is never fetched,
-    /// and the stale / active classification of the others is unchanged.
-    #[test]
-    fn recovery_fetches_only_markers_with_foreign_journals() {
-        init_test_environment();
-        let storage = GetLoggingBackend {
-            inner: MemoryBackend::new(),
-            gets: Default::default(),
-        };
-        let crypto = test_crypto();
-        write_session_marker(&storage, "current", &fresh_timestamp());
-        write_session_marker(&storage, "other", &fresh_timestamp());
-        write_session_marker(&storage, "active", &fresh_timestamp());
-        write_valid_journal(&storage, &crypto, &session_index_key("active"));
-        write_session_marker(&storage, "stale", &stale_timestamp());
-        write_valid_journal(&storage, &crypto, &session_index_key("stale"));
-
-        let (ws, recovery) = recover_from(&storage);
-        assert_eq!(recovery.recovered_sessions, vec!["stale"]);
-        assert_eq!(ws.recovered_index_keys, vec![session_index_key("stale")]);
-
-        let gets = storage.gets.lock().unwrap().clone();
-        let mut markers: Vec<&String> = gets.iter().filter(|k| k.ends_with(".json")).collect();
-        markers.sort();
-        assert_eq!(
-            markers,
-            [&session_marker_key("active"), &session_marker_key("stale")],
-            "all GETs: {gets:?}"
-        );
-    }
-
-    #[test]
-    fn mixed_valid_and_corrupt_journals() {
-        init_test_environment();
-        let storage = MemoryBackend::new();
-        let crypto = test_crypto();
-        let chunk_index = ChunkIndex::new();
-
-        // Valid orphan journal.
-        let valid_key = session_index_key("valid");
-        write_valid_journal(&storage, &crypto, &valid_key);
-
-        // Corrupt orphan journal (random bytes).
-        let corrupt_key = session_index_key("corrupt");
-        storage.put(&corrupt_key, b"random garbage").unwrap();
-
-        let mut ws = WriteSessionState::new(1024, 1024, 1, HashAlgorithm::Blake2b);
-        ws.session_id = "current".to_string();
-
-        let recovery = ws
-            .recover_pending_index(&storage, &crypto, &chunk_index)
-            .unwrap();
-        assert!(
-            recovery.recovered_chunks > 0,
-            "should recover from the valid journal"
-        );
-        assert_eq!(recovery.recovered_sessions, vec!["valid"]);
-
-        // Valid journal tracked for cleanup.
-        assert_eq!(ws.recovered_index_keys.len(), 1);
-        assert_eq!(ws.recovered_index_keys[0], valid_key);
-
-        // Corrupt journal should have been deleted.
-        assert!(
-            !storage.exists(&corrupt_key).unwrap(),
-            "corrupt .index should be deleted"
-        );
-    }
-
-    #[test]
-    fn corrupt_stale_journal_deletes_index_preserves_json() {
-        init_test_environment();
-        let storage = MemoryBackend::new();
-        let crypto = test_crypto();
-        let chunk_index = ChunkIndex::new();
-
-        // Write a stale .json marker.
-        write_session_marker(&storage, "old", &stale_timestamp());
-        // Write a corrupt .index companion.
-        let index_key = session_index_key("old");
-        storage.put(&index_key, b"corrupt data").unwrap();
-
-        let mut ws = WriteSessionState::new(1024, 1024, 1, HashAlgorithm::Blake2b);
-        ws.session_id = "current".to_string();
-
-        let _recovered = ws
-            .recover_pending_index(&storage, &crypto, &chunk_index)
-            .unwrap();
-
-        // Corrupt .index should be deleted.
-        assert!(
-            !storage.exists(&index_key).unwrap(),
-            "corrupt .index should be deleted"
-        );
-        // .json marker must NOT be deleted — a live backup could still own it.
-        assert!(
-            storage.exists(&session_marker_key("old")).unwrap(),
-            "stale .json must not be deleted by recovery"
-        );
-    }
-
-    #[test]
-    fn zero_recovery_journals_tracked_for_cleanup() {
-        init_test_environment();
-        let storage = MemoryBackend::new();
-        let crypto = test_crypto();
-
-        // Write a valid orphan journal.
-        let index_key = session_index_key("old");
-        let (_pack_id, chunk_id) = write_valid_journal(&storage, &crypto, &index_key);
-
-        // Pre-populate the chunk index so recovery yields 0 new chunks.
-        let mut chunk_index = ChunkIndex::new();
-        chunk_index.add(chunk_id, 100, PackId::from_bytes([0x11; 32]), 0);
-
-        let mut ws = WriteSessionState::new(1024, 1024, 1, HashAlgorithm::Blake2b);
-        ws.session_id = "current".to_string();
-
-        let recovery = ws
-            .recover_pending_index(&storage, &crypto, &chunk_index)
-            .unwrap();
-        assert_eq!(recovery.recovered_chunks, 0, "all chunks already indexed");
-        assert_eq!(recovery.recovered_sessions, vec!["old"]);
-        // The journal should still be tracked for cleanup.
-        assert_eq!(
-            ws.recovered_index_keys.len(),
-            1,
-            "Ok(0) journal should be tracked for cleanup"
-        );
-    }
-
-    #[test]
-    fn cleanup_deletes_index_files_only() {
-        init_test_environment();
-        let storage = MemoryBackend::new();
-
-        // Simulate an orphan entry (index only, no json).
-        let orphan_index = session_index_key("orphan");
-        storage.put(&orphan_index, b"data").unwrap();
-
-        // Simulate a stale entry (both index and json exist in storage).
-        let stale_index = session_index_key("stale");
-        let stale_json = session_marker_key("stale");
-        storage.put(&stale_index, b"data").unwrap();
-        storage.put(&stale_json, b"data").unwrap();
-
-        let mut ws = WriteSessionState::new(1024, 1024, 1, HashAlgorithm::Blake2b);
-        ws.recovered_index_keys = vec![orphan_index.clone(), stale_index.clone()];
-
-        ws.cleanup_recovered_indices(&storage);
-
-        assert!(
-            !storage.exists(&orphan_index).unwrap(),
-            "orphan .index should be deleted"
-        );
-        assert!(
-            !storage.exists(&stale_index).unwrap(),
-            "stale .index should be deleted"
-        );
-        // .json marker must NOT be touched by cleanup.
-        assert!(
-            storage.exists(&stale_json).unwrap(),
-            "stale .json must not be deleted by cleanup"
-        );
-        assert!(ws.recovered_index_keys.is_empty(), "keys should be drained");
     }
 
     // ── Journal dirty guard ──────────────────────────────────────────────
@@ -1502,7 +562,8 @@ mod tests {
         let storage = JournalCountingBackend::new();
         let crypto = test_crypto();
         let mut ws = journal_session();
-        ws.pending_journal
+        ws.journal
+            .entries
             .record_pack(PackId::from_bytes([1; 32]), chunk(1));
 
         ws.wait_pending_uploads(&storage, &crypto).unwrap();
@@ -1515,7 +576,8 @@ mod tests {
         let storage = JournalCountingBackend::new();
         let crypto = test_crypto();
         let mut ws = journal_session();
-        ws.pending_journal
+        ws.journal
+            .entries
             .record_pack(PackId::from_bytes([1; 32]), chunk(1));
 
         storage
@@ -1535,12 +597,12 @@ mod tests {
         let mut ws = journal_session();
         let a = PackId::from_bytes([1; 32]);
         let b = PackId::from_bytes([2; 32]);
-        ws.pending_journal.record_pack(a, chunk(1));
+        ws.journal.entries.record_pack(a, chunk(1));
         ws.wait_pending_uploads(&storage, &crypto).unwrap();
 
         // Same length, different content.
-        ws.pending_journal.remove_pack(&a);
-        ws.pending_journal.record_pack(b, chunk(2));
+        ws.journal.entries.remove_pack(&a);
+        ws.journal.entries.record_pack(b, chunk(2));
         ws.wait_pending_uploads(&storage, &crypto).unwrap();
 
         assert_eq!(journal_puts(&storage), 2);
@@ -1556,17 +618,22 @@ mod tests {
         let dyn_storage: Arc<dyn StorageBackend> = storage.clone();
         let crypto: Arc<dyn CryptoEngine> = Arc::new(test_crypto());
         let mut ws = journal_session();
-        ws.pending_journal
+        ws.journal
+            .entries
             .record_pack(PackId::from_bytes([1; 32]), chunk(1));
 
         ws.wait_pending_uploads_journal_in_background(&dyn_storage, &crypto)
             .unwrap();
-        assert!(ws.journal_write.is_some(), "final write runs in background");
+        assert!(
+            ws.journal.write_in_flight(),
+            "final write runs in background"
+        );
         ws.wait_pending_uploads(&*storage, &*crypto).unwrap();
-        assert!(ws.journal_write.is_none());
+        assert!(!ws.journal.write_in_flight());
         assert_eq!(journal_puts(&storage), 1);
 
-        ws.pending_journal
+        ws.journal
+            .entries
             .record_pack(PackId::from_bytes([2; 32]), chunk(2));
         storage
             .fail_next
@@ -1584,7 +651,8 @@ mod tests {
 
     fn record_packs(ws: &mut WriteSessionState, seeds: std::ops::Range<u8>) {
         for b in seeds {
-            ws.pending_journal
+            ws.journal
+                .entries
                 .record_pack(PackId::from_bytes([b; 32]), chunk(b));
         }
     }
@@ -1600,17 +668,17 @@ mod tests {
         record_packs(&mut ws, 1..1 + JOURNAL_WRITE_INTERVAL as u8);
         ws.maybe_write_pending_index(&dyn_storage, &crypto);
         assert!(
-            ws.journal_write.is_some(),
+            ws.journal.write_in_flight(),
             "debounced write runs in background"
         );
         // Confirmed while the write is in flight: must still reach storage.
         record_packs(&mut ws, 100..100 + JOURNAL_WRITE_INTERVAL as u8);
 
         ws.wait_pending_uploads(&*storage, &*crypto).unwrap();
-        assert!(ws.journal_write.is_none());
+        assert!(!ws.journal.write_in_flight());
         assert_eq!(
-            ws.pending_journal_written_rev,
-            Some(ws.pending_journal.revision())
+            ws.journal.written_rev(),
+            Some(ws.journal.entries.revision())
         );
         assert_eq!(
             stored_pack_ids(&*storage, &*crypto).len(),
@@ -1633,14 +701,14 @@ mod tests {
         ws.maybe_write_pending_index(&dyn_storage, &crypto);
         ws.join_journal_write();
         assert_eq!(journal_puts(&storage), 0);
-        assert_eq!(ws.pending_journal_written_rev, None);
+        assert_eq!(ws.journal.written_rev(), None);
 
         ws.maybe_write_pending_index(&dyn_storage, &crypto);
         ws.join_journal_write();
         assert_eq!(journal_puts(&storage), 1);
         assert_eq!(
-            ws.pending_journal_written_rev,
-            Some(ws.pending_journal.revision())
+            ws.journal.written_rev(),
+            Some(ws.journal.entries.revision())
         );
     }
 
@@ -1658,175 +726,6 @@ mod tests {
         let back = PendingIndexJournal::from_wire(j.to_wire());
         assert_eq!(back.len(), 1);
         assert_eq!(back.to_wire()[0].pack_id, PackId::from_bytes([3; 32]));
-    }
-
-    // ── Recovery verification ────────────────────────────────────────────
-
-    #[test]
-    fn v2_journal_with_exact_length_is_recovered() {
-        init_test_environment();
-        let storage = MemoryBackend::new();
-        let crypto = test_crypto();
-        let (pack_id, chunk_id) =
-            write_journal(&storage, &crypto, &session_index_key("old"), Wire::V2);
-
-        let (ws, recovery) = recover_from(&storage);
-        assert_eq!(recovery.recovered_chunks, 1);
-        assert_eq!(ws.recovered_chunks[&chunk_id].pack_id, pack_id);
-        assert_eq!(ws.pending_journal.len(), 1, "recovered pack is re-seeded");
-    }
-
-    #[test]
-    fn v2_journal_with_short_pack_is_skipped_and_not_reseeded() {
-        init_test_environment();
-        let storage = MemoryBackend::new();
-        let crypto = test_crypto();
-        let (pack_id, data, entry) = fake_pack(0x11);
-        storage
-            .put(&pack_id.storage_key(), &data[..data.len() - 1])
-            .unwrap();
-        put_journal(
-            &storage,
-            &crypto,
-            &session_index_key("old"),
-            &[entry],
-            Wire::V2,
-        );
-
-        let (ws, recovery) = recover_from(&storage);
-        assert_eq!(recovery.recovered_chunks, 0);
-        assert!(ws.recovered_chunks.is_empty());
-        assert!(
-            ws.pending_journal.is_empty(),
-            "skipped pack must not be re-seeded"
-        );
-        // The journal itself was processed and will be cleaned up.
-        assert_eq!(recovery.recovered_sessions, vec!["old"]);
-    }
-
-    #[test]
-    fn v2_journal_trusts_length_without_reading_content() {
-        // Same-length but different bytes: v2 skips the content check.
-        init_test_environment();
-        let storage = MemoryBackend::new();
-        let crypto = test_crypto();
-        let (pack_id, mut data, entry) = fake_pack(0x11);
-        data[20] ^= 0xFF;
-        storage.put(&pack_id.storage_key(), &data).unwrap();
-        put_journal(
-            &storage,
-            &crypto,
-            &session_index_key("old"),
-            &[entry],
-            Wire::V2,
-        );
-
-        let (_ws, recovery) = recover_from(&storage);
-        assert_eq!(recovery.recovered_chunks, 1);
-    }
-
-    #[test]
-    fn legacy_journal_is_discarded_even_with_intact_pack() {
-        init_test_environment();
-        let storage = MemoryBackend::new();
-        let crypto = test_crypto();
-        let key = session_index_key("old");
-        write_journal(&storage, &crypto, &key, Wire::Legacy);
-
-        let (ws, recovery) = recover_from(&storage);
-        assert_eq!(recovery.recovered_chunks, 0);
-        assert!(recovery.recovered_sessions.is_empty());
-        assert!(ws.recovered_chunks.is_empty());
-        assert!(ws.pending_journal.is_empty());
-        assert!(!storage.exists(&key).unwrap(), "legacy journal is deleted");
-    }
-
-    #[test]
-    fn overflowing_pack_offset_is_skipped_without_panic() {
-        init_test_environment();
-        let storage = MemoryBackend::new();
-        let crypto = test_crypto();
-        let (pack_id, data, mut entry) = fake_pack(0x11);
-        storage.put(&pack_id.storage_key(), &data).unwrap();
-        entry.chunks[0].pack_offset = u64::MAX - 1;
-        put_journal(
-            &storage,
-            &crypto,
-            &session_index_key("old"),
-            &[entry],
-            Wire::V2,
-        );
-
-        let (_ws, recovery) = recover_from(&storage);
-        assert_eq!(recovery.recovered_chunks, 0);
-    }
-
-    /// `MemoryBackend` uses the default `list_sized` (no sizes); this wrapper
-    /// counts `size()` calls to prove the fallback path is taken.
-    struct SizeCountingBackend {
-        inner: MemoryBackend,
-        size_calls: std::sync::atomic::AtomicUsize,
-    }
-
-    impl vykar_storage::InnerBackend for SizeCountingBackend {
-        fn inner_backend(&self) -> &dyn StorageBackend {
-            &self.inner
-        }
-    }
-
-    vykar_storage::delegate_storage_backend! {
-        for SizeCountingBackend;
-        except [size];
-
-        fn size(&self, key: &str) -> Result<Option<u64>> {
-            self.size_calls
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            self.inner.size(key)
-        }
-    }
-
-    #[test]
-    fn unsized_listing_falls_back_to_size() {
-        init_test_environment();
-        let storage = SizeCountingBackend {
-            inner: MemoryBackend::new(),
-            size_calls: Default::default(),
-        };
-        let crypto = test_crypto();
-        write_journal(&storage, &crypto, &session_index_key("old"), Wire::V2);
-        assert!(storage
-            .list_sized("packs/")
-            .unwrap()
-            .iter()
-            .all(|o| o.size.is_none()));
-
-        let (_ws, recovery) = recover_from(&storage);
-        assert_eq!(recovery.recovered_chunks, 1);
-        assert_eq!(
-            storage.size_calls.load(std::sync::atomic::Ordering::SeqCst),
-            1
-        );
-    }
-
-    #[test]
-    fn unknown_journal_version_is_left_in_place() {
-        init_test_environment();
-        let storage = MemoryBackend::new();
-        let crypto = test_crypto();
-        let (pack_id, data, entry) = fake_pack(0x11);
-        storage.put(&pack_id.storage_key(), &data).unwrap();
-        let key = session_index_key("future");
-        let serialized = rmp_serde::to_vec(&(3u8, vec![entry])).unwrap();
-        put_journal_bytes(&storage, &crypto, &key, &serialized);
-
-        let (mut ws, recovery) = recover_from(&storage);
-        assert_eq!(recovery.recovered_chunks, 0);
-        assert!(recovery.recovered_sessions.is_empty());
-        assert!(!ws.recovered_index_keys.contains(&key));
-        assert!(storage.exists(&key).unwrap(), "kept after recovery");
-
-        ws.cleanup_recovered_indices(&storage);
-        assert!(storage.exists(&key).unwrap(), "kept after cleanup");
     }
 
     // ── Upload confirmation ──────────────────────────────────────────────
@@ -1877,12 +776,12 @@ mod tests {
         let release = gated_upload(&mut ws, &storage, 1, target);
         ws.cap_pending_uploads(&dyn_storage, &dyn_crypto, target)
             .unwrap();
-        assert_eq!(ws.pending_uploads.len(), 1);
+        assert_eq!(ws.uploads.len(), 1);
         release.send(()).unwrap();
         ws.wait_pending_uploads(&*storage, &crypto).unwrap();
 
         // Enabled: the same call waits for the queued pack to be written.
-        ws.cap_pending_upload_bytes = true;
+        ws.uploads.cap_pending_upload_bytes = true;
         let release = gated_upload(&mut ws, &storage, 2, target);
         let releaser = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(100));
@@ -1892,14 +791,14 @@ mod tests {
         ws.cap_pending_uploads(&dyn_storage, &dyn_crypto, target)
             .unwrap();
         assert!(start.elapsed() >= std::time::Duration::from_millis(100));
-        assert!(ws.pending_uploads.is_empty());
+        assert!(ws.uploads.is_empty());
         releaser.join().unwrap();
 
         // A pack that fits next to the queued one does not block.
         let release = gated_upload(&mut ws, &storage, 3, target / 4);
         ws.cap_pending_uploads(&dyn_storage, &dyn_crypto, target / 2)
             .unwrap();
-        assert_eq!(ws.pending_uploads.len(), 1);
+        assert_eq!(ws.uploads.len(), 1);
         release.send(()).unwrap();
         ws.wait_pending_uploads(&*storage, &crypto).unwrap();
 
@@ -1915,7 +814,7 @@ mod tests {
         )));
         let crypto = test_crypto();
         let mut ws = journal_session();
-        ws.max_in_flight_uploads = 2;
+        ws.uploads.max_in_flight_uploads = 2;
         let target = ws.data_pack_writer.target_size();
 
         // Within the slots: nothing to lend.
@@ -1934,7 +833,7 @@ mod tests {
             std::thread::yield_now();
         }
         // The local byte cap bounds the queue itself: never lend.
-        ws.cap_pending_upload_bytes = true;
+        ws.uploads.cap_pending_upload_bytes = true;
         assert_eq!(ws.upload_slack_bytes(), 0);
 
         for r in [r2, r3, r4] {
@@ -1958,7 +857,7 @@ mod tests {
         spawn_upload(&mut ws, &storage, 3);
 
         // What `flush_on_abort` does: join everything, warn on failure.
-        for upload in std::mem::take(&mut ws.pending_uploads) {
+        for upload in ws.uploads.take_all() {
             let _ = ws.finish_upload(upload);
         }
         ws.write_pending_index_best_effort(&*storage, &crypto);
@@ -1997,7 +896,7 @@ mod tests {
         let dyn_storage: Arc<dyn StorageBackend> = storage.clone();
         let dyn_crypto: Arc<dyn CryptoEngine> = Arc::new(test_crypto());
         let mut ws = journal_session();
-        let slots = ws.max_in_flight_uploads + UPLOAD_QUEUE_HEADROOM;
+        let slots = ws.uploads.max_in_flight_uploads + UPLOAD_QUEUE_HEADROOM;
         let mut gates: Vec<_> = (1..=slots as u8)
             .map(|seed| gated_upload(&mut ws, &storage, seed, 0))
             .collect();
@@ -2018,9 +917,10 @@ mod tests {
             .unwrap();
         returned.send(()).unwrap();
         assert!(start.elapsed() < std::time::Duration::from_secs(5));
-        assert_eq!(ws.pending_uploads.len(), slots - 1);
+        assert_eq!(ws.uploads.len(), slots - 1);
         let journaled: Vec<PackId> = ws
-            .pending_journal
+            .journal
+            .entries
             .to_wire()
             .iter()
             .map(|e| e.pack_id)
@@ -2029,6 +929,23 @@ mod tests {
 
         watchdog.join().unwrap();
         ws.wait_pending_uploads(&*storage, &crypto).unwrap();
-        assert_eq!(ws.pending_journal.len(), slots);
+        assert_eq!(ws.journal.entries.len(), slots);
+    }
+
+    /// Dropping the session joins a background journal write before the
+    /// session's other fields drop, so the write still lands.
+    #[test]
+    fn dropping_session_joins_background_journal_write() {
+        let backend = Arc::new(crate::repo::session_journal::tests::SlowPutBackend::new());
+        let storage: Arc<dyn StorageBackend> = backend.clone();
+        let crypto: Arc<dyn CryptoEngine> = Arc::new(test_crypto());
+        let mut ws = journal_session();
+        record_packs(&mut ws, 1..1 + JOURNAL_WRITE_INTERVAL as u8);
+        ws.maybe_write_pending_index(&storage, &crypto);
+        assert!(ws.journal.write_in_flight());
+
+        drop(ws);
+        assert!(backend.put_done.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(backend.inner.exists(&session_index_key("s1")).unwrap());
     }
 }

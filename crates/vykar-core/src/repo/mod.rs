@@ -1,10 +1,13 @@
 pub mod file_cache;
 pub mod format;
 pub mod identity;
+pub(crate) mod journal_recovery;
 pub mod lock;
 pub mod manifest;
 pub mod pack;
+pub(crate) mod session_journal;
 pub mod snapshot_cache;
+mod upload_queue;
 pub(crate) mod write_session;
 
 mod chunks;

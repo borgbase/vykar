@@ -1,8 +1,10 @@
 use tracing::{debug, warn};
 
+use super::journal_recovery::PendingIndexRecovery;
 use super::pack::{compute_data_pack_target, compute_tree_pack_target, PackType, PackWriter};
 use super::write_session::{
-    self, WriteSessionState, DEFAULT_SESSION_ID, INITIAL_MAX_IN_FLIGHT_UPLOADS,
+    active, active_mut, RollbackTracker, WriteSessionState, DEFAULT_SESSION_ID,
+    INITIAL_MAX_IN_FLIGHT_UPLOADS,
 };
 use super::Repository;
 use crate::config::ResourceLimitsConfig;
@@ -21,7 +23,7 @@ pub struct WriteSessionOptions {
     /// Bound on in-flight background pack uploads.
     pub max_in_flight_uploads: usize,
     /// Also bound sealed-but-unwritten packs by bytes
-    /// (see `WriteSessionState::cap_pending_upload_bytes`).
+    /// (see `UploadQueue::cap_pending_upload_bytes`).
     pub cap_upload_bytes: bool,
     /// Stream data packs to the backend while they fill
     /// (see `WriteSessionState::stream_data_packs`).
@@ -63,6 +65,18 @@ impl WriteSessionOptions {
 }
 
 impl Repository {
+    /// The active write session. Panics when none is active.
+    #[track_caller]
+    pub(super) fn ws(&self) -> &WriteSessionState {
+        active(&self.write_session)
+    }
+
+    /// The active write session, mutably. Panics when none is active.
+    #[track_caller]
+    pub(super) fn ws_mut(&mut self) -> &mut WriteSessionState {
+        active_mut(&mut self.write_session)
+    }
+
     /// Activate a write session.
     ///
     /// Creates a fresh `WriteSessionState` with pack targets computed from the
@@ -103,12 +117,9 @@ impl Repository {
     /// from [`Self::begin_write_session`] so backup's command dumps still run
     /// under the defaults.
     pub(crate) fn apply_upload_limits(&mut self, opts: &WriteSessionOptions) {
-        let ws = self
-            .write_session
-            .as_mut()
-            .expect("no active write session");
-        ws.max_in_flight_uploads = opts.max_in_flight_uploads.max(1);
-        ws.cap_pending_upload_bytes = opts.cap_upload_bytes;
+        let ws = self.ws_mut();
+        ws.uploads.max_in_flight_uploads = opts.max_in_flight_uploads.max(1);
+        ws.uploads.cap_pending_upload_bytes = opts.cap_upload_bytes;
     }
 
     /// Recompute pack-target state from `self.chunk_index`.
@@ -139,10 +150,11 @@ impl Repository {
 
     /// Apply backpressure to keep the number of in-flight uploads bounded.
     pub(super) fn cap_pending_uploads(&mut self, incoming: usize) -> Result<()> {
-        self.write_session
-            .as_mut()
-            .expect("no active write session")
-            .cap_pending_uploads(&self.storage, &self.crypto, incoming)
+        active_mut(&mut self.write_session).cap_pending_uploads(
+            &self.storage,
+            &self.crypto,
+            incoming,
+        )
     }
 
     /// Pipeline budget to lend to the upload queue (see
@@ -161,10 +173,7 @@ impl Repository {
     ///
     /// For 10M chunks this reduces steady-state memory from ~800 MB to ~450 MB.
     pub fn enable_dedup_mode(&mut self) {
-        let ws = self
-            .write_session
-            .as_mut()
-            .expect("no active write session");
+        let ws = active_mut(&mut self.write_session);
         if ws.dedup_index.is_some() {
             return; // already enabled
         }
@@ -186,10 +195,7 @@ impl Repository {
     /// existing `DedupIndex` HashMap path.
     pub fn enable_tiered_dedup_mode(&mut self) {
         {
-            let ws = self
-                .write_session
-                .as_ref()
-                .expect("no active write session");
+            let ws = self.ws();
             if ws.tiered_dedup.is_some() || ws.dedup_index.is_some() {
                 return; // already in a dedup mode
             }
@@ -215,10 +221,7 @@ impl Repository {
             // in this same cache instance (`bump_ref_*` in chunks.rs).
             let index_delta =
                 IndexDelta::with_cached_bumps(std::sync::Arc::clone(tiered.mmap_cache()));
-            let ws = self
-                .write_session
-                .as_mut()
-                .expect("write session active while enabling tiered dedup");
+            let ws = self.ws_mut();
             ws.tiered_dedup = Some(tiered);
             ws.index_delta = Some(index_delta);
         } else {
@@ -273,7 +276,7 @@ impl Repository {
         };
         let has_partial_packs =
             ws.data_pack_writer.has_pending() || ws.tree_pack_writer.has_pending();
-        if ws.pending_uploads.is_empty() && ws.pending_journal.is_empty() && !has_partial_packs {
+        if ws.uploads.is_empty() && ws.journal.entries.is_empty() && !has_partial_packs {
             return;
         }
 
@@ -299,20 +302,15 @@ impl Repository {
         }
 
         // Join all in-flight upload threads so packs land on storage.
-        let ws = self
-            .write_session
-            .as_mut()
-            .expect("write session active while flushing abort state");
-        for upload in std::mem::take(&mut ws.pending_uploads) {
+        let ws = self.ws_mut();
+        for upload in ws.uploads.take_all() {
             if let Err(e) = ws.finish_upload(upload) {
                 warn!("flush_on_abort: upload thread failed: {e}");
             }
         }
 
         // Write final pending_index so next run can recover.
-        self.write_session
-            .as_mut()
-            .expect("write session active while writing abort journal")
+        active_mut(&mut self.write_session)
             .write_pending_index_best_effort(&*self.storage, &*self.crypto);
 
         // Clear the session so Drop doesn't fire the debug_assert.
@@ -323,17 +321,18 @@ impl Repository {
     /// `pending_index` file. Verifies each pack exists before adding entries.
     ///
     /// Must be called inside the repo lock, before `enable_tiered_dedup_mode()`.
-    pub fn recover_pending_index(&mut self) -> Result<write_session::PendingIndexRecovery> {
-        self.write_session
-            .as_mut()
-            .expect("no active write session")
-            .recover_pending_index(&*self.storage, &*self.crypto, &self.chunk_index)
+    pub fn recover_pending_index(&mut self) -> Result<PendingIndexRecovery> {
+        active_mut(&mut self.write_session).recover_pending_index(
+            &*self.storage,
+            &*self.crypto,
+            &self.chunk_index,
+        )
     }
 
     /// Best-effort delete of the `pending_index` file from storage.
     /// Called from the backup command after `save_state()` succeeds.
     pub fn clear_pending_index(&self, session_id: &str) {
-        WriteSessionState::clear_pending_index(&*self.storage, session_id);
+        super::session_journal::clear_pending_index(&*self.storage, session_id);
     }
 
     // --- Rollback checkpoint API ---
@@ -356,10 +355,7 @@ impl Repository {
     )]
     pub(crate) fn begin_rollback_checkpoint(&mut self) -> Result<()> {
         {
-            let ws = self
-                .write_session
-                .as_ref()
-                .expect("no active write session");
+            let ws = self.ws();
             assert!(
                 ws.rollback_tracker.is_none(),
                 "begin_rollback_checkpoint called while another checkpoint is armed"
@@ -371,27 +367,19 @@ impl Repository {
         }
 
         // Force-flush the data pack writer to isolate the scope's data.
-        let has_pending = self
-            .write_session
-            .as_ref()
-            .expect("no active write session")
-            .data_pack_writer
-            .has_pending();
+        let has_pending = self.ws().data_pack_writer.has_pending();
         if has_pending {
             self.flush_writer_async(PackType::Data)?;
         }
 
-        let ws = self
-            .write_session
-            .as_mut()
-            .expect("no active write session");
+        let ws = self.ws_mut();
         let delta_checkpoint = ws
             .index_delta
             .as_mut()
             .expect("dedup mode implies index_delta is set")
             .checkpoint();
         let data_pack_target_size = ws.data_pack_writer.target_size();
-        ws.rollback_tracker = Some(write_session::RollbackTracker {
+        ws.rollback_tracker = Some(RollbackTracker {
             delta_checkpoint,
             dedup_inserts: Vec::new(),
             promoted_recovered: Vec::new(),
@@ -419,10 +407,7 @@ impl Repository {
     /// occurred since `begin_rollback_checkpoint()`. Packs already uploaded
     /// to storage become orphans cleaned by compact.
     pub(crate) fn abort_rollback_checkpoint(&mut self) {
-        let ws = self
-            .write_session
-            .as_mut()
-            .expect("no active write session");
+        let ws = self.ws_mut();
         let Some(tracker) = ws.rollback_tracker.take() else {
             return;
         };
@@ -451,14 +436,9 @@ impl Repository {
         // 4. Remove tracked packs from the pending journal, and keep uploads
         // still in flight from journaling them when they complete.
         for pack_id in &tracker.journal_pack_ids {
-            ws.pending_journal.remove_pack(pack_id);
+            ws.journal.entries.remove_pack(pack_id);
         }
-        let rolled_back: std::collections::HashSet<_> = tracker.journal_pack_ids.iter().collect();
-        for upload in &mut ws.pending_uploads {
-            if rolled_back.contains(&upload.pack_id) {
-                upload.journal = false;
-            }
-        }
+        ws.uploads.exclude_from_journal(&tracker.journal_pack_ids);
 
         // 5. Reset data pack writer (discards any partial pack buffer).
         // Carry the algorithm over from the writer being replaced rather than
@@ -471,10 +451,7 @@ impl Repository {
     /// Promote a recovered chunk into the active dedup structure and index delta.
     /// Returns the stored size if the chunk was in `recovered_chunks`, None otherwise.
     pub(super) fn promote_recovered_chunk(&mut self, chunk_id: &ChunkId) -> Option<u32> {
-        let (stored_size, index_modified) = self
-            .write_session
-            .as_mut()
-            .expect("no active write session")
+        let (stored_size, index_modified) = active_mut(&mut self.write_session)
             .promote_recovered_chunk(chunk_id, &mut self.chunk_index)?;
         if index_modified {
             self.index_dirty = true;
@@ -487,19 +464,12 @@ impl Repository {
 impl Repository {
     /// Current data pack target size in bytes (for testing).
     pub(crate) fn data_pack_target(&self) -> usize {
-        self.write_session
-            .as_ref()
-            .expect("no active write session")
-            .data_pack_writer
-            .target_size()
+        self.ws().data_pack_writer.target_size()
     }
 
     /// Enter tiered dedup mode over an explicit mmap cache (for testing).
     pub(crate) fn enable_tiered_dedup_mode_with(&mut self, cache: dedup_cache::MmapDedupCache) {
-        let ws = self
-            .write_session
-            .as_mut()
-            .expect("no active write session");
+        let ws = self.ws_mut();
         let tiered = TieredDedupIndex::new(cache);
         ws.index_delta = Some(IndexDelta::with_cached_bumps(std::sync::Arc::clone(
             tiered.mmap_cache(),
@@ -596,15 +566,15 @@ mod tests {
             let ws = repo.write_session.as_ref().unwrap();
             assert_eq!(ws.session_id, "abc");
             assert!(ws.stream_data_packs);
-            assert_eq!(ws.max_in_flight_uploads, 2);
-            assert!(!ws.cap_pending_upload_bytes);
+            assert_eq!(ws.uploads.max_in_flight_uploads, 2);
+            assert!(!ws.uploads.cap_pending_upload_bytes);
         }
         assert_eq!(repo.request_concurrency, 9);
 
         repo.apply_upload_limits(&opts);
         let ws = repo.write_session.as_ref().unwrap();
-        assert_eq!(ws.max_in_flight_uploads, 7);
-        assert!(ws.cap_pending_upload_bytes);
+        assert_eq!(ws.uploads.max_in_flight_uploads, 7);
+        assert!(ws.uploads.cap_pending_upload_bytes);
         repo.write_session = None;
     }
 
@@ -658,8 +628,8 @@ mod tests {
         repo.store_chunk(b"first pack chunk", Compression::None, PackType::Data)
             .unwrap();
         repo.flush_writer_async(PackType::Data).unwrap();
-        let pack_id = repo.write_session.as_ref().unwrap().pending_uploads[0].pack_id;
-        while !repo.write_session.as_ref().unwrap().pending_uploads[0]
+        let pack_id = repo.write_session.as_ref().unwrap().uploads.pending()[0].pack_id;
+        while !repo.write_session.as_ref().unwrap().uploads.pending()[0]
             .handle
             .is_finished()
         {
@@ -670,9 +640,10 @@ mod tests {
             .unwrap();
 
         let ws = repo.write_session.as_ref().unwrap();
-        assert!(ws.pending_uploads.is_empty());
+        assert!(ws.uploads.is_empty());
         assert!(ws
-            .pending_journal
+            .journal
+            .entries
             .to_wire()
             .iter()
             .any(|e| e.pack_id == pack_id));
@@ -721,7 +692,10 @@ mod tests {
         repo.flush_writer_async(PackType::Data).unwrap();
         let (pack_id, bytes) = {
             let ws = repo.write_session.as_ref().unwrap();
-            (ws.pending_uploads[0].pack_id, ws.pending_uploads[0].bytes)
+            (
+                ws.uploads.pending()[0].pack_id,
+                ws.uploads.pending()[0].bytes,
+            )
         };
         assert_eq!(bytes, 0, "a staged pack counts no heap bytes");
 
@@ -731,7 +705,8 @@ mod tests {
         assert_eq!(PackId::compute(&stored, repo.content_hash()), pack_id);
         let ws = repo.write_session.as_ref().unwrap();
         assert!(ws
-            .pending_journal
+            .journal
+            .entries
             .to_wire()
             .iter()
             .any(|e| e.pack_id == pack_id));
@@ -786,12 +761,12 @@ mod tests {
         repo.flush_writer_async(PackType::Data).unwrap();
         let pack_id = {
             let ws = repo.write_session.as_ref().unwrap();
-            assert_eq!(ws.pending_uploads.len(), 1);
+            assert_eq!(ws.uploads.len(), 1);
             assert!(
-                !ws.pending_uploads[0].handle.is_finished(),
+                !ws.uploads.pending()[0].handle.is_finished(),
                 "upload is gated"
             );
-            ws.pending_uploads[0].pack_id
+            ws.uploads.pending()[0].pack_id
         };
 
         repo.abort_rollback_checkpoint();
@@ -799,9 +774,10 @@ mod tests {
         repo.flush_packs().unwrap();
 
         let ws = repo.write_session.as_ref().unwrap();
-        assert!(ws.pending_uploads.is_empty());
+        assert!(ws.uploads.is_empty());
         assert!(
-            ws.pending_journal
+            ws.journal
+                .entries
                 .to_wire()
                 .iter()
                 .all(|e| e.pack_id != pack_id),

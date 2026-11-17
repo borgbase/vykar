@@ -1088,7 +1088,7 @@ fn run_against_repo(
                         drop(guard);
                         // All entries are in the persisted index now. Best-effort —
                         // a stale journal is harmless.
-                        crate::repo::write_session::WriteSessionState::clear_pending_index(
+                        crate::repo::session_journal::clear_pending_index(
                             storage.as_ref(),
                             &session_id,
                         );

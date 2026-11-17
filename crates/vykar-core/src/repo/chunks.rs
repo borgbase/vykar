@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use super::format::{pack_object_with_context, ObjectType};
 use super::pack::{self, compute_data_pack_target, PackType, SealedPack};
+use super::write_session::active_mut;
 use super::Repository;
 use crate::compress;
 use crate::index::dedup_cache::{DedupPrefilter, TieredHit};
@@ -49,10 +50,7 @@ impl Repository {
     pub fn bump_ref_if_exists(&mut self, chunk_id: &ChunkId) -> Option<u32> {
         // Check dedup modes (write session required).
         let in_dedup_mode = {
-            let ws = self
-                .write_session
-                .as_mut()
-                .expect("no active write session");
+            let ws = self.ws_mut();
             if let Some(ref tiered) = ws.tiered_dedup {
                 if let Some(hit) = tiered.find(chunk_id) {
                     if let Some(ref mut delta) = ws.index_delta {
@@ -96,10 +94,7 @@ impl Repository {
     /// Non-tiered: falls through to bump_ref_if_exists.
     pub fn bump_ref_prefilter_hit(&mut self, chunk_id: &ChunkId) -> Option<u32> {
         let is_tiered = {
-            let ws = self
-                .write_session
-                .as_mut()
-                .expect("no active write session");
+            let ws = self.ws_mut();
             if let Some(ref tiered) = ws.tiered_dedup {
                 if let Some(hit) = tiered.find_skip_filter(chunk_id) {
                     if let Some(ref mut delta) = ws.index_delta {
@@ -143,10 +138,7 @@ impl Repository {
         cache_position: u32,
         prefilter: &DedupPrefilter,
     ) -> Result<()> {
-        let ws = self
-            .write_session
-            .as_mut()
-            .expect("no active write session");
+        let ws = self.ws_mut();
         let tiered = ws
             .tiered_dedup
             .as_ref()
@@ -182,10 +174,7 @@ impl Repository {
     /// Non-tiered: falls through to bump_ref_if_exists.
     pub fn bump_ref_prefilter_miss(&mut self, chunk_id: &ChunkId) -> Option<u32> {
         let is_tiered = {
-            let ws = self
-                .write_session
-                .as_mut()
-                .expect("no active write session");
+            let ws = self.ws_mut();
             if let Some(ref tiered) = ws.tiered_dedup {
                 if let Some(stored_size) = tiered.session_new_stored_size(chunk_id) {
                     if let Some(ref mut delta) = ws.index_delta {
@@ -209,10 +198,7 @@ impl Repository {
 
     /// Check only pending pack writers (shared helper).
     fn bump_ref_pending(&mut self, chunk_id: &ChunkId) -> Option<u32> {
-        self.write_session
-            .as_mut()
-            .expect("no active write session")
-            .bump_ref_pending(chunk_id)
+        self.ws_mut().bump_ref_pending(chunk_id)
     }
 
     /// Inline false-positive path: compress + encrypt + commit a chunk whose ChunkId
@@ -251,10 +237,7 @@ impl Repository {
 
         // Add blob and check flush in a scoped borrow
         let should_flush = {
-            let ws = self
-                .write_session
-                .as_mut()
-                .expect("no active write session");
+            let ws = active_mut(&mut self.write_session);
             // Tree packs are small (<= 4 MiB) and stay on the heap.
             let (writer, stage) = match pack_type {
                 PackType::Data => (
@@ -272,11 +255,8 @@ impl Repository {
         } else {
             // Journal confirmed packs as soon as their upload finishes rather
             // than at the next seal, so a SIGKILL loses as little as possible.
-            let ws = self
-                .write_session
-                .as_mut()
-                .expect("no active write session");
-            if ws.pending_uploads.iter().any(|u| u.handle.is_finished()) {
+            let ws = active_mut(&mut self.write_session);
+            if ws.uploads.any_finished() {
                 ws.drain_finished_uploads(&self.storage, &self.crypto)?;
             }
         }
@@ -290,12 +270,11 @@ impl Repository {
         pack_id: vykar_types::pack_id::PackId,
         entries: Vec<pack::PackedChunkEntry>,
     ) {
-        if self
-            .write_session
-            .as_mut()
-            .expect("no active write session")
-            .apply_sealed_entries(pack_id, entries, &mut self.chunk_index)
-        {
+        if active_mut(&mut self.write_session).apply_sealed_entries(
+            pack_id,
+            entries,
+            &mut self.chunk_index,
+        ) {
             self.index_dirty = true;
         }
     }
@@ -310,10 +289,7 @@ impl Repository {
     pub(super) fn flush_writer_async(&mut self, pack_type: PackType) -> Result<()> {
         // Keep upload fan-out bounded to avoid excessive memory/thread pressure.
         let incoming = {
-            let ws = self
-                .write_session
-                .as_ref()
-                .expect("no active write session");
+            let ws = self.ws();
             match pack_type {
                 PackType::Data => ws.data_pack_writer.buffer_capacity(),
                 PackType::Tree => ws.tree_pack_writer.buffer_capacity(),
@@ -321,10 +297,7 @@ impl Repository {
         };
         self.cap_pending_uploads(incoming)?;
 
-        let ws = self
-            .write_session
-            .as_mut()
-            .expect("no active write session");
+        let ws = active_mut(&mut self.write_session);
         let SealedPack {
             pack_id,
             entries,
@@ -370,9 +343,7 @@ impl Repository {
         let bytes = data.capacity();
         let storage = Arc::clone(&self.storage);
         let key = pack_id.storage_key();
-        self.write_session
-            .as_mut()
-            .expect("write session active while flushing writer")
+        self.ws_mut()
             .spawn_upload(pack_id, journal_chunks, bytes, move || {
                 data.put_to(&*storage, &key)
             });
@@ -438,10 +409,7 @@ impl Repository {
             self.flush_writer_async(PackType::Tree)?;
         }
         // Wait for all background uploads to complete before returning.
-        let ws = self
-            .write_session
-            .as_mut()
-            .expect("write session active after pending writer flush");
+        let ws = active_mut(&mut self.write_session);
         if background_journal {
             ws.wait_pending_uploads_journal_in_background(&self.storage, &self.crypto)
         } else {

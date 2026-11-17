@@ -113,10 +113,7 @@ impl Repository {
     fn flush_and_take_session_delta(&mut self) -> Result<Option<IndexDelta>> {
         self.flush_packs()?;
 
-        let ws = self
-            .write_session
-            .as_mut()
-            .expect("no active write session");
+        let ws = self.ws_mut();
         ws.tiered_dedup.take();
         let delta = ws.index_delta.take();
         if delta.is_some() {
@@ -299,12 +296,7 @@ impl Repository {
         // All of these are reads under the commit lock; every write still
         // follows them. Results are judged in the old order: probe, flush,
         // snapshot list and name check, index.
-        let session_id = self
-            .write_session
-            .as_ref()
-            .expect("no active write session")
-            .session_id
-            .clone();
+        let session_id = self.ws().session_id.clone();
         let taken = self.flush_and_take_session_delta();
         let fetch_index = matches!(&taken, Ok(Some(delta)) if !delta.is_empty());
         let marker_key =

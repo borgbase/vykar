@@ -6,7 +6,7 @@ use vykar_types::error::{Result, VykarError};
 
 use crate::compress::Compression;
 use crate::repo::pack::PackType;
-use crate::repo::Repository;
+use crate::repo::{Repository, WriteSessionOptions};
 use crate::testutil::{init_test_environment, MemoryBackend, PutLog, RecordingBackend};
 
 fn repo_on_counting_backend() -> (Repository, PutLog) {
@@ -21,7 +21,8 @@ fn repo_on_counting_backend() -> (Repository, PutLog) {
         None,
     )
     .expect("init");
-    repo.begin_write_session().expect("begin write session");
+    repo.begin_write_session(&WriteSessionOptions::default())
+        .expect("begin write session");
     (repo, log)
 }
 
@@ -386,7 +387,8 @@ fn repo_with_cancelling_backend(
         None,
     )
     .expect("init");
-    repo.begin_write_session().expect("begin write session");
+    repo.begin_write_session(&WriteSessionOptions::default())
+        .expect("begin write session");
 
     let mut ids = Vec::with_capacity(packs);
     for i in 0..packs {

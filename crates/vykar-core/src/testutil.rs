@@ -9,7 +9,7 @@ use vykar_types::chunk_id::ChunkHasher;
 use vykar_types::hash::HashAlgorithm;
 
 use crate::config::ChunkerConfig;
-use crate::repo::{EncryptionMode, Repository};
+use crate::repo::{EncryptionMode, Repository, WriteSessionOptions};
 use vykar_storage::{delegate_storage_backend, InnerBackend, StorageBackend};
 use vykar_types::error::{Result, VykarError};
 
@@ -174,6 +174,15 @@ impl StorageBackend for MemoryBackend {
         Ok(())
     }
 
+    // Local, default width.
+    fn profile(&self) -> vykar_storage::BackendProfile {
+        vykar_storage::BackendProfile {
+            local: true,
+            staged_put: false,
+            request_width: 2,
+        }
+    }
+
     vykar_storage::unsupported_server_ops!();
 }
 
@@ -190,7 +199,7 @@ pub fn test_repo_plaintext() -> Repository {
         None,
     )
     .expect("failed to init test repo");
-    repo.begin_write_session()
+    repo.begin_write_session(&WriteSessionOptions::default())
         .expect("failed to begin write session");
     repo
 }
@@ -283,7 +292,7 @@ impl InnerBackend for RecordingBackend {
 
 delegate_storage_backend! {
     for RecordingBackend;
-    except [put, get_range, get_range_into, open_range, put_owned, begin_staged_put];
+    except [put, get_range, get_range_into, open_range, put_owned, begin_staged_put, profile];
 
     // Keep packs on the intercepted `put` path. Recorded puts must see every pack.
     fn begin_staged_put(
@@ -291,6 +300,13 @@ delegate_storage_backend! {
         _prefix: &str,
     ) -> Result<Option<Box<dyn vykar_storage::StagedPut>>> {
         Ok(None)
+    }
+
+    fn profile(&self) -> vykar_storage::BackendProfile {
+        vykar_storage::BackendProfile {
+            staged_put: false,
+            ..self.inner.profile()
+        }
     }
 
     fn put(&self, key: &str, data: &[u8]) -> Result<()> {
@@ -367,7 +383,7 @@ impl InnerBackend for PackUploadBackend {
 
 delegate_storage_backend! {
     for PackUploadBackend;
-    except [put_owned, begin_staged_put];
+    except [put_owned, begin_staged_put, profile];
 
     // Keep packs on the intercepted `put` path. Gating and fault injection act on `put_owned`.
     fn begin_staged_put(
@@ -375,6 +391,13 @@ delegate_storage_backend! {
         _prefix: &str,
     ) -> Result<Option<Box<dyn vykar_storage::StagedPut>>> {
         Ok(None)
+    }
+
+    fn profile(&self) -> vykar_storage::BackendProfile {
+        vykar_storage::BackendProfile {
+            staged_put: false,
+            ..self.inner.profile()
+        }
     }
 
     fn put_owned(&self, key: &str, data: Vec<u8>) -> Result<()> {
@@ -441,7 +464,7 @@ impl InnerBackend for HookBackend {
 
 delegate_storage_backend! {
     for HookBackend;
-    except [put, delete, list, put_owned, begin_staged_put, list_sized];
+    except [put, delete, list, put_owned, begin_staged_put, list_sized, profile];
 
     // Keep packs on the intercepted `put` path. Hooks fire on `put`.
     fn begin_staged_put(
@@ -449,6 +472,13 @@ delegate_storage_backend! {
         _prefix: &str,
     ) -> Result<Option<Box<dyn vykar_storage::StagedPut>>> {
         Ok(None)
+    }
+
+    fn profile(&self) -> vykar_storage::BackendProfile {
+        vykar_storage::BackendProfile {
+            staged_put: false,
+            ..self.inner.profile()
+        }
     }
 
     fn put(&self, key: &str, data: &[u8]) -> Result<()> {

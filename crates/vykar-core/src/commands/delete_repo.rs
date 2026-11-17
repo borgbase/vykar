@@ -53,7 +53,7 @@ pub fn run(config: &VykarConfig) -> Result<DeleteRepoStats> {
 
     let parsed = parse_repo_url(&config.repository.url)?;
     let mut root_removed = false;
-    let is_local = parsed.is_local();
+    let is_local = backend.profile().local;
 
     if let ParsedUrl::Local { path } = parsed {
         let repo_path = Path::new(&path);

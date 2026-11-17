@@ -73,6 +73,14 @@ mod tests {
             Ok(())
         }
 
+        fn profile(&self) -> vykar_storage::BackendProfile {
+            vykar_storage::BackendProfile {
+                local: false,
+                staged_put: false,
+                request_width: 1,
+            }
+        }
+
         vykar_storage::unsupported_server_ops!();
     }
 

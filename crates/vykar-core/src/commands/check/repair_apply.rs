@@ -6,7 +6,7 @@ use crate::compress::Compression;
 use crate::index::ChunkIndexEntry;
 use crate::repo::format::{pack_object_with_context, ObjectType};
 use crate::repo::manifest::SnapshotEntry;
-use crate::repo::Repository;
+use crate::repo::{Repository, WriteSessionOptions};
 use crate::snapshot::item::ItemType;
 use crate::snapshot::SnapshotMeta;
 use vykar_storage::StorageBackend;
@@ -61,7 +61,7 @@ fn apply_item_level_rewrites(
     }
 
     // 1. Begin a write session so store_chunk can pack new tree chunks.
-    repo.begin_write_session()?;
+    repo.begin_write_session(&WriteSessionOptions::default())?;
 
     // 2. Prepare each rewrite (defer all PUT/DELETE until after Step 4 of
     //    this routine, mirroring commit_prepare → PUT ordering).
@@ -611,6 +611,14 @@ mod tests {
         }
         fn create_dir(&self, _key: &str) -> vykar_types::error::Result<()> {
             Ok(())
+        }
+
+        fn profile(&self) -> vykar_storage::BackendProfile {
+            vykar_storage::BackendProfile {
+                local: false,
+                staged_put: false,
+                request_width: 1,
+            }
         }
 
         vykar_storage::unsupported_server_ops!();

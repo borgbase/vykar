@@ -6,7 +6,7 @@ use crate::commands::util::with_repo_lock;
 use crate::compress::Compression;
 use crate::config::{ChunkerConfig, RepositoryConfig};
 use crate::repo::pack::PackType;
-use crate::repo::{EncryptionMode, Repository};
+use crate::repo::{EncryptionMode, Repository, WriteSessionOptions};
 use vykar_storage::StorageBackend;
 use vykar_types::error::{Result, VykarError};
 
@@ -100,6 +100,14 @@ impl StorageBackend for AdvisoryLockBackend {
         Ok(())
     }
 
+    fn profile(&self) -> vykar_storage::BackendProfile {
+        vykar_storage::BackendProfile {
+            local: false,
+            staged_put: false,
+            request_width: 1,
+        }
+    }
+
     vykar_storage::unsupported_server_ops!();
 }
 
@@ -167,7 +175,7 @@ fn with_repo_lock_flushes_pending_state_on_action_error() {
 
     let result: Result<()> = with_repo_lock(&mut repo, |repo| {
         // Begin a write session, store enough to trigger a pack flush, then fail.
-        repo.begin_write_session()?;
+        repo.begin_write_session(&WriteSessionOptions::default())?;
         repo.store_chunk(&vec![0xABu8; 300], Compression::None, PackType::Data)?;
         Err(VykarError::Other("simulated backup failure".into()))
     });

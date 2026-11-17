@@ -19,7 +19,7 @@ use tracing::{debug, info, warn};
 
 use super::util::check_interrupted;
 use crate::compress::Compression;
-use crate::config::{ChunkerConfig, CommandDump, VykarConfig};
+use crate::config::{ChunkerConfig, CommandDump, ResourceLimitsConfig, VykarConfig};
 use std::sync::Arc;
 
 use crate::limits;
@@ -31,11 +31,12 @@ use crate::repo::format::{pack_object_with_context, ObjectType};
 use crate::repo::lock;
 use crate::repo::manifest::SnapshotEntry;
 use crate::repo::pack::PackType;
-use crate::repo::Repository;
+use crate::repo::{Repository, WriteSessionOptions};
 use crate::snapshot::item::Item;
 use crate::snapshot::{SnapshotMeta, SnapshotStats};
 use crate::storage;
 use vykar_common::display::{format_bytes, format_count};
+use vykar_storage::BackendProfile;
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
 use vykar_types::snapshot_id::SnapshotId;
@@ -473,10 +474,35 @@ struct Prepared<'a> {
     max_pending_transform_bytes: usize,
     max_pending_file_actions: usize,
     upload_concurrency: usize,
-    is_local: bool,
+}
+
+/// Transform worker setup, sized to the backend.
+struct Workers {
     num_workers: usize,
     use_pipeline: bool,
     transform_pool: Option<rayon::ThreadPool>,
+}
+
+fn resolve_workers(limits: &ResourceLimitsConfig, profile: BackendProfile) -> Result<Workers> {
+    // Resolve effective worker count before building the rayon pool so we
+    // can right-size it in pipeline mode (avoids 2× thread oversubscription).
+    let num_workers = limits.effective_backup_threads(profile.local);
+
+    // Pipeline mode when we have more than 1 worker thread.
+    let use_pipeline = num_workers > 1;
+
+    let transform_pool = if use_pipeline {
+        // Pipeline mode doesn't need a rayon pool (no inline large-file processing).
+        None
+    } else {
+        sequential::build_transform_pool(num_workers)?
+    };
+
+    Ok(Workers {
+        num_workers,
+        use_pipeline,
+        transform_pool,
+    })
 }
 
 fn prepare<'a>(config: &VykarConfig, req: &BackupRequest<'a>) -> Result<Prepared<'a>> {
@@ -521,22 +547,6 @@ fn prepare<'a>(config: &VykarConfig, req: &BackupRequest<'a>) -> Result<Prepared
         warn!("could not apply limits.nice={}: {e}", config.limits.nice);
     }
 
-    // Resolve effective worker count before building the rayon pool so we
-    // can right-size it in pipeline mode (avoids 2× thread oversubscription).
-    let is_local =
-        vykar_storage::parse_repo_url(&config.repository.url).is_ok_and(|u| u.is_local());
-    let num_workers = config.limits.effective_backup_threads(is_local);
-
-    // Pipeline mode when we have more than 1 worker thread.
-    let use_pipeline = num_workers > 1;
-
-    let transform_pool = if use_pipeline {
-        // Pipeline mode doesn't need a rayon pool (no inline large-file processing).
-        None
-    } else {
-        sequential::build_transform_pool(num_workers)?
-    };
-
     Ok(Prepared {
         xattrs_enabled,
         exclude_patterns,
@@ -544,10 +554,6 @@ fn prepare<'a>(config: &VykarConfig, req: &BackupRequest<'a>) -> Result<Prepared
         max_pending_transform_bytes: config.limits.transform_batch_bytes(),
         max_pending_file_actions: config.limits.max_pending_actions(),
         upload_concurrency: config.limits.upload_concurrency(),
-        is_local,
-        num_workers,
-        use_pipeline,
-        transform_pool,
     })
 }
 
@@ -577,10 +583,6 @@ fn run_against_repo(
         max_pending_transform_bytes,
         max_pending_file_actions,
         upload_concurrency,
-        is_local,
-        num_workers,
-        use_pipeline,
-        transform_pool,
     } = prepared;
     let exclude_patterns: &[String] = &exclude_patterns;
 
@@ -590,9 +592,16 @@ fn run_against_repo(
         Some(wrap) => wrap(backend),
         None => backend,
     };
+    let profile = backend.profile();
+    let Workers {
+        num_workers,
+        use_pipeline,
+        transform_pool,
+    } = resolve_workers(&config.limits, profile)?;
 
     // Generate a unique session ID for this backup.
     let session_id = format!("{:032x}", rand::random::<u128>());
+    let session_opts = WriteSessionOptions::for_backup(session_id.clone(), profile, &config.limits);
 
     // ── Phase 1: Register session and upload (no lock) ──────────────────
     //
@@ -621,10 +630,7 @@ fn run_against_repo(
     let opts = super::util::with_identity_context(opts, config);
     let open_result = Repository::open(backend, passphrase, cache_dir, opts);
     let mut repo = match open_result {
-        Ok(mut r) => {
-            // Commit-time pack verification may overlap its read-only requests
-            // up to the backend's listing width (the warm HTTP pool).
-            r.set_request_concurrency(config.limits.listing_concurrency(!is_local));
+        Ok(r) => {
             if let Err(e) = super::util::verify_repo_identity(config, &r) {
                 if let Ok(cleanup) = storage::backend_from_config(&config.repository, 1) {
                     lock::deregister_session(cleanup.as_ref(), &session_id);
@@ -685,13 +691,10 @@ fn run_against_repo(
             return Err(VykarError::SnapshotAlreadyExists(snapshot_name.into()));
         }
 
-        // Activate write session with per-session pending_index.
-        repo.begin_write_session()?;
-        repo.set_write_session_id(session_id.clone());
-        // Data packs go straight to a temp file in the repository where the
-        // backend can do that (local), instead of holding up to two pack
-        // buffers (filling + sealed) on the heap. Other backends ignore it.
-        repo.set_stream_data_packs(true);
+        // Activate write session with per-session pending_index. Commit-time
+        // pack verification may overlap its read-only requests up to the
+        // backend's request width (the warm HTTP pool).
+        repo.begin_write_session(&session_opts)?;
 
         // Recover chunk→pack mappings from a previous interrupted session.
         match repo.recover_pending_index() {
@@ -838,12 +841,11 @@ fn run_against_repo(
             time_start,
         )?;
 
-        // Apply configurable upload concurrency.
-        repo.set_max_in_flight_uploads(upload_concurrency);
-        // Local writes gain little from queueing several sealed packs, and
-        // each one holds a full pack buffer. Remote backends keep the count
-        // limit only, so slow round trips still overlap.
-        repo.set_cap_pending_upload_bytes(is_local);
+        // Apply configurable upload concurrency. Local writes gain little
+        // from queueing several sealed packs, and each one holds a full pack
+        // buffer. Remote backends keep the count limit only, so slow round
+        // trips still overlap.
+        repo.apply_upload_limits(&session_opts);
 
         let pipeline_depth = config.limits.effective_pipeline_depth();
         let pipeline_buffer_bytes = config.limits.pipeline_buffer_for_workers(num_workers);

@@ -2,7 +2,7 @@
 //! "unsupported" bodies for leaves.
 //!
 //! Every wrapper that holds an inner backend (rate limiter, test recorder, the
-//! `Arc<dyn StorageBackend>` coercion impl) has to forward all 21 trait methods,
+//! `Arc<dyn StorageBackend>` coercion impl) has to forward all 22 trait methods,
 //! and hand-written forwards rot — a forgotten one disabled server-side pack
 //! verification and server init on any throttled REST repo.
 //!
@@ -11,13 +11,14 @@
 //! * [`crate::delegate_storage_backend!`] holds the forwarding inventory in one
 //!   place. A wrapper implements [`InnerBackend`], names the methods it writes by
 //!   hand, and gets forwards for the rest.
-//! * The trait's eight capability methods (`remove_stale_temp_files`,
+//! * The trait's nine capability methods (`remove_stale_temp_files`,
 //!   `server_repack`, `batch_delete_keys`, `server_verify_packs`, `server_init`,
-//!   `bind_content_hash`, `server_capabilities`, `object_sizes`) have **no
-//!   defaults**, so the inventory cannot silently fall behind the trait:
-//!   adding a ninth breaks every impl, this macro included, until it is
+//!   `bind_content_hash`, `server_capabilities`, `object_sizes`, `profile`)
+//!   have **no defaults**, so the inventory cannot silently fall behind the
+//!   trait: adding a tenth breaks every impl, this macro included, until it is
 //!   handled. Leaves get bodies
-//!   for the ones they do not implement from [`crate::unsupported_server_ops!`].
+//!   for the ones they do not implement from [`crate::unsupported_server_ops!`]
+//!   (all but `profile`).
 //!
 //! What is *not* guarded: a new method with a default body. Wrappers would
 //! inherit it, which is safe by construction for the defaults that exist today
@@ -57,6 +58,8 @@ pub mod __macro_support {
 /// Used inside an `impl StorageBackend for _` block. `except [...]` names the
 /// ones the backend does implement itself, in trait-declaration order — same
 /// convention as [`crate::delegate_storage_backend!`].
+///
+/// Does not supply `profile`: every backend states its own.
 ///
 /// ```text
 /// impl StorageBackend for LocalBackend {
@@ -229,12 +232,36 @@ macro_rules! delegate_storage_backend {
                  put_owned begin_staged_put size list_sized remove_stale_temp_files
                  server_repack batch_delete_keys
                  server_verify_packs server_init bind_content_hash
-                 server_capabilities object_sizes]
+                 server_capabilities object_sizes profile]
                 [$($except)*]);
         }
         $crate::delegate_storage_backend!(@check_list [$($except)*] [] []);
         $crate::delegate_storage_backend!(@check_put [$($except)*] [] []);
         $crate::delegate_storage_backend!(@check_range [$($except)*] [] []);
+        $crate::delegate_storage_backend!(@check_staged [$($except)*] [] []);
+    };
+
+    // ── Guard: overriding `begin_staged_put` requires `profile` ───────────
+    //
+    // A forwarded `profile` reports the inner backend's `staged_put`, which
+    // is wrong for a wrapper that answers `begin_staged_put` itself.
+
+    (@check_staged [] [] $profile:tt) => {};
+    (@check_staged [] [begin_staged_put] [profile]) => {};
+    (@check_staged [] [begin_staged_put] []) => {
+        compile_error!(
+            "delegate_storage_backend!: a wrapper that overrides `begin_staged_put` \
+             must also override `profile`, so `staged_put` matches what it returns"
+        );
+    };
+    (@check_staged [begin_staged_put $($rest:ident)*] [] $profile:tt) => {
+        $crate::delegate_storage_backend!(@check_staged [$($rest)*] [begin_staged_put] $profile);
+    };
+    (@check_staged [profile $($rest:ident)*] $staged:tt []) => {
+        $crate::delegate_storage_backend!(@check_staged [$($rest)*] $staged [profile]);
+    };
+    (@check_staged [$other:ident $($rest:ident)*] $staged:tt $profile:tt) => {
+        $crate::delegate_storage_backend!(@check_staged [$($rest)*] $staged $profile);
     };
 
     // ── Guard: overriding `get_range_into` requires `open_range` ──────────
@@ -579,6 +606,16 @@ macro_rules! delegate_storage_backend {
         }
         $crate::delegate_storage_backend!(@forward [$($rest)*] [$($except)*]);
     };
+
+    (@forward [profile $($rest:ident)*] [profile $($except:ident)*]) => {
+        $crate::delegate_storage_backend!(@forward [$($rest)*] [$($except)*]);
+    };
+    (@forward [profile $($rest:ident)*] [$($except:ident)*]) => {
+        fn profile(&self) -> $crate::BackendProfile {
+            $crate::InnerBackend::inner_backend(self).profile()
+        }
+        $crate::delegate_storage_backend!(@forward [$($rest)*] [$($except)*]);
+    };
 }
 
 #[cfg(test)]
@@ -716,6 +753,14 @@ mod tests {
             self.hit();
             Ok(vec![None; keys.len()])
         }
+        fn profile(&self) -> crate::BackendProfile {
+            self.hit();
+            crate::BackendProfile {
+                local: false,
+                staged_put: false,
+                request_width: 3,
+            }
+        }
     }
 
     struct Wrapper {
@@ -743,7 +788,7 @@ mod tests {
     ///
     /// This covers the methods that *have* trait defaults — for those a
     /// forgotten forward compiles, so only a call-count assertion catches it.
-    /// The eight capability methods are covered by the compiler instead (no
+    /// The nine capability methods are covered by the compiler instead (no
     /// default ⇒ a missing forward is an error), which is what keeps the
     /// inventory from drifting behind the trait.
     #[test]
@@ -789,8 +834,9 @@ mod tests {
             .unwrap();
         w.server_capabilities().unwrap();
         w.object_sizes(&["packs/00/k".into()]).unwrap();
+        assert_eq!(w.profile().request_width, 3);
 
-        // 21 trait methods, 20 of them forwarded.
-        assert_eq!(w.inner.calls.load(Ordering::SeqCst), 20);
+        // 22 trait methods, 21 of them forwarded.
+        assert_eq!(w.inner.calls.load(Ordering::SeqCst), 21);
     }
 }

@@ -185,7 +185,7 @@ fn maintenance_lock_fence_blocks_stale_write() {
 
     let result = with_maintenance_lock(&mut repo, |repo| {
         // Begin a write session so save_state has something to write.
-        repo.begin_write_session()?;
+        repo.begin_write_session(&crate::repo::WriteSessionOptions::default())?;
         repo.store_chunk(b"data", Compression::None, PackType::Data)?;
 
         // Delete the lock file to simulate suspension/expiry.

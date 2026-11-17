@@ -211,7 +211,7 @@ impl InnerBackend for FaultyBackend {
 
 vykar_storage::delegate_storage_backend! {
     for FaultyBackend;
-    except [get, put, begin_staged_put];
+    except [get, put, begin_staged_put, profile];
 
     // Keep packs on the intercepted `put` path.
     fn begin_staged_put(
@@ -219,6 +219,13 @@ vykar_storage::delegate_storage_backend! {
         _prefix: &str,
     ) -> vykar_types::error::Result<Option<Box<dyn vykar_storage::StagedPut>>> {
         Ok(None)
+    }
+
+    fn profile(&self) -> vykar_storage::BackendProfile {
+        vykar_storage::BackendProfile {
+            staged_put: false,
+            ..self.inner.profile()
+        }
     }
 
     fn get(&self, key: &str) -> vykar_types::error::Result<Option<Vec<u8>>> {

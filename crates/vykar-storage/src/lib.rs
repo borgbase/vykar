@@ -198,7 +198,9 @@ pub trait StorageBackend: Send + Sync {
     /// recorders) must also decide what to do here, or staged objects bypass
     /// it; [`crate::delegate_storage_backend!`] refuses to compile a wrapper
     /// that overrides one without the other. Returning `Ok(None)` keeps every
-    /// object on the `put` path the wrapper already intercepts.
+    /// object on the `put` path the wrapper already intercepts; such a wrapper
+    /// also reports `staged_put: false` from [`Self::profile`], which
+    /// `delegate_storage_backend!` enforces.
     fn begin_staged_put(&self, _prefix: &str) -> Result<Option<Box<dyn StagedPut>>> {
         Ok(None)
     }
@@ -239,7 +241,8 @@ pub trait StorageBackend: Send + Sync {
     // Leaving them required means a new capability method breaks every impl,
     // including `delegate_storage_backend!`'s inventory, until it is handled.
     // Backends with no server-side APIs get the bodies from
-    // `unsupported_server_ops!`.
+    // `unsupported_server_ops!`, except `profile`, which every backend states
+    // itself.
     //
     // The methods above may keep defaults: each routes back through this
     // impl's own `get`/`put`/`get_range`/`list`, so inheriting one is correct (at
@@ -320,6 +323,12 @@ pub trait StorageBackend: Send + Sync {
     /// above: a wrapper inheriting an "unsupported" default would silently
     /// cost a commit one request per pack shard.
     fn object_sizes(&self, keys: &[String]) -> Result<Vec<Option<u64>>>;
+
+    /// What kind of backend this is. Required for the reason in the note above:
+    /// a wrapper inheriting a default would report a guess instead of the
+    /// backend's answer. A wrapper that overrides `begin_staged_put` must
+    /// report `staged_put` to match.
+    fn profile(&self) -> BackendProfile;
 }
 
 /// An object being written incrementally; see
@@ -440,6 +449,18 @@ impl RangeReader for BufferedRange<'_> {
             .get_mut(rel..rel + len)
             .ok_or_else(|| VykarError::Other("range piece beyond buffered bytes".into()))
     }
+}
+
+/// What a backend is, for callers that tune to it. See [`StorageBackend::profile`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BackendProfile {
+    /// Repository on a local filesystem.
+    pub local: bool,
+    /// [`StorageBackend::begin_staged_put`] can return a staged writer.
+    pub staged_put: bool,
+    /// Independent read-only requests worth issuing at once (listing,
+    /// existence checks, pack verification). At least 1.
+    pub request_width: usize,
 }
 
 /// One entry of [`StorageBackend::list_sized`].
@@ -644,18 +665,30 @@ pub struct StorageConfig {
     pub s3_soft_delete: bool,
 }
 
+/// [`BackendProfile::request_width`] of a remote backend: three requests per
+/// configured connection, capped at 24.
+pub(crate) fn remote_request_width(max_connections: Option<usize>) -> usize {
+    (max_connections.unwrap_or(2) * 3).clamp(1, 24)
+}
+
+/// [`BackendProfile::request_width`] of a local backend: one per configured
+/// connection, capped at 8.
+pub(crate) fn local_request_width(max_connections: Option<usize>) -> usize {
+    max_connections.unwrap_or(2).clamp(1, 8)
+}
+
 /// Idle-connection pool size for the HTTP backends, derived from the
 /// repository's `max_connections`.
 ///
 /// ureq's defaults (3 idle per host, 10 total) are far below the number of
 /// threads vykar points at a single host: listing and existence checks run at
-/// `listing_concurrency` = `(connections * 3).min(24)`, so anything smaller
-/// throws away connections and pays a fresh TLS handshake per request. Idle
-/// connections are a reuse cache rather than a concurrency cap, so sizing to
-/// the worst-case consumer only costs a few idle sockets. A repository is a
-/// single host, so the per-host and total limits are the same number.
+/// [`remote_request_width`], so anything smaller throws away connections and
+/// pays a fresh TLS handshake per request. Idle connections are a reuse cache
+/// rather than a concurrency cap, so sizing to the worst-case consumer only
+/// costs a few idle sockets. A repository is a single host, so the per-host
+/// and total limits are the same number.
 pub(crate) fn http_idle_pool_size(max_connections: Option<usize>) -> usize {
-    (max_connections.unwrap_or(2) * 3).clamp(4, 24)
+    remote_request_width(max_connections).max(4)
 }
 
 /// How long an idle connection may sit in the pool before being discarded.
@@ -752,7 +785,9 @@ pub fn backend_from_config(cfg: &StorageConfig) -> Result<Box<dyn StorageBackend
     }
 
     match parsed {
-        ParsedUrl::Local { path } => Ok(Box::new(local_backend::LocalBackend::new(&path)?)),
+        ParsedUrl::Local { path } => Ok(Box::new(
+            local_backend::LocalBackend::new(&path)?.with_max_connections(cfg.max_connections),
+        )),
         ParsedUrl::S3 {
             bucket,
             root,
@@ -837,13 +872,75 @@ mod tests {
     }
 
     #[test]
-    fn idle_pool_covers_listing_concurrency() {
-        // Mirrors `Limits::listing_concurrency(remote)` = (connections * 3).min(24).
+    fn request_width_and_idle_pool() {
         assert_eq!(http_idle_pool_size(None), 6);
         assert_eq!(http_idle_pool_size(Some(1)), 4); // floor, not 3
         assert_eq!(http_idle_pool_size(Some(4)), 12);
         assert_eq!(http_idle_pool_size(Some(8)), 24);
         assert_eq!(http_idle_pool_size(Some(64)), 24); // ceiling
+
+        for (c, w) in [
+            (None, 6),
+            (Some(1), 3),
+            (Some(2), 6),
+            (Some(4), 12),
+            (Some(8), 24),
+            (Some(16), 24),
+        ] {
+            assert_eq!(remote_request_width(c), w, "remote {c:?}");
+        }
+        for (c, w) in [
+            (None, 2),
+            (Some(1), 1),
+            (Some(2), 2),
+            (Some(8), 8),
+            (Some(16), 8),
+        ] {
+            assert_eq!(local_request_width(c), w, "local {c:?}");
+        }
+    }
+
+    /// Remote `(c * 3).min(24)`, local `c.min(8)`.
+    #[test]
+    fn profile_widths_by_backend() {
+        let tmp = tempfile::tempdir().unwrap();
+        let local_url = tmp.path().to_str().unwrap().to_string();
+        for c in 1..=16usize {
+            let mut local = test_config(&local_url);
+            local.max_connections = Some(c);
+            assert_eq!(
+                backend_from_config(&local).unwrap().profile(),
+                BackendProfile {
+                    local: true,
+                    staged_put: true,
+                    request_width: c.min(8),
+                },
+                "local c={c}"
+            );
+
+            let remote = BackendProfile {
+                local: false,
+                staged_put: false,
+                request_width: (c * 3).min(24),
+            };
+            let mut rest = test_config("https://backup.example.com/repo");
+            rest.max_connections = Some(c);
+            assert_eq!(
+                backend_from_config(&rest).unwrap().profile(),
+                remote,
+                "rest c={c}"
+            );
+
+            let mut s3 = test_config("s3://s3.example.com/my-bucket/vykar");
+            s3.access_key_id = Some("test-key".into());
+            s3.secret_access_key = Some("test-secret".into());
+            s3.max_connections = Some(c);
+            assert_eq!(
+                backend_from_config(&s3).unwrap().profile(),
+                remote,
+                "s3 c={c}"
+            );
+        }
     }
 
     #[test]

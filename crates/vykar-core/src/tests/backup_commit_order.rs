@@ -117,7 +117,7 @@ impl InnerBackend for ObservingBackend {
 
 delegate_storage_backend! {
     for ObservingBackend;
-    except [put, delete, put_owned, begin_staged_put, object_sizes];
+    except [put, delete, put_owned, begin_staged_put, object_sizes, profile];
 
     // Keep packs on the intercepted `put` path. The recorded order must include every pack write.
     fn begin_staged_put(
@@ -125,6 +125,13 @@ delegate_storage_backend! {
         _prefix: &str,
     ) -> Result<Option<Box<dyn vykar_storage::StagedPut>>> {
         Ok(None)
+    }
+
+    fn profile(&self) -> vykar_storage::BackendProfile {
+        vykar_storage::BackendProfile {
+            staged_put: false,
+            ..self.inner.profile()
+        }
     }
 
     fn put(&self, key: &str, data: &[u8]) -> Result<()> {

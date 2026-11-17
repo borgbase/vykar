@@ -29,7 +29,9 @@ const UPLOAD_QUEUE_HEADROOM: usize = 2;
 /// Number of new packs between debounced `pending_index` writes.
 const JOURNAL_WRITE_INTERVAL: usize = 8;
 
-const DEFAULT_SESSION_ID: &str = "default";
+pub(super) const DEFAULT_SESSION_ID: &str = "default";
+/// `max_in_flight_uploads` of a new session, until `apply_upload_limits`.
+pub(super) const INITIAL_MAX_IN_FLIGHT_UPLOADS: usize = 2;
 const PENDING_INDEX_OBJECT_CONTEXT: &[u8] = b"pending_index";
 
 /// Result of recovering pending index journals from interrupted sessions.
@@ -1429,7 +1431,7 @@ mod tests {
 
     vykar_storage::delegate_storage_backend! {
         for JournalCountingBackend;
-        except [put, begin_staged_put];
+        except [put, begin_staged_put, profile];
 
         // Keep packs on the intercepted `put` path.
         fn begin_staged_put(
@@ -1437,6 +1439,13 @@ mod tests {
             _prefix: &str,
         ) -> Result<Option<Box<dyn vykar_storage::StagedPut>>> {
             Ok(None)
+        }
+
+        fn profile(&self) -> vykar_storage::BackendProfile {
+            vykar_storage::BackendProfile {
+                staged_put: false,
+                ..self.inner.profile()
+            }
         }
 
         fn put(&self, key: &str, data: &[u8]) -> Result<()> {

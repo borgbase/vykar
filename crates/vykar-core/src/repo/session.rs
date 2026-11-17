@@ -1,23 +1,80 @@
 use tracing::{debug, warn};
 
 use super::pack::{compute_data_pack_target, compute_tree_pack_target, PackType, PackWriter};
-use super::write_session::{self, WriteSessionState};
+use super::write_session::{
+    self, WriteSessionState, DEFAULT_SESSION_ID, INITIAL_MAX_IN_FLIGHT_UPLOADS,
+};
 use super::Repository;
+use crate::config::ResourceLimitsConfig;
 use crate::index::dedup_cache::{self, DedupPrefilter, TieredDedupIndex};
 use crate::index::{ChunkIndex, DedupIndex, IndexDelta};
+use vykar_storage::BackendProfile;
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
 
+/// How a write session runs. `Default` is what non-backup writers (repair,
+/// tests) use.
+#[derive(Debug, Clone)]
+pub struct WriteSessionOptions {
+    /// Names the session's `pending_index` journal.
+    pub session_id: String,
+    /// Bound on in-flight background pack uploads.
+    pub max_in_flight_uploads: usize,
+    /// Also bound sealed-but-unwritten packs by bytes
+    /// (see `WriteSessionState::cap_pending_upload_bytes`).
+    pub cap_upload_bytes: bool,
+    /// Stream data packs to the backend while they fill
+    /// (see `WriteSessionState::stream_data_packs`).
+    pub stream_data_packs: bool,
+    /// Independent read-only requests the commit may issue at once.
+    pub commit_request_width: usize,
+}
+
+impl Default for WriteSessionOptions {
+    fn default() -> Self {
+        Self {
+            session_id: DEFAULT_SESSION_ID.to_string(),
+            max_in_flight_uploads: INITIAL_MAX_IN_FLIGHT_UPLOADS,
+            cap_upload_bytes: false,
+            stream_data_packs: false,
+            commit_request_width: 1,
+        }
+    }
+}
+
+impl WriteSessionOptions {
+    /// Options for a backup against a backend with `profile`.
+    pub fn for_backup(
+        session_id: String,
+        profile: BackendProfile,
+        limits: &ResourceLimitsConfig,
+    ) -> Self {
+        Self {
+            session_id,
+            max_in_flight_uploads: limits.upload_concurrency(),
+            cap_upload_bytes: profile.local,
+            // Data packs go straight to a temp file in the repository where the
+            // backend can do that (local), instead of holding up to two pack
+            // buffers (filling + sealed) on the heap.
+            stream_data_packs: profile.staged_put,
+            commit_request_width: profile.request_width,
+        }
+    }
+}
+
 impl Repository {
-    /// Activate a write session for backup.
+    /// Activate a write session.
     ///
     /// Creates a fresh `WriteSessionState` with pack targets computed from the
     /// current chunk index and repo config. Must be called before any write-path
     /// methods (`store_chunk`, `flush_packs`, dedup modes, etc.).
     ///
+    /// Applies `opts` except the upload limits, which start at the defaults
+    /// until `apply_upload_limits`.
+    ///
     /// Returns an error if a session is already active (caller must `save_state()`
     /// or `flush_on_abort()` first).
-    pub fn begin_write_session(&mut self) -> Result<()> {
+    pub fn begin_write_session(&mut self, opts: &WriteSessionOptions) -> Result<()> {
         if self.write_session.is_some() {
             return Err(VykarError::Other("write session already active".into()));
         }
@@ -28,17 +85,30 @@ impl Repository {
             self.config.max_pack_size,
         );
         let tree_target = compute_tree_pack_target(self.config.min_pack_size);
-        let mut ws = WriteSessionState::new(data_target, tree_target, 2, self.content_hash());
+        let mut ws = WriteSessionState::new(
+            data_target,
+            tree_target,
+            INITIAL_MAX_IN_FLIGHT_UPLOADS,
+            self.content_hash(),
+        );
         ws.persisted_pack_count = num_packs;
+        ws.session_id.clone_from(&opts.session_id);
+        ws.stream_data_packs = opts.stream_data_packs;
         self.write_session = Some(ws);
+        self.request_concurrency = opts.commit_request_width.max(1);
         Ok(())
     }
 
-    /// Set the session ID on the active write session (for per-session pending_index).
-    pub fn set_write_session_id(&mut self, session_id: String) {
-        if let Some(ws) = self.write_session.as_mut() {
-            ws.session_id = session_id;
-        }
+    /// Apply the upload limits of `opts` to the active write session. Separate
+    /// from [`Self::begin_write_session`] so backup's command dumps still run
+    /// under the defaults.
+    pub(crate) fn apply_upload_limits(&mut self, opts: &WriteSessionOptions) {
+        let ws = self
+            .write_session
+            .as_mut()
+            .expect("no active write session");
+        ws.max_in_flight_uploads = opts.max_in_flight_uploads.max(1);
+        ws.cap_pending_upload_bytes = opts.cap_upload_bytes;
     }
 
     /// Recompute pack-target state from `self.chunk_index`.
@@ -81,32 +151,6 @@ impl Repository {
         self.write_session
             .as_ref()
             .map_or(0, |ws| ws.upload_slack_bytes())
-    }
-
-    /// Bound sealed-but-unwritten packs by bytes as well as by count
-    /// (see `WriteSessionState::cap_pending_upload_bytes`).
-    pub fn set_cap_pending_upload_bytes(&mut self, enabled: bool) {
-        self.write_session
-            .as_mut()
-            .expect("no active write session")
-            .cap_pending_upload_bytes = enabled;
-    }
-
-    /// Stream data packs to the backend while they fill, where it supports
-    /// that (see `WriteSessionState::stream_data_packs`).
-    pub fn set_stream_data_packs(&mut self, enabled: bool) {
-        self.write_session
-            .as_mut()
-            .expect("no active write session")
-            .stream_data_packs = enabled;
-    }
-
-    /// Set the maximum number of in-flight background pack uploads.
-    pub fn set_max_in_flight_uploads(&mut self, n: usize) {
-        self.write_session
-            .as_mut()
-            .expect("no active write session")
-            .max_in_flight_uploads = n.max(1);
     }
 
     /// Switch to dedup-only index mode to reduce memory during backup.
@@ -494,7 +538,75 @@ impl Repository {
 
 #[cfg(test)]
 mod tests {
+    use super::WriteSessionOptions;
+    use crate::config::ResourceLimitsConfig;
     use crate::testutil::test_repo_plaintext;
+    use vykar_storage::BackendProfile;
+
+    #[test]
+    fn for_backup_derives_from_profile() {
+        let limits = ResourceLimitsConfig {
+            connections: 5,
+            ..ResourceLimitsConfig::default()
+        };
+        let local = WriteSessionOptions::for_backup(
+            "s".into(),
+            BackendProfile {
+                local: true,
+                staged_put: true,
+                request_width: 5,
+            },
+            &limits,
+        );
+        assert_eq!(local.session_id, "s");
+        assert_eq!(local.max_in_flight_uploads, 5);
+        assert!(local.cap_upload_bytes);
+        assert!(local.stream_data_packs);
+        assert_eq!(local.commit_request_width, 5);
+
+        let remote = WriteSessionOptions::for_backup(
+            "s".into(),
+            BackendProfile {
+                local: false,
+                staged_put: false,
+                request_width: 15,
+            },
+            &limits,
+        );
+        assert!(!remote.cap_upload_bytes);
+        assert!(!remote.stream_data_packs);
+        assert_eq!(remote.commit_request_width, 15);
+    }
+
+    /// The session starts on the default upload limits; only
+    /// `apply_upload_limits` switches to the backup's.
+    #[test]
+    fn upload_limits_apply_separately() {
+        let mut repo = test_repo_plaintext();
+        repo.write_session = None;
+        let opts = WriteSessionOptions {
+            session_id: "abc".into(),
+            max_in_flight_uploads: 7,
+            cap_upload_bytes: true,
+            stream_data_packs: true,
+            commit_request_width: 9,
+        };
+        repo.begin_write_session(&opts).unwrap();
+        {
+            let ws = repo.write_session.as_ref().unwrap();
+            assert_eq!(ws.session_id, "abc");
+            assert!(ws.stream_data_packs);
+            assert_eq!(ws.max_in_flight_uploads, 2);
+            assert!(!ws.cap_pending_upload_bytes);
+        }
+        assert_eq!(repo.request_concurrency, 9);
+
+        repo.apply_upload_limits(&opts);
+        let ws = repo.write_session.as_ref().unwrap();
+        assert_eq!(ws.max_in_flight_uploads, 7);
+        assert!(ws.cap_pending_upload_bytes);
+        repo.write_session = None;
+    }
 
     #[test]
     fn rollback_checkpoint_armed_and_committed_round_trips() {
@@ -593,7 +705,7 @@ mod tests {
             vykar_storage::local_backend::LocalBackend::new(dir.path().to_str().unwrap()).unwrap(),
         );
         repo.enable_dedup_mode();
-        repo.set_stream_data_packs(true);
+        repo.write_session.as_mut().unwrap().stream_data_packs = true;
 
         repo.store_chunk(b"streamed chunk", Compression::None, PackType::Data)
             .unwrap();
@@ -639,7 +751,7 @@ mod tests {
             vykar_storage::local_backend::LocalBackend::new(dir.path().to_str().unwrap()).unwrap(),
         );
         repo.enable_dedup_mode();
-        repo.set_stream_data_packs(true);
+        repo.write_session.as_mut().unwrap().stream_data_packs = true;
 
         repo.begin_rollback_checkpoint().unwrap();
         repo.store_chunk(b"rolled back", Compression::None, PackType::Data)

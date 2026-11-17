@@ -123,15 +123,6 @@ impl ResourceLimitsConfig {
         self.connections
     }
 
-    /// Concurrency for listing/existence checks.
-    pub fn listing_concurrency(&self, is_remote: bool) -> usize {
-        if is_remote {
-            (self.connections * 3).min(24)
-        } else {
-            self.connections.min(8)
-        }
-    }
-
     /// Restore reader thread count = connections.
     pub fn restore_concurrency(&self) -> usize {
         self.connections

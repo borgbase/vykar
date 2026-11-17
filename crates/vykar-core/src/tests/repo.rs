@@ -4,7 +4,7 @@ use crate::compress::Compression;
 use crate::config::ChunkerConfig;
 use crate::repo::pack::PackType;
 use crate::repo::EncryptionMode;
-use crate::repo::Repository;
+use crate::repo::{Repository, WriteSessionOptions};
 use crate::testutil::{test_repo_plaintext, MemoryBackend, PutLog, RecordingBackend};
 use vykar_common::paths;
 
@@ -172,7 +172,7 @@ fn repo_on_recording_backend() -> (Repository, PutLog) {
         None,
     )
     .expect("failed to init test repo");
-    repo.begin_write_session()
+    repo.begin_write_session(&WriteSessionOptions::default())
         .expect("failed to begin write session");
     (repo, log)
 }
@@ -245,7 +245,8 @@ fn dedup_mode_empty_delta_restores_index_without_write() {
     let entry_before = *repo.chunk_index().get(&id_a).unwrap();
 
     // Start a new write session and enable dedup mode (drops full index)
-    repo.begin_write_session().unwrap();
+    repo.begin_write_session(&WriteSessionOptions::default())
+        .unwrap();
     repo.enable_dedup_mode();
     assert!(
         repo.chunk_index().is_empty(),
@@ -286,7 +287,8 @@ fn dedup_mode_with_delta_writes_index() {
     assert_eq!(repo.chunk_index().len(), 1);
 
     // Start a new write session and enable dedup mode
-    repo.begin_write_session().unwrap();
+    repo.begin_write_session(&WriteSessionOptions::default())
+        .unwrap();
     repo.enable_dedup_mode();
     log.clear();
 
@@ -370,7 +372,8 @@ fn deferred_hydration_survives_file_cache_save_error() {
     assert_eq!(repo.chunk_index().len(), 1);
 
     // Start a new write session and enable dedup mode (drops full index, activates deferred hydration path)
-    repo.begin_write_session().unwrap();
+    repo.begin_write_session(&WriteSessionOptions::default())
+        .unwrap();
     repo.enable_dedup_mode();
     assert!(repo.chunk_index().is_empty());
 
@@ -487,7 +490,8 @@ fn flush_on_abort_writes_pending_index() {
         None,
     )
     .unwrap();
-    repo.begin_write_session().unwrap();
+    repo.begin_write_session(&WriteSessionOptions::default())
+        .unwrap();
 
     // Store a chunk large enough to exceed the 256-byte pack target.
     // After encryption envelope overhead, this will trigger flush_writer_async.
@@ -598,6 +602,10 @@ impl vykar_storage::StorageBackend for FailPackUploadsBackend {
         self.inner.create_dir(key)
     }
 
+    fn profile(&self) -> vykar_storage::BackendProfile {
+        self.inner.profile()
+    }
+
     vykar_storage::unsupported_server_ops!();
 }
 
@@ -622,7 +630,8 @@ fn flush_on_abort_survives_pack_upload_failure() {
         None,
     )
     .unwrap();
-    repo.begin_write_session().unwrap();
+    repo.begin_write_session(&WriteSessionOptions::default())
+        .unwrap();
 
     // Store a chunk large enough to trigger flush_writer_async.
     // The background upload thread will fail (FailPackUploadsBackend rejects packs/).
@@ -886,7 +895,8 @@ fn repo_with_small_packs(min_pack: u32, max_pack: u32) -> Repository {
         None,
     )
     .unwrap();
-    repo.begin_write_session().unwrap();
+    repo.begin_write_session(&WriteSessionOptions::default())
+        .unwrap();
     repo
 }
 
@@ -960,7 +970,8 @@ fn load_chunk_index_resets_session_counter() {
     // Reload the index — session counter should reset to 0, so the target
     // should be based only on persisted packs.
     repo.load_chunk_index().unwrap();
-    repo.begin_write_session().unwrap();
+    repo.begin_write_session(&WriteSessionOptions::default())
+        .unwrap();
     let target_after_reload = repo.data_pack_target();
 
     // Compute the expected target from the reloaded index's pack count.
@@ -988,7 +999,8 @@ fn save_state_rebases_pack_counters() {
     // Second session on the same Repository instance: flush more packs.
     // Without rebasing, the session counter would double-count the first
     // session's packs, inflating the target.
-    repo.begin_write_session().unwrap();
+    repo.begin_write_session(&WriteSessionOptions::default())
+        .unwrap();
     store_unique_chunks(&mut repo, 100, 20, PackType::Data);
     let target_second_session = repo.data_pack_target();
 
@@ -1006,7 +1018,8 @@ fn save_state_rebases_pack_counters() {
     repo.mark_index_dirty();
     repo.save_state().unwrap();
     repo.load_chunk_index().unwrap();
-    repo.begin_write_session().unwrap();
+    repo.begin_write_session(&WriteSessionOptions::default())
+        .unwrap();
     let target_after_reload = repo.data_pack_target();
 
     // The reload path uses count_distinct_packs() which includes tree packs,
@@ -1048,8 +1061,11 @@ fn cross_session_pending_index_recovery() {
         None,
     )
     .unwrap();
-    repo.begin_write_session().unwrap();
-    repo.set_write_session_id("aaa".to_string());
+    repo.begin_write_session(&WriteSessionOptions {
+        session_id: "aaa".into(),
+        ..Default::default()
+    })
+    .unwrap();
 
     // Store several chunks large enough to trigger pack flushes.
     let mut chunk_ids = Vec::new();
@@ -1083,8 +1099,12 @@ fn cross_session_pending_index_recovery() {
         crate::repo::OpenOptions::new().with_index(),
     )
     .unwrap();
-    repo2.begin_write_session().unwrap();
-    repo2.set_write_session_id("bbb".to_string());
+    repo2
+        .begin_write_session(&WriteSessionOptions {
+            session_id: "bbb".into(),
+            ..Default::default()
+        })
+        .unwrap();
 
     let recovery = repo2.recover_pending_index().unwrap();
     assert!(
@@ -1131,7 +1151,8 @@ fn initial_session_seed_includes_tree_packs() {
     );
 
     // Start a fresh session — initial seed uses count_distinct_packs().
-    repo.begin_write_session().unwrap();
+    repo.begin_write_session(&WriteSessionOptions::default())
+        .unwrap();
     let target = repo.data_pack_target();
 
     // The target should match compute_data_pack_target(total_packs, ...) —
@@ -1196,13 +1217,20 @@ impl vykar_storage::InnerBackend for PutKeyLog {
 
 vykar_storage::delegate_storage_backend! {
     for PutKeyLog;
-    except [put, begin_staged_put];
+    except [put, begin_staged_put, profile];
 
     fn begin_staged_put(
         &self,
         _prefix: &str,
     ) -> vykar_types::error::Result<Option<Box<dyn vykar_storage::StagedPut>>> {
         Ok(None)
+    }
+
+    fn profile(&self) -> vykar_storage::BackendProfile {
+        vykar_storage::BackendProfile {
+            staged_put: false,
+            ..self.inner.profile()
+        }
     }
 
     fn put(&self, key: &str, data: &[u8]) -> vykar_types::error::Result<()> {

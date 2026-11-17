@@ -4,7 +4,7 @@ use std::path::{Component, Path, PathBuf};
 
 use vykar_types::error::{Result, VykarError};
 
-use crate::{ListedObject, RangeCursor, RangeReader, StagedPut, StorageBackend};
+use crate::{BackendProfile, ListedObject, RangeCursor, RangeReader, StagedPut, StorageBackend};
 
 /// Write buffer of a staged object. Its appends are a 4-byte length prefix
 /// followed by a blob of typically hundreds of KiB, which bypasses the buffer,
@@ -14,6 +14,7 @@ const STAGED_WRITE_BUFFER: usize = 64 * 1024;
 /// Storage backend for local filesystem using `std::fs` directly.
 pub struct LocalBackend {
     root: PathBuf,
+    request_width: usize,
 }
 
 impl LocalBackend {
@@ -31,7 +32,18 @@ impl LocalBackend {
         } else {
             root_path
         };
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            request_width: crate::local_request_width(None),
+        })
+    }
+
+    /// Size [`BackendProfile::request_width`] from the repository's
+    /// configured connection count.
+    #[must_use]
+    pub fn with_max_connections(mut self, max_connections: Option<usize>) -> Self {
+        self.request_width = crate::local_request_width(max_connections);
+        self
     }
 
     /// Reject storage keys that could escape the repository root.
@@ -350,6 +362,14 @@ impl StorageBackend for LocalBackend {
         Ok(())
     }
 
+    fn profile(&self) -> BackendProfile {
+        BackendProfile {
+            local: true,
+            staged_put: true,
+            request_width: self.request_width,
+        }
+    }
+
     crate::unsupported_server_ops!(except[remove_stale_temp_files]);
 }
 
@@ -581,6 +601,23 @@ mod tests {
         assert!(LocalBackend::validate_key("snapshots/abc123").is_ok());
         assert!(LocalBackend::validate_key("index").is_ok());
         assert!(LocalBackend::validate_key("keys/repokey").is_ok());
+    }
+
+    #[test]
+    fn profile_reports_local_staging_and_width() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_str().unwrap();
+        let backend = LocalBackend::new(root).unwrap();
+        let profile = backend.profile();
+        assert!(profile.local);
+        assert!(profile.staged_put);
+        assert_eq!(profile.request_width, 2);
+        assert!(backend.begin_staged_put("packs").unwrap().is_some());
+
+        let wide = LocalBackend::new(root)
+            .unwrap()
+            .with_max_connections(Some(16));
+        assert_eq!(wide.profile().request_width, 8);
     }
 
     #[test]

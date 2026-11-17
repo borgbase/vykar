@@ -1369,6 +1369,15 @@ impl StorageBackend for SftpBackend {
         Ok(removed.into_inner())
     }
 
+    fn profile(&self) -> crate::BackendProfile {
+        crate::BackendProfile {
+            local: false,
+            staged_put: false,
+            // Deliberately exceeds the pool; extra requests wait for a connection.
+            request_width: crate::remote_request_width(Some(self.max_connections)),
+        }
+    }
+
     crate::unsupported_server_ops!(except[remove_stale_temp_files]);
 }
 
@@ -1436,6 +1445,31 @@ mod tests {
         assert_eq!(
             normalize_max_connections(Some(99)),
             MAX_SFTP_MAX_CONNECTIONS
+        );
+    }
+
+    #[test]
+    fn profile_width_is_three_per_connection() {
+        // Construction is lazy: no connection is made.
+        let backend = SftpBackend::new(
+            "127.0.0.1",
+            Some("vykar"),
+            None,
+            "/repo",
+            None,
+            Some("/nonexistent/known_hosts"),
+            Some(4),
+            None,
+            RetryConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            backend.profile(),
+            crate::BackendProfile {
+                local: false,
+                staged_put: false,
+                request_width: 12,
+            }
         );
     }
 

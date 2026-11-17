@@ -10,7 +10,7 @@ use vykar_types::pack_id::PackId;
 use crate::commands::list::{for_each_decoded_item, LazyItemStream};
 use crate::compress::Compression;
 use crate::repo::pack::PackType;
-use crate::repo::Repository;
+use crate::repo::{Repository, WriteSessionOptions};
 use crate::snapshot::item::{Item, ItemType};
 use crate::testutil::{init_test_environment, PutLog, RecordingBackend};
 
@@ -28,7 +28,8 @@ fn repo_on_counting_backend() -> (Repository, PutLog) {
         None,
     )
     .expect("init");
-    repo.begin_write_session().expect("begin write session");
+    repo.begin_write_session(&WriteSessionOptions::default())
+        .expect("begin write session");
     (repo, log)
 }
 

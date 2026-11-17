@@ -18,6 +18,7 @@ pub use key::{select_repository_key, LoadedKey};
 pub(crate) use open::derive_plaintext_chunk_id_key;
 mod read;
 mod session;
+pub use session::WriteSessionOptions;
 
 use std::collections::{HashMap as StdHashMap, VecDeque};
 use std::path::PathBuf;
@@ -320,7 +321,9 @@ pub struct Repository {
     /// into the scan. `None` for unencrypted repositories.
     key_blob: Option<Vec<u8>>,
     /// Independent read-only requests the commit may issue at once (pack
-    /// verification). 1 = serial; backup sets it from `limits.connections`.
+    /// verification). 1 = serial; set by `begin_write_session` from
+    /// `WriteSessionOptions::commit_request_width` (backup: the backend's
+    /// `request_width`).
     request_concurrency: usize,
     /// The advisory `index.gen` PUT that follows an index write, running in
     /// the background so it overlaps the next request (the commit's fence
@@ -333,12 +336,6 @@ impl Repository {
     /// The key blob that unwrapped at open, if this repository is encrypted.
     pub fn key_blob(&self) -> Option<&[u8]> {
         self.key_blob.as_deref()
-    }
-
-    /// Set how many independent read-only requests the commit may issue at
-    /// once (see `request_concurrency`). Clamped to at least 1.
-    pub fn set_request_concurrency(&mut self, n: usize) {
-        self.request_concurrency = n.max(1);
     }
 
     /// Mark the chunk index as needing persistence on the next `save_state()`.

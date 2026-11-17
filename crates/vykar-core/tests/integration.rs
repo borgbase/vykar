@@ -10,7 +10,7 @@ use vykar_core::commands;
 use vykar_core::compress::Compression;
 use vykar_core::config::{ChunkerConfig, EncryptionModeConfig, VykarConfig};
 use vykar_core::repo::pack::PackType;
-use vykar_core::repo::{EncryptionMode, OpenOptions, Repository};
+use vykar_core::repo::{EncryptionMode, OpenOptions, Repository, WriteSessionOptions};
 use vykar_core::snapshot::item::ItemType;
 use vykar_storage::local_backend::LocalBackend;
 
@@ -30,7 +30,8 @@ fn init_local_repo(dir: &std::path::Path) -> Repository {
         None,
     )
     .unwrap();
-    repo.begin_write_session().unwrap();
+    repo.begin_write_session(&WriteSessionOptions::default())
+        .unwrap();
     repo
 }
 

@@ -139,7 +139,7 @@ impl InnerBackend for ThrottledStorageBackend {
 // to be disabled on every throttled REST repo.
 delegate_storage_backend! {
     for ThrottledStorageBackend;
-    except [get, put, get_range, get_range_into, open_range, put_owned, begin_staged_put];
+    except [get, put, get_range, get_range_into, open_range, put_owned, begin_staged_put, profile];
 
     fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
         let out = self.inner.get(key)?;
@@ -204,6 +204,13 @@ delegate_storage_backend! {
     // Keep throttled repositories on the buffered `put_owned` path above.
     fn begin_staged_put(&self, _prefix: &str) -> Result<Option<Box<dyn vykar_storage::StagedPut>>> {
         Ok(None)
+    }
+
+    fn profile(&self) -> vykar_storage::BackendProfile {
+        vykar_storage::BackendProfile {
+            staged_put: false,
+            ..self.inner.profile()
+        }
     }
 }
 
@@ -430,6 +437,14 @@ mod tests {
                 Ok(vec![Some(1); keys.len()])
             }
 
+            fn profile(&self) -> vykar_storage::BackendProfile {
+                vykar_storage::BackendProfile {
+                    local: false,
+                    staged_put: false,
+                    request_width: 1,
+                }
+            }
+
             vykar_storage::unsupported_server_ops!(except [
                 server_verify_packs,
                 server_init,
@@ -469,6 +484,30 @@ mod tests {
         assert_eq!(verify_calls.load(Ordering::SeqCst), 1);
         assert_eq!(init_calls.load(Ordering::SeqCst), 1);
         assert_eq!(sizes_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// The throttle keeps packs on its `put` path, so its profile must not
+    /// promise staged writes; everything else is the inner backend's.
+    #[test]
+    fn throttled_backend_disables_staged_put_in_profile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let inner = vykar_storage::local_backend::LocalBackend::new(tmp.path().to_str().unwrap())
+            .unwrap()
+            .with_max_connections(Some(4));
+        let limits = ResourceLimitsConfig {
+            upload_mib_per_sec: 1,
+            ..ResourceLimitsConfig::default()
+        };
+        let wrapped = wrap_storage_backend(Box::new(inner), &limits);
+        assert_eq!(
+            wrapped.profile(),
+            vykar_storage::BackendProfile {
+                local: true,
+                staged_put: false,
+                request_width: 4,
+            }
+        );
+        assert!(wrapped.begin_staged_put("packs").unwrap().is_none());
     }
 
     #[test]

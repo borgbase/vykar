@@ -212,7 +212,7 @@ mod server_side {
 
     delegate_storage_backend! {
         for ServerRepackBackend;
-        except [put, delete, put_owned, begin_staged_put, server_repack];
+        except [put, delete, put_owned, begin_staged_put, server_repack, profile];
 
         // Keep packs on the intercepted `put` path.
         fn begin_staged_put(
@@ -220,6 +220,13 @@ mod server_side {
             _prefix: &str,
         ) -> Result<Option<Box<dyn vykar_storage::StagedPut>>> {
             Ok(None)
+        }
+
+        fn profile(&self) -> vykar_storage::BackendProfile {
+            vykar_storage::BackendProfile {
+                staged_put: false,
+                ..self.inner.profile()
+            }
         }
 
         fn put(&self, key: &str, data: &[u8]) -> Result<()> {
@@ -287,7 +294,8 @@ mod server_side {
             None,
         )
         .unwrap();
-        repo.begin_write_session().unwrap();
+        repo.begin_write_session(&crate::repo::WriteSessionOptions::default())
+            .unwrap();
         (repo, log)
     }
 
@@ -295,7 +303,8 @@ mod server_side {
     /// dead pack (c). Returns (b, partly-dead source key, empty source key).
     fn setup_dead_packs(repo: &mut Repository) -> (ChunkId, String, String) {
         let (id_a, id_b) = store_two_chunks(repo);
-        repo.begin_write_session().unwrap();
+        repo.begin_write_session(&crate::repo::WriteSessionOptions::default())
+            .unwrap();
         let (id_c, _, _) = repo
             .store_chunk(
                 b"chunk-c-data-for-compact-test",

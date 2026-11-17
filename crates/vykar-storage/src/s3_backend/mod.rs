@@ -41,6 +41,7 @@ pub struct S3Backend {
     /// keeps a pack's buffer through its completion, so a store that accepts
     /// parts but refuses completions still gets the second attempt.
     multipart_proven: std::sync::atomic::AtomicBool,
+    request_width: usize,
 }
 
 #[allow(clippy::result_large_err)]
@@ -106,6 +107,7 @@ impl S3Backend {
             soft_delete,
             part_slots: multipart::PartSlots::new(part_concurrency),
             multipart_proven: std::sync::atomic::AtomicBool::new(false),
+            request_width: crate::remote_request_width(max_connections),
         })
     }
 
@@ -506,6 +508,14 @@ impl StorageBackend for S3Backend {
         )
         .map_err(|e| s3_error("MKDIR", key, e))?;
         Ok(())
+    }
+
+    fn profile(&self) -> crate::BackendProfile {
+        crate::BackendProfile {
+            local: false,
+            staged_put: false,
+            request_width: self.request_width,
+        }
     }
 
     crate::unsupported_server_ops!();

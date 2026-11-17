@@ -277,10 +277,7 @@ pub(super) fn integrity_scan(
     let mut snapshot_per_item_chunks: HashMap<SnapshotId, Vec<HashSet<ChunkId>>> = HashMap::new();
     let mut snapshot_item_counts: HashMap<SnapshotId, usize> = HashMap::new();
 
-    let is_remote = vykar_storage::parse_repo_url(&config.repository.url)
-        .map(|u| !u.is_local())
-        .unwrap_or(false);
-    let concurrency = config.limits.listing_concurrency(is_remote);
+    let concurrency = repo.storage.profile().request_width;
 
     // Phase K: repository key copies. Runs before the snapshot passes so a
     // damaged key file is the first thing reported, and so a healthy run says
@@ -1149,6 +1146,14 @@ mod tests {
         }
         fn create_dir(&self, _key: &str) -> vykar_types::error::Result<()> {
             Ok(())
+        }
+
+        fn profile(&self) -> vykar_storage::BackendProfile {
+            vykar_storage::BackendProfile {
+                local: false,
+                staged_put: false,
+                request_width: 1,
+            }
         }
 
         vykar_storage::unsupported_server_ops!();

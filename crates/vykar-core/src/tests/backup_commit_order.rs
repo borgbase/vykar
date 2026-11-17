@@ -6,6 +6,7 @@
 
 use std::fs;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
@@ -60,6 +61,11 @@ struct Shared {
     batch_sizes: bool,
     /// Number of `object_sizes` batches answered.
     batches: Arc<Mutex<usize>>,
+    /// Fail every `locks/` PUT, so the commit lock is never acquired.
+    fail_lock_put: bool,
+    /// Set by the first successful pack PUT and passed to the backup as its
+    /// shutdown flag, so the run is interrupted once packs are durable.
+    interrupt_after_pack: Option<Arc<AtomicBool>>,
 }
 
 struct ObservingBackend {
@@ -75,6 +81,9 @@ impl ObservingBackend {
     fn put_with(&self, key: &str, put: impl FnOnce() -> Result<()>) -> Result<()> {
         if key.starts_with("locks/") {
             self.record(Event::LockPut);
+            if self.shared.fail_lock_put {
+                return Err(VykarError::Other("injected lock PUT failure".into()));
+            }
             if self.shared.delete_pack_at_lock {
                 let victim = self
                     .inner
@@ -104,6 +113,11 @@ impl ObservingBackend {
         } else {
             put()
         };
+        if res.is_ok() {
+            if let Some(flag) = &self.shared.interrupt_after_pack {
+                flag.store(true, Ordering::SeqCst);
+            }
+        }
         self.record(Event::PackPutEnd);
         res
     }
@@ -184,6 +198,7 @@ fn run_backup(
     shared: &Shared,
 ) -> Result<backup::BackupOutcome> {
     let source_paths = vec![src.to_string_lossy().to_string()];
+    let shutdown = shared.interrupt_after_pack.clone();
     let shared = shared.clone();
     let wrap = move |inner: Box<dyn StorageBackend>| -> Box<dyn StorageBackend> {
         Box::new(ObservingBackend {
@@ -208,7 +223,7 @@ fn run_backup(
             verbose: false,
         },
         None,
-        None,
+        shutdown.as_deref(),
         Some(&wrap),
     )
 }
@@ -477,4 +492,100 @@ fn commit_persists_snapshot_cache_immediately() {
         .collect();
     names.sort();
     assert_eq!(names, ["snap-1", "snap-2"]);
+}
+
+fn session_keys(config: &crate::config::VykarConfig) -> (bool, bool) {
+    let sessions = repo_keys(config, "sessions/");
+    (
+        sessions.iter().any(|k| k.ends_with(".json")),
+        sessions.iter().any(|k| k.ends_with(".index")),
+    )
+}
+
+/// A commit that fails after taking the lock deregisters the session while
+/// still holding the lock, and keeps the journal so the next run can recover
+/// the uploaded packs.
+#[test]
+fn failed_commit_deregisters_before_releasing_lock() {
+    let (_dir, config, src) = setup();
+    let shared = Shared {
+        delete_pack_at_lock: true,
+        ..Default::default()
+    };
+    let err = run_backup(&config, &src, &shared).unwrap_err().to_string();
+    assert!(
+        err.contains("missing from storage"),
+        "unexpected error: {err}"
+    );
+
+    let events = shared.events.lock().unwrap().clone();
+    let pos = |e: Event| {
+        events
+            .iter()
+            .position(|x| *x == e)
+            .unwrap_or_else(|| panic!("{e:?} missing: {events:?}"))
+    };
+    assert!(
+        pos(Event::MarkerDelete) < pos(Event::LockDelete),
+        "{events:?}"
+    );
+    assert!(!events.contains(&Event::JournalDelete), "{events:?}");
+    let (marker, journal) = session_keys(&config);
+    assert!(!marker, "session marker should be removed");
+    assert!(journal, "the journal must survive for recovery");
+    assert!(repo_keys(&config, "locks/").is_empty());
+    assert!(repo_keys(&config, "snapshots/").is_empty());
+}
+
+/// A backup that cannot take the commit lock deregisters its session and
+/// keeps the journal.
+#[test]
+fn lock_acquisition_failure_deregisters_and_keeps_journal() {
+    let (_dir, config, src) = setup();
+    let shared = Shared {
+        fail_lock_put: true,
+        ..Default::default()
+    };
+    let err = run_backup(&config, &src, &shared).unwrap_err().to_string();
+    assert!(
+        err.contains("injected lock PUT failure"),
+        "unexpected error: {err}"
+    );
+
+    let events = shared.events.lock().unwrap().clone();
+    let count = |e: Event| events.iter().filter(|x| **x == e).count();
+    assert_eq!(count(Event::LockPut), 1, "{events:?}");
+    assert_eq!(count(Event::SnapshotPut), 0, "{events:?}");
+    assert_eq!(count(Event::LockDelete), 0, "{events:?}");
+    assert_eq!(count(Event::JournalDelete), 0, "{events:?}");
+    assert!(events.contains(&Event::MarkerDelete), "{events:?}");
+    let (marker, journal) = session_keys(&config);
+    assert!(!marker, "session marker should be removed");
+    assert!(journal, "the journal must survive for recovery");
+    assert!(repo_keys(&config, "locks/").is_empty());
+    assert!(repo_keys(&config, "snapshots/").is_empty());
+}
+
+/// An interrupt after packs were uploaded deregisters the session without
+/// touching the commit lock, and keeps the journal.
+#[test]
+fn interrupt_after_upload_deregisters_and_keeps_journal() {
+    let (_dir, config, src) = setup();
+    let shared = Shared {
+        interrupt_after_pack: Some(Arc::new(AtomicBool::new(false))),
+        ..Default::default()
+    };
+    let err = run_backup(&config, &src, &shared).unwrap_err();
+    assert!(
+        matches!(err, VykarError::Interrupted),
+        "unexpected error: {err}"
+    );
+
+    let events = shared.events.lock().unwrap().clone();
+    assert!(!events.contains(&Event::LockPut), "{events:?}");
+    assert!(events.contains(&Event::MarkerDelete), "{events:?}");
+    let (marker, journal) = session_keys(&config);
+    assert!(!marker, "session marker should be removed");
+    assert!(journal, "the journal must survive for recovery");
+    assert!(repo_keys(&config, "snapshots/").is_empty());
 }

@@ -75,25 +75,13 @@ impl S3Backend {
 
         let credentials = Credentials::new(access_key_id, secret_access_key);
 
-        let part_concurrency = multipart::part_concurrency(max_connections);
+        let part_concurrency =
+            crate::http_util::part_concurrency(multipart::PART_CONCURRENCY_ENV, max_connections);
         // Keep every part stream pooled plus a few for control requests
         // (create/complete, locks, index), so a part never pays a fresh
         // connection (cold congestion window, TLS handshake).
         let pool = crate::http_idle_pool_size(max_connections).max(part_concurrency + 4);
-        let agent: ureq::Agent = ureq::Agent::config_builder()
-            .http_status_as_error(false)
-            .timeout_resolve(Some(crate::HTTP_RESOLVE_TIMEOUT))
-            .timeout_connect(Some(Duration::from_secs(30)))
-            .timeout_send_request(Some(crate::HTTP_SEND_REQUEST_TIMEOUT))
-            .timeout_recv_response(Some(crate::HTTP_RECV_RESPONSE_TIMEOUT))
-            .timeout_send_body(Some(Duration::from_secs(300)))
-            .timeout_recv_body(Some(Duration::from_secs(300)))
-            .max_idle_connections_per_host(pool)
-            .max_idle_connections(pool)
-            .max_idle_age(crate::HTTP_IDLE_AGE)
-            .tls_config(crate::http_tls_config())
-            .build()
-            .into();
+        let agent = crate::http_util::build_agent(&crate::http_util::HttpTimeouts::default(), pool);
 
         // Normalize root: strip leading/trailing slashes, ensure trailing slash if non-empty.
         let root = root.trim_matches('/').to_string();

@@ -1,3 +1,4 @@
+pub(crate) mod bounded;
 pub mod file_cache;
 pub mod format;
 pub mod identity;

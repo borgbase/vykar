@@ -799,46 +799,39 @@ fn parallel_pack_existence(
         return (0, 0, Vec::new());
     }
 
-    let work_idx = AtomicUsize::new(0);
     let present_ok = AtomicUsize::new(0);
     let missing_count = AtomicUsize::new(0);
     let issues = Mutex::new(Vec::new());
 
-    std::thread::scope(|s| {
-        for _ in 0..concurrency {
-            s.spawn(|| loop {
-                if is_shutting_down(shutdown) {
-                    break;
+    crate::repo::bounded::for_each_bounded(
+        concurrency,
+        packs,
+        shutdown,
+        |(pack_id, _chunk_count)| {
+            let pack_key = pack_id.storage_key();
+            match storage.exists(&pack_key) {
+                Ok(true) => {
+                    present_ok.fetch_add(1, Ordering::Relaxed);
                 }
-                let idx = work_idx.fetch_add(1, Ordering::Relaxed);
-                let Some((pack_id, _chunk_count)) = packs.get(idx) else {
-                    break;
-                };
-                let pack_key = pack_id.storage_key();
-                match storage.exists(&pack_key) {
-                    Ok(true) => {
-                        present_ok.fetch_add(1, Ordering::Relaxed);
-                    }
-                    Ok(false) => {
-                        missing_count.fetch_add(1, Ordering::Relaxed);
-                        issues
-                            .lock()
-                            .expect("scan present issues lock not poisoned")
-                            .push(IntegrityIssue::MissingPack { pack_id: *pack_id });
-                    }
-                    Err(e) => {
-                        issues
-                            .lock()
-                            .expect("scan present issues lock not poisoned")
-                            .push(IntegrityIssue::PackExistenceCheckFailed {
-                                pack_id: *pack_id,
-                                detail: e.to_string(),
-                            });
-                    }
+                Ok(false) => {
+                    missing_count.fetch_add(1, Ordering::Relaxed);
+                    issues
+                        .lock()
+                        .expect("scan present issues lock not poisoned")
+                        .push(IntegrityIssue::MissingPack { pack_id: *pack_id });
                 }
-            });
-        }
-    });
+                Err(e) => {
+                    issues
+                        .lock()
+                        .expect("scan present issues lock not poisoned")
+                        .push(IntegrityIssue::PackExistenceCheckFailed {
+                            pack_id: *pack_id,
+                            detail: e.to_string(),
+                        });
+                }
+            }
+        },
+    );
 
     let present = present_ok.load(Ordering::Relaxed);
     let missing = missing_count.load(Ordering::Relaxed);

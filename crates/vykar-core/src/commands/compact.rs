@@ -435,46 +435,38 @@ fn parallel_list_packs(
 ) -> Result<Vec<(String, PackId)>> {
     let results: Mutex<Vec<(String, PackId)>> = Mutex::new(Vec::new());
     let errors: Mutex<Vec<VykarError>> = Mutex::new(Vec::new());
-    let shard_idx = std::sync::atomic::AtomicU16::new(0);
+    let shards: Vec<u16> = (0..256).collect();
 
-    std::thread::scope(|s| {
-        for _ in 0..concurrency {
-            s.spawn(|| loop {
-                let shard = shard_idx.fetch_add(1, Ordering::Relaxed);
-                if shard >= 256 {
-                    break;
-                }
-                let prefix = format!("packs/{:02x}/", shard);
-                let keys = match storage.list(&prefix) {
-                    Ok(k) => k,
-                    Err(e) => {
-                        errors
-                            .lock()
-                            .expect("compact list-pack errors lock not poisoned")
-                            .push(e);
-                        continue;
-                    }
-                };
+    crate::repo::bounded::for_each_bounded(concurrency, &shards, None, |&shard| {
+        let prefix = format!("packs/{:02x}/", shard);
+        let keys = match storage.list(&prefix) {
+            Ok(k) => k,
+            Err(e) => {
+                errors
+                    .lock()
+                    .expect("compact list-pack errors lock not poisoned")
+                    .push(e);
+                return;
+            }
+        };
 
-                let mut local = Vec::new();
-                for key in keys {
-                    if key.ends_with('/') {
-                        continue;
-                    }
-                    match PackId::from_storage_key(&key) {
-                        Ok(id) => local.push((key, id)),
-                        Err(e) => {
-                            warn!("Skipping invalid pack key '{}': {}", key, e);
-                        }
-                    }
+        let mut local = Vec::new();
+        for key in keys {
+            if key.ends_with('/') {
+                continue;
+            }
+            match PackId::from_storage_key(&key) {
+                Ok(id) => local.push((key, id)),
+                Err(e) => {
+                    warn!("Skipping invalid pack key '{}': {}", key, e);
                 }
-                if !local.is_empty() {
-                    results
-                        .lock()
-                        .expect("compact list-pack results lock not poisoned")
-                        .extend(local);
-                }
-            });
+            }
+        }
+        if !local.is_empty() {
+            results
+                .lock()
+                .expect("compact list-pack results lock not poisoned")
+                .extend(local);
         }
     });
 

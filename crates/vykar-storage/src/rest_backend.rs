@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use blake2::{Blake2b256, Digest};
 
+use crate::http_util::HttpTimeouts;
 use crate::retry::HttpRetryError;
 use crate::RetryConfig;
 use vykar_types::error::{Result, VykarError};
@@ -50,32 +51,6 @@ fn read_body_snippet(resp: &mut http::Response<ureq::Body>) -> String {
         String::new()
     } else {
         format!(": {trimmed}")
-    }
-}
-
-/// Phase timeouts for [`RestBackend`]. `Default` uses the crate constants;
-/// tests shrink them to exercise stalled servers.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct HttpTimeouts {
-    pub resolve: Duration,
-    pub send_request: Duration,
-    /// Response-header wait for data operations (agent default).
-    pub recv_response: Duration,
-    /// Response-header wait for admin actions that run server-side work.
-    pub admin: Duration,
-    /// Response-header wait for server-side repack.
-    pub repack: Duration,
-}
-
-impl Default for HttpTimeouts {
-    fn default() -> Self {
-        Self {
-            resolve: crate::HTTP_RESOLVE_TIMEOUT,
-            send_request: crate::HTTP_SEND_REQUEST_TIMEOUT,
-            recv_response: crate::HTTP_RECV_RESPONSE_TIMEOUT,
-            admin: crate::HTTP_ADMIN_RECV_RESPONSE_TIMEOUT,
-            repack: crate::HTTP_REPACK_RECV_RESPONSE_TIMEOUT,
-        }
     }
 }
 
@@ -144,25 +119,13 @@ impl RestBackend {
         max_connections: Option<usize>,
         timeouts: HttpTimeouts,
     ) -> Result<Self> {
-        let part_concurrency = parts::part_concurrency(max_connections);
+        let part_concurrency =
+            crate::http_util::part_concurrency(parts::PART_CONCURRENCY_ENV, max_connections);
         // Part streams plus a few control connections stay pooled: ureq hands
         // out the oldest idle connection, and a part sent on a fresh one pays
         // a handshake and slow start.
         let pool = crate::http_idle_pool_size(max_connections).max(part_concurrency + 4);
-        let agent: ureq::Agent = ureq::Agent::config_builder()
-            .http_status_as_error(false)
-            .timeout_resolve(Some(timeouts.resolve))
-            .timeout_connect(Some(Duration::from_secs(30)))
-            .timeout_send_request(Some(timeouts.send_request))
-            .timeout_recv_response(Some(timeouts.recv_response))
-            .timeout_send_body(Some(Duration::from_secs(5 * 60)))
-            .timeout_recv_body(Some(Duration::from_secs(5 * 60)))
-            .max_idle_connections_per_host(pool)
-            .max_idle_connections(pool)
-            .max_idle_age(crate::HTTP_IDLE_AGE)
-            .tls_config(crate::http_tls_config())
-            .build()
-            .into();
+        let agent = crate::http_util::build_agent(&timeouts, pool);
 
         let base = base_url.trim_end_matches('/').to_string();
 

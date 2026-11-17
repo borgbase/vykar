@@ -8,8 +8,8 @@
 //! `PRESIGN_DURATION`.
 
 use std::io::Read;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::Ordering;
+use std::sync::OnceLock;
 
 use base64::Engine;
 use md5::{Digest, Md5};
@@ -45,27 +45,7 @@ const ABORT_MPU: &str = "ABORT_MPU";
 
 /// Env override for the backend-wide part concurrency. Hidden tuning knob for
 /// benchmarking; not a supported configuration surface.
-const PART_CONCURRENCY_ENV: &str = "VYKAR_S3_PART_CONCURRENCY";
-/// Upper bound on the backend-wide part concurrency (also caps the env override).
-const MAX_PART_CONCURRENCY: usize = 64;
-
-/// Backend-wide number of concurrent part PUTs, derived from the repository's
-/// `max_connections` (default 2).
-///
-/// One stream at 40 ms RTT is capped near 100 MiB/s by its send window, and
-/// every part pays ~1 RTT of fixed turnaround, so throughput scales with the
-/// number of concurrent streams rather than with the number of packs in
-/// flight. Core keeps `connections + 2` packs in flight; parts of each pack
-/// upload in parallel, bounded across all packs by this many slots.
-pub(super) fn part_concurrency(max_connections: Option<usize>) -> usize {
-    if let Some(n) = std::env::var(PART_CONCURRENCY_ENV)
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-    {
-        return n.clamp(1, MAX_PART_CONCURRENCY);
-    }
-    (max_connections.unwrap_or(2) * 4).clamp(4, 32)
-}
+pub(super) const PART_CONCURRENCY_ENV: &str = "VYKAR_S3_PART_CONCURRENCY";
 
 pub(super) use crate::http_util::PartSlots;
 
@@ -328,11 +308,12 @@ impl S3Backend {
     }
 
     /// Upload every part, up to [`PartSlots`] at a time across the backend;
-    /// their ETags in part order. Workers claim part indices in ascending
-    /// order; the first failure stops new parts from starting and the scope
-    /// joins every worker before returning, so the caller's abort runs only
-    /// after all in-flight parts have stopped. Any part failure means complete
-    /// never ran → not ambiguous.
+    /// their ETags in part order. Parts run through
+    /// [`run_parts_prepared`](crate::http_util::run_parts_prepared), which
+    /// claims indices in ascending order, stops new parts after the first
+    /// failure and joins every worker before returning, so the caller's abort
+    /// runs only after all in-flight parts have stopped. Any part failure
+    /// means complete never ran → not ambiguous.
     fn upload_parts(
         &self,
         full_key: &str,
@@ -341,67 +322,38 @@ impl S3Backend {
         upload_id: &str,
     ) -> std::result::Result<Vec<String>, MultipartFailure> {
         let etags: Vec<OnceLock<String>> = (0..parts.len()).map(|_| OnceLock::new()).collect();
-        let next = AtomicUsize::new(0);
-        let failed = AtomicBool::new(false);
-        // Lowest-numbered part failure wins, matching what a sequential upload
-        // would have reported.
-        let failure: Mutex<Option<(usize, MultipartFailure)>> = Mutex::new(None);
-
-        let worker = || loop {
-            let i = next.fetch_add(1, Ordering::Relaxed);
-            let (Some((chunk, content_md5)), Some(etag_slot)) = (parts.get(i), etags.get(i)) else {
-                return;
-            };
-            if failed.load(Ordering::Acquire) {
-                return;
-            }
-            // The digest above is computed before taking a slot, so a slot (and
-            // its pooled connection) never idles while a part is hashed.
-            let _slot = self.part_slots.acquire();
-            if failed.load(Ordering::Acquire) {
-                return;
-            }
-            // part_size is derived to keep the count <= S3_MAX_PARTS (<= u16::MAX).
-            let part_number = u16::try_from(i + 1).expect("part count bounded by S3_MAX_PARTS");
-            let err =
+        crate::http_util::run_parts_prepared(
+            &self.part_slots,
+            parts.len(),
+            // The digest is computed before taking a slot, so a slot (and its
+            // pooled connection) never idles while a part is hashed.
+            |i| parts.get(i).expect("index below parts.len()"),
+            |i, (chunk, content_md5)| {
+                // part_size is derived to keep the count <= S3_MAX_PARTS (<= u16::MAX).
+                let part_number = u16::try_from(i + 1).expect("part count bounded by S3_MAX_PARTS");
                 match self.upload_part(full_key, key, part_number, upload_id, chunk, content_md5) {
                     Ok(PartOutcome::Uploaded(etag)) => {
-                        etag_slot
+                        etags
+                            .get(i)
+                            .expect("one ETag slot per part")
                             .set(etag)
                             .expect("each part index is claimed once");
-                        continue;
+                        Ok(())
                     }
                     // The MPU expired or was aborted out from under us. A fresh MPU
                     // can recover, so restart at the outer loop.
-                    Ok(PartOutcome::NoSuchUpload) => MultipartFailure {
+                    Ok(PartOutcome::NoSuchUpload) => Err(MultipartFailure {
                         kind: MultipartFailureKind::Retryable,
                         ambiguous: false,
                         err: VykarError::Other(format!(
                             "S3 PUT {key}: NoSuchUpload uploading part {part_number}; \
-                         the multipart upload no longer exists"
+                             the multipart upload no longer exists"
                         )),
-                    },
-                    Err(f) => f,
-                };
-            failed.store(true, Ordering::Release);
-            let mut first = failure.lock().unwrap_or_else(|e| e.into_inner());
-            if first.as_ref().is_none_or(|(j, _)| i < *j) {
-                *first = Some((i, err));
-            }
-            return;
-        };
-
-        let workers = self.part_slots.capacity().min(parts.len());
-        std::thread::scope(|s| {
-            for _ in 1..workers {
-                s.spawn(worker);
-            }
-            worker();
-        });
-
-        if let Some((_, err)) = failure.into_inner().unwrap_or_else(|e| e.into_inner()) {
-            return Err(err);
-        }
+                    }),
+                    Err(f) => Err(f),
+                }
+            },
+        )?;
         Ok(etags
             .into_iter()
             .map(|e| {

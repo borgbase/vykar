@@ -4,45 +4,29 @@
 //! otherwise one PUT on one stream, so the stream count would equal the number
 //! of packs in flight. Here a pack is sent as slices of the buffer already in
 //! memory — no copy — from scoped worker threads, bounded across every pack
-//! of the backend by a shared [`PartSlots`] budget, and finished with one
-//! completion request that the server answers only once the pack is durable.
+//! of the backend by a shared [`PartSlots`](crate::http_util::PartSlots)
+//! budget, and finished with one completion request that the server answers
+//! only once the pack is durable.
 //! Wire format: `crates/vykar-server/src/handlers/parts.rs`.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::Ordering;
 
 use super::RestBackend;
-use crate::http_util::PartSlots;
 use crate::retry::HttpRetryError;
 
 /// Hidden benchmarking knobs, not a supported configuration surface.
-const PART_CONCURRENCY_ENV: &str = "VYKAR_REST_PART_CONCURRENCY";
+pub(super) const PART_CONCURRENCY_ENV: &str = "VYKAR_REST_PART_CONCURRENCY";
 const PART_SIZE_ENV: &str = "VYKAR_REST_PART_SIZE_MIB";
-/// Upper bound on the backend-wide part concurrency (also caps the override).
-const MAX_PART_CONCURRENCY: usize = 64;
 
 /// Target part size. Packs at or below it stay one whole-object PUT; larger
 /// ones are cut into equal parts no larger than this.
 pub(super) const DEFAULT_PART_SIZE: usize = 16 * 1024 * 1024;
 const MIN_PART_SIZE: usize = 1024 * 1024;
 
-/// Backend-wide number of concurrent part PUTs: 4 per configured connection
-/// (default 2), clamped to 4..=32, like the S3 multipart path.
-pub(super) fn part_concurrency(max_connections: Option<usize>) -> usize {
-    if let Some(n) = env_usize(PART_CONCURRENCY_ENV) {
-        return n.clamp(1, MAX_PART_CONCURRENCY);
-    }
-    (max_connections.unwrap_or(2) * 4).clamp(4, 32)
-}
-
 pub(super) fn part_size() -> usize {
-    env_usize(PART_SIZE_ENV).map_or(DEFAULT_PART_SIZE, |mib| {
+    crate::http_util::env_usize(PART_SIZE_ENV).map_or(DEFAULT_PART_SIZE, |mib| {
         mib.saturating_mul(1024 * 1024).max(MIN_PART_SIZE)
     })
-}
-
-fn env_usize(name: &str) -> Option<usize> {
-    std::env::var(name).ok()?.trim().parse().ok()
 }
 
 /// Byte ranges of `len` split into the fewest equal parts of at most
@@ -103,31 +87,15 @@ impl RestBackend {
         key: &str,
         data: &[u8],
     ) -> std::result::Result<String, PartsFailure> {
-        let slots: &PartSlots = &self.part_slots;
         let token = new_token();
         let ranges = part_ranges(data.len(), self.part_size);
         let base = self.url(key);
         let total = data.len();
-
-        let next = AtomicUsize::new(0);
-        let failed = AtomicBool::new(false);
-        let failure: Mutex<Option<(usize, PartsFailure)>> = Mutex::new(None);
-
-        let worker = || loop {
-            let i = next.fetch_add(1, Ordering::Relaxed);
-            let Some(range) = ranges.get(i) else {
-                return;
-            };
-            if failed.load(Ordering::Acquire) {
-                return;
-            }
-            let _slot = slots.acquire();
-            if failed.load(Ordering::Acquire) {
-                return;
-            }
+        crate::http_util::run_parts(&self.part_slots, ranges.len(), |i| {
+            let range = ranges.get(i).expect("index below ranges.len()");
             let chunk = data.get(range.clone()).expect("ranges lie within data");
             let url = format!("{base}?upload={token}&offset={}&total={total}", range.start);
-            let result = self.retry_call(
+            self.retry_call(
                 &format!("PUT {key} part {}", i + 1),
                 || self.authed(self.agent.put(&url)).send(chunk),
                 |resp| {
@@ -137,28 +105,10 @@ impl RestBackend {
                         format!("REST PUT {key} part {}: HTTP {status}", i + 1),
                     )
                 },
-            );
-            if let Err(e) = result {
-                failed.store(true, Ordering::Release);
-                let mut first = failure.lock().unwrap_or_else(|e| e.into_inner());
-                if first.as_ref().is_none_or(|(j, _)| i < *j) {
-                    *first = Some((i, PartsFailure::from_http(&format!("part {}", i + 1), &e)));
-                }
-                return;
-            }
-        };
-
-        let workers = slots.capacity().min(ranges.len());
-        std::thread::scope(|s| {
-            for _ in 1..workers {
-                s.spawn(worker);
-            }
-            worker();
-        });
-        match failure.into_inner().unwrap_or_else(|e| e.into_inner()) {
-            Some((_, f)) => Err(f),
-            None => Ok(token),
-        }
+            )
+            .map_err(|e| PartsFailure::from_http(&format!("part {}", i + 1), &e))
+        })?;
+        Ok(token)
     }
 
     /// Complete the part upload `token` of pack `key`. Needs no pack bytes,
@@ -218,17 +168,6 @@ mod tests {
             let min = ranges.iter().map(|r| r.len()).min().unwrap();
             assert!(max - min <= parts, "near-equal parts: {ranges:?}");
         }
-    }
-
-    #[test]
-    fn concurrency_follows_connections() {
-        if std::env::var_os(PART_CONCURRENCY_ENV).is_some() {
-            return;
-        }
-        assert_eq!(part_concurrency(None), 8);
-        assert_eq!(part_concurrency(Some(1)), 4);
-        assert_eq!(part_concurrency(Some(4)), 16);
-        assert_eq!(part_concurrency(Some(64)), 32);
     }
 
     #[test]

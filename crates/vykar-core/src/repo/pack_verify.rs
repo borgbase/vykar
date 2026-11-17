@@ -13,8 +13,6 @@
 //! so the batch path can only make verification cheaper, never weaker.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Mutex;
 
 use tracing::debug;
 use vykar_storage::StorageBackend;
@@ -125,7 +123,7 @@ pub(crate) fn verify_packs_present_with(
         }
         Strategy::ShardLists => {
             let groups: Vec<(String, Vec<PackId>)> = by_shard.into_iter().collect();
-            run_bounded(width, &groups, |(shard, ids)| {
+            super::bounded::try_for_each_bounded(width, &groups, |(shard, ids)| {
                 verify_shard(storage, shard, ids)
             })
         }
@@ -192,7 +190,7 @@ fn verify_shard(storage: &dyn StorageBackend, shard: &str, ids: &[PackId]) -> Re
 }
 
 fn check_exists(storage: &dyn StorageBackend, ids: &[PackId], width: usize) -> Result<()> {
-    run_bounded(width, ids, |id| {
+    super::bounded::try_for_each_bounded(width, ids, |id| {
         if storage.exists(&id.storage_key())? {
             Ok(())
         } else {
@@ -201,55 +199,11 @@ fn check_exists(storage: &dyn StorageBackend, ids: &[PackId], width: usize) -> R
     })
 }
 
-/// Run `task` on every item, on up to `width` scoped threads. Stops handing
-/// out work after the first error and returns it; `Ok` only if every task
-/// succeeded. With `width <= 1` (or a single item) it runs inline, in order.
-fn run_bounded<T, F>(width: usize, items: &[T], task: F) -> Result<()>
-where
-    T: Sync,
-    F: Fn(&T) -> Result<()> + Sync,
-{
-    let threads = width.min(items.len());
-    if threads <= 1 {
-        return items.iter().try_for_each(task);
-    }
-    let next = AtomicUsize::new(0);
-    let failed = AtomicBool::new(false);
-    let first_err: Mutex<Option<VykarError>> = Mutex::new(None);
-    std::thread::scope(|s| {
-        for _ in 0..threads {
-            s.spawn(|| loop {
-                if failed.load(Ordering::Relaxed) {
-                    break;
-                }
-                let Some(item) = items.get(next.fetch_add(1, Ordering::Relaxed)) else {
-                    break;
-                };
-                if let Err(e) = task(item) {
-                    failed.store(true, Ordering::Relaxed);
-                    let mut slot = first_err.lock().expect("pack verify error lock poisoned");
-                    if slot.is_none() {
-                        *slot = Some(e);
-                    }
-                    break;
-                }
-            });
-        }
-    });
-    match first_err
-        .into_inner()
-        .expect("pack verify error lock poisoned")
-    {
-        Some(e) => Err(e),
-        None => Ok(()),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::testutil::MemoryBackend;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use vykar_storage::{delegate_storage_backend, InnerBackend};
 
     /// Counts requests and can fail listings or `exists()`. With `batch` it

@@ -14,6 +14,7 @@ pub(crate) mod read_source;
 pub(crate) use chunk_process::WorkerChunk;
 
 use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 use tracing::{debug, info, warn};
 
@@ -30,7 +31,7 @@ use crate::snapshot::item::Item;
 use crate::snapshot::SnapshotStats;
 use crate::storage;
 use vykar_common::display::{format_bytes, format_count};
-use vykar_storage::BackendProfile;
+use vykar_storage::{BackendProfile, StorageBackend};
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
 
@@ -464,7 +465,6 @@ struct Prepared<'a> {
     resolved_sources: Vec<source::ResolvedSource>,
     max_pending_transform_bytes: usize,
     max_pending_file_actions: usize,
-    upload_concurrency: usize,
 }
 
 /// Transform worker setup, sized to the backend.
@@ -544,7 +544,6 @@ fn prepare<'a>(config: &VykarConfig, req: &BackupRequest<'a>) -> Result<Prepared
         resolved_sources,
         max_pending_transform_bytes: config.limits.transform_batch_bytes(),
         max_pending_file_actions: config.limits.max_pending_actions(),
-        upload_concurrency: config.limits.upload_concurrency(),
     })
 }
 
@@ -560,12 +559,13 @@ fn run_against_repo(
     let passphrase = req.passphrase;
     let source_paths = req.source_paths;
 
-    let backend = storage::backend_from_config(&config.repository, prepared.upload_concurrency)?;
+    let backend = storage::backend_from_config(&config.repository, config.limits.connections)?;
     let backend = limits::wrap_storage_backend(backend, &config.limits);
     let backend = match wrap_backend {
         Some(wrap) => wrap(backend),
         None => backend,
     };
+    let backend: Arc<dyn StorageBackend> = Arc::from(backend);
     let profile = backend.profile();
     let workers = resolve_workers(&config.limits, profile)?;
 
@@ -583,8 +583,8 @@ fn run_against_repo(
     debug!(session_id, "backup session registered");
 
     // Open repo after session registration (minimizes T0→commit window).
-    // If open fails, deregister the session so it doesn't block maintenance
-    // until the marker ages out (45 min).
+    // If open fails, deregister through the same backend so the session
+    // doesn't block maintenance until the marker ages out (45 min).
     //
     // When there are no filesystem source paths (command-dump-only backup),
     // skip loading the file cache — it's never consulted for command dumps
@@ -598,26 +598,22 @@ fn run_against_repo(
             .with_file_cache()
     };
     let opts = super::util::with_identity_context(opts, config);
-    let open_result = Repository::open(backend, passphrase, cache_dir, opts);
+    let open_result = Repository::open_shared(Arc::clone(&backend), passphrase, cache_dir, opts);
     let mut repo = match open_result {
         Ok(r) => {
             if let Err(e) = super::util::verify_repo_identity(config, &r) {
-                if let Ok(cleanup) = storage::backend_from_config(&config.repository, 1) {
-                    lock::deregister_session(cleanup.as_ref(), &session_id);
-                }
+                lock::deregister_session(backend.as_ref(), &session_id);
                 return Err(e);
             }
             r
         }
         Err(e) => {
             let e = super::util::enrich_repo_not_found(e, &config.repository.url);
-            // Create a fresh backend just for deregistration (the original was consumed by open).
-            if let Ok(cleanup_backend) = storage::backend_from_config(&config.repository, 1) {
-                lock::deregister_session(cleanup_backend.as_ref(), &session_id);
-            }
+            lock::deregister_session(backend.as_ref(), &session_id);
             return Err(e);
         }
     };
+    drop(backend);
 
     // Adopt the session into a guard so the heartbeat thread is independent
     // of the upload pipeline. `BackupSession` owns the guard, and every

@@ -114,10 +114,9 @@ pub(super) fn phase1_upload(
         return Err(VykarError::SnapshotAlreadyExists(snapshot_name.into()));
     }
 
-    // Activate write session with per-session pending_index. Journal
-    // recovery's pack lookups and commit-time pack verification may
-    // overlap their read-only requests up to the backend's request width
-    // (the warm HTTP pool).
+    // Activate the write session with the backup's options (per-session
+    // `pending_index`, upload limits, staging), so command dumps already run
+    // under the backup's upload limits.
     repo.begin_write_session(session_opts)?;
 
     // Recover chunk→pack mappings from a previous interrupted session.
@@ -265,12 +264,6 @@ pub(super) fn phase1_upload(
         time_start,
     )?;
 
-    // Apply configurable upload concurrency. Local writes gain little
-    // from queueing several sealed packs, and each one holds a full pack
-    // buffer. Remote backends keep the count limit only, so slow round
-    // trips still overlap.
-    repo.apply_upload_limits(session_opts);
-
     let pipeline_depth = config.limits.effective_pipeline_depth();
     let pipeline_buffer_bytes = config.limits.pipeline_buffer_for_workers(num_workers);
 
@@ -317,34 +310,33 @@ pub(super) fn phase1_upload(
         repo.restore_file_cache(file_cache_snapshot);
         pipeline_result?;
     } else {
+        let seq_ctx = sequential::SequentialCtx {
+            exclude_patterns,
+            exclude_if_present,
+            one_file_system,
+            git_ignore,
+            xattrs_enabled,
+            compression,
+            items_config: &items_config,
+            max_pending_transform_bytes,
+            max_pending_file_actions,
+            read_limiter: None, // no source-file read limiter
+            transform_pool: transform_pool.as_ref(),
+            prefilter: prefilter.as_ref(),
+            shutdown,
+            verbose,
+            parent_reuse_index: parent_reuse_index.as_ref(),
+        };
+        let mut seq_bufs = pipeline::PipelineBuffers {
+            item_stream: &mut item_stream,
+            item_ptrs: &mut item_ptrs,
+            stats: &mut stats,
+            new_file_cache: &mut new_file_cache,
+            dataless,
+        };
         for source in resolved_sources {
             check_interrupted(shutdown)?;
-
-            sequential::process_source_path(
-                repo,
-                source,
-                exclude_patterns,
-                exclude_if_present,
-                one_file_system,
-                git_ignore,
-                xattrs_enabled,
-                compression,
-                &items_config,
-                &mut item_stream,
-                &mut item_ptrs,
-                &mut stats,
-                &mut new_file_cache,
-                max_pending_transform_bytes,
-                max_pending_file_actions,
-                None, // no source-file read limiter
-                transform_pool.as_ref(),
-                progress,
-                prefilter.as_ref(),
-                shutdown,
-                verbose,
-                parent_reuse_index.as_ref(),
-                dataless,
-            )?;
+            sequential::process_source_path(repo, source, &seq_ctx, &mut seq_bufs, progress)?;
         }
     }
     // The walk was the last reader of the loaded cache's sections for

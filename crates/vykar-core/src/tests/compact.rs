@@ -479,3 +479,50 @@ fn compact_sweeps_temp_files_once_and_never_on_dry_run() {
         }
     }
 }
+
+/// Counts `size` calls.
+struct SizeCounter {
+    inner: std::sync::Arc<dyn vykar_storage::StorageBackend>,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl vykar_storage::InnerBackend for SizeCounter {
+    fn inner_backend(&self) -> &dyn vykar_storage::StorageBackend {
+        &*self.inner
+    }
+}
+
+vykar_storage::delegate_storage_backend! {
+    for SizeCounter;
+    except [size];
+
+    fn size(&self, key: &str) -> vykar_types::error::Result<Option<u64>> {
+        self.calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inner.size(key)
+    }
+}
+
+/// A shutdown raised before analysis stops it before the first pack is
+/// claimed.
+#[test]
+fn compact_honours_shutdown_during_analysis() {
+    let mut repo = test_repo_plaintext();
+    store_two_chunks(&mut repo);
+    let counter = std::sync::Arc::new(SizeCounter {
+        inner: std::sync::Arc::clone(&repo.storage),
+        calls: Default::default(),
+    });
+    repo.storage = counter.clone();
+    let packs_before = count_all_packs(&repo);
+    assert!(packs_before > 0);
+
+    let shutdown = std::sync::atomic::AtomicBool::new(true);
+    let err = compact_repo(&mut repo, 1.0, None, false, 4, Some(&shutdown)).unwrap_err();
+    assert!(
+        matches!(err, vykar_types::error::VykarError::Interrupted),
+        "{err:?}"
+    );
+    assert_eq!(counter.calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+    assert_eq!(count_all_packs(&repo), packs_before);
+}

@@ -1,4 +1,5 @@
 pub(crate) mod bounded;
+pub(crate) mod coalesce;
 pub mod file_cache;
 pub mod format;
 pub mod identity;
@@ -324,12 +325,6 @@ pub struct Repository {
     /// would cost another Argon2id derivation and need the passphrase threaded
     /// into the scan. `None` for unencrypted repositories.
     key_blob: Option<Vec<u8>>,
-    /// Independent read-only requests a write session may issue at once
-    /// (journal recovery's pack lookups, commit-time pack verification).
-    /// 1 = serial; set by `begin_write_session` from
-    /// `WriteSessionOptions::commit_request_width` (backup: the backend's
-    /// `request_width`).
-    request_concurrency: usize,
     /// The advisory `index.gen` PUT that follows an index write, running in
     /// the background so it overlaps the next request (the commit's fence
     /// check). Joined by the next index write, by `save_state`, after the

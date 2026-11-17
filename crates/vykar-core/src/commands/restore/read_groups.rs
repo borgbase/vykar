@@ -10,7 +10,7 @@ use vykar_types::pack_id::PackId;
 use smallvec::SmallVec;
 
 use super::plan::{ChunkTargets, WriteTarget};
-use super::{MAX_COALESCE_GAP, MAX_READ_SIZE};
+use crate::repo::coalesce::coalesce_pack_reads;
 
 /// A chunk within a coalesced read group.
 pub(super) struct PlannedBlob {
@@ -56,58 +56,20 @@ where
 
     // For each pack: sort blobs by offset, then coalesce into ReadGroups.
     let mut groups: Vec<ReadGroup> = Vec::new();
-    // (blob count, read_start, read_end) of each group of the current pack.
-    let mut spans: Vec<(usize, u64, u64)> = Vec::new();
-
-    for (pack_id, mut blobs) in pack_blobs {
-        blobs.sort_by_key(|b| b.pack_offset);
-
-        // Pass 1: find the group boundaries.
-        spans.clear();
-        for blob in &blobs {
-            let blob_end = blob
-                .pack_offset
-                .checked_add(blob.stored_size as u64)
-                .ok_or_else(|| {
-                    VykarError::InvalidFormat(format!(
-                        "pack offset overflow in pack {pack_id}: offset {} + size {}",
-                        blob.pack_offset, blob.stored_size,
-                    ))
-                })?;
-            if let Some((len, read_start, read_end)) = spans.last_mut() {
-                let gap = blob.pack_offset.saturating_sub(*read_end);
-                // sort-by-offset gives blob_end >= read_start in practice, but
-                // checked_sub keeps a corrupted index from wrapping silently.
-                let merged_size = blob_end.checked_sub(*read_start).ok_or_else(|| {
-                    VykarError::InvalidFormat(format!(
-                        "blob ordering violation in pack {pack_id}: blob_end {blob_end} < read_start {read_start}",
-                    ))
-                })?;
-                if gap <= MAX_COALESCE_GAP && merged_size <= MAX_READ_SIZE {
-                    // Coalesce into the current group.
-                    *len += 1;
-                    *read_end = blob_end;
-                    continue;
-                }
-            }
-            // Start a new group.
-            spans.push((1, blob.pack_offset, blob_end));
-        }
-
-        // Pass 2: move the blobs into exactly sized per-group vectors. The
-        // groups live until their worker has processed them, so push-growth
-        // slack here would be held for most of the batch.
-        let mut iter = blobs.into_iter();
-        for &(len, read_start, read_end) in &spans {
-            let mut group_blobs = Vec::with_capacity(len);
-            group_blobs.extend(iter.by_ref().take(len));
-            groups.push(ReadGroup {
-                pack_id,
-                read_start,
-                read_end,
-                blobs: group_blobs,
-            });
-        }
+    for (pack_id, blobs) in pack_blobs {
+        coalesce_pack_reads(
+            &pack_id,
+            blobs,
+            |b| (b.pack_offset, b.stored_size),
+            |read_start, read_end, blobs| {
+                groups.push(ReadGroup {
+                    pack_id,
+                    read_start,
+                    read_end,
+                    blobs,
+                })
+            },
+        )?;
     }
 
     Ok(groups)
@@ -121,6 +83,7 @@ mod tests {
         dummy_chunk_id, dummy_pack_id, index_lookup, make_file_item, make_file_item_with_size,
     };
     use crate::index::ChunkIndex;
+    use crate::repo::coalesce::{MAX_COALESCE_GAP, MAX_READ_SIZE};
     use crate::snapshot::item::Item;
     use std::path::PathBuf;
 

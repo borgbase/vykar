@@ -197,6 +197,15 @@ fn run_backup(
     src: &Path,
     shared: &Shared,
 ) -> Result<backup::BackupOutcome> {
+    run_backup_with_passphrase(config, src, shared, None)
+}
+
+fn run_backup_with_passphrase(
+    config: &crate::config::VykarConfig,
+    src: &Path,
+    shared: &Shared,
+    passphrase: Option<&str>,
+) -> Result<backup::BackupOutcome> {
     let source_paths = vec![src.to_string_lossy().to_string()];
     let shutdown = shared.interrupt_after_pack.clone();
     let shared = shared.clone();
@@ -210,7 +219,7 @@ fn run_backup(
         config,
         backup::BackupRequest {
             snapshot_name: "snap",
-            passphrase: None,
+            passphrase,
             source_paths: &source_paths,
             source_label: "test",
             exclude_patterns: &[],
@@ -588,4 +597,55 @@ fn interrupt_after_upload_deregisters_and_keeps_journal() {
     assert!(!marker, "session marker should be removed");
     assert!(journal, "the journal must survive for recovery");
     assert!(repo_keys(&config, "snapshots/").is_empty());
+}
+
+/// A repository encrypted with passphrase "right", and a source to back up.
+fn setup_encrypted() -> (
+    tempfile::TempDir,
+    crate::config::VykarConfig,
+    std::path::PathBuf,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let src_dir = dir.path().join("src");
+    fs::create_dir_all(&src_dir).unwrap();
+    fs::write(src_dir.join("a.txt"), b"x").unwrap();
+    let mut config = crate::tests::helpers::make_test_config(&repo_dir);
+    config.encryption.mode = crate::config::EncryptionModeConfig::Aes256Gcm;
+    crate::commands::init::run(&config, Some("right")).unwrap();
+    (dir, config, src_dir)
+}
+
+fn session_markers(config: &crate::config::VykarConfig) -> Vec<String> {
+    repo_keys(config, "sessions/")
+        .into_iter()
+        .filter(|k| k.ends_with(".json"))
+        .collect()
+}
+
+/// A backup whose open fails removes its session marker through the backend
+/// it registered with.
+#[test]
+fn open_failure_deregisters_backup_session() {
+    let (_dir, config, src) = setup_encrypted();
+    let shared = Shared::default();
+    let err = run_backup_with_passphrase(&config, &src, &shared, Some("wrong")).unwrap_err();
+    assert!(err.is_passphrase_failure(), "{err:?}");
+
+    let events = shared.events.lock().unwrap().clone();
+    assert!(events.contains(&Event::MarkerDelete), "{events:?}");
+    assert!(session_markers(&config).is_empty());
+}
+
+/// A read session whose open fails removes its session marker.
+#[test]
+fn open_failure_deregisters_read_session() {
+    let (_dir, config, _src) = setup_encrypted();
+    let res = crate::commands::util::open_repo_with_read_session(
+        &config,
+        Some("wrong"),
+        crate::repo::OpenOptions::new(),
+    );
+    assert!(res.is_err());
+    assert!(session_markers(&config).is_empty());
 }

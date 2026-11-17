@@ -19,8 +19,6 @@ use super::session_journal::SessionJournal;
 use super::upload_queue::{PendingUpload, UploadQueue};
 
 pub(super) const DEFAULT_SESSION_ID: &str = "default";
-/// `max_in_flight_uploads` of a new session, until `apply_upload_limits`.
-pub(super) const INITIAL_MAX_IN_FLIGHT_UPLOADS: usize = 2;
 
 /// Tracks index mutations between `begin_rollback_checkpoint` and commit so
 /// they can be undone if the guarded scope (command dump, or per-file backup

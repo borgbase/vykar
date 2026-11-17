@@ -50,17 +50,8 @@ fn detect_raw_entries(items: impl super::list::ItemSource) -> Result<Option<(usi
 }
 
 // ---------------------------------------------------------------------------
-// Constants for coalesced parallel restore
+// Constants for parallel restore
 // ---------------------------------------------------------------------------
-
-/// Maximum gap (in bytes) between blobs in the same pack that will be coalesced
-/// into a single range read rather than issuing separate requests.
-pub(super) const MAX_COALESCE_GAP: u64 = 256 * 1024; // 256 KiB
-
-/// Maximum size of a single coalesced range read.
-pub(super) const MAX_READ_SIZE: u64 = 16 * 1024 * 1024; // 16 MiB
-
-// MAX_READER_THREADS removed — uses config.limits.restore_concurrency() instead.
 
 /// Maximum number of simultaneously open output files per restore worker.
 /// Caps fd usage while still avoiding per-chunk open/close churn.
@@ -273,8 +264,8 @@ where
         crate::repo::OpenOptions::new(),
     )?;
     // Shrink blob cache for restore — the parallel pipeline reads pack data
-    // directly via storage.get_range(), so the cache only serves the small
-    // item-stream tree-pack chunks. 2 MiB is plenty.
+    // directly via `StorageBackend::open_range`, so the cache only serves the
+    // small item-stream tree-pack chunks. 2 MiB is plenty.
     repo.set_blob_cache_max_bytes(2 * 1024 * 1024);
     let RestoreOptions {
         xattrs_enabled,

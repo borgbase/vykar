@@ -249,7 +249,6 @@ impl Repository {
             write_session: None,
             lock_fence: None,
             key_blob,
-            request_concurrency: 1,
             index_sidecar_write: None,
         })
     }
@@ -261,6 +260,17 @@ impl Repository {
     /// opt in.
     pub fn open(
         storage: Box<dyn StorageBackend>,
+        passphrase: Option<&str>,
+        cache_dir: Option<PathBuf>,
+        opts: OpenOptions,
+    ) -> Result<Self> {
+        Self::open_shared(Arc::from(storage), passphrase, cache_dir, opts)
+    }
+
+    /// [`Self::open`] over a backend the caller keeps a handle to, e.g. to
+    /// delete a session marker when the open fails.
+    pub(crate) fn open_shared(
+        storage: Arc<dyn StorageBackend>,
         passphrase: Option<&str>,
         cache_dir: Option<PathBuf>,
         opts: OpenOptions,
@@ -290,13 +300,11 @@ impl Repository {
     /// only local disk, so it overlaps the remaining round trips of open.
     #[allow(clippy::type_complexity)]
     fn open_inner(
-        storage: Box<dyn StorageBackend>,
+        storage: Arc<dyn StorageBackend>,
         passphrase: Option<&str>,
         cache_dir: Option<PathBuf>,
         opts: &OpenOptions,
     ) -> Result<(Self, Option<std::thread::JoinHandle<FileCache>>)> {
-        let storage: Arc<dyn StorageBackend> = Arc::from(storage);
-
         // Read config
         let config_data = storage
             .get("config")?
@@ -425,7 +433,6 @@ impl Repository {
             write_session: None,
             lock_fence: None,
             key_blob,
-            request_concurrency: 1,
             index_sidecar_write: None,
         };
         Ok((repo, file_cache_load))

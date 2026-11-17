@@ -4,7 +4,6 @@ use super::journal_recovery::PendingIndexRecovery;
 use super::pack::{compute_data_pack_target, compute_tree_pack_target, PackType, PackWriter};
 use super::write_session::{
     active, active_mut, RollbackTracker, WriteSessionState, DEFAULT_SESSION_ID,
-    INITIAL_MAX_IN_FLIGHT_UPLOADS,
 };
 use super::Repository;
 use crate::config::ResourceLimitsConfig;
@@ -14,13 +13,18 @@ use vykar_storage::BackendProfile;
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
 
+/// `max_in_flight_uploads` of `WriteSessionOptions::default()`.
+const DEFAULT_MAX_IN_FLIGHT_UPLOADS: usize = 2;
+
 /// How a write session runs. `Default` is what non-backup writers (repair,
 /// tests) use.
 #[derive(Debug, Clone)]
 pub struct WriteSessionOptions {
     /// Names the session's `pending_index` journal.
     pub session_id: String,
-    /// Bound on in-flight background pack uploads.
+    /// Bound on in-flight background pack uploads. The queue admits
+    /// `UPLOAD_QUEUE_HEADROOM` more sealed packs before the producer blocks
+    /// (see `UploadQueue::wait_below_count_cap`).
     pub max_in_flight_uploads: usize,
     /// Also bound sealed-but-unwritten packs by bytes
     /// (see `UploadQueue::cap_pending_upload_bytes`).
@@ -28,19 +32,15 @@ pub struct WriteSessionOptions {
     /// Stream data packs to the backend while they fill
     /// (see `WriteSessionState::stream_data_packs`).
     pub stream_data_packs: bool,
-    /// Independent read-only requests the session may issue at once (journal
-    /// recovery's pack lookups, commit-time pack verification).
-    pub commit_request_width: usize,
 }
 
 impl Default for WriteSessionOptions {
     fn default() -> Self {
         Self {
             session_id: DEFAULT_SESSION_ID.to_string(),
-            max_in_flight_uploads: INITIAL_MAX_IN_FLIGHT_UPLOADS,
+            max_in_flight_uploads: DEFAULT_MAX_IN_FLIGHT_UPLOADS,
             cap_upload_bytes: false,
             stream_data_packs: false,
-            commit_request_width: 1,
         }
     }
 }
@@ -60,7 +60,6 @@ impl WriteSessionOptions {
             // backend can do that (local), instead of holding up to two pack
             // buffers (filling + sealed) on the heap.
             stream_data_packs: profile.staged_put,
-            commit_request_width: profile.request_width,
         }
     }
 }
@@ -84,8 +83,7 @@ impl Repository {
     /// current chunk index and repo config. Must be called before any write-path
     /// methods (`store_chunk`, `flush_packs`, dedup modes, etc.).
     ///
-    /// Applies `opts` except the upload limits, which start at the defaults
-    /// until `apply_upload_limits`.
+    /// Applies every field of `opts`.
     ///
     /// Returns an error if a session is already active (caller must `save_state()`
     /// or `flush_on_abort()` first).
@@ -103,24 +101,22 @@ impl Repository {
         let mut ws = WriteSessionState::new(
             data_target,
             tree_target,
-            INITIAL_MAX_IN_FLIGHT_UPLOADS,
+            opts.max_in_flight_uploads.max(1),
             self.content_hash(),
         );
+        ws.uploads.cap_pending_upload_bytes = opts.cap_upload_bytes;
         ws.persisted_pack_count = num_packs;
         ws.session_id.clone_from(&opts.session_id);
         ws.stream_data_packs = opts.stream_data_packs;
         self.write_session = Some(ws);
-        self.request_concurrency = opts.commit_request_width.max(1);
         Ok(())
     }
 
-    /// Apply the upload limits of `opts` to the active write session. Separate
-    /// from [`Self::begin_write_session`] so backup's command dumps still run
-    /// under the defaults.
-    pub(crate) fn apply_upload_limits(&mut self, opts: &WriteSessionOptions) {
-        let ws = self.ws_mut();
-        ws.uploads.max_in_flight_uploads = opts.max_in_flight_uploads.max(1);
-        ws.uploads.cap_pending_upload_bytes = opts.cap_upload_bytes;
+    /// Independent read-only requests worth issuing at once against this
+    /// repository's backend (journal recovery's pack lookups, commit-time
+    /// pack verification). At least 1.
+    pub(super) fn request_width(&self) -> usize {
+        self.storage.profile().request_width.max(1)
     }
 
     /// Recompute pack-target state from `self.chunk_index`.
@@ -322,14 +318,15 @@ impl Repository {
     /// `pending_index` file. Verifies each pack exists before adding entries.
     ///
     /// Must be called inside the repo lock, before `enable_tiered_dedup_mode()`.
-    /// Pack lookups use the session's request width
-    /// (`WriteSessionOptions::commit_request_width`).
+    /// Pack lookups use the backend's request width
+    /// (`BackendProfile::request_width`).
     pub fn recover_pending_index(&mut self) -> Result<PendingIndexRecovery> {
+        let width = self.request_width();
         active_mut(&mut self.write_session).recover_pending_index(
             &*self.storage,
             &*self.crypto,
             &self.chunk_index,
-            self.request_concurrency,
+            width,
         )
     }
 
@@ -515,7 +512,8 @@ mod tests {
     use super::WriteSessionOptions;
     use crate::config::ResourceLimitsConfig;
     use crate::testutil::test_repo_plaintext;
-    use vykar_storage::BackendProfile;
+    use std::sync::Arc;
+    use vykar_storage::{delegate_storage_backend, BackendProfile, InnerBackend, StorageBackend};
 
     #[test]
     fn for_backup_derives_from_profile() {
@@ -536,7 +534,6 @@ mod tests {
         assert_eq!(local.max_in_flight_uploads, 5);
         assert!(local.cap_upload_bytes);
         assert!(local.stream_data_packs);
-        assert_eq!(local.commit_request_width, 5);
 
         let remote = WriteSessionOptions::for_backup(
             "s".into(),
@@ -549,37 +546,72 @@ mod tests {
         );
         assert!(!remote.cap_upload_bytes);
         assert!(!remote.stream_data_packs);
-        assert_eq!(remote.commit_request_width, 15);
     }
 
-    /// The session starts on the default upload limits; only
-    /// `apply_upload_limits` switches to the backup's.
+    /// Upload limits are in force from `begin_write_session` on, so command
+    /// dumps already run under them.
     #[test]
-    fn upload_limits_apply_separately() {
+    fn begin_write_session_applies_every_option() {
         let mut repo = test_repo_plaintext();
         repo.write_session = None;
-        let opts = WriteSessionOptions {
+        let mut opts = WriteSessionOptions {
             session_id: "abc".into(),
             max_in_flight_uploads: 7,
             cap_upload_bytes: true,
             stream_data_packs: true,
-            commit_request_width: 9,
         };
         repo.begin_write_session(&opts).unwrap();
         {
             let ws = repo.write_session.as_ref().unwrap();
             assert_eq!(ws.session_id, "abc");
             assert!(ws.stream_data_packs);
-            assert_eq!(ws.uploads.max_in_flight_uploads, 2);
-            assert!(!ws.uploads.cap_pending_upload_bytes);
+            assert_eq!(ws.uploads.max_in_flight_uploads, 7);
+            assert!(ws.uploads.cap_pending_upload_bytes);
         }
-        assert_eq!(repo.request_concurrency, 9);
 
-        repo.apply_upload_limits(&opts);
-        let ws = repo.write_session.as_ref().unwrap();
-        assert_eq!(ws.uploads.max_in_flight_uploads, 7);
-        assert!(ws.uploads.cap_pending_upload_bytes);
         repo.write_session = None;
+        opts.max_in_flight_uploads = 0;
+        repo.begin_write_session(&opts).unwrap();
+        assert_eq!(
+            repo.write_session
+                .as_ref()
+                .unwrap()
+                .uploads
+                .max_in_flight_uploads,
+            1
+        );
+        repo.write_session = None;
+    }
+
+    struct ZeroWidth(Arc<dyn StorageBackend>);
+
+    impl InnerBackend for ZeroWidth {
+        fn inner_backend(&self) -> &dyn StorageBackend {
+            &*self.0
+        }
+    }
+
+    delegate_storage_backend! {
+        for ZeroWidth;
+        except [profile];
+
+        fn profile(&self) -> BackendProfile {
+            BackendProfile {
+                request_width: 0,
+                ..self.0.profile()
+            }
+        }
+    }
+
+    #[test]
+    fn request_width_follows_the_backend() {
+        let mut repo = test_repo_plaintext();
+        assert_eq!(repo.request_width(), 2);
+        repo.write_session = None;
+        assert_eq!(repo.request_width(), 2);
+
+        repo.storage = Arc::new(ZeroWidth(Arc::clone(&repo.storage)));
+        assert_eq!(repo.request_width(), 1);
     }
 
     #[test]

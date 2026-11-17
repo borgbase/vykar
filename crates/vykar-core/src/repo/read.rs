@@ -97,13 +97,6 @@ impl Repository {
         Ok(plaintext)
     }
 
-    /// Maximum gap (in bytes) between two blobs in the same pack that will be
-    /// merged into a single range read.
-    const COALESCE_GAP: u64 = 256 * 1024; // 256 KiB
-
-    /// Maximum total size of a single coalesced range read.
-    const COALESCE_MAX: u64 = 16 * 1024 * 1024; // 16 MiB
-
     /// Read multiple chunks via coalesced range reads and append plaintext to `out`.
     ///
     /// Each entry in `chunks` is `(ChunkId, PackId, pack_offset, stored_size)`.
@@ -168,41 +161,20 @@ impl Repository {
         // --- Phase 2: coalesce ---
         let mut groups: Vec<CoalescedGroup> = Vec::new();
 
-        for (pack_id, mut blobs) in pack_blobs {
-            blobs.sort_by_key(|b| b.pack_offset);
-
-            let mut iter = blobs.into_iter();
-            let first = iter.next().expect("pack blob group is non-empty");
-            let mut cur_start = first.pack_offset;
-            let mut cur_end = first.pack_offset + first.stored_size as u64;
-            let mut cur_blobs = vec![first];
-
-            for blob in iter {
-                let blob_end = blob.pack_offset + blob.stored_size as u64;
-                let gap = blob.pack_offset.saturating_sub(cur_end);
-                let merged_size = blob_end - cur_start;
-
-                if gap <= Self::COALESCE_GAP && merged_size <= Self::COALESCE_MAX {
-                    cur_end = blob_end;
-                    cur_blobs.push(blob);
-                } else {
+        for (pack_id, blobs) in pack_blobs {
+            super::coalesce::coalesce_pack_reads(
+                &pack_id,
+                blobs,
+                |b| (b.pack_offset, b.stored_size),
+                |read_start, read_end, blobs| {
                     groups.push(CoalescedGroup {
                         pack_id,
-                        read_start: cur_start,
-                        read_end: cur_end,
-                        blobs: cur_blobs,
-                    });
-                    cur_start = blob.pack_offset;
-                    cur_end = blob_end;
-                    cur_blobs = vec![blob];
-                }
-            }
-            groups.push(CoalescedGroup {
-                pack_id,
-                read_start: cur_start,
-                read_end: cur_end,
-                blobs: cur_blobs,
-            });
+                        read_start,
+                        read_end,
+                        blobs,
+                    })
+                },
+            )?;
         }
 
         // Sort groups so the one containing the earliest-needed slot is first.

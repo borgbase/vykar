@@ -11,6 +11,7 @@ use crate::repo::lock;
 use crate::repo::lock::SessionEntry;
 use crate::repo::{identity, OpenOptions, Repository};
 use crate::storage;
+use vykar_storage::StorageBackend;
 use vykar_types::error::{
     ActiveSessionDetails, ActiveSessionInfo, ActiveSessionList, Result, VykarError,
 };
@@ -105,24 +106,24 @@ pub fn open_repo_with_read_session(
     let connections = config.limits.connections;
     let opts = with_identity_context(opts, config);
     let backend = storage::backend_from_config(&config.repository, connections)?;
-    let backend = limits::wrap_storage_backend(backend, &config.limits);
+    let backend: Arc<dyn StorageBackend> =
+        Arc::from(limits::wrap_storage_backend(backend, &config.limits));
 
     let session_id = format!("{:032x}", rand::random::<u128>());
     lock::register_session(backend.as_ref(), &session_id)?;
 
-    let open_result = Repository::open(backend, passphrase, cache_dir_from_config(config), opts);
-
-    let deregister_fresh = |sid: &str| {
-        if let Ok(cleanup) = storage::backend_from_config(&config.repository, 1) {
-            lock::deregister_session(cleanup.as_ref(), sid);
-        }
-    };
+    let open_result = Repository::open_shared(
+        Arc::clone(&backend),
+        passphrase,
+        cache_dir_from_config(config),
+        opts,
+    );
 
     match open_result {
         Ok(repo) => {
             // Verify identity before adopting the session into a guard.
             if let Err(e) = verify_repo_identity(config, &repo) {
-                deregister_fresh(&session_id);
+                lock::deregister_session(backend.as_ref(), &session_id);
                 return Err(e);
             }
             match lock::SessionGuard::adopt(Arc::clone(&repo.storage), session_id.clone()) {
@@ -134,8 +135,7 @@ pub fn open_repo_with_read_session(
             }
         }
         Err(e) => {
-            // Backend was consumed by open — build a fresh one just for cleanup.
-            deregister_fresh(&session_id);
+            lock::deregister_session(backend.as_ref(), &session_id);
             Err(enrich_repo_not_found(e, &config.repository.url))
         }
     }

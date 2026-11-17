@@ -21,6 +21,7 @@ use vykar_types::error::{Result, VykarError};
 use super::chunk_process::{classify_chunk, WorkerChunk};
 use super::commit::process_worker_chunks;
 use super::drift::{open_checked, read_range_drift_checked, ReadPlan};
+use super::pipeline::PipelineBuffers;
 use super::source::ResolvedSource;
 use super::walk::{materialize_item, DatalessKind, InodeSortedWalk, Materialized, WalkEvent};
 use super::{
@@ -450,32 +451,57 @@ pub(super) fn process_regular_file_item(
     Ok(ProcessOutcome::Committed)
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Read-only inputs of [`process_source_path`], shared by every source
+/// (the sequential counterpart of `pipeline::PipelineCtx`).
+pub(super) struct SequentialCtx<'a> {
+    pub exclude_patterns: &'a [String],
+    pub exclude_if_present: &'a [String],
+    pub one_file_system: bool,
+    pub git_ignore: bool,
+    pub xattrs_enabled: bool,
+    pub compression: Compression,
+    pub items_config: &'a ChunkerConfig,
+    pub max_pending_transform_bytes: usize,
+    pub max_pending_file_actions: usize,
+    pub read_limiter: Option<&'a ByteRateLimiter>,
+    pub transform_pool: Option<&'a rayon::ThreadPool>,
+    pub prefilter: Option<&'a DedupPrefilter>,
+    pub shutdown: Option<&'a AtomicBool>,
+    pub verbose: bool,
+    pub parent_reuse_index: Option<&'a ParentReuseIndex>,
+}
+
 pub(super) fn process_source_path(
     repo: &mut Repository,
     source: &ResolvedSource,
-    exclude_patterns: &[String],
-    exclude_if_present: &[String],
-    one_file_system: bool,
-    git_ignore: bool,
-    xattrs_enabled: bool,
-    compression: Compression,
-    items_config: &ChunkerConfig,
-    item_stream: &mut Vec<u8>,
-    item_ptrs: &mut Vec<ChunkId>,
-    stats: &mut SnapshotStats,
-    new_file_cache: &mut FileCache,
-    max_pending_transform_bytes: usize,
-    max_pending_file_actions: usize,
-    read_limiter: Option<&ByteRateLimiter>,
-    transform_pool: Option<&rayon::ThreadPool>,
+    ctx: &SequentialCtx<'_>,
+    bufs: &mut PipelineBuffers<'_>,
     progress: &mut Option<&mut dyn FnMut(BackupProgressEvent)>,
-    prefilter: Option<&DedupPrefilter>,
-    shutdown: Option<&AtomicBool>,
-    verbose: bool,
-    parent_reuse_index: Option<&ParentReuseIndex>,
-    dataless: &mut super::DatalessTally,
 ) -> Result<()> {
+    let SequentialCtx {
+        exclude_patterns,
+        exclude_if_present,
+        one_file_system,
+        git_ignore,
+        xattrs_enabled,
+        compression,
+        items_config,
+        max_pending_transform_bytes,
+        max_pending_file_actions,
+        read_limiter,
+        transform_pool,
+        prefilter,
+        shutdown,
+        verbose,
+        parent_reuse_index,
+    } = *ctx;
+    let PipelineBuffers {
+        item_stream,
+        item_ptrs,
+        stats,
+        new_file_cache,
+        dataless,
+    } = bufs;
     emit_progress(
         progress,
         BackupProgressEvent::SourceStarted {

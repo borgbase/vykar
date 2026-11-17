@@ -177,9 +177,16 @@ pub trait StorageBackend: Send + Sync {
     /// Create a directory marker (no-op for flat object stores).
     fn create_dir(&self, key: &str) -> Result<()>;
 
-    /// Write an object from an owned buffer, with the same contract as
-    /// [`Self::put`]. Backends can override to avoid an extra copy when the
-    /// caller already owns the data.
+    /// Write an object from an owned buffer. Backends can override to avoid
+    /// an extra copy when the caller already owns the data.
+    ///
+    /// Same contract as [`Self::put`], except for packs on REST and S3: a
+    /// `packs/` key large enough to go up in parts may release `data` once
+    /// every part is acknowledged, before the completion request (only after
+    /// an earlier completion has succeeded on this backend instance). A
+    /// completion that still fails after its in-place retries (and, on S3,
+    /// is not reconciled as committed by size) is then returned as an error
+    /// instead of being retried with the whole object, which `put` would do.
     fn put_owned(&self, key: &str, data: Vec<u8>) -> Result<()> {
         self.put(key, &data)
     }

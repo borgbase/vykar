@@ -132,117 +132,103 @@ pub fn compact_repo(
     let blobs_live = AtomicU64::new(0);
 
     let storage = repo.storage.as_ref();
-    let work_idx = std::sync::atomic::AtomicUsize::new(0);
+    crate::repo::bounded::for_each_bounded(concurrency, &discovered, shutdown, |(key, pack_id)| {
+        packs_total.fetch_add(1, Ordering::Relaxed);
 
-    std::thread::scope(|s| {
-        for _ in 0..concurrency {
-            s.spawn(|| loop {
-                if shutdown.is_some_and(|f| f.load(Ordering::Relaxed)) {
-                    break;
-                }
-                let idx = work_idx.fetch_add(1, Ordering::Relaxed);
-                let Some((key, pack_id)) = discovered.get(idx) else {
-                    break;
-                };
+        // Get pack size via metadata-only call (HEAD, stat, fs::metadata).
+        let pack_size = match storage.size(key) {
+            Ok(Some(sz)) => sz,
+            Ok(None) => {
+                // Pack disappeared between list and size.
+                warn!("Pack {} disappeared before size check, skipping", pack_id);
+                packs_corrupt.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            Err(e) => {
+                warn!("Skipping pack {} (size check failed): {}", pack_id, e);
+                packs_corrupt.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        };
 
-                packs_total.fetch_add(1, Ordering::Relaxed);
+        let index_entries = per_pack_lookup.get(pack_id);
 
-                // Get pack size via metadata-only call (HEAD, stat, fs::metadata).
-                let pack_size = match storage.size(key) {
-                    Ok(Some(sz)) => sz,
-                    Ok(None) => {
-                        // Pack disappeared between list and size.
-                        warn!("Pack {} disappeared before size check, skipping", pack_id);
-                        packs_corrupt.fetch_add(1, Ordering::Relaxed);
-                        continue;
-                    }
-                    Err(e) => {
-                        warn!("Skipping pack {} (size check failed): {}", pack_id, e);
-                        packs_corrupt.fetch_add(1, Ordering::Relaxed);
-                        continue;
-                    }
-                };
+        if let Some(entries) = index_entries {
+            // Case A: pack has index entries (normal pack).
+            let live_bytes: u64 = entries
+                .iter()
+                .map(|(_, stored_size, _)| 4 + *stored_size as u64)
+                .sum();
 
-                let index_entries = per_pack_lookup.get(pack_id);
+            // Sanity check: live bytes can't exceed pack payload.
+            if pack_size < pack_header_size || live_bytes > pack_size - pack_header_size {
+                warn!(
+                    "Pack {} has inconsistent size (pack_size={}, live_bytes={}, header={}), marking corrupt",
+                    pack_id, pack_size, live_bytes, pack_header_size
+                );
+                packs_corrupt.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
 
-                if let Some(entries) = index_entries {
-                    // Case A: pack has index entries (normal pack).
-                    let live_bytes: u64 = entries
-                        .iter()
-                        .map(|(_, stored_size, _)| 4 + *stored_size as u64)
-                        .sum();
+            let payload = pack_size - pack_header_size;
+            let dead_bytes = payload - live_bytes;
 
-                    // Sanity check: live bytes can't exceed pack payload.
-                    if pack_size < pack_header_size || live_bytes > pack_size - pack_header_size {
-                        warn!(
-                            "Pack {} has inconsistent size (pack_size={}, live_bytes={}, header={}), marking corrupt",
-                            pack_id, pack_size, live_bytes, pack_header_size
-                        );
-                        packs_corrupt.fetch_add(1, Ordering::Relaxed);
-                        continue;
-                    }
+            blobs_live.fetch_add(entries.len() as u64, Ordering::Relaxed);
 
-                    let payload = pack_size - pack_header_size;
-                    let dead_bytes = payload - live_bytes;
+            if dead_bytes == 0 {
+                return;
+            }
 
-                    blobs_live.fetch_add(entries.len() as u64, Ordering::Relaxed);
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "ratio for display, precision loss acceptable"
+            )]
+            let unused_ratio = if payload > 0 {
+                (dead_bytes as f64 / payload as f64) * 100.0
+            } else {
+                0.0
+            };
 
-                    if dead_bytes == 0 {
-                        continue;
-                    }
+            if unused_ratio >= threshold {
+                let mut live_entries: Vec<LiveEntry> = entries
+                    .iter()
+                    .map(|(chunk_id, stored_size, pack_offset)| LiveEntry {
+                        chunk_id: *chunk_id,
+                        offset: *pack_offset,
+                        length: *stored_size,
+                    })
+                    .collect();
+                // Sort by offset for deterministic output and sequential reads.
+                live_entries.sort_by_key(|e| e.offset);
 
-                    #[allow(
-                        clippy::cast_precision_loss,
-                        reason = "ratio for display, precision loss acceptable"
-                    )]
-                    let unused_ratio = if payload > 0 {
-                        (dead_bytes as f64 / payload as f64) * 100.0
-                    } else {
-                        0.0
-                    };
+                analyses_mu
+                    .lock()
+                    .expect("compact analyses lock not poisoned")
+                    .push(PackAnalysis {
+                        pack_id: *pack_id,
+                        storage_key: key.clone(),
+                        live_entries,
+                        total_bytes: payload,
+                        dead_bytes,
+                    });
+            }
+        } else {
+            // Case B: orphan pack (no index entries).
+            packs_orphan.fetch_add(1, Ordering::Relaxed);
 
-                    if unused_ratio >= threshold {
-                        let mut live_entries: Vec<LiveEntry> = entries
-                            .iter()
-                            .map(|(chunk_id, stored_size, pack_offset)| LiveEntry {
-                                chunk_id: *chunk_id,
-                                offset: *pack_offset,
-                                length: *stored_size,
-                            })
-                            .collect();
-                        // Sort by offset for deterministic output and sequential reads.
-                        live_entries.sort_by_key(|e| e.offset);
-
-                        analyses_mu
-                            .lock()
-                            .expect("compact analyses lock not poisoned")
-                            .push(PackAnalysis {
-                            pack_id: *pack_id,
-                            storage_key: key.clone(),
-                            live_entries,
-                            total_bytes: payload,
-                            dead_bytes,
-                        });
-                    }
-                } else {
-                    // Case B: orphan pack (no index entries).
-                    packs_orphan.fetch_add(1, Ordering::Relaxed);
-
-                    let payload = pack_size.saturating_sub(pack_header_size);
-                    if payload > 0 {
-                        analyses_mu
-                            .lock()
-                            .expect("compact analyses lock not poisoned")
-                            .push(PackAnalysis {
-                            pack_id: *pack_id,
-                            storage_key: key.clone(),
-                            live_entries: Vec::new(),
-                            total_bytes: payload,
-                            dead_bytes: payload,
-                        });
-                    }
-                }
-            });
+            let payload = pack_size.saturating_sub(pack_header_size);
+            if payload > 0 {
+                analyses_mu
+                    .lock()
+                    .expect("compact analyses lock not poisoned")
+                    .push(PackAnalysis {
+                        pack_id: *pack_id,
+                        storage_key: key.clone(),
+                        live_entries: Vec::new(),
+                        total_bytes: payload,
+                        dead_bytes: payload,
+                    });
+            }
         }
     });
 

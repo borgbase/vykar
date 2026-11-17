@@ -596,13 +596,13 @@ impl Repository {
     /// exist on storage. Returns an error if any are missing.
     ///
     /// Every pack is checked; only the request pattern adapts (see
-    /// `pack_verify`), with up to `request_concurrency` requests in flight.
+    /// `pack_verify`), with up to the backend's request width in flight.
     fn verify_delta_packs(&self, delta: &IndexDelta) -> Result<()> {
         super::pack_verify::verify_packs_present(
             self.storage.as_ref(),
             &Self::delta_pack_ids(delta),
             self.persisted_pack_count(),
-            self.request_concurrency,
+            self.request_width(),
         )
     }
 
@@ -902,7 +902,7 @@ impl Repository {
         // the join.
         let pack_ids = Self::delta_pack_ids(&delta);
         let persisted_packs = self.persisted_pack_count();
-        let width = self.request_concurrency;
+        let width = self.request_width();
         let generation = rand::rng().next_u64();
         let new_cache_path = full_cache_path.with_extension("merged");
         let storage = self.storage.as_ref();

@@ -47,7 +47,9 @@ pub(crate) struct UploadQueue {
     done_tx: crossbeam_channel::Sender<u64>,
     done_rx: crossbeam_channel::Receiver<u64>,
     next_seq: u64,
-    /// Configurable limit for in-flight background pack uploads.
+    /// Upload slots. `UPLOAD_QUEUE_HEADROOM` more sealed packs may queue
+    /// before `wait_below_count_cap` blocks, so up to this plus the headroom
+    /// uploads run at once.
     pub(crate) max_in_flight_uploads: usize,
     /// Also bound sealed-but-unwritten packs by bytes: the queued packs plus
     /// the one about to be sealed may not exceed the current data-pack

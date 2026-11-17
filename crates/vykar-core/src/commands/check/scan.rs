@@ -858,51 +858,38 @@ fn parallel_verify_data(
         return (0, Vec::new());
     }
 
-    let work_idx = AtomicUsize::new(0);
     let verified = AtomicUsize::new(0);
     let issues = Mutex::new(Vec::new());
 
-    std::thread::scope(|s| {
-        for _ in 0..concurrency {
-            s.spawn(|| loop {
-                if is_shutting_down(shutdown) {
-                    break;
-                }
-                let idx = work_idx.fetch_add(1, Ordering::Relaxed);
-                let Some((pack_id, chunks)) = packs.get(idx) else {
-                    break;
-                };
+    crate::repo::bounded::for_each_bounded(concurrency, packs, shutdown, |(pack_id, chunks)| {
+        let mut local_issues = Vec::new();
+        let count = if chunks.len() >= batch_threshold {
+            verify_pack_full(
+                storage.as_ref(),
+                crypto.as_ref(),
+                chunk_hasher,
+                pack_id,
+                chunks,
+                &mut local_issues,
+            )
+        } else {
+            verify_pack_individual(
+                storage.as_ref(),
+                crypto.as_ref(),
+                chunk_hasher,
+                pack_id,
+                chunks,
+                &mut local_issues,
+                shutdown,
+            )
+        };
 
-                let mut local_issues = Vec::new();
-                let count = if chunks.len() >= batch_threshold {
-                    verify_pack_full(
-                        storage.as_ref(),
-                        crypto.as_ref(),
-                        chunk_hasher,
-                        pack_id,
-                        chunks,
-                        &mut local_issues,
-                    )
-                } else {
-                    verify_pack_individual(
-                        storage.as_ref(),
-                        crypto.as_ref(),
-                        chunk_hasher,
-                        pack_id,
-                        chunks,
-                        &mut local_issues,
-                        shutdown,
-                    )
-                };
-
-                verified.fetch_add(count, Ordering::Relaxed);
-                if !local_issues.is_empty() {
-                    issues
-                        .lock()
-                        .expect("scan verify issues lock not poisoned")
-                        .extend(local_issues);
-                }
-            });
+        verified.fetch_add(count, Ordering::Relaxed);
+        if !local_issues.is_empty() {
+            issues
+                .lock()
+                .expect("scan verify issues lock not poisoned")
+                .extend(local_issues);
         }
     });
 

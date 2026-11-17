@@ -239,7 +239,7 @@ fn large_gap_splits_into_separate_reads() {
 
     // Store: small chunk A, large gap chunk (>256 KiB), small chunk B — all in one flush.
     let data_a = b"small-chunk-a-unique-data-xxxxx";
-    let gap_data = vec![0x42u8; 300 * 1024]; // 300 KiB — exceeds COALESCE_GAP
+    let gap_data = vec![0x42u8; 300 * 1024]; // 300 KiB — exceeds MAX_COALESCE_GAP
     let data_b = b"small-chunk-b-unique-data-yyyyy";
 
     let (id_a, _, _) = repo
@@ -271,7 +271,7 @@ fn large_gap_splits_into_separate_reads() {
     let gap_between = chunks[1].2 - (chunks[0].2 + chunks[0].3 as u64);
     assert!(
         gap_between > 256 * 1024,
-        "gap {gap_between} should exceed COALESCE_GAP (256 KiB) to force a split"
+        "gap {gap_between} should exceed MAX_COALESCE_GAP (256 KiB) to force a split"
     );
 
     repo.clear_blob_cache();

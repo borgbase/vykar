@@ -69,12 +69,14 @@ pub(crate) struct RecoveryTarget<'a> {
 /// Active sessions and sessions with unreadable markers are skipped.
 ///
 /// Must be called inside the repo lock, before `enable_tiered_dedup_mode()`.
-/// Returns the total number of recovered chunk entries.
+/// Returns the total number of recovered chunk entries. `width` bounds the
+/// concurrent pack size lookups (see `pack_recovery`).
 pub(crate) fn recover_pending_index(
     storage: &dyn StorageBackend,
     crypto: &dyn CryptoEngine,
     chunk_index: &ChunkIndex,
     own_session_id: &str,
+    width: usize,
     target: &mut RecoveryTarget<'_>,
 ) -> Result<PendingIndexRecovery> {
     let all_keys = storage.list(SESSIONS_PREFIX)?;
@@ -144,7 +146,7 @@ pub(crate) fn recover_pending_index(
             Some(MarkerState::Unknown) => continue,
         };
 
-        match recover_single_index(storage, crypto, chunk_index, index_key, target) {
+        match recover_single_index(storage, crypto, chunk_index, index_key, width, target) {
             Ok(RecoverResult::Ok(n)) => {
                 target.recovered_index_keys.push(index_key.clone());
                 recovered_sessions.push(session_id.clone());
@@ -192,6 +194,7 @@ fn recover_single_index(
     crypto: &dyn CryptoEngine,
     chunk_index: &ChunkIndex,
     key: &str,
+    width: usize,
     target: &mut RecoveryTarget<'_>,
 ) -> Result<RecoverResult> {
     let data = match storage.get(key)? {
@@ -242,7 +245,7 @@ fn recover_single_index(
         "found pending index from interrupted session, verifying packs\u{2026}"
     );
 
-    let accepted = verify_journal_packs(storage, &wire);
+    let accepted = verify_journal_packs(storage, &wire, width);
 
     let mut recovered = 0usize;
     let pack_count = wire.len();
@@ -375,7 +378,7 @@ mod tests {
         let mut ws = WriteSessionState::new(1024, 1024, 1, HashAlgorithm::Blake2b);
         ws.session_id = "current".to_string();
         let recovery = ws
-            .recover_pending_index(storage, &crypto, &ChunkIndex::new())
+            .recover_pending_index(storage, &crypto, &ChunkIndex::new(), 1)
             .unwrap();
         (ws, recovery)
     }
@@ -418,7 +421,7 @@ mod tests {
         ws.session_id = "new".to_string();
 
         let recovery = ws
-            .recover_pending_index(&storage, &crypto, &chunk_index)
+            .recover_pending_index(&storage, &crypto, &chunk_index, 1)
             .unwrap();
         assert!(
             recovery.recovered_chunks > 0,
@@ -445,7 +448,7 @@ mod tests {
         ws.session_id = "current".to_string();
 
         let recovery = ws
-            .recover_pending_index(&storage, &crypto, &chunk_index)
+            .recover_pending_index(&storage, &crypto, &chunk_index, 1)
             .unwrap();
         assert!(
             recovery.recovered_chunks > 0,
@@ -478,7 +481,7 @@ mod tests {
         ws.session_id = "current".to_string();
 
         let recovery = ws
-            .recover_pending_index(&storage, &crypto, &chunk_index)
+            .recover_pending_index(&storage, &crypto, &chunk_index, 1)
             .unwrap();
         assert_eq!(
             recovery.recovered_chunks, 0,
@@ -506,7 +509,7 @@ mod tests {
         ws.session_id = "current".to_string();
 
         let recovery = ws
-            .recover_pending_index(&storage, &crypto, &chunk_index)
+            .recover_pending_index(&storage, &crypto, &chunk_index, 1)
             .unwrap();
         assert_eq!(
             recovery.recovered_chunks, 0,
@@ -589,7 +592,7 @@ mod tests {
         ws.session_id = "current".to_string();
 
         let recovery = ws
-            .recover_pending_index(&storage, &crypto, &chunk_index)
+            .recover_pending_index(&storage, &crypto, &chunk_index, 1)
             .unwrap();
         assert!(
             recovery.recovered_chunks > 0,
@@ -625,7 +628,7 @@ mod tests {
         ws.session_id = "current".to_string();
 
         let _recovered = ws
-            .recover_pending_index(&storage, &crypto, &chunk_index)
+            .recover_pending_index(&storage, &crypto, &chunk_index, 1)
             .unwrap();
 
         // Corrupt .index should be deleted.
@@ -658,7 +661,7 @@ mod tests {
         ws.session_id = "current".to_string();
 
         let recovery = ws
-            .recover_pending_index(&storage, &crypto, &chunk_index)
+            .recover_pending_index(&storage, &crypto, &chunk_index, 1)
             .unwrap();
         assert_eq!(recovery.recovered_chunks, 0, "all chunks already indexed");
         assert_eq!(recovery.recovered_sessions, vec!["old"]);

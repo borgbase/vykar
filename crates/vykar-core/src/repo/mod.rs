@@ -324,8 +324,9 @@ pub struct Repository {
     /// would cost another Argon2id derivation and need the passphrase threaded
     /// into the scan. `None` for unencrypted repositories.
     key_blob: Option<Vec<u8>>,
-    /// Independent read-only requests the commit may issue at once (pack
-    /// verification). 1 = serial; set by `begin_write_session` from
+    /// Independent read-only requests a write session may issue at once
+    /// (journal recovery's pack lookups, commit-time pack verification).
+    /// 1 = serial; set by `begin_write_session` from
     /// `WriteSessionOptions::commit_request_width` (backup: the backend's
     /// `request_width`).
     request_concurrency: usize,

@@ -691,9 +691,10 @@ fn run_against_repo(
             return Err(VykarError::SnapshotAlreadyExists(snapshot_name.into()));
         }
 
-        // Activate write session with per-session pending_index. Commit-time
-        // pack verification may overlap its read-only requests up to the
-        // backend's request width (the warm HTTP pool).
+        // Activate write session with per-session pending_index. Journal
+        // recovery's pack lookups and commit-time pack verification may
+        // overlap their read-only requests up to the backend's request width
+        // (the warm HTTP pool).
         repo.begin_write_session(&session_opts)?;
 
         // Recover chunk→pack mappings from a previous interrupted session.

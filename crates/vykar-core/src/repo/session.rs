@@ -28,7 +28,8 @@ pub struct WriteSessionOptions {
     /// Stream data packs to the backend while they fill
     /// (see `WriteSessionState::stream_data_packs`).
     pub stream_data_packs: bool,
-    /// Independent read-only requests the commit may issue at once.
+    /// Independent read-only requests the session may issue at once (journal
+    /// recovery's pack lookups, commit-time pack verification).
     pub commit_request_width: usize,
 }
 
@@ -321,11 +322,14 @@ impl Repository {
     /// `pending_index` file. Verifies each pack exists before adding entries.
     ///
     /// Must be called inside the repo lock, before `enable_tiered_dedup_mode()`.
+    /// Pack lookups use the session's request width
+    /// (`WriteSessionOptions::commit_request_width`).
     pub fn recover_pending_index(&mut self) -> Result<PendingIndexRecovery> {
         active_mut(&mut self.write_session).recover_pending_index(
             &*self.storage,
             &*self.crypto,
             &self.chunk_index,
+            self.request_concurrency,
         )
     }
 

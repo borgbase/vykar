@@ -343,7 +343,9 @@ fn pack_deleted_before_commit_fails_backup_few_packs() {
 
 /// A backend with a batch size API (vykar-server `?sizes`) verifies every
 /// session pack with one request and still refuses to commit over a pack
-/// deleted after Phase 1.
+/// deleted after Phase 1. The next backup issues two batches: one to check
+/// the packs of the failed run's orphaned journal during recovery, one for
+/// its commit.
 #[test]
 fn pack_deleted_before_commit_fails_backup_batch_sizes() {
     let (_dir, config, src) = setup();
@@ -354,7 +356,11 @@ fn pack_deleted_before_commit_fails_backup_batch_sizes() {
         ..Default::default()
     };
     run_backup(&config, &src, &shared).unwrap();
-    assert_eq!(*shared.batches.lock().unwrap(), 1, "one batch per commit");
+    assert_eq!(
+        *shared.batches.lock().unwrap(),
+        2,
+        "one batch to check the failed run's journal, one for the commit"
+    );
     assert_eq!(repo_keys(&config, "snapshots/").len(), 1);
 }
 

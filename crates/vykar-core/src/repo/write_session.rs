@@ -335,12 +335,14 @@ impl WriteSessionState {
         storage: &dyn StorageBackend,
         crypto: &dyn CryptoEngine,
         chunk_index: &ChunkIndex,
+        width: usize,
     ) -> Result<PendingIndexRecovery> {
         journal_recovery::recover_pending_index(
             storage,
             crypto,
             chunk_index,
             &self.session_id,
+            width,
             &mut RecoveryTarget {
                 recovered_chunks: &mut self.recovered_chunks,
                 recovered_index_keys: &mut self.recovered_index_keys,

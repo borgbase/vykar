@@ -466,8 +466,15 @@ pub struct BackendProfile {
     /// [`StorageBackend::begin_staged_put`] can return a staged writer.
     pub staged_put: bool,
     /// Independent read-only requests worth issuing at once (listing,
-    /// existence checks, pack verification). At least 1.
+    /// existence checks, pack verification). At least 1. May exceed what the
+    /// backend serves at once: SFTP reports three per pooled connection, and
+    /// the extra requests wait for a connection.
     pub request_width: usize,
+    /// Whole-object transfers worth running at once: pack uploads during a
+    /// backup (a writer may queue [`UPLOAD_HEADROOM`] more), read groups
+    /// during a restore. An HTTP backend may split each transfer into
+    /// parallel parts. At least 1.
+    pub transfer_width: usize,
 }
 
 /// One entry of [`StorageBackend::list_sized`].
@@ -683,6 +690,19 @@ pub(crate) fn remote_request_width(max_connections: Option<usize>) -> usize {
 pub(crate) fn local_request_width(max_connections: Option<usize>) -> usize {
     max_connections.unwrap_or(2).clamp(1, 8)
 }
+
+/// [`BackendProfile::transfer_width`] of the local, REST and S3 backends:
+/// one transfer per configured connection (default 2).
+pub(crate) fn transfer_width(max_connections: Option<usize>) -> usize {
+    max_connections.unwrap_or(2).max(1)
+}
+
+/// Sealed packs a writer may hold beyond [`BackendProfile::transfer_width`],
+/// each already on its own upload thread, so up to
+/// `transfer_width + UPLOAD_HEADROOM` pack uploads run at once and a sealed
+/// pack is ready the moment a transfer finishes. Consumed by the writer
+/// only; the HTTP part-slot and pool sizes are independent formulas.
+pub const UPLOAD_HEADROOM: usize = 2;
 
 /// Idle-connection pool size for the HTTP backends, derived from the
 /// repository's `max_connections`.
@@ -905,9 +925,18 @@ mod tests {
         ] {
             assert_eq!(local_request_width(c), w, "local {c:?}");
         }
+        for (c, w) in [
+            (None, 2),
+            (Some(0), 1),
+            (Some(1), 1),
+            (Some(8), 8),
+            (Some(16), 16),
+        ] {
+            assert_eq!(transfer_width(c), w, "transfer {c:?}");
+        }
     }
 
-    /// Remote `(c * 3).min(24)`, local `c.min(8)`.
+    /// Remote `(c * 3).min(24)`, local `c.min(8)`; transfer width `c` everywhere.
     #[test]
     fn profile_widths_by_backend() {
         let tmp = tempfile::tempdir().unwrap();
@@ -921,6 +950,7 @@ mod tests {
                     local: true,
                     staged_put: true,
                     request_width: c.min(8),
+                    transfer_width: c,
                 },
                 "local c={c}"
             );
@@ -929,6 +959,7 @@ mod tests {
                 local: false,
                 staged_put: false,
                 request_width: (c * 3).min(24),
+                transfer_width: c,
             };
             let mut rest = test_config("https://backup.example.com/repo");
             rest.max_connections = Some(c);

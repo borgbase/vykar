@@ -759,6 +759,7 @@ mod tests {
                 local: false,
                 staged_put: false,
                 request_width: 3,
+                transfer_width: 3,
             }
         }
     }
@@ -834,7 +835,9 @@ mod tests {
             .unwrap();
         w.server_capabilities().unwrap();
         w.object_sizes(&["packs/00/k".into()]).unwrap();
-        assert_eq!(w.profile().request_width, 3);
+        let p = w.profile();
+        assert_eq!(p.request_width, 3);
+        assert_eq!(p.transfer_width, 3);
 
         // 22 trait methods, 21 of them forwarded.
         assert_eq!(w.inner.calls.load(Ordering::SeqCst), 21);

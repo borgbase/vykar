@@ -42,6 +42,7 @@ pub struct S3Backend {
     /// parts but refuses completions still gets the second attempt.
     multipart_proven: std::sync::atomic::AtomicBool,
     request_width: usize,
+    transfer_width: usize,
 }
 
 #[allow(clippy::result_large_err)]
@@ -96,6 +97,7 @@ impl S3Backend {
             part_slots: multipart::PartSlots::new(part_concurrency),
             multipart_proven: std::sync::atomic::AtomicBool::new(false),
             request_width: crate::remote_request_width(max_connections),
+            transfer_width: crate::transfer_width(max_connections),
         })
     }
 
@@ -503,6 +505,7 @@ impl StorageBackend for S3Backend {
             local: false,
             staged_put: false,
             request_width: self.request_width,
+            transfer_width: self.transfer_width,
         }
     }
 

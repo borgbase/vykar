@@ -105,6 +105,7 @@ impl StorageBackend for AdvisoryLockBackend {
             local: false,
             staged_put: false,
             request_width: 1,
+            transfer_width: 1,
         }
     }
 

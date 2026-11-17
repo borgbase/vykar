@@ -6,7 +6,6 @@ use super::write_session::{
     active, active_mut, RollbackTracker, WriteSessionState, DEFAULT_SESSION_ID,
 };
 use super::Repository;
-use crate::config::ResourceLimitsConfig;
 use crate::index::dedup_cache::{self, DedupPrefilter, TieredDedupIndex};
 use crate::index::{ChunkIndex, DedupIndex, IndexDelta};
 use vykar_storage::BackendProfile;
@@ -22,7 +21,8 @@ const DEFAULT_MAX_IN_FLIGHT_UPLOADS: usize = 2;
 pub struct WriteSessionOptions {
     /// Names the session's `pending_index` journal.
     pub session_id: String,
-    /// Bound on in-flight background pack uploads. The queue admits
+    /// Bound on in-flight background pack uploads; a backup takes it from
+    /// [`BackendProfile::transfer_width`]. The queue admits
     /// `UPLOAD_QUEUE_HEADROOM` more sealed packs before the producer blocks
     /// (see `UploadQueue::wait_below_count_cap`).
     pub max_in_flight_uploads: usize,
@@ -47,14 +47,10 @@ impl Default for WriteSessionOptions {
 
 impl WriteSessionOptions {
     /// Options for a backup against a backend with `profile`.
-    pub fn for_backup(
-        session_id: String,
-        profile: BackendProfile,
-        limits: &ResourceLimitsConfig,
-    ) -> Self {
+    pub fn for_backup(session_id: String, profile: BackendProfile) -> Self {
         Self {
             session_id,
-            max_in_flight_uploads: limits.upload_concurrency(),
+            max_in_flight_uploads: profile.transfer_width,
             cap_upload_bytes: profile.local,
             // Data packs go straight to a temp file in the repository where the
             // backend can do that (local), instead of holding up to two pack
@@ -510,28 +506,23 @@ impl Repository {
 #[cfg(test)]
 mod tests {
     use super::WriteSessionOptions;
-    use crate::config::ResourceLimitsConfig;
     use crate::testutil::test_repo_plaintext;
     use std::sync::Arc;
     use vykar_storage::{delegate_storage_backend, BackendProfile, InnerBackend, StorageBackend};
 
     #[test]
     fn for_backup_derives_from_profile() {
-        let limits = ResourceLimitsConfig {
-            connections: 5,
-            ..ResourceLimitsConfig::default()
-        };
         let local = WriteSessionOptions::for_backup(
             "s".into(),
             BackendProfile {
                 local: true,
                 staged_put: true,
                 request_width: 5,
+                transfer_width: 7,
             },
-            &limits,
         );
         assert_eq!(local.session_id, "s");
-        assert_eq!(local.max_in_flight_uploads, 5);
+        assert_eq!(local.max_in_flight_uploads, 7);
         assert!(local.cap_upload_bytes);
         assert!(local.stream_data_packs);
 
@@ -541,9 +532,10 @@ mod tests {
                 local: false,
                 staged_put: false,
                 request_width: 15,
+                transfer_width: 3,
             },
-            &limits,
         );
+        assert_eq!(remote.max_in_flight_uploads, 3);
         assert!(!remote.cap_upload_bytes);
         assert!(!remote.stream_data_packs);
     }

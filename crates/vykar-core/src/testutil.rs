@@ -180,6 +180,7 @@ impl StorageBackend for MemoryBackend {
             local: true,
             staged_put: false,
             request_width: 2,
+            transfer_width: 2,
         }
     }
 

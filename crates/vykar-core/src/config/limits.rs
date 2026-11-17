@@ -18,8 +18,9 @@ pub const THREADS_MAX: usize = 128;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResourceLimitsConfig {
-    /// Parallel backend operations (SFTP pool, upload concurrency, restore threads).
-    /// Range: 1–16. Default: 2.
+    /// Parallel backend operations (SFTP pool, pack uploads, restore readers).
+    /// Pack uploads and restore readers follow the backend's
+    /// `BackendProfile::transfer_width`. Range: 1–16. Default: 2.
     #[serde(default = "default_connections")]
     pub connections: usize,
     /// CPU worker threads for backup transforms.
@@ -116,16 +117,6 @@ impl ResourceLimitsConfig {
     /// Max pending chunk actions (fixed 8192).
     pub fn max_pending_actions(&self) -> usize {
         8192
-    }
-
-    /// Upload concurrency = connections.
-    pub fn upload_concurrency(&self) -> usize {
-        self.connections
-    }
-
-    /// Restore reader thread count = connections.
-    pub fn restore_concurrency(&self) -> usize {
-        self.connections
     }
 
     /// Verify-data concurrency: capped at 4 (each thread holds ~128 MiB).

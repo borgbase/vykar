@@ -442,6 +442,7 @@ mod tests {
                     local: false,
                     staged_put: false,
                     request_width: 1,
+                    transfer_width: 1,
                 }
             }
 
@@ -493,7 +494,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let inner = vykar_storage::local_backend::LocalBackend::new(tmp.path().to_str().unwrap())
             .unwrap()
-            .with_max_connections(Some(4));
+            .with_max_connections(Some(16));
         let limits = ResourceLimitsConfig {
             upload_mib_per_sec: 1,
             ..ResourceLimitsConfig::default()
@@ -504,7 +505,8 @@ mod tests {
             vykar_storage::BackendProfile {
                 local: true,
                 staged_put: false,
-                request_width: 4,
+                request_width: 8,
+                transfer_width: 16,
             }
         );
         assert!(wrapped.begin_staged_put("packs").unwrap().is_none());

@@ -212,7 +212,8 @@ pub(crate) fn env_usize(name: &str) -> Option<usize> {
 /// One stream at 40 ms RTT is capped near 100 MiB/s by its send window, and
 /// every part pays ~1 RTT of fixed turnaround, so throughput scales with the
 /// number of concurrent streams rather than with the number of packs in
-/// flight. Core keeps `connections + 2` packs in flight; parts of each pack
+/// flight. A writer runs up to [`crate::BackendProfile::transfer_width`] +
+/// [`crate::UPLOAD_HEADROOM`] pack uploads at once; parts of each pack
 /// upload in parallel, bounded across all packs by this many slots.
 pub(crate) fn part_concurrency(env_name: &str, max_connections: Option<usize>) -> usize {
     if let Some(n) = env_usize(env_name) {

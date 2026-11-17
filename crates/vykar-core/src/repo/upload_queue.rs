@@ -4,8 +4,9 @@ use crate::index::PendingChunkEntry;
 use vykar_types::error::{Result, VykarError};
 use vykar_types::pack_id::PackId;
 
-/// Extra upload handles allowed beyond `max_in_flight_uploads` before blocking.
-pub(super) const UPLOAD_QUEUE_HEADROOM: usize = 2;
+/// Extra upload handles allowed beyond `max_in_flight_uploads` before
+/// blocking; the storage crate's [`vykar_storage::UPLOAD_HEADROOM`].
+pub(super) const UPLOAD_QUEUE_HEADROOM: usize = vykar_storage::UPLOAD_HEADROOM;
 
 /// A background pack upload plus what to journal once it is confirmed.
 pub(crate) struct PendingUpload {

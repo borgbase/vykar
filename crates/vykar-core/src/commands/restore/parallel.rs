@@ -337,7 +337,8 @@ fn lightest_bucket(bucket_bytes: &[u64]) -> usize {
         .map_or(0, |(i, _)| i)
 }
 
-/// Run every read group across a scoped worker pool.
+/// Run every read group across a scoped pool of `readers` workers (at most
+/// one per group).
 ///
 /// With `failures` set, source-side failures are recorded in it (against the
 /// files they affect in continue mode, or blob by blob for a deferring sink)
@@ -350,7 +351,7 @@ pub(super) fn execute_parallel_restore(
     storage: &Arc<dyn StorageBackend>,
     crypto: &dyn CryptoEngine,
     root: &Path,
-    restore_concurrency: usize,
+    readers: usize,
     verify_chunks: bool,
     shutdown: Option<&AtomicBool>,
     failures: Option<&BatchFailures>,
@@ -360,7 +361,7 @@ pub(super) fn execute_parallel_restore(
         return Ok(0);
     }
 
-    let num_threads = restore_concurrency.min(groups.len());
+    let num_threads = readers.min(groups.len());
     let buckets = partition_groups(groups, num_threads);
 
     let bytes_written = AtomicU64::new(0);

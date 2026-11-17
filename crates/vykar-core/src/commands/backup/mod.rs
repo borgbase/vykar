@@ -571,7 +571,7 @@ fn run_against_repo(
 
     // Generate a unique session ID for this backup.
     let session_id = format!("{:032x}", rand::random::<u128>());
-    let session_opts = WriteSessionOptions::for_backup(session_id.clone(), profile, &config.limits);
+    let session_opts = WriteSessionOptions::for_backup(session_id.clone(), profile);
 
     // ── Phase 1: Register session and upload (no lock) ──────────────────
     //

@@ -15,6 +15,7 @@ const STAGED_WRITE_BUFFER: usize = 64 * 1024;
 pub struct LocalBackend {
     root: PathBuf,
     request_width: usize,
+    transfer_width: usize,
 }
 
 impl LocalBackend {
@@ -35,14 +36,17 @@ impl LocalBackend {
         Ok(Self {
             root,
             request_width: crate::local_request_width(None),
+            transfer_width: crate::transfer_width(None),
         })
     }
 
-    /// Size [`BackendProfile::request_width`] from the repository's
-    /// configured connection count.
+    /// Size [`BackendProfile::request_width`] and
+    /// [`BackendProfile::transfer_width`] from the repository's configured
+    /// connection count.
     #[must_use]
     pub fn with_max_connections(mut self, max_connections: Option<usize>) -> Self {
         self.request_width = crate::local_request_width(max_connections);
+        self.transfer_width = crate::transfer_width(max_connections);
         self
     }
 
@@ -367,6 +371,7 @@ impl StorageBackend for LocalBackend {
             local: true,
             staged_put: true,
             request_width: self.request_width,
+            transfer_width: self.transfer_width,
         }
     }
 
@@ -612,12 +617,15 @@ mod tests {
         assert!(profile.local);
         assert!(profile.staged_put);
         assert_eq!(profile.request_width, 2);
+        assert_eq!(profile.transfer_width, 2);
         assert!(backend.begin_staged_put("packs").unwrap().is_some());
 
         let wide = LocalBackend::new(root)
             .unwrap()
             .with_max_connections(Some(16));
-        assert_eq!(wide.profile().request_width, 8);
+        let wide = wide.profile();
+        assert_eq!(wide.request_width, 8);
+        assert_eq!(wide.transfer_width, 16);
     }
 
     #[test]

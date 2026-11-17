@@ -650,6 +650,7 @@ mod tests {
                 local: true,
                 staged_put: true,
                 request_width: 1,
+                transfer_width: 1,
             }
         }
 
@@ -920,6 +921,7 @@ mod tests {
                     local: false,
                     staged_put: false,
                     request_width: 1,
+                    transfer_width: 1,
                 }
             }
 
@@ -1014,6 +1016,7 @@ mod tests {
                 local: false,
                 staged_put: false,
                 request_width: 1,
+                transfer_width: 1,
             }
         }
 

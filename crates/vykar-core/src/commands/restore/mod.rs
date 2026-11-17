@@ -97,6 +97,11 @@ const MAX_RESTORE_WARNINGS: usize = 64;
 /// stays exact past it.
 const MAX_DAMAGED_REPORTED: usize = 10_000;
 
+/// Read-group workers for a restore against a backend with `profile`.
+fn restore_readers(profile: vykar_storage::BackendProfile) -> usize {
+    profile.transfer_width.max(1)
+}
+
 // ---------------------------------------------------------------------------
 // Public entry points
 // ---------------------------------------------------------------------------
@@ -267,6 +272,7 @@ where
     // directly via `StorageBackend::open_range`, so the cache only serves the
     // small item-stream tree-pack chunks. 2 MiB is plenty.
     repo.set_blob_cache_max_bytes(2 * 1024 * 1024);
+    let readers = restore_readers(repo.storage.profile());
     let RestoreOptions {
         xattrs_enabled,
         verify_chunks,
@@ -440,7 +446,7 @@ where
                 &repo.storage,
                 repo.crypto.as_ref(),
                 &temp_root,
-                config.limits.restore_concurrency(),
+                readers,
                 verify_chunks,
                 shutdown,
                 failures.as_ref(),
@@ -506,7 +512,7 @@ where
                         &repo.storage,
                         repo.crypto.as_ref(),
                         &temp_root,
-                        config.limits.restore_concurrency(),
+                        readers,
                         verify_chunks,
                         shutdown,
                         retry_failures.as_ref(),
@@ -992,6 +998,18 @@ pub(super) fn warn_metadata_err<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restore_readers_follow_transfer_width() {
+        let profile = |transfer_width| vykar_storage::BackendProfile {
+            local: false,
+            staged_put: false,
+            request_width: 9,
+            transfer_width,
+        };
+        assert_eq!(restore_readers(profile(5)), 5);
+        assert_eq!(restore_readers(profile(0)), 1);
+    }
 
     #[test]
     fn path_matches_selection_ancestors() {

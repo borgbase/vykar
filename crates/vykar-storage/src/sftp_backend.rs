@@ -1375,6 +1375,8 @@ impl StorageBackend for SftpBackend {
             staged_put: false,
             // Deliberately exceeds the pool; extra requests wait for a connection.
             request_width: crate::remote_request_width(Some(self.max_connections)),
+            // The pool size: each transfer holds one pooled session.
+            transfer_width: self.max_connections,
         }
     }
 
@@ -1469,6 +1471,7 @@ mod tests {
                 local: false,
                 staged_put: false,
                 request_width: 12,
+                transfer_width: 4,
             }
         );
     }

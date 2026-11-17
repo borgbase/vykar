@@ -94,6 +94,7 @@ pub struct RestBackend {
     /// Target part size; packs at or below it are sent whole.
     part_size: usize,
     request_width: usize,
+    transfer_width: usize,
 }
 
 impl RestBackend {
@@ -143,6 +144,7 @@ impl RestBackend {
             part_slots: crate::http_util::PartSlots::new(part_concurrency),
             part_size: parts::part_size(),
             request_width: crate::remote_request_width(max_connections),
+            transfer_width: crate::transfer_width(max_connections),
         })
     }
 
@@ -933,6 +935,7 @@ impl StorageBackend for RestBackend {
             local: false,
             staged_put: false,
             request_width: self.request_width,
+            transfer_width: self.transfer_width,
         }
     }
 

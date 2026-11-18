@@ -139,6 +139,8 @@ URL format: `sftp://[user@]host[:port]/path`. Default port is 22.
 
 The server must support the `posix-rename@openssh.com` extension. Vykar uploads each object to a temporary file and renames it over the destination, so an interrupted upload never leaves a partial object in place. OpenSSH's `sftp-server` provides the extension. On servers that do not advertise it, reads (restore, list, check) still work, but every write fails with an error naming the missing extension.
 
+`sftp_timeout` applies to each SFTP request. The data writes of an upload are sent up to 2 MiB ahead of their acknowledgements, so each of them is allowed four times `sftp_timeout`.
+
 ## REST (vykar-server)
 
 Store backups on a dedicated [vykar-server](/server-setup) instance via HTTP/HTTPS. The server provides append-only enforcement, quotas, lock management, and server-side compaction.

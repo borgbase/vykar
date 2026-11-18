@@ -29,6 +29,9 @@ pub(super) struct Faults {
     pub drop_rename_reply_once: AtomicBool,
     /// Kill the connection on the next WRITE, before writing anything.
     pub drop_on_write_once: AtomicBool,
+    /// Kill the connection on the WRITE with this 1-based number (counted
+    /// across connections, like `writes`), before writing it. 0 = off.
+    pub drop_on_write_number: AtomicUsize,
     /// Seconds added to every mtime the server reports, as if its clock
     /// differed from the client's.
     pub mtime_skew_secs: AtomicI64,
@@ -338,6 +341,16 @@ impl russh_sftp::server::Handler for SftpHandler {
         data: Vec<u8>,
     ) -> Result<Status, Self::Error> {
         if self.faults.drop_on_write_once.swap(false, Ordering::SeqCst) {
+            self.kill_connection().await;
+            std::future::pending::<()>().await;
+        }
+        let number = self.faults.writes.load(Ordering::SeqCst) + 1;
+        if self
+            .faults
+            .drop_on_write_number
+            .compare_exchange(number, 0, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
             self.kill_connection().await;
             std::future::pending::<()>().await;
         }

@@ -66,6 +66,23 @@ const TEMP_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 /// and keeps NAT mappings alive.
 const DEFAULT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Unacknowledged SFTP WRITE requests per upload. With
+/// `SFTP_MAX_WRITE_PACKET_LEN` this keeps 2 MiB in flight, matching the
+/// 2 MiB channel window OpenSSH grants, so uploads run at window / RTT per
+/// connection. The library default (16) caps them at 512 KiB / RTT.
+const SFTP_MAX_CONCURRENT_WRITES: usize = 64;
+
+/// Framed size of one SFTP WRITE. 32 KiB is the size every server must
+/// accept; for servers that do not advertise `limits@openssh.com` the
+/// library caps a larger value only at its own 256 KiB packet limit.
+const SFTP_MAX_WRITE_PACKET_LEN: u32 = 32 * 1024;
+
+/// Multiplier on `sftp_timeout` for the pipelined WRITEs of an upload. A
+/// request's deadline starts when it is queued, so a WRITE waits behind the
+/// whole pipeline. Scaling by the same factor as the depth (64 vs the
+/// library's 16) keeps the slowest workable link where it was.
+const SFTP_WRITE_TIMEOUT_FACTOR: u64 = 4;
+
 /// Parameters needed to (re-)establish an SFTP connection.
 #[derive(Clone)]
 struct SftpConnectParams {
@@ -422,8 +439,10 @@ impl SftpBackend {
             inactivity_timeout: Some(INACTIVITY_TIMEOUT),
             keepalive_interval: Some(DEFAULT_KEEPALIVE_INTERVAL),
             nodelay: true,
-            window_size: 16 * 1024 * 1024, // 16 MiB (default: 2 MiB)
-            maximum_packet_size: 65535,    // max safe value (russh errors above this)
+            // Receive-side window and packet size: they bound downloads only.
+            // Uploads are bounded by the window the server grants (OpenSSH: 2 MiB).
+            window_size: 16 * 1024 * 1024,
+            maximum_packet_size: 65535, // russh warns above this
             ..Default::default()
         });
         let handler = SshHandler {
@@ -478,10 +497,7 @@ impl SftpBackend {
             .request_subsystem(true, "sftp")
             .await
             .map_err(|e| ssh_retry_error("request sftp subsystem", &params.host, params.port, e))?;
-        let sftp_cfg = SftpConfig {
-            request_timeout_secs: params.sftp_timeout_secs,
-            ..SftpConfig::default()
-        };
+        let sftp_cfg = sftp_session_config(params.sftp_timeout_secs);
         let sftp = SftpSession::new_with_config(channel.into_stream(), sftp_cfg)
             .await
             .map_err(|e| {
@@ -635,6 +651,16 @@ fn normalize_sftp_timeout(requested: Option<u64>) -> u64 {
     requested
         .unwrap_or(DEFAULT_SFTP_TIMEOUT_SECS)
         .clamp(MIN_SFTP_TIMEOUT_SECS, MAX_SFTP_TIMEOUT_SECS)
+}
+
+/// Client settings for one SFTP session.
+fn sftp_session_config(request_timeout_secs: u64) -> SftpConfig {
+    SftpConfig {
+        request_timeout_secs,
+        max_concurrent_writes: SFTP_MAX_CONCURRENT_WRITES,
+        max_write_packet_len: SFTP_MAX_WRITE_PACKET_LEN,
+        ..SftpConfig::default()
+    }
 }
 
 /// Join two POSIX path segments with `/`. Never uses `std::path::Path`,
@@ -1084,6 +1110,7 @@ async fn atomic_put(
     tmp: &str,
     ensure_parent: Option<&str>,
     data: &[u8],
+    timeout_secs: u64,
 ) -> RetryResult<()> {
     if let Some(parent) = ensure_parent {
         mkdir_p(sftp, parent).await?;
@@ -1097,9 +1124,12 @@ async fn atomic_put(
             )
             .await
             .map_err(|e| sftp_retry_error("create", tmp, e))?;
-        file.write_all(data)
-            .await
-            .map_err(|e| io_retry_error("write", tmp, e))?;
+        // Pipelined WRITEs queue behind each other; give them a scaled deadline,
+        // and restore the normal one on every outcome since the session is reused.
+        sftp.set_timeout(timeout_secs.saturating_mul(SFTP_WRITE_TIMEOUT_FACTOR));
+        let wrote = file.write_all(data).await;
+        sftp.set_timeout(timeout_secs);
+        wrote.map_err(|e| io_retry_error("write", tmp, e))?;
         // Drains write acks and sends fsync@openssh.com when supported.
         file.flush()
             .await
@@ -1163,7 +1193,15 @@ impl SftpBackend {
                 if let Some(prev) = prev {
                     remove_temp_best_effort(sftp, &prev).await;
                 }
-                atomic_put(sftp, &path, &tmp, ensure_parent, &data).await
+                atomic_put(
+                    sftp,
+                    &path,
+                    &tmp,
+                    ensure_parent,
+                    &data,
+                    self.params.sftp_timeout_secs,
+                )
+                .await
             })
         })?;
         if let Some(parent) = ensure_parent {
@@ -1767,6 +1805,75 @@ mod tests {
         assert_eq!(backend.remove_stale_temp_files(Duration::ZERO).unwrap(), 1);
         assert!(foreign.exists());
         assert!(server.temps_next_to("packs/ab/x").is_empty());
+    }
+
+    #[test]
+    fn session_config_pipelines_two_mib_of_writes() {
+        let cfg = sftp_session_config(42);
+        assert_eq!(cfg.request_timeout_secs, 42);
+        assert_eq!(cfg.max_concurrent_writes, 64);
+        assert_eq!(cfg.max_write_packet_len, 32 * 1024);
+        let in_flight = cfg.max_concurrent_writes as u64 * u64::from(cfg.max_write_packet_len);
+        assert_eq!(
+            in_flight,
+            2 * 1024 * 1024,
+            "in-flight upload bytes per connection match OpenSSH's channel window"
+        );
+        assert_eq!(
+            in_flight / SFTP_WRITE_TIMEOUT_FACTOR,
+            16 * 32 * 1024,
+            "a queued WRITE gets the same byte budget per sftp_timeout as at the library default"
+        );
+        let lib = SftpConfig::default();
+        assert_eq!(cfg.max_concurrent_reads, lib.max_concurrent_reads);
+        assert_eq!(cfg.max_packet_len, lib.max_packet_len);
+    }
+
+    /// 3 MiB with a period that is not a power of two, so a WRITE applied at
+    /// the wrong offset changes the bytes.
+    fn patterned_payload() -> Vec<u8> {
+        (0..3 * 1024 * 1024).map(|i| (i % 251) as u8).collect()
+    }
+
+    #[test]
+    fn large_put_survives_deep_write_pipeline() {
+        let server = FaultServer::start();
+        let data = patterned_payload();
+        let backend = server.backend(0);
+        backend
+            .put_owned("packs/ab/deadbeef", data.clone())
+            .unwrap();
+
+        assert!(read(&server, "packs/ab/deadbeef") == data);
+        assert!(server.temps_next_to("packs/ab/deadbeef").is_empty());
+        // At least one WRITE per 32 KiB: the write size was not raised.
+        let writes = server.faults.writes.load(Ordering::SeqCst);
+        assert!(writes >= data.len().div_ceil(32 * 1024), "{writes} writes");
+    }
+
+    #[test]
+    fn connection_drop_with_full_write_pipeline_retries_to_success() {
+        let server = FaultServer::start();
+        backend_put_seed(&server);
+        let writes_now = server.faults.writes.load(Ordering::SeqCst);
+        server
+            .faults
+            .drop_on_write_number
+            .store(writes_now + 80, Ordering::SeqCst);
+
+        let data = patterned_payload();
+        let backend = server.backend(3);
+        backend
+            .put_owned("packs/ab/deadbeef", data.clone())
+            .unwrap();
+
+        assert!(read(&server, "packs/ab/deadbeef") == data);
+        assert!(server.temps_next_to("packs/ab/deadbeef").is_empty());
+        assert_eq!(
+            server.faults.drop_on_write_number.load(Ordering::SeqCst),
+            0,
+            "the fault fired"
+        );
     }
 
     fn backend_put_seed(server: &FaultServer) {

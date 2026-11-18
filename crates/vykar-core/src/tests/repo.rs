@@ -1217,7 +1217,7 @@ impl vykar_storage::InnerBackend for PutKeyLog {
 
 vykar_storage::delegate_storage_backend! {
     for PutKeyLog;
-    except [put, begin_staged_put, profile];
+    except [put, put_pack, begin_staged_put, profile];
 
     fn begin_staged_put(
         &self,
@@ -1236,6 +1236,14 @@ vykar_storage::delegate_storage_backend! {
     fn put(&self, key: &str, data: &[u8]) -> vykar_types::error::Result<()> {
         self.puts.lock().unwrap().push(key.to_string());
         self.inner.put(key, data)
+    }
+
+    fn put_pack(
+        &self,
+        key: &str,
+        data: vykar_storage::PackData,
+    ) -> vykar_types::error::Result<()> {
+        self.inner.put_pack(key, data)
     }
 }
 

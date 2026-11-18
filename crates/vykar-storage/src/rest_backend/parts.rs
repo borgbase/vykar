@@ -112,7 +112,7 @@ impl RestBackend {
     }
 
     /// Complete the part upload `token` of pack `key`. Needs no pack bytes,
-    /// so `put_owned` releases its buffer before calling this.
+    /// so `put_pack` releases its buffer before calling this.
     ///
     /// Retrying is safe: once committed, the server answers a repeated
     /// completion from the stored object's digest.

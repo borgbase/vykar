@@ -137,9 +137,17 @@ impl InnerBackend for ThrottledStorageBackend {
 // this impl cannot silently answer "unsupported" on behalf of a backend that
 // does support them, which is how `server_verify_packs` and `server_init` came
 // to be disabled on every throttled REST repo.
+//
+// Tokens are charged per object (before an upload is sent, after a read
+// completes), so the caps bound the average rate, not the peak: each object
+// still moves at link speed. Shaping the peak would need the limiter inside
+// the HTTP backends.
 delegate_storage_backend! {
     for ThrottledStorageBackend;
-    except [get, put, get_range, get_range_into, open_range, put_owned, begin_staged_put, profile];
+    except [
+        get, put, get_range, get_range_into, open_range, put_owned, put_pack, begin_staged_put,
+        profile
+    ];
 
     fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
         let out = self.inner.get(key)?;
@@ -199,9 +207,16 @@ delegate_storage_backend! {
         self.inner.put_owned(key, data)
     }
 
+    fn put_pack(&self, key: &str, data: vykar_storage::PackData) -> Result<()> {
+        if let Some(limiter) = self.write_limiter.as_ref() {
+            limiter.consume(data.len());
+        }
+        self.inner.put_pack(key, data)
+    }
+
     // A staged pack is written from the backup's consumer thread, where
     // throttling would stall chunk processing instead of one upload thread.
-    // Keep throttled repositories on the buffered `put_owned` path above.
+    // Keep throttled repositories on the buffered `put_pack` path above.
     fn begin_staged_put(&self, _prefix: &str) -> Result<Option<Box<dyn vykar_storage::StagedPut>>> {
         Ok(None)
     }
@@ -485,6 +500,83 @@ mod tests {
         assert_eq!(verify_calls.load(Ordering::SeqCst), 1);
         assert_eq!(init_calls.load(Ordering::SeqCst), 1);
         assert_eq!(sizes_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// Packs reach the inner `put_pack` (not `put`/`put_owned`), release
+    /// signal intact.
+    #[test]
+    fn throttled_backend_forwards_put_pack() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct PackRecorder {
+            pack_calls: Arc<AtomicUsize>,
+        }
+
+        impl StorageBackend for PackRecorder {
+            fn get(&self, _key: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn put(&self, _key: &str, _data: &[u8]) -> Result<()> {
+                Err(vykar_types::error::VykarError::Other(
+                    "pack reached put".into(),
+                ))
+            }
+            fn delete(&self, _key: &str) -> Result<()> {
+                Ok(())
+            }
+            fn exists(&self, _key: &str) -> Result<bool> {
+                Ok(false)
+            }
+            fn list(&self, _prefix: &str) -> Result<Vec<String>> {
+                Ok(Vec::new())
+            }
+            fn get_range(&self, _key: &str, _offset: u64, _length: u64) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn create_dir(&self, _key: &str) -> Result<()> {
+                Ok(())
+            }
+            fn put_owned(&self, _key: &str, _data: Vec<u8>) -> Result<()> {
+                Err(vykar_types::error::VykarError::Other(
+                    "pack reached put_owned".into(),
+                ))
+            }
+            fn put_pack(&self, _key: &str, data: vykar_storage::PackData) -> Result<()> {
+                self.pack_calls.fetch_add(1, Ordering::SeqCst);
+                drop(data);
+                Ok(())
+            }
+            fn profile(&self) -> vykar_storage::BackendProfile {
+                vykar_storage::BackendProfile {
+                    local: false,
+                    staged_put: false,
+                    request_width: 1,
+                    transfer_width: 1,
+                }
+            }
+
+            vykar_storage::unsupported_server_ops!();
+        }
+
+        let pack_calls = Arc::new(AtomicUsize::new(0));
+        let inner = Box::new(PackRecorder {
+            pack_calls: Arc::clone(&pack_calls),
+        });
+        // Non-zero cap, so the wrapper is actually installed.
+        let limits = ResourceLimitsConfig {
+            upload_mib_per_sec: 1,
+            ..ResourceLimitsConfig::default()
+        };
+        let wrapped = wrap_storage_backend(inner, &limits);
+
+        let released = Arc::new(AtomicUsize::new(0));
+        let r = Arc::clone(&released);
+        let data = vykar_storage::PackData::with_release(vec![0; 16], move || {
+            r.fetch_add(1, Ordering::SeqCst);
+        });
+        wrapped.put_pack("packs/00/x", data).unwrap();
+        assert_eq!(pack_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(released.load(Ordering::SeqCst), 1);
     }
 
     /// The throttle keeps packs on its `put` path, so its profile must not

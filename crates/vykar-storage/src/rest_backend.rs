@@ -87,7 +87,7 @@ pub struct RestBackend {
     parts_disabled: AtomicBool,
     /// Set by the first completed part upload. Until then a part upload
     /// keeps its whole-PUT fallback through the completion (see
-    /// [`StorageBackend::put_owned`]).
+    /// [`StorageBackend::put_pack`]).
     parts_proven: AtomicBool,
     /// Backend-wide budget of concurrent part PUTs.
     part_slots: crate::http_util::PartSlots,
@@ -625,15 +625,15 @@ impl StorageBackend for RestBackend {
     /// falls back as `put` does, and until one completion has succeeded on
     /// this backend the buffer is kept through it, so a server or proxy that
     /// accepts parts but refuses completions still gets whole PUTs.
-    fn put_owned(&self, key: &str, data: Vec<u8>) -> Result<()> {
+    fn put_pack(&self, key: &str, data: crate::PackData) -> Result<()> {
         let Some(pack_hex) = Self::try_extract_pack_hex(key) else {
-            return self.put_bytes(key, &data);
+            return self.put_bytes(key, data.as_slice());
         };
         if !self.parts_proven.load(Ordering::Relaxed) || !self.pack_parts_for(data.len()) {
-            return self.put_bytes(key, &data);
+            return self.put_bytes(key, data.as_slice());
         }
         let header = self.pack_digest_header();
-        match self.send_pack_parts(key, &data) {
+        match self.send_pack_parts(key, data.as_slice()) {
             Ok(token) => {
                 drop(data);
                 self.complete_pack_parts(key, pack_hex, header, &token)
@@ -650,7 +650,7 @@ impl StorageBackend for RestBackend {
             }
             Err(failure) => {
                 self.note_parts_failure(key, &failure);
-                self.put_whole(key, header, pack_hex, &data)
+                self.put_whole(key, header, pack_hex, data.as_slice())
             }
         }
     }
@@ -1557,10 +1557,10 @@ mod tests {
         assert!(is_whole(seen.last().unwrap()));
     }
 
-    /// `put_owned` keeps the whole-PUT fallback through the completion until
+    /// `put_pack` keeps the whole-PUT fallback through the completion until
     /// one completion has succeeded on the backend.
     #[test]
-    fn owned_put_keeps_the_fallback_until_a_completion_succeeded() {
+    fn pack_put_keeps_the_fallback_until_a_completion_succeeded() {
         let (url, seen) = routing_server(pack_routes(
             HEALTH_PARTS,
             "204 No Content",
@@ -1569,17 +1569,17 @@ mod tests {
         ));
         let backend = parts_backend(&url, no_retry());
         let (key, data) = test_pack(3000);
-        backend.put_owned(&key, data).unwrap();
+        backend.put_pack(&key, crate::PackData::new(data)).unwrap();
         let seen = seen.lock().unwrap().clone();
         assert_eq!(count(&seen, is_part), 3);
         assert!(is_whole(seen.last().unwrap()), "{seen:#?}");
     }
 
-    /// Once completions are known to work, `put_owned` releases the buffer
+    /// Once completions are known to work, `put_pack` releases the buffer
     /// before completing, so a failed completion is the upload's error and
     /// is never answered with a whole PUT.
     #[test]
-    fn owned_put_after_a_completion_surfaces_a_failed_completion() {
+    fn pack_put_after_a_completion_surfaces_a_failed_completion() {
         let complete_ok = std::sync::Arc::new(AtomicBool::new(true));
         let flag = std::sync::Arc::clone(&complete_ok);
         let (url, seen) = routing_server(move |line: &str| {
@@ -1599,13 +1599,18 @@ mod tests {
         });
         let backend = parts_backend(&url, no_retry());
         let (key, data) = test_pack(3000);
-        backend.put_owned(&key, data).unwrap();
+        backend.put_pack(&key, crate::PackData::new(data)).unwrap();
 
         let (key2, data2) = test_pack(3500);
-        backend.put_owned(&key2, data2).unwrap();
+        backend
+            .put_pack(&key2, crate::PackData::new(data2))
+            .unwrap();
         complete_ok.store(false, Ordering::Relaxed);
         let (key3, data3) = test_pack(4000);
-        let err = backend.put_owned(&key3, data3).unwrap_err().to_string();
+        let err = backend
+            .put_pack(&key3, crate::PackData::new(data3))
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("404") && err.contains("released"),
             "got: {err}"
@@ -1617,10 +1622,10 @@ mod tests {
         assert_eq!(count(&seen, |s| is_part(s) && s.line.contains(&key3)), 4);
     }
 
-    /// A part failure still falls back to a whole PUT from `put_owned`,
+    /// A part failure still falls back to a whole PUT from `put_pack`,
     /// with the buffer still held.
     #[test]
-    fn owned_put_part_failure_falls_back() {
+    fn pack_put_part_failure_falls_back() {
         let (url, seen) = routing_server(pack_routes(
             HEALTH_PARTS,
             "503 Service Unavailable",
@@ -1630,10 +1635,57 @@ mod tests {
         let backend = parts_backend(&url, no_retry());
         backend.parts_proven.store(true, Ordering::Relaxed);
         let (key, data) = test_pack(3500);
-        backend.put_owned(&key, data).unwrap();
+        backend.put_pack(&key, crate::PackData::new(data)).unwrap();
         let seen = seen.lock().unwrap().clone();
         assert_eq!(count(&seen, is_whole), 1, "{seen:#?}");
         assert_eq!(count(&seen, |s| s.line.contains("?complete")), 0);
+    }
+
+    /// Unproven, the buffer is held through the completion; once a
+    /// completion succeeded, it is released before the next one is sent.
+    #[test]
+    fn pack_put_releases_before_completion_once_proven() {
+        use std::sync::{Arc, Mutex};
+        let released = Arc::new(AtomicBool::new(false));
+        let at_completion: Arc<Mutex<Vec<bool>>> = Arc::default();
+        let (flag, log) = (Arc::clone(&released), Arc::clone(&at_completion));
+        let (url, _seen) = routing_server(move |line: &str| {
+            if line.starts_with("POST ") && line.contains("?complete") {
+                log.lock().unwrap().push(flag.load(Ordering::SeqCst));
+            }
+            pack_routes(HEALTH_PARTS, "204 No Content", "201 Created", "201 Created")(line)
+        });
+        let backend = parts_backend(&url, no_retry());
+        for len in [3000, 3500] {
+            released.store(false, Ordering::SeqCst);
+            let (key, data) = test_pack(len);
+            let flag = Arc::clone(&released);
+            let data = crate::PackData::with_release(data, move || {
+                flag.store(true, Ordering::SeqCst);
+            });
+            backend.put_pack(&key, data).unwrap();
+            assert!(released.load(Ordering::SeqCst));
+        }
+        assert_eq!(*at_completion.lock().unwrap(), [false, true]);
+    }
+
+    /// `put_owned` keeps the `put` contract on a proven backend: a failed
+    /// completion falls back to a whole PUT.
+    #[test]
+    fn put_owned_keeps_whole_fallback_when_proven() {
+        let (url, seen) = routing_server(pack_routes(
+            HEALTH_PARTS,
+            "204 No Content",
+            "404 Not Found",
+            "201 Created",
+        ));
+        let backend = parts_backend(&url, no_retry());
+        backend.parts_proven.store(true, Ordering::Relaxed);
+        let (key, data) = test_pack(3000);
+        backend.put_owned(&key, data).unwrap();
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(count(&seen, is_part), 3);
+        assert!(is_whole(seen.last().unwrap()), "{seen:#?}");
     }
 
     /// When the fallback PUT fails too, its error is what the caller sees.

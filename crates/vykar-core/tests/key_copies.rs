@@ -211,7 +211,7 @@ impl InnerBackend for FaultyBackend {
 
 vykar_storage::delegate_storage_backend! {
     for FaultyBackend;
-    except [get, put, begin_staged_put, profile];
+    except [get, put, put_pack, begin_staged_put, profile];
 
     // Keep packs on the intercepted `put` path.
     fn begin_staged_put(
@@ -244,6 +244,15 @@ vykar_storage::delegate_storage_backend! {
             ))));
         }
         self.inner.put(key, data)
+    }
+
+    // Packs bypass the `unwritable` list, as the forwarded `put_owned` did.
+    fn put_pack(
+        &self,
+        key: &str,
+        data: vykar_storage::PackData,
+    ) -> vykar_types::error::Result<()> {
+        self.inner.put_pack(key, data)
     }
 }
 

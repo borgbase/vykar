@@ -340,7 +340,7 @@ limits:
   its own priority between runs, leave `nice` at `0` and run backups as separate
   `vykar backup` processes under `nice -n 19` or a systemd `Nice=` setting.
 - `connections: 1` minimizes backend parallelism (SFTP pool, upload concurrency, restore readers).
-- `upload_mib_per_sec` and `download_mib_per_sec` cap backend throughput in MiB/s.
+- `upload_mib_per_sec` and `download_mib_per_sec` cap backend throughput in MiB/s (an average; the link still sees short full-speed bursts per pack).
 - If this is too slow, raise `upload_mib_per_sec` first, then increase `connections`.
 
 

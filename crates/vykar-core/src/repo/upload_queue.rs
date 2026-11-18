@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread::JoinHandle;
 
 use crate::index::PendingChunkEntry;
@@ -8,6 +10,20 @@ use vykar_types::pack_id::PackId;
 /// blocking; the storage crate's [`vykar_storage::UPLOAD_HEADROOM`].
 pub(super) const UPLOAD_QUEUE_HEADROOM: usize = vykar_storage::UPLOAD_HEADROOM;
 
+/// Handed to an upload: drop it (or call `release`) once the pack's heap
+/// bytes are freed, so the queue stops counting them.
+pub(crate) struct HeldBytes(Arc<AtomicBool>);
+
+impl HeldBytes {
+    pub(crate) fn release(self) {}
+}
+
+impl Drop for HeldBytes {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
 /// A background pack upload plus what to journal once it is confirmed.
 pub(crate) struct PendingUpload {
     /// Sent on the session's completion channel when the thread finishes.
@@ -17,10 +33,25 @@ pub(crate) struct PendingUpload {
     /// Cleared by rollback: the pack is still uploaded (an orphan for
     /// compact) but must not enter the journal.
     pub(crate) journal: bool,
-    /// Heap bytes held by the sealed pack until the upload thread returns
-    /// (0 for a staged pack, whose bytes are already in a temp file).
+    /// Heap bytes held by the sealed pack when queued (0 for a staged pack,
+    /// whose bytes are already in a temp file); see `held_bytes` for what is
+    /// still held.
     pub(crate) bytes: usize,
+    /// Set once the upload has freed the heap bytes.
+    released: Arc<AtomicBool>,
     pub(crate) handle: JoinHandle<Result<()>>,
+}
+
+impl PendingUpload {
+    /// Heap bytes this upload still holds: `bytes` until the upload releases
+    /// them or its thread returns, then 0.
+    pub(crate) fn held_bytes(&self) -> usize {
+        if self.released.load(Ordering::Acquire) || self.handle.is_finished() {
+            0
+        } else {
+            self.bytes
+        }
+    }
 }
 
 /// Announces an upload thread's completion on drop, so the send also happens
@@ -75,7 +106,8 @@ impl UploadQueue {
     }
 
     /// Run `upload` on a background thread and queue it for joining.
-    /// `bytes` is the heap the upload holds until it returns.
+    /// `bytes` is the heap the upload holds until it drops the [`HeldBytes`]
+    /// it is handed, or returns.
     pub(crate) fn spawn<F>(
         &mut self,
         pack_id: PackId,
@@ -83,7 +115,7 @@ impl UploadQueue {
         bytes: usize,
         upload: F,
     ) where
-        F: FnOnce() -> Result<()> + Send + 'static,
+        F: FnOnce(HeldBytes) -> Result<()> + Send + 'static,
     {
         let seq = self.next_seq;
         self.next_seq += 1;
@@ -91,9 +123,11 @@ impl UploadQueue {
             tx: self.done_tx.clone(),
             seq,
         };
+        let released = Arc::new(AtomicBool::new(false));
+        let held = HeldBytes(Arc::clone(&released));
         let handle = std::thread::spawn(move || {
             let _done = done;
-            upload()
+            upload(held)
         });
         self.pending.push(PendingUpload {
             seq,
@@ -101,6 +135,7 @@ impl UploadQueue {
             journal_chunks,
             journal: true,
             bytes,
+            released,
             handle,
         });
     }
@@ -255,7 +290,7 @@ impl UploadQueue {
         }
         let mut blocked = false;
         while !self.pending.is_empty() {
-            let pending: usize = self.pending.iter().map(|u| u.bytes).sum();
+            let pending: usize = self.pending.iter().map(PendingUpload::held_bytes).sum();
             if pending.saturating_add(incoming) <= cap {
                 break;
             }
@@ -268,12 +303,13 @@ impl UploadQueue {
         Ok(blocked)
     }
 
-    /// Pipeline budget to lend to the upload queue: half the heap bytes of
-    /// sealed packs whose upload has not returned yet, beyond what the
-    /// upload slots themselves hold (`max_in_flight_uploads` packs of the
-    /// current data-pack target). The backup pipeline subtracts this from
-    /// its byte budget, so the slack queued behind a slow link is not held
-    /// a second time as processed pipeline output.
+    /// Pipeline budget to lend to the upload queue: half the heap bytes still
+    /// held by queued uploads (see `PendingUpload::held_bytes`: a pack whose
+    /// upload released its buffer, or whose thread returned, holds none),
+    /// beyond what the upload slots themselves hold (`max_in_flight_uploads`
+    /// packs of the current data-pack target). The backup pipeline subtracts
+    /// this from its byte budget, so the slack queued behind a slow link is
+    /// not held a second time as processed pipeline output.
     ///
     /// Half, not all: the pipeline's lead is what refills the queue when an
     /// upload returns. Lending the full slack measured -22% peak RSS but
@@ -284,13 +320,7 @@ impl UploadQueue {
         if self.cap_pending_upload_bytes {
             return 0;
         }
-        // A finished upload thread has already dropped its buffer.
-        let pending: usize = self
-            .pending
-            .iter()
-            .filter(|u| !u.handle.is_finished())
-            .map(|u| u.bytes)
-            .sum();
+        let pending: usize = self.pending.iter().map(PendingUpload::held_bytes).sum();
         let in_slots = self.max_in_flight_uploads.saturating_mul(pack_target);
         pending.saturating_sub(in_slots) / 2
     }
@@ -316,10 +346,10 @@ mod tests {
         let b = PackId::from_bytes([2; 32]);
         let c = PackId::from_bytes([3; 32]);
         let mut queue = UploadQueue::new(2);
-        queue.spawn(a, Vec::new(), 0, || Ok(()));
-        queue.spawn(b, Vec::new(), 0, || Ok(()));
+        queue.spawn(a, Vec::new(), 0, |_| Ok(()));
+        queue.spawn(b, Vec::new(), 0, |_| Ok(()));
         queue.exclude_from_journal(&[b]);
-        queue.spawn(c, Vec::new(), 0, || Err(VykarError::Other("x".into())));
+        queue.spawn(c, Vec::new(), 0, |_| Err(VykarError::Other("x".into())));
 
         let mut confirmed = Vec::new();
         let result = queue.join_all(|id, _| confirmed.push(id));
@@ -333,7 +363,7 @@ mod tests {
         let mut queue = UploadQueue::new(2);
         assert!(!queue.cap_pending_upload_bytes);
         let (release, gate) = std::sync::mpsc::channel::<()>();
-        queue.spawn(PackId::from_bytes([1; 32]), Vec::new(), 100, move || {
+        queue.spawn(PackId::from_bytes([1; 32]), Vec::new(), 100, move |_held| {
             let _ = gate.recv();
             Ok(())
         });
@@ -345,6 +375,73 @@ mod tests {
         assert_eq!(queue.len(), 1);
 
         release.send(()).unwrap();
+        queue.join_all(|_, _| {}).unwrap();
+    }
+
+    #[test]
+    fn released_upload_stops_counting_before_its_thread_returns() {
+        let mut queue = UploadQueue::new(1);
+        let (open_a, gate_a) = std::sync::mpsc::channel::<()>();
+        let (open_b, gate_b) = std::sync::mpsc::channel::<()>();
+        let (go_tx, go) = std::sync::mpsc::channel::<()>();
+        let (ack, acked) = std::sync::mpsc::channel::<()>();
+        queue.spawn(PackId::from_bytes([1; 32]), Vec::new(), 100, move |_held| {
+            let _ = gate_a.recv();
+            Ok(())
+        });
+        let b = PackId::from_bytes([2; 32]);
+        queue.spawn(b, Vec::new(), 100, move |held| {
+            let _ = go.recv();
+            drop(held);
+            let _ = ack.send(());
+            let _ = gate_b.recv();
+            Ok(())
+        });
+
+        // Two packs held, one slot of 100: (200 - 100) / 2.
+        assert_eq!(queue.slack_bytes(100), 50);
+        go_tx.send(()).unwrap();
+        acked.recv().unwrap();
+        assert_eq!(queue.slack_bytes(100), 0);
+        let upload_b = queue.pending().iter().find(|u| u.pack_id == b).unwrap();
+        assert!(!upload_b.handle.is_finished());
+        assert_eq!(upload_b.held_bytes(), 0);
+
+        open_a.send(()).unwrap();
+        open_b.send(()).unwrap();
+        queue.join_all(|_, _| {}).unwrap();
+    }
+
+    #[test]
+    fn byte_cap_ignores_released_bytes() {
+        let mut queue = UploadQueue::new(2);
+        queue.cap_pending_upload_bytes = true;
+        let (open, gate) = std::sync::mpsc::channel::<()>();
+        let (ack, acked) = std::sync::mpsc::channel::<()>();
+        queue.spawn(PackId::from_bytes([1; 32]), Vec::new(), 100, move |held| {
+            drop(held);
+            let _ = ack.send(());
+            let _ = gate.recv();
+            Ok(())
+        });
+        acked.recv().unwrap();
+
+        // If the cap still counted the released bytes it would block on the
+        // upload; the watchdog then opens the gate and the asserts fail.
+        let watchdog = open.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(10));
+            let _ = watchdog.send(());
+        });
+        let mut joined = 0;
+        let waited = queue
+            .wait_below_byte_cap(100, 100, |_, _| joined += 1)
+            .unwrap();
+        assert!(!waited);
+        assert_eq!(joined, 0);
+        assert_eq!(queue.len(), 1);
+
+        open.send(()).unwrap();
         queue.join_all(|_, _| {}).unwrap();
     }
 }

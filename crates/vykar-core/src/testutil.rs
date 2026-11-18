@@ -333,8 +333,8 @@ impl InnerBackend for RecordingBackend {
 delegate_storage_backend! {
     for RecordingBackend;
     except [
-        put, list, get_range, get_range_into, open_range, put_owned, begin_staged_put, size,
-        list_sized, profile,
+        put, list, get_range, get_range_into, open_range, put_owned, put_pack, begin_staged_put,
+        size, list_sized, profile,
     ];
 
     fn list(&self, prefix: &str) -> Result<Vec<String>> {
@@ -416,9 +416,14 @@ delegate_storage_backend! {
         self.log.record(key);
         self.inner.put(key, &data)
     }
+
+    fn put_pack(&self, key: &str, data: vykar_storage::PackData) -> Result<()> {
+        self.log.record(key);
+        self.inner.put(key, data.as_slice())
+    }
 }
 
-/// Pack-upload fault injection: `put_owned` fails for keys in `fail`, and the
+/// Pack-upload fault injection: `put_owned`/`put_pack` fail for keys in `fail`, and the
 /// first pack upload of a [`Self::gated`] backend blocks until the gate's
 /// sender fires (or is dropped).
 pub struct PackUploadBackend {
@@ -442,6 +447,19 @@ impl PackUploadBackend {
         *backend.gate.lock().unwrap() = Some(rx);
         (backend, tx)
     }
+
+    fn intercept(&self, key: &str) -> Result<()> {
+        if key.starts_with("packs/") {
+            let gate = self.gate.lock().unwrap().take();
+            if let Some(rx) = gate {
+                let _ = rx.recv();
+            }
+        }
+        if self.fail.lock().unwrap().contains(key) {
+            return Err(VykarError::Other("injected pack upload failure".into()));
+        }
+        Ok(())
+    }
 }
 
 impl InnerBackend for PackUploadBackend {
@@ -452,9 +470,10 @@ impl InnerBackend for PackUploadBackend {
 
 delegate_storage_backend! {
     for PackUploadBackend;
-    except [put_owned, begin_staged_put, profile];
+    except [put_owned, put_pack, begin_staged_put, profile];
 
-    // Keep packs on the intercepted `put` path. Gating and fault injection act on `put_owned`.
+    // Keep packs off staged writes. Gating and fault injection act on
+    // `put_owned`/`put_pack`.
     fn begin_staged_put(
         &self,
         _prefix: &str,
@@ -470,16 +489,13 @@ delegate_storage_backend! {
     }
 
     fn put_owned(&self, key: &str, data: Vec<u8>) -> Result<()> {
-        if key.starts_with("packs/") {
-            let gate = self.gate.lock().unwrap().take();
-            if let Some(rx) = gate {
-                let _ = rx.recv();
-            }
-        }
-        if self.fail.lock().unwrap().contains(key) {
-            return Err(VykarError::Other("injected pack upload failure".into()));
-        }
+        self.intercept(key)?;
         self.inner.put_owned(key, data)
+    }
+
+    fn put_pack(&self, key: &str, data: vykar_storage::PackData) -> Result<()> {
+        self.intercept(key)?;
+        self.inner.put_pack(key, data)
     }
 }
 
@@ -533,7 +549,7 @@ impl InnerBackend for HookBackend {
 
 delegate_storage_backend! {
     for HookBackend;
-    except [put, delete, list, put_owned, begin_staged_put, list_sized, profile];
+    except [put, delete, list, put_owned, put_pack, begin_staged_put, list_sized, profile];
 
     // Keep packs on the intercepted `put` path. Hooks fire on `put`.
     fn begin_staged_put(
@@ -568,6 +584,11 @@ delegate_storage_backend! {
     fn put_owned(&self, key: &str, data: Vec<u8>) -> Result<()> {
         self.before(Op::Put, key);
         self.inner.put(key, &data)
+    }
+
+    fn put_pack(&self, key: &str, data: vykar_storage::PackData) -> Result<()> {
+        self.before(Op::Put, key);
+        self.inner.put(key, data.as_slice())
     }
 
     fn list_sized(&self, prefix: &str) -> Result<Vec<vykar_storage::ListedObject>> {

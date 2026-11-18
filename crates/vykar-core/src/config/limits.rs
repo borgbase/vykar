@@ -31,10 +31,13 @@ pub struct ResourceLimitsConfig {
     /// thread for the rest of the process lifetime; never lowered again.
     #[serde(default)]
     pub nice: i32,
-    /// Upload bandwidth cap in MiB/s. 0 = unlimited.
+    /// Upload bandwidth cap in MiB/s, as an average: each object is admitted
+    /// whole and then sent at link speed (over several part streams for large
+    /// packs on REST/S3), so the link sees object-sized bursts. 0 = unlimited.
     #[serde(default)]
     pub upload_mib_per_sec: u64,
-    /// Download bandwidth cap in MiB/s. 0 = unlimited.
+    /// Download bandwidth cap in MiB/s, as an average (charged per completed
+    /// read). 0 = unlimited.
     #[serde(default)]
     pub download_mib_per_sec: u64,
 }

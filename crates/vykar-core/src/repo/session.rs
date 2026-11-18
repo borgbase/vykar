@@ -741,6 +741,96 @@ mod tests {
         repo.write_session = None;
     }
 
+    /// Stores a pack, releases its buffer, then blocks until the gate opens,
+    /// like an HTTP backend waiting on a slow completion.
+    struct ReleaseThenBlock {
+        inner: Arc<dyn StorageBackend>,
+        released_tx: std::sync::mpsc::Sender<()>,
+        gate_rx: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl InnerBackend for ReleaseThenBlock {
+        fn inner_backend(&self) -> &dyn StorageBackend {
+            &*self.inner
+        }
+    }
+
+    delegate_storage_backend! {
+        for ReleaseThenBlock;
+        except [put_pack, begin_staged_put, profile];
+
+        fn put_pack(
+            &self,
+            key: &str,
+            data: vykar_storage::PackData,
+        ) -> vykar_types::error::Result<()> {
+            let (bytes, release) = data.into_parts();
+            self.inner.put(key, &bytes)?;
+            drop(bytes);
+            drop(release);
+            let _ = self.released_tx.send(());
+            let _ = self.gate_rx.lock().unwrap().recv();
+            Ok(())
+        }
+
+        fn begin_staged_put(
+            &self,
+            _prefix: &str,
+        ) -> vykar_types::error::Result<Option<Box<dyn vykar_storage::StagedPut>>> {
+            Ok(None)
+        }
+
+        fn profile(&self) -> BackendProfile {
+            BackendProfile {
+                staged_put: false,
+                ..self.inner.profile()
+            }
+        }
+    }
+
+    /// A heap pack whose upload released its buffer stops counting while its
+    /// upload thread is still running, and is journaled once it returns.
+    #[test]
+    fn early_released_pack_stops_counting_before_its_upload_returns() {
+        use crate::compress::Compression;
+        use crate::repo::pack::PackType;
+
+        let mut repo = test_repo_plaintext();
+        let (released_tx, released_rx) = std::sync::mpsc::channel();
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel();
+        repo.storage = Arc::new(ReleaseThenBlock {
+            inner: Arc::clone(&repo.storage),
+            released_tx,
+            gate_rx: std::sync::Mutex::new(gate_rx),
+        });
+        repo.enable_dedup_mode();
+
+        repo.store_chunk(b"x", Compression::None, PackType::Data)
+            .unwrap();
+        repo.flush_writer_async(PackType::Data).unwrap();
+        released_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        let pack_id = {
+            let upload = &repo.write_session.as_ref().unwrap().uploads.pending()[0];
+            assert!(upload.bytes > 0);
+            assert!(!upload.handle.is_finished());
+            assert_eq!(upload.held_bytes(), 0);
+            upload.pack_id
+        };
+
+        gate_tx.send(()).unwrap();
+        repo.flush_packs().unwrap();
+        let ws = repo.write_session.as_ref().unwrap();
+        assert!(ws
+            .journal
+            .entries
+            .to_wire()
+            .iter()
+            .any(|e| e.pack_id == pack_id));
+        repo.write_session = None;
+    }
+
     /// Rolling back a checkpoint, or dropping the session, discards the
     /// partially written staged pack and leaves no temp file behind.
     #[test]

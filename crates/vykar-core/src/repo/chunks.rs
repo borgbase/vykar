@@ -344,8 +344,8 @@ impl Repository {
         let storage = Arc::clone(&self.storage);
         let key = pack_id.storage_key();
         self.ws_mut()
-            .spawn_upload(pack_id, journal_chunks, bytes, move || {
-                data.put_to(&*storage, &key)
+            .spawn_upload(pack_id, journal_chunks, bytes, move |held| {
+                data.put_to(&*storage, &key, move || held.release())
             });
 
         Ok(())

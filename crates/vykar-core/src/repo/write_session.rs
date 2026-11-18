@@ -16,7 +16,7 @@ use vykar_types::pack_id::PackId;
 use super::journal_recovery::{self, PendingIndexRecovery, RecoveryTarget};
 use super::pack::{PackType, PackWriter, PackedChunkEntry};
 use super::session_journal::SessionJournal;
-use super::upload_queue::{PendingUpload, UploadQueue};
+use super::upload_queue::{HeldBytes, PendingUpload, UploadQueue};
 
 pub(super) const DEFAULT_SESSION_ID: &str = "default";
 
@@ -130,7 +130,7 @@ impl WriteSessionState {
     }
 
     /// Run `upload` on a background thread and queue it for joining.
-    /// `bytes` is the heap the upload holds until it returns.
+    /// `bytes` is the heap the upload holds until it releases it or returns.
     pub(crate) fn spawn_upload<F>(
         &mut self,
         pack_id: PackId,
@@ -138,7 +138,7 @@ impl WriteSessionState {
         bytes: usize,
         upload: F,
     ) where
-        F: FnOnce() -> Result<()> + Send + 'static,
+        F: FnOnce(HeldBytes) -> Result<()> + Send + 'static,
     {
         self.uploads.spawn(pack_id, journal_chunks, bytes, upload);
     }
@@ -492,7 +492,7 @@ pub(super) mod tests {
 
     vykar_storage::delegate_storage_backend! {
         for JournalCountingBackend;
-        except [put, begin_staged_put, profile];
+        except [put, put_pack, begin_staged_put, profile];
 
         // Keep packs on the intercepted `put` path.
         fn begin_staged_put(
@@ -518,6 +518,10 @@ pub(super) mod tests {
                 self.journal_puts.fetch_add(1, Ordering::SeqCst);
             }
             self.inner.put(key, data)
+        }
+
+        fn put_pack(&self, key: &str, data: vykar_storage::PackData) -> Result<()> {
+            self.inner.put_pack(key, data)
         }
     }
 
@@ -738,7 +742,7 @@ pub(super) mod tests {
     ) {
         let (pack_id, data, entry) = fake_pack(seed);
         let storage = std::sync::Arc::clone(storage);
-        ws.spawn_upload(pack_id, entry.chunks, 0, move || {
+        ws.spawn_upload(pack_id, entry.chunks, 0, move |_| {
             storage.put_owned(&pack_id.storage_key(), data)
         });
     }
@@ -754,7 +758,7 @@ pub(super) mod tests {
         let (pack_id, data, entry) = fake_pack(seed);
         let storage = std::sync::Arc::clone(storage);
         let (release, gate) = std::sync::mpsc::channel::<()>();
-        ws.spawn_upload(pack_id, entry.chunks, bytes, move || {
+        ws.spawn_upload(pack_id, entry.chunks, bytes, move |_held| {
             let _ = gate.recv();
             storage.put_owned(&pack_id.storage_key(), data)
         });

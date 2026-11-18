@@ -2,7 +2,7 @@
 //! "unsupported" bodies for leaves.
 //!
 //! Every wrapper that holds an inner backend (rate limiter, test recorder, the
-//! `Arc<dyn StorageBackend>` coercion impl) has to forward all 22 trait methods,
+//! `Arc<dyn StorageBackend>` coercion impl) has to forward all 23 trait methods,
 //! and hand-written forwards rot — a forgotten one disabled server-side pack
 //! verification and server init on any throttled REST repo.
 //!
@@ -229,7 +229,7 @@ macro_rules! delegate_storage_backend {
 
             $crate::delegate_storage_backend!(@forward
                 [get put delete exists list get_range get_range_into open_range create_dir
-                 put_owned begin_staged_put size list_sized remove_stale_temp_files
+                 put_owned put_pack begin_staged_put size list_sized remove_stale_temp_files
                  server_repack batch_delete_keys
                  server_verify_packs server_init bind_content_hash
                  server_capabilities object_sizes profile]
@@ -237,6 +237,7 @@ macro_rules! delegate_storage_backend {
         }
         $crate::delegate_storage_backend!(@check_list [$($except)*] [] []);
         $crate::delegate_storage_backend!(@check_put [$($except)*] [] []);
+        $crate::delegate_storage_backend!(@check_pack [$($except)*] [] []);
         $crate::delegate_storage_backend!(@check_range [$($except)*] [] []);
         $crate::delegate_storage_backend!(@check_staged [$($except)*] [] []);
     };
@@ -289,7 +290,7 @@ macro_rules! delegate_storage_backend {
         $crate::delegate_storage_backend!(@check_range [$($rest)*] $into $open);
     };
 
-    // ── Guard: overriding `put`/`put_owned` requires `begin_staged_put` ───
+    // ── Guard: overriding `put`/`put_owned`/`put_pack` requires `begin_staged_put`
     //
     // A forwarded `begin_staged_put` hands out the inner backend's staged
     // writer, whose `commit` publishes without passing through the wrapper's
@@ -300,8 +301,8 @@ macro_rules! delegate_storage_backend {
     (@check_put [] [put] [begin_staged_put]) => {};
     (@check_put [] [put] []) => {
         compile_error!(
-            "delegate_storage_backend!: a wrapper that overrides `put` or `put_owned` \
-             must also override `begin_staged_put`, or staged writes bypass it"
+            "delegate_storage_backend!: a wrapper that overrides `put`, `put_owned` or \
+             `put_pack` must also override `begin_staged_put`, or staged writes bypass it"
         );
     };
     (@check_put [put $($rest:ident)*] $put:tt $staged:tt) => {
@@ -310,11 +311,41 @@ macro_rules! delegate_storage_backend {
     (@check_put [put_owned $($rest:ident)*] $put:tt $staged:tt) => {
         $crate::delegate_storage_backend!(@check_put [$($rest)*] [put] $staged);
     };
+    (@check_put [put_pack $($rest:ident)*] $put:tt $staged:tt) => {
+        $crate::delegate_storage_backend!(@check_put [$($rest)*] [put] $staged);
+    };
     (@check_put [begin_staged_put $($rest:ident)*] $put:tt []) => {
         $crate::delegate_storage_backend!(@check_put [$($rest)*] $put [begin_staged_put]);
     };
     (@check_put [$other:ident $($rest:ident)*] $put:tt $staged:tt) => {
         $crate::delegate_storage_backend!(@check_put [$($rest)*] $put $staged);
+    };
+
+    // ── Guard: overriding `put`/`put_owned` requires `put_pack` ───────────
+    //
+    // A forwarded `put_pack` hands sealed packs straight to the inner backend,
+    // past the wrapper's `put` override (rate limit, recorder, fault injection).
+    // No runtime test: the workspace has no `trybuild`.
+
+    (@check_pack [] [] $pack:tt) => {};
+    (@check_pack [] [put] [put_pack]) => {};
+    (@check_pack [] [put] []) => {
+        compile_error!(
+            "delegate_storage_backend!: a wrapper that overrides `put` or `put_owned` \
+             must also override `put_pack`, or pack uploads bypass it"
+        );
+    };
+    (@check_pack [put $($rest:ident)*] $put:tt $pack:tt) => {
+        $crate::delegate_storage_backend!(@check_pack [$($rest)*] [put] $pack);
+    };
+    (@check_pack [put_owned $($rest:ident)*] $put:tt $pack:tt) => {
+        $crate::delegate_storage_backend!(@check_pack [$($rest)*] [put] $pack);
+    };
+    (@check_pack [put_pack $($rest:ident)*] $put:tt []) => {
+        $crate::delegate_storage_backend!(@check_pack [$($rest)*] $put [put_pack]);
+    };
+    (@check_pack [$other:ident $($rest:ident)*] $put:tt $pack:tt) => {
+        $crate::delegate_storage_backend!(@check_pack [$($rest)*] $put $pack);
     };
 
     // ── Guard: overriding `list` requires overriding `list_sized` ─────────
@@ -470,6 +501,20 @@ macro_rules! delegate_storage_backend {
     (@forward [put_owned $($rest:ident)*] [$($except:ident)*]) => {
         fn put_owned(&self, key: &str, data: Vec<u8>) -> $crate::__macro_support::Result<()> {
             $crate::InnerBackend::inner_backend(self).put_owned(key, data)
+        }
+        $crate::delegate_storage_backend!(@forward [$($rest)*] [$($except)*]);
+    };
+
+    (@forward [put_pack $($rest:ident)*] [put_pack $($except:ident)*]) => {
+        $crate::delegate_storage_backend!(@forward [$($rest)*] [$($except)*]);
+    };
+    (@forward [put_pack $($rest:ident)*] [$($except:ident)*]) => {
+        fn put_pack(
+            &self,
+            key: &str,
+            data: $crate::PackData,
+        ) -> $crate::__macro_support::Result<()> {
+            $crate::InnerBackend::inner_backend(self).put_pack(key, data)
         }
         $crate::delegate_storage_backend!(@forward [$($rest)*] [$($except)*]);
     };
@@ -692,6 +737,10 @@ mod tests {
             self.hit();
             Ok(())
         }
+        fn put_pack(&self, _key: &str, _data: crate::PackData) -> Result<()> {
+            self.hit();
+            Ok(())
+        }
         fn begin_staged_put(&self, _prefix: &str) -> Result<Option<Box<dyn crate::StagedPut>>> {
             self.hit();
             Ok(None)
@@ -814,6 +863,7 @@ mod tests {
         assert!(w.open_range("k", 0, 1, &mut Vec::new()).unwrap().is_none());
         w.create_dir("d").unwrap();
         w.put_owned("k", vec![1]).unwrap();
+        w.put_pack("k", crate::PackData::new(vec![1])).unwrap();
         assert!(w.begin_staged_put("p").unwrap().is_none());
         w.size("k").unwrap();
         w.list_sized("p").unwrap();
@@ -839,7 +889,7 @@ mod tests {
         assert_eq!(p.request_width, 3);
         assert_eq!(p.transfer_width, 3);
 
-        // 22 trait methods, 21 of them forwarded.
-        assert_eq!(w.inner.calls.load(Ordering::SeqCst), 21);
+        // 23 trait methods, 22 of them forwarded.
+        assert_eq!(w.inner.calls.load(Ordering::SeqCst), 22);
     }
 }

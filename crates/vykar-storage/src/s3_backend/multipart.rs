@@ -128,7 +128,7 @@ impl S3Backend {
         Ok(self.size(key)? == Some(expected))
     }
 
-    /// [`put_multipart`](Self::put_multipart) for an owned pack buffer, which
+    /// [`put_multipart`](Self::put_multipart) for a [`crate::PackData`], which
     /// is released once every part is acknowledged, before the completion:
     /// that request (the store assembling and persisting the object) is the
     /// slow end of the upload and needs no object bytes.
@@ -141,7 +141,7 @@ impl S3Backend {
         &self,
         full_key: &str,
         key: &str,
-        data: Vec<u8>,
+        data: crate::PackData,
     ) -> Result<()> {
         debug_assert!(key.starts_with("packs/"), "size-only reconcile");
         let part_size = derive_part_size(data.len(), key)?;
@@ -153,7 +153,7 @@ impl S3Backend {
         })?;
         let (upload_id, etags) = {
             // Built once: part digests survive a whole-MPU restart.
-            let parts = Parts::new(&data, part_size);
+            let parts = Parts::new(data.as_slice(), part_size);
             let mut attempt = 0;
             loop {
                 attempt += 1;
@@ -766,6 +766,7 @@ mod tests {
     use crate::s3_backend::test_support::*;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
+    use std::sync::atomic::AtomicUsize;
     use std::sync::{Arc, Mutex};
 
     // ── 12. S3 multipart upload ─────────────────────────────────────
@@ -1260,12 +1261,12 @@ mod tests {
         handle.join().unwrap();
     }
 
-    // ── put_owned: buffer released before the completion ───────────────
+    // ── put_pack: buffer released before the completion ────────────────
 
-    /// Until a completion has succeeded, `put_owned` keeps the buffer through
+    /// Until a completion has succeeded, `put_pack` keeps the buffer through
     /// it, so a completion failure still restarts with a fresh upload.
     #[test]
-    fn owned_unproven_completion_failure_restarts() {
+    fn pack_unproven_completion_failure_restarts() {
         let (port, captured, handle) = mock_server_script(vec![
             mp_create_ok("u1"),
             mp_part_ok("\"e1\""),
@@ -1280,7 +1281,10 @@ mod tests {
         ]);
         let backend = s3_backend(port, no_retry(), false);
         backend
-            .put_owned("packs/ab/obj", vec![0u8; MULTIPART_DATA_LEN])
+            .put_pack(
+                "packs/ab/obj",
+                crate::PackData::new(vec![0u8; MULTIPART_DATA_LEN]),
+            )
             .unwrap();
         assert!(backend.multipart_proven.load(Ordering::Relaxed));
         assert_eq!(mp_creates(&captured.lock().unwrap()), 2);
@@ -1290,7 +1294,7 @@ mod tests {
     /// Once proven, a completion that fails (and is not reconciled) is the
     /// upload's error: the buffer is gone, so no second upload is created.
     #[test]
-    fn owned_proven_completion_failure_is_an_error() {
+    fn pack_proven_completion_failure_is_an_error() {
         let (port, captured, handle) = mock_server_script(vec![
             mp_create_ok("u1"),
             mp_part_ok("\"e1\""),
@@ -1302,7 +1306,10 @@ mod tests {
         let backend = s3_backend(port, no_retry(), false);
         backend.multipart_proven.store(true, Ordering::Relaxed);
         let err = backend
-            .put_owned("packs/ab/obj", vec![0u8; MULTIPART_DATA_LEN])
+            .put_pack(
+                "packs/ab/obj",
+                crate::PackData::new(vec![0u8; MULTIPART_DATA_LEN]),
+            )
             .unwrap_err()
             .to_string();
         assert!(
@@ -1318,7 +1325,7 @@ mod tests {
 
     /// An ambiguous completion after the release still reconciles by size.
     #[test]
-    fn owned_proven_lost_completion_reconciles_via_head() {
+    fn pack_proven_lost_completion_reconciles_via_head() {
         let (port, _captured, handle) = mock_server_script(vec![
             mp_create_ok("u1"),
             mp_part_ok("\"e1\""),
@@ -1330,7 +1337,10 @@ mod tests {
         let backend = s3_backend(port, no_retry(), false);
         backend.multipart_proven.store(true, Ordering::Relaxed);
         backend
-            .put_owned("packs/ab/obj", vec![0u8; MULTIPART_DATA_LEN])
+            .put_pack(
+                "packs/ab/obj",
+                crate::PackData::new(vec![0u8; MULTIPART_DATA_LEN]),
+            )
             .unwrap();
         handle.join().unwrap();
     }
@@ -1338,7 +1348,7 @@ mod tests {
     /// A part failure happens while the buffer is still held, so the second
     /// attempt is still available.
     #[test]
-    fn owned_proven_part_failure_restarts() {
+    fn pack_proven_part_failure_restarts() {
         let (port, captured, handle) = mock_server_script(vec![
             mp_create_ok("u1"),
             mp_part_ok("\"e1\""),
@@ -1352,9 +1362,107 @@ mod tests {
         let backend = s3_backend(port, no_retry(), false);
         backend.multipart_proven.store(true, Ordering::Relaxed);
         backend
+            .put_pack(
+                "packs/ab/obj",
+                crate::PackData::new(vec![0u8; MULTIPART_DATA_LEN]),
+            )
+            .unwrap();
+        assert_eq!(mp_creates(&captured.lock().unwrap()), 2);
+        handle.join().unwrap();
+    }
+
+    /// Once proven, the buffer is released after the parts and before the
+    /// completion: the mock records each request before replying, so the
+    /// release sees create + 2 parts and no completion yet.
+    #[test]
+    fn pack_proven_releases_before_the_completion() {
+        let (port, captured, handle) = mock_server_script(vec![
+            mp_create_ok("u1"),
+            mp_part_ok("\"e1\""),
+            mp_part_ok("\"e2\""),
+            mp_complete_ok(),
+        ]);
+        let backend = s3_backend(port, no_retry(), false);
+        backend.multipart_proven.store(true, Ordering::Relaxed);
+        let seen = Arc::new(AtomicUsize::new(usize::MAX));
+        let (cap, s) = (Arc::clone(&captured), Arc::clone(&seen));
+        let data = crate::PackData::with_release(vec![0u8; MULTIPART_DATA_LEN], move || {
+            s.store(cap.lock().unwrap().len(), Ordering::SeqCst);
+        });
+        backend.put_pack("packs/ab/obj", data).unwrap();
+        assert_eq!(seen.load(Ordering::SeqCst), 3);
+        assert_eq!(captured.lock().unwrap().len(), 4);
+        handle.join().unwrap();
+    }
+
+    /// Unproven, the buffer is held through the completion and released on
+    /// return.
+    #[test]
+    fn pack_unproven_releases_on_return() {
+        let (port, captured, handle) = mock_server_script(vec![
+            mp_create_ok("u1"),
+            mp_part_ok("\"e1\""),
+            mp_part_ok("\"e2\""),
+            mp_complete_ok(),
+        ]);
+        let backend = s3_backend(port, no_retry(), false);
+        let seen = Arc::new(AtomicUsize::new(usize::MAX));
+        let (cap, s) = (Arc::clone(&captured), Arc::clone(&seen));
+        let data = crate::PackData::with_release(vec![0u8; MULTIPART_DATA_LEN], move || {
+            s.store(cap.lock().unwrap().len(), Ordering::SeqCst);
+        });
+        backend.put_pack("packs/ab/obj", data).unwrap();
+        assert_eq!(seen.load(Ordering::SeqCst), 4);
+        handle.join().unwrap();
+    }
+
+    /// Completion fails, the plain path reconciles (absent) and restarts.
+    fn restart_after_failed_completion_script() -> Vec<MpReply> {
+        vec![
+            mp_create_ok("u1"),
+            mp_part_ok("\"e1\""),
+            mp_part_ok("\"e2\""),
+            mp_err("404 Not Found", "NoSuchUpload"), // complete
+            mp_status("204 No Content"),             // abort
+            mp_status("404 Not Found"),              // reconcile: absent
+            mp_create_ok("u2"),
+            mp_part_ok("\"e1\""),
+            mp_part_ok("\"e2\""),
+            mp_complete_ok(),
+        ]
+    }
+
+    /// `put_owned` keeps the `put` contract on a proven backend: the buffer
+    /// is held, so a failed completion restarts.
+    #[test]
+    fn put_owned_keeps_the_put_contract_when_proven() {
+        let (port, captured, handle) = mock_server_script(restart_after_failed_completion_script());
+        let backend = s3_backend(port, no_retry(), false);
+        backend.multipart_proven.store(true, Ordering::Relaxed);
+        backend
             .put_owned("packs/ab/obj", vec![0u8; MULTIPART_DATA_LEN])
             .unwrap();
         assert_eq!(mp_creates(&captured.lock().unwrap()), 2);
+        handle.join().unwrap();
+    }
+
+    /// A key outside `packs/` cannot reconcile by size, so `put_pack` takes
+    /// the plain path even when proven.
+    #[test]
+    fn pack_non_pack_key_takes_the_put_path() {
+        let (port, captured, handle) = mock_server_script(restart_after_failed_completion_script());
+        let backend = s3_backend(port, no_retry(), false);
+        backend.multipart_proven.store(true, Ordering::Relaxed);
+        backend
+            .put_pack("index", crate::PackData::new(vec![0u8; MULTIPART_DATA_LEN]))
+            .unwrap();
+        let cap = captured.lock().unwrap();
+        assert_eq!(mp_creates(&cap), 2);
+        assert!(
+            req_line(&cap, 5).starts_with("GET "),
+            "byte-compare reconcile"
+        );
+        drop(cap);
         handle.join().unwrap();
     }
 

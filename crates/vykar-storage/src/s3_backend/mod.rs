@@ -37,7 +37,7 @@ pub struct S3Backend {
     soft_delete: bool,
     /// Backend-wide bound on concurrent multipart part PUTs.
     part_slots: multipart::PartSlots,
-    /// Set by the first completed multipart upload. Until then `put_owned`
+    /// Set by the first completed multipart upload. Until then `put_pack`
     /// keeps a pack's buffer through its completion, so a store that accepts
     /// parts but refuses completions still gets the second attempt.
     multipart_proven: std::sync::atomic::AtomicBool,
@@ -225,11 +225,11 @@ impl StorageBackend for S3Backend {
         self.put_bytes(key, data)
     }
 
-    /// Like `put`, except that a multipart pack releases its buffer before
-    /// the completion request (see `put_multipart_owned`). Only for
-    /// `packs/` keys, whose ambiguous completion reconciles by size alone, and
-    /// only once a completion has succeeded on this backend.
-    fn put_owned(&self, key: &str, data: Vec<u8>) -> Result<()> {
+    /// Like `put`, except that once a completion has succeeded on this
+    /// backend, a multipart pack releases its buffer before the completion
+    /// request (see `put_multipart_owned`). A key outside `packs/` takes the
+    /// plain `put` path: only a content-addressed key reconciles by size.
+    fn put_pack(&self, key: &str, data: crate::PackData) -> Result<()> {
         if key.starts_with("packs/")
             && data.len() > multipart::MULTIPART_THRESHOLD
             && self
@@ -238,7 +238,7 @@ impl StorageBackend for S3Backend {
         {
             return self.put_multipart_owned(&self.full_key(key), key, data);
         }
-        self.put_bytes(key, &data)
+        self.put_bytes(key, data.as_slice())
     }
 
     fn delete(&self, key: &str) -> Result<()> {

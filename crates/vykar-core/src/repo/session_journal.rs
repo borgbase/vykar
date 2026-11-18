@@ -244,7 +244,7 @@ pub(super) mod tests {
 
     vykar_storage::delegate_storage_backend! {
         for SlowPutBackend;
-        except [put, begin_staged_put, profile];
+        except [put, put_pack, begin_staged_put, profile];
 
         fn begin_staged_put(
             &self,
@@ -265,6 +265,10 @@ pub(super) mod tests {
             self.inner.put(key, data)?;
             self.put_done.store(true, Ordering::SeqCst);
             Ok(())
+        }
+
+        fn put_pack(&self, key: &str, data: vykar_storage::PackData) -> Result<()> {
+            self.inner.put_pack(key, data)
         }
     }
 

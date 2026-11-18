@@ -180,15 +180,31 @@ pub trait StorageBackend: Send + Sync {
     /// Write an object from an owned buffer. Backends can override to avoid
     /// an extra copy when the caller already owns the data.
     ///
-    /// Same contract as [`Self::put`], except for packs on REST and S3: a
-    /// `packs/` key large enough to go up in parts may release `data` once
-    /// every part is acknowledged, before the completion request (only after
-    /// an earlier completion has succeeded on this backend instance). A
-    /// completion that still fails after its in-place retries (and, on S3,
-    /// is not reconciled as committed by size) is then returned as an error
-    /// instead of being retried with the whole object, which `put` would do.
+    /// Same contract as [`Self::put`]. Sealed packs go through [`Self::put_pack`],
+    /// which may release the buffer early.
     fn put_owned(&self, key: &str, data: Vec<u8>) -> Result<()> {
         self.put(key, &data)
+    }
+
+    /// Upload a sealed pack. `key` is a content-addressed pack key
+    /// (`packs/<shard>/<id>`, the id naming the bytes), which lets a backend
+    /// prove an ambiguous upload committed from the object's size alone.
+    ///
+    /// Visibility and durability as [`Self::put`]. The difference: a backend may
+    /// drop `data` before it returns, once it no longer needs the bytes (REST and
+    /// S3: after every part is acknowledged, before the completion request, and
+    /// only after an earlier completion succeeded on this backend instance).
+    /// A completion that still fails after its in-place retries (and, on S3, is
+    /// not reconciled as committed by size) is then returned as an error instead
+    /// of being retried with the whole object.
+    ///
+    /// Dropping `data` fires its release signal (see [`PackData`]); callers use
+    /// it to stop counting the bytes as held.
+    ///
+    /// The default uploads through [`Self::put_owned`] and releases on return.
+    fn put_pack(&self, key: &str, data: PackData) -> Result<()> {
+        let (bytes, _release) = data.into_parts();
+        self.put_owned(key, bytes)
     }
 
     /// Start writing an object incrementally, for callers that only learn
@@ -197,11 +213,11 @@ pub trait StorageBackend: Send + Sync {
     /// (e.g. `"packs"`), and [`StagedPut::commit`] must name a key below it.
     ///
     /// Returns `Ok(None)` when the backend cannot stage writes; the caller
-    /// then buffers the object and uses [`Self::put_owned`]. That is the
+    /// then buffers the object and uses [`Self::put_pack`]. That is the
     /// default, and the right answer for every backend whose upload needs the
     /// whole object up front (S3, SFTP, REST).
     ///
-    /// A wrapper that intercepts `put`/`put_owned` (rate limiting, test
+    /// A wrapper that intercepts `put`/`put_owned`/`put_pack` (rate limiting, test
     /// recorders) must also decide what to do here, or staged objects bypass
     /// it; [`crate::delegate_storage_backend!`] refuses to compile a wrapper
     /// that overrides one without the other. Returning `Ok(None)` keeps every
@@ -253,9 +269,10 @@ pub trait StorageBackend: Send + Sync {
     //
     // The methods above may keep defaults: each routes back through this
     // impl's own `get`/`put`/`get_range`/`list`, so inheriting one is correct (at
-    // worst less efficient), never a silent loss of capability. The one
-    // exception, `begin_staged_put`, defaults to `Ok(None)` ("buffer and
-    // `put` instead"), which is likewise only ever less efficient.
+    // worst less efficient), never a silent loss of capability; `put_pack`
+    // routes through this impl's own `put_owned`. The one exception,
+    // `begin_staged_put`, defaults to `Ok(None)` ("buffer and `put`
+    // instead"), which is likewise only ever less efficient.
 
     /// Delete temp files ([`vykar_protocol::is_repo_temp_file`]) last
     /// modified at least `older_than` ago (`Duration::ZERO` = all), in the
@@ -455,6 +472,67 @@ impl RangeReader for BufferedRange<'_> {
         self.buf
             .get_mut(rel..rel + len)
             .ok_or_else(|| VykarError::Other("range piece beyond buffered bytes".into()))
+    }
+}
+
+/// A sealed pack's bytes, handed to [`StorageBackend::put_pack`].
+///
+/// Dropping it frees the bytes and then fires the release signal given to
+/// [`Self::with_release`], exactly once. A backend that is done with the bytes
+/// before the upload is (an HTTP part upload waiting for its completion) drops
+/// it early; otherwise it drops when `put_pack` returns, or on unwind.
+pub struct PackData {
+    // Declared before `release`: fields drop in declaration order, so the
+    // bytes are freed before the signal fires.
+    bytes: Vec<u8>,
+    release: PackRelease,
+}
+
+/// The release half of a [`PackData`]; fires its signal when dropped.
+pub struct PackRelease(Option<Box<dyn FnOnce() + Send>>);
+
+impl PackData {
+    /// Bytes with no release signal.
+    pub fn new(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes,
+            release: PackRelease(None),
+        }
+    }
+
+    /// Bytes whose release calls `on_release`.
+    pub fn with_release(bytes: Vec<u8>, on_release: impl FnOnce() + Send + 'static) -> Self {
+        Self {
+            bytes,
+            release: PackRelease(Some(Box::new(on_release))),
+        }
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    /// Split into the bytes and the signal, for a backend that hands the
+    /// bytes on by value. Keep the `PackRelease` alive until the bytes are
+    /// gone: binding it to `_` fires the signal immediately.
+    pub fn into_parts(self) -> (Vec<u8>, PackRelease) {
+        (self.bytes, self.release)
+    }
+}
+
+impl Drop for PackRelease {
+    fn drop(&mut self) {
+        if let Some(f) = self.0.take() {
+            f();
+        }
     }
 }
 
@@ -889,6 +967,103 @@ pub(crate) fn is_stale(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    fn counting_release(bytes: Vec<u8>) -> (PackData, Arc<AtomicUsize>) {
+        let fired = Arc::new(AtomicUsize::new(0));
+        let f = Arc::clone(&fired);
+        let data = PackData::with_release(bytes, move || {
+            f.fetch_add(1, Ordering::SeqCst);
+        });
+        (data, fired)
+    }
+
+    #[test]
+    fn pack_data_release_fires_once_on_drop() {
+        let (data, fired) = counting_release(vec![1, 2, 3]);
+        assert_eq!(fired.load(Ordering::SeqCst), 0);
+        drop(data);
+        assert_eq!(fired.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn pack_data_into_parts_defers_release_to_the_guard() {
+        let (data, fired) = counting_release(vec![1, 2, 3]);
+        let (bytes, release) = data.into_parts();
+        assert_eq!(fired.load(Ordering::SeqCst), 0);
+        drop(bytes);
+        assert_eq!(fired.load(Ordering::SeqCst), 0);
+        drop(release);
+        assert_eq!(fired.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn pack_data_new_has_no_signal() {
+        let data = PackData::new(vec![1, 2]);
+        assert_eq!(data.len(), 2);
+        assert!(!data.is_empty());
+        drop(data);
+    }
+
+    /// A leaf that keeps the trait's `put_pack`, recording what `put_owned`
+    /// saw and whether the release had fired by then.
+    struct OwnedRecorder {
+        fired: Arc<AtomicUsize>,
+        seen: Mutex<Option<(Vec<u8>, usize)>>,
+    }
+
+    impl StorageBackend for OwnedRecorder {
+        fn get(&self, _key: &str) -> Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+        fn put(&self, _key: &str, _data: &[u8]) -> Result<()> {
+            Err(VykarError::Other("put_pack must reach put_owned".into()))
+        }
+        fn delete(&self, _key: &str) -> Result<()> {
+            Ok(())
+        }
+        fn exists(&self, _key: &str) -> Result<bool> {
+            Ok(false)
+        }
+        fn list(&self, _prefix: &str) -> Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+        fn get_range(&self, _key: &str, _offset: u64, _length: u64) -> Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+        fn create_dir(&self, _key: &str) -> Result<()> {
+            Ok(())
+        }
+        fn put_owned(&self, _key: &str, data: Vec<u8>) -> Result<()> {
+            *self.seen.lock().unwrap() = Some((data, self.fired.load(Ordering::SeqCst)));
+            Ok(())
+        }
+        fn profile(&self) -> BackendProfile {
+            BackendProfile {
+                local: false,
+                staged_put: false,
+                request_width: 1,
+                transfer_width: 1,
+            }
+        }
+        unsupported_server_ops!();
+    }
+
+    #[test]
+    fn default_put_pack_goes_through_put_owned_and_releases_on_return() {
+        let (data, fired) = counting_release(vec![7; 64]);
+        let backend = OwnedRecorder {
+            fired: Arc::clone(&fired),
+            seen: Mutex::new(None),
+        };
+        backend.put_pack("packs/00/x", data).unwrap();
+        let (bytes, fired_inside) = backend.seen.lock().unwrap().take().unwrap();
+        assert_eq!(bytes, vec![7; 64]);
+        assert_eq!(fired_inside, 0, "released only after put_owned returned");
+        assert_eq!(fired.load(Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn http_tls_uses_platform_verifier() {

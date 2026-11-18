@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use vykar_storage::{StagedPut, StorageBackend};
+use vykar_storage::{PackData, StagedPut, StorageBackend};
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
 use vykar_types::hash::{HashAlgorithm, Hasher256};
@@ -102,12 +102,22 @@ impl SealedData {
         }
     }
 
-    /// Upload pack data: `put_owned` for a heap buffer (zero-copy for
-    /// backends that support owned buffers), `commit` for a staged one.
-    pub fn put_to(self, storage: &dyn StorageBackend, key: &str) -> Result<()> {
+    /// Upload pack data: `put_pack` for a heap buffer, `commit` for a staged
+    /// one. `on_release` runs once the heap bytes are freed (immediately after
+    /// the commit for a staged pack, which holds none).
+    pub fn put_to(
+        self,
+        storage: &dyn StorageBackend,
+        key: &str,
+        on_release: impl FnOnce() + Send + 'static,
+    ) -> Result<()> {
         match self {
-            SealedData::Memory(v) => storage.put_owned(key, v),
-            SealedData::Staged(object) => object.commit(key),
+            SealedData::Memory(v) => storage.put_pack(key, PackData::with_release(v, on_release)),
+            SealedData::Staged(object) => {
+                let result = object.commit(key);
+                on_release();
+                result
+            }
         }
     }
 }
@@ -400,7 +410,7 @@ impl PackWriter {
         let key = pack_id.storage_key();
         match data {
             SealedData::Memory(v) => storage.put(&key, &v)?,
-            staged @ SealedData::Staged(_) => staged.put_to(storage, &key)?,
+            staged @ SealedData::Staged(_) => staged.put_to(storage, &key, || {})?,
         }
         Ok((pack_id, entries))
     }
@@ -558,7 +568,7 @@ mod tests {
                 let bytes = memory_bytes(&heap.data).to_vec();
                 assert_eq!(PackId::compute(&bytes, algo), staged.pack_id);
                 let key = staged.pack_id.storage_key();
-                staged.data.put_to(&local, &key).unwrap();
+                staged.data.put_to(&local, &key, || {}).unwrap();
                 assert_eq!(local.get(&key).unwrap().unwrap(), bytes);
                 assert_eq!(
                     scan_pack_blobs(&local, &staged.pack_id).unwrap().len(),
@@ -879,12 +889,14 @@ mod tests {
         assert_eq!(w.current_size, 0);
     }
 
-    /// SealedData::put_to dispatches Memory to put_owned.
+    /// SealedData::put_to dispatches Memory to put_pack and fires the release.
     #[test]
     fn put_to_dispatches_correctly() {
-        use std::sync::atomic::{AtomicU8, Ordering};
+        use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+        use std::sync::Arc;
 
         const CALLED_PUT_OWNED: u8 = 2;
+        const CALLED_PUT_PACK: u8 = 3;
 
         struct RecordingBackend {
             called: AtomicU8,
@@ -898,6 +910,10 @@ mod tests {
             }
             fn put_owned(&self, _: &str, _: Vec<u8>) -> Result<()> {
                 self.called.store(CALLED_PUT_OWNED, Ordering::SeqCst);
+                Ok(())
+            }
+            fn put_pack(&self, _: &str, _: PackData) -> Result<()> {
+                self.called.store(CALLED_PUT_PACK, Ordering::SeqCst);
                 Ok(())
             }
             fn delete(&self, _: &str) -> Result<()> {
@@ -928,17 +944,21 @@ mod tests {
             vykar_storage::unsupported_server_ops!();
         }
 
-        // Memory variant → put_owned
+        // Memory variant → put_pack
         let backend = RecordingBackend {
             called: AtomicU8::new(0),
         };
+        let released = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&released);
         let data = SealedData::Memory(vec![1, 2, 3]);
-        data.put_to(&backend, "test").unwrap();
+        data.put_to(&backend, "test", move || flag.store(true, Ordering::SeqCst))
+            .unwrap();
         assert_eq!(
             backend.called.load(Ordering::SeqCst),
-            CALLED_PUT_OWNED,
-            "Memory variant should call put_owned"
+            CALLED_PUT_PACK,
+            "Memory variant should call put_pack"
         );
+        assert!(released.load(Ordering::SeqCst), "release fired");
     }
 
     #[test]

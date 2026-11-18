@@ -288,7 +288,7 @@ mod server_side {
 
     delegate_storage_backend! {
         for ServerRepackBackend;
-        except [put, delete, put_owned, begin_staged_put, server_repack, profile];
+        except [put, delete, put_owned, put_pack, begin_staged_put, server_repack, profile];
 
         // Keep packs on the intercepted `put` path.
         fn begin_staged_put(
@@ -320,6 +320,10 @@ mod server_side {
 
         fn put_owned(&self, key: &str, data: Vec<u8>) -> Result<()> {
             self.put(key, &data)
+        }
+
+        fn put_pack(&self, key: &str, data: vykar_storage::PackData) -> Result<()> {
+            self.put(key, data.as_slice())
         }
 
         fn server_repack(&self, plan: &RepackPlanRequest) -> Result<RepackResultResponse> {

@@ -1,6 +1,7 @@
 ---
 name: e2e-tests
 description: "End-to-end validation suite for vykar backup tool on a Linux sandbox server"
+disable-model-invocation: true
 ---
 
 # Vykar E2E Test Suite

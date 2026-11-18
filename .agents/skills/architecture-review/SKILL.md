@@ -1,6 +1,7 @@
 ---
 name: architecture-review
 description: "Review and improve Rust application architecture for large CLI and backup systems, including workspace layout, crate boundaries, error handling, async/sync design, and testing strategy."
+disable-model-invocation: true
 ---
 
 # Skill: Rust Application Architecture Review

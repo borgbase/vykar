@@ -5,6 +5,7 @@ description: >
   runtimes, client-server networking, memory allocation, serialization, and
   concurrency. Use when asked to audit, review, or optimize Rust code for
   performance.
+disable-model-invocation: true
 ---
 
 # Rust Performance Review Skill

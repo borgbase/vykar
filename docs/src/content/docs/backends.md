@@ -4,13 +4,18 @@ title: "Storage Backends"
 
 The repository URL in your config determines which backend is used. All backends are included in the pre-built binaries. Every repository field, with defaults, is listed in [Configuration → Repositories](/configuration#repositories).
 
-| Backend | URL example |
-|---------|-------------|
-| Local filesystem | `/backups/repo` |
-| S3 / S3-compatible (HTTPS) | `s3://endpoint[:port]/bucket/prefix` |
-| S3 / S3-compatible (HTTP, unsafe) | `s3+http://endpoint[:port]/bucket/prefix` |
-| SFTP | `sftp://host/path` |
-| REST (vykar-server) | `https://host` |
+<figure>
+
+| Backend | URL example | Bandwidth\* |
+|---------|-------------|-------------|
+| Local filesystem | `/backups/repo` | |
+| S3 / S3-compatible (HTTPS) | `s3://endpoint[:port]/bucket/prefix` | |
+| S3 / S3-compatible (HTTP, unsafe) | `s3+http://endpoint[:port]/bucket/prefix` | 134 MiB/s |
+| SFTP | `sftp://host/path` | 37 MiB/s |
+| REST (vykar-server) | `https://host` | 146 MiB/s |
+
+<figcaption>* Average bandwidth over a fresh backup of a 14.63 GB corpus with 40 ms round-trip latency. Each value is the median of three runs. The S3 benchmark used MinIO over HTTP, and the REST benchmark also used HTTP.</figcaption>
+</figure>
 
 ## Transport security
 

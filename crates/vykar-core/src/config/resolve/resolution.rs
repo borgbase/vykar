@@ -444,6 +444,7 @@ sources:
 repositories:
   - url: sftp://backup@nas.local/backups/vykar
     sftp_key: /tmp/id_ed25519
+    sftp_agent: /tmp/agent.sock
     sftp_known_hosts: /tmp/known_hosts
     sftp_timeout: 60
 sources:
@@ -460,6 +461,11 @@ sources:
             repo.sftp_key.as_deref(),
             Some("/tmp/id_ed25519"),
             "sftp_key should be parsed"
+        );
+        assert_eq!(
+            repo.sftp_agent.as_deref(),
+            Some("/tmp/agent.sock"),
+            "sftp_agent should be parsed"
         );
         assert_eq!(
             repo.sftp_known_hosts.as_deref(),

@@ -135,12 +135,28 @@ Host keys are verified with an OpenSSH `known_hosts` file. Unknown hosts use TOF
 repositories:
   - label: "nas"
     url: "sftp://backup@nas.local/backups/vykar"
-    # sftp_key: "/home/user/.ssh/id_rsa"  # Path to private key (optional)
+    # sftp_key: "/home/user/.ssh/id_rsa"  # Path to private key, or public key held by the agent (optional)
+    # sftp_agent: "/path/to/agent.sock"  # SSH agent socket (optional, default: SSH_AUTH_SOCK)
     # sftp_known_hosts: "/home/user/.ssh/known_hosts"  # Optional known_hosts path
     # sftp_timeout: 30         # Per-request timeout in seconds (default: 30, range: 5–300)
 ```
 
 URL format: `sftp://[user@]host[:port]/path`. Default port is 22.
+
+When `sftp_key` is not set, vykar first offers the keys held by the SSH agent. If the agent is absent or the server rejects its keys while keeping the connection open, vykar falls back to `~/.ssh/{id_ed25519, id_rsa, id_ecdsa}`. Use the agent for passphrase-protected keys, because vykar cannot read them from disk.
+
+Servers can disconnect after too many rejected keys, preventing fallback. If your agent holds many keys, set `sftp_key` to the intended `.pub` file, or to a private key to bypass the agent.
+
+Agent authentication has a 30-second timeout, including any approval prompt. Timeouts and temporary connection failures use the configured retries.
+
+`sftp_agent` sets the agent socket, like OpenSSH's `IdentityAgent`. Without it, vykar uses `SSH_AUTH_SOCK`. On Windows, `sftp_agent` is a named pipe. If neither is set, vykar tries the Windows OpenSSH agent at `\\.\pipe\openssh-ssh-agent`, which 1Password and Bitwarden also serve, and then Pageant.
+
+If `sftp_key` names a public key file, vykar signs with the agent and offers only that key, like an OpenSSH `IdentityFile` that points to a `.pub` file. If `sftp_key` names a private key, vykar does not use the agent.
+
+```yaml
+    sftp_agent: "~/.ssh/agent.sock"
+    sftp_key: "~/.ssh/id_ed25519.pub"
+```
 
 The server must support the `posix-rename@openssh.com` extension. Vykar uploads each object to a temporary file and renames it over the destination, so an interrupted upload never leaves a partial object in place. OpenSSH's `sftp-server` provides the extension. On servers that do not advertise it, reads (restore, list, check) still work, but every write fails with an error naming the missing extension.
 

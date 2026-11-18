@@ -25,6 +25,8 @@ pub struct RepositoryEntry {
     #[serde(default, deserialize_with = "deserialize_optional_strict_string")]
     pub sftp_key: Option<String>,
     #[serde(default, deserialize_with = "deserialize_optional_strict_string")]
+    pub sftp_agent: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_strict_string")]
     pub sftp_known_hosts: Option<String>,
     #[serde(default)]
     pub sftp_timeout: Option<u64>,
@@ -74,6 +76,7 @@ impl RepositoryEntry {
             access_key_id: self.access_key_id.clone(),
             secret_access_key: self.secret_access_key.clone(),
             sftp_key: self.sftp_key.clone(),
+            sftp_agent: self.sftp_agent.clone(),
             sftp_known_hosts: self.sftp_known_hosts.clone(),
             sftp_timeout: self.sftp_timeout,
             access_token: self.access_token.clone(),

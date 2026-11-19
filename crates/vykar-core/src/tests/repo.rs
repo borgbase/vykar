@@ -720,6 +720,7 @@ fn init_refuses_a_v3_repository_against_a_pre_blake3_server() {
         access_key_id: None,
         secret_access_key: None,
         sftp_key: None,
+        sftp_agent: None,
         sftp_known_hosts: None,
         max_connections: None,
         sftp_timeout: None,

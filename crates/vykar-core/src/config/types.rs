@@ -200,6 +200,8 @@ pub struct RepositoryConfig {
     pub secret_access_key: Option<String>,
     /// Path to SSH private key for SFTP backend.
     pub sftp_key: Option<String>,
+    /// Path to the SSH agent socket for SFTP (default: `SSH_AUTH_SOCK`).
+    pub sftp_agent: Option<String>,
     /// Path to OpenSSH known_hosts file for SFTP host key verification.
     pub sftp_known_hosts: Option<String>,
     /// Per-request SFTP timeout in seconds (default: 30).
@@ -239,6 +241,7 @@ impl Default for RepositoryConfig {
             access_key_id: None,
             secret_access_key: None,
             sftp_key: None,
+            sftp_agent: None,
             sftp_known_hosts: None,
             sftp_timeout: None,
             access_token: None,

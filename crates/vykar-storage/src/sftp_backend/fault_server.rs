@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures_util::StreamExt;
 use russh::keys::ssh_key::{private::Ed25519Keypair, LineEnding};
 use russh::keys::PrivateKey;
 use russh::server::{Auth, ChannelOpenHandle, Msg, Session};
@@ -23,6 +24,10 @@ use russh_sftp::protocol::{
 /// request and then clears itself.
 #[derive(Default)]
 pub(super) struct Faults {
+    pub drop_agent_once: AtomicBool,
+    pub stall_agent: AtomicBool,
+    /// Reject every public key and drop the connection, like OpenSSH at MaxAuthTries.
+    pub disconnect_on_auth: AtomicBool,
     pub hide_posix_rename: AtomicBool,
     pub refuse_rename: AtomicBool,
     /// Perform the rename, then kill the connection instead of replying.
@@ -45,7 +50,12 @@ pub(super) struct FaultServer {
     pub faults: Arc<Faults>,
     client_key: PathBuf,
     known_hosts: PathBuf,
-    _runtime: tokio::runtime::Runtime,
+    runtime: tokio::runtime::Runtime,
+}
+
+/// The only client key the server accepts, so a test cannot pass on a key from ~/.ssh.
+pub(super) fn client_private_key() -> PrivateKey {
+    PrivateKey::from(Ed25519Keypair::from_seed(&[7; 32]))
 }
 
 impl FaultServer {
@@ -54,10 +64,12 @@ impl FaultServer {
         std::fs::create_dir(dir.path().join("repo")).unwrap();
 
         let client_key = dir.path().join("id_ed25519");
-        let key = PrivateKey::from(Ed25519Keypair::from_seed(&[7; 32]));
         std::fs::write(
             &client_key,
-            key.to_openssh(LineEnding::LF).unwrap().as_bytes(),
+            client_private_key()
+                .to_openssh(LineEnding::LF)
+                .unwrap()
+                .as_bytes(),
         )
         .unwrap();
         let known_hosts = dir.path().join("known_hosts");
@@ -106,17 +118,88 @@ impl FaultServer {
             faults,
             client_key,
             known_hosts,
-            _runtime: runtime,
+            runtime,
         }
     }
 
+    /// Serve an ssh-agent holding the client key; returns its socket or pipe path.
+    pub fn start_agent(&self) -> PathBuf {
+        #[cfg(unix)]
+        let sock = self.dir.path().join("agent.sock");
+        #[cfg(windows)]
+        let sock = PathBuf::from(format!(
+            r"\\.\pipe\vykar-test-{}",
+            self.dir.path().file_name().unwrap().to_string_lossy()
+        ));
+        self.runtime.block_on(async {
+            #[cfg(unix)]
+            let conns = {
+                let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+                futures_util::stream::unfold(listener, |l| async move {
+                    Some((l.accept().await.map(|(s, _)| s), l))
+                })
+            };
+            #[cfg(windows)]
+            let conns = {
+                use tokio::net::windows::named_pipe::ServerOptions;
+
+                let first = ServerOptions::new()
+                    .first_pipe_instance(true)
+                    .create(&sock)
+                    .unwrap();
+                let pipe = sock.clone();
+                futures_util::stream::unfold(first, move |server| {
+                    let pipe = pipe.clone();
+                    async move {
+                        // Each client takes a pipe instance; open the next before serving this one.
+                        let next = ServerOptions::new().create(&pipe).unwrap();
+                        let connected = server.connect().await;
+                        Some((connected.map(|()| server), next))
+                    }
+                })
+            };
+            let faults = Arc::clone(&self.faults);
+            let conns = conns.filter_map(move |conn| {
+                let faults = Arc::clone(&faults);
+                async move {
+                    if faults.drop_agent_once.swap(false, Ordering::SeqCst) {
+                        return None;
+                    }
+                    if faults.stall_agent.load(Ordering::SeqCst) {
+                        std::future::pending::<()>().await;
+                    }
+                    Some(conn)
+                }
+            });
+            tokio::spawn(russh::keys::agent::server::serve(Box::pin(conns), ()));
+            super::connect_agent(Some(&sock))
+                .await
+                .unwrap()
+                .add_identity(&client_private_key(), &[])
+                .await
+                .unwrap();
+        });
+        sock
+    }
+
     pub fn backend(&self, max_retries: usize) -> super::SftpBackend {
+        self.backend_with(max_retries, Some(&self.client_key), None)
+    }
+
+    /// A backend using the given `sftp_key` and `sftp_agent`.
+    pub fn backend_with(
+        &self,
+        max_retries: usize,
+        key: Option<&Path>,
+        agent: Option<&Path>,
+    ) -> super::SftpBackend {
         super::SftpBackend::new(
             "127.0.0.1",
             Some("vykar"),
             Some(self.port),
             "/repo",
-            Some(self.client_key.to_str().unwrap()),
+            key.map(|p| p.to_str().unwrap()),
+            agent.map(|p| p.to_str().unwrap()),
             Some(self.known_hosts.to_str().unwrap()),
             Some(1),
             Some(5),
@@ -159,9 +242,16 @@ impl russh::server::Handler for SshHandler {
     async fn auth_publickey(
         &mut self,
         _user: &str,
-        _key: russh::server::VerifiedPublicKey<'_>,
+        key: russh::server::VerifiedPublicKey<'_>,
     ) -> Result<Auth, Self::Error> {
-        Ok(Auth::Accept)
+        if self.faults.disconnect_on_auth.load(Ordering::SeqCst) {
+            return Err(russh::Error::Disconnect);
+        }
+        if *key.public_key == *client_private_key().public_key() {
+            Ok(Auth::Accept)
+        } else {
+            Ok(Auth::reject())
+        }
     }
 
     async fn channel_open_session(

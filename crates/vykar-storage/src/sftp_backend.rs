@@ -19,7 +19,7 @@ use russh::client;
 use russh::keys::known_hosts::{known_host_keys_path, learn_known_hosts_path};
 use russh::keys::ssh_key;
 use russh::keys::PublicKeyOrCertificate;
-use russh::keys::{load_secret_key, PrivateKey, PrivateKeyWithHashAlg};
+use russh::keys::{load_public_key, load_secret_key, PrivateKey, PrivateKeyWithHashAlg};
 use russh_sftp::client::{Config as SftpConfig, SftpSession};
 use russh_sftp::protocol::{OpenFlags, StatusCode};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -90,6 +90,10 @@ struct SftpConnectParams {
     port: u16,
     user: String,
     key_path: Option<PathBuf>,
+    /// Public key read from `key_path`: sign with the agent, using this key only.
+    agent_key: Option<ssh_key::PublicKey>,
+    /// Agent socket; `SSH_AUTH_SOCK` when unset.
+    agent_socket: Option<PathBuf>,
     root: String,
     known_hosts_path: PathBuf,
     sftp_timeout_secs: u64,
@@ -284,11 +288,24 @@ impl SftpBackend {
         port: Option<u16>,
         root: &str,
         key_path: Option<&str>,
+        agent_socket: Option<&str>,
         known_hosts_path: Option<&str>,
         max_connections: Option<usize>,
         sftp_timeout_secs: Option<u64>,
         retry: RetryConfig,
     ) -> Result<Self> {
+        let key_path = key_path.map(expand_tilde_path);
+        // Like OpenSSH's IdentityFile, sftp_key may name the public half of an agent-held key.
+        // A `.pub` that fails to load must not fall through to the private-key path.
+        let agent_key = match key_path.as_deref() {
+            Some(p) if p.extension().is_some_and(|e| e == "pub") => {
+                Some(load_public_key(p).map_err(|e| {
+                    VykarError::Other(format!("load SSH public key {}: {e}", p.display()))
+                })?)
+            }
+            Some(p) => load_public_key(p).ok(),
+            None => None,
+        };
         let user = user
             .map(|u| u.to_string())
             .unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "unknown".into()));
@@ -326,7 +343,9 @@ impl SftpBackend {
                 host: host.to_string(),
                 port: port.unwrap_or(22),
                 user,
-                key_path: key_path.map(expand_tilde_path),
+                key_path,
+                agent_key,
+                agent_socket: agent_socket.map(expand_tilde_path),
                 root: normalize_root(root),
                 known_hosts_path,
                 sftp_timeout_secs: effective_timeout,
@@ -465,27 +484,50 @@ impl SftpBackend {
                 })?
                 .map_err(|e| ssh_retry_error("connect", &params.host, params.port, e))?;
 
-        // Authenticate with public key.
-        let key_pair = load_key(&params.key_path)?;
         let hash_alg = session
             .best_supported_rsa_hash()
             .await
             .map_err(|e| ssh_retry_error("negotiate hash algorithm", &params.host, params.port, e))?
             .flatten();
 
-        let auth_ok = session
-            .authenticate_publickey(
-                &params.user,
-                PrivateKeyWithHashAlg::new(Arc::new(key_pair), hash_alg),
+        // Without an explicit private key, try ssh-agent first, as OpenSSH does.
+        let agent_ok = (params.key_path.is_none() || params.agent_key.is_some())
+            && tokio::time::timeout(
+                CONNECT_TIMEOUT,
+                auth_with_agent(&mut session, params, hash_alg),
             )
             .await
-            .map_err(|e| ssh_retry_error("authenticate", &params.host, params.port, e))?;
+            .map_err(|_| {
+                ssh_retry_error(
+                    "agent authentication",
+                    &params.host,
+                    params.port,
+                    russh::Error::ConnectionTimeout,
+                )
+            })??;
 
-        if !auth_ok.success() {
-            return Err(RetryError::permanent(VykarError::Other(format!(
-                "SSH public-key authentication failed for user '{}' on {}:{}",
-                params.user, params.host, params.port
-            ))));
+        if !agent_ok {
+            if params.agent_key.is_some() {
+                return Err(RetryError::permanent(VykarError::Other(format!(
+                    "SSH agent has no accepted key matching sftp_key for user '{}' on {}:{}",
+                    params.user, params.host, params.port
+                ))));
+            }
+            let key_pair = load_key(&params.key_path)?;
+            let auth_ok = session
+                .authenticate_publickey(
+                    &params.user,
+                    PrivateKeyWithHashAlg::new(Arc::new(key_pair), hash_alg),
+                )
+                .await
+                .map_err(|e| ssh_retry_error("authenticate", &params.host, params.port, e))?;
+
+            if !auth_ok.success() {
+                return Err(RetryError::permanent(VykarError::Other(format!(
+                    "SSH public-key authentication failed for user '{}' on {}:{}",
+                    params.user, params.host, params.port
+                ))));
+            }
         }
 
         // Open SFTP subsystem.
@@ -782,6 +824,103 @@ fn verify_or_learn_host_key(
     })
 }
 
+/// Offer each agent key (or only `params.agent_key`) until one is accepted.
+/// Returns false when an optional agent is absent or the server accepts none of its keys.
+async fn auth_with_agent(
+    session: &mut client::Handle<SshHandler>,
+    params: &SftpConnectParams,
+    hash_alg: Option<ssh_key::HashAlg>,
+) -> RetryResult<bool> {
+    use russh::keys::agent::AgentIdentity;
+    use russh::AgentAuthError;
+
+    let agent_error = |e| ssh_retry_error("agent authentication", &params.host, params.port, e);
+    let mut agent = match connect_agent(params.agent_socket.as_deref()).await {
+        Ok(agent) => agent,
+        Err(e) if params.agent_key.is_some() => {
+            return Err(RetryError::transient(VykarError::Other(format!(
+                "SSH agent connection: {e}"
+            ))));
+        }
+        Err(e) => {
+            // A configured socket that does not work is worth a warning; a missing SSH_AUTH_SOCK is not.
+            if let Some(path) = &params.agent_socket {
+                tracing::warn!("ssh-agent {}: {e}", path.display());
+            }
+            return Ok(false);
+        }
+    };
+    let identities = match agent.request_identities().await {
+        Ok(identities) => identities,
+        Err(russh::keys::Error::IO(e)) => return Err(agent_error(russh::Error::IO(e))),
+        Err(_) => return Ok(false),
+    };
+    for identity in identities {
+        // Certificates would need authenticate_certificate_with; not supported yet.
+        let AgentIdentity::PublicKey { key, .. } = identity else {
+            continue;
+        };
+        if params
+            .agent_key
+            .as_ref()
+            .is_some_and(|only| only.key_data() != key.key_data())
+        {
+            continue;
+        }
+        match session
+            .authenticate_publickey_with(&params.user, key, hash_alg, &mut agent)
+            .await
+        {
+            Ok(res) if res.success() => return Ok(true),
+            // Typically MaxAuthTries: a retry would offer the same keys and fail the same way.
+            Ok(_) if session.is_closed() => {
+                return Err(RetryError::permanent(VykarError::Other(format!(
+                    "SSH server {}:{} disconnected after rejecting an ssh-agent key \
+                     (too many authentication attempts?); set sftp_key to the key to use",
+                    params.host, params.port
+                ))));
+            }
+            Ok(_) => {}
+            Err(AgentAuthError::Send(_)) => return Err(agent_error(russh::Error::SendError)),
+            Err(AgentAuthError::Key(russh::keys::Error::IO(e))) => {
+                return Err(agent_error(russh::Error::IO(e)));
+            }
+            Err(e) => tracing::debug!("ssh-agent: sign: {e}"),
+        }
+    }
+    Ok(false)
+}
+
+type DynAgentClient = russh::keys::agent::client::AgentClient<
+    Box<dyn russh::keys::agent::client::AgentStream + Send + Unpin>,
+>;
+
+/// Connect to the agent at `socket` (a Unix socket or Windows named pipe), or the platform default.
+async fn connect_agent(
+    socket: Option<&Path>,
+) -> std::result::Result<DynAgentClient, russh::keys::Error> {
+    use russh::keys::agent::client::AgentClient;
+
+    #[cfg(unix)]
+    let agent = match socket {
+        Some(path) => AgentClient::connect_uds(path).await?.dynamic(),
+        None => AgentClient::connect_env().await?.dynamic(),
+    };
+    #[cfg(windows)]
+    let agent = match socket
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("SSH_AUTH_SOCK").map(PathBuf::from))
+    {
+        Some(pipe) => AgentClient::connect_named_pipe(pipe).await?.dynamic(),
+        // Windows OpenSSH's agent pipe (also served by 1Password and Bitwarden), then Pageant.
+        None => match AgentClient::connect_named_pipe(r"\\.\pipe\openssh-ssh-agent").await {
+            Ok(agent) => agent.dynamic(),
+            Err(_) => AgentClient::connect_pageant().await?.dynamic(),
+        },
+    };
+    Ok(agent)
+}
+
 /// Load SSH private key, trying explicit path first, then default locations.
 fn load_key(explicit: &Option<PathBuf>) -> RetryResult<PrivateKey> {
     if let Some(path) = explicit {
@@ -811,7 +950,7 @@ fn load_key(explicit: &Option<PathBuf>) -> RetryResult<PrivateKey> {
     }
 
     Err(RetryError::permanent(VykarError::Other(
-        "no SSH private key found; set sftp_key in config or place a key in ~/.ssh/".into(),
+        "no SSH private key found; set sftp_key in config, place a key in ~/.ssh/, or load one into ssh-agent".into(),
     )))
 }
 
@@ -1497,6 +1636,7 @@ mod tests {
             None,
             "/repo",
             None,
+            None,
             Some("/nonexistent/known_hosts"),
             Some(4),
             None,
@@ -1844,7 +1984,7 @@ mod tests {
             .put_owned("packs/ab/deadbeef", data.clone())
             .unwrap();
 
-        assert!(read(&server, "packs/ab/deadbeef") == data);
+        assert_eq!(read(&server, "packs/ab/deadbeef"), data);
         assert!(server.temps_next_to("packs/ab/deadbeef").is_empty());
         // At least one WRITE per 32 KiB: the write size was not raised.
         let writes = server.faults.writes.load(Ordering::SeqCst);
@@ -1867,13 +2007,147 @@ mod tests {
             .put_owned("packs/ab/deadbeef", data.clone())
             .unwrap();
 
-        assert!(read(&server, "packs/ab/deadbeef") == data);
+        assert_eq!(read(&server, "packs/ab/deadbeef"), data);
         assert!(server.temps_next_to("packs/ab/deadbeef").is_empty());
         assert_eq!(
             server.faults.drop_on_write_number.load(Ordering::SeqCst),
             0,
             "the fault fired"
         );
+    }
+
+    #[test]
+    fn authenticates_with_ssh_agent() {
+        use russh::keys::ssh_key::private::Ed25519Keypair;
+
+        let server = FaultServer::start();
+        let sock = server.start_agent();
+
+        // No sftp_key: any agent key the server accepts.
+        let backend = server.backend_with(0, None, Some(&sock));
+        backend.put("index", b"no key").unwrap();
+        assert_eq!(read(&server, "index"), b"no key");
+
+        // A .pub sftp_key selects that agent key.
+        let write_pub = |name: &str, key: PrivateKey| {
+            let path = server.dir.path().join(name);
+            std::fs::write(&path, key.public_key().to_openssh().unwrap()).unwrap();
+            path
+        };
+        let held = write_pub("held.pub", fault_server::client_private_key());
+        let absent = write_pub(
+            "absent.pub",
+            PrivateKey::from(Ed25519Keypair::from_seed(&[8; 32])),
+        );
+
+        let backend = server.backend_with(0, Some(&held), Some(&sock));
+        backend.put("index", b"via agent").unwrap();
+        assert_eq!(read(&server, "index"), b"via agent");
+
+        // The agent holds an accepted key, but not the one named, so login fails.
+        let err = server
+            .backend_with(0, Some(&absent), Some(&sock))
+            .get("index")
+            .unwrap_err();
+        assert!(err.to_string().contains("no accepted key"), "{err}");
+    }
+
+    #[test]
+    #[ignore = "waits the full 30 s agent timeout"]
+    fn ssh_agent_stall_times_out() {
+        let server = FaultServer::start();
+        let sock = server.start_agent();
+        server.faults.stall_agent.store(true, Ordering::SeqCst);
+        let backend = server.backend_with(0, None, Some(&sock));
+
+        let result = ASYNC_RUNTIME.block_on(async {
+            tokio::time::timeout(
+                CONNECT_TIMEOUT + Duration::from_secs(5),
+                SftpBackend::connect(&backend.params),
+            )
+            .await
+        });
+        let err = result
+            .expect("agent authentication must have its own deadline")
+            .err()
+            .expect("a stalled agent must fail");
+        assert!(err.retryable, "{err:?}");
+        assert!(err.err.to_string().contains("timeout"), "{err:?}");
+    }
+
+    #[test]
+    fn ssh_agent_disconnect_retries() {
+        let server = FaultServer::start();
+        let sock = server.start_agent();
+        server.faults.drop_agent_once.store(true, Ordering::SeqCst);
+
+        server
+            .backend_with(1, None, Some(&sock))
+            .put("index", b"retried agent")
+            .unwrap();
+        assert_eq!(read(&server, "index"), b"retried agent");
+        assert!(!server.faults.drop_agent_once.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn unreadable_pub_sftp_key_is_reported_as_public_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let bad = dir.path().join("bad.pub");
+        std::fs::write(&bad, "not a key\n").unwrap();
+        for path in [bad, dir.path().join("missing.pub")] {
+            let err = SftpBackend::new(
+                "127.0.0.1",
+                Some("vykar"),
+                None,
+                "/repo",
+                path.to_str(),
+                None,
+                Some("/nonexistent/known_hosts"),
+                Some(4),
+                None,
+                RetryConfig::default(),
+            )
+            .err()
+            .expect("a .pub sftp_key that does not load must fail");
+            assert!(err.to_string().contains("SSH public key"), "{err}");
+        }
+    }
+
+    #[test]
+    fn ssh_agent_auth_disconnect_is_permanent() {
+        let server = FaultServer::start();
+        let sock = server.start_agent();
+        server
+            .faults
+            .disconnect_on_auth
+            .store(true, Ordering::SeqCst);
+        let backend = server.backend_with(0, None, Some(&sock));
+
+        let err = ASYNC_RUNTIME
+            .block_on(SftpBackend::connect(&backend.params))
+            .err()
+            .expect("a disconnect during agent auth must fail");
+        assert!(!err.retryable, "{err:?}");
+        assert!(err.err.to_string().contains("set sftp_key"), "{err:?}");
+    }
+
+    #[test]
+    fn ssh_agent_connect_failure_retries_only_when_required() {
+        let server = FaultServer::start();
+        let sock = server.dir.path().join("no-agent.sock");
+        let mut params = server.backend_with(0, None, Some(&sock)).params;
+        let mut conn = ASYNC_RUNTIME
+            .block_on(SftpBackend::connect(&server.backend(0).params))
+            .unwrap();
+
+        assert!(!ASYNC_RUNTIME
+            .block_on(auth_with_agent(&mut conn._session, &params, None))
+            .unwrap());
+        params.agent_key = Some(fault_server::client_private_key().public_key().clone());
+        let err = ASYNC_RUNTIME
+            .block_on(auth_with_agent(&mut conn._session, &params, None))
+            .unwrap_err();
+        assert!(err.retryable, "{err:?}");
     }
 
     fn backend_put_seed(server: &FaultServer) {

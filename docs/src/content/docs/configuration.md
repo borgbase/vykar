@@ -135,7 +135,8 @@ name. Two entries that resolve to the same name are rejected at load time. Two
 
 | Field | Default | Values | Description |
 |-------|---------|--------|-------------|
-| `sftp_key` | — | string | Path to SSH private key. Auto-detects `~/.ssh/{id_ed25519, id_rsa, id_ecdsa}` when omitted |
+| `sftp_key` | — | string | Path to SSH private key, or to a public key held by the SSH agent. When omitted, tries the SSH agent, then `~/.ssh/{id_ed25519, id_rsa, id_ecdsa}` |
+| `sftp_agent` | — | string | Path to SSH agent socket, or named pipe on Windows. Defaults to `SSH_AUTH_SOCK`; on Windows, falls back to the OpenSSH agent pipe, then Pageant |
 | `sftp_known_hosts` | — | string | Path to known_hosts file. Defaults to `~/.ssh/known_hosts` at runtime |
 | `sftp_timeout` | — | integer (seconds, 5–300) | Per-request timeout; upload data writes get four times this. Defaults to 30s; clamped to 5–300s range |
 

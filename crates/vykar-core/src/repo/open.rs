@@ -250,6 +250,7 @@ impl Repository {
             lock_fence: None,
             key_blob,
             index_sidecar_write: None,
+            local_caches_stale: false,
         })
     }
 
@@ -293,12 +294,20 @@ impl Repository {
                 .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
         }
         if let Some(index_object) = index_object {
-            let raw_index = index_object?.into_bytes(repo.storage.as_ref())?;
-            let index = Self::decode_full_index(raw_index, repo.crypto.as_ref())?;
+            let start = std::time::Instant::now();
+            let (index, source) = repo.index_from_object(index_object?)?;
+            let (generation, entries) = (index.0, index.1.len());
             // `index_generation` still holds the `index.gen` hint read in
             // `open_inner`, before the index GET.
             let sidecar = repo.index_generation;
             repo.install_chunk_index(index, Some(sidecar));
+            tracing::debug!(
+                ?source,
+                generation,
+                entries,
+                elapsed_ms = start.elapsed().as_millis() as u64,
+                "index loaded at open"
+            );
         }
         Ok(repo)
     }
@@ -442,6 +451,7 @@ impl Repository {
             lock_fence: None,
             key_blob,
             index_sidecar_write: None,
+            local_caches_stale: false,
         };
         Ok((repo, file_cache_load))
     }
@@ -450,9 +460,16 @@ impl Repository {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::index::dedup_cache::{self, CachedIndexBlob};
+    use crate::index::ChunkIndexEntry;
+    use crate::repo::commit::IndexSource;
+    use crate::repo::index_fetch::IndexObject;
     use crate::testutil::MemoryBackend;
+    use std::collections::HashMap;
     use std::sync::Mutex;
     use vykar_storage::{delegate_storage_backend, InnerBackend};
+    use vykar_types::chunk_id::ChunkId;
+    use vykar_types::pack_id::PackId;
 
     /// Logs every `get` key in call order.
     struct GetLog {
@@ -526,6 +543,124 @@ mod tests {
             0u64.to_le_bytes(),
             "the stale sidecar is rewritten to the index's generation"
         );
+    }
+
+    /// A plaintext repository whose index (refcounts 2, 1, 1) was persisted,
+    /// with the blob cache and a full cache at its generation in `cache`.
+    fn repo_with_caches(cache: &std::path::Path) -> (Arc<dyn StorageBackend>, Repository) {
+        crate::testutil::init_test_environment();
+        let inner: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+        let mut repo = Repository::init(
+            Box::new(Arc::clone(&inner)),
+            EncryptionMode::None,
+            ChunkerConfig::default(),
+            None,
+            None,
+            Some(cache.to_path_buf()),
+        )
+        .unwrap();
+        let pack = PackId::from_bytes([0xAA; 32]);
+        let index = repo.chunk_index_mut();
+        for i in 0..3u8 {
+            index.add(
+                ChunkId::from_bytes([i; 32]),
+                100 + u32::from(i),
+                pack,
+                200 * u64::from(i),
+            );
+        }
+        index.increment_refcount(&ChunkId::from_bytes([0; 32]));
+        repo.save_state().unwrap();
+        dedup_cache::build_full_index_cache(
+            repo.chunk_index(),
+            repo.index_generation,
+            &repo.config.id,
+            Some(cache),
+        )
+        .unwrap();
+        (inner, repo)
+    }
+
+    fn entries(index: &ChunkIndex) -> HashMap<ChunkId, ChunkIndexEntry> {
+        index.iter().map(|(id, e)| (*id, *e)).collect()
+    }
+
+    #[test]
+    fn index_from_object_uses_full_cache_for_cached_and_matching_remote() {
+        let cache = tempfile::tempdir().unwrap();
+        let (inner, repo) = repo_with_caches(cache.path());
+        let cd = Some(cache.path());
+        let stored = inner.get("index").unwrap().unwrap();
+        let (gen, decoded) =
+            Repository::decode_full_index(Some(stored.clone()), repo.crypto.as_ref()).unwrap();
+        assert_eq!(gen, repo.index_generation);
+        assert_eq!(decoded.len(), 3);
+
+        let cached = CachedIndexBlob::open(&repo.config.id, cd).unwrap();
+        let ((g, index), source) = repo.index_from_object(IndexObject::Cached(cached)).unwrap();
+        assert_eq!(source, IndexSource::FullCache);
+        assert_eq!((g, entries(&index)), (gen, entries(&decoded)));
+
+        let ((g, index), source) = repo
+            .index_from_object(IndexObject::Remote(Some(stored.clone())))
+            .unwrap();
+        assert_eq!(source, IndexSource::FullCache);
+        assert_eq!((g, entries(&index)), (gen, entries(&decoded)));
+
+        // Another client rewrites the index: decoded, not taken from the full cache.
+        let other_cache = tempfile::tempdir().unwrap();
+        let mut other_repo = Repository::open(
+            Box::new(Arc::clone(&inner)),
+            None,
+            Some(other_cache.path().to_path_buf()),
+            OpenOptions::new().with_index(),
+        )
+        .unwrap();
+        other_repo
+            .chunk_index_mut()
+            .increment_refcount(&ChunkId::from_bytes([1; 32]));
+        other_repo.save_state().unwrap();
+        let other = inner.get("index").unwrap().unwrap();
+        let (other_gen, other_decoded) =
+            Repository::decode_full_index(Some(other.clone()), repo.crypto.as_ref()).unwrap();
+        let ((g, index), source) = repo
+            .index_from_object(IndexObject::Remote(Some(other)))
+            .unwrap();
+        assert_eq!(source, IndexSource::Decoded);
+        assert_eq!((g, entries(&index)), (other_gen, entries(&other_decoded)));
+
+        let ((g, index), source) = repo.index_from_object(IndexObject::Remote(None)).unwrap();
+        assert_eq!(source, IndexSource::Decoded);
+        assert_eq!((g, index.len()), (0, 0));
+    }
+
+    #[test]
+    fn index_from_object_decodes_when_full_cache_generation_differs() {
+        let cache = tempfile::tempdir().unwrap();
+        let (inner, repo) = repo_with_caches(cache.path());
+        let cd = Some(cache.path());
+        // Same content, another generation label: no longer provably ours.
+        dedup_cache::build_full_index_cache(
+            repo.chunk_index(),
+            repo.index_generation.wrapping_add(1),
+            &repo.config.id,
+            cd,
+        )
+        .unwrap();
+        let stored = inner.get("index").unwrap().unwrap();
+        let (gen, decoded) =
+            Repository::decode_full_index(Some(stored.clone()), repo.crypto.as_ref()).unwrap();
+
+        let cached = CachedIndexBlob::open(&repo.config.id, cd).unwrap();
+        let ((g, index), source) = repo.index_from_object(IndexObject::Cached(cached)).unwrap();
+        assert_eq!(source, IndexSource::Decoded);
+        assert_eq!((g, entries(&index)), (gen, entries(&decoded)));
+
+        let ((g, index), source) = repo
+            .index_from_object(IndexObject::Remote(Some(stored)))
+            .unwrap();
+        assert_eq!(source, IndexSource::Decoded);
+        assert_eq!((g, entries(&index)), (gen, entries(&decoded)));
     }
 
     /// Pins the plaintext chunk-ID key derivation for both formats, through

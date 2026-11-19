@@ -20,6 +20,7 @@ mod item;
 mod lazy_item_stream;
 mod lock;
 mod lock_fence;
+mod maintenance_index;
 mod manifest;
 mod passphrase;
 mod proptest;

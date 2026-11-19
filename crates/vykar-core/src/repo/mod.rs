@@ -332,6 +332,10 @@ pub struct Repository {
     /// check). Joined by the next index write, by `save_state`, after the
     /// commit's fence check, and on drop.
     index_sidecar_write: Option<std::thread::JoinHandle<()>>,
+    /// `save_state` persisted the index without rebuilding the local
+    /// full/dedup/restore caches, so they are labelled with an older
+    /// generation. Cleared by a rebuild and by every replacement of `chunk_index`.
+    local_caches_stale: bool,
 }
 
 impl Repository {
@@ -418,6 +422,7 @@ impl Repository {
     /// Does not mark dirty — intended for memory optimization (e.g. restore).
     pub fn clear_chunk_index(&mut self) {
         self.chunk_index = ChunkIndex::new();
+        self.local_caches_stale = false;
     }
 
     /// Read-only access to the file cache.

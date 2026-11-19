@@ -237,6 +237,18 @@ impl Fixture {
         dedup_cache::index_blob_cache_path(&self.repo_id(), Some(&self.cache_dir)).unwrap()
     }
 
+    /// Flip the last payload byte of the index blob cache (header intact).
+    fn corrupt_blob_cache_payload(&self) {
+        let path = self.blob_cache_path();
+        let mut cached = fs::read(&path).unwrap();
+        *cached.last_mut().unwrap() ^= 0x01;
+        fs::write(&path, &cached).unwrap();
+    }
+
+    fn full_cache_path(&self) -> PathBuf {
+        dedup_cache::full_index_cache_path(&self.repo_id(), Some(&self.cache_dir)).unwrap()
+    }
+
     /// Another client (its own cache dir) rewrites `index` at a new
     /// generation, bumping one refcount when `bump` is set.
     fn rewrite_index_elsewhere(&self, bump: bool) -> Repository {
@@ -327,22 +339,69 @@ fn open_after_304_matches_remote_index() {
 }
 
 #[test]
-fn corrupt_cached_payload_falls_back_at_open_but_not_at_commit() {
+fn corrupt_cached_payload_is_not_read_when_full_cache_exists() {
     let fx = Fixture::new();
-    let path = fx.blob_cache_path();
-    let mut cached = fs::read(&path).unwrap();
-    *cached.last_mut().unwrap() ^= 0x01;
-    fs::write(&path, &cached).unwrap();
+    fx.corrupt_blob_cache_payload();
     fs::write(fx.src.join("b.bin"), vec![0x22u8; 64 * 1024]).unwrap();
 
     let etag = Etag::honest();
     let stages = fx.backup("s2", Some(&etag));
 
-    // The open verifies the payload and downloads instead; the commit only
-    // needs the header digest and the full index cache (D18).
-    assert_eq!(etag.counts(), (1, 2), "(full GETs, 304s)");
+    // The open builds the index from the full cache and never reads the
+    // payload; the commit only needs the header digest and the full index
+    // cache (D18).
+    assert_eq!(etag.counts(), (0, 2), "(full GETs, 304s)");
     assert!(stages.contains(&FAST), "expected fast path: {stages:?}");
     fx.assert_check_clean();
+}
+
+#[test]
+fn corrupt_cached_payload_without_full_cache_falls_back_at_open() {
+    let fx = Fixture::new();
+    fx.corrupt_blob_cache_payload();
+    fs::remove_file(fx.full_cache_path()).unwrap();
+
+    let etag = Etag::honest();
+    let repo = fx.open_via(&etag);
+
+    // The payload fails verification, so the open downloads instead.
+    assert_eq!(etag.counts(), (1, 1), "(full GETs, 304s)");
+    let plain = fx.open_fresh();
+    assert_eq!(repo.index_generation(), plain.index_generation());
+    assert_eq!(entries(&repo), entries(&plain));
+}
+
+#[test]
+fn corrupt_full_cache_falls_back_to_decode() {
+    let fx = Fixture::new();
+    let path = fx.full_cache_path();
+    let mut full = fs::read(&path).unwrap();
+    // Last entry byte, just before the 32-byte checksum trailer.
+    let at = full.len() - 33;
+    full[at] ^= 0x01;
+    fs::write(&path, &full).unwrap();
+
+    let etag = Etag::honest();
+    let repo = fx.open_via(&etag);
+
+    // Checksum mismatch: the verified local payload is decoded, nothing is
+    // downloaded.
+    assert_eq!(etag.counts(), (0, 1), "(full GETs, 304s)");
+    let plain = fx.open_fresh();
+    assert_eq!(repo.index_generation(), plain.index_generation());
+    assert_eq!(entries(&repo), entries(&plain));
+}
+
+/// A backend without conditional GET downloads the index; bytes matching the
+/// cached blob's digest are taken from the full cache with the same result.
+/// (`repo::open` unit tests assert the source.)
+#[test]
+fn open_on_plain_backend_with_matching_digest_equals_decode() {
+    let fx = Fixture::new();
+    let repo = fx.open(fx.local(), &fx.cache_dir);
+    let plain = fx.open_fresh();
+    assert_eq!(repo.index_generation(), plain.index_generation());
+    assert_eq!(entries(&repo), entries(&plain));
 }
 
 /// A 304 for a cache at another generation than the session's: the verified

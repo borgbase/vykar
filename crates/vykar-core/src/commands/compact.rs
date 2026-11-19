@@ -70,11 +70,24 @@ pub fn run(
         threshold
     };
 
-    let mut repo = open_repo(config, passphrase, OpenOptions::new().with_index())?;
+    let mut repo = open_repo(config, passphrase, OpenOptions::new())?;
+    run_on_repo(&mut repo, threshold, max_repack_size, dry_run, shutdown)
+}
 
+/// [`run`] on an already opened repository, with a sanitised `threshold`.
+/// The chunk index is loaded under the maintenance lock, so any index loaded
+/// at open is replaced.
+pub(crate) fn run_on_repo(
+    repo: &mut Repository,
+    threshold: f64,
+    max_repack_size: Option<u64>,
+    dry_run: bool,
+    shutdown: Option<&AtomicBool>,
+) -> Result<CompactStats> {
     let concurrency = repo.storage.profile().request_width;
 
-    with_maintenance_lock(&mut repo, |repo| {
+    with_maintenance_lock(repo, |repo| {
+        repo.load_chunk_index_under_lock()?;
         compact_repo(
             repo,
             threshold,

@@ -48,6 +48,14 @@ fn log_stage_elapsed(ctx: (std::time::Instant, &'static str)) {
     );
 }
 
+/// Where an index built for open or a maintenance load came from (logged;
+/// asserted in tests).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IndexSource {
+    FullCache,
+    Decoded,
+}
+
 impl Repository {
     /// Load the chunk index from storage on demand.
     /// Always downloads the remote index blob to get the authenticated generation.
@@ -80,6 +88,7 @@ impl Repository {
         let (gen, index) = index;
         self.index_generation = gen;
         self.chunk_index = index;
+        self.local_caches_stale = false;
         if sidecar != Some(gen) {
             // Best-effort rewrite index.gen
             let _ = self.storage.put("index.gen", &gen.to_le_bytes());
@@ -95,8 +104,88 @@ impl Repository {
     /// operations. Use `load_chunk_index()` for write paths.
     pub fn load_chunk_index_uncached(&mut self) -> Result<()> {
         self.chunk_index = self.reload_full_index()?;
+        self.local_caches_stale = false;
         self.rebase_pack_target_from_index();
         Ok(())
+    }
+
+    /// Load the chunk index as storage holds it now. For maintenance
+    /// operations that hold the repository lock, so nothing can change it
+    /// until the lock is released. Replaces any index loaded at open.
+    /// Conditional GET against the local blob cache, then
+    /// [`Self::index_from_object`]. The value `index_generation` held before
+    /// the load is passed on as the sidecar.
+    pub(crate) fn load_chunk_index_under_lock(&mut self) -> Result<()> {
+        debug_assert!(self.write_session.is_none() && !self.index_dirty);
+        let start = std::time::Instant::now();
+        let sidecar = self.index_generation;
+        let object = super::index_fetch::fetch_index_object(
+            self.storage.as_ref(),
+            &self.config.id,
+            self.cache_dir_override.as_deref(),
+        )?;
+        let (index, source) = self.index_from_object(object)?;
+        let (generation, entries) = (index.0, index.1.len());
+        self.install_chunk_index(index, Some(sidecar));
+        debug!(
+            ?source,
+            generation,
+            entries,
+            elapsed_ms = start.elapsed().as_millis() as u64,
+            "index loaded under maintenance lock"
+        );
+        Ok(())
+    }
+
+    /// The chunk index for a fetched `index` object.
+    ///
+    /// Built from the local full index cache when the object is provably the
+    /// blob this machine last wrote (storage answered "unchanged", or the
+    /// downloaded bytes hash to the cached blob's recorded digest) and a
+    /// checksum-valid full cache exists at that blob's generation. Otherwise
+    /// decoded exactly as before.
+    ///
+    /// Opens and maintenance operations therefore act on the local full
+    /// index cache whenever it matches the cached blob's generation: the same
+    /// trust the backup fast path already places in it when it promotes that
+    /// cache to the remote index.
+    pub(super) fn index_from_object(
+        &self,
+        object: IndexObject,
+    ) -> Result<((u64, ChunkIndex), IndexSource)> {
+        let cd = self.cache_dir_override.as_deref();
+        let id = &self.config.id;
+        let raw = match object {
+            IndexObject::Cached(cached) => {
+                let generation = cached.generation();
+                if let Some(full) = dedup_cache::MmapFullIndexCache::open(id, generation, cd) {
+                    drop(cached);
+                    let index = dedup_cache::chunk_index_from_full_cache(&full);
+                    return Ok(((generation, index), IndexSource::FullCache));
+                }
+                IndexObject::Cached(cached).into_bytes(self.storage.as_ref())?
+            }
+            IndexObject::Remote(Some(raw)) => {
+                let matching = dedup_cache::CachedIndexBlob::open(id, cd)
+                    .filter(|cached| blake3::hash(&raw).as_bytes() == cached.digest())
+                    .and_then(|cached| {
+                        let generation = cached.generation();
+                        dedup_cache::MmapFullIndexCache::open(id, generation, cd)
+                            .map(|full| (generation, full))
+                    });
+                if let Some((generation, full)) = matching {
+                    drop(raw);
+                    let index = dedup_cache::chunk_index_from_full_cache(&full);
+                    return Ok(((generation, index), IndexSource::FullCache));
+                }
+                Some(raw)
+            }
+            IndexObject::Remote(None) => None,
+        };
+        Ok((
+            Self::decode_full_index(raw, self.crypto.as_ref())?,
+            IndexSource::Decoded,
+        ))
     }
 
     /// Flush pending packs and wait for uploads, then drop the tiered dedup
@@ -218,17 +307,18 @@ impl Repository {
 
         // When the index changes, rotate index_generation so the local dedup
         // cache is invalidated.
-        if self.index_dirty {
+        let persisted = self.index_dirty;
+        if persisted {
             self.index_generation = rand::rng().next_u64();
-        }
-
-        if self.index_dirty {
             self.persist_index()?;
         }
 
         if self.rebuild_dedup_cache {
             self.rebuild_local_caches(false);
             self.rebuild_dedup_cache = false;
+            self.local_caches_stale = false;
+        } else if persisted {
+            self.local_caches_stale = true;
         }
 
         // Save file cache before hydrating chunk_index to reduce peak memory.
@@ -544,6 +634,7 @@ impl Repository {
         // Persist if dirty — covers both the merge above AND any prior
         // invalidation that set the dirty flag (e.g., stale sections removed
         // at backup start).
+        let ctx = (std::time::Instant::now(), "save file cache");
         if let Err(e) = self.save_file_cache_if_dirty() {
             crate::commands::backup::emit_post_commit_warning(
                 progress,
@@ -555,6 +646,7 @@ impl Repository {
                 ),
             );
         }
+        log_stage_elapsed(ctx);
 
         // Rebuild local caches if needed. When the fast path already wrote the
         // full cache (deferred_chunk_index_hydrate), skip the redundant sort;
@@ -564,6 +656,7 @@ impl Repository {
         if self.rebuild_dedup_cache {
             self.rebuild_local_caches(deferred_chunk_index_hydrate);
             self.rebuild_dedup_cache = false;
+            self.local_caches_stale = false;
         }
         log_stage_elapsed(ctx);
 
@@ -716,6 +809,37 @@ impl Repository {
         if let Some(handle) = self.index_sidecar_write.take() {
             let _ = handle.join();
         }
+    }
+
+    /// Rebuild the local full/dedup/restore caches after a maintenance
+    /// operation persisted the index (see `local_caches_stale`). Local and
+    /// best-effort; call it before the repository lock is released, since
+    /// every local cache writer shares fixed temp-file names (skipped if the
+    /// lock fence no longer holds). Only refreshes
+    /// caches this machine already keeps (an existing `full_index_cache`),
+    /// and only while `chunk_index` is exactly the persisted index
+    /// (`!index_dirty`, no write session).
+    pub(crate) fn refresh_stale_local_caches(&mut self) {
+        if !self.local_caches_stale || self.index_dirty || self.write_session.is_some() {
+            return;
+        }
+        let cd = self.cache_dir_override.as_deref();
+        if !dedup_cache::full_index_cache_path(&self.config.id, cd).is_some_and(|p| p.exists()) {
+            return;
+        }
+        // The lock is what keeps other cache writers off the shared temp files.
+        if let Err(e) = self.check_lock_fence() {
+            warn!("skipping local cache rebuild, repository lock not confirmed: {e}");
+            return;
+        }
+        let start = std::time::Instant::now();
+        self.rebuild_local_caches(false);
+        self.local_caches_stale = false;
+        debug!(
+            elapsed_ms = start.elapsed().as_millis() as u64,
+            generation = self.index_generation,
+            "rebuilt local caches after maintenance index write"
+        );
     }
 
     /// Rebuild all local caches: full index cache (1 sort), then derive

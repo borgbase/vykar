@@ -173,6 +173,7 @@ impl Repository {
         let dedup = DedupIndex::from_chunk_index(&self.chunk_index);
         // Drop the full index to reclaim memory
         self.chunk_index = ChunkIndex::new();
+        self.local_caches_stale = false;
         ws.dedup_index = Some(dedup);
         ws.index_delta = Some(IndexDelta::new());
     }
@@ -208,6 +209,7 @@ impl Repository {
             // fallback below still has the index because it only runs when
             // the cache failed to open.
             self.chunk_index = ChunkIndex::new();
+            self.local_caches_stale = false;
             let tiered = TieredDedupIndex::new(mmap_cache);
             debug!(?tiered, "tiered dedup mode: using mmap cache");
             // Bumps for chunks already in the cache are recorded by position

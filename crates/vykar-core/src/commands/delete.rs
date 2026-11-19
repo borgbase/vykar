@@ -7,8 +7,8 @@ use super::list::load_item_stream_from_ptrs;
 use super::snapshot_ops::{
     decrement_chunk_refs_on_index, prepare_removal_targets, remove_snapshots,
 };
-use super::util::{check_interrupted, with_open_repo_maintenance_lock};
-use crate::repo::OpenOptions;
+use super::util::{check_interrupted, open_repo, with_maintenance_lock};
+use crate::repo::{OpenOptions, Repository};
 
 pub struct DeleteStats {
     pub snapshot_name: String,
@@ -46,6 +46,18 @@ pub fn run(
     dry_run: bool,
     shutdown: Option<&AtomicBool>,
 ) -> Result<DeleteResult> {
+    let mut repo = open_repo(config, passphrase, OpenOptions::new())?;
+    run_on_repo(&mut repo, snapshot_names, dry_run, shutdown)
+}
+
+/// [`run`] on an already opened repository. The chunk index is loaded under
+/// the maintenance lock, so any index loaded at open is replaced.
+pub(crate) fn run_on_repo(
+    repo: &mut Repository,
+    snapshot_names: &[&str],
+    dry_run: bool,
+    shutdown: Option<&AtomicBool>,
+) -> Result<DeleteResult> {
     // Phase 0: Deduplicate while preserving order.
     let mut seen = HashSet::new();
     let unique_names: Vec<&str> = snapshot_names
@@ -54,57 +66,50 @@ pub fn run(
         .filter(|name| seen.insert(*name))
         .collect();
 
-    with_open_repo_maintenance_lock(
-        config,
-        passphrase,
-        OpenOptions::new().with_index(),
-        |repo| {
-            let targets = prepare_removal_targets(repo, &unique_names, shutdown)?;
+    with_maintenance_lock(repo, |repo| {
+        // Under the lock, so the index is the one storage holds now.
+        repo.load_chunk_index_under_lock()?;
+        let targets = prepare_removal_targets(repo, &unique_names, shutdown)?;
 
-            if dry_run {
-                // Scratch-index simulation: clone the real index and run
-                // decrements against the clone so shared chunks are counted
-                // correctly across the batch.
-                let mut scratch = repo.chunk_index().clone();
-                let mut all_stats = Vec::with_capacity(targets.len());
+        if dry_run {
+            // Scratch-index simulation: clone the real index and run
+            // decrements against the clone so shared chunks are counted
+            // correctly across the batch.
+            let mut scratch = repo.chunk_index().clone();
+            let mut all_stats = Vec::with_capacity(targets.len());
 
-                for target in &targets {
-                    check_interrupted(shutdown)?;
-                    let items_stream =
-                        load_item_stream_from_ptrs(repo, &target.item_ptrs, shutdown)?;
-                    let impact = decrement_chunk_refs_on_index(
-                        &mut scratch,
-                        &items_stream,
-                        &target.item_ptrs,
-                    )?;
+            for target in &targets {
+                check_interrupted(shutdown)?;
+                let items_stream = load_item_stream_from_ptrs(repo, &target.item_ptrs, shutdown)?;
+                let impact =
+                    decrement_chunk_refs_on_index(&mut scratch, &items_stream, &target.item_ptrs)?;
 
-                    all_stats.push(DeleteStats {
-                        snapshot_name: target.snapshot_name.clone(),
-                        chunks_deleted: impact.chunks_deleted,
-                        space_freed: impact.space_freed,
-                    });
-                }
-
-                return Ok(DeleteResult {
-                    stats: all_stats,
-                    warnings: Vec::new(),
+                all_stats.push(DeleteStats {
+                    snapshot_name: target.snapshot_name.clone(),
+                    chunks_deleted: impact.chunks_deleted,
+                    space_freed: impact.space_freed,
                 });
             }
 
-            let mut warnings: Vec<String> = Vec::new();
-            let all_stats = remove_snapshots(repo, targets, "delete", shutdown, &mut warnings)?
-                .into_iter()
-                .map(|r| DeleteStats {
-                    snapshot_name: r.snapshot_name,
-                    chunks_deleted: r.impact.chunks_deleted,
-                    space_freed: r.impact.space_freed,
-                })
-                .collect();
-
-            Ok(DeleteResult {
+            return Ok(DeleteResult {
                 stats: all_stats,
-                warnings,
+                warnings: Vec::new(),
+            });
+        }
+
+        let mut warnings: Vec<String> = Vec::new();
+        let all_stats = remove_snapshots(repo, targets, "delete", shutdown, &mut warnings)?
+            .into_iter()
+            .map(|r| DeleteStats {
+                snapshot_name: r.snapshot_name,
+                chunks_deleted: r.impact.chunks_deleted,
+                space_freed: r.impact.space_freed,
             })
-        },
-    )
+            .collect();
+
+        Ok(DeleteResult {
+            stats: all_stats,
+            warnings,
+        })
+    })
 }

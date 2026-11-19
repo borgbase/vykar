@@ -1290,7 +1290,11 @@ pub fn load_chunk_index_from_full_cache_path(path: &Path, generation: u64) -> Re
     let cache = MmapFullIndexCache::open_path(path, generation).ok_or_else(|| {
         vykar_types::error::VykarError::Other("full index cache not found or stale".into())
     })?;
+    Ok(chunk_index_from_full_cache(&cache))
+}
 
+/// Build a `ChunkIndex` from an opened (header- and checksum-validated) full index cache.
+pub(crate) fn chunk_index_from_full_cache(cache: &MmapFullIndexCache) -> ChunkIndex {
     let mut index = ChunkIndex::with_capacity(cache.entry_count() as usize);
     for entry in cache.iter() {
         index.add(
@@ -1304,7 +1308,7 @@ pub fn load_chunk_index_from_full_cache_path(path: &Path, generation: u64) -> Re
             index.increment_refcount_by(&entry.chunk_id, entry.refcount - 1);
         }
     }
-    Ok(index)
+    index
 }
 
 // ---------------------------------------------------------------------------

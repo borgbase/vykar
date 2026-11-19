@@ -8,8 +8,8 @@ use crate::prune::{apply_policy_by_label, PruneDecision};
 use vykar_types::error::{Result, VykarError};
 
 use super::snapshot_ops::{prepare_removal_targets, remove_snapshots};
-use super::util::with_open_repo_maintenance_lock;
-use crate::repo::OpenOptions;
+use super::util::{open_repo, with_maintenance_lock};
+use crate::repo::{OpenOptions, Repository};
 
 /// Aggregate result of a prune operation.
 ///
@@ -49,112 +49,135 @@ pub fn run(
     source_filter: &[String],
     shutdown: Option<&AtomicBool>,
 ) -> Result<(PruneStats, Vec<PruneListEntry>)> {
-    with_open_repo_maintenance_lock(
+    let mut repo = open_repo(config, passphrase, OpenOptions::new())?;
+    run_on_repo(
+        &mut repo,
         config,
-        passphrase,
-        OpenOptions::new().with_index(),
-        |repo| {
-            let now = Utc::now();
+        dry_run,
+        list,
+        sources,
+        source_filter,
+        shutdown,
+    )
+}
 
-            // When --source is given, restrict to matching snapshots only
-            let target_snapshots = if source_filter.is_empty() {
-                repo.manifest().snapshots.clone()
-            } else {
-                repo.manifest()
-                    .snapshots
-                    .iter()
-                    .filter(|e| source_filter.contains(&e.source_label))
-                    .cloned()
-                    .collect()
-            };
+/// [`run`] on an already opened repository. The chunk index is loaded under
+/// the maintenance lock, so any index loaded at open is replaced.
+pub(crate) fn run_on_repo(
+    repo: &mut Repository,
+    config: &VykarConfig,
+    dry_run: bool,
+    list: bool,
+    sources: &[SourceEntry],
+    source_filter: &[String],
+    shutdown: Option<&AtomicBool>,
+) -> Result<(PruneStats, Vec<PruneListEntry>)> {
+    with_maintenance_lock(repo, |repo| {
+        let now = Utc::now();
 
-            // Build per-source retention map
-            let source_retentions: HashMap<String, RetentionConfig> = sources
+        // When --source is given, restrict to matching snapshots only
+        let target_snapshots = if source_filter.is_empty() {
+            repo.manifest().snapshots.clone()
+        } else {
+            repo.manifest()
+                .snapshots
                 .iter()
-                .filter_map(|s| s.retention.as_ref().map(|r| (s.label.clone(), r.clone())))
-                .collect();
+                .filter(|e| source_filter.contains(&e.source_label))
+                .cloned()
+                .collect()
+        };
 
-            // Always group by source_label — labels are intrinsic to each
-            // snapshot (recorded at backup time), so retention must apply
-            // per-label regardless of whether the local config has a
-            // `sources:` block. (Issue #138.)
-            if !config.retention.has_any_rule()
-                && source_retentions.values().all(|r| !r.has_any_rule())
-            {
-                return Err(VykarError::Config(
-                    "no retention rules configured — set at least one keep_* option in the retention section or per-source".into(),
-                ));
-            }
+        // Build per-source retention map
+        let source_retentions: HashMap<String, RetentionConfig> = sources
+            .iter()
+            .filter_map(|s| s.retention.as_ref().map(|r| (s.label.clone(), r.clone())))
+            .collect();
 
-            let decisions = apply_policy_by_label(
-                &target_snapshots,
-                &config.retention,
-                &source_retentions,
-                now,
-            )?;
+        // Always group by source_label — labels are intrinsic to each
+        // snapshot (recorded at backup time), so retention must apply
+        // per-label regardless of whether the local config has a
+        // `sources:` block. (Issue #138.)
+        if !config.retention.has_any_rule() && source_retentions.values().all(|r| !r.has_any_rule())
+        {
+            return Err(VykarError::Config(
+                "no retention rules configured — set at least one keep_* option in the retention section or per-source".into(),
+            ));
+        }
 
-            // Build list output
-            let mut list_entries = Vec::new();
-            let mut kept = 0usize;
-            let mut to_prune: Vec<String> = Vec::new();
+        let decisions = apply_policy_by_label(
+            &target_snapshots,
+            &config.retention,
+            &source_retentions,
+            now,
+        )?;
 
-            for entry in &decisions {
-                match &entry.decision {
-                    PruneDecision::Keep { reasons } => {
-                        kept += 1;
-                        if list || dry_run {
-                            list_entries.push(PruneListEntry {
-                                action: "keep".into(),
-                                snapshot_name: entry.snapshot_name.clone(),
-                                reasons: reasons.clone(),
-                            });
-                        }
+        // Build list output
+        let mut list_entries = Vec::new();
+        let mut kept = 0usize;
+        let mut to_prune: Vec<String> = Vec::new();
+
+        for entry in &decisions {
+            match &entry.decision {
+                PruneDecision::Keep { reasons } => {
+                    kept += 1;
+                    if list || dry_run {
+                        list_entries.push(PruneListEntry {
+                            action: "keep".into(),
+                            snapshot_name: entry.snapshot_name.clone(),
+                            reasons: reasons.clone(),
+                        });
                     }
-                    PruneDecision::Prune => {
-                        to_prune.push(entry.snapshot_name.clone());
-                        if list || dry_run {
-                            list_entries.push(PruneListEntry {
-                                action: "prune".into(),
-                                snapshot_name: entry.snapshot_name.clone(),
-                                reasons: Vec::new(),
-                            });
-                        }
+                }
+                PruneDecision::Prune => {
+                    to_prune.push(entry.snapshot_name.clone());
+                    if list || dry_run {
+                        list_entries.push(PruneListEntry {
+                            action: "prune".into(),
+                            snapshot_name: entry.snapshot_name.clone(),
+                            reasons: Vec::new(),
+                        });
                     }
                 }
             }
+        }
 
-            if dry_run {
-                return Ok((
-                    PruneStats {
-                        kept,
-                        pruned: to_prune.len(),
-                        chunks_deleted: 0,
-                        space_freed: 0,
-                        warnings: Vec::new(),
-                    },
-                    list_entries,
-                ));
-            }
-
-            // Process oldest first
-            to_prune.reverse();
-
-            let targets = prepare_removal_targets(repo, &to_prune, shutdown)?;
-            let mut warnings: Vec<String> = Vec::new();
-            let removed = remove_snapshots(repo, targets, "prune", shutdown, &mut warnings)?;
-            let total_chunks_deleted = removed.iter().map(|r| r.impact.chunks_deleted).sum();
-            let total_space_freed = removed.iter().map(|r| r.impact.space_freed).sum();
-
-            Ok((
+        if dry_run {
+            return Ok((
                 PruneStats {
                     kept,
                     pruned: to_prune.len(),
-                    chunks_deleted: total_chunks_deleted,
-                    space_freed: total_space_freed,
-                    warnings,
+                    chunks_deleted: 0,
+                    space_freed: 0,
+                    warnings: Vec::new(),
                 },
                 list_entries,
-            ))
-        },
-    )
+            ));
+        }
+
+        // Process oldest first
+        to_prune.reverse();
+
+        // Loaded only now, under the lock, and only when something is
+        // removed: dry runs and empty prunes never touch the index.
+        if !to_prune.is_empty() {
+            repo.load_chunk_index_under_lock()?;
+        }
+
+        let targets = prepare_removal_targets(repo, &to_prune, shutdown)?;
+        let mut warnings: Vec<String> = Vec::new();
+        let removed = remove_snapshots(repo, targets, "prune", shutdown, &mut warnings)?;
+        let total_chunks_deleted = removed.iter().map(|r| r.impact.chunks_deleted).sum();
+        let total_space_freed = removed.iter().map(|r| r.impact.space_freed).sum();
+
+        Ok((
+            PruneStats {
+                kept,
+                pruned: to_prune.len(),
+                chunks_deleted: total_chunks_deleted,
+                space_freed: total_space_freed,
+                warnings,
+            },
+            list_entries,
+        ))
+    })
 }

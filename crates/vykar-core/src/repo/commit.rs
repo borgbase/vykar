@@ -7,11 +7,13 @@ use super::format::{
     pack_object_streaming_with_context, unpack_object_expect_with_context, ObjectType,
 };
 use super::index_fetch::IndexObject;
+use super::index_store::{self, CacheLocation, SyncedIndex};
 use super::manifest::{self, Manifest};
 use super::snapshot_cache;
-use super::{Repository, INDEX_OBJECT_CONTEXT};
+use super::{IndexLayout, RepoFormat, Repository, INDEX_OBJECT_CONTEXT};
 use crate::compress;
 use crate::index::dedup_cache;
+use crate::index::head::IndexHead;
 use crate::index::{ChunkIndex, IndexBlob, IndexBlobRef, IndexDelta};
 use vykar_crypto::CryptoEngine;
 use vykar_types::error::{Result, VykarError};
@@ -73,6 +75,11 @@ impl Repository {
     /// concurrent writer put there since. The sidecar is never trusted for
     /// writes either way.
     pub(super) fn load_chunk_index_with_sidecar(&mut self, sidecar: Option<u64>) -> Result<()> {
+        if self.is_segmented() {
+            let synced = self.sync_index(None, true)?;
+            self.install_synced_index(synced);
+            return Ok(());
+        }
         let index = self.reload_full_index_with_generation()?;
         self.install_chunk_index(index, sidecar);
         Ok(())
@@ -89,7 +96,7 @@ impl Repository {
         self.index_generation = gen;
         self.chunk_index = index;
         self.local_caches_stale = false;
-        if sidecar != Some(gen) {
+        if sidecar != Some(gen) && !self.is_segmented() {
             // Best-effort rewrite index.gen
             let _ = self.storage.put("index.gen", &gen.to_le_bytes());
         }
@@ -103,6 +110,13 @@ impl Repository {
     /// NOTE: Does not update `index_generation` — only suitable for read-only
     /// operations. Use `load_chunk_index()` for write paths.
     pub fn load_chunk_index_uncached(&mut self) -> Result<()> {
+        if self.is_segmented() {
+            // Every object of the chain is fetched and verified; the head is
+            // kept for later writes.
+            let synced = self.sync_index(None, false)?;
+            self.install_synced_index(synced);
+            return Ok(());
+        }
         self.chunk_index = self.reload_full_index()?;
         self.local_caches_stale = false;
         self.rebase_pack_target_from_index();
@@ -118,6 +132,19 @@ impl Repository {
     pub(crate) fn load_chunk_index_under_lock(&mut self) -> Result<()> {
         debug_assert!(self.write_session.is_none() && !self.index_dirty);
         let start = std::time::Instant::now();
+        if self.is_segmented() {
+            let synced = self.sync_index(None, true)?;
+            let source = synced.source;
+            self.install_synced_index(synced);
+            debug!(
+                ?source,
+                generation = self.index_generation,
+                entries = self.chunk_index.len(),
+                elapsed_ms = start.elapsed().as_millis() as u64,
+                "index loaded under maintenance lock"
+            );
+            return Ok(());
+        }
         let sidecar = self.index_generation;
         let object = super::index_fetch::fetch_index_object(
             self.storage.as_ref(),
@@ -135,6 +162,77 @@ impl Repository {
             "index loaded under maintenance lock"
         );
         Ok(())
+    }
+
+    pub(super) fn is_segmented(&self) -> bool {
+        self.format.index_layout() == IndexLayout::Segmented
+    }
+
+    /// Refuse index writes this version cannot make yet: the segmented
+    /// layout is read-only here.
+    pub(super) fn ensure_index_writable(&self) -> Result<()> {
+        if self.is_segmented() {
+            return Err(VykarError::Other(format!(
+                "this version of vykar can read, but not write, format v{} repositories",
+                self.format.version()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Segmented layout: bring the local full index cache to `head`, or to
+    /// a freshly read head. `use_local: false` ignores and leaves alone the
+    /// local cache (the result lives in a temp file), so every object of the
+    /// chain is fetched and verified.
+    pub(super) fn sync_index(
+        &mut self,
+        head: Option<IndexHead>,
+        use_local: bool,
+    ) -> Result<SyncedIndex> {
+        let head = match head {
+            Some(head) => head,
+            None => index_store::fetch_head(self.storage.as_ref(), self.crypto.as_ref())?,
+        };
+        let path = use_local
+            .then(|| {
+                dedup_cache::full_index_cache_path(
+                    &self.config.id,
+                    self.cache_dir_override.as_deref(),
+                )
+            })
+            .flatten();
+        let location = CacheLocation {
+            path: path.as_deref(),
+            scratch: self.index_scratch.take(),
+            use_local,
+        };
+        let start = std::time::Instant::now();
+        let synced = index_store::sync_full_cache(
+            self.storage.as_ref(),
+            self.crypto.as_ref(),
+            head,
+            location,
+            self.request_width(),
+        )?;
+        debug!(
+            source = ?synced.source,
+            entries = synced.head.entries,
+            segments = synced.head.segments.len(),
+            elapsed_ms = start.elapsed().as_millis() as u64,
+            "index cache synced to head"
+        );
+        Ok(synced)
+    }
+
+    /// Make a synced full cache the in-memory index.
+    pub(super) fn install_synced_index(&mut self, synced: SyncedIndex) {
+        self.chunk_index = dedup_cache::chunk_index_from_full_cache(&synced.cache);
+        drop(synced.cache);
+        self.index_generation = dedup_cache::generation_for_state(&synced.head.state_hash);
+        self.index_head = Some(synced.head);
+        self.index_scratch = synced.scratch;
+        self.local_caches_stale = false;
+        self.rebase_pack_target_from_index();
     }
 
     /// The chunk index for a fetched `index` object.
@@ -772,6 +870,7 @@ impl Repository {
     /// raw-blob cache that the next run's fast path compares against. Only
     /// the `index` PUT is fatal — the sidecar and the cache are best-effort.
     fn put_index_blob(&mut self, index_packed: &[u8], generation: u64) -> Result<()> {
+        self.ensure_index_writable()?;
         self.join_index_sidecar_write();
         self.check_lock_fence()?;
         self.storage.put("index", index_packed)?;
@@ -936,17 +1035,36 @@ impl Repository {
 
     /// Reload the full chunk index + generation from storage.
     fn reload_full_index_with_generation(&self) -> Result<(u64, ChunkIndex)> {
-        Self::fetch_full_index(self.storage.as_ref(), self.crypto.as_ref())
+        Self::fetch_full_index(self.storage.as_ref(), self.crypto.as_ref(), self.format)
     }
 
     /// Download and decode the full chunk index + generation using only the
     /// storage and crypto handles, for readers that cannot borrow the
-    /// repository. Does not touch the repository's own index.
+    /// repository. Does not touch the repository's own index or local
+    /// caches: a segmented index is built from its base and segments in a
+    /// temp file.
     pub(crate) fn fetch_full_index(
         storage: &dyn vykar_storage::StorageBackend,
         crypto: &dyn CryptoEngine,
+        format: RepoFormat,
     ) -> Result<(u64, ChunkIndex)> {
-        Self::decode_full_index(storage.get("index")?, crypto)
+        match format.index_layout() {
+            IndexLayout::Monolithic => Self::decode_full_index(storage.get("index")?, crypto),
+            IndexLayout::Segmented => {
+                let head = index_store::fetch_head(storage, crypto)?;
+                let location = CacheLocation {
+                    path: None,
+                    scratch: None,
+                    use_local: false,
+                };
+                let width = storage.profile().request_width.max(1);
+                let synced = index_store::sync_full_cache(storage, crypto, head, location, width)?;
+                Ok((
+                    dedup_cache::generation_for_state(&synced.head.state_hash),
+                    dedup_cache::chunk_index_from_full_cache(&synced.cache),
+                ))
+            }
+        }
     }
 
     /// Decode a fetched `index` object (`None` = absent: generation 0, empty).

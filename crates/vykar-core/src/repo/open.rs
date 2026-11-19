@@ -6,23 +6,27 @@ use rand::Rng;
 
 use super::file_cache::FileCache;
 use super::format::{pack_object_streaming_with_context, ObjectType};
+use super::index_store;
 use super::key::{self, KeyProofCtx};
 use super::manifest::Manifest;
 use super::snapshot_cache;
 use super::{
-    BlobCache, EncryptionMode, OpenOptions, RepoConfig, RepoFormat, Repository,
+    BlobCache, EncryptionMode, IndexLayout, OpenOptions, RepoConfig, RepoFormat, Repository,
     BLOB_CACHE_MAX_BYTES, INDEX_OBJECT_CONTEXT, KEY_PRIMARY, KEY_SECONDARY,
 };
 use crate::compress;
 use crate::config::{
     default_max_pack_size, default_min_pack_size, ChunkerConfig, RepositoryConfig,
 };
+use crate::index::dedup_cache::generation_for_state;
+use crate::index::head::IndexHead;
 use crate::index::{ChunkIndex, IndexBlob};
 use vykar_crypto::key::{EncryptedKey, MasterKey};
 use vykar_crypto::{CryptoEngine, PlaintextEngine};
 use vykar_storage::StorageBackend;
 use vykar_types::chunk_id::ChunkHasher;
 use vykar_types::error::{Result, VykarError};
+use vykar_types::hash::HashAlgorithm;
 
 /// Domain-separation context for the format-v3 plaintext chunk-ID key.
 ///
@@ -44,19 +48,21 @@ const PLAINTEXT_CHUNK_ID_KEY_CONTEXT: &str =
 /// path as encrypted ones, which buys corruption detection, not tamper
 /// resistance.
 pub(crate) fn derive_plaintext_chunk_id_key(repo_id: &[u8], format: RepoFormat) -> [u8; 32] {
-    match format {
+    // Follows the chunk hash, not the version: a v2 repository keeps its key
+    // as v4.
+    match format.chunk_hash() {
         // Frozen: RustCrypto BLAKE2b-256, exactly as v2 repositories were
         // written. Do not "modernise" this to blake2b_simd without checking
         // it byte-for-byte. `Blake2b256` sets the same digest length in the
         // BLAKE2b parameter block as the `Blake2bVar::new(32)` this replaced,
         // so the output is unchanged; `v2_fixture_compat` is the guard.
-        RepoFormat::V2 => {
+        HashAlgorithm::Blake2b => {
             use blake2::{Blake2b256, Digest};
             let mut hasher = Blake2b256::new();
             hasher.update(repo_id);
             hasher.finalize().into()
         }
-        RepoFormat::V3 => blake3::derive_key(PLAINTEXT_CHUNK_ID_KEY_CONTEXT, repo_id),
+        HashAlgorithm::Blake3 => blake3::derive_key(PLAINTEXT_CHUNK_ID_KEY_CONTEXT, repo_id),
     }
 }
 
@@ -74,6 +80,33 @@ impl Repository {
         passphrase: Option<&str>,
         repo_config_opts: Option<&RepositoryConfig>,
         cache_dir: Option<PathBuf>,
+    ) -> Result<Self> {
+        // New repositories are always created at the current format. There is
+        // deliberately no flag and no config key to choose otherwise: the
+        // choice would only ever be "make this repo unreadable by newer
+        // binaries for no benefit".
+        Self::init_at_format(
+            storage,
+            encryption,
+            chunker_params,
+            passphrase,
+            repo_config_opts,
+            cache_dir,
+            RepoFormat::CURRENT,
+        )
+    }
+
+    /// [`Self::init`] at an explicit format, for tests of formats `init`
+    /// does not create yet.
+    #[doc(hidden)]
+    pub fn init_at_format(
+        storage: Box<dyn StorageBackend>,
+        encryption: EncryptionMode,
+        chunker_params: ChunkerConfig,
+        passphrase: Option<&str>,
+        repo_config_opts: Option<&RepositoryConfig>,
+        cache_dir: Option<PathBuf>,
+        format: RepoFormat,
     ) -> Result<Self> {
         // Library callers can bypass YAML validation. Reject unsupported
         // parameters before writing a new repository's immutable config.
@@ -102,12 +135,6 @@ impl Repository {
                 "max_pack_size ({max_pack_size}) exceeds hard limit of 512 MiB"
             )));
         }
-
-        // New repositories are always created at the current format. There is
-        // deliberately no flag and no config key to choose otherwise: the
-        // choice would only ever be "make this repo unreadable by newer
-        // binaries for no benefit".
-        let format = RepoFormat::CURRENT;
 
         let repo_config = RepoConfig {
             version: format.version(),
@@ -139,6 +166,8 @@ impl Repository {
                 }
             };
 
+        let layout = format.index_layout();
+
         // Pre-flight: refuse to create a repository the server cannot serve.
         //
         // Load-bearing, because `init` writes only non-pack keys (config,
@@ -156,6 +185,15 @@ impl Repository {
                         storage_label(repo_config_opts),
                         caps.version,
                         format.chunk_hash().as_str().to_uppercase(),
+                        format.version(),
+                    )));
+                }
+                if layout == IndexLayout::Segmented && !caps.segmented_index {
+                    return Err(VykarError::Config(format!(
+                        "vykar-server at {} (version {}) does not support the segmented \
+                         index of format v{}. Upgrade the server first.",
+                        storage_label(repo_config_opts),
+                        caps.version,
                         format.version(),
                     )));
                 }
@@ -197,29 +235,42 @@ impl Repository {
             key_blob = Some(key_data);
         }
 
-        // Store empty IndexBlob (compressed with ZSTD)
         let manifest = Manifest::new();
         let chunk_index = ChunkIndex::new();
-        let index_blob = IndexBlob {
-            generation: 0,
-            chunks: chunk_index.clone(),
-        };
-        let index_packed = pack_object_streaming_with_context(
-            ObjectType::ChunkIndex,
-            INDEX_OBJECT_CONTEXT,
-            64, // empty index is tiny
-            crypto.as_ref(),
-            |buf| {
-                compress::compress_stream_zstd(buf, 3, |encoder| {
-                    rmp_serde::encode::write(encoder, &index_blob)?;
-                    Ok(())
-                })
-            },
-        )?;
-        storage.put("index", &index_packed)?;
+        let (index_generation, index_head) = match layout {
+            IndexLayout::Monolithic => {
+                // Store empty IndexBlob (compressed with ZSTD)
+                let index_blob = IndexBlob {
+                    generation: 0,
+                    chunks: chunk_index.clone(),
+                };
+                let index_packed = pack_object_streaming_with_context(
+                    ObjectType::ChunkIndex,
+                    INDEX_OBJECT_CONTEXT,
+                    64, // empty index is tiny
+                    crypto.as_ref(),
+                    |buf| {
+                        compress::compress_stream_zstd(buf, 3, |encoder| {
+                            rmp_serde::encode::write(encoder, &index_blob)?;
+                            Ok(())
+                        })
+                    },
+                )?;
+                storage.put("index", &index_packed)?;
 
-        // Write advisory index.gen sidecar
-        storage.put("index.gen", &0u64.to_le_bytes())?;
+                // Write advisory index.gen sidecar
+                storage.put("index.gen", &0u64.to_le_bytes())?;
+                (0, None)
+            }
+            IndexLayout::Segmented => {
+                // `server_init` does not create `index.d/`: a server that
+                // predates it refuses to start with the directory present.
+                storage.create_dir(index_store::INDEX_OBJECT_DIR)?;
+                let head = IndexHead::empty();
+                storage.put("index", &index_store::pack_head(&head, crypto.as_ref())?)?;
+                (generation_for_state(&head.state_hash), Some(head))
+            }
+        };
 
         // Create directory structure (skip if server already did it)
         if !server_did_init {
@@ -241,7 +292,7 @@ impl Repository {
             format,
             file_cache: FileCache::new(),
             blob_cache: BlobCache::new(BLOB_CACHE_MAX_BYTES),
-            index_generation: 0,
+            index_generation,
             index_dirty: false,
             file_cache_dirty: false,
             rebuild_dedup_cache: false,
@@ -251,6 +302,8 @@ impl Repository {
             key_blob,
             index_sidecar_write: None,
             local_caches_stale: false,
+            index_head,
+            index_scratch: None,
         })
     }
 
@@ -277,6 +330,33 @@ impl Repository {
         opts: OpenOptions,
     ) -> Result<Self> {
         let (mut repo, file_cache_load) = Self::open_inner(storage, passphrase, cache_dir, &opts)?;
+        if repo.is_segmented() {
+            // Local cache catch-up and segment downloads overlap the file
+            // cache load; the index is built only after it finished.
+            let synced = opts.load_index.then(|| {
+                let head = repo.index_head.take();
+                repo.sync_index(head, true)
+            });
+            if let Some(handle) = file_cache_load {
+                repo.file_cache = handle
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            }
+            if let Some(synced) = synced {
+                let start = std::time::Instant::now();
+                let synced = synced?;
+                let source = synced.source;
+                repo.install_synced_index(synced);
+                tracing::debug!(
+                    ?source,
+                    generation = repo.index_generation,
+                    entries = repo.chunk_index.len(),
+                    elapsed_ms = start.elapsed().as_millis() as u64,
+                    "index loaded at open"
+                );
+            }
+            return Ok(repo);
+        }
         // The index GET overlaps the file cache load (local disk), which
         // runs on its own thread. A local copy confirmed by storage is read
         // and verified, and the index decoded, only after that load has
@@ -410,12 +490,16 @@ impl Repository {
             None
         };
 
-        // Read advisory index.gen sidecar (cache hint only, not trusted for writes).
-        let index_generation = match storage.get("index.gen")? {
-            Some(data) => <[u8; 8]>::try_from(data.as_slice())
-                .map(u64::from_le_bytes)
-                .unwrap_or(0),
-            None => 0,
+        // Read advisory index.gen sidecar (cache hint only, not trusted for
+        // writes). The segmented layout has none.
+        let mut index_generation = match format.index_layout() {
+            IndexLayout::Monolithic => match storage.get("index.gen")? {
+                Some(data) => <[u8; 8]>::try_from(data.as_slice())
+                    .map(u64::from_le_bytes)
+                    .unwrap_or(0),
+                None => 0,
+            },
+            IndexLayout::Segmented => 0,
         };
 
         // Refresh snapshot list from snapshots/ (replaces manifest load).
@@ -430,6 +514,19 @@ impl Repository {
         )?;
         let skipped_snapshots = refresh.skipped;
         let manifest = Manifest::from_snapshot_entries(refresh.entries);
+
+        // Segmented layout: the head, read once and only after the snapshot
+        // list. A writer PUTs the head before its snapshot, so this head
+        // covers every listed snapshot. Opens without the index still use
+        // it for the state identity of the local caches.
+        let index_head = match format.index_layout() {
+            IndexLayout::Monolithic => None,
+            IndexLayout::Segmented => {
+                let head = index_store::fetch_head(storage.as_ref(), crypto.as_ref())?;
+                index_generation = generation_for_state(&head.state_hash);
+                Some(head)
+            }
+        };
 
         let repo = Repository {
             storage,
@@ -452,6 +549,8 @@ impl Repository {
             key_blob,
             index_sidecar_write: None,
             local_caches_stale: false,
+            index_head,
+            index_scratch: None,
         };
         Ok((repo, file_cache_load))
     }

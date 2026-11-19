@@ -87,6 +87,7 @@ impl Repository {
         if self.write_session.is_some() {
             return Err(VykarError::Other("write session already active".into()));
         }
+        self.ensure_index_writable()?;
         let num_packs = self.chunk_index.count_distinct_packs();
         let data_target = compute_data_pack_target(
             num_packs,

@@ -170,14 +170,20 @@ pub fn prove_key(
 
     let engine = build_engine(&repo_config.encryption, format, candidate)?;
 
+    // Either layout's object may be at `index` whatever the format says: an
+    // upgrade can be interrupted, and an old binary can overwrite a head.
     if let Ok(Some(blob)) = storage.get("index") {
-        if unpack_object_expect_with_context(
-            &blob,
-            ObjectType::ChunkIndex,
-            INDEX_OBJECT_CONTEXT,
-            engine.as_ref(),
-        )
-        .is_ok()
+        if [ObjectType::ChunkIndex, ObjectType::IndexHead]
+            .into_iter()
+            .any(|expected| {
+                unpack_object_expect_with_context(
+                    &blob,
+                    expected,
+                    INDEX_OBJECT_CONTEXT,
+                    engine.as_ref(),
+                )
+                .is_ok()
+            })
         {
             return Ok(KeyProof::AuthenticatedData);
         }

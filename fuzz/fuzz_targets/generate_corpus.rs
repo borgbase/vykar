@@ -14,9 +14,13 @@ use std::path::Path;
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::Aes256Gcm;
 use vykar_core::compress::{compress, Compression};
-use vykar_core::index::dedup_cache::FullCacheEntry;
+use vykar_core::index::base::encode_base;
+use vykar_core::index::dedup_cache::{
+    build_full_index_cache_to_path, FullCacheEntry, MmapFullIndexCache,
+};
+use vykar_core::index::head::{BaseRef, IndexHead, ObjectName, SegmentRef};
 use vykar_core::index::segment::{RefcountDelta, Relocation, Segment};
-use vykar_core::index::IndexBlob;
+use vykar_core::index::{ChunkIndex, IndexBlob};
 use vykar_core::repo::file_cache::{CachedChunkRef, CachedChunks, FileCache};
 use vykar_core::repo::format::ObjectType;
 use vykar_core::repo::pack::{PackType, PackWriter};
@@ -180,6 +184,59 @@ fn seed_index_segment() {
         }],
     };
     write_seed("fuzz_index_segment", "all_sections", &segment.encode());
+}
+
+fn seed_index_head() {
+    write_seed(
+        "fuzz_index_head",
+        "empty",
+        &IndexHead::empty().encode().unwrap(),
+    );
+    let head = IndexHead {
+        layout: 1,
+        state_hash: [3; 32],
+        entries: 12,
+        base: Some(BaseRef {
+            name: ObjectName([1; 32]),
+            size: 100,
+            state_hash: [1; 32],
+            entries: 10,
+        }),
+        segments: vec![SegmentRef {
+            name: ObjectName([2; 32]),
+            size: 20,
+            state_hash_after: [3; 32],
+            entries_after: 12,
+        }],
+        retired: vec![ObjectName([9; 32])],
+    };
+    write_seed(
+        "fuzz_index_head",
+        "base_segment_retired",
+        &head.encode().unwrap(),
+    );
+}
+
+fn seed_index_base() {
+    let path = std::env::temp_dir().join("vykar-fuzz-corpus-full-cache");
+    for (name, n) in [("empty", 0u8), ("three_packs", 9)] {
+        let mut index = ChunkIndex::new();
+        for i in 0..n {
+            let id = ChunkId::from_bytes([i.wrapping_mul(37); 32]);
+            index.add(
+                id,
+                100 + u32::from(i),
+                PackId::from_bytes([i % 3 + 1; 32]),
+                u64::from(i) * 4096,
+            );
+        }
+        build_full_index_cache_to_path(&index, 1, &path).unwrap();
+        let cache = MmapFullIndexCache::open_verified(&path).unwrap();
+        let mut data = vec![n];
+        encode_base(&cache, &mut data).unwrap();
+        write_seed("fuzz_index_base", name, &data);
+    }
+    let _ = fs::remove_file(&path);
 }
 
 fn seed_item_stream() {
@@ -398,6 +455,12 @@ fn main() {
 
     seed_index_segment();
     println!("  fuzz_index_segment: done");
+
+    seed_index_head();
+    println!("  fuzz_index_head: done");
+
+    seed_index_base();
+    println!("  fuzz_index_base: done");
 
     println!("All corpus seeds written to {CORPUS_DIR}");
 }

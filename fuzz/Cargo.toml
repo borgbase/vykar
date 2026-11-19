@@ -65,6 +65,16 @@ path = "fuzz_targets/fuzz_index_segment.rs"
 doc = false
 
 [[bin]]
+name = "fuzz_index_head"
+path = "fuzz_targets/fuzz_index_head.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_index_base"
+path = "fuzz_targets/fuzz_index_base.rs"
+doc = false
+
+[[bin]]
 name = "generate_corpus"
 path = "fuzz_targets/generate_corpus.rs"
 required-features = []

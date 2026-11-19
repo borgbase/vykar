@@ -799,7 +799,7 @@ fn init_creates_the_current_repository_format() {
 }
 
 /// A repository written by a future vykar must be refused at the version
-/// gate, not decoded with v3 semantics.
+/// gate, not decoded with known semantics.
 #[test]
 fn open_rejects_an_unknown_repository_version() {
     crate::testutil::init_test_environment();
@@ -815,7 +815,7 @@ fn open_rejects_an_unknown_repository_version() {
     .unwrap();
 
     let mut tampered_config = repo.config.clone();
-    tampered_config.version = 4;
+    tampered_config.version = 6;
     let tampered_data = rmp_serde::to_vec(&tampered_config).unwrap();
     repo.storage.put("config", &tampered_data).unwrap();
 
@@ -826,9 +826,9 @@ fn open_rejects_an_unknown_repository_version() {
         crate::repo::OpenOptions::new(),
     );
     match result {
-        Err(vykar_types::error::VykarError::UnsupportedVersion(v)) => assert_eq!(v, 4),
+        Err(vykar_types::error::VykarError::UnsupportedVersion(v)) => assert_eq!(v, 6),
         other => panic!(
-            "expected UnsupportedVersion(4), got {:?}",
+            "expected UnsupportedVersion(6), got {:?}",
             other.map(|_| ())
         ),
     }

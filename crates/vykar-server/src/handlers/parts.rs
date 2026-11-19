@@ -438,6 +438,7 @@ mod tests {
         let caps: vykar_protocol::ServerCapabilities =
             serde_json::from_slice(&body_bytes(resp).await).unwrap();
         assert!(caps.pack_parts);
+        assert!(caps.segmented_index);
     }
 
     /// Parts in any order, one sent twice; the assembled object is exactly

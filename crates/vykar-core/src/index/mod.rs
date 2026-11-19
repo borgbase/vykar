@@ -1,6 +1,8 @@
+pub mod base;
 pub mod cached_bumps;
 pub mod dedup_cache;
 pub mod hasher;
+pub mod head;
 pub mod segment;
 
 use std::collections::{HashMap, HashSet};

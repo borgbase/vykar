@@ -141,12 +141,16 @@ pub async fn put_object(
         Err(e) => return Err(ServerError::from(e)),
     };
 
-    // Append-only: only index, index.gen, locks/*, sessions/* are overwritable.
-    // Everything else (config, keys/*, snapshots/*, packs/*) is immutable once written.
+    // Append-only: only index, index.gen, index.d/*, locks/*, sessions/* are
+    // overwritable. Everything else (config, keys/*, snapshots/*, packs/*) is
+    // immutable once written. An `index.d/` object is content-named, so an
+    // overwrite is a retried or repeated PUT of the same state; the index
+    // itself was always overwritable.
     if state.inner.config.append_only && existing_meta.is_some() {
         let is_mutable = key == "index"
             || key == "index.gen"
             || key == "manifest" // v1 compat — remove once v1 clients are retired
+            || vykar_protocol::is_index_object_key(&key)
             || key.starts_with("locks/")
             || key.starts_with("sessions/");
         if !is_mutable {
@@ -374,9 +378,11 @@ pub async fn delete_object(
 
     // Append-only forbids deleting committed data. Temp files are uncommitted
     // (interrupted PUTs), and locks/ + sessions/ are ephemeral coordination
-    // state — deleting any of these cannot violate append-only.
+    // state — deleting any of these cannot violate append-only. Index objects
+    // are the same trust as overwriting `index`, which was always allowed.
     if state.inner.config.append_only
         && !is_temp
+        && !vykar_protocol::is_index_object_key(&key)
         && !key.starts_with("locks/")
         && !key.starts_with("sessions/")
     {
@@ -1350,6 +1356,31 @@ mod tests {
             listed.sort();
             assert_eq!(listed, expected, "{uri}");
         }
+    }
+
+    /// Index objects are content-named: a repeated PUT and a DELETE are
+    /// allowed in append-only mode, as overwriting `index` always was.
+    #[tokio::test]
+    async fn append_only_allows_index_object_overwrite_and_delete() {
+        let (router, _state, tmp) = setup_app_append_only(0);
+        let key = format!("index.d/{}", "5a".repeat(32));
+        let uri = format!("/{key}");
+
+        let resp = authed_put(router.clone(), &uri, b"obj".to_vec()).await;
+        assert_status(&resp, StatusCode::CREATED);
+        let resp = authed_put(router.clone(), &uri, b"obj".to_vec()).await;
+        assert_status(&resp, StatusCode::NO_CONTENT);
+        let resp = authed_delete(router.clone(), &uri).await;
+        assert_status(&resp, StatusCode::NO_CONTENT);
+        assert!(!tmp.path().join(&key).exists());
+
+        for bad in ["/index.d/abc", "/index.d/x/y"] {
+            let resp = authed_put(router.clone(), bad, b"obj".to_vec()).await;
+            assert_status(&resp, StatusCode::BAD_REQUEST);
+        }
+        let upper = format!("/index.d/{}", "5A".repeat(32));
+        let resp = authed_put(router, &upper, b"obj".to_vec()).await;
+        assert_status(&resp, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

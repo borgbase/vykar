@@ -15,6 +15,7 @@ pub(crate) mod write_session;
 mod chunks;
 mod commit;
 mod index_fetch;
+pub(crate) mod index_store;
 mod key;
 mod open;
 mod pack_lookup;
@@ -61,20 +62,33 @@ use self::manifest::Manifest;
 /// This is not really a conflation of two concepts: `version` answers "what
 /// must a reader understand to read this repository?", and a reader computing
 /// BLAKE2b chunk IDs *cannot* read a BLAKE3 repository — the storage keys and
-/// the entire dedup index differ. Deferring an explicit `hash` field is also
-/// free: whenever a future algorithm forces a v4 bump, the field can be
-/// appended then, because a bumped version is already unreadable by old
-/// binaries.
+/// the entire dedup index differ. The same holds for the index layout: v4 and
+/// v5 are v2 and v3 with the segmented index (see [`IndexLayout`]).
 ///
 /// Only chunk IDs and pack IDs follow the format. Every other digest in the
 /// workspace is BLAKE3 for all versions — see the "Repository Versions"
 /// subsection of `docs/src/content/docs/architecture.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RepoFormat {
-    /// Keyed/unkeyed BLAKE2b-256 chunk and pack IDs.
+    /// Keyed/unkeyed BLAKE2b-256 chunk and pack IDs, monolithic index.
     V2,
-    /// Keyed/unkeyed BLAKE3 chunk and pack IDs.
+    /// Keyed/unkeyed BLAKE3 chunk and pack IDs, monolithic index.
     V3,
+    /// BLAKE2b-256 chunk and pack IDs, segmented index.
+    V4,
+    /// BLAKE3 chunk and pack IDs, segmented index.
+    V5,
+}
+
+/// How the chunk index is stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexLayout {
+    /// One `IndexBlob` at `index`, rewritten whole on every change, with the
+    /// advisory `index.gen` sidecar.
+    Monolithic,
+    /// A small head at `index` naming a base and a chain of segments, all
+    /// write-once objects under `index.d/` (see `repo::index_store`).
+    Segmented,
 }
 
 impl RepoFormat {
@@ -85,7 +99,7 @@ impl RepoFormat {
     /// reaches hashing code.
     ///
     /// Deliberately not a `2 => Blake2b, _ => Blake3` mapping — that would
-    /// silently hand BLAKE3 semantics to a future v4.
+    /// silently hand known semantics to a future version.
     ///
     /// # Errors
     ///
@@ -95,6 +109,8 @@ impl RepoFormat {
         match version {
             2 => Ok(Self::V2),
             3 => Ok(Self::V3),
+            4 => Ok(Self::V4),
+            5 => Ok(Self::V5),
             other => Err(vykar_types::error::VykarError::UnsupportedVersion(other)),
         }
     }
@@ -104,14 +120,24 @@ impl RepoFormat {
         match self {
             Self::V2 => 2,
             Self::V3 => 3,
+            Self::V4 => 4,
+            Self::V5 => 5,
         }
     }
 
     /// The algorithm this format uses for chunk IDs and pack IDs.
     pub fn chunk_hash(self) -> HashAlgorithm {
         match self {
-            Self::V2 => HashAlgorithm::Blake2b,
-            Self::V3 => HashAlgorithm::Blake3,
+            Self::V2 | Self::V4 => HashAlgorithm::Blake2b,
+            Self::V3 | Self::V5 => HashAlgorithm::Blake3,
+        }
+    }
+
+    /// How this format stores the chunk index.
+    pub fn index_layout(self) -> IndexLayout {
+        match self {
+            Self::V2 | Self::V3 => IndexLayout::Monolithic,
+            Self::V4 | Self::V5 => IndexLayout::Segmented,
         }
     }
 }
@@ -303,10 +329,11 @@ pub struct Repository {
     /// Weight-bounded cache for decrypted chunks (used during restore).
     blob_cache: BlobCache,
     /// Cache-validity token for the local dedup/restore caches.
-    /// A random u64 rotated each time the index is saved.
-    /// Stored inside the encrypted `IndexBlob` (source of truth) and
-    /// advisory `index.gen` sidecar. Read from `index.gen` on open;
-    /// verified against the remote `IndexBlob` on write paths.
+    /// Monolithic layout: a random u64 rotated each time the index is saved,
+    /// stored inside the encrypted `IndexBlob` (source of truth) and the
+    /// advisory `index.gen` sidecar; read from `index.gen` on open and
+    /// verified against the remote `IndexBlob` on write paths. Segmented
+    /// layout: derived from the head's state hash (`generation_for_state`).
     index_generation: u64,
     /// Whether the chunk index has been modified since last persist.
     index_dirty: bool,
@@ -336,6 +363,13 @@ pub struct Repository {
     /// full/dedup/restore caches, so they are labelled with an older
     /// generation. Cleared by a rebuild and by every replacement of `chunk_index`.
     local_caches_stale: bool,
+    /// Segmented layout: the head the in-memory state was loaded from (or
+    /// written as). `None` for the monolithic layout.
+    index_head: Option<crate::index::head::IndexHead>,
+    /// Segmented layout: the full index cache when it lives in a temp file
+    /// (no cache directory, or persisting over the cache failed), kept from
+    /// open to the next index load or write.
+    index_scratch: Option<tempfile::TempPath>,
 }
 
 impl Repository {
@@ -523,12 +557,14 @@ mod format_tests {
     fn from_version_maps_known_versions() {
         assert_eq!(RepoFormat::from_version(2).unwrap(), RepoFormat::V2);
         assert_eq!(RepoFormat::from_version(3).unwrap(), RepoFormat::V3);
+        assert_eq!(RepoFormat::from_version(4).unwrap(), RepoFormat::V4);
+        assert_eq!(RepoFormat::from_version(5).unwrap(), RepoFormat::V5);
     }
 
-    /// A future v4 must be refused, not silently handed v3 semantics.
+    /// A future version must be refused, not silently handed known semantics.
     #[test]
     fn from_version_rejects_unknown_versions() {
-        for version in [0u32, 1, 4, 5, u32::MAX] {
+        for version in [0u32, 1, 6, u32::MAX] {
             match RepoFormat::from_version(version) {
                 Err(VykarError::UnsupportedVersion(v)) => assert_eq!(v, version),
                 other => panic!("version {version} should be unsupported, got {other:?}"),
@@ -538,7 +574,12 @@ mod format_tests {
 
     #[test]
     fn version_round_trips() {
-        for format in [RepoFormat::V2, RepoFormat::V3] {
+        for format in [
+            RepoFormat::V2,
+            RepoFormat::V3,
+            RepoFormat::V4,
+            RepoFormat::V5,
+        ] {
             assert_eq!(RepoFormat::from_version(format.version()).unwrap(), format);
         }
     }
@@ -547,6 +588,16 @@ mod format_tests {
     fn format_selects_the_hash() {
         assert_eq!(RepoFormat::V2.chunk_hash(), HashAlgorithm::Blake2b);
         assert_eq!(RepoFormat::V3.chunk_hash(), HashAlgorithm::Blake3);
+        assert_eq!(RepoFormat::V4.chunk_hash(), HashAlgorithm::Blake2b);
+        assert_eq!(RepoFormat::V5.chunk_hash(), HashAlgorithm::Blake3);
         assert_eq!(RepoFormat::CURRENT, RepoFormat::V3);
+    }
+
+    #[test]
+    fn format_selects_the_index_layout() {
+        assert_eq!(RepoFormat::V2.index_layout(), IndexLayout::Monolithic);
+        assert_eq!(RepoFormat::V3.index_layout(), IndexLayout::Monolithic);
+        assert_eq!(RepoFormat::V4.index_layout(), IndexLayout::Segmented);
+        assert_eq!(RepoFormat::V5.index_layout(), IndexLayout::Segmented);
     }
 }

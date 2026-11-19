@@ -23,10 +23,14 @@ pub(super) async fn batch_delete(
         )));
     }
 
-    // Append-only permits batch-delete of temp files only (interrupted-upload
-    // cleanup). Fail fast — name the first committed key and delete nothing.
+    // Append-only permits batch-delete of temp files (interrupted-upload
+    // cleanup) and index objects (as single DELETE does). Fail fast — name
+    // the first committed key and delete nothing.
     if state.inner.config.append_only {
-        if let Some(key) = keys.iter().find(|k| !vykar_protocol::is_temp_file(k)) {
+        if let Some(key) = keys
+            .iter()
+            .find(|k| !vykar_protocol::is_temp_file(k) && !vykar_protocol::is_index_object_key(k))
+        {
             return Err(ServerError::Forbidden(format!(
                 "append-only: cannot batch-delete non-temp key: {key}"
             )));
@@ -181,6 +185,27 @@ mod tests {
         assert!(!tmp.path().join("index.gen").exists());
         assert!(!tmp.path().join(".tmp.config.0").exists());
         assert!(!tmp.path().join(".tmp.index.gen.0").exists());
+    }
+
+    #[tokio::test]
+    async fn append_only_batch_delete_index_objects() {
+        let (router, _state, tmp) = setup_app_append_only(0);
+        let obj = format!("index.d/{}", "c3".repeat(32));
+        std::fs::create_dir_all(tmp.path().join("index.d")).unwrap();
+        std::fs::write(tmp.path().join(&obj), b"x").unwrap();
+        std::fs::write(tmp.path().join("snapshots").join("abc"), b"s").unwrap();
+
+        // Mixed with a committed snapshot: refused, nothing deleted.
+        let keys = serde_json::to_vec(&serde_json::json!([obj, "snapshots/abc"])).unwrap();
+        let resp = authed_post(router.clone(), "/?batch-delete", keys).await;
+        assert_status(&resp, StatusCode::FORBIDDEN);
+        assert!(tmp.path().join(&obj).exists());
+
+        let keys = serde_json::to_vec(&serde_json::json!([obj])).unwrap();
+        let resp = authed_post(router, "/?batch-delete", keys).await;
+        assert_status(&resp, StatusCode::NO_CONTENT);
+        assert!(!tmp.path().join(&obj).exists());
+        assert!(tmp.path().join("snapshots").join("abc").exists());
     }
 
     #[tokio::test]

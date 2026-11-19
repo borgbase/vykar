@@ -57,14 +57,7 @@ pub fn run(config: &VykarConfig) -> Result<DeleteRepoStats> {
         for i in 0..=0xFFu32 {
             let _ = std::fs::remove_dir(repo_path.join(format!("packs/{:02x}", i)));
         }
-        for dir in &[
-            "packs",
-            "keys",
-            "snapshots",
-            "locks",
-            "sessions",
-            "pending_index",
-        ] {
+        for dir in vykar_protocol::KNOWN_ROOT_DIRS {
             let _ = std::fs::remove_dir(repo_path.join(dir));
         }
 

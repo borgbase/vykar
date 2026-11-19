@@ -80,11 +80,15 @@ fn object_type_from_u8_valid() {
     assert_eq!(ObjectType::from_u8(5).unwrap(), ObjectType::PackHeader);
     assert_eq!(ObjectType::from_u8(6).unwrap(), ObjectType::FileCache);
     assert_eq!(ObjectType::from_u8(7).unwrap(), ObjectType::PendingIndex);
+    assert_eq!(ObjectType::from_u8(8).unwrap(), ObjectType::SnapshotCache);
+    assert_eq!(ObjectType::from_u8(9).unwrap(), ObjectType::IndexHead);
+    assert_eq!(ObjectType::from_u8(10).unwrap(), ObjectType::IndexBase);
+    assert_eq!(ObjectType::from_u8(11).unwrap(), ObjectType::IndexSegment);
 }
 
 #[test]
 fn object_type_from_u8_invalid() {
-    assert!(ObjectType::from_u8(9).is_err());
+    assert!(ObjectType::from_u8(12).is_err());
     assert!(ObjectType::from_u8(255).is_err());
 }
 

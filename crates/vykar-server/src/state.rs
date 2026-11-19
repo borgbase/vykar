@@ -473,6 +473,9 @@ fn is_valid_storage_key(key: &str) -> bool {
             return (1..=2).contains(&parts.len());
         }
         "packs" => return is_valid_packs_key(&parts),
+        vykar_protocol::INDEX_OBJECT_DIR => {
+            return parts.len() == 1 || vykar_protocol::is_index_object_key(trimmed);
+        }
         _ => {}
     }
     if vykar_protocol::KNOWN_ROOT_FILES.contains(first) {
@@ -531,6 +534,21 @@ mod tests {
         assert!(is_valid_storage_key("config"));
         assert!(is_valid_storage_key("index"));
         assert!(is_valid_storage_key("index.gen"));
+        assert!(is_valid_storage_key("index.d"));
+        assert!(is_valid_storage_key("index.d/"));
+        assert!(is_valid_storage_key(&format!(
+            "index.d/{}",
+            "0f".repeat(32)
+        )));
+        assert!(!is_valid_storage_key(&format!(
+            "index.d/{}",
+            "0F".repeat(32)
+        )));
+        assert!(!is_valid_storage_key("index.d/abc"));
+        assert!(!is_valid_storage_key(&format!(
+            "index.d/{}/x",
+            "0f".repeat(32)
+        )));
         assert!(is_valid_storage_key("manifest"));
     }
 
@@ -580,6 +598,15 @@ mod tests {
             ..Default::default()
         };
         (AppState::new_with_quota(config, quota_state), tmp)
+    }
+
+    /// A segmented-index repository must not stop the server from starting.
+    #[test]
+    fn index_object_dir_is_an_expected_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("index.d")).unwrap();
+        std::fs::write(tmp.path().join("index"), b"h").unwrap();
+        assert!(unexpected_entries(tmp.path()).is_empty());
     }
 
     #[test]

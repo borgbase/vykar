@@ -20,6 +20,12 @@ pub enum ObjectType {
     FileCache = 6,
     PendingIndex = 7,
     SnapshotCache = 8,
+    /// Segmented index head at `index` (formats v4/v5).
+    IndexHead = 9,
+    /// Segmented index base under `index.d/`.
+    IndexBase = 10,
+    /// Segmented index segment under `index.d/`.
+    IndexSegment = 11,
 }
 
 impl ObjectType {
@@ -34,6 +40,9 @@ impl ObjectType {
             6 => Ok(Self::FileCache),
             7 => Ok(Self::PendingIndex),
             8 => Ok(Self::SnapshotCache),
+            9 => Ok(Self::IndexHead),
+            10 => Ok(Self::IndexBase),
+            11 => Ok(Self::IndexSegment),
             _ => Err(VykarError::UnknownObjectType(v)),
         }
     }

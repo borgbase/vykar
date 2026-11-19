@@ -170,6 +170,11 @@ pub struct ServerCapabilities {
     /// as "whole-object PUT only".
     #[serde(default)]
     pub pack_parts: bool,
+    /// The server serves the segmented index of formats v4/v5: it accepts
+    /// `index.d/` keys and, in append-only mode, lets clients overwrite and
+    /// delete them. Absent on older servers.
+    #[serde(default)]
+    pub segmented_index: bool,
 }
 
 impl ServerCapabilities {
@@ -426,7 +431,24 @@ pub const KNOWN_ROOT_DIRS: &[&str] = &[
     "locks",
     "sessions",
     "pending_index",
+    INDEX_OBJECT_DIR,
 ];
+
+/// Directory of the segmented index's write-once objects (formats v4/v5).
+pub const INDEX_OBJECT_DIR: &str = "index.d";
+
+/// Whether `key` is exactly `index.d/<64 lowercase hex>`: an object of the
+/// segmented index.
+pub fn is_index_object_key(key: &str) -> bool {
+    key.strip_prefix(INDEX_OBJECT_DIR)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .is_some_and(|name| {
+            name.len() == 64
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        })
+}
 
 /// Prefix of every temp file written next to its final destination for an
 /// atomic rename (server PUT/repack, local backend). Shared with
@@ -777,6 +799,27 @@ mod tests {
         assert!(is_known_repo_key("locks/lock.json"));
         assert!(is_known_repo_key("sessions/abc123.json"));
         assert!(is_known_repo_key("pending_index/session123"));
+        assert!(is_known_repo_key(&format!("index.d/{}", "ab".repeat(32))));
+    }
+
+    #[test]
+    fn index_object_keys() {
+        let name = "0123456789abcdef".repeat(4);
+        assert!(is_index_object_key(&format!("index.d/{name}")));
+        for bad in [
+            "index.d".to_string(),
+            "index.d/".to_string(),
+            format!("index.d/{}", name.to_uppercase()),
+            format!("index.d/{}", &name[1..]),
+            format!("index.d/{name}0"),
+            format!("index.d/{name}/"),
+            format!("index.d/x/{name}"),
+            format!("index.dx/{name}"),
+            format!("/index.d/{name}"),
+            format!("index.d/.tmp.{}", &name[5..]),
+        ] {
+            assert!(!is_index_object_key(&bad), "{bad}");
+        }
     }
 
     #[test]

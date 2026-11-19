@@ -18,6 +18,8 @@ Coverage-guided fuzz tests for vykar's parser, deserializer, and decrypt paths. 
 | `fuzz_file_cache_decode` | `FileCache::decode_from_plaintext` (custom msgpack parser) |
 | `fuzz_unpack_object` | AEAD envelope parse + decrypt (legacy and context-bound paths) |
 | `fuzz_index_segment` | Index segment decode (`Segment::decode`), checked to re-encode identically |
+| `fuzz_index_head` | Index head decode (`IndexHead::decode`), checked to round-trip |
+| `fuzz_index_base` | Index base decode (`decode_base_to_temp`), checked to re-encode identically |
 
 ## Corpus
 

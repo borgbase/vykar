@@ -902,6 +902,7 @@ mod tests {
                 protocol_version: vykar_protocol::PROTOCOL_VERSION,
                 hashes: Vec::new(),
                 pack_parts: false,
+                segmented_index: false,
             })
         }
         fn object_sizes(&self, keys: &[String]) -> Result<Vec<Option<u64>>> {

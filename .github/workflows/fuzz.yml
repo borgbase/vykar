@@ -20,6 +20,8 @@ jobs:
           - fuzz_file_cache_decode
           - fuzz_unpack_object
           - fuzz_index_segment
+          - fuzz_index_head
+          - fuzz_index_base
     steps:
       - uses: actions/checkout@v6
 

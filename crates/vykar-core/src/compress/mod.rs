@@ -350,6 +350,42 @@ fn decode_metadata_msgpack_inner<T: serde::de::DeserializeOwned>(data: &[u8]) ->
     Ok((value, total))
 }
 
+/// A streaming reader over a ZSTD-tagged metadata payload, limited to the
+/// metadata size bound. Errors on any other codec tag. The caller must read
+/// to the end to detect a truncated frame.
+pub(crate) fn zstd_metadata_reader(data: &[u8]) -> Result<impl Read + '_> {
+    let Some((&TAG_ZSTD, frame)) = data.split_first() else {
+        return Err(VykarError::Decompression(
+            "expected a zstd-compressed payload".into(),
+        ));
+    };
+    let decoder = zstd::stream::Decoder::with_buffer(frame)
+        .map_err(|e| VykarError::Decompression(format!("zstd init: {e}")))?;
+    Ok(LimitedRead {
+        inner: decoder,
+        left: MAX_METADATA_DECOMPRESS_SIZE,
+    })
+}
+
+/// Fails, instead of ending early as `Read::take` would, once more than
+/// `left` bytes were produced.
+struct LimitedRead<R> {
+    inner: R,
+    left: u64,
+}
+
+impl<R: Read> Read for LimitedRead<R> {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(out)?;
+        self.left = self.left.checked_sub(n as u64).ok_or_else(|| {
+            std::io::Error::other(format!(
+                "zstd: decompressed size exceeds limit of {MAX_METADATA_DECOMPRESS_SIZE} bytes"
+            ))
+        })?;
+        Ok(n)
+    }
+}
+
 /// Buffered reader tuned for rmp-serde, which issues a `read_exact` for every
 /// marker byte and every short field: millions of 1-32 byte reads for a large
 /// index or file cache. `std::io::BufReader` (plus a counting wrapper) costs

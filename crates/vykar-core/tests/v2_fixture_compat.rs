@@ -270,6 +270,84 @@ fn v2_fixtures_accept_a_new_backup_and_still_dedup() {
     }
 }
 
+/// `vykar upgrade` takes each v2 fixture to v4 in place: same chunk IDs (the
+/// plaintext key follows the chunk hash), the same index, every snapshot
+/// still restores byte-identical, and a new backup still dedups.
+#[test]
+fn v2_fixtures_upgrade_to_v4() {
+    use vykar_core::repo::UpgradeOutcome;
+    for mode in MODES {
+        let fx = extract(mode);
+        let config = fx.config();
+        let mut before: Vec<_> = fx
+            .open()
+            .chunk_index()
+            .iter()
+            .map(|(id, e)| (*id, *e))
+            .collect();
+        before.sort_by_key(|(id, _)| *id.as_bytes());
+
+        let outcome = commands::upgrade::run(&config, fx.passphrase()).unwrap();
+        assert!(
+            matches!(
+                outcome,
+                UpgradeOutcome::Upgraded {
+                    from: 2,
+                    to: 4,
+                    resumed: false,
+                    ..
+                }
+            ),
+            "{mode}: {outcome:?}"
+        );
+        assert!(!fx.repo_dir().join("index.gen").exists(), "{mode}");
+
+        let repo = fx.open();
+        assert_eq!(repo.config.version, 4, "{mode}");
+        let mut after: Vec<_> = repo.chunk_index().iter().map(|(id, e)| (*id, *e)).collect();
+        after.sort_by_key(|(id, _)| *id.as_bytes());
+        assert_eq!(before, after, "{mode}: the upgrade changed the index");
+        drop(repo);
+
+        let result = commands::check::run(&config, fx.passphrase(), true, false).unwrap();
+        assert!(result.errors.is_empty(), "{mode}: {:?}", result.errors);
+
+        let dest = fx.root.join("restore-upgraded");
+        commands::restore::run(
+            &config,
+            fx.passphrase(),
+            fx.latest_snapshot(),
+            dest.to_str().unwrap(),
+            None,
+            config.xattrs.enabled,
+            true,
+            None,
+        )
+        .unwrap();
+        assert_eq!(read_tree(&dest), read_tree(&fx.source_dir()), "{mode}");
+
+        let stats = backup_source(
+            &config,
+            &fx.source_dir(),
+            "fixture-src",
+            "post-upgrade-snap",
+            fx.passphrase(),
+            config.xattrs.enabled,
+        );
+        assert!(
+            stats.deduplicated_size < stats.original_size / 8,
+            "{mode}: the backup after the upgrade did not dedup"
+        );
+        assert!(
+            matches!(
+                commands::upgrade::run(&config, fx.passphrase()).unwrap(),
+                UpgradeOutcome::AlreadyCurrent { version: 4 }
+            ),
+            "{mode}"
+        );
+    }
+}
+
 /// Packs written into a v2 repository today — by backup and by repack — must
 /// still be named by BLAKE2b, or a v2-era binary could not locate them.
 #[test]

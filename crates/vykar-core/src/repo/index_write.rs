@@ -277,7 +277,7 @@ impl Repository {
     /// Fold: garbage-collect `index.d/` including `prev`'s retired objects,
     /// PUT `cache` as the base, then the head naming it alone, with `prev`'s
     /// live objects as retired.
-    fn put_base(
+    pub(super) fn put_base(
         &mut self,
         prev: Option<&IndexHead>,
         cache: &MmapFullIndexCache,

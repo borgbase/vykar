@@ -14,4 +14,5 @@ pub mod mount;
 pub mod prune;
 pub mod restore;
 pub(crate) mod snapshot_ops;
+pub mod upgrade;
 pub mod util;

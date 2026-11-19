@@ -181,13 +181,14 @@ fn repo_on_recording_backend(
         Listing::UnsizedTree => RecordingBackend::with_unsized_tree_listing(),
         Listing::FailingTree => RecordingBackend::with_failing_tree_listing(),
     };
-    let mut repo = crate::repo::Repository::init(
+    let mut repo = crate::repo::Repository::init_at_format(
         Box::new(backend),
         crate::repo::EncryptionMode::None,
         crate::config::ChunkerConfig::default(),
         None,
         None,
         None,
+        crate::repo::RepoFormat::V3,
     )
     .unwrap();
     repo.begin_write_session(&crate::repo::WriteSessionOptions::default())
@@ -455,13 +456,14 @@ mod server_side {
             batch,
             log: log.clone(),
         });
-        let mut repo = Repository::init(
+        let mut repo = Repository::init_at_format(
             storage,
             EncryptionMode::None,
             ChunkerConfig::default(),
             None,
             None,
             None,
+            crate::repo::RepoFormat::V3,
         )
         .unwrap();
         repo.begin_write_session(&crate::repo::WriteSessionOptions::default())

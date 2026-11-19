@@ -28,6 +28,8 @@ pub(crate) use open::derive_plaintext_chunk_id_key;
 mod read;
 mod session;
 pub use session::WriteSessionOptions;
+mod upgrade;
+pub use upgrade::UpgradeOutcome;
 
 use std::collections::{HashMap as StdHashMap, VecDeque};
 use std::path::PathBuf;
@@ -94,7 +96,7 @@ pub enum IndexLayout {
 
 impl RepoFormat {
     /// The format `vykar init` creates. Existing repositories keep theirs.
-    pub const CURRENT: Self = Self::V3;
+    pub const CURRENT: Self = Self::V5;
 
     /// The single version gate: an unknown version is rejected here and never
     /// reaches hashing code.
@@ -603,7 +605,7 @@ mod format_tests {
         assert_eq!(RepoFormat::V3.chunk_hash(), HashAlgorithm::Blake3);
         assert_eq!(RepoFormat::V4.chunk_hash(), HashAlgorithm::Blake2b);
         assert_eq!(RepoFormat::V5.chunk_hash(), HashAlgorithm::Blake3);
-        assert_eq!(RepoFormat::CURRENT, RepoFormat::V3);
+        assert_eq!(RepoFormat::CURRENT, RepoFormat::V5);
     }
 
     #[test]

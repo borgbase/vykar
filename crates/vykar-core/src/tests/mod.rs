@@ -32,4 +32,5 @@ mod restore_cancel;
 mod segmented_index;
 mod segmented_writes;
 pub(crate) mod tree_cut;
+mod upgrade;
 mod util_lock;

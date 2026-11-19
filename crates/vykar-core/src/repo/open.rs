@@ -97,7 +97,7 @@ impl Repository {
     }
 
     /// [`Self::init`] at an explicit format, for tests of formats `init`
-    /// does not create yet.
+    /// does not create.
     #[doc(hidden)]
     pub fn init_at_format(
         storage: Box<dyn StorageBackend>,
@@ -619,13 +619,14 @@ mod tests {
     fn open_with_index_reads_the_sidecar_before_the_index() {
         crate::testutil::init_test_environment();
         let inner: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
-        Repository::init(
+        Repository::init_at_format(
             Box::new(Arc::clone(&inner)),
             EncryptionMode::None,
             ChunkerConfig::default(),
             None,
             None,
             None,
+            crate::repo::RepoFormat::V3,
         )
         .unwrap();
         // Make the sidecar disagree, so the open must repair it.
@@ -661,13 +662,14 @@ mod tests {
     fn repo_with_caches(cache: &std::path::Path) -> (Arc<dyn StorageBackend>, Repository) {
         crate::testutil::init_test_environment();
         let inner: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
-        let mut repo = Repository::init(
+        let mut repo = Repository::init_at_format(
             Box::new(Arc::clone(&inner)),
             EncryptionMode::None,
             ChunkerConfig::default(),
             None,
             None,
             Some(cache.to_path_buf()),
+            crate::repo::RepoFormat::V3,
         )
         .unwrap();
         let pack = PackId::from_bytes([0xAA; 32]);

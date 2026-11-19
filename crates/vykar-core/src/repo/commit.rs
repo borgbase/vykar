@@ -1163,6 +1163,9 @@ impl Repository {
 
     /// Decrypt an index blob, returning its still-compressed payload.
     fn unpack_index_blob(index_data: &[u8], crypto: &dyn CryptoEngine) -> Result<Vec<u8>> {
+        if super::upgrade::is_index_head(index_data) {
+            return Err(super::upgrade::interrupted_upgrade_error());
+        }
         unpack_object_expect_with_context(
             index_data,
             ObjectType::ChunkIndex,

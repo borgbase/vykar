@@ -205,19 +205,16 @@ fn check_detects_corruption_err_path(corruption: Corruption) {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn check_with_deleted_index_reports_empty_repo() {
+fn check_with_deleted_index_head_fails() {
     let tmp = tempfile::tempdir().unwrap();
     let (repo_dir, config) = setup_repo(tmp.path());
 
     apply_delete_index(&repo_dir);
 
-    // With no index file, the repo opens with an empty index (generation 0).
-    // Check succeeds but snapshot item references fail "chunk not in index" checks.
-    let result = commands::check::run(&config, None, true, false).unwrap();
-    assert!(
-        !result.errors.is_empty(),
-        "deleted index: check should report errors for missing chunk references"
-    );
+    // A segmented repository always has a head; without one the open fails.
+    let err = commands::check::run(&config, None, true, false)
+        .expect_err("deleted index head: check must fail");
+    assert!(err.to_string().contains("index head missing"), "{err}");
 }
 
 // ---------------------------------------------------------------------------

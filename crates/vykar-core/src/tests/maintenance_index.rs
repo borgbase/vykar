@@ -20,7 +20,7 @@ use crate::index::dedup_cache::{self, MmapDedupCache, MmapFullIndexCache, MmapRe
 use crate::index::ChunkIndexEntry;
 use crate::repo::{OpenOptions, Repository};
 
-use super::helpers::{backup_single_source, init_repo, source_entry};
+use super::helpers::{backup_single_source, init_repo_v3, source_entry};
 
 const FAST: &str = "index unchanged, fast path";
 const SLOW: &str = "decode index";
@@ -105,7 +105,7 @@ impl Env {
         let dir = tempfile::tempdir().unwrap();
         let repo_dir = dir.path().join("repo");
         let cache_dir = dir.path().join("cache");
-        let mut config = init_repo(&repo_dir);
+        let mut config = init_repo_v3(&repo_dir);
         config.cache_dir = Some(cache_dir.to_string_lossy().into_owned());
         config.retention = RetentionConfig {
             keep_last: Some(1),

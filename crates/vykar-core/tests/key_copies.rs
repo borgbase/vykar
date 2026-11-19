@@ -60,7 +60,10 @@ impl Fixture {
         config.encryption.mode = EncryptionModeConfig::Aes256Gcm;
         config.cache_dir = Some(cache_dir.to_string_lossy().into_owned());
 
-        commands::init::run(&config, Some(PASS)).unwrap();
+        // v3: the fixtures below lean on the monolithic index (an absent
+        // `index` reads as empty, `index.gen` is read at open).
+        commands::init::run_at_format(&config, Some(PASS), vykar_core::repo::RepoFormat::V3)
+            .unwrap();
         if with_snapshot {
             backup_source(&config, &source_dir, "src", "snap1", Some(PASS), false);
         }

@@ -151,7 +151,7 @@ impl Fixture {
         let src = dir.path().join("src");
         fs::create_dir_all(&src).unwrap();
         fs::write(src.join("a.bin"), vec![0x11u8; 64 * 1024]).unwrap();
-        let mut config = crate::tests::helpers::init_repo(&repo_dir);
+        let mut config = crate::tests::helpers::init_repo_v3(&repo_dir);
         config.cache_dir = Some(cache_dir.to_string_lossy().into_owned());
         let fx = Self {
             dir,

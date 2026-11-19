@@ -326,6 +326,9 @@ pub(crate) fn dispatch_command(
             cmd::compact::run_compact(cfg, label, t, max_repack_size.clone(), *dry_run, shutdown)
                 .map(|()| false)
         }
+        Commands::Upgrade { yes, .. } => {
+            cmd::upgrade::run_upgrade(cfg, label, *yes).map(|()| false)
+        }
         Commands::Config { .. } => Err(CliError::from(
             "'config' command should be handled before config resolution",
         )),

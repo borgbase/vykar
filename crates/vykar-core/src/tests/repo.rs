@@ -21,10 +21,10 @@ fn init_creates_required_keys() {
     )
     .unwrap();
 
-    // config, index, and index.gen should exist (no manifest in v2)
+    // config and the index head exist; the segmented layout has no index.gen.
     assert!(repo.storage.exists("config").unwrap());
     assert!(repo.storage.exists("index").unwrap());
-    assert!(repo.storage.exists("index.gen").unwrap());
+    assert!(!repo.storage.exists("index.gen").unwrap());
 }
 
 #[test]
@@ -786,8 +786,8 @@ fn init_creates_the_current_repository_format() {
     )
     .unwrap();
 
-    assert_eq!(repo.config.version, 3);
-    assert_eq!(repo.format(), crate::repo::RepoFormat::V3);
+    assert_eq!(repo.config.version, 5);
+    assert_eq!(repo.format(), crate::repo::RepoFormat::V5);
     assert_eq!(
         repo.content_hash(),
         vykar_types::hash::HashAlgorithm::Blake3
@@ -1168,7 +1168,7 @@ fn initial_session_seed_includes_tree_packs() {
 
 #[test]
 fn load_chunk_index_overwrites_stale_index_gen() {
-    let mut repo = test_repo_plaintext();
+    let mut repo = crate::testutil::test_repo_plaintext_v3();
 
     // Store a chunk and persist so the index has a real generation.
     repo.store_chunk(b"gen test chunk", Compression::None, PackType::Data)
@@ -1276,7 +1276,7 @@ fn open_rewrites_index_gen_only_when_stale() {
     let src = tmp.path().join("src");
     std::fs::create_dir_all(&src).unwrap();
     std::fs::write(src.join("f.txt"), b"index gen").unwrap();
-    let config = crate::tests::helpers::init_repo(&repo_dir);
+    let config = crate::tests::helpers::init_repo_v3(&repo_dir);
     crate::tests::helpers::backup_single_source(&config, &src, "src", "snap");
 
     let (repo, puts) = open_logging_puts(&repo_dir);

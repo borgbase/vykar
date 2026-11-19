@@ -93,7 +93,6 @@ fn delete_repo_handles_partial_repo() {
     // Remove the files that would have been deleted in a partial first attempt
     std::fs::remove_file(repo_dir.join("config")).unwrap();
     std::fs::remove_file(repo_dir.join("index")).unwrap();
-    std::fs::remove_file(repo_dir.join("index.gen")).unwrap();
 
     // Verify config is gone (old code would fail here with RepoNotFound)
     assert!(!repo_dir.join("config").exists());

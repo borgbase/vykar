@@ -205,6 +205,24 @@ pub fn test_repo_plaintext() -> Repository {
     repo
 }
 
+/// [`test_repo_plaintext`] at format v3 (monolithic index).
+pub fn test_repo_plaintext_v3() -> Repository {
+    init_test_environment();
+    let mut repo = Repository::init_at_format(
+        Box::new(MemoryBackend::new()),
+        EncryptionMode::None,
+        ChunkerConfig::default(),
+        None,
+        None,
+        None,
+        crate::repo::RepoFormat::V3,
+    )
+    .expect("failed to init test repo");
+    repo.begin_write_session(&WriteSessionOptions::default())
+        .expect("failed to begin write session");
+    repo
+}
+
 /// Fixed chunk hasher for deterministic tests.
 ///
 /// Pinned to BLAKE2b: these tests assert on stored digests, and format-v3

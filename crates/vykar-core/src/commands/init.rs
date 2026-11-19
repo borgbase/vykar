@@ -1,11 +1,21 @@
 use crate::config::{EncryptionModeConfig, VykarConfig};
-use crate::repo::{identity, EncryptionMode, Repository};
+use crate::repo::{identity, EncryptionMode, RepoFormat, Repository};
 use crate::storage;
 use vykar_crypto::select::{self, AutoAeadMode};
 use vykar_types::error::Result;
 
 /// Run `vykar init`.
 pub fn run(config: &VykarConfig, passphrase: Option<&str>) -> Result<Repository> {
+    run_at_format(config, passphrase, RepoFormat::CURRENT)
+}
+
+/// [`run`] at an explicit format, for tests of formats `init` no longer creates.
+#[doc(hidden)]
+pub fn run_at_format(
+    config: &VykarConfig,
+    passphrase: Option<&str>,
+    format: RepoFormat,
+) -> Result<Repository> {
     let backend = storage::backend_from_config(&config.repository, config.limits.connections)?;
 
     let encryption = match config.encryption.mode {
@@ -18,13 +28,14 @@ pub fn run(config: &VykarConfig, passphrase: Option<&str>) -> Result<Repository>
         EncryptionModeConfig::Chacha20Poly1305 => EncryptionMode::Chacha20Poly1305,
     };
 
-    let repo = Repository::init(
+    let repo = Repository::init_at_format(
         backend,
         encryption,
         config.chunker.clone(),
         passphrase,
         Some(&config.repository),
         super::util::cache_dir_from_config(config),
+        format,
     )?;
 
     // Pin the repository identity immediately to close the TOFU window.

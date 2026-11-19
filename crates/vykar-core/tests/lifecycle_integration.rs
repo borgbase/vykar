@@ -679,9 +679,13 @@ fn restore_resolves_data_chunks_via_restore_cache_without_index() {
     let tmp = tempfile::tempdir().unwrap();
     let (config, _, _, _) = one_file_repo(tmp.path());
 
-    // Make the remote index unreadable: the restore can only succeed if it
-    // never loads it, i.e. resolves every chunk through the restore cache.
-    std::fs::write(tmp.path().join("repo").join("index"), b"not an index").unwrap();
+    // Remove the index's base and segments (the head stays, open reads it):
+    // the restore can only succeed if it never loads the index, i.e.
+    // resolves every chunk through the restore cache.
+    let objects = tmp.path().join("repo").join("index.d");
+    for entry in std::fs::read_dir(&objects).unwrap() {
+        std::fs::remove_file(entry.unwrap().path()).unwrap();
+    }
 
     let restore_dir = tmp.path().join("restore");
     let stats = commands::restore::run(

@@ -295,6 +295,17 @@ pub(crate) enum Commands {
         #[arg(short = 'n', long)]
         dry_run: bool,
     },
+
+    /// Upgrade the repository to the current format (one-way)
+    Upgrade {
+        /// Select repository by label or path
+        #[arg(short = 'R', long = "repo")]
+        repo: Option<String>,
+
+        /// Skip interactive confirmation (for scripting)
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Clone, clap::ValueEnum)]
@@ -458,7 +469,8 @@ impl Commands {
             | Self::Info { repo, .. }
             | Self::Mount { repo, .. }
             | Self::BreakLock { repo, .. }
-            | Self::Compact { repo, .. } => repo.as_deref(),
+            | Self::Compact { repo, .. }
+            | Self::Upgrade { repo, .. } => repo.as_deref(),
             Self::Snapshot { command, .. } => command.repo(),
             Self::Key { command, .. } => command.repo(),
             Self::Config { .. } | Self::Daemon { .. } => None,
@@ -499,6 +511,7 @@ impl Commands {
             Self::Mount { .. } => "mount",
             Self::BreakLock { .. } => "break-lock",
             Self::Compact { .. } => "compact",
+            Self::Upgrade { .. } => "upgrade",
             Self::Snapshot { .. } => "snapshot",
             Self::Key { .. } => "key",
             Self::Config { .. } => "config",

@@ -55,7 +55,7 @@ fn fast_path_taken_only_when_cached_blob_matches() {
     let src = dir.path().join("src");
     fs::create_dir_all(&src).unwrap();
     fs::write(src.join("a.bin"), vec![0x11u8; 64 * 1024]).unwrap();
-    let config = crate::tests::helpers::init_repo(&repo_dir);
+    let config = crate::tests::helpers::init_repo_v3(&repo_dir);
 
     backup_with_stages(&config, &src, "s1");
 

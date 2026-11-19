@@ -275,15 +275,15 @@ fn cli_init_backup_list_restore_info_roundtrip() {
     let info_out = fx.run_ok(&["--config", &cfg, "info"]);
     assert!(info_out.contains("Snapshots"));
     assert!(info_out.contains("Encryption"));
-    // Users hold a mix of v2 and v3 repositories; `info` has to say which.
+    // Users hold a mix of v2 to v5 repositories; `info` has to say which.
     let has_row = |label: &str, value: &str| {
         info_out
             .lines()
             .any(|l| l.contains(label) && l.contains(value))
     };
     assert!(
-        has_row("Format", "v3"),
-        "expected a Format row reading v3, got:\n{info_out}"
+        has_row("Format", "v5"),
+        "expected a Format row reading v5, got:\n{info_out}"
     );
     assert!(
         has_row("Hash", "blake3"),
@@ -291,10 +291,10 @@ fn cli_init_backup_list_restore_info_roundtrip() {
     );
 }
 
-/// `vykar init` must write format v3 to the repository `config`, read straight
+/// `vykar init` must write format v5 to the repository `config`, read straight
 /// off disk rather than through the library that produced it.
 #[test]
-fn cli_init_writes_repository_format_v3() {
+fn cli_init_writes_repository_format_v5() {
     let fx = CliFixture::new();
     write_plain_config(&fx.config_path, &fx.repo_dir);
     let cfg = fx.config_path.to_string_lossy().to_string();
@@ -309,7 +309,45 @@ fn cli_init_writes_repository_format_v3() {
         Some(&0x97),
         "RepoConfig must stay a 7-element msgpack array"
     );
-    assert_eq!(config_bytes.get(1), Some(&3), "init must write version 3");
+    assert_eq!(config_bytes.get(1), Some(&5), "init must write version 5");
+}
+
+/// `vykar upgrade` takes a v3 repository to v5. It refuses to run without a
+/// terminal unless `--yes` is given, and a second run does nothing.
+#[test]
+fn cli_upgrade_moves_a_v3_repository_to_v5() {
+    let fx = CliFixture::new();
+    write_plain_config(&fx.config_path, &fx.repo_dir);
+    let cfg = fx.config_path.to_string_lossy().to_string();
+    std::fs::create_dir_all(&fx.repo_dir).unwrap();
+    Repository::init_at_format(
+        Box::new(LocalBackend::new(fx.repo_dir.to_str().unwrap()).unwrap()),
+        vykar_core::repo::EncryptionMode::None,
+        vykar_core::config::ChunkerConfig::default(),
+        None,
+        None,
+        None,
+        vykar_core::repo::RepoFormat::V3,
+    )
+    .unwrap();
+
+    let (_, stderr) = fx.run_err(&["--config", &cfg, "upgrade"]);
+    assert!(stderr.contains("--yes"), "{stderr}");
+    assert_eq!(
+        std::fs::read(fx.repo_dir.join("config")).unwrap().get(1),
+        Some(&3)
+    );
+
+    let out = fx.run_ok(&["--config", &cfg, "upgrade", "--yes"]);
+    assert!(out.contains("from format v3 to v5"), "{out}");
+    assert_eq!(
+        std::fs::read(fx.repo_dir.join("config")).unwrap().get(1),
+        Some(&5)
+    );
+    assert!(!fx.repo_dir.join("index.gen").exists());
+
+    let out = fx.run_ok(&["--config", &cfg, "upgrade", "--yes"]);
+    assert!(out.contains("already at format v5"), "{out}");
 }
 
 #[test]

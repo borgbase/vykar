@@ -39,6 +39,14 @@ pub fn init_repo(repo_dir: &Path) -> VykarConfig {
     config
 }
 
+/// [`init_repo`] at format v3, for tests of the monolithic index
+/// (`index.gen`, the conditional index GET, the backup fast path).
+pub fn init_repo_v3(repo_dir: &Path) -> VykarConfig {
+    let config = make_test_config(repo_dir);
+    commands::init::run_at_format(&config, None, crate::repo::RepoFormat::V3).unwrap();
+    config
+}
+
 pub fn source_entry(path: &Path, label: &str) -> SourceEntry {
     SourceEntry {
         paths: vec![path.to_string_lossy().to_string()],

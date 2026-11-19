@@ -12,3 +12,4 @@ pub(crate) mod mount;
 pub(crate) mod prune;
 pub(crate) mod restore;
 pub(crate) mod snapshot;
+pub(crate) mod upgrade;

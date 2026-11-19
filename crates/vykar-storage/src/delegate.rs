@@ -2,7 +2,7 @@
 //! "unsupported" bodies for leaves.
 //!
 //! Every wrapper that holds an inner backend (rate limiter, test recorder, the
-//! `Arc<dyn StorageBackend>` coercion impl) has to forward all 24 trait methods,
+//! `Arc<dyn StorageBackend>` coercion impl) has to forward all 25 trait methods,
 //! and hand-written forwards rot — a forgotten one disabled server-side pack
 //! verification and server init on any throttled REST repo.
 //!
@@ -11,14 +11,13 @@
 //! * [`crate::delegate_storage_backend!`] holds the forwarding inventory in one
 //!   place. A wrapper implements [`InnerBackend`], names the methods it writes by
 //!   hand, and gets forwards for the rest.
-//! * The trait's nine capability methods (`remove_stale_temp_files`,
+//! * The trait's ten capability methods (`remove_stale_temp_files`,
 //!   `server_repack`, `batch_delete_keys`, `server_verify_packs`, `server_init`,
-//!   `bind_content_hash`, `server_capabilities`, `object_sizes`, `profile`)
-//!   have **no defaults**, so the inventory cannot silently fall behind the
-//!   trait: adding a tenth breaks every impl, this macro included, until it is
-//!   handled. Leaves get bodies
-//!   for the ones they do not implement from [`crate::unsupported_server_ops!`]
-//!   (all but `profile`).
+//!   `bind_content_hash`, `server_capabilities`, `object_sizes`,
+//!   `list_tree_sized`, `profile`) have **no defaults**, so the inventory cannot
+//!   silently fall behind the trait: adding an eleventh breaks every impl, this
+//!   macro included, until it is handled. Leaves get bodies for the ones they do
+//!   not implement from [`crate::unsupported_server_ops!`] (all but `profile`).
 //!
 //! What is *not* guarded: a new method with a default body. Wrappers would
 //! inherit it, which is safe by construction for the defaults that exist today
@@ -75,7 +74,7 @@ macro_rules! unsupported_server_ops {
     (except [$($except:ident),* $(,)?]) => {
         $crate::unsupported_server_ops!(@emit
             [remove_stale_temp_files server_repack batch_delete_keys server_verify_packs
-             server_init bind_content_hash server_capabilities object_sizes]
+             server_init bind_content_hash server_capabilities object_sizes list_tree_sized]
             [$($except)*]);
     };
 
@@ -119,7 +118,11 @@ macro_rules! unsupported_server_ops {
         $crate::unsupported_server_ops!(@emit [$($rest)*] [$($except)*]);
     };
     (@emit [batch_delete_keys $($rest:ident)*] [$($except:ident)*]) => {
-        fn batch_delete_keys(&self, _keys: &[String]) -> $crate::__macro_support::Result<()> {
+        fn batch_delete_keys(
+            &self,
+            _keys: &[String],
+            _scope: $crate::BatchDeleteScope,
+        ) -> $crate::__macro_support::Result<()> {
             Err($crate::__macro_support::VykarError::UnsupportedBackend(
                 "batch delete API".into(),
             ))
@@ -198,6 +201,21 @@ macro_rules! unsupported_server_ops {
         }
         $crate::unsupported_server_ops!(@emit [$($rest)*] [$($except)*]);
     };
+
+    (@emit [list_tree_sized $($rest:ident)*] [list_tree_sized $($except:ident)*]) => {
+        $crate::unsupported_server_ops!(@emit [$($rest)*] [$($except)*]);
+    };
+    (@emit [list_tree_sized $($rest:ident)*] [$($except:ident)*]) => {
+        fn list_tree_sized(
+            &self,
+            _prefix: &str,
+        ) -> $crate::__macro_support::Result<Vec<$crate::ListedObject>> {
+            Err($crate::__macro_support::VykarError::UnsupportedBackend(
+                "one-request tree listing".into(),
+            ))
+        }
+        $crate::unsupported_server_ops!(@emit [$($rest)*] [$($except)*]);
+    };
 }
 
 /// Implement `StorageBackend` for a wrapper by forwarding to its
@@ -232,7 +250,7 @@ macro_rules! delegate_storage_backend {
                  put_owned put_pack begin_staged_put size list_sized remove_stale_temp_files
                  server_repack batch_delete_keys
                  server_verify_packs server_init bind_content_hash
-                 server_capabilities object_sizes profile]
+                 server_capabilities object_sizes list_tree_sized profile]
                 [$($except)*]);
         }
         $crate::delegate_storage_backend!(@check_get [$($except)*] [] []);
@@ -241,6 +259,7 @@ macro_rules! delegate_storage_backend {
         $crate::delegate_storage_backend!(@check_pack [$($except)*] [] []);
         $crate::delegate_storage_backend!(@check_range [$($except)*] [] []);
         $crate::delegate_storage_backend!(@check_staged [$($except)*] [] []);
+        $crate::delegate_storage_backend!(@check_tree [$($except)*] [] []);
     };
 
     // ── Guard: overriding `begin_staged_put` requires `profile` ───────────
@@ -394,6 +413,29 @@ macro_rules! delegate_storage_backend {
     };
     (@check_list [$other:ident $($rest:ident)*] $list:tt $sized:tt) => {
         $crate::delegate_storage_backend!(@check_list [$($rest)*] $list $sized);
+    };
+
+    // ── Guard: overriding `list_sized` requires `list_tree_sized` ─────────
+    //
+    // Otherwise the generated `list_tree_sized` forwards straight to the inner
+    // backend, bypassing whatever the `list_sized` override intercepts.
+
+    (@check_tree [] [] $tree:tt) => {};
+    (@check_tree [] [list_sized] [list_tree_sized]) => {};
+    (@check_tree [] [list_sized] []) => {
+        compile_error!(
+            "delegate_storage_backend!: a wrapper that overrides `list_sized` must also \
+             override `list_tree_sized`, or one-request listings bypass it"
+        );
+    };
+    (@check_tree [list_sized $($rest:ident)*] [] $tree:tt) => {
+        $crate::delegate_storage_backend!(@check_tree [$($rest)*] [list_sized] $tree);
+    };
+    (@check_tree [list_tree_sized $($rest:ident)*] $sized:tt []) => {
+        $crate::delegate_storage_backend!(@check_tree [$($rest)*] $sized [list_tree_sized]);
+    };
+    (@check_tree [$other:ident $($rest:ident)*] $sized:tt $tree:tt) => {
+        $crate::delegate_storage_backend!(@check_tree [$($rest)*] $sized $tree);
     };
 
     // ── Muncher ────────────────────────────────────────────────────────────
@@ -624,8 +666,12 @@ macro_rules! delegate_storage_backend {
         $crate::delegate_storage_backend!(@forward [$($rest)*] [$($except)*]);
     };
     (@forward [batch_delete_keys $($rest:ident)*] [$($except:ident)*]) => {
-        fn batch_delete_keys(&self, keys: &[String]) -> $crate::__macro_support::Result<()> {
-            $crate::InnerBackend::inner_backend(self).batch_delete_keys(keys)
+        fn batch_delete_keys(
+            &self,
+            keys: &[String],
+            scope: $crate::BatchDeleteScope,
+        ) -> $crate::__macro_support::Result<()> {
+            $crate::InnerBackend::inner_backend(self).batch_delete_keys(keys, scope)
         }
         $crate::delegate_storage_backend!(@forward [$($rest)*] [$($except)*]);
     };
@@ -687,6 +733,19 @@ macro_rules! delegate_storage_backend {
             keys: &[String],
         ) -> $crate::__macro_support::Result<Vec<Option<u64>>> {
             $crate::InnerBackend::inner_backend(self).object_sizes(keys)
+        }
+        $crate::delegate_storage_backend!(@forward [$($rest)*] [$($except)*]);
+    };
+
+    (@forward [list_tree_sized $($rest:ident)*] [list_tree_sized $($except:ident)*]) => {
+        $crate::delegate_storage_backend!(@forward [$($rest)*] [$($except)*]);
+    };
+    (@forward [list_tree_sized $($rest:ident)*] [$($except:ident)*]) => {
+        fn list_tree_sized(
+            &self,
+            prefix: &str,
+        ) -> $crate::__macro_support::Result<Vec<$crate::ListedObject>> {
+            $crate::InnerBackend::inner_backend(self).list_tree_sized(prefix)
         }
         $crate::delegate_storage_backend!(@forward [$($rest)*] [$($except)*]);
     };
@@ -809,7 +868,11 @@ mod tests {
                 completed: Vec::new(),
             })
         }
-        fn batch_delete_keys(&self, _keys: &[String]) -> Result<()> {
+        fn batch_delete_keys(
+            &self,
+            _keys: &[String],
+            _scope: crate::BatchDeleteScope,
+        ) -> Result<()> {
             self.hit();
             Ok(())
         }
@@ -844,6 +907,10 @@ mod tests {
         fn object_sizes(&self, keys: &[String]) -> Result<Vec<Option<u64>>> {
             self.hit();
             Ok(vec![None; keys.len()])
+        }
+        fn list_tree_sized(&self, _prefix: &str) -> Result<Vec<crate::ListedObject>> {
+            self.hit();
+            Ok(Vec::new())
         }
         fn profile(&self) -> crate::BackendProfile {
             self.hit();
@@ -914,7 +981,7 @@ mod tests {
     ///
     /// This covers the methods that *have* trait defaults — for those a
     /// forgotten forward compiles, so only a call-count assertion catches it.
-    /// The nine capability methods are covered by the compiler instead (no
+    /// The ten capability methods are covered by the compiler instead (no
     /// default ⇒ a missing forward is an error), which is what keeps the
     /// inventory from drifting behind the trait.
     #[test]
@@ -961,7 +1028,8 @@ mod tests {
             vykar_types::hash::HashAlgorithm::Blake3,
         ))
         .unwrap();
-        w.batch_delete_keys(&[]).unwrap();
+        w.batch_delete_keys(&[], crate::BatchDeleteScope::KeysOnly)
+            .unwrap();
         w.server_verify_packs(&vykar_protocol::VerifyPacksPlanRequest::new(
             Vec::new(),
             vykar_types::hash::HashAlgorithm::Blake3,
@@ -972,11 +1040,12 @@ mod tests {
             .unwrap();
         w.server_capabilities().unwrap();
         w.object_sizes(&["packs/00/k".into()]).unwrap();
+        w.list_tree_sized("p").unwrap();
         let p = w.profile();
         assert_eq!(p.request_width, 3);
         assert_eq!(p.transfer_width, 3);
 
-        // 24 trait methods, 22 of them forwarded.
-        assert_eq!(w.inner.calls.load(Ordering::SeqCst), 22);
+        // 25 trait methods, 23 of them forwarded.
+        assert_eq!(w.inner.calls.load(Ordering::SeqCst), 23);
     }
 }

@@ -220,13 +220,15 @@ pub fn chunk_hasher_for(key: [u8; 32]) -> ChunkHasher {
 }
 
 /// Shared handle to inspect backend traffic: keys written via `put()`, and
-/// counts of `get_range()`, `list()`, `list_sized()` and `size()` calls.
+/// counts of `get_range()`, `list()`, `list_sized()`, `list_tree_sized()` and
+/// `size()` calls.
 #[derive(Clone)]
 pub struct PutLog {
     puts: std::sync::Arc<Mutex<Vec<String>>>,
     get_ranges: std::sync::Arc<AtomicU64>,
     lists: std::sync::Arc<AtomicU64>,
     sized_lists: std::sync::Arc<AtomicU64>,
+    tree_lists: std::sync::Arc<AtomicU64>,
     sizes: std::sync::Arc<AtomicU64>,
 }
 
@@ -237,6 +239,7 @@ impl PutLog {
             get_ranges: std::sync::Arc::new(AtomicU64::new(0)),
             lists: std::sync::Arc::new(AtomicU64::new(0)),
             sized_lists: std::sync::Arc::new(AtomicU64::new(0)),
+            tree_lists: std::sync::Arc::new(AtomicU64::new(0)),
             sizes: std::sync::Arc::new(AtomicU64::new(0)),
         }
     }
@@ -249,13 +252,24 @@ impl PutLog {
         self.sized_lists.load(Ordering::Relaxed)
     }
 
+    /// Counted `list_tree_sized()` calls (only in a tree-listing mode).
+    pub fn tree_list_count(&self) -> u64 {
+        self.tree_lists.load(Ordering::Relaxed)
+    }
+
     pub fn size_count(&self) -> u64 {
         self.sizes.load(Ordering::Relaxed)
     }
 
-    /// Reset the `list()`, `list_sized()` and `size()` counters.
+    /// Reset the `list()`, `list_sized()`, `list_tree_sized()` and `size()`
+    /// counters.
     pub fn reset_metadata_counts(&self) {
-        for c in [&self.lists, &self.sized_lists, &self.sizes] {
+        for c in [
+            &self.lists,
+            &self.sized_lists,
+            &self.tree_lists,
+            &self.sizes,
+        ] {
             c.store(0, Ordering::Relaxed);
         }
     }
@@ -296,6 +310,19 @@ pub struct RecordingBackend {
     inner: MemoryBackend,
     log: PutLog,
     sized_listing: bool,
+    tree_listing: TreeListing,
+}
+
+/// How [`RecordingBackend`] answers `list_tree_sized`.
+enum TreeListing {
+    /// The memory backend's `UnsupportedBackend`, uncounted.
+    Unsupported,
+    /// One listing with sizes, as a vykar-server answers it.
+    Answer,
+    /// One listing without sizes, as a server before `?list&sized` answers it.
+    AnswerUnsized,
+    /// An injected error.
+    Fail,
 }
 
 impl RecordingBackend {
@@ -306,6 +333,7 @@ impl RecordingBackend {
                 inner: MemoryBackend::new(),
                 log: log.clone(),
                 sized_listing: false,
+                tree_listing: TreeListing::Unsupported,
             },
             log,
         )
@@ -322,6 +350,47 @@ impl RecordingBackend {
             log,
         )
     }
+
+    /// Like [`Self::with_sized_listing`], plus a one-request
+    /// `list_tree_sized` with sizes (a vykar-server).
+    pub fn with_tree_listing() -> (Self, PutLog) {
+        Self::with_tree_mode(true, TreeListing::Answer)
+    }
+
+    /// Like [`Self::new`], plus a one-request `list_tree_sized` that reports
+    /// no sizes (a vykar-server before `?list&sized`).
+    pub fn with_unsized_tree_listing() -> (Self, PutLog) {
+        Self::with_tree_mode(false, TreeListing::AnswerUnsized)
+    }
+
+    /// Like [`Self::with_sized_listing`], but `list_tree_sized` fails.
+    pub fn with_failing_tree_listing() -> (Self, PutLog) {
+        Self::with_tree_mode(true, TreeListing::Fail)
+    }
+
+    fn with_tree_mode(sized_listing: bool, tree_listing: TreeListing) -> (Self, PutLog) {
+        let (backend, log) = Self::new();
+        (
+            Self {
+                sized_listing,
+                tree_listing,
+                ..backend
+            },
+            log,
+        )
+    }
+
+    // Sizes come from the inner backend, uncounted.
+    fn sized_from_inner(&self, prefix: &str) -> Result<Vec<vykar_storage::ListedObject>> {
+        self.inner
+            .list(prefix)?
+            .into_iter()
+            .map(|key| {
+                let size = self.inner.size(&key)?;
+                Ok(vykar_storage::ListedObject { key, size })
+            })
+            .collect()
+    }
 }
 
 impl InnerBackend for RecordingBackend {
@@ -334,7 +403,7 @@ delegate_storage_backend! {
     for RecordingBackend;
     except [
         put, list, get_range, get_range_into, open_range, put_owned, put_pack, begin_staged_put,
-        size, list_sized, profile,
+        size, list_sized, list_tree_sized, profile,
     ];
 
     fn list(&self, prefix: &str) -> Result<Vec<String>> {
@@ -342,20 +411,23 @@ delegate_storage_backend! {
         self.inner.list(prefix)
     }
 
-    // Sizes for `sized_listing` come from the inner backend, uncounted.
     fn list_sized(&self, prefix: &str) -> Result<Vec<vykar_storage::ListedObject>> {
         self.log.sized_lists.fetch_add(1, Ordering::Relaxed);
         if !self.sized_listing {
             return self.inner.list_sized(prefix);
         }
-        self.inner
-            .list(prefix)?
-            .into_iter()
-            .map(|key| {
-                let size = self.inner.size(&key)?;
-                Ok(vykar_storage::ListedObject { key, size })
-            })
-            .collect()
+        self.sized_from_inner(prefix)
+    }
+
+    fn list_tree_sized(&self, prefix: &str) -> Result<Vec<vykar_storage::ListedObject>> {
+        let answer = match self.tree_listing {
+            TreeListing::Unsupported => return self.inner.list_tree_sized(prefix),
+            TreeListing::Answer => self.sized_from_inner(prefix),
+            TreeListing::AnswerUnsized => self.inner.list_sized(prefix),
+            TreeListing::Fail => Err(VykarError::Other("injected tree listing failure".into())),
+        };
+        self.log.tree_lists.fetch_add(1, Ordering::Relaxed);
+        answer
     }
 
     fn size(&self, key: &str) -> Result<Option<u64>> {
@@ -549,7 +621,10 @@ impl InnerBackend for HookBackend {
 
 delegate_storage_backend! {
     for HookBackend;
-    except [put, delete, list, put_owned, put_pack, begin_staged_put, list_sized, profile];
+    except [
+        put, delete, list, put_owned, put_pack, begin_staged_put, list_sized, list_tree_sized,
+        profile,
+    ];
 
     // Keep packs on the intercepted `put` path. Hooks fire on `put`.
     fn begin_staged_put(
@@ -594,5 +669,10 @@ delegate_storage_backend! {
     fn list_sized(&self, prefix: &str) -> Result<Vec<vykar_storage::ListedObject>> {
         self.before(Op::List, prefix);
         self.inner.list_sized(prefix)
+    }
+
+    fn list_tree_sized(&self, prefix: &str) -> Result<Vec<vykar_storage::ListedObject>> {
+        self.before(Op::List, prefix);
+        self.inner.list_tree_sized(prefix)
     }
 }

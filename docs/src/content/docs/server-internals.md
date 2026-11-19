@@ -125,6 +125,7 @@ High-level flow:
 2. The client sends a repack plan describing source packs and live blob offsets.
 3. The server copies the referenced encrypted blobs into new pack files, preserving the pack wire format.
 4. The server returns new pack keys and offsets so the client can update the chunk index.
+5. After saving the index, the client deletes the source packs with one `POST /?batch-delete` (without `cleanup-dirs`), falling back to per-pack `DELETE`.
 
 This is encrypted passthrough: the server never decrypts chunk payloads.
 

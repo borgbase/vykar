@@ -867,7 +867,7 @@ mod tests {
 
     vykar_storage::delegate_storage_backend! {
         for LookupCountingBackend;
-        except [list, size, list_sized];
+        except [list, size, list_sized, list_tree_sized];
 
         fn size(&self, key: &str) -> Result<Option<u64>> {
             self.size_calls
@@ -883,6 +883,11 @@ mod tests {
         fn list_sized(&self, prefix: &str) -> Result<Vec<vykar_storage::ListedObject>> {
             self.count_pack_list(prefix);
             self.inner.list_sized(prefix)
+        }
+
+        fn list_tree_sized(&self, prefix: &str) -> Result<Vec<vykar_storage::ListedObject>> {
+            self.count_pack_list(prefix);
+            self.inner.list_tree_sized(prefix)
         }
     }
 

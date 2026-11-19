@@ -328,6 +328,28 @@ mod tests {
         );
     }
 
+    /// Without `cleanup-dirs` only the named keys go: another client's
+    /// in-flight upload survives a compact's batch delete.
+    #[tokio::test]
+    async fn batch_delete_without_cleanup_dirs_keeps_unlisted_temps() {
+        let (router, _state, tmp) = setup_app(0);
+        let data_dir = tmp.path();
+        let pack_key = "packs/ab/".to_string() + &"ab".repeat(32);
+        let temp_key = "packs/ab/.tmp.inflight.0";
+        std::fs::write(data_dir.join(&pack_key), b"packdata").unwrap();
+        std::fs::write(data_dir.join(temp_key), b"partial").unwrap();
+
+        let keys = serde_json::to_vec(&serde_json::json!([pack_key])).unwrap();
+        let resp = authed_post(router, "/?batch-delete", keys).await;
+        assert_status(&resp, StatusCode::NO_CONTENT);
+
+        assert!(!data_dir.join(&pack_key).exists());
+        assert!(
+            data_dir.join(temp_key).exists(),
+            "unlisted temp must survive"
+        );
+    }
+
     #[tokio::test]
     async fn batch_delete_cleanup_dirs_preserves_nonempty_dirs() {
         let (router, _state, tmp) = setup_app(0);

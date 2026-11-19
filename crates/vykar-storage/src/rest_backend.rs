@@ -20,8 +20,8 @@ use crate::RetryConfig;
 use vykar_types::error::{Result, VykarError};
 
 use crate::{
-    ConditionalGet, ListedObject, RepackPlanRequest, RepackResultResponse, ServerCapabilities,
-    StorageBackend, VerifyPacksPlanRequest, VerifyPacksResponse,
+    BatchDeleteScope, ConditionalGet, ListedObject, RepackPlanRequest, RepackResultResponse,
+    ServerCapabilities, StorageBackend, VerifyPacksPlanRequest, VerifyPacksResponse,
 };
 use vykar_types::hash::{HashAlgorithm, Hasher256};
 
@@ -580,7 +580,7 @@ impl RestBackend {
 
 impl RestBackend {
     /// GET a listing; `sized` adds `&sized` (see [`vykar_protocol::SizedKey`]).
-    fn fetch_listing(&self, prefix: &str, sized: bool) -> Result<Vec<u8>> {
+    fn fetch_listing(&self, prefix: &str, sized: bool, retry: &RetryConfig) -> Result<Vec<u8>> {
         let query = if sized { "list&sized" } else { "list" };
         let prefix = prefix.trim_start_matches('/');
         let url = if prefix.is_empty() {
@@ -588,7 +588,8 @@ impl RestBackend {
         } else {
             format!("{}?{query}", self.url(prefix))
         };
-        self.retry_call(
+        self.retry_call_with(
+            retry,
             &format!("LIST {prefix}"),
             || {
                 let req = self.authed(self.agent.get(&url));
@@ -611,6 +612,32 @@ impl RestBackend {
             },
         )
         .map_err(|e| VykarError::Other(format!("REST LIST {prefix}: {e}")))
+    }
+
+    /// Parse a `?list&sized` body. A server that predates `sized` ignores it
+    /// and returns bare keys.
+    fn parse_sized_listing(body: &[u8]) -> Result<Vec<ListedObject>> {
+        #[derive(serde::Deserialize)]
+        #[serde(untagged)]
+        enum Listing {
+            Sized(Vec<vykar_protocol::SizedKey>),
+            Plain(Vec<String>),
+        }
+        let listing: Listing = serde_json::from_slice(body)
+            .map_err(|e| VykarError::Other(format!("REST LIST parse: {e}")))?;
+        Ok(match listing {
+            Listing::Sized(keys) => keys
+                .into_iter()
+                .map(|k| ListedObject {
+                    key: k.key,
+                    size: Some(k.size),
+                })
+                .collect(),
+            Listing::Plain(keys) => keys
+                .into_iter()
+                .map(|key| ListedObject { key, size: None })
+                .collect(),
+        })
     }
 }
 
@@ -800,35 +827,14 @@ impl StorageBackend for RestBackend {
     fn list(&self, prefix: &str) -> Result<Vec<String>> {
         // Plain listing: sizes would roughly double large pack listings only
         // to be discarded.
-        let body = self.fetch_listing(prefix, false)?;
+        let body = self.fetch_listing(prefix, false, &self.retry)?;
         serde_json::from_slice(&body)
             .map_err(|e| VykarError::Other(format!("REST LIST parse: {e}")))
     }
 
     fn list_sized(&self, prefix: &str) -> Result<Vec<ListedObject>> {
-        let body = self.fetch_listing(prefix, true)?;
-        // A server that predates `sized` ignores it and returns bare keys.
-        #[derive(serde::Deserialize)]
-        #[serde(untagged)]
-        enum Listing {
-            Sized(Vec<vykar_protocol::SizedKey>),
-            Plain(Vec<String>),
-        }
-        let listing: Listing = serde_json::from_slice(&body)
-            .map_err(|e| VykarError::Other(format!("REST LIST parse: {e}")))?;
-        Ok(match listing {
-            Listing::Sized(keys) => keys
-                .into_iter()
-                .map(|k| ListedObject {
-                    key: k.key,
-                    size: Some(k.size),
-                })
-                .collect(),
-            Listing::Plain(keys) => keys
-                .into_iter()
-                .map(|key| ListedObject { key, size: None })
-                .collect(),
-        })
+        let body = self.fetch_listing(prefix, true, &self.retry)?;
+        Self::parse_sized_listing(&body)
     }
 
     fn get_range(&self, key: &str, offset: u64, length: u64) -> Result<Option<Vec<u8>>> {
@@ -928,18 +934,22 @@ impl StorageBackend for RestBackend {
         self.repack(plan)
     }
 
-    fn batch_delete_keys(&self, keys: &[String]) -> Result<()> {
+    fn batch_delete_keys(&self, keys: &[String], scope: BatchDeleteScope) -> Result<()> {
+        let cleanup = scope == BatchDeleteScope::WholeRepository;
+        if keys.is_empty() && !cleanup {
+            return Ok(());
+        }
         // Chunk below the server's per-request key cap (200k). cleanup-dirs runs
         // only on the final chunk, so empty directories are pruned once, after
         // every key has been removed.
         const CHUNK: usize = 100_000;
         if keys.len() <= CHUNK {
-            return self.batch_delete(keys, true);
+            return self.batch_delete(keys, cleanup);
         }
         let mut chunks = keys.chunks(CHUNK).peekable();
         while let Some(chunk) = chunks.next() {
             let is_last = chunks.peek().is_none();
-            self.batch_delete(chunk, is_last)?;
+            self.batch_delete(chunk, cleanup && is_last)?;
         }
         Ok(())
     }
@@ -999,6 +1009,20 @@ impl StorageBackend for RestBackend {
             rest = tail;
         }
         Ok(sizes)
+    }
+
+    /// One `GET <prefix>?list&sized`: the server walks the whole tree.
+    ///
+    /// Not retried: the caller's per-directory fallback supplies the retries,
+    /// and a retry after the admin timeout would hold the maintenance lock
+    /// while the server is still walking the tree.
+    fn list_tree_sized(&self, prefix: &str) -> Result<Vec<ListedObject>> {
+        let retry = RetryConfig {
+            max_retries: 0,
+            ..self.retry
+        };
+        let body = self.fetch_listing(prefix, true, &retry)?;
+        Self::parse_sized_listing(&body)
     }
 
     fn profile(&self) -> crate::BackendProfile {
@@ -1411,6 +1435,108 @@ mod tests {
         );
         let request = request.join().unwrap();
         assert!(request.starts_with("GET /?list&sized "), "got:\n{request}");
+    }
+
+    #[test]
+    fn list_tree_sized_is_one_sized_listing_of_the_prefix() {
+        let (url, request) = capture_request(&json_response(
+            r#"[{"key":"packs/00/a","size":1},{"key":"packs/ff/b","size":2}]"#,
+        ));
+        let backend = RestBackend::new(&url, None, no_retry(), None).unwrap();
+        assert_eq!(
+            backend.list_tree_sized("packs/").unwrap(),
+            vec![
+                ListedObject {
+                    key: "packs/00/a".into(),
+                    size: Some(1)
+                },
+                ListedObject {
+                    key: "packs/ff/b".into(),
+                    size: Some(2)
+                },
+            ]
+        );
+        let request = request.join().unwrap();
+        assert!(
+            request.starts_with("GET /packs/?list&sized "),
+            "got:\n{request}"
+        );
+    }
+
+    /// The tree listing gets one attempt (compact falls back per shard);
+    /// `list_sized` keeps the configured retries.
+    #[test]
+    fn list_tree_sized_is_not_retried() {
+        let (url, seen) = routing_server(|_| empty("500 Internal Server Error"));
+        let backend = RestBackend::new(&url, None, fast_retry(), None).unwrap();
+        assert!(backend.list_tree_sized("packs/").is_err());
+        assert_eq!(seen.lock().unwrap().len(), 1);
+
+        let (url, seen) = routing_server(|_| empty("500 Internal Server Error"));
+        let backend = RestBackend::new(&url, None, fast_retry(), None).unwrap();
+        assert!(backend.list_sized("packs/00/").is_err());
+        assert!(seen.lock().unwrap().len() > 1);
+    }
+
+    #[test]
+    fn batch_delete_keys_only_never_sends_cleanup_dirs() {
+        let (url, request) = capture_request(&empty("204 No Content"));
+        let backend = RestBackend::new(&url, None, no_retry(), None).unwrap();
+        backend
+            .batch_delete_keys(&["packs/ab/x".into()], BatchDeleteScope::KeysOnly)
+            .unwrap();
+        let request = request.join().unwrap();
+        assert!(
+            request.starts_with("POST /?batch-delete "),
+            "got:\n{request}"
+        );
+    }
+
+    #[test]
+    fn batch_delete_whole_repository_sends_cleanup_dirs() {
+        let (url, request) = capture_request(&empty("204 No Content"));
+        let backend = RestBackend::new(&url, None, no_retry(), None).unwrap();
+        backend
+            .batch_delete_keys(&["packs/ab/x".into()], BatchDeleteScope::WholeRepository)
+            .unwrap();
+        let request = request.join().unwrap();
+        assert!(
+            request.starts_with("POST /?batch-delete&cleanup-dirs "),
+            "got:\n{request}"
+        );
+    }
+
+    #[test]
+    fn batch_delete_keys_only_with_no_keys_sends_nothing() {
+        let backend = RestBackend::new("http://127.0.0.1:1", None, no_retry(), None).unwrap();
+        backend
+            .batch_delete_keys(&[], BatchDeleteScope::KeysOnly)
+            .unwrap();
+    }
+
+    #[test]
+    fn batch_delete_cleanup_dirs_only_on_the_final_chunk() {
+        let keys: Vec<String> = (0..100_001).map(|i| format!("k{i}")).collect();
+        let lines = |scope| {
+            let (url, seen) = routing_server(|_| empty("204 No Content"));
+            let backend = RestBackend::new(&url, None, no_retry(), None).unwrap();
+            backend.batch_delete_keys(&keys, scope).unwrap();
+            let lines: Vec<String> = seen
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|s| s.line.clone())
+                .collect();
+            lines
+        };
+        assert_eq!(
+            lines(BatchDeleteScope::KeysOnly),
+            vec!["POST /?batch-delete", "POST /?batch-delete"]
+        );
+        assert_eq!(
+            lines(BatchDeleteScope::WholeRepository),
+            vec!["POST /?batch-delete", "POST /?batch-delete&cleanup-dirs"]
+        );
     }
 
     #[test]

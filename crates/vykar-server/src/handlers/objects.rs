@@ -1328,6 +1328,30 @@ mod tests {
         assert_eq!(keys, vec!["packs/ab/pack1"]);
     }
 
+    /// One sized listing of `packs/` spans every shard (compact relies on it).
+    #[tokio::test]
+    async fn sized_listing_of_packs_spans_every_shard() {
+        let (router, _state, tmp) = setup_app(0);
+        let mut expected = Vec::new();
+        for (shard, len) in [("00", 3u64), ("ab", 5), ("ff", 7)] {
+            let key = format!("packs/{shard}/{}", shard.repeat(32));
+            std::fs::write(tmp.path().join(&key), vec![0u8; len as usize]).unwrap();
+            expected.push((key, len));
+        }
+        std::fs::write(tmp.path().join("packs/ab/.tmp.x.1"), b"x").unwrap();
+
+        for uri in ["/packs/?list&sized", "/packs?list&sized"] {
+            let resp = authed_get(router.clone(), uri).await;
+            assert_status(&resp, StatusCode::OK);
+            let listed: Vec<vykar_protocol::SizedKey> =
+                serde_json::from_slice(&body_bytes(resp).await).unwrap();
+            let mut listed: Vec<(String, u64)> =
+                listed.into_iter().map(|k| (k.key, k.size)).collect();
+            listed.sort();
+            assert_eq!(listed, expected, "{uri}");
+        }
+    }
+
     #[tokio::test]
     async fn append_only_delete_temp_file_succeeds() {
         let (router, _state, tmp) = setup_app_append_only(0);

@@ -4,7 +4,7 @@ use tracing::info;
 
 use crate::config::VykarConfig;
 use crate::storage::backend_from_config;
-use vykar_storage::{parse_repo_url, ParsedUrl};
+use vykar_storage::{parse_repo_url, BatchDeleteScope, ParsedUrl, StorageBackend};
 use vykar_types::error::{Result, VykarError};
 
 pub use vykar_protocol::is_known_repo_key;
@@ -40,15 +40,7 @@ pub fn run(config: &VykarConfig) -> Result<DeleteRepoStats> {
     // if the sweep fails, the repo is still intact and a rerun retries it.
     let temps_deleted = backend.remove_stale_temp_files(std::time::Duration::ZERO)?;
 
-    match backend.batch_delete_keys(&known) {
-        Ok(()) => {}
-        Err(VykarError::UnsupportedBackend(_)) => {
-            for key in &known {
-                backend.delete(key)?;
-            }
-        }
-        Err(e) => return Err(e),
-    }
+    delete_known(backend.as_ref(), &known)?;
     let keys_deleted = (known.len() + temps_deleted) as u64;
 
     let parsed = parse_repo_url(&config.repository.url)?;
@@ -92,4 +84,101 @@ pub fn run(config: &VykarConfig) -> Result<DeleteRepoStats> {
         root_removed,
         is_local,
     })
+}
+
+/// Delete every known repository key: one batch where the backend has one
+/// (with the whole-repository cleanup), else key by key.
+fn delete_known(backend: &dyn StorageBackend, known: &[String]) -> Result<()> {
+    match backend.batch_delete_keys(known, BatchDeleteScope::WholeRepository) {
+        Ok(()) => Ok(()),
+        Err(VykarError::UnsupportedBackend(_)) => {
+            for key in known {
+                backend.delete(key)?;
+            }
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use vykar_storage::{delegate_storage_backend, InnerBackend};
+
+    use super::*;
+    use crate::testutil::MemoryBackend;
+
+    /// Records the batch-delete scope and every per-key delete.
+    struct ScopeRecorder {
+        inner: MemoryBackend,
+        batch_supported: bool,
+        scopes: Mutex<Vec<BatchDeleteScope>>,
+        deletes: Mutex<Vec<String>>,
+    }
+
+    impl ScopeRecorder {
+        fn new(batch_supported: bool) -> Self {
+            Self {
+                inner: MemoryBackend::new(),
+                batch_supported,
+                scopes: Mutex::default(),
+                deletes: Mutex::default(),
+            }
+        }
+    }
+
+    impl InnerBackend for ScopeRecorder {
+        fn inner_backend(&self) -> &dyn StorageBackend {
+            &self.inner
+        }
+    }
+
+    delegate_storage_backend! {
+        for ScopeRecorder;
+        except [delete, batch_delete_keys];
+
+        fn delete(&self, key: &str) -> Result<()> {
+            self.deletes.lock().unwrap().push(key.to_string());
+            self.inner.delete(key)
+        }
+
+        fn batch_delete_keys(&self, keys: &[String], scope: BatchDeleteScope) -> Result<()> {
+            self.scopes.lock().unwrap().push(scope);
+            if !self.batch_supported {
+                return self.inner.batch_delete_keys(keys, scope);
+            }
+            for key in keys {
+                self.inner.delete(key)?;
+            }
+            Ok(())
+        }
+    }
+
+    fn known() -> Vec<String> {
+        vec!["config".into(), "index".into(), "packs/ab/x".into()]
+    }
+
+    #[test]
+    fn delete_known_batches_with_whole_repository_scope() {
+        let backend = ScopeRecorder::new(true);
+        delete_known(&backend, &known()).unwrap();
+        assert_eq!(
+            *backend.scopes.lock().unwrap(),
+            vec![BatchDeleteScope::WholeRepository]
+        );
+        assert!(backend.deletes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn delete_known_falls_back_to_per_key_deletes() {
+        let backend = ScopeRecorder::new(false);
+        delete_known(&backend, &known()).unwrap();
+        assert_eq!(
+            *backend.scopes.lock().unwrap(),
+            vec![BatchDeleteScope::WholeRepository]
+        );
+        assert_eq!(*backend.deletes.lock().unwrap(), known());
+    }
 }

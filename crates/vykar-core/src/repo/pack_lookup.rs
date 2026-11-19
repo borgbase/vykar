@@ -319,7 +319,7 @@ pub(crate) mod tests {
 
     delegate_storage_backend! {
         for Probe;
-        except [exists, list, size, list_sized, object_sizes];
+        except [exists, list, size, list_sized, object_sizes, list_tree_sized];
 
         fn exists(&self, key: &str) -> Result<bool> {
             self.exists.fetch_add(1, Ordering::SeqCst);
@@ -365,6 +365,14 @@ pub(crate) mod tests {
                     Ok(ListedObject { key, size })
                 })
                 .collect()
+        }
+
+        fn list_tree_sized(&self, prefix: &str) -> Result<Vec<ListedObject>> {
+            self.lists.fetch_add(1, Ordering::SeqCst);
+            if self.fail_list {
+                return Err(VykarError::Other("injected list failure".into()));
+            }
+            self.inner.list_tree_sized(prefix)
         }
 
         fn object_sizes(&self, keys: &[String]) -> Result<Vec<Option<u64>>> {

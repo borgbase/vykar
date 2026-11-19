@@ -765,8 +765,8 @@ flowchart TB
 ```
 
 **Phase 1 — Analysis (read-only, no pack downloads):**
-1. Enumerate all pack files across 256 shard dirs (`packs/00/` through `packs/ff/`)
-2. Query each pack's size via metadata-only calls (`HEAD`/stat), parallelized from `limits.connections` (remote: `min(connections*3, 24)`, local: `min(connections, 8)`)
+1. Enumerate all pack files: one sized listing of `packs/` on a vykar-server, otherwise one sized listing per shard dir (`packs/00/` through `packs/ff/`), parallelized from `limits.connections` (remote: `min(connections*3, 24)`, local: `min(connections, 8)`)
+2. Sizes come from the listing; `HEAD`/stat only for packs it lists without one (servers before v0.22), parallelized the same way
 3. Compute live bytes per pack from the `ChunkIndex`: `live_bytes = Σ(4 + stored_size)` for each indexed blob in that pack
 4. Derive `dead_bytes = (pack_size - PACK_HEADER_SIZE) - live_bytes`; packs where `live_bytes > pack_payload` are marked corrupt
 5. Compute `unused_ratio = dead_bytes / pack_size` per pack

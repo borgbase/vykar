@@ -839,7 +839,7 @@ impl InnerBackend for CountingBackend {
 
 vykar_storage::delegate_storage_backend! {
     for CountingBackend;
-    except [get, get_if_changed, list, list_sized];
+    except [get, get_if_changed, list, list_sized, list_tree_sized];
 
     fn get(&self, key: &str) -> vykar_types::error::Result<Option<Vec<u8>>> {
         self.reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -865,6 +865,14 @@ vykar_storage::delegate_storage_backend! {
     ) -> vykar_types::error::Result<Vec<vykar_storage::ListedObject>> {
         self.reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.inner.list_sized(prefix)
+    }
+
+    fn list_tree_sized(
+        &self,
+        prefix: &str,
+    ) -> vykar_types::error::Result<Vec<vykar_storage::ListedObject>> {
+        self.reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inner.list_tree_sized(prefix)
     }
 }
 

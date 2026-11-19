@@ -315,14 +315,18 @@ pub trait StorageBackend: Send + Sync {
     /// Execute a server-side repack plan when supported by the backend.
     fn server_repack(&self, plan: &RepackPlanRequest) -> Result<RepackResultResponse>;
 
-    /// Batch-delete keys using a backend-native API.
+    /// Delete `keys` using a backend-native batch API. An absent key is not an
+    /// error. After `Err` an unknown subset may already be deleted; deleting a
+    /// key again is harmless.
     ///
-    /// **For delete-repo only.** `RestBackend` sends `cleanup-dirs` with the
-    /// final request, which prunes empty directories and purges every temp
-    /// file in the repository, including those of a backup still in flight.
-    /// A caller that deletes keys in a repository that stays live (compact,
-    /// prune) must use [`Self::delete`] or add a variant without the purge.
-    fn batch_delete_keys(&self, keys: &[String]) -> Result<()>;
+    /// `scope` says whether the repository survives. Only
+    /// [`BatchDeleteScope::WholeRepository`] may touch anything not named in
+    /// `keys`; a caller in a live repository (compact) must pass
+    /// [`BatchDeleteScope::KeysOnly`].
+    ///
+    /// Reports `UnsupportedBackend` on every backend without a batch API;
+    /// callers then delete key by key.
+    fn batch_delete_keys(&self, keys: &[String], scope: BatchDeleteScope) -> Result<()>;
 
     /// Server-side pack verification: hash check + header + blob boundary scan.
     fn server_verify_packs(&self, plan: &VerifyPacksPlanRequest) -> Result<VerifyPacksResponse>;
@@ -364,6 +368,20 @@ pub trait StorageBackend: Send + Sync {
     /// above: a wrapper inheriting an "unsupported" default would silently
     /// cost a commit one request per pack shard.
     fn object_sizes(&self, keys: &[String]) -> Result<Vec<Option<u64>>>;
+
+    /// [`Self::list_sized`] answered in **one** request for the whole tree
+    /// under `prefix`, for callers that would otherwise split a large tree into
+    /// per-directory listings (compact's 256 pack shards).
+    ///
+    /// Same result contract as `list_sized`, including `size: None` for "not
+    /// reported" (a vykar-server older than `?list&sized` returns bare keys).
+    ///
+    /// Reports `UnsupportedBackend` where a whole-tree listing is not one cheap
+    /// request: a serial directory walk on SFTP, sequential pagination on S3,
+    /// and local, which gains nothing. Only `RestBackend` implements it.
+    /// Required for the reason in the note above: a wrapper inheriting an
+    /// "unsupported" default would silently cost compact 255 extra requests.
+    fn list_tree_sized(&self, prefix: &str) -> Result<Vec<ListedObject>>;
 
     /// What kind of backend this is. Required for the reason in the note above:
     /// a wrapper inheriting a default would report a guess instead of the
@@ -578,6 +596,17 @@ pub struct BackendProfile {
 pub struct ListedObject {
     pub key: String,
     pub size: Option<u64>,
+}
+
+/// What [`StorageBackend::batch_delete_keys`] removes besides the named keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchDeleteScope {
+    /// Exactly the named keys. For a repository that stays live (compact).
+    KeysOnly,
+    /// The repository itself is going away (delete-repo): a vykar-server
+    /// also prunes now-empty directories and purges every temp file,
+    /// including those of a backup still in flight (`cleanup-dirs`).
+    WholeRepository,
 }
 
 /// Outcome of [`StorageBackend::get_if_changed`].

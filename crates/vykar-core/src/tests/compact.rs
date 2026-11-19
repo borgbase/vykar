@@ -154,13 +154,32 @@ fn count_all_packs(repo: &crate::repo::Repository) -> usize {
     count
 }
 
-fn repo_on_recording_backend(sized: bool) -> (crate::repo::Repository, crate::testutil::PutLog) {
+/// How the [`crate::testutil::RecordingBackend`] under a test repo lists packs.
+#[derive(Clone, Copy, Debug)]
+enum Listing {
+    /// Per-shard listings without sizes (a REST server before v0.22).
+    Plain,
+    /// Per-shard listings with sizes (S3, SFTP, local).
+    Sized,
+    /// One tree listing with sizes (a vykar-server).
+    Tree,
+    /// One tree listing without sizes (a vykar-server before `?list&sized`).
+    UnsizedTree,
+    /// The tree listing fails; per-shard listings with sizes.
+    FailingTree,
+}
+
+fn repo_on_recording_backend(
+    listing: Listing,
+) -> (crate::repo::Repository, crate::testutil::PutLog) {
     use crate::testutil::RecordingBackend;
     crate::testutil::init_test_environment();
-    let (backend, log) = if sized {
-        RecordingBackend::with_sized_listing()
-    } else {
-        RecordingBackend::new()
+    let (backend, log) = match listing {
+        Listing::Plain => RecordingBackend::new(),
+        Listing::Sized => RecordingBackend::with_sized_listing(),
+        Listing::Tree => RecordingBackend::with_tree_listing(),
+        Listing::UnsizedTree => RecordingBackend::with_unsized_tree_listing(),
+        Listing::FailingTree => RecordingBackend::with_failing_tree_listing(),
     };
     let mut repo = crate::repo::Repository::init(
         Box::new(backend),
@@ -176,14 +195,22 @@ fn repo_on_recording_backend(sized: bool) -> (crate::repo::Repository, crate::te
     (repo, log)
 }
 
-/// Compact takes pack sizes from a sized listing and calls `size()` only for
-/// packs listed without one (old REST servers); the analysis is identical.
+/// Compact takes pack sizes from the listing and calls `size()` only for
+/// packs listed without one (old REST servers). A vykar-server answers with
+/// one tree listing; if that fails, compact lists per shard. The analysis is
+/// identical in every case.
 #[test]
 fn compact_sizes_packs_from_the_listing() {
     for dead in [false, true] {
         let mut runs = Vec::new();
-        for sized in [true, false] {
-            let (mut repo, log) = repo_on_recording_backend(sized);
+        for listing in [
+            Listing::Sized,
+            Listing::Plain,
+            Listing::Tree,
+            Listing::UnsizedTree,
+            Listing::FailingTree,
+        ] {
+            let (mut repo, log) = repo_on_recording_backend(listing);
             // A data and a tree chunk land in two packs.
             let (data_id, _, _) = repo
                 .store_chunk(
@@ -208,11 +235,18 @@ fn compact_sizes_packs_from_the_listing() {
 
             log.reset_metadata_counts();
             let stats = compact_repo(&mut repo, 10.0, None, dead, 4, None).unwrap();
-            let ctx = format!("sized={sized} dead={dead}");
-            assert_eq!(log.sized_list_count(), 256, "{ctx}");
+            let ctx = format!("{listing:?} dead={dead}");
+            let (tree_lists, sized_lists, sizes) = match listing {
+                Listing::Plain => (0, 256, packs),
+                Listing::Sized => (0, 256, 0),
+                Listing::Tree => (1, 0, 0),
+                Listing::UnsizedTree => (1, 0, packs),
+                Listing::FailingTree => (1, 256, 0),
+            };
+            assert_eq!(log.tree_list_count(), tree_lists, "{ctx}");
+            assert_eq!(log.sized_list_count(), sized_lists, "{ctx}");
             assert_eq!(log.list_count(), 0, "{ctx}");
-            let expected_sizes = if sized { 0 } else { packs };
-            assert_eq!(log.size_count(), expected_sizes, "{ctx}");
+            assert_eq!(log.size_count(), sizes, "{ctx}");
             runs.push((
                 stats.packs_total,
                 stats.packs_corrupt,
@@ -223,11 +257,34 @@ fn compact_sizes_packs_from_the_listing() {
                 stats.space_freed,
             ));
         }
-        assert_eq!(runs[0], runs[1], "dead={dead}");
+        for run in &runs[1..] {
+            assert_eq!(run, &runs[0], "dead={dead}");
+        }
         if dead {
             assert!(runs[0].6 > 0, "dry run reports dead space: {:?}", runs[0]);
         }
     }
+}
+
+/// A pack-like key directly under `packs/` is outside every shard: the tree
+/// listing must not hand it to the analysis (which could delete it as an
+/// orphan), just as the per-shard listings never see it.
+#[test]
+fn compact_tree_listing_ignores_keys_outside_shards() {
+    let stray = format!("packs/{}", hex::encode([0xcd; 32]));
+    let mut runs = Vec::new();
+    for listing in [Listing::Tree, Listing::Sized] {
+        let (mut repo, _log) = repo_on_recording_backend(listing);
+        store_two_chunks(&mut repo);
+        repo.storage
+            .put(&stray, &[0u8; vykar_protocol::PACK_HEADER_SIZE + 64])
+            .unwrap();
+
+        let stats = compact_repo(&mut repo, 0.0, None, false, 4, None).unwrap();
+        assert!(repo.storage.exists(&stray).unwrap(), "{listing:?}");
+        runs.push((stats.packs_total, stats.packs_orphan));
+    }
+    assert_eq!(runs[0], runs[1]);
 }
 
 mod server_side {
@@ -256,6 +313,8 @@ mod server_side {
         FailRepack,
         /// Repack succeeds, but deleting any pack fails.
         FailPackDeletes,
+        /// Repack succeeds and per-pack deletes succeed; the batch delete fails.
+        FailBatchDelete,
     }
 
     #[derive(Clone, Default)]
@@ -277,6 +336,9 @@ mod server_side {
     struct ServerRepackBackend {
         inner: MemoryBackend,
         mode: Mode,
+        /// Answer `batch_delete_keys` (as a vykar-server does) instead of
+        /// reporting it unsupported.
+        batch: bool,
         log: Log,
     }
 
@@ -288,7 +350,10 @@ mod server_side {
 
     delegate_storage_backend! {
         for ServerRepackBackend;
-        except [put, delete, put_owned, put_pack, begin_staged_put, server_repack, profile];
+        except [
+            put, delete, put_owned, put_pack, begin_staged_put, server_repack, batch_delete_keys,
+            profile,
+        ];
 
         // Keep packs on the intercepted `put` path.
         fn begin_staged_put(
@@ -355,14 +420,39 @@ mod server_side {
             }
             Ok(RepackResultResponse { completed })
         }
+
+        fn batch_delete_keys(
+            &self,
+            keys: &[String],
+            scope: vykar_storage::BatchDeleteScope,
+        ) -> Result<()> {
+            if !self.batch {
+                return self.inner.batch_delete_keys(keys, scope);
+            }
+            if matches!(self.mode, Mode::FailPackDeletes)
+                && keys.iter().any(|k| k.starts_with("packs/"))
+            {
+                return Err(VykarError::Other("403 Forbidden: batch-delete".into()));
+            }
+            if matches!(self.mode, Mode::FailBatchDelete) {
+                return Err(VykarError::Other("REST batch-delete: HTTP 408".into()));
+            }
+            self.log
+                .push(format!("batch-delete {scope:?} {}", keys.join(",")));
+            for key in keys {
+                self.inner.delete(key)?;
+            }
+            Ok(())
+        }
     }
 
-    fn server_repo(mode: Mode) -> (Repository, Log) {
+    fn server_repo(mode: Mode, batch: bool) -> (Repository, Log) {
         init_test_environment();
         let log = Log::default();
         let storage = Box::new(ServerRepackBackend {
             inner: MemoryBackend::new(),
             mode,
+            batch,
             log: log.clone(),
         });
         let mut repo = Repository::init(
@@ -410,7 +500,7 @@ mod server_side {
 
     #[test]
     fn sources_deleted_by_client_after_index_saved() {
-        let (mut repo, log) = server_repo(Mode::CopyToNewPack);
+        let (mut repo, log) = server_repo(Mode::CopyToNewPack, false);
         let (id_b, partial, empty) = setup_dead_packs(&mut repo);
         log.events.lock().unwrap().clear();
 
@@ -449,7 +539,7 @@ mod server_side {
 
     #[test]
     fn source_returned_as_new_pack_is_kept() {
-        let (mut repo, log) = server_repo(Mode::ReturnSource);
+        let (mut repo, log) = server_repo(Mode::ReturnSource, false);
         let (id_b, partial, empty) = setup_dead_packs(&mut repo);
         log.events.lock().unwrap().clear();
 
@@ -468,7 +558,7 @@ mod server_side {
 
     #[test]
     fn repack_error_leaves_sources_and_index() {
-        let (mut repo, log) = server_repo(Mode::FailRepack);
+        let (mut repo, log) = server_repo(Mode::FailRepack, false);
         let (id_b, partial, empty) = setup_dead_packs(&mut repo);
         log.events.lock().unwrap().clear();
 
@@ -488,7 +578,7 @@ mod server_side {
 
     #[test]
     fn delete_failure_keeps_index_on_new_packs() {
-        let (mut repo, log) = server_repo(Mode::FailPackDeletes);
+        let (mut repo, log) = server_repo(Mode::FailPackDeletes, false);
         let (id_b, partial, _empty) = setup_dead_packs(&mut repo);
         log.events.lock().unwrap().clear();
 
@@ -508,6 +598,133 @@ mod server_side {
         );
 
         // The new location is persisted, not just held in memory.
+        assert_eq!(log.events(), ["repack", "put index", "put index.gen"]);
+    }
+
+    /// `(packs_repacked, packs_deleted_empty, space_freed)` of a successful
+    /// compact over [`setup_dead_packs`].
+    fn delete_stats(mode: Mode, batch: bool) -> (u64, u64, u64) {
+        let (mut repo, _log) = server_repo(mode, batch);
+        setup_dead_packs(&mut repo);
+        let stats = compact_repo(&mut repo, 1.0, None, false, 4, None).unwrap();
+        (
+            stats.packs_repacked,
+            stats.packs_deleted_empty,
+            stats.space_freed,
+        )
+    }
+
+    fn batch_events(events: &[String]) -> Vec<&String> {
+        events
+            .iter()
+            .filter(|e| e.starts_with("batch-delete"))
+            .collect()
+    }
+
+    #[test]
+    fn sources_deleted_in_one_batch_after_index_saved() {
+        let (mut repo, log) = server_repo(Mode::CopyToNewPack, true);
+        let (id_b, partial, empty) = setup_dead_packs(&mut repo);
+        log.events.lock().unwrap().clear();
+
+        let stats = compact_repo(&mut repo, 1.0, None, false, 4, None).unwrap();
+
+        let events = log.events();
+        let batches = batch_events(&events);
+        assert_eq!(batches.len(), 1, "{events:?}");
+        let batch = batches[0];
+        assert!(batch.starts_with("batch-delete KeysOnly "), "{batch}");
+        assert!(
+            batch.contains(&partial) && batch.contains(&empty),
+            "{batch}"
+        );
+        let pos = |pred: &dyn Fn(&String) -> bool| events.iter().position(pred).unwrap();
+        assert!(pos(&|e| e == "put index") < pos(&|e| e == batch));
+        assert!(
+            events.iter().all(|e| !e.starts_with("delete packs/")),
+            "{events:?}"
+        );
+
+        assert!(!repo.storage.exists(&partial).unwrap());
+        assert!(!repo.storage.exists(&empty).unwrap());
+        assert_eq!(
+            repo.read_chunk(&id_b).unwrap(),
+            b"chunk-b-data-for-compact-test"
+        );
+        assert_eq!(
+            (
+                stats.packs_repacked,
+                stats.packs_deleted_empty,
+                stats.space_freed
+            ),
+            delete_stats(Mode::CopyToNewPack, false)
+        );
+    }
+
+    #[test]
+    fn batch_never_names_a_source_returned_as_new_pack() {
+        let (mut repo, log) = server_repo(Mode::ReturnSource, true);
+        let (_id_b, partial, empty) = setup_dead_packs(&mut repo);
+        log.events.lock().unwrap().clear();
+
+        compact_repo(&mut repo, 1.0, None, false, 4, None).unwrap();
+
+        let events = log.events();
+        let batches = batch_events(&events);
+        assert_eq!(batches.len(), 1, "{events:?}");
+        assert!(batches[0].contains(&empty), "{events:?}");
+        assert!(!batches[0].contains(&partial), "{events:?}");
+        assert!(repo.storage.exists(&partial).unwrap());
+    }
+
+    #[test]
+    fn failed_batch_delete_falls_back_to_per_pack_deletes() {
+        let (mut repo, log) = server_repo(Mode::FailBatchDelete, true);
+        let (_id_b, partial, empty) = setup_dead_packs(&mut repo);
+        log.events.lock().unwrap().clear();
+
+        let stats = compact_repo(&mut repo, 1.0, None, false, 4, None).unwrap();
+
+        let events = log.events();
+        let pos = |e: &str| {
+            events
+                .iter()
+                .position(|x| x == e)
+                .unwrap_or_else(|| panic!("missing event {e:?} in {events:?}"))
+        };
+        let saved = pos("put index");
+        assert!(saved < pos(&format!("delete {partial}")));
+        assert!(saved < pos(&format!("delete {empty}")));
+        assert!(!repo.storage.exists(&partial).unwrap());
+        assert!(!repo.storage.exists(&empty).unwrap());
+        assert_eq!(
+            (
+                stats.packs_repacked,
+                stats.packs_deleted_empty,
+                stats.space_freed
+            ),
+            delete_stats(Mode::CopyToNewPack, false)
+        );
+    }
+
+    #[test]
+    fn append_only_batch_delete_reports_the_per_pack_error() {
+        let (mut repo, log) = server_repo(Mode::FailPackDeletes, true);
+        let (id_b, partial, _empty) = setup_dead_packs(&mut repo);
+        log.events.lock().unwrap().clear();
+
+        let err = compact_repo(&mut repo, 1.0, None, false, 4, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("append-only"), "{msg}");
+        assert!(!msg.contains("batch-delete"), "{msg}");
+
+        let new_pack = pack_of(&repo, &id_b);
+        assert_ne!(new_pack, partial);
+        assert!(repo.storage.exists(&new_pack).unwrap());
+        assert!(
+            repo.storage.exists(&partial).unwrap(),
+            "orphan source stays"
+        );
         assert_eq!(log.events(), ["repack", "put index", "put index.gen"]);
     }
 }

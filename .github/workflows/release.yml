@@ -342,6 +342,9 @@ jobs:
         with:
           shared-key: release-windows
           cache-on-failure: true
+      # skia builds from source here (no +crt-static prebuilt); MSVC 14.52's STL needs Clang >= 22.
+      - name: Install LLVM 22
+        run: choco upgrade llvm --version=22.1.8 -y --no-progress --allow-downgrade
       - name: Build
         run: cargo build --release --target x86_64-pc-windows-msvc -p vykar-cli -p vykar-server -p vykar-gui
       - name: Package

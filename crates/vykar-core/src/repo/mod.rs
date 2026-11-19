@@ -16,6 +16,7 @@ mod chunks;
 mod commit;
 mod index_fetch;
 pub(crate) mod index_store;
+pub(crate) mod index_write;
 mod key;
 mod open;
 mod pack_lookup;
@@ -279,6 +280,10 @@ pub struct OpenOptions {
     /// config is unauthenticated, so only the client's own config may opt
     /// into plaintext.
     pub require_encryption: bool,
+    /// Open a segmented repository whose index head cannot be read (an
+    /// older binary overwrote it). Set by `check --repair`, which rebuilds
+    /// the index; every other command refuses such a repository.
+    pub tolerate_broken_index: bool,
 }
 
 impl OpenOptions {
@@ -307,6 +312,10 @@ impl OpenOptions {
     }
     pub fn require_encryption(mut self, require: bool) -> Self {
         self.require_encryption = require;
+        self
+    }
+    pub fn tolerate_broken_index(mut self) -> Self {
+        self.tolerate_broken_index = true;
         self
     }
 }
@@ -370,6 +379,10 @@ pub struct Repository {
     /// (no cache directory, or persisting over the cache failed), kept from
     /// open to the next index load or write.
     index_scratch: Option<tempfile::TempPath>,
+    /// Segmented layout: when chains are folded into a new base.
+    fold_policy: index_write::FoldPolicy,
+    /// Segmented layout: make the next index write a fold.
+    fold_requested: bool,
 }
 
 impl Repository {

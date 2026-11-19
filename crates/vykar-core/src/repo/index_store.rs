@@ -67,12 +67,18 @@ pub(crate) fn pack_head(head: &IndexHead, crypto: &dyn CryptoEngine) -> Result<V
     )
 }
 
+/// Whether `data` (the object at `index`) is a monolithic index blob.
+pub(crate) fn is_legacy_index(data: &[u8]) -> bool {
+    data.first() == Some(&(ObjectType::ChunkIndex as u8))
+}
+
 /// Decrypt and decode the object stored at `index`.
 pub(crate) fn decode_head(data: &[u8], crypto: &dyn CryptoEngine) -> Result<IndexHead> {
-    if data.first() == Some(&(ObjectType::ChunkIndex as u8)) {
+    if is_legacy_index(data) {
         return Err(invalid(
             "the repository is in a segmented index format, but `index` holds a \
-             monolithic index (written by an older vykar)",
+             monolithic index (written by an older vykar); run `vykar check --repair` \
+             to rebuild it",
         ));
     }
     let plain = unpack_object_expect_with_context(
@@ -101,25 +107,11 @@ pub(crate) fn fetch_head(
 // ---------------------------------------------------------------------------
 
 /// A packed write-once object and its name.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "used by the segmented index write path, not yet implemented"
-    )
-)]
 pub(crate) struct PackedObject {
     pub name: ObjectName,
     pub bytes: Vec<u8>,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "used by the segmented index write path, not yet implemented"
-    )
-)]
 impl PackedObject {
     fn new(bytes: Vec<u8>) -> Self {
         Self {
@@ -138,13 +130,6 @@ impl PackedObject {
 }
 
 /// Encode, compress and encrypt a segment.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "used by the segmented index write path, not yet implemented"
-    )
-)]
 pub(crate) fn pack_segment(seg: &Segment, crypto: &dyn CryptoEngine) -> Result<PackedObject> {
     let body = seg.encode();
     let packed = pack_object_streaming_with_context(
@@ -163,13 +148,6 @@ pub(crate) fn pack_segment(seg: &Segment, crypto: &dyn CryptoEngine) -> Result<P
 }
 
 /// Encode, compress and encrypt the base of `cache`'s state.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "used by the segmented index write path, not yet implemented"
-    )
-)]
 pub(crate) fn pack_base(
     cache: &MmapFullIndexCache,
     crypto: &dyn CryptoEngine,
@@ -339,6 +317,20 @@ fn temp_anchor() -> PathBuf {
     std::env::temp_dir().join("vykar-full-index-cache")
 }
 
+/// Where temp files of a full index cache go: beside `path` when its
+/// directory exists or can be created, otherwise in the system temp dir.
+pub(crate) fn cache_anchor(path: Option<&Path>) -> PathBuf {
+    match path {
+        Some(p)
+            if p.parent()
+                .is_some_and(|d| std::fs::create_dir_all(d).is_ok()) =>
+        {
+            p.to_path_buf()
+        }
+        _ => temp_anchor(),
+    }
+}
+
 /// Bring a local full index cache to `head`'s state.
 ///
 /// Readers take no lock, so a fold may delete the objects of the head they
@@ -409,15 +401,7 @@ fn sync_once(
         }
     }
 
-    let anchor = match location.path {
-        Some(p)
-            if p.parent()
-                .is_some_and(|d| std::fs::create_dir_all(d).is_ok()) =>
-        {
-            p.to_path_buf()
-        }
-        _ => temp_anchor(),
-    };
+    let anchor = cache_anchor(location.path);
 
     let downloaded = start.is_none();
     // `prev_tmp` keeps a downloaded base alive while it is mapped.
@@ -519,6 +503,143 @@ fn install(tmp: TempPath, location: &mut CacheLocation<'_>) -> Result<MmapFullIn
     };
     MmapFullIndexCache::open_verified(&path)
         .ok_or_else(|| invalid("index cache failed verification after sync"))
+}
+
+/// [`install`] for a cache written by an index write: persisted over
+/// `path`, or kept as a temp file. Returns the opened cache and the temp
+/// file when it stays one.
+pub(crate) fn install_cache(
+    tmp: TempPath,
+    path: Option<&Path>,
+) -> Result<(MmapFullIndexCache, Option<TempPath>)> {
+    let mut location = CacheLocation {
+        path,
+        scratch: None,
+        use_local: true,
+    };
+    let cache = install(tmp, &mut location)?;
+    Ok((cache, location.scratch))
+}
+
+// ---------------------------------------------------------------------------
+// Garbage collection and salvage
+// ---------------------------------------------------------------------------
+
+/// Names of every object under `index.d/`. Keys that are not object names
+/// (foreign files) are left out, and so never deleted.
+pub(crate) fn list_objects(storage: &dyn StorageBackend) -> Result<Vec<ObjectName>> {
+    let keys = storage.list(INDEX_OBJECT_DIR)?;
+    Ok(keys
+        .iter()
+        .filter(|k| vykar_protocol::is_index_object_key(k))
+        .filter_map(|k| {
+            let hex = k.strip_prefix(INDEX_OBJECT_DIR)?;
+            let bytes: [u8; 32] = hex::decode(hex).ok()?.try_into().ok()?;
+            Some(ObjectName(bytes))
+        })
+        .collect())
+}
+
+/// Delete every `index.d/` object that `head` names neither as live nor
+/// (unless `drop_retired`) as retired. `head: None` deletes them all.
+/// Best-effort per object: a failed delete leaves debris for the next run.
+/// Returns how many were deleted.
+pub(crate) fn collect_garbage(
+    storage: &dyn StorageBackend,
+    head: Option<&IndexHead>,
+    drop_retired: bool,
+) -> Result<usize> {
+    let keep: std::collections::HashSet<ObjectName> = head
+        .map(|h| {
+            let retired = h.retired.iter().copied().filter(|_| !drop_retired);
+            h.live_objects().chain(retired).collect()
+        })
+        .unwrap_or_default();
+    let mut deleted = 0;
+    for name in list_objects(storage)? {
+        if keep.contains(&name) {
+            continue;
+        }
+        match storage.delete(&object_key(&name)) {
+            Ok(()) => deleted += 1,
+            Err(e) => tracing::warn!("failed to delete index object {}: {e}", name.to_hex()),
+        }
+    }
+    Ok(deleted)
+}
+
+/// The latest state of `head`'s chain that can still be read: the base (or
+/// the empty index when it cannot be read), then segments up to the first
+/// that is missing or fails to verify or apply. For `check --repair`, which
+/// rebuilds the index from there. Returns the cache in a temp file and how
+/// many segments were applied.
+pub(crate) fn salvage_chain(
+    storage: &dyn StorageBackend,
+    crypto: &dyn CryptoEngine,
+    head: &IndexHead,
+    anchor: &Path,
+) -> Result<(TempPath, usize)> {
+    let base = head.base.as_ref().and_then(|base_ref| {
+        let bytes = match storage.get(&object_key(&base_ref.name)) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => {
+                tracing::warn!("index base {} is missing", base_ref.name.to_hex());
+                return None;
+            }
+            Err(e) => {
+                tracing::warn!("index base {}: {e}", base_ref.name.to_hex());
+                return None;
+            }
+        };
+        decode_base_to_temp(base_ref, bytes, crypto, anchor)
+            .inspect_err(|e| tracing::warn!("index base {}: {e}", base_ref.name.to_hex()))
+            .ok()
+    });
+    let mut current = match base {
+        Some(tmp) => tmp,
+        None => FullCacheWriter::new_beside(anchor)?
+            .finish(None)?
+            .0
+            .into_temp_path(),
+    };
+    if head.base.is_some() && !base_is(&current, head) {
+        // The base could not be read: later segments do not apply.
+        return Ok((current, 0));
+    }
+    let mut applied = 0;
+    for seg_ref in &head.segments {
+        let step = (|| -> Result<TempPath> {
+            let bytes = storage
+                .get(&object_key(&seg_ref.name))?
+                .ok_or_else(|| invalid("index segment missing"))?;
+            let segment = decode_segment(seg_ref, &bytes, crypto)?;
+            let prev = MmapFullIndexCache::open_verified(&current)
+                .ok_or_else(|| invalid("salvaged index state failed verification"))?;
+            let step = ChainStep {
+                segment: &segment,
+                state_hash_after: seg_ref.state_hash_after,
+                entries_after: seg_ref.entries_after,
+            };
+            Ok(segment::apply_to_temp(&prev, &[step], anchor)?.0)
+        })();
+        match step {
+            Ok(next) => {
+                current = next;
+                applied += 1;
+            }
+            Err(e) => {
+                tracing::warn!("index segment {}: {e}", seg_ref.name.to_hex());
+                break;
+            }
+        }
+    }
+    Ok((current, applied))
+}
+
+/// Whether the cache at `path` holds `head`'s base state.
+fn base_is(path: &Path, head: &IndexHead) -> bool {
+    MmapFullIndexCache::open_verified(path)
+        .is_some_and(|c| (c.state_hash(), u64::from(c.entry_count())) == head.base_state())
 }
 
 #[cfg(test)]

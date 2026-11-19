@@ -28,6 +28,20 @@ pub(crate) fn run_info(config: &VykarConfig, label: Option<&str>) -> CliResult<(
         format!("v{}", stats.format.version()),
     );
     add_kv_row(&mut t1, theme, "Hash", stats.format.chunk_hash().as_str());
+    if let Some(index) = stats.index {
+        add_kv_row(
+            &mut t1,
+            theme,
+            "Index",
+            format!(
+                "{} base, {} segment{} ({})",
+                format_bytes(index.base_bytes),
+                index.segments,
+                if index.segments == 1 { "" } else { "s" },
+                format_bytes(index.segment_bytes),
+            ),
+        );
+    }
     add_kv_row(
         &mut t1,
         theme,

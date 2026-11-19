@@ -11,7 +11,6 @@ use crate::repo::index_store::tests::{entries, index_with, Writer};
 use crate::repo::index_store::INDEX_OBJECT_DIR;
 use crate::repo::{
     derive_plaintext_chunk_id_key, EncryptionMode, OpenOptions, RepoFormat, Repository,
-    WriteSessionOptions,
 };
 use crate::testutil::MemoryBackend;
 use vykar_crypto::key::{EncryptedKey, MasterKey};
@@ -231,27 +230,6 @@ fn uncached_and_static_loads_fetch_the_whole_chain() {
     assert_eq!(index_d_gets(&ops.lock().unwrap()), 2);
 }
 
-/// This version reads but does not write the segmented layout.
-#[test]
-fn index_writes_are_refused() {
-    let env = init(RepoFormat::V5, EncryptionMode::None);
-    env.writer().commit(&index_with(0..10, 0));
-    let (mut repo, _) = env.open_logged(OpenOptions::new().with_index());
-    let err = repo
-        .begin_write_session(&WriteSessionOptions::default())
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("format v5"), "{err}");
-
-    repo.mark_index_dirty();
-    let err = repo.save_state().unwrap_err().to_string();
-    assert!(err.contains("format v5"), "{err}");
-    assert_eq!(
-        env.inner.get("index").unwrap().unwrap()[0],
-        ObjectType::IndexHead as u8
-    );
-}
-
 /// A monolithic blob at `index` of a segmented repository (an old binary
 /// overwrote the head) is named, not misread.
 #[test]
@@ -270,6 +248,7 @@ fn legacy_blob_at_index_is_refused() {
     .expect("refused")
     .to_string();
     assert!(err.contains("monolithic index"), "{err}");
+    assert!(err.contains("check --repair"), "{err}");
 }
 
 /// The key proof accepts a head at `index` as repository-authored data.
@@ -324,4 +303,43 @@ fn plaintext_key_follows_the_chunk_hash() {
         derive_plaintext_chunk_id_key(&id, RepoFormat::V5),
         derive_plaintext_chunk_id_key(&id, RepoFormat::V3)
     );
+}
+
+/// Writes on an encrypted repository: a session's chunks land in a segment
+/// (or a base), and other clients read them back.
+#[test]
+fn encrypted_writes_round_trip() {
+    use crate::compress::Compression;
+    use crate::repo::pack::PackType;
+    use crate::repo::WriteSessionOptions;
+
+    for format in [RepoFormat::V4, RepoFormat::V5] {
+        let mut env = init(format, EncryptionMode::Aes256Gcm);
+        for round in 0..3u8 {
+            env.repo
+                .begin_write_session(&WriteSessionOptions::default())
+                .unwrap();
+            for i in 0..5u8 {
+                env.repo
+                    .store_chunk(&[round, i, 7, 7, 7], Compression::None, PackType::Data)
+                    .unwrap();
+            }
+            env.repo.save_state().unwrap();
+        }
+        let head = env.repo.index_head().unwrap().clone();
+        assert_eq!(head.entries, 15);
+        let (repo, _) = env.open_logged(OpenOptions::new().with_index());
+        assert_eq!(repo.index_head(), Some(&head));
+        assert_eq!(entries(repo.chunk_index()), entries(env.repo.chunk_index()));
+
+        let cold = tempfile::tempdir().unwrap();
+        let repo = Repository::open(
+            Box::new(Arc::clone(&env.inner)),
+            Some("pw"),
+            Some(cold.path().to_path_buf()),
+            OpenOptions::new().with_index(),
+        )
+        .unwrap();
+        assert_eq!(entries(repo.chunk_index()), entries(env.repo.chunk_index()));
+    }
 }

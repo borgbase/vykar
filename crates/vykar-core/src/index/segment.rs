@@ -801,5 +801,245 @@ pub fn diff_to_temp(
     Ok((diff, tmp.into_temp_path()))
 }
 
+// ---------------------------------------------------------------------------
+// Merge: sorted predecessor cache + a backup session's IndexDelta
+// ---------------------------------------------------------------------------
+
+/// Sum-merge of two bump streams, each in chunk-ID order.
+struct MergedBumps<A: Iterator<Item = (ChunkId, u64)>, B: Iterator<Item = (ChunkId, u64)>> {
+    a: std::iter::Peekable<A>,
+    b: std::iter::Peekable<B>,
+}
+
+impl<A, B> Iterator for MergedBumps<A, B>
+where
+    A: Iterator<Item = (ChunkId, u64)>,
+    B: Iterator<Item = (ChunkId, u64)>,
+{
+    type Item = (ChunkId, u64);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        use std::cmp::Ordering;
+        let order = match (self.a.peek(), self.b.peek()) {
+            (None, None) => return None,
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (Some(x), Some(y)) => x.0.as_bytes().cmp(y.0.as_bytes()),
+        };
+        match order {
+            Ordering::Less => self.a.next(),
+            Ordering::Greater => self.b.next(),
+            Ordering::Equal => {
+                let (id, x) = self.a.next()?;
+                let (_, y) = self.b.next()?;
+                Some((id, x + y))
+            }
+        }
+    }
+}
+
+/// A session's new entries in chunk-ID order, one per chunk: duplicates are
+/// summed into the first one's location.
+fn sorted_new_entries(entries: &[super::NewChunkEntry]) -> Vec<FullCacheEntry> {
+    let mut v: Vec<FullCacheEntry> = entries
+        .iter()
+        .map(|e| FullCacheEntry {
+            chunk_id: e.chunk_id,
+            refcount: e.refcount,
+            stored_size: e.stored_size,
+            pack_id: e.pack_id,
+            pack_offset: e.pack_offset,
+        })
+        .collect();
+    v.sort_by(|a, b| a.chunk_id.as_bytes().cmp(b.chunk_id.as_bytes()));
+    v.dedup_by(|later, kept| {
+        let same = later.chunk_id == kept.chunk_id;
+        if same {
+            kept.refcount = kept.refcount.saturating_add(later.refcount);
+        }
+        same
+    });
+    v
+}
+
+/// The segment that applies a backup session's `delta` to `prev`, and the
+/// resulting state written as a full index cache into a temp file beside
+/// `target`.
+///
+/// One merge-walk over four sorted inputs: `prev`, the positional bumps (in
+/// the dedup cache's order, which is chunk-ID order), the keyed bumps, and
+/// the new entries. No map of bumps is built, so `prev` may be a later
+/// state than the one the session started from:
+///
+/// - a new entry already in `prev` (another client committed the chunk
+///   first) becomes a refcount bump,
+/// - a bump whose chunk is in neither `prev` nor the new entries is
+///   [`VykarError::StaleChunksDuringCommit`].
+///
+/// Should the positional bumps turn out not to be in order (a damaged local
+/// dedup cache), all bumps are collected and sorted instead.
+pub fn merge_delta_to_temp(
+    prev: &MmapFullIndexCache,
+    delta: &super::IndexDelta,
+    target: &Path,
+) -> Result<(Diff, TempPath)> {
+    let news = sorted_new_entries(&delta.new_entries);
+    let mut keyed: Vec<(ChunkId, u64)> = delta
+        .refcount_bumps
+        .iter()
+        .filter(|(_, &count)| count > 0)
+        .map(|(id, &count)| (*id, u64::from(count)))
+        .collect();
+    keyed.sort_unstable_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+    let cached = || {
+        delta
+            .cached_bumps
+            .iter()
+            .flat_map(|c| c.iter_nonzero())
+            .map(|(id, count)| (id, u64::from(count)))
+    };
+
+    let merged = MergedBumps {
+        a: cached().peekable(),
+        b: keyed.iter().copied().peekable(),
+    };
+    if let Some(result) = merge_walk(prev, merged, &news, target)? {
+        return Ok(result);
+    }
+
+    tracing::debug!("positional bumps out of chunk-ID order, sorting all bumps");
+    let mut all: Vec<(ChunkId, u64)> = cached().chain(keyed).collect();
+    all.sort_unstable_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+    all.dedup_by(|later, kept| {
+        let same = later.0 == kept.0;
+        if same {
+            kept.1 += later.1;
+        }
+        same
+    });
+    merge_walk(prev, all.into_iter(), &news, target)?
+        .ok_or_else(|| invalid("bumps out of order after sorting"))
+}
+
+/// The next record of [`merge_walk`]: a predecessor entry (with the new
+/// entry for the same chunk, if any), or a new entry alone.
+enum MergeStep<'a> {
+    Old(FullCacheEntry, Option<&'a FullCacheEntry>),
+    New(&'a FullCacheEntry),
+}
+
+/// One pass of [`merge_delta_to_temp`]. `Ok(None)` (temp file deleted) when
+/// `bumps` is not strictly increasing.
+fn merge_walk(
+    prev: &MmapFullIndexCache,
+    bumps: impl Iterator<Item = (ChunkId, u64)>,
+    news: &[FullCacheEntry],
+    target: &Path,
+) -> Result<Option<(Diff, TempPath)>> {
+    use std::cmp::Ordering;
+
+    let add_refs = |base: u32, add: u64| {
+        u32::try_from(u64::from(base) + add).map_err(|_| invalid("refcount exceeds u32"))
+    };
+
+    let mut bumps = bumps.peekable();
+    let mut last_bump: Option<ChunkId> = None;
+    let mut last_old: Option<ChunkId> = None;
+    let mut deltas = Vec::new();
+    let mut new_entries = Vec::new();
+    let mut writer = FullCacheWriter::new_beside(target)?;
+    let prev_count = prev.entry_count() as usize;
+    let mut pos = 0usize;
+    let mut next_new = 0usize;
+
+    loop {
+        let old = (pos < prev_count).then(|| prev.entry_at(pos));
+        let step = match (old, news.get(next_new)) {
+            (None, None) => break,
+            (Some(o), None) => MergeStep::Old(o, None),
+            (None, Some(n)) => MergeStep::New(n),
+            (Some(o), Some(n)) => match o.chunk_id.as_bytes().cmp(n.chunk_id.as_bytes()) {
+                Ordering::Less => MergeStep::Old(o, None),
+                Ordering::Greater => MergeStep::New(n),
+                Ordering::Equal => MergeStep::Old(o, Some(n)),
+            },
+        };
+        let key = match &step {
+            MergeStep::Old(o, _) => o.chunk_id,
+            MergeStep::New(n) => n.chunk_id,
+        };
+
+        // Bumps arrive in key order, so one below `key` targets a chunk in
+        // neither input.
+        let bump = match bumps.peek() {
+            Some(&(id, _)) if last_bump.is_some_and(|l| l.as_bytes() >= id.as_bytes()) => {
+                return Ok(None)
+            }
+            Some(&(id, count)) => match id.as_bytes().cmp(key.as_bytes()) {
+                Ordering::Less => return Err(VykarError::StaleChunksDuringCommit),
+                Ordering::Equal => {
+                    last_bump = Some(id);
+                    bumps.next();
+                    count
+                }
+                Ordering::Greater => 0,
+            },
+            None => 0,
+        };
+
+        match step {
+            MergeStep::Old(mut entry, same_new) => {
+                if last_old.is_some_and(|l| l.as_bytes() >= entry.chunk_id.as_bytes()) {
+                    return Err(invalid("predecessor not strictly sorted"));
+                }
+                last_old = Some(entry.chunk_id);
+                // A new entry another client committed first is a bump.
+                let add = bump + same_new.map_or(0, |n| u64::from(n.refcount));
+                if add > 0 {
+                    entry.refcount = add_refs(entry.refcount, add)?;
+                    deltas.push(RefcountDelta {
+                        position: pos as u32,
+                        delta: add as i64,
+                    });
+                }
+                writer.push(&entry)?;
+                pos += 1;
+                if same_new.is_some() {
+                    next_new += 1;
+                }
+            }
+            MergeStep::New(new) => {
+                let mut entry = *new;
+                entry.refcount = add_refs(entry.refcount, bump)?;
+                if entry.refcount > 0 {
+                    writer.push(&entry)?;
+                    new_entries.push(entry);
+                }
+                next_new += 1;
+            }
+        }
+    }
+    if let Some(&(id, _)) = bumps.peek() {
+        if last_bump.is_some_and(|l| l.as_bytes() >= id.as_bytes()) {
+            return Ok(None);
+        }
+        return Err(VykarError::StaleChunksDuringCommit);
+    }
+
+    let (tmp, state_hash_after, entries_after) = writer.finish(None)?;
+    let diff = Diff {
+        segment: Segment {
+            prev_state_hash: prev.state_hash(),
+            prev_entries: u64::from(prev.entry_count()),
+            deltas,
+            relocations: Vec::new(),
+            new_entries,
+        },
+        state_hash_after,
+        entries_after,
+    };
+    Ok(Some((diff, tmp.into_temp_path())))
+}
+
 #[cfg(test)]
 mod tests;

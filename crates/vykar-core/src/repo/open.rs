@@ -304,6 +304,8 @@ impl Repository {
             local_caches_stale: false,
             index_head,
             index_scratch: None,
+            fold_policy: Default::default(),
+            fold_requested: false,
         })
     }
 
@@ -522,9 +524,17 @@ impl Repository {
         let index_head = match format.index_layout() {
             IndexLayout::Monolithic => None,
             IndexLayout::Segmented => {
-                let head = index_store::fetch_head(storage.as_ref(), crypto.as_ref())?;
-                index_generation = generation_for_state(&head.state_hash);
-                Some(head)
+                match index_store::fetch_head(storage.as_ref(), crypto.as_ref()) {
+                    Ok(head) => {
+                        index_generation = generation_for_state(&head.state_hash);
+                        Some(head)
+                    }
+                    Err(e) if opts.tolerate_broken_index => {
+                        tracing::warn!("the index head cannot be read: {e}");
+                        None
+                    }
+                    Err(e) => return Err(e),
+                }
             }
         };
 
@@ -551,6 +561,8 @@ impl Repository {
             local_caches_stale: false,
             index_head,
             index_scratch: None,
+            fold_policy: Default::default(),
+            fold_requested: false,
         };
         Ok((repo, file_cache_load))
     }

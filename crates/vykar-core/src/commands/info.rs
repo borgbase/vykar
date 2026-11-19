@@ -24,6 +24,16 @@ pub struct InfoStats {
     /// Layout version. Worth showing because users will hold a mix of v2 and
     /// v3 repositories, and the format determines which binaries can read one.
     pub format: RepoFormat,
+    /// Segmented index layout (v4/v5) only.
+    pub index: Option<IndexLayoutStats>,
+}
+
+/// Shape of a segmented index: its base and the segments written since.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexLayoutStats {
+    pub base_bytes: u64,
+    pub segments: usize,
+    pub segment_bytes: u64,
 }
 
 /// Run `vykar info`.
@@ -66,5 +76,10 @@ pub fn run(config: &VykarConfig, passphrase: Option<&str>) -> Result<InfoStats> 
         repo_created: repo.config.created,
         encryption: repo.config.encryption.clone(),
         format: repo.format(),
+        index: repo.index_head().map(|head| IndexLayoutStats {
+            base_bytes: head.base.as_ref().map_or(0, |b| b.size),
+            segments: head.segments.len(),
+            segment_bytes: head.segments.iter().map(|s| s.size).sum(),
+        }),
     })
 }

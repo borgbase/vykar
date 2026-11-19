@@ -35,6 +35,11 @@ pub struct CompactStats {
 
 const STALE_TEMP_FILE_AGE: std::time::Duration = std::time::Duration::from_secs(3600);
 
+/// Client-side repack persists the index once per batch of source packs (by
+/// count or by their bytes) and only then deletes that batch's sources.
+const SAVE_BATCH_PACKS: usize = 64;
+const SAVE_BATCH_BYTES: u64 = 4 << 30;
+
 /// A live blob entry with its location in the source pack.
 struct LiveEntry {
     chunk_id: ChunkId,
@@ -100,7 +105,33 @@ pub(crate) fn run_on_repo(
 }
 
 /// Core compact logic operating on an already-opened repository.
+///
+/// Ends, unless `dry_run`, with the segmented index's upkeep: a fold at the
+/// soft limit, otherwise removal of unreferenced index objects. That also
+/// runs when there was nothing to repack.
 pub fn compact_repo(
+    repo: &mut Repository,
+    threshold: f64,
+    max_repack_size: Option<u64>,
+    dry_run: bool,
+    concurrency: usize,
+    shutdown: Option<&AtomicBool>,
+) -> Result<CompactStats> {
+    let stats = compact_packs(
+        repo,
+        threshold,
+        max_repack_size,
+        dry_run,
+        concurrency,
+        shutdown,
+    )?;
+    if !dry_run {
+        repo.maintain_segmented_index()?;
+    }
+    Ok(stats)
+}
+
+fn compact_packs(
     repo: &mut Repository,
     threshold: f64,
     max_repack_size: Option<u64>,
@@ -315,9 +346,13 @@ pub fn compact_repo(
     // Proactive fence check at Phase 1→Phase 2 boundary.
     repo.check_lock_fence()?;
 
-    // Phase 2: Repack
+    // Phase 2: Repack. Source packs, including empty ones, are deleted per
+    // batch, after the index naming their replacements is persisted, so no
+    // pack is deleted while the index on storage still references it.
     let mut total_repacked_bytes: u64 = 0;
     let pack_target = repo.config.min_pack_size as usize;
+    let mut batch: Vec<&PackAnalysis> = Vec::new();
+    let mut batch_bytes: u64 = 0;
 
     for analysis in &selected {
         check_interrupted(shutdown)?;
@@ -327,12 +362,14 @@ pub fn compact_repo(
                 break;
             }
         }
+        if batch.len() >= SAVE_BATCH_PACKS || batch_bytes >= SAVE_BATCH_BYTES {
+            persist_and_delete(repo, &mut batch, &mut stats)?;
+            batch_bytes = 0;
+        }
 
         if analysis.live_entries.is_empty() {
             info!("Deleting empty pack {}", analysis.pack_id);
-            repo.storage.delete(&analysis.storage_key)?;
-            stats.packs_deleted_empty += 1;
-            stats.space_freed += analysis.total_bytes;
+            batch.push(analysis);
             continue;
         }
 
@@ -416,21 +453,30 @@ pub fn compact_repo(
                 .update_location(chunk_id, new_pack_id, *offset, *stored_size);
         }
 
-        // Save state BEFORE deleting old pack (crash safety)
-        repo.save_state()?;
-
-        repo.storage.delete(&analysis.storage_key)?;
-
         stats.packs_repacked += 1;
-        stats.space_freed += analysis.dead_bytes;
         total_repacked_bytes += analysis.total_bytes;
+        batch_bytes += analysis.total_bytes;
+        batch.push(analysis);
     }
-
-    if stats.packs_repacked > 0 || stats.packs_deleted_empty > 0 {
-        repo.save_state()?;
-    }
+    persist_and_delete(repo, &mut batch, &mut stats)?;
 
     Ok(stats)
+}
+
+/// Persist the index if it changed (crash safety), then delete `batch`'s
+/// source packs and empty the batch.
+fn persist_and_delete(
+    repo: &mut Repository,
+    batch: &mut Vec<&PackAnalysis>,
+    stats: &mut CompactStats,
+) -> Result<()> {
+    if batch.is_empty() {
+        return Ok(());
+    }
+    repo.save_state()?;
+    let err = delete_sources(repo.storage.as_ref(), batch, stats);
+    batch.clear();
+    err.map_or(Ok(()), Err)
 }
 
 /// A pack found by [`list_packs`]; `size` is `None` when the listing did not

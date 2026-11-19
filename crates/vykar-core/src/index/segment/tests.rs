@@ -638,3 +638,199 @@ fn apply_unchecked(
     let (tmp, hash, count) = w.finish(None)?;
     Ok((tmp.into_temp_path(), hash, count))
 }
+
+// ---------------------------------------------------------------------------
+// merge_delta_to_temp
+// ---------------------------------------------------------------------------
+
+mod merge {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::index::dedup_cache::{build_dedup_cache_to_path, MmapDedupCache};
+    use crate::index::IndexDelta;
+
+    /// A delta whose positional bumps index a dedup cache of `session_start`.
+    fn delta_over(session_start: &ChunkIndex, dir: &Path) -> IndexDelta {
+        let path = dir.join("dedup");
+        build_dedup_cache_to_path(session_start, 1, &path).unwrap();
+        IndexDelta::with_cached_bumps(Arc::new(MmapDedupCache::open_path(&path, 1).unwrap()))
+    }
+
+    fn bump_by_position(delta: &mut IndexDelta, chunk: ChunkId) {
+        let (position, _) = delta
+            .cached_bumps
+            .as_ref()
+            .unwrap()
+            .cache()
+            .find_with_position(&chunk)
+            .unwrap();
+        delta.bump_cached_refcount(&chunk, position);
+    }
+
+    fn new_entry(delta: &mut IndexDelta, e: FullCacheEntry) {
+        delta.add_new_entry(
+            e.chunk_id,
+            e.stored_size,
+            e.pack_id,
+            e.pack_offset,
+            e.refcount,
+        );
+    }
+
+    /// The delta applied to `prev` by key, as the monolithic path does.
+    fn expected(prev: &ChunkIndex, delta: IndexDelta) -> ChunkIndex {
+        let mut index = prev.clone();
+        delta.reconcile(prev).unwrap().apply_to(&mut index);
+        index
+    }
+
+    /// Merge `delta` over `prev_index` and check the written state equals
+    /// the keyed result, and that the segment reproduces it.
+    fn check(prev_index: &ChunkIndex, delta: IndexDelta, dir: &Path) -> Diff {
+        let prev = write_cache(prev_index, dir, "prev");
+        let (diff, tmp) = merge_delta_to_temp(&prev, &delta, &target(dir)).unwrap();
+        let written = MmapFullIndexCache::open_verified(&tmp).unwrap();
+        assert_eq!(
+            sorted(&chunk_index_from_full_cache(&written)),
+            sorted(&expected(prev_index, delta))
+        );
+        assert_eq!(diff.state_hash_after, written.state_hash());
+        assert_eq!(
+            Segment::decode(&diff.segment.encode()).unwrap(),
+            diff.segment
+        );
+        let (applied, hash, _) = apply_to_temp(&prev, &[diff.step()], &target(dir)).unwrap();
+        assert_eq!(hash, diff.state_hash_after);
+        assert_eq!(
+            std::fs::read(&applied).unwrap(),
+            std::fs::read(&tmp).unwrap()
+        );
+        diff
+    }
+
+    fn base_entries() -> Vec<FullCacheEntry> {
+        (1..=8)
+            .map(|b| entry(id(b * 10), 1, 1, u64::from(b)))
+            .collect()
+    }
+
+    /// Positional, keyed and new-entry inputs together, against the state
+    /// the session started from.
+    #[test]
+    fn all_inputs_against_the_session_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let prev = index_from(&base_entries());
+        let mut delta = delta_over(&prev, dir.path());
+        bump_by_position(&mut delta, id(10));
+        bump_by_position(&mut delta, id(10));
+        bump_by_position(&mut delta, id(50));
+        delta.bump_refcount(&id(50));
+        new_entry(&mut delta, entry(id(15), 1, 3, 0));
+        new_entry(&mut delta, entry(id(85), 2, 3, 100));
+        // A keyed bump on a session-new chunk is not stale.
+        delta.bump_refcount(&id(15));
+
+        let diff = check(&prev, delta, dir.path());
+        assert_eq!(
+            diff.segment.deltas,
+            vec![
+                RefcountDelta {
+                    position: 0,
+                    delta: 2
+                },
+                RefcountDelta {
+                    position: 4,
+                    delta: 2
+                },
+            ]
+        );
+        assert_eq!(diff.segment.new_entries.len(), 2);
+        assert_eq!(diff.segment.new_entries[0].refcount, 2);
+    }
+
+    /// The head moved during the session: positions index the session's
+    /// dedup cache, not `prev`, and a new entry another client committed
+    /// first becomes a bump.
+    #[test]
+    fn head_moved_during_the_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let start = index_from(&base_entries());
+        let mut delta = delta_over(&start, dir.path());
+        bump_by_position(&mut delta, id(30));
+        bump_by_position(&mut delta, id(80));
+        new_entry(&mut delta, entry(id(35), 1, 3, 0));
+        new_entry(&mut delta, entry(id(5), 1, 3, 10));
+
+        // Another client committed id(35) and id(1), and bumped id(80).
+        let mut moved = start.clone();
+        moved.add(id(35), 99, pack(4), 0);
+        moved.add(id(1), 99, pack(4), 100);
+        moved.increment_refcount(&id(80));
+
+        let diff = check(&moved, delta, dir.path());
+        assert_eq!(diff.segment.new_entries.len(), 1, "only id(5) is new");
+        assert_eq!(diff.segment.new_entries[0].chunk_id, id(5));
+        assert_eq!(diff.segment.deltas.len(), 3);
+    }
+
+    /// Duplicate new entries are summed into the first one's location.
+    #[test]
+    fn duplicate_new_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let prev = index_from(&base_entries());
+        let mut delta = IndexDelta::new();
+        new_entry(&mut delta, entry(id(12), 1, 3, 0));
+        new_entry(&mut delta, entry(id(12), 2, 4, 50));
+        let prev_cache = write_cache(&prev, dir.path(), "prev");
+        let (diff, _) = merge_delta_to_temp(&prev_cache, &delta, &target(dir.path())).unwrap();
+        assert_eq!(diff.segment.new_entries, vec![entry(id(12), 3, 3, 0)]);
+    }
+
+    /// A bump whose chunk is in neither the index nor the new entries means
+    /// the chunk was deleted during the session.
+    #[test]
+    fn stale_bumps_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let start = index_from(&base_entries());
+        let mut pruned = start.clone();
+        pruned.decrement(&id(40));
+        pruned.decrement(&id(80));
+        let prev = write_cache(&pruned, dir.path(), "prev");
+
+        for victim in [id(40), id(80)] {
+            let mut delta = delta_over(&start, dir.path());
+            bump_by_position(&mut delta, victim);
+            let err = merge_delta_to_temp(&prev, &delta, &target(dir.path())).unwrap_err();
+            assert!(matches!(err, VykarError::StaleChunksDuringCommit), "{err}");
+
+            let mut delta = IndexDelta::new();
+            delta.bump_refcount(&victim);
+            let err = merge_delta_to_temp(&prev, &delta, &target(dir.path())).unwrap_err();
+            assert!(matches!(err, VykarError::StaleChunksDuringCommit), "{err}");
+        }
+    }
+
+    /// Refcounts beyond u32 are an error, not a wrap.
+    #[test]
+    fn refcount_overflow_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let prev = write_cache(
+            &index_from(&[entry(id(1), u32::MAX, 1, 0)]),
+            dir.path(),
+            "prev",
+        );
+        let mut delta = IndexDelta::new();
+        delta.bump_refcount(&id(1));
+        assert!(merge_delta_to_temp(&prev, &delta, &target(dir.path())).is_err());
+    }
+
+    /// An empty delta changes nothing.
+    #[test]
+    fn empty_delta_is_an_empty_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let prev = index_from(&base_entries());
+        let diff = check(&prev, IndexDelta::new(), dir.path());
+        assert!(diff.segment.is_empty());
+    }
+}

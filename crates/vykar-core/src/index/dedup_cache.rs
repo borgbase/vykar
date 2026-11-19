@@ -1182,6 +1182,26 @@ pub fn build_full_index_cache_to_path(
     Ok(())
 }
 
+/// `index` as a full index cache in a temp file beside `target`, generation
+/// derived from its state. Entries at refcount 0 are left out, as a segment
+/// diff treats them (see [`crate::index::segment::diff_to_temp`]).
+pub(crate) fn full_cache_from_index_to_temp(index: &ChunkIndex, target: &Path) -> Result<TempPath> {
+    let mut entries: Vec<(&ChunkId, &crate::index::ChunkIndexEntry)> =
+        index.iter().filter(|(_, e)| e.refcount > 0).collect();
+    entries.sort_unstable_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+    let mut w = FullCacheWriter::new_beside(target)?;
+    for (id, e) in entries {
+        w.push(&FullCacheEntry {
+            chunk_id: *id,
+            refcount: e.refcount,
+            stored_size: e.stored_size,
+            pack_id: e.pack_id,
+            pack_offset: e.pack_offset,
+        })?;
+    }
+    Ok(w.finish(None)?.0.into_temp_path())
+}
+
 /// Two-pointer merge of an existing full cache with a sorted IndexDelta.
 /// Produces a new cache file at `out_path` with the given generation.
 /// O(buffer) heap — no HashMap materialization in the normal case.

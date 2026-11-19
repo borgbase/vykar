@@ -368,9 +368,11 @@ pub fn run_with_repair(
         let (mut repo, _session_guard) = crate::commands::util::open_repo_with_read_session(
             config,
             passphrase,
-            OpenOptions::new().skip_key_backfill(),
+            OpenOptions::new()
+                .skip_key_backfill()
+                .tolerate_broken_index(),
         )?;
-        repo.load_chunk_index_uncached()?;
+        repo.load_chunk_index_for_repair()?;
         repo.refresh_snapshot_list()?;
 
         let scan = integrity_scan(&mut repo, config, &scan_opts, &mut progress, shutdown)?;
@@ -397,9 +399,9 @@ pub fn run_with_repair(
         crate::commands::util::with_open_repo_maintenance_lock(
             config,
             passphrase,
-            OpenOptions::new(),
+            OpenOptions::new().tolerate_broken_index(),
             |repo| {
-                repo.load_chunk_index_uncached()?;
+                repo.load_chunk_index_for_repair()?;
                 repo.refresh_snapshot_list()?;
 
                 let scan = integrity_scan(repo, config, &scan_opts, &mut progress, shutdown)?;

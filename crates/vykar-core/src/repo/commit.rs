@@ -14,6 +14,7 @@ use super::{IndexLayout, RepoFormat, Repository, INDEX_OBJECT_CONTEXT};
 use crate::compress;
 use crate::index::dedup_cache;
 use crate::index::head::IndexHead;
+use crate::index::segment;
 use crate::index::{ChunkIndex, IndexBlob, IndexBlobRef, IndexDelta};
 use vykar_crypto::CryptoEngine;
 use vykar_types::error::{Result, VykarError};
@@ -48,6 +49,13 @@ fn log_stage_elapsed(ctx: (std::time::Instant, &'static str)) {
         elapsed_ms = ctx.0.elapsed().as_millis() as u64,
         "commit stage complete"
     );
+}
+
+/// The index read at the start of a backup commit, concurrently with the
+/// snapshot refresh.
+enum PrefetchedIndex {
+    Monolithic(Result<IndexObject>),
+    Segmented(Result<IndexHead>),
 }
 
 /// Where an index built for open or a maintenance load came from (logged;
@@ -168,18 +176,6 @@ impl Repository {
         self.format.index_layout() == IndexLayout::Segmented
     }
 
-    /// Refuse index writes this version cannot make yet: the segmented
-    /// layout is read-only here.
-    pub(super) fn ensure_index_writable(&self) -> Result<()> {
-        if self.is_segmented() {
-            return Err(VykarError::Other(format!(
-                "this version of vykar can read, but not write, format v{} repositories",
-                self.format.version()
-            )));
-        }
-        Ok(())
-    }
-
     /// Segmented layout: bring the local full index cache to `head`, or to
     /// a freshly read head. `use_local: false` ignores and leaves alone the
     /// local cache (the result lives in a temp file), so every object of the
@@ -213,7 +209,13 @@ impl Repository {
             head,
             location,
             self.request_width(),
-        )?;
+        )
+        .map_err(|e| match e {
+            VykarError::InvalidFormat(msg) => VykarError::InvalidFormat(format!(
+                "{msg}; run `vykar check --repair` to rebuild the index"
+            )),
+            e => e,
+        })?;
         debug!(
             source = ?synced.source,
             entries = synced.head.entries,
@@ -329,7 +331,18 @@ impl Repository {
         let mut deferred_index_load = false;
 
         if let Some(delta) = delta {
-            if !delta.is_empty() {
+            if !delta.is_empty() && self.is_segmented() {
+                // The head as storage holds it now, from the local full
+                // cache where it can be; the write then diffs against it.
+                // Without a head (`check --repair` rebuilding the index) the
+                // loaded index is the one to extend.
+                if self.index_head.is_some() {
+                    let synced = self.sync_index(None, true)?;
+                    self.install_synced_index(synced);
+                }
+                delta.apply_to(&mut self.chunk_index);
+                self.index_dirty = true;
+            } else if !delta.is_empty() {
                 // Download fresh remote index and apply delta.
                 // No reconcile() needed: callers use with_maintenance_lock()
                 // which guarantees no concurrent sessions are active.
@@ -404,15 +417,15 @@ impl Repository {
         };
 
         // When the index changes, rotate index_generation so the local dedup
-        // cache is invalidated.
+        // cache is invalidated. The segmented layout derives it from the new
+        // state, and leaves the local full cache at that state.
         let persisted = self.index_dirty;
         if persisted {
-            self.index_generation = rand::rng().next_u64();
-            self.persist_index()?;
+            self.persist_dirty_index()?;
         }
 
         if self.rebuild_dedup_cache {
-            self.rebuild_local_caches(false);
+            self.rebuild_local_caches(persisted && self.is_segmented());
             self.rebuild_dedup_cache = false;
             self.local_caches_stale = false;
         } else if persisted {
@@ -428,12 +441,9 @@ impl Repository {
         if deferred_index_load {
             // Try local full_index_cache first (fast, no storage round-trip),
             // fall back to reloading from remote storage if cache is unavailable.
-            self.chunk_index = dedup_cache::load_chunk_index_from_full_cache(
-                &self.config.id,
-                self.index_generation,
-                self.cache_dir_override.as_deref(),
-            )
-            .or_else(|_| self.reload_full_index())?;
+            self.chunk_index = self
+                .chunk_index_from_local_cache()
+                .or_else(|_| self.reload_full_index())?;
         }
 
         self.join_index_sidecar_write();
@@ -494,6 +504,7 @@ impl Repository {
         let crypto = self.crypto.as_ref();
         let repo_id = self.config.id.as_slice();
         let cache_dir = self.cache_dir_override.as_deref();
+        let segmented = self.is_segmented();
         let ctx = emit_stage(progress, "refresh snapshots");
         let (side, prefetched) = std::thread::scope(|scope| {
             let side = taken.is_ok().then(|| {
@@ -508,8 +519,15 @@ impl Repository {
                     (refresh, marker)
                 })
             });
-            let prefetched = fetch_index
-                .then(|| super::index_fetch::fetch_index_object(storage, repo_id, cache_dir));
+            let prefetched = fetch_index.then(|| {
+                if segmented {
+                    PrefetchedIndex::Segmented(index_store::fetch_head(storage, crypto))
+                } else {
+                    PrefetchedIndex::Monolithic(super::index_fetch::fetch_index_object(
+                        storage, repo_id, cache_dir,
+                    ))
+                }
+            });
             (side.map(join_scoped), prefetched)
         });
         log_stage_elapsed(ctx);
@@ -591,7 +609,7 @@ impl Repository {
         &mut self,
         snapshot_entry: &manifest::SnapshotEntry,
         delta: Option<IndexDelta>,
-        prefetched: Option<Result<IndexObject>>,
+        prefetched: Option<PrefetchedIndex>,
         progress: &mut Option<impl FnMut(crate::commands::backup::BackupProgressEvent)>,
     ) -> Result<bool> {
         // 4. Check snapshot name uniqueness against fresh list.
@@ -604,11 +622,22 @@ impl Repository {
         // 5. Download fresh remote index, reconcile delta, persist index.
         let mut deferred_chunk_index_hydrate = false;
         if let Some(delta) = delta {
-            if !delta.is_empty() {
+            if self.is_segmented() {
+                if !delta.is_empty() {
+                    let head = match prefetched {
+                        Some(PrefetchedIndex::Segmented(head)) => head?,
+                        _ => index_store::fetch_head(self.storage.as_ref(), self.crypto.as_ref())?,
+                    };
+                    self.segmented_commit(head, delta, progress)?;
+                }
+                // The local full cache is at the index state; the in-memory
+                // index is rebuilt from it after the commit point.
+                deferred_chunk_index_hydrate = true;
+            } else if !delta.is_empty() {
                 let ctx = emit_stage(progress, "fetch index");
                 let object = match prefetched {
-                    Some(fetched) => fetched?,
-                    None => super::index_fetch::fetch_index_object(
+                    Some(PrefetchedIndex::Monolithic(fetched)) => fetched?,
+                    _ => super::index_fetch::fetch_index_object(
                         self.storage.as_ref(),
                         &self.config.id,
                         self.cache_dir_override.as_deref(),
@@ -696,11 +725,58 @@ impl Repository {
         // Defensive: persist index if dirty but no delta (unreachable today
         // because backup always activates dedup mode, but guards future callers).
         if self.index_dirty {
-            self.index_generation = rand::rng().next_u64();
-            self.persist_index()?;
+            self.persist_dirty_index()?;
         }
 
         Ok(deferred_chunk_index_hydrate)
+    }
+
+    /// Segmented layout: bring the local full cache to `head` (normally
+    /// already there), merge-walk the session's `delta` over it into the next
+    /// state and its segment while the session's packs are verified, and
+    /// publish. The snapshot PUT that follows remains the commit point.
+    fn segmented_commit(
+        &mut self,
+        head: IndexHead,
+        delta: IndexDelta,
+        progress: &mut Option<impl FnMut(crate::commands::backup::BackupProgressEvent)>,
+    ) -> Result<()> {
+        let ctx = emit_stage(progress, "fetch index");
+        let synced = self.sync_index(Some(head), true)?;
+        log_stage_elapsed(ctx);
+        let SyncedIndex {
+            head,
+            cache,
+            scratch,
+            ..
+        } = synced;
+        self.index_scratch = scratch;
+        let anchor = index_store::cache_anchor(self.full_cache_path().as_deref());
+
+        let ctx = emit_stage(progress, "reconcile");
+        let pack_ids = Self::delta_pack_ids(&delta);
+        let persisted_packs = self.persisted_pack_count();
+        let width = self.request_width();
+        let storage = self.storage.as_ref();
+        let (verified, merged) = std::thread::scope(|scope| {
+            let verify = scope.spawn(|| {
+                super::pack_verify::verify_packs_present(storage, &pack_ids, persisted_packs, width)
+            });
+            let merged = segment::merge_delta_to_temp(&cache, &delta, &anchor);
+            (join_scoped(verify), merged)
+        });
+        // Unmap the predecessor before its file is replaced (Windows).
+        drop(cache);
+        drop(delta);
+        // A stale bump is the typed error callers retry on; report it first.
+        let (diff, next) = merged?;
+        verified?;
+        log_stage_elapsed(ctx);
+
+        let ctx = emit_stage(progress, "write index");
+        self.publish_index_state(Some(head), Some(diff), next)?;
+        log_stage_elapsed(ctx);
+        Ok(())
     }
 
     /// Post-commit best-effort work. The `-> ()` return type is load-bearing:
@@ -783,13 +859,7 @@ impl Repository {
         &mut self,
         progress: &mut Option<impl FnMut(crate::commands::backup::BackupProgressEvent)>,
     ) {
-        let cd = self.cache_dir_override.as_deref();
-        match dedup_cache::load_chunk_index_from_full_cache(
-            &self.config.id,
-            self.index_generation,
-            cd,
-        )
-        .or_else(|e| {
+        match self.chunk_index_from_local_cache().or_else(|e| {
             warn!("fast path: local cache hydration failed ({e}), reloading from remote");
             self.reload_full_index()
         }) {
@@ -837,6 +907,15 @@ impl Repository {
             .map_or(0, |ws| ws.persisted_pack_count)
     }
 
+    /// Persist the dirty in-memory index in the repository's layout.
+    fn persist_dirty_index(&mut self) -> Result<()> {
+        if self.is_segmented() {
+            return self.persist_segmented_index();
+        }
+        self.index_generation = rand::rng().next_u64();
+        self.persist_index()
+    }
+
     /// Serialize, encrypt, and write the IndexBlob (generation + chunks) to storage.
     /// Also writes the advisory `index.gen` sidecar and caches the raw encrypted
     /// blob locally for the fast-path commit on the next backup run.
@@ -870,7 +949,6 @@ impl Repository {
     /// raw-blob cache that the next run's fast path compares against. Only
     /// the `index` PUT is fatal — the sidecar and the cache are best-effort.
     fn put_index_blob(&mut self, index_packed: &[u8], generation: u64) -> Result<()> {
-        self.ensure_index_writable()?;
         self.join_index_sidecar_write();
         self.check_lock_fence()?;
         self.storage.put("index", index_packed)?;
@@ -932,7 +1010,8 @@ impl Repository {
             return;
         }
         let start = std::time::Instant::now();
-        self.rebuild_local_caches(false);
+        // A segmented write leaves the full cache at the new state.
+        self.rebuild_local_caches(self.is_segmented());
         self.local_caches_stale = false;
         debug!(
             elapsed_ms = start.elapsed().as_millis() as u64,

@@ -167,7 +167,7 @@ fn prepare_rewrite(
     action_idx: usize,
 ) -> Result<PreparedRewrite> {
     use crate::commands::backup::{
-        append_item_to_stream, flush_item_stream_chunk, items_chunker_config,
+        append_item_to_stream, flush_item_stream_chunk, ItemStreamCutter,
     };
 
     let drop: HashSet<usize> = item_indices.iter().copied().collect();
@@ -175,7 +175,7 @@ fn prepare_rewrite(
     let old_meta: SnapshotMeta = load_snapshot_meta(repo, snapshot_name)?;
     let old_stream = load_snapshot_item_stream(repo, snapshot_name, None)?;
 
-    let chunker = items_chunker_config();
+    let cutter = ItemStreamCutter::new(repo.crypto.chunk_hasher());
     let compression = Compression::default();
 
     let mut new_item_ptrs: Vec<ChunkId> = Vec::new();
@@ -201,7 +201,7 @@ fn prepare_rewrite(
             &mut buf,
             &mut new_item_ptrs,
             &item,
-            &chunker,
+            &cutter,
             compression,
         )
     })?;
@@ -637,5 +637,72 @@ mod tests {
     fn probe_deletes_allowed_false_for_forbidden_backend() {
         let backend = ForbiddenDeleteBackend;
         assert!(!probe_deletes_allowed(&backend));
+    }
+
+    /// The listing rewriter cuts tree chunks with the same rule as backup.
+    ///
+    /// The cut key derives from the fresh repository's chunk-ID key, so cut
+    /// positions differ between runs. The bounds have margin; a failure should
+    /// be investigated, not fixed by loosening a bound.
+    #[test]
+    fn repair_rewrite_cuts_like_backup() {
+        use crate::repo::format::unpack_object_expect_with_context;
+        use crate::tests::helpers::{backup_single_source, init_repo, open_local_repo};
+        use crate::tests::tree_cut::make_tree_cut_source;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_dir = tmp.path().join("repo");
+        let source_dir = tmp.path().join("source");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        let mut config = init_repo(&repo_dir);
+        config.xattrs.enabled = false;
+        make_tree_cut_source(&source_dir);
+        backup_single_source(&config, &source_dir, "src", "snap1");
+
+        let mut repo = open_local_repo(&repo_dir);
+        let old_meta = load_snapshot_meta(&repo, "snap1").unwrap();
+        assert!(
+            old_meta.item_ptrs.len() >= 8,
+            "only {} tree chunks",
+            old_meta.item_ptrs.len()
+        );
+        let mut nitems = 0usize;
+        let stream = load_snapshot_item_stream(&mut repo, "snap1", None).unwrap();
+        for_each_decoded_item(&stream, |_| {
+            nitems += 1;
+            Ok(())
+        })
+        .unwrap();
+
+        repo.begin_write_session(&WriteSessionOptions::default())
+            .unwrap();
+        let id = repo.manifest().find_snapshot("snap1").unwrap().id;
+        let mut rewrite = |drop: &[usize]| -> SnapshotMeta {
+            let rw = prepare_rewrite(&mut repo, id, "snap1", drop, 0).unwrap();
+            let bytes = unpack_object_expect_with_context(
+                &rw.new_packed,
+                ObjectType::SnapshotMeta,
+                rw.new_id.as_bytes(),
+                repo.crypto.as_ref(),
+            )
+            .unwrap();
+            rmp_serde::from_slice(&bytes).unwrap()
+        };
+
+        let same = rewrite(&[]);
+        assert_eq!(same.item_ptrs, old_meta.item_ptrs);
+
+        let dropped = rewrite(&[nitems / 2]);
+        let old: HashSet<&ChunkId> = old_meta.item_ptrs.iter().collect();
+        let new = dropped
+            .item_ptrs
+            .iter()
+            .filter(|id| !old.contains(id))
+            .count();
+        assert!(
+            (1..=3).contains(&new),
+            "{new} of {} tree chunks new after dropping one item",
+            dropped.item_ptrs.len()
+        );
     }
 }

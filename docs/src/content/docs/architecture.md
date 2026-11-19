@@ -608,10 +608,10 @@ Everything is written inside the staging directory, so a failed restore leaves t
 Snapshot metadata (the list of files, directories, and symlinks) is **not** stored as a single monolithic blob. Instead:
 
 1. Items are serialized one-by-one as msgpack and appended to an in-memory buffer
-2. When the buffer reaches ~128 KiB, it is chunked and stored as a **tree pack** chunk (with a finer CDC config: 32 KiB min / 128 KiB avg / 512 KiB max)
+2. After each entry, the buffer is stored as a **tree pack** chunk if it holds at least 8 KiB and a keyed BLAKE3 hash of the entry's path falls under a threshold proportional to the entry's encoded size (about 32 KiB per chunk on average), or once it reaches 128 KiB. Chunks always hold whole entries
 3. The resulting `ChunkId` values are collected into `item_ptrs` in the `SnapshotMeta`
 
-This design means the item stream benefits from deduplication — if most files are unchanged between backups, the item-stream chunks are mostly identical and deduplicated away.
+Because the entry, not its offset, decides where a chunk ends, an inserted or removed entry changes only the chunk(s) around it, and the unchanged parts of the listing deduplicate across snapshots. `check --repair` rewrites listings with the same rule.
 
 Command dumps participate in this same item stream. A source with `command_dumps` produces a synthetic `vykar-dumps/` directory entry plus one regular-file `Item` per dump, so restores treat dump output like ordinary files.
 

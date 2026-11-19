@@ -4,7 +4,6 @@ use std::sync::Arc;
 
 use tracing::warn;
 
-use crate::config::ChunkerConfig;
 use crate::platform::fs;
 use crate::repo::file_cache::{CachedChunks, FileCache, ParentReuseIndex, RetainedHit};
 use crate::snapshot::item::{Item, ItemRawNames, ItemType};
@@ -15,15 +14,6 @@ use super::source::ResolvedSource;
 
 mod inode_walk;
 pub(super) use inode_walk::{InodeSortedWalk, WalkEvent, WalkedEntry};
-
-/// Items chunker config — finer granularity for the item metadata stream.
-pub(crate) fn items_chunker_config() -> ChunkerConfig {
-    ChunkerConfig {
-        min_size: 32 * 1024,  // 32 KiB
-        avg_size: 128 * 1024, // 128 KiB
-        max_size: 512 * 1024, // 512 KiB
-    }
-}
 
 pub(crate) fn build_explicit_excludes(
     source: &Path,

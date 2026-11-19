@@ -11,7 +11,6 @@
 use tracing::debug;
 
 use crate::compress::Compression;
-use crate::config::ChunkerConfig;
 use crate::index::dedup_cache::DedupPrefilter;
 use crate::repo::file_cache::{CachedChunks, FileCache};
 use crate::repo::Repository;
@@ -23,7 +22,7 @@ use super::super::commit::{commit_cache_hit, process_worker_chunks};
 use super::super::concurrency::ByteBudget;
 use super::super::{
     append_item_to_stream, emit_progress, emit_stats_progress, stamp_item_metadata,
-    BackupProgressEvent, FileStatus,
+    BackupProgressEvent, FileStatus, ItemStreamCutter,
 };
 use super::segmentation::{validate_segment_accum, LargeFileAccum};
 use super::ProcessedEntry;
@@ -35,7 +34,7 @@ pub(super) fn consume_processed_entry(
     repo: &mut Repository,
     stats: &mut SnapshotStats,
     new_file_cache: &mut FileCache,
-    items_config: &ChunkerConfig,
+    item_cutter: &ItemStreamCutter,
     item_stream: &mut Vec<u8>,
     item_ptrs: &mut Vec<ChunkId>,
     compression: Compression,
@@ -93,7 +92,7 @@ pub(super) fn consume_processed_entry(
                 item_stream,
                 item_ptrs,
                 &item,
-                items_config,
+                item_cutter,
                 compression,
             )?;
 
@@ -196,7 +195,7 @@ pub(super) fn consume_processed_entry(
                     item_stream,
                     item_ptrs,
                     &accum.item,
-                    items_config,
+                    item_cutter,
                     compression,
                 )?;
 
@@ -245,7 +244,7 @@ pub(super) fn consume_processed_entry(
                 item_stream,
                 item_ptrs,
                 &item,
-                items_config,
+                item_cutter,
                 compression,
             )?;
 
@@ -270,7 +269,7 @@ pub(super) fn consume_processed_entry(
                 item_stream,
                 item_ptrs,
                 &item,
-                items_config,
+                item_cutter,
                 compression,
             )?;
         }

@@ -9,7 +9,7 @@ use tracing::{info, warn};
 
 use crate::chunker;
 use crate::compress::Compression;
-use crate::config::{ChunkerConfig, CommandDump};
+use crate::config::CommandDump;
 use crate::platform::shell;
 use crate::repo::pack::PackType;
 use crate::repo::Repository;
@@ -20,7 +20,7 @@ use vykar_types::error::{Result, VykarError};
 
 use super::{
     append_item_to_stream, emit_progress, emit_stats_progress, with_rollback_checkpoint,
-    BackupProgressEvent,
+    BackupProgressEvent, ItemStreamCutter,
 };
 
 /// Default timeout for command_dump execution (1 hour).
@@ -239,7 +239,7 @@ pub(super) fn process_command_dumps(
     repo: &mut Repository,
     command_dumps: &[CommandDump],
     compression: Compression,
-    items_config: &ChunkerConfig,
+    item_cutter: &ItemStreamCutter,
     item_stream: &mut Vec<u8>,
     item_ptrs: &mut Vec<ChunkId>,
     stats: &mut SnapshotStats,
@@ -273,7 +273,7 @@ pub(super) fn process_command_dumps(
         item_stream,
         item_ptrs,
         &dumps_dir_item,
-        items_config,
+        item_cutter,
         compression,
     )?;
 
@@ -325,7 +325,7 @@ pub(super) fn process_command_dumps(
             item_stream,
             item_ptrs,
             &dump_item,
-            items_config,
+            item_cutter,
             compression,
         )?;
 

@@ -28,4 +28,5 @@ mod prune_command;
 mod repair;
 mod repo;
 mod restore_cancel;
+pub(crate) mod tree_cut;
 mod util_lock;

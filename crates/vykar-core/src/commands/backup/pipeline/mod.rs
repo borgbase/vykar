@@ -17,7 +17,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::compress::Compression;
-use crate::config::ChunkerConfig;
 use crate::index::dedup_cache::DedupPrefilter;
 use crate::limits::ByteRateLimiter;
 use crate::platform::fs;
@@ -31,7 +30,7 @@ use vykar_types::error::{Result, VykarError};
 use super::concurrency::ByteBudget;
 use super::source::ResolvedSource;
 use super::walk::{build_walk_iter, reserve_budget, DatalessKind, WalkEntry};
-use super::BackupProgressEvent;
+use super::{BackupProgressEvent, ItemStreamCutter};
 
 mod consumer;
 mod segmentation;
@@ -252,7 +251,7 @@ pub(crate) struct PipelineCtx<'a> {
     pub num_workers: usize,
     pub readahead_depth: usize,
     pub segment_size: u64,
-    pub items_config: &'a ChunkerConfig,
+    pub item_cutter: &'a ItemStreamCutter,
     pub pipeline_buffer_bytes: usize,
     pub prefilter: Option<&'a DedupPrefilter>,
     pub shutdown: Option<&'a AtomicBool>,
@@ -299,7 +298,7 @@ pub(crate) fn run_parallel_pipeline(
         num_workers,
         readahead_depth,
         segment_size,
-        items_config,
+        item_cutter,
         pipeline_buffer_bytes,
         prefilter,
         shutdown,
@@ -609,7 +608,7 @@ pub(crate) fn run_parallel_pipeline(
                             repo,
                             stats,
                             new_file_cache,
-                            items_config,
+                            item_cutter,
                             item_stream,
                             item_ptrs,
                             compression,

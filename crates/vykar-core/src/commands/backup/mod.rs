@@ -3,6 +3,7 @@ mod command_dump;
 mod commit;
 mod concurrency;
 mod drift;
+mod item_cut;
 mod phases;
 pub(crate) mod pipeline;
 mod sequential;
@@ -19,7 +20,7 @@ use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 use crate::compress::Compression;
-use crate::config::{ChunkerConfig, CommandDump, ResourceLimitsConfig, VykarConfig};
+use crate::config::{CommandDump, ResourceLimitsConfig, VykarConfig};
 
 use crate::limits;
 use crate::platform::fs;
@@ -35,7 +36,7 @@ use vykar_storage::{BackendProfile, StorageBackend};
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
 
-pub(crate) use walk::items_chunker_config;
+pub(crate) use item_cut::ItemStreamCutter;
 
 /// Normalize a relative path to always use `/` as the separator.
 ///
@@ -161,11 +162,13 @@ pub(crate) fn append_item_to_stream(
     item_stream: &mut Vec<u8>,
     item_ptrs: &mut Vec<ChunkId>,
     item: &Item,
-    items_config: &ChunkerConfig,
+    cutter: &ItemStreamCutter,
     compression: Compression,
 ) -> Result<()> {
+    let start = item_stream.len();
     rmp_serde::encode::write(item_stream, item)?;
-    if item_stream.len() >= items_config.avg_size as usize {
+    let entry_len = item_stream.len() - start;
+    if cutter.should_cut(&item.path, entry_len, item_stream.len()) {
         flush_item_stream_chunk(repo, item_stream, item_ptrs, compression)?;
     }
     Ok(())

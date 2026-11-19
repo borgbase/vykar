@@ -7,7 +7,6 @@ use tracing::debug;
 use crate::commands::util::check_interrupted;
 
 use crate::compress::Compression;
-use crate::config::ChunkerConfig;
 use crate::index::dedup_cache::DedupPrefilter;
 use crate::limits::ByteRateLimiter;
 use crate::platform::fs;
@@ -26,7 +25,7 @@ use super::source::ResolvedSource;
 use super::walk::{materialize_item, DatalessKind, InodeSortedWalk, Materialized, WalkEvent};
 use super::{
     append_item_to_stream, emit_post_commit_warning, emit_progress, emit_stats_progress,
-    skip_reason,
+    skip_reason, ItemStreamCutter,
 };
 use super::{stamp_item_metadata, with_rollback_checkpoint, BackupProgressEvent, FileStatus};
 use vykar_crypto::CryptoEngine;
@@ -152,7 +151,7 @@ fn flush_cross_file_batch(
     compression: Compression,
     chunk_hasher: &ChunkHasher,
     transform_pool: Option<&rayon::ThreadPool>,
-    items_config: &ChunkerConfig,
+    item_cutter: &ItemStreamCutter,
     item_stream: &mut Vec<u8>,
     item_ptrs: &mut Vec<ChunkId>,
     stats: &mut SnapshotStats,
@@ -219,7 +218,7 @@ fn flush_cross_file_batch(
             item_stream,
             item_ptrs,
             &item,
-            items_config,
+            item_cutter,
             compression,
         )?;
 
@@ -460,7 +459,7 @@ pub(super) struct SequentialCtx<'a> {
     pub git_ignore: bool,
     pub xattrs_enabled: bool,
     pub compression: Compression,
-    pub items_config: &'a ChunkerConfig,
+    pub item_cutter: &'a ItemStreamCutter,
     pub max_pending_transform_bytes: usize,
     pub max_pending_file_actions: usize,
     pub read_limiter: Option<&'a ByteRateLimiter>,
@@ -485,7 +484,7 @@ pub(super) fn process_source_path(
         git_ignore,
         xattrs_enabled,
         compression,
-        items_config,
+        item_cutter,
         max_pending_transform_bytes,
         max_pending_file_actions,
         read_limiter,
@@ -615,7 +614,7 @@ pub(super) fn process_source_path(
                         compression,
                         &chunk_hasher,
                         transform_pool,
-                        items_config,
+                        item_cutter,
                         item_stream,
                         item_ptrs,
                         stats,
@@ -718,7 +717,7 @@ pub(super) fn process_source_path(
                             compression,
                             &chunk_hasher,
                             transform_pool,
-                            items_config,
+                            item_cutter,
                             item_stream,
                             item_ptrs,
                             stats,
@@ -738,7 +737,7 @@ pub(super) fn process_source_path(
                     compression,
                     &chunk_hasher,
                     transform_pool,
-                    items_config,
+                    item_cutter,
                     item_stream,
                     item_ptrs,
                     stats,
@@ -794,7 +793,7 @@ pub(super) fn process_source_path(
                 compression,
                 &chunk_hasher,
                 transform_pool,
-                items_config,
+                item_cutter,
                 item_stream,
                 item_ptrs,
                 stats,
@@ -811,7 +810,7 @@ pub(super) fn process_source_path(
             item_stream,
             item_ptrs,
             &item,
-            items_config,
+            item_cutter,
             compression,
         )?;
     }
@@ -823,7 +822,7 @@ pub(super) fn process_source_path(
         compression,
         &chunk_hasher,
         transform_pool,
-        items_config,
+        item_cutter,
         item_stream,
         item_ptrs,
         stats,

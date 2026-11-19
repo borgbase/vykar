@@ -384,7 +384,7 @@ type ChunkLoc = (ChunkId, PackId, u64, u32);
 
 /// Upper bound on one range read of [`LazyItemStream`]. Smaller than the
 /// eager reader's 16 MiB coalescing cap because the raw window stays resident
-/// while its chunks are decoded; item-stream chunks average 128 KiB
+/// while its chunks are decoded; item-stream chunks average about 32 KiB
 /// plaintext, so one window still spans dozens of them.
 const LAZY_WINDOW_MAX: u64 = 4 * 1024 * 1024;
 

@@ -8,9 +8,9 @@ use chrono::Utc;
 use tracing::{debug, info, warn};
 
 use super::{
-    command_dump, emit_post_commit_warning, emit_progress, flush_item_stream_chunk,
-    items_chunker_config, pipeline, sequential, source, source_paths_match, BackupProgressEvent,
-    BackupRequest, DatalessTally, Prepared, Workers,
+    command_dump, emit_post_commit_warning, emit_progress, flush_item_stream_chunk, pipeline,
+    sequential, source, source_paths_match, BackupProgressEvent, BackupRequest, DatalessTally,
+    ItemStreamCutter, Prepared, Workers,
 };
 use crate::commands::util::check_interrupted;
 use crate::config::VykarConfig;
@@ -238,7 +238,7 @@ pub(super) fn phase1_upload(
     let mut stats = SnapshotStats::default();
     let mut item_stream = Vec::new();
     let mut item_ptrs: Vec<ChunkId> = Vec::new();
-    let items_config = items_chunker_config();
+    let item_cutter = ItemStreamCutter::new(repo.crypto.chunk_hasher());
     let mut new_file_cache = FileCache::new();
 
     // Prepare write cache: the loaded sections' sizes pre-size the
@@ -256,7 +256,7 @@ pub(super) fn phase1_upload(
         repo,
         command_dumps,
         compression,
-        &items_config,
+        &item_cutter,
         &mut item_stream,
         &mut item_ptrs,
         &mut stats,
@@ -289,7 +289,7 @@ pub(super) fn phase1_upload(
             num_workers,
             readahead_depth: pipeline_depth,
             segment_size,
-            items_config: &items_config,
+            item_cutter: &item_cutter,
             pipeline_buffer_bytes,
             prefilter: prefilter.as_ref(),
             shutdown,
@@ -317,7 +317,7 @@ pub(super) fn phase1_upload(
             git_ignore,
             xattrs_enabled,
             compression,
-            items_config: &items_config,
+            item_cutter: &item_cutter,
             max_pending_transform_bytes,
             max_pending_file_actions,
             read_limiter: None, // no source-file read limiter

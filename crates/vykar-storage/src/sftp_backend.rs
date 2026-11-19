@@ -863,7 +863,14 @@ async fn auth_with_agent(
             .await
         {
             Ok(res) if res.success() => return Ok(true),
-            Ok(_) if session.is_closed() => return Err(agent_error(russh::Error::Disconnect)),
+            // Typically MaxAuthTries: a retry would offer the same keys and fail the same way.
+            Ok(_) if session.is_closed() => {
+                return Err(RetryError::permanent(VykarError::Other(format!(
+                    "SSH server {}:{} disconnected after rejecting an ssh-agent key \
+                     (too many authentication attempts?); set sftp_key to the key to use",
+                    params.host, params.port
+                ))));
+            }
             Ok(_) => {}
             Err(AgentAuthError::Send(_)) => return Err(agent_error(russh::Error::SendError)),
             Err(AgentAuthError::Key(russh::keys::Error::IO(e))) => {
@@ -2071,6 +2078,24 @@ mod tests {
             .unwrap();
         assert_eq!(read(&server, "index"), b"retried agent");
         assert!(!server.faults.drop_agent_once.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn ssh_agent_auth_disconnect_is_permanent() {
+        let server = FaultServer::start();
+        let sock = server.start_agent();
+        server
+            .faults
+            .disconnect_on_auth
+            .store(true, Ordering::SeqCst);
+        let backend = server.backend_with(0, None, Some(&sock));
+
+        let err = ASYNC_RUNTIME
+            .block_on(SftpBackend::connect(&backend.params))
+            .err()
+            .expect("a disconnect during agent auth must fail");
+        assert!(!err.retryable, "{err:?}");
+        assert!(err.err.to_string().contains("set sftp_key"), "{err:?}");
     }
 
     #[test]

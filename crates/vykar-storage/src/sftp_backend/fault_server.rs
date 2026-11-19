@@ -26,6 +26,8 @@ use russh_sftp::protocol::{
 pub(super) struct Faults {
     pub drop_agent_once: AtomicBool,
     pub stall_agent: AtomicBool,
+    /// Reject every public key and drop the connection, like OpenSSH at MaxAuthTries.
+    pub disconnect_on_auth: AtomicBool,
     pub hide_posix_rename: AtomicBool,
     pub refuse_rename: AtomicBool,
     /// Perform the rename, then kill the connection instead of replying.
@@ -242,6 +244,9 @@ impl russh::server::Handler for SshHandler {
         _user: &str,
         key: russh::server::VerifiedPublicKey<'_>,
     ) -> Result<Auth, Self::Error> {
+        if self.faults.disconnect_on_auth.load(Ordering::SeqCst) {
+            return Err(russh::Error::Disconnect);
+        }
         if *key.public_key == *client_private_key().public_key() {
             Ok(Auth::Accept)
         } else {

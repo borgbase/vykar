@@ -1,6 +1,7 @@
 pub mod cached_bumps;
 pub mod dedup_cache;
 pub mod hasher;
+pub mod segment;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;

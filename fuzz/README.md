@@ -17,6 +17,7 @@ Coverage-guided fuzz tests for vykar's parser, deserializer, and decrypt paths. 
 | `fuzz_item_stream` | Streaming item decode (`for_each_decoded_item`) |
 | `fuzz_file_cache_decode` | `FileCache::decode_from_plaintext` (custom msgpack parser) |
 | `fuzz_unpack_object` | AEAD envelope parse + decrypt (legacy and context-bound paths) |
+| `fuzz_index_segment` | Index segment decode (`Segment::decode`), checked to re-encode identically |
 
 ## Corpus
 

@@ -1064,7 +1064,6 @@ impl Repository {
         let persisted_packs = self.persisted_pack_count();
         let width = self.request_width();
         let generation = rand::rng().next_u64();
-        let new_cache_path = full_cache_path.with_extension("merged");
         let storage = self.storage.as_ref();
         let crypto = self.crypto.as_ref();
         let (verified, built) = std::thread::scope(|scope| {
@@ -1084,11 +1083,11 @@ impl Repository {
                 r
             });
             let built = (|| {
-                dedup_cache::merge_full_index_cache(
+                let merged = dedup_cache::merge_full_index_cache_to_temp(
                     &old_cache,
                     &delta,
                     generation,
-                    &new_cache_path,
+                    full_cache_path,
                 )?;
                 // Drop the mmap BEFORE renaming — on Windows, mapped files
                 // block replacement.
@@ -1098,21 +1097,21 @@ impl Repository {
                 drop(delta);
                 // Serialize the merged cache as the new index blob. The
                 // mapping is dropped again before the rename below.
-                let merged_cache =
-                    dedup_cache::MmapFullIndexCache::open_path(&new_cache_path, generation)
-                        .ok_or_else(|| VykarError::Other("failed to reopen merged cache".into()))?;
-                dedup_cache::serialize_full_cache_as_index_blob(&merged_cache, generation, crypto)
+                let merged_cache = dedup_cache::MmapFullIndexCache::open_path(&merged, generation)
+                    .ok_or_else(|| VykarError::Other("failed to reopen merged cache".into()))?;
+                let packed = dedup_cache::serialize_full_cache_as_index_blob(
+                    &merged_cache,
+                    generation,
+                    crypto,
+                )?;
+                Ok::<_, VykarError>((merged, packed))
             })();
             (join_scoped(verify), built)
         });
-        let index_packed = match verified.and(built) {
-            Ok(packed) => packed,
-            Err(e) => {
-                let _ = std::fs::remove_file(&new_cache_path);
-                return Err(e);
-            }
-        };
-        std::fs::rename(&new_cache_path, full_cache_path)?;
+        // On error the merged temp file is deleted when `built` drops.
+        verified?;
+        let (merged, index_packed) = built?;
+        merged.persist(full_cache_path).map_err(|e| e.error)?;
         self.index_generation = generation;
 
         self.put_index_blob(&index_packed, self.index_generation)?;

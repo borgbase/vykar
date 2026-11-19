@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use memmap2::Mmap;
+use tempfile::{NamedTempFile, TempPath};
 use tracing::{debug, warn};
 use xorf::{Filter, Xor8};
 
@@ -29,6 +30,39 @@ fn read_u32_le(bytes: [u8; 4]) -> u32 {
 
 fn read_u64_le(bytes: [u8; 8]) -> u64 {
     u64::from_le_bytes(bytes)
+}
+
+/// A uniquely named temp file in `target`'s directory, to be persisted over
+/// `target`. Unique names let concurrent writers of the same cache (two
+/// processes catching up one cache directory) never share a temp file; the
+/// last `persist` wins and every mapping keeps its own inode.
+fn temp_file_beside(target: &Path) -> Result<NamedTempFile> {
+    let dir = match target.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let prefix = format!(
+        ".{}.",
+        target
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("cache")
+    );
+    Ok(tempfile::Builder::new()
+        .prefix(&prefix)
+        .suffix(".tmp")
+        .tempfile_in(dir)?)
+}
+
+/// Atomically move a finished temp file over `target`.
+fn persist_temp(tmp: NamedTempFile, target: &Path) -> Result<()> {
+    tmp.persist(target).map_err(|e| e.error)?;
+    Ok(())
+}
+
+/// Flush a buffered temp-file writer and hand back the temp file.
+fn into_temp(w: BufWriter<NamedTempFile>) -> Result<NamedTempFile> {
+    w.into_inner().map_err(|e| e.into_error().into())
 }
 
 // ---------------------------------------------------------------------------
@@ -82,9 +116,16 @@ impl CacheSpec {
     /// cache miss and falls back to its slow path. Content-level validation
     /// (the full index cache's checksum trailer) stays with the caller; this
     /// only guarantees the file's framing is what the spec describes.
-    fn open_validated(&self, path: &Path, expected_generation: u64) -> Option<ValidatedCache> {
+    ///
+    /// `expected_generation: None` skips the generation check, for callers
+    /// that identify the cache by its content checksum instead.
+    fn open_validated(
+        &self,
+        path: &Path,
+        expected_generation: Option<u64>,
+    ) -> Option<ValidatedCache> {
         // Generation 0 means "no cache ever written".
-        if expected_generation == 0 {
+        if expected_generation == Some(0) {
             return None;
         }
 
@@ -97,9 +138,9 @@ impl CacheSpec {
         // over the target, which swaps the directory entry and leaves this
         // inode untouched for as long as we hold it open. Any writer added
         // here must do the same. Today that is `write_sorted_cache` (dedup
-        // and restore), `build_full_index_cache_to_path`,
-        // `merge_full_index_cache`, and the two streaming derivations
-        // `build_dedup_cache_from_full_cache` /
+        // and restore), `FullCacheWriter` (every full index cache writer,
+        // including the segment apply and diff in `index::segment`), and the
+        // two streaming derivations `build_dedup_cache_from_full_cache` /
         // `build_restore_cache_from_full_cache`. A vykar process racing
         // another vykar process therefore only ever reads a *stale* mapping,
         // which the generation check turns into a cache miss.
@@ -129,7 +170,7 @@ impl CacheSpec {
         }
 
         let generation = read_u64_le(mmap[12..20].try_into().expect("8-byte slice from header"));
-        if generation != expected_generation {
+        if expected_generation.is_some_and(|expected| generation != expected) {
             debug!(
                 cache_gen = generation,
                 expected_gen = expected_generation,
@@ -210,7 +251,7 @@ impl CacheSpec {
 
 /// Write the shared 28-byte cache header.
 fn write_cache_header(
-    w: &mut BufWriter<std::fs::File>,
+    w: &mut impl Write,
     spec: &CacheSpec,
     generation: u64,
     entry_count: u32,
@@ -235,26 +276,20 @@ fn write_sorted_cache<T>(
     path: &Path,
     generation: u64,
     entries: &[T],
-    mut write_entry: impl FnMut(&mut BufWriter<std::fs::File>, &T) -> Result<()>,
+    mut write_entry: impl FnMut(&mut BufWriter<NamedTempFile>, &T) -> Result<()>,
 ) -> Result<()> {
     debug_assert_eq!(spec.trailer_size, 0, "write_sorted_cache writes no trailer");
 
     let entry_count = entries.len() as u32;
 
-    let tmp_path = path.with_extension("tmp");
-    let file = std::fs::File::create(&tmp_path)?;
-    let mut w = BufWriter::new(file);
+    let mut w = BufWriter::new(temp_file_beside(path)?);
 
     write_cache_header(&mut w, spec, generation, entry_count)?;
     for entry in entries {
         write_entry(&mut w, entry)?;
     }
 
-    w.flush()?;
-    drop(w);
-
-    // Atomic rename into place.
-    std::fs::rename(&tmp_path, path)?;
+    persist_temp(into_temp(w)?, path)?;
 
     debug!(
         entries = entry_count,
@@ -372,7 +407,7 @@ impl MmapDedupCache {
 
     /// Open and validate a dedup cache file at an explicit path (used by tests).
     pub fn open_path(path: &Path, expected_generation: u64) -> Option<Self> {
-        let validated = DEDUP_SPEC.open_validated(path, expected_generation)?;
+        let validated = DEDUP_SPEC.open_validated(path, Some(expected_generation))?;
         Some(Self {
             mmap: validated.mmap,
             entry_count: validated.entry_count,
@@ -823,7 +858,7 @@ impl MmapRestoreCache {
 
     /// Open and validate a restore cache file at an explicit path (used by tests).
     pub fn open_path(path: &Path, expected_generation: u64) -> Option<Self> {
-        let validated = RESTORE_SPEC.open_validated(path, expected_generation)?;
+        let validated = RESTORE_SPEC.open_validated(path, Some(expected_generation))?;
         Some(Self {
             mmap: validated.mmap,
             entry_count: validated.entry_count,
@@ -897,7 +932,7 @@ pub fn full_index_cache_path(repo_id: &[u8], cache_dir: Option<&Path>) -> Option
 }
 
 /// A single entry read from the full index cache.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FullCacheEntry {
     pub chunk_id: ChunkId,
     pub refcount: u32,
@@ -929,6 +964,16 @@ impl MmapFullIndexCache {
 
     /// Open and validate at an explicit path (used by tests).
     pub fn open_path(path: &Path, expected_generation: u64) -> Option<Self> {
+        Self::open_checked(path, Some(expected_generation))
+    }
+
+    /// Open and checksum-verify without a generation check. The cache is
+    /// then identified by its whole content checksum, [`Self::state_hash`].
+    pub fn open_verified(path: &Path) -> Option<Self> {
+        Self::open_checked(path, None)
+    }
+
+    fn open_checked(path: &Path, expected_generation: Option<u64>) -> Option<Self> {
         let validated = FULL_SPEC.open_validated(path, expected_generation)?;
         let mmap = validated.mmap;
 
@@ -956,41 +1001,32 @@ impl MmapFullIndexCache {
         self.entry_count
     }
 
-    /// Read the i-th entry (0-indexed).
-    fn entry_at(&self, i: usize) -> FullCacheEntry {
+    /// BLAKE3 over the canonical sorted records: the checksum trailer, which
+    /// `open_checked` verified against the entries.
+    pub fn state_hash(&self) -> StateHash {
+        let entries_end = self.mmap.len() - FULL_CHECKSUM_SIZE;
+        self.mmap[entries_end..]
+            .try_into()
+            .expect("32-byte trailer within validated cache")
+    }
+
+    /// Read the i-th entry (0-indexed). Panics if `i >= entry_count()`.
+    pub(crate) fn entry_at(&self, i: usize) -> FullCacheEntry {
         let data = &self.mmap[FULL_HEADER_SIZE..];
         let offset = i * FULL_ENTRY_SIZE;
-        let mut chunk_bytes = [0u8; 32];
-        chunk_bytes.copy_from_slice(&data[offset..offset + 32]);
-        let refcount = read_u32_le(
-            data[offset + 32..offset + 36]
-                .try_into()
-                .expect("4-byte slice within validated entry"),
-        );
-        let stored_size = read_u32_le(
-            data[offset + 36..offset + 40]
-                .try_into()
-                .expect("4-byte slice within validated entry"),
-        );
-        let mut pack_bytes = [0u8; 32];
-        pack_bytes.copy_from_slice(&data[offset + 40..offset + 72]);
-        let pack_offset = read_u64_le(
-            data[offset + 72..offset + 80]
-                .try_into()
-                .expect("8-byte slice within validated entry"),
-        );
-        FullCacheEntry {
-            chunk_id: ChunkId::from_bytes(chunk_bytes),
-            refcount,
-            stored_size,
-            pack_id: PackId::from_bytes(pack_bytes),
-            pack_offset,
-        }
+        decode_full_entry(&data[offset..offset + FULL_ENTRY_SIZE])
     }
 
     /// Iterate over all entries in order.
     pub fn iter(&self) -> impl Iterator<Item = FullCacheEntry> + '_ {
         (0..self.entry_count as usize).map(move |i| self.entry_at(i))
+    }
+
+    /// Position of `chunk_id` in the sorted entry array, if present.
+    pub fn find_position(&self, chunk_id: &ChunkId) -> Option<u32> {
+        FULL_SPEC
+            .find_entry_with_position(&self.mmap, self.entry_count, chunk_id)
+            .map(|(position, _)| position)
     }
 
     /// Get the ChunkId bytes for the i-th entry (for merge comparisons).
@@ -1000,8 +1036,27 @@ impl MmapFullIndexCache {
     }
 }
 
-/// Encode a single full cache entry into its 80-byte on-disk representation.
-fn encode_full_entry(entry: &FullCacheEntry) -> [u8; FULL_ENTRY_SIZE] {
+/// Identity of an index state: BLAKE3 over its canonical sorted records,
+/// i.e. the full index cache's checksum trailer.
+pub type StateHash = [u8; 32];
+
+/// The u64 generation that the dedup and restore caches (and the full
+/// cache header) carry for an index state: the first 8 bytes of its
+/// `state_hash`, with 0 mapped to 1 because generation 0 means "no cache".
+pub fn generation_for_state(state_hash: &StateHash) -> u64 {
+    let g = read_u64_le(state_hash[..8].try_into().expect("8-byte prefix"));
+    if g == 0 {
+        1
+    } else {
+        g
+    }
+}
+
+/// Size of one canonical record (see [`encode_full_entry`]).
+pub const CANONICAL_RECORD_SIZE: usize = FULL_ENTRY_SIZE;
+
+/// Encode a single full cache entry into its 80-byte canonical record.
+pub fn encode_full_entry(entry: &FullCacheEntry) -> [u8; FULL_ENTRY_SIZE] {
     let mut buf = [0u8; FULL_ENTRY_SIZE];
     buf[0..32].copy_from_slice(entry.chunk_id.as_bytes());
     buf[32..36].copy_from_slice(&entry.refcount.to_le_bytes());
@@ -1011,32 +1066,70 @@ fn encode_full_entry(entry: &FullCacheEntry) -> [u8; FULL_ENTRY_SIZE] {
     buf
 }
 
-/// Write a single full cache entry to a writer, folding it into the running
-/// content-checksum hasher.
-fn write_full_entry(
-    w: &mut BufWriter<std::fs::File>,
-    hasher: &mut blake3::Hasher,
-    entry: &FullCacheEntry,
-) -> Result<()> {
-    let buf = encode_full_entry(entry);
-    w.write_all(&buf)?;
-    hasher.update(&buf);
-    Ok(())
+/// Decode an 80-byte canonical record. Panics if `buf` is shorter.
+fn decode_full_entry(buf: &[u8]) -> FullCacheEntry {
+    FullCacheEntry {
+        chunk_id: ChunkId::from_bytes(buf[0..32].try_into().expect("32-byte ChunkId")),
+        refcount: read_u32_le(buf[32..36].try_into().expect("4-byte refcount")),
+        stored_size: read_u32_le(buf[36..40].try_into().expect("4-byte stored_size")),
+        pack_id: PackId::from_bytes(buf[40..72].try_into().expect("32-byte PackId")),
+        pack_offset: read_u64_le(buf[72..80].try_into().expect("8-byte pack_offset")),
+    }
 }
 
-/// Append the finalized content-checksum trailer over all entries written so far.
-fn write_full_checksum(w: &mut BufWriter<std::fs::File>, hasher: blake3::Hasher) -> Result<()> {
-    w.write_all(hasher.finalize().as_bytes())?;
-    Ok(())
+/// Streaming writer for a full index cache, into a unique temp file next to
+/// its eventual target.
+///
+/// The entry count and (optionally) the generation need not be known up
+/// front: the header is written last, over a placeholder. Entries must be
+/// pushed in strictly increasing chunk-ID order; the writer does not check.
+pub(crate) struct FullCacheWriter {
+    w: BufWriter<NamedTempFile>,
+    hasher: blake3::Hasher,
+    count: u64,
 }
 
-/// Write the full index cache header.
-fn write_full_header(
-    w: &mut BufWriter<std::fs::File>,
-    generation: u64,
-    entry_count: u32,
-) -> Result<()> {
-    write_cache_header(w, &FULL_SPEC, generation, entry_count)
+impl FullCacheWriter {
+    pub(crate) fn new_beside(target: &Path) -> Result<Self> {
+        let mut w = BufWriter::new(temp_file_beside(target)?);
+        w.write_all(&[0u8; FULL_HEADER_SIZE])?;
+        Ok(Self {
+            w,
+            hasher: blake3::Hasher::new(),
+            count: 0,
+        })
+    }
+
+    pub(crate) fn push(&mut self, entry: &FullCacheEntry) -> Result<()> {
+        let buf = encode_full_entry(entry);
+        self.w.write_all(&buf)?;
+        self.hasher.update(&buf);
+        self.count += 1;
+        Ok(())
+    }
+
+    /// Append the checksum trailer and write the header. `generation: None`
+    /// derives it from the state hash ([`generation_for_state`]).
+    pub(crate) fn finish(
+        mut self,
+        generation: Option<u64>,
+    ) -> Result<(NamedTempFile, StateHash, u64)> {
+        use std::io::{Seek, SeekFrom};
+
+        let entry_count = u32::try_from(self.count).map_err(|_| {
+            vykar_types::error::VykarError::InvalidFormat(format!(
+                "index has {} entries, more than a full index cache can hold",
+                self.count
+            ))
+        })?;
+        let state_hash: StateHash = self.hasher.finalize().into();
+        self.w.write_all(&state_hash)?;
+        let generation = generation.unwrap_or_else(|| generation_for_state(&state_hash));
+        self.w.seek(SeekFrom::Start(0))?;
+        write_cache_header(&mut self.w, &FULL_SPEC, generation, entry_count)?;
+        let tmp = into_temp(self.w)?;
+        Ok((tmp, state_hash, self.count))
+    }
 }
 
 /// Build the full index cache from a ChunkIndex HashMap.
@@ -1074,21 +1167,12 @@ pub fn build_full_index_cache_to_path(
         .collect();
     entries.sort_unstable_by_key(|a| *a.chunk_id.as_bytes());
 
-    let entry_count = entries.len() as u32;
-    let tmp_path = path.with_extension("tmp");
-    let file = std::fs::File::create(&tmp_path)?;
-    let mut w = BufWriter::new(file);
-
-    write_full_header(&mut w, generation, entry_count)?;
-    let mut hasher = blake3::Hasher::new();
+    let mut w = FullCacheWriter::new_beside(path)?;
     for entry in &entries {
-        write_full_entry(&mut w, &mut hasher, entry)?;
+        w.push(entry)?;
     }
-    write_full_checksum(&mut w, hasher)?;
-
-    w.flush()?;
-    drop(w);
-    std::fs::rename(&tmp_path, path)?;
+    let (tmp, _, entry_count) = w.finish(Some(generation))?;
+    persist_temp(tmp, path)?;
 
     debug!(
         entries = entry_count,
@@ -1116,6 +1200,19 @@ pub fn merge_full_index_cache(
     new_generation: u64,
     out_path: &Path,
 ) -> Result<()> {
+    let tmp = merge_full_index_cache_to_temp(old_cache, delta, new_generation, out_path)?;
+    tmp.persist(out_path).map_err(|e| e.error)?;
+    Ok(())
+}
+
+/// [`merge_full_index_cache`], leaving the result in a uniquely named temp
+/// file beside `target` for the caller to persist (or drop, which deletes it).
+pub fn merge_full_index_cache_to_temp(
+    old_cache: &MmapFullIndexCache,
+    delta: &IndexDelta,
+    new_generation: u64,
+    target: &Path,
+) -> Result<TempPath> {
     // Sort new entries by ChunkId for merge
     let mut sorted_new: Vec<&crate::index::NewChunkEntry> = delta.new_entries.iter().collect();
     sorted_new.sort_unstable_by_key(|a| *a.chunk_id.as_bytes());
@@ -1129,15 +1226,15 @@ pub fn merge_full_index_cache(
         Some(_) => None,
     };
     if let Some(source) = positional {
-        if write_merged_full_cache(
+        if let Some(tmp) = write_merged_full_cache(
             old_cache,
             delta,
             &sorted_new,
             &source,
             new_generation,
-            out_path,
+            target,
         )? {
-            return Ok(());
+            return Ok(tmp);
         }
     }
 
@@ -1153,10 +1250,9 @@ pub fn merge_full_index_cache(
         &sorted_new,
         &CachedBumpSource::Keyed(keyed),
         new_generation,
-        out_path,
+        target,
     )?;
-    debug_assert!(merged, "keyed merge cannot be rejected");
-    Ok(())
+    Ok(merged.expect("keyed merge cannot be rejected"))
 }
 
 /// How [`write_merged_full_cache`] looks up the delta's positional bumps.
@@ -1169,26 +1265,18 @@ enum CachedBumpSource<'a> {
     Keyed(HashMap<ChunkId, u32>),
 }
 
-/// One merge pass. Returns `Ok(false)` — with the temp file left for the
-/// retry to overwrite — when `CachedBumpSource::Positional` turns out not to
-/// line up with `old_cache`.
+/// One merge pass into a temp file beside `target`. Returns `Ok(None)` —
+/// with the temp file deleted — when `CachedBumpSource::Positional` turns
+/// out not to line up with `old_cache`.
 fn write_merged_full_cache(
     old_cache: &MmapFullIndexCache,
     delta: &IndexDelta,
     sorted_new: &[&crate::index::NewChunkEntry],
     cached: &CachedBumpSource<'_>,
     new_generation: u64,
-    out_path: &Path,
-) -> Result<bool> {
-    // Count total entries: old + new (new entries should not overlap with old)
-    let total_count = old_cache.entry_count() + sorted_new.len() as u32;
-
-    let tmp_path = out_path.with_extension("tmp");
-    let file = std::fs::File::create(&tmp_path)?;
-    let mut w = BufWriter::new(file);
-
-    write_full_header(&mut w, new_generation, total_count)?;
-    let mut hasher = blake3::Hasher::new();
+    target: &Path,
+) -> Result<Option<TempPath>> {
+    let mut w = FullCacheWriter::new_beside(target)?;
 
     let keyed_bump = |id: &ChunkId| -> u32 {
         let mut bump = delta.refcount_bumps.get(id).copied().unwrap_or(0);
@@ -1224,18 +1312,18 @@ fn write_merged_full_cache(
             if let CachedBumpSource::Positional(bumps) = cached {
                 let key = old_cache.chunk_id_bytes_at(old_idx);
                 if old_idx > 0 && old_cache.chunk_id_bytes_at(old_idx - 1) >= key {
-                    return Ok(false);
+                    return Ok(None);
                 }
                 let count = bumps.count_at(old_idx);
                 if count != 0 {
                     if bumps.cache().chunk_id_bytes_at(old_idx as u32) != key {
-                        return Ok(false);
+                        return Ok(None);
                     }
                     entry.refcount += count;
                     last_old_positional = count;
                 }
             }
-            write_full_entry(&mut w, &mut hasher, &entry)?;
+            w.push(&entry)?;
             old_idx += 1;
         } else {
             let ne = &sorted_new[new_idx];
@@ -1255,22 +1343,18 @@ fn write_merged_full_cache(
                 pack_id: ne.pack_id,
                 pack_offset: ne.pack_offset,
             };
-            write_full_entry(&mut w, &mut hasher, &entry)?;
+            w.push(&entry)?;
             new_idx += 1;
         }
     }
-    write_full_checksum(&mut w, hasher)?;
-
-    w.flush()?;
-    drop(w);
-    std::fs::rename(&tmp_path, out_path)?;
+    let (tmp, _, total_count) = w.finish(Some(new_generation))?;
 
     debug!(
         entries = total_count,
-        path = %out_path.display(),
+        target = %target.display(),
         "wrote merged full index cache"
     );
-    Ok(true)
+    Ok(Some(tmp.into_temp_path()))
 }
 
 /// Load a ChunkIndex HashMap from the local full index cache.
@@ -1464,9 +1548,7 @@ pub fn build_dedup_cache_from_full_cache(
     })?;
 
     let entry_count = cache.entry_count();
-    let tmp_path = path.with_extension("tmp");
-    let file = std::fs::File::create(&tmp_path)?;
-    let mut w = BufWriter::new(file);
+    let mut w = BufWriter::new(temp_file_beside(&path)?);
 
     // Dedup cache header
     w.write_all(MAGIC)?;
@@ -1481,9 +1563,7 @@ pub fn build_dedup_cache_from_full_cache(
         w.write_all(&entry.stored_size.to_le_bytes())?;
     }
 
-    w.flush()?;
-    drop(w);
-    std::fs::rename(&tmp_path, &path)?;
+    persist_temp(into_temp(w)?, &path)?;
 
     debug!(
         entries = entry_count,
@@ -1512,9 +1592,7 @@ pub fn build_restore_cache_from_full_cache(
     })?;
 
     let entry_count = cache.entry_count();
-    let tmp_path = path.with_extension("tmp");
-    let file = std::fs::File::create(&tmp_path)?;
-    let mut w = BufWriter::new(file);
+    let mut w = BufWriter::new(temp_file_beside(&path)?);
 
     // Restore cache header
     w.write_all(RESTORE_MAGIC)?;
@@ -1531,9 +1609,7 @@ pub fn build_restore_cache_from_full_cache(
         w.write_all(&entry.pack_offset.to_le_bytes())?;
     }
 
-    w.flush()?;
-    drop(w);
-    std::fs::rename(&tmp_path, &path)?;
+    persist_temp(into_temp(w)?, &path)?;
 
     debug!(
         entries = entry_count,
@@ -1689,9 +1765,7 @@ pub fn write_index_blob_cache(
     // compares against on a conditional GET.
     let digest: [u8; 32] = blake3::hash(blob).into();
 
-    let tmp_path = path.with_extension("tmp");
-    let file = std::fs::File::create(&tmp_path)?;
-    let mut w = BufWriter::new(file);
+    let mut w = BufWriter::new(temp_file_beside(&path)?);
 
     // Header
     w.write_all(INDEX_BLOB_MAGIC)?;
@@ -1703,10 +1777,7 @@ pub fn write_index_blob_cache(
     // Blob payload
     w.write_all(blob)?;
 
-    w.flush()?;
-    drop(w);
-
-    std::fs::rename(&tmp_path, &path)?;
+    persist_temp(into_temp(w)?, &path)?;
 
     debug!(
         generation,

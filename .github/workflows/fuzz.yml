@@ -19,6 +19,7 @@ jobs:
           - fuzz_item_stream
           - fuzz_file_cache_decode
           - fuzz_unpack_object
+          - fuzz_index_segment
     steps:
       - uses: actions/checkout@v6
 

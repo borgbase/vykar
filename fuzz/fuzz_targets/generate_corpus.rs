@@ -14,6 +14,8 @@ use std::path::Path;
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::Aes256Gcm;
 use vykar_core::compress::{compress, Compression};
+use vykar_core::index::dedup_cache::FullCacheEntry;
+use vykar_core::index::segment::{RefcountDelta, Relocation, Segment};
 use vykar_core::index::IndexBlob;
 use vykar_core::repo::file_cache::{CachedChunkRef, CachedChunks, FileCache};
 use vykar_core::repo::format::ObjectType;
@@ -22,6 +24,7 @@ use vykar_core::snapshot::item::{ChunkRef, Item, ItemType};
 use vykar_core::snapshot::SnapshotMeta;
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::hash::HashAlgorithm;
+use vykar_types::pack_id::PackId;
 
 const CORPUS_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/corpus");
 
@@ -139,6 +142,46 @@ fn seed_index_blob() {
     write_seed("fuzz_msgpack_index_blob", "empty_index", &encoded);
 }
 
+fn seed_index_segment() {
+    write_seed(
+        "fuzz_index_segment",
+        "empty",
+        &Segment::empty([0; 32], 0).encode(),
+    );
+    let segment = Segment {
+        prev_state_hash: [7; 32],
+        prev_entries: 1000,
+        deltas: vec![
+            RefcountDelta {
+                position: 0,
+                delta: 1,
+            },
+            RefcountDelta {
+                position: 1,
+                delta: 1,
+            },
+            RefcountDelta {
+                position: 500,
+                delta: -3,
+            },
+        ],
+        relocations: vec![Relocation {
+            position: 42,
+            pack_id: PackId::from_bytes([9; 32]),
+            pack_offset: 123_456,
+            stored_size: 4096,
+        }],
+        new_entries: vec![FullCacheEntry {
+            chunk_id: ChunkId::from_bytes([3; 32]),
+            refcount: 2,
+            stored_size: 777,
+            pack_id: PackId::from_bytes([9; 32]),
+            pack_offset: 64,
+        }],
+    };
+    write_seed("fuzz_index_segment", "all_sections", &segment.encode());
+}
+
 fn seed_item_stream() {
     let items = vec![
         Item {
@@ -177,10 +220,7 @@ fn seed_item_stream() {
             size: 0,
             chunks: vec![],
             link_target: None,
-            xattrs: Some(HashMap::from([(
-                "user.test".into(),
-                b"value".to_vec(),
-            )])),
+            xattrs: Some(HashMap::from([("user.test".into(), b"value".to_vec())])),
             raw_names: None,
             hardlink: None,
         },
@@ -355,6 +395,9 @@ fn main() {
 
     seed_unpack_object();
     println!("  fuzz_unpack_object: done");
+
+    seed_index_segment();
+    println!("  fuzz_index_segment: done");
 
     println!("All corpus seeds written to {CORPUS_DIR}");
 }

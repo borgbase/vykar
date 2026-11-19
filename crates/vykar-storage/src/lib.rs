@@ -60,6 +60,19 @@ pub trait StorageBackend: Send + Sync {
     /// Read an object by key. Returns `None` if not found.
     fn get(&self, key: &str) -> Result<Option<Vec<u8>>>;
 
+    /// Read an object unless it is byte-identical to the caller's copy, whose
+    /// unkeyed BLAKE2b-256 is `known_blake2b`.
+    ///
+    /// `Unchanged` transfers nothing. `Fetched` has the contract of
+    /// [`Self::get`]. The default always fetches; only `RestBackend` asks the
+    /// server. BLAKE2b for every repository format, by design: it is the
+    /// `X-Content-BLAKE2b` digest the REST client sends with every non-pack
+    /// object, which is what a vykar-server compares against.
+    fn get_if_changed(&self, key: &str, known_blake2b: &[u8; 32]) -> Result<ConditionalGet> {
+        let _ = known_blake2b;
+        get_unconditionally(self, key)
+    }
+
     /// Write an object, replacing any existing one.
     ///
     /// # Visibility (all backends)
@@ -273,6 +286,10 @@ pub trait StorageBackend: Send + Sync {
     // routes through this impl's own `put_owned`. The one exception,
     // `begin_staged_put`, defaults to `Ok(None)` ("buffer and `put`
     // instead"), which is likewise only ever less efficient.
+    //
+    // `get_if_changed` also routes through this impl's own `get`, so its
+    // default is only less efficient. It is forwarded by the macro, and a
+    // wrapper that overrides `get` must override it too (guard).
 
     /// Delete temp files ([`vykar_protocol::is_repo_temp_file`]) last
     /// modified at least `older_than` ago (`Duration::ZERO` = all), in the
@@ -560,6 +577,33 @@ pub struct BackendProfile {
 pub struct ListedObject {
     pub key: String,
     pub size: Option<u64>,
+}
+
+/// Outcome of [`StorageBackend::get_if_changed`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConditionalGet {
+    /// The backend reports the stored object byte-identical to the caller's
+    /// copy. Nothing was transferred. This is the backend's claim, not a proof:
+    /// use it only to substitute a copy the caller already trusts.
+    Unchanged,
+    /// The object as stored (`None` = absent), exactly as [`StorageBackend::get`]
+    /// returns it.
+    Fetched(Option<Vec<u8>>),
+}
+
+/// [`StorageBackend::get_if_changed`] answered with an unconditional
+/// [`StorageBackend::get`] on `backend`. The trait default, and the body for
+/// wrappers that intercept `get`, so the read keeps going through their
+/// override.
+///
+/// # Errors
+///
+/// Whatever `get` returns.
+pub fn get_unconditionally<B: StorageBackend + ?Sized>(
+    backend: &B,
+    key: &str,
+) -> Result<ConditionalGet> {
+    Ok(ConditionalGet::Fetched(backend.get(key)?))
 }
 
 // Lets a `Box<Arc<dyn StorageBackend>>` coerce to `Box<dyn StorageBackend>`

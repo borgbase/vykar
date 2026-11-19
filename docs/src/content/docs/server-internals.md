@@ -24,7 +24,7 @@ The server exposes normal storage-object routes plus a small set of admin query 
 
 | Method | Path | Maps to | Notes |
 |--------|------|---------|-------|
-| `GET` | `/{*path}` | `get(key)` | Returns `200` + body or `404`. With a `Range` header, this becomes a ranged read and returns `206`. |
+| `GET` | `/{*path}` | `get(key)` | Returns `200` + body or `404`. With a `Range` header, this becomes a ranged read and returns `206`. `GET /index` honours `If-None-Match: "<BLAKE2b-256 hex>"`: it answers `304` with `ETag` when the value names the digest verified on the last `PUT /index` (`X-Content-BLAKE2b`) and the file that PUT produced is still in place. The record is held in server memory, so the first conditional GET after a restart is a `200`. Other keys ignore the header, and so does a `Range` read. An `index` corrupted in place (same inode, size and mtime) still gets a `304`, so the client proceeds on its own good copy where a plain GET would fail to decode; `check` always reads `index` unconditionally. |
 | `HEAD` | `/{*path}` | `exists(key)` | Returns `200` with metadata or `404`. |
 | `PUT` | `/{*path}` | `put(key, data)` | Raw bytes body. REST clients send exactly one of `X-Content-BLAKE3` (pack uploads to a format-v3 repository) or `X-Content-BLAKE2b` (format-v2 packs, and every non-pack object regardless of format); the server verifies it while streaming the write. Both headers at once is a 400, and a pack upload with neither is a 400. |
 | `DELETE` | `/{*path}` | `delete(key)` | Returns `204` or `404`. Rejected with `403` in append-only mode, except for `locks/*`, `sessions/*` and temporary upload files. |

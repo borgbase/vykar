@@ -1554,12 +1554,45 @@ pub fn build_restore_cache_from_full_cache(
 /// Magic bytes at the start of the index blob cache file.
 const INDEX_BLOB_MAGIC: &[u8; 8] = b"VGIDXB\0\0";
 
-/// Current index blob cache format version.
-const INDEX_BLOB_VERSION: u32 = 1;
+/// Current index blob cache format version. v2 adds the BLAKE2b-256 of the
+/// blob, sent as the conditional-GET validator. Other versions are a miss.
+const INDEX_BLOB_VERSION: u32 = 2;
 
-/// Size of the index blob cache header in bytes:
-/// magic(8) + version(4) + generation(8) + reserved(4) = 24.
-const INDEX_BLOB_HEADER_SIZE: usize = 24;
+/// Size of the index blob cache header in bytes: magic(8) + version(4) +
+/// generation(8) + reserved(4) + BLAKE2b-256 of the blob(32) = 56.
+const INDEX_BLOB_HEADER_SIZE: usize = 56;
+
+struct IndexBlobHeader {
+    generation: u64,
+    blake2b: [u8; 32],
+}
+
+/// Read and validate the header at the start of `file`, leaving it positioned
+/// at the payload. `None` on short read, bad magic or unknown version.
+fn read_index_blob_header(file: &mut std::fs::File) -> Option<IndexBlobHeader> {
+    use std::io::Read;
+
+    let mut header = [0u8; INDEX_BLOB_HEADER_SIZE];
+    if file.read_exact(&mut header).is_err() {
+        debug!("index blob cache: file too small for header");
+        return None;
+    }
+    if &header[0..8] != INDEX_BLOB_MAGIC {
+        debug!("index blob cache: bad magic");
+        return None;
+    }
+    let version = read_u32_le(header[8..12].try_into().expect("4-byte slice from header"));
+    if version != INDEX_BLOB_VERSION {
+        debug!(version, "index blob cache: unsupported version");
+        return None;
+    }
+    Some(IndexBlobHeader {
+        generation: read_u64_le(header[12..20].try_into().expect("8-byte slice from header")),
+        blake2b: header[24..56]
+            .try_into()
+            .expect("32-byte slice from header"),
+    })
+}
 
 /// Return the local filesystem path for the index blob cache file.
 pub fn index_blob_cache_path(repo_id: &[u8], cache_dir: Option<&Path>) -> Option<PathBuf> {
@@ -1591,21 +1624,10 @@ pub fn index_blob_cache_matches(
         return false;
     };
 
-    let mut header = [0u8; INDEX_BLOB_HEADER_SIZE];
-    if file.read_exact(&mut header).is_err() {
-        debug!("index blob cache: file too small for header");
+    let Some(header) = read_index_blob_header(&mut file) else {
         return false;
-    }
-    if &header[0..8] != INDEX_BLOB_MAGIC {
-        debug!("index blob cache: bad magic");
-        return false;
-    }
-    let version = read_u32_le(header[8..12].try_into().expect("4-byte slice from header"));
-    if version != INDEX_BLOB_VERSION {
-        debug!(version, "index blob cache: unsupported version");
-        return false;
-    }
-    let generation = read_u64_le(header[12..20].try_into().expect("8-byte slice from header"));
+    };
+    let generation = header.generation;
     if generation != expected_generation {
         debug!(
             cache_gen = generation,
@@ -1666,6 +1688,11 @@ pub fn write_index_blob_cache(
         std::fs::create_dir_all(parent)?;
     }
 
+    // BLAKE2b for every repository format, by design: it is the digest the
+    // REST client sends as `X-Content-BLAKE2b` and the server compares
+    // against on a conditional GET.
+    let digest: [u8; 32] = Blake2b256::digest(blob).into();
+
     let tmp_path = path.with_extension("tmp");
     let file = std::fs::File::create(&tmp_path)?;
     let mut w = BufWriter::new(file);
@@ -1675,6 +1702,7 @@ pub fn write_index_blob_cache(
     w.write_all(&INDEX_BLOB_VERSION.to_le_bytes())?;
     w.write_all(&generation.to_le_bytes())?;
     w.write_all(&0u32.to_le_bytes())?; // reserved
+    w.write_all(&digest)?;
 
     // Blob payload
     w.write_all(blob)?;
@@ -1692,6 +1720,86 @@ pub fn write_index_blob_cache(
     );
 
     Ok(())
+}
+
+/// An index blob cache file, opened and header-validated. The handle stays
+/// open, so the payload read later is the file whose header was read, even if
+/// the cache is replaced in between.
+pub struct CachedIndexBlob {
+    file: std::fs::File,
+    generation: u64,
+    blake2b: [u8; 32],
+    payload_len: u64,
+}
+
+impl CachedIndexBlob {
+    /// `None` when the cache is missing, unreadable, of another version,
+    /// generation 0, or shorter than its header.
+    pub fn open(repo_id: &[u8], cache_dir: Option<&Path>) -> Option<Self> {
+        let path = index_blob_cache_path(repo_id, cache_dir)?;
+        let mut file = std::fs::File::open(path).ok()?;
+        let header = read_index_blob_header(&mut file)?;
+        if header.generation == 0 {
+            return None;
+        }
+        let payload_len = file
+            .metadata()
+            .ok()?
+            .len()
+            .checked_sub(INDEX_BLOB_HEADER_SIZE as u64)?;
+        Some(Self {
+            file,
+            generation: header.generation,
+            blake2b: header.blake2b,
+            payload_len,
+        })
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Unkeyed BLAKE2b-256 of the cached blob, as recorded when it was written.
+    pub fn blake2b(&self) -> &[u8; 32] {
+        &self.blake2b
+    }
+
+    /// Read the payload and verify it against [`Self::blake2b`]. `None` on I/O
+    /// error, short read, trailing bytes or digest mismatch.
+    pub fn read_verified(self) -> Option<Vec<u8>> {
+        use std::io::Read;
+
+        let Self {
+            mut file,
+            blake2b,
+            payload_len,
+            ..
+        } = self;
+        let mut buf = Vec::new();
+        buf.try_reserve_exact(usize::try_from(payload_len).ok()?)
+            .ok()?;
+        if let Err(e) = (&mut file).take(payload_len).read_to_end(&mut buf) {
+            debug!(error = %e, "index blob cache: payload read failed");
+            return None;
+        }
+        if buf.len() as u64 != payload_len {
+            debug!(
+                read = buf.len(),
+                expected = payload_len,
+                "index blob cache: short payload"
+            );
+            return None;
+        }
+        if !matches!(file.read(&mut [0u8; 1]), Ok(0)) {
+            debug!("index blob cache: trailing bytes after payload");
+            return None;
+        }
+        if Blake2b256::digest(&buf).as_slice() != blake2b {
+            debug!("index blob cache: payload digest mismatch");
+            return None;
+        }
+        Some(buf)
+    }
 }
 
 #[cfg(test)]
@@ -2375,6 +2483,85 @@ mod tests {
     fn index_blob_cache_rejects_generation_zero() {
         let repo_id = [0xDDu8; 32];
         assert!(!index_blob_cache_matches(&repo_id, 0, None, b"x"));
+    }
+
+    #[test]
+    fn index_blob_cache_v2_records_blob_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_id = [0xB1u8; 32];
+        let blob = b"some encrypted index data here";
+        write_index_blob_cache(blob, 9, &repo_id, Some(dir.path())).unwrap();
+
+        let cached = CachedIndexBlob::open(&repo_id, Some(dir.path())).unwrap();
+        assert_eq!(cached.generation(), 9);
+        let expected: [u8; 32] = Blake2b256::digest(blob).into();
+        assert_eq!(cached.blake2b(), &expected);
+        assert_eq!(cached.read_verified().as_deref(), Some(&blob[..]));
+    }
+
+    #[test]
+    fn cached_index_blob_requires_v2_and_nonzero_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let cd = Some(dir.path());
+        let repo_id = [0xB2u8; 32];
+        let blob = b"payload";
+        let path = index_blob_cache_path(&repo_id, cd).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        // v1: magic + version 1 + generation + reserved, then the payload.
+        let mut v1 = INDEX_BLOB_MAGIC.to_vec();
+        v1.extend_from_slice(&1u32.to_le_bytes());
+        v1.extend_from_slice(&5u64.to_le_bytes());
+        v1.extend_from_slice(&0u32.to_le_bytes());
+        v1.extend_from_slice(blob);
+        std::fs::write(&path, &v1).unwrap();
+        assert!(CachedIndexBlob::open(&repo_id, cd).is_none());
+        assert!(!index_blob_cache_matches(&repo_id, 5, cd, blob));
+
+        write_index_blob_cache(blob, 0, &repo_id, cd).unwrap();
+        assert!(CachedIndexBlob::open(&repo_id, cd).is_none());
+
+        write_index_blob_cache(blob, 5, &repo_id, cd).unwrap();
+        let data = std::fs::read(&path).unwrap();
+        std::fs::write(&path, &data[..INDEX_BLOB_HEADER_SIZE - 1]).unwrap();
+        assert!(CachedIndexBlob::open(&repo_id, cd).is_none());
+    }
+
+    #[test]
+    fn cached_index_blob_read_verified_rejects_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        let cd = Some(dir.path());
+        let repo_id = [0xB3u8; 32];
+        let blob = b"some encrypted index data here";
+        let path = index_blob_cache_path(&repo_id, cd).unwrap();
+
+        let corruptions: [fn(&mut Vec<u8>); 3] = [
+            |d| *d.last_mut().unwrap() ^= 1,
+            |d| d.push(0),
+            |d| {
+                d.pop();
+            },
+        ];
+        for corrupt in corruptions {
+            write_index_blob_cache(blob, 3, &repo_id, cd).unwrap();
+            let mut data = std::fs::read(&path).unwrap();
+            corrupt(&mut data);
+            std::fs::write(&path, &data).unwrap();
+            let cached = CachedIndexBlob::open(&repo_id, cd).unwrap();
+            assert!(cached.read_verified().is_none());
+        }
+    }
+
+    #[test]
+    fn cached_index_blob_reads_the_file_it_opened() {
+        let dir = tempfile::tempdir().unwrap();
+        let cd = Some(dir.path());
+        let repo_id = [0xB4u8; 32];
+        write_index_blob_cache(b"first blob", 3, &repo_id, cd).unwrap();
+
+        let cached = CachedIndexBlob::open(&repo_id, cd).unwrap();
+        write_index_blob_cache(b"second, longer blob", 4, &repo_id, cd).unwrap();
+        assert_eq!(cached.read_verified().as_deref(), Some(&b"first blob"[..]));
     }
 
     #[test]

@@ -22,8 +22,8 @@ use crate::RetryConfig;
 use vykar_types::error::{Result, VykarError};
 
 use crate::{
-    ListedObject, RepackPlanRequest, RepackResultResponse, ServerCapabilities, StorageBackend,
-    VerifyPacksPlanRequest, VerifyPacksResponse,
+    ConditionalGet, ListedObject, RepackPlanRequest, RepackResultResponse, ServerCapabilities,
+    StorageBackend, VerifyPacksPlanRequest, VerifyPacksResponse,
 };
 use vykar_types::hash::HashAlgorithm;
 
@@ -609,6 +609,44 @@ impl StorageBackend for RestBackend {
         .map_err(|e| VykarError::Other(format!("REST GET {key}: {e}")))
     }
 
+    /// GET with `If-None-Match: "<hex>"`. A vykar-server that recorded this
+    /// digest for the stored object answers 304. An older server, or a key it
+    /// keeps no digest for, ignores the header and answers as for `get`.
+    fn get_if_changed(&self, key: &str, known_blake2b: &[u8; 32]) -> Result<ConditionalGet> {
+        let url = self.url(key);
+        let validator = format!("\"{}\"", hex::encode(known_blake2b));
+        self.retry_call(
+            &format!("GET {key}"),
+            || {
+                self.authed(self.agent.get(&url))
+                    .header("If-None-Match", &validator)
+                    .call()
+            },
+            |mut resp| {
+                let status = resp.status().as_u16();
+                if status == 304 {
+                    return Ok(ConditionalGet::Unchanged);
+                }
+                if status == 404 {
+                    return Ok(ConditionalGet::Fetched(None));
+                }
+                if status >= 400 {
+                    crate::retry::classify_status(
+                        status,
+                        format!("REST GET {key}: HTTP {status}"),
+                    )?;
+                }
+                let mut buf = Vec::new();
+                resp.body_mut()
+                    .as_reader()
+                    .read_to_end(&mut buf)
+                    .map_err(HttpRetryError::BodyIo)?;
+                Ok(ConditionalGet::Fetched(Some(buf)))
+            },
+        )
+        .map_err(|e| VykarError::Other(format!("REST GET {key}: {e}")))
+    }
+
     fn put(&self, key: &str, data: &[u8]) -> Result<()> {
         self.put_bytes(key, data)
     }
@@ -1174,6 +1212,73 @@ mod tests {
             "the server's message must reach the user, got: {err}"
         );
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn get_if_changed_sends_quoted_validator_and_maps_304() {
+        let (url, request) = capture_request(&empty("304 Not Modified"));
+        let backend = RestBackend::new(&url, None, no_retry(), None).unwrap();
+        let known = [0xABu8; 32];
+        assert_eq!(
+            backend.get_if_changed("index", &known).unwrap(),
+            ConditionalGet::Unchanged
+        );
+        let request = request.join().unwrap();
+        assert!(request.starts_with("GET /index "), "got:\n{request}");
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains(&format!("if-none-match: \"{}\"", hex::encode(known))),
+            "got:\n{request}"
+        );
+    }
+
+    /// Also the "old server ignores the header" case.
+    #[test]
+    fn get_if_changed_returns_body_on_200() {
+        let (url, handle) = mock_server("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello");
+        let backend = RestBackend::new(&url, None, no_retry(), None).unwrap();
+        assert_eq!(
+            backend.get_if_changed("index", &[0; 32]).unwrap(),
+            ConditionalGet::Fetched(Some(b"hello".to_vec()))
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn get_if_changed_maps_404_to_absent() {
+        let (url, handle) = mock_server(&empty("404 Not Found"));
+        let backend = RestBackend::new(&url, None, no_retry(), None).unwrap();
+        assert_eq!(
+            backend.get_if_changed("index", &[0; 32]).unwrap(),
+            ConditionalGet::Fetched(None)
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn get_if_changed_5xx_is_an_error() {
+        let (url, handle) = mock_server(&empty("500 Internal Server Error"));
+        let backend = RestBackend::new(&url, None, no_retry(), None).unwrap();
+        let err = backend
+            .get_if_changed("index", &[0; 32])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("REST GET index"), "got: {err}");
+        assert!(err.contains("500"), "got: {err}");
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn plain_get_sends_no_if_none_match() {
+        let (url, request) = capture_request("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+        let backend = RestBackend::new(&url, None, no_retry(), None).unwrap();
+        assert_eq!(backend.get("index").unwrap(), Some(b"ok".to_vec()));
+        let request = request.join().unwrap();
+        assert!(
+            !request.to_ascii_lowercase().contains("if-none-match"),
+            "got:\n{request}"
+        );
     }
 
     #[test]

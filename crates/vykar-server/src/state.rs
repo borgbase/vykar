@@ -1,11 +1,12 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use chrono::{DateTime, Utc};
 
 use crate::cleanup::{scan_usage, TEMP_DEBRIS_MAX_AGE};
 use crate::config::ServerSection;
+use crate::index_etag::IndexValidator;
 use crate::quota::{self, QuotaState};
 use crate::uploads::PartUploads;
 
@@ -32,6 +33,9 @@ pub struct AppStateInner {
 
     /// In-progress pack part uploads (see `crate::uploads`).
     pub part_uploads: PartUploads,
+
+    /// Conditional-GET record for `index` (see `crate::index_etag`).
+    pub(crate) index_validator: Mutex<Option<IndexValidator>>,
 }
 
 pub(crate) fn read_unpoisoned<'a, T>(
@@ -127,6 +131,7 @@ impl AppState {
                 quota_state,
                 last_backup_at: RwLock::new(None),
                 part_uploads: PartUploads::default(),
+                index_validator: Mutex::new(None),
             }),
         }
     }
@@ -165,8 +170,20 @@ impl AppState {
                 quota_state,
                 last_backup_at: RwLock::new(None),
                 part_uploads: PartUploads::default(),
+                index_validator: Mutex::new(None),
             }),
         }
+    }
+
+    /// The conditional-GET record for `index`. Held across the rename in
+    /// `PUT /index` and across the stat in a conditional `GET /index`, so a
+    /// record always describes the last file the server itself put there.
+    /// The guard is `!Send`: drop it before any `.await`.
+    pub(crate) fn lock_index_validator(&self) -> MutexGuard<'_, Option<IndexValidator>> {
+        self.inner
+            .index_validator
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Resolve a full file path within the repo, ensuring it stays within `data_dir`.

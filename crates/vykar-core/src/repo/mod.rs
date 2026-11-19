@@ -14,6 +14,7 @@ pub(crate) mod write_session;
 
 mod chunks;
 mod commit;
+mod index_fetch;
 mod key;
 mod open;
 mod pack_lookup;

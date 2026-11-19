@@ -211,7 +211,7 @@ impl InnerBackend for FaultyBackend {
 
 vykar_storage::delegate_storage_backend! {
     for FaultyBackend;
-    except [get, put, put_pack, begin_staged_put, profile];
+    except [get, get_if_changed, put, put_pack, begin_staged_put, profile];
 
     // Keep packs on the intercepted `put` path.
     fn begin_staged_put(
@@ -235,6 +235,14 @@ vykar_storage::delegate_storage_backend! {
             ))));
         }
         self.inner.get(key)
+    }
+
+    fn get_if_changed(
+        &self,
+        key: &str,
+        _known: &[u8; 32],
+    ) -> vykar_types::error::Result<vykar_storage::ConditionalGet> {
+        vykar_storage::get_unconditionally(self, key)
     }
 
     fn put(&self, key: &str, data: &[u8]) -> vykar_types::error::Result<()> {
@@ -831,11 +839,19 @@ impl InnerBackend for CountingBackend {
 
 vykar_storage::delegate_storage_backend! {
     for CountingBackend;
-    except [get, list, list_sized];
+    except [get, get_if_changed, list, list_sized];
 
     fn get(&self, key: &str) -> vykar_types::error::Result<Option<Vec<u8>>> {
         self.reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.inner.get(key)
+    }
+
+    fn get_if_changed(
+        &self,
+        key: &str,
+        _known: &[u8; 32],
+    ) -> vykar_types::error::Result<vykar_storage::ConditionalGet> {
+        vykar_storage::get_unconditionally(self, key)
     }
 
     fn list(&self, prefix: &str) -> vykar_types::error::Result<Vec<String>> {

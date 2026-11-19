@@ -262,10 +262,14 @@ These files live under a per-repo local cache root. By default this is the platf
 |- snapshot_list             # Snapshot ID -> SnapshotEntry cache
 |- dedup_cache               # Sorted ChunkId -> stored_size (mmap + xor filter)
 |- restore_cache             # Sorted ChunkId -> pack_id, pack_offset, stored_size (mmap)
-`- full_index_cache          # Sorted full index rows for local rehydration/cache rebuilds
+|- full_index_cache          # Sorted full index rows for local rehydration/cache rebuilds
+`- index_blob                # Raw index blob as last written by this machine, with its BLAKE2b
+                             #   (validator for the conditional GET and the commit fast path)
 ```
 
 The index caches are validated against the current index generation. The authenticated source of truth is `IndexBlob.generation` inside `index`; `index.gen` is only an advisory hint used to avoid unnecessary remote index downloads on read paths. A stale or missing sidecar causes cache misses or full-index fallback, not correctness issues.
+
+On a REST repository, opening with the index and the backup commit ask the server whether `index` still matches `index_blob` (`If-None-Match`). On a `304` the client uses its local copy, verified against the recorded digest, instead of downloading the index.
 
 The `snapshot_list` cache is separate: on open/refresh, the client lists `snapshots/`, removes stale local entries, loads only new snapshot blobs, and persists the resulting snapshot list locally. This avoids O(n) snapshot metadata GETs on every open.
 

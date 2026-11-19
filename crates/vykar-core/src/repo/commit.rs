@@ -6,6 +6,7 @@ use super::file_cache;
 use super::format::{
     pack_object_streaming_with_context, unpack_object_expect_with_context, ObjectType,
 };
+use super::index_fetch::IndexObject;
 use super::manifest::{self, Manifest};
 use super::snapshot_cache;
 use super::{Repository, INDEX_OBJECT_CONTEXT};
@@ -319,7 +320,8 @@ impl Repository {
                     (refresh, marker)
                 })
             });
-            let prefetched = fetch_index.then(|| storage.get("index"));
+            let prefetched = fetch_index
+                .then(|| super::index_fetch::fetch_index_object(storage, repo_id, cache_dir));
             (side.map(join_scoped), prefetched)
         });
         log_stage_elapsed(ctx);
@@ -391,7 +393,7 @@ impl Repository {
     /// caller has flushed packs, taken the session `delta`, refreshed the
     /// snapshot list (unreadable blobs are skipped — a garbage snapshot
     /// that can't be decrypted cannot conflict with a valid name) and, for
-    /// a non-empty delta, fetched the raw remote `index` (`prefetched`):
+    /// a non-empty delta, fetched the remote `index` object (`prefetched`):
     ///   4. Enforce snapshot name uniqueness against the fresh list.
     ///   5. Decode remote index, reconcile delta, persist index.
     ///
@@ -401,7 +403,7 @@ impl Repository {
         &mut self,
         snapshot_entry: &manifest::SnapshotEntry,
         delta: Option<IndexDelta>,
-        prefetched: Option<Result<Option<Vec<u8>>>>,
+        prefetched: Option<Result<IndexObject>>,
         progress: &mut Option<impl FnMut(crate::commands::backup::BackupProgressEvent)>,
     ) -> Result<bool> {
         // 4. Check snapshot name uniqueness against fresh list.
@@ -416,16 +418,41 @@ impl Repository {
         if let Some(delta) = delta {
             if !delta.is_empty() {
                 let ctx = emit_stage(progress, "fetch index");
-                let raw_blob = match prefetched {
+                let object = match prefetched {
                     Some(fetched) => fetched?,
-                    None => self.storage.get("index")?,
+                    None => super::index_fetch::fetch_index_object(
+                        self.storage.as_ref(),
+                        &self.config.id,
+                        self.cache_dir_override.as_deref(),
+                    )?,
                 };
                 log_stage_elapsed(ctx);
 
-                // Try fast path: compare raw blob against cached copy.
-                let fast_path_cache = raw_blob
-                    .as_deref()
-                    .and_then(|raw_data| self.fast_path_full_cache(raw_data));
+                // A 304 for the blob cached at this session's generation is
+                // the comparison `fast_path_full_cache` would make, answered
+                // by storage, so the cached payload is not read on the fast
+                // path. Otherwise compare the raw blob against the cache.
+                let (fast_path_cache, raw_blob) = match object {
+                    IndexObject::Cached(cached) if cached.generation() == self.index_generation => {
+                        match self.full_cache_for_fast_path() {
+                            Some(found) => {
+                                drop(cached);
+                                (Some(found), None)
+                            }
+                            None => (
+                                None,
+                                IndexObject::Cached(cached).into_bytes(self.storage.as_ref())?,
+                            ),
+                        }
+                    }
+                    object => {
+                        let raw_blob = object.into_bytes(self.storage.as_ref())?;
+                        let found = raw_blob
+                            .as_deref()
+                            .and_then(|raw_data| self.fast_path_full_cache(raw_data));
+                        (found, raw_blob)
+                    }
+                };
 
                 if let Some((old_cache, full_cache_path)) = fast_path_cache {
                     // The remote blob was only needed for the comparison; the
@@ -855,7 +882,15 @@ impl Repository {
             );
             return None;
         }
+        self.full_cache_for_fast_path()
+    }
 
+    /// The full index cache at `self.index_generation`, opened for a
+    /// fast-path merge (second half of the fast-path precondition).
+    fn full_cache_for_fast_path(
+        &self,
+    ) -> Option<(dedup_cache::MmapFullIndexCache, std::path::PathBuf)> {
+        let cd = self.cache_dir_override.as_deref();
         // Index unchanged — try to open the full index cache for merge.
         let Some(full_cache_path) = dedup_cache::full_index_cache_path(&self.config.id, cd) else {
             debug!("fast path: no cache dir, falling through to slow path");

@@ -2,7 +2,7 @@
 //! "unsupported" bodies for leaves.
 //!
 //! Every wrapper that holds an inner backend (rate limiter, test recorder, the
-//! `Arc<dyn StorageBackend>` coercion impl) has to forward all 23 trait methods,
+//! `Arc<dyn StorageBackend>` coercion impl) has to forward all 24 trait methods,
 //! and hand-written forwards rot — a forgotten one disabled server-side pack
 //! verification and server init on any throttled REST repo.
 //!
@@ -228,13 +228,14 @@ macro_rules! delegate_storage_backend {
             $($custom)*
 
             $crate::delegate_storage_backend!(@forward
-                [get put delete exists list get_range get_range_into open_range create_dir
+                [get get_if_changed put delete exists list get_range get_range_into open_range create_dir
                  put_owned put_pack begin_staged_put size list_sized remove_stale_temp_files
                  server_repack batch_delete_keys
                  server_verify_packs server_init bind_content_hash
                  server_capabilities object_sizes profile]
                 [$($except)*]);
         }
+        $crate::delegate_storage_backend!(@check_get [$($except)*] [] []);
         $crate::delegate_storage_backend!(@check_list [$($except)*] [] []);
         $crate::delegate_storage_backend!(@check_put [$($except)*] [] []);
         $crate::delegate_storage_backend!(@check_pack [$($except)*] [] []);
@@ -348,6 +349,30 @@ macro_rules! delegate_storage_backend {
         $crate::delegate_storage_backend!(@check_pack [$($rest)*] $put $pack);
     };
 
+    // ── Guard: overriding `get` requires overriding `get_if_changed` ──────
+    //
+    // A forwarded `get_if_changed` reads from the inner backend, past the
+    // wrapper's `get` override (rate limit, recorder, fault injection).
+    // `vykar_storage::get_unconditionally` with `self` keeps it on `get`.
+
+    (@check_get [] [] $cond:tt) => {};
+    (@check_get [] [get] [get_if_changed]) => {};
+    (@check_get [] [get] []) => {
+        compile_error!(
+            "delegate_storage_backend!: a wrapper that overrides `get` must also \
+             override `get_if_changed`, or conditional reads bypass it"
+        );
+    };
+    (@check_get [get $($rest:ident)*] [] $cond:tt) => {
+        $crate::delegate_storage_backend!(@check_get [$($rest)*] [get] $cond);
+    };
+    (@check_get [get_if_changed $($rest:ident)*] $get:tt []) => {
+        $crate::delegate_storage_backend!(@check_get [$($rest)*] $get [get_if_changed]);
+    };
+    (@check_get [$other:ident $($rest:ident)*] $get:tt $cond:tt) => {
+        $crate::delegate_storage_backend!(@check_get [$($rest)*] $get $cond);
+    };
+
     // ── Guard: overriding `list` requires overriding `list_sized` ─────────
     //
     // Otherwise the generated `list_sized` forwards straight to the inner
@@ -392,6 +417,20 @@ macro_rules! delegate_storage_backend {
     (@forward [get $($rest:ident)*] [$($except:ident)*]) => {
         fn get(&self, key: &str) -> $crate::__macro_support::Result<Option<Vec<u8>>> {
             $crate::InnerBackend::inner_backend(self).get(key)
+        }
+        $crate::delegate_storage_backend!(@forward [$($rest)*] [$($except)*]);
+    };
+
+    (@forward [get_if_changed $($rest:ident)*] [get_if_changed $($except:ident)*]) => {
+        $crate::delegate_storage_backend!(@forward [$($rest)*] [$($except)*]);
+    };
+    (@forward [get_if_changed $($rest:ident)*] [$($except:ident)*]) => {
+        fn get_if_changed(
+            &self,
+            key: &str,
+            known_blake2b: &[u8; 32],
+        ) -> $crate::__macro_support::Result<$crate::ConditionalGet> {
+            $crate::InnerBackend::inner_backend(self).get_if_changed(key, known_blake2b)
         }
         $crate::delegate_storage_backend!(@forward [$($rest)*] [$($except)*]);
     };
@@ -689,6 +728,10 @@ mod tests {
             self.hit();
             Ok(None)
         }
+        fn get_if_changed(&self, _key: &str, _known: &[u8; 32]) -> Result<crate::ConditionalGet> {
+            self.hit();
+            Ok(crate::ConditionalGet::Unchanged)
+        }
         fn put(&self, _key: &str, _data: &[u8]) -> Result<()> {
             self.hit();
             Ok(())
@@ -826,12 +869,45 @@ mod tests {
 
     delegate_storage_backend! {
         for Wrapper;
-        except [get];
+        except [get, get_if_changed];
 
         fn get(&self, _key: &str) -> Result<Option<Vec<u8>>> {
             self.custom_gets.fetch_add(1, Ordering::SeqCst);
             Ok(Some(vec![1, 2, 3]))
         }
+        fn get_if_changed(&self, key: &str, _known: &[u8; 32]) -> Result<crate::ConditionalGet> {
+            crate::get_unconditionally(self, key)
+        }
+    }
+
+    struct PlainWrapper {
+        inner: Counter,
+    }
+
+    impl InnerBackend for PlainWrapper {
+        fn inner_backend(&self) -> &dyn StorageBackend {
+            &self.inner
+        }
+    }
+
+    delegate_storage_backend! {
+        for PlainWrapper;
+        except [];
+    }
+
+    /// The generated forward must reach the inner `get_if_changed`, not `get`.
+    #[test]
+    fn forwards_get_if_changed_to_inner_get_if_changed() {
+        let w = PlainWrapper {
+            inner: Counter {
+                calls: AtomicUsize::new(0),
+            },
+        };
+        assert_eq!(
+            w.get_if_changed("k", &[0; 32]).unwrap(),
+            crate::ConditionalGet::Unchanged
+        );
+        assert_eq!(w.inner.calls.load(Ordering::SeqCst), 1);
     }
 
     /// Every method except the overridden one must reach the inner backend.
@@ -853,6 +929,17 @@ mod tests {
         assert_eq!(w.get("k").unwrap(), Some(vec![1, 2, 3]));
         assert_eq!(w.custom_gets.load(Ordering::SeqCst), 1);
         assert_eq!(w.inner.calls.load(Ordering::SeqCst), 0, "get is overridden");
+
+        assert_eq!(
+            w.get_if_changed("k", &[0; 32]).unwrap(),
+            crate::ConditionalGet::Fetched(Some(vec![1, 2, 3]))
+        );
+        assert_eq!(w.custom_gets.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            w.inner.calls.load(Ordering::SeqCst),
+            0,
+            "routed through get"
+        );
 
         w.put("k", b"v").unwrap();
         w.delete("k").unwrap();
@@ -889,7 +976,7 @@ mod tests {
         assert_eq!(p.request_width, 3);
         assert_eq!(p.transfer_width, 3);
 
-        // 23 trait methods, 22 of them forwarded.
+        // 24 trait methods, 22 of them forwarded.
         assert_eq!(w.inner.calls.load(Ordering::SeqCst), 22);
     }
 }

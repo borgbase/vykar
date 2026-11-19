@@ -277,16 +277,24 @@ impl Repository {
     ) -> Result<Self> {
         let (mut repo, file_cache_load) = Self::open_inner(storage, passphrase, cache_dir, &opts)?;
         // The index GET overlaps the file cache load (local disk), which
-        // runs on its own thread; it is decoded only after that load has
+        // runs on its own thread. A local copy confirmed by storage is read
+        // and verified, and the index decoded, only after that load has
         // finished, so the two never hold their transient buffers at once.
-        let raw_index = opts.load_index.then(|| repo.storage.get("index"));
+        let index_object = opts.load_index.then(|| {
+            super::index_fetch::fetch_index_object(
+                repo.storage.as_ref(),
+                &repo.config.id,
+                repo.cache_dir_override.as_deref(),
+            )
+        });
         if let Some(handle) = file_cache_load {
             repo.file_cache = handle
                 .join()
                 .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
         }
-        if let Some(raw_index) = raw_index {
-            let index = Self::decode_full_index(raw_index?, repo.crypto.as_ref())?;
+        if let Some(index_object) = index_object {
+            let raw_index = index_object?.into_bytes(repo.storage.as_ref())?;
+            let index = Self::decode_full_index(raw_index, repo.crypto.as_ref())?;
             // `index_generation` still holds the `index.gen` hint read in
             // `open_inner`, before the index GET.
             let sidecar = repo.index_generation;
@@ -460,11 +468,19 @@ mod tests {
 
     delegate_storage_backend! {
         for GetLog;
-        except [get];
+        except [get, get_if_changed];
 
         fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
             self.gets.lock().unwrap().push(key.to_string());
             self.inner.get(key)
+        }
+
+        fn get_if_changed(
+            &self,
+            key: &str,
+            _known: &[u8; 32],
+        ) -> Result<vykar_storage::ConditionalGet> {
+            vykar_storage::get_unconditionally(self, key)
         }
     }
 

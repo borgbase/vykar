@@ -1022,13 +1022,21 @@ impl InnerBackend for IndexGetCounter {
 
 vykar_storage::delegate_storage_backend! {
     for IndexGetCounter;
-    except [get];
+    except [get, get_if_changed];
 
     fn get(&self, key: &str) -> vykar_types::error::Result<Option<Vec<u8>>> {
         if key == "index" {
             self.index_gets.fetch_add(1, Ordering::Relaxed);
         }
         self.inner.get(key)
+    }
+
+    fn get_if_changed(
+        &self,
+        key: &str,
+        _known: &[u8; 32],
+    ) -> vykar_types::error::Result<vykar_storage::ConditionalGet> {
+        vykar_storage::get_unconditionally(self, key)
     }
 }
 

@@ -48,7 +48,41 @@ pub async fn get_or_list(
         return handle_range_read(&file_path, range_header, &key).await;
     }
 
+    if crate::index_etag::is_index_key(&key) {
+        if let Some(resp) = index_not_modified(&state, &file_path, &headers) {
+            return Ok(resp);
+        }
+    }
+
     stream_full_read(&file_path, &key).await
+}
+
+/// `304 Not Modified` for a `GET /index` whose `If-None-Match` names the digest
+/// recorded by the last `PUT /index`, while the file that PUT produced is still
+/// the one on disk. `None` means serve the object normally (also for any stat
+/// error: the normal read reports it). Synchronous on purpose: the record's
+/// lock is held across the stat.
+fn index_not_modified(
+    state: &AppState,
+    file_path: &std::path::Path,
+    headers: &HeaderMap,
+) -> Option<Response> {
+    let inm = headers
+        .get(axum::http::header::IF_NONE_MATCH)?
+        .to_str()
+        .ok()?;
+    let slot = state.lock_index_validator();
+    let recorded = slot.as_ref()?;
+    if !crate::index_etag::if_none_match_hits(inm, &recorded.digest_hex) {
+        return None;
+    }
+    let meta = std::fs::metadata(file_path).ok()?;
+    if crate::index_etag::FileFingerprint::of(&meta)? != recorded.fingerprint {
+        return None;
+    }
+    let etag = format!("\"{}\"", recorded.digest_hex);
+    drop(slot);
+    Some((StatusCode::NOT_MODIFIED, [(axum::http::header::ETAG, etag)]).into_response())
 }
 
 /// HEAD /{*path} — check existence, return Content-Length.
@@ -99,6 +133,7 @@ pub async fn put_object(
     let file_path = state
         .file_path(&key)
         .ok_or_else(|| ServerError::BadRequest("invalid path".into()))?;
+    let is_index = crate::index_etag::is_index_key(&key);
 
     let existing_meta = match tokio::fs::metadata(&file_path).await {
         Ok(meta) => Some(meta),
@@ -268,9 +303,35 @@ pub async fn put_object(
     // Atomic rename temp → final path (file handle already closed). `persist`
     // consumes the owner, so nothing is unlinked afterwards; on failure the
     // temp is still dropped (and unlinked) with the error.
-    temp_path
-        .persist(&file_path)
-        .map_err(|e| ServerError::from(e.error))?;
+    if is_index {
+        // Only a verified BLAKE2b can answer a conditional GET; any other
+        // PUT clears the record. The lock keeps other `index` writes out
+        // between the rename and the stat, so the fingerprint is this file's.
+        let digest_hex = match &expected_digest {
+            Some((HashAlgorithm::Blake2b, hex)) => Some(hex.clone()),
+            _ => None,
+        };
+        let mut slot = state.lock_index_validator();
+        temp_path
+            .persist(&file_path)
+            .map_err(|e| ServerError::from(e.error))?;
+        let fingerprint = std::fs::metadata(&file_path)
+            .ok()
+            .as_ref()
+            .and_then(crate::index_etag::FileFingerprint::of);
+        *slot = digest_hex
+            .zip(fingerprint)
+            .map(
+                |(digest_hex, fingerprint)| crate::index_etag::IndexValidator {
+                    digest_hex,
+                    fingerprint,
+                },
+            );
+    } else {
+        temp_path
+            .persist(&file_path)
+            .map_err(|e| ServerError::from(e.error))?;
+    }
 
     // Commit the reservation (moves reserved bytes into committed usage) right
     // after the rename, before the fsync below: the file is on disk either
@@ -343,6 +404,9 @@ pub async fn delete_object(
 
     match tokio::fs::remove_file(&file_path).await {
         Ok(()) => {
+            if crate::index_etag::is_index_key(&key) {
+                *state.lock_index_validator() = None;
+            }
             // Temp-file bytes were never committed to `quota_usage` (they live
             // in `quota_reserved` while the upload runs, released on failure),
             // so subtracting them would drift usage low — the unsafe direction.
@@ -1633,6 +1697,206 @@ mod tests {
             body_text.contains("X-Content-BLAKE3") && body_text.contains("64 hex characters"),
             "got: {body_text}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Conditional GET of `index`
+    // -----------------------------------------------------------------------
+
+    const INDEX_PATH: &str = "/index";
+
+    async fn authed_get_with_headers(
+        router: axum::Router,
+        path: &str,
+        headers: &[(&str, &str)],
+    ) -> axum::response::Response {
+        use tower::ServiceExt;
+        let mut builder = axum::http::Request::builder()
+            .method("GET")
+            .uri(path)
+            .header(
+                "Authorization",
+                format!("Bearer {}", super::super::test_helpers::TEST_TOKEN),
+            );
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        router
+            .oneshot(builder.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    async fn get_index_if_none_match(router: axum::Router, hex: &str) -> axum::response::Response {
+        let inm = format!("\"{hex}\"");
+        authed_get_with_headers(router, INDEX_PATH, &[("If-None-Match", &inm)]).await
+    }
+
+    async fn put_index(router: axum::Router, data: &[u8]) -> String {
+        let hex = blake2b_hex(data);
+        let resp = authed_put_with_blake2b(router, INDEX_PATH, data.to_vec(), &hex).await;
+        assert!(resp.status().is_success(), "PUT /index: {}", resp.status());
+        hex
+    }
+
+    #[tokio::test]
+    async fn index_get_with_matching_validator_is_304() {
+        let (router, _state, _tmp) = setup_app(0);
+        let hex = put_index(router.clone(), &[0x11; 300]).await;
+
+        let resp = get_index_if_none_match(router, &hex).await;
+        assert_status(&resp, StatusCode::NOT_MODIFIED);
+        let etag = resp.headers().get("ETag").unwrap().to_str().unwrap();
+        assert_eq!(etag, format!("\"{hex}\""));
+        assert!(body_bytes(resp).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn index_get_with_other_validator_is_200() {
+        let (router, _state, _tmp) = setup_app(0);
+        let data = vec![0x11; 300];
+        put_index(router.clone(), &data).await;
+
+        let resp = get_index_if_none_match(router, &"0".repeat(64)).await;
+        assert_status(&resp, StatusCode::OK);
+        assert_eq!(body_bytes(resp).await, data);
+    }
+
+    #[tokio::test]
+    async fn index_without_record_is_200() {
+        // A PUT without a digest leaves nothing to compare against.
+        let (router, _state, _tmp) = setup_app(0);
+        let data = vec![0x22; 300];
+        let resp = authed_put(router.clone(), INDEX_PATH, data.clone()).await;
+        assert_status(&resp, StatusCode::CREATED);
+        let resp = get_index_if_none_match(router, &blake2b_hex(&data)).await;
+        assert_status(&resp, StatusCode::OK);
+
+        // A file the server did not write (the restart case).
+        let (router, _state, tmp) = setup_app(0);
+        std::fs::write(tmp.path().join("index"), &data).unwrap();
+        let resp = get_index_if_none_match(router, &blake2b_hex(&data)).await;
+        assert_status(&resp, StatusCode::OK);
+        assert_eq!(body_bytes(resp).await, data);
+    }
+
+    #[tokio::test]
+    async fn index_replaced_on_disk_is_200() {
+        let (router, _state, tmp) = setup_app(0);
+        let hex = put_index(router.clone(), &[0x33; 300]).await;
+
+        let staged = tmp.path().join("staged-index");
+        std::fs::write(&staged, vec![0x44; 300]).unwrap();
+        // Same length, so off Unix only the mtime tells the files apart.
+        std::fs::File::options()
+            .write(true)
+            .open(&staged)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(2))
+            .unwrap();
+        std::fs::rename(&staged, tmp.path().join("index")).unwrap();
+
+        let resp = get_index_if_none_match(router, &hex).await;
+        assert_status(&resp, StatusCode::OK);
+        assert_eq!(body_bytes(resp).await, vec![0x44; 300]);
+    }
+
+    #[tokio::test]
+    async fn index_put_with_blake3_clears_record() {
+        let (router, _state, _tmp) = setup_app(0);
+        let first = put_index(router.clone(), &[0x55; 300]).await;
+
+        let data = vec![0x66; 300];
+        let resp = authed_put_with_digests(
+            router.clone(),
+            INDEX_PATH,
+            data.clone(),
+            &[("X-Content-BLAKE3", &blake3_hex(&data))],
+        )
+        .await;
+        assert_status(&resp, StatusCode::NO_CONTENT);
+
+        for hex in [first, blake2b_hex(&data)] {
+            let resp = get_index_if_none_match(router.clone(), &hex).await;
+            assert_status(&resp, StatusCode::OK);
+        }
+    }
+
+    /// A rejected PUT leaves the previous file, and so its record, in place.
+    #[tokio::test]
+    async fn index_put_digest_mismatch_keeps_the_previous_record() {
+        let (router, _state, _tmp) = setup_app(0);
+        let hex = put_index(router.clone(), &[0x77; 300]).await;
+
+        let resp =
+            authed_put_with_blake2b(router.clone(), INDEX_PATH, vec![0x88; 300], &"a".repeat(64))
+                .await;
+        assert_status(&resp, StatusCode::CONFLICT);
+
+        let resp = get_index_if_none_match(router, &hex).await;
+        assert_status(&resp, StatusCode::NOT_MODIFIED);
+    }
+
+    #[tokio::test]
+    async fn if_none_match_on_other_keys_is_ignored() {
+        let (router, _state, _tmp) = setup_app(0);
+        let data = vec![0x99; 100];
+        let hex = blake2b_hex(&data);
+        let resp = authed_put_with_blake2b(router.clone(), CONFIG_PATH, data, &hex).await;
+        assert_status(&resp, StatusCode::CREATED);
+
+        let inm = format!("\"{hex}\"");
+        let resp = authed_get_with_headers(router, CONFIG_PATH, &[("If-None-Match", &inm)]).await;
+        assert_status(&resp, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn range_read_of_index_ignores_if_none_match() {
+        let (router, _state, _tmp) = setup_app(0);
+        let hex = put_index(router.clone(), &[0xAA; 300]).await;
+
+        let inm = format!("\"{hex}\"");
+        let resp = authed_get_with_headers(
+            router,
+            INDEX_PATH,
+            &[("If-None-Match", &inm), ("Range", "bytes=0-9")],
+        )
+        .await;
+        assert_status(&resp, StatusCode::PARTIAL_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn deleted_index_is_404_not_304() {
+        let (router, _state, _tmp) = setup_app(0);
+        let hex = put_index(router.clone(), &[0xBB; 300]).await;
+        let resp = authed_delete(router.clone(), INDEX_PATH).await;
+        assert_status(&resp, StatusCode::NO_CONTENT);
+
+        let resp = get_index_if_none_match(router, &hex).await;
+        assert_status(&resp, StatusCode::NOT_FOUND);
+    }
+
+    /// Consistency check, not a race test: after two overlapping PUTs the
+    /// record describes whichever file is left on disk, and only that one.
+    #[tokio::test]
+    async fn index_record_matches_the_file_left_on_disk() {
+        let (router, _state, tmp) = setup_app(0);
+        let a = vec![0xC1; 300];
+        let b = vec![0xC2; 300];
+        let (hex_a, hex_b) =
+            tokio::join!(put_index(router.clone(), &a), put_index(router.clone(), &b));
+
+        let on_disk = std::fs::read(tmp.path().join("index")).unwrap();
+        let (kept, other) = if on_disk == a {
+            (hex_a, hex_b)
+        } else {
+            assert_eq!(on_disk, b);
+            (hex_b, hex_a)
+        };
+        let resp = get_index_if_none_match(router.clone(), &kept).await;
+        assert_status(&resp, StatusCode::NOT_MODIFIED);
+        let resp = get_index_if_none_match(router, &other).await;
+        assert_status(&resp, StatusCode::OK);
     }
 
     /// The old-client path must keep working against a new server: this is the

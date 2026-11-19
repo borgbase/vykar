@@ -710,7 +710,7 @@ mod tests {
 
     vykar_storage::delegate_storage_backend! {
         for FailGetBackend;
-        except [get, size];
+        except [get, get_if_changed, size];
 
         fn get(&self, key: &str) -> vykar_types::error::Result<Option<Vec<u8>>> {
             if key.starts_with(&self.fail_prefix) {
@@ -719,6 +719,14 @@ mod tests {
                 ));
             }
             self.inner.get(key)
+        }
+
+        fn get_if_changed(
+            &self,
+            key: &str,
+            _known: &[u8; 32],
+        ) -> vykar_types::error::Result<vykar_storage::ConditionalGet> {
+            vykar_storage::get_unconditionally(self, key)
         }
 
         // Route through the overridden `get` (like the pre-macro trait default

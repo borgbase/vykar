@@ -17,6 +17,7 @@ mod cleanup;
 pub mod config;
 pub mod error;
 pub mod handlers;
+mod index_etag;
 pub mod quota;
 pub mod state;
 mod uploads;

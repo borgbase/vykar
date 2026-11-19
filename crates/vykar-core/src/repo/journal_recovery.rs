@@ -543,11 +543,19 @@ mod tests {
 
     vykar_storage::delegate_storage_backend! {
         for GetLoggingBackend;
-        except [get];
+        except [get, get_if_changed];
 
         fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
             self.gets.lock().unwrap().push(key.to_string());
             self.inner.get(key)
+        }
+
+        fn get_if_changed(
+            &self,
+            key: &str,
+            _known: &[u8; 32],
+        ) -> Result<vykar_storage::ConditionalGet> {
+            vykar_storage::get_unconditionally(self, key)
         }
     }
 

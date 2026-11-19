@@ -296,7 +296,16 @@ impl SftpBackend {
     ) -> Result<Self> {
         let key_path = key_path.map(expand_tilde_path);
         // Like OpenSSH's IdentityFile, sftp_key may name the public half of an agent-held key.
-        let agent_key = key_path.as_deref().and_then(|p| load_public_key(p).ok());
+        // A `.pub` that fails to load must not fall through to the private-key path.
+        let agent_key = match key_path.as_deref() {
+            Some(p) if p.extension().is_some_and(|e| e == "pub") => {
+                Some(load_public_key(p).map_err(|e| {
+                    VykarError::Other(format!("load SSH public key {}: {e}", p.display()))
+                })?)
+            }
+            Some(p) => load_public_key(p).ok(),
+            None => None,
+        };
         let user = user
             .map(|u| u.to_string())
             .unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "unknown".into()));
@@ -2078,6 +2087,30 @@ mod tests {
             .unwrap();
         assert_eq!(read(&server, "index"), b"retried agent");
         assert!(!server.faults.drop_agent_once.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn unreadable_pub_sftp_key_is_reported_as_public_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let bad = dir.path().join("bad.pub");
+        std::fs::write(&bad, "not a key\n").unwrap();
+        for path in [bad, dir.path().join("missing.pub")] {
+            let err = SftpBackend::new(
+                "127.0.0.1",
+                Some("vykar"),
+                None,
+                "/repo",
+                path.to_str(),
+                None,
+                Some("/nonexistent/known_hosts"),
+                Some(4),
+                None,
+                RetryConfig::default(),
+            )
+            .err()
+            .expect("a .pub sftp_key that does not load must fail");
+            assert!(err.to_string().contains("SSH public key"), "{err}");
+        }
     }
 
     #[test]

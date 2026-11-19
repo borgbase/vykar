@@ -8,7 +8,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use blake2::{Blake2b256, Digest};
 use vykar_storage::{delegate_storage_backend, ConditionalGet, InnerBackend, StorageBackend};
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::Result;
@@ -112,7 +111,7 @@ delegate_storage_backend! {
         self.inner.get(key)
     }
 
-    fn get_if_changed(&self, key: &str, known_blake2b: &[u8; 32]) -> Result<ConditionalGet> {
+    fn get_if_changed(&self, key: &str, known_blake3: &[u8; 32]) -> Result<ConditionalGet> {
         let call = self.cond_calls.fetch_add(1, Ordering::SeqCst);
         let answer = if call >= self.etag.switch_at {
             self.etag.late.clone()
@@ -125,7 +124,7 @@ delegate_storage_backend! {
             Answer::Honest => {
                 let data = self.inner.get(key)?;
                 match &data {
-                    Some(bytes) if Blake2b256::digest(bytes).as_slice() == known_blake2b => {
+                    Some(bytes) if blake3::hash(bytes).as_bytes() == known_blake3 => {
                         Ok(self.not_modified())
                     }
                     _ => Ok(self.fetched(key, data)),

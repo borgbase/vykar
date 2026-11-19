@@ -67,7 +67,7 @@ use self::manifest::Manifest;
 /// binaries.
 ///
 /// Only chunk IDs and pack IDs follow the format. Every other digest in the
-/// workspace stays BLAKE2b for all versions — see the "Repository Versions"
+/// workspace is BLAKE3 for all versions — see the "Repository Versions"
 /// subsection of `docs/src/content/docs/architecture.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RepoFormat {

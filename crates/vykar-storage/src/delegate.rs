@@ -428,9 +428,9 @@ macro_rules! delegate_storage_backend {
         fn get_if_changed(
             &self,
             key: &str,
-            known_blake2b: &[u8; 32],
+            known_blake3: &[u8; 32],
         ) -> $crate::__macro_support::Result<$crate::ConditionalGet> {
-            $crate::InnerBackend::inner_backend(self).get_if_changed(key, known_blake2b)
+            $crate::InnerBackend::inner_backend(self).get_if_changed(key, known_blake3)
         }
         $crate::delegate_storage_backend!(@forward [$($rest)*] [$($except)*]);
     };

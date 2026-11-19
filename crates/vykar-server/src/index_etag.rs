@@ -1,8 +1,9 @@
 //! Conditional GET of the repository `index` (`If-None-Match` -> 304).
 //!
-//! The digest is the BLAKE2b-256 the server verified on the last
-//! `PUT /index` (`X-Content-BLAKE2b`, which REST clients send for every
-//! non-pack object regardless of repository format). It is held in memory
+//! The digest is the BLAKE3 the server verified on the last `PUT /index`
+//! (`X-Content-BLAKE3`, which REST clients send for every non-pack object to
+//! a server that advertises `blake3`). A BLAKE2b-verified PUT, from an older
+//! client, leaves no validator. It is held in memory
 //! only, and bound to the identity of the file that PUT produced: the path is
 //! stat'ed right after the rename, under the lock that also covers every
 //! other server write of `index`. So an `index` replaced any other way never

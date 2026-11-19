@@ -2,7 +2,6 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use blake2::{Blake2b128, Digest};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
@@ -25,7 +24,13 @@ use vykar_types::snapshot_id::SnapshotId;
 /// dispatch unambiguous: a legacy v1 plaintext (raw msgpack starting
 /// with a fix-array/fix-map header) can never be misread as v2, and a
 /// v2 plaintext can never be misread as raw compressed data.
-const FORMAT_VERSION_BYTE: u8 = 0x10;
+///
+/// `0x11` keys entries by BLAKE3 path hashes; `0x10` used BLAKE2b-128 and is
+/// rejected on load, costing one backup that re-reads every file.
+const FORMAT_VERSION_BYTE: u8 = 0x11;
+
+/// The BLAKE2b-128-keyed predecessor of [`FORMAT_VERSION_BYTE`].
+const LEGACY_BLAKE2B_FORMAT_BYTE: u8 = 0x10;
 
 /// Atomic write via temp file + fsync + rename. On error the temp file is
 /// cleaned up automatically (NamedTempFile drops on panic/early return).
@@ -55,7 +60,7 @@ pub(crate) fn repo_cache_dir(repo_id: &[u8], cache_dir_override: Option<&Path>) 
     base.map(|b| b.join(hex::encode(repo_id)))
 }
 
-/// 16-byte BLAKE2b hash of a file path, used as a compact HashMap key.
+/// 16-byte BLAKE3 hash of a file path, used as a compact HashMap key.
 /// `Ord` only serves the sorted retained-hit list (see `RetainedHit`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct PathHash([u8; 16]);
@@ -103,17 +108,13 @@ impl<'de> serde::Deserialize<'de> for PathHash {
     }
 }
 
-/// Hash a path to its 16-byte file-cache key.
-///
-/// Deliberately BLAKE2b for every repository format, including v3. Note this is
-/// `Blake2b128`, i.e. BLAKE2b-**128**, which is a different digest from a
-/// truncated BLAKE2b-256 — do not "unify" the two. Changing it would
-/// invalidate every local file cache, and it hashes short path strings where
-/// digest throughput is irrelevant.
+/// Hash a path to its 16-byte file-cache key: the first 16 bytes of
+/// `BLAKE3(path)`.
 fn hash_path(path: &str) -> PathHash {
-    let mut hasher = Blake2b128::new();
-    hasher.update(path.as_bytes());
-    PathHash(hasher.finalize().into())
+    let digest = blake3::hash(path.as_bytes());
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&digest.as_bytes()[..16]);
+    PathHash(out)
 }
 
 /// Compact chunk reference used only in the local filecache. Drops the
@@ -845,6 +846,11 @@ impl FileCache {
                 error: "empty plaintext".into(),
             };
         };
+        if first == LEGACY_BLAKE2B_FORMAT_BYTE {
+            return CacheDecode::Rejected {
+                reason: "pre-BLAKE3 path keys",
+            };
+        }
         if first != FORMAT_VERSION_BYTE {
             return CacheDecode::Malformed {
                 error: format!("unrecognised filecache format byte 0x{first:02x}"),
@@ -2329,28 +2335,29 @@ mod tests {
     const _CACHED_CHUNKS_SIZE_OK: () = assert!(std::mem::size_of::<CachedChunks>() <= 48);
     const _PARENT_ENTRY_SIZE_OK: () = assert!(std::mem::size_of::<ParentEntry>() <= 88);
 
-    /// Pins the 16-byte file-cache path key.
-    ///
-    /// It is BLAKE2b-**128** (`Blake2bVar::new(16)`), not a truncated
-    /// BLAKE2b-256, and stays that way for every repository format. A change
-    /// here silently invalidates every user's local file cache, so this is a
+    /// Pins the 16-byte file-cache path key (truncated BLAKE3). A change here
+    /// silently invalidates every user's local file cache, so this is a
     /// compatibility assertion, not a stale expectation to regenerate.
-    /// Cross-checked against Python's `hashlib.blake2b(digest_size=16)`.
     #[test]
     fn path_hash_known_answer() {
         assert_eq!(
             hex::encode(hash_path("/var/lib/vykar/example.bin").0),
-            "448ba6eaa656aeb83627f356e8663e5f"
+            "a1e0b61df2afa5f0d0d44a12737d088c"
         );
-        // Distinct from the first 16 bytes of BLAKE2b-256 over the same input.
-        let mut wide = blake2::Blake2b256::new();
-        blake2::Digest::update(&mut wide, b"/var/lib/vykar/example.bin");
-        let out = blake2::Digest::finalize(wide);
-        assert_ne!(
-            hash_path("/var/lib/vykar/example.bin").0,
-            out[..16],
-            "BLAKE2b-128 must not be conflated with a truncated BLAKE2b-256"
-        );
+    }
+
+    #[test]
+    fn blake2b_keyed_cache_is_rejected() {
+        let mut blob = vec![LEGACY_BLAKE2B_FORMAT_BYTE];
+        crate::compress::compress_stream_zstd(&mut blob, 3, |enc| {
+            std::io::Write::write_all(enc, &rmp_serde::to_vec(&FileCache::new()).unwrap())?;
+            Ok(())
+        })
+        .unwrap();
+        assert!(matches!(
+            FileCache::decode_from_plaintext_outcome(&blob),
+            CacheDecode::Rejected { .. }
+        ));
     }
 
     #[test]

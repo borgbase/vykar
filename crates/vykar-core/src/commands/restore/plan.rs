@@ -31,25 +31,21 @@ use super::{push_metadata_warning, warn_metadata_err, RestoreStats, MAX_HARDLINK
 pub(super) struct RepInfo {
     pub(super) rel_path: PathBuf,
     pub(super) size: u64,
-    /// BLAKE2b-256 over the representative's ordered chunk ids — the content
+    /// BLAKE3 over the representative's ordered chunk ids — the content
     /// identity a candidate member must match to be linked rather than
     /// independently materialized. See [`chunks_fingerprint`].
     pub(super) chunks_fp: [u8; 32],
 }
 
-/// Fingerprint a file's content as BLAKE2b-256 over its ordered chunk ids.
+/// Fingerprint a file's content as BLAKE3 over its ordered chunk ids.
 /// Chunk ids are content-addressed, so two files with the same fingerprint
 /// have byte-identical content. Used to gate hard-link relinking: only members
 /// whose fingerprint matches their group representative are linked (one inode,
 /// one content); a mismatch — produced by inode-number reuse during the walk —
 /// is materialized independently from its own chunks, never silently replaced
-/// by the representative's content.
-/// Deliberately BLAKE2b for every repository format, including v3: the
-/// fingerprint is runtime-only and never persisted, so it is not part of any
-/// repository format.
+/// by the representative's content. Runtime-only, never persisted.
 pub(super) fn chunks_fingerprint(chunks: &[ChunkRef]) -> [u8; 32] {
-    use blake2::{Blake2b256, Digest};
-    let mut hasher = Blake2b256::new();
+    let mut hasher = blake3::Hasher::new();
     for c in chunks {
         hasher.update(c.id.as_bytes());
     }

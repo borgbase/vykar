@@ -14,8 +14,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use blake2::{Blake2b256, Digest};
-
 use crate::http_util::HttpTimeouts;
 use crate::retry::HttpRetryError;
 use crate::RetryConfig;
@@ -25,7 +23,7 @@ use crate::{
     ConditionalGet, ListedObject, RepackPlanRequest, RepackResultResponse, ServerCapabilities,
     StorageBackend, VerifyPacksPlanRequest, VerifyPacksResponse,
 };
-use vykar_types::hash::HashAlgorithm;
+use vykar_types::hash::{HashAlgorithm, Hasher256};
 
 /// Read a short prefix of a response body for use in an error message.
 ///
@@ -78,11 +76,11 @@ pub struct RestBackend {
     /// Set once the server has answered `?sizes` as an unknown request, so a
     /// process probes an old server at most once.
     sizes_unsupported: AtomicBool,
-    /// Whether the server accepts pack uploads in parts, from `/health`.
-    /// Probed on the first pack large enough to split (or recorded by an
-    /// explicit [`StorageBackend::server_capabilities`] call), so a backup
-    /// that uploads nothing pays no extra round trip.
-    pack_parts: OnceLock<bool>,
+    /// What `/health` advertised. Probed on first need (a pack large enough
+    /// to split, or a non-pack PUT on a backend not bound to BLAKE3), or
+    /// recorded by an explicit [`StorageBackend::server_capabilities`] call,
+    /// so a backup that uploads nothing pays no extra round trip.
+    probed: OnceLock<ProbedCaps>,
     /// Set when the part path failed permanently; later packs use whole PUTs.
     parts_disabled: AtomicBool,
     /// Set by the first completed part upload. Until then a part upload
@@ -95,6 +93,30 @@ pub struct RestBackend {
     part_size: usize,
     request_width: usize,
     transfer_width: usize,
+}
+
+/// The upload header carrying a content digest under `algo`.
+fn digest_header(algo: HashAlgorithm) -> &'static str {
+    match algo {
+        HashAlgorithm::Blake2b => "X-Content-BLAKE2b",
+        HashAlgorithm::Blake3 => "X-Content-BLAKE3",
+    }
+}
+
+/// The parts of [`ServerCapabilities`] the client acts on.
+#[derive(Clone, Copy, Default)]
+struct ProbedCaps {
+    pack_parts: bool,
+    blake3: bool,
+}
+
+impl From<&ServerCapabilities> for ProbedCaps {
+    fn from(caps: &ServerCapabilities) -> Self {
+        Self {
+            pack_parts: caps.pack_parts,
+            blake3: caps.supports_hash(HashAlgorithm::Blake3),
+        }
+    }
 }
 
 impl RestBackend {
@@ -138,7 +160,7 @@ impl RestBackend {
             timeouts,
             content_hash: OnceLock::new(),
             sizes_unsupported: AtomicBool::new(false),
-            pack_parts: OnceLock::new(),
+            probed: OnceLock::new(),
             parts_disabled: AtomicBool::new(false),
             parts_proven: AtomicBool::new(false),
             part_slots: crate::http_util::PartSlots::new(part_concurrency),
@@ -434,29 +456,43 @@ impl RestBackend {
         }
     }
 
-    /// Compute unkeyed BLAKE2b-256 and return the 64-char hex string.
-    /// Used for non-pack objects (manifest, index, snapshots, config).
-    fn compute_blake2b_256_hex(data: &[u8]) -> String {
-        let mut hasher = Blake2b256::new();
+    /// Unkeyed digest of a non-pack object (manifest, index, snapshots,
+    /// config) as `(header, 64-char hex)`.
+    fn non_pack_digest(&self, data: &[u8]) -> (&'static str, String) {
+        let algo = self.non_pack_hash();
+        let mut hasher = Hasher256::new(algo);
         hasher.update(data);
-        hex::encode(hasher.finalize())
+        (digest_header(algo), hasher.finalize_hex())
+    }
+
+    /// BLAKE3 unless the server cannot verify it. A BLAKE3 binding proves it
+    /// can, since packs go up under that header; otherwise `/health` decides.
+    /// A failed probe falls back to BLAKE2b, which every server verifies.
+    fn non_pack_hash(&self) -> HashAlgorithm {
+        if self.content_hash() == HashAlgorithm::Blake3 || self.probed_caps().blake3 {
+            HashAlgorithm::Blake3
+        } else {
+            HashAlgorithm::Blake2b
+        }
+    }
+
+    /// `/health`, probed at most once. A failed probe counts as "nothing
+    /// supported".
+    fn probed_caps(&self) -> ProbedCaps {
+        *self.probed.get_or_init(|| {
+            self.fetch_server_capabilities()
+                .map(|caps| ProbedCaps::from(&caps))
+                .unwrap_or_else(|e| {
+                    tracing::debug!("REST: capability probe failed, assuming an old server: {e}");
+                    ProbedCaps::default()
+                })
+        })
     }
 
     /// Whether packs go up in parts: the server advertised `pack_parts` and
-    /// the path has not failed permanently. The first call probes `/health`;
-    /// a failed probe counts as "not supported".
+    /// the path has not failed permanently.
     fn pack_parts_enabled(&self) -> bool {
-        if self.parts_disabled.load(Ordering::Relaxed) {
-            return false;
-        }
-        *self.pack_parts.get_or_init(|| {
-            self.fetch_server_capabilities()
-                .map(|caps| caps.pack_parts)
-                .unwrap_or_else(|e| {
-                    tracing::debug!("REST: capability probe failed, uploading packs whole: {e}");
-                    false
-                })
-        })
+        !self.parts_disabled.load(Ordering::Relaxed) && self.probed_caps().pack_parts
     }
 
     /// The content-digest algorithm this backend was bound to, defaulting to
@@ -467,10 +503,7 @@ impl RestBackend {
 
     /// The digest header naming a pack's content hash.
     fn pack_digest_header(&self) -> &'static str {
-        match self.content_hash() {
-            HashAlgorithm::Blake2b => "X-Content-BLAKE2b",
-            HashAlgorithm::Blake3 => "X-Content-BLAKE3",
-        }
+        digest_header(self.content_hash())
     }
 
     /// Whether a pack of `len` bytes goes up in parts.
@@ -501,7 +534,7 @@ impl RestBackend {
     /// *is* the pack ID, so the hex is lifted straight out of the key — which
     /// means that for packs only the header *name* changes with the
     /// algorithm, because the value is already the right digest. Non-pack
-    /// objects are hashed here and stay BLAKE2b unconditionally.
+    /// objects are hashed here, see [`Self::non_pack_digest`].
     fn put_bytes(&self, key: &str, data: &[u8]) -> Result<()> {
         let (header, checksum) = match Self::try_extract_pack_hex(key) {
             Some(pack_hex) => {
@@ -514,7 +547,7 @@ impl RestBackend {
                 }
                 (header, pack_hex.to_string())
             }
-            None => ("X-Content-BLAKE2b", Self::compute_blake2b_256_hex(data)),
+            None => self.non_pack_digest(data),
         };
         self.put_whole(key, header, &checksum, data)
     }
@@ -612,9 +645,9 @@ impl StorageBackend for RestBackend {
     /// GET with `If-None-Match: "<hex>"`. A vykar-server that recorded this
     /// digest for the stored object answers 304. An older server, or a key it
     /// keeps no digest for, ignores the header and answers as for `get`.
-    fn get_if_changed(&self, key: &str, known_blake2b: &[u8; 32]) -> Result<ConditionalGet> {
+    fn get_if_changed(&self, key: &str, known_blake3: &[u8; 32]) -> Result<ConditionalGet> {
         let url = self.url(key);
-        let validator = format!("\"{}\"", hex::encode(known_blake2b));
+        let validator = format!("\"{}\"", hex::encode(known_blake3));
         self.retry_call(
             &format!("GET {key}"),
             || {
@@ -932,7 +965,7 @@ impl StorageBackend for RestBackend {
 
     fn server_capabilities(&self) -> Result<ServerCapabilities> {
         let caps = self.fetch_server_capabilities()?;
-        let _ = self.pack_parts.set(caps.pack_parts);
+        let _ = self.probed.set(ProbedCaps::from(&caps));
         Ok(caps)
     }
 
@@ -1168,10 +1201,16 @@ mod tests {
         }
     }
 
-    /// Non-pack objects are hashed by the client and stay BLAKE2b regardless
-    /// of the repository format.
+    fn hex_digest(algo: HashAlgorithm, data: &[u8]) -> String {
+        let mut hasher = Hasher256::new(algo);
+        hasher.update(data);
+        hasher.finalize_hex()
+    }
+
+    /// Under a BLAKE3 binding the server is known to verify BLAKE3, so a
+    /// non-pack object goes up under it without a probe.
     #[test]
-    fn non_pack_upload_stays_blake2b_under_a_blake3_binding() {
+    fn non_pack_upload_is_blake3_under_a_blake3_binding() {
         let (url, request_line) =
             capture_request("HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n");
         let backend = RestBackend::new(&url, None, no_retry(), None).unwrap();
@@ -1183,12 +1222,59 @@ mod tests {
         let request = request_line.join().unwrap().to_ascii_lowercase();
         assert!(
             request.contains(&format!(
-                "x-content-blake2b: {}",
-                RestBackend::compute_blake2b_256_hex(data)
+                "x-content-blake3: {}",
+                hex_digest(HashAlgorithm::Blake3, data)
             )),
             "got:\n{request}"
         );
-        assert!(!request.contains("x-content-blake3"), "got:\n{request}");
+        assert!(!request.contains("x-content-blake2b"), "got:\n{request}");
+    }
+
+    /// Unbound (or v2-bound), the header follows `/health`: BLAKE3 when
+    /// advertised, BLAKE2b for a pre-0.20 server or a failed probe.
+    #[test]
+    fn non_pack_upload_header_follows_the_server_capabilities() {
+        const LEGACY: &str = r#"{"status":"ok","version":"0.19.0"}"#;
+        let data = b"repository index bytes";
+        let b2 = hex_digest(HashAlgorithm::Blake2b, data);
+        let b3 = hex_digest(HashAlgorithm::Blake3, data);
+        for (health, bind, expected) in [
+            (Some(HEALTH_PARTS), None, format!("x-content-blake3: {b3}")),
+            (
+                Some(HEALTH_PARTS),
+                Some(HashAlgorithm::Blake2b),
+                format!("x-content-blake3: {b3}"),
+            ),
+            (Some(LEGACY), None, format!("x-content-blake2b: {b2}")),
+            (None, None, format!("x-content-blake2b: {b2}")),
+        ] {
+            let (url, seen) = routing_server(move |line| {
+                if line.starts_with("GET /health") {
+                    health.map_or_else(|| empty("404 Not Found"), json_response)
+                } else {
+                    empty("201 Created")
+                }
+            });
+            let backend = RestBackend::new(&url, None, no_retry(), None).unwrap();
+            if let Some(algo) = bind {
+                backend.bind_content_hash(algo).unwrap();
+            }
+            backend.put("index", data).unwrap();
+            backend.put("index", data).unwrap();
+
+            let seen = seen.lock().unwrap().clone();
+            assert_eq!(
+                count(&seen, |s| s.line.starts_with("GET /health")),
+                1,
+                "{seen:#?}"
+            );
+            let puts: Vec<_> = seen.iter().filter(|s| is_whole(s)).collect();
+            assert_eq!(puts.len(), 2, "{seen:#?}");
+            for put in puts {
+                let head = put.head.to_ascii_lowercase();
+                assert!(head.contains(&expected), "{health:?}: got\n{head}");
+            }
+        }
     }
 
     /// A 400 must carry the server's own message. Without this the old-server
@@ -2056,16 +2142,6 @@ mod tests {
     #[test]
     fn extract_pack_hex_returns_none_for_short_hex() {
         assert_eq!(RestBackend::try_extract_pack_hex("packs/ab/tooshort"), None);
-    }
-
-    #[test]
-    fn compute_blake2b_matches_pack_id() {
-        use vykar_types::hash::HashAlgorithm;
-        use vykar_types::pack_id::PackId;
-        let data = b"hello world test data for blake2b verification";
-        let pack_id = PackId::compute(data, HashAlgorithm::Blake2b);
-        let computed = RestBackend::compute_blake2b_256_hex(data);
-        assert_eq!(computed, pack_id.to_hex());
     }
 
     #[test]

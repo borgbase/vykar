@@ -19,8 +19,7 @@ vykar-protocol.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 
-# Crypto (REST backend uses BLAKE2b for checksums)
-blake2.workspace = true
+# Crypto
 hex.workspace = true
 rand.workspace = true
 

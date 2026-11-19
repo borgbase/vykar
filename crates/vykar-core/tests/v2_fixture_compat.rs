@@ -401,39 +401,44 @@ fn v2_encrypted_fixtures_reject_a_wrong_passphrase() {
 
 // ── Local state written by the pre-change binary ───────────────────────────
 
-/// The pin file name is a cache key over the repository URL, which necessarily
-/// differs between fixture-generation time and test time. Reproduced here from
-/// `identity::pin_file_path`; the test below proves the derivation still names
-/// the file the implementation reads.
+/// `identity::pin_file_path`, reproduced so the test can name the file the
+/// implementation reads.
 fn pin_file_name(url: &str) -> String {
-    use blake2::{Blake2b256, Digest};
-    let mut hasher = Blake2b256::new();
-    hasher.update(url.as_bytes());
-    format!("pin.{}", hex::encode(hasher.finalize()))
+    format!("pin3.{}", blake3::hash(url.as_bytes()).to_hex())
 }
 
+/// The pre-BLAKE3 fingerprint, `BLAKE2b-256(repo_id || chunk_id_key)`.
+fn legacy_fingerprint(repo_id: &[u8], chunk_id_key: &[u8; 32]) -> String {
+    use blake2::{Blake2b256, Digest};
+    let mut hasher = Blake2b256::new();
+    hasher.update(repo_id);
+    hasher.update(chunk_id_key);
+    hex::encode(hasher.finalize())
+}
+
+/// Pins written before the BLAKE3 switch are left alone and ignored: the first
+/// open re-pins under the new name (the accepted one-time TOFU gap), and from
+/// then on the new pin is enforced.
 #[test]
-fn v2_fixture_pin_files_still_validate() {
+fn v2_fixture_pin_files_are_superseded() {
     for mode in MODES {
         let fx = extract(mode);
         let repo = fx.open();
         let url = fx.repo_dir().to_string_lossy().into_owned();
+        let repo_id = &repo.config.id;
+        let key = repo.crypto.chunk_hasher().key();
 
-        // The fingerprint is BLAKE2b(repo_id || chunk_id_key) and stays
-        // BLAKE2b for every repository format. For the plaintext fixture it
-        // also pins the derived chunk-ID key, which format v3 changes.
-        let fingerprint =
-            identity::compute_fingerprint(&repo.config.id, repo.crypto.chunk_hasher().key());
+        // Guards the fixture reading: the pin really is the old derivation.
         assert_eq!(
-            hex::encode(fingerprint),
+            legacy_fingerprint(repo_id, key),
             fx.pin_fingerprint,
-            "{mode}: identity fingerprint drifted from the pre-change binary"
+            "{mode}: fixture pin is not the BLAKE2b fingerprint"
         );
+        let fingerprint = hex::encode(identity::compute_fingerprint(repo_id, key));
+        assert_ne!(fingerprint, fx.pin_fingerprint, "{mode}");
 
-        // Move the pre-change pin file to the name this repo URL hashes to,
-        // then let the real code path validate it.
         let cache = fx.cache_dir();
-        let original = std::fs::read_dir(&cache)
+        let legacy_pin = std::fs::read_dir(&cache)
             .unwrap()
             .filter_map(|e| e.ok().map(|e| e.path()))
             .find(|p| {
@@ -442,41 +447,39 @@ fn v2_fixture_pin_files_still_validate() {
                     .is_some_and(|n| n.starts_with("pin."))
             })
             .unwrap_or_else(|| panic!("{mode}: fixture has no pin file"));
+        let legacy_bytes = std::fs::read(&legacy_pin).unwrap();
+
+        // Rewrite the old pin to contradict this repository, as it would after
+        // a re-init. It must not be consulted.
+        let mut pin: serde_json::Value = serde_json::from_slice(&legacy_bytes).unwrap();
+        pin["fingerprint"] = serde_json::Value::String("0".repeat(64));
+        std::fs::write(&legacy_pin, serde_json::to_vec(&pin).unwrap()).unwrap();
+        let legacy_bytes = std::fs::read(&legacy_pin).unwrap();
+
+        identity::verify_or_pin(&url, repo_id, key, Some(&cache), false)
+            .unwrap_or_else(|e| panic!("{mode}: old pin was consulted: {e}"));
+        assert_eq!(std::fs::read(&legacy_pin).unwrap(), legacy_bytes, "{mode}");
+
         let target = cache.join(pin_file_name(&url));
-        std::fs::rename(&original, &target).unwrap();
-
-        identity::verify_or_pin(
-            &url,
-            &repo.config.id,
-            repo.crypto.chunk_hasher().key(),
-            Some(&cache),
-            false, // no --trust-repo
-        )
-        .unwrap_or_else(|e| panic!("{mode}: pre-change pin file rejected: {e}"));
-
-        // Closing the loop: corrupt the file we just placed and confirm the
-        // same call now fails. Without this, a wrong `pin_file_name` would
-        // silently make the assertion above a TOFU no-op.
-        let mut pin: serde_json::Value =
+        let new_pin: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&target).unwrap()).unwrap();
+        assert_eq!(new_pin["fingerprint"], fingerprint.as_str(), "{mode}");
+
+        // Closing the loop: the new pin is enforced.
+        let mut pin = new_pin;
         pin["fingerprint"] = serde_json::Value::String("0".repeat(64));
         std::fs::write(&target, serde_json::to_vec(&pin).unwrap()).unwrap();
         assert!(
-            identity::verify_or_pin(
-                &url,
-                &repo.config.id,
-                repo.crypto.chunk_hasher().key(),
-                Some(&cache),
-                false,
-            )
-            .is_err(),
+            identity::verify_or_pin(&url, repo_id, key, Some(&cache), false).is_err(),
             "{mode}: verify_or_pin does not read the pin file this test writes"
         );
     }
 }
 
+/// The pre-change file cache keys paths by BLAKE2b-128, so it is dropped on
+/// load rather than misread: the next backup re-reads every file once.
 #[test]
-fn v2_fixture_file_caches_still_load() {
+fn v2_fixture_file_caches_are_dropped() {
     for mode in MODES {
         let fx = extract(mode);
         let repo = fx.open();
@@ -493,9 +496,8 @@ fn v2_fixture_file_caches_still_load() {
 
         let loaded = FileCache::load(&repo.config.id, repo.crypto.as_ref(), Some(&cache));
         assert!(
-            !loaded.is_empty(),
-            "{mode}: pre-change file cache loaded as empty — the on-disk \
-             format or its AEAD context changed"
+            loaded.is_empty(),
+            "{mode}: BLAKE2b-keyed file cache was loaded"
         );
     }
 }

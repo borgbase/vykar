@@ -1500,7 +1500,7 @@ fn check_state_files(cache_dir: &std::path::Path) -> Vec<String> {
     entries
         .flatten()
         .filter_map(|e| e.file_name().into_string().ok())
-        .filter(|n| n.starts_with("check."))
+        .filter(|n| n.starts_with("check3."))
         .collect()
 }
 

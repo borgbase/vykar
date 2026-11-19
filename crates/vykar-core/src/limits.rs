@@ -161,9 +161,9 @@ delegate_storage_backend! {
     fn get_if_changed(
         &self,
         key: &str,
-        known_blake2b: &[u8; 32],
+        known_blake3: &[u8; 32],
     ) -> Result<vykar_storage::ConditionalGet> {
-        let out = self.inner.get_if_changed(key, known_blake2b)?;
+        let out = self.inner.get_if_changed(key, known_blake3)?;
         if let (Some(limiter), vykar_storage::ConditionalGet::Fetched(Some(data))) =
             (self.read_limiter.as_ref(), &out)
         {

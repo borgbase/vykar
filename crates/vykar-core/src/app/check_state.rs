@@ -1,7 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use blake2::{Blake2b256, Digest};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -14,20 +13,13 @@ struct CheckStateFile {
 }
 
 /// Per-repo check state file path.
-/// `<cache_base>/vykar/check.<BLAKE2b-256(url) hex>`
-///
-/// Deliberately BLAKE2b for every repository format, including v3. A pure
-/// URL-to-filename cache key; changing it would orphan local check state.
+/// `<cache_base>/vykar/check3.<BLAKE3(url) hex>`
 fn check_state_path(url: &str, cache_dir: Option<&Path>) -> Option<PathBuf> {
     let base = match cache_dir {
         Some(dir) => Some(dir.to_path_buf()),
         None => paths::cache_dir().map(|d| d.join("vykar")),
     };
-    base.map(|b| {
-        let mut hasher = Blake2b256::new();
-        hasher.update(url.as_bytes());
-        b.join(format!("check.{}", hex::encode(hasher.finalize())))
-    })
+    base.map(|b| b.join(format!("check3.{}", blake3::hash(url.as_bytes()).to_hex())))
 }
 
 /// Read the last full check timestamp, validating fingerprint.

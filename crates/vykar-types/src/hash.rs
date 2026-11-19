@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// Only chunk IDs and pack IDs are selectable. Every other digest in the
 /// workspace (TOFU fingerprint, cache file names, `PathHash`, the index
-/// checksum) is unconditionally BLAKE2b for all repository formats.
+/// checksum) is unconditionally BLAKE3 for all repository formats.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum HashAlgorithm {

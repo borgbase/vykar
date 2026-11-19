@@ -2220,7 +2220,7 @@ fn pin_paths(fx: &CliFixture) -> Vec<PathBuf> {
             continue;
         };
         for entry in entries.flatten() {
-            if entry.file_name().to_string_lossy().starts_with("pin.") {
+            if entry.file_name().to_string_lossy().starts_with("pin3.") {
                 out.push(entry.path());
             }
         }
@@ -2256,7 +2256,7 @@ fn forget_pins(fx: &CliFixture) -> usize {
             continue;
         };
         for entry in entries.flatten() {
-            if entry.file_name().to_string_lossy().starts_with("pin.") {
+            if entry.file_name().to_string_lossy().starts_with("pin3.") {
                 std::fs::remove_file(entry.path()).unwrap();
                 removed += 1;
             }

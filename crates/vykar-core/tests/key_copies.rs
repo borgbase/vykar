@@ -164,7 +164,7 @@ impl Fixture {
     /// Drop the local identity pin so `prove_key` has only data to go on.
     fn forget_pin(&self) {
         for entry in std::fs::read_dir(&self.cache_dir).unwrap().flatten() {
-            if entry.file_name().to_string_lossy().starts_with("pin.") {
+            if entry.file_name().to_string_lossy().starts_with("pin3.") {
                 std::fs::remove_file(entry.path()).unwrap();
             }
         }
@@ -177,7 +177,7 @@ impl Fixture {
             .map(|e| e.path())
             .filter(|p| {
                 p.file_name()
-                    .map(|n| n.to_string_lossy().starts_with("pin."))
+                    .map(|n| n.to_string_lossy().starts_with("pin3."))
                     .unwrap_or(false)
             })
             .collect()

@@ -304,11 +304,12 @@ pub async fn put_object(
     // consumes the owner, so nothing is unlinked afterwards; on failure the
     // temp is still dropped (and unlinked) with the error.
     if is_index {
-        // Only a verified BLAKE2b can answer a conditional GET; any other
-        // PUT clears the record. The lock keeps other `index` writes out
+        // Only a verified BLAKE3 can answer a conditional GET (it is the
+        // digest clients cache the index under); any other PUT clears the
+        // record. The lock keeps other `index` writes out
         // between the rename and the stat, so the fingerprint is this file's.
         let digest_hex = match &expected_digest {
-            Some((HashAlgorithm::Blake2b, hex)) => Some(hex.clone()),
+            Some((HashAlgorithm::Blake3, hex)) => Some(hex.clone()),
             _ => None,
         };
         let mut slot = state.lock_index_validator();
@@ -1733,8 +1734,14 @@ mod tests {
     }
 
     async fn put_index(router: axum::Router, data: &[u8]) -> String {
-        let hex = blake2b_hex(data);
-        let resp = authed_put_with_blake2b(router, INDEX_PATH, data.to_vec(), &hex).await;
+        let hex = blake3_hex(data);
+        let resp = authed_put_with_digests(
+            router,
+            INDEX_PATH,
+            data.to_vec(),
+            &[("X-Content-BLAKE3", &hex)],
+        )
+        .await;
         assert!(resp.status().is_success(), "PUT /index: {}", resp.status());
         hex
     }
@@ -1769,13 +1776,13 @@ mod tests {
         let data = vec![0x22; 300];
         let resp = authed_put(router.clone(), INDEX_PATH, data.clone()).await;
         assert_status(&resp, StatusCode::CREATED);
-        let resp = get_index_if_none_match(router, &blake2b_hex(&data)).await;
+        let resp = get_index_if_none_match(router, &blake3_hex(&data)).await;
         assert_status(&resp, StatusCode::OK);
 
         // A file the server did not write (the restart case).
         let (router, _state, tmp) = setup_app(0);
         std::fs::write(tmp.path().join("index"), &data).unwrap();
-        let resp = get_index_if_none_match(router, &blake2b_hex(&data)).await;
+        let resp = get_index_if_none_match(router, &blake3_hex(&data)).await;
         assert_status(&resp, StatusCode::OK);
         assert_eq!(body_bytes(resp).await, data);
     }
@@ -1802,21 +1809,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn index_put_with_blake3_clears_record() {
+    async fn index_put_with_blake2b_clears_record() {
+        // An older client's PUT: verified, but not a validator newer
+        // clients could ever send.
         let (router, _state, _tmp) = setup_app(0);
         let first = put_index(router.clone(), &[0x55; 300]).await;
 
         let data = vec![0x66; 300];
-        let resp = authed_put_with_digests(
+        let resp = authed_put_with_blake2b(
             router.clone(),
             INDEX_PATH,
             data.clone(),
-            &[("X-Content-BLAKE3", &blake3_hex(&data))],
+            &blake2b_hex(&data),
         )
         .await;
         assert_status(&resp, StatusCode::NO_CONTENT);
 
-        for hex in [first, blake2b_hex(&data)] {
+        for hex in [first, blake2b_hex(&data), blake3_hex(&data)] {
             let resp = get_index_if_none_match(router.clone(), &hex).await;
             assert_status(&resp, StatusCode::OK);
         }

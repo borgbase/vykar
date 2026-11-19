@@ -216,17 +216,18 @@ There is deliberately **no user-facing choice**: no `--hash` flag, no YAML key. 
 
 **Why there is no stored `hash` field.** `RepoConfig` is serialized as a *positional* msgpack array, and appending a field is not backward-safe in the way `#[serde(default)]` suggests: `#[serde(default)]` rescues *shorter* arrays, but rmp-serde **errors on longer ones** (`array had incorrect length, expected N`) — the same failure mode described for `SnapshotMeta` above. An old binary reading an 8-field config would therefore fail *before* reaching the version gate, turning a clear `unsupported repository version: 3` into a parse error that looks like corruption. So `RepoConfig` stays at exactly seven fields, and the version implies the algorithm. A unit test asserts the msgpack array length so this cannot be undone by accident. Deferring the field is free: whenever a future algorithm forces a v4 bump, it can be appended *then*, since a bumped version is already unreadable by old binaries.
 
-**Why the auxiliary hashes stayed BLAKE2b.** Only chunk IDs and pack IDs follow the format — the two the throughput measurements are about. Everything else in the workspace that hashes is unconditionally BLAKE2b, for every version:
+**Auxiliary hashes.** Only chunk IDs and pack IDs follow the format. Every other digest vykar computes is BLAKE3 for every version (BLAKE2b up to 0.23):
 
-| Digest | Why it stays |
-|---|---|
-| TOFU identity fingerprint | Keeping it fixed preserves every existing pin with zero branching; it hashes key material, not content |
-| Pin and check-state **file names** | Pure URL-to-filename cache keys; changing them orphans local state for no gain |
-| `PathHash` in the file cache | BLAKE2b-**128** (`Blake2bVar::new(16)`), a different digest from a truncated BLAKE2b-256; hashes short path strings |
-| Full-index cache checksum trailer | Frozen local-cache format, not repository content |
-| Hard-link `chunks_fingerprint` | Hashes a chunk-ID list, not content — the speedup would be noise |
+| Digest | Persisted in | Effect of the switch from BLAKE2b |
+|---|---|---|
+| TOFU identity fingerprint (`derive_key` over `repo_id ‖ chunk_id_key`) | `pin3.<BLAKE3(url)>` | Old `pin.*` files are ignored: the first open per client per repository re-pins without verification |
+| Check-state file name | `check3.<BLAKE3(url)>` | Old state orphaned; the next `check` is a full one |
+| `PathHash` in the file cache (first 16 bytes of BLAKE3) | `filecache` | Old caches rejected; the next backup re-reads every file once |
+| Full-index cache checksum trailer | `full_index_cache` | Rebuilt once |
+| Index blob digest (conditional-GET validator) | `index_blob` | Rebuilt once |
+| Hard-link `chunks_fingerprint` | runtime only | none |
 
-Making these version-dependent would add a parameter, a branch and a test axis to each for benefits nothing has measured, and every one is *already* compatible if simply left alone. If the index checksum ever needs acceleration, a byte-compatible SIMD BLAKE2b is the independent change to make.
+Non-pack REST uploads carry `X-Content-BLAKE3` when the server advertises `blake3` (or the repository is v3, whose packs already require it), and `X-Content-BLAKE2b` only for a pre-0.20 server. BLAKE2b remains for the v2 chunk/pack format and that fallback.
 
 The single exception is the plaintext-mode `chunk_id_key` derivation, which *is* the chunk-ID key and therefore must follow the format — see [Key Derivation](#key-derivation).
 
@@ -263,7 +264,7 @@ These files live under a per-repo local cache root. By default this is the platf
 |- dedup_cache               # Sorted ChunkId -> stored_size (mmap + xor filter)
 |- restore_cache             # Sorted ChunkId -> pack_id, pack_offset, stored_size (mmap)
 |- full_index_cache          # Sorted full index rows for local rehydration/cache rebuilds
-`- index_blob                # Raw index blob as last written by this machine, with its BLAKE2b
+`- index_blob                # Raw index blob as last written by this machine, with its BLAKE3
                              #   (validator for the conditional GET and the commit fast path)
 ```
 

@@ -1,6 +1,6 @@
 //! Pass-through hasher for [`ChunkId`]-keyed maps.
 //!
-//! A `ChunkId` is already a 32-byte BLAKE2b digest, so re-hashing it with
+//! A `ChunkId` is already a 32-byte keyed digest (BLAKE2b or BLAKE3), so re-hashing it with
 //! SipHash — what `RandomState` does — buys nothing and costs a full hash per
 //! lookup on the hottest path in the tool. This hasher takes the first 8 bytes
 //! of the digest as the bucket key instead, matching what

@@ -61,15 +61,15 @@ pub trait StorageBackend: Send + Sync {
     fn get(&self, key: &str) -> Result<Option<Vec<u8>>>;
 
     /// Read an object unless it is byte-identical to the caller's copy, whose
-    /// unkeyed BLAKE2b-256 is `known_blake2b`.
+    /// unkeyed BLAKE3 is `known_blake3`.
     ///
     /// `Unchanged` transfers nothing. `Fetched` has the contract of
     /// [`Self::get`]. The default always fetches; only `RestBackend` asks the
-    /// server. BLAKE2b for every repository format, by design: it is the
-    /// `X-Content-BLAKE2b` digest the REST client sends with every non-pack
+    /// server. BLAKE3 for every repository format: it is the
+    /// `X-Content-BLAKE3` digest the REST client sends with every non-pack
     /// object, which is what a vykar-server compares against.
-    fn get_if_changed(&self, key: &str, known_blake2b: &[u8; 32]) -> Result<ConditionalGet> {
-        let _ = known_blake2b;
+    fn get_if_changed(&self, key: &str, known_blake3: &[u8; 32]) -> Result<ConditionalGet> {
+        let _ = known_blake3;
         get_unconditionally(self, key)
     }
 

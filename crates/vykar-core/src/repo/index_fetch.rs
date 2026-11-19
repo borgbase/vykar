@@ -30,7 +30,7 @@ pub(crate) fn fetch_index_object(
     let Some(cached) = CachedIndexBlob::open(repo_id, cache_dir) else {
         return Ok(IndexObject::Remote(storage.get("index")?));
     };
-    match storage.get_if_changed("index", cached.blake2b())? {
+    match storage.get_if_changed("index", cached.digest())? {
         ConditionalGet::Unchanged => {
             debug!(
                 generation = cached.generation(),

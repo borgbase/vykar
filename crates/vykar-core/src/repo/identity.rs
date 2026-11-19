@@ -1,7 +1,6 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use blake2::{Blake2b256, Digest};
 use serde::{Deserialize, Serialize};
 
 use vykar_common::paths;
@@ -23,36 +22,33 @@ struct PinFile {
     url: String,
 }
 
+/// Domain-separation context for [`compute_fingerprint`].
+const FINGERPRINT_CONTEXT: &str = "vykar 2026-11-19 repository identity fingerprint v1";
+
+/// Pin format version. Version 1 used BLAKE2b for both the fingerprint and
+/// the file name; those pins live under the old `pin.` prefix and are ignored.
+const PIN_FILE_VERSION: u32 = 2;
+
 /// Compute a 32-byte fingerprint from repo identity and key material.
-/// `BLAKE2b-256(repo_id || chunk_id_key)`
-///
-/// **Deliberately BLAKE2b for every repository format, including v3.** Keeping it fixed
-/// preserves every existing TOFU pin with zero branching, and this hashes key
-/// material rather than content, so the BLAKE3 throughput argument does not
-/// apply. Do not "finish the migration" here.
+/// `BLAKE3-derive_key(FINGERPRINT_CONTEXT, repo_id || chunk_id_key)`
 pub fn compute_fingerprint(repo_id: &[u8], chunk_id_key: &[u8; 32]) -> [u8; 32] {
-    let mut hasher = Blake2b256::new();
+    let mut hasher = blake3::Hasher::new_derive_key(FINGERPRINT_CONTEXT);
     hasher.update(repo_id);
     hasher.update(chunk_id_key);
     hasher.finalize().into()
 }
 
 /// Derive the pin file path for a given URL.
-/// `<cache_base>/vykar/pin.<BLAKE2b-256(url), all 32 bytes hex-encoded>`
+/// `<cache_base>/vykar/pin3.<BLAKE3(url), all 32 bytes hex-encoded>`
 ///
-/// Deliberately BLAKE2b for every repository format, including v3. This is a pure
-/// URL-to-filename cache key; changing it would orphan every local pin for no
-/// gain.
+/// The `pin3.` prefix keeps these apart from the BLAKE2b `pin.` files of
+/// older binaries, so a downgraded binary still finds its own pins.
 fn pin_file_path(url: &str, cache_dir: Option<&Path>) -> Option<PathBuf> {
     let base = match cache_dir {
         Some(dir) => Some(dir.to_path_buf()),
         None => paths::cache_dir().map(|d| d.join("vykar")),
     };
-    base.map(|b| {
-        let mut hasher = Blake2b256::new();
-        hasher.update(url.as_bytes());
-        b.join(format!("pin.{}", hex::encode(hasher.finalize())))
-    })
+    base.map(|b| b.join(format!("pin3.{}", blake3::hash(url.as_bytes()).to_hex())))
 }
 
 /// Read the pinned fingerprint for `url` without creating one.
@@ -284,7 +280,7 @@ fn write_pin(path: &Path, url: &str, repo_id: &[u8], fp_hex: &str) -> Result<()>
     }
 
     let pin = PinFile {
-        version: 1,
+        version: PIN_FILE_VERSION,
         repo_id: hex::encode(repo_id),
         fingerprint: fp_hex.to_string(),
         url: url.to_string(),
@@ -359,7 +355,7 @@ mod tests {
         let entries: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| e.file_name().to_string_lossy().starts_with("pin."))
+            .filter(|e| e.file_name().to_string_lossy().starts_with("pin3."))
             .collect();
         assert_eq!(entries.len(), 1);
     }
@@ -460,7 +456,7 @@ mod tests {
         // Find the pin file and make it unreadable
         for entry in std::fs::read_dir(dir.path()).unwrap() {
             let entry = entry.unwrap();
-            if entry.file_name().to_string_lossy().starts_with("pin.") {
+            if entry.file_name().to_string_lossy().starts_with("pin3.") {
                 std::fs::set_permissions(entry.path(), std::fs::Permissions::from_mode(0o000))
                     .unwrap();
             }
@@ -479,7 +475,7 @@ mod tests {
         // Restore permissions so tempdir cleanup works
         for entry in std::fs::read_dir(dir.path()).unwrap() {
             let entry = entry.unwrap();
-            if entry.file_name().to_string_lossy().starts_with("pin.") {
+            if entry.file_name().to_string_lossy().starts_with("pin3.") {
                 std::fs::set_permissions(entry.path(), std::fs::Permissions::from_mode(0o644))
                     .unwrap();
             }

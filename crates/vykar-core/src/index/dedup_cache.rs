@@ -13,7 +13,6 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use blake2::{Blake2b256, Digest};
 use memmap2::Mmap;
 use tracing::{debug, warn};
 use xorf::{Filter, Xor8};
@@ -229,7 +228,7 @@ fn write_cache_header(
 /// materialized in memory.
 ///
 /// Shared by the dedup and restore writers. The full index cache writer is
-/// deliberately *not* routed through here: it folds a running BLAKE2b
+/// deliberately *not* routed through here: it folds a running BLAKE3
 /// checksum into every entry write and appends it as a trailer.
 fn write_sorted_cache<T>(
     spec: &CacheSpec,
@@ -460,7 +459,7 @@ impl MmapDedupCache {
 // ---------------------------------------------------------------------------
 
 /// Extract the first 8 bytes of a ChunkId as a little-endian u64.
-/// BLAKE2b output has excellent entropy, so this is a high-quality hash key.
+/// Keyed-hash output has excellent entropy, so this is a high-quality hash key.
 pub(crate) fn chunk_id_to_u64(id: &ChunkId) -> u64 {
     read_u64_le(id.as_bytes()[..8].try_into().expect("ChunkId is 32 bytes"))
 }
@@ -865,11 +864,11 @@ const FULL_MAGIC: &[u8; 8] = b"VGFULL\0\0";
 
 /// Current full index cache format version.
 ///
-/// Version 2 appends a 32-byte BLAKE2b-256 checksum trailer over the entry
-/// region. Version 1 caches (no trailer) are rejected by the version check,
-/// so callers fall through to the slow path and rebuild — self-healing, no
-/// migration code.
-const FULL_VERSION: u32 = 2;
+/// Version 3 appends a 32-byte BLAKE3 checksum trailer over the entry region
+/// (version 2 used BLAKE2b-256, version 1 had no trailer). Other versions are
+/// rejected by the version check, so callers fall through to the slow path
+/// and rebuild — self-healing, no migration code.
+const FULL_VERSION: u32 = 3;
 
 /// Size of the full index cache header in bytes.
 const FULL_HEADER_SIZE: usize = 28;
@@ -878,13 +877,9 @@ const FULL_HEADER_SIZE: usize = 28;
 /// ChunkId(32) + refcount(4) + stored_size(4) + PackId(32) + pack_offset(8) = 80.
 const FULL_ENTRY_SIZE: usize = 80;
 
-/// Size of the BLAKE2b-256 content-checksum trailer appended after the last
-/// entry, verified in `open_path` to detect silent corruption of the plaintext
-/// cache before it is promoted to the authoritative remote index.
-///
-/// Deliberately BLAKE2b for every repository format, including v3: this is
-/// local cache validation rather than repository content, and the cache is
-/// versioned by `FULL_VERSION` independently of the repository format.
+/// Size of the BLAKE3 content-checksum trailer appended after the last entry,
+/// verified in `open_path` to detect silent corruption of the plaintext cache
+/// before it is promoted to the authoritative remote index.
 const FULL_CHECKSUM_SIZE: usize = 32;
 
 const FULL_SPEC: CacheSpec = CacheSpec {
@@ -944,10 +939,8 @@ impl MmapFullIndexCache {
         // (including the trailer's presence) was already validated by
         // `open_validated`; only this cache has content to verify.
         let entries_end = mmap.len() - FULL_CHECKSUM_SIZE;
-        let mut hasher = Blake2b256::new();
-        Digest::update(&mut hasher, &mmap[FULL_HEADER_SIZE..entries_end]);
-        let computed = hasher.finalize();
-        if computed[..] != mmap[entries_end..] {
+        let computed = blake3::hash(&mmap[FULL_HEADER_SIZE..entries_end]);
+        if computed.as_bytes()[..] != mmap[entries_end..] {
             debug!("full index cache: checksum mismatch");
             return None;
         }
@@ -1022,19 +1015,18 @@ fn encode_full_entry(entry: &FullCacheEntry) -> [u8; FULL_ENTRY_SIZE] {
 /// content-checksum hasher.
 fn write_full_entry(
     w: &mut BufWriter<std::fs::File>,
-    hasher: &mut Blake2b256,
+    hasher: &mut blake3::Hasher,
     entry: &FullCacheEntry,
 ) -> Result<()> {
     let buf = encode_full_entry(entry);
     w.write_all(&buf)?;
-    Digest::update(hasher, buf);
+    hasher.update(&buf);
     Ok(())
 }
 
 /// Append the finalized content-checksum trailer over all entries written so far.
-fn write_full_checksum(w: &mut BufWriter<std::fs::File>, hasher: Blake2b256) -> Result<()> {
-    let digest = hasher.finalize();
-    w.write_all(&digest)?;
+fn write_full_checksum(w: &mut BufWriter<std::fs::File>, hasher: blake3::Hasher) -> Result<()> {
+    w.write_all(hasher.finalize().as_bytes())?;
     Ok(())
 }
 
@@ -1088,7 +1080,7 @@ pub fn build_full_index_cache_to_path(
     let mut w = BufWriter::new(file);
 
     write_full_header(&mut w, generation, entry_count)?;
-    let mut hasher = Blake2b256::new();
+    let mut hasher = blake3::Hasher::new();
     for entry in &entries {
         write_full_entry(&mut w, &mut hasher, entry)?;
     }
@@ -1196,7 +1188,7 @@ fn write_merged_full_cache(
     let mut w = BufWriter::new(file);
 
     write_full_header(&mut w, new_generation, total_count)?;
-    let mut hasher = Blake2b256::new();
+    let mut hasher = blake3::Hasher::new();
 
     let keyed_bump = |id: &ChunkId| -> u32 {
         let mut bump = delta.refcount_bumps.get(id).copied().unwrap_or(0);
@@ -1554,17 +1546,18 @@ pub fn build_restore_cache_from_full_cache(
 /// Magic bytes at the start of the index blob cache file.
 const INDEX_BLOB_MAGIC: &[u8; 8] = b"VGIDXB\0\0";
 
-/// Current index blob cache format version. v2 adds the BLAKE2b-256 of the
-/// blob, sent as the conditional-GET validator. Other versions are a miss.
-const INDEX_BLOB_VERSION: u32 = 2;
+/// Current index blob cache format version. v2 added the BLAKE2b-256 of the
+/// blob as the conditional-GET validator; v3 makes it BLAKE3. Other versions
+/// are a miss.
+const INDEX_BLOB_VERSION: u32 = 3;
 
 /// Size of the index blob cache header in bytes: magic(8) + version(4) +
-/// generation(8) + reserved(4) + BLAKE2b-256 of the blob(32) = 56.
+/// generation(8) + reserved(4) + BLAKE3 of the blob(32) = 56.
 const INDEX_BLOB_HEADER_SIZE: usize = 56;
 
 struct IndexBlobHeader {
     generation: u64,
-    blake2b: [u8; 32],
+    digest: [u8; 32],
 }
 
 /// Read and validate the header at the start of `file`, leaving it positioned
@@ -1588,7 +1581,7 @@ fn read_index_blob_header(file: &mut std::fs::File) -> Option<IndexBlobHeader> {
     }
     Some(IndexBlobHeader {
         generation: read_u64_le(header[12..20].try_into().expect("8-byte slice from header")),
-        blake2b: header[24..56]
+        digest: header[24..56]
             .try_into()
             .expect("32-byte slice from header"),
     })
@@ -1688,10 +1681,9 @@ pub fn write_index_blob_cache(
         std::fs::create_dir_all(parent)?;
     }
 
-    // BLAKE2b for every repository format, by design: it is the digest the
-    // REST client sends as `X-Content-BLAKE2b` and the server compares
-    // against on a conditional GET.
-    let digest: [u8; 32] = Blake2b256::digest(blob).into();
+    // The digest the REST client sends as `X-Content-BLAKE3` and the server
+    // compares against on a conditional GET.
+    let digest: [u8; 32] = blake3::hash(blob).into();
 
     let tmp_path = path.with_extension("tmp");
     let file = std::fs::File::create(&tmp_path)?;
@@ -1728,7 +1720,7 @@ pub fn write_index_blob_cache(
 pub struct CachedIndexBlob {
     file: std::fs::File,
     generation: u64,
-    blake2b: [u8; 32],
+    digest: [u8; 32],
     payload_len: u64,
 }
 
@@ -1750,7 +1742,7 @@ impl CachedIndexBlob {
         Some(Self {
             file,
             generation: header.generation,
-            blake2b: header.blake2b,
+            digest: header.digest,
             payload_len,
         })
     }
@@ -1759,19 +1751,19 @@ impl CachedIndexBlob {
         self.generation
     }
 
-    /// Unkeyed BLAKE2b-256 of the cached blob, as recorded when it was written.
-    pub fn blake2b(&self) -> &[u8; 32] {
-        &self.blake2b
+    /// Unkeyed BLAKE3 of the cached blob, as recorded when it was written.
+    pub fn digest(&self) -> &[u8; 32] {
+        &self.digest
     }
 
-    /// Read the payload and verify it against [`Self::blake2b`]. `None` on I/O
+    /// Read the payload and verify it against [`Self::digest`]. `None` on I/O
     /// error, short read, trailing bytes or digest mismatch.
     pub fn read_verified(self) -> Option<Vec<u8>> {
         use std::io::Read;
 
         let Self {
             mut file,
-            blake2b,
+            digest,
             payload_len,
             ..
         } = self;
@@ -1794,7 +1786,7 @@ impl CachedIndexBlob {
             debug!("index blob cache: trailing bytes after payload");
             return None;
         }
-        if Blake2b256::digest(&buf).as_slice() != blake2b {
+        if blake3::hash(&buf).as_bytes() != &digest {
             debug!("index blob cache: payload digest mismatch");
             return None;
         }
@@ -2494,8 +2486,8 @@ mod tests {
 
         let cached = CachedIndexBlob::open(&repo_id, Some(dir.path())).unwrap();
         assert_eq!(cached.generation(), 9);
-        let expected: [u8; 32] = Blake2b256::digest(blob).into();
-        assert_eq!(cached.blake2b(), &expected);
+        let expected: [u8; 32] = blake3::hash(blob).into();
+        assert_eq!(cached.digest(), &expected);
         assert_eq!(cached.read_verified().as_deref(), Some(&blob[..]));
     }
 

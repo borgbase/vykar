@@ -561,9 +561,10 @@ pub struct BackendProfile {
     /// [`StorageBackend::begin_staged_put`] can return a staged writer.
     pub staged_put: bool,
     /// Independent read-only requests worth issuing at once (listing,
-    /// existence checks, pack verification). At least 1. May exceed what the
-    /// backend serves at once: SFTP reports three per pooled connection, and
-    /// the extra requests wait for a connection.
+    /// existence checks, pack verification, item-stream range reads). At
+    /// least 1. May exceed what the backend serves at once: SFTP reports
+    /// three per pooled connection, and the extra requests wait for a
+    /// connection.
     pub request_width: usize,
     /// Whole-object transfers worth running at once: pack uploads during a
     /// backup (a writer may queue [`UPLOAD_HEADROOM`] more), read groups

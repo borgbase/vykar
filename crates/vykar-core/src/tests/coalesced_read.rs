@@ -1,12 +1,15 @@
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use vykar_storage::{delegate_storage_backend, InnerBackend, StorageBackend};
+use vykar_storage::{delegate_storage_backend, BackendProfile, InnerBackend, StorageBackend};
+use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
 
 use crate::compress::Compression;
 use crate::repo::pack::PackType;
-use crate::repo::{Repository, WriteSessionOptions};
+use crate::repo::{EncryptionMode, Repository, WriteSessionOptions};
 use crate::testutil::{init_test_environment, MemoryBackend, PutLog, RecordingBackend};
 
 fn repo_on_counting_backend() -> (Repository, PutLog) {
@@ -341,6 +344,7 @@ struct CancelOnFirstReadBackend {
     inner: MemoryBackend,
     flag: Arc<AtomicBool>,
     reads: Arc<AtomicUsize>,
+    width: usize,
 }
 
 impl InnerBackend for CancelOnFirstReadBackend {
@@ -351,19 +355,28 @@ impl InnerBackend for CancelOnFirstReadBackend {
 
 delegate_storage_backend! {
     for CancelOnFirstReadBackend;
-    except [get_range];
+    except [get_range, profile];
 
     fn get_range(&self, key: &str, offset: u64, length: u64) -> Result<Option<Vec<u8>>> {
         self.reads.fetch_add(1, Ordering::Relaxed);
         self.flag.store(true, Ordering::Relaxed);
         self.inner.get_range(key, offset, length)
     }
+
+    fn profile(&self) -> BackendProfile {
+        BackendProfile {
+            request_width: self.width,
+            ..self.inner.profile()
+        }
+    }
 }
 
-/// Build a repo on the cancelling backend and store one chunk per pack, so the
-/// coalescer produces one read group (and therefore one `get_range`) per chunk.
+/// Build a repo on the cancelling backend with the given request width and
+/// store one chunk per pack, so the coalescer produces one read group (and
+/// therefore one `get_range`) per chunk.
 fn repo_with_cancelling_backend(
     packs: usize,
+    width: usize,
 ) -> (
     Repository,
     Arc<AtomicBool>,
@@ -377,6 +390,7 @@ fn repo_with_cancelling_backend(
         inner: MemoryBackend::new(),
         flag: Arc::clone(&flag),
         reads: Arc::clone(&reads),
+        width,
     };
     let mut repo = Repository::init(
         Box::new(backend),
@@ -408,9 +422,10 @@ fn repo_with_cancelling_backend(
 /// with `Interrupted` after exactly that one request. The pair of assertions is
 /// the point: `Err` alone would also hold for an entry-only check, and a read
 /// count of one alone would also hold for a loop that never polls at all.
+/// Width 1, so this covers the sequential path.
 #[test]
 fn coalesced_read_cancels_between_range_reads() {
-    let (mut repo, flag, reads, ids) = repo_with_cancelling_backend(3);
+    let (mut repo, flag, reads, ids) = repo_with_cancelling_backend(3, 1);
     let chunks = resolve_chunks(&repo, &ids);
     assert_eq!(
         chunks
@@ -439,14 +454,13 @@ fn coalesced_read_cancels_between_range_reads() {
     );
 }
 
-/// A flag that is already set issues no storage request at all. Kept separate
-/// from the mid-loop test: a pre-set flag trips the first loop-head check
-/// before any read, so on its own it cannot demonstrate mid-loop cancellation.
+/// With several workers, each polls the flag before its next range read, so a
+/// cancellation raised inside the first read stops the fan-out after at most
+/// one read per worker.
 #[test]
-fn pre_cancelled_coalesced_read_issues_no_request() {
-    let (mut repo, flag, reads, ids) = repo_with_cancelling_backend(3);
+fn parallel_coalesced_read_cancels_within_one_read_per_worker() {
+    let (mut repo, flag, reads, ids) = repo_with_cancelling_backend(12, 4);
     let chunks = resolve_chunks(&repo, &ids);
-    flag.store(true, Ordering::Relaxed);
 
     let mut out = Vec::new();
     let err = repo
@@ -457,8 +471,36 @@ fn pre_cancelled_coalesced_read_issues_no_request() {
         matches!(err, VykarError::Interrupted),
         "expected Interrupted, got: {err}"
     );
-    assert_eq!(reads.load(Ordering::Relaxed), 0, "expected no range reads");
-    assert!(out.is_empty(), "nothing may be emitted");
+    let reads = reads.load(Ordering::Relaxed);
+    assert!((1..=4).contains(&reads), "range reads {reads}");
+}
+
+/// A flag that is already set issues no storage request at all. Kept separate
+/// from the mid-loop test: a pre-set flag trips the first loop-head check
+/// before any read, so on its own it cannot demonstrate mid-loop cancellation.
+#[test]
+fn pre_cancelled_coalesced_read_issues_no_request() {
+    for width in [1, 4] {
+        let (mut repo, flag, reads, ids) = repo_with_cancelling_backend(3, width);
+        let chunks = resolve_chunks(&repo, &ids);
+        flag.store(true, Ordering::Relaxed);
+
+        let mut out = Vec::new();
+        let err = repo
+            .read_chunks_coalesced_into(&chunks, &mut out, Some(&flag))
+            .unwrap_err();
+
+        assert!(
+            matches!(err, VykarError::Interrupted),
+            "width {width}: expected Interrupted, got: {err}"
+        );
+        assert_eq!(
+            reads.load(Ordering::Relaxed),
+            0,
+            "width {width}: expected no range reads"
+        );
+        assert!(out.is_empty(), "width {width}: nothing may be emitted");
+    }
 }
 
 /// Flip one byte of `data` inside its stored blob in a plaintext repo. With no
@@ -515,4 +557,252 @@ fn plaintext_coalesced_read_rejects_corrupt_blob() {
         matches!(&err, VykarError::InvalidFormat(m) if m.contains("hash mismatch")),
         "expected hash mismatch, got: {err}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Parallel reads
+// ---------------------------------------------------------------------------
+
+/// Shared knobs and counters of a [`TunedBackend`].
+#[derive(Default)]
+struct Probe {
+    width: AtomicUsize,
+    reads: AtomicUsize,
+    in_flight: AtomicUsize,
+    max_in_flight: AtomicUsize,
+    /// Keys whose range reads sleep `delay_ms` first.
+    slow: Mutex<HashSet<String>>,
+    /// Sleep `delay_ms` in every range read.
+    slow_all: AtomicBool,
+    delay_ms: AtomicU64,
+}
+
+impl Probe {
+    fn reset_counters(&self) {
+        self.reads.store(0, Ordering::SeqCst);
+        self.max_in_flight.store(0, Ordering::SeqCst);
+    }
+}
+
+/// MemoryBackend with a settable request width; counts range reads and the
+/// most that were in flight at once, and can slow down chosen reads.
+struct TunedBackend {
+    inner: MemoryBackend,
+    probe: Arc<Probe>,
+}
+
+impl InnerBackend for TunedBackend {
+    fn inner_backend(&self) -> &dyn StorageBackend {
+        &self.inner
+    }
+}
+
+delegate_storage_backend! {
+    for TunedBackend;
+    except [get_range, profile];
+
+    fn get_range(&self, key: &str, offset: u64, length: u64) -> Result<Option<Vec<u8>>> {
+        let p = &self.probe;
+        p.reads.fetch_add(1, Ordering::SeqCst);
+        let now = p.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        p.max_in_flight.fetch_max(now, Ordering::SeqCst);
+        if p.slow_all.load(Ordering::SeqCst) || p.slow.lock().unwrap().contains(key) {
+            std::thread::sleep(Duration::from_millis(p.delay_ms.load(Ordering::SeqCst)));
+        }
+        let result = self.inner.get_range(key, offset, length);
+        p.in_flight.fetch_sub(1, Ordering::SeqCst);
+        result
+    }
+
+    fn profile(&self) -> BackendProfile {
+        BackendProfile {
+            request_width: self.probe.width.load(Ordering::SeqCst),
+            ..self.inner.profile()
+        }
+    }
+}
+
+fn repo_on_tuned_backend(mode: EncryptionMode) -> (Repository, Arc<Probe>) {
+    init_test_environment();
+    let probe = Arc::new(Probe::default());
+    probe.width.store(2, Ordering::SeqCst);
+    let backend = TunedBackend {
+        inner: MemoryBackend::new(),
+        probe: Arc::clone(&probe),
+    };
+    let passphrase = match mode {
+        EncryptionMode::None => None,
+        _ => Some("test-pass"),
+    };
+    let mut repo = Repository::init(
+        Box::new(backend),
+        mode,
+        crate::config::ChunkerConfig::default(),
+        passphrase,
+        None,
+        None,
+    )
+    .expect("init");
+    repo.begin_write_session(&WriteSessionOptions::default())
+        .expect("begin write session");
+    (repo, probe)
+}
+
+/// Store `pack_sizes[p]` chunks in pack `p` (one flush per pack). Returns each
+/// chunk's id and plaintext, pack by pack.
+fn store_packs(repo: &mut Repository, pack_sizes: &[usize]) -> Vec<Vec<(ChunkId, Vec<u8>)>> {
+    let mut packs = Vec::with_capacity(pack_sizes.len());
+    for (p, &n) in pack_sizes.iter().enumerate() {
+        let mut chunks = Vec::with_capacity(n);
+        for c in 0..n {
+            // Varied lengths, so blobs differ in size as well as content.
+            let len = 64 + (p * 7 + c * 13) * 97 % 4000;
+            let data: Vec<u8> = format!("pack-{p:02}-chunk-{c:02}-")
+                .into_bytes()
+                .into_iter()
+                .chain((0..len).map(|i| (i * 31 + p * 17 + c * 5) as u8))
+                .collect();
+            let (id, _, _) = repo
+                .store_chunk(&data, Compression::None, PackType::Tree)
+                .unwrap();
+            chunks.push((id, data));
+        }
+        repo.flush_packs().unwrap();
+        packs.push(chunks);
+    }
+    repo.clear_blob_cache();
+    packs
+}
+
+fn pack_key(repo: &Repository, id: &ChunkId) -> String {
+    repo.chunk_index().get(id).unwrap().pack_id.storage_key()
+}
+
+/// Later groups finishing first must not reorder the output.
+#[test]
+fn parallel_read_keeps_stream_order_when_later_groups_finish_first() {
+    let (mut repo, probe) = repo_on_tuned_backend(EncryptionMode::None);
+    let packs = store_packs(&mut repo, &[2; 8]);
+    // Interleaved across packs: every pack's first chunk, then every second.
+    let order: Vec<&(ChunkId, Vec<u8>)> = (0..2)
+        .flat_map(|c| packs.iter().map(move |p| &p[c]))
+        .collect();
+    let ids: Vec<ChunkId> = order.iter().map(|(id, _)| *id).collect();
+    let expected: Vec<u8> = order.iter().flat_map(|(_, d)| d.clone()).collect();
+
+    probe.width.store(4, Ordering::SeqCst);
+    probe.delay_ms.store(50, Ordering::SeqCst);
+    probe.slow.lock().unwrap().insert(pack_key(&repo, &ids[0]));
+    probe.reset_counters();
+
+    let chunks = resolve_chunks(&repo, &ids);
+    let mut out = Vec::new();
+    repo.read_chunks_coalesced_into(&chunks, &mut out, None)
+        .unwrap();
+
+    assert_eq!(out, expected);
+    assert_eq!(probe.reads.load(Ordering::SeqCst), 8, "one read per pack");
+}
+
+#[test]
+fn parallel_read_overlaps_range_reads_up_to_width() {
+    let (mut repo, probe) = repo_on_tuned_backend(EncryptionMode::None);
+    let packs = store_packs(&mut repo, &[1; 9]);
+    let ids: Vec<ChunkId> = packs.iter().map(|p| p[0].0).collect();
+    let expected: Vec<u8> = packs.iter().flat_map(|p| p[0].1.clone()).collect();
+    let chunks = resolve_chunks(&repo, &ids);
+    probe.delay_ms.store(20, Ordering::SeqCst);
+    probe.slow_all.store(true, Ordering::SeqCst);
+
+    for width in [3, 1] {
+        probe.width.store(width, Ordering::SeqCst);
+        repo.clear_blob_cache();
+        probe.reset_counters();
+
+        let mut out = Vec::new();
+        repo.read_chunks_coalesced_into(&chunks, &mut out, None)
+            .unwrap();
+
+        assert_eq!(out, expected, "width {width}");
+        assert_eq!(probe.reads.load(Ordering::SeqCst), 9, "width {width}");
+        let max = probe.max_in_flight.load(Ordering::SeqCst);
+        if width == 1 {
+            assert_eq!(max, 1, "sequential path must read one at a time");
+        } else {
+            assert!((2..=width).contains(&max), "max in flight {max}");
+        }
+    }
+}
+
+/// The error is the one of the earliest failing group, not the first to be
+/// recorded: group 1's read is slowed so group 4's failure lands first.
+#[test]
+fn parallel_read_returns_the_earliest_failing_group() {
+    let (mut repo, probe) = repo_on_tuned_backend(EncryptionMode::None);
+    let packs = store_packs(&mut repo, &[1; 6]);
+    let ids: Vec<ChunkId> = packs.iter().map(|p| p[0].0).collect();
+    let chunks = resolve_chunks(&repo, &ids);
+    let missing_pack = chunks[1].1;
+
+    repo.storage.delete(&missing_pack.storage_key()).unwrap();
+    flip_byte_in_stored_chunk(&repo, &ids[4], &packs[4][0].1);
+    probe.delay_ms.store(50, Ordering::SeqCst);
+    probe
+        .slow
+        .lock()
+        .unwrap()
+        .insert(missing_pack.storage_key());
+
+    for width in [4, 1] {
+        probe.width.store(width, Ordering::SeqCst);
+        for attempt in 0..5 {
+            repo.clear_blob_cache();
+            let mut out = Vec::new();
+            let err = repo
+                .read_chunks_coalesced_into(&chunks, &mut out, None)
+                .unwrap_err();
+            assert!(
+                matches!(&err, VykarError::Other(m)
+                    if m.contains("pack not found") && m.contains(&missing_pack.to_string())),
+                "width {width}, attempt {attempt}: expected pack 1 not found, got: {err}"
+            );
+        }
+    }
+}
+
+/// Mixed cache hits and misses over several packs give the same item stream
+/// at every width, with and without AEAD.
+#[test]
+fn item_stream_bytes_identical_across_widths() {
+    for mode in [EncryptionMode::None, EncryptionMode::Aes256Gcm] {
+        let (mut repo, probe) = repo_on_tuned_backend(mode.clone());
+        let packs = store_packs(&mut repo, &[3, 1, 2, 3, 3]);
+        let all: Vec<&(ChunkId, Vec<u8>)> = packs.iter().flatten().collect();
+        // A fixed permutation that hops between packs, plus one repeat.
+        let order: Vec<&(ChunkId, Vec<u8>)> = [7, 0, 11, 3, 5, 9, 1, 4, 10, 2, 8, 6, 0]
+            .iter()
+            .map(|&i| all[i])
+            .collect();
+        let ids: Vec<ChunkId> = order.iter().map(|(id, _)| *id).collect();
+        let expected: Vec<u8> = order.iter().flat_map(|(_, d)| d.clone()).collect();
+
+        for width in [1, 2, 4, 16] {
+            probe.width.store(width, Ordering::SeqCst);
+            for prewarm in [false, true] {
+                repo.clear_blob_cache();
+                if prewarm {
+                    for id in ids.iter().step_by(3) {
+                        repo.read_chunk(id).unwrap();
+                    }
+                }
+                let stream =
+                    crate::commands::list::load_item_stream_from_ptrs(&mut repo, &ids, None)
+                        .unwrap();
+                assert!(
+                    stream == expected,
+                    "{mode:?}, width {width}, prewarm {prewarm}: stream differs"
+                );
+            }
+        }
+    }
 }

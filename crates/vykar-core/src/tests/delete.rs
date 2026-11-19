@@ -1,4 +1,11 @@
+use std::collections::{HashMap, HashSet};
+
 use crate::commands;
+use crate::commands::snapshot_ops;
+use crate::index::{ChunkIndex, ChunkIndexEntry};
+use crate::repo::{OpenOptions, Repository};
+use vykar_storage::local_backend::LocalBackend;
+use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::VykarError;
 
 use super::helpers::{
@@ -353,4 +360,88 @@ fn delete_single_snapshot_handles_empty_stats() {
     assert!(result.stats.is_empty());
     assert_eq!(result.warnings.len(), 1);
     assert!(result.warnings[0].contains("snap-wrapper"));
+}
+
+fn index_entries(index: &ChunkIndex) -> HashMap<ChunkId, ChunkIndexEntry> {
+    index.iter().map(|(id, e)| (*id, *e)).collect()
+}
+
+/// Phase 3 reads the deleted snapshot's item stream on several threads when
+/// it spans several tree packs. The refcounts it leaves must match a
+/// sequential read of the same stream.
+#[test]
+fn delete_with_parallel_tree_reads_matches_sequential_refcounts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = tmp.path().join("repo");
+    let source_dir = tmp.path().join("source");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    let mut config = init_repo(&repo_dir);
+    config.limits.connections = 4;
+
+    // Enough entries for an item stream of several chunks.
+    for d in 0..20 {
+        let dir = source_dir.join(format!("dir-{d:02}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        for f in 0..300 {
+            std::fs::write(dir.join(format!("file-{f:04}.txt")), format!("{d}/{f}")).unwrap();
+        }
+    }
+    backup_single_source(&config, &source_dir, "src", "snap1");
+    // Same length, new content: only the stream's tail changes, so snap2
+    // reuses snap1's earlier tree chunks and adds its own tree pack.
+    std::fs::write(source_dir.join("dir-19").join("file-0299.txt"), b"xx/yyy").unwrap();
+    backup_single_source(&config, &source_dir, "src", "snap2");
+
+    let open_with = |connections: usize| {
+        let backend = LocalBackend::new(repo_dir.to_str().unwrap())
+            .unwrap()
+            .with_max_connections(Some(connections));
+        Repository::open(
+            Box::new(backend),
+            None,
+            None,
+            OpenOptions::new().with_index(),
+        )
+        .unwrap()
+    };
+
+    let mut sequential = open_with(1);
+    assert_eq!(sequential.storage.profile().request_width, 1);
+    let item_ptrs = commands::list::load_snapshot_meta(&sequential, "snap2")
+        .unwrap()
+        .item_ptrs;
+    let packs: HashSet<_> = item_ptrs
+        .iter()
+        .map(|id| sequential.chunk_index().get(id).unwrap().pack_id)
+        .collect();
+    assert!(
+        packs.len() >= 2,
+        "snap2's item stream must span several packs to take the parallel path, got {}",
+        packs.len()
+    );
+    let stream = commands::list::load_snapshot_item_stream(&mut sequential, "snap2", None).unwrap();
+    let mut expected = sequential.chunk_index().clone();
+    let impact =
+        snapshot_ops::decrement_chunk_refs_on_index(&mut expected, &stream, &item_ptrs).unwrap();
+    drop(sequential);
+
+    let mut parallel = open_with(4);
+    assert_eq!(parallel.storage.profile().request_width, 4);
+    let parallel_stream =
+        commands::list::load_snapshot_item_stream(&mut parallel, "snap2", None).unwrap();
+    assert!(
+        parallel_stream == stream,
+        "parallel and sequential item streams differ"
+    );
+    drop(parallel);
+
+    let result = commands::delete::run(&config, None, &["snap2"], false, None).unwrap();
+    assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    assert_eq!(result.stats.len(), 1);
+    assert_eq!(result.stats[0].chunks_deleted, impact.chunks_deleted);
+    assert_eq!(result.stats[0].space_freed, impact.space_freed);
+
+    let after = open_local_repo(&repo_dir);
+    assert!(after.manifest().find_snapshot("snap2").is_none());
+    assert_eq!(index_entries(after.chunk_index()), index_entries(&expected));
 }

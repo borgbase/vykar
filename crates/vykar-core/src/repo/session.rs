@@ -110,7 +110,7 @@ impl Repository {
 
     /// Independent read-only requests worth issuing at once against this
     /// repository's backend (journal recovery's pack lookups, commit-time
-    /// pack verification). At least 1.
+    /// pack verification, item-stream range reads). At least 1.
     pub(super) fn request_width(&self) -> usize {
         self.storage.profile().request_width.max(1)
     }

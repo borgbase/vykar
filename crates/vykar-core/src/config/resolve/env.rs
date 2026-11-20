@@ -35,7 +35,7 @@ pub(super) fn parse_env_files(
             }
 
             // Strip optional `export ` prefix.
-            let line = line.strip_prefix("export ").unwrap_or(line);
+            let line = line.trim_prefix("export ");
 
             let Some(eq_pos) = line.find('=') else {
                 return Err(vykar_types::error::VykarError::Config(format!(

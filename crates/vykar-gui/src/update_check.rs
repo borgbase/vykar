@@ -44,7 +44,7 @@ fn parse_release(body: &str, current: &str) -> Option<UpdateInfo> {
     let json: serde_json::Value = serde_json::from_str(body).ok()?;
 
     let tag = json.get("tag_name")?.as_str()?;
-    let latest = tag.strip_prefix('v').unwrap_or(tag);
+    let latest = tag.trim_prefix('v');
 
     if !is_newer(latest, current) {
         return None;

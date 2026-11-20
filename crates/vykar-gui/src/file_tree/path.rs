@@ -99,10 +99,7 @@ pub(super) fn transform_items(
     };
 
     if let [source] = source_paths {
-        let display_prefix = source
-            .strip_prefix(strip_prefix)
-            .unwrap_or(source)
-            .trim_start_matches('/');
+        let display_prefix = source.trim_prefix(strip_prefix).trim_start_matches('/');
 
         let transformed = items
             .iter()
@@ -133,8 +130,7 @@ pub(super) fn transform_items(
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| source.clone());
         let display_prefix = source
-            .strip_prefix(strip_prefix)
-            .unwrap_or(source)
+            .trim_prefix(strip_prefix)
             .trim_start_matches('/')
             .to_string();
         basename_to_display.insert(basename, display_prefix);

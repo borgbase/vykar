@@ -1149,10 +1149,7 @@ async fn walk_files(
             if meta.file_type().is_dir() {
                 dirs_to_visit.push(full);
             } else {
-                let key = full
-                    .strip_prefix(root)
-                    .unwrap_or(&full)
-                    .trim_start_matches('/');
+                let key = full.trim_prefix(root).trim_start_matches('/');
                 if !key.is_empty() {
                     visit(key, &meta);
                 }

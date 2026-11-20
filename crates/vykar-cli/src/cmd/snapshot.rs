@@ -16,7 +16,7 @@ use crate::table::{CliTableTheme, add_kv_row};
 use vykar_common::display::{format_duration_seconds, format_optional_size, format_size_delta};
 
 fn normalize_path_filter(raw: &str) -> String {
-    let s = raw.strip_prefix("./").unwrap_or(raw);
+    let s = raw.trim_prefix("./");
     s.trim_end_matches('/').to_string()
 }
 

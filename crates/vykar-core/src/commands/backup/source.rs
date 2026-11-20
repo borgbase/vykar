@@ -284,7 +284,7 @@ fn derive_snapshot_prefix_raw(configured: &Path, abs_source: &Path) -> Vec<u8> {
         None => return derive_basename_raw(configured, abs_source),
     };
     let bytes = abs_clean.as_os_str().as_bytes();
-    let bytes = bytes.strip_prefix(b"/").unwrap_or(bytes);
+    let bytes = bytes.trim_prefix(b"/");
     let trimmed_len = bytes.iter().rposition(|&b| b != b'/').map_or(0, |i| i + 1);
     let trimmed = bytes.get(..trimmed_len).unwrap_or(bytes);
     if trimmed.is_empty() {
@@ -357,7 +357,7 @@ fn derive_snapshot_prefix(configured: &Path, abs_source: &Path) -> String {
         None => return derive_basename(configured, abs_source),
     };
     let s = abs_clean.to_string_lossy();
-    let trimmed = s.strip_prefix('/').unwrap_or(&s).trim_end_matches('/');
+    let trimmed = s.trim_prefix('/').trim_end_matches('/');
     if trimmed.is_empty() {
         derive_basename(configured, abs_source)
     } else {
@@ -399,7 +399,7 @@ mod tests {
     #[cfg(unix)]
     fn expected_prefix(abs_path: &Path) -> String {
         let s = abs_path.to_string_lossy().to_string();
-        s.strip_prefix('/').unwrap_or(&s).to_string()
+        s.trim_prefix('/').to_string()
     }
 
     #[test]

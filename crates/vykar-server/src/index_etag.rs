@@ -60,7 +60,7 @@ pub(crate) fn if_none_match_hits(header: &str, digest_hex: &str) -> bool {
         .split(',')
         .map(str::trim)
         .filter_map(|tag| {
-            let tag = tag.strip_prefix("W/").unwrap_or(tag);
+            let tag = tag.trim_prefix("W/");
             tag.strip_prefix('"')?.strip_suffix('"')
         })
         .any(|opaque| opaque.eq_ignore_ascii_case(digest_hex))

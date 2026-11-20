@@ -97,10 +97,10 @@ pub fn detect_quota(
     explicit_override: Option<u64>,
     current_usage: u64,
 ) -> (QuotaSource, u64) {
-    if let Some(limit) = explicit_override {
-        if limit > 0 {
-            return (QuotaSource::Explicit, limit);
-        }
+    if let Some(limit) = explicit_override
+        && limit > 0
+    {
+        return (QuotaSource::Explicit, limit);
     }
     detect_auto(data_dir, current_usage)
 }

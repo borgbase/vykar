@@ -209,12 +209,12 @@ fn apply_repo_model(
     // Trigger a snapshot refresh for the resolved repo, unless its card is in an
     // error state. Retry (→ FetchRepoInfo → a fresh RepoModelData with
     // has_error: false) then naturally re-triggers the refresh on success.
-    if let Some(name) = current_repo {
-        if !resolved_has_error {
-            let _ = ctx.app_tx.send(AppCommand::RefreshSnapshots {
-                repo_selector: name,
-            });
-        }
+    if let Some(name) = current_repo
+        && !resolved_has_error
+    {
+        let _ = ctx.app_tx.send(AppCommand::RefreshSnapshots {
+            repo_selector: name,
+        });
     }
 }
 

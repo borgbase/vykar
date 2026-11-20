@@ -26,15 +26,14 @@ pub(super) async fn batch_delete(
     // Append-only permits batch-delete of temp files (interrupted-upload
     // cleanup) and index objects (as single DELETE does). Fail fast — name
     // the first committed key and delete nothing.
-    if state.inner.config.append_only {
-        if let Some(key) = keys
+    if state.inner.config.append_only
+        && let Some(key) = keys
             .iter()
             .find(|k| !vykar_protocol::is_temp_file(k) && !vykar_protocol::is_index_object_key(k))
-        {
-            return Err(ServerError::Forbidden(format!(
-                "append-only: cannot batch-delete non-temp key: {key}"
-            )));
-        }
+    {
+        return Err(ServerError::Forbidden(format!(
+            "append-only: cannot batch-delete non-temp key: {key}"
+        )));
     }
 
     let state_clone = state.clone();

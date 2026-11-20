@@ -195,11 +195,10 @@ delegate_storage_backend! {
         buf: &mut Vec<u8>,
     ) -> Result<bool> {
         let found = self.inner.get_range_into(key, offset, length, buf)?;
-        if found {
-            if let Some(limiter) = self.read_limiter.as_ref() {
+        if found
+            && let Some(limiter) = self.read_limiter.as_ref() {
                 limiter.consume(buf.len());
             }
-        }
         Ok(found)
     }
 

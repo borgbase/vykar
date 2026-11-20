@@ -882,11 +882,11 @@ mod tests {
         let abs_source = walk.abs_source().to_owned();
         let mut found_symlink = false;
         for event in walk {
-            if let Ok(WalkEvent::Entry(e)) = event {
-                if rel_path_from_abs(&abs_source, &e.abs_path) == "link.txt" {
-                    assert!(e.file_type.is_symlink());
-                    found_symlink = true;
-                }
+            if let Ok(WalkEvent::Entry(e)) = event
+                && rel_path_from_abs(&abs_source, &e.abs_path) == "link.txt"
+            {
+                assert!(e.file_type.is_symlink());
+                found_symlink = true;
             }
         }
         assert!(found_symlink, "should find symlink");

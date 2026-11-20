@@ -71,22 +71,22 @@ pub fn decrement_chunk_refs_on_index(
 
     list::for_each_decoded_item(items_stream, |item| {
         for chunk_ref in &item.chunks {
-            if let Some((rc, size)) = index.decrement(&chunk_ref.id) {
-                if rc == 0 {
-                    impact.chunks_deleted += 1;
-                    impact.space_freed += size as u64;
-                }
+            if let Some((rc, size)) = index.decrement(&chunk_ref.id)
+                && rc == 0
+            {
+                impact.chunks_deleted += 1;
+                impact.space_freed += size as u64;
             }
         }
         Ok(())
     })?;
 
     for chunk_id in item_ptrs {
-        if let Some((rc, size)) = index.decrement(chunk_id) {
-            if rc == 0 {
-                impact.chunks_deleted += 1;
-                impact.space_freed += size as u64;
-            }
+        if let Some((rc, size)) = index.decrement(chunk_id)
+            && rc == 0
+        {
+            impact.chunks_deleted += 1;
+            impact.space_freed += size as u64;
         }
     }
 

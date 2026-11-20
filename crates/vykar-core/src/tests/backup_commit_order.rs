@@ -164,10 +164,10 @@ impl ObservingBackend {
         } else {
             put()
         };
-        if res.is_ok() {
-            if let Some(flag) = &self.shared.interrupt_after_pack {
-                flag.store(true, Ordering::SeqCst);
-            }
+        if res.is_ok()
+            && let Some(flag) = &self.shared.interrupt_after_pack
+        {
+            flag.store(true, Ordering::SeqCst);
         }
         self.record(Event::PackPutEnd);
         res

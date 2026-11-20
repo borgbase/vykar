@@ -962,10 +962,10 @@ pub(super) fn fault_staging_loop(shutdown: Option<&AtomicBool>) {
         c.set(v + 1);
         v
     });
-    if FAULT_CANCEL_AT_STAGED_FILE.with(std::cell::Cell::get) == Some(idx) {
-        if let Some(flag) = shutdown {
-            flag.store(true, std::sync::atomic::Ordering::Relaxed);
-        }
+    if FAULT_CANCEL_AT_STAGED_FILE.with(std::cell::Cell::get) == Some(idx)
+        && let Some(flag) = shutdown
+    {
+        flag.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }
 

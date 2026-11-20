@@ -313,25 +313,25 @@ impl SftpBackend {
         let requested_max_connections = max_connections;
         let max_connections = normalize_max_connections(requested_max_connections);
 
-        if let Some(requested) = requested_max_connections {
-            if requested != max_connections {
-                tracing::warn!(
-                    requested,
-                    effective = max_connections,
-                    "adjusted max_connections to supported range"
-                );
-            }
+        if let Some(requested) = requested_max_connections
+            && requested != max_connections
+        {
+            tracing::warn!(
+                requested,
+                effective = max_connections,
+                "adjusted max_connections to supported range"
+            );
         }
 
         let effective_timeout = normalize_sftp_timeout(sftp_timeout_secs);
-        if let Some(requested) = sftp_timeout_secs {
-            if requested != effective_timeout {
-                tracing::warn!(
-                    requested,
-                    effective = effective_timeout,
-                    "adjusted sftp_timeout to supported range"
-                );
-            }
+        if let Some(requested) = sftp_timeout_secs
+            && requested != effective_timeout
+        {
+            tracing::warn!(
+                requested,
+                effective = effective_timeout,
+                "adjusted sftp_timeout to supported range"
+            );
         }
         tracing::debug!(
             sftp_timeout_secs = effective_timeout,
@@ -744,16 +744,16 @@ fn resolve_known_hosts_path(explicit: Option<&str>) -> Result<PathBuf> {
 }
 
 fn expand_tilde_path(raw: &str) -> PathBuf {
-    if raw == "~" {
-        if let Some(home) = paths::home_dir() {
-            return home;
-        }
+    if raw == "~"
+        && let Some(home) = paths::home_dir()
+    {
+        return home;
     }
 
-    if let Some(rest) = raw.strip_prefix("~/").or_else(|| raw.strip_prefix("~\\")) {
-        if let Some(home) = paths::home_dir() {
-            return home.join(rest);
-        }
+    if let Some(rest) = raw.strip_prefix("~/").or_else(|| raw.strip_prefix("~\\"))
+        && let Some(home) = paths::home_dir()
+    {
+        return home.join(rest);
     }
 
     PathBuf::from(raw)

@@ -48,10 +48,10 @@ pub async fn get_or_list(
         return handle_range_read(&file_path, range_header, &key).await;
     }
 
-    if crate::index_etag::is_index_key(&key) {
-        if let Some(resp) = index_not_modified(&state, &file_path, &headers) {
-            return Ok(resp);
-        }
+    if crate::index_etag::is_index_key(&key)
+        && let Some(resp) = index_not_modified(&state, &file_path, &headers)
+    {
+        return Ok(resp);
     }
 
     stream_full_read(&file_path, &key).await
@@ -288,12 +288,12 @@ pub async fn put_object(
     };
 
     // Validate Content-Length if it was present
-    if let Some(content_length) = content_length {
-        if data_len != content_length {
-            return Err(ServerError::BadRequest(format!(
-                "upload size mismatch: Content-Length {content_length}, received {data_len}"
-            )));
-        }
+    if let Some(content_length) = content_length
+        && data_len != content_length
+    {
+        return Err(ServerError::BadRequest(format!(
+            "upload size mismatch: Content-Length {content_length}, received {data_len}"
+        )));
     }
 
     // Verify the content digest if a header was present.
@@ -612,10 +612,10 @@ async fn read_sizes_body(headers: &HeaderMap, body: Body) -> Result<Vec<u8>, Ser
         .get("Content-Length")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok());
-    if let Some(len) = content_length {
-        if len > MAX_SIZES_BODY_BYTES as u64 {
-            return Err(too_large(len));
-        }
+    if let Some(len) = content_length
+        && len > MAX_SIZES_BODY_BYTES as u64
+    {
+        return Err(too_large(len));
     }
     let mut buf = Vec::with_capacity(sizes_body_initial_capacity(content_length));
     let mut stream = body.into_data_stream();

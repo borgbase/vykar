@@ -146,10 +146,10 @@ fn read_groups_parallel(
                 Ok(_) => Ok(()),
                 Err(e) => Err(e),
             };
-            if let Err(e) = result {
-                if first_err.as_ref().is_none_or(|(i, _)| idx < *i) {
-                    first_err = Some((idx, e));
-                }
+            if let Err(e) = result
+                && first_err.as_ref().is_none_or(|(i, _)| idx < *i)
+            {
+                first_err = Some((idx, e));
             }
         }
     });

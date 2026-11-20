@@ -563,15 +563,15 @@ impl LocalBackend {
             let file_type = entry.file_type()?;
             if file_type.is_dir() {
                 self.walk_files(&entry.path(), visit)?;
-            } else if file_type.is_file() {
-                if let Ok(rel) = entry.path().strip_prefix(&self.root) {
-                    let key = rel
-                        .components()
-                        .map(|c| c.as_os_str().to_string_lossy())
-                        .collect::<Vec<_>>()
-                        .join("/");
-                    visit(&entry, &key)?;
-                }
+            } else if file_type.is_file()
+                && let Ok(rel) = entry.path().strip_prefix(&self.root)
+            {
+                let key = rel
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("/");
+                visit(&entry, &key)?;
             }
         }
         Ok(())

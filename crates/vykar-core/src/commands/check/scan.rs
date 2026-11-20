@@ -582,10 +582,10 @@ pub(super) fn integrity_scan(
     // Phase 2: Pack existence check
     let mut pack_chunks: HashMap<PackId, Vec<(ChunkId, ChunkIndexEntry)>> = HashMap::new();
     for (chunk_id, entry) in repo.chunk_index().iter() {
-        if let Some(skip) = opts.skip_packs {
-            if skip.contains(&entry.pack_id) {
-                continue;
-            }
+        if let Some(skip) = opts.skip_packs
+            && skip.contains(&entry.pack_id)
+        {
+            continue;
         }
         pack_chunks
             .entry(entry.pack_id)

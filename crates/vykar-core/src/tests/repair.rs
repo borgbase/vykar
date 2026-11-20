@@ -473,15 +473,15 @@ fn per_chunk_corruption_preserves_siblings() {
 
     // The number of corrupted chunk IDs should be less than the total in the pack
     for action in &result.plan.actions {
-        if let RepairAction::RemoveCorruptChunks { pack_id, chunk_ids } = action {
-            if *pack_id == target_pack_id {
-                assert!(
-                    chunk_ids.len() < total_chunks_in_pack,
-                    "corrupted {} of {} chunks — should preserve siblings",
-                    chunk_ids.len(),
-                    total_chunks_in_pack
-                );
-            }
+        if let RepairAction::RemoveCorruptChunks { pack_id, chunk_ids } = action
+            && *pack_id == target_pack_id
+        {
+            assert!(
+                chunk_ids.len() < total_chunks_in_pack,
+                "corrupted {} of {} chunks — should preserve siblings",
+                chunk_ids.len(),
+                total_chunks_in_pack
+            );
         }
     }
 }

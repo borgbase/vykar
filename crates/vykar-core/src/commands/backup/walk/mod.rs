@@ -1197,10 +1197,10 @@ mod tests {
         let walk = InodeSortedWalk::new(&source, &[], &[], false, false).unwrap();
         let mut raws: Vec<Vec<u8>> = Vec::new();
         for ev in walk {
-            if let Ok(WalkEvent::Entry(walked)) = ev {
-                if let Materialized::Entry { item, .. } = materialize_item(walked, false).unwrap() {
-                    raws.push(item.path_bytes().to_vec());
-                }
+            if let Ok(WalkEvent::Entry(walked)) = ev
+                && let Materialized::Entry { item, .. } = materialize_item(walked, false).unwrap()
+            {
+                raws.push(item.path_bytes().to_vec());
             }
         }
         raws.sort();

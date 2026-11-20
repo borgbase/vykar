@@ -71,17 +71,17 @@ fn wire_config_editor(ui: &MainWindow, app_tx: &Sender<AppCommand>) {
     let tx = app_tx.clone();
     let ui_weak = ui.as_weak();
     ui.on_switch_config_clicked(move || {
-        if let Some(u) = ui_weak.upgrade() {
-            if u.get_editor_dirty() {
-                let proceed = tinyfiledialogs::message_box_yes_no(
-                    "Unsaved changes",
-                    "You have unsaved changes in the editor. Discard them and switch config?",
-                    tinyfiledialogs::MessageBoxIcon::Warning,
-                    tinyfiledialogs::YesNo::No,
-                );
-                if proceed == tinyfiledialogs::YesNo::No {
-                    return;
-                }
+        if let Some(u) = ui_weak.upgrade()
+            && u.get_editor_dirty()
+        {
+            let proceed = tinyfiledialogs::message_box_yes_no(
+                "Unsaved changes",
+                "You have unsaved changes in the editor. Discard them and switch config?",
+                tinyfiledialogs::MessageBoxIcon::Warning,
+                tinyfiledialogs::YesNo::No,
+            );
+            if proceed == tinyfiledialogs::YesNo::No {
+                return;
             }
         }
         let _ = tx.send(AppCommand::SwitchConfig);
@@ -209,13 +209,13 @@ fn wire_navigation(ui: &MainWindow, app_tx: &Sender<AppCommand>) {
         ui.set_current_repo_index(repo_idx);
         ui.set_current_page(page);
 
-        if repo_idx != prev_repo {
-            if let Some(repo_name) = ui_state::repo_name_at(repo_idx) {
-                ui_state::refresh_repo_source_model(Some(repo_name.as_str()));
-                let _ = tx.send(AppCommand::RefreshSnapshots {
-                    repo_selector: repo_name,
-                });
-            }
+        if repo_idx != prev_repo
+            && let Some(repo_name) = ui_state::repo_name_at(repo_idx)
+        {
+            ui_state::refresh_repo_source_model(Some(repo_name.as_str()));
+            let _ = tx.send(AppCommand::RefreshSnapshots {
+                repo_selector: repo_name,
+            });
         }
     });
 }

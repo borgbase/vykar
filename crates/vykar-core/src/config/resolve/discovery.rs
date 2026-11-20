@@ -82,10 +82,10 @@ pub fn resolve_config_path(cli_config: Option<&str>) -> Option<ConfigSource> {
     }
 
     // 2. VYKAR_CONFIG env var
-    if let Ok(val) = std::env::var("VYKAR_CONFIG") {
-        if !val.is_empty() {
-            return Some(ConfigSource::EnvVar(PathBuf::from(val)));
-        }
+    if let Ok(val) = std::env::var("VYKAR_CONFIG")
+        && !val.is_empty()
+    {
+        return Some(ConfigSource::EnvVar(PathBuf::from(val)));
     }
 
     // 3. Search standard locations

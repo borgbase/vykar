@@ -187,17 +187,16 @@ impl PackWriter {
     /// and able to, otherwise on the heap.
     fn init_buffer(&mut self, stage: Option<&dyn StorageBackend>) -> Result<()> {
         let header = [PACK_MAGIC.as_slice(), &[PACK_VERSION_CURRENT]].concat();
-        if let Some(storage) = stage {
-            if let Some(mut object) = storage
+        if let Some(storage) = stage
+            && let Some(mut object) = storage
                 .begin_staged_put(PACK_STAGING_PREFIX)
                 .map_err(staged_write_error)?
-            {
-                object.append(&header).map_err(staged_write_error)?;
-                let mut hasher = Hasher256::new(self.hash_algo);
-                hasher.update(&header);
-                self.buffer = Some(PackBuffer::Staged { object, hasher });
-                return Ok(());
-            }
+        {
+            object.append(&header).map_err(staged_write_error)?;
+            let mut hasher = Hasher256::new(self.hash_algo);
+            hasher.update(&header);
+            self.buffer = Some(PackBuffer::Staged { object, hasher });
+            return Ok(());
         }
         let mut v = Vec::with_capacity(PACK_HEADER_SIZE + self.target_size.min(512 * 1024 * 1024));
         v.extend_from_slice(&header);
@@ -316,10 +315,10 @@ impl PackWriter {
         if self.blob_meta.len() >= MAX_BLOBS_PER_PACK {
             return true;
         }
-        if let Some(first_time) = self.first_blob_time {
-            if first_time.elapsed().as_secs() >= PACK_MAX_AGE_SECS {
-                return true;
-            }
+        if let Some(first_time) = self.first_blob_time
+            && first_time.elapsed().as_secs() >= PACK_MAX_AGE_SECS
+        {
+            return true;
         }
         false
     }

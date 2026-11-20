@@ -178,14 +178,15 @@ fn resolve_config_source(cli: &Cli) -> Result<config::ConfigSource, ExitCode> {
             eprintln!("Error: --trust-repo cannot be used with the daemon command");
             return Err(ExitCode::from(EXIT_ERROR));
         }
-        if let Some(addr) = http_listen {
-            if !addr.ip().is_loopback() && !*http_allow_public {
-                eprintln!(
-                    "Error: --http-listen {addr} binds to a non-loopback address; \
+        if let Some(addr) = http_listen
+            && !addr.ip().is_loopback()
+            && !*http_allow_public
+        {
+            eprintln!(
+                "Error: --http-listen {addr} binds to a non-loopback address; \
                      pass --http-allow-public (or set VYKAR_HTTP_ALLOW_PUBLIC=1) to confirm"
-                );
-                return Err(ExitCode::from(EXIT_ERROR));
-            }
+            );
+            return Err(ExitCode::from(EXIT_ERROR));
         }
         if let Err(e) = cmd::daemon::run_daemon(source, *http_listen) {
             eprintln!("Error: {e}");
@@ -285,14 +286,13 @@ fn dispatch_targeted(cli: &Cli, repos: &[&ResolvedRepo]) -> Option<ExitCode> {
     if let Some(cli::Commands::Snapshot {
         command: cli::SnapshotCommand::Delete { snapshots, .. },
     }) = cli.command.as_ref()
+        && snapshots.len() > 1
     {
-        if snapshots.len() > 1 {
-            eprintln!(
-                "Error: deleting multiple snapshots requires -R / --repo \
+        eprintln!(
+            "Error: deleting multiple snapshots requires -R / --repo \
                  when multiple repositories are configured"
-            );
-            return Some(ExitCode::from(EXIT_ERROR));
-        }
+        );
+        return Some(ExitCode::from(EXIT_ERROR));
     }
 
     if let Some(cli::Commands::Snapshot {
@@ -433,14 +433,16 @@ fn run_all_repos(cli: &Cli, repos: &[&ResolvedRepo], repo_explicitly_selected: b
         // Pre-flight: skip unavailable local repos in multi-repo bare
         // command (no subcommand) when no explicit --repo was given.
         // Subcommands like `init` must reach uninitialized repos normally.
-        if cli.command.is_none() && multi && !repo_explicitly_selected {
-            if let Some(path) = local_repo_unavailable(repo) {
-                eprintln!(
-                    "Warning: skipping '{}' — repository not found at '{path}'",
-                    repo.label_or_url(),
-                );
-                continue;
-            }
+        if cli.command.is_none()
+            && multi
+            && !repo_explicitly_selected
+            && let Some(path) = local_repo_unavailable(repo)
+        {
+            eprintln!(
+                "Warning: skipping '{}' — repository not found at '{path}'",
+                repo.label_or_url(),
+            );
+            continue;
         }
 
         if multi {

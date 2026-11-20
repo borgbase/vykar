@@ -34,11 +34,11 @@ impl Repository {
 
     /// Increment the refcount for a chunk (works in both normal and dedup modes).
     pub fn increment_chunk_ref(&mut self, id: &ChunkId) {
-        if let Some(ref mut ws) = self.write_session {
-            if let Some(ref mut delta) = ws.index_delta {
-                delta.bump_refcount(id);
-                return;
-            }
+        if let Some(ref mut ws) = self.write_session
+            && let Some(ref mut delta) = ws.index_delta
+        {
+            delta.bump_refcount(id);
+            return;
         }
         self.chunk_index.increment_refcount(id);
         self.index_dirty = true;
@@ -73,13 +73,11 @@ impl Repository {
         };
 
         // Normal mode: check chunk_index (only when no dedup mode is active).
-        if !in_dedup_mode {
-            if let Some(entry) = self.chunk_index.get(chunk_id) {
-                let stored_size = entry.stored_size;
-                self.chunk_index.increment_refcount(chunk_id);
-                self.index_dirty = true;
-                return Some(stored_size);
-            }
+        if !in_dedup_mode && let Some(entry) = self.chunk_index.get(chunk_id) {
+            let stored_size = entry.stored_size;
+            self.chunk_index.increment_refcount(chunk_id);
+            self.index_dirty = true;
+            return Some(stored_size);
         }
 
         // Check recovered chunks before pending pack writers.

@@ -119,12 +119,12 @@ pub(super) fn consume_processed_entry(
             num_segments,
         } => {
             // For segment 0, fire progress event before validation consumes `item`.
-            if segment_index == 0 {
-                if let (Some(cb), Some(it)) = (progress.as_deref_mut(), item.as_ref()) {
-                    cb(BackupProgressEvent::FileStarted {
-                        path: it.path.clone(),
-                    });
-                }
+            if segment_index == 0
+                && let (Some(cb), Some(it)) = (progress.as_deref_mut(), item.as_ref())
+            {
+                cb(BackupProgressEvent::FileStarted {
+                    path: it.path.clone(),
+                });
             }
 
             let dedup_baseline = if verbose && segment_index == 0 {

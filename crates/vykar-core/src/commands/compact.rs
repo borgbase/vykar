@@ -356,11 +356,11 @@ fn compact_packs(
 
     for analysis in &selected {
         check_interrupted(shutdown)?;
-        if let Some(cap) = max_repack_size {
-            if total_repacked_bytes >= cap {
-                info!("Reached max-repack-size limit, stopping");
-                break;
-            }
+        if let Some(cap) = max_repack_size
+            && total_repacked_bytes >= cap
+        {
+            info!("Reached max-repack-size limit, stopping");
+            break;
         }
         if batch.len() >= SAVE_BATCH_PACKS || batch_bytes >= SAVE_BATCH_BYTES {
             persist_and_delete(repo, &mut batch, &mut stats)?;
@@ -594,10 +594,10 @@ fn select_analyses_by_cap(
     let mut total = 0u64;
 
     for analysis in analyses {
-        if let Some(cap) = max_repack_size {
-            if total >= cap {
-                break;
-            }
+        if let Some(cap) = max_repack_size
+            && total >= cap
+        {
+            break;
         }
         selected.push(analysis);
         total = total.saturating_add(analysis.total_bytes);

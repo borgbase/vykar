@@ -10,10 +10,11 @@ pub(crate) fn run_config_generate(dest: Option<&str>) -> CliResult<()> {
         None => pick_config_location()?,
     };
 
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() && !parent.exists() {
-            std::fs::create_dir_all(parent)?;
-        }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+        && !parent.exists()
+    {
+        std::fs::create_dir_all(parent)?;
     }
 
     if let Err(err) = write_config_file(&path) {

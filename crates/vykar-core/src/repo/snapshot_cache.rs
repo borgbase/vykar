@@ -265,10 +265,10 @@ pub fn refresh_snapshot_cache(
     let mut remote_ids: HashMap<String, String> = HashMap::new();
     for key in &remote_keys {
         // key is "snapshots/<id_hex>"
-        if let Some(id_hex) = key.strip_prefix("snapshots/") {
-            if !id_hex.is_empty() {
-                remote_ids.insert(id_hex.to_string(), key.clone());
-            }
+        if let Some(id_hex) = key.strip_prefix("snapshots/")
+            && !id_hex.is_empty()
+        {
+            remote_ids.insert(id_hex.to_string(), key.clone());
         }
     }
 

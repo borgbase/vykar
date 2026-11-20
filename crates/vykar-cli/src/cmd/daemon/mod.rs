@@ -375,12 +375,10 @@ fn run_backup_cycle(
         let name = repo.label_or_url();
 
         // Pre-flight: skip unavailable local repos in multi-repo configs
-        if multi {
-            if let Some(path) = local_repo_unavailable(repo) {
-                tracing::info!(repo = name, path, "skipping unavailable repository");
-                report.skipped.push(name.to_string());
-                continue;
-            }
+        if multi && let Some(path) = local_repo_unavailable(repo) {
+            tracing::info!(repo = name, path, "skipping unavailable repository");
+            report.skipped.push(name.to_string());
+            continue;
         }
 
         if multi {

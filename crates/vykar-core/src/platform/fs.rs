@@ -61,10 +61,10 @@ pub(crate) fn path_starts_with(path: &Path, base: &Path) -> bool {
     {
         use std::os::unix::ffi::OsStrExt;
         let (p, b) = (path.as_os_str().as_bytes(), base.as_os_str().as_bytes());
-        if let Some(rest) = p.strip_prefix(b) {
-            if rest.is_empty() || rest.first() == Some(&b'/') || b.last() == Some(&b'/') {
-                return true;
-            }
+        if let Some(rest) = p.strip_prefix(b)
+            && (rest.is_empty() || rest.first() == Some(&b'/') || b.last() == Some(&b'/'))
+        {
+            return true;
         }
     }
     path.starts_with(base)
@@ -86,18 +86,18 @@ pub(crate) fn strip_path_prefix<'a>(path: &'a Path, base: &Path) -> Option<&'a P
         let (p, b) = (path.as_os_str().as_bytes(), base.as_os_str().as_bytes());
         // An empty `base` keeps a leading root (`"/a"` minus `""` is `"/a"`),
         // so it is left to std.
-        if let (false, Some(mut rest)) = (b.is_empty(), p.strip_prefix(b)) {
-            if rest.is_empty() || rest.first() == Some(&b'/') || b.last() == Some(&b'/') {
-                while let Some(r) = rest.strip_prefix(b"/") {
-                    rest = r;
-                }
-                let ambiguous = rest == b"."
-                    || rest.starts_with(b"./")
-                    || rest.ends_with(b"/")
-                    || rest.ends_with(b"/.");
-                if !ambiguous {
-                    return Some(Path::new(OsStr::from_bytes(rest)));
-                }
+        if let (false, Some(mut rest)) = (b.is_empty(), p.strip_prefix(b))
+            && (rest.is_empty() || rest.first() == Some(&b'/') || b.last() == Some(&b'/'))
+        {
+            while let Some(r) = rest.strip_prefix(b"/") {
+                rest = r;
+            }
+            let ambiguous = rest == b"."
+                || rest.starts_with(b"./")
+                || rest.ends_with(b"/")
+                || rest.ends_with(b"/.");
+            if !ambiguous {
+                return Some(Path::new(OsStr::from_bytes(rest)));
             }
         }
     }

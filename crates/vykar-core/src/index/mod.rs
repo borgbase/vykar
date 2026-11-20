@@ -529,14 +529,14 @@ impl IndexDelta {
     /// has no positional table or the position does not hold `id`, so the
     /// recorded logical bump is the same either way.
     pub fn bump_cached_refcount(&mut self, id: &ChunkId, position: u32) {
-        if let Some(cached) = self.cached_bumps.as_mut() {
-            if cached.bump(position, id) {
-                return;
-            }
-            // Unreachable while positions come from `TieredDedupIndex::find*`
-            // on the cache this table was built from; the keyed fallback
-            // keeps the count exact if that ever stops holding.
+        if let Some(cached) = self.cached_bumps.as_mut()
+            && cached.bump(position, id)
+        {
+            return;
         }
+        // Unreachable while positions come from `TieredDedupIndex::find*`
+        // on the cache this table was built from; the keyed fallback
+        // keeps the count exact if that ever stops holding.
         self.bump_refcount(id);
     }
 
@@ -594,13 +594,12 @@ impl IndexDelta {
         if self.refcount_bumps.keys().any(is_stale) {
             return Err(vykar_types::error::VykarError::StaleChunksDuringCommit);
         }
-        if let Some(cached) = self.cached_bumps.as_ref() {
-            if cached
+        if let Some(cached) = self.cached_bumps.as_ref()
+            && cached
                 .iter_nonzero()
                 .any(|(chunk_id, _)| is_stale(&chunk_id))
-            {
-                return Err(vykar_types::error::VykarError::StaleChunksDuringCommit);
-            }
+        {
+            return Err(vykar_types::error::VykarError::StaleChunksDuringCommit);
         }
 
         Ok(self)

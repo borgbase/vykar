@@ -244,14 +244,15 @@ impl Repository {
         next: TempPath,
     ) -> Result<()> {
         let fold = std::mem::take(&mut self.fold_requested);
-        if let (Some(prev), Some(diff)) = (prev.as_ref(), diff.as_ref()) {
-            if diff.segment.is_empty() && !fold {
-                debug!("index unchanged, nothing to write");
-                drop(next);
-                self.index_head = Some(prev.clone());
-                self.index_dirty = false;
-                return Ok(());
-            }
+        if let (Some(prev), Some(diff)) = (prev.as_ref(), diff.as_ref())
+            && diff.segment.is_empty()
+            && !fold
+        {
+            debug!("index unchanged, nothing to write");
+            drop(next);
+            self.index_head = Some(prev.clone());
+            self.index_dirty = false;
+            return Ok(());
         }
 
         let start = std::time::Instant::now();

@@ -772,10 +772,10 @@ fn inj_open_writable(path: &Path) -> io::Result<std::fs::File> {
             c.set(v + 1);
             v
         });
-        if let Some((target, kind)) = OPEN_WRITABLE_FAULT.with(|c| c.get()) {
-            if call == target {
-                return Err(io::Error::from(kind));
-            }
+        if let Some((target, kind)) = OPEN_WRITABLE_FAULT.with(|c| c.get())
+            && call == target
+        {
+            return Err(io::Error::from(kind));
         }
     }
     let mut opts = OpenOptions::new();

@@ -1457,17 +1457,17 @@ pub fn merge_full_index_cache_to_temp(
         }
         Some(_) => None,
     };
-    if let Some(source) = positional {
-        if let Some(tmp) = write_merged_full_cache(
+    if let Some(source) = positional
+        && let Some(tmp) = write_merged_full_cache(
             old_cache,
             delta,
             &sorted_new,
             &source,
             new_generation,
             target,
-        )? {
-            return Ok(tmp);
-        }
+        )?
+    {
+        return Ok(tmp);
     }
 
     let cached = cached.expect("only positional bumps can fail the merge");

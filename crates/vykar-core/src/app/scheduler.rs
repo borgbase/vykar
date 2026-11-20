@@ -39,11 +39,11 @@ impl SchedulerLock {
             }
         };
 
-        if let Some(parent) = path.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                tracing::warn!(%e, "could not create scheduler lock dir; proceeding without lock");
-                return Some(Self { _file: None });
-            }
+        if let Some(parent) = path.parent()
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            tracing::warn!(%e, "could not create scheduler lock dir; proceeding without lock");
+            return Some(Self { _file: None });
         }
 
         let file = match File::options()

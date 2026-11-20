@@ -99,10 +99,10 @@ pub(crate) fn lookup(
     if unique.is_empty() {
         return PackSizes::new();
     }
-    if force.is_none() {
-        if let Some(sizes) = batch(storage, &unique) {
-            return sizes;
-        }
+    if force.is_none()
+        && let Some(sizes) = batch(storage, &unique)
+    {
+        return sizes;
     }
     let mut by_shard: HashMap<String, Vec<PackId>> = HashMap::new();
     for id in &unique {

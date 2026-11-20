@@ -553,10 +553,10 @@ fn local_start(head: &IndexHead, location: &CacheLocation<'_>) -> LocalStart {
         if state == target_state {
             return LocalStart::AtHead(cache);
         }
-        if let Some(k) = chain.iter().rposition(|s| *s == state) {
-            if start.as_ref().is_none_or(|(_, best)| k > *best) {
-                start = Some((cache, k));
-            }
+        if let Some(k) = chain.iter().rposition(|s| *s == state)
+            && start.as_ref().is_none_or(|(_, best)| k > *best)
+        {
+            start = Some((cache, k));
         }
     }
     match start {

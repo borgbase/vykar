@@ -60,10 +60,10 @@ fn extra_path_dirs() -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = EXTRA_PATH_DIRS.iter().map(PathBuf::from).collect();
 
     #[cfg(unix)]
-    if let Some(home) = std::env::var_os("HOME") {
-        if !home.is_empty() {
-            dirs.push(PathBuf::from(home).join(".local").join("bin"));
-        }
+    if let Some(home) = std::env::var_os("HOME")
+        && !home.is_empty()
+    {
+        dirs.push(PathBuf::from(home).join(".local").join("bin"));
     }
 
     dirs.retain(|d| d.is_dir());

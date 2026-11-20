@@ -83,16 +83,16 @@ pub(super) fn handle_save_and_apply_config(ctx: &mut WorkerContext, yaml_text: S
 /// (rename succeeded or a prior cleanup ran); any other failure is logged so
 /// a stuck tmp file (e.g. a still-locked file on Windows) is visible.
 fn cleanup_tmp(ctx: &WorkerContext, path: &Path) {
-    if let Err(e) = std::fs::remove_file(path) {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            send_log(
-                &ctx.ui_tx,
-                format!(
-                    "Failed to remove temporary config file {}: {e}",
-                    path.display()
-                ),
-            );
-        }
+    if let Err(e) = std::fs::remove_file(path)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        send_log(
+            &ctx.ui_tx,
+            format!(
+                "Failed to remove temporary config file {}: {e}",
+                path.display()
+            ),
+        );
     }
 }
 

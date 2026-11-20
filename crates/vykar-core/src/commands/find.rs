@@ -197,29 +197,30 @@ pub fn run(
 
 fn matches_filter(item: &Item, filter: &FindFilter) -> bool {
     // Type filter (cheapest)
-    if let Some(ref t) = filter.item_type {
-        if &item.entry_type != t {
-            return false;
-        }
+    if let Some(ref t) = filter.item_type
+        && &item.entry_type != t
+    {
+        return false;
     }
 
     // Path prefix
-    if let Some(ref prefix) = filter.path_prefix {
-        if item.path != *prefix && !item.path.starts_with(&format!("{prefix}/")) {
-            return false;
-        }
+    if let Some(ref prefix) = filter.path_prefix
+        && item.path != *prefix
+        && !item.path.starts_with(&format!("{prefix}/"))
+    {
+        return false;
     }
 
     // Size filters
-    if let Some(min) = filter.larger_than {
-        if item.size < min {
-            return false;
-        }
+    if let Some(min) = filter.larger_than
+        && item.size < min
+    {
+        return false;
     }
-    if let Some(max) = filter.smaller_than {
-        if item.size > max {
-            return false;
-        }
+    if let Some(max) = filter.smaller_than
+        && item.size > max
+    {
+        return false;
     }
 
     // Since filter (mtime in nanos)
@@ -247,17 +248,17 @@ fn matches_filter(item: &Item, filter: &FindFilter) -> bool {
     }
 
     // Path glob (case-sensitive, full path)
-    if let Some(ref glob) = filter.path_glob {
-        if !glob.is_match(&item.path) {
-            return false;
-        }
+    if let Some(ref glob) = filter.path_glob
+        && !glob.is_match(&item.path)
+    {
+        return false;
     }
 
     // Path glob (case-insensitive, full path)
-    if let Some(ref glob) = filter.ipath_glob {
-        if !glob.is_match(&item.path) {
-            return false;
-        }
+    if let Some(ref glob) = filter.ipath_glob
+        && !glob.is_match(&item.path)
+    {
+        return false;
     }
 
     true

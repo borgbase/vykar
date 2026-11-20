@@ -76,14 +76,14 @@ pub(crate) fn resolve_or_create_config(
     // 0. Try saved config path from GUI state (if file still exists)
     if let Some(saved) = saved_config_path {
         let path = PathBuf::from(saved);
-        if path.is_file() {
-            if let Ok(repos) = config::load_and_resolve(&path) {
-                let source = ConfigSource::SearchOrder {
-                    path,
-                    level: "user",
-                };
-                return Ok(app::RuntimeConfig { source, repos });
-            }
+        if path.is_file()
+            && let Ok(repos) = config::load_and_resolve(&path)
+        {
+            let source = ConfigSource::SearchOrder {
+                path,
+                level: "user",
+            };
+            return Ok(app::RuntimeConfig { source, repos });
         }
     }
 

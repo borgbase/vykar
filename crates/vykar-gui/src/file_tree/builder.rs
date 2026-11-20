@@ -164,10 +164,10 @@ impl FileTree {
             if arena[i].item_paths.len() != 1 {
                 arena[i].mixed_origins = true;
             }
-            if arena[i].mixed_origins {
-                if let Some(pidx) = arena[i].parent {
-                    arena[pidx].mixed_origins = true;
-                }
+            if arena[i].mixed_origins
+                && let Some(pidx) = arena[i].parent
+            {
+                arena[pidx].mixed_origins = true;
             }
         }
 

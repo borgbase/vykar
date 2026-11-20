@@ -411,20 +411,20 @@ pub(super) fn execute_repair(
     // rebuild — if a delete fails, the snapshot's chunks must remain counted.
     let mut successfully_deleted_doomed: HashSet<String> = HashSet::new();
     for action in &plan.actions {
-        if let RepairAction::RemoveDanglingSnapshot { snapshot_name, .. } = action {
-            if let Some(entry) = repo.manifest().find_snapshot(snapshot_name) {
-                let key = entry.id.storage_key();
-                match repo.storage.delete(&key) {
-                    Ok(()) => {
-                        repo.manifest_mut().remove_snapshot(snapshot_name);
-                        applied.push(action.clone());
-                        successfully_deleted_doomed.insert(snapshot_name.clone());
-                    }
-                    Err(e) => {
-                        repair_errors.push(format!(
-                            "failed to remove doomed snapshot '{snapshot_name}': {e}"
-                        ));
-                    }
+        if let RepairAction::RemoveDanglingSnapshot { snapshot_name, .. } = action
+            && let Some(entry) = repo.manifest().find_snapshot(snapshot_name)
+        {
+            let key = entry.id.storage_key();
+            match repo.storage.delete(&key) {
+                Ok(()) => {
+                    repo.manifest_mut().remove_snapshot(snapshot_name);
+                    applied.push(action.clone());
+                    successfully_deleted_doomed.insert(snapshot_name.clone());
+                }
+                Err(e) => {
+                    repair_errors.push(format!(
+                        "failed to remove doomed snapshot '{snapshot_name}': {e}"
+                    ));
                 }
             }
         }

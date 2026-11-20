@@ -172,8 +172,8 @@ pub fn prove_key(
 
     // Either layout's object may be at `index` whatever the format says: an
     // upgrade can be interrupted, and an old binary can overwrite a head.
-    if let Ok(Some(blob)) = storage.get("index") {
-        if [ObjectType::ChunkIndex, ObjectType::IndexHead]
+    if let Ok(Some(blob)) = storage.get("index")
+        && [ObjectType::ChunkIndex, ObjectType::IndexHead]
             .into_iter()
             .any(|expected| {
                 unpack_object_expect_with_context(
@@ -184,9 +184,8 @@ pub fn prove_key(
                 )
                 .is_ok()
             })
-        {
-            return Ok(KeyProof::AuthenticatedData);
-        }
+    {
+        return Ok(KeyProof::AuthenticatedData);
     }
 
     if let Ok(keys) = storage.list("snapshots/") {

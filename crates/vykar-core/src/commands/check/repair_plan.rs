@@ -388,18 +388,18 @@ pub(super) fn build_repair_plan(
                     if name_to_id.get(snapshot_name) == Some(id)
             )
         });
-        if let Some(name_opt) = invalid_item_name {
-            if !has_other_whole {
-                actions.push(RepairAction::RemoveCorruptSnapshot {
-                    snapshot_id: *id,
-                    name: name_opt.clone(),
-                });
-                if let Some(n) = name_opt {
-                    corrupt_snapshot_names.insert(n);
-                }
-                emitted_corrupt.insert(*id);
-                has_data_loss = true;
+        if let Some(name_opt) = invalid_item_name
+            && !has_other_whole
+        {
+            actions.push(RepairAction::RemoveCorruptSnapshot {
+                snapshot_id: *id,
+                name: name_opt.clone(),
+            });
+            if let Some(n) = name_opt {
+                corrupt_snapshot_names.insert(n);
             }
+            emitted_corrupt.insert(*id);
+            has_data_loss = true;
         }
     }
 

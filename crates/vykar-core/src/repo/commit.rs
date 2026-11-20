@@ -1024,15 +1024,15 @@ impl Repository {
     fn rebuild_local_caches(&self, full_cache_fresh: bool) {
         let cd = self.cache_dir_override.as_deref();
         let generation = self.index_generation;
-        if !full_cache_fresh {
-            if let Err(e) = dedup_cache::build_full_index_cache(
+        if !full_cache_fresh
+            && let Err(e) = dedup_cache::build_full_index_cache(
                 &self.chunk_index,
                 generation,
                 &self.config.id,
                 cd,
-            ) {
-                warn!("failed to build full index cache: {e}");
-            }
+            )
+        {
+            warn!("failed to build full index cache: {e}");
         }
         let Some(full_path) = dedup_cache::full_index_cache_path(&self.config.id, cd) else {
             return;

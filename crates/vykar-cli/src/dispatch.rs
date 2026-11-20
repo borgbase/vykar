@@ -79,10 +79,8 @@ pub(crate) fn run_default_actions(
                             }
                             backup_renderer = None;
                         }
-                        if matches!(outcome, StepOutcome::Failed(..)) {
-                            if let StepOutcome::Failed(e) = outcome {
-                                eprintln!("Error: {e}");
-                            }
+                        if let StepOutcome::Failed(e) = outcome {
+                            eprintln!("Error: {e}");
                         }
                     }
                     CycleEvent::Backup(evt) => {
@@ -169,10 +167,10 @@ fn print_step_details(result: &FullCycleResult) {
     }
 
     // Check results (skip summary if check was skipped — the step outcome table already shows it)
-    if let Some(ref result) = result.check_result {
-        if !result.skipped {
-            print_check_summary(result);
-        }
+    if let Some(ref result) = result.check_result
+        && !result.skipped
+    {
+        print_check_summary(result);
     }
 }
 

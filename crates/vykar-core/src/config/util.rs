@@ -4,15 +4,15 @@ use vykar_common::paths;
 
 /// Expand a leading `~` or `~/` to the user's home directory.
 pub fn expand_tilde(path: &str) -> String {
-    if path == "~" {
-        if let Some(home) = paths::home_dir() {
-            return home.to_string_lossy().to_string();
-        }
+    if path == "~"
+        && let Some(home) = paths::home_dir()
+    {
+        return home.to_string_lossy().to_string();
     }
-    if let Some(suffix) = path.strip_prefix("~/") {
-        if let Some(home) = paths::home_dir() {
-            return home.join(suffix).to_string_lossy().to_string();
-        }
+    if let Some(suffix) = path.strip_prefix("~/")
+        && let Some(home) = paths::home_dir()
+    {
+        return home.join(suffix).to_string_lossy().to_string();
     }
     path.to_string()
 }

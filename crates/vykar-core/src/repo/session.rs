@@ -285,15 +285,11 @@ impl Repository {
         let flush_data = ws.data_pack_writer.has_pending();
         let flush_tree = ws.tree_pack_writer.has_pending();
 
-        if flush_data {
-            if let Err(e) = self.flush_writer_async(PackType::Data) {
-                warn!("flush_on_abort: failed to seal data pack: {e}");
-            }
+        if flush_data && let Err(e) = self.flush_writer_async(PackType::Data) {
+            warn!("flush_on_abort: failed to seal data pack: {e}");
         }
-        if flush_tree {
-            if let Err(e) = self.flush_writer_async(PackType::Tree) {
-                warn!("flush_on_abort: failed to seal tree pack: {e}");
-            }
+        if flush_tree && let Err(e) = self.flush_writer_async(PackType::Tree) {
+            warn!("flush_on_abort: failed to seal tree pack: {e}");
         }
 
         // Join all in-flight upload threads so packs land on storage.
@@ -394,10 +390,10 @@ impl Repository {
             // Only discard the delta's undo log when a tracker was actually
             // armed (mirrors `begin_rollback_checkpoint`); leave the no-tracker
             // case untouched.
-            if ws.rollback_tracker.take().is_some() {
-                if let Some(ref mut delta) = ws.index_delta {
-                    delta.discard_checkpoint();
-                }
+            if ws.rollback_tracker.take().is_some()
+                && let Some(ref mut delta) = ws.index_delta
+            {
+                delta.discard_checkpoint();
             }
         }
     }

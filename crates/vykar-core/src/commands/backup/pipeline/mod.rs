@@ -670,13 +670,13 @@ pub(crate) fn run_parallel_pipeline(
         drop(result_rx);
 
         // Verify no in-progress segmented file was left incomplete.
-        if consume_err.is_none() {
-            if let Some(accum) = &large_file_accum {
-                consume_err = Some(VykarError::Other(format!(
-                    "incomplete segmented file '{}': received {}/{} segments",
-                    accum.abs_path, accum.next_expected_index, accum.num_segments,
-                )));
-            }
+        if consume_err.is_none()
+            && let Some(accum) = &large_file_accum
+        {
+            consume_err = Some(VykarError::Other(format!(
+                "incomplete segmented file '{}': received {}/{} segments",
+                accum.abs_path, accum.next_expected_index, accum.num_segments,
+            )));
         }
 
         debug_assert!(

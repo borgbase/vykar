@@ -669,18 +669,18 @@ impl FileCache {
                 .active_keys
                 .iter()
                 .filter(|key| path_starts_with(p, Path::new(key.as_str())));
-            if let (Some(key), None) = (matching.next(), matching.next()) {
-                if let (Some(section), Some(hits)) = (
+            if let (Some(key), None) = (matching.next(), matching.next())
+                && let (Some(section), Some(hits)) = (
                     self.sections.get_mut(key.as_str()),
                     self.retained_hits.get_mut(key.as_str()),
-                ) {
-                    // Last write wins, as with `insert`: drop an entry this run
-                    // already wrote for the same path so it cannot shadow the
-                    // retained one at absorb time.
-                    section.entries.remove(&path_hash);
-                    hits.hashes.push(path_hash);
-                    return;
-                }
+                )
+            {
+                // Last write wins, as with `insert`: drop an entry this run
+                // already wrote for the same path so it cannot shadow the
+                // retained one at absorb time.
+                section.entries.remove(&path_hash);
+                hits.hashes.push(path_hash);
+                return;
             }
         }
         self.insert(path, device, inode, mtime_ns, ctime_ns, size, chunk_refs);

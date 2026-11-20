@@ -81,10 +81,10 @@ fn resolve(ids: &[PackId], mut sizes: PackSizes) -> Result<()> {
     if let Some(id) = absent {
         return Err(missing(id));
     }
-    if let Some(id) = failed {
-        if let Some(Err(e)) = sizes.remove(id) {
-            return Err(e);
-        }
+    if let Some(id) = failed
+        && let Some(Err(e)) = sizes.remove(id)
+    {
+        return Err(e);
     }
     match unreached {
         Some(id) => Err(missing(id)),

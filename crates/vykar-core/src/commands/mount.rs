@@ -123,11 +123,11 @@ fn insert_into_tree(children: &mut HashMap<String, VfsNode>, components: &[&str]
         let name = (*head).to_string();
         // If this is a directory and one already exists as an intermediate,
         // just update its metadata rather than replacing it (which would lose children).
-        if item.entry_type == ItemType::Directory {
-            if let Some(VfsNode::Dir { meta, .. }) = children.get_mut(&name) {
-                *meta = VfsMeta::from_item(item);
-                return;
-            }
+        if item.entry_type == ItemType::Directory
+            && let Some(VfsNode::Dir { meta, .. }) = children.get_mut(&name)
+        {
+            *meta = VfsMeta::from_item(item);
+            return;
         }
         let node = match item.entry_type {
             ItemType::Directory => VfsNode::Dir {

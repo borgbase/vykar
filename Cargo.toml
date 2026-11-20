@@ -98,8 +98,6 @@ unreachable = "deny"
 undocumented_unsafe_blocks = "deny"
 cast_precision_loss = "deny"
 indexing_slicing = "warn"
-# Temporary: removed again with the let-chain clippy fixes.
-collapsible_if = "allow"
 
 # Deferred audit lints. `make pre-commit` runs clippy with `-D warnings`, so a
 # workspace lint set to `warn` is commit-blocking. Keep these as explicit

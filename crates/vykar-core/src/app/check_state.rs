@@ -47,11 +47,11 @@ pub fn record_full_check(url: &str, fingerprint: &str, cache_dir: Option<&Path>)
         return;
     };
 
-    if let Some(parent) = path.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            tracing::warn!("could not create cache directory {}: {e}", parent.display());
-            return;
-        }
+    if let Some(parent) = path.parent()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        tracing::warn!("could not create cache directory {}: {e}", parent.display());
+        return;
     }
 
     let state = CheckStateFile {

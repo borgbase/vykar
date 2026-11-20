@@ -31,66 +31,63 @@ fn check_structure(repo_dir: &std::path::Path) -> serde_json::Value {
 
     // Check pack shard structure.
     let packs_dir = repo_dir.join("packs");
-    if packs_dir.exists() {
-        if let Ok(shards) = std::fs::read_dir(&packs_dir) {
-            for shard_entry in shards.flatten() {
-                let shard_name = shard_entry.file_name().to_string_lossy().to_string();
+    if packs_dir.exists()
+        && let Ok(shards) = std::fs::read_dir(&packs_dir)
+    {
+        for shard_entry in shards.flatten() {
+            let shard_name = shard_entry.file_name().to_string_lossy().to_string();
 
-                // Verify shard is 2-char hex.
-                if shard_name.len() != 2 || !shard_name.chars().all(|c| c.is_ascii_hexdigit()) {
-                    errors.push(format!("invalid shard directory: packs/{shard_name}"));
-                    continue;
-                }
+            // Verify shard is 2-char hex.
+            if shard_name.len() != 2 || !shard_name.chars().all(|c| c.is_ascii_hexdigit()) {
+                errors.push(format!("invalid shard directory: packs/{shard_name}"));
+                continue;
+            }
 
-                if let Ok(packs) = std::fs::read_dir(shard_entry.path()) {
-                    for pack_entry in packs.flatten() {
-                        let pack_name = pack_entry.file_name().to_string_lossy().to_string();
-                        // Upload/repack debris is not a pack: report it as a
-                        // count, not as a malformed pack. The server sweeps it
-                        // once it is older than `TEMP_DEBRIS_MAX_AGE`.
-                        if vykar_protocol::is_temp_file(&pack_name) {
-                            temp_files += 1;
-                            continue;
-                        }
-                        pack_count += 1;
+            if let Ok(packs) = std::fs::read_dir(shard_entry.path()) {
+                for pack_entry in packs.flatten() {
+                    let pack_name = pack_entry.file_name().to_string_lossy().to_string();
+                    // Upload/repack debris is not a pack: report it as a
+                    // count, not as a malformed pack. The server sweeps it
+                    // once it is older than `TEMP_DEBRIS_MAX_AGE`.
+                    if vykar_protocol::is_temp_file(&pack_name) {
+                        temp_files += 1;
+                        continue;
+                    }
+                    pack_count += 1;
 
-                        // Verify pack name is 64-char hex.
-                        if pack_name.len() != 64
-                            || !pack_name.chars().all(|c| c.is_ascii_hexdigit())
-                        {
-                            errors
-                                .push(format!("invalid pack name: packs/{shard_name}/{pack_name}"));
-                        }
+                    // Verify pack name is 64-char hex.
+                    if pack_name.len() != 64 || !pack_name.chars().all(|c| c.is_ascii_hexdigit()) {
+                        errors.push(format!("invalid pack name: packs/{shard_name}/{pack_name}"));
+                    }
 
-                        let meta = pack_entry.metadata();
-                        if let Ok(meta) = meta {
-                            let size = meta.len();
-                            total_size += size;
+                    let meta = pack_entry.metadata();
+                    if let Ok(meta) = meta {
+                        let size = meta.len();
+                        total_size += size;
 
-                            if size < PACK_HEADER_SIZE as u64 {
-                                errors.push(format!(
-                                    "pack too small ({size} bytes): packs/{shard_name}/{pack_name}"
-                                ));
-                            } else {
-                                // Read the header only — magic + version byte.
-                                match std::fs::File::open(pack_entry.path()).and_then(|mut f| {
-                                    use std::io::Read;
-                                    let mut hdr = [0u8; PACK_HEADER_SIZE];
-                                    f.read_exact(&mut hdr)?;
-                                    Ok(hdr)
-                                }) {
-                                    Ok(hdr) => {
-                                        if let Err(reason) = validate_pack_header(&hdr) {
-                                            errors.push(format!(
-                                                "{reason}: packs/{shard_name}/{pack_name}"
-                                            ));
-                                        }
-                                    }
-                                    Err(e) => {
+                        if size < PACK_HEADER_SIZE as u64 {
+                            errors.push(format!(
+                                "pack too small ({size} bytes): packs/{shard_name}/{pack_name}"
+                            ));
+                        } else {
+                            // Read the header only — magic + version byte.
+                            match std::fs::File::open(pack_entry.path()).and_then(|mut f| {
+                                use std::io::Read;
+                                let mut hdr = [0u8; PACK_HEADER_SIZE];
+                                f.read_exact(&mut hdr)?;
+                                Ok(hdr)
+                            }) {
+                                Ok(hdr) => {
+                                    if let Err(reason) = validate_pack_header(&hdr) {
                                         errors.push(format!(
-                                            "read error for packs/{shard_name}/{pack_name}: {e}"
+                                            "{reason}: packs/{shard_name}/{pack_name}"
                                         ));
                                     }
+                                }
+                                Err(e) => {
+                                    errors.push(format!(
+                                        "read error for packs/{shard_name}/{pack_name}: {e}"
+                                    ));
                                 }
                             }
                         }

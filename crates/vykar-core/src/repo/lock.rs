@@ -230,10 +230,10 @@ fn should_cleanup_lock(
     if let Some(entry) = entry {
         let same_host = entry.hostname == local_hostname;
         if same_host {
-            if let (Some(local), Some(remote)) = (local_boot_id, entry.boot_id.as_deref()) {
-                if local != remote {
-                    return true;
-                }
+            if let (Some(local), Some(remote)) = (local_boot_id, entry.boot_id.as_deref())
+                && local != remote
+            {
+                return true;
             }
             if !pid_alive_fn(entry.pid) {
                 return true;
@@ -322,11 +322,11 @@ fn build_lock_fence_inner(
                 time: Utc::now().to_rfc3339(),
                 boot_id: crate::platform::boot_id(),
             };
-            if let Ok(data) = serde_json::to_vec(&entry) {
-                if storage.put(&lock_key, &data).is_ok() {
-                    last_refreshed.store(now_secs, Ordering::SeqCst);
-                    debug!(lock_key = %lock_key, "lock file refreshed");
-                }
+            if let Ok(data) = serde_json::to_vec(&entry)
+                && storage.put(&lock_key, &data).is_ok()
+            {
+                last_refreshed.store(now_secs, Ordering::SeqCst);
+                debug!(lock_key = %lock_key, "lock file refreshed");
             }
         }
 
@@ -714,10 +714,10 @@ pub fn cleanup_stale_sessions(
         if let Some(id) = key
             .strip_prefix(SESSIONS_PREFIX)
             .and_then(|s| s.strip_suffix(".index"))
+            && !surviving_markers.contains(id)
+            && !cleaned_ids.contains(id)
         {
-            if !surviving_markers.contains(id) && !cleaned_ids.contains(id) {
-                storage.delete(key)?;
-            }
+            storage.delete(key)?;
         }
     }
 

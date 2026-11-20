@@ -10,7 +10,7 @@ publish.workspace = true
 workspace = true
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.31.3", features = ["fs", "user"] }
+nix = { version = "0.32.0", features = ["fs", "user"] }
 
 [dev-dependencies]
 tempfile.workspace = true

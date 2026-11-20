@@ -102,7 +102,7 @@ tokio = { workspace = true, features = ["rt-multi-thread", "net"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-nix = { version = "0.31.3", features = ["fs", "hostname", "signal", "process"] }
+nix = { version = "0.32.0", features = ["fs", "hostname", "signal", "process"] }
 xattr = "1"
 
 [target.'cfg(windows)'.dependencies]

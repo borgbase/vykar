@@ -184,8 +184,8 @@ print_stderr = "warn"
 
 [patch.crates-io]
 # posix-rename@openssh.com for atomic SFTP uploads.
-# TODO(russh-sftp#112): drop once a release contains posix_rename.
-russh-sftp = { git = "https://github.com/m3nu/russh-sftp", rev = "60164e1005b39214f5960b21629168c21fc4570c" }
+# TODO(russh-sftp#112): drop once a release after 3.0.1 includes #112.
+russh-sftp = { git = "https://github.com/AspectUnk/russh-sftp", rev = "49451b7b89c07149b2a1744f15ba28f983a53ddc" }
 
 [profile.release]
 opt-level = 3

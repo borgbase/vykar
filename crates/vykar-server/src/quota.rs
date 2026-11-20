@@ -189,22 +189,22 @@ fn detect_fs_quota(data_dir: &Path) -> Option<u64> {
     // Try user quota for the data directory owner (covers running as root)
     if let Ok(meta) = std::fs::metadata(data_dir) {
         let dir_uid = meta.uid();
-        if dir_uid != uid {
-            if let Some(limit) = xfs_get_quota_fd(fd, dir_uid, USRQUOTA) {
-                info!(dir_uid, limit, "quota: detected user quota (dir owner)");
-                return Some(limit);
-            }
+        if dir_uid != uid
+            && let Some(limit) = xfs_get_quota_fd(fd, dir_uid, USRQUOTA)
+        {
+            info!(dir_uid, limit, "quota: detected user quota (dir owner)");
+            return Some(limit);
         }
     }
 
     // Fall back to project quota
     if let Some(proj_id) = get_project_id(data_dir) {
         debug!(proj_id, "quota: project id on data dir");
-        if proj_id > 0 {
-            if let Some(limit) = xfs_get_quota_fd(fd, proj_id, PRJQUOTA) {
-                info!(proj_id, limit, "quota: detected project quota");
-                return Some(limit);
-            }
+        if proj_id > 0
+            && let Some(limit) = xfs_get_quota_fd(fd, proj_id, PRJQUOTA)
+        {
+            info!(proj_id, limit, "quota: detected project quota");
+            return Some(limit);
         }
     }
 

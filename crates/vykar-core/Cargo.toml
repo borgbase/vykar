@@ -73,7 +73,7 @@ crossbeam-channel.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread"], optional = true }
 
 # Mount (WebDAV server)
-dav-server = { version = "0.11", optional = true }
+dav-server = { version = "0.12", optional = true }
 hyper = { version = "1", features = ["server", "http1"], optional = true }
 hyper-util = { version = "0.1", features = ["tokio"], optional = true }
 lru = { version = "0.19", optional = true }

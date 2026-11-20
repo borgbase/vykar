@@ -563,6 +563,11 @@ impl DavFileSystem for VykarDavFs {
         })
     }
 
+    // The snapshot VFS never follows links, so `metadata` already describes the link itself.
+    fn symlink_metadata<'a>(&'a self, path: &'a DavPath) -> FsFuture<'a, Box<dyn DavMetaData>> {
+        DavFileSystem::metadata(self, path)
+    }
+
     fn read_dir<'a>(
         &'a self,
         path: &'a DavPath,

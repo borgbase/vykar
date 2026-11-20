@@ -1,4 +1,4 @@
-// libc fchmod/futimens/utimensat for fd- and path-based file metadata writes;
+// libc fchmod/fchown/chown/lchown/geteuid for file mode and ownership writes;
 // SAFETY documented per block.
 #![allow(unsafe_code)]
 
@@ -253,50 +253,28 @@ pub fn apply_mode_fd(file: &std::fs::File, mode: u32) -> std::io::Result<()> {
     }
 }
 
-/// Set file mtime via an open file descriptor (avoids path lookup).
+/// Set file mtime via an open file descriptor (avoids path lookup). Atime is
+/// left untouched.
 pub fn set_file_mtime_fd(file: &std::fs::File, secs: i64, nanos: u32) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::io::AsRawFd;
-        let times = [
-            libc::timespec {
-                tv_sec: 0,
-                tv_nsec: libc::UTIME_OMIT,
-            },
-            libc::timespec {
-                tv_sec: secs as _,
-                tv_nsec: nanos as _,
-            },
-        ];
-        // SAFETY: fd is borrowed from the open `file` (valid for the call);
-        // `times` is a stack-owned 2-element array of timespec — well-defined
-        // input for futimens.
-        let ret = unsafe { libc::futimens(file.as_raw_fd(), times.as_ptr()) };
-        if ret == 0 {
-            Ok(())
-        } else {
-            Err(std::io::Error::last_os_error())
-        }
-    }
+    file.set_times(mtime_only(secs, nanos)?)
+}
 
-    #[cfg(windows)]
-    {
-        use std::fs::FileTimes;
-        use std::time::{Duration, SystemTime};
+/// `FileTimes` carrying only the given mtime; std passes `UTIME_OMIT` (or a
+/// null pointer on Windows) for the unset atime.
+fn mtime_only(secs: i64, nanos: u32) -> std::io::Result<std::fs::FileTimes> {
+    use std::time::{Duration, SystemTime};
 
-        let time = if secs >= 0 {
-            SystemTime::UNIX_EPOCH + Duration::new(secs as u64, nanos)
-        } else {
-            SystemTime::UNIX_EPOCH - Duration::new(secs.unsigned_abs(), 0) + Duration::new(0, nanos)
-        };
-        file.set_times(FileTimes::new().set_modified(time))
-    }
-
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = (file, secs, nanos);
-        Ok(())
-    }
+    let base = if secs >= 0 {
+        SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(secs as u64))
+    } else {
+        SystemTime::UNIX_EPOCH.checked_sub(Duration::from_secs(secs.unsigned_abs()))
+    };
+    let time = base
+        .and_then(|t| t.checked_add(Duration::from_nanos(nanos.into())))
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "mtime out of range")
+        })?;
+    Ok(std::fs::FileTimes::new().set_modified(time))
 }
 
 pub fn create_symlink(link_target: &Path, target: &Path) -> std::io::Result<()> {
@@ -356,83 +334,20 @@ pub fn hard_link(original: &Path, link: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Set a path's mtime, following symlinks. Atime is left untouched.
 pub fn set_file_mtime(path: &Path, secs: i64, nanos: u32) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        set_path_mtime(path, secs, nanos, 0)
-    }
-
-    #[cfg(not(unix))]
-    {
-        set_path_mtime(path, secs, nanos)
-    }
+    std::fs::set_times(path, mtime_only(secs, nanos)?)
 }
 
 /// Set a symlink's own mtime without following it (`AT_SYMLINK_NOFOLLOW`).
-/// No-op on non-Unix platforms (no portable symlink-mtime API).
+/// No-op on non-Unix platforms.
 pub fn set_symlink_mtime(path: &Path, secs: i64, nanos: u32) -> std::io::Result<()> {
     #[cfg(unix)]
     {
-        set_path_mtime(path, secs, nanos, libc::AT_SYMLINK_NOFOLLOW)
+        std::fs::set_times_nofollow(path, mtime_only(secs, nanos)?)
     }
 
     #[cfg(not(unix))]
-    {
-        let _ = (path, secs, nanos);
-        Ok(())
-    }
-}
-
-/// Path-based mtime write. On Unix, `flags` are passed to `utimensat`
-/// (`0` follows symlinks; `AT_SYMLINK_NOFOLLOW` targets the link itself).
-#[cfg(unix)]
-fn set_path_mtime(path: &Path, secs: i64, nanos: u32, flags: i32) -> std::io::Result<()> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-
-    let c_path = CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains null"))?;
-    let times = [
-        libc::timespec {
-            tv_sec: 0,
-            tv_nsec: libc::UTIME_OMIT,
-        },
-        libc::timespec {
-            tv_sec: secs as _,
-            tv_nsec: nanos as _,
-        },
-    ];
-    // SAFETY: `c_path` is a valid NUL-terminated CString owned in this
-    // scope; `times` is a stack-owned 2-element array of timespec; `flags`
-    // is a valid utimensat flag set (0 or AT_SYMLINK_NOFOLLOW).
-    if unsafe { libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), flags) } == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
-#[cfg(not(unix))]
-fn set_path_mtime(path: &Path, secs: i64, nanos: u32) -> std::io::Result<()> {
-    #[cfg(windows)]
-    {
-        use std::fs::{FileTimes, OpenOptions};
-        use std::os::windows::fs::OpenOptionsExt;
-        use std::time::{Duration, SystemTime};
-
-        const FILE_WRITE_ATTRIBUTES: u32 = 0x0100;
-        let time = if secs >= 0 {
-            SystemTime::UNIX_EPOCH + Duration::new(secs as u64, nanos)
-        } else {
-            SystemTime::UNIX_EPOCH - Duration::new(secs.unsigned_abs(), 0) + Duration::new(0, nanos)
-        };
-        let file = OpenOptions::new()
-            .access_mode(FILE_WRITE_ATTRIBUTES)
-            .open(path)?;
-        file.set_times(FileTimes::new().set_modified(time))
-    }
-
-    #[cfg(not(windows))]
     {
         let _ = (path, secs, nanos);
         Ok(())
@@ -648,8 +563,8 @@ mod tests {
         std::fs::set_permissions(&path, perms).unwrap();
 
         let target_secs: i64 = 1_600_000_000;
-        // Both Unix (utimensat is path-based) and Windows (FILE_WRITE_ATTRIBUTES)
-        // should succeed on read-only files.
+        // Path-based on Unix; std opens with FILE_WRITE_ATTRIBUTES on Windows.
+        // Both succeed on read-only files.
         set_file_mtime(&path, target_secs, 0).unwrap();
 
         let meta = std::fs::metadata(&path).unwrap();
@@ -716,6 +631,32 @@ mod tests {
         let since_epoch = mtime.duration_since(SystemTime::UNIX_EPOCH).unwrap();
         let diff = (since_epoch.as_secs() as i64 - target_secs).unsigned_abs();
         assert!(diff <= 1, "mtime off by {diff} seconds");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn set_symlink_mtime_does_not_follow() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.txt");
+        let link = dir.path().join("link");
+        std::fs::write(&target, b"data").unwrap();
+        set_file_mtime(&target, 1_600_000_000, 0).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        set_symlink_mtime(&link, 1_700_000_000, 0).unwrap();
+
+        let secs = |m: std::fs::Metadata| {
+            m.modified()
+                .unwrap()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+        };
+        assert_eq!(
+            secs(std::fs::symlink_metadata(&link).unwrap()),
+            1_700_000_000
+        );
+        assert_eq!(secs(std::fs::metadata(&target).unwrap()), 1_600_000_000);
     }
 
     /// `metadata_matches` must catch mutations in every guarded field.

@@ -6,6 +6,7 @@ __pycache__
 proptest-regressions/
 fuzz/artifacts/
 fuzz/target/
+fuzz/corpus/
 /output
 
 # Nix build artifacts

@@ -21,6 +21,10 @@ use vykar_types::pack_id::PackId;
 mod finalize;
 mod parallel;
 mod plan;
+#[cfg(feature = "fuzzing")]
+pub(crate) use plan::{
+    classify_symlink_target_path, sanitize_item_into, symlink_target_path, SymlinkSafety,
+};
 mod read_groups;
 #[cfg(test)]
 mod test_support;

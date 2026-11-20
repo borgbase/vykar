@@ -19,6 +19,7 @@ serde = { version = "1", features = ["derive"] }
 chrono = { version = "0.4", features = ["serde"] }
 aes-gcm = "0.11"
 blake3 = "1"
+argon2 = "0.6"
 
 vykar-core = { path = "../crates/vykar-core", default-features = false, features = ["fuzzing"] }
 vykar-crypto = { path = "../crates/vykar-crypto" }
@@ -88,6 +89,41 @@ doc = false
 [[bin]]
 name = "fuzz_full_index_cache"
 path = "fuzz_targets/fuzz_full_index_cache.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_repo_config"
+path = "fuzz_targets/fuzz_repo_config.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_key_blob"
+path = "fuzz_targets/fuzz_key_blob.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_restore_paths"
+path = "fuzz_targets/fuzz_restore_paths.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_pending_journal"
+path = "fuzz_targets/fuzz_pending_journal.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_protocol_keys"
+path = "fuzz_targets/fuzz_protocol_keys.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_metadata_msgpack"
+path = "fuzz_targets/fuzz_metadata_msgpack.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_plaintext_read"
+path = "fuzz_targets/fuzz_plaintext_read.rs"
 doc = false
 
 [[bin]]

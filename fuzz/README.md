@@ -23,6 +23,13 @@ Coverage-guided fuzz tests for vykar's parser, deserializer, and decrypt paths. 
 | `fuzz_index_apply` | Segment chain apply (`apply_to_temp`) over a decoded base, chained to it, checked against the reference model |
 | `fuzz_index_object` | Stored `index.d/` objects through the store-level segment and base decoders (name check, plaintext unpack, zstd, codec), against a buffered reference |
 | `fuzz_full_index_cache` | Local full index cache file (`open_verified`) with a correct trailer, then `encode_base` and apply over it |
+| `fuzz_repo_config` | Repository `config` decode and `RepoConfig::validate`, pack-size targets, then backup's chunker gate and both chunkers (checked to cut identically) |
+| `fuzz_key_blob` | Key blob screening (`inspect_key_blob`), checked against the KDF bounds; never runs the KDF |
+| `fuzz_restore_paths` | Restore path sanitizer and symlink audit over an item stream, against an independent model |
+| `fuzz_pending_journal` | Session journal decode (`decode_pending_journal`), re-encode and recovery seeding |
+| `fuzz_protocol_keys` | Server storage-key validators, pack-key temp paths, `Range` parsing (`parse_byte_range`), `validate_pack_header` |
+| `fuzz_metadata_msgpack` | Streaming `decode_metadata_msgpack::<IndexBlob>` against the buffered decode |
+| `fuzz_plaintext_read` | Plaintext read path: pack scan, unpack, decompress, chunk-ID check, size-hinted decompression |
 
 ## Corpus
 
@@ -62,6 +69,21 @@ Run a single target:
 ```
 cargo +nightly fuzz run fuzz_pack_scan -- -max_total_time=30 -rss_limit_mb=4096 -max_len=1048576
 ```
+
+## Long runs
+
+`fuzz/campaign.sh [SECONDS_PER_TARGET] [TARGET...]` runs every target (or the ones named) in turn with `-fork`, keeping going after findings. The grown corpus, crash artifacts and per-target logs go to `$FUZZ_WORK` (default `~/fuzz-work`), never into `fuzz/corpus/`. `FUZZ_JOBS` (default 6) and `FUZZ_RSS_MB` (per worker, default 4096) size it. Rerunning continues from the grown corpus.
+
+On a shared Linux box, run it as a capped user unit (`loginctl enable-linger` keeps it alive after logout):
+
+```
+systemd-run --user --unit=vykar-fuzz -p CPUQuota=600% -p MemoryMax=32G -p Nice=10 \
+  "$PWD/fuzz/campaign.sh" 600            # from the repository root
+journalctl --user -u vykar-fuzz -f     # progress
+systemctl --user stop vykar-fuzz       # pause, e.g. for benchmarks
+```
+
+Findings land in `$FUZZ_WORK/artifacts/<target>/`. Reproduce with `cargo +nightly fuzz run <target> <artifact>`, shrink with `cargo +nightly fuzz tmin <target> <artifact>`, then turn the input into a unit test in the affected crate.
 
 ## CI
 

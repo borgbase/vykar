@@ -68,7 +68,7 @@ pub(super) struct PendingLink {
 /// restore root or point at absolute system paths. The link itself is still
 /// restored as-is — these are flags, not rejections.
 #[derive(Debug, PartialEq, Eq)]
-enum SymlinkSafety {
+pub(crate) enum SymlinkSafety {
     Safe,
     Absolute,
     EscapesParent,
@@ -85,7 +85,7 @@ fn classify_symlink_target(target: &str) -> SymlinkSafety {
 
 /// Path-based classifier, so non-UTF8 byte-derived targets are audited with the
 /// same rules as UTF-8 ones.
-fn classify_symlink_target_path(path: &Path) -> SymlinkSafety {
+pub(crate) fn classify_symlink_target_path(path: &Path) -> SymlinkSafety {
     if path.is_absolute() {
         return SymlinkSafety::Absolute;
     }
@@ -97,7 +97,7 @@ fn classify_symlink_target_path(path: &Path) -> SymlinkSafety {
 
 /// Build the symlink target path, byte-faithfully when the item carries a raw
 /// (non-UTF8) target shadow (Unix), else from the lossy display string.
-fn symlink_target_path(item: &Item) -> PathBuf {
+pub(crate) fn symlink_target_path(item: &Item) -> PathBuf {
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt;
@@ -635,7 +635,7 @@ fn ensure_path_within_root(path: &Path, root: &Path) -> Result<()> {
 /// the item carries a non-UTF8 raw shadow (Unix) and the lossy display path
 /// otherwise. The same traversal checks (reject absolute / `..` / root /
 /// prefix) run on both branches — this is security-sensitive.
-fn sanitize_item_into(item: &Item, out: &mut PathBuf) -> Result<()> {
+pub(crate) fn sanitize_item_into(item: &Item, out: &mut PathBuf) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt;

@@ -14,19 +14,24 @@ use std::path::Path;
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::Aes256Gcm;
 use vykar_core::compress::{compress, Compression};
+use vykar_core::config::ChunkerConfig;
 use vykar_core::index::base::encode_base;
 use vykar_core::index::dedup_cache::{
     build_full_index_cache_to_path, FullCacheEntry, MmapFullIndexCache,
 };
 use vykar_core::index::head::{BaseRef, IndexHead, ObjectName, SegmentRef};
 use vykar_core::index::segment::{diff_to_temp, RefcountDelta, Relocation, Segment};
-use vykar_core::index::{ChunkIndex, IndexBlob};
+use vykar_core::index::{
+    encode_pending_journal, ChunkIndex, IndexBlob, PendingChunkEntry, PendingPackEntry,
+};
 use vykar_core::repo::file_cache::{CachedChunkRef, CachedChunks, FileCache};
-use vykar_core::repo::format::ObjectType;
+use vykar_core::repo::format::{pack_object_with_context, ObjectType};
 use vykar_core::repo::pack::{PackType, PackWriter};
-use vykar_core::snapshot::item::{ChunkRef, Item, ItemType};
+use vykar_core::repo::{EncryptionMode, RepoConfig};
+use vykar_core::snapshot::item::{ChunkRef, Item, ItemRawNames, ItemType};
 use vykar_core::snapshot::SnapshotMeta;
-use vykar_crypto::PlaintextEngine;
+use vykar_crypto::key::{EncryptedKey, KdfParams};
+use vykar_crypto::{CryptoEngine, PlaintextEngine};
 use vykar_types::chunk_id::{ChunkHasher, ChunkId};
 use vykar_types::hash::HashAlgorithm;
 use vykar_types::pack_id::PackId;
@@ -617,6 +622,249 @@ fn seed_unpack_object() {
     }
 }
 
+fn repo_config(version: u32, chunker: ChunkerConfig, min_pack: u32, max_pack: u32) -> Vec<u8> {
+    rmp_serde::to_vec(&RepoConfig {
+        version,
+        id: vec![0x42; 32],
+        chunker_params: chunker,
+        encryption: EncryptionMode::None,
+        created: fixed_time(),
+        min_pack_size: min_pack,
+        max_pack_size: max_pack,
+    })
+    .unwrap()
+}
+
+fn seed_repo_config() {
+    const MIB: u32 = 1024 * 1024;
+    let small = ChunkerConfig {
+        min_size: 1024,
+        avg_size: 4096,
+        max_size: 16384,
+    };
+    let seeds = [
+        (
+            "v5_default",
+            repo_config(5, ChunkerConfig::default(), 32 * MIB, 192 * MIB),
+        ),
+        ("v2_small", repo_config(2, small.clone(), MIB, 4 * MIB)),
+        (
+            "v4_min_above_max",
+            repo_config(4, small, 64 * MIB, 32 * MIB),
+        ),
+        (
+            "v3_odd_chunker",
+            repo_config(
+                3,
+                ChunkerConfig {
+                    min_size: 257,
+                    avg_size: 1024,
+                    max_size: 4096,
+                },
+                MIB,
+                4 * MIB,
+            ),
+        ),
+    ];
+    for (name, data) in seeds {
+        write_seed("fuzz_repo_config", name, &data);
+    }
+}
+
+fn seed_key_blob() {
+    // Well-formed but never derived from: the target only screens it.
+    let key = EncryptedKey {
+        kdf: KdfParams {
+            algorithm: "argon2id".into(),
+            time_cost: 3,
+            memory_cost: 64 * 1024,
+            parallelism: 4,
+            salt: vec![0x11; 32],
+        },
+        nonce: vec![0x22; 12],
+        encrypted_payload: vec![0x33; 120],
+    };
+    write_seed("fuzz_key_blob", "valid", &rmp_serde::to_vec(&key).unwrap());
+    let mut bad = key;
+    bad.kdf.memory_cost = 8 * 1024 * 1024;
+    write_seed(
+        "fuzz_key_blob",
+        "memory_too_large",
+        &rmp_serde::to_vec(&bad).unwrap(),
+    );
+}
+
+fn path_item(path: &str, entry_type: ItemType, link_target: Option<&str>) -> Item {
+    Item {
+        path: path.into(),
+        entry_type,
+        mode: 0o644,
+        uid: 1000,
+        gid: 1000,
+        user: None,
+        group: None,
+        mtime: 1_234_567_890_000_000_000,
+        atime: None,
+        ctime: None,
+        size: 0,
+        chunks: vec![],
+        link_target: link_target.map(Into::into),
+        xattrs: None,
+        raw_names: None,
+        hardlink: None,
+    }
+}
+
+fn seed_restore_paths() {
+    let mut raw_file = path_item("", ItemType::RegularFile, None);
+    let raw_path = b"dir/caf\xe9".to_vec();
+    raw_file.path = String::from_utf8_lossy(&raw_path).into_owned();
+    raw_file.raw_names = Some(ItemRawNames {
+        path: Some(raw_path),
+        link_target: None,
+    });
+    let mut raw_link = path_item("dir/raw-link", ItemType::Symlink, None);
+    let raw_target = b"../\xfftarget".to_vec();
+    raw_link.link_target = Some(String::from_utf8_lossy(&raw_target).into_owned());
+    raw_link.raw_names = Some(ItemRawNames {
+        path: None,
+        link_target: Some(raw_target),
+    });
+
+    let items = [
+        path_item("dir", ItemType::Directory, None),
+        path_item("./dir//file.txt", ItemType::RegularFile, None),
+        path_item("dir/../../escape", ItemType::RegularFile, None),
+        path_item("/etc/passwd", ItemType::RegularFile, None),
+        path_item("dir/abs-link", ItemType::Symlink, Some("/etc/shadow")),
+        path_item("dir/up-link", ItemType::Symlink, Some("../../x")),
+        path_item("dir/safe-link", ItemType::Symlink, Some("file.txt")),
+        raw_file,
+        raw_link,
+    ];
+    let mut stream = Vec::new();
+    for item in &items {
+        rmp_serde::encode::write(&mut stream, item).unwrap();
+    }
+    write_seed("fuzz_restore_paths", "mixed", &stream);
+}
+
+fn seed_pending_journal() {
+    let entries = vec![
+        PendingPackEntry {
+            pack_id: PackId::from_bytes([1; 32]),
+            chunks: vec![
+                PendingChunkEntry {
+                    chunk_id: ChunkId::from_bytes([2; 32]),
+                    stored_size: 100,
+                    pack_offset: 9,
+                },
+                PendingChunkEntry {
+                    chunk_id: ChunkId::from_bytes([3; 32]),
+                    stored_size: 200,
+                    pack_offset: 113,
+                },
+            ],
+        },
+        PendingPackEntry {
+            pack_id: PackId::from_bytes([1; 32]),
+            chunks: vec![],
+        },
+    ];
+    write_seed(
+        "fuzz_pending_journal",
+        "v2",
+        &encode_pending_journal(&entries).unwrap(),
+    );
+    write_seed(
+        "fuzz_pending_journal",
+        "legacy",
+        &rmp_serde::to_vec(&entries).unwrap(),
+    );
+    write_seed(
+        "fuzz_pending_journal",
+        "unknown_version",
+        &[0x92, 0x03, 0x90],
+    );
+}
+
+fn seed_protocol_keys() {
+    let hex64 = "0123456789abcdef".repeat(4);
+    let keys = [
+        ("key_config", "config".to_string()),
+        ("key_pack", format!("packs/01/{hex64}")),
+        ("key_index_object", format!("index.d/{hex64}")),
+        ("key_snapshot", "snapshots/abc".to_string()),
+        ("key_session", "sessions/abc.index".to_string()),
+        ("key_traversal", "snapshots/../config".to_string()),
+        ("key_temp", "snapshots/.tmp.abc.1".to_string()),
+    ];
+    for (name, key) in keys {
+        let mut data = vec![0u8];
+        data.extend_from_slice(key.as_bytes());
+        write_seed("fuzz_protocol_keys", name, &data);
+    }
+    let mut range = vec![1u8];
+    range.extend_from_slice(b"bytes=200-299");
+    write_seed("fuzz_protocol_keys", "range", &range);
+    let mut header = vec![2u8];
+    header.extend_from_slice(b"VGERPACK\x01");
+    write_seed("fuzz_protocol_keys", "pack_header", &header);
+}
+
+fn seed_metadata_msgpack() {
+    let blob = IndexBlob {
+        generation: 7,
+        chunks: seed_chunk_index(9),
+    };
+    let raw = rmp_serde::to_vec(&blob).unwrap();
+    for (name, compression) in [
+        ("zstd", Compression::Zstd { level: 3 }),
+        ("lz4", Compression::Lz4),
+        ("none", Compression::None),
+    ] {
+        write_seed(
+            "fuzz_metadata_msgpack",
+            name,
+            &compress(compression, &raw).unwrap(),
+        );
+    }
+}
+
+/// Chunk-ID key of `fuzz_plaintext_read`.
+const PLAINTEXT_CHUNK_ID_KEY: [u8; 32] = [0x5A; 32];
+
+fn seed_plaintext_read() {
+    let plaintext = b"plaintext chunk read path, plaintext chunk read path";
+    for (name, algorithm, compression) in [
+        ("blake2b_lz4", HashAlgorithm::Blake2b, Compression::Lz4),
+        (
+            "blake3_zstd",
+            HashAlgorithm::Blake3,
+            Compression::Zstd { level: 3 },
+        ),
+    ] {
+        let engine = PlaintextEngine::new(ChunkHasher::new(algorithm, PLAINTEXT_CHUNK_ID_KEY));
+        let id = ChunkId::compute(engine.chunk_hasher(), plaintext);
+        let blob = pack_object_with_context(
+            ObjectType::ChunkData,
+            id.as_bytes(),
+            &compress(compression, plaintext).unwrap(),
+            &engine,
+        )
+        .unwrap();
+        let mut pw = PackWriter::new(PackType::Data, usize::MAX, algorithm);
+        pw.add_blob(id, blob).unwrap();
+        let sealed = pw.seal().unwrap();
+
+        let mut data = vec![u8::from(algorithm == HashAlgorithm::Blake3)];
+        data.extend_from_slice(id.as_bytes());
+        data.extend_from_slice(&u32::try_from(plaintext.len()).unwrap().to_le_bytes());
+        data.extend_from_slice(sealed.data.as_bytes().expect("heap-buffered pack"));
+        write_seed("fuzz_plaintext_read", name, &data);
+    }
+}
+
 fn main() {
     println!("Generating fuzz corpus seeds...");
 
@@ -658,6 +906,27 @@ fn main() {
 
     seed_full_index_cache();
     println!("  fuzz_full_index_cache: done");
+
+    seed_repo_config();
+    println!("  fuzz_repo_config: done");
+
+    seed_key_blob();
+    println!("  fuzz_key_blob: done");
+
+    seed_restore_paths();
+    println!("  fuzz_restore_paths: done");
+
+    seed_pending_journal();
+    println!("  fuzz_pending_journal: done");
+
+    seed_protocol_keys();
+    println!("  fuzz_protocol_keys: done");
+
+    seed_metadata_msgpack();
+    println!("  fuzz_metadata_msgpack: done");
+
+    seed_plaintext_read();
+    println!("  fuzz_plaintext_read: done");
 
     println!("All corpus seeds written to {CORPUS_DIR}");
 }

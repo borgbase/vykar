@@ -2161,6 +2161,7 @@ name = "vykar-fuzz"
 version = "0.0.0"
 dependencies = [
  "aes-gcm",
+ "argon2",
  "blake3",
  "chrono",
  "libfuzzer-sys",

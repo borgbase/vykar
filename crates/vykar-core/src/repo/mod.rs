@@ -23,7 +23,7 @@ mod pack_lookup;
 mod pack_recovery;
 mod pack_verify;
 pub use key::{select_repository_key, LoadedKey};
-#[cfg(test)]
+#[cfg(any(test, feature = "fuzzing"))]
 pub(crate) use open::derive_plaintext_chunk_id_key;
 mod read;
 mod session;

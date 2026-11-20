@@ -50,7 +50,7 @@ Unit tests in `vykar-core` cover each subsystem in isolation. Fast feedback (sec
 
 ## Fuzz Tests
 
-13 coverage-guided fuzz targets via `cargo-fuzz` (libFuzzer). Each target feeds adversarial byte sequences into a parser, deserializer, or decrypt path, mutating from committed corpus seeds toward crashes, hangs, and OOM. Complements proptest by running for hours/days and optimizing for code-path coverage rather than round-trip invariants.
+20 coverage-guided fuzz targets via `cargo-fuzz` (libFuzzer). Each target feeds adversarial byte sequences into a parser, deserializer, or decrypt path, mutating from committed corpus seeds toward crashes, hangs, and OOM. Complements proptest by running for hours/days and optimizing for code-path coverage rather than round-trip invariants.
 
 | Target | Function under test | Risk surface |
 |--------|-------------------|--------------|
@@ -67,6 +67,13 @@ Unit tests in `vykar-core` cover each subsystem in isolation. Fast feedback (sec
 | `fuzz_index_apply` | `apply_to_temp` over a decoded base and 1-3 segments | Streaming apply disagreeing with the reference model, wrong declared results |
 | `fuzz_index_object` | Store-level segment and base decode of `index.d/` objects | Name check, zstd streaming, error classification as damage |
 | `fuzz_full_index_cache` | `MmapFullIndexCache::open_verified`, `encode_base`, apply | Local cache framing, unsorted entries behind a valid trailer |
+| `fuzz_repo_config` | `RepoConfig` decode, `RepoConfig::validate`, pack-size targets, backup's chunker gate and both chunkers | Unauthenticated `config`: unknown versions, pack-size limits, chunker parameters reaching FastCDC, resumable chunker disagreeing with fastcdc |
+| `fuzz_key_blob` | `inspect_key_blob` | Unauthenticated KDF parameters out of bounds (the KDF never runs) |
+| `fuzz_restore_paths` | `sanitize_item_into`, symlink target audit over an item stream | Path traversal on restore, raw (non-UTF-8) names, against an independent model |
+| `fuzz_pending_journal` | `decode_pending_journal`, recovery seeding | `sessions/<id>.index` from other clients, versioned and legacy shapes |
+| `fuzz_protocol_keys` | Storage-key validators, pack-key temp paths, `parse_byte_range`, `validate_pack_header` | Server keys resolving outside the repository root, `Range` header parsing |
+| `fuzz_metadata_msgpack` | `decode_metadata_msgpack::<IndexBlob>` | Streaming msgpack decode disagreeing with the buffered path |
+| `fuzz_plaintext_read` | Pack scan, unpack, decompress, chunk-ID check for a plaintext engine | Forged chunks in unencrypted repositories, size hints changing the decoded bytes |
 
 Corpus seeds are committed and deterministic. CI runs each target for 300 seconds weekly on nightly (`make fuzz-check` replays the corpus without new fuzzing for fast regression checks).
 

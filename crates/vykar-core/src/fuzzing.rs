@@ -2,16 +2,20 @@
 //! feature. Not part of the API.
 
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use tempfile::TempPath;
 use vykar_crypto::CryptoEngine;
+use vykar_types::chunk_id::{ChunkHasher, ChunkId};
 use vykar_types::error::{Result, VykarError};
+use vykar_types::pack_id::PackId;
 
+use crate::config::ChunkerConfig;
 use crate::index::dedup_cache::MmapFullIndexCache;
 use crate::index::head::{BaseRef, ObjectName, SegmentRef};
 use crate::index::segment::Segment;
 use crate::repo::index_store;
+use crate::snapshot::item::Item;
 
 /// AEAD context of a stored index base.
 pub const BASE_CONTEXT: &[u8] = index_store::BASE_CONTEXT;
@@ -64,4 +68,60 @@ pub fn read_zstd_metadata(data: &[u8]) -> Result<Vec<u8>> {
         .read_to_end(&mut out)
         .map_err(|e| VykarError::Decompression(format!("zstd: {e}")))?;
     Ok(out)
+}
+
+/// `repo::open::derive_plaintext_chunk_id_key`.
+pub fn plaintext_chunk_id_key(repo_id: &[u8], format: crate::repo::RepoFormat) -> [u8; 32] {
+    crate::repo::derive_plaintext_chunk_id_key(repo_id, format)
+}
+
+/// Chunk lengths backup cuts `data` into (`chunker::ChunkReader`, bounded
+/// by the input length as backup bounds it by the file size).
+pub fn chunk_lengths(data: &[u8], config: &ChunkerConfig) -> std::io::Result<Vec<usize>> {
+    let mut reader = crate::chunker::ChunkReader::new(data.take(data.len() as u64), config);
+    let mut lengths = Vec::new();
+    while let Some(chunk) = reader.next_chunk()? {
+        lengths.push(chunk.len());
+    }
+    Ok(lengths)
+}
+
+/// Chunk lengths of `chunker::chunk_stream` (command dumps) over `data`.
+pub fn stream_chunk_lengths(data: &[u8], config: &ChunkerConfig) -> Result<Vec<usize>> {
+    crate::chunker::chunk_stream(data, config)
+        .map(|chunk| {
+            chunk
+                .map(|c| c.length)
+                .map_err(|e| VykarError::Other(format!("chunker: {e}")))
+        })
+        .collect()
+}
+
+/// The path restore writes `item` to, relative to the destination
+/// (`sanitize_item_into`), or its refusal.
+pub fn restore_rel_path(item: &Item) -> Result<PathBuf> {
+    let mut out = PathBuf::new();
+    crate::commands::restore::sanitize_item_into(item, &mut out)?;
+    Ok(out)
+}
+
+/// A symlink's target as restore builds it, and whether restore flags it
+/// as absolute or escaping its parent.
+pub fn symlink_target(item: &Item) -> (PathBuf, bool) {
+    use crate::commands::restore::{classify_symlink_target_path, SymlinkSafety};
+    let target = crate::commands::restore::symlink_target_path(item);
+    let flagged = classify_symlink_target_path(&target) != SymlinkSafety::Safe;
+    (target, flagged)
+}
+
+/// `repo::format::verify_chunk_id`.
+pub fn verify_chunk_id(hasher: &ChunkHasher, expected: &ChunkId, plaintext: &[u8]) -> Result<()> {
+    crate::repo::format::verify_chunk_id(
+        hasher,
+        expected,
+        plaintext,
+        &PackId::from_bytes([0; 32]),
+        0,
+        0,
+    )
 }

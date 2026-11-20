@@ -168,7 +168,7 @@ See the [borgbase.vykar role](https://github.com/borgbase/ansible-role-vykar) fo
 
 ## Build from source
 
-Requires Rust 1.98 or later.
+Requires Rust 1.100 or later.
 
 ```bash
 git clone https://github.com/borgbase/vykar.git

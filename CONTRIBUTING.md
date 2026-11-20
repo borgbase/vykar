@@ -31,6 +31,14 @@ This project uses [prek](https://prek.j178.dev/) for git hooks. Run `prek instal
 
 Individual targets (`fmt-check`, `lint`, `doc-check`, `test`) remain available for ad-hoc use.
 
+### Dependency cooldown
+
+`.cargo/config.toml` sets `registry.global-min-publish-age = "3 days"`, so `cargo update` and `cargo add` skip crate versions published less than three days ago. For an urgent security fix, bypass it for one command:
+
+```bash
+CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE=allow cargo update -p <crate>
+```
+
 ### Nix users
 
 If you use Nix with flakes, you can enter the development shell with:

@@ -9,3 +9,6 @@ rustflags = ["--cfg", "aes_armv8", "--cfg", "polyval_armv8"]
 
 [target.x86_64-pc-windows-msvc]
 rustflags = ["-C", "target-feature=+crt-static"]
+
+[registry]
+global-min-publish-age = "3 days"

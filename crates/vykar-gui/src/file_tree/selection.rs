@@ -26,7 +26,7 @@ impl FileTree {
 
     pub fn toggle_expanded(&mut self, node_idx: usize) {
         if node_idx < self.arena.len() && self.arena[node_idx].is_dir {
-            self.arena[node_idx].expanded = !self.arena[node_idx].expanded;
+            self.arena[node_idx].expanded.toggle();
             self.rebuild_visible();
         }
     }

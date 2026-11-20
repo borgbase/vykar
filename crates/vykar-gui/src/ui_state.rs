@@ -194,7 +194,7 @@ pub(crate) fn toggle_source_row_expanded(model: &Rc<VecModel<SourceInfo>>, idx: 
     let Some(mut item) = model.row_data(idx) else {
         return false;
     };
-    item.expanded = !item.expanded;
+    item.expanded.toggle();
     model.set_row_data(idx, item);
     true
 }
@@ -385,7 +385,7 @@ pub(crate) fn apply_snapshot_selection(
         }
     } else if toggle {
         if let Some(selected) = selection.selected.get_mut(row) {
-            *selected = !*selected;
+            selected.toggle();
         }
         selection.anchor = Some(row);
     } else {

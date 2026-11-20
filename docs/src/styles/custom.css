@@ -130,3 +130,8 @@ img[src$='gui-screenshot.webp'] {
 	color: var(--sl-color-white);
 	font-size: var(--sl-text-sm);
 }
+
+/* Landing page: keep the splash content width despite the sidebar. */
+html[data-has-hero] {
+	--sl-content-width: 67.5rem;
+}

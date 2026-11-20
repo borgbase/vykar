@@ -17,17 +17,17 @@
     #   3. Run `nix flake update` to re-fetch and update the locks.
     skia-binaries-x86_64-linux = {
       type = "file";
-      url = "https://github.com/rust-skia/skia-binaries/releases/download/0.153.3/skia-binaries-b7f043e0b1e2a850e702-x86_64-unknown-linux-gnu-ganesh-gl-jpegd-jpege-pdf-vulkan.tar.gz";
+      url = "https://github.com/rust-skia/skia-binaries/releases/download/0.157.0/skia-binaries-30669978c3f39a73e8a7-x86_64-unknown-linux-gnu-ganesh-gl-jpegd-jpege-pdf-vulkan.tar.gz";
       flake = false;
     };
     skia-binaries-aarch64-linux = {
       type = "file";
-      url = "https://github.com/rust-skia/skia-binaries/releases/download/0.153.3/skia-binaries-b7f043e0b1e2a850e702-aarch64-unknown-linux-gnu-ganesh-gl-jpegd-jpege-pdf-vulkan.tar.gz";
+      url = "https://github.com/rust-skia/skia-binaries/releases/download/0.157.0/skia-binaries-30669978c3f39a73e8a7-aarch64-unknown-linux-gnu-ganesh-gl-jpegd-jpege-pdf-vulkan.tar.gz";
       flake = false;
     };
     skia-binaries-aarch64-darwin = {
       type = "file";
-      url = "https://github.com/rust-skia/skia-binaries/releases/download/0.153.3/skia-binaries-b7f043e0b1e2a850e702-aarch64-apple-darwin-ganesh-gl-jpegd-jpege-metal-pdf.tar.gz";
+      url = "https://github.com/rust-skia/skia-binaries/releases/download/0.157.0/skia-binaries-30669978c3f39a73e8a7-aarch64-apple-darwin-ganesh-gl-jpegd-jpege-metal-pdf.tar.gz";
       flake = false;
     };
   };

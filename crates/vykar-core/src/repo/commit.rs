@@ -75,6 +75,18 @@ impl Repository {
         self.load_chunk_index_with_sidecar(None)
     }
 
+    /// Load the index for the snapshot view already captured at open.
+    pub(crate) fn load_chunk_index_for_snapshot_view(&mut self) -> Result<()> {
+        if !self.is_segmented() {
+            return self.load_chunk_index();
+        }
+        // Open reads the head after listing snapshots, so it covers the
+        // whole view. Sync re-reads it if a fold has removed an object.
+        let synced = self.sync_index(self.index_head.clone(), true)?;
+        self.install_synced_index(synced);
+        Ok(())
+    }
+
     /// [`Self::load_chunk_index`], given the `index.gen` value this process
     /// just read (`Some`, with 0 standing for absent, as open reads it). The
     /// advisory sidecar is rewritten only when it differs from the

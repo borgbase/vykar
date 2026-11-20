@@ -152,6 +152,30 @@ fn open_lists_snapshots_before_the_single_head_get() {
     }
 }
 
+#[test]
+fn snapshot_reader_loads_the_head_captured_at_open() {
+    let env = init(RepoFormat::V5, EncryptionMode::None);
+    let mut writer = env.writer();
+    let opened_index = index_with(0..20, 0);
+    writer.commit(&opened_index);
+    let (mut repo, _) = env.open_logged(OpenOptions::new());
+    writer.commit(&index_with(0..30, 0));
+
+    let ops = Arc::new(Mutex::new(Vec::new()));
+    repo.storage = Arc::new(OpLog {
+        inner: Arc::clone(&env.inner),
+        ops: Arc::clone(&ops),
+    });
+    crate::commands::list::ItemStreamReader::new(&repo)
+        .ensure_index(&mut repo)
+        .unwrap();
+
+    assert_eq!(entries(repo.chunk_index()), entries(&opened_index));
+    let ops = ops.lock().unwrap();
+    assert!(!ops.iter().any(|op| op == "get index"), "{ops:?}");
+    assert_eq!(index_d_gets(&ops), 1);
+}
+
 /// An open with the index builds it from base and segments, then reuses
 /// and catches up the local full cache on later opens.
 #[test]

@@ -308,7 +308,7 @@ impl ItemStreamReader {
     /// Load the full chunk index unless this reader already did.
     pub fn ensure_index(&mut self, repo: &mut Repository) -> Result<()> {
         if !self.index_loaded {
-            repo.load_chunk_index()?;
+            repo.load_chunk_index_for_snapshot_view()?;
             self.index_loaded = true;
         }
         Ok(())

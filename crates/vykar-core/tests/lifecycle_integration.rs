@@ -994,28 +994,29 @@ fn item_stream_reader_resolves_from_cache_then_falls_back_once() {
         assert!(reader.uses_restore_cache());
         assert!(!reader.index_loaded());
         assert!(reader.lookup(&repo, &data_chunk).is_some());
-        assert_eq!(index_gets.load(Ordering::Relaxed), 0);
+        assert_eq!(index_gets.load(Ordering::Relaxed), 1);
         assert!(repo.chunk_index().is_empty());
     }
 
-    // Cache lacking the data chunk: the first miss loads the index once and
-    // every later lookup uses it.
+    // Cache lacking the data chunk: the first miss loads the index using the
+    // head read at open, and every later lookup uses it.
     write_cache_without(&repo_dir, &repo_id, generation, &data_chunk);
     let (mut repo, index_gets) = open_counting_repo(&repo_dir);
     let mut reader = commands::list::ItemStreamReader::new(&repo);
     reader.load(&mut repo, "snap1", None).unwrap();
-    assert_eq!(index_gets.load(Ordering::Relaxed), 0);
+    assert!(!reader.index_loaded());
     for _ in 0..2 {
         reader
             .ensure_resolvable(&mut repo, std::iter::once(&data_chunk))
             .unwrap();
         assert!(!reader.uses_restore_cache());
+        assert!(reader.index_loaded());
         assert!(reader.lookup(&repo, &data_chunk).is_some());
     }
     assert_eq!(index_gets.load(Ordering::Relaxed), 1);
 }
 
-/// Counts GETs of the remote `index` blob.
+/// Counts GETs of the remote index head, including at open.
 struct IndexGetCounter {
     inner: LocalBackend,
     index_gets: Arc<AtomicUsize>,
@@ -1089,7 +1090,6 @@ fn open_counting_repo(repo_dir: &std::path::Path) -> (Repository, Arc<AtomicUsiz
         index_gets: index_gets.clone(),
     });
     let repo = Repository::open(storage, None, None, OpenOptions::new()).unwrap();
-    index_gets.store(0, Ordering::Relaxed);
     (repo, index_gets)
 }
 
@@ -1118,6 +1118,7 @@ fn item_stream_reader_loads_index_once_across_snapshots() {
 
     assert!(!stream_paths(&s1).iter().any(|p| p.contains("b.txt")));
     assert!(stream_paths(&s2).iter().any(|p| p.contains("b.txt")));
+    assert!(reader.index_loaded());
     assert_eq!(index_gets.load(Ordering::Relaxed), 1);
 }
 
@@ -1142,6 +1143,7 @@ fn item_stream_reader_falls_back_once_on_empty_cache() {
 
     assert!(stream_paths(&s1).iter().any(|p| p.contains("a.txt")));
     assert!(stream_paths(&s2).iter().any(|p| p.contains("b.txt")));
+    assert!(reader.index_loaded());
     assert_eq!(index_gets.load(Ordering::Relaxed), 1);
 }
 
@@ -1158,7 +1160,7 @@ fn item_stream_reader_propagates_interrupt_without_fallback() {
         .unwrap_err();
 
     assert!(matches!(err, VykarError::Interrupted), "got {err:?}");
-    assert_eq!(index_gets.load(Ordering::Relaxed), 0);
+    assert_eq!(index_gets.load(Ordering::Relaxed), 1);
     assert!(repo.chunk_index().is_empty());
 }
 

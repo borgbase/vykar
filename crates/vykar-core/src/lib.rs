@@ -25,6 +25,10 @@ pub use repo::OpenOptions;
 pub mod snapshot;
 pub mod storage;
 
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub mod fuzzing;
+
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

@@ -29,6 +29,7 @@ mod prune;
 mod prune_command;
 mod repair;
 mod repo;
+mod rest_server;
 mod restore_cancel;
 mod segmented_index;
 mod segmented_writes;

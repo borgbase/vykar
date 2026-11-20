@@ -8,13 +8,14 @@
 	fmt-check \
 	fuzz \
 	fuzz-check \
+	fuzz-list \
 	lint \
 	test \
 	test-all \
 	pre-commit
 
-FUZZ_TARGETS := fuzz_pack_scan fuzz_decompress fuzz_msgpack_snapshot_meta \
-	fuzz_msgpack_index_blob fuzz_item_stream fuzz_file_cache_decode fuzz_unpack_object
+FUZZ_TARGETS := $(sort $(patsubst fuzz/fuzz_targets/%.rs,%,$(wildcard fuzz/fuzz_targets/fuzz_*.rs)))
+FUZZ_TARGETS_GUARD = $(if $(FUZZ_TARGETS),,$(error no fuzz targets found; run make from the repository root))
 
 fmt:
 	cargo fmt --all
@@ -51,6 +52,7 @@ app:
 	cp target/AppIcon.icns "$(APP_BUNDLE)/Contents/Resources/"
 
 fuzz:
+	$(FUZZ_TARGETS_GUARD)
 	@for target in $(FUZZ_TARGETS); do \
 		echo "==> Fuzzing $$target (60s)"; \
 		cargo +nightly fuzz run $$target -- \
@@ -58,11 +60,16 @@ fuzz:
 	done
 
 fuzz-check:
+	$(FUZZ_TARGETS_GUARD)
 	@for target in $(FUZZ_TARGETS); do \
 		echo "==> Replaying corpus for $$target"; \
 		cargo +nightly fuzz run $$target -- \
 			-runs=0 -rss_limit_mb=4096 -max_len=1048576 || exit 1; \
 	done
+
+fuzz-list:
+	$(FUZZ_TARGETS_GUARD)
+	@echo $(FUZZ_TARGETS)
 
 docs-build:
 	cd docs && pnpm install --frozen-lockfile && pnpm build

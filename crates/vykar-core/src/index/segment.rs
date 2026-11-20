@@ -1076,5 +1076,9 @@ fn merge_walk(
     Ok(Some((diff, tmp.into_temp_path())))
 }
 
+#[cfg(any(test, feature = "fuzzing"))]
+#[doc(hidden)]
+pub mod model;
+
 #[cfg(test)]
 mod tests;

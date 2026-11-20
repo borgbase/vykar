@@ -18,8 +18,9 @@ rmp = "0.8"
 serde = { version = "1", features = ["derive"] }
 chrono = { version = "0.4", features = ["serde"] }
 aes-gcm = "0.11"
+blake3 = "1"
 
-vykar-core = { path = "../crates/vykar-core", default-features = false }
+vykar-core = { path = "../crates/vykar-core", default-features = false, features = ["fuzzing"] }
 vykar-crypto = { path = "../crates/vykar-crypto" }
 vykar-types = { path = "../crates/vykar-types" }
 vykar-protocol = { path = "../crates/vykar-protocol" }
@@ -72,6 +73,21 @@ doc = false
 [[bin]]
 name = "fuzz_index_base"
 path = "fuzz_targets/fuzz_index_base.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_index_apply"
+path = "fuzz_targets/fuzz_index_apply.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_index_object"
+path = "fuzz_targets/fuzz_index_object.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_full_index_cache"
+path = "fuzz_targets/fuzz_full_index_cache.rs"
 doc = false
 
 [[bin]]

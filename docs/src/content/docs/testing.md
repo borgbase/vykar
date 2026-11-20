@@ -50,17 +50,23 @@ Unit tests in `vykar-core` cover each subsystem in isolation. Fast feedback (sec
 
 ## Fuzz Tests
 
-7 coverage-guided fuzz targets via `cargo-fuzz` (libFuzzer). Each target feeds adversarial byte sequences into a parser, deserializer, or decrypt path, mutating from committed corpus seeds toward crashes, hangs, and OOM. Complements proptest by running for hours/days and optimizing for code-path coverage rather than round-trip invariants.
+13 coverage-guided fuzz targets via `cargo-fuzz` (libFuzzer). Each target feeds adversarial byte sequences into a parser, deserializer, or decrypt path, mutating from committed corpus seeds toward crashes, hangs, and OOM. Complements proptest by running for hours/days and optimizing for code-path coverage rather than round-trip invariants.
 
 | Target | Function under test | Risk surface |
 |--------|-------------------|--------------|
 | `fuzz_pack_scan` | `scan_pack_blobs_bytes` | Integer overflow in length fields, truncated frames |
-| `fuzz_decompress` | `decompress` + `decompress_metadata` | Decompression bombs, corrupt LZ4/Zstd frames |
+| `fuzz_decompress` | `decompress` + `decompress_metadata`, streaming zstd metadata reader | Decompression bombs, corrupt LZ4/Zstd frames, streaming vs buffered disagreement |
 | `fuzz_msgpack_snapshot_meta` | `from_slice::<SnapshotMeta>` | Large collection size declarations |
 | `fuzz_msgpack_index_blob` | `from_slice::<IndexBlob>` | Massive chunk index allocation |
 | `fuzz_item_stream` | `for_each_decoded_item` | Streaming framing via `Deserializer::position()`, EOF handling |
 | `fuzz_file_cache_decode` | `FileCache::decode_from_plaintext` | Manual msgpack marker parsing, allocation cap, legacy fallback |
-| `fuzz_unpack_object` | `unpack_object` + `unpack_object_expect_with_context` | AEAD envelope parse, nonce extraction, context/AAD wiring, tag authentication |
+| `fuzz_unpack_object` | `unpack_object` + `unpack_object_expect_with_context` (+ in-place) | AEAD envelope parse, nonce extraction, context/AAD wiring for chunk, index, head, base and segment objects, tag authentication |
+| `fuzz_index_segment` | `Segment::decode` | Position gaps, counts, re-encode identity |
+| `fuzz_index_head` | `IndexHead::decode` | Head framing, round-trip |
+| `fuzz_index_base` | `index::base::decode_base_to_temp` | Sort order, pack table, varints, re-encode identity |
+| `fuzz_index_apply` | `apply_to_temp` over a decoded base and 1-3 segments | Streaming apply disagreeing with the reference model, wrong declared results |
+| `fuzz_index_object` | Store-level segment and base decode of `index.d/` objects | Name check, zstd streaming, error classification as damage |
+| `fuzz_full_index_cache` | `MmapFullIndexCache::open_verified`, `encode_base`, apply | Local cache framing, unsorted entries behind a valid trailer |
 
 Corpus seeds are committed and deterministic. CI runs each target for 300 seconds weekly on nightly (`make fuzz-check` replays the corpus without new fuzzing for fast regression checks).
 

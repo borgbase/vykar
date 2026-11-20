@@ -85,6 +85,8 @@ percent-encoding = { version = "2", optional = true }
 default = []
 backend-sftp = ["vykar-storage/backend-sftp"]
 mount = ["dav-server", "tokio/rt-multi-thread", "tokio/macros", "tokio/signal", "tokio/net", "tokio/sync", "hyper", "hyper-util", "lru", "bytes", "futures-util", "percent-encoding"]
+# Internal entry points for fuzz/ (src/fuzzing.rs, index::segment::model). Not API; never enable in a product build.
+fuzzing = []
 
 [dev-dependencies]
 proptest = { workspace = true }
@@ -93,6 +95,10 @@ test-case = { workspace = true }
 # Crates rather than shelling out to `tar` so the tests run on Windows too.
 tar = "0.4"
 flate2 = "1"
+# In-process vykar-server for the REST end-to-end tests (src/tests/rest_server.rs).
+vykar-server = { path = "../vykar-server" }
+axum = "0.8"
+tokio = { workspace = true, features = ["rt-multi-thread", "net"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

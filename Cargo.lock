@@ -7714,6 +7714,7 @@ dependencies = [
 name = "vykar-core"
 version = "0.24.0"
 dependencies = [
+ "axum",
  "blake2",
  "blake3",
  "bytes",
@@ -7755,6 +7756,7 @@ dependencies = [
  "vykar-common",
  "vykar-crypto",
  "vykar-protocol",
+ "vykar-server",
  "vykar-storage",
  "vykar-types",
  "windows-sys 0.61.2",

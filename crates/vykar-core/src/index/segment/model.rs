@@ -2,7 +2,8 @@
 //! no streaming, no positional cursors. Agrees with `apply_to_temp` on
 //! success or failure for any chain; error messages are not compared.
 //!
-//! Uses only `pub` items, so it can be reused outside this module.
+//! Compiled for tests and, with the `fuzzing` feature, for
+//! `fuzz/fuzz_targets/fuzz_index_apply.rs`.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -10,7 +11,7 @@ use crate::index::dedup_cache::{encode_full_entry, FullCacheEntry, StateHash};
 use crate::index::segment::{ChainStep, Segment};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Reject {
+pub enum Reject {
     /// A segment's `prev_state_hash`/`prev_entries` differ from the state before it.
     ChainMismatch { step: usize },
     /// The layer's input has a different length from the segment's `prev_entries`.
@@ -26,7 +27,7 @@ pub(crate) enum Reject {
 }
 
 /// BLAKE3 over the canonical records, as the full cache trailer.
-pub(crate) fn state_hash(entries: &[FullCacheEntry]) -> StateHash {
+pub fn state_hash(entries: &[FullCacheEntry]) -> StateHash {
     let mut hasher = blake3::Hasher::new();
     for e in entries {
         hasher.update(&encode_full_entry(e));
@@ -36,7 +37,7 @@ pub(crate) fn state_hash(entries: &[FullCacheEntry]) -> StateHash {
 
 /// One layer over `input` (sorted, unique). Checks only the layer's own
 /// ops, not the chain or the result; `step` is for the reject reason.
-pub(crate) fn apply_layer(
+pub fn apply_layer(
     input: &[FullCacheEntry],
     segment: &Segment,
     step: usize,
@@ -89,7 +90,7 @@ pub(crate) fn apply_layer(
 }
 
 /// `apply_to_temp(prev, chain)`: `Ok(entries)` iff it succeeds, with these entries.
-pub(crate) fn apply_chain(
+pub fn apply_chain(
     prev: &[FullCacheEntry],
     chain: &[ChainStep<'_>],
 ) -> Result<Vec<FullCacheEntry>, Reject> {

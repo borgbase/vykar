@@ -7,7 +7,7 @@ use crate::index::dedup_cache::{
     build_full_index_cache_to_path, chunk_index_from_full_cache, generation_for_state,
 };
 
-mod model;
+use super::model;
 
 fn id(b: u8) -> ChunkId {
     ChunkId::from_bytes([b; 32])

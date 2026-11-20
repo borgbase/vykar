@@ -6,22 +6,25 @@ on:
   workflow_dispatch:
 
 jobs:
+  targets:
+    runs-on: ubuntu-latest
+    outputs:
+      list: ${{ steps.list.outputs.list }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - id: list
+        run: |
+          targets="$(make -s fuzz-list)"
+          echo "list=$(jq -cn --arg t "$targets" '$t | split(" ")')" >> "$GITHUB_OUTPUT"
+
   fuzz:
+    needs: targets
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        target:
-          - fuzz_pack_scan
-          - fuzz_decompress
-          - fuzz_msgpack_snapshot_meta
-          - fuzz_msgpack_index_blob
-          - fuzz_item_stream
-          - fuzz_file_cache_decode
-          - fuzz_unpack_object
-          - fuzz_index_segment
-          - fuzz_index_head
-          - fuzz_index_base
+        target: ${{ fromJSON(needs.targets.outputs.list) }}
     steps:
       - uses: actions/checkout@v6
 

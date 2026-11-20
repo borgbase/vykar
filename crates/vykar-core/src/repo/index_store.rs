@@ -38,7 +38,7 @@ use crate::index::segment::{self, ChainStep, Segment};
 /// Directory of the write-once base and segment objects.
 pub(crate) const INDEX_OBJECT_DIR: &str = "index.d/";
 
-const BASE_CONTEXT: &[u8] = b"index.d/base";
+pub(crate) const BASE_CONTEXT: &[u8] = b"index.d/base";
 pub(crate) const SEGMENT_CONTEXT: &[u8] = b"index.d/segment";
 
 /// How often a reader retries on a re-read head after a named object

@@ -11,15 +11,18 @@ Coverage-guided fuzz tests for vykar's parser, deserializer, and decrypt paths. 
 | Target | What it fuzzes |
 |--------|---------------|
 | `fuzz_pack_scan` | Pack binary parser (`scan_pack_blobs_bytes`) |
-| `fuzz_decompress` | LZ4/Zstd decompression (`decompress` + `decompress_metadata`) |
+| `fuzz_decompress` | LZ4/Zstd decompression (`decompress`, `decompress_metadata`, and the streaming zstd metadata reader against it) |
 | `fuzz_msgpack_snapshot_meta` | `SnapshotMeta` deserialization |
 | `fuzz_msgpack_index_blob` | `IndexBlob` deserialization |
 | `fuzz_item_stream` | Streaming item decode (`for_each_decoded_item`) |
 | `fuzz_file_cache_decode` | `FileCache::decode_from_plaintext` (custom msgpack parser) |
-| `fuzz_unpack_object` | AEAD envelope parse + decrypt (legacy and context-bound paths) |
+| `fuzz_unpack_object` | AEAD envelope parse + decrypt (legacy and context-bound paths, chunk/index/head/base/segment types, in-place variant) |
 | `fuzz_index_segment` | Index segment decode (`Segment::decode`), checked to re-encode identically |
 | `fuzz_index_head` | Index head decode (`IndexHead::decode`), checked to round-trip |
 | `fuzz_index_base` | Index base decode (`decode_base_to_temp`), checked to re-encode identically |
+| `fuzz_index_apply` | Segment chain apply (`apply_to_temp`) over a decoded base, chained to it, checked against the reference model |
+| `fuzz_index_object` | Stored `index.d/` objects through the store-level segment and base decoders (name check, plaintext unpack, zstd, codec), against a buffered reference |
+| `fuzz_full_index_cache` | Local full index cache file (`open_verified`) with a correct trailer, then `encode_base` and apply over it |
 
 ## Corpus
 
@@ -45,6 +48,8 @@ Run all targets (60s each):
 ```
 make fuzz
 ```
+
+`make fuzz-list` prints the targets `make fuzz`, `make fuzz-check` and CI run; it is every `fuzz/fuzz_targets/fuzz_*.rs`.
 
 Replay committed corpus only (no new fuzzing, fast regression check):
 

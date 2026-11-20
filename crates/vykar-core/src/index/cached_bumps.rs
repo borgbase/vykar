@@ -534,13 +534,7 @@ mod tests {
         // up-front checks pass.
         let repo_id = [0x5a; 32];
         let cache_dir = dir.path().join("cache");
-        dedup_cache::build_dedup_cache_from_full_cache(
-            &full_path,
-            dup_gen,
-            &repo_id,
-            Some(&cache_dir),
-        )
-        .unwrap();
+        dedup_cache::build_dedup_cache_from_full_cache(&full, &repo_id, Some(&cache_dir)).unwrap();
         let cache = Arc::new(MmapDedupCache::open(&repo_id, dup_gen, Some(&cache_dir)).unwrap());
 
         for target in [ids[1].0, ids[2].0, ids[0].0] {

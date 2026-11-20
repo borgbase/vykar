@@ -2,6 +2,7 @@
 //! commits, maintenance writes, folds, garbage collection and repair.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use super::helpers::{
@@ -10,13 +11,14 @@ use super::helpers::{
 use crate::commands;
 use crate::commands::check::{IndexRecovery, RepairAction, RepairMode};
 use crate::config::VykarConfig;
+use crate::index::dedup_cache::{self, MmapDedupCache, MmapFullIndexCache, MmapRestoreCache};
 use crate::index::head::{IndexHead, ObjectName};
 use crate::index::{ChunkIndex, IndexBlob};
 use crate::repo::format::{pack_object_streaming_with_context, ObjectType};
 use crate::repo::index_store::{
     decode_segment, object_key, pack_head, INDEX_OBJECT_DIR, SEGMENT_CONTEXT,
 };
-use crate::repo::{EncryptionMode, OpenOptions, RepoFormat, Repository};
+use crate::repo::{EncryptionMode, OpenOptions, RepoFormat, Repository, WriteSessionOptions};
 use vykar_storage::local_backend::LocalBackend;
 use vykar_storage::{delegate_storage_backend, InnerBackend, StorageBackend};
 use vykar_types::error::{Result, VykarError};
@@ -206,6 +208,89 @@ fn backups_append_one_segment_each() {
         fx.check_clean(&fx.config);
         let dest = fx.restore(&fx.config, "s3");
         assert_eq!(std::fs::read_to_string(find(&dest, "b")).unwrap(), "bravo");
+    }
+}
+
+/// A backup commit leaves the full, dedup and restore caches at the new
+/// state, and the derived caches agree with the index a cold client builds.
+#[test]
+fn backup_leaves_derived_caches_at_the_new_state() {
+    for format in [RepoFormat::V4, RepoFormat::V5] {
+        let fx = fixture(format);
+        fx.write("a", "alpha");
+        fx.backup(&fx.config, "s1");
+        fx.write("b", "bravo");
+        fx.backup(&fx.config, "s2");
+
+        let repo = fx.open(&fx.cache(), false).unwrap();
+        let gen = repo.index_generation();
+        let id = repo.config.id.clone();
+        let cd = fx.cache();
+        let entries = fx.head().entries;
+        let full = MmapFullIndexCache::open(&id, gen, Some(&cd)).unwrap();
+        let dedup = MmapDedupCache::open(&id, gen, Some(&cd)).unwrap();
+        let restore = MmapRestoreCache::open(&id, gen, Some(&cd)).unwrap();
+        assert_eq!(u64::from(full.entry_count()), entries);
+        assert_eq!(u64::from(dedup.entry_count()), entries);
+        assert_eq!(u64::from(restore.entry_count()), entries);
+
+        let cold = fx.tmp.path().join("cold");
+        let cold_repo = fx.open(&cold, true).unwrap();
+        assert_eq!(cold_repo.chunk_index().len() as u64, entries);
+        for (chunk_id, e) in cold_repo.chunk_index().iter() {
+            assert_eq!(dedup.get_stored_size(chunk_id), Some(e.stored_size));
+            assert_eq!(
+                restore.lookup(chunk_id),
+                Some((e.pack_id, e.pack_offset, e.stored_size))
+            );
+        }
+    }
+}
+
+/// `save_state` of a session that asked for tiered dedup, with no changes,
+/// derives the dedup and restore caches from the local full cache and
+/// hydrates the index from it, without reading the index from storage.
+#[test]
+fn empty_session_rebuilds_derived_caches_from_the_full_cache() {
+    for format in [RepoFormat::V4, RepoFormat::V5] {
+        let fx = fixture(format);
+        fx.write("a", "alpha");
+        fx.backup(&fx.config, "s1");
+        let cd = fx.cache();
+
+        // Index reads fail once the repository is open, so the fallback
+        // (`reload_full_index`) would error.
+        let fail = Arc::new(AtomicBool::new(false));
+        let armed = Arc::clone(&fail);
+        let storage = FailGet::new(
+            Arc::from(fx.storage()),
+            move |k| {
+                armed.load(Ordering::SeqCst) && (k == "index" || k.starts_with(INDEX_OBJECT_DIR))
+            },
+            usize::MAX,
+        );
+        let mut repo = fx
+            .open_with(Box::new(storage), &cd, OpenOptions::new().with_index())
+            .unwrap();
+        let id = repo.config.id.clone();
+        let gen = repo.index_generation();
+        for path in [
+            dedup_cache::dedup_cache_path(&id, Some(&cd)).unwrap(),
+            dedup_cache::restore_cache_path(&id, Some(&cd)).unwrap(),
+        ] {
+            std::fs::remove_file(path).unwrap();
+        }
+        fail.store(true, Ordering::SeqCst);
+
+        repo.begin_write_session(&WriteSessionOptions::default())
+            .unwrap();
+        repo.enable_tiered_dedup_mode();
+        repo.save_state().unwrap();
+
+        assert_eq!(repo.index_generation(), gen);
+        assert!(MmapDedupCache::open(&id, gen, Some(&cd)).is_some());
+        assert!(MmapRestoreCache::open(&id, gen, Some(&cd)).is_some());
+        assert_eq!(sorted_entries(repo.chunk_index()), cold_index(&fx, "cold"));
     }
 }
 

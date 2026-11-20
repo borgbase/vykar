@@ -357,40 +357,21 @@ impl Repository {
                 // Try to rebuild caches from full_index_cache if available.
                 let mut rebuilt_from_cache = false;
                 let cd = self.cache_dir_override.as_deref();
-                if let Some(cache_path) = dedup_cache::full_index_cache_path(&self.config.id, cd) {
-                    if dedup_cache::MmapFullIndexCache::open(
-                        &self.config.id,
-                        self.index_generation,
-                        cd,
-                    )
-                    .is_some()
-                    {
-                        let gen = self.index_generation;
-                        let id = &self.config.id;
-                        let dedup_ok = dedup_cache::build_dedup_cache_from_full_cache(
-                            &cache_path,
-                            gen,
-                            id,
-                            cd,
-                        )
-                        .is_ok();
-                        let restore_ok = dedup_cache::build_restore_cache_from_full_cache(
-                            &cache_path,
-                            gen,
-                            id,
-                            cd,
-                        )
-                        .is_ok();
-                        if dedup_ok && restore_ok {
-                            self.rebuild_dedup_cache = false;
-                            rebuilt_from_cache = true;
-                            // Defer chunk_index hydration to reduce peak memory.
-                            deferred_index_load = true;
-                        } else {
-                            warn!(
-                                "cache rebuild from full_index_cache partially failed, falling back"
-                            );
-                        }
+                let gen = self.index_generation;
+                if let Some(full) = dedup_cache::MmapFullIndexCache::open(&self.config.id, gen, cd)
+                {
+                    let id = &self.config.id;
+                    let dedup_ok =
+                        dedup_cache::build_dedup_cache_from_full_cache(&full, id, cd).is_ok();
+                    let restore_ok =
+                        dedup_cache::build_restore_cache_from_full_cache(&full, id, cd).is_ok();
+                    if dedup_ok && restore_ok {
+                        self.rebuild_dedup_cache = false;
+                        rebuilt_from_cache = true;
+                        // Defer chunk_index hydration to reduce peak memory.
+                        deferred_index_load = true;
+                    } else {
+                        warn!("cache rebuild from full_index_cache partially failed, falling back");
                     }
                 }
                 if !rebuilt_from_cache {
@@ -1027,36 +1008,36 @@ impl Repository {
     ///
     /// When `full_cache_fresh` is true, the full index cache is already
     /// up-to-date (e.g. from a fast-path merge) and only the derivation
-    /// step runs.
+    /// step runs. The full cache is opened and verified once; both
+    /// derivations stream from that mapping.
     fn rebuild_local_caches(&self, full_cache_fresh: bool) {
         let cd = self.cache_dir_override.as_deref();
+        let generation = self.index_generation;
         if !full_cache_fresh {
             if let Err(e) = dedup_cache::build_full_index_cache(
                 &self.chunk_index,
-                self.index_generation,
+                generation,
                 &self.config.id,
                 cd,
             ) {
                 warn!("failed to build full index cache: {e}");
             }
         }
-        if let Some(full_path) = dedup_cache::full_index_cache_path(&self.config.id, cd) {
-            if let Err(e) = dedup_cache::build_dedup_cache_from_full_cache(
-                &full_path,
-                self.index_generation,
-                &self.config.id,
-                cd,
-            ) {
-                warn!("failed to rebuild dedup cache from full cache: {e}");
-            }
-            if let Err(e) = dedup_cache::build_restore_cache_from_full_cache(
-                &full_path,
-                self.index_generation,
-                &self.config.id,
-                cd,
-            ) {
-                warn!("failed to rebuild restore cache from full cache: {e}");
-            }
+        let Some(full_path) = dedup_cache::full_index_cache_path(&self.config.id, cd) else {
+            return;
+        };
+        let Some(full) = dedup_cache::MmapFullIndexCache::open_path(&full_path, generation) else {
+            warn!(
+                "failed to rebuild dedup and restore caches: full index cache not found or stale"
+            );
+            return;
+        };
+        if let Err(e) = dedup_cache::build_dedup_cache_from_full_cache(&full, &self.config.id, cd) {
+            warn!("failed to rebuild dedup cache from full cache: {e}");
+        }
+        if let Err(e) = dedup_cache::build_restore_cache_from_full_cache(&full, &self.config.id, cd)
+        {
+            warn!("failed to rebuild restore cache from full cache: {e}");
         }
     }
 

@@ -1150,6 +1150,7 @@ pub struct FullCacheEntry {
 pub struct MmapFullIndexCache {
     mmap: Mmap,
     entry_count: u32,
+    generation: u64,
 }
 
 impl MmapFullIndexCache {
@@ -1198,12 +1199,18 @@ impl MmapFullIndexCache {
         Some(Self {
             mmap,
             entry_count: validated.entry_count,
+            generation: validated.generation,
         })
     }
 
     /// Return the number of entries.
     pub fn entry_count(&self) -> u32 {
         self.entry_count
+    }
+
+    /// Generation from the file header.
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// BLAKE3 over the canonical sorted records: the checksum trailer, which
@@ -1754,10 +1761,10 @@ pub fn serialize_full_cache_as_index_blob(
 // Cache-based dedup/restore cache builders (Step 5)
 // ---------------------------------------------------------------------------
 
-/// Build the dedup cache from the full index cache (streaming, no HashMap).
+/// Build the dedup cache from an opened full index cache (streaming, no
+/// HashMap). The derived cache carries the full cache's generation.
 pub fn build_dedup_cache_from_full_cache(
-    full_cache_path: &Path,
-    generation: u64,
+    full_cache: &MmapFullIndexCache,
     repo_id: &[u8],
     cache_dir: Option<&Path>,
 ) -> Result<()> {
@@ -1768,11 +1775,8 @@ pub fn build_dedup_cache_from_full_cache(
         std::fs::create_dir_all(parent)?;
     }
 
-    let cache = MmapFullIndexCache::open_path(full_cache_path, generation).ok_or_else(|| {
-        vykar_types::error::VykarError::Other("full index cache not found or stale".into())
-    })?;
-
-    let entry_count = cache.entry_count();
+    let generation = full_cache.generation();
+    let entry_count = full_cache.entry_count();
     let mut w = BufWriter::new(temp_file_beside(&path)?);
 
     // Dedup cache header
@@ -1783,7 +1787,7 @@ pub fn build_dedup_cache_from_full_cache(
     w.write_all(&0u32.to_le_bytes())?; // reserved
 
     // Stream entries: ChunkId(32) + stored_size(4)
-    for entry in cache.iter() {
+    for entry in full_cache.iter() {
         w.write_all(entry.chunk_id.as_bytes())?;
         w.write_all(&entry.stored_size.to_le_bytes())?;
     }
@@ -1798,10 +1802,10 @@ pub fn build_dedup_cache_from_full_cache(
     Ok(())
 }
 
-/// Build the restore cache from the full index cache (streaming, no HashMap).
+/// Build the restore cache from an opened full index cache (streaming, no
+/// HashMap). The derived cache carries the full cache's generation.
 pub fn build_restore_cache_from_full_cache(
-    full_cache_path: &Path,
-    generation: u64,
+    full_cache: &MmapFullIndexCache,
     repo_id: &[u8],
     cache_dir: Option<&Path>,
 ) -> Result<()> {
@@ -1812,11 +1816,8 @@ pub fn build_restore_cache_from_full_cache(
         std::fs::create_dir_all(parent)?;
     }
 
-    let cache = MmapFullIndexCache::open_path(full_cache_path, generation).ok_or_else(|| {
-        vykar_types::error::VykarError::Other("full index cache not found or stale".into())
-    })?;
-
-    let entry_count = cache.entry_count();
+    let generation = full_cache.generation();
+    let entry_count = full_cache.entry_count();
     let mut w = BufWriter::new(temp_file_beside(&path)?);
 
     // Restore cache header
@@ -1827,7 +1828,7 @@ pub fn build_restore_cache_from_full_cache(
     w.write_all(&0u32.to_le_bytes())?; // reserved
 
     // Stream entries: ChunkId(32) + stored_size(4) + PackId(32) + pack_offset(8)
-    for entry in cache.iter() {
+    for entry in full_cache.iter() {
         w.write_all(entry.chunk_id.as_bytes())?;
         w.write_all(&entry.stored_size.to_le_bytes())?;
         w.write_all(entry.pack_id.as_bytes())?;
@@ -2647,6 +2648,49 @@ mod tests {
             let chunk_id = ChunkId::from_bytes(id_bytes);
             assert_eq!(cache1.lookup(&chunk_id), cache2.lookup(&chunk_id));
         }
+    }
+
+    #[test]
+    fn derived_caches_from_one_mapping_match_index_builds() {
+        const GEN: u64 = 77;
+        let dir = tempfile::tempdir().unwrap();
+        let full_path = dir.path().join("full_index_cache");
+        let cd = dir.path().join("cache");
+        let repo_id = [0x3cu8; 32];
+
+        let mut index = ChunkIndex::new();
+        for i in 0u8..6 {
+            let mut id_bytes = [0u8; 32];
+            id_bytes[0] = i.wrapping_mul(37);
+            id_bytes[31] = i;
+            index.add(
+                ChunkId::from_bytes(id_bytes),
+                200 + 13 * i as u32,
+                PackId::from_bytes([i + 1; 32]),
+                1000 * i as u64 + 7,
+            );
+        }
+        build_full_index_cache_to_path(&index, GEN, &full_path).unwrap();
+
+        let full = MmapFullIndexCache::open_path(&full_path, GEN).unwrap();
+        assert_eq!(full.generation(), GEN);
+        build_dedup_cache_from_full_cache(&full, &repo_id, Some(&cd)).unwrap();
+        build_restore_cache_from_full_cache(&full, &repo_id, Some(&cd)).unwrap();
+
+        let dedup = MmapDedupCache::open(&repo_id, full.generation(), Some(&cd)).unwrap();
+        let restore = MmapRestoreCache::open(&repo_id, full.generation(), Some(&cd)).unwrap();
+        assert_eq!(dedup.entry_count() as usize, index.len());
+        assert_eq!(restore.entry_count() as usize, index.len());
+        for (id, e) in index.iter() {
+            assert_eq!(dedup.get_stored_size(id), Some(e.stored_size));
+            assert_eq!(
+                restore.lookup(id),
+                Some((e.pack_id, e.pack_offset, e.stored_size))
+            );
+        }
+
+        assert!(MmapDedupCache::open(&repo_id, GEN + 1, Some(&cd)).is_none());
+        assert!(MmapRestoreCache::open(&repo_id, GEN + 1, Some(&cd)).is_none());
     }
 
     // -------------------------------------------------------------------

@@ -488,8 +488,9 @@ pub fn compute_data_pack_target(
     min_pack_size: u32,
     max_pack_size: u32,
 ) -> usize {
-    let min = min_pack_size as f64;
-    let max = max_pack_size as f64;
+    let min = f64::from(min_pack_size);
+    // `clamp` panics on `min > max`, which an unchecked `config` can hold.
+    let max = f64::from(max_pack_size.max(min_pack_size));
     #[allow(
         clippy::cast_precision_loss,
         reason = "pack-target sizing; usize range fits f64 mantissa for realistic counts"
@@ -1058,6 +1059,16 @@ mod tests {
             msg.contains("short read from pack") && msg.contains("expected 100 bytes, got 99"),
             "expected short read error, got: {msg}"
         );
+    }
+
+    /// An unchecked `config` can hold `min_pack_size > max_pack_size`;
+    /// `f64::clamp` would panic on it.
+    #[test]
+    fn compute_data_pack_target_min_above_max_does_not_panic() {
+        let (min, max) = (64 * 1024 * 1024u32, 32 * 1024 * 1024u32);
+        for n in [0, 50, 10_000] {
+            assert_eq!(compute_data_pack_target(n, min, max), min as usize);
+        }
     }
 
     #[test]

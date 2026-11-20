@@ -367,8 +367,6 @@ impl ChunkerConfig {
     /// Clamp `max_size` to `CHUNK_MAX_SIZE_HARD_CAP` with a warning if it
     /// was configured above the cap.
     pub fn validate(&mut self) -> vykar_types::error::Result<()> {
-        use vykar_types::error::VykarError;
-
         if self.max_size > CHUNK_MAX_SIZE_HARD_CAP {
             tracing::warn!(
                 configured = self.max_size,
@@ -377,6 +375,14 @@ impl ChunkerConfig {
             );
             self.max_size = CHUNK_MAX_SIZE_HARD_CAP;
         }
+        self.validate_stored()
+    }
+
+    /// Everything FastCDC requires of the parameters: the ranges, their
+    /// order, and even sizes. Never clamps, so it is safe to apply to the
+    /// parameters a repository's `config` holds.
+    pub fn validate_stored(&self) -> vykar_types::error::Result<()> {
+        use vykar_types::error::VykarError;
 
         let min = self.min_size as usize;
         let avg = self.avg_size as usize;
@@ -696,6 +702,27 @@ mod tests {
                 (min, avg, max)
             );
         }
+    }
+
+    /// Stored parameters are checked, never clamped.
+    #[test]
+    fn chunker_validate_stored_rejects_without_clamping() {
+        let config = ChunkerConfig {
+            min_size: 512 * 1024,
+            avg_size: 2 * 1024 * 1024,
+            max_size: 2 * CHUNK_MAX_SIZE_HARD_CAP,
+        };
+        let error = config.validate_stored().unwrap_err();
+        assert!(error.to_string().contains("chunker.max_size must be in"));
+        for (min, avg, max) in [(0, 1024, 4096), (256, 0, 4096), (8192, 4096, 16384)] {
+            let config = ChunkerConfig {
+                min_size: min,
+                avg_size: avg,
+                max_size: max,
+            };
+            assert!(config.validate_stored().is_err(), "{min} {avg} {max}");
+        }
+        assert!(ChunkerConfig::default().validate_stored().is_ok());
     }
 
     #[test]

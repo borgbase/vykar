@@ -89,7 +89,7 @@ fn open_raw(config: &VykarConfig) -> Result<(Box<dyn StorageBackend>, RepoConfig
         .get("config")?
         .ok_or_else(|| VykarError::RepoNotFound(config.repository.url.clone()))?;
     let repo_config: RepoConfig = rmp_serde::from_slice(&data)?;
-    let format = RepoFormat::from_version(repo_config.version)?;
+    let format = repo_config.validate()?;
     if repo_config.encryption == EncryptionMode::None {
         return Err(VykarError::Config(
             "this repository is unencrypted (mode: none), so it has no repository key".into(),

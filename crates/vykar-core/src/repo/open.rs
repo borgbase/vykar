@@ -12,7 +12,7 @@ use super::manifest::Manifest;
 use super::snapshot_cache;
 use super::{
     BlobCache, EncryptionMode, IndexLayout, OpenOptions, RepoConfig, RepoFormat, Repository,
-    BLOB_CACHE_MAX_BYTES, INDEX_OBJECT_CONTEXT, KEY_PRIMARY, KEY_SECONDARY,
+    BLOB_CACHE_MAX_BYTES, INDEX_OBJECT_CONTEXT, KEY_PRIMARY, KEY_SECONDARY, MAX_PACK_SIZE_LIMIT,
 };
 use crate::compress;
 use crate::config::{
@@ -110,7 +110,7 @@ impl Repository {
     ) -> Result<Self> {
         // Library callers can bypass YAML validation. Reject unsupported
         // parameters before writing a new repository's immutable config.
-        chunker_params.validate_even_sizes()?;
+        chunker_params.validate_stored()?;
         let storage: Arc<dyn StorageBackend> = Arc::from(storage);
 
         // Check that the repo doesn't already exist
@@ -130,9 +130,14 @@ impl Repository {
             .map(|c| c.max_pack_size)
             .unwrap_or_else(default_max_pack_size);
 
-        if max_pack_size > 512 * 1024 * 1024 {
+        if max_pack_size > MAX_PACK_SIZE_LIMIT {
             return Err(VykarError::Config(format!(
                 "max_pack_size ({max_pack_size}) exceeds hard limit of 512 MiB"
+            )));
+        }
+        if min_pack_size > max_pack_size {
+            return Err(VykarError::Config(format!(
+                "min_pack_size ({min_pack_size}) exceeds max_pack_size ({max_pack_size})"
             )));
         }
 
@@ -409,10 +414,7 @@ impl Repository {
             .get("config")?
             .ok_or_else(|| VykarError::RepoNotFound("config not found".into()))?;
         let repo_config: RepoConfig = rmp_serde::from_slice(&config_data)?;
-
-        // The single version gate. Everything downstream asks the resolved
-        // `RepoFormat`, never the raw integer.
-        let format = RepoFormat::from_version(repo_config.version)?;
+        let format = repo_config.validate()?;
 
         if opts.require_encryption && repo_config.encryption == EncryptionMode::None {
             return Err(VykarError::PlaintextRepository(
@@ -424,13 +426,6 @@ impl Repository {
         // constructed before the config could be read, so this is the first
         // moment the algorithm is known.
         storage.bind_content_hash(format.chunk_hash())?;
-
-        if repo_config.max_pack_size > 512 * 1024 * 1024 {
-            return Err(VykarError::Config(format!(
-                "max_pack_size ({}) exceeds hard limit of 512 MiB",
-                repo_config.max_pack_size
-            )));
-        }
 
         // Build crypto engine. `key::load_master_key` is the single place the
         // key copies are read, so corroboration, diagnosis and backfill live

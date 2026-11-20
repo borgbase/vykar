@@ -162,6 +162,33 @@ pub struct RepoConfig {
     pub max_pack_size: u32,
 }
 
+/// Upper bound on `RepoConfig::max_pack_size`.
+pub(crate) const MAX_PACK_SIZE_LIMIT: u32 = 512 * 1024 * 1024;
+
+impl RepoConfig {
+    /// The checks every open applies to a decoded `config`, which is
+    /// unauthenticated even in an encrypted repository. This is the single
+    /// version gate: everything downstream asks the returned [`RepoFormat`],
+    /// never the raw integer.
+    ///
+    /// The chunker parameters are not checked here, so that restore stays
+    /// usable; backup checks them (`ChunkerConfig::validate_stored`).
+    ///
+    /// # Errors
+    ///
+    /// An unknown version, or a `max_pack_size` above the hard limit.
+    pub fn validate(&self) -> Result<RepoFormat> {
+        let format = RepoFormat::from_version(self.version)?;
+        if self.max_pack_size > MAX_PACK_SIZE_LIMIT {
+            return Err(vykar_types::error::VykarError::Config(format!(
+                "max_pack_size ({}) exceeds hard limit of 512 MiB",
+                self.max_pack_size
+            )));
+        }
+        Ok(format)
+    }
+}
+
 /// Maximum total weight (bytes) of cached blobs in the blob cache.
 const BLOB_CACHE_MAX_BYTES: usize = 32 * 1024 * 1024; // 32 MiB
 

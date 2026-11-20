@@ -94,20 +94,18 @@ pub(super) fn phase1_upload(
     let transform_pool = &workers.transform_pool;
 
     // Existing repositories bypass YAML validation and may store odd
-    // parameters from before FastCDC 5. Check before any upload or dump
+    // parameters from before FastCDC 5, or anything at all if `config` was
+    // tampered with (it is unauthenticated). Check before any upload or dump
     // execution, while retaining the normal session cleanup on failure.
     // Do not reject these in Repository::open: restore must remain usable.
-    repo.config
-        .chunker_params
-        .validate_even_sizes()
-        .map_err(|e| {
-            VykarError::Config(format!(
-                "cannot back up with stored repository chunker parameters: {e}; \
+    repo.config.chunker_params.validate_stored().map_err(|e| {
+        VykarError::Config(format!(
+            "cannot back up with stored repository chunker parameters: {e}; \
              changing YAML does not change stored parameters. Existing snapshots \
              can still be restored; initialize a new repository with even \
              chunker sizes for future backups"
-            ))
-        })?;
+        ))
+    })?;
 
     // Check snapshot name is unique (best-effort, re-checked at commit).
     if repo.manifest().find_snapshot(snapshot_name).is_some() {

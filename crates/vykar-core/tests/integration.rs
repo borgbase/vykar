@@ -191,10 +191,24 @@ fn init_rejects_odd_chunker_parameters_without_writing_config() {
 }
 
 #[test]
-fn backup_rejects_stored_odd_chunker_parameters_but_restore_still_works() {
-    for (field, chunker) in [
+fn init_rejects_min_pack_size_above_max_without_writing_config() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = make_test_config(tmp.path());
+    config.repository.min_pack_size = 64 * 1024 * 1024;
+    config.repository.max_pack_size = 32 * 1024 * 1024;
+    let error = commands::init::run(&config, None).err().unwrap();
+    assert!(
+        error.to_string().contains("exceeds max_pack_size"),
+        "{error}"
+    );
+    assert!(!tmp.path().join("config").exists());
+}
+
+#[test]
+fn backup_rejects_stored_invalid_chunker_parameters_but_restore_still_works() {
+    for (expected, chunker) in [
         (
-            "min_size",
+            "chunker.min_size must be even",
             ChunkerConfig {
                 min_size: 257,
                 avg_size: 1024,
@@ -202,7 +216,7 @@ fn backup_rejects_stored_odd_chunker_parameters_but_restore_still_works() {
             },
         ),
         (
-            "avg_size",
+            "chunker.avg_size must be even",
             ChunkerConfig {
                 min_size: 256,
                 avg_size: 1025,
@@ -210,11 +224,29 @@ fn backup_rejects_stored_odd_chunker_parameters_but_restore_still_works() {
             },
         ),
         (
-            "max_size",
+            "chunker.max_size must be even",
             ChunkerConfig {
                 min_size: 256,
                 avg_size: 1024,
                 max_size: 4095,
+            },
+        ),
+        // `config` is unauthenticated: out-of-range values reach FastCDC
+        // unless backup checks them.
+        (
+            "chunker.min_size must be in",
+            ChunkerConfig {
+                min_size: 0,
+                avg_size: 1024,
+                max_size: 4096,
+            },
+        ),
+        (
+            "chunker.max_size must be in",
+            ChunkerConfig {
+                min_size: 256,
+                avg_size: 1024,
+                max_size: 64 * 1024 * 1024,
             },
         ),
     ] {
@@ -260,10 +292,7 @@ fn backup_rejects_stored_odd_chunker_parameters_but_restore_still_works() {
             )
             .unwrap_err()
             .to_string();
-            assert!(
-                error.contains(&format!("chunker.{field} must be even")),
-                "{error}"
-            );
+            assert!(error.contains(expected), "{error}");
             assert!(error.contains("stored repository"), "{error}");
             assert_eq!(std::fs::read(&config_path).unwrap(), config_bytes);
             assert_eq!(

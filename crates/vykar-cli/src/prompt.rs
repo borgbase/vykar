@@ -48,28 +48,18 @@ fn read_hidden_line(buf: &mut String) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
 
-    struct RestoreTermios {
-        fd: i32,
-        original: libc::termios,
-    }
-
-    impl Drop for RestoreTermios {
-        fn drop(&mut self) {
-            // SAFETY: `self.original` was produced by a successful tcgetattr
-            // and `self.fd` was valid for the borrow that constructed this
-            // guard; the guard is dropped before stdin's borrow ends.
-            let _ = unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.original) };
-        }
-    }
-
-    let _restore = RestoreTermios { fd, original };
+    let _restore = std::mem::DropGuard::new(original, |original| {
+        // SAFETY: `original` was produced by a successful tcgetattr and `fd`
+        // stays valid while stdin is borrowed; the guard drops before that.
+        let _ = unsafe { libc::tcsetattr(fd, libc::TCSANOW, &original) };
+    });
     stdin.lock().read_line(buf)?;
     Ok(())
 }
 
 #[cfg(windows)]
 fn read_hidden_line(buf: &mut String) -> io::Result<()> {
-    use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
     use windows_sys::Win32::System::Console::{
         ENABLE_ECHO_INPUT, GetConsoleMode, GetStdHandle, STD_INPUT_HANDLE, SetConsoleMode,
     };
@@ -104,20 +94,11 @@ fn read_hidden_line(buf: &mut String) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
 
-    struct RestoreConsoleMode {
-        handle: HANDLE,
-        mode: u32,
-    }
-
-    impl Drop for RestoreConsoleMode {
-        fn drop(&mut self) {
-            // SAFETY: both values came from a successful console-mode round
-            // trip during construction of this guard.
-            let _ = unsafe { SetConsoleMode(self.handle, self.mode) };
-        }
-    }
-
-    let _restore = RestoreConsoleMode { handle, mode };
+    let _restore = std::mem::DropGuard::new(mode, |mode| {
+        // SAFETY: `handle` and `mode` came from a successful console-mode
+        // round trip above.
+        let _ = unsafe { SetConsoleMode(handle, mode) };
+    });
     stdin.lock().read_line(buf)?;
     Ok(())
 }

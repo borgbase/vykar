@@ -44,13 +44,8 @@ const CAUTIOUS_MAX_BYTES: usize = 1024 * 1024;
 /// Run `f` with a pre-sizing budget of `input_len` bytes. Restores the
 /// previous budget afterwards, also on unwind, so nested decodes are safe.
 pub(crate) fn with_input_budget<R>(input_len: usize, f: impl FnOnce() -> R) -> R {
-    struct Restore(Option<usize>);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            INPUT_BUDGET.with(|b| b.set(self.0));
-        }
-    }
-    let _restore = Restore(INPUT_BUDGET.with(|b| b.replace(Some(input_len))));
+    let previous = INPUT_BUDGET.with(|b| b.replace(Some(input_len)));
+    let _restore = std::mem::DropGuard::new(previous, |prev| INPUT_BUDGET.with(|b| b.set(prev)));
     f()
 }
 

@@ -32,7 +32,7 @@ use status::SharedStatus;
 /// pages via madvise/munmap.
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 pub(super) fn release_malloc_arenas() {
-    extern "C" {
+    unsafe extern "C" {
         fn malloc_trim(pad: libc::size_t) -> libc::c_int;
     }
     // SAFETY: malloc_trim is safe to call at any time and is thread-safe.

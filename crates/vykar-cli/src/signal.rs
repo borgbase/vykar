@@ -87,10 +87,13 @@ unsafe extern "system" fn windows_console_handler(ctrl_type: u32) -> i32 {
     if ctrl_type <= 2 {
         SHUTDOWN.store(true, Ordering::SeqCst);
         // Unregister this handler so a second signal terminates immediately
-        windows_sys::Win32::System::Console::SetConsoleCtrlHandler(
-            Some(windows_console_handler),
-            0, // FALSE = remove
-        );
+        // SAFETY: removes the handler this process registered; no pointers involved.
+        unsafe {
+            windows_sys::Win32::System::Console::SetConsoleCtrlHandler(
+                Some(windows_console_handler),
+                0, // FALSE = remove
+            );
+        }
         return 1; // TRUE = handled this time
     }
     0 // FALSE = not handled

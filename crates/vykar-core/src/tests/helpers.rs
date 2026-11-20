@@ -153,8 +153,10 @@ pub fn try_backup_single_source(
 
 /// RAII guard that sets an env var and restores its previous value on drop.
 ///
-/// Tests that touch process env must serialize themselves; this only handles
-/// the restore half.
+/// Tests that touch process env must serialize themselves on `CWD_LOCK`; this
+/// only handles the restore half. That keeps env-mutating tests apart, but a
+/// concurrently running test that reads the environment without the lock can
+/// still race with the mutation, the usual compromise in a threaded harness.
 pub struct EnvGuard {
     key: &'static str,
     prev: Option<String>,
@@ -163,22 +165,35 @@ pub struct EnvGuard {
 impl EnvGuard {
     pub fn set(key: &'static str, val: &str) -> Self {
         let prev = std::env::var(key).ok();
-        std::env::set_var(key, val);
+        // SAFETY: see the type docs; callers hold `CWD_LOCK`.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::set_var(key, val);
+        }
         Self { key, prev }
     }
 
     pub fn unset(key: &'static str) -> Self {
         let prev = std::env::var(key).ok();
-        std::env::remove_var(key);
+        // SAFETY: see the type docs; callers hold `CWD_LOCK`.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::remove_var(key);
+        }
         Self { key, prev }
     }
 }
 
 impl Drop for EnvGuard {
     fn drop(&mut self) {
-        match &self.prev {
-            Some(v) => std::env::set_var(self.key, v),
-            None => std::env::remove_var(self.key),
+        // SAFETY: as in `set`; the guard drops before the caller's `CWD_LOCK`
+        // guard, which is declared first.
+        #[allow(unsafe_code)]
+        unsafe {
+            match &self.prev {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
         }
     }
 }

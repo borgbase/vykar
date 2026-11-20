@@ -1,5 +1,3 @@
-// Env removal of VYKAR_PASSPHRASE during single-threaded startup; SAFETY per block.
-#![allow(unsafe_code)]
 #![allow(
     clippy::duration_suboptimal_units,
     clippy::missing_errors_doc,
@@ -93,9 +91,14 @@ fn take_env_passphrase() -> Option<Zeroizing<String>> {
         .ok()
         .filter(|s| !s.is_empty());
     if val.is_some() {
-        // SAFETY: called during single-threaded startup before any thread
-        // pool spawns; no concurrent env reads/writes can race here.
-        #[allow(unused_unsafe)]
+        // SAFETY: `remove_var` is unsound while another thread reads or
+        // writes the environment. One-shot CLI commands and daemon startup
+        // (`load_daemon_config`) get here before spawning threads, and the
+        // cache above makes every later call return early. Not guaranteed in
+        // the GUI, which resolves passphrases on its worker thread while the
+        // UI thread runs, nor for a daemon whose first env lookup comes after
+        // a SIGHUP reload.
+        #[allow(unsafe_code)]
         unsafe {
             std::env::remove_var("VYKAR_PASSPHRASE");
         }

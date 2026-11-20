@@ -983,17 +983,20 @@ fn item_stream_reader_resolves_from_cache_then_falls_back_once() {
     let repo_dir = tmp.path().join("repo");
 
     // Complete cache: lookups are served without touching the index.
-    let (mut repo, index_gets) = open_counting_repo(&repo_dir);
-    let mut reader = commands::list::ItemStreamReader::new(&repo);
-    reader.load(&mut repo, "snap1", None).unwrap();
-    reader
-        .ensure_resolvable(&mut repo, std::iter::once(&data_chunk))
-        .unwrap();
-    assert!(reader.uses_restore_cache());
-    assert!(!reader.index_loaded());
-    assert!(reader.lookup(&repo, &data_chunk).is_some());
-    assert_eq!(index_gets.load(Ordering::Relaxed), 0);
-    assert!(repo.chunk_index().is_empty());
+    // Scoped so the cache is unmapped before it is replaced (Windows refuses).
+    {
+        let (mut repo, index_gets) = open_counting_repo(&repo_dir);
+        let mut reader = commands::list::ItemStreamReader::new(&repo);
+        reader.load(&mut repo, "snap1", None).unwrap();
+        reader
+            .ensure_resolvable(&mut repo, std::iter::once(&data_chunk))
+            .unwrap();
+        assert!(reader.uses_restore_cache());
+        assert!(!reader.index_loaded());
+        assert!(reader.lookup(&repo, &data_chunk).is_some());
+        assert_eq!(index_gets.load(Ordering::Relaxed), 0);
+        assert!(repo.chunk_index().is_empty());
+    }
 
     // Cache lacking the data chunk: the first miss loads the index once and
     // every later lookup uses it.

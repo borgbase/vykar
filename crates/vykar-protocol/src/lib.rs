@@ -510,6 +510,122 @@ pub fn is_valid_pack_key(key: &str) -> bool {
         && id.chars().all(|c| c.is_ascii_hexdigit())
 }
 
+/// Path-traversal safety check without schema enforcement, for deleting
+/// leftover files. Rejects null bytes, backslashes, empty segments, `.` and
+/// `..`, but allows any filename. The empty key (the root) is accepted.
+pub fn is_safe_relative_path(key: &str) -> bool {
+    if key.contains('\0') || key.contains('\\') {
+        return false;
+    }
+    let trimmed = key.trim_matches('/');
+    if trimmed.is_empty() {
+        return true;
+    }
+    !trimmed
+        .split('/')
+        .any(|part| part.is_empty() || part == "." || part == "..")
+}
+
+/// Whether the server accepts `key` as a committed object key: path-safe as
+/// [`is_safe_relative_path`], and inside the repository's key schema.
+pub fn is_valid_storage_key(key: &str) -> bool {
+    if key.contains('\0') || key.contains('\\') {
+        return false;
+    }
+    // Temp-file names are never valid committed keys. Append-only mode allows
+    // deleting temp-named files (uncommitted upload debris); if PUT could
+    // commit an object under a temp-looking name (e.g. `snapshots/.tmp.x.1` —
+    // the namespaces below accept any basename), that object would be
+    // deletable in append-only mode, breaking its guarantee.
+    if is_temp_file(key) {
+        return false;
+    }
+    let trimmed = key.trim_matches('/');
+    if trimmed.is_empty() {
+        return true;
+    }
+    let parts: Vec<&str> = trimmed.split('/').collect();
+    if parts
+        .iter()
+        .any(|part| part.is_empty() || *part == "." || *part == "..")
+    {
+        return false;
+    }
+    let Some(first) = parts.first() else {
+        return false;
+    };
+    match *first {
+        "keys" | "snapshots" | "locks" | "sessions" | "pending_index" => {
+            return (1..=2).contains(&parts.len());
+        }
+        "packs" => return is_valid_packs_key(&parts),
+        INDEX_OBJECT_DIR => {
+            return parts.len() == 1 || is_index_object_key(trimmed);
+        }
+        _ => {}
+    }
+    if KNOWN_ROOT_FILES.contains(first) {
+        return parts.len() == 1;
+    }
+    false
+}
+
+fn is_valid_packs_key(parts: &[&str]) -> bool {
+    let Some(first) = parts.first() else {
+        return false;
+    };
+    if *first != "packs" {
+        return false;
+    }
+    if parts.len() == 1 {
+        return true;
+    }
+    let Some(shard) = parts.get(1) else {
+        return false;
+    };
+    if shard.len() != 2 || !shard.chars().all(|c| c.is_ascii_hexdigit()) {
+        return false;
+    }
+    if parts.len() == 2 {
+        return true;
+    }
+    if parts.len() == 3 {
+        let Some(pack) = parts.get(2) else {
+            return false;
+        };
+        return pack.len() == 64 && pack.chars().all(|c| c.is_ascii_hexdigit());
+    }
+    false
+}
+
+/// Parse an HTTP `Range` header of the one form the client sends,
+/// `bytes=<start>-<end>` (inclusive), into `(start, length)`.
+///
+/// # Errors
+///
+/// Returns a message for any other form, `end < start`, or a length that
+/// overflows `u64`.
+pub fn parse_byte_range(header: &str) -> Result<(u64, u64), String> {
+    let range = header
+        .strip_prefix("bytes=")
+        .ok_or_else(|| "invalid Range header".to_string())?;
+    let mut iter = range.split('-');
+    let (Some(start), Some(end), None) = (iter.next(), iter.next(), iter.next()) else {
+        return Err("invalid Range header".into());
+    };
+    let start: u64 = start
+        .parse()
+        .map_err(|_| "invalid range start".to_string())?;
+    let end: u64 = end.parse().map_err(|_| "invalid range end".to_string())?;
+    if end < start {
+        return Err("invalid Range header: end before start".into());
+    }
+    let length = (end - start)
+        .checked_add(1)
+        .ok_or_else(|| "invalid Range header".to_string())?;
+    Ok((start, length))
+}
+
 /// Validate a single blob reference from a wire-format request.
 ///
 /// Returns `Ok(())` on success, `Err(message)` on failure.
@@ -535,6 +651,30 @@ pub fn validate_blob_ref(offset: u64, length: u64, context: &str) -> Result<(), 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_byte_range_accepts_only_bytes_start_end() {
+        assert_eq!(parse_byte_range("bytes=0-0"), Ok((0, 1)));
+        assert_eq!(parse_byte_range("bytes=200-299"), Ok((200, 100)));
+        assert_eq!(
+            parse_byte_range(&format!("bytes=1-{}", u64::MAX)),
+            Ok((1, u64::MAX))
+        );
+        for bad in [
+            "",
+            "bytes=",
+            "bytes=5",
+            "bytes=-5",
+            "bytes=5-",
+            "bytes=1-2-3",
+            "bytes=9-8",
+            "items=0-1",
+            "bytes=0-1,4-5",
+        ] {
+            assert!(parse_byte_range(bad).is_err(), "{bad}");
+        }
+        assert!(parse_byte_range(&format!("bytes=0-{}", u64::MAX)).is_err());
+    }
 
     // ── Serde default round-trip ───────────────────────────────────────
 

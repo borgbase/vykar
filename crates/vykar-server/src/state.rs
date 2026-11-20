@@ -9,6 +9,7 @@ use crate::config::ServerSection;
 use crate::index_etag::IndexValidator;
 use crate::quota::{self, QuotaState};
 use crate::uploads::PartUploads;
+use vykar_protocol::{is_safe_relative_path, is_valid_storage_key};
 
 /// Shared application state, wrapped in Arc for axum handlers.
 #[derive(Clone)]
@@ -425,91 +426,6 @@ pub(crate) fn rescan_usage(inner: &AppStateInner) {
     let (usage, _) = scan_usage(&inner.data_dir, Some(TEMP_DEBRIS_MAX_AGE));
     inner.quota_usage.store(usage, Ordering::Relaxed);
     inner.quota_state.refresh(usage);
-}
-
-/// Path-traversal safety check without schema enforcement. Rejects null bytes,
-/// backslashes, empty segments, `.` and `..` — but allows any filename.
-fn is_safe_relative_path(key: &str) -> bool {
-    if key.contains('\0') || key.contains('\\') {
-        return false;
-    }
-    let trimmed = key.trim_matches('/');
-    if trimmed.is_empty() {
-        return true;
-    }
-    !trimmed
-        .split('/')
-        .any(|part| part.is_empty() || part == "." || part == "..")
-}
-
-fn is_valid_storage_key(key: &str) -> bool {
-    if key.contains('\0') || key.contains('\\') {
-        return false;
-    }
-    // Temp-file names are never valid committed keys. Append-only mode allows
-    // deleting temp-named files (uncommitted upload debris); if PUT could
-    // commit an object under a temp-looking name (e.g. `snapshots/.tmp.x.1` —
-    // the namespaces below accept any basename), that object would be
-    // deletable in append-only mode, breaking its guarantee.
-    if vykar_protocol::is_temp_file(key) {
-        return false;
-    }
-    let trimmed = key.trim_matches('/');
-    if trimmed.is_empty() {
-        return true;
-    }
-    let parts: Vec<&str> = trimmed.split('/').collect();
-    if parts
-        .iter()
-        .any(|part| part.is_empty() || *part == "." || *part == "..")
-    {
-        return false;
-    }
-    let Some(first) = parts.first() else {
-        return false;
-    };
-    match *first {
-        "keys" | "snapshots" | "locks" | "sessions" | "pending_index" => {
-            return (1..=2).contains(&parts.len());
-        }
-        "packs" => return is_valid_packs_key(&parts),
-        vykar_protocol::INDEX_OBJECT_DIR => {
-            return parts.len() == 1 || vykar_protocol::is_index_object_key(trimmed);
-        }
-        _ => {}
-    }
-    if vykar_protocol::KNOWN_ROOT_FILES.contains(first) {
-        return parts.len() == 1;
-    }
-    false
-}
-
-fn is_valid_packs_key(parts: &[&str]) -> bool {
-    let Some(first) = parts.first() else {
-        return false;
-    };
-    if *first != "packs" {
-        return false;
-    }
-    if parts.len() == 1 {
-        return true;
-    }
-    let Some(shard) = parts.get(1) else {
-        return false;
-    };
-    if shard.len() != 2 || !shard.chars().all(|c| c.is_ascii_hexdigit()) {
-        return false;
-    }
-    if parts.len() == 2 {
-        return true;
-    }
-    if parts.len() == 3 {
-        let Some(pack) = parts.get(2) else {
-            return false;
-        };
-        return pack.len() == 64 && pack.chars().all(|c| c.is_ascii_hexdigit());
-    }
-    false
 }
 
 fn existing_ancestor_within(path: &Path, base: &Path) -> bool {

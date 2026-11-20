@@ -762,32 +762,8 @@ async fn handle_range_read(
     range_header: &str,
     key: &str,
 ) -> Result<Response, ServerError> {
-    // Parse "bytes=<start>-<end>"
-    let range_str = range_header
-        .strip_prefix("bytes=")
-        .ok_or_else(|| ServerError::BadRequest("invalid Range header".into()))?;
-
-    let mut iter = range_str.split('-');
-    let (Some(start_str), Some(end_str), None) = (iter.next(), iter.next(), iter.next()) else {
-        return Err(ServerError::BadRequest("invalid Range header".into()));
-    };
-
-    let start: u64 = start_str
-        .parse()
-        .map_err(|_| ServerError::BadRequest("invalid range start".into()))?;
-    let end: u64 = end_str
-        .parse()
-        .map_err(|_| ServerError::BadRequest("invalid range end".into()))?;
-    if end < start {
-        return Err(ServerError::BadRequest(
-            "invalid Range header: end before start".into(),
-        ));
-    }
-
-    let length = end
-        .checked_sub(start)
-        .and_then(|d| d.checked_add(1))
-        .ok_or_else(|| ServerError::BadRequest("invalid Range header".into()))?;
+    let (start, length) =
+        vykar_protocol::parse_byte_range(range_header).map_err(ServerError::BadRequest)?;
     let mut file = match tokio::fs::File::open(file_path).await {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {

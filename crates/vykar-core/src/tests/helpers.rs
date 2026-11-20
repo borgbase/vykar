@@ -116,6 +116,18 @@ pub fn backup_single_source(
     source_label: &str,
     snapshot_name: &str,
 ) -> SnapshotStats {
+    try_backup_single_source(config, source_dir, source_label, snapshot_name)
+        .unwrap()
+        .stats
+}
+
+/// [`backup_single_source`], returning the backup's result.
+pub fn try_backup_single_source(
+    config: &VykarConfig,
+    source_dir: &Path,
+    source_label: &str,
+    snapshot_name: &str,
+) -> vykar_types::error::Result<commands::backup::BackupOutcome> {
     let source_paths = vec![source_dir.to_string_lossy().to_string()];
     let exclude_if_present: Vec<String> = Vec::new();
     let exclude_patterns: Vec<String> = Vec::new();
@@ -137,8 +149,6 @@ pub fn backup_single_source(
             verbose: false,
         },
     )
-    .unwrap()
-    .stats
 }
 
 /// RAII guard that sets an env var and restores its previous value on drop.

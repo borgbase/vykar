@@ -25,6 +25,10 @@ enum Event {
     MarkerDelete,
     JournalDelete,
     LockDelete,
+    SegmentPut,
+    BasePut,
+    HeadPut,
+    IndexGenPut,
 }
 
 #[derive(Default)]
@@ -66,6 +70,8 @@ struct Shared {
     /// Set by the first successful pack PUT and passed to the backup as its
     /// shutdown flag, so the run is interrupted once packs are durable.
     interrupt_after_pack: Option<Arc<AtomicBool>>,
+    /// Fail every `snapshots/` PUT, after the index write it follows.
+    fail_snapshot_put: bool,
 }
 
 struct ObservingBackend {
@@ -76,6 +82,26 @@ struct ObservingBackend {
 impl ObservingBackend {
     fn record(&self, e: Event) {
         self.shared.events.lock().unwrap().push(e);
+    }
+
+    /// Records the index objects a commit writes.
+    fn record_index_put(&self, key: &str, data: &[u8]) {
+        use crate::repo::format::ObjectType;
+        let tag = data.first().copied();
+        let event = if key == "index" && tag == Some(ObjectType::IndexHead as u8) {
+            Event::HeadPut
+        } else if key == "index.gen" {
+            Event::IndexGenPut
+        } else if key.starts_with(crate::repo::index_store::INDEX_OBJECT_DIR) {
+            match tag {
+                Some(t) if t == ObjectType::IndexBase as u8 => Event::BasePut,
+                Some(t) if t == ObjectType::IndexSegment as u8 => Event::SegmentPut,
+                _ => return,
+            }
+        } else {
+            return;
+        };
+        self.record(event);
     }
 
     fn put_with(&self, key: &str, put: impl FnOnce() -> Result<()>) -> Result<()> {
@@ -97,6 +123,9 @@ impl ObservingBackend {
         }
         if key.starts_with("snapshots/") {
             self.record(Event::SnapshotPut);
+            if self.shared.fail_snapshot_put {
+                return Err(VykarError::Other("injected snapshot PUT failure".into()));
+            }
         }
         if !key.starts_with("packs/") {
             return put();
@@ -149,6 +178,7 @@ delegate_storage_backend! {
     }
 
     fn put(&self, key: &str, data: &[u8]) -> Result<()> {
+        self.record_index_put(key, data);
         self.put_with(key, || self.inner.put(key, data))
     }
 
@@ -164,6 +194,7 @@ delegate_storage_backend! {
     }
 
     fn put_owned(&self, key: &str, data: Vec<u8>) -> Result<()> {
+        self.record_index_put(key, &data);
         self.put_with(key, || self.inner.put_owned(key, data))
     }
 
@@ -243,12 +274,14 @@ fn run_backup_with_passphrase(
 
 fn repo_keys(config: &crate::config::VykarConfig, prefix: &str) -> Vec<String> {
     let storage = crate::storage::backend_from_config(&config.repository, 1).unwrap();
-    storage
+    let mut keys: Vec<String> = storage
         .list(prefix)
         .unwrap()
         .into_iter()
         .filter(|k| !k.ends_with('/'))
-        .collect()
+        .collect();
+    keys.sort();
+    keys
 }
 
 #[test]
@@ -344,6 +377,9 @@ fn assert_missing_pack_fails_commit_with(
     batch_sizes: bool,
 ) {
     let packs_before = repo_keys(config, "packs/").len();
+    let storage = crate::storage::backend_from_config(&config.repository, 1).unwrap();
+    let index_before = storage.get("index").unwrap();
+    let objects_before = repo_keys(config, "index.d/");
     let shared = Shared {
         delete_pack_at_lock: true,
         batch_sizes,
@@ -360,6 +396,23 @@ fn assert_missing_pack_fails_commit_with(
         "no snapshot may be committed over a missing pack"
     );
     assert!(repo_keys(config, "locks/").is_empty());
+    assert_eq!(
+        storage.get("index").unwrap(),
+        index_before,
+        "the head must not move"
+    );
+    assert_eq!(
+        repo_keys(config, "index.d/"),
+        objects_before,
+        "no index object written"
+    );
+    let events = shared.events.lock().unwrap().clone();
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, Event::SegmentPut | Event::BasePut | Event::HeadPut)),
+        "{events:?}"
+    );
 }
 
 /// Few session packs: verified with one `size()` per pack.
@@ -652,4 +705,220 @@ fn open_failure_deregisters_read_session() {
     );
     assert!(res.is_err());
     assert!(session_markers(&config).is_empty());
+}
+
+/// A v5 commit writes one segment, then the head, then the snapshot, all
+/// under the commit lock, and never `index.gen`.
+#[test]
+fn segmented_commit_puts_segment_then_head_then_snapshot() {
+    let (_dir, config, src) = setup();
+    let shared = Shared::default();
+    run_backup(&config, &src, &shared).unwrap();
+
+    let events = shared.events.lock().unwrap().clone();
+    let writes: Vec<(usize, Event)> = events
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|(_, e)| {
+            matches!(
+                e,
+                Event::SegmentPut
+                    | Event::BasePut
+                    | Event::HeadPut
+                    | Event::IndexGenPut
+                    | Event::SnapshotPut
+            )
+        })
+        .collect();
+    assert_eq!(
+        writes.iter().map(|(_, e)| *e).collect::<Vec<_>>(),
+        [Event::SegmentPut, Event::HeadPut, Event::SnapshotPut],
+        "{events:?}"
+    );
+    let lock = events.iter().position(|e| *e == Event::LockPut).unwrap();
+    assert_eq!(
+        events.iter().filter(|e| **e == Event::LockPut).count(),
+        1,
+        "{events:?}"
+    );
+    let unlock = events.iter().position(|e| *e == Event::LockDelete).unwrap();
+    assert!(
+        writes.iter().all(|(i, _)| lock < *i && *i < unlock),
+        "{events:?}"
+    );
+    let storage = crate::storage::backend_from_config(&config.repository, 1).unwrap();
+    assert!(!storage.exists("index.gen").unwrap());
+}
+
+type Refcounts = std::collections::HashMap<vykar_types::chunk_id::ChunkId, u32>;
+
+fn refcounts(repo_dir: &Path) -> Refcounts {
+    crate::tests::helpers::open_local_repo(repo_dir)
+        .chunk_index()
+        .iter()
+        .map(|(id, e)| (*id, e.refcount))
+        .collect()
+}
+
+/// The file called `name` somewhere below `dir`.
+fn find_file(dir: &Path, name: &str) -> Option<std::path::PathBuf> {
+    for entry in fs::read_dir(dir).ok()? {
+        let p = entry.ok()?.path();
+        if p.is_dir() {
+            if let Some(found) = find_file(&p, name) {
+                return Some(found);
+            }
+        } else if p.file_name().and_then(|s| s.to_str()) == Some(name) {
+            return Some(p);
+        }
+    }
+    None
+}
+
+fn assert_check_clean(config: &crate::config::VykarConfig) {
+    let result = crate::commands::check::run(config, None, false, false).unwrap();
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+}
+
+fn compact(config: &crate::config::VykarConfig) {
+    crate::commands::compact::run(config, None, 0.0, None, false, None).unwrap();
+}
+
+fn assert_superset(packs: &[String], config: &crate::config::VykarConfig) {
+    let now = repo_keys(config, "packs/");
+    let lost: Vec<_> = packs.iter().filter(|p| !now.contains(p)).collect();
+    assert!(lost.is_empty(), "packs lost: {lost:?}");
+}
+
+/// Restores `snap` and compares it with the source `setup` wrote.
+fn assert_restores_snap(config: &crate::config::VykarConfig, dest: &Path) {
+    crate::commands::restore::run(
+        config,
+        None,
+        "snap",
+        dest.to_str().unwrap(),
+        None,
+        false,
+        true,
+        None,
+    )
+    .unwrap();
+    let a = find_file(dest, "a.bin").expect("a.bin restored");
+    assert_eq!(fs::read(a).unwrap(), vec![0x5au8; 64 * 1024]);
+    let b = find_file(dest, "b.txt").expect("b.txt restored");
+    assert_eq!(fs::read(b).unwrap(), b"hello");
+}
+
+/// A backup whose snapshot PUT fails after the index write: the head moved,
+/// no snapshot exists. Returns the packs and refcounts it left.
+fn fail_after_the_index_write(
+    config: &crate::config::VykarConfig,
+    src: &Path,
+    repo_dir: &Path,
+) -> (Vec<String>, Refcounts) {
+    let storage = crate::storage::backend_from_config(&config.repository, 1).unwrap();
+    let index_before = storage.get("index").unwrap();
+    let shared = Shared {
+        fail_snapshot_put: true,
+        ..Default::default()
+    };
+    let err = run_backup(config, src, &shared).unwrap_err().to_string();
+    assert!(err.contains("injected snapshot PUT failure"), "{err}");
+
+    let events = shared.events.lock().unwrap().clone();
+    let pos = |e: Event| {
+        events
+            .iter()
+            .position(|x| *x == e)
+            .unwrap_or_else(|| panic!("{e:?} missing: {events:?}"))
+    };
+    assert!(pos(Event::SegmentPut) < pos(Event::HeadPut), "{events:?}");
+    assert!(pos(Event::HeadPut) < pos(Event::SnapshotPut), "{events:?}");
+
+    assert_ne!(storage.get("index").unwrap(), index_before);
+    let repo = crate::tests::helpers::open_local_repo(repo_dir);
+    let head = repo.index_head().unwrap();
+    assert_eq!(head.segments.len(), 1, "{head:?}");
+    assert!(head.entries > 0, "{head:?}");
+    drop(repo);
+    assert!(repo_keys(config, "snapshots/").is_empty());
+
+    let packs = repo_keys(config, "packs/");
+    assert!(!packs.is_empty());
+    let r1 = refcounts(repo_dir);
+    assert!(!r1.is_empty());
+    assert!(r1.values().all(|&r| r > 0), "{r1:?}");
+    (packs, r1)
+}
+
+/// Compact right after a commit whose snapshot PUT failed keeps the packs
+/// the committed index names; the next backup dedups against them, and
+/// `check --repair` corrects the inflated refcounts without data loss.
+#[test]
+fn snapshot_put_failure_after_the_index_write_keeps_its_packs() {
+    use crate::commands::check::{IndexRecovery, RepairAction, RepairMode};
+
+    let (dir, config, src) = setup();
+    let repo_dir = dir.path().join("repo");
+    let (packs, r1) = fail_after_the_index_write(&config, &src, &repo_dir);
+
+    compact(&config);
+    assert_eq!(repo_keys(&config, "packs/"), packs);
+
+    let out = run_backup(&config, &src, &Shared::default()).unwrap();
+    assert_eq!(out.stats.deduplicated_size, 0, "{:?}", out.stats);
+    assert_superset(&packs, &config);
+    assert_eq!(repo_keys(&config, "snapshots/").len(), 1);
+    assert_check_clean(&config);
+
+    let r2 = refcounts(&repo_dir);
+    let sum = |r: &Refcounts| -> u64 { r1.keys().map(|k| u64::from(r[k])).sum() };
+    assert!(sum(&r2) > sum(&r1), "refcounts not inflated: {r1:?} {r2:?}");
+
+    let repair = |mode| {
+        crate::commands::check::run_with_repair(&config, None, false, mode, None, None).unwrap()
+    };
+    let plan = repair(RepairMode::PlanOnly).plan;
+    assert!(!plan.has_data_loss, "{:?}", plan.actions);
+    assert_eq!(plan.index_recovery, IndexRecovery::Complete);
+    assert!(
+        matches!(plan.actions.as_slice(), [RepairAction::RebuildRefcounts]),
+        "{:?}",
+        plan.actions
+    );
+    repair(RepairMode::Apply);
+
+    let r3 = refcounts(&repo_dir);
+    let shared: Vec<_> = r1.keys().filter(|k| r3.contains_key(k)).collect();
+    assert!(!shared.is_empty());
+    for k in shared {
+        assert_eq!(r3[k], r1[k], "{k:?}");
+    }
+
+    compact(&config);
+    assert_check_clean(&config);
+    assert_restores_snap(&config, &dir.path().join("restore"));
+}
+
+/// A retry right after a commit whose snapshot PUT failed (its journal still
+/// present) dedups against the committed index; compact then keeps every
+/// pack.
+#[test]
+fn retry_after_a_snapshot_put_failure_dedups_and_keeps_its_packs() {
+    let (dir, config, src) = setup();
+    let repo_dir = dir.path().join("repo");
+    let (packs, _) = fail_after_the_index_write(&config, &src, &repo_dir);
+    assert_eq!(session_keys(&config), (false, true));
+
+    let out = run_backup(&config, &src, &Shared::default()).unwrap();
+    assert_eq!(out.stats.deduplicated_size, 0, "{:?}", out.stats);
+    assert_superset(&packs, &config);
+    assert_eq!(repo_keys(&config, "snapshots/").len(), 1);
+    assert_check_clean(&config);
+
+    compact(&config);
+    assert_superset(&packs, &config);
+    assert_check_clean(&config);
+    assert_restores_snap(&config, &dir.path().join("restore"));
 }

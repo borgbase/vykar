@@ -2432,8 +2432,8 @@ mod tests {
 
         // Build initial cache with 5 entries
         let mut index = make_test_index(5);
-        let gen = 42u64;
-        build_full_index_cache_to_path(&index, gen, &path).unwrap();
+        let generation = 42u64;
+        build_full_index_cache_to_path(&index, generation, &path).unwrap();
 
         // Create a delta with new entries and refcount bumps
         let mut delta = IndexDelta::new();
@@ -2459,7 +2459,7 @@ mod tests {
         delta.bump_refcount(&new_id);
 
         // Merge
-        let old_cache = MmapFullIndexCache::open_path(&path, gen).unwrap();
+        let old_cache = MmapFullIndexCache::open_path(&path, generation).unwrap();
         let new_gen = 99u64;
         // Persist only after unmapping: Windows refuses to replace a mapped file.
         let merged = merge_full_index_cache_to_temp(&old_cache, &delta, new_gen, &path).unwrap();
@@ -2492,11 +2492,11 @@ mod tests {
         let path = dir.path().join("full_index_cache");
 
         let index = make_test_index(5);
-        let gen = 42u64;
-        build_full_index_cache_to_path(&index, gen, &path).unwrap();
+        let generation = 42u64;
+        build_full_index_cache_to_path(&index, generation, &path).unwrap();
 
         let delta = IndexDelta::new();
-        let old_cache = MmapFullIndexCache::open_path(&path, gen).unwrap();
+        let old_cache = MmapFullIndexCache::open_path(&path, generation).unwrap();
         let new_gen = 100u64;
         // Persist only after unmapping: Windows refuses to replace a mapped file.
         let merged = merge_full_index_cache_to_temp(&old_cache, &delta, new_gen, &path).unwrap();
@@ -2521,10 +2521,10 @@ mod tests {
         let path = dir.path().join("full_index_cache");
 
         let index = make_test_index(10);
-        let gen = 42u64;
-        build_full_index_cache_to_path(&index, gen, &path).unwrap();
+        let generation = 42u64;
+        build_full_index_cache_to_path(&index, generation, &path).unwrap();
 
-        let cache = MmapFullIndexCache::open_path(&path, gen).unwrap();
+        let cache = MmapFullIndexCache::open_path(&path, generation).unwrap();
 
         // Serialize via streaming using plaintext engine
         let engine =
@@ -2561,25 +2561,25 @@ mod tests {
         let dedup_from_full_path = dir.path().join("dedup_cache_from_full");
 
         let index = make_test_index(10);
-        let gen = 42u64;
+        let generation = 42u64;
 
         // Build full cache
-        build_full_index_cache_to_path(&index, gen, &full_path).unwrap();
+        build_full_index_cache_to_path(&index, generation, &full_path).unwrap();
 
         // Build dedup cache directly from HashMap
-        build_dedup_cache_to_path(&index, gen, &dedup_path).unwrap();
+        build_dedup_cache_to_path(&index, generation, &dedup_path).unwrap();
 
         // Build dedup cache from full cache
         // We need to set up the path manually since we're testing to explicit paths.
         // Use the full cache to create a dedup cache at the from_full path.
-        let cache = MmapFullIndexCache::open_path(&full_path, gen).unwrap();
+        let cache = MmapFullIndexCache::open_path(&full_path, generation).unwrap();
         let entry_count = cache.entry_count();
         let tmp = dedup_from_full_path.with_extension("tmp");
         let file = std::fs::File::create(&tmp).unwrap();
         let mut w = std::io::BufWriter::new(file);
         w.write_all(MAGIC).unwrap();
         w.write_all(&VERSION.to_le_bytes()).unwrap();
-        w.write_all(&gen.to_le_bytes()).unwrap();
+        w.write_all(&generation.to_le_bytes()).unwrap();
         w.write_all(&entry_count.to_le_bytes()).unwrap();
         w.write_all(&0u32.to_le_bytes()).unwrap();
         for entry in cache.iter() {
@@ -2591,8 +2591,8 @@ mod tests {
         std::fs::rename(&tmp, &dedup_from_full_path).unwrap();
 
         // Both dedup caches should produce identical results
-        let cache1 = MmapDedupCache::open_path(&dedup_path, gen).unwrap();
-        let cache2 = MmapDedupCache::open_path(&dedup_from_full_path, gen).unwrap();
+        let cache1 = MmapDedupCache::open_path(&dedup_path, generation).unwrap();
+        let cache2 = MmapDedupCache::open_path(&dedup_from_full_path, generation).unwrap();
 
         assert_eq!(cache1.entry_count(), cache2.entry_count());
         for i in 0u8..10 {
@@ -2614,21 +2614,21 @@ mod tests {
         let restore_from_full_path = dir.path().join("restore_cache_from_full");
 
         let index = make_test_index(10);
-        let gen = 42u64;
+        let generation = 42u64;
 
         // Build full cache and restore cache from HashMap
-        build_full_index_cache_to_path(&index, gen, &full_path).unwrap();
-        build_restore_cache_to_path(&index, gen, &restore_path).unwrap();
+        build_full_index_cache_to_path(&index, generation, &full_path).unwrap();
+        build_restore_cache_to_path(&index, generation, &restore_path).unwrap();
 
         // Build restore cache from full cache
-        let cache = MmapFullIndexCache::open_path(&full_path, gen).unwrap();
+        let cache = MmapFullIndexCache::open_path(&full_path, generation).unwrap();
         let entry_count = cache.entry_count();
         let tmp = restore_from_full_path.with_extension("tmp");
         let file = std::fs::File::create(&tmp).unwrap();
         let mut w = std::io::BufWriter::new(file);
         w.write_all(RESTORE_MAGIC).unwrap();
         w.write_all(&RESTORE_VERSION.to_le_bytes()).unwrap();
-        w.write_all(&gen.to_le_bytes()).unwrap();
+        w.write_all(&generation.to_le_bytes()).unwrap();
         w.write_all(&entry_count.to_le_bytes()).unwrap();
         w.write_all(&0u32.to_le_bytes()).unwrap();
         for entry in cache.iter() {
@@ -2642,8 +2642,8 @@ mod tests {
         std::fs::rename(&tmp, &restore_from_full_path).unwrap();
 
         // Both restore caches should produce identical results
-        let cache1 = MmapRestoreCache::open_path(&restore_path, gen).unwrap();
-        let cache2 = MmapRestoreCache::open_path(&restore_from_full_path, gen).unwrap();
+        let cache1 = MmapRestoreCache::open_path(&restore_path, generation).unwrap();
+        let cache2 = MmapRestoreCache::open_path(&restore_from_full_path, generation).unwrap();
 
         assert_eq!(cache1.entry_count(), cache2.entry_count());
         for i in 0u8..10 {

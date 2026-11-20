@@ -649,14 +649,14 @@ fn refcount_rebuild_excludes_doomed_snapshots() {
     let drop_items = has_action(&result.applied, |a| {
         matches!(
             a,
-            RepairAction::DropItemsFromSnapshot { ref snapshot_name, .. }
+            RepairAction::DropItemsFromSnapshot { snapshot_name, .. }
                 if snapshot_name == "snap-A"
         )
     });
     let remove_dangling = has_action(&result.applied, |a| {
         matches!(
             a,
-            RepairAction::RemoveDanglingSnapshot { ref snapshot_name, .. }
+            RepairAction::RemoveDanglingSnapshot { snapshot_name, .. }
                 if snapshot_name == "snap-A"
         )
     });

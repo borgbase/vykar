@@ -223,13 +223,13 @@ fn backup_leaves_derived_caches_at_the_new_state() {
         fx.backup(&fx.config, "s2");
 
         let repo = fx.open(&fx.cache(), false).unwrap();
-        let gen = repo.index_generation();
+        let generation = repo.index_generation();
         let id = repo.config.id.clone();
         let cd = fx.cache();
         let entries = fx.head().entries;
-        let full = MmapFullIndexCache::open(&id, gen, Some(&cd)).unwrap();
-        let dedup = MmapDedupCache::open(&id, gen, Some(&cd)).unwrap();
-        let restore = MmapRestoreCache::open(&id, gen, Some(&cd)).unwrap();
+        let full = MmapFullIndexCache::open(&id, generation, Some(&cd)).unwrap();
+        let dedup = MmapDedupCache::open(&id, generation, Some(&cd)).unwrap();
+        let restore = MmapRestoreCache::open(&id, generation, Some(&cd)).unwrap();
         assert_eq!(u64::from(full.entry_count()), entries);
         assert_eq!(u64::from(dedup.entry_count()), entries);
         assert_eq!(u64::from(restore.entry_count()), entries);
@@ -273,7 +273,7 @@ fn empty_session_rebuilds_derived_caches_from_the_full_cache() {
             .open_with(Box::new(storage), &cd, OpenOptions::new().with_index())
             .unwrap();
         let id = repo.config.id.clone();
-        let gen = repo.index_generation();
+        let generation = repo.index_generation();
         for path in [
             dedup_cache::dedup_cache_path(&id, Some(&cd)).unwrap(),
             dedup_cache::restore_cache_path(&id, Some(&cd)).unwrap(),
@@ -287,9 +287,9 @@ fn empty_session_rebuilds_derived_caches_from_the_full_cache() {
         repo.enable_tiered_dedup_mode();
         repo.save_state().unwrap();
 
-        assert_eq!(repo.index_generation(), gen);
-        assert!(MmapDedupCache::open(&id, gen, Some(&cd)).is_some());
-        assert!(MmapRestoreCache::open(&id, gen, Some(&cd)).is_some());
+        assert_eq!(repo.index_generation(), generation);
+        assert!(MmapDedupCache::open(&id, generation, Some(&cd)).is_some());
+        assert!(MmapRestoreCache::open(&id, generation, Some(&cd)).is_some());
         assert_eq!(sorted_entries(repo.chunk_index()), cold_index(&fx, "cold"));
     }
 }

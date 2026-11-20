@@ -58,8 +58,8 @@ impl Read for BackupSource {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let n = self.file.read(buf)?;
         #[cfg(test)]
-        if let Some(gen) = self.hook_generation {
-            test_hooks::fire_after_read(gen, n as u64);
+        if let Some(generation) = self.hook_generation {
+            test_hooks::fire_after_read(generation, n as u64);
         }
         Ok(n)
     }

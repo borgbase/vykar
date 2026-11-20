@@ -922,7 +922,7 @@ pub fn merge_delta_to_temp(
     let mut keyed: Vec<(ChunkId, u64)> = delta
         .refcount_bumps
         .iter()
-        .filter(|(_, &count)| count > 0)
+        .filter(|&(_, &count)| count > 0)
         .map(|(id, &count)| (*id, u64::from(count)))
         .collect();
     keyed.sort_unstable_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));

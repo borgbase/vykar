@@ -30,7 +30,7 @@ where
     F: FnMut(crate::commands::backup::BackupProgressEvent),
 {
     let start = std::time::Instant::now();
-    if let Some(ref mut cb) = progress {
+    if let Some(cb) = progress {
         cb(crate::commands::backup::BackupProgressEvent::CommitStage { stage });
     }
     (start, stage)
@@ -112,13 +112,13 @@ impl Repository {
     /// index could already hold a concurrent writer's newer generation, and
     /// "fixing" it to this older one would clobber it.
     pub(super) fn install_chunk_index(&mut self, index: (u64, ChunkIndex), sidecar: Option<u64>) {
-        let (gen, index) = index;
-        self.index_generation = gen;
+        let (generation, index) = index;
+        self.index_generation = generation;
         self.chunk_index = index;
         self.local_caches_stale = false;
-        if sidecar != Some(gen) && !self.is_segmented() {
+        if sidecar != Some(generation) && !self.is_segmented() {
             // Best-effort rewrite index.gen
-            let _ = self.storage.put("index.gen", &gen.to_le_bytes());
+            let _ = self.storage.put("index.gen", &generation.to_le_bytes());
         }
         self.rebase_pack_target_from_index();
     }
@@ -369,8 +369,9 @@ impl Repository {
                 // Try to rebuild caches from full_index_cache if available.
                 let mut rebuilt_from_cache = false;
                 let cd = self.cache_dir_override.as_deref();
-                let gen = self.index_generation;
-                if let Some(full) = dedup_cache::MmapFullIndexCache::open(&self.config.id, gen, cd)
+                let generation = self.index_generation;
+                if let Some(full) =
+                    dedup_cache::MmapFullIndexCache::open(&self.config.id, generation, cd)
                 {
                     let id = &self.config.id;
                     let dedup_ok =
@@ -1240,7 +1241,7 @@ impl Repository {
     ) -> Result<()> {
         use crate::commands::backup::BackupProgressEvent;
 
-        if let Some(ref mut cb) = progress {
+        if let Some(cb) = progress {
             cb(BackupProgressEvent::CommitStage {
                 stage: "index unchanged, fast path",
             });

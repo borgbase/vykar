@@ -304,7 +304,7 @@ pub(crate) fn emit_post_commit_warning<F: FnMut(BackupProgressEvent)>(
     msg: String,
 ) {
     warn!("{msg}");
-    if let Some(ref mut cb) = progress {
+    if let Some(cb) = progress {
         cb(BackupProgressEvent::Warning { message: msg });
     }
 }

@@ -712,14 +712,15 @@ fn restore_resolves_data_chunks_via_restore_cache_without_index() {
 fn write_cache_without(
     repo_dir: &std::path::Path,
     repo_id: &[u8],
-    gen: u64,
+    generation: u64,
     drop_id: &vykar_types::chunk_id::ChunkId,
 ) {
     let mut index = open_local_repo(repo_dir, None).chunk_index().clone();
     assert!(index.remove(drop_id).is_some());
     let cache_path =
         vykar_core::index::dedup_cache::restore_cache_path(repo_id, None).expect("cache path");
-    vykar_core::index::dedup_cache::build_restore_cache_to_path(&index, gen, &cache_path).unwrap();
+    vykar_core::index::dedup_cache::build_restore_cache_to_path(&index, generation, &cache_path)
+        .unwrap();
 }
 
 #[test]

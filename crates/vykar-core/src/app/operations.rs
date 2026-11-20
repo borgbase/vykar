@@ -300,7 +300,7 @@ fn run_backup_sources(
                 verbose,
             };
 
-            if let Some(ref mut cb) = on_event {
+            if let Some(cb) = on_event {
                 let mut backup_cb = |bpe| {
                     cb(BackupRunEvent::Backup(bpe));
                 };
@@ -443,7 +443,7 @@ fn drain_backup_warnings(
     on_event: &mut Option<&mut dyn FnMut(BackupRunEvent)>,
     scope: &HookScope,
 ) {
-    if let Some(ref mut cb) = on_event {
+    if let Some(cb) = on_event {
         for warning in ctx.warnings.drain(..) {
             cb(BackupRunEvent::HookWarning {
                 scope: scope.clone(),

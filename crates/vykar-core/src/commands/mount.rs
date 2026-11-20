@@ -151,7 +151,7 @@ fn insert_into_tree(children: &mut HashMap<String, VfsNode>, components: &[&str]
             meta: VfsMeta::dir_default(),
         });
         if let VfsNode::Dir {
-            children: ref mut dir_children,
+            children: dir_children,
             ..
         } = entry
         {

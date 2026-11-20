@@ -722,7 +722,7 @@ mod tests {
                 .set_modified(old)
                 .unwrap();
         }
-        let gen = repo.index_generation;
+        let generation = repo.index_generation;
         drop(repo);
 
         let open = || {
@@ -739,7 +739,9 @@ mod tests {
         assert!(!stale_temp.exists());
         assert!(!stale_legacy.exists());
         assert!(fresh_temp.exists());
-        assert!(dedup_cache::MmapFullIndexCache::open(&id, gen, Some(cache.path())).is_some());
+        assert!(
+            dedup_cache::MmapFullIndexCache::open(&id, generation, Some(cache.path())).is_some()
+        );
         assert!(CachedIndexBlob::open(&id, Some(cache.path())).is_some());
 
         // The cache dir is swept on every open, not rate-limited.
@@ -758,21 +760,21 @@ mod tests {
         let (inner, repo) = repo_with_caches(cache.path());
         let cd = Some(cache.path());
         let stored = inner.get("index").unwrap().unwrap();
-        let (gen, decoded) =
+        let (generation, decoded) =
             Repository::decode_full_index(Some(stored.clone()), repo.crypto.as_ref()).unwrap();
-        assert_eq!(gen, repo.index_generation);
+        assert_eq!(generation, repo.index_generation);
         assert_eq!(decoded.len(), 3);
 
         let cached = CachedIndexBlob::open(&repo.config.id, cd).unwrap();
         let ((g, index), source) = repo.index_from_object(IndexObject::Cached(cached)).unwrap();
         assert_eq!(source, IndexSource::FullCache);
-        assert_eq!((g, entries(&index)), (gen, entries(&decoded)));
+        assert_eq!((g, entries(&index)), (generation, entries(&decoded)));
 
         let ((g, index), source) = repo
             .index_from_object(IndexObject::Remote(Some(stored.clone())))
             .unwrap();
         assert_eq!(source, IndexSource::FullCache);
-        assert_eq!((g, entries(&index)), (gen, entries(&decoded)));
+        assert_eq!((g, entries(&index)), (generation, entries(&decoded)));
 
         // Another client rewrites the index: decoded, not taken from the full cache.
         let other_cache = tempfile::tempdir().unwrap();
@@ -815,19 +817,19 @@ mod tests {
         )
         .unwrap();
         let stored = inner.get("index").unwrap().unwrap();
-        let (gen, decoded) =
+        let (generation, decoded) =
             Repository::decode_full_index(Some(stored.clone()), repo.crypto.as_ref()).unwrap();
 
         let cached = CachedIndexBlob::open(&repo.config.id, cd).unwrap();
         let ((g, index), source) = repo.index_from_object(IndexObject::Cached(cached)).unwrap();
         assert_eq!(source, IndexSource::Decoded);
-        assert_eq!((g, entries(&index)), (gen, entries(&decoded)));
+        assert_eq!((g, entries(&index)), (generation, entries(&decoded)));
 
         let ((g, index), source) = repo
             .index_from_object(IndexObject::Remote(Some(stored)))
             .unwrap();
         assert_eq!(source, IndexSource::Decoded);
-        assert_eq!((g, entries(&index)), (gen, entries(&decoded)));
+        assert_eq!((g, entries(&index)), (generation, entries(&decoded)));
     }
 
     /// Pins the plaintext chunk-ID key derivation for both formats, through

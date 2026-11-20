@@ -457,7 +457,9 @@ mod tests {
     /// repository, because the failure this must catch was introduced by
     /// changing which variant that open returns — a hand-written
     /// `Err(DecryptionFailed)` stub would have kept passing throughout.
-    fn open_with(repo_dir: &std::path::Path) -> impl FnMut(Option<&str>) -> Result<(), VykarError> {
+    fn open_with(
+        repo_dir: &std::path::Path,
+    ) -> impl FnMut(Option<&str>) -> Result<(), VykarError> + use<> {
         let repo_dir = repo_dir.to_path_buf();
         move |pass: Option<&str>| {
             let storage = Box::new(

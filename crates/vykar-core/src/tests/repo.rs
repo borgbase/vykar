@@ -1292,6 +1292,6 @@ fn open_rewrites_index_gen_only_when_stale() {
     let (repo, puts) = open_logging_puts(&repo_dir);
     assert_eq!(repo.index_generation(), real_gen);
     assert!(puts.iter().any(|k| k == "index.gen"), "{puts:?}");
-    let gen = std::fs::read(repo_dir.join("index.gen")).unwrap();
-    assert_eq!(u64::from_le_bytes(gen.try_into().unwrap()), real_gen);
+    let gen_bytes = std::fs::read(repo_dir.join("index.gen")).unwrap();
+    assert_eq!(u64::from_le_bytes(gen_bytes.try_into().unwrap()), real_gen);
 }

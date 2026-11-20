@@ -136,7 +136,7 @@ impl CachedBumps {
         self.counts
             .iter()
             .enumerate()
-            .filter(|(_, &count)| count != 0)
+            .filter(|&(_, &count)| count != 0)
             .map(|(position, &count)| (self.cache.chunk_id_at(position as u32), count))
     }
 }

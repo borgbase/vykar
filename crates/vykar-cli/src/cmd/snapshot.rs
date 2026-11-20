@@ -45,7 +45,7 @@ pub(crate) fn run_snapshot_command(
             })?;
 
             // Apply path filter (empty filter after normalization means "all items")
-            if let Some(ref raw_path) = path {
+            if let Some(raw_path) = path {
                 let filter = normalize_path_filter(raw_path);
                 if !filter.is_empty() {
                     items.retain(|item| path_matches_filter(&item.path, &filter));

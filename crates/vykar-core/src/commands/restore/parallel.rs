@@ -333,7 +333,7 @@ fn lightest_bucket(bucket_bytes: &[u64]) -> usize {
     bucket_bytes
         .iter()
         .enumerate()
-        .min_by_key(|(_, &b)| b)
+        .min_by_key(|&(_, &b)| b)
         .map_or(0, |(i, _)| i)
 }
 

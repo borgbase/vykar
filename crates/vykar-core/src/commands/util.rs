@@ -248,8 +248,8 @@ pub fn with_open_repo_maintenance_lock<T>(
 /// in the blocking list — maintenance will not proceed past them without
 /// operator intervention (`break-lock --sessions`).
 ///
-/// After the action, still under the lock, refreshes this machine's existing
-/// local index caches if the action persisted the index (see
+/// After the action, before the lock is released, refreshes this machine's
+/// existing local index caches if the action persisted the index (see
 /// `Repository::refresh_stale_local_caches`).
 pub fn with_maintenance_lock<T>(
     repo: &mut Repository,
@@ -307,7 +307,9 @@ pub fn with_maintenance_lock<T>(
     // Session checks passed — hand off to the shared fence/flush/release epilogue.
     run_under_fence(repo, guard, |repo| {
         let result = action(repo);
-        // Still under the lock: local cache writers share temp-file names.
+        // Before the release: a backup on this machine that starts once the
+        // lock is free then finds the caches at the generation just written,
+        // and its commit does not race this rebuild for the same cache files.
         repo.refresh_stale_local_caches();
         result
     })

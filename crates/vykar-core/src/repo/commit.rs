@@ -973,23 +973,21 @@ impl Repository {
 
     /// Rebuild the local full/dedup/restore caches after a maintenance
     /// operation persisted the index (see `local_caches_stale`). Local and
-    /// best-effort; call it before the repository lock is released, since
-    /// every local cache writer shares fixed temp-file names (skipped if the
-    /// lock fence no longer holds). Only refreshes
-    /// caches this machine already keeps (an existing `full_index_cache`),
-    /// and only while `chunk_index` is exactly the persisted index
-    /// (`!index_dirty`, no write session).
+    /// best-effort, and safe without the repository lock: every cache writer
+    /// renames a uniquely named temp file into place, and each cache carries
+    /// the generation of the index it holds. A copy that a concurrent process
+    /// outdates is a miss for anything that promotes it to the index, and at
+    /// worst an older consistent view for the dedup and restore readers that
+    /// go by the `index.gen` hint, which commit and read verification catch.
+    /// Only refreshes caches this machine already keeps (an existing
+    /// `full_index_cache`), and only while `chunk_index` is exactly the
+    /// persisted index (`!index_dirty`, no write session).
     pub(crate) fn refresh_stale_local_caches(&mut self) {
         if !self.local_caches_stale || self.index_dirty || self.write_session.is_some() {
             return;
         }
         let cd = self.cache_dir_override.as_deref();
         if !dedup_cache::full_index_cache_path(&self.config.id, cd).is_some_and(|p| p.exists()) {
-            return;
-        }
-        // The lock is what keeps other cache writers off the shared temp files.
-        if let Err(e) = self.check_lock_fence() {
-            warn!("skipping local cache rebuild, repository lock not confirmed: {e}");
             return;
         }
         let start = std::time::Instant::now();

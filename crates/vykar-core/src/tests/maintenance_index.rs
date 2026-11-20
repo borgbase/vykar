@@ -20,7 +20,7 @@ use crate::index::dedup_cache::{self, MmapDedupCache, MmapFullIndexCache, MmapRe
 use crate::index::ChunkIndexEntry;
 use crate::repo::{OpenOptions, Repository};
 
-use super::helpers::{backup_single_source, init_repo_v3, source_entry};
+use super::helpers::{backup_single_source, init_repo, init_repo_v3, source_entry};
 
 const FAST: &str = "index unchanged, fast path";
 const SLOW: &str = "decode index";
@@ -100,12 +100,21 @@ struct Env {
 }
 
 impl Env {
-    /// An empty repository; this client's caches live in a private dir.
+    /// An empty v3 repository; this client's caches live in a private dir.
     fn new() -> Self {
+        Self::with_init(init_repo_v3)
+    }
+
+    /// As [`Env::new`], at the current (segmented) format.
+    fn segmented() -> Self {
+        Self::with_init(init_repo)
+    }
+
+    fn with_init(init: fn(&Path) -> VykarConfig) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let repo_dir = dir.path().join("repo");
         let cache_dir = dir.path().join("cache");
-        let mut config = init_repo_v3(&repo_dir);
+        let mut config = init(&repo_dir);
         config.cache_dir = Some(cache_dir.to_string_lossy().into_owned());
         config.retention = RetentionConfig {
             keep_last: Some(1),
@@ -412,6 +421,101 @@ fn lock_lost_before_save_leaves_caches_untouched() {
 
     assert_eq!(caches_at(&id, &env.cache_dir, generation), [true; 3]);
     assert_eq!(env.open_fresh().index_generation(), generation);
+}
+
+/// Changes a refcount and persists the index; call under the maintenance lock.
+fn bump_and_save(repo: &mut Repository) -> Result<()> {
+    repo.load_chunk_index_under_lock()?;
+    let first = *repo.chunk_index().iter().next().unwrap().0;
+    repo.chunk_index_mut().increment_refcount(&first);
+    repo.save_state()
+}
+
+fn delete_locks(repo: &Repository) {
+    for key in repo.storage.list("locks/").unwrap() {
+        if key.ends_with(".json") {
+            repo.storage.delete(&key).unwrap();
+        }
+    }
+}
+
+/// Persists a refcount change under the maintenance lock, then loses the
+/// lock before the action returns. Returns the generation before and after.
+fn save_then_lose_lock(env: &Env) -> (u64, u64) {
+    let before = env.open_fresh().index_generation();
+    let mut repo = env.open(env.local(), OpenOptions::new());
+    with_maintenance_lock(&mut repo, |repo| {
+        bump_and_save(repo)?;
+        delete_locks(repo);
+        Ok(())
+    })
+    .unwrap();
+    drop(repo);
+    (before, env.open_fresh().index_generation())
+}
+
+#[test]
+fn lock_lost_after_save_still_refreshes_caches() {
+    let env = Env::new();
+    let src = env.source("a", &[("one.bin", 0x11)]);
+    env.backup(&src, "a", "s1");
+    let id = env.open_fresh().config.id.clone();
+
+    let (before, after) = save_then_lose_lock(&env);
+    assert_ne!(before, after);
+    assert_eq!(caches_at(&id, &env.cache_dir, after), [true; 3]);
+}
+
+#[test]
+fn lock_lost_after_save_still_refreshes_caches_segmented() {
+    let env = Env::segmented();
+    let src = env.source("a", &[("one.bin", 0x11)]);
+    env.backup(&src, "a", "s1");
+    let id = env.open_fresh().config.id.clone();
+
+    let (before, after) = save_then_lose_lock(&env);
+    assert_ne!(before, after);
+    assert_eq!(caches_at(&id, &env.cache_dir, after), [true; 3]);
+}
+
+/// After losing the lock, another writer on this host persists a newer index
+/// and refreshes the caches; our late refresh then replaces them with caches
+/// at our older generation, which every open and commit must miss.
+#[test]
+fn late_refresh_after_takeover_is_a_cache_miss() {
+    let env = Env::new();
+    let src = env.source("a", &[("one.bin", 0x11)]);
+    env.backup(&src, "a", "s1");
+
+    let mut repo = env.open(env.local(), OpenOptions::new());
+    let ours = with_maintenance_lock(&mut repo, |repo| {
+        bump_and_save(repo)?;
+        let ours = repo.index_generation();
+        delete_locks(repo);
+        let mut other = env.open(env.local(), OpenOptions::new());
+        with_maintenance_lock(&mut other, bump_and_save)?;
+        Ok(ours)
+    })
+    .unwrap();
+    drop(repo);
+
+    let remote = env.open_fresh();
+    let id = remote.config.id.clone();
+    assert_ne!(ours, remote.index_generation());
+    assert_eq!(caches_at(&id, &env.cache_dir, ours), [true; 3]);
+    assert_eq!(
+        caches_at(&id, &env.cache_dir, remote.index_generation()),
+        [false; 3]
+    );
+
+    let own = env.open(env.local(), OpenOptions::new().with_index());
+    assert_eq!(own.index_generation(), remote.index_generation());
+    assert_eq!(entries(&own), entries(&remote));
+    drop(own);
+
+    fs::write(src.join("two.bin"), vec![0x22u8; 64 * 1024]).unwrap();
+    let stages = env.backup(&src, "a", "s2");
+    assert!(stages.contains(&SLOW), "expected slow path: {stages:?}");
 }
 
 // --- (C) index loaded under the maintenance lock ---

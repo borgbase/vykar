@@ -351,13 +351,20 @@ fn decode_metadata_msgpack_inner<T: serde::de::DeserializeOwned>(data: &[u8]) ->
 }
 
 /// A streaming reader over a ZSTD-tagged metadata payload, limited to the
-/// metadata size bound. Errors on any other codec tag. The caller must read
-/// to the end to detect a truncated frame.
+/// metadata size bound. Empty input and the other known codec tags are
+/// `Decompression` errors; a tag no codec has is `UnknownCompressionTag`.
+/// The caller must read to the end to detect a truncated frame.
 pub(crate) fn zstd_metadata_reader(data: &[u8]) -> Result<impl Read + '_> {
-    let Some((&TAG_ZSTD, frame)) = data.split_first() else {
-        return Err(VykarError::Decompression(
-            "expected a zstd-compressed payload".into(),
-        ));
+    let frame = match data.split_first() {
+        Some((&TAG_ZSTD, frame)) => frame,
+        Some((&tag, _)) if tag != TAG_NONE && tag != TAG_LZ4 => {
+            return Err(VykarError::UnknownCompressionTag(tag));
+        }
+        _ => {
+            return Err(VykarError::Decompression(
+                "expected a zstd-compressed payload".into(),
+            ));
+        }
     };
     let decoder = zstd::stream::Decoder::with_buffer(frame)
         .map_err(|e| VykarError::Decompression(format!("zstd init: {e}")))?;
@@ -1005,5 +1012,69 @@ mod tests {
             VykarError::Decompression(msg) => assert_eq!(msg, "empty data"),
             other => panic!("expected Decompression error, got: {other}"),
         }
+    }
+
+    #[test]
+    fn zstd_metadata_reader_reads_a_frame_and_rejects_it_truncated() {
+        let payload: Vec<u8> = (0..200_000u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8)
+            .collect();
+        let mut compressed = Vec::new();
+        compress_stream_zstd(&mut compressed, 3, |w| {
+            std::io::Write::write_all(w, &payload)?;
+            Ok(())
+        })
+        .unwrap();
+
+        let mut out = Vec::new();
+        zstd_metadata_reader(&compressed)
+            .unwrap()
+            .read_to_end(&mut out)
+            .unwrap();
+        assert_eq!(out, payload);
+
+        for cut in [compressed.len() / 2, compressed.len() - 1] {
+            let mut out = Vec::new();
+            let read = zstd_metadata_reader(&compressed[..cut])
+                .unwrap()
+                .read_to_end(&mut out);
+            assert!(read.is_err(), "cut at {cut} must fail");
+            assert!(decompress_metadata(&compressed[..cut]).is_err());
+        }
+    }
+
+    #[test]
+    fn zstd_metadata_reader_rejects_other_codecs() {
+        let none = compress(Compression::None, b"x").unwrap();
+        let lz4 = compress(Compression::Lz4, b"x").unwrap();
+        for data in [&[][..], &none, &lz4] {
+            assert!(matches!(
+                zstd_metadata_reader(data),
+                Err(VykarError::Decompression(_))
+            ));
+        }
+        assert!(matches!(
+            zstd_metadata_reader(&[0xEE, 1, 2, 3]),
+            Err(VykarError::UnknownCompressionTag(0xEE))
+        ));
+    }
+
+    #[test]
+    fn limited_read_fails_once_past_its_limit() {
+        let mut out = Vec::new();
+        let at_limit = LimitedRead {
+            inner: &[7u8; 10][..],
+            left: 10,
+        }
+        .read_to_end(&mut out);
+        assert_eq!(at_limit.unwrap(), 10);
+
+        let err = LimitedRead {
+            inner: &[7u8; 10][..],
+            left: 9,
+        }
+        .read_to_end(&mut Vec::new())
+        .unwrap_err();
+        assert!(err.to_string().contains("exceeds limit"), "got {err}");
     }
 }

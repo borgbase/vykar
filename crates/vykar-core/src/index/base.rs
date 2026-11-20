@@ -215,7 +215,10 @@ fn decode_base_inner<R: Read>(
     if referenced.iter().any(|r| !r) {
         return Err(invalid("unreferenced pack table entry"));
     }
-    if !r.fill_buf()?.is_empty() {
+    let rest = r
+        .fill_buf()
+        .map_err(|e| invalid(format!("after the records: {e}")))?;
+    if !rest.is_empty() {
         return Err(invalid("trailing bytes"));
     }
     w.finish(None)

@@ -1797,6 +1797,103 @@ fn headless_rebuild_refuses_an_unknown_compression() {
     }
 }
 
+/// [`headless_rebuild_refuses_an_unknown_compression`] for a base.
+#[test]
+fn headless_rebuild_refuses_a_base_with_an_unknown_compression() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = base_cache(dir.path());
+    let mut body = Vec::new();
+    base::encode_base(&cache, &mut body).unwrap();
+    let mut payload = vec![0xEE];
+    payload.extend_from_slice(&body);
+    for crypto in [plaintext(), encrypted()] {
+        let (mem, mut w) = writer(&crypto);
+        w.commit(&index_with(0..40, 0));
+        let (base_ref, bytes) = base_object(crypto.as_ref(), &payload, &cache);
+        mem.put(&object_key(&base_ref.name), &bytes).unwrap();
+        let msg = refused(mem.as_ref(), crypto.as_ref());
+        assert!(msg.contains("written by a newer vykar"), "{msg}");
+        assert!(msg.contains("tag 238"), "{msg}");
+        assert!(msg.contains(&base_ref.name.to_hex()), "{msg}");
+    }
+}
+
+/// The full cache of `index_with(0..40, 0)`, in `dir`.
+fn base_cache(dir: &Path) -> MmapFullIndexCache {
+    let path = dir.join("cache");
+    build_full_index_cache_to_path(&index_with(0..40, 0), 1, &path).unwrap();
+    MmapFullIndexCache::open_verified(&path).unwrap()
+}
+
+/// The zstd payload (codec tag included) of `cache`'s base.
+fn zstd_base_payload(cache: &MmapFullIndexCache) -> Vec<u8> {
+    let mut payload = Vec::new();
+    compress::compress_stream_zstd(&mut payload, 3, |w| base::encode_base(cache, w)).unwrap();
+    payload
+}
+
+/// A named base object whose payload is `payload` (codec tag included), and its ref.
+fn base_object(
+    crypto: &dyn CryptoEngine,
+    payload: &[u8],
+    cache: &MmapFullIndexCache,
+) -> (BaseRef, Vec<u8>) {
+    let bytes =
+        pack_object_with_context(ObjectType::IndexBase, BASE_CONTEXT, payload, crypto).unwrap();
+    let base_ref = BaseRef {
+        name: ObjectName::of(&bytes),
+        size: bytes.len() as u64,
+        state_hash: cache.state_hash(),
+        entries: u64::from(cache.entry_count()),
+    };
+    (base_ref, bytes)
+}
+
+/// Decode `payload` as a stored base in an empty dir; the error and whether
+/// the dir is still empty afterwards.
+fn decode_base_payload(
+    crypto: &dyn CryptoEngine,
+    payload: &[u8],
+    cache: &MmapFullIndexCache,
+) -> (Result<TempPath>, bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let (base_ref, bytes) = base_object(crypto, payload, cache);
+    let out = decode_base_to_temp(&base_ref, bytes, crypto, &dir.path().join("anchor"));
+    let empty = std::fs::read_dir(dir.path()).unwrap().next().is_none();
+    (out, empty)
+}
+
+#[test]
+fn base_with_a_truncated_zstd_frame_is_object_damage() {
+    let cache_dir = tempfile::tempdir().unwrap();
+    let cache = base_cache(cache_dir.path());
+    let payload = zstd_base_payload(&cache);
+    for crypto in [plaintext(), encrypted()] {
+        let (ok, _) = decode_base_payload(crypto.as_ref(), &payload, &cache);
+        ok.unwrap();
+        for cut in [payload.len() / 2, payload.len() - 1] {
+            let (out, empty) = decode_base_payload(crypto.as_ref(), &payload[..cut], &cache);
+            let e = out.unwrap_err();
+            assert!(is_object_damage(&e), "cut at {cut}: {e:?}");
+            assert!(empty, "cut at {cut}: a temp file was left behind");
+        }
+    }
+}
+
+#[test]
+fn base_with_bytes_after_its_zstd_frame_is_object_damage() {
+    let cache_dir = tempfile::tempdir().unwrap();
+    let cache = base_cache(cache_dir.path());
+    let mut payload = zstd_base_payload(&cache);
+    payload.push(0x00);
+    for crypto in [plaintext(), encrypted()] {
+        let (out, empty) = decode_base_payload(crypto.as_ref(), &payload, &cache);
+        let e = out.unwrap_err();
+        assert!(is_object_damage(&e), "{e:?}");
+        assert!(empty, "a temp file was left behind");
+    }
+}
+
 /// A listed object that is gone at GET time is skipped as damage.
 #[test]
 fn headless_rebuild_skips_a_listed_object_that_is_gone() {

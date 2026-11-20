@@ -92,12 +92,13 @@ fn take_env_passphrase() -> Option<Zeroizing<String>> {
         .filter(|s| !s.is_empty());
     if val.is_some() {
         // SAFETY: `remove_var` is unsound while another thread reads or
-        // writes the environment. One-shot CLI commands and daemon startup
+        // writes the environment. Single-repo CLI commands and daemon startup
         // (`load_daemon_config`) get here before spawning threads, and the
         // cache above makes every later call return early. Not guaranteed in
-        // the GUI, which resolves passphrases on its worker thread while the
-        // UI thread runs, nor for a daemon whose first env lookup comes after
-        // a SIGHUP reload.
+        // the GUI (passphrases resolve on its worker thread while the UI
+        // thread runs), in multi-repo CLI runs (an earlier repo may already
+        // have started the storage runtime), or for a daemon whose first env
+        // lookup comes after a SIGHUP reload.
         #[allow(unsafe_code)]
         unsafe {
             std::env::remove_var("VYKAR_PASSPHRASE");

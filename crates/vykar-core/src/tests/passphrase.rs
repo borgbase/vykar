@@ -1,8 +1,6 @@
 // Test-only env mutation; SAFETY documented per block.
 #![allow(unsafe_code)]
 
-use std::sync::Mutex;
-
 use zeroize::Zeroizing;
 
 use crate::app::passphrase::{
@@ -13,11 +11,10 @@ use crate::config::EncryptionModeConfig;
 use vykar_types::error::VykarError;
 
 use super::helpers::make_test_config;
-
-static ENV_LOCK: Mutex<()> = Mutex::new(());
+use crate::testutil::CWD_LOCK;
 
 fn set_vykar_passphrase(value: Option<&str>) {
-    // SAFETY: callers serialize on `ENV_LOCK` so no other test thread is
+    // SAFETY: callers serialize on `CWD_LOCK`, like every other env-mutating test, so no other test thread is
     // reading/writing env concurrently for the duration of this mutation.
     unsafe {
         match value {
@@ -40,7 +37,7 @@ fn print_script(text: &str) -> String {
 
 #[test]
 fn resolve_passphrase_returns_none_when_encryption_mode_is_none() {
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = CWD_LOCK.lock().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let repo_dir = tmp.path().join("repo");
     std::fs::create_dir_all(&repo_dir).unwrap();
@@ -63,7 +60,7 @@ fn resolve_passphrase_returns_none_when_encryption_mode_is_none() {
 
 #[test]
 fn resolve_passphrase_uses_expected_precedence() {
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = CWD_LOCK.lock().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let repo_dir = tmp.path().join("repo");
     std::fs::create_dir_all(&repo_dir).unwrap();
@@ -103,7 +100,7 @@ fn resolve_passphrase_uses_expected_precedence() {
 
 #[test]
 fn resolve_passphrase_surfaces_passcommand_failure() {
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = CWD_LOCK.lock().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let repo_dir = tmp.path().join("repo");
     std::fs::create_dir_all(&repo_dir).unwrap();
@@ -124,7 +121,7 @@ fn resolve_passphrase_surfaces_passcommand_failure() {
 #[cfg(not(windows))]
 #[test]
 fn resolve_passphrase_passcommand_handles_shell_quoting() {
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = CWD_LOCK.lock().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let repo_dir = tmp.path().join("repo");
     std::fs::create_dir_all(&repo_dir).unwrap();
@@ -145,7 +142,7 @@ fn resolve_passphrase_passcommand_handles_shell_quoting() {
 #[cfg(not(windows))]
 #[test]
 fn resolve_passphrase_passcommand_gets_null_stdin() {
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = CWD_LOCK.lock().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let repo_dir = tmp.path().join("repo");
     std::fs::create_dir_all(&repo_dir).unwrap();
@@ -171,7 +168,7 @@ fn resolve_passphrase_passcommand_gets_null_stdin() {
 
 #[test]
 fn resolve_passphrase_passes_prompt_context() {
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = CWD_LOCK.lock().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let repo_dir = tmp.path().join("repo");
     std::fs::create_dir_all(&repo_dir).unwrap();
@@ -204,7 +201,7 @@ fn counting_passcommand(marker: &std::path::Path, value: &str) -> String {
 #[cfg(not(windows))]
 #[test]
 fn init_reuses_the_probed_configured_passphrase_without_rerunning_passcommand() {
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = CWD_LOCK.lock().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let repo_dir = tmp.path().join("repo");
     std::fs::create_dir_all(&repo_dir).unwrap();
@@ -237,7 +234,7 @@ fn init_reuses_the_probed_configured_passphrase_without_rerunning_passcommand() 
 
 #[test]
 fn init_uses_env_passphrase_without_prompting() {
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = CWD_LOCK.lock().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let repo_dir = tmp.path().join("repo");
     std::fs::create_dir_all(&repo_dir).unwrap();
@@ -258,7 +255,7 @@ fn init_uses_env_passphrase_without_prompting() {
 
 #[test]
 fn init_confirms_an_interactively_entered_passphrase() {
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = CWD_LOCK.lock().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let repo_dir = tmp.path().join("repo");
     std::fs::create_dir_all(&repo_dir).unwrap();
@@ -283,7 +280,7 @@ fn init_confirms_an_interactively_entered_passphrase() {
 
 #[test]
 fn init_rejects_empty_and_mismatched_passphrases() {
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = CWD_LOCK.lock().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let repo_dir = tmp.path().join("repo");
     std::fs::create_dir_all(&repo_dir).unwrap();
@@ -311,7 +308,7 @@ fn init_rejects_empty_and_mismatched_passphrases() {
 
 #[test]
 fn init_rejects_an_empty_configured_passphrase() {
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = CWD_LOCK.lock().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let repo_dir = tmp.path().join("repo");
     std::fs::create_dir_all(&repo_dir).unwrap();
@@ -333,7 +330,7 @@ fn init_rejects_an_empty_configured_passphrase() {
 
 #[test]
 fn init_rejects_an_empty_pre_resolved_passphrase() {
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = CWD_LOCK.lock().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let repo_dir = tmp.path().join("repo");
     std::fs::create_dir_all(&repo_dir).unwrap();
@@ -357,7 +354,7 @@ fn init_rejects_an_empty_pre_resolved_passphrase() {
 
 #[test]
 fn init_cancellation_of_either_prompt_is_not_an_error() {
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = CWD_LOCK.lock().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let repo_dir = tmp.path().join("repo");
     std::fs::create_dir_all(&repo_dir).unwrap();
@@ -380,7 +377,7 @@ fn init_cancellation_of_either_prompt_is_not_an_error() {
 
 #[test]
 fn init_needs_no_passphrase_for_an_unencrypted_repo() {
-    let _lock = ENV_LOCK.lock().unwrap();
+    let _lock = CWD_LOCK.lock().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let repo_dir = tmp.path().join("repo");
     std::fs::create_dir_all(&repo_dir).unwrap();

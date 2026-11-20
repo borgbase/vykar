@@ -24,6 +24,8 @@ use vykar_storage::local_backend::LocalBackend;
 use vykar_types::hash::HashAlgorithm;
 use vykar_types::pack_id::PackId;
 
+pub mod fixtures;
+
 static TEST_ENV_INIT: Once = Once::new();
 
 /// Point `HOME`/`XDG_CACHE_HOME` at a per-process temp directory so tests never

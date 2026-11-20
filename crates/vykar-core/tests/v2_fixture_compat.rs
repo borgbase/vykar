@@ -18,144 +18,25 @@
 
 mod common;
 
-use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
-
 use vykar_core::commands;
-use vykar_core::config::{EncryptionModeConfig, VykarConfig};
 use vykar_core::repo::file_cache::FileCache;
-use vykar_core::repo::{identity, EncryptionMode, OpenOptions, Repository};
+use vykar_core::repo::{identity, OpenOptions, Repository};
 use vykar_storage::local_backend::LocalBackend;
 
-use crate::common::{backup_source, exercise_pack_naming, make_test_config};
+use crate::common::fixtures::{self, read_tree, Fixture};
+use crate::common::{backup_source, exercise_pack_naming};
 use vykar_types::hash::HashAlgorithm;
 
 /// One fixture per encryption mode.
 const MODES: &[&str] = &["none", "aes256gcm", "chacha20poly1305"];
 
-struct Fixture {
-    /// Kept alive for the duration of the test.
-    _tmp: tempfile::TempDir,
-    root: PathBuf,
-    mode: String,
-    passphrase: Option<String>,
-    snapshots: Vec<String>,
-    /// The identity fingerprint the pre-change binary computed for this repo.
-    pin_fingerprint: String,
-}
-
-impl Fixture {
-    fn repo_dir(&self) -> PathBuf {
-        self.root.join("repo")
-    }
-    fn source_dir(&self) -> PathBuf {
-        self.root.join("source")
-    }
-    fn cache_dir(&self) -> PathBuf {
-        self.root.join("cache")
-    }
-    fn passphrase(&self) -> Option<&str> {
-        self.passphrase.as_deref()
-    }
-    /// The snapshot the fixture's `source/` tree corresponds to (the last one).
-    fn latest_snapshot(&self) -> &str {
-        self.snapshots.last().unwrap()
-    }
-
-    fn config(&self) -> VykarConfig {
-        let mut config = make_test_config(&self.repo_dir());
-        config.cache_dir = Some(self.cache_dir().to_string_lossy().into_owned());
-        config.encryption.mode = match self.mode.as_str() {
-            "none" => EncryptionModeConfig::None,
-            "aes256gcm" => EncryptionModeConfig::Aes256Gcm,
-            "chacha20poly1305" => EncryptionModeConfig::Chacha20Poly1305,
-            other => panic!("unknown fixture encryption mode {other}"),
-        };
-        config
-    }
-
-    fn expected_encryption(&self) -> EncryptionMode {
-        match self.mode.as_str() {
-            "none" => EncryptionMode::None,
-            "aes256gcm" => EncryptionMode::Aes256Gcm,
-            "chacha20poly1305" => EncryptionMode::Chacha20Poly1305,
-            other => panic!("unknown fixture encryption mode {other}"),
-        }
-    }
-
-    fn open(&self) -> Repository {
-        let storage = Box::new(LocalBackend::new(self.repo_dir().to_str().unwrap()).unwrap());
-        Repository::open(
-            storage,
-            self.passphrase(),
-            Some(self.cache_dir()),
-            OpenOptions::new().with_index(),
-        )
-        .unwrap()
-    }
-}
-
 fn extract(mode: &str) -> Fixture {
-    common::init_test_environment();
-
-    let archive = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("fixtures")
-        .join(format!("v2-{mode}.tar.gz"));
-    let tmp = tempfile::tempdir().unwrap();
-    let file = std::fs::File::open(&archive)
-        .unwrap_or_else(|e| panic!("open fixture {}: {e}", archive.display()));
-    tar::Archive::new(flate2::read::GzDecoder::new(file))
-        .unpack(tmp.path())
-        .unwrap();
-
-    let meta: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(tmp.path().join("meta.json")).unwrap()).unwrap();
-    assert_eq!(meta["format_version"].as_u64(), Some(2));
-
-    let root = tmp.path().to_path_buf();
-    Fixture {
-        _tmp: tmp,
-        root,
-        mode: mode.to_string(),
-        passphrase: meta["passphrase"].as_str().map(str::to_string),
-        snapshots: meta["snapshots"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_str().unwrap().to_string())
-            .collect(),
-        pin_fingerprint: meta["pin_fingerprint"].as_str().unwrap().to_string(),
-    }
+    fixtures::extract("v2", mode, 2)
 }
 
-fn digest_hex(data: &[u8]) -> String {
-    use blake2::{Blake2b256, Digest};
-    let mut hasher = Blake2b256::new();
-    hasher.update(data);
-    hex::encode(hasher.finalize())
-}
-
-/// Every regular file under `root`, keyed by its path relative to `root` and
-/// summarised as `(length, BLAKE2b-256 hex)` so a mismatch prints a diff a
-/// human can read rather than megabytes of bytes.
-fn read_tree(root: &Path) -> BTreeMap<PathBuf, (u64, String)> {
-    let mut out = BTreeMap::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        for entry in std::fs::read_dir(&dir).unwrap() {
-            let entry = entry.unwrap();
-            let path = entry.path();
-            if entry.file_type().unwrap().is_dir() {
-                stack.push(path);
-            } else {
-                let rel = path.strip_prefix(root).unwrap().to_path_buf();
-                let data = std::fs::read(&path).unwrap();
-                out.insert(rel, (data.len() as u64, digest_hex(&data)));
-            }
-        }
-    }
-    out
+/// The identity fingerprint the pre-change binary computed for this repo.
+fn pin_fingerprint(fx: &Fixture) -> String {
+    fx.meta["pin_fingerprint"].as_str().unwrap().to_string()
 }
 
 // ── Reading ────────────────────────────────────────────────────────────────
@@ -509,11 +390,11 @@ fn v2_fixture_pin_files_are_superseded() {
         // Guards the fixture reading: the pin really is the old derivation.
         assert_eq!(
             legacy_fingerprint(repo_id, key),
-            fx.pin_fingerprint,
+            pin_fingerprint(&fx),
             "{mode}: fixture pin is not the BLAKE2b fingerprint"
         );
         let fingerprint = hex::encode(identity::compute_fingerprint(repo_id, key));
-        assert_ne!(fingerprint, fx.pin_fingerprint, "{mode}");
+        assert_ne!(fingerprint, pin_fingerprint(&fx), "{mode}");
 
         let cache = fx.cache_dir();
         let legacy_pin = std::fs::read_dir(&cache)

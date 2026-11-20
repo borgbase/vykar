@@ -6,7 +6,7 @@ use zeroize::Zeroizing;
 use crate::error::{CliError, CliResult};
 use crate::prompt::prompt_hidden;
 use vykar_core::app::passphrase::{
-    resolve_init_passphrase, resolve_passphrase, InitPassphrase, InitPromptStage,
+    InitPassphrase, InitPromptStage, resolve_init_passphrase, resolve_passphrase,
 };
 use vykar_core::config::{EncryptionModeConfig, VykarConfig};
 

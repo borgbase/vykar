@@ -1,8 +1,8 @@
 //! Test fixtures shared across `pipeline/` submodule test blocks.
 
 use crate::platform::fs;
-use crate::snapshot::item::Item;
 use crate::snapshot::SnapshotStats;
+use crate::snapshot::item::Item;
 
 pub(super) fn test_item(path: &str) -> Item {
     Item {

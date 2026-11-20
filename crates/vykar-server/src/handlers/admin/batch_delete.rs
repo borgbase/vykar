@@ -225,12 +225,13 @@ mod tests {
         let resp = authed_post(router, "/?batch-delete", keys).await;
         assert_status(&resp, StatusCode::NO_CONTENT);
         assert!(!tmp.path().join(".tmp.config.0").exists());
-        assert!(!tmp
-            .path()
-            .join("packs")
-            .join("ab")
-            .join(".tmp.deadbeef.0")
-            .exists());
+        assert!(
+            !tmp.path()
+                .join("packs")
+                .join("ab")
+                .join(".tmp.deadbeef.0")
+                .exists()
+        );
     }
 
     #[tokio::test]

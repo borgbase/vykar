@@ -6,7 +6,7 @@ use vykar_core::config::VykarConfig;
 use crate::error::CliResult;
 use crate::format::{format_bytes, format_size_with_savings};
 use crate::passphrase::with_repo_passphrase;
-use crate::table::{add_kv_row, CliTableTheme};
+use crate::table::{CliTableTheme, add_kv_row};
 
 pub(crate) fn run_info(config: &VykarConfig, label: Option<&str>) -> CliResult<()> {
     let stats = with_repo_passphrase(config, label, |passphrase| {

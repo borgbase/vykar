@@ -4,8 +4,8 @@
 //! Decoded and checked as open does, then used as backup uses it.
 
 use libfuzzer_sys::fuzz_target;
-use vykar_core::repo::pack::{compute_data_pack_target, compute_tree_pack_target};
 use vykar_core::repo::RepoConfig;
+use vykar_core::repo::pack::{compute_data_pack_target, compute_tree_pack_target};
 
 /// Fixed input for the chunkers: varied enough to produce cuts.
 fn chunker_input() -> Vec<u8> {

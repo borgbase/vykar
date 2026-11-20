@@ -1,7 +1,7 @@
 use chrono::{DateTime, Duration, TimeZone, Utc};
 
 use crate::config::RetentionConfig;
-use crate::prune::{apply_policy, parse_timespan, PruneDecision};
+use crate::prune::{PruneDecision, apply_policy, parse_timespan};
 use crate::repo::manifest::SnapshotEntry;
 use vykar_types::snapshot_id::SnapshotId;
 

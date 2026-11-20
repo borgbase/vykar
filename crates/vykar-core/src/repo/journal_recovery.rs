@@ -4,15 +4,15 @@ use tracing::{debug, warn};
 
 use crate::compress;
 use crate::index::{
-    decode_pending_journal, ChunkIndex, DecodedJournal, PendingIndexJournal, RecoveredChunkEntry,
+    ChunkIndex, DecodedJournal, PendingIndexJournal, RecoveredChunkEntry, decode_pending_journal,
 };
 use vykar_crypto::CryptoEngine;
 use vykar_storage::StorageBackend;
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::Result;
 
-use super::format::{unpack_object_expect_with_context, ObjectType};
-use super::lock::{session_index_key, SessionEntry, SESSIONS_PREFIX, SESSION_STALE_SECS};
+use super::format::{ObjectType, unpack_object_expect_with_context};
+use super::lock::{SESSION_STALE_SECS, SESSIONS_PREFIX, SessionEntry, session_index_key};
 use super::pack_recovery::verify_journal_packs;
 use super::session_journal::PENDING_INDEX_OBJECT_CONTEXT;
 
@@ -312,12 +312,12 @@ pub(crate) fn delete_recovered_indices(storage: &dyn StorageBackend, keys: &mut 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::{encode_pending_journal, PendingPackEntry};
+    use crate::index::{PendingPackEntry, encode_pending_journal};
     use crate::repo::format::pack_object_with_context;
     use crate::repo::lock::session_marker_key;
-    use crate::repo::write_session::tests::{fake_pack, test_crypto};
     use crate::repo::write_session::WriteSessionState;
-    use crate::testutil::{init_test_environment, MemoryBackend};
+    use crate::repo::write_session::tests::{fake_pack, test_crypto};
+    use crate::testutil::{MemoryBackend, init_test_environment};
     use vykar_types::hash::HashAlgorithm;
     use vykar_types::pack_id::PackId;
 

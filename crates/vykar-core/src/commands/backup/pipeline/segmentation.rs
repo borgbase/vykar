@@ -10,8 +10,8 @@ use std::sync::Arc;
 
 use crate::platform::fs;
 use crate::repo::Repository;
-use crate::snapshot::item::Item;
 use crate::snapshot::SnapshotStats;
+use crate::snapshot::item::Item;
 use vykar_types::error::{Result, VykarError};
 
 use super::super::BackupProgressEvent;

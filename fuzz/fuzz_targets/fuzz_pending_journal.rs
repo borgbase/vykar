@@ -6,8 +6,8 @@ use std::collections::HashSet;
 
 use libfuzzer_sys::fuzz_target;
 use vykar_core::index::{
-    decode_pending_journal, encode_pending_journal, DecodedJournal, PendingIndexJournal,
-    PENDING_JOURNAL_VERSION,
+    DecodedJournal, PENDING_JOURNAL_VERSION, PendingIndexJournal, decode_pending_journal,
+    encode_pending_journal,
 };
 
 fuzz_target!(|data: &[u8]| {

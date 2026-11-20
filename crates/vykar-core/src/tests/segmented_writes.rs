@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use super::helpers::{
-    backup_single_source, is_base_put, is_head_put, make_test_config, FailGet, FaultyPut,
+    FailGet, FaultyPut, backup_single_source, is_base_put, is_head_put, make_test_config,
 };
 use crate::commands;
 use crate::commands::check::{IndexRecovery, RepairAction, RepairMode};
@@ -14,13 +14,13 @@ use crate::config::VykarConfig;
 use crate::index::dedup_cache::{self, MmapDedupCache, MmapFullIndexCache, MmapRestoreCache};
 use crate::index::head::{IndexHead, ObjectName};
 use crate::index::{ChunkIndex, IndexBlob};
-use crate::repo::format::{pack_object_streaming_with_context, ObjectType};
+use crate::repo::format::{ObjectType, pack_object_streaming_with_context};
 use crate::repo::index_store::{
-    decode_segment, object_key, pack_head, INDEX_OBJECT_DIR, SEGMENT_CONTEXT,
+    INDEX_OBJECT_DIR, SEGMENT_CONTEXT, decode_segment, object_key, pack_head,
 };
 use crate::repo::{EncryptionMode, OpenOptions, RepoFormat, Repository, WriteSessionOptions};
 use vykar_storage::local_backend::LocalBackend;
-use vykar_storage::{delegate_storage_backend, InnerBackend, StorageBackend};
+use vykar_storage::{InnerBackend, StorageBackend, delegate_storage_backend};
 use vykar_types::error::{Result, VykarError};
 
 struct Fixture {

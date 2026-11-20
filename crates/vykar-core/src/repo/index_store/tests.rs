@@ -8,9 +8,9 @@ use crate::index::{ChunkIndex, ChunkIndexEntry};
 use crate::repo::{EncryptionMode, RepoFormat};
 use crate::tests::helpers::FailGet;
 use crate::testutil::MemoryBackend;
-use vykar_crypto::key::MasterKey;
 use vykar_crypto::PlaintextEngine;
-use vykar_storage::{delegate_storage_backend, InnerBackend};
+use vykar_crypto::key::MasterKey;
+use vykar_storage::{InnerBackend, delegate_storage_backend};
 use vykar_types::chunk_id::{ChunkHasher, ChunkId};
 use vykar_types::hash::HashAlgorithm;
 use vykar_types::pack_id::PackId;
@@ -557,10 +557,11 @@ fn reader_on_a_retired_head_survives_one_fold_and_recovers_after_two() {
     let latest = index_with(0..70, 2);
     w.commit(&latest);
     w.fold();
-    assert!(mem
-        .get(&object_key(&old_head.segments[0].name))
-        .unwrap()
-        .is_none());
+    assert!(
+        mem.get(&object_key(&old_head.segments[0].name))
+            .unwrap()
+            .is_none()
+    );
     let old_base = object_key(&old_head.base.as_ref().unwrap().name);
     let synced = sync(&log, crypto.as_ref(), old_head, None, None, true).unwrap();
     assert_eq!(synced.head, w.head, "re-read the head");

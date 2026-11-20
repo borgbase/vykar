@@ -20,10 +20,10 @@ mod common;
 
 use vykar_core::commands;
 use vykar_core::repo::file_cache::FileCache;
-use vykar_core::repo::{identity, OpenOptions, Repository};
+use vykar_core::repo::{OpenOptions, Repository, identity};
 use vykar_storage::local_backend::LocalBackend;
 
-use crate::common::fixtures::{self, read_tree, Fixture};
+use crate::common::fixtures::{self, Fixture, read_tree};
 use crate::common::{backup_source, exercise_pack_naming};
 use vykar_types::hash::HashAlgorithm;
 

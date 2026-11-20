@@ -2,9 +2,9 @@ use axum::response::{IntoResponse, Response};
 use vykar_types::hash::{HashAlgorithm, Hasher256};
 
 use vykar_protocol::{
-    check_protocol_version, is_valid_pack_key, validate_blob_ref, validate_pack_header,
-    VerifyPackRequest, VerifyPackResult, VerifyPacksPlanRequest, VerifyPacksResponse,
-    PACK_HEADER_SIZE,
+    PACK_HEADER_SIZE, VerifyPackRequest, VerifyPackResult, VerifyPacksPlanRequest,
+    VerifyPacksResponse, check_protocol_version, is_valid_pack_key, validate_blob_ref,
+    validate_pack_header,
 };
 
 use crate::error::ServerError;
@@ -341,9 +341,9 @@ fn verify_pack_from_reader<R: std::io::Read>(
 #[cfg(test)]
 mod tests {
     use super::super::test_support::{blake2b_256_hex, build_pack, pack_id_hex};
-    use super::{verify_pack_from_reader, VerifyPackRequest, VerifyPackResult};
+    use super::{VerifyPackRequest, VerifyPackResult, verify_pack_from_reader};
     use vykar_protocol::{
-        VerifyBlobRef as ProtoVerifyBlobRef, PACK_HEADER_SIZE, PACK_MAGIC, PACK_VERSION_CURRENT,
+        PACK_HEADER_SIZE, PACK_MAGIC, PACK_VERSION_CURRENT, VerifyBlobRef as ProtoVerifyBlobRef,
     };
     use vykar_types::hash::HashAlgorithm;
 

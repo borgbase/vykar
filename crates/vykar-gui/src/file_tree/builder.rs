@@ -200,8 +200,8 @@ impl FileTree {
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_support::{dir, file, find_node, sorted};
     use super::super::FileTree;
+    use super::super::test_support::{dir, file, find_node, sorted};
 
     #[test]
     fn single_source_basic() {

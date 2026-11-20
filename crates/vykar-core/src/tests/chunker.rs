@@ -1,6 +1,6 @@
 use std::io::{Cursor, Read};
 
-use crate::chunker::{chunk_data, chunk_stream, chunk_stream_bounded, ChunkReader};
+use crate::chunker::{ChunkReader, chunk_data, chunk_stream, chunk_stream_bounded};
 use crate::config::ChunkerConfig;
 
 fn test_config() -> ChunkerConfig {

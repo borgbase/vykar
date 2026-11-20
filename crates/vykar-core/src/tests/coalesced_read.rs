@@ -3,14 +3,14 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use vykar_storage::{delegate_storage_backend, BackendProfile, InnerBackend, StorageBackend};
+use vykar_storage::{BackendProfile, InnerBackend, StorageBackend, delegate_storage_backend};
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
 
 use crate::compress::Compression;
 use crate::repo::pack::PackType;
 use crate::repo::{EncryptionMode, Repository, WriteSessionOptions};
-use crate::testutil::{init_test_environment, MemoryBackend, PutLog, RecordingBackend};
+use crate::testutil::{MemoryBackend, PutLog, RecordingBackend, init_test_environment};
 
 fn repo_on_counting_backend() -> (Repository, PutLog) {
     init_test_environment();

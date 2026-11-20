@@ -4,11 +4,11 @@ use super::types::{IntegrityIssue, RepairAction, RepairPlan};
 use crate::commands::list::{for_each_decoded_item, load_snapshot_item_stream, load_snapshot_meta};
 use crate::compress::Compression;
 use crate::index::ChunkIndexEntry;
-use crate::repo::format::{pack_object_with_context, ObjectType};
+use crate::repo::format::{ObjectType, pack_object_with_context};
 use crate::repo::manifest::SnapshotEntry;
 use crate::repo::{Repository, WriteSessionOptions};
-use crate::snapshot::item::ItemType;
 use crate::snapshot::SnapshotMeta;
+use crate::snapshot::item::ItemType;
 use vykar_storage::StorageBackend;
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
@@ -167,7 +167,7 @@ fn prepare_rewrite(
     action_idx: usize,
 ) -> Result<PreparedRewrite> {
     use crate::commands::backup::{
-        append_item_to_stream, flush_item_stream_chunk, ItemStreamCutter,
+        ItemStreamCutter, append_item_to_stream, flush_item_stream_chunk,
     };
 
     let drop: HashSet<usize> = item_indices.iter().copied().collect();
@@ -510,7 +510,7 @@ pub(super) fn execute_repair(
 mod tests {
     use super::*;
     use crate::commands::check::repair_plan::build_repair_plan;
-    use crate::commands::check::scan::{integrity_scan, ScanOptions};
+    use crate::commands::check::scan::{ScanOptions, integrity_scan};
     use crate::config::ChunkerConfig;
     use crate::repo::{EncryptionMode, KEY_PRIMARY, KEY_SECONDARY};
     use crate::testutil::MemoryBackend;
@@ -570,9 +570,11 @@ mod tests {
         let (applied, errors) =
             execute_repair(&mut repo, &plan, &scan.issues, &HashMap::new()).unwrap();
         assert!(errors.is_empty(), "{errors:?}");
-        assert!(applied
-            .iter()
-            .any(|a| matches!(a, RepairAction::RestoreKeyCopy { .. })));
+        assert!(
+            applied
+                .iter()
+                .any(|a| matches!(a, RepairAction::RestoreKeyCopy { .. }))
+        );
 
         assert_eq!(
             repo.storage.get(KEY_SECONDARY).unwrap().unwrap(),

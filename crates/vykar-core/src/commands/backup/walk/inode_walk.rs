@@ -21,11 +21,11 @@ use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use tracing::debug;
 
 use crate::platform::fs::{self, MetadataSummary};
-use vykar_types::error::{is_fileprovider_deadlock, is_soft_backup_io_error, Result, VykarError};
+use vykar_types::error::{Result, VykarError, is_fileprovider_deadlock, is_soft_backup_io_error};
 
 use super::super::source::{ResolvedSource, RootEmission, SourceKind};
 use super::{
-    build_explicit_excludes, classify_dir_skip, should_skip_for_device, DatalessKind, DirSkipKind,
+    DatalessKind, DirSkipKind, build_explicit_excludes, classify_dir_skip, should_skip_for_device,
 };
 
 #[cfg(unix)]

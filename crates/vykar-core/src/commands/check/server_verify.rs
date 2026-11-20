@@ -1,13 +1,13 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use super::types::{
-    emit_progress, CheckError, CheckProgressEvent, ProcessedVerifyResult, ServerVerifyOutcome,
+    CheckError, CheckProgressEvent, ProcessedVerifyResult, ServerVerifyOutcome, emit_progress,
 };
 use crate::index::ChunkIndexEntry;
 use vykar_protocol::{
-    VerifyBlobRef, VerifyPackRequest, VerifyPacksPlanRequest, VerifyPacksResponse, PACK_HEADER_SIZE,
+    PACK_HEADER_SIZE, VerifyBlobRef, VerifyPackRequest, VerifyPacksPlanRequest, VerifyPacksResponse,
 };
 use vykar_storage::StorageBackend;
 use vykar_types::chunk_id::ChunkId;

@@ -8,17 +8,17 @@
 //! `PRESIGN_DURATION`.
 
 use std::io::Read;
-use std::sync::atomic::Ordering;
 use std::sync::OnceLock;
+use std::sync::atomic::Ordering;
 
 use base64::Engine;
 use md5::{Digest, Md5};
 use rusty_s3::actions::{CreateMultipartUpload, S3Action};
 use serde::Deserialize;
 
-use super::{s3_error, S3Backend, PRESIGN_DURATION};
-use crate::retry::HttpRetryError;
+use super::{PRESIGN_DURATION, S3Backend, s3_error};
 use crate::StorageBackend;
+use crate::retry::HttpRetryError;
 use vykar_types::error::{Result, VykarError};
 
 /// Baseline multipart part size (16 MiB). Grown only for objects that would

@@ -1044,8 +1044,8 @@ pub(crate) fn is_stale(
 mod tests {
     use super::*;
 
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn counting_release(bytes: Vec<u8>) -> (PackData, Arc<AtomicUsize>) {
         let fired = Arc::new(AtomicUsize::new(0));

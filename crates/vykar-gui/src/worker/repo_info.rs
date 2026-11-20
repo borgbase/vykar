@@ -3,23 +3,23 @@ use std::sync::atomic::Ordering;
 
 use slint::SharedString;
 use vykar_core::app::passphrase;
-use vykar_core::app::views::{format_last_snapshot, SnapshotRowView};
+use vykar_core::app::views::{SnapshotRowView, format_last_snapshot};
 use vykar_core::commands::info::InfoStats;
 use vykar_core::commands::{init, list};
 use vykar_core::config;
 use vykar_types::error::VykarError;
 
+use crate::APP_TITLE;
 use crate::controllers;
 use crate::messages::{RepoInfoData, SnapshotRowData, UiEvent};
 use crate::repo_helpers::{
-    classify_init_target, find_repo_for_snapshot, select_repos, send_log, with_passphrase_retry,
-    InitTarget, PassphraseRun,
+    InitTarget, PassphraseRun, classify_init_target, find_repo_for_snapshot, select_repos,
+    send_log, with_passphrase_retry,
 };
-use crate::APP_TITLE;
 use vykar_common::display::format_bytes;
 
-use super::shared::{select_repo_or_fail, OpGuard};
 use super::WorkerContext;
+use super::shared::{OpGuard, select_repo_or_fail};
 
 /// Placeholder shown for metric cells of a repo that failed to load.
 const METRIC_PLACEHOLDER: &str = "\u{2014}"; // em dash

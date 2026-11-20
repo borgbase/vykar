@@ -2714,9 +2714,11 @@ fn cli_key_export_tightens_permissions_on_an_existing_file() {
 
     let mode = std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o600, "export must not leave a 0644 key file behind");
-    assert!(std::fs::read_to_string(&dest)
-        .unwrap()
-        .contains("BEGIN VYKAR REPOSITORY KEY"));
+    assert!(
+        std::fs::read_to_string(&dest)
+            .unwrap()
+            .contains("BEGIN VYKAR REPOSITORY KEY")
+    );
 }
 
 /// **`--trust-repo` must re-pin.** It waives the pin to authorize the import;

@@ -8,7 +8,7 @@ use vykar_types::error::Result;
 
 use crate::messages::UiEvent;
 use crate::progress::BackupStatusTracker;
-use crate::repo_helpers::{send_log, with_passphrase_retry, PassphraseRun};
+use crate::repo_helpers::{PassphraseRun, send_log, with_passphrase_retry};
 
 use super::WorkerContext;
 
@@ -335,9 +335,10 @@ mod tests {
             })
             .collect();
         assert_eq!(logs.len(), 1, "expected a single log line, got {logs:?}");
-        assert!(logs
-            .first()
-            .is_some_and(|m| m.contains("No repository matching 'missing'")));
+        assert!(
+            logs.first()
+                .is_some_and(|m| m.contains("No repository matching 'missing'"))
+        );
         assert!(matches!(events.last(), Some(UiEvent::ErrorStatus(_))));
     }
 

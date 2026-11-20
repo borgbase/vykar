@@ -159,8 +159,8 @@ impl Drop for BudgetGuard<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::Ordering;
     use std::sync::Arc;
+    use std::sync::atomic::Ordering;
 
     #[test]
     fn byte_budget_acquire_release() {

@@ -28,7 +28,7 @@ mod ui_state;
 mod update_check;
 mod view_models;
 mod worker;
-use messages::{log_entry_now, AppCommand, UiEvent};
+use messages::{AppCommand, UiEvent, log_entry_now};
 
 const APP_TITLE: &str = "Vykar Backup";
 

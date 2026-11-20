@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use super::super::hooks::HooksConfig;
-use super::super::sources::{normalize_sources, SourceEntry};
+use super::super::sources::{SourceEntry, normalize_sources};
 use super::super::types::*;
 use super::super::util::expand_tilde;
 use super::document::{ConfigDocument, EnvFilePre};

@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use super::format::{unpack_object_expect_with_context, verify_chunk_id, ObjectType};
+use super::format::{ObjectType, unpack_object_expect_with_context, verify_chunk_id};
 use super::pack::read_blob_from_pack;
 use super::{BlobCache, Repository};
 use crate::commands::util::check_interrupted;
@@ -130,11 +130,7 @@ fn read_groups_parallel(
                 let failed = result.is_err();
                 // The receiver lives until this thread drops `tx`.
                 let _ = tx.send((idx, result));
-                if failed {
-                    Err(())
-                } else {
-                    Ok(())
-                }
+                if failed { Err(()) } else { Ok(()) }
             });
         });
         // Ends once the spawned thread returns and drops `tx`.

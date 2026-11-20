@@ -186,11 +186,7 @@ fn fan_out<T: Sync>(
     match on_failure {
         OnFailure::Stop => {
             let _ = super::bounded::try_for_each_bounded(width, items, |t| {
-                if task(t) {
-                    Ok(())
-                } else {
-                    Err(())
-                }
+                if task(t) { Ok(()) } else { Err(()) }
             });
         }
         OnFailure::Continue => super::bounded::for_each_bounded(width, items, None, |t| {
@@ -245,7 +241,7 @@ pub(crate) mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread::ThreadId;
     use std::time::Duration;
-    use vykar_storage::{delegate_storage_backend, InnerBackend, ListedObject};
+    use vykar_storage::{InnerBackend, ListedObject, delegate_storage_backend};
 
     /// Counts requests; flags pick the request path and inject failures.
     pub(crate) struct Probe {

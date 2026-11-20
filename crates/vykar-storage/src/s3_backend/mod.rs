@@ -14,8 +14,8 @@ use percent_encoding::percent_decode_str;
 use rusty_s3::actions::{ListObjectsV2, S3Action};
 use rusty_s3::{Bucket, Credentials, UrlStyle};
 
-use crate::retry::HttpRetryError;
 use crate::RetryConfig;
+use crate::retry::HttpRetryError;
 use vykar_types::error::{Result, VykarError};
 
 use crate::{ListedObject, StorageBackend};

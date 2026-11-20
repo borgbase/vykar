@@ -137,11 +137,7 @@ pub(crate) mod test_hooks {
         // Best-effort canonicalization; fall back to direct compare.
         let a = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         let b = std::fs::canonicalize(&hook.target).unwrap_or_else(|_| hook.target.clone());
-        if a == b {
-            Some(hook.generation)
-        } else {
-            None
-        }
+        if a == b { Some(hook.generation) } else { None }
     }
 
     /// Fire the hook iff the currently-installed hook's generation matches

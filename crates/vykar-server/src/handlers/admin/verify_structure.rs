@@ -1,6 +1,6 @@
 use axum::response::{IntoResponse, Response};
 
-use vykar_protocol::{validate_pack_header, PACK_HEADER_SIZE};
+use vykar_protocol::{PACK_HEADER_SIZE, validate_pack_header};
 
 use crate::error::ServerError;
 use crate::state::AppState;

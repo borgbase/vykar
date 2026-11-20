@@ -8,9 +8,9 @@ use std::path::{Component, Path};
 
 use libfuzzer_sys::fuzz_target;
 use vykar_protocol::{
-    is_index_object_key, is_known_repo_key, is_safe_relative_path, is_temp_file, is_valid_pack_key,
+    PACK_MAGIC, PACK_VERSION_MAX, PACK_VERSION_MIN, TEMP_FILE_PREFIX, is_index_object_key,
+    is_known_repo_key, is_safe_relative_path, is_temp_file, is_valid_pack_key,
     is_valid_storage_key, is_valid_upload_token, parse_byte_range, validate_pack_header,
-    PACK_MAGIC, PACK_VERSION_MAX, PACK_VERSION_MIN, TEMP_FILE_PREFIX,
 };
 
 /// The lexical half of the server's key → path resolution: what

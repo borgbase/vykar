@@ -1,11 +1,11 @@
 use tracing::{debug, warn};
 
-use super::journal_recovery::PendingIndexRecovery;
-use super::pack::{compute_data_pack_target, compute_tree_pack_target, PackType, PackWriter};
-use super::write_session::{
-    active, active_mut, RollbackTracker, WriteSessionState, DEFAULT_SESSION_ID,
-};
 use super::Repository;
+use super::journal_recovery::PendingIndexRecovery;
+use super::pack::{PackType, PackWriter, compute_data_pack_target, compute_tree_pack_target};
+use super::write_session::{
+    DEFAULT_SESSION_ID, RollbackTracker, WriteSessionState, active, active_mut,
+};
 use crate::index::dedup_cache::{self, DedupPrefilter, TieredDedupIndex};
 use crate::index::{ChunkIndex, DedupIndex, IndexDelta};
 use vykar_storage::BackendProfile;
@@ -506,7 +506,7 @@ mod tests {
     use super::WriteSessionOptions;
     use crate::testutil::test_repo_plaintext;
     use std::sync::Arc;
-    use vykar_storage::{delegate_storage_backend, BackendProfile, InnerBackend, StorageBackend};
+    use vykar_storage::{BackendProfile, InnerBackend, StorageBackend, delegate_storage_backend};
 
     #[test]
     fn for_backup_derives_from_profile() {
@@ -667,12 +667,13 @@ mod tests {
 
         let ws = repo.write_session.as_ref().unwrap();
         assert!(ws.uploads.is_empty());
-        assert!(ws
-            .journal
-            .entries
-            .to_wire()
-            .iter()
-            .any(|e| e.pack_id == pack_id));
+        assert!(
+            ws.journal
+                .entries
+                .to_wire()
+                .iter()
+                .any(|e| e.pack_id == pack_id)
+        );
         repo.write_session = None;
     }
 
@@ -730,12 +731,13 @@ mod tests {
         let stored = repo.storage.get(&pack_id.storage_key()).unwrap().unwrap();
         assert_eq!(PackId::compute(&stored, repo.content_hash()), pack_id);
         let ws = repo.write_session.as_ref().unwrap();
-        assert!(ws
-            .journal
-            .entries
-            .to_wire()
-            .iter()
-            .any(|e| e.pack_id == pack_id));
+        assert!(
+            ws.journal
+                .entries
+                .to_wire()
+                .iter()
+                .any(|e| e.pack_id == pack_id)
+        );
         repo.write_session = None;
     }
 
@@ -820,12 +822,13 @@ mod tests {
         gate_tx.send(()).unwrap();
         repo.flush_packs().unwrap();
         let ws = repo.write_session.as_ref().unwrap();
-        assert!(ws
-            .journal
-            .entries
-            .to_wire()
-            .iter()
-            .any(|e| e.pack_id == pack_id));
+        assert!(
+            ws.journal
+                .entries
+                .to_wire()
+                .iter()
+                .any(|e| e.pack_id == pack_id)
+        );
         repo.write_session = None;
     }
 

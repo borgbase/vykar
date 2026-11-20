@@ -4,9 +4,9 @@ use slint::{ComponentHandle, ModelRc, StandardListViewItem, VecModel};
 use vykar_common::display::{format_optional_size, format_size_delta};
 use vykar_core::commands::diff::DiffChangeKind;
 
+use crate::DiffWindow;
 use crate::messages::DiffResultRow;
 use crate::view_models::to_table_model;
-use crate::DiffWindow;
 
 thread_local! {
     static DIFF_HANDLE: RefCell<Option<DiffWindow>> = const { RefCell::new(None) };

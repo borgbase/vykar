@@ -10,24 +10,24 @@ use crate::compress::Compression;
 use crate::index::dedup_cache::DedupPrefilter;
 use crate::limits::ByteRateLimiter;
 use crate::platform::fs;
-use crate::repo::file_cache::{CachedChunks, FileCache, ParentReuseIndex};
 use crate::repo::Repository;
-use crate::snapshot::item::{Item, ItemType};
+use crate::repo::file_cache::{CachedChunks, FileCache, ParentReuseIndex};
 use crate::snapshot::SnapshotStats;
+use crate::snapshot::item::{Item, ItemType};
 use vykar_types::chunk_id::{ChunkHasher, ChunkId};
 use vykar_types::error::{Result, VykarError};
 
-use super::chunk_process::{classify_chunk, WorkerChunk};
+use super::chunk_process::{WorkerChunk, classify_chunk};
 use super::commit::process_worker_chunks;
-use super::drift::{open_checked, read_range_drift_checked, ReadPlan};
+use super::drift::{ReadPlan, open_checked, read_range_drift_checked};
 use super::pipeline::PipelineBuffers;
 use super::source::ResolvedSource;
-use super::walk::{materialize_item, DatalessKind, InodeSortedWalk, Materialized, WalkEvent};
+use super::walk::{DatalessKind, InodeSortedWalk, Materialized, WalkEvent, materialize_item};
+use super::{BackupProgressEvent, FileStatus, stamp_item_metadata, with_rollback_checkpoint};
 use super::{
-    append_item_to_stream, emit_post_commit_warning, emit_progress, emit_stats_progress,
-    skip_reason, ItemStreamCutter,
+    ItemStreamCutter, append_item_to_stream, emit_post_commit_warning, emit_progress,
+    emit_stats_progress, skip_reason,
 };
-use super::{stamp_item_metadata, with_rollback_checkpoint, BackupProgressEvent, FileStatus};
 use vykar_crypto::CryptoEngine;
 
 /// Classify raw data chunks into `WorkerChunk`s, optionally using a rayon pool

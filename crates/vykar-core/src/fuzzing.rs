@@ -108,7 +108,7 @@ pub fn restore_rel_path(item: &Item) -> Result<PathBuf> {
 /// A symlink's target as restore builds it, and whether restore flags it
 /// as absolute or escaping its parent.
 pub fn symlink_target(item: &Item) -> (PathBuf, bool) {
-    use crate::commands::restore::{classify_symlink_target_path, SymlinkSafety};
+    use crate::commands::restore::{SymlinkSafety, classify_symlink_target_path};
     let target = crate::commands::restore::symlink_target_path(item);
     let flagged = classify_symlink_target_path(&target) != SymlinkSafety::Safe;
     (target, flagged)

@@ -3,14 +3,14 @@
 //! own re-add path never runs. A hidden top-level window listens instead.
 #![allow(unsafe_code)]
 
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     ChangeWindowMessageFilterEx, CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW,
-    RegisterClassW, RegisterWindowMessageW, TranslateMessage, MSG, MSGFLT_ALLOW, WNDCLASSW,
+    MSG, MSGFLT_ALLOW, RegisterClassW, RegisterWindowMessageW, TranslateMessage, WNDCLASSW,
     WS_EX_TOOLWINDOW, WS_POPUP,
 };
 

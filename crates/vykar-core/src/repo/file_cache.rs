@@ -45,7 +45,7 @@ pub(crate) fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
 }
 
 use super::format::{
-    pack_object_streaming_with_context, unpack_object_expect_with_context, ObjectType,
+    ObjectType, pack_object_streaming_with_context, unpack_object_expect_with_context,
 };
 
 /// Compute the per-repo cache directory.
@@ -1551,12 +1551,16 @@ mod tests {
         );
 
         assert_eq!(cache.len(), 1);
-        assert!(cache
-            .lookup("/tmp/test.txt", 1, 1000, 1234567890, 1234567890, 4096)
-            .is_none());
-        assert!(cache
-            .lookup("/tmp/test.txt", 1, 1000, 9999999999, 9999999999, 8192)
-            .is_some());
+        assert!(
+            cache
+                .lookup("/tmp/test.txt", 1, 1000, 1234567890, 1234567890, 4096)
+                .is_none()
+        );
+        assert!(
+            cache
+                .lookup("/tmp/test.txt", 1, 1000, 9999999999, 9999999999, 8192)
+                .is_some()
+        );
     }
 
     #[test]
@@ -1577,21 +1581,29 @@ mod tests {
         cache.insert("/b/file.txt", 1, 200, 222, 222, 8192, sample_chunk_refs());
 
         // Looking up in /b should not find /a's entry.
-        assert!(cache
-            .lookup("/a/file.txt", 1, 100, 111, 111, 4096)
-            .is_none());
-        assert!(cache
-            .lookup("/b/file.txt", 1, 200, 222, 222, 8192)
-            .is_some());
+        assert!(
+            cache
+                .lookup("/a/file.txt", 1, 100, 111, 111, 4096)
+                .is_none()
+        );
+        assert!(
+            cache
+                .lookup("/b/file.txt", 1, 200, 222, 222, 8192)
+                .is_some()
+        );
 
         // Switch to /a.
         assert!(cache.activate_for_walk_roots(&roots(&["/a"])));
-        assert!(cache
-            .lookup("/a/file.txt", 1, 100, 111, 111, 4096)
-            .is_some());
-        assert!(cache
-            .lookup("/b/file.txt", 1, 200, 222, 222, 8192)
-            .is_none());
+        assert!(
+            cache
+                .lookup("/a/file.txt", 1, 100, 111, 111, 4096)
+                .is_some()
+        );
+        assert!(
+            cache
+                .lookup("/b/file.txt", 1, 200, 222, 222, 8192)
+                .is_none()
+        );
 
         assert_eq!(cache.len(), 2);
     }
@@ -1751,9 +1763,11 @@ mod tests {
         assert_eq!(write.absorb_read_sections(&mut read), 1);
         // /a/g.txt was not walked (deleted): gone. /a/f.txt carried over.
         assert_eq!(write.section_len("/a"), 1);
-        assert!(write.sections["/a"]
-            .entries
-            .contains_key(&hash_path("/a/f.txt")));
+        assert!(
+            write.sections["/a"]
+                .entries
+                .contains_key(&hash_path("/a/f.txt"))
+        );
         assert_eq!(write.section_len("/new"), 1);
         // Read cache: /a moved out, /b (not part of this run) kept, lookups off.
         assert!(!read.sections.contains_key("/a"));
@@ -1763,9 +1777,11 @@ mod tests {
         write.finalize_sections(SnapshotId::from_bytes([0x43; 32]));
         let taken = write.take_active_sections();
         assert_eq!(taken.len(), 2);
-        assert!(taken
-            .iter()
-            .all(|(_, s)| s.anchor_snapshot_id == SnapshotId::from_bytes([0x43; 32])));
+        assert!(
+            taken
+                .iter()
+                .all(|(_, s)| s.anchor_snapshot_id == SnapshotId::from_bytes([0x43; 32]))
+        );
     }
 
     /// Comparable view of a section: key -> every stored field.
@@ -1924,9 +1940,12 @@ mod tests {
                         3 => m.ctime_ns = m.ctime_ns.wrapping_add(1),
                         _ => m.size += 1,
                     }
-                    assert!(read
-                        .lookup_retainable(path, m.device, m.inode, m.mtime_ns, m.ctime_ns, m.size)
-                        .is_none());
+                    assert!(
+                        read.lookup_retainable(
+                            path, m.device, m.inode, m.mtime_ns, m.ctime_ns, m.size
+                        )
+                        .is_none()
+                    );
                     let refs = random_refs(&mut rng);
                     let (d, i, mt, ct, sz) = (m.device, m.inode, m.mtime_ns, m.ctime_ns, m.size);
                     old.insert(path, d, i, mt, ct, sz, refs.clone());
@@ -2547,13 +2566,15 @@ mod tests {
 
         let idx = build_parent_index(items, &["/src".into()], false).unwrap();
         // Dump item should not be indexed
-        assert!(idx
-            .lookup(&native_join("/src", "vykar-dumps/pg_dump"), 4096, 1000, 0)
-            .is_none());
+        assert!(
+            idx.lookup(&native_join("/src", "vykar-dumps/pg_dump"), 4096, 1000, 0)
+                .is_none()
+        );
         // Real file should be indexed
-        assert!(idx
-            .lookup(&native_join("/src", "real.txt"), 8192, 2000, 3000)
-            .is_some());
+        assert!(
+            idx.lookup(&native_join("/src", "real.txt"), 8192, 2000, 3000)
+                .is_some()
+        );
     }
 
     #[test]
@@ -2591,9 +2612,10 @@ mod tests {
         assert!(idx.lookup_dataless(&path, 4096, 9999).is_none());
 
         // Wrong path — miss.
-        assert!(idx
-            .lookup_dataless(&native_join("/src", "other.txt"), 4096, 1000)
-            .is_none());
+        assert!(
+            idx.lookup_dataless(&native_join("/src", "other.txt"), 4096, 1000)
+                .is_none()
+        );
     }
 
     /// Documents the intentional identity tradeoff for cold-start dataless
@@ -2657,9 +2679,10 @@ mod tests {
         let idx =
             build_parent_index(items, &["/mnt/home".into(), "/mnt/data".into()], true).unwrap();
         // "home/a.txt" → matches source_path "/mnt/home" (basename "home"), reconstructs to "/mnt/home/a.txt"
-        assert!(idx
-            .lookup(&native_join("/mnt/home", "a.txt"), 4096, 1000, 2000)
-            .is_some());
+        assert!(
+            idx.lookup(&native_join("/mnt/home", "a.txt"), 4096, 1000, 2000)
+                .is_some()
+        );
     }
 
     fn skiproot(abs_root: &str) -> ParentReuseRoot {

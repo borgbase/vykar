@@ -23,7 +23,7 @@ mod parallel;
 mod plan;
 #[cfg(feature = "fuzzing")]
 pub(crate) use plan::{
-    classify_symlink_target_path, sanitize_item_into, symlink_target_path, SymlinkSafety,
+    SymlinkSafety, classify_symlink_target_path, sanitize_item_into, symlink_target_path,
 };
 mod read_groups;
 #[cfg(test)]

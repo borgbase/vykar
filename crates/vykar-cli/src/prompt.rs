@@ -71,7 +71,7 @@ fn read_hidden_line(buf: &mut String) -> io::Result<()> {
 fn read_hidden_line(buf: &mut String) -> io::Result<()> {
     use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::Console::{
-        GetConsoleMode, GetStdHandle, SetConsoleMode, ENABLE_ECHO_INPUT, STD_INPUT_HANDLE,
+        ENABLE_ECHO_INPUT, GetConsoleMode, GetStdHandle, STD_INPUT_HANDLE, SetConsoleMode,
     };
 
     let stdin = io::stdin();

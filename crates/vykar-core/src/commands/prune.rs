@@ -4,7 +4,7 @@ use std::sync::atomic::AtomicBool;
 use chrono::Utc;
 
 use crate::config::{RetentionConfig, SourceEntry, VykarConfig};
-use crate::prune::{apply_policy_by_label, PruneDecision};
+use crate::prune::{PruneDecision, apply_policy_by_label};
 use vykar_types::error::{Result, VykarError};
 
 use super::snapshot_ops::{prepare_removal_targets, remove_snapshots};

@@ -6,7 +6,7 @@ use crate::config::VykarConfig;
 use crate::snapshot::item::ItemType;
 use vykar_protocol::PACK_HEADER_SIZE;
 
-use super::corruption::{apply_corruption, setup_repo, Corruption};
+use super::corruption::{Corruption, apply_corruption, setup_repo};
 use super::helpers::{backup_single_source, init_repo, make_test_config, open_local_repo};
 
 // ---------------------------------------------------------------------------

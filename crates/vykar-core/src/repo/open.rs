@@ -5,18 +5,19 @@ use chrono::Utc;
 use rand::Rng;
 
 use super::file_cache::FileCache;
-use super::format::{pack_object_streaming_with_context, ObjectType};
+use super::format::{ObjectType, pack_object_streaming_with_context};
 use super::index_store;
 use super::key::{self, KeyProofCtx};
 use super::manifest::Manifest;
 use super::snapshot_cache;
 use super::{
-    BlobCache, EncryptionMode, IndexLayout, OpenOptions, RepoConfig, RepoFormat, Repository,
-    BLOB_CACHE_MAX_BYTES, INDEX_OBJECT_CONTEXT, KEY_PRIMARY, KEY_SECONDARY, MAX_PACK_SIZE_LIMIT,
+    BLOB_CACHE_MAX_BYTES, BlobCache, EncryptionMode, INDEX_OBJECT_CONTEXT, IndexLayout,
+    KEY_PRIMARY, KEY_SECONDARY, MAX_PACK_SIZE_LIMIT, OpenOptions, RepoConfig, RepoFormat,
+    Repository,
 };
 use crate::compress;
 use crate::config::{
-    default_max_pack_size, default_min_pack_size, ChunkerConfig, RepositoryConfig,
+    ChunkerConfig, RepositoryConfig, default_max_pack_size, default_min_pack_size,
 };
 use crate::index::dedup_cache::generation_for_state;
 use crate::index::head::IndexHead;
@@ -480,7 +481,7 @@ impl Repository {
                 Err(e) => {
                     return Err(VykarError::Other(format!(
                         "failed to spawn file cache load thread: {e}"
-                    )))
+                    )));
                 }
             }
         } else {
@@ -570,14 +571,14 @@ impl Repository {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::dedup_cache::{self, CachedIndexBlob};
     use crate::index::ChunkIndexEntry;
+    use crate::index::dedup_cache::{self, CachedIndexBlob};
     use crate::repo::commit::IndexSource;
     use crate::repo::index_fetch::IndexObject;
     use crate::testutil::MemoryBackend;
     use std::collections::HashMap;
     use std::sync::Mutex;
-    use vykar_storage::{delegate_storage_backend, InnerBackend};
+    use vykar_storage::{InnerBackend, delegate_storage_backend};
     use vykar_types::chunk_id::ChunkId;
     use vykar_types::pack_id::PackId;
 

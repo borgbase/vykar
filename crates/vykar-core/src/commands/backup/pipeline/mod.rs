@@ -13,15 +13,15 @@
 //! - [`segmentation`] — large-file segmentation state machine (accumulator + cross-segment rollback) used by both the consumer and the orchestrator's skip-drain handling.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::compress::Compression;
 use crate::index::dedup_cache::DedupPrefilter;
 use crate::limits::ByteRateLimiter;
 use crate::platform::fs;
-use crate::repo::file_cache::{CachedChunks, FileCache, ParentReuseIndex, RetainedHit};
 use crate::repo::Repository;
+use crate::repo::file_cache::{CachedChunks, FileCache, ParentReuseIndex, RetainedHit};
 use crate::snapshot::SnapshotStats;
 use vykar_crypto::CryptoEngine;
 use vykar_types::chunk_id::ChunkId;
@@ -29,7 +29,7 @@ use vykar_types::error::{Result, VykarError};
 
 use super::concurrency::ByteBudget;
 use super::source::ResolvedSource;
-use super::walk::{build_walk_iter, reserve_budget, DatalessKind, WalkEntry};
+use super::walk::{DatalessKind, WalkEntry, build_walk_iter, reserve_budget};
 use super::{BackupProgressEvent, ItemStreamCutter};
 
 mod consumer;
@@ -38,7 +38,7 @@ mod segmentation;
 mod test_support;
 mod worker;
 
-use segmentation::{rollback_and_skip_large_file, LargeFileAccum};
+use segmentation::{LargeFileAccum, rollback_and_skip_large_file};
 
 // ---------------------------------------------------------------------------
 // Channel message types

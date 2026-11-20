@@ -24,7 +24,7 @@ use vykar_core::index::head::IndexHead;
 use vykar_core::repo::Repository;
 use vykar_types::hash::HashAlgorithm;
 
-use crate::common::fixtures::{self, archive_path, read_tree, Fixture};
+use crate::common::fixtures::{self, Fixture, archive_path, read_tree};
 use crate::common::{backup_source, exercise_pack_naming};
 
 /// `(prefix, mode)` of every segmented fixture.

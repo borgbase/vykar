@@ -9,9 +9,9 @@ use vykar_storage::StorageBackend;
 use vykar_types::error::{Result, VykarError};
 use vykar_types::snapshot_id::SnapshotId;
 
-use super::format::{unpack_object_expect_with_context, ObjectType};
+use super::format::{ObjectType, unpack_object_expect_with_context};
 use super::key::build_engine;
-use super::{RepoConfig, RepoFormat, INDEX_OBJECT_CONTEXT};
+use super::{INDEX_OBJECT_CONTEXT, RepoConfig, RepoFormat};
 
 /// Pin file format (one per repository URL).
 #[derive(Debug, Serialize, Deserialize)]
@@ -509,21 +509,25 @@ mod tests {
         )
         .unwrap();
         // Both survive independently
-        assert!(verify_or_pin(
-            "s3://bucket-a",
-            &test_repo_id(),
-            &key_a,
-            Some(dir.path()),
-            false
-        )
-        .is_ok());
-        assert!(verify_or_pin(
-            "s3://bucket-b",
-            &test_repo_id(),
-            &key_b,
-            Some(dir.path()),
-            false
-        )
-        .is_ok());
+        assert!(
+            verify_or_pin(
+                "s3://bucket-a",
+                &test_repo_id(),
+                &key_a,
+                Some(dir.path()),
+                false
+            )
+            .is_ok()
+        );
+        assert!(
+            verify_or_pin(
+                "s3://bucket-b",
+                &test_repo_id(),
+                &key_b,
+                Some(dir.path()),
+                false
+            )
+            .is_ok()
+        );
     }
 }

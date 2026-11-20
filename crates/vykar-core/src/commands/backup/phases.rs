@@ -1,21 +1,21 @@
 //! The two phases of a backup run, driven by `run_against_repo`, and the session owner they share.
 
 use std::collections::HashSet;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use chrono::Utc;
 use tracing::{debug, info, warn};
 
 use super::{
+    BackupProgressEvent, BackupRequest, DatalessTally, ItemStreamCutter, Prepared, Workers,
     command_dump, emit_post_commit_warning, emit_progress, flush_item_stream_chunk, pipeline,
-    sequential, source, source_paths_match, BackupProgressEvent, BackupRequest, DatalessTally,
-    ItemStreamCutter, Prepared, Workers,
+    sequential, source, source_paths_match,
 };
 use crate::commands::util::check_interrupted;
 use crate::config::VykarConfig;
 use crate::repo::file_cache::{FileCache, ParentReuseBuilder, ParentReuseIndex, ParentReuseRoot};
-use crate::repo::format::{pack_object_with_context, ObjectType};
+use crate::repo::format::{ObjectType, pack_object_with_context};
 use crate::repo::lock;
 use crate::repo::manifest::SnapshotEntry;
 use crate::repo::{Repository, WriteSessionOptions};

@@ -282,11 +282,13 @@ mod tests {
 
         let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&temp_path), mode(&reference));
-        assert!(temp_path
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .starts_with(vykar_protocol::TEMP_FILE_PREFIX));
+        assert!(
+            temp_path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(vykar_protocol::TEMP_FILE_PREFIX)
+        );
     }
 
     #[test]

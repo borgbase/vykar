@@ -7,7 +7,7 @@ use vykar_types::error::{Result, VykarError};
 use vykar_types::hash::{HashAlgorithm, Hasher256};
 use vykar_types::pack_id::PackId;
 
-use vykar_protocol::{validate_pack_header, PACK_HEADER_SIZE, PACK_MAGIC, PACK_VERSION_CURRENT};
+use vykar_protocol::{PACK_HEADER_SIZE, PACK_MAGIC, PACK_VERSION_CURRENT, validate_pack_header};
 
 /// Distinguishes data packs (file content) from tree packs (item-stream metadata).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -892,8 +892,8 @@ mod tests {
     /// SealedData::put_to dispatches Memory to put_pack and fires the release.
     #[test]
     fn put_to_dispatches_correctly() {
-        use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
         const CALLED_PUT_OWNED: u8 = 2;
         const CALLED_PUT_PACK: u8 = 3;

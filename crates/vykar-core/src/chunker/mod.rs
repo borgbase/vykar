@@ -1,7 +1,7 @@
 use std::io::{self, Read, Take};
 use std::sync::LazyLock;
 
-use fastcdc::v2020::{get_gear_with_seed, select_masks, Normalization, StreamCDC};
+use fastcdc::v2020::{Normalization, StreamCDC, get_gear_with_seed, select_masks};
 
 use crate::config::ChunkerConfig;
 

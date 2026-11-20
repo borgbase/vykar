@@ -23,7 +23,7 @@
 use libfuzzer_sys::fuzz_target;
 use vykar_core::index::base::decode_unnamed_base_to_temp;
 use vykar_core::index::dedup_cache::{FullCacheEntry, MmapFullIndexCache};
-use vykar_core::index::segment::{apply_to_temp, model, ChainStep, Segment};
+use vykar_core::index::segment::{ChainStep, Segment, apply_to_temp, model};
 use vykar_types::error::VykarError;
 
 fn take_framed<'a>(data: &mut &'a [u8]) -> Option<&'a [u8]> {

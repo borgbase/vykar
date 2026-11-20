@@ -66,10 +66,12 @@ fn delete_snapshot_removes_manifest_entry_and_chunk_refs() {
     backup_single_source(&config, &source_dir, "src-a", "snap-delete-live");
 
     let before = open_local_repo(&repo_dir);
-    assert!(before
-        .manifest()
-        .find_snapshot("snap-delete-live")
-        .is_some());
+    assert!(
+        before
+            .manifest()
+            .find_snapshot("snap-delete-live")
+            .is_some()
+    );
     let chunks_before = before.chunk_index().len();
     assert!(chunks_before > 0);
     drop(before);

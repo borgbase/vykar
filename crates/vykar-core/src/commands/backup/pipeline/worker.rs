@@ -23,8 +23,8 @@ use vykar_types::error::{Result, VykarError};
 
 use super::super::chunk_process::classify_chunk;
 use super::super::concurrency::{BudgetGuard, ByteBudget};
-use super::super::drift::{open_checked, read_range_drift_checked, ReadPlan};
-use super::super::walk::{into_lossy_string, WalkEntry};
+use super::super::drift::{ReadPlan, open_checked, read_range_drift_checked};
+use super::super::walk::{WalkEntry, into_lossy_string};
 use super::ProcessedEntry;
 
 /// Estimate the number of chunks a file will produce, for pre-sizing Vecs.

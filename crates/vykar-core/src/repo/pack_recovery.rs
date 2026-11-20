@@ -103,7 +103,7 @@ fn verify_journal_packs_with(
 mod tests {
     use super::*;
     use crate::index::PendingChunkEntry;
-    use crate::repo::pack_lookup::tests::{pack, Probe};
+    use crate::repo::pack_lookup::tests::{Probe, pack};
     use vykar_types::chunk_id::ChunkId;
 
     fn entry(i: u32, len: u32) -> PendingPackEntry {

@@ -38,8 +38,8 @@ use crate::dispatch::{
 };
 use crate::error::{CliError, CliResult};
 use crate::resolve::{
-    classify_diff_target, classify_snapshot_target, repo_name_at, repo_names_at, DiffDispatch,
-    SnapshotDispatch,
+    DiffDispatch, SnapshotDispatch, classify_diff_target, classify_snapshot_target, repo_name_at,
+    repo_names_at,
 };
 
 /// Exit code: hard error (backup failed, config error, etc.).
@@ -210,7 +210,9 @@ fn load_repos(cli: &Cli, source: &config::ConfigSource) -> Result<Vec<ResolvedRe
     };
 
     if all_repos.is_empty() {
-        eprintln!("Error: no repositories configured. Edit your config file and add a 'repositories' section.");
+        eprintln!(
+            "Error: no repositories configured. Edit your config file and add a 'repositories' section."
+        );
         return Err(ExitCode::from(EXIT_ERROR));
     }
 

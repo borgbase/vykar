@@ -2,7 +2,7 @@
 
 use crate::compress::Compression;
 use crate::index::ChunkIndex;
-use crate::repo::format::{pack_object_with_context, ObjectType};
+use crate::repo::format::{ObjectType, pack_object_with_context};
 use crate::snapshot::item::{ChunkRef, Item, ItemType};
 use smallvec::SmallVec;
 use vykar_crypto::CryptoEngine;

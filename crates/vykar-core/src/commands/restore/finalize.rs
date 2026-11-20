@@ -12,7 +12,7 @@ use vykar_types::error::{Result, VykarError};
 
 use super::plan::{PendingLink, PlannedFile, PlannedNode, RepInfo};
 use super::{
-    apply_item_xattrs, push_damaged, push_metadata_warning, warn_metadata_err, RestoreStats,
+    RestoreStats, apply_item_xattrs, push_damaged, push_metadata_warning, warn_metadata_err,
 };
 use crate::snapshot::item::HardlinkId;
 use std::collections::{HashMap, HashSet};

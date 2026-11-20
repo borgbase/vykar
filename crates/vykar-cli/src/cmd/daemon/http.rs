@@ -99,7 +99,7 @@ fn respond_text(req: tiny_http::Request, code: u16, body: &str) -> CliResult<()>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cmd::daemon::status::{new_shared, DaemonStatus, ProcessInfo, RepoInfo};
+    use crate::cmd::daemon::status::{DaemonStatus, ProcessInfo, RepoInfo, new_shared};
     use std::net::TcpListener;
     use std::sync::OnceLock;
 

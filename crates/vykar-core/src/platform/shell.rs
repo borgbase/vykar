@@ -269,7 +269,7 @@ pub fn run_script_status_with_timeout(
 pub fn terminate_process_group(pid: u32) {
     #[cfg(unix)]
     {
-        use nix::sys::signal::{killpg, Signal};
+        use nix::sys::signal::{Signal, killpg};
         use nix::unistd::Pid;
 
         let Ok(pid) = i32::try_from(pid) else {

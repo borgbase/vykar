@@ -19,8 +19,8 @@ pub(crate) use self::defaults::{default_max_pack_size, default_min_pack_size};
 #[allow(deprecated)]
 pub use self::resolve::load_config;
 pub use self::resolve::{
-    default_config_search_paths, load_and_resolve, minimal_config_template, resolve_config_path,
-    select_repo, select_sources, ConfigSource, RepositoryEntry, ResolvedRepo,
+    ConfigSource, RepositoryEntry, ResolvedRepo, default_config_search_paths, load_and_resolve,
+    minimal_config_template, resolve_config_path, select_repo, select_sources,
 };
 pub use self::sources::{CommandDump, SourceEntry, SourceInput};
 pub(crate) use self::types::parse_cron;

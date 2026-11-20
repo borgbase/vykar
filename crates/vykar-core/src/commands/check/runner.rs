@@ -3,7 +3,7 @@ use std::sync::atomic::AtomicBool;
 
 use super::repair_apply::{execute_repair, probe_deletes_allowed};
 use super::repair_plan::build_repair_plan;
-use super::scan::{integrity_scan, ScanOptions, ScanResult};
+use super::scan::{ScanOptions, ScanResult, integrity_scan};
 use super::server_verify::try_server_verify;
 use super::types::{
     CheckError, CheckProgressEvent, CheckResult, IndexRecovery, IntegrityIssue, RepairMode,

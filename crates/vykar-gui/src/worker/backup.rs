@@ -9,14 +9,14 @@ use vykar_types::error::VykarError;
 use zeroize::Zeroizing;
 
 use crate::messages::{AppCommand, UiEvent};
-use crate::progress::{format_check_status, format_step_outcome, BackupStatusTracker};
+use crate::progress::{BackupStatusTracker, format_check_status, format_step_outcome};
 use crate::repo_helpers::{
-    classify_init_target, log_backup_report, send_log, with_passphrase_retry, InitTarget,
-    PassphraseRun,
+    InitTarget, PassphraseRun, classify_init_target, log_backup_report, send_log,
+    with_passphrase_retry,
 };
 
-use super::shared::{run_selection_with_progress, OpGuard};
 use super::WorkerContext;
+use super::shared::{OpGuard, run_selection_with_progress};
 
 pub(super) fn handle_backup_all(ctx: &mut WorkerContext, scheduled: bool) {
     run_backup_cycle(ctx, scheduled, None);

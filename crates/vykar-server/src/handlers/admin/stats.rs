@@ -1,7 +1,7 @@
 use axum::response::{IntoResponse, Response};
 
 use crate::error::ServerError;
-use crate::state::{read_unpoisoned, AppState};
+use crate::state::{AppState, read_unpoisoned};
 
 pub(super) async fn repo_stats(state: AppState) -> Result<Response, ServerError> {
     let data_dir = state.inner.data_dir.clone();

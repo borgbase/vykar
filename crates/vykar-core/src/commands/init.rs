@@ -1,5 +1,5 @@
 use crate::config::{EncryptionModeConfig, VykarConfig};
-use crate::repo::{identity, EncryptionMode, RepoFormat, Repository};
+use crate::repo::{EncryptionMode, RepoFormat, Repository, identity};
 use crate::storage;
 use vykar_crypto::select::{self, AutoAeadMode};
 use vykar_types::error::Result;

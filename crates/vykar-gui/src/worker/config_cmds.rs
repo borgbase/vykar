@@ -7,8 +7,8 @@ use crate::view_models::send_structured_data;
 use vykar_core::{repo::lock, storage};
 use vykar_types::error::Result;
 
-use super::shared::select_repo_or_log;
 use super::WorkerContext;
+use super::shared::select_repo_or_log;
 
 pub(super) fn handle_open_config_file(ctx: &WorkerContext) {
     let path = ctx.runtime.source.path();

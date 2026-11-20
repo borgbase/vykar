@@ -2,15 +2,15 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use super::types::{emit_progress, CheckProgressEvent, IntegrityIssue, ItemImpact};
+use super::types::{CheckProgressEvent, IntegrityIssue, ItemImpact, emit_progress};
 use crate::commands::list::{for_each_decoded_item, load_snapshot_item_stream, load_snapshot_meta};
 use crate::commands::util::check_interrupted;
 use crate::compress;
 use crate::config::VykarConfig;
 use crate::index::ChunkIndexEntry;
-use crate::repo::format::{unpack_object_expect_with_context, ObjectType};
-use crate::repo::pack::read_blob_from_pack;
 use crate::repo::Repository;
+use crate::repo::format::{ObjectType, unpack_object_expect_with_context};
+use crate::repo::pack::read_blob_from_pack;
 use crate::snapshot::item::ItemType;
 use vykar_crypto::CryptoEngine;
 use vykar_protocol::validate_pack_header;
@@ -235,7 +235,7 @@ fn classify_meta_decode_issue(
     snapshot_id: SnapshotId,
     snapshot_name: Option<String>,
 ) -> IntegrityIssue {
-    use crate::repo::snapshot_cache::{classify_decode_error, SkipReason};
+    use crate::repo::snapshot_cache::{SkipReason, classify_decode_error};
     match classify_decode_error(err, meta_bytes) {
         reason @ SkipReason::IncompatibleEnvelope { .. } => {
             IntegrityIssue::IncompatibleSnapshotEnvelope {

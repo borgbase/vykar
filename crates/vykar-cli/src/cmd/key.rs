@@ -9,7 +9,7 @@ use base64::Engine;
 use vykar_core::commands::key::{self, CopyOutcome, ImportReport, KeyExport};
 use vykar_core::config::VykarConfig;
 use vykar_core::repo::identity::KeyProof;
-use vykar_core::repo::{KeyCopyState, KEY_PRIMARY, KEY_SECONDARY};
+use vykar_core::repo::{KEY_PRIMARY, KEY_SECONDARY, KeyCopyState};
 
 use crate::error::{CliError, CliResult};
 use crate::passphrase::with_repo_passphrase;

@@ -434,13 +434,13 @@ pub(super) mod tests {
     use super::*;
     use crate::compress;
     use crate::index::{
-        decode_pending_journal, DecodedJournal, PendingIndexJournal, PendingPackEntry,
+        DecodedJournal, PendingIndexJournal, PendingPackEntry, decode_pending_journal,
     };
-    use crate::repo::format::{unpack_object_expect_with_context, ObjectType};
+    use crate::repo::format::{ObjectType, unpack_object_expect_with_context};
     use crate::repo::lock::session_index_key;
     use crate::repo::session_journal::{JOURNAL_WRITE_INTERVAL, PENDING_INDEX_OBJECT_CONTEXT};
     use crate::repo::upload_queue::UPLOAD_QUEUE_HEADROOM;
-    use crate::testutil::{init_test_environment, MemoryBackend, PackUploadBackend};
+    use crate::testutil::{MemoryBackend, PackUploadBackend, init_test_environment};
     use vykar_crypto::PlaintextEngine;
     use vykar_types::error::VykarError;
 

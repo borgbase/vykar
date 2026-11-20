@@ -6,8 +6,8 @@ use std::sync::Mutex;
 use zeroize::Zeroizing;
 
 use crate::app::passphrase::{
-    reset_env_passphrase_cache, resolve_init_passphrase, resolve_passphrase, InitPassphrase,
-    InitPromptStage, PassphrasePrompt,
+    InitPassphrase, InitPromptStage, PassphrasePrompt, reset_env_passphrase_cache,
+    resolve_init_passphrase, resolve_passphrase,
 };
 use crate::config::EncryptionModeConfig;
 use vykar_types::error::VykarError;

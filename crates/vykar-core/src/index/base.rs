@@ -227,8 +227,8 @@ fn decode_base_inner<R: Read>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::dedup_cache::build_full_index_cache_to_path;
     use crate::index::ChunkIndex;
+    use crate::index::dedup_cache::build_full_index_cache_to_path;
 
     fn cache_of(index: &ChunkIndex, dir: &Path) -> MmapFullIndexCache {
         let path = dir.join("full");

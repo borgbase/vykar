@@ -1,6 +1,6 @@
 use std::io::{BufRead, Read};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::Deserialize;
 use tracing::info;
@@ -8,11 +8,11 @@ use tracing::info;
 use crate::compress;
 use crate::config::VykarConfig;
 use crate::index::dedup_cache::MmapRestoreCache;
-use crate::repo::format::{unpack_object_expect_with_context, verify_chunk_id, ObjectType};
-use crate::repo::manifest::SnapshotEntry;
 use crate::repo::Repository;
-use crate::snapshot::item::Item;
+use crate::repo::format::{ObjectType, unpack_object_expect_with_context, verify_chunk_id};
+use crate::repo::manifest::SnapshotEntry;
 use crate::snapshot::SnapshotMeta;
+use crate::snapshot::item::Item;
 use vykar_crypto::CryptoEngine;
 use vykar_storage::StorageBackend;
 use vykar_types::chunk_id::ChunkId;

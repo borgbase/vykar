@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use super::file_cache::{atomic_write, repo_cache_dir};
-use super::format::{pack_object_with_context, unpack_object_expect_with_context, ObjectType};
+use super::format::{ObjectType, pack_object_with_context, unpack_object_expect_with_context};
 use super::manifest::SnapshotEntry;
 use vykar_crypto::CryptoEngine;
 use vykar_storage::StorageBackend;
@@ -390,7 +390,7 @@ pub fn refresh_snapshot_cache(
 mod tests {
     use super::*;
     use crate::config::ChunkerConfig;
-    use crate::snapshot::{SnapshotMeta, SNAPSHOT_META_FIELD_COUNT};
+    use crate::snapshot::{SNAPSHOT_META_FIELD_COUNT, SnapshotMeta};
     use crate::testutil::MemoryBackend;
     use vykar_crypto::PlaintextEngine;
 

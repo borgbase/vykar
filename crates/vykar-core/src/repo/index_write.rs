@@ -21,15 +21,15 @@ use std::path::PathBuf;
 use tempfile::TempPath;
 use tracing::{debug, warn};
 
+use super::Repository;
 use super::index_store::{
     self, CacheLocation, HeadlessOutcome, PackedObject, StoredHead, SyncSource,
 };
-use super::Repository;
 use crate::commands::check::IndexRecovery;
-use crate::index::dedup_cache::{self, generation_for_state, MmapFullIndexCache};
-use crate::index::head::{BaseRef, IndexHead, SegmentRef, HEAD_LAYOUT_VERSION};
-use crate::index::segment::{self, Diff};
 use crate::index::ChunkIndex;
+use crate::index::dedup_cache::{self, MmapFullIndexCache, generation_for_state};
+use crate::index::head::{BaseRef, HEAD_LAYOUT_VERSION, IndexHead, SegmentRef};
+use crate::index::segment::{self, Diff};
 use vykar_types::error::{Result, VykarError};
 
 /// When a chain is folded into a new base: at `segments` segments, or when
@@ -183,7 +183,9 @@ impl Repository {
             }
             Ok(None) => None,
             Err(VykarError::IndexObjectMissing { kind, key }) => {
-                warn!("index {kind} {key} is missing from storage; writing a base, which does not need it");
+                warn!(
+                    "index {kind} {key} is missing from storage; writing a base, which does not need it"
+                );
                 None
             }
             Err(e) => {

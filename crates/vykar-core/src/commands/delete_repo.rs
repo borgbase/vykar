@@ -4,7 +4,7 @@ use tracing::info;
 
 use crate::config::VykarConfig;
 use crate::storage::backend_from_config;
-use vykar_storage::{parse_repo_url, BatchDeleteScope, ParsedUrl, StorageBackend};
+use vykar_storage::{BatchDeleteScope, ParsedUrl, StorageBackend, parse_repo_url};
 use vykar_types::error::{Result, VykarError};
 
 pub use vykar_protocol::is_known_repo_key;
@@ -98,7 +98,7 @@ fn delete_known(backend: &dyn StorageBackend, known: &[String]) -> Result<()> {
 mod tests {
     use std::sync::Mutex;
 
-    use vykar_storage::{delegate_storage_backend, InnerBackend};
+    use vykar_storage::{InnerBackend, delegate_storage_backend};
 
     use super::*;
     use crate::testutil::MemoryBackend;

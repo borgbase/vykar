@@ -32,8 +32,8 @@ use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
 use vykar_types::pack_id::PackId;
 
-use super::dedup_cache::{FullCacheEntry, FullCacheWriter, MmapFullIndexCache, StateHash};
 use super::ChunkIndex;
+use super::dedup_cache::{FullCacheEntry, FullCacheWriter, MmapFullIndexCache, StateHash};
 
 /// Segment body layout version.
 const SEGMENT_VERSION: u8 = 1;
@@ -1008,7 +1008,7 @@ fn merge_walk(
         // neither input.
         let bump = match bumps.peek() {
             Some(&(id, _)) if last_bump.is_some_and(|l| l.as_bytes() >= id.as_bytes()) => {
-                return Ok(None)
+                return Ok(None);
             }
             Some(&(id, count)) => match id.as_bytes().cmp(key.as_bytes()) {
                 Ordering::Less => return Err(VykarError::StaleChunksDuringCommit),

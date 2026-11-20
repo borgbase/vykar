@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, Rw
 
 use chrono::{DateTime, Utc};
 
-use crate::cleanup::{scan_usage, TEMP_DEBRIS_MAX_AGE};
+use crate::cleanup::{TEMP_DEBRIS_MAX_AGE, scan_usage};
 use crate::config::ServerSection;
 use crate::index_etag::IndexValidator;
 use crate::quota::{self, QuotaState};

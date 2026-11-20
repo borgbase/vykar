@@ -9,7 +9,7 @@
 use libfuzzer_sys::fuzz_target;
 use vykar_core::index::base::{decode_unnamed_base_to_temp, encode_base};
 use vykar_core::index::dedup_cache::MmapFullIndexCache;
-use vykar_core::index::segment::{apply_to_temp, ChainStep, Segment};
+use vykar_core::index::segment::{ChainStep, Segment, apply_to_temp};
 use vykar_types::error::VykarError;
 
 // `index/dedup_cache.rs` `FULL_MAGIC`, `FULL_VERSION`, `FULL_ENTRY_SIZE`

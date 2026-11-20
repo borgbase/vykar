@@ -5,12 +5,12 @@ use vykar_core::commands;
 use vykar_core::commands::find::{FileStatus, FindFilter, FindScope};
 
 use crate::messages::{AppCommand, DiffResultRow, FindResultRow, FindSnapshotGroup, UiEvent};
-use crate::repo_helpers::{find_repo_for_snapshot, send_log, PassphraseRun};
+use crate::repo_helpers::{PassphraseRun, find_repo_for_snapshot, send_log};
 use vykar_common::display::format_bytes;
 use vykar_types::error::VykarError;
 
-use super::shared::{with_repo_op, OpGuard};
 use super::WorkerContext;
+use super::shared::{OpGuard, with_repo_op};
 
 pub(super) fn handle_restore_selected(
     ctx: &mut WorkerContext,

@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
-use super::format::{pack_object_with_context, ObjectType};
-use super::pack::{self, compute_data_pack_target, PackType, SealedPack};
-use super::write_session::active_mut;
 use super::Repository;
+use super::format::{ObjectType, pack_object_with_context};
+use super::pack::{self, PackType, SealedPack, compute_data_pack_target};
+use super::write_session::active_mut;
 use crate::compress;
 use crate::index::dedup_cache::{DedupPrefilter, TieredHit};
 use crate::index::{IndexDelta, PendingChunkEntry};

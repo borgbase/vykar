@@ -2,15 +2,15 @@
 #![allow(unsafe_code)]
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::sync::Once;
+use std::sync::atomic::{AtomicU64, Ordering};
 use vykar_types::chunk_id::ChunkHasher;
 use vykar_types::hash::HashAlgorithm;
 
 use crate::config::ChunkerConfig;
 use crate::repo::{EncryptionMode, Repository, WriteSessionOptions};
-use vykar_storage::{delegate_storage_backend, InnerBackend, StorageBackend};
+use vykar_storage::{InnerBackend, StorageBackend, delegate_storage_backend};
 use vykar_types::error::{Result, VykarError};
 
 static TEST_ENV_INIT: Once = Once::new();

@@ -11,16 +11,16 @@ use crate::chunker;
 use crate::compress::Compression;
 use crate::config::CommandDump;
 use crate::platform::shell;
-use crate::repo::pack::PackType;
 use crate::repo::Repository;
-use crate::snapshot::item::{ChunkRef, Item, ItemType};
+use crate::repo::pack::PackType;
 use crate::snapshot::SnapshotStats;
+use crate::snapshot::item::{ChunkRef, Item, ItemType};
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
 
 use super::{
-    append_item_to_stream, emit_progress, emit_stats_progress, with_rollback_checkpoint,
-    BackupProgressEvent, ItemStreamCutter,
+    BackupProgressEvent, ItemStreamCutter, append_item_to_stream, emit_progress,
+    emit_stats_progress, with_rollback_checkpoint,
 };
 
 /// Default timeout for command_dump execution (1 hour).

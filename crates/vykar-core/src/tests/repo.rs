@@ -2,10 +2,10 @@ use std::path::PathBuf;
 
 use crate::compress::Compression;
 use crate::config::ChunkerConfig;
-use crate::repo::pack::PackType;
 use crate::repo::EncryptionMode;
+use crate::repo::pack::PackType;
 use crate::repo::{Repository, WriteSessionOptions};
-use crate::testutil::{test_repo_plaintext, MemoryBackend, PutLog, RecordingBackend};
+use crate::testutil::{MemoryBackend, PutLog, RecordingBackend, test_repo_plaintext};
 use vykar_common::paths;
 
 #[test]
@@ -470,7 +470,7 @@ fn flush_on_abort_writes_pending_index() {
     use crate::compress;
     use crate::config::RepositoryConfig;
     use crate::index::PendingPackEntry;
-    use crate::repo::format::{unpack_object_expect_with_context, ObjectType};
+    use crate::repo::format::{ObjectType, unpack_object_expect_with_context};
 
     crate::testutil::init_test_environment();
 

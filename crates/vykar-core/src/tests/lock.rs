@@ -1,8 +1,8 @@
 use crate::repo::lock::{
-    acquire_lock, break_lock, cleanup_stale_locks_inner, cleanup_stale_sessions,
-    clear_all_sessions, default_stale_session_duration, format_age, format_age_since,
-    refresh_session, register_session, release_lock, session_marker_key, SessionEntry,
-    SessionGuard, SESSION_STALE_SECS,
+    SESSION_STALE_SECS, SessionEntry, SessionGuard, acquire_lock, break_lock,
+    cleanup_stale_locks_inner, cleanup_stale_sessions, clear_all_sessions,
+    default_stale_session_duration, format_age, format_age_since, refresh_session,
+    register_session, release_lock, session_marker_key,
 };
 use crate::testutil::MemoryBackend;
 use chrono::{Duration, Utc};
@@ -752,8 +752,8 @@ fn session_guard_drop_stops_thread_before_deregister() {
 mod deadline {
     use crate::repo::lock::{acquire_lock, acquire_lock_with_deadline, release_lock};
     use crate::testutil::MemoryBackend;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
     use vykar_storage::StorageBackend;
     use vykar_types::error::VykarError;
@@ -853,7 +853,7 @@ mod exclusion {
     use chrono::Utc;
     use std::collections::HashSet;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::{mpsc, Arc, Barrier, Condvar, Mutex};
+    use std::sync::{Arc, Barrier, Condvar, Mutex, mpsc};
     use std::time::{Duration, Instant};
     use vykar_storage::StorageBackend;
     use vykar_types::error::VykarError;
@@ -1140,21 +1140,25 @@ mod exclusion {
                     Arc::clone(&inside),
                     Arc::clone(&max_inside),
                 );
-                std::thread::spawn(move || loop {
-                    match acquire_lock(&*storage) {
-                        Ok(guard) => {
-                            let n = inside.fetch_add(1, Ordering::SeqCst) + 1;
-                            max_inside.fetch_max(n, Ordering::SeqCst);
-                            std::thread::sleep(Duration::from_millis(2));
-                            inside.fetch_sub(1, Ordering::SeqCst);
-                            release_lock(&*storage, guard).unwrap();
-                            return;
+                std::thread::spawn(move || {
+                    loop {
+                        match acquire_lock(&*storage) {
+                            Ok(guard) => {
+                                let n = inside.fetch_add(1, Ordering::SeqCst) + 1;
+                                max_inside.fetch_max(n, Ordering::SeqCst);
+                                std::thread::sleep(Duration::from_millis(2));
+                                inside.fetch_sub(1, Ordering::SeqCst);
+                                release_lock(&*storage, guard).unwrap();
+                                return;
+                            }
+                            Err(VykarError::Locked(_)) => {
+                                assert!(Instant::now() < deadline, "thread starved");
+                                std::thread::sleep(Duration::from_micros(
+                                    rand::random::<u64>() % 3000,
+                                ));
+                            }
+                            Err(e) => panic!("unexpected error: {e}"),
                         }
-                        Err(VykarError::Locked(_)) => {
-                            assert!(Instant::now() < deadline, "thread starved");
-                            std::thread::sleep(Duration::from_micros(rand::random::<u64>() % 3000));
-                        }
-                        Err(e) => panic!("unexpected error: {e}"),
                     }
                 })
             })

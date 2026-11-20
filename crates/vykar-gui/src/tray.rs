@@ -7,7 +7,7 @@ use std::rc::Rc;
 
 use slint::{Image, ModelRc, Rgba8Pixel, SharedPixelBuffer, SharedString, VecModel};
 
-use crate::{VykarTray, APP_TITLE};
+use crate::{APP_TITLE, VykarTray};
 
 #[cfg(target_os = "linux")]
 pub(crate) mod linux;
@@ -70,8 +70,8 @@ pub(crate) fn shutdown() {
 /// follows. Returns the `scheme-override` value for `VykarTray`.
 #[cfg(target_os = "windows")]
 fn taskbar_scheme_override() -> i32 {
-    use winreg::enums::HKEY_CURRENT_USER;
     use winreg::RegKey;
+    use winreg::enums::HKEY_CURRENT_USER;
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     match hkcu
         .open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")

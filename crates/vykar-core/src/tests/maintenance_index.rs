@@ -4,11 +4,11 @@
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use vykar_storage::{delegate_storage_backend, ConditionalGet, InnerBackend, StorageBackend};
+use vykar_storage::{ConditionalGet, InnerBackend, StorageBackend, delegate_storage_backend};
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
 
@@ -16,8 +16,8 @@ use crate::commands;
 use crate::commands::backup::{self, BackupProgressEvent};
 use crate::commands::util::with_maintenance_lock;
 use crate::config::{RetentionConfig, SourceEntry, VykarConfig};
-use crate::index::dedup_cache::{self, MmapDedupCache, MmapFullIndexCache, MmapRestoreCache};
 use crate::index::ChunkIndexEntry;
+use crate::index::dedup_cache::{self, MmapDedupCache, MmapFullIndexCache, MmapRestoreCache};
 use crate::repo::format::ObjectType;
 use crate::repo::{OpenOptions, RepoFormat, Repository};
 

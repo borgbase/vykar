@@ -1257,11 +1257,7 @@ pub type StateHash = [u8; 32];
 /// `state_hash`, with 0 mapped to 1 because generation 0 means "no cache".
 pub fn generation_for_state(state_hash: &StateHash) -> u64 {
     let g = read_u64_le(state_hash[..8].try_into().expect("8-byte prefix"));
-    if g == 0 {
-        1
-    } else {
-        g
-    }
+    if g == 0 { 1 } else { g }
 }
 
 /// Size of one canonical record (see [`encode_full_entry`]).

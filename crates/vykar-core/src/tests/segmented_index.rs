@@ -7,14 +7,14 @@ use crate::index::dedup_cache::{full_index_cache_path, generation_for_state};
 use crate::index::head::empty_state_hash;
 use crate::repo::format::ObjectType;
 use crate::repo::identity::{self, KeyProof};
-use crate::repo::index_store::tests::{entries, index_with, Writer};
 use crate::repo::index_store::INDEX_OBJECT_DIR;
+use crate::repo::index_store::tests::{Writer, entries, index_with};
 use crate::repo::{
-    derive_plaintext_chunk_id_key, EncryptionMode, OpenOptions, RepoFormat, Repository,
+    EncryptionMode, OpenOptions, RepoFormat, Repository, derive_plaintext_chunk_id_key,
 };
 use crate::testutil::MemoryBackend;
 use vykar_crypto::key::{EncryptedKey, MasterKey};
-use vykar_storage::{delegate_storage_backend, InnerBackend, StorageBackend};
+use vykar_storage::{InnerBackend, StorageBackend, delegate_storage_backend};
 use vykar_types::error::Result;
 
 /// Logs `get` and `list` calls in order.
@@ -334,8 +334,8 @@ fn plaintext_key_follows_the_chunk_hash() {
 #[test]
 fn encrypted_writes_round_trip() {
     use crate::compress::Compression;
-    use crate::repo::pack::PackType;
     use crate::repo::WriteSessionOptions;
+    use crate::repo::pack::PackType;
 
     for format in [RepoFormat::V4, RepoFormat::V5] {
         let mut env = init(format, EncryptionMode::Aes256Gcm);

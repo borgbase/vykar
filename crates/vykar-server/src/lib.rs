@@ -28,7 +28,7 @@ use clap::Parser;
 use tokio::net::TcpListener;
 use tracing::{info, warn};
 
-use crate::config::{parse_size, ServerSection};
+use crate::config::{ServerSection, parse_size};
 use crate::error::StartupError;
 use crate::state::AppState;
 
@@ -209,7 +209,7 @@ impl ShutdownSignals {
     fn install() -> std::io::Result<Self> {
         #[cfg(unix)]
         {
-            use tokio::signal::unix::{signal, SignalKind};
+            use tokio::signal::unix::{SignalKind, signal};
             Ok(Self {
                 interrupt: signal(SignalKind::interrupt())?,
                 terminate: signal(SignalKind::terminate())?,

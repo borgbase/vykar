@@ -268,7 +268,7 @@ fn terminal_columns() -> usize {
 /// Query the OS for the terminal width of stderr.
 #[cfg(unix)]
 fn terminal_columns_os() -> Option<usize> {
-    use libc::{ioctl, winsize, STDERR_FILENO, TIOCGWINSZ};
+    use libc::{STDERR_FILENO, TIOCGWINSZ, ioctl, winsize};
     // SAFETY: `winsize` is a C POD; ioctl with TIOCGWINSZ writes the struct
     // through the `&mut ws` pointer, which is exclusive and properly aligned.
     unsafe {
@@ -284,7 +284,7 @@ fn terminal_columns_os() -> Option<usize> {
 #[cfg(windows)]
 fn terminal_columns_os() -> Option<usize> {
     use windows_sys::Win32::System::Console::{
-        GetConsoleScreenBufferInfo, GetStdHandle, CONSOLE_SCREEN_BUFFER_INFO, STD_ERROR_HANDLE,
+        CONSOLE_SCREEN_BUFFER_INFO, GetConsoleScreenBufferInfo, GetStdHandle, STD_ERROR_HANDLE,
     };
     // SAFETY: GetStdHandle is always sound; CONSOLE_SCREEN_BUFFER_INFO is a
     // C POD that the kernel populates through the exclusive `&mut info`
@@ -294,11 +294,7 @@ fn terminal_columns_os() -> Option<usize> {
         let mut info: CONSOLE_SCREEN_BUFFER_INFO = std::mem::zeroed();
         if GetConsoleScreenBufferInfo(handle, &mut info) != 0 {
             let width = (info.srWindow.Right - info.srWindow.Left + 1) as usize;
-            if width > 0 {
-                Some(width)
-            } else {
-                None
-            }
+            if width > 0 { Some(width) } else { None }
         } else {
             None
         }

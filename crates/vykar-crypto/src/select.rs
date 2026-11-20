@@ -1,8 +1,8 @@
 use std::time::Instant;
 
+use super::CryptoEngine;
 use super::aes_gcm::Aes256GcmEngine;
 use super::chacha20_poly1305::ChaCha20Poly1305Engine;
-use super::CryptoEngine;
 use vykar_types::chunk_id::ChunkHasher;
 use vykar_types::hash::HashAlgorithm;
 
@@ -141,7 +141,7 @@ fn choose_from_scores(gcm: f64, chacha: f64) -> AutoAeadMode {
 
 #[cfg(test)]
 mod tests {
-    use super::{choose_from_scores, weighted_score, AutoAeadMode};
+    use super::{AutoAeadMode, choose_from_scores, weighted_score};
 
     #[test]
     fn chooser_prefers_chacha_on_clear_win() {

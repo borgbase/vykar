@@ -4,7 +4,7 @@ use std::sync::atomic::AtomicBool;
 use crate::progress::BackupProgressRenderer;
 use vykar_core::app::operations::{self, CycleEvent, CycleStep, FullCycleResult, StepOutcome};
 use vykar_core::config::{EncryptionModeConfig, ResolvedRepo, VykarConfig};
-use vykar_storage::{parse_repo_url, ParsedUrl};
+use vykar_storage::{ParsedUrl, parse_repo_url};
 
 use crate::cli::{Commands, KeyCommand};
 use crate::cmd;

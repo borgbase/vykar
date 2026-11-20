@@ -22,7 +22,7 @@ mod open;
 mod pack_lookup;
 mod pack_recovery;
 mod pack_verify;
-pub use key::{select_repository_key, LoadedKey};
+pub use key::{LoadedKey, select_repository_key};
 #[cfg(any(test, feature = "fuzzing"))]
 pub(crate) use open::derive_plaintext_chunk_id_key;
 mod read;
@@ -40,7 +40,7 @@ use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use self::write_session::WriteSessionState;
-use crate::config::{default_max_pack_size, default_min_pack_size, ChunkerConfig};
+use crate::config::{ChunkerConfig, default_max_pack_size, default_min_pack_size};
 use crate::index::ChunkIndex;
 use vykar_crypto::CryptoEngine;
 use vykar_storage::StorageBackend;

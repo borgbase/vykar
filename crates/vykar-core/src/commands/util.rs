@@ -9,7 +9,7 @@ use crate::config::{EncryptionModeConfig, VykarConfig};
 use crate::limits;
 use crate::repo::lock;
 use crate::repo::lock::SessionEntry;
-use crate::repo::{identity, OpenOptions, Repository};
+use crate::repo::{OpenOptions, Repository, identity};
 use crate::storage;
 use vykar_storage::StorageBackend;
 use vykar_types::error::{

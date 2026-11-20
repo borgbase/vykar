@@ -1,18 +1,18 @@
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use tracing::{info, warn};
 
 use super::util::{check_interrupted, open_repo, with_maintenance_lock};
 use crate::config::VykarConfig;
-use crate::repo::pack::{PackType, PackWriter};
 use crate::repo::OpenOptions;
 use crate::repo::Repository;
+use crate::repo::pack::{PackType, PackWriter};
 use vykar_protocol::{
-    repack_op_output_size, validate_pack_header, RepackBlobRef, RepackOperationRequest,
-    RepackPlanRequest, MAX_REPACK_OUTPUT_BYTES, PACK_HEADER_SIZE,
+    MAX_REPACK_OUTPUT_BYTES, PACK_HEADER_SIZE, RepackBlobRef, RepackOperationRequest,
+    RepackPlanRequest, repack_op_output_size, validate_pack_header,
 };
 use vykar_storage::StorageBackend;
 use vykar_types::chunk_id::ChunkId;
@@ -888,7 +888,7 @@ mod listing_tests {
 mod repack_chunk_tests {
     use super::chunk_repack_operations;
     use vykar_protocol::{
-        repack_op_output_size, RepackBlobRef, RepackOperationRequest, MAX_REPACK_OUTPUT_BYTES,
+        MAX_REPACK_OUTPUT_BYTES, RepackBlobRef, RepackOperationRequest, repack_op_output_size,
     };
 
     fn op_with_blob(length: u64) -> RepackOperationRequest {

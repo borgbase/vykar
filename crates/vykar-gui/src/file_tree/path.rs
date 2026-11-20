@@ -174,8 +174,8 @@ pub(super) fn transform_items(
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_support::dir;
     use super::super::FileTree;
+    use super::super::test_support::dir;
 
     #[test]
     fn common_prefix_return_values() {

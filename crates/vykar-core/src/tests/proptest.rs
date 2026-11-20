@@ -4,7 +4,7 @@ use proptest::prelude::*;
 
 use crate::index::{ChunkIndex, ChunkIndexEntry, IndexBlob};
 use crate::repo::format::{
-    pack_object_streaming_with_context, unpack_object_expect_with_context_into, ObjectType,
+    ObjectType, pack_object_streaming_with_context, unpack_object_expect_with_context_into,
 };
 use crate::snapshot::item::{ChunkRef, Item, ItemType};
 use vykar_crypto::aes_gcm::Aes256GcmEngine;
@@ -311,7 +311,7 @@ mod chunker {
 
     use proptest::prelude::*;
 
-    use crate::chunker::{chunk_data, chunk_stream, chunk_stream_bounded, ChunkReader};
+    use crate::chunker::{ChunkReader, chunk_data, chunk_stream, chunk_stream_bounded};
     use crate::config::ChunkerConfig;
 
     /// Generate valid ChunkerConfig values that respect fastcdc's hard bounds:
@@ -537,7 +537,7 @@ mod backup_restore {
 mod compression {
     use proptest::prelude::*;
 
-    use crate::compress::{compress, compressed_size_bound, decompress, Compression};
+    use crate::compress::{Compression, compress, compressed_size_bound, decompress};
 
     fn arb_compression() -> impl Strategy<Value = Compression> {
         prop_oneof![
@@ -637,8 +637,8 @@ mod index_delta {
 
     /// Generate an IndexDelta with new_entries that may contain duplicate chunk_ids,
     /// plus refcount_bumps targeting a subset of those new_entry IDs.
-    fn arb_index_delta_standalone(
-    ) -> impl Strategy<Value = (IndexDelta, Vec<NewChunkEntry>, HashMap<ChunkId, u32>)> {
+    fn arb_index_delta_standalone()
+    -> impl Strategy<Value = (IndexDelta, Vec<NewChunkEntry>, HashMap<ChunkId, u32>)> {
         prop::collection::vec(arb_chunk_id().prop_flat_map(arb_new_chunk_entry), 1..30)
             .prop_flat_map(|entries| {
                 let ids: Vec<ChunkId> = entries.iter().map(|e| e.chunk_id).collect();

@@ -11,10 +11,10 @@ use slint::ComponentHandle;
 use vykar_core::app;
 
 use crate::controllers::password_dialog;
-use crate::messages::{log_entry_now, AppCommand, UiEvent};
+use crate::messages::{AppCommand, UiEvent, log_entry_now};
 use crate::repo_helpers::send_log;
-use crate::{autostart, event_consumer, scheduler, state, tray, ui_state, update_check, worker};
 use crate::{AppData, MainWindow, VykarTray};
+use crate::{autostart, event_consumer, scheduler, state, tray, ui_state, update_check, worker};
 
 /// Create the main window and seed its initial (pre-worker) state.
 pub(crate) fn init_main_window(

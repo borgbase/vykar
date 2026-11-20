@@ -4,8 +4,8 @@ use std::sync::atomic::AtomicBool;
 use zeroize::Zeroizing;
 
 use crate::app::operations::{
-    run_backup_selection, run_full_cycle_for_repo, run_full_cycle_with_passphrase_source,
-    run_hooked_step, BackupRunEvent, CycleEvent, CycleStep, FullCycleResult, StepOutcome,
+    BackupRunEvent, CycleEvent, CycleStep, FullCycleResult, StepOutcome, run_backup_selection,
+    run_full_cycle_for_repo, run_full_cycle_with_passphrase_source, run_hooked_step,
 };
 use crate::config::{HooksConfig, ResolvedRepo, SourceHooksConfig};
 use crate::testutil::{cmd_append, env_word};
@@ -244,10 +244,12 @@ fn cycle_before_backup_skip_skips_every_step() {
     let result = run_cycle(&repo);
 
     assert_eq!(result.steps.len(), 4);
-    assert!(result
-        .steps
-        .iter()
-        .all(|(_, o)| matches!(o, StepOutcome::Skipped(_))));
+    assert!(
+        result
+            .steps
+            .iter()
+            .all(|(_, o)| matches!(o, StepOutcome::Skipped(_)))
+    );
     assert!(!result.has_failures());
     assert!(result.backup_skipped().is_some());
     assert!(result.backup_report.is_none());
@@ -510,9 +512,11 @@ fn missing_source_does_not_stop_the_next_one() {
     assert_eq!(report.failed.len(), 1);
     assert_eq!(report.failed[0].label, "gone");
     assert!(report.aborted.is_none());
-    assert!(report
-        .failure_summary()
-        .is_some_and(|s| s.starts_with("source 'gone': ")));
+    assert!(
+        report
+            .failure_summary()
+            .is_some_and(|s| s.starts_with("source 'gone': "))
+    );
     assert_eq!(source_failed_labels(&events), vec!["gone"]);
 }
 

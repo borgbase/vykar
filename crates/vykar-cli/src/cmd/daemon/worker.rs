@@ -13,9 +13,9 @@
 //! until its next cycle or a reload. Status I/O does not retry.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::Local;

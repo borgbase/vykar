@@ -8,9 +8,9 @@ mod status;
 mod worker;
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use vykar_core::app::passphrase::configured_passphrase;

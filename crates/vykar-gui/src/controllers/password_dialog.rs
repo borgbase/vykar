@@ -3,7 +3,7 @@ use std::sync::mpsc;
 
 use slint::{ComponentHandle, Weak};
 
-use crate::{event_consumer, MainWindow};
+use crate::{MainWindow, event_consumer};
 
 thread_local! {
     static MAIN_WINDOW: RefCell<Option<Weak<MainWindow>>> = const { RefCell::new(None) };

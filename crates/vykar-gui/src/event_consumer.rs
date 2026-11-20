@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crossbeam_channel::Receiver;
 use slint::{ComponentHandle, Model, ModelRc, SharedString, StandardListViewItem, VecModel};

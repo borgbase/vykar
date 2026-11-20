@@ -3,10 +3,10 @@ use std::sync::Arc;
 use vykar_core::commands::mount::{self, MountProgressEvent};
 
 use crate::messages::UiEvent;
-use crate::repo_helpers::{find_repo_for_snapshot, send_log, with_passphrase_retry, PassphraseRun};
+use crate::repo_helpers::{PassphraseRun, find_repo_for_snapshot, send_log, with_passphrase_retry};
 
-use super::shared::OpGuard;
 use super::WorkerContext;
+use super::shared::OpGuard;
 
 pub(crate) struct MountHandle {
     shutdown: Arc<tokio::sync::Notify>,

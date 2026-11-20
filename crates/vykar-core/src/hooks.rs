@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crate::config::{HooksConfig, SourceHooksConfig, HOOK_COMMANDS};
+use crate::config::{HOOK_COMMANDS, HooksConfig, SourceHooksConfig};
 use crate::platform::shell;
 use vykar_types::error::{Result, VykarError};
 

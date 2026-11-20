@@ -28,20 +28,22 @@ where
     let first_err: Mutex<Option<E>> = Mutex::new(None);
     std::thread::scope(|s| {
         for _ in 0..threads {
-            s.spawn(|| loop {
-                if failed.load(Ordering::Relaxed) {
-                    break;
-                }
-                let Some(item) = items.get(next.fetch_add(1, Ordering::Relaxed)) else {
-                    break;
-                };
-                if let Err(e) = task(item) {
-                    failed.store(true, Ordering::Relaxed);
-                    let mut slot = first_err.lock().unwrap_or_else(PoisonError::into_inner);
-                    if slot.is_none() {
-                        *slot = Some(e);
+            s.spawn(|| {
+                loop {
+                    if failed.load(Ordering::Relaxed) {
+                        break;
                     }
-                    break;
+                    let Some(item) = items.get(next.fetch_add(1, Ordering::Relaxed)) else {
+                        break;
+                    };
+                    if let Err(e) = task(item) {
+                        failed.store(true, Ordering::Relaxed);
+                        let mut slot = first_err.lock().unwrap_or_else(PoisonError::into_inner);
+                        if slot.is_none() {
+                            *slot = Some(e);
+                        }
+                        break;
+                    }
                 }
             });
         }
@@ -82,14 +84,16 @@ pub(crate) fn for_each_bounded<T, F>(
     let next = AtomicUsize::new(0);
     std::thread::scope(|s| {
         for _ in 0..threads {
-            s.spawn(|| loop {
-                if cancelled() {
-                    break;
+            s.spawn(|| {
+                loop {
+                    if cancelled() {
+                        break;
+                    }
+                    let Some(item) = items.get(next.fetch_add(1, Ordering::Relaxed)) else {
+                        break;
+                    };
+                    task(item);
                 }
-                let Some(item) = items.get(next.fetch_add(1, Ordering::Relaxed)) else {
-                    break;
-                };
-                task(item);
             });
         }
     });
@@ -128,11 +132,7 @@ mod tests {
         let calls = counters(items.len());
         let result = try_for_each_bounded(1, &items, |&i| {
             calls[i].fetch_add(1, Ordering::SeqCst);
-            if i == 3 || i == 7 {
-                Err(i)
-            } else {
-                Ok(())
-            }
+            if i == 3 || i == 7 { Err(i) } else { Ok(()) }
         });
         assert_eq!(result, Err(3));
         assert_eq!(counts(&calls), [1, 1, 1, 1, 0, 0, 0, 0, 0, 0]);

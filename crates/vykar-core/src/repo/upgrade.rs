@@ -20,9 +20,9 @@ use super::format::ObjectType;
 use super::index_fetch::{self, IndexObject};
 use super::index_store;
 use super::{RepoConfig, RepoFormat, Repository};
-use crate::index::dedup_cache::{self, generation_for_state, MmapFullIndexCache};
-use crate::index::head::IndexHead;
 use crate::index::ChunkIndex;
+use crate::index::dedup_cache::{self, MmapFullIndexCache, generation_for_state};
+use crate::index::head::IndexHead;
 use vykar_types::error::{Result, VykarError};
 
 /// What [`Repository::upgrade_index_layout`] did.
@@ -127,7 +127,7 @@ impl Repository {
                             "the index head left by an interrupted upgrade cannot be read \
                              ({e}); run `vykar check --repair` to rebuild it, then `vykar \
                              upgrade` again"
-                        )))
+                        )));
                     }
                     other => other.into_head()?,
                 };

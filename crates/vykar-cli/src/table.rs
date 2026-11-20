@@ -1,6 +1,6 @@
 use std::io::IsTerminal;
 
-use comfy_table::{presets::NOTHING, Attribute, Cell, Table};
+use comfy_table::{Attribute, Cell, Table, presets::NOTHING};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct CliTableTheme {

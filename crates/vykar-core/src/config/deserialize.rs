@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::fmt;
 
-use serde::de;
 use serde::Deserialize;
+use serde::de;
 
 pub(super) const STRICT_STRING_ERROR: &str = "string value must be quoted";
 pub(super) const NULL_VALUE_ERROR: &str =

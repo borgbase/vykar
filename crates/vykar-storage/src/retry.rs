@@ -287,27 +287,39 @@ mod tests {
 
     #[test]
     fn classify_status_retryable() {
-        assert!(classify_status(429, "rate limit".into())
-            .unwrap_err()
-            .is_retryable());
-        assert!(classify_status(500, "internal".into())
-            .unwrap_err()
-            .is_retryable());
-        assert!(classify_status(503, "unavail".into())
-            .unwrap_err()
-            .is_retryable());
+        assert!(
+            classify_status(429, "rate limit".into())
+                .unwrap_err()
+                .is_retryable()
+        );
+        assert!(
+            classify_status(500, "internal".into())
+                .unwrap_err()
+                .is_retryable()
+        );
+        assert!(
+            classify_status(503, "unavail".into())
+                .unwrap_err()
+                .is_retryable()
+        );
     }
 
     #[test]
     fn classify_status_permanent() {
-        assert!(!classify_status(400, "bad req".into())
-            .unwrap_err()
-            .is_retryable());
-        assert!(!classify_status(403, "forbidden".into())
-            .unwrap_err()
-            .is_retryable());
-        assert!(!classify_status(404, "not found".into())
-            .unwrap_err()
-            .is_retryable());
+        assert!(
+            !classify_status(400, "bad req".into())
+                .unwrap_err()
+                .is_retryable()
+        );
+        assert!(
+            !classify_status(403, "forbidden".into())
+                .unwrap_err()
+                .is_retryable()
+        );
+        assert!(
+            !classify_status(404, "not found".into())
+                .unwrap_err()
+                .is_retryable()
+        );
     }
 }

@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use nix::errno::Errno;
 
 use crate::config::ResourceLimitsConfig;
-use vykar_storage::{delegate_storage_backend, InnerBackend, StorageBackend};
+use vykar_storage::{InnerBackend, StorageBackend, delegate_storage_backend};
 use vykar_types::error::Result;
 
 // ── Rate limiting runtime ────────────────────────────────────────────────────

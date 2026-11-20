@@ -4,12 +4,12 @@ use std::thread::JoinHandle;
 use tracing::{debug, warn};
 
 use crate::compress;
-use crate::index::{encode_pending_journal, PendingIndexJournal, PendingPackEntry};
+use crate::index::{PendingIndexJournal, PendingPackEntry, encode_pending_journal};
 use vykar_crypto::CryptoEngine;
 use vykar_storage::StorageBackend;
 use vykar_types::error::Result;
 
-use super::format::{pack_object_with_context, ObjectType};
+use super::format::{ObjectType, pack_object_with_context};
 use super::lock::session_index_key;
 
 /// Number of new packs between debounced `pending_index` writes.
@@ -217,7 +217,7 @@ pub(super) mod tests {
     use super::*;
     use crate::index::PendingChunkEntry;
     use crate::repo::write_session::tests::test_crypto;
-    use crate::testutil::{init_test_environment, MemoryBackend};
+    use crate::testutil::{MemoryBackend, init_test_environment};
     use vykar_types::chunk_id::ChunkId;
     use vykar_types::pack_id::PackId;
 

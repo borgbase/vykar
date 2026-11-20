@@ -11,25 +11,25 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
-use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::Aes256Gcm;
-use vykar_core::compress::{compress, Compression};
+use aes_gcm::aead::{Aead, KeyInit};
+use vykar_core::compress::{Compression, compress};
 use vykar_core::config::ChunkerConfig;
 use vykar_core::index::base::encode_base;
 use vykar_core::index::dedup_cache::{
-    build_full_index_cache_to_path, FullCacheEntry, MmapFullIndexCache,
+    FullCacheEntry, MmapFullIndexCache, build_full_index_cache_to_path,
 };
 use vykar_core::index::head::{BaseRef, IndexHead, ObjectName, SegmentRef};
-use vykar_core::index::segment::{diff_to_temp, RefcountDelta, Relocation, Segment};
+use vykar_core::index::segment::{RefcountDelta, Relocation, Segment, diff_to_temp};
 use vykar_core::index::{
-    encode_pending_journal, ChunkIndex, IndexBlob, PendingChunkEntry, PendingPackEntry,
+    ChunkIndex, IndexBlob, PendingChunkEntry, PendingPackEntry, encode_pending_journal,
 };
 use vykar_core::repo::file_cache::{CachedChunkRef, CachedChunks, FileCache};
-use vykar_core::repo::format::{pack_object_with_context, ObjectType};
+use vykar_core::repo::format::{ObjectType, pack_object_with_context};
 use vykar_core::repo::pack::{PackType, PackWriter};
 use vykar_core::repo::{EncryptionMode, RepoConfig};
-use vykar_core::snapshot::item::{ChunkRef, Item, ItemRawNames, ItemType};
 use vykar_core::snapshot::SnapshotMeta;
+use vykar_core::snapshot::item::{ChunkRef, Item, ItemRawNames, ItemType};
 use vykar_crypto::key::{EncryptedKey, KdfParams};
 use vykar_crypto::{CryptoEngine, PlaintextEngine};
 use vykar_types::chunk_id::{ChunkHasher, ChunkId};

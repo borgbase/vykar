@@ -1,16 +1,16 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::commands;
 use crate::commands::check::{
-    process_verify_response, try_server_verify, verify_pack_full, CheckError, IntegrityIssue,
-    RepairAction, RepairMode, ServerVerifyOutcome,
+    CheckError, IntegrityIssue, RepairAction, RepairMode, ServerVerifyOutcome,
+    process_verify_response, try_server_verify, verify_pack_full,
 };
 use crate::index::ChunkIndexEntry;
 use vykar_protocol::{VerifyPackResult, VerifyPacksPlanRequest, VerifyPacksResponse};
-use vykar_storage::local_backend::LocalBackend;
 use vykar_storage::StorageBackend;
+use vykar_storage::local_backend::LocalBackend;
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
 use vykar_types::pack_id::PackId;
@@ -321,9 +321,11 @@ fn test_process_verify_response_missing_packs() {
         errors[0].message.contains("pack3"),
         "error should mention the missing pack"
     );
-    assert!(errors[0]
-        .message
-        .contains("not included in server response"));
+    assert!(
+        errors[0]
+            .message
+            .contains("not included in server response")
+    );
 }
 
 #[test]
@@ -996,14 +998,18 @@ fn repair_drops_items_rebuilds_refcounts() {
     let result =
         commands::check::run_with_repair(&config, None, false, RepairMode::Apply, None, None)
             .unwrap();
-    assert!(result
-        .applied
-        .iter()
-        .any(|a| matches!(a, RepairAction::DropItemsFromSnapshot { .. })));
-    assert!(result
-        .applied
-        .iter()
-        .any(|a| matches!(a, RepairAction::RebuildRefcounts)));
+    assert!(
+        result
+            .applied
+            .iter()
+            .any(|a| matches!(a, RepairAction::DropItemsFromSnapshot { .. }))
+    );
+    assert!(
+        result
+            .applied
+            .iter()
+            .any(|a| matches!(a, RepairAction::RebuildRefcounts))
+    );
 
     // After repair, every chunk in the index must have refcount > 0; no
     // ghost entries remain. snap-b's chunks are unchanged.
@@ -1038,7 +1044,7 @@ fn repair_drops_items_rebuilds_refcounts() {
 /// the (frozen) envelope otherwise intact. Used to simulate a snapshot written
 /// by a future vykar.
 fn bump_snapshot_version_on_disk(repo_dir: &std::path::Path, snapshot_name: &str, version: u32) {
-    use crate::repo::format::{pack_object_with_context, ObjectType};
+    use crate::repo::format::{ObjectType, pack_object_with_context};
     let repo = open_local_repo(repo_dir);
     let entry = repo
         .manifest()
@@ -1111,7 +1117,7 @@ fn check_flags_unsupported_version_and_repair_refuses() {
 /// Longer, not shorter: a shorter array still decodes via `#[serde(default)]`,
 /// which is what makes the format backward-readable.
 fn extend_snapshot_envelope_on_disk(repo_dir: &std::path::Path, snapshot_name: &str) {
-    use crate::repo::format::{pack_object_with_context, ObjectType};
+    use crate::repo::format::{ObjectType, pack_object_with_context};
     use crate::snapshot::SNAPSHOT_META_FIELD_COUNT;
 
     let repo = open_local_repo(repo_dir);

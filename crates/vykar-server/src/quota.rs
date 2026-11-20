@@ -4,8 +4,8 @@
 #![allow(unsafe_code)]
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering::Relaxed};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering::Relaxed};
 
 use tracing::{debug, info};
 

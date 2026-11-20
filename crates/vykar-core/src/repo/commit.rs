@@ -4,13 +4,13 @@ use tracing::{debug, warn};
 
 use super::file_cache;
 use super::format::{
-    pack_object_streaming_with_context, unpack_object_expect_with_context, ObjectType,
+    ObjectType, pack_object_streaming_with_context, unpack_object_expect_with_context,
 };
 use super::index_fetch::IndexObject;
 use super::index_store::{self, CacheLocation, SyncedIndex};
 use super::manifest::{self, Manifest};
 use super::snapshot_cache;
-use super::{IndexLayout, RepoFormat, Repository, INDEX_OBJECT_CONTEXT};
+use super::{INDEX_OBJECT_CONTEXT, IndexLayout, RepoFormat, Repository};
 use crate::compress;
 use crate::index::dedup_cache;
 use crate::index::head::IndexHead;

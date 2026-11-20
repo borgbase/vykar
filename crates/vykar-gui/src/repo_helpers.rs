@@ -6,8 +6,8 @@ use vykar_core::commands;
 use vykar_core::config::{self, ResolvedRepo};
 use vykar_types::error::VykarError;
 
-use crate::messages::{log_entry_now, UiEvent};
 use crate::APP_TITLE;
+use crate::messages::{UiEvent, log_entry_now};
 use vykar_common::display::format_bytes;
 
 /// Resolve a repo passphrase (configured source or interactive prompt),

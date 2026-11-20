@@ -434,9 +434,9 @@ mod tests {
     /// kept as a dev-dependency purely as an independent reference.
     #[test]
     fn compute_matches_rustcrypto_blake2() {
+        use blake2::Blake2bMac;
         use blake2::digest::consts::U32;
         use blake2::digest::{KeyInit, Mac};
-        use blake2::Blake2bMac;
 
         for key in [[0xAA; 32], counting_key(), [0u8; 32]] {
             for len in [0usize, 1, 63, 64, 127, 128, 129, 255, 1000, 4096] {

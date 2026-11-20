@@ -1,8 +1,8 @@
 use std::borrow::Cow;
 
-use crate::compress::{compress_append, compressed_size_bound, Compression};
+use crate::compress::{Compression, compress_append, compressed_size_bound};
 use crate::index::dedup_cache::{DedupPrefilter, PrefilterVerdict};
-use crate::repo::format::{pack_object_streaming_with_context, ObjectType};
+use crate::repo::format::{ObjectType, pack_object_streaming_with_context};
 use vykar_crypto::CryptoEngine;
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::Result;
@@ -123,10 +123,10 @@ mod tests {
     use crate::repo::format::unpack_object_expect_with_context;
     use vykar_crypto::PlaintextEngine;
 
-    use crate::index::dedup_cache::{
-        build_dedup_cache_to_path, chunk_id_to_u64, MmapDedupCache, TieredDedupIndex,
-    };
     use crate::index::ChunkIndex;
+    use crate::index::dedup_cache::{
+        MmapDedupCache, TieredDedupIndex, build_dedup_cache_to_path, chunk_id_to_u64,
+    };
     use std::sync::Arc;
     use vykar_types::pack_id::PackId;
 

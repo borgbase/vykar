@@ -5,12 +5,12 @@ mod parts;
 #[cfg(test)]
 pub(crate) mod test_helpers;
 
+use axum::Router;
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{Request, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::Router;
 use subtle::ConstantTimeEq;
 use tower_http::trace::TraceLayer;
 

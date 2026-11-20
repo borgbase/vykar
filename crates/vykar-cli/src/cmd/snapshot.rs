@@ -12,7 +12,7 @@ use crate::cli::{SnapshotCommand, SortField};
 use crate::error::{CliError, CliResult};
 use crate::format::{format_bytes, parse_size};
 use crate::passphrase::with_repo_passphrase;
-use crate::table::{add_kv_row, CliTableTheme};
+use crate::table::{CliTableTheme, add_kv_row};
 use vykar_common::display::{format_duration_seconds, format_optional_size, format_size_delta};
 
 fn normalize_path_filter(raw: &str) -> String {

@@ -117,11 +117,7 @@ pub(super) fn read_item_xattrs(path: &Path) -> Option<HashMap<String, Vec<u8>>> 
         }
     }
 
-    if attrs.is_empty() {
-        None
-    } else {
-        Some(attrs)
-    }
+    if attrs.is_empty() { None } else { Some(attrs) }
 }
 
 #[cfg(not(unix))]
@@ -1066,7 +1062,7 @@ mod tests {
                     std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::InvalidInput
                 ) =>
             {
-                return
+                return;
             }
             Err(e) => panic!("unexpected bind error: {e}"),
         };
@@ -1294,7 +1290,7 @@ mod tests {
                     std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::InvalidInput
                 ) =>
             {
-                return
+                return;
             }
             Err(e) => panic!("unexpected bind error: {e}"),
         };

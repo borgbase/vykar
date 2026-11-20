@@ -3,8 +3,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use smallvec::SmallVec;
 
@@ -14,7 +14,7 @@ use crate::snapshot::item::{ChunkRef, HardlinkId, Item, ItemType};
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
 
-use super::{push_metadata_warning, warn_metadata_err, RestoreStats, MAX_HARDLINK_TRACKED};
+use super::{MAX_HARDLINK_TRACKED, RestoreStats, push_metadata_warning, warn_metadata_err};
 
 /// Recorded identity of a hard-link group's representative (the first member
 /// that passed the include filter). Later members of the same group are linked
@@ -958,12 +958,13 @@ mod tests {
             stats.warnings[0]
         );
         // Symlink was still created.
-        assert!(dest
-            .join("link")
-            .symlink_metadata()
-            .unwrap()
-            .file_type()
-            .is_symlink());
+        assert!(
+            dest.join("link")
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
     }
 
     #[test]
@@ -1074,17 +1075,21 @@ mod tests {
 
         // Absolute byte path → rejected.
         let abs = raw_path_item(b"/etc/\x80pwd");
-        assert!(sanitize_item_into(&abs, &mut out)
-            .unwrap_err()
-            .to_string()
-            .contains("absolute path"));
+        assert!(
+            sanitize_item_into(&abs, &mut out)
+                .unwrap_err()
+                .to_string()
+                .contains("absolute path")
+        );
 
         // `..` traversal in bytes → rejected.
         let dotdot = raw_path_item(b"../\x80escape");
-        assert!(sanitize_item_into(&dotdot, &mut out)
-            .unwrap_err()
-            .to_string()
-            .contains("unsafe path"));
+        assert!(
+            sanitize_item_into(&dotdot, &mut out)
+                .unwrap_err()
+                .to_string()
+                .contains("unsafe path")
+        );
 
         // Benign non-UTF8 relative name → accepted, exact bytes preserved.
         let benign = raw_path_item(b"sub/\x80ok.bin");
@@ -1294,11 +1299,13 @@ mod tests {
 
         // Symlink was created and points to the right target.
         let link_path = dest.join("mydir/link");
-        assert!(link_path
-            .symlink_metadata()
-            .unwrap()
-            .file_type()
-            .is_symlink());
+        assert!(
+            link_path
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
         assert_eq!(
             std::fs::read_link(&link_path).unwrap().to_str().unwrap(),
             "target"
@@ -1400,7 +1407,7 @@ mod tests {
         std::fs::create_dir_all(temp.path().join(".vykar-restore-notes")).unwrap();
         std::fs::create_dir_all(temp.path().join(".vykar-restore-0123456789abcde")).unwrap(); // 15
         std::fs::create_dir_all(temp.path().join(".vykar-restore-0123456789abcdef0")).unwrap(); // 17
-                                                                                                // A *file* named exactly like the valid pattern — not a directory.
+        // A *file* named exactly like the valid pattern — not a directory.
         std::fs::write(
             temp.path().join(".vykar-restore-fedcba9876543210"),
             b"not a dir",
@@ -1415,14 +1422,16 @@ mod tests {
         assert!(!temp.path().join(".vykar-restore-0123456789abcdef").exists());
         assert!(temp.path().join(".vykar-restore-notes").exists());
         assert!(temp.path().join(".vykar-restore-0123456789abcde").exists());
-        assert!(temp
-            .path()
-            .join(".vykar-restore-0123456789abcdef0")
-            .exists());
-        assert!(temp
-            .path()
-            .join(".vykar-restore-fedcba9876543210")
-            .is_file());
+        assert!(
+            temp.path()
+                .join(".vykar-restore-0123456789abcdef0")
+                .exists()
+        );
+        assert!(
+            temp.path()
+                .join(".vykar-restore-fedcba9876543210")
+                .is_file()
+        );
     }
 
     #[cfg(unix)]
@@ -1437,13 +1446,14 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("not empty"), "got: {err}");
-        assert!(temp
-            .path()
-            .join(".vykar-restore-aaaaaaaaaaaaaaaa")
-            .symlink_metadata()
-            .unwrap()
-            .file_type()
-            .is_symlink());
+        assert!(
+            temp.path()
+                .join(".vykar-restore-aaaaaaaaaaaaaaaa")
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
     }
 
     #[test]
@@ -1750,9 +1760,11 @@ mod tests {
         ];
         assert_conflict(plan_and_stage(&items, &fx.dest, 1), "x");
         assert_eq!(std::fs::read(&fx.victim).unwrap(), VICTIM_BYTES);
-        assert!(std::fs::symlink_metadata(fx.dest.join("x"))
-            .unwrap()
-            .is_file());
+        assert!(
+            std::fs::symlink_metadata(fx.dest.join("x"))
+                .unwrap()
+                .is_file()
+        );
     }
 
     #[test]

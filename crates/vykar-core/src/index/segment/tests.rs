@@ -693,8 +693,8 @@ mod merge {
     use std::sync::Arc;
 
     use super::*;
-    use crate::index::dedup_cache::{build_dedup_cache_to_path, MmapDedupCache};
     use crate::index::IndexDelta;
+    use crate::index::dedup_cache::{MmapDedupCache, build_dedup_cache_to_path};
 
     /// A delta whose positional bumps index a dedup cache of `session_start`.
     fn delta_over(session_start: &ChunkIndex, dir: &Path) -> IndexDelta {

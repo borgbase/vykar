@@ -95,7 +95,7 @@ fn resolve(ids: &[PackId], mut sizes: PackSizes) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::repo::pack_lookup::tests::{pack, Probe};
+    use crate::repo::pack_lookup::tests::{Probe, pack};
 
     fn stored(storage: &Probe, n: u32) -> HashSet<PackId> {
         (0..n)

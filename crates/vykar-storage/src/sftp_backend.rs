@@ -16,10 +16,10 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use russh::client;
+use russh::keys::PublicKeyOrCertificate;
 use russh::keys::known_hosts::{known_host_keys_path, learn_known_hosts_path};
 use russh::keys::ssh_key;
-use russh::keys::PublicKeyOrCertificate;
-use russh::keys::{load_public_key, load_secret_key, PrivateKey, PrivateKeyWithHashAlg};
+use russh::keys::{PrivateKey, PrivateKeyWithHashAlg, load_public_key, load_secret_key};
 use russh_sftp::client::{Config as SftpConfig, SftpSession};
 use russh_sftp::protocol::{OpenFlags, StatusCode};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -414,7 +414,7 @@ impl SftpBackend {
                         return Ok(ConnGuard {
                             conn: Some(conn),
                             backend: self,
-                        })
+                        });
                     }
                     Err(e) => {
                         self.release_slot();
@@ -831,8 +831,8 @@ async fn auth_with_agent(
     params: &SftpConnectParams,
     hash_alg: Option<ssh_key::HashAlg>,
 ) -> RetryResult<bool> {
-    use russh::keys::agent::AgentIdentity;
     use russh::AgentAuthError;
+    use russh::keys::agent::AgentIdentity;
 
     let agent_error = |e| ssh_retry_error("agent authentication", &params.host, params.port, e);
     let mut agent = match connect_agent(params.agent_socket.as_deref()).await {
@@ -2140,9 +2140,11 @@ mod tests {
             .block_on(SftpBackend::connect(&server.backend(0).params))
             .unwrap();
 
-        assert!(!ASYNC_RUNTIME
-            .block_on(auth_with_agent(&mut conn._session, &params, None))
-            .unwrap());
+        assert!(
+            !ASYNC_RUNTIME
+                .block_on(auth_with_agent(&mut conn._session, &params, None))
+                .unwrap()
+        );
         params.agent_key = Some(fault_server::client_private_key().public_key().clone());
         let err = ASYNC_RUNTIME
             .block_on(auth_with_agent(&mut conn._session, &params, None))

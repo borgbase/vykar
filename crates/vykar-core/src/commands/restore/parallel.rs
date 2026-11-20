@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use crate::commands::util::check_interrupted;
 use crate::compress;
 use crate::repo::format::{
-    unpack_object_expect_with_context_in_place, verify_chunk_id, ObjectType,
+    ObjectType, unpack_object_expect_with_context_in_place, verify_chunk_id,
 };
 use smallvec::SmallVec;
 use vykar_crypto::CryptoEngine;
@@ -889,14 +889,14 @@ mod tests {
     };
     use crate::compress::Compression;
     use crate::repo::format::pack_object_with_context;
-    use crate::testutil::{test_chunk_hasher, MemoryBackend};
+    use crate::testutil::{MemoryBackend, test_chunk_hasher};
     use smallvec::SmallVec;
     use std::path::PathBuf;
-    use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
     use tempfile::tempdir;
-    use vykar_crypto::aes_gcm::Aes256GcmEngine;
     use vykar_crypto::PlaintextEngine;
+    use vykar_crypto::aes_gcm::Aes256GcmEngine;
     use vykar_types::chunk_id::ChunkId;
 
     #[test]

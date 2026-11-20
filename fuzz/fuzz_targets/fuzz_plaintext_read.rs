@@ -9,7 +9,7 @@
 
 use libfuzzer_sys::fuzz_target;
 use vykar_core::compress::{decompress, decompress_with_hint};
-use vykar_core::repo::format::{unpack_object_expect_with_context, ObjectType};
+use vykar_core::repo::format::{ObjectType, unpack_object_expect_with_context};
 use vykar_core::repo::pack::scan_pack_blobs_bytes;
 use vykar_crypto::{CryptoEngine, PlaintextEngine};
 use vykar_types::chunk_id::{ChunkHasher, ChunkId};

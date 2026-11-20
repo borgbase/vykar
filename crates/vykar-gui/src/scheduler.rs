@@ -8,7 +8,7 @@ use vykar_core::app::scheduler::SchedulePlan;
 use vykar_core::config::ScheduleConfig;
 use vykar_types::error::VykarError;
 
-use crate::messages::{log_entry_now, AppCommand, UiEvent};
+use crate::messages::{AppCommand, UiEvent, log_entry_now};
 
 // Bounds post-wake latency: after system sleep or a wall-clock jump the loop
 // re-evaluates wall-clock state within this many seconds regardless of how
@@ -100,103 +100,105 @@ pub(crate) fn spawn_scheduler(
     backup_running: Arc<AtomicBool>,
     notify_rx: Receiver<()>,
 ) {
-    thread::spawn(move || loop {
-        let timeout = {
-            let state = match scheduler.lock() {
-                Ok(s) => s,
-                Err(_) => break,
-            };
+    thread::spawn(move || {
+        loop {
+            let timeout = {
+                let state = match scheduler.lock() {
+                    Ok(s) => s,
+                    Err(_) => break,
+                };
 
-            if !state.enabled || state.paused {
-                // Disabled or paused — block until notified of state change.
-                drop(state);
-                if notify_rx.recv().is_err() {
-                    break;
-                }
-                continue;
-            }
-
-            match state.plan.next_wake() {
-                Some(next) => {
-                    let wait = capped_wait(next, SystemTime::now());
-                    if wait.is_zero() {
-                        if backup_running.load(Ordering::SeqCst) {
-                            // Backup is running and a slot has passed — block
-                            // until woken by backup completion to avoid hot-spin.
-                            drop(state);
-                            if notify_rx.recv().is_err() {
-                                break;
-                            }
-                            continue;
-                        }
-                        // Time to run — will be handled below after select.
-                        Duration::ZERO
-                    } else {
-                        wait
-                    }
-                }
-                None => {
-                    // Nothing scheduled — block until notified.
+                if !state.enabled || state.paused {
+                    // Disabled or paused — block until notified of state change.
                     drop(state);
                     if notify_rx.recv().is_err() {
                         break;
                     }
                     continue;
                 }
-            }
-        };
 
-        // Wait for timeout or notification (state change / backup completion).
-        if !timeout.is_zero() {
-            crossbeam_channel::select! {
-                recv(notify_rx) -> res => {
-                    if res.is_err() {
-                        break;
+                match state.plan.next_wake() {
+                    Some(next) => {
+                        let wait = capped_wait(next, SystemTime::now());
+                        if wait.is_zero() {
+                            if backup_running.load(Ordering::SeqCst) {
+                                // Backup is running and a slot has passed — block
+                                // until woken by backup completion to avoid hot-spin.
+                                drop(state);
+                                if notify_rx.recv().is_err() {
+                                    break;
+                                }
+                                continue;
+                            }
+                            // Time to run — will be handled below after select.
+                            Duration::ZERO
+                        } else {
+                            wait
+                        }
                     }
-                    // State changed — re-evaluate from the top.
-                    continue;
+                    None => {
+                        // Nothing scheduled — block until notified.
+                        drop(state);
+                        if notify_rx.recv().is_err() {
+                            break;
+                        }
+                        continue;
+                    }
                 }
-                default(timeout) => {
-                    // Timeout reached — fall through to check if we should run.
-                }
-            }
-        }
-
-        // Re-check state under lock (may have changed during wait).
-        let mut due_names: Vec<String> = Vec::new();
-        {
-            let mut state = match scheduler.lock() {
-                Ok(s) => s,
-                Err(_) => break,
             };
 
-            if !state.enabled || state.paused {
-                continue;
-            }
-
-            if !backup_running.load(Ordering::SeqCst) {
-                let (names, errors) = state.take_due(SystemTime::now());
-                due_names = names;
-                // Only the offending repo loses its slot; the rest stay on
-                // schedule. Pausing globally here would let one bad cadence
-                // stop every backup silently.
-                for (repo, e) in errors {
-                    let _ = ui_tx.send(log_entry_now(format!(
-                        "[{repo}] scheduler error: {e}. This repository will not run \
-                         automatically until the config is fixed and reloaded."
-                    )));
+            // Wait for timeout or notification (state change / backup completion).
+            if !timeout.is_zero() {
+                crossbeam_channel::select! {
+                    recv(notify_rx) -> res => {
+                        if res.is_err() {
+                            break;
+                        }
+                        // State changed — re-evaluate from the top.
+                        continue;
+                    }
+                    default(timeout) => {
+                        // Timeout reached — fall through to check if we should run.
+                    }
                 }
             }
-        }
 
-        if !due_names.is_empty()
-            && app_tx
-                .send(AppCommand::RunBackupRepos {
-                    repo_names: due_names,
-                })
-                .is_err()
-        {
-            break;
+            // Re-check state under lock (may have changed during wait).
+            let mut due_names: Vec<String> = Vec::new();
+            {
+                let mut state = match scheduler.lock() {
+                    Ok(s) => s,
+                    Err(_) => break,
+                };
+
+                if !state.enabled || state.paused {
+                    continue;
+                }
+
+                if !backup_running.load(Ordering::SeqCst) {
+                    let (names, errors) = state.take_due(SystemTime::now());
+                    due_names = names;
+                    // Only the offending repo loses its slot; the rest stay on
+                    // schedule. Pausing globally here would let one bad cadence
+                    // stop every backup silently.
+                    for (repo, e) in errors {
+                        let _ = ui_tx.send(log_entry_now(format!(
+                            "[{repo}] scheduler error: {e}. This repository will not run \
+                         automatically until the config is fixed and reloaded."
+                        )));
+                    }
+                }
+            }
+
+            if !due_names.is_empty()
+                && app_tx
+                    .send(AppCommand::RunBackupRepos {
+                        repo_names: due_names,
+                    })
+                    .is_err()
+            {
+                break;
+            }
         }
     });
 }

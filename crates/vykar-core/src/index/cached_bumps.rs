@@ -164,8 +164,8 @@ mod tests {
 
     use super::*;
     use crate::index::dedup_cache::{
-        self, build_dedup_cache_to_path, build_full_index_cache_to_path, merge_full_index_cache,
-        MmapFullIndexCache,
+        self, MmapFullIndexCache, build_dedup_cache_to_path, build_full_index_cache_to_path,
+        merge_full_index_cache,
     };
     use crate::index::{ChunkIndex, IndexDelta};
     use vykar_types::pack_id::PackId;
@@ -496,9 +496,11 @@ mod tests {
             assert_eq!(pos as usize, expected_pos);
             assert_eq!(cache.chunk_id_at(pos), id);
         }
-        assert!(cache
-            .find_with_position(&ChunkId::from_bytes([2; 32]))
-            .is_none());
+        assert!(
+            cache
+                .find_with_position(&ChunkId::from_bytes([2; 32]))
+                .is_none()
+        );
     }
 
     /// A full index cache with a duplicated chunk ID (left behind by an

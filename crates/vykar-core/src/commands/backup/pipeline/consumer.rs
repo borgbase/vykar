@@ -12,8 +12,8 @@ use tracing::debug;
 
 use crate::compress::Compression;
 use crate::index::dedup_cache::DedupPrefilter;
-use crate::repo::file_cache::{CachedChunks, FileCache};
 use crate::repo::Repository;
+use crate::repo::file_cache::{CachedChunks, FileCache};
 use crate::snapshot::SnapshotStats;
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
@@ -21,11 +21,11 @@ use vykar_types::error::{Result, VykarError};
 use super::super::commit::{commit_cache_hit, process_worker_chunks};
 use super::super::concurrency::ByteBudget;
 use super::super::{
-    append_item_to_stream, emit_progress, emit_stats_progress, stamp_item_metadata,
-    BackupProgressEvent, FileStatus, ItemStreamCutter,
+    BackupProgressEvent, FileStatus, ItemStreamCutter, append_item_to_stream, emit_progress,
+    emit_stats_progress, stamp_item_metadata,
 };
-use super::segmentation::{validate_segment_accum, LargeFileAccum};
 use super::ProcessedEntry;
+use super::segmentation::{LargeFileAccum, validate_segment_accum};
 
 /// Consume a single processed entry: dedup check, pack commit, item stream, file cache.
 #[allow(clippy::too_many_arguments)]

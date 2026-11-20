@@ -14,8 +14,8 @@ use std::path::PathBuf;
 use crate::config::VykarConfig;
 use crate::repo::identity::{self, KeyProof};
 use crate::repo::{
-    select_repository_key, EncryptionMode, KeyCopyState, RepoConfig, RepoFormat, KEY_PRIMARY,
-    KEY_SECONDARY,
+    EncryptionMode, KEY_PRIMARY, KEY_SECONDARY, KeyCopyState, RepoConfig, RepoFormat,
+    select_repository_key,
 };
 use crate::{limits, storage};
 use vykar_crypto::key::MasterKey;

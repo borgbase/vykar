@@ -9,7 +9,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use super::identity::{self, KeyProof};
-use super::{EncryptionMode, KeyCopyState, RepoConfig, RepoFormat, KEY_PRIMARY, KEY_SECONDARY};
+use super::{EncryptionMode, KEY_PRIMARY, KEY_SECONDARY, KeyCopyState, RepoConfig, RepoFormat};
 use vykar_crypto::key::{KeyBlobDefect, MasterKey};
 use vykar_crypto::{self as crypto, CryptoEngine};
 use vykar_storage::StorageBackend;

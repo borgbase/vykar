@@ -12,9 +12,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
+use dav_server::DavHandler;
 use dav_server::davpath::DavPath;
 use dav_server::fs::*;
-use dav_server::DavHandler;
 use futures_util::stream;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;

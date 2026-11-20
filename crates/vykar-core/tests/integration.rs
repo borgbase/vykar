@@ -648,7 +648,7 @@ fn backup_warns_but_does_not_fail_on_unsupported_special_file() {
                     std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::InvalidInput
                 ) =>
             {
-                return
+                return;
             }
             Err(e) => panic!("unexpected bind error: {e}"),
         };
@@ -1299,11 +1299,13 @@ fn backup_and_restore_preserves_symlink_xattrs() {
     .unwrap();
 
     let restored_link = restore_dir.join("link");
-    assert!(restored_link
-        .symlink_metadata()
-        .unwrap()
-        .file_type()
-        .is_symlink());
+    assert!(
+        restored_link
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
     // The xattr is on the link.
     assert_eq!(
         xattr::get(&restored_link, attr_name).unwrap(),

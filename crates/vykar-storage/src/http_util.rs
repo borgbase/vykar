@@ -415,11 +415,7 @@ mod tests {
             |i| prepared.lock().unwrap().push(i),
             |i, ()| {
                 sent.lock().unwrap().push(i);
-                if i == 3 {
-                    Err(i)
-                } else {
-                    Ok(())
-                }
+                if i == 3 { Err(i) } else { Ok(()) }
             },
         );
         assert_eq!(result, Err(3));

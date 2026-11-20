@@ -295,15 +295,15 @@ mod server_side {
     use crate::commands::compact::compact_repo;
     use crate::compress::Compression;
     use crate::config::ChunkerConfig;
-    use crate::index::segment::Segment;
     use crate::index::ChunkIndexEntry;
+    use crate::index::segment::Segment;
     use crate::repo::index_store;
     use crate::repo::index_write::FoldPolicy;
     use crate::repo::pack::PackType;
     use crate::repo::{EncryptionMode, OpenOptions, RepoFormat, Repository};
-    use crate::testutil::{init_test_environment, MemoryBackend};
+    use crate::testutil::{MemoryBackend, init_test_environment};
     use vykar_protocol::{RepackOperationResult, RepackPlanRequest, RepackResultResponse};
-    use vykar_storage::{delegate_storage_backend, InnerBackend, StorageBackend};
+    use vykar_storage::{InnerBackend, StorageBackend, delegate_storage_backend};
     use vykar_types::chunk_id::ChunkId;
     use vykar_types::error::{Result, VykarError};
     use vykar_types::pack_id::PackId;
@@ -514,10 +514,12 @@ mod server_side {
 
         let plans = log.plans.lock().unwrap().clone();
         assert!(!plans.is_empty());
-        assert!(plans
-            .iter()
-            .flat_map(|p| &p.operations)
-            .all(|op| !op.delete_after));
+        assert!(
+            plans
+                .iter()
+                .flat_map(|p| &p.operations)
+                .all(|op| !op.delete_after)
+        );
 
         let events = log.events();
         let pos = |e: &str| {

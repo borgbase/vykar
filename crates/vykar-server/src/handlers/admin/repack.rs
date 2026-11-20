@@ -2,9 +2,9 @@ use axum::response::{IntoResponse, Response};
 use vykar_types::hash::Hasher256;
 
 use vykar_protocol::{
-    check_protocol_version, is_valid_pack_key, repack_op_output_size, validate_blob_ref,
-    RepackOperationResult, RepackPlanRequest, RepackResultResponse, PACK_HEADER_SIZE, PACK_MAGIC,
-    PACK_VERSION_CURRENT,
+    PACK_HEADER_SIZE, PACK_MAGIC, PACK_VERSION_CURRENT, RepackOperationResult, RepackPlanRequest,
+    RepackResultResponse, check_protocol_version, is_valid_pack_key, repack_op_output_size,
+    validate_blob_ref,
 };
 
 use crate::error::ServerError;
@@ -164,9 +164,9 @@ fn execute_repack(
                         .ok_or_else(|| "repack blob range overflow".to_string())?;
                     if end > source_len {
                         return Err(format!(
-                        "repack blob range out of bounds: offset={} length={} file_size={source_len}",
-                        blob_ref.offset, blob_ref.length
-                    ));
+                            "repack blob range out of bounds: offset={} length={} file_size={source_len}",
+                            blob_ref.offset, blob_ref.length
+                        ));
                     }
 
                     // Cross-check the on-disk 4-byte length prefix against the
@@ -785,7 +785,7 @@ mod tests {
     #[tokio::test]
     async fn repack_quota_reflects_net_change() {
         let (router, state, tmp) = setup_app(0); // unlimited
-                                                 // Keep a strict subset so the repack actually shrinks the pack.
+        // Keep a strict subset so the repack actually shrinks the pack.
         let (pack_bytes, refs) = build_pack(&[b"keep-this-blob", b"dead-blob"]);
         let source_key = write_pack(tmp.path(), &pack_bytes);
         state.add_quota_usage(pack_bytes.len() as u64);

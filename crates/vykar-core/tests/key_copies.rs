@@ -15,7 +15,7 @@ use vykar_core::commands::key::KeyExport;
 use vykar_core::config::{EncryptionModeConfig, VykarConfig};
 use vykar_core::repo::identity::{self, KeyProof};
 use vykar_core::repo::{
-    EncryptionMode, OpenOptions, RepoConfig, RepoFormat, Repository, KEY_PRIMARY, KEY_SECONDARY,
+    EncryptionMode, KEY_PRIMARY, KEY_SECONDARY, OpenOptions, RepoConfig, RepoFormat, Repository,
 };
 use vykar_crypto::key::MasterKey;
 use vykar_storage::local_backend::LocalBackend;
@@ -561,15 +561,17 @@ fn divergent_and_unresolvable_fails_at_open_and_changes_nothing() {
 
     // `check` and `check --repair` cannot get past the same open.
     assert!(commands::check::run(&fx.config, Some(PASS), false, false).is_err());
-    assert!(commands::check::run_with_repair(
-        &fx.config,
-        Some(PASS),
-        false,
-        RepairMode::Apply,
-        None,
-        None
-    )
-    .is_err());
+    assert!(
+        commands::check::run_with_repair(
+            &fx.config,
+            Some(PASS),
+            false,
+            RepairMode::Apply,
+            None,
+            None
+        )
+        .is_err()
+    );
 
     assert_eq!(
         key_dir_snapshot(&fx.repo_dir),
@@ -1025,15 +1027,17 @@ fn an_unprovable_divergent_candidate_cannot_win_and_cannot_drive_repair() {
     // the genuine primary is never rewritten.
     let mut attacker_config = fx.config.clone();
     attacker_config.encryption.passphrase = Some(ATTACKER_PASS.to_string());
-    assert!(commands::check::run_with_repair(
-        &attacker_config,
-        Some(ATTACKER_PASS),
-        false,
-        RepairMode::Apply,
-        None,
-        None,
-    )
-    .is_err());
+    assert!(
+        commands::check::run_with_repair(
+            &attacker_config,
+            Some(ATTACKER_PASS),
+            false,
+            RepairMode::Apply,
+            None,
+            None,
+        )
+        .is_err()
+    );
 
     assert_eq!(
         key_dir_snapshot(&fx.repo_dir),

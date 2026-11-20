@@ -44,11 +44,7 @@ fn walk(dir: &Path) -> Vec<std::path::PathBuf> {
     };
     rd.flat_map(|e| {
         let p = e.unwrap().path();
-        if p.is_dir() {
-            walk(&p)
-        } else {
-            vec![p]
-        }
+        if p.is_dir() { walk(&p) } else { vec![p] }
     })
     .collect()
 }

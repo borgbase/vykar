@@ -5,18 +5,18 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-use vykar_storage::{delegate_storage_backend, ConditionalGet, InnerBackend, StorageBackend};
+use vykar_storage::{ConditionalGet, InnerBackend, StorageBackend, delegate_storage_backend};
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::Result;
 
 use crate::commands;
 use crate::commands::backup::{self, BackupProgressEvent};
 use crate::config::VykarConfig;
-use crate::index::dedup_cache;
 use crate::index::ChunkIndexEntry;
+use crate::index::dedup_cache;
 use crate::repo::{OpenOptions, Repository};
 
 const FAST: &str = "index unchanged, fast path";

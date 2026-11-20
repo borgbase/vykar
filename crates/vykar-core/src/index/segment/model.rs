@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::index::dedup_cache::{encode_full_entry, FullCacheEntry, StateHash};
+use crate::index::dedup_cache::{FullCacheEntry, StateHash, encode_full_entry};
 use crate::index::segment::{ChainStep, Segment};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

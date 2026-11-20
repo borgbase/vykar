@@ -5,20 +5,20 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use super::helpers::{
-    backup_single_source, is_base_put, is_head_put, make_test_config, try_backup_single_source,
-    FaultyPut,
+    FaultyPut, backup_single_source, is_base_put, is_head_put, make_test_config,
+    try_backup_single_source,
 };
 use crate::commands;
 use crate::commands::check::{IndexRecovery, RepairAction, RepairMode};
 use crate::config::VykarConfig;
-use crate::index::dedup_cache::{self, MmapDedupCache, MmapFullIndexCache, MmapRestoreCache};
 use crate::index::ChunkIndex;
+use crate::index::dedup_cache::{self, MmapDedupCache, MmapFullIndexCache, MmapRestoreCache};
 use crate::repo::index_store::{self, INDEX_OBJECT_DIR};
 use crate::repo::{
     EncryptionMode, OpenOptions, RepoConfig, RepoFormat, Repository, UpgradeOutcome,
 };
 use vykar_storage::local_backend::LocalBackend;
-use vykar_storage::{delegate_storage_backend, InnerBackend, StorageBackend};
+use vykar_storage::{InnerBackend, StorageBackend, delegate_storage_backend};
 use vykar_types::error::{Result, VykarError};
 
 struct Fixture {

@@ -10,13 +10,13 @@
 mod parts;
 
 use std::io::Read;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use crate::RetryConfig;
 use crate::http_util::HttpTimeouts;
 use crate::retry::HttpRetryError;
-use crate::RetryConfig;
 use vykar_types::error::{Result, VykarError};
 
 use crate::{

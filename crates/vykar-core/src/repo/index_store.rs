@@ -24,11 +24,11 @@ use vykar_crypto::CryptoEngine;
 use vykar_storage::StorageBackend;
 use vykar_types::error::{Result, VykarError};
 
-use super::format::{
-    pack_object_streaming_with_context, pack_object_with_context,
-    unpack_object_expect_with_context, unpack_object_expect_with_context_in_place, ObjectType,
-};
 use super::INDEX_OBJECT_CONTEXT;
+use super::format::{
+    ObjectType, pack_object_streaming_with_context, pack_object_with_context,
+    unpack_object_expect_with_context, unpack_object_expect_with_context_in_place,
+};
 use crate::compress;
 use crate::index::base;
 use crate::index::dedup_cache::{FullCacheWriter, MmapFullIndexCache, StateHash};
@@ -302,8 +302,8 @@ enum Fetched {
 /// GET `keys` with up to `width` requests in flight. Absence and errors
 /// are reported for the first failing key in key order.
 fn fetch_all(storage: &dyn StorageBackend, keys: &[String], width: usize) -> Result<Fetched> {
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     let width = width.clamp(1, keys.len().max(1));
     if width == 1 {
@@ -322,18 +322,21 @@ fn fetch_all(storage: &dyn StorageBackend, keys: &[String], width: usize) -> Res
     let results: Mutex<Vec<Slot>> = Mutex::new((0..keys.len()).map(|_| None).collect());
     std::thread::scope(|scope| {
         for _ in 0..width {
-            scope.spawn(|| loop {
-                let i = next.fetch_add(1, Ordering::Relaxed);
-                let Some(key) = keys.get(i) else { break };
-                let r = storage.get(key);
-                let failed = !matches!(r, Ok(Some(_)));
-                if let Some(slot) = results.lock().unwrap_or_else(|e| e.into_inner()).get_mut(i) {
-                    *slot = Some(r);
-                }
-                if failed {
-                    // Let the other workers drain; nothing more is needed.
-                    next.store(keys.len(), Ordering::Relaxed);
-                    break;
+            scope.spawn(|| {
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(key) = keys.get(i) else { break };
+                    let r = storage.get(key);
+                    let failed = !matches!(r, Ok(Some(_)));
+                    if let Some(slot) = results.lock().unwrap_or_else(|e| e.into_inner()).get_mut(i)
+                    {
+                        *slot = Some(r);
+                    }
+                    if failed {
+                        // Let the other workers drain; nothing more is needed.
+                        next.store(keys.len(), Ordering::Relaxed);
+                        break;
+                    }
                 }
             });
         }
@@ -443,7 +446,7 @@ pub(crate) fn sync_full_cache(
                     cache,
                     scratch: location.scratch,
                     source,
-                })
+                });
             }
             Attempt::Missing(missing) => missing,
         };
@@ -1120,11 +1123,9 @@ pub(crate) fn rebuild_without_head(
     }))
 }
 
-const HEADLESS_PREFIX: &str =
-    "the index head cannot be read, and the objects in index.d/ do not determine one index \
+const HEADLESS_PREFIX: &str = "the index head cannot be read, and the objects in index.d/ do not determine one index \
      state: ";
-const HEADLESS_CACHE_WAY: &str =
-    "Nothing was changed. Run `vykar check --repair` on the machine that wrote to the \
+const HEADLESS_CACHE_WAY: &str = "Nothing was changed. Run `vykar check --repair` on the machine that wrote to the \
      repository last (its local index cache holds the latest state)";
 
 fn fork_refusal(names: Vec<String>, state: State) -> String {

@@ -171,11 +171,7 @@ pub fn summarize_metadata(metadata: &Metadata, file_type: &FileType) -> Metadata
 
         let readonly = metadata.permissions().readonly();
         let mode = if file_type.is_dir() {
-            if readonly {
-                0o555
-            } else {
-                0o755
-            }
+            if readonly { 0o555 } else { 0o755 }
         } else if readonly {
             0o444
         } else {

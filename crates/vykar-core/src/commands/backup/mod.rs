@@ -14,8 +14,8 @@ pub(crate) mod read_source;
 
 pub(crate) use chunk_process::WorkerChunk;
 
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use tracing::{debug, info, warn};
 
@@ -28,8 +28,8 @@ use crate::repo::file_cache::{CachedChunks, FileCache, ParentReuseIndex, Retaine
 use crate::repo::lock;
 use crate::repo::pack::PackType;
 use crate::repo::{Repository, WriteSessionOptions};
-use crate::snapshot::item::Item;
 use crate::snapshot::SnapshotStats;
+use crate::snapshot::item::Item;
 use crate::storage;
 use vykar_common::display::{format_bytes, format_count};
 use vykar_storage::{BackendProfile, StorageBackend};

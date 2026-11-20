@@ -1,10 +1,9 @@
 use crate::repo::format::{
-    pack_object, pack_object_streaming, pack_object_with_context, unpack_object,
+    ObjectType, pack_object, pack_object_streaming, pack_object_with_context, unpack_object,
     unpack_object_expect, unpack_object_expect_with_context, unpack_object_with_context,
-    ObjectType,
 };
-use vykar_crypto::aes_gcm::Aes256GcmEngine;
 use vykar_crypto::PlaintextEngine;
+use vykar_crypto::aes_gcm::Aes256GcmEngine;
 use vykar_types::error::VykarError;
 
 #[test]

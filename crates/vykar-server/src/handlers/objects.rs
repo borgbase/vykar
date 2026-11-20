@@ -873,8 +873,8 @@ mod tests {
     #[tokio::test]
     async fn sizes_rejects_a_body_over_the_cap() {
         use futures_util::StreamExt;
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::time::Duration;
         use tower::ServiceExt;
         let (router, _state, _tmp) = setup_app(0);
@@ -951,7 +951,7 @@ mod tests {
 
     #[test]
     fn sizes_body_initial_capacity_is_bounded() {
-        use super::{sizes_body_initial_capacity as cap_for, SIZES_BODY_INITIAL_CAPACITY};
+        use super::{SIZES_BODY_INITIAL_CAPACITY, sizes_body_initial_capacity as cap_for};
         assert_eq!(cap_for(None), 0);
         assert_eq!(cap_for(Some(0)), 0);
         assert_eq!(cap_for(Some(20_000)), 20_000);

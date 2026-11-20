@@ -1,10 +1,10 @@
 use crate::compress::Compression;
 use crate::index::dedup_cache::DedupPrefilter;
+use crate::repo::Repository;
 use crate::repo::file_cache::CachedChunks;
 use crate::repo::pack::PackType;
-use crate::repo::Repository;
-use crate::snapshot::item::{ChunkRef, Item};
 use crate::snapshot::SnapshotStats;
+use crate::snapshot::item::{ChunkRef, Item};
 use vykar_types::error::{Result, VykarError};
 
 use super::chunk_process::WorkerChunk;
@@ -172,11 +172,11 @@ mod tests {
 
     mod tiered {
         use super::*;
-        use crate::commands::backup::chunk_process::{classify_chunk, WorkerChunk};
-        use crate::index::dedup_cache::{
-            build_dedup_cache_to_path, chunk_id_to_u64, MmapDedupCache, TieredDedupIndex,
-        };
+        use crate::commands::backup::chunk_process::{WorkerChunk, classify_chunk};
         use crate::index::ChunkIndex;
+        use crate::index::dedup_cache::{
+            MmapDedupCache, TieredDedupIndex, build_dedup_cache_to_path, chunk_id_to_u64,
+        };
         use std::borrow::Cow;
         use vykar_types::pack_id::PackId;
 

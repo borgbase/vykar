@@ -7,13 +7,13 @@
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use futures_util::StreamExt;
-use russh::keys::ssh_key::{private::Ed25519Keypair, LineEnding};
 use russh::keys::PrivateKey;
+use russh::keys::ssh_key::{LineEnding, private::Ed25519Keypair};
 use russh::server::{Auth, ChannelOpenHandle, Msg, Session};
 use russh::{Channel, ChannelId, Disconnect};
 use russh_sftp::protocol::{

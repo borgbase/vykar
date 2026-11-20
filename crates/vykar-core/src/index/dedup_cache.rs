@@ -2461,8 +2461,10 @@ mod tests {
         // Merge
         let old_cache = MmapFullIndexCache::open_path(&path, gen).unwrap();
         let new_gen = 99u64;
-        merge_full_index_cache(&old_cache, &delta, new_gen, &path).unwrap();
+        // Persist only after unmapping: Windows refuses to replace a mapped file.
+        let merged = merge_full_index_cache_to_temp(&old_cache, &delta, new_gen, &path).unwrap();
         drop(old_cache);
+        merged.persist(&path).unwrap();
 
         // Also apply delta to the HashMap to get expected results
         delta.apply_to(&mut index);
@@ -2496,8 +2498,10 @@ mod tests {
         let delta = IndexDelta::new();
         let old_cache = MmapFullIndexCache::open_path(&path, gen).unwrap();
         let new_gen = 100u64;
-        merge_full_index_cache(&old_cache, &delta, new_gen, &path).unwrap();
+        // Persist only after unmapping: Windows refuses to replace a mapped file.
+        let merged = merge_full_index_cache_to_temp(&old_cache, &delta, new_gen, &path).unwrap();
         drop(old_cache);
+        merged.persist(&path).unwrap();
 
         let loaded = load_chunk_index_from_full_cache_path(&path, new_gen).unwrap();
         assert_eq!(loaded.len(), index.len());
@@ -2896,7 +2900,11 @@ mod tests {
         write_index_blob_cache(b"first blob", 3, &repo_id, cd).unwrap();
 
         let cached = CachedIndexBlob::open(&repo_id, cd).unwrap();
-        write_index_blob_cache(b"second, longer blob", 4, &repo_id, cd).unwrap();
+        let replaced = write_index_blob_cache(b"second, longer blob", 4, &repo_id, cd);
+        // Windows may refuse to replace an open file; unix must swap the entry.
+        if cfg!(not(windows)) {
+            replaced.unwrap();
+        }
         assert_eq!(cached.read_verified().as_deref(), Some(&b"first blob"[..]));
     }
 

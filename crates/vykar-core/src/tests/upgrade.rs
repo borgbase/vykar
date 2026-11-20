@@ -7,6 +7,7 @@ use super::helpers::{backup_single_source, is_base_put, is_head_put, make_test_c
 use crate::commands;
 use crate::commands::check::{IndexRecovery, RepairAction, RepairMode};
 use crate::config::VykarConfig;
+use crate::index::dedup_cache::{self, MmapDedupCache, MmapFullIndexCache, MmapRestoreCache};
 use crate::index::ChunkIndex;
 use crate::repo::index_store::{self, INDEX_OBJECT_DIR};
 use crate::repo::{
@@ -275,6 +276,56 @@ fn interrupted_upgrade_resumes() {
     assert!(!fx.repo_dir.join("index.gen").exists());
     assert_eq!(fx.cold_index("cold-after"), before);
     fx.check_clean();
+}
+
+/// Both branches leave `chunk_index` unbuilt, and the epilogue rebuilds the
+/// local caches at the new generation. On resume the full cache can only
+/// come from the synced one.
+#[test]
+fn upgrade_leaves_the_index_unloaded_and_the_caches_current() {
+    for resumed in [false, true] {
+        let fx = fixture(RepoFormat::V3);
+        fx.write("a", "alpha");
+        fx.backup("s1");
+        if resumed {
+            commands::upgrade::run(&fx.config, None).unwrap();
+            fx.set_version(3);
+        }
+        let id = fx.open(&fx.cache(), false).unwrap().config.id.clone();
+        let cd = Some(fx.cache());
+        let mut stale = vec![
+            dedup_cache::dedup_cache_path(&id, cd.as_deref()),
+            dedup_cache::restore_cache_path(&id, cd.as_deref()),
+        ];
+        if resumed {
+            stale.push(dedup_cache::full_index_cache_path(&id, cd.as_deref()));
+        }
+        for path in stale.into_iter().flatten() {
+            let _ = std::fs::remove_file(path);
+        }
+
+        let mut repo = fx.open(&fx.cache(), false).unwrap();
+        let outcome =
+            commands::util::with_maintenance_lock(&mut repo, |r| r.upgrade_index_layout()).unwrap();
+        assert!(
+            matches!(outcome, UpgradeOutcome::Upgraded { resumed: r, .. } if r == resumed),
+            "{outcome:?}"
+        );
+        assert_eq!(repo.format(), RepoFormat::V5);
+        assert!(repo.chunk_index().is_empty(), "resumed: {resumed}");
+        let head = repo.index_head().unwrap().clone();
+        let generation = dedup_cache::generation_for_state(&head.state_hash);
+        assert_eq!(repo.index_generation(), generation);
+        let bytes = std::fs::read(fx.repo_dir.join("index")).unwrap();
+        let crypto = vykar_crypto::PlaintextEngine::new(crate::testutil::test_chunk_hasher());
+        assert_eq!(index_store::decode_head(&bytes, &crypto).unwrap(), head);
+        drop(repo);
+
+        assert!(MmapFullIndexCache::open(&id, generation, cd.as_deref()).is_some());
+        assert!(MmapDedupCache::open(&id, generation, cd.as_deref()).is_some());
+        assert!(MmapRestoreCache::open(&id, generation, cd.as_deref()).is_some());
+        fx.check_clean();
+    }
 }
 
 /// Refuses to overwrite `config`, as an append-only server does.

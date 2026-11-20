@@ -143,8 +143,15 @@ impl Repository {
                         e
                     }
                 })?;
-                let head = synced.head.clone();
-                self.install_synced_index(synced);
+                // Nothing here reads the index; only the cache file is kept.
+                let index_store::SyncedIndex {
+                    head,
+                    cache,
+                    scratch,
+                    ..
+                } = synced;
+                drop(cache);
+                self.index_scratch = scratch;
                 (head, true)
             }
             object => {

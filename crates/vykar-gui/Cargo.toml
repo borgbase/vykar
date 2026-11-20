@@ -35,6 +35,7 @@ auto-launch = "0.6"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Already in the tree via Slint's ksni tray; used to wait for an SNI host.
+# Held on 5: ksni and accesskit still require zbus ^5, so 6 would duplicate it.
 zbus = { version = "5", default-features = false, features = ["async-io"] }
 futures-lite = "2"
 

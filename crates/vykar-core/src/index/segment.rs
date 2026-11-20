@@ -512,14 +512,20 @@ impl<'a> Layer<'a> {
         Ok((!removed).then_some(entry))
     }
 
-    /// Check that the layer consumed exactly its predecessor and produced
-    /// the expected state.
-    fn finish(self, expected: &ChainStep<'_>) -> Result<()> {
+    /// Check that the layer consumed exactly its predecessor.
+    fn check_consumed(&self) -> Result<()> {
         if self.in_pos != self.segment.prev_entries {
             return Err(invalid("predecessor has fewer entries than recorded"));
         }
         debug_assert_eq!(self.next_delta, self.segment.deltas.len());
         debug_assert_eq!(self.next_reloc, self.segment.relocations.len());
+        Ok(())
+    }
+
+    /// Check that the layer consumed exactly its predecessor and produced
+    /// the expected state.
+    fn finish(self, expected: &ChainStep<'_>) -> Result<()> {
+        self.check_consumed()?;
         if self.emitted != expected.entries_after {
             return Err(invalid(format!(
                 "produced {} entries, expected {}",
@@ -636,6 +642,35 @@ pub fn apply_to_temp(
     let (tmp, hash, count) = w.finish(None)?;
     debug_assert_eq!(hash, expected_hash);
     debug_assert_eq!(count, expected_entries);
+    Ok((tmp.into_temp_path(), hash, count))
+}
+
+/// Apply one segment to `prev` when no head records the state it produces
+/// (`check --repair` rebuilding the index without a head). Checks that the
+/// segment names `prev`'s state and consumes exactly its entries; returns
+/// the resulting state as computed.
+pub fn apply_unnamed_to_temp(
+    prev: &MmapFullIndexCache,
+    segment: &Segment,
+    target: &Path,
+) -> Result<(TempPath, StateHash, u64)> {
+    if segment.prev_state_hash != prev.state_hash()
+        || segment.prev_entries != u64::from(prev.entry_count())
+    {
+        return Err(invalid("segment does not follow the preceding state"));
+    }
+    let mut layers = [Layer::new(segment)];
+    let mut base = BaseSource {
+        cache: prev,
+        next: 0,
+    };
+    let mut w = FullCacheWriter::new_beside(target)?;
+    while let Some(entry) = pull(&mut layers, &mut base)? {
+        w.push(&entry)?;
+    }
+    let [layer] = layers;
+    layer.check_consumed()?;
+    let (tmp, hash, count) = w.finish(None)?;
     Ok((tmp.into_temp_path(), hash, count))
 }
 

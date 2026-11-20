@@ -57,6 +57,25 @@ vykar check --repair
 vykar check --repair --yes
 ```
 
+When index objects are missing or damaged, repair rebuilds the index from what
+can still be read and may remove snapshots whose data it then cannot locate; the
+plan says how much of the index could be read. Run it with `--dry-run` first.
+A storage error while reading the index is not treated as damage: repair changes
+nothing and reports the error. If the error persists for one `index.d/` object,
+removing that object from the repository lets `vykar check --repair` rebuild the
+index from the rest, which may remove snapshots.
+
+If the index head itself cannot be read, repair rebuilds the index from this
+machine's index cache, which may be older than the latest state, or else from
+the objects in `index.d/`. Without this machine's cache, that works only while
+those objects form a single chain. That is typically not the case after an
+index fold that changed the index state (until a fold that leaves the state
+unchanged, the one at the end of `compact`), or when an index
+state recurred (an unchanged source with rolling retention); repair then
+refuses, lists the objects and changes nothing. Run it on the machine that
+wrote to the repository last, whose cache is current. Do not delete a damaged
+`index`: without it, repair rebuilds the index from nothing.
+
 The refcount rebuild also reclaims the space leak left by an **interrupted backup**.
 If a backup crashes after its index was committed but before its snapshot was
 written, the index keeps orphan chunk entries (and inflated refcounts) that no
@@ -110,7 +129,7 @@ vykar upgrade -R <repo> --yes    # for scripts
 - **One-way.** vykar releases before 0.25 can no longer read or write the repository afterwards. Upgrade vykar on every host that uses it, and stop all of them, before upgrading.
 - **No active backups.** The upgrade takes the maintenance lock and refuses while backup sessions are active, like `compact` and `prune`.
 - **Append-only servers.** The upgrade rewrites `config` and `index`, which an append-only `vykar-server` refuses; it fails before changing anything. Disable append-only for the upgrade.
-- **Interrupted upgrades** are completed by running `vykar upgrade` again; until then, commands report that the upgrade must be completed.
+- **Interrupted upgrades** are completed by running `vykar upgrade` again; until then, commands report that the upgrade must be completed. If the interrupted upgrade left a damaged index, `vykar upgrade` says so: run `vykar check --repair`, then `vykar upgrade` again.
 - If a pre-0.25 client still wrote to the repository after the upgrade, commands refuse and name `vykar check --repair`, which rebuilds the index.
 
 New repositories are created in the current format; there is nothing to upgrade.

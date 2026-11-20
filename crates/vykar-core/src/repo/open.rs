@@ -492,6 +492,10 @@ impl Repository {
             None
         };
 
+        // Leftovers of local cache writes interrupted by a kill or power
+        // loss; only files unwritten for a day.
+        crate::index::dedup_cache::sweep_stale_cache_temps(&repo_config.id, cache_dir.as_deref());
+
         // Read advisory index.gen sidecar (cache hint only, not trusted for
         // writes). The segmented layout has none.
         let mut index_generation = match format.index_layout() {
@@ -696,6 +700,61 @@ mod tests {
 
     fn entries(index: &ChunkIndex) -> HashMap<ChunkId, ChunkIndexEntry> {
         index.iter().map(|(id, e)| (*id, *e)).collect()
+    }
+
+    #[test]
+    fn open_sweeps_stale_cache_temp_files() {
+        let cache = tempfile::tempdir().unwrap();
+        let (inner, repo) = repo_with_caches(cache.path());
+        let id = repo.config.id.clone();
+        let dir = crate::repo::file_cache::repo_cache_dir(&id, Some(cache.path())).unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(25 * 3600);
+        let stale_temp = dir.join(".full_index_cache.AbC123.tmp");
+        let stale_legacy = dir.join("full_index_cache.merged");
+        let fresh_temp = dir.join(".dedup_cache.Fresh1.tmp");
+        for path in [&stale_temp, &stale_legacy] {
+            std::fs::File::create(path)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
+        std::fs::write(&fresh_temp, b"fresh").unwrap();
+        for name in ["full_index_cache", "index_blob"] {
+            std::fs::File::options()
+                .write(true)
+                .open(dir.join(name))
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
+        let gen = repo.index_generation;
+        drop(repo);
+
+        let open = || {
+            Repository::open(
+                Box::new(Arc::clone(&inner)),
+                None,
+                Some(cache.path().to_path_buf()),
+                OpenOptions::new(),
+            )
+            .unwrap()
+        };
+        drop(open());
+
+        assert!(!stale_temp.exists());
+        assert!(!stale_legacy.exists());
+        assert!(fresh_temp.exists());
+        assert!(dedup_cache::MmapFullIndexCache::open(&id, gen, Some(cache.path())).is_some());
+        assert!(CachedIndexBlob::open(&id, Some(cache.path())).is_some());
+
+        // The cache dir is swept on every open, not rate-limited.
+        let second = dir.join(".restore_cache.XyZ789.tmp");
+        std::fs::File::create(&second)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        drop(open());
+        assert!(!second.exists());
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use super::scan::ScanResult;
-use super::types::{IntegrityIssue, RepairAction, RepairPlan};
+use super::types::{IndexRecovery, IntegrityIssue, RepairAction, RepairPlan};
 use crate::index::ChunkIndexEntry;
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::pack_id::PackId;
@@ -465,6 +465,7 @@ pub(super) fn build_repair_plan(
     RepairPlan {
         actions,
         has_data_loss,
+        index_recovery: IndexRecovery::Complete,
     }
 }
 

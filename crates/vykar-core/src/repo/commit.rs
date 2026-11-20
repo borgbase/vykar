@@ -212,7 +212,9 @@ impl Repository {
         )
         .map_err(|e| match e {
             VykarError::InvalidFormat(msg) => VykarError::InvalidFormat(format!(
-                "{msg}; run `vykar check --repair` to rebuild the index"
+                "{msg}; `vykar check --repair` rebuilds the index from what can still be \
+                 read and may remove snapshots whose data it then cannot locate (run it \
+                 with `--dry-run` first to see which)"
             )),
             e => e,
         })?;

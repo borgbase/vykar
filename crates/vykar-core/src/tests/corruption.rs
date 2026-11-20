@@ -266,6 +266,7 @@ fn backup_succeeds_after_corrupt_snapshot() {
 #[test_case(Corruption::ZeroFillRegion ; "zero_fill_region")]
 #[test_case(Corruption::DeletePack ; "delete_pack")]
 #[test_case(Corruption::CorruptSnapshot ; "corrupt_snapshot")]
+#[test_case(Corruption::TruncateIndex ; "truncate_index")]
 fn repair_fixes_corruption(corruption: Corruption) {
     let tmp = tempfile::tempdir().unwrap();
     let (repo_dir, config) = setup_repo(tmp.path());
@@ -301,7 +302,6 @@ fn repair_fixes_corruption(corruption: Corruption) {
     );
 }
 
-#[test_case(Corruption::TruncateIndex ; "truncate_index")]
 #[test_case(Corruption::CorruptConfig ; "corrupt_config")]
 fn repair_not_possible_err_path(corruption: Corruption) {
     let tmp = tempfile::tempdir().unwrap();

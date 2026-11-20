@@ -7,8 +7,8 @@ mod types;
 
 pub use runner::{run, run_with_progress, run_with_repair};
 pub use types::{
-    CheckError, CheckProgressEvent, CheckResult, IntegrityIssue, ItemImpact, RepairAction,
-    RepairMode, RepairPlan, RepairResult,
+    CheckError, CheckProgressEvent, CheckResult, IndexRecovery, IntegrityIssue, ItemImpact,
+    RepairAction, RepairMode, RepairPlan, RepairResult,
 };
 
 // Re-exported for the crate-level unit tests in `tests::check_command`, which

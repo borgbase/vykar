@@ -2,7 +2,9 @@ use std::io::{self, BufRead, Write};
 use std::sync::atomic::AtomicBool;
 
 use vykar_core::commands;
-use vykar_core::commands::check::{RepairAction, RepairMode, RepairPlan, RepairResult};
+use vykar_core::commands::check::{
+    IndexRecovery, RepairAction, RepairMode, RepairPlan, RepairResult,
+};
 use vykar_core::config::VykarConfig;
 
 use crate::error::{CliError, CliResult};
@@ -62,7 +64,8 @@ pub(crate) fn run_check(
     if !plan_result.plan.has_data_loss && plan_result.plan.actions.iter().all(is_safe_action) {
         // Tier 1 only — apply without prompt.
         eprintln!("No data-loss actions; applying safe repairs...");
-        let result = run_repair(config, label, verify_data, RepairMode::Apply, shutdown)?;
+        let mode = apply_mode_after(&plan_result.plan);
+        let result = run_repair(config, label, verify_data, mode, shutdown)?;
         print_repair_result(&result);
         return Ok(());
     }
@@ -79,10 +82,20 @@ pub(crate) fn run_check(
     }
 
     // Re-scan and apply under maintenance lock.
-    let result = run_repair(config, label, verify_data, RepairMode::Apply, shutdown)?;
+    let mode = apply_mode_after(&plan_result.plan);
+    let result = run_repair(config, label, verify_data, mode, shutdown)?;
     print_repair_result(&result);
 
     Ok(())
+}
+
+/// The Apply mode after the user saw `plan`: the plan rebuilt under the lock
+/// may not add data loss or come from an index read differently.
+fn apply_mode_after(plan: &RepairPlan) -> RepairMode {
+    RepairMode::ApplyShown {
+        has_data_loss: plan.has_data_loss,
+        index_recovery: plan.index_recovery,
+    }
 }
 
 /// One scan-and-repair pass. `RepairMode::Apply` re-scans from scratch under the
@@ -223,6 +236,7 @@ fn is_safe_action(action: &RepairAction) -> bool {
 }
 
 fn print_repair_plan(plan: &RepairPlan) {
+    print_index_recovery(plan);
     if plan.actions.is_empty() {
         println!("\nRepair plan: no actions needed.");
         return;
@@ -248,6 +262,109 @@ fn print_repair_plan(plan: &RepairPlan) {
         for a in &loss_actions {
             println!("    - {}", format_repair_action(a));
         }
+    }
+}
+
+/// How the index was read, when not simply in full.
+fn print_index_recovery(plan: &RepairPlan) {
+    let lossy = match plan.index_recovery {
+        IndexRecovery::Complete => return,
+        IndexRecovery::LegacyBlob => {
+            println!(
+                "\nIndex: `index` held a monolithic index written by an older vykar; \
+                 the index is rebuilt from it."
+            );
+            return;
+        }
+        IndexRecovery::HeadMissing => {
+            println!("\nIndex: the index head is missing; the index is rebuilt from nothing.");
+            true
+        }
+        IndexRecovery::HeadUnreadable {
+            from_local_cache: true,
+            ..
+        } => {
+            println!(
+                "\nIndex: the index head cannot be read; the index is rebuilt from this \
+                 machine's cache of it, which may be older than the repository's latest \
+                 index state."
+            );
+            if plan.has_data_loss {
+                println!(
+                    "  To avoid the removals below, run the repair on the machine that wrote \
+                     to the repository last,\n  or move this machine's cache directory aside \
+                     so the repair reads the objects in index.d/."
+                );
+            }
+            true
+        }
+        IndexRecovery::HeadUnreadable {
+            bases: 0,
+            applied: 0,
+            unplaced,
+            damaged,
+            ..
+        } => {
+            println!(
+                "\nIndex: the index head cannot be read and no object in index.d/ can be \
+                 used; the index is rebuilt from nothing."
+            );
+            print_headless_counts(unplaced, damaged);
+            true
+        }
+        IndexRecovery::HeadUnreadable {
+            bases,
+            applied,
+            unplaced,
+            damaged,
+            ..
+        } => {
+            println!(
+                "\nIndex: the index head cannot be read; the index is rebuilt from the \
+                 objects in index.d/ ({bases} base(s), {applied} segment(s) read). \
+                 Without the head it cannot be confirmed that this is the repository's \
+                 latest index state."
+            );
+            print_headless_counts(unplaced, damaged);
+            true
+        }
+        IndexRecovery::PartialChain {
+            base_lost: true,
+            total,
+            ..
+        } => {
+            println!(
+                "\nIndex: the index base cannot be read; the index is rebuilt without it \
+                 and its {total} segment(s)."
+            );
+            true
+        }
+        IndexRecovery::PartialChain { applied, total, .. } => {
+            println!(
+                "\nIndex: only {applied} of {total} index segment(s) can be read; \
+                 the index is rebuilt from them."
+            );
+            true
+        }
+    };
+    if lossy && plan.has_data_loss {
+        println!(
+            "  Snapshots whose data the rebuilt index cannot locate are removed by this \
+             repair and listed below; packs only they used are deleted by the next \
+             `vykar compact`."
+        );
+    }
+}
+
+fn print_headless_counts(unplaced: usize, damaged: usize) {
+    if damaged > 0 {
+        println!("  {damaged} index object(s) in index.d/ cannot be read and are left out.");
+    }
+    if unplaced > 0 {
+        println!(
+            "  {unplaced} index segment(s) follow no index state that can be rebuilt; \
+             their changes are missing from the rebuilt index."
+        );
     }
 }
 
@@ -328,6 +445,34 @@ fn print_repair_result(result: &RepairResult) {
         eprintln!("\nRepair errors:");
         for err in &result.repair_errors {
             eprintln!("  {err}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn apply_mode_after_carries_the_shown_plan() {
+        for has_data_loss in [false, true] {
+            let recovery = IndexRecovery::PartialChain {
+                base_lost: false,
+                applied: 1,
+                total: 2,
+            };
+            let plan = RepairPlan {
+                actions: vec![RepairAction::RebuildRefcounts],
+                has_data_loss,
+                index_recovery: recovery,
+            };
+            assert_eq!(
+                apply_mode_after(&plan),
+                RepairMode::ApplyShown {
+                    has_data_loss,
+                    index_recovery: recovery,
+                }
+            );
         }
     }
 }

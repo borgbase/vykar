@@ -6,8 +6,8 @@ use super::repair_plan::build_repair_plan;
 use super::scan::{integrity_scan, ScanOptions, ScanResult};
 use super::server_verify::try_server_verify;
 use super::types::{
-    CheckError, CheckProgressEvent, CheckResult, IntegrityIssue, RepairMode, RepairPlan,
-    RepairResult, ServerVerifyOutcome,
+    CheckError, CheckProgressEvent, CheckResult, IndexRecovery, IntegrityIssue, RepairMode,
+    RepairPlan, RepairResult, ServerVerifyOutcome,
 };
 use crate::commands::util::check_interrupted;
 use crate::config::VykarConfig;
@@ -36,14 +36,50 @@ fn group_by_pack(index: &ChunkIndex) -> PackChunks {
 
 /// Build the repair plan for a completed scan. The planner needs a snapshot
 /// name → id map, derived from the manifest the scan ran against.
-fn plan_repair(repo: &Repository, scan: &ScanResult, pack_chunks: &PackChunks) -> RepairPlan {
+fn plan_repair(
+    repo: &Repository,
+    scan: &ScanResult,
+    pack_chunks: &PackChunks,
+    index_recovery: IndexRecovery,
+) -> RepairPlan {
     let name_to_id: HashMap<String, SnapshotId> = repo
         .manifest()
         .snapshots
         .iter()
         .map(|e| (e.name.clone(), e.id))
         .collect();
-    build_repair_plan(scan, pack_chunks, &name_to_id)
+    let mut plan = build_repair_plan(scan, pack_chunks, &name_to_id);
+    plan.index_recovery = index_recovery;
+    plan
+}
+
+/// For `RepairMode::ApplyShown`: refuse the plan rebuilt under the lock when
+/// it differs from the shown one in data loss or in how the index was read.
+fn refuse_repair_if_plan_changed(mode: RepairMode, plan: &RepairPlan) -> Result<()> {
+    let RepairMode::ApplyShown {
+        has_data_loss,
+        index_recovery,
+    } = mode
+    else {
+        return Ok(());
+    };
+    if !has_data_loss && plan.has_data_loss {
+        return Err(VykarError::Other(
+            "aborting repair: the plan rebuilt under the repository lock removes data, \
+             but the plan that was shown did not; nothing was changed. Run \
+             `vykar check --repair` again to review the new plan"
+                .into(),
+        ));
+    }
+    if plan.index_recovery != index_recovery {
+        return Err(VykarError::Other(
+            "aborting repair: the index could be read differently than when the plan was \
+             shown; nothing was changed. Run `vykar check --repair` again to review the new \
+             plan"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 impl From<ScanResult> for CheckResult {
@@ -341,7 +377,9 @@ fn refuse_repair_if_unreadable_snapshots(scan: &ScanResult) -> Result<()> {
     Ok(())
 }
 
-/// Run `check --repair`.
+/// Run `check --repair`. `RepairMode::ApplyShown` behaves like
+/// `RepairMode::Apply`, except that it refuses, before anything is written,
+/// a plan rebuilt under the lock that differs from the one shown.
 pub fn run_with_repair(
     config: &VykarConfig,
     passphrase: Option<&str>,
@@ -372,7 +410,7 @@ pub fn run_with_repair(
                 .skip_key_backfill()
                 .tolerate_broken_index(),
         )?;
-        repo.load_chunk_index_for_repair()?;
+        let recovery = repo.load_chunk_index_for_repair()?;
         repo.refresh_snapshot_list()?;
 
         let scan = integrity_scan(&mut repo, config, &scan_opts, &mut progress, shutdown)?;
@@ -381,7 +419,7 @@ pub fn run_with_repair(
         // misleading executable RebuildRefcounts plan for a too-new repo.
         refuse_repair_if_unreadable_snapshots(&scan)?;
 
-        let plan = plan_repair(&repo, &scan, &group_by_pack(repo.chunk_index()));
+        let plan = plan_repair(&repo, &scan, &group_by_pack(repo.chunk_index()), recovery);
 
         // PlanOnly is cancellable end to end, and `plan_repair` is unguarded
         // CPU work over the scan; without this the CLI would print a plan built
@@ -401,7 +439,7 @@ pub fn run_with_repair(
             passphrase,
             OpenOptions::new().tolerate_broken_index(),
             |repo| {
-                repo.load_chunk_index_for_repair()?;
+                let recovery = repo.load_chunk_index_for_repair()?;
                 repo.refresh_snapshot_list()?;
 
                 let scan = integrity_scan(repo, config, &scan_opts, &mut progress, shutdown)?;
@@ -412,7 +450,10 @@ pub fn run_with_repair(
                 refuse_repair_if_unreadable_snapshots(&scan)?;
 
                 let pack_chunks = group_by_pack(repo.chunk_index());
-                let plan = plan_repair(repo, &scan, &pack_chunks);
+                let plan = plan_repair(repo, &scan, &pack_chunks, recovery);
+
+                // Before the delete probe.
+                refuse_repair_if_plan_changed(mode, &plan)?;
 
                 // If plan has data-loss actions, probe append-only before mutating.
                 if plan.has_data_loss && !probe_deletes_allowed(repo.storage.as_ref()) {

@@ -121,10 +121,28 @@ impl Repository {
         )?;
         let (head, resumed) = match object {
             IndexObject::Remote(Some(data)) if is_index_head(&data) => {
-                let head = index_store::decode_head(&data, self.crypto.as_ref())?;
+                let head = match index_store::classify_head(&data, self.crypto.as_ref()) {
+                    index_store::StoredHead::Unreadable(e) => {
+                        return Err(VykarError::Other(format!(
+                            "the index head left by an interrupted upgrade cannot be read \
+                             ({e}); run `vykar check --repair` to rebuild it, then `vykar \
+                             upgrade` again"
+                        )))
+                    }
+                    other => other.into_head()?,
+                };
                 info!("completing an interrupted upgrade");
                 // Every object of the chain is fetched and verified.
-                let synced = self.sync_index(Some(head), false)?;
+                let synced = self.sync_index(Some(head), false).map_err(|e| {
+                    if index_store::is_object_damage(&e) {
+                        VykarError::Other(format!(
+                            "{e}; after the repair, run `vykar upgrade` again to complete the \
+                             upgrade"
+                        ))
+                    } else {
+                        e
+                    }
+                })?;
                 let head = synced.head.clone();
                 self.install_synced_index(synced);
                 (head, true)
@@ -136,9 +154,7 @@ impl Repository {
             }
         };
         if let Some(scratch) = self.index_scratch.take() {
-            let (cache, scratch) = index_store::install_cache(scratch, path.as_deref())?;
-            drop(cache);
-            self.index_scratch = scratch;
+            self.index_scratch = index_store::install_cache(scratch, path.as_deref());
         }
 
         // 4. The version switch.
@@ -174,8 +190,8 @@ impl Repository {
     }
 
     /// Write `index` as a base (none for an empty index) and the head naming
-    /// it, after deleting debris of an earlier attempt from `index.d/`. The
-    /// new full cache is left in `index_scratch`.
+    /// it; debris of an earlier attempt in `index.d/` is deleted after the
+    /// head is in place. The new full cache is left in `index_scratch`.
     fn write_upgraded_index(&mut self, index: &ChunkIndex) -> Result<IndexHead> {
         self.storage.create_dir(index_store::INDEX_OBJECT_DIR)?;
         let path = self.full_cache_path();
@@ -183,18 +199,7 @@ impl Repository {
         let next = dedup_cache::full_cache_from_index_to_temp(index, &anchor)?;
         let cache = MmapFullIndexCache::open_verified(&next)
             .ok_or_else(|| VykarError::Other("new index state failed verification".into()))?;
-        let head = if cache.entry_count() == 0 {
-            let head = IndexHead::empty();
-            self.check_lock_fence()?;
-            index_store::collect_garbage(self.storage.as_ref(), None, true)?;
-            self.storage.put(
-                "index",
-                &index_store::pack_head(&head, self.crypto.as_ref())?,
-            )?;
-            head
-        } else {
-            self.put_base(None, &cache)?
-        };
+        let head = self.put_base(None, &cache)?;
         drop(cache);
         self.index_scratch = Some(next);
         Ok(head)

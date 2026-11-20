@@ -15,6 +15,24 @@ use super::dedup_cache::StateHash;
 /// The only head layout this binary reads and writes.
 pub const HEAD_LAYOUT_VERSION: u32 = 1;
 
+/// The error for a head whose layout this binary does not read.
+pub fn unsupported_layout(layout: u32) -> VykarError {
+    VykarError::InvalidFormat(format!(
+        "unsupported index head layout {layout} (this version reads {HEAD_LAYOUT_VERSION})"
+    ))
+}
+
+/// The `layout` field of an encoded head, read without decoding the rest:
+/// the first element of the positional array, when it is an integer that
+/// fits a `u32`. Tells a newer head layout (of any array length) from damage.
+pub fn peek_layout(bytes: &[u8]) -> Option<u32> {
+    let mut rd = bytes;
+    if rmp::decode::read_array_len(&mut rd).ok()? == 0 {
+        return None;
+    }
+    rmp::decode::read_int::<u32, _>(&mut rd).ok()
+}
+
 /// The state hash of the empty index: BLAKE3 over no records.
 pub fn empty_state_hash() -> StateHash {
     blake3::hash(b"").into()
@@ -121,10 +139,7 @@ impl IndexHead {
     /// object is named twice.
     pub fn validate(&self) -> Result<()> {
         if self.layout != HEAD_LAYOUT_VERSION {
-            return Err(VykarError::InvalidFormat(format!(
-                "unsupported index head layout {} (this version reads {HEAD_LAYOUT_VERSION})",
-                self.layout
-            )));
+            return Err(unsupported_layout(self.layout));
         }
         let last = *self
             .chain_states()
@@ -270,5 +285,18 @@ mod tests {
         bytes[0] = 0x97;
         bytes.push(0x00);
         assert!(IndexHead::decode(&bytes).is_err());
+    }
+
+    #[test]
+    fn peek_layout_reads_the_layout_of_any_length() {
+        assert_eq!(peek_layout(&IndexHead::empty().encode().unwrap()), Some(1));
+        let mut longer = sample().encode().unwrap();
+        longer[0] = 0x97;
+        longer[1] = 0x02;
+        longer.push(0xc0);
+        assert_eq!(peek_layout(&longer), Some(2));
+        assert_eq!(peek_layout(&[0xc0]), None);
+        assert_eq!(peek_layout(&[]), None);
+        assert_eq!(peek_layout(&[0x90]), None);
     }
 }

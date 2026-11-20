@@ -183,6 +183,26 @@ pub enum VykarError {
     #[error("invalid repository format: {0}")]
     InvalidFormat(String),
 
+    /// An `index.d/` object that the index head names is absent from
+    /// storage, and a fresh read of the head still names it: the object is
+    /// lost, not removed by a concurrent fold. `kind` is `"base"` or
+    /// `"segment"`; `key` the storage key (`index.d/<64 hex>`).
+    #[error(
+        "index {kind} {key} is missing from storage although the index head names it; \
+         `vykar check --repair` rebuilds the index from what can still be read and may \
+         remove snapshots whose data it then cannot locate (run it with `--dry-run` \
+         first to see which)"
+    )]
+    IndexObjectMissing { kind: &'static str, key: String },
+
+    /// A lock-free index read kept finding objects missing and the head
+    /// moved on every re-read: a concurrent writer, not damage.
+    #[error(
+        "index objects kept vanishing while reading the index, and the index head \
+         changed on every re-read; another client is rewriting the index, retry later"
+    )]
+    IndexHeadUnstable,
+
     #[error("unknown object type tag: {0}")]
     UnknownObjectType(u8),
 

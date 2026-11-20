@@ -135,15 +135,39 @@ pub fn decode_base_to_temp<R: Read>(
     expected_entries: u64,
     target: &Path,
 ) -> Result<(NamedTempFile, StateHash, u64)> {
+    decode_base_inner(r, Some(expected_entries), target)
+}
+
+/// [`decode_base_to_temp`] for a base no head names (`check --repair`
+/// without a head): the entry count is the base's own, at most `u32::MAX`.
+pub fn decode_unnamed_base_to_temp<R: Read>(
+    r: R,
+    target: &Path,
+) -> Result<(NamedTempFile, StateHash, u64)> {
+    decode_base_inner(r, None, target)
+}
+
+fn decode_base_inner<R: Read>(
+    r: R,
+    expected_entries: Option<u64>,
+    target: &Path,
+) -> Result<(NamedTempFile, StateHash, u64)> {
     let mut r = BufReader::with_capacity(256 << 10, r);
-    if get_u8(&mut r)? != BASE_VERSION {
-        return Err(invalid("unsupported version"));
+    let version = get_u8(&mut r)?;
+    if version != BASE_VERSION {
+        return Err(VykarError::UnsupportedVersion(u32::from(version)));
     }
     let entries = get_uvarint(&mut r)?;
-    if entries != expected_entries {
-        return Err(invalid(format!(
-            "holds {entries} entries, head names {expected_entries}"
-        )));
+    match expected_entries {
+        Some(expected) if entries != expected => {
+            return Err(invalid(format!(
+                "holds {entries} entries, head names {expected}"
+            )));
+        }
+        None if entries > u64::from(u32::MAX) => {
+            return Err(invalid("entry count out of range"));
+        }
+        _ => {}
     }
     let n_packs = get_uvarint(&mut r)?;
     if n_packs > entries || (entries > 0 && n_packs == 0) {
@@ -270,7 +294,10 @@ mod tests {
         assert!(decode(&trailing, 20).is_err(), "trailing bytes");
         let mut version = body.clone();
         version[0] = 2;
-        assert!(decode(&version, 20).is_err(), "unknown version");
+        assert!(
+            matches!(decode(&version, 20), Err(VykarError::UnsupportedVersion(2))),
+            "unknown version"
+        );
 
         // Header: version, entries=20 (1 byte), packs=7 (1 byte), table.
         let table = 3;
@@ -324,5 +351,41 @@ mod tests {
             }
         }
         assert!(decode_base_to_temp(extra.as_slice(), 2, &target).is_err());
+    }
+
+    #[test]
+    fn unnamed_decode_matches_named() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("x");
+        for n in [0u32, 1, 200] {
+            let cache = cache_of(&sample_index(n), dir.path());
+            let body = encode(&cache);
+            let (named, named_hash, named_count) =
+                decode_base_to_temp(body.as_slice(), u64::from(n), &target).unwrap();
+            let (unnamed, hash, count) =
+                decode_unnamed_base_to_temp(body.as_slice(), &target).unwrap();
+            assert_eq!((hash, count), (named_hash, named_count));
+            let a = MmapFullIndexCache::open_verified(named.path()).unwrap();
+            let b = MmapFullIndexCache::open_verified(unnamed.path()).unwrap();
+            assert!(a.iter().eq(b.iter()));
+        }
+    }
+
+    #[test]
+    fn unnamed_decode_bounds_the_entry_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("x");
+        let mut body = vec![BASE_VERSION];
+        put_uvarint(&mut body, u64::from(u32::MAX) + 1).unwrap();
+        let err = decode_unnamed_base_to_temp(body.as_slice(), &target).unwrap_err();
+        assert!(
+            err.to_string().contains("entry count out of range"),
+            "{err}"
+        );
+        body[0] = 2;
+        assert!(matches!(
+            decode_unnamed_base_to_temp(body.as_slice(), &target),
+            Err(VykarError::UnsupportedVersion(2))
+        ));
     }
 }

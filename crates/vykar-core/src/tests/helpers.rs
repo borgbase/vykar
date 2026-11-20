@@ -203,3 +203,133 @@ pub fn make_test_source(label: &str) -> SourceEntry {
         ..source_entry(Path::new(&format!("/home/{label}")), label)
     }
 }
+
+/// Fails `get` of the keys `fail` selects with an injected storage error,
+/// the first `times` times (`usize::MAX`: always).
+pub(crate) struct FailGet {
+    inner: std::sync::Arc<dyn vykar_storage::StorageBackend>,
+    fail: Box<dyn Fn(&str) -> bool + Send + Sync>,
+    times: std::sync::Mutex<usize>,
+}
+
+impl FailGet {
+    pub(crate) fn new(
+        inner: std::sync::Arc<dyn vykar_storage::StorageBackend>,
+        fail: impl Fn(&str) -> bool + Send + Sync + 'static,
+        times: usize,
+    ) -> Self {
+        Self {
+            inner,
+            fail: Box::new(fail),
+            times: std::sync::Mutex::new(times),
+        }
+    }
+
+    fn should_fail(&self, key: &str) -> bool {
+        if !(self.fail)(key) {
+            return false;
+        }
+        let mut times = self.times.lock().unwrap();
+        if *times == 0 {
+            return false;
+        }
+        if *times != usize::MAX {
+            *times -= 1;
+        }
+        true
+    }
+}
+
+impl vykar_storage::InnerBackend for FailGet {
+    fn inner_backend(&self) -> &dyn vykar_storage::StorageBackend {
+        &*self.inner
+    }
+}
+
+vykar_storage::delegate_storage_backend! {
+    for FailGet;
+    except [get, get_if_changed];
+
+    fn get(&self, key: &str) -> vykar_types::error::Result<Option<Vec<u8>>> {
+        if self.should_fail(key) {
+            return Err(vykar_types::error::VykarError::Other(format!(
+                "injected GET failure: {key}"
+            )));
+        }
+        self.inner.get(key)
+    }
+
+    fn get_if_changed(
+        &self,
+        key: &str,
+        _known: &[u8; 32],
+    ) -> vykar_types::error::Result<vykar_storage::ConditionalGet> {
+        vykar_storage::get_unconditionally(self, key)
+    }
+}
+
+/// Selects the PUTs a [`FaultyPut`] fails, by key and data.
+pub(crate) type PutFilter = Box<dyn Fn(&str, &[u8]) -> bool + Send + Sync>;
+
+/// Logs `put` and `delete` keys in call order and fails each `put` for
+/// which `fail(key, data)` holds, without writing it. Batch deletes are
+/// forwarded unlogged; on a backend without them the fallback's `delete`
+/// calls are logged.
+pub(crate) struct FaultyPut {
+    pub inner: std::sync::Arc<dyn vykar_storage::StorageBackend>,
+    pub fail: PutFilter,
+    pub ops: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+/// A PUT of the segmented index head.
+pub(crate) fn is_head_put(key: &str, data: &[u8]) -> bool {
+    key == "index" && data.first() == Some(&(crate::repo::format::ObjectType::IndexHead as u8))
+}
+
+/// A PUT of an index base object.
+pub(crate) fn is_base_put(key: &str, data: &[u8]) -> bool {
+    key.starts_with(crate::repo::index_store::INDEX_OBJECT_DIR)
+        && data.first() == Some(&(crate::repo::format::ObjectType::IndexBase as u8))
+}
+
+impl vykar_storage::InnerBackend for FaultyPut {
+    fn inner_backend(&self) -> &dyn vykar_storage::StorageBackend {
+        &*self.inner
+    }
+}
+
+vykar_storage::delegate_storage_backend! {
+    for FaultyPut;
+    except [put, delete, put_pack, begin_staged_put, profile];
+
+    fn profile(&self) -> vykar_storage::BackendProfile {
+        self.inner.profile()
+    }
+
+    // Packs and staged writes are not logged.
+    fn put_pack(&self, key: &str, data: vykar_storage::PackData) -> vykar_types::error::Result<()> {
+        self.inner.put_pack(key, data)
+    }
+
+    fn begin_staged_put(
+        &self,
+        prefix: &str,
+    ) -> vykar_types::error::Result<Option<Box<dyn vykar_storage::StagedPut>>> {
+        self.inner.begin_staged_put(prefix)
+    }
+
+    fn put(&self, key: &str, data: &[u8]) -> vykar_types::error::Result<()> {
+        self.ops.lock().unwrap().push(format!("put {key}"));
+        if (self.fail)(key, data) {
+            return Err(vykar_types::error::VykarError::Other(format!(
+                "injected failure: put {key}"
+            )));
+        }
+        self.inner.put(key, data)
+    }
+
+    fn delete(&self, key: &str) -> vykar_types::error::Result<()> {
+        self.ops.lock().unwrap().push(format!("delete {key}"));
+        self.inner.delete(key)
+    }
+}

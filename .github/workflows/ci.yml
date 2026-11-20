@@ -78,6 +78,11 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # skia builds from source here (no +crt-static prebuilt); MSVC 14.52's STL needs Clang >= 22.
+      - name: Install LLVM 22
+        if: runner.os == 'Windows'
+        run: choco upgrade llvm --version=22.1.8 -y --no-progress --allow-downgrade
+
       - name: Run tests
         run: cargo test --workspace -- --include-ignored
 

@@ -1,7 +1,7 @@
 //! Maintenance operations load the chunk index under the repository lock,
 //! and refresh this machine's existing local index caches after writing it.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -18,17 +18,43 @@ use crate::commands::util::with_maintenance_lock;
 use crate::config::{RetentionConfig, SourceEntry, VykarConfig};
 use crate::index::dedup_cache::{self, MmapDedupCache, MmapFullIndexCache, MmapRestoreCache};
 use crate::index::ChunkIndexEntry;
-use crate::repo::{OpenOptions, Repository};
+use crate::repo::format::ObjectType;
+use crate::repo::{OpenOptions, RepoFormat, Repository};
 
-use super::helpers::{backup_single_source, init_repo, init_repo_v3, source_entry};
+use super::helpers::{backup_single_source, make_test_config, source_entry};
 
 const FAST: &str = "index unchanged, fast path";
 const SLOW: &str = "decode index";
 
-/// Counts reads of `index`, conditional or not.
+/// GETs of `index` (the v3 blob or the v5 head) and of `index.d/` objects.
+#[derive(Default)]
+struct IndexReads {
+    head: AtomicUsize,
+    objects: AtomicUsize,
+}
+
+impl IndexReads {
+    /// `(head GETs, index.d/ GETs)` so far.
+    fn counts(&self) -> (usize, usize) {
+        (
+            self.head.load(Ordering::SeqCst),
+            self.objects.load(Ordering::SeqCst),
+        )
+    }
+
+    fn count(&self, key: &str) {
+        if key == "index" {
+            self.head.fetch_add(1, Ordering::SeqCst);
+        } else if key.starts_with(crate::repo::index_store::INDEX_OBJECT_DIR) {
+            self.objects.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
+
+/// Counts reads of `index`, conditional or not, and of `index.d/` objects.
 struct CountIndexReads {
     inner: Box<dyn StorageBackend>,
-    reads: Arc<AtomicUsize>,
+    reads: Arc<IndexReads>,
 }
 
 impl InnerBackend for CountIndexReads {
@@ -42,16 +68,12 @@ delegate_storage_backend! {
     except [get, get_if_changed];
 
     fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
-        if key == "index" {
-            self.reads.fetch_add(1, Ordering::SeqCst);
-        }
+        self.reads.count(key);
         self.inner.get(key)
     }
 
     fn get_if_changed(&self, key: &str, known_blake3: &[u8; 32]) -> Result<ConditionalGet> {
-        if key == "index" {
-            self.reads.fetch_add(1, Ordering::SeqCst);
-        }
+        self.reads.count(key);
         self.inner.get_if_changed(key, known_blake3)
     }
 }
@@ -97,24 +119,17 @@ struct Env {
     repo_dir: PathBuf,
     cache_dir: PathBuf,
     config: VykarConfig,
+    format: RepoFormat,
 }
 
 impl Env {
-    /// An empty v3 repository; this client's caches live in a private dir.
-    fn new() -> Self {
-        Self::with_init(init_repo_v3)
-    }
-
-    /// As [`Env::new`], at the current (segmented) format.
-    fn segmented() -> Self {
-        Self::with_init(init_repo)
-    }
-
-    fn with_init(init: fn(&Path) -> VykarConfig) -> Self {
+    /// An empty repository at `format`; this client's caches live in a private dir.
+    fn new(format: RepoFormat) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let repo_dir = dir.path().join("repo");
         let cache_dir = dir.path().join("cache");
-        let mut config = init(&repo_dir);
+        let mut config = make_test_config(&repo_dir);
+        commands::init::run_at_format(&config, None, format).unwrap();
         config.cache_dir = Some(cache_dir.to_string_lossy().into_owned());
         config.retention = RetentionConfig {
             keep_last: Some(1),
@@ -125,6 +140,7 @@ impl Env {
             repo_dir,
             cache_dir,
             config,
+            format,
         }
     }
 
@@ -140,6 +156,33 @@ impl Env {
 
     /// Back up `src` with this client's config, returning the commit stages.
     fn backup(&self, src: &Path, label: &str, name: &str) -> Vec<&'static str> {
+        self.backup_with(src, label, name, None)
+    }
+
+    /// Back up with every GET counted in `reads`.
+    fn backup_counting(
+        &self,
+        src: &Path,
+        label: &str,
+        name: &str,
+        reads: &Arc<IndexReads>,
+    ) -> Vec<&'static str> {
+        let wrap = |inner: Box<dyn StorageBackend>| -> Box<dyn StorageBackend> {
+            Box::new(CountIndexReads {
+                inner,
+                reads: Arc::clone(reads),
+            })
+        };
+        self.backup_with(src, label, name, Some(&wrap))
+    }
+
+    fn backup_with(
+        &self,
+        src: &Path,
+        label: &str,
+        name: &str,
+        wrap: Option<backup::BackendWrapper<'_>>,
+    ) -> Vec<&'static str> {
         // Distinct snapshot times for retention ordering.
         std::thread::sleep(Duration::from_millis(2));
         let source_paths = vec![src.to_string_lossy().to_string()];
@@ -167,7 +210,7 @@ impl Env {
             },
             Some(&mut on_event),
             None,
-            None,
+            wrap,
         )
         .unwrap();
         stages
@@ -192,6 +235,33 @@ impl Env {
             vykar_storage::local_backend::LocalBackend::new(self.repo_dir.to_str().unwrap())
                 .unwrap(),
         )
+    }
+
+    /// Plain local storage wrapped to count index reads into `reads`.
+    fn counting(&self, reads: &Arc<IndexReads>) -> Box<dyn StorageBackend> {
+        Box::new(CountIndexReads {
+            inner: self.local(),
+            reads: Arc::clone(reads),
+        })
+    }
+
+    /// The bytes at `index`.
+    fn index_bytes(&self) -> Vec<u8> {
+        fs::read(self.repo_dir.join("index")).unwrap()
+    }
+
+    /// Files under `index.d/` (0 when the directory does not exist, i.e. on v3).
+    fn index_objects(&self) -> usize {
+        self.index_object_names().len()
+    }
+
+    /// Names of the files under `index.d/`.
+    fn index_object_names(&self) -> BTreeSet<String> {
+        let Ok(dir) = fs::read_dir(self.repo_dir.join("index.d")) else {
+            return BTreeSet::new();
+        };
+        dir.map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect()
     }
 
     /// Open over `storage` with this client's cache dir.
@@ -260,73 +330,94 @@ fn find_file(dir: &Path, name: &str) -> Option<PathBuf> {
 
 // --- (A) local caches refreshed after a maintenance index write ---
 
+const FORMATS: [RepoFormat; 2] = [RepoFormat::V3, RepoFormat::V5];
+
+/// The next backup used the refreshed caches: the fast path on v3, no
+/// `index.d/` download on v5.
+fn assert_backup_uses_caches(env: &Env, src: &Path, name: &str) {
+    let reads = Arc::new(IndexReads::default());
+    let stages = env.backup_counting(src, "a", name, &reads);
+    if env.format == RepoFormat::V3 {
+        assert!(stages.contains(&FAST), "expected fast path: {stages:?}");
+        assert!(!stages.contains(&SLOW), "unexpected slow path: {stages:?}");
+    } else {
+        let (head, objects) = reads.counts();
+        assert!(head > 0, "the counter saw no head GET");
+        assert_eq!(objects, 0, "backup downloaded index objects");
+    }
+}
+
 #[test]
 fn prune_refreshes_local_caches_so_next_backup_is_fast() {
-    let env = Env::new();
-    let src = env.source("a", &[("one.bin", 0x11)]);
-    env.backup(&src, "a", "s1");
-    fs::write(src.join("two.bin"), vec![0x22u8; 64 * 1024]).unwrap();
-    env.backup(&src, "a", "s2");
+    for format in FORMATS {
+        let env = Env::new(format);
+        let src = env.source("a", &[("one.bin", 0x11)]);
+        env.backup(&src, "a", "s1");
+        fs::write(src.join("two.bin"), vec![0x22u8; 64 * 1024]).unwrap();
+        env.backup(&src, "a", "s2");
 
-    let (stats, _) = commands::prune::run(
-        &env.config,
-        None,
-        false,
-        false,
-        &env.sources(&["a"]),
-        &[],
-        None,
-    )
-    .unwrap();
-    assert_eq!(stats.pruned, 1);
-    assert!(stats.warnings.is_empty(), "{:?}", stats.warnings);
+        let (stats, _) = commands::prune::run(
+            &env.config,
+            None,
+            false,
+            false,
+            &env.sources(&["a"]),
+            &[],
+            None,
+        )
+        .unwrap();
+        assert_eq!(stats.pruned, 1);
+        assert!(stats.warnings.is_empty(), "{:?}", stats.warnings);
 
-    let remote = env.open_fresh();
-    let id = remote.config.id.clone();
-    assert_eq!(
-        caches_at(&id, &env.cache_dir, remote.index_generation()),
-        [true; 3]
-    );
+        let remote = env.open_fresh();
+        let id = remote.config.id.clone();
+        assert_eq!(
+            caches_at(&id, &env.cache_dir, remote.index_generation()),
+            [true; 3],
+            "{format:?}"
+        );
 
-    fs::write(src.join("three.bin"), vec![0x33u8; 64 * 1024]).unwrap();
-    let stages = env.backup(&src, "a", "s3");
-    assert!(stages.contains(&FAST), "expected fast path: {stages:?}");
-    assert!(!stages.contains(&SLOW), "unexpected slow path: {stages:?}");
-    env.assert_check_clean();
+        fs::write(src.join("three.bin"), vec![0x33u8; 64 * 1024]).unwrap();
+        assert_backup_uses_caches(&env, &src, "s3");
+        env.assert_check_clean();
+    }
 }
 
 #[test]
 fn compact_refreshes_local_caches() {
-    let env = Env::new();
-    let src = env.source("a", &[("one.bin", 0x11), ("dead.bin", 0x44)]);
-    env.backup(&src, "a", "s1");
-    fs::remove_file(src.join("dead.bin")).unwrap();
-    fs::write(src.join("two.bin"), vec![0x22u8; 64 * 1024]).unwrap();
-    env.backup(&src, "a", "s2");
-    // s1's data pack now holds a live chunk (one.bin) and a dead one.
-    commands::delete::run(&env.config, None, &["s1"], false, None).unwrap();
-    let before = env.open_fresh().index_generation();
+    for format in FORMATS {
+        let env = Env::new(format);
+        let src = env.source("a", &[("one.bin", 0x11), ("dead.bin", 0x44)]);
+        env.backup(&src, "a", "s1");
+        fs::remove_file(src.join("dead.bin")).unwrap();
+        fs::write(src.join("two.bin"), vec![0x22u8; 64 * 1024]).unwrap();
+        env.backup(&src, "a", "s2");
+        // s1's data pack now holds a live chunk (one.bin) and a dead one.
+        commands::delete::run(&env.config, None, &["s1"], false, None).unwrap();
+        let before = env.open_fresh().index_generation();
 
-    let stats = commands::compact::run(&env.config, None, 0.0, None, false, None).unwrap();
-    assert!(stats.packs_repacked > 0, "{stats:?}");
+        let stats = commands::compact::run(&env.config, None, 0.0, None, false, None).unwrap();
+        assert!(stats.packs_repacked > 0, "{stats:?}");
 
-    let remote = env.open_fresh();
-    assert_ne!(remote.index_generation(), before, "compact wrote the index");
-    let id = remote.config.id.clone();
-    assert_eq!(
-        caches_at(&id, &env.cache_dir, remote.index_generation()),
-        [true; 3]
-    );
+        let remote = env.open_fresh();
+        assert_ne!(remote.index_generation(), before, "compact wrote the index");
+        let id = remote.config.id.clone();
+        assert_eq!(
+            caches_at(&id, &env.cache_dir, remote.index_generation()),
+            [true; 3],
+            "{format:?}"
+        );
 
-    fs::write(src.join("three.bin"), vec![0x33u8; 64 * 1024]).unwrap();
-    let stages = env.backup(&src, "a", "s3");
-    assert!(stages.contains(&FAST), "expected fast path: {stages:?}");
-    env.assert_check_clean();
+        fs::write(src.join("three.bin"), vec![0x33u8; 64 * 1024]).unwrap();
+        assert_backup_uses_caches(&env, &src, "s3");
+        env.assert_check_clean();
+    }
 }
 
+/// v3 only; see `maintenance_on_a_host_without_caches_segmented` for v5.
 #[test]
 fn maintenance_does_not_create_caches_on_a_host_without_them() {
-    let env = Env::new();
+    let env = Env::new(RepoFormat::V3);
     let src = env.source("a", &[("one.bin", 0x11)]);
     env.backup(&src, "a", "s1");
     fs::write(src.join("two.bin"), vec![0x22u8; 64 * 1024]).unwrap();
@@ -352,75 +443,165 @@ fn maintenance_does_not_create_caches_on_a_host_without_them() {
     }
 }
 
+/// Whether v5 maintenance should create caches on a host without them is
+/// undecided, so existence is deliberately not asserted: only that the write
+/// is a segment and that any cache present is at the new state.
 #[test]
-fn failed_index_write_in_prune_leaves_caches_untouched() {
-    let env = Env::new();
+fn maintenance_on_a_host_without_caches_segmented() {
+    let env = Env::new(RepoFormat::V5);
     let src = env.source("a", &[("one.bin", 0x11)]);
     env.backup(&src, "a", "s1");
     fs::write(src.join("two.bin"), vec![0x22u8; 64 * 1024]).unwrap();
     env.backup(&src, "a", "s2");
-    let remote = env.open_fresh();
-    let (id, generation) = (remote.config.id.clone(), remote.index_generation());
-    assert_eq!(caches_at(&id, &env.cache_dir, generation), [true; 3]);
+    let head_before = env.open_fresh().index_head().unwrap().clone();
 
-    let mut repo = env.open(
-        Box::new(FailIndexPut { inner: env.local() }),
-        OpenOptions::new(),
-    );
-    let (stats, _) = commands::prune::run_on_repo(
-        &mut repo,
-        &env.config,
-        false,
-        false,
-        &env.sources(&["a"]),
-        &[],
-        None,
-    )
-    .unwrap();
+    let other_cache = env.dir.path().join("maintenance-only");
+    fs::create_dir_all(&other_cache).unwrap();
+    let mut config = env.config.clone();
+    config.cache_dir = Some(other_cache.to_string_lossy().into_owned());
+    let (stats, _) =
+        commands::prune::run(&config, None, false, false, &env.sources(&["a"]), &[], None).unwrap();
     assert_eq!(stats.pruned, 1);
-    assert_eq!(stats.warnings.len(), 1, "{:?}", stats.warnings);
-    assert!(stats.warnings[0].contains("persisting refcount changes failed"));
-    drop(repo);
 
-    // The caches still describe the remote index, which was not replaced.
-    assert_eq!(caches_at(&id, &env.cache_dir, generation), [true; 3]);
     let remote = env.open_fresh();
-    assert_eq!(remote.index_generation(), generation);
-    let own = env.open(env.local(), OpenOptions::new().with_index());
-    assert_eq!(own.index_generation(), generation);
-    assert_eq!(entries(&own), entries(&remote));
+    let head_after = remote.index_head().unwrap().clone();
+    assert_eq!(head_after.base, head_before.base);
+    assert_eq!(head_after.segments.len(), head_before.segments.len() + 1);
+
+    let id = remote.config.id.clone();
+    let generation = dedup_cache::generation_for_state(&head_after.state_hash);
+    let cd = Some(other_cache.as_path());
+    let checks: [(Option<PathBuf>, bool); 3] = [
+        (
+            dedup_cache::full_index_cache_path(&id, cd),
+            MmapFullIndexCache::open(&id, generation, cd).is_some(),
+        ),
+        (
+            dedup_cache::dedup_cache_path(&id, cd),
+            MmapDedupCache::open(&id, generation, cd).is_some(),
+        ),
+        (
+            dedup_cache::restore_cache_path(&id, cd),
+            MmapRestoreCache::open(&id, generation, cd).is_some(),
+        ),
+    ];
+    for (path, current) in checks {
+        let path = path.unwrap();
+        if path.exists() {
+            assert!(current, "{} is not at the new state", path.display());
+        }
+    }
+}
+
+#[test]
+fn failed_index_write_in_prune_leaves_caches_untouched() {
+    for format in FORMATS {
+        let env = Env::new(format);
+        let src = env.source("a", &[("one.bin", 0x11)]);
+        env.backup(&src, "a", "s1");
+        fs::write(src.join("two.bin"), vec![0x22u8; 64 * 1024]).unwrap();
+        env.backup(&src, "a", "s2");
+        let remote = env.open_fresh();
+        let (id, generation) = (remote.config.id.clone(), remote.index_generation());
+        assert_eq!(caches_at(&id, &env.cache_dir, generation), [true; 3]);
+        let index_before = env.index_bytes();
+        let objects_before = env.index_object_names();
+
+        let mut repo = env.open(
+            Box::new(FailIndexPut { inner: env.local() }),
+            OpenOptions::new(),
+        );
+        let (stats, _) = commands::prune::run_on_repo(
+            &mut repo,
+            &env.config,
+            false,
+            false,
+            &env.sources(&["a"]),
+            &[],
+            None,
+        )
+        .unwrap();
+        assert_eq!(stats.pruned, 1);
+        assert_eq!(stats.warnings.len(), 1, "{:?}", stats.warnings);
+        assert!(stats.warnings[0].contains("persisting refcount changes failed"));
+        drop(repo);
+
+        // The caches still describe the remote index, which was not replaced.
+        assert_eq!(caches_at(&id, &env.cache_dir, generation), [true; 3]);
+        assert_eq!(env.index_bytes(), index_before, "{format:?}");
+        let remote = env.open_fresh();
+        assert_eq!(remote.index_generation(), generation);
+        let own = env.open(env.local(), OpenOptions::new().with_index());
+        assert_eq!(own.index_generation(), generation);
+        assert_eq!(entries(&own), entries(&remote));
+        drop(own);
+
+        if format == RepoFormat::V5 {
+            // The segment PUT went through before the failed head PUT.
+            let objects = env.index_object_names();
+            let debris: Vec<&String> = objects.difference(&objects_before).collect();
+            assert_eq!(debris.len(), 1, "{debris:?}");
+            assert_eq!(objects.len(), objects_before.len() + 1);
+            let bytes = fs::read(env.repo_dir.join("index.d").join(debris[0])).unwrap();
+            assert_eq!(bytes[0], ObjectType::IndexSegment as u8);
+            let head = remote.index_head().unwrap();
+            let named = head
+                .base
+                .iter()
+                .map(|b| b.name)
+                .chain(head.segments.iter().map(|s| s.name))
+                .chain(head.retired.iter().copied())
+                .any(|n| n.to_hex() == *debris[0]);
+            assert!(!named, "debris is named by the head");
+            drop(remote);
+
+            commands::compact::run(&env.config, None, 100.0, None, false, None).unwrap();
+            assert_eq!(env.index_object_names(), objects_before);
+        }
+    }
 }
 
 #[test]
 fn lock_lost_before_save_leaves_caches_untouched() {
-    let env = Env::new();
-    let src = env.source("a", &[("one.bin", 0x11)]);
-    env.backup(&src, "a", "s1");
-    let remote = env.open_fresh();
-    let (id, generation) = (remote.config.id.clone(), remote.index_generation());
-    assert_eq!(caches_at(&id, &env.cache_dir, generation), [true; 3]);
+    for format in FORMATS {
+        let env = Env::new(format);
+        let src = env.source("a", &[("one.bin", 0x11)]);
+        env.backup(&src, "a", "s1");
+        let remote = env.open_fresh();
+        let (id, generation) = (remote.config.id.clone(), remote.index_generation());
+        assert_eq!(caches_at(&id, &env.cache_dir, generation), [true; 3]);
+        let index_before = env.index_bytes();
+        let objects_before = env.index_objects();
 
-    let mut repo = env.open(env.local(), OpenOptions::new());
-    let result = with_maintenance_lock(&mut repo, |repo| {
-        repo.load_chunk_index_under_lock()?;
-        let first = *repo.chunk_index().iter().next().unwrap().0;
-        repo.chunk_index_mut().increment_refcount(&first);
-        for key in repo.storage.list("locks/").unwrap() {
-            if key.ends_with(".json") {
-                repo.storage.delete(&key).unwrap();
+        let mut repo = env.open(env.local(), OpenOptions::new());
+        let result = with_maintenance_lock(&mut repo, |repo| {
+            repo.load_chunk_index_under_lock()?;
+            let first = *repo.chunk_index().iter().next().unwrap().0;
+            repo.chunk_index_mut().increment_refcount(&first);
+            for key in repo.storage.list("locks/").unwrap() {
+                if key.ends_with(".json") {
+                    repo.storage.delete(&key).unwrap();
+                }
             }
-        }
-        repo.save_state()
-    });
-    let err = result.unwrap_err();
-    assert!(
-        matches!(err, VykarError::LockExpired(_)),
-        "expected LockExpired, got: {err}"
-    );
-    drop(repo);
+            repo.save_state()
+        });
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, VykarError::LockExpired(_)),
+            "expected LockExpired, got: {err}"
+        );
+        drop(repo);
 
-    assert_eq!(caches_at(&id, &env.cache_dir, generation), [true; 3]);
-    assert_eq!(env.open_fresh().index_generation(), generation);
+        assert_eq!(caches_at(&id, &env.cache_dir, generation), [true; 3]);
+        assert_eq!(env.open_fresh().index_generation(), generation);
+        assert_eq!(env.index_bytes(), index_before, "{format:?}");
+        // v5 PUTs the segment, then checks the lock before the head PUT.
+        let expected = match format {
+            RepoFormat::V3 => 0,
+            _ => objects_before + 1,
+        };
+        assert_eq!(env.index_objects(), expected, "{format:?}");
+    }
 }
 
 /// Changes a refcount and persists the index; call under the maintenance lock.
@@ -456,7 +637,7 @@ fn save_then_lose_lock(env: &Env) -> (u64, u64) {
 
 #[test]
 fn lock_lost_after_save_still_refreshes_caches() {
-    let env = Env::new();
+    let env = Env::new(RepoFormat::V3);
     let src = env.source("a", &[("one.bin", 0x11)]);
     env.backup(&src, "a", "s1");
     let id = env.open_fresh().config.id.clone();
@@ -468,7 +649,7 @@ fn lock_lost_after_save_still_refreshes_caches() {
 
 #[test]
 fn lock_lost_after_save_still_refreshes_caches_segmented() {
-    let env = Env::segmented();
+    let env = Env::new(RepoFormat::V5);
     let src = env.source("a", &[("one.bin", 0x11)]);
     env.backup(&src, "a", "s1");
     let id = env.open_fresh().config.id.clone();
@@ -478,15 +659,10 @@ fn lock_lost_after_save_still_refreshes_caches_segmented() {
     assert_eq!(caches_at(&id, &env.cache_dir, after), [true; 3]);
 }
 
-/// After losing the lock, another writer on this host persists a newer index
-/// and refreshes the caches; our late refresh then replaces them with caches
-/// at our older generation, which every open and commit must miss.
-#[test]
-fn late_refresh_after_takeover_is_a_cache_miss() {
-    let env = Env::new();
-    let src = env.source("a", &[("one.bin", 0x11)]);
-    env.backup(&src, "a", "s1");
-
+/// Saves under the maintenance lock, loses it, and lets another writer on
+/// this host persist a newer index before our late cache refresh. Returns
+/// our generation.
+fn save_then_get_taken_over(env: &Env) -> u64 {
     let mut repo = env.open(env.local(), OpenOptions::new());
     let ours = with_maintenance_lock(&mut repo, |repo| {
         bump_and_save(repo)?;
@@ -498,6 +674,19 @@ fn late_refresh_after_takeover_is_a_cache_miss() {
     })
     .unwrap();
     drop(repo);
+    ours
+}
+
+/// After losing the lock, another writer on this host persists a newer index
+/// and refreshes the caches; our late refresh then replaces them with caches
+/// at our older generation, which every open and commit must miss.
+#[test]
+fn late_refresh_after_takeover_is_a_cache_miss() {
+    let env = Env::new(RepoFormat::V3);
+    let src = env.source("a", &[("one.bin", 0x11)]);
+    env.backup(&src, "a", "s1");
+
+    let ours = save_then_get_taken_over(&env);
 
     let remote = env.open_fresh();
     let id = remote.config.id.clone();
@@ -516,6 +705,34 @@ fn late_refresh_after_takeover_is_a_cache_miss() {
     fs::write(src.join("two.bin"), vec![0x22u8; 64 * 1024]).unwrap();
     let stages = env.backup(&src, "a", "s2");
     assert!(stages.contains(&SLOW), "expected slow path: {stages:?}");
+}
+
+/// On v5 our late refresh finds the full cache at the newer state and
+/// leaves every cache there.
+#[test]
+fn late_refresh_after_takeover_keeps_the_newer_caches_segmented() {
+    let env = Env::new(RepoFormat::V5);
+    let src = env.source("a", &[("one.bin", 0x11)]);
+    env.backup(&src, "a", "s1");
+
+    let ours = save_then_get_taken_over(&env);
+
+    let remote = env.open_fresh();
+    let id = remote.config.id.clone();
+    assert_ne!(ours, remote.index_generation());
+    assert_eq!(caches_at(&id, &env.cache_dir, ours), [false; 3]);
+    assert_eq!(
+        caches_at(&id, &env.cache_dir, remote.index_generation()),
+        [true; 3]
+    );
+
+    let own = env.open(env.local(), OpenOptions::new().with_index());
+    assert_eq!(own.index_generation(), remote.index_generation());
+    assert_eq!(entries(&own), entries(&remote));
+    drop(own);
+
+    fs::write(src.join("two.bin"), vec![0x22u8; 64 * 1024]).unwrap();
+    assert_backup_uses_caches(&env, &src, "s2");
 }
 
 // --- (C) index loaded under the maintenance lock ---
@@ -542,189 +759,199 @@ fn assert_present(env: &Env, chunks: &HashMap<ChunkId, ChunkIndexEntry>) {
 
 #[test]
 fn prune_uses_index_current_at_lock_time() {
-    let env = Env::new();
-    let src_a = env.source("a", &[("one.bin", 0x11)]);
-    env.backup(&src_a, "a", "s1");
-    fs::write(src_a.join("two.bin"), vec![0x22u8; 64 * 1024]).unwrap();
-    env.backup(&src_a, "a", "s2");
+    for format in FORMATS {
+        let env = Env::new(format);
+        let src_a = env.source("a", &[("one.bin", 0x11)]);
+        env.backup(&src_a, "a", "s1");
+        fs::write(src_a.join("two.bin"), vec![0x22u8; 64 * 1024]).unwrap();
+        env.backup(&src_a, "a", "s2");
 
-    // Opened with the index before the other client commits.
-    let mut repo = env.open(env.local(), OpenOptions::new().with_index());
-    let src_b = env.source("b", &[("other.bin", 0x55)]);
-    let s3_chunks = new_chunks(&env, || env.backup_elsewhere(&src_b, "b", "s3"));
+        // Opened with the index before the other client commits.
+        let mut repo = env.open(env.local(), OpenOptions::new().with_index());
+        let src_b = env.source("b", &[("other.bin", 0x55)]);
+        let s3_chunks = new_chunks(&env, || env.backup_elsewhere(&src_b, "b", "s3"));
 
-    let (stats, _) = commands::prune::run_on_repo(
-        &mut repo,
-        &env.config,
-        false,
-        false,
-        &env.sources(&["a", "b"]),
-        &[],
-        None,
-    )
-    .unwrap();
-    drop(repo);
-    assert_eq!(stats.pruned, 1);
-    assert!(stats.warnings.is_empty(), "{:?}", stats.warnings);
+        let (stats, _) = commands::prune::run_on_repo(
+            &mut repo,
+            &env.config,
+            false,
+            false,
+            &env.sources(&["a", "b"]),
+            &[],
+            None,
+        )
+        .unwrap();
+        drop(repo);
+        assert_eq!(stats.pruned, 1);
+        assert!(stats.warnings.is_empty(), "{:?}", stats.warnings);
 
-    let names: Vec<String> = env
-        .open_fresh()
-        .manifest()
-        .snapshots
-        .iter()
-        .map(|s| s.name.clone())
-        .collect();
-    assert_eq!(names.len(), 2, "{names:?}");
-    assert!(names.contains(&"s2".to_string()) && names.contains(&"s3".to_string()));
-    assert_present(&env, &s3_chunks);
-    env.assert_check_clean();
+        let names: Vec<String> = env
+            .open_fresh()
+            .manifest()
+            .snapshots
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+        assert_eq!(names.len(), 2, "{names:?}");
+        assert!(names.contains(&"s2".to_string()) && names.contains(&"s3".to_string()));
+        assert_present(&env, &s3_chunks);
+        env.assert_check_clean();
+    }
 }
 
 #[test]
 fn delete_uses_index_current_at_lock_time() {
-    let env = Env::new();
-    let src_a = env.source("a", &[("one.bin", 0x11)]);
-    env.backup(&src_a, "a", "s1");
+    for format in FORMATS {
+        let env = Env::new(format);
+        let src_a = env.source("a", &[("one.bin", 0x11)]);
+        env.backup(&src_a, "a", "s1");
 
-    let mut repo = env.open(env.local(), OpenOptions::new().with_index());
-    let src_b = env.source("b", &[("other.bin", 0x55)]);
-    let s2_chunks = new_chunks(&env, || env.backup_elsewhere(&src_b, "b", "s2"));
+        let mut repo = env.open(env.local(), OpenOptions::new().with_index());
+        let src_b = env.source("b", &[("other.bin", 0x55)]);
+        let s2_chunks = new_chunks(&env, || env.backup_elsewhere(&src_b, "b", "s2"));
 
-    let result = commands::delete::run_on_repo(&mut repo, &["s1"], false, None).unwrap();
-    drop(repo);
-    assert_eq!(result.stats.len(), 1);
-    assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        let result = commands::delete::run_on_repo(&mut repo, &["s1"], false, None).unwrap();
+        drop(repo);
+        assert_eq!(result.stats.len(), 1);
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
 
-    assert_present(&env, &s2_chunks);
-    env.assert_check_clean();
+        assert_present(&env, &s2_chunks);
+        env.assert_check_clean();
+    }
 }
 
 #[test]
 fn compact_does_not_delete_packs_committed_after_open() {
-    let env = Env::new();
-    let src_a = env.source("a", &[("one.bin", 0x11)]);
-    env.backup(&src_a, "a", "s1");
+    for format in FORMATS {
+        let env = Env::new(format);
+        let src_a = env.source("a", &[("one.bin", 0x11)]);
+        env.backup(&src_a, "a", "s1");
 
-    let mut repo = env.open(env.local(), OpenOptions::new().with_index());
-    let src_b = env.source("b", &[("other.bin", 0x55)]);
-    let s2_chunks = new_chunks(&env, || env.backup_elsewhere(&src_b, "b", "s2"));
+        let mut repo = env.open(env.local(), OpenOptions::new().with_index());
+        let src_b = env.source("b", &[("other.bin", 0x55)]);
+        let s2_chunks = new_chunks(&env, || env.backup_elsewhere(&src_b, "b", "s2"));
 
-    let stats = commands::compact::run_on_repo(&mut repo, 0.0, None, false, None).unwrap();
-    drop(repo);
-    assert_eq!(stats.packs_orphan, 0, "{stats:?}");
+        let stats = commands::compact::run_on_repo(&mut repo, 0.0, None, false, None).unwrap();
+        drop(repo);
+        assert_eq!(stats.packs_orphan, 0, "{stats:?}");
 
-    assert_present(&env, &s2_chunks);
-    let storage = env.local();
-    for entry in s2_chunks.values() {
-        assert!(
-            storage.exists(&entry.pack_id.storage_key()).unwrap(),
-            "pack {} deleted",
-            entry.pack_id
+        assert_present(&env, &s2_chunks);
+        let storage = env.local();
+        for entry in s2_chunks.values() {
+            assert!(
+                storage.exists(&entry.pack_id.storage_key()).unwrap(),
+                "pack {} deleted",
+                entry.pack_id
+            );
+        }
+        env.assert_check_clean();
+
+        let dest = env.dir.path().join("restored");
+        fs::create_dir_all(&dest).unwrap();
+        commands::restore::run(
+            &env.config,
+            None,
+            "s2",
+            dest.to_str().unwrap(),
+            None,
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+        let restored = find_file(&dest, "other.bin").expect("other.bin restored");
+        assert_eq!(
+            fs::read(restored).unwrap(),
+            fs::read(src_b.join("other.bin")).unwrap()
         );
     }
-    env.assert_check_clean();
+}
 
-    let dest = env.dir.path().join("restored");
-    fs::create_dir_all(&dest).unwrap();
-    commands::restore::run(
-        &env.config,
-        None,
-        "s2",
-        dest.to_str().unwrap(),
-        None,
-        false,
-        false,
-        None,
-    )
-    .unwrap();
-    let restored = find_file(&dest, "other.bin").expect("other.bin restored");
-    assert_eq!(
-        fs::read(restored).unwrap(),
-        fs::read(src_b.join("other.bin")).unwrap()
-    );
+/// Index reads an open without the index makes: none on v3, the single head
+/// GET on v5.
+fn open_reads(format: RepoFormat) -> (usize, usize) {
+    match format {
+        RepoFormat::V3 => (0, 0),
+        _ => (1, 0),
+    }
 }
 
 #[test]
 fn prune_with_nothing_to_prune_does_not_read_index() {
-    let env = Env::new();
-    let src = env.source("a", &[("one.bin", 0x11)]);
-    env.backup(&src, "a", "s1");
-    fs::write(src.join("two.bin"), vec![0x22u8; 64 * 1024]).unwrap();
-    env.backup(&src, "a", "s2");
+    for format in FORMATS {
+        let env = Env::new(format);
+        let src = env.source("a", &[("one.bin", 0x11)]);
+        env.backup(&src, "a", "s1");
+        fs::write(src.join("two.bin"), vec![0x22u8; 64 * 1024]).unwrap();
+        env.backup(&src, "a", "s2");
 
-    let reads = Arc::new(AtomicUsize::new(0));
-    let counting = || {
-        Box::new(CountIndexReads {
-            inner: env.local(),
-            reads: Arc::clone(&reads),
-        })
-    };
+        let mut keep_all = env.config.clone();
+        keep_all.retention.keep_last = Some(10);
+        let reads = Arc::new(IndexReads::default());
+        let mut repo = env.open(env.counting(&reads), OpenOptions::new());
+        assert_eq!(reads.counts(), open_reads(format), "{format:?}: open");
+        let (stats, _) = commands::prune::run_on_repo(
+            &mut repo,
+            &keep_all,
+            false,
+            false,
+            &env.sources(&["a"]),
+            &[],
+            None,
+        )
+        .unwrap();
+        assert_eq!(stats.pruned, 0);
+        assert_eq!(reads.counts(), open_reads(format), "{format:?}: prune");
 
-    let mut keep_all = env.config.clone();
-    keep_all.retention.keep_last = Some(10);
-    let mut repo = env.open(counting(), OpenOptions::new());
-    let (stats, _) = commands::prune::run_on_repo(
-        &mut repo,
-        &keep_all,
-        false,
-        false,
-        &env.sources(&["a"]),
-        &[],
-        None,
-    )
-    .unwrap();
-    assert_eq!(stats.pruned, 0);
-    assert_eq!(reads.load(Ordering::SeqCst), 0);
-
-    // A dry run with a candidate does not read it either.
-    let mut repo = env.open(counting(), OpenOptions::new());
-    let (stats, _) = commands::prune::run_on_repo(
-        &mut repo,
-        &env.config,
-        true,
-        false,
-        &env.sources(&["a"]),
-        &[],
-        None,
-    )
-    .unwrap();
-    assert_eq!(stats.pruned, 1);
-    assert_eq!(reads.load(Ordering::SeqCst), 0);
-    assert_eq!(env.open_fresh().manifest().snapshots.len(), 2);
+        // A dry run with a candidate does not read it either.
+        let reads = Arc::new(IndexReads::default());
+        let mut repo = env.open(env.counting(&reads), OpenOptions::new());
+        assert_eq!(reads.counts(), open_reads(format), "{format:?}: open");
+        let (stats, _) = commands::prune::run_on_repo(
+            &mut repo,
+            &env.config,
+            true,
+            false,
+            &env.sources(&["a"]),
+            &[],
+            None,
+        )
+        .unwrap();
+        assert_eq!(stats.pruned, 1);
+        assert_eq!(reads.counts(), open_reads(format), "{format:?}: dry run");
+        assert_eq!(env.open_fresh().manifest().snapshots.len(), 2);
+    }
 }
 
 #[test]
 fn prune_loads_index_after_session_check() {
-    let env = Env::new();
-    let src = env.source("a", &[("one.bin", 0x11)]);
-    env.backup(&src, "a", "s1");
-    fs::write(src.join("two.bin"), vec![0x22u8; 64 * 1024]).unwrap();
-    env.backup(&src, "a", "s2");
+    for format in FORMATS {
+        let env = Env::new(format);
+        let src = env.source("a", &[("one.bin", 0x11)]);
+        env.backup(&src, "a", "s1");
+        fs::write(src.join("two.bin"), vec![0x22u8; 64 * 1024]).unwrap();
+        env.backup(&src, "a", "s2");
 
-    crate::repo::lock::register_session(env.local().as_ref(), "live-session").unwrap();
+        crate::repo::lock::register_session(env.local().as_ref(), "live-session").unwrap();
 
-    let reads = Arc::new(AtomicUsize::new(0));
-    let mut repo = env.open(
-        Box::new(CountIndexReads {
-            inner: env.local(),
-            reads: Arc::clone(&reads),
-        }),
-        OpenOptions::new(),
-    );
-    let err = commands::prune::run_on_repo(
-        &mut repo,
-        &env.config,
-        false,
-        false,
-        &env.sources(&["a"]),
-        &[],
-        None,
-    )
-    .err()
-    .unwrap();
-    assert!(
-        matches!(err, VykarError::ActiveSessions(_)),
-        "expected ActiveSessions, got: {err}"
-    );
-    assert_eq!(reads.load(Ordering::SeqCst), 0);
+        let reads = Arc::new(IndexReads::default());
+        let mut repo = env.open(env.counting(&reads), OpenOptions::new());
+        assert_eq!(reads.counts(), open_reads(format), "{format:?}: open");
+        let err = commands::prune::run_on_repo(
+            &mut repo,
+            &env.config,
+            false,
+            false,
+            &env.sources(&["a"]),
+            &[],
+            None,
+        )
+        .err()
+        .unwrap();
+        assert!(
+            matches!(err, VykarError::ActiveSessions(_)),
+            "expected ActiveSessions, got: {err}"
+        );
+        assert_eq!(reads.counts(), open_reads(format), "{format:?}: prune");
+    }
 }

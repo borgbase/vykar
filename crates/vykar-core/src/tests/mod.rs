@@ -17,6 +17,7 @@ mod hostname;
 mod index;
 mod info;
 mod item;
+mod layout_equivalence;
 mod lazy_item_stream;
 mod lock;
 mod lock_fence;

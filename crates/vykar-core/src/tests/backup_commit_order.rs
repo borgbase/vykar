@@ -51,6 +51,13 @@ impl Gate {
     }
 }
 
+/// Runs once, at the first `locks/` PUT (the commit lock), before it is forwarded.
+type AtLock = Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>>;
+
+fn at_lock(f: impl FnOnce() + Send + 'static) -> Option<AtLock> {
+    Some(Arc::new(Mutex::new(Some(Box::new(f)))))
+}
+
 #[derive(Clone, Default)]
 struct Shared {
     events: Arc<Mutex<Vec<Event>>>,
@@ -72,6 +79,13 @@ struct Shared {
     interrupt_after_pack: Option<Arc<AtomicBool>>,
     /// Fail every `snapshots/` PUT, after the index write it follows.
     fail_snapshot_put: bool,
+    /// Another client's work, run at the commit lock PUT.
+    at_lock: Option<AtLock>,
+    /// Fail every `exists` of a session marker once the commit lock PUT was
+    /// seen, so the commit's marker probe is inconclusive.
+    fail_marker_probe: bool,
+    /// Number of marker `exists` calls failed by `fail_marker_probe`.
+    marker_probe_failures: Arc<Mutex<usize>>,
 }
 
 struct ObservingBackend {
@@ -109,6 +123,14 @@ impl ObservingBackend {
             self.record(Event::LockPut);
             if self.shared.fail_lock_put {
                 return Err(VykarError::Other("injected lock PUT failure".into()));
+            }
+            let hook = self
+                .shared
+                .at_lock
+                .as_ref()
+                .and_then(|h| h.lock().unwrap().take());
+            if let Some(f) = hook {
+                f();
             }
             if self.shared.delete_pack_at_lock {
                 let victim = self
@@ -160,7 +182,9 @@ impl InnerBackend for ObservingBackend {
 
 delegate_storage_backend! {
     for ObservingBackend;
-    except [put, delete, put_owned, put_pack, begin_staged_put, object_sizes, profile];
+    except [
+        put, delete, exists, put_owned, put_pack, begin_staged_put, object_sizes, profile,
+    ];
 
     // Keep packs on the intercepted `put` path. The recorded order must include every pack write.
     fn begin_staged_put(
@@ -200,6 +224,18 @@ delegate_storage_backend! {
 
     fn put_pack(&self, key: &str, data: vykar_storage::PackData) -> Result<()> {
         self.put_with(key, || self.inner.put_pack(key, data))
+    }
+
+    fn exists(&self, key: &str) -> Result<bool> {
+        let marker = key.starts_with("sessions/") && key.ends_with(".json");
+        if marker
+            && self.shared.fail_marker_probe
+            && self.shared.events.lock().unwrap().contains(&Event::LockPut)
+        {
+            *self.shared.marker_probe_failures.lock().unwrap() += 1;
+            return Err(VykarError::Other("injected marker probe failure".into()));
+        }
+        self.inner.exists(key)
     }
 
     fn object_sizes(&self, keys: &[String]) -> Result<Vec<Option<u64>>> {
@@ -781,6 +817,12 @@ fn assert_check_clean(config: &crate::config::VykarConfig) {
     assert!(result.errors.is_empty(), "{:?}", result.errors);
 }
 
+/// [`assert_check_clean`] with data verification on.
+fn assert_check_clean_verified(config: &crate::config::VykarConfig) {
+    let result = crate::commands::check::run(config, None, true, false).unwrap();
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+}
+
 fn compact(config: &crate::config::VykarConfig) {
     crate::commands::compact::run(config, None, 0.0, None, false, None).unwrap();
 }
@@ -793,10 +835,15 @@ fn assert_superset(packs: &[String], config: &crate::config::VykarConfig) {
 
 /// Restores `snap` and compares it with the source `setup` wrote.
 fn assert_restores_snap(config: &crate::config::VykarConfig, dest: &Path) {
+    assert_restores(config, "snap", dest);
+}
+
+/// Restores `snapshot` and compares it with the files `setup` wrote.
+fn assert_restores(config: &crate::config::VykarConfig, snapshot: &str, dest: &Path) {
     crate::commands::restore::run(
         config,
         None,
-        "snap",
+        snapshot,
         dest.to_str().unwrap(),
         None,
         false,
@@ -921,4 +968,235 @@ fn retry_after_a_snapshot_put_failure_dedups_and_keeps_its_packs() {
     assert_superset(&packs, &config);
     assert_check_clean(&config);
     assert_restores_snap(&config, &dir.path().join("restore"));
+}
+
+// --- the head moved during the session ---
+
+/// `config` seen from another machine (its own cache dir under `dir`).
+fn other_client(dir: &Path, config: &crate::config::VykarConfig) -> crate::config::VykarConfig {
+    let mut other = config.clone();
+    other.cache_dir = Some(dir.join("other-cache").to_string_lossy().into_owned());
+    other
+}
+
+/// The repository as a client with an empty cache dir at `cache` reads it.
+fn cold_repo(config: &crate::config::VykarConfig, cache: &Path) -> crate::repo::Repository {
+    let storage = crate::storage::backend_from_config(&config.repository, 1).unwrap();
+    crate::repo::Repository::open(
+        storage,
+        None,
+        Some(cache.to_path_buf()),
+        crate::repo::OpenOptions::new().with_index(),
+    )
+    .unwrap()
+}
+
+/// The index as a client with an empty cache dir at `cache` reads it.
+fn cold_index(config: &crate::config::VykarConfig, cache: &Path) -> crate::index::ChunkIndex {
+    cold_repo(config, cache).chunk_index().clone()
+}
+
+fn sorted_entries(
+    index: &crate::index::ChunkIndex,
+) -> Vec<(
+    vykar_types::chunk_id::ChunkId,
+    crate::index::ChunkIndexEntry,
+)> {
+    let mut v: Vec<_> = index.iter().map(|(id, e)| (*id, *e)).collect();
+    v.sort_by_key(|(id, _)| *id.as_bytes());
+    v
+}
+
+/// Another client commits the same chunks while this session runs: the
+/// commit catches up on the moved head and turns its new entries into bumps.
+#[test]
+fn concurrent_commit_of_the_same_chunks_becomes_bumps() {
+    use crate::commands::check::RepairMode;
+    use crate::index::head::IndexHead;
+
+    let (dir, config, src) = setup();
+    let repo_dir = dir.path().join("repo");
+    let other = other_client(dir.path(), &config);
+
+    type AtLockState = (Refcounts, Vec<vykar_types::chunk_id::ChunkId>, IndexHead);
+    let seen: Arc<Mutex<Option<AtLockState>>> = Arc::default();
+    let hook = {
+        let (seen, config, src) = (Arc::clone(&seen), config.clone(), src.clone());
+        let cold = dir.path().join("cold-at-lock");
+        move || {
+            crate::tests::helpers::backup_single_source(&other, &src, "test", "other");
+            let repo = cold_repo(&config, &cold);
+            let refcounts: Refcounts = repo
+                .chunk_index()
+                .iter()
+                .map(|(id, e)| (*id, e.refcount))
+                .collect();
+            let ids = sorted_entries(repo.chunk_index())
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
+            let head = repo.index_head().unwrap().clone();
+            *seen.lock().unwrap() = Some((refcounts, ids, head));
+        }
+    };
+    let shared = Shared {
+        at_lock: at_lock(hook),
+        ..Default::default()
+    };
+    run_backup(&config, &src, &shared).unwrap();
+    let (at_lock_refcounts, other_ids, head_at_lock) =
+        seen.lock().unwrap().take().expect("the hook ran");
+    assert_eq!(head_at_lock.segments.len(), 1, "{head_at_lock:?}");
+
+    // One more segment over the moved head, not a base.
+    let repo = cold_repo(&config, &dir.path().join("cold-after"));
+    let head = repo.index_head().unwrap().clone();
+    assert_eq!(head.base, head_at_lock.base, "{head:?}");
+    assert_eq!(head.segments.len(), 2, "{head:?}");
+    assert_eq!(head.segments[0], head_at_lock.segments[0], "{head:?}");
+    let seg_ref = &head.segments[1];
+    let bytes = repo
+        .storage
+        .get(&crate::repo::index_store::object_key(&seg_ref.name))
+        .unwrap()
+        .unwrap();
+    let seg =
+        crate::repo::index_store::decode_segment(seg_ref, &bytes, repo.crypto.as_ref()).unwrap();
+    assert_eq!(seg.prev_entries, other_ids.len() as u64);
+    assert!(
+        seg.new_entries.iter().all(|e| other_ids
+            .binary_search_by_key(e.chunk_id.as_bytes(), |id| *id.as_bytes())
+            .is_err()),
+        "a chunk the other client committed was written as a new entry: {seg:?}"
+    );
+    drop(repo);
+
+    // Repair recounts references; its result is the oracle for the bumps.
+    let refs = refcounts(&repo_dir);
+    let plan = crate::commands::check::run_with_repair(
+        &config,
+        None,
+        false,
+        RepairMode::Apply,
+        None,
+        None,
+    )
+    .unwrap()
+    .plan;
+    assert!(!plan.has_data_loss, "{:?}", plan.actions);
+    let repaired = refcounts(&repo_dir);
+    assert_eq!(refs, repaired, "the merge lost or doubled a refcount");
+    for (pos, id) in other_ids.iter().enumerate() {
+        let delta = seg
+            .deltas
+            .iter()
+            .find(|d| d.position as usize == pos)
+            .map_or(0, |d| d.delta);
+        let ours = i64::from(repaired[id]) - i64::from(at_lock_refcounts[id]);
+        assert_eq!(delta, ours, "chunk {id}");
+    }
+    assert!(seg.deltas.iter().all(|d| d.delta > 0), "{seg:?}");
+    assert!(!seg.deltas.is_empty(), "{seg:?}");
+
+    assert_check_clean_verified(&config);
+    let warm = crate::tests::helpers::open_local_repo(&repo_dir);
+    assert_eq!(
+        sorted_entries(&cold_index(&config, &dir.path().join("cold-end"))),
+        sorted_entries(warm.chunk_index())
+    );
+    drop(warm);
+    assert_restores(&config, "snap", &dir.path().join("restore-snap"));
+    assert_restores(&config, "other", &dir.path().join("restore-other"));
+}
+
+/// The session was reaped (its marker aged out and maintenance deleted the
+/// snapshot it deduplicated against) while its marker probe was
+/// inconclusive, so the merge is the safety net: it finds bumps on chunks
+/// that are gone and fails the commit before any index write.
+#[test]
+fn chunks_deleted_during_the_session_fail_the_commit_as_stale() {
+    let (dir, config, src) = setup();
+    crate::tests::helpers::backup_single_source(&config, &src, "test", "s1");
+    // A new chunk, so the session uploads a pack and journals it.
+    fs::write(src.join("c.bin"), vec![0xc3u8; 32 * 1024]).unwrap();
+    let other = other_client(dir.path(), &config);
+
+    type AtLockState = (Option<Vec<u8>>, Vec<String>);
+    let seen: Arc<Mutex<Option<AtLockState>>> = Arc::default();
+    let hook = {
+        let (seen, config) = (Arc::clone(&seen), config.clone());
+        move || {
+            let storage = crate::storage::backend_from_config(&config.repository, 1).unwrap();
+            let markers: Vec<String> = storage
+                .list("sessions/")
+                .unwrap()
+                .into_iter()
+                .filter(|k| k.ends_with(".json"))
+                .collect();
+            assert_eq!(markers.len(), 1, "{markers:?}");
+            let key = &markers[0];
+            let mut entry: serde_json::Value =
+                serde_json::from_slice(&storage.get(key).unwrap().unwrap()).unwrap();
+            let old = (chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
+            entry["registered_at"] = old.clone().into();
+            entry["last_refresh"] = old.into();
+            storage
+                .put(key, &serde_json::to_vec(&entry).unwrap())
+                .unwrap();
+
+            crate::commands::delete::run(&other, None, &["s1"], false, None).unwrap();
+            assert!(
+                !storage.exists(key).unwrap(),
+                "maintenance reaped the marker"
+            );
+
+            let head = storage.get("index").unwrap();
+            *seen.lock().unwrap() = Some((head, repo_keys(&config, "index.d/")));
+        }
+    };
+    let shared = Shared {
+        at_lock: at_lock(hook),
+        fail_marker_probe: true,
+        ..Default::default()
+    };
+    let err = run_backup(&config, &src, &shared).unwrap_err();
+    assert!(
+        matches!(err, VykarError::StaleChunksDuringCommit),
+        "expected StaleChunksDuringCommit, got: {err}"
+    );
+    assert!(
+        *shared.marker_probe_failures.lock().unwrap() > 0,
+        "the marker probe never ran"
+    );
+    let (head_at_lock, objects_at_lock) = seen.lock().unwrap().take().expect("the hook ran");
+
+    let storage = crate::storage::backend_from_config(&config.repository, 1).unwrap();
+    assert_eq!(
+        storage.get("index").unwrap(),
+        head_at_lock,
+        "the head moved"
+    );
+    assert_eq!(repo_keys(&config, "index.d/"), objects_at_lock);
+    let events = shared.events.lock().unwrap().clone();
+    let lock = events.iter().position(|e| *e == Event::LockPut).unwrap();
+    assert!(
+        !events[lock..]
+            .iter()
+            .any(|e| matches!(e, Event::SegmentPut | Event::BasePut | Event::HeadPut)),
+        "{events:?}"
+    );
+    assert!(repo_keys(&config, "snapshots/").is_empty());
+    assert!(repo_keys(&config, "locks/").is_empty());
+    let (marker, journal) = session_keys(&config);
+    assert!(!marker, "the reaped marker stays gone");
+    // The cleanup that reaped the marker gives its journal one run of
+    // grace, and the failed commit keeps it for recovery.
+    assert!(journal, "the journal must survive for recovery");
+
+    run_backup(&config, &src, &Shared::default()).unwrap();
+    assert_check_clean(&config);
+    let dest = dir.path().join("restore");
+    assert_restores_snap(&config, &dest);
+    let c = find_file(&dest, "c.bin").expect("c.bin restored");
+    assert_eq!(fs::read(c).unwrap(), vec![0xc3u8; 32 * 1024]);
 }

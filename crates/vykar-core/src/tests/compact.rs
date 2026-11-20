@@ -295,8 +295,12 @@ mod server_side {
     use crate::commands::compact::compact_repo;
     use crate::compress::Compression;
     use crate::config::ChunkerConfig;
+    use crate::index::segment::Segment;
+    use crate::index::ChunkIndexEntry;
+    use crate::repo::index_store;
+    use crate::repo::index_write::FoldPolicy;
     use crate::repo::pack::PackType;
-    use crate::repo::{EncryptionMode, Repository};
+    use crate::repo::{EncryptionMode, OpenOptions, RepoFormat, Repository};
     use crate::testutil::{init_test_environment, MemoryBackend};
     use vykar_protocol::{RepackOperationResult, RepackPlanRequest, RepackResultResponse};
     use vykar_storage::{delegate_storage_backend, InnerBackend, StorageBackend};
@@ -447,7 +451,7 @@ mod server_side {
         }
     }
 
-    fn server_repo(mode: Mode, batch: bool) -> (Repository, Log) {
+    fn server_repo(mode: Mode, batch: bool, format: RepoFormat) -> (Repository, Log) {
         init_test_environment();
         let log = Log::default();
         let storage = Box::new(ServerRepackBackend {
@@ -463,7 +467,7 @@ mod server_side {
             None,
             None,
             None,
-            crate::repo::RepoFormat::V3,
+            format,
         )
         .unwrap();
         repo.begin_write_session(&crate::repo::WriteSessionOptions::default())
@@ -502,7 +506,7 @@ mod server_side {
 
     #[test]
     fn sources_deleted_by_client_after_index_saved() {
-        let (mut repo, log) = server_repo(Mode::CopyToNewPack, false);
+        let (mut repo, log) = server_repo(Mode::CopyToNewPack, false, RepoFormat::V3);
         let (id_b, partial, empty) = setup_dead_packs(&mut repo);
         log.events.lock().unwrap().clear();
 
@@ -541,7 +545,7 @@ mod server_side {
 
     #[test]
     fn source_returned_as_new_pack_is_kept() {
-        let (mut repo, log) = server_repo(Mode::ReturnSource, false);
+        let (mut repo, log) = server_repo(Mode::ReturnSource, false, RepoFormat::V3);
         let (id_b, partial, empty) = setup_dead_packs(&mut repo);
         log.events.lock().unwrap().clear();
 
@@ -560,7 +564,7 @@ mod server_side {
 
     #[test]
     fn repack_error_leaves_sources_and_index() {
-        let (mut repo, log) = server_repo(Mode::FailRepack, false);
+        let (mut repo, log) = server_repo(Mode::FailRepack, false, RepoFormat::V3);
         let (id_b, partial, empty) = setup_dead_packs(&mut repo);
         log.events.lock().unwrap().clear();
 
@@ -580,7 +584,7 @@ mod server_side {
 
     #[test]
     fn delete_failure_keeps_index_on_new_packs() {
-        let (mut repo, log) = server_repo(Mode::FailPackDeletes, false);
+        let (mut repo, log) = server_repo(Mode::FailPackDeletes, false, RepoFormat::V3);
         let (id_b, partial, _empty) = setup_dead_packs(&mut repo);
         log.events.lock().unwrap().clear();
 
@@ -606,7 +610,7 @@ mod server_side {
     /// `(packs_repacked, packs_deleted_empty, space_freed)` of a successful
     /// compact over [`setup_dead_packs`].
     fn delete_stats(mode: Mode, batch: bool) -> (u64, u64, u64) {
-        let (mut repo, _log) = server_repo(mode, batch);
+        let (mut repo, _log) = server_repo(mode, batch, RepoFormat::V3);
         setup_dead_packs(&mut repo);
         let stats = compact_repo(&mut repo, 1.0, None, false, 4, None).unwrap();
         (
@@ -625,7 +629,7 @@ mod server_side {
 
     #[test]
     fn sources_deleted_in_one_batch_after_index_saved() {
-        let (mut repo, log) = server_repo(Mode::CopyToNewPack, true);
+        let (mut repo, log) = server_repo(Mode::CopyToNewPack, true, RepoFormat::V3);
         let (id_b, partial, empty) = setup_dead_packs(&mut repo);
         log.events.lock().unwrap().clear();
 
@@ -665,7 +669,7 @@ mod server_side {
 
     #[test]
     fn batch_never_names_a_source_returned_as_new_pack() {
-        let (mut repo, log) = server_repo(Mode::ReturnSource, true);
+        let (mut repo, log) = server_repo(Mode::ReturnSource, true, RepoFormat::V3);
         let (_id_b, partial, empty) = setup_dead_packs(&mut repo);
         log.events.lock().unwrap().clear();
 
@@ -681,7 +685,7 @@ mod server_side {
 
     #[test]
     fn failed_batch_delete_falls_back_to_per_pack_deletes() {
-        let (mut repo, log) = server_repo(Mode::FailBatchDelete, true);
+        let (mut repo, log) = server_repo(Mode::FailBatchDelete, true, RepoFormat::V3);
         let (_id_b, partial, empty) = setup_dead_packs(&mut repo);
         log.events.lock().unwrap().clear();
 
@@ -711,7 +715,7 @@ mod server_side {
 
     #[test]
     fn append_only_batch_delete_reports_the_per_pack_error() {
-        let (mut repo, log) = server_repo(Mode::FailPackDeletes, true);
+        let (mut repo, log) = server_repo(Mode::FailPackDeletes, true, RepoFormat::V3);
         let (id_b, partial, _empty) = setup_dead_packs(&mut repo);
         log.events.lock().unwrap().clear();
 
@@ -728,6 +732,187 @@ mod server_side {
             "orphan source stays"
         );
         assert_eq!(log.events(), ["repack", "put index", "put index.gen"]);
+    }
+
+    /// A second handle on `repo`'s storage with an empty cache directory, index loaded.
+    fn cold_open(repo: &Repository) -> (tempfile::TempDir, Repository) {
+        let dir = tempfile::tempdir().unwrap();
+        let cold = Repository::open(
+            Box::new(Arc::clone(&repo.storage)),
+            None,
+            Some(dir.path().to_path_buf()),
+            OpenOptions::new().with_index(),
+        )
+        .unwrap();
+        (dir, cold)
+    }
+
+    fn sorted_entries(repo: &Repository) -> Vec<(ChunkId, ChunkIndexEntry)> {
+        let mut v: Vec<_> = repo.chunk_index().iter().map(|(id, e)| (*id, *e)).collect();
+        v.sort_by_key(|(id, _)| *id.as_bytes());
+        v
+    }
+
+    /// A cold open equals the warm index, `id_b` reads back from it, and
+    /// every pack it names exists.
+    fn assert_cold_open_matches(repo: &Repository, id_b: &ChunkId, ctx: &str) {
+        let (_dir, mut cold) = cold_open(repo);
+        assert_eq!(sorted_entries(&cold), sorted_entries(repo), "{ctx}");
+        assert_eq!(
+            cold.read_chunk(id_b).unwrap(),
+            b"chunk-b-data-for-compact-test",
+            "{ctx}"
+        );
+        for (id, entry) in cold.chunk_index().iter() {
+            assert!(
+                repo.storage.exists(&entry.pack_id.storage_key()).unwrap(),
+                "{ctx}: pack of {id} is missing"
+            );
+        }
+    }
+
+    /// The last segment the head names, decoded.
+    fn last_segment(repo: &Repository) -> Segment {
+        let seg = repo.index_head().unwrap().segments.last().unwrap().clone();
+        let bytes = repo
+            .storage
+            .get(&index_store::object_key(&seg.name))
+            .unwrap()
+            .unwrap();
+        index_store::decode_segment(&seg, &bytes, repo.crypto.as_ref()).unwrap()
+    }
+
+    fn is_pack_delete(event: &str) -> bool {
+        event.starts_with("delete packs/")
+            || (event.starts_with("batch-delete") && event.contains("packs/"))
+    }
+
+    fn is_segment_put(event: &str) -> bool {
+        event.starts_with("put index.d/")
+    }
+
+    #[test]
+    fn server_repack_persists_the_index_before_deleting_sources() {
+        for format in [RepoFormat::V3, RepoFormat::V5] {
+            for batch in [false, true] {
+                let ctx = format!("{format:?}, batch {batch}");
+                let (mut repo, log) = server_repo(Mode::CopyToNewPack, batch, format);
+                let (id_b, partial, empty) = setup_dead_packs(&mut repo);
+                log.events.lock().unwrap().clear();
+
+                compact_repo(&mut repo, 1.0, None, false, 4, None).unwrap();
+
+                let events = log.events();
+                let first_delete = events
+                    .iter()
+                    .position(|e| is_pack_delete(e))
+                    .unwrap_or_else(|| panic!("{ctx}: no pack delete in {events:?}"));
+                let before = &events[..first_delete];
+                let heads: Vec<usize> = (0..before.len())
+                    .filter(|&i| before[i] == "put index")
+                    .collect();
+                assert_eq!(heads.len(), 1, "{ctx}: {events:?}");
+                if format == RepoFormat::V5 {
+                    let segments: Vec<usize> = (0..before.len())
+                        .filter(|&i| is_segment_put(&before[i]))
+                        .collect();
+                    assert_eq!(segments.len(), 1, "{ctx}: {events:?}");
+                    assert!(segments[0] < heads[0], "{ctx}: {events:?}");
+                    assert!(
+                        !events.iter().any(|e| e == "put index.gen"),
+                        "{ctx}: {events:?}"
+                    );
+                }
+
+                assert!(!repo.storage.exists(&partial).unwrap(), "{ctx}");
+                assert!(!repo.storage.exists(&empty).unwrap(), "{ctx}");
+                assert_cold_open_matches(&repo, &id_b, &ctx);
+                if format == RepoFormat::V5 {
+                    let seg = last_segment(&repo);
+                    assert_eq!(seg.relocations.len(), 1, "{ctx}: {seg:?}");
+                    assert!(seg.deltas.is_empty(), "{ctx}: {seg:?}");
+                    assert!(seg.new_entries.is_empty(), "{ctx}: {seg:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn server_repack_delete_failure_keeps_the_index_on_new_packs_segmented() {
+        for batch in [false, true] {
+            let (mut repo, log) = server_repo(Mode::FailPackDeletes, batch, RepoFormat::V5);
+            let (id_b, partial, _empty) = setup_dead_packs(&mut repo);
+            log.events.lock().unwrap().clear();
+
+            let err = compact_repo(&mut repo, 1.0, None, false, 4, None).unwrap_err();
+            assert!(err.to_string().contains("append-only"), "{err}");
+
+            let events = log.events();
+            assert_eq!(events.len(), 3, "{events:?}");
+            assert_eq!(events[0], "repack");
+            let hex = events[1]
+                .strip_prefix("put index.d/")
+                .unwrap_or_else(|| panic!("{events:?}"));
+            assert!(
+                hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()),
+                "{events:?}"
+            );
+            assert_eq!(events[2], "put index");
+
+            let ctx = format!("batch {batch}");
+            let (_dir, cold) = cold_open(&repo);
+            let new_pack = pack_of(&cold, &id_b);
+            assert_ne!(new_pack, partial);
+            assert!(repo.storage.exists(&new_pack).unwrap());
+            drop(cold);
+            assert_cold_open_matches(&repo, &id_b, &ctx);
+            assert!(
+                repo.storage.exists(&partial).unwrap(),
+                "orphan source stays"
+            );
+        }
+    }
+
+    #[test]
+    fn server_repack_then_fold_keeps_the_index_readable_segmented() {
+        let (mut repo, log) = server_repo(Mode::CopyToNewPack, true, RepoFormat::V5);
+        let (id_b, _partial, _empty) = setup_dead_packs(&mut repo);
+        let mut policy = FoldPolicy::default();
+        policy.soft.segments = 1;
+        repo.set_fold_policy(policy);
+        log.events.lock().unwrap().clear();
+
+        compact_repo(&mut repo, 1.0, None, false, 4, None).unwrap();
+
+        let events = log.events();
+        let head = repo.index_head().unwrap().clone();
+        assert!(head.segments.is_empty(), "{head:?}");
+        let base = head.base.as_ref().expect("fold wrote a base");
+
+        // The relocation segment: the only segment PUT of this compact.
+        let segment_puts: Vec<&String> = events
+            .iter()
+            .filter(|e| is_segment_put(e))
+            .filter(|e| **e != format!("put {}", index_store::object_key(&base.name)))
+            .collect();
+        assert_eq!(segment_puts.len(), 1, "{events:?}");
+        let relocation = segment_puts[0].strip_prefix("put index.d/").unwrap();
+        assert!(
+            head.retired.iter().any(|n| n.to_hex() == relocation),
+            "{head:?}"
+        );
+
+        let base_put = events
+            .iter()
+            .position(|e| *e == format!("put {}", index_store::object_key(&base.name)))
+            .unwrap_or_else(|| panic!("no base PUT in {events:?}"));
+        let deletes: Vec<usize> = (0..events.len())
+            .filter(|&i| is_pack_delete(&events[i]))
+            .collect();
+        assert!(!deletes.is_empty(), "{events:?}");
+        assert!(deletes.iter().all(|&i| i < base_put), "{events:?}");
+
+        assert_cold_open_matches(&repo, &id_b, "fold");
     }
 }
 

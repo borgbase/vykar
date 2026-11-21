@@ -121,7 +121,7 @@ pub(super) enum ProcessedEntry {
     /// reparse tag, cloud-file unavailable, locked file held by another
     /// process). Carries the failing path and
     /// pre-formatted reason so the consumer can emit a path-bearing
-    /// warning. Mirrors `sequential.rs` `WalkEvent::Skipped` handling.
+    /// warning.
     WalkSkip {
         path: String,
         reason: String,

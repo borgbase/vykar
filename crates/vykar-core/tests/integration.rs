@@ -622,9 +622,7 @@ fn backup_run_with_progress_emits_events_and_final_stats() {
 /// Backing up a source containing a Unix socket (a file type vykar's data
 /// model can't represent) must warn-only: emit a `Warning` event naming the
 /// socket, but leave `stats.errors == 0` and `is_partial == false` so the
-/// backup still reports full success. Exercised on both the pipeline (default
-/// threads) and sequential (threads = 1) paths, which surface the skip through
-/// different channels.
+/// backup still reports full success. Exercised at one and two workers.
 #[test]
 #[cfg(unix)]
 fn backup_warns_but_does_not_fail_on_unsupported_special_file() {
@@ -717,10 +715,9 @@ fn backup_warns_but_does_not_fail_on_unsupported_special_file() {
         );
     }
 
-    // Pipeline path (threads = 2 forces num_workers > 1) and sequential path
-    // (threads = 1).
+    // One and two workers.
     run_case(2, "snap-socket-pipeline");
-    run_case(1, "snap-socket-sequential");
+    run_case(1, "snap-socket-one-thread");
 }
 
 #[test]
@@ -2008,7 +2005,7 @@ fn command_dump_mixed_with_files() {
 }
 
 /// Backup 500 small files (1 KiB each) + 1 large file, verify roundtrip.
-/// Tests both pipeline and sequential paths via two backups with different configs.
+/// The second backup runs at one thread and hits the file cache of the first.
 #[test]
 fn backup_many_small_files_plus_large_file_roundtrip() {
     let tmp = tempfile::tempdir().unwrap();
@@ -2034,7 +2031,7 @@ fn backup_many_small_files_plus_large_file_roundtrip() {
     let exclude_if_present: Vec<String> = Vec::new();
     let exclude_patterns: Vec<String> = Vec::new();
 
-    // First backup (pipeline path — default pipeline_depth > 0).
+    // First backup (default thread count).
     let stats = commands::backup::run(
         &config,
         commands::backup::BackupRequest {
@@ -2111,7 +2108,7 @@ fn backup_many_small_files_plus_large_file_roundtrip() {
         large_payload
     );
 
-    // Second backup (sequential path — single thread).
+    // Second backup at one thread (all cache hits).
     let mut seq_config = make_test_config(&repo_dir);
     seq_config.limits.threads = 1;
 
@@ -2212,7 +2209,7 @@ fn backup_pipeline_threshold_splitting_roundtrip() {
     std::fs::write(source_dir.join("small.bin"), &small_payload).unwrap();
 
     let mut config = make_test_config(&repo_dir);
-    // Use 2 threads to trigger pipeline mode.
+    // Two workers.
     config.limits.threads = 2;
 
     commands::init::run(&config, None).unwrap();
@@ -2270,7 +2267,7 @@ fn backup_pipeline_threshold_splitting_roundtrip() {
     );
 }
 
-/// Verify that pipeline mode preserves deterministic walk order even when
+/// Verify that the pipeline preserves deterministic walk order even when
 /// files have very different processing times.
 #[test]
 fn backup_pipeline_preserves_walk_order_with_mixed_file_sizes() {
@@ -2293,7 +2290,7 @@ fn backup_pipeline_preserves_walk_order_with_mixed_file_sizes() {
     std::fs::write(source_dir.join("dir").join("d-small.bin"), &d_small).unwrap();
 
     let mut config = make_test_config(&repo_dir);
-    // Use 2 threads to trigger pipeline mode.
+    // Two workers.
     config.limits.threads = 2;
 
     commands::init::run(&config, None).unwrap();
@@ -2358,7 +2355,7 @@ fn backup_pipeline_mixed_cache_hit_processed_and_large_roundtrip() {
     std::fs::write(source_dir.join("keep-large.bin"), &keep_large).unwrap();
 
     let mut config = make_test_config(&repo_dir);
-    // Use 2 threads to trigger pipeline mode.
+    // Two workers.
     config.limits.threads = 2;
 
     commands::init::run(&config, None).unwrap();
@@ -2454,14 +2451,13 @@ fn backup_emits_intermediate_progress_during_large_file() {
     std::fs::create_dir_all(&repo_dir).unwrap();
     std::fs::create_dir_all(&source_dir).unwrap();
 
-    // Write a file large enough to trigger multiple batch flushes.
-    // With fixed transform_batch_bytes = 32 MiB, a 70 MiB file triggers
-    // at least 2 intermediate flushes + 1 final flush = 3 StatsUpdated events.
+    // 70 MiB → two 64 MiB segments → one intermediate `StatsUpdated(None)`
+    // after segment 0 plus the final one.
     let big_data = vec![0xABu8; 70 * 1024 * 1024];
     std::fs::write(source_dir.join("big.bin"), &big_data).unwrap();
 
     let mut config = make_test_config(&repo_dir);
-    // Force sequential path (single thread).
+    // One worker.
     config.limits.threads = 1;
 
     commands::init::run(&config, None).unwrap();
@@ -2520,10 +2516,10 @@ fn backup_emits_intermediate_progress_during_large_file() {
         })
         .collect();
 
-    // Must have at least 3 events in the window: ≥2 intermediate (None) + 1 final (Some).
+    // Must have at least 2 events in the window: ≥1 intermediate (None) + 1 final (Some).
     assert!(
-        big_stats.len() >= 3,
-        "expected at least 3 StatsUpdated events for big.bin, got {}",
+        big_stats.len() >= 2,
+        "expected at least 2 StatsUpdated events for big.bin, got {}",
         big_stats.len()
     );
 
@@ -3164,11 +3160,115 @@ fn maintenance_blocks_on_malformed_session_marker() {
     );
 }
 
-/// Verify that pipeline (multi-threaded) and sequential (single-threaded) backup
-/// paths produce identical item metadata for symlinks, directories, and xattrs.
+/// Files above 64 MiB are cut into the same fixed segments at every thread
+/// count, so their chunk IDs do not depend on `limits.threads`. Chunk IDs are
+/// keyed per repository, so all runs share one repository and back up the
+/// same bytes from distinct source paths (no file-cache hit).
+#[test]
+fn large_file_chunk_ids_do_not_depend_on_threads() {
+    const SEGMENT: u64 = 64 * 1024 * 1024;
+    const FILE_LEN: usize = 69 * 1024 * 1024;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = tmp.path().join("repo");
+    let init_config = make_test_config(&repo_dir);
+    commands::init::run(&init_config, None).unwrap();
+
+    let mut data = Vec::with_capacity(FILE_LEN);
+    let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+    while data.len() < FILE_LEN {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        data.extend_from_slice(&x.to_le_bytes());
+    }
+    data.truncate(FILE_LEN);
+    let original = tmp.path().join("big.bin");
+    std::fs::write(&original, &data).unwrap();
+    drop(data);
+
+    let thread_counts = [1usize, 2, 8];
+    let mut runs = Vec::new();
+    for threads in thread_counts {
+        let source_dir = tmp.path().join(format!("source-{threads}"));
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::copy(&original, source_dir.join("big.bin")).unwrap();
+
+        let mut config = make_test_config(&repo_dir);
+        config.limits.threads = threads;
+        let snapshot_name = format!("snap-threads-{threads}");
+        let source_label = format!("source-{threads}");
+        let source_paths = vec![source_dir.to_string_lossy().to_string()];
+        let no_patterns: Vec<String> = Vec::new();
+
+        let mut statuses = Vec::new();
+        let mut on_progress = |event| {
+            if let commands::backup::BackupProgressEvent::FileProcessed { path, status, .. } = event
+                && path.ends_with("big.bin")
+            {
+                statuses.push(status);
+            }
+        };
+        commands::backup::run_with_progress(
+            &config,
+            commands::backup::BackupRequest {
+                snapshot_name: &snapshot_name,
+                passphrase: None,
+                source_paths: &source_paths,
+                source_label: &source_label,
+                exclude_patterns: &no_patterns,
+                exclude_if_present: &no_patterns,
+                one_file_system: true,
+                git_ignore: false,
+                xattrs_enabled: false,
+                compression: Compression::None,
+                command_dumps: &[],
+                verbose: true,
+            },
+            Some(&mut on_progress),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            statuses,
+            vec![commands::backup::FileStatus::New],
+            "threads {threads}: big.bin must be read, not taken from the file cache"
+        );
+
+        let mut repo = open_local_repo_cached(&repo_dir, None);
+        let items = commands::list::load_snapshot_items(&mut repo, &snapshot_name, None).unwrap();
+        let item = items
+            .iter()
+            .find(|i| i.path.ends_with("big.bin"))
+            .expect("big.bin in snapshot");
+        let chunks: Vec<_> = item.chunks.iter().map(|c| (c.id, c.size)).collect();
+        runs.push((threads, chunks));
+    }
+
+    let (_, first) = &runs[0];
+    for (threads, chunks) in &runs[1..] {
+        assert_eq!(
+            chunks, first,
+            "threads {threads}: chunk list differs from threads {}",
+            runs[0].0
+        );
+    }
+
+    let total: u64 = first.iter().map(|&(_, size)| u64::from(size)).sum();
+    assert_eq!(total, FILE_LEN as u64);
+    let mut prefix = 0u64;
+    let seam = first.iter().any(|&(_, size)| {
+        prefix += u64::from(size);
+        prefix == SEGMENT
+    });
+    assert!(seam, "no chunk boundary at the 64 MiB segment seam");
+}
+
+/// Backups at the default thread count and at one thread produce identical
+/// item metadata for symlinks, directories, and xattrs.
 #[test]
 #[cfg(unix)]
-fn backup_pipeline_and_sequential_parity_symlinks_xattrs() {
+fn backup_item_metadata_does_not_depend_on_threads() {
     let tmp = tempfile::tempdir().unwrap();
     let repo_dir = tmp.path().join("repo");
     let source_dir = tmp.path().join("source");
@@ -3220,13 +3320,13 @@ fn backup_pipeline_and_sequential_parity_symlinks_xattrs() {
     )
     .unwrap();
 
-    // Sequential backup (threads = 1)
+    // One-thread backup
     let mut config_seq = make_test_config(&repo_dir);
     config_seq.limits.threads = 1;
     commands::backup::run(
         &config_seq,
         commands::backup::BackupRequest {
-            snapshot_name: "snap-sequential",
+            snapshot_name: "snap-one-thread",
             passphrase: None,
             source_paths: &source_paths,
             source_label: "source",
@@ -3245,7 +3345,7 @@ fn backup_pipeline_and_sequential_parity_symlinks_xattrs() {
     // Compare item lists — should be identical
     let mut repo = open_local_repo_cached(&repo_dir, None);
     let items_p = commands::list::load_snapshot_items(&mut repo, "snap-pipeline", None).unwrap();
-    let items_s = commands::list::load_snapshot_items(&mut repo, "snap-sequential", None).unwrap();
+    let items_s = commands::list::load_snapshot_items(&mut repo, "snap-one-thread", None).unwrap();
 
     // Sort by path for deterministic comparison (walk order may differ)
     let mut sorted_p: Vec<_> = items_p.iter().collect();

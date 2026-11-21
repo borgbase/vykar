@@ -406,8 +406,7 @@ pub struct RecoveredChunkEntry {
 /// delta's undo log and the positional journal in `cached_bumps` (both armed
 /// by `checkpoint()`), so no map snapshot is stored.
 ///
-/// Armed per modified regular file in sequential backup, per streamed command
-/// dump, and per segmented large file in pipeline mode.
+/// Armed per streamed command dump and per segmented large file.
 #[derive(Debug)]
 pub struct IndexDeltaCheckpoint {
     new_entries_len: usize,

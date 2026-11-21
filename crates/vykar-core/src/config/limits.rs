@@ -24,7 +24,7 @@ pub struct ResourceLimitsConfig {
     #[serde(default = "default_connections")]
     pub connections: usize,
     /// CPU worker threads for backup transforms.
-    /// 0 = auto: local repos use ceil(cores/2) clamped to [2, 4], or 1 on a single-core host; remote repos use min(cores, 4). 1 = sequential.
+    /// 0 = auto: local repos use ceil(cores/2) clamped to [2, 4], or 1 on a single-core host; remote repos use min(cores, 4). 1 = one worker; the walk and the commit stage still run on threads of their own.
     #[serde(default)]
     pub threads: usize,
     /// Unix process niceness target (-20..19). 0 = unchanged. Applied to every
@@ -110,16 +110,6 @@ impl ResourceLimitsConfig {
     /// Segment size in bytes for large-file pipeline splitting (fixed 64 MiB).
     pub fn segment_size_bytes(&self) -> usize {
         64 * 1024 * 1024
-    }
-
-    /// Transform batch size in bytes (fixed 32 MiB).
-    pub fn transform_batch_bytes(&self) -> usize {
-        32 * 1024 * 1024
-    }
-
-    /// Max pending chunk actions (fixed 8192).
-    pub fn max_pending_actions(&self) -> usize {
-        8192
     }
 
     /// Verify-data concurrency: capped at 4 (each thread holds ~128 MiB).

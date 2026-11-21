@@ -331,7 +331,7 @@ limits:
   download_mib_per_sec: 4
 ```
 
-- `threads: 1` keeps backup transforms mostly sequential.
+- `threads: 1` runs one transform worker, so the backup uses mostly one core.
 - `nice: 19` lowers CPU scheduling priority on Unix; it is ignored on Windows.
   The value is applied to every thread and never lowered again (that needs
   `CAP_SYS_NICE` or a raised `RLIMIT_NICE` on Linux, root on macOS), so the

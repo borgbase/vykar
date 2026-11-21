@@ -1,4 +1,4 @@
-//! TOCTOU-safe file reads shared by the sequential and pipeline backup paths.
+//! TOCTOU-safe file reads for the backup pipeline's workers.
 //!
 //! Every backup read of a regular file follows the same invariant:
 //!
@@ -76,9 +76,11 @@ pub(super) fn open_checked(
 /// is dropped before returning, so workers do not retain it while queueing
 /// results or processing cache hits. Whole-file plans transfer ownership.
 ///
-/// Streaming plans call `on_chunk` as chunks are produced, so a drift
-/// detected afterwards can leave partial work behind — those callers are
-/// responsible for rolling it back (see `with_rollback_checkpoint`).
+/// Streaming plans call `on_chunk` as chunks are produced. The pipeline
+/// worker only collects them and hands them to the consumer after this
+/// returns `Ok`, so a drift leaves nothing committed for a whole-file read.
+/// For a segment, the consumer rolls back the file's earlier segments (see
+/// `pipeline::segmentation`).
 /// [`ReadPlan::Whole`] instead buffers and only hands the data over *after*
 /// the post-read check passes, so a drift leaves the caller untouched.
 pub(super) fn read_range_drift_checked(

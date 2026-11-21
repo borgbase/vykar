@@ -126,7 +126,7 @@ pub(super) fn read_item_xattrs(_path: &Path) -> Option<HashMap<String, Vec<u8>>>
 }
 
 // ---------------------------------------------------------------------------
-// Entry materialization — shared between pipeline and sequential paths
+// Entry materialization — used by the pipeline walk and `walk_measure`
 // ---------------------------------------------------------------------------
 
 /// Result of converting a walked filesystem entry into an `Item`.

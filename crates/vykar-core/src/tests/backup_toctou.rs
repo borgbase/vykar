@@ -1,17 +1,17 @@
 //! End-to-end tests for the backup TOCTOU (walk-to-open / intra-read) drift
-//! detection paths exercised through the sequential and parallel backup code.
+//! detection paths exercised through the pipeline at one and four workers.
 //!
 //! Two deterministic mechanisms are used here:
 //!
 //! - **Mechanism A**: soft-error the open itself (e.g. chmod 000) so the
-//!   sequential path takes the pre-checkpoint skip branch.
+//!   worker soft-errors the open.
 //! - **Mechanism C**: install a read hook via
 //!   [`backup::read_source::test_hooks`] so the test thread can mutate the
 //!   file after a deterministic byte threshold of the worker's read has
 //!   elapsed, forcing the intra-read post-fstat check to fire.
 //!
 //! Synthetic pipeline / rollback tests (Mechanism B) live next to the code
-//! they exercise in `commands/backup/pipeline.rs`.
+//! they exercise in `commands/backup/pipeline/worker.rs`.
 
 // libc::geteuid for root detection; SAFETY documented per block.
 #![allow(unsafe_code)]
@@ -72,10 +72,9 @@ fn intra_read_truncation_is_skipped_with_warning() {
     fs::create_dir_all(&src_dir).unwrap();
 
     let mut config = crate::tests::helpers::make_test_config(&repo_dir);
-    // Force the sequential backup path (1 worker).
+    // One worker. A small `min_size` makes the file take the
+    // `ReadPlan::Chunked` read.
     config.limits.threads = 1;
-    // Small chunker min_size so the file is a "large" file (hits the sequential
-    // chunk-loop path rather than the cross-file batch).
     config.chunker.min_size = 1024;
     config.chunker.avg_size = 2048;
     config.chunker.max_size = 4096;
@@ -113,10 +112,10 @@ fn intra_read_truncation_is_skipped_with_warning() {
 /// and `read_to_end` completion. The read is hard-capped at `pre_meta.size + 1`
 /// so the chunker/classifier cannot consume unbounded appended bytes, and the
 /// `total_bytes != pre_meta.size` post-check then skips the file with a warning.
-/// Exercises the sequential large-file path (`sequential.rs` chunker stream).
+/// The threads = 4 variant below at N = 1.
 #[cfg(unix)]
 #[test]
-fn intra_read_append_sequential_large_is_skipped_with_warning() {
+fn intra_read_append_large_one_worker_is_skipped_with_warning() {
     init();
     let _guard = crate::testutil::CWD_LOCK.lock().unwrap();
 
@@ -161,9 +160,9 @@ fn intra_read_append_sequential_large_is_skipped_with_warning() {
     );
 }
 
-/// Parallel-path variant of the append test covering `pipeline.rs` medium-file
-/// chunker stream (site 2). Same regression coverage as the sequential large
-/// test, but routed through the pipeline worker path (`threads > 1`).
+/// Four-worker variant of the append test covering the worker's medium-file
+/// chunker stream (site 2). Same regression coverage as the one-worker large
+/// test, at four workers.
 #[cfg(unix)]
 #[test]
 fn intra_read_append_parallel_large_is_skipped_with_warning() {
@@ -176,7 +175,7 @@ fn intra_read_append_parallel_large_is_skipped_with_warning() {
     fs::create_dir_all(&src_dir).unwrap();
 
     let mut config = crate::tests::helpers::make_test_config(&repo_dir);
-    // Force the parallel pipeline path (>1 worker).
+    // Four workers.
     config.limits.threads = 4;
     config.chunker.min_size = 1024;
     config.chunker.avg_size = 2048;
@@ -208,7 +207,7 @@ fn intra_read_append_parallel_large_is_skipped_with_warning() {
     );
 }
 
-/// Parallel-path small-file variant covering `pipeline.rs` small-file
+/// Four-worker small-file variant covering the worker's small-file
 /// single-chunk read (site 1). The file starts below `min_chunk_size` so it
 /// takes the `read_to_end`-into-Vec branch; the append grows it past the
 /// pre-sized capacity, and the `.take(size + 1)` cap bounds the allocation.
@@ -256,13 +255,13 @@ fn intra_read_append_parallel_small_is_skipped_with_warning() {
     );
 }
 
-/// Sequential small-file variant (cross-file batch path): a mid-read append
-/// must skip only the mutated file. Nothing of it may reach the batch — the
-/// whole-file buffer is handed over only after the post-read check passes —
-/// and the sibling small file must still commit in walk order.
+/// One-worker small-file variant (whole-file read): a mid-read append must
+/// skip only the mutated file. Nothing of it is handed to the consumer before
+/// the post-read check passes, and the sibling small file must still commit
+/// in walk order.
 #[cfg(unix)]
 #[test]
-fn intra_read_append_sequential_small_skips_only_the_mutated_file() {
+fn intra_read_append_small_skips_only_the_mutated_file() {
     init();
     let _guard = crate::testutil::CWD_LOCK.lock().unwrap();
 
@@ -272,8 +271,8 @@ fn intra_read_append_sequential_small_skips_only_the_mutated_file() {
     fs::create_dir_all(&src_dir).unwrap();
 
     let mut config = crate::tests::helpers::make_test_config(&repo_dir);
-    // Sequential path, with both files below min_size so they take the
-    // cross-file batch branch.
+    // One worker, with both files below min_size so they take the
+    // whole-file read.
     config.limits.threads = 1;
     config.chunker.min_size = 32 * 1024;
     config.chunker.avg_size = 64 * 1024;
@@ -306,14 +305,12 @@ fn intra_read_append_sequential_small_skips_only_the_mutated_file() {
     );
 }
 
-/// Mechanism A: a chmod-000 file causes a soft open error in the sequential
-/// path. The pre-checkpoint open-skip branch must count the file and still
-/// commit the sibling — if a rollback tracker were leaked, the next call to
-/// `begin_rollback_checkpoint` for the readable file would panic and no
-/// snapshot would land.
+/// Mechanism A: a chmod-000 file causes a soft open error in the worker at
+/// one thread. The file must be counted as skipped and the sibling still
+/// commits.
 #[cfg(unix)]
 #[test]
-fn sequential_soft_open_error_skips_bad_commits_good() {
+fn soft_open_error_skips_bad_commits_good() {
     use std::os::unix::fs::PermissionsExt;
     init();
     let _guard = crate::testutil::CWD_LOCK.lock().unwrap();

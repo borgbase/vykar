@@ -536,7 +536,7 @@ begin_write_session(session_id) → journal key = sessions/<session_id>.index
   → walk sources with excludes + one_file_system + exclude_if_present
     → cache-hit path: reuse cached ChunkRefs and bump refs
     → cache-miss path:
-      → pipeline path (if effective worker threads > 1):
+      → pipeline (N = effective worker threads, N ≥ 1):
         → walk emits regular files and segmented large files
           (segmentation applies when file_size > 64 MiB;
            segment size is min(64 MiB, pipeline_buffer_bytes))
@@ -548,7 +548,6 @@ begin_write_session(session_id) → journal key = sessions/<session_id>.index
           and handles xor false positives via inline transform
         → ByteBudget enforces pipeline_buffer_bytes as a hard in-flight memory cap
           (64 MiB × effective threads, clamped to 64 MiB..1 GiB)
-      → sequential fallback path (effective worker threads == 1)
   → serialize items incrementally into item-stream chunks (tree packs)
   → throughout: packs are sealed and uploaded in the background when a writer
     reaches its target size, 10,000 blobs, or 300s age
@@ -866,16 +865,18 @@ flowchart LR
 ```
 
 1. Sequential walk stage emits file work
-2. Parallel workers in a crossbeam-channel pipeline read/chunk/hash files and classify chunks (hash-only vs prepacked)
+2. N workers (N = effective threads, at least 1) in a crossbeam-channel pipeline read/chunk/hash files and classify chunks (hash-only vs prepacked)
 3. A `ByteBudget` enforces a hard cap on in-flight pipeline bytes (derived from `limits.threads`)
 4. Consumer stage commits chunks and updates dedup/index state sequentially (including segment-order validation for large files)
 5. Pack uploads run in background with bounded in-flight upload concurrency
+
+With one thread the walk, the worker and the consumer still run on separate OS threads, but most of the CPU time is spent in the single worker. To lower the CPU impact of a backup, use `limits.nice`.
 
 Large files are split into fixed 64 MiB segments and processed through the same worker pool. Segmentation applies when `file_size > 64 MiB`; segment *i* covers `[i × 64 MiB, min((i+1) × 64 MiB, file_size))`. The pipeline byte budget is never below 64 MiB, so the segment size is always 64 MiB. Each segment is chunked on its own, which makes every multiple of 64 MiB a forced chunk boundary.
 
 What this means for deduplication:
 
-- Chunk boundaries, and so chunk IDs, of a file > 64 MiB depend on its content and size, not on how many workers run. The exception is a backup with one effective thread (`limits.threads: 1`, or auto mode on a single-core host): it takes the sequential path, which chunks the whole file without segments. Moving between one thread and more uploads the changed chunks of such files once; unchanged files hit the file cache and are not re-read.
+- Chunk boundaries, and so chunk IDs, of a file > 64 MiB depend on its content and size, not on `limits.threads` or the host's core count.
 - Overwrites in place and appends (VM images, databases, logs) do not move data against the fixed grid and deduplicate as without segments.
 - An insertion or deletion shifts everything after it against the grid. The chunks on both sides of each later seam change until FastCDC finds its old cut points again; the rest of each segment still deduplicates. The cost is a few chunks per 64 MiB, not the segment (an estimate, not measured).
 - Command dumps are chunked as one stream and are not segmented.
@@ -895,7 +896,7 @@ Internal backup pipeline knobs are derived automatically:
 - `threads_effective = threads == 0 ? (local ? (cores == 1 ? 1 : ceil(cores/2)∈[2,4]) : min(cores, 4)) : threads`
 - `pipeline_depth = max(connections, 2)`
 - `pipeline_buffer_bytes = clamp(threads_effective * 64 MiB, 64 MiB..1 GiB)`
-- `segment_size = 64 MiB`, `transform_batch = 32 MiB`, `max_pending_actions = 8192`
+- `segment_size = 64 MiB`
 
 ### Allocator tuning
 

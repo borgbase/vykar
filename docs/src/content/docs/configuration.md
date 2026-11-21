@@ -575,7 +575,7 @@ limits:
 | Field | Default | Values | Description |
 |-------|---------|--------|-------------|
 | `connections` | `2` | integer, 1–16 | Parallel backend operations; also controls upload/restore concurrency |
-| `threads` | `0` | integer, 0–128 | CPU worker threads. `0` = auto: local repos use ceil(cores/2) clamped to [2, 4], or 1 on a single-core host; remote repos use min(cores, 4). `1` = mostly sequential. Also available as `--threads` on the `backup` subcommand |
+| `threads` | `0` | integer, 0–128 | CPU worker threads. `0` = auto: local repos use ceil(cores/2) clamped to [2, 4], or 1 on a single-core host; remote repos use min(cores, 4). `1` = one transform worker. The walk and the commit stage run on threads of their own; a backup still uses mostly one core; to lower its CPU priority use `nice`. Also available as `--threads` on the `backup` subcommand |
 | `nice` | `0` | integer, -20–19 | Unix process niceness. `0` = unchanged. Applied to every thread of the process and never lowered again (see below). Ignored on Windows |
 | `upload_mib_per_sec` | `0` | integer (MiB/s) | Upload bandwidth cap (average over the run; individual packs go out at link speed). `0` = unlimited |
 | `download_mib_per_sec` | `0` | integer (MiB/s) | Download bandwidth cap (average over the run; individual reads arrive at link speed). `0` = unlimited |

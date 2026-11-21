@@ -1307,14 +1307,13 @@ fn check_repair_apply_writes_nothing_for_unsupported_version() {
     );
 }
 
-/// A small non-UTF8-named file backed up through the **sequential small-file
-/// fast path** (forced via `threads = 1`) round-trips byte-identically on
-/// restore. This exercises the `resolve_cache_hit` call at that distinct site
-/// (`sequential.rs`), not just the pipeline/normal paths. Self-skips on
-/// filesystems that reject non-UTF8 names (macOS APFS/HFS+); runs on Linux/CI.
+/// A small non-UTF8-named file backed up through the pipeline's small-file
+/// read at N = 1 (`threads = 1`) round-trips byte-identically on restore.
+/// Self-skips on filesystems that reject non-UTF8 names (macOS APFS/HFS+);
+/// runs on Linux/CI.
 #[cfg(unix)]
 #[test]
-fn small_file_non_utf8_name_round_trips_via_sequential_path() {
+fn small_file_non_utf8_name_round_trips_at_one_thread() {
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
 
@@ -1330,8 +1329,7 @@ fn small_file_non_utf8_name_round_trips_via_sequential_path() {
     }
 
     let mut config = init_repo(&repo_dir);
-    // Force the single-threaded sequential backup path so the small-file fast
-    // path (a separate resolve_cache_hit call site) is exercised.
+    // The pipeline's small-file read at N = 1.
     config.limits.threads = 1;
     backup_single_source(&config, &source_dir, "src-a", "snap-small");
 

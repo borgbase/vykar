@@ -7711,7 +7711,6 @@ dependencies = [
  "percent-encoding",
  "proptest",
  "rand 0.10.4",
- "rayon",
  "rmp",
  "rmp-serde",
  "serde",

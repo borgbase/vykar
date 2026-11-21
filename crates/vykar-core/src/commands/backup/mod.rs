@@ -7,7 +7,6 @@ mod instrument;
 mod item_cut;
 mod phases;
 pub(crate) mod pipeline;
-mod sequential;
 mod source;
 mod walk;
 #[cfg(feature = "measure")]
@@ -27,7 +26,7 @@ use std::sync::atomic::AtomicBool;
 use tracing::{debug, info, warn};
 
 use crate::compress::Compression;
-use crate::config::{CommandDump, ResourceLimitsConfig, VykarConfig};
+use crate::config::{CommandDump, VykarConfig};
 
 use crate::limits;
 use crate::platform::fs;
@@ -39,7 +38,7 @@ use crate::snapshot::SnapshotStats;
 use crate::snapshot::item::Item;
 use crate::storage;
 use vykar_common::display::{format_bytes, format_count};
-use vykar_storage::{BackendProfile, StorageBackend};
+use vykar_storage::StorageBackend;
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
 
@@ -350,7 +349,7 @@ pub(crate) fn skip_reason(e: &VykarError) -> String {
 ///
 /// Closure form because a drop-guard holding `&mut Repository` + `&mut
 /// SnapshotStats` can't compose with bodies that need to pass those same
-/// mutable references to helpers like `flush_regular_file_batch`.
+/// mutable references to helpers (the command-dump stream loop).
 pub(crate) fn with_rollback_checkpoint<R>(
     repo: &mut Repository,
     stats: &mut SnapshotStats,
@@ -479,37 +478,6 @@ struct Prepared<'a> {
     xattrs_enabled: bool,
     exclude_patterns: std::borrow::Cow<'a, [String]>,
     resolved_sources: Vec<source::ResolvedSource>,
-    max_pending_transform_bytes: usize,
-    max_pending_file_actions: usize,
-}
-
-/// Transform worker setup, sized to the backend.
-struct Workers {
-    num_workers: usize,
-    use_pipeline: bool,
-    transform_pool: Option<rayon::ThreadPool>,
-}
-
-fn resolve_workers(limits: &ResourceLimitsConfig, profile: BackendProfile) -> Result<Workers> {
-    // Resolve effective worker count before building the rayon pool so we
-    // can right-size it in pipeline mode (avoids 2× thread oversubscription).
-    let num_workers = limits.effective_backup_threads(profile.local);
-
-    // Pipeline mode when we have more than 1 worker thread.
-    let use_pipeline = num_workers > 1;
-
-    let transform_pool = if use_pipeline {
-        // Pipeline mode doesn't need a rayon pool (no inline large-file processing).
-        None
-    } else {
-        sequential::build_transform_pool(num_workers)?
-    };
-
-    Ok(Workers {
-        num_workers,
-        use_pipeline,
-        transform_pool,
-    })
 }
 
 fn prepare<'a>(config: &VykarConfig, req: &BackupRequest<'a>) -> Result<Prepared<'a>> {
@@ -558,8 +526,6 @@ fn prepare<'a>(config: &VykarConfig, req: &BackupRequest<'a>) -> Result<Prepared
         xattrs_enabled,
         exclude_patterns,
         resolved_sources,
-        max_pending_transform_bytes: config.limits.transform_batch_bytes(),
-        max_pending_file_actions: config.limits.max_pending_actions(),
     })
 }
 
@@ -583,7 +549,7 @@ fn run_against_repo(
     };
     let backend: Arc<dyn StorageBackend> = Arc::from(backend);
     let profile = backend.profile();
-    let workers = resolve_workers(&config.limits, profile)?;
+    let num_workers = config.limits.effective_backup_threads(profile.local);
 
     // Generate a unique session ID for this backup.
     let session_id = format!("{:032x}", rand::random::<u128>());
@@ -652,7 +618,7 @@ fn run_against_repo(
         config,
         req,
         &prepared,
-        &workers,
+        num_workers,
         &session_opts,
         &mut progress,
         shutdown,

@@ -10,9 +10,9 @@ use tracing::{debug, info, warn};
 
 use super::instrument::{BackupInstrumentation, PipelineTimings};
 use super::{
-    BackupProgressEvent, BackupRequest, DatalessTally, ItemStreamCutter, Prepared, Workers,
-    command_dump, emit_post_commit_warning, emit_progress, flush_item_stream_chunk, pipeline,
-    sequential, source, source_paths_match,
+    BackupProgressEvent, BackupRequest, DatalessTally, ItemStreamCutter, Prepared, command_dump,
+    emit_post_commit_warning, emit_progress, flush_item_stream_chunk, pipeline, source,
+    source_paths_match,
 };
 use crate::commands::util::check_interrupted;
 use crate::config::VykarConfig;
@@ -71,7 +71,7 @@ pub(super) fn phase1_upload(
     config: &VykarConfig,
     req: &BackupRequest<'_>,
     prepared: &Prepared<'_>,
-    workers: &Workers,
+    num_workers: usize,
     session_opts: &WriteSessionOptions,
     progress: &mut Option<&mut dyn FnMut(BackupProgressEvent)>,
     shutdown: Option<&AtomicBool>,
@@ -92,11 +92,6 @@ pub(super) fn phase1_upload(
     let xattrs_enabled = prepared.xattrs_enabled;
     let exclude_patterns: &[String] = &prepared.exclude_patterns;
     let resolved_sources: &[source::ResolvedSource] = &prepared.resolved_sources;
-    let max_pending_transform_bytes = prepared.max_pending_transform_bytes;
-    let max_pending_file_actions = prepared.max_pending_file_actions;
-    let num_workers = workers.num_workers;
-    let use_pipeline = workers.use_pipeline;
-    let transform_pool = &workers.transform_pool;
 
     // Existing repositories bypass YAML validation and may store odd
     // parameters from before FastCDC 5, or anything at all if `config` was
@@ -272,7 +267,7 @@ pub(super) fn phase1_upload(
     let pipeline_buffer_bytes = config.limits.pipeline_buffer_for_workers(num_workers);
 
     let mut pipeline_timings: Option<PipelineTimings> = None;
-    if use_pipeline && !source_paths.is_empty() {
+    if !source_paths.is_empty() {
         let file_cache_snapshot = repo.take_file_cache();
         let crypto = std::sync::Arc::clone(&repo.crypto);
         let segment_size = config
@@ -313,34 +308,6 @@ pub(super) fn phase1_upload(
         // for commit-time merge.
         repo.restore_file_cache(file_cache_snapshot);
         pipeline_timings = Some(pipeline_result?);
-    } else {
-        let seq_ctx = sequential::SequentialCtx {
-            exclude_patterns,
-            exclude_if_present,
-            one_file_system,
-            git_ignore,
-            xattrs_enabled,
-            compression,
-            item_cutter: &item_cutter,
-            max_pending_transform_bytes,
-            max_pending_file_actions,
-            transform_pool: transform_pool.as_ref(),
-            prefilter: prefilter.as_ref(),
-            shutdown,
-            verbose,
-            parent_reuse_index: parent_reuse_index.as_ref(),
-        };
-        let mut seq_bufs = pipeline::PipelineBuffers {
-            item_stream: &mut item_stream,
-            item_ptrs: &mut item_ptrs,
-            stats: &mut stats,
-            new_file_cache: &mut new_file_cache,
-            dataless,
-        };
-        for source in resolved_sources {
-            check_interrupted(shutdown)?;
-            sequential::process_source_path(repo, source, &seq_ctx, &mut seq_bufs, progress)?;
-        }
     }
     let walk = walk_start.elapsed();
     // The walk was the last reader of the loaded cache's sections for

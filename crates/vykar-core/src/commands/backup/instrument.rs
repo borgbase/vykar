@@ -59,7 +59,7 @@ pub(crate) struct PipelineTimings {
 pub(crate) struct BackupInstrumentation {
     pub(crate) threads: usize,
     pub(crate) phase1: Duration,
-    /// Command dumps plus the walk (pipeline or sequential).
+    /// Command dumps plus the walk.
     pub(crate) walk: Duration,
     /// `flush_packs_journal_in_background` at the end of phase 1.
     pub(crate) final_flush: Duration,

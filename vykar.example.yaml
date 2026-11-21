@@ -256,7 +256,7 @@ compression:
 #
 # limits:
 #   connections: 2                 # Parallel backend ops (1-16)
-#   threads: 0                     # Backup transform workers (0 = auto: local ceil(cores/2)∈[2,4] (1 on one core), remote min(cores,4); 1 = sequential)
+#   threads: 0                     # Backup transform workers (0 = auto: local ceil(cores/2)∈[2,4] (1 on one core), remote min(cores,4); 1 = one worker)
 #   nice: 0                        # Unix niceness target (-20..19)
 #   upload_mib_per_sec: 0          # Upload bandwidth cap
 #   download_mib_per_sec: 0        # Download bandwidth cap

@@ -409,7 +409,7 @@ Each `SnapshotEntry` contains: `name`, `id` (32-byte random), `time`, `source_la
 | size | u32 | Uncompressed (original) size |
 | csize | u32 | Stored size (compressed + encrypted) |
 
-The uncompressed `size` is stored per-reference so the restore path can pass it as a size hint to the ZSTD bulk decompressor, avoiding the overhead of a streaming decoder, and then validate the decoded length against it. The chunk index holds only the stored size, so without this field each decompression would fall back to the slower streaming path.
+The uncompressed `size` is stored per-reference so the restore path can size its output buffers up front, pass it as a size hint to the ZSTD one-shot decompressor, and then validate the decoded length against it. The chunk index holds only the stored size; readers without this field (e.g. `check --verify-data`) use the same decompressor and take the size from the ZSTD frame header instead, so both paths accept and reject the same frames.
 
 ### Segmented Index (v4/v5)
 

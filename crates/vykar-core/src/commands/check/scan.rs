@@ -1176,4 +1176,34 @@ mod tests {
             IntegrityIssue::PackExistenceCheckFailed { pack_id, .. } if *pack_id == errored
         )));
     }
+
+    /// A zstd frame restore rejects must also fail `check --verify-data`,
+    /// even where libzstd's streaming decoder would accept it.
+    #[test]
+    fn verify_single_chunk_rejects_frame_restore_rejects() {
+        use crate::repo::format::pack_object_with_context;
+        use vykar_crypto::PlaintextEngine;
+        use vykar_types::hash::HashAlgorithm;
+
+        let frame = crate::compress::tests::ZSTD_EMPTY_COMPRESSED_BLOCK;
+        let hasher = ChunkHasher::new(HashAlgorithm::Blake3, [0x5A; 32]);
+        let engine = PlaintextEngine::new(hasher.clone());
+        let chunk_id = ChunkId::compute(&hasher, &frame[frame.len() - 6..]);
+        let pack_id = PackId::from_bytes([0x01; 32]);
+        let raw =
+            pack_object_with_context(ObjectType::ChunkData, chunk_id.as_bytes(), frame, &engine)
+                .unwrap();
+
+        let mut issues = Vec::new();
+        let verified =
+            verify_single_chunk(&engine, &hasher, &chunk_id, &pack_id, &raw, &mut issues);
+        assert_eq!(verified, 0);
+        assert!(
+            matches!(
+                issues.as_slice(),
+                [IntegrityIssue::CorruptChunk { detail, .. }] if detail.starts_with("decompress failed")
+            ),
+            "{issues:?}"
+        );
+    }
 }

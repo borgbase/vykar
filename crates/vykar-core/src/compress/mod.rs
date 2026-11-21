@@ -157,16 +157,30 @@ pub fn decompress(data: &[u8]) -> Result<Vec<u8>> {
     decompress_with_hint(data, None)
 }
 
+/// How a ZSTD payload is decoded.
+///
+/// libzstd's streaming and one-shot decoders do not reject the same frames
+/// (1.5.7's streaming decoder accepts a compressed block of declared size 0
+/// that the one-shot decoder calls corrupt). Chunk data always goes through
+/// `Bulk`, so `check` rejects exactly what restore rejects.
+#[derive(Clone, Copy)]
+enum ZstdDecode {
+    /// One-shot decode via the thread-local decompressor. `hint` is the
+    /// expected plaintext size; `None` takes it from the frame header.
+    Bulk { hint: Option<usize> },
+    /// Streaming decode, for metadata objects that record no content size.
+    Stream,
+}
+
 /// Core decompression dispatch behind every `decompress*` entry point.
 ///
-/// - `expected_size`: ZSTD hint for bulk decompression. `Some(n)` uses the
-///   thread-local bulk decompressor; `None` uses streaming.
+/// - `zstd_decode`: ZSTD decoder choice, see [`ZstdDecode`].
 /// - `max_size`: Upper bound on decompressed output (bomb protection).
 /// - `output`: cleared, then filled with the plaintext. Callers that hold the
 ///   buffer across calls keep their allocation.
 fn decompress_into_impl(
     data: &[u8],
-    expected_size: Option<usize>,
+    zstd_decode: ZstdDecode,
     max_size: u64,
     output: &mut Vec<u8>,
 ) -> Result<()> {
@@ -222,44 +236,9 @@ fn decompress_into_impl(
             output.truncate(written);
             Ok(())
         }
-        TAG_ZSTD => {
-            if let Some(hint) = expected_size {
-                // Hot path (restore): reuse thread-local bulk decompressor
-                use std::cell::RefCell;
-                thread_local! {
-                    static ZSTD_DX: RefCell<Option<zstd::bulk::Decompressor<'static>>> =
-                        const { RefCell::new(None) };
-                }
-                ZSTD_DX.with(|cell| {
-                    let mut slot = cell.borrow_mut();
-                    if slot.is_none() {
-                        *slot =
-                            Some(zstd::bulk::Decompressor::new().map_err(|e| {
-                                VykarError::Decompression(format!("zstd init: {e}"))
-                            })?);
-                    }
-                    let dx = slot.as_mut().expect("zstd decompressor initialized");
-                    // A zero hint means "unknown" — clamp to 1 so the bulk
-                    // decompressor gets a minimal buffer rather than an empty
-                    // one for what might be a valid non-empty frame.
-                    let cap = hint
-                        .max(1)
-                        .min(usize::try_from(max_size).unwrap_or(usize::MAX));
-                    output.clear();
-                    output.resize(cap, 0);
-                    let written = dx
-                        .decompress_to_buffer(payload, output)
-                        .map_err(|e| VykarError::Decompression(format!("zstd: {e}")))?;
-                    output.truncate(written);
-                    if output.len() as u64 > max_size {
-                        return Err(VykarError::Decompression(format!(
-                            "zstd: decompressed size exceeds limit of {max_size} bytes",
-                        )));
-                    }
-                    Ok(())
-                })
-            } else {
-                // Cold path: streaming decoder (handles unknown sizes efficiently)
+        TAG_ZSTD => match zstd_decode {
+            ZstdDecode::Bulk { hint } => decompress_zstd_bulk(payload, hint, max_size, output),
+            ZstdDecode::Stream => {
                 output.clear();
                 let mut decoder = zstd::stream::Decoder::new(std::io::Cursor::new(payload))
                     .map_err(|e| VykarError::Decompression(format!("zstd init: {e}")))?;
@@ -275,39 +254,105 @@ fn decompress_into_impl(
                 }
                 Ok(())
             }
-        }
+        },
         _ => Err(VykarError::UnknownCompressionTag(tag)),
     }
 }
 
+fn decompress_zstd_bulk(
+    payload: &[u8],
+    hint: Option<usize>,
+    max_size: u64,
+    output: &mut Vec<u8>,
+) -> Result<()> {
+    use std::cell::RefCell;
+    thread_local! {
+        static ZSTD_DX: RefCell<Option<zstd::bulk::Decompressor<'static>>> =
+            const { RefCell::new(None) };
+    }
+    // The one-shot decoder reads zero bytes as zero frames. Every writer
+    // emits a frame, even for empty plaintext, and streaming rejects it.
+    if payload.is_empty() {
+        return Err(VykarError::Decompression("zstd: empty frame".into()));
+    }
+    let limit = usize::try_from(max_size).unwrap_or(usize::MAX);
+    let (cap, sized) = match hint {
+        // A zero hint means "unknown": clamp to 1 so the decompressor gets a
+        // minimal buffer rather than an empty one for a non-empty frame.
+        Some(n) => (n.max(1).min(limit), true),
+        None => match zstd::bulk::Decompressor::upper_bound(payload) {
+            Some(n) if n > limit => {
+                return Err(VykarError::Decompression(format!(
+                    "zstd: decompressed size ({n}) exceeds limit of {max_size} bytes",
+                )));
+            }
+            Some(n) => (n.max(1), true),
+            // No recorded content size: decode into the full limit rather
+            // than reject a frame restore would accept.
+            None => (limit, false),
+        },
+    };
+    ZSTD_DX.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(
+                zstd::bulk::Decompressor::new()
+                    .map_err(|e| VykarError::Decompression(format!("zstd init: {e}")))?,
+            );
+        }
+        let dx = slot.as_mut().expect("zstd decompressor initialized");
+        // The decompressor writes into capacity and sets the length itself.
+        output.clear();
+        output.reserve(cap);
+        dx.decompress_to_buffer(payload, output)
+            .map_err(|e| VykarError::Decompression(format!("zstd: {e}")))?;
+        if output.len() as u64 > max_size {
+            return Err(VykarError::Decompression(format!(
+                "zstd: decompressed size exceeds limit of {max_size} bytes",
+            )));
+        }
+        if !sized {
+            output.shrink_to_fit();
+        }
+        Ok(())
+    })
+}
+
 /// Allocating wrapper over [`decompress_into_impl`].
-fn decompress_impl(data: &[u8], expected_size: Option<usize>, max_size: u64) -> Result<Vec<u8>> {
+fn decompress_impl(data: &[u8], zstd_decode: ZstdDecode, max_size: u64) -> Result<Vec<u8>> {
     let mut output = Vec::new();
-    decompress_into_impl(data, expected_size, max_size, &mut output)?;
+    decompress_into_impl(data, zstd_decode, max_size, &mut output)?;
     Ok(output)
 }
 
 /// Decompress data by reading the 1-byte tag prefix and dispatching.
 ///
-/// `expected_size` controls ZSTD decode strategy:
-/// - `Some(n)`: uses a bulk decompressor with `n` as the output buffer capacity
-///   (capped by `MAX_DECOMPRESS_SIZE`). The value must be >= the actual
-///   decompressed size or the call will error. Best for restore paths where
-///   the exact size is known from snapshot metadata.
-/// - `None`: uses a streaming decoder that handles unknown sizes. Slightly
-///   slower due to per-call decoder initialization.
+/// ZSTD always uses the one-shot decoder. `expected_size` sizes its output
+/// buffer (capped by `MAX_DECOMPRESS_SIZE`):
+/// - `Some(n)`: `n` must be >= the actual decompressed size or the call may
+///   error. Restore passes the size from snapshot metadata.
+/// - `None`: the size recorded in the frame header, or `MAX_DECOMPRESS_SIZE`
+///   for a frame that records none.
 ///
 /// For LZ4 and None codecs the parameter is unused.
 pub fn decompress_with_hint(data: &[u8], expected_size: Option<usize>) -> Result<Vec<u8>> {
-    decompress_impl(data, expected_size, MAX_DECOMPRESS_SIZE)
+    decompress_impl(
+        data,
+        ZstdDecode::Bulk {
+            hint: expected_size,
+        },
+        MAX_DECOMPRESS_SIZE,
+    )
 }
 
 /// Decompress metadata objects (e.g. chunk index) with a higher size limit.
 ///
-/// Same dispatch logic as `decompress()` but allows up to 4 GiB of output,
-/// sized for metadata objects that scale with the number of chunks in the repo.
+/// Allows up to 4 GiB of output, sized for metadata objects that scale with
+/// the number of chunks in the repo. Unlike `decompress()`, ZSTD goes through
+/// the streaming decoder: large metadata objects (index, caches) are
+/// stream-compressed and record no content size.
 pub fn decompress_metadata(data: &[u8]) -> Result<Vec<u8>> {
-    decompress_impl(data, None, MAX_METADATA_DECOMPRESS_SIZE)
+    decompress_impl(data, ZstdDecode::Stream, MAX_METADATA_DECOMPRESS_SIZE)
 }
 
 /// Decode a msgpack value directly from a compressed metadata payload.
@@ -509,20 +554,26 @@ where
 
 /// Decompress data into a caller-provided buffer, reusing its allocation.
 ///
-/// `expected_size` controls ZSTD decode strategy (see [`decompress_with_hint`]).
-/// When `Some(n)`, ZSTD uses a bulk decompressor and `n` must be >= the actual
-/// decompressed size. All three codec paths reuse the existing allocation in
-/// `output` from prior calls.
+/// `expected_size` sizes the ZSTD output buffer as in
+/// [`decompress_with_hint`]. All three codec paths reuse the existing
+/// allocation in `output` from prior calls.
 pub fn decompress_into_with_hint(
     data: &[u8],
     expected_size: Option<usize>,
     output: &mut Vec<u8>,
 ) -> Result<()> {
-    decompress_into_impl(data, expected_size, MAX_DECOMPRESS_SIZE, output)
+    decompress_into_impl(
+        data,
+        ZstdDecode::Bulk {
+            hint: expected_size,
+        },
+        MAX_DECOMPRESS_SIZE,
+        output,
+    )
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -706,6 +757,61 @@ mod tests {
         // decompress_metadata() should succeed (4 GiB limit)
         let decompressed = decompress_metadata(&compressed).unwrap();
         assert_eq!(decompressed, payload);
+    }
+
+    /// A zstd frame whose first block is compressed with declared size 0,
+    /// followed by a last raw block of 6 bytes. libzstd 1.5.7's streaming
+    /// decoder accepts it; the one-shot decoder rejects it.
+    pub(crate) const ZSTD_EMPTY_COMPRESSED_BLOCK: &[u8] = &[
+        TAG_ZSTD, 0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x34, 0x04, 0x00, 0x00, 0x31, 0x00, 0x00, 0x73,
+        0x48, 0x9c, 0x6b, 0x93, 0x8f,
+    ];
+
+    #[test]
+    fn chunk_decoders_reject_empty_compressed_block() {
+        let frame = ZSTD_EMPTY_COMPRESSED_BLOCK;
+        assert!(decompress(frame).is_err());
+        assert!(decompress_with_hint(frame, Some(6)).is_err());
+        let mut output = Vec::new();
+        assert!(decompress_into_with_hint(frame, None, &mut output).is_err());
+    }
+
+    #[test]
+    fn chunk_decoders_reject_empty_zstd_payload() {
+        let tag_only = [TAG_ZSTD];
+        assert!(decompress(&tag_only).is_err());
+        assert!(decompress_with_hint(&tag_only, Some(0)).is_err());
+        assert!(decompress_metadata(&tag_only).is_err());
+    }
+
+    #[test]
+    fn decompress_rejects_unsized_zstd_frame_above_chunk_limit() {
+        let size = (MAX_DECOMPRESS_SIZE as usize) + 1024;
+        let mut compressed = Vec::new();
+        compress_stream_zstd(&mut compressed, 1, |w| {
+            std::io::Write::write_all(w, &vec![0x42; size])?;
+            Ok(())
+        })
+        .unwrap();
+        // Fails if zstd's `experimental` feature is on: `upper_bound` would then
+        // return a block-count estimate here instead of `None`.
+        assert!(zstd::bulk::Decompressor::upper_bound(&compressed[1..]).is_none());
+        assert!(decompress(&compressed).is_err());
+        assert_eq!(decompress_metadata(&compressed).unwrap().len(), size);
+    }
+
+    #[test]
+    fn decompress_unsized_zstd_frame_does_not_keep_limit_capacity() {
+        let payload = vec![0x42; 4096];
+        let mut compressed = Vec::new();
+        compress_stream_zstd(&mut compressed, 1, |w| {
+            std::io::Write::write_all(w, &payload)?;
+            Ok(())
+        })
+        .unwrap();
+        let decoded = decompress(&compressed).unwrap();
+        assert_eq!(decoded, payload);
+        assert!(decoded.capacity() < 1 << 20);
     }
 
     #[test]

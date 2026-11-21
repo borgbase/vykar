@@ -13,7 +13,7 @@ use super::concurrency::ByteBudget;
 use super::source::ResolvedSource;
 
 mod inode_walk;
-pub(super) use inode_walk::{InodeSortedWalk, WalkEvent, WalkedEntry};
+pub(super) use inode_walk::{EmitOrder, InodeSortedWalk, WalkEvent, WalkedEntry};
 
 pub(crate) fn build_explicit_excludes(
     source: &Path,

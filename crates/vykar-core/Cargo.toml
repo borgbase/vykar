@@ -90,6 +90,16 @@ fuzzing = []
 # Simulation harness for protocol tests (src/sim). Test support, not API;
 # never enable in a product build.
 sim = []
+# Measurement entry points for examples/walk_order.rs and examples/listing_stats.rs (06 step 0). Not API.
+measure = []
+
+[[example]]
+name = "walk_order"
+required-features = ["measure"]
+
+[[example]]
+name = "listing_stats"
+required-features = ["measure"]
 
 [dev-dependencies]
 proptest = { workspace = true }

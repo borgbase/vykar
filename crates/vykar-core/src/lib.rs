@@ -33,6 +33,13 @@ pub mod fuzzing;
 #[doc(hidden)]
 pub mod sim;
 
+#[cfg(feature = "measure")]
+#[doc(hidden)]
+pub mod measure;
+#[cfg(not(feature = "measure"))]
+#[allow(dead_code)]
+mod measure;
+
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

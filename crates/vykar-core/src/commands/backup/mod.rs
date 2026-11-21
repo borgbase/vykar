@@ -9,6 +9,12 @@ pub(crate) mod pipeline;
 mod sequential;
 mod source;
 mod walk;
+#[cfg(feature = "measure")]
+#[doc(hidden)]
+pub mod walk_measure;
+#[cfg(not(feature = "measure"))]
+#[allow(dead_code)]
+mod walk_measure;
 
 pub(crate) mod read_source;
 

@@ -9,6 +9,10 @@
 //! On macOS and Windows, entries are sorted by filename for deterministic
 //! snapshots. All platforms share the same filtering logic (excludes,
 //! gitignore, markers, cross-device).
+//!
+//! Entries are emitted (and subdirectories descended) in stat order, unless
+//! [`EMIT_ORDER_ENV`] selects name order: then stat stays inode-sorted and
+//! each directory's events are re-sorted by name before they are emitted.
 
 // libc::statfs to detect filesystems where inode-sorted stat helps; SAFETY per block.
 #![allow(unsafe_code)]
@@ -82,6 +86,58 @@ fn inode_sort_beneficial(path: &Path) -> bool {
 #[cfg(not(target_os = "linux"))]
 fn inode_sort_beneficial(_path: &Path) -> bool {
     false
+}
+
+/// Order in which a directory's entries are emitted (and its subdirectories
+/// descended). Stat order is unaffected: it stays inode-sorted wherever
+/// `inode_sort_beneficial` holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EmitOrder {
+    /// Emit in stat order (inode order on ext4/xfs/reiserfs, name order elsewhere).
+    Stat,
+    /// Emit in name order on every filesystem.
+    Name,
+}
+
+/// Measurement switch for 06 step 0; step 3 decides its fate. Setting it in a
+/// real backup changes the item order on ext4/xfs, so that run shares no tree
+/// chunks with the previous snapshot of the source.
+pub(crate) const EMIT_ORDER_ENV: &str = "VYKAR_WALK_EMIT_ORDER";
+
+impl EmitOrder {
+    /// `None`, `""` and `"inode"` give `Stat`, `"name"` gives `Name`. Any other
+    /// value gives `Stat` with `recognized = false`. Case-sensitive.
+    pub(crate) fn parse(value: Option<&str>) -> (Self, bool) {
+        match value {
+            None | Some("" | "inode") => (Self::Stat, true),
+            Some("name") => (Self::Name, true),
+            Some(_) => (Self::Stat, false),
+        }
+    }
+
+    pub(crate) fn from_env() -> Self {
+        let value = std::env::var(EMIT_ORDER_ENV).ok();
+        let (order, recognized) = Self::parse(value.as_deref());
+        if !recognized {
+            tracing::warn!(
+                value = value.as_deref().unwrap_or_default(),
+                "unrecognized {EMIT_ORDER_ENV}; emitting in stat order"
+            );
+        }
+        order
+    }
+}
+
+/// Path of a walk event, for the name-order re-sort.
+fn path_sort_bytes(path: &Path) -> &[u8] {
+    path.as_os_str().as_encoded_bytes()
+}
+
+fn event_path(event: &WalkEvent) -> &Path {
+    match event {
+        WalkEvent::Entry(e) => &e.abs_path,
+        WalkEvent::Skipped { path, .. } | WalkEvent::SkippedDataless { path, .. } => path,
+    }
 }
 
 /// A filesystem entry that has been statted and passed all filters.
@@ -258,7 +314,8 @@ struct DirLevel {
 ///
 /// For each directory, entries are sorted by inode number before calling
 /// `symlink_metadata()`, making stat calls sweep sequentially through
-/// the inode table on ext4/xfs.
+/// the inode table on ext4/xfs. They are emitted in that order unless
+/// `emit_order` is [`EmitOrder::Name`], which re-sorts them by name after stat.
 pub(in crate::commands::backup) struct InodeSortedWalk {
     stack: Vec<DirLevel>,
     /// Absolute source path — used for filesystem access (so `read_dir`
@@ -277,6 +334,7 @@ pub(in crate::commands::backup) struct InodeSortedWalk {
     /// Cached result of `inode_sort_beneficial()` for the source root.
     /// Avoids per-directory `statfs()` + `CString` allocation.
     inode_sort_for_source: bool,
+    emit_order: EmitOrder,
     /// Snapshot-root policy: `SkipRoot` (descendants only, relative to
     /// `abs_source`) or `EmitRoot` (prefix all emitted paths with `prefix`).
     policy: RootEmission,
@@ -305,6 +363,29 @@ impl InodeSortedWalk {
         one_file_system: bool,
         git_ignore: bool,
     ) -> Result<Self> {
+        Self::new_inner(
+            source,
+            exclude_patterns,
+            exclude_if_present,
+            one_file_system,
+            git_ignore,
+            EmitOrder::from_env(),
+            None,
+        )
+    }
+
+    /// [`Self::new`] with an explicit emission order and, when
+    /// `inode_sort_override` is `Some`, a forced inode-sort decision instead
+    /// of `inode_sort_beneficial`.
+    pub(in crate::commands::backup) fn new_inner(
+        source: &ResolvedSource,
+        exclude_patterns: &[String],
+        exclude_if_present: &[String],
+        one_file_system: bool,
+        git_ignore: bool,
+        emit_order: EmitOrder,
+        inode_sort_override: Option<bool>,
+    ) -> Result<Self> {
         let abs_source = source.abs_source.clone();
 
         let source_meta = std::fs::metadata(&abs_source).map_err(|e| {
@@ -316,10 +397,12 @@ impl InodeSortedWalk {
 
         let excludes = build_explicit_excludes(&abs_source, exclude_patterns)?;
 
-        let inode_sort_for_source = inode_sort_beneficial(&abs_source);
+        let inode_sort_for_source =
+            inode_sort_override.unwrap_or_else(|| inode_sort_beneficial(&abs_source));
 
         tracing::debug!(
             inode_sort = inode_sort_for_source,
+            emit_order = ?emit_order,
             path = %abs_source.display(),
             "source filesystem detection"
         );
@@ -376,6 +459,7 @@ impl InodeSortedWalk {
             gitignore_enabled: git_ignore,
             gitignore_stack,
             inode_sort_for_source,
+            emit_order,
             policy: source.policy.clone(),
             prefix_raw: source.prefix_raw.clone(),
         };
@@ -411,6 +495,11 @@ impl InodeSortedWalk {
         }
 
         Ok(walk)
+    }
+
+    /// Whether stat runs in inode order for this source.
+    pub(in crate::commands::backup) fn inode_sort(&self) -> bool {
+        self.inode_sort_for_source
     }
 
     /// Check if a path is excluded by the gitignore stack.
@@ -634,6 +723,19 @@ impl InodeSortedWalk {
             }));
         }
 
+        // Phase 5: re-sort for emission when stat order was inode order.
+        if self.inode_sort_for_source && self.emit_order == EmitOrder::Name {
+            // Siblings share their parent prefix, so comparing the encoded
+            // bytes orders them by name without `Path::cmp`'s per-comparison
+            // component parsing.
+            events.make_contiguous().sort_unstable_by(|a, b| {
+                path_sort_bytes(event_path(a)).cmp(path_sort_bytes(event_path(b)))
+            });
+            pending_subdirs
+                .make_contiguous()
+                .sort_unstable_by(|a, b| path_sort_bytes(a).cmp(path_sort_bytes(b)));
+        }
+
         // Prepend skip events for readdir errors from phase 1 so consumers can
         // account for each lost entry. `push_front` reverses the deferred order,
         // so iterate the deferred list in reverse to keep the original order
@@ -716,6 +818,7 @@ impl Iterator for InodeSortedWalk {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use std::fs;
 
     fn resolve_dir(path: &Path) -> ResolvedSource {
@@ -1282,5 +1385,127 @@ mod tests {
             .map(|e| e.snapshot_path.clone())
             .collect();
         assert_eq!(descendant_paths, vec![format!("{root_prefix}/a.txt")]);
+    }
+
+    /// Root files `z.txt`..`a.txt`, subdirs `d3, d1, d2` and `d1/n2, d1/n1`,
+    /// each created in reverse name order so inode order is not name order.
+    fn make_reverse_tree(root: &Path) {
+        for c in (b'a'..=b'z').rev() {
+            fs::write(root.join(format!("{}.txt", c as char)), "x").unwrap();
+        }
+        for d in ["d3", "d1", "d2"] {
+            fs::create_dir(root.join(d)).unwrap();
+            for f in (1..=5).rev() {
+                fs::write(root.join(format!("{d}/f{f}")), "x").unwrap();
+            }
+        }
+        for n in ["n2", "n1"] {
+            fs::create_dir(root.join("d1").join(n)).unwrap();
+            fs::write(root.join(format!("d1/{n}/g")), "x").unwrap();
+        }
+    }
+
+    fn walk_paths(root: &Path, order: EmitOrder, inode_sort: bool) -> Vec<String> {
+        InodeSortedWalk::new_inner(
+            &resolve_dir(root),
+            &[],
+            &[],
+            false,
+            false,
+            order,
+            Some(inode_sort),
+        )
+        .unwrap()
+        .map(|ev| match ev.unwrap() {
+            WalkEvent::Entry(e) => e.snapshot_path,
+            _ => panic!("unexpected skip event"),
+        })
+        .collect()
+    }
+
+    fn parent_and_name(path: &str) -> (&str, &str) {
+        path.rsplit_once('/').unwrap_or(("", path))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn name_emission_matches_name_sort_under_inode_stat() {
+        let tmp = tempfile::tempdir().unwrap();
+        make_reverse_tree(tmp.path());
+
+        let name_inode = walk_paths(tmp.path(), EmitOrder::Name, true);
+        let name_plain = walk_paths(tmp.path(), EmitOrder::Stat, false);
+        assert_eq!(name_inode, name_plain);
+
+        let stat_inode = walk_paths(tmp.path(), EmitOrder::Stat, true);
+        assert_ne!(
+            stat_inode, name_inode,
+            "precondition does not hold: this filesystem hands out inodes in name order"
+        );
+
+        let mut children: HashMap<&str, Vec<&str>> = HashMap::new();
+        for p in &name_inode {
+            let (parent, name) = parent_and_name(p);
+            children.entry(parent).or_default().push(name);
+        }
+        for (parent, names) in &children {
+            let mut sorted = names.clone();
+            sorted.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+            assert_eq!(names, &sorted, "children of {parent:?} not in name order");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stat_emission_keeps_inode_order() {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        make_reverse_tree(root);
+
+        let paths = walk_paths(root, EmitOrder::Stat, true);
+        let root_children: Vec<&str> = paths
+            .iter()
+            .map(String::as_str)
+            .filter(|p| !p.contains('/'))
+            .collect();
+        let mut by_ino = root_children.clone();
+        by_ino.sort_by_key(|p| fs::symlink_metadata(root.join(p)).unwrap().ino());
+        assert_eq!(root_children, by_ino);
+
+        let dirs: Vec<&str> = root_children
+            .iter()
+            .copied()
+            .filter(|p| root.join(p).is_dir())
+            .collect();
+        let mut descent: Vec<&str> = Vec::new();
+        for p in &paths {
+            if let Some((top, _)) = p.split_once('/')
+                && descent.last() != Some(&top)
+            {
+                descent.push(top);
+            }
+        }
+        assert_eq!(descent, dirs);
+    }
+
+    #[test]
+    fn name_emission_noop_without_inode_sort() {
+        let tmp = tempfile::tempdir().unwrap();
+        make_reverse_tree(tmp.path());
+        assert_eq!(
+            walk_paths(tmp.path(), EmitOrder::Name, false),
+            walk_paths(tmp.path(), EmitOrder::Stat, false)
+        );
+    }
+
+    #[test]
+    fn emit_order_parse() {
+        assert_eq!(EmitOrder::parse(None), (EmitOrder::Stat, true));
+        assert_eq!(EmitOrder::parse(Some("")), (EmitOrder::Stat, true));
+        assert_eq!(EmitOrder::parse(Some("inode")), (EmitOrder::Stat, true));
+        assert_eq!(EmitOrder::parse(Some("name")), (EmitOrder::Name, true));
+        assert_eq!(EmitOrder::parse(Some("NAME")), (EmitOrder::Stat, false));
+        assert_eq!(EmitOrder::parse(Some("bogus")), (EmitOrder::Stat, false));
     }
 }

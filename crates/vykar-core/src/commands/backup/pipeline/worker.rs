@@ -16,7 +16,6 @@ use tracing::warn;
 use crate::compress::Compression;
 use crate::config::ChunkerConfig;
 use crate::index::dedup_cache::DedupPrefilter;
-use crate::limits::ByteRateLimiter;
 use crate::platform::fs;
 use vykar_crypto::CryptoEngine;
 use vykar_types::chunk_id::{ChunkHasher, ChunkId};
@@ -61,7 +60,6 @@ pub(super) fn process_file_worker(
     crypto: &dyn CryptoEngine,
     compression: Compression,
     chunker_config: &ChunkerConfig,
-    read_limiter: Option<&ByteRateLimiter>,
     budget: &ByteBudget,
     pre_acquired_bytes: usize,
     prefilter: Option<&DedupPrefilter>,
@@ -100,7 +98,6 @@ pub(super) fn process_file_worker(
                     &pre_meta,
                     plan,
                     chunker_config,
-                    read_limiter,
                     |data| {
                         let start = Instant::now();
                         let chunk_id = ChunkId::compute(chunk_hasher, &data);
@@ -163,7 +160,6 @@ pub(super) fn process_file_worker(
                     &pre_meta,
                     ReadPlan::Segment { offset, len },
                     chunker_config,
-                    read_limiter,
                     |data| {
                         let start = Instant::now();
                         let chunk_id = ChunkId::compute(chunk_hasher, &data);

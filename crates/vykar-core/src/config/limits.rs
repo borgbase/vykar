@@ -24,7 +24,7 @@ pub struct ResourceLimitsConfig {
     #[serde(default = "default_connections")]
     pub connections: usize,
     /// CPU worker threads for backup transforms.
-    /// 0 = auto: local repos use ceil(cores/2) clamped to [2, 4]; remote repos use min(cores, 4). 1 = sequential.
+    /// 0 = auto: local repos use ceil(cores/2) clamped to [2, 4], or 1 on a single-core host; remote repos use min(cores, 4). 1 = sequential.
     #[serde(default)]
     pub threads: usize,
     /// Unix process niceness target (-20..19). 0 = unchanged. Applied to every

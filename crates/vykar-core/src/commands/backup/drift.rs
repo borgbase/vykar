@@ -19,7 +19,6 @@ use std::path::Path;
 
 use crate::chunker;
 use crate::config::ChunkerConfig;
-use crate::limits::{self, ByteRateLimiter};
 use crate::platform::fs;
 use vykar_types::error::{Result, VykarError};
 
@@ -88,7 +87,6 @@ pub(super) fn read_range_drift_checked(
     pre_meta: &fs::MetadataSummary,
     plan: ReadPlan,
     chunker_config: &ChunkerConfig,
-    limiter: Option<&ByteRateLimiter>,
     mut on_chunk: impl FnMut(Cow<'_, [u8]>) -> Result<()>,
 ) -> Result<()> {
     // For whole-file plans the read is hard-capped at `size + 1`: an
@@ -118,15 +116,14 @@ pub(super) fn read_range_drift_checked(
                 ))
             })?;
             let mut data = Vec::with_capacity(cap);
-            let reader = Read::take(&mut *source, read_limit);
-            limits::LimitedReader::new(reader, limiter)
+            Read::take(&mut *source, read_limit)
                 .read_to_end(&mut data)
                 .map_err(VykarError::Io)?;
             total_bytes = data.len() as u64;
             whole_file = Some(data);
         }
         ReadPlan::Chunked | ReadPlan::Segment { .. } => {
-            let reader = limits::LimitedReader::new(&mut *source, limiter).take(read_limit);
+            let reader = Read::take(&mut *source, read_limit);
             let mut chunks = chunker::ChunkReader::new(reader, chunker_config);
             while let Some(chunk) = chunks.next_chunk().map_err(VykarError::Io)? {
                 total_bytes = total_bytes.saturating_add(chunk.len() as u64);
@@ -182,7 +179,6 @@ mod tests {
             &pre_meta,
             ReadPlan::Segment { offset, len },
             &ChunkerConfig::default(),
-            None,
             |data| {
                 got.extend_from_slice(&data);
                 Ok(())

@@ -290,7 +290,6 @@ pub(super) fn phase1_upload(
             file_cache: &file_cache_snapshot,
             crypto: &crypto,
             compression,
-            read_limiter: None,
             num_workers,
             readahead_depth: pipeline_depth,
             segment_size,
@@ -325,7 +324,6 @@ pub(super) fn phase1_upload(
             item_cutter: &item_cutter,
             max_pending_transform_bytes,
             max_pending_file_actions,
-            read_limiter: None, // no source-file read limiter
             transform_pool: transform_pool.as_ref(),
             prefilter: prefilter.as_ref(),
             shutdown,

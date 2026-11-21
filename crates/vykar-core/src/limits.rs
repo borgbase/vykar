@@ -2,7 +2,6 @@
 // Each `unsafe { }` has a SAFETY comment (enforced by undocumented_unsafe_blocks).
 #![allow(unsafe_code)]
 
-use std::io::Read;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -73,28 +72,6 @@ impl ByteRateLimiter {
         if let Some(d) = sleep_duration {
             std::thread::sleep(d);
         }
-    }
-}
-
-/// Read adaptor that applies an optional shared byte-rate limiter.
-pub struct LimitedReader<'a, R> {
-    inner: R,
-    limiter: Option<&'a ByteRateLimiter>,
-}
-
-impl<'a, R> LimitedReader<'a, R> {
-    pub fn new(inner: R, limiter: Option<&'a ByteRateLimiter>) -> Self {
-        Self { inner, limiter }
-    }
-}
-
-impl<R: Read> Read for LimitedReader<'_, R> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let n = self.inner.read(buf)?;
-        if let Some(limiter) = self.limiter {
-            limiter.consume(n);
-        }
-        Ok(n)
     }
 }
 

@@ -8,7 +8,6 @@ use crate::commands::util::check_interrupted;
 
 use crate::compress::Compression;
 use crate::index::dedup_cache::DedupPrefilter;
-use crate::limits::ByteRateLimiter;
 use crate::platform::fs;
 use crate::repo::Repository;
 use crate::repo::file_cache::{CachedChunks, FileCache, ParentReuseIndex};
@@ -275,7 +274,6 @@ pub(super) fn process_regular_file_item(
     metadata_summary: fs::MetadataSummary,
     compression: Compression,
     transform_pool: Option<&rayon::ThreadPool>,
-    read_limiter: Option<&ByteRateLimiter>,
     item: &mut Item,
     stats: &mut SnapshotStats,
     new_file_cache: &mut FileCache,
@@ -371,7 +369,6 @@ pub(super) fn process_regular_file_item(
             &pre_meta,
             ReadPlan::Chunked,
             &chunker_params,
-            read_limiter,
             |data| {
                 pending_bytes = pending_bytes.saturating_add(data.len());
                 // Deferred batch transformation needs to retain the bytes.
@@ -462,7 +459,6 @@ pub(super) struct SequentialCtx<'a> {
     pub item_cutter: &'a ItemStreamCutter,
     pub max_pending_transform_bytes: usize,
     pub max_pending_file_actions: usize,
-    pub read_limiter: Option<&'a ByteRateLimiter>,
     pub transform_pool: Option<&'a rayon::ThreadPool>,
     pub prefilter: Option<&'a DedupPrefilter>,
     pub shutdown: Option<&'a AtomicBool>,
@@ -487,7 +483,6 @@ pub(super) fn process_source_path(
         item_cutter,
         max_pending_transform_bytes,
         max_pending_file_actions,
-        read_limiter,
         transform_pool,
         prefilter,
         shutdown,
@@ -678,7 +673,6 @@ pub(super) fn process_source_path(
                                 &pre_meta,
                                 ReadPlan::Whole,
                                 &repo.config.chunker_params,
-                                None,
                                 |buf| {
                                     data = Some(buf.into_owned());
                                     Ok(())
@@ -753,7 +747,6 @@ pub(super) fn process_source_path(
                     metadata_summary,
                     compression,
                     transform_pool,
-                    read_limiter,
                     &mut item,
                     stats,
                     new_file_cache,

@@ -21,7 +21,6 @@ use std::time::{Duration, Instant};
 
 use crate::compress::Compression;
 use crate::index::dedup_cache::DedupPrefilter;
-use crate::limits::ByteRateLimiter;
 use crate::platform::fs;
 use crate::repo::Repository;
 use crate::repo::file_cache::{CachedChunks, FileCache, ParentReuseIndex, RetainedHit};
@@ -251,7 +250,6 @@ pub(crate) struct PipelineCtx<'a> {
     pub file_cache: &'a FileCache,
     pub crypto: &'a Arc<dyn CryptoEngine>,
     pub compression: Compression,
-    pub read_limiter: Option<&'a ByteRateLimiter>,
     pub num_workers: usize,
     pub readahead_depth: usize,
     pub segment_size: u64,
@@ -300,7 +298,6 @@ pub(crate) fn run_parallel_pipeline(
         file_cache,
         crypto,
         compression,
-        read_limiter,
         num_workers,
         readahead_depth,
         segment_size,
@@ -464,7 +461,6 @@ pub(crate) fn run_parallel_pipeline(
                         &**crypto,
                         compression,
                         &chunker_cfg,
-                        read_limiter,
                         budget_ref,
                         pre_acquired,
                         prefilter,

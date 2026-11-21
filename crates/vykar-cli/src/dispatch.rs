@@ -3,6 +3,7 @@ use std::sync::atomic::AtomicBool;
 
 use crate::progress::BackupProgressRenderer;
 use vykar_core::app::operations::{self, CycleEvent, CycleStep, FullCycleResult, StepOutcome};
+use vykar_core::app::preflight::{self, Availability, UnavailableRepo};
 use vykar_core::config::{EncryptionModeConfig, ResolvedRepo, VykarConfig};
 use vykar_storage::{ParsedUrl, parse_repo_url};
 
@@ -12,8 +13,9 @@ use crate::cmd::backup::BackupRunOpts;
 use crate::cmd::check::{format_check_progress, print_check_summary};
 use crate::error::{CliError, CliResult};
 use crate::format::print_backup_stats;
-use crate::passphrase::with_repo_passphrase;
+use crate::passphrase::get_passphrase;
 use vykar_common::display::format_duration_seconds;
+use vykar_types::error::VykarError;
 
 pub(crate) fn warn_if_untrusted_rest(config: &VykarConfig, label: Option<&str>) {
     let Ok(parsed) = parse_repo_url(&config.repository.url) else {
@@ -42,6 +44,8 @@ pub(crate) struct CycleOutcome {
     pub partial: bool,
     /// Why the backup step (and so the whole cycle) was skipped, if it was.
     pub skipped: Option<String>,
+    /// The skip in `skipped` is because the local repository was missing.
+    pub unavailable: bool,
 }
 
 pub(crate) fn run_default_actions(
@@ -49,68 +53,87 @@ pub(crate) fn run_default_actions(
     shutdown: Option<&AtomicBool>,
     verbose: u8,
     source_filter: &[String],
+    unavailable: UnavailableRepo,
 ) -> CliResult<CycleOutcome> {
     let start = std::time::Instant::now();
     let label = repo.label.as_deref();
 
-    let result = with_repo_passphrase(&repo.config, label, |passphrase| {
-        let is_tty = std::io::stderr().is_terminal();
-        let show_progress = is_tty || verbose > 0;
-        let mut backup_renderer: Option<BackupProgressRenderer> = None;
+    // A repository that is missing now can only appear through a `before` hook,
+    // so its passphrase is fetched after the hooks, if it appears at all. Any
+    // other repository gets its passphrase first, as before.
+    let defer = unavailable == UnavailableRepo::Skip
+        && matches!(preflight::availability(repo), Availability::LocalMissing(_));
+    let mut early = if defer {
+        None
+    } else {
+        get_passphrase(&repo.config, label)?
+    };
+    let mut resolve = || {
+        if defer {
+            get_passphrase(&repo.config, label).map_err(|e| match e {
+                CliError::Vykar(e) => e,
+                e => VykarError::Other(e.to_string()),
+            })
+        } else {
+            Ok(early.take())
+        }
+    };
 
-        let cycle_result = operations::run_full_cycle_for_repo(
-            repo,
-            passphrase,
-            shutdown,
-            verbose >= 1,
-            source_filter,
-            &mut |event| {
-                match &event {
-                    CycleEvent::StepStarted(step) => {
-                        eprintln!("==> Starting {}", step.command_name());
-                        if matches!(step, CycleStep::Backup) && show_progress {
-                            backup_renderer = Some(BackupProgressRenderer::new(verbose, is_tty));
-                        }
-                    }
-                    CycleEvent::StepFinished(step, outcome) => {
-                        if matches!(step, CycleStep::Backup) {
-                            if let Some(ref mut r) = backup_renderer {
-                                r.finish();
-                            }
-                            backup_renderer = None;
-                        }
-                        if let StepOutcome::Failed(e) = outcome {
-                            eprintln!("Error: {e}");
-                        }
-                    }
-                    CycleEvent::Backup(evt) => {
-                        if let Some(ref mut r) = backup_renderer {
-                            r.on_event(evt.clone());
-                        }
-                    }
-                    CycleEvent::Check(evt) => {
-                        format_check_progress(evt);
-                    }
-                    // HookWarning: tracing::warn! already fired inside log_hook_errors.
-                    // Events are for GUI consumers only.
-                    CycleEvent::HookWarning { .. } => {}
-                    CycleEvent::StepWarning { step, message } => {
-                        // tracing::warn! already fired inside the step;
-                        // duplicate to stderr so CLI users see the warning
-                        // even without the tracing subscriber.
-                        eprintln!("warning: [{}] {message}", step.command_name());
+    let is_tty = std::io::stderr().is_terminal();
+    let show_progress = is_tty || verbose > 0;
+    let mut backup_renderer: Option<BackupProgressRenderer> = None;
+
+    let result = operations::run_full_cycle_with_passphrase_source(
+        repo,
+        &mut resolve,
+        shutdown,
+        verbose >= 1,
+        source_filter,
+        unavailable,
+        &mut |event| {
+            match &event {
+                CycleEvent::StepStarted(step) => {
+                    eprintln!("==> Starting {}", step.command_name());
+                    if matches!(step, CycleStep::Backup) && show_progress {
+                        backup_renderer = Some(BackupProgressRenderer::new(verbose, is_tty));
                     }
                 }
-            },
-        );
+                CycleEvent::StepFinished(step, outcome) => {
+                    if matches!(step, CycleStep::Backup) {
+                        if let Some(ref mut r) = backup_renderer {
+                            r.finish();
+                        }
+                        backup_renderer = None;
+                    }
+                    if let StepOutcome::Failed(e) = outcome {
+                        eprintln!("Error: {e}");
+                    }
+                }
+                CycleEvent::Backup(evt) => {
+                    if let Some(ref mut r) = backup_renderer {
+                        r.on_event(evt.clone());
+                    }
+                }
+                CycleEvent::Check(evt) => {
+                    format_check_progress(evt);
+                }
+                // HookWarning: tracing::warn! already fired inside log_hook_errors.
+                // Events are for GUI consumers only.
+                CycleEvent::HookWarning { .. } => {}
+                CycleEvent::StepWarning { step, message } => {
+                    // tracing::warn! already fired inside the step;
+                    // duplicate to stderr so CLI users see the warning
+                    // even without the tracing subscriber.
+                    eprintln!("warning: [{}] {message}", step.command_name());
+                }
+            }
+        },
+    );
 
-        // Ensure renderer is cleaned up if cycle ended abruptly (e.g. shutdown).
-        if let Some(ref mut r) = backup_renderer {
-            r.finish();
-        }
-
-        Ok(cycle_result)
-    })?;
+    // Ensure renderer is cleaned up if cycle ended abruptly (e.g. shutdown).
+    if let Some(ref mut r) = backup_renderer {
+        r.finish();
+    }
 
     print_step_details(&result);
     print_summary(&result.steps, start);
@@ -121,6 +144,7 @@ pub(crate) fn run_default_actions(
         Ok(CycleOutcome {
             partial: result.had_partial(),
             skipped: result.backup_skipped().map(str::to_owned),
+            unavailable: result.repo_unavailable,
         })
     }
 }
@@ -263,12 +287,9 @@ pub(crate) fn dispatch_command(
             dry_run,
             list,
             source,
-            compact,
             ..
-        } => cmd::prune::run_prune(
-            cfg, label, *dry_run, *list, sources, source, *compact, shutdown,
-        )
-        .map(|()| false),
+        } => cmd::prune::run_prune(cfg, label, *dry_run, *list, sources, source, shutdown)
+            .map(|()| false),
         Commands::Check {
             verify_data,
             distrust_server,
@@ -334,19 +355,4 @@ pub(crate) fn dispatch_command(
             "'daemon' command should be handled before per-repo dispatch",
         )),
     }
-}
-
-/// For local repos, check if the config sentinel file is reachable.
-/// Returns `Some(path)` if local and config definitely missing, `None` otherwise.
-pub(crate) fn local_repo_unavailable(repo: &ResolvedRepo) -> Option<String> {
-    let parsed = parse_repo_url(&repo.config.repository.url).ok()?;
-    if let ParsedUrl::Local { path } = parsed {
-        let config_path = std::path::Path::new(&path).join("config");
-        match config_path.try_exists() {
-            Ok(false) => return Some(path), // definitely missing → skip
-            Ok(true) => {}                  // present → proceed
-            Err(_) => {}                    // can't tell → let it fail normally
-        }
-    }
-    None
 }

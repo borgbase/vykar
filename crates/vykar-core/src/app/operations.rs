@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use rand::Rng;
 use zeroize::Zeroizing;
 
+use crate::app::preflight::{self, UnavailableRepo};
 use crate::commands;
 use crate::compress::Compression;
 use crate::config::{ResolvedRepo, SourceEntry, VykarConfig};
@@ -172,6 +173,9 @@ pub struct FullCycleResult {
     pub compact_stats: Option<commands::compact::CompactStats>,
     pub check_result: Option<commands::check::CheckResult>,
     pub steps: Vec<(CycleStep, StepOutcome)>,
+    /// The backup step was skipped because the local repository was missing
+    /// after its `before` hooks; `backup_skipped()` holds the reason.
+    pub repo_unavailable: bool,
 }
 
 impl FullCycleResult {
@@ -189,8 +193,9 @@ impl FullCycleResult {
             .any(|(step, o)| matches!((step, o), (CycleStep::Backup, StepOutcome::Partial)))
     }
 
-    /// Why the backup step was skipped, if it was. Only a hook or a dismissed
-    /// passphrase prompt does this, and the rest of the cycle is skipped with it.
+    /// Why the backup step was skipped, if it was. Only a hook, a dismissed
+    /// passphrase prompt or an unavailable local repository does this, and the
+    /// rest of the cycle is skipped with it.
     pub fn backup_skipped(&self) -> Option<&str> {
         self.steps.iter().find_map(|(step, o)| match (step, o) {
             (CycleStep::Backup, StepOutcome::Skipped(reason)) => Some(reason.as_str()),
@@ -517,6 +522,21 @@ pub fn run_command_with_hooks<F, T>(
 where
     F: FnOnce() -> vykar_types::error::Result<T>,
 {
+    run_command_with_hook_warnings(repo, command, &mut |_| {}, action)
+}
+
+/// [`run_command_with_hooks`] that also hands each non-fatal hook warning
+/// (an `after`/`failed`/`finally` failure, already traced) to `on_warning`,
+/// for frontends that do not show tracing output.
+pub fn run_command_with_hook_warnings<F, T>(
+    repo: &ResolvedRepo,
+    command: &str,
+    on_warning: &mut dyn FnMut(String),
+    action: F,
+) -> vykar_types::error::Result<T>
+where
+    F: FnOnce() -> vykar_types::error::Result<T>,
+{
     let mut ctx = crate::hooks::HookContext {
         command: command.to_string(),
         repository: repo.config.repository.url.clone(),
@@ -526,19 +546,28 @@ where
         source_paths: None,
         warnings: Vec::new(),
     };
-    crate::hooks::run_with_hooks(&repo.global_hooks, &repo.repo_hooks, &mut ctx, action)
+    let result =
+        crate::hooks::run_with_hooks(&repo.global_hooks, &repo.repo_hooks, &mut ctx, action);
+    for w in ctx.warnings.drain(..) {
+        on_warning(w);
+    }
+    result
 }
 
 // ── Full-cycle with internalized hooks ───────────────────────────────────
 
 /// Run the full backup cycle: backup → prune → compact → check.
 /// Hooks are run internally — callers don't need to handle them.
+/// With `UnavailableRepo::Skip`, a local repository whose `config` is missing
+/// once the backup step's `before` hooks have run is skipped like a hook skip:
+/// only `finally` hooks run and nothing is resolved or opened.
 pub fn run_full_cycle_for_repo(
     repo: &ResolvedRepo,
     passphrase: Option<&str>,
     shutdown: Option<&AtomicBool>,
     verbose: bool,
     source_filter: &[String],
+    unavailable: UnavailableRepo,
     on_event: &mut dyn FnMut(CycleEvent),
 ) -> FullCycleResult {
     run_full_cycle_with_passphrase_source(
@@ -547,6 +576,7 @@ pub fn run_full_cycle_for_repo(
         shutdown,
         verbose,
         source_filter,
+        unavailable,
         on_event,
     )
 }
@@ -556,12 +586,16 @@ pub fn run_full_cycle_for_repo(
 /// it, after that step's `before` hooks pass, and at most once per cycle: a
 /// failure is not retried. Returning `Err(VykarError::Skipped)` skips the step
 /// without reporting an error.
+/// With `UnavailableRepo::Skip`, a local repository whose `config` is missing
+/// once the backup step's `before` hooks have run is skipped like a hook skip:
+/// only `finally` hooks run and nothing is resolved or opened.
 pub fn run_full_cycle_with_passphrase_source(
     repo: &ResolvedRepo,
     resolve: &mut dyn FnMut() -> Result<Option<Zeroizing<String>>>,
     shutdown: Option<&AtomicBool>,
     verbose: bool,
     source_filter: &[String],
+    unavailable: UnavailableRepo,
     on_event: &mut dyn FnMut(CycleEvent),
 ) -> FullCycleResult {
     let mut passphrase = LazyPassphrase::new(resolve);
@@ -574,6 +608,7 @@ pub fn run_full_cycle_with_passphrase_source(
     let mut prune_stats: Option<commands::prune::PruneStats> = None;
     let mut compact_stats: Option<commands::compact::CompactStats> = None;
     let mut check_result: Option<commands::check::CheckResult> = None;
+    let mut repo_unavailable = false;
 
     // 1. Backup
     if !shutting_down(shutdown) {
@@ -591,6 +626,15 @@ pub fn run_full_cycle_with_passphrase_source(
                     on_event,
                     &mut steps,
                     |evt| {
+                        // After the `before` hooks, so one can mount the repository;
+                        // before the passphrase, so nothing is asked for one that
+                        // is not there.
+                        if unavailable == UnavailableRepo::Skip
+                            && let Some(reason) = preflight::availability(repo).unavailable_reason()
+                        {
+                            repo_unavailable = true;
+                            return Err(VykarError::Skipped(reason));
+                        }
                         run_backup_sources(
                             config,
                             &effective_sources,
@@ -803,6 +847,7 @@ pub fn run_full_cycle_with_passphrase_source(
         compact_stats,
         check_result,
         steps,
+        repo_unavailable,
     }
 }
 

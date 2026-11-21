@@ -14,11 +14,12 @@ use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant, SystemTime};
 
 use vykar_core::app::passphrase::configured_passphrase;
+use vykar_core::app::preflight::UnavailableRepo;
 use vykar_core::app::scheduler::{SchedulePlan, SchedulerLock};
 use vykar_core::config::{self, ConfigSource, EncryptionModeConfig, ResolvedRepo, ScheduleConfig};
 use vykar_types::error::VykarError;
 
-use crate::dispatch::{local_repo_unavailable, run_default_actions, warn_if_untrusted_rest};
+use crate::dispatch::{run_default_actions, warn_if_untrusted_rest};
 use crate::error::{CliError, CliResult};
 use crate::signal::{RELOAD, SHUTDOWN, TRIGGER};
 
@@ -206,6 +207,7 @@ pub(crate) fn run_daemon(source: ConfigSource, http_listen: Option<SocketAddr>) 
                         "configuration reloaded successfully"
                     );
                     repos = new_repos;
+                    crate::passphrase::clear_passphrase_cache();
                     status::init(&status, &repos, started_at);
                     send_configure(&status_tx, &repos);
 
@@ -344,9 +346,9 @@ struct CycleReport {
 
 /// Run a backup cycle for the `due` repositories.
 ///
-/// `all` is the full configured set: it decides multi-repo presentation (the
-/// `=== Repository ===` headers and the unavailable-local-repo preflight skip,
-/// which must not switch off just because a single repo came due).
+/// `all` is the full configured set: it decides whether the
+/// `=== Repository ===` headers print, which must not switch off just because
+/// a single repo came due.
 fn run_backup_cycle(
     due: &[&ResolvedRepo],
     all: &[ResolvedRepo],
@@ -374,13 +376,6 @@ fn run_backup_cycle(
 
         let name = repo.label_or_url();
 
-        // Pre-flight: skip unavailable local repos in multi-repo configs
-        if multi && let Some(path) = local_repo_unavailable(repo) {
-            tracing::info!(repo = name, path, "skipping unavailable repository");
-            report.skipped.push(name.to_string());
-            continue;
-        }
-
         if multi {
             eprintln!("=== Repository: {name} ===");
             if repo.label.is_some() {
@@ -391,14 +386,18 @@ fn run_backup_cycle(
         warn_if_untrusted_rest(&repo.config, repo.label.as_deref());
 
         attempted += 1;
-        match run_default_actions(repo, Some(&SHUTDOWN), 0, &[]) {
+        match run_default_actions(repo, Some(&SHUTDOWN), 0, &[], UnavailableRepo::Skip) {
             Ok(outcome) => {
                 if outcome.partial {
                     tracing::warn!(repo = name, "backup cycle partial: some files were skipped");
                     had_partial = true;
                 }
                 if let Some(reason) = outcome.skipped {
-                    tracing::info!(repo = name, reason, "backup cycle skipped");
+                    if outcome.unavailable {
+                        tracing::warn!(repo = name, reason, "skipping unavailable repository");
+                    } else {
+                        tracing::info!(repo = name, reason, "backup cycle skipped");
+                    }
                     skipped += 1;
                     report.skipped.push(name.to_string());
                 } else {

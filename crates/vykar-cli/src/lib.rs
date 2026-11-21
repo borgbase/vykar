@@ -29,13 +29,12 @@ use std::sync::atomic::Ordering;
 use clap::Parser;
 
 use vykar_core::app::operations;
+use vykar_core::app::preflight::UnavailableRepo;
 use vykar_core::config::{self, ResolvedRepo};
 
 use crate::cli::{Cli, Commands};
 use crate::config_gen::run_config_generate;
-use crate::dispatch::{
-    dispatch_command, local_repo_unavailable, run_default_actions, warn_if_untrusted_rest,
-};
+use crate::dispatch::{dispatch_command, run_default_actions, warn_if_untrusted_rest};
 use crate::error::{CliError, CliResult};
 use crate::resolve::{
     DiffDispatch, SnapshotDispatch, classify_diff_target, classify_snapshot_target, repo_name_at,
@@ -80,7 +79,7 @@ pub(crate) fn run_cli(cli: Cli) -> ExitCode {
         return code;
     }
 
-    run_all_repos(&cli, &repos, repo_selector.is_some())
+    run_all_repos(&cli, &repos)
 }
 
 /// `EnvFilter` directives appended to the `-v`-derived log filter
@@ -444,7 +443,7 @@ fn dispatch_snapshot(cli: &Cli, repos: &[&ResolvedRepo], snap: &str) -> ExitCode
 
 /// Run the command against every selected repository, aggregating the outcome:
 /// any hard error wins over a partial, which wins over success.
-fn run_all_repos(cli: &Cli, repos: &[&ResolvedRepo], repo_explicitly_selected: bool) -> ExitCode {
+fn run_all_repos(cli: &Cli, repos: &[&ResolvedRepo]) -> ExitCode {
     let multi = repos.len() > 1;
     let mut had_error = false;
     let mut had_partial = false;
@@ -452,21 +451,6 @@ fn run_all_repos(cli: &Cli, repos: &[&ResolvedRepo], repo_explicitly_selected: b
     for repo in repos {
         if signal::SHUTDOWN.load(Ordering::SeqCst) {
             break;
-        }
-
-        // Pre-flight: skip unavailable local repos in multi-repo bare
-        // command (no subcommand) when no explicit --repo was given.
-        // Subcommands like `init` must reach uninitialized repos normally.
-        if cli.command.is_none()
-            && multi
-            && !repo_explicitly_selected
-            && let Some(path) = local_repo_unavailable(repo)
-        {
-            eprintln!(
-                "Warning: skipping '{}' — repository not found at '{path}'",
-                repo.label_or_url(),
-            );
-            continue;
         }
 
         if multi {
@@ -508,9 +492,24 @@ fn run_all_repos(cli: &Cli, repos: &[&ResolvedRepo], repo_explicitly_selected: b
     ExitCode::SUCCESS
 }
 
+/// Run `action` inside the repo-level hooks for `command`. The CLI error is
+/// flattened to `VykarError::Other` to fit the core signature; only its text
+/// is used downstream, so the lost downcast info is immaterial.
+fn run_hooked(
+    repo: &ResolvedRepo,
+    command: &str,
+    action: impl FnOnce() -> CliResult<bool>,
+) -> CliResult<bool> {
+    operations::run_command_with_hooks(repo, command, || {
+        action().map_err(|e| vykar_types::error::VykarError::Other(e.to_string()))
+    })
+    .map_err(CliError::from)
+}
+
 /// Execute the CLI command (or default actions) against one repo.
 /// Returns `Ok(had_partial)` where `true` means backup had soft errors. A skip
-/// requested by a hook is reported here and counts as success.
+/// requested by a hook, or a bare cycle skipped because its local repository is
+/// unavailable, is reported here and counts as success.
 fn run_repo_command(cli: &Cli, repo: &ResolvedRepo) -> CliResult<bool> {
     warn_if_untrusted_rest(&repo.config, repo.label.as_deref());
 
@@ -521,19 +520,53 @@ fn run_repo_command(cli: &Cli, repo: &ResolvedRepo) -> CliResult<bool> {
                 // Backup: hooks handled by run_backup_selection in core
                 dispatch_command(cmd, repo, shutdown, cli.verbose)
             } else {
-                // Other commands: wrap with repo-level hooks via core. The closure
-                // flattens the CLI's CliError into VykarError::Other to match the
-                // library signature; display-only usage downstream makes the lost
-                // downcast info immaterial.
-                let run_action = || -> vykar_types::error::Result<bool> {
+                let result = run_hooked(repo, cmd.name(), || {
                     dispatch_command(cmd, repo, shutdown, cli.verbose)
-                        .map_err(|e| vykar_types::error::VykarError::Other(e.to_string()))
-                };
-                operations::run_command_with_hooks(repo, cmd.name(), run_action)
-                    .map_err(CliError::from)
+                });
+                match (result, cmd) {
+                    // Compact runs as its own hooked command once prune's lifecycle
+                    // has ended, as in the default cycle. A failed or skipped prune
+                    // does not compact, nor does one interrupted by a shutdown.
+                    (
+                        Ok(partial),
+                        Commands::Prune {
+                            compact: true,
+                            dry_run,
+                            ..
+                        },
+                    ) if !signal::SHUTDOWN.load(Ordering::SeqCst) => {
+                        run_hooked(repo, "compact", || {
+                            crate::cmd::compact::run_compact(
+                                &repo.config,
+                                repo.label.as_deref(),
+                                repo.config.compact.threshold,
+                                None,
+                                *dry_run,
+                                shutdown,
+                            )
+                            .map(|()| partial)
+                        })
+                    }
+                    (other, _) => other,
+                }
             }
         }
-        None => run_default_actions(repo, shutdown, cli.verbose, &cli.source).map(|o| o.partial),
+        None => {
+            // An explicitly selected repository runs and fails if it is missing.
+            let unavailable = if effective_repo_selector(cli).is_some() {
+                UnavailableRepo::Attempt
+            } else {
+                UnavailableRepo::Skip
+            };
+            run_default_actions(repo, shutdown, cli.verbose, &cli.source, unavailable).map(|o| {
+                if o.unavailable
+                    && let Some(reason) = &o.skipped
+                {
+                    eprintln!("Warning: skipping '{}' — {reason}", repo.label_or_url());
+                }
+                o.partial
+            })
+        }
     };
 
     match result {

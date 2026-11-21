@@ -6,6 +6,7 @@ use vykar_types::error::{Result, VykarError};
 pub(crate) mod check_state;
 pub mod operations;
 pub mod passphrase;
+pub mod preflight;
 pub mod scheduler;
 pub mod views;
 

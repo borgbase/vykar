@@ -58,6 +58,25 @@ pub fn cmd_append(path: &std::path::Path, value: &str) -> String {
     }
 }
 
+/// Hook command that renames `from` to `to`, as a mount would make a
+/// repository appear.
+pub fn cmd_rename(from: &std::path::Path, to: &std::path::Path) -> String {
+    #[cfg(windows)]
+    {
+        let q = |p: &std::path::Path| p.display().to_string().replace('\'', "''");
+        format!(
+            "Move-Item -LiteralPath '{}' -Destination '{}'",
+            q(from),
+            q(to)
+        )
+    }
+
+    #[cfg(not(windows))]
+    {
+        format!("mv '{}' '{}'", from.display(), to.display())
+    }
+}
+
 /// Tests that mutate process-global state (CWD, env vars) must hold this lock.
 /// Shared across all test modules (inode_walk, resolve, etc.).
 pub static CWD_LOCK: Mutex<()> = Mutex::new(());

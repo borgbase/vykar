@@ -308,8 +308,9 @@ pub(crate) fn record_cycle_start(status: &SharedStatus) {
     };
 }
 
-/// `all_skipped` means every attempted repo was skipped by a hook, so the cycle
-/// produced no backups and must not read as `ok`.
+/// `all_skipped` means every attempted repo was skipped by a hook or because its
+/// repository was unavailable, so the cycle produced no backups and must not
+/// read as `ok`.
 fn cycle_outcome(had_error: bool, had_partial: bool, all_skipped: bool) -> &'static str {
     if had_error {
         "errors"

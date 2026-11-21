@@ -10,7 +10,7 @@ use vykar_common::display::format_bytes;
 use vykar_types::error::VykarError;
 
 use super::WorkerContext;
-use super::shared::{OpGuard, with_repo_op};
+use super::shared::{OpGuard, with_hooked_repo_op, with_repo_op};
 
 pub(super) fn handle_restore_selected(
     ctx: &mut WorkerContext,
@@ -295,7 +295,7 @@ pub(super) fn handle_diff_snapshots(
 }
 
 pub(super) fn handle_prune_repo(ctx: &mut WorkerContext, repo_name: String) {
-    let Ok((stats, _)) = with_repo_op(
+    let Ok((stats, _)) = with_hooked_repo_op(
         ctx,
         &repo_name,
         "Pruning snapshots...",
@@ -419,4 +419,106 @@ pub(super) fn handle_find_files(ctx: &mut WorkerContext, repo_name: String, name
         ),
     );
     let _ = ctx.ui_tx.send(UiEvent::FindResultsData { groups });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::worker::test_support::{Harness, cmd_append, drain, harness};
+
+    fn yaml_str(s: &str) -> String {
+        format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+    }
+
+    /// A worker over an initialized plaintext repo `nas` with one source and
+    /// the given global hooks.
+    fn prune_harness(hooks: &[(&str, String)]) -> Harness {
+        let h = harness(|tmp| {
+            let source = tmp.join("source");
+            std::fs::create_dir_all(&source).unwrap();
+            std::fs::write(source.join("a.txt"), b"a").unwrap();
+            let hooks = hooks
+                .iter()
+                .map(|(k, v)| format!("  {k}: {}\n", yaml_str(v)))
+                .collect::<Vec<_>>()
+                .concat();
+            format!(
+                "repositories:\n  - url: {}\n    label: nas\n\
+                 encryption:\n  mode: none\n\
+                 cache_dir: {}\n\
+                 retention:\n  keep_last: 1\n\
+                 hooks:\n{hooks}\
+                 sources:\n  - path: {}\n    label: src\n",
+                yaml_str(&tmp.join("repo").display().to_string()),
+                yaml_str(&tmp.join("cache").display().to_string()),
+                yaml_str(&source.display().to_string()),
+            )
+        });
+        commands::init::run(&h.ctx.runtime.repos.first().unwrap().config, None).unwrap();
+        h
+    }
+
+    #[test]
+    fn prune_runs_prune_hooks() {
+        let log = tempfile::tempdir().unwrap();
+        let log = log.path().join("hooks.log");
+        let mut h = prune_harness(&[
+            ("before_prune", cmd_append(&log, "before_prune")),
+            ("after_prune", cmd_append(&log, "after_prune")),
+            ("finally_prune", cmd_append(&log, "finally_prune")),
+        ]);
+
+        handle_prune_repo(&mut h.ctx, "nas".into());
+        let (logs, errors) = drain(&h.ui_rx);
+
+        let lines: Vec<String> = std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(|l| l.trim().to_string())
+            .collect();
+        assert_eq!(lines, ["before_prune", "after_prune", "finally_prune"]);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(logs.iter().any(|l| l.contains("Pruned")), "{logs:?}");
+        assert!(h.tmp.path().join("cache").exists());
+    }
+
+    #[test]
+    fn prune_hook_skip_is_logged_not_failed() {
+        let mut h = prune_harness(&[("before_prune", "exit 75".to_string())]);
+
+        handle_prune_repo(&mut h.ctx, "nas".into());
+        let (logs, errors) = drain(&h.ui_rx);
+
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(
+            logs.iter()
+                .any(|l| l.contains("prune skipped") && l.contains("requested skip")),
+            "{logs:?}"
+        );
+        assert!(!logs.iter().any(|l| l.contains("Pruned")), "{logs:?}");
+    }
+
+    #[test]
+    fn prune_after_hook_failure_is_a_logged_warning() {
+        let mut h = prune_harness(&[("after_prune", "exit 3".to_string())]);
+
+        handle_prune_repo(&mut h.ctx, "nas".into());
+        let (logs, errors) = drain(&h.ui_rx);
+
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(logs.iter().any(|l| l.contains("hook warning")), "{logs:?}");
+    }
+
+    #[test]
+    fn prune_before_hook_failure_fails_once() {
+        let mut h = prune_harness(&[("before_prune", "exit 3".to_string())]);
+
+        handle_prune_repo(&mut h.ctx, "nas".into());
+        let (_, errors) = drain(&h.ui_rx);
+
+        assert!(
+            matches!(errors.as_slice(), [e] if e.contains("prune failed")),
+            "{errors:?}"
+        );
+    }
 }

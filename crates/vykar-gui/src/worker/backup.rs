@@ -3,6 +3,7 @@ use std::sync::atomic::Ordering;
 
 use crossbeam_channel::Sender;
 use vykar_core::app::operations;
+use vykar_core::app::preflight::UnavailableRepo;
 use vykar_core::commands::backup::BackupProgressEvent;
 use vykar_core::config;
 use vykar_types::error::VykarError;
@@ -146,6 +147,7 @@ fn run_backup_cycle(ctx: &mut WorkerContext, scheduled: bool, only: Option<&[Str
             Some(&ctx.cancel_requested),
             false,
             &[],
+            UnavailableRepo::Skip,
             &mut |event| match &event {
                 operations::CycleEvent::StepStarted(step) => {
                     let _ = ui_tx_progress.send(UiEvent::Status(format!(
@@ -397,7 +399,10 @@ pub(super) fn handle_backup_source(ctx: &mut WorkerContext, source_label: String
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
+    use crate::worker::test_support::{self, Harness, drain};
 
     fn two_repos() -> Vec<config::ResolvedRepo> {
         let yaml = "repositories:\n  \
@@ -430,75 +435,24 @@ mod tests {
         );
     }
 
-    struct Harness {
-        ctx: WorkerContext,
-        ui_rx: crossbeam_channel::Receiver<UiEvent>,
-        _tmp: tempfile::TempDir,
-        // Held so sends on the context's channels keep succeeding.
-        _app_rx: crossbeam_channel::Receiver<AppCommand>,
-        _sched_rx: crossbeam_channel::Receiver<()>,
-    }
-
     /// A worker whose only repo does not exist, so anything past the `before`
-    /// hook would surface as an error.
+    /// hook would surface as an error (in a cycle, as an unavailable-repo skip).
     fn harness(before_backup: &str) -> Harness {
-        let tmp = tempfile::tempdir().unwrap();
-        let repo = tmp.path().join("volume").join("repo");
-        let source = tmp.path().join("source");
-        std::fs::create_dir_all(&source).unwrap();
-        let yaml = format!(
-            "repositories:\n  - url: '{}'\n    label: nas\n\
-             encryption:\n  mode: none\n\
-             hooks:\n  before_backup: {before_backup}\n\
-             sources:\n  - path: '{}'\n    label: src\n",
-            repo.display(),
-            source.display(),
-        );
-        let path = tmp.path().join("config.yaml");
-        std::fs::write(&path, yaml).unwrap();
-
-        let (ui_tx, ui_rx) = crossbeam_channel::unbounded();
-        let (app_tx, app_rx) = crossbeam_channel::unbounded();
-        let (sched_notify_tx, sched_rx) = crossbeam_channel::bounded(1);
-        let ctx = WorkerContext {
-            passphrases: HashMap::new(),
-            repo_info: HashMap::new(),
-            config_display_path: path.clone(),
-            runtime: vykar_core::app::RuntimeConfig {
-                repos: config::load_and_resolve(&path).unwrap(),
-                source: config::ConfigSource::CliArg(path),
-            },
-            app_tx,
-            ui_tx,
-            sched_notify_tx,
-            scheduler: Default::default(),
-            backup_running: Default::default(),
-            operation_running: Default::default(),
-            cancel_requested: Default::default(),
-            scheduler_lock_held: true,
-            schedule_paused: false,
-            mount: None,
-        };
-        Harness {
-            ctx,
-            ui_rx,
-            _tmp: tmp,
-            _app_rx: app_rx,
-            _sched_rx: sched_rx,
-        }
-    }
-
-    /// Log lines and red-status messages emitted so far.
-    fn drain(rx: &crossbeam_channel::Receiver<UiEvent>) -> (Vec<String>, Vec<String>) {
-        let (mut logs, mut errors) = (Vec::new(), Vec::new());
-        for event in rx.try_iter() {
-            match event {
-                UiEvent::LogEntry { message, .. } => logs.push(message),
-                UiEvent::ErrorStatus(message) => errors.push(message),
-                _ => {}
-            }
-        }
-        (logs, errors)
+        test_support::harness(|tmp| {
+            let repo = tmp.join("volume").join("repo");
+            let source = tmp.join("source");
+            std::fs::create_dir_all(&source).unwrap();
+            format!(
+                "repositories:\n  - url: '{}'\n    label: nas\n\
+                 encryption:\n  mode: none\n\
+                 cache_dir: '{}'\n\
+                 hooks:\n  before_backup: {before_backup}\n\
+                 sources:\n  - path: '{}'\n    label: src\n",
+                repo.display(),
+                tmp.join("cache").display(),
+                source.display(),
+            )
+        })
     }
 
     type Handler = fn(&mut WorkerContext);
@@ -543,23 +497,128 @@ mod tests {
         }
     }
 
-    /// With the hook passing, the probe runs inside the cycle: an unavailable
-    /// repo fails the backup step once and the later steps stay quiet.
+    const FIXTURE_HOOKS: [&str; 4] = [
+        "before_backup",
+        "after_backup",
+        "failed_backup",
+        "finally_backup",
+    ];
+
+    /// YAML single-quoted scalar.
+    fn quoted(value: &str) -> String {
+        format!("'{}'", value.replace('\'', "''"))
+    }
+
+    /// The shared unavailable-repository fixture: `nas` at `<tmp>/volume/repo`
+    /// (not created), with every backup hook appending its name to
+    /// `<tmp>/hooks.log`. `before_backup` replaces that hook's command.
+    fn unavailable_harness(before_backup: Option<&dyn Fn(&Path) -> String>) -> Harness {
+        test_support::harness(|tmp| {
+            let source = tmp.join("source");
+            std::fs::create_dir_all(&source).unwrap();
+            std::fs::write(source.join("a.txt"), b"data").unwrap();
+            let log = tmp.join("hooks.log");
+            let hooks = FIXTURE_HOOKS
+                .iter()
+                .map(|name| {
+                    let cmd = match before_backup {
+                        Some(build) if *name == "before_backup" => build(tmp),
+                        _ => test_support::cmd_append(&log, name),
+                    };
+                    format!("  {name}: {}\n", quoted(&cmd))
+                })
+                .collect::<Vec<_>>()
+                .concat();
+            format!(
+                "repositories:\n  - url: {}\n    label: nas\n\
+                 encryption:\n  mode: none\n\
+                 cache_dir: {}\n\
+                 hooks:\n{hooks}\
+                 sources:\n  - path: {}\n    label: src\n",
+                quoted(&tmp.join("volume").join("repo").display().to_string()),
+                quoted(&tmp.join("cache").display().to_string()),
+                quoted(&source.display().to_string()),
+            )
+        })
+    }
+
+    fn hook_log(h: &Harness) -> Vec<String> {
+        std::fs::read_to_string(h.tmp.path().join("hooks.log"))
+            .unwrap_or_default()
+            .lines()
+            .map(|l| l.trim().to_string())
+            .collect()
+    }
+
+    /// An unavailable repository in a cycle is skipped after its `before`
+    /// hooks, without a red status.
     #[test]
-    fn unavailable_repo_fails_the_cycle_once() {
-        let mut h = harness("exit 0");
+    fn unavailable_repo_is_skipped_after_hooks() {
+        let mut h = unavailable_harness(None);
         handle_backup_all(&mut h.ctx, true);
         let (logs, errors) = drain(&h.ui_rx);
 
-        assert_eq!(errors.len(), 1, "{errors:?}");
-        assert!(
-            errors
-                .iter()
-                .any(|e| e.contains("repository not available")),
-            "{errors:?}"
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(
+            logs.iter()
+                .filter(
+                    |l| l.contains("[nas] backup: skipped (repository not found at")
+                        && l.contains("vykar init")
+                )
+                .count(),
+            1,
+            "{logs:?}"
         );
-        assert!(logs.iter().any(|l| l.contains("drive not connected")));
-        assert_eq!(logs.iter().filter(|l| l.contains("FAILED")).count(), 1);
+        assert!(
+            !logs
+                .iter()
+                .any(|l| l.contains("FAILED") || l.contains("drive not connected")),
+            "{logs:?}"
+        );
+        assert_eq!(hook_log(&h), vec!["before_backup", "finally_backup"]);
+    }
+
+    /// "Back up" for one repository does not use the cycle and still fails.
+    #[test]
+    fn explicit_repo_backup_still_fails_when_unavailable() {
+        let mut h = unavailable_harness(None);
+        handle_backup_repo(&mut h.ctx, "nas".to_string());
+        let (_, errors) = drain(&h.ui_rx);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn before_hook_that_mounts_the_repository_runs_the_cycle() {
+        let mount = |tmp: &Path| {
+            format!(
+                "mv '{}' '{}'",
+                tmp.join("store").display(),
+                tmp.join("volume").display()
+            )
+        };
+        let mut h = unavailable_harness(Some(&mount));
+        let volume = h.tmp.path().join("volume");
+        std::fs::create_dir_all(volume.join("repo")).unwrap();
+        vykar_core::commands::init::run(&h.ctx.runtime.repos.first().unwrap().config, None)
+            .unwrap();
+        std::fs::rename(&volume, h.tmp.path().join("store")).unwrap();
+
+        handle_backup_all(&mut h.ctx, true);
+        let (logs, errors) = drain(&h.ui_rx);
+
+        assert!(errors.is_empty(), "{errors:?} {logs:?}");
+        assert!(
+            !logs
+                .iter()
+                .any(|l| l.contains("skipped (repository not found")),
+            "{logs:?}"
+        );
+        assert!(
+            hook_log(&h).iter().any(|l| l == "after_backup"),
+            "{:?}",
+            hook_log(&h)
+        );
     }
 
     #[test]

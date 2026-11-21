@@ -641,6 +641,8 @@ sources:
 
 Hooks only run for `backup`, `prune`, `check`, and `compact`. The bare form (`before`, `after`, etc.) fires for all four commands. The command-specific form (`before_backup`, `failed_prune`, etc.) fires only for that command and is only available at the global and per-repository levels — **not** in per-source hooks.
 
+The CLI, the daemon and the GUI all run them, including for the GUI's Prune action. `vykar prune --compact` runs the prune hooks around prune and then the compact hooks around compact, so `after_prune` fires before compact starts; if prune fails or is skipped, compact does not run. The bare `before`, `after`, `failed` and `finally` hooks run once for each of the two commands, first with `VYKAR_COMMAND=prune` and then with `VYKAR_COMMAND=compact`. A compact failure fires the compact `failed` hooks (bare `failed` and `failed_compact`), not `failed_prune`.
+
 ### Execution order
 
 1. `before` hooks run: global bare → repo bare → global specific → repo specific
@@ -683,14 +685,26 @@ What each surface reports:
 | Cycle, a later step skipped (e.g. `before_prune`) | Only that step is skipped |
 | One source skipped | Other sources continue, repository `after` hooks run, and the skip is reported |
 | Every selected source skipped | Treated as a repository-level skip: no repository `after` / `failed` hooks, `finally` hooks run |
-| Daemon | Logged at INFO. The cycle outcome is `skipped` only when every attempted repository skipped; otherwise it follows the repositories that ran. No early retry: the next attempt is the normal schedule |
+| Daemon | Logged at INFO (an [unavailable repository](#unavailable-local-repositories) at WARN). The cycle outcome is `skipped` only when every attempted repository skipped; otherwise it follows the repositories that ran. No early retry: the next attempt is the normal schedule |
 | GUI | Log line, no red status, no failure entry |
 
 > **Monitoring:** a skip exits `0`, so `vykar backup && ping` reports success even though no snapshot was created. Ping from an `after_backup` hook instead, which does not run on a skip.
 
 > **Daemon status refresh:** the status page is refreshed in the background and never delays the page or a backup cycle. A repository whose last cycle was skipped is not contacted until its next cycle runs. A repository that fails a status connect is marked `error` and not contacted again until its next cycle or a configuration reload (`SIGHUP`). Status calls do not retry. One case remains: without `on_startup`, each repository gets one status connect attempt at startup, because its hook has not run yet. Each row on the page shows its state (`pending`, `ok`, `skipped`, `error`) and when it was last refreshed.
 
-> **Passphrases:** the CLI and daemon resolve the passphrase before hooks run. That does not connect to the repository, but a `passcommand` that needs the network can still fail before a skip hook gets to run. GUI scheduled cycles run `before` hooks first.
+> **Passphrases:** the CLI and daemon resolve the passphrase before hooks run. That does not connect to the repository, but a `passcommand` that needs the network can still fail before a skip hook gets to run. GUI scheduled cycles run `before` hooks first. For a local repository that is missing when a cycle starts, the CLI and daemon resolve the passphrase in that cycle after the `before` hooks, once a hook has made the repository available, and a failure to resolve it then is reported as a failed backup step (so `failed` and `finally` hooks run); a repository that stays missing is skipped without one. The daemon still validates every passphrase source at startup and on reload.
+
+### Unavailable local repositories
+
+In the default `vykar` cycle, in daemon cycles and in GUI backup cycles, a local repository whose `config` file is missing is skipped, in single-repository and multi-repository configs alike. That covers an unplugged drive, an unmounted share (an empty mount point) and a path that was never initialized.
+
+- The check runs after the backup step's `before` hooks, so a `before_backup` hook may mount the repository first.
+- The skip behaves like a [hook skip](#skipping-a-run): `finally` hooks run, `after` and `failed` hooks do not, and `prune`, `compact` and `check` are skipped.
+- Because `before` hooks run first, a `before` hook that exits non-zero because the drive is absent (for example `mountpoint -q /mnt/backup`) makes the step fail: `failed` and `finally` hooks run, and the run reports an error. A guard hook that should skip instead must exit `75`, e.g. `mountpoint -q /mnt/backup || exit 75`.
+- The CLI prints `Warning: skipping '<repository>' — repository not found at '<path>' …` and exits `0`; the daemon logs it at WARN and records the repository as `skipped`; the GUI logs it, with no red status.
+- With `-R`, the cycle runs and fails as usual. `vykar backup` and the other subcommands, and the GUI's per-repository and per-source backup, are not affected.
+
+> **Monitoring:** this skip exits `0`, like a hook skip. Ping from an `after_backup` hook to notice that no snapshot was created.
 
 ### Hook variables
 

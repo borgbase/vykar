@@ -6,7 +6,7 @@
 //!
 //! - `Configure` at startup and on reload,
 //! - `CycleDone` after each backup cycle, naming the repos that ran and the
-//!   repos a hook (or the local-repo preflight) skipped.
+//!   repos skipped by a hook or because they were unavailable.
 //!
 //! A skipped repo is not contacted until its next cycle runs. A repo whose
 //! status fetch or poll fails is marked `error` and is likewise left alone

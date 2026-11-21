@@ -428,6 +428,107 @@ fn cli_prune_list_source_filter_and_mutation() {
     assert!(list_after.contains(&snap_b1));
 }
 
+/// `write_sources_config` with a global `hooks:` block of `(key, command)`.
+#[cfg(unix)]
+fn write_hooked_sources_config(fx: &CliFixture, hooks: &[(&str, String)]) {
+    write_sources_config(&fx.config_path, &fx.repo_dir, &fx.source_a, &fx.source_b, 1);
+    let mut config = std::fs::read_to_string(&fx.config_path).unwrap();
+    config.push_str("hooks:\n");
+    for (key, cmd) in hooks {
+        let quoted = format!("\"{}\"", cmd.replace('\\', "\\\\").replace('"', "\\\""));
+        config.push_str(&format!("  {key}: {quoted}\n"));
+    }
+    std::fs::write(&fx.config_path, config).unwrap();
+}
+
+#[test]
+#[cfg(unix)]
+fn cli_prune_compact_runs_compact_hooks() {
+    let fx = CliFixture::new();
+    write_sources_config(&fx.config_path, &fx.repo_dir, &fx.source_a, &fx.source_b, 1);
+    std::fs::write(fx.source_a.join("a.txt"), b"a-v1").unwrap();
+    let cfg = fx.config_path.to_string_lossy().to_string();
+    fx.run_ok(&["--config", &cfg, "init"]);
+    fx.run_ok(&["--config", &cfg, "backup", "--source", "src-a"]);
+    std::fs::write(fx.source_a.join("a.txt"), b"a-v2").unwrap();
+    fx.run_ok(&["--config", &cfg, "backup", "--source", "src-a"]);
+
+    // Hooks are added only now, so the setup backups do not log.
+    let log = fx.home_dir.join("hooks.log");
+    let append = |word: &str| format!("echo {word} >> '{}'", log.display());
+    write_hooked_sources_config(
+        &fx,
+        &[
+            ("before", append("before:$VYKAR_COMMAND")),
+            ("after", append("after:$VYKAR_COMMAND")),
+            ("finally", append("finally:$VYKAR_COMMAND")),
+            ("before_compact", append("before_compact")),
+        ],
+    );
+
+    let out = fx.run_ok(&["--config", &cfg, "prune", "--compact"]);
+    assert!(out.contains("Pruned 1 snapshots"), "{out}");
+
+    let lines: Vec<String> = std::fs::read_to_string(&log)
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            "before:prune",
+            "after:prune",
+            "finally:prune",
+            "before:compact",
+            "before_compact",
+            "after:compact",
+            "finally:compact",
+        ]
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn cli_prune_compact_skipped_prune_does_not_compact() {
+    let fx = CliFixture::new();
+    let marker = fx.home_dir.join("compacted");
+    write_hooked_sources_config(
+        &fx,
+        &[
+            ("before_prune", "exit 75".to_string()),
+            ("before_compact", format!("touch '{}'", marker.display())),
+        ],
+    );
+    let cfg = fx.config_path.to_string_lossy().to_string();
+    fx.run_ok(&["--config", &cfg, "init"]);
+
+    let output = fx.run(&["--config", &cfg, "prune", "--compact"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stderr(&output).contains("Skipped:"), "{}", stderr(&output));
+    assert!(!marker.exists());
+}
+
+#[test]
+#[cfg(unix)]
+fn cli_prune_compact_failed_prune_does_not_compact() {
+    let fx = CliFixture::new();
+    let marker = fx.home_dir.join("compacted");
+    write_hooked_sources_config(
+        &fx,
+        &[
+            ("before_prune", "exit 3".to_string()),
+            ("before_compact", format!("touch '{}'", marker.display())),
+        ],
+    );
+    let cfg = fx.config_path.to_string_lossy().to_string();
+    fx.run_ok(&["--config", &cfg, "init"]);
+
+    let output = fx.run(&["--config", &cfg, "prune", "--compact"]);
+    assert!(!output.status.success(), "{}", stderr(&output));
+    assert!(!marker.exists());
+}
+
 #[test]
 fn cli_snapshot_find_timeline_and_filters() {
     let fx = CliFixture::new();
@@ -1661,6 +1762,65 @@ fn cli_daemon_sighup_reloads_config() {
 
 #[test]
 #[cfg(unix)]
+fn cli_daemon_sighup_picks_up_changed_passphrase() {
+    let fx = CliFixture::new();
+    std::fs::write(fx.source_a.join("a.txt"), b"passphrase reload\n").unwrap();
+    let write_config = |passphrase: &str| {
+        let config = format!(
+            "repositories:\n  - url: {}\nencryption:\n  mode: aes256gcm\n  passphrase: {passphrase}\nsources:\n  - {}\nschedule:\n  enabled: true\n  every: \"2s\"\n  on_startup: true\n",
+            yaml_quote_path(&fx.repo_dir),
+            yaml_quote_path(&fx.source_a),
+        );
+        std::fs::write(&fx.config_path, config).unwrap();
+    };
+    let cfg = fx.config_path.to_string_lossy().to_string();
+
+    write_config("right");
+    fx.run_ok(&["--config", &cfg, "init"]);
+
+    write_config("wrong");
+    let (mut child, logs) = spawn_daemon(&fx, &cfg);
+    assert!(
+        logs.wait_for("backup cycle finished with errors", Duration::from_secs(20)),
+        "first cycle should fail with the wrong passphrase, got stderr:\n{}",
+        logs.snapshot()
+    );
+
+    write_config("right");
+    send_signal(&child, "-HUP");
+    let reload_marker = "configuration reloaded successfully";
+    assert!(
+        logs.wait_for(reload_marker, Duration::from_secs(20)),
+        "reload should succeed, got stderr:\n{}",
+        logs.snapshot()
+    );
+
+    // Only a cycle after the reload counts; without clearing the cache the
+    // daemon keeps the wrong passphrase it resolved first.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let succeeded_after_reload = loop {
+        let current = logs.snapshot();
+        let pos = current.find(reload_marker).unwrap();
+        if current[pos..].contains("backup cycle finished successfully") {
+            break true;
+        }
+        if std::time::Instant::now() > deadline {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+
+    send_signal(&child, "-TERM");
+    wait_for_exit(&mut child, 10);
+    assert!(
+        succeeded_after_reload,
+        "a cycle after the reload should succeed, got stderr:\n{}",
+        logs.snapshot()
+    );
+}
+
+#[test]
+#[cfg(unix)]
 fn cli_daemon_sighup_invalid_config_keeps_old() {
     let fx = CliFixture::new();
     let config = format!(
@@ -2238,21 +2398,324 @@ fn cli_bare_multi_repo_skips_missing_local() {
 }
 
 #[test]
-fn cli_bare_single_repo_missing_still_errors() {
+#[cfg(unix)]
+fn cli_bare_multi_repo_missing_local_runs_hooks_then_skips() {
+    let fx = CliFixture::new();
+    let repo_b = fx._tmp.path().join("repo_b");
+    write_two_repo_sources_config(
+        &fx.config_path,
+        &fx.repo_dir,
+        &repo_b,
+        &fx.source_a,
+        &fx.source_b,
+    );
+    std::fs::write(fx.source_a.join("a.txt"), b"aaa").unwrap();
+    let cfg = fx.config_path.to_string_lossy().to_string();
+    fx.run_ok(&["--config", &cfg, "init", "-R", "repo-a"]);
+
+    let log = fx._tmp.path().join("hooks.log");
+    let mut config = std::fs::read_to_string(&fx.config_path).unwrap();
+    config.push_str("hooks:\n");
+    for name in FIXTURE_HOOKS {
+        let cmd = format!("echo {name}:$VYKAR_LABEL >> '{}'", log.display());
+        config.push_str(&format!("  {name}: {}\n", yaml_single(&cmd)));
+    }
+    std::fs::write(&fx.config_path, config).unwrap();
+
+    let output = fx.run(&["--config", &cfg]);
+    let err = stderr(&output);
+    assert!(output.status.success(), "{err}");
+    assert!(err.contains("Warning: skipping 'repo-b'"), "{err}");
+    let repo_b_hooks: Vec<String> = hook_log(&log)
+        .into_iter()
+        .filter(|l| l.ends_with(":repo-b"))
+        .collect();
+    assert_eq!(
+        repo_b_hooks,
+        ["before_backup:repo-b", "finally_backup:repo-b"]
+    );
+}
+
+#[test]
+fn cli_bare_single_repo_missing_is_skipped() {
     let fx = CliFixture::new();
     let missing_repo = fx._tmp.path().join("nonexistent_repo");
-    // Single-repo config pointing to a non-existent directory
     write_plain_config(&fx.config_path, &missing_repo);
-
     let cfg = fx.config_path.to_string_lossy().to_string();
 
-    // Bare command with single repo — should error, not skip
     let output = fx.run(&["--config", &cfg]);
+    let err = stderr(&output);
     assert!(
-        !output.status.success(),
-        "single-repo with missing path should error, got status: {}",
+        output.status.success(),
+        "a missing single repo is skipped, got status: {}, stderr:\n{err}",
         output.status
     );
+    assert!(err.contains("skipping"), "{err}");
+    assert!(err.contains("repository not found at"), "{err}");
+    assert!(err.contains("vykar init"), "{err}");
+}
+
+#[test]
+fn cli_bare_single_repo_missing_with_repo_flag_errors() {
+    let fx = CliFixture::new();
+    let missing_repo = fx._tmp.path().join("nonexistent_repo");
+    std::fs::write(fx.source_a.join("a.txt"), b"aaa").unwrap();
+    let config = format!(
+        "repositories:\n  - url: {}\n    label: nas\nencryption:\n  mode: none\nsources:\n  - path: {}\n    label: src\n",
+        yaml_quote_path(&missing_repo),
+        yaml_quote_path(&fx.source_a)
+    );
+    std::fs::write(&fx.config_path, config).unwrap();
+    let cfg = fx.config_path.to_string_lossy().to_string();
+
+    let (_, err) = fx.run_err(&["--config", &cfg, "-R", "nas"]);
+    assert!(!err.contains("skipping"), "{err}");
+    assert!(
+        err.lines()
+            .any(|l| l.contains("backup") && l.contains("FAILED: repository not found at")),
+        "{err}"
+    );
+}
+
+/// YAML single-quoted scalar.
+#[cfg(unix)]
+fn yaml_single(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+#[cfg(unix)]
+const FIXTURE_HOOKS: [&str; 4] = [
+    "before_backup",
+    "after_backup",
+    "failed_backup",
+    "finally_backup",
+];
+
+/// The shared unavailable-repository fixture: `nas` at `<tmp>/volume/repo`
+/// (not created), one source with one file, and every backup hook appending its
+/// name to the returned `<tmp>/hooks.log`. `before_backup` replaces that hook's
+/// command; `encryption` and `extra` are YAML blocks spliced in as given.
+#[cfg(unix)]
+fn write_unavailable_config(
+    fx: &CliFixture,
+    before_backup: Option<&str>,
+    encryption: &str,
+    extra: &str,
+) -> PathBuf {
+    let tmp = fx._tmp.path();
+    let log = tmp.join("hooks.log");
+    std::fs::write(fx.source_a.join("a.txt"), b"aaa").unwrap();
+    let hooks: String = FIXTURE_HOOKS
+        .iter()
+        .map(|name| {
+            let cmd = match before_backup {
+                Some(cmd) if *name == "before_backup" => cmd.to_string(),
+                _ => format!("echo {name} >> '{}'", log.display()),
+            };
+            format!("  {name}: {}\n", yaml_single(&cmd))
+        })
+        .collect();
+    let config = format!(
+        "repositories:\n  - url: {}\n    label: nas\nencryption:\n{encryption}hooks:\n{hooks}sources:\n  - path: {}\n    label: src\n{extra}",
+        yaml_single(&tmp.join("volume").join("repo").to_string_lossy()),
+        yaml_single(&fx.source_a.to_string_lossy()),
+    );
+    std::fs::write(&fx.config_path, config).unwrap();
+    log
+}
+
+#[cfg(unix)]
+fn hook_log(log: &Path) -> Vec<String> {
+    std::fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .map(|l| l.trim().to_string())
+        .collect()
+}
+
+#[cfg(unix)]
+const PLAIN: &str = "  mode: none\n";
+
+/// Initializes `<tmp>/volume/repo` and moves `volume` to `store`, returning
+/// a `before_backup` command that moves it back, as a mount would, and logs
+/// its name.
+#[cfg(unix)]
+fn init_then_unmount(fx: &CliFixture, cfg: &str) -> String {
+    let tmp = fx._tmp.path();
+    let volume = tmp.join("volume");
+    let store = tmp.join("store");
+    std::fs::create_dir_all(volume.join("repo")).unwrap();
+    fx.run_ok(&["--config", cfg, "init"]);
+    std::fs::rename(&volume, &store).unwrap();
+    format!(
+        "mv '{}' '{}' && echo before_backup >> '{}'",
+        store.display(),
+        volume.display(),
+        tmp.join("hooks.log").display()
+    )
+}
+
+#[test]
+#[cfg(unix)]
+fn cli_bare_unavailable_repo_runs_hooks_then_skips() {
+    let fx = CliFixture::new();
+    let log = write_unavailable_config(&fx, None, PLAIN, "");
+    let cfg = fx.config_path.to_string_lossy().to_string();
+
+    let output = fx.run(&["--config", &cfg]);
+    let err = stderr(&output);
+    assert!(output.status.success(), "{err}");
+    assert!(err.contains("Warning: skipping 'nas'"), "{err}");
+    assert!(err.contains("vykar init"), "{err}");
+    assert_eq!(hook_log(&log), vec!["before_backup", "finally_backup"]);
+}
+
+#[test]
+#[cfg(unix)]
+fn cli_bare_before_hook_that_mounts_the_repository_runs_the_backup() {
+    let fx = CliFixture::new();
+    let log = write_unavailable_config(&fx, None, PLAIN, "");
+    let cfg = fx.config_path.to_string_lossy().to_string();
+    let mount = init_then_unmount(&fx, &cfg);
+    write_unavailable_config(&fx, Some(&mount), PLAIN, "");
+
+    let output = fx.run(&["--config", &cfg]);
+    let (out, err) = (stdout(&output), stderr(&output));
+    assert!(output.status.success(), "{out}\n{err}");
+    assert!(out.contains("Snapshot created"), "{out}");
+    assert!(!err.contains("skipping"), "{err}");
+    assert!(hook_log(&log).iter().any(|l| l == "after_backup"));
+}
+
+#[test]
+#[cfg(unix)]
+fn cli_bare_unavailable_encrypted_repo_resolves_no_passphrase() {
+    let fx = CliFixture::new();
+    let marker = fx._tmp.path().join("pass-ran");
+    let encryption = format!(
+        "  mode: aes256gcm\n  passcommand: {}\n",
+        yaml_single(&format!("touch '{}' && echo secret", marker.display()))
+    );
+    let log = write_unavailable_config(&fx, None, &encryption, "");
+    let cfg = fx.config_path.to_string_lossy().to_string();
+
+    let output = fx.run(&["--config", &cfg]);
+    let err = stderr(&output);
+    assert!(output.status.success(), "{err}");
+    assert!(!marker.exists(), "passcommand ran for a missing repository");
+    assert_eq!(hook_log(&log), vec!["before_backup", "finally_backup"]);
+}
+
+/// `aes256gcm` with a passcommand that logs `pass` to the hook log.
+#[cfg(unix)]
+fn logging_passcommand(fx: &CliFixture) -> String {
+    let log = fx._tmp.path().join("hooks.log");
+    format!(
+        "  mode: aes256gcm\n  passcommand: {}\n",
+        yaml_single(&format!("echo pass >> '{}' && echo secret", log.display()))
+    )
+}
+
+#[test]
+#[cfg(unix)]
+fn cli_bare_mounted_encrypted_repo_resolves_passphrase_after_before_hooks() {
+    let fx = CliFixture::new();
+    let encryption = logging_passcommand(&fx);
+    let log = write_unavailable_config(&fx, None, &encryption, "");
+    let cfg = fx.config_path.to_string_lossy().to_string();
+    let mount = init_then_unmount(&fx, &cfg);
+    write_unavailable_config(&fx, Some(&mount), &encryption, "");
+    let _ = std::fs::remove_file(&log);
+
+    let output = fx.run(&["--config", &cfg]);
+    let (out, err) = (stdout(&output), stderr(&output));
+    assert!(output.status.success(), "{out}\n{err}");
+    assert!(out.contains("Snapshot created"), "{out}");
+    let lines = hook_log(&log);
+    assert_eq!(
+        lines.get(..3),
+        Some(&["before_backup", "pass", "after_backup"].map(String::from)[..]),
+        "{lines:?}"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn cli_bare_present_encrypted_repo_resolves_passphrase_before_hooks() {
+    let fx = CliFixture::new();
+    let encryption = logging_passcommand(&fx);
+    let log = write_unavailable_config(&fx, None, &encryption, "");
+    let cfg = fx.config_path.to_string_lossy().to_string();
+    std::fs::create_dir_all(fx._tmp.path().join("volume").join("repo")).unwrap();
+    fx.run_ok(&["--config", &cfg, "init"]);
+    let _ = std::fs::remove_file(&log);
+
+    let output = fx.run(&["--config", &cfg]);
+    let err = stderr(&output);
+    assert!(output.status.success(), "{err}");
+    let lines = hook_log(&log);
+    assert_eq!(
+        lines.get(..2),
+        Some(&["pass", "before_backup"].map(String::from)[..]),
+        "{lines:?}"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn cli_bare_mounted_encrypted_repo_passphrase_failure_fails_the_backup() {
+    let fx = CliFixture::new();
+    let encryption = logging_passcommand(&fx);
+    let log = write_unavailable_config(&fx, None, &encryption, "");
+    let cfg = fx.config_path.to_string_lossy().to_string();
+    let mount = init_then_unmount(&fx, &cfg);
+    let failing = format!(
+        "  mode: aes256gcm\n  passcommand: {}\n",
+        yaml_single(&format!("echo pass >> '{}' && exit 1", log.display()))
+    );
+    write_unavailable_config(&fx, Some(&mount), &failing, "");
+    let _ = std::fs::remove_file(&log);
+
+    let output = fx.run(&["--config", &cfg]);
+    let err = stderr(&output);
+    assert_eq!(output.status.code(), Some(1), "{err}");
+    assert!(
+        err.lines().any(|l| l.contains("backup")
+            && l.contains("FAILED: configuration error: passcommand failed")),
+        "{err}"
+    );
+    assert_eq!(
+        hook_log(&log),
+        ["before_backup", "pass", "failed_backup", "finally_backup"]
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn cli_daemon_skips_unavailable_single_repo() {
+    let fx = CliFixture::new();
+    let log = write_unavailable_config(
+        &fx,
+        None,
+        PLAIN,
+        "schedule:\n  enabled: true\n  every: \"1h\"\n  on_startup: true\n",
+    );
+    let cfg = fx.config_path.to_string_lossy().to_string();
+
+    let (mut child, logs) = spawn_daemon(&fx, &cfg);
+    let found = logs.wait_for("every repository was skipped", Duration::from_secs(15));
+    send_signal(&child, "-TERM");
+    wait_for_exit(&mut child, 10);
+    let out = logs.snapshot();
+
+    assert!(found, "{out}");
+    assert!(
+        out.lines().any(|l| l.contains("WARN")
+            && l.contains("skipping unavailable repository")
+            && l.contains("vykar init")),
+        "{out}"
+    );
+    assert_eq!(hook_log(&log), vec!["before_backup", "finally_backup"]);
 }
 
 #[test]

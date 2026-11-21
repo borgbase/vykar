@@ -4,7 +4,7 @@ use crossbeam_channel::Sender;
 use vykar_core::app::operations;
 use vykar_core::commands::backup::BackupProgressEvent;
 use vykar_core::config::{self, ResolvedRepo, SourceEntry};
-use vykar_types::error::Result;
+use vykar_types::error::{Result, VykarError};
 
 use crate::messages::UiEvent;
 use crate::progress::BackupStatusTracker;
@@ -199,6 +199,63 @@ pub(super) fn with_repo_op<T>(
         }
         Err(e) => {
             guard.fail(format!("[{repo_name}] {label} failed: {e}"));
+            Err(e.to_string())
+        }
+    }
+}
+
+/// [`with_repo_op`] for a hookable command: the repo-level hooks for `command`
+/// enclose the passphrase step and `run`, so a prompt appears only after the
+/// `before` hooks pass and a re-prompt does not re-run them. A hook skip or a
+/// dismissed prompt is logged and is not a failure; hook warnings are logged.
+pub(super) fn with_hooked_repo_op<T>(
+    ctx: &mut WorkerContext,
+    repo_name: &str,
+    status: impl Into<String>,
+    command: &'static str,
+    mut run: impl FnMut(&ResolvedRepo, Option<&str>, &AtomicBool) -> Result<T>,
+) -> std::result::Result<T, String> {
+    let mut guard = OpGuard::ui(
+        &ctx.ui_tx,
+        &ctx.cancel_requested,
+        &ctx.operation_running,
+        status,
+    );
+
+    let Some(repo) = select_repo_or_fail(&mut guard, &ctx.runtime.repos, repo_name) else {
+        return Err("repository not found".to_string());
+    };
+
+    let ui_tx = &ctx.ui_tx;
+    let cancel = &ctx.cancel_requested;
+    let passphrases = &mut ctx.passphrases;
+    let mut canceled = false;
+    let outcome = operations::run_command_with_hook_warnings(
+        repo,
+        command,
+        &mut |w| send_log(ui_tx, format!("[{repo_name}] hook warning: {w}")),
+        || match with_passphrase_retry(repo, passphrases, 3, |pass| run(repo, pass, cancel))? {
+            PassphraseRun::Ran(value) => Ok(value),
+            // A skip, so `finally` hooks run but `after` hooks do not.
+            PassphraseRun::Canceled => {
+                canceled = true;
+                Err(VykarError::Skipped(PASSPHRASE_CANCELLED.to_string()))
+            }
+        },
+    );
+
+    match outcome {
+        Ok(value) => Ok(value),
+        Err(VykarError::Skipped(_)) if canceled => {
+            send_log(ui_tx, format!("[{repo_name}] {PASSPHRASE_CANCELLED}"));
+            Err("passphrase required".to_string())
+        }
+        Err(VykarError::Skipped(reason)) => {
+            send_log(ui_tx, format!("[{repo_name}] {command} skipped: {reason}"));
+            Err(reason)
+        }
+        Err(e) => {
+            guard.fail(format!("[{repo_name}] {command} failed: {e}"));
             Err(e.to_string())
         }
     }

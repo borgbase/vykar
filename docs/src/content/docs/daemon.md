@@ -80,10 +80,10 @@ The flag takes a full `host:port` address. There is no implicit default — pass
 What the page shows:
 - Process info: hostname, pid, version, uptime, next scheduled run — the **earliest** across repositories, which is what the loop wakes at
 - Schedule summary (interval / cron expression / `Off`, or `per-repo` when repositories have different cadences)
-- Per-repository snapshot count, last snapshot time, total stored size, that repository's own next run (`Off` when its schedule is disabled), and a status: `pending` (not fetched yet), `ok`, `skipped` (its last cycle was skipped by a hook) or `error` (the last status fetch failed; the previous numbers are kept), with the time the row was last refreshed
+- Per-repository snapshot count, last snapshot time, total stored size, that repository's own next run (`Off` when its schedule is disabled), and a status: `pending` (not fetched yet), `ok`, `skipped` (its last cycle was skipped by a hook, or its repository was unavailable) or `error` (the last status fetch failed; the previous numbers are kept), with the time the row was last refreshed
 - The 10 most recent snapshots across all repositories
 - Configured sources and their target repositories
-- Last cycle: started/finished timestamps, duration, outcome (`ok` / `partial` / `errors` / `skipped`). `skipped` means every attempted repository was [skipped by a hook](/configuration#skipping-a-run)
+- Last cycle: started/finished timestamps, duration, outcome (`ok` / `partial` / `errors` / `skipped`). `skipped` means every attempted repository was [skipped by a hook](/configuration#skipping-a-run) or [unavailable](/configuration#unavailable-local-repositories)
 
 The page auto-refreshes every 30 seconds via a `<meta http-equiv="refresh">` tag — no JavaScript, no external assets, no cache. Repository data is refreshed in the background, so a slow or unreachable repository never delays the page or a backup cycle: after each cycle for the repositories that ran, on a SIGHUP reload for new or failed repositories, and when a 60-second check finds the set of snapshots changed (for example after a `delete` or `prune` from the CLI). At startup each repository is fetched once, after the first cycle when `on_startup` is set. Repositories in `skipped` or `error` are not contacted again until their next cycle. See [Daemon status refresh](/configuration#skipping-a-run).
 
@@ -126,6 +126,7 @@ Reload behavior:
 - `on_startup` is ignored on reload; every repository's next run is recalculated from its schedule relative to now
 - If the new config is **invalid** (parse error, empty repositories, no repository with `schedule.enabled: true`, passphrase validation failure), the daemon logs a warning and continues with the previous config
 - If the new config is **valid**, repos and schedules are replaced and the next run times are recalculated
+- Passphrases are resolved again from the new configuration on the next cycle. Without a reload the daemon keeps the passphrase it resolved first for each repository; after rotating a `passcommand` secret, send `SIGHUP`
 
 ## Ad-hoc backup via SIGUSR1
 

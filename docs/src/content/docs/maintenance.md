@@ -6,7 +6,7 @@ Running `vykar` with no subcommand, the [daemon](/daemon), and the desktop GUI a
 
 ## Prune old snapshots
 
-Apply the [retention policy](/configuration#retention) defined in your configuration to remove expired snapshots. Optionally `compact` the repository after pruning.
+Apply the [retention policy](/configuration#retention) defined in your configuration to remove expired snapshots. Optionally `compact` the repository after pruning. With `--compact`, the prune [hooks](/configuration#hooks) run around prune and the compact hooks then run around compact, as two separate runs; if prune fails or is skipped, compact does not run.
 
 ```bash
 # Preview which snapshots would be kept and pruned, with reasons

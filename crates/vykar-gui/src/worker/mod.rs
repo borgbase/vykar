@@ -17,6 +17,8 @@ mod config_cmds;
 mod mount;
 mod repo_info;
 mod shared;
+#[cfg(test)]
+mod test_support;
 
 pub(super) struct WorkerContext {
     pub(super) passphrases: HashMap<String, zeroize::Zeroizing<String>>,

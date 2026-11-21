@@ -7,7 +7,6 @@ use crate::error::CliResult;
 use crate::format::format_bytes;
 use crate::passphrase::with_repo_passphrase;
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_prune(
     config: &VykarConfig,
     label: Option<&str>,
@@ -15,7 +14,6 @@ pub(crate) fn run_prune(
     list: bool,
     sources: &[SourceEntry],
     source_filter: &[String],
-    compact: bool,
     shutdown: Option<&AtomicBool>,
 ) -> CliResult<()> {
     let (stats, list_entries) = with_repo_passphrase(config, label, |passphrase| {
@@ -57,17 +55,6 @@ pub(crate) fn run_prune(
 
     for w in &stats.warnings {
         eprintln!("warning: {w}");
-    }
-
-    if compact {
-        super::compact::run_compact(
-            config,
-            label,
-            config.compact.threshold,
-            None,
-            dry_run,
-            shutdown,
-        )?;
     }
 
     Ok(())

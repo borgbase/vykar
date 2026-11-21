@@ -5,13 +5,15 @@ use zeroize::Zeroizing;
 
 use crate::app::operations::{
     BackupRunEvent, CycleEvent, CycleStep, FullCycleResult, StepOutcome, run_backup_selection,
-    run_full_cycle_for_repo, run_full_cycle_with_passphrase_source, run_hooked_step,
+    run_command_with_hook_warnings, run_command_with_hooks, run_full_cycle_for_repo,
+    run_full_cycle_with_passphrase_source, run_hooked_step,
 };
+use crate::app::preflight::UnavailableRepo;
 use crate::config::{HooksConfig, ResolvedRepo, SourceHooksConfig};
-use crate::testutil::{cmd_append, env_word};
+use crate::testutil::{cmd_append, cmd_rename, env_word};
 use vykar_types::error::VykarError;
 
-use super::helpers::{init_repo, make_test_repo, resolved_repo, source_entry};
+use super::helpers::{init_repo, make_test_config, make_test_repo, resolved_repo, source_entry};
 
 #[test]
 fn run_backup_selection_rejects_empty_sources() {
@@ -218,7 +220,15 @@ fn local_repo(tmp: &tempfile::TempDir, labels: &[&str]) -> ResolvedRepo {
 }
 
 fn run_cycle(repo: &ResolvedRepo) -> FullCycleResult {
-    run_full_cycle_for_repo(repo, None, None, false, &[], &mut |_| {})
+    run_full_cycle_for_repo(
+        repo,
+        None,
+        None,
+        false,
+        &[],
+        UnavailableRepo::Skip,
+        &mut |_| {},
+    )
 }
 
 fn outcome(result: &FullCycleResult, step: CycleStep) -> &StepOutcome {
@@ -366,6 +376,7 @@ fn resolver_not_called_when_backup_is_skipped() {
         None,
         false,
         &[],
+        UnavailableRepo::Skip,
         &mut |_| {},
     );
 
@@ -392,6 +403,7 @@ fn resolver_runs_once_after_before_hooks() {
         None,
         false,
         &[],
+        UnavailableRepo::Skip,
         &mut |_| {},
     );
 
@@ -418,6 +430,7 @@ fn resolver_failure_is_reported_once_and_fires_failed_hooks() {
         None,
         false,
         &[],
+        UnavailableRepo::Skip,
         &mut |_| {},
     );
 
@@ -454,12 +467,156 @@ fn canceled_resolver_skips_the_cycle_without_failure() {
         None,
         false,
         &[],
+        UnavailableRepo::Skip,
         &mut |_| {},
     );
 
     assert!(!result.has_failures());
     assert_eq!(result.backup_skipped(), Some("passphrase prompt canceled"));
     assert_eq!(log_lines(&log), vec!["finally"]);
+}
+
+// ── Unavailable local repository ────────────────────────────────────────────
+
+/// A repository at `<tmp>/volume/repo` (not created) with one source, whose
+/// backup hooks append their own names to `log`.
+fn unavailable_fixture(tmp: &tempfile::TempDir, log: &std::path::Path) -> ResolvedRepo {
+    let src = tmp.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("a.txt"), b"data").unwrap();
+    let config = make_test_config(&tmp.path().join("volume").join("repo"));
+    let mut repo = resolved_repo(config, vec![source_entry(&src, "src")]);
+    let cmds: Vec<(&str, String)> = [
+        "before_backup",
+        "after_backup",
+        "failed_backup",
+        "finally_backup",
+    ]
+    .into_iter()
+    .map(|name| (name, cmd_append(log, name)))
+    .collect();
+    let pairs: Vec<(&str, &str)> = cmds.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    repo.repo_hooks = hooks(&pairs);
+    repo
+}
+
+fn run_counting(
+    repo: &ResolvedRepo,
+    unavailable: UnavailableRepo,
+    calls: &Cell<u32>,
+) -> FullCycleResult {
+    run_full_cycle_with_passphrase_source(
+        repo,
+        &mut || {
+            calls.set(calls.get() + 1);
+            Ok(None)
+        },
+        None,
+        false,
+        &[],
+        unavailable,
+        &mut |_| {},
+    )
+}
+
+#[test]
+fn cycle_skips_unavailable_repo_after_before_hooks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let log = tmp.path().join("hooks.log");
+    let repo = unavailable_fixture(&tmp, &log);
+    let calls = Cell::new(0);
+
+    let result = run_counting(&repo, UnavailableRepo::Skip, &calls);
+
+    assert_eq!(calls.get(), 0, "no passphrase for a missing repository");
+    assert!(result.repo_unavailable);
+    let reason = result.backup_skipped().expect("backup skipped");
+    assert!(
+        reason.contains("repository not found at") && reason.contains("vykar init"),
+        "{reason}"
+    );
+    assert_eq!(result.steps.len(), 4);
+    assert!(
+        result
+            .steps
+            .iter()
+            .all(|(_, o)| matches!(o, StepOutcome::Skipped(_))),
+        "{:?}",
+        result.steps
+    );
+    assert!(!result.has_failures());
+    assert!(result.backup_report.is_none());
+    assert_eq!(log_lines(&log), vec!["before_backup", "finally_backup"]);
+}
+
+#[test]
+fn cycle_with_attempt_fails_on_unavailable_repo() {
+    let tmp = tempfile::tempdir().unwrap();
+    let log = tmp.path().join("hooks.log");
+    let repo = unavailable_fixture(&tmp, &log);
+    let calls = Cell::new(0);
+
+    let result = run_counting(&repo, UnavailableRepo::Attempt, &calls);
+
+    assert!(matches!(
+        outcome(&result, CycleStep::Backup),
+        StepOutcome::Failed(_)
+    ));
+    assert!(!result.repo_unavailable);
+    let lines = log_lines(&log);
+    assert!(lines.iter().any(|l| l == "failed_backup"), "{lines:?}");
+    assert!(lines.iter().any(|l| l == "finally_backup"), "{lines:?}");
+    assert!(!lines.iter().any(|l| l == "after_backup"), "{lines:?}");
+}
+
+#[test]
+fn before_hook_that_mounts_the_repository_lets_the_backup_run() {
+    let tmp = tempfile::tempdir().unwrap();
+    let log = tmp.path().join("hooks.log");
+    let volume = tmp.path().join("volume");
+    let store = tmp.path().join("store");
+    let repo_dir = volume.join("repo");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+    init_repo(&repo_dir);
+    std::fs::rename(&volume, &store).unwrap();
+
+    let mut repo = unavailable_fixture(&tmp, &log);
+    let mount = cmd_rename(&store, &volume);
+    let after = cmd_append(&log, "after_backup");
+    let failed = cmd_append(&log, "failed_backup");
+    repo.repo_hooks = hooks(&[
+        ("before_backup", mount.as_str()),
+        ("after_backup", after.as_str()),
+        ("failed_backup", failed.as_str()),
+    ]);
+    let calls = Cell::new(0);
+
+    let result = run_counting(&repo, UnavailableRepo::Skip, &calls);
+
+    assert!(
+        matches!(outcome(&result, CycleStep::Backup), StepOutcome::Ok),
+        "{:?}",
+        result.steps
+    );
+    let report = result.backup_report.as_ref().expect("backup report");
+    assert_eq!(report.created.len(), 1);
+    assert!(!result.repo_unavailable);
+    assert_eq!(log_lines(&log), vec!["after_backup"]);
+}
+
+#[test]
+fn before_hook_skip_wins_over_unavailability() {
+    let tmp = tempfile::tempdir().unwrap();
+    let log = tmp.path().join("hooks.log");
+    let mut repo = unavailable_fixture(&tmp, &log);
+    repo.repo_hooks = hooks(&[("before_backup", CMD_SKIP)]);
+    let calls = Cell::new(0);
+
+    let result = run_counting(&repo, UnavailableRepo::Skip, &calls);
+
+    assert!(!result.repo_unavailable);
+    let reason = result.backup_skipped().expect("backup skipped");
+    assert!(reason.contains("requested skip"), "{reason}");
 }
 
 // ── Continuing past a failing source ────────────────────────────────────────
@@ -694,11 +851,19 @@ fn cycle_with_failed_source_reports_failure_and_skips_maintenance() {
     break_source(&mut repo, 0);
     let mut warnings = Vec::new();
 
-    let result = run_full_cycle_for_repo(&repo, None, None, false, &[], &mut |e| {
-        if let CycleEvent::StepWarning { step, message } = e {
-            warnings.push((step, message));
-        }
-    });
+    let result = run_full_cycle_for_repo(
+        &repo,
+        None,
+        None,
+        false,
+        &[],
+        UnavailableRepo::Skip,
+        &mut |e| {
+            if let CycleEvent::StepWarning { step, message } = e {
+                warnings.push((step, message));
+            }
+        },
+    );
 
     assert!(matches!(
         outcome(&result, CycleStep::Backup),
@@ -725,4 +890,29 @@ fn cycle_with_failed_source_reports_failure_and_skips_maintenance() {
             .any(|(s, m)| *s == CycleStep::Backup && m.contains("'gone'")),
         "{warnings:?}"
     );
+}
+
+// ── Standalone command hooks ────────────────────────────────────────────────
+
+#[test]
+fn command_hooks_report_warnings() {
+    let mut repo = make_test_repo("/tmp/repo", None);
+    repo.repo_hooks = hooks(&[("after_prune", "exit 1")]);
+    let mut seen = Vec::new();
+
+    let result = run_command_with_hook_warnings(&repo, "prune", &mut |w| seen.push(w), || Ok(7));
+
+    assert_eq!(result.unwrap(), 7);
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    assert!(seen[0].contains("exited with 1"), "{seen:?}");
+}
+
+#[test]
+fn command_hooks_wrapper_matches_reporting_variant() {
+    let mut repo = make_test_repo("/tmp/repo", None);
+    repo.repo_hooks = hooks(&[("before_prune", CMD_SKIP)]);
+
+    let result = run_command_with_hooks(&repo, "prune", || Ok(()));
+
+    assert!(matches!(result, Err(VykarError::Skipped(_))), "{result:?}");
 }

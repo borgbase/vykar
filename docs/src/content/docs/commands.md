@@ -78,4 +78,4 @@ With several repositories configured and no `-R`:
 
 `vykar backup` and the default `vykar` workflow can return `3` when a backup succeeds with skipped unreadable/missing files. `vykar restore --continue-on-error` returns `3` when it left out damaged files (see [Restore from a damaged repository](/restore#restore-from-a-damaged-repository)).
 
-A `before` hook that exits `75` [skips the run](/configuration#skipping-a-run), and that exits `0`. So `vykar backup && ping` reports success with no new snapshot; for monitoring, ping from an `after_backup` hook instead.
+A `before` hook that exits `75` [skips the run](/configuration#skipping-a-run), and that exits `0`. So `vykar backup && ping` reports success with no new snapshot; for monitoring, ping from an `after_backup` hook instead. The default `vykar` cycle also exits `0` when it skips an [unavailable local repository](/configuration#unavailable-local-repositories).

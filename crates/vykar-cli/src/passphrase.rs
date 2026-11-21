@@ -61,6 +61,15 @@ pub(crate) fn get_passphrase(
     Ok(pass)
 }
 
+/// Forget every cached passphrase, so the next lookup resolves from the
+/// current config. The daemon calls this after a successful reload.
+pub(crate) fn clear_passphrase_cache() {
+    PASSPHRASE_CACHE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clear();
+}
+
 pub(crate) fn get_init_passphrase(
     config: &VykarConfig,
     label: Option<&str>,
@@ -90,5 +99,41 @@ pub(crate) fn get_init_passphrase(
         // Unreachable from a terminal: `prompt_hidden` never reports a
         // cancellation (Ctrl-C terminates the process, EOF is an I/O error).
         InitPassphrase::Cancelled => Err(CliError::from("passphrase entry cancelled")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vykar_core::config::{EncryptionConfig, RepositoryConfig};
+
+    fn config(passphrase: &str) -> VykarConfig {
+        VykarConfig {
+            repository: RepositoryConfig {
+                url: "/test/passphrase-cache-clear".to_string(),
+                ..Default::default()
+            },
+            encryption: EncryptionConfig {
+                mode: EncryptionModeConfig::Aes256Gcm,
+                passphrase: Some(passphrase.to_string()),
+                passcommand: None,
+            },
+            ..Default::default()
+        }
+    }
+
+    fn lookup(passphrase: &str) -> String {
+        get_passphrase(&config(passphrase), None)
+            .unwrap()
+            .unwrap()
+            .to_string()
+    }
+
+    #[test]
+    fn clear_forgets_a_cached_passphrase() {
+        assert_eq!(lookup("old"), "old");
+        assert_eq!(lookup("new"), "old");
+        clear_passphrase_cache();
+        assert_eq!(lookup("new"), "new");
     }
 }

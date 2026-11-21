@@ -20,6 +20,7 @@ use vykar_types::error::{Result, VykarError};
 
 use crate::{ListedObject, StorageBackend};
 
+mod batch_delete;
 mod multipart;
 pub(crate) mod probe;
 
@@ -42,6 +43,9 @@ pub struct S3Backend {
     /// keeps a pack's buffer through its completion, so a store that accepts
     /// parts but refuses completions still gets the second attempt.
     multipart_proven: std::sync::atomic::AtomicBool,
+    /// Set once the endpoint answers DeleteObjects with NotImplemented; from
+    /// then on batch_delete_keys reports UnsupportedBackend without a request.
+    batch_delete_unsupported: std::sync::atomic::AtomicBool,
     request_width: usize,
     transfer_width: usize,
 }
@@ -97,6 +101,7 @@ impl S3Backend {
             soft_delete,
             part_slots: multipart::PartSlots::new(part_concurrency),
             multipart_proven: std::sync::atomic::AtomicBool::new(false),
+            batch_delete_unsupported: std::sync::atomic::AtomicBool::new(false),
             request_width: crate::remote_request_width(max_connections),
             transfer_width: crate::transfer_width(max_connections),
         })
@@ -510,7 +515,11 @@ impl StorageBackend for S3Backend {
         }
     }
 
-    crate::unsupported_server_ops!();
+    fn batch_delete_keys(&self, keys: &[String], _scope: crate::BatchDeleteScope) -> Result<()> {
+        self.delete_objects(keys)
+    }
+
+    crate::unsupported_server_ops!(except[batch_delete_keys]);
 }
 
 #[allow(clippy::result_large_err)]
@@ -640,7 +649,7 @@ mod tests {
     /// Draining is load-bearing on Windows: closing a socket with unread
     /// receive data triggers WSAECONNRESET (os error 10054) on the peer,
     /// which ureq surfaces as a transport error. Linux tolerates it.
-    fn read_request(reader: &mut BufReader<TcpStream>) -> (Vec<String>, Vec<u8>) {
+    pub(super) fn read_request(reader: &mut BufReader<TcpStream>) -> (Vec<String>, Vec<u8>) {
         let mut lines = Vec::new();
         let mut content_len = 0usize;
         let mut line = String::new();
@@ -732,6 +741,33 @@ mod tests {
                 let mut reader = BufReader::new(stream.try_clone().unwrap());
                 let (lines, _) = read_request(&mut reader);
                 captured_clone.lock().unwrap().push(lines);
+                stream.write_all(response.as_bytes()).unwrap();
+                stream.flush().unwrap();
+                drop(stream);
+            }
+        });
+        (port, captured, handle)
+    }
+
+    /// Multi-response mock that captures each request's header lines and body.
+    #[allow(clippy::type_complexity)]
+    pub(super) fn mock_server_capture_bodies(
+        responses: Vec<String>,
+    ) -> (
+        u16,
+        Arc<Mutex<Vec<(Vec<String>, Vec<u8>)>>>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let captured_clone = Arc::clone(&captured);
+        let handle = std::thread::spawn(move || {
+            for response in &responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let request = read_request(&mut reader);
+                captured_clone.lock().unwrap().push(request);
                 stream.write_all(response.as_bytes()).unwrap();
                 stream.flush().unwrap();
                 drop(stream);

@@ -709,7 +709,7 @@ pub(super) fn parse_s3_error_code(body: &str) -> Option<String> {
 
 /// S3 error `<Code>`s that should be retried (re-signed + re-sent) rather than
 /// treated as permanent. Extensible. `RequestTimeout` is a *retryable* HTTP 400.
-fn is_retryable_s3_code(code: &str) -> bool {
+pub(super) fn is_retryable_s3_code(code: &str) -> bool {
     matches!(
         code,
         "InternalError" | "SlowDown" | "ServiceUnavailable" | "RequestTimeout"
@@ -719,7 +719,7 @@ fn is_retryable_s3_code(code: &str) -> bool {
 /// Classify an S3 error response (status + parsed `<Code>`) for retry. Reads the
 /// retryable-code allowlist first, then falls back to status. Produces a bare
 /// detail message (no `S3 <op> <key>:` prefix — [`s3_error`] adds that).
-fn classify_s3_error(status: u16, code: Option<&str>) -> HttpRetryError {
+pub(super) fn classify_s3_error(status: u16, code: Option<&str>) -> HttpRetryError {
     let message = match code {
         Some(c) => format!("HTTP {status}: {c}"),
         None => format!("HTTP {status}"),

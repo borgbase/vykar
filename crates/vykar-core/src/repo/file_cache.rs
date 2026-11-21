@@ -5,10 +5,10 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
+use crate::cache_paths::repo_cache_dir;
 use crate::compress;
 use crate::platform::fs::path_starts_with;
 use crate::snapshot::item::ChunkRef;
-use vykar_common::paths;
 use vykar_crypto::CryptoEngine;
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::Result;
@@ -47,18 +47,6 @@ pub(crate) fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
 use super::format::{
     ObjectType, pack_object_streaming_with_context, unpack_object_expect_with_context,
 };
-
-/// Compute the per-repo cache directory.
-///
-/// With `cache_dir_override`: `<override>/<repo_id_hex>/`
-/// Without: `<platform_cache_dir>/vykar/<repo_id_hex>/`
-pub(crate) fn repo_cache_dir(repo_id: &[u8], cache_dir_override: Option<&Path>) -> Option<PathBuf> {
-    let base = match cache_dir_override {
-        Some(dir) => Some(dir.to_path_buf()),
-        None => paths::cache_dir().map(|d| d.join("vykar")),
-    };
-    base.map(|b| b.join(hex::encode(repo_id)))
-}
 
 /// 16-byte BLAKE3 hash of a file path, used as a compact HashMap key.
 /// `Ord` only serves the sorted retained-hit list (see `RetainedHit`).
@@ -2377,26 +2365,6 @@ mod tests {
             FileCache::decode_from_plaintext_outcome(&blob),
             CacheDecode::Rejected { .. }
         ));
-    }
-
-    #[test]
-    fn repo_cache_dir_default() {
-        let repo_id = [0xABu8; 32];
-        let dir = super::repo_cache_dir(&repo_id, None);
-        assert!(dir.is_some());
-        let d = dir.unwrap();
-        assert!(d.to_string_lossy().contains("vykar"));
-        assert!(d.to_string_lossy().contains(&hex::encode(repo_id)));
-    }
-
-    #[test]
-    fn repo_cache_dir_with_override() {
-        let repo_id = [0xCDu8; 32];
-        let temp = tempfile::tempdir().unwrap();
-        let override_root = temp.path().join("vykar-cache");
-        let dir = super::repo_cache_dir(&repo_id, Some(override_root.as_path())).unwrap();
-        assert!(dir.starts_with(&override_root));
-        assert!(dir.to_string_lossy().contains(&hex::encode(repo_id)));
     }
 
     /// Helper: build a ParentReuseIndex from a Vec<Item> using the builder.

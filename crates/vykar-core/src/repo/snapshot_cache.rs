@@ -5,7 +5,9 @@ use std::sync::{Mutex, OnceLock};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
-use super::file_cache::{atomic_write, repo_cache_dir};
+use crate::cache_paths::repo_cache_dir;
+
+use super::file_cache::atomic_write;
 use super::format::{ObjectType, pack_object_with_context, unpack_object_expect_with_context};
 use super::manifest::SnapshotEntry;
 use vykar_crypto::CryptoEngine;

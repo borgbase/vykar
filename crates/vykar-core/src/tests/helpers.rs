@@ -100,7 +100,7 @@ pub(crate) fn downgrade_to_legacy(
         rmp_serde::from_slice(&std::fs::read(repo_dir.join("config")).unwrap()).unwrap();
     config.version = legacy.version();
     std::fs::write(repo_dir.join("config"), rmp_serde::to_vec(&config).unwrap()).unwrap();
-    if let Some(dir) = crate::repo::file_cache::repo_cache_dir(&repo_id, Some(cache_dir))
+    if let Some(dir) = crate::cache_paths::repo_cache_dir(&repo_id, Some(cache_dir))
         && dir.exists()
     {
         std::fs::remove_dir_all(dir).unwrap();

@@ -545,7 +545,7 @@ mod tests {
         let cache = tempfile::tempdir().unwrap();
         let (inner, repo) = repo_with_caches(cache.path());
         let id = repo.config.id.clone();
-        let dir = crate::repo::file_cache::repo_cache_dir(&id, Some(cache.path())).unwrap();
+        let dir = crate::cache_paths::repo_cache_dir(&id, Some(cache.path())).unwrap();
         let old = std::time::SystemTime::now() - std::time::Duration::from_secs(25 * 3600);
         let stale_temp = dir.join(".full_index_cache.AbC123.tmp");
         let stale_legacy = dir.join("full_index_cache.merged");

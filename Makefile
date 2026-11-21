@@ -1,6 +1,7 @@
 .PHONY: \
 	app \
 	appimage \
+	boundaries \
 	doc-check \
 	docs-build \
 	docs-serve \
@@ -23,7 +24,10 @@ fmt:
 fmt-check:
 	cargo fmt --all -- --check
 
-lint:
+boundaries:
+	sh scripts/check-module-boundaries.sh
+
+lint: boundaries
 	cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 test:

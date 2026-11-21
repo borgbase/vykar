@@ -29,6 +29,7 @@ use super::format::{
     ObjectType, pack_object_streaming_with_context, pack_object_with_context,
     unpack_object_expect_with_context, unpack_object_expect_with_context_in_place,
 };
+use crate::cache_paths::TEMP_ANCHOR_FILE;
 use crate::compress;
 use crate::index::base;
 use crate::index::dedup_cache::{FullCacheWriter, MmapFullIndexCache, StateHash};
@@ -398,10 +399,6 @@ pub(crate) struct SyncedIndex {
     pub scratch: Option<TempPath>,
     pub source: SyncSource,
 }
-
-/// File name of the temp-file anchor, used for syncs that bypass the local
-/// cache and when there is no cache directory.
-pub(crate) const TEMP_ANCHOR_FILE: &str = "vykar-full-index-cache";
 
 /// Path of the anchor named by [`TEMP_ANCHOR_FILE`].
 fn temp_anchor() -> PathBuf {

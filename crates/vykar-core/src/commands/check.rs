@@ -3,6 +3,7 @@ mod repair_plan;
 mod runner;
 mod scan;
 mod server_verify;
+pub(crate) mod state;
 mod types;
 
 #[cfg(any(test, feature = "sim"))]

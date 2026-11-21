@@ -184,7 +184,7 @@ pub(crate) fn run_on_repo(
     let effective = if max_percent == 100 {
         100
     } else if let Some(ref interval) = full_every_dur {
-        if crate::app::check_state::full_check_is_due(
+        if super::state::full_check_is_due(
             &config.repository.url,
             &fingerprint,
             cache_dir,
@@ -309,7 +309,7 @@ pub(crate) fn run_on_repo(
 
     // Record full check timestamp if this was a 100% run and succeeded.
     if record_state && effective == 100 && result.errors.is_empty() {
-        crate::app::check_state::record_full_check(&config.repository.url, &fingerprint, cache_dir);
+        super::state::record_full_check(&config.repository.url, &fingerprint, cache_dir);
     }
 
     Ok(result)

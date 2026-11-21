@@ -11,6 +11,7 @@
 )]
 
 pub mod app;
+pub(crate) mod cache_paths;
 pub(crate) mod chunker;
 pub mod commands;
 pub mod compress;

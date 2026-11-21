@@ -1691,7 +1691,7 @@ fn interrupted_check_does_not_record_full_check() {
     );
     // Fingerprint is irrelevant with no state file: the lookup fails open.
     assert!(
-        crate::app::check_state::full_check_is_due(
+        crate::commands::check::state::full_check_is_due(
             &config.repository.url,
             "any-fingerprint",
             Some(&cancel_cache),

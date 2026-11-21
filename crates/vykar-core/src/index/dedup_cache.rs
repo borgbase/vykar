@@ -18,8 +18,8 @@ use tempfile::{NamedTempFile, TempPath};
 use tracing::{debug, info, warn};
 use xorf::{Filter, Xor8};
 
+use crate::cache_paths::repo_cache_dir;
 use crate::index::{ChunkIndex, ChunkIndexEntry, IndexDelta};
-use crate::repo::file_cache::repo_cache_dir;
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::Result;
 use vykar_types::pack_id::PackId;
@@ -213,7 +213,7 @@ fn sweep_stale_cache_temps_in(repo_cache_dir: Option<&Path>, temp_dir: Option<&P
     if let Some(dir) = temp_dir {
         swept.add(sweep_stale_temps_in(
             dir,
-            &[crate::repo::index_store::TEMP_ANCHOR_FILE],
+            &[crate::cache_paths::TEMP_ANCHOR_FILE],
             &[],
             STALE_TEMP_AGE,
         ));
@@ -2544,7 +2544,7 @@ mod tests {
     fn sweep_of_the_temp_dir_matches_only_the_anchor() {
         let cache = tempfile::tempdir().unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        let anchor = crate::repo::index_store::TEMP_ANCHOR_FILE;
+        let anchor = crate::cache_paths::TEMP_ANCHOR_FILE;
         let stale = tmp.path().join(format!(".{anchor}.AbC123.tmp"));
         let fresh = tmp.path().join(format!(".{anchor}.Fresh1.tmp"));
         let other = tmp.path().join(format!(".{anchor}-other.AbC123.tmp"));
@@ -2587,7 +2587,7 @@ mod tests {
         let all: Vec<&str> = CACHE_FILE_NAMES
             .iter()
             .copied()
-            .chain([crate::repo::index_store::TEMP_ANCHOR_FILE])
+            .chain([crate::cache_paths::TEMP_ANCHOR_FILE])
             .collect();
         for name in &all {
             let tmp = temp_file_beside(&dir.path().join(name)).unwrap();

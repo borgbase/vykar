@@ -803,9 +803,9 @@ fn restore_falls_back_to_index_when_cached_item_stream_location_is_wrong() {
 }
 
 /// A restore cache that holds every chunk but places the data chunk
-/// somewhere it is not: in a pack that no longer exists (what a cache left
-/// behind by another client's compaction looks like when the advisory
-/// `index.gen` was not updated), or at another blob's coordinates.
+/// somewhere it is not: in a pack that no longer exists (what a stale cache
+/// left behind by another client's compaction looks like), or at another
+/// blob's coordinates.
 #[test]
 fn restore_re_resolves_data_chunks_the_cache_places_wrongly() {
     for (gone_pack, continue_on_error) in
@@ -1031,21 +1031,13 @@ impl InnerBackend for IndexGetCounter {
 
 vykar_storage::delegate_storage_backend! {
     for IndexGetCounter;
-    except [get, get_if_changed];
+    except [get];
 
     fn get(&self, key: &str) -> vykar_types::error::Result<Option<Vec<u8>>> {
         if key == "index" {
             self.index_gets.fetch_add(1, Ordering::Relaxed);
         }
         self.inner.get(key)
-    }
-
-    fn get_if_changed(
-        &self,
-        key: &str,
-        _known: &[u8; 32],
-    ) -> vykar_types::error::Result<vykar_storage::ConditionalGet> {
-        vykar_storage::get_unconditionally(self, key)
     }
 }
 

@@ -78,6 +78,19 @@ impl Fixture {
         self.open_with_cache(self.root.join(name))
     }
 
+    /// Open a v2/v3 fixture as `vykar upgrade` does: without the index, with
+    /// the fixture's cache dir.
+    pub fn open_legacy(&self) -> Repository {
+        let storage = Box::new(LocalBackend::new(self.repo_dir().to_str().unwrap()).unwrap());
+        Repository::open(
+            storage,
+            self.passphrase(),
+            Some(self.cache_dir()),
+            OpenOptions::new().legacy_format(),
+        )
+        .unwrap()
+    }
+
     fn open_with_cache(&self, cache: PathBuf) -> Repository {
         let storage = Box::new(LocalBackend::new(self.repo_dir().to_str().unwrap()).unwrap());
         Repository::open(

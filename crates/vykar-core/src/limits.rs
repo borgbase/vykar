@@ -122,28 +122,13 @@ impl InnerBackend for ThrottledStorageBackend {
 delegate_storage_backend! {
     for ThrottledStorageBackend;
     except [
-        get, get_if_changed, put, get_range, get_range_into, open_range, put_owned, put_pack,
-        begin_staged_put, profile
+        get, put, get_range, get_range_into, open_range, put_owned, put_pack, begin_staged_put,
+        profile
     ];
 
     fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
         let out = self.inner.get(key)?;
         if let (Some(limiter), Some(data)) = (self.read_limiter.as_ref(), out.as_ref()) {
-            limiter.consume(data.len());
-        }
-        Ok(out)
-    }
-
-    // A 304 moves no body, so it charges nothing.
-    fn get_if_changed(
-        &self,
-        key: &str,
-        known_blake3: &[u8; 32],
-    ) -> Result<vykar_storage::ConditionalGet> {
-        let out = self.inner.get_if_changed(key, known_blake3)?;
-        if let (Some(limiter), vykar_storage::ConditionalGet::Fetched(Some(data))) =
-            (self.read_limiter.as_ref(), &out)
-        {
             limiter.consume(data.len());
         }
         Ok(out)
@@ -568,109 +553,6 @@ mod tests {
         wrapped.put_pack("packs/00/x", data).unwrap();
         assert_eq!(pack_calls.load(Ordering::SeqCst), 1);
         assert_eq!(released.load(Ordering::SeqCst), 1);
-    }
-
-    /// Leaf for the conditional-GET tests: `index` is "unchanged", any other
-    /// key is fetched with a 5-byte body.
-    struct ConditionalRecorder {
-        get_calls: Arc<std::sync::atomic::AtomicUsize>,
-        cond_calls: Arc<std::sync::atomic::AtomicUsize>,
-    }
-
-    impl StorageBackend for ConditionalRecorder {
-        fn get(&self, _key: &str) -> Result<Option<Vec<u8>>> {
-            self.get_calls
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(None)
-        }
-        fn get_if_changed(
-            &self,
-            key: &str,
-            _known: &[u8; 32],
-        ) -> Result<vykar_storage::ConditionalGet> {
-            self.cond_calls
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(if key == "index" {
-                vykar_storage::ConditionalGet::Unchanged
-            } else {
-                vykar_storage::ConditionalGet::Fetched(Some(vec![7; 5]))
-            })
-        }
-        fn put(&self, _key: &str, _data: &[u8]) -> Result<()> {
-            Ok(())
-        }
-        fn delete(&self, _key: &str) -> Result<()> {
-            Ok(())
-        }
-        fn exists(&self, _key: &str) -> Result<bool> {
-            Ok(false)
-        }
-        fn list(&self, _prefix: &str) -> Result<Vec<String>> {
-            Ok(Vec::new())
-        }
-        fn get_range(&self, _key: &str, _offset: u64, _length: u64) -> Result<Option<Vec<u8>>> {
-            Ok(None)
-        }
-        fn create_dir(&self, _key: &str) -> Result<()> {
-            Ok(())
-        }
-        fn profile(&self) -> vykar_storage::BackendProfile {
-            vykar_storage::BackendProfile {
-                local: false,
-                staged_put: false,
-                request_width: 1,
-                transfer_width: 1,
-            }
-        }
-
-        vykar_storage::unsupported_server_ops!();
-    }
-
-    /// The conditional read reaches the inner `get_if_changed`, not `get`.
-    #[test]
-    fn throttled_backend_forwards_conditional_get() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        let get_calls = Arc::new(AtomicUsize::new(0));
-        let cond_calls = Arc::new(AtomicUsize::new(0));
-        let inner = Box::new(ConditionalRecorder {
-            get_calls: Arc::clone(&get_calls),
-            cond_calls: Arc::clone(&cond_calls),
-        });
-        let limits = ResourceLimitsConfig {
-            download_mib_per_sec: 1,
-            ..ResourceLimitsConfig::default()
-        };
-        let wrapped = wrap_storage_backend(inner, &limits);
-
-        assert_eq!(
-            wrapped.get_if_changed("index", &[0; 32]).unwrap(),
-            vykar_storage::ConditionalGet::Unchanged
-        );
-        assert_eq!(cond_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(get_calls.load(Ordering::SeqCst), 0);
-    }
-
-    /// A fetched body is charged like a `get`; a 304 moves nothing and is free.
-    #[test]
-    fn throttled_conditional_get_charges_only_fetched_bodies() {
-        use std::sync::atomic::AtomicUsize;
-
-        let limiter = Arc::new(ByteRateLimiter::new(1 << 30));
-        let throttled = ThrottledStorageBackend {
-            inner: Box::new(ConditionalRecorder {
-                get_calls: Arc::new(AtomicUsize::new(0)),
-                cond_calls: Arc::new(AtomicUsize::new(0)),
-            }),
-            read_limiter: Some(Arc::clone(&limiter)),
-            write_limiter: None,
-        };
-        let consumed = || limiter.state.lock().unwrap().bytes_consumed;
-
-        throttled.get_if_changed("index", &[0; 32]).unwrap();
-        assert_eq!(consumed(), 0);
-        throttled.get_if_changed("config", &[0; 32]).unwrap();
-        assert_eq!(consumed(), 5);
     }
 
     /// The throttle keeps packs on its `put` path, so its profile must not

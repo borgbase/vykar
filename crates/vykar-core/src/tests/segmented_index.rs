@@ -31,15 +31,11 @@ impl InnerBackend for OpLog {
 
 delegate_storage_backend! {
     for OpLog;
-    except [get, get_if_changed, list, list_sized, list_tree_sized];
+    except [get, list, list_sized, list_tree_sized];
 
     fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
         self.ops.lock().unwrap().push(format!("get {key}"));
         self.inner.get(key)
-    }
-
-    fn get_if_changed(&self, key: &str, _known: &[u8; 32]) -> Result<vykar_storage::ConditionalGet> {
-        vykar_storage::get_unconditionally(self, key)
     }
 
     fn list(&self, prefix: &str) -> Result<Vec<String>> {
@@ -238,8 +234,7 @@ fn uncached_and_static_loads_fetch_the_whole_chain() {
         inner: Arc::clone(&env.inner),
         ops: Arc::clone(&ops),
     };
-    let (_, index) =
-        Repository::fetch_full_index(&logged, env.repo.crypto.as_ref(), RepoFormat::V5).unwrap();
+    let (_, index) = Repository::fetch_full_index(&logged, env.repo.crypto.as_ref()).unwrap();
     assert_eq!(entries(&index), entries(&s2));
     assert_eq!(index_d_gets(&ops.lock().unwrap()), 2);
 
@@ -259,8 +254,11 @@ fn uncached_and_static_loads_fetch_the_whole_chain() {
 #[test]
 fn legacy_blob_at_index_is_refused() {
     let env = init(RepoFormat::V5, EncryptionMode::None);
-    let v3 = init(RepoFormat::V3, EncryptionMode::None);
-    let legacy = v3.inner.get("index").unwrap().unwrap();
+    let legacy = crate::tests::helpers::legacy_index_blob(
+        &crate::index::ChunkIndex::new(),
+        7,
+        env.repo.crypto.as_ref(),
+    );
     env.inner.put("index", &legacy).unwrap();
     let err = Repository::open(
         Box::new(Arc::clone(&env.inner)),

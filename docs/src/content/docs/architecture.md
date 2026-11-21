@@ -66,7 +66,7 @@ Every degraded state — a missing copy, a copy that disagrees, a backfill that 
 
 An **unreadable** copy is distinguished from a missing one. An I/O or permission failure on one object must not defeat the redundancy the other exists to provide, so the open proceeds off the survivor — and the unreadable object is left strictly alone, never backfilled over, since it may well be intact.
 
-Redundancy inside the repository covers bit rot, not loss of the storage. `vykar key export` and `vykar key import` (see [Commands](/commands)) move the passphrase-protected blob in and out of a password manager. Both work on raw storage rather than through `Repository::open`: `import` because it runs on a repository that can no longer be opened, `export` because a recovery tool for the key must not fail on an unreadable `index.gen` sidecar, scale with the snapshot count, or write anything. Export uses the same copy selection as `open`, so it can never hand out a copy `open` would have rejected. A key belongs to exactly one repository, so both commands require `-R` when several are configured.
+Redundancy inside the repository covers bit rot, not loss of the storage. `vykar key export` and `vykar key import` (see [Commands](/commands)) move the passphrase-protected blob in and out of a password manager. Both work on raw storage rather than through `Repository::open`: `import` because it runs on a repository that can no longer be opened, `export` because a recovery tool for the key must not fail on an unreadable index head, scale with the snapshot count, or write anything. Export uses the same copy selection as `open`, so it can never hand out a copy `open` would have rejected. A key belongs to exactly one repository, so both commands require `-R` when several are configured.
 
 ### Hashing / Chunk IDs
 
@@ -215,7 +215,7 @@ Future snapshot-level metadata goes inside the reserved opaque `ext` blob (parse
 | 4 | keyed BLAKE2b-256 | unkeyed BLAKE2b-256 | segmented | `vykar upgrade` of a v2 repository |
 | 5 | keyed BLAKE3 | unkeyed BLAKE3 | segmented | `init` 0.25 and later, `vykar upgrade` of v3 |
 
-`RepoFormat::from_version` is the single gate; `chunk_hash()` and `index_layout()` derive both properties from it. The **hash never changes** for a repository: it is the dedup identity of every chunk and part of every pack's storage key, so a v2 repository stays BLAKE2b for life and remains fully readable *and writable*. The **index layout can change**, once and one way: `vykar upgrade` moves v2 to v4 and v3 to v5 in place (see [In-Place Upgrade](#in-place-upgrade)). It is never automatic, because it locks out older binaries on every other machine. `vykar info` reports the format, the hash, and for a segmented index the base and segment sizes.
+`RepoFormat::from_version` is the single gate; `chunk_hash()` derives the hash from it. The **hash never changes** for a repository: it is the dedup identity of every chunk and part of every pack's storage key, so a v2 repository is upgraded to v4 and stays BLAKE2b for life. v2 and v3 are **upgrade-only** (`is_upgrade_only()`): every open except the one `vykar upgrade` makes refuses them, right after reading `config` and before the key is loaded, with an error that names `vykar upgrade`; `init` can no longer create them. `key export`/`key import`, `delete-repo` and `break-lock` work on raw storage and keep working on them. The **index layout can change**, once and one way: `vykar upgrade` moves v2 to v4 and v3 to v5 in place (see [In-Place Upgrade](#in-place-upgrade)). It is never automatic, because it locks out older binaries on every other machine. `vykar info` reports the format, the hash, and for a segmented index the base and segment sizes.
 
 There is deliberately **no user-facing choice** at `init`: no `--hash` flag, no YAML key. `init` always creates the current format (v5). Two accepted consequences: older binaries cannot open a repository created by a newer release (`unsupported repository version: 5`), so a fleet sharing a new repository must upgrade together; and a self-hosted `vykar-server` must be upgraded before a new repository can be created against it (a pre-flight `/health` probe at `init` checks both BLAKE3 support and the `segmented_index` capability, so that fails cleanly rather than at the first backup).
 
@@ -229,7 +229,7 @@ There is deliberately **no user-facing choice** at `init`: no `--hash` flag, no 
 | Check-state file name | `check3.<BLAKE3(url)>` | Old state orphaned; the next `check` is a full one |
 | `PathHash` in the file cache (first 16 bytes of BLAKE3) | `filecache` | Old caches rejected; the next backup re-reads every file once |
 | Full-index cache checksum trailer | `full_index_cache` | Rebuilt once |
-| Index blob digest (conditional-GET validator) | `index_blob` | Rebuilt once |
+| Index blob digest (conditional-GET validator of 0.24 and earlier) | `index_blob` | No longer written; `vykar upgrade` deletes it |
 | Segmented index object names and state hashes | `index.d/`, head | none (BLAKE3 from the start) |
 | Hard-link `chunks_fingerprint` | runtime only | none |
 
@@ -243,7 +243,7 @@ The single exception is the plaintext-mode `chunk_id_key` derivation, which *is*
 
 ### On-Disk Layout
 
-`RepoConfig.version = 5` is what `vykar init` writes; versions 2 to 4 remain fully readable and writable. See [Repository Versions](#repository-versions).
+`RepoConfig.version = 5` is what `vykar init` writes; version 4 remains fully readable and writable, and versions 2 and 3 are opened only by `vykar upgrade`. See [Repository Versions](#repository-versions).
 
 ```text
 <repo>/
@@ -252,7 +252,7 @@ The single exception is the plaintext-mode `chunk_id_key` derivation, which *is*
 |- keys/repokey.2            # Byte-identical redundant copy (see Key Redundancy)
 |- index                     # v4/v5: encrypted IndexHead (small); v2/v3: encrypted IndexBlob { generation, chunks }
 |- index.d/<64 hex>          # v4/v5: write-once index base and segments, named by the BLAKE3 of their bytes
-|- index.gen                 # v2/v3 only: unencrypted advisory u64 generation hint
+|- index.gen                 # v2/v3 only (written by 0.24 and earlier): unencrypted advisory u64 generation hint
 |- snapshots/<id>            # Encrypted snapshot metadata; source of truth for snapshot listing
 |- sessions/<id>.json        # Session presence markers (concurrent backups)
 |- sessions/<id>.index       # Per-session crash-recovery journals (absent after clean backup)
@@ -271,17 +271,13 @@ These files live under a per-repo local cache root. By default this is the platf
 |- dedup_cache               # Sorted ChunkId -> stored_size (mmap + xor filter)
 |- restore_cache             # Sorted ChunkId -> pack_id, pack_offset, stored_size (mmap)
 |- full_index_cache          # Sorted full index rows for local rehydration/cache rebuilds
-`- index_blob                # Raw index blob as last written by this machine, with its BLAKE3
-                             #   (validator for the conditional GET and the commit fast path)
+`- index_blob                # 0.24 and earlier only: the v2/v3 index blob this machine last wrote;
+                             #   no longer read or written, deleted by `vykar upgrade`
 ```
 
-The index caches are validated against the current index generation. In v4/v5 the generation is derived from the head's `state_hash` (its first eight bytes, 0 mapped to 1), and `full_index_cache` is matched by its whole 32-byte trailer, which is that state hash; `index_blob` is not written. The rest of this section describes v2/v3.
+The index caches are validated against the current index generation, derived from the head's `state_hash` (its first eight bytes, 0 mapped to 1); `full_index_cache` is matched by its whole 32-byte trailer, which is that state hash.
 
-In v2/v3, the authenticated source of truth is `IndexBlob.generation` inside `index`; `index.gen` is only an advisory hint used to avoid unnecessary remote index downloads on read paths. A stale or missing sidecar causes cache misses or full-index fallback, not correctness issues.
-
-On a REST repository, opening with the index and the backup commit ask the server whether `index` still matches `index_blob` (`If-None-Match`). On a `304` the client uses its local copy, verified against the recorded digest, instead of downloading the index.
-
-When the index is provably the blob this machine last wrote (a `304`, or downloaded bytes on any backend that hash to the digest recorded in `index_blob`) and `full_index_cache` is checksum-valid at that blob's generation, the in-memory index is built from `full_index_cache` instead of decrypting and decoding the blob. The backup fast path already trusts the full cache on the same evidence. In every other case the blob is decoded as before.
+In v2/v3 the authenticated generation is `IndexBlob.generation` inside `index`, and `index.gen` is an advisory hint that only pre-0.25 binaries write and read. This vykar reads neither outside `vykar upgrade`, which GETs and decodes the `IndexBlob` once (`check --repair` also decodes an `IndexBlob` that a pre-0.25 client left at `index` of a v4/v5 repository). The client no longer sends `If-None-Match`; vykar-server still answers it (`304`) for 0.24 clients.
 
 The `snapshot_list` cache is separate: on open/refresh, the client lists `snapshots/`, removes stale local entries, loads only new snapshot blobs, and persists the resulting snapshot list locally. This avoids O(n) snapshot metadata GETs on every open.
 
@@ -441,11 +437,11 @@ index.d/<64 hex>     # write-once: base or segment, name = BLAKE3 of the stored 
 `vykar upgrade` (`repo/upgrade.rs`) moves v2 to v4 and v3 to v5 under the maintenance lock, on a repository opened without its index:
 
 1. Probe the server's `segmented_index` capability, and PUT the stored `config` bytes back unchanged. A server that refuses overwrites (append-only) fails here, with the repository untouched.
-2. Load the legacy index (from the local full cache when the stored blob is the one this machine last wrote) and write it as a base (none for an empty index). Anything an earlier attempt left in `index.d/` is deleted after step 3, or by the next compact if the upgrade is interrupted there.
+2. GET `index` and decode the legacy index, then write it as a base (none for an empty index). An index that cannot be decoded fails the upgrade before anything is written. Anything an earlier attempt left in `index.d/` is deleted after step 3, or by the next compact if the upgrade is interrupted there.
 3. Overwrite `index` with the head. From here every older binary fails on its next index read (`UnknownObjectType`), rather than reading an empty index — compact deletes packs with no index entries, so an empty index would be dangerous, not just wrong.
 4. Rewrite `config` with the new version; delete `index.gen` and the local `index_blob`. The local full cache is installed at the new state and the dedup and restore caches are rebuilt.
 
-A v2/v3 `config` with a head at `index` is an upgrade interrupted after step 3: monolithic index reads fail and name `vykar upgrade`, which verifies the head and every object of its chain and completes step 4. `prove_key` accepts either object at `index`, so key-copy disagreement can be resolved in every state. Remaining hole: a pre-0.25 prune or delete that loaded the index before the upgrade and gets the lock after it can overwrite the head with a legacy blob; that is the damage case above, repaired by `check --repair`. Stop all other clients before upgrading. With a damaged chain or head, `vykar upgrade` names `check --repair`, which repairs the segmented index the upgrade wrote (leaving `config` at v2/v3); `vykar upgrade` then completes.
+A v2/v3 `config` with a head at `index` is an upgrade interrupted after step 3: every other command refuses the repository and names `vykar upgrade`, which verifies the head and every object of its chain and completes step 4. `prove_key` accepts either object at `index`, so key-copy disagreement can be resolved in every state. Remaining hole: a pre-0.25 prune or delete that loaded the index before the upgrade and gets the lock after it can overwrite the head with a legacy blob; that is the damage case above, repaired by `check --repair`. Stop all other clients before upgrading. With a damaged chain or head, `vykar upgrade` still completes the version switch, without the deletions of step 4, and returns an error that names `check --repair`, which then repairs the repository as v4/v5. Every released binary already fails on such a repository, so the switch loses nothing. When the head cannot be read and `index.d/` holds no objects, `index` is more likely a damaged monolithic index: the upgrade refuses and changes nothing.
 
 ### Pack Files
 
@@ -574,21 +570,12 @@ commit_concurrent_session_with_progress():
   → flush packs (no-op safety net: Phase 1 already drained uploads)
   → refresh snapshot list from snapshots/ (via local snapshot cache diff)
   → check snapshot name uniqueness against fresh list
-  → v4/v5 (segmented index):
+  → if delta is non-empty:
       → GET head, bring the local full cache to it
       → merge-walk cache + positional bumps + keyed bumps + new entries:
         new entries already present → bumps; bump targets in neither → Err(StaleChunksDuringCommit)
       → verify packs alongside
       → PUT index.d/<segment> (or a base at the fold limit), fence check, PUT index (head)
-  → v2/v3 (monolithic index), if delta is non-empty:
-      → reload full index from storage
-      → delta.reconcile(fresh_index): new_entries already present → refcount bumps;
-        missing bump targets → Err(StaleChunksDuringCommit)
-      → verify_delta_packs on reconciled delta
-      → apply reconciled delta to fresh index
-      → persist IndexBlob + advisory index.gen
-  → v2/v3, if delta is empty but local dedup caches need rebuilding:
-      → reload full index from storage for cache rebuild
   → write snapshots/<id> (commit point)
   → rebuild local dedup/restore/full-index caches as needed
   → update in-memory manifest
@@ -708,7 +695,7 @@ The lock fence detects a lost lock at its next check; it cannot stop a write alr
 
 The advisory lock is used for:
 - **Backup commit phase**: acquired with `acquire_lock_with_deadline`, which retries (500 ms base delay, exponential backoff + 25 % jitter) for up to `COMMIT_LOCK_MAX_WAIT` (10 minutes) and is interruptible by Ctrl-C. Waiters do not queue, so the bound is soft when several commits contend. The lock is held only for the brief commit — typically seconds, since all packs are uploaded before it is taken.
-- **Maintenance commands** (`delete`, `prune`, `compact`): acquired via `with_maintenance_lock()`, which additionally cleans stale session markers (>45 min since `last_refresh`) while preserving their companion `.index` journals so the next backup can recover uploaded-but-uncommitted chunks. Orphaned `.index` files from a *prior* cleanup run (marker already gone) are removed. Then maintenance checks for remaining active sessions — if any non-stale sessions exist (including malformed markers that cannot be proven stale), the lock is released and `VykarError::ActiveSessions` is returned, preventing compaction from deleting packs that upload-phase backups depend on. Maintenance commands open without the chunk index and load it only after the lock is held and the session check has passed, so they act on the index as storage holds it while no other writer can change it. `prune` loads it only when it removes at least one snapshot (never for `--dry-run`). When the operation persisted the index, the machine's existing local index caches (`full_index_cache`, `dedup_cache`, `restore_cache`) are rebuilt at the new generation before the lock is released, so the next backup can use tiered dedup and the commit fast path. A machine without a `full_index_cache` gets none created.
+- **Maintenance commands** (`delete`, `prune`, `compact`): acquired via `with_maintenance_lock()`, which additionally cleans stale session markers (>45 min since `last_refresh`) while preserving their companion `.index` journals so the next backup can recover uploaded-but-uncommitted chunks. Orphaned `.index` files from a *prior* cleanup run (marker already gone) are removed. Then maintenance checks for remaining active sessions — if any non-stale sessions exist (including malformed markers that cannot be proven stale), the lock is released and `VykarError::ActiveSessions` is returned, preventing compaction from deleting packs that upload-phase backups depend on. Maintenance commands open without the chunk index and load it only after the lock is held and the session check has passed, so they act on the index as storage holds it while no other writer can change it. `prune` loads it only when it removes at least one snapshot (never for `--dry-run`). When the operation persisted the index, the machine's existing local index caches (`full_index_cache`, `dedup_cache`, `restore_cache`) are rebuilt at the new generation before the lock is released, so the next backup can use tiered dedup without downloading index objects. A machine without a `full_index_cache` gets none created.
 
 #### Command Summary
 

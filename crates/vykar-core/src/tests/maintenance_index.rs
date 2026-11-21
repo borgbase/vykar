@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use vykar_storage::{ConditionalGet, InnerBackend, StorageBackend, delegate_storage_backend};
+use vykar_storage::{InnerBackend, StorageBackend, delegate_storage_backend};
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
 
@@ -23,10 +23,7 @@ use crate::repo::{OpenOptions, RepoFormat, Repository};
 
 use super::helpers::{backup_single_source, make_test_config, source_entry};
 
-const FAST: &str = "index unchanged, fast path";
-const SLOW: &str = "decode index";
-
-/// GETs of `index` (the v3 blob or the v5 head) and of `index.d/` objects.
+/// GETs of `index` (the head) and of `index.d/` objects.
 #[derive(Default)]
 struct IndexReads {
     head: AtomicUsize,
@@ -65,16 +62,11 @@ impl InnerBackend for CountIndexReads {
 
 delegate_storage_backend! {
     for CountIndexReads;
-    except [get, get_if_changed];
+    except [get];
 
     fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
         self.reads.count(key);
         self.inner.get(key)
-    }
-
-    fn get_if_changed(&self, key: &str, known_blake3: &[u8; 32]) -> Result<ConditionalGet> {
-        self.reads.count(key);
-        self.inner.get_if_changed(key, known_blake3)
     }
 }
 
@@ -119,7 +111,6 @@ struct Env {
     repo_dir: PathBuf,
     cache_dir: PathBuf,
     config: VykarConfig,
-    format: RepoFormat,
 }
 
 impl Env {
@@ -140,7 +131,6 @@ impl Env {
             repo_dir,
             cache_dir,
             config,
-            format,
         }
     }
 
@@ -250,7 +240,7 @@ impl Env {
         fs::read(self.repo_dir.join("index")).unwrap()
     }
 
-    /// Files under `index.d/` (0 when the directory does not exist, i.e. on v3).
+    /// Files under `index.d/` (0 when the directory does not exist).
     fn index_objects(&self) -> usize {
         self.index_object_names().len()
     }
@@ -330,21 +320,15 @@ fn find_file(dir: &Path, name: &str) -> Option<PathBuf> {
 
 // --- (A) local caches refreshed after a maintenance index write ---
 
-const FORMATS: [RepoFormat; 2] = [RepoFormat::V3, RepoFormat::V5];
+const FORMATS: [RepoFormat; 1] = [RepoFormat::V5];
 
-/// The next backup used the refreshed caches: the fast path on v3, no
-/// `index.d/` download on v5.
+/// The next backup used the refreshed caches: no `index.d/` download.
 fn assert_backup_uses_caches(env: &Env, src: &Path, name: &str) {
     let reads = Arc::new(IndexReads::default());
-    let stages = env.backup_counting(src, "a", name, &reads);
-    if env.format == RepoFormat::V3 {
-        assert!(stages.contains(&FAST), "expected fast path: {stages:?}");
-        assert!(!stages.contains(&SLOW), "unexpected slow path: {stages:?}");
-    } else {
-        let (head, objects) = reads.counts();
-        assert!(head > 0, "the counter saw no head GET");
-        assert_eq!(objects, 0, "backup downloaded index objects");
-    }
+    env.backup_counting(src, "a", name, &reads);
+    let (head, objects) = reads.counts();
+    assert!(head > 0, "the counter saw no head GET");
+    assert_eq!(objects, 0, "backup downloaded index objects");
 }
 
 #[test]
@@ -411,35 +395,6 @@ fn compact_refreshes_local_caches() {
         fs::write(src.join("three.bin"), vec![0x33u8; 64 * 1024]).unwrap();
         assert_backup_uses_caches(&env, &src, "s3");
         env.assert_check_clean();
-    }
-}
-
-/// v3 only; see `maintenance_on_a_host_without_caches_segmented` for v5.
-#[test]
-fn maintenance_does_not_create_caches_on_a_host_without_them() {
-    let env = Env::new(RepoFormat::V3);
-    let src = env.source("a", &[("one.bin", 0x11)]);
-    env.backup(&src, "a", "s1");
-    fs::write(src.join("two.bin"), vec![0x22u8; 64 * 1024]).unwrap();
-    env.backup(&src, "a", "s2");
-
-    let other_cache = env.dir.path().join("maintenance-only");
-    fs::create_dir_all(&other_cache).unwrap();
-    let mut config = env.config.clone();
-    config.cache_dir = Some(other_cache.to_string_lossy().into_owned());
-    let (stats, _) =
-        commands::prune::run(&config, None, false, false, &env.sources(&["a"]), &[], None).unwrap();
-    assert_eq!(stats.pruned, 1);
-
-    let id = env.open_fresh().config.id.clone();
-    let cd = Some(other_cache.as_path());
-    for path in [
-        dedup_cache::full_index_cache_path(&id, cd),
-        dedup_cache::dedup_cache_path(&id, cd),
-        dedup_cache::restore_cache_path(&id, cd),
-    ] {
-        let path = path.unwrap();
-        assert!(!path.exists(), "{} was created", path.display());
     }
 }
 
@@ -536,28 +491,26 @@ fn failed_index_write_in_prune_leaves_caches_untouched() {
         assert_eq!(entries(&own), entries(&remote));
         drop(own);
 
-        if format == RepoFormat::V5 {
-            // The segment PUT went through before the failed head PUT.
-            let objects = env.index_object_names();
-            let debris: Vec<&String> = objects.difference(&objects_before).collect();
-            assert_eq!(debris.len(), 1, "{debris:?}");
-            assert_eq!(objects.len(), objects_before.len() + 1);
-            let bytes = fs::read(env.repo_dir.join("index.d").join(debris[0])).unwrap();
-            assert_eq!(bytes[0], ObjectType::IndexSegment as u8);
-            let head = remote.index_head().unwrap();
-            let named = head
-                .base
-                .iter()
-                .map(|b| b.name)
-                .chain(head.segments.iter().map(|s| s.name))
-                .chain(head.retired.iter().copied())
-                .any(|n| n.to_hex() == *debris[0]);
-            assert!(!named, "debris is named by the head");
-            drop(remote);
+        // The segment PUT went through before the failed head PUT.
+        let objects = env.index_object_names();
+        let debris: Vec<&String> = objects.difference(&objects_before).collect();
+        assert_eq!(debris.len(), 1, "{debris:?}");
+        assert_eq!(objects.len(), objects_before.len() + 1);
+        let bytes = fs::read(env.repo_dir.join("index.d").join(debris[0])).unwrap();
+        assert_eq!(bytes[0], ObjectType::IndexSegment as u8);
+        let head = remote.index_head().unwrap();
+        let named = head
+            .base
+            .iter()
+            .map(|b| b.name)
+            .chain(head.segments.iter().map(|s| s.name))
+            .chain(head.retired.iter().copied())
+            .any(|n| n.to_hex() == *debris[0]);
+        assert!(!named, "debris is named by the head");
+        drop(remote);
 
-            commands::compact::run(&env.config, None, 100.0, None, false, None).unwrap();
-            assert_eq!(env.index_object_names(), objects_before);
-        }
+        commands::compact::run(&env.config, None, 100.0, None, false, None).unwrap();
+        assert_eq!(env.index_object_names(), objects_before);
     }
 }
 
@@ -595,12 +548,8 @@ fn lock_lost_before_save_leaves_caches_untouched() {
         assert_eq!(caches_at(&id, &env.cache_dir, generation), [true; 3]);
         assert_eq!(env.open_fresh().index_generation(), generation);
         assert_eq!(env.index_bytes(), index_before, "{format:?}");
-        // v5 PUTs the segment, then checks the lock before the head PUT.
-        let expected = match format {
-            RepoFormat::V3 => 0,
-            _ => objects_before + 1,
-        };
-        assert_eq!(env.index_objects(), expected, "{format:?}");
+        // The segment is PUT, then the lock checked before the head PUT.
+        assert_eq!(env.index_objects(), objects_before + 1, "{format:?}");
     }
 }
 
@@ -636,18 +585,6 @@ fn save_then_lose_lock(env: &Env) -> (u64, u64) {
 }
 
 #[test]
-fn lock_lost_after_save_still_refreshes_caches() {
-    let env = Env::new(RepoFormat::V3);
-    let src = env.source("a", &[("one.bin", 0x11)]);
-    env.backup(&src, "a", "s1");
-    let id = env.open_fresh().config.id.clone();
-
-    let (before, after) = save_then_lose_lock(&env);
-    assert_ne!(before, after);
-    assert_eq!(caches_at(&id, &env.cache_dir, after), [true; 3]);
-}
-
-#[test]
 fn lock_lost_after_save_still_refreshes_caches_segmented() {
     let env = Env::new(RepoFormat::V5);
     let src = env.source("a", &[("one.bin", 0x11)]);
@@ -675,36 +612,6 @@ fn save_then_get_taken_over(env: &Env) -> u64 {
     .unwrap();
     drop(repo);
     ours
-}
-
-/// After losing the lock, another writer on this host persists a newer index
-/// and refreshes the caches; our late refresh then replaces them with caches
-/// at our older generation, which every open and commit must miss.
-#[test]
-fn late_refresh_after_takeover_is_a_cache_miss() {
-    let env = Env::new(RepoFormat::V3);
-    let src = env.source("a", &[("one.bin", 0x11)]);
-    env.backup(&src, "a", "s1");
-
-    let ours = save_then_get_taken_over(&env);
-
-    let remote = env.open_fresh();
-    let id = remote.config.id.clone();
-    assert_ne!(ours, remote.index_generation());
-    assert_eq!(caches_at(&id, &env.cache_dir, ours), [true; 3]);
-    assert_eq!(
-        caches_at(&id, &env.cache_dir, remote.index_generation()),
-        [false; 3]
-    );
-
-    let own = env.open(env.local(), OpenOptions::new().with_index());
-    assert_eq!(own.index_generation(), remote.index_generation());
-    assert_eq!(entries(&own), entries(&remote));
-    drop(own);
-
-    fs::write(src.join("two.bin"), vec![0x22u8; 64 * 1024]).unwrap();
-    let stages = env.backup(&src, "a", "s2");
-    assert!(stages.contains(&SLOW), "expected slow path: {stages:?}");
 }
 
 /// On v5 our late refresh finds the full cache at the newer state and
@@ -867,14 +774,8 @@ fn compact_does_not_delete_packs_committed_after_open() {
     }
 }
 
-/// Index reads an open without the index makes: none on v3, the single head
-/// GET on v5.
-fn open_reads(format: RepoFormat) -> (usize, usize) {
-    match format {
-        RepoFormat::V3 => (0, 0),
-        _ => (1, 0),
-    }
-}
+/// Index reads an open without the index makes: the single head GET.
+const OPEN_READS: (usize, usize) = (1, 0);
 
 #[test]
 fn prune_with_nothing_to_prune_does_not_read_index() {
@@ -889,7 +790,7 @@ fn prune_with_nothing_to_prune_does_not_read_index() {
         keep_all.retention.keep_last = Some(10);
         let reads = Arc::new(IndexReads::default());
         let mut repo = env.open(env.counting(&reads), OpenOptions::new());
-        assert_eq!(reads.counts(), open_reads(format), "{format:?}: open");
+        assert_eq!(reads.counts(), OPEN_READS, "{format:?}: open");
         let (stats, _) = commands::prune::run_on_repo(
             &mut repo,
             &keep_all,
@@ -901,12 +802,12 @@ fn prune_with_nothing_to_prune_does_not_read_index() {
         )
         .unwrap();
         assert_eq!(stats.pruned, 0);
-        assert_eq!(reads.counts(), open_reads(format), "{format:?}: prune");
+        assert_eq!(reads.counts(), OPEN_READS, "{format:?}: prune");
 
         // A dry run with a candidate does not read it either.
         let reads = Arc::new(IndexReads::default());
         let mut repo = env.open(env.counting(&reads), OpenOptions::new());
-        assert_eq!(reads.counts(), open_reads(format), "{format:?}: open");
+        assert_eq!(reads.counts(), OPEN_READS, "{format:?}: open");
         let (stats, _) = commands::prune::run_on_repo(
             &mut repo,
             &env.config,
@@ -918,7 +819,7 @@ fn prune_with_nothing_to_prune_does_not_read_index() {
         )
         .unwrap();
         assert_eq!(stats.pruned, 1);
-        assert_eq!(reads.counts(), open_reads(format), "{format:?}: dry run");
+        assert_eq!(reads.counts(), OPEN_READS, "{format:?}: dry run");
         assert_eq!(env.open_fresh().manifest().snapshots.len(), 2);
     }
 }
@@ -936,7 +837,7 @@ fn prune_loads_index_after_session_check() {
 
         let reads = Arc::new(IndexReads::default());
         let mut repo = env.open(env.counting(&reads), OpenOptions::new());
-        assert_eq!(reads.counts(), open_reads(format), "{format:?}: open");
+        assert_eq!(reads.counts(), OPEN_READS, "{format:?}: open");
         let err = commands::prune::run_on_repo(
             &mut repo,
             &env.config,
@@ -952,6 +853,6 @@ fn prune_loads_index_after_session_check() {
             matches!(err, VykarError::ActiveSessions(_)),
             "expected ActiveSessions, got: {err}"
         );
-        assert_eq!(reads.counts(), open_reads(format), "{format:?}: prune");
+        assert_eq!(reads.counts(), OPEN_READS, "{format:?}: prune");
     }
 }

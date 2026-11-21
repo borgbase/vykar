@@ -6,8 +6,11 @@ use crate::config::{
     EncryptionConfig, EncryptionModeConfig, HooksConfig, RepositoryConfig, ResolvedRepo,
     SourceEntry, SourceHooksConfig, VykarConfig,
 };
-use crate::repo::Repository;
+use crate::index::{ChunkIndex, IndexBlob};
+use crate::repo::format::{ObjectType, pack_object_streaming_with_context};
+use crate::repo::{OpenOptions, RepoConfig, RepoFormat, Repository};
 use crate::snapshot::SnapshotStats;
+use vykar_crypto::CryptoEngine;
 
 // Re-exported so `helpers::init_test_environment()` call sites keep working
 // while a single `Once` governs the whole unit-test binary.
@@ -39,12 +42,70 @@ pub fn init_repo(repo_dir: &Path) -> VykarConfig {
     config
 }
 
-/// [`init_repo`] at format v3, for tests of the monolithic index
-/// (`index.gen`, the conditional index GET, the backup fast path).
-pub fn init_repo_v3(repo_dir: &Path) -> VykarConfig {
-    let config = make_test_config(repo_dir);
-    commands::init::run_at_format(&config, None, crate::repo::RepoFormat::V3).unwrap();
-    config
+/// The `IndexBlob` a v2/v3 binary writes at `index`: zstd-compressed msgpack,
+/// packed as `ObjectType::ChunkIndex` with context `b"index"`.
+pub(crate) fn legacy_index_blob(
+    index: &ChunkIndex,
+    generation: u64,
+    crypto: &dyn CryptoEngine,
+) -> Vec<u8> {
+    let blob = IndexBlob {
+        generation,
+        chunks: index.clone(),
+    };
+    pack_object_streaming_with_context(ObjectType::ChunkIndex, b"index", 64, crypto, |buf| {
+        crate::compress::compress_stream_zstd(buf, 3, |encoder| {
+            rmp_serde::encode::write(encoder, &blob)?;
+            Ok(())
+        })
+    })
+    .unwrap()
+}
+
+/// Turn the v4/v5 repository at `repo_dir` into the v2/v3 repository 0.24
+/// writes for the same data: `index` becomes the [`legacy_index_blob`] of its
+/// index, `index.gen` is written, `index.d/` removed, `config` set to the
+/// legacy version, and this repository's local cache directory under
+/// `cache_dir` deleted. Packs and snapshots are identical between v2/v4 and
+/// v3/v5 (see `RepoFormat`). Returns the legacy format.
+pub(crate) fn downgrade_to_legacy(
+    repo_dir: &Path,
+    passphrase: Option<&str>,
+    cache_dir: &Path,
+) -> RepoFormat {
+    const GENERATION: u64 = 0x24;
+    let scratch = tempfile::tempdir().unwrap();
+    let storage =
+        vykar_storage::local_backend::LocalBackend::new(repo_dir.to_str().unwrap()).unwrap();
+    let repo = Repository::open(
+        Box::new(storage),
+        passphrase,
+        Some(scratch.path().to_path_buf()),
+        OpenOptions::new().with_index(),
+    )
+    .unwrap();
+    let legacy = match repo.format() {
+        RepoFormat::V4 => RepoFormat::V2,
+        RepoFormat::V5 => RepoFormat::V3,
+        other => panic!("not a segmented format: {other:?}"),
+    };
+    let blob = legacy_index_blob(repo.chunk_index(), GENERATION, repo.crypto.as_ref());
+    let repo_id = repo.config.id.clone();
+    drop(repo);
+
+    std::fs::write(repo_dir.join("index"), blob).unwrap();
+    std::fs::write(repo_dir.join("index.gen"), GENERATION.to_le_bytes()).unwrap();
+    std::fs::remove_dir_all(repo_dir.join("index.d")).unwrap();
+    let mut config: RepoConfig =
+        rmp_serde::from_slice(&std::fs::read(repo_dir.join("config")).unwrap()).unwrap();
+    config.version = legacy.version();
+    std::fs::write(repo_dir.join("config"), rmp_serde::to_vec(&config).unwrap()).unwrap();
+    if let Some(dir) = crate::repo::file_cache::repo_cache_dir(&repo_id, Some(cache_dir))
+        && dir.exists()
+    {
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    legacy
 }
 
 pub fn source_entry(path: &Path, label: &str) -> SourceEntry {
@@ -273,7 +334,7 @@ impl vykar_storage::InnerBackend for FailGet {
 
 vykar_storage::delegate_storage_backend! {
     for FailGet;
-    except [get, get_if_changed];
+    except [get];
 
     fn get(&self, key: &str) -> vykar_types::error::Result<Option<Vec<u8>>> {
         if self.should_fail(key) {
@@ -282,14 +343,6 @@ vykar_storage::delegate_storage_backend! {
             )));
         }
         self.inner.get(key)
-    }
-
-    fn get_if_changed(
-        &self,
-        key: &str,
-        _known: &[u8; 32],
-    ) -> vykar_types::error::Result<vykar_storage::ConditionalGet> {
-        vykar_storage::get_unconditionally(self, key)
     }
 }
 

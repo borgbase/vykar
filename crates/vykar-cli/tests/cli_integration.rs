@@ -312,6 +312,61 @@ fn cli_init_writes_repository_format_v5() {
     assert_eq!(config_bytes.get(1), Some(&5), "init must write version 5");
 }
 
+/// The empty v3 repository 0.24 creates, at `repo_dir`: no binary writes
+/// v2/v3 any more, so a v5 one is rewritten into it. `index` becomes an empty
+/// `IndexBlob` (zstd msgpack, packed as `ChunkIndex` with context `index`),
+/// `index.gen` 0, `index.d/` goes and `config` says version 3.
+fn init_empty_v3(repo_dir: &Path) {
+    use vykar_core::repo::format::{ObjectType, pack_object_streaming_with_context};
+
+    std::fs::create_dir_all(repo_dir).unwrap();
+    let storage = || Box::new(LocalBackend::new(repo_dir.to_str().unwrap()).unwrap());
+    Repository::init(
+        storage(),
+        vykar_core::repo::EncryptionMode::None,
+        vykar_core::config::ChunkerConfig::default(),
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+    let cache = TempDir::new().unwrap();
+    let repo = Repository::open(
+        storage(),
+        None,
+        Some(cache.path().to_path_buf()),
+        OpenOptions::new(),
+    )
+    .unwrap();
+    let blob = vykar_core::index::IndexBlob {
+        generation: 0,
+        chunks: vykar_core::index::ChunkIndex::new(),
+    };
+    let index = pack_object_streaming_with_context(
+        ObjectType::ChunkIndex,
+        b"index",
+        64,
+        repo.crypto.as_ref(),
+        |buf| {
+            vykar_core::compress::compress_stream_zstd(buf, 3, |encoder| {
+                rmp_serde::encode::write(encoder, &blob)?;
+                Ok(())
+            })
+        },
+    )
+    .unwrap();
+    drop(repo);
+
+    std::fs::write(repo_dir.join("index"), index).unwrap();
+    std::fs::write(repo_dir.join("index.gen"), 0u64.to_le_bytes()).unwrap();
+    std::fs::remove_dir_all(repo_dir.join("index.d")).unwrap();
+    let path = repo_dir.join("config");
+    let mut config: vykar_core::repo::RepoConfig =
+        rmp_serde::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    config.version = 3;
+    std::fs::write(path, rmp_serde::to_vec(&config).unwrap()).unwrap();
+}
+
 /// `vykar upgrade` takes a v3 repository to v5. It refuses to run without a
 /// terminal unless `--yes` is given, and a second run does nothing.
 #[test]
@@ -319,17 +374,10 @@ fn cli_upgrade_moves_a_v3_repository_to_v5() {
     let fx = CliFixture::new();
     write_plain_config(&fx.config_path, &fx.repo_dir);
     let cfg = fx.config_path.to_string_lossy().to_string();
-    std::fs::create_dir_all(&fx.repo_dir).unwrap();
-    Repository::init_at_format(
-        Box::new(LocalBackend::new(fx.repo_dir.to_str().unwrap()).unwrap()),
-        vykar_core::repo::EncryptionMode::None,
-        vykar_core::config::ChunkerConfig::default(),
-        None,
-        None,
-        None,
-        vykar_core::repo::RepoFormat::V3,
-    )
-    .unwrap();
+    init_empty_v3(&fx.repo_dir);
+
+    let (_, stderr) = fx.run_err(&["--config", &cfg, "list"]);
+    assert!(stderr.contains("vykar upgrade"), "{stderr}");
 
     let (_, stderr) = fx.run_err(&["--config", &cfg, "upgrade"]);
     assert!(stderr.contains("--yes"), "{stderr}");

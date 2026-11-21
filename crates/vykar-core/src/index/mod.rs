@@ -18,22 +18,14 @@ use xorf::Xor8;
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::pack_id::PackId;
 
-/// Wire format for the persisted index blob.
-///
-/// Contains the generation counter (previously stored in the manifest) alongside
-/// the chunk index data. Encrypted at the `index` key with context `b"index"`.
+/// Wire format of the monolithic index that formats v2/v3 store at `index`,
+/// encrypted with context `b"index"`. Read only by the upgrade, and by the
+/// repair of a v4/v5 `index` that an older binary overwrote; nothing writes
+/// it any more (`Serialize` stays for test and fuzz encoders).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexBlob {
     pub generation: u64,
     pub chunks: ChunkIndex,
-}
-
-/// Borrowed variant of [`IndexBlob`] for serialization without cloning.
-/// Produces the same wire format as `IndexBlob`.
-#[derive(Serialize)]
-pub struct IndexBlobRef<'a> {
-    pub generation: u64,
-    pub chunks: &'a ChunkIndex,
 }
 
 /// In-memory index of all chunks in the repository.
@@ -1049,9 +1041,9 @@ mod tests {
             id[31] = 0x5a;
             chunks.add(ChunkId::from_bytes(id), i, make_pack_id(1), u64::from(i));
         }
-        let blob = IndexBlobRef {
+        let blob = IndexBlob {
             generation: 7,
-            chunks: &chunks,
+            chunks: chunks.clone(),
         };
         let encoded = rmp_serde::to_vec(&blob).unwrap();
         let compressed =
@@ -1091,31 +1083,6 @@ mod tests {
         assert_eq!(
             restored.chunks.get(&make_chunk_id(2)).unwrap().stored_size,
             200
-        );
-    }
-
-    #[test]
-    fn index_blob_ref_matches_index_blob_wire_format() {
-        let mut chunks = ChunkIndex::new();
-        chunks.add(make_chunk_id(5), 500, make_pack_id(50), 0);
-
-        let generation = 99u64;
-
-        let blob = IndexBlob {
-            generation,
-            chunks: chunks.clone(),
-        };
-        let blob_ref = IndexBlobRef {
-            generation,
-            chunks: &chunks,
-        };
-
-        let serialized_blob = rmp_serde::to_vec(&blob).unwrap();
-        let serialized_ref = rmp_serde::to_vec(&blob_ref).unwrap();
-
-        assert_eq!(
-            serialized_blob, serialized_ref,
-            "IndexBlobRef should produce the same wire format as IndexBlob"
         );
     }
 

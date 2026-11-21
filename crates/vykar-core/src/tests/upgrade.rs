@@ -5,8 +5,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use super::helpers::{
-    FaultyPut, backup_single_source, is_base_put, is_head_put, make_test_config,
-    try_backup_single_source,
+    FaultyPut, backup_single_source, downgrade_to_legacy, is_base_put, is_head_put,
+    make_test_config, try_backup_single_source,
 };
 use crate::commands;
 use crate::commands::check::{IndexRecovery, RepairAction, RepairMode};
@@ -26,9 +26,14 @@ struct Fixture {
     repo_dir: PathBuf,
     source: PathBuf,
     config: VykarConfig,
+    /// The v2/v3 format [`Fixture::downgrade`] produces.
+    legacy: RepoFormat,
 }
 
-fn fixture(format: RepoFormat) -> Fixture {
+/// A repository at the segmented successor of `legacy` (v2 → v4, v3 → v5),
+/// which a test fills and then turns into a `legacy` one with
+/// [`Fixture::downgrade`]: no binary writes v2/v3 any more.
+fn fixture(legacy: RepoFormat) -> Fixture {
     let tmp = tempfile::tempdir().unwrap();
     let repo_dir = tmp.path().join("repo");
     let source = tmp.path().join("src");
@@ -44,7 +49,7 @@ fn fixture(format: RepoFormat) -> Fixture {
         None,
         Some(&config.repository),
         Some(cache),
-        format,
+        legacy.segmented_successor().unwrap(),
     )
     .unwrap();
     Fixture {
@@ -52,6 +57,7 @@ fn fixture(format: RepoFormat) -> Fixture {
         repo_dir,
         source,
         config,
+        legacy,
     }
 }
 
@@ -64,6 +70,12 @@ impl Fixture {
         Box::new(LocalBackend::new(self.repo_dir.to_str().unwrap()).unwrap())
     }
 
+    /// Turn the repository into the `legacy` one 0.24 writes for its data.
+    fn downgrade(&self) {
+        let format = downgrade_to_legacy(&self.repo_dir, None, &self.cache());
+        assert_eq!(format, self.legacy);
+    }
+
     fn open(&self, cache: &Path, with_index: bool) -> Result<Repository> {
         let opts = if with_index {
             OpenOptions::new().with_index()
@@ -71,6 +83,29 @@ impl Fixture {
             OpenOptions::new()
         };
         Repository::open(self.storage(), None, Some(cache.to_path_buf()), opts)
+    }
+
+    /// The open `vykar upgrade` does: any format, without the index.
+    fn open_legacy(&self, cache: &Path) -> Result<Repository> {
+        Repository::open(
+            self.storage(),
+            None,
+            Some(cache.to_path_buf()),
+            OpenOptions::new().legacy_format(),
+        )
+    }
+
+    fn repo_id(&self) -> Vec<u8> {
+        self.open_legacy(&self.cache()).unwrap().config.id.clone()
+    }
+
+    /// This machine's copy of the legacy index blob, planted as 0.24 leaves it.
+    fn plant_blob_copy(&self) -> PathBuf {
+        let blob =
+            dedup_cache::index_blob_cache_path(&self.repo_id(), Some(&self.cache())).unwrap();
+        std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
+        std::fs::write(&blob, b"0.24 blob copy").unwrap();
+        blob
     }
 
     fn version(&self) -> u32 {
@@ -84,6 +119,25 @@ impl Fixture {
         let mut config: RepoConfig = rmp_serde::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         config.version = version;
         std::fs::write(path, rmp_serde::to_vec(&config).unwrap()).unwrap();
+    }
+
+    /// Every file under the repository, by its path relative to it.
+    fn tree(&self) -> std::collections::BTreeMap<String, Vec<u8>> {
+        let mut out = std::collections::BTreeMap::new();
+        let mut stack = vec![self.repo_dir.clone()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else {
+                    let rel = path.strip_prefix(&self.repo_dir).unwrap();
+                    let rel = rel.to_string_lossy().replace('\\', "/");
+                    out.insert(rel, std::fs::read(&path).unwrap());
+                }
+            }
+        }
+        out
     }
 
     fn index_objects(&self) -> usize {
@@ -113,7 +167,7 @@ impl Fixture {
     }
 
     fn snapshot_names(&self) -> Vec<String> {
-        let repo = self.open(&self.cache(), false).unwrap();
+        let repo = self.open_legacy(&self.cache()).unwrap();
         let mut names: Vec<String> = repo
             .manifest()
             .snapshots
@@ -130,13 +184,15 @@ impl Fixture {
         std::fs::write(&path, &bytes[..bytes.len() / 2]).unwrap();
     }
 
-    /// The index as a client with no local cache builds it.
+    /// The index as a client with no local cache builds it; the legacy
+    /// index while `config` is at v2/v3.
     fn cold_index(&self, name: &str) -> Vec<String> {
-        sorted_entries(
-            self.open(&self.tmp.path().join(name), true)
-                .unwrap()
-                .chunk_index(),
-        )
+        let cache = self.tmp.path().join(name);
+        if RepoFormat::from_version(self.version()).is_ok_and(RepoFormat::is_upgrade_only) {
+            let repo = self.open_legacy(&cache).unwrap();
+            return sorted_entries(&repo.legacy_index().unwrap());
+        }
+        sorted_entries(self.open(&cache, true).unwrap().chunk_index())
     }
 }
 
@@ -163,13 +219,9 @@ fn upgrade_moves_the_index_to_a_base() {
         fx.backup("s1");
         fx.write("b", "bravo");
         fx.backup("s2");
+        fx.downgrade();
         let before = fx.cold_index("cold-before");
-        let blob = crate::index::dedup_cache::index_blob_cache_path(
-            &fx.open(&fx.cache(), false).unwrap().config.id,
-            Some(&fx.cache()),
-        )
-        .unwrap();
-        assert!(blob.exists(), "{from:?}: the backup left a local blob copy");
+        let blob = fx.plant_blob_copy();
 
         let outcome = commands::upgrade::run(&fx.config, None).unwrap();
         let UpgradeOutcome::Upgraded {
@@ -218,6 +270,7 @@ fn upgrade_moves_the_index_to_a_base() {
 #[test]
 fn upgrade_of_an_empty_repository() {
     let fx = fixture(RepoFormat::V3);
+    fx.downgrade();
     let outcome = commands::upgrade::run(&fx.config, None).unwrap();
     assert!(
         matches!(
@@ -238,8 +291,9 @@ fn upgrade_of_an_empty_repository() {
     fx.check_clean();
 }
 
-/// Interrupted after the head PUT: `config` still says v3. Monolithic index
-/// reads name `vykar upgrade`, which verifies the chain and completes.
+/// Interrupted after the head PUT: `config` still says v3. Every open but
+/// the upgrade's names `vykar upgrade`, which verifies the chain and
+/// completes.
 #[test]
 fn interrupted_upgrade_resumes() {
     for (from, to) in [
@@ -249,6 +303,7 @@ fn interrupted_upgrade_resumes() {
         let fx = fixture(from);
         fx.write("a", "alpha");
         fx.backup("s1");
+        fx.downgrade();
         let before = fx.cold_index("cold-before");
         commands::upgrade::run(&fx.config, None).unwrap();
         fx.set_version(from.version());
@@ -292,11 +347,12 @@ fn upgrade_leaves_the_index_unloaded_and_the_caches_current() {
         let fx = fixture(RepoFormat::V3);
         fx.write("a", "alpha");
         fx.backup("s1");
+        fx.downgrade();
         if resumed {
             commands::upgrade::run(&fx.config, None).unwrap();
             fx.set_version(3);
         }
-        let id = fx.open(&fx.cache(), false).unwrap().config.id.clone();
+        let id = fx.repo_id();
         let cd = Some(fx.cache());
         let mut stale = vec![
             dedup_cache::dedup_cache_path(&id, cd.as_deref()),
@@ -309,7 +365,7 @@ fn upgrade_leaves_the_index_unloaded_and_the_caches_current() {
             let _ = std::fs::remove_file(path);
         }
 
-        let mut repo = fx.open(&fx.cache(), false).unwrap();
+        let mut repo = fx.open_legacy(&fx.cache()).unwrap();
         let outcome =
             commands::util::with_maintenance_lock(&mut repo, |r| r.upgrade_index_layout()).unwrap();
         assert!(
@@ -339,6 +395,7 @@ fn upgrade_without_config_overwrite_changes_nothing() {
     let fx = fixture(RepoFormat::V3);
     fx.write("a", "alpha");
     fx.backup("s1");
+    fx.downgrade();
     let index = std::fs::read(fx.repo_dir.join("index")).unwrap();
     let (result, ops) = upgrade_through(&fx, |k, _| k == "config");
     let err = result.unwrap_err().to_string();
@@ -358,6 +415,7 @@ fn upgrade_without_config_overwrite_changes_nothing() {
     assert_eq!(fx.version(), 3);
     assert_eq!(std::fs::read(fx.repo_dir.join("index")).unwrap(), index);
     assert_eq!(fx.index_objects(), 0);
+    commands::upgrade::run(&fx.config, None).unwrap();
     fx.check_clean();
 }
 
@@ -381,7 +439,13 @@ fn upgrade_through(
         fail: Box::new(fail),
         ops: Arc::clone(&ops),
     });
-    let mut repo = Repository::open(storage, None, Some(fx.cache()), OpenOptions::new()).unwrap();
+    let mut repo = Repository::open(
+        storage,
+        None,
+        Some(fx.cache()),
+        OpenOptions::new().legacy_format(),
+    )
+    .unwrap();
     let result =
         commands::util::with_maintenance_lock(&mut repo, |repo| repo.upgrade_index_layout());
     drop(repo);
@@ -399,6 +463,7 @@ fn upgrade_deletes_debris_only_after_the_head() {
             fx.write("a", "alpha");
             fx.backup("s1");
         }
+        fx.downgrade();
         let debris = write_debris(&fx);
         let (result, ops) = upgrade_through(&fx, |_, _| false);
         result.unwrap();
@@ -429,6 +494,7 @@ fn upgrade_failing_before_the_head_keeps_the_legacy_index() {
             let fx = fixture(from);
             fx.write("a", "alpha");
             fx.backup("s1");
+            fx.downgrade();
             let before = fx.cold_index(&format!("cold-before-{name}"));
             let debris = write_debris(&fx);
             let index_before = std::fs::read(fx.repo_dir.join("index")).unwrap();
@@ -443,9 +509,7 @@ fn upgrade_failing_before_the_head_keeps_the_legacy_index() {
             );
             assert_eq!(fx.version(), from.version(), "{name}");
             assert!(debris.exists(), "{name}");
-            fx.open(&fx.tmp.path().join(format!("old-open-{name}")), true)
-                .unwrap();
-            fx.check_clean();
+            assert_eq!(fx.cold_index(&format!("legacy-{name}")), before, "{name}");
 
             commands::upgrade::run(&fx.config, None).unwrap();
             assert_eq!(fx.version(), to.version(), "{name}");
@@ -461,8 +525,7 @@ fn upgrade_with_fence(
     fx: &Fixture,
     fence: Arc<dyn Fn() -> Result<()> + Send + Sync>,
 ) -> Result<UpgradeOutcome> {
-    let mut repo =
-        Repository::open(fx.storage(), None, Some(fx.cache()), OpenOptions::new()).unwrap();
+    let mut repo = fx.open_legacy(&fx.cache()).unwrap();
     commands::util::with_maintenance_lock(&mut repo, |repo| {
         repo.set_lock_fence(fence);
         repo.upgrade_index_layout()
@@ -477,12 +540,11 @@ fn holds_head(fx: &Fixture) -> bool {
     is_index_head(&std::fs::read(fx.repo_dir.join("index")).unwrap())
 }
 
-/// The error of a monolithic index read of an interrupted upgrade.
-fn assert_interrupted(err: &VykarError) {
+/// The refusal every open but the upgrade's returns for v2/v3.
+fn assert_legacy_refusal(err: &VykarError) {
     let msg = err.to_string();
     assert!(
-        msg.contains("upgrade to the segmented index format was interrupted")
-            && msg.contains("vykar upgrade"),
+        msg.contains("which this vykar opens only to upgrade it") && msg.contains("vykar upgrade"),
         "{err:?}"
     );
 }
@@ -520,13 +582,14 @@ fn server(segmented_index: bool) -> vykar_protocol::ServerCapabilities {
 }
 
 /// The version-switch `config` PUT fails after the head is in place: every
-/// monolithic path is refused with the interrupted-upgrade error, nothing is
-/// written, and a rerun resumes.
+/// command but the upgrade is refused with the legacy-format error, nothing
+/// is written, and a rerun resumes.
 #[test]
 fn upgrade_failing_at_the_version_switch_is_resumed() {
     let fx = fixture(RepoFormat::V3);
     fx.write("a", "alpha");
     fx.backup("s1");
+    fx.downgrade();
     let before = fx.cold_index("cold-before");
     let config_path = fx.repo_dir.join("config");
     let config_before = std::fs::read(&config_path).unwrap();
@@ -554,21 +617,20 @@ fn upgrade_failing_at_the_version_switch_is_resumed() {
     };
     let packs_before = packs();
 
-    assert_interrupted(&fx.open(&fx.tmp.path().join("reader"), true).err().unwrap());
-    // This machine still has its local blob copy.
-    assert_interrupted(&fx.open(&fx.cache(), true).err().unwrap());
-    assert_interrupted(
+    assert_legacy_refusal(&fx.open(&fx.tmp.path().join("reader"), true).err().unwrap());
+    assert_legacy_refusal(&fx.open(&fx.cache(), true).err().unwrap());
+    assert_legacy_refusal(
         &commands::check::run(&fx.config, None, false, false)
             .err()
             .unwrap(),
     );
-    assert_interrupted(
+    assert_legacy_refusal(
         &commands::compact::run(&fx.config, None, 0.0, None, false, None)
             .err()
             .unwrap(),
     );
     fx.write("b", "bravo");
-    assert_interrupted(
+    assert_legacy_refusal(
         &try_backup_single_source(&fx.config, &fx.source, "src", "s2")
             .err()
             .unwrap(),
@@ -604,6 +666,7 @@ fn lost_lock_before_the_version_switch_leaves_config_unchanged() {
         let fx = fixture(RepoFormat::V3);
         fx.write("a", "alpha");
         fx.backup("s1");
+        fx.downgrade();
         let before = fx.cold_index("cold-before");
         let debris = if resume {
             commands::upgrade::run(&fx.config, None).unwrap();
@@ -654,7 +717,7 @@ fn lost_lock_before_the_version_switch_leaves_config_unchanged() {
         );
         assert_eq!(fx.version(), 3);
         assert!(holds_head(&fx), "{resume}");
-        assert_interrupted(&fx.open(&fx.tmp.path().join("cold"), true).err().unwrap());
+        assert_legacy_refusal(&fx.open(&fx.tmp.path().join("cold"), true).err().unwrap());
 
         let outcome = commands::upgrade::run(&fx.config, None).unwrap();
         assert!(resumed(&outcome), "{resume}: {outcome:?}");
@@ -671,6 +734,7 @@ fn upgrade_probes_the_server_before_writing() {
     let fx = fixture(RepoFormat::V3);
     fx.write("a", "alpha");
     fx.backup("s1");
+    fx.downgrade();
     let read = |name: &str| std::fs::read(fx.repo_dir.join(name)).unwrap();
     let state = || {
         (
@@ -693,8 +757,13 @@ fn upgrade_probes_the_server_before_writing() {
             inner: Arc::new(logged),
             answer,
         });
-        let mut repo =
-            Repository::open(storage, None, Some(fx.cache()), OpenOptions::new()).unwrap();
+        let mut repo = Repository::open(
+            storage,
+            None,
+            Some(fx.cache()),
+            OpenOptions::new().legacy_format(),
+        )
+        .unwrap();
         let result = commands::util::with_maintenance_lock(&mut repo, |r| r.upgrade_index_layout());
         drop(repo);
         let ops = ops.lock().unwrap().clone();
@@ -746,45 +815,6 @@ fn upgrade_probes_the_server_before_writing() {
     fx.check_clean();
 }
 
-/// A v3 view opened before the upgrade completed: its monolithic read, its
-/// locked load and a compact through it are refused, and nothing is written.
-#[test]
-fn a_view_opened_before_the_upgrade_fails_cleanly() {
-    let fx = fixture(RepoFormat::V3);
-    fx.write("a", "alpha");
-    fx.backup("s1");
-    let before = fx.cold_index("cold-before");
-    let mut stale = fx.open(&fx.tmp.path().join("stale"), true).unwrap();
-    assert_eq!(stale.format(), RepoFormat::V3);
-
-    commands::upgrade::run(&fx.config, None).unwrap();
-    let head = std::fs::read(fx.repo_dir.join("index")).unwrap();
-
-    let refused = |res: Result<()>, what: &str| {
-        let err = res.err().unwrap_or_else(|| panic!("{what} succeeded"));
-        assert!(
-            matches!(&err, VykarError::InvalidFormat(m) if m.contains("vykar upgrade")),
-            "{what}: {err:?}"
-        );
-    };
-    refused(stale.load_chunk_index_uncached(), "uncached load");
-    refused(
-        commands::util::with_maintenance_lock(&mut stale, |r| r.load_chunk_index_under_lock()),
-        "locked load",
-    );
-    refused(
-        commands::compact::run_on_repo(&mut stale, 0.0, None, false, None).map(|_| ()),
-        "compact",
-    );
-
-    assert_eq!(std::fs::read(fx.repo_dir.join("index")).unwrap(), head);
-    assert!(!fx.repo_dir.join("index.gen").exists());
-    assert_eq!(fx.version(), 5);
-    drop(stale);
-    assert_eq!(fx.cold_index("cold-after"), before);
-    fx.check_clean();
-}
-
 fn repair(config: &VykarConfig, mode: RepairMode) -> Result<commands::check::RepairResult> {
     commands::check::run_with_repair(config, None, false, mode, None, None)
 }
@@ -804,17 +834,18 @@ fn resumed(outcome: &UpgradeOutcome) -> bool {
     matches!(outcome, UpgradeOutcome::Upgraded { resumed: true, .. })
 }
 
-/// An interrupted upgrade whose chain lost a segment: `vykar upgrade` names
-/// `check --repair`, which repairs the segmented index (dropping the snapshot
-/// that needs the segment) and leaves `config` at v3; `vykar upgrade` then
-/// completes.
+/// An interrupted upgrade whose chain lost a segment: `vykar upgrade`
+/// completes the version switch, deletes nothing and names `check --repair`,
+/// which repairs the index as v5 (dropping the snapshot that needs the
+/// segment).
 #[test]
-fn interrupted_upgrade_with_a_broken_chain_is_repaired_then_completed() {
+fn interrupted_upgrade_with_a_broken_chain_is_completed_then_repaired() {
     let fx = fixture(RepoFormat::V3);
     fx.write("a", "alpha");
     fx.backup("s1");
     fx.write("b", "bravo");
     fx.backup("s2");
+    fx.downgrade();
     commands::upgrade::run(&fx.config, None).unwrap();
     fx.write("c", "charlie");
     fx.backup("s3");
@@ -827,14 +858,18 @@ fn interrupted_upgrade_with_a_broken_chain_is_repaired_then_completed() {
     fx.set_version(3);
     let lost = head.segments.last().unwrap().name;
     std::fs::remove_file(fx.repo_dir.join(INDEX_OBJECT_DIR).join(lost.to_hex())).unwrap();
+    let index_gen = fx.repo_dir.join("index.gen");
+    std::fs::write(&index_gen, 9u64.to_le_bytes()).unwrap();
+    let blob = fx.plant_blob_copy();
 
     let err = commands::upgrade::run(&fx.config, None)
         .err()
         .unwrap()
         .to_string();
+    assert!(err.contains("completed an interrupted upgrade"), "{err}");
     assert!(err.contains("check --repair"), "{err}");
-    assert!(err.contains("`vykar upgrade` again"), "{err}");
-    assert_eq!(fx.version(), 3);
+    assert_eq!(fx.version(), 5);
+    assert!(index_gen.exists() && blob.exists());
 
     let cold = fx.cold("cold");
     let plan = repair(&cold, RepairMode::PlanOnly).unwrap().plan;
@@ -856,52 +891,43 @@ fn interrupted_upgrade_with_a_broken_chain_is_repaired_then_completed() {
     );
     apply_shown(&cold, &plan).unwrap();
 
-    assert_eq!(fx.version(), 3);
     let bytes = std::fs::read(fx.repo_dir.join("index")).unwrap();
-    assert_eq!(bytes[0], 9);
     let crypto = vykar_crypto::PlaintextEngine::new(crate::testutil::test_chunk_hasher());
     let head = index_store::decode_head(&bytes, &crypto).unwrap();
     assert!(head.base.is_some() && head.segments.is_empty());
-    assert_eq!(fx.snapshot_names(), ["s1", "s2"]);
-
-    let outcome = commands::upgrade::run(&fx.config, None).unwrap();
-    assert!(
-        matches!(
-            outcome,
-            UpgradeOutcome::Upgraded {
-                from: 3,
-                to: 5,
-                resumed: true,
-                ..
-            }
-        ),
-        "{outcome:?}"
-    );
-    assert_eq!(fx.version(), 5);
-    assert!(!fx.repo_dir.join("index.gen").exists());
     fx.check_clean();
     assert_eq!(fx.snapshot_names(), ["s1", "s2"]);
+    assert_eq!(
+        commands::upgrade::run(&fx.config, None).unwrap(),
+        UpgradeOutcome::AlreadyCurrent { version: 5 }
+    );
 }
 
-/// An interrupted upgrade whose head is damaged: rebuilt from this
-/// machine's cache, or on another machine from the upgrade's base.
+/// An interrupted upgrade whose head is damaged: `vykar upgrade` completes
+/// the version switch and names `check --repair`, which rebuilds the index
+/// from this machine's cache, or on another machine from the upgrade's base.
 #[test]
-fn interrupted_upgrade_with_a_corrupt_head_is_repaired_then_completed() {
+fn interrupted_upgrade_with_a_corrupt_head_is_completed_then_repaired() {
     let fx = fixture(RepoFormat::V3);
     fx.write("a", "alpha");
     fx.backup("s1");
+    fx.downgrade();
     let before = fx.cold_index("cold-before");
     commands::upgrade::run(&fx.config, None).unwrap();
     fx.set_version(3);
     fx.truncate_head();
+    let index_gen = fx.repo_dir.join("index.gen");
+    std::fs::write(&index_gen, 9u64.to_le_bytes()).unwrap();
+    let blob = fx.plant_blob_copy();
 
     let err = commands::upgrade::run(&fx.config, None)
         .err()
         .unwrap()
         .to_string();
-    assert!(err.contains("cannot be read"), "{err}");
+    assert!(err.contains("completed an interrupted upgrade"), "{err}");
     assert!(err.contains("check --repair"), "{err}");
-    assert!(err.contains("`vykar upgrade` again"), "{err}");
+    assert_eq!(fx.version(), 5);
+    assert!(index_gen.exists() && blob.exists());
 
     let warm = repair(&fx.config, RepairMode::PlanOnly).unwrap().plan;
     assert!(
@@ -930,58 +956,259 @@ fn interrupted_upgrade_with_a_corrupt_head_is_repaired_then_completed() {
     );
     assert!(!plan.has_data_loss, "{:?}", plan.actions);
     apply_shown(&cold, &plan).unwrap();
-    assert_eq!(fx.version(), 3);
 
-    assert!(resumed(&commands::upgrade::run(&fx.config, None).unwrap()));
     assert_eq!(fx.cold_index("cold-after"), before);
     fx.check_clean();
+    assert_eq!(
+        commands::upgrade::run(&fx.config, None).unwrap(),
+        UpgradeOutcome::AlreadyCurrent { version: 5 }
+    );
 }
 
-/// Repair of a healthy interrupted upgrade runs on the segmented index and
-/// leaves the upgrade to `vykar upgrade`.
+/// `check --repair` refuses a healthy interrupted upgrade like any v3
+/// repository and changes nothing; `vykar upgrade` then resumes it.
 #[test]
-fn repair_of_a_healthy_interrupted_upgrade_keeps_it_resumable() {
+fn check_refuses_a_legacy_repository() {
     let fx = fixture(RepoFormat::V3);
     fx.write("a", "alpha");
     fx.backup("s1");
+    fx.downgrade();
     let before = fx.cold_index("cold-before");
     commands::upgrade::run(&fx.config, None).unwrap();
     fx.set_version(3);
+    let state = fx.tree();
 
-    let result = repair(&fx.config, RepairMode::Apply).unwrap();
-    assert_eq!(result.plan.index_recovery, IndexRecovery::Complete);
-    assert!(!result.plan.has_data_loss, "{:?}", result.plan.actions);
-    assert_eq!(fx.version(), 3);
+    for mode in [RepairMode::PlanOnly, RepairMode::Apply] {
+        assert_legacy_refusal(&repair(&fx.config, mode).err().unwrap());
+        assert_eq!(fx.tree(), state);
+    }
 
     assert!(resumed(&commands::upgrade::run(&fx.config, None).unwrap()));
     assert_eq!(fx.cold_index("cold-after"), before);
 }
 
 /// A monolithic index whose first byte was damaged into the head's tag, with
-/// nothing in `index.d/`: refused, not rebuilt as a segmented index.
+/// nothing in `index.d/`: the upgrade refuses it and changes nothing, and
+/// `check --repair` refuses the v3 repository.
 #[test]
 fn damaged_monolithic_index_that_looks_like_a_head_is_refused() {
     let fx = fixture(RepoFormat::V3);
     fx.write("a", "alpha");
     fx.backup("s1");
+    fx.downgrade();
     let path = fx.repo_dir.join("index");
     let mut bytes = std::fs::read(&path).unwrap();
     bytes[0] = 9;
     std::fs::write(&path, &bytes).unwrap();
 
-    for mode in [RepairMode::PlanOnly, RepairMode::Apply] {
-        let err = repair(&fx.config, mode).err().unwrap().to_string();
-        assert!(
-            err.contains("more likely a damaged monolithic index"),
-            "{err}"
-        );
-        assert_eq!(std::fs::read(&path).unwrap(), bytes);
-        assert_eq!(fx.version(), 3);
-        assert_eq!(fx.index_objects(), 0);
-    }
     let err = commands::upgrade::run(&fx.config, None)
         .err()
         .unwrap()
         .to_string();
-    assert!(err.contains("cannot be read"), "{err}");
+    assert!(
+        err.contains("more likely a damaged monolithic index"),
+        "{err}"
+    );
+    assert_eq!(fx.version(), 3);
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    assert_eq!(fx.index_objects(), 0);
+
+    for mode in [RepairMode::PlanOnly, RepairMode::Apply] {
+        assert_legacy_refusal(&repair(&fx.config, mode).err().unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(fx.version(), 3);
+    }
+}
+
+/// A legacy index that cannot be decoded fails the upgrade before anything
+/// is written, and nothing falls back to a local copy.
+#[test]
+fn unreadable_legacy_index_fails_the_upgrade_and_changes_nothing() {
+    let fx = fixture(RepoFormat::V3);
+    fx.write("a", "alpha");
+    fx.backup("s1");
+    fx.downgrade();
+    let path = fx.repo_dir.join("index");
+    let bytes = std::fs::read(&path).unwrap();
+    std::fs::write(&path, &bytes[..bytes.len() / 2]).unwrap();
+    // A local copy 0.24 left must not be used in place of the unreadable index.
+    fx.plant_blob_copy();
+    let state = fx.tree();
+
+    let err = commands::upgrade::run(&fx.config, None)
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(
+        err.contains("the v3 index cannot be read") && err.contains("nothing was changed"),
+        "{err}"
+    );
+    assert_eq!(fx.version(), 3);
+    assert_eq!(fx.tree(), state);
+}
+
+/// Every command but `vykar upgrade` refuses a v3 repository, naming the
+/// upgrade, and none of them writes to it.
+#[test]
+fn legacy_open_is_refused_by_every_command_and_writes_nothing() {
+    let fx = fixture(RepoFormat::V3);
+    fx.write("a", "alpha");
+    fx.backup("s1");
+    fx.downgrade();
+    let state = fx.tree();
+    let config = &fx.config;
+
+    let errors: Vec<(&str, VykarError)> = vec![
+        ("open", fx.open(&fx.cache(), false).err().unwrap()),
+        ("open with index", fx.open(&fx.cache(), true).err().unwrap()),
+        (
+            "check",
+            commands::check::run(config, None, false, false)
+                .err()
+                .unwrap(),
+        ),
+        (
+            "check --repair --dry-run",
+            repair(config, RepairMode::PlanOnly).err().unwrap(),
+        ),
+        (
+            "list",
+            commands::list::list_snapshots(config, None).err().unwrap(),
+        ),
+        ("info", commands::info::run(config, None).err().unwrap()),
+        (
+            "compact",
+            commands::compact::run(config, None, 0.0, None, false, None)
+                .err()
+                .unwrap(),
+        ),
+        (
+            "prune",
+            commands::prune::run(config, None, false, false, &[], &[], None)
+                .err()
+                .unwrap(),
+        ),
+        (
+            "delete",
+            commands::delete::run(config, None, &["s1"], false, None)
+                .err()
+                .unwrap(),
+        ),
+        (
+            "backup",
+            try_backup_single_source(config, &fx.source, "src", "s2")
+                .err()
+                .unwrap(),
+        ),
+    ];
+    for (command, err) in &errors {
+        assert!(
+            err.to_string().contains("vykar upgrade"),
+            "{command}: {err}"
+        );
+    }
+
+    let transient = |p: &String| p.starts_with("locks/") || p.starts_with("sessions/");
+    let after = fx.tree();
+    assert!(after.keys().all(|p| !transient(p)), "{:?}", after.keys());
+    let mut state = state;
+    state.retain(|p, _| !transient(p));
+    assert_eq!(after, state);
+}
+
+#[test]
+fn legacy_open_rejects_load_index() {
+    let fx = fixture(RepoFormat::V3);
+    fx.downgrade();
+    let err = Repository::open(
+        fx.storage(),
+        None,
+        Some(fx.cache()),
+        OpenOptions::new().legacy_format().with_index(),
+    )
+    .err()
+    .unwrap()
+    .to_string();
+    assert!(err.contains("read only by `vykar upgrade`"), "{err}");
+}
+
+#[test]
+fn init_refuses_legacy_formats() {
+    for format in [RepoFormat::V2, RepoFormat::V3] {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = Repository::init_at_format(
+            Box::new(LocalBackend::new(tmp.path().to_str().unwrap()).unwrap()),
+            EncryptionMode::None,
+            crate::config::ChunkerConfig::default(),
+            None,
+            None,
+            None,
+            format,
+        )
+        .err()
+        .unwrap();
+        assert!(
+            matches!(&err, VykarError::Config(m) if m.contains("can no longer be created")),
+            "{format:?}: {err:?}"
+        );
+        assert!(!tmp.path().join("config").exists(), "{format:?}");
+    }
+}
+
+/// Logs every `get` key.
+struct GetLog {
+    inner: Arc<dyn StorageBackend>,
+    gets: Arc<Mutex<Vec<String>>>,
+}
+
+impl InnerBackend for GetLog {
+    fn inner_backend(&self) -> &dyn StorageBackend {
+        &*self.inner
+    }
+}
+
+delegate_storage_backend! {
+    for GetLog;
+    except [get];
+
+    fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        self.gets.lock().unwrap().push(key.to_string());
+        self.inner.get(key)
+    }
+}
+
+/// The upgrade reads `index` once with a plain GET and never reads
+/// `index.gen`, from an empty cache directory.
+#[test]
+fn upgrade_reads_the_index_with_a_plain_get() {
+    let fx = fixture(RepoFormat::V3);
+    fx.write("a", "alpha");
+    fx.backup("s1");
+    fx.downgrade();
+    let before = fx.cold_index("cold-before");
+
+    let gets = Arc::new(Mutex::new(Vec::new()));
+    let storage = Box::new(GetLog {
+        inner: Arc::from(fx.storage()),
+        gets: Arc::clone(&gets),
+    });
+    let cache = fx.tmp.path().join("empty-cache");
+    let mut repo = Repository::open(
+        storage,
+        None,
+        Some(cache),
+        OpenOptions::new().legacy_format(),
+    )
+    .unwrap();
+    let outcome =
+        commands::util::with_maintenance_lock(&mut repo, |r| r.upgrade_index_layout()).unwrap();
+    drop(repo);
+    assert!(
+        matches!(outcome, UpgradeOutcome::Upgraded { resumed: false, .. }),
+        "{outcome:?}"
+    );
+    let gets = gets.lock().unwrap().clone();
+    assert_eq!(gets.iter().filter(|k| *k == "index").count(), 1, "{gets:?}");
+    assert!(!gets.iter().any(|k| k == "index.gen"), "{gets:?}");
+    assert_eq!(fx.cold_index("cold-after"), before);
 }

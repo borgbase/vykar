@@ -497,9 +497,9 @@ pub(super) fn execute_repair(
     repo.chunk_index_mut().rebuild_refcounts(&new_refcounts);
     applied.push(RepairAction::RebuildRefcounts);
 
-    // Step 7: Persist index (also rewrites index.gen). In the segmented
-    // layout this is the one write that folds the index into a new base and
-    // removes unreferenced index objects; earlier persists stay segments.
+    // Step 7: Persist index. This is the one write that folds the index
+    // into a new base and removes unreferenced index objects; earlier
+    // persists stay segments.
     repo.request_index_fold();
     repo.save_state()?;
 

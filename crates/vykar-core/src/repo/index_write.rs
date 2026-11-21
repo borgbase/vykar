@@ -90,9 +90,9 @@ impl Repository {
         self.fold_policy = policy;
     }
 
-    /// The head of a segmented index as last loaded or written by this
-    /// process. `None` for the monolithic layout, and for a segmented one
-    /// whose index `check --repair` is rebuilding.
+    /// The head of the index as last loaded or written by this process.
+    /// `None` on a handle opened for the upgrade, and while `check --repair`
+    /// rebuilds the index.
     pub fn index_head(&self) -> Option<&IndexHead> {
         self.index_head.as_ref()
     }
@@ -120,22 +120,13 @@ impl Repository {
             .find(|c| (c.state_hash(), u64::from(c.entry_count())) == target)
     }
 
-    /// The in-memory index from the local full cache at the current head
-    /// (segmented), or at `index_generation` (monolithic).
+    /// The in-memory index from the local full cache at the current head.
     pub(super) fn chunk_index_from_local_cache(&self) -> Result<ChunkIndex> {
-        if self.is_segmented() {
-            return self
-                .index_head
-                .as_ref()
-                .and_then(|head| self.local_full_cache_at(head))
-                .map(|cache| dedup_cache::chunk_index_from_full_cache(&cache))
-                .ok_or_else(|| VykarError::Other("full index cache not found or stale".into()));
-        }
-        dedup_cache::load_chunk_index_from_full_cache(
-            &self.config.id,
-            self.index_generation,
-            self.cache_dir_override.as_deref(),
-        )
+        self.index_head
+            .as_ref()
+            .and_then(|head| self.local_full_cache_at(head))
+            .map(|cache| dedup_cache::chunk_index_from_full_cache(&cache))
+            .ok_or_else(|| VykarError::Other("full index cache not found or stale".into()))
     }
 
     /// GET the head and check it is the one the in-memory index was loaded
@@ -403,9 +394,6 @@ impl Repository {
     /// `index.d/` objects (debris of interrupted writes). Safe without an
     /// age check: no other writer can be between its segment and head PUTs.
     pub(crate) fn maintain_segmented_index(&mut self) -> Result<()> {
-        if !self.is_segmented() {
-            return Ok(());
-        }
         if self.index_dirty {
             self.save_state()?;
         }
@@ -443,46 +431,17 @@ impl Repository {
     /// salvaged around. An unreadable head is rebuilt from this machine's
     /// full cache, else from the objects in `index.d/` (see
     /// [`index_store::rebuild_without_head`]); a head of an unknown layout or
-    /// an `index` of an unknown type is refused. A monolithic `config` with a
-    /// head at `index` (an interrupted upgrade) is repaired in the segmented
-    /// layout, and `vykar upgrade` completes it afterwards. Either way the
-    /// head is dropped, so the repair's index write is a fresh base. Returns
-    /// how the index was read.
+    /// an `index` of an unknown type is refused. When the index is rebuilt,
+    /// the head is dropped, so the repair's index write is a fresh base.
+    /// Returns how the index was read.
     pub(crate) fn load_chunk_index_for_repair(&mut self) -> Result<IndexRecovery> {
         let data = self.storage.get("index")?;
-        let adopted =
-            !self.is_segmented() && data.as_deref().is_some_and(super::upgrade::is_index_head);
-        if !adopted && !self.is_segmented() {
-            // As `load_chunk_index_uncached`, on the bytes fetched above.
-            self.chunk_index = Self::decode_full_index(data, self.crypto.as_ref())?.1;
-            self.local_caches_stale = false;
-            self.rebase_pack_target_from_index();
-            return Ok(IndexRecovery::Complete);
-        }
-        let monolithic = self.format;
-        if adopted {
-            self.adopt_interrupted_upgrade_layout();
-        }
-        let result = self.load_segmented_index_for_repair(data, adopted);
-        if adopted {
-            match &result {
-                Ok(_) => warn!(
-                    "the index is read in the segmented layout the interrupted upgrade \
-                     wrote; to complete the upgrade, run `vykar upgrade` after the repair"
-                ),
-                Err(_) => self.format = monolithic,
-            }
-        }
-        result
+        self.load_segmented_index_for_repair(data)
     }
 
-    /// [`Self::load_chunk_index_for_repair`] on the segmented layout, from
-    /// the object fetched at `index`.
-    fn load_segmented_index_for_repair(
-        &mut self,
-        data: Option<Vec<u8>>,
-        adopted: bool,
-    ) -> Result<IndexRecovery> {
+    /// [`Self::load_chunk_index_for_repair`], from the object fetched at
+    /// `index`.
+    fn load_segmented_index_for_repair(&mut self, data: Option<Vec<u8>>) -> Result<IndexRecovery> {
         let (index, recovery) = match data {
             None => {
                 warn!("the index head is missing; rebuilding from an empty index");
@@ -494,7 +453,7 @@ impl Repository {
                         "`index` holds a monolithic index; rebuilding the segmented index from it"
                     );
                     (
-                        Self::decode_full_index(Some(data), self.crypto.as_ref())?.1,
+                        super::upgrade::decode_index_blob(Some(data), self.crypto.as_ref())?.1,
                         IndexRecovery::LegacyBlob,
                     )
                 }
@@ -568,7 +527,7 @@ impl Repository {
                          copy of the repository"
                     )));
                 }
-                StoredHead::Unreadable(err) => self.chunk_index_without_head(&err, adopted)?,
+                StoredHead::Unreadable(err) => self.chunk_index_without_head(&err)?,
             },
         };
         self.chunk_index = index;
@@ -578,19 +537,6 @@ impl Repository {
         self.local_caches_stale = false;
         self.rebase_pack_target_from_index();
         Ok(recovery)
-    }
-
-    /// Switch this run (not `config`) to the segmented successor format.
-    fn adopt_interrupted_upgrade_layout(&mut self) {
-        let Some(successor) = self.format.segmented_successor() else {
-            return;
-        };
-        warn!(
-            "`config` names format v{} but `index` holds a segmented index head: an upgrade \
-             was interrupted",
-            self.config.version
-        );
-        self.format = successor;
     }
 
     /// This machine's full index cache at any state: this run's temp-file
@@ -606,27 +552,7 @@ impl Repository {
 
     /// The index for `check --repair` when `index` cannot be read (`err`):
     /// this machine's full cache, else rebuilt from `index.d/`.
-    fn chunk_index_without_head(
-        &self,
-        err: &VykarError,
-        adopted: bool,
-    ) -> Result<(ChunkIndex, IndexRecovery)> {
-        let listed = if adopted {
-            let names = list_objects_for_repair(self.storage.as_ref())?;
-            if names.is_empty() {
-                return Err(VykarError::Other(format!(
-                    "`config` names format v{}, and `index` starts like the segmented index \
-                     head of an interrupted upgrade, but it cannot be read ({err}) and \
-                     index.d/ holds no index objects: `index` is more likely a damaged \
-                     monolithic index. Nothing was changed; restore `index` from a copy of \
-                     the repository",
-                    self.config.version
-                )));
-            }
-            Some(names)
-        } else {
-            None
-        };
+    fn chunk_index_without_head(&self, err: &VykarError) -> Result<(ChunkIndex, IndexRecovery)> {
         if let Some(cache) = self.local_full_cache_any() {
             warn!(
                 "the index head cannot be read ({err}); rebuilding the index from this \
@@ -645,10 +571,7 @@ impl Repository {
             "the index head cannot be read ({err}); rebuilding the index from the objects in \
              index.d/"
         );
-        let names = match listed {
-            Some(names) => names,
-            None => list_objects_for_repair(self.storage.as_ref())?,
-        };
+        let names = list_objects_for_repair(self.storage.as_ref())?;
         let path = self.full_cache_path();
         let anchor = index_store::cache_anchor(path.as_deref());
         let rebuilt = match index_store::rebuild_without_head(
@@ -684,7 +607,7 @@ impl Repository {
 
 /// The `index.d/` listing for a repair without a head. A failure is named as
 /// such and gets none of [`repair_load_refusal`]'s advice about objects.
-fn list_objects_for_repair(
+pub(super) fn list_objects_for_repair(
     storage: &dyn vykar_storage::StorageBackend,
 ) -> Result<Vec<crate::index::head::ObjectName>> {
     index_store::list_objects(storage).map_err(|e| match e {

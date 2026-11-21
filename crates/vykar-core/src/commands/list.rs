@@ -279,7 +279,6 @@ impl ItemStreamReader {
         let mut stream = LazyItemStream {
             storage: Arc::clone(&repo.storage),
             crypto: Arc::clone(&repo.crypto),
-            format: repo.format(),
             shutdown,
             chunks,
             from_cache,
@@ -324,11 +323,12 @@ impl ItemStreamReader {
     /// declares a chunk missing keeps an incomplete cache from marking files
     /// damaged.
     ///
-    /// This only checks presence. The pin is the advisory `index.gen`, so a
-    /// cache can hold every chunk and still be stale (locations of packs a
-    /// compaction has since rewritten); a caller that fails to read a chunk
-    /// at a cached location must call [`Self::fall_back_to_index`] and
-    /// resolve it again before treating the chunk as unreadable.
+    /// This only checks presence. The pin is the generation the open read
+    /// from the index head, so a cache can hold every chunk and still be
+    /// stale (locations of packs a compaction has since rewritten); a caller
+    /// that fails to read a chunk at a cached location must call
+    /// [`Self::fall_back_to_index`] and resolve it again before treating the
+    /// chunk as unreadable.
     pub fn ensure_resolvable<'a>(
         &mut self,
         repo: &mut Repository,
@@ -419,7 +419,6 @@ fn resolve_from_index(index: &crate::index::ChunkIndex, ids: &[ChunkId]) -> Resu
 pub struct LazyItemStream<'a> {
     storage: Arc<dyn StorageBackend>,
     crypto: Arc<dyn CryptoEngine>,
-    format: crate::repo::RepoFormat,
     shutdown: Option<&'a AtomicBool>,
     chunks: Vec<ChunkLoc>,
     from_cache: bool,
@@ -459,7 +458,6 @@ impl<'a> LazyItemStream<'a> {
         Self {
             storage: Arc::clone(&repo.storage),
             crypto: Arc::clone(&repo.crypto),
-            format: repo.format(),
             shutdown,
             chunks,
             from_cache,
@@ -585,11 +583,8 @@ impl<'a> LazyItemStream<'a> {
                 info!("restore cache location unreadable, falling back to full index: {e}");
                 self.from_cache = false;
                 self.cache_distrusted.store(true, Ordering::Relaxed);
-                let (_, index) = Repository::fetch_full_index(
-                    self.storage.as_ref(),
-                    self.crypto.as_ref(),
-                    self.format,
-                )?;
+                let (_, index) =
+                    Repository::fetch_full_index(self.storage.as_ref(), self.crypto.as_ref())?;
                 let rest = self.chunks.get(self.next..).unwrap_or_default();
                 let ids: Vec<ChunkId> = rest.iter().map(|c| c.0).collect();
                 let resolved = resolve_from_index(&index, &ids)?;

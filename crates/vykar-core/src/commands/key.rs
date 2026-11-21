@@ -3,7 +3,7 @@
 //! Both work on **raw storage**, without `Repository::open`. `import` has to:
 //! it runs on a repository that can no longer be opened, which is exactly when
 //! a key needs restoring. `export` must too: a recovery tool for the key cannot
-//! be allowed to fail on an unreadable `index.gen` sidecar, scale with the
+//! be allowed to fail on an unreadable index head, scale with the
 //! snapshot count, or write anything — all of which `open` does.
 //!
 //! The CLI owns the armor format, file I/O and printing. Everything that

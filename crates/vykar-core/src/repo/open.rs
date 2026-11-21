@@ -5,22 +5,20 @@ use chrono::Utc;
 use rand::Rng;
 
 use super::file_cache::FileCache;
-use super::format::{ObjectType, pack_object_streaming_with_context};
 use super::index_store;
 use super::key::{self, KeyProofCtx};
 use super::manifest::Manifest;
 use super::snapshot_cache;
 use super::{
-    EncryptionMode, INDEX_OBJECT_CONTEXT, IndexLayout, KEY_PRIMARY, KEY_SECONDARY,
-    MAX_PACK_SIZE_LIMIT, OpenOptions, RepoConfig, RepoFormat, Repository,
+    EncryptionMode, KEY_PRIMARY, KEY_SECONDARY, MAX_PACK_SIZE_LIMIT, OpenOptions, RepoConfig,
+    RepoFormat, Repository,
 };
-use crate::compress;
 use crate::config::{
     ChunkerConfig, RepositoryConfig, default_max_pack_size, default_min_pack_size,
 };
+use crate::index::ChunkIndex;
 use crate::index::dedup_cache::generation_for_state;
 use crate::index::head::IndexHead;
-use crate::index::{ChunkIndex, IndexBlob};
 use vykar_crypto::key::{EncryptedKey, MasterKey};
 use vykar_crypto::{CryptoEngine, PlaintextEngine};
 use vykar_storage::StorageBackend;
@@ -108,6 +106,12 @@ impl Repository {
         cache_dir: Option<PathBuf>,
         format: RepoFormat,
     ) -> Result<Self> {
+        if format.is_upgrade_only() {
+            return Err(VykarError::Config(format!(
+                "format v{} repositories can no longer be created",
+                format.version()
+            )));
+        }
         // Library callers can bypass YAML validation. Reject unsupported
         // parameters before writing a new repository's immutable config.
         chunker_params.validate_stored()?;
@@ -171,12 +175,10 @@ impl Repository {
                 }
             };
 
-        let layout = format.index_layout();
-
         // Pre-flight: refuse to create a repository the server cannot serve.
         //
         // Load-bearing, because `init` writes only non-pack keys (config,
-        // keys/repokey, index, index.gen) and an old server accepts every one
+        // keys/repokey, index) and an old server accepts every one
         // of them. Without this probe `vykar init` would *succeed* against an
         // old server and only the first `backup` would fail, leaving a repo
         // nobody can write to.
@@ -193,7 +195,7 @@ impl Repository {
                         format.version(),
                     )));
                 }
-                if layout == IndexLayout::Segmented && !caps.segmented_index {
+                if !caps.segmented_index {
                     return Err(VykarError::Config(format!(
                         "vykar-server at {} (version {}) does not support the segmented \
                          index of format v{}. Upgrade the server first.",
@@ -242,40 +244,13 @@ impl Repository {
 
         let manifest = Manifest::new();
         let chunk_index = ChunkIndex::new();
-        let (index_generation, index_head) = match layout {
-            IndexLayout::Monolithic => {
-                // Store empty IndexBlob (compressed with ZSTD)
-                let index_blob = IndexBlob {
-                    generation: 0,
-                    chunks: chunk_index.clone(),
-                };
-                let index_packed = pack_object_streaming_with_context(
-                    ObjectType::ChunkIndex,
-                    INDEX_OBJECT_CONTEXT,
-                    64, // empty index is tiny
-                    crypto.as_ref(),
-                    |buf| {
-                        compress::compress_stream_zstd(buf, 3, |encoder| {
-                            rmp_serde::encode::write(encoder, &index_blob)?;
-                            Ok(())
-                        })
-                    },
-                )?;
-                storage.put("index", &index_packed)?;
-
-                // Write advisory index.gen sidecar
-                storage.put("index.gen", &0u64.to_le_bytes())?;
-                (0, None)
-            }
-            IndexLayout::Segmented => {
-                // `server_init` does not create `index.d/`: a server that
-                // predates it refuses to start with the directory present.
-                storage.create_dir(index_store::INDEX_OBJECT_DIR)?;
-                let head = IndexHead::empty();
-                storage.put("index", &index_store::pack_head(&head, crypto.as_ref())?)?;
-                (generation_for_state(&head.state_hash), Some(head))
-            }
-        };
+        // `server_init` does not create `index.d/`: a server that predates
+        // it refuses to start with the directory present.
+        storage.create_dir(index_store::INDEX_OBJECT_DIR)?;
+        let head = IndexHead::empty();
+        storage.put("index", &index_store::pack_head(&head, crypto.as_ref())?)?;
+        let index_generation = generation_for_state(&head.state_hash);
+        let index_head = Some(head);
 
         // Create directory structure (skip if server already did it)
         if !server_did_init {
@@ -304,7 +279,6 @@ impl Repository {
             write_session: None,
             lock_fence: None,
             key_blob,
-            index_sidecar_write: None,
             local_caches_stale: false,
             index_head,
             index_scratch: None,
@@ -336,61 +310,26 @@ impl Repository {
         opts: OpenOptions,
     ) -> Result<Self> {
         let (mut repo, file_cache_load) = Self::open_inner(storage, passphrase, cache_dir, &opts)?;
-        if repo.is_segmented() {
-            // Local cache catch-up and segment downloads overlap the file
-            // cache load; the index is built only after it finished.
-            let synced = opts.load_index.then(|| {
-                let head = repo.index_head.take();
-                repo.sync_index(head, true)
-            });
-            if let Some(handle) = file_cache_load {
-                repo.file_cache = handle
-                    .join()
-                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-            }
-            if let Some(synced) = synced {
-                let start = std::time::Instant::now();
-                let synced = synced?;
-                let source = synced.source;
-                repo.install_synced_index(synced);
-                tracing::debug!(
-                    ?source,
-                    generation = repo.index_generation,
-                    entries = repo.chunk_index.len(),
-                    elapsed_ms = start.elapsed().as_millis() as u64,
-                    "index loaded at open"
-                );
-            }
-            return Ok(repo);
-        }
-        // The index GET overlaps the file cache load (local disk), which
-        // runs on its own thread. A local copy confirmed by storage is read
-        // and verified, and the index decoded, only after that load has
-        // finished, so the two never hold their transient buffers at once.
-        let index_object = opts.load_index.then(|| {
-            super::index_fetch::fetch_index_object(
-                repo.storage.as_ref(),
-                &repo.config.id,
-                repo.cache_dir_override.as_deref(),
-            )
+        // Local cache catch-up and segment downloads overlap the file cache
+        // load; the index is built only after it finished.
+        let synced = opts.load_index.then(|| {
+            let head = repo.index_head.take();
+            repo.sync_index(head, true)
         });
         if let Some(handle) = file_cache_load {
             repo.file_cache = handle
                 .join()
                 .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
         }
-        if let Some(index_object) = index_object {
+        if let Some(synced) = synced {
             let start = std::time::Instant::now();
-            let (index, source) = repo.index_from_object(index_object?)?;
-            let (generation, entries) = (index.0, index.1.len());
-            // `index_generation` still holds the `index.gen` hint read in
-            // `open_inner`, before the index GET.
-            let sidecar = repo.index_generation;
-            repo.install_chunk_index(index, Some(sidecar));
+            let synced = synced?;
+            let source = synced.source;
+            repo.install_synced_index(synced);
             tracing::debug!(
                 ?source,
-                generation,
-                entries,
+                generation = repo.index_generation,
+                entries = repo.chunk_index.len(),
                 elapsed_ms = start.elapsed().as_millis() as u64,
                 "index loaded at open"
             );
@@ -414,6 +353,16 @@ impl Repository {
             .ok_or_else(|| VykarError::RepoNotFound("config not found".into()))?;
         let repo_config: RepoConfig = rmp_serde::from_slice(&config_data)?;
         let format = repo_config.validate()?;
+        if format.is_upgrade_only() {
+            if !opts.legacy_format {
+                return Err(super::upgrade::legacy_format_error(format));
+            }
+            if opts.load_index {
+                return Err(VykarError::Other(
+                    "a v2/v3 index is read only by `vykar upgrade`".into(),
+                ));
+            }
+        }
 
         if opts.require_encryption && repo_config.encryption == EncryptionMode::None {
             return Err(VykarError::PlaintextRepository(
@@ -490,17 +439,7 @@ impl Repository {
         // loss; only files unwritten for a day.
         crate::index::dedup_cache::sweep_stale_cache_temps(&repo_config.id, cache_dir.as_deref());
 
-        // Read advisory index.gen sidecar (cache hint only, not trusted for
-        // writes). The segmented layout has none.
-        let mut index_generation = match format.index_layout() {
-            IndexLayout::Monolithic => match storage.get("index.gen")? {
-                Some(data) => <[u8; 8]>::try_from(data.as_slice())
-                    .map(u64::from_le_bytes)
-                    .unwrap_or(0),
-                None => 0,
-            },
-            IndexLayout::Segmented => 0,
-        };
+        let mut index_generation = 0;
 
         // Refresh snapshot list from snapshots/ (replaces manifest load).
         // Resilient open: skip unreadable snapshots so a single corrupt blob
@@ -515,24 +454,24 @@ impl Repository {
         let skipped_snapshots = refresh.skipped;
         let manifest = Manifest::from_snapshot_entries(refresh.entries);
 
-        // Segmented layout: the head, read once and only after the snapshot
-        // list. A writer PUTs the head before its snapshot, so this head
-        // covers every listed snapshot. Opens without the index still use
-        // it for the state identity of the local caches.
-        let index_head = match format.index_layout() {
-            IndexLayout::Monolithic => None,
-            IndexLayout::Segmented => {
-                match index_store::fetch_head(storage.as_ref(), crypto.as_ref()) {
-                    Ok(head) => {
-                        index_generation = generation_for_state(&head.state_hash);
-                        Some(head)
-                    }
-                    Err(e) if opts.tolerate_broken_index => {
-                        tracing::warn!("the index head cannot be read: {e}");
-                        None
-                    }
-                    Err(e) => return Err(e),
+        // The head, read once and only after the snapshot list. A writer
+        // PUTs the head before its snapshot, so this head covers every listed
+        // snapshot. Opens without the index still use it for the state
+        // identity of the local caches. A handle opened for the upgrade has
+        // none.
+        let index_head = if format.is_upgrade_only() {
+            None
+        } else {
+            match index_store::fetch_head(storage.as_ref(), crypto.as_ref()) {
+                Ok(head) => {
+                    index_generation = generation_for_state(&head.state_hash);
+                    Some(head)
                 }
+                Err(e) if opts.tolerate_broken_index => {
+                    tracing::warn!("the index head cannot be read: {e}");
+                    None
+                }
+                Err(e) => return Err(e),
             }
         };
 
@@ -554,7 +493,6 @@ impl Repository {
             write_session: None,
             lock_fence: None,
             key_blob,
-            index_sidecar_write: None,
             local_caches_stale: false,
             index_head,
             index_scratch: None,
@@ -568,105 +506,23 @@ impl Repository {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::ChunkIndexEntry;
-    use crate::index::dedup_cache::{self, CachedIndexBlob};
-    use crate::repo::commit::IndexSource;
-    use crate::repo::index_fetch::IndexObject;
+    use crate::index::dedup_cache;
     use crate::testutil::MemoryBackend;
-    use std::collections::HashMap;
-    use std::sync::Mutex;
-    use vykar_storage::{InnerBackend, delegate_storage_backend};
     use vykar_types::chunk_id::ChunkId;
     use vykar_types::pack_id::PackId;
 
-    /// Logs every `get` key in call order.
-    struct GetLog {
-        inner: Arc<dyn StorageBackend>,
-        gets: Arc<Mutex<Vec<String>>>,
-    }
-
-    impl InnerBackend for GetLog {
-        fn inner_backend(&self) -> &dyn StorageBackend {
-            &*self.inner
-        }
-    }
-
-    delegate_storage_backend! {
-        for GetLog;
-        except [get, get_if_changed];
-
-        fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
-            self.gets.lock().unwrap().push(key.to_string());
-            self.inner.get(key)
-        }
-
-        fn get_if_changed(
-            &self,
-            key: &str,
-            _known: &[u8; 32],
-        ) -> Result<vykar_storage::ConditionalGet> {
-            vykar_storage::get_unconditionally(self, key)
-        }
-    }
-
-    /// With `with_index`, the index is still fetched after the `index.gen`
-    /// hint it is compared against (see `install_chunk_index`), and it is
-    /// installed with its generation.
-    #[test]
-    fn open_with_index_reads_the_sidecar_before_the_index() {
-        crate::testutil::init_test_environment();
-        let inner: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
-        Repository::init_at_format(
-            Box::new(Arc::clone(&inner)),
-            EncryptionMode::None,
-            ChunkerConfig::default(),
-            None,
-            None,
-            None,
-            crate::repo::RepoFormat::V3,
-        )
-        .unwrap();
-        // Make the sidecar disagree, so the open must repair it.
-        inner.put("index.gen", &7u64.to_le_bytes()).unwrap();
-
-        let gets = Arc::new(Mutex::new(Vec::new()));
-        let storage = Box::new(GetLog {
-            inner: Arc::clone(&inner),
-            gets: Arc::clone(&gets),
-        });
-        let cache = tempfile::tempdir().unwrap();
-        let repo = Repository::open(
-            storage,
-            None,
-            Some(cache.path().to_path_buf()),
-            OpenOptions::new().with_index(),
-        )
-        .unwrap();
-
-        let gets = gets.lock().unwrap().clone();
-        let pos = |k: &str| gets.iter().position(|g| g == k).expect(k);
-        assert!(pos("index.gen") < pos("index"), "{gets:?}");
-        assert_eq!(repo.index_generation, 0);
-        assert_eq!(
-            inner.get("index.gen").unwrap().unwrap(),
-            0u64.to_le_bytes(),
-            "the stale sidecar is rewritten to the index's generation"
-        );
-    }
-
     /// A plaintext repository whose index (refcounts 2, 1, 1) was persisted,
-    /// with the blob cache and a full cache at its generation in `cache`.
+    /// with a full cache at its generation in `cache`.
     fn repo_with_caches(cache: &std::path::Path) -> (Arc<dyn StorageBackend>, Repository) {
         crate::testutil::init_test_environment();
         let inner: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
-        let mut repo = Repository::init_at_format(
+        let mut repo = Repository::init(
             Box::new(Arc::clone(&inner)),
             EncryptionMode::None,
             ChunkerConfig::default(),
             None,
             None,
             Some(cache.to_path_buf()),
-            crate::repo::RepoFormat::V3,
         )
         .unwrap();
         let pack = PackId::from_bytes([0xAA; 32]);
@@ -681,18 +537,7 @@ mod tests {
         }
         index.increment_refcount(&ChunkId::from_bytes([0; 32]));
         repo.save_state().unwrap();
-        dedup_cache::build_full_index_cache(
-            repo.chunk_index(),
-            repo.index_generation,
-            &repo.config.id,
-            Some(cache),
-        )
-        .unwrap();
         (inner, repo)
-    }
-
-    fn entries(index: &ChunkIndex) -> HashMap<ChunkId, ChunkIndexEntry> {
-        index.iter().map(|(id, e)| (*id, *e)).collect()
     }
 
     #[test]
@@ -712,14 +557,12 @@ mod tests {
                 .unwrap();
         }
         std::fs::write(&fresh_temp, b"fresh").unwrap();
-        for name in ["full_index_cache", "index_blob"] {
-            std::fs::File::options()
-                .write(true)
-                .open(dir.join(name))
-                .unwrap()
-                .set_modified(old)
-                .unwrap();
-        }
+        std::fs::File::options()
+            .write(true)
+            .open(dir.join("full_index_cache"))
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
         let generation = repo.index_generation;
         drop(repo);
 
@@ -740,7 +583,6 @@ mod tests {
         assert!(
             dedup_cache::MmapFullIndexCache::open(&id, generation, Some(cache.path())).is_some()
         );
-        assert!(CachedIndexBlob::open(&id, Some(cache.path())).is_some());
 
         // The cache dir is swept on every open, not rate-limited.
         let second = dir.join(".restore_cache.XyZ789.tmp");
@@ -750,84 +592,6 @@ mod tests {
             .unwrap();
         drop(open());
         assert!(!second.exists());
-    }
-
-    #[test]
-    fn index_from_object_uses_full_cache_for_cached_and_matching_remote() {
-        let cache = tempfile::tempdir().unwrap();
-        let (inner, repo) = repo_with_caches(cache.path());
-        let cd = Some(cache.path());
-        let stored = inner.get("index").unwrap().unwrap();
-        let (generation, decoded) =
-            Repository::decode_full_index(Some(stored.clone()), repo.crypto.as_ref()).unwrap();
-        assert_eq!(generation, repo.index_generation);
-        assert_eq!(decoded.len(), 3);
-
-        let cached = CachedIndexBlob::open(&repo.config.id, cd).unwrap();
-        let ((g, index), source) = repo.index_from_object(IndexObject::Cached(cached)).unwrap();
-        assert_eq!(source, IndexSource::FullCache);
-        assert_eq!((g, entries(&index)), (generation, entries(&decoded)));
-
-        let ((g, index), source) = repo
-            .index_from_object(IndexObject::Remote(Some(stored.clone())))
-            .unwrap();
-        assert_eq!(source, IndexSource::FullCache);
-        assert_eq!((g, entries(&index)), (generation, entries(&decoded)));
-
-        // Another client rewrites the index: decoded, not taken from the full cache.
-        let other_cache = tempfile::tempdir().unwrap();
-        let mut other_repo = Repository::open(
-            Box::new(Arc::clone(&inner)),
-            None,
-            Some(other_cache.path().to_path_buf()),
-            OpenOptions::new().with_index(),
-        )
-        .unwrap();
-        other_repo
-            .chunk_index_mut()
-            .increment_refcount(&ChunkId::from_bytes([1; 32]));
-        other_repo.save_state().unwrap();
-        let other = inner.get("index").unwrap().unwrap();
-        let (other_gen, other_decoded) =
-            Repository::decode_full_index(Some(other.clone()), repo.crypto.as_ref()).unwrap();
-        let ((g, index), source) = repo
-            .index_from_object(IndexObject::Remote(Some(other)))
-            .unwrap();
-        assert_eq!(source, IndexSource::Decoded);
-        assert_eq!((g, entries(&index)), (other_gen, entries(&other_decoded)));
-
-        let ((g, index), source) = repo.index_from_object(IndexObject::Remote(None)).unwrap();
-        assert_eq!(source, IndexSource::Decoded);
-        assert_eq!((g, index.len()), (0, 0));
-    }
-
-    #[test]
-    fn index_from_object_decodes_when_full_cache_generation_differs() {
-        let cache = tempfile::tempdir().unwrap();
-        let (inner, repo) = repo_with_caches(cache.path());
-        let cd = Some(cache.path());
-        // Same content, another generation label: no longer provably ours.
-        dedup_cache::build_full_index_cache(
-            repo.chunk_index(),
-            repo.index_generation.wrapping_add(1),
-            &repo.config.id,
-            cd,
-        )
-        .unwrap();
-        let stored = inner.get("index").unwrap().unwrap();
-        let (generation, decoded) =
-            Repository::decode_full_index(Some(stored.clone()), repo.crypto.as_ref()).unwrap();
-
-        let cached = CachedIndexBlob::open(&repo.config.id, cd).unwrap();
-        let ((g, index), source) = repo.index_from_object(IndexObject::Cached(cached)).unwrap();
-        assert_eq!(source, IndexSource::Decoded);
-        assert_eq!((g, entries(&index)), (generation, entries(&decoded)));
-
-        let ((g, index), source) = repo
-            .index_from_object(IndexObject::Remote(Some(stored)))
-            .unwrap();
-        assert_eq!(source, IndexSource::Decoded);
-        assert_eq!((g, entries(&index)), (generation, entries(&decoded)));
     }
 
     /// Pins the plaintext chunk-ID key derivation for both formats, through

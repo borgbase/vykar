@@ -18,7 +18,9 @@
 mod common;
 
 use vykar_core::commands;
-use vykar_core::repo::{IndexLayout, Repository, UpgradeOutcome};
+use vykar_core::index::ChunkIndex;
+use vykar_core::repo::{OpenOptions, Repository, UpgradeOutcome};
+use vykar_storage::local_backend::LocalBackend;
 
 use crate::common::backup_source;
 use crate::common::fixtures::{self, Fixture, archive_path, read_tree};
@@ -48,12 +50,12 @@ fn extract(mode: &str) -> Fixture {
 }
 
 fn sorted_entries(
-    repo: &Repository,
+    index: &ChunkIndex,
 ) -> Vec<(
     vykar_types::chunk_id::ChunkId,
     vykar_core::index::ChunkIndexEntry,
 )> {
-    let mut out: Vec<_> = repo.chunk_index().iter().map(|(id, e)| (*id, *e)).collect();
+    let mut out: Vec<_> = index.iter().map(|(id, e)| (*id, *e)).collect();
     out.sort_by_key(|(id, _)| *id.as_bytes());
     out
 }
@@ -113,8 +115,10 @@ fn v3_fixture_archives_are_frozen() {
     );
 }
 
+/// Every open but the upgrade's refuses a v3 fixture and writes nothing; the
+/// upgrade's open reads its config, snapshots and legacy index.
 #[test]
-fn v3_fixtures_open_as_format_v3() {
+fn v3_fixtures_open_only_for_upgrade() {
     for mode in MODES {
         let fx = extract(mode);
         assert_eq!(
@@ -126,12 +130,26 @@ fn v3_fixtures_open_as_format_v3() {
         assert!(fx.repo_dir().join("index.gen").is_file(), "{mode}");
         assert!(!fx.repo_dir().join("index.d").exists(), "{mode}");
 
-        let repo = fx.open();
+        let tree = read_tree(&fx.repo_dir());
+        for opts in [OpenOptions::new(), OpenOptions::new().with_index()] {
+            let storage = Box::new(LocalBackend::new(fx.repo_dir().to_str().unwrap()).unwrap());
+            let err = Repository::open(storage, fx.passphrase(), Some(fx.cache_dir()), opts)
+                .err()
+                .unwrap()
+                .to_string();
+            assert!(err.contains("vykar upgrade"), "{mode}: {err}");
+        }
+        assert_eq!(
+            read_tree(&fx.repo_dir()),
+            tree,
+            "{mode}: a refused open wrote"
+        );
+
+        let repo = fx.open_legacy();
         assert_eq!(
             repo.config.version, 3,
             "{mode}: fixture must stay at format v3"
         );
-        assert_eq!(repo.format().index_layout(), IndexLayout::Monolithic);
         assert!(repo.index_head().is_none(), "{mode}");
         assert_eq!(repo.config.encryption, fx.expected_encryption(), "{mode}");
 
@@ -151,23 +169,54 @@ fn v3_fixtures_open_as_format_v3() {
             repo.skipped_snapshots().is_empty(),
             "{mode}: no snapshot may be unreadable"
         );
+        assert!(!repo.legacy_index().unwrap().is_empty(), "{mode}");
     }
 }
 
+/// A backup into a v3 fixture is refused and leaves no session marker and no
+/// new pack.
 #[test]
-fn v3_fixtures_restore_byte_identical() {
-    for mode in MODES {
-        let fx = extract(mode);
-        assert_restores_source(&fx, "restore-original", mode);
-    }
+fn v3_fixture_backup_is_refused_and_leaves_no_session() {
+    let fx = extract("none");
+    let config = fx.config();
+    let packs_before = pack_files(&fx);
+    let source_paths = vec![fx.source_dir().to_string_lossy().to_string()];
+    let err = commands::backup::run(
+        &config,
+        commands::backup::BackupRequest {
+            snapshot_name: "refused",
+            passphrase: fx.passphrase(),
+            source_paths: &source_paths,
+            source_label: "fixture-src",
+            exclude_patterns: &[],
+            exclude_if_present: &[],
+            one_file_system: true,
+            git_ignore: false,
+            xattrs_enabled: config.xattrs.enabled,
+            compression: vykar_core::compress::Compression::None,
+            command_dumps: &[],
+            verbose: false,
+        },
+    )
+    .err()
+    .unwrap()
+    .to_string();
+    assert!(err.contains("vykar upgrade"), "{err}");
+    let sessions = fx.repo_dir().join("sessions");
+    let markers: Vec<_> = std::fs::read_dir(&sessions)
+        .map(|d| d.map(|e| e.unwrap().file_name()).collect())
+        .unwrap_or_default();
+    assert!(markers.is_empty(), "{markers:?}");
+    assert_eq!(pack_files(&fx), packs_before);
 }
 
-#[test]
-fn v3_fixtures_verify_data_is_clean() {
-    for mode in MODES {
-        let fx = extract(mode);
-        assert_check_clean(&fx, mode);
-    }
+fn pack_files(fx: &Fixture) -> Vec<std::path::PathBuf> {
+    let mut packs: Vec<_> = read_tree(&fx.repo_dir())
+        .into_keys()
+        .filter(|p| p.starts_with("packs"))
+        .collect();
+    packs.sort();
+    packs
 }
 
 /// `vykar upgrade` takes each v3 fixture to v5 in place: the same index, every
@@ -178,7 +227,7 @@ fn v3_fixtures_upgrade_to_v5() {
     for mode in MODES {
         let fx = extract(mode);
         let config = fx.config();
-        let before = sorted_entries(&fx.open());
+        let before = sorted_entries(&fx.open_legacy().legacy_index().unwrap());
 
         let outcome = commands::upgrade::run(&config, fx.passphrase()).unwrap();
         assert!(
@@ -199,7 +248,7 @@ fn v3_fixtures_upgrade_to_v5() {
         assert_eq!(repo.config.version, 5, "{mode}");
         assert_eq!(
             before,
-            sorted_entries(&repo),
+            sorted_entries(repo.chunk_index()),
             "{mode}: the upgrade changed the index"
         );
         drop(repo);

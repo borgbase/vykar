@@ -119,7 +119,7 @@ vykar break-lock --sessions
 
 ## Upgrade the repository format
 
-Repositories created before 0.25 (format v2 or v3) rewrite the whole chunk index on every backup, prune and compact. On a large repository that is hundreds of megabytes per write. `vykar upgrade` converts the repository in place to the segmented index (v2 → v4, v3 → v5), after which each write uploads only what changed. Chunk and pack hashes stay the same, so nothing is re-uploaded except the index itself, once.
+Repositories created before 0.25 (format v2 or v3) store the chunk index as one object, which those releases rewrote on every backup, prune and compact. On a large repository that was hundreds of megabytes per write. This vykar opens them only to upgrade them: every other command refuses and names `vykar upgrade` (`key export`/`key import`, `delete-repo` and `break-lock` still work). `vykar upgrade` converts the repository in place to the segmented index (v2 → v4, v3 → v5), after which each write uploads only what changed. Chunk and pack hashes stay the same, so nothing is re-uploaded except the index itself, once.
 
 ```bash
 vykar upgrade -R <repo>          # asks for confirmation
@@ -129,7 +129,7 @@ vykar upgrade -R <repo> --yes    # for scripts
 - **One-way.** vykar releases before 0.25 can no longer read or write the repository afterwards. Upgrade vykar on every host that uses it, and stop all of them, before upgrading.
 - **No active backups.** The upgrade takes the maintenance lock and refuses while backup sessions are active, like `compact` and `prune`.
 - **Append-only servers.** The upgrade rewrites `config` and `index`, which an append-only `vykar-server` refuses; it fails before changing anything. Disable append-only for the upgrade.
-- **Interrupted upgrades** are completed by running `vykar upgrade` again; until then, commands report that the upgrade must be completed. If the interrupted upgrade left a damaged index, `vykar upgrade` says so: run `vykar check --repair`, then `vykar upgrade` again.
+- **Interrupted upgrades** are completed by running `vykar upgrade` again; until then, every other command refuses and names `vykar upgrade`. If the interrupted upgrade left a damaged index, `vykar upgrade` still completes the switch to the new format and then reports the damage: run `vykar check --repair` (with `--dry-run` first to see what it would change). If `index` turns out to be a damaged pre-0.25 index instead, the upgrade changes nothing and says so; restore `index` from a copy of the repository.
 - If a pre-0.25 client still wrote to the repository after the upgrade, commands refuse and name `vykar check --repair`, which rebuilds the index.
 
 New repositories are created in the current format; there is nothing to upgrade.

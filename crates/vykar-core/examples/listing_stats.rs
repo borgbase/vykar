@@ -3,8 +3,7 @@
 //! for the snapshots of a repository (06 step 0). Passphrase from
 //! `VYKAR_PASSPHRASE`.
 //!
-//! Registers no session marker and backfills no key copy, but it is not
-//! write-free: on a v2/v3 repository the open can PUT `index.gen`. Against a
+//! Registers no session marker and backfills no key copy. Against a
 //! repository that must not change, run it on a read-only mount. Locally it
 //! writes an identity pin and caches under `--cache` (use an empty scratch
 //! directory, never a real client cache) and sweeps stale index temp files

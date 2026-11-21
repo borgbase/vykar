@@ -60,10 +60,7 @@ impl Fixture {
         config.encryption.mode = EncryptionModeConfig::Aes256Gcm;
         config.cache_dir = Some(cache_dir.to_string_lossy().into_owned());
 
-        // v3: the fixtures below lean on the monolithic index (an absent
-        // `index` reads as empty, `index.gen` is read at open).
-        commands::init::run_at_format(&config, Some(PASS), vykar_core::repo::RepoFormat::V3)
-            .unwrap();
+        commands::init::run(&config, Some(PASS)).unwrap();
         if with_snapshot {
             backup_source(&config, &source_dir, "src", "snap1", Some(PASS), false);
         }
@@ -214,7 +211,7 @@ impl InnerBackend for FaultyBackend {
 
 vykar_storage::delegate_storage_backend! {
     for FaultyBackend;
-    except [get, get_if_changed, put, put_pack, begin_staged_put, profile];
+    except [get, put, put_pack, begin_staged_put, profile];
 
     // Keep packs on the intercepted `put` path.
     fn begin_staged_put(
@@ -238,14 +235,6 @@ vykar_storage::delegate_storage_backend! {
             ))));
         }
         self.inner.get(key)
-    }
-
-    fn get_if_changed(
-        &self,
-        key: &str,
-        _known: &[u8; 32],
-    ) -> vykar_types::error::Result<vykar_storage::ConditionalGet> {
-        vykar_storage::get_unconditionally(self, key)
     }
 
     fn put(&self, key: &str, data: &[u8]) -> vykar_types::error::Result<()> {
@@ -613,8 +602,18 @@ fn same_key_wrapped_twice_needs_no_proof() {
     fx.strip_provable_data();
     fx.forget_pin();
 
-    fx.open_pinned()
-        .expect("identical key material must resolve without evidence");
+    // Without `index` the head read fails after key selection; tolerate it,
+    // so the open shows that key selection succeeded.
+    let storage = Box::new(fx.storage());
+    Repository::open(
+        storage,
+        Some(PASS),
+        Some(fx.cache_dir.clone()),
+        OpenOptions::new()
+            .with_repo_url(fx.config.repository.url.clone())
+            .tolerate_broken_index(),
+    )
+    .expect("identical key material must resolve without evidence");
 }
 
 /// **A stale pin is not an unresolvable repository.** Both copies unwrap to
@@ -844,19 +843,11 @@ impl InnerBackend for CountingBackend {
 
 vykar_storage::delegate_storage_backend! {
     for CountingBackend;
-    except [get, get_if_changed, list, list_sized, list_tree_sized];
+    except [get, list, list_sized, list_tree_sized];
 
     fn get(&self, key: &str) -> vykar_types::error::Result<Option<Vec<u8>>> {
         self.reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.inner.get(key)
-    }
-
-    fn get_if_changed(
-        &self,
-        key: &str,
-        _known: &[u8; 32],
-    ) -> vykar_types::error::Result<vykar_storage::ConditionalGet> {
-        vykar_storage::get_unconditionally(self, key)
     }
 
     fn list(&self, prefix: &str) -> vykar_types::error::Result<Vec<String>> {
@@ -960,9 +951,9 @@ fn import_rejects_a_malformed_blob_before_touching_storage() {
 }
 
 /// `export` must not go through `Repository::open`: a recovery tool for the
-/// key cannot fail on an unreadable advisory sidecar, and must write nothing.
+/// key cannot fail on an unreadable index head, and must write nothing.
 ///
-/// The sidecar is made unreadable by replacing it with a directory, which
+/// The head is made unreadable by replacing it with a directory, which
 /// fails with EISDIR for root as well; this path is reached through the
 /// config, so a failure cannot be injected into the backend.
 #[test]
@@ -970,10 +961,10 @@ fn export_works_on_a_repository_open_would_choke_on_and_writes_nothing() {
     let fx = Fixture::new();
     std::fs::remove_file(fx.secondary()).unwrap();
     let before = key_dir_snapshot(&fx.repo_dir);
-    make_unreadable_via_fs(&fx.repo_dir.join("index.gen"));
+    make_unreadable_via_fs(&fx.repo_dir.join("index"));
 
     // Export first: `open` backfills the missing copy before it trips over
-    // the sidecar, which would mask whether *export* wrote anything.
+    // the index head, which would mask whether *export* wrote anything.
     let exported = commands::key::export(&fx.config, Some(PASS))
         .expect("export must not depend on opening the repository");
     assert_eq!(

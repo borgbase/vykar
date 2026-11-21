@@ -445,7 +445,7 @@ where
                 items.ensure_resolvable(repo, batch_chunks.keys())?;
             }
             // Cached locations can be stale even when every chunk is present
-            // (the cache is pinned to the advisory `index.gen`), so a blob
+            // (the cache is pinned to the generation the open read), so a blob
             // that cannot be read at one is not declared unreadable yet: the
             // pass collects such blobs and they are re-resolved through the
             // index below. Strict mode therefore finishes the batch before

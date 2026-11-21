@@ -11,9 +11,9 @@ use super::helpers::{
 use crate::commands;
 use crate::commands::check::{IndexRecovery, RepairAction, RepairMode};
 use crate::config::VykarConfig;
+use crate::index::ChunkIndex;
 use crate::index::dedup_cache::{self, MmapDedupCache, MmapFullIndexCache, MmapRestoreCache};
 use crate::index::head::{IndexHead, ObjectName};
-use crate::index::{ChunkIndex, IndexBlob};
 use crate::repo::format::{ObjectType, pack_object_streaming_with_context};
 use crate::repo::index_store::{
     INDEX_OBJECT_DIR, SEGMENT_CONTEXT, decode_segment, object_key, pack_head,
@@ -536,18 +536,8 @@ fn two_clients_alternate_commits() {
 
 /// The monolithic blob an older binary would write.
 fn legacy_blob(index: &ChunkIndex) -> Vec<u8> {
-    let blob = IndexBlob {
-        generation: 7,
-        chunks: index.clone(),
-    };
     let crypto = vykar_crypto::PlaintextEngine::new(crate::testutil::test_chunk_hasher());
-    pack_object_streaming_with_context(ObjectType::ChunkIndex, b"index", 64, &crypto, |buf| {
-        crate::compress::compress_stream_zstd(buf, 3, |encoder| {
-            rmp_serde::encode::write(encoder, &blob)?;
-            Ok(())
-        })
-    })
-    .unwrap()
+    crate::tests::helpers::legacy_index_blob(index, 7, &crypto)
 }
 
 /// An older binary overwrote the head with a monolithic blob. Every command
@@ -878,65 +868,63 @@ delegate_storage_backend! {
 
 /// Client-side compact persists the index once for the whole batch, before
 /// deleting any pack, including empty ones whose entries were removed from
-/// the in-memory index without a save. Both layouts.
+/// the in-memory index without a save.
 #[test]
 fn compact_deletes_packs_only_after_persisting_the_index() {
-    for format in [RepoFormat::V3, RepoFormat::V5] {
-        let fx = fixture(format);
-        fx.write("a", "alpha");
-        fx.write("b", "bravo");
-        fx.backup(&fx.config, "s1");
-        std::fs::remove_file(fx.source.join("b")).unwrap();
-        fx.write("c", "charlie");
-        fx.backup(&fx.config, "s2");
-        fx.write("d", "delta");
-        fx.backup(&fx.config, "s3");
-        commands::delete::run(&fx.config, None, &["s1"], false, None).unwrap();
+    let fx = fixture(RepoFormat::V5);
+    fx.write("a", "alpha");
+    fx.write("b", "bravo");
+    fx.backup(&fx.config, "s1");
+    std::fs::remove_file(fx.source.join("b")).unwrap();
+    fx.write("c", "charlie");
+    fx.backup(&fx.config, "s2");
+    fx.write("d", "delta");
+    fx.backup(&fx.config, "s3");
+    commands::delete::run(&fx.config, None, &["s1"], false, None).unwrap();
 
-        let ops = Arc::new(Mutex::new(Vec::new()));
-        let storage = Box::new(MutLog {
-            inner: Arc::from(fx.storage()),
-            ops: Arc::clone(&ops),
-        });
-        let mut repo = fx
-            .open_with(storage, &fx.cache(), OpenOptions::new())
-            .unwrap();
-        commands::util::with_maintenance_lock(&mut repo, |repo| {
-            repo.load_chunk_index_under_lock()?;
-            // A pack whose entries leave only the in-memory index.
-            let (_, entry) = repo
-                .chunk_index()
-                .iter()
-                .max_by_key(|(_, e)| e.pack_offset)
-                .map(|(id, e)| (*id, *e))
-                .unwrap();
-            repo.chunk_index_mut().remove_by_pack(&entry.pack_id);
-            ops.lock().unwrap().clear();
-            commands::compact::compact_repo(repo, 0.0, None, false, 2, None)
-        })
+    let ops = Arc::new(Mutex::new(Vec::new()));
+    let storage = Box::new(MutLog {
+        inner: Arc::from(fx.storage()),
+        ops: Arc::clone(&ops),
+    });
+    let mut repo = fx
+        .open_with(storage, &fx.cache(), OpenOptions::new())
         .unwrap();
+    commands::util::with_maintenance_lock(&mut repo, |repo| {
+        repo.load_chunk_index_under_lock()?;
+        // A pack whose entries leave only the in-memory index.
+        let (_, entry) = repo
+            .chunk_index()
+            .iter()
+            .max_by_key(|(_, e)| e.pack_offset)
+            .map(|(id, e)| (*id, *e))
+            .unwrap();
+        repo.chunk_index_mut().remove_by_pack(&entry.pack_id);
+        ops.lock().unwrap().clear();
+        commands::compact::compact_repo(repo, 0.0, None, false, 2, None)
+    })
+    .unwrap();
 
-        let ops = ops.lock().unwrap().clone();
-        let first_pack_delete = ops
-            .iter()
-            .position(|o| o.starts_with("delete packs/"))
-            .unwrap_or_else(|| panic!("{format:?}: no pack deleted: {ops:?}"));
-        let head_puts: Vec<usize> = ops
-            .iter()
-            .enumerate()
-            .filter(|(_, o)| *o == "put index")
-            .map(|(i, _)| i)
-            .collect();
-        assert!(
-            head_puts.first().is_some_and(|&i| i < first_pack_delete),
-            "{format:?}: {ops:?}"
-        );
-        assert_eq!(
-            head_puts.iter().filter(|&&i| i < first_pack_delete).count(),
-            1,
-            "{format:?}: one index write for the batch: {ops:?}"
-        );
-    }
+    let ops = ops.lock().unwrap().clone();
+    let first_pack_delete = ops
+        .iter()
+        .position(|o| o.starts_with("delete packs/"))
+        .unwrap_or_else(|| panic!("no pack deleted: {ops:?}"));
+    let head_puts: Vec<usize> = ops
+        .iter()
+        .enumerate()
+        .filter(|(_, o)| *o == "put index")
+        .map(|(i, _)| i)
+        .collect();
+    assert!(
+        head_puts.first().is_some_and(|&i| i < first_pack_delete),
+        "{ops:?}"
+    );
+    assert_eq!(
+        head_puts.iter().filter(|&&i| i < first_pack_delete).count(),
+        1,
+        "one index write for the batch: {ops:?}"
+    );
 }
 
 #[derive(Debug, Clone, Copy)]

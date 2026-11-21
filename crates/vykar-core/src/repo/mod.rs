@@ -14,7 +14,6 @@ pub(crate) mod write_session;
 
 mod chunks;
 mod commit;
-mod index_fetch;
 pub(crate) mod index_store;
 pub(crate) mod index_write;
 mod key;
@@ -64,32 +63,24 @@ use self::manifest::Manifest;
 /// must a reader understand to read this repository?", and a reader computing
 /// BLAKE2b chunk IDs *cannot* read a BLAKE3 repository — the storage keys and
 /// the entire dedup index differ. The same holds for the index layout: v4 and
-/// v5 are v2 and v3 with the segmented index (see [`IndexLayout`]).
+/// v5 are v2 and v3 with the segmented index. v2 and v3 are upgrade-only (see
+/// [`RepoFormat::is_upgrade_only`]).
 ///
 /// Only chunk IDs and pack IDs follow the format. Every other digest in the
 /// workspace is BLAKE3 for all versions — see the "Repository Versions"
 /// subsection of `docs/src/content/docs/architecture.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RepoFormat {
-    /// Keyed/unkeyed BLAKE2b-256 chunk and pack IDs, monolithic index.
+    /// Keyed/unkeyed BLAKE2b-256 chunk and pack IDs, monolithic index;
+    /// upgrade-only.
     V2,
-    /// Keyed/unkeyed BLAKE3 chunk and pack IDs, monolithic index.
+    /// Keyed/unkeyed BLAKE3 chunk and pack IDs, monolithic index;
+    /// upgrade-only.
     V3,
     /// BLAKE2b-256 chunk and pack IDs, segmented index.
     V4,
     /// BLAKE3 chunk and pack IDs, segmented index.
     V5,
-}
-
-/// How the chunk index is stored.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IndexLayout {
-    /// One `IndexBlob` at `index`, rewritten whole on every change, with the
-    /// advisory `index.gen` sidecar.
-    Monolithic,
-    /// A small head at `index` naming a base and a chain of segments, all
-    /// write-once objects under `index.d/` (see `repo::index_store`).
-    Segmented,
 }
 
 impl RepoFormat {
@@ -134,12 +125,10 @@ impl RepoFormat {
         }
     }
 
-    /// How this format stores the chunk index.
-    pub fn index_layout(self) -> IndexLayout {
-        match self {
-            Self::V2 | Self::V3 => IndexLayout::Monolithic,
-            Self::V4 | Self::V5 => IndexLayout::Segmented,
-        }
+    /// v2 and v3 (monolithic index): opened only by `vykar upgrade`, through
+    /// [`OpenOptions::legacy_format`]. Every other open refuses them.
+    pub fn is_upgrade_only(self) -> bool {
+        matches!(self, Self::V2 | Self::V3)
     }
 }
 
@@ -263,6 +252,10 @@ pub struct OpenOptions {
     /// older binary overwrote it). Set by `check --repair`, which rebuilds
     /// the index; every other command refuses such a repository.
     pub tolerate_broken_index: bool,
+    /// Open a v2/v3 repository instead of refusing it. Only `vykar upgrade`
+    /// sets this. Such a handle supports `upgrade_index_layout` and
+    /// `legacy_index` only; it has no head, and `load_index` is refused.
+    pub legacy_format: bool,
 }
 
 impl OpenOptions {
@@ -297,6 +290,10 @@ impl OpenOptions {
         self.tolerate_broken_index = true;
         self
     }
+    pub fn legacy_format(mut self) -> Self {
+        self.legacy_format = true;
+        self
+    }
 }
 
 /// A handle to an opened repository.
@@ -314,12 +311,8 @@ pub struct Repository {
     /// caller asks the repository rather than re-inspecting the integer.
     format: RepoFormat,
     file_cache: FileCache,
-    /// Cache-validity token for the local dedup/restore caches.
-    /// Monolithic layout: a random u64 rotated each time the index is saved,
-    /// stored inside the encrypted `IndexBlob` (source of truth) and the
-    /// advisory `index.gen` sidecar; read from `index.gen` on open and
-    /// verified against the remote `IndexBlob` on write paths. Segmented
-    /// layout: derived from the head's state hash (`generation_for_state`).
+    /// Cache-validity token for the local dedup/restore caches, derived from
+    /// the head's state hash (`generation_for_state`); 0 when there is no head.
     index_generation: u64,
     /// Whether the chunk index has been modified since last persist.
     index_dirty: bool,
@@ -340,25 +333,21 @@ pub struct Repository {
     /// would cost another Argon2id derivation and need the passphrase threaded
     /// into the scan. `None` for unencrypted repositories.
     key_blob: Option<Vec<u8>>,
-    /// The advisory `index.gen` PUT that follows an index write, running in
-    /// the background so it overlaps the next request (the commit's fence
-    /// check). Joined by the next index write, by `save_state`, after the
-    /// commit's fence check, and on drop.
-    index_sidecar_write: Option<std::thread::JoinHandle<()>>,
     /// `save_state` persisted the index without rebuilding the local
     /// full/dedup/restore caches, so they are labelled with an older
     /// generation. Cleared by a rebuild and by every replacement of `chunk_index`.
     local_caches_stale: bool,
-    /// Segmented layout: the head the in-memory state was loaded from (or
-    /// written as). `None` for the monolithic layout.
+    /// The head the in-memory state was loaded from (or written as). `None`
+    /// on a handle opened for the upgrade, and while `check --repair`
+    /// rebuilds the index.
     index_head: Option<crate::index::head::IndexHead>,
-    /// Segmented layout: the full index cache when it lives in a temp file
-    /// (no cache directory, or persisting over the cache failed), kept from
-    /// open to the next index load or write.
+    /// The full index cache when it lives in a temp file (no cache
+    /// directory, or persisting over the cache failed), kept from open to the
+    /// next index load or write.
     index_scratch: Option<tempfile::TempPath>,
-    /// Segmented layout: when chains are folded into a new base.
+    /// When chains are folded into a new base.
     fold_policy: index_write::FoldPolicy,
-    /// Segmented layout: make the next index write a fold.
+    /// Make the next index write a fold.
     fold_requested: bool,
 }
 
@@ -498,7 +487,6 @@ impl Repository {
 
 impl Drop for Repository {
     fn drop(&mut self) {
-        self.join_index_sidecar_write();
         if self.write_session.is_some() {
             warn!("Repository dropped with active write session");
         }
@@ -593,10 +581,10 @@ mod format_tests {
     }
 
     #[test]
-    fn format_selects_the_index_layout() {
-        assert_eq!(RepoFormat::V2.index_layout(), IndexLayout::Monolithic);
-        assert_eq!(RepoFormat::V3.index_layout(), IndexLayout::Monolithic);
-        assert_eq!(RepoFormat::V4.index_layout(), IndexLayout::Segmented);
-        assert_eq!(RepoFormat::V5.index_layout(), IndexLayout::Segmented);
+    fn upgrade_only_formats() {
+        assert!(RepoFormat::V2.is_upgrade_only());
+        assert!(RepoFormat::V3.is_upgrade_only());
+        assert!(!RepoFormat::V4.is_upgrade_only());
+        assert!(!RepoFormat::V5.is_upgrade_only());
     }
 }

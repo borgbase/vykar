@@ -19,6 +19,7 @@
 mod common;
 
 use vykar_core::commands;
+use vykar_core::index::ChunkIndex;
 use vykar_core::repo::file_cache::FileCache;
 use vykar_core::repo::{OpenOptions, Repository, identity};
 use vykar_storage::local_backend::LocalBackend;
@@ -34,6 +35,25 @@ fn extract(mode: &str) -> Fixture {
     fixtures::extract("v2", mode, 2)
 }
 
+/// [`extract`], then `vykar upgrade` to v4: every command but the upgrade
+/// refuses v2.
+fn extract_upgraded(mode: &str) -> Fixture {
+    let fx = extract(mode);
+    commands::upgrade::run(&fx.config(), fx.passphrase()).unwrap();
+    fx
+}
+
+fn sorted_entries(
+    index: &ChunkIndex,
+) -> Vec<(
+    vykar_types::chunk_id::ChunkId,
+    vykar_core::index::ChunkIndexEntry,
+)> {
+    let mut out: Vec<_> = index.iter().map(|(id, e)| (*id, *e)).collect();
+    out.sort_by_key(|(id, _)| *id.as_bytes());
+    out
+}
+
 /// The identity fingerprint the pre-change binary computed for this repo.
 fn pin_fingerprint(fx: &Fixture) -> String {
     fx.meta["pin_fingerprint"].as_str().unwrap().to_string()
@@ -41,11 +61,27 @@ fn pin_fingerprint(fx: &Fixture) -> String {
 
 // ── Reading ────────────────────────────────────────────────────────────────
 
+/// Every open but the upgrade's refuses a v2 fixture and writes nothing.
 #[test]
-fn v2_fixtures_open_as_format_v2() {
+fn v2_fixtures_open_only_for_upgrade() {
     for mode in MODES {
         let fx = extract(mode);
-        let repo = fx.open();
+        let tree = read_tree(&fx.repo_dir());
+        for opts in [OpenOptions::new(), OpenOptions::new().with_index()] {
+            let storage = Box::new(LocalBackend::new(fx.repo_dir().to_str().unwrap()).unwrap());
+            let err = Repository::open(storage, fx.passphrase(), Some(fx.cache_dir()), opts)
+                .err()
+                .unwrap()
+                .to_string();
+            assert!(err.contains("vykar upgrade"), "{mode}: {err}");
+        }
+        assert_eq!(
+            read_tree(&fx.repo_dir()),
+            tree,
+            "{mode}: a refused open wrote"
+        );
+
+        let repo = fx.open_legacy();
         assert_eq!(
             repo.config.version, 2,
             "{mode}: fixture must stay at format v2"
@@ -60,13 +96,14 @@ fn v2_fixtures_open_as_format_v2() {
             repo.skipped_snapshots().is_empty(),
             "{mode}: no snapshot may be unreadable"
         );
+        assert!(!repo.legacy_index().unwrap().is_empty(), "{mode}");
     }
 }
 
 #[test]
 fn v2_fixtures_restore_byte_identical() {
     for mode in MODES {
-        let fx = extract(mode);
+        let fx = extract_upgraded(mode);
         let config = fx.config();
         let dest = fx.root.join("restore-original");
 
@@ -93,7 +130,7 @@ fn v2_fixtures_restore_byte_identical() {
 #[test]
 fn v2_fixtures_verify_data_is_clean() {
     for mode in MODES {
-        let fx = extract(mode);
+        let fx = extract_upgraded(mode);
         let result = commands::check::run(&fx.config(), fx.passphrase(), true, false).unwrap();
         assert!(
             result.errors.is_empty(),
@@ -105,68 +142,17 @@ fn v2_fixtures_verify_data_is_clean() {
 
 // ── Writing ────────────────────────────────────────────────────────────────
 
-#[test]
-fn v2_fixtures_accept_a_new_backup_and_still_dedup() {
-    for mode in MODES {
-        let fx = extract(mode);
-        let config = fx.config();
-
-        let before = fx.open().chunk_index().len();
-
-        // Back up the exact tree the last fixture snapshot already contains.
-        // File data must dedup completely against chunks written by the
-        // pre-change binary; only snapshot metadata is genuinely new.
-        let stats = backup_source(
-            &config,
-            &fx.source_dir(),
-            "fixture-src",
-            "post-change-snap",
-            fx.passphrase(),
-            config.xattrs.enabled,
-        );
-
-        assert!(
-            stats.original_size > 1024 * 1024,
-            "{mode}: expected a non-trivial source, got {} bytes",
-            stats.original_size
-        );
-        assert!(
-            stats.deduplicated_size < stats.original_size / 8,
-            "{mode}: {} of {} bytes were newly stored — dedup against the \
-             pre-change chunk IDs is broken",
-            stats.deduplicated_size,
-            stats.original_size
-        );
-
-        let after = fx.open().chunk_index().len();
-        assert!(
-            after >= before,
-            "{mode}: chunk index shrank ({before} -> {after})"
-        );
-        assert!(
-            after - before < before,
-            "{mode}: chunk index nearly doubled ({before} -> {after}) — the \
-             new backup re-stored content instead of deduplicating"
-        );
-    }
-}
-
 /// `vykar upgrade` takes each v2 fixture to v4 in place: same chunk IDs (the
 /// plaintext key follows the chunk hash), the same index, every snapshot
-/// still restores byte-identical, and a new backup still dedups.
+/// still restores byte-identical, and a new backup dedups against the chunks
+/// the pre-change binary wrote.
 #[test]
 fn v2_fixtures_upgrade_to_v4() {
     use vykar_core::repo::UpgradeOutcome;
     for mode in MODES {
         let fx = extract(mode);
         let config = fx.config();
-        let mut before: Vec<_> = fx
-            .open()
-            .chunk_index()
-            .iter()
-            .map(|(id, e)| (*id, *e))
-            .collect();
-        before.sort_by_key(|(id, _)| *id.as_bytes());
+        let before = sorted_entries(&fx.open_legacy().legacy_index().unwrap());
 
         let outcome = commands::upgrade::run(&config, fx.passphrase()).unwrap();
         assert!(
@@ -185,9 +171,11 @@ fn v2_fixtures_upgrade_to_v4() {
 
         let repo = fx.open();
         assert_eq!(repo.config.version, 4, "{mode}");
-        let mut after: Vec<_> = repo.chunk_index().iter().map(|(id, e)| (*id, *e)).collect();
-        after.sort_by_key(|(id, _)| *id.as_bytes());
-        assert_eq!(before, after, "{mode}: the upgrade changed the index");
+        assert_eq!(
+            before,
+            sorted_entries(repo.chunk_index()),
+            "{mode}: the upgrade changed the index"
+        );
         drop(repo);
 
         let result = commands::check::run(&config, fx.passphrase(), true, false).unwrap();
@@ -215,9 +203,26 @@ fn v2_fixtures_upgrade_to_v4() {
             fx.passphrase(),
             config.xattrs.enabled,
         );
+        // File data must dedup completely against chunks written by the
+        // pre-change binary; only snapshot metadata is genuinely new.
+        assert!(
+            stats.original_size > 1024 * 1024,
+            "{mode}: expected a non-trivial source, got {} bytes",
+            stats.original_size
+        );
         assert!(
             stats.deduplicated_size < stats.original_size / 8,
-            "{mode}: the backup after the upgrade did not dedup"
+            "{mode}: {} of {} bytes were newly stored after the upgrade — dedup \
+             against the pre-change chunk IDs is broken",
+            stats.deduplicated_size,
+            stats.original_size
+        );
+        let after = fx.open().chunk_index().len();
+        assert!(
+            after >= before.len() && after - before.len() < before.len(),
+            "{mode}: chunk index {} -> {after}: the new backup re-stored content \
+             instead of deduplicating",
+            before.len()
         );
         assert!(
             matches!(
@@ -229,12 +234,12 @@ fn v2_fixtures_upgrade_to_v4() {
     }
 }
 
-/// Packs written into a v2 repository today — by backup and by repack — must
-/// still be named by BLAKE2b, or a v2-era binary could not locate them.
+/// Packs written into an upgraded v2 repository — by backup and by repack —
+/// must still be named by BLAKE2b: v4 keeps v2's chunk and pack hash.
 #[test]
 fn v2_fixtures_name_new_packs_by_blake2b() {
     for mode in MODES {
-        let fx = extract(mode);
+        let fx = extract_upgraded(mode);
         let config = fx.config();
         exercise_pack_naming(
             &config,
@@ -248,7 +253,7 @@ fn v2_fixtures_name_new_packs_by_blake2b() {
 #[test]
 fn v2_fixtures_survive_delete_prune_compact_and_restore() {
     for mode in MODES {
-        let fx = extract(mode);
+        let fx = extract_upgraded(mode);
         let config = fx.config();
 
         // Add a snapshot so deleting one still leaves something to restore.
@@ -307,8 +312,9 @@ fn v2_fixtures_survive_delete_prune_compact_and_restore() {
 }
 
 /// The v2 half of the `{none, aes256gcm} x {v2, v3}` lifecycle matrix that
-/// `lifecycle_integration.rs` covers for v3 (every repo it creates is v3 now).
-/// The encrypted fixtures must still reject a wrong passphrase the same way.
+/// `lifecycle_integration.rs` covers for v5 (every repo it creates is v5 now).
+/// The encrypted fixtures must still reject a wrong passphrase the same way
+/// on the upgrade's open. Every other open refuses v2 before the key check.
 #[test]
 fn v2_encrypted_fixtures_reject_a_wrong_passphrase() {
     for mode in MODES {
@@ -321,14 +327,27 @@ fn v2_encrypted_fixtures_reject_a_wrong_passphrase() {
 
         // A frozen v2 fixture predates key redundancy, so it carries a single
         // copy: the diagnosis says so rather than claiming corroboration.
-        let storage = Box::new(LocalBackend::new(fx.repo_dir().to_str().unwrap()).unwrap());
-        let err = Repository::open(storage, wrong, None, OpenOptions::new())
-            .err()
-            .unwrap_or_else(|| panic!("{mode}: opening with a wrong passphrase must fail"));
-        let msg = err.to_string();
+        let open = |opts| {
+            let storage = Box::new(LocalBackend::new(fx.repo_dir().to_str().unwrap()).unwrap());
+            Repository::open(storage, wrong, None, opts)
+                .err()
+                .unwrap_or_else(|| panic!("{mode}: opening with a wrong passphrase must fail"))
+                .to_string()
+        };
+        let msg = open(OpenOptions::new().legacy_format());
         assert!(
             msg.contains("wrong passphrase, or the stored key is damaged"),
             "{mode}: unexpected wrong-passphrase message: {msg}"
+        );
+        let msg = open(OpenOptions::new());
+        assert!(msg.contains("vykar upgrade"), "{mode}: {msg}");
+
+        let err = commands::upgrade::run(&config, wrong)
+            .err()
+            .unwrap_or_else(|| panic!("{mode}: upgrading with a wrong passphrase must fail"));
+        assert!(
+            err.to_string().contains("wrong passphrase"),
+            "{mode}: unexpected upgrade message: {err}"
         );
 
         let err = commands::restore::run(
@@ -344,7 +363,7 @@ fn v2_encrypted_fixtures_reject_a_wrong_passphrase() {
         .err()
         .unwrap_or_else(|| panic!("{mode}: restoring with a wrong passphrase must fail"));
         assert!(
-            err.to_string().contains("wrong passphrase"),
+            err.to_string().contains("vykar upgrade"),
             "{mode}: unexpected restore message: {err}"
         );
 
@@ -352,7 +371,7 @@ fn v2_encrypted_fixtures_reject_a_wrong_passphrase() {
             .err()
             .unwrap_or_else(|| panic!("{mode}: check with a wrong passphrase must fail"));
         assert!(
-            err.to_string().contains("wrong passphrase"),
+            err.to_string().contains("vykar upgrade"),
             "{mode}: unexpected check message: {err}"
         );
     }
@@ -382,7 +401,7 @@ fn legacy_fingerprint(repo_id: &[u8], chunk_id_key: &[u8; 32]) -> String {
 fn v2_fixture_pin_files_are_superseded() {
     for mode in MODES {
         let fx = extract(mode);
-        let repo = fx.open();
+        let repo = fx.open_legacy();
         let url = fx.repo_dir().to_string_lossy().into_owned();
         let repo_id = &repo.config.id;
         let key = repo.crypto.chunk_hasher().key();
@@ -441,7 +460,7 @@ fn v2_fixture_pin_files_are_superseded() {
 fn v2_fixture_file_caches_are_dropped() {
     for mode in MODES {
         let fx = extract(mode);
-        let repo = fx.open();
+        let repo = fx.open_legacy();
         let cache = fx.cache_dir();
 
         // The file cache is keyed by repo_id, so its path is portable as-is.

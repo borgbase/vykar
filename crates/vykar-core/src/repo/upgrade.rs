@@ -5,24 +5,29 @@
 //! 1. Probe the server capability and PUT the stored `config` bytes back
 //!    unchanged: a server that refuses overwrites (append-only) fails here,
 //!    with the repository untouched.
-//! 2. Load the legacy index and write it as a base.
+//! 2. GET `index`, decode the legacy index and write it as a base.
 //! 3. Overwrite `index` with the head. From here every older binary fails on
 //!    its next index read.
 //! 4. Rewrite `config` with the new version, delete `index.gen` and the
 //!    local copy of the legacy index blob.
 //!
 //! A v2/v3 `config` with a head at `index` is an upgrade interrupted after
-//! step 3: the head and its chain are verified and step 4 completes.
+//! step 3: the head and its chain are verified and step 4 completes. When
+//! the head or its chain is damaged, step 4 (without the deletions) still
+//! completes, so that `check --repair` can repair the repository as v4/v5,
+//! and the upgrade returns an error that says so. Every released binary
+//! already fails on such a repository, so the switch loses nothing.
 
 use tracing::{debug, info};
 
-use super::format::ObjectType;
-use super::index_fetch::{self, IndexObject};
-use super::index_store;
-use super::{RepoConfig, RepoFormat, Repository};
-use crate::index::ChunkIndex;
+use super::format::{ObjectType, unpack_object_expect_with_context};
+use super::index_store::{self, StoredHead};
+use super::{INDEX_OBJECT_CONTEXT, RepoConfig, RepoFormat, Repository};
+use crate::compress;
 use crate::index::dedup_cache::{self, MmapFullIndexCache, generation_for_state};
 use crate::index::head::IndexHead;
+use crate::index::{ChunkIndex, IndexBlob};
+use vykar_crypto::CryptoEngine;
 use vykar_types::error::{Result, VykarError};
 
 /// What [`Repository::upgrade_index_layout`] did.
@@ -54,14 +59,36 @@ impl RepoFormat {
     }
 }
 
-/// The error every monolithic index read returns when `index` holds a head
-/// while `config` still names a monolithic format.
-pub(crate) fn interrupted_upgrade_error() -> VykarError {
-    VykarError::InvalidFormat(
-        "an upgrade to the segmented index format was interrupted; run `vykar upgrade` \
-         to complete it"
-            .into(),
-    )
+/// The error every open except `vykar upgrade` returns for v2/v3.
+pub(crate) fn legacy_format_error(format: RepoFormat) -> VykarError {
+    VykarError::Other(format!(
+        "this repository is in format v{}, which this vykar opens only to upgrade it: \
+         run `vykar upgrade` (one-way; stop every other client of the repository and \
+         upgrade vykar on all of them first)",
+        format.version()
+    ))
+}
+
+/// Decode a v2/v3 `IndexBlob` fetched from `index` (`None` = absent: generation
+/// 0, empty). The only reader of the monolithic index, kept for the upgrade
+/// and for repairing a v4/v5 `index` an older binary overwrote.
+pub(crate) fn decode_index_blob(
+    data: Option<Vec<u8>>,
+    crypto: &dyn CryptoEngine,
+) -> Result<(u64, ChunkIndex)> {
+    let Some(data) = data else {
+        return Ok((0, ChunkIndex::new()));
+    };
+    let compressed = unpack_object_expect_with_context(
+        &data,
+        ObjectType::ChunkIndex,
+        INDEX_OBJECT_CONTEXT,
+        crypto,
+    )?;
+    // Free the ciphertext before building the index from the plaintext.
+    drop(data);
+    let blob: IndexBlob = compress::decode_metadata_msgpack(&compressed)?.0;
+    Ok((blob.generation, blob.chunks))
 }
 
 /// Whether `data` (the object at `index`) is a segmented index head.
@@ -114,49 +141,34 @@ impl Repository {
 
         // 2–3. Base and head, unless an interrupted upgrade already wrote them.
         let path = self.full_cache_path();
-        let object = index_fetch::fetch_index_object(
-            self.storage.as_ref(),
-            &self.config.id,
-            self.cache_dir_override.as_deref(),
-        )?;
-        let (head, resumed) = match object {
-            IndexObject::Remote(Some(data)) if is_index_head(&data) => {
-                let head = match index_store::classify_head(&data, self.crypto.as_ref()) {
-                    index_store::StoredHead::Unreadable(e) => {
+        let (head, resumed) = match self.storage.get("index")? {
+            Some(data) if is_index_head(&data) => {
+                info!("completing an interrupted upgrade");
+                match self.verify_interrupted_upgrade(&data)? {
+                    Ok(head) => (head, true),
+                    Err(damage) => {
+                        // The head proves an upgrade wrote it; finish the
+                        // switch so `check --repair` can repair the index.
+                        self.switch_version(stored, target)?;
                         return Err(VykarError::Other(format!(
-                            "the index head left by an interrupted upgrade cannot be read \
-                             ({e}); run `vykar check --repair` to rebuild it, then `vykar \
-                             upgrade` again"
+                            "completed an interrupted upgrade to format v{}, but the index it \
+                             wrote is damaged ({damage}); run `vykar check --repair` (with \
+                             `--dry-run` first to see what it would change)",
+                            target.version()
                         )));
                     }
-                    other => other.into_head()?,
-                };
-                info!("completing an interrupted upgrade");
-                // Every object of the chain is fetched and verified.
-                let synced = self.sync_index(Some(head), false).map_err(|e| {
-                    if index_store::is_object_damage(&e) {
-                        VykarError::Other(format!(
-                            "{e}; after the repair, run `vykar upgrade` again to complete the \
-                             upgrade"
-                        ))
-                    } else {
-                        e
-                    }
-                })?;
-                // Nothing here reads the index; only the cache file is kept.
-                let index_store::SyncedIndex {
-                    head,
-                    cache,
-                    scratch,
-                    ..
-                } = synced;
-                drop(cache);
-                self.index_scratch = scratch;
-                (head, true)
+                }
             }
-            object => {
-                let ((_, index), source) = self.index_from_object(object)?;
-                debug!(?source, entries = index.len(), "legacy index loaded");
+            data => {
+                let (_, index) = decode_index_blob(data, self.crypto.as_ref()).map_err(|e| {
+                    VykarError::Other(format!(
+                        "the v{} index cannot be read ({e}); nothing was changed. Restore \
+                         `index` from a copy of the repository, or use the vykar release \
+                         that wrote it",
+                        from.version()
+                    ))
+                })?;
+                debug!(entries = index.len(), "legacy index loaded");
                 (self.write_upgraded_index(&index)?, false)
             }
         };
@@ -165,20 +177,8 @@ impl Repository {
         }
 
         // 4. The version switch.
-        let mut config = stored;
-        config.version = target.version();
-        self.check_lock_fence()?;
-        self.storage.put("config", &rmp_serde::to_vec(&config)?)?;
-        self.config.version = config.version;
-        self.format = target;
-        if let Err(e) = self.storage.delete("index.gen") {
-            tracing::warn!("failed to delete index.gen: {e}");
-        }
-        if let Some(blob) =
-            dedup_cache::index_blob_cache_path(&self.config.id, self.cache_dir_override.as_deref())
-        {
-            let _ = std::fs::remove_file(blob);
-        }
+        self.switch_version(stored, target)?;
+        self.remove_legacy_leftovers();
 
         let entries = head.entries;
         let base_bytes = head.base.as_ref().map_or(0, |b| b.size);
@@ -194,6 +194,94 @@ impl Repository {
             base_bytes,
             resumed,
         })
+    }
+
+    /// The v2/v3 index at `index`, on a handle opened with
+    /// [`super::OpenOptions::legacy_format`]. Errors on any other format, and
+    /// on a head at `index` (an interrupted upgrade).
+    #[doc(hidden)]
+    pub fn legacy_index(&self) -> Result<ChunkIndex> {
+        if !self.format.is_upgrade_only() {
+            return Err(VykarError::Other(format!(
+                "format v{} has no legacy index",
+                self.format.version()
+            )));
+        }
+        let data = self.storage.get("index")?;
+        if data.as_deref().is_some_and(is_index_head) {
+            return Err(VykarError::Other(
+                "`index` holds the head of an interrupted upgrade; run `vykar upgrade`".into(),
+            ));
+        }
+        Ok(decode_index_blob(data, self.crypto.as_ref())?.1)
+    }
+
+    /// Step 4: the version switch. Fence check, then the `config` PUT.
+    fn switch_version(&mut self, mut stored: RepoConfig, target: RepoFormat) -> Result<()> {
+        stored.version = target.version();
+        self.check_lock_fence()?;
+        self.storage.put("config", &rmp_serde::to_vec(&stored)?)?;
+        self.config.version = stored.version;
+        self.format = target;
+        Ok(())
+    }
+
+    /// Best-effort deletion of `index.gen` and of the local `index_blob`
+    /// copy an older vykar left, after the version switch.
+    fn remove_legacy_leftovers(&self) {
+        if let Err(e) = self.storage.delete("index.gen") {
+            tracing::warn!("failed to delete index.gen: {e}");
+        }
+        if let Some(blob) =
+            dedup_cache::index_blob_cache_path(&self.config.id, self.cache_dir_override.as_deref())
+        {
+            let _ = std::fs::remove_file(blob);
+        }
+    }
+
+    /// The head an interrupted upgrade left at `index`, with every object of
+    /// its chain fetched and verified (`Ok(Ok(head))`). `Ok(Err(e))` when the
+    /// head or its chain is damaged and the switch should complete anyway.
+    /// `Err` (nothing changed) for a storage error, for a head of an unknown
+    /// layout or type, and for an unreadable head with an empty `index.d/`.
+    fn verify_interrupted_upgrade(
+        &mut self,
+        data: &[u8],
+    ) -> Result<std::result::Result<IndexHead, VykarError>> {
+        let head = match index_store::classify_head(data, self.crypto.as_ref()) {
+            StoredHead::Head(head) => head,
+            StoredHead::Unreadable(e) => {
+                let names = super::index_write::list_objects_for_repair(self.storage.as_ref())?;
+                if names.is_empty() {
+                    return Err(VykarError::Other(format!(
+                        "`config` names format v{}, and `index` starts like the segmented \
+                         index head of an interrupted upgrade, but it cannot be read ({e}) \
+                         and index.d/ holds no index objects: `index` is more likely a \
+                         damaged monolithic index. Nothing was changed; restore `index` from \
+                         a copy of the repository",
+                        self.config.version
+                    )));
+                }
+                return Ok(Err(e));
+            }
+            other => other.into_head()?,
+        };
+        match self.sync_index(Some(head), false) {
+            Ok(synced) => {
+                // Nothing here reads the index; only the cache file is kept.
+                let index_store::SyncedIndex {
+                    head,
+                    cache,
+                    scratch,
+                    ..
+                } = synced;
+                drop(cache);
+                self.index_scratch = scratch;
+                Ok(Ok(head))
+            }
+            Err(e) if index_store::is_object_damage(&e) => Ok(Err(e)),
+            Err(e) => Err(e),
+        }
     }
 
     /// Write `index` as a base (none for an empty index) and the head naming

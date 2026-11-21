@@ -115,13 +115,13 @@ complements an off-repository copy rather than replacing one.
 
 ## Repository format
 
-`vykar init` always creates a **format v3** repository, whose chunk and pack IDs use BLAKE3. There is no flag or config key to choose otherwise. `vykar info` reports the format and hash of any repository.
+`vykar init` always creates a **format v5** repository, whose chunk and pack IDs use BLAKE3 and whose chunk index is segmented. There is no flag or config key to choose otherwise. `vykar info` reports the format and hash of any repository.
 
-Existing **format v2** repositories (created by vykar 0.19 and earlier, using BLAKE2b) stay v2 for life and remain fully readable and writable — nothing needs migrating. The hash is part of every chunk's dedup identity and every pack's storage key, so it cannot be changed in place.
+Repositories created by vykar 0.24 and earlier (**format v2**, BLAKE2b, from 0.19 and earlier; **format v3**, BLAKE3) must be converted with [`vykar upgrade`](/maintenance#upgrade-the-repository-format) before any other command works on them: v2 becomes v4, v3 becomes v5. The hash is part of every chunk's dedup identity and every pack's storage key, so it never changes: a v2 repository stays BLAKE2b for life.
 
 This matters in two situations:
 
-- **Older vykar binaries cannot open a v3 repository** (`unsupported repository version: 3`). If several machines share one repository, upgrade them together — or keep using the existing repository, which needs no coordination at all.
-- **A self-hosted `vykar-server` must be upgraded first** (0.20 or later). `init` checks this up front and refuses with a clear message rather than creating a repository whose first backup would fail.
+- **Older vykar binaries cannot open a v5 repository** (`unsupported repository version: 5`). If several machines share one repository, upgrade vykar on all of them together.
+- **A self-hosted `vykar-server` must be upgraded first** (0.25 or later, which supports the segmented index). `init` checks this up front and refuses with a clear message rather than creating a repository whose first backup would fail.
 
 Next: [Back Up](/backup)

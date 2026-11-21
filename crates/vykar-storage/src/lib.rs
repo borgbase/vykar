@@ -13,6 +13,8 @@
 )]
 
 pub mod local_backend;
+#[doc(hidden)]
+pub mod probe;
 pub mod rest_backend;
 pub mod s3_backend;
 #[cfg(feature = "backend-sftp")]
@@ -1393,6 +1395,17 @@ mod tests {
                 port: Some(2222),
                 path: "/repo".into(),
             }
+        );
+    }
+
+    /// A URL cannot carry a path relative to the login directory: the dot
+    /// segment is dropped (why the probe has `--relative-root`).
+    #[test]
+    fn test_sftp_dot_segment_becomes_absolute() {
+        let parsed = parse_repo_url("sftp://backup@nas.local/./repo").unwrap();
+        assert!(
+            matches!(&parsed, ParsedUrl::Sftp { path, .. } if path == "/repo"),
+            "{parsed:?}"
         );
     }
 

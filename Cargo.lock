@@ -7831,6 +7831,7 @@ name = "vykar-storage"
 version = "0.24.0"
 dependencies = [
  "base64 0.23.1",
+ "clap",
  "futures-util",
  "hex",
  "http",

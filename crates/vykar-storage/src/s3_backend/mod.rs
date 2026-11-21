@@ -21,6 +21,7 @@ use vykar_types::error::{Result, VykarError};
 use crate::{ListedObject, StorageBackend};
 
 mod multipart;
+pub(crate) mod probe;
 
 /// Duration for presigned URL validity.
 const PRESIGN_DURATION: Duration = Duration::from_secs(3600);
@@ -694,7 +695,7 @@ mod tests {
     }
 
     /// Single-response mock that captures the full request (request line + headers).
-    fn mock_server_capture(
+    pub(super) fn mock_server_capture(
         response: &str,
     ) -> (u16, Arc<Mutex<Vec<String>>>, std::thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();

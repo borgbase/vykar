@@ -42,6 +42,10 @@ pub(super) struct Faults {
     pub mtime_skew_secs: AtomicI64,
     pub writes: AtomicUsize,
     pub renames: AtomicUsize,
+    /// Do not advertise `hardlink@openssh.com` and refuse it.
+    pub hide_hardlink: AtomicBool,
+    /// `hardlink@openssh.com` requests received.
+    pub hardlinks: AtomicUsize,
 }
 
 pub(super) struct FaultServer {
@@ -371,6 +375,11 @@ impl russh_sftp::server::Handler for SftpHandler {
                 .extensions
                 .insert("posix-rename@openssh.com".into(), "1".into());
         }
+        if !self.faults.hide_hardlink.load(Ordering::SeqCst) {
+            version
+                .extensions
+                .insert("hardlink@openssh.com".into(), "1".into());
+        }
         Ok(version)
     }
 
@@ -481,6 +490,24 @@ impl russh_sftp::server::Handler for SftpHandler {
         Ok(ok(id))
     }
 
+    async fn rmdir(&mut self, id: u32, path: String) -> Result<Status, Self::Error> {
+        std::fs::remove_dir(self.local(&path)).map_err(|e| io_status(&e))?;
+        Ok(ok(id))
+    }
+
+    /// The login directory is `/repo`; other paths are returned as given.
+    async fn realpath(&mut self, id: u32, path: String) -> Result<Name, Self::Error> {
+        let resolved = if path == "." {
+            "/repo".to_string()
+        } else {
+            path
+        };
+        Ok(Name {
+            id,
+            files: vec![File::dummy(resolved)],
+        })
+    }
+
     async fn opendir(&mut self, id: u32, path: String) -> Result<Handle, Self::Error> {
         let mut files = Vec::new();
         for entry in std::fs::read_dir(self.local(&path)).map_err(|e| io_status(&e))? {
@@ -510,6 +537,14 @@ impl russh_sftp::server::Handler for SftpHandler {
         request: String,
         data: Vec<u8>,
     ) -> Result<Packet, Self::Error> {
+        if request == "hardlink@openssh.com" && !self.faults.hide_hardlink.load(Ordering::SeqCst) {
+            self.faults.hardlinks.fetch_add(1, Ordering::SeqCst);
+            let (old, rest) = sftp_string(&data).ok_or(StatusCode::BadMessage)?;
+            let (new, _) = sftp_string(rest).ok_or(StatusCode::BadMessage)?;
+            // Like OpenSSH's link(2): an existing target answers Failure (io_status).
+            std::fs::hard_link(self.local(&old), self.local(&new)).map_err(|e| io_status(&e))?;
+            return Ok(Packet::Status(ok(id)));
+        }
         if request != "posix-rename@openssh.com"
             || self.faults.hide_posix_rename.load(Ordering::SeqCst)
         {

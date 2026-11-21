@@ -701,7 +701,7 @@ fn failure_kind(err: &HttpRetryError) -> MultipartFailureKind {
 
 /// Extract the `<Code>` from an S3 error document (non-2xx or the 2xx-embedded
 /// form). Returns an owned `String` so it does not borrow the consumed body.
-fn parse_s3_error_code(body: &str) -> Option<String> {
+pub(super) fn parse_s3_error_code(body: &str) -> Option<String> {
     quick_xml::de::from_str::<S3ErrorDoc>(body)
         .ok()
         .map(|e| e.code)

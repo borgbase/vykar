@@ -1560,6 +1560,8 @@ impl StorageBackend for SftpBackend {
 #[cfg(test)]
 mod fault_server;
 
+pub(crate) mod probe;
+
 #[cfg(test)]
 mod tests {
     use super::*;

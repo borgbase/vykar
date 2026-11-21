@@ -1,6 +1,7 @@
 mod app_ops;
 mod backup_commit_order;
 mod backup_fast_path;
+mod backup_metrics;
 mod backup_toctou;
 mod check_command;
 mod chunker;

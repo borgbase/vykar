@@ -3,10 +3,12 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::time::Instant;
 
 use chrono::Utc;
 use tracing::{debug, info, warn};
 
+use super::instrument::{BackupInstrumentation, PipelineTimings};
 use super::{
     BackupProgressEvent, BackupRequest, DatalessTally, ItemStreamCutter, Prepared, Workers,
     command_dump, emit_post_commit_warning, emit_progress, flush_item_stream_chunk, pipeline,
@@ -58,6 +60,7 @@ pub(super) struct Phase1Output {
     pub(super) snapshot_packed: Vec<u8>,
     pub(super) new_file_cache: FileCache,
     pub(super) stats: SnapshotStats,
+    pub(super) instrumentation: BackupInstrumentation,
 }
 
 /// Phase 1: prepare the write session, run command dumps and the walk, and
@@ -74,6 +77,8 @@ pub(super) fn phase1_upload(
     shutdown: Option<&AtomicBool>,
     dataless: &mut DatalessTally,
 ) -> Result<Phase1Output> {
+    let phase1_start = Instant::now();
+    let _span = tracing::debug_span!("backup_phase1").entered();
     let snapshot_name = req.snapshot_name;
     let source_paths = req.source_paths;
     let source_label = req.source_label;
@@ -250,6 +255,7 @@ pub(super) fn phase1_upload(
     }
 
     // Execute command dumps before walking filesystem.
+    let walk_start = Instant::now();
     command_dump::process_command_dumps(
         repo,
         command_dumps,
@@ -265,6 +271,7 @@ pub(super) fn phase1_upload(
     let pipeline_depth = config.limits.effective_pipeline_depth();
     let pipeline_buffer_bytes = config.limits.pipeline_buffer_for_workers(num_workers);
 
+    let mut pipeline_timings: Option<PipelineTimings> = None;
     if use_pipeline && !source_paths.is_empty() {
         let file_cache_snapshot = repo.take_file_cache();
         let crypto = std::sync::Arc::clone(&repo.crypto);
@@ -306,7 +313,7 @@ pub(super) fn phase1_upload(
         // Always restore before propagating — keeps repo.file_cache valid
         // for commit-time merge.
         repo.restore_file_cache(file_cache_snapshot);
-        pipeline_result?;
+        pipeline_timings = Some(pipeline_result?);
     } else {
         let seq_ctx = sequential::SequentialCtx {
             exclude_patterns,
@@ -337,6 +344,7 @@ pub(super) fn phase1_upload(
             sequential::process_source_path(repo, source, &seq_ctx, &mut seq_bufs, progress)?;
         }
     }
+    let walk = walk_start.elapsed();
     // The walk was the last reader of the loaded cache's sections for
     // these roots. Move them into the write cache now: during the walk
     // the write cache recorded only the path hashes of exact hits, so
@@ -372,7 +380,18 @@ pub(super) fn phase1_upload(
             stage: "upload packs",
         },
     );
+    let flush_start = Instant::now();
     repo.flush_packs_journal_in_background()?;
+    let final_flush = flush_start.elapsed();
+    let instrumentation = BackupInstrumentation {
+        threads: num_workers,
+        phase1: phase1_start.elapsed(),
+        walk,
+        final_flush,
+        pipeline: pipeline_timings,
+        write: repo.write_metrics().unwrap_or_default(),
+    };
+    instrumentation.emit(&stats);
     check_interrupted(shutdown)?;
 
     let time_end = Utc::now();
@@ -435,6 +454,7 @@ pub(super) fn phase1_upload(
         snapshot_packed,
         new_file_cache,
         stats,
+        instrumentation,
     })
 }
 

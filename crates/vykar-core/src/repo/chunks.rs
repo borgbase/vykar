@@ -1,12 +1,15 @@
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::time::Instant;
 
 use super::Repository;
 use super::format::{ObjectType, pack_object_with_context};
 use super::pack::{self, PackType, SealedPack, compute_data_pack_target};
-use super::write_session::active_mut;
+use super::write_session::{active_mut, duration_nanos};
 use crate::compress;
 use crate::index::dedup_cache::{DedupPrefilter, TieredHit};
 use crate::index::{IndexDelta, PendingChunkEntry};
+use vykar_protocol::PACK_HEADER_SIZE;
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
 
@@ -293,9 +296,12 @@ impl Repository {
                 PackType::Tree => ws.tree_pack_writer.buffer_capacity(),
             }
         };
+        let cap_start = Instant::now();
         self.cap_pending_uploads(incoming)?;
+        let cap_wait = cap_start.elapsed();
 
         let ws = active_mut(&mut self.write_session);
+        let seal_start = Instant::now();
         let SealedPack {
             pack_id,
             entries,
@@ -304,6 +310,23 @@ impl Repository {
             PackType::Data => ws.data_pack_writer.seal()?,
             PackType::Tree => ws.tree_pack_writer.seal()?,
         };
+        let seal_time = seal_start.elapsed();
+
+        let pack_bytes =
+            PACK_HEADER_SIZE as u64 + entries.iter().map(|e| 4 + u64::from(e.1)).sum::<u64>();
+        let counters = &mut ws.metrics.counters;
+        counters.upload_cap_wait += cap_wait;
+        counters.seal += seal_time;
+        match pack_type {
+            PackType::Data => {
+                counters.data_packs += 1;
+                counters.data_pack_bytes += pack_bytes;
+            }
+            PackType::Tree => {
+                counters.tree_packs += 1;
+                counters.tree_pack_bytes += pack_bytes;
+            }
+        }
 
         // Recalculate data pack target after each data pack flush.
         if pack_type == PackType::Data {
@@ -341,9 +364,14 @@ impl Repository {
         let bytes = data.capacity();
         let storage = Arc::clone(&self.storage);
         let key = pack_id.storage_key();
+        let put_nanos = Arc::clone(&self.ws().metrics.upload_put_nanos);
         self.ws_mut()
             .spawn_upload(pack_id, journal_chunks, bytes, move |held| {
-                data.put_to(&*storage, &key, move || held.release())
+                let _span = tracing::debug_span!("pack_upload").entered();
+                let start = Instant::now();
+                let result = data.put_to(&*storage, &key, move || held.release());
+                put_nanos.fetch_add(duration_nanos(start.elapsed()), Ordering::Relaxed);
+                result
             });
 
         Ok(())
@@ -408,10 +436,13 @@ impl Repository {
         }
         // Wait for all background uploads to complete before returning.
         let ws = active_mut(&mut self.write_session);
-        if background_journal {
+        let wait_start = Instant::now();
+        let result = if background_journal {
             ws.wait_pending_uploads_journal_in_background(&self.storage, &self.crypto)
         } else {
             ws.wait_pending_uploads(&*self.storage, &*self.crypto)
-        }
+        };
+        ws.metrics.counters.final_upload_wait += wait_start.elapsed();
+        result
     }
 }

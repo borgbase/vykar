@@ -83,16 +83,38 @@ pub(crate) fn run_cli(cli: Cli) -> ExitCode {
     run_all_repos(&cli, &repos, repo_selector.is_some())
 }
 
-/// Initialize tracing. The daemon runs at `info` by default; everything else
-/// stays quiet until `-v` is passed.
-fn init_logging(cli: &Cli) {
-    let filter = match cli.verbose {
-        0 if matches!(&cli.command, Some(Commands::Daemon { .. })) => "info",
+/// `EnvFilter` directives appended to the `-v`-derived log filter
+/// (e.g. `vykar::stats=debug`).
+const LOG_FILTER_ENV: &str = "VYKAR_LOG";
+
+/// Tracing filter for this invocation: the `-v`-derived level, followed by
+/// `VYKAR_LOG` when it is non-empty.
+fn log_filter(verbose: u8, daemon: bool, env_extra: Option<String>) -> String {
+    let base = match verbose {
+        0 if daemon => "info",
         0 => "warn",
         1 => "info",
         2 => "debug",
         _ => "trace",
     };
+    match env_extra.filter(|f| !f.trim().is_empty()) {
+        Some(extra) => format!("{base},{extra}"),
+        None => base.to_string(),
+    }
+}
+
+/// Initialize tracing. The daemon runs at `info` by default; everything else
+/// stays quiet until `-v` is passed. `VYKAR_LOG` adds directives.
+fn init_logging(cli: &Cli) {
+    // VYKAR_LOG is an internal measurement aid (e.g. backup pipeline stats
+    // without `-v`'s per-file output), deliberately not documented. It comes
+    // after the default, so it can add or override directives but a malformed
+    // or bare value cannot drop the default level for other targets.
+    let filter = log_filter(
+        cli.verbose,
+        matches!(&cli.command, Some(Commands::Daemon { .. })),
+        std::env::var(LOG_FILTER_ENV).ok(),
+    );
     let is_tty = std::io::stderr().is_terminal();
     let builder = tracing_subscriber::fmt()
         .with_env_filter(filter)
@@ -520,5 +542,49 @@ fn run_repo_command(cli: &Cli, repo: &ResolvedRepo) -> CliResult<bool> {
             Ok(false)
         }
         other => other,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::log_filter;
+
+    #[test]
+    fn log_filter_appends_non_empty_env() {
+        assert_eq!(log_filter(0, false, None), "warn");
+        assert_eq!(log_filter(0, true, None), "info");
+        assert_eq!(log_filter(2, false, None), "debug");
+        assert_eq!(log_filter(5, false, None), "trace");
+        assert_eq!(log_filter(1, false, Some(String::new())), "info");
+        assert_eq!(log_filter(1, false, Some("  ".into())), "info");
+        assert_eq!(
+            log_filter(0, false, Some("vykar::stats=debug".into())),
+            "warn,vykar::stats=debug"
+        );
+        assert_eq!(log_filter(0, true, Some("verbose".into())), "info,verbose");
+    }
+
+    /// A bare word, a target-only directive or a malformed value must not
+    /// silence warnings from other targets.
+    #[test]
+    fn log_filter_env_keeps_default_level() {
+        use tracing::Level;
+        use tracing_subscriber::EnvFilter;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        for extra in ["verbose", "vykar::stats=debug", "foo=bar"] {
+            let filter = EnvFilter::new(log_filter(0, false, Some(extra.into())));
+            let subscriber = tracing_subscriber::registry().with(filter);
+            tracing::subscriber::with_default(subscriber, || {
+                assert!(
+                    tracing::enabled!(target: "vykar_core::other", Level::WARN),
+                    "{extra}"
+                );
+                assert!(
+                    !tracing::enabled!(target: "vykar_core::other", Level::INFO),
+                    "{extra}"
+                );
+            });
+        }
     }
 }

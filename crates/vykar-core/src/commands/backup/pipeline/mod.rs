@@ -11,10 +11,13 @@
 //! - [`worker`] — chunking / hashing / encryption per file or segment.
 //! - [`consumer`] — per-entry commit: pack write, item stream, file cache, stats.
 //! - [`segmentation`] — large-file segmentation state machine (accumulator + cross-segment rollback) used by both the consumer and the orchestrator's skip-drain handling.
+//!
+//! Each stage's busy and blocked time is summed into `PipelineTimings`.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use crate::compress::Compression;
 use crate::index::dedup_cache::DedupPrefilter;
@@ -28,6 +31,7 @@ use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
 
 use super::concurrency::ByteBudget;
+use super::instrument::{PipelineClocks, PipelineTimings};
 use super::source::ResolvedSource;
 use super::walk::{DatalessKind, WalkEntry, build_walk_iter, reserve_budget};
 use super::{BackupProgressEvent, ItemStreamCutter};
@@ -278,12 +282,14 @@ pub(crate) struct PipelineBuffers<'a> {
 /// Unlike the previous pariter-based design, no single thread both feeds
 /// work and delivers results, eliminating the deadlock where budget
 /// acquisition in the walk thread could block result delivery.
+///
+/// Returns the run's timings, also logged at debug.
 pub(crate) fn run_parallel_pipeline(
     repo: &mut Repository,
     ctx: &PipelineCtx<'_>,
     bufs: &mut PipelineBuffers<'_>,
     progress: &mut Option<&mut dyn FnMut(BackupProgressEvent)>,
-) -> Result<()> {
+) -> Result<PipelineTimings> {
     let PipelineCtx {
         sources,
         exclude_patterns,
@@ -325,7 +331,12 @@ pub(crate) fn run_parallel_pipeline(
     let work_cap = num_workers * 2;
     let result_cap = num_workers + readahead_depth;
 
-    std::thread::scope(|s| {
+    let clocks = PipelineClocks::default();
+    let mut consumer_wall = Duration::ZERO;
+    let mut consumer_recv_wait = Duration::ZERO;
+    let mut consumer_cap_wait = Duration::ZERO;
+
+    let result = std::thread::scope(|s| {
         // Stage A → B: walk thread sends pre-budgeted entries to workers.
         let (work_tx, work_rx) = crossbeam_channel::bounded::<(usize, WalkEntry, usize)>(work_cap);
 
@@ -334,10 +345,12 @@ pub(crate) fn run_parallel_pipeline(
 
         // Reference so `move` closures capture `&ByteBudget`, not move it.
         let budget_ref = &budget;
+        let clocks_ref = &clocks;
 
         // --- Stage A: Walk thread — iterate + acquire budget in walk order ---
         let walk_result_tx = result_tx.clone();
         s.spawn(move || {
+            let _span = tracing::debug_span!("backup_walk").entered();
             let walk_iter = build_walk_iter(
                 sources,
                 exclude_patterns,
@@ -394,7 +407,10 @@ pub(crate) fn run_parallel_pipeline(
                         if !flush(&mut batch, batch_start) {
                             return;
                         }
-                        let acquired = match reserve_budget(&entry, budget_ref) {
+                        let t = Instant::now();
+                        let reserved = reserve_budget(&entry, budget_ref);
+                        clocks_ref.walk_budget_wait.add(t.elapsed());
+                        let acquired = match reserved {
                             Ok(n) => n,
                             Err(_) => {
                                 // Budget poisoned — stop walking. Consumer
@@ -402,7 +418,10 @@ pub(crate) fn run_parallel_pipeline(
                                 return;
                             }
                         };
-                        if work_tx.send((seq_idx, entry, acquired)).is_err() {
+                        let t = Instant::now();
+                        let sent = work_tx.send((seq_idx, entry, acquired));
+                        clocks_ref.walk_send_wait.add(t.elapsed());
+                        if sent.is_err() {
                             // Workers/consumer gone — release budget and stop.
                             budget_ref.release(acquired);
                             return;
@@ -425,12 +444,20 @@ pub(crate) fn run_parallel_pipeline(
 
         // --- Stage B: N worker threads ---
         // Drop originals after spawning so channels close when workers exit.
-        for _ in 0..num_workers {
+        for worker_idx in 0..num_workers {
             let rx = work_rx.clone();
             let tx = result_tx.clone();
             let chunker_cfg = chunker_config.clone();
             s.spawn(move || {
-                for (idx, entry, pre_acquired) in rx {
+                let _span = tracing::debug_span!("backup_worker", worker = worker_idx).entered();
+                loop {
+                    let wait = Instant::now();
+                    let received = rx.recv();
+                    clocks_ref.worker_recv_wait.add(wait.elapsed());
+                    let Ok((idx, entry, pre_acquired)) = received else {
+                        return;
+                    };
+                    let busy = Instant::now();
                     let result = worker::process_file_worker(
                         entry,
                         chunk_hasher,
@@ -441,12 +468,17 @@ pub(crate) fn run_parallel_pipeline(
                         budget_ref,
                         pre_acquired,
                         prefilter,
+                        &clocks_ref.worker_transform,
                     );
+                    clocks_ref.worker_busy.add(busy.elapsed());
                     let msg = match result {
                         Ok(processed) => PipelineResult::Ok(idx, Box::new(processed)),
                         Err(e) => PipelineResult::WorkerErr(idx, e),
                     };
-                    if tx.send(msg).is_err() {
+                    let send = Instant::now();
+                    let sent = tx.send(msg);
+                    clocks_ref.worker_send_wait.add(send.elapsed());
+                    if sent.is_err() {
                         return; // Consumer gone.
                     }
                 }
@@ -469,7 +501,13 @@ pub(crate) fn run_parallel_pipeline(
         let mut dataless_dirs: u64 = 0;
         let mut last_debt: usize = 0;
 
-        for msg in &result_rx {
+        let consumer_span = tracing::debug_span!("backup_consumer").entered();
+        let cap_wait_start = session_cap_wait(repo);
+        let loop_start = Instant::now();
+        loop {
+            let wait = Instant::now();
+            let Ok(msg) = result_rx.recv() else { break };
+            consumer_recv_wait += wait.elapsed();
             if shutdown.is_some_and(|f| f.load(Ordering::Relaxed)) {
                 budget.poison();
                 consume_err = Some(VykarError::Interrupted);
@@ -665,6 +703,9 @@ pub(crate) fn run_parallel_pipeline(
             // Uploads may also finish while the consumer waits for results.
             update_debt(repo, &budget, &mut last_debt);
         }
+        consumer_wall = loop_start.elapsed();
+        consumer_cap_wait = session_cap_wait(repo).saturating_sub(cap_wait_start);
+        drop(consumer_span);
 
         // Drop receiver to unblock any workers stuck on result_tx.send().
         drop(result_rx);
@@ -697,7 +738,29 @@ pub(crate) fn run_parallel_pipeline(
         }
 
         Ok(())
-    })
+    });
+
+    let timings = PipelineTimings {
+        workers: num_workers,
+        wall: consumer_wall,
+        consumer_busy: consumer_wall.saturating_sub(consumer_recv_wait),
+        consumer_recv_wait,
+        consumer_cap_wait,
+        worker_busy: clocks.worker_busy.total(),
+        worker_transform: clocks.worker_transform.total(),
+        worker_recv_wait: clocks.worker_recv_wait.total(),
+        worker_send_wait: clocks.worker_send_wait.total(),
+        walk_budget_wait: clocks.walk_budget_wait.total(),
+        walk_send_wait: clocks.walk_send_wait.total(),
+    };
+    timings.emit();
+    result.map(|()| timings)
+}
+
+/// The write session's `upload_cap_wait` so far.
+fn session_cap_wait(repo: &Repository) -> Duration {
+    repo.write_metrics()
+        .map_or(Duration::ZERO, |m| m.upload_cap_wait)
 }
 
 /// Lend the upload queue's slack (sealed packs beyond the in-flight slots)

@@ -4,7 +4,8 @@ use super::Repository;
 use super::journal_recovery::PendingIndexRecovery;
 use super::pack::{PackType, PackWriter, compute_data_pack_target, compute_tree_pack_target};
 use super::write_session::{
-    DEFAULT_SESSION_ID, RollbackTracker, WriteSessionState, active, active_mut,
+    DEFAULT_SESSION_ID, RollbackTracker, WriteMetricsSnapshot, WriteSessionState, active,
+    active_mut,
 };
 use crate::index::dedup_cache::{self, DedupPrefilter, TieredDedupIndex};
 use crate::index::{ChunkIndex, DedupIndex, IndexDelta};
@@ -156,6 +157,11 @@ impl Repository {
         self.write_session
             .as_ref()
             .map_or(0, |ws| ws.upload_slack_bytes())
+    }
+
+    /// Snapshot of the active write session's diagnostic counters; `None` without one.
+    pub(crate) fn write_metrics(&self) -> Option<WriteMetricsSnapshot> {
+        self.write_session.as_ref().map(|ws| ws.metrics.snapshot())
     }
 
     /// Switch to dedup-only index mode to reduce memory during backup.
@@ -365,6 +371,7 @@ impl Repository {
         let has_pending = self.ws().data_pack_writer.has_pending();
         if has_pending {
             self.flush_writer_async(PackType::Data)?;
+            self.ws_mut().metrics.counters.forced_data_seals += 1;
         }
 
         let ws = self.ws_mut();
@@ -674,6 +681,42 @@ mod tests {
                 .iter()
                 .any(|e| e.pack_id == pack_id)
         );
+        repo.write_session = None;
+    }
+
+    /// The write counters match what reached storage, and count the seal
+    /// forced by a rollback checkpoint.
+    #[test]
+    fn write_metrics_count_seals_bytes_and_forced_seals() {
+        use crate::compress::Compression;
+        use crate::repo::pack::PackType;
+
+        let mut repo = test_repo_plaintext();
+        repo.enable_dedup_mode();
+        repo.store_chunk(b"first", Compression::None, PackType::Data)
+            .unwrap();
+        repo.begin_rollback_checkpoint().unwrap();
+        repo.commit_rollback_checkpoint();
+        repo.store_chunk(b"second", Compression::None, PackType::Data)
+            .unwrap();
+        repo.store_chunk(b"tree", Compression::None, PackType::Tree)
+            .unwrap();
+        repo.flush_packs().unwrap();
+
+        let m = repo.write_metrics().unwrap();
+        assert_eq!(m.data_packs, 2);
+        assert_eq!(m.tree_packs, 1);
+        assert_eq!(m.forced_data_seals, 1);
+        assert!(m.seal > std::time::Duration::ZERO || m.upload_put > std::time::Duration::ZERO);
+
+        let stored: u64 = repo
+            .storage
+            .list("packs/")
+            .unwrap()
+            .iter()
+            .map(|key| repo.storage.get(key).unwrap().unwrap().len() as u64)
+            .sum();
+        assert_eq!(m.data_pack_bytes + m.tree_pack_bytes, stored);
         repo.write_session = None;
     }
 

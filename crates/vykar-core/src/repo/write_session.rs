@@ -1,5 +1,7 @@
 use std::collections::HashMap as StdHashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use crate::index::dedup_cache::TieredDedupIndex;
 use crate::index::{
@@ -37,6 +39,48 @@ pub(crate) struct RollbackTracker {
     pub journal_pack_ids: Vec<PackId>,
     /// Data pack writer target size at checkpoint time (for reset on rollback).
     pub data_pack_target_size: usize,
+}
+
+/// Diagnostic counters of one write session, for the backup's debug summary.
+/// Updated on the thread that seals packs; `upload_put_nanos` by upload threads.
+#[derive(Debug, Default)]
+pub(crate) struct WriteMetrics {
+    pub(crate) counters: WriteMetricsSnapshot,
+    /// Sum of `put_to` durations over all upload threads (they overlap, so this
+    /// can exceed wall time). Read after the uploads are joined.
+    pub(crate) upload_put_nanos: Arc<AtomicU64>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct WriteMetricsSnapshot {
+    pub(crate) data_packs: u64,
+    pub(crate) tree_packs: u64,
+    pub(crate) data_pack_bytes: u64,
+    pub(crate) tree_pack_bytes: u64,
+    /// Data packs sealed early by `begin_rollback_checkpoint`.
+    pub(crate) forced_data_seals: u64,
+    /// Time inside `PackWriter::seal` (pack ID hash for heap packs).
+    pub(crate) seal: Duration,
+    /// Time the sealing thread spent in `cap_pending_uploads` (upload backpressure).
+    pub(crate) upload_cap_wait: Duration,
+    /// Time spent joining uploads in `flush_packs*`.
+    pub(crate) final_upload_wait: Duration,
+    /// Filled from `upload_put_nanos` by `snapshot()`.
+    pub(crate) upload_put: Duration,
+}
+
+impl WriteMetrics {
+    pub(crate) fn snapshot(&self) -> WriteMetricsSnapshot {
+        WriteMetricsSnapshot {
+            upload_put: Duration::from_nanos(self.upload_put_nanos.load(Ordering::Relaxed)),
+            ..self.counters
+        }
+    }
+}
+
+/// Saturating `Duration` → u64 nanoseconds (584 years).
+pub(crate) fn duration_nanos(d: Duration) -> u64 {
+    u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
 }
 
 /// Write-path state that is active during a backup session.
@@ -89,6 +133,8 @@ pub(crate) struct WriteSessionState {
     /// during per-file backup chunk loops that need to survive mid-read
     /// drift detection. Single-slot by design.
     pub(crate) rollback_tracker: Option<RollbackTracker>,
+    /// Diagnostic counters for the backup's debug summary.
+    pub(crate) metrics: WriteMetrics,
 }
 
 /// Borrow the active write session from the `Repository::write_session` field.
@@ -126,6 +172,7 @@ impl WriteSessionState {
             session_packs_flushed: 0,
             session_id: DEFAULT_SESSION_ID.to_string(),
             rollback_tracker: None,
+            metrics: WriteMetrics::default(),
         }
     }
 

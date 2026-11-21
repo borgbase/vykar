@@ -3,6 +3,7 @@ mod command_dump;
 mod commit;
 mod concurrency;
 mod drift;
+mod instrument;
 mod item_cut;
 mod phases;
 pub(crate) mod pipeline;
@@ -209,6 +210,12 @@ pub struct BackupOutcome {
     /// means an entire subtree is missing from the snapshot. Same reporting
     /// rules as `dataless_files_skipped`.
     pub dataless_dirs_skipped: u64,
+    /// Diagnostic counters and timings (also logged at debug on `vykar::stats`).
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "read by tests; logged by the run")
+    )]
+    pub(crate) instrumentation: instrument::BackupInstrumentation,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -658,6 +665,7 @@ fn run_against_repo(
         snapshot_packed,
         mut new_file_cache,
         stats,
+        instrumentation,
     } = match phase1_result {
         Ok(result) => result,
         Err(e) => {
@@ -724,6 +732,7 @@ fn run_against_repo(
         is_partial,
         dataless_files_skipped: dataless.files,
         dataless_dirs_skipped: dataless.dirs,
+        instrumentation,
     })
 }
 

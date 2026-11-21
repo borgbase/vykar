@@ -9,6 +9,7 @@
 //! them without aborting the whole backup.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use tracing::warn;
 
@@ -24,6 +25,7 @@ use vykar_types::error::{Result, VykarError};
 use super::super::chunk_process::classify_chunk;
 use super::super::concurrency::{BudgetGuard, ByteBudget};
 use super::super::drift::{ReadPlan, open_checked, read_range_drift_checked};
+use super::super::instrument::StageClock;
 use super::super::walk::{WalkEntry, into_lossy_string};
 use super::ProcessedEntry;
 
@@ -50,6 +52,8 @@ fn estimate_chunk_count(data_len: u64, avg_chunk_size: u32) -> usize {
 ///
 /// Budget bytes are pre-acquired by the walk thread; `pre_acquired_bytes`
 /// is wrapped in a [`BudgetGuard`] for error safety (auto-release on `?` bail).
+/// Time spent hashing, compressing and encrypting chunks is added to
+/// `transform_clock`.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn process_file_worker(
     entry: WalkEntry,
@@ -61,6 +65,7 @@ pub(super) fn process_file_worker(
     budget: &ByteBudget,
     pre_acquired_bytes: usize,
     prefilter: Option<&DedupPrefilter>,
+    transform_clock: &StageClock,
 ) -> Result<ProcessedEntry> {
     match entry {
         WalkEntry::File {
@@ -97,9 +102,12 @@ pub(super) fn process_file_worker(
                     chunker_config,
                     read_limiter,
                     |data| {
+                        let start = Instant::now();
                         let chunk_id = ChunkId::compute(chunk_hasher, &data);
-                        worker_chunks
-                            .push(classify_chunk(chunk_id, data, prefilter, compression, crypto)?);
+                        let classified =
+                            classify_chunk(chunk_id, data, prefilter, compression, crypto);
+                        transform_clock.add(start.elapsed());
+                        worker_chunks.push(classified?);
                         Ok(())
                     },
                 )?;
@@ -157,9 +165,12 @@ pub(super) fn process_file_worker(
                     chunker_config,
                     read_limiter,
                     |data| {
+                        let start = Instant::now();
                         let chunk_id = ChunkId::compute(chunk_hasher, &data);
-                        worker_chunks
-                            .push(classify_chunk(chunk_id, data, prefilter, compression, crypto)?);
+                        let classified =
+                            classify_chunk(chunk_id, data, prefilter, compression, crypto);
+                        transform_clock.add(start.elapsed());
+                        worker_chunks.push(classified?);
                         Ok(())
                     },
                 )?;

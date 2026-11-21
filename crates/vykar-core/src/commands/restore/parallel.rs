@@ -12,14 +12,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::commands::util::check_interrupted;
-use crate::compress;
-use crate::repo::format::{
-    ObjectType, unpack_object_expect_with_context_in_place, verify_chunk_id,
-};
+use crate::repo::format::{BlobLocation, ChunkDecodeError, decode_chunk_into};
 use smallvec::SmallVec;
 use vykar_crypto::CryptoEngine;
 use vykar_storage::{RangeReader, StorageBackend};
-use vykar_types::chunk_id::{ChunkHasher, ChunkId};
+use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
 use vykar_types::pack_id::PackId;
 
@@ -366,7 +363,6 @@ pub(super) fn execute_parallel_restore(
 
     let bytes_written = AtomicU64::new(0);
     let cancelled = AtomicBool::new(false);
-    let chunk_hasher = crypto.chunk_hasher();
 
     std::thread::scope(|s| {
         let mut handles = Vec::with_capacity(buckets.len());
@@ -401,7 +397,6 @@ pub(super) fn execute_parallel_restore(
                         &mut pw,
                         root,
                         verify_chunks,
-                        chunk_hasher,
                         shutdown,
                         failures,
                     ) {
@@ -440,7 +435,6 @@ struct BlobCtx<'a> {
     cancelled: &'a AtomicBool,
     root: &'a Path,
     verify_chunks: bool,
-    chunk_hasher: &'a ChunkHasher,
     shutdown: Option<&'a AtomicBool>,
     failures: Option<&'a BatchFailures>,
 }
@@ -498,7 +492,6 @@ fn process_read_group(
     pw: &mut PendingWrite,
     root: &Path,
     verify_chunks: bool,
-    chunk_hasher: &ChunkHasher,
     shutdown: Option<&AtomicBool>,
     failures: Option<&BatchFailures>,
 ) -> std::result::Result<(), ReadError> {
@@ -509,7 +502,6 @@ fn process_read_group(
         cancelled,
         root,
         verify_chunks,
-        chunk_hasher,
         shutdown,
         failures,
     };
@@ -757,55 +749,21 @@ fn decode_blob(
     raw: &mut [u8],
     decompress_buf: &mut Vec<u8>,
 ) -> Result<()> {
-    let compressed = unpack_object_expect_with_context_in_place(
+    let at = BlobLocation {
+        chunk_id: blob.chunk_id,
+        pack_id: *pack_id,
+        pack_offset: blob.pack_offset,
+        stored_size: blob.stored_size,
+    };
+    decode_chunk_into(
         raw,
-        ObjectType::ChunkData,
-        blob.chunk_id.as_bytes(),
+        at,
         ctx.crypto,
-    )
-    .map_err(|e| {
-        VykarError::Other(format!(
-            "chunk {} in pack {} (offset {}, size {}): {e}",
-            blob.chunk_id, pack_id, blob.pack_offset, blob.stored_size
-        ))
-    })?;
-    compress::decompress_into_with_hint(
-        compressed,
         Some(blob.expected_size as usize),
+        ctx.verify_chunks,
         decompress_buf,
     )
-    .map_err(|e| {
-        VykarError::Other(format!(
-            "chunk {} in pack {} (offset {}, size {}): {e}",
-            blob.chunk_id, pack_id, blob.pack_offset, blob.stored_size
-        ))
-    })?;
-
-    if decompress_buf.len() != blob.expected_size as usize {
-        return Err(VykarError::InvalidFormat(format!(
-            "chunk {} in pack {} (offset {}, size {}) size mismatch after restore decode: \
-             expected {} bytes, got {} bytes",
-            blob.chunk_id,
-            pack_id,
-            blob.pack_offset,
-            blob.stored_size,
-            blob.expected_size,
-            decompress_buf.len()
-        )));
-    }
-
-    // Without AEAD, the chunk ID is the only checksum on chunk data.
-    if ctx.verify_chunks || !ctx.crypto.is_encrypting() {
-        verify_chunk_id(
-            ctx.chunk_hasher,
-            &blob.chunk_id,
-            decompress_buf,
-            pack_id,
-            blob.pack_offset,
-            blob.stored_size,
-        )?;
-    }
-    Ok(())
+    .map_err(ChunkDecodeError::into_located)
 }
 
 /// Write `buf` to the target file at `offset`.  Opens the (already staged)
@@ -888,7 +846,7 @@ mod tests {
         stage_files,
     };
     use crate::compress::Compression;
-    use crate::repo::format::pack_object_with_context;
+    use crate::repo::format::{ObjectType, pack_object_with_context};
     use crate::testutil::{MemoryBackend, test_chunk_hasher};
     use smallvec::SmallVec;
     use std::path::PathBuf;
@@ -964,7 +922,6 @@ mod tests {
             &mut PendingWrite::new(),
             temp.path(),
             false,
-            &test_chunk_hasher(),
             None,
             None,
         )
@@ -1032,7 +989,6 @@ mod tests {
             &mut PendingWrite::new(),
             temp.path(),
             false,
-            &test_chunk_hasher(),
             None,
             None,
         )
@@ -1117,7 +1073,6 @@ mod tests {
             &mut PendingWrite::new(),
             temp.path(),
             false,
-            &test_chunk_hasher(),
             None,
             None,
         )
@@ -1214,7 +1169,6 @@ mod tests {
             &mut PendingWrite::new(),
             temp.path(),
             false,
-            &test_chunk_hasher(),
             None,
             None,
         )
@@ -1290,7 +1244,6 @@ mod tests {
             &mut PendingWrite::new(),
             temp.path(),
             false,
-            &test_chunk_hasher(),
             None,
             None,
         )
@@ -1358,7 +1311,6 @@ mod tests {
             &mut PendingWrite::new(),
             temp.path(),
             true,
-            &test_chunk_hasher(),
             None,
             None,
         )
@@ -1389,7 +1341,6 @@ mod tests {
             &mut PendingWrite::new(),
             root,
             verify_chunks,
-            crypto.chunk_hasher(),
             None,
             None,
         )
@@ -1821,7 +1772,6 @@ mod tests {
             &mut PendingWrite::new(),
             root,
             false,
-            crypto.chunk_hasher(),
             None,
             failures,
         )
@@ -2472,7 +2422,6 @@ mod tests {
                 &mut pw,
                 temp.path(),
                 false,
-                crypto.chunk_hasher(),
                 None,
                 Some(&failures),
             )

@@ -1,6 +1,7 @@
 //! `LazyItemStream`: the item stream decoded chunk by chunk, with items
 //! straddling chunk and range-read boundaries.
 
+use std::io::Read;
 use std::sync::atomic::AtomicBool;
 
 use vykar_types::chunk_id::ChunkId;
@@ -24,6 +25,23 @@ fn repo_on_counting_backend() -> (Repository, PutLog) {
         crate::repo::EncryptionMode::None,
         crate::config::ChunkerConfig::default(),
         None,
+        None,
+        None,
+    )
+    .expect("init");
+    repo.begin_write_session(&WriteSessionOptions::default())
+        .expect("begin write session");
+    (repo, log)
+}
+
+fn aes_repo_on_counting_backend() -> (Repository, PutLog) {
+    init_test_environment();
+    let (backend, log) = RecordingBackend::new();
+    let mut repo = Repository::init(
+        Box::new(backend),
+        crate::repo::EncryptionMode::Aes256Gcm,
+        crate::config::ChunkerConfig::default(),
+        Some("test-pass"),
         None,
         None,
     )
@@ -200,4 +218,20 @@ fn lazy_stream_from_cache_falls_back_to_index_on_bad_location() {
     // Without the cache origin there is no fallback: the error surfaces.
     let mut lazy = LazyItemStream::for_test(&repo, locs, false, u64::MAX, None);
     assert!(paths_of(&mut lazy).is_err());
+}
+
+#[test]
+fn lazy_stream_reads_an_aead_repo() {
+    let (mut repo, _log) = aes_repo_on_counting_backend();
+    let cut = 64;
+    let (stream, mut locs) = stored_stream(&mut repo, 200, cut);
+    let mut pieces: Vec<&[u8]> = stream.chunks(cut).collect();
+    locs.insert(4, locs[3]);
+    pieces.insert(4, pieces[3]);
+
+    let cap = u64::from(locs[0].3) * 4;
+    let mut lazy = LazyItemStream::for_test(&repo, locs, false, cap, None);
+    let mut bytes = Vec::new();
+    lazy.read_to_end(&mut bytes).unwrap();
+    assert_eq!(bytes, pieces.concat());
 }

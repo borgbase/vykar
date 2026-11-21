@@ -806,3 +806,30 @@ fn item_stream_bytes_identical_across_widths() {
         }
     }
 }
+
+/// Duplicates in one group share bytes of the fetched range; an in-place AEAD
+/// decrypt of the first must not destroy the second.
+#[test]
+fn duplicate_chunk_ids_decode_under_aead() {
+    let (mut repo, probe) = repo_on_tuned_backend(EncryptionMode::Aes256Gcm);
+    let ids = store_chunks(&mut repo, 2);
+    let chunks = resolve_chunks(&repo, &ids);
+    let mut dup_chunks = chunks.clone();
+    dup_chunks.extend_from_slice(&chunks);
+
+    repo.clear_blob_cache();
+    let c0 = repo.read_chunk(&ids[0]).unwrap();
+    let c1 = repo.read_chunk(&ids[1]).unwrap();
+    let expected = [c0.as_slice(), &c1, &c0, &c1].concat();
+
+    for width in [1, 4] {
+        probe.width.store(width, Ordering::SeqCst);
+        repo.clear_blob_cache();
+        probe.reset_counters();
+        let mut out = Vec::new();
+        repo.read_chunks_coalesced_into(&dup_chunks, &mut out, None)
+            .unwrap();
+        assert_eq!(probe.reads.load(Ordering::SeqCst), 1, "width {width}");
+        assert_eq!(out, expected, "width {width}");
+    }
+}

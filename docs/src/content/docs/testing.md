@@ -73,7 +73,7 @@ Unit tests in `vykar-core` cover each subsystem in isolation. Fast feedback (sec
 | `fuzz_pending_journal` | `decode_pending_journal`, recovery seeding | `sessions/<id>.index` from other clients, versioned and legacy shapes |
 | `fuzz_protocol_keys` | Storage-key validators, pack-key temp paths, `parse_byte_range`, `validate_pack_header` | Server keys resolving outside the repository root, `Range` header parsing |
 | `fuzz_metadata_msgpack` | `decode_metadata_msgpack::<IndexBlob>` | Streaming msgpack decode disagreeing with the buffered path |
-| `fuzz_plaintext_read` | Pack scan, unpack, decompress, chunk-ID check for a plaintext engine | Forged chunks in unencrypted repositories, size hints changing the decoded bytes |
+| `fuzz_plaintext_read` | Pack scan, then `decode_chunk_into` against the unpack + decompress composition for a plaintext engine, with and without size hints | Forged chunks in unencrypted repositories, size hints changing the decoded bytes |
 
 Corpus seeds are committed and deterministic. CI runs each target for 300 seconds weekly on nightly (`make fuzz-check` replays the corpus without new fuzzing for fast regression checks).
 

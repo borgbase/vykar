@@ -29,7 +29,7 @@ Coverage-guided fuzz tests for vykar's parser, deserializer, and decrypt paths. 
 | `fuzz_pending_journal` | Session journal decode (`decode_pending_journal`), re-encode and recovery seeding |
 | `fuzz_protocol_keys` | Server storage-key validators, pack-key temp paths, `Range` parsing (`parse_byte_range`), `validate_pack_header` |
 | `fuzz_metadata_msgpack` | Streaming `decode_metadata_msgpack::<IndexBlob>` against the buffered decode |
-| `fuzz_plaintext_read` | Plaintext read path: pack scan, unpack, decompress, chunk-ID check, size-hinted decompression |
+| `fuzz_plaintext_read` | Plaintext read path: pack scan, then `decode_chunk_into` (chunk-ID check, size-hinted decode) against the unpack + decompress composition |
 
 ## Corpus
 

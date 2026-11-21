@@ -5,17 +5,19 @@ use std::sync::{Arc, Mutex};
 use super::types::{CheckProgressEvent, IntegrityIssue, ItemImpact, emit_progress};
 use crate::commands::list::{for_each_decoded_item, load_snapshot_item_stream, load_snapshot_meta};
 use crate::commands::util::check_interrupted;
-use crate::compress;
 use crate::config::VykarConfig;
 use crate::index::ChunkIndexEntry;
 use crate::repo::Repository;
-use crate::repo::format::{ObjectType, unpack_object_expect_with_context};
+use crate::repo::format::{
+    BlobLocation, ChunkDecodeStage, ObjectType, decode_chunk_into,
+    unpack_object_expect_with_context,
+};
 use crate::repo::pack::read_blob_from_pack;
 use crate::snapshot::item::ItemType;
 use vykar_crypto::CryptoEngine;
 use vykar_protocol::validate_pack_header;
 use vykar_storage::StorageBackend;
-use vykar_types::chunk_id::{ChunkHasher, ChunkId};
+use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
 use vykar_types::pack_id::PackId;
 use vykar_types::snapshot_id::SnapshotId;
@@ -667,7 +669,6 @@ pub(super) fn integrity_scan(
         let (data_count, data_issues) = parallel_verify_data(
             &repo.storage,
             &repo.crypto,
-            repo.crypto.chunk_hasher(),
             &packs_vec,
             config.limits.verify_data_concurrency(),
             BATCH_THRESHOLD,
@@ -848,7 +849,6 @@ fn parallel_pack_existence(
 fn parallel_verify_data(
     storage: &Arc<dyn StorageBackend>,
     crypto: &Arc<dyn CryptoEngine>,
-    chunk_hasher: &ChunkHasher,
     packs: &[(PackId, Vec<(ChunkId, ChunkIndexEntry)>)],
     concurrency: usize,
     batch_threshold: usize,
@@ -867,7 +867,6 @@ fn parallel_verify_data(
             verify_pack_full(
                 storage.as_ref(),
                 crypto.as_ref(),
-                chunk_hasher,
                 pack_id,
                 chunks,
                 &mut local_issues,
@@ -876,7 +875,6 @@ fn parallel_verify_data(
             verify_pack_individual(
                 storage.as_ref(),
                 crypto.as_ref(),
-                chunk_hasher,
                 pack_id,
                 chunks,
                 &mut local_issues,
@@ -905,7 +903,6 @@ fn parallel_verify_data(
 pub(crate) fn verify_pack_full(
     storage: &dyn StorageBackend,
     crypto: &dyn CryptoEngine,
-    chunk_hasher: &ChunkHasher,
     pack_id: &PackId,
     chunks: &[(ChunkId, ChunkIndexEntry)],
     issues: &mut Vec<IntegrityIssue>,
@@ -938,6 +935,7 @@ pub(crate) fn verify_pack_full(
     }
 
     let mut count = 0;
+    let mut raw = Vec::new();
     for (chunk_id, entry) in chunks {
         let start = match usize::try_from(entry.pack_offset) {
             Ok(s) => s,
@@ -993,10 +991,20 @@ pub(crate) fn verify_pack_full(
             continue;
         }
 
-        let raw = pack_data
+        let blob = pack_data
             .get(start..end)
             .expect("end <= pack_data.len() (checked above)");
-        count += verify_single_chunk(crypto, chunk_hasher, chunk_id, pack_id, raw, issues);
+        // Entries of a corrupt index can overlap; decoding in place would let
+        // one failed decrypt damage a valid neighbour, so decode a copy.
+        raw.clear();
+        raw.extend_from_slice(blob);
+        let at = BlobLocation {
+            chunk_id: *chunk_id,
+            pack_id: *pack_id,
+            pack_offset: entry.pack_offset,
+            stored_size: entry.stored_size,
+        };
+        count += verify_single_chunk(crypto, at, &mut raw, issues);
     }
     count
 }
@@ -1005,7 +1013,6 @@ pub(crate) fn verify_pack_full(
 fn verify_pack_individual(
     storage: &dyn StorageBackend,
     crypto: &dyn CryptoEngine,
-    chunk_hasher: &ChunkHasher,
     pack_id: &PackId,
     chunks: &[(ChunkId, ChunkIndexEntry)],
     issues: &mut Vec<IntegrityIssue>,
@@ -1019,72 +1026,58 @@ fn verify_pack_individual(
         if is_shutting_down(shutdown) {
             break;
         }
-        let raw = match read_blob_from_pack(storage, pack_id, entry.pack_offset, entry.stored_size)
-        {
-            Ok(data) => data,
-            Err(e) => {
-                issues.push(IntegrityIssue::CorruptChunk {
-                    chunk_id: *chunk_id,
-                    pack_id: *pack_id,
-                    detail: format!("read failed: {e}"),
-                });
-                continue;
-            }
+        let mut raw =
+            match read_blob_from_pack(storage, pack_id, entry.pack_offset, entry.stored_size) {
+                Ok(data) => data,
+                Err(e) => {
+                    issues.push(IntegrityIssue::CorruptChunk {
+                        chunk_id: *chunk_id,
+                        pack_id: *pack_id,
+                        detail: format!("read failed: {e}"),
+                    });
+                    continue;
+                }
+            };
+        let at = BlobLocation {
+            chunk_id: *chunk_id,
+            pack_id: *pack_id,
+            pack_offset: entry.pack_offset,
+            stored_size: entry.stored_size,
         };
-        count += verify_single_chunk(crypto, chunk_hasher, chunk_id, pack_id, &raw, issues);
+        count += verify_single_chunk(crypto, at, &mut raw, issues);
     }
     count
 }
 
-/// Decrypt, decompress, and recompute ChunkId for one blob. Returns 1 on success, 0 on error.
+/// Decrypt, decompress, and recompute ChunkId for one blob, decoding in place
+/// in `raw`. Returns 1 on success, 0 on error.
 fn verify_single_chunk(
     crypto: &dyn CryptoEngine,
-    chunk_hasher: &ChunkHasher,
-    chunk_id: &ChunkId,
-    pack_id: &PackId,
-    raw: &[u8],
+    at: BlobLocation,
+    raw: &mut [u8],
     issues: &mut Vec<IntegrityIssue>,
 ) -> usize {
-    let compressed = match unpack_object_expect_with_context(
-        raw,
-        ObjectType::ChunkData,
-        chunk_id.as_bytes(),
-        crypto,
-    ) {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            issues.push(IntegrityIssue::CorruptChunk {
-                chunk_id: *chunk_id,
-                pack_id: *pack_id,
-                detail: format!("decrypt failed: {e}"),
-            });
-            return 0;
+    // A fresh buffer per chunk: a reused one changes how much a frame
+    // without a recorded size may decode to before it is rejected.
+    let mut out = Vec::new();
+    let Err(e) = decode_chunk_into(raw, at, crypto, None, true, &mut out) else {
+        return 1;
+    };
+    let detail = match e.stage {
+        ChunkDecodeStage::Decrypt(inner) => format!("decrypt failed: {inner}"),
+        ChunkDecodeStage::Decompress(inner) => format!("decompress failed: {inner}"),
+        ChunkDecodeStage::IdMismatch { actual } => format!("ID mismatch (recomputed {actual})"),
+        // Check passes no size hint, so this does not occur.
+        ChunkDecodeStage::SizeMismatch { expected, actual } => {
+            format!("size mismatch: expected {expected} bytes, got {actual} bytes")
         }
     };
-
-    let plaintext = match compress::decompress(&compressed) {
-        Ok(data) => data,
-        Err(e) => {
-            issues.push(IntegrityIssue::CorruptChunk {
-                chunk_id: *chunk_id,
-                pack_id: *pack_id,
-                detail: format!("decompress failed: {e}"),
-            });
-            return 0;
-        }
-    };
-
-    let recomputed = ChunkId::compute(chunk_hasher, &plaintext);
-    if &recomputed != chunk_id {
-        issues.push(IntegrityIssue::CorruptChunk {
-            chunk_id: *chunk_id,
-            pack_id: *pack_id,
-            detail: format!("ID mismatch (recomputed {recomputed})"),
-        });
-        return 0;
-    }
-
-    1
+    issues.push(IntegrityIssue::CorruptChunk {
+        chunk_id: at.chunk_id,
+        pack_id: at.pack_id,
+        detail,
+    });
+    0
 }
 
 #[cfg(test)]
@@ -1183,6 +1176,7 @@ mod tests {
     fn verify_single_chunk_rejects_frame_restore_rejects() {
         use crate::repo::format::pack_object_with_context;
         use vykar_crypto::PlaintextEngine;
+        use vykar_types::chunk_id::ChunkHasher;
         use vykar_types::hash::HashAlgorithm;
 
         let frame = crate::compress::tests::ZSTD_EMPTY_COMPRESSED_BLOCK;
@@ -1190,13 +1184,18 @@ mod tests {
         let engine = PlaintextEngine::new(hasher.clone());
         let chunk_id = ChunkId::compute(&hasher, &frame[frame.len() - 6..]);
         let pack_id = PackId::from_bytes([0x01; 32]);
-        let raw =
+        let mut raw =
             pack_object_with_context(ObjectType::ChunkData, chunk_id.as_bytes(), frame, &engine)
                 .unwrap();
+        let at = BlobLocation {
+            chunk_id,
+            pack_id,
+            pack_offset: 0,
+            stored_size: raw.len() as u32,
+        };
 
         let mut issues = Vec::new();
-        let verified =
-            verify_single_chunk(&engine, &hasher, &chunk_id, &pack_id, &raw, &mut issues);
+        let verified = verify_single_chunk(&engine, at, &mut raw, &mut issues);
         assert_eq!(verified, 0);
         assert!(
             matches!(

@@ -1,10 +1,14 @@
+use crate::compress::{self, Compression};
 use crate::repo::format::{
-    ObjectType, pack_object, pack_object_streaming, pack_object_with_context, unpack_object,
-    unpack_object_expect, unpack_object_expect_with_context, unpack_object_with_context,
+    BlobLocation, ChunkDecodeError, ChunkDecodeStage, ObjectType, decode_chunk_into, pack_object,
+    pack_object_streaming, pack_object_with_context, unpack_object, unpack_object_expect,
+    unpack_object_expect_with_context, unpack_object_with_context,
 };
-use vykar_crypto::PlaintextEngine;
 use vykar_crypto::aes_gcm::Aes256GcmEngine;
+use vykar_crypto::{CryptoEngine, PlaintextEngine};
+use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::VykarError;
+use vykar_types::pack_id::PackId;
 
 #[test]
 fn roundtrip_plaintext() {
@@ -172,4 +176,233 @@ fn context_bound_unpack_rejects_legacy_object() {
         unpack_object_expect_with_context(&packed, ObjectType::Manifest, b"manifest", &engine)
             .unwrap_err();
     assert!(matches!(err, VykarError::DecryptionFailed));
+}
+
+fn plaintext_engine() -> PlaintextEngine {
+    PlaintextEngine::new(crate::testutil::chunk_hasher_for([0xAA; 32]))
+}
+
+fn aes_engine() -> Aes256GcmEngine {
+    Aes256GcmEngine::new(&[0x11; 32], crate::testutil::chunk_hasher_for([0x22; 32]))
+}
+
+/// A stored chunk blob of `payload` (already compressed) under `id`.
+fn chunk_blob(id: &ChunkId, payload: &[u8], engine: &dyn CryptoEngine) -> Vec<u8> {
+    pack_object_with_context(ObjectType::ChunkData, id.as_bytes(), payload, engine).unwrap()
+}
+
+fn location(chunk_id: ChunkId, raw: &[u8]) -> BlobLocation {
+    BlobLocation {
+        chunk_id,
+        pack_id: PackId::from_bytes([0x07; 32]),
+        pack_offset: 7,
+        stored_size: raw.len() as u32,
+    }
+}
+
+fn decode(
+    raw: &[u8],
+    at: BlobLocation,
+    engine: &dyn CryptoEngine,
+    hint: Option<usize>,
+    verify: bool,
+) -> Result<Vec<u8>, ChunkDecodeError> {
+    let mut out = vec![0xEE; 3];
+    decode_chunk_into(&mut raw.to_vec(), at, engine, hint, verify, &mut out).map(|()| out)
+}
+
+#[test]
+fn decode_chunk_round_trips_every_codec() {
+    let data = b"chunk payload chunk payload chunk payload".repeat(20);
+    let engines: [Box<dyn CryptoEngine>; 2] =
+        [Box::new(aes_engine()), Box::new(plaintext_engine())];
+    for engine in &engines {
+        let id = ChunkId::compute(engine.chunk_hasher(), &data);
+        for codec in [
+            Compression::None,
+            Compression::Lz4,
+            Compression::Zstd { level: 3 },
+        ] {
+            let raw = chunk_blob(
+                &id,
+                &compress::compress(codec, &data).unwrap(),
+                engine.as_ref(),
+            );
+            for hint in [None, Some(data.len())] {
+                for verify in [false, true] {
+                    let out = decode(&raw, location(id, &raw), engine.as_ref(), hint, verify)
+                        .unwrap_or_else(|e| panic!("{codec:?} hint {hint:?}: {e:?}"));
+                    assert_eq!(out, data, "{codec:?} hint {hint:?}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn decode_chunk_decrypt_stage() {
+    let engine = aes_engine();
+    let data = b"decrypt stage";
+    let id = ChunkId::compute(engine.chunk_hasher(), data);
+    let payload = compress::compress(Compression::None, data).unwrap();
+
+    let raw = chunk_blob(&id, &payload, &engine);
+    let other = ChunkId::from_bytes([0x33; 32]);
+    let at = location(other, &raw);
+    let e = decode(&raw, at, &engine, None, false).unwrap_err();
+    assert!(
+        matches!(&e.stage, ChunkDecodeStage::Decrypt(inner) if matches!(**inner, VykarError::DecryptionFailed)),
+        "{e:?}"
+    );
+    assert_eq!(e.at, at);
+
+    let manifest =
+        pack_object_with_context(ObjectType::Manifest, id.as_bytes(), &payload, &engine).unwrap();
+    let e = decode(&manifest, location(id, &manifest), &engine, None, false).unwrap_err();
+    assert!(
+        matches!(&e.stage, ChunkDecodeStage::Decrypt(inner)
+            if matches!(&**inner, VykarError::InvalidFormat(m) if m.starts_with("unexpected object type"))),
+        "{e:?}"
+    );
+
+    let e = decode(&[], location(id, &[]), &engine, None, false).unwrap_err();
+    assert!(
+        matches!(&e.stage, ChunkDecodeStage::Decrypt(inner)
+            if matches!(&**inner, VykarError::InvalidFormat(m) if m == "empty object")),
+        "{e:?}"
+    );
+}
+
+#[test]
+fn decode_chunk_decompress_stage() {
+    let engine = plaintext_engine();
+    let id = ChunkId::from_bytes([0x44; 32]);
+
+    let raw = chunk_blob(&id, &[0xFF, 1, 2, 3], &engine);
+    let e = decode(&raw, location(id, &raw), &engine, None, false).unwrap_err();
+    assert!(
+        matches!(&e.stage, ChunkDecodeStage::Decompress(inner)
+            if matches!(**inner, VykarError::UnknownCompressionTag(0xFF))),
+        "{e:?}"
+    );
+
+    let raw = chunk_blob(&id, compress::tests::ZSTD_EMPTY_COMPRESSED_BLOCK, &engine);
+    let e = decode(&raw, location(id, &raw), &engine, None, false).unwrap_err();
+    assert!(
+        matches!(&e.stage, ChunkDecodeStage::Decompress(inner)
+            if matches!(**inner, VykarError::Decompression(_))),
+        "{e:?}"
+    );
+}
+
+#[test]
+fn decode_chunk_size_mismatch_only_with_hint() {
+    let engine = plaintext_engine();
+    let data = b"sized payload";
+    let id = ChunkId::compute(engine.chunk_hasher(), data);
+    let raw = chunk_blob(
+        &id,
+        &compress::compress(Compression::None, data).unwrap(),
+        &engine,
+    );
+    let at = location(id, &raw);
+
+    let e = decode(&raw, at, &engine, Some(data.len() + 1), false).unwrap_err();
+    assert!(
+        matches!(
+            e.stage,
+            ChunkDecodeStage::SizeMismatch { expected, actual }
+                if expected == data.len() + 1 && actual == data.len()
+        ),
+        "{e:?}"
+    );
+    assert_eq!(decode(&raw, at, &engine, None, false).unwrap(), data);
+}
+
+#[test]
+fn decode_chunk_id_check() {
+    let data = b"payload stored under the wrong id";
+    let wrong = ChunkId::from_bytes([0x55; 32]);
+    let payload = compress::compress(Compression::None, data).unwrap();
+
+    let engine = plaintext_engine();
+    let raw = chunk_blob(&wrong, &payload, &engine);
+    let e = decode(&raw, location(wrong, &raw), &engine, None, false).unwrap_err();
+    let actual_id = ChunkId::compute(engine.chunk_hasher(), data);
+    assert!(
+        matches!(e.stage, ChunkDecodeStage::IdMismatch { actual } if actual == actual_id),
+        "{e:?}"
+    );
+
+    let engine = aes_engine();
+    let raw = chunk_blob(&wrong, &payload, &engine);
+    let at = location(wrong, &raw);
+    assert_eq!(decode(&raw, at, &engine, None, false).unwrap(), data);
+    let e = decode(&raw, at, &engine, None, true).unwrap_err();
+    let actual_id = ChunkId::compute(engine.chunk_hasher(), data);
+    assert!(
+        matches!(e.stage, ChunkDecodeStage::IdMismatch { actual } if actual == actual_id),
+        "{e:?}"
+    );
+}
+
+#[test]
+fn chunk_decode_error_conversions() {
+    let id = ChunkId::from_bytes([0x66; 32]);
+    let pack = PackId::from_bytes([0x07; 32]);
+    let at = BlobLocation {
+        chunk_id: id,
+        pack_id: pack,
+        pack_offset: 7,
+        stored_size: 42,
+    };
+    let decrypt = || ChunkDecodeError {
+        stage: ChunkDecodeStage::Decrypt(Box::new(VykarError::DecryptionFailed)),
+        at,
+    };
+
+    assert!(matches!(
+        VykarError::from(decrypt()),
+        VykarError::DecryptionFailed
+    ));
+    match decrypt().into_located() {
+        VykarError::Other(m) => assert_eq!(
+            m,
+            format!(
+                "chunk {id} in pack {pack} (offset 7, size 42): \
+                 decryption failed: wrong passphrase or corrupted data"
+            )
+        ),
+        other => panic!("{other:?}"),
+    }
+
+    let actual = ChunkId::from_bytes([0x77; 32]);
+    let id_mismatch = ChunkDecodeError {
+        stage: ChunkDecodeStage::IdMismatch { actual },
+        at,
+    };
+    match VykarError::from(id_mismatch) {
+        VykarError::InvalidFormat(m) => assert_eq!(
+            m,
+            format!(
+                "chunk {id} in pack {pack} (offset 7, size 42) \
+                 hash mismatch after decode: expected {id}, got {actual}"
+            )
+        ),
+        other => panic!("{other:?}"),
+    }
+
+    let size_mismatch = ChunkDecodeError {
+        stage: ChunkDecodeStage::SizeMismatch {
+            expected: 10,
+            actual: 9,
+        },
+        at,
+    };
+    match VykarError::from(size_mismatch) {
+        VykarError::InvalidFormat(m) => {
+            assert!(m.contains("size mismatch after restore decode"), "{m}")
+        }
+        other => panic!("{other:?}"),
+    }
 }

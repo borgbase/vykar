@@ -439,7 +439,6 @@ fn test_verify_pack_full_overflow_offset() {
     let storage =
         LocalBackend::new(&tempfile::tempdir().unwrap().path().to_string_lossy()).unwrap();
     let crypto = vykar_crypto::PlaintextEngine::new(crate::testutil::chunk_hasher_for([0u8; 32]));
-    let chunk_hasher = crate::testutil::chunk_hasher_for([0u8; 32]);
     let pack_id = PackId::from_bytes([0u8; 32]);
 
     // Create a minimal valid pack file so we get past the header check.
@@ -459,7 +458,6 @@ fn test_verify_pack_full_overflow_offset() {
     let count = verify_pack_full(
         &storage,
         &crypto,
-        &chunk_hasher,
         &pack_id,
         &[(chunk_id, entry)],
         &mut issues,
@@ -480,7 +478,6 @@ fn test_verify_pack_full_overflow_add() {
     let storage =
         LocalBackend::new(&tempfile::tempdir().unwrap().path().to_string_lossy()).unwrap();
     let crypto = vykar_crypto::PlaintextEngine::new(crate::testutil::chunk_hasher_for([0u8; 32]));
-    let chunk_hasher = crate::testutil::chunk_hasher_for([0u8; 32]);
     let pack_id = PackId::from_bytes([0u8; 32]);
 
     // Create a minimal valid pack file
@@ -501,7 +498,6 @@ fn test_verify_pack_full_overflow_add() {
     let count = verify_pack_full(
         &storage,
         &crypto,
-        &chunk_hasher,
         &pack_id,
         &[(chunk_id, entry)],
         &mut issues,
@@ -1781,4 +1777,42 @@ fn sorted_dir_listing(dir: &std::path::Path) -> Vec<String> {
         .unwrap_or_default();
     names.sort();
     names
+}
+
+/// Entries that share bytes of one downloaded pack each decode from their own
+/// copy, so an in-place AEAD decrypt of one does not corrupt the next.
+#[test]
+fn verify_pack_full_decodes_a_repeated_entry_under_aead() {
+    init_test_environment();
+    let mut repo = crate::repo::Repository::init(
+        Box::new(crate::testutil::MemoryBackend::new()),
+        crate::repo::EncryptionMode::Aes256Gcm,
+        crate::config::ChunkerConfig::default(),
+        Some("test-pass"),
+        None,
+        None,
+    )
+    .unwrap();
+    repo.begin_write_session(&crate::repo::WriteSessionOptions::default())
+        .unwrap();
+    let (id, _, _) = repo
+        .store_chunk(
+            b"repeated entry payload",
+            crate::compress::Compression::Lz4,
+            crate::repo::pack::PackType::Data,
+        )
+        .unwrap();
+    repo.flush_packs().unwrap();
+    let entry = *repo.chunk_index().get(&id).unwrap();
+
+    let mut issues: Vec<IntegrityIssue> = Vec::new();
+    let count = verify_pack_full(
+        repo.storage.as_ref(),
+        repo.crypto.as_ref(),
+        &entry.pack_id,
+        &[(id, entry), (id, entry), (id, entry)],
+        &mut issues,
+    );
+    assert_eq!(count, 3);
+    assert!(issues.is_empty(), "{issues:?}");
 }

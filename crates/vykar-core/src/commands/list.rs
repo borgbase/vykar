@@ -5,11 +5,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use serde::Deserialize;
 use tracing::info;
 
-use crate::compress;
 use crate::config::VykarConfig;
 use crate::index::dedup_cache::MmapRestoreCache;
 use crate::repo::Repository;
-use crate::repo::format::{ObjectType, unpack_object_expect_with_context, verify_chunk_id};
+use crate::repo::format::{
+    BlobLocation, ObjectType, decode_chunk_into, unpack_object_expect_with_context,
+};
 use crate::repo::manifest::SnapshotEntry;
 use crate::snapshot::SnapshotMeta;
 use crate::snapshot::item::Item;
@@ -554,24 +555,23 @@ impl<'a> LazyItemStream<'a> {
                     "blob extends beyond downloaded range in pack {pack_id}"
                 ))
             })?;
-        let compressed = unpack_object_expect_with_context(
-            blob,
-            ObjectType::ChunkData,
-            chunk_id.as_bytes(),
-            self.crypto.as_ref(),
-        )?;
-        let plaintext = compress::decompress(&compressed)?;
-        // Without AEAD, the chunk ID is the only checksum on chunk data.
-        if !self.crypto.is_encrypting() {
-            verify_chunk_id(
-                self.crypto.chunk_hasher(),
-                &chunk_id,
-                &plaintext,
-                &pack_id,
-                offset,
+        // Decode a copy: after a failed decode the window is kept and the
+        // same bytes are decoded again on retry.
+        let mut raw = blob.to_vec();
+        let mut plaintext = Vec::new();
+        decode_chunk_into(
+            &mut raw,
+            BlobLocation {
+                chunk_id,
+                pack_id,
+                pack_offset: offset,
                 stored_size,
-            )?;
-        }
+            },
+            self.crypto.as_ref(),
+            None,
+            false,
+            &mut plaintext,
+        )?;
         self.cur = plaintext;
         self.pos = 0;
         self.next += 1;

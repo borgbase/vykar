@@ -6,9 +6,7 @@ use std::path::{Path, PathBuf};
 
 use tempfile::TempPath;
 use vykar_crypto::CryptoEngine;
-use vykar_types::chunk_id::{ChunkHasher, ChunkId};
 use vykar_types::error::{Result, VykarError};
-use vykar_types::pack_id::PackId;
 
 use crate::config::ChunkerConfig;
 use crate::index::dedup_cache::MmapFullIndexCache;
@@ -112,16 +110,4 @@ pub fn symlink_target(item: &Item) -> (PathBuf, bool) {
     let target = crate::commands::restore::symlink_target_path(item);
     let flagged = classify_symlink_target_path(&target) != SymlinkSafety::Safe;
     (target, flagged)
-}
-
-/// `repo::format::verify_chunk_id`.
-pub fn verify_chunk_id(hasher: &ChunkHasher, expected: &ChunkId, plaintext: &[u8]) -> Result<()> {
-    crate::repo::format::verify_chunk_id(
-        hasher,
-        expected,
-        plaintext,
-        &PackId::from_bytes([0; 32]),
-        0,
-        0,
-    )
 }

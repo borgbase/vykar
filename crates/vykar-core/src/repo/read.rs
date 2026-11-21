@@ -1,11 +1,10 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use super::format::{ObjectType, unpack_object_expect_with_context, verify_chunk_id};
+use super::format::{BlobLocation, decode_chunk_into};
 use super::pack::read_blob_from_pack;
 use super::{BlobCache, Repository};
 use crate::commands::util::check_interrupted;
-use crate::compress;
 use crate::index::dedup_cache;
 use vykar_crypto::CryptoEngine;
 use vykar_storage::StorageBackend;
@@ -39,14 +38,13 @@ struct DecodedBlob {
 }
 
 /// Fetch `group` with one range read and decode its blobs in `group.blobs`
-/// order. Without AEAD the chunk ID is the only checksum on chunk data, so it
-/// is verified here.
+/// order through `decode_chunk_into`, which also verifies the chunk ID when
+/// the engine does not encrypt.
 fn fetch_group(
     storage: &dyn StorageBackend,
     crypto: &dyn CryptoEngine,
     group: &CoalescedGroup,
 ) -> Result<Vec<DecodedBlob>> {
-    let verify = !crypto.is_encrypting();
     let pack_key = group.pack_id.storage_key();
     let read_len = group.read_end - group.read_start;
 
@@ -55,6 +53,7 @@ fn fetch_group(
         .ok_or_else(|| VykarError::Other(format!("pack not found: {}", group.pack_id)))?;
 
     let mut decoded = Vec::with_capacity(group.blobs.len());
+    let mut raw = Vec::new();
     for blob in &group.blobs {
         let local_offset = (blob.pack_offset - group.read_start) as usize;
         let local_end = local_offset + blob.stored_size as usize;
@@ -68,23 +67,24 @@ fn fetch_group(
         let blob_data = raw_data
             .get(local_offset..local_end)
             .expect("local_end <= raw_data.len() (checked above)");
-        let compressed = unpack_object_expect_with_context(
-            blob_data,
-            ObjectType::ChunkData,
-            blob.chunk_id.as_bytes(),
+        // The in-place decode destroys its input, and blobs of a group can
+        // share bytes (duplicate offsets), so decode a copy.
+        raw.clear();
+        raw.extend_from_slice(blob_data);
+        let mut plaintext = Vec::new();
+        decode_chunk_into(
+            &mut raw,
+            BlobLocation {
+                chunk_id: blob.chunk_id,
+                pack_id: group.pack_id,
+                pack_offset: blob.pack_offset,
+                stored_size: blob.stored_size,
+            },
             crypto,
+            None,
+            false,
+            &mut plaintext,
         )?;
-        let plaintext = compress::decompress(&compressed)?;
-        if verify {
-            verify_chunk_id(
-                crypto.chunk_hasher(),
-                &blob.chunk_id,
-                &plaintext,
-                &group.pack_id,
-                blob.pack_offset,
-                blob.stored_size,
-            )?;
-        }
         decoded.push(DecodedBlob {
             result_idx: blob.result_idx,
             chunk_id: blob.chunk_id,
@@ -236,25 +236,22 @@ impl Repository {
             return Ok(cached.to_vec());
         }
 
-        let blob_data =
+        let mut blob_data =
             read_blob_from_pack(self.storage.as_ref(), pack_id, pack_offset, stored_size)?;
-        let compressed = unpack_object_expect_with_context(
-            &blob_data,
-            ObjectType::ChunkData,
-            chunk_id.as_bytes(),
-            self.crypto.as_ref(),
-        )?;
-        let plaintext = compress::decompress(&compressed)?;
-        if !self.crypto.is_encrypting() {
-            verify_chunk_id(
-                self.crypto.chunk_hasher(),
-                chunk_id,
-                &plaintext,
-                pack_id,
+        let mut plaintext = Vec::new();
+        decode_chunk_into(
+            &mut blob_data,
+            BlobLocation {
+                chunk_id: *chunk_id,
+                pack_id: *pack_id,
                 pack_offset,
                 stored_size,
-            )?;
-        }
+            },
+            self.crypto.as_ref(),
+            None,
+            false,
+            &mut plaintext,
+        )?;
 
         self.blob_cache.insert(*chunk_id, plaintext.clone());
         Ok(plaintext)

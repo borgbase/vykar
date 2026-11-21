@@ -76,7 +76,11 @@ pub fn run(
         threshold
     };
 
-    let mut repo = open_repo(config, passphrase, OpenOptions::new())?;
+    // The backend observes `shutdown` in its retry waits. `persist_and_delete`
+    // does not poll it, so after a cancel its requests get one attempt each
+    // and no retries, and on SFTP a read in flight is abandoned; it is
+    // crash-safe by design.
+    let mut repo = open_repo(config, passphrase, OpenOptions::new(), shutdown)?;
     run_on_repo(&mut repo, threshold, max_repack_size, dry_run, shutdown)
 }
 
@@ -505,6 +509,8 @@ fn list_packs(storage: &dyn StorageBackend, concurrency: usize) -> Result<Vec<Li
             Ok(packs)
         }
         Err(VykarError::UnsupportedBackend(_)) => parallel_list_packs(storage, concurrency),
+        // A cancelled listing is not a reason to list every shard instead.
+        Err(e @ VykarError::Interrupted) => Err(e),
         Err(e) => {
             warn!("compact: one-request pack listing failed ({e}); listing per shard");
             parallel_list_packs(storage, concurrency)

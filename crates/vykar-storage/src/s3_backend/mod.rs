@@ -16,6 +16,7 @@ use rusty_s3::{Bucket, Credentials, UrlStyle};
 
 use crate::RetryConfig;
 use crate::retry::HttpRetryError;
+use vykar_types::cancel::CancelToken;
 use vykar_types::error::{Result, VykarError};
 
 use crate::{ListedObject, StorageBackend};
@@ -32,6 +33,8 @@ pub struct S3Backend {
     credentials: Credentials,
     agent: ureq::Agent,
     retry: RetryConfig,
+    /// See [`crate::StorageConfig::cancel`].
+    cancel: CancelToken,
     /// Prefix (root path) prepended to all keys.
     root: String,
     /// When true, `delete()` overwrites with a zero-byte tombstone instead of
@@ -97,6 +100,7 @@ impl S3Backend {
             credentials,
             agent,
             retry,
+            cancel: CancelToken::new(),
             root,
             soft_delete,
             part_slots: multipart::PartSlots::new(part_concurrency),
@@ -105,6 +109,13 @@ impl S3Backend {
             request_width: crate::remote_request_width(max_connections),
             transfer_width: crate::transfer_width(max_connections),
         })
+    }
+
+    /// Observe `cancel` in retry waits; see [`crate::StorageConfig::cancel`].
+    #[must_use]
+    pub fn with_cancel(mut self, cancel: CancelToken) -> Self {
+        self.cancel = cancel;
+        self
     }
 
     /// Prepend the root prefix to a key.
@@ -123,7 +134,7 @@ impl S3Backend {
         f: impl Fn() -> std::result::Result<http::Response<ureq::Body>, ureq::Error>,
         handle_response: impl Fn(http::Response<ureq::Body>) -> std::result::Result<T, HttpRetryError>,
     ) -> std::result::Result<T, HttpRetryError> {
-        crate::retry::retry_http(&self.retry, op_name, "S3", f, handle_response)
+        crate::retry::retry_http(&self.retry, &self.cancel, op_name, "S3", f, handle_response)
     }
 }
 
@@ -166,6 +177,9 @@ fn s3_check_status(
 /// assert that credentials or quota are fine — successful reads do not rule out
 /// a write-scoped permission or quota cause.
 fn s3_error(op: &str, key: &str, err: HttpRetryError) -> VykarError {
+    if matches!(err, HttpRetryError::Interrupted) {
+        return VykarError::Interrupted;
+    }
     let mut msg = format!("S3 {op} {key}: {err}");
     if op == "PUT"
         && matches!(
@@ -1663,5 +1677,46 @@ mod tests {
             !msg.contains("connection was closed"),
             "non-PUT op should not get hint, got: {msg}"
         );
+    }
+
+    #[test]
+    fn s3_error_keeps_interrupted_typed() {
+        assert!(matches!(
+            s3_error("GET", "k", HttpRetryError::Interrupted),
+            VykarError::Interrupted
+        ));
+    }
+
+    #[test]
+    fn s3_cancel_during_retry_wait_returns_interrupted() {
+        let (port, handle) =
+            mock_server("HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n");
+        let token = CancelToken::new();
+        let backend = s3_backend(
+            port,
+            RetryConfig {
+                max_retries: 5,
+                retry_delay_ms: 60_000,
+                retry_max_delay_ms: 60_000,
+            },
+            false,
+        )
+        .with_cancel(token.clone());
+        let bound = Duration::from_secs(5);
+        std::thread::scope(|s| {
+            let get = s.spawn(|| backend.get("config"));
+            let deadline = std::time::Instant::now() + bound;
+            while !handle.is_finished() {
+                assert!(std::time::Instant::now() < deadline, "request not answered");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let cancelled_at = std::time::Instant::now();
+            token.cancel();
+            let err = get.join().unwrap().unwrap_err();
+            let latency = cancelled_at.elapsed();
+            assert!(matches!(err, VykarError::Interrupted), "{err}");
+            assert!(latency < bound, "{latency:?}");
+        });
+        handle.join().unwrap();
     }
 }

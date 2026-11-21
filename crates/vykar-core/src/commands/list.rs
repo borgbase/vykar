@@ -29,7 +29,7 @@ pub fn list_snapshots(
     config: &VykarConfig,
     passphrase: Option<&str>,
 ) -> Result<Vec<SnapshotEntry>> {
-    let repo = open_repo(config, passphrase, OpenOptions::new())?;
+    let repo = open_repo(config, passphrase, OpenOptions::new(), &CancelToken::new())?;
     Ok(repo.manifest().snapshots.clone())
 }
 
@@ -59,8 +59,12 @@ fn list_snapshot_items_inner(
     passphrase: Option<&str>,
     snapshot_name: &str,
 ) -> Result<(Vec<Item>, Vec<String>)> {
-    let (mut repo, _session_guard) =
-        super::util::open_repo_with_read_session(config, passphrase, OpenOptions::new())?;
+    let (mut repo, _session_guard) = super::util::open_repo_with_read_session(
+        config,
+        passphrase,
+        OpenOptions::new(),
+        &CancelToken::new(),
+    )?;
 
     let resolved_name = repo
         .manifest()
@@ -92,7 +96,7 @@ pub fn list_snapshots_with_stats(
     config: &VykarConfig,
     passphrase: Option<&str>,
 ) -> Result<SnapshotListing> {
-    let repo = open_repo(config, passphrase, OpenOptions::new())?;
+    let repo = open_repo(config, passphrase, OpenOptions::new(), &CancelToken::new())?;
     let entries = repo.manifest().snapshots.clone();
     let mut snapshots = Vec::with_capacity(entries.len());
     for entry in entries {
@@ -113,7 +117,7 @@ pub fn get_snapshot_meta(
     passphrase: Option<&str>,
     snapshot_name: &str,
 ) -> Result<SnapshotMeta> {
-    let repo = open_repo(config, passphrase, OpenOptions::new())?;
+    let repo = open_repo(config, passphrase, OpenOptions::new(), &CancelToken::new())?;
     let resolved_name = repo
         .manifest()
         .resolve_snapshot(snapshot_name)?

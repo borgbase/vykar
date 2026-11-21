@@ -148,8 +148,12 @@ pub fn run_with_progress(
     }
 
     // Open repo (needed for fingerprint check and actual scan).
-    let (mut repo, _session_guard) =
-        crate::commands::util::open_repo_with_read_session(config, passphrase, OpenOptions::new())?;
+    let (mut repo, _session_guard) = crate::commands::util::open_repo_with_read_session(
+        config,
+        passphrase,
+        OpenOptions::new(),
+        shutdown,
+    )?;
 
     run_on_repo(
         &mut repo,
@@ -417,10 +421,14 @@ pub fn run_with_repair(
     let opts = repair_open_options(mode);
     if mode == RepairMode::PlanOnly {
         let (mut repo, _session_guard) =
-            crate::commands::util::open_repo_with_read_session(config, passphrase, opts)?;
+            crate::commands::util::open_repo_with_read_session(config, passphrase, opts, shutdown)?;
         run_with_repair_on_repo(&mut repo, config, verify_data, mode, progress, shutdown)
     } else {
-        let mut repo = crate::commands::util::open_repo(config, passphrase, opts)?;
+        // A token nothing cancels: past its mutation boundary a repair must
+        // not be cut short, and the read path beneath `execute_repair` does
+        // not poll `shutdown` either. The scan stays cancellable by polling.
+        let mut repo =
+            crate::commands::util::open_repo(config, passphrase, opts, &CancelToken::new())?;
         run_with_repair_on_repo(&mut repo, config, verify_data, mode, progress, shutdown)
     }
 }

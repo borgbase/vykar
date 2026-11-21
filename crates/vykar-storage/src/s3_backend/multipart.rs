@@ -64,6 +64,13 @@ impl S3Backend {
         let parts = Parts::new(data, part_size);
         let mut last_err: Option<VykarError> = None;
         for _attempt in 0..MULTIPART_MAX_ATTEMPTS {
+            // A fresh upload after a cancel would be a new attempt.
+            if let Some(e) = &last_err
+                && self.cancel.is_cancelled()
+            {
+                tracing::warn!("S3 multipart {key}: cancelled, not restarting after: {e}");
+                return Err(VykarError::Interrupted);
+            }
             match self.try_one_multipart(full_key, key, &parts) {
                 Ok(()) => return Ok(()),
                 Err(MultipartFailure {
@@ -167,6 +174,13 @@ impl S3Backend {
                         {
                             return Err(err);
                         }
+                        // A fresh upload after a cancel would be a new attempt.
+                        if self.cancel.is_cancelled() {
+                            tracing::warn!(
+                                "S3 multipart {key}: cancelled, not restarting after: {err}"
+                            );
+                            return Err(VykarError::Interrupted);
+                        }
                     }
                 }
             }
@@ -186,6 +200,9 @@ impl S3Backend {
                     "S3 multipart {key}: reconcile inconclusive after ambiguous completion: {e}"
                 ),
             }
+        }
+        if matches!(err, VykarError::Interrupted) {
+            return Err(err);
         }
         Err(VykarError::Other(format!(
             "{err} (the pack buffer was already released, so the upload cannot be restarted)"
@@ -690,9 +707,13 @@ struct CompleteResultDoc {
 }
 
 /// Map an exhausted [`HttpRetryError`] to a restart disposition: a clean
-/// `Permanent` cannot be helped by a fresh upload; everything else can.
+/// `Permanent` cannot be helped by a fresh upload, and an `Interrupted` one
+/// must not start another; everything else can.
 fn failure_kind(err: &HttpRetryError) -> MultipartFailureKind {
-    if matches!(err, HttpRetryError::Permanent(_)) {
+    if matches!(
+        err,
+        HttpRetryError::Permanent(_) | HttpRetryError::Interrupted
+    ) {
         MultipartFailureKind::Permanent
     } else {
         MultipartFailureKind::Retryable
@@ -1999,5 +2020,53 @@ mod tests {
         seen.iter()
             .filter(|r| r.line.starts_with("POST ") && r.line.contains("uploads=1"))
             .count()
+    }
+
+    #[test]
+    fn interrupted_multipart_failure_is_not_restarted() {
+        assert_eq!(
+            failure_kind(&HttpRetryError::Interrupted),
+            MultipartFailureKind::Permanent
+        );
+
+        // A part answering 503 waits 60 s to retry; the cancel ends the
+        // wait, the upload is aborted and no fresh one is created.
+        let (port, captured, handle) = mock_server_script(vec![
+            mp_create_ok("u1"),
+            mp_status("503 Service Unavailable"),
+            mp_status("204 No Content"),
+        ]);
+        let token = vykar_types::cancel::CancelToken::new();
+        let backend = s3_backend(
+            port,
+            crate::RetryConfig {
+                max_retries: 5,
+                retry_delay_ms: 60_000,
+                retry_max_delay_ms: 60_000,
+            },
+            false,
+        )
+        .with_cancel(token.clone());
+        let data = vec![0u8; MULTIPART_DATA_LEN];
+        std::thread::scope(|s| {
+            let put = s.spawn(|| backend.put("packs/ab/obj", &data));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while captured.lock().unwrap().len() < 2 {
+                assert!(std::time::Instant::now() < deadline, "part not sent");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            token.cancel();
+            let err = put.join().unwrap().unwrap_err();
+            assert!(matches!(err, VykarError::Interrupted), "{err}");
+        });
+        handle.join().unwrap();
+        let cap = captured.lock().unwrap();
+        assert_eq!(mp_creates(&cap), 1, "no restart after a cancel");
+        assert_eq!(cap.len(), 3, "create + part + abort");
+        assert!(
+            req_line(&cap, 2).starts_with("DELETE "),
+            "{}",
+            req_line(&cap, 2)
+        );
     }
 }

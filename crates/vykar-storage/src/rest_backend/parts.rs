@@ -50,6 +50,8 @@ fn new_token() -> String {
 /// lost the capability); transient failures leave the path enabled.
 pub(super) struct PartsFailure {
     pub permanent: bool,
+    /// The upload was cancelled during a retry wait; it must not fall back.
+    pub interrupted: bool,
     pub message: String,
 }
 
@@ -57,6 +59,7 @@ impl PartsFailure {
     fn from_http(what: &str, err: &HttpRetryError) -> Self {
         Self {
             permanent: matches!(err, HttpRetryError::Permanent(_)),
+            interrupted: matches!(err, HttpRetryError::Interrupted),
             message: format!("{what}: {err}"),
         }
     }

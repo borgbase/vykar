@@ -132,8 +132,12 @@ pub fn run(
     scope: &FindScope,
     filter: &FindFilter,
 ) -> Result<Vec<PathTimeline>> {
-    let (mut repo, _session_guard) =
-        super::util::open_repo_with_read_session(config, passphrase, OpenOptions::new())?;
+    let (mut repo, _session_guard) = super::util::open_repo_with_read_session(
+        config,
+        passphrase,
+        OpenOptions::new(),
+        &CancelToken::new(),
+    )?;
 
     // Select and sort snapshots chronologically
     let mut entries: Vec<_> = repo.manifest().snapshots.clone();

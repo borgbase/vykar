@@ -112,6 +112,7 @@ fn storage_config(url: String) -> StorageConfig {
         allow_insecure_http: false,
         retry: RetryConfig::default(),
         s3_soft_delete: false,
+        cancel: vykar_types::cancel::CancelToken::new(),
     }
 }
 

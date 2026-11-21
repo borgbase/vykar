@@ -423,6 +423,8 @@ pub(super) fn integrity_scan(
                 });
                 continue;
             }
+            // A cancelled storage read is not corruption (see below).
+            Err(e @ VykarError::Interrupted) => return Err(e),
             Err(e) => {
                 if is_transient_io(&e) {
                     issues.push(IntegrityIssue::SnapshotReadFailed {
@@ -1022,6 +1024,8 @@ fn verify_pack_individual(
         let mut raw =
             match read_blob_from_pack(storage, pack_id, entry.pack_offset, entry.stored_size) {
                 Ok(data) => data,
+                // A cancelled read is not damage; the caller's guard raises it.
+                Err(VykarError::Interrupted) => break,
                 Err(e) => {
                     issues.push(IntegrityIssue::CorruptChunk {
                         chunk_id: *chunk_id,

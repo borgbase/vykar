@@ -93,6 +93,7 @@ fn main() -> Result<(), Error> {
         &config,
         passphrase.as_deref(),
         OpenOptions::new().with_index().skip_key_backfill(),
+        &vykar_core::repo::control::CancelToken::new(),
     )?;
     eprintln!(
         "opened in {} ms; {} index entries, {} snapshots",

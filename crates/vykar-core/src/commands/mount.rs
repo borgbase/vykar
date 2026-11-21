@@ -822,10 +822,12 @@ pub fn run_with_progress(
     mut progress: Option<&mut dyn FnMut(MountProgressEvent)>,
     shutdown: Option<Arc<tokio::sync::Notify>>,
 ) -> Result<()> {
+    // Mount cancels through `shutdown` (a Notify), not a token.
     let mut repo = open_repo(
         config,
         passphrase,
         crate::repo::OpenOptions::new().with_index(),
+        &CancelToken::new(),
     )?;
 
     // Build the VFS tree from snapshot items

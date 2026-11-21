@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use crate::config::{EncryptionModeConfig, VykarConfig};
 use crate::limits;
+use crate::repo::control::CancelToken;
 use crate::repo::lock;
 use crate::repo::lock::SessionEntry;
 use crate::repo::{OpenOptions, OpenRequest, Repository, identity};
@@ -89,13 +90,20 @@ pub(crate) fn with_identity_context(opts: OpenOptions, req: &OpenRequest) -> Ope
 }
 
 /// Open a repository from config using the standard backend resolver.
+///
+/// The backend observes `cancel` in its retry waits.
 pub fn open_repo(
     config: &VykarConfig,
     passphrase: Option<&str>,
     opts: OpenOptions,
+    cancel: &CancelToken,
 ) -> Result<Repository> {
-    let backend =
-        storage::backend_from_config(&config.repository.storage_config(config.limits.connections))?;
+    let backend = storage::backend_from_config(
+        &config
+            .repository
+            .storage_config(config.limits.connections)
+            .with_cancel(cancel.clone()),
+    )?;
     let backend = limits::wrap_storage_backend(backend, &config.limits);
     open_repo_on(backend, &open_request(config), passphrase, opts)
 }
@@ -118,13 +126,20 @@ pub(crate) fn open_repo_on(
 /// Open a repo for a read-only operation, registering a session marker
 /// BEFORE opening so that concurrent maintenance sees us.
 /// Returns (repo, session_guard). The guard deregisters on drop.
+///
+/// The backend observes `cancel` in its retry waits.
 pub fn open_repo_with_read_session(
     config: &VykarConfig,
     passphrase: Option<&str>,
     opts: OpenOptions,
+    cancel: &CancelToken,
 ) -> Result<(Repository, lock::SessionGuard)> {
-    let backend =
-        storage::backend_from_config(&config.repository.storage_config(config.limits.connections))?;
+    let backend = storage::backend_from_config(
+        &config
+            .repository
+            .storage_config(config.limits.connections)
+            .with_cancel(cancel.clone()),
+    )?;
     let backend: Arc<dyn StorageBackend> =
         Arc::from(limits::wrap_storage_backend(backend, &config.limits));
     open_repo_with_read_session_on(backend, &open_request(config), passphrase, opts)
@@ -257,7 +272,8 @@ pub fn with_open_repo_maintenance_lock<T>(
     opts: OpenOptions,
     action: impl FnOnce(&mut Repository) -> Result<T>,
 ) -> Result<T> {
-    let mut repo = open_repo(config, passphrase, opts)?;
+    // Upgrade, the only caller, has no token.
+    let mut repo = open_repo(config, passphrase, opts, &CancelToken::new())?;
     with_maintenance_lock(&mut repo, action)
 }
 

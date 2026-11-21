@@ -23,7 +23,17 @@ use crate::{
     BatchDeleteScope, ListedObject, RepackPlanRequest, RepackResultResponse, ServerCapabilities,
     StorageBackend, VerifyPacksPlanRequest, VerifyPacksResponse,
 };
+use vykar_types::cancel::CancelToken;
 use vykar_types::hash::{HashAlgorithm, Hasher256};
+
+/// VykarError for a failed REST call: Interrupted stays typed; everything else
+/// becomes Other("REST <context>: <err>") as before.
+fn rest_error(context: impl std::fmt::Display, err: HttpRetryError) -> VykarError {
+    match err {
+        HttpRetryError::Interrupted => VykarError::Interrupted,
+        err => VykarError::Other(format!("REST {context}: {err}")),
+    }
+}
 
 /// Read a short prefix of a response body for use in an error message.
 ///
@@ -62,6 +72,8 @@ pub struct RestBackend {
     /// does not allocate a header string per request.
     bearer: Option<String>,
     retry: RetryConfig,
+    /// See [`crate::StorageConfig::cancel`].
+    cancel: CancelToken,
     timeouts: HttpTimeouts,
     /// The repository's content-digest algorithm, bound once by
     /// `Repository::init`/`open` after the format is resolved.
@@ -157,6 +169,7 @@ impl RestBackend {
             agent,
             bearer: token.map(|t| format!("Bearer {t}")),
             retry,
+            cancel: CancelToken::new(),
             timeouts,
             content_hash: OnceLock::new(),
             sizes_unsupported: AtomicBool::new(false),
@@ -168,6 +181,13 @@ impl RestBackend {
             request_width: crate::remote_request_width(max_connections),
             transfer_width: crate::transfer_width(max_connections),
         })
+    }
+
+    /// Observe `cancel` in retry waits; see [`crate::StorageConfig::cancel`].
+    #[must_use]
+    pub fn with_cancel(mut self, cancel: CancelToken) -> Self {
+        self.cancel = cancel;
+        self
     }
 
     fn url(&self, key: &str) -> String {
@@ -209,7 +229,7 @@ impl RestBackend {
         f: impl Fn() -> std::result::Result<http::Response<ureq::Body>, ureq::Error>,
         handle_response: impl Fn(http::Response<ureq::Body>) -> std::result::Result<T, HttpRetryError>,
     ) -> std::result::Result<T, HttpRetryError> {
-        crate::retry::retry_http(retry, op_name, "REST", f, handle_response)
+        crate::retry::retry_http(retry, &self.cancel, op_name, "REST", f, handle_response)
     }
 
     /// POST `payload` as JSON and deserialize the JSON response body.
@@ -252,7 +272,7 @@ impl RestBackend {
                     Ok(buf)
                 },
             )
-            .map_err(|e| VykarError::Other(format!("REST {op_name}: {e}")))?;
+            .map_err(|e| rest_error(format_args!("{op_name}"), e))?;
         serde_json::from_slice(&body)
             .map_err(|e| VykarError::Other(format!("REST {op_name} parse: {e}")))
     }
@@ -276,7 +296,7 @@ impl RestBackend {
                 Ok(buf)
             },
         )
-        .map_err(|e| VykarError::Other(format!("REST health: {e}")))
+        .map_err(|e| rest_error(format_args!("health"), e))
         .and_then(|body| {
             serde_json::from_slice(&body)
                 .map_err(|e| VykarError::Other(format!("REST health parse: {e}")))
@@ -305,7 +325,7 @@ impl RestBackend {
                 )
             },
         )
-        .map_err(|e| VykarError::Other(format!("REST {op_name}: {e}")))
+        .map_err(|e| rest_error(format_args!("{op_name}"), e))
     }
 
     /// Batch delete multiple keys in a single request.
@@ -359,7 +379,7 @@ impl RestBackend {
                     Ok(Some(buf))
                 },
             )
-            .map_err(|e| VykarError::Other(format!("REST {op_name}: {e}")))?;
+            .map_err(|e| rest_error(format_args!("{op_name}"), e))?;
         let Some(body) = body else {
             return Ok(None);
         };
@@ -511,6 +531,23 @@ impl RestBackend {
         len > self.part_size && self.pack_parts_enabled()
     }
 
+    /// Whether a failed part upload must end as `Interrupted` instead of
+    /// falling back to a whole PUT: the whole PUT would be a new attempt of
+    /// an operation that was cancelled. `parts_disabled` is left untouched.
+    fn parts_interrupted(&self, key: &str, failure: &parts::PartsFailure) -> bool {
+        if failure.interrupted {
+            return true;
+        }
+        if self.cancel.is_cancelled() {
+            tracing::warn!(
+                "REST PUT {key}: part upload failed ({}); cancelled, not sending it whole",
+                failure.message
+            );
+            return true;
+        }
+        false
+    }
+
     /// Log a part upload that will be retried as a whole PUT, and turn the
     /// part path off if the failure would recur.
     fn note_parts_failure(&self, key: &str, failure: &parts::PartsFailure) {
@@ -542,6 +579,9 @@ impl RestBackend {
                 if self.pack_parts_for(data.len()) {
                     match self.put_pack_in_parts(key, pack_hex, header, data) {
                         Ok(()) => return Ok(()),
+                        Err(failure) if self.parts_interrupted(key, &failure) => {
+                            return Err(VykarError::Interrupted);
+                        }
                         Err(failure) => self.note_parts_failure(key, &failure),
                     }
                 }
@@ -573,7 +613,7 @@ impl RestBackend {
                 Ok(())
             },
         )
-        .map_err(|e| VykarError::Other(format!("REST PUT {key}: {e}")))?;
+        .map_err(|e| rest_error(format_args!("PUT {key}"), e))?;
         Ok(())
     }
 }
@@ -611,7 +651,7 @@ impl RestBackend {
                 Ok(buf)
             },
         )
-        .map_err(|e| VykarError::Other(format!("REST LIST {prefix}: {e}")))
+        .map_err(|e| rest_error(format_args!("LIST {prefix}"), e))
     }
 
     /// Parse a `?list&sized` body. A server that predates `sized` ignores it
@@ -666,7 +706,7 @@ impl StorageBackend for RestBackend {
                 Ok(Some(buf))
             },
         )
-        .map_err(|e| VykarError::Other(format!("REST GET {key}: {e}")))
+        .map_err(|e| rest_error(format_args!("GET {key}"), e))
     }
 
     fn put(&self, key: &str, data: &[u8]) -> Result<()> {
@@ -698,6 +738,9 @@ impl StorageBackend for RestBackend {
                 drop(data);
                 self.complete_pack_parts(key, pack_hex, header, &token)
                     .map_err(|failure| {
+                        if failure.interrupted {
+                            return VykarError::Interrupted;
+                        }
                         if failure.permanent {
                             self.parts_disabled.store(true, Ordering::Relaxed);
                         }
@@ -708,6 +751,7 @@ impl StorageBackend for RestBackend {
                         ))
                     })
             }
+            Err(failure) if self.parts_interrupted(key, &failure) => Err(VykarError::Interrupted),
             Err(failure) => {
                 self.note_parts_failure(key, &failure);
                 self.put_whole(key, header, pack_hex, data.as_slice())
@@ -734,7 +778,7 @@ impl StorageBackend for RestBackend {
                 Ok(())
             },
         )
-        .map_err(|e| VykarError::Other(format!("REST DELETE {key}: {e}")))
+        .map_err(|e| rest_error(format_args!("DELETE {key}"), e))
     }
 
     fn exists(&self, key: &str) -> Result<bool> {
@@ -756,7 +800,7 @@ impl StorageBackend for RestBackend {
                 Ok(true)
             },
         )
-        .map_err(|e| VykarError::Other(format!("REST HEAD {key}: {e}")))
+        .map_err(|e| rest_error(format_args!("HEAD {key}"), e))
     }
 
     fn size(&self, key: &str) -> Result<Option<u64>> {
@@ -783,7 +827,7 @@ impl StorageBackend for RestBackend {
                 Ok(Some(len))
             },
         )
-        .map_err(|e| VykarError::Other(format!("REST HEAD {key}: {e}")))
+        .map_err(|e| rest_error(format_args!("HEAD {key}"), e))
     }
 
     fn list(&self, prefix: &str) -> Result<Vec<String>> {
@@ -863,7 +907,7 @@ impl StorageBackend for RestBackend {
                     .map(Some)
             },
         )
-        .map_err(|e| VykarError::Other(format!("REST GET_RANGE {key}: {e}")))
+        .map_err(|e| rest_error(format_args!("GET_RANGE {key}"), e))
     }
 
     fn create_dir(&self, key: &str) -> Result<()> {
@@ -883,7 +927,7 @@ impl StorageBackend for RestBackend {
                 Ok(())
             },
         )
-        .map_err(|e| VykarError::Other(format!("REST MKDIR {key}: {e}")))?;
+        .map_err(|e| rest_error(format_args!("MKDIR {key}"), e))?;
         Ok(())
     }
 
@@ -1012,7 +1056,7 @@ impl StorageBackend for RestBackend {
                 Ok(())
             },
         )
-        .map_err(|e| VykarError::Other(format!("REST INIT: {e}")))?;
+        .map_err(|e| rest_error(format_args!("INIT"), e))?;
         Ok(())
     }
 }
@@ -2300,5 +2344,71 @@ mod tests {
             "expected permanent error, got: {err}"
         );
         handle.join().unwrap();
+    }
+
+    const LONG_RETRY: RetryConfig = RetryConfig {
+        max_retries: 5,
+        retry_delay_ms: 60_000,
+        retry_max_delay_ms: 60_000,
+    };
+
+    /// Far below the 60 s retry wait, loose enough for a loaded CI host.
+    const CANCEL_BOUND: Duration = Duration::from_secs(5);
+
+    fn wait_for(cond: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + CANCEL_BOUND;
+        while !cond() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "condition not reached"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn cancel_during_retry_wait_returns_interrupted() {
+        let (url, seen) = routing_server(|_| empty("503 Service Unavailable"));
+        let token = CancelToken::new();
+        let backend = RestBackend::new(&url, None, LONG_RETRY, None)
+            .unwrap()
+            .with_cancel(token.clone());
+        std::thread::scope(|s| {
+            let get = s.spawn(|| backend.get("config"));
+            wait_for(|| seen.lock().unwrap().len() == 1);
+            let cancelled_at = std::time::Instant::now();
+            token.cancel();
+            let err = get.join().unwrap().unwrap_err();
+            let latency = cancelled_at.elapsed();
+            assert!(matches!(err, VykarError::Interrupted), "{err}");
+            assert!(latency < CANCEL_BOUND, "{latency:?}");
+        });
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn interrupted_part_upload_is_not_resent_whole() {
+        let (url, seen) = routing_server(pack_routes(
+            HEALTH_PARTS,
+            "503 Service Unavailable",
+            "201 Created",
+            "201 Created",
+        ));
+        let token = CancelToken::new();
+        let backend = parts_backend(&url, LONG_RETRY).with_cancel(token.clone());
+        let (key, data) = test_pack(3000);
+        std::thread::scope(|s| {
+            let put = s.spawn(|| backend.put(&key, &data));
+            wait_for(|| count(&seen.lock().unwrap(), is_part) >= 1);
+            let cancelled_at = std::time::Instant::now();
+            token.cancel();
+            let err = put.join().unwrap().unwrap_err();
+            let latency = cancelled_at.elapsed();
+            assert!(matches!(err, VykarError::Interrupted), "{err}");
+            assert!(latency < CANCEL_BOUND, "{latency:?}");
+        });
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(count(&seen, is_whole), 0, "{seen:#?}");
+        assert!(!backend.parts_disabled.load(Ordering::Relaxed));
     }
 }

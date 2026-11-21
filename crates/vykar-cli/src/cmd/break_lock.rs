@@ -12,7 +12,10 @@ pub(crate) fn run_break_lock(
     sessions: bool,
 ) -> CliResult<()> {
     let storage = vykar_core::storage::backend_from_config(
-        &config.repository.storage_config(config.limits.connections),
+        &config
+            .repository
+            .storage_config(config.limits.connections)
+            .with_cancel(crate::signal::shutdown_token().clone()),
     )?;
 
     let removed = lock::break_lock(storage.as_ref())?;

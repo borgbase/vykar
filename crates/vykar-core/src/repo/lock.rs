@@ -81,9 +81,21 @@ pub fn acquire_lock(storage: &dyn StorageBackend) -> Result<LockGuard> {
     let data = serde_json::to_vec(&entry)
         .map_err(|e| vykar_types::error::VykarError::Other(format!("lock serialize: {e}")))?;
 
-    storage.put(&key, &data)?;
+    if let Err(e) = storage.put(&key, &data) {
+        // A PUT can fail after it committed (a lost reply, or a retry wait
+        // cut by a cancel). The key is ours alone: never leave it behind.
+        let _ = storage.delete(&key);
+        return Err(e);
+    }
 
-    let mut keys = list_lock_keys(storage)?;
+    let mut keys = match list_lock_keys(storage) {
+        Ok(keys) => keys,
+        Err(e) => {
+            // Our key may be the only one: never leave it behind.
+            let _ = storage.delete(&key);
+            return Err(e);
+        }
+    };
     keys.sort();
     if !keys.contains(&key) {
         // PUT succeeded but LIST doesn't include our key — storage-layer bug
@@ -440,7 +452,12 @@ pub(crate) fn register_session_inner(
     };
     let data = serde_json::to_vec(&entry)
         .map_err(|e| VykarError::Other(format!("session serialize: {e}")))?;
-    storage.put(&key, &data)?;
+    if let Err(e) = storage.put(&key, &data) {
+        // The PUT may have committed although it failed (a lost reply, or a
+        // retry wait cut by a cancel): do not leave the marker behind.
+        let _ = storage.delete(&key);
+        return Err(e);
+    }
 
     match retry_while_locked(max_attempts, base_delay_ms, || probe_unlocked(storage)) {
         Ok(()) => {

@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use futures_util::StreamExt;
@@ -46,6 +46,10 @@ pub(super) struct Faults {
     pub hide_hardlink: AtomicBool,
     /// `hardlink@openssh.com` requests received.
     pub hardlinks: AtomicUsize,
+    /// Delay every STAT/LSTAT reply by this many ms; 0 = off.
+    pub stat_delay_ms: AtomicU64,
+    /// STAT/LSTAT requests received, counted before the delay.
+    pub stats: AtomicUsize,
 }
 
 pub(super) struct FaultServer {
@@ -197,6 +201,28 @@ impl FaultServer {
         key: Option<&Path>,
         agent: Option<&Path>,
     ) -> super::SftpBackend {
+        self.build_backend(
+            key,
+            agent,
+            crate::RetryConfig {
+                max_retries,
+                retry_delay_ms: 1,
+                retry_max_delay_ms: 1,
+            },
+        )
+    }
+
+    /// A backend using the client key and the given retry config.
+    pub fn backend_with_retry(&self, retry: crate::RetryConfig) -> super::SftpBackend {
+        self.build_backend(Some(&self.client_key), None, retry)
+    }
+
+    fn build_backend(
+        &self,
+        key: Option<&Path>,
+        agent: Option<&Path>,
+        retry: crate::RetryConfig,
+    ) -> super::SftpBackend {
         super::SftpBackend::new(
             "127.0.0.1",
             Some("vykar"),
@@ -207,11 +233,7 @@ impl FaultServer {
             Some(self.known_hosts.to_str().unwrap()),
             Some(1),
             Some(5),
-            crate::RetryConfig {
-                max_retries,
-                retry_delay_ms: 1,
-                retry_max_delay_ms: 1,
-            },
+            retry,
         )
         .unwrap()
     }
@@ -462,6 +484,11 @@ impl russh_sftp::server::Handler for SftpHandler {
     }
 
     async fn stat(&mut self, id: u32, path: String) -> Result<Attrs, Self::Error> {
+        self.faults.stats.fetch_add(1, Ordering::SeqCst);
+        let delay = self.faults.stat_delay_ms.load(Ordering::SeqCst);
+        if delay > 0 {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
         Ok(Attrs {
             id,
             attrs: attrs_of(&self.local(&path), &self.faults)?,

@@ -49,7 +49,11 @@ pub fn run(
     source_filter: &[String],
     shutdown: &CancelToken,
 ) -> Result<(PruneStats, Vec<PruneListEntry>)> {
-    let mut repo = open_repo(config, passphrase, OpenOptions::new())?;
+    // The backend observes `shutdown` in its retry waits. The phases past
+    // the commit point do not poll it, so after a cancel their requests get
+    // one attempt each and no retries, and on SFTP a read in flight is
+    // abandoned; they are crash-safe by design.
+    let mut repo = open_repo(config, passphrase, OpenOptions::new(), shutdown)?;
     run_on_repo(
         &mut repo,
         config,

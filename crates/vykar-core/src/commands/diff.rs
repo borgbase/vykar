@@ -44,8 +44,12 @@ pub fn run(
     snapshot_a: &str,
     snapshot_b: &str,
 ) -> Result<DiffResult> {
-    let (mut repo, _session_guard) =
-        super::util::open_repo_with_read_session(config, passphrase, OpenOptions::new())?;
+    let (mut repo, _session_guard) = super::util::open_repo_with_read_session(
+        config,
+        passphrase,
+        OpenOptions::new(),
+        &CancelToken::new(),
+    )?;
 
     let entry_a = repo.manifest().resolve_snapshot(snapshot_a)?.clone();
     let entry_b = repo.manifest().resolve_snapshot(snapshot_b)?.clone();

@@ -206,6 +206,8 @@ repositories:
 
 > **Note:** The default (5 retries, ~1 minute of cumulative backoff on average with jitter, up to ~90s worst case) is sized to absorb a brief network gap such as WiFi reconnecting after laptop sleep. Raise `max_retries` further if you run on a flaky link; set it to `0` to fail fast for CI or scripted runs.
 
+A retry wait ends at once on Ctrl-C (or Cancel in the GUI). The operation then stops as interrupted instead of retrying. A request already in flight is not cut short, except SFTP reads.
+
 ## Sources
 
 Sources define what to back up — filesystem paths, command output, or both. Each source entry produces one snapshot per backup run.

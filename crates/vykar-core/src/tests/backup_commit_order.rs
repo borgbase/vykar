@@ -660,7 +660,8 @@ fn lock_acquisition_failure_deregisters_and_keeps_journal() {
     let count = |e: Event| events.iter().filter(|x| **x == e).count();
     assert_eq!(count(Event::LockPut), 1, "{events:?}");
     assert_eq!(count(Event::SnapshotPut), 0, "{events:?}");
-    assert_eq!(count(Event::LockDelete), 0, "{events:?}");
+    // A failed PUT may still have committed, so the key is removed once.
+    assert_eq!(count(Event::LockDelete), 1, "{events:?}");
     assert_eq!(count(Event::JournalDelete), 0, "{events:?}");
     assert!(events.contains(&Event::MarkerDelete), "{events:?}");
     let (marker, journal) = session_keys(&config);
@@ -740,6 +741,7 @@ fn open_failure_deregisters_read_session() {
         &config,
         Some("wrong"),
         crate::repo::OpenOptions::new(),
+        &crate::repo::control::CancelToken::new(),
     );
     assert!(res.is_err());
     assert!(session_markers(&config).is_empty());

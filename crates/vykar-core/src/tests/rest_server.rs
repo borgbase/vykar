@@ -73,7 +73,7 @@ fn client(server: &Server, tmp: &Path, cache: &str) -> VykarConfig {
 }
 
 fn open(config: &VykarConfig) -> Repository {
-    commands::util::open_repo(config, None, OpenOptions::new()).unwrap()
+    commands::util::open_repo(config, None, OpenOptions::new(), &CancelToken::new()).unwrap()
 }
 
 fn head(config: &VykarConfig) -> IndexHead {
@@ -90,7 +90,13 @@ fn sorted_entries(index: &ChunkIndex) -> Vec<String> {
 }
 
 fn entries(config: &VykarConfig) -> Vec<String> {
-    let repo = commands::util::open_repo(config, None, OpenOptions::new().with_index()).unwrap();
+    let repo = commands::util::open_repo(
+        config,
+        None,
+        OpenOptions::new().with_index(),
+        &CancelToken::new(),
+    )
+    .unwrap();
     sorted_entries(repo.chunk_index())
 }
 

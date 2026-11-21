@@ -27,6 +27,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use crate::RetryConfig;
 use crate::{ListedObject, StorageBackend};
 use vykar_common::paths;
+use vykar_types::cancel::CancelToken;
 use vykar_types::error::{Result, VykarError};
 
 use super::runtime::ASYNC_RUNTIME;
@@ -276,6 +277,8 @@ pub struct SftpBackend {
     pool_ready: Condvar,
     max_connections: usize,
     retry: RetryConfig,
+    /// See [`crate::StorageConfig::cancel`].
+    cancel: CancelToken,
     /// Cache of directories known to exist, skipping redundant `mkdir_p` calls.
     known_dirs: Mutex<HashSet<String>>,
 }
@@ -354,7 +357,52 @@ impl SftpBackend {
             pool_ready: Condvar::new(),
             max_connections,
             retry,
+            cancel: CancelToken::new(),
             known_dirs: Mutex::new(HashSet::new()),
+        })
+    }
+
+    /// Observe `cancel` in retry waits and abandon reads in flight when it
+    /// fires; see [`crate::StorageConfig::cancel`].
+    #[must_use]
+    pub fn with_cancel(mut self, cancel: CancelToken) -> Self {
+        self.cancel = cancel;
+        self
+    }
+
+    /// Run one request future on the SFTP runtime. With `abortable`, a cancel
+    /// that arrives while it runs drops the future and yields
+    /// `RetryError::permanent(VykarError::Interrupted)`. The connection then
+    /// has an unanswered request and must be discarded (`retry_op` does
+    /// this). A request started after the cancel runs to completion, because
+    /// cleanup after an interrupt must still reach the server. Only reads and
+    /// the connect are abortable: an abandoned write leaves its outcome
+    /// unknown.
+    fn block_on_op<T>(
+        &self,
+        abortable: bool,
+        fut: impl Future<Output = RetryResult<T>>,
+    ) -> RetryResult<T> {
+        if !abortable || self.cancel.is_cancelled() {
+            return ASYNC_RUNTIME.block_on(fut);
+        }
+        ASYNC_RUNTIME.block_on(async {
+            let mut fut = std::pin::pin!(fut);
+            let mut stop = std::pin::pin!(self.cancel.cancelled());
+            std::future::poll_fn(|cx| {
+                // The request first, so one that completed in the same
+                // wake-up wins over the cancel.
+                if let std::task::Poll::Ready(r) = fut.as_mut().poll(cx) {
+                    return std::task::Poll::Ready(r);
+                }
+                if stop.as_mut().poll(cx).is_ready() {
+                    return std::task::Poll::Ready(Err(RetryError::permanent(
+                        VykarError::Interrupted,
+                    )));
+                }
+                std::task::Poll::Pending
+            })
+            .await
         })
     }
 
@@ -409,7 +457,7 @@ impl SftpBackend {
                 state.total += 1;
                 drop(state);
 
-                match ASYNC_RUNTIME.block_on(Self::connect(&self.params)) {
+                match self.block_on_op(true, Self::connect(&self.params)) {
                     Ok(conn) => {
                         return Ok(ConnGuard {
                             conn: Some(conn),
@@ -564,15 +612,15 @@ impl SftpBackend {
     /// the exponential backoff sleep.
     fn retry_op<T>(&self, op_name: &str, f: impl Fn(&SftpSession) -> RetryResult<T>) -> Result<T> {
         let mut state = RetryState::default();
-        let mut delay_ms = self.retry.retry_delay_ms;
+        let mut backoff = crate::retry::Backoff::new(&self.retry, &self.cancel);
         let mut needs_backoff = false;
 
         loop {
             if needs_backoff {
-                let base = delay_ms.max(1);
-                let jitter = rand::random::<u64>() % base;
-                std::thread::sleep(Duration::from_millis(base + jitter));
-                delay_ms = (base.saturating_mul(2)).min(self.retry.retry_max_delay_ms.max(1));
+                if backoff.wait().is_err() {
+                    tracing::debug!("SFTP {op_name}: cancelled while waiting to retry");
+                    return Err(VykarError::Interrupted);
+                }
                 needs_backoff = false;
             }
 
@@ -621,6 +669,12 @@ impl SftpBackend {
                     return Ok(val);
                 }
                 Err(e) => {
+                    // An abandoned request leaves the session with a reply
+                    // still due: never hand it to another operation.
+                    if matches!(e.err, VykarError::Interrupted) {
+                        guard.discard();
+                        return Err(e.err);
+                    }
                     if !e.retryable {
                         guard.release();
                         return Err(e.err);
@@ -1351,7 +1405,7 @@ impl StorageBackend for SftpBackend {
     fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
         let path = self.full_path(key);
         self.retry_op(&format!("GET {key}"), |sftp| {
-            ASYNC_RUNTIME.block_on(async {
+            self.block_on_op(true, async {
                 let mut file = match sftp.open(&path).await {
                     Ok(f) => f,
                     Err(e) if is_not_found(&e) => return Ok(None),
@@ -1387,7 +1441,7 @@ impl StorageBackend for SftpBackend {
     fn exists(&self, key: &str) -> Result<bool> {
         let path = self.full_path(key);
         self.retry_op(&format!("EXISTS {key}"), |sftp| {
-            ASYNC_RUNTIME.block_on(async {
+            self.block_on_op(true, async {
                 match sftp.metadata(&path).await {
                     Ok(_) => Ok(true),
                     Err(e) if is_not_found(&e) => Ok(false),
@@ -1400,7 +1454,7 @@ impl StorageBackend for SftpBackend {
     fn size(&self, key: &str) -> Result<Option<u64>> {
         let path = self.full_path(key);
         self.retry_op(&format!("SIZE {key}"), |sftp| {
-            ASYNC_RUNTIME.block_on(async {
+            self.block_on_op(true, async {
                 match sftp.metadata(&path).await {
                     Ok(meta) => match meta.size {
                         Some(sz) => Ok(Some(sz)),
@@ -1426,7 +1480,7 @@ impl StorageBackend for SftpBackend {
     fn get_range(&self, key: &str, offset: u64, length: u64) -> Result<Option<Vec<u8>>> {
         let path = self.full_path(key);
         self.retry_op(&format!("GET_RANGE {key}"), |sftp| {
-            ASYNC_RUNTIME.block_on(async {
+            self.block_on_op(true, async {
                 let requested_len = validate_range_length(length)?;
 
                 let mut file = match sftp.open_with_flags(&path, OpenFlags::READ).await {
@@ -1482,7 +1536,7 @@ impl StorageBackend for SftpBackend {
         let dir_path = self.full_path(prefix);
         let root = self.params.root.clone();
         self.retry_op(&format!("LIST {prefix}"), |sftp| {
-            ASYNC_RUNTIME.block_on(list_recursive(sftp, &dir_path, &root))
+            self.block_on_op(true, list_recursive(sftp, &dir_path, &root))
         })
     }
 
@@ -2153,5 +2207,91 @@ mod tests {
 
     fn backend_put_seed(server: &FaultServer) {
         server.backend(0).put("index", b"old index").unwrap();
+    }
+
+    const LONG_RETRY: crate::RetryConfig = crate::RetryConfig {
+        max_retries: 5,
+        retry_delay_ms: 60_000,
+        retry_max_delay_ms: 60_000,
+    };
+
+    /// Far below the 60 s retry wait, loose enough for a loaded CI host.
+    const CANCEL_BOUND: Duration = Duration::from_secs(5);
+
+    fn wait_for(cond: impl Fn() -> bool) {
+        let deadline = Instant::now() + CANCEL_BOUND;
+        while !cond() {
+            assert!(Instant::now() < deadline, "condition not reached");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn cancel_during_sftp_backoff_returns_interrupted() {
+        let server = FaultServer::start();
+        let token = CancelToken::new();
+        let backend = server
+            .backend_with_retry(LONG_RETRY)
+            .with_cancel(token.clone());
+        server
+            .faults
+            .drop_on_write_once
+            .store(true, Ordering::SeqCst);
+
+        std::thread::scope(|s| {
+            let put = s.spawn(|| backend.put("snapshots/x", b"snapshot"));
+            // The fault fired: the first attempt failed or is failing.
+            wait_for(|| !server.faults.drop_on_write_once.load(Ordering::SeqCst));
+            std::thread::sleep(Duration::from_millis(50));
+            let cancelled_at = Instant::now();
+            token.cancel();
+            let err = put.join().unwrap().unwrap_err();
+            let latency = cancelled_at.elapsed();
+            assert!(matches!(err, VykarError::Interrupted), "{err}");
+            assert!(latency < CANCEL_BOUND, "{latency:?}");
+        });
+    }
+
+    #[test]
+    fn cancel_abandons_inflight_sftp_read_and_frees_the_slot() {
+        let server = FaultServer::start();
+        let token = CancelToken::new();
+        let backend = server
+            .backend_with_retry(LONG_RETRY)
+            .with_cancel(token.clone());
+        server.faults.stat_delay_ms.store(60_000, Ordering::SeqCst);
+
+        std::thread::scope(|s| {
+            let exists = s.spawn(|| backend.exists("x"));
+            wait_for(|| server.faults.stats.load(Ordering::SeqCst) >= 1);
+            let cancelled_at = Instant::now();
+            token.cancel();
+            let err = exists.join().unwrap().unwrap_err();
+            let latency = cancelled_at.elapsed();
+            assert!(matches!(err, VykarError::Interrupted), "{err}");
+            assert!(latency < CANCEL_BOUND, "{latency:?}");
+        });
+
+        // max_connections is 1: this only gets a connection if the abandoned
+        // one released its slot, instead of waiting out the 60 s pool wait.
+        server.faults.stat_delay_ms.store(0, Ordering::SeqCst);
+        let started = Instant::now();
+        assert!(!backend.exists("x").unwrap());
+        assert!(started.elapsed() < CANCEL_BOUND, "{:?}", started.elapsed());
+    }
+
+    #[test]
+    fn request_started_after_cancel_runs_to_completion() {
+        let server = FaultServer::start();
+        let token = CancelToken::new();
+        let backend = server
+            .backend_with_retry(LONG_RETRY)
+            .with_cancel(token.clone());
+        token.cancel();
+        server.faults.stat_delay_ms.store(300, Ordering::SeqCst);
+
+        let started = Instant::now();
+        assert!(!backend.exists("x").unwrap());
+        assert!(started.elapsed() >= Duration::from_millis(300));
     }
 }

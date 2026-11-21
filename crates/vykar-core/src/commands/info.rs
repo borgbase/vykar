@@ -38,7 +38,12 @@ pub struct IndexLayoutStats {
 
 /// Run `vykar info`.
 pub fn run(config: &VykarConfig, passphrase: Option<&str>) -> Result<InfoStats> {
-    let repo = open_repo(config, passphrase, OpenOptions::new().with_index())?;
+    let repo = open_repo(
+        config,
+        passphrase,
+        OpenOptions::new().with_index(),
+        &crate::repo::control::CancelToken::new(),
+    )?;
 
     let mut raw_size = 0u64;
     let mut compressed_size = 0u64;

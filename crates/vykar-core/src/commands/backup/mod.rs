@@ -550,8 +550,16 @@ fn run_against_repo(
     let passphrase = req.passphrase;
     let source_paths = req.source_paths;
 
-    let backend =
-        storage::backend_from_config(&config.repository.storage_config(config.limits.connections))?;
+    // The backend observes `shutdown` in its retry waits. Phase 2 (past the
+    // commit point) does not poll it, so after a cancel its requests get one
+    // attempt each and no retries, and on SFTP a read in flight is abandoned;
+    // it is crash-safe by design.
+    let backend = storage::backend_from_config(
+        &config
+            .repository
+            .storage_config(config.limits.connections)
+            .with_cancel(shutdown.clone()),
+    )?;
     let backend = limits::wrap_storage_backend(backend, &config.limits);
     let backend = match wrap_backend {
         Some(wrap) => wrap(backend),

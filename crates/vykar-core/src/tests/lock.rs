@@ -28,6 +28,71 @@ fn acquire_and_release_lock() {
     assert!(!storage.exists(&key).unwrap());
 }
 
+/// Fails the first LIST that would return a key (on an empty store, the
+/// one after the lock PUT), once.
+struct FailFirstNonEmptyList {
+    inner: MemoryBackend,
+    fired: std::sync::atomic::AtomicBool,
+}
+
+impl FailFirstNonEmptyList {
+    fn check(&self, prefix: &str) -> vykar_types::error::Result<()> {
+        if !self.inner.list(prefix)?.is_empty()
+            && !self.fired.swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(vykar_types::error::VykarError::Interrupted);
+        }
+        Ok(())
+    }
+}
+
+impl vykar_storage::InnerBackend for FailFirstNonEmptyList {
+    fn inner_backend(&self) -> &dyn StorageBackend {
+        &self.inner
+    }
+}
+
+vykar_storage::delegate_storage_backend! {
+    for FailFirstNonEmptyList;
+    except [list, list_sized, list_tree_sized];
+
+    fn list(&self, prefix: &str) -> vykar_types::error::Result<Vec<String>> {
+        self.check(prefix)?;
+        self.inner.list(prefix)
+    }
+
+    fn list_sized(
+        &self,
+        prefix: &str,
+    ) -> vykar_types::error::Result<Vec<vykar_storage::ListedObject>> {
+        self.check(prefix)?;
+        self.inner.list_sized(prefix)
+    }
+
+    fn list_tree_sized(
+        &self,
+        prefix: &str,
+    ) -> vykar_types::error::Result<Vec<vykar_storage::ListedObject>> {
+        self.check(prefix)?;
+        self.inner.list_tree_sized(prefix)
+    }
+}
+
+/// A LIST that fails after the lock PUT must not leave the key behind.
+#[test]
+fn failed_list_after_lock_put_removes_the_key() {
+    let storage = FailFirstNonEmptyList {
+        inner: MemoryBackend::new(),
+        fired: std::sync::atomic::AtomicBool::new(false),
+    };
+    let err = acquire_lock(&storage).unwrap_err();
+    assert!(
+        matches!(err, vykar_types::error::VykarError::Interrupted),
+        "{err}"
+    );
+    assert!(storage.inner.list("locks/").unwrap().is_empty());
+}
+
 #[test]
 fn lock_key_in_locks_directory() {
     let storage = MemoryBackend::new();

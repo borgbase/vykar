@@ -236,6 +236,9 @@ impl RepositoryConfig {
     /// `self` is destructured exhaustively (no `..` rest pattern), so a field
     /// added to `RepositoryConfig` fails to compile here instead of being
     /// dropped silently on the way to the backend.
+    ///
+    /// Its cancel token is never cancelled; a caller that has a token attaches
+    /// it with [`vykar_storage::StorageConfig::with_cancel`].
     pub fn storage_config(&self, connections: usize) -> vykar_storage::StorageConfig {
         let RepositoryConfig {
             url,
@@ -269,6 +272,7 @@ impl RepositoryConfig {
             allow_insecure_http: *allow_insecure_http,
             retry: *retry,
             s3_soft_delete: *s3_soft_delete,
+            cancel: vykar_types::cancel::CancelToken::new(),
         }
     }
 

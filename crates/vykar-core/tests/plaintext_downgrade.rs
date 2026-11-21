@@ -14,6 +14,7 @@ use vykar_core::commands::util::open_repo;
 use vykar_core::compress::Compression;
 use vykar_core::config::{EncryptionModeConfig, VykarConfig};
 use vykar_core::repo::OpenOptions;
+use vykar_core::repo::control::CancelToken;
 use vykar_types::error::VykarError;
 
 use crate::common::make_test_config;
@@ -50,7 +51,7 @@ fn walk(dir: &Path) -> Vec<std::path::PathBuf> {
 }
 
 fn open_err(config: &VykarConfig) -> VykarError {
-    match open_repo(config, Some(PASS), OpenOptions::new()) {
+    match open_repo(config, Some(PASS), OpenOptions::new(), &CancelToken::new()) {
         Ok(_) => panic!("open unexpectedly succeeded"),
         Err(e) => e,
     }
@@ -124,7 +125,7 @@ fn trust_repo_does_not_waive_encryption_requirement() {
 fn plaintext_config_opens_plaintext_repo() {
     let tmp = tempfile::tempdir().unwrap();
     let config = plaintext_repo(tmp.path(), EncryptionModeConfig::None);
-    open_repo(&config, None, OpenOptions::new()).unwrap();
+    open_repo(&config, None, OpenOptions::new(), &CancelToken::new()).unwrap();
 }
 
 #[test]
@@ -136,5 +137,5 @@ fn encrypting_config_opens_encrypted_repo() {
     config.encryption.mode = EncryptionModeConfig::Auto;
     config.cache_dir = Some(tmp.path().join("cache").to_string_lossy().into_owned());
     commands::init::run(&config, Some(PASS)).unwrap();
-    open_repo(&config, Some(PASS), OpenOptions::new()).unwrap();
+    open_repo(&config, Some(PASS), OpenOptions::new(), &CancelToken::new()).unwrap();
 }

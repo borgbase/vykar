@@ -73,7 +73,10 @@ pub(crate) fn run_delete_repo(
     // Verify the repo exists before prompting — use list + is_known_repo_key
     // so we detect partially-deleted repos (e.g. config gone but packs remain).
     let backend = vykar_core::storage::backend_from_config(
-        &config.repository.storage_config(config.limits.connections),
+        &config
+            .repository
+            .storage_config(config.limits.connections)
+            .with_cancel(crate::signal::shutdown_token().clone()),
     )?;
     let all_keys = backend.list("")?;
     let has_repo_keys = all_keys

@@ -298,6 +298,7 @@ where
         config,
         passphrase,
         crate::repo::OpenOptions::new(),
+        shutdown,
     )?;
     restore_on_repo_with_filter(&mut repo, snapshot_name, dest, opts, include_path, shutdown)
 }

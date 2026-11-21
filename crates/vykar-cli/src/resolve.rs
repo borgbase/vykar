@@ -76,6 +76,7 @@ fn probe_snapshot(
             config,
             passphrase,
             vykar_core::OpenOptions::new(),
+            crate::signal::shutdown_token(),
         )?;
         Ok(repo.manifest().find_snapshot(snapshot_name).is_some())
     })

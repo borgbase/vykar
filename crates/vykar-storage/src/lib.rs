@@ -36,6 +36,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
+use vykar_types::cancel::CancelToken;
 use vykar_types::error::{Result, VykarError};
 
 // Wire-format types used in the `StorageBackend` trait surface. Callers import
@@ -792,6 +793,23 @@ pub struct StorageConfig {
     pub retry: RetryConfig,
     /// Use soft-delete for S3 Object Lock compatibility.
     pub s3_soft_delete: bool,
+    /// Cancels retry waits and abandons SFTP reads in flight. Once it is
+    /// cancelled, a remote backend starts no new attempt of an operation and
+    /// returns Interrupted. The first attempt of an operation still runs, so
+    /// cleanup after a cancel (lock release, session removal) is attempted.
+    /// Requests that change storage are never abandoned in flight. Use
+    /// CancelToken::new() for a backend that nothing cancels. The local
+    /// backend ignores it.
+    pub cancel: CancelToken,
+}
+
+impl StorageConfig {
+    /// This config with [`StorageConfig::cancel`] replaced by `cancel`.
+    #[must_use]
+    pub fn with_cancel(mut self, cancel: CancelToken) -> Self {
+        self.cancel = cancel;
+        self
+    }
 }
 
 /// [`BackendProfile::request_width`] of a remote backend: three requests per
@@ -944,17 +962,20 @@ pub fn backend_from_config(cfg: &StorageConfig) -> Result<Box<dyn StorageBackend
                 VykarError::Config("S3 requires secret_access_key in repository config".into())
             })?;
 
-            Ok(Box::new(s3_backend::S3Backend::new(
-                &bucket,
-                region,
-                &root,
-                &endpoint,
-                access_key_id,
-                secret_access_key,
-                cfg.retry,
-                cfg.s3_soft_delete,
-                cfg.max_connections,
-            )?))
+            Ok(Box::new(
+                s3_backend::S3Backend::new(
+                    &bucket,
+                    region,
+                    &root,
+                    &endpoint,
+                    access_key_id,
+                    secret_access_key,
+                    cfg.retry,
+                    cfg.s3_soft_delete,
+                    cfg.max_connections,
+                )?
+                .with_cancel(cfg.cancel.clone()),
+            ))
         }
         #[cfg(feature = "backend-sftp")]
         ParsedUrl::Sftp {
@@ -962,30 +983,31 @@ pub fn backend_from_config(cfg: &StorageConfig) -> Result<Box<dyn StorageBackend
             host,
             port,
             path,
-        } => Ok(Box::new(sftp_backend::SftpBackend::new(
-            &host,
-            user.as_deref(),
-            port,
-            &path,
-            cfg.sftp_key.as_deref(),
-            cfg.sftp_agent.as_deref(),
-            cfg.sftp_known_hosts.as_deref(),
-            cfg.max_connections,
-            cfg.sftp_timeout,
-            cfg.retry,
-        )?)),
+        } => Ok(Box::new(
+            sftp_backend::SftpBackend::new(
+                &host,
+                user.as_deref(),
+                port,
+                &path,
+                cfg.sftp_key.as_deref(),
+                cfg.sftp_agent.as_deref(),
+                cfg.sftp_known_hosts.as_deref(),
+                cfg.max_connections,
+                cfg.sftp_timeout,
+                cfg.retry,
+            )?
+            .with_cancel(cfg.cancel.clone()),
+        )),
         #[cfg(not(feature = "backend-sftp"))]
         ParsedUrl::Sftp { .. } => Err(VykarError::UnsupportedBackend(
             "sftp (compile with feature 'backend-sftp')".into(),
         )),
         ParsedUrl::Rest { url } => {
             let token = cfg.access_token.as_deref();
-            Ok(Box::new(rest_backend::RestBackend::new(
-                &url,
-                token,
-                cfg.retry,
-                cfg.max_connections,
-            )?))
+            Ok(Box::new(
+                rest_backend::RestBackend::new(&url, token, cfg.retry, cfg.max_connections)?
+                    .with_cancel(cfg.cancel.clone()),
+            ))
         }
     }
 }
@@ -1424,6 +1446,7 @@ mod tests {
             allow_insecure_http: false,
             retry: RetryConfig::default(),
             s3_soft_delete: false,
+            cancel: CancelToken::new(),
         }
     }
 

@@ -850,7 +850,12 @@ impl InnerBackend for MutLog {
 
 delegate_storage_backend! {
     for MutLog;
-    except [put, delete, put_pack, begin_staged_put, batch_delete_keys, profile];
+    except [put, delete, put_pack, begin_staged_put, batch_delete_keys, conditional, profile];
+
+    // Test wrapper: keeps every write on `put`.
+    fn conditional(&self) -> Option<&dyn vykar_storage::ConditionalWrite> {
+        None
+    }
 
     fn profile(&self) -> vykar_storage::BackendProfile {
         self.inner.profile()
@@ -1180,7 +1185,14 @@ impl InnerBackend for FailListAfterHeadPut {
 
 delegate_storage_backend! {
     for FailListAfterHeadPut;
-    except [list, list_sized, list_tree_sized];
+    except [list, list_sized, list_meta, list_tree_sized];
+
+    fn list_meta(
+        &self,
+        prefix: &str,
+    ) -> vykar_types::error::Result<Vec<vykar_storage::ListedObject>> {
+        self.list_sized(prefix)
+    }
 
     fn list(&self, prefix: &str) -> Result<Vec<String>> {
         self.check(prefix)?;
@@ -1596,7 +1608,14 @@ impl InnerBackend for FailIndexList {
 
 delegate_storage_backend! {
     for FailIndexList;
-    except [list, list_sized, list_tree_sized];
+    except [list, list_sized, list_meta, list_tree_sized];
+
+    fn list_meta(
+        &self,
+        prefix: &str,
+    ) -> vykar_types::error::Result<Vec<vykar_storage::ListedObject>> {
+        self.list_sized(prefix)
+    }
 
     fn list(&self, prefix: &str) -> Result<Vec<String>> {
         self.check(prefix)?;

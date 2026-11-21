@@ -49,6 +49,7 @@ pub struct RepoQuery {
     pub verify_packs: Option<String>,
     pub list: Option<String>,
     pub sized: Option<String>,
+    pub mtime: Option<String>,
 }
 
 /// GET / - dispatches based on query parameter.
@@ -63,7 +64,12 @@ pub async fn repo_dispatch(
         return with_admin_timeout(verify_structure(state)).await;
     }
     if query.list.is_some() {
-        return with_admin_timeout(repo_list_all(state, query.sized.is_some())).await;
+        return with_admin_timeout(repo_list_all(
+            state,
+            query.sized.is_some(),
+            query.mtime.is_some(),
+        ))
+        .await;
     }
     Err(ServerError::BadRequest(
         "missing query parameter (stats, verify-structure, list)".into(),
@@ -101,7 +107,9 @@ pub async fn repo_action_dispatch(
 /// without them, which is how a new client tells the two apart at `vykar init`
 /// instead of discovering it at the first pack upload. `key_dirs` lists the
 /// top-level key directories this server accepts, so a client can tell
-/// whether it serves the format-v6 ones.
+/// whether it serves the format-v6 ones. `conditional_put` says that a
+/// `PUT` with `If-None-Match: *` creates only (412 when the key exists),
+/// atomically; older servers ignore the header and overwrite.
 pub async fn health() -> impl IntoResponse {
     axum::Json(serde_json::json!({
         "status": "ok",
@@ -114,5 +122,6 @@ pub async fn health() -> impl IntoResponse {
         "pack_parts": true,
         "segmented_index": true,
         "key_dirs": vykar_protocol::KNOWN_ROOT_DIRS,
+        "conditional_put": true,
     }))
 }

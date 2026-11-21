@@ -859,7 +859,14 @@ mod tests {
 
     vykar_storage::delegate_storage_backend! {
         for LookupCountingBackend;
-        except [list, size, list_sized, list_tree_sized];
+        except [list, size, list_sized, list_meta, list_tree_sized];
+
+        fn list_meta(
+            &self,
+            prefix: &str,
+        ) -> vykar_types::error::Result<Vec<vykar_storage::ListedObject>> {
+            self.list_sized(prefix)
+        }
 
         fn size(&self, key: &str) -> Result<Option<u64>> {
             self.size_calls

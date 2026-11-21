@@ -642,11 +642,8 @@ fn is_mechanism_refusal(detail: &str) -> bool {
         return true;
     }
     let mut parts = detail.split_whitespace();
-    let status = parts.next().unwrap_or_default();
-    let code = parts.next().unwrap_or_default();
-    status == "501"
-        || code == "NotImplemented"
-        || (status == "400" && matches!(code, "InvalidArgument" | "InvalidRequest"))
+    let status = parts.next().unwrap_or_default().parse().unwrap_or(0);
+    crate::s3_backend::conditional::s3_refuses_mechanism(status, parts.next())
 }
 
 /// Verdict from the case list and race, plus one line per deviation.

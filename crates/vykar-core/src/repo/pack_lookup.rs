@@ -318,7 +318,14 @@ pub(crate) mod tests {
 
     delegate_storage_backend! {
         for Probe;
-        except [exists, list, size, list_sized, object_sizes, list_tree_sized];
+        except [exists, list, size, list_sized, list_meta, object_sizes, list_tree_sized];
+
+        fn list_meta(
+            &self,
+            prefix: &str,
+        ) -> vykar_types::error::Result<Vec<vykar_storage::ListedObject>> {
+            self.list_sized(prefix)
+        }
 
         fn exists(&self, key: &str) -> Result<bool> {
             self.exists.fetch_add(1, Ordering::SeqCst);
@@ -361,7 +368,11 @@ pub(crate) mod tests {
                     } else {
                         None
                     };
-                    Ok(ListedObject { key, size })
+                    Ok(ListedObject {
+                        key,
+                        size,
+                        mtime: None,
+                    })
                 })
                 .collect()
         }

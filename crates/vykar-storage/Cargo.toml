@@ -27,6 +27,9 @@ rand.workspace = true
 md-5 = "0.11"
 base64 = "0.23"
 
+# S3 LastModified (RFC 3339) in list_meta
+chrono.workspace = true
+
 # URL parsing
 url = "2"
 percent-encoding = "2"

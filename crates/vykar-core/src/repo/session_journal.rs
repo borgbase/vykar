@@ -244,7 +244,12 @@ pub(super) mod tests {
 
     vykar_storage::delegate_storage_backend! {
         for SlowPutBackend;
-        except [put, put_pack, begin_staged_put, profile];
+        except [put, put_pack, begin_staged_put, conditional, profile];
+
+        // Test wrapper: keeps every write on `put`.
+        fn conditional(&self) -> Option<&dyn vykar_storage::ConditionalWrite> {
+            None
+        }
 
         fn begin_staged_put(
             &self,

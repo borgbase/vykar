@@ -183,8 +183,14 @@ impl InnerBackend for ObservingBackend {
 delegate_storage_backend! {
     for ObservingBackend;
     except [
-        put, delete, exists, put_owned, put_pack, begin_staged_put, object_sizes, profile,
+        put, delete, exists, put_owned, put_pack, begin_staged_put, object_sizes, conditional,
+        profile
     ];
+
+    // Test wrapper: keeps every write on `put`.
+    fn conditional(&self) -> Option<&dyn vykar_storage::ConditionalWrite> {
+        None
+    }
 
     // Keep packs on the intercepted `put` path. The recorded order must include every pack write.
     fn begin_staged_put(

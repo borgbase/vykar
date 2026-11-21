@@ -19,9 +19,11 @@ use crate::retry::HttpRetryError;
 use vykar_types::cancel::CancelToken;
 use vykar_types::error::{Result, VykarError};
 
-use crate::{ListedObject, StorageBackend};
+use crate::conditional::Verifier;
+use crate::{ConditionalWrite, ListedObject, S3ConditionalWrites, StorageBackend};
 
 mod batch_delete;
+pub(crate) mod conditional;
 mod multipart;
 pub(crate) mod probe;
 
@@ -51,6 +53,12 @@ pub struct S3Backend {
     batch_delete_unsupported: std::sync::atomic::AtomicBool,
     request_width: usize,
     transfer_width: usize,
+    /// `s3_conditional_writes`; see [`Self::with_conditional_writes`].
+    conditional_mode: S3ConditionalWrites,
+    /// The endpoint's host is an AWS one (what `auto` trusts).
+    aws_endpoint: bool,
+    /// Cache of the put-if-absent check.
+    cond: Verifier,
 }
 
 #[allow(clippy::result_large_err)]
@@ -108,7 +116,19 @@ impl S3Backend {
             batch_delete_unsupported: std::sync::atomic::AtomicBool::new(false),
             request_width: crate::remote_request_width(max_connections),
             transfer_width: crate::transfer_width(max_connections),
+            conditional_mode: S3ConditionalWrites::Auto,
+            aws_endpoint: conditional::is_aws_endpoint(endpoint),
+            cond: Verifier::new(),
         })
+    }
+
+    /// Whether `conditional()` offers put-if-absent: `Auto` (the default)
+    /// only on AWS endpoints, `On` on any, `Off` never. The check on first
+    /// use still runs in every mode that offers it.
+    #[must_use]
+    pub fn with_conditional_writes(mut self, mode: S3ConditionalWrites) -> Self {
+        self.conditional_mode = mode;
+        self
     }
 
     /// Observe `cancel` in retry waits; see [`crate::StorageConfig::cancel`].
@@ -356,88 +376,11 @@ impl StorageBackend for S3Backend {
     }
 
     fn list_sized(&self, prefix: &str) -> Result<Vec<ListedObject>> {
-        let full_prefix = self.full_key(prefix);
-        let root_prefix_len = if self.root.is_empty() {
-            0
-        } else {
-            self.root.len() + 1 // +1 for the '/'
-        };
+        self.list_objects(prefix, false)
+    }
 
-        let mut keys = Vec::new();
-        let mut continuation_token: Option<String> = None;
-
-        loop {
-            let mut action = self.bucket.list_objects_v2(Some(&self.credentials));
-            action.query_mut().insert("prefix", &full_prefix);
-            if let Some(ref token) = continuation_token {
-                action.query_mut().insert("continuation-token", token);
-            }
-            let url = action.sign(PRESIGN_DURATION);
-
-            let parsed = self
-                .retry_call(
-                    &format!("LIST {prefix}"),
-                    || self.agent.get(url.as_str()).call(),
-                    |mut resp| {
-                        s3_check_status(&mut resp, "LIST", prefix)?;
-                        let mut body = Vec::new();
-                        resp.body_mut()
-                            .as_reader()
-                            .read_to_end(&mut body)
-                            .map_err(HttpRetryError::BodyIo)?;
-                        // rusty-s3 (instant-xml) parses from &str.
-                        let body = std::str::from_utf8(&body).map_err(|e| {
-                            HttpRetryError::Permanent(format!(
-                                "S3 LIST {prefix}: response was not valid UTF-8: {e}"
-                            ))
-                        })?;
-                        ListObjectsV2::parse_response(body).map_err(|e| {
-                            HttpRetryError::Permanent(format!(
-                                "S3 LIST {prefix}: failed to parse response: {e}"
-                            ))
-                        })
-                    },
-                )
-                .map_err(|e| s3_error("LIST", prefix, e))?;
-
-            for obj in &parsed.contents {
-                // rusty_s3 sends encoding-type=url and decodes the keys itself when
-                // the response echoes EncodingType. This covers backends (e.g.
-                // Garage) that encode keys without echoing it; vykar's own keys
-                // contain no `%`, so it is a no-op for already-decoded ones.
-                let key = percent_decode_str(&obj.key)
-                    .decode_utf8()
-                    .map_err(|e| VykarError::Other(format!("S3 LIST: invalid UTF-8 in key: {e}")))?
-                    .into_owned();
-                // Skip directory markers
-                if key.ends_with('/') {
-                    continue;
-                }
-                // Skip zero-byte tombstones (soft-deleted objects).
-                // rusty-s3 reports Size as optional; only a known zero is a tombstone,
-                // so a server omitting Size can never hide a live key.
-                if self.soft_delete && obj.size == Some(0) {
-                    continue;
-                }
-                // Strip root prefix to return relative keys
-                let key = if root_prefix_len > 0 && key.len() > root_prefix_len {
-                    key[root_prefix_len..].to_string()
-                } else {
-                    key
-                };
-                keys.push(ListedObject {
-                    key,
-                    size: obj.size,
-                });
-            }
-
-            match parsed.next_continuation_token {
-                Some(token) => continuation_token = Some(token),
-                None => break,
-            }
-        }
-
-        Ok(keys)
+    fn list_meta(&self, prefix: &str) -> Result<Vec<ListedObject>> {
+        self.list_objects(prefix, true)
     }
 
     fn get_range(&self, key: &str, offset: u64, length: u64) -> Result<Option<Vec<u8>>> {
@@ -533,11 +476,109 @@ impl StorageBackend for S3Backend {
         self.delete_objects(keys)
     }
 
-    crate::unsupported_server_ops!(except[batch_delete_keys]);
+    fn conditional(&self) -> Option<&dyn ConditionalWrite> {
+        (self.conditional_offered() && !self.cond.refused())
+            .then_some(self as &dyn ConditionalWrite)
+    }
+
+    crate::unsupported_server_ops!(except[batch_delete_keys, conditional]);
 }
 
 #[allow(clippy::result_large_err)]
 impl S3Backend {
+    /// `list_sized` (`with_mtime` false) and `list_meta` (true).
+    fn list_objects(&self, prefix: &str, with_mtime: bool) -> Result<Vec<ListedObject>> {
+        let full_prefix = self.full_key(prefix);
+        let root_prefix_len = if self.root.is_empty() {
+            0
+        } else {
+            self.root.len() + 1 // +1 for the '/'
+        };
+
+        let mut keys = Vec::new();
+        let mut continuation_token: Option<String> = None;
+
+        loop {
+            let mut action = self.bucket.list_objects_v2(Some(&self.credentials));
+            action.query_mut().insert("prefix", &full_prefix);
+            if let Some(ref token) = continuation_token {
+                action.query_mut().insert("continuation-token", token);
+            }
+            let url = action.sign(PRESIGN_DURATION);
+
+            let parsed = self
+                .retry_call(
+                    &format!("LIST {prefix}"),
+                    || self.agent.get(url.as_str()).call(),
+                    |mut resp| {
+                        s3_check_status(&mut resp, "LIST", prefix)?;
+                        let mut body = Vec::new();
+                        resp.body_mut()
+                            .as_reader()
+                            .read_to_end(&mut body)
+                            .map_err(HttpRetryError::BodyIo)?;
+                        // rusty-s3 (instant-xml) parses from &str.
+                        let body = std::str::from_utf8(&body).map_err(|e| {
+                            HttpRetryError::Permanent(format!(
+                                "S3 LIST {prefix}: response was not valid UTF-8: {e}"
+                            ))
+                        })?;
+                        ListObjectsV2::parse_response(body).map_err(|e| {
+                            HttpRetryError::Permanent(format!(
+                                "S3 LIST {prefix}: failed to parse response: {e}"
+                            ))
+                        })
+                    },
+                )
+                .map_err(|e| s3_error("LIST", prefix, e))?;
+
+            for obj in &parsed.contents {
+                // rusty_s3 sends encoding-type=url and decodes the keys itself when
+                // the response echoes EncodingType. This covers backends (e.g.
+                // Garage) that encode keys without echoing it; vykar's own keys
+                // contain no `%`, so it is a no-op for already-decoded ones.
+                let key = percent_decode_str(&obj.key)
+                    .decode_utf8()
+                    .map_err(|e| VykarError::Other(format!("S3 LIST: invalid UTF-8 in key: {e}")))?
+                    .into_owned();
+                // Skip directory markers
+                if key.ends_with('/') {
+                    continue;
+                }
+                // Skip zero-byte tombstones (soft-deleted objects).
+                // rusty-s3 reports Size as optional; only a known zero is a tombstone,
+                // so a server omitting Size can never hide a live key.
+                if self.soft_delete && obj.size == Some(0) {
+                    continue;
+                }
+                // Strip root prefix to return relative keys
+                let key = if root_prefix_len > 0 && key.len() > root_prefix_len {
+                    key[root_prefix_len..].to_string()
+                } else {
+                    key
+                };
+                keys.push(ListedObject {
+                    key,
+                    size: obj.size,
+                    mtime: if with_mtime {
+                        obj.last_modified
+                            .as_deref()
+                            .and_then(conditional::parse_s3_time)
+                    } else {
+                        None
+                    },
+                });
+            }
+
+            match parsed.next_continuation_token {
+                Some(token) => continuation_token = Some(token),
+                None => break,
+            }
+        }
+
+        Ok(keys)
+    }
+
     fn put_bytes(&self, key: &str, data: &[u8]) -> Result<()> {
         let full_key = self.full_key(key);
         // Large objects (packs, or any object over the threshold — e.g. a big
@@ -578,6 +619,8 @@ impl S3Backend {
 #[cfg(test)]
 mod test_support {
     use super::*;
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
 
     pub(super) fn no_retry() -> RetryConfig {
         RetryConfig {
@@ -645,12 +688,164 @@ mod test_support {
     pub(super) fn s3_error_xml(code: &str, message: &str) -> String {
         format!("<Error><Code>{code}</Code><Message>{message}</Message></Error>")
     }
+
+    pub(super) fn reply(status: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// One parsed request: method, path without the query, whole request line,
+    /// whether `if-none-match: *` was sent, and the body.
+    pub(super) struct Req {
+        pub(super) method: String,
+        pub(super) path: String,
+        pub(super) line: String,
+        pub(super) if_none_match: bool,
+        pub(super) body: Vec<u8>,
+    }
+
+    /// Serves requests until the test ends, answering each with `route`.
+    pub(super) fn serve(route: impl Fn(&Req) -> (&'static str, String) + Send + 'static) -> u16 {
+        serve_bytes(move |req| {
+            let (status, body) = route(req);
+            (status, body.into_bytes())
+        })
+    }
+
+    /// [`serve`] with binary reply bodies. A HEAD reply carries the body's
+    /// length as Content-Length and no body.
+    pub(super) fn serve_bytes(
+        route: impl Fn(&Req) -> (&'static str, Vec<u8>) + Send + 'static,
+    ) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut request_line = String::new();
+                let mut content_len = 0usize;
+                let mut if_none_match = false;
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line.trim().is_empty() {
+                        break;
+                    }
+                    if request_line.is_empty() {
+                        request_line = line.clone();
+                        continue;
+                    }
+                    let lower = line.to_lowercase();
+                    if let Some(v) = lower.strip_prefix("content-length:") {
+                        content_len = v.trim().parse().unwrap_or(0);
+                    }
+                    if lower.replace(' ', "").trim_end() == "if-none-match:*" {
+                        if_none_match = true;
+                    }
+                }
+                let mut body = vec![0u8; content_len];
+                let _ = std::io::Read::read_exact(&mut reader, &mut body);
+                let mut parts = request_line.split_whitespace();
+                let method = parts.next().unwrap_or_default().to_string();
+                let target = parts.next().unwrap_or_default();
+                let path = target.split('?').next().unwrap_or_default().to_string();
+                let req = Req {
+                    method,
+                    path,
+                    line: request_line.clone(),
+                    if_none_match,
+                    body,
+                };
+                let (status, reply_body) = route(&req);
+                let head = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    reply_body.len()
+                );
+                let _ = stream.write_all(head.as_bytes());
+                if req.method != "HEAD" {
+                    let _ = stream.write_all(&reply_body);
+                }
+                let _ = stream.flush();
+            }
+        });
+        port
+    }
+
+    /// An in-memory S3 for the conformance suite: PutObject (honouring
+    /// `if-none-match: *` with 412), GetObject, HeadObject, DeleteObject and
+    /// ListObjectsV2 with `<Size>` and `<LastModified>`. Connections are served
+    /// one at a time, so concurrent creators are serialised (still one winner).
+    pub(super) fn stateful_s3() -> u16 {
+        use std::collections::BTreeMap;
+        use std::sync::Mutex;
+        let objects: Mutex<BTreeMap<String, Vec<u8>>> = Mutex::new(BTreeMap::new());
+        serve_bytes(move |req| {
+            let path = percent_encoding::percent_decode_str(&req.path)
+                .decode_utf8_lossy()
+                .into_owned();
+            let key = path
+                .strip_prefix("/test-bucket/")
+                .unwrap_or_default()
+                .to_string();
+            let mut objects = objects.lock().unwrap();
+            match req.method.as_str() {
+                "PUT" => {
+                    if req.if_none_match && objects.contains_key(&key) {
+                        let xml = s3_error_xml("PreconditionFailed", "exists");
+                        return ("412 Precondition Failed", xml.into_bytes());
+                    }
+                    objects.insert(key, req.body.clone());
+                    ("200 OK", Vec::new())
+                }
+                "GET" if req.line.contains("list-type=2") => {
+                    let target = req.line.split_whitespace().nth(1).unwrap_or_default();
+                    let url = url::Url::parse(&format!("http://h{target}")).unwrap();
+                    let prefix = url
+                        .query_pairs()
+                        .find(|(k, _)| k == "prefix")
+                        .map(|(_, v)| v.into_owned())
+                        .unwrap_or_default();
+                    let mut xml = String::from(
+                        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+                         <ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+                         <Name>test-bucket</Name><MaxKeys>1000</MaxKeys>\
+                         <IsTruncated>false</IsTruncated>",
+                    );
+                    for (k, v) in objects.range(prefix.clone()..) {
+                        if !k.starts_with(&prefix) {
+                            break;
+                        }
+                        xml.push_str(&format!(
+                            "<Contents><Key>{k}</Key><Size>{}</Size>\
+                             <LastModified>2024-01-01T00:00:00.000Z</LastModified></Contents>",
+                            v.len()
+                        ));
+                    }
+                    xml.push_str("</ListBucketResult>");
+                    ("200 OK", xml.into_bytes())
+                }
+                "GET" | "HEAD" => match objects.get(&key) {
+                    Some(v) => ("200 OK", v.clone()),
+                    None => ("404 Not Found", Vec::new()),
+                },
+                "DELETE" => {
+                    objects.remove(&key);
+                    ("204 No Content", Vec::new())
+                }
+                _ => ("400 Bad Request", Vec::new()),
+            }
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::test_support::*;
     use super::*;
+    use crate::{ConditionalSupport, Created};
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::sync::{Arc, Mutex};
@@ -1146,11 +1341,13 @@ mod tests {
             vec![
                 ListedObject {
                     key: "snapshots/abc".into(),
-                    size: Some(100)
+                    size: Some(100),
+                    mtime: None,
                 },
                 ListedObject {
                     key: "snapshots/def".into(),
-                    size: Some(200)
+                    size: Some(200),
+                    mtime: None,
                 },
             ]
         );
@@ -1718,5 +1915,266 @@ mod tests {
             assert!(latency < bound, "{latency:?}");
         });
         handle.join().unwrap();
+    }
+    // ── Conditional writes and list_meta ─────────────────────────────
+
+    fn conditional_backend(port: u16, retry: RetryConfig) -> S3Backend {
+        s3_backend(port, retry, false).with_conditional_writes(S3ConditionalWrites::On)
+    }
+
+    #[test]
+    fn conditional_put_signs_and_sends_if_none_match() {
+        let (port, captured, handle) = mock_server_capture_bodies(vec![
+            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_string(),
+        ]);
+        let backend = conditional_backend(port, no_retry());
+        assert_eq!(
+            backend.put_if_absent_raw("locks/k", b"d").unwrap(),
+            Created::Yes
+        );
+        handle.join().unwrap();
+        let (lines, body) = captured.lock().unwrap()[0].clone();
+        assert_eq!(body, b"d");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.to_lowercase().replace(' ', "") == "if-none-match:*"),
+            "{lines:?}"
+        );
+        let request_line = &lines[0];
+        let target = request_line.split_whitespace().nth(1).unwrap();
+        let url = url::Url::parse(&format!("http://h{target}")).unwrap();
+        let signed = url
+            .query_pairs()
+            .find(|(k, _)| k == "X-Amz-SignedHeaders")
+            .map(|(_, v)| v.into_owned())
+            .unwrap();
+        assert!(signed.split(';').any(|h| h == "if-none-match"), "{signed}");
+    }
+
+    #[test]
+    fn conditional_put_412_is_already_exists() {
+        let port = serve(|_| {
+            (
+                "412 Precondition Failed",
+                s3_error_xml("PreconditionFailed", "m"),
+            )
+        });
+        let backend = conditional_backend(port, no_retry());
+        assert_eq!(
+            backend.put_if_absent_raw("locks/k", b"d").unwrap(),
+            Created::AlreadyExists
+        );
+    }
+
+    #[test]
+    fn conditional_put_retries_409() {
+        let n = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls = n.clone();
+        let port = serve(move |_| {
+            if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                (
+                    "409 Conflict",
+                    s3_error_xml("ConditionalRequestConflict", "m"),
+                )
+            } else {
+                ("200 OK", String::new())
+            }
+        });
+        let backend = conditional_backend(port, fast_retry());
+        assert_eq!(
+            backend.put_if_absent_raw("locks/k", b"d").unwrap(),
+            Created::Yes
+        );
+        assert_eq!(n.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        let port = serve(|_| {
+            (
+                "409 Conflict",
+                s3_error_xml("ConditionalRequestConflict", "m"),
+            )
+        });
+        let backend = conditional_backend(port, no_retry());
+        assert!(backend.put_if_absent_raw("locks/k", b"d").is_err());
+    }
+
+    #[test]
+    fn conditional_refusals_make_verify_unsupported() {
+        for (status, code) in [
+            ("501 Not Implemented", "NotImplemented"),
+            ("400 Bad Request", "InvalidRequest"),
+        ] {
+            let port = serve(move |req| {
+                if req.method == "PUT" {
+                    (status, s3_error_xml(code, "m"))
+                } else {
+                    ("204 No Content", String::new())
+                }
+            });
+            let backend = conditional_backend(port, no_retry());
+            let support = backend.conditional().unwrap().verify().unwrap();
+            assert!(
+                matches!(support, ConditionalSupport::Unsupported { .. }),
+                "{status}: {support:?}"
+            );
+            assert!(backend.conditional().is_none());
+        }
+    }
+
+    /// Garage 2.5.0: every PUT succeeds, the condition is ignored.
+    #[test]
+    fn a_store_that_ignores_the_condition_is_refused() {
+        let stored = Arc::new(Mutex::new(Vec::new()));
+        let s = stored.clone();
+        let port = serve_bytes(move |req| match req.method.as_str() {
+            "PUT" => {
+                *s.lock().unwrap() = req.body.clone();
+                ("200 OK", Vec::new())
+            }
+            "GET" => ("200 OK", s.lock().unwrap().clone()),
+            _ => ("204 No Content", Vec::new()),
+        });
+        let backend = conditional_backend(port, no_retry());
+        let ConditionalSupport::Unsupported { reason } =
+            backend.conditional().unwrap().verify().unwrap()
+        else {
+            panic!("an ignored condition must be Unsupported");
+        };
+        assert!(reason.contains("ignores the condition"), "{reason}");
+        assert!(backend.conditional().is_none());
+        match backend.put_if_absent("locks/x", b"x") {
+            Err(VykarError::UnsupportedBackend(m)) => {
+                assert!(m.contains("s3_conditional_writes"), "{m}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn conditional_mode_gates_the_capability() {
+        let local = |mode| s3_backend(1, no_retry(), false).with_conditional_writes(mode);
+        assert!(local(S3ConditionalWrites::Off).conditional().is_none());
+        assert!(local(S3ConditionalWrites::Auto).conditional().is_none());
+        assert!(local(S3ConditionalWrites::On).conditional().is_some());
+        let aws = S3Backend::new(
+            "b",
+            "eu-west-1",
+            "",
+            "https://s3.eu-west-1.amazonaws.com",
+            "AKID",
+            "SECRET",
+            no_retry(),
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(aws.conditional().is_some(), "auto trusts AWS");
+        assert!(
+            aws.with_conditional_writes(S3ConditionalWrites::Off)
+                .conditional()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn over_cap_put_if_absent_sends_nothing() {
+        let n = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls = n.clone();
+        let port = serve(move |_| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            ("200 OK", String::new())
+        });
+        let backend = conditional_backend(port, no_retry());
+        let big = vec![0u8; crate::MAX_PUT_IF_ABSENT_BYTES + 1];
+        assert!(matches!(
+            backend.put_if_absent("locks/k", &big),
+            Err(VykarError::InvalidFormat(_))
+        ));
+        assert_eq!(n.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn list_meta_parses_last_modified() {
+        let xml = |modified: &str| {
+            format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+                 <ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+                 <Name>test-bucket</Name><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated>\
+                 <Contents><Key>locks/a</Key><Size>3</Size>\
+                 <LastModified>{modified}</LastModified></Contents></ListBucketResult>"
+            )
+        };
+        let good = xml("2024-01-01T00:00:00.000Z");
+        let port = serve(move |_| ("200 OK", good.clone()));
+        let backend = s3_backend(port, no_retry(), false);
+        let listed = backend.list_meta("locks/").unwrap();
+        assert_eq!(
+            listed,
+            vec![ListedObject {
+                key: "locks/a".into(),
+                size: Some(3),
+                mtime: Some(std::time::UNIX_EPOCH + Duration::from_secs(1_704_067_200)),
+            }]
+        );
+        assert_eq!(backend.list_sized("locks/").unwrap()[0].mtime, None);
+
+        let bad = xml("not a time");
+        let port = serve(move |_| ("200 OK", bad.clone()));
+        let backend = s3_backend(port, no_retry(), false);
+        assert_eq!(backend.list_meta("locks/").unwrap()[0].mtime, None);
+    }
+
+    #[test]
+    fn conformance_against_the_stateful_mock() {
+        let backend = conditional_backend(stateful_s3(), no_retry());
+        crate::conformance::run(&backend, &crate::conformance::ConformanceOptions::default())
+            .unwrap();
+    }
+
+    /// Opt-in run against a real S3 service (MinIO, AWS). Returns at once when
+    /// `VYKAR_TEST_S3_URL` or the keys are unset. With
+    /// `VYKAR_TEST_S3_CONDITIONAL=auto` (AWS) it also asserts that `auto`
+    /// recognises the endpoint.
+    #[test]
+    #[ignore = "set VYKAR_TEST_S3_URL etc. to run against a real S3 service"]
+    fn conformance_real_s3() {
+        let (Ok(url), Ok(key_id), Ok(secret)) = (
+            std::env::var("VYKAR_TEST_S3_URL"),
+            std::env::var("VYKAR_TEST_S3_ACCESS_KEY_ID"),
+            std::env::var("VYKAR_TEST_S3_SECRET_ACCESS_KEY"),
+        ) else {
+            return;
+        };
+        let mode = match std::env::var("VYKAR_TEST_S3_CONDITIONAL").as_deref() {
+            Ok("auto") => S3ConditionalWrites::Auto,
+            _ => S3ConditionalWrites::On,
+        };
+        let cfg = crate::StorageConfig {
+            allow_insecure_http: url.starts_with("s3+http://"),
+            region: std::env::var("VYKAR_TEST_S3_REGION").ok(),
+            access_key_id: Some(key_id),
+            secret_access_key: Some(secret),
+            sftp_key: None,
+            sftp_agent: None,
+            sftp_known_hosts: None,
+            max_connections: None,
+            sftp_timeout: None,
+            access_token: None,
+            retry: RetryConfig::default(),
+            s3_soft_delete: false,
+            s3_conditional_writes: mode,
+            cancel: vykar_types::cancel::CancelToken::new(),
+            url,
+        };
+        let backend = crate::backend_from_config(&cfg).unwrap();
+        assert!(
+            backend.conditional().is_some(),
+            "{mode:?} offers put-if-absent"
+        );
+        crate::conformance::run(
+            &*backend,
+            &crate::conformance::ConformanceOptions::default(),
+        )
+        .unwrap();
     }
 }

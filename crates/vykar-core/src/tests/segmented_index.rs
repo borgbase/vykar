@@ -31,7 +31,14 @@ impl InnerBackend for OpLog {
 
 delegate_storage_backend! {
     for OpLog;
-    except [get, list, list_sized, list_tree_sized];
+    except [get, list, list_sized, list_meta, list_tree_sized];
+
+    fn list_meta(
+        &self,
+        prefix: &str,
+    ) -> vykar_types::error::Result<Vec<vykar_storage::ListedObject>> {
+        self.list_sized(prefix)
+    }
 
     fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
         self.ops.lock().unwrap().push(format!("get {key}"));

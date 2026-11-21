@@ -68,6 +68,11 @@ pub enum ServerError {
     RangeNotSatisfiable(String),
     /// Transient refusal (503); clients retry.
     ServiceUnavailable(String),
+    /// A conditional request's precondition does not hold (412): a
+    /// `PUT` with `If-None-Match: *` on a key that exists.
+    PreconditionFailed(String),
+    /// The request is valid but this server cannot perform it (501).
+    NotImplemented(String),
     Internal(String),
 }
 
@@ -81,6 +86,8 @@ impl std::fmt::Display for ServerError {
             Self::Conflict(msg) => write!(f, "conflict: {msg}"),
             Self::RangeNotSatisfiable(msg) => write!(f, "range not satisfiable: {msg}"),
             Self::ServiceUnavailable(msg) => write!(f, "service unavailable: {msg}"),
+            Self::PreconditionFailed(msg) => write!(f, "precondition failed: {msg}"),
+            Self::NotImplemented(msg) => write!(f, "not implemented: {msg}"),
             Self::Internal(msg) => write!(f, "internal error: {msg}"),
         }
     }
@@ -96,10 +103,17 @@ impl IntoResponse for ServerError {
             Self::Conflict(msg) => (StatusCode::CONFLICT, msg.clone()),
             Self::RangeNotSatisfiable(msg) => (StatusCode::RANGE_NOT_SATISFIABLE, msg.clone()),
             Self::ServiceUnavailable(msg) => (StatusCode::SERVICE_UNAVAILABLE, msg.clone()),
+            Self::PreconditionFailed(msg) => (StatusCode::PRECONDITION_FAILED, msg.clone()),
+            Self::NotImplemented(msg) => (StatusCode::NOT_IMPLEMENTED, msg.clone()),
             Self::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),
         };
-        // Log the full message server-side.
-        tracing::error!(status = %status, error = %message);
+        // Log the full message server-side. A failed precondition is a normal
+        // outcome of put-if-absent, not a server problem.
+        if matches!(self, Self::PreconditionFailed(_)) {
+            tracing::debug!(status = %status, error = %message);
+        } else {
+            tracing::error!(status = %status, error = %message);
+        }
         // Internal errors can carry server paths / io detail (e.g.
         // `From<io::Error>` and repack's path-bearing `format!` strings).
         // Return a generic body so nothing leaks to clients. Other variants are
@@ -141,6 +155,14 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         assert_eq!(&body[..], b"bad key foo");
+    }
+
+    #[test]
+    fn precondition_failed_and_not_implemented_map_to_412_and_501() {
+        let resp = ServerError::PreconditionFailed("object exists".into()).into_response();
+        assert_eq!(resp.status(), StatusCode::PRECONDITION_FAILED);
+        let resp = ServerError::NotImplemented("no".into()).into_response();
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
     }
 
     #[test]

@@ -10,7 +10,10 @@ use russh_sftp::protocol::OpenFlags;
 use tokio::io::AsyncWriteExt;
 use vykar_types::error::{Result, VykarError};
 
-use super::{SftpBackend, SftpConn, is_not_found, posix_join};
+use super::{
+    HardlinkOutcome, SftpBackend, SftpConn, hardlink_no_clobber, is_not_found, posix_join,
+    status_detail,
+};
 use crate::probe::{
     CREATE, CaseResult, Cleanup, Ledger, Outcome, ProbeOptions, REPEAT_OTHER, REPEAT_SAME,
     RaceResult, Report, is_created, is_exists, payload,
@@ -181,17 +184,6 @@ pub async fn run_sftp_sessions(
     ))
 }
 
-fn status_detail(e: &SftpError) -> Option<String> {
-    match e {
-        SftpError::Status(s) => Some(
-            format!("{:?} {}", s.status_code, s.error_message)
-                .trim_end()
-                .to_string(),
-        ),
-        _ => None,
-    }
-}
-
 fn outcome_of(what: &str, e: &SftpError) -> Outcome {
     match status_detail(e) {
         Some(detail) => Outcome::Rejected {
@@ -221,26 +213,14 @@ async fn write_new(s: &SftpSession, path: &str, data: &[u8]) -> std::result::Res
     Ok(())
 }
 
-/// One `hardlink@openssh.com`. A refusal is classified by a `stat` of the
-/// target, never by its status code.
+/// One `hardlink@openssh.com`, classified as the backend classifies it.
 async fn link(s: &SftpSession, from: &str, to: &str) -> Outcome {
-    match s.hardlink(from, to).await {
-        Ok(false) => Outcome::NotAdvertised,
-        Ok(true) => Outcome::Created,
-        Err(e) => {
-            let Some(detail) = status_detail(&e) else {
-                return Outcome::Transport {
-                    detail: e.to_string(),
-                };
-            };
-            match s.metadata(to).await {
-                Ok(_) => Outcome::AlreadyExists { detail },
-                Err(se) if is_not_found(&se) => Outcome::Rejected { detail },
-                Err(se) => Outcome::Transport {
-                    detail: format!("{detail}; stat of target: {se}"),
-                },
-            }
-        }
+    match hardlink_no_clobber(s, from, to).await {
+        HardlinkOutcome::Created => Outcome::Created,
+        HardlinkOutcome::NotAdvertised => Outcome::NotAdvertised,
+        HardlinkOutcome::Exists { detail } => Outcome::AlreadyExists { detail },
+        HardlinkOutcome::Refused { detail, .. } => Outcome::Rejected { detail },
+        HardlinkOutcome::Transport { detail } => Outcome::Transport { detail },
     }
 }
 

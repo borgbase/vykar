@@ -19,9 +19,11 @@ use crate::http_util::HttpTimeouts;
 use crate::retry::HttpRetryError;
 use vykar_types::error::{Result, VykarError};
 
+use crate::conditional::{Verifier, after_verified, check_args};
 use crate::{
-    BatchDeleteScope, ListedObject, RepackPlanRequest, RepackResultResponse, ServerCapabilities,
-    StorageBackend, VerifyPacksPlanRequest, VerifyPacksResponse,
+    BatchDeleteScope, ConditionalSupport, ConditionalWrite, Created, ListedObject,
+    RepackPlanRequest, RepackResultResponse, ServerCapabilities, StorageBackend,
+    VerifyPacksPlanRequest, VerifyPacksResponse,
 };
 use vykar_types::cancel::CancelToken;
 use vykar_types::hash::{HashAlgorithm, Hasher256};
@@ -105,6 +107,8 @@ pub struct RestBackend {
     part_size: usize,
     request_width: usize,
     transfer_width: usize,
+    /// Cache of the put-if-absent check.
+    cond: Verifier,
 }
 
 /// The upload header carrying a content digest under `algo`.
@@ -120,6 +124,7 @@ fn digest_header(algo: HashAlgorithm) -> &'static str {
 struct ProbedCaps {
     pack_parts: bool,
     blake3: bool,
+    conditional_put: bool,
 }
 
 impl From<&ServerCapabilities> for ProbedCaps {
@@ -127,6 +132,7 @@ impl From<&ServerCapabilities> for ProbedCaps {
         Self {
             pack_parts: caps.pack_parts,
             blake3: caps.supports_hash(HashAlgorithm::Blake3),
+            conditional_put: caps.conditional_put,
         }
     }
 }
@@ -180,6 +186,7 @@ impl RestBackend {
             part_size: parts::part_size(),
             request_width: crate::remote_request_width(max_connections),
             transfer_width: crate::transfer_width(max_connections),
+            cond: Verifier::new(),
         })
     }
 
@@ -618,10 +625,77 @@ impl RestBackend {
     }
 }
 
+/// How the server answered a conditional PUT.
+enum ConditionalAnswer {
+    Created,
+    Exists,
+    NotImplemented,
+    /// A success status other than 201: the server acted as if it overwrote.
+    Replaced(u16),
+}
+
 impl RestBackend {
-    /// GET a listing; `sized` adds `&sized` (see [`vykar_protocol::SizedKey`]).
-    fn fetch_listing(&self, prefix: &str, sized: bool, retry: &RetryConfig) -> Result<Vec<u8>> {
-        let query = if sized { "list&sized" } else { "list" };
+    /// The unverified put-if-absent primitive: one whole-object PUT with
+    /// `If-None-Match: *` and the content digest, retried like `put`.
+    /// Never the part path.
+    fn put_if_absent_raw(&self, key: &str, data: &[u8]) -> Result<Created> {
+        let (header, checksum) = match Self::try_extract_pack_hex(key) {
+            Some(pack_hex) => (self.pack_digest_header(), pack_hex.to_string()),
+            None => self.non_pack_digest(data),
+        };
+        let url = self.url(key);
+        let answer = self
+            .retry_call(
+                &format!("PUT_IF_ABSENT {key}"),
+                || {
+                    self.authed(self.agent.put(&url))
+                        .header(header, &checksum)
+                        .header("If-None-Match", "*")
+                        .send(data)
+                },
+                |resp| match resp.status().as_u16() {
+                    201 => Ok(ConditionalAnswer::Created),
+                    412 => Ok(ConditionalAnswer::Exists),
+                    501 => Ok(ConditionalAnswer::NotImplemented),
+                    status @ 200..=299 => Ok(ConditionalAnswer::Replaced(status)),
+                    status => {
+                        let message = format!("REST PUT_IF_ABSENT {key}: HTTP {status}");
+                        crate::retry::classify_status(status, message.clone())?;
+                        Err(HttpRetryError::Permanent(message))
+                    }
+                },
+            )
+            .map_err(|e| rest_error(format_args!("PUT_IF_ABSENT {key}"), e))?;
+        match answer {
+            ConditionalAnswer::Created => Ok(Created::Yes),
+            ConditionalAnswer::Exists => Ok(Created::AlreadyExists),
+            ConditionalAnswer::NotImplemented => Err(VykarError::UnsupportedBackend(
+                "vykar-server: conditional PUT not implemented on its storage".into(),
+            )),
+            ConditionalAnswer::Replaced(s) => Err(VykarError::UnsupportedBackend(format!(
+                "vykar-server answered {s} to a conditional PUT (overwrote?)"
+            ))),
+        }
+    }
+}
+
+impl ConditionalWrite for RestBackend {
+    fn put_if_absent(&self, key: &str, data: &[u8]) -> Result<Created> {
+        check_args(key, data)?;
+        self.cond
+            .require("vykar-server", self, &|k, d| self.put_if_absent_raw(k, d))?;
+        after_verified(self.put_if_absent_raw(key, data))
+    }
+
+    fn verify(&self) -> Result<ConditionalSupport> {
+        self.cond.verify(self, &|k, d| self.put_if_absent_raw(k, d))
+    }
+}
+
+impl RestBackend {
+    /// GET a listing; `query` is `list`, `list&sized` or `list&sized&mtime`
+    /// (see [`vykar_protocol::SizedKey`]).
+    fn fetch_listing(&self, prefix: &str, query: &str, retry: &RetryConfig) -> Result<Vec<u8>> {
         let prefix = prefix.trim_start_matches('/');
         let url = if prefix.is_empty() {
             format!("{}?{query}", self.base_url)
@@ -655,7 +729,7 @@ impl RestBackend {
     }
 
     /// Parse a `?list&sized` body. A server that predates `sized` ignores it
-    /// and returns bare keys.
+    /// and returns bare keys; one that predates `&mtime` omits `mtime_ms`.
     fn parse_sized_listing(body: &[u8]) -> Result<Vec<ListedObject>> {
         #[derive(serde::Deserialize)]
         #[serde(untagged)]
@@ -671,11 +745,18 @@ impl RestBackend {
                 .map(|k| ListedObject {
                     key: k.key,
                     size: Some(k.size),
+                    mtime: k
+                        .mtime_ms
+                        .map(|ms| std::time::UNIX_EPOCH + Duration::from_millis(ms)),
                 })
                 .collect(),
             Listing::Plain(keys) => keys
                 .into_iter()
-                .map(|key| ListedObject { key, size: None })
+                .map(|key| ListedObject {
+                    key,
+                    size: None,
+                    mtime: None,
+                })
                 .collect(),
         })
     }
@@ -833,13 +914,18 @@ impl StorageBackend for RestBackend {
     fn list(&self, prefix: &str) -> Result<Vec<String>> {
         // Plain listing: sizes would roughly double large pack listings only
         // to be discarded.
-        let body = self.fetch_listing(prefix, false, &self.retry)?;
+        let body = self.fetch_listing(prefix, "list", &self.retry)?;
         serde_json::from_slice(&body)
             .map_err(|e| VykarError::Other(format!("REST LIST parse: {e}")))
     }
 
     fn list_sized(&self, prefix: &str) -> Result<Vec<ListedObject>> {
-        let body = self.fetch_listing(prefix, true, &self.retry)?;
+        let body = self.fetch_listing(prefix, "list&sized", &self.retry)?;
+        Self::parse_sized_listing(&body)
+    }
+
+    fn list_meta(&self, prefix: &str) -> Result<Vec<ListedObject>> {
+        let body = self.fetch_listing(prefix, "list&sized&mtime", &self.retry)?;
         Self::parse_sized_listing(&body)
     }
 
@@ -1027,8 +1113,16 @@ impl StorageBackend for RestBackend {
             max_retries: 0,
             ..self.retry
         };
-        let body = self.fetch_listing(prefix, true, &retry)?;
+        let body = self.fetch_listing(prefix, "list&sized", &retry)?;
         Self::parse_sized_listing(&body)
+    }
+
+    /// Offered when `/health` advertises `conditional_put` (probed on first
+    /// need; see [`StorageBackend::conditional`] for a failed probe) and no
+    /// check on this instance concluded `Unsupported`.
+    fn conditional(&self) -> Option<&dyn ConditionalWrite> {
+        (self.probed_caps().conditional_put && !self.cond.refused())
+            .then_some(self as &dyn ConditionalWrite)
     }
 
     fn profile(&self) -> crate::BackendProfile {
@@ -1359,7 +1453,8 @@ mod tests {
             backend.list_sized("packs").unwrap(),
             vec![ListedObject {
                 key: "packs/ab/x".into(),
-                size: Some(42)
+                size: Some(42),
+                mtime: None,
             }]
         );
         let request = request.join().unwrap();
@@ -1376,11 +1471,13 @@ mod tests {
             vec![
                 ListedObject {
                     key: "config".into(),
-                    size: None
+                    size: None,
+                    mtime: None,
                 },
                 ListedObject {
                     key: "index".into(),
-                    size: None
+                    size: None,
+                    mtime: None,
                 },
             ]
         );
@@ -1399,11 +1496,13 @@ mod tests {
             vec![
                 ListedObject {
                     key: "packs/00/a".into(),
-                    size: Some(1)
+                    size: Some(1),
+                    mtime: None,
                 },
                 ListedObject {
                     key: "packs/ff/b".into(),
-                    size: Some(2)
+                    size: Some(2),
+                    mtime: None,
                 },
             ]
         );
@@ -2410,5 +2509,142 @@ mod tests {
         let seen = seen.lock().unwrap().clone();
         assert_eq!(count(&seen, is_whole), 0, "{seen:#?}");
         assert!(!backend.parts_disabled.load(Ordering::Relaxed));
+    }
+    // ── Conditional PUT and list_meta ───────────────────────────────────────
+
+    const HEALTH_COND: &str = r#"{"status":"ok","version":"0.25.0","protocol_version":2,"hashes":["blake2b","blake3"],"pack_parts":true,"conditional_put":true}"#;
+
+    #[test]
+    fn conditional_is_none_without_the_capability() {
+        let (url, seen) = routing_server(|line| {
+            if line.starts_with("GET /health") {
+                json_response(HEALTH_PARTS)
+            } else {
+                empty("201 Created")
+            }
+        });
+        let backend = RestBackend::new(&url, None, no_retry(), None).unwrap();
+        assert!(backend.conditional().is_none());
+        assert!(backend.conditional().is_none());
+        let seen = seen.lock().unwrap();
+        assert_eq!(count(&seen, |s| s.line.starts_with("GET /health")), 1);
+        assert_eq!(count(&seen, |s| s.line.starts_with("PUT ")), 0, "{seen:#?}");
+    }
+
+    #[test]
+    fn conditional_put_sends_if_none_match_and_maps_statuses() {
+        for (status, expected) in [
+            ("201 Created", Some(Created::Yes)),
+            ("412 Precondition Failed", Some(Created::AlreadyExists)),
+            ("204 No Content", None),
+            ("200 OK", None),
+            ("501 Not Implemented", None),
+        ] {
+            let (url, seen) = routing_server(move |line| {
+                if line.starts_with("GET /health") {
+                    json_response(HEALTH_COND)
+                } else {
+                    empty(status)
+                }
+            });
+            let backend = RestBackend::new(&url, None, no_retry(), None).unwrap();
+            assert!(backend.conditional().is_some());
+            let got = backend.put_if_absent_raw("locks/k", b"data");
+            match expected {
+                Some(want) => assert_eq!(got.unwrap(), want, "{status}"),
+                None => assert!(
+                    matches!(got, Err(VykarError::UnsupportedBackend(_))),
+                    "{status}: {got:?}"
+                ),
+            }
+            let seen = seen.lock().unwrap();
+            let puts: Vec<_> = seen.iter().filter(|s| s.line.starts_with("PUT ")).collect();
+            assert_eq!(puts.len(), 1, "{seen:#?}");
+            assert_eq!(puts[0].line, "PUT /locks/k");
+            let head = puts[0].head.to_ascii_lowercase();
+            assert!(head.contains("if-none-match: *"), "{head}");
+            let b3 = hex_digest(HashAlgorithm::Blake3, b"data");
+            assert!(head.contains(&format!("x-content-blake3: {b3}")), "{head}");
+            assert_eq!(puts[0].body, b"data");
+        }
+    }
+
+    #[test]
+    fn conditional_put_retries_a_503() {
+        let n = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls = n.clone();
+        let (url, _seen) = routing_server(move |line| {
+            if line.starts_with("GET /health") {
+                json_response(HEALTH_COND)
+            } else if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                empty("503 Service Unavailable")
+            } else {
+                empty("201 Created")
+            }
+        });
+        let backend = RestBackend::new(&url, None, fast_retry(), None).unwrap();
+        assert_eq!(
+            backend.put_if_absent_raw("locks/k", b"d").unwrap(),
+            Created::Yes
+        );
+        assert_eq!(n.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn conditional_501_makes_verify_unsupported() {
+        let (url, seen) = routing_server(|line| {
+            if line.starts_with("GET /health") {
+                json_response(HEALTH_COND)
+            } else if line.starts_with("PUT ") {
+                empty("501 Not Implemented")
+            } else {
+                empty("204 No Content")
+            }
+        });
+        let backend = RestBackend::new(&url, None, no_retry(), None).unwrap();
+        let cond = backend.conditional().expect("advertised");
+        assert!(matches!(
+            cond.verify().unwrap(),
+            ConditionalSupport::Unsupported { .. }
+        ));
+        assert!(backend.conditional().is_none());
+        assert!(matches!(
+            backend.put_if_absent("locks/x", b"x"),
+            Err(VykarError::UnsupportedBackend(_))
+        ));
+        let seen = seen.lock().unwrap();
+        assert_eq!(count(&seen, |s| s.line.starts_with("PUT ")), 1, "cached");
+    }
+
+    #[test]
+    fn list_meta_requests_and_parses_mtime() {
+        let (url, request) = capture_request(&json_response(
+            r#"[{"key":"locks/a","size":3,"mtime_ms":1700000000123}]"#,
+        ));
+        let backend = RestBackend::new(&url, None, no_retry(), None).unwrap();
+        assert_eq!(
+            backend.list_meta("locks").unwrap(),
+            vec![ListedObject {
+                key: "locks/a".into(),
+                size: Some(3),
+                mtime: Some(std::time::UNIX_EPOCH + Duration::from_millis(1_700_000_000_123)),
+            }]
+        );
+        let request = request.join().unwrap();
+        assert!(
+            request.starts_with("GET /locks?list&sized&mtime "),
+            "got:\n{request}"
+        );
+
+        // A server older than `&mtime` answers as for `?list&sized`.
+        let (url, _r) = capture_request(&json_response(r#"[{"key":"locks/a","size":3}]"#));
+        let backend = RestBackend::new(&url, None, no_retry(), None).unwrap();
+        assert_eq!(backend.list_meta("locks").unwrap()[0].mtime, None);
+
+        // And one older than `sized` with bare keys.
+        let (url, _r) = capture_request(&json_response(r#"["locks/a"]"#));
+        let backend = RestBackend::new(&url, None, no_retry(), None).unwrap();
+        let listed = backend.list_meta("locks").unwrap();
+        assert_eq!((listed[0].size, listed[0].mtime), (None, None));
     }
 }

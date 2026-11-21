@@ -6,13 +6,18 @@ use crate::error::ServerError;
 use crate::handlers::objects::list_response;
 use crate::state::AppState;
 
-/// GET /?list - list all keys in the repository; `&sized` adds sizes.
-pub(super) async fn repo_list_all(state: AppState, sized: bool) -> Result<Response, ServerError> {
+/// GET /?list - list all keys in the repository; `&sized` adds sizes, and
+/// `&sized&mtime` also modification times.
+pub(super) async fn repo_list_all(
+    state: AppState,
+    sized: bool,
+    mtime: bool,
+) -> Result<Response, ServerError> {
     let data_dir = state.inner.data_dir.clone();
 
     let keys = tokio::task::spawn_blocking(move || -> std::io::Result<Vec<SizedKey>> {
         let mut keys = Vec::new();
-        list_all_recursive(&data_dir, &data_dir, &mut keys)?;
+        list_all_recursive(&data_dir, &data_dir, mtime, &mut keys)?;
         keys.sort_by(|a, b| a.key.cmp(&b.key));
         Ok(keys)
     })
@@ -27,6 +32,7 @@ pub(super) async fn repo_list_all(state: AppState, sized: bool) -> Result<Respon
 fn list_all_recursive(
     dir: &std::path::Path,
     root: &std::path::Path,
+    mtime: bool,
     out: &mut Vec<SizedKey>,
 ) -> std::io::Result<()> {
     for entry in std::fs::read_dir(dir)? {
@@ -37,7 +43,7 @@ fn list_all_recursive(
             continue;
         };
         if meta.is_dir() {
-            list_all_recursive(&path, root, out)?;
+            list_all_recursive(&path, root, mtime, out)?;
         } else if let Ok(rel) = path.strip_prefix(root) {
             // Use forward slashes for storage keys regardless of platform.
             let key: String = rel
@@ -49,6 +55,11 @@ fn list_all_recursive(
                 out.push(SizedKey {
                     key,
                     size: meta.len(),
+                    mtime_ms: if mtime {
+                        crate::handlers::objects::mtime_ms(&meta)
+                    } else {
+                        None
+                    },
                 });
             }
         }
@@ -101,10 +112,12 @@ mod tests {
             vykar_protocol::SizedKey {
                 key: "config".into(),
                 size: 3,
+                mtime_ms: None,
             },
             vykar_protocol::SizedKey {
                 key: pack.clone(),
                 size: 1234,
+                mtime_ms: None,
             },
         ];
 
@@ -119,6 +132,18 @@ mod tests {
         let keys: Vec<vykar_protocol::SizedKey> =
             serde_json::from_slice(&body_bytes(resp).await).unwrap();
         assert_eq!(keys, expected[1..]);
+
+        // Without `&mtime` the JSON carries no `mtime_ms` key at all.
+        let resp = authed_get(router.clone(), "/?list&sized").await;
+        let raw = String::from_utf8(body_bytes(resp).await).unwrap();
+        assert!(!raw.contains("mtime_ms"), "{raw}");
+
+        let resp = authed_get(router.clone(), "/?list&sized&mtime").await;
+        assert_status(&resp, StatusCode::OK);
+        let keys: Vec<vykar_protocol::SizedKey> =
+            serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(keys.len(), 2);
+        assert!(keys.iter().all(|k| k.mtime_ms.is_some()), "{keys:?}");
 
         // Without `sized`, bare keys as before.
         let resp = authed_get(router, "/packs?list").await;

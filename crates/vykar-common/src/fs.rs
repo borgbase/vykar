@@ -18,6 +18,22 @@ use std::fs::File;
 use std::io;
 use std::path::Path;
 
+/// Whether an error from a no-clobber rename or link (tempfile's
+/// `persist_noclobber`, `link(2)`) means the filesystem cannot do it at all,
+/// as opposed to "the target exists": the `Unsupported` and `CrossesDevices`
+/// kinds, and `EPERM` on unix (`link(2)` on a filesystem without hard links,
+/// such as FAT or exFAT).
+#[must_use]
+pub fn is_no_clobber_unsupported(e: &io::Error) -> bool {
+    if matches!(
+        e.kind(),
+        io::ErrorKind::Unsupported | io::ErrorKind::CrossesDevices
+    ) {
+        return true;
+    }
+    cfg!(unix) && e.raw_os_error() == Some(1)
+}
+
 /// Open `dir` and fsync it so its newly-created/renamed entries become
 /// durable.
 ///

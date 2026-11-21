@@ -361,8 +361,13 @@ mod server_side {
         for ServerRepackBackend;
         except [
             put, delete, put_owned, put_pack, begin_staged_put, server_repack, batch_delete_keys,
-            profile,
+            conditional, profile
         ];
+
+        // Test wrapper: keeps every write on `put`.
+        fn conditional(&self) -> Option<&dyn vykar_storage::ConditionalWrite> {
+            None
+        }
 
         // Keep packs on the intercepted `put` path.
         fn begin_staged_put(

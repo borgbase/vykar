@@ -16,6 +16,8 @@ pub struct ObjectQuery {
     pub list: Option<String>,
     /// With `list`: return [`vykar_protocol::SizedKey`] entries instead of bare keys.
     pub sized: Option<String>,
+    /// With `list&sized`: add `mtime_ms` to every entry.
+    pub mtime: Option<String>,
     pub mkdir: Option<String>,
     /// POST: report the sizes of a JSON list of keys (see `object_sizes`).
     pub sizes: Option<String>,
@@ -36,7 +38,7 @@ pub async fn get_or_list(
     headers: HeaderMap,
 ) -> Result<Response, ServerError> {
     if query.list.is_some() {
-        return list_keys(state, &key, query.sized.is_some()).await;
+        return list_keys(state, &key, query.sized.is_some(), query.mtime.is_some()).await;
     }
 
     let file_path = state
@@ -112,6 +114,12 @@ pub async fn head_object(
 
 /// PUT /{*path} — write object. Enforces append-only and quota.
 ///
+/// `If-None-Match: *` makes it a create-only PUT: 412 when the key exists,
+/// decided atomically by a no-clobber rename, and checked before append-only
+/// and quota (a create-only PUT never overwrites, so "exists" is the answer
+/// in every mode). Any other `If-None-Match` value is a 400. 501 when the
+/// data directory's filesystem cannot rename without replacing.
+///
 /// Streams the request body to a temp file to avoid buffering large uploads
 /// in memory. Atomic rename on completion.
 ///
@@ -129,6 +137,15 @@ pub async fn put_object(
     if let Some(token) = query.upload.as_deref() {
         return super::parts::put_part(state, &key, token, &query, &headers, body).await;
     }
+    let conditional = match headers.get(axum::http::header::IF_NONE_MATCH) {
+        None => false,
+        Some(v) if v.to_str().is_ok_and(|s| s.trim() == "*") => true,
+        Some(_) => {
+            return Err(ServerError::BadRequest(
+                "If-None-Match on PUT supports only *".into(),
+            ));
+        }
+    };
 
     let file_path = state
         .file_path(&key)
@@ -140,6 +157,12 @@ pub async fn put_object(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => return Err(ServerError::from(e)),
     };
+
+    // Before append-only, quota and the body: the fast path of create-only.
+    // The no-clobber rename below decides a race with a concurrent creator.
+    if conditional && existing_meta.is_some() {
+        return Err(ServerError::PreconditionFailed("object exists".into()));
+    }
 
     // Append-only: an existing object may be replaced only where the key-class
     // table allows it (`vykar_protocol::KeyClass`).
@@ -309,9 +332,7 @@ pub async fn put_object(
             _ => None,
         };
         let mut slot = state.lock_index_validator();
-        temp_path
-            .persist(&file_path)
-            .map_err(|e| ServerError::from(e.error))?;
+        persist_temp(temp_path, &file_path, conditional)?;
         let fingerprint = std::fs::metadata(&file_path)
             .ok()
             .as_ref()
@@ -325,9 +346,7 @@ pub async fn put_object(
                 },
             );
     } else {
-        temp_path
-            .persist(&file_path)
-            .map_err(|e| ServerError::from(e.error))?;
+        persist_temp(temp_path, &file_path, conditional)?;
     }
 
     // Commit the reservation (moves reserved bytes into committed usage) right
@@ -359,6 +378,36 @@ pub async fn put_object(
         StatusCode::CREATED
     };
     Ok(status.into_response())
+}
+
+/// Rename a finished upload into place: replacing, or for a create-only PUT
+/// with a no-clobber rename. On error the temp file is dropped (unlinked) and
+/// the caller's quota reservation released with it.
+fn persist_temp(
+    temp_path: tempfile::TempPath,
+    file_path: &std::path::Path,
+    conditional: bool,
+) -> Result<(), ServerError> {
+    if !conditional {
+        return temp_path
+            .persist(file_path)
+            .map(drop)
+            .map_err(|e| ServerError::from(e.error));
+    }
+    match temp_path.persist_noclobber(file_path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err(ServerError::PreconditionFailed("object exists".into()))
+        }
+        Err(e) if vykar_common::fs::is_no_clobber_unsupported(&e.error) => {
+            Err(ServerError::NotImplemented(
+                "conditional PUT: the data directory's filesystem cannot create without \
+                 replacing"
+                    .into(),
+            ))
+        }
+        Err(e) => Err(ServerError::from(e.error)),
+    }
 }
 
 /// DELETE /{*path} — delete object. Append-only: per the key-class table.
@@ -673,15 +722,21 @@ async fn object_sizes(state: AppState, dir: &str, body: &[u8]) -> Result<Respons
     Ok(axum::Json(sizes).into_response())
 }
 
-async fn list_keys(state: AppState, prefix: &str, sized: bool) -> Result<Response, ServerError> {
+async fn list_keys(
+    state: AppState,
+    prefix: &str,
+    sized: bool,
+    mtime: bool,
+) -> Result<Response, ServerError> {
     let dir_path = state
         .file_path(prefix)
         .ok_or_else(|| ServerError::BadRequest("invalid path".into()))?;
 
     let prefix_owned = prefix.to_string();
-    let keys = tokio::task::spawn_blocking(move || list_files_recursive(&dir_path, &prefix_owned))
-        .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?;
+    let keys =
+        tokio::task::spawn_blocking(move || list_files_recursive(&dir_path, &prefix_owned, mtime))
+            .await
+            .map_err(|e| ServerError::Internal(e.to_string()))?;
 
     Ok(list_response(keys, sized))
 }
@@ -696,8 +751,21 @@ pub(crate) fn list_response(keys: Vec<SizedKey>, sized: bool) -> Response {
     }
 }
 
+/// A file's mtime in ms since the Unix epoch, for `?list&sized&mtime`;
+/// `None` when the platform does not report one or it predates the epoch.
+pub(crate) fn mtime_ms(meta: &std::fs::Metadata) -> Option<u64> {
+    let since = meta
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?;
+    u64::try_from(since.as_millis()).ok()
+}
+
 /// Sizes follow symlinks, matching what HEAD reports for the same key.
-fn list_files_recursive(dir: &std::path::Path, prefix: &str) -> Vec<SizedKey> {
+/// `mtime` fills [`SizedKey::mtime_ms`]; without it the field stays `None`
+/// and is not serialized.
+fn list_files_recursive(dir: &std::path::Path, prefix: &str, mtime: bool) -> Vec<SizedKey> {
     let mut keys = Vec::new();
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
@@ -712,11 +780,12 @@ fn list_files_recursive(dir: &std::path::Path, prefix: &str) -> Vec<SizedKey> {
                 continue;
             };
             if meta.is_dir() {
-                keys.extend(list_files_recursive(&path, &full_key));
+                keys.extend(list_files_recursive(&path, &full_key, mtime));
             } else if !vykar_protocol::is_temp_file(&full_key) {
                 keys.push(SizedKey {
                     key: full_key,
                     size: meta.len(),
+                    mtime_ms: if mtime { mtime_ms(&meta) } else { None },
                 });
             }
         }
@@ -2095,5 +2164,167 @@ mod tests {
 
         let resp = authed_put_with_blake2b(router, &pack_path, data, &checksum).await;
         assert_status(&resp, StatusCode::CREATED);
+    }
+    // ── Conditional PUT (`If-None-Match: *`) ──────────────────────────────
+
+    async fn put_if_none_match(
+        router: axum::Router,
+        path: &str,
+        value: &str,
+        body: Vec<u8>,
+    ) -> axum::response::Response {
+        use tower::ServiceExt;
+        let req = authed_request("PUT", path)
+            .header("Content-Length", body.len().to_string())
+            .header("If-None-Match", value)
+            .body(Body::from(body))
+            .unwrap();
+        router.oneshot(req).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn conditional_put_creates_then_refuses_with_412() {
+        let (router, state, tmp) = setup_app(1_000_000);
+        let resp = put_if_none_match(router.clone(), "/locks/a", "*", b"first".to_vec()).await;
+        assert_status(&resp, StatusCode::CREATED);
+        let used = state.quota_used();
+
+        let resp = put_if_none_match(router.clone(), "/locks/a", "*", b"second".to_vec()).await;
+        assert_status(&resp, StatusCode::PRECONDITION_FAILED);
+        assert_eq!(std::fs::read(tmp.path().join("locks/a")).unwrap(), b"first");
+        assert_eq!(state.quota_used(), used, "a 412 commits nothing");
+        assert_eq!(state.quota_reserved(), 0);
+        assert_no_temp_files(tmp.path());
+    }
+
+    #[tokio::test]
+    async fn conditional_put_rejects_other_if_none_match_values() {
+        let (router, _state, tmp) = setup_app(0);
+        let resp = put_if_none_match(router, "/locks/a", "\"abc\"", b"x".to_vec()).await;
+        assert_status(&resp, StatusCode::BAD_REQUEST);
+        assert!(!tmp.path().join("locks/a").exists());
+    }
+
+    /// Create-only answers "exists" before the append-only refusal.
+    #[tokio::test]
+    async fn conditional_put_on_existing_write_once_key_is_412_in_append_only() {
+        let (router, _state, tmp) = setup_app_append_only(0);
+        let resp = authed_put(router.clone(), CONFIG_PATH, b"cfg".to_vec()).await;
+        assert_status(&resp, StatusCode::CREATED);
+        let resp = put_if_none_match(router.clone(), CONFIG_PATH, "*", b"other".to_vec()).await;
+        assert_status(&resp, StatusCode::PRECONDITION_FAILED);
+        assert_eq!(std::fs::read(tmp.path().join("config")).unwrap(), b"cfg");
+        // A plain overwrite is still refused as before.
+        let resp = authed_put(router, CONFIG_PATH, b"other".to_vec()).await;
+        assert_status(&resp, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn conditional_put_of_index_creates_then_refuses() {
+        let (router, _state, tmp) = setup_app(0);
+        let resp = put_if_none_match(router.clone(), "/index", "*", b"i1".to_vec()).await;
+        assert_status(&resp, StatusCode::CREATED);
+        let resp = put_if_none_match(router, "/index", "*", b"i2".to_vec()).await;
+        assert_status(&resp, StatusCode::PRECONDITION_FAILED);
+        assert_eq!(std::fs::read(tmp.path().join("index")).unwrap(), b"i1");
+    }
+
+    /// The race path: the target appears after the existence check, while the
+    /// body is still streaming. The no-clobber rename must refuse it (412),
+    /// leave the other writer's bytes, and release the reservation.
+    async fn conditional_put_loses_race(key: &str) {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+        use tower::ServiceExt;
+
+        let (router, state, tmp) = setup_app(1_000_000);
+        let target = tmp.path().join(key);
+        let dir = target.parent().unwrap().to_path_buf();
+        let used = state.quota_used();
+
+        let release = Arc::new(AtomicBool::new(false));
+        let gate = Arc::clone(&release);
+        let body = b"loser".to_vec();
+        let stream = futures_util::stream::unfold(Some(body.clone()), move |chunk| {
+            let gate = Arc::clone(&gate);
+            async move {
+                let chunk = chunk?;
+                while !gate.load(Ordering::SeqCst) {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                Some((
+                    Ok::<_, std::io::Error>(axum::body::Bytes::from(chunk)),
+                    None,
+                ))
+            }
+        });
+        let req = authed_request("PUT", &format!("/{key}"))
+            .header("Content-Length", body.len().to_string())
+            .header("If-None-Match", "*")
+            .body(Body::from_stream(stream))
+            .unwrap();
+        let handle = tokio::spawn(router.oneshot(req));
+
+        // The temp file exists once the handler is past the existence check
+        // and the quota reservation, and is waiting for the body.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while temp_file_count(&dir) == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no temp file appeared"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        std::fs::write(&target, b"winner").unwrap();
+        release.store(true, Ordering::SeqCst);
+
+        let resp = handle.await.unwrap().unwrap();
+        assert_status(&resp, StatusCode::PRECONDITION_FAILED);
+        assert_eq!(std::fs::read(&target).unwrap(), b"winner");
+        assert_eq!(state.quota_used(), used, "a lost race commits nothing");
+        assert_eq!(state.quota_reserved(), 0, "the reservation is released");
+        assert_eq!(temp_file_count(&dir), 0);
+    }
+
+    #[tokio::test]
+    async fn conditional_put_race_is_decided_by_the_rename() {
+        conditional_put_loses_race("locks/raced").await;
+    }
+
+    #[tokio::test]
+    async fn conditional_put_race_is_decided_by_the_rename_for_index() {
+        conditional_put_loses_race("index").await;
+    }
+
+    #[tokio::test]
+    async fn list_mtime_is_added_only_on_request() {
+        let (router, _state, _tmp) = setup_app(0);
+        let resp = authed_put(router.clone(), "/locks/a", b"abc".to_vec()).await;
+        assert_status(&resp, StatusCode::CREATED);
+
+        let resp = authed_get(router.clone(), "/locks?list&sized").await;
+        let raw = body_bytes(resp).await;
+        let json: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(json, serde_json::json!([{"key": "locks/a", "size": 3}]));
+
+        let resp = authed_get(router, "/locks?list&sized&mtime").await;
+        let keys: Vec<vykar_protocol::SizedKey> =
+            serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        let now_ms = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap();
+        let [k] = keys.as_slice() else {
+            panic!("one key expected: {keys:?}");
+        };
+        let mtime = k.mtime_ms.expect("mtime_ms requested");
+        assert!(
+            now_ms.abs_diff(mtime) < 60_000,
+            "mtime {mtime}, now {now_ms}"
+        );
     }
 }

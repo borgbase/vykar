@@ -264,3 +264,30 @@ fn find(dir: &Path, name: &str) -> PathBuf {
     }
     walk(dir, name).unwrap_or_else(|| panic!("{name} not found below {}", dir.display()))
 }
+
+/// The put-if-absent and `list_meta` conformance suite through `RestBackend`
+/// against the server, in both modes. `locks/` is ephemeral, so the suite's
+/// deletes are allowed in append-only mode too.
+#[test]
+fn conditional_conformance_suite_passes() {
+    use vykar_storage::StorageBackend;
+    for append_only in [false, true] {
+        let server = Server::start(append_only);
+        let backend = vykar_storage::rest_backend::RestBackend::new(
+            &server.url,
+            Some(TOKEN),
+            vykar_storage::RetryConfig {
+                max_retries: 0,
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        assert!(backend.conditional().is_some(), "the server advertises it");
+        vykar_storage::conformance::run(
+            &backend,
+            &vykar_storage::conformance::ConformanceOptions::default(),
+        )
+        .unwrap_or_else(|e| panic!("append_only={append_only}: {e}"));
+    }
+}

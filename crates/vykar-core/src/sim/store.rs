@@ -733,6 +733,7 @@ impl vykar_storage::StorageBackend for SimClient {
                 .map(|(k, o)| ListedObject {
                     key: k.clone(),
                     size: Some(o.data.len() as u64),
+                    mtime: None,
                 })
                 .collect();
             let n = listed.len() as u64;

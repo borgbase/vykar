@@ -57,6 +57,10 @@ pub struct RepositoryEntry {
     #[serde(default)]
     pub s3_soft_delete: bool,
 
+    /// Put-if-absent on S3: auto, on or off.
+    #[serde(default)]
+    pub s3_conditional_writes: S3ConditionalWrites,
+
     /// Per-repository resource limits (full override of top-level `limits`).
     pub limits: Option<ResourceLimitsConfig>,
 
@@ -85,6 +89,7 @@ impl RepositoryEntry {
             max_pack_size: self.max_pack_size.unwrap_or_else(default_max_pack_size),
             retry: self.retry.unwrap_or_default(),
             s3_soft_delete: self.s3_soft_delete,
+            s3_conditional_writes: self.s3_conditional_writes,
         }
     }
 }
@@ -233,6 +238,39 @@ compression:
             msg.contains("levelz") || msg.contains("unknown field"),
             "expected unknown-field error, got: {msg}"
         );
+    }
+
+    /// `on`/`off` stay strings under the strict YAML booleans, so all three
+    /// values parse to the enum; an absent key is `auto`.
+    #[test]
+    fn test_s3_conditional_writes_values() {
+        use super::super::super::types::S3ConditionalWrites;
+        let parse = |line: &str| {
+            let yaml =
+                format!("repositories:\n  - url: /tmp/repo\n{line}sources:\n  - /home/user\n");
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("config.yaml");
+            fs::write(&path, yaml).unwrap();
+            load_and_resolve(&path).map(|r| r[0].config.repository.clone())
+        };
+        for (value, want) in [
+            ("on", S3ConditionalWrites::On),
+            ("off", S3ConditionalWrites::Off),
+            ("auto", S3ConditionalWrites::Auto),
+        ] {
+            let repo = parse(&format!("    s3_conditional_writes: {value}\n")).unwrap();
+            assert_eq!(repo.s3_conditional_writes, want, "{value}");
+            assert_eq!(
+                repo.storage_config(1).s3_conditional_writes,
+                want,
+                "{value}"
+            );
+        }
+        assert_eq!(
+            parse("").unwrap().s3_conditional_writes,
+            S3ConditionalWrites::Auto
+        );
+        assert!(parse("    s3_conditional_writes: always\n").is_err());
     }
 
     #[test]

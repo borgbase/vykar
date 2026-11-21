@@ -60,6 +60,17 @@ fn resolve(state: &AppState, key: &str, token: &str) -> Result<(PathBuf, PathBuf
     Ok((file_path, temp))
 }
 
+/// Part uploads are never conditional: silently ignoring `If-None-Match`
+/// there would be a false guarantee, so a request carrying it is refused.
+fn refuse_conditional(headers: &HeaderMap) -> Result<(), ServerError> {
+    if headers.contains_key(axum::http::header::IF_NONE_MATCH) {
+        return Err(ServerError::BadRequest(
+            "conditional part uploads are not supported".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// `PUT /packs/<xx>/<id>?upload=<token>&offset=<n>&total=<size>`.
 pub(crate) async fn put_part(
     state: AppState,
@@ -69,6 +80,7 @@ pub(crate) async fn put_part(
     headers: &HeaderMap,
     body: axum::body::Body,
 ) -> Result<Response, ServerError> {
+    refuse_conditional(headers)?;
     let (file_path, temp) = resolve(&state, key, token)?;
     let (Some(offset), Some(total)) = (query.offset, query.total) else {
         return Err(ServerError::BadRequest(
@@ -162,6 +174,7 @@ pub(crate) async fn complete_upload(
     token: &str,
     headers: &HeaderMap,
 ) -> Result<Response, ServerError> {
+    refuse_conditional(headers)?;
     let (file_path, temp) = resolve(&state, key, token)?;
     let (algo, expected) = parse_expected_digest(headers, true)?
         .ok_or_else(|| ServerError::BadRequest("content digest required".into()))?;
@@ -441,6 +454,26 @@ mod tests {
         assert!(caps.segmented_index);
         assert!(caps.serves_v6_key_dirs());
         assert_eq!(caps.key_dirs, vykar_protocol::KNOWN_ROOT_DIRS);
+        assert!(caps.conditional_put);
+    }
+
+    #[tokio::test]
+    async fn parts_refuse_if_none_match() {
+        let (router, _state, _tmp) = setup_app(0);
+        let (data, _id, path) = pack(1000);
+        let uri = format!("{path}?upload={TOKEN}&offset=0&total={}", data.len());
+        let resp = send(
+            router.clone(),
+            "PUT",
+            &uri,
+            &[("If-None-Match", "*")],
+            data.clone(),
+        )
+        .await;
+        assert_status(&resp, StatusCode::BAD_REQUEST);
+        let uri = format!("{path}?complete&upload={TOKEN}");
+        let resp = send(router, "POST", &uri, &[("If-None-Match", "*")], Vec::new()).await;
+        assert_status(&resp, StatusCode::BAD_REQUEST);
     }
 
     /// Parts in any order, one sent twice; the assembled object is exactly

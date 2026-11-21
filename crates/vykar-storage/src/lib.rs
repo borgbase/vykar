@@ -20,6 +20,9 @@ pub mod s3_backend;
 #[cfg(feature = "backend-sftp")]
 pub mod sftp_backend;
 
+mod conditional;
+#[doc(hidden)]
+pub mod conformance;
 mod delegate;
 mod http_util;
 mod retry;
@@ -27,6 +30,9 @@ mod retry;
 #[doc(hidden)]
 pub use delegate::__macro_support;
 pub use delegate::InnerBackend;
+
+pub use conditional::{ConditionalSupport, ConditionalWrite, Created, MAX_PUT_IF_ABSENT_BYTES};
+// `S3ConditionalWrites` is defined below, next to `StorageConfig`.
 
 #[cfg(feature = "backend-sftp")]
 pub(crate) mod runtime;
@@ -251,8 +257,22 @@ pub trait StorageBackend: Send + Sync {
         Ok(self
             .list(prefix)?
             .into_iter()
-            .map(|key| ListedObject { key, size: None })
+            .map(|key| ListedObject {
+                key,
+                size: None,
+                mtime: None,
+            })
             .collect())
+    }
+
+    /// Like [`Self::list_sized`], plus each object's last-modified time by
+    /// the storage's clock where the backend reports it (local: filesystem
+    /// mtime; SFTP: readdir mtime, 1 s resolution; S3: `LastModified`;
+    /// vykar-server: milliseconds). `mtime: None` means "not reported" (a
+    /// vykar-server older than `?list&sized&mtime`, or a backend without it).
+    /// `list_sized` itself always reports `mtime: None`.
+    fn list_meta(&self, prefix: &str) -> Result<Vec<ListedObject>> {
+        self.list_sized(prefix)
     }
 
     // ── Capability methods: no defaults, deliberately ──────────────────────
@@ -273,9 +293,12 @@ pub trait StorageBackend: Send + Sync {
     // The methods above may keep defaults: each routes back through this
     // impl's own `get`/`put`/`get_range`/`list`, so inheriting one is correct (at
     // worst less efficient), never a silent loss of capability; `put_pack`
-    // routes through this impl's own `put_owned`. The one exception,
-    // `begin_staged_put`, defaults to `Ok(None)` ("buffer and `put`
-    // instead"), which is likewise only ever less efficient.
+    // routes through this impl's own `put_owned`, and `list_meta` through
+    // its own `list_sized` (losing only the mtime, which then reads "not
+    // reported"). The one exception, `begin_staged_put`, defaults to
+    // `Ok(None)` ("buffer and `put` instead"), which is likewise only ever
+    // less efficient. `conditional` is a capability method like the others
+    // below: a default `None` would let a wrapper silently disable it.
 
     /// Delete temp files ([`vykar_protocol::is_repo_temp_file`]) last
     /// modified at least `older_than` ago (`Duration::ZERO` = all), in the
@@ -368,6 +391,20 @@ pub trait StorageBackend: Send + Sync {
     /// Required for the reason in the note above: a wrapper inheriting an
     /// "unsupported" default would silently cost compact 255 extra requests.
     fn list_tree_sized(&self, prefix: &str) -> Result<Vec<ListedObject>>;
+
+    /// Atomic create-if-absent, when this backend offers it. `None`: never
+    /// (the backend has no mechanism, the server does not advertise
+    /// `conditional_put`, `s3_conditional_writes` says off or auto on a
+    /// non-AWS endpoint), or a `verify()` on this instance concluded
+    /// `Unsupported`. `Some` does not mean verified: the first
+    /// `verify()`/`put_if_absent()` checks by writing.
+    ///
+    /// Never writes. `RestBackend` may `GET /health` (read-only) on its
+    /// first call, and a failed probe there caches "nothing supported" for
+    /// the process: call `server_capabilities()` first to see the error.
+    /// Required for the reason in the note above: a wrapper inheriting a
+    /// `None` default would silently disable the capability.
+    fn conditional(&self) -> Option<&dyn ConditionalWrite>;
 
     /// What kind of backend this is. Required for the reason in the note above:
     /// a wrapper inheriting a default would report a guess instead of the
@@ -581,11 +618,15 @@ pub struct BackendProfile {
     pub transfer_width: usize,
 }
 
-/// One entry of [`StorageBackend::list_sized`].
+/// One entry of [`StorageBackend::list_sized`] and
+/// [`StorageBackend::list_meta`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListedObject {
     pub key: String,
     pub size: Option<u64>,
+    /// Last modification by the storage's clock; `None` = not reported.
+    /// Only [`StorageBackend::list_meta`] fills it.
+    pub mtime: Option<std::time::SystemTime>,
 }
 
 /// What [`StorageBackend::batch_delete_keys`] removes besides the named keys.
@@ -773,6 +814,23 @@ Use HTTPS, or set repository.allow_insecure_http: true to permit plaintext HTTP 
     Ok(())
 }
 
+/// Whether the S3 backend offers put-if-absent (`If-None-Match: *` on
+/// PutObject), the `s3_conditional_writes` repository setting.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum S3ConditionalWrites {
+    /// Only for AWS endpoints (host under `amazonaws.com` or
+    /// `amazonaws.com.cn`), and only once the sequential check passes. Every
+    /// other endpoint: off.
+    #[default]
+    Auto,
+    /// The user asserts the service honours the condition atomically. The
+    /// sequential check still runs and refuses a service that ignores it.
+    On,
+    /// Never offered.
+    Off,
+}
+
 /// Configuration for constructing a storage backend.
 ///
 /// This is a decoupled subset of the full repository config, containing
@@ -793,6 +851,8 @@ pub struct StorageConfig {
     pub retry: RetryConfig,
     /// Use soft-delete for S3 Object Lock compatibility.
     pub s3_soft_delete: bool,
+    /// Whether S3 offers put-if-absent; see [`S3ConditionalWrites`].
+    pub s3_conditional_writes: S3ConditionalWrites,
     /// Cancels retry waits and abandons SFTP reads in flight. Once it is
     /// cancelled, a remote backend starts no new attempt of an operation and
     /// returns Interrupted. The first attempt of an operation still runs, so
@@ -974,7 +1034,8 @@ pub fn backend_from_config(cfg: &StorageConfig) -> Result<Box<dyn StorageBackend
                     cfg.s3_soft_delete,
                     cfg.max_connections,
                 )?
-                .with_cancel(cfg.cancel.clone()),
+                .with_cancel(cfg.cancel.clone())
+                .with_conditional_writes(cfg.s3_conditional_writes),
             ))
         }
         #[cfg(feature = "backend-sftp")]
@@ -1446,6 +1507,7 @@ mod tests {
             allow_insecure_http: false,
             retry: RetryConfig::default(),
             s3_soft_delete: false,
+            s3_conditional_writes: S3ConditionalWrites::Auto,
             cancel: CancelToken::new(),
         }
     }

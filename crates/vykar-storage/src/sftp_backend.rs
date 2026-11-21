@@ -25,7 +25,8 @@ use russh_sftp::protocol::{OpenFlags, StatusCode};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 use crate::RetryConfig;
-use crate::{ListedObject, StorageBackend};
+use crate::conditional::{Verifier, after_verified, check_args};
+use crate::{ConditionalSupport, ConditionalWrite, Created, ListedObject, StorageBackend};
 use vykar_common::paths;
 use vykar_types::cancel::CancelToken;
 use vykar_types::error::{Result, VykarError};
@@ -281,6 +282,8 @@ pub struct SftpBackend {
     cancel: CancelToken,
     /// Cache of directories known to exist, skipping redundant `mkdir_p` calls.
     known_dirs: Mutex<HashSet<String>>,
+    /// Cache of the put-if-absent check.
+    cond: Verifier,
 }
 
 impl SftpBackend {
@@ -359,6 +362,7 @@ impl SftpBackend {
             retry,
             cancel: CancelToken::new(),
             known_dirs: Mutex::new(HashSet::new()),
+            cond: Verifier::new(),
         })
     }
 
@@ -1157,11 +1161,13 @@ fn validate_range_length(length: u64) -> RetryResult<usize> {
 }
 
 /// Recursively list all files under a directory, returning keys relative to
-/// root with the sizes reported by `readdir`. Temp files are skipped.
+/// root with the sizes (and, with `with_mtime`, the mtimes) reported by
+/// `readdir`. Temp files are skipped.
 async fn list_recursive(
     sftp: &SftpSession,
     dir_path: &str,
     root: &str,
+    with_mtime: bool,
 ) -> RetryResult<Vec<ListedObject>> {
     let mut out = Vec::new();
     walk_files(sftp, dir_path, root, |key, meta| {
@@ -1169,6 +1175,11 @@ async fn list_recursive(
             out.push(ListedObject {
                 key: key.to_string(),
                 size: meta.size,
+                mtime: if with_mtime {
+                    meta.modified().ok()
+                } else {
+                    None
+                },
             });
         }
     })
@@ -1350,7 +1361,178 @@ async fn atomic_put(
     }
 }
 
+/// A status reply's code and message, for diagnostics; `None` for an error
+/// that is not a status reply (transport).
+pub(super) fn status_detail(e: &russh_sftp::client::error::Error) -> Option<String> {
+    match e {
+        russh_sftp::client::error::Error::Status(s) => Some(
+            format!("{:?} {}", s.status_code, s.error_message)
+                .trim_end()
+                .to_string(),
+        ),
+        _ => None,
+    }
+}
+
+/// What one `hardlink@openssh.com` did.
+pub(super) enum HardlinkOutcome {
+    Created,
+    NotAdvertised,
+    /// A status reply, and a stat shows the target present.
+    Exists {
+        detail: String,
+    },
+    /// A status reply, and the target is absent.
+    Refused {
+        detail: String,
+        err: russh_sftp::client::error::Error,
+    },
+    /// No status reply (transport), or the stat after a refusal failed.
+    Transport {
+        detail: String,
+    },
+}
+
+/// One `hardlink@openssh.com` from `from` to `to`, which never replaces
+/// `to`. OpenSSH maps every link failure to `SSH_FX_FAILURE`, so a refusal is
+/// classified by a `stat` of the target, never by its status code.
+pub(super) async fn hardlink_no_clobber(
+    sftp: &SftpSession,
+    from: &str,
+    to: &str,
+) -> HardlinkOutcome {
+    match sftp.hardlink(from, to).await {
+        Ok(false) => HardlinkOutcome::NotAdvertised,
+        Ok(true) => HardlinkOutcome::Created,
+        Err(err) => {
+            let Some(detail) = status_detail(&err) else {
+                return HardlinkOutcome::Transport {
+                    detail: err.to_string(),
+                };
+            };
+            match sftp.metadata(to).await {
+                Ok(_) => HardlinkOutcome::Exists { detail },
+                Err(se) if is_not_found(&se) => HardlinkOutcome::Refused { detail, err },
+                Err(se) => HardlinkOutcome::Transport {
+                    detail: format!("{detail}; stat of target: {se}"),
+                },
+            }
+        }
+    }
+}
+
+/// One attempt of a put-if-absent: write `data` to the fresh temp file
+/// `tmp`, then hard-link it to `path`, which fails if `path` exists.
+async fn put_if_absent_once(
+    sftp: &SftpSession,
+    path: &str,
+    tmp: &str,
+    ensure_parent: Option<&str>,
+    data: &[u8],
+    timeout_secs: u64,
+    server: &str,
+) -> RetryResult<Created> {
+    if let Some(parent) = ensure_parent {
+        mkdir_p(sftp, parent).await?;
+    }
+    let written: RetryResult<()> = async {
+        let mut file = sftp
+            .open_with_flags(
+                tmp,
+                OpenFlags::CREATE | OpenFlags::EXCLUDE | OpenFlags::WRITE,
+            )
+            .await
+            .map_err(|e| sftp_retry_error("create", tmp, e))?;
+        sftp.set_timeout(timeout_secs.saturating_mul(SFTP_WRITE_TIMEOUT_FACTOR));
+        let wrote = file.write_all(data).await;
+        sftp.set_timeout(timeout_secs);
+        wrote.map_err(|e| io_retry_error("write", tmp, e))?;
+        file.flush()
+            .await
+            .map_err(|e| io_retry_error("flush", tmp, e))?;
+        file.shutdown()
+            .await
+            .map_err(|e| io_retry_error("close", tmp, e))?;
+        Ok(())
+    }
+    .await;
+    if let Err(e) = written {
+        remove_temp_best_effort(sftp, tmp).await;
+        return Err(e);
+    }
+
+    match hardlink_no_clobber(sftp, tmp, path).await {
+        HardlinkOutcome::Created => {
+            remove_temp_best_effort(sftp, tmp).await;
+            Ok(Created::Yes)
+        }
+        HardlinkOutcome::Exists { .. } => {
+            remove_temp_best_effort(sftp, tmp).await;
+            Ok(Created::AlreadyExists)
+        }
+        HardlinkOutcome::NotAdvertised => {
+            remove_temp_best_effort(sftp, tmp).await;
+            Err(RetryError::permanent(VykarError::UnsupportedBackend(
+                format!("SFTP server {server} does not offer hardlink@openssh.com"),
+            )))
+        }
+        HardlinkOutcome::Refused { detail, err } => {
+            remove_temp_best_effort(sftp, tmp).await;
+            if is_retryable_sftp_error(&err) {
+                return Err(sftp_retry_error("hardlink", path, err));
+            }
+            // Advertised, but refused for a target that does not exist, in a
+            // directory the temp was just written to: the server cannot link.
+            Err(RetryError::permanent(VykarError::UnsupportedBackend(
+                format!("SFTP server {server} refuses hardlink@openssh.com: {detail}"),
+            )))
+        }
+        // No answer: the link may or may not exist. The next attempt removes
+        // this temp, and a retry that finds the target reports AlreadyExists.
+        HardlinkOutcome::Transport { detail } => Err(RetryError::transient(VykarError::Other(
+            format!("SFTP hardlink '{tmp}' -> '{path}': {detail}"),
+        ))),
+    }
+}
+
 impl SftpBackend {
+    /// The unverified put-if-absent primitive, with `put_arc`'s path, parent
+    /// creation and previous-temp cleanup. Needs `hardlink@openssh.com`, not
+    /// `posix-rename`. Not abortable in flight: it writes.
+    fn put_if_absent_raw(&self, key: &str, data: &[u8]) -> Result<Created> {
+        let path = self.full_path(key);
+        let parent = path
+            .rsplit_once('/')
+            .map(|(p, _)| p)
+            .filter(|p| !p.is_empty());
+        let ensure_parent = parent.filter(|p| !self.is_known_dir(p));
+        let server = format!("{}:{}", self.params.host, self.params.port);
+        let prev_tmp: RefCell<Option<String>> = RefCell::new(None);
+        let created = self.retry_op(&format!("PUT_IF_ABSENT {key}"), |sftp| {
+            let tmp = temp_path_for(&path);
+            let prev = prev_tmp.replace(Some(tmp.clone()));
+            ASYNC_RUNTIME.block_on(async {
+                if let Some(prev) = prev {
+                    remove_temp_best_effort(sftp, &prev).await;
+                }
+                put_if_absent_once(
+                    sftp,
+                    &path,
+                    &tmp,
+                    ensure_parent,
+                    data,
+                    self.params.sftp_timeout_secs,
+                    &server,
+                )
+                .await
+            })
+        })?;
+        if let Some(parent) = ensure_parent {
+            self.mark_dir_known(parent);
+        }
+        Ok(created)
+    }
+
     fn put_arc(&self, key: &str, data: Arc<Vec<u8>>) -> Result<()> {
         let path = self.full_path(key);
         let parent = path
@@ -1536,7 +1718,15 @@ impl StorageBackend for SftpBackend {
         let dir_path = self.full_path(prefix);
         let root = self.params.root.clone();
         self.retry_op(&format!("LIST {prefix}"), |sftp| {
-            self.block_on_op(true, list_recursive(sftp, &dir_path, &root))
+            self.block_on_op(true, list_recursive(sftp, &dir_path, &root, false))
+        })
+    }
+
+    fn list_meta(&self, prefix: &str) -> Result<Vec<ListedObject>> {
+        let dir_path = self.full_path(prefix);
+        let root = self.params.root.clone();
+        self.retry_op(&format!("LIST {prefix}"), |sftp| {
+            self.block_on_op(true, list_recursive(sftp, &dir_path, &root, true))
         })
     }
 
@@ -1608,7 +1798,30 @@ impl StorageBackend for SftpBackend {
         }
     }
 
-    crate::unsupported_server_ops!(except[remove_stale_temp_files]);
+    /// `Some` until a check on this instance concludes `Unsupported`: whether
+    /// the server offers `hardlink@openssh.com` is only known per connection,
+    /// so `verify()` decides.
+    fn conditional(&self) -> Option<&dyn ConditionalWrite> {
+        (!self.cond.refused()).then_some(self as &dyn ConditionalWrite)
+    }
+
+    crate::unsupported_server_ops!(except[remove_stale_temp_files, conditional]);
+}
+
+impl ConditionalWrite for SftpBackend {
+    fn put_if_absent(&self, key: &str, data: &[u8]) -> Result<Created> {
+        check_args(key, data)?;
+        self.cond
+            .require("SFTP", self, &|k, d| self.put_if_absent_raw(k, d))?;
+        after_verified(self.put_if_absent_raw(key, data))
+    }
+
+    /// A server that advertises `hardlink@openssh.com` but refuses a link
+    /// into a directory just written to (the target staying absent) counts as
+    /// not offering it: the capability is then off for this backend instance.
+    fn verify(&self) -> Result<ConditionalSupport> {
+        self.cond.verify(self, &|k, d| self.put_if_absent_raw(k, d))
+    }
 }
 
 #[cfg(test)]
@@ -1953,7 +2166,8 @@ mod tests {
             listed,
             vec![ListedObject {
                 key: "index".into(),
-                size: Some(9)
+                size: Some(9),
+                mtime: None,
             }]
         );
         assert_eq!(
@@ -2293,5 +2507,92 @@ mod tests {
         let started = Instant::now();
         assert!(!backend.exists("x").unwrap());
         assert!(started.elapsed() >= Duration::from_millis(300));
+    }
+    // ── Put-if-absent (hardlink@openssh.com) and list_meta ──────────
+
+    #[test]
+    fn conformance_suite_passes() {
+        let server = FaultServer::start();
+        let backend = server.backend(0);
+        crate::conformance::run(&backend, &crate::conformance::ConformanceOptions::default())
+            .unwrap();
+        // Every temp of the suite is gone.
+        assert!(server.temps_next_to("locks/x").is_empty());
+    }
+
+    #[test]
+    fn hidden_hardlink_makes_verify_unsupported() {
+        let server = FaultServer::start();
+        server.faults.hide_hardlink.store(true, Ordering::SeqCst);
+        let backend = server.backend(0);
+        let ConditionalSupport::Unsupported { reason } =
+            backend.conditional().unwrap().verify().unwrap()
+        else {
+            panic!("no hardlink must be Unsupported");
+        };
+        assert!(reason.contains("hardlink@openssh.com"), "{reason}");
+        assert!(backend.conditional().is_none());
+        assert!(server.temps_next_to("locks/x").is_empty());
+    }
+
+    /// Advertised but refused for an absent target: the capability is off
+    /// for the instance instead of staying undecided.
+    #[test]
+    fn refused_hardlink_makes_verify_unsupported() {
+        let server = FaultServer::start();
+        server.faults.refuse_hardlink.store(true, Ordering::SeqCst);
+        let backend = server.backend(2);
+        let ConditionalSupport::Unsupported { reason } =
+            backend.conditional().unwrap().verify().unwrap()
+        else {
+            panic!("a refused hardlink must be Unsupported");
+        };
+        assert!(reason.contains("refuses hardlink"), "{reason}");
+        assert!(backend.conditional().is_none());
+        assert_eq!(
+            server.faults.hardlinks.load(Ordering::SeqCst),
+            1,
+            "not retried"
+        );
+        assert!(server.temps_next_to("locks/x").is_empty());
+    }
+
+    /// A link whose reply is lost is retried; the retry finds the caller's
+    /// own object and reports AlreadyExists.
+    #[test]
+    fn lost_hardlink_reply_retries_into_already_exists() {
+        let server = FaultServer::start();
+        let backend = server.backend(3);
+        let cond = backend.conditional().unwrap();
+        assert_eq!(cond.verify().unwrap(), ConditionalSupport::Verified);
+
+        server
+            .faults
+            .drop_hardlink_reply_once
+            .store(true, Ordering::SeqCst);
+        assert_eq!(
+            cond.put_if_absent("locks/k", b"mine").unwrap(),
+            Created::AlreadyExists
+        );
+        assert_eq!(read(&server, "locks/k"), b"mine");
+        // The first attempt's temp is removed by the retry (or the sweep).
+        backend.remove_stale_temp_files(Duration::ZERO).unwrap();
+        assert!(server.temps_next_to("locks/k").is_empty());
+    }
+
+    #[test]
+    fn list_meta_reports_mtime_with_the_server_clock() {
+        let server = FaultServer::start();
+        let backend = server.backend(0);
+        backend.put("locks/a", b"abc").unwrap();
+        let plain = backend.list_meta("locks").unwrap()[0].mtime.unwrap();
+        assert_eq!(backend.list_sized("locks").unwrap()[0].mtime, None);
+
+        server.faults.mtime_skew_secs.store(-7200, Ordering::SeqCst);
+        let skewed = backend.list_meta("locks").unwrap()[0].mtime.unwrap();
+        assert_eq!(
+            plain.duration_since(skewed).unwrap(),
+            Duration::from_secs(7200)
+        );
     }
 }

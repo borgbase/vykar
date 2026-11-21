@@ -77,16 +77,6 @@ fn describe(e: &std::io::Error) -> String {
     }
 }
 
-/// A filesystem that cannot do a no-clobber rename or a hard link.
-fn is_unsupported(e: &std::io::Error) -> bool {
-    use std::io::ErrorKind;
-    if matches!(e.kind(), ErrorKind::Unsupported | ErrorKind::CrossesDevices) {
-        return true;
-    }
-    // EPERM: link(2) on a filesystem without hard links (macOS exFAT, FAT).
-    cfg!(unix) && e.raw_os_error() == Some(1)
-}
-
 fn classify(e: &std::io::Error) -> Outcome {
     if e.kind() == std::io::ErrorKind::AlreadyExists {
         return Outcome::AlreadyExists {
@@ -94,7 +84,7 @@ fn classify(e: &std::io::Error) -> Outcome {
         };
     }
     let detail = describe(e);
-    if is_unsupported(e) {
+    if vykar_common::fs::is_no_clobber_unsupported(e) {
         Outcome::Rejected {
             detail: format!("{UNSUPPORTED_DETAIL}{detail}"),
         }

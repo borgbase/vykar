@@ -226,6 +226,11 @@ pub struct RepositoryConfig {
     /// preserves previous versions for the configured retention period.
     #[serde(default)]
     pub s3_soft_delete: bool,
+    /// Put-if-absent on S3: `auto` (AWS endpoints only, after a check), `on`
+    /// (assert the service supports it; still checked), `off`. See
+    /// backends.md.
+    #[serde(default)]
+    pub s3_conditional_writes: S3ConditionalWrites,
 }
 
 impl RepositoryConfig {
@@ -256,6 +261,7 @@ impl RepositoryConfig {
             max_pack_size: _,
             retry,
             s3_soft_delete,
+            s3_conditional_writes,
         } = self;
 
         vykar_storage::StorageConfig {
@@ -272,6 +278,7 @@ impl RepositoryConfig {
             allow_insecure_http: *allow_insecure_http,
             retry: *retry,
             s3_soft_delete: *s3_soft_delete,
+            s3_conditional_writes: *s3_conditional_writes,
             cancel: vykar_types::cancel::CancelToken::new(),
         }
     }
@@ -312,6 +319,7 @@ impl Default for RepositoryConfig {
             max_pack_size: default_max_pack_size(),
             retry: RetryConfig::default(),
             s3_soft_delete: false,
+            s3_conditional_writes: S3ConditionalWrites::Auto,
         }
     }
 }
@@ -557,8 +565,9 @@ impl CheckConfig {
     }
 }
 
-// RetryConfig is defined in vykar-storage; re-exported here for ergonomic config construction.
-pub use vykar_storage::RetryConfig;
+// RetryConfig and S3ConditionalWrites are defined in vykar-storage; re-exported
+// here for ergonomic config construction.
+pub use vykar_storage::{RetryConfig, S3ConditionalWrites};
 
 #[cfg(test)]
 mod tests {

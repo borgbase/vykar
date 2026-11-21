@@ -426,7 +426,11 @@ impl RecordingBackend {
             .into_iter()
             .map(|key| {
                 let size = self.inner.size(&key)?;
-                Ok(vykar_storage::ListedObject { key, size })
+                Ok(vykar_storage::ListedObject {
+                    key,
+                    size,
+                    mtime: None,
+                })
             })
             .collect()
     }
@@ -442,8 +446,20 @@ delegate_storage_backend! {
     for RecordingBackend;
     except [
         put, list, get_range, get_range_into, open_range, put_owned, put_pack, begin_staged_put,
-        size, list_sized, list_tree_sized, profile,
+        size, list_sized, list_meta, list_tree_sized, conditional, profile
     ];
+
+    fn list_meta(
+        &self,
+        prefix: &str,
+    ) -> vykar_types::error::Result<Vec<vykar_storage::ListedObject>> {
+        self.list_sized(prefix)
+    }
+
+    // Test wrapper: keeps every write on `put`.
+    fn conditional(&self) -> Option<&dyn vykar_storage::ConditionalWrite> {
+        None
+    }
 
     fn list(&self, prefix: &str) -> Result<Vec<String>> {
         self.log.lists.fetch_add(1, Ordering::Relaxed);
@@ -582,7 +598,12 @@ impl InnerBackend for PackUploadBackend {
 
 delegate_storage_backend! {
     for PackUploadBackend;
-    except [put_owned, put_pack, begin_staged_put, profile];
+    except [put_owned, put_pack, begin_staged_put, conditional, profile];
+
+    // Test wrapper: keeps every write on `put`.
+    fn conditional(&self) -> Option<&dyn vykar_storage::ConditionalWrite> {
+        None
+    }
 
     // Keep packs off staged writes. Gating and fault injection act on
     // `put_owned`/`put_pack`.
@@ -662,9 +683,21 @@ impl InnerBackend for HookBackend {
 delegate_storage_backend! {
     for HookBackend;
     except [
-        put, delete, list, put_owned, put_pack, begin_staged_put, list_sized, list_tree_sized,
-        profile,
+        put, delete, list, put_owned, put_pack, begin_staged_put, list_sized, list_meta,
+        list_tree_sized, conditional, profile
     ];
+
+    fn list_meta(
+        &self,
+        prefix: &str,
+    ) -> vykar_types::error::Result<Vec<vykar_storage::ListedObject>> {
+        self.list_sized(prefix)
+    }
+
+    // Test wrapper: keeps every write on `put`.
+    fn conditional(&self) -> Option<&dyn vykar_storage::ConditionalWrite> {
+        None
+    }
 
     // Keep packs on the intercepted `put` path. Hooks fire on `put`.
     fn begin_staged_put(

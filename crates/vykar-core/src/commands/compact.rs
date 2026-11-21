@@ -535,7 +535,7 @@ fn push_listed(
     objects: impl IntoIterator<Item = vykar_storage::ListedObject>,
     out: &mut Vec<ListedPack>,
 ) {
-    for vykar_storage::ListedObject { key, size } in objects {
+    for vykar_storage::ListedObject { key, size, .. } in objects {
         if key.ends_with('/') {
             continue;
         }

@@ -4,7 +4,11 @@ use std::path::{Component, Path, PathBuf};
 
 use vykar_types::error::{Result, VykarError};
 
-use crate::{BackendProfile, ListedObject, RangeCursor, RangeReader, StagedPut, StorageBackend};
+use crate::conditional::{Verifier, after_verified, check_args};
+use crate::{
+    BackendProfile, ConditionalSupport, ConditionalWrite, Created, ListedObject, RangeCursor,
+    RangeReader, StagedPut, StorageBackend,
+};
 
 /// Write buffer of a staged object. Its appends are a 4-byte length prefix
 /// followed by a blob of typically hundreds of KiB, which bypasses the buffer,
@@ -16,6 +20,8 @@ pub struct LocalBackend {
     root: PathBuf,
     request_width: usize,
     transfer_width: usize,
+    /// Cache of the put-if-absent check.
+    cond: Verifier,
 }
 
 impl LocalBackend {
@@ -37,6 +43,7 @@ impl LocalBackend {
             root,
             request_width: crate::local_request_width(None),
             transfer_width: crate::transfer_width(None),
+            cond: Verifier::new(),
         })
     }
 
@@ -116,6 +123,34 @@ impl LocalBackend {
                 create()
             }
             other => other,
+        }
+    }
+
+    /// The unverified put-if-absent primitive: temp file, fsync, no-clobber
+    /// rename (or link), fsync the directory.
+    fn put_if_absent_raw(&self, key: &str, data: &[u8]) -> Result<Created> {
+        let path = self.resolve(key)?;
+        let dir = path.parent().unwrap_or(&self.root);
+        let mut tmp = Self::temp_file_in(dir)?;
+        tmp.write_all(data)?;
+        vykar_common::fs::fsync_file(tmp.as_file())?;
+        match tmp.persist_noclobber(&path) {
+            Ok(persisted) => {
+                drop(persisted);
+                Self::sync_directory(dir)?;
+                Ok(Created::Yes)
+            }
+            // Dropping the returned temp file removes it.
+            Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists => {
+                Ok(Created::AlreadyExists)
+            }
+            Err(e) if vykar_common::fs::is_no_clobber_unsupported(&e.error) => {
+                Err(VykarError::UnsupportedBackend(format!(
+                    "local filesystem cannot create without replacing ({})",
+                    e.error
+                )))
+            }
+            Err(e) => Err(e.error.into()),
         }
     }
 
@@ -204,14 +239,18 @@ impl StorageBackend for LocalBackend {
 
     fn list(&self, prefix: &str) -> Result<Vec<String>> {
         Ok(self
-            .list_entries(prefix, false)?
+            .list_entries(prefix, false, false)?
             .into_iter()
             .map(|o| o.key)
             .collect())
     }
 
     fn list_sized(&self, prefix: &str) -> Result<Vec<ListedObject>> {
-        self.list_entries(prefix, true)
+        self.list_entries(prefix, true, false)
+    }
+
+    fn list_meta(&self, prefix: &str) -> Result<Vec<ListedObject>> {
+        self.list_entries(prefix, true, true)
     }
 
     fn remove_stale_temp_files(&self, older_than: std::time::Duration) -> Result<usize> {
@@ -375,7 +414,24 @@ impl StorageBackend for LocalBackend {
         }
     }
 
-    crate::unsupported_server_ops!(except[remove_stale_temp_files]);
+    fn conditional(&self) -> Option<&dyn ConditionalWrite> {
+        (!self.cond.refused()).then_some(self as &dyn ConditionalWrite)
+    }
+
+    crate::unsupported_server_ops!(except[remove_stale_temp_files, conditional]);
+}
+
+impl ConditionalWrite for LocalBackend {
+    fn put_if_absent(&self, key: &str, data: &[u8]) -> Result<Created> {
+        check_args(key, data)?;
+        self.cond
+            .require("local", self, &|k, d| self.put_if_absent_raw(k, d))?;
+        after_verified(self.put_if_absent_raw(key, data))
+    }
+
+    fn verify(&self) -> Result<ConditionalSupport> {
+        self.cond.verify(self, &|k, d| self.put_if_absent_raw(k, d))
+    }
 }
 
 /// A range opened by [`LocalBackend::open_range`]: each piece is one
@@ -483,7 +539,12 @@ impl StagedPut for LocalStagedPut {
 }
 
 impl LocalBackend {
-    fn list_entries(&self, prefix: &str, with_size: bool) -> Result<Vec<ListedObject>> {
+    fn list_entries(
+        &self,
+        prefix: &str,
+        with_size: bool,
+        with_mtime: bool,
+    ) -> Result<Vec<ListedObject>> {
         let dir = if prefix.is_empty() {
             self.root.clone()
         } else {
@@ -500,19 +561,27 @@ impl LocalBackend {
             if vykar_protocol::is_temp_file(key) {
                 return Ok(());
             }
-            let size = if with_size {
+            let (size, mtime) = if with_size || with_mtime {
                 match entry.metadata() {
-                    Ok(meta) => Some(meta.len()),
+                    Ok(meta) => (
+                        with_size.then_some(meta.len()),
+                        if with_mtime {
+                            meta.modified().ok()
+                        } else {
+                            None
+                        },
+                    ),
                     // Deleted between `read_dir` and the stat.
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
                     Err(e) => return Err(e.into()),
                 }
             } else {
-                None
+                (None, None)
             };
             out.push(ListedObject {
                 key: key.to_string(),
                 size,
+                mtime,
             });
             Ok(())
         })?;
@@ -767,11 +836,13 @@ mod tests {
             vec![
                 ListedObject {
                     key: "index".into(),
-                    size: Some(5)
+                    size: Some(5),
+                    mtime: None,
                 },
                 ListedObject {
                     key: "packs/ab/pack1".into(),
-                    size: Some(2)
+                    size: Some(2),
+                    mtime: None,
                 },
             ]
         );
@@ -1130,5 +1201,47 @@ mod tests {
         let err = reader.read_at(500, 200).unwrap_err().to_string();
         assert!(err.contains("short read"), "{err}");
         assert!(err.contains("expected 200 bytes, got 100"), "{err}");
+    }
+    #[test]
+    fn conformance_suite_passes() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = LocalBackend::new(dir.path().to_str().unwrap()).unwrap();
+        assert!(backend.conditional().is_some());
+        crate::conformance::run(&backend, &crate::conformance::ConformanceOptions::default())
+            .unwrap();
+    }
+
+    #[test]
+    fn put_if_absent_creates_missing_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = LocalBackend::new(dir.path().to_str().unwrap()).unwrap();
+        let cond = backend.conditional().unwrap();
+        assert_eq!(cond.put_if_absent("a/b/c/k", b"x").unwrap(), Created::Yes);
+        assert_eq!(fs::read(dir.path().join("a/b/c/k")).unwrap(), b"x");
+        assert_eq!(
+            cond.put_if_absent("a/b/c/k", b"y").unwrap(),
+            Created::AlreadyExists
+        );
+        assert_eq!(fs::read(dir.path().join("a/b/c/k")).unwrap(), b"x");
+    }
+
+    #[test]
+    fn list_meta_reports_mtime_and_list_sized_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = LocalBackend::new(dir.path().to_str().unwrap()).unwrap();
+        backend.put("locks/a", b"abc").unwrap();
+        let meta = backend.list_meta("locks/").unwrap();
+        let [entry] = meta.as_slice() else {
+            panic!("{meta:?}");
+        };
+        assert_eq!(entry.size, Some(3));
+        let now = std::time::SystemTime::now();
+        let mtime = entry.mtime.unwrap();
+        let skew = now
+            .duration_since(mtime)
+            .or_else(|e| Ok::<_, ()>(e.duration()))
+            .unwrap();
+        assert!(skew < std::time::Duration::from_secs(5), "{skew:?}");
+        assert_eq!(backend.list_sized("locks/").unwrap()[0].mtime, None);
     }
 }

@@ -118,13 +118,21 @@ impl InnerBackend for ThrottledStorageBackend {
 // Tokens are charged per object (before an upload is sent, after a read
 // completes), so the caps bound the average rate, not the peak: each object
 // still moves at link speed. Shaping the peak would need the limiter inside
-// the HTTP backends.
+// the HTTP backends. Conditional writes are charged like `put`: the wrapper
+// offers put-if-absent exactly when the inner backend does, and answers it
+// itself so its bytes pass the write limiter.
 delegate_storage_backend! {
     for ThrottledStorageBackend;
     except [
         get, put, get_range, get_range_into, open_range, put_owned, put_pack, begin_staged_put,
-        profile
+        conditional, profile
     ];
+
+    fn conditional(&self) -> Option<&dyn vykar_storage::ConditionalWrite> {
+        self.inner
+            .conditional()
+            .map(|_| self as &dyn vykar_storage::ConditionalWrite)
+    }
 
     fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
         let out = self.inner.get(key)?;
@@ -202,6 +210,29 @@ delegate_storage_backend! {
             staged_put: false,
             ..self.inner.profile()
         }
+    }
+}
+
+impl ThrottledStorageBackend {
+    fn inner_conditional(&self) -> Result<&dyn vykar_storage::ConditionalWrite> {
+        self.inner.conditional().ok_or_else(|| {
+            vykar_types::error::VykarError::UnsupportedBackend("put-if-absent".into())
+        })
+    }
+}
+
+impl vykar_storage::ConditionalWrite for ThrottledStorageBackend {
+    fn put_if_absent(&self, key: &str, data: &[u8]) -> Result<vykar_storage::Created> {
+        // Checked before charging, so a refused call costs no tokens.
+        let inner = self.inner_conditional()?;
+        if let Some(limiter) = self.write_limiter.as_ref() {
+            limiter.consume(data.len());
+        }
+        inner.put_if_absent(key, data)
+    }
+
+    fn verify(&self) -> Result<vykar_storage::ConditionalSupport> {
+        self.inner_conditional()?.verify()
     }
 }
 
@@ -476,6 +507,94 @@ mod tests {
         assert_eq!(verify_calls.load(Ordering::SeqCst), 1);
         assert_eq!(init_calls.load(Ordering::SeqCst), 1);
         assert_eq!(sizes_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// Put-if-absent is offered exactly when the inner backend offers it,
+    /// reaches the inner backend, and is charged to the write limiter.
+    #[test]
+    fn throttled_backend_wraps_conditional_writes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use vykar_storage::{ConditionalSupport, ConditionalWrite, Created};
+
+        struct CondLeaf {
+            offers: bool,
+            creates: AtomicUsize,
+        }
+
+        impl StorageBackend for CondLeaf {
+            fn get(&self, _key: &str) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn put(&self, _key: &str, _data: &[u8]) -> Result<()> {
+                Ok(())
+            }
+            fn delete(&self, _key: &str) -> Result<()> {
+                Ok(())
+            }
+            fn exists(&self, _key: &str) -> Result<bool> {
+                Ok(false)
+            }
+            fn list(&self, _prefix: &str) -> Result<Vec<String>> {
+                Ok(Vec::new())
+            }
+            fn get_range(&self, _key: &str, _offset: u64, _length: u64) -> Result<Option<Vec<u8>>> {
+                Ok(None)
+            }
+            fn create_dir(&self, _key: &str) -> Result<()> {
+                Ok(())
+            }
+            fn conditional(&self) -> Option<&dyn ConditionalWrite> {
+                self.offers.then_some(self as &dyn ConditionalWrite)
+            }
+            fn profile(&self) -> vykar_storage::BackendProfile {
+                vykar_storage::BackendProfile {
+                    local: false,
+                    staged_put: false,
+                    request_width: 1,
+                    transfer_width: 1,
+                }
+            }
+            vykar_storage::unsupported_server_ops!(except[conditional]);
+        }
+
+        impl ConditionalWrite for CondLeaf {
+            fn put_if_absent(&self, _key: &str, _data: &[u8]) -> Result<Created> {
+                self.creates.fetch_add(1, Ordering::SeqCst);
+                Ok(Created::Yes)
+            }
+            fn verify(&self) -> Result<ConditionalSupport> {
+                Ok(ConditionalSupport::Verified)
+            }
+        }
+
+        let limiter = Arc::new(ByteRateLimiter::new(u64::MAX));
+        let wrapped = ThrottledStorageBackend {
+            inner: Box::new(CondLeaf {
+                offers: true,
+                creates: AtomicUsize::new(0),
+            }),
+            read_limiter: None,
+            write_limiter: Some(Arc::clone(&limiter)),
+        };
+        let cond = wrapped
+            .conditional()
+            .expect("offered like the inner backend");
+        assert_eq!(cond.verify().unwrap(), ConditionalSupport::Verified);
+        assert_eq!(
+            cond.put_if_absent("locks/k", &[0u8; 100]).unwrap(),
+            Created::Yes
+        );
+        assert_eq!(limiter.state.lock().unwrap().bytes_consumed, 100);
+
+        let wrapped = ThrottledStorageBackend {
+            inner: Box::new(CondLeaf {
+                offers: false,
+                creates: AtomicUsize::new(0),
+            }),
+            read_limiter: None,
+            write_limiter: Some(Arc::new(ByteRateLimiter::new(u64::MAX))),
+        };
+        assert!(wrapped.conditional().is_none());
     }
 
     /// Packs reach the inner `put_pack` (not `put`/`put_owned`), release

@@ -46,6 +46,10 @@ pub(super) struct Faults {
     pub hide_hardlink: AtomicBool,
     /// `hardlink@openssh.com` requests received.
     pub hardlinks: AtomicUsize,
+    /// Advertise `hardlink@openssh.com` but refuse every link with Failure.
+    pub refuse_hardlink: AtomicBool,
+    /// Perform the next hard link, then kill the connection instead of replying.
+    pub drop_hardlink_reply_once: AtomicBool,
     /// Delay every STAT/LSTAT reply by this many ms; 0 = off.
     pub stat_delay_ms: AtomicU64,
     /// STAT/LSTAT requests received, counted before the delay.
@@ -566,10 +570,21 @@ impl russh_sftp::server::Handler for SftpHandler {
     ) -> Result<Packet, Self::Error> {
         if request == "hardlink@openssh.com" && !self.faults.hide_hardlink.load(Ordering::SeqCst) {
             self.faults.hardlinks.fetch_add(1, Ordering::SeqCst);
+            if self.faults.refuse_hardlink.load(Ordering::SeqCst) {
+                return Err(StatusCode::Failure);
+            }
             let (old, rest) = sftp_string(&data).ok_or(StatusCode::BadMessage)?;
             let (new, _) = sftp_string(rest).ok_or(StatusCode::BadMessage)?;
             // Like OpenSSH's link(2): an existing target answers Failure (io_status).
             std::fs::hard_link(self.local(&old), self.local(&new)).map_err(|e| io_status(&e))?;
+            if self
+                .faults
+                .drop_hardlink_reply_once
+                .swap(false, Ordering::SeqCst)
+            {
+                self.kill_connection().await;
+                std::future::pending::<()>().await;
+            }
             return Ok(Packet::Status(ok(id)));
         }
         if request != "posix-rename@openssh.com"

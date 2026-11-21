@@ -762,6 +762,7 @@ fn init_refuses_a_v3_repository_against_a_pre_blake3_server() {
             ..Default::default()
         },
         s3_soft_delete: false,
+        s3_conditional_writes: Default::default(),
         cancel: vykar_types::cancel::CancelToken::new(),
     })
     .expect("REST backend builds");

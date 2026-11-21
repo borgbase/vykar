@@ -125,6 +125,27 @@ aws s3api put-bucket-lifecycle-configuration \
   }'
 ```
 
+### Conditional writes
+
+Some repository operations can use put-if-absent: create an object only if no object exists under its key, decided atomically by the storage. On S3 this is `If-None-Match: *` on PutObject. Not every S3-compatible service implements it correctly, so the `s3_conditional_writes` setting decides whether vykar offers it:
+
+| Value | Meaning |
+|-------|---------|
+| `auto` (default) | Offered only on AWS endpoints (a host under `amazonaws.com` or `amazonaws.com.cn`). Every other endpoint, including a custom domain in front of AWS, is treated as `off`. |
+| `on` | You assert that your service honours the condition atomically, including for concurrent requests. Use it only for a service you have verified. |
+| `off` | Never offered. |
+
+Before the first conditional write, vykar runs a check on a fresh key under `locks/`: it creates the key twice and expects the second create to be refused with the first content kept, then deletes the key. A service that ignores the header fails this check, and vykar then stops offering put-if-absent for the rest of the run. The check is sequential: it cannot detect a service that refuses a repeated create but lets two concurrent creates both succeed. That is why `auto` trusts only AWS, and why `on` is your assertion about the service, not something vykar proves.
+
+Tested services:
+
+- MinIO (2025-10-15): works.
+- Garage (2.5.0): ignores the header and overwrites. The check catches this and refuses.
+- IDrive e2: passes the sequential check but lets concurrent creates both win. Do not set `on`.
+- Ceph RGW, Cloudflare R2, Backblaze B2 and Wasabi: untested.
+
+With `s3_soft_delete`, a deleted key leaves a zero-byte tombstone, which still counts as existing for put-if-absent.
+
 ## SFTP
 
 Store backups on a remote server via SFTP. Uses a native [russh](https://github.com/Eugeny/russh) implementation (pure Rust SSH/SFTP) — no system `ssh` binary required. Works on all platforms including Windows.
@@ -160,6 +181,8 @@ If `sftp_key` names a public key file, vykar signs with the agent and offers onl
 
 The server must support the `posix-rename@openssh.com` extension. Vykar uploads each object to a temporary file and renames it over the destination, so an interrupted upload never leaves a partial object in place. OpenSSH's `sftp-server` provides the extension. On servers that do not advertise it, reads (restore, list, check) still work, but every write fails with an error naming the missing extension.
 
+Put-if-absent uses the `hardlink@openssh.com` extension when the server offers it (OpenSSH's `sftp-server` does): the object is written to a temporary file and hard-linked to its key, which fails if the key exists. It does not need `posix-rename@openssh.com`. A server that does not offer the extension, or refuses the link, has no put-if-absent; the first check finds out and turns it off for the rest of the run.
+
 `sftp_timeout` applies to each SFTP request. The data writes of an upload are sent up to 2 MiB ahead of their acknowledgements, so each of them is allowed four times `sftp_timeout`.
 
 ## REST (vykar-server)
@@ -174,6 +197,8 @@ repositories:
 ```
 
 See [Server Setup](/server-setup) for how to set up and configure the server.
+
+Put-if-absent is offered when the server advertises `conditional_put` in `/health`; it is a `PUT` with `If-None-Match: *`, answered `412` when the key exists. Older servers do not advertise it, and vykar never sends them a conditional PUT.
 
 ## S3 append-only / ransomware protection
 

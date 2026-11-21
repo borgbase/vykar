@@ -800,7 +800,12 @@ mod tests {
 
     delegate_storage_backend! {
         for ReleaseThenBlock;
-        except [put_pack, begin_staged_put, profile];
+        except [put_pack, begin_staged_put, conditional, profile];
+
+        // Test wrapper: keeps every write on `put`.
+        fn conditional(&self) -> Option<&dyn vykar_storage::ConditionalWrite> {
+            None
+        }
 
         fn put_pack(
             &self,

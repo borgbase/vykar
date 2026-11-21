@@ -212,7 +212,12 @@ impl InnerBackend for FaultyBackend {
 
 vykar_storage::delegate_storage_backend! {
     for FaultyBackend;
-    except [get, put, put_pack, begin_staged_put, profile];
+    except [get, put, put_pack, begin_staged_put, conditional, profile];
+
+    // Test wrapper: keeps every write on `put`.
+    fn conditional(&self) -> Option<&dyn vykar_storage::ConditionalWrite> {
+        None
+    }
 
     // Keep packs on the intercepted `put` path.
     fn begin_staged_put(
@@ -858,7 +863,14 @@ impl InnerBackend for CountingBackend {
 
 vykar_storage::delegate_storage_backend! {
     for CountingBackend;
-    except [get, list, list_sized, list_tree_sized];
+    except [get, list, list_sized, list_meta, list_tree_sized];
+
+    fn list_meta(
+        &self,
+        prefix: &str,
+    ) -> vykar_types::error::Result<Vec<vykar_storage::ListedObject>> {
+        self.list_sized(prefix)
+    }
 
     fn get(&self, key: &str) -> vykar_types::error::Result<Option<Vec<u8>>> {
         self.reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

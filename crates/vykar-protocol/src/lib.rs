@@ -122,14 +122,24 @@ pub fn check_protocol_version(version: u32) -> Result<(), String> {
     Ok(())
 }
 
-// ── Sized listing (`GET ?list&sized`) ─────────────────────────────────────
+// ── Sized listing (`GET ?list&sized`, `GET ?list&sized&mtime`) ─────────────
 
 /// One entry of a `?list&sized` response. Servers that predate the `sized`
 /// parameter ignore it and return plain key strings instead.
+///
+/// `?list&sized&mtime` adds `mtime_ms` to every entry. The flag is additive:
+/// a server that predates it ignores the unknown query parameter and answers
+/// as for `?list&sized`, so a client reads a missing `mtime_ms` as "not
+/// reported". Without `&mtime` the field is omitted, keeping the
+/// `?list&sized` response byte-identical to older servers'.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SizedKey {
     pub key: String,
     pub size: u64,
+    /// Last modification, ms since the Unix epoch, by the server's clock. Sent
+    /// only when the request has `&mtime`; absent from older servers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mtime_ms: Option<u64>,
 }
 
 // ── Batch object sizes (`POST /<dir>?sizes`) ──────────────────────────────
@@ -181,6 +191,11 @@ pub struct ServerCapabilities {
     /// server accepted.
     #[serde(default)]
     pub key_dirs: Vec<String>,
+    /// The server honours `If-None-Match: *` on PUT (412 when the key exists),
+    /// atomically. Absent on older servers, which ignore the header and
+    /// overwrite: a client must not send a conditional PUT without it.
+    #[serde(default)]
+    pub conditional_put: bool,
 }
 
 impl ServerCapabilities {
@@ -779,6 +794,26 @@ pub fn validate_blob_ref(offset: u64, length: u64, context: &str) -> Result<(), 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capabilities_without_conditional_put_read_as_false() {
+        let caps: ServerCapabilities =
+            serde_json::from_str(r#"{"status":"ok","version":"0.24.0"}"#).unwrap();
+        assert!(!caps.conditional_put);
+    }
+
+    #[test]
+    fn sized_key_mtime_is_optional_on_the_wire() {
+        let k: SizedKey = serde_json::from_str(r#"{"key":"a","size":3}"#).unwrap();
+        assert_eq!(k.mtime_ms, None);
+        assert_eq!(
+            serde_json::to_string(&k).unwrap(),
+            r#"{"key":"a","size":3}"#
+        );
+        let k: SizedKey =
+            serde_json::from_str(r#"{"key":"a","size":3,"mtime_ms":1700000000123}"#).unwrap();
+        assert_eq!(k.mtime_ms, Some(1_700_000_000_123));
+    }
 
     #[test]
     fn parse_byte_range_accepts_only_bytes_start_end() {

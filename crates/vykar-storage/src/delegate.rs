@@ -2,7 +2,7 @@
 //! "unsupported" bodies for leaves.
 //!
 //! Every wrapper that holds an inner backend (rate limiter, test recorder, the
-//! `Arc<dyn StorageBackend>` coercion impl) has to forward all 24 trait methods,
+//! `Arc<dyn StorageBackend>` coercion impl) has to forward all 26 trait methods,
 //! and hand-written forwards rot — a forgotten one disabled server-side pack
 //! verification and server init on any throttled REST repo.
 //!
@@ -11,13 +11,17 @@
 //! * [`crate::delegate_storage_backend!`] holds the forwarding inventory in one
 //!   place. A wrapper implements [`InnerBackend`], names the methods it writes by
 //!   hand, and gets forwards for the rest.
-//! * The trait's ten capability methods (`remove_stale_temp_files`,
+//! * The trait's eleven capability methods (`remove_stale_temp_files`,
 //!   `server_repack`, `batch_delete_keys`, `server_verify_packs`, `server_init`,
 //!   `bind_content_hash`, `server_capabilities`, `object_sizes`,
-//!   `list_tree_sized`, `profile`) have **no defaults**, so the inventory cannot
-//!   silently fall behind the trait: adding an eleventh breaks every impl, this
-//!   macro included, until it is handled. Leaves get bodies for the ones they do
-//!   not implement from [`crate::unsupported_server_ops!`] (all but `profile`).
+//!   `list_tree_sized`, `conditional`, `profile`) have **no defaults**, so the
+//!   inventory cannot silently fall behind the trait: adding a twelfth breaks
+//!   every impl, this macro included, until it is handled. Leaves get bodies for
+//!   the ones they do not implement from [`crate::unsupported_server_ops!`] (all
+//!   but `profile`; `conditional` is `None` there).
+//!
+//! The defaulted `list_meta` is forwarded like every other method; a wrapper
+//! that overrides `list_sized` must override it too (a compile-time guard).
 //!
 //! What is *not* guarded: a new method with a default body. Wrappers would
 //! inherit it, which is safe by construction for the defaults that exist today
@@ -52,7 +56,8 @@ pub mod __macro_support {
 /// it: `UnsupportedBackend` for the server-side APIs, a no-op for
 /// `bind_content_hash` (nothing to bind — only `RestBackend` sends a
 /// content-digest header), and `Ok(0)` for `remove_stale_temp_files` (for
-/// backends that leave no client-side temp files; Local and SFTP implement it).
+/// backends that leave no client-side temp files; Local and SFTP implement it),
+/// and `None` for `conditional` (no put-if-absent).
 ///
 /// Used inside an `impl StorageBackend for _` block. `except [...]` names the
 /// ones the backend does implement itself, in trait-declaration order — same
@@ -74,7 +79,8 @@ macro_rules! unsupported_server_ops {
     (except [$($except:ident),* $(,)?]) => {
         $crate::unsupported_server_ops!(@emit
             [remove_stale_temp_files server_repack batch_delete_keys server_verify_packs
-             server_init bind_content_hash server_capabilities object_sizes list_tree_sized]
+             server_init bind_content_hash server_capabilities object_sizes list_tree_sized
+             conditional]
             [$($except)*]);
     };
 
@@ -216,6 +222,16 @@ macro_rules! unsupported_server_ops {
         }
         $crate::unsupported_server_ops!(@emit [$($rest)*] [$($except)*]);
     };
+
+    (@emit [conditional $($rest:ident)*] [conditional $($except:ident)*]) => {
+        $crate::unsupported_server_ops!(@emit [$($rest)*] [$($except)*]);
+    };
+    (@emit [conditional $($rest:ident)*] [$($except:ident)*]) => {
+        fn conditional(&self) -> Option<&dyn $crate::ConditionalWrite> {
+            None
+        }
+        $crate::unsupported_server_ops!(@emit [$($rest)*] [$($except)*]);
+    };
 }
 
 /// Implement `StorageBackend` for a wrapper by forwarding to its
@@ -247,13 +263,15 @@ macro_rules! delegate_storage_backend {
 
             $crate::delegate_storage_backend!(@forward
                 [get put delete exists list get_range get_range_into open_range create_dir
-                 put_owned put_pack begin_staged_put size list_sized remove_stale_temp_files
-                 server_repack batch_delete_keys
+                 put_owned put_pack begin_staged_put size list_sized list_meta
+                 remove_stale_temp_files server_repack batch_delete_keys
                  server_verify_packs server_init bind_content_hash
-                 server_capabilities object_sizes list_tree_sized profile]
+                 server_capabilities object_sizes list_tree_sized conditional profile]
                 [$($except)*]);
         }
         $crate::delegate_storage_backend!(@check_list [$($except)*] [] []);
+        $crate::delegate_storage_backend!(@check_meta [$($except)*] [] []);
+        $crate::delegate_storage_backend!(@check_cond [$($except)*] [] []);
         $crate::delegate_storage_backend!(@check_put [$($except)*] [] []);
         $crate::delegate_storage_backend!(@check_pack [$($except)*] [] []);
         $crate::delegate_storage_backend!(@check_range [$($except)*] [] []);
@@ -365,6 +383,59 @@ macro_rules! delegate_storage_backend {
     };
     (@check_pack [$other:ident $($rest:ident)*] $put:tt $pack:tt) => {
         $crate::delegate_storage_backend!(@check_pack [$($rest)*] $put $pack);
+    };
+
+    // ── Guard: overriding `put`/`put_owned`/`put_pack` requires `conditional`
+    //
+    // A forwarded `conditional` hands out the inner backend's put-if-absent,
+    // which writes without passing through the wrapper's `put` override.
+
+    (@check_cond [] [] $cond:tt) => {};
+    (@check_cond [] [put] [conditional]) => {};
+    (@check_cond [] [put] []) => {
+        compile_error!(
+            "delegate_storage_backend!: a wrapper that overrides `put`, `put_owned` or \
+             `put_pack` must also override `conditional`, or conditional writes bypass \
+             it; returning None keeps every write on `put`"
+        );
+    };
+    (@check_cond [put $($rest:ident)*] $put:tt $cond:tt) => {
+        $crate::delegate_storage_backend!(@check_cond [$($rest)*] [put] $cond);
+    };
+    (@check_cond [put_owned $($rest:ident)*] $put:tt $cond:tt) => {
+        $crate::delegate_storage_backend!(@check_cond [$($rest)*] [put] $cond);
+    };
+    (@check_cond [put_pack $($rest:ident)*] $put:tt $cond:tt) => {
+        $crate::delegate_storage_backend!(@check_cond [$($rest)*] [put] $cond);
+    };
+    (@check_cond [conditional $($rest:ident)*] $put:tt []) => {
+        $crate::delegate_storage_backend!(@check_cond [$($rest)*] $put [conditional]);
+    };
+    (@check_cond [$other:ident $($rest:ident)*] $put:tt $cond:tt) => {
+        $crate::delegate_storage_backend!(@check_cond [$($rest)*] $put $cond);
+    };
+
+    // ── Guard: overriding `list_sized` requires `list_meta` ───────────────
+    //
+    // Otherwise the generated `list_meta` forwards straight to the inner
+    // backend, bypassing whatever the `list_sized` override intercepts.
+
+    (@check_meta [] [] $meta:tt) => {};
+    (@check_meta [] [list_sized] [list_meta]) => {};
+    (@check_meta [] [list_sized] []) => {
+        compile_error!(
+            "delegate_storage_backend!: a wrapper that overrides `list_sized` must also \
+             override `list_meta`, or listings with mtime bypass it"
+        );
+    };
+    (@check_meta [list_sized $($rest:ident)*] [] $meta:tt) => {
+        $crate::delegate_storage_backend!(@check_meta [$($rest)*] [list_sized] $meta);
+    };
+    (@check_meta [list_meta $($rest:ident)*] $sized:tt []) => {
+        $crate::delegate_storage_backend!(@check_meta [$($rest)*] $sized [list_meta]);
+    };
+    (@check_meta [$other:ident $($rest:ident)*] $sized:tt $meta:tt) => {
+        $crate::delegate_storage_backend!(@check_meta [$($rest)*] $sized $meta);
     };
 
     // ── Guard: overriding `list` requires overriding `list_sized` ─────────
@@ -597,6 +668,19 @@ macro_rules! delegate_storage_backend {
         $crate::delegate_storage_backend!(@forward [$($rest)*] [$($except)*]);
     };
 
+    (@forward [list_meta $($rest:ident)*] [list_meta $($except:ident)*]) => {
+        $crate::delegate_storage_backend!(@forward [$($rest)*] [$($except)*]);
+    };
+    (@forward [list_meta $($rest:ident)*] [$($except:ident)*]) => {
+        fn list_meta(
+            &self,
+            prefix: &str,
+        ) -> $crate::__macro_support::Result<Vec<$crate::ListedObject>> {
+            $crate::InnerBackend::inner_backend(self).list_meta(prefix)
+        }
+        $crate::delegate_storage_backend!(@forward [$($rest)*] [$($except)*]);
+    };
+
     (@forward [remove_stale_temp_files $($rest:ident)*] [remove_stale_temp_files $($except:ident)*]) => {
         $crate::delegate_storage_backend!(@forward [$($rest)*] [$($except)*]);
     };
@@ -711,6 +795,16 @@ macro_rules! delegate_storage_backend {
         $crate::delegate_storage_backend!(@forward [$($rest)*] [$($except)*]);
     };
 
+    (@forward [conditional $($rest:ident)*] [conditional $($except:ident)*]) => {
+        $crate::delegate_storage_backend!(@forward [$($rest)*] [$($except)*]);
+    };
+    (@forward [conditional $($rest:ident)*] [$($except:ident)*]) => {
+        fn conditional(&self) -> Option<&dyn $crate::ConditionalWrite> {
+            $crate::InnerBackend::inner_backend(self).conditional()
+        }
+        $crate::delegate_storage_backend!(@forward [$($rest)*] [$($except)*]);
+    };
+
     (@forward [profile $($rest:ident)*] [profile $($except:ident)*]) => {
         $crate::delegate_storage_backend!(@forward [$($rest)*] [$($except)*]);
     };
@@ -812,6 +906,10 @@ mod tests {
             self.hit();
             Ok(Vec::new())
         }
+        fn list_meta(&self, _prefix: &str) -> Result<Vec<crate::ListedObject>> {
+            self.hit();
+            Ok(Vec::new())
+        }
         fn remove_stale_temp_files(&self, _older_than: std::time::Duration) -> Result<usize> {
             self.hit();
             Ok(0)
@@ -868,6 +966,10 @@ mod tests {
             self.hit();
             Ok(Vec::new())
         }
+        fn conditional(&self) -> Option<&dyn crate::ConditionalWrite> {
+            self.hit();
+            None
+        }
         fn profile(&self) -> crate::BackendProfile {
             self.hit();
             crate::BackendProfile {
@@ -904,7 +1006,7 @@ mod tests {
     ///
     /// This covers the methods that *have* trait defaults — for those a
     /// forgotten forward compiles, so only a call-count assertion catches it.
-    /// The ten capability methods are covered by the compiler instead (no
+    /// The eleven capability methods are covered by the compiler instead (no
     /// default ⇒ a missing forward is an error), which is what keeps the
     /// inventory from drifting behind the trait.
     #[test]
@@ -953,11 +1055,13 @@ mod tests {
         w.server_capabilities().unwrap();
         w.object_sizes(&["packs/00/k".into()]).unwrap();
         w.list_tree_sized("p").unwrap();
+        w.list_meta("p").unwrap();
+        assert!(w.conditional().is_none());
         let p = w.profile();
         assert_eq!(p.request_width, 3);
         assert_eq!(p.transfer_width, 3);
 
-        // 24 trait methods, 23 of them forwarded.
-        assert_eq!(w.inner.calls.load(Ordering::SeqCst), 23);
+        // 26 trait methods, 25 of them forwarded.
+        assert_eq!(w.inner.calls.load(Ordering::SeqCst), 25);
     }
 }

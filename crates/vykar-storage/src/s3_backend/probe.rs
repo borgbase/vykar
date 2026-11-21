@@ -14,6 +14,7 @@ use rusty_s3::actions::CreateMultipartUpload;
 use serde::Deserialize;
 use vykar_types::error::{Result, VykarError};
 
+use super::conditional::{OCTET_STREAM, PreparedPut, prepare_put};
 use super::multipart::parse_s3_error_code;
 use super::{PRESIGN_DURATION, S3Backend};
 use crate::probe::{
@@ -25,7 +26,6 @@ use crate::{ParsedUrl, RetryConfig, StorageBackend, StorageConfig};
 
 const BODY_LEN: usize = 1024;
 const MECHANISM: &str = "If-None-Match: * (signed)";
-const OCTET_STREAM: &str = "application/octet-stream";
 
 /// Probe `If-None-Match: *` on the S3 target in `cfg.url`. Credentials come from `cfg`.
 /// Errors only before the first write.
@@ -310,28 +310,6 @@ fn read_body(resp: &mut http::Response<ureq::Body>) -> String {
     let mut body = String::new();
     let _ = resp.body_mut().as_reader().read_to_string(&mut body);
     body
-}
-
-/// A signed PutObject, ready to send.
-struct PreparedPut {
-    url: String,
-    content_md5: String,
-    if_none_match: bool,
-}
-
-fn prepare_put(b: &S3Backend, full_key: &str, body: &[u8], if_none_match: bool) -> PreparedPut {
-    let content_md5 = base64::engine::general_purpose::STANDARD.encode(Md5::digest(body));
-    let mut action = b.bucket.put_object(Some(&b.credentials), full_key);
-    action.headers_mut().insert("content-type", OCTET_STREAM);
-    action.headers_mut().insert("content-md5", &content_md5);
-    if if_none_match {
-        action.headers_mut().insert("if-none-match", "*");
-    }
-    PreparedPut {
-        url: action.sign(PRESIGN_DURATION).to_string(),
-        content_md5,
-        if_none_match,
-    }
 }
 
 fn send_put(b: &S3Backend, p: &PreparedPut, body: &[u8]) -> Outcome {
@@ -777,10 +755,8 @@ fn outcome_text(o: &Outcome) -> String {
 mod tests {
     use super::*;
     use crate::probe::{Verdict, decide};
-    use crate::s3_backend::test_support::{no_retry, s3_backend, s3_error_xml};
+    use crate::s3_backend::test_support::{no_retry, reply, s3_backend, s3_error_xml, serve};
     use crate::s3_backend::tests::mock_server_capture;
-    use std::io::{BufRead, BufReader, Write};
-    use std::net::TcpListener;
 
     fn rejected_detail(o: &Outcome) -> &str {
         match o {
@@ -892,13 +868,6 @@ mod tests {
         );
     }
 
-    fn reply(status: &str, body: &str) -> String {
-        format!(
-            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        )
-    }
-
     #[test]
     fn create_upload_412_is_not_exists() {
         let (port, _, handle) = mock_server_capture(&reply(
@@ -929,64 +898,6 @@ mod tests {
          <ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
          <Name>test-bucket</Name><KeyCount>0</KeyCount><MaxKeys>1000</MaxKeys>\
          <IsTruncated>false</IsTruncated></ListBucketResult>";
-
-    /// One parsed request: method, path without the query, whole request line,
-    /// and whether `if-none-match: *` was sent.
-    struct Req {
-        method: String,
-        path: String,
-        line: String,
-        if_none_match: bool,
-    }
-
-    /// Serves requests until the test ends, answering each with `route`.
-    fn serve(route: impl Fn(&Req) -> (&'static str, String) + Send + 'static) -> u16 {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                let Ok(mut stream) = stream else { return };
-                let mut reader = BufReader::new(stream.try_clone().unwrap());
-                let mut request_line = String::new();
-                let mut content_len = 0usize;
-                let mut if_none_match = false;
-                let mut line = String::new();
-                loop {
-                    line.clear();
-                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line.trim().is_empty() {
-                        break;
-                    }
-                    if request_line.is_empty() {
-                        request_line = line.clone();
-                        continue;
-                    }
-                    let lower = line.to_lowercase();
-                    if let Some(v) = lower.strip_prefix("content-length:") {
-                        content_len = v.trim().parse().unwrap_or(0);
-                    }
-                    if lower.replace(' ', "").trim_end() == "if-none-match:*" {
-                        if_none_match = true;
-                    }
-                }
-                let mut body = vec![0u8; content_len];
-                let _ = std::io::Read::read_exact(&mut reader, &mut body);
-                let mut parts = request_line.split_whitespace();
-                let method = parts.next().unwrap_or_default().to_string();
-                let target = parts.next().unwrap_or_default();
-                let path = target.split('?').next().unwrap_or_default().to_string();
-                let req = Req {
-                    method,
-                    path,
-                    line: request_line.clone(),
-                    if_none_match,
-                };
-                let (status, reply_body) = route(&req);
-                let _ = stream.write_all(reply(status, &reply_body).as_bytes());
-                let _ = stream.flush();
-            }
-        });
-        port
-    }
 
     /// An empty listing for LIST, 404 for HEAD and a `SignatureDoesNotMatch`
     /// naming `key_id` for everything else. `list_fails` makes LIST fail the same way.

@@ -185,7 +185,7 @@ fn repo_on_recording_backend(
     let mut repo = crate::repo::Repository::init_at_format(
         Box::new(backend),
         crate::repo::EncryptionMode::None,
-        crate::config::ChunkerConfig::default(),
+        crate::repo::ChunkerParams::default(),
         None,
         None,
         None,
@@ -298,9 +298,9 @@ mod server_side {
     use super::store_two_chunks;
     use crate::commands::compact::compact_repo;
     use crate::compress::Compression;
-    use crate::config::ChunkerConfig;
     use crate::index::ChunkIndexEntry;
     use crate::index::segment::Segment;
+    use crate::repo::ChunkerParams;
     use crate::repo::index_store;
     use crate::repo::index_write::FoldPolicy;
     use crate::repo::pack::PackType;
@@ -467,7 +467,7 @@ mod server_side {
         let mut repo = Repository::init_at_format(
             storage,
             EncryptionMode::None,
-            ChunkerConfig::default(),
+            ChunkerParams::default(),
             None,
             None,
             None,

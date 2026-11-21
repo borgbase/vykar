@@ -391,7 +391,7 @@ pub fn refresh_snapshot_cache(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::ChunkerConfig;
+    use crate::chunker::ChunkerParams;
     use crate::snapshot::{SNAPSHOT_META_FIELD_COUNT, SnapshotMeta};
     use crate::testutil::MemoryBackend;
     use vykar_crypto::PlaintextEngine;
@@ -407,7 +407,7 @@ mod tests {
             username: "testuser".into(),
             time: chrono::Utc::now(),
             time_end: chrono::Utc::now(),
-            chunker_params: ChunkerConfig::default(),
+            chunker_params: ChunkerParams::default(),
             comment: String::new(),
             item_ptrs: vec![],
             stats: Default::default(),

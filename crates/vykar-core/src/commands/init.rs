@@ -16,7 +16,8 @@ pub fn run_at_format(
     passphrase: Option<&str>,
     format: RepoFormat,
 ) -> Result<Repository> {
-    let backend = storage::backend_from_config(&config.repository, config.limits.connections)?;
+    let backend =
+        storage::backend_from_config(&config.repository.storage_config(config.limits.connections))?;
 
     let encryption = match config.encryption.mode {
         EncryptionModeConfig::None => EncryptionMode::None,
@@ -31,9 +32,9 @@ pub fn run_at_format(
     let repo = Repository::init_at_format(
         backend,
         encryption,
-        config.chunker.clone(),
+        config.chunker.params(),
         passphrase,
-        Some(&config.repository),
+        Some(&config.repository.init_options()),
         super::util::cache_dir_from_config(config),
         format,
     )?;

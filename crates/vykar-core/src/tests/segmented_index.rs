@@ -2,9 +2,9 @@
 
 use std::sync::{Arc, Mutex};
 
-use crate::config::ChunkerConfig;
 use crate::index::dedup_cache::{full_index_cache_path, generation_for_state};
 use crate::index::head::empty_state_hash;
+use crate::repo::ChunkerParams;
 use crate::repo::format::ObjectType;
 use crate::repo::identity::{self, KeyProof};
 use crate::repo::index_store::INDEX_OBJECT_DIR;
@@ -68,7 +68,7 @@ fn init(format: RepoFormat, encryption: EncryptionMode) -> Env {
     let repo = Repository::init_at_format(
         Box::new(Arc::clone(&inner)),
         encryption,
-        ChunkerConfig::default(),
+        ChunkerParams::default(),
         pass,
         None,
         Some(cache.path().to_path_buf()),

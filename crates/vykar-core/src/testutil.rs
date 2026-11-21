@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use vykar_types::chunk_id::ChunkHasher;
 use vykar_types::hash::HashAlgorithm;
 
-use crate::config::ChunkerConfig;
+use crate::repo::ChunkerParams;
 use crate::repo::{EncryptionMode, Repository, WriteSessionOptions};
 use vykar_storage::{InnerBackend, StorageBackend, delegate_storage_backend};
 use vykar_types::error::{Result, VykarError};
@@ -233,7 +233,7 @@ pub fn test_repo_plaintext() -> Repository {
     let mut repo = Repository::init(
         storage,
         EncryptionMode::None,
-        ChunkerConfig::default(),
+        ChunkerParams::default(),
         None,
         None,
         None,

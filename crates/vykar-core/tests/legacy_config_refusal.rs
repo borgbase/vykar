@@ -35,10 +35,28 @@ mod v0_24_0;
 
 use chrono::{DateTime, TimeZone, Utc};
 use serde::ser::{SerializeMap, Serializer};
-use vykar_core::config::ChunkerConfig;
-use vykar_core::repo::EncryptionMode;
+use vykar_core::repo::{ChunkerParams, EncryptionMode};
 
 use crate::common::fixtures;
+
+/// Today's `RepoConfig` re-encodes every frozen fixture's `config` byte for
+/// byte, so the type still reads and writes what released binaries wrote.
+#[test]
+fn repo_config_reencodes_every_fixture_config_byte_for_byte() {
+    for (prefix, version) in [("v2", 2), ("v3", 3), ("v4", 4), ("v5", 5)] {
+        for mode in ["none", "aes256gcm", "chacha20poly1305"] {
+            let fx = fixtures::extract(prefix, mode, version);
+            let bytes = std::fs::read(fx.repo_dir().join("config")).unwrap();
+            let config: vykar_core::repo::RepoConfig =
+                rmp_serde::from_slice(&bytes).unwrap_or_else(|e| panic!("{prefix}-{mode}: {e}"));
+            assert_eq!(
+                rmp_serde::to_vec(&config).unwrap(),
+                bytes,
+                "{prefix}-{mode}"
+            );
+        }
+    }
+}
 
 /// The two outcomes of an old release's `config` gate that this suite tells apart.
 #[derive(Debug)]
@@ -81,7 +99,7 @@ enum Val {
     Str(String),
     StrList(Vec<String>),
     U32List(Vec<u32>),
-    Chunker(ChunkerConfig),
+    Chunker(ChunkerParams),
     Encryption(EncryptionMode),
     Created(DateTime<Utc>),
 }
@@ -108,7 +126,7 @@ fn encode_map(fields: Vec<(&'static str, Val)>) -> Vec<u8> {
 struct Probe {
     version: u32,
     id: [u8; 32],
-    chunker: ChunkerConfig,
+    chunker: ChunkerParams,
     encryption: EncryptionMode,
     created: DateTime<Utc>,
     min_pack_size: u32,
@@ -119,7 +137,7 @@ fn probe(version: u32, encryption: EncryptionMode) -> Probe {
     Probe {
         version,
         id: [0xA5; 32],
-        chunker: ChunkerConfig {
+        chunker: ChunkerParams {
             min_size: 8192,
             avg_size: 16384,
             max_size: 65536,
@@ -181,7 +199,7 @@ fn v6_probe(mode: EncryptionMode) -> Vec<(&'static str, Val)> {
 struct PositionalV6 {
     version: u32,
     id: Vec<u8>,
-    chunker_params: ChunkerConfig,
+    chunker_params: ChunkerParams,
     encryption: EncryptionMode,
     created: DateTime<Utc>,
     min_pack_size: u32,

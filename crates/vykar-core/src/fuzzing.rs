@@ -8,10 +8,10 @@ use tempfile::TempPath;
 use vykar_crypto::CryptoEngine;
 use vykar_types::error::{Result, VykarError};
 
-use crate::config::ChunkerConfig;
 use crate::index::dedup_cache::MmapFullIndexCache;
 use crate::index::head::{BaseRef, ObjectName, SegmentRef};
 use crate::index::segment::Segment;
+use crate::repo::ChunkerParams;
 use crate::repo::index_store;
 use crate::snapshot::item::Item;
 
@@ -75,7 +75,7 @@ pub fn plaintext_chunk_id_key(repo_id: &[u8], format: crate::repo::RepoFormat) -
 
 /// Chunk lengths backup cuts `data` into (`chunker::ChunkReader`, bounded
 /// by the input length as backup bounds it by the file size).
-pub fn chunk_lengths(data: &[u8], config: &ChunkerConfig) -> std::io::Result<Vec<usize>> {
+pub fn chunk_lengths(data: &[u8], config: &ChunkerParams) -> std::io::Result<Vec<usize>> {
     let mut reader = crate::chunker::ChunkReader::new(data.take(data.len() as u64), config);
     let mut lengths = Vec::new();
     while let Some(chunk) = reader.next_chunk()? {
@@ -85,7 +85,7 @@ pub fn chunk_lengths(data: &[u8], config: &ChunkerConfig) -> std::io::Result<Vec
 }
 
 /// Chunk lengths of `chunker::chunk_stream` (command dumps) over `data`.
-pub fn stream_chunk_lengths(data: &[u8], config: &ChunkerConfig) -> Result<Vec<usize>> {
+pub fn stream_chunk_lengths(data: &[u8], config: &ChunkerParams) -> Result<Vec<usize>> {
     crate::chunker::chunk_stream(data, config)
         .map(|chunk| {
             chunk

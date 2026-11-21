@@ -8,7 +8,7 @@ use crate::config::{EncryptionModeConfig, VykarConfig};
 use crate::limits;
 use crate::repo::lock;
 use crate::repo::lock::SessionEntry;
-use crate::repo::{OpenOptions, Repository, identity};
+use crate::repo::{OpenOptions, OpenRequest, Repository, identity};
 use crate::storage;
 use vykar_storage::StorageBackend;
 use vykar_types::error::{
@@ -53,14 +53,24 @@ pub(crate) fn enrich_repo_not_found(err: VykarError, url: &str) -> VykarError {
     }
 }
 
+/// The open request `config` describes.
+pub fn open_request(config: &VykarConfig) -> OpenRequest {
+    OpenRequest {
+        url: config.repository.url.clone(),
+        cache_dir: cache_dir_from_config(config),
+        trust_repo: config.trust_repo,
+        require_encryption: config.encryption.mode != EncryptionModeConfig::None,
+    }
+}
+
 /// Verify the repository identity against the locally pinned fingerprint.
-pub(crate) fn verify_repo_identity(config: &VykarConfig, repo: &Repository) -> Result<()> {
+pub(crate) fn verify_repo_identity(req: &OpenRequest, repo: &Repository) -> Result<()> {
     identity::verify_or_pin(
-        &config.repository.url,
+        &req.url,
         &repo.config.id,
         repo.crypto.chunk_hasher().key(),
-        cache_dir_from_config(config).as_deref(),
-        config.trust_repo,
+        req.cache_dir.as_deref(),
+        req.trust_repo,
     )
 }
 
@@ -72,10 +82,10 @@ pub(crate) fn verify_repo_identity(config: &VykarConfig, repo: &Repository) -> R
 /// config is unauthenticated and must not be able to downgrade the client.
 /// Applied in one place so every core open path gets all three; caller-set
 /// flags such as `skip_key_backfill` are preserved.
-pub(crate) fn with_identity_context(opts: OpenOptions, config: &VykarConfig) -> OpenOptions {
-    opts.with_repo_url(config.repository.url.clone())
-        .trust_repo(config.trust_repo)
-        .require_encryption(config.encryption.mode != EncryptionModeConfig::None)
+pub(crate) fn with_identity_context(opts: OpenOptions, req: &OpenRequest) -> OpenOptions {
+    opts.with_repo_url(req.url.clone())
+        .trust_repo(req.trust_repo)
+        .require_encryption(req.require_encryption)
 }
 
 /// Open a repository from config using the standard backend resolver.
@@ -84,23 +94,24 @@ pub fn open_repo(
     passphrase: Option<&str>,
     opts: OpenOptions,
 ) -> Result<Repository> {
-    let backend = storage::backend_from_config(&config.repository, config.limits.connections)?;
+    let backend =
+        storage::backend_from_config(&config.repository.storage_config(config.limits.connections))?;
     let backend = limits::wrap_storage_backend(backend, &config.limits);
-    open_repo_on(backend, config, passphrase, opts)
+    open_repo_on(backend, &open_request(config), passphrase, opts)
 }
 
 /// [`open_repo`] over a backend the caller built. Applies the same identity
 /// context and pin check; no limits wrapper (the caller decides).
 pub(crate) fn open_repo_on(
     backend: Box<dyn StorageBackend>,
-    config: &VykarConfig,
+    req: &OpenRequest,
     passphrase: Option<&str>,
     opts: OpenOptions,
 ) -> Result<Repository> {
-    let opts = with_identity_context(opts, config);
-    let repo = Repository::open(backend, passphrase, cache_dir_from_config(config), opts)
-        .map_err(|e| enrich_repo_not_found(e, &config.repository.url))?;
-    verify_repo_identity(config, &repo)?;
+    let opts = with_identity_context(opts, req);
+    let repo = Repository::open(backend, passphrase, req.cache_dir.clone(), opts)
+        .map_err(|e| enrich_repo_not_found(e, &req.url))?;
+    verify_repo_identity(req, &repo)?;
     Ok(repo)
 }
 
@@ -112,35 +123,36 @@ pub fn open_repo_with_read_session(
     passphrase: Option<&str>,
     opts: OpenOptions,
 ) -> Result<(Repository, lock::SessionGuard)> {
-    let backend = storage::backend_from_config(&config.repository, config.limits.connections)?;
+    let backend =
+        storage::backend_from_config(&config.repository.storage_config(config.limits.connections))?;
     let backend: Arc<dyn StorageBackend> =
         Arc::from(limits::wrap_storage_backend(backend, &config.limits));
-    open_repo_with_read_session_on(backend, config, passphrase, opts)
+    open_repo_with_read_session_on(backend, &open_request(config), passphrase, opts)
 }
 
 /// [`open_repo_with_read_session`] over a backend the caller built: registers
 /// the session marker on `backend` before opening, exactly as the config path.
 pub(crate) fn open_repo_with_read_session_on(
     backend: Arc<dyn StorageBackend>,
-    config: &VykarConfig,
+    req: &OpenRequest,
     passphrase: Option<&str>,
     opts: OpenOptions,
 ) -> Result<(Repository, lock::SessionGuard)> {
-    let opts = with_identity_context(opts, config);
+    let opts = with_identity_context(opts, req);
     let session_id = format!("{:032x}", rand::random::<u128>());
     lock::register_session(backend.as_ref(), &session_id)?;
 
     let open_result = Repository::open_shared(
         Arc::clone(&backend),
         passphrase,
-        cache_dir_from_config(config),
+        req.cache_dir.clone(),
         opts,
     );
 
     match open_result {
         Ok(repo) => {
             // Verify identity before adopting the session into a guard.
-            if let Err(e) = verify_repo_identity(config, &repo) {
+            if let Err(e) = verify_repo_identity(req, &repo) {
                 lock::deregister_session(backend.as_ref(), &session_id);
                 return Err(e);
             }
@@ -154,7 +166,7 @@ pub(crate) fn open_repo_with_read_session_on(
         }
         Err(e) => {
             lock::deregister_session(backend.as_ref(), &session_id);
-            Err(enrich_repo_not_found(e, &config.repository.url))
+            Err(enrich_repo_not_found(e, &req.url))
         }
     }
 }

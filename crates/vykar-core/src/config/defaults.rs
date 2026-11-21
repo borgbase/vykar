@@ -1,21 +1,11 @@
 use std::time::Duration;
 
 use super::types::{CompressionAlgorithm, EncryptionModeConfig};
+pub(super) use crate::chunker::{default_avg_size, default_max_size, default_min_size};
+pub(super) use crate::repo::{default_max_pack_size, default_min_pack_size};
 
 pub(super) fn default_encryption_mode() -> EncryptionModeConfig {
     EncryptionModeConfig::Auto
-}
-
-pub(super) fn default_min_size() -> u32 {
-    512 * 1024 // 512 KiB
-}
-
-pub(super) fn default_avg_size() -> u32 {
-    2 * 1024 * 1024 // 2 MiB
-}
-
-pub(super) fn default_max_size() -> u32 {
-    8 * 1024 * 1024 // 8 MiB
 }
 
 pub(super) fn default_algorithm() -> CompressionAlgorithm {
@@ -24,14 +14,6 @@ pub(super) fn default_algorithm() -> CompressionAlgorithm {
 
 pub(super) fn default_zstd_level() -> i32 {
     3
-}
-
-pub(crate) fn default_min_pack_size() -> u32 {
-    32 * 1024 * 1024 // 32 MiB
-}
-
-pub(crate) fn default_max_pack_size() -> u32 {
-    192 * 1024 * 1024 // 192 MiB
 }
 
 pub(super) fn default_allow_insecure_http() -> bool {

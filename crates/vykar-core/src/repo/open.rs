@@ -10,11 +10,8 @@ use super::key::{self, KeyProofCtx};
 use super::manifest::Manifest;
 use super::snapshot_cache;
 use super::{
-    EncryptionMode, KEY_PRIMARY, KEY_SECONDARY, MAX_PACK_SIZE_LIMIT, OpenOptions, RepoConfig,
-    RepoFormat, Repository,
-};
-use crate::config::{
-    ChunkerConfig, RepositoryConfig, default_max_pack_size, default_min_pack_size,
+    ChunkerParams, EncryptionMode, InitOptions, KEY_PRIMARY, KEY_SECONDARY, MAX_PACK_SIZE_LIMIT,
+    OpenOptions, RepoConfig, RepoFormat, Repository, default_max_pack_size, default_min_pack_size,
 };
 use crate::index::ChunkIndex;
 use crate::index::dedup_cache::generation_for_state;
@@ -65,8 +62,10 @@ pub(crate) fn derive_plaintext_chunk_id_key(repo_id: &[u8], format: RepoFormat) 
 }
 
 /// Best-effort repository label for the capability-probe error message.
-fn storage_label(repo_config_opts: Option<&RepositoryConfig>) -> String {
-    repo_config_opts.map_or_else(|| "the configured server".to_string(), |c| c.url.clone())
+fn storage_label(init_opts: Option<&InitOptions>) -> String {
+    init_opts
+        .and_then(|o| o.url.clone())
+        .unwrap_or_else(|| "the configured server".to_string())
 }
 
 impl Repository {
@@ -74,9 +73,9 @@ impl Repository {
     pub fn init(
         storage: Box<dyn StorageBackend>,
         encryption: EncryptionMode,
-        chunker_params: ChunkerConfig,
+        chunker_params: ChunkerParams,
         passphrase: Option<&str>,
-        repo_config_opts: Option<&RepositoryConfig>,
+        init_opts: Option<&InitOptions>,
         cache_dir: Option<PathBuf>,
     ) -> Result<Self> {
         // New repositories are always created at the current format. There is
@@ -88,7 +87,7 @@ impl Repository {
             encryption,
             chunker_params,
             passphrase,
-            repo_config_opts,
+            init_opts,
             cache_dir,
             RepoFormat::CURRENT,
         )
@@ -100,9 +99,9 @@ impl Repository {
     pub fn init_at_format(
         storage: Box<dyn StorageBackend>,
         encryption: EncryptionMode,
-        chunker_params: ChunkerConfig,
+        chunker_params: ChunkerParams,
         passphrase: Option<&str>,
-        repo_config_opts: Option<&RepositoryConfig>,
+        init_opts: Option<&InitOptions>,
         cache_dir: Option<PathBuf>,
         format: RepoFormat,
     ) -> Result<Self> {
@@ -127,11 +126,11 @@ impl Repository {
         let mut repo_id = vec![0u8; 32];
         rng.fill_bytes(&mut repo_id);
 
-        let min_pack_size = repo_config_opts
-            .map(|c| c.min_pack_size)
+        let min_pack_size = init_opts
+            .map(|o| o.min_pack_size)
             .unwrap_or_else(default_min_pack_size);
-        let max_pack_size = repo_config_opts
-            .map(|c| c.max_pack_size)
+        let max_pack_size = init_opts
+            .map(|o| o.max_pack_size)
             .unwrap_or_else(default_max_pack_size);
 
         if max_pack_size > MAX_PACK_SIZE_LIMIT {
@@ -189,7 +188,7 @@ impl Repository {
                         "vykar-server at {} (version {}) does not support {} repositories \
                          (format v{}). Upgrade the server to 0.20 or later, or keep using \
                          an existing repository.",
-                        storage_label(repo_config_opts),
+                        storage_label(init_opts),
                         caps.version,
                         format.chunk_hash().as_str().to_uppercase(),
                         format.version(),
@@ -199,7 +198,7 @@ impl Repository {
                     return Err(VykarError::Config(format!(
                         "vykar-server at {} (version {}) does not support the segmented \
                          index of format v{}. Upgrade the server first.",
-                        storage_label(repo_config_opts),
+                        storage_label(init_opts),
                         caps.version,
                         format.version(),
                     )));
@@ -519,7 +518,7 @@ mod tests {
         let mut repo = Repository::init(
             Box::new(Arc::clone(&inner)),
             EncryptionMode::None,
-            ChunkerConfig::default(),
+            ChunkerParams::default(),
             None,
             None,
             Some(cache.to_path_buf()),

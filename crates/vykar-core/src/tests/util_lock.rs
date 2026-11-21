@@ -4,7 +4,8 @@ use std::sync::{Arc, Mutex};
 
 use crate::commands::util::with_repo_lock;
 use crate::compress::Compression;
-use crate::config::{ChunkerConfig, RepositoryConfig};
+use crate::repo::ChunkerParams;
+use crate::repo::InitOptions;
 use crate::repo::pack::PackType;
 use crate::repo::{EncryptionMode, Repository, WriteSessionOptions};
 use vykar_storage::StorageBackend;
@@ -116,7 +117,7 @@ fn init_repo_with_backend(backend: AdvisoryLockBackend) -> Repository {
     Repository::init(
         Box::new(backend),
         EncryptionMode::None,
-        ChunkerConfig::default(),
+        ChunkerParams::default(),
         None,
         None,
         None,
@@ -158,8 +159,7 @@ fn with_repo_lock_flushes_pending_state_on_action_error() {
     crate::testutil::init_test_environment();
 
     let backend = AdvisoryLockBackend::new(false);
-    let small_config = RepositoryConfig {
-        url: String::new(),
+    let small_config = InitOptions {
         min_pack_size: 256,
         max_pack_size: 256,
         ..Default::default()
@@ -167,7 +167,7 @@ fn with_repo_lock_flushes_pending_state_on_action_error() {
     let mut repo = Repository::init(
         Box::new(backend.clone()),
         EncryptionMode::None,
-        ChunkerConfig::default(),
+        ChunkerParams::default(),
         None,
         Some(&small_config),
         None,

@@ -110,8 +110,9 @@ impl From<StrictChunkerConfig> for ChunkerConfig {
     }
 }
 
-// ChunkerConfig is serialized in snapshot metadata, so we keep the wire type
-// forward-compatible and enforce strict YAML config parsing here instead.
+// The stored type (`ChunkerParams`, in repository config and snapshot
+// metadata) stays forward-compatible; strict YAML config parsing is enforced
+// here instead.
 fn deserialize_strict_chunker_config<'de, D>(deserializer: D) -> Result<ChunkerConfig, D::Error>
 where
     D: serde::Deserializer<'de>,

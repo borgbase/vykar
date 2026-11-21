@@ -1,14 +1,130 @@
 use std::io::{self, Read, Take};
 use std::sync::LazyLock;
 
-use fastcdc::v2020::{Normalization, StreamCDC, get_gear_with_seed, select_masks};
+use fastcdc::v2020::{
+    AVERAGE_MAX, AVERAGE_MIN, MAXIMUM_MIN, MINIMUM_MAX, MINIMUM_MIN, Normalization, StreamCDC,
+    get_gear_with_seed, select_masks,
+};
+use serde::{Deserialize, Serialize};
 
-use crate::config::ChunkerConfig;
+/// Hard cap on `ChunkerParams::max_size`. Any user-configured value above
+/// this is clamped down during config validation. This bounds the maximum
+/// encrypted blob size to `CHUNK_MAX_SIZE_HARD_CAP + 1024` (compression tag +
+/// encryption envelope).
+pub const CHUNK_MAX_SIZE_HARD_CAP: u32 = 16 * 1024 * 1024; // 16 MiB
+
+pub(crate) fn default_min_size() -> u32 {
+    512 * 1024 // 512 KiB
+}
+
+pub(crate) fn default_avg_size() -> u32 {
+    2 * 1024 * 1024 // 2 MiB
+}
+
+pub(crate) fn default_max_size() -> u32 {
+    8 * 1024 * 1024 // 8 MiB
+}
+
+/// FastCDC parameters as a repository stores them: in its `config` and in
+/// every snapshot.
+///
+/// **On-disk type.** Serialized as a positional 3-element msgpack array
+/// inside `RepoConfig` and `SnapshotMeta`. Field order, names, types and the
+/// serde attributes are frozen (`repo_config_golden_bytes`). The YAML
+/// `chunker:` section is a separate type, `ChunkerConfig`, that converts
+/// into this one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChunkerParams {
+    #[serde(default = "default_min_size")]
+    pub min_size: u32,
+    #[serde(default = "default_avg_size")]
+    pub avg_size: u32,
+    #[serde(default = "default_max_size")]
+    pub max_size: u32,
+}
+
+impl Default for ChunkerParams {
+    fn default() -> Self {
+        Self {
+            min_size: default_min_size(),
+            avg_size: default_avg_size(),
+            max_size: default_max_size(),
+        }
+    }
+}
+
+impl ChunkerParams {
+    /// FastCDC 5 requires even parameters. This check does not normalize or
+    /// clamp values, so it is also safe to apply to persisted repository config.
+    fn validate_even_sizes(&self) -> vykar_types::error::Result<()> {
+        for (field, value) in [
+            ("min_size", self.min_size),
+            ("avg_size", self.avg_size),
+            ("max_size", self.max_size),
+        ] {
+            if value % 2 != 0 {
+                return Err(vykar_types::error::VykarError::Config(format!(
+                    "chunker.{field} must be even, got {value}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Everything FastCDC requires of the parameters: the ranges, their
+    /// order, and even sizes. Never clamps, so it is safe to apply to the
+    /// parameters a repository's `config` holds.
+    pub fn validate_stored(&self) -> vykar_types::error::Result<()> {
+        use vykar_types::error::VykarError;
+
+        let min = self.min_size as usize;
+        let avg = self.avg_size as usize;
+        let max = self.max_size as usize;
+        let hard_cap = CHUNK_MAX_SIZE_HARD_CAP as usize;
+
+        if !(MINIMUM_MIN..=MINIMUM_MAX).contains(&min) {
+            return Err(VykarError::Config(format!(
+                "chunker.min_size must be in [{MINIMUM_MIN}, {MINIMUM_MAX}], got {}",
+                self.min_size
+            )));
+        }
+
+        if !(AVERAGE_MIN..=AVERAGE_MAX).contains(&avg) {
+            return Err(VykarError::Config(format!(
+                "chunker.avg_size must be in [{AVERAGE_MIN}, {AVERAGE_MAX}], got {}",
+                self.avg_size
+            )));
+        }
+
+        if !(MAXIMUM_MIN..=hard_cap).contains(&max) {
+            return Err(VykarError::Config(format!(
+                "chunker.max_size must be in [{MAXIMUM_MIN}, {CHUNK_MAX_SIZE_HARD_CAP}], got {}",
+                self.max_size
+            )));
+        }
+
+        if self.min_size > self.avg_size {
+            return Err(VykarError::Config(format!(
+                "chunker must satisfy min_size <= avg_size, got {} > {}",
+                self.min_size, self.avg_size
+            )));
+        }
+
+        if self.avg_size > self.max_size {
+            return Err(VykarError::Config(format!(
+                "chunker must satisfy avg_size <= max_size, got {} > {}",
+                self.avg_size, self.max_size
+            )));
+        }
+
+        self.validate_even_sizes()
+    }
+}
 
 /// Chunk a byte slice using FastCDC content-defined chunking.
 /// Returns a vector of `(offset, length)` pairs.
 #[cfg(test)]
-pub(crate) fn chunk_data(data: &[u8], config: &ChunkerConfig) -> Vec<(usize, usize)> {
+pub(crate) fn chunk_data(data: &[u8], config: &ChunkerParams) -> Vec<(usize, usize)> {
     let chunker = fastcdc::v2020::FastCDC::new(
         data,
         config.min_size as usize,
@@ -19,7 +135,7 @@ pub(crate) fn chunk_data(data: &[u8], config: &ChunkerConfig) -> Vec<(usize, usi
 }
 
 /// Chunk a reader stream using FastCDC content-defined chunking.
-pub fn chunk_stream<R: Read>(source: R, config: &ChunkerConfig) -> StreamCDC<R> {
+pub fn chunk_stream<R: Read>(source: R, config: &ChunkerParams) -> StreamCDC<R> {
     StreamCDC::new(
         source,
         config.min_size as usize,
@@ -49,7 +165,7 @@ pub fn chunk_stream<R: Read>(source: R, config: &ChunkerConfig) -> StreamCDC<R> 
 #[cfg(test)]
 pub(crate) fn chunk_stream_bounded<R: Read>(
     source: Take<R>,
-    config: &ChunkerConfig,
+    config: &ChunkerParams,
 ) -> StreamCDC<Take<R>> {
     let max_size = bounded_window_size(source.limit(), config);
     StreamCDC::new(
@@ -61,7 +177,7 @@ pub(crate) fn chunk_stream_bounded<R: Read>(
 }
 
 /// Preserve the original bounded StreamCDC allocation size and cut window.
-fn bounded_window_size(limit: u64, config: &ChunkerConfig) -> usize {
+fn bounded_window_size(limit: u64, config: &ChunkerParams) -> usize {
     let max_size = limit
         .max(u64::from(config.avg_size))
         .max(fastcdc::v2020::MAXIMUM_MIN as u64)
@@ -170,7 +286,7 @@ pub(crate) struct ChunkReader<R: Read> {
 }
 
 impl<R: Read> ChunkReader<R> {
-    pub(crate) fn new(source: Take<R>, config: &ChunkerConfig) -> Self {
+    pub(crate) fn new(source: Take<R>, config: &ChunkerParams) -> Self {
         let max_size = bounded_window_size(source.limit(), config);
         let (mask_s, mask_l) = select_masks(config.avg_size as usize, Normalization::Level1);
         Self {
@@ -283,7 +399,7 @@ mod tests {
 
     #[test]
     fn reader_buffer_matches_legacy_bound_and_never_grows() {
-        let config = ChunkerConfig {
+        let config = ChunkerParams {
             min_size: 256,
             avg_size: 1024,
             max_size: 4096,
@@ -323,7 +439,7 @@ mod tests {
     /// The pre-change reader: compact and refill a full window before every
     /// chunk, then call fastcdc's `cut` on it. This is the reference the
     /// resumable scan must match bit for bit.
-    fn reference_chunks(data: &[u8], limit: usize, config: &ChunkerConfig) -> Vec<usize> {
+    fn reference_chunks(data: &[u8], limit: usize, config: &ChunkerParams) -> Vec<usize> {
         let data = &data[..limit.min(data.len())];
         let window = bounded_window_size(limit as u64, config);
         let (mask_s, mask_l) = select_masks(config.avg_size as usize, Normalization::Level1);
@@ -373,7 +489,7 @@ mod tests {
         }
     }
 
-    fn reader_chunks<R: Read>(source: Take<R>, data: &[u8], config: &ChunkerConfig) -> Vec<usize> {
+    fn reader_chunks<R: Read>(source: Take<R>, data: &[u8], config: &ChunkerParams) -> Vec<usize> {
         let mut reader = ChunkReader::new(source, config);
         let mut out = Vec::new();
         let mut offset = 0;
@@ -386,7 +502,7 @@ mod tests {
         out
     }
 
-    fn assert_matches_reference(data: &[u8], limit: usize, config: &ChunkerConfig, seed: u64) {
+    fn assert_matches_reference(data: &[u8], limit: usize, config: &ChunkerParams, seed: u64) {
         let expected = reference_chunks(data, limit, config);
         let whole = reader_chunks(Cursor::new(data).take(limit as u64), data, config);
         assert_eq!(
@@ -412,21 +528,21 @@ mod tests {
         }
     }
 
-    fn differential_configs() -> Vec<ChunkerConfig> {
+    fn differential_configs() -> Vec<ChunkerParams> {
         vec![
-            ChunkerConfig {
+            ChunkerParams {
                 min_size: 256,
                 avg_size: 1024,
                 max_size: 4096,
             },
             // Low-entropy masks so `mask_l` hits past `avg` are common.
-            ChunkerConfig {
+            ChunkerParams {
                 min_size: 64,
                 avg_size: 256,
                 max_size: 1024,
             },
             // min close to avg: the mask_s phase is short.
-            ChunkerConfig {
+            ChunkerParams {
                 min_size: 1000,
                 avg_size: 1024,
                 max_size: 1100,
@@ -486,10 +602,31 @@ mod tests {
 
     #[test]
     fn resumable_scan_matches_fastcdc_cut_at_default_parameters() {
-        let config = ChunkerConfig::default();
+        let config = ChunkerParams::default();
         let len = 3 * config.max_size as usize + 12_345;
         let data = xorshift_data(2026, len);
         assert_matches_reference(&data, len, &config, 11);
         assert_matches_reference(&data, len - 4_000_001, &config, 13);
+    }
+
+    /// Stored parameters are checked, never clamped.
+    #[test]
+    fn params_validate_stored_rejects_without_clamping() {
+        let config = ChunkerParams {
+            min_size: 512 * 1024,
+            avg_size: 2 * 1024 * 1024,
+            max_size: 2 * CHUNK_MAX_SIZE_HARD_CAP,
+        };
+        let error = config.validate_stored().unwrap_err();
+        assert!(error.to_string().contains("chunker.max_size must be in"));
+        for (min, avg, max) in [(0, 1024, 4096), (256, 0, 4096), (8192, 4096, 16384)] {
+            let config = ChunkerParams {
+                min_size: min,
+                avg_size: avg,
+                max_size: max,
+            };
+            assert!(config.validate_stored().is_err(), "{min} {avg} {max}");
+        }
+        assert!(ChunkerParams::default().validate_stored().is_ok());
     }
 }

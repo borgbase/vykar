@@ -14,7 +14,6 @@ use zeroize::Zeroizing;
 
 use crate::app::preflight::{self, UnavailableRepo};
 use crate::commands;
-use crate::compress::Compression;
 use crate::config::{ResolvedRepo, SourceEntry, VykarConfig};
 use crate::repo::control::CancelToken;
 use vykar_types::error::{Result, VykarError};
@@ -280,8 +279,7 @@ fn run_backup_sources(
         ));
     }
 
-    let compression =
-        Compression::from_algorithm(config.compression.algorithm, config.compression.zstd_level);
+    let compression = config.compression.to_compression();
 
     let mut report = BackupRunReport::default();
     let mut first_failure: Option<VykarError> = None;

@@ -309,7 +309,8 @@ fn run_backup_with_passphrase(
 }
 
 fn repo_keys(config: &crate::config::VykarConfig, prefix: &str) -> Vec<String> {
-    let storage = crate::storage::backend_from_config(&config.repository, 1).unwrap();
+    let storage =
+        crate::storage::backend_from_config(&config.repository.storage_config(1)).unwrap();
     let mut keys: Vec<String> = storage
         .list(prefix)
         .unwrap()
@@ -413,7 +414,8 @@ fn assert_missing_pack_fails_commit_with(
     batch_sizes: bool,
 ) {
     let packs_before = repo_keys(config, "packs/").len();
-    let storage = crate::storage::backend_from_config(&config.repository, 1).unwrap();
+    let storage =
+        crate::storage::backend_from_config(&config.repository.storage_config(1)).unwrap();
     let index_before = storage.get("index").unwrap();
     let objects_before = repo_keys(config, "index.d/");
     let shared = Shared {
@@ -783,7 +785,8 @@ fn segmented_commit_puts_segment_then_head_then_snapshot() {
         writes.iter().all(|(i, _)| lock < *i && *i < unlock),
         "{events:?}"
     );
-    let storage = crate::storage::backend_from_config(&config.repository, 1).unwrap();
+    let storage =
+        crate::storage::backend_from_config(&config.repository.storage_config(1)).unwrap();
     assert!(!storage.exists("index.gen").unwrap());
 }
 
@@ -864,7 +867,8 @@ fn fail_after_the_index_write(
     src: &Path,
     repo_dir: &Path,
 ) -> (Vec<String>, Refcounts) {
-    let storage = crate::storage::backend_from_config(&config.repository, 1).unwrap();
+    let storage =
+        crate::storage::backend_from_config(&config.repository.storage_config(1)).unwrap();
     let index_before = storage.get("index").unwrap();
     let shared = Shared {
         fail_snapshot_put: true,
@@ -989,7 +993,8 @@ fn other_client(dir: &Path, config: &crate::config::VykarConfig) -> crate::confi
 
 /// The repository as a client with an empty cache dir at `cache` reads it.
 fn cold_repo(config: &crate::config::VykarConfig, cache: &Path) -> crate::repo::Repository {
-    let storage = crate::storage::backend_from_config(&config.repository, 1).unwrap();
+    let storage =
+        crate::storage::backend_from_config(&config.repository.storage_config(1)).unwrap();
     crate::repo::Repository::open(
         storage,
         None,
@@ -1134,7 +1139,8 @@ fn chunks_deleted_during_the_session_fail_the_commit_as_stale() {
     let hook = {
         let (seen, config) = (Arc::clone(&seen), config.clone());
         move || {
-            let storage = crate::storage::backend_from_config(&config.repository, 1).unwrap();
+            let storage =
+                crate::storage::backend_from_config(&config.repository.storage_config(1)).unwrap();
             let markers: Vec<String> = storage
                 .list("sessions/")
                 .unwrap()
@@ -1179,7 +1185,8 @@ fn chunks_deleted_during_the_session_fail_the_commit_as_stale() {
     );
     let (head_at_lock, objects_at_lock) = seen.lock().unwrap().take().expect("the hook ran");
 
-    let storage = crate::storage::backend_from_config(&config.repository, 1).unwrap();
+    let storage =
+        crate::storage::backend_from_config(&config.repository.storage_config(1)).unwrap();
     assert_eq!(
         storage.get("index").unwrap(),
         head_at_lock,

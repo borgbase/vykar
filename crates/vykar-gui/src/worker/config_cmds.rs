@@ -123,18 +123,21 @@ fn handle_repo_recovery_action<F>(
         Some(r) => r,
         None => return,
     };
-    let backend =
-        match storage::backend_from_config(&repo.config.repository, repo.config.limits.connections)
-        {
-            Ok(b) => b,
-            Err(e) => {
-                send_log(
-                    &ctx.ui_tx,
-                    format!("[{repo_name}] cannot open storage: {e}"),
-                );
-                return;
-            }
-        };
+    let backend = match storage::backend_from_config(
+        &repo
+            .config
+            .repository
+            .storage_config(repo.config.limits.connections),
+    ) {
+        Ok(b) => b,
+        Err(e) => {
+            send_log(
+                &ctx.ui_tx,
+                format!("[{repo_name}] cannot open storage: {e}"),
+            );
+            return;
+        }
+    };
 
     match action(backend.as_ref()) {
         Ok(removed) => {

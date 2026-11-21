@@ -358,7 +358,7 @@ Each `SnapshotEntry` contains: `name`, `id` (32-byte random), `time`, `source_la
 | hostname | String | Machine that created the backup |
 | username | String | User that ran the backup |
 | time / time_end | DateTime | Backup start and end timestamps |
-| chunker_params | ChunkerConfig | CDC parameters used for this snapshot |
+| chunker_params | ChunkerParams | CDC parameters used for this snapshot |
 | comment | String | Optional snapshot comment field; currently written as `""` by backup flows |
 | item_ptrs | Vec\<ChunkId\> | Chunk IDs containing the serialized item stream |
 | stats | SnapshotStats | File count, original/compressed/deduplicated sizes |

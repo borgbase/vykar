@@ -46,9 +46,9 @@ fn fixture(legacy: RepoFormat) -> Fixture {
     Repository::init_at_format(
         Box::new(LocalBackend::new(repo_dir.to_str().unwrap()).unwrap()),
         EncryptionMode::None,
-        config.chunker.clone(),
+        config.chunker.params(),
         None,
-        Some(&config.repository),
+        Some(&config.repository.init_options()),
         Some(cache),
         legacy.segmented_successor().unwrap(),
     )
@@ -1141,7 +1141,7 @@ fn init_refuses_legacy_formats() {
         let err = Repository::init_at_format(
             Box::new(LocalBackend::new(tmp.path().to_str().unwrap()).unwrap()),
             EncryptionMode::None,
-            crate::config::ChunkerConfig::default(),
+            crate::repo::ChunkerParams::default(),
             None,
             None,
             None,

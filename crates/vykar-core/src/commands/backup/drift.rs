@@ -18,8 +18,8 @@ use std::io::Read;
 use std::path::Path;
 
 use crate::chunker;
-use crate::config::ChunkerConfig;
 use crate::platform::fs;
+use crate::repo::ChunkerParams;
 use vykar_types::error::{Result, VykarError};
 
 use super::read_source::BackupSource;
@@ -88,7 +88,7 @@ pub(super) fn read_range_drift_checked(
     path: &str,
     pre_meta: &fs::MetadataSummary,
     plan: ReadPlan,
-    chunker_config: &ChunkerConfig,
+    chunker_config: &ChunkerParams,
     mut on_chunk: impl FnMut(Cow<'_, [u8]>) -> Result<()>,
 ) -> Result<()> {
     // For whole-file plans the read is hard-capped at `size + 1`: an
@@ -180,7 +180,7 @@ mod tests {
             &path.to_string_lossy(),
             &pre_meta,
             ReadPlan::Segment { offset, len },
-            &ChunkerConfig::default(),
+            &ChunkerParams::default(),
             |data| {
                 got.extend_from_slice(&data);
                 Ok(())

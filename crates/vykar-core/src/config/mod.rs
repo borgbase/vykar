@@ -15,7 +15,6 @@ pub use self::limits::{ResourceLimitsConfig, THREADS_MAX, THREADS_MIN};
 
 // Re-export from submodules
 pub use self::defaults::parse_interval;
-pub(crate) use self::defaults::{default_max_pack_size, default_min_pack_size};
 #[allow(deprecated)]
 pub use self::resolve::load_config;
 pub use self::resolve::{

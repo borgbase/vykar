@@ -43,9 +43,9 @@ fn fixture(format: RepoFormat) -> Fixture {
     Repository::init_at_format(
         Box::new(LocalBackend::new(repo_dir.to_str().unwrap()).unwrap()),
         EncryptionMode::None,
-        config.chunker.clone(),
+        config.chunker.params(),
         None,
-        Some(&config.repository),
+        Some(&config.repository.init_options()),
         Some(cache),
         format,
     )

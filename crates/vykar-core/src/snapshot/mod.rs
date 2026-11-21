@@ -3,7 +3,7 @@ pub mod item;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::config::ChunkerConfig;
+use crate::chunker::ChunkerParams;
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
 
@@ -31,7 +31,7 @@ pub struct SnapshotMeta {
     pub username: String,
     pub time: DateTime<Utc>,
     pub time_end: DateTime<Utc>,
-    pub chunker_params: ChunkerConfig,
+    pub chunker_params: ChunkerParams,
     #[serde(default)]
     pub comment: String,
     /// Chunk IDs that contain the serialized item stream.
@@ -137,7 +137,7 @@ mod tests {
             username: "user".into(),
             time: Utc::now(),
             time_end: Utc::now(),
-            chunker_params: ChunkerConfig::default(),
+            chunker_params: ChunkerParams::default(),
             comment: String::new(),
             item_ptrs: vec![],
             stats: SnapshotStats::default(),
@@ -190,7 +190,7 @@ mod tests {
             username: "the-user".into(),
             time: t0,
             time_end: t1,
-            chunker_params: ChunkerConfig {
+            chunker_params: ChunkerParams {
                 min_size: 11,
                 avg_size: 22,
                 max_size: 33,
@@ -229,7 +229,7 @@ mod tests {
             String,          // username
             DateTime<Utc>,   // time
             DateTime<Utc>,   // time_end
-            ChunkerConfig,   // chunker_params
+            (u32, u32, u32), // chunker_params
             String,          // comment
             Vec<ChunkId>,    // item_ptrs
             SnapshotStats,   // stats
@@ -275,7 +275,7 @@ mod tests {
             username: String,
             time: DateTime<Utc>,
             time_end: DateTime<Utc>,
-            chunker_params: ChunkerConfig,
+            chunker_params: ChunkerParams,
             comment: String,
             item_ptrs: Vec<ChunkId>,
             stats: SnapshotStats,
@@ -290,7 +290,7 @@ mod tests {
             username: "u".into(),
             time: now,
             time_end: now,
-            chunker_params: ChunkerConfig::default(),
+            chunker_params: ChunkerParams::default(),
             comment: String::new(),
             item_ptrs: vec![],
             stats: SnapshotStats::default(),

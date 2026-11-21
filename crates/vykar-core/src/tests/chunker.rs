@@ -1,10 +1,10 @@
 use std::io::{Cursor, Read};
 
 use crate::chunker::{ChunkReader, chunk_data, chunk_stream, chunk_stream_bounded};
-use crate::config::ChunkerConfig;
+use crate::repo::ChunkerParams;
 
-fn test_config() -> ChunkerConfig {
-    ChunkerConfig {
+fn test_config() -> ChunkerParams {
+    ChunkerParams {
         min_size: 256,
         avg_size: 1024,
         max_size: 4096,
@@ -260,7 +260,7 @@ const GOLDEN_SMALL_PARAMS: &[(usize, usize)] = &[
 #[test]
 fn cut_points_match_pinned_vectors_at_default_params() {
     let data = seeded_data(0x5645_4b41_5f43_4443, 40 * 1024 * 1024);
-    let chunks = chunk_data(&data, &ChunkerConfig::default());
+    let chunks = chunk_data(&data, &ChunkerParams::default());
     assert_eq!(chunks, GOLDEN_DEFAULT_PARAMS);
 }
 

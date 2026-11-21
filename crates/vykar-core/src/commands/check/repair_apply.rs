@@ -512,7 +512,7 @@ mod tests {
     use super::*;
     use crate::commands::check::repair_plan::build_repair_plan;
     use crate::commands::check::scan::{ScanOptions, integrity_scan};
-    use crate::config::ChunkerConfig;
+    use crate::repo::ChunkerParams;
     use crate::repo::{EncryptionMode, KEY_PRIMARY, KEY_SECONDARY};
     use crate::testutil::MemoryBackend;
 
@@ -528,7 +528,7 @@ mod tests {
         let mut repo = crate::repo::Repository::init(
             Box::new(MemoryBackend::new()),
             EncryptionMode::Aes256Gcm,
-            ChunkerConfig::default(),
+            ChunkerParams::default(),
             Some("repair-writes-key-blob"),
             None,
             None,

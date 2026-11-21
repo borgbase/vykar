@@ -9,6 +9,7 @@ mod common;
 use vykar_core::commands;
 use vykar_core::compress::Compression;
 use vykar_core::config::{ChunkerConfig, EncryptionModeConfig, VykarConfig};
+use vykar_core::repo::ChunkerParams;
 use vykar_core::repo::control::CancelToken;
 use vykar_core::repo::pack::PackType;
 use vykar_core::repo::{EncryptionMode, OpenOptions, Repository, WriteSessionOptions};
@@ -25,7 +26,7 @@ fn init_local_repo(dir: &std::path::Path) -> Repository {
     let mut repo = Repository::init(
         storage,
         EncryptionMode::None,
-        ChunkerConfig::default(),
+        ChunkerParams::default(),
         None,
         None,
         None,
@@ -210,7 +211,7 @@ fn backup_rejects_stored_invalid_chunker_parameters_but_restore_still_works() {
     for (expected, chunker) in [
         (
             "chunker.min_size must be even",
-            ChunkerConfig {
+            ChunkerParams {
                 min_size: 257,
                 avg_size: 1024,
                 max_size: 4096,
@@ -218,7 +219,7 @@ fn backup_rejects_stored_invalid_chunker_parameters_but_restore_still_works() {
         ),
         (
             "chunker.avg_size must be even",
-            ChunkerConfig {
+            ChunkerParams {
                 min_size: 256,
                 avg_size: 1025,
                 max_size: 4096,
@@ -226,7 +227,7 @@ fn backup_rejects_stored_invalid_chunker_parameters_but_restore_still_works() {
         ),
         (
             "chunker.max_size must be even",
-            ChunkerConfig {
+            ChunkerParams {
                 min_size: 256,
                 avg_size: 1024,
                 max_size: 4095,
@@ -236,7 +237,7 @@ fn backup_rejects_stored_invalid_chunker_parameters_but_restore_still_works() {
         // unless backup checks them.
         (
             "chunker.min_size must be in",
-            ChunkerConfig {
+            ChunkerParams {
                 min_size: 0,
                 avg_size: 1024,
                 max_size: 4096,
@@ -244,7 +245,7 @@ fn backup_rejects_stored_invalid_chunker_parameters_but_restore_still_works() {
         ),
         (
             "chunker.max_size must be in",
-            ChunkerConfig {
+            ChunkerParams {
                 min_size: 256,
                 avg_size: 1024,
                 max_size: 64 * 1024 * 1024,
@@ -2980,7 +2981,7 @@ fn plaintext_chunk_id_key_consistent_across_init_and_open() {
     let repo = Repository::init(
         storage,
         EncryptionMode::None,
-        ChunkerConfig::default(),
+        ChunkerParams::default(),
         None,
         None,
         None,
@@ -3031,7 +3032,7 @@ fn session_guard_blocks_maintenance() {
     let repo = Repository::init(
         storage,
         EncryptionMode::None,
-        ChunkerConfig::default(),
+        ChunkerParams::default(),
         None,
         None,
         None,
@@ -3091,7 +3092,7 @@ fn maintenance_reaps_session_older_than_45_minutes() {
     let repo = Repository::init(
         storage,
         EncryptionMode::None,
-        ChunkerConfig::default(),
+        ChunkerParams::default(),
         None,
         None,
         None,
@@ -3139,7 +3140,7 @@ fn maintenance_blocks_on_malformed_session_marker() {
     let repo = Repository::init(
         storage,
         EncryptionMode::None,
-        ChunkerConfig::default(),
+        ChunkerParams::default(),
         None,
         None,
         None,

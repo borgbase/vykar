@@ -1,7 +1,8 @@
 use std::time::Duration;
 
-use fastcdc::v2020::{AVERAGE_MAX, AVERAGE_MIN, MAXIMUM_MIN, MINIMUM_MAX, MINIMUM_MIN};
 use serde::{Deserialize, Serialize};
+
+use crate::chunker::ChunkerParams;
 
 use super::defaults::*;
 use super::deserialize::*;
@@ -227,6 +228,63 @@ pub struct RepositoryConfig {
     pub s3_soft_delete: bool,
 }
 
+impl RepositoryConfig {
+    /// The transport settings a storage backend is built from, with its
+    /// connection pool sized to `connections` (SFTP pool size and the
+    /// parallelism of every storage operation).
+    ///
+    /// `self` is destructured exhaustively (no `..` rest pattern), so a field
+    /// added to `RepositoryConfig` fails to compile here instead of being
+    /// dropped silently on the way to the backend.
+    pub fn storage_config(&self, connections: usize) -> vykar_storage::StorageConfig {
+        let RepositoryConfig {
+            url,
+            region,
+            access_key_id,
+            secret_access_key,
+            sftp_key,
+            sftp_agent,
+            sftp_known_hosts,
+            sftp_timeout,
+            access_token,
+            allow_insecure_http,
+            // Pack sizing is a repository-format concern, not a transport one.
+            min_pack_size: _,
+            max_pack_size: _,
+            retry,
+            s3_soft_delete,
+        } = self;
+
+        vykar_storage::StorageConfig {
+            url: url.clone(),
+            region: region.clone(),
+            access_key_id: access_key_id.clone(),
+            secret_access_key: secret_access_key.clone(),
+            sftp_key: sftp_key.clone(),
+            sftp_agent: sftp_agent.clone(),
+            sftp_known_hosts: sftp_known_hosts.clone(),
+            max_connections: Some(connections),
+            sftp_timeout: *sftp_timeout,
+            access_token: access_token.clone(),
+            allow_insecure_http: *allow_insecure_http,
+            retry: *retry,
+            s3_soft_delete: *s3_soft_delete,
+        }
+    }
+
+    /// The pack sizing and URL that `Repository::init` takes.
+    ///
+    /// `url` is `Some` even when it is empty, so the capability-probe error
+    /// names exactly what was configured.
+    pub fn init_options(&self) -> crate::repo::InitOptions {
+        crate::repo::InitOptions {
+            url: Some(self.url.clone()),
+            min_pack_size: self.min_pack_size,
+            max_pack_size: self.max_pack_size,
+        }
+    }
+}
+
 impl Default for RepositoryConfig {
     /// Mirrors the `#[serde(default = …)]` attributes above, so a hand-built
     /// config and one deserialized from YAML that omits those keys agree.
@@ -304,12 +362,10 @@ impl Default for EncryptionConfig {
     }
 }
 
-/// Hard cap on `ChunkerConfig::max_size`. Any user-configured value above
-/// this is clamped down during validation. This bounds the maximum encrypted
-/// blob size to `CHUNK_MAX_SIZE_HARD_CAP + 1024` (compression tag + encryption
-/// envelope).
-pub const CHUNK_MAX_SIZE_HARD_CAP: u32 = 16 * 1024 * 1024; // 16 MiB
+pub use crate::chunker::CHUNK_MAX_SIZE_HARD_CAP;
 
+/// The YAML `chunker:` section. A repository stores its parameters as
+/// `ChunkerParams` (see `ChunkerConfig::params`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChunkerConfig {
     #[serde(default = "default_min_size")]
@@ -347,25 +403,18 @@ pub(crate) fn parse_cron(
 }
 
 impl ChunkerConfig {
-    /// FastCDC 5 requires even parameters. This check does not normalize or
-    /// clamp values, so it is also safe to apply to persisted repository config.
-    pub(crate) fn validate_even_sizes(&self) -> vykar_types::error::Result<()> {
-        for (field, value) in [
-            ("min_size", self.min_size),
-            ("avg_size", self.avg_size),
-            ("max_size", self.max_size),
-        ] {
-            if value % 2 != 0 {
-                return Err(vykar_types::error::VykarError::Config(format!(
-                    "chunker.{field} must be even, got {value}"
-                )));
-            }
+    /// The parameters a new repository stores.
+    pub fn params(&self) -> ChunkerParams {
+        ChunkerParams {
+            min_size: self.min_size,
+            avg_size: self.avg_size,
+            max_size: self.max_size,
         }
-        Ok(())
     }
 
     /// Clamp `max_size` to `CHUNK_MAX_SIZE_HARD_CAP` with a warning if it
-    /// was configured above the cap.
+    /// was configured above the cap, then check what FastCDC requires
+    /// (`ChunkerParams::validate_stored`).
     pub fn validate(&mut self) -> vykar_types::error::Result<()> {
         if self.max_size > CHUNK_MAX_SIZE_HARD_CAP {
             tracing::warn!(
@@ -375,56 +424,7 @@ impl ChunkerConfig {
             );
             self.max_size = CHUNK_MAX_SIZE_HARD_CAP;
         }
-        self.validate_stored()
-    }
-
-    /// Everything FastCDC requires of the parameters: the ranges, their
-    /// order, and even sizes. Never clamps, so it is safe to apply to the
-    /// parameters a repository's `config` holds.
-    pub fn validate_stored(&self) -> vykar_types::error::Result<()> {
-        use vykar_types::error::VykarError;
-
-        let min = self.min_size as usize;
-        let avg = self.avg_size as usize;
-        let max = self.max_size as usize;
-        let hard_cap = CHUNK_MAX_SIZE_HARD_CAP as usize;
-
-        if !(MINIMUM_MIN..=MINIMUM_MAX).contains(&min) {
-            return Err(VykarError::Config(format!(
-                "chunker.min_size must be in [{MINIMUM_MIN}, {MINIMUM_MAX}], got {}",
-                self.min_size
-            )));
-        }
-
-        if !(AVERAGE_MIN..=AVERAGE_MAX).contains(&avg) {
-            return Err(VykarError::Config(format!(
-                "chunker.avg_size must be in [{AVERAGE_MIN}, {AVERAGE_MAX}], got {}",
-                self.avg_size
-            )));
-        }
-
-        if !(MAXIMUM_MIN..=hard_cap).contains(&max) {
-            return Err(VykarError::Config(format!(
-                "chunker.max_size must be in [{MAXIMUM_MIN}, {CHUNK_MAX_SIZE_HARD_CAP}], got {}",
-                self.max_size
-            )));
-        }
-
-        if self.min_size > self.avg_size {
-            return Err(VykarError::Config(format!(
-                "chunker must satisfy min_size <= avg_size, got {} > {}",
-                self.min_size, self.avg_size
-            )));
-        }
-
-        if self.avg_size > self.max_size {
-            return Err(VykarError::Config(format!(
-                "chunker must satisfy avg_size <= max_size, got {} > {}",
-                self.avg_size, self.max_size
-            )));
-        }
-
-        self.validate_even_sizes()
+        self.params().validate_stored()
     }
 }
 
@@ -458,6 +458,20 @@ impl CompressionAlgorithm {
 impl PartialEq<&str> for CompressionAlgorithm {
     fn eq(&self, other: &&str) -> bool {
         self.as_str() == *other
+    }
+}
+
+impl CompressionConfig {
+    /// The codec this section selects. `zstd_level` applies only to zstd.
+    pub fn to_compression(&self) -> crate::compress::Compression {
+        use crate::compress::Compression;
+        match self.algorithm {
+            CompressionAlgorithm::None => Compression::None,
+            CompressionAlgorithm::Lz4 => Compression::Lz4,
+            CompressionAlgorithm::Zstd => Compression::Zstd {
+                level: self.zstd_level,
+            },
+        }
     }
 }
 
@@ -545,6 +559,7 @@ pub use vykar_storage::RetryConfig;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fastcdc::v2020::MINIMUM_MIN;
 
     fn schedule(every: Option<&str>, cron: Option<&str>) -> ScheduleConfig {
         ScheduleConfig {
@@ -704,25 +719,39 @@ mod tests {
         }
     }
 
-    /// Stored parameters are checked, never clamped.
+    /// The YAML section and the stored parameters agree on defaults, and
+    /// `params` copies every field.
     #[test]
-    fn chunker_validate_stored_rejects_without_clamping() {
+    fn chunker_config_params_copies_fields_and_defaults_agree() {
+        assert_eq!(ChunkerConfig::default().params(), ChunkerParams::default());
         let config = ChunkerConfig {
-            min_size: 512 * 1024,
-            avg_size: 2 * 1024 * 1024,
-            max_size: 2 * CHUNK_MAX_SIZE_HARD_CAP,
+            min_size: 256,
+            avg_size: 1024,
+            max_size: 8192,
         };
-        let error = config.validate_stored().unwrap_err();
-        assert!(error.to_string().contains("chunker.max_size must be in"));
-        for (min, avg, max) in [(0, 1024, 4096), (256, 0, 4096), (8192, 4096, 16384)] {
-            let config = ChunkerConfig {
-                min_size: min,
-                avg_size: avg,
-                max_size: max,
-            };
-            assert!(config.validate_stored().is_err(), "{min} {avg} {max}");
-        }
-        assert!(ChunkerConfig::default().validate_stored().is_ok());
+        assert_eq!(
+            config.params(),
+            ChunkerParams {
+                min_size: 256,
+                avg_size: 1024,
+                max_size: 8192,
+            }
+        );
+    }
+
+    /// An empty URL still names itself in the capability-probe error, and the
+    /// connection count always reaches the backend.
+    #[test]
+    fn repository_config_init_options_and_storage_config() {
+        let repo = RepositoryConfig {
+            min_pack_size: 1024,
+            max_pack_size: 4096,
+            ..Default::default()
+        };
+        let opts = repo.init_options();
+        assert_eq!(opts.url.as_deref(), Some(""));
+        assert_eq!((opts.min_pack_size, opts.max_pack_size), (1024, 4096));
+        assert_eq!(repo.storage_config(7).max_connections, Some(7));
     }
 
     #[test]

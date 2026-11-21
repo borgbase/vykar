@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use crate::compress::Compression;
-use crate::config::ChunkerConfig;
+use crate::repo::ChunkerParams;
 use crate::repo::EncryptionMode;
 use crate::repo::pack::PackType;
 use crate::repo::{Repository, WriteSessionOptions};
@@ -14,7 +14,7 @@ fn init_creates_required_keys() {
     let repo = Repository::init(
         storage,
         EncryptionMode::None,
-        ChunkerConfig::default(),
+        ChunkerParams::default(),
         None,
         None,
         None,
@@ -33,7 +33,7 @@ fn init_twice_fails() {
     let repo = Repository::init(
         storage,
         EncryptionMode::None,
-        ChunkerConfig::default(),
+        ChunkerParams::default(),
         None,
         None,
         None,
@@ -44,7 +44,7 @@ fn init_twice_fails() {
     let result = Repository::init(
         Box::new(repo.storage.clone()),
         EncryptionMode::None,
-        ChunkerConfig::default(),
+        ChunkerParams::default(),
         None,
         None,
         None,
@@ -201,7 +201,7 @@ fn repo_on_recording_backend() -> (Repository, PutLog) {
     let mut repo = Repository::init(
         Box::new(backend),
         EncryptionMode::None,
-        ChunkerConfig::default(),
+        ChunkerParams::default(),
         None,
         None,
         None,
@@ -449,15 +449,14 @@ fn deferred_hydration_survives_file_cache_save_error() {
 
 #[test]
 fn init_rejects_oversized_max_pack_size() {
-    use crate::config::RepositoryConfig;
+    use crate::repo::InitOptions;
 
     crate::testutil::init_test_environment();
 
     let min_pack = 32 * 1024 * 1024; // 32 MiB
 
     // Just over the 512 MiB hard limit — should fail.
-    let oversized_config = RepositoryConfig {
-        url: String::new(),
+    let oversized_config = InitOptions {
         min_pack_size: min_pack,
         max_pack_size: 513 * 1024 * 1024,
         ..Default::default()
@@ -466,7 +465,7 @@ fn init_rejects_oversized_max_pack_size() {
     let result = Repository::init(
         Box::new(MemoryBackend::new()),
         EncryptionMode::None,
-        ChunkerConfig::default(),
+        ChunkerParams::default(),
         None,
         Some(&oversized_config),
         None,
@@ -479,8 +478,7 @@ fn init_rejects_oversized_max_pack_size() {
     assert!(err.contains("512 MiB"), "error should mention limit: {err}");
 
     // Exactly 512 MiB — should succeed.
-    let valid_config = RepositoryConfig {
-        url: String::new(),
+    let valid_config = InitOptions {
         min_pack_size: min_pack,
         max_pack_size: 512 * 1024 * 1024,
         ..Default::default()
@@ -489,7 +487,7 @@ fn init_rejects_oversized_max_pack_size() {
     let result = Repository::init(
         Box::new(MemoryBackend::new()),
         EncryptionMode::None,
-        ChunkerConfig::default(),
+        ChunkerParams::default(),
         None,
         Some(&valid_config),
         None,
@@ -503,15 +501,14 @@ fn init_rejects_oversized_max_pack_size() {
 #[test]
 fn flush_on_abort_writes_pending_index() {
     use crate::compress;
-    use crate::config::RepositoryConfig;
     use crate::index::PendingPackEntry;
+    use crate::repo::InitOptions;
     use crate::repo::format::{ObjectType, unpack_object_expect_with_context};
 
     crate::testutil::init_test_environment();
 
     // Use tiny pack sizes so a single chunk triggers a flush.
-    let small_config = RepositoryConfig {
-        url: String::new(),
+    let small_config = InitOptions {
         min_pack_size: 256,
         max_pack_size: 256,
         ..Default::default()
@@ -519,7 +516,7 @@ fn flush_on_abort_writes_pending_index() {
     let mut repo = Repository::init(
         Box::new(MemoryBackend::new()),
         EncryptionMode::None,
-        ChunkerConfig::default(),
+        ChunkerParams::default(),
         None,
         Some(&small_config),
         None,
@@ -646,12 +643,11 @@ impl vykar_storage::StorageBackend for FailPackUploadsBackend {
 
 #[test]
 fn flush_on_abort_survives_pack_upload_failure() {
-    use crate::config::RepositoryConfig;
+    use crate::repo::InitOptions;
 
     crate::testutil::init_test_environment();
 
-    let small_config = RepositoryConfig {
-        url: String::new(),
+    let small_config = InitOptions {
         min_pack_size: 256,
         max_pack_size: 256,
         ..Default::default()
@@ -659,7 +655,7 @@ fn flush_on_abort_survives_pack_upload_failure() {
     let mut repo = Repository::init(
         Box::new(FailPackUploadsBackend::new()),
         EncryptionMode::None,
-        ChunkerConfig::default(),
+        ChunkerParams::default(),
         None,
         Some(&small_config),
         None,
@@ -772,10 +768,10 @@ fn init_refuses_a_v3_repository_against_a_pre_blake3_server() {
     let err = Repository::init(
         storage,
         EncryptionMode::None,
-        ChunkerConfig::default(),
+        ChunkerParams::default(),
         None,
-        Some(&crate::config::RepositoryConfig {
-            url: url.clone(),
+        Some(&crate::repo::InitOptions {
+            url: Some(url.clone()),
             ..Default::default()
         }),
         None,
@@ -814,7 +810,7 @@ fn init_creates_the_current_repository_format() {
     let repo = Repository::init(
         Box::new(MemoryBackend::new()),
         EncryptionMode::None,
-        ChunkerConfig::default(),
+        ChunkerParams::default(),
         None,
         None,
         None,
@@ -842,7 +838,7 @@ fn open_rejects_an_unknown_repository_version() {
     let repo = Repository::init(
         Box::new(MemoryBackend::new()),
         EncryptionMode::None,
-        ChunkerConfig::default(),
+        ChunkerParams::default(),
         None,
         None,
         None,
@@ -878,7 +874,7 @@ fn open_rejects_oversized_max_pack_size() {
     let repo = Repository::init(
         storage,
         EncryptionMode::None,
-        ChunkerConfig::default(),
+        ChunkerParams::default(),
         None,
         None,
         None,
@@ -912,12 +908,11 @@ fn open_rejects_oversized_max_pack_size() {
 
 /// Helper: create a plaintext repo with tiny pack sizes for testing pack flushes.
 fn repo_with_small_packs(min_pack: u32, max_pack: u32) -> Repository {
-    use crate::config::RepositoryConfig;
+    use crate::repo::InitOptions;
 
     crate::testutil::init_test_environment();
 
-    let small_config = RepositoryConfig {
-        url: String::new(),
+    let small_config = InitOptions {
         min_pack_size: min_pack,
         max_pack_size: max_pack,
         ..Default::default()
@@ -925,7 +920,7 @@ fn repo_with_small_packs(min_pack: u32, max_pack: u32) -> Repository {
     let mut repo = Repository::init(
         Box::new(MemoryBackend::new()),
         EncryptionMode::None,
-        ChunkerConfig::default(),
+        ChunkerParams::default(),
         None,
         Some(&small_config),
         None,
@@ -1075,13 +1070,12 @@ fn save_state_rebases_pack_counters() {
 
 #[test]
 fn cross_session_pending_index_recovery() {
-    use crate::config::RepositoryConfig;
+    use crate::repo::InitOptions;
 
     crate::testutil::init_test_environment();
 
     // Use tiny pack sizes so chunks trigger pack flushes.
-    let small_config = RepositoryConfig {
-        url: String::new(),
+    let small_config = InitOptions {
         min_pack_size: 256,
         max_pack_size: 256,
         ..Default::default()
@@ -1091,7 +1085,7 @@ fn cross_session_pending_index_recovery() {
     let mut repo = Repository::init(
         Box::new(MemoryBackend::new()),
         EncryptionMode::None,
-        ChunkerConfig::default(),
+        ChunkerParams::default(),
         None,
         Some(&small_config),
         None,

@@ -11,7 +11,6 @@ use std::io::Read;
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::CompressionAlgorithm;
 use vykar_types::error::{Result, VykarError};
 
 fn read_u32_le(bytes: [u8; 4]) -> u32 {
@@ -51,14 +50,6 @@ impl Compression {
             other => Err(VykarError::Config(format!(
                 "unknown compression algorithm: {other}"
             ))),
-        }
-    }
-
-    pub fn from_algorithm(algorithm: CompressionAlgorithm, zstd_level: i32) -> Self {
-        match algorithm {
-            CompressionAlgorithm::None => Compression::None,
-            CompressionAlgorithm::Lz4 => Compression::Lz4,
-            CompressionAlgorithm::Zstd => Compression::Zstd { level: zstd_level },
         }
     }
 }

@@ -14,9 +14,9 @@ use std::time::Instant;
 use tracing::warn;
 
 use crate::compress::Compression;
-use crate::config::ChunkerConfig;
 use crate::index::dedup_cache::DedupPrefilter;
 use crate::platform::fs;
+use crate::repo::ChunkerParams;
 use vykar_crypto::CryptoEngine;
 use vykar_types::chunk_id::{ChunkHasher, ChunkId};
 use vykar_types::error::{Result, VykarError};
@@ -59,7 +59,7 @@ pub(super) fn process_file_worker(
     chunk_hasher: &ChunkHasher,
     crypto: &dyn CryptoEngine,
     compression: Compression,
-    chunker_config: &ChunkerConfig,
+    chunker_config: &ChunkerParams,
     budget: &ByteBudget,
     pre_acquired_bytes: usize,
     prefilter: Option<&DedupPrefilter>,

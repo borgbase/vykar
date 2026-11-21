@@ -40,7 +40,7 @@ use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use self::write_session::WriteSessionState;
-use crate::config::{ChunkerConfig, default_max_pack_size, default_min_pack_size};
+pub use crate::chunker::ChunkerParams;
 use crate::index::ChunkIndex;
 use vykar_crypto::CryptoEngine;
 use vykar_storage::StorageBackend;
@@ -142,13 +142,21 @@ impl RepoFormat {
 pub struct RepoConfig {
     pub version: u32,
     pub id: Vec<u8>, // 32 bytes
-    pub chunker_params: ChunkerConfig,
+    pub chunker_params: ChunkerParams,
     pub encryption: EncryptionMode,
     pub created: DateTime<Utc>,
     #[serde(default = "default_min_pack_size")]
     pub min_pack_size: u32,
     #[serde(default = "default_max_pack_size")]
     pub max_pack_size: u32,
+}
+
+pub(crate) fn default_min_pack_size() -> u32 {
+    32 * 1024 * 1024 // 32 MiB
+}
+
+pub(crate) fn default_max_pack_size() -> u32 {
+    192 * 1024 * 1024 // 192 MiB
 }
 
 /// Upper bound on `RepoConfig::max_pack_size`.
@@ -161,7 +169,7 @@ impl RepoConfig {
     /// never the raw integer.
     ///
     /// The chunker parameters are not checked here, so that restore stays
-    /// usable; backup checks them (`ChunkerConfig::validate_stored`).
+    /// usable; backup checks them (`ChunkerParams::validate_stored`).
     ///
     /// # Errors
     ///
@@ -228,6 +236,39 @@ impl EncryptionMode {
             EncryptionMode::Chacha20Poly1305 => "chacha20poly1305",
         }
     }
+}
+
+/// What `Repository::init` takes from the client's repository settings.
+#[derive(Debug, Clone)]
+pub struct InitOptions {
+    /// Repository URL. Names the server in the capability-probe error only.
+    pub url: Option<String>,
+    pub min_pack_size: u32,
+    pub max_pack_size: u32,
+}
+
+impl Default for InitOptions {
+    fn default() -> Self {
+        Self {
+            url: None,
+            min_pack_size: default_min_pack_size(),
+            max_pack_size: default_max_pack_size(),
+        }
+    }
+}
+
+/// What opening a repository needs from the client besides its backend and
+/// passphrase: where its local caches live, and the identity context.
+#[derive(Debug, Clone, Default)]
+pub struct OpenRequest {
+    /// Repository URL: names the repository in errors and keys the identity pin.
+    pub url: String,
+    /// Override for the local cache root.
+    pub cache_dir: Option<PathBuf>,
+    /// Accept a key that contradicts the local identity pin (`--trust-repo`).
+    pub trust_repo: bool,
+    /// Refuse a repository whose config says it is unencrypted.
+    pub require_encryption: bool,
 }
 
 /// Options controlling which expensive subsystems are loaded when opening a
@@ -526,7 +567,7 @@ mod format_tests {
         let config = RepoConfig {
             version: RepoFormat::CURRENT.version(),
             id: vec![0u8; 32],
-            chunker_params: ChunkerConfig::default(),
+            chunker_params: ChunkerParams::default(),
             encryption: EncryptionMode::None,
             created: chrono::Utc::now(),
             min_pack_size: default_min_pack_size(),
@@ -540,6 +581,70 @@ mod format_tests {
              got a leading byte of {:#04x}",
             encoded.first().copied().unwrap_or(0)
         );
+    }
+
+    /// Pins the exact bytes of a fixed `RepoConfig`, chunker parameters
+    /// included. The field-count test above only sees the array header; this
+    /// one fails on any change to the type, order or encoding of a field,
+    /// nested ones too. Never update the constant to make it pass: a
+    /// difference means repositories written before and after disagree.
+    #[test]
+    fn repo_config_golden_bytes() {
+        use chrono::TimeZone;
+        const GOLDEN: &str = "9705dc0020000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f\
+            93cd0100ce00010000ce00800000\
+            b04368616368613230506f6c7931333035\
+            bb323032332d31312d31345432323a31333a32302e3132333435365a\
+            ce02000000ce0c000000";
+        let config = RepoConfig {
+            version: 5,
+            id: (0u8..32).collect(),
+            chunker_params: ChunkerParams {
+                min_size: 256,
+                avg_size: 65_536,
+                max_size: 8 * 1024 * 1024,
+            },
+            encryption: EncryptionMode::Chacha20Poly1305,
+            created: chrono::Utc
+                .timestamp_opt(1_700_000_000, 123_456_000)
+                .unwrap(),
+            min_pack_size: 32 * 1024 * 1024,
+            max_pack_size: 192 * 1024 * 1024,
+        };
+        let bytes = rmp_serde::to_vec(&config).unwrap();
+        assert_eq!(hex::encode(&bytes), GOLDEN);
+        let decoded: RepoConfig = rmp_serde::from_slice(&hex::decode(GOLDEN).unwrap()).unwrap();
+        assert_eq!(rmp_serde::to_vec(&decoded).unwrap(), bytes);
+        assert_eq!(
+            (
+                decoded.chunker_params.min_size,
+                decoded.chunker_params.avg_size,
+                decoded.chunker_params.max_size
+            ),
+            (256, 65_536, 8 * 1024 * 1024)
+        );
+    }
+
+    /// Pins the field names and per-field serde defaults of the stored
+    /// chunker parameters: the named (map) encoding uses `min_size`,
+    /// `avg_size`, `max_size`, and a shorter positional array fills the
+    /// missing fields with their defaults.
+    #[test]
+    fn chunker_params_names_and_serde_defaults_are_pinned() {
+        let params = ChunkerParams {
+            min_size: 256,
+            avg_size: 65_536,
+            max_size: 8 * 1024 * 1024,
+        };
+        let named = rmp_serde::to_vec_named(&params).unwrap();
+        assert_eq!(
+            hex::encode(&named),
+            "83a86d696e5f73697a65cd0100a86176675f73697a65ce00010000a86d61785f73697a65ce00800000"
+        );
+        let short: ChunkerParams =
+            rmp_serde::from_slice(&hex::decode("92cd0100ce00010000").unwrap()).unwrap();
+        assert_eq!((short.min_size, short.avg_size), (256, 65_536));
+        assert_eq!(short.max_size, 8 * 1024 * 1024);
     }
 
     #[test]

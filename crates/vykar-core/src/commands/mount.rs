@@ -1257,7 +1257,7 @@ mod tests {
         let mut repo = Repository::init(
             Box::new(backend),
             EncryptionMode::None,
-            crate::config::ChunkerConfig::default(),
+            crate::repo::ChunkerParams::default(),
             None,
             None,
             None,

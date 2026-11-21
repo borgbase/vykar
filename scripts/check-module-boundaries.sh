@@ -2,7 +2,8 @@
 # Module boundaries inside vykar-core. Fails when a lower layer names a higher one.
 #   engine modules (repo, index, compress, chunker) must not use commands or app;
 #   commands must not use app;
-#   index may use repo only through repo::format, which itself uses neither.
+#   index may use repo only through repo::format, which itself uses neither;
+#   repo, index, compress, chunker, storage and snapshot must not use config.
 # A text match, not a compiler check: it sees `crate::`/`super::` paths and
 # `crate::{..}` groups, not `super::{..}` groups, paths broken across lines or macros.
 set -eu
@@ -43,6 +44,9 @@ if [ -n "$hits" ]; then
     printf 'module boundary violated: index may use repo only through repo::format\n%s\n' "$hits" >&2
     fail=1
 fi
+forbid "repo/index/compress/chunker/storage/snapshot must not use config" \
+    "(crate|super(::super)*)::config$w|crate::\{([^;]*[^A-Za-z0-9_])?config$w" \
+    "$src/repo" "$src/index" "$src/compress" "$src/chunker" "$src/storage" "$src/snapshot"
 forbid "repo/format.rs must stay a leaf (no crate::repo, crate::index, super::)" \
     "crate::(repo|index)$w|super::" "$src/repo/format.rs"
 exit $fail

@@ -782,9 +782,9 @@ fn a_contradicting_pin_beats_self_consistent_repository_data() {
     Repository::init(
         storage,
         EncryptionMode::Aes256Gcm,
-        fresh_config.chunker.clone(),
+        fresh_config.chunker.params(),
         Some(PASS),
-        Some(&fresh_config.repository),
+        Some(&fresh_config.repository.init_options()),
         Some(fx.cache_dir.clone()),
     )
     .unwrap();

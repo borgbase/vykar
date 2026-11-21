@@ -491,7 +491,7 @@ mod tests {
         vykar_core::repo::Repository::init(
             storage,
             vykar_core::repo::EncryptionMode::Aes256Gcm,
-            vykar_core::config::ChunkerConfig::default(),
+            vykar_core::repo::ChunkerParams::default(),
             Some(pass),
             None,
             None,

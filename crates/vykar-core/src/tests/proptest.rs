@@ -312,16 +312,17 @@ mod chunker {
     use proptest::prelude::*;
 
     use crate::chunker::{ChunkReader, chunk_data, chunk_stream, chunk_stream_bounded};
-    use crate::config::ChunkerConfig;
+    use crate::repo::ChunkerParams;
 
-    /// Generate valid ChunkerConfig values that respect fastcdc's hard bounds:
+    /// Generate valid ChunkerParams values that respect fastcdc's hard bounds:
     /// MINIMUM_MIN=64, AVERAGE_MIN=256, MAXIMUM_MIN=1024.
     ///
     /// All three sizes are generated as halves and doubled, so they are always
-    /// even. fastcdc 5 requires even size parameters and `ChunkerConfig::validate`
-    /// enforces it, so an odd value is not a valid config to generate. Every
-    /// bound below is itself even, so doubling a half stays inside the range.
-    fn arb_chunker_config() -> impl Strategy<Value = ChunkerConfig> {
+    /// even. fastcdc 5 requires even size parameters and
+    /// `ChunkerParams::validate_stored` enforces it, so an odd value is not a
+    /// valid config to generate. Every bound below is itself even, so doubling
+    /// a half stays inside the range.
+    fn arb_chunker_config() -> impl Strategy<Value = ChunkerParams> {
         // min_size: even values 64–2048
         (32..=1024u32)
             .prop_flat_map(|half_min| {
@@ -336,7 +337,7 @@ mod chunker {
                 let max_hi = avg_size * 4;
                 (Just(min_size), Just(avg_size), max_lo / 2..=max_hi / 2)
             })
-            .prop_map(|(min_size, avg_size, half_max)| ChunkerConfig {
+            .prop_map(|(min_size, avg_size, half_max)| ChunkerParams {
                 min_size,
                 avg_size,
                 max_size: half_max * 2,
@@ -442,11 +443,14 @@ mod chunker {
             prop_assert_eq!(expected, borrowed_chunks);
         }
 
-        /// Any config from `arb_chunker_config()` passes `validate()`.
+        /// Any config from `arb_chunker_config()` passes `validate_stored()`.
         #[test]
         fn valid_config_always_validates(config in arb_chunker_config()) {
-            let mut cfg = config;
-            prop_assert!(cfg.validate().is_ok(), "validate() failed for {:?}", cfg);
+            prop_assert!(
+                config.validate_stored().is_ok(),
+                "validate_stored() failed for {:?}",
+                config
+            );
         }
     }
 }

@@ -847,7 +847,7 @@ mod deadline {
 mod exclusion {
     use super::{lock_key_at, write_lock_marker};
     use crate::commands::util::with_maintenance_lock;
-    use crate::config::ChunkerConfig;
+    use crate::repo::ChunkerParams;
     use crate::repo::lock::{
         acquire_lock, register_session_inner, release_lock, session_marker_key,
     };
@@ -925,7 +925,7 @@ mod exclusion {
         Repository::init(
             Box::new(storage),
             EncryptionMode::None,
-            ChunkerConfig::default(),
+            ChunkerParams::default(),
             None,
             None,
             None,

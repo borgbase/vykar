@@ -1845,7 +1845,7 @@ fn verify_pack_full_decodes_a_repeated_entry_under_aead() {
     let mut repo = crate::repo::Repository::init(
         Box::new(crate::testutil::MemoryBackend::new()),
         crate::repo::EncryptionMode::Aes256Gcm,
-        crate::config::ChunkerConfig::default(),
+        crate::repo::ChunkerParams::default(),
         Some("test-pass"),
         None,
         None,

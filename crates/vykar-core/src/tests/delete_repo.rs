@@ -156,7 +156,8 @@ fn delete_repo_deletes_all_nested_keys() {
     backup_single_source(&config, &source_dir, "src-a", "snap-nested");
 
     // Verify we actually have nested keys (packs under shard dirs, snapshots, etc.)
-    let backend = crate::storage::backend_from_config(&config.repository, 1).unwrap();
+    let backend =
+        crate::storage::backend_from_config(&config.repository.storage_config(1)).unwrap();
     let all_keys_before = backend.list("").unwrap();
     let nested_count = all_keys_before.iter().filter(|k| k.contains('/')).count();
     assert!(

@@ -14,7 +14,6 @@ use std::path::Path;
 use aes_gcm::Aes256Gcm;
 use aes_gcm::aead::{Aead, KeyInit};
 use vykar_core::compress::{Compression, compress};
-use vykar_core::config::ChunkerConfig;
 use vykar_core::index::base::encode_base;
 use vykar_core::index::dedup_cache::{
     FullCacheEntry, MmapFullIndexCache, build_full_index_cache_to_path,
@@ -27,7 +26,7 @@ use vykar_core::index::{
 use vykar_core::repo::file_cache::{CachedChunkRef, CachedChunks, FileCache};
 use vykar_core::repo::format::{ObjectType, pack_object_with_context};
 use vykar_core::repo::pack::{PackType, PackWriter};
-use vykar_core::repo::{EncryptionMode, RepoConfig};
+use vykar_core::repo::{ChunkerParams, EncryptionMode, RepoConfig};
 use vykar_core::snapshot::SnapshotMeta;
 use vykar_core::snapshot::item::{ChunkRef, Item, ItemRawNames, ItemType};
 use vykar_crypto::key::{EncryptedKey, KdfParams};
@@ -646,7 +645,7 @@ fn seed_unpack_object() {
     }
 }
 
-fn repo_config(version: u32, chunker: ChunkerConfig, min_pack: u32, max_pack: u32) -> Vec<u8> {
+fn repo_config(version: u32, chunker: ChunkerParams, min_pack: u32, max_pack: u32) -> Vec<u8> {
     rmp_serde::to_vec(&RepoConfig {
         version,
         id: vec![0x42; 32],
@@ -661,7 +660,7 @@ fn repo_config(version: u32, chunker: ChunkerConfig, min_pack: u32, max_pack: u3
 
 fn seed_repo_config() {
     const MIB: u32 = 1024 * 1024;
-    let small = ChunkerConfig {
+    let small = ChunkerParams {
         min_size: 1024,
         avg_size: 4096,
         max_size: 16384,
@@ -669,7 +668,7 @@ fn seed_repo_config() {
     let seeds = [
         (
             "v5_default",
-            repo_config(5, ChunkerConfig::default(), 32 * MIB, 192 * MIB),
+            repo_config(5, ChunkerParams::default(), 32 * MIB, 192 * MIB),
         ),
         ("v2_small", repo_config(2, small.clone(), MIB, 4 * MIB)),
         (
@@ -680,7 +679,7 @@ fn seed_repo_config() {
             "v3_odd_chunker",
             repo_config(
                 3,
-                ChunkerConfig {
+                ChunkerParams {
                     min_size: 257,
                     avg_size: 1024,
                     max_size: 4096,

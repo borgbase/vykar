@@ -11,8 +11,8 @@ use vykar_types::chunk_id::ChunkId;
 use vykar_types::pack_id::PackId;
 
 use crate::compress::Compression;
-use crate::config::ChunkerConfig;
 use crate::index::{ChunkIndex, ChunkIndexEntry};
+use crate::repo::ChunkerParams;
 use crate::repo::index_write::FoldPolicy;
 use crate::repo::pack::PackType;
 use crate::repo::{EncryptionMode, OpenOptions, Repository, WriteSessionOptions};
@@ -75,7 +75,7 @@ fn fixture(hard_segments: usize) -> Fixture {
     Repository::init(
         Box::new(LocalBackend::new(repo_dir.to_str().unwrap()).unwrap()),
         EncryptionMode::None,
-        ChunkerConfig::default(),
+        ChunkerParams::default(),
         None,
         None,
         Some(dir.path().join("cache")),

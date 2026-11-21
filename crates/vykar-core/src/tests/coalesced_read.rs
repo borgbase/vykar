@@ -19,7 +19,7 @@ fn repo_on_counting_backend() -> (Repository, PutLog) {
     let mut repo = Repository::init(
         Box::new(backend),
         crate::repo::EncryptionMode::None,
-        crate::config::ChunkerConfig::default(),
+        crate::repo::ChunkerParams::default(),
         None,
         None,
         None,
@@ -403,7 +403,7 @@ fn repo_with_cancelling_backend(
     let mut repo = Repository::init(
         Box::new(backend),
         crate::repo::EncryptionMode::None,
-        crate::config::ChunkerConfig::default(),
+        crate::repo::ChunkerParams::default(),
         None,
         None,
         None,
@@ -642,7 +642,7 @@ fn repo_on_tuned_backend(mode: EncryptionMode) -> (Repository, Arc<Probe>) {
     let mut repo = Repository::init(
         Box::new(backend),
         mode,
-        crate::config::ChunkerConfig::default(),
+        crate::repo::ChunkerParams::default(),
         passphrase,
         None,
         None,

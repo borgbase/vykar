@@ -550,7 +550,8 @@ fn run_against_repo(
     let passphrase = req.passphrase;
     let source_paths = req.source_paths;
 
-    let backend = storage::backend_from_config(&config.repository, config.limits.connections)?;
+    let backend =
+        storage::backend_from_config(&config.repository.storage_config(config.limits.connections))?;
     let backend = limits::wrap_storage_backend(backend, &config.limits);
     let backend = match wrap_backend {
         Some(wrap) => wrap(backend),
@@ -580,7 +581,8 @@ fn run_against_repo(
     // When there are no filesystem source paths (command-dump-only backup),
     // skip loading the file cache — it's never consulted for command dumps
     // and can be large (~736K entries).
-    let cache_dir = super::util::cache_dir_from_config(config);
+    let open_req = super::util::open_request(config);
+    let cache_dir = open_req.cache_dir.clone();
     let opts = if source_paths.is_empty() {
         crate::repo::OpenOptions::new().with_index()
     } else {
@@ -588,18 +590,18 @@ fn run_against_repo(
             .with_index()
             .with_file_cache()
     };
-    let opts = super::util::with_identity_context(opts, config);
+    let opts = super::util::with_identity_context(opts, &open_req);
     let open_result = Repository::open_shared(Arc::clone(&backend), passphrase, cache_dir, opts);
     let mut repo = match open_result {
         Ok(r) => {
-            if let Err(e) = super::util::verify_repo_identity(config, &r) {
+            if let Err(e) = super::util::verify_repo_identity(&open_req, &r) {
                 lock::deregister_session(backend.as_ref(), &session_id);
                 return Err(e);
             }
             r
         }
         Err(e) => {
-            let e = super::util::enrich_repo_not_found(e, &config.repository.url);
+            let e = super::util::enrich_repo_not_found(e, &open_req.url);
             lock::deregister_session(backend.as_ref(), &session_id);
             return Err(e);
         }

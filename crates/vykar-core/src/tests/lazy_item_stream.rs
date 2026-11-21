@@ -23,7 +23,7 @@ fn repo_on_counting_backend() -> (Repository, PutLog) {
     let mut repo = Repository::init(
         Box::new(backend),
         crate::repo::EncryptionMode::None,
-        crate::config::ChunkerConfig::default(),
+        crate::repo::ChunkerParams::default(),
         None,
         None,
         None,
@@ -40,7 +40,7 @@ fn aes_repo_on_counting_backend() -> (Repository, PutLog) {
     let mut repo = Repository::init(
         Box::new(backend),
         crate::repo::EncryptionMode::Aes256Gcm,
-        crate::config::ChunkerConfig::default(),
+        crate::repo::ChunkerParams::default(),
         Some("test-pass"),
         None,
         None,

@@ -169,14 +169,14 @@ fn maintenance_lock_fence_blocks_stale_write() {
     crate::testutil::init_test_environment();
 
     use crate::commands::util::with_maintenance_lock;
-    use crate::config::ChunkerConfig;
+    use crate::repo::ChunkerParams;
     use crate::repo::{EncryptionMode, Repository};
 
     let storage = MemoryBackend::new();
     let mut repo = Repository::init(
         Box::new(storage),
         EncryptionMode::None,
-        ChunkerConfig::default(),
+        ChunkerParams::default(),
         None,
         None,
         None,

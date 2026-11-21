@@ -324,7 +324,7 @@ fn init_empty_v3(repo_dir: &Path) {
     Repository::init(
         storage(),
         vykar_core::repo::EncryptionMode::None,
-        vykar_core::config::ChunkerConfig::default(),
+        vykar_core::repo::ChunkerParams::default(),
         None,
         None,
         None,

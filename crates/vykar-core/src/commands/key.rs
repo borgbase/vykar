@@ -83,7 +83,8 @@ impl ImportReport {
 /// Open raw storage and read the repository `config`, refusing unencrypted
 /// repositories up front — they have no key to export or import.
 fn open_raw(config: &VykarConfig) -> Result<(Box<dyn StorageBackend>, RepoConfig, RepoFormat)> {
-    let backend = storage::backend_from_config(&config.repository, config.limits.connections)?;
+    let backend =
+        storage::backend_from_config(&config.repository.storage_config(config.limits.connections))?;
     let backend = limits::wrap_storage_backend(backend, &config.limits);
     let data = backend
         .get("config")?

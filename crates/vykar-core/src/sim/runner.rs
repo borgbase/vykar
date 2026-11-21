@@ -20,11 +20,10 @@ use crate::commands::restore::{self, RestoreOptions};
 use crate::commands::{backup, compact, delete, prune, util};
 use crate::compress::Compression;
 use crate::config::{
-    ChunkerConfig, EncryptionConfig, EncryptionModeConfig, RepositoryConfig, RetentionConfig,
-    VykarConfig,
+    EncryptionConfig, EncryptionModeConfig, RepositoryConfig, RetentionConfig, VykarConfig,
 };
 use crate::repo::control::CancelToken;
-use crate::repo::{EncryptionMode, OpenOptions, Repository, identity, lock};
+use crate::repo::{ChunkerParams, EncryptionMode, OpenOptions, Repository, identity, lock};
 
 /// A source directory's regular files, by `/`-separated relative path.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -155,9 +154,9 @@ impl Sim {
             let repo = Repository::init(
                 Box::new(store.handle(init)),
                 EncryptionMode::None,
-                ChunkerConfig::default(),
+                ChunkerParams::default(),
                 None,
-                Some(&cfg.repository),
+                Some(&cfg.repository.init_options()),
                 util::cache_dir_from_config(&cfg),
             )?;
             // As `commands::init`: pin at once, with the init client's cache.
@@ -312,8 +311,12 @@ impl Sim {
             names: names.iter().map(|n| n.to_string()).collect(),
         };
         self.run(c, op, |store, cfg, _, _| {
-            let mut repo =
-                util::open_repo_on(Box::new(store.handle(c)), &cfg, None, OpenOptions::new())?;
+            let mut repo = util::open_repo_on(
+                Box::new(store.handle(c)),
+                &util::open_request(&cfg),
+                None,
+                OpenOptions::new(),
+            )?;
             let result = delete::run_on_repo(&mut repo, names, false, &CancelToken::new())?;
             let removed = result
                 .stats
@@ -327,8 +330,12 @@ impl Sim {
     pub fn prune(&mut self, c: ClientId, retention: RetentionConfig) -> RunRecord {
         self.run(c, ClientOp::Prune, |store, mut cfg, _, _| {
             cfg.retention = retention;
-            let mut repo =
-                util::open_repo_on(Box::new(store.handle(c)), &cfg, None, OpenOptions::new())?;
+            let mut repo = util::open_repo_on(
+                Box::new(store.handle(c)),
+                &util::open_request(&cfg),
+                None,
+                OpenOptions::new(),
+            )?;
             let (stats, list) =
                 prune::run_on_repo(&mut repo, &cfg, false, true, &[], &[], &CancelToken::new())?;
             let removed = list
@@ -345,8 +352,12 @@ impl Sim {
 
     pub fn compact(&mut self, c: ClientId) -> RunRecord {
         self.run(c, ClientOp::Compact, |store, cfg, _, _| {
-            let mut repo =
-                util::open_repo_on(Box::new(store.handle(c)), &cfg, None, OpenOptions::new())?;
+            let mut repo = util::open_repo_on(
+                Box::new(store.handle(c)),
+                &util::open_request(&cfg),
+                None,
+                OpenOptions::new(),
+            )?;
             let s = compact::run_on_repo(
                 &mut repo,
                 cfg.compact.threshold,
@@ -372,7 +383,7 @@ impl Sim {
         self.run(c, ClientOp::Check, |store, cfg, _, _| {
             let (mut repo, _session_guard) = util::open_repo_with_read_session_on(
                 Arc::new(store.handle(c)),
-                &cfg,
+                &util::open_request(&cfg),
                 None,
                 OpenOptions::new(),
             )?;
@@ -399,7 +410,7 @@ impl Sim {
             let mode = RepairMode::Apply;
             let mut repo = util::open_repo_on(
                 Box::new(store.handle(c)),
-                &cfg,
+                &util::open_request(&cfg),
                 None,
                 check::repair_open_options(mode),
             )?;
@@ -433,7 +444,7 @@ impl Sim {
         self.run(c, op, |store, cfg, dir, idx| {
             let (mut repo, _session_guard) = util::open_repo_with_read_session_on(
                 Arc::new(store.handle(c)),
-                &cfg,
+                &util::open_request(&cfg),
                 None,
                 OpenOptions::new(),
             )?;
@@ -478,8 +489,12 @@ impl Sim {
             label: label.to_string(),
         };
         self.run(c, op, |store, cfg, _, _| {
-            let mut repo =
-                util::open_repo_on(Box::new(store.handle(c)), &cfg, None, OpenOptions::new())?;
+            let mut repo = util::open_repo_on(
+                Box::new(store.handle(c)),
+                &util::open_request(&cfg),
+                None,
+                OpenOptions::new(),
+            )?;
             util::with_repo_lock(&mut repo, f)?;
             Ok((Vec::new(), String::new()))
         })

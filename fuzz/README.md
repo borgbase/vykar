@@ -72,13 +72,13 @@ cargo +nightly fuzz run fuzz_pack_scan -- -max_total_time=30 -rss_limit_mb=4096 
 
 ## Long runs
 
-`fuzz/campaign.sh [SECONDS_PER_TARGET] [TARGET...]` runs every target (or the ones named) in turn with `-fork`, keeping going after findings. The grown corpus, crash artifacts and per-target logs go to `$FUZZ_WORK` (default `~/fuzz-work`), never into `fuzz/corpus/`. `FUZZ_JOBS` (default 6) and `FUZZ_RSS_MB` (per worker, default 4096) size it. Rerunning continues from the grown corpus.
+`fuzz/campaign.sh [BASE_SECONDS] [TARGET...]` runs every target (or the ones named) in turn with `-fork`, keeping going after findings. Targets whose coverage was still growing at the end of the last campaign get 4× `BASE_SECONDS` (default 900, so one hour), those flat from the first minute get a third, the rest `BASE_SECONDS`: about 10 hours for all targets. The tiers live in `budget_for` in the script; `FUZZ_FLAT=1` gives every target `BASE_SECONDS`. The grown corpus, crash artifacts and per-target logs go to `$FUZZ_WORK` (default `~/fuzz-work`), never into `fuzz/corpus/`. `FUZZ_JOBS` (default 6) and `FUZZ_RSS_MB` (per worker, default 4096) size it. Rerunning continues from the grown corpus.
 
 On a shared Linux box, run it as a capped user unit (`loginctl enable-linger` keeps it alive after logout):
 
 ```
 systemd-run --user --unit=vykar-fuzz -p CPUQuota=600% -p MemoryMax=32G -p Nice=10 \
-  "$PWD/fuzz/campaign.sh" 600            # from the repository root
+  "$PWD/fuzz/campaign.sh"                # from the repository root
 journalctl --user -u vykar-fuzz -f     # progress
 systemctl --user stop vykar-fuzz       # pause, e.g. for benchmarks
 ```

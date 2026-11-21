@@ -332,8 +332,10 @@ pub struct ChunkDecodeError {
 ///
 /// `raw` is overwritten whether this succeeds or fails, so it must not be
 /// decoded again: callers that decode several ranges of one shared buffer
-/// copy each blob out first. `out` is cleared and filled; on error its
-/// contents are unspecified. `hint` is also the ZSTD output size, see
+/// copy each blob out first (check, the lazy item stream); the coalesced
+/// readers in `repo::blob_read` read each blob once and decode it in place.
+/// `out` is cleared and filled; on error its contents are unspecified.
+/// `hint` is also the ZSTD output size, see
 /// [`compress::decompress_into_with_hint`].
 pub fn decode_chunk_into(
     raw: &mut [u8],

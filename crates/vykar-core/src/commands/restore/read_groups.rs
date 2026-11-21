@@ -10,7 +10,7 @@ use vykar_types::pack_id::PackId;
 use smallvec::SmallVec;
 
 use super::plan::{ChunkTargets, WriteTarget};
-use crate::repo::coalesce::coalesce_pack_reads;
+use crate::repo::blob_read::{PlannedRead, coalesce_groups};
 
 /// A chunk within a coalesced read group.
 pub(super) struct PlannedBlob {
@@ -23,13 +23,23 @@ pub(super) struct PlannedBlob {
     pub(super) targets: SmallVec<[WriteTarget; 1]>,
 }
 
-/// A coalesced read — maps to a single storage range GET.
-pub(super) struct ReadGroup {
-    pub(super) pack_id: PackId,
-    pub(super) read_start: u64,
-    pub(super) read_end: u64, // exclusive
-    pub(super) blobs: Vec<PlannedBlob>,
+impl PlannedRead for PlannedBlob {
+    fn chunk_id(&self) -> ChunkId {
+        self.chunk_id
+    }
+    fn pack_offset(&self) -> u64 {
+        self.pack_offset
+    }
+    fn stored_size(&self) -> u32 {
+        self.stored_size
+    }
+    fn size_hint(&self) -> Option<usize> {
+        Some(self.expected_size as usize)
+    }
 }
+
+/// A coalesced read — maps to a single storage range GET.
+pub(super) type ReadGroup = crate::repo::blob_read::ReadGroup<PlannedBlob>;
 
 /// Look up each unique chunk's pack location and coalesce into ReadGroups.
 /// Consumes `chunk_targets` by value.
@@ -55,24 +65,7 @@ where
     }
 
     // For each pack: sort blobs by offset, then coalesce into ReadGroups.
-    let mut groups: Vec<ReadGroup> = Vec::new();
-    for (pack_id, blobs) in pack_blobs {
-        coalesce_pack_reads(
-            &pack_id,
-            blobs,
-            |b| (b.pack_offset, b.stored_size),
-            |read_start, read_end, blobs| {
-                groups.push(ReadGroup {
-                    pack_id,
-                    read_start,
-                    read_end,
-                    blobs,
-                })
-            },
-        )?;
-    }
-
-    Ok(groups)
+    coalesce_groups(pack_blobs)
 }
 
 #[cfg(test)]

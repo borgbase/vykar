@@ -1,38 +1,48 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::HashMap;
 use std::time::Instant;
 
+use smallvec::SmallVec;
+
 use super::Repository;
+use super::blob_read::{
+    BlobReader, GroupEnd, PlannedRead, ReadBuffers, ReadGroup, coalesce_groups,
+    fetch_groups_bounded,
+};
 use super::control::CancelToken;
 use super::format::{BlobLocation, decode_chunk_into};
 use super::pack::read_blob_from_pack;
 use crate::index::dedup_cache;
-use vykar_crypto::CryptoEngine;
-use vykar_storage::StorageBackend;
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
 use vykar_types::pack_id::PackId;
 
-/// A single blob within a coalesced read group.
+/// A unique blob of a coalesced read: one stored location, and every slot in
+/// the caller's `chunks` that wants it.
 struct CoalescedBlob {
-    /// Index in the original `chunks` slice (determines output order).
-    result_idx: usize,
+    /// Indices in the original `chunks` slice (determine output order), in
+    /// input order, so `result_idxs[0]` is the smallest.
+    result_idxs: SmallVec<[usize; 1]>,
     chunk_id: ChunkId,
     pack_offset: u64,
     stored_size: u32,
 }
 
-/// A group of adjacent blobs from the same pack that will be fetched in one range read.
-struct CoalescedGroup {
-    pack_id: PackId,
-    read_start: u64,
-    read_end: u64, // exclusive
-    blobs: Vec<CoalescedBlob>,
+impl PlannedRead for CoalescedBlob {
+    fn chunk_id(&self) -> ChunkId {
+        self.chunk_id
+    }
+    fn pack_offset(&self) -> u64 {
+        self.pack_offset
+    }
+    fn stored_size(&self) -> u32 {
+        self.stored_size
+    }
 }
 
-/// A blob of a coalesced group after decoding: its slot in the caller's
+/// A blob of a coalesced group after decoding: its slots in the caller's
 /// `chunks` and its plaintext.
 struct DecodedBlob {
-    result_idx: usize,
+    result_idxs: SmallVec<[usize; 1]>,
     plaintext: Vec<u8>,
 }
 
@@ -40,115 +50,34 @@ struct DecodedBlob {
 /// order through `decode_chunk_into`, which also verifies the chunk ID when
 /// the engine does not encrypt.
 fn fetch_group(
-    storage: &dyn StorageBackend,
-    crypto: &dyn CryptoEngine,
-    group: &CoalescedGroup,
+    reader: &BlobReader<'_>,
+    group: &ReadGroup<CoalescedBlob>,
 ) -> Result<Vec<DecodedBlob>> {
-    let pack_key = group.pack_id.storage_key();
-    let read_len = group.read_end - group.read_start;
-
-    let raw_data = storage
-        .get_range(&pack_key, group.read_start, read_len)?
-        .ok_or_else(|| VykarError::Other(format!("pack not found: {}", group.pack_id)))?;
-
+    let mut bufs = ReadBuffers::default();
     let mut decoded = Vec::with_capacity(group.blobs.len());
-    let mut raw = Vec::new();
-    for blob in &group.blobs {
-        let local_offset = (blob.pack_offset - group.read_start) as usize;
-        let local_end = local_offset + blob.stored_size as usize;
-        if local_end > raw_data.len() {
-            return Err(VykarError::Other(format!(
-                "blob extends beyond downloaded range in pack {}",
-                group.pack_id
-            )));
-        }
-
-        let blob_data = raw_data
-            .get(local_offset..local_end)
-            .expect("local_end <= raw_data.len() (checked above)");
-        // The in-place decode destroys its input, and blobs of a group can
-        // share bytes (duplicate offsets), so decode a copy.
-        raw.clear();
-        raw.extend_from_slice(blob_data);
-        let mut plaintext = Vec::new();
-        decode_chunk_into(
-            &mut raw,
-            BlobLocation {
-                chunk_id: blob.chunk_id,
-                pack_id: group.pack_id,
-                pack_offset: blob.pack_offset,
-                stored_size: blob.stored_size,
-            },
-            crypto,
-            None,
-            false,
-            &mut plaintext,
-        )?;
-        decoded.push(DecodedBlob {
-            result_idx: blob.result_idx,
-            plaintext,
-        });
-    }
-    Ok(decoded)
-}
-
-/// Fetch and decode `groups` on up to `width` threads and pass each group's
-/// blobs to `accept` on the calling thread, in completion order. Threads claim
-/// groups in slice order and poll `shutdown` before each range read.
-///
-/// Returns the error of the earliest group (in `groups` order) that failed.
-/// Every group before a failed one has been claimed, so for any failure that
-/// does not depend on timing this is the error the sequential loop returns.
-/// After the first failure no further group is claimed, and results that
-/// arrive later are dropped.
-fn read_groups_parallel(
-    width: usize,
-    storage: &dyn StorageBackend,
-    crypto: &dyn CryptoEngine,
-    groups: &[CoalescedGroup],
-    shutdown: &CancelToken,
-    mut accept: impl FnMut(Vec<DecodedBlob>) -> Result<()>,
-) -> Result<()> {
-    let indexed: Vec<(usize, &CoalescedGroup)> = groups.iter().enumerate().collect();
-    let (tx, rx) = crossbeam_channel::unbounded::<(usize, Result<Vec<DecodedBlob>>)>();
-    // Raised when `accept` fails, so workers stop claiming groups. Not raised
-    // for fetch errors: an earlier, already-claimed group must still report.
-    let stop = AtomicBool::new(false);
-    let mut first_err: Option<(usize, VykarError)> = None;
-    std::thread::scope(|s| {
-        let stop = &stop;
-        s.spawn(move || {
-            // `Err(())` only stops handing out groups; the error goes over `tx`.
-            let _ = super::bounded::try_for_each_bounded(width, &indexed, |&(idx, group)| {
-                if stop.load(Ordering::Relaxed) {
-                    return Err(());
-                }
-                let result = shutdown
-                    .check()
-                    .and_then(|()| fetch_group(storage, crypto, group));
-                let failed = result.is_err();
-                // The receiver lives until this thread drops `tx`.
-                let _ = tx.send((idx, result));
-                if failed { Err(()) } else { Ok(()) }
+    let end = reader.read_group(
+        group,
+        &mut bufs,
+        || false,
+        |blob, plain| {
+            let plain = plain.map_err(VykarError::from)?;
+            decoded.push(DecodedBlob {
+                result_idxs: blob.result_idxs.clone(),
+                plaintext: std::mem::take(plain),
             });
-        });
-        // Ends once the spawned thread returns and drops `tx`.
-        for (idx, result) in rx {
-            let result = match result {
-                Ok(blobs) if first_err.is_none() => accept(blobs).inspect_err(|_| {
-                    stop.store(true, Ordering::Relaxed);
-                }),
-                Ok(_) => Ok(()),
-                Err(e) => Err(e),
-            };
-            if let Err(e) = result
-                && first_err.as_ref().is_none_or(|(i, _)| idx < *i)
-            {
-                first_err = Some((idx, e));
-            }
-        }
-    });
-    first_err.map_or(Ok(()), |(_, e)| Err(e))
+            Ok::<(), VykarError>(())
+        },
+    )?;
+    match end {
+        GroupEnd::Done => Ok(decoded),
+        GroupEnd::PackNotFound => Err(VykarError::Other(format!(
+            "pack not found: {}",
+            group.pack_id
+        ))),
+        GroupEnd::OpenFailed(e) | GroupEnd::ReadFailed { error: e, .. } => Err(e),
+        // Cannot happen with `|| false`; map it rather than panic.
+        GroupEnd::Stopped => Err(VykarError::Interrupted),
+    }
 }
 
 /// Holds out-of-order plaintext until every earlier chunk has arrived;
@@ -172,16 +101,24 @@ impl Assembler<'_> {
         }
     }
 
-    /// Slot and drain each blob of one fetched group, in blob order.
+    /// Slot and drain each blob of one fetched group, in blob order. A blob
+    /// wanted by several slots is cloned into all but the last.
     fn accept(&mut self, blobs: Vec<DecodedBlob>) -> Result<()> {
         for blob in blobs {
-            let slot = self.slots.get_mut(blob.result_idx).ok_or_else(|| {
-                VykarError::Other(format!(
-                    "internal error: read result index {} out of range",
-                    blob.result_idx
-                ))
-            })?;
-            *slot = Some(blob.plaintext);
+            let mut plaintext = Some(blob.plaintext);
+            let last = blob.result_idxs.len().saturating_sub(1);
+            for (n, &idx) in blob.result_idxs.iter().enumerate() {
+                let slot = self.slots.get_mut(idx).ok_or_else(|| {
+                    VykarError::Other(format!(
+                        "internal error: read result index {idx} out of range"
+                    ))
+                })?;
+                *slot = if n == last {
+                    plaintext.take()
+                } else {
+                    plaintext.clone()
+                };
+            }
             self.drain_ready();
         }
         Ok(())
@@ -259,9 +196,11 @@ impl Repository {
     /// Range reads go out on up to the backend's `request_width` threads (one
     /// at a time with width 1 or a single read). Each thread decrypts and
     /// decompresses its own reads; the plaintext is reassembled in `chunks`
-    /// order on the caller's thread. Up to `request_width` raw ranges (each at
-    /// most `MAX_READ_SIZE`) are in flight at once; decoded chunks that arrive
-    /// ahead of an earlier read wait in memory, bounded by the stream size.
+    /// order on the caller's thread. Up to `request_width` ranges are in flight
+    /// at once; a buffered backend holds each range (at most `MAX_READ_SIZE`),
+    /// `LocalBackend` only the current blob. Decoded chunks that arrive ahead of
+    /// an earlier read wait in memory, bounded by the stream size. A chunk
+    /// listed more than once at the same location is read and decoded once.
     ///
     /// `shutdown` is polled before every range read, so a cancellation is
     /// observed within one storage round-trip per read in flight rather than
@@ -280,17 +219,42 @@ impl Repository {
             return Ok(());
         }
 
-        // --- Phase 1: group by pack ---
-        let mut pack_blobs: std::collections::HashMap<PackId, Vec<CoalescedBlob>> =
-            std::collections::HashMap::new();
-        for (idx, (chunk_id, pack_id, pack_offset, stored_size)) in chunks.iter().enumerate() {
-            pack_blobs.entry(*pack_id).or_default().push(CoalescedBlob {
-                result_idx: idx,
-                chunk_id: *chunk_id,
-                pack_offset: *pack_offset,
-                stored_size: *stored_size,
-            });
+        // --- Phase 1: group by pack, one blob per distinct location ---
+        // A repeated entry (the same chunk twice in a stream) is read and
+        // decoded once: the storage range reader cannot go back over bytes it
+        // has served, and the in-place decode destroys them anyway. The key is
+        // the whole location, so two IDs claiming one location (corrupt index)
+        // stay two blobs, and the second fails as an overlapping read.
+        let mut pack_blobs: HashMap<PackId, Vec<CoalescedBlob>> = HashMap::new();
+        let mut seen: HashMap<(ChunkId, PackId, u64, u32), usize> = HashMap::new();
+        for (idx, &(chunk_id, pack_id, pack_offset, stored_size)) in chunks.iter().enumerate() {
+            let blobs = pack_blobs.entry(pack_id).or_default();
+            match seen.entry((chunk_id, pack_id, pack_offset, stored_size)) {
+                std::collections::hash_map::Entry::Occupied(e) => {
+                    // The stored position always exists; losing it would
+                    // leave a slot unfilled and cut the stream short.
+                    blobs
+                        .get_mut(*e.get())
+                        .ok_or_else(|| {
+                            VykarError::Other(
+                                "internal error: coalesced read lost a planned blob".into(),
+                            )
+                        })?
+                        .result_idxs
+                        .push(idx);
+                }
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(blobs.len());
+                    blobs.push(CoalescedBlob {
+                        result_idxs: smallvec::smallvec![idx],
+                        chunk_id,
+                        pack_offset,
+                        stored_size,
+                    });
+                }
+            }
         }
+        drop(seen);
 
         let mut asm = Assembler {
             slots: vec![None; chunks.len()],
@@ -299,29 +263,13 @@ impl Repository {
         };
 
         // --- Phase 2: coalesce ---
-        let mut groups: Vec<CoalescedGroup> = Vec::new();
-
-        for (pack_id, blobs) in pack_blobs {
-            super::coalesce::coalesce_pack_reads(
-                &pack_id,
-                blobs,
-                |b| (b.pack_offset, b.stored_size),
-                |read_start, read_end, blobs| {
-                    groups.push(CoalescedGroup {
-                        pack_id,
-                        read_start,
-                        read_end,
-                        blobs,
-                    })
-                },
-            )?;
-        }
+        let mut groups = coalesce_groups(pack_blobs)?;
 
         // Sort groups so the one containing the earliest-needed slot is first.
         groups.sort_by_key(|g| {
             g.blobs
                 .iter()
-                .map(|b| b.result_idx)
+                .filter_map(|b| b.result_idxs.first().copied())
                 .min()
                 .expect("coalesced group is non-empty")
         });
@@ -330,18 +278,14 @@ impl Repository {
         let started = Instant::now();
         let width = self.request_width();
         let threads = width.min(groups.len());
-        let storage = self.storage.as_ref();
-        let crypto = self.crypto.as_ref();
-        if threads <= 1 {
-            for group in &groups {
-                shutdown.check()?;
-                asm.accept(fetch_group(storage, crypto, group)?)?;
-            }
-        } else {
-            read_groups_parallel(width, storage, crypto, &groups, shutdown, |blobs| {
-                asm.accept(blobs)
-            })?;
-        }
+        let reader = BlobReader::new(self.storage.as_ref(), self.crypto.as_ref(), false);
+        fetch_groups_bounded(
+            width,
+            &groups,
+            shutdown,
+            |g| fetch_group(&reader, g),
+            |blobs| asm.accept(blobs),
+        )?;
 
         // Final drain (safety net for groups not sorted by earliest slot).
         asm.drain_ready();

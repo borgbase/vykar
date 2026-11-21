@@ -345,6 +345,28 @@ fn duplicate_chunk_ids_coalesce_into_single_range_read() {
 // Cancellation
 // ---------------------------------------------------------------------------
 
+/// The `get_range_into` trait default, for wrappers that intercept
+/// `get_range` only: every range read, `open_range` included, then passes
+/// through their `get_range`.
+fn range_into_via_get_range(
+    backend: &dyn StorageBackend,
+    key: &str,
+    offset: u64,
+    length: u64,
+    buf: &mut Vec<u8>,
+) -> Result<bool> {
+    match backend.get_range(key, offset, length)? {
+        Some(data) => {
+            *buf = data;
+            Ok(true)
+        }
+        None => {
+            buf.clear();
+            Ok(false)
+        }
+    }
+}
+
 /// Backend that raises a shared cancellation flag from *inside* the first
 /// `get_range`, and counts how many range reads were issued. Lets a test prove
 /// the read loop polls between storage requests rather than only at entry.
@@ -363,7 +385,7 @@ impl InnerBackend for CancelOnFirstReadBackend {
 
 delegate_storage_backend! {
     for CancelOnFirstReadBackend;
-    except [get_range, profile];
+    except [get_range, get_range_into, open_range, profile];
 
     fn get_range(&self, key: &str, offset: u64, length: u64) -> Result<Option<Vec<u8>>> {
         self.reads.fetch_add(1, Ordering::Relaxed);
@@ -376,6 +398,20 @@ delegate_storage_backend! {
             request_width: self.width,
             ..self.inner.profile()
         }
+    }
+
+    fn get_range_into(&self, key: &str, offset: u64, length: u64, buf: &mut Vec<u8>) -> Result<bool> {
+        range_into_via_get_range(self, key, offset, length, buf)
+    }
+
+    fn open_range<'a>(
+        &self,
+        key: &str,
+        offset: u64,
+        length: u64,
+        buf: &'a mut Vec<u8>,
+    ) -> Result<Option<Box<dyn vykar_storage::RangeReader + 'a>>> {
+        vykar_storage::buffered_range(self, key, offset, length, buf)
     }
 }
 
@@ -604,7 +640,7 @@ impl InnerBackend for TunedBackend {
 
 delegate_storage_backend! {
     for TunedBackend;
-    except [get_range, profile];
+    except [get_range, get_range_into, open_range, profile];
 
     fn get_range(&self, key: &str, offset: u64, length: u64) -> Result<Option<Vec<u8>>> {
         let p = &self.probe;
@@ -624,6 +660,20 @@ delegate_storage_backend! {
             request_width: self.probe.width.load(Ordering::SeqCst),
             ..self.inner.profile()
         }
+    }
+
+    fn get_range_into(&self, key: &str, offset: u64, length: u64, buf: &mut Vec<u8>) -> Result<bool> {
+        range_into_via_get_range(self, key, offset, length, buf)
+    }
+
+    fn open_range<'a>(
+        &self,
+        key: &str,
+        offset: u64,
+        length: u64,
+        buf: &'a mut Vec<u8>,
+    ) -> Result<Option<Box<dyn vykar_storage::RangeReader + 'a>>> {
+        vykar_storage::buffered_range(self, key, offset, length, buf)
     }
 }
 
@@ -825,5 +875,151 @@ fn duplicate_chunk_ids_decode_under_aead() {
             .unwrap();
         assert_eq!(probe.reads.load(Ordering::SeqCst), 1, "width {width}");
         assert_eq!(out, expected, "width {width}");
+    }
+}
+
+/// A chunk repeated non-adjacently is read once and lands in every slot, in
+/// stream order, with one range read for the pack.
+#[test]
+fn duplicate_ids_non_adjacent_keep_stream_order() {
+    let (mut repo, probe) = repo_on_tuned_backend(EncryptionMode::None);
+    let ids = store_chunks(&mut repo, 3);
+    let input = [ids[0], ids[1], ids[0], ids[2], ids[0]];
+    let chunks = resolve_chunks(&repo, &input);
+    let expected: Vec<u8> = input
+        .iter()
+        .flat_map(|id| repo.read_chunk(id).unwrap())
+        .collect();
+
+    for width in [1, 4] {
+        probe.width.store(width, Ordering::SeqCst);
+        probe.reset_counters();
+        let mut out = Vec::new();
+        repo.read_chunks_coalesced_into(&chunks, &mut out, &CancelToken::new())
+            .unwrap();
+        assert_eq!(probe.reads.load(Ordering::SeqCst), 1, "width {width}");
+        assert_eq!(out, expected, "width {width}");
+    }
+}
+
+/// A repeated chunk whose first slot comes before a chunk stored at a lower
+/// offset: every slot gets its own chunk's bytes.
+#[test]
+fn duplicate_sorting_after_its_first_slot_fills_every_slot() {
+    let (mut repo, probe) = repo_on_tuned_backend(EncryptionMode::Aes256Gcm);
+    let ids = store_chunks(&mut repo, 3);
+    let input = [ids[2], ids[0], ids[2], ids[1], ids[0]];
+    let chunks = resolve_chunks(&repo, &input);
+    assert!(
+        chunks[0].2 > chunks[1].2,
+        "the repeated chunk must be stored after the next one"
+    );
+    let parts: Vec<Vec<u8>> = input
+        .iter()
+        .map(|id| repo.read_chunk(id).unwrap())
+        .collect();
+
+    for width in [1, 4] {
+        probe.width.store(width, Ordering::SeqCst);
+        let mut out = Vec::new();
+        repo.read_chunks_coalesced_into(&chunks, &mut out, &CancelToken::new())
+            .unwrap();
+        let mut rest = out.as_slice();
+        for (slot, part) in parts.iter().enumerate() {
+            assert!(rest.len() >= part.len(), "width {width}: output too short");
+            let (head, tail) = rest.split_at(part.len());
+            assert_eq!(head, part.as_slice(), "width {width}, slot {slot}");
+            rest = tail;
+        }
+        assert!(rest.is_empty(), "width {width}: trailing bytes");
+    }
+}
+
+/// A corrupt index that puts two different chunk IDs at one pack location is
+/// an error (the second read overlaps the first), not a panic.
+#[test]
+fn two_ids_at_one_location_is_an_error() {
+    let (mut repo, probe) = repo_on_tuned_backend(EncryptionMode::None);
+    let packs = store_packs(&mut repo, &[2, 1]);
+    let ids = [packs[0][0].0, packs[0][1].0, packs[1][0].0];
+    let mut chunks = resolve_chunks(&repo, &ids);
+    let (_, pack, offset, size) = chunks[0];
+    chunks[1] = (chunks[1].0, pack, offset, size);
+
+    for width in [1, 4] {
+        probe.width.store(width, Ordering::SeqCst);
+        let mut out = Vec::new();
+        let result = repo.read_chunks_coalesced_into(&chunks, &mut out, &CancelToken::new());
+        assert!(result.is_err(), "width {width}: expected an error");
+    }
+}
+
+/// `LocalBackend` with a settable request width; everything else, the
+/// streaming `open_range` included, is the local backend's own.
+struct LocalWidthBackend {
+    inner: vykar_storage::local_backend::LocalBackend,
+    width: Arc<AtomicUsize>,
+}
+
+impl InnerBackend for LocalWidthBackend {
+    fn inner_backend(&self) -> &dyn StorageBackend {
+        &self.inner
+    }
+}
+
+delegate_storage_backend! {
+    for LocalWidthBackend;
+    except [profile];
+
+    fn profile(&self) -> BackendProfile {
+        BackendProfile {
+            request_width: self.width.load(Ordering::SeqCst),
+            ..self.inner.profile()
+        }
+    }
+}
+
+/// Coalesced reads on the streaming `LocalBackend` range reader, across two
+/// packs and with a repeated chunk, at both widths.
+#[test]
+fn coalesced_read_on_local_backend() {
+    init_test_environment();
+    let dir = tempfile::tempdir().unwrap();
+    let width = Arc::new(AtomicUsize::new(1));
+    let backend = LocalWidthBackend {
+        inner: vykar_storage::local_backend::LocalBackend::new(dir.path().to_str().unwrap())
+            .unwrap(),
+        width: Arc::clone(&width),
+    };
+    let mut repo = Repository::init(
+        Box::new(backend),
+        EncryptionMode::Aes256Gcm,
+        crate::repo::ChunkerParams::default(),
+        Some("test-pass"),
+        None,
+        None,
+    )
+    .expect("init");
+    repo.begin_write_session(&WriteSessionOptions::default())
+        .expect("begin write session");
+    let packs = store_packs(&mut repo, &[3, 2]);
+    let order = [
+        &packs[0][0],
+        &packs[1][0],
+        &packs[0][0],
+        &packs[0][2],
+        &packs[1][1],
+        &packs[0][1],
+    ];
+    let ids: Vec<ChunkId> = order.iter().map(|(id, _)| *id).collect();
+    let expected: Vec<u8> = order.iter().flat_map(|(_, d)| d.clone()).collect();
+    let chunks = resolve_chunks(&repo, &ids);
+
+    for w in [1, 4] {
+        width.store(w, Ordering::SeqCst);
+        let mut out = Vec::new();
+        repo.read_chunks_coalesced_into(&chunks, &mut out, &CancelToken::new())
+            .unwrap();
+        assert!(out == expected, "width {w}: output differs");
     }
 }

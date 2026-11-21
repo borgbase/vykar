@@ -500,7 +500,8 @@ delegate_storage_backend! {
     }
 
     // Counted as one range read, same as the `get_range` it used to reach
-    // through the trait default. The restore path reads via this method.
+    // through the trait default. Every `open_range` (restore, coalesced
+    // item-stream loads) reads via this method.
     fn get_range_into(
         &self,
         key: &str,

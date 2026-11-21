@@ -33,6 +33,7 @@ mod rest_server;
 mod restore_cancel;
 mod segmented_index;
 mod segmented_writes;
+mod sim;
 pub(crate) mod tree_cut;
 mod upgrade;
 mod util_lock;

@@ -85,10 +85,20 @@ pub fn open_repo(
     passphrase: Option<&str>,
     opts: OpenOptions,
 ) -> Result<Repository> {
-    let connections = config.limits.connections;
-    let opts = with_identity_context(opts, config);
-    let backend = storage::backend_from_config(&config.repository, connections)?;
+    let backend = storage::backend_from_config(&config.repository, config.limits.connections)?;
     let backend = limits::wrap_storage_backend(backend, &config.limits);
+    open_repo_on(backend, config, passphrase, opts)
+}
+
+/// [`open_repo`] over a backend the caller built. Applies the same identity
+/// context and pin check; no limits wrapper (the caller decides).
+pub(crate) fn open_repo_on(
+    backend: Box<dyn StorageBackend>,
+    config: &VykarConfig,
+    passphrase: Option<&str>,
+    opts: OpenOptions,
+) -> Result<Repository> {
+    let opts = with_identity_context(opts, config);
     let repo = Repository::open(backend, passphrase, cache_dir_from_config(config), opts)
         .map_err(|e| enrich_repo_not_found(e, &config.repository.url))?;
     verify_repo_identity(config, &repo)?;
@@ -103,12 +113,21 @@ pub fn open_repo_with_read_session(
     passphrase: Option<&str>,
     opts: OpenOptions,
 ) -> Result<(Repository, lock::SessionGuard)> {
-    let connections = config.limits.connections;
-    let opts = with_identity_context(opts, config);
-    let backend = storage::backend_from_config(&config.repository, connections)?;
+    let backend = storage::backend_from_config(&config.repository, config.limits.connections)?;
     let backend: Arc<dyn StorageBackend> =
         Arc::from(limits::wrap_storage_backend(backend, &config.limits));
+    open_repo_with_read_session_on(backend, config, passphrase, opts)
+}
 
+/// [`open_repo_with_read_session`] over a backend the caller built: registers
+/// the session marker on `backend` before opening, exactly as the config path.
+pub(crate) fn open_repo_with_read_session_on(
+    backend: Arc<dyn StorageBackend>,
+    config: &VykarConfig,
+    passphrase: Option<&str>,
+    opts: OpenOptions,
+) -> Result<(Repository, lock::SessionGuard)> {
+    let opts = with_identity_context(opts, config);
     let session_id = format!("{:032x}", rand::random::<u128>());
     lock::register_session(backend.as_ref(), &session_id)?;
 

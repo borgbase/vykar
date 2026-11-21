@@ -13,6 +13,7 @@ use tracing::{info, warn};
 use crate::commands::util::check_interrupted;
 use crate::config::VykarConfig;
 use crate::platform::fs;
+use crate::repo::Repository;
 use vykar_common::display::{format_bytes, format_count};
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
@@ -198,7 +199,22 @@ pub fn run_with_options(
     opts: RestoreOptions,
     shutdown: Option<&AtomicBool>,
 ) -> Result<RestoreStats> {
-    let filter = pattern
+    let filter = compile_pattern(pattern)?;
+
+    restore_with_filter(
+        config,
+        passphrase,
+        snapshot_name,
+        dest,
+        opts,
+        move |path| filter.as_ref().is_none_or(|matcher| matcher.is_match(path)),
+        shutdown,
+    )
+}
+
+/// The glob filter `run_with_options` builds from `pattern`.
+fn compile_pattern(pattern: Option<&str>) -> Result<Option<globset::GlobMatcher>> {
+    pattern
         .map(|p| {
             globset::GlobBuilder::new(p)
                 .literal_separator(false)
@@ -206,11 +222,23 @@ pub fn run_with_options(
                 .map(|g| g.compile_matcher())
         })
         .transpose()
-        .map_err(|e| VykarError::Config(format!("invalid pattern: {e}")))?;
+        .map_err(|e| VykarError::Config(format!("invalid pattern: {e}")))
+}
 
-    restore_with_filter(
-        config,
-        passphrase,
+/// [`run_with_options`] on an already opened repository (read session, if
+/// any, is the caller's).
+#[cfg(any(test, feature = "sim"))]
+pub(crate) fn run_on_repo(
+    repo: &mut Repository,
+    snapshot_name: &str,
+    dest: &str,
+    pattern: Option<&str>,
+    opts: RestoreOptions,
+    shutdown: Option<&AtomicBool>,
+) -> Result<RestoreStats> {
+    let filter = compile_pattern(pattern)?;
+    restore_on_repo_with_filter(
+        repo,
         snapshot_name,
         dest,
         opts,
@@ -260,7 +288,7 @@ fn restore_with_filter<F>(
     snapshot_name: &str,
     dest: &str,
     opts: RestoreOptions,
-    mut include_path: F,
+    include_path: F,
     shutdown: Option<&AtomicBool>,
 ) -> Result<RestoreStats>
 where
@@ -272,6 +300,20 @@ where
         passphrase,
         crate::repo::OpenOptions::new(),
     )?;
+    restore_on_repo_with_filter(&mut repo, snapshot_name, dest, opts, include_path, shutdown)
+}
+
+fn restore_on_repo_with_filter<F>(
+    repo: &mut Repository,
+    snapshot_name: &str,
+    dest: &str,
+    opts: RestoreOptions,
+    mut include_path: F,
+    shutdown: Option<&AtomicBool>,
+) -> Result<RestoreStats>
+where
+    F: FnMut(&str) -> bool,
+{
     // Shrink blob cache for restore — the parallel pipeline reads pack data
     // directly via `StorageBackend::open_range`, so the cache only serves the
     // small item-stream tree-pack chunks. 2 MiB is plenty.
@@ -311,7 +353,7 @@ where
     // before anything is written (`temp_root` does not exist yet), leaving the
     // filesystem untouched. A failure further into the stream surfaces from
     // `stream_and_plan` and is cleaned up like any other mid-restore error.
-    let mut items = super::list::ItemStreamReader::new(&repo);
+    let mut items = super::list::ItemStreamReader::new(repo);
 
     // Byte-faithful restore of non-UTF8 names is Unix-only. On other platforms
     // run a separate read-only metadata pass over the whole stream *before*
@@ -324,7 +366,7 @@ where
     // extreme edge.
     #[cfg(not(unix))]
     {
-        let mut preflight = items.open_lazy(&mut repo, &resolved_name, shutdown)?;
+        let mut preflight = items.open_lazy(repo, &resolved_name, shutdown)?;
         if let Some((raw_count, example)) = detect_raw_entries(&mut preflight)? {
             return Err(VykarError::Other(format!(
                 "snapshot contains {raw_count} entr{} with non-UTF8 name(s) \
@@ -335,7 +377,7 @@ where
             )));
         }
     }
-    let mut item_stream = items.open_lazy(&mut repo, &resolved_name, shutdown)?;
+    let mut item_stream = items.open_lazy(repo, &resolved_name, shutdown)?;
 
     let dest_root = plan::validate_and_prepare_dest(dest)?;
 
@@ -404,7 +446,7 @@ where
                 // Resolve through the mmap'd restore cache (already resident
                 // for the item stream) and load the heap index only if the
                 // cache is absent or lacks a chunk of this batch.
-                items.ensure_resolvable(&mut repo, batch_chunks.keys())?;
+                items.ensure_resolvable(repo, batch_chunks.keys())?;
             }
             // Cached locations can be stale even when every chunk is present
             // (the cache is pinned to the advisory `index.gen`), so a blob
@@ -421,7 +463,7 @@ where
             let groups = if batch_chunks.is_empty() {
                 Vec::new()
             } else {
-                let (items, repo) = (&items, &repo);
+                let (items, repo) = (&items, &*repo);
                 if let (true, Some(f)) = (continue_on_error, &failures) {
                     batch_chunks.retain(|id, ct| {
                         let present = items.lookup(repo, id).is_some();
@@ -466,7 +508,7 @@ where
                 // the rest of the restore and ask the index: a blob it places
                 // elsewhere was only stale in the cache and is read again from
                 // there; any other failure is final, as without a cache.
-                let index_ok = match items.fall_back_to_index(&mut repo) {
+                let index_ok = match items.fall_back_to_index(repo) {
                     Ok(()) => true,
                     Err(e @ VykarError::Interrupted) => return Err(e),
                     Err(e) => {
@@ -483,7 +525,7 @@ where
                     let cached = (blob.pack_id, blob.pack_offset, blob.stored_size);
                     let relocated = index_ok
                         && items
-                            .lookup(&repo, &blob.chunk_id)
+                            .lookup(repo, &blob.chunk_id)
                             .is_some_and(|loc| loc != cached);
                     if relocated {
                         moved.insert(
@@ -509,7 +551,7 @@ where
                         moved.len()
                     );
                     let retry_failures = continue_on_error.then(parallel::BatchFailures::default);
-                    let groups = sorted_read_groups(moved, |id| items.lookup(&repo, id))?;
+                    let groups = sorted_read_groups(moved, |id| items.lookup(repo, id))?;
                     bytes += parallel::execute_parallel_restore(
                         &batch_files,
                         groups,

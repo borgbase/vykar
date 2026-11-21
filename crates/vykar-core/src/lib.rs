@@ -29,6 +29,10 @@ pub mod storage;
 #[doc(hidden)]
 pub mod fuzzing;
 
+#[cfg(any(test, feature = "sim"))]
+#[doc(hidden)]
+pub mod sim;
+
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

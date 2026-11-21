@@ -132,7 +132,7 @@ pub fn run_with_progress(
     passphrase: Option<&str>,
     verify_data: bool,
     distrust_server: bool,
-    mut progress: Option<&mut dyn FnMut(CheckProgressEvent)>,
+    progress: Option<&mut dyn FnMut(CheckProgressEvent)>,
     max_percent: u8,
     record_state: bool,
     shutdown: Option<&AtomicBool>,
@@ -142,12 +142,9 @@ pub fn run_with_progress(
     // record success for work that never ran.
     check_interrupted(shutdown)?;
 
-    let cache_dir = config.cache_dir.as_deref().map(std::path::Path::new);
-    let full_every_dur = config.check.full_every_duration();
-
     // Pre-open early exit: if max_percent=0 and no full_every configured,
     // skip without opening the repo at all.
-    if max_percent == 0 && full_every_dur.is_none() {
+    if max_percent == 0 && config.check.full_every_duration().is_none() {
         return Ok(skipped_result());
     }
 
@@ -155,8 +152,36 @@ pub fn run_with_progress(
     let (mut repo, _session_guard) =
         crate::commands::util::open_repo_with_read_session(config, passphrase, OpenOptions::new())?;
 
+    run_on_repo(
+        &mut repo,
+        config,
+        verify_data,
+        distrust_server,
+        progress,
+        max_percent,
+        record_state,
+        shutdown,
+    )
+}
+
+/// [`run_with_progress`] on an already opened repository (opened with
+/// `OpenOptions::new()`; any read session is the caller's).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_on_repo(
+    repo: &mut Repository,
+    config: &VykarConfig,
+    verify_data: bool,
+    distrust_server: bool,
+    mut progress: Option<&mut dyn FnMut(CheckProgressEvent)>,
+    max_percent: u8,
+    record_state: bool,
+    shutdown: Option<&AtomicBool>,
+) -> Result<CheckResult> {
+    let cache_dir = config.cache_dir.as_deref().map(std::path::Path::new);
+    let full_every_dur = config.check.full_every_duration();
+
     // Determine effective check percentage using repo fingerprint.
-    let fingerprint = compute_repo_fingerprint(&repo);
+    let fingerprint = compute_repo_fingerprint(repo);
     let effective = if max_percent == 100 {
         100
     } else if let Some(ref interval) = full_every_dur {
@@ -253,7 +278,7 @@ pub fn run_with_progress(
     };
 
     let scan = integrity_scan(
-        &mut repo,
+        repo,
         config,
         &ScanOptions {
             collect_chunk_refs: false,
@@ -385,11 +410,48 @@ pub fn run_with_repair(
     passphrase: Option<&str>,
     verify_data: bool,
     mode: RepairMode,
-    mut progress: Option<&mut dyn FnMut(CheckProgressEvent)>,
+    progress: Option<&mut dyn FnMut(CheckProgressEvent)>,
     shutdown: Option<&AtomicBool>,
 ) -> Result<RepairResult> {
     check_interrupted(shutdown)?;
 
+    let opts = repair_open_options(mode);
+    if mode == RepairMode::PlanOnly {
+        let (mut repo, _session_guard) =
+            crate::commands::util::open_repo_with_read_session(config, passphrase, opts)?;
+        run_with_repair_on_repo(&mut repo, config, verify_data, mode, progress, shutdown)
+    } else {
+        let mut repo = crate::commands::util::open_repo(config, passphrase, opts)?;
+        run_with_repair_on_repo(&mut repo, config, verify_data, mode, progress, shutdown)
+    }
+}
+
+/// Open options `run_with_repair` uses for `mode`.
+pub(crate) fn repair_open_options(mode: RepairMode) -> OpenOptions {
+    if mode == RepairMode::PlanOnly {
+        // PlanOnly: read session, no lock, purely read-only. `skip_key_backfill`
+        // is what keeps that promise: the dry run prints "no changes applied",
+        // and a key-copy backfill firing during the open underneath would make
+        // that statement false.
+        OpenOptions::new()
+            .skip_key_backfill()
+            .tolerate_broken_index()
+    } else {
+        OpenOptions::new().tolerate_broken_index()
+    }
+}
+
+/// [`run_with_repair`] on a repository opened with
+/// [`repair_open_options`]`(mode)`. PlanOnly takes no lock (the caller holds
+/// the read session); Apply/ApplyShown take the maintenance lock here.
+pub(crate) fn run_with_repair_on_repo(
+    repo: &mut Repository,
+    config: &VykarConfig,
+    verify_data: bool,
+    mode: RepairMode,
+    mut progress: Option<&mut dyn FnMut(CheckProgressEvent)>,
+    shutdown: Option<&AtomicBool>,
+) -> Result<RepairResult> {
     let scan_opts = ScanOptions {
         collect_chunk_refs: true,
         detect_orphans: true,
@@ -399,27 +461,16 @@ pub fn run_with_repair(
     };
 
     if mode == RepairMode::PlanOnly {
-        // PlanOnly: read session, no lock, purely read-only. `skip_key_backfill`
-        // is what keeps that promise: the dry run prints "no changes applied",
-        // and a key-copy backfill firing during the open underneath would make
-        // that statement false.
-        let (mut repo, _session_guard) = crate::commands::util::open_repo_with_read_session(
-            config,
-            passphrase,
-            OpenOptions::new()
-                .skip_key_backfill()
-                .tolerate_broken_index(),
-        )?;
         let recovery = repo.load_chunk_index_for_repair()?;
         repo.refresh_snapshot_list()?;
 
-        let scan = integrity_scan(&mut repo, config, &scan_opts, &mut progress, shutdown)?;
+        let scan = integrity_scan(repo, config, &scan_opts, &mut progress, shutdown)?;
 
         // Refuse before building the plan so a dry-run never presents a
         // misleading executable RebuildRefcounts plan for a too-new repo.
         refuse_repair_if_unreadable_snapshots(&scan)?;
 
-        let plan = plan_repair(&repo, &scan, &group_by_pack(repo.chunk_index()), recovery);
+        let plan = plan_repair(repo, &scan, &group_by_pack(repo.chunk_index()), recovery);
 
         // PlanOnly is cancellable end to end, and `plan_repair` is unguarded
         // CPU work over the scan; without this the CLI would print a plan built
@@ -434,55 +485,49 @@ pub fn run_with_repair(
         })
     } else {
         // Apply: maintenance lock, re-scan under lock, mutate state.
-        crate::commands::util::with_open_repo_maintenance_lock(
-            config,
-            passphrase,
-            OpenOptions::new().tolerate_broken_index(),
-            |repo| {
-                let recovery = repo.load_chunk_index_for_repair()?;
-                repo.refresh_snapshot_list()?;
+        crate::commands::util::with_maintenance_lock(repo, |repo| {
+            let recovery = repo.load_chunk_index_for_repair()?;
+            repo.refresh_snapshot_list()?;
 
-                let scan = integrity_scan(repo, config, &scan_opts, &mut progress, shutdown)?;
+            let scan = integrity_scan(repo, config, &scan_opts, &mut progress, shutdown)?;
 
-                // Refuse right after the under-lock scan — before the delete
-                // probe and execute_repair — so not even the probe object is
-                // written when a too-new snapshot is present.
-                refuse_repair_if_unreadable_snapshots(&scan)?;
+            // Refuse right after the under-lock scan — before the delete
+            // probe and execute_repair — so not even the probe object is
+            // written when a too-new snapshot is present.
+            refuse_repair_if_unreadable_snapshots(&scan)?;
 
-                let pack_chunks = group_by_pack(repo.chunk_index());
-                let plan = plan_repair(repo, &scan, &pack_chunks, recovery);
+            let pack_chunks = group_by_pack(repo.chunk_index());
+            let plan = plan_repair(repo, &scan, &pack_chunks, recovery);
 
-                // Before the delete probe.
-                refuse_repair_if_plan_changed(mode, &plan)?;
+            // Before the delete probe.
+            refuse_repair_if_plan_changed(mode, &plan)?;
 
-                // If plan has data-loss actions, probe append-only before mutating.
-                if plan.has_data_loss && !probe_deletes_allowed(repo.storage.as_ref()) {
-                    return Err(VykarError::Other(
-                        "repair requires deleting immutable snapshot objects; \
-                     not supported on append-only backends"
-                            .into(),
-                    ));
-                }
+            // If plan has data-loss actions, probe append-only before mutating.
+            if plan.has_data_loss && !probe_deletes_allowed(repo.storage.as_ref()) {
+                return Err(VykarError::Other(
+                    "repair requires deleting immutable snapshot objects; \
+                 not supported on append-only backends"
+                        .into(),
+                ));
+            }
 
-                // Mutation boundary. Everything above — the scan, the plan, the
-                // append-only probe — is cancellable; from here on `execute_repair`
-                // deletes immutable snapshot objects and rewrites the index, with
-                // no resumable mid-state, so it and the read path beneath it
-                // (`repair_apply`) deliberately do not poll the flag. This is the
-                // last point at which aborting is free.
-                check_interrupted(shutdown)?;
+            // Mutation boundary. Everything above — the scan, the plan, the
+            // append-only probe — is cancellable; from here on `execute_repair`
+            // deletes immutable snapshot objects and rewrites the index, with
+            // no resumable mid-state, so it and the read path beneath it
+            // (`repair_apply`) deliberately do not poll the flag. This is the
+            // last point at which aborting is free.
+            check_interrupted(shutdown)?;
 
-                // Execute the repair
-                let (applied, repair_errors) =
-                    execute_repair(repo, &plan, &scan.issues, &pack_chunks)?;
+            // Execute the repair
+            let (applied, repair_errors) = execute_repair(repo, &plan, &scan.issues, &pack_chunks)?;
 
-                Ok(RepairResult {
-                    check_result: scan.into(),
-                    plan,
-                    applied,
-                    repair_errors,
-                })
-            },
-        )
+            Ok(RepairResult {
+                check_result: scan.into(),
+                plan,
+                applied,
+                repair_errors,
+            })
+        })
     }
 }

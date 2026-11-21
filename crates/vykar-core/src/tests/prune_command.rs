@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use crate::commands;
 use crate::config::RetentionConfig;
+use crate::repo::control::CancelToken;
 use vykar_types::error::VykarError;
 
 use super::helpers::{
@@ -19,9 +20,17 @@ fn prune_errors_when_no_retention_rules_are_configured() {
 
     let config = init_repo(&repo_dir);
     let sources = vec![source_entry(&source_dir, "src-a")];
-    let err = commands::prune::run(&config, None, true, false, &sources, &[], None)
-        .err()
-        .unwrap();
+    let err = commands::prune::run(
+        &config,
+        None,
+        true,
+        false,
+        &sources,
+        &[],
+        &CancelToken::new(),
+    )
+    .err()
+    .unwrap();
     assert!(
         matches!(err, VykarError::Config(msg) if msg.contains("no retention rules configured"))
     );
@@ -51,9 +60,16 @@ fn prune_dry_run_reports_without_mutating_state() {
     drop(before);
 
     let sources = vec![source_entry(&source_dir, "src-a")];
-    let (stats, list_entries) =
-        commands::prune::run(&config, None, true, true, &sources, &[], None)
-            .expect("dry-run prune should succeed");
+    let (stats, list_entries) = commands::prune::run(
+        &config,
+        None,
+        true,
+        true,
+        &sources,
+        &[],
+        &CancelToken::new(),
+    )
+    .expect("dry-run prune should succeed");
 
     assert_eq!(stats.kept, 1);
     assert_eq!(stats.pruned, 1);
@@ -95,8 +111,16 @@ fn prune_source_filter_only_prunes_matching_label() {
         source_entry(&source_b, "src-b"),
     ];
     let source_filter = vec!["src-a".to_string()];
-    let (stats, _list_entries) =
-        commands::prune::run(&config, None, false, false, &sources, &source_filter, None).unwrap();
+    let (stats, _list_entries) = commands::prune::run(
+        &config,
+        None,
+        false,
+        false,
+        &sources,
+        &source_filter,
+        &CancelToken::new(),
+    )
+    .unwrap();
 
     assert_eq!(stats.pruned, 1);
     assert_eq!(stats.kept, 1);
@@ -139,8 +163,9 @@ fn prune_groups_by_label_even_without_configured_sources() {
     std::thread::sleep(Duration::from_millis(2));
     backup_single_source(&config, &source_b, "b", "snap-b");
 
-    let (stats, _) = commands::prune::run(&config, None, false, false, &[], &[], None)
-        .expect("prune should succeed without a sources block");
+    let (stats, _) =
+        commands::prune::run(&config, None, false, false, &[], &[], &CancelToken::new())
+            .expect("prune should succeed without a sources block");
 
     assert_eq!(stats.pruned, 0);
     assert_eq!(stats.kept, 2);
@@ -180,7 +205,8 @@ fn prune_persists_snapshot_cache_immediately() {
     let before = load_snapshot_cache_from_disk(&repo_dir);
     assert!(before.entries.values().any(|e| e.name == "snap-old"));
 
-    let (stats, _) = commands::prune::run(&config, None, false, false, &[], &[], None).unwrap();
+    let (stats, _) =
+        commands::prune::run(&config, None, false, false, &[], &[], &CancelToken::new()).unwrap();
     assert_eq!(stats.pruned, 1);
     assert_eq!(stats.kept, 1);
 
@@ -202,7 +228,7 @@ fn prune_errors_without_retention_rules_when_sources_empty() {
     std::fs::create_dir_all(&repo_dir).unwrap();
 
     let config = init_repo(&repo_dir);
-    let err = commands::prune::run(&config, None, true, false, &[], &[], None)
+    let err = commands::prune::run(&config, None, true, false, &[], &[], &CancelToken::new())
         .err()
         .unwrap();
     assert!(
@@ -247,8 +273,16 @@ fn prune_phase3_refcount_failure_returns_warning_not_error() {
     }
 
     let sources = vec![source_entry(&source_dir, "src-a")];
-    let (stats, _) = commands::prune::run(&config, None, false, false, &sources, &[], None)
-        .expect("prune must not fail after commit point — Phase 3 errors become warnings");
+    let (stats, _) = commands::prune::run(
+        &config,
+        None,
+        false,
+        false,
+        &sources,
+        &[],
+        &CancelToken::new(),
+    )
+    .expect("prune must not fail after commit point — Phase 3 errors become warnings");
 
     // One snapshot was pruned (blob deleted) but its Phase 3 cleanup failed.
     assert_eq!(stats.pruned, 1);

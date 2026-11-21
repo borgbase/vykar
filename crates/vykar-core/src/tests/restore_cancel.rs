@@ -8,12 +8,12 @@
 
 use std::collections::HashSet;
 use std::path::Path;
-use std::sync::atomic::AtomicBool;
 
 use vykar_types::error::VykarError;
 
 use crate::commands;
 use crate::config::VykarConfig;
+use crate::repo::control::CancelToken;
 
 use super::helpers::{backup_single_source, init_repo};
 
@@ -52,7 +52,8 @@ fn pre_cancelled_restore_run_writes_nothing() {
     let tmp = tempfile::tempdir().unwrap();
     let (config, dest) = fixture(tmp.path());
 
-    let flag = AtomicBool::new(true);
+    let flag = CancelToken::new();
+    flag.cancel();
     let err = commands::restore::run(
         &config,
         None,
@@ -61,7 +62,7 @@ fn pre_cancelled_restore_run_writes_nothing() {
         None,
         false,
         false,
-        Some(&flag),
+        &flag,
     )
     .unwrap_err();
 
@@ -80,7 +81,8 @@ fn pre_cancelled_restore_run_selected_writes_nothing() {
     let mut selected = HashSet::new();
     selected.insert("a.txt".to_string());
 
-    let flag = AtomicBool::new(true);
+    let flag = CancelToken::new();
+    flag.cancel();
     let err = commands::restore::run_selected(
         &config,
         None,
@@ -89,7 +91,7 @@ fn pre_cancelled_restore_run_selected_writes_nothing() {
         &selected,
         false,
         false,
-        Some(&flag),
+        &flag,
     )
     .unwrap_err();
 
@@ -107,7 +109,7 @@ fn restore_with_unset_flag_completes_normally() {
     let tmp = tempfile::tempdir().unwrap();
     let (config, dest) = fixture(tmp.path());
 
-    let flag = AtomicBool::new(false);
+    let flag = CancelToken::new();
     let stats = commands::restore::run(
         &config,
         None,
@@ -116,7 +118,7 @@ fn restore_with_unset_flag_completes_normally() {
         None,
         false,
         false,
-        Some(&flag),
+        &flag,
     )
     .unwrap();
 

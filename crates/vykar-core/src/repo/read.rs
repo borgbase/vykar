@@ -2,9 +2,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use super::Repository;
+use super::control::CancelToken;
 use super::format::{BlobLocation, decode_chunk_into};
 use super::pack::read_blob_from_pack;
-use crate::commands::util::check_interrupted;
 use crate::index::dedup_cache;
 use vykar_crypto::CryptoEngine;
 use vykar_storage::StorageBackend;
@@ -106,7 +106,7 @@ fn read_groups_parallel(
     storage: &dyn StorageBackend,
     crypto: &dyn CryptoEngine,
     groups: &[CoalescedGroup],
-    shutdown: Option<&AtomicBool>,
+    shutdown: &CancelToken,
     mut accept: impl FnMut(Vec<DecodedBlob>) -> Result<()>,
 ) -> Result<()> {
     let indexed: Vec<(usize, &CoalescedGroup)> = groups.iter().enumerate().collect();
@@ -123,8 +123,9 @@ fn read_groups_parallel(
                 if stop.load(Ordering::Relaxed) {
                     return Err(());
                 }
-                let result =
-                    check_interrupted(shutdown).and_then(|()| fetch_group(storage, crypto, group));
+                let result = shutdown
+                    .check()
+                    .and_then(|()| fetch_group(storage, crypto, group));
                 let failed = result.is_err();
                 // The receiver lives until this thread drops `tx`.
                 let _ = tx.send((idx, result));
@@ -273,7 +274,7 @@ impl Repository {
         &self,
         chunks: &[(ChunkId, PackId, u64, u32)],
         out: &mut Vec<u8>,
-        shutdown: Option<&AtomicBool>,
+        shutdown: &CancelToken,
     ) -> Result<()> {
         if chunks.is_empty() {
             return Ok(());
@@ -333,7 +334,7 @@ impl Repository {
         let crypto = self.crypto.as_ref();
         if threads <= 1 {
             for group in &groups {
-                check_interrupted(shutdown)?;
+                shutdown.check()?;
                 asm.accept(fetch_group(storage, crypto, group)?)?;
             }
         } else {

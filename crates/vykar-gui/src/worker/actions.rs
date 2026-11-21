@@ -42,9 +42,9 @@ pub(super) fn handle_restore_selected(
                 &path_set,
                 repo.config.xattrs.enabled,
                 false, // verify_chunks
-                // Taken after `OpGuard::ui`, which resets the flag at
+                // Taken after `OpGuard::ui`, which installs a fresh token at
                 // operation start (see `with_repo_op`).
-                Some(&ctx.cancel_requested),
+                &ctx.cancel_requested.current(),
             ) {
                 Ok(stats) => {
                     send_log(
@@ -162,7 +162,7 @@ pub(super) fn handle_delete_snapshots(
     // one error covers the whole batch.
     let names: Vec<&str> = snapshot_names.iter().map(String::as_str).collect();
     let result = match with_repo_op(ctx, &repo_name, status, "delete", |repo, pass, cancel| {
-        commands::delete::run(&repo.config, pass, &names, false, Some(cancel))
+        commands::delete::run(&repo.config, pass, &names, false, cancel)
     }) {
         Ok(r) => r,
         Err(_) => return,
@@ -301,15 +301,7 @@ pub(super) fn handle_prune_repo(ctx: &mut WorkerContext, repo_name: String) {
         "Pruning snapshots...",
         "prune",
         |repo, pass, cancel| {
-            commands::prune::run(
-                &repo.config,
-                pass,
-                false,
-                false,
-                &repo.sources,
-                &[],
-                Some(cancel),
-            )
+            commands::prune::run(&repo.config, pass, false, false, &repo.sources, &[], cancel)
         },
     ) else {
         return;

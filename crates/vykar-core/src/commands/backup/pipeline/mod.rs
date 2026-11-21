@@ -16,13 +16,13 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::compress::Compression;
 use crate::index::dedup_cache::DedupPrefilter;
 use crate::platform::fs;
 use crate::repo::Repository;
+use crate::repo::control::CancelToken;
 use crate::repo::file_cache::{CachedChunks, FileCache, ParentReuseIndex, RetainedHit};
 use crate::snapshot::SnapshotStats;
 use vykar_crypto::CryptoEngine;
@@ -256,7 +256,7 @@ pub(crate) struct PipelineCtx<'a> {
     pub item_cutter: &'a ItemStreamCutter,
     pub pipeline_buffer_bytes: usize,
     pub prefilter: Option<&'a DedupPrefilter>,
-    pub shutdown: Option<&'a AtomicBool>,
+    pub shutdown: &'a CancelToken,
     pub verbose: bool,
     pub parent_reuse_index: Option<&'a ParentReuseIndex>,
 }
@@ -380,7 +380,7 @@ pub(crate) fn run_parallel_pipeline(
 
             let mut seq_idx: usize = 0;
             for entry_result in walk_iter {
-                if shutdown.is_some_and(|f| f.load(Ordering::Relaxed)) {
+                if shutdown.is_cancelled() {
                     break;
                 }
                 match entry_result {
@@ -504,7 +504,7 @@ pub(crate) fn run_parallel_pipeline(
             let wait = Instant::now();
             let Ok(msg) = result_rx.recv() else { break };
             consumer_recv_wait += wait.elapsed();
-            if shutdown.is_some_and(|f| f.load(Ordering::Relaxed)) {
+            if shutdown.is_cancelled() {
                 budget.poison();
                 consume_err = Some(VykarError::Interrupted);
                 break;
@@ -729,7 +729,7 @@ pub(crate) fn run_parallel_pipeline(
 
         // The walk thread may have exited cleanly on shutdown without
         // the consumer ever seeing a message.  Catch that here.
-        if shutdown.is_some_and(|f| f.load(Ordering::Relaxed)) {
+        if shutdown.is_cancelled() {
             return Err(VykarError::Interrupted);
         }
 
@@ -782,7 +782,7 @@ mod tests {
     /// small budget + large items + workers finishing in reverse order.
     #[test]
     fn pipeline_no_deadlock_with_small_budget_and_large_items() {
-        use std::sync::atomic::AtomicBool;
+        use std::sync::atomic::{AtomicBool, Ordering};
         use std::time::Duration;
 
         let completed = Arc::new(AtomicBool::new(false));
@@ -869,7 +869,7 @@ mod tests {
     /// next item. Same topology as the test above.
     #[test]
     fn pipeline_no_deadlock_with_budget_debt() {
-        use std::sync::atomic::AtomicBool;
+        use std::sync::atomic::{AtomicBool, Ordering};
         use std::time::Duration;
 
         let completed = Arc::new(AtomicBool::new(false));

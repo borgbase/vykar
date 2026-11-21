@@ -9,6 +9,7 @@ use crate::commands;
 use crate::config::VykarConfig;
 use crate::index::ChunkIndex;
 use crate::index::head::IndexHead;
+use crate::repo::control::CancelToken;
 use crate::repo::index_store::INDEX_OBJECT_DIR;
 use crate::repo::index_write::FoldPolicy;
 use crate::repo::{OpenOptions, RepoFormat, Repository};
@@ -150,7 +151,7 @@ fn v5_backup_fold_and_compact_through_the_server() {
     assert_eq!(head(&c.config).segments.len(), 3);
     assert_eq!(server.index_objects(), 3);
 
-    commands::delete::run(&c.config, None, &["s1"], false, None).unwrap();
+    commands::delete::run(&c.config, None, &["s1"], false, &CancelToken::new()).unwrap();
     let after_delete = head(&c.config);
     assert_eq!(after_delete.segments.len(), 4);
 
@@ -159,7 +160,7 @@ fn v5_backup_fold_and_compact_through_the_server() {
         let mut policy = FoldPolicy::default();
         policy.soft.segments = 2;
         repo.set_fold_policy(policy);
-        commands::compact::run_on_repo(&mut repo, 0.0, None, false, None).unwrap();
+        commands::compact::run_on_repo(&mut repo, 0.0, None, false, &CancelToken::new()).unwrap();
     };
     compact();
     let folded = head(&c.config);
@@ -195,7 +196,7 @@ fn v5_backup_fold_and_compact_through_the_server() {
         None,
         false,
         true,
-        None,
+        &CancelToken::new(),
     )
     .unwrap();
     let restored = find(&dest, "c");

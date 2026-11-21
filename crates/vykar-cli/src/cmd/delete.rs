@@ -1,8 +1,8 @@
 use std::io::IsTerminal;
-use std::sync::atomic::AtomicBool;
 
 use vykar_core::commands;
 use vykar_core::config::VykarConfig;
+use vykar_core::repo::control::CancelToken;
 
 use crate::error::{CliError, CliResult};
 use crate::format::format_bytes;
@@ -13,7 +13,7 @@ pub(crate) fn run_delete(
     label: Option<&str>,
     snapshot_names: &[String],
     dry_run: bool,
-    shutdown: Option<&AtomicBool>,
+    shutdown: &CancelToken,
 ) -> CliResult<()> {
     let name_refs: Vec<&str> = snapshot_names.iter().map(|s| s.as_str()).collect();
     let result = with_repo_passphrase(config, label, |passphrase| {

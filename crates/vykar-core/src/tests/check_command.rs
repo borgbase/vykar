@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::commands;
 use crate::commands::check::{
@@ -8,6 +7,7 @@ use crate::commands::check::{
     process_verify_response, try_server_verify, verify_pack_full,
 };
 use crate::index::ChunkIndexEntry;
+use crate::repo::control::CancelToken;
 use vykar_protocol::{VerifyPackResult, VerifyPacksPlanRequest, VerifyPacksResponse};
 use vykar_storage::StorageBackend;
 use vykar_storage::local_backend::LocalBackend;
@@ -117,7 +117,7 @@ fn sampled_check_preserves_local_fallback_counters() {
                 None,
                 50,
                 false,
-                None,
+                &CancelToken::new(),
             )
             .unwrap();
             assert!(result.errors.is_empty());
@@ -230,7 +230,7 @@ fn check_with_progress_emits_phase_events() {
         Some(&mut on_progress),
         100,
         false,
-        None,
+        &CancelToken::new(),
     )
     .unwrap();
     assert!(result.errors.is_empty());
@@ -422,7 +422,7 @@ fn test_server_fallback_no_stale_errors() {
         true,
         vykar_types::hash::HashAlgorithm::Blake2b,
         &mut progress,
-        None,
+        &CancelToken::new(),
     );
 
     match outcome {
@@ -573,7 +573,8 @@ fn pick_data_only_pack(
     let mut affected: Vec<(String, String, usize, vykar_types::snapshot_id::SnapshotId)> =
         Vec::new();
     for entry in &entries {
-        let stream = load_snapshot_item_stream(&mut repo, &entry.name, None).unwrap();
+        let stream =
+            load_snapshot_item_stream(&mut repo, &entry.name, &CancelToken::new()).unwrap();
         let mut idx: usize = 0;
         for_each_decoded_item(&stream, |item| {
             let i = idx;
@@ -714,9 +715,15 @@ fn check_repair_dry_run_includes_item_impact() {
     std::fs::remove_file(repo_dir.join(deleted_pack.storage_key())).unwrap();
     assert!(!expected_items.is_empty());
 
-    let result =
-        commands::check::run_with_repair(&config, None, false, RepairMode::PlanOnly, None, None)
-            .unwrap();
+    let result = commands::check::run_with_repair(
+        &config,
+        None,
+        false,
+        RepairMode::PlanOnly,
+        None,
+        &CancelToken::new(),
+    )
+    .unwrap();
 
     assert!(
         !result.check_result.item_impacts.is_empty(),
@@ -780,9 +787,15 @@ fn repair_drops_items_via_missing_pack_keeps_snapshot() {
         .collect();
     std::fs::remove_file(repo_dir.join(deleted_pack.storage_key())).unwrap();
 
-    let result =
-        commands::check::run_with_repair(&config, None, false, RepairMode::Apply, None, None)
-            .unwrap();
+    let result = commands::check::run_with_repair(
+        &config,
+        None,
+        false,
+        RepairMode::Apply,
+        None,
+        &CancelToken::new(),
+    )
+    .unwrap();
 
     let drop_actions: Vec<_> = result
         .applied
@@ -827,7 +840,7 @@ fn repair_drops_items_via_missing_pack_keeps_snapshot() {
         None,
         false,
         false,
-        None,
+        &CancelToken::new(),
     )
     .unwrap();
     for name in &file_names {
@@ -867,9 +880,15 @@ fn repair_falls_back_to_whole_snapshot_when_all_items_affected() {
     assert_eq!(expected_items.len(), 1);
     std::fs::remove_file(repo_dir.join(deleted_pack.storage_key())).unwrap();
 
-    let result =
-        commands::check::run_with_repair(&config, None, false, RepairMode::Apply, None, None)
-            .unwrap();
+    let result = commands::check::run_with_repair(
+        &config,
+        None,
+        false,
+        RepairMode::Apply,
+        None,
+        &CancelToken::new(),
+    )
+    .unwrap();
 
     let has_drop = result
         .applied
@@ -913,9 +932,15 @@ fn repair_dry_run_emits_drop_items_from_snapshot() {
     assert!(!expected_items.is_empty() && expected_items.len() < 3);
     std::fs::remove_file(repo_dir.join(deleted_pack.storage_key())).unwrap();
 
-    let result =
-        commands::check::run_with_repair(&config, None, false, RepairMode::PlanOnly, None, None)
-            .unwrap();
+    let result = commands::check::run_with_repair(
+        &config,
+        None,
+        false,
+        RepairMode::PlanOnly,
+        None,
+        &CancelToken::new(),
+    )
+    .unwrap();
 
     let drops: Vec<&RepairAction> = result
         .plan
@@ -991,9 +1016,15 @@ fn repair_drops_items_rebuilds_refcounts() {
     }
     std::fs::remove_file(repo_dir.join(deleted_pack.storage_key())).unwrap();
 
-    let result =
-        commands::check::run_with_repair(&config, None, false, RepairMode::Apply, None, None)
-            .unwrap();
+    let result = commands::check::run_with_repair(
+        &config,
+        None,
+        false,
+        RepairMode::Apply,
+        None,
+        &CancelToken::new(),
+    )
+    .unwrap();
     assert!(
         result
             .applied
@@ -1027,7 +1058,7 @@ fn repair_drops_items_rebuilds_refcounts() {
         None,
         false,
         false,
-        None,
+        &CancelToken::new(),
     )
     .unwrap();
     let restored = walk_find_file(&dest, "z.bin").expect("z.bin missing after restore");
@@ -1094,16 +1125,28 @@ fn check_flags_unsupported_version_and_repair_refuses() {
     );
 
     // Both repair modes refuse before producing a plan / mutating anything.
-    let plan_err =
-        commands::check::run_with_repair(&config, None, false, RepairMode::PlanOnly, None, None)
-            .unwrap_err()
-            .to_string();
+    let plan_err = commands::check::run_with_repair(
+        &config,
+        None,
+        false,
+        RepairMode::PlanOnly,
+        None,
+        &CancelToken::new(),
+    )
+    .unwrap_err()
+    .to_string();
     assert!(plan_err.contains("aborting repair"), "got: {plan_err}");
 
-    let apply_err =
-        commands::check::run_with_repair(&config, None, false, RepairMode::Apply, None, None)
-            .unwrap_err()
-            .to_string();
+    let apply_err = commands::check::run_with_repair(
+        &config,
+        None,
+        false,
+        RepairMode::Apply,
+        None,
+        &CancelToken::new(),
+    )
+    .unwrap_err()
+    .to_string();
     assert!(apply_err.contains("aborting repair"), "got: {apply_err}");
 }
 
@@ -1181,9 +1224,10 @@ fn check_repair_refuses_on_incompatible_envelope() {
     let (config, _repo_dir) = repo_with_future_envelope_snapshot(tmp.path());
 
     for mode in [RepairMode::PlanOnly, RepairMode::Apply] {
-        let err = commands::check::run_with_repair(&config, None, false, mode, None, None)
-            .unwrap_err()
-            .to_string();
+        let err =
+            commands::check::run_with_repair(&config, None, false, mode, None, &CancelToken::new())
+                .unwrap_err()
+                .to_string();
         assert!(
             err.contains("aborting repair") && err.contains("newer vykar"),
             "{mode:?}: repair must refuse and name the cause, got: {err}"
@@ -1205,10 +1249,16 @@ fn check_repair_apply_writes_nothing_for_incompatible_envelope() {
         "fixture must leave a snapshot blob on disk"
     );
 
-    let apply_err =
-        commands::check::run_with_repair(&config, None, false, RepairMode::Apply, None, None)
-            .unwrap_err()
-            .to_string();
+    let apply_err = commands::check::run_with_repair(
+        &config,
+        None,
+        false,
+        RepairMode::Apply,
+        None,
+        &CancelToken::new(),
+    )
+    .unwrap_err()
+    .to_string();
     assert!(apply_err.contains("aborting repair"), "got: {apply_err}");
 
     let after = collect_repo_files(&repo_dir);
@@ -1289,10 +1339,16 @@ fn check_repair_apply_writes_nothing_for_unsupported_version() {
 
     let before = collect_repo_files(&repo_dir);
 
-    let apply_err =
-        commands::check::run_with_repair(&config, None, false, RepairMode::Apply, None, None)
-            .unwrap_err()
-            .to_string();
+    let apply_err = commands::check::run_with_repair(
+        &config,
+        None,
+        false,
+        RepairMode::Apply,
+        None,
+        &CancelToken::new(),
+    )
+    .unwrap_err()
+    .to_string();
     assert!(apply_err.contains("aborting repair"), "got: {apply_err}");
 
     let after = collect_repo_files(&repo_dir);
@@ -1339,7 +1395,7 @@ fn small_file_non_utf8_name_round_trips_at_one_thread() {
         None,
         false,
         false,
-        None,
+        &CancelToken::new(),
     )
     .unwrap();
 
@@ -1413,7 +1469,7 @@ fn non_utf8_names_round_trip_via_pipeline() {
         None,
         false,
         false,
-        None,
+        &CancelToken::new(),
     )
     .unwrap();
 
@@ -1518,13 +1574,13 @@ fn check_cancelled_mid_scan_returns_interrupted() {
     let tmp = tempfile::tempdir().unwrap();
     let (config, _repo_dir) = repo_for_cancel_tests(tmp.path(), 2);
 
-    let flag = AtomicBool::new(false);
+    let flag = CancelToken::new();
     let mut cb = |evt: commands::check::CheckProgressEvent| {
         if matches!(
             evt,
             commands::check::CheckProgressEvent::SnapshotStarted { .. }
         ) {
-            flag.store(true, Ordering::Relaxed);
+            flag.cancel();
         }
     };
 
@@ -1536,7 +1592,7 @@ fn check_cancelled_mid_scan_returns_interrupted() {
         Some(&mut cb),
         100,
         false,
-        Some(&flag),
+        &flag,
     );
     assert_interrupted(result);
 }
@@ -1550,13 +1606,13 @@ fn check_cancelled_on_late_callback_returns_interrupted() {
     let tmp = tempfile::tempdir().unwrap();
     let (config, _repo_dir) = repo_for_cancel_tests(tmp.path(), 1);
 
-    let flag = AtomicBool::new(false);
+    let flag = CancelToken::new();
     let mut cb = |evt: commands::check::CheckProgressEvent| {
         if matches!(
             evt,
             commands::check::CheckProgressEvent::PacksExistenceProgress { .. }
         ) {
-            flag.store(true, Ordering::Relaxed);
+            flag.cancel();
         }
     };
 
@@ -1568,7 +1624,7 @@ fn check_cancelled_on_late_callback_returns_interrupted() {
         Some(&mut cb),
         100,
         false,
-        Some(&flag), // verify_data = false: no later phase polls the flag
+        &flag, // verify_data = false: no later phase polls the flag
     );
     assert_interrupted(result);
 }
@@ -1585,9 +1641,17 @@ fn interrupted_check_does_not_record_full_check() {
     let control_cache = tmp.path().join("cache-control");
     std::fs::create_dir_all(&control_cache).unwrap();
     config.cache_dir = Some(control_cache.to_string_lossy().into_owned());
-    let control =
-        commands::check::run_with_progress(&config, None, false, false, None, 100, true, None)
-            .unwrap();
+    let control = commands::check::run_with_progress(
+        &config,
+        None,
+        false,
+        false,
+        None,
+        100,
+        true,
+        &CancelToken::new(),
+    )
+    .unwrap();
     assert!(control.errors.is_empty(), "control run must be clean");
     assert_eq!(
         check_state_files(&control_cache).len(),
@@ -1600,13 +1664,13 @@ fn interrupted_check_does_not_record_full_check() {
     std::fs::create_dir_all(&cancel_cache).unwrap();
     config.cache_dir = Some(cancel_cache.to_string_lossy().into_owned());
 
-    let flag = AtomicBool::new(false);
+    let flag = CancelToken::new();
     let mut cb = |evt: commands::check::CheckProgressEvent| {
         if matches!(
             evt,
             commands::check::CheckProgressEvent::SnapshotStarted { .. }
         ) {
-            flag.store(true, Ordering::Relaxed);
+            flag.cancel();
         }
     };
     let result = commands::check::run_with_progress(
@@ -1617,7 +1681,7 @@ fn interrupted_check_does_not_record_full_check() {
         Some(&mut cb),
         100,
         true,
-        Some(&flag),
+        &flag,
     );
     assert_interrupted(result);
 
@@ -1653,17 +1717,10 @@ fn pre_cancelled_check_on_empty_repository_returns_interrupted() {
     std::fs::create_dir_all(&cache).unwrap();
     config.cache_dir = Some(cache.to_string_lossy().into_owned());
 
-    let flag = AtomicBool::new(true);
-    let result = commands::check::run_with_progress(
-        &config,
-        None,
-        false,
-        false,
-        None,
-        100,
-        true,
-        Some(&flag),
-    );
+    let flag = CancelToken::new();
+    flag.cancel();
+    let result =
+        commands::check::run_with_progress(&config, None, false, false, None, 100, true, &flag);
     assert_interrupted(result);
     assert!(
         check_state_files(&cache).is_empty(),
@@ -1673,7 +1730,7 @@ fn pre_cancelled_check_on_empty_repository_returns_interrupted() {
     // Pre-open early exit: without the entry guard this returns Ok(skipped).
     config.check.full_every = None;
     let result =
-        commands::check::run_with_progress(&config, None, false, false, None, 0, true, Some(&flag));
+        commands::check::run_with_progress(&config, None, false, false, None, 0, true, &flag);
     assert_interrupted(result);
 }
 
@@ -1700,13 +1757,13 @@ fn missing_pack_rescan_is_cancellable() {
     std::fs::remove_file(&pack_path).unwrap();
 
     // Raised once pack existence has resolved, i.e. just before Phase 2b.
-    let flag = AtomicBool::new(false);
+    let flag = CancelToken::new();
     let mut cb = |evt: commands::check::CheckProgressEvent| {
         if matches!(
             evt,
             commands::check::CheckProgressEvent::PacksExistenceProgress { .. }
         ) {
-            flag.store(true, Ordering::Relaxed);
+            flag.cancel();
         }
     };
     let result = commands::check::run_with_progress(
@@ -1717,7 +1774,7 @@ fn missing_pack_rescan_is_cancellable() {
         Some(&mut cb),
         100,
         false,
-        Some(&flag),
+        &flag,
     );
     assert_interrupted(result);
 }
@@ -1732,14 +1789,15 @@ fn repair_aborts_before_mutating() {
     let tmp = tempfile::tempdir().unwrap();
     let (config, repo_dir) = repo_for_cancel_tests(tmp.path(), 1);
 
-    let flag = AtomicBool::new(true);
+    let flag = CancelToken::new();
+    flag.cancel();
     assert_interrupted(commands::check::run_with_repair(
         &config,
         None,
         false,
         RepairMode::PlanOnly,
         None,
-        Some(&flag),
+        &flag,
     ));
 
     // Apply mode: nothing about the repository may change.
@@ -1752,7 +1810,7 @@ fn repair_aborts_before_mutating() {
         false,
         RepairMode::Apply,
         None,
-        Some(&flag),
+        &flag,
     ));
 
     assert_eq!(

@@ -8,6 +8,7 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use crate::commands::list::{for_each_decoded_item, load_snapshot_item_stream, load_snapshot_meta};
+use crate::repo::control::CancelToken;
 use crate::tests::helpers::{backup_single_source, init_repo, open_local_repo};
 use vykar_types::chunk_id::ChunkId;
 
@@ -60,7 +61,7 @@ fn every_tree_chunk_holds_whole_entries() {
         }
         concat.extend_from_slice(&chunk);
     }
-    let stream = load_snapshot_item_stream(&mut repo, "snap1", None).unwrap();
+    let stream = load_snapshot_item_stream(&mut repo, "snap1", &CancelToken::new()).unwrap();
     assert!(
         concat == stream,
         "tree chunks do not concatenate to the stream"

@@ -1,10 +1,10 @@
 use std::collections::HashMap;
-use std::sync::atomic::AtomicBool;
 
 use chrono::Utc;
 
 use crate::config::{RetentionConfig, SourceEntry, VykarConfig};
 use crate::prune::{PruneDecision, apply_policy_by_label};
+use crate::repo::control::CancelToken;
 use vykar_types::error::{Result, VykarError};
 
 use super::snapshot_ops::{prepare_removal_targets, remove_snapshots};
@@ -47,7 +47,7 @@ pub fn run(
     list: bool,
     sources: &[SourceEntry],
     source_filter: &[String],
-    shutdown: Option<&AtomicBool>,
+    shutdown: &CancelToken,
 ) -> Result<(PruneStats, Vec<PruneListEntry>)> {
     let mut repo = open_repo(config, passphrase, OpenOptions::new())?;
     run_on_repo(
@@ -70,7 +70,7 @@ pub(crate) fn run_on_repo(
     list: bool,
     sources: &[SourceEntry],
     source_filter: &[String],
-    shutdown: Option<&AtomicBool>,
+    shutdown: &CancelToken,
 ) -> Result<(PruneStats, Vec<PruneListEntry>)> {
     with_maintenance_lock(repo, |repo| {
         let now = Utc::now();

@@ -5,6 +5,7 @@ use globset::GlobMatcher;
 
 use crate::config::VykarConfig;
 use crate::repo::OpenOptions;
+use crate::repo::control::CancelToken;
 use crate::snapshot::item::{Item, ItemType};
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::Result;
@@ -159,7 +160,7 @@ pub fn run(
         let snapshot_name = entry.name.clone();
         let snapshot_time = entry.time;
 
-        let items_stream = reader.load(&mut repo, &snapshot_name, None)?;
+        let items_stream = reader.load(&mut repo, &snapshot_name, &CancelToken::new())?;
 
         list::for_each_decoded_item(&items_stream, |item| {
             if matches_filter(&item, filter) {

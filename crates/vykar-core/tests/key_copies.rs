@@ -13,6 +13,7 @@ use vykar_core::commands;
 use vykar_core::commands::check::{RepairAction, RepairMode};
 use vykar_core::commands::key::KeyExport;
 use vykar_core::config::{EncryptionModeConfig, VykarConfig};
+use vykar_core::repo::control::CancelToken;
 use vykar_core::repo::identity::{self, KeyProof};
 use vykar_core::repo::{
     EncryptionMode, KEY_PRIMARY, KEY_SECONDARY, OpenOptions, RepoConfig, RepoFormat, Repository,
@@ -472,7 +473,7 @@ fn a_corrupt_copy_does_not_stop_the_open_and_check_reports_it() {
         false,
         RepairMode::Apply,
         None,
-        None,
+        &CancelToken::new(),
     )
     .unwrap();
     assert!(
@@ -512,8 +513,15 @@ fn divergent_but_resolvable_opens_off_the_real_key_and_repairs_the_other() {
         result.errors
     );
 
-    commands::check::run_with_repair(&fx.config, Some(PASS), false, RepairMode::Apply, None, None)
-        .unwrap();
+    commands::check::run_with_repair(
+        &fx.config,
+        Some(PASS),
+        false,
+        RepairMode::Apply,
+        None,
+        &CancelToken::new(),
+    )
+    .unwrap();
 
     assert_eq!(
         std::fs::read(fx.secondary()).unwrap(),
@@ -557,7 +565,7 @@ fn divergent_and_unresolvable_fails_at_open_and_changes_nothing() {
             false,
             RepairMode::Apply,
             None,
-            None
+            &CancelToken::new()
         )
         .is_err()
     );
@@ -582,8 +590,15 @@ fn same_key_wrapped_twice_resolves_without_complaint() {
     let repo = fx.open().expect("identical key material must resolve");
     assert_eq!(repo.manifest().snapshots.len(), 1);
 
-    commands::check::run_with_repair(&fx.config, Some(PASS), false, RepairMode::Apply, None, None)
-        .unwrap();
+    commands::check::run_with_repair(
+        &fx.config,
+        Some(PASS),
+        false,
+        RepairMode::Apply,
+        None,
+        &CancelToken::new(),
+    )
+    .unwrap();
     assert_eq!(
         std::fs::read(fx.secondary()).unwrap(),
         genuine,
@@ -655,7 +670,7 @@ fn dry_run_repair_does_not_backfill_the_missing_copy() {
         false,
         RepairMode::PlanOnly,
         None,
-        None,
+        &CancelToken::new(),
     )
     .unwrap();
 
@@ -1025,7 +1040,7 @@ fn an_unprovable_divergent_candidate_cannot_win_and_cannot_drive_repair() {
             false,
             RepairMode::Apply,
             None,
-            None,
+            &CancelToken::new(),
         )
         .is_err()
     );

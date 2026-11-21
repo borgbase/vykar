@@ -14,6 +14,7 @@ use slint::ComponentHandle;
 
 mod autostart;
 mod bootstrap;
+mod cancel;
 mod config_helpers;
 mod controllers;
 mod event_consumer;
@@ -81,7 +82,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Set while *any* worker operation runs (backup or UI read); drives the tray
     // "Cancel" item so it matches the window Cancel button.
     let operation_running = Arc::new(AtomicBool::new(false));
-    let cancel_requested = Arc::new(AtomicBool::new(false));
+    let cancel_requested = cancel::CancelSlot::default();
 
     // Attempt to acquire the process-wide scheduler lock.
     // If another scheduler (daemon or GUI) holds it, disable automatic scheduling

@@ -19,6 +19,7 @@ mod common;
 
 use vykar_core::commands;
 use vykar_core::index::ChunkIndex;
+use vykar_core::repo::control::CancelToken;
 use vykar_core::repo::{OpenOptions, Repository, UpgradeOutcome};
 use vykar_storage::local_backend::LocalBackend;
 
@@ -80,7 +81,7 @@ fn assert_restores_source(fx: &Fixture, dest_name: &str, label: &str) {
         None,
         config.xattrs.enabled,
         true, // verify chunk IDs
-        None,
+        &CancelToken::new(),
     )
     .unwrap();
     assert_eq!(

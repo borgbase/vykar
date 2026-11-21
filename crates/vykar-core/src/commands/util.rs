@@ -1,5 +1,4 @@
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use tracing::info;
 
@@ -158,14 +157,6 @@ pub(crate) fn open_repo_with_read_session_on(
             Err(enrich_repo_not_found(e, &config.repository.url))
         }
     }
-}
-
-/// Return `Err(VykarError::Interrupted)` if the shutdown flag is set.
-pub fn check_interrupted(shutdown: Option<&AtomicBool>) -> Result<()> {
-    if shutdown.is_some_and(|f| f.load(Ordering::Relaxed)) {
-        return Err(VykarError::Interrupted);
-    }
-    Ok(())
 }
 
 /// Execute a repository mutation while holding an advisory lock.

@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use crossbeam_channel::{Receiver, Sender};
 use vykar_core::app;
 
+use crate::cancel::CancelSlot;
 use crate::messages::{AppCommand, RepoInfoData, UiEvent};
 use crate::repo_helpers::send_log;
 use crate::scheduler;
@@ -37,7 +38,7 @@ pub(super) struct WorkerContext {
     /// Set while any operation (backup *or* UI read) is running. Drives the
     /// tray "Cancel" item, mirroring the window Cancel button.
     pub(super) operation_running: Arc<AtomicBool>,
-    pub(super) cancel_requested: Arc<AtomicBool>,
+    pub(super) cancel_requested: CancelSlot,
 
     pub(super) scheduler_lock_held: bool,
     pub(super) schedule_paused: bool,
@@ -146,7 +147,7 @@ pub(crate) fn run_worker(
     scheduler: Arc<Mutex<scheduler::SchedulerState>>,
     backup_running: Arc<AtomicBool>,
     operation_running: Arc<AtomicBool>,
-    cancel_requested: Arc<AtomicBool>,
+    cancel_requested: CancelSlot,
     runtime: app::RuntimeConfig,
     scheduler_lock_held: bool,
     sched_notify_tx: Sender<()>,

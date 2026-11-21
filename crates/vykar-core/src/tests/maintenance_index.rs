@@ -18,6 +18,7 @@ use crate::commands::util::with_maintenance_lock;
 use crate::config::{RetentionConfig, SourceEntry, VykarConfig};
 use crate::index::ChunkIndexEntry;
 use crate::index::dedup_cache::{self, MmapDedupCache, MmapFullIndexCache, MmapRestoreCache};
+use crate::repo::control::CancelToken;
 use crate::repo::format::ObjectType;
 use crate::repo::{OpenOptions, RepoFormat, Repository};
 
@@ -199,7 +200,7 @@ impl Env {
                 verbose: false,
             },
             Some(&mut on_event),
-            None,
+            &CancelToken::new(),
             wrap,
         )
         .unwrap();
@@ -347,7 +348,7 @@ fn prune_refreshes_local_caches_so_next_backup_is_fast() {
             false,
             &env.sources(&["a"]),
             &[],
-            None,
+            &CancelToken::new(),
         )
         .unwrap();
         assert_eq!(stats.pruned, 1);
@@ -377,10 +378,12 @@ fn compact_refreshes_local_caches() {
         fs::write(src.join("two.bin"), vec![0x22u8; 64 * 1024]).unwrap();
         env.backup(&src, "a", "s2");
         // s1's data pack now holds a live chunk (one.bin) and a dead one.
-        commands::delete::run(&env.config, None, &["s1"], false, None).unwrap();
+        commands::delete::run(&env.config, None, &["s1"], false, &CancelToken::new()).unwrap();
         let before = env.open_fresh().index_generation();
 
-        let stats = commands::compact::run(&env.config, None, 0.0, None, false, None).unwrap();
+        let stats =
+            commands::compact::run(&env.config, None, 0.0, None, false, &CancelToken::new())
+                .unwrap();
         assert!(stats.packs_repacked > 0, "{stats:?}");
 
         let remote = env.open_fresh();
@@ -414,8 +417,16 @@ fn maintenance_on_a_host_without_caches_segmented() {
     fs::create_dir_all(&other_cache).unwrap();
     let mut config = env.config.clone();
     config.cache_dir = Some(other_cache.to_string_lossy().into_owned());
-    let (stats, _) =
-        commands::prune::run(&config, None, false, false, &env.sources(&["a"]), &[], None).unwrap();
+    let (stats, _) = commands::prune::run(
+        &config,
+        None,
+        false,
+        false,
+        &env.sources(&["a"]),
+        &[],
+        &CancelToken::new(),
+    )
+    .unwrap();
     assert_eq!(stats.pruned, 1);
 
     let remote = env.open_fresh();
@@ -473,7 +484,7 @@ fn failed_index_write_in_prune_leaves_caches_untouched() {
             false,
             &env.sources(&["a"]),
             &[],
-            None,
+            &CancelToken::new(),
         )
         .unwrap();
         assert_eq!(stats.pruned, 1);
@@ -509,7 +520,7 @@ fn failed_index_write_in_prune_leaves_caches_untouched() {
         assert!(!named, "debris is named by the head");
         drop(remote);
 
-        commands::compact::run(&env.config, None, 100.0, None, false, None).unwrap();
+        commands::compact::run(&env.config, None, 100.0, None, false, &CancelToken::new()).unwrap();
         assert_eq!(env.index_object_names(), objects_before);
     }
 }
@@ -685,7 +696,7 @@ fn prune_uses_index_current_at_lock_time() {
             false,
             &env.sources(&["a", "b"]),
             &[],
-            None,
+            &CancelToken::new(),
         )
         .unwrap();
         drop(repo);
@@ -717,7 +728,8 @@ fn delete_uses_index_current_at_lock_time() {
         let src_b = env.source("b", &[("other.bin", 0x55)]);
         let s2_chunks = new_chunks(&env, || env.backup_elsewhere(&src_b, "b", "s2"));
 
-        let result = commands::delete::run_on_repo(&mut repo, &["s1"], false, None).unwrap();
+        let result =
+            commands::delete::run_on_repo(&mut repo, &["s1"], false, &CancelToken::new()).unwrap();
         drop(repo);
         assert_eq!(result.stats.len(), 1);
         assert!(result.warnings.is_empty(), "{:?}", result.warnings);
@@ -738,7 +750,9 @@ fn compact_does_not_delete_packs_committed_after_open() {
         let src_b = env.source("b", &[("other.bin", 0x55)]);
         let s2_chunks = new_chunks(&env, || env.backup_elsewhere(&src_b, "b", "s2"));
 
-        let stats = commands::compact::run_on_repo(&mut repo, 0.0, None, false, None).unwrap();
+        let stats =
+            commands::compact::run_on_repo(&mut repo, 0.0, None, false, &CancelToken::new())
+                .unwrap();
         drop(repo);
         assert_eq!(stats.packs_orphan, 0, "{stats:?}");
 
@@ -763,7 +777,7 @@ fn compact_does_not_delete_packs_committed_after_open() {
             None,
             false,
             false,
-            None,
+            &CancelToken::new(),
         )
         .unwrap();
         let restored = find_file(&dest, "other.bin").expect("other.bin restored");
@@ -798,7 +812,7 @@ fn prune_with_nothing_to_prune_does_not_read_index() {
             false,
             &env.sources(&["a"]),
             &[],
-            None,
+            &CancelToken::new(),
         )
         .unwrap();
         assert_eq!(stats.pruned, 0);
@@ -815,7 +829,7 @@ fn prune_with_nothing_to_prune_does_not_read_index() {
             false,
             &env.sources(&["a"]),
             &[],
-            None,
+            &CancelToken::new(),
         )
         .unwrap();
         assert_eq!(stats.pruned, 1);
@@ -845,7 +859,7 @@ fn prune_loads_index_after_session_check() {
             false,
             &env.sources(&["a"]),
             &[],
-            None,
+            &CancelToken::new(),
         )
         .err()
         .unwrap();

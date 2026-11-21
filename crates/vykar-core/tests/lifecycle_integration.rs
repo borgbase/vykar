@@ -4,12 +4,13 @@
 mod common;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use vykar_core::commands;
 use vykar_core::compress::Compression;
 use vykar_core::config::{ChunkerConfig, CommandDump, EncryptionModeConfig, RetentionConfig};
+use vykar_core::repo::control::CancelToken;
 use vykar_core::repo::lock;
 use vykar_core::repo::{EncryptionMode, OpenOptions, Repository};
 use vykar_storage::local_backend::LocalBackend;
@@ -61,7 +62,8 @@ fn lifecycle_delete_compact_check_and_restore() {
         config.xattrs.enabled,
     );
 
-    let delete_result = commands::delete::run(&config, None, &["snap-v1"], false, None).unwrap();
+    let delete_result =
+        commands::delete::run(&config, None, &["snap-v1"], false, &CancelToken::new()).unwrap();
     assert!(delete_result.warnings.is_empty());
     let stats = delete_result
         .stats
@@ -70,7 +72,8 @@ fn lifecycle_delete_compact_check_and_restore() {
     assert_eq!(stats.snapshot_name, "snap-v1");
     assert!(stats.chunks_deleted > 0);
 
-    let compact_stats = commands::compact::run(&config, None, 0.0, None, false, None).unwrap();
+    let compact_stats =
+        commands::compact::run(&config, None, 0.0, None, false, &CancelToken::new()).unwrap();
     assert!(compact_stats.space_freed > 0);
 
     let check = commands::check::run(&config, None, true, false).unwrap();
@@ -94,7 +97,7 @@ fn lifecycle_delete_compact_check_and_restore() {
         None,
         config.xattrs.enabled,
         true,
-        None,
+        &CancelToken::new(),
     )
     .unwrap();
     assert_eq!(extract_stats.files, 2);
@@ -165,15 +168,24 @@ fn prune_compact_check_and_restore_kept_snapshots() {
         source_entry(&source_b, "src-b"),
     ];
     let source_filter = vec!["src-a".to_string()];
-    let (prune_stats, list_entries) =
-        commands::prune::run(&config, None, false, true, &sources, &source_filter, None).unwrap();
+    let (prune_stats, list_entries) = commands::prune::run(
+        &config,
+        None,
+        false,
+        true,
+        &sources,
+        &source_filter,
+        &CancelToken::new(),
+    )
+    .unwrap();
 
     assert_eq!(prune_stats.pruned, 1);
     assert_eq!(prune_stats.kept, 1);
     assert!(list_entries.iter().any(|e| e.action == "prune"));
     assert!(list_entries.iter().any(|e| e.action == "keep"));
 
-    let compact_stats = commands::compact::run(&config, None, 0.0, None, false, None).unwrap();
+    let compact_stats =
+        commands::compact::run(&config, None, 0.0, None, false, &CancelToken::new()).unwrap();
     assert!(
         compact_stats.packs_repacked > 0
             || compact_stats.packs_deleted_empty > 0
@@ -204,7 +216,7 @@ fn prune_compact_check_and_restore_kept_snapshots() {
         None,
         config.xattrs.enabled,
         false,
-        None,
+        &CancelToken::new(),
     )
     .unwrap();
     assert_eq!(
@@ -221,7 +233,7 @@ fn prune_compact_check_and_restore_kept_snapshots() {
         None,
         config.xattrs.enabled,
         false,
-        None,
+        &CancelToken::new(),
     )
     .unwrap();
     assert_eq!(
@@ -271,7 +283,7 @@ fn run_encrypted_lifecycle(mode: EncryptionModeConfig, expected_mode: Encryption
         None,
         config.xattrs.enabled,
         false,
-        None,
+        &CancelToken::new(),
     )
     .unwrap();
     assert_eq!(
@@ -301,7 +313,7 @@ fn run_encrypted_lifecycle(mode: EncryptionModeConfig, expected_mode: Encryption
         None,
         config.xattrs.enabled,
         false,
-        None,
+        &CancelToken::new(),
     );
     let msg = wrong_extract.expect_err("restore must fail").to_string();
     assert!(
@@ -509,7 +521,7 @@ fn restore_loads_items_via_restore_cache_without_index() {
         &mut repo,
         "snap1",
         |id| cache.lookup(id),
-        None,
+        &CancelToken::new(),
     )
     .unwrap();
 
@@ -572,7 +584,7 @@ fn restore_falls_back_to_index_on_cache_miss() {
         None,
         false,
         false,
-        None,
+        &CancelToken::new(),
     )
     .unwrap();
 
@@ -621,7 +633,7 @@ fn restore_works_without_restore_cache() {
         None,
         false,
         false,
-        None,
+        &CancelToken::new(),
     )
     .unwrap();
 
@@ -660,7 +672,8 @@ fn one_file_repo(
     );
 
     let mut repo = open_local_repo(&repo_dir, None);
-    let items = commands::list::load_snapshot_items(&mut repo, "snap1", None).unwrap();
+    let items =
+        commands::list::load_snapshot_items(&mut repo, "snap1", &CancelToken::new()).unwrap();
     let file = items
         .iter()
         .find(|i| i.path.ends_with("file.txt"))
@@ -696,7 +709,7 @@ fn restore_resolves_data_chunks_via_restore_cache_without_index() {
         None,
         false,
         false,
-        None,
+        &CancelToken::new(),
     )
     .unwrap();
 
@@ -743,7 +756,7 @@ fn restore_falls_back_to_index_when_cache_lacks_data_chunk() {
                 continue_on_error,
                 ..Default::default()
             },
-            None,
+            &CancelToken::new(),
         )
         .unwrap();
 
@@ -791,7 +804,7 @@ fn restore_falls_back_to_index_when_cached_item_stream_location_is_wrong() {
         None,
         false,
         false,
-        None,
+        &CancelToken::new(),
     )
     .unwrap();
 
@@ -858,7 +871,7 @@ fn restore_re_resolves_data_chunks_the_cache_places_wrongly() {
                 continue_on_error,
                 ..Default::default()
             },
-            None,
+            &CancelToken::new(),
         )
         .expect(&case);
 
@@ -898,7 +911,7 @@ fn restore_reports_unreadable_data_chunk_with_restore_cache_in_use() {
                 continue_on_error,
                 ..Default::default()
             },
-            None,
+            &CancelToken::new(),
         );
         if continue_on_error {
             let stats = result.unwrap();
@@ -959,7 +972,7 @@ fn restore_streams_a_multi_chunk_item_stream() {
         None,
         false,
         false,
-        None,
+        &CancelToken::new(),
     )
     .unwrap();
 
@@ -988,7 +1001,9 @@ fn item_stream_reader_resolves_from_cache_then_falls_back_once() {
     {
         let (mut repo, index_gets) = open_counting_repo(&repo_dir);
         let mut reader = commands::list::ItemStreamReader::new(&repo);
-        reader.load(&mut repo, "snap1", None).unwrap();
+        reader
+            .load(&mut repo, "snap1", &CancelToken::new())
+            .unwrap();
         reader
             .ensure_resolvable(&mut repo, std::iter::once(&data_chunk))
             .unwrap();
@@ -1004,7 +1019,9 @@ fn item_stream_reader_resolves_from_cache_then_falls_back_once() {
     write_cache_without(&repo_dir, &repo_id, generation, &data_chunk);
     let (mut repo, index_gets) = open_counting_repo(&repo_dir);
     let mut reader = commands::list::ItemStreamReader::new(&repo);
-    reader.load(&mut repo, "snap1", None).unwrap();
+    reader
+        .load(&mut repo, "snap1", &CancelToken::new())
+        .unwrap();
     assert!(!reader.index_loaded());
     for _ in 0..2 {
         reader
@@ -1106,8 +1123,12 @@ fn item_stream_reader_loads_index_once_across_snapshots() {
 
     let (mut repo, index_gets) = open_counting_repo(&tmp.path().join("repo"));
     let mut reader = commands::list::ItemStreamReader::new(&repo);
-    let s1 = reader.load(&mut repo, "snap1", None).unwrap();
-    let s2 = reader.load(&mut repo, "snap2", None).unwrap();
+    let s1 = reader
+        .load(&mut repo, "snap1", &CancelToken::new())
+        .unwrap();
+    let s2 = reader
+        .load(&mut repo, "snap2", &CancelToken::new())
+        .unwrap();
 
     assert!(!stream_paths(&s1).iter().any(|p| p.contains("b.txt")));
     assert!(stream_paths(&s2).iter().any(|p| p.contains("b.txt")));
@@ -1131,8 +1152,12 @@ fn item_stream_reader_falls_back_once_on_empty_cache() {
 
     let (mut repo, index_gets) = open_counting_repo(&tmp.path().join("repo"));
     let mut reader = commands::list::ItemStreamReader::new(&repo);
-    let s1 = reader.load(&mut repo, "snap1", None).unwrap();
-    let s2 = reader.load(&mut repo, "snap2", None).unwrap();
+    let s1 = reader
+        .load(&mut repo, "snap1", &CancelToken::new())
+        .unwrap();
+    let s2 = reader
+        .load(&mut repo, "snap2", &CancelToken::new())
+        .unwrap();
 
     assert!(stream_paths(&s1).iter().any(|p| p.contains("a.txt")));
     assert!(stream_paths(&s2).iter().any(|p| p.contains("b.txt")));
@@ -1147,10 +1172,9 @@ fn item_stream_reader_propagates_interrupt_without_fallback() {
 
     let (mut repo, index_gets) = open_counting_repo(&tmp.path().join("repo"));
     let mut reader = commands::list::ItemStreamReader::new(&repo);
-    let shutdown = AtomicBool::new(true);
-    let err = reader
-        .load(&mut repo, "snap1", Some(&shutdown))
-        .unwrap_err();
+    let shutdown = CancelToken::new();
+    shutdown.cancel();
+    let err = reader.load(&mut repo, "snap1", &shutdown).unwrap_err();
 
     assert!(matches!(err, VykarError::Interrupted), "got {err:?}");
     assert_eq!(index_gets.load(Ordering::Relaxed), 1);
@@ -1224,7 +1248,7 @@ fn file_cache_survives_label_rename() {
             verbose: true,
         },
         Some(&mut on_progress),
-        None,
+        &CancelToken::new(),
     )
     .unwrap();
 
@@ -1313,7 +1337,7 @@ fn parent_fallback_survives_label_rename() {
             verbose: true,
         },
         Some(&mut on_progress),
-        None,
+        &CancelToken::new(),
     )
     .unwrap();
 

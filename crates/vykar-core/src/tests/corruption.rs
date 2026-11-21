@@ -4,6 +4,7 @@ use test_case::test_case;
 
 use crate::commands;
 use crate::config::VykarConfig;
+use crate::repo::control::CancelToken;
 use vykar_protocol::PACK_HEADER_SIZE;
 
 use super::helpers::{backup_single_source, init_repo, open_local_repo};
@@ -279,7 +280,7 @@ fn repair_fixes_corruption(corruption: Corruption) {
         true, // verify_data
         commands::check::RepairMode::Apply,
         None,
-        None,
+        &CancelToken::new(),
     )
     .unwrap();
 
@@ -315,7 +316,7 @@ fn repair_not_possible_err_path(corruption: Corruption) {
         true,
         commands::check::RepairMode::Apply,
         None,
-        None,
+        &CancelToken::new(),
     );
     assert!(
         result.is_err(),

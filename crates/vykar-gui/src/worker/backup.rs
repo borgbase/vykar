@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::sync::atomic::Ordering;
 
 use crossbeam_channel::Sender;
 use vykar_core::app::operations;
@@ -121,7 +120,7 @@ fn run_backup_cycle(ctx: &mut WorkerContext, scheduled: bool, only: Option<&[Str
     let mut failures: Vec<(String, String)> = Vec::new();
     let total = selected.len();
     for (i, &repo_idx) in selected.iter().enumerate() {
-        if ctx.cancel_requested.load(Ordering::SeqCst) {
+        if ctx.cancel_requested.is_cancelled() {
             send_log(&ctx.ui_tx, "Backup cancelled by user.");
             break;
         }
@@ -144,7 +143,7 @@ fn run_backup_cycle(ctx: &mut WorkerContext, scheduled: bool, only: Option<&[Str
         let result = operations::run_full_cycle_with_passphrase_source(
             repo,
             &mut || resolve_cycle_passphrase(repo, passphrases, ui_tx),
-            Some(&ctx.cancel_requested),
+            &ctx.cancel_requested.current(),
             false,
             &[],
             UnavailableRepo::Skip,
@@ -255,7 +254,13 @@ pub(super) fn handle_backup_repo(ctx: &mut WorkerContext, repo_name: String) {
     );
 
     let outcome = with_passphrase_retry(repo, &mut ctx.passphrases, 3, |pass| {
-        run_selection_with_progress(&ctx.ui_tx, &ctx.cancel_requested, repo, &repo.sources, pass)
+        run_selection_with_progress(
+            &ctx.ui_tx,
+            &ctx.cancel_requested.current(),
+            repo,
+            &repo.sources,
+            pass,
+        )
     });
 
     match outcome {
@@ -311,7 +316,7 @@ pub(super) fn handle_backup_source(ctx: &mut WorkerContext, source_label: String
     let mut failures: Vec<(String, String)> = Vec::new();
     let total = ctx.runtime.repos.len();
     for (i, repo) in ctx.runtime.repos.iter().enumerate() {
-        if ctx.cancel_requested.load(Ordering::SeqCst) {
+        if ctx.cancel_requested.is_cancelled() {
             send_log(&ctx.ui_tx, "Backup cancelled by user.");
             break;
         }
@@ -338,7 +343,7 @@ pub(super) fn handle_backup_source(ctx: &mut WorkerContext, source_label: String
         let outcome = with_passphrase_retry(repo, &mut ctx.passphrases, 3, |pass| {
             run_selection_with_progress(
                 &ctx.ui_tx,
-                &ctx.cancel_requested,
+                &ctx.cancel_requested.current(),
                 repo,
                 &matching_sources,
                 pass,

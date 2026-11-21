@@ -1,5 +1,4 @@
 use std::collections::HashSet;
-use std::sync::atomic::AtomicBool;
 
 use vykar_types::error::Result;
 
@@ -7,7 +6,8 @@ use super::list::load_item_stream_from_ptrs;
 use super::snapshot_ops::{
     decrement_chunk_refs_on_index, prepare_removal_targets, remove_snapshots,
 };
-use super::util::{check_interrupted, open_repo, with_maintenance_lock};
+use super::util::{open_repo, with_maintenance_lock};
+use crate::repo::control::CancelToken;
 use crate::repo::{OpenOptions, Repository};
 
 pub struct DeleteStats {
@@ -44,7 +44,7 @@ pub fn run(
     passphrase: Option<&str>,
     snapshot_names: &[&str],
     dry_run: bool,
-    shutdown: Option<&AtomicBool>,
+    shutdown: &CancelToken,
 ) -> Result<DeleteResult> {
     let mut repo = open_repo(config, passphrase, OpenOptions::new())?;
     run_on_repo(&mut repo, snapshot_names, dry_run, shutdown)
@@ -56,7 +56,7 @@ pub(crate) fn run_on_repo(
     repo: &mut Repository,
     snapshot_names: &[&str],
     dry_run: bool,
-    shutdown: Option<&AtomicBool>,
+    shutdown: &CancelToken,
 ) -> Result<DeleteResult> {
     // Phase 0: Deduplicate while preserving order.
     let mut seen = HashSet::new();
@@ -79,7 +79,7 @@ pub(crate) fn run_on_repo(
             let mut all_stats = Vec::with_capacity(targets.len());
 
             for target in &targets {
-                check_interrupted(shutdown)?;
+                shutdown.check()?;
                 let items_stream = load_item_stream_from_ptrs(repo, &target.item_ptrs, shutdown)?;
                 let impact =
                     decrement_chunk_refs_on_index(&mut scratch, &items_stream, &target.item_ptrs)?;

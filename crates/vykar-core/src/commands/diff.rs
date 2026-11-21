@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 
 use super::list::ItemStreamReader;
 use crate::config::VykarConfig;
+use crate::repo::control::CancelToken;
 use crate::repo::manifest::SnapshotEntry;
 use crate::repo::{OpenOptions, Repository};
 use crate::snapshot::item::ItemType;
@@ -89,7 +90,7 @@ fn load_regular_file_map(
     reader: &mut ItemStreamReader,
     snapshot_name: &str,
 ) -> Result<BTreeMap<String, FileSig>> {
-    let stream = reader.load(repo, snapshot_name, None)?;
+    let stream = reader.load(repo, snapshot_name, &CancelToken::new())?;
     let mut map = BTreeMap::new();
     super::list::for_each_decoded_item(&stream, |item| {
         if item.entry_type == ItemType::RegularFile {

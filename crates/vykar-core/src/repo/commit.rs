@@ -2,6 +2,7 @@ use chrono::Utc;
 use tracing::{debug, warn};
 
 use super::Repository;
+use super::control::{CommitEvent, EventSink};
 use super::file_cache;
 use super::index_store::{self, CacheLocation, SyncedIndex};
 use super::manifest::{self, Manifest};
@@ -14,20 +15,21 @@ use vykar_crypto::CryptoEngine;
 use vykar_types::error::{Result, VykarError};
 use vykar_types::pack_id::PackId;
 
-/// Emit a `CommitStage` progress event and return a context
+/// Emit a `CommitEvent::Stage` and return a context
 /// (start time, stage name) for later `log_stage_elapsed`.
-fn emit_stage<F>(
-    progress: &mut Option<F>,
+fn emit_stage(
+    events: &dyn EventSink<CommitEvent>,
     stage: &'static str,
-) -> (std::time::Instant, &'static str)
-where
-    F: FnMut(crate::commands::backup::BackupProgressEvent),
-{
+) -> (std::time::Instant, &'static str) {
     let start = std::time::Instant::now();
-    if let Some(cb) = progress {
-        cb(crate::commands::backup::BackupProgressEvent::CommitStage { stage });
-    }
+    events.emit(CommitEvent::Stage { stage });
     (start, stage)
+}
+
+/// `tracing::warn!` plus `CommitEvent::Warning`, always together.
+fn post_commit_warning(events: &dyn EventSink<CommitEvent>, message: String) {
+    warn!("{message}");
+    events.emit(CommitEvent::Warning { message });
 }
 
 /// Join a scoped helper thread, re-raising its panic on the caller.
@@ -321,7 +323,7 @@ impl Repository {
         snapshot_entry: manifest::SnapshotEntry,
         snapshot_packed: Vec<u8>,
         new_file_cache: &mut file_cache::FileCache,
-        progress: &mut Option<impl FnMut(crate::commands::backup::BackupProgressEvent)>,
+        events: &dyn EventSink<CommitEvent>,
         on_commit_point: impl FnOnce(),
     ) -> Result<()> {
         // The reads that start the commit are independent of each other. The
@@ -339,7 +341,7 @@ impl Repository {
         let crypto = self.crypto.as_ref();
         let repo_id = self.config.id.as_slice();
         let cache_dir = self.cache_dir_override.as_deref();
-        let ctx = emit_stage(progress, "refresh snapshots");
+        let ctx = emit_stage(events, "refresh snapshots");
         let (side, prefetched) = std::thread::scope(|scope| {
             let side = taken.is_ok().then(|| {
                 scope.spawn(move || {
@@ -387,10 +389,10 @@ impl Repository {
         }
 
         let deferred_chunk_index_hydrate =
-            self.commit_prepare(&snapshot_entry, delta, prefetched, progress)?;
+            self.commit_prepare(&snapshot_entry, delta, prefetched, events)?;
 
         // ---- COMMIT POINT ----
-        let ctx = emit_stage(progress, "write snapshot");
+        let ctx = emit_stage(events, "write snapshot");
         self.check_lock_fence()?;
         self.storage
             .put(&snapshot_entry.id.storage_key(), &snapshot_packed)?;
@@ -413,7 +415,7 @@ impl Repository {
         // the cache is pruned against `snapshots/` on every open.
         self.persist_snapshot_cache_from_manifest();
 
-        self.commit_finalize(new_file_cache, deferred_chunk_index_hydrate, progress);
+        self.commit_finalize(new_file_cache, deferred_chunk_index_hydrate, events);
         Ok(())
     }
 
@@ -432,7 +434,7 @@ impl Repository {
         snapshot_entry: &manifest::SnapshotEntry,
         delta: Option<IndexDelta>,
         prefetched: Option<Result<IndexHead>>,
-        progress: &mut Option<impl FnMut(crate::commands::backup::BackupProgressEvent)>,
+        events: &dyn EventSink<CommitEvent>,
     ) -> Result<bool> {
         // 4. Check snapshot name uniqueness against fresh list.
         if self.manifest.find_snapshot(&snapshot_entry.name).is_some() {
@@ -449,7 +451,7 @@ impl Repository {
                     Some(head) => head?,
                     None => index_store::fetch_head(self.storage.as_ref(), self.crypto.as_ref())?,
                 };
-                self.segmented_commit(head, delta, progress)?;
+                self.segmented_commit(head, delta, events)?;
             }
             // The local full cache is at the index state; the in-memory
             // index is rebuilt from it after the commit point.
@@ -473,9 +475,9 @@ impl Repository {
         &mut self,
         head: IndexHead,
         delta: IndexDelta,
-        progress: &mut Option<impl FnMut(crate::commands::backup::BackupProgressEvent)>,
+        events: &dyn EventSink<CommitEvent>,
     ) -> Result<()> {
-        let ctx = emit_stage(progress, "fetch index");
+        let ctx = emit_stage(events, "fetch index");
         let synced = self.sync_index(Some(head), true)?;
         log_stage_elapsed(ctx);
         let SyncedIndex {
@@ -487,7 +489,7 @@ impl Repository {
         self.index_scratch = scratch;
         let anchor = index_store::cache_anchor(self.full_cache_path().as_deref());
 
-        let ctx = emit_stage(progress, "reconcile");
+        let ctx = emit_stage(events, "reconcile");
         let pack_ids = Self::delta_pack_ids(&delta);
         let persisted_packs = self.persisted_pack_count();
         let width = self.request_width();
@@ -507,7 +509,7 @@ impl Repository {
         verified?;
         log_stage_elapsed(ctx);
 
-        let ctx = emit_stage(progress, "write index");
+        let ctx = emit_stage(events, "write index");
         self.publish_index_state(Some(head), Some(diff), next)?;
         log_stage_elapsed(ctx);
         Ok(())
@@ -516,12 +518,12 @@ impl Repository {
     /// Post-commit best-effort work. The `-> ()` return type is load-bearing:
     /// it statically forbids `?` from escaping a path that runs after the
     /// snapshot has already been durably committed. All internal failures
-    /// must be reported via `emit_post_commit_warning`.
+    /// must be reported via `post_commit_warning`.
     fn commit_finalize(
         &mut self,
         new_file_cache: &mut file_cache::FileCache,
         deferred_chunk_index_hydrate: bool,
-        progress: &mut Option<impl FnMut(crate::commands::backup::BackupProgressEvent)>,
+        events: &dyn EventSink<CommitEvent>,
     ) {
         // The commit deferred `chunk_index` hydration past the commit point.
         // It runs last (below): neither the file-cache save nor
@@ -544,8 +546,8 @@ impl Repository {
         // at backup start).
         let ctx = (std::time::Instant::now(), "save file cache");
         if let Err(e) = self.save_file_cache_if_dirty() {
-            crate::commands::backup::emit_post_commit_warning(
-                progress,
+            post_commit_warning(
+                events,
                 format!(
                     "snapshot was successfully committed, but saving the local file \
                      cache failed: {e}. The next backup run will fall back to a \
@@ -560,7 +562,7 @@ impl Repository {
         // the full cache (deferred_chunk_index_hydrate), skip the redundant sort;
         // the derivation then streams the on-disk full_index_cache and does
         // not read `self.chunk_index`, which is not hydrated yet.
-        let ctx = emit_stage(progress, "rebuild local caches");
+        let ctx = emit_stage(events, "rebuild local caches");
         if self.rebuild_dedup_cache {
             self.rebuild_local_caches(deferred_chunk_index_hydrate);
             self.rebuild_dedup_cache = false;
@@ -569,7 +571,7 @@ impl Repository {
         log_stage_elapsed(ctx);
 
         if deferred_chunk_index_hydrate {
-            self.hydrate_deferred_chunk_index(progress);
+            self.hydrate_deferred_chunk_index(events);
         }
 
         // Clean up recovered index journals from previous interrupted sessions.
@@ -589,10 +591,7 @@ impl Repository {
     /// already committed; it leaves `chunk_index` stale and the next
     /// Repository operation calls `reload_full_index` and rehydrates from
     /// remote.
-    fn hydrate_deferred_chunk_index(
-        &mut self,
-        progress: &mut Option<impl FnMut(crate::commands::backup::BackupProgressEvent)>,
-    ) {
+    fn hydrate_deferred_chunk_index(&mut self, events: &dyn EventSink<CommitEvent>) {
         match self.chunk_index_from_local_cache().or_else(|e| {
             warn!("local cache hydration failed ({e}), reloading from remote");
             self.reload_full_index()
@@ -601,8 +600,8 @@ impl Repository {
                 self.chunk_index = idx;
             }
             Err(e) => {
-                crate::commands::backup::emit_post_commit_warning(
-                    progress,
+                post_commit_warning(
+                    events,
                     format!(
                         "snapshot was successfully committed, but hydrating the \
                          in-memory chunk index from local cache and remote storage \

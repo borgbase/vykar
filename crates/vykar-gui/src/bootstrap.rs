@@ -10,6 +10,7 @@ use crossbeam_channel::{Receiver, Sender};
 use slint::ComponentHandle;
 use vykar_core::app;
 
+use crate::cancel::CancelSlot;
 use crate::controllers::password_dialog;
 use crate::messages::{AppCommand, UiEvent, log_entry_now};
 use crate::repo_helpers::send_log;
@@ -60,7 +61,7 @@ fn wire_tray(
     tray: &VykarTray,
     app_tx: &Sender<AppCommand>,
     ui_tx: &Sender<UiEvent>,
-    cancel_requested: &Arc<AtomicBool>,
+    cancel_requested: &CancelSlot,
     operation_running: &Arc<AtomicBool>,
 ) {
     tray.on_open_clicked({
@@ -94,7 +95,7 @@ fn wire_tray(
                 send_log(&ui_tx, "No operation running.");
                 return;
             }
-            cancel_requested.store(true, Ordering::SeqCst);
+            cancel_requested.cancel();
             send_log(
                 &ui_tx,
                 "Cancel requested; Vykar will stop when the current file, upload, or storage operation returns.",
@@ -115,7 +116,7 @@ fn wire_tray(
 pub(crate) fn setup_tray(
     app_tx: &Sender<AppCommand>,
     ui_tx: &Sender<UiEvent>,
-    cancel_requested: Arc<AtomicBool>,
+    cancel_requested: CancelSlot,
     operation_running: Arc<AtomicBool>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     tray::set_factory({
@@ -173,7 +174,7 @@ pub(crate) fn spawn_background_threads(
     scheduler: Arc<Mutex<scheduler::SchedulerState>>,
     backup_running: Arc<AtomicBool>,
     operation_running: Arc<AtomicBool>,
-    cancel_requested: Arc<AtomicBool>,
+    cancel_requested: CancelSlot,
     runtime: app::RuntimeConfig,
     scheduler_lock_held: bool,
     sched_notify_tx: Sender<()>,

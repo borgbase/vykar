@@ -11,7 +11,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::commands::util::check_interrupted;
+use crate::repo::control::CancelToken;
 use crate::repo::format::{BlobLocation, ChunkDecodeError, decode_chunk_into};
 use smallvec::SmallVec;
 use vykar_crypto::CryptoEngine;
@@ -23,14 +23,6 @@ use vykar_types::pack_id::PackId;
 use super::plan::{PlannedFile, WriteTarget};
 use super::read_groups::{PlannedBlob, ReadGroup};
 use super::{MAX_OPEN_FILES_PER_GROUP, MAX_WRITE_BATCH};
-
-/// Relaxed poll of the external cancellation flag. Kept separate from the
-/// local `cancelled` flag, which is the failure-propagation channel: this one
-/// is raised by the user (Ctrl-C, GUI Cancel) and is checked at the same two
-/// points, so cancellation granularity is one storage request.
-fn is_shutting_down(shutdown: Option<&AtomicBool>) -> bool {
-    shutdown.is_some_and(|f| f.load(Ordering::Relaxed))
-}
 
 /// A restore-worker failure, classified by where it came from.
 ///
@@ -350,10 +342,10 @@ pub(super) fn execute_parallel_restore(
     root: &Path,
     readers: usize,
     verify_chunks: bool,
-    shutdown: Option<&AtomicBool>,
+    shutdown: &CancelToken,
     failures: Option<&BatchFailures>,
 ) -> std::result::Result<u64, ReadError> {
-    check_interrupted(shutdown)?;
+    shutdown.check()?;
     if groups.is_empty() {
         return Ok(0);
     }
@@ -422,7 +414,7 @@ pub(super) fn execute_parallel_restore(
         // Workers return `Ok(())` when they stop early, so a cancellation would
         // otherwise surface as a short but successful byte count — and the
         // caller would go on to publish a partial tree.
-        check_interrupted(shutdown)?;
+        shutdown.check()?;
         Ok(bytes_written.load(Ordering::Relaxed))
     })
 }
@@ -435,13 +427,13 @@ struct BlobCtx<'a> {
     cancelled: &'a AtomicBool,
     root: &'a Path,
     verify_chunks: bool,
-    shutdown: Option<&'a AtomicBool>,
+    shutdown: &'a CancelToken,
     failures: Option<&'a BatchFailures>,
 }
 
 impl BlobCtx<'_> {
     fn stopping(&self) -> bool {
-        self.cancelled.load(Ordering::Acquire) || is_shutting_down(self.shutdown)
+        self.cancelled.load(Ordering::Acquire) || self.shutdown.is_cancelled()
     }
 
     /// Record a source-side failure of `blob` in the failure sink, or turn it
@@ -492,7 +484,7 @@ fn process_read_group(
     pw: &mut PendingWrite,
     root: &Path,
     verify_chunks: bool,
-    shutdown: Option<&AtomicBool>,
+    shutdown: &CancelToken,
     failures: Option<&BatchFailures>,
 ) -> std::result::Result<(), ReadError> {
     let ctx = BlobCtx {
@@ -922,7 +914,7 @@ mod tests {
             &mut PendingWrite::new(),
             temp.path(),
             false,
-            None,
+            &CancelToken::new(),
             None,
         )
         .map_err(ReadError::into_inner)
@@ -989,7 +981,7 @@ mod tests {
             &mut PendingWrite::new(),
             temp.path(),
             false,
-            None,
+            &CancelToken::new(),
             None,
         )
         .unwrap();
@@ -1073,7 +1065,7 @@ mod tests {
             &mut PendingWrite::new(),
             temp.path(),
             false,
-            None,
+            &CancelToken::new(),
             None,
         )
         .unwrap();
@@ -1169,7 +1161,7 @@ mod tests {
             &mut PendingWrite::new(),
             temp.path(),
             false,
-            None,
+            &CancelToken::new(),
             None,
         )
         .unwrap();
@@ -1244,7 +1236,7 @@ mod tests {
             &mut PendingWrite::new(),
             temp.path(),
             false,
-            None,
+            &CancelToken::new(),
             None,
         )
         .unwrap();
@@ -1311,7 +1303,7 @@ mod tests {
             &mut PendingWrite::new(),
             temp.path(),
             true,
-            None,
+            &CancelToken::new(),
             None,
         )
         .unwrap();
@@ -1341,7 +1333,7 @@ mod tests {
             &mut PendingWrite::new(),
             root,
             verify_chunks,
-            None,
+            &CancelToken::new(),
             None,
         )
         .map_err(ReadError::into_inner)?;
@@ -1493,7 +1485,7 @@ mod tests {
     /// already running.
     struct CancelOnReadBackend {
         inner: MemoryBackend,
-        flag: Arc<AtomicBool>,
+        flag: CancelToken,
     }
 
     impl vykar_storage::InnerBackend for CancelOnReadBackend {
@@ -1523,7 +1515,7 @@ mod tests {
             length: u64,
             buf: &mut Vec<u8>,
         ) -> vykar_types::error::Result<bool> {
-            self.flag.store(true, Ordering::Relaxed);
+            self.flag.cancel();
             self.inner.get_range_into(key, offset, length, buf)
         }
     }
@@ -1570,12 +1562,12 @@ mod tests {
         let crypto = PlaintextEngine::new(test_chunk_hasher());
         let (pack_id, packed) = one_chunk_pack(&crypto, payload);
 
-        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown = CancelToken::new();
         let inner = MemoryBackend::new();
         inner.put(&pack_id.storage_key(), &packed).unwrap();
         let storage: Arc<dyn StorageBackend> = Arc::new(CancelOnReadBackend {
             inner,
-            flag: Arc::clone(&shutdown),
+            flag: shutdown.clone(),
         });
 
         let files = one_file_plan(payload.len() as u64);
@@ -1590,7 +1582,7 @@ mod tests {
             }],
         )];
 
-        assert!(!shutdown.load(Ordering::Relaxed), "flag must start clear");
+        assert!(!shutdown.is_cancelled(), "flag must start clear");
         let err = execute_parallel_restore(
             &files,
             groups,
@@ -1599,7 +1591,7 @@ mod tests {
             temp.path(),
             2,
             false,
-            Some(&shutdown),
+            &shutdown,
             None,
         )
         .map_err(ReadError::into_inner)
@@ -1610,7 +1602,7 @@ mod tests {
             "expected Interrupted, got: {err}"
         );
         assert!(
-            shutdown.load(Ordering::Relaxed),
+            shutdown.is_cancelled(),
             "the backend should have raised the flag mid-pool"
         );
         assert!(!out.exists(), "no data may have been written");
@@ -1660,7 +1652,8 @@ mod tests {
             }],
         )];
 
-        let shutdown = AtomicBool::new(true);
+        let shutdown = CancelToken::new();
+        shutdown.cancel();
         let err = execute_parallel_restore(
             &files,
             groups,
@@ -1669,7 +1662,7 @@ mod tests {
             temp.path(),
             2,
             false,
-            Some(&shutdown),
+            &shutdown,
             None,
         )
         .map_err(ReadError::into_inner)
@@ -1772,7 +1765,7 @@ mod tests {
             &mut PendingWrite::new(),
             root,
             false,
-            None,
+            &CancelToken::new(),
             failures,
         )
     }
@@ -1958,7 +1951,7 @@ mod tests {
                 temp.path(),
                 2,
                 false,
-                None,
+                &CancelToken::new(),
                 None,
             )
             .unwrap_err();
@@ -2422,7 +2415,7 @@ mod tests {
                 &mut pw,
                 temp.path(),
                 false,
-                None,
+                &CancelToken::new(),
                 Some(&failures),
             )
             .unwrap();

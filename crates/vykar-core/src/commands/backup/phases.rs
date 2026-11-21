@@ -2,7 +2,6 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
 use chrono::Utc;
@@ -14,8 +13,8 @@ use super::{
     emit_post_commit_warning, emit_progress, flush_item_stream_chunk, pipeline, source,
     source_paths_match,
 };
-use crate::commands::util::check_interrupted;
 use crate::config::VykarConfig;
+use crate::repo::control::{CancelToken, CommitEvent, FnMutSink};
 use crate::repo::file_cache::{FileCache, ParentReuseBuilder, ParentReuseIndex, ParentReuseRoot};
 use crate::repo::format::{ObjectType, pack_object_with_context};
 use crate::repo::lock;
@@ -74,7 +73,7 @@ pub(super) fn phase1_upload(
     num_workers: usize,
     session_opts: &WriteSessionOptions,
     progress: &mut Option<&mut dyn FnMut(BackupProgressEvent)>,
-    shutdown: Option<&AtomicBool>,
+    shutdown: &CancelToken,
     dataless: &mut DatalessTally,
 ) -> Result<Phase1Output> {
     let phase1_start = Instant::now();
@@ -330,7 +329,7 @@ pub(super) fn phase1_upload(
     }
 
     // Bail before committing if shutdown was requested during the walk.
-    check_interrupted(shutdown)?;
+    shutdown.check()?;
 
     flush_item_stream_chunk(repo, &mut item_stream, &mut item_ptrs, compression)?;
 
@@ -357,7 +356,7 @@ pub(super) fn phase1_upload(
         write: repo.write_metrics().unwrap_or_default(),
     };
     instrumentation.emit(&stats);
-    check_interrupted(shutdown)?;
+    shutdown.check()?;
 
     let time_end = Utc::now();
 
@@ -433,7 +432,7 @@ pub(super) fn phase2_commit(
     snapshot_packed: Vec<u8>,
     new_file_cache: &mut FileCache,
     progress: &mut Option<&mut dyn FnMut(BackupProgressEvent)>,
-    shutdown: Option<&AtomicBool>,
+    shutdown: &CancelToken,
 ) -> Result<()> {
     let guard = lock::acquire_lock_with_deadline(
         repo.storage.as_ref(),
@@ -465,32 +464,35 @@ pub(super) fn phase2_commit(
     // `with_repo_lock`.
     let repo_storage = Arc::clone(&repo.storage);
     let mut cleanup: Option<std::thread::JoinHandle<()>> = None;
-    let result = repo.commit_concurrent_session_with_progress(
-        snapshot_entry,
-        snapshot_packed,
-        new_file_cache,
-        progress,
-        || {
-            let guard = session.guard.take();
-            let storage = Arc::clone(&repo_storage);
-            let session_id = session.id.clone();
-            let spawned = std::thread::Builder::new()
-                .name("session-cleanup".into())
-                .spawn(move || {
-                    drop(guard);
-                    // All entries are in the persisted index now. Best-effort —
-                    // a stale journal is harmless.
-                    crate::repo::session_journal::clear_pending_index(
-                        storage.as_ref(),
-                        &session_id,
-                    );
-                });
-            match spawned {
-                Ok(handle) => cleanup = Some(handle),
-                Err(e) => warn!("failed to spawn session cleanup thread: {e}"),
-            }
-        },
-    );
+    let result = {
+        let events = FnMutSink::new(|e: CommitEvent| emit_progress(progress, e.into()));
+        repo.commit_concurrent_session_with_progress(
+            snapshot_entry,
+            snapshot_packed,
+            new_file_cache,
+            &events,
+            || {
+                let guard = session.guard.take();
+                let storage = Arc::clone(&repo_storage);
+                let session_id = session.id.clone();
+                let spawned = std::thread::Builder::new()
+                    .name("session-cleanup".into())
+                    .spawn(move || {
+                        drop(guard);
+                        // All entries are in the persisted index now. Best-effort —
+                        // a stale journal is harmless.
+                        crate::repo::session_journal::clear_pending_index(
+                            storage.as_ref(),
+                            &session_id,
+                        );
+                    });
+                match spawned {
+                    Ok(handle) => cleanup = Some(handle),
+                    Err(e) => warn!("failed to spawn session cleanup thread: {e}"),
+                }
+            },
+        )
+    };
     let journal_cleared = cleanup.is_some();
     if let Some(handle) = cleanup.take() {
         let _ = handle.join();

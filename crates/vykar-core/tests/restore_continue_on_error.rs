@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use vykar_core::commands;
 use vykar_core::commands::restore::{RestoreOptions, RestoreStats};
 use vykar_core::config::{EncryptionModeConfig, VykarConfig};
+use vykar_core::repo::control::CancelToken;
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
 
@@ -106,7 +107,7 @@ impl Fixture {
                 continue_on_error,
                 ..Default::default()
             },
-            None,
+            &CancelToken::new(),
         )
     }
 
@@ -254,7 +255,7 @@ fn damaged_hardlink_representative_drops_the_whole_group() {
         None,
         false,
         false,
-        None,
+        &CancelToken::new(),
     )
     .unwrap();
     assert_eq!(intact.hardlinks, 2, "fixture must restore as a link group");

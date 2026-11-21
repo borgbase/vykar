@@ -25,12 +25,46 @@ use super::Repository;
 use super::index_store::{
     self, CacheLocation, HeadlessOutcome, PackedObject, StoredHead, SyncSource,
 };
-use crate::commands::check::IndexRecovery;
 use crate::index::ChunkIndex;
 use crate::index::dedup_cache::{self, MmapFullIndexCache, generation_for_state};
 use crate::index::head::{BaseRef, HEAD_LAYOUT_VERSION, IndexHead, SegmentRef};
 use crate::index::segment::{self, Diff};
 use vykar_types::error::{Result, VykarError};
+
+/// How `check --repair` obtained the chunk index it repairs from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexRecovery {
+    /// The index as storage holds it: every object of the chain read, or
+    /// this machine's cache of the head's state.
+    Complete,
+    /// `index` held a monolithic index written by an older vykar; the index
+    /// is rebuilt from it.
+    LegacyBlob,
+    /// `index` is absent; the index is rebuilt from nothing.
+    HeadMissing,
+    /// `index` cannot be read; see `index_store::rebuild_without_head`.
+    /// `from_local_cache`: rebuilt from this machine's full index cache (the
+    /// counts are then 0). Else from `index.d/`: `bases` bases decoded,
+    /// `applied` segments applied (including ones discarded at a join),
+    /// `unplaced` decoded segments that follow no rebuilt state, `damaged`
+    /// objects skipped as damage.
+    HeadUnreadable {
+        from_local_cache: bool,
+        bases: usize,
+        applied: usize,
+        unplaced: usize,
+        damaged: usize,
+    },
+    /// Part of the chain is missing or damaged. The index is the state after
+    /// the base and the first `applied` of `total` segments, or the empty
+    /// index when `base_lost`. Snapshots whose chunks it lacks show up in
+    /// the plan as removals.
+    PartialChain {
+        base_lost: bool,
+        applied: usize,
+        total: usize,
+    },
+}
 
 /// When a chain is folded into a new base: at `segments` segments, or when
 /// the segments add up to `percent` of the base's bytes and at least

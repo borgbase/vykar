@@ -6,14 +6,13 @@
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
 
 use tracing::{info, warn};
 
-use crate::commands::util::check_interrupted;
 use crate::config::VykarConfig;
 use crate::platform::fs;
 use crate::repo::Repository;
+use crate::repo::control::CancelToken;
 use vykar_common::display::{format_bytes, format_count};
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
@@ -171,7 +170,7 @@ pub fn run(
     pattern: Option<&str>,
     xattrs_enabled: bool,
     verify_chunks: bool,
-    shutdown: Option<&AtomicBool>,
+    shutdown: &CancelToken,
 ) -> Result<RestoreStats> {
     let opts = RestoreOptions {
         xattrs_enabled,
@@ -197,7 +196,7 @@ pub fn run_with_options(
     dest: &str,
     pattern: Option<&str>,
     opts: RestoreOptions,
-    shutdown: Option<&AtomicBool>,
+    shutdown: &CancelToken,
 ) -> Result<RestoreStats> {
     let filter = compile_pattern(pattern)?;
 
@@ -234,7 +233,7 @@ pub(crate) fn run_on_repo(
     dest: &str,
     pattern: Option<&str>,
     opts: RestoreOptions,
-    shutdown: Option<&AtomicBool>,
+    shutdown: &CancelToken,
 ) -> Result<RestoreStats> {
     let filter = compile_pattern(pattern)?;
     restore_on_repo_with_filter(
@@ -260,7 +259,7 @@ pub fn run_selected(
     selected_paths: &HashSet<String>,
     xattrs_enabled: bool,
     verify_chunks: bool,
-    shutdown: Option<&AtomicBool>,
+    shutdown: &CancelToken,
 ) -> Result<RestoreStats> {
     restore_with_filter(
         config,
@@ -289,12 +288,12 @@ fn restore_with_filter<F>(
     dest: &str,
     opts: RestoreOptions,
     include_path: F,
-    shutdown: Option<&AtomicBool>,
+    shutdown: &CancelToken,
 ) -> Result<RestoreStats>
 where
     F: FnMut(&str) -> bool,
 {
-    check_interrupted(shutdown)?;
+    shutdown.check()?;
     let (mut repo, _session_guard) = super::util::open_repo_with_read_session(
         config,
         passphrase,
@@ -309,7 +308,7 @@ fn restore_on_repo_with_filter<F>(
     dest: &str,
     opts: RestoreOptions,
     mut include_path: F,
-    shutdown: Option<&AtomicBool>,
+    shutdown: &CancelToken,
 ) -> Result<RestoreStats>
 where
     F: FnMut(&str) -> bool,
@@ -433,7 +432,7 @@ where
         &mut pending_links,
         shutdown,
         |mut batch_files, mut batch_chunks, verified_dirs, stats| -> Result<()> {
-            check_interrupted(shutdown)?;
+            shutdown.check()?;
             if batch_files.is_empty() {
                 return Ok(());
             }
@@ -654,7 +653,7 @@ where
     // poll the flag.
     #[cfg(test)]
     fault_pre_publish_shutdown(&temp_root, shutdown);
-    check_interrupted(shutdown).map_err(cleanup)?;
+    shutdown.check().map_err(cleanup)?;
     finalize::move_temp_to_dest(&temp_root, &dest_root)?;
 
     // Directory metadata (F1/F2: chown → xattrs → mode → mtime, deepest-first)
@@ -799,10 +798,10 @@ fn discard_damaged(
 fn sweep_tombstones(
     temp_root: &Path,
     tombstones: &HashSet<PathBuf>,
-    shutdown: Option<&AtomicBool>,
+    shutdown: &CancelToken,
 ) -> Result<()> {
     for rel in tombstones {
-        check_interrupted(shutdown)?;
+        shutdown.check()?;
         let path = temp_root.join(rel);
         std::fs::remove_file(&path).map_err(|e| {
             VykarError::Other(format!(
@@ -980,30 +979,26 @@ impl Drop for PrePublishFaultGuard {
 }
 
 #[cfg(test)]
-fn fault_pre_publish_shutdown(temp_root: &Path, shutdown: Option<&AtomicBool>) {
+fn fault_pre_publish_shutdown(temp_root: &Path, shutdown: &CancelToken) {
     if !FAULT_PRE_PUBLISH_CANCEL.with(std::cell::Cell::get) {
         return;
     }
     PRE_PUBLISH_STAGED_FILES.with(|c| c.set(count_staged_files(temp_root)));
-    if let Some(flag) = shutdown {
-        flag.store(true, std::sync::atomic::Ordering::Relaxed);
-    }
+    shutdown.cancel();
 }
 
 /// Counts staging-loop iterations and, when armed, raises the shutdown flag on
 /// the chosen one. Called *after* that iteration's guard, so the armed
 /// iteration still completes and the following one is the first to abort.
 #[cfg(test)]
-pub(super) fn fault_staging_loop(shutdown: Option<&AtomicBool>) {
+pub(super) fn fault_staging_loop(shutdown: &CancelToken) {
     let idx = STAGING_LOOP_ITERATIONS.with(|c| {
         let v = c.get();
         c.set(v + 1);
         v
     });
-    if FAULT_CANCEL_AT_STAGED_FILE.with(std::cell::Cell::get) == Some(idx)
-        && let Some(flag) = shutdown
-    {
-        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    if FAULT_CANCEL_AT_STAGED_FILE.with(std::cell::Cell::get) == Some(idx) {
+        shutdown.cancel();
     }
 }
 
@@ -1205,7 +1200,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (config, dest) = restore_fixture(tmp.path(), 8);
 
-        let flag = AtomicBool::new(false);
+        let flag = CancelToken::new();
         let mut seen = 0usize;
         let err = restore_with_filter(
             &config,
@@ -1216,11 +1211,11 @@ mod tests {
             |_path| {
                 seen += 1;
                 if seen == 3 {
-                    flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                    flag.cancel();
                 }
                 true
             },
-            Some(&flag),
+            &flag,
         )
         .unwrap_err();
 
@@ -1254,7 +1249,7 @@ mod tests {
         let (config, dest) = restore_fixture_empty_files(tmp.path(), 12);
 
         let fault = PrePublishFaultGuard::arm_staging_cancel(4);
-        let flag = AtomicBool::new(false);
+        let flag = CancelToken::new();
         let err = restore_with_filter(
             &config,
             None,
@@ -1262,7 +1257,7 @@ mod tests {
             dest.to_str().unwrap(),
             RestoreOptions::default(),
             |_path| true,
-            Some(&flag),
+            &flag,
         )
         .unwrap_err();
 
@@ -1290,7 +1285,7 @@ mod tests {
         let (config, dest) = restore_fixture(tmp.path(), 8);
 
         let fault = PrePublishFaultGuard::arm_pre_publish();
-        let flag = AtomicBool::new(false);
+        let flag = CancelToken::new();
         let err = restore_with_filter(
             &config,
             None,
@@ -1298,7 +1293,7 @@ mod tests {
             dest.to_str().unwrap(),
             RestoreOptions::default(),
             |_path| true,
-            Some(&flag),
+            &flag,
         )
         .unwrap_err();
 
@@ -1353,7 +1348,7 @@ mod tests {
             std::fs::write(root.join(t), b"").unwrap();
         }
         std::fs::write(root.join("keep"), b"x").unwrap();
-        sweep_tombstones(root, &tombstones, None).unwrap();
+        sweep_tombstones(root, &tombstones, &CancelToken::new()).unwrap();
         assert!(!root.join("a").exists());
         assert!(!root.join("d/b").exists());
         assert!(root.join("keep").exists());
@@ -1365,7 +1360,7 @@ mod tests {
     fn sweep_tombstones_failure_is_fatal() {
         let tmp = tempfile::tempdir().unwrap();
         let tombstones: HashSet<PathBuf> = [PathBuf::from("gone")].into();
-        let err = sweep_tombstones(tmp.path(), &tombstones, None).unwrap_err();
+        let err = sweep_tombstones(tmp.path(), &tombstones, &CancelToken::new()).unwrap_err();
         assert!(err.to_string().contains("placeholder"), "got: {err}");
     }
 
@@ -1419,7 +1414,7 @@ mod tests {
             dest.to_str().unwrap(),
             RestoreOptions::default(),
             |_path| true,
-            None,
+            &CancelToken::new(),
         );
         // SAFETY: as above.
         unsafe { libc::umask(0o022) };

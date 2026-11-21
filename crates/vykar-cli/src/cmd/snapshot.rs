@@ -1,5 +1,4 @@
 use std::cmp::Reverse;
-use std::sync::atomic::AtomicBool;
 
 use chrono::Local;
 use comfy_table::{Cell, CellAlignment};
@@ -7,6 +6,7 @@ use comfy_table::{Cell, CellAlignment};
 use vykar_core::app::views::SnapshotRowView;
 use vykar_core::commands;
 use vykar_core::config::VykarConfig;
+use vykar_core::repo::control::CancelToken;
 
 use crate::cli::{SnapshotCommand, SortField};
 use crate::error::{CliError, CliResult};
@@ -28,7 +28,7 @@ pub(crate) fn run_snapshot_command(
     command: &SnapshotCommand,
     config: &VykarConfig,
     label: Option<&str>,
-    shutdown: Option<&AtomicBool>,
+    shutdown: &CancelToken,
 ) -> CliResult<()> {
     match command {
         SnapshotCommand::List {

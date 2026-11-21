@@ -1,7 +1,6 @@
-use std::sync::atomic::AtomicBool;
-
 use vykar_core::commands;
 use vykar_core::config::VykarConfig;
+use vykar_core::repo::control::CancelToken;
 
 use crate::error::CliResult;
 use crate::format::{format_bytes, parse_size};
@@ -13,7 +12,7 @@ pub(crate) fn run_compact(
     threshold: f64,
     max_repack_size: Option<String>,
     dry_run: bool,
-    shutdown: Option<&AtomicBool>,
+    shutdown: &CancelToken,
 ) -> CliResult<()> {
     let max_bytes = max_repack_size.map(|s| parse_size(&s)).transpose()?;
 

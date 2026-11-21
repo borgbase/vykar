@@ -386,7 +386,13 @@ fn run_backup_cycle(
         warn_if_untrusted_rest(&repo.config, repo.label.as_deref());
 
         attempted += 1;
-        match run_default_actions(repo, Some(&SHUTDOWN), 0, &[], UnavailableRepo::Skip) {
+        match run_default_actions(
+            repo,
+            crate::signal::shutdown_token(),
+            0,
+            &[],
+            UnavailableRepo::Skip,
+        ) {
             Ok(outcome) => {
                 if outcome.partial {
                     tracing::warn!(repo = name, "backup cycle partial: some files were skipped");

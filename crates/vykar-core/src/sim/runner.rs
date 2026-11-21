@@ -23,6 +23,7 @@ use crate::config::{
     ChunkerConfig, EncryptionConfig, EncryptionModeConfig, RepositoryConfig, RetentionConfig,
     VykarConfig,
 };
+use crate::repo::control::CancelToken;
 use crate::repo::{EncryptionMode, OpenOptions, Repository, identity, lock};
 
 /// A source directory's regular files, by `/`-separated relative path.
@@ -298,7 +299,7 @@ impl Sim {
                         verbose: false,
                     },
                     None,
-                    None,
+                    &CancelToken::new(),
                     Some(&wrap),
                 )?;
                 Ok((Vec::new(), format!("partial: {}", outcome.is_partial)))
@@ -313,7 +314,7 @@ impl Sim {
         self.run(c, op, |store, cfg, _, _| {
             let mut repo =
                 util::open_repo_on(Box::new(store.handle(c)), &cfg, None, OpenOptions::new())?;
-            let result = delete::run_on_repo(&mut repo, names, false, None)?;
+            let result = delete::run_on_repo(&mut repo, names, false, &CancelToken::new())?;
             let removed = result
                 .stats
                 .iter()
@@ -328,7 +329,8 @@ impl Sim {
             cfg.retention = retention;
             let mut repo =
                 util::open_repo_on(Box::new(store.handle(c)), &cfg, None, OpenOptions::new())?;
-            let (stats, list) = prune::run_on_repo(&mut repo, &cfg, false, true, &[], &[], None)?;
+            let (stats, list) =
+                prune::run_on_repo(&mut repo, &cfg, false, true, &[], &[], &CancelToken::new())?;
             let removed = list
                 .into_iter()
                 .filter(|e| e.action == "prune")
@@ -345,7 +347,13 @@ impl Sim {
         self.run(c, ClientOp::Compact, |store, cfg, _, _| {
             let mut repo =
                 util::open_repo_on(Box::new(store.handle(c)), &cfg, None, OpenOptions::new())?;
-            let s = compact::run_on_repo(&mut repo, cfg.compact.threshold, None, false, None)?;
+            let s = compact::run_on_repo(
+                &mut repo,
+                cfg.compact.threshold,
+                None,
+                false,
+                &CancelToken::new(),
+            )?;
             Ok((
                 Vec::new(),
                 format!(
@@ -368,7 +376,16 @@ impl Sim {
                 None,
                 OpenOptions::new(),
             )?;
-            let result = check::run_on_repo(&mut repo, &cfg, false, true, None, 100, false, None)?;
+            let result = check::run_on_repo(
+                &mut repo,
+                &cfg,
+                false,
+                true,
+                None,
+                100,
+                false,
+                &CancelToken::new(),
+            )?;
             Ok((
                 Vec::new(),
                 format!("{} errors {:?}", result.errors.len(), result.errors),
@@ -386,7 +403,14 @@ impl Sim {
                 None,
                 check::repair_open_options(mode),
             )?;
-            let result = check::run_with_repair_on_repo(&mut repo, &cfg, false, mode, None, None)?;
+            let result = check::run_with_repair_on_repo(
+                &mut repo,
+                &cfg,
+                false,
+                mode,
+                None,
+                &CancelToken::new(),
+            )?;
             let removed = result
                 .applied
                 .iter()
@@ -424,7 +448,7 @@ impl Sim {
                     verify_chunks: true,
                     continue_on_error: false,
                 },
-                None,
+                &CancelToken::new(),
             )?;
             Ok((Vec::new(), format!("{} files", stats.files)))
         })

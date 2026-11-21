@@ -14,6 +14,7 @@ use crate::config::VykarConfig;
 use crate::index::ChunkIndex;
 use crate::index::dedup_cache::{self, MmapDedupCache, MmapFullIndexCache, MmapRestoreCache};
 use crate::index::head::{IndexHead, ObjectName};
+use crate::repo::control::CancelToken;
 use crate::repo::format::{ObjectType, pack_object_streaming_with_context};
 use crate::repo::index_store::{
     INDEX_OBJECT_DIR, SEGMENT_CONTEXT, decode_segment, object_key, pack_head,
@@ -130,7 +131,7 @@ impl Fixture {
             None,
             false,
             true,
-            None,
+            &CancelToken::new(),
         )
         .unwrap();
         dest
@@ -309,7 +310,7 @@ fn delete_and_compact_fold_and_collect_garbage() {
     let before = fx.head();
     let chunks_before = fx.open(&fx.cache(), true).unwrap().chunk_index().len();
 
-    commands::delete::run(&fx.config, None, &["s1"], false, None).unwrap();
+    commands::delete::run(&fx.config, None, &["s1"], false, &CancelToken::new()).unwrap();
     let after_delete = fx.head();
     assert_eq!(after_delete.segments.len(), before.segments.len() + 1);
     assert!(fx.open(&fx.cache(), true).unwrap().chunk_index().len() < chunks_before);
@@ -357,7 +358,7 @@ fn compact(fx: &Fixture, segments: usize) {
     let mut policy = crate::repo::index_write::FoldPolicy::default();
     policy.soft.segments = segments;
     repo.set_fold_policy(policy);
-    commands::compact::run_on_repo(&mut repo, 0.0, None, false, None).unwrap();
+    commands::compact::run_on_repo(&mut repo, 0.0, None, false, &CancelToken::new()).unwrap();
 }
 
 /// A reader holding a head from before two production folds: after the
@@ -556,9 +557,15 @@ fn repair_rebuilds_an_overwritten_head() {
     let err = fx.open(&fx.cache(), false).err().unwrap().to_string();
     assert!(err.contains("check --repair"), "{err}");
 
-    let result =
-        commands::check::run_with_repair(&fx.config, None, false, RepairMode::Apply, None, None)
-            .unwrap();
+    let result = commands::check::run_with_repair(
+        &fx.config,
+        None,
+        false,
+        RepairMode::Apply,
+        None,
+        &CancelToken::new(),
+    )
+    .unwrap();
     assert!(!result.plan.has_data_loss, "{:?}", result.plan.actions);
     assert_eq!(result.plan.index_recovery, IndexRecovery::LegacyBlob);
     let head = fx.head();
@@ -623,7 +630,9 @@ fn repair_salvages_a_broken_chain() {
     assert!(err.contains(&lost.to_hex()), "{err}");
     assert!(!err.contains("retry later"), "{err}");
 
-    let repair = |mode| commands::check::run_with_repair(&other, None, false, mode, None, None);
+    let repair = |mode| {
+        commands::check::run_with_repair(&other, None, false, mode, None, &CancelToken::new())
+    };
     let shown = repair(RepairMode::PlanOnly).unwrap().plan;
     assert_eq!(
         shown.index_recovery,
@@ -686,7 +695,7 @@ fn repair_salvages_a_broken_chain() {
         None,
         false,
         true,
-        None,
+        &CancelToken::new(),
     );
     assert!(s3.is_err());
 
@@ -813,10 +822,16 @@ fn repair_reports_a_missing_head() {
     fx.write("a", "alpha");
     fx.backup(&fx.config, "s1");
     std::fs::remove_file(fx.repo_dir.join("index")).unwrap();
-    let plan =
-        commands::check::run_with_repair(&fx.config, None, false, RepairMode::PlanOnly, None, None)
-            .unwrap()
-            .plan;
+    let plan = commands::check::run_with_repair(
+        &fx.config,
+        None,
+        false,
+        RepairMode::PlanOnly,
+        None,
+        &CancelToken::new(),
+    )
+    .unwrap()
+    .plan;
     assert_eq!(plan.index_recovery, IndexRecovery::HeadMissing);
     assert!(plan.has_data_loss, "{:?}", plan.actions);
 }
@@ -880,7 +895,7 @@ fn compact_deletes_packs_only_after_persisting_the_index() {
     fx.backup(&fx.config, "s2");
     fx.write("d", "delta");
     fx.backup(&fx.config, "s3");
-    commands::delete::run(&fx.config, None, &["s1"], false, None).unwrap();
+    commands::delete::run(&fx.config, None, &["s1"], false, &CancelToken::new()).unwrap();
 
     let ops = Arc::new(Mutex::new(Vec::new()));
     let storage = Box::new(MutLog {
@@ -901,7 +916,7 @@ fn compact_deletes_packs_only_after_persisting_the_index() {
             .unwrap();
         repo.chunk_index_mut().remove_by_pack(&entry.pack_id);
         ops.lock().unwrap().clear();
-        commands::compact::compact_repo(repo, 0.0, None, false, 2, None)
+        commands::compact::compact_repo(repo, 0.0, None, false, 2, &CancelToken::new())
     })
     .unwrap();
 
@@ -1228,7 +1243,7 @@ fn empty_index_folds_to_a_head_without_base() {
     fx.backup(&fx.config, "s1");
     fx.write("b", "bravo");
     fx.backup(&fx.config, "s2");
-    commands::delete::run(&fx.config, None, &["s1", "s2"], false, None).unwrap();
+    commands::delete::run(&fx.config, None, &["s1", "s2"], false, &CancelToken::new()).unwrap();
     assert!(fx.open(&fx.cache(), true).unwrap().chunk_index().is_empty());
 
     let live: Vec<_> = fx.head().live_objects().collect();
@@ -1290,7 +1305,7 @@ fn put_base_failures_with_a_previous_head_leave_it_intact() {
         let mut policy = crate::repo::index_write::FoldPolicy::default();
         policy.soft.segments = 1;
         repo.set_fold_policy(policy);
-        let err = commands::compact::run_on_repo(&mut repo, 0.0, None, false, None)
+        let err = commands::compact::run_on_repo(&mut repo, 0.0, None, false, &CancelToken::new())
             .err()
             .unwrap()
             .to_string();
@@ -1329,8 +1344,15 @@ fn repair_of_an_empty_index_writes_the_empty_head() {
     )
     .unwrap();
     std::fs::remove_file(fx.repo_dir.join("index")).unwrap();
-    commands::check::run_with_repair(&fx.config, None, false, RepairMode::Apply, None, None)
-        .unwrap();
+    commands::check::run_with_repair(
+        &fx.config,
+        None,
+        false,
+        RepairMode::Apply,
+        None,
+        &CancelToken::new(),
+    )
+    .unwrap();
     assert_eq!(fx.head(), IndexHead::empty());
     assert_eq!(fx.index_objects(), 0);
     fx.check_clean(&fx.config);
@@ -1479,7 +1501,14 @@ fn truncate_head(fx: &Fixture) {
 }
 
 fn plan_only(config: &VykarConfig) -> Result<commands::check::RepairResult> {
-    commands::check::run_with_repair(config, None, false, RepairMode::PlanOnly, None, None)
+    commands::check::run_with_repair(
+        config,
+        None,
+        false,
+        RepairMode::PlanOnly,
+        None,
+        &CancelToken::new(),
+    )
 }
 
 fn removes(snapshot: &str) -> impl Fn(&RepairAction) -> bool + '_ {
@@ -1529,7 +1558,7 @@ fn repair_rebuilds_from_a_corrupt_head() {
             index_recovery: shown.index_recovery,
         },
         None,
-        None,
+        &CancelToken::new(),
     )
     .unwrap();
 
@@ -1645,10 +1674,11 @@ fn repair_after_a_state_changing_fold_needs_a_current_cache() {
     let cold = fx.other_client("cold");
     let before = repo_state(&fx);
     for mode in [RepairMode::PlanOnly, RepairMode::Apply] {
-        let err = commands::check::run_with_repair(&cold, None, false, mode, None, None)
-            .err()
-            .unwrap()
-            .to_string();
+        let err =
+            commands::check::run_with_repair(&cold, None, false, mode, None, &CancelToken::new())
+                .err()
+                .unwrap()
+                .to_string();
         assert!(err.contains("2 different index states"), "{err}");
         assert!(err.contains("the empty index"), "{err}");
         assert!(err.contains(&live_base), "{err}");
@@ -1673,7 +1703,7 @@ fn repair_after_a_state_changing_fold_needs_a_current_cache() {
             index_recovery: shown.index_recovery,
         },
         None,
-        None,
+        &CancelToken::new(),
     )
     .unwrap();
     let head = fx.head();
@@ -1821,7 +1851,7 @@ fn repair_without_a_head_applies_a_failed_write_s_segment() {
             index_recovery: shown.index_recovery,
         },
         None,
-        None,
+        &CancelToken::new(),
     )
     .unwrap();
     fx.check_clean(&cold);
@@ -1850,10 +1880,17 @@ fn repair_refuses_a_newer_index() {
         std::fs::write(fx.repo_dir.join("index"), &bytes).unwrap();
         let before = repo_state(&fx);
         for mode in [RepairMode::PlanOnly, RepairMode::Apply] {
-            let err = commands::check::run_with_repair(&fx.config, None, false, mode, None, None)
-                .err()
-                .unwrap()
-                .to_string();
+            let err = commands::check::run_with_repair(
+                &fx.config,
+                None,
+                false,
+                mode,
+                None,
+                &CancelToken::new(),
+            )
+            .err()
+            .unwrap()
+            .to_string();
             for text in expected {
                 assert!(err.contains(text), "{err}");
             }

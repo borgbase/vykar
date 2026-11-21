@@ -14,6 +14,7 @@ use std::path::Path;
 use vykar_core::commands;
 use vykar_core::compress::Compression;
 use vykar_core::config::VykarConfig;
+use vykar_core::repo::control::CancelToken;
 
 use crate::common::make_test_config;
 
@@ -71,7 +72,7 @@ fn backup_and_restore_single_file_source() {
         None,
         false,
         false,
-        None,
+        &CancelToken::new(),
     )
     .unwrap();
     assert_eq!(stats.files, 1);
@@ -95,7 +96,7 @@ fn backup_and_restore_single_file_source() {
         None,
         false,
         false,
-        None,
+        &CancelToken::new(),
     )
     .unwrap();
     assert_eq!(
@@ -133,7 +134,7 @@ fn backup_mixed_file_and_directory_sources() {
         None,
         false,
         false,
-        None,
+        &CancelToken::new(),
     )
     .unwrap();
 

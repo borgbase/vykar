@@ -1,9 +1,9 @@
 use std::io::IsTerminal;
-use std::sync::atomic::AtomicBool;
 
 use vykar_core::app::operations::{self, BackupRunEvent};
 use vykar_core::compress::Compression;
 use vykar_core::config::{self, CompressionAlgorithm, ResolvedRepo, SourceEntry};
+use vykar_core::repo::control::CancelToken;
 use vykar_types::error::VykarError;
 
 use crate::error::{CliError, CliResult};
@@ -18,7 +18,7 @@ pub(crate) struct BackupRunOpts<'a> {
     pub threads: Option<usize>,
     pub paths: Vec<String>,
     pub source_filter: &'a [String],
-    pub shutdown: Option<&'a AtomicBool>,
+    pub shutdown: &'a CancelToken,
     pub verbose: u8,
 }
 

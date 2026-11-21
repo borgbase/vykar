@@ -1,7 +1,6 @@
-use std::sync::atomic::AtomicBool;
-
 use vykar_core::commands;
 use vykar_core::config::{SourceEntry, VykarConfig};
+use vykar_core::repo::control::CancelToken;
 
 use crate::error::CliResult;
 use crate::format::format_bytes;
@@ -14,7 +13,7 @@ pub(crate) fn run_prune(
     list: bool,
     sources: &[SourceEntry],
     source_filter: &[String],
-    shutdown: Option<&AtomicBool>,
+    shutdown: &CancelToken,
 ) -> CliResult<()> {
     let (stats, list_entries) = with_repo_passphrase(config, label, |passphrase| {
         Ok(commands::prune::run(

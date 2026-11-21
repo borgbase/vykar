@@ -13,6 +13,7 @@ use crate::commands::check::{IndexRecovery, RepairAction, RepairMode};
 use crate::config::VykarConfig;
 use crate::index::ChunkIndex;
 use crate::index::dedup_cache::{self, MmapDedupCache, MmapFullIndexCache, MmapRestoreCache};
+use crate::repo::control::CancelToken;
 use crate::repo::index_store::{self, INDEX_OBJECT_DIR};
 use crate::repo::{
     EncryptionMode, OpenOptions, RepoConfig, RepoFormat, Repository, UpgradeOutcome,
@@ -626,7 +627,7 @@ fn upgrade_failing_at_the_version_switch_is_resumed() {
             .unwrap(),
     );
     assert_legacy_refusal(
-        &commands::compact::run(&fx.config, None, 0.0, None, false, None)
+        &commands::compact::run(&fx.config, None, 0.0, None, false, &CancelToken::new())
             .err()
             .unwrap(),
     );
@@ -817,7 +818,7 @@ fn upgrade_probes_the_server_before_writing() {
 }
 
 fn repair(config: &VykarConfig, mode: RepairMode) -> Result<commands::check::RepairResult> {
-    commands::check::run_with_repair(config, None, false, mode, None, None)
+    commands::check::run_with_repair(config, None, false, mode, None, &CancelToken::new())
 }
 
 fn apply_shown(config: &VykarConfig, plan: &commands::check::RepairPlan) -> Result<()> {
@@ -1079,19 +1080,19 @@ fn legacy_open_is_refused_by_every_command_and_writes_nothing() {
         ("info", commands::info::run(config, None).err().unwrap()),
         (
             "compact",
-            commands::compact::run(config, None, 0.0, None, false, None)
+            commands::compact::run(config, None, 0.0, None, false, &CancelToken::new())
                 .err()
                 .unwrap(),
         ),
         (
             "prune",
-            commands::prune::run(config, None, false, false, &[], &[], None)
+            commands::prune::run(config, None, false, false, &[], &[], &CancelToken::new())
                 .err()
                 .unwrap(),
         ),
         (
             "delete",
-            commands::delete::run(config, None, &["s1"], false, None)
+            commands::delete::run(config, None, &["s1"], false, &CancelToken::new())
                 .err()
                 .unwrap(),
         ),

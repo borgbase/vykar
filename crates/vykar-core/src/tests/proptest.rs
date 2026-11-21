@@ -457,6 +457,7 @@ mod chunker {
 
 #[cfg(test)]
 mod backup_restore {
+    use crate::repo::control::CancelToken;
     use proptest::prelude::*;
 
     use crate::commands;
@@ -517,7 +518,7 @@ mod backup_restore {
                 None,
                 config.xattrs.enabled,
                 false,
-                None,
+                &CancelToken::new(),
             )
             .unwrap();
 

@@ -1,13 +1,13 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use super::types::{CheckProgressEvent, IntegrityIssue, ItemImpact, emit_progress};
 use crate::commands::list::{for_each_decoded_item, load_snapshot_item_stream, load_snapshot_meta};
-use crate::commands::util::check_interrupted;
 use crate::config::VykarConfig;
 use crate::index::ChunkIndexEntry;
 use crate::repo::Repository;
+use crate::repo::control::CancelToken;
 use crate::repo::format::{
     BlobLocation, ChunkDecodeStage, ObjectType, decode_chunk_into,
     unpack_object_expect_with_context,
@@ -253,13 +253,6 @@ fn classify_meta_decode_issue(
     }
 }
 
-/// Relaxed poll of the cancellation flag, for the worker loops and the two
-/// count-returning helpers that cannot propagate an error themselves. Their
-/// callers re-raise via `check_interrupted` once the pass is joined.
-fn is_shutting_down(shutdown: Option<&AtomicBool>) -> bool {
-    shutdown.is_some_and(|f| f.load(Ordering::Relaxed))
-}
-
 /// Run the integrity scan, producing structured issues.
 ///
 /// `ScanOptions` controls which phases run and which packs are skipped.
@@ -270,7 +263,7 @@ pub(super) fn integrity_scan(
     config: &VykarConfig,
     opts: &ScanOptions,
     progress: &mut Option<&mut dyn FnMut(CheckProgressEvent)>,
-    shutdown: Option<&AtomicBool>,
+    shutdown: &CancelToken,
 ) -> Result<ScanResult> {
     let mut counters = ScanCounters::default();
     let mut issues: Vec<IntegrityIssue> = Vec::new();
@@ -298,7 +291,7 @@ pub(super) fn integrity_scan(
             .collect();
         let remote_keys = repo.storage.list("snapshots/")?;
         for key in &remote_keys {
-            check_interrupted(shutdown)?;
+            shutdown.check()?;
             let Some(id_hex) = key.strip_prefix("snapshots/") else {
                 continue;
             };
@@ -396,7 +389,7 @@ pub(super) fn integrity_scan(
     };
     let snapshot_count = snapshot_entries.len();
     for (i, entry) in snapshot_entries.iter().enumerate() {
-        check_interrupted(shutdown)?;
+        shutdown.check()?;
         emit_progress(
             progress,
             CheckProgressEvent::SnapshotStarted {
@@ -503,7 +496,7 @@ pub(super) fn integrity_scan(
         let walk_result = for_each_decoded_item(&items_stream, |item| {
             // Per-item poll: a single multi-million-item snapshot must stay
             // responsive, not just the per-snapshot boundary.
-            check_interrupted(shutdown)?;
+            shutdown.check()?;
             let idx = item_index;
             item_index += 1;
             per_snapshot_items += 1;
@@ -612,7 +605,7 @@ pub(super) fn integrity_scan(
             parallel_pack_existence(&repo.storage, &packs_for_existence, concurrency, shutdown);
         // Workers `break` out of the work queue on cancellation, so a short
         // count must never be folded into the result as coverage.
-        check_interrupted(shutdown)?;
+        shutdown.check()?;
         counters.packs_existence_checked = existence_checked;
 
         // Count chunks only in packs whose existence was definitively resolved
@@ -674,7 +667,7 @@ pub(super) fn integrity_scan(
             BATCH_THRESHOLD,
             shutdown,
         );
-        check_interrupted(shutdown)?;
+        shutdown.check()?;
         counters.chunks_data_verified = data_count;
         issues.extend(data_issues);
 
@@ -690,7 +683,7 @@ pub(super) fn integrity_scan(
     // Final guard: closes the window where the flag is raised after the last
     // loop-level check — e.g. a callback setting it on `PacksExistenceProgress`
     // with `verify_data = false`, where nothing downstream polls again.
-    check_interrupted(shutdown)?;
+    shutdown.check()?;
 
     Ok(ScanResult {
         counters,
@@ -716,7 +709,7 @@ pub(super) fn integrity_scan(
 fn locate_items_in_missing_packs(
     repo: &mut Repository,
     missing_packs: &HashSet<PackId>,
-    shutdown: Option<&AtomicBool>,
+    shutdown: &CancelToken,
 ) -> Result<Vec<ItemImpact>> {
     if missing_packs.is_empty() {
         return Ok(Vec::new());
@@ -738,7 +731,7 @@ fn locate_items_in_missing_packs(
     let mut impacts: Vec<ItemImpact> = Vec::new();
 
     for entry in &entries {
-        check_interrupted(shutdown)?;
+        shutdown.check()?;
         let items_stream = match load_snapshot_item_stream(repo, &entry.name, shutdown) {
             Ok(s) => s,
             Err(e @ VykarError::Interrupted) => return Err(e),
@@ -748,7 +741,7 @@ fn locate_items_in_missing_packs(
         let mut item_index: usize = 0;
         let mut local: Vec<ItemImpact> = Vec::new();
         let walk = for_each_decoded_item(&items_stream, |item| {
-            check_interrupted(shutdown)?;
+            shutdown.check()?;
             let idx = item_index;
             item_index += 1;
             if item.entry_type == ItemType::RegularFile {
@@ -794,7 +787,7 @@ fn parallel_pack_existence(
     storage: &Arc<dyn StorageBackend>,
     packs: &[(PackId, usize)],
     concurrency: usize,
-    shutdown: Option<&AtomicBool>,
+    shutdown: &CancelToken,
 ) -> (usize, usize, Vec<IntegrityIssue>) {
     if packs.is_empty() {
         return (0, 0, Vec::new());
@@ -852,7 +845,7 @@ fn parallel_verify_data(
     packs: &[(PackId, Vec<(ChunkId, ChunkIndexEntry)>)],
     concurrency: usize,
     batch_threshold: usize,
-    shutdown: Option<&AtomicBool>,
+    shutdown: &CancelToken,
 ) -> (usize, Vec<IntegrityIssue>) {
     if packs.is_empty() {
         return (0, Vec::new());
@@ -1016,14 +1009,14 @@ fn verify_pack_individual(
     pack_id: &PackId,
     chunks: &[(ChunkId, ChunkIndexEntry)],
     issues: &mut Vec<IntegrityIssue>,
-    shutdown: Option<&AtomicBool>,
+    shutdown: &CancelToken,
 ) -> usize {
     let mut count = 0;
     // One range read per chunk: without this poll a cancelled verify keeps
     // issuing storage requests for the rest of the pack. `break` rather than
     // `Err` — the caller's post-scope guard raises the error.
     for (chunk_id, entry) in chunks {
-        if is_shutting_down(shutdown) {
+        if shutdown.is_cancelled() {
             break;
         }
         let mut raw =
@@ -1149,7 +1142,8 @@ mod tests {
         });
 
         let packs = vec![(present, 1), (missing, 1), (errored, 1)];
-        let (checked, missing_count, issues) = parallel_pack_existence(&backend, &packs, 2, None);
+        let (checked, missing_count, issues) =
+            parallel_pack_existence(&backend, &packs, 2, &CancelToken::new());
 
         // Definitively-resolved packs only: present + missing. The I/O-errored pack
         // must NOT be counted, otherwise progress overstates coverage.

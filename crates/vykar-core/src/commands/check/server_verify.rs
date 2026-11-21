@@ -1,11 +1,11 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 
 use super::types::{
     CheckError, CheckProgressEvent, ProcessedVerifyResult, ServerVerifyOutcome, emit_progress,
 };
 use crate::index::ChunkIndexEntry;
+use crate::repo::control::CancelToken;
 use vykar_protocol::{
     PACK_HEADER_SIZE, VerifyBlobRef, VerifyPackRequest, VerifyPacksPlanRequest, VerifyPacksResponse,
 };
@@ -46,7 +46,7 @@ pub(crate) fn try_server_verify(
     verify_data: bool,
     hash: HashAlgorithm,
     progress: &mut Option<&mut dyn FnMut(CheckProgressEvent)>,
-    shutdown: Option<&AtomicBool>,
+    shutdown: &CancelToken,
 ) -> ServerVerifyOutcome {
     let total_packs = pack_chunks.len();
     if total_packs == 0 {
@@ -72,8 +72,8 @@ pub(crate) fn try_server_verify(
     let mut offset = 0;
     while offset < pack_list.len() {
         // Break between round-trips. The partial result is kept; the caller
-        // re-raises the cancellation via `check_interrupted` before using it.
-        if shutdown.is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed)) {
+        // re-raises the cancellation via `CancelToken::check` before using it.
+        if shutdown.is_cancelled() {
             break;
         }
         // Compute batch end respecting both pack count and byte volume.

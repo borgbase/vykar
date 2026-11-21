@@ -1,5 +1,4 @@
 use std::cell::Cell;
-use std::sync::atomic::AtomicBool;
 
 use zeroize::Zeroizing;
 
@@ -10,6 +9,7 @@ use crate::app::operations::{
 };
 use crate::app::preflight::UnavailableRepo;
 use crate::config::{HooksConfig, ResolvedRepo, SourceHooksConfig};
+use crate::repo::control::CancelToken;
 use crate::testutil::{cmd_append, cmd_rename, env_word};
 use vykar_types::error::VykarError;
 
@@ -23,7 +23,7 @@ fn run_backup_selection_rejects_empty_sources() {
     let config = init_repo(&repo_dir);
     let repo = resolved_repo(config, Vec::new());
 
-    let err = run_backup_selection(&repo, &[], None, None, false, None)
+    let err = run_backup_selection(&repo, &[], None, &CancelToken::new(), false, None)
         .err()
         .unwrap();
     assert!(matches!(err, VykarError::Config(msg) if msg.contains("no sources configured")));
@@ -42,7 +42,8 @@ fn run_backup_selection_returns_created_source_report() {
     let sources = vec![source_entry(&source_dir, "src-a")];
     let repo = resolved_repo(config, sources.clone());
 
-    let report = run_backup_selection(&repo, &sources, None, None, false, None).unwrap();
+    let report =
+        run_backup_selection(&repo, &sources, None, &CancelToken::new(), false, None).unwrap();
     assert_eq!(report.created.len(), 1);
     assert_eq!(report.created[0].source_label, "src-a");
     assert_eq!(report.created[0].source_paths.len(), 1);
@@ -223,7 +224,7 @@ fn run_cycle(repo: &ResolvedRepo) -> FullCycleResult {
     run_full_cycle_for_repo(
         repo,
         None,
-        None,
+        &CancelToken::new(),
         false,
         &[],
         UnavailableRepo::Skip,
@@ -315,7 +316,8 @@ fn one_skipped_source_still_backs_up_the_other() {
     let failed = cmd_append(&log, "failed");
     repo.repo_hooks = hooks(&[("after", after.as_str()), ("failed", failed.as_str())]);
 
-    let report = run_backup_selection(&repo, &repo.sources, None, None, false, None).unwrap();
+    let report =
+        run_backup_selection(&repo, &repo.sources, None, &CancelToken::new(), false, None).unwrap();
 
     assert_eq!(report.created.len(), 1);
     assert_eq!(report.created[0].source_label, "kept");
@@ -344,7 +346,7 @@ fn all_sources_skipped_is_a_repo_level_skip() {
         ("finally", finally.as_str()),
     ]);
 
-    let err = run_backup_selection(&repo, &repo.sources, None, None, false, None)
+    let err = run_backup_selection(&repo, &repo.sources, None, &CancelToken::new(), false, None)
         .err()
         .unwrap();
 
@@ -373,7 +375,7 @@ fn resolver_not_called_when_backup_is_skipped() {
             calls.set(calls.get() + 1);
             Ok(None)
         },
-        None,
+        &CancelToken::new(),
         false,
         &[],
         UnavailableRepo::Skip,
@@ -400,7 +402,7 @@ fn resolver_runs_once_after_before_hooks() {
             calls.set(calls.get() + 1);
             Ok(None::<Zeroizing<String>>)
         },
-        None,
+        &CancelToken::new(),
         false,
         &[],
         UnavailableRepo::Skip,
@@ -427,7 +429,7 @@ fn resolver_failure_is_reported_once_and_fires_failed_hooks() {
             calls.set(calls.get() + 1);
             Err(VykarError::Other("no route to host".into()))
         },
-        None,
+        &CancelToken::new(),
         false,
         &[],
         UnavailableRepo::Skip,
@@ -464,7 +466,7 @@ fn canceled_resolver_skips_the_cycle_without_failure() {
     let result = run_full_cycle_with_passphrase_source(
         &repo,
         &mut || Err(VykarError::Skipped("passphrase prompt canceled".into())),
-        None,
+        &CancelToken::new(),
         false,
         &[],
         UnavailableRepo::Skip,
@@ -511,7 +513,7 @@ fn run_counting(
             calls.set(calls.get() + 1);
             Ok(None)
         },
-        None,
+        &CancelToken::new(),
         false,
         &[],
         unavailable,
@@ -638,7 +640,7 @@ fn run_collecting(
         repo,
         &repo.sources,
         None,
-        None,
+        &CancelToken::new(),
         false,
         Some(&mut |e| events.push(e)),
     );
@@ -789,9 +791,16 @@ fn wrong_passphrase_on_first_source_stays_typed() {
     ];
     let repo = resolved_repo(config, sources);
 
-    let err = run_backup_selection(&repo, &repo.sources, Some("wrong"), None, false, None)
-        .err()
-        .unwrap();
+    let err = run_backup_selection(
+        &repo,
+        &repo.sources,
+        Some("wrong"),
+        &CancelToken::new(),
+        false,
+        None,
+    )
+    .err()
+    .unwrap();
     assert!(err.is_passphrase_failure(), "{err:?}");
 }
 
@@ -799,9 +808,10 @@ fn wrong_passphrase_on_first_source_stays_typed() {
 fn shutdown_before_first_source_is_interrupted() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = local_repo(&tmp, &["one", "two"]);
-    let shutdown = AtomicBool::new(true);
+    let shutdown = CancelToken::new();
+    shutdown.cancel();
 
-    let err = run_backup_selection(&repo, &repo.sources, None, Some(&shutdown), false, None)
+    let err = run_backup_selection(&repo, &repo.sources, None, &shutdown, false, None)
         .err()
         .unwrap();
     assert!(matches!(err, VykarError::Interrupted), "{err:?}");
@@ -817,7 +827,8 @@ fn partial_failure_fires_repo_failed_hook_naming_the_source() {
     let failed = cmd_append(&log, &env_word("failed:", "VYKAR_ERROR", ""));
     repo.repo_hooks = hooks(&[("after", after.as_str()), ("failed", failed.as_str())]);
 
-    let report = run_backup_selection(&repo, &repo.sources, None, None, false, None).unwrap();
+    let report =
+        run_backup_selection(&repo, &repo.sources, None, &CancelToken::new(), false, None).unwrap();
 
     assert_eq!(report.created.len(), 1);
     let lines = log_lines(&log);
@@ -854,7 +865,7 @@ fn cycle_with_failed_source_reports_failure_and_skips_maintenance() {
     let result = run_full_cycle_for_repo(
         &repo,
         None,
-        None,
+        &CancelToken::new(),
         false,
         &[],
         UnavailableRepo::Skip,

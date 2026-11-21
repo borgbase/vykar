@@ -13,6 +13,7 @@ mod common;
 
 use vykar_core::commands;
 use vykar_core::compress::Compression;
+use vykar_core::repo::control::CancelToken;
 
 use crate::common::make_test_config;
 
@@ -65,7 +66,7 @@ fn backup_symlink_to_directory_descends_target() {
         None,
         false,
         false,
-        None,
+        &CancelToken::new(),
     )
     .unwrap();
 

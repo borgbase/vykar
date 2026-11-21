@@ -6,6 +6,8 @@
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, PoisonError};
 
+use super::control::CancelToken;
+
 /// Run `task` on every item until one fails, on up to `width` scoped threads.
 /// Stops handing out work after the first error and returns it (the first one
 /// recorded, not the lowest index); `Ok` only if every task succeeded.
@@ -61,20 +63,15 @@ where
 /// tasks report — `task` records its own outcome. Stops claiming items once
 /// `cancel` is raised (checked before each claim); items not reached are
 /// skipped silently, so a caller that counts coverage must re-check `cancel`.
-pub(crate) fn for_each_bounded<T, F>(
-    width: usize,
-    items: &[T],
-    cancel: Option<&AtomicBool>,
-    task: F,
-) where
+pub(crate) fn for_each_bounded<T, F>(width: usize, items: &[T], cancel: &CancelToken, task: F)
+where
     T: Sync,
     F: Fn(&T) + Sync,
 {
-    let cancelled = || cancel.is_some_and(|f| f.load(Ordering::Relaxed));
     let threads = width.min(items.len());
     if threads <= 1 {
         for item in items {
-            if cancelled() {
+            if cancel.is_cancelled() {
                 break;
             }
             task(item);
@@ -86,7 +83,7 @@ pub(crate) fn for_each_bounded<T, F>(
         for _ in 0..threads {
             s.spawn(|| {
                 loop {
-                    if cancelled() {
+                    if cancel.is_cancelled() {
                         break;
                     }
                     let Some(item) = items.get(next.fetch_add(1, Ordering::Relaxed)) else {
@@ -156,7 +153,7 @@ mod tests {
         let caller = std::thread::current().id();
         let items = [0, 1, 2];
         let threads = Mutex::new(Vec::new());
-        for_each_bounded(1, &items, None, |_| {
+        for_each_bounded(1, &items, &CancelToken::new(), |_| {
             threads.lock().unwrap().push(std::thread::current().id());
         });
         let result = try_for_each_bounded(1, &items, |_| {
@@ -175,7 +172,7 @@ mod tests {
         for width in [0, 1, 3, 100] {
             let calls = counters(items.len());
             let errors = Mutex::new(Vec::new());
-            for_each_bounded(width, &items, None, |&i| {
+            for_each_bounded(width, &items, &CancelToken::new(), |&i| {
                 calls[i].fetch_add(1, Ordering::SeqCst);
                 if i % 2 == 0 {
                     errors.lock().unwrap().push(i);
@@ -191,31 +188,32 @@ mod tests {
         let items: Vec<usize> = (0..1000).collect();
 
         for width in [0, 1, 4] {
-            let cancel = AtomicBool::new(true);
+            let cancel = CancelToken::new();
+            cancel.cancel();
             let calls = AtomicUsize::new(0);
-            for_each_bounded(width, &items, Some(&cancel), |_| {
+            for_each_bounded(width, &items, &cancel, |_| {
                 calls.fetch_add(1, Ordering::SeqCst);
             });
             assert_eq!(calls.load(Ordering::SeqCst), 0, "width {width}");
         }
 
-        let cancel = AtomicBool::new(false);
+        let cancel = CancelToken::new();
         let calls = counters(items.len());
-        for_each_bounded(1, &items, Some(&cancel), |&i| {
+        for_each_bounded(1, &items, &cancel, |&i| {
             calls[i].fetch_add(1, Ordering::SeqCst);
             if i == 5 {
-                cancel.store(true, Ordering::Relaxed);
+                cancel.cancel();
             }
         });
         let counts = counts(&calls);
         assert!(counts[..=5].iter().all(|&c| c == 1));
         assert!(counts[6..].iter().all(|&c| c == 0));
 
-        let cancel = AtomicBool::new(false);
+        let cancel = CancelToken::new();
         let calls = AtomicUsize::new(0);
-        for_each_bounded(4, &items, Some(&cancel), |_| {
+        for_each_bounded(4, &items, &cancel, |_| {
             calls.fetch_add(1, Ordering::SeqCst);
-            cancel.store(true, Ordering::Relaxed);
+            cancel.cancel();
         });
         let calls = calls.load(Ordering::SeqCst);
         assert!((1..=4).contains(&calls), "calls {calls}");
@@ -226,7 +224,7 @@ mod tests {
         let items: Vec<usize> = (0..30).collect();
         let in_flight = AtomicUsize::new(0);
         let max = AtomicUsize::new(0);
-        for_each_bounded(3, &items, None, |_| {
+        for_each_bounded(3, &items, &CancelToken::new(), |_| {
             let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
             max.fetch_max(now, Ordering::SeqCst);
             std::thread::sleep(Duration::from_millis(2));

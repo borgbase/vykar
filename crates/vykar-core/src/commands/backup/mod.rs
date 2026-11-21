@@ -21,7 +21,6 @@ pub(crate) mod read_source;
 pub(crate) use chunk_process::WorkerChunk;
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 
 use tracing::{debug, info, warn};
 
@@ -30,6 +29,7 @@ use crate::config::{CommandDump, VykarConfig};
 
 use crate::limits;
 use crate::platform::fs;
+use crate::repo::control::{CancelToken, CommitEvent};
 use crate::repo::file_cache::{CachedChunks, FileCache, ParentReuseIndex, RetainedHit};
 use crate::repo::lock;
 use crate::repo::pack::PackType;
@@ -261,6 +261,15 @@ pub enum BackupProgressEvent {
     },
 }
 
+impl From<CommitEvent> for BackupProgressEvent {
+    fn from(event: CommitEvent) -> Self {
+        match event {
+            CommitEvent::Stage { stage } => Self::CommitStage { stage },
+            CommitEvent::Warning { message } => Self::Warning { message },
+        }
+    }
+}
+
 pub(crate) fn emit_progress(
     progress: &mut Option<&mut dyn FnMut(BackupProgressEvent)>,
     event: BackupProgressEvent,
@@ -421,14 +430,14 @@ pub struct BackupRequest<'a> {
 }
 
 pub fn run(config: &VykarConfig, req: BackupRequest<'_>) -> Result<BackupOutcome> {
-    run_with_progress(config, req, None, None)
+    run_with_progress(config, req, None, &CancelToken::new())
 }
 
 pub fn run_with_progress(
     config: &VykarConfig,
     req: BackupRequest<'_>,
     progress: Option<&mut dyn FnMut(BackupProgressEvent)>,
-    shutdown: Option<&AtomicBool>,
+    shutdown: &CancelToken,
 ) -> Result<BackupOutcome> {
     run_impl(config, req, progress, shutdown, None)
 }
@@ -454,7 +463,7 @@ pub(crate) fn run_impl(
     config: &VykarConfig,
     req: BackupRequest<'_>,
     progress: Option<&mut dyn FnMut(BackupProgressEvent)>,
-    shutdown: Option<&AtomicBool>,
+    shutdown: &CancelToken,
     wrap_backend: Option<BackendWrapper<'_>>,
 ) -> Result<BackupOutcome> {
     run_scoped(config, req, progress, shutdown, wrap_backend).map_err(|(_, e)| e)
@@ -465,7 +474,7 @@ pub(crate) fn run_scoped(
     config: &VykarConfig,
     req: BackupRequest<'_>,
     progress: Option<&mut dyn FnMut(BackupProgressEvent)>,
-    shutdown: Option<&AtomicBool>,
+    shutdown: &CancelToken,
     wrap_backend: Option<BackendWrapper<'_>>,
 ) -> std::result::Result<BackupOutcome, (FailureScope, VykarError)> {
     let prepared = prepare(config, &req).map_err(|e| (FailureScope::Source, e))?;
@@ -534,7 +543,7 @@ fn run_against_repo(
     req: &BackupRequest<'_>,
     prepared: Prepared<'_>,
     mut progress: Option<&mut dyn FnMut(BackupProgressEvent)>,
-    shutdown: Option<&AtomicBool>,
+    shutdown: &CancelToken,
     wrap_backend: Option<BackendWrapper<'_>>,
 ) -> Result<BackupOutcome> {
     let snapshot_name = req.snapshot_name;
@@ -717,6 +726,20 @@ fn source_paths_match(a: &[String], b: &[String]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn commit_event_maps_to_backup_progress() {
+        assert!(matches!(
+            BackupProgressEvent::from(CommitEvent::Stage { stage: "x" }),
+            BackupProgressEvent::CommitStage { stage: "x" }
+        ));
+        match BackupProgressEvent::from(CommitEvent::Warning {
+            message: "w".into(),
+        }) {
+            BackupProgressEvent::Warning { message } => assert_eq!(message, "w"),
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
 
     #[test]
     fn source_paths_match_order_independent() {

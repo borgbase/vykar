@@ -6,7 +6,6 @@
 
 use std::fs;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
@@ -15,6 +14,7 @@ use vykar_storage::{InnerBackend, StorageBackend, delegate_storage_backend};
 use vykar_types::error::{Result, VykarError};
 
 use crate::commands::backup;
+use crate::repo::control::CancelToken;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Event {
@@ -76,7 +76,7 @@ struct Shared {
     fail_lock_put: bool,
     /// Set by the first successful pack PUT and passed to the backup as its
     /// shutdown flag, so the run is interrupted once packs are durable.
-    interrupt_after_pack: Option<Arc<AtomicBool>>,
+    interrupt_after_pack: Option<CancelToken>,
     /// Fail every `snapshots/` PUT, after the index write it follows.
     fail_snapshot_put: bool,
     /// Another client's work, run at the commit lock PUT.
@@ -167,7 +167,7 @@ impl ObservingBackend {
         if res.is_ok()
             && let Some(flag) = &self.shared.interrupt_after_pack
         {
-            flag.store(true, Ordering::SeqCst);
+            flag.cancel();
         }
         self.record(Event::PackPutEnd);
         res
@@ -278,7 +278,7 @@ fn run_backup_with_passphrase(
     passphrase: Option<&str>,
 ) -> Result<backup::BackupOutcome> {
     let source_paths = vec![src.to_string_lossy().to_string()];
-    let shutdown = shared.interrupt_after_pack.clone();
+    let shutdown = shared.interrupt_after_pack.clone().unwrap_or_default();
     let shared = shared.clone();
     let wrap = move |inner: Box<dyn StorageBackend>| -> Box<dyn StorageBackend> {
         Box::new(ObservingBackend {
@@ -303,7 +303,7 @@ fn run_backup_with_passphrase(
             verbose: false,
         },
         None,
-        shutdown.as_deref(),
+        &shutdown,
         Some(&wrap),
     )
 }
@@ -674,7 +674,7 @@ fn lock_acquisition_failure_deregisters_and_keeps_journal() {
 fn interrupt_after_upload_deregisters_and_keeps_journal() {
     let (_dir, config, src) = setup();
     let shared = Shared {
-        interrupt_after_pack: Some(Arc::new(AtomicBool::new(false))),
+        interrupt_after_pack: Some(CancelToken::new()),
         ..Default::default()
     };
     let err = run_backup(&config, &src, &shared).unwrap_err();
@@ -824,7 +824,7 @@ fn assert_check_clean_verified(config: &crate::config::VykarConfig) {
 }
 
 fn compact(config: &crate::config::VykarConfig) {
-    crate::commands::compact::run(config, None, 0.0, None, false, None).unwrap();
+    crate::commands::compact::run(config, None, 0.0, None, false, &CancelToken::new()).unwrap();
 }
 
 fn assert_superset(packs: &[String], config: &crate::config::VykarConfig) {
@@ -848,7 +848,7 @@ fn assert_restores(config: &crate::config::VykarConfig, snapshot: &str, dest: &P
         None,
         false,
         true,
-        None,
+        &CancelToken::new(),
     )
     .unwrap();
     let a = find_file(dest, "a.bin").expect("a.bin restored");
@@ -924,7 +924,15 @@ fn snapshot_put_failure_after_the_index_write_keeps_its_packs() {
     assert!(sum(&r2) > sum(&r1), "refcounts not inflated: {r1:?} {r2:?}");
 
     let repair = |mode| {
-        crate::commands::check::run_with_repair(&config, None, false, mode, None, None).unwrap()
+        crate::commands::check::run_with_repair(
+            &config,
+            None,
+            false,
+            mode,
+            None,
+            &CancelToken::new(),
+        )
+        .unwrap()
     };
     let plan = repair(RepairMode::PlanOnly).plan;
     assert!(!plan.has_data_loss, "{:?}", plan.actions);
@@ -1079,7 +1087,7 @@ fn concurrent_commit_of_the_same_chunks_becomes_bumps() {
         false,
         RepairMode::Apply,
         None,
-        None,
+        &CancelToken::new(),
     )
     .unwrap()
     .plan;
@@ -1144,7 +1152,8 @@ fn chunks_deleted_during_the_session_fail_the_commit_as_stale() {
                 .put(key, &serde_json::to_vec(&entry).unwrap())
                 .unwrap();
 
-            crate::commands::delete::run(&other, None, &["s1"], false, None).unwrap();
+            crate::commands::delete::run(&other, None, &["s1"], false, &CancelToken::new())
+                .unwrap();
             assert!(
                 !storage.exists(key).unwrap(),
                 "maintenance reaped the marker"

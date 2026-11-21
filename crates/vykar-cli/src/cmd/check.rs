@@ -1,11 +1,11 @@
 use std::io::{self, BufRead, Write};
-use std::sync::atomic::AtomicBool;
 
 use vykar_core::commands;
 use vykar_core::commands::check::{
     IndexRecovery, RepairAction, RepairMode, RepairPlan, RepairResult,
 };
 use vykar_core::config::VykarConfig;
+use vykar_core::repo::control::CancelToken;
 
 use crate::error::{CliError, CliResult};
 use crate::passphrase::with_repo_passphrase;
@@ -19,7 +19,7 @@ pub(crate) fn run_check(
     repair: bool,
     dry_run: bool,
     yes: bool,
-    shutdown: Option<&AtomicBool>,
+    shutdown: &CancelToken,
 ) -> CliResult<()> {
     if !repair {
         if distrust_server && !verify_data {
@@ -105,7 +105,7 @@ fn run_repair(
     label: Option<&str>,
     verify_data: bool,
     mode: RepairMode,
-    shutdown: Option<&AtomicBool>,
+    shutdown: &CancelToken,
 ) -> CliResult<RepairResult> {
     with_repo_passphrase(config, label, |passphrase| {
         Ok(commands::check::run_with_repair(
@@ -124,7 +124,7 @@ fn run_check_readonly(
     label: Option<&str>,
     verify_data: bool,
     distrust_server: bool,
-    shutdown: Option<&AtomicBool>,
+    shutdown: &CancelToken,
 ) -> CliResult<()> {
     let result = with_repo_passphrase(config, label, |passphrase| {
         Ok(commands::check::run_with_progress(

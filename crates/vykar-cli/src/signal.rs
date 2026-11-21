@@ -3,8 +3,16 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use vykar_core::repo::control::CancelToken;
+
 /// Global shutdown flag. Set to `true` on first SIGINT/SIGTERM.
 pub static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+/// The cancellation token over [`SHUTDOWN`], shared by every command of the process.
+pub fn shutdown_token() -> &'static CancelToken {
+    static TOKEN: std::sync::OnceLock<CancelToken> = std::sync::OnceLock::new();
+    TOKEN.get_or_init(|| CancelToken::from_static(&SHUTDOWN))
+}
 
 /// Global reload flag (Unix only). Set to `true` on SIGHUP.
 /// The daemon checks this between backup cycles and re-reads config.

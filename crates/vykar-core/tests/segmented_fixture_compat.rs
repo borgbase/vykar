@@ -22,6 +22,7 @@ use std::path::Path;
 use vykar_core::commands;
 use vykar_core::index::head::IndexHead;
 use vykar_core::repo::Repository;
+use vykar_core::repo::control::CancelToken;
 use vykar_types::hash::HashAlgorithm;
 
 use crate::common::fixtures::{self, Fixture, archive_path, read_tree};
@@ -219,7 +220,7 @@ fn segmented_fixtures_restore_byte_identical() {
             None,
             config.xattrs.enabled,
             true, // verify chunk IDs
-            None,
+            &CancelToken::new(),
         )
         .unwrap();
         assert_eq!(
@@ -289,7 +290,15 @@ fn segmented_fixtures_compact_keeps_the_retired_generation() {
         let fx = extract(prefix, mode);
         let before = head(&fx.open());
 
-        commands::compact::run(&fx.config(), fx.passphrase(), 100.0, None, false, None).unwrap();
+        commands::compact::run(
+            &fx.config(),
+            fx.passphrase(),
+            100.0,
+            None,
+            false,
+            &CancelToken::new(),
+        )
+        .unwrap();
 
         let files = index_files(&fx.repo_dir());
         for name in named_objects(&before) {

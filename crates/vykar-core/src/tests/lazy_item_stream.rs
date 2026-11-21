@@ -2,7 +2,6 @@
 //! straddling chunk and range-read boundaries.
 
 use std::io::Read;
-use std::sync::atomic::AtomicBool;
 
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::VykarError;
@@ -10,6 +9,7 @@ use vykar_types::pack_id::PackId;
 
 use crate::commands::list::{LazyItemStream, for_each_decoded_item};
 use crate::compress::Compression;
+use crate::repo::control::CancelToken;
 use crate::repo::pack::PackType;
 use crate::repo::{Repository, WriteSessionOptions};
 use crate::snapshot::item::{Item, ItemType};
@@ -134,14 +134,15 @@ fn lazy_stream_matches_eager_decode_across_windows() {
         .filter(|w| w[0].1 != w[1].1 || w[1].2 < w[0].2 + u64::from(w[0].3))
         .count();
     log.reset_get_range_count();
-    let mut lazy = LazyItemStream::for_test(&repo, locs.clone(), false, u64::MAX, None);
+    let never = CancelToken::new();
+    let mut lazy = LazyItemStream::for_test(&repo, locs.clone(), false, u64::MAX, &never);
     assert_eq!(paths_of(&mut lazy).unwrap(), expected);
     assert_eq!(log.get_range_count() as usize, pack_runs);
 
     // A window cap of ~4 chunks: many range reads, same items.
     let cap = u64::from(locs[0].3) * 4;
     log.reset_get_range_count();
-    let mut lazy = LazyItemStream::for_test(&repo, locs.clone(), false, cap, None);
+    let mut lazy = LazyItemStream::for_test(&repo, locs.clone(), false, cap, &never);
     assert_eq!(paths_of(&mut lazy).unwrap(), expected);
     let reads = log.get_range_count() as usize;
     assert!(
@@ -154,7 +155,8 @@ fn lazy_stream_matches_eager_decode_across_windows() {
 #[test]
 fn lazy_stream_empty_is_empty() {
     let (repo, log) = repo_on_counting_backend();
-    let mut lazy = LazyItemStream::for_test(&repo, Vec::new(), false, u64::MAX, None);
+    let never = CancelToken::new();
+    let mut lazy = LazyItemStream::for_test(&repo, Vec::new(), false, u64::MAX, &never);
     assert!(paths_of(&mut lazy).unwrap().is_empty());
     assert_eq!(log.get_range_count(), 0);
 }
@@ -167,7 +169,8 @@ fn lazy_stream_surfaces_chunk_id_mismatch_not_a_decode_error() {
     // the chunk-ID check can notice.
     let (_, p, o, s) = locs[4];
     locs[3] = (locs[3].0, p, o, s);
-    let mut lazy = LazyItemStream::for_test(&repo, locs, false, u64::MAX, None);
+    let never = CancelToken::new();
+    let mut lazy = LazyItemStream::for_test(&repo, locs, false, u64::MAX, &never);
     let err = paths_of(&mut lazy).unwrap_err();
     assert!(
         matches!(err, VykarError::InvalidFormat(_)),
@@ -180,14 +183,14 @@ fn lazy_stream_polls_shutdown_between_range_reads() {
     let (mut repo, log) = repo_on_counting_backend();
     let (_stream, locs) = stored_stream(&mut repo, 300, 64);
     let cap = u64::from(locs[0].3) * 2;
-    let shutdown = AtomicBool::new(false);
-    let mut lazy = LazyItemStream::for_test(&repo, locs, false, cap, Some(&shutdown));
+    let shutdown = CancelToken::new();
+    let mut lazy = LazyItemStream::for_test(&repo, locs, false, cap, &shutdown);
     log.reset_get_range_count();
     let mut seen = 0usize;
     let err = lazy
         .for_each_item(|_| {
             seen += 1;
-            shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+            shutdown.cancel();
             Ok(())
         })
         .unwrap_err();
@@ -209,14 +212,15 @@ fn lazy_stream_from_cache_falls_back_to_index_on_bad_location() {
     let (_, p, o, s) = locs[2];
     locs[5] = (locs[5].0, p, o, s);
 
-    let mut lazy = LazyItemStream::for_test(&repo, locs.clone(), true, u64::MAX, None);
+    let never = CancelToken::new();
+    let mut lazy = LazyItemStream::for_test(&repo, locs.clone(), true, u64::MAX, &never);
     assert!(!lazy.cache_distrusted());
     assert_eq!(paths_of(&mut lazy).unwrap(), eager_paths(&stream));
     // The reader that opened the stream must stop using the cache as well.
     assert!(lazy.cache_distrusted());
 
     // Without the cache origin there is no fallback: the error surfaces.
-    let mut lazy = LazyItemStream::for_test(&repo, locs, false, u64::MAX, None);
+    let mut lazy = LazyItemStream::for_test(&repo, locs, false, u64::MAX, &never);
     assert!(paths_of(&mut lazy).is_err());
 }
 
@@ -230,7 +234,8 @@ fn lazy_stream_reads_an_aead_repo() {
     pieces.insert(4, pieces[3]);
 
     let cap = u64::from(locs[0].3) * 4;
-    let mut lazy = LazyItemStream::for_test(&repo, locs, false, cap, None);
+    let never = CancelToken::new();
+    let mut lazy = LazyItemStream::for_test(&repo, locs, false, cap, &never);
     let mut bytes = Vec::new();
     lazy.read_to_end(&mut bytes).unwrap();
     assert_eq!(bytes, pieces.concat());

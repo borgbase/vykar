@@ -4,12 +4,11 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 
 use smallvec::SmallVec;
 
-use crate::commands::util::check_interrupted;
 use crate::platform::fs;
+use crate::repo::control::CancelToken;
 use crate::snapshot::item::{ChunkRef, HardlinkId, Item, ItemType};
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
@@ -213,7 +212,7 @@ pub(super) fn stream_and_plan<F, B>(
     batch_size: usize,
     group_reps: &mut HashMap<HardlinkId, RepInfo>,
     pending_links: &mut Vec<PendingLink>,
-    shutdown: Option<&AtomicBool>,
+    shutdown: &CancelToken,
     mut flush_batch: B,
 ) -> Result<StreamPlan>
 where
@@ -239,7 +238,7 @@ where
         // Per-item poll: this is what makes "stop between files" real, since
         // `RESTORE_BATCH_FILES` batch boundaries are far too coarse. A relaxed
         // load is negligible against per-item decode + filesystem work.
-        check_interrupted(shutdown)?;
+        shutdown.check()?;
         if !include_path(&item.path) {
             return Ok(());
         }
@@ -555,10 +554,10 @@ pub(super) fn stage_batch_files(
     files: &[PlannedFile],
     temp_root: &Path,
     verified_dirs: &VerifiedDirs,
-    shutdown: Option<&AtomicBool>,
+    shutdown: &CancelToken,
 ) -> Result<()> {
     for pf in files {
-        check_interrupted(shutdown)?;
+        shutdown.check()?;
         #[cfg(test)]
         super::fault_staging_loop(shutdown);
         let full_path = temp_root.join(&pf.rel_path);
@@ -725,7 +724,7 @@ mod tests {
             usize::MAX,
             &mut group_reps,
             &mut pending_links,
-            None,
+            &CancelToken::new(),
             |files, chunks, verified, _stats| {
                 all_files.extend(files);
                 for (k, v) in chunks {
@@ -763,7 +762,7 @@ mod tests {
             usize::MAX,
             &mut group_reps,
             &mut pending_links,
-            None,
+            &CancelToken::new(),
             |files, _chunks, _verified, _stats| {
                 all_files.extend(files);
                 Ok(())
@@ -1552,7 +1551,7 @@ mod tests {
             2,
             &mut group_reps,
             &mut pending_links,
-            None,
+            &CancelToken::new(),
             |files, _chunks, _verified, _stats| {
                 sizes.push(files.len());
                 Ok(())
@@ -1589,7 +1588,7 @@ mod tests {
             usize::MAX,
             &mut group_reps,
             &mut pending_links,
-            None,
+            &CancelToken::new(),
             |_files, _chunks, _verified, _stats| Ok(()),
         )
         .unwrap();
@@ -1633,7 +1632,7 @@ mod tests {
             100,
             &mut group_reps,
             &mut pending_links,
-            None,
+            &CancelToken::new(),
             |files, chunks, verified, _stats| {
                 flush_calls += 1;
                 assert!(files.is_empty());
@@ -1691,8 +1690,10 @@ mod tests {
             batch_size,
             &mut group_reps,
             &mut pending_links,
-            None,
-            |files, _chunks, verified, _stats| stage_batch_files(&files, dest, verified, None),
+            &CancelToken::new(),
+            |files, _chunks, verified, _stats| {
+                stage_batch_files(&files, dest, verified, &CancelToken::new())
+            },
         )
     }
 
@@ -1846,9 +1847,9 @@ mod tests {
             1,
             &mut group_reps,
             &mut pending_links,
-            None,
+            &CancelToken::new(),
             |mut files, _chunks, verified, stats| {
-                stage_batch_files(&files, dest, verified, None)?;
+                stage_batch_files(&files, dest, verified, &CancelToken::new())?;
                 let failed = (0..files.len())
                     .map(|i| (i, "damaged".to_string()))
                     .collect();

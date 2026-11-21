@@ -20,6 +20,7 @@ mod common;
 
 use vykar_core::commands;
 use vykar_core::index::ChunkIndex;
+use vykar_core::repo::control::CancelToken;
 use vykar_core::repo::file_cache::FileCache;
 use vykar_core::repo::{OpenOptions, Repository, identity};
 use vykar_storage::local_backend::LocalBackend;
@@ -115,7 +116,7 @@ fn v2_fixtures_restore_byte_identical() {
             None,
             config.xattrs.enabled,
             true, // verify chunk IDs: the point of the exercise
-            None,
+            &CancelToken::new(),
         )
         .unwrap();
 
@@ -190,7 +191,7 @@ fn v2_fixtures_upgrade_to_v4() {
             None,
             config.xattrs.enabled,
             true,
-            None,
+            &CancelToken::new(),
         )
         .unwrap();
         assert_eq!(read_tree(&dest), read_tree(&fx.source_dir()), "{mode}");
@@ -267,8 +268,14 @@ fn v2_fixtures_survive_delete_prune_compact_and_restore() {
         );
 
         let oldest = fx.snapshots.first().unwrap().clone();
-        let deleted =
-            commands::delete::run(&config, fx.passphrase(), &[&oldest], false, None).unwrap();
+        let deleted = commands::delete::run(
+            &config,
+            fx.passphrase(),
+            &[&oldest],
+            false,
+            &CancelToken::new(),
+        )
+        .unwrap();
         assert!(
             deleted.warnings.is_empty(),
             "{mode}: {:?}",
@@ -279,10 +286,27 @@ fn v2_fixtures_survive_delete_prune_compact_and_restore() {
         // is left so this step exercises the code path without deleting more.
         let mut prune_config = config.clone();
         prune_config.retention.keep_last = Some(10);
-        commands::prune::run(&prune_config, fx.passphrase(), false, false, &[], &[], None).unwrap();
+        commands::prune::run(
+            &prune_config,
+            fx.passphrase(),
+            false,
+            false,
+            &[],
+            &[],
+            &CancelToken::new(),
+        )
+        .unwrap();
 
         // Threshold 0.0 so compaction actually repacks the holes delete left.
-        commands::compact::run(&config, fx.passphrase(), 0.0, None, false, None).unwrap();
+        commands::compact::run(
+            &config,
+            fx.passphrase(),
+            0.0,
+            None,
+            false,
+            &CancelToken::new(),
+        )
+        .unwrap();
 
         let dest = fx.root.join("restore-after-maintenance");
         commands::restore::run(
@@ -293,7 +317,7 @@ fn v2_fixtures_survive_delete_prune_compact_and_restore() {
             None,
             config.xattrs.enabled,
             true,
-            None,
+            &CancelToken::new(),
         )
         .unwrap();
         assert_eq!(
@@ -358,7 +382,7 @@ fn v2_encrypted_fixtures_reject_a_wrong_passphrase() {
             None,
             config.xattrs.enabled,
             false,
-            None,
+            &CancelToken::new(),
         )
         .err()
         .unwrap_or_else(|| panic!("{mode}: restoring with a wrong passphrase must fail"));

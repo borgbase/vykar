@@ -15,6 +15,7 @@ use super::runner::SourceTree;
 use super::store::SimStore;
 use crate::commands::list;
 use crate::commands::restore::{self, RestoreOptions};
+use crate::repo::control::CancelToken;
 use crate::repo::{OpenOptions, Repository, index_store};
 use crate::snapshot::item::ItemType;
 
@@ -404,7 +405,7 @@ fn check_snapshots(
             );
             continue;
         }
-        let stream = match list::load_snapshot_item_stream(repo, name, None) {
+        let stream = match list::load_snapshot_item_stream(repo, name, &CancelToken::new()) {
             Ok(s) => s,
             Err(e) => {
                 report.add(
@@ -483,7 +484,7 @@ fn check_snapshots(
                 verify_chunks: true,
                 continue_on_error: false,
             },
-            None,
+            &CancelToken::new(),
         );
         if let Err(e) = restored {
             report.add(

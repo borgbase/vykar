@@ -8,7 +8,6 @@
 )]
 
 use std::borrow::Cow;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use rand::Rng;
 use zeroize::Zeroizing;
@@ -17,6 +16,7 @@ use crate::app::preflight::{self, UnavailableRepo};
 use crate::commands;
 use crate::compress::Compression;
 use crate::config::{ResolvedRepo, SourceEntry, VykarConfig};
+use crate::repo::control::CancelToken;
 use vykar_types::error::{Result, VykarError};
 
 #[derive(Debug, Clone)]
@@ -268,7 +268,7 @@ fn run_backup_sources(
     sources: &[SourceEntry],
     passphrase: Option<&str>,
     repo_label: Option<&str>,
-    shutdown: Option<&AtomicBool>,
+    shutdown: &CancelToken,
     verbose: bool,
     on_event: &mut Option<&mut dyn FnMut(BackupRunEvent)>,
 ) -> Result<BackupRunReport> {
@@ -315,7 +315,7 @@ fn run_backup_sources(
             }
         };
 
-        let result = if shutdown.is_some_and(|f| f.load(Ordering::SeqCst)) {
+        let result = if shutdown.is_cancelled() {
             Err((FailureScope::Repository, VykarError::Interrupted))
         } else if source.hooks.has_any() {
             let mut ctx = crate::hooks::HookContext {
@@ -466,7 +466,7 @@ pub fn run_backup_selection(
     repo: &ResolvedRepo,
     sources: &[SourceEntry],
     passphrase: Option<&str>,
-    shutdown: Option<&AtomicBool>,
+    shutdown: &CancelToken,
     verbose: bool,
     on_event: Option<&mut dyn FnMut(BackupRunEvent)>,
 ) -> Result<BackupRunReport> {
@@ -564,7 +564,7 @@ where
 pub fn run_full_cycle_for_repo(
     repo: &ResolvedRepo,
     passphrase: Option<&str>,
-    shutdown: Option<&AtomicBool>,
+    shutdown: &CancelToken,
     verbose: bool,
     source_filter: &[String],
     unavailable: UnavailableRepo,
@@ -592,7 +592,7 @@ pub fn run_full_cycle_for_repo(
 pub fn run_full_cycle_with_passphrase_source(
     repo: &ResolvedRepo,
     resolve: &mut dyn FnMut() -> Result<Option<Zeroizing<String>>>,
-    shutdown: Option<&AtomicBool>,
+    shutdown: &CancelToken,
     verbose: bool,
     source_filter: &[String],
     unavailable: UnavailableRepo,
@@ -601,7 +601,6 @@ pub fn run_full_cycle_with_passphrase_source(
     let mut passphrase = LazyPassphrase::new(resolve);
     let config = &repo.config;
     let sources = &repo.sources;
-    let shutting_down = |s: Option<&AtomicBool>| s.is_some_and(|f| f.load(Ordering::SeqCst));
 
     let mut steps: Vec<(CycleStep, StepOutcome)> = Vec::new();
     let mut backup_report: Option<BackupRunReport> = None;
@@ -611,7 +610,7 @@ pub fn run_full_cycle_with_passphrase_source(
     let mut repo_unavailable = false;
 
     // 1. Backup
-    if !shutting_down(shutdown) {
+    if !shutdown.is_cancelled() {
         match resolve_cycle_sources(sources, source_filter) {
             Err(e) => emit_terminal(
                 CycleStep::Backup,
@@ -688,7 +687,7 @@ pub fn run_full_cycle_with_passphrase_source(
     let backup_skip_outcome = || StepOutcome::Skipped("backup skipped".into());
 
     // 2. Prune
-    if !shutting_down(shutdown) {
+    if !shutdown.is_cancelled() {
         let has_retention = config.retention.has_any_rule()
             || sources
                 .iter()
@@ -749,7 +748,7 @@ pub fn run_full_cycle_with_passphrase_source(
     }
 
     // 3. Compact
-    if !shutting_down(shutdown) {
+    if !shutdown.is_cancelled() {
         if backup_skipped {
             emit_terminal(
                 CycleStep::Compact,
@@ -786,7 +785,7 @@ pub fn run_full_cycle_with_passphrase_source(
     }
 
     // 4. Check (metadata-only, with sampling support)
-    if !shutting_down(shutdown) {
+    if !shutdown.is_cancelled() {
         let check_max_percent = config.check.max_percent;
         if backup_skipped {
             emit_terminal(

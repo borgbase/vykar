@@ -1,8 +1,7 @@
-use std::sync::atomic::AtomicBool;
-
 use vykar_core::commands;
 use vykar_core::commands::restore::RestoreOptions;
 use vykar_core::config::VykarConfig;
+use vykar_core::repo::control::CancelToken;
 use vykar_types::error::VykarError;
 
 use crate::error::{CliError, CliResult};
@@ -18,7 +17,7 @@ pub(crate) fn run_restore(
     pattern: Option<String>,
     verify: bool,
     continue_on_error: bool,
-    shutdown: Option<&AtomicBool>,
+    shutdown: &CancelToken,
 ) -> CliResult<bool> {
     let opts = RestoreOptions {
         xattrs_enabled: config.xattrs.enabled,

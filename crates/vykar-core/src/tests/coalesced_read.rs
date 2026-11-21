@@ -8,6 +8,7 @@ use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
 
 use crate::compress::Compression;
+use crate::repo::control::CancelToken;
 use crate::repo::pack::PackType;
 use crate::repo::{EncryptionMode, Repository, WriteSessionOptions};
 use crate::testutil::{MemoryBackend, PutLog, RecordingBackend, init_test_environment};
@@ -81,7 +82,7 @@ fn adjacent_blobs_coalesce_into_single_read() {
     log.reset_get_range_count();
 
     let mut out = Vec::new();
-    repo.read_chunks_coalesced_into(&chunks, &mut out, None)
+    repo.read_chunks_coalesced_into(&chunks, &mut out, &CancelToken::new())
         .unwrap();
 
     // Should have been a single coalesced get_range call.
@@ -110,7 +111,7 @@ fn repeat_reads_go_to_storage() {
 
     log.reset_get_range_count();
     let mut out = Vec::new();
-    repo.read_chunks_coalesced_into(&chunks, &mut out, None)
+    repo.read_chunks_coalesced_into(&chunks, &mut out, &CancelToken::new())
         .unwrap();
 
     assert_eq!(
@@ -150,7 +151,7 @@ fn cross_pack_grouping() {
     log.reset_get_range_count();
 
     let mut out = Vec::new();
-    repo.read_chunks_coalesced_into(&chunks, &mut out, None)
+    repo.read_chunks_coalesced_into(&chunks, &mut out, &CancelToken::new())
         .unwrap();
 
     // One get_range per pack.
@@ -203,7 +204,7 @@ fn output_order_preserved_across_packs() {
     let chunks = resolve_chunks(&repo, &[id_a1, id_b1, id_a2]);
 
     let mut out = Vec::new();
-    repo.read_chunks_coalesced_into(&chunks, &mut out, None)
+    repo.read_chunks_coalesced_into(&chunks, &mut out, &CancelToken::new())
         .unwrap();
 
     let mut expected = Vec::new();
@@ -222,7 +223,7 @@ fn empty_input_is_noop() {
     log.reset_get_range_count();
 
     let mut out = Vec::new();
-    repo.read_chunks_coalesced_into(&[], &mut out, None)
+    repo.read_chunks_coalesced_into(&[], &mut out, &CancelToken::new())
         .unwrap();
 
     assert!(out.is_empty());
@@ -233,8 +234,12 @@ fn empty_input_is_noop() {
 fn load_item_stream_from_ptrs_reports_chunk_not_in_index() {
     let (mut repo, _log) = repo_on_counting_backend();
     let missing = ChunkId::from_bytes([0xEE; 32]);
-    let err =
-        crate::commands::list::load_item_stream_from_ptrs(&mut repo, &[missing], None).unwrap_err();
+    let err = crate::commands::list::load_item_stream_from_ptrs(
+        &mut repo,
+        &[missing],
+        &CancelToken::new(),
+    )
+    .unwrap_err();
     assert!(
         matches!(err, VykarError::ChunkNotInIndex(id) if id == missing),
         "got: {err}"
@@ -285,7 +290,7 @@ fn large_gap_splits_into_separate_reads() {
     log.reset_get_range_count();
 
     let mut out = Vec::new();
-    repo.read_chunks_coalesced_into(&chunks, &mut out, None)
+    repo.read_chunks_coalesced_into(&chunks, &mut out, &CancelToken::new())
         .unwrap();
 
     // Gap exceeds threshold — should be 2 separate get_range calls.
@@ -315,7 +320,7 @@ fn duplicate_chunk_ids_coalesce_into_single_range_read() {
     log.reset_get_range_count();
 
     let mut out = Vec::new();
-    repo.read_chunks_coalesced_into(&dup_chunks, &mut out, None)
+    repo.read_chunks_coalesced_into(&dup_chunks, &mut out, &CancelToken::new())
         .unwrap();
 
     // Duplicates sit at the same pack offset and coalesce into one range read.
@@ -345,7 +350,7 @@ fn duplicate_chunk_ids_coalesce_into_single_range_read() {
 /// the read loop polls between storage requests rather than only at entry.
 struct CancelOnFirstReadBackend {
     inner: MemoryBackend,
-    flag: Arc<AtomicBool>,
+    flag: CancelToken,
     reads: Arc<AtomicUsize>,
     width: usize,
 }
@@ -362,7 +367,7 @@ delegate_storage_backend! {
 
     fn get_range(&self, key: &str, offset: u64, length: u64) -> Result<Option<Vec<u8>>> {
         self.reads.fetch_add(1, Ordering::Relaxed);
-        self.flag.store(true, Ordering::Relaxed);
+        self.flag.cancel();
         self.inner.get_range(key, offset, length)
     }
 
@@ -382,16 +387,16 @@ fn repo_with_cancelling_backend(
     width: usize,
 ) -> (
     Repository,
-    Arc<AtomicBool>,
+    CancelToken,
     Arc<AtomicUsize>,
     Vec<vykar_types::chunk_id::ChunkId>,
 ) {
     init_test_environment();
-    let flag = Arc::new(AtomicBool::new(false));
+    let flag = CancelToken::new();
     let reads = Arc::new(AtomicUsize::new(0));
     let backend = CancelOnFirstReadBackend {
         inner: MemoryBackend::new(),
-        flag: Arc::clone(&flag),
+        flag: flag.clone(),
         reads: Arc::clone(&reads),
         width,
     };
@@ -438,11 +443,11 @@ fn coalesced_read_cancels_between_range_reads() {
         3,
         "expected one pack (and so one read group) per chunk"
     );
-    assert!(!flag.load(Ordering::Relaxed), "flag must start clear");
+    assert!(!flag.is_cancelled(), "flag must start clear");
 
     let mut out = Vec::new();
     let err = repo
-        .read_chunks_coalesced_into(&chunks, &mut out, Some(&flag))
+        .read_chunks_coalesced_into(&chunks, &mut out, &flag)
         .unwrap_err();
 
     assert!(
@@ -466,7 +471,7 @@ fn parallel_coalesced_read_cancels_within_one_read_per_worker() {
 
     let mut out = Vec::new();
     let err = repo
-        .read_chunks_coalesced_into(&chunks, &mut out, Some(&flag))
+        .read_chunks_coalesced_into(&chunks, &mut out, &flag)
         .unwrap_err();
 
     assert!(
@@ -485,11 +490,11 @@ fn pre_cancelled_coalesced_read_issues_no_request() {
     for width in [1, 4] {
         let (repo, flag, reads, ids) = repo_with_cancelling_backend(3, width);
         let chunks = resolve_chunks(&repo, &ids);
-        flag.store(true, Ordering::Relaxed);
+        flag.cancel();
 
         let mut out = Vec::new();
         let err = repo
-            .read_chunks_coalesced_into(&chunks, &mut out, Some(&flag))
+            .read_chunks_coalesced_into(&chunks, &mut out, &flag)
             .unwrap_err();
 
         assert!(
@@ -551,7 +556,7 @@ fn plaintext_coalesced_read_rejects_corrupt_blob() {
     let chunks = resolve_chunks(&repo, &ids);
     let mut out = Vec::new();
     let err = repo
-        .read_chunks_coalesced_into(&chunks, &mut out, None)
+        .read_chunks_coalesced_into(&chunks, &mut out, &CancelToken::new())
         .unwrap_err();
     assert!(
         matches!(&err, VykarError::InvalidFormat(m) if m.contains("hash mismatch")),
@@ -696,7 +701,7 @@ fn parallel_read_keeps_stream_order_when_later_groups_finish_first() {
 
     let chunks = resolve_chunks(&repo, &ids);
     let mut out = Vec::new();
-    repo.read_chunks_coalesced_into(&chunks, &mut out, None)
+    repo.read_chunks_coalesced_into(&chunks, &mut out, &CancelToken::new())
         .unwrap();
 
     assert_eq!(out, expected);
@@ -718,7 +723,7 @@ fn parallel_read_overlaps_range_reads_up_to_width() {
         probe.reset_counters();
 
         let mut out = Vec::new();
-        repo.read_chunks_coalesced_into(&chunks, &mut out, None)
+        repo.read_chunks_coalesced_into(&chunks, &mut out, &CancelToken::new())
             .unwrap();
 
         assert_eq!(out, expected, "width {width}");
@@ -756,7 +761,7 @@ fn parallel_read_returns_the_earliest_failing_group() {
         for attempt in 0..5 {
             let mut out = Vec::new();
             let err = repo
-                .read_chunks_coalesced_into(&chunks, &mut out, None)
+                .read_chunks_coalesced_into(&chunks, &mut out, &CancelToken::new())
                 .unwrap_err();
             assert!(
                 matches!(&err, VykarError::Other(m)
@@ -784,8 +789,12 @@ fn item_stream_bytes_identical_across_widths() {
 
         for width in [1, 2, 4, 16] {
             probe.width.store(width, Ordering::SeqCst);
-            let stream =
-                crate::commands::list::load_item_stream_from_ptrs(&mut repo, &ids, None).unwrap();
+            let stream = crate::commands::list::load_item_stream_from_ptrs(
+                &mut repo,
+                &ids,
+                &CancelToken::new(),
+            )
+            .unwrap();
             assert!(
                 stream == expected,
                 "{mode:?}, width {width}: stream differs"
@@ -812,7 +821,7 @@ fn duplicate_chunk_ids_decode_under_aead() {
         probe.width.store(width, Ordering::SeqCst);
         probe.reset_counters();
         let mut out = Vec::new();
-        repo.read_chunks_coalesced_into(&dup_chunks, &mut out, None)
+        repo.read_chunks_coalesced_into(&dup_chunks, &mut out, &CancelToken::new())
             .unwrap();
         assert_eq!(probe.reads.load(Ordering::SeqCst), 1, "width {width}");
         assert_eq!(out, expected, "width {width}");

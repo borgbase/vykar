@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::AtomicBool;
 
 use super::repair_apply::{execute_repair, probe_deletes_allowed};
 use super::repair_plan::build_repair_plan;
@@ -9,9 +8,9 @@ use super::types::{
     CheckError, CheckProgressEvent, CheckResult, IndexRecovery, IntegrityIssue, RepairMode,
     RepairPlan, RepairResult, ServerVerifyOutcome,
 };
-use crate::commands::util::check_interrupted;
 use crate::config::VykarConfig;
 use crate::index::{ChunkIndex, ChunkIndexEntry};
+use crate::repo::control::CancelToken;
 use crate::repo::{OpenOptions, Repository};
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
@@ -117,7 +116,7 @@ pub fn run(
         None,
         100,
         false,
-        None,
+        &CancelToken::new(),
     )
 }
 
@@ -135,12 +134,12 @@ pub fn run_with_progress(
     progress: Option<&mut dyn FnMut(CheckProgressEvent)>,
     max_percent: u8,
     record_state: bool,
-    shutdown: Option<&AtomicBool>,
+    shutdown: &CancelToken,
 ) -> Result<CheckResult> {
     // Entry guard: on an empty repository every loop below runs zero
     // iterations, so without this a pre-set flag would return a clean `Ok` and
     // record success for work that never ran.
-    check_interrupted(shutdown)?;
+    shutdown.check()?;
 
     // Pre-open early exit: if max_percent=0 and no full_every configured,
     // skip without opening the repo at all.
@@ -175,7 +174,7 @@ pub(crate) fn run_on_repo(
     mut progress: Option<&mut dyn FnMut(CheckProgressEvent)>,
     max_percent: u8,
     record_state: bool,
-    shutdown: Option<&AtomicBool>,
+    shutdown: &CancelToken,
 ) -> Result<CheckResult> {
     let cache_dir = config.cache_dir.as_deref().map(std::path::Path::new);
     let full_every_dur = config.check.full_every_duration();
@@ -237,7 +236,7 @@ pub(crate) fn run_on_repo(
     };
     // `try_server_verify` returns an outcome rather than a `Result`, so a
     // cancellation mid-batch needs raising explicitly here.
-    check_interrupted(shutdown)?;
+    shutdown.check()?;
 
     let (verified_packs, srv_packs_responded, srv_chunks_verified, srv_errors) =
         match server_outcome {
@@ -306,7 +305,7 @@ pub(crate) fn run_on_repo(
     // vec, so an extra `&&` term here would still return `Ok(partial_result)` —
     // which the cycle orchestrator maps to `StepOutcome::Ok` and the CLI prints
     // as a completed summary. Cancellation must be an error, not a short `Ok`.
-    check_interrupted(shutdown)?;
+    shutdown.check()?;
 
     // Record full check timestamp if this was a 100% run and succeeded.
     if record_state && effective == 100 && result.errors.is_empty() {
@@ -411,9 +410,9 @@ pub fn run_with_repair(
     verify_data: bool,
     mode: RepairMode,
     progress: Option<&mut dyn FnMut(CheckProgressEvent)>,
-    shutdown: Option<&AtomicBool>,
+    shutdown: &CancelToken,
 ) -> Result<RepairResult> {
-    check_interrupted(shutdown)?;
+    shutdown.check()?;
 
     let opts = repair_open_options(mode);
     if mode == RepairMode::PlanOnly {
@@ -450,7 +449,7 @@ pub(crate) fn run_with_repair_on_repo(
     verify_data: bool,
     mode: RepairMode,
     mut progress: Option<&mut dyn FnMut(CheckProgressEvent)>,
-    shutdown: Option<&AtomicBool>,
+    shutdown: &CancelToken,
 ) -> Result<RepairResult> {
     let scan_opts = ScanOptions {
         collect_chunk_refs: true,
@@ -475,7 +474,7 @@ pub(crate) fn run_with_repair_on_repo(
         // PlanOnly is cancellable end to end, and `plan_repair` is unguarded
         // CPU work over the scan; without this the CLI would print a plan built
         // from a cancelled run as though it were complete.
-        check_interrupted(shutdown)?;
+        shutdown.check()?;
 
         Ok(RepairResult {
             check_result: scan.into(),
@@ -517,7 +516,7 @@ pub(crate) fn run_with_repair_on_repo(
             // no resumable mid-state, so it and the read path beneath it
             // (`repair_apply`) deliberately do not poll the flag. This is the
             // last point at which aborting is free.
-            check_interrupted(shutdown)?;
+            shutdown.check()?;
 
             // Execute the repair
             let (applied, repair_errors) = execute_repair(repo, &plan, &scan.issues, &pack_chunks)?;

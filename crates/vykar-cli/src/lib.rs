@@ -513,7 +513,7 @@ fn run_hooked(
 fn run_repo_command(cli: &Cli, repo: &ResolvedRepo) -> CliResult<bool> {
     warn_if_untrusted_rest(&repo.config, repo.label.as_deref());
 
-    let shutdown = Some(&signal::SHUTDOWN as &std::sync::atomic::AtomicBool);
+    let shutdown = signal::shutdown_token();
     let result = match &cli.command {
         Some(cmd) => {
             if matches!(cmd, Commands::Backup { .. }) {

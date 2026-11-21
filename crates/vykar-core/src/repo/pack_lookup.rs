@@ -17,6 +17,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, PoisonError};
 
+use super::control::CancelToken;
 use tracing::debug;
 use vykar_storage::StorageBackend;
 use vykar_types::error::{Result, VykarError};
@@ -189,9 +190,11 @@ fn fan_out<T: Sync>(
                 if task(t) { Ok(()) } else { Err(()) }
             });
         }
-        OnFailure::Continue => super::bounded::for_each_bounded(width, items, None, |t| {
-            task(t);
-        }),
+        OnFailure::Continue => {
+            super::bounded::for_each_bounded(width, items, &CancelToken::new(), |t| {
+                task(t);
+            })
+        }
     }
 }
 

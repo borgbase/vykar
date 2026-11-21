@@ -18,6 +18,7 @@ use vykar_core::config::{
     EncryptionConfig, EncryptionModeConfig, RepositoryConfig, SourceEntry, SourceHooksConfig,
     VykarConfig,
 };
+use vykar_core::repo::control::CancelToken;
 use vykar_core::repo::{OpenOptions, Repository};
 use vykar_core::snapshot::SnapshotStats;
 use vykar_storage::local_backend::LocalBackend;
@@ -250,10 +251,12 @@ pub fn exercise_pack_naming(
         xattrs,
     );
 
-    let deleted = commands::delete::run(config, passphrase, &["pn-a"], false, None).unwrap();
+    let deleted =
+        commands::delete::run(config, passphrase, &["pn-a"], false, &CancelToken::new()).unwrap();
     assert!(deleted.warnings.is_empty(), "{:?}", deleted.warnings);
 
-    let compact = commands::compact::run(config, passphrase, 0.0, None, false, None).unwrap();
+    let compact =
+        commands::compact::run(config, passphrase, 0.0, None, false, &CancelToken::new()).unwrap();
     assert!(
         compact.packs_repacked > 0,
         "compaction repacked nothing, so repack pack names went unchecked: {compact:?}"
@@ -269,7 +272,7 @@ pub fn exercise_pack_naming(
         None,
         xattrs,
         true,
-        None,
+        &CancelToken::new(),
     )
     .unwrap();
     assert_eq!(std::fs::read(dest.join("pn-keep.bin")).unwrap(), keep);

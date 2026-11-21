@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use crate::commands;
 use crate::commands::check::{RepairAction, RepairMode, RepairResult};
 use crate::config::VykarConfig;
+use crate::repo::control::CancelToken;
 use crate::snapshot::item::ItemType;
 use vykar_protocol::PACK_HEADER_SIZE;
 
@@ -18,13 +19,27 @@ fn has_action(actions: &[RepairAction], pred: impl Fn(&RepairAction) -> bool) ->
 }
 
 fn plan_only(config: &VykarConfig, verify_data: bool) -> RepairResult {
-    commands::check::run_with_repair(config, None, verify_data, RepairMode::PlanOnly, None, None)
-        .unwrap()
+    commands::check::run_with_repair(
+        config,
+        None,
+        verify_data,
+        RepairMode::PlanOnly,
+        None,
+        &CancelToken::new(),
+    )
+    .unwrap()
 }
 
 fn apply_repair(config: &VykarConfig, verify_data: bool) -> RepairResult {
-    commands::check::run_with_repair(config, None, verify_data, RepairMode::Apply, None, None)
-        .unwrap()
+    commands::check::run_with_repair(
+        config,
+        None,
+        verify_data,
+        RepairMode::Apply,
+        None,
+        &CancelToken::new(),
+    )
+    .unwrap()
 }
 
 fn assert_clean_after_repair(config: &VykarConfig) {
@@ -577,7 +592,8 @@ fn refcount_rebuild_excludes_doomed_snapshots() {
     // Also collect file chunks from item stream
     {
         let items_stream =
-            commands::list::load_snapshot_item_stream(&mut repo, "snap-A", None).unwrap();
+            commands::list::load_snapshot_item_stream(&mut repo, "snap-A", &CancelToken::new())
+                .unwrap();
         commands::list::for_each_decoded_item(&items_stream, |item| {
             if item.entry_type == ItemType::RegularFile {
                 for chunk_ref in &item.chunks {
@@ -605,7 +621,8 @@ fn refcount_rebuild_excludes_doomed_snapshots() {
     }
     {
         let items_stream =
-            commands::list::load_snapshot_item_stream(&mut repo, "snap-B", None).unwrap();
+            commands::list::load_snapshot_item_stream(&mut repo, "snap-B", &CancelToken::new())
+                .unwrap();
         commands::list::for_each_decoded_item(&items_stream, |item| {
             if item.entry_type == ItemType::RegularFile {
                 for chunk_ref in &item.chunks {
@@ -771,8 +788,15 @@ fn apply_refuses_with_active_sessions() {
     .unwrap();
 
     // Apply should fail with ActiveSessions
-    let err = commands::check::run_with_repair(&config, None, false, RepairMode::Apply, None, None)
-        .unwrap_err();
+    let err = commands::check::run_with_repair(
+        &config,
+        None,
+        false,
+        RepairMode::Apply,
+        None,
+        &CancelToken::new(),
+    )
+    .unwrap_err();
 
     assert!(
         matches!(err, vykar_types::error::VykarError::ActiveSessions(_)),
@@ -922,7 +946,7 @@ fn repair_reclaims_crash_orphan_index_entries() {
         None,
         false,
         false,
-        None,
+        &CancelToken::new(),
     )
     .unwrap();
     let restored =

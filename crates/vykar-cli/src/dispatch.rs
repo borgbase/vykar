@@ -1,10 +1,10 @@
 use std::io::IsTerminal;
-use std::sync::atomic::AtomicBool;
 
 use crate::progress::BackupProgressRenderer;
 use vykar_core::app::operations::{self, CycleEvent, CycleStep, FullCycleResult, StepOutcome};
 use vykar_core::app::preflight::{self, Availability, UnavailableRepo};
 use vykar_core::config::{EncryptionModeConfig, ResolvedRepo, VykarConfig};
+use vykar_core::repo::control::CancelToken;
 use vykar_storage::{ParsedUrl, parse_repo_url};
 
 use crate::cli::{Commands, KeyCommand};
@@ -50,7 +50,7 @@ pub(crate) struct CycleOutcome {
 
 pub(crate) fn run_default_actions(
     repo: &ResolvedRepo,
-    shutdown: Option<&AtomicBool>,
+    shutdown: &CancelToken,
     verbose: u8,
     source_filter: &[String],
     unavailable: UnavailableRepo,
@@ -226,7 +226,7 @@ fn print_summary(steps: &[(CycleStep, StepOutcome)], start: std::time::Instant) 
 pub(crate) fn dispatch_command(
     command: &Commands,
     repo: &ResolvedRepo,
-    shutdown: Option<&AtomicBool>,
+    shutdown: &CancelToken,
     verbose: u8,
 ) -> CliResult<bool> {
     let cfg = &repo.config;

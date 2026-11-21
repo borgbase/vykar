@@ -1,5 +1,6 @@
 use crate::commands::compact::compact_repo;
 use crate::compress::Compression;
+use crate::repo::control::CancelToken;
 use crate::repo::pack::PackType;
 use crate::testutil::test_repo_plaintext;
 
@@ -35,7 +36,7 @@ fn compact_clean_repo_no_repacking() {
     // Store chunks — all live, no dead blobs
     store_two_chunks(&mut repo);
 
-    let stats = compact_repo(&mut repo, 10.0, None, false, 4, None).unwrap();
+    let stats = compact_repo(&mut repo, 10.0, None, false, 4, &CancelToken::new()).unwrap();
     assert_eq!(stats.packs_repacked, 0);
     assert_eq!(stats.packs_deleted_empty, 0);
     assert_eq!(stats.space_freed, 0);
@@ -51,7 +52,7 @@ fn compact_after_delete_repacks() {
     repo.save_state().unwrap();
 
     // Compact should detect the dead blob and repack
-    let stats = compact_repo(&mut repo, 1.0, None, false, 4, None).unwrap();
+    let stats = compact_repo(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
 
     // Should have repacked (or deleted) at least one pack
     assert!(
@@ -85,7 +86,7 @@ fn compact_threshold_filters() {
     repo.save_state().unwrap();
 
     // With a very high threshold (90%), nothing should be repacked
-    let stats = compact_repo(&mut repo, 90.0, None, false, 4, None).unwrap();
+    let stats = compact_repo(&mut repo, 90.0, None, false, 4, &CancelToken::new()).unwrap();
     assert_eq!(stats.packs_repacked, 0);
     assert_eq!(stats.packs_deleted_empty, 0);
 }
@@ -102,7 +103,7 @@ fn compact_dry_run_does_not_modify() {
     // Count packs before
     let packs_before = count_all_packs(&repo);
 
-    let stats = compact_repo(&mut repo, 1.0, None, true, 4, None).unwrap();
+    let stats = compact_repo(&mut repo, 1.0, None, true, 4, &CancelToken::new()).unwrap();
 
     // Dry run should report activity
     assert!(stats.packs_repacked > 0 || stats.packs_deleted_empty > 0 || stats.space_freed > 0);
@@ -135,7 +136,7 @@ fn compact_empty_pack_deleted() {
     repo.chunk_index_mut().decrement(&id_a);
     repo.save_state().unwrap();
 
-    let stats = compact_repo(&mut repo, 1.0, None, false, 4, None).unwrap();
+    let stats = compact_repo(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
 
     assert_eq!(stats.packs_deleted_empty, 1);
     assert_eq!(stats.packs_repacked, 0);
@@ -235,7 +236,7 @@ fn compact_sizes_packs_from_the_listing() {
             assert!(packs >= 2, "packs {packs}");
 
             log.reset_metadata_counts();
-            let stats = compact_repo(&mut repo, 10.0, None, dead, 4, None).unwrap();
+            let stats = compact_repo(&mut repo, 10.0, None, dead, 4, &CancelToken::new()).unwrap();
             let ctx = format!("{listing:?} dead={dead}");
             let (tree_lists, sized_lists, sizes) = match listing {
                 Listing::Plain => (0, 256, packs),
@@ -283,7 +284,7 @@ fn compact_tree_listing_ignores_keys_outside_shards() {
             .put(&stray, &[0u8; vykar_protocol::PACK_HEADER_SIZE + 64])
             .unwrap();
 
-        let stats = compact_repo(&mut repo, 0.0, None, false, 4, None).unwrap();
+        let stats = compact_repo(&mut repo, 0.0, None, false, 4, &CancelToken::new()).unwrap();
         assert!(repo.storage.exists(&stray).unwrap(), "{listing:?}");
         runs.push((stats.packs_total, stats.packs_orphan));
     }
@@ -291,6 +292,7 @@ fn compact_tree_listing_ignores_keys_outside_shards() {
 }
 
 mod server_side {
+    use crate::repo::control::CancelToken;
     use std::sync::{Arc, Mutex};
 
     use super::store_two_chunks;
@@ -512,7 +514,7 @@ mod server_side {
         let (id_b, partial, empty) = setup_dead_packs(&mut repo);
         log.events.lock().unwrap().clear();
 
-        let stats = compact_repo(&mut repo, 1.0, None, false, 4, None).unwrap();
+        let stats = compact_repo(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
 
         let plans = log.plans.lock().unwrap().clone();
         assert!(!plans.is_empty());
@@ -553,7 +555,7 @@ mod server_side {
         let (id_b, partial, empty) = setup_dead_packs(&mut repo);
         log.events.lock().unwrap().clear();
 
-        compact_repo(&mut repo, 1.0, None, false, 4, None).unwrap();
+        compact_repo(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
 
         let events = log.events();
         assert!(!events.contains(&format!("delete {partial}")), "{events:?}");
@@ -572,7 +574,7 @@ mod server_side {
         let (id_b, partial, empty) = setup_dead_packs(&mut repo);
         log.events.lock().unwrap().clear();
 
-        assert!(compact_repo(&mut repo, 1.0, None, false, 4, None).is_err());
+        assert!(compact_repo(&mut repo, 1.0, None, false, 4, &CancelToken::new()).is_err());
 
         let events = log.events();
         assert!(
@@ -591,7 +593,7 @@ mod server_side {
     fn delete_stats(mode: Mode, batch: bool) -> (u64, u64, u64) {
         let (mut repo, _log) = server_repo(mode, batch, RepoFormat::V5);
         setup_dead_packs(&mut repo);
-        let stats = compact_repo(&mut repo, 1.0, None, false, 4, None).unwrap();
+        let stats = compact_repo(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
         (
             stats.packs_repacked,
             stats.packs_deleted_empty,
@@ -612,7 +614,7 @@ mod server_side {
         let (id_b, partial, empty) = setup_dead_packs(&mut repo);
         log.events.lock().unwrap().clear();
 
-        let stats = compact_repo(&mut repo, 1.0, None, false, 4, None).unwrap();
+        let stats = compact_repo(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
 
         let events = log.events();
         let batches = batch_events(&events);
@@ -652,7 +654,7 @@ mod server_side {
         let (_id_b, partial, empty) = setup_dead_packs(&mut repo);
         log.events.lock().unwrap().clear();
 
-        compact_repo(&mut repo, 1.0, None, false, 4, None).unwrap();
+        compact_repo(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
 
         let events = log.events();
         let batches = batch_events(&events);
@@ -668,7 +670,7 @@ mod server_side {
         let (_id_b, partial, empty) = setup_dead_packs(&mut repo);
         log.events.lock().unwrap().clear();
 
-        let stats = compact_repo(&mut repo, 1.0, None, false, 4, None).unwrap();
+        let stats = compact_repo(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
 
         let events = log.events();
         let pos = |e: &str| {
@@ -757,7 +759,7 @@ mod server_side {
             let (id_b, partial, empty) = setup_dead_packs(&mut repo);
             log.events.lock().unwrap().clear();
 
-            compact_repo(&mut repo, 1.0, None, false, 4, None).unwrap();
+            compact_repo(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
 
             let events = log.events();
             let first_delete = events
@@ -796,7 +798,8 @@ mod server_side {
             let (id_b, partial, _empty) = setup_dead_packs(&mut repo);
             log.events.lock().unwrap().clear();
 
-            let err = compact_repo(&mut repo, 1.0, None, false, 4, None).unwrap_err();
+            let err =
+                compact_repo(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap_err();
             assert!(err.to_string().contains("append-only"), "{err}");
             // The batch route reports the per-pack error, not its own wrapper.
             assert!(!err.to_string().contains("batch-delete"), "{err}");
@@ -836,7 +839,7 @@ mod server_side {
         repo.set_fold_policy(policy);
         log.events.lock().unwrap().clear();
 
-        compact_repo(&mut repo, 1.0, None, false, 4, None).unwrap();
+        compact_repo(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
 
         let events = log.events();
         let head = repo.index_head().unwrap().clone();
@@ -906,7 +909,7 @@ fn compact_sweeps_temp_files_once_and_never_on_dry_run() {
         });
         repo.storage = recorder.clone();
 
-        let stats = compact_repo(&mut repo, 10.0, None, dry_run, 4, None).unwrap();
+        let stats = compact_repo(&mut repo, 10.0, None, dry_run, 4, &CancelToken::new()).unwrap();
         let calls = recorder.calls.lock().unwrap().clone();
         if dry_run {
             assert!(calls.is_empty(), "dry run must not sweep");
@@ -955,8 +958,9 @@ fn compact_honours_shutdown_during_analysis() {
     let packs_before = count_all_packs(&repo);
     assert!(packs_before > 0);
 
-    let shutdown = std::sync::atomic::AtomicBool::new(true);
-    let err = compact_repo(&mut repo, 1.0, None, false, 4, Some(&shutdown)).unwrap_err();
+    let shutdown = CancelToken::new();
+    shutdown.cancel();
+    let err = compact_repo(&mut repo, 1.0, None, false, 4, &shutdown).unwrap_err();
     assert!(
         matches!(err, vykar_types::error::VykarError::Interrupted),
         "{err:?}"

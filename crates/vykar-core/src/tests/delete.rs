@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use crate::commands;
 use crate::commands::snapshot_ops;
 use crate::index::{ChunkIndex, ChunkIndexEntry};
+use crate::repo::control::CancelToken;
 use crate::repo::{OpenOptions, Repository};
 use vykar_storage::local_backend::LocalBackend;
 use vykar_types::chunk_id::ChunkId;
@@ -19,7 +20,13 @@ fn delete_missing_snapshot_returns_snapshot_not_found() {
     std::fs::create_dir_all(&repo_dir).unwrap();
     let config = init_repo(&repo_dir);
 
-    let result = commands::delete::run(&config, None, &["does-not-exist"], false, None);
+    let result = commands::delete::run(
+        &config,
+        None,
+        &["does-not-exist"],
+        false,
+        &CancelToken::new(),
+    );
     assert!(matches!(result, Err(VykarError::SnapshotNotFound(name)) if name == "does-not-exist"));
 }
 
@@ -40,7 +47,14 @@ fn delete_dry_run_reports_impact_without_mutation() {
     let chunks_before = before.chunk_index().len();
     drop(before);
 
-    let result = commands::delete::run(&config, None, &["snap-delete-dry"], true, None).unwrap();
+    let result = commands::delete::run(
+        &config,
+        None,
+        &["snap-delete-dry"],
+        true,
+        &CancelToken::new(),
+    )
+    .unwrap();
     assert_eq!(result.stats.len(), 1);
     assert!(result.warnings.is_empty());
     let stats = &result.stats[0];
@@ -76,7 +90,14 @@ fn delete_snapshot_removes_manifest_entry_and_chunk_refs() {
     assert!(chunks_before > 0);
     drop(before);
 
-    let result = commands::delete::run(&config, None, &["snap-delete-live"], false, None).unwrap();
+    let result = commands::delete::run(
+        &config,
+        None,
+        &["snap-delete-live"],
+        false,
+        &CancelToken::new(),
+    )
+    .unwrap();
     assert_eq!(result.stats.len(), 1);
     assert!(result.warnings.is_empty());
     let stats = &result.stats[0];
@@ -106,7 +127,14 @@ fn delete_persists_snapshot_cache_immediately() {
     let before = load_snapshot_cache_from_disk(&repo_dir);
     assert!(before.entries.values().any(|e| e.name == "snap-cache-del"));
 
-    commands::delete::run(&config, None, &["snap-cache-del"], false, None).unwrap();
+    commands::delete::run(
+        &config,
+        None,
+        &["snap-cache-del"],
+        false,
+        &CancelToken::new(),
+    )
+    .unwrap();
 
     // The on-disk cache reflects the deletion immediately — without a reopen
     // that would run refresh_snapshot_cache's remote-list retain.
@@ -142,7 +170,14 @@ fn delete_multiple_snapshots_in_single_call() {
     drop(before);
 
     // Delete first two in one call.
-    let result = commands::delete::run(&config, None, &["snap-1", "snap-2"], false, None).unwrap();
+    let result = commands::delete::run(
+        &config,
+        None,
+        &["snap-1", "snap-2"],
+        false,
+        &CancelToken::new(),
+    )
+    .unwrap();
     assert_eq!(result.stats.len(), 2);
     assert!(result.warnings.is_empty());
     assert_eq!(result.stats[0].snapshot_name, "snap-1");
@@ -166,7 +201,7 @@ fn delete_multiple_snapshots_in_single_call() {
         None,
         false,
         false,
-        None,
+        &CancelToken::new(),
     )
     .unwrap();
     assert_eq!(
@@ -196,7 +231,13 @@ fn delete_fails_fast_if_any_snapshot_missing() {
     backup_single_source(&config, &source_dir, "src", "snap-exists");
 
     // Request deletion of existing + nonexistent — should fail before any mutation.
-    let result = commands::delete::run(&config, None, &["snap-exists", "nonexistent"], false, None);
+    let result = commands::delete::run(
+        &config,
+        None,
+        &["snap-exists", "nonexistent"],
+        false,
+        &CancelToken::new(),
+    );
     assert!(matches!(&result, Err(VykarError::SnapshotNotFound(name)) if name == "nonexistent"));
 
     // Existing snapshot must still be present.
@@ -221,8 +262,14 @@ fn delete_deduplicates_snapshot_names() {
     drop(before);
 
     // Pass the same name twice — should succeed (deduped to one delete).
-    let result =
-        commands::delete::run(&config, None, &["snap-dup", "snap-dup"], false, None).unwrap();
+    let result = commands::delete::run(
+        &config,
+        None,
+        &["snap-dup", "snap-dup"],
+        false,
+        &CancelToken::new(),
+    )
+    .unwrap();
     assert_eq!(result.stats.len(), 1);
     assert!(result.warnings.is_empty());
     assert_eq!(result.stats[0].snapshot_name, "snap-dup");
@@ -253,16 +300,28 @@ fn delete_dry_run_accounts_for_shared_chunks() {
     // Dry-run: delete both. The shared chunks should be counted as freed
     // (they appear in the second snapshot's stats after the first "removed"
     // them from refcount=2 to refcount=1 in the scratch index).
-    let dry_result =
-        commands::delete::run(&config, None, &["snap-a", "snap-b"], true, None).unwrap();
+    let dry_result = commands::delete::run(
+        &config,
+        None,
+        &["snap-a", "snap-b"],
+        true,
+        &CancelToken::new(),
+    )
+    .unwrap();
     assert_eq!(dry_result.stats.len(), 2);
 
     let dry_total_freed: u64 = dry_result.stats.iter().map(|s| s.space_freed).sum();
     let dry_total_chunks: u64 = dry_result.stats.iter().map(|s| s.chunks_deleted).sum();
 
     // Now actually delete both and compare.
-    let real_result =
-        commands::delete::run(&config, None, &["snap-a", "snap-b"], false, None).unwrap();
+    let real_result = commands::delete::run(
+        &config,
+        None,
+        &["snap-a", "snap-b"],
+        false,
+        &CancelToken::new(),
+    )
+    .unwrap();
     let real_total_freed: u64 = real_result.stats.iter().map(|s| s.space_freed).sum();
     let real_total_chunks: u64 = real_result.stats.iter().map(|s| s.chunks_deleted).sum();
 
@@ -300,7 +359,7 @@ fn delete_phase3_refcount_failure_returns_warning_not_error() {
         }
     }
 
-    let result = commands::delete::run(&config, None, &["snap-fail"], false, None)
+    let result = commands::delete::run(&config, None, &["snap-fail"], false, &CancelToken::new())
         .expect("delete must not fail after the commit point — Phase 3 errors become warnings");
 
     // Phase 2 succeeded (blob is gone), Phase 3 failed (no stats collected).
@@ -357,8 +416,9 @@ fn delete_single_snapshot_handles_empty_stats() {
         }
     }
 
-    let result = commands::delete::run(&config, None, &["snap-wrapper"], false, None)
-        .expect("delete must not fail after commit point");
+    let result =
+        commands::delete::run(&config, None, &["snap-wrapper"], false, &CancelToken::new())
+            .expect("delete must not fail after commit point");
     assert!(result.stats.is_empty());
     assert_eq!(result.warnings.len(), 1);
     assert!(result.warnings[0].contains("snap-wrapper"));
@@ -421,7 +481,9 @@ fn delete_with_parallel_tree_reads_matches_sequential_refcounts() {
         "snap2's item stream must span several packs to take the parallel path, got {}",
         packs.len()
     );
-    let stream = commands::list::load_snapshot_item_stream(&mut sequential, "snap2", None).unwrap();
+    let stream =
+        commands::list::load_snapshot_item_stream(&mut sequential, "snap2", &CancelToken::new())
+            .unwrap();
     let mut expected = sequential.chunk_index().clone();
     let impact =
         snapshot_ops::decrement_chunk_refs_on_index(&mut expected, &stream, &item_ptrs).unwrap();
@@ -430,14 +492,16 @@ fn delete_with_parallel_tree_reads_matches_sequential_refcounts() {
     let mut parallel = open_with(4);
     assert_eq!(parallel.storage.profile().request_width, 4);
     let parallel_stream =
-        commands::list::load_snapshot_item_stream(&mut parallel, "snap2", None).unwrap();
+        commands::list::load_snapshot_item_stream(&mut parallel, "snap2", &CancelToken::new())
+            .unwrap();
     assert!(
         parallel_stream == stream,
         "parallel and sequential item streams differ"
     );
     drop(parallel);
 
-    let result = commands::delete::run(&config, None, &["snap2"], false, None).unwrap();
+    let result =
+        commands::delete::run(&config, None, &["snap2"], false, &CancelToken::new()).unwrap();
     assert!(result.warnings.is_empty(), "{:?}", result.warnings);
     assert_eq!(result.stats.len(), 1);
     assert_eq!(result.stats[0].chunks_deleted, impact.chunks_deleted);

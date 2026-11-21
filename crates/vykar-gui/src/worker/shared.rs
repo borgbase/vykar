@@ -4,8 +4,10 @@ use crossbeam_channel::Sender;
 use vykar_core::app::operations;
 use vykar_core::commands::backup::BackupProgressEvent;
 use vykar_core::config::{self, ResolvedRepo, SourceEntry};
+use vykar_core::repo::control::CancelToken;
 use vykar_types::error::{Result, VykarError};
 
+use crate::cancel::CancelSlot;
 use crate::messages::UiEvent;
 use crate::progress::BackupStatusTracker;
 use crate::repo_helpers::{PassphraseRun, send_log, with_passphrase_retry};
@@ -37,11 +39,11 @@ impl<'a> OpGuard<'a> {
     /// Begin a UI (read/maintenance) operation.
     pub(super) fn ui(
         ui_tx: &'a Sender<UiEvent>,
-        cancel_requested: &AtomicBool,
+        cancel_requested: &CancelSlot,
         operation_running: &'a AtomicBool,
         status_msg: impl Into<String>,
     ) -> Self {
-        cancel_requested.store(false, Ordering::SeqCst);
+        cancel_requested.renew();
         operation_running.store(true, Ordering::SeqCst);
         let _ = ui_tx.send(UiEvent::OperationStarted);
         let _ = ui_tx.send(UiEvent::Status(status_msg.into()));
@@ -58,13 +60,13 @@ impl<'a> OpGuard<'a> {
     /// the scheduler).
     pub(super) fn backup(
         ui_tx: &'a Sender<UiEvent>,
-        cancel_requested: &AtomicBool,
+        cancel_requested: &CancelSlot,
         operation_running: &'a AtomicBool,
         backup_running: &'a AtomicBool,
         sched_notify_tx: &'a Sender<()>,
         status_msg: impl Into<String>,
     ) -> Self {
-        cancel_requested.store(false, Ordering::SeqCst);
+        cancel_requested.renew();
         operation_running.store(true, Ordering::SeqCst);
         backup_running.store(true, Ordering::SeqCst);
         let _ = ui_tx.send(UiEvent::OperationStarted);
@@ -159,7 +161,7 @@ const PASSPHRASE_CANCELLED: &str = "passphrase prompt canceled; skipping.";
 /// have to push a result event (diff); handlers with nothing to report simply
 /// drop it.
 ///
-/// `run` receives the cancel flag rather than reading it off the context: the
+/// `run` receives the cancel token rather than reading it off the context: the
 /// context is mutably borrowed here for the passphrase cache, so a closure
 /// capturing `ctx` would not borrow-check.
 ///
@@ -171,7 +173,7 @@ pub(super) fn with_repo_op<T>(
     repo_name: &str,
     status: impl Into<String>,
     label: &str,
-    mut run: impl FnMut(&ResolvedRepo, Option<&str>, &AtomicBool) -> Result<T>,
+    mut run: impl FnMut(&ResolvedRepo, Option<&str>, &CancelToken) -> Result<T>,
 ) -> std::result::Result<T, String> {
     let mut guard = OpGuard::ui(
         &ctx.ui_tx,
@@ -184,9 +186,9 @@ pub(super) fn with_repo_op<T>(
         return Err("repository not found".to_string());
     };
 
-    let cancel = &ctx.cancel_requested;
+    let cancel = ctx.cancel_requested.current();
     let outcome = with_passphrase_retry(repo, &mut ctx.passphrases, 3, |pass| {
-        run(repo, pass, cancel)
+        run(repo, pass, &cancel)
     });
 
     match outcome {
@@ -213,7 +215,7 @@ pub(super) fn with_hooked_repo_op<T>(
     repo_name: &str,
     status: impl Into<String>,
     command: &'static str,
-    mut run: impl FnMut(&ResolvedRepo, Option<&str>, &AtomicBool) -> Result<T>,
+    mut run: impl FnMut(&ResolvedRepo, Option<&str>, &CancelToken) -> Result<T>,
 ) -> std::result::Result<T, String> {
     let mut guard = OpGuard::ui(
         &ctx.ui_tx,
@@ -227,14 +229,14 @@ pub(super) fn with_hooked_repo_op<T>(
     };
 
     let ui_tx = &ctx.ui_tx;
-    let cancel = &ctx.cancel_requested;
+    let cancel = ctx.cancel_requested.current();
     let passphrases = &mut ctx.passphrases;
     let mut canceled = false;
     let outcome = operations::run_command_with_hook_warnings(
         repo,
         command,
         &mut |w| send_log(ui_tx, format!("[{repo_name}] hook warning: {w}")),
-        || match with_passphrase_retry(repo, passphrases, 3, |pass| run(repo, pass, cancel))? {
+        || match with_passphrase_retry(repo, passphrases, 3, |pass| run(repo, pass, &cancel))? {
             PassphraseRun::Ran(value) => Ok(value),
             // A skip, so `finally` hooks run but `after` hooks do not.
             PassphraseRun::Canceled => {
@@ -263,7 +265,7 @@ pub(super) fn with_hooked_repo_op<T>(
 
 pub(super) fn run_selection_with_progress(
     ui_tx: &Sender<UiEvent>,
-    cancel_requested: &AtomicBool,
+    cancel_requested: &CancelToken,
     repo: &ResolvedRepo,
     sources: &[SourceEntry],
     passphrase: Option<&str>,
@@ -275,7 +277,7 @@ pub(super) fn run_selection_with_progress(
         repo,
         sources,
         passphrase,
-        Some(cancel_requested),
+        cancel_requested,
         false,
         Some(&mut |evt| match evt {
             operations::BackupRunEvent::Backup(BackupProgressEvent::Warning { message }) => {
@@ -317,12 +319,13 @@ mod tests {
     #[test]
     fn ui_guard_emits_started_then_finished_on_drop() {
         let (tx, rx) = crossbeam_channel::unbounded();
-        let cancel = AtomicBool::new(true);
+        let cancel = CancelSlot::default();
+        cancel.cancel();
         let op_running = AtomicBool::new(false);
         {
             let _g = OpGuard::ui(&tx, &cancel, &op_running, "Working...");
-            // cancel flag reset, operation flag set at construction.
-            assert!(!cancel.load(Ordering::SeqCst));
+            // fresh cancel token installed, operation flag set at construction.
+            assert!(!cancel.is_cancelled());
             assert!(op_running.load(Ordering::SeqCst));
             let started = drain(&rx);
             assert!(
@@ -340,7 +343,7 @@ mod tests {
     fn ui_guard_pairs_started_finished_on_early_return() {
         // Simulates an early return: guard is created then dropped immediately.
         let (tx, rx) = crossbeam_channel::unbounded();
-        let cancel = AtomicBool::new(false);
+        let cancel = CancelSlot::default();
         let op_running = AtomicBool::new(false);
         drop(OpGuard::ui(&tx, &cancel, &op_running, "Deleting..."));
         let events = drain(&rx);
@@ -358,7 +361,7 @@ mod tests {
     #[test]
     fn failed_guard_emits_error_status_instead_of_idle() {
         let (tx, rx) = crossbeam_channel::unbounded();
-        let cancel = AtomicBool::new(false);
+        let cancel = CancelSlot::default();
         let op_running = AtomicBool::new(false);
         {
             let mut g = OpGuard::ui(&tx, &cancel, &op_running, "Restoring...");
@@ -377,7 +380,7 @@ mod tests {
     #[test]
     fn select_repo_or_fail_logs_the_miss_once() {
         let (tx, rx) = crossbeam_channel::unbounded();
-        let cancel = AtomicBool::new(false);
+        let cancel = CancelSlot::default();
         let op_running = AtomicBool::new(false);
         {
             let mut g = OpGuard::ui(&tx, &cancel, &op_running, "Deleting...");
@@ -403,7 +406,7 @@ mod tests {
     fn backup_guard_toggles_running_and_notifies_scheduler() {
         let (tx, rx) = crossbeam_channel::unbounded();
         let (sched_tx, sched_rx) = crossbeam_channel::bounded(1);
-        let cancel = AtomicBool::new(false);
+        let cancel = CancelSlot::default();
         let op_running = AtomicBool::new(false);
         let running = AtomicBool::new(false);
         {

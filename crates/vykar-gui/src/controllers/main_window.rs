@@ -1,9 +1,7 @@
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-
 use crossbeam_channel::Sender;
 use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 
+use crate::cancel::CancelSlot;
 use crate::controllers;
 use crate::messages::{AppCommand, UiEvent};
 use crate::repo_helpers::send_log;
@@ -49,7 +47,7 @@ pub(crate) fn wire_callbacks(
     ui: &MainWindow,
     app_tx: Sender<AppCommand>,
     ui_tx: Sender<UiEvent>,
-    cancel_requested: Arc<AtomicBool>,
+    cancel_requested: CancelSlot,
 ) {
     wire_config_editor(ui, &app_tx);
     wire_backup_actions(ui, &app_tx);
@@ -411,11 +409,11 @@ fn wire_footer_links(ui: &MainWindow, app_tx: &Sender<AppCommand>) {
 }
 
 /// Cancel button — mirrors the tray "Cancel" menu item.
-fn wire_cancel(ui: &MainWindow, ui_tx: &Sender<UiEvent>, cancel_requested: Arc<AtomicBool>) {
+fn wire_cancel(ui: &MainWindow, ui_tx: &Sender<UiEvent>, cancel_requested: CancelSlot) {
     let cancel = cancel_requested;
     let ui_tx = ui_tx.clone();
     ui.on_cancel_operation_clicked(move || {
-        cancel.store(true, Ordering::SeqCst);
+        cancel.cancel();
         send_log(
             &ui_tx,
             "Cancel requested; Vykar will stop when the current file, upload, or storage operation returns.",

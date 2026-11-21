@@ -4,6 +4,7 @@ use super::types::{IntegrityIssue, RepairAction, RepairPlan};
 use crate::commands::list::{for_each_decoded_item, load_snapshot_item_stream, load_snapshot_meta};
 use crate::compress::Compression;
 use crate::index::ChunkIndexEntry;
+use crate::repo::control::CancelToken;
 use crate::repo::format::{ObjectType, pack_object_with_context};
 use crate::repo::manifest::SnapshotEntry;
 use crate::repo::{Repository, WriteSessionOptions};
@@ -173,7 +174,7 @@ fn prepare_rewrite(
     let drop: HashSet<usize> = item_indices.iter().copied().collect();
 
     let old_meta: SnapshotMeta = load_snapshot_meta(repo, snapshot_name)?;
-    let old_stream = load_snapshot_item_stream(repo, snapshot_name, None)?;
+    let old_stream = load_snapshot_item_stream(repo, snapshot_name, &CancelToken::new())?;
 
     let cutter = ItemStreamCutter::new(repo.crypto.chunk_hasher());
     let compression = Compression::default();
@@ -466,7 +467,7 @@ pub(super) fn execute_repair(
         }
 
         // Count file chunks
-        let items_stream = match load_snapshot_item_stream(repo, &entry.name, None) {
+        let items_stream = match load_snapshot_item_stream(repo, &entry.name, &CancelToken::new()) {
             Ok(s) => s,
             Err(e) => {
                 return Err(VykarError::Other(format!(
@@ -544,7 +545,8 @@ mod tests {
             skip_packs: None,
             snapshot_sample_percent: None,
         };
-        let scan = integrity_scan(&mut repo, &config, &opts, &mut None, None).unwrap();
+        let scan =
+            integrity_scan(&mut repo, &config, &opts, &mut None, &CancelToken::new()).unwrap();
         let plan = build_repair_plan(&scan, &HashMap::new(), &HashMap::new());
         assert!(
             plan.actions.iter().any(|a| matches!(
@@ -672,7 +674,7 @@ mod tests {
             old_meta.item_ptrs.len()
         );
         let mut nitems = 0usize;
-        let stream = load_snapshot_item_stream(&mut repo, "snap1", None).unwrap();
+        let stream = load_snapshot_item_stream(&mut repo, "snap1", &CancelToken::new()).unwrap();
         for_each_decoded_item(&stream, |_| {
             nitems += 1;
             Ok(())

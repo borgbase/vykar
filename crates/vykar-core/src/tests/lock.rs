@@ -750,10 +750,10 @@ fn session_guard_drop_stops_thread_before_deregister() {
 // ── acquire_lock_with_deadline ───────────────────────────────────────────
 
 mod deadline {
+    use crate::repo::control::CancelToken;
     use crate::repo::lock::{acquire_lock, acquire_lock_with_deadline, release_lock};
     use crate::testutil::MemoryBackend;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
     use vykar_storage::StorageBackend;
     use vykar_types::error::VykarError;
@@ -771,11 +771,14 @@ mod deadline {
         };
 
         let mut contended = 0;
-        let guard =
-            acquire_lock_with_deadline(&*storage, Duration::from_secs(30), 100, None, |_| {
-                contended += 1
-            })
-            .unwrap();
+        let guard = acquire_lock_with_deadline(
+            &*storage,
+            Duration::from_secs(30),
+            100,
+            &CancelToken::new(),
+            |_| contended += 1,
+        )
+        .unwrap();
         releaser.join().unwrap();
         assert_eq!(contended, 1);
         release_lock(&*storage, guard).unwrap();
@@ -786,9 +789,14 @@ mod deadline {
         let storage = MemoryBackend::new();
         let _held = acquire_lock(&storage).unwrap();
         let start = Instant::now();
-        let err =
-            acquire_lock_with_deadline(&storage, Duration::from_millis(300), 500, None, |_| {})
-                .unwrap_err();
+        let err = acquire_lock_with_deadline(
+            &storage,
+            Duration::from_millis(300),
+            500,
+            &CancelToken::new(),
+            |_| {},
+        )
+        .unwrap_err();
         let elapsed = start.elapsed();
         assert!(matches!(err, VykarError::Locked(_)), "got {err:?}");
         assert!(
@@ -800,10 +808,10 @@ mod deadline {
     #[test]
     fn deadline_interrupted_before_first_attempt() {
         let storage = MemoryBackend::new();
-        let flag = AtomicBool::new(true);
-        let err =
-            acquire_lock_with_deadline(&storage, Duration::from_secs(30), 500, Some(&flag), |_| {})
-                .unwrap_err();
+        let flag = CancelToken::new();
+        flag.cancel();
+        let err = acquire_lock_with_deadline(&storage, Duration::from_secs(30), 500, &flag, |_| {})
+            .unwrap_err();
         assert!(matches!(err, VykarError::Interrupted), "got {err:?}");
         assert!(storage.list("locks/").unwrap().is_empty());
     }
@@ -812,23 +820,18 @@ mod deadline {
     fn deadline_interrupted_during_contention() {
         let storage = MemoryBackend::new();
         let _held = acquire_lock(&storage).unwrap();
-        let flag = Arc::new(AtomicBool::new(false));
+        let flag = CancelToken::new();
         let setter = {
-            let flag = Arc::clone(&flag);
+            let flag = flag.clone();
             std::thread::spawn(move || {
                 std::thread::sleep(Duration::from_millis(200));
-                flag.store(true, Ordering::Relaxed);
+                flag.cancel();
             })
         };
         let start = Instant::now();
-        let err = acquire_lock_with_deadline(
-            &storage,
-            Duration::from_secs(600),
-            500,
-            Some(&flag),
-            |_| {},
-        )
-        .unwrap_err();
+        let err =
+            acquire_lock_with_deadline(&storage, Duration::from_secs(600), 500, &flag, |_| {})
+                .unwrap_err();
         setter.join().unwrap();
         assert!(matches!(err, VykarError::Interrupted), "got {err:?}");
         assert!(

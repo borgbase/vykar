@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::sync::atomic::Ordering;
 
 use slint::SharedString;
 use vykar_core::app::passphrase;
@@ -334,7 +333,7 @@ pub(super) fn handle_fetch_all_repo_info(ctx: &mut WorkerContext) {
     // returning to "Idle". Mirrors `handle_refresh_snapshots`.
     let mut failures: Vec<(String, String)> = Vec::new();
     for (i, repo) in ctx.runtime.repos.iter().enumerate() {
-        if ctx.cancel_requested.load(Ordering::SeqCst) {
+        if ctx.cancel_requested.is_cancelled() {
             send_log(&ctx.ui_tx, "Repository info fetch cancelled.");
             break;
         }
@@ -412,7 +411,7 @@ pub(super) fn handle_refresh_snapshots(ctx: &mut WorkerContext, repo_selector: S
     let mut failures: Vec<(String, String)> = Vec::new();
 
     for repo in repos_to_scan {
-        if ctx.cancel_requested.load(Ordering::SeqCst) {
+        if ctx.cancel_requested.is_cancelled() {
             break;
         }
         let repo_name = repo.label_or_url().to_string();

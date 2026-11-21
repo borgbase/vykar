@@ -6,8 +6,8 @@ use std::fs::OpenOptions;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::commands::util::check_interrupted;
 use crate::platform::fs;
+use crate::repo::control::CancelToken;
 use vykar_types::error::{Result, VykarError};
 
 use super::plan::{PendingLink, PlannedFile, PlannedNode, RepInfo};
@@ -16,7 +16,6 @@ use super::{
 };
 use crate::snapshot::item::HardlinkId;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::AtomicBool;
 
 #[cfg(test)]
 use std::cell::{Cell, RefCell};
@@ -51,13 +50,13 @@ pub(super) fn apply_file_metadata(
     xattrs_enabled: bool,
     restore_as_root: bool,
     stats: &mut RestoreStats,
-    shutdown: Option<&AtomicBool>,
+    shutdown: &CancelToken,
 ) -> Result<()> {
     // Per-file poll: the pass is short per file but runs up to
     // `RESTORE_BATCH_FILES` times, each opening an fd and applying
     // chown -> xattrs -> chmod -> mtime.
     for pf in planned_files {
-        check_interrupted(shutdown)?;
+        shutdown.check()?;
         finalize_one_file(pf, temp_root, xattrs_enabled, restore_as_root, stats)?;
     }
     Ok(())
@@ -204,10 +203,10 @@ pub(super) fn apply_symlink_metadata(
     symlinks: &[PlannedNode],
     restore_as_root: bool,
     stats: &mut RestoreStats,
-    shutdown: Option<&AtomicBool>,
+    shutdown: &CancelToken,
 ) -> Result<()> {
     for s in symlinks {
-        check_interrupted(shutdown)?;
+        shutdown.check()?;
         if restore_as_root {
             warn_metadata_err(
                 stats,
@@ -297,13 +296,13 @@ pub(super) fn create_hardlinks(
     restore_as_root: bool,
     tombstones: &mut HashSet<PathBuf>,
     stats: &mut RestoreStats,
-    shutdown: Option<&AtomicBool>,
+    shutdown: &CancelToken,
 ) -> Result<u64> {
     let mut copied_bytes: u64 = 0;
     // Per-link poll: not a cheap metadata pass — the EMLINK fallback copies the
     // representative's whole content for each link it cannot make.
     for link in pending_links {
-        check_interrupted(shutdown)?;
+        shutdown.check()?;
         let Some(rep) = group_reps.get(&link.id) else {
             // A link is only ever queued after its representative is recorded,
             // and representatives are never evicted — so this is unreachable.
@@ -882,7 +881,14 @@ mod tests {
     /// own cleanup (rollback).
     fn finalize_phase(files: &[PlannedFile], temp_root: &Path, dest_root: &Path) -> Result<()> {
         let mut stats = RestoreStats::default();
-        if let Err(e) = apply_file_metadata(files, temp_root, false, false, &mut stats, None) {
+        if let Err(e) = apply_file_metadata(
+            files,
+            temp_root,
+            false,
+            false,
+            &mut stats,
+            &CancelToken::new(),
+        ) {
             let _ = force_remove_temp_tree(temp_root);
             return Err(e);
         }
@@ -1094,7 +1100,7 @@ mod tests {
             false,
             &mut HashSet::new(),
             &mut stats,
-            None,
+            &CancelToken::new(),
         )
         .unwrap();
 
@@ -1137,7 +1143,7 @@ mod tests {
             false,
             &mut HashSet::new(),
             &mut stats,
-            None,
+            &CancelToken::new(),
         )
         .unwrap_err()
         .to_string();
@@ -1191,7 +1197,7 @@ mod tests {
             false,
             &mut HashSet::new(),
             &mut stats,
-            None,
+            &CancelToken::new(),
         );
 
         assert!(result.is_err(), "escaping parent must be rejected");
@@ -1254,7 +1260,7 @@ mod tests {
             false,
             &mut HashSet::new(),
             &mut stats,
-            None,
+            &CancelToken::new(),
         )
         .unwrap();
 
@@ -1334,7 +1340,7 @@ mod tests {
             false,
             &mut HashSet::new(),
             &mut stats,
-            None,
+            &CancelToken::new(),
         )
         .unwrap_err();
         assert!(
@@ -1438,7 +1444,7 @@ mod tests {
             false,
             &mut fx.tombstones,
             &mut stats,
-            None,
+            &CancelToken::new(),
         );
         (res, stats)
     }
@@ -1534,7 +1540,7 @@ mod tests {
             false,
             false,
             &mut stats,
-            None,
+            &CancelToken::new(),
         );
         assert!(res.is_err(), "open through a symlink leaf must fail");
         let after = std::fs::metadata(&victim).unwrap();
@@ -1592,7 +1598,7 @@ mod tests {
             false,
             &mut HashSet::new(),
             &mut stats,
-            None,
+            &CancelToken::new(),
         )
         .unwrap_err()
         .to_string();
@@ -1652,7 +1658,15 @@ mod tests {
         let mut stats = RestoreStats::default();
         // restore_as_root = true exercises the privileged branch even though the
         // test process is unprivileged (fchown fails → warning, op recorded).
-        apply_file_metadata(&files, &temp_root, false, true, &mut stats, None).unwrap();
+        apply_file_metadata(
+            &files,
+            &temp_root,
+            false,
+            true,
+            &mut stats,
+            &CancelToken::new(),
+        )
+        .unwrap();
 
         assert_eq!(recorded_tags(), vec!["chown", "xattr", "chmod", "mtime"]);
         let chown = recorded_ops()
@@ -1709,7 +1723,7 @@ mod tests {
             xattrs: None,
         }];
         let mut stats = RestoreStats::default();
-        apply_symlink_metadata(&syms, true, &mut stats, None).unwrap();
+        apply_symlink_metadata(&syms, true, &mut stats, &CancelToken::new()).unwrap();
 
         // No chmod for symlinks.
         assert_eq!(recorded_tags(), vec!["lchown", "xattr", "mtime"]);
@@ -1794,7 +1808,15 @@ mod tests {
 
         let mut stats = RestoreStats::default();
         // (1) reopen recovers → Ok.
-        apply_file_metadata(&files, &temp_root, true, false, &mut stats, None).unwrap();
+        apply_file_metadata(
+            &files,
+            &temp_root,
+            true,
+            false,
+            &mut stats,
+            &CancelToken::new(),
+        )
+        .unwrap();
         assert_eq!(
             OPEN_WRITABLE_CALLS.with(|c| c.get()),
             2,
@@ -1834,8 +1856,15 @@ mod tests {
 
         let files = [planned("f.txt", 4)];
         let mut stats = RestoreStats::default();
-        let err =
-            apply_file_metadata(&files, &temp_root, false, false, &mut stats, None).unwrap_err();
+        let err = apply_file_metadata(
+            &files,
+            &temp_root,
+            false,
+            false,
+            &mut stats,
+            &CancelToken::new(),
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("to apply metadata"), "got: {err}");
         // Open attempted exactly once.
         assert_eq!(OPEN_WRITABLE_CALLS.with(|c| c.get()), 1);
@@ -1895,7 +1924,15 @@ mod tests {
             .collect();
 
         let mut stats = RestoreStats::default();
-        apply_file_metadata(&files, &temp_root, false, false, &mut stats, None).unwrap();
+        apply_file_metadata(
+            &files,
+            &temp_root,
+            false,
+            false,
+            &mut stats,
+            &CancelToken::new(),
+        )
+        .unwrap();
 
         for (i, pf) in files.iter().enumerate() {
             let meta = std::fs::metadata(temp_root.join(&pf.rel_path)).unwrap();
@@ -1946,7 +1983,15 @@ mod tests {
 
         let mut stats = RestoreStats::default();
         // restore_as_root = true exercises the chown branch unprivileged.
-        apply_file_metadata(&files, &temp_root, false, true, &mut stats, None).unwrap();
+        apply_file_metadata(
+            &files,
+            &temp_root,
+            false,
+            true,
+            &mut stats,
+            &CancelToken::new(),
+        )
+        .unwrap();
 
         assert_eq!(stats.warnings.len(), cap);
         assert_eq!(

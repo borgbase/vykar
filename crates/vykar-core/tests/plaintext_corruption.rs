@@ -12,6 +12,7 @@ use std::path::Path;
 
 use vykar_core::commands;
 use vykar_core::config::VykarConfig;
+use vykar_core::repo::control::CancelToken;
 use vykar_types::chunk_id::ChunkId;
 
 use crate::common::{backup_source, make_test_config, open_local_repo};
@@ -74,7 +75,7 @@ fn plaintext_restore_rejects_corrupt_file_chunk_without_verify() {
         None,
         false,
         false,
-        None,
+        &CancelToken::new(),
     )
     .unwrap_err()
     .to_string();

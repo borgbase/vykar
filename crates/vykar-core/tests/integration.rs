@@ -9,6 +9,7 @@ mod common;
 use vykar_core::commands;
 use vykar_core::compress::Compression;
 use vykar_core::config::{ChunkerConfig, EncryptionModeConfig, VykarConfig};
+use vykar_core::repo::control::CancelToken;
 use vykar_core::repo::pack::PackType;
 use vykar_core::repo::{EncryptionMode, OpenOptions, Repository, WriteSessionOptions};
 use vykar_core::snapshot::item::ItemType;
@@ -317,7 +318,7 @@ fn backup_rejects_stored_invalid_chunker_parameters_but_restore_still_works() {
             None,
             false,
             true,
-            None,
+            &CancelToken::new(),
         )
         .unwrap();
         assert_eq!(std::fs::read(dest.join("file.txt")).unwrap(), payload);
@@ -505,7 +506,8 @@ fn backup_deduplicates_identical_files_and_extracts_correctly() {
     assert!(stats.deduplicated_size < stats.compressed_size);
 
     let mut repo = open_local_repo_cached(&repo_dir, None);
-    let items = commands::list::load_snapshot_items(&mut repo, "snap-dedup", None).unwrap();
+    let items =
+        commands::list::load_snapshot_items(&mut repo, "snap-dedup", &CancelToken::new()).unwrap();
     let file_items: Vec<_> = items
         .iter()
         .filter(|item| item.entry_type == ItemType::RegularFile)
@@ -531,7 +533,7 @@ fn backup_deduplicates_identical_files_and_extracts_correctly() {
         None,
         config.xattrs.enabled,
         false,
-        None,
+        &CancelToken::new(),
     )
     .unwrap();
     assert_eq!(extract_stats.files, 2);
@@ -577,7 +579,7 @@ fn backup_run_with_progress_emits_events_and_final_stats() {
             verbose: false,
         },
         Some(&mut on_progress),
-        None,
+        &CancelToken::new(),
     )
     .unwrap()
     .stats;
@@ -680,7 +682,7 @@ fn backup_warns_but_does_not_fail_on_unsupported_special_file() {
                 verbose: false,
             },
             Some(&mut on_progress),
-            None,
+            &CancelToken::new(),
         )
         .unwrap();
 
@@ -708,7 +710,9 @@ fn backup_warns_but_does_not_fail_on_unsupported_special_file() {
 
         // The regular file alongside the socket must still have been backed up.
         let mut repo = open_local_repo_cached(&repo_dir, None);
-        let items = commands::list::load_snapshot_items(&mut repo, snapshot_name, None).unwrap();
+        let items =
+            commands::list::load_snapshot_items(&mut repo, snapshot_name, &CancelToken::new())
+                .unwrap();
         assert!(
             items.iter().any(|i| i.path.ends_with("regular.txt")),
             "threads={threads}: the regular file must still be in the snapshot"
@@ -767,7 +771,8 @@ fn backup_and_restore_preserves_file_xattrs_when_enabled() {
     .unwrap();
 
     let mut repo = open_local_repo_cached(&repo_dir, None);
-    let items = commands::list::load_snapshot_items(&mut repo, "snap-xattrs", None).unwrap();
+    let items =
+        commands::list::load_snapshot_items(&mut repo, "snap-xattrs", &CancelToken::new()).unwrap();
     let item = items.iter().find(|i| i.path == "file.txt").unwrap();
     let stored = item
         .xattrs
@@ -785,7 +790,7 @@ fn backup_and_restore_preserves_file_xattrs_when_enabled() {
         None,
         true,
         false,
-        None,
+        &CancelToken::new(),
     )
     .unwrap();
 
@@ -840,7 +845,9 @@ fn backup_skips_xattrs_when_disabled() {
     .unwrap();
 
     let mut repo = open_local_repo_cached(&repo_dir, None);
-    let items = commands::list::load_snapshot_items(&mut repo, "snap-no-xattrs", None).unwrap();
+    let items =
+        commands::list::load_snapshot_items(&mut repo, "snap-no-xattrs", &CancelToken::new())
+            .unwrap();
     let item = items.iter().find(|i| i.path == "file.txt").unwrap();
     assert!(item.xattrs.is_none());
 }
@@ -903,7 +910,8 @@ fn backup_and_restore_preserves_hard_links() {
 
     // Both items carry the same hardlink key.
     let mut repo = open_local_repo_cached(&repo_dir, None);
-    let items = commands::list::load_snapshot_items(&mut repo, "snap-hl", None).unwrap();
+    let items =
+        commands::list::load_snapshot_items(&mut repo, "snap-hl", &CancelToken::new()).unwrap();
     let a_item = items.iter().find(|i| i.path == "a.txt").unwrap();
     let b_item = items.iter().find(|i| i.path == "b.txt").unwrap();
     assert!(a_item.hardlink.is_some());
@@ -918,7 +926,7 @@ fn backup_and_restore_preserves_hard_links() {
         None,
         false,
         false,
-        None,
+        &CancelToken::new(),
     )
     .unwrap();
 
@@ -965,7 +973,7 @@ fn restore_pattern_excluding_representative_restores_link_from_own_chunks() {
         Some("keep*"),
         false,
         false,
-        None,
+        &CancelToken::new(),
     )
     .unwrap();
 
@@ -1007,7 +1015,9 @@ fn restore_single_in_set_hardlink_is_standalone_file() {
 
     // The item records hardlink (nlink > 1) but is the only member in the set.
     let mut repo = open_local_repo_cached(&repo_dir, None);
-    let items = commands::list::load_snapshot_items(&mut repo, "snap-hl-single", None).unwrap();
+    let items =
+        commands::list::load_snapshot_items(&mut repo, "snap-hl-single", &CancelToken::new())
+            .unwrap();
     let item = items.iter().find(|i| i.path == "in_set.txt").unwrap();
     assert!(item.hardlink.is_some());
 
@@ -1020,7 +1030,7 @@ fn restore_single_in_set_hardlink_is_standalone_file() {
         None,
         false,
         false,
-        None,
+        &CancelToken::new(),
     )
     .unwrap();
 
@@ -1072,7 +1082,7 @@ fn restore_relinks_cross_source_hard_link_group() {
         None,
         false,
         false,
-        None,
+        &CancelToken::new(),
     )
     .unwrap();
 
@@ -1115,7 +1125,8 @@ fn second_backup_cache_hit_preserves_hard_link() {
     backup_sources(&config, "snap-hl-2", &sources);
 
     let mut repo = open_local_repo_cached(&repo_dir, None);
-    let items = commands::list::load_snapshot_items(&mut repo, "snap-hl-2", None).unwrap();
+    let items =
+        commands::list::load_snapshot_items(&mut repo, "snap-hl-2", &CancelToken::new()).unwrap();
     let a_item = items.iter().find(|i| i.path == "a.txt").unwrap();
     let b_item = items.iter().find(|i| i.path == "b.txt").unwrap();
     assert!(
@@ -1132,7 +1143,7 @@ fn second_backup_cache_hit_preserves_hard_link() {
         None,
         false,
         false,
-        None,
+        &CancelToken::new(),
     )
     .unwrap();
 
@@ -1203,7 +1214,7 @@ fn backup_and_restore_preserves_directory_mtime() {
         None,
         false,
         false,
-        None,
+        &CancelToken::new(),
     )
     .unwrap();
 
@@ -1244,7 +1255,7 @@ fn backup_and_restore_preserves_symlink_mtime() {
         None,
         false,
         false,
-        None,
+        &CancelToken::new(),
     )
     .unwrap();
 
@@ -1291,7 +1302,7 @@ fn backup_and_restore_preserves_symlink_xattrs() {
         None,
         true,
         false,
-        None,
+        &CancelToken::new(),
     )
     .unwrap();
 
@@ -1344,7 +1355,7 @@ fn restore_populates_readonly_directory() {
         None,
         false,
         false,
-        None,
+        &CancelToken::new(),
     )
     .unwrap();
 
@@ -1402,7 +1413,7 @@ fn restore_readonly_file_keeps_xattr_and_mode() {
         None,
         true,
         false,
-        None,
+        &CancelToken::new(),
     )
     .unwrap();
 
@@ -1459,7 +1470,7 @@ fn restore_readonly_dir_keeps_xattr_and_mode() {
         None,
         true,
         false,
-        None,
+        &CancelToken::new(),
     )
     .unwrap();
 
@@ -1527,7 +1538,8 @@ fn file_cache_persists_and_matches_snapshot_items() {
     // Verify file cache was persisted and its chunk_refs match the snapshot.
     {
         let mut repo = open_local_repo_cached(&repo_dir, None);
-        let items = commands::list::load_snapshot_items(&mut repo, "snap-1", None).unwrap();
+        let items =
+            commands::list::load_snapshot_items(&mut repo, "snap-1", &CancelToken::new()).unwrap();
         let files: Vec<_> = items
             .iter()
             .filter(|i| i.entry_type == ItemType::RegularFile)
@@ -1591,8 +1603,10 @@ fn file_cache_persists_and_matches_snapshot_items() {
     .unwrap();
 
     let mut repo = open_local_repo_cached(&repo_dir, None);
-    let items1 = commands::list::load_snapshot_items(&mut repo, "snap-1", None).unwrap();
-    let items2 = commands::list::load_snapshot_items(&mut repo, "snap-2", None).unwrap();
+    let items1 =
+        commands::list::load_snapshot_items(&mut repo, "snap-1", &CancelToken::new()).unwrap();
+    let items2 =
+        commands::list::load_snapshot_items(&mut repo, "snap-2", &CancelToken::new()).unwrap();
     let files1: Vec<_> = items1
         .iter()
         .filter(|i| i.entry_type == ItemType::RegularFile)
@@ -1668,7 +1682,8 @@ fn file_cache_misses_on_modified_file() {
     // Collect chunk IDs from the first snapshot.
     let snap1_chunks: std::collections::HashMap<String, Vec<_>> = {
         let mut repo = open_local_repo_cached(&repo_dir, None);
-        let items = commands::list::load_snapshot_items(&mut repo, "snap-1", None).unwrap();
+        let items =
+            commands::list::load_snapshot_items(&mut repo, "snap-1", &CancelToken::new()).unwrap();
         items
             .iter()
             .filter(|i| i.entry_type == ItemType::RegularFile)
@@ -1701,7 +1716,8 @@ fn file_cache_misses_on_modified_file() {
     .unwrap();
 
     let mut repo = open_local_repo_cached(&repo_dir, None);
-    let items2 = commands::list::load_snapshot_items(&mut repo, "snap-2", None).unwrap();
+    let items2 =
+        commands::list::load_snapshot_items(&mut repo, "snap-2", &CancelToken::new()).unwrap();
     let files2: std::collections::HashMap<String, Vec<_>> = items2
         .iter()
         .filter(|i| i.entry_type == ItemType::RegularFile)
@@ -1856,7 +1872,8 @@ fn command_dump_backup_and_restore() {
 
     // List snapshot contents — verify vykar-dumps/hello.txt appears
     let mut repo = open_local_repo_cached(repo_dir.path(), None);
-    let items = commands::list::load_snapshot_items(&mut repo, "snap-dumps", None).unwrap();
+    let items =
+        commands::list::load_snapshot_items(&mut repo, "snap-dumps", &CancelToken::new()).unwrap();
     let dump_items: Vec<_> = items
         .iter()
         .filter(|i| i.path == "vykar-dumps/hello.txt")
@@ -1880,7 +1897,7 @@ fn command_dump_backup_and_restore() {
         None,
         false,
         false,
-        None,
+        &CancelToken::new(),
     )
     .unwrap();
 
@@ -1976,7 +1993,8 @@ fn command_dump_mixed_with_files() {
     assert_eq!(stats.nfiles, 2);
 
     let mut repo = open_local_repo_cached(repo_dir.path(), None);
-    let items = commands::list::load_snapshot_items(&mut repo, "snap-mixed", None).unwrap();
+    let items =
+        commands::list::load_snapshot_items(&mut repo, "snap-mixed", &CancelToken::new()).unwrap();
     let has_real = items.iter().any(|i| i.path == "real.txt");
     let has_dump = items.iter().any(|i| i.path == "vykar-dumps/dump.txt");
     assert!(has_real, "should contain real.txt");
@@ -1992,7 +2010,7 @@ fn command_dump_mixed_with_files() {
         None,
         false,
         false,
-        None,
+        &CancelToken::new(),
     )
     .unwrap();
 
@@ -2058,7 +2076,9 @@ fn backup_many_small_files_plus_large_file_roundtrip() {
     // Verify all items present in the snapshot.
     {
         let mut repo = open_local_repo_cached(&repo_dir, None);
-        let items = commands::list::load_snapshot_items(&mut repo, "snap-small-1", None).unwrap();
+        let items =
+            commands::list::load_snapshot_items(&mut repo, "snap-small-1", &CancelToken::new())
+                .unwrap();
         let files: Vec<_> = items
             .iter()
             .filter(|i| i.entry_type == ItemType::RegularFile)
@@ -2094,7 +2114,7 @@ fn backup_many_small_files_plus_large_file_roundtrip() {
         None,
         false,
         false,
-        None,
+        &CancelToken::new(),
     )
     .unwrap();
 
@@ -2137,7 +2157,9 @@ fn backup_many_small_files_plus_large_file_roundtrip() {
     // Verify the second snapshot also has correct walk order.
     {
         let mut repo = open_local_repo_cached(&repo_dir, None);
-        let items = commands::list::load_snapshot_items(&mut repo, "snap-small-2", None).unwrap();
+        let items =
+            commands::list::load_snapshot_items(&mut repo, "snap-small-2", &CancelToken::new())
+                .unwrap();
         let files: Vec<_> = items
             .iter()
             .filter(|i| i.entry_type == ItemType::RegularFile)
@@ -2174,7 +2196,7 @@ fn backup_many_small_files_plus_large_file_roundtrip() {
         None,
         false,
         false,
-        None,
+        &CancelToken::new(),
     )
     .unwrap();
 
@@ -2251,7 +2273,7 @@ fn backup_pipeline_threshold_splitting_roundtrip() {
         None,
         false,
         false,
-        None,
+        &CancelToken::new(),
     )
     .unwrap();
 
@@ -2322,7 +2344,8 @@ fn backup_pipeline_preserves_walk_order_with_mixed_file_sizes() {
     assert_eq!(stats.nfiles, 4);
 
     let mut repo = open_local_repo_cached(&repo_dir, None);
-    let items = commands::list::load_snapshot_items(&mut repo, "snap-order", None).unwrap();
+    let items =
+        commands::list::load_snapshot_items(&mut repo, "snap-order", &CancelToken::new()).unwrap();
     let mut paths: Vec<_> = items.iter().map(|i| i.path.clone()).collect();
     paths.sort();
     assert_eq!(
@@ -2421,7 +2444,7 @@ fn backup_pipeline_mixed_cache_hit_processed_and_large_roundtrip() {
         None,
         false,
         false,
-        None,
+        &CancelToken::new(),
     )
     .unwrap();
 
@@ -2486,7 +2509,7 @@ fn backup_emits_intermediate_progress_during_large_file() {
             verbose: false,
         },
         Some(&mut on_progress),
-        None,
+        &CancelToken::new(),
     )
     .unwrap();
 
@@ -2601,7 +2624,7 @@ fn command_dump_emits_progress_events() {
             verbose: false,
         },
         Some(&mut on_progress),
-        None,
+        &CancelToken::new(),
     )
     .unwrap();
 
@@ -2713,7 +2736,7 @@ fn command_dump_mixed_progress_events() {
             verbose: false,
         },
         Some(&mut on_progress),
-        None,
+        &CancelToken::new(),
     )
     .unwrap();
 
@@ -2810,7 +2833,7 @@ fn verbose_file_processed_events_classify_new_modified_unchanged() {
             verbose: true,
         },
         Some(&mut cb1),
-        None,
+        &CancelToken::new(),
     )
     .unwrap();
     let fp1 = file_processed_events(&events1);
@@ -2852,7 +2875,7 @@ fn verbose_file_processed_events_classify_new_modified_unchanged() {
             verbose: true,
         },
         Some(&mut cb2),
-        None,
+        &CancelToken::new(),
     )
     .unwrap();
     let fp2 = file_processed_events(&events2);
@@ -2898,7 +2921,7 @@ fn verbose_file_processed_events_classify_new_modified_unchanged() {
             verbose: true,
         },
         Some(&mut cb3),
-        None,
+        &CancelToken::new(),
     )
     .unwrap();
     let fp3 = file_processed_events(&events3);
@@ -3226,7 +3249,7 @@ fn large_file_chunk_ids_do_not_depend_on_threads() {
                 verbose: true,
             },
             Some(&mut on_progress),
-            None,
+            &CancelToken::new(),
         )
         .unwrap();
         assert_eq!(
@@ -3236,7 +3259,9 @@ fn large_file_chunk_ids_do_not_depend_on_threads() {
         );
 
         let mut repo = open_local_repo_cached(&repo_dir, None);
-        let items = commands::list::load_snapshot_items(&mut repo, &snapshot_name, None).unwrap();
+        let items =
+            commands::list::load_snapshot_items(&mut repo, &snapshot_name, &CancelToken::new())
+                .unwrap();
         let item = items
             .iter()
             .find(|i| i.path.ends_with("big.bin"))
@@ -3344,8 +3369,12 @@ fn backup_item_metadata_does_not_depend_on_threads() {
 
     // Compare item lists — should be identical
     let mut repo = open_local_repo_cached(&repo_dir, None);
-    let items_p = commands::list::load_snapshot_items(&mut repo, "snap-pipeline", None).unwrap();
-    let items_s = commands::list::load_snapshot_items(&mut repo, "snap-one-thread", None).unwrap();
+    let items_p =
+        commands::list::load_snapshot_items(&mut repo, "snap-pipeline", &CancelToken::new())
+            .unwrap();
+    let items_s =
+        commands::list::load_snapshot_items(&mut repo, "snap-one-thread", &CancelToken::new())
+            .unwrap();
 
     // Sort by path for deterministic comparison (walk order may differ)
     let mut sorted_p: Vec<_> = items_p.iter().collect();

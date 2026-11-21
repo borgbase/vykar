@@ -1,14 +1,15 @@
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use tracing::{info, warn};
 
-use super::util::{check_interrupted, open_repo, with_maintenance_lock};
+use super::util::{open_repo, with_maintenance_lock};
 use crate::config::VykarConfig;
 use crate::repo::OpenOptions;
 use crate::repo::Repository;
+use crate::repo::control::CancelToken;
 use crate::repo::pack::{PackType, PackWriter};
 use vykar_protocol::{
     MAX_REPACK_OUTPUT_BYTES, PACK_HEADER_SIZE, RepackBlobRef, RepackOperationRequest,
@@ -62,7 +63,7 @@ pub fn run(
     threshold: f64,
     max_repack_size: Option<u64>,
     dry_run: bool,
-    shutdown: Option<&AtomicBool>,
+    shutdown: &CancelToken,
 ) -> Result<CompactStats> {
     let threshold = if !threshold.is_finite() || !(0.0..=100.0).contains(&threshold) {
         let default = config.compact.threshold;
@@ -87,7 +88,7 @@ pub(crate) fn run_on_repo(
     threshold: f64,
     max_repack_size: Option<u64>,
     dry_run: bool,
-    shutdown: Option<&AtomicBool>,
+    shutdown: &CancelToken,
 ) -> Result<CompactStats> {
     let concurrency = repo.storage.profile().request_width;
 
@@ -115,7 +116,7 @@ pub fn compact_repo(
     max_repack_size: Option<u64>,
     dry_run: bool,
     concurrency: usize,
-    shutdown: Option<&AtomicBool>,
+    shutdown: &CancelToken,
 ) -> Result<CompactStats> {
     let stats = compact_packs(
         repo,
@@ -137,7 +138,7 @@ fn compact_packs(
     max_repack_size: Option<u64>,
     dry_run: bool,
     concurrency: usize,
-    shutdown: Option<&AtomicBool>,
+    shutdown: &CancelToken,
 ) -> Result<CompactStats> {
     let mut stats = CompactStats::default();
 
@@ -288,7 +289,7 @@ fn compact_packs(
     stats.blobs_live = blobs_live.load(Ordering::Relaxed);
 
     // Bail before Phase 2 if shutdown was requested during analysis.
-    check_interrupted(shutdown)?;
+    shutdown.check()?;
 
     let mut analyses = analyses_mu
         .into_inner()
@@ -355,7 +356,7 @@ fn compact_packs(
     let mut batch_bytes: u64 = 0;
 
     for analysis in &selected {
-        check_interrupted(shutdown)?;
+        shutdown.check()?;
         if let Some(cap) = max_repack_size
             && total_repacked_bytes >= cap
         {
@@ -551,7 +552,7 @@ fn parallel_list_packs(
     let shards: Vec<u16> = (0..256).collect();
 
     // Not cancellable: `shutdown` is honoured by the analysis that follows.
-    crate::repo::bounded::for_each_bounded(concurrency, &shards, None, |&shard| {
+    crate::repo::bounded::for_each_bounded(concurrency, &shards, &CancelToken::new(), |&shard| {
         let prefix = format!("packs/{:02x}/", shard);
         let objects = match storage.list_sized(&prefix) {
             Ok(k) => k,

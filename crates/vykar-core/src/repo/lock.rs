@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::SystemTime;
@@ -7,6 +7,7 @@ use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
+use super::control::CancelToken;
 use vykar_storage::StorageBackend;
 use vykar_types::error::{LockHolder, LockHolderDetails, Result, VykarError};
 
@@ -849,15 +850,14 @@ pub fn acquire_lock_with_deadline(
     storage: &dyn StorageBackend,
     max_wait: std::time::Duration,
     base_delay_ms: u64,
-    shutdown: Option<&AtomicBool>,
+    shutdown: &CancelToken,
     mut on_contended: impl FnMut(&LockHolder),
 ) -> Result<LockGuard> {
-    let interrupted = || shutdown.is_some_and(|f| f.load(Ordering::Relaxed));
     let start = std::time::Instant::now();
     let deadline = start + max_wait;
     let mut attempt: usize = 0;
     loop {
-        if interrupted() {
+        if shutdown.is_cancelled() {
             return Err(VykarError::Interrupted);
         }
         let holder = match acquire_lock(storage) {
@@ -893,7 +893,7 @@ pub fn acquire_lock_with_deadline(
             if now >= wake {
                 break;
             }
-            if interrupted() {
+            if shutdown.is_cancelled() {
                 return Err(VykarError::Interrupted);
             }
             std::thread::sleep((wake - now).min(LOCK_WAIT_SLICE));

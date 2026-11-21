@@ -26,6 +26,7 @@ use tokio::net::TcpListener;
 use crate::commands::list as list_cmd;
 use crate::config::VykarConfig;
 use crate::repo::Repository;
+use crate::repo::control::CancelToken;
 use crate::snapshot::item::{ChunkRef, Item, ItemType};
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
@@ -832,7 +833,7 @@ pub fn run_with_progress(
         cb(MountProgressEvent::LoadingSnapshots);
     }
     let tree = if let Some(name) = snapshot_name {
-        let items = list_cmd::load_snapshot_items(&mut repo, name, None)?;
+        let items = list_cmd::load_snapshot_items(&mut repo, name, &CancelToken::new())?;
         if let Some(ref mut cb) = progress {
             cb(MountProgressEvent::SnapshotLoaded {
                 name: name.to_string(),
@@ -853,7 +854,7 @@ pub fn run_with_progress(
                 .collect()
         };
         for entry in &entries {
-            let items = list_cmd::load_snapshot_items(&mut repo, &entry.name, None)?;
+            let items = list_cmd::load_snapshot_items(&mut repo, &entry.name, &CancelToken::new())?;
             if let Some(ref mut cb) = progress {
                 cb(MountProgressEvent::SnapshotLoaded {
                     name: entry.name.clone(),

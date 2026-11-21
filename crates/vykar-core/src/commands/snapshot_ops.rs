@@ -1,14 +1,12 @@
-use std::sync::atomic::AtomicBool;
-
 use tracing::warn;
 
 use crate::index::ChunkIndex;
 use crate::repo::Repository;
+use crate::repo::control::CancelToken;
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
 
 use super::list;
-use super::util::check_interrupted;
 
 /// Append `msg` to `warnings` and emit `tracing::warn!` for it. Both actions
 /// always happen together: warnings are the surface-visible half, tracing is
@@ -32,7 +30,7 @@ pub fn try_cleanup_deleted_snapshot_refs(
     warnings: &mut Vec<String>,
 ) -> Option<SnapshotChunkImpact> {
     let result = (|| -> Result<SnapshotChunkImpact> {
-        let items_stream = list::load_item_stream_from_ptrs(repo, item_ptrs, None)?;
+        let items_stream = list::load_item_stream_from_ptrs(repo, item_ptrs, &CancelToken::new())?;
         decrement_chunk_refs_on_index(repo.chunk_index_mut(), &items_stream, item_ptrs)
     })();
     match result {
@@ -143,7 +141,7 @@ pub struct RemovedSnapshot {
 pub fn prepare_removal_targets<S: AsRef<str>>(
     repo: &mut Repository,
     names: &[S],
-    shutdown: Option<&AtomicBool>,
+    shutdown: &CancelToken,
 ) -> Result<Vec<RemovalTarget>> {
     let keys = names
         .iter()
@@ -158,7 +156,7 @@ pub fn prepare_removal_targets<S: AsRef<str>>(
 
     let mut targets = Vec::with_capacity(names.len());
     for (name, snapshot_key) in names.iter().zip(keys) {
-        check_interrupted(shutdown)?;
+        shutdown.check()?;
         let name = name.as_ref();
         let snapshot_meta = list::load_snapshot_meta(repo, name)?;
         targets.push(RemovalTarget {
@@ -184,11 +182,11 @@ pub fn remove_snapshots(
     repo: &mut Repository,
     targets: Vec<RemovalTarget>,
     op: &str,
-    shutdown: Option<&AtomicBool>,
+    shutdown: &CancelToken,
     warnings: &mut Vec<String>,
 ) -> Result<Vec<RemovedSnapshot>> {
     for target in &targets {
-        check_interrupted(shutdown)?;
+        shutdown.check()?;
         repo.check_lock_fence()?;
         repo.storage.delete(&target.snapshot_key).map_err(|e| {
             VykarError::Other(format!(

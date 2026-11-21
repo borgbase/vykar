@@ -1,5 +1,6 @@
 pub(crate) mod bounded;
 pub(crate) mod coalesce;
+pub mod control;
 pub mod file_cache;
 pub mod format;
 pub mod identity;
@@ -21,6 +22,7 @@ mod open;
 mod pack_lookup;
 mod pack_recovery;
 mod pack_verify;
+pub use index_write::IndexRecovery;
 pub use key::{LoadedKey, select_repository_key};
 #[cfg(any(test, feature = "fuzzing"))]
 pub(crate) use open::derive_plaintext_chunk_id_key;

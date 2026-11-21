@@ -29,8 +29,8 @@ fuzz_target!(|data: &[u8]| {
         HashAlgorithm::Blake2b
     };
     let chunk_id = ChunkId::from_bytes(header[1..33].try_into().unwrap());
-    // Capped: the bulk decoder zero-fills a buffer of the hint (at most
-    // 32 MiB), which would dominate every run.
+    // Capped: the bulk decoder reserves a buffer of the hint (at most
+    // 32 MiB), and allocating that would dominate every run.
     let hint = (u32::from_le_bytes(header[33..37].try_into().unwrap()) as usize).min(1 << 20);
     let engine = PlaintextEngine::new(ChunkHasher::new(algorithm, CHUNK_ID_KEY));
 

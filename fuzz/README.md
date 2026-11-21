@@ -11,7 +11,7 @@ Coverage-guided fuzz tests for vykar's parser, deserializer, and decrypt paths. 
 | Target | What it fuzzes |
 |--------|---------------|
 | `fuzz_pack_scan` | Pack binary parser (`scan_pack_blobs_bytes`) |
-| `fuzz_decompress` | LZ4/Zstd decompression (`decompress`, `decompress_metadata`, and the streaming zstd metadata reader against it) |
+| `fuzz_decompress` | LZ4/Zstd decompression (`decompress`, `decompress_metadata`, and the streaming zstd metadata reader against it); chunk decoding with and without a size hint must agree |
 | `fuzz_msgpack_snapshot_meta` | `SnapshotMeta` deserialization |
 | `fuzz_msgpack_index_blob` | `IndexBlob` deserialization |
 | `fuzz_item_stream` | Streaming item decode (`for_each_decoded_item`) |

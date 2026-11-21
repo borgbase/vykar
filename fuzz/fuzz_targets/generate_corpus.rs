@@ -38,6 +38,14 @@ use vykar_types::pack_id::PackId;
 
 const CORPUS_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/corpus");
 
+/// A tagged zstd frame: a compressed block of declared size 0, then a last
+/// raw block holding the 6 trailing bytes. libzstd 1.5.7's streaming decoder
+/// accepts it; the one-shot decoder rejects it.
+const ZSTD_EMPTY_COMPRESSED_BLOCK: &[u8] = &[
+    0x02, 0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x34, 0x04, 0x00, 0x00, 0x31, 0x00, 0x00, 0x73, 0x48, 0x9c,
+    0x6b, 0x93, 0x8f,
+];
+
 /// Fixed epoch for deterministic snapshot timestamps (2025-01-01T00:00:00Z).
 fn fixed_time() -> chrono::DateTime<chrono::Utc> {
     chrono::DateTime::from_timestamp(1_735_689_600, 0).unwrap()
@@ -102,6 +110,22 @@ fn seed_decompress() {
 
     let zstd_empty = compress(Compression::Zstd { level: 3 }, b"").unwrap();
     write_seed("fuzz_decompress", "zstd_empty", &zstd_empty);
+
+    write_seed("fuzz_decompress", "zstd_tag_only", &[0x02]);
+    // An RLE block of ~873 KiB in a frame with a 1 KiB window: the one-shot
+    // decoder accepts it, streaming rejects it.
+    write_seed(
+        "fuzz_decompress",
+        "zstd_rle_block_over_window",
+        &[
+            0x02, 0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x01, 0x32, 0x00, 0x6d, 0x00, 0x01, 0x00, 0x00,
+        ],
+    );
+    write_seed(
+        "fuzz_decompress",
+        "zstd_empty_compressed_block",
+        ZSTD_EMPTY_COMPRESSED_BLOCK,
+    );
 }
 
 fn seed_snapshot_meta() {
@@ -835,24 +859,33 @@ fn seed_metadata_msgpack() {
 const PLAINTEXT_CHUNK_ID_KEY: [u8; 32] = [0x5A; 32];
 
 fn seed_plaintext_read() {
-    let plaintext = b"plaintext chunk read path, plaintext chunk read path";
-    for (name, algorithm, compression) in [
-        ("blake2b_lz4", HashAlgorithm::Blake2b, Compression::Lz4),
+    let plaintext: &[u8] = b"plaintext chunk read path, plaintext chunk read path";
+    let frame = ZSTD_EMPTY_COMPRESSED_BLOCK;
+    for (name, algorithm, plaintext, compressed) in [
+        (
+            "blake2b_lz4",
+            HashAlgorithm::Blake2b,
+            plaintext,
+            compress(Compression::Lz4, plaintext).unwrap(),
+        ),
         (
             "blake3_zstd",
             HashAlgorithm::Blake3,
-            Compression::Zstd { level: 3 },
+            plaintext,
+            compress(Compression::Zstd { level: 3 }, plaintext).unwrap(),
+        ),
+        (
+            "blake3_zstd_empty_compressed_block",
+            HashAlgorithm::Blake3,
+            &frame[frame.len() - 6..],
+            frame.to_vec(),
         ),
     ] {
         let engine = PlaintextEngine::new(ChunkHasher::new(algorithm, PLAINTEXT_CHUNK_ID_KEY));
         let id = ChunkId::compute(engine.chunk_hasher(), plaintext);
-        let blob = pack_object_with_context(
-            ObjectType::ChunkData,
-            id.as_bytes(),
-            &compress(compression, plaintext).unwrap(),
-            &engine,
-        )
-        .unwrap();
+        let blob =
+            pack_object_with_context(ObjectType::ChunkData, id.as_bytes(), &compressed, &engine)
+                .unwrap();
         let mut pw = PackWriter::new(PackType::Data, usize::MAX, algorithm);
         pw.add_blob(id, blob).unwrap();
         let sealed = pw.seal().unwrap();

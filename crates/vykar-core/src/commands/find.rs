@@ -124,7 +124,7 @@ pub struct PathTimeline {
 
 /// Run the find command: search for files across snapshots.
 /// Tries the local restore cache first to avoid downloading the full index.
-/// Falls back to the full index (with blob cache) on cache miss.
+/// Falls back to the full index on cache miss.
 pub fn run(
     config: &VykarConfig,
     passphrase: Option<&str>,

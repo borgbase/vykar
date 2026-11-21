@@ -314,10 +314,6 @@ fn restore_on_repo_with_filter<F>(
 where
     F: FnMut(&str) -> bool,
 {
-    // Shrink blob cache for restore — the parallel pipeline reads pack data
-    // directly via `StorageBackend::open_range`, so the cache only serves the
-    // small item-stream tree-pack chunks. 2 MiB is plenty.
-    repo.set_blob_cache_max_bytes(2 * 1024 * 1024);
     let readers = restore_readers(repo.storage.profile());
     let RestoreOptions {
         xattrs_enabled,

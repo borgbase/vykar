@@ -95,7 +95,6 @@ fn main() -> Result<(), Error> {
         passphrase.as_deref(),
         OpenOptions::new().with_index().skip_key_backfill(),
     )?;
-    repo.set_blob_cache_max_bytes(0);
     eprintln!(
         "opened in {} ms; {} index entries, {} snapshots",
         t.elapsed().as_millis(),

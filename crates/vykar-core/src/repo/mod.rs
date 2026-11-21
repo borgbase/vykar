@@ -31,7 +31,6 @@ pub use session::WriteSessionOptions;
 mod upgrade;
 pub use upgrade::UpgradeOutcome;
 
-use std::collections::{HashMap as StdHashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -44,7 +43,6 @@ use crate::config::{ChunkerConfig, default_max_pack_size, default_min_pack_size}
 use crate::index::ChunkIndex;
 use vykar_crypto::CryptoEngine;
 use vykar_storage::StorageBackend;
-use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::Result;
 use vykar_types::hash::HashAlgorithm;
 
@@ -189,9 +187,6 @@ impl RepoConfig {
     }
 }
 
-/// Maximum total weight (bytes) of cached blobs in the blob cache.
-const BLOB_CACHE_MAX_BYTES: usize = 32 * 1024 * 1024; // 32 MiB
-
 const INDEX_OBJECT_CONTEXT: &[u8] = b"index";
 
 /// The repository key, stored twice.
@@ -225,51 +220,6 @@ pub enum KeyCopyState {
         good: &'static str,
         bad: &'static str,
     },
-}
-
-/// FIFO blob cache bounded by total weight in bytes.
-/// Caches decrypted+decompressed chunks to avoid redundant storage reads.
-struct BlobCache {
-    entries: StdHashMap<ChunkId, Vec<u8>>,
-    order: VecDeque<ChunkId>,
-    current_bytes: usize,
-    max_bytes: usize,
-}
-
-impl BlobCache {
-    fn new(max_bytes: usize) -> Self {
-        Self {
-            entries: StdHashMap::new(),
-            order: VecDeque::new(),
-            current_bytes: 0,
-            max_bytes,
-        }
-    }
-
-    fn get(&self, id: &ChunkId) -> Option<&[u8]> {
-        self.entries.get(id).map(Vec::as_slice)
-    }
-
-    fn insert(&mut self, id: ChunkId, data: Vec<u8>) {
-        let data_len = data.len();
-        // Don't cache items larger than the entire cache
-        if data_len > self.max_bytes {
-            return;
-        }
-        // Evict oldest entries until there's room
-        while self.current_bytes + data_len > self.max_bytes {
-            if let Some(evicted_id) = self.order.pop_front() {
-                if let Some(evicted_data) = self.entries.remove(&evicted_id) {
-                    self.current_bytes -= evicted_data.len();
-                }
-            } else {
-                break;
-            }
-        }
-        self.current_bytes += data_len;
-        self.entries.insert(id, data);
-        self.order.push_back(id);
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -364,8 +314,6 @@ pub struct Repository {
     /// caller asks the repository rather than re-inspecting the integer.
     format: RepoFormat,
     file_cache: FileCache,
-    /// Weight-bounded cache for decrypted chunks (used during restore).
-    blob_cache: BlobCache,
     /// Cache-validity token for the local dedup/restore caches.
     /// Monolithic layout: a random u64 rotated each time the index is saved,
     /// stored inside the encrypted `IndexBlob` (source of truth) and the
@@ -556,6 +504,15 @@ impl Drop for Repository {
         }
     }
 }
+
+// Compile-time assertion: reads take `&self`, so `Arc<Repository>` must be
+// shareable across threads (mount serves concurrent reads from one handle).
+const _: () = {
+    fn _assert_send_sync<T: Send + Sync>() {}
+    fn _check() {
+        _assert_send_sync::<Repository>();
+    }
+};
 
 #[cfg(test)]
 mod format_tests {

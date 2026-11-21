@@ -758,7 +758,7 @@ mod server_side {
     /// A cold open equals the warm index, `id_b` reads back from it, and
     /// every pack it names exists.
     fn assert_cold_open_matches(repo: &Repository, id_b: &ChunkId, ctx: &str) {
-        let (_dir, mut cold) = cold_open(repo);
+        let (_dir, cold) = cold_open(repo);
         assert_eq!(sorted_entries(&cold), sorted_entries(repo), "{ctx}");
         assert_eq!(
             cold.read_chunk(id_b).unwrap(),

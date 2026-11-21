@@ -124,7 +124,7 @@ fn init_store_reopen_read() {
     };
 
     // Reopen and verify
-    let mut repo = open_local_repo_cached(dir, None);
+    let repo = open_local_repo_cached(dir, None);
     assert_eq!(repo.chunk_index().len(), 2);
     let read1 = repo.read_chunk(&id1).unwrap();
     let read2 = repo.read_chunk(&id2).unwrap();

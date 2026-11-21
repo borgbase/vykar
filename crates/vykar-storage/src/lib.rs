@@ -399,7 +399,11 @@ pub trait StorageBackend: Send + Sync {
 /// Dropping it uncommitted discards the staged bytes. A crash leaves at most a
 /// [`vykar_protocol::TEMP_FILE_PREFIX`] file that
 /// [`StorageBackend::remove_stale_temp_files`] sweeps.
-pub trait StagedPut: Send {
+///
+/// `Sync` so a repository holding an open staged pack can be shared
+/// (`Arc<Repository>`); the methods take `&mut self` or `self`, so
+/// implementors need no locking.
+pub trait StagedPut: Send + Sync {
     /// Append `data` to the object.
     fn append(&mut self, data: &[u8]) -> Result<()>;
 

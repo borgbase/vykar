@@ -1,9 +1,9 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
+use super::Repository;
 use super::format::{BlobLocation, decode_chunk_into};
 use super::pack::read_blob_from_pack;
-use super::{BlobCache, Repository};
 use crate::commands::util::check_interrupted;
 use crate::index::dedup_cache;
 use vykar_crypto::CryptoEngine;
@@ -33,7 +33,6 @@ struct CoalescedGroup {
 /// `chunks` and its plaintext.
 struct DecodedBlob {
     result_idx: usize,
-    chunk_id: ChunkId,
     plaintext: Vec<u8>,
 }
 
@@ -87,7 +86,6 @@ fn fetch_group(
         )?;
         decoded.push(DecodedBlob {
             result_idx: blob.result_idx,
-            chunk_id: blob.chunk_id,
             plaintext,
         });
     }
@@ -173,10 +171,9 @@ impl Assembler<'_> {
         }
     }
 
-    /// Cache, slot and drain each blob of one fetched group, in blob order.
-    fn accept(&mut self, cache: &mut BlobCache, blobs: Vec<DecodedBlob>) -> Result<()> {
+    /// Slot and drain each blob of one fetched group, in blob order.
+    fn accept(&mut self, blobs: Vec<DecodedBlob>) -> Result<()> {
         for blob in blobs {
-            cache.insert(blob.chunk_id, blob.plaintext.clone());
             let slot = self.slots.get_mut(blob.result_idx).ok_or_else(|| {
                 VykarError::Other(format!(
                     "internal error: read result index {} out of range",
@@ -201,18 +198,18 @@ impl Repository {
         )
     }
 
-    /// Replace the blob cache with a new one of the given capacity.
-    pub fn set_blob_cache_max_bytes(&mut self, max_bytes: usize) {
-        self.blob_cache = BlobCache::new(max_bytes);
-    }
-
-    /// Read and decrypt a chunk from the repository.
-    /// Results are cached in a weight-bounded blob cache for faster repeated access.
-    pub fn read_chunk(&mut self, chunk_id: &ChunkId) -> Result<Vec<u8>> {
+    /// Read and decrypt a chunk located through the in-memory chunk index.
+    ///
+    /// # Errors
+    ///
+    /// [`VykarError::ChunkNotInIndex`] when the index has no entry for
+    /// `chunk_id`, which is always the case on a repository opened without
+    /// `OpenOptions::with_index()`.
+    pub fn read_chunk(&self, chunk_id: &ChunkId) -> Result<Vec<u8>> {
         let entry = *self
             .chunk_index
             .get(chunk_id)
-            .ok_or_else(|| VykarError::Other(format!("chunk not found: {chunk_id}")))?;
+            .ok_or(VykarError::ChunkNotInIndex(*chunk_id))?;
 
         self.read_chunk_at(
             chunk_id,
@@ -226,16 +223,12 @@ impl Repository {
     /// Bypasses the chunk index — the caller supplies (pack_id, offset, stored_size)
     /// e.g. from the mmap restore cache.
     pub fn read_chunk_at(
-        &mut self,
+        &self,
         chunk_id: &ChunkId,
         pack_id: &PackId,
         pack_offset: u64,
         stored_size: u32,
     ) -> Result<Vec<u8>> {
-        if let Some(cached) = self.blob_cache.get(chunk_id) {
-            return Ok(cached.to_vec());
-        }
-
         let mut blob_data =
             read_blob_from_pack(self.storage.as_ref(), pack_id, pack_offset, stored_size)?;
         let mut plaintext = Vec::new();
@@ -252,8 +245,6 @@ impl Repository {
             false,
             &mut plaintext,
         )?;
-
-        self.blob_cache.insert(*chunk_id, plaintext.clone());
         Ok(plaintext)
     }
 
@@ -261,8 +252,8 @@ impl Repository {
     ///
     /// Each entry in `chunks` is `(ChunkId, PackId, pack_offset, stored_size)`.
     /// Output is appended to `out` in the same order as `chunks`.
-    /// Cache hits are served from `blob_cache`; misses are grouped by pack and
-    /// coalesced into large range reads to minimise HTTP round-trips.
+    /// Chunks are grouped by pack and coalesced into large range reads to
+    /// minimise HTTP round-trips.
     ///
     /// Range reads go out on up to the backend's `request_width` threads (one
     /// at a time with width 1 or a single read). Each thread decrypts and
@@ -279,7 +270,7 @@ impl Repository {
     /// returned once the reads already in flight (up to `request_width - 1`)
     /// have finished; the contents of `out` are then unspecified.
     pub fn read_chunks_coalesced_into(
-        &mut self,
+        &self,
         chunks: &[(ChunkId, PackId, u64, u32)],
         out: &mut Vec<u8>,
         shutdown: Option<&AtomicBool>,
@@ -288,40 +279,23 @@ impl Repository {
             return Ok(());
         }
 
-        // --- Phase 1: cache scan ---
-        // Result slots: Some(plaintext) for cache hits, None for misses.
-        let mut slots: Vec<Option<Vec<u8>>> = Vec::with_capacity(chunks.len());
-        // Blobs that need fetching, grouped by pack.
+        // --- Phase 1: group by pack ---
         let mut pack_blobs: std::collections::HashMap<PackId, Vec<CoalescedBlob>> =
             std::collections::HashMap::new();
-        let mut misses = 0usize;
-
         for (idx, (chunk_id, pack_id, pack_offset, stored_size)) in chunks.iter().enumerate() {
-            if let Some(cached) = self.blob_cache.get(chunk_id) {
-                slots.push(Some(cached.to_vec()));
-            } else {
-                slots.push(None);
-                misses += 1;
-                pack_blobs.entry(*pack_id).or_default().push(CoalescedBlob {
-                    result_idx: idx,
-                    chunk_id: *chunk_id,
-                    pack_offset: *pack_offset,
-                    stored_size: *stored_size,
-                });
-            }
+            pack_blobs.entry(*pack_id).or_default().push(CoalescedBlob {
+                result_idx: idx,
+                chunk_id: *chunk_id,
+                pack_offset: *pack_offset,
+                stored_size: *stored_size,
+            });
         }
 
         let mut asm = Assembler {
-            slots,
+            slots: vec![None; chunks.len()],
             next_emit: 0,
             out,
         };
-        asm.drain_ready();
-
-        // All cache hits — done.
-        if pack_blobs.is_empty() {
-            return Ok(());
-        }
 
         // --- Phase 2: coalesce ---
         let mut groups: Vec<CoalescedGroup> = Vec::new();
@@ -357,15 +331,14 @@ impl Repository {
         let threads = width.min(groups.len());
         let storage = self.storage.as_ref();
         let crypto = self.crypto.as_ref();
-        let cache = &mut self.blob_cache;
         if threads <= 1 {
             for group in &groups {
                 check_interrupted(shutdown)?;
-                asm.accept(cache, fetch_group(storage, crypto, group)?)?;
+                asm.accept(fetch_group(storage, crypto, group)?)?;
             }
         } else {
             read_groups_parallel(width, storage, crypto, &groups, shutdown, |blobs| {
-                asm.accept(cache, blobs)
+                asm.accept(blobs)
             })?;
         }
 
@@ -379,22 +352,13 @@ impl Repository {
 
         let bytes: u64 = groups.iter().map(|g| g.read_end - g.read_start).sum();
         tracing::debug!(
-            "coalesced read: {} chunks ({} misses) in {} range reads of {} bytes, width {}, {:?}",
+            "coalesced read: {} chunks in {} range reads of {} bytes, width {}, {:?}",
             chunks.len(),
-            misses,
             groups.len(),
             bytes,
             threads,
             started.elapsed()
         );
         Ok(())
-    }
-}
-
-#[cfg(test)]
-impl Repository {
-    /// Clear the blob cache (test-only).
-    pub fn clear_blob_cache(&mut self) {
-        self.blob_cache = BlobCache::new(self.blob_cache.max_bytes);
     }
 }

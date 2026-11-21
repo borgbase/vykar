@@ -34,7 +34,7 @@ pub fn list_snapshots(
 
 /// List all items in a specific snapshot.
 /// Tries the local restore cache first to avoid downloading the full index.
-/// Falls back to the full index (with blob cache) on cache miss.
+/// Falls back to the full index on cache miss.
 pub fn list_snapshot_items(
     config: &VykarConfig,
     passphrase: Option<&str>,
@@ -397,9 +397,7 @@ const LAZY_WINDOW_GAP: u64 = 256 * 1024;
 fn resolve_from_index(index: &crate::index::ChunkIndex, ids: &[ChunkId]) -> Result<Vec<ChunkLoc>> {
     ids.iter()
         .map(|id| {
-            let e = index
-                .get(id)
-                .ok_or_else(|| VykarError::Other(format!("chunk not found: {id}")))?;
+            let e = index.get(id).ok_or(VykarError::ChunkNotInIndex(*id))?;
             Ok((*id, e.pack_id, e.pack_offset, e.stored_size))
         })
         .collect()
@@ -705,6 +703,7 @@ where
 }
 
 /// Load the raw concatenated item stream bytes from chunk pointers using the chunk index.
+/// Returns ChunkNotInIndex if a chunk is missing from the chunk index.
 pub fn load_item_stream_from_ptrs(
     repo: &mut Repository,
     item_ptrs: &[ChunkId],
@@ -717,7 +716,7 @@ pub fn load_item_stream_from_ptrs(
             let entry = *repo
                 .chunk_index()
                 .get(chunk_id)
-                .ok_or_else(|| VykarError::Other(format!("chunk not found: {chunk_id}")))?;
+                .ok_or(VykarError::ChunkNotInIndex(*chunk_id))?;
             Ok((entry.pack_id, entry.pack_offset, entry.stored_size))
         },
         shutdown,

@@ -78,8 +78,6 @@ fn adjacent_blobs_coalesce_into_single_read() {
         "expected all chunks in one pack"
     );
 
-    // Clear blob cache so everything must be fetched.
-    repo.clear_blob_cache();
     log.reset_get_range_count();
 
     let mut out = Vec::new();
@@ -97,15 +95,17 @@ fn adjacent_blobs_coalesce_into_single_read() {
     assert_eq!(out, expected);
 }
 
+/// The repository does not cache decoded chunks: reading chunks that were
+/// just read goes to storage again.
 #[test]
-fn cache_hits_skip_network() {
+fn repeat_reads_go_to_storage() {
     let (mut repo, log) = repo_on_counting_backend();
     let ids = store_chunks(&mut repo, 3);
     let chunks = resolve_chunks(&repo, &ids);
 
-    // Pre-populate blob cache by reading each chunk.
+    let mut expected = Vec::new();
     for id in &ids {
-        let _ = repo.read_chunk(id).unwrap();
+        expected.extend_from_slice(&repo.read_chunk(id).unwrap());
     }
 
     log.reset_get_range_count();
@@ -115,14 +115,9 @@ fn cache_hits_skip_network() {
 
     assert_eq!(
         log.get_range_count(),
-        0,
-        "expected 0 get_range calls (all cache hits)"
+        1,
+        "expected the one coalesced get_range"
     );
-
-    let mut expected = Vec::new();
-    for id in &ids {
-        expected.extend_from_slice(&repo.read_chunk(id).unwrap());
-    }
     assert_eq!(out, expected);
 }
 
@@ -152,7 +147,6 @@ fn cross_pack_grouping() {
         "expected chunks in different packs"
     );
 
-    repo.clear_blob_cache();
     log.reset_get_range_count();
 
     let mut out = Vec::new();
@@ -207,7 +201,6 @@ fn output_order_preserved_across_packs() {
 
     // Request order: a1, b1, a2 — interleaved across packs.
     let chunks = resolve_chunks(&repo, &[id_a1, id_b1, id_a2]);
-    repo.clear_blob_cache();
 
     let mut out = Vec::new();
     repo.read_chunks_coalesced_into(&chunks, &mut out, None)
@@ -225,7 +218,7 @@ fn output_order_preserved_across_packs() {
 
 #[test]
 fn empty_input_is_noop() {
-    let (mut repo, log) = repo_on_counting_backend();
+    let (repo, log) = repo_on_counting_backend();
     log.reset_get_range_count();
 
     let mut out = Vec::new();
@@ -234,6 +227,18 @@ fn empty_input_is_noop() {
 
     assert!(out.is_empty());
     assert_eq!(log.get_range_count(), 0);
+}
+
+#[test]
+fn load_item_stream_from_ptrs_reports_chunk_not_in_index() {
+    let (mut repo, _log) = repo_on_counting_backend();
+    let missing = ChunkId::from_bytes([0xEE; 32]);
+    let err =
+        crate::commands::list::load_item_stream_from_ptrs(&mut repo, &[missing], None).unwrap_err();
+    assert!(
+        matches!(err, VykarError::ChunkNotInIndex(id) if id == missing),
+        "got: {err}"
+    );
 }
 
 #[test]
@@ -277,7 +282,6 @@ fn large_gap_splits_into_separate_reads() {
         "gap {gap_between} should exceed MAX_COALESCE_GAP (256 KiB) to force a split"
     );
 
-    repo.clear_blob_cache();
     log.reset_get_range_count();
 
     let mut out = Vec::new();
@@ -308,7 +312,6 @@ fn duplicate_chunk_ids_coalesce_into_single_range_read() {
     let mut dup_chunks = chunks.clone();
     dup_chunks.extend_from_slice(&chunks);
 
-    repo.clear_blob_cache();
     log.reset_get_range_count();
 
     let mut out = Vec::new();
@@ -413,7 +416,6 @@ fn repo_with_cancelling_backend(
         repo.flush_packs().unwrap();
         ids.push(id);
     }
-    repo.clear_blob_cache();
     reads.store(0, Ordering::Relaxed);
     (repo, flag, reads, ids)
 }
@@ -425,7 +427,7 @@ fn repo_with_cancelling_backend(
 /// Width 1, so this covers the sequential path.
 #[test]
 fn coalesced_read_cancels_between_range_reads() {
-    let (mut repo, flag, reads, ids) = repo_with_cancelling_backend(3, 1);
+    let (repo, flag, reads, ids) = repo_with_cancelling_backend(3, 1);
     let chunks = resolve_chunks(&repo, &ids);
     assert_eq!(
         chunks
@@ -459,7 +461,7 @@ fn coalesced_read_cancels_between_range_reads() {
 /// one read per worker.
 #[test]
 fn parallel_coalesced_read_cancels_within_one_read_per_worker() {
-    let (mut repo, flag, reads, ids) = repo_with_cancelling_backend(12, 4);
+    let (repo, flag, reads, ids) = repo_with_cancelling_backend(12, 4);
     let chunks = resolve_chunks(&repo, &ids);
 
     let mut out = Vec::new();
@@ -481,7 +483,7 @@ fn parallel_coalesced_read_cancels_within_one_read_per_worker() {
 #[test]
 fn pre_cancelled_coalesced_read_issues_no_request() {
     for width in [1, 4] {
-        let (mut repo, flag, reads, ids) = repo_with_cancelling_backend(3, width);
+        let (repo, flag, reads, ids) = repo_with_cancelling_backend(3, width);
         let chunks = resolve_chunks(&repo, &ids);
         flag.store(true, Ordering::Relaxed);
 
@@ -521,7 +523,7 @@ fn flip_byte_in_stored_chunk(repo: &Repository, id: &vykar_types::chunk_id::Chun
 }
 
 #[test]
-fn plaintext_read_chunk_rejects_corrupt_blob_and_does_not_cache_it() {
+fn plaintext_read_chunk_rejects_corrupt_blob() {
     let mut repo = crate::testutil::test_repo_plaintext();
     let data = b"plaintext-chunk-that-will-be-corrupted-on-disk";
     let (id, _, _) = repo
@@ -529,7 +531,6 @@ fn plaintext_read_chunk_rejects_corrupt_blob_and_does_not_cache_it() {
         .unwrap();
     repo.flush_packs().unwrap();
     flip_byte_in_stored_chunk(&repo, &id, data);
-    repo.clear_blob_cache();
 
     for attempt in 0..2 {
         let err = repo.read_chunk(&id).unwrap_err();
@@ -546,7 +547,6 @@ fn plaintext_coalesced_read_rejects_corrupt_blob() {
     let ids = store_chunks(&mut repo, 3);
     let corrupt = "chunk-data-0001-padding-to-make-it-unique";
     flip_byte_in_stored_chunk(&repo, &ids[1], corrupt.as_bytes());
-    repo.clear_blob_cache();
 
     let chunks = resolve_chunks(&repo, &ids);
     let mut out = Vec::new();
@@ -670,7 +670,6 @@ fn store_packs(repo: &mut Repository, pack_sizes: &[usize]) -> Vec<Vec<(ChunkId,
         repo.flush_packs().unwrap();
         packs.push(chunks);
     }
-    repo.clear_blob_cache();
     packs
 }
 
@@ -716,7 +715,6 @@ fn parallel_read_overlaps_range_reads_up_to_width() {
 
     for width in [3, 1] {
         probe.width.store(width, Ordering::SeqCst);
-        repo.clear_blob_cache();
         probe.reset_counters();
 
         let mut out = Vec::new();
@@ -756,7 +754,6 @@ fn parallel_read_returns_the_earliest_failing_group() {
     for width in [4, 1] {
         probe.width.store(width, Ordering::SeqCst);
         for attempt in 0..5 {
-            repo.clear_blob_cache();
             let mut out = Vec::new();
             let err = repo
                 .read_chunks_coalesced_into(&chunks, &mut out, None)
@@ -770,8 +767,7 @@ fn parallel_read_returns_the_earliest_failing_group() {
     }
 }
 
-/// Mixed cache hits and misses over several packs give the same item stream
-/// at every width, with and without AEAD.
+/// The same item stream at every width, with and without AEAD.
 #[test]
 fn item_stream_bytes_identical_across_widths() {
     for mode in [EncryptionMode::None, EncryptionMode::Aes256Gcm] {
@@ -788,21 +784,12 @@ fn item_stream_bytes_identical_across_widths() {
 
         for width in [1, 2, 4, 16] {
             probe.width.store(width, Ordering::SeqCst);
-            for prewarm in [false, true] {
-                repo.clear_blob_cache();
-                if prewarm {
-                    for id in ids.iter().step_by(3) {
-                        repo.read_chunk(id).unwrap();
-                    }
-                }
-                let stream =
-                    crate::commands::list::load_item_stream_from_ptrs(&mut repo, &ids, None)
-                        .unwrap();
-                assert!(
-                    stream == expected,
-                    "{mode:?}, width {width}, prewarm {prewarm}: stream differs"
-                );
-            }
+            let stream =
+                crate::commands::list::load_item_stream_from_ptrs(&mut repo, &ids, None).unwrap();
+            assert!(
+                stream == expected,
+                "{mode:?}, width {width}: stream differs"
+            );
         }
     }
 }
@@ -817,14 +804,12 @@ fn duplicate_chunk_ids_decode_under_aead() {
     let mut dup_chunks = chunks.clone();
     dup_chunks.extend_from_slice(&chunks);
 
-    repo.clear_blob_cache();
     let c0 = repo.read_chunk(&ids[0]).unwrap();
     let c1 = repo.read_chunk(&ids[1]).unwrap();
     let expected = [c0.as_slice(), &c1, &c0, &c1].concat();
 
     for width in [1, 4] {
         probe.width.store(width, Ordering::SeqCst);
-        repo.clear_blob_cache();
         probe.reset_counters();
         let mut out = Vec::new();
         repo.read_chunks_coalesced_into(&dup_chunks, &mut out, None)

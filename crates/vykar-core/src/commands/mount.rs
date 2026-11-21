@@ -551,7 +551,7 @@ impl DavDirEntry for VykarDirEntry {
 #[derive(Clone)]
 struct VykarDavFs {
     tree: Arc<VfsNode>,
-    repo: Arc<Mutex<Repository>>,
+    repo: Arc<Repository>,
     cache: Arc<Mutex<LruCache<ChunkId, Arc<Vec<u8>>>>>,
 }
 
@@ -624,7 +624,7 @@ struct VykarDavFile {
     chunks: Vec<ChunkRef>,
     meta: VfsMeta,
     pos: u64,
-    repo: Arc<Mutex<Repository>>,
+    repo: Arc<Repository>,
     cache: ChunkCache,
 }
 
@@ -638,9 +638,11 @@ impl fmt::Debug for VykarDavFile {
     }
 }
 
-/// Read a chunk via the LRU cache, falling back to the repository.
+/// Read a chunk via the LRU cache, falling back to the repository. Neither
+/// lock is held across the storage read, so concurrent misses read in
+/// parallel (and two misses on the same chunk both read it).
 fn read_chunk_cached(
-    repo: &Arc<Mutex<Repository>>,
+    repo: &Repository,
     cache: &ChunkCache,
     chunk_id: &ChunkId,
 ) -> FsResult<Arc<Vec<u8>>> {
@@ -653,12 +655,9 @@ fn read_chunk_cached(
     }
 
     // Slow path: read from repository
-    let data = {
-        let mut guard = repo.lock().unwrap_or_else(|e| e.into_inner());
-        guard
-            .read_chunk(chunk_id)
-            .map_err(|_| FsError::GeneralFailure)?
-    };
+    let data = repo
+        .read_chunk(chunk_id)
+        .map_err(|_| FsError::GeneralFailure)?;
 
     let data = Arc::new(data);
 
@@ -873,7 +872,7 @@ pub fn run_with_progress(
         }
     };
 
-    let repo = Arc::new(Mutex::new(repo));
+    let repo = Arc::new(repo);
     let cache_size = NonZeroUsize::new(cache_size)
         .unwrap_or_else(|| NonZeroUsize::new(256).expect("literal non-zero cache size"));
     let cache = Arc::new(Mutex::new(LruCache::new(cache_size)));
@@ -1190,5 +1189,102 @@ mod tests {
             html_inner.contains(r#"data-sort-col="1" data-sort-dir="asc""#),
             "inner directory table should default to col 1 asc"
         );
+    }
+
+    /// Shared state of a [`RendezvousBackend`]: (reads in flight, most at once).
+    #[derive(Default)]
+    struct Rendezvous {
+        armed: std::sync::atomic::AtomicBool,
+        state: Mutex<(usize, usize)>,
+        cond: std::sync::Condvar,
+    }
+
+    /// MemoryBackend whose armed range reads wait until two are in flight.
+    struct RendezvousBackend {
+        inner: crate::testutil::MemoryBackend,
+        rv: Arc<Rendezvous>,
+    }
+
+    impl vykar_storage::InnerBackend for RendezvousBackend {
+        fn inner_backend(&self) -> &dyn vykar_storage::StorageBackend {
+            &self.inner
+        }
+    }
+
+    vykar_storage::delegate_storage_backend! {
+        for RendezvousBackend;
+        except [get_range];
+
+        fn get_range(&self, key: &str, offset: u64, length: u64) -> Result<Option<Vec<u8>>> {
+            use std::sync::atomic::Ordering;
+            if !self.rv.armed.load(Ordering::SeqCst) {
+                return self.inner.get_range(key, offset, length);
+            }
+            {
+                let mut s = self.rv.state.lock().unwrap();
+                s.0 += 1;
+                s.1 = s.1.max(s.0);
+                self.rv.cond.notify_all();
+                let _ = self
+                    .rv
+                    .cond
+                    .wait_timeout_while(s, std::time::Duration::from_secs(30), |s| s.1 < 2)
+                    .unwrap();
+            }
+            let result = self.inner.get_range(key, offset, length);
+            self.rv.state.lock().unwrap().0 -= 1;
+            result
+        }
+    }
+
+    /// Two uncached reads through one `Repository` reach storage at the same
+    /// time. Guards against a lock held across the storage read in
+    /// `read_chunk_cached`: with one, the second read cannot enter `get_range`
+    /// while the first waits, the first times out and `max` stays 1.
+    #[test]
+    fn uncached_reads_run_concurrently() {
+        use crate::compress::Compression;
+        use crate::repo::pack::PackType;
+        use crate::repo::{EncryptionMode, WriteSessionOptions};
+
+        crate::testutil::init_test_environment();
+        let rv = Arc::new(Rendezvous::default());
+        let backend = RendezvousBackend {
+            inner: crate::testutil::MemoryBackend::new(),
+            rv: Arc::clone(&rv),
+        };
+        let mut repo = Repository::init(
+            Box::new(backend),
+            EncryptionMode::None,
+            crate::config::ChunkerConfig::default(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        repo.begin_write_session(&WriteSessionOptions::default())
+            .unwrap();
+        let data_a = b"mount chunk a".repeat(100);
+        let data_b = b"mount chunk b".repeat(100);
+        let (id_a, _, _) = repo
+            .store_chunk(&data_a, Compression::None, PackType::Data)
+            .unwrap();
+        let (id_b, _, _) = repo
+            .store_chunk(&data_b, Compression::None, PackType::Data)
+            .unwrap();
+        repo.flush_packs().unwrap();
+        rv.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let repo = Arc::new(repo);
+        let cache: ChunkCache = Arc::new(Mutex::new(LruCache::new(NonZeroUsize::new(16).unwrap())));
+        let (a, b) = std::thread::scope(|s| {
+            let a = s.spawn(|| read_chunk_cached(&repo, &cache, &id_a));
+            let b = s.spawn(|| read_chunk_cached(&repo, &cache, &id_b));
+            (a.join().unwrap(), b.join().unwrap())
+        });
+
+        assert_eq!(*a.ok().unwrap(), data_a);
+        assert_eq!(*b.ok().unwrap(), data_b);
+        assert_eq!(rv.state.lock().unwrap().1, 2);
     }
 }

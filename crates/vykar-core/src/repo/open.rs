@@ -11,9 +11,8 @@ use super::key::{self, KeyProofCtx};
 use super::manifest::Manifest;
 use super::snapshot_cache;
 use super::{
-    BLOB_CACHE_MAX_BYTES, BlobCache, EncryptionMode, INDEX_OBJECT_CONTEXT, IndexLayout,
-    KEY_PRIMARY, KEY_SECONDARY, MAX_PACK_SIZE_LIMIT, OpenOptions, RepoConfig, RepoFormat,
-    Repository,
+    EncryptionMode, INDEX_OBJECT_CONTEXT, IndexLayout, KEY_PRIMARY, KEY_SECONDARY,
+    MAX_PACK_SIZE_LIMIT, OpenOptions, RepoConfig, RepoFormat, Repository,
 };
 use crate::compress;
 use crate::config::{
@@ -297,7 +296,6 @@ impl Repository {
             config: repo_config,
             format,
             file_cache: FileCache::new(),
-            blob_cache: BlobCache::new(BLOB_CACHE_MAX_BYTES),
             index_generation,
             index_dirty: false,
             file_cache_dirty: false,
@@ -548,7 +546,6 @@ impl Repository {
             format,
             // Filled in by `open` from `file_cache_load`.
             file_cache: FileCache::new(),
-            blob_cache: BlobCache::new(BLOB_CACHE_MAX_BYTES),
             index_generation,
             index_dirty: false,
             file_cache_dirty: false,

@@ -129,10 +129,45 @@ fn save_state_persists_index() {
 
 #[test]
 fn read_missing_chunk_fails() {
-    let mut repo = test_repo_plaintext();
+    let repo = test_repo_plaintext();
     let fake_id = vykar_types::chunk_id::ChunkId::from_bytes([0xFF; 32]);
     let result = repo.read_chunk(&fake_id);
-    assert!(result.is_err());
+    assert!(
+        matches!(result, Err(vykar_types::error::VykarError::ChunkNotInIndex(id)) if id == fake_id)
+    );
+}
+
+/// Without a loaded index every chunk is "not in the index", even a stored
+/// one; its explicit location still reads.
+#[test]
+fn read_chunk_without_loaded_index_is_chunk_not_in_index() {
+    let mut repo = test_repo_plaintext();
+    let data = b"chunk read through a handle without the index";
+    let (id, _, _) = repo
+        .store_chunk(data, Compression::None, PackType::Data)
+        .unwrap();
+    repo.flush_packs().unwrap();
+    repo.save_state().unwrap();
+    let entry = *repo.chunk_index().get(&id).unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let bare = Repository::open(
+        Box::new(std::sync::Arc::clone(&repo.storage)),
+        None,
+        Some(dir.path().to_path_buf()),
+        crate::repo::OpenOptions::new(),
+    )
+    .unwrap();
+
+    let err = bare.read_chunk(&id).unwrap_err();
+    assert!(
+        matches!(err, vykar_types::error::VykarError::ChunkNotInIndex(got) if got == id),
+        "got: {err}"
+    );
+    let read_back = bare
+        .read_chunk_at(&id, &entry.pack_id, entry.pack_offset, entry.stored_size)
+        .unwrap();
+    assert_eq!(read_back, data);
 }
 
 #[test]

@@ -431,7 +431,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn health_advertises_pack_parts() {
+    async fn health_advertises_capabilities() {
         let (router, _state, _tmp) = setup_app(0);
         let resp = send(router, "GET", "/health", &[], Vec::new()).await;
         assert_status(&resp, StatusCode::OK);
@@ -439,6 +439,8 @@ mod tests {
             serde_json::from_slice(&body_bytes(resp).await).unwrap();
         assert!(caps.pack_parts);
         assert!(caps.segmented_index);
+        assert!(caps.serves_v6_key_dirs());
+        assert_eq!(caps.key_dirs, vykar_protocol::KNOWN_ROOT_DIRS);
     }
 
     /// Parts in any order, one sent twice; the assembled object is exactly

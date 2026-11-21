@@ -99,7 +99,9 @@ pub async fn repo_action_dispatch(
 ///
 /// `protocol_version` and `hashes` are additive: a pre-BLAKE3 server answers
 /// without them, which is how a new client tells the two apart at `vykar init`
-/// instead of discovering it at the first pack upload.
+/// instead of discovering it at the first pack upload. `key_dirs` lists the
+/// top-level key directories this server accepts, so a client can tell
+/// whether it serves the format-v6 ones.
 pub async fn health() -> impl IntoResponse {
     axum::Json(serde_json::json!({
         "status": "ok",
@@ -111,5 +113,6 @@ pub async fn health() -> impl IntoResponse {
         ],
         "pack_parts": true,
         "segmented_index": true,
+        "key_dirs": vykar_protocol::KNOWN_ROOT_DIRS,
     }))
 }

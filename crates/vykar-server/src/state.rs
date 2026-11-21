@@ -466,6 +466,16 @@ mod tests {
             "0f".repeat(32)
         )));
         assert!(is_valid_storage_key("manifest"));
+        assert!(is_valid_storage_key("index.h/12"));
+        assert!(!is_valid_storage_key("index.h/012"));
+        assert!(is_valid_storage_key(&format!(
+            "packmaps/{}",
+            "0f".repeat(32)
+        )));
+        assert!(!is_valid_storage_key(&format!(
+            "packmaps/{}",
+            "0F".repeat(32)
+        )));
     }
 
     #[test]
@@ -475,6 +485,9 @@ mod tests {
         assert!(is_valid_storage_key("sessions/abc123.index"));
         // Legacy pending_index directory (backward compat)
         assert!(is_valid_storage_key("pending_index/session123"));
+        assert!(is_valid_storage_key("index.h"));
+        assert!(is_valid_storage_key("index.h/"));
+        assert!(is_valid_storage_key("packmaps/"));
     }
 
     #[test]
@@ -522,6 +535,15 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join("index.d")).unwrap();
         std::fs::write(tmp.path().join("index"), b"h").unwrap();
+        assert!(unexpected_entries(tmp.path()).is_empty());
+    }
+
+    /// Neither do the format-v6 directories.
+    #[test]
+    fn v6_dirs_are_expected_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("index.h")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("packmaps")).unwrap();
         assert!(unexpected_entries(tmp.path()).is_empty());
     }
 

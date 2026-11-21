@@ -27,7 +27,7 @@ The server exposes normal storage-object routes plus a small set of admin query 
 | `GET` | `/{*path}` | `get(key)` | Returns `200` + body or `404`. With a `Range` header, this becomes a ranged read and returns `206`. `GET /index` honours `If-None-Match: "<BLAKE3 hex>"`: it answers `304` with `ETag` when the value names the digest verified on the last `PUT /index` (`X-Content-BLAKE3`; a BLAKE2b-verified PUT leaves no record) and the file that PUT produced is still in place. The record is held in server memory, so the first conditional GET after a restart is a `200`. Other keys ignore the header, and so does a `Range` read. An `index` corrupted in place (same inode, size and mtime) still gets a `304`, so the client proceeds on its own good copy where a plain GET would fail to decode; `check` always reads `index` unconditionally. |
 | `HEAD` | `/{*path}` | `exists(key)` | Returns `200` with metadata or `404`. |
 | `PUT` | `/{*path}` | `put(key, data)` | Raw bytes body. REST clients send exactly one of `X-Content-BLAKE3` (format-v3 packs, and non-pack objects to a server advertising `blake3`) or `X-Content-BLAKE2b` (format-v2 packs, and non-pack objects to a pre-0.20 server); the server verifies it while streaming the write. Both headers at once is a 400, and a pack upload with neither is a 400. |
-| `DELETE` | `/{*path}` | `delete(key)` | Returns `204` or `404`. Rejected with `403` in append-only mode, except for `locks/*`, `sessions/*` and temporary upload files. |
+| `DELETE` | `/{*path}` | `delete(key)` | Returns `204` or `404`. Rejected with `403` in append-only mode unless the key class allows it (see [Append-Only Enforcement](#append-only-enforcement)). |
 | `GET` | `/{*path}?list` | `list(prefix)` | Returns a JSON array of matching keys. |
 | `POST` | `/{*path}?mkdir` | `create_dir(key)` | Creates directory scaffolding. |
 | `POST` | `/{*path}?sizes` | `object_sizes(keys)` | Body: a JSON array of up to 100,000 full keys, all below `{path}/`. Returns a JSON array of the same length with each object's size in bytes, or `null` when it is absent. A backup commit uses it to verify all its packs (`POST /packs?sizes`) in one request; servers that predate it answer `400`, and the client falls back to per-shard listings or `HEAD`s. |
@@ -56,14 +56,20 @@ All routes except `GET /health` require `Authorization: Bearer <token>`. The tok
 
 ## Append-Only Enforcement
 
-When `append_only = true`:
+When `append_only = true`, `PUT` of an existing key, `DELETE` and `/?batch-delete` consult one key-class table (`vykar_protocol::key_class`). Creating a key is always allowed, except under a temp-file name, which is never a valid key. A refused request returns `403 Forbidden`.
 
-- `DELETE` returns `403 Forbidden`, except for `locks/*`, `sessions/*`, and leftover temporary upload files — ephemeral coordination state and uncommitted data, whose removal cannot violate append-only
-- `PUT` to an existing key returns `403` **unless** the key is on the mutable-allowlist
+| Class | Keys | Overwrite | Delete |
+|-------|------|-----------|--------|
+| Write-once | `config`, `keys/*`, `snapshots/*`, `packs/<xx>/<id>`, `index.h/<gen>`, `packmaps/<id>`, legacy `pending_index/*` | no | no |
+| Content-addressed | `index.d/<id>` | yes | yes |
+| Legacy mutable | `index`, `index.gen`, `manifest` | yes | no |
+| Ephemeral | `locks/*`, `sessions/*` | yes | yes |
+| Temp | leftover temporary upload files (`.tmp.*`, `.repack_tmp.*`) | — | yes |
+
+Keys are classified after trimming leading and trailing slashes, as path resolution does. Directories and keys outside the schema have no class and are refused.
+
+- `/?batch-delete` is refused as a whole, with nothing deleted, if any key's class refuses deletion
 - A part upload of an existing pack is refused with `403` at its first part; a completion that finds the pack already present succeeds only if the stored object carries the expected digest (nothing is overwritten), and fsyncs the directory before answering
-- Mutable-allowlist: `index`, `index.gen`, `locks/*`, `sessions/*` — these may be overwritten freely
-- All other keys (`config`, `keys/*`, `snapshots/*`, `packs/*`) are immutable once written
-- `/?batch-delete` is rejected
 - `/?repack` operations that delete old packs are rejected
 
 This protects existing history from a compromised client while still allowing normal backup commits. In particular, snapshot blobs under `snapshots/` are immutable — a compromised client cannot hide historical backups by overwriting or deleting them.
@@ -152,10 +158,12 @@ It also sends the content-digest header on `PUT` requests — bound once to the 
 `GET /health` is unauthenticated and advertises what the server supports:
 
 ```json
-{"status":"ok","version":"0.20.0","protocol_version":2,"hashes":["blake2b","blake3"],"pack_parts":true}
+{"status":"ok","version":"0.20.0","protocol_version":2,"hashes":["blake2b","blake3"],"pack_parts":true,"segmented_index":true,"key_dirs":["keys","snapshots","packs","locks","sessions","pending_index","index.d","index.h","packmaps"]}
 ```
 
-`pack_parts` advertises [pack uploads in parts](#pack-uploads-in-parts); the client probes it lazily, on the first pack large enough to split (or the first non-pack upload when the repository is v2, to pick its digest header), so a backup that uploads nothing pays no extra round trip. All three fields are additive: a pre-BLAKE3 server omits `protocol_version` and `hashes`, which a client reads as "blake2b only", and a server without part support omits `pack_parts`. `vykar init` probes this **before writing anything**, because `init` writes only non-pack keys that an old server happily accepts — without the probe, `init` would succeed and only the first `backup` would fail. Requests that declare `"hash": "blake3"` must also declare `protocol_version: 2`, so an old server rejects them outright rather than silently verifying every pack under the wrong algorithm.
+`key_dirs` lists the top-level key directories the server accepts. `index.h` and `packmaps` (format v6) are accepted only by servers that list them; older servers omit the field and answer `400` to those keys.
+
+`pack_parts` advertises [pack uploads in parts](#pack-uploads-in-parts); the client probes it lazily, on the first pack large enough to split (or the first non-pack upload when the repository is v2, to pick its digest header), so a backup that uploads nothing pays no extra round trip. All fields beyond `status` and `version` are additive: a pre-BLAKE3 server omits `protocol_version` and `hashes`, which a client reads as "blake2b only", a server without part support omits `pack_parts`, and a server without the segmented index omits `segmented_index`. `vykar init` probes this **before writing anything**, because `init` writes only non-pack keys that an old server happily accepts — without the probe, `init` would succeed and only the first `backup` would fail. Requests that declare `"hash": "blake3"` must also declare `protocol_version: 2`, so an old server rejects them outright rather than silently verifying every pack under the wrong algorithm.
 
 Client config:
 

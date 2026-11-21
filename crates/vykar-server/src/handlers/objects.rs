@@ -141,23 +141,15 @@ pub async fn put_object(
         Err(e) => return Err(ServerError::from(e)),
     };
 
-    // Append-only: only index, index.gen, index.d/*, locks/*, sessions/* are
-    // overwritable. Everything else (config, keys/*, snapshots/*, packs/*) is
-    // immutable once written. An `index.d/` object is content-named, so an
-    // overwrite is a retried or repeated PUT of the same state; the index
-    // itself was always overwritable.
-    if state.inner.config.append_only && existing_meta.is_some() {
-        let is_mutable = key == "index"
-            || key == "index.gen"
-            || key == "manifest" // v1 compat — remove once v1 clients are retired
-            || vykar_protocol::is_index_object_key(&key)
-            || key.starts_with("locks/")
-            || key.starts_with("sessions/");
-        if !is_mutable {
-            return Err(ServerError::Forbidden(
-                "append-only: cannot overwrite immutable object".into(),
-            ));
-        }
+    // Append-only: an existing object may be replaced only where the key-class
+    // table allows it (`vykar_protocol::KeyClass`).
+    if state.inner.config.append_only
+        && existing_meta.is_some()
+        && !vykar_protocol::append_only_allows(&key, vykar_protocol::Verb::Overwrite)
+    {
+        return Err(ServerError::Forbidden(
+            "append-only: cannot overwrite immutable object".into(),
+        ));
     }
 
     // Track old file size for quota accounting.
@@ -369,22 +361,17 @@ pub async fn put_object(
     Ok(status.into_response())
 }
 
-/// DELETE /{*path} — delete object. Rejected in append-only mode.
+/// DELETE /{*path} — delete object. Append-only: per the key-class table.
 pub async fn delete_object(
     State(state): State<AppState>,
     Path(key): Path<String>,
 ) -> Result<Response, ServerError> {
     let is_temp = vykar_protocol::is_temp_file(&key);
 
-    // Append-only forbids deleting committed data. Temp files are uncommitted
-    // (interrupted PUTs), and locks/ + sessions/ are ephemeral coordination
-    // state — deleting any of these cannot violate append-only. Index objects
-    // are the same trust as overwriting `index`, which was always allowed.
+    // Append-only: only the classes the key-class table allows to be deleted
+    // (`vykar_protocol::KeyClass`). Checked before path resolution.
     if state.inner.config.append_only
-        && !is_temp
-        && !vykar_protocol::is_index_object_key(&key)
-        && !key.starts_with("locks/")
-        && !key.starts_with("sessions/")
+        && !vykar_protocol::append_only_allows(&key, vykar_protocol::Verb::Delete)
     {
         return Err(ServerError::Forbidden(
             "append-only: delete not allowed".into(),
@@ -1331,6 +1318,164 @@ mod tests {
                 listed.into_iter().map(|k| (k.key, k.size)).collect();
             listed.sort();
             assert_eq!(listed, expected, "{uri}");
+        }
+    }
+
+    /// One sample key per class, mapped by hand rather than with `key_class`.
+    fn class_samples() -> Vec<(String, vykar_protocol::KeyClass)> {
+        use vykar_protocol::KeyClass::*;
+        let hex = "0123456789abcdef".repeat(4);
+        vec![
+            ("snapshots/abc".into(), WriteOnce),
+            ("config".into(), WriteOnce),
+            ("keys/k".into(), WriteOnce),
+            ("pending_index/p".into(), WriteOnce),
+            ("manifest".into(), LegacyMutable),
+            (pack_key(0x7e), WriteOnce),
+            ("index.h/7".into(), WriteOnce),
+            (format!("packmaps/{hex}"), WriteOnce),
+            (format!("index.d/{hex}"), ContentAddressed),
+            ("index".into(), LegacyMutable),
+            ("index.gen".into(), LegacyMutable),
+            ("locks/l.json".into(), Ephemeral),
+            ("sessions/s.json".into(), Ephemeral),
+            ("snapshots/.tmp.x.1".into(), Temp),
+        ]
+    }
+
+    async fn put_with_blake3(
+        router: axum::Router,
+        key: &str,
+        body: &[u8],
+    ) -> axum::response::Response {
+        let digest = blake3_hex(body);
+        authed_put_with_digests(
+            router,
+            &format!("/{key}"),
+            body.to_vec(),
+            &[("X-Content-BLAKE3", &digest)],
+        )
+        .await
+    }
+
+    /// Create, overwrite, delete and batch-delete one sample key of every
+    /// class. The expected outcome comes from `KeyClass::append_only_allows`.
+    async fn run_class_matrix(append_only: bool) {
+        use vykar_protocol::{KeyClass, Verb};
+        for (key, class) in class_samples() {
+            let (router, _state, tmp) = setup_app_with(0, append_only);
+            let path = tmp.path().join(&key);
+            let allows = |verb| !append_only || class.append_only_allows(verb);
+            let write_direct = |bytes: &[u8]| {
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(&path, bytes).unwrap();
+            };
+            let ctx = format!("{key} ({class:?}, append_only={append_only})");
+
+            // Create. Temp names are never committable, in any mode.
+            let resp = put_with_blake3(router.clone(), &key, b"one").await;
+            if class == KeyClass::Temp {
+                assert_status(&resp, StatusCode::BAD_REQUEST);
+                write_direct(b"one");
+            } else {
+                assert!(allows(Verb::Create), "{ctx}");
+                assert_eq!(resp.status(), StatusCode::CREATED, "{ctx}");
+            }
+
+            // Overwrite.
+            let resp = put_with_blake3(router.clone(), &key, b"two").await;
+            let expected = if class == KeyClass::Temp {
+                StatusCode::BAD_REQUEST
+            } else if allows(Verb::Overwrite) {
+                StatusCode::NO_CONTENT
+            } else {
+                StatusCode::FORBIDDEN
+            };
+            assert_eq!(resp.status(), expected, "overwrite {ctx}");
+            let stored = std::fs::read(&path).unwrap();
+            let want: &[u8] = if expected == StatusCode::NO_CONTENT {
+                b"two"
+            } else {
+                b"one"
+            };
+            assert_eq!(stored, want, "overwrite {ctx}");
+
+            // Delete.
+            let resp = authed_delete(router.clone(), &format!("/{key}")).await;
+            if allows(Verb::Delete) {
+                assert_eq!(resp.status(), StatusCode::NO_CONTENT, "delete {ctx}");
+                assert!(!path.exists(), "delete {ctx}");
+            } else {
+                assert_eq!(resp.status(), StatusCode::FORBIDDEN, "delete {ctx}");
+                assert!(path.exists(), "delete {ctx}");
+            }
+
+            // Batch delete.
+            if !path.exists() {
+                write_direct(b"one");
+            }
+            let body = serde_json::to_vec(&[&key]).unwrap();
+            let resp = authed_post(router, "/?batch-delete", body).await;
+            if allows(Verb::Delete) {
+                assert_eq!(resp.status(), StatusCode::NO_CONTENT, "batch {ctx}");
+                assert!(!path.exists(), "batch {ctx}");
+            } else {
+                assert_eq!(resp.status(), StatusCode::FORBIDDEN, "batch {ctx}");
+                assert!(path.exists(), "batch {ctx}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn append_only_matrix_follows_the_key_class_table() {
+        run_class_matrix(true).await;
+    }
+
+    #[tokio::test]
+    async fn without_append_only_every_class_is_mutable() {
+        run_class_matrix(false).await;
+    }
+
+    /// Slashes around a key resolve to the same file, so they must not change
+    /// its class.
+    #[tokio::test]
+    async fn append_only_ignores_a_trailing_slash() {
+        let (router, _state, tmp) = setup_app_append_only(0);
+        std::fs::write(tmp.path().join("snapshots/abc"), b"s").unwrap();
+        let resp = authed_put(router.clone(), "/snapshots/abc/", b"x".to_vec()).await;
+        assert_status(&resp, StatusCode::FORBIDDEN);
+        let resp = authed_delete(router, "/snapshots/abc/").await;
+        assert_status(&resp, StatusCode::FORBIDDEN);
+        assert_eq!(
+            std::fs::read(tmp.path().join("snapshots/abc")).unwrap(),
+            b"s"
+        );
+    }
+
+    #[tokio::test]
+    async fn v6_keys_round_trip() {
+        let (router, _state, _tmp) = setup_app(0);
+        let hex = "0123456789abcdef".repeat(4);
+        let map = format!("packmaps/{hex}");
+        for key in ["index.h/1", map.as_str()] {
+            let resp =
+                authed_put(router.clone(), &format!("/{key}"), key.as_bytes().to_vec()).await;
+            assert_status(&resp, StatusCode::CREATED);
+            let resp = authed_get(router.clone(), &format!("/{key}")).await;
+            assert_status(&resp, StatusCode::OK);
+            assert_eq!(body_bytes(resp).await, key.as_bytes());
+        }
+        for dir in ["index.h", "packmaps"] {
+            let resp = authed_get(router.clone(), &format!("/{dir}?list")).await;
+            assert_status(&resp, StatusCode::OK);
+            let keys: Vec<String> = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+            assert_eq!(keys.len(), 1, "{dir}: {keys:?}");
+            assert!(keys[0].starts_with(&format!("{dir}/")), "{dir}: {keys:?}");
+        }
+        let upper = format!("/packmaps/{}", hex.to_uppercase());
+        for bad in ["/index.h/01", upper.as_str()] {
+            let resp = authed_put(router.clone(), bad, b"x".to_vec()).await;
+            assert_status(&resp, StatusCode::BAD_REQUEST);
         }
     }
 

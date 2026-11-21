@@ -99,11 +99,31 @@ fn crashed_err(op: OpKind, key: &str) -> VykarError {
     VykarError::Other(format!("{INJECTED_MARKER}: client crashed ({op:?} {key})"))
 }
 
-fn append_only_refusal(key: &str) -> VykarError {
+fn append_only_overwrite_refusal(key: &str) -> VykarError {
     // MemoryBackend's text.
     VykarError::Other(format!(
         "403 Forbidden: repository is append-only, {key} already exists"
     ))
+}
+
+fn append_only_delete_refusal(key: &str) -> VykarError {
+    // MemoryBackend's text.
+    VykarError::Other(format!(
+        "403 Forbidden: repository is append-only, delete of {key} refused"
+    ))
+}
+
+/// An append-only server allows overwriting `key`. Refused for keys outside
+/// the schema.
+fn append_only_overwrite_ok(key: &str) -> bool {
+    vykar_protocol::append_only_allows(key, vykar_protocol::Verb::Overwrite)
+}
+
+/// An append-only server allows deleting `key`. Allowed for keys outside the
+/// schema, which only synthetic test keys are.
+fn append_only_delete_ok(key: &str) -> bool {
+    vykar_protocol::key_class(key)
+        .is_none_or(|c| c.append_only_allows(vykar_protocol::Verb::Delete))
 }
 
 fn observer_refusal() -> VykarError {
@@ -193,8 +213,8 @@ impl State {
         }
     }
 
-    /// Apply an effect at the current clock. Only an append-only overwrite
-    /// is refused.
+    /// Apply an effect at the current clock. Refuses what an append-only
+    /// server refuses (key-class table); a refused batch deletes nothing.
     fn apply(
         &mut self,
         append_only: bool,
@@ -205,8 +225,8 @@ impl State {
         let mut absent = Vec::new();
         match effect {
             Effect::Put(data) => {
-                if append_only && self.objects.contains_key(key) {
-                    return Err(append_only_refusal(key));
+                if append_only && self.objects.contains_key(key) && !append_only_overwrite_ok(key) {
+                    return Err(append_only_overwrite_refusal(key));
                 }
                 self.objects.insert(
                     key.to_string(),
@@ -218,6 +238,11 @@ impl State {
                 );
             }
             Effect::Delete(keys) => {
+                if append_only
+                    && let Some(refused) = keys.iter().find(|k| !append_only_delete_ok(k))
+                {
+                    return Err(append_only_delete_refusal(refused));
+                }
                 let mut removed = BTreeSet::new();
                 for k in keys {
                     if self.objects.remove(k).is_some() {
@@ -1079,6 +1104,50 @@ mod tests {
 
         a.delete("k").unwrap();
         assert!(store.object("k").is_none());
+    }
+
+    #[test]
+    fn append_only_follows_the_key_class_table() {
+        let config = SimConfig {
+            append_only: true,
+            batch_delete: true,
+            ..SimConfig::default()
+        };
+        let (store, a, _) = two_clients(config);
+        for key in [
+            "index",
+            "locks/a",
+            "config",
+            "index.h/1",
+            "snapshots/s",
+            "sessions/s",
+        ] {
+            a.put(key, b"one").unwrap();
+        }
+        a.put("index", b"two").unwrap();
+        a.put("locks/a", b"two").unwrap();
+        for key in ["config", "index.h/1"] {
+            let err = a.put(key, b"two").unwrap_err().to_string();
+            assert!(err.contains("append-only"), "{key}: {err}");
+            assert_eq!(last(&store).outcome, OpOutcome::Refused);
+            assert_eq!(store.object(key).unwrap().data, b"one");
+        }
+        let err = a.delete("snapshots/s").unwrap_err().to_string();
+        assert!(err.contains("append-only"), "{err}");
+        assert_eq!(last(&store).outcome, OpOutcome::Refused);
+        assert!(store.object("snapshots/s").is_some());
+        a.delete("sessions/s").unwrap();
+        assert!(store.object("sessions/s").is_none());
+
+        // A batch fails as a whole on its first refused key.
+        let keys = ["locks/a".to_string(), "snapshots/s".to_string()];
+        let err = a
+            .batch_delete_keys(&keys, BatchDeleteScope::KeysOnly)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("append-only"), "{err}");
+        assert_eq!(last(&store).outcome, OpOutcome::Refused);
+        assert!(store.object("locks/a").is_some());
     }
 
     #[test]

@@ -578,6 +578,7 @@ fn server(segmented_index: bool) -> vykar_protocol::ServerCapabilities {
         hashes: vec!["blake3".into()],
         pack_parts: false,
         segmented_index,
+        ..Default::default()
     }
 }
 

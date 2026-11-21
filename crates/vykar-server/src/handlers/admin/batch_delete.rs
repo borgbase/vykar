@@ -23,13 +23,13 @@ pub(super) async fn batch_delete(
         )));
     }
 
-    // Append-only permits batch-delete of temp files (interrupted-upload
-    // cleanup) and index objects (as single DELETE does). Fail fast — name
-    // the first committed key and delete nothing.
+    // Append-only permits what single DELETE permits (the key-class table):
+    // temp files, index objects, locks and sessions. Fail fast — name the
+    // first refused key and delete nothing.
     if state.inner.config.append_only
         && let Some(key) = keys
             .iter()
-            .find(|k| !vykar_protocol::is_temp_file(k) && !vykar_protocol::is_index_object_key(k))
+            .find(|k| !vykar_protocol::append_only_allows(k, vykar_protocol::Verb::Delete))
     {
         return Err(ServerError::Forbidden(format!(
             "append-only: cannot batch-delete non-temp key: {key}"
@@ -205,6 +205,28 @@ mod tests {
         assert_status(&resp, StatusCode::NO_CONTENT);
         assert!(!tmp.path().join(&obj).exists());
         assert!(tmp.path().join("snapshots").join("abc").exists());
+    }
+
+    /// Locks and sessions are deletable in a batch as they are one by one.
+    #[tokio::test]
+    async fn append_only_batch_delete_allows_locks_and_sessions() {
+        for query in ["/?batch-delete", "/?batch-delete&cleanup-dirs"] {
+            let (router, _state, tmp) = setup_app_append_only(0);
+            std::fs::create_dir_all(tmp.path().join("sessions")).unwrap();
+            std::fs::write(tmp.path().join("locks/a.json"), b"l").unwrap();
+            std::fs::write(tmp.path().join("sessions/s.json"), b"s").unwrap();
+
+            let keys = serde_json::to_vec(&serde_json::json!(["locks/a.json", "sessions/s.json"]))
+                .unwrap();
+            let resp = authed_post(router.clone(), query, keys).await;
+            assert_status(&resp, StatusCode::NO_CONTENT);
+            assert!(!tmp.path().join("locks/a.json").exists(), "{query}");
+            assert!(!tmp.path().join("sessions/s.json").exists(), "{query}");
+
+            // A removed `locks/` directory is recreated by the next PUT.
+            let resp = authed_put(router, "/locks/x", b"l".to_vec()).await;
+            assert_status(&resp, StatusCode::CREATED);
+        }
     }
 
     #[tokio::test]

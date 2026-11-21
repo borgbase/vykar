@@ -106,8 +106,9 @@ pub fn init_test_environment() {
 /// In-memory storage backend for testing. Thread-safe via Mutex.
 pub struct MemoryBackend {
     data: Mutex<HashMap<String, Vec<u8>>>,
-    /// Refuse to overwrite an existing object, the way an append-only
-    /// vykar-server does.
+    /// Refuse what an append-only vykar-server refuses
+    /// (`vykar_protocol::KeyClass`). Keys outside the server's schema are
+    /// refused an overwrite and allowed a delete, as before.
     append_only: bool,
 }
 
@@ -119,13 +120,27 @@ impl MemoryBackend {
         }
     }
 
-    /// A backend that permits creation but refuses to overwrite.
+    /// A backend that permits creation and applies the append-only key-class
+    /// table to overwrites and deletes.
     pub fn append_only() -> Self {
         Self {
             append_only: true,
             ..Self::new()
         }
     }
+}
+
+/// An append-only server allows overwriting `key`. Refused for keys outside
+/// the schema.
+fn append_only_overwrite_ok(key: &str) -> bool {
+    vykar_protocol::append_only_allows(key, vykar_protocol::Verb::Overwrite)
+}
+
+/// An append-only server allows deleting `key`. Allowed for keys outside the
+/// schema, which only synthetic test keys are.
+fn append_only_delete_ok(key: &str) -> bool {
+    vykar_protocol::key_class(key)
+        .is_none_or(|c| c.append_only_allows(vykar_protocol::Verb::Delete))
 }
 
 impl StorageBackend for MemoryBackend {
@@ -136,7 +151,7 @@ impl StorageBackend for MemoryBackend {
 
     fn put(&self, key: &str, data: &[u8]) -> Result<()> {
         let mut map = self.data.lock().unwrap();
-        if self.append_only && map.contains_key(key) {
+        if self.append_only && map.contains_key(key) && !append_only_overwrite_ok(key) {
             return Err(VykarError::Other(format!(
                 "403 Forbidden: repository is append-only, {key} already exists"
             )));
@@ -146,6 +161,11 @@ impl StorageBackend for MemoryBackend {
     }
 
     fn delete(&self, key: &str) -> Result<()> {
+        if self.append_only && !append_only_delete_ok(key) {
+            return Err(VykarError::Other(format!(
+                "403 Forbidden: repository is append-only, delete of {key} refused"
+            )));
+        }
         let mut map = self.data.lock().unwrap();
         map.remove(key);
         Ok(())
@@ -693,5 +713,40 @@ delegate_storage_backend! {
     fn list_tree_sized(&self, prefix: &str) -> Result<Vec<vykar_storage::ListedObject>> {
         self.before(Op::List, prefix);
         self.inner.list_tree_sized(prefix)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn memory_backend_append_only_follows_the_table() {
+        let store = MemoryBackend::append_only();
+        for key in [
+            "index",
+            "locks/x",
+            "config",
+            "index.h/1",
+            "snapshots/s",
+            "sessions/s",
+            "k",
+        ] {
+            store.put(key, b"one").unwrap();
+        }
+        store.put("index", b"two").unwrap();
+        store.put("locks/x", b"two").unwrap();
+        for key in ["config", "index.h/1"] {
+            let err = store.put(key, b"two").unwrap_err().to_string();
+            assert!(err.contains("append-only"), "{key}: {err}");
+            assert_eq!(store.get(key).unwrap().unwrap(), b"one");
+        }
+        let err = store.delete("snapshots/s").unwrap_err().to_string();
+        assert!(err.contains("append-only"), "{err}");
+        assert!(store.exists("snapshots/s").unwrap());
+        store.delete("sessions/s").unwrap();
+        store.delete("k").unwrap();
+        assert!(!store.exists("sessions/s").unwrap());
+        assert!(!store.exists("k").unwrap());
     }
 }

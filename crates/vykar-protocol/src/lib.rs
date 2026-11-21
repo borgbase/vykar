@@ -151,7 +151,7 @@ pub const MAX_OBJECT_SIZES_KEYS: usize = 100_000;
 /// both, so the client sees `protocol_version` 0 and an empty `hashes` list,
 /// i.e. "blake2b only". That is what makes the `init` pre-flight probe able to
 /// tell an old server from a new one without a separate endpoint.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ServerCapabilities {
     pub status: String,
     pub version: String,
@@ -175,6 +175,12 @@ pub struct ServerCapabilities {
     /// delete them. Absent on older servers.
     #[serde(default)]
     pub segmented_index: bool,
+    /// Top-level key directories the server accepts (its `KNOWN_ROOT_DIRS`).
+    /// Strings, like `hashes`, so a newer server's directories do not fail
+    /// parsing. Absent on older servers: empty, i.e. only the directories every
+    /// server accepted.
+    #[serde(default)]
+    pub key_dirs: Vec<String>,
 }
 
 impl ServerCapabilities {
@@ -184,6 +190,17 @@ impl ServerCapabilities {
     /// and the oldest ones advertise nothing at all.
     pub fn supports_hash(&self, algo: HashAlgorithm) -> bool {
         algo == HashAlgorithm::Blake2b || self.hashes.iter().any(|h| h == algo.as_str())
+    }
+
+    /// Whether the server accepts keys under `dir` (a [`KNOWN_ROOT_DIRS`] name).
+    pub fn accepts_key_dir(&self, dir: &str) -> bool {
+        self.key_dirs.iter().any(|d| d == dir)
+    }
+
+    /// Whether the server accepts every key directory of format v6
+    /// ([`V6_KEY_DIRS`]). A server that predates them answers 400 to those keys.
+    pub fn serves_v6_key_dirs(&self) -> bool {
+        V6_KEY_DIRS.iter().all(|d| self.accepts_key_dir(d))
     }
 }
 
@@ -432,15 +449,25 @@ pub const KNOWN_ROOT_DIRS: &[&str] = &[
     "sessions",
     "pending_index",
     INDEX_OBJECT_DIR,
+    HEAD_DIR,
+    PACK_MAP_DIR,
 ];
 
 /// Directory of the segmented index's write-once objects (formats v4/v5).
 pub const INDEX_OBJECT_DIR: &str = "index.d";
 
-/// Whether `key` is exactly `index.d/<64 lowercase hex>`: an object of the
-/// segmented index.
-pub fn is_index_object_key(key: &str) -> bool {
-    key.strip_prefix(INDEX_OBJECT_DIR)
+/// Directory of the numbered index heads (format v6): `index.h/<gen>`.
+pub const HEAD_DIR: &str = "index.h";
+
+/// Directory of the pack maps (format v6): `packmaps/<64 hex>`.
+pub const PACK_MAP_DIR: &str = "packmaps";
+
+/// The key directories a format-v6 repository needs beyond the older layouts.
+pub const V6_KEY_DIRS: &[&str] = &[HEAD_DIR, PACK_MAP_DIR];
+
+/// Whether `key` is `<dir>/<64 lowercase hex>`.
+fn is_hex_name_in(dir: &str, key: &str) -> bool {
+    key.strip_prefix(dir)
         .and_then(|rest| rest.strip_prefix('/'))
         .is_some_and(|name| {
             name.len() == 64
@@ -448,6 +475,31 @@ pub fn is_index_object_key(key: &str) -> bool {
                     .bytes()
                     .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
         })
+}
+
+/// Whether `key` is exactly `index.d/<64 lowercase hex>`: an object of the
+/// segmented index.
+pub fn is_index_object_key(key: &str) -> bool {
+    is_hex_name_in(INDEX_OBJECT_DIR, key)
+}
+
+/// Whether `key` is exactly `packmaps/<64 lowercase hex>`.
+pub fn is_pack_map_key(key: &str) -> bool {
+    is_hex_name_in(PACK_MAP_DIR, key)
+}
+
+/// The generation of a head key `index.h/<gen>`, where `<gen>` is a u64 in
+/// canonical decimal (no sign, no leading zero), so one generation has exactly
+/// one key. Raw key, no slash trimming, like [`is_index_object_key`].
+pub fn head_generation(key: &str) -> Option<u64> {
+    let name = key.strip_prefix(HEAD_DIR)?.strip_prefix('/')?;
+    let generation: u64 = name.parse().ok()?;
+    (generation.to_string() == name).then_some(generation)
+}
+
+/// The storage key of head generation `generation`.
+pub fn head_key(generation: u64) -> String {
+    format!("{HEAD_DIR}/{generation}")
 }
 
 /// Prefix of every temp file written next to its final destination for an
@@ -528,74 +580,150 @@ pub fn is_safe_relative_path(key: &str) -> bool {
 
 /// Whether the server accepts `key` as a committed object key: path-safe as
 /// [`is_safe_relative_path`], and inside the repository's key schema.
+///
+/// Temp-file names are never valid committed keys. Append-only mode allows
+/// deleting temp-named files (uncommitted upload debris); if PUT could commit
+/// an object under a temp-looking name (e.g. `snapshots/.tmp.x.1` — several
+/// namespaces accept any basename), that object would be deletable in
+/// append-only mode, breaking its guarantee.
 pub fn is_valid_storage_key(key: &str) -> bool {
-    if key.contains('\0') || key.contains('\\') {
-        return false;
+    classify_committed(key).is_some()
+}
+
+// ── Key classes ────────────────────────────────────────────────────────────
+
+/// How an append-only server treats the objects under a key. One table for
+/// PUT, DELETE and batch delete on the server and for the test doubles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum KeyClass {
+    /// `config`, `keys/*`, `snapshots/*`, `packs/<shard>/<id>`, `index.h/<gen>`,
+    /// `packmaps/<hex>`, and the legacy `pending_index/*`.
+    WriteOnce,
+    /// `index.d/<64 hex>`: named by the BLAKE3 of its bytes, so a repeated PUT
+    /// stores the same bytes.
+    ContentAddressed,
+    /// `index`, `index.gen`, `manifest`: overwritten in place by v2/v3 clients.
+    LegacyMutable,
+    /// `locks/*`, `sessions/*`: coordination state.
+    Ephemeral,
+    /// A temp-file name ([`is_temp_file`]) anywhere: upload debris, never a
+    /// committed object. Says nothing about path safety.
+    Temp,
+}
+
+/// What a request does to one key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Verb {
+    /// PUT of a key that does not exist yet.
+    Create,
+    /// PUT of a key that exists.
+    Overwrite,
+    /// DELETE, alone or in a batch.
+    Delete,
+}
+
+impl KeyClass {
+    pub const ALL: [KeyClass; 5] = [
+        KeyClass::WriteOnce,
+        KeyClass::ContentAddressed,
+        KeyClass::LegacyMutable,
+        KeyClass::Ephemeral,
+        KeyClass::Temp,
+    ];
+
+    /// Whether an append-only server allows `verb` on a key of this class.
+    /// Without append-only, every verb on every committed key is allowed.
+    pub const fn append_only_allows(self, verb: Verb) -> bool {
+        match (self, verb) {
+            (Self::Temp, Verb::Create | Verb::Overwrite) => false,
+            (Self::Temp, Verb::Delete) => true,
+            (_, Verb::Create) => true,
+            (Self::WriteOnce, Verb::Overwrite | Verb::Delete) => false,
+            // 03 step 1a refuses Delete here.
+            (Self::ContentAddressed, Verb::Overwrite | Verb::Delete) => true,
+            (Self::LegacyMutable, Verb::Overwrite) => true,
+            (Self::LegacyMutable, Verb::Delete) => false,
+            (Self::Ephemeral, Verb::Overwrite | Verb::Delete) => true,
+        }
     }
-    // Temp-file names are never valid committed keys. Append-only mode allows
-    // deleting temp-named files (uncommitted upload debris); if PUT could
-    // commit an object under a temp-looking name (e.g. `snapshots/.tmp.x.1` —
-    // the namespaces below accept any basename), that object would be
-    // deletable in append-only mode, breaking its guarantee.
+}
+
+/// The class of the object `key` names: `Temp` for a temp-file name, else
+/// the class of a committed object key that [`is_valid_storage_key`] accepts.
+/// `None` for the root, directories, and keys outside the schema.
+/// Leading and trailing slashes are ignored, as in the server's path resolution.
+pub fn key_class(key: &str) -> Option<KeyClass> {
     if is_temp_file(key) {
-        return false;
+        return Some(KeyClass::Temp);
+    }
+    match classify_committed(key)? {
+        Entry::Object(class) => Some(class),
+        Entry::Dir => None,
+    }
+}
+
+/// `key_class(key)` allows `verb` on an append-only server. A key without a
+/// class (a directory, an unknown key) allows nothing.
+pub fn append_only_allows(key: &str, verb: Verb) -> bool {
+    key_class(key).is_some_and(|class| class.append_only_allows(verb))
+}
+
+/// What a committed key names.
+enum Entry {
+    Dir,
+    Object(KeyClass),
+}
+
+/// What a committed (non-temp) key names, or `None` outside the schema.
+/// The one classifier behind [`is_valid_storage_key`] and [`key_class`].
+fn classify_committed(key: &str) -> Option<Entry> {
+    if key.contains('\0') || key.contains('\\') || is_temp_file(key) {
+        return None;
     }
     let trimmed = key.trim_matches('/');
     if trimmed.is_empty() {
-        return true;
+        return Some(Entry::Dir);
     }
     let parts: Vec<&str> = trimmed.split('/').collect();
     if parts
         .iter()
         .any(|part| part.is_empty() || *part == "." || *part == "..")
     {
-        return false;
+        return None;
     }
-    let Some(first) = parts.first() else {
-        return false;
+    let (first, rest) = parts.split_first()?;
+    let entry = match (*first, rest) {
+        (
+            "keys" | "snapshots" | "pending_index" | "locks" | "sessions" | "packs"
+            | INDEX_OBJECT_DIR | HEAD_DIR | PACK_MAP_DIR,
+            [],
+        ) => Entry::Dir,
+        ("keys" | "snapshots" | "pending_index", [_]) => Entry::Object(KeyClass::WriteOnce),
+        ("locks" | "sessions", [_]) => Entry::Object(KeyClass::Ephemeral),
+        ("packs", [shard]) if is_pack_shard(shard) => Entry::Dir,
+        ("packs", [shard, id]) if is_pack_shard(shard) && is_pack_id(id) => {
+            Entry::Object(KeyClass::WriteOnce)
+        }
+        (INDEX_OBJECT_DIR, [_]) if is_index_object_key(trimmed) => {
+            Entry::Object(KeyClass::ContentAddressed)
+        }
+        (HEAD_DIR, [_]) if head_generation(trimmed).is_some() => Entry::Object(KeyClass::WriteOnce),
+        (PACK_MAP_DIR, [_]) if is_pack_map_key(trimmed) => Entry::Object(KeyClass::WriteOnce),
+        ("config", []) => Entry::Object(KeyClass::WriteOnce),
+        ("index" | "index.gen" | "manifest", []) => Entry::Object(KeyClass::LegacyMutable),
+        _ => return None,
     };
-    match *first {
-        "keys" | "snapshots" | "locks" | "sessions" | "pending_index" => {
-            return (1..=2).contains(&parts.len());
-        }
-        "packs" => return is_valid_packs_key(&parts),
-        INDEX_OBJECT_DIR => {
-            return parts.len() == 1 || is_index_object_key(trimmed);
-        }
-        _ => {}
-    }
-    if KNOWN_ROOT_FILES.contains(first) {
-        return parts.len() == 1;
-    }
-    false
+    Some(entry)
 }
 
-fn is_valid_packs_key(parts: &[&str]) -> bool {
-    let Some(first) = parts.first() else {
-        return false;
-    };
-    if *first != "packs" {
-        return false;
-    }
-    if parts.len() == 1 {
-        return true;
-    }
-    let Some(shard) = parts.get(1) else {
-        return false;
-    };
-    if shard.len() != 2 || !shard.chars().all(|c| c.is_ascii_hexdigit()) {
-        return false;
-    }
-    if parts.len() == 2 {
-        return true;
-    }
-    if parts.len() == 3 {
-        let Some(pack) = parts.get(2) else {
-            return false;
-        };
-        return pack.len() == 64 && pack.chars().all(|c| c.is_ascii_hexdigit());
-    }
-    false
+/// A pack shard directory name: two hex digits, either case.
+fn is_pack_shard(name: &str) -> bool {
+    name.len() == 2 && name.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// A pack ID in a pack key: 64 hex digits, either case.
+fn is_pack_id(name: &str) -> bool {
+    name.len() == 64 && name.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 /// Parse an HTTP `Range` header of the one form the client sends,
@@ -975,6 +1103,326 @@ mod tests {
         assert!(!is_known_repo_key("data/something"));
     }
 
+    // ── Key classes ───────────────────────────────────────────────────
+
+    /// `is_valid_storage_key` before the key-class table, verbatim.
+    fn legacy_is_valid_storage_key(key: &str) -> bool {
+        if key.contains('\0') || key.contains('\\') {
+            return false;
+        }
+        if is_temp_file(key) {
+            return false;
+        }
+        let trimmed = key.trim_matches('/');
+        if trimmed.is_empty() {
+            return true;
+        }
+        let parts: Vec<&str> = trimmed.split('/').collect();
+        if parts
+            .iter()
+            .any(|part| part.is_empty() || *part == "." || *part == "..")
+        {
+            return false;
+        }
+        let Some(first) = parts.first() else {
+            return false;
+        };
+        match *first {
+            "keys" | "snapshots" | "locks" | "sessions" | "pending_index" => {
+                return (1..=2).contains(&parts.len());
+            }
+            "packs" => return legacy_is_valid_packs_key(&parts),
+            INDEX_OBJECT_DIR => {
+                return parts.len() == 1 || is_index_object_key(trimmed);
+            }
+            _ => {}
+        }
+        if KNOWN_ROOT_FILES.contains(first) {
+            return parts.len() == 1;
+        }
+        false
+    }
+
+    fn legacy_is_valid_packs_key(parts: &[&str]) -> bool {
+        let Some(first) = parts.first() else {
+            return false;
+        };
+        if *first != "packs" {
+            return false;
+        }
+        if parts.len() == 1 {
+            return true;
+        }
+        let Some(shard) = parts.get(1) else {
+            return false;
+        };
+        if shard.len() != 2 || !shard.chars().all(|c| c.is_ascii_hexdigit()) {
+            return false;
+        }
+        if parts.len() == 2 {
+            return true;
+        }
+        if parts.len() == 3 {
+            let Some(pack) = parts.get(2) else {
+                return false;
+            };
+            return pack.len() == 64 && pack.chars().all(|c| c.is_ascii_hexdigit());
+        }
+        false
+    }
+
+    /// The server's append-only PUT overwrite allowlist before the table.
+    fn legacy_put_overwrite_allowed(key: &str) -> bool {
+        key == "index"
+            || key == "index.gen"
+            || key == "manifest"
+            || is_index_object_key(key)
+            || key.starts_with("locks/")
+            || key.starts_with("sessions/")
+    }
+
+    /// The server's append-only DELETE allowlist before the table.
+    fn legacy_delete_allowed(key: &str) -> bool {
+        is_temp_file(key)
+            || is_index_object_key(key)
+            || key.starts_with("locks/")
+            || key.starts_with("sessions/")
+    }
+
+    /// The server's append-only batch-delete allowlist before the table.
+    fn legacy_batch_delete_allowed(key: &str) -> bool {
+        is_temp_file(key) || is_index_object_key(key)
+    }
+
+    /// Every sequence of up to four segments from a fixed alphabet, as
+    /// `(key, slash_variants)`: the plain join, then with a leading and with a
+    /// trailing slash.
+    fn key_corpus() -> &'static [(String, [String; 2])] {
+        static CORPUS: std::sync::OnceLock<Vec<(String, [String; 2])>> = std::sync::OnceLock::new();
+        CORPUS.get_or_init(|| {
+            let hex_lower = "a".repeat(64);
+            let hex_upper = "A".repeat(64);
+            let hex_short = "a".repeat(63);
+            let segments: Vec<&str> = vec![
+                "",
+                ".",
+                "..",
+                "keys",
+                "snapshots",
+                "packs",
+                "ab",
+                "AB",
+                "zz",
+                &hex_lower,
+                &hex_upper,
+                &hex_short,
+                "index.d",
+                "index",
+                "index.gen",
+                "config",
+                "manifest",
+                "locks",
+                "sessions",
+                "pending_index",
+                HEAD_DIR,
+                PACK_MAP_DIR,
+                "1",
+                "01",
+                ".tmp.x",
+                ".repack_tmp.y",
+                "x\\y",
+                "nul\0",
+            ];
+            let mut seqs: Vec<Vec<&str>> = vec![vec![]];
+            let mut frontier: Vec<Vec<&str>> = vec![vec![]];
+            for _ in 0..4 {
+                let mut next = Vec::new();
+                for seq in &frontier {
+                    for s in &segments {
+                        let mut longer = seq.clone();
+                        longer.push(s);
+                        next.push(longer);
+                    }
+                }
+                seqs.extend(next.iter().cloned());
+                frontier = next;
+            }
+            seqs.into_iter()
+                .map(|seq| {
+                    let key = seq.join("/");
+                    let variants = [format!("/{key}"), format!("{key}/")];
+                    (key, variants)
+                })
+                .collect()
+        })
+    }
+
+    fn first_segment(key: &str) -> &str {
+        key.split('/').find(|s| !s.is_empty()).unwrap_or("")
+    }
+
+    #[test]
+    fn is_valid_storage_key_is_unchanged_outside_v6_dirs() {
+        for (key, variants) in key_corpus() {
+            for k in std::iter::once(key).chain(variants) {
+                if V6_KEY_DIRS.contains(&first_segment(k)) {
+                    continue;
+                }
+                assert_eq!(
+                    is_valid_storage_key(k),
+                    legacy_is_valid_storage_key(k),
+                    "{k:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn key_class_agrees_with_is_valid_storage_key() {
+        let v6 = [head_key(1), format!("{PACK_MAP_DIR}/{}", "0".repeat(64))];
+        let corpus = key_corpus()
+            .iter()
+            .flat_map(|(key, variants)| std::iter::once(key).chain(variants))
+            .chain(v6.iter());
+        for k in corpus {
+            match key_class(k) {
+                Some(KeyClass::Temp) => assert!(is_temp_file(k), "{k:?}"),
+                Some(_) => assert!(is_valid_storage_key(k), "{k:?}"),
+                None => {}
+            }
+            assert_eq!(
+                key_class(k) == Some(KeyClass::Temp),
+                is_temp_file(k),
+                "{k:?}"
+            );
+        }
+        for f in KNOWN_ROOT_FILES {
+            assert!(key_class(f).is_some(), "{f}");
+        }
+        for d in KNOWN_ROOT_DIRS.iter().chain(&[""]) {
+            assert!(is_valid_storage_key(d), "{d}");
+            assert_eq!(key_class(d), None, "{d}");
+        }
+    }
+
+    #[test]
+    fn v6_keys() {
+        for good in ["index.h/1", "index.h/0", "index.h/18446744073709551615"] {
+            assert_eq!(key_class(good), Some(KeyClass::WriteOnce), "{good}");
+        }
+        let digits21 = format!("index.h/{}", "1".repeat(21));
+        for bad in [
+            "index.h/01",
+            "index.h/+1",
+            &digits21,
+            "index.h/18446744073709551616",
+            "index.h/1/x",
+            "index.h/a",
+            "index.hx/1",
+        ] {
+            assert!(!is_valid_storage_key(bad), "{bad}");
+            assert_eq!(key_class(bad), None, "{bad}");
+        }
+        let name = "0123456789abcdef".repeat(4);
+        assert_eq!(
+            key_class(&format!("packmaps/{name}")),
+            Some(KeyClass::WriteOnce)
+        );
+        for bad in [
+            format!("packmaps/{}", name.to_uppercase()),
+            format!("packmaps/{}", &name[1..]),
+            format!("packmaps/{name}0"),
+            format!("packmaps/x/{name}"),
+            "packmaps/.tmp.x".to_string(),
+        ] {
+            assert!(!is_valid_storage_key(&bad), "{bad}");
+        }
+        assert_eq!(key_class("packmaps/.tmp.x"), Some(KeyClass::Temp));
+        for g in [0, 1, u64::MAX] {
+            assert_eq!(head_generation(&head_key(g)), Some(g));
+        }
+        assert!(is_known_repo_key("index.h/1"));
+        assert!(is_repo_temp_file("packmaps/.tmp.x"));
+    }
+
+    #[test]
+    fn append_only_matches_the_legacy_allowlists() {
+        for (key, _) in key_corpus() {
+            let k = key.as_str();
+            // The old allowlists compared the raw key; see the slash test below.
+            if k != k.trim_matches('/') {
+                continue;
+            }
+            if is_valid_storage_key(k) {
+                assert_eq!(
+                    append_only_allows(k, Verb::Overwrite),
+                    legacy_put_overwrite_allowed(k),
+                    "{k:?}"
+                );
+            }
+            if is_valid_storage_key(k) || is_temp_file(k) {
+                assert_eq!(
+                    append_only_allows(k, Verb::Delete),
+                    legacy_delete_allowed(k),
+                    "{k:?}"
+                );
+                // Batch delete now follows single DELETE for locks and sessions.
+                let expected =
+                    legacy_batch_delete_allowed(k) || key_class(k) == Some(KeyClass::Ephemeral);
+                assert_eq!(append_only_allows(k, Verb::Delete), expected, "{k:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn append_only_ignores_surrounding_slashes() {
+        for (key, variants) in key_corpus() {
+            for k in std::iter::once(key).chain(variants) {
+                for verb in [Verb::Create, Verb::Overwrite, Verb::Delete] {
+                    assert_eq!(
+                        append_only_allows(k, verb),
+                        append_only_allows(k.trim_matches('/'), verb),
+                        "{k:?} {verb:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_pack_key_is_write_once() {
+        for (key, variants) in key_corpus() {
+            for k in std::iter::once(key).chain(variants) {
+                if is_valid_pack_key(k) {
+                    assert_eq!(key_class(k), Some(KeyClass::WriteOnce), "{k:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn policy_table() {
+        use KeyClass::*;
+        // (class, create, overwrite, delete) on an append-only server.
+        let table = [
+            (WriteOnce, true, false, false),
+            (ContentAddressed, true, true, true),
+            (LegacyMutable, true, true, false),
+            (Ephemeral, true, true, true),
+            (Temp, false, false, true),
+        ];
+        assert_eq!(table.map(|row| row.0), KeyClass::ALL);
+        for (class, create, overwrite, delete) in table {
+            assert_eq!(class.append_only_allows(Verb::Create), create, "{class:?}");
+            assert_eq!(
+                class.append_only_allows(Verb::Overwrite),
+                overwrite,
+                "{class:?}"
+            );
+            assert_eq!(class.append_only_allows(Verb::Delete), delete, "{class:?}");
+        }
+    }
+
     // ── Server capabilities / part uploads ────────────────────────────
 
     #[test]
@@ -988,6 +1436,35 @@ mod tests {
         )
         .unwrap();
         assert!(caps.pack_parts);
+    }
+
+    #[test]
+    fn capabilities_without_key_dirs_default_to_empty() {
+        let caps: ServerCapabilities =
+            serde_json::from_str(r#"{"status":"ok","version":"0.24.0","protocol_version":2}"#)
+                .unwrap();
+        assert!(caps.key_dirs.is_empty());
+        assert!(!caps.serves_v6_key_dirs());
+        let caps: ServerCapabilities = serde_json::from_str(
+            r#"{"status":"ok","version":"0.25.0","key_dirs":["index.h","packmaps","future"]}"#,
+        )
+        .unwrap();
+        assert!(caps.serves_v6_key_dirs());
+        assert!(caps.accepts_key_dir("future"));
+        let caps: ServerCapabilities =
+            serde_json::from_str(r#"{"status":"ok","version":"0.25.0","key_dirs":["index.h"]}"#)
+                .unwrap();
+        assert!(caps.accepts_key_dir(HEAD_DIR));
+        assert!(!caps.serves_v6_key_dirs());
+    }
+
+    #[test]
+    fn default_capabilities_are_the_oldest_server() {
+        let caps = ServerCapabilities::default();
+        assert!(caps.key_dirs.is_empty());
+        assert!(!caps.pack_parts && !caps.segmented_index);
+        assert!(caps.supports_hash(HashAlgorithm::Blake2b));
+        assert!(!caps.supports_hash(HashAlgorithm::Blake3));
     }
 
     #[test]

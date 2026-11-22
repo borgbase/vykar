@@ -1,11 +1,13 @@
 use std::collections::BTreeSet;
-use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::time::{Duration, Instant};
 
 use crate::config::RetentionConfig;
 use crate::sim::checker::{self, Invariant, ViolationKind, head_object_keys};
 use crate::sim::hazards::{self, HazardOutcome, KNOWN_HAZARDS, LateHead, REGRESSIONS};
 use crate::sim::history::{AllowedError, ErrorClass, INDEX_CHANGED_TEXT, classify};
-use crate::sim::{FaultAction, FaultRule, KeyMatch, OpKind, OpMatch, OpOutcome, Sim, SourceTree};
+use crate::sim::{
+    ClientId, FaultAction, FaultRule, KeyMatch, OpKind, OpMatch, OpOutcome, Sim, SourceTree,
+};
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{ActiveSessionList, LockHolder, VykarError};
 
@@ -354,21 +356,261 @@ fn crash_then_break_lock_then_backup() {
     // The crash hit the lock PUT itself, so no lock was written.
     assert!(sim.store().keys("locks/").is_empty());
 
-    // The guard against a 10-minute real-time commit wait, on a planted lock.
+    // A planted lock that never ages out: the backup's registration probe
+    // retries on virtual time and gives up with Locked.
     sim.tamper_put("locks/planted.json", b"{}");
-    let panicked = catch_unwind(AssertUnwindSafe(|| {
-        sim.backup(b, "t1", &tree("t1"));
-    }))
-    .expect_err("backup must refuse to start with a lock present");
-    let msg = panicked
-        .downcast_ref::<String>()
-        .cloned()
-        .unwrap_or_default();
-    assert!(msg.contains("break_lock"), "{msg}");
+    let (virt, real) = (sim.time().elapsed(), Instant::now());
+    let r = sim.backup(b, "t1", &tree("t1"));
+    assert_eq!(
+        r.error_class(),
+        Some(&ErrorClass::Allowed(AllowedError::Locked)),
+        "{}",
+        r.detail()
+    );
+    // Two backoff sleeps of at least 1.5 s and 3 s.
+    assert!(
+        sim.time().elapsed() - virt >= Duration::from_secs(4),
+        "{:?}",
+        sim.time().elapsed() - virt
+    );
+    assert!(
+        real.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        real.elapsed()
+    );
 
     sim.break_lock(b, true).expect_ok();
-    sim.backup(b, "t1", &tree("t1")).expect_ok();
+    // The failed backup used up its name.
+    sim.backup(b, "t2", &tree("t2")).expect_ok();
     sim.check_invariants(Invariant::STEP1).assert_clean();
+}
+
+/// A fault that crashes `c` on its first delete under `locks/`: its lock
+/// release, so the lock stays behind.
+fn crash_on_lock_release(sim: &Sim, c: ClientId) {
+    sim.fault(
+        FaultRule::new(
+            OpMatch::AnyDelete,
+            KeyMatch::Prefix("locks/".into()),
+            FaultAction::Crash,
+        )
+        .client(c),
+    );
+}
+
+/// `c` takes the lock and crashes releasing it.
+fn hold_lock_and_crash(sim: &mut Sim, c: ClientId) {
+    crash_on_lock_release(sim, c);
+    sim.custom(c, "hold", |_| Ok(()));
+    assert!(sim.store().is_crashed(c));
+    assert_eq!(sim.store().keys("locks/").len(), 1);
+}
+
+#[test]
+fn crashed_lock_holder_ages_out() {
+    let mut sim = Sim::new();
+    let (a, b) = (sim.client("a"), sim.client("b"));
+    sim.backup(b, "t0", &tree("t0")).expect_ok();
+    hold_lock_and_crash(&mut sim, a);
+
+    // Another machine cannot tell the holder is dead.
+    let r = sim.backup(b, "t1", &tree("t1"));
+    assert_eq!(
+        r.error_class(),
+        Some(&ErrorClass::Allowed(AllowedError::Locked)),
+        "{}",
+        r.detail()
+    );
+
+    sim.advance(Duration::from_secs(6 * 3600 + 60));
+    sim.backup(b, "t2", &tree("t2")).expect_ok();
+    assert!(sim.store().keys("locks/").is_empty());
+    sim.check_invariants(Invariant::STEP1).assert_clean();
+}
+
+#[test]
+fn same_machine_reaps_dead_holder_at_once() {
+    let mut sim = Sim::new();
+    let a = sim.client_on("a", "hostx", Some("boot1"));
+    let c = sim.client_on("c", "hostx", Some("boot1"));
+    sim.backup(c, "t0", &tree("t0")).expect_ok();
+    hold_lock_and_crash(&mut sim, a);
+    let held = sim.store().keys("locks/");
+
+    sim.backup(c, "t1", &tree("t1")).expect_ok();
+    for key in &held {
+        assert!(sim.store().object(key).is_none(), "{key} not reaped");
+    }
+    sim.check_invariants(Invariant::STEP1).assert_clean();
+}
+
+#[test]
+fn same_hostname_other_boot_reaps_at_once() {
+    let mut sim = Sim::new();
+    let a = sim.client_on("a", "hostx", Some("boot1"));
+    let d = sim.client_on("d", "hostx", Some("boot2"));
+    sim.backup(d, "t0", &tree("t0")).expect_ok();
+    hold_lock_and_crash(&mut sim, a);
+
+    sim.backup(d, "t1", &tree("t1")).expect_ok();
+    assert!(sim.store().keys("locks/").is_empty());
+    sim.check_invariants(Invariant::STEP1).assert_clean();
+}
+
+/// `a`'s backup crashes on its first pack upload, leaving its session
+/// marker behind. Returns the marker key.
+fn crash_backup_leaving_marker(sim: &mut Sim, a: ClientId) -> String {
+    sim.fault(
+        FaultRule::new(
+            OpMatch::AnyWrite,
+            KeyMatch::Prefix("packs/".into()),
+            FaultAction::Crash,
+        )
+        .client(a),
+    );
+    let r = sim.backup(a, "t1", &tree("t1"));
+    assert_eq!(
+        r.error_class(),
+        Some(&ErrorClass::Allowed(AllowedError::Injected)),
+        "{}",
+        r.detail()
+    );
+    let markers: Vec<String> = sim
+        .store()
+        .keys("sessions/")
+        .into_iter()
+        .filter(|k| k.ends_with(".json"))
+        .collect();
+    assert_eq!(markers.len(), 1, "{markers:?}");
+    markers.into_iter().next().unwrap()
+}
+
+#[test]
+fn foreign_session_blocks_compact_until_stale() {
+    let mut sim = Sim::new();
+    let (a, b) = (sim.client("a"), sim.client("b"));
+    sim.backup(b, "t0", &tree("t0")).expect_ok();
+    let marker = crash_backup_leaving_marker(&mut sim, a);
+
+    let r = sim.compact(b);
+    assert_eq!(
+        r.error_class(),
+        Some(&ErrorClass::Allowed(AllowedError::ActiveSessions)),
+        "{}",
+        r.detail()
+    );
+
+    sim.advance(Duration::from_secs(46 * 60));
+    sim.compact(b).expect_ok();
+    assert!(sim.store().object(&marker).is_none());
+    sim.check_invariants(Invariant::STEP1).assert_clean();
+}
+
+#[test]
+fn same_machine_session_reaped_at_once() {
+    let mut sim = Sim::new();
+    let a = sim.client_on("a", "hostx", Some("boot1"));
+    let c = sim.client_on("c", "hostx", Some("boot1"));
+    sim.backup(c, "t0", &tree("t0")).expect_ok();
+    let marker = crash_backup_leaving_marker(&mut sim, a);
+
+    sim.compact(c).expect_ok();
+    assert!(sim.store().object(&marker).is_none());
+    sim.check_invariants(Invariant::STEP1).assert_clean();
+}
+
+#[test]
+fn stale_session_journal_recovered_after_staleness() {
+    let mut sim = Sim::new();
+    // One machine, so `c` reaps the lock `a` leaves; journal recovery judges
+    // the marker by age alone.
+    let a = sim.client_on("a", "hostx", Some("boot1"));
+    let c = sim.client_on("c", "hostx", Some("boot1"));
+    sim.backup(c, "t0", &tree("t0")).expect_ok();
+    // The commit joins the journal write before its first snapshot write.
+    sim.fault(
+        FaultRule::new(
+            OpMatch::AnyWrite,
+            KeyMatch::Prefix("snapshots/".into()),
+            FaultAction::Crash,
+        )
+        .client(a),
+    );
+    let r = sim.backup(a, "t1", &tree("t1"));
+    assert_eq!(
+        r.error_class(),
+        Some(&ErrorClass::Allowed(AllowedError::Injected)),
+        "{}",
+        r.detail()
+    );
+    let journals: Vec<String> = sim
+        .store()
+        .keys("sessions/")
+        .into_iter()
+        .filter(|k| k.ends_with(".index"))
+        .collect();
+    assert_eq!(journals.len(), 1, "a's journal: {journals:?}");
+    let journal = &journals[0];
+
+    // The marker is fresh: the journal belongs to a live-looking session.
+    sim.backup(c, "t2", &tree("t2")).expect_ok();
+    assert!(sim.store().object(journal).is_some(), "recovered too early");
+
+    sim.advance(Duration::from_secs(46 * 60));
+    sim.backup(c, "t3", &tree("t3")).expect_ok();
+    assert!(
+        sim.store().object(journal).is_none(),
+        "stale journal not recovered"
+    );
+    sim.check_invariants(Invariant::STEP1).assert_clean();
+}
+
+#[test]
+fn prune_keep_within_uses_virtual_time() {
+    let mut sim = Sim::new();
+    let c = sim.client("c");
+    sim.backup(c, "p0", &tree("p0")).expect_ok();
+    sim.advance(Duration::from_secs(48 * 3600));
+    sim.backup(c, "p1", &tree("p1")).expect_ok();
+    let run = sim.prune(
+        c,
+        RetentionConfig {
+            keep_within: Some("1d".into()),
+            ..Default::default()
+        },
+    );
+    run.expect_ok();
+    assert_eq!(run.removed(), ["p0".to_string()]);
+    sim.check_invariants(Invariant::STEP1).assert_clean();
+}
+
+#[test]
+fn markers_carry_client_identity() {
+    let mut sim = Sim::new();
+    let a = sim.client_on("a", "hosta", Some("b1"));
+    let b = sim.client("b");
+    sim.backup(b, "t0", &tree("t0")).expect_ok();
+    hold_lock_and_crash(&mut sim, a);
+    let key = sim.store().keys("locks/").pop().unwrap();
+    let entry: serde_json::Value =
+        serde_json::from_slice(&sim.store().object(&key).unwrap().data).unwrap();
+    let pid = sim.host(a).pid;
+    assert_eq!(entry["hostname"], "hosta");
+    assert_eq!(entry["pid"], pid);
+    assert_eq!(entry["boot_id"], "b1");
+
+    let r = sim.backup(b, "t1", &tree("t1"));
+    assert_eq!(
+        r.error_class(),
+        Some(&ErrorClass::Allowed(AllowedError::Locked)),
+        "{}",
+        r.detail()
+    );
+    assert!(
+        r.detail().contains("hosta") && r.detail().contains(&format!("PID {pid}")),
+        "{}",
+        r.detail()
+    );
 }
 
 #[test]

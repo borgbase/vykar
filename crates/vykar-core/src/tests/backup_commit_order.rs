@@ -336,6 +336,7 @@ fn run_backup_with_passphrase(
         None,
         &shutdown,
         Some(&wrap),
+        crate::repo::HostEnv::system(),
     )
 }
 

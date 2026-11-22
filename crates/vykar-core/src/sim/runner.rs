@@ -5,11 +5,13 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use vykar_storage::StorageBackend;
 use vykar_types::error::Result;
 
 use super::checker::{Invariant, Report, check_invariants};
+use super::env::{SimHosts, SimTime, TimeMode};
 use super::fault::{ClientId, FaultRule, ParkedId, RuleId};
 use super::history::{
     ClientOp, ErrorRecord, History, Observation, ObservationCause, RunOutcome, RunRecord, classify,
@@ -23,7 +25,9 @@ use crate::config::{
     EncryptionConfig, EncryptionModeConfig, RepositoryConfig, RetentionConfig, VykarConfig,
 };
 use crate::repo::control::CancelToken;
-use crate::repo::{ChunkerParams, EncryptionMode, OpenOptions, Repository, identity, lock};
+use crate::repo::{
+    ChunkerParams, EncryptionMode, HostEnv, HostIdentity, OpenOptions, Repository, identity, lock,
+};
 
 /// A source directory's regular files, by `/`-separated relative path.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -111,6 +115,10 @@ pub fn seeded_bytes(seed: &str, size: usize) -> Vec<u8> {
 /// Result of a client body: names removed, and a detail line.
 type RunResult = Result<(Vec<String>, String)>;
 
+/// Virtual time added before every run, so consecutive runs never share a
+/// timestamp.
+const RUN_TICK: Duration = Duration::from_secs(1);
+
 pub struct Sim {
     store: SimStore,
     root: tempfile::TempDir,
@@ -118,6 +126,10 @@ pub struct Sim {
     history: History,
     /// Client root: `cache/`, `restore-<run>/`.
     clients: BTreeMap<ClientId, PathBuf>,
+    /// Virtual time of every client, linked to the store clock.
+    time: Arc<SimTime>,
+    hosts: SimHosts,
+    skews: BTreeMap<ClientId, chrono::Duration>,
 }
 
 impl Default for Sim {
@@ -142,15 +154,21 @@ impl Sim {
         let url_dir = root.path().join("repo-url-placeholder");
         std::fs::create_dir_all(&url_dir).expect("placeholder dir");
         let repo_url = url_dir.to_string_lossy().into_owned();
+        let store = SimStore::new(config);
+        let time = SimTime::for_store(&store, TimeMode::Auto);
+        let hosts = SimHosts::new(store.clone());
         let mut sim = Self {
-            store: SimStore::new(config),
+            store,
             root,
             repo_url,
             history: History::default(),
             clients: BTreeMap::new(),
+            time,
+            hosts,
+            skews: BTreeMap::new(),
         };
         let init = sim.client("init");
-        sim.run(init, ClientOp::Init, |store, cfg, _, _| {
+        sim.run(init, ClientOp::Init, |store, cfg, _, _, _| {
             let repo = Repository::init(
                 Box::new(store.handle(init)),
                 EncryptionMode::None,
@@ -181,8 +199,18 @@ impl Sim {
         &self.history
     }
 
+    /// A client on its own machine: hostname `sim-<name>`, boot ID
+    /// `boot-<name>`.
     pub fn client(&mut self, name: &str) -> ClientId {
+        self.client_on(name, &format!("sim-{name}"), Some(&format!("boot-{name}")))
+    }
+
+    /// A client on host `hostname` with boot ID `boot_id`. Two clients with
+    /// the same pair share a machine; the same hostname with another boot ID
+    /// is a second machine with a clashing name (cloned VMs, H1).
+    pub fn client_on(&mut self, name: &str, hostname: &str, boot_id: Option<&str>) -> ClientId {
         let id = self.store.register_client(name);
+        self.hosts.register(id, hostname, boot_id);
         let dir = self
             .root
             .path()
@@ -191,6 +219,40 @@ impl Sim {
         std::fs::create_dir_all(dir.join("cache")).expect("client dir");
         self.clients.insert(id, dir);
         id
+    }
+
+    /// Wall-clock skew of `c` against the shared time (and the store).
+    pub fn set_skew(&mut self, c: ClientId, skew: chrono::Duration) {
+        self.skews.insert(c, skew);
+    }
+
+    /// Advance client time and the store clock together.
+    pub fn advance(&mut self, by: Duration) {
+        self.time.advance(by);
+    }
+
+    pub fn time(&self) -> &Arc<SimTime> {
+        &self.time
+    }
+
+    /// The identity of `c`'s current or last run.
+    pub fn host(&self, c: ClientId) -> HostIdentity {
+        self.hosts.host(c)
+    }
+
+    /// The environment `c`'s commands run with.
+    pub fn host_env(&self, c: ClientId) -> HostEnv {
+        let skew = self
+            .skews
+            .get(&c)
+            .copied()
+            .unwrap_or_else(chrono::Duration::zero);
+        let hosts = self.hosts.clone();
+        HostEnv {
+            clock: Arc::new(self.time.clock(skew)),
+            host: self.hosts.host(c),
+            pid_alive: Arc::new(move |local, pid| hosts.pid_alive(local, pid)),
+        }
     }
 
     pub fn client_dir(&self, c: ClientId) -> &Path {
@@ -257,13 +319,6 @@ impl Sim {
             !self.history.trees.contains_key(snapshot),
             "snapshot name {snapshot} reused"
         );
-        // A live-looking lock would make the commit wait 10 minutes of real
-        // time; step 1 has no clock to age it out.
-        let locks = self.store.keys("locks/");
-        assert!(
-            locks.is_empty(),
-            "backup {snapshot}: lock {locks:?} present; step 1 has no clock; run break_lock first"
-        );
         let src = self.root.path().join("sources").join(snapshot);
         tree.write_to(&src).expect("write source tree");
         self.history
@@ -275,7 +330,7 @@ impl Sim {
             ClientOp::Backup {
                 snapshot: name.clone(),
             },
-            move |store, cfg, _, _| {
+            move |store, cfg, _, _, env| {
                 let handle = store.handle(c);
                 let wrap = move |_: Box<dyn StorageBackend>| -> Box<dyn StorageBackend> {
                     Box::new(handle.clone())
@@ -300,6 +355,7 @@ impl Sim {
                     None,
                     &CancelToken::new(),
                     Some(&wrap),
+                    env,
                 )?;
                 Ok((Vec::new(), format!("partial: {}", outcome.is_partial)))
             },
@@ -310,12 +366,12 @@ impl Sim {
         let op = ClientOp::Delete {
             names: names.iter().map(|n| n.to_string()).collect(),
         };
-        self.run(c, op, |store, cfg, _, _| {
+        self.run(c, op, |store, cfg, _, _, env| {
             let mut repo = util::open_repo_on(
                 Box::new(store.handle(c)),
                 &util::open_request(&cfg),
                 None,
-                OpenOptions::new(),
+                OpenOptions::new().host_env(env),
             )?;
             let result = delete::run_on_repo(&mut repo, names, false, &CancelToken::new())?;
             let removed = result
@@ -328,13 +384,13 @@ impl Sim {
     }
 
     pub fn prune(&mut self, c: ClientId, retention: RetentionConfig) -> RunRecord {
-        self.run(c, ClientOp::Prune, |store, mut cfg, _, _| {
+        self.run(c, ClientOp::Prune, |store, mut cfg, _, _, env| {
             cfg.retention = retention;
             let mut repo = util::open_repo_on(
                 Box::new(store.handle(c)),
                 &util::open_request(&cfg),
                 None,
-                OpenOptions::new(),
+                OpenOptions::new().host_env(env),
             )?;
             let (stats, list) =
                 prune::run_on_repo(&mut repo, &cfg, false, true, &[], &[], &CancelToken::new())?;
@@ -351,12 +407,12 @@ impl Sim {
     }
 
     pub fn compact(&mut self, c: ClientId) -> RunRecord {
-        self.run(c, ClientOp::Compact, |store, cfg, _, _| {
+        self.run(c, ClientOp::Compact, |store, cfg, _, _, env| {
             let mut repo = util::open_repo_on(
                 Box::new(store.handle(c)),
                 &util::open_request(&cfg),
                 None,
-                OpenOptions::new(),
+                OpenOptions::new().host_env(env),
             )?;
             let s = compact::run_on_repo(
                 &mut repo,
@@ -380,12 +436,12 @@ impl Sim {
     }
 
     pub fn check(&mut self, c: ClientId) -> RunRecord {
-        self.run(c, ClientOp::Check, |store, cfg, _, _| {
+        self.run(c, ClientOp::Check, |store, cfg, _, _, env| {
             let (mut repo, _session_guard) = util::open_repo_with_read_session_on(
                 Arc::new(store.handle(c)),
                 &util::open_request(&cfg),
                 None,
-                OpenOptions::new(),
+                OpenOptions::new().host_env(env),
             )?;
             let result = check::run_on_repo(
                 &mut repo,
@@ -406,13 +462,13 @@ impl Sim {
 
     /// `check --repair` in `RepairMode::Apply`.
     pub fn check_repair(&mut self, c: ClientId) -> RunRecord {
-        self.run(c, ClientOp::CheckRepair, |store, cfg, _, _| {
+        self.run(c, ClientOp::CheckRepair, |store, cfg, _, _, env| {
             let mode = RepairMode::Apply;
             let mut repo = util::open_repo_on(
                 Box::new(store.handle(c)),
                 &util::open_request(&cfg),
                 None,
-                check::repair_open_options(mode),
+                check::repair_open_options(mode).host_env(env),
             )?;
             let result = check::run_with_repair_on_repo(
                 &mut repo,
@@ -441,12 +497,12 @@ impl Sim {
         let op = ClientOp::Restore {
             snapshot: snapshot.to_string(),
         };
-        self.run(c, op, |store, cfg, dir, idx| {
+        self.run(c, op, |store, cfg, dir, idx, env| {
             let (mut repo, _session_guard) = util::open_repo_with_read_session_on(
                 Arc::new(store.handle(c)),
                 &util::open_request(&cfg),
                 None,
-                OpenOptions::new(),
+                OpenOptions::new().host_env(env),
             )?;
             let dest = dir.join(format!("restore-{idx}"));
             let stats = restore::run_on_repo(
@@ -466,7 +522,7 @@ impl Sim {
     }
 
     pub fn break_lock(&mut self, c: ClientId, sessions: bool) -> RunRecord {
-        self.run(c, ClientOp::BreakLock { sessions }, |store, _, _, _| {
+        self.run(c, ClientOp::BreakLock { sessions }, |store, _, _, _, _| {
             let handle = store.handle(c);
             let locks = lock::break_lock(&handle)?;
             let cleared = if sessions {
@@ -488,12 +544,12 @@ impl Sim {
         let op = ClientOp::Custom {
             label: label.to_string(),
         };
-        self.run(c, op, |store, cfg, _, _| {
+        self.run(c, op, |store, cfg, _, _, env| {
             let mut repo = util::open_repo_on(
                 Box::new(store.handle(c)),
                 &util::open_request(&cfg),
                 None,
-                OpenOptions::new(),
+                OpenOptions::new().host_env(env),
             )?;
             util::with_repo_lock(&mut repo, f)?;
             Ok((Vec::new(), String::new()))
@@ -533,17 +589,22 @@ impl Sim {
         &mut self,
         c: ClientId,
         op: ClientOp,
-        body: impl FnOnce(&SimStore, VykarConfig, &Path, usize) -> RunResult,
+        body: impl FnOnce(&SimStore, VykarConfig, &Path, usize, HostEnv) -> RunResult,
     ) -> RunRecord {
         let index = self.history.runs.len();
         let cfg = self.client_config(c);
         let dir = self.client_dir(c).to_path_buf();
         let is_init = matches!(op, ClientOp::Init);
+        self.advance(RUN_TICK);
+        // Each run is a new process: a fresh PID, alive until it returns.
+        self.hosts.start_run(c);
+        let env = self.host_env(c);
         self.store.set_current_run(Some(index));
         let first_step = self.store.step();
-        let result = body(&self.store, cfg, &dir, index);
+        let result = body(&self.store, cfg, &dir, index, env);
         let last_step = self.store.step();
         self.store.set_current_run(None);
+        self.hosts.set_running(c, false);
         let outcome = match result {
             Ok((removed, detail)) => RunOutcome::Ok { removed, detail },
             Err(e) => RunOutcome::Err(ErrorRecord {

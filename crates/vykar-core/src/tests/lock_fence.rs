@@ -1,20 +1,31 @@
 use std::sync::Arc;
-use std::time::SystemTime;
+
+use chrono::Utc;
 
 use crate::compress::Compression;
-use crate::repo::lock::{
-    acquire_lock, build_lock_fence, build_lock_fence_with_epoch, release_lock, verify_lock_validity,
-};
+use crate::repo::lock::{acquire_lock, build_lock_fence, release_lock, verify_lock_validity};
 use crate::repo::pack::PackType;
+use crate::repo::{HostEnv, SystemClock};
+use crate::sim::env::{SimTime, TimeMode};
 use crate::testutil::MemoryBackend;
 use vykar_storage::StorageBackend;
 use vykar_types::error::VykarError;
 
+/// An environment on virtual time starting now.
+fn virtual_env() -> (Arc<SimTime>, HostEnv) {
+    let time = SimTime::new(Utc::now(), TimeMode::Auto);
+    let env = HostEnv::system().with_clock(Arc::new(time.clock(chrono::Duration::zero())));
+    (time, env)
+}
+
+const HOUR: std::time::Duration = std::time::Duration::from_secs(3600);
+
 #[test]
 fn fence_ok_for_fresh_lock() {
     let storage: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
-    let guard = acquire_lock(&*storage).unwrap();
-    let fence = build_lock_fence(&guard, Arc::clone(&storage));
+    let env = HostEnv::system();
+    let guard = acquire_lock(&*storage, &env).unwrap();
+    let fence = build_lock_fence(&guard, Arc::clone(&storage), env);
     fence().expect("fence should succeed for fresh lock");
     release_lock(&*storage, guard).unwrap();
 }
@@ -22,8 +33,9 @@ fn fence_ok_for_fresh_lock() {
 #[test]
 fn fence_fails_when_lock_file_deleted() {
     let storage: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
-    let guard = acquire_lock(&*storage).unwrap();
-    let fence = build_lock_fence(&guard, Arc::clone(&storage));
+    let env = HostEnv::system();
+    let guard = acquire_lock(&*storage, &env).unwrap();
+    let fence = build_lock_fence(&guard, Arc::clone(&storage), env);
 
     // Delete the lock file to simulate another client cleaning it up.
     storage.delete(guard.key()).unwrap();
@@ -37,69 +49,88 @@ fn fence_fails_when_lock_file_deleted() {
 
 #[test]
 fn fence_fails_after_time_expiry() {
-    let storage = MemoryBackend::new();
-    let guard = acquire_lock(&storage).unwrap();
+    let storage: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+    let (time, env) = virtual_env();
+    let guard = acquire_lock(&*storage, &env).unwrap();
+    let fence = build_lock_fence(&guard, Arc::clone(&storage), env);
 
-    // Simulate lock acquired 6 hours ago (exceeds LOCK_MAX_UNREFRESHED_SECS = 5h30m).
-    let now_secs = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
-    let old_secs = now_secs - 6 * 3600;
+    // Past LOCK_MAX_UNREFRESHED_SECS = 5h30m without a fence call.
+    time.advance(5 * HOUR + 31 * 60 * std::time::Duration::from_secs(1));
 
-    let err = verify_lock_validity(guard.key(), old_secs, &storage).unwrap_err();
+    let err = fence().unwrap_err();
     assert!(
         matches!(err, VykarError::LockExpired(ref msg) if msg.contains("unrefreshed")),
         "expected LockExpired with 'unrefreshed', got: {err}"
     );
-    release_lock(&storage, guard).unwrap();
+    release_lock(&*storage, guard).unwrap();
 }
 
 #[test]
 fn fence_fails_on_clock_anomaly() {
-    let storage = MemoryBackend::new();
-    let guard = acquire_lock(&storage).unwrap();
+    let storage: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+    let (time, env) = virtual_env();
+    let guard = acquire_lock(&*storage, &env).unwrap();
+    let fence = build_lock_fence(&guard, Arc::clone(&storage), env);
 
-    // Simulate last_refreshed_secs far in the future (clock went backwards).
-    let future_secs = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64
-        + 3600;
+    // The wall clock steps back an hour.
+    time.jump_wall(chrono::Duration::hours(-1));
 
-    let err = verify_lock_validity(guard.key(), future_secs, &storage).unwrap_err();
+    let err = fence().unwrap_err();
     assert!(
         matches!(err, VykarError::LockExpired(ref msg) if msg.contains("clock anomaly")),
         "expected LockExpired with 'clock anomaly', got: {err}"
     );
-    release_lock(&storage, guard).unwrap();
+
+    // last_refreshed_secs in the future, on the system clock.
+    let future_secs = Utc::now().timestamp() + 3600;
+    let err = verify_lock_validity(guard.key(), future_secs, &*storage, &SystemClock).unwrap_err();
+    assert!(
+        matches!(err, VykarError::LockExpired(ref msg) if msg.contains("clock anomaly")),
+        "expected LockExpired with 'clock anomaly', got: {err}"
+    );
+
+    // A clock before 1970: the elapsed time is positive, the clock is not
+    // believed.
+    let old = SimTime::new(
+        chrono::DateTime::from_timestamp(-50, 0).unwrap(),
+        TimeMode::Auto,
+    );
+    let err = verify_lock_validity(
+        guard.key(),
+        -100,
+        &*storage,
+        &old.clock(chrono::Duration::zero()),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, VykarError::LockExpired(ref msg) if msg.contains("clock anomaly")),
+        "expected LockExpired with 'clock anomaly', got: {err}"
+    );
+    release_lock(&*storage, guard).unwrap();
 }
 
 #[test]
 fn fence_refreshes_lock_file() {
     let storage: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
-    let guard = acquire_lock(&*storage).unwrap();
+    let (time, env) = virtual_env();
+    let guard = acquire_lock(&*storage, &env).unwrap();
     let lock_key = guard.key().to_string();
-    let hostname = crate::platform::hostname();
+    let fence = build_lock_fence(&guard, Arc::clone(&storage), env.clone());
 
-    // Set last_refreshed 4 hours ago (exceeds 3h refresh interval, within 5.5h max).
-    let now_secs = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
-    let old_secs = now_secs - 4 * 3600;
-
-    let fence = build_lock_fence_with_epoch(&guard, Arc::clone(&storage), old_secs);
-
-    // The fence should succeed (4h < 5.5h max) and trigger a refresh.
+    // Past the 3h refresh interval, within the 5.5h maximum.
+    time.advance(4 * HOUR);
     fence().expect("fence should succeed");
 
-    // Verify lock file data was rewritten with a fresh timestamp.
+    // The lock file was rewritten with the current time.
     let data = storage.get(&lock_key).unwrap().unwrap();
     let entry: serde_json::Value = serde_json::from_slice(&data).unwrap();
-    assert_eq!(entry["hostname"].as_str().unwrap(), hostname);
+    assert_eq!(entry["hostname"].as_str().unwrap(), env.host.hostname);
+    let written = chrono::DateTime::parse_from_rfc3339(entry["time"].as_str().unwrap()).unwrap();
+    assert_eq!(written.timestamp(), env.now_utc().timestamp());
 
-    // A second call should also succeed (last_refreshed was updated by the first call).
+    // 8h since acquisition but 4h since the refresh: still valid, so the
+    // refresh reset the epoch.
+    time.advance(4 * HOUR);
     fence().expect("fence should succeed on second call");
 
     release_lock(&*storage, guard).unwrap();

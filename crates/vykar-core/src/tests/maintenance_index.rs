@@ -208,6 +208,7 @@ impl Env {
             Some(&mut on_event),
             &CancelToken::new(),
             wrap,
+            crate::repo::HostEnv::system(),
         )
         .unwrap();
         stages
@@ -828,7 +829,12 @@ fn prune_loads_index_after_session_check() {
         fs::write(src.join("two.bin"), vec![0x22u8; 64 * 1024]).unwrap();
         env.backup(&src, "a", "s2");
 
-        crate::repo::lock::register_session(env.local().as_ref(), "live-session").unwrap();
+        crate::repo::lock::register_session(
+            env.local().as_ref(),
+            "live-session",
+            &crate::repo::HostEnv::system(),
+        )
+        .unwrap();
 
         let reads = Arc::new(IndexReads::default());
         let mut repo = env.open(env.counting(&reads), OpenOptions::new());

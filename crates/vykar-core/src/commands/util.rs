@@ -153,9 +153,10 @@ pub(crate) fn open_repo_with_read_session_on(
     passphrase: Option<&str>,
     opts: OpenOptions,
 ) -> Result<(Repository, lock::SessionGuard)> {
+    let env = opts.host_env.clone();
     let opts = with_identity_context(opts, req);
     let session_id = format!("{:032x}", rand::random::<u128>());
-    lock::register_session(backend.as_ref(), &session_id)?;
+    lock::register_session(backend.as_ref(), &session_id, &env)?;
 
     let open_result = Repository::open_shared(
         Arc::clone(&backend),
@@ -168,19 +169,23 @@ pub(crate) fn open_repo_with_read_session_on(
         Ok(repo) => {
             // Verify identity before adopting the session into a guard.
             if let Err(e) = verify_repo_identity(req, &repo) {
-                lock::deregister_session(backend.as_ref(), &session_id);
+                lock::deregister_session(backend.as_ref(), &session_id, &env);
                 return Err(e);
             }
-            match lock::SessionGuard::adopt(Arc::clone(&repo.storage), session_id.clone()) {
+            match lock::SessionGuard::adopt(
+                Arc::clone(&repo.storage),
+                session_id.clone(),
+                env.clone(),
+            ) {
                 Ok(guard) => Ok((repo, guard)),
                 Err(e) => {
-                    lock::deregister_session(repo.storage.as_ref(), &session_id);
+                    lock::deregister_session(repo.storage.as_ref(), &session_id, &env);
                     Err(e)
                 }
             }
         }
         Err(e) => {
-            lock::deregister_session(backend.as_ref(), &session_id);
+            lock::deregister_session(backend.as_ref(), &session_id, &env);
             Err(enrich_repo_not_found(e, &req.url))
         }
     }
@@ -194,7 +199,8 @@ pub fn with_repo_lock<T>(
     repo: &mut Repository,
     action: impl FnOnce(&mut Repository) -> Result<T>,
 ) -> Result<T> {
-    let guard = lock::acquire_lock(repo.storage.as_ref())?;
+    let env = repo.host_env().clone();
+    let guard = lock::acquire_lock(repo.storage.as_ref(), &env)?;
     run_under_fence(repo, guard, action)
 }
 
@@ -247,7 +253,7 @@ fn run_under_fence<T>(
     guard: lock::LockGuard,
     action: impl FnOnce(&mut Repository) -> Result<T>,
 ) -> Result<T> {
-    let fence = lock::build_lock_fence(&guard, Arc::clone(&repo.storage));
+    let fence = lock::build_lock_fence(&guard, Arc::clone(&repo.storage), repo.host_env().clone());
     repo.set_lock_fence(fence);
 
     let result = action(repo);
@@ -289,17 +295,12 @@ pub fn with_maintenance_lock<T>(
     repo: &mut Repository,
     action: impl FnOnce(&mut Repository) -> Result<T>,
 ) -> Result<T> {
-    let guard = lock::acquire_lock(repo.storage.as_ref())?;
+    let env = repo.host_env().clone();
+    let guard = lock::acquire_lock(repo.storage.as_ref(), &env)?;
 
     // Clean up stale sessions before checking for active ones.
     let stale_threshold = lock::default_stale_session_duration();
-    let local_hostname = crate::platform::hostname();
-    match lock::cleanup_stale_sessions(
-        repo.storage.as_ref(),
-        stale_threshold,
-        &local_hostname,
-        crate::platform::is_pid_alive,
-    ) {
+    match lock::cleanup_stale_sessions(repo.storage.as_ref(), stale_threshold, &env) {
         Ok(cleaned) => {
             if !cleaned.is_empty() {
                 info!(
@@ -324,7 +325,7 @@ pub fn with_maintenance_lock<T>(
     // `build_active_session_list` — they are NOT silently filtered.
     match lock::list_session_entries(repo.storage.as_ref()) {
         Ok(entries) if !entries.is_empty() => {
-            let list = build_active_session_list(entries, &chrono::Utc::now());
+            let list = build_active_session_list(entries, &env.now_utc());
             let _ = lock::release_lock(repo.storage.as_ref(), guard);
             return Err(VykarError::ActiveSessions(list));
         }

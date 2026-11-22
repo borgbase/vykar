@@ -12,6 +12,7 @@ use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::Result;
 
 use super::format::{ObjectType, unpack_object_expect_with_context};
+use super::host_env::Clock;
 use super::lock::{SESSION_STALE_SECS, SESSIONS_PREFIX, SessionEntry, session_index_key};
 use super::pack_recovery::verify_journal_packs;
 use super::session_journal::PENDING_INDEX_OBJECT_CONTEXT;
@@ -52,8 +53,11 @@ enum MarkerState {
     Unknown,
 }
 
-/// The parts of the write session that recovery fills in.
+/// The parts of the write session that recovery fills in, and the clock it
+/// judges marker staleness by.
 pub(crate) struct RecoveryTarget<'a> {
+    /// Read once, right after the LIST of `sessions/`.
+    pub(crate) clock: &'a dyn Clock,
     pub(crate) recovered_chunks: &'a mut StdHashMap<ChunkId, RecoveredChunkEntry>,
     pub(crate) recovered_index_keys: &'a mut Vec<String>,
     /// Seeded with every accepted pack so a re-interruption preserves it.
@@ -81,7 +85,7 @@ pub(crate) fn recover_pending_index(
     target: &mut RecoveryTarget<'_>,
 ) -> Result<PendingIndexRecovery> {
     let all_keys = storage.list(SESSIONS_PREFIX)?;
-    let now = chrono::Utc::now();
+    let now = target.clock.now_utc();
 
     // Collect .index keys, skip our own session.
     let my_key = session_index_key(own_session_id);
@@ -320,6 +324,7 @@ mod tests {
     use super::*;
     use crate::index::{PendingPackEntry, encode_pending_journal};
     use crate::repo::format::pack_object_with_context;
+    use crate::repo::host_env::SystemClock;
     use crate::repo::lock::session_marker_key;
     use crate::repo::write_session::WriteSessionState;
     use crate::repo::write_session::tests::{fake_pack, test_crypto};
@@ -394,7 +399,7 @@ mod tests {
         let mut ws = WriteSessionState::new(1024, 1024, 1, HashAlgorithm::Blake2b);
         ws.session_id = "current".to_string();
         let recovery = ws
-            .recover_pending_index(storage, &crypto, &LiveIndex::empty(), 1)
+            .recover_pending_index(storage, &crypto, &LiveIndex::empty(), 1, &SystemClock)
             .unwrap();
         (ws, recovery)
     }
@@ -437,7 +442,7 @@ mod tests {
         ws.session_id = "new".to_string();
 
         let recovery = ws
-            .recover_pending_index(&storage, &crypto, &chunk_index, 1)
+            .recover_pending_index(&storage, &crypto, &chunk_index, 1, &SystemClock)
             .unwrap();
         assert!(
             recovery.recovered_chunks > 0,
@@ -464,7 +469,7 @@ mod tests {
         ws.session_id = "current".to_string();
 
         let recovery = ws
-            .recover_pending_index(&storage, &crypto, &chunk_index, 1)
+            .recover_pending_index(&storage, &crypto, &chunk_index, 1, &SystemClock)
             .unwrap();
         assert!(
             recovery.recovered_chunks > 0,
@@ -497,7 +502,7 @@ mod tests {
         ws.session_id = "current".to_string();
 
         let recovery = ws
-            .recover_pending_index(&storage, &crypto, &chunk_index, 1)
+            .recover_pending_index(&storage, &crypto, &chunk_index, 1, &SystemClock)
             .unwrap();
         assert_eq!(
             recovery.recovered_chunks, 0,
@@ -525,7 +530,7 @@ mod tests {
         ws.session_id = "current".to_string();
 
         let recovery = ws
-            .recover_pending_index(&storage, &crypto, &chunk_index, 1)
+            .recover_pending_index(&storage, &crypto, &chunk_index, 1, &SystemClock)
             .unwrap();
         assert_eq!(
             recovery.recovered_chunks, 0,
@@ -608,7 +613,7 @@ mod tests {
         ws.session_id = "current".to_string();
 
         let recovery = ws
-            .recover_pending_index(&storage, &crypto, &chunk_index, 1)
+            .recover_pending_index(&storage, &crypto, &chunk_index, 1, &SystemClock)
             .unwrap();
         assert!(
             recovery.recovered_chunks > 0,
@@ -644,7 +649,7 @@ mod tests {
         ws.session_id = "current".to_string();
 
         let _recovered = ws
-            .recover_pending_index(&storage, &crypto, &chunk_index, 1)
+            .recover_pending_index(&storage, &crypto, &chunk_index, 1, &SystemClock)
             .unwrap();
 
         // Corrupt .index should be deleted.
@@ -677,7 +682,7 @@ mod tests {
         ws.session_id = "current".to_string();
 
         let recovery = ws
-            .recover_pending_index(&storage, &crypto, &chunk_index, 1)
+            .recover_pending_index(&storage, &crypto, &chunk_index, 1, &SystemClock)
             .unwrap();
         assert_eq!(recovery.recovered_chunks, 0, "all chunks already indexed");
         assert_eq!(recovery.recovered_sessions, vec!["old"]);
@@ -993,7 +998,7 @@ mod tests {
             ws.session_id = "current".to_string();
             ws.persisted_pack_count = persisted;
             let recovery = ws
-                .recover_pending_index(&storage, &crypto, &LiveIndex::empty(), 1)
+                .recover_pending_index(&storage, &crypto, &LiveIndex::empty(), 1, &SystemClock)
                 .unwrap();
             assert_eq!(recovery.recovered_chunks, 3, "{persisted}");
             assert_eq!(storage.counts(), expected, "{persisted}");

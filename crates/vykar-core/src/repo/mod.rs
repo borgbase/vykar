@@ -4,6 +4,7 @@ pub(crate) mod coalesce;
 pub mod control;
 pub mod file_cache;
 pub mod format;
+pub mod host_env;
 pub mod identity;
 pub(crate) mod journal_recovery;
 pub mod lock;
@@ -28,6 +29,7 @@ pub(crate) mod pack_listing;
 mod pack_lookup;
 mod pack_recovery;
 mod pack_verify;
+pub use host_env::{Clock, HostEnv, HostIdentity, StopSignal, SystemClock};
 pub use index_rebuild::{RebuildCounts, UncoveredPack};
 pub use index_write::{IndexLoss, IndexRecovery, RepairIndexLoad};
 pub use key::{LoadedKey, select_repository_key};
@@ -307,6 +309,9 @@ pub struct OpenOptions {
     /// sets this. Such a handle supports `upgrade_index_layout` and
     /// `legacy_index` only; it has no head, and `load_index` is refused.
     pub legacy_format: bool,
+    /// Clock and identity for the lock, session and maintenance code.
+    /// Default: [`HostEnv::system`]. The simulator sets one per client.
+    pub host_env: HostEnv,
 }
 
 impl OpenOptions {
@@ -345,6 +350,10 @@ impl OpenOptions {
         self.legacy_format = true;
         self
     }
+    pub fn host_env(mut self, env: HostEnv) -> Self {
+        self.host_env = env;
+        self
+    }
 }
 
 /// A handle to an opened repository.
@@ -375,6 +384,8 @@ pub struct Repository {
     cache_dir_override: Option<PathBuf>,
     /// Local tree-chunk cache; None without a cache dir.
     tree_cache: Option<tree_cache::TreeChunkCache>,
+    /// Clock and identity of this client; see [`host_env`].
+    host_env: HostEnv,
     /// Write-path state: pack writers, upload queue, dedup, journal, sizing.
     /// `None` when no write session is active (read-only operations, compact, delete, prune).
     /// Activated by `begin_write_session()` before backup.
@@ -397,6 +408,16 @@ pub struct Repository {
 }
 
 impl Repository {
+    /// Clock and identity of this client.
+    pub fn host_env(&self) -> &HostEnv {
+        &self.host_env
+    }
+
+    /// Replace the environment, e.g. on a handle from `Repository::init`.
+    pub fn set_host_env(&mut self, env: HostEnv) {
+        self.host_env = env;
+    }
+
     /// The key blob that unwrapped at open, if this repository is encrypted.
     pub fn key_blob(&self) -> Option<&[u8]> {
         self.key_blob.as_deref()

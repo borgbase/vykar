@@ -14,6 +14,7 @@ use vykar_types::error::Result;
 use vykar_types::hash::HashAlgorithm;
 use vykar_types::pack_id::PackId;
 
+use super::host_env::Clock;
 use super::journal_recovery::{self, PendingIndexRecovery, RecoveryTarget};
 use super::pack::{PackType, PackWriter, PackedChunkEntry};
 use super::session_journal::SessionJournal;
@@ -344,6 +345,7 @@ impl WriteSessionState {
         crypto: &dyn CryptoEngine,
         chunk_index: &LiveIndex,
         width: usize,
+        clock: &dyn Clock,
     ) -> Result<PendingIndexRecovery> {
         journal_recovery::recover_pending_index(
             storage,
@@ -353,6 +355,7 @@ impl WriteSessionState {
             self.persisted_pack_count,
             width,
             &mut RecoveryTarget {
+                clock,
                 recovered_chunks: &mut self.recovered_chunks,
                 recovered_index_keys: &mut self.recovered_index_keys,
                 journal: &mut self.journal.entries,

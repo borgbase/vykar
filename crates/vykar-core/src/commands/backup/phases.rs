@@ -2,9 +2,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Instant;
 
-use chrono::Utc;
 use tracing::{debug, info, warn};
 
 use super::instrument::{BackupInstrumentation, PipelineTimings};
@@ -19,7 +17,7 @@ use crate::repo::file_cache::{FileCache, ParentReuseBuilder, ParentReuseIndex, P
 use crate::repo::format::{ObjectType, pack_object_with_context};
 use crate::repo::lock;
 use crate::repo::manifest::SnapshotEntry;
-use crate::repo::{Repository, WriteSessionOptions};
+use crate::repo::{HostEnv, Repository, WriteSessionOptions};
 use crate::snapshot::{SnapshotMeta, SnapshotStats};
 use vykar_storage::StorageBackend;
 use vykar_types::chunk_id::ChunkId;
@@ -37,11 +35,15 @@ pub(super) struct BackupSession {
 impl BackupSession {
     /// Adopt the already-registered session `id` into a heartbeat guard.
     /// On failure the marker is deregistered before the error is returned.
-    pub(super) fn adopt(storage: &Arc<dyn StorageBackend>, id: String) -> Result<Self> {
-        match lock::SessionGuard::adopt(Arc::clone(storage), id.clone()) {
+    pub(super) fn adopt(
+        storage: &Arc<dyn StorageBackend>,
+        id: String,
+        env: HostEnv,
+    ) -> Result<Self> {
+        match lock::SessionGuard::adopt(Arc::clone(storage), id.clone(), env.clone()) {
             Ok(g) => Ok(Self { id, guard: Some(g) }),
             Err(e) => {
-                lock::deregister_session(storage.as_ref(), &id);
+                lock::deregister_session(storage.as_ref(), &id, &env);
                 Err(e)
             }
         }
@@ -76,7 +78,9 @@ pub(super) fn phase1_upload(
     shutdown: &CancelToken,
     dataless: &mut DatalessTally,
 ) -> Result<Phase1Output> {
-    let phase1_start = Instant::now();
+    let env = repo.host_env().clone();
+    let clock = Arc::clone(&env.clock);
+    let phase1_start = clock.monotonic();
     let _span = tracing::debug_span!("backup_phase1").entered();
     let snapshot_name = req.snapshot_name;
     let source_paths = req.source_paths;
@@ -229,7 +233,7 @@ pub(super) fn phase1_upload(
     // Workers confirm dedup hits against the session's table themselves.
     let prefilter = repo.dedup_prefilter();
 
-    let time_start = Utc::now();
+    let time_start = clock.now_utc();
     let mut stats = SnapshotStats::default();
     let mut item_stream = Vec::new();
     let mut item_ptrs: Vec<ChunkId> = Vec::new();
@@ -247,7 +251,7 @@ pub(super) fn phase1_upload(
     }
 
     // Execute command dumps before walking filesystem.
-    let walk_start = Instant::now();
+    let walk_start = clock.monotonic();
     command_dump::process_command_dumps(
         repo,
         command_dumps,
@@ -306,7 +310,7 @@ pub(super) fn phase1_upload(
         repo.restore_file_cache(file_cache_snapshot);
         pipeline_timings = Some(pipeline_result?);
     }
-    let walk = walk_start.elapsed();
+    let walk = clock.elapsed(walk_start);
     // The walk was the last reader of the loaded cache's sections for
     // these roots. Move them into the write cache now: during the walk
     // the write cache recorded only the path hashes of exact hits, so
@@ -342,12 +346,12 @@ pub(super) fn phase1_upload(
             stage: "upload packs",
         },
     );
-    let flush_start = Instant::now();
+    let flush_start = clock.monotonic();
     repo.flush_packs_journal_in_background()?;
-    let final_flush = flush_start.elapsed();
+    let final_flush = clock.elapsed(flush_start);
     let instrumentation = BackupInstrumentation {
         threads: num_workers,
-        phase1: phase1_start.elapsed(),
+        phase1: clock.elapsed(phase1_start),
         walk,
         final_flush,
         pipeline: pipeline_timings,
@@ -356,7 +360,7 @@ pub(super) fn phase1_upload(
     instrumentation.emit(&stats);
     shutdown.check()?;
 
-    let time_end = Utc::now();
+    let time_end = clock.now_utc();
 
     // Build snapshot metadata.
     let hostname = config
@@ -365,7 +369,7 @@ pub(super) fn phase1_upload(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(String::from)
-        .unwrap_or_else(crate::platform::short_hostname);
+        .unwrap_or_else(|| env.host.short_hostname());
     let username = std::env::var("USER").unwrap_or_else(|_| "unknown".into());
 
     let snapshot_meta = SnapshotMeta {
@@ -432,8 +436,10 @@ pub(super) fn phase2_commit(
     progress: &mut Option<&mut dyn FnMut(BackupProgressEvent)>,
     shutdown: &CancelToken,
 ) -> Result<()> {
+    let env = repo.host_env().clone();
     let guard = lock::acquire_lock_with_deadline(
         repo.storage.as_ref(),
+        &env,
         lock::COMMIT_LOCK_MAX_WAIT,
         500,
         shutdown,
@@ -446,7 +452,7 @@ pub(super) fn phase2_commit(
             );
         },
     )?;
-    let fence = lock::build_lock_fence(&guard, Arc::clone(&repo.storage));
+    let fence = lock::build_lock_fence(&guard, Arc::clone(&repo.storage), env);
     repo.set_lock_fence(fence);
 
     // Once the snapshot is committed, deregister the session and delete

@@ -12,6 +12,7 @@ mod delete_repo;
 mod error_messages;
 mod format;
 pub(crate) mod helpers;
+mod host_env_seams;
 mod hostname;
 mod index;
 mod index_rebuild;

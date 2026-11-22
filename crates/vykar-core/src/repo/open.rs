@@ -11,8 +11,9 @@ use super::manifest::Manifest;
 use super::snapshot_cache;
 use super::tree_cache::TreeChunkCache;
 use super::{
-    ChunkerParams, EncryptionMode, InitOptions, KEY_PRIMARY, KEY_SECONDARY, MAX_PACK_SIZE_LIMIT,
-    OpenOptions, RepoConfig, RepoFormat, Repository, default_max_pack_size, default_min_pack_size,
+    ChunkerParams, EncryptionMode, HostEnv, InitOptions, KEY_PRIMARY, KEY_SECONDARY,
+    MAX_PACK_SIZE_LIMIT, OpenOptions, RepoConfig, RepoFormat, Repository, default_max_pack_size,
+    default_min_pack_size,
 };
 use crate::index::LiveIndex;
 use crate::index::dedup_cache::generation_for_state;
@@ -275,6 +276,7 @@ impl Repository {
             file_cache_dirty: false,
             cache_dir_override: cache_dir,
             tree_cache,
+            host_env: HostEnv::system(),
             write_session: None,
             lock_fence: None,
             key_blob,
@@ -489,6 +491,7 @@ impl Repository {
             file_cache_dirty: false,
             cache_dir_override: cache_dir,
             tree_cache,
+            host_env: opts.host_env.clone(),
             write_session: None,
             lock_fence: None,
             key_blob,

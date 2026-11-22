@@ -1,13 +1,13 @@
+use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
-use std::time::SystemTime;
 
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use super::control::CancelToken;
+use super::host_env::{Clock, HostEnv, StopSignal};
 use vykar_storage::StorageBackend;
 use vykar_types::error::{LockHolder, LockHolderDetails, Result, VykarError};
 
@@ -35,7 +35,8 @@ const LOCK_MAX_UNREFRESHED_SECS: u64 = (DEFAULT_STALE_LOCK_SECS as u64) - 30 * 6
 #[derive(Debug)]
 pub struct LockGuard {
     key: String,
-    acquired_at: SystemTime,
+    /// Wall-clock time of acquisition, read after the confirming LIST.
+    acquired_at: DateTime<Utc>,
 }
 
 impl LockGuard {
@@ -53,23 +54,24 @@ impl LockGuard {
 ///
 /// Relies on the [`StorageBackend::list`] contract: a LIST reflects every PUT
 /// that completed before it started, including other clients' PUTs.
-pub fn acquire_lock(storage: &dyn StorageBackend) -> Result<LockGuard> {
-    let hostname = crate::platform::hostname();
-    let pid = std::process::id();
-
+pub fn acquire_lock(storage: &dyn StorageBackend, env: &HostEnv) -> Result<LockGuard> {
     // Don't publish a key while a holder exists: waiters would otherwise
     // collide with each other on every retry.
-    let held = cleanup_stale_locks(storage, Duration::seconds(DEFAULT_STALE_LOCK_SECS))?;
+    let held = cleanup_stale_locks(storage, Duration::seconds(DEFAULT_STALE_LOCK_SECS), env)?;
     if let Some(holder_key) = held.first() {
-        return Err(VykarError::Locked(build_lock_holder(storage, holder_key)));
+        return Err(VykarError::Locked(build_lock_holder(
+            storage,
+            holder_key,
+            env.clock.as_ref(),
+        )));
     }
 
-    let now = Utc::now();
+    let now = env.now_utc();
     let entry = LockEntry {
-        hostname,
-        pid,
+        hostname: env.host.hostname.clone(),
+        pid: env.host.pid,
         time: now.to_rfc3339(),
-        boot_id: crate::platform::boot_id(),
+        boot_id: env.host.boot_id.clone(),
     };
 
     let uuid = format!("{:032x}", rand::random::<u128>());
@@ -107,12 +109,16 @@ pub fn acquire_lock(storage: &dyn StorageBackend) -> Result<LockGuard> {
     }
     if let Some(other) = keys.iter().find(|k| **k != key) {
         let _ = storage.delete(&key);
-        return Err(VykarError::Locked(build_lock_holder(storage, other)));
+        return Err(VykarError::Locked(build_lock_holder(
+            storage,
+            other,
+            env.clock.as_ref(),
+        )));
     }
 
     Ok(LockGuard {
         key,
-        acquired_at: SystemTime::now(),
+        acquired_at: env.now_utc(),
     })
 }
 
@@ -147,8 +153,13 @@ fn list_lock_keys(storage: &dyn StorageBackend) -> Result<Vec<String>> {
 ///
 /// Falls back to `LockHolder { details: None }` when the lock object cannot be
 /// fetched or decoded — the holder may have released it between our LIST and
-/// this GET, so this is a normal race, not an error.
-fn build_lock_holder(storage: &dyn StorageBackend, lock_key: &str) -> LockHolder {
+/// this GET, so this is a normal race, not an error. The age is read on
+/// `clock` after the GET.
+fn build_lock_holder(
+    storage: &dyn StorageBackend,
+    lock_key: &str,
+    clock: &dyn Clock,
+) -> LockHolder {
     let bare = || LockHolder {
         key: lock_key.to_string(),
         details: None,
@@ -163,7 +174,7 @@ fn build_lock_holder(storage: &dyn StorageBackend, lock_key: &str) -> LockHolder
     // entry's own `time` field is unparseable.
     let age = lock_timestamp(Some(&entry), lock_key).map_or_else(
         || "unknown".to_string(),
-        |ts| format_age_since(&Utc::now(), &ts),
+        |ts| format_age_since(&clock.now_utc(), &ts),
     );
     LockHolder {
         key: lock_key.to_string(),
@@ -180,48 +191,35 @@ fn build_lock_holder(storage: &dyn StorageBackend, lock_key: &str) -> LockHolder
 /// Safe against a concurrent maintenance lock without taking one: the caller
 /// writes its session marker before this LIST, and maintenance writes its lock
 /// before listing sessions, so at least one of the two sees the other.
-fn probe_unlocked(storage: &dyn StorageBackend) -> Result<()> {
-    let held = cleanup_stale_locks(storage, Duration::seconds(DEFAULT_STALE_LOCK_SECS))?;
+fn probe_unlocked(storage: &dyn StorageBackend, env: &HostEnv) -> Result<()> {
+    let held = cleanup_stale_locks(storage, Duration::seconds(DEFAULT_STALE_LOCK_SECS), env)?;
     match held.first() {
-        Some(key) => Err(VykarError::Locked(build_lock_holder(storage, key))),
+        Some(key) => Err(VykarError::Locked(build_lock_holder(
+            storage,
+            key,
+            env.clock.as_ref(),
+        ))),
         None => Ok(()),
     }
 }
 
 /// Remove stale locks and return the keys that remain.
-fn cleanup_stale_locks(storage: &dyn StorageBackend, max_age: Duration) -> Result<Vec<String>> {
-    cleanup_stale_locks_inner(
-        storage,
-        max_age,
-        &crate::platform::hostname(),
-        crate::platform::boot_id().as_deref(),
-        crate::platform::is_pid_alive,
-    )
-}
-
-pub(crate) fn cleanup_stale_locks_inner(
+///
+/// A lock is stale when it is older than `max_age`, or when it comes from
+/// `env`'s hostname and either another boot ID or a dead PID.
+pub(crate) fn cleanup_stale_locks(
     storage: &dyn StorageBackend,
     max_age: Duration,
-    local_hostname: &str,
-    local_boot_id: Option<&str>,
-    pid_alive_fn: impl Fn(u32) -> bool,
+    env: &HostEnv,
 ) -> Result<Vec<String>> {
-    let now = Utc::now();
+    let now = env.now_utc();
     let mut surviving = Vec::new();
     for key in list_lock_keys(storage)? {
         let Some(data) = storage.get(&key)? else {
             continue;
         };
         let entry = serde_json::from_slice::<LockEntry>(&data).ok();
-        if should_cleanup_lock(
-            &key,
-            entry.as_ref(),
-            now,
-            max_age,
-            local_hostname,
-            local_boot_id,
-            &pid_alive_fn,
-        ) {
+        if should_cleanup_lock(&key, entry.as_ref(), now, max_age, env) {
             storage.delete(&key)?;
         } else {
             surviving.push(key);
@@ -234,21 +232,20 @@ pub(crate) fn cleanup_stale_locks_inner(
 fn should_cleanup_lock(
     key: &str,
     entry: Option<&LockEntry>,
-    now: chrono::DateTime<Utc>,
+    now: DateTime<Utc>,
     max_age: Duration,
-    local_hostname: &str,
-    local_boot_id: Option<&str>,
-    pid_alive_fn: &impl Fn(u32) -> bool,
+    env: &HostEnv,
 ) -> bool {
     if let Some(entry) = entry {
-        let same_host = entry.hostname == local_hostname;
+        let same_host = entry.hostname == env.host.hostname;
         if same_host {
-            if let (Some(local), Some(remote)) = (local_boot_id, entry.boot_id.as_deref())
+            if let (Some(local), Some(remote)) =
+                (env.host.boot_id.as_deref(), entry.boot_id.as_deref())
                 && local != remote
             {
                 return true;
             }
-            if !pid_alive_fn(entry.pid) {
+            if !env.is_pid_alive(entry.pid) {
                 return true;
             }
         }
@@ -291,49 +288,30 @@ fn lock_key_timestamp(key: &str) -> Option<chrono::DateTime<Utc>> {
 pub fn build_lock_fence(
     guard: &LockGuard,
     storage: Arc<dyn StorageBackend>,
-) -> Arc<dyn Fn() -> Result<()> + Send + Sync> {
-    let acquired_secs = guard
-        .acquired_at
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs() as i64);
-    build_lock_fence_inner(guard, storage, acquired_secs)
-}
-
-/// Same as [`build_lock_fence`] but with an overridden initial epoch for testing.
-#[cfg(test)]
-pub fn build_lock_fence_with_epoch(
-    guard: &LockGuard,
-    storage: Arc<dyn StorageBackend>,
-    override_epoch_secs: i64,
-) -> Arc<dyn Fn() -> Result<()> + Send + Sync> {
-    build_lock_fence_inner(guard, storage, override_epoch_secs)
-}
-
-fn build_lock_fence_inner(
-    guard: &LockGuard,
-    storage: Arc<dyn StorageBackend>,
-    initial_epoch_secs: i64,
+    env: HostEnv,
 ) -> Arc<dyn Fn() -> Result<()> + Send + Sync> {
     let lock_key = guard.key.clone();
-    let hostname = crate::platform::hostname();
-    let pid = std::process::id();
-
-    let last_refreshed = Arc::new(AtomicI64::new(initial_epoch_secs));
+    // A clock before the epoch gives a negative value, which the anomaly
+    // check in `verify_lock_validity` refuses.
+    let last_refreshed = Arc::new(AtomicI64::new(guard.acquired_at.timestamp()));
 
     Arc::new(move || {
-        verify_lock_validity(&lock_key, last_refreshed.load(Ordering::SeqCst), &*storage)?;
+        verify_lock_validity(
+            &lock_key,
+            last_refreshed.load(Ordering::SeqCst),
+            &*storage,
+            env.clock.as_ref(),
+        )?;
 
         // Refresh lock file if refresh interval has elapsed.
-        let now_secs = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map_or(i64::MAX, |d| d.as_secs() as i64);
+        let now_secs = env.now_utc().timestamp();
         let elapsed = now_secs - last_refreshed.load(Ordering::SeqCst);
         if elapsed >= LOCK_REFRESH_INTERVAL_SECS as i64 {
             let entry = LockEntry {
-                hostname: hostname.clone(),
-                pid,
-                time: Utc::now().to_rfc3339(),
-                boot_id: crate::platform::boot_id(),
+                hostname: env.host.hostname.clone(),
+                pid: env.host.pid,
+                time: env.now_utc().to_rfc3339(),
+                boot_id: env.host.boot_id.clone(),
             };
             if let Ok(data) = serde_json::to_vec(&entry)
                 && storage.put(&lock_key, &data).is_ok()
@@ -349,11 +327,15 @@ fn build_lock_fence_inner(
 
 /// Verify that a lock is still valid by checking existence and time elapsed.
 ///
+/// The time is read on `clock` after the existence check. It is wall-clock
+/// time, so a suspended machine finds its lock unrefreshed on resume.
+///
 /// This is the core validation logic, exposed for unit testing.
 pub fn verify_lock_validity(
     lock_key: &str,
     last_refreshed_secs: i64,
     storage: &dyn StorageBackend,
+    clock: &dyn Clock,
 ) -> Result<()> {
     // 1. Check lock file still exists.
     if !storage.exists(lock_key)? {
@@ -363,14 +345,13 @@ pub fn verify_lock_validity(
     }
 
     // 2. Check time since last refresh.
-    let now_secs = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map_or(i64::MAX, |d| d.as_secs() as i64);
+    let now_secs = clock.now_utc().timestamp();
 
     let elapsed = now_secs - last_refreshed_secs;
 
-    // Fail closed on clock anomaly (negative elapsed or clock failure).
-    if elapsed < 0 || now_secs == i64::MAX {
+    // Fail closed on clock anomaly (negative elapsed, or a clock before the
+    // epoch).
+    if elapsed < 0 || now_secs < 0 {
         return Err(VykarError::LockExpired(
             "clock anomaly detected; refusing to write with potentially stale lock".into(),
         ));
@@ -429,11 +410,15 @@ pub struct SessionEntry {
 /// (another backup's commit phase is typically seconds). If still locked
 /// after retries, deletes the marker and returns `Err(Locked)`.
 ///
-/// Performs blocking `std::thread::sleep` between attempts. Callers running
+/// Blocks the calling thread on `env.clock` between attempts. Callers running
 /// inside an async runtime must invoke this via `tokio::task::spawn_blocking`
 /// (see `commands/mount.rs` for the established pattern).
-pub fn register_session(storage: &dyn StorageBackend, session_id: &str) -> Result<()> {
-    register_session_inner(storage, session_id, 3, 2000)
+pub fn register_session(
+    storage: &dyn StorageBackend,
+    session_id: &str,
+    env: &HostEnv,
+) -> Result<()> {
+    register_session_inner(storage, session_id, 3, 2000, env)
 }
 
 pub(crate) fn register_session_inner(
@@ -441,12 +426,13 @@ pub(crate) fn register_session_inner(
     session_id: &str,
     max_attempts: usize,
     base_delay_ms: u64,
+    env: &HostEnv,
 ) -> Result<()> {
     let key = session_marker_key(session_id);
-    let now = Utc::now();
+    let now = env.now_utc();
     let entry = SessionEntry {
-        hostname: crate::platform::hostname(),
-        pid: std::process::id(),
+        hostname: env.host.hostname.clone(),
+        pid: env.host.pid,
         registered_at: now.to_rfc3339(),
         last_refresh: now.to_rfc3339(),
     };
@@ -459,7 +445,9 @@ pub(crate) fn register_session_inner(
         return Err(e);
     }
 
-    match retry_while_locked(max_attempts, base_delay_ms, || probe_unlocked(storage)) {
+    match retry_while_locked(max_attempts, base_delay_ms, env.clock.as_ref(), || {
+        probe_unlocked(storage, env)
+    }) {
         Ok(()) => {
             debug!(session_id, "session registered, no active lock");
             Ok(())
@@ -474,10 +462,10 @@ pub(crate) fn register_session_inner(
 
 /// Deregister a backup session. Best-effort: retries twice on failure.
 ///
-/// Performs blocking `std::thread::sleep` between retries. Callers running
+/// Blocks the calling thread on `env.clock` between retries. Callers running
 /// inside an async runtime must invoke this via `tokio::task::spawn_blocking`
 /// (see `commands/mount.rs` for the established pattern).
-pub fn deregister_session(storage: &dyn StorageBackend, session_id: &str) {
+pub fn deregister_session(storage: &dyn StorageBackend, session_id: &str, env: &HostEnv) {
     let key = session_marker_key(session_id);
     for attempt in 0..3 {
         match storage.delete(&key) {
@@ -488,43 +476,12 @@ pub fn deregister_session(storage: &dyn StorageBackend, session_id: &str) {
             Err(e) => {
                 if attempt < 2 {
                     debug!(session_id, error = %e, "retrying session deregister");
-                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    env.clock.sleep(std::time::Duration::from_millis(500));
                 } else {
                     warn!(session_id, error = %e, "failed to deregister session after retries");
                 }
             }
         }
-    }
-}
-
-/// Interruptible stop signal for the refresh thread.
-struct StopSignal {
-    mutex: Mutex<bool>,
-    condvar: Condvar,
-}
-
-impl StopSignal {
-    fn new() -> Self {
-        Self {
-            mutex: Mutex::new(false),
-            condvar: Condvar::new(),
-        }
-    }
-
-    /// Block up to `timeout`. Returns true immediately if signalled.
-    fn wait_timeout(&self, timeout: std::time::Duration) -> bool {
-        let guard = self.mutex.lock().expect("StopSignal mutex not poisoned");
-        let (guard, _) = self
-            .condvar
-            .wait_timeout_while(guard, timeout, |stopped| !*stopped)
-            .expect("StopSignal condvar wait not poisoned");
-        *guard
-    }
-
-    /// Wake the thread immediately.
-    fn signal(&self) {
-        *self.mutex.lock().expect("StopSignal mutex not poisoned") = true;
-        self.condvar.notify_all();
     }
 }
 
@@ -535,28 +492,42 @@ pub struct SessionGuard {
     session_id: String,
     refresh_handle: Option<JoinHandle<()>>,
     stop: Arc<StopSignal>,
+    env: HostEnv,
 }
 
 impl SessionGuard {
     /// Adopt an already-registered session. Starts the refresh thread but
     /// does NOT call `register_session()` — the caller must have done that
     /// before opening the repo (mirrors backup's ordering).
-    pub fn adopt(storage: Arc<dyn StorageBackend>, session_id: String) -> Result<Self> {
+    pub fn adopt(
+        storage: Arc<dyn StorageBackend>,
+        session_id: String,
+        env: HostEnv,
+    ) -> Result<Self> {
         let stop = Arc::new(StopSignal::new());
-        let handle =
-            Self::spawn_refresher(Arc::clone(&storage), session_id.clone(), Arc::clone(&stop))?;
+        let handle = Self::spawn_refresher(
+            Arc::clone(&storage),
+            session_id.clone(),
+            Arc::clone(&stop),
+            env.clone(),
+        )?;
         Ok(Self {
             storage,
             session_id,
             refresh_handle: Some(handle),
             stop,
+            env,
         })
     }
 
+    /// The heartbeat counts polls, not elapsed time: it refreshes after 30
+    /// polls of 30 s on `env.clock`, so a single long jump of the clock (a
+    /// suspend) counts as one poll.
     fn spawn_refresher(
         storage: Arc<dyn StorageBackend>,
         session_id: String,
         stop: Arc<StopSignal>,
+        env: HostEnv,
     ) -> Result<JoinHandle<()>> {
         std::thread::Builder::new()
             .name("session-refresh".into())
@@ -566,12 +537,12 @@ impl SessionGuard {
                 const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
                 let mut elapsed = std::time::Duration::ZERO;
                 loop {
-                    if stop.wait_timeout(POLL_INTERVAL) {
+                    if env.clock.wait_timeout(&stop, POLL_INTERVAL) {
                         break;
                     }
                     elapsed += POLL_INTERVAL;
                     if elapsed >= REFRESH_INTERVAL {
-                        refresh_session(storage.as_ref(), &session_id);
+                        refresh_session(storage.as_ref(), &session_id, env.clock.as_ref());
                         elapsed = std::time::Duration::ZERO;
                     }
                 }
@@ -586,7 +557,7 @@ impl Drop for SessionGuard {
         if let Some(handle) = self.refresh_handle.take() {
             let _ = handle.join();
         }
-        deregister_session(self.storage.as_ref(), &self.session_id);
+        deregister_session(self.storage.as_ref(), &self.session_id, &self.env);
     }
 }
 
@@ -602,9 +573,9 @@ impl Drop for SessionGuard {
 /// On storage read errors we also bail out without writing, so an
 /// inconclusive `Err` read can't overwrite a live marker's fields with
 /// defaults.
-pub fn refresh_session(storage: &dyn StorageBackend, session_id: &str) {
+pub fn refresh_session(storage: &dyn StorageBackend, session_id: &str, clock: &dyn Clock) {
     let key = session_marker_key(session_id);
-    let now = Utc::now();
+    let now = clock.now_utc();
 
     let mut entry: SessionEntry = match storage.get(&key) {
         Ok(Some(data)) => match serde_json::from_slice::<SessionEntry>(&data) {
@@ -657,17 +628,16 @@ pub fn list_sessions(storage: &dyn StorageBackend) -> Result<Vec<String>> {
 /// and not cleaned this invocation) are deleted — they already had their
 /// grace period.
 ///
-/// `local_hostname` and `pid_alive_fn` enable same-host dead-process detection:
-/// if a session's hostname matches and the PID is no longer alive, the session
-/// is treated as stale regardless of age. Sessions from different hosts are
-/// only cleaned by the `max_age` timeout.
+/// `env` gives the time and enables same-host dead-process detection: if a
+/// session's hostname matches `env`'s and the PID is no longer alive there,
+/// the session is treated as stale regardless of age. Sessions from different
+/// hosts are only cleaned by the `max_age` timeout.
 pub fn cleanup_stale_sessions(
     storage: &dyn StorageBackend,
     max_age: Duration,
-    local_hostname: &str,
-    pid_alive_fn: impl Fn(u32) -> bool,
+    env: &HostEnv,
 ) -> Result<Vec<String>> {
-    let now = Utc::now();
+    let now = env.now_utc();
     let keys = storage.list(SESSIONS_PREFIX)?;
     let mut cleaned = Vec::new();
     // Track which session IDs survived the first pass (not deleted).
@@ -703,7 +673,7 @@ pub fn cleanup_stale_sessions(
         };
 
         let is_stale_by_age = now.signed_duration_since(ts.with_timezone(&Utc)) > max_age;
-        let is_dead_local = entry.hostname == local_hostname && !pid_alive_fn(entry.pid);
+        let is_dead_local = entry.hostname == env.host.hostname && !env.is_pid_alive(entry.pid);
 
         if is_stale_by_age {
             debug!(session_id, age_hours = %((now - ts.with_timezone(&Utc)).num_hours()), "cleaning stale session");
@@ -797,10 +767,11 @@ fn describe_holder(holder: &LockHolder) -> String {
 
 /// Run `op` until it returns something other than `Locked`, with exponential
 /// backoff + jitter between attempts. Returns the last `Locked` when attempts
-/// run out. Blocks the calling thread.
+/// run out. Blocks the calling thread on `clock`.
 fn retry_while_locked<T>(
     max_attempts: usize,
     base_delay_ms: u64,
+    clock: &dyn Clock,
     mut op: impl FnMut() -> Result<T>,
 ) -> Result<T> {
     for attempt in 0..max_attempts {
@@ -816,7 +787,7 @@ fn retry_while_locked<T>(
                         delay_ms = delay,
                         "lock contention, retrying"
                     );
-                    std::thread::sleep(std::time::Duration::from_millis(delay));
+                    clock.sleep(std::time::Duration::from_millis(delay));
                 } else {
                     return Err(VykarError::Locked(holder));
                 }
@@ -861,28 +832,29 @@ const LOCK_WAIT_SLICE: std::time::Duration = std::time::Duration::from_millis(50
 ///   contenders that PUT in the same window both back off. With several
 ///   commits queued the deadline is a soft bound.
 ///
-/// Blocks the calling thread. Callers running inside an async runtime must
-/// invoke this via `tokio::task::spawn_blocking`.
+/// Blocks the calling thread on `env.clock`. Callers running inside an async
+/// runtime must invoke this via `tokio::task::spawn_blocking`.
 pub fn acquire_lock_with_deadline(
     storage: &dyn StorageBackend,
+    env: &HostEnv,
     max_wait: std::time::Duration,
     base_delay_ms: u64,
     shutdown: &CancelToken,
     mut on_contended: impl FnMut(&LockHolder),
 ) -> Result<LockGuard> {
-    let start = std::time::Instant::now();
+    let start = env.clock.monotonic();
     let deadline = start + max_wait;
     let mut attempt: usize = 0;
     loop {
         if shutdown.is_cancelled() {
             return Err(VykarError::Interrupted);
         }
-        let holder = match acquire_lock(storage) {
+        let holder = match acquire_lock(storage, env) {
             Ok(guard) => return Ok(guard),
             Err(VykarError::Locked(holder)) => holder,
             Err(e) => return Err(e),
         };
-        let now = std::time::Instant::now();
+        let now = env.clock.monotonic();
         if now >= deadline {
             return Err(VykarError::Locked(holder));
         }
@@ -906,14 +878,14 @@ pub fn acquire_lock_with_deadline(
         }
         let wake = now + delay;
         loop {
-            let now = std::time::Instant::now();
+            let now = env.clock.monotonic();
             if now >= wake {
                 break;
             }
             if shutdown.is_cancelled() {
                 return Err(VykarError::Interrupted);
             }
-            std::thread::sleep((wake - now).min(LOCK_WAIT_SLICE));
+            env.clock.sleep((wake - now).min(LOCK_WAIT_SLICE));
         }
         attempt += 1;
     }

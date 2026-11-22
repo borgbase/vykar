@@ -33,7 +33,7 @@ use crate::repo::control::{CancelToken, CommitEvent};
 use crate::repo::file_cache::{CachedChunks, FileCache, ParentReuseIndex, RetainedHit};
 use crate::repo::lock;
 use crate::repo::pack::PackType;
-use crate::repo::{Repository, WriteSessionOptions};
+use crate::repo::{HostEnv, Repository, WriteSessionOptions};
 use crate::snapshot::SnapshotStats;
 use crate::snapshot::item::Item;
 use crate::storage;
@@ -439,7 +439,7 @@ pub fn run_with_progress(
     progress: Option<&mut dyn FnMut(BackupProgressEvent)>,
     shutdown: &CancelToken,
 ) -> Result<BackupOutcome> {
-    run_impl(config, req, progress, shutdown, None)
+    run_impl(config, req, progress, shutdown, None, HostEnv::system())
 }
 
 /// Wraps the storage backend before the backup uses it (tests only).
@@ -465,8 +465,9 @@ pub(crate) fn run_impl(
     progress: Option<&mut dyn FnMut(BackupProgressEvent)>,
     shutdown: &CancelToken,
     wrap_backend: Option<BackendWrapper<'_>>,
+    host_env: HostEnv,
 ) -> Result<BackupOutcome> {
-    run_scoped(config, req, progress, shutdown, wrap_backend).map_err(|(_, e)| e)
+    run_scoped(config, req, progress, shutdown, wrap_backend, host_env).map_err(|(_, e)| e)
 }
 
 /// [`run_impl`] that also reports whether a failure was source-local.
@@ -476,10 +477,19 @@ pub(crate) fn run_scoped(
     progress: Option<&mut dyn FnMut(BackupProgressEvent)>,
     shutdown: &CancelToken,
     wrap_backend: Option<BackendWrapper<'_>>,
+    host_env: HostEnv,
 ) -> std::result::Result<BackupOutcome, (FailureScope, VykarError)> {
     let prepared = prepare(config, &req).map_err(|e| (FailureScope::Source, e))?;
-    run_against_repo(config, &req, prepared, progress, shutdown, wrap_backend)
-        .map_err(|e| (FailureScope::Repository, e))
+    run_against_repo(
+        config,
+        &req,
+        prepared,
+        progress,
+        shutdown,
+        wrap_backend,
+        host_env,
+    )
+    .map_err(|e| (FailureScope::Repository, e))
 }
 
 /// Source-local setup that touches no repository state.
@@ -545,6 +555,7 @@ fn run_against_repo(
     mut progress: Option<&mut dyn FnMut(BackupProgressEvent)>,
     shutdown: &CancelToken,
     wrap_backend: Option<BackendWrapper<'_>>,
+    host_env: HostEnv,
 ) -> Result<BackupOutcome> {
     let snapshot_name = req.snapshot_name;
     let passphrase = req.passphrase;
@@ -579,7 +590,7 @@ fn run_against_repo(
     // pending_index journal), so Phase 2 has no uploads left to wait for.
 
     // Register session marker and probe for maintenance lock.
-    lock::register_session(backend.as_ref(), &session_id)?;
+    lock::register_session(backend.as_ref(), &session_id, &host_env)?;
     debug!(session_id, "backup session registered");
 
     // Open repo after session registration (minimizes T0→commit window).
@@ -592,25 +603,28 @@ fn run_against_repo(
     let open_req = super::util::open_request(config);
     let cache_dir = open_req.cache_dir.clone();
     let opts = if source_paths.is_empty() {
-        crate::repo::OpenOptions::new().with_index()
+        crate::repo::OpenOptions::new()
+            .with_index()
+            .host_env(host_env.clone())
     } else {
         crate::repo::OpenOptions::new()
             .with_index()
             .with_file_cache()
+            .host_env(host_env.clone())
     };
     let opts = super::util::with_identity_context(opts, &open_req);
     let open_result = Repository::open_shared(Arc::clone(&backend), passphrase, cache_dir, opts);
     let mut repo = match open_result {
         Ok(r) => {
             if let Err(e) = super::util::verify_repo_identity(&open_req, &r) {
-                lock::deregister_session(backend.as_ref(), &session_id);
+                lock::deregister_session(backend.as_ref(), &session_id, &host_env);
                 return Err(e);
             }
             r
         }
         Err(e) => {
             let e = super::util::enrich_repo_not_found(e, &open_req.url);
-            lock::deregister_session(backend.as_ref(), &session_id);
+            lock::deregister_session(backend.as_ref(), &session_id, &host_env);
             return Err(e);
         }
     };
@@ -624,7 +638,8 @@ fn run_against_repo(
     // the lock release, or hands it to the cleanup thread at the commit point.
     // `session` is declared after `repo` so it drops before `Repository::drop`;
     // those error returns depend on that order.
-    let mut session = phases::BackupSession::adopt(&repo.storage, session_id)?;
+    let mut session =
+        phases::BackupSession::adopt(&repo.storage, session_id, repo.host_env().clone())?;
 
     // Run-local tally of unreachable cloud-only content. Declared here because
     // Phase 1 below borrows it while `BackupOutcome` is built after it

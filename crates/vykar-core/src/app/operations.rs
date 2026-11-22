@@ -15,6 +15,7 @@ use zeroize::Zeroizing;
 use crate::app::preflight::{self, UnavailableRepo};
 use crate::commands;
 use crate::config::{ResolvedRepo, SourceEntry, VykarConfig};
+use crate::repo::HostEnv;
 use crate::repo::control::CancelToken;
 use vykar_types::error::{Result, VykarError};
 
@@ -307,9 +308,16 @@ fn run_backup_sources(
                 let mut backup_cb = |bpe| {
                     cb(BackupRunEvent::Backup(bpe));
                 };
-                commands::backup::run_scoped(config, req, Some(&mut backup_cb), shutdown, None)
+                commands::backup::run_scoped(
+                    config,
+                    req,
+                    Some(&mut backup_cb),
+                    shutdown,
+                    None,
+                    HostEnv::system(),
+                )
             } else {
-                commands::backup::run_scoped(config, req, None, shutdown, None)
+                commands::backup::run_scoped(config, req, None, shutdown, None, HostEnv::system())
             }
         };
 

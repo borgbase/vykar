@@ -12,7 +12,7 @@ use vykar_core::config::{ChunkerConfig, EncryptionModeConfig, VykarConfig};
 use vykar_core::repo::ChunkerParams;
 use vykar_core::repo::control::CancelToken;
 use vykar_core::repo::pack::PackType;
-use vykar_core::repo::{EncryptionMode, OpenOptions, Repository, WriteSessionOptions};
+use vykar_core::repo::{EncryptionMode, HostEnv, OpenOptions, Repository, WriteSessionOptions};
 use vykar_core::snapshot::item::ItemType;
 use vykar_storage::local_backend::LocalBackend;
 
@@ -3044,9 +3044,13 @@ fn session_guard_blocks_maintenance() {
     let storage: std::sync::Arc<dyn vykar_storage::StorageBackend> =
         std::sync::Arc::new(LocalBackend::new(repo_dir.to_str().unwrap()).unwrap());
     let session_id = format!("{:032x}", rand::random::<u128>());
-    lock::register_session(storage.as_ref(), &session_id).unwrap();
-    let guard =
-        lock::SessionGuard::adopt(std::sync::Arc::clone(&storage), session_id.clone()).unwrap();
+    lock::register_session(storage.as_ref(), &session_id, &HostEnv::system()).unwrap();
+    let guard = lock::SessionGuard::adopt(
+        std::sync::Arc::clone(&storage),
+        session_id.clone(),
+        HostEnv::system(),
+    )
+    .unwrap();
 
     // with_maintenance_lock must refuse while the session is active
     let mut repo2 = open_local_repo_cached(&repo_dir, None);

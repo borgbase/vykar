@@ -1,7 +1,5 @@
 use std::collections::HashMap;
 
-use chrono::Utc;
-
 use crate::config::{RetentionConfig, SourceEntry, VykarConfig};
 use crate::prune::{PruneDecision, apply_policy_by_label};
 use crate::repo::control::CancelToken;
@@ -77,7 +75,7 @@ pub(crate) fn run_on_repo(
     shutdown: &CancelToken,
 ) -> Result<(PruneStats, Vec<PruneListEntry>)> {
     with_maintenance_lock(repo, |repo| {
-        let now = Utc::now();
+        let now = repo.host_env().now_utc();
 
         // When --source is given, restrict to matching snapshots only
         let target_snapshots = if source_filter.is_empty() {

@@ -12,7 +12,7 @@ use vykar_core::compress::Compression;
 use vykar_core::config::{ChunkerConfig, CommandDump, EncryptionModeConfig, RetentionConfig};
 use vykar_core::repo::control::CancelToken;
 use vykar_core::repo::lock;
-use vykar_core::repo::{EncryptionMode, OpenOptions, Repository};
+use vykar_core::repo::{EncryptionMode, HostEnv, OpenOptions, Repository};
 use vykar_storage::local_backend::LocalBackend;
 use vykar_storage::{InnerBackend, StorageBackend};
 use vykar_types::error::VykarError;
@@ -444,7 +444,7 @@ fn backup_fails_when_repository_lock_is_held_by_another_process() {
     commands::init::run(&config, None).unwrap();
 
     let storage = LocalBackend::new(repo_dir.to_str().unwrap()).unwrap();
-    let guard = lock::acquire_lock(&storage).unwrap();
+    let guard = lock::acquire_lock(&storage, &HostEnv::system()).unwrap();
 
     let source_paths = vec![source_dir.to_string_lossy().to_string()];
     let exclude_if_present: Vec<String> = Vec::new();

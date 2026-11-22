@@ -1,9 +1,10 @@
 use crate::repo::lock::{
-    SESSION_STALE_SECS, SessionEntry, SessionGuard, acquire_lock, break_lock,
-    cleanup_stale_locks_inner, cleanup_stale_sessions, clear_all_sessions,
-    default_stale_session_duration, format_age, format_age_since, refresh_session,
-    register_session, release_lock, session_marker_key,
+    SESSION_STALE_SECS, SessionEntry, SessionGuard, acquire_lock, break_lock, cleanup_stale_locks,
+    cleanup_stale_sessions, clear_all_sessions, default_stale_session_duration, format_age,
+    format_age_since, refresh_session, register_session, release_lock, session_marker_key,
 };
+use crate::repo::{HostEnv, HostIdentity, SystemClock};
+use crate::sim::env::{SimTime, TimeMode};
 use crate::testutil::MemoryBackend;
 use chrono::{Duration, Utc};
 use std::sync::Arc;
@@ -14,10 +15,26 @@ fn pid_always_alive(_pid: u32) -> bool {
     true
 }
 
+/// The system clock on host `hostname` with boot ID `boot_id`, where
+/// `alive` decides PID liveness.
+fn env_on(
+    hostname: &str,
+    boot_id: Option<&str>,
+    alive: impl Fn(u32) -> bool + Send + Sync + 'static,
+) -> HostEnv {
+    HostEnv::system()
+        .with_host(HostIdentity {
+            hostname: hostname.to_string(),
+            pid: 1,
+            boot_id: boot_id.map(str::to_string),
+        })
+        .with_pid_alive(Arc::new(move |_, p| alive(p)))
+}
+
 #[test]
 fn acquire_and_release_lock() {
     let storage = MemoryBackend::new();
-    let guard = acquire_lock(&storage).unwrap();
+    let guard = acquire_lock(&storage, &HostEnv::system()).unwrap();
     let key = guard.key().to_string();
 
     // Lock key should exist in storage
@@ -89,7 +106,7 @@ fn failed_list_after_lock_put_removes_the_key() {
         inner: MemoryBackend::new(),
         fired: std::sync::atomic::AtomicBool::new(false),
     };
-    let err = acquire_lock(&storage).unwrap_err();
+    let err = acquire_lock(&storage, &HostEnv::system()).unwrap_err();
     assert!(
         matches!(err, vykar_types::error::VykarError::Interrupted),
         "{err}"
@@ -100,7 +117,7 @@ fn failed_list_after_lock_put_removes_the_key() {
 #[test]
 fn lock_key_in_locks_directory() {
     let storage = MemoryBackend::new();
-    let guard = acquire_lock(&storage).unwrap();
+    let guard = acquire_lock(&storage, &HostEnv::system()).unwrap();
     assert!(guard.key().starts_with("locks/"));
     assert!(guard.key().ends_with(".json"));
     release_lock(&storage, guard).unwrap();
@@ -109,9 +126,9 @@ fn lock_key_in_locks_directory() {
 #[test]
 fn second_lock_is_rejected() {
     let storage = MemoryBackend::new();
-    let first = acquire_lock(&storage).unwrap();
+    let first = acquire_lock(&storage, &HostEnv::system()).unwrap();
 
-    let second = acquire_lock(&storage);
+    let second = acquire_lock(&storage, &HostEnv::system());
     assert!(second.is_err(), "second lock acquisition should fail");
     let msg = second.unwrap_err().to_string();
     assert!(msg.contains("locked"), "unexpected error: {msg}");
@@ -126,9 +143,11 @@ fn second_lock_is_rejected() {
 #[test]
 fn locked_error_names_holder_age_and_remedy() {
     let storage = MemoryBackend::new();
-    let first = acquire_lock(&storage).unwrap();
+    let first = acquire_lock(&storage, &HostEnv::system()).unwrap();
 
-    let msg = acquire_lock(&storage).unwrap_err().to_string();
+    let msg = acquire_lock(&storage, &HostEnv::system())
+        .unwrap_err()
+        .to_string();
     assert!(
         msg.contains(&crate::platform::hostname()),
         "message should name the holder's host: {msg}"
@@ -167,7 +186,9 @@ fn locked_error_falls_back_to_key_when_holder_unparseable() {
     let garbage_key = lock_key_at(Utc::now() - Duration::minutes(1), "garbage");
     storage.put(&garbage_key, b"not json").unwrap();
 
-    let msg = acquire_lock(&storage).unwrap_err().to_string();
+    let msg = acquire_lock(&storage, &HostEnv::system())
+        .unwrap_err()
+        .to_string();
     assert!(
         msg.contains(&garbage_key),
         "message should name the lock key: {msg}"
@@ -218,7 +239,7 @@ fn stale_lock_is_cleaned_up() {
     storage.put(stale_key, stale_entry.as_bytes()).unwrap();
     assert!(storage.exists(stale_key).unwrap());
 
-    let guard = acquire_lock(&storage).unwrap();
+    let guard = acquire_lock(&storage, &HostEnv::system()).unwrap();
     assert!(
         !storage.exists(stale_key).unwrap(),
         "stale lock should be removed during acquisition"
@@ -257,12 +278,10 @@ fn stale_lock_cleanup_removes_same_host_older_boot() {
     let key = lock_key_at(Utc::now(), "old-boot");
     write_lock_marker(&storage, &key, "myhost", 123, Utc::now(), Some("boot-a"));
 
-    cleanup_stale_locks_inner(
+    cleanup_stale_locks(
         &storage,
         Duration::hours(6),
-        "myhost",
-        Some("boot-b"),
-        |_| true,
+        &env_on("myhost", Some("boot-b"), |_| true),
     )
     .unwrap();
 
@@ -275,12 +294,10 @@ fn stale_lock_cleanup_removes_dead_same_host_pid() {
     let key = lock_key_at(Utc::now(), "dead-pid");
     write_lock_marker(&storage, &key, "myhost", 123, Utc::now(), Some("boot-a"));
 
-    cleanup_stale_locks_inner(
+    cleanup_stale_locks(
         &storage,
         Duration::hours(6),
-        "myhost",
-        Some("boot-a"),
-        |_| false,
+        &env_on("myhost", Some("boot-a"), |_| false),
     )
     .unwrap();
 
@@ -293,12 +310,10 @@ fn stale_lock_cleanup_preserves_live_same_host_pid() {
     let key = lock_key_at(Utc::now(), "live-pid");
     write_lock_marker(&storage, &key, "myhost", 123, Utc::now(), Some("boot-a"));
 
-    cleanup_stale_locks_inner(
+    cleanup_stale_locks(
         &storage,
         Duration::hours(6),
-        "myhost",
-        Some("boot-a"),
-        |_| true,
+        &env_on("myhost", Some("boot-a"), |_| true),
     )
     .unwrap();
 
@@ -311,12 +326,10 @@ fn stale_lock_cleanup_preserves_recent_foreign_host() {
     let key = lock_key_at(Utc::now(), "foreign");
     write_lock_marker(&storage, &key, "otherhost", 123, Utc::now(), Some("boot-a"));
 
-    cleanup_stale_locks_inner(
+    cleanup_stale_locks(
         &storage,
         Duration::hours(6),
-        "myhost",
-        Some("boot-b"),
-        |_| false,
+        &env_on("myhost", Some("boot-b"), |_| false),
     )
     .unwrap();
 
@@ -330,12 +343,10 @@ fn stale_lock_cleanup_reaps_malformed_lock_by_key_age() {
     let key = lock_key_at(old, "malformed");
     storage.put(&key, b"not-json").unwrap();
 
-    cleanup_stale_locks_inner(
+    cleanup_stale_locks(
         &storage,
         Duration::hours(6),
-        "myhost",
-        Some("boot-a"),
-        |_| true,
+        &env_on("myhost", Some("boot-a"), |_| true),
     )
     .unwrap();
 
@@ -348,12 +359,10 @@ fn stale_lock_cleanup_preserves_recent_old_format_lock() {
     let key = lock_key_at(Utc::now(), "old-format");
     write_lock_marker(&storage, &key, "otherhost", 123, Utc::now(), None);
 
-    cleanup_stale_locks_inner(
+    cleanup_stale_locks(
         &storage,
         Duration::hours(6),
-        "myhost",
-        Some("boot-a"),
-        |_| false,
+        &env_on("myhost", Some("boot-a"), |_| false),
     )
     .unwrap();
 
@@ -367,12 +376,10 @@ fn stale_lock_cleanup_reaps_age_stale_old_format_lock() {
     let key = lock_key_at(old, "age-stale");
     write_lock_marker(&storage, &key, "otherhost", 123, old, None);
 
-    cleanup_stale_locks_inner(
+    cleanup_stale_locks(
         &storage,
         Duration::hours(6),
-        "myhost",
-        Some("boot-a"),
-        |_| false,
+        &env_on("myhost", Some("boot-a"), |_| false),
     )
     .unwrap();
 
@@ -384,7 +391,7 @@ fn break_lock_removes_all_locks() {
     let storage = MemoryBackend::new();
 
     // Acquire a lock and "forget" the guard (simulates a killed process)
-    let guard = acquire_lock(&storage).unwrap();
+    let guard = acquire_lock(&storage, &HostEnv::system()).unwrap();
     let key = guard.key().to_string();
     assert!(storage.exists(&key).unwrap());
     std::mem::forget(guard);
@@ -442,8 +449,7 @@ fn cleanup_stale_sessions_preserves_active_index() {
     let cleaned = cleanup_stale_sessions(
         &storage,
         Duration::hours(72),
-        "other-host",
-        pid_always_alive,
+        &env_on("other-host", None, pid_always_alive),
     )
     .unwrap();
     assert!(cleaned.is_empty());
@@ -468,8 +474,7 @@ fn cleanup_stale_sessions_removes_marker_preserves_index() {
     let cleaned = cleanup_stale_sessions(
         &storage,
         Duration::hours(72),
-        "other-host",
-        pid_always_alive,
+        &env_on("other-host", None, pid_always_alive),
     )
     .unwrap();
     assert_eq!(cleaned, vec!["sess2"]);
@@ -492,8 +497,7 @@ fn cleanup_stale_sessions_removes_orphaned_index() {
     let cleaned = cleanup_stale_sessions(
         &storage,
         Duration::hours(72),
-        "other-host",
-        pid_always_alive,
+        &env_on("other-host", None, pid_always_alive),
     )
     .unwrap();
     assert!(cleaned.is_empty(), "no .json marker to report as cleaned");
@@ -519,8 +523,7 @@ fn cleanup_stale_sessions_skips_non_json_files() {
     let cleaned = cleanup_stale_sessions(
         &storage,
         Duration::hours(72),
-        "other-host",
-        pid_always_alive,
+        &env_on("other-host", None, pid_always_alive),
     )
     .unwrap();
     assert!(cleaned.is_empty());
@@ -543,8 +546,12 @@ fn cleanup_removes_dead_local_session() {
         .put("sessions/local-dead.index", b"journal")
         .unwrap();
 
-    let cleaned =
-        cleanup_stale_sessions(&storage, Duration::hours(72), "myhost", |_pid| false).unwrap();
+    let cleaned = cleanup_stale_sessions(
+        &storage,
+        Duration::hours(72),
+        &env_on("myhost", None, |_pid| false),
+    )
+    .unwrap();
     assert_eq!(cleaned, vec!["local-dead"]);
     assert!(!storage.exists("sessions/local-dead.json").unwrap());
     assert!(
@@ -561,8 +568,12 @@ fn cleanup_preserves_alive_local_session() {
     // Session from "myhost" with PID 42 — pid_alive says it's alive.
     write_session_marker_with_host(&storage, "local-alive", &now, "myhost", 42);
 
-    let cleaned =
-        cleanup_stale_sessions(&storage, Duration::hours(72), "myhost", |_pid| true).unwrap();
+    let cleaned = cleanup_stale_sessions(
+        &storage,
+        Duration::hours(72),
+        &env_on("myhost", None, |_pid| true),
+    )
+    .unwrap();
     assert!(cleaned.is_empty());
     assert!(storage.exists("sessions/local-alive.json").unwrap());
 }
@@ -576,8 +587,12 @@ fn cleanup_does_not_remove_remote_dead_pid() {
     // false, we cannot verify remote PIDs, so the session must survive.
     write_session_marker_with_host(&storage, "remote-sess", &now, "remote-host", 42);
 
-    let cleaned =
-        cleanup_stale_sessions(&storage, Duration::hours(72), "myhost", |_pid| false).unwrap();
+    let cleaned = cleanup_stale_sessions(
+        &storage,
+        Duration::hours(72),
+        &env_on("myhost", None, |_pid| false),
+    )
+    .unwrap();
     assert!(
         cleaned.is_empty(),
         "remote session should not be removed by dead-PID detection"
@@ -599,8 +614,7 @@ fn cleanup_second_pass_removes_orphan_index_from_prior_run() {
     let cleaned = cleanup_stale_sessions(
         &storage,
         Duration::hours(72),
-        "other-host",
-        pid_always_alive,
+        &env_on("other-host", None, pid_always_alive),
     )
     .unwrap();
     assert_eq!(cleaned, vec!["prior"]);
@@ -615,8 +629,7 @@ fn cleanup_second_pass_removes_orphan_index_from_prior_run() {
     let cleaned = cleanup_stale_sessions(
         &storage,
         Duration::hours(72),
-        "other-host",
-        pid_always_alive,
+        &env_on("other-host", None, pid_always_alive),
     )
     .unwrap();
     assert!(cleaned.is_empty());
@@ -677,8 +690,7 @@ fn cleanup_keeps_session_at_44_minutes() {
     let cleaned = cleanup_stale_sessions(
         &storage,
         default_stale_session_duration(),
-        "other-host",
-        pid_always_alive,
+        &env_on("other-host", None, pid_always_alive),
     )
     .unwrap();
     assert!(cleaned.is_empty(), "44-min session must not be reaped");
@@ -694,8 +706,7 @@ fn cleanup_reaps_session_at_46_minutes() {
     let cleaned = cleanup_stale_sessions(
         &storage,
         default_stale_session_duration(),
-        "other-host",
-        pid_always_alive,
+        &env_on("other-host", None, pid_always_alive),
     )
     .unwrap();
     assert_eq!(cleaned, vec!["stale"], "46-min session must be reaped");
@@ -713,8 +724,7 @@ fn cleanup_preserves_malformed_marker() {
     let cleaned = cleanup_stale_sessions(
         &storage,
         default_stale_session_duration(),
-        "other-host",
-        pid_always_alive,
+        &env_on("other-host", None, pid_always_alive),
     )
     .unwrap();
 
@@ -741,8 +751,7 @@ fn cleanup_preserves_marker_with_bad_timestamp() {
     let cleaned = cleanup_stale_sessions(
         &storage,
         default_stale_session_duration(),
-        "other-host",
-        pid_always_alive,
+        &env_on("other-host", None, pid_always_alive),
     )
     .unwrap();
 
@@ -764,7 +773,7 @@ fn refresh_session_does_not_resurrect_missing_marker() {
     // Refresh a session whose marker was already deleted (e.g. by maintenance).
     // Must NOT recreate the key — otherwise the marker would come back from
     // the dead and block the next maintenance run.
-    refresh_session(&storage, "ghost");
+    refresh_session(&storage, "ghost", &SystemClock);
 
     assert!(
         !storage.exists(&key).unwrap(),
@@ -778,7 +787,7 @@ fn refresh_session_updates_existing_marker() {
     let original = (Utc::now() - Duration::minutes(10)).to_rfc3339();
     write_session_marker(&storage, "live", &original);
 
-    refresh_session(&storage, "live");
+    refresh_session(&storage, "live", &SystemClock);
 
     let key = session_marker_key("live");
     let data = storage.get(&key).unwrap().unwrap();
@@ -794,33 +803,58 @@ fn refresh_session_updates_existing_marker() {
 // --- SessionGuard lifecycle tests ---
 
 #[test]
-fn session_guard_drop_stops_thread_before_deregister() {
+fn session_heartbeat_refreshes_on_virtual_time() {
     let storage: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+    let start = Utc::now();
+    let time = SimTime::new(start, TimeMode::Auto);
+    let env = HostEnv::system().with_clock(Arc::new(time.clock(Duration::zero())));
     let session_id = format!("guard-{:016x}", rand::random::<u64>());
+    let wait = std::time::Duration::from_secs(5);
 
-    register_session(storage.as_ref(), &session_id).unwrap();
+    register_session(storage.as_ref(), &session_id, &env).unwrap();
     let key = session_marker_key(&session_id);
     assert!(storage.exists(&key).unwrap());
 
-    let guard = SessionGuard::adopt(Arc::clone(&storage), session_id.clone()).unwrap();
-    drop(guard);
+    let guard = SessionGuard::adopt(Arc::clone(&storage), session_id.clone(), env.clone()).unwrap();
+    assert!(time.wait_for_waiters(1, wait));
+    // The heartbeat counts 30 polls of 30 s, then refreshes.
+    for _ in 0..30 {
+        time.advance(std::time::Duration::from_secs(30));
+        assert!(time.wait_for_waiters(1, wait));
+    }
+    let expected = (start + Duration::minutes(15)).timestamp();
+    let real = std::time::Instant::now();
+    loop {
+        let data = storage.get(&key).unwrap().unwrap();
+        let entry: SessionEntry = serde_json::from_slice(&data).unwrap();
+        let refreshed = chrono::DateTime::parse_from_rfc3339(&entry.last_refresh)
+            .unwrap()
+            .timestamp();
+        if refreshed == expected {
+            assert_eq!(env.now_utc().timestamp(), expected);
+            break;
+        }
+        assert!(real.elapsed() < wait, "marker not refreshed: {entry:?}");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
 
-    // After Drop completes, the marker must be gone AND the heartbeat thread
-    // must not race back in to recreate it. Give the scheduler a moment and
-    // re-check — if the (non-resurrecting) refresh fires after deregister,
-    // the key stays gone.
-    std::thread::sleep(std::time::Duration::from_millis(50));
+    drop(guard);
     assert!(
         !storage.exists(&key).unwrap(),
         "SessionGuard::drop must deregister after joining the heartbeat thread"
     );
+    assert!(time.waiters().is_empty(), "heartbeat thread still waits");
 }
 
 // ── acquire_lock_with_deadline ───────────────────────────────────────────
 
 mod deadline {
+    use crate::repo::HostEnv;
     use crate::repo::control::CancelToken;
-    use crate::repo::lock::{acquire_lock, acquire_lock_with_deadline, release_lock};
+    use crate::repo::lock::{
+        COMMIT_LOCK_MAX_WAIT, acquire_lock, acquire_lock_with_deadline, release_lock,
+    };
+    use crate::sim::env::{SimTime, TimeMode};
     use crate::testutil::MemoryBackend;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -830,7 +864,7 @@ mod deadline {
     #[test]
     fn deadline_waits_for_release() {
         let storage = Arc::new(MemoryBackend::new());
-        let held = acquire_lock(&*storage).unwrap();
+        let held = acquire_lock(&*storage, &HostEnv::system()).unwrap();
         let releaser = {
             let storage = Arc::clone(&storage);
             std::thread::spawn(move || {
@@ -842,6 +876,7 @@ mod deadline {
         let mut contended = 0;
         let guard = acquire_lock_with_deadline(
             &*storage,
+            &HostEnv::system(),
             Duration::from_secs(30),
             100,
             &CancelToken::new(),
@@ -856,21 +891,29 @@ mod deadline {
     #[test]
     fn deadline_times_out_after_budget() {
         let storage = MemoryBackend::new();
-        let _held = acquire_lock(&storage).unwrap();
+        let _held = acquire_lock(&storage, &HostEnv::system()).unwrap();
+        let time = SimTime::new(chrono::Utc::now(), TimeMode::Auto);
+        let env = HostEnv::system().with_clock(Arc::new(time.clock(chrono::Duration::zero())));
         let start = Instant::now();
         let err = acquire_lock_with_deadline(
             &storage,
-            Duration::from_millis(300),
+            &env,
+            COMMIT_LOCK_MAX_WAIT,
             500,
             &CancelToken::new(),
             |_| {},
         )
         .unwrap_err();
-        let elapsed = start.elapsed();
         assert!(matches!(err, VykarError::Locked(_)), "got {err:?}");
         assert!(
-            elapsed >= Duration::from_millis(250) && elapsed <= Duration::from_secs(3),
-            "elapsed {elapsed:?}"
+            time.elapsed() >= COMMIT_LOCK_MAX_WAIT,
+            "{:?}",
+            time.elapsed()
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            start.elapsed()
         );
     }
 
@@ -879,8 +922,15 @@ mod deadline {
         let storage = MemoryBackend::new();
         let flag = CancelToken::new();
         flag.cancel();
-        let err = acquire_lock_with_deadline(&storage, Duration::from_secs(30), 500, &flag, |_| {})
-            .unwrap_err();
+        let err = acquire_lock_with_deadline(
+            &storage,
+            &HostEnv::system(),
+            Duration::from_secs(30),
+            500,
+            &flag,
+            |_| {},
+        )
+        .unwrap_err();
         assert!(matches!(err, VykarError::Interrupted), "got {err:?}");
         assert!(storage.list("locks/").unwrap().is_empty());
     }
@@ -888,7 +938,7 @@ mod deadline {
     #[test]
     fn deadline_interrupted_during_contention() {
         let storage = MemoryBackend::new();
-        let _held = acquire_lock(&storage).unwrap();
+        let _held = acquire_lock(&storage, &HostEnv::system()).unwrap();
         let flag = CancelToken::new();
         let setter = {
             let flag = flag.clone();
@@ -898,9 +948,15 @@ mod deadline {
             })
         };
         let start = Instant::now();
-        let err =
-            acquire_lock_with_deadline(&storage, Duration::from_secs(600), 500, &flag, |_| {})
-                .unwrap_err();
+        let err = acquire_lock_with_deadline(
+            &storage,
+            &HostEnv::system(),
+            Duration::from_secs(600),
+            500,
+            &flag,
+            |_| {},
+        )
+        .unwrap_err();
         setter.join().unwrap();
         assert!(matches!(err, VykarError::Interrupted), "got {err:?}");
         assert!(
@@ -920,7 +976,7 @@ mod exclusion {
     use crate::repo::lock::{
         acquire_lock, register_session_inner, release_lock, session_marker_key,
     };
-    use crate::repo::{EncryptionMode, Repository};
+    use crate::repo::{EncryptionMode, HostEnv, Repository};
     use crate::testutil::{HookBackend, MemoryBackend, Op, RecordingBackend};
     use chrono::Utc;
     use std::collections::HashSet;
@@ -1009,7 +1065,10 @@ mod exclusion {
         let storage = MemoryBackend::new();
         let foreign = foreign_lock(&storage, Utc::now() + chrono::Duration::minutes(1));
 
-        assert_eq!(locked_key(acquire_lock(&storage).unwrap_err()), foreign);
+        assert_eq!(
+            locked_key(acquire_lock(&storage, &HostEnv::system()).unwrap_err()),
+            foreign
+        );
         assert_eq!(storage.list("locks/").unwrap(), vec![foreign]);
     }
 
@@ -1019,20 +1078,24 @@ mod exclusion {
         foreign_lock(&storage, Utc::now() - chrono::Duration::minutes(1));
         log.clear();
 
-        assert!(matches!(acquire_lock(&storage), Err(VykarError::Locked(_))));
+        assert!(matches!(
+            acquire_lock(&storage, &HostEnv::system()),
+            Err(VykarError::Locked(_))
+        ));
         assert_eq!(lock_puts(&log.entries()), 0, "{:?}", log.entries());
     }
 
     #[test]
     fn register_session_probe_issues_no_lock_put() {
         let (storage, log) = RecordingBackend::new();
-        register_session_inner(&storage, "free", 1, 10).unwrap();
+        register_session_inner(&storage, "free", 1, 10, &HostEnv::system()).unwrap();
         assert!(storage.exists(&session_marker_key("free")).unwrap());
         assert_eq!(lock_puts(&log.entries()), 0, "{:?}", log.entries());
 
-        let held = acquire_lock(&storage).unwrap();
+        let held = acquire_lock(&storage, &HostEnv::system()).unwrap();
         log.clear();
-        let err = register_session_inner(&storage, "blocked", 1, 10).unwrap_err();
+        let err =
+            register_session_inner(&storage, "blocked", 1, 10, &HostEnv::system()).unwrap_err();
         assert_eq!(locked_key(err), held.key());
         assert!(!storage.exists(&session_marker_key("blocked")).unwrap());
         assert_eq!(lock_puts(&log.entries()), 0, "{:?}", log.entries());
@@ -1084,7 +1147,7 @@ mod exclusion {
         let handles: Vec<_> = (0..2)
             .map(|_| {
                 let storage = Arc::clone(&storage);
-                std::thread::spawn(move || acquire_lock(&*storage))
+                std::thread::spawn(move || acquire_lock(&*storage, &HostEnv::system()))
             })
             .collect();
         for h in handles {
@@ -1118,7 +1181,10 @@ mod exclusion {
             }
         });
 
-        assert_eq!(locked_key(acquire_lock(&storage).unwrap_err()), late);
+        assert_eq!(
+            locked_key(acquire_lock(&storage, &HostEnv::system()).unwrap_err()),
+            late
+        );
         assert_eq!(inner.list("locks/").unwrap(), vec![late]);
     }
 
@@ -1139,7 +1205,7 @@ mod exclusion {
         let storage = Arc::clone(&repo.storage);
         let session = std::thread::Builder::new()
             .name("session".into())
-            .spawn(move || register_session_inner(&*storage, "s1", 1, 10))
+            .spawn(move || register_session_inner(&*storage, "s1", 1, 10, &HostEnv::system()))
             .unwrap();
         reached.recv_timeout(Duration::from_secs(10)).unwrap();
 
@@ -1186,7 +1252,7 @@ mod exclusion {
             .unwrap();
         reached.recv_timeout(Duration::from_secs(10)).unwrap();
 
-        let err = register_session_inner(&*storage, "s2", 1, 10).unwrap_err();
+        let err = register_session_inner(&*storage, "s2", 1, 10, &HostEnv::system()).unwrap_err();
         assert!(matches!(err, VykarError::Locked(_)), "got {err:?}");
         assert!(!inner.exists(&session_marker_key("s2")).unwrap());
 
@@ -1214,7 +1280,7 @@ mod exclusion {
                 );
                 std::thread::spawn(move || {
                     loop {
-                        match acquire_lock(&*storage) {
+                        match acquire_lock(&*storage, &HostEnv::system()) {
                             Ok(guard) => {
                                 let n = inside.fetch_add(1, Ordering::SeqCst) + 1;
                                 max_inside.fetch_max(n, Ordering::SeqCst);

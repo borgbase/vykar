@@ -260,6 +260,7 @@ impl Repository {
             &*self.crypto,
             &self.chunk_index,
             width,
+            self.host_env.clock.as_ref(),
         )
     }
 

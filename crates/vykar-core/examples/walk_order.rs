@@ -1,6 +1,8 @@
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 //! Time a walk of one configured source in stat or name emission order
 //! (06 step 0). Prints one JSON `WalkReport` per repetition to stdout.
+//! `--order` defaults to `name`, the order backups emit; `stat` is the
+//! emission order before 06 step 3, kept for A/B timing.
 //!
 //! ```text
 //! walk_order [--config <path>] [--repo <label|url>] --source <label>
@@ -79,9 +81,6 @@ fn parse_args() -> Result<Args, Error> {
 
 fn main() -> Result<(), Error> {
     let args = parse_args()?;
-    if let Ok(v) = std::env::var("VYKAR_WALK_EMIT_ORDER") {
-        eprintln!("note: VYKAR_WALK_EMIT_ORDER={v:?} is ignored; --order decides");
-    }
 
     let config_path = resolve_config_path(args.config.as_deref()).ok_or("no config file found")?;
     let repos = load_and_resolve(config_path.path())?;

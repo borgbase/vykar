@@ -6,13 +6,15 @@
 //! yields 3-8x speedup on HDD for stat-dominated workloads (e.g. incremental
 //! backups where the file cache skips most reads).
 //!
-//! On macOS and Windows, entries are sorted by filename for deterministic
-//! snapshots. All platforms share the same filtering logic (excludes,
-//! gitignore, markers, cross-device).
+//! Elsewhere (macOS, Windows, other Linux filesystems) stat runs in name
+//! order. All platforms share the same filtering logic (excludes, gitignore,
+//! markers, cross-device).
 //!
-//! Entries are emitted (and subdirectories descended) in stat order, unless
-//! [`EMIT_ORDER_ENV`] selects name order: then stat stays inode-sorted and
-//! each directory's events are re-sorted by name before they are emitted.
+//! Entries are emitted, and subdirectories descended, in name order (the
+//! bytes of the snapshot path, see `emit_key`) on every filesystem; on
+//! ext4/xfs/reiserfs stat runs in inode order first and the directory is
+//! re-sorted before emission. Every directory's entries are emitted before
+//! any of its descendants, so each root's entries come out in dfs-name order.
 
 // libc::statfs to detect filesystems where inode-sorted stat helps; SAFETY per block.
 #![allow(unsafe_code)]
@@ -93,44 +95,43 @@ fn inode_sort_beneficial(_path: &Path) -> bool {
 /// `inode_sort_beneficial` holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EmitOrder {
-    /// Emit in stat order (inode order on ext4/xfs/reiserfs, name order elsewhere).
+    /// Stat order: inode order on ext4/xfs/reiserfs, name order elsewhere.
+    /// The emission order before 06 step 3, kept only so `walk_measure` can
+    /// time it against `Name`. Never used by a backup.
     Stat,
-    /// Emit in name order on every filesystem.
+    /// Name order on every filesystem (06 order 1, "dfs-name"). What
+    /// backups use.
     Name,
 }
 
-/// Measurement switch for 06 step 0; step 3 decides its fate. Setting it in a
-/// real backup changes the item order on ext4/xfs, so that run shares no tree
-/// chunks with the previous snapshot of the source.
-pub(crate) const EMIT_ORDER_ENV: &str = "VYKAR_WALK_EMIT_ORDER";
-
-impl EmitOrder {
-    /// `None`, `""` and `"inode"` give `Stat`, `"name"` gives `Name`. Any other
-    /// value gives `Stat` with `recognized = false`. Case-sensitive.
-    pub(crate) fn parse(value: Option<&str>) -> (Self, bool) {
-        match value {
-            None | Some("" | "inode") => (Self::Stat, true),
-            Some("name") => (Self::Name, true),
-            Some(_) => (Self::Stat, false),
+/// Sort key of a walk event for name-ordered emission: an entry's snapshot
+/// path as the item stores it (what `Item::path_bytes` returns: the raw
+/// shadow when present, else the display path). Skip events write no item
+/// and are keyed on their absolute path instead, so they do not interleave
+/// with the entries by name but cluster (usually before them); that only has
+/// to be deterministic.
+fn emit_key(event: &WalkEvent) -> &[u8] {
+    match event {
+        WalkEvent::Entry(e) => e
+            .snapshot_path_raw
+            .as_deref()
+            .unwrap_or(e.snapshot_path.as_bytes()),
+        WalkEvent::Skipped { path, .. } | WalkEvent::SkippedDataless { path, .. } => {
+            path.as_os_str().as_encoded_bytes()
         }
-    }
-
-    pub(crate) fn from_env() -> Self {
-        let value = std::env::var(EMIT_ORDER_ENV).ok();
-        let (order, recognized) = Self::parse(value.as_deref());
-        if !recognized {
-            tracing::warn!(
-                value = value.as_deref().unwrap_or_default(),
-                "unrecognized {EMIT_ORDER_ENV}; emitting in stat order"
-            );
-        }
-        order
     }
 }
 
-/// Path of a walk event, for the name-order re-sort.
-fn path_sort_bytes(path: &Path) -> &[u8] {
-    path.as_os_str().as_encoded_bytes()
+/// Total order for name-ordered emission: `emit_key`, then the encoded
+/// absolute path, so that two entries whose lossy paths collide (unpaired
+/// surrogates on Windows) still come out in a fixed order.
+fn emit_cmp(a: &WalkEvent, b: &WalkEvent) -> std::cmp::Ordering {
+    emit_key(a).cmp(emit_key(b)).then_with(|| {
+        event_path(a)
+            .as_os_str()
+            .as_encoded_bytes()
+            .cmp(event_path(b).as_os_str().as_encoded_bytes())
+    })
 }
 
 fn event_path(event: &WalkEvent) -> &Path {
@@ -314,8 +315,8 @@ struct DirLevel {
 ///
 /// For each directory, entries are sorted by inode number before calling
 /// `symlink_metadata()`, making stat calls sweep sequentially through
-/// the inode table on ext4/xfs. They are emitted in that order unless
-/// `emit_order` is [`EmitOrder::Name`], which re-sorts them by name after stat.
+/// the inode table on ext4/xfs. With [`EmitOrder::Name`] (every backup) they
+/// are re-sorted by name after stat and emitted in that order.
 pub(in crate::commands::backup) struct InodeSortedWalk {
     stack: Vec<DirLevel>,
     /// Absolute source path — used for filesystem access (so `read_dir`
@@ -369,12 +370,13 @@ impl InodeSortedWalk {
             exclude_if_present,
             one_file_system,
             git_ignore,
-            EmitOrder::from_env(),
+            EmitOrder::Name,
             None,
         )
     }
 
-    /// [`Self::new`] with an explicit emission order and, when
+    /// [`Self::new`] with an explicit emission order (`Stat` is for
+    /// measurement and tests only) and, when
     /// `inode_sort_override` is `Some`, a forced inode-sort decision instead
     /// of `inode_sort_beneficial`.
     pub(in crate::commands::backup) fn new_inner(
@@ -638,13 +640,13 @@ impl InodeSortedWalk {
             // ext4/xfs/reiserfs: inode order ≈ disk order → sequential stat.
             raw_entries.sort_unstable_by_key(|e| e.ino);
         } else {
-            // Other filesystems: filename order for deterministic snapshots.
+            // Other filesystems: filename order for stat (emission order is
+            // set in phase 5).
             raw_entries.sort_unstable_by(|a, b| a.path.cmp(&b.path));
         }
 
         // Phase 4: Stat in inode order and post-stat filter.
         let mut events: VecDeque<WalkEvent> = VecDeque::new();
-        let mut pending_subdirs = VecDeque::new();
 
         for raw in raw_entries {
             let metadata = match std::fs::symlink_metadata(&raw.path) {
@@ -706,10 +708,6 @@ impl InodeSortedWalk {
                 continue;
             }
 
-            if actual_is_dir && !file_type.is_symlink() {
-                pending_subdirs.push_back(raw.path.clone());
-            }
-
             let rel = rel_path_from_abs(&self.abs_source, &raw.path);
             let rel_raw = rel_raw_from_abs(&self.abs_source, &raw.path);
             let (snapshot_path, snapshot_path_raw) = self.combined_snapshot_path(rel, rel_raw);
@@ -723,18 +721,24 @@ impl InodeSortedWalk {
             }));
         }
 
-        // Phase 5: re-sort for emission when stat order was inode order.
-        if self.inode_sort_for_source && self.emit_order == EmitOrder::Name {
-            // Siblings share their parent prefix, so comparing the encoded
-            // bytes orders them by name without `Path::cmp`'s per-comparison
-            // component parsing.
-            events.make_contiguous().sort_unstable_by(|a, b| {
-                path_sort_bytes(event_path(a)).cmp(path_sort_bytes(event_path(b)))
-            });
-            pending_subdirs
-                .make_contiguous()
-                .sort_unstable_by(|a, b| path_sort_bytes(a).cmp(path_sort_bytes(b)));
+        // Phase 5: name order for emission (06 order 1). On inode-sorted
+        // filesystems this re-sorts the stat order; elsewhere the events are
+        // already in this order and the sort is a linear pass.
+        if self.emit_order == EmitOrder::Name {
+            events.make_contiguous().sort_unstable_by(emit_cmp);
         }
+
+        // Subdirectories are descended in the order their entries are emitted,
+        // which is what makes every subtree follow its directory's entries in
+        // the same order. `file_type` is from `symlink_metadata`, so a
+        // symlink to a directory is not descended.
+        let pending_subdirs: VecDeque<PathBuf> = events
+            .iter()
+            .filter_map(|ev| match ev {
+                WalkEvent::Entry(e) if e.file_type.is_dir() => Some(e.abs_path.clone()),
+                _ => None,
+            })
+            .collect();
 
         // Prepend skip events for readdir errors from phase 1 so consumers can
         // account for each lost entry. `push_front` reverses the deferred order,
@@ -1499,13 +1503,169 @@ mod tests {
         );
     }
 
+    /// 06 order 1: (parent components, name), components compared as bytes.
+    fn dfs_name_key(p: &[u8]) -> (Vec<&[u8]>, &[u8]) {
+        let mut c: Vec<&[u8]> = p.split(|b| *b == b'/').collect();
+        let name = c.pop().unwrap();
+        (c, name)
+    }
+
+    fn entry_path_bytes(e: &WalkedEntry) -> Vec<u8> {
+        e.snapshot_path_raw
+            .clone()
+            .unwrap_or_else(|| e.snapshot_path.as_bytes().to_vec())
+    }
+
+    fn walk_path_bytes(source: &ResolvedSource, inode_sort: bool) -> Vec<Vec<u8>> {
+        InodeSortedWalk::new_inner(
+            source,
+            &[],
+            &[],
+            false,
+            false,
+            EmitOrder::Name,
+            Some(inode_sort),
+        )
+        .unwrap()
+        .map(|ev| match ev.unwrap() {
+            WalkEvent::Entry(e) => entry_path_bytes(&e),
+            _ => panic!("unexpected skip event"),
+        })
+        .collect()
+    }
+
+    fn position(paths: &[Vec<u8>], p: &[u8]) -> usize {
+        paths
+            .iter()
+            .position(|q| q == p)
+            .unwrap_or_else(|| panic!("{:?} not walked", String::from_utf8_lossy(p)))
+    }
+
+    /// Names whose dfs-name order differs from the byte order of the joined
+    /// path (`a.b` vs `a/x`), case and non-ASCII siblings, and on Unix
+    /// non-UTF-8 names whose raw bytes sort differently from their lossy
+    /// display form. Everything is created in reverse name order so inode
+    /// order is not name order. `B` is left out where the
+    /// filesystem does not distinguish case (default APFS, NTFS); `C` keeps
+    /// an uppercase-before-lowercase sibling everywhere.
+    fn make_awkward_tree(root: &Path) -> AwkwardTree {
+        let mut created: Vec<Vec<u8>> = Vec::new();
+        let mut mixed_case = true;
+        let files = ["z", "é", "b", "B", "C", "ab", "a b", "a-b"];
+        for name in files {
+            if name == "B" && root.join(name).symlink_metadata().is_ok() {
+                // `b` already answers to `B`: case-insensitive.
+                mixed_case = false;
+                continue;
+            }
+            fs::write(root.join(name), "x").unwrap();
+            created.push(name.as_bytes().to_vec());
+        }
+        for dir in ["a.b", "a"] {
+            fs::create_dir(root.join(dir)).unwrap();
+            created.push(dir.as_bytes().to_vec());
+        }
+        fs::write(root.join("a.b/x"), "x").unwrap();
+        fs::write(root.join("a/y"), "x").unwrap();
+        fs::create_dir(root.join("a/x")).unwrap();
+        fs::write(root.join("a/x/deep"), "x").unwrap();
+        for p in ["a.b/x", "a/y", "a/x", "a/x/deep"] {
+            created.push(p.as_bytes().to_vec());
+        }
+
+        let mut raw = false;
+        #[cfg(unix)]
+        {
+            use std::ffi::OsStr;
+            use std::os::unix::ffi::OsStrExt;
+            // Some filesystems (APFS/HFS+) reject non-UTF-8 names; then only
+            // the UTF-8 names are tested.
+            if fs::write(root.join(OsStr::from_bytes(b"\xff")), "x").is_ok() {
+                raw = true;
+                created.push(b"\xff".to_vec());
+                fs::write(root.join("\u{10000}"), "x").unwrap();
+                created.push("\u{10000}".as_bytes().to_vec());
+                fs::write(root.join("né"), "x").unwrap();
+                created.push("né".as_bytes().to_vec());
+                let d = root.join(OsStr::from_bytes(b"n\x80"));
+                fs::create_dir(&d).unwrap();
+                created.push(b"n\x80".to_vec());
+                fs::write(d.join("c"), "x").unwrap();
+                created.push(b"n\x80/c".to_vec());
+            }
+        }
+        AwkwardTree {
+            created,
+            raw,
+            mixed_case,
+        }
+    }
+
+    struct AwkwardTree {
+        created: Vec<Vec<u8>>,
+        /// The non-UTF-8 names were created.
+        raw: bool,
+        /// Both `b` and `B` were created.
+        mixed_case: bool,
+    }
+
+    fn assert_dfs_name_order(paths: &[Vec<u8>]) {
+        for w in paths.windows(2) {
+            assert!(
+                dfs_name_key(&w[0]) < dfs_name_key(&w[1]),
+                "not in dfs-name order: {:?} then {:?}",
+                String::from_utf8_lossy(&w[0]),
+                String::from_utf8_lossy(&w[1]),
+            );
+        }
+    }
+
     #[test]
-    fn emit_order_parse() {
-        assert_eq!(EmitOrder::parse(None), (EmitOrder::Stat, true));
-        assert_eq!(EmitOrder::parse(Some("")), (EmitOrder::Stat, true));
-        assert_eq!(EmitOrder::parse(Some("inode")), (EmitOrder::Stat, true));
-        assert_eq!(EmitOrder::parse(Some("name")), (EmitOrder::Name, true));
-        assert_eq!(EmitOrder::parse(Some("NAME")), (EmitOrder::Stat, false));
-        assert_eq!(EmitOrder::parse(Some("bogus")), (EmitOrder::Stat, false));
+    fn name_emission_is_dfs_name_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tree = make_awkward_tree(tmp.path());
+        let mut expected = tree.created;
+        expected.sort_by(|a, b| dfs_name_key(a).cmp(&dfs_name_key(b)));
+
+        let source = resolve_dir(tmp.path());
+        let with_inode = walk_path_bytes(&source, true);
+        let without = walk_path_bytes(&source, false);
+        assert_eq!(with_inode, expected);
+        assert_eq!(without, expected);
+        assert_dfs_name_order(&with_inode);
+
+        // Not the byte order of the joined paths: `a.b` (a child of the
+        // root) before `a/x`, and the whole `a/` subtree before `a.b/`'s.
+        let p = |s: &[u8]| position(&with_inode, s);
+        assert!(p(b"a.b") < p(b"a/x"));
+        assert!(p(b"a/x/deep") < p(b"a.b/x"));
+        assert!(p(b"C") < p(b"a") && p(b"ab") < p(b"b"));
+        if tree.mixed_case {
+            assert!(p(b"B") < p(b"C"));
+        }
+        if tree.raw {
+            // Raw bytes, not the lossy display form, decide the order.
+            assert!(p(b"n\x80") < p("né".as_bytes()));
+            assert!(p("\u{10000}".as_bytes()) < p(b"\xff"));
+        }
+    }
+
+    #[test]
+    fn name_emission_is_dfs_name_order_under_emit_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("data");
+        fs::create_dir(&root).unwrap();
+        let created = make_awkward_tree(&root).created;
+
+        let source = ResolvedSource::resolve(&root.to_string_lossy(), true).unwrap();
+        let paths = walk_path_bytes(&source, true);
+        assert_eq!(paths, walk_path_bytes(&source, false));
+        assert_eq!(paths.len(), created.len() + 1);
+        let prefix = paths[0].clone();
+        assert!(prefix.ends_with(b"/data"), "root entry first");
+        let mut with_slash = prefix.clone();
+        with_slash.push(b'/');
+        assert!(paths[1..].iter().all(|p| p.starts_with(&with_slash)));
+        assert_dfs_name_order(&paths);
     }
 }

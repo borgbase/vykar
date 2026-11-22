@@ -1,6 +1,6 @@
 //! Walk one configured source as a backup would and time it, for
-//! `examples/walk_order.rs` (06 step 0). Public only with the `measure`
-//! feature; not API.
+//! `examples/walk_order.rs` (06 step 0; kept after step 3 for A/B timing of
+//! the old order). Public only with the `measure` feature; not API.
 //!
 //! The walk thread's per-entry syscalls (stat, readlink, xattrs) run as in a
 //! backup. File content is read only for `read_changed_since_ns`, and on this
@@ -17,7 +17,10 @@ use vykar_types::error::{Result, VykarError, is_soft_backup_io_error};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WalkOrder {
+    /// Emission before 06 step 3 (inode order on ext4/xfs); for A/B timing
+    /// only.
     Stat,
+    /// Name order, what backups emit.
     Name,
 }
 
@@ -53,7 +56,7 @@ pub struct WalkMeasureOptions {
 impl Default for WalkMeasureOptions {
     fn default() -> Self {
         Self {
-            order: WalkOrder::Stat,
+            order: WalkOrder::Name,
             inode_sort: InodeSort::Auto,
             materialize: true,
             read_changed_since_ns: None,

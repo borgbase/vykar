@@ -89,7 +89,8 @@ fuzzing = []
 # Simulation harness for protocol tests (src/sim). Test support, not API;
 # never enable in a product build.
 sim = []
-# Measurement entry points for examples/walk_order.rs and examples/listing_stats.rs (06 step 0). Not API.
+# Measurement entry points for examples/walk_order.rs and examples/listing_stats.rs (06 step 0;
+# walk_order keeps the pre-step-3 emission order for A/B). Not API.
 measure = []
 
 [[example]]

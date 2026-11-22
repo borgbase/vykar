@@ -267,6 +267,7 @@ pub(super) fn process_command_dumps(
     };
     listing.push(repo, &dumps_dir_item)?;
 
+    let mut dump_items: Vec<Item> = Vec::with_capacity(command_dumps.len());
     for dump in command_dumps {
         info!(
             name = %dump.name,
@@ -310,9 +311,16 @@ pub(super) fn process_command_dumps(
             raw_names: None,
             hardlink: None,
         };
-        listing.push(repo, &dump_item)?;
+        dump_items.push(dump_item);
 
         emit_stats_progress(progress, stats, Some(format!("vykar-dumps/{}", dump.name)));
+    }
+
+    // Name order within vykar-dumps/ (06 order 1); dumps still run in config
+    // order, since a later dump may depend on an earlier one.
+    dump_items.sort_unstable_by(|a, b| a.path_bytes().cmp(b.path_bytes()));
+    for item in &dump_items {
+        listing.push(repo, item)?;
     }
 
     Ok(())

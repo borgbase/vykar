@@ -2091,8 +2091,8 @@ fn backup_many_small_files_plus_large_file_roundtrip() {
             .collect();
         assert_eq!(files.len(), 501, "all files should be in snapshot");
 
-        // Walk order depends on filesystem (inode order on ext4/xfs, filename
-        // order elsewhere). Just verify all expected files are present.
+        // Walk order is name order on every filesystem; the check below only
+        // needs the set.
         let mut paths: Vec<_> = items
             .iter()
             .filter(|i| i.entry_type == ItemType::RegularFile)

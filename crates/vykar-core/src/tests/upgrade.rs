@@ -1,5 +1,4 @@
-//! `vykar upgrade`: monolithic index (v2/v3) to the numbered heads of
-//! v7/v6 in place.
+//! `vykar upgrade`: monolithic index (v2/v3) to format v6 in place.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -17,7 +16,7 @@ use crate::index::table::{self, ChunkTable};
 use crate::repo::control::CancelToken;
 use crate::repo::index_store::{self, INDEX_OBJECT_DIR};
 use crate::repo::{
-    EncryptionMode, OpenOptions, RepoConfig, RepoFormat, Repository, UpgradeOutcome,
+    DecodedConfig, EncryptionMode, OpenOptions, RepoConfig, RepoFormat, Repository, UpgradeOutcome,
 };
 use vykar_storage::local_backend::LocalBackend;
 use vykar_storage::{InnerBackend, StorageBackend, delegate_storage_backend};
@@ -32,7 +31,7 @@ struct Fixture {
     legacy: RepoFormat,
 }
 
-/// A repository at the upgrade target of `legacy` (v2 → v7, v3 → v6),
+/// A repository at the upgrade target of `legacy` (v6 with its hash),
 /// which a test fills and then turns into a `legacy` one with
 /// [`Fixture::downgrade`]: no binary writes v2/v3 any more.
 fn fixture(legacy: RepoFormat) -> Fixture {
@@ -110,17 +109,32 @@ impl Fixture {
         blob
     }
 
-    fn version(&self) -> u32 {
-        let config: RepoConfig =
-            rmp_serde::from_slice(&std::fs::read(self.repo_dir.join("config")).unwrap()).unwrap();
-        config.version
+    fn decoded_config(&self) -> DecodedConfig {
+        RepoConfig::decode(&std::fs::read(self.repo_dir.join("config")).unwrap()).unwrap()
     }
 
+    fn version(&self) -> u32 {
+        match self.decoded_config() {
+            DecodedConfig::Map(c) => c.version,
+            DecodedConfig::Positional(c) => c.version,
+        }
+    }
+
+    /// Rewrite `config` as the positional config of `version` (what the
+    /// development formats 4 and 5 wrote).
     fn set_version(&self, version: u32) {
         let path = self.repo_dir.join("config");
-        let mut config: RepoConfig = rmp_serde::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        config.version = version;
-        std::fs::write(path, rmp_serde::to_vec(&config).unwrap()).unwrap();
+        let c = self.decoded_config().into_repo_config();
+        let legacy = crate::repo::LegacyRepoConfig {
+            version,
+            id: c.id,
+            chunker_params: c.chunker_params,
+            encryption: c.encryption,
+            created: c.created,
+            min_pack_size: c.min_pack_size,
+            max_pack_size: c.max_pack_size,
+        };
+        std::fs::write(path, rmp_serde::to_vec(&legacy).unwrap()).unwrap();
     }
 
     /// Every file under the repository, by its path relative to it.
@@ -186,7 +200,11 @@ impl Fixture {
     /// index while `config` is at v2/v3.
     fn cold_index(&self, name: &str) -> Vec<String> {
         let cache = self.tmp.path().join(name);
-        if RepoFormat::from_version(self.version()).is_ok_and(RepoFormat::is_upgrade_only) {
+        if self
+            .decoded_config()
+            .validate()
+            .is_ok_and(RepoFormat::is_upgrade_only)
+        {
             let repo = self.open_legacy(&cache).unwrap();
             return sorted_entries(&repo.legacy_index().unwrap());
         }
@@ -194,25 +212,29 @@ impl Fixture {
     }
 }
 
+/// The entries without their refcounts (not persisted from v6 on).
 fn sorted_entries(index: &impl crate::testutil::EntryIter) -> Vec<String> {
     let mut v: Vec<String> = index
         .entry_vec()
         .iter()
-        .map(|(id, e)| format!("{id:?} {e:?}"))
+        .map(|(id, e)| format!("{id:?} {} {} {}", e.pack_id, e.pack_offset, e.stored_size))
         .collect();
     v.sort();
     v
 }
 
-/// v2 → v7 and v3 → v6 (UPG-1): one base, no segments, a head at
+/// v2 and v3 → v6 (UPG-1): one base, no segments, a head at
 /// `index.h/1`, the same index; `index`, `index.gen` and the local blob
 /// copy gone; later backups append segments, and a second upgrade does
 /// nothing.
 #[test]
 fn upgrade_moves_the_index_to_a_base() {
     for (from, to) in [
-        (RepoFormat::V2, RepoFormat::V7),
-        (RepoFormat::V3, RepoFormat::V6),
+        (
+            RepoFormat::V2,
+            RepoFormat::V6(vykar_types::hash::HashAlgorithm::Blake2b),
+        ),
+        (RepoFormat::V3, RepoFormat::CURRENT),
     ] {
         let fx = fixture(from);
         fx.write("a", "alpha");
@@ -227,14 +249,19 @@ fn upgrade_moves_the_index_to_a_base() {
         let UpgradeOutcome::Upgraded {
             from: f,
             to: t,
+            chunk_hash,
             entries,
             base_bytes,
+            packs_mapped,
+            packs_unmapped,
             resumed,
         } = outcome
         else {
             panic!("{from:?}: {outcome:?}");
         };
         assert_eq!((f, t), (from.version(), to.version()));
+        assert_eq!(chunk_hash, to.chunk_hash());
+        assert!(packs_mapped > 0 && packs_unmapped == 0, "{from:?}");
         assert_eq!(entries as usize, before.len());
         assert!(base_bytes > 0 && !resumed);
         assert_eq!(fx.version(), to.version());
@@ -309,8 +336,11 @@ fn interrupt_at_the_switch(fx: &Fixture) -> (VykarError, Vec<String>) {
 #[test]
 fn interrupted_upgrade_resumes_from_the_legacy_index() {
     for (from, to) in [
-        (RepoFormat::V2, RepoFormat::V7),
-        (RepoFormat::V3, RepoFormat::V6),
+        (
+            RepoFormat::V2,
+            RepoFormat::V6(vykar_types::hash::HashAlgorithm::Blake2b),
+        ),
+        (RepoFormat::V3, RepoFormat::CURRENT),
     ] {
         let fx = fixture(from);
         fx.write("a", "alpha");
@@ -381,7 +411,7 @@ fn a_resume_keeps_what_an_old_client_wrote_in_between() {
 }
 
 /// Both branches leave the handle's index at the upgraded state and its
-/// table in the cache dir.
+/// base table in the cache dir.
 #[test]
 fn upgrade_leaves_the_index_and_the_table_at_the_new_state() {
     for resume in [false, true] {
@@ -394,7 +424,7 @@ fn upgrade_leaves_the_index_and_the_table_at_the_new_state() {
         }
         let id = fx.repo_id();
         let dir = crate::cache_paths::repo_cache_dir(&id, Some(&fx.cache())).unwrap();
-        for (_, path) in table::list_tables(&dir) {
+        for (_, path) in table::list_base_tables(&dir) {
             std::fs::remove_file(path).unwrap();
         }
 
@@ -405,15 +435,14 @@ fn upgrade_leaves_the_index_and_the_table_at_the_new_state() {
             matches!(outcome, UpgradeOutcome::Upgraded { resumed: r, .. } if r == resume),
             "{outcome:?}"
         );
-        assert_eq!(repo.format(), RepoFormat::V6);
+        assert_eq!(repo.format(), RepoFormat::CURRENT);
         let head = repo.index_head().unwrap().clone();
         assert_eq!(
-            repo.chunk_index().table().map(|t| t.state()),
-            Some((head.state_hash, head.entries)),
+            *repo.chunk_index().state(),
+            crate::index::table::IndexState::of_head(&head),
             "resumed: {resume}"
         );
-        let generation = dedup_cache::generation_for_state(&head.state_hash);
-        assert_eq!(repo.index_generation(), generation);
+        assert_eq!(repo.index_generation(), head.generation);
         let crypto = vykar_crypto::PlaintextEngine::new(crate::testutil::test_chunk_hasher());
         assert_eq!(
             index_store::fetch_head(&*fx.storage(), &crypto).unwrap(),
@@ -421,7 +450,13 @@ fn upgrade_leaves_the_index_and_the_table_at_the_new_state() {
         );
         drop(repo);
 
-        assert!(ChunkTable::open_file(&table::table_path(&dir, &head.state_hash)).is_some());
+        assert!(
+            ChunkTable::open_file(&table::base_table_path(
+                &dir,
+                &head.base.as_ref().unwrap().name
+            ))
+            .is_some()
+        );
         fx.check_clean();
     }
 }
@@ -523,8 +558,11 @@ fn upgrade_keeps_young_debris() {
 fn upgrade_failing_before_the_head_keeps_the_legacy_index() {
     type Fail = fn(&str, &[u8]) -> bool;
     for (from, to) in [
-        (RepoFormat::V2, RepoFormat::V7),
-        (RepoFormat::V3, RepoFormat::V6),
+        (
+            RepoFormat::V2,
+            RepoFormat::V6(vykar_types::hash::HashAlgorithm::Blake2b),
+        ),
+        (RepoFormat::V3, RepoFormat::CURRENT),
     ] {
         for (name, fail) in [("base", is_base_put as Fail), ("head", is_head_put as Fail)] {
             let name = format!("{from:?}-{name}");
@@ -1164,4 +1202,142 @@ fn upgrade_reads_the_index_with_a_plain_get() {
     assert_eq!(gets.iter().filter(|k| *k == "index").count(), 1, "{gets:?}");
     assert!(!gets.iter().any(|k| k == "index.gen"), "{gets:?}");
     assert_eq!(fx.cold_index("cold-after"), before);
+}
+
+/// R1: packs with more entries than a pack map may hold are skipped and
+/// reported, and the upgrade completes; those packs are described only by
+/// the index.
+#[test]
+fn upgrade_reports_packs_no_map_can_describe() {
+    let fx = fixture(RepoFormat::V3);
+    fx.write("a", "alpha");
+    fx.write("b", "bravo");
+    fx.backup("s1");
+    fx.downgrade();
+    crate::repo::pack_map::MAX_ENTRIES_FOR_TEST.with(|c| c.set(Some(1)));
+    let outcome = commands::upgrade::run(&fx.config, None);
+    crate::repo::pack_map::MAX_ENTRIES_FOR_TEST.with(|c| c.set(None));
+    let UpgradeOutcome::Upgraded {
+        packs_mapped,
+        packs_unmapped,
+        ..
+    } = outcome.unwrap()
+    else {
+        panic!("not upgraded");
+    };
+    assert!(packs_unmapped > 0, "{packs_unmapped}");
+    assert!(packs_mapped + packs_unmapped > 0);
+    assert_eq!(fx.version(), 6);
+    fx.check_clean();
+}
+
+/// R1: a legacy index that describes a pack inconsistently (two chunks
+/// overlapping) stops the upgrade before the switch: the repository keeps
+/// its version and its legacy index.
+#[test]
+fn upgrade_stops_on_a_pack_the_legacy_index_describes_inconsistently() {
+    let fx = fixture(RepoFormat::V3);
+    fx.write("a", "alpha");
+    fx.write("b", "bravo");
+    fx.backup("s1");
+    fx.downgrade();
+    let repo = fx.open_legacy(&fx.cache()).unwrap();
+    let mut index = repo.legacy_index().unwrap();
+    let (first, e) = index
+        .iter()
+        .map(|(id, e)| (*id, *e))
+        .find(|(_, e)| index.iter().filter(|(_, o)| o.pack_id == e.pack_id).count() > 1)
+        .expect("a pack with two chunks");
+    let overlapping = vykar_types::chunk_id::ChunkId::from_bytes([0xEE; 32]);
+    index.add(overlapping, e.stored_size, e.pack_id, e.pack_offset + 1);
+    let _ = first;
+    let blob = super::helpers::legacy_index_blob(&index, 0x24, repo.crypto.as_ref());
+    drop(repo);
+    std::fs::write(fx.repo_dir.join("index"), &blob).unwrap();
+
+    let err = commands::upgrade::run(&fx.config, None)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("inconsistently"), "{err}");
+    assert!(err.contains("still v3"), "{err}");
+    assert_eq!(fx.version(), 3);
+    assert_eq!(std::fs::read(fx.repo_dir.join("index")).unwrap(), blob);
+    assert!(fx.heads().is_empty(), "no head written");
+}
+
+/// UPG-7: after an interrupted attempt and its resume, the index garbage
+/// collection (no grace) keeps every object the latest head names and
+/// deletes objects no kept head names; the attempt's head stays within the
+/// window of recent heads.
+#[test]
+fn garbage_collection_after_a_resumed_upgrade_keeps_the_latest_objects() {
+    let fx = fixture(RepoFormat::V3);
+    fx.write("a", "alpha");
+    fx.backup("s1");
+    fx.downgrade();
+    interrupt_at_the_switch(&fx);
+    commands::upgrade::run(&fx.config, None).unwrap();
+    assert_eq!(fx.heads(), vec![1, 2]);
+    let debris = write_debris(&fx);
+    let repo = fx.open(&fx.cache(), false).unwrap();
+    let latest = repo.index_head().unwrap().clone();
+    let stats = index_store::collect_index_garbage(
+        repo.storage.as_ref(),
+        repo.crypto.as_ref(),
+        &latest,
+        std::time::Duration::ZERO,
+    )
+    .unwrap();
+    assert!(stats.objects_deleted >= 1, "{stats:?}");
+    assert!(!debris.exists(), "unnamed debris is collected");
+    for name in latest.named_objects() {
+        assert!(
+            fx.repo_dir
+                .join(INDEX_OBJECT_DIR)
+                .join(name.to_hex())
+                .exists(),
+            "{name:?}"
+        );
+    }
+    assert_eq!(fx.heads(), vec![1, 2], "within latest - 16");
+    drop(repo);
+    fx.check_clean();
+}
+
+/// TRL-3: packs of an upgraded repository are recorded without a trailer
+/// (`trailer_len` 0; v2/v3 writers wrote none), but these hold one (the
+/// fixture was written by this build): compact counts the trailer as dead,
+/// repacks such a pack once, and leaves the output alone afterwards.
+#[test]
+fn a_trailer_recorded_as_absent_is_repacked_once() {
+    let fx = fixture(RepoFormat::V3);
+    fx.write("a", "alpha");
+    fx.backup("s1");
+    fx.downgrade();
+    commands::upgrade::run(&fx.config, None).unwrap();
+    let repo = fx.open(&fx.cache(), true).unwrap();
+    let packs: Vec<_> = repo.chunk_index().iter().map(|(_, e)| e.pack_id).collect();
+    assert!(
+        packs
+            .iter()
+            .all(|p| repo.chunk_index().pack_trailer_len(p) == Some(0))
+    );
+    drop(repo);
+    let first =
+        commands::compact::run(&fx.config, None, 1.0, None, false, &CancelToken::new()).unwrap();
+    assert!(first.packs_repacked > 0, "{first:?}");
+    let second =
+        commands::compact::run(&fx.config, None, 1.0, None, false, &CancelToken::new()).unwrap();
+    assert_eq!(second.packs_repacked, 0, "{second:?}");
+    let repo = fx.open(&fx.cache(), true).unwrap();
+    for (_, e) in repo.chunk_index().iter() {
+        let recorded = repo.chunk_index().pack_trailer_len(&e.pack_id).unwrap();
+        let bytes = repo.storage.get(&e.pack_id.storage_key()).unwrap().unwrap();
+        assert_eq!(
+            recorded,
+            4 + crate::repo::pack_trailer::parse_footer(&bytes).unwrap()
+        );
+    }
+    drop(repo);
+    fx.check_clean();
 }

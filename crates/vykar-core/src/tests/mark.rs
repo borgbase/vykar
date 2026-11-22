@@ -1414,16 +1414,19 @@ fn repair_rebuild_matches_a_sequential_rebuild() {
             result.repair_errors
         );
 
+        // Refcounts are not persisted: the rebuilt index holds exactly the
+        // referenced chunks, each at refcount 1 when loaded.
         let repo = fx.open();
-        let after: HashMap<ChunkId, u32> = repo
-            .chunk_index()
-            .iter()
-            .map(|(id, e)| (id, e.refcount))
-            .collect();
-        assert_eq!(after, oracle, "encrypted={encrypted}");
+        let after: std::collections::HashSet<ChunkId> =
+            repo.chunk_index().iter().map(|(id, _)| id).collect();
+        assert_eq!(
+            after,
+            oracle.keys().copied().collect(),
+            "encrypted={encrypted}"
+        );
+        assert!(repo.chunk_index().iter().all(|(_, e)| e.refcount == 1));
         let report = fx.report().unwrap();
         assert!(report.unreferenced.is_empty());
-        assert_eq!(report.refcount_mismatches, 0);
     }
 }
 
@@ -1955,6 +1958,8 @@ fn compact_collects_old_heads_and_unnamed_objects() {
             repo.load_chunk_index_under_lock()?;
             let id = repo.chunk_index().iter().next().unwrap().0;
             repo.chunk_index_mut().increment_refcount_by(&id, round + 1);
+            // Refcounts are not written: a fold makes each round a head.
+            repo.request_index_fold();
             repo.save_state()
         })
         .unwrap();

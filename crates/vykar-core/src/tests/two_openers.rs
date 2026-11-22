@@ -1,7 +1,7 @@
 //! Two openers of one repository sharing one cache directory: the rules of
-//! the write-once chunk tables (05 "One chunk table"). Both handles live in
-//! this process, which is what a daemon running a scheduler beside
-//! CLI-like operations does.
+//! the write-once base tables and cached segments (05 "One chunk table").
+//! Both handles live in this process, which is what a daemon running a
+//! scheduler beside CLI-like operations does.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -12,6 +12,7 @@ use vykar_storage::local_backend::LocalBackend;
 use vykar_types::chunk_id::ChunkId;
 
 use crate::compress::Compression;
+use crate::index::head::ObjectName;
 use crate::index::table::{self, ChunkTable};
 use crate::repo::pack::PackType;
 use crate::repo::{ChunkerParams, EncryptionMode, OpenOptions, Repository, WriteSessionOptions};
@@ -25,7 +26,7 @@ struct Env {
 }
 
 impl Env {
-    /// A repository holding `n` chunks (state S0), and an empty cache dir.
+    /// A repository holding `n` chunks in a base (S0), and an empty cache dir.
     fn new(n: u8) -> (Self, Vec<ChunkId>) {
         init_test_environment();
         let tmp = tempfile::tempdir().unwrap();
@@ -43,6 +44,7 @@ impl Env {
             Some(setup_cache),
         )
         .unwrap();
+        repo.request_index_fold();
         let ids = store(&mut repo, 0, n);
         drop(repo);
         let env = Self {
@@ -103,21 +105,27 @@ fn payload(b: u8) -> Vec<u8> {
     format!("two openers chunk {b}").into_bytes()
 }
 
-fn state(repo: &Repository) -> [u8; 32] {
-    repo.index_head().unwrap().state_hash
+/// Store chunks as a fold: a new base.
+fn store_fold(repo: &mut Repository, from: u8, n: u8) -> Vec<ChunkId> {
+    repo.request_index_fold();
+    store(repo, from, n)
 }
 
-fn states_in(dir: &Path) -> Vec<[u8; 32]> {
-    let mut v: Vec<_> = table::list_tables(dir)
-        .into_iter()
-        .map(|(s, _)| s)
-        .collect();
-    v.sort_unstable();
-    v
+fn base(repo: &Repository) -> ObjectName {
+    repo.index_head().unwrap().base.as_ref().unwrap().name
 }
 
-fn sorted(mut v: Vec<[u8; 32]>) -> Vec<[u8; 32]> {
-    v.sort_unstable();
+fn bases_in(dir: &Path) -> Vec<ObjectName> {
+    sorted(
+        table::list_base_tables(dir)
+            .into_iter()
+            .map(|(s, _)| s)
+            .collect(),
+    )
+}
+
+fn sorted(mut v: Vec<ObjectName>) -> Vec<ObjectName> {
+    v.sort_unstable_by_key(|n| n.0);
     v
 }
 
@@ -130,56 +138,64 @@ fn age_file(path: &Path, secs: u64) {
         .unwrap();
 }
 
-/// A and B open at S0 (one table). A writes S1; B still reads S0's chunks
-/// through its mapping, and both tables are in the cache dir. B's load under
-/// the lock finds S1's table and downloads nothing; B writes S2, and A's
-/// next load uses S2's table.
+/// TWO-1. A and B open at S0 (one base file). A writes a segment; B still
+/// reads S0's chunks, and B's load under the lock uses the base file and
+/// A's cached segment, downloading nothing. B writes a maintenance segment,
+/// and A's next load catches up from the cached files too. Every file each
+/// open used was verified.
 #[test]
 fn two_openers_share_one_cache_dir() {
     let (env, ids) = Env::new(8);
     let (mut a, a_gets) = env.open();
     let (mut b, b_gets) = env.open();
     let dir = env.dir(&a);
-    let s0 = state(&a);
-    assert_eq!(states_in(&dir), vec![s0]);
-    assert_eq!(b_gets.load(Ordering::SeqCst), 0, "B found A's table");
+    let s0 = base(&a);
+    assert_eq!(bases_in(&dir), vec![s0]);
+    assert_eq!(b_gets.load(Ordering::SeqCst), 0, "B found A's base table");
 
     store(&mut a, 100, 4);
-    let s1 = state(&a);
-    assert_eq!(states_in(&dir), sorted(vec![s0, s1]));
+    assert_eq!(a.index_head().unwrap().segments.len(), 1);
+    assert_eq!(bases_in(&dir), vec![s0], "a segment rewrites no table");
     for (i, id) in ids.iter().enumerate() {
         assert_eq!(b.read_chunk(id).unwrap(), payload(i as u8));
     }
 
     b.load_chunk_index_under_lock().unwrap();
-    assert_eq!(state(&b), s1);
-    assert_eq!(b_gets.load(Ordering::SeqCst), 0, "B used S1's table");
+    assert_eq!(b.index_head(), a.index_head());
+    assert_eq!(
+        b_gets.load(Ordering::SeqCst),
+        0,
+        "B used the cached segment"
+    );
     let first = ids[0];
-    b.chunk_index_mut().decrement(&first);
+    b.chunk_index_mut().remove(&first);
     b.save_state().unwrap();
-    let s2 = state(&b);
-    assert!(states_in(&dir).contains(&s2));
+    assert_eq!(b.index_head().unwrap().segments.len(), 2);
 
     let before = a_gets.load(Ordering::SeqCst);
     a.load_chunk_index().unwrap();
-    assert_eq!(state(&a), s2);
-    assert_eq!(a_gets.load(Ordering::SeqCst), before, "A used S2's table");
+    assert_eq!(a.index_head(), b.index_head());
+    assert_eq!(
+        a_gets.load(Ordering::SeqCst),
+        before,
+        "A used the cached files"
+    );
     assert_eq!(
         a.chunk_index().table().unwrap().file_path(),
-        Some(table::table_path(&dir, &s2).as_path())
+        Some(table::base_table_path(&dir, &s0).as_path())
     );
     assert!(!a.chunk_index().contains(&first));
 }
 
-/// A table deleted while B maps it keeps serving B; once B drops it, the
-/// next load downloads the index again and publishes the same name.
+/// A base table deleted while B maps it keeps serving B; once B drops it,
+/// the next load downloads the base again and publishes the same name.
 #[cfg(unix)]
 #[test]
 fn a_table_deleted_under_a_reader_is_rebuilt() {
     let (env, ids) = Env::new(6);
     let (mut b, gets) = env.open();
     let dir = env.dir(&b);
-    let path = table::table_path(&dir, &state(&b));
+    let path = table::base_table_path(&dir, &base(&b));
     std::fs::remove_file(&path).unwrap();
     for (i, id) in ids.iter().enumerate() {
         assert_eq!(b.read_chunk(id).unwrap(), payload(i as u8));
@@ -193,30 +209,30 @@ fn a_table_deleted_under_a_reader_is_rebuilt() {
     assert_eq!(b.chunk_index().len(), ids.len());
 }
 
-/// An install deletes old tables, but never one this process maps and never
-/// a young one another process may be about to open.
+/// A fold deletes old base tables, but never one this process maps and
+/// never a young one another process may be about to open.
 #[test]
 fn prune_leaves_tables_of_other_openers() {
     let (env, _) = Env::new(4);
     let (a, _) = env.open();
     let (mut b, _) = env.open();
     let dir = env.dir(&a);
-    let s0 = state(&a);
-    let s0_path = table::table_path(&dir, &s0);
+    let s0 = base(&a);
+    let s0_path = table::base_table_path(&dir, &s0);
     age_file(&s0_path, 7200);
 
-    // B's install of S1: S0 is old, but A maps it.
-    store(&mut b, 50, 2);
-    let s1 = state(&b);
-    assert_eq!(states_in(&dir), sorted(vec![s0, s1]));
+    // B's fold to S1: S0 is old, but A maps it.
+    store_fold(&mut b, 50, 2);
+    let s1 = base(&b);
+    assert_eq!(bases_in(&dir), sorted(vec![s0, s1]));
 
     // A is gone and B moved on: the old, unmapped S0 is deleted with B's
-    // next install; the young S1 stays.
+    // next fold; the young S1 stays.
     drop(a);
-    store(&mut b, 60, 2);
-    let s2 = state(&b);
+    store_fold(&mut b, 60, 2);
+    let s2 = base(&b);
     assert!(!s0_path.exists());
-    assert_eq!(states_in(&dir), sorted(vec![s1, s2]));
+    assert_eq!(bases_in(&dir), sorted(vec![s1, s2]));
 }
 
 /// Two openers syncing the same head into one empty cache dir: both
@@ -239,5 +255,5 @@ fn concurrent_installs_of_one_state_succeed() {
     assert_eq!(entries[0], entries[1]);
     assert_eq!(entries[0].len(), ids.len());
     let (repo, _) = env.open();
-    assert_eq!(states_in(&env.dir(&repo)), vec![state(&repo)]);
+    assert_eq!(bases_in(&env.dir(&repo)), vec![base(&repo)]);
 }

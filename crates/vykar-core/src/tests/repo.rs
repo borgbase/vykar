@@ -243,6 +243,8 @@ fn save_state_writes_only_dirty_components() {
         vykar_types::pack_id::PackId::from_bytes([8; 32]),
         0,
     );
+    repo.chunk_index_mut()
+        .set_pack_trailer(vykar_types::pack_id::PackId::from_bytes([8; 32]), 0);
     repo.save_state().unwrap();
 
     let entries = log.entries();
@@ -813,7 +815,7 @@ fn init_creates_the_current_repository_format() {
     .unwrap();
 
     assert_eq!(repo.config.version, 6);
-    assert_eq!(repo.format(), crate::repo::RepoFormat::V6);
+    assert_eq!(repo.format(), crate::repo::RepoFormat::CURRENT);
     assert_eq!(
         repo.content_hash(),
         vykar_types::hash::HashAlgorithm::Blake3
@@ -842,7 +844,7 @@ fn open_rejects_an_unknown_repository_version() {
 
     let mut tampered_config = repo.config.clone();
     tampered_config.version = 8;
-    let tampered_data = rmp_serde::to_vec(&tampered_config).unwrap();
+    let tampered_data = rmp_serde::to_vec_named(&tampered_config).unwrap();
     repo.storage.put("config", &tampered_data).unwrap();
 
     let result = Repository::open(
@@ -879,7 +881,7 @@ fn open_rejects_oversized_max_pack_size() {
     // Tamper with the stored config: set max_pack_size > 512 MiB.
     let mut tampered_config = repo.config.clone();
     tampered_config.max_pack_size = 513 * 1024 * 1024;
-    let tampered_data = rmp_serde::to_vec(&tampered_config).unwrap();
+    let tampered_data = tampered_config.encode().unwrap();
     repo.storage.put("config", &tampered_data).unwrap();
 
     // Re-open should fail.
@@ -1202,7 +1204,7 @@ fn persist_refuses_an_unloaded_index_over_a_non_empty_head() {
     repo.store_chunk(b"one chunk", Compression::None, PackType::Data)
         .unwrap();
     repo.save_state().unwrap();
-    assert!(repo.index_head().unwrap().entries > 0);
+    assert!(!repo.index_head().unwrap().is_empty());
 
     repo.clear_chunk_index();
     repo.mark_index_dirty();
@@ -1297,10 +1299,10 @@ fn writes_reuse_the_live_table_without_a_cache_dir() {
     )
     .unwrap();
     assert_eq!(repo.chunk_index().len(), 3);
-    assert_eq!(repo.chunk_index().table().unwrap().state(), {
-        let head = repo.index_head().unwrap();
-        (head.state_hash, head.entries)
-    });
+    assert_eq!(
+        *repo.chunk_index().state(),
+        crate::index::table::IndexState::of_head(repo.index_head().unwrap())
+    );
 }
 
 /// Answers the capability probe with a server that serves the segmented

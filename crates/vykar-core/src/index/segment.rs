@@ -34,7 +34,6 @@ use vykar_types::pack_id::PackId;
 
 use super::ChunkIndex;
 use super::dedup_cache::{FullCacheEntry, FullCacheWriter, MmapFullIndexCache, StateHash};
-pub use super::table::diff_live_to_temp;
 
 /// Segment body layout version.
 const SEGMENT_VERSION: u8 = 1;

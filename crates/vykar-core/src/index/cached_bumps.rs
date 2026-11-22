@@ -13,9 +13,9 @@
 //! The counters are only meaningful together with the table they index, so
 //! [`CachedBumps`] holds the table (shared with the session and the backup
 //! workers' prefilter) and resolves positions back to chunk IDs, in table
-//! order, wherever a keyed view is required: the commit's merge with the
-//! head's table (`segment::merge_delta_to_temp`), `reconcile` and
-//! `apply_to`.
+//! order, wherever a keyed view is required: the commit's re-check of reused
+//! chunks, `reconcile` and `apply_to`. Chunks added by the head's segments
+//! (outside the table) are bumped by key.
 
 // `counts` has exactly `table.len()` elements; `bump` range-checks
 // every position before it is stored or journaled, and `count_at` documents
@@ -154,16 +154,14 @@ impl std::fmt::Debug for CachedBumps {
 mod tests {
     //! Positional recording must be indistinguishable from keyed recording:
     //! every test runs the same operations against an `IndexDelta` with
-    //! positional bumps and one without, and compares the commit outputs
-    //! (`merge_delta_to_temp` bytes and diff, `apply_to`, `reconcile`).
+    //! positional bumps and one without, and compares what a commit reads
+    //! (the logical bumps and new entries, `apply_to`, `reconcile`).
 
     use std::path::Path;
 
     use proptest::prelude::*;
 
     use super::*;
-    use crate::index::dedup_cache::full_cache_from_index_to_temp;
-    use crate::index::segment::merge_delta_to_temp;
     use crate::index::{ChunkIndex, ChunkIndexEntry, IndexDelta, LiveIndex};
     use vykar_types::pack_id::PackId;
 
@@ -178,31 +176,40 @@ mod tests {
         index
     }
 
-    fn open_table(index: &ChunkIndex, dir: &Path, name: &str) -> Arc<ChunkTable> {
-        let tmp = full_cache_from_index_to_temp(index, &dir.join(name)).unwrap();
-        Arc::new(ChunkTable::scratch(tmp).unwrap())
+    fn open_table(index: &ChunkIndex, _dir: &Path, _name: &str) -> Arc<ChunkTable> {
+        crate::testutil::base_table_of(index)
     }
 
     fn entries(index: &LiveIndex) -> Vec<(ChunkId, ChunkIndexEntry)> {
         index.iter().collect()
     }
 
-    /// The merge of `delta` over `prev`: segment, resulting state and the
-    /// written table's bytes, or `None` for an error.
+    /// What a commit reads from `delta`: the logical bump of every chunk
+    /// (keyed plus positional) and the new entries.
     #[allow(clippy::type_complexity)]
-    fn merged(
-        prev: &ChunkTable,
+    fn logical(
         delta: &IndexDelta,
-        target: &Path,
-    ) -> Option<(crate::index::segment::Segment, [u8; 32], u64, Vec<u8>)> {
-        let (diff, tmp) = merge_delta_to_temp(prev.cache(), delta, target).ok()?;
-        let bytes = std::fs::read(&tmp).unwrap();
-        Some((
-            diff.segment,
-            diff.state_hash_after,
-            diff.entries_after,
-            bytes,
-        ))
+    ) -> (
+        std::collections::BTreeMap<[u8; 32], u32>,
+        Vec<(ChunkId, u32, u64, u32)>,
+    ) {
+        let mut bumps = std::collections::BTreeMap::new();
+        for (id, n) in &delta.refcount_bumps {
+            if *n > 0 {
+                *bumps.entry(*id.as_bytes()).or_insert(0) += n;
+            }
+        }
+        if let Some(cached) = delta.cached_bumps.as_ref() {
+            for (id, n) in cached.iter_nonzero() {
+                *bumps.entry(*id.as_bytes()).or_insert(0) += n;
+            }
+        }
+        let new = delta
+            .new_entries
+            .iter()
+            .map(|e| (e.chunk_id, e.stored_size, e.pack_offset, e.refcount))
+            .collect();
+        (bumps, new)
     }
 
     /// Apply the same bump to both deltas: positionally where the chunk is
@@ -321,9 +328,9 @@ mod tests {
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(300))]
 
-        /// The commit merge, `apply_to`, and `reconcile` + `apply_to` produce
-        /// identical results for positional and keyed recording over random
-        /// bump / new-entry / checkpoint / rollback sequences.
+        /// The logical bumps, `apply_to`, and `reconcile` + `apply_to`
+        /// produce identical results for positional and keyed recording over
+        /// random bump / new-entry / checkpoint / rollback sequences.
         #[test]
         fn positional_equals_keyed(
             repo_ids in arb_repo(),
@@ -335,10 +342,7 @@ mod tests {
             let table = open_table(&index, dir.path(), "table");
 
             let (positional, keyed) = run_ops(&table, &repo_ids, &ops, true);
-            prop_assert_eq!(
-                merged(&table, &positional, &dir.path().join("m1")),
-                merged(&table, &keyed, &dir.path().join("m2"))
-            );
+            prop_assert_eq!(logical(&positional), logical(&keyed));
 
             let mut a = LiveIndex::from_table(Arc::clone(&table));
             let mut b = LiveIndex::from_table(Arc::clone(&table));
@@ -364,37 +368,6 @@ mod tests {
                 (Err(_), Err(_)) => {}
                 (p, k) => prop_assert!(false, "reconcile diverged: {:?} vs {:?}", p.is_ok(), k.is_ok()),
             }
-        }
-
-        /// When the head's table at commit is not the session's (another
-        /// client committed in between), the merge resolves positions to chunk
-        /// IDs and still matches the keyed merge, stale bumps included.
-        #[test]
-        fn merge_against_a_different_table_matches_keyed(
-            repo_ids in arb_repo(),
-            extra in prop::collection::btree_map(any::<[u8; 32]>(), 1..5u32, 0..5),
-            remove in prop::collection::vec(any::<usize>(), 0..3),
-            ops in prop::collection::vec(arb_op(), 0..80),
-        ) {
-            let dir = tempfile::tempdir().unwrap();
-            let index = index_from(&repo_ids);
-            let table = open_table(&index, dir.path(), "table");
-
-            let mut other_ids = repo_ids.clone();
-            for i in remove {
-                if !other_ids.is_empty() {
-                    let n = other_ids.len();
-                    other_ids.remove(i % n);
-                }
-            }
-            other_ids.extend(extra.into_iter().map(|(b, rc)| (ChunkId::from_bytes(b), rc)));
-            let other = open_table(&index_from(&other_ids), dir.path(), "other");
-
-            let (positional, keyed) = run_ops(&table, &repo_ids, &ops, true);
-            prop_assert_eq!(
-                merged(&other, &positional, &dir.path().join("m1")),
-                merged(&other, &keyed, &dir.path().join("m2"))
-            );
         }
     }
 

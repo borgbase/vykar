@@ -37,11 +37,12 @@ impl Repository {
     }
 
     /// An existing chunk `id` for a new reference: stored earlier in the
-    /// session, else (index unedited) in the session's table, found through
-    /// the filter (unless `skip_filter`) and recorded by table position, else
-    /// (index edited after the session began: repair, tests) in the live
-    /// index by key. Records the bump in the session delta and returns the
-    /// stored size; `None` when not found.
+    /// session, else (index unedited) in the session's view: an addition of
+    /// its segments (bumped by key), or its table, found through the filter
+    /// (unless `skip_filter`) and recorded by table position; else (index
+    /// edited after the session began: repair, tests) in the live index by
+    /// key. Records the bump in the session delta and returns the stored
+    /// size; `None` when not found.
     fn bump_existing(&mut self, id: &ChunkId, skip_filter: bool) -> Option<u32> {
         let edited = self.chunk_index.is_modified();
         let keyed_hit = if edited {
@@ -60,7 +61,12 @@ impl Repository {
             delta.bump_refcount(id);
             return Some(stored_size);
         }
-        let table = ws.table.as_ref()?;
+        let view = &ws.view.as_ref()?.view;
+        if let Some(stored_size) = view.find_added(id) {
+            delta.bump_refcount(id);
+            return Some(stored_size);
+        }
+        let table = view.table();
         if !skip_filter
             && let Some(filter) = table.filter()
             && !xorf::Filter::contains(
@@ -70,9 +76,10 @@ impl Repository {
         {
             return None;
         }
-        let (position, entry) = table.find(id)?;
+        let (position, record) = table.find(id)?;
+        let stored_size = view.table_hit(position, &record)?;
         delta.bump_cached_refcount(id, position);
-        Some(entry.stored_size)
+        Some(stored_size)
     }
 
     /// Increment refcount if this chunk already exists in committed or pending state.
@@ -99,10 +106,10 @@ impl Repository {
     /// No second lookup is needed: `table_position` is where the worker found
     /// the chunk, and the bump is recorded against it (the positional table
     /// re-checks that the entry there is `chunk_id` and otherwise records the
-    /// bump by key). The verdict came from the very table the session
-    /// resolves against (checked by identity), and that table is immutable —
+    /// bump by key). The verdict came from the very view the session
+    /// resolves against (checked by identity), and that view is immutable —
     /// a chunk in it is never also in `session_new` or the recovered set,
-    /// because every path consults the table before storing or promoting a
+    /// because every path consults the view before storing or promoting a
     /// chunk.
     ///
     /// Errors, rather than recording a possibly dangling reference, if the
@@ -114,34 +121,66 @@ impl Repository {
         table_position: u32,
         prefilter: &DedupPrefilter,
     ) -> Result<()> {
-        // A positional hit comes from the session's immutable table. An index
+        debug_assert_eq!(
+            prefilter
+                .view()
+                .table()
+                .find(chunk_id)
+                .map(|(p, r)| (p, prefilter.view().table_hit(p, &r))),
+            Some((table_position, Some(stored_size))),
+            "pre-session hit must resolve to the worker's table entry"
+        );
+        let delta = self.session_delta_for(chunk_id, prefilter)?;
+        delta.bump_cached_refcount(chunk_id, table_position);
+        Ok(())
+    }
+
+    /// A worker found `chunk_id` among the additions of the session's view
+    /// (`PrefilterVerdict::PresentAdded`): record the reference by key.
+    /// The same identity check as [`Self::bump_ref_presession_hit`].
+    pub(crate) fn bump_ref_presession_added(
+        &mut self,
+        chunk_id: &ChunkId,
+        stored_size: u32,
+        prefilter: &DedupPrefilter,
+    ) -> Result<()> {
+        debug_assert_eq!(
+            prefilter.view().find_added(chunk_id),
+            Some(stored_size),
+            "pre-session hit must resolve to the worker's addition"
+        );
+        let delta = self.session_delta_for(chunk_id, prefilter)?;
+        delta.bump_refcount(chunk_id);
+        Ok(())
+    }
+
+    /// The session's delta, once `prefilter` is checked to be over the
+    /// session's view.
+    fn session_delta_for(
+        &mut self,
+        chunk_id: &ChunkId,
+        prefilter: &DedupPrefilter,
+    ) -> Result<&mut crate::index::IndexDelta> {
+        // A pre-session hit comes from the session's immutable view. An index
         // edited during the session could have removed that entry.
         debug_assert!(
             !self.chunk_index.is_modified(),
             "pre-session dedup hit over an index edited during the session"
         );
         let ws = self.ws_mut();
-        let table = ws
-            .table
+        if !ws
+            .view
             .as_ref()
-            .filter(|t| Arc::ptr_eq(t, prefilter.table()))
-            .ok_or_else(|| {
-                VykarError::Other(format!(
-                    "BUG: pre-session dedup hit for chunk {chunk_id} does not match \
-                     the active session's table"
-                ))
-            })?;
-        debug_assert_eq!(
-            table.find(chunk_id).map(|(p, e)| (p, e.stored_size)),
-            Some((table_position, stored_size)),
-            "pre-session hit must resolve to the worker's table entry"
-        );
-        let delta = ws
-            .index_delta
+            .is_some_and(|v| v.view.same_as(prefilter.view()))
+        {
+            return Err(VykarError::Other(format!(
+                "BUG: pre-session dedup hit for chunk {chunk_id} does not match \
+                 the active session's index view"
+            )));
+        }
+        ws.index_delta
             .as_mut()
-            .ok_or_else(|| VykarError::Other("BUG: write session without an index delta".into()))?;
-        delta.bump_cached_refcount(chunk_id, table_position);
-        Ok(())
+            .ok_or_else(|| VykarError::Other("BUG: write session without an index delta".into()))
     }
 
     /// Prefilter said "not in the session's table" (`PrefilterVerdict::Absent`:
@@ -243,13 +282,16 @@ impl Repository {
         Ok(stored_size)
     }
 
-    /// Update index entries for a freshly sealed pack.
+    /// Update index entries for a freshly sealed pack. The trailer length
+    /// follows from the blob count and whether this repository's engine
+    /// encrypts.
     fn apply_sealed_entries(
         &mut self,
         pack_id: vykar_types::pack_id::PackId,
         entries: Vec<pack::PackedChunkEntry>,
     ) {
-        active_mut(&mut self.write_session).apply_sealed_entries(pack_id, entries);
+        let encrypting = self.crypto.is_encrypting();
+        active_mut(&mut self.write_session).apply_sealed_entries(pack_id, entries, encrypting);
     }
 
     /// Seal a pack writer and upload in the background.

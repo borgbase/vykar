@@ -36,7 +36,7 @@ fn extract(mode: &str) -> Fixture {
     fixtures::extract("v2", mode, 2)
 }
 
-/// [`extract`], then `vykar upgrade` to v7: every command but the upgrade
+/// [`extract`], then `vykar upgrade` to v6 (BLAKE2b): every command but the upgrade
 /// refuses v2.
 fn extract_upgraded(mode: &str) -> Fixture {
     let fx = extract(mode);
@@ -50,7 +50,18 @@ fn sorted_entries(
     vykar_types::chunk_id::ChunkId,
     vykar_core::index::ChunkIndexEntry,
 )> {
-    let mut out: Vec<_> = index.iter().map(|(id, e)| (*id, *e)).collect();
+    // Refcounts are not persisted from v6 on (every loaded entry reads 1),
+    // and the upgrade leaves refcount-0 legacy entries out.
+    let mut out: Vec<_> = index
+        .iter()
+        .filter(|(_, e)| e.refcount > 0)
+        .map(|(id, e)| {
+            (
+                *id,
+                vykar_core::index::ChunkIndexEntry { refcount: 1, ..*e },
+            )
+        })
+        .collect();
     out.sort_by_key(|(id, _)| *id.as_bytes());
     out
 }
@@ -143,13 +154,14 @@ fn v2_fixtures_verify_data_is_clean() {
 
 // ── Writing ────────────────────────────────────────────────────────────────
 
-/// `vykar upgrade` takes each v2 fixture to v7 in place (UPG-1; a head at
-/// `index.h/1`, no `index` or `index.gen`): same chunk IDs (the
+/// `vykar upgrade` takes each v2 fixture to v6 with BLAKE2b in place (UPG-1:
+/// a map config naming `blake2b`, a layout-3 head at `index.h/1` naming a
+/// base, a pack map for every pack, no `index` or `index.gen`): same chunk IDs (the
 /// plaintext key follows the chunk hash), the same index, every snapshot
 /// still restores byte-identical, and a new backup dedups against the chunks
 /// the pre-change binary wrote.
 #[test]
-fn v2_fixtures_upgrade_to_v7() {
+fn v2_fixtures_upgrade_to_v6_with_blake2b() {
     use vykar_core::repo::UpgradeOutcome;
     for mode in MODES {
         let fx = extract(mode);
@@ -162,7 +174,9 @@ fn v2_fixtures_upgrade_to_v7() {
                 outcome,
                 UpgradeOutcome::Upgraded {
                     from: 2,
-                    to: 7,
+                    to: 6,
+                    chunk_hash: vykar_types::hash::HashAlgorithm::Blake2b,
+                    packs_unmapped: 0,
                     resumed: false,
                     ..
                 }
@@ -174,7 +188,13 @@ fn v2_fixtures_upgrade_to_v7() {
         assert!(fx.repo_dir().join("index.h/1").is_file(), "{mode}");
 
         let repo = fx.open();
-        assert_eq!(repo.config.version, 7, "{mode}");
+        assert_eq!(repo.config.version, 6, "{mode}");
+        assert_eq!(repo.config.chunk_hash, "blake2b", "{mode}");
+        let head = repo.index_head().unwrap();
+        assert_eq!(head.layout, 3, "{mode}");
+        assert!(head.base.is_some() && head.segments.is_empty(), "{mode}");
+        let maps = commands::pack_maps::run(&config, fx.passphrase(), &CancelToken::new()).unwrap();
+        assert_eq!(maps.packs_mapped, 0, "{mode}: every pack already mapped");
         assert_eq!(
             before,
             sorted_entries(&repo.chunk_index().to_chunk_index()),
@@ -231,7 +251,7 @@ fn v2_fixtures_upgrade_to_v7() {
         assert!(
             matches!(
                 commands::upgrade::run(&config, fx.passphrase()).unwrap(),
-                UpgradeOutcome::AlreadyCurrent { version: 7 }
+                UpgradeOutcome::AlreadyCurrent { version: 6 }
             ),
             "{mode}"
         );
@@ -239,7 +259,7 @@ fn v2_fixtures_upgrade_to_v7() {
 }
 
 /// Packs written into an upgraded v2 repository — by backup and by repack —
-/// must still be named by BLAKE2b: v7 keeps v2's chunk and pack hash.
+/// must still be named by BLAKE2b: the upgraded v6 keeps v2's chunk and pack hash.
 #[test]
 fn v2_fixtures_name_new_packs_by_blake2b() {
     for mode in MODES {

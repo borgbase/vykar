@@ -120,19 +120,21 @@ fn client_repack_writes_a_trailer() {
     assert_trailer_matches_index(&repo, &key, TrailerPackType::Repacked);
 }
 
-/// Fails every 12-byte range read: the trailer footer reads of compact.
-struct FailingFooterReads {
+/// Counts 12-byte range reads (the trailer footer reads compact made
+/// before the index recorded trailer lengths).
+struct CountingFooterReads {
     inner: std::sync::Arc<dyn vykar_storage::StorageBackend>,
+    footer_reads: std::sync::atomic::AtomicUsize,
 }
 
-impl vykar_storage::InnerBackend for FailingFooterReads {
+impl vykar_storage::InnerBackend for CountingFooterReads {
     fn inner_backend(&self) -> &dyn vykar_storage::StorageBackend {
         &*self.inner
     }
 }
 
 vykar_storage::delegate_storage_backend! {
-    for FailingFooterReads;
+    for CountingFooterReads;
     except [get_range];
 
     fn get_range(
@@ -142,63 +144,66 @@ vykar_storage::delegate_storage_backend! {
         length: u64,
     ) -> vykar_types::error::Result<Option<Vec<u8>>> {
         if length == 12 {
-            return Err(vykar_types::error::VykarError::Other("injected".into()));
+            self.footer_reads
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
         self.inner.get_range(key, offset, length)
     }
 }
 
-/// When the footer cannot be read, the trailer counts as dead bytes, as
-/// before trailers: compact repacks the pack and still completes.
+/// TRL-1: the trailer overhead comes from the index's `trailer_len`:
+/// compact of a clean repository repacks nothing at any threshold and reads
+/// no pack footer.
 #[test]
-fn failed_footer_read_counts_the_trailer_as_dead() {
+fn compact_reads_no_pack_footer() {
     let mut repo = test_repo_plaintext();
-    let (id_a, id_b) = store_two_chunks(&mut repo);
-    repo.storage = std::sync::Arc::new(FailingFooterReads {
+    store_two_chunks(&mut repo);
+    let counting = std::sync::Arc::new(CountingFooterReads {
         inner: std::sync::Arc::clone(&repo.storage),
+        footer_reads: std::sync::atomic::AtomicUsize::new(0),
     });
-    let stats =
-        compact_repo_without_mark(&mut repo, 10.0, None, false, 4, &CancelToken::new()).unwrap();
-    assert_eq!(stats.packs_repacked, 1, "{stats:?}");
-    assert!(stats.space_freed > 0, "{stats:?}");
+    repo.storage = counting.clone();
+    for threshold in [0.0, 10.0] {
+        let stats =
+            compact_repo_without_mark(&mut repo, threshold, None, false, 4, &CancelToken::new())
+                .unwrap();
+        assert_eq!(stats.packs_repacked, 0, "{stats:?}");
+        assert_eq!(stats.space_freed, 0, "{stats:?}");
+    }
     assert_eq!(
-        repo.read_chunk(&id_a).unwrap(),
-        b"chunk-a-data-for-compact-test"
-    );
-    assert_eq!(
-        repo.read_chunk(&id_b).unwrap(),
-        b"chunk-b-data-for-compact-test"
+        counting
+            .footer_reads
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0
     );
 }
 
-/// A footer that claims a frame larger than the pack's unindexed bytes is
-/// not trusted: those bytes stay dead and the pack is repacked.
+/// TRL-2 (client repack): the repack output's recorded trailer length is
+/// its real frame.
 #[test]
-fn oversized_footer_is_not_trusted() {
+fn client_repack_records_the_output_trailer_length() {
     let mut repo = test_repo_plaintext();
     let (id_a, id_b) = store_two_chunks(&mut repo);
-    let key = repo.chunk_index().get(&id_a).unwrap().pack_id.storage_key();
-    let mut bytes = repo.storage.get(&key).unwrap().unwrap();
-    let n = bytes.len();
-    let real = parse_footer(&bytes).expect("pack has a trailer");
-    // Larger than the real frame, but still a frame that starts after the
-    // header.
-    let forged = real + 20;
-    assert!(n as u64 >= 9 + 4 + u64::from(forged));
-    bytes[n - 12..n - 8].copy_from_slice(&forged.to_le_bytes());
-    repo.storage.put(&key, &bytes).unwrap();
-
-    let stats =
-        compact_repo_without_mark(&mut repo, 10.0, None, false, 4, &CancelToken::new()).unwrap();
-    assert_eq!(stats.packs_repacked, 1, "{stats:?}");
+    repo.chunk_index_mut().decrement(&id_a);
+    repo.save_state().unwrap();
+    compact_repo_without_mark(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
+    let pack = repo.chunk_index().get(&id_b).unwrap().pack_id;
+    let bytes = repo.storage.get(&pack.storage_key()).unwrap().unwrap();
+    let blob_len = parse_footer(&bytes).unwrap();
     assert_eq!(
-        repo.read_chunk(&id_a).unwrap(),
-        b"chunk-a-data-for-compact-test"
+        repo.chunk_index().pack_trailer_len(&pack),
+        Some(4 + blob_len)
     );
-    assert_eq!(
-        repo.read_chunk(&id_b).unwrap(),
-        b"chunk-b-data-for-compact-test"
-    );
+    // And after a cold load.
+    let seg = repo.index_head().unwrap().segments.last().unwrap().clone();
+    let stored = repo
+        .storage
+        .get(&crate::repo::index_store::object_key(&seg.name))
+        .unwrap()
+        .unwrap();
+    let seg =
+        crate::repo::index_store::decode_segment_v2(&seg, &stored, repo.crypto.as_ref()).unwrap();
+    assert!(seg.pack_trailers.contains(&(pack, 4 + blob_len)), "{seg:?}");
 }
 
 /// A repack's output with the ID of a pack the listing showed as an orphan
@@ -402,7 +407,7 @@ fn repo_on_recording_backend(
         None,
         None,
         None,
-        crate::repo::RepoFormat::V6,
+        crate::repo::RepoFormat::CURRENT,
     )
     .unwrap();
     repo.begin_write_session(&crate::repo::WriteSessionOptions::default())
@@ -519,7 +524,7 @@ mod server_side {
     use crate::commands::compact::compact_repo_without_mark;
     use crate::compress::Compression;
     use crate::index::ChunkIndexEntry;
-    use crate::index::segment::Segment;
+    use crate::index::segment_v2::SegmentBody;
     use crate::repo::ChunkerParams;
     use crate::repo::index_store;
     use crate::repo::index_write::FoldPolicy;
@@ -834,7 +839,7 @@ mod server_side {
 
     #[test]
     fn sources_deleted_by_client_after_index_saved() {
-        let (mut repo, log) = server_repo(Mode::CopyToNewPack, false, RepoFormat::V6);
+        let (mut repo, log) = server_repo(Mode::CopyToNewPack, false, RepoFormat::CURRENT);
         let (id_b, partial, empty) = setup_dead_packs(&mut repo);
         log.events.lock().unwrap().clear();
 
@@ -878,7 +883,7 @@ mod server_side {
     /// no plan is sent, and the dead space is still freed.
     #[test]
     fn server_repack_not_offered_repacks_on_the_client() {
-        let (mut repo, log) = server_repo(Mode::NotOffered, false, RepoFormat::V6);
+        let (mut repo, log) = server_repo(Mode::NotOffered, false, RepoFormat::CURRENT);
         let (id_b, partial, empty) = setup_dead_packs(&mut repo);
         log.events.lock().unwrap().clear();
 
@@ -901,7 +906,7 @@ mod server_side {
 
     #[test]
     fn source_returned_as_new_pack_is_kept() {
-        let (mut repo, log) = server_repo(Mode::ReturnSource, false, RepoFormat::V6);
+        let (mut repo, log) = server_repo(Mode::ReturnSource, false, RepoFormat::CURRENT);
         let (id_a, partial, empty) = setup_dead_packs_live_first(&mut repo);
         log.events.lock().unwrap().clear();
 
@@ -920,7 +925,7 @@ mod server_side {
 
     #[test]
     fn repack_error_leaves_sources_and_index() {
-        let (mut repo, log) = server_repo(Mode::FailRepack, false, RepoFormat::V6);
+        let (mut repo, log) = server_repo(Mode::FailRepack, false, RepoFormat::CURRENT);
         let (id_b, partial, empty) = setup_dead_packs(&mut repo);
         log.events.lock().unwrap().clear();
 
@@ -943,7 +948,7 @@ mod server_side {
     /// `(packs_repacked, packs_deleted_empty, space_freed)` of a successful
     /// compact over [`setup_dead_packs`].
     fn delete_stats(mode: Mode, batch: bool) -> (u64, u64, u64) {
-        let (mut repo, _log) = server_repo(mode, batch, RepoFormat::V6);
+        let (mut repo, _log) = server_repo(mode, batch, RepoFormat::CURRENT);
         setup_dead_packs(&mut repo);
         let stats =
             compact_repo_without_mark(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
@@ -963,7 +968,7 @@ mod server_side {
 
     #[test]
     fn sources_deleted_in_one_batch_after_index_saved() {
-        let (mut repo, log) = server_repo(Mode::CopyToNewPack, true, RepoFormat::V6);
+        let (mut repo, log) = server_repo(Mode::CopyToNewPack, true, RepoFormat::CURRENT);
         let (id_b, partial, empty) = setup_dead_packs(&mut repo);
         log.events.lock().unwrap().clear();
 
@@ -1004,7 +1009,7 @@ mod server_side {
 
     #[test]
     fn batch_never_names_a_source_returned_as_new_pack() {
-        let (mut repo, log) = server_repo(Mode::ReturnSource, true, RepoFormat::V6);
+        let (mut repo, log) = server_repo(Mode::ReturnSource, true, RepoFormat::CURRENT);
         let (_id_a, partial, empty) = setup_dead_packs_live_first(&mut repo);
         log.events.lock().unwrap().clear();
 
@@ -1020,7 +1025,7 @@ mod server_side {
 
     #[test]
     fn failed_batch_delete_falls_back_to_per_pack_deletes() {
-        let (mut repo, log) = server_repo(Mode::FailBatchDelete, true, RepoFormat::V6);
+        let (mut repo, log) = server_repo(Mode::FailBatchDelete, true, RepoFormat::CURRENT);
         let (_id_b, partial, empty) = setup_dead_packs(&mut repo);
         log.events.lock().unwrap().clear();
 
@@ -1054,7 +1059,7 @@ mod server_side {
     /// writes them to, and the new pack's trailer matches the index.
     #[test]
     fn server_repack_sends_trailers() {
-        let (mut repo, log) = server_repo(Mode::CopyToNewPack, true, RepoFormat::V6);
+        let (mut repo, log) = server_repo(Mode::CopyToNewPack, true, RepoFormat::CURRENT);
         let (id_b, _partial, _empty) = setup_dead_packs(&mut repo);
         compact_repo_without_mark(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
 
@@ -1096,7 +1101,7 @@ mod server_side {
     /// trailers: the client repacks, with the client path's results.
     #[test]
     fn server_without_repack_trailer_repacks_on_the_client() {
-        let (mut repo, log) = server_repo(Mode::NoTrailer, false, RepoFormat::V6);
+        let (mut repo, log) = server_repo(Mode::NoTrailer, false, RepoFormat::CURRENT);
         let (id_b, partial, empty) = setup_dead_packs(&mut repo);
         log.events.lock().unwrap().clear();
 
@@ -1127,7 +1132,7 @@ mod server_side {
     /// a failed one is.)
     #[test]
     fn wrong_server_offsets_are_refused() {
-        let (mut repo, log) = server_repo(Mode::WrongOffsets, true, RepoFormat::V6);
+        let (mut repo, log) = server_repo(Mode::WrongOffsets, true, RepoFormat::CURRENT);
         let (id_b, partial, _empty) = setup_dead_packs(&mut repo);
         log.events.lock().unwrap().clear();
 
@@ -1185,14 +1190,14 @@ mod server_side {
     }
 
     /// The last segment the head names, decoded.
-    fn last_segment(repo: &Repository) -> Segment {
+    fn last_segment(repo: &Repository) -> SegmentBody {
         let seg = repo.index_head().unwrap().segments.last().unwrap().clone();
         let bytes = repo
             .storage
             .get(&index_store::object_key(&seg.name))
             .unwrap()
             .unwrap();
-        index_store::decode_segment(&seg, &bytes, repo.crypto.as_ref()).unwrap()
+        index_store::decode_segment_v2(&seg, &bytes, repo.crypto.as_ref()).unwrap()
     }
 
     fn is_pack_delete(event: &str) -> bool {
@@ -1208,7 +1213,7 @@ mod server_side {
     fn server_repack_persists_the_index_before_deleting_sources() {
         for batch in [false, true] {
             let ctx = format!("batch {batch}");
-            let (mut repo, log) = server_repo(Mode::CopyToNewPack, batch, RepoFormat::V6);
+            let (mut repo, log) = server_repo(Mode::CopyToNewPack, batch, RepoFormat::CURRENT);
             let (id_b, partial, empty) = setup_dead_packs(&mut repo);
             log.events.lock().unwrap().clear();
 
@@ -1239,15 +1244,21 @@ mod server_side {
             assert_cold_open_matches(&repo, &id_b, &ctx);
             let seg = last_segment(&repo);
             assert_eq!(seg.relocations.len(), 1, "{ctx}: {seg:?}");
-            assert!(seg.deltas.is_empty(), "{ctx}: {seg:?}");
-            assert!(seg.new_entries.is_empty(), "{ctx}: {seg:?}");
+            assert!(seg.removals.is_empty(), "{ctx}: {seg:?}");
+            assert!(seg.additions.is_empty(), "{ctx}: {seg:?}");
+            // TRL-2 (server repack): the output pack's recorded trailer
+            // length is its real frame.
+            let output = seg.relocations[0].1.pack_id;
+            let bytes = repo.storage.get(&output.storage_key()).unwrap().unwrap();
+            let blob_len = crate::repo::pack_trailer::parse_footer(&bytes).unwrap();
+            assert_eq!(seg.pack_trailers, vec![(output, 4 + blob_len)], "{ctx}");
         }
     }
 
     #[test]
     fn server_repack_delete_failure_keeps_the_index_on_new_packs_segmented() {
         for batch in [false, true] {
-            let (mut repo, log) = server_repo(Mode::FailPackDeletes, batch, RepoFormat::V6);
+            let (mut repo, log) = server_repo(Mode::FailPackDeletes, batch, RepoFormat::CURRENT);
             let (id_b, partial, _empty) = setup_dead_packs(&mut repo);
             log.events.lock().unwrap().clear();
 
@@ -1286,7 +1297,7 @@ mod server_side {
 
     #[test]
     fn server_repack_then_fold_keeps_the_index_readable_segmented() {
-        let (mut repo, log) = server_repo(Mode::CopyToNewPack, true, RepoFormat::V6);
+        let (mut repo, log) = server_repo(Mode::CopyToNewPack, true, RepoFormat::CURRENT);
         let (id_b, _partial, _empty) = setup_dead_packs(&mut repo);
         let mut policy = FoldPolicy::default();
         policy.soft.segments = 1;

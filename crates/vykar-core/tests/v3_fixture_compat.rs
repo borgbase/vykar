@@ -56,7 +56,18 @@ fn sorted_entries(
     vykar_types::chunk_id::ChunkId,
     vykar_core::index::ChunkIndexEntry,
 )> {
-    let mut out: Vec<_> = index.iter().map(|(id, e)| (*id, *e)).collect();
+    // Refcounts are not persisted from v6 on (every loaded entry reads 1),
+    // and the upgrade leaves refcount-0 legacy entries out.
+    let mut out: Vec<_> = index
+        .iter()
+        .filter(|(_, e)| e.refcount > 0)
+        .map(|(id, e)| {
+            (
+                *id,
+                vykar_core::index::ChunkIndexEntry { refcount: 1, ..*e },
+            )
+        })
+        .collect();
     out.sort_by_key(|(id, _)| *id.as_bytes());
     out
 }
@@ -238,6 +249,8 @@ fn v3_fixtures_upgrade_to_v6() {
                 UpgradeOutcome::Upgraded {
                     from: 3,
                     to: 6,
+                    chunk_hash: vykar_types::hash::HashAlgorithm::Blake3,
+                    packs_unmapped: 0,
                     resumed: false,
                     ..
                 }
@@ -250,6 +263,12 @@ fn v3_fixtures_upgrade_to_v6() {
 
         let repo = fx.open();
         assert_eq!(repo.config.version, 6, "{mode}");
+        assert_eq!(repo.config.chunk_hash, "blake3", "{mode}");
+        let head = repo.index_head().unwrap();
+        assert_eq!(head.layout, 3, "{mode}");
+        assert!(head.base.is_some() && head.segments.is_empty(), "{mode}");
+        let maps = commands::pack_maps::run(&config, fx.passphrase(), &CancelToken::new()).unwrap();
+        assert_eq!(maps.packs_mapped, 0, "{mode}: every pack already mapped");
         assert_eq!(
             before,
             sorted_entries(&repo.chunk_index().to_chunk_index()),

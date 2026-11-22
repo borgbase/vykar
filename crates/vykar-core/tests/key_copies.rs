@@ -151,11 +151,12 @@ impl Fixture {
 
     fn repo_config(&self) -> RepoConfig {
         let data = std::fs::read(self.repo_dir.join("config")).unwrap();
-        rmp_serde::from_slice(&data).unwrap()
+        RepoConfig::decode(&data).unwrap().into_repo_config()
     }
 
     fn format(&self) -> RepoFormat {
-        RepoFormat::from_version(self.repo_config().version).unwrap()
+        let data = std::fs::read(self.repo_dir.join("config")).unwrap();
+        RepoConfig::decode(&data).unwrap().validate().unwrap()
     }
 
     fn storage(&self) -> LocalBackend {

@@ -13,14 +13,22 @@ pub(crate) struct PreparedChunk {
     pub(crate) packed: Vec<u8>,
 }
 
-/// A chunk the worker confirmed in the session's table.
+/// Where the worker found an existing chunk in the session's view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExistingAt {
+    /// At this position of the view's table, so the consumer can record the
+    /// refcount bump without a second lookup.
+    Table(u32),
+    /// Among the additions of the view's segments: bumped by key.
+    Added,
+}
+
+/// A chunk the worker confirmed in the session's view.
 pub(crate) struct ExistingChunk {
     pub(crate) chunk_id: ChunkId,
     pub(crate) uncompressed_size: u32,
     pub(crate) stored_size: u32,
-    /// Position of the chunk in the session's table, so the consumer can
-    /// record the refcount bump without a second lookup.
-    pub(crate) cache_position: u32,
+    pub(crate) at: ExistingAt,
 }
 
 /// Result of worker-side classify.
@@ -57,7 +65,15 @@ pub(super) fn classify_chunk(
                 chunk_id,
                 uncompressed_size: data.len() as u32,
                 stored_size,
-                cache_position: position,
+                at: ExistingAt::Table(position),
+            }));
+        }
+        Some(PrefilterVerdict::PresentAdded { stored_size }) => {
+            return Ok(WorkerChunk::Existing(ExistingChunk {
+                chunk_id,
+                uncompressed_size: data.len() as u32,
+                stored_size,
+                at: ExistingAt::Added,
             }));
         }
     }
@@ -104,22 +120,17 @@ mod tests {
     use crate::repo::format::unpack_object_expect_with_context;
     use vykar_crypto::PlaintextEngine;
 
-    use crate::index::dedup_cache::{chunk_id_to_u64, full_cache_from_index_to_temp};
-    use crate::index::{ChunkIndex, ChunkTable};
-    use std::sync::Arc;
+    use crate::index::ChunkIndex;
+    use crate::index::dedup_cache::chunk_id_to_u64;
     use vykar_types::pack_id::PackId;
 
     /// Prefilter over a table holding `stored` chunks.
-    fn table_prefilter(stored: &[(ChunkId, u32)]) -> (tempfile::TempDir, DedupPrefilter) {
-        let dir = tempfile::tempdir().unwrap();
+    fn table_prefilter(stored: &[(ChunkId, u32)]) -> ((), DedupPrefilter) {
         let mut index = ChunkIndex::new();
         for &(id, stored_size) in stored {
             index.add(id, stored_size, PackId::from_bytes([0x01; 32]), 0);
         }
-        let tmp = full_cache_from_index_to_temp(&index, &dir.path().join("chunk_table")).unwrap();
-        let table = Arc::new(ChunkTable::scratch(tmp).unwrap());
-        let prefilter = DedupPrefilter::new(&table).unwrap();
-        (dir, prefilter)
+        ((), crate::testutil::prefilter_of(&index))
     }
 
     #[test]

@@ -50,7 +50,7 @@ Unit tests in `vykar-core` cover each subsystem in isolation. Fast feedback (sec
 
 ## Fuzz Tests
 
-20 coverage-guided fuzz targets via `cargo-fuzz` (libFuzzer). Each target feeds adversarial byte sequences into a parser, deserializer, or decrypt path, mutating from committed corpus seeds toward crashes, hangs, and OOM. Complements proptest by running for hours/days and optimizing for code-path coverage rather than round-trip invariants.
+25 coverage-guided fuzz targets via `cargo-fuzz` (libFuzzer). Each target feeds adversarial byte sequences into a parser, deserializer, or decrypt path, mutating from committed corpus seeds toward crashes, hangs, and OOM. Complements proptest by running for hours/days and optimizing for code-path coverage rather than round-trip invariants.
 
 | Target | Function under test | Risk surface |
 |--------|-------------------|--------------|
@@ -65,11 +65,13 @@ Unit tests in `vykar-core` cover each subsystem in isolation. Fast feedback (sec
 | `fuzz_unpack_object` | `unpack_object` + `unpack_object_expect_with_context` (+ in-place) | AEAD envelope parse, nonce extraction, context/AAD wiring for chunk, index, head, base and segment objects, tag authentication |
 | `fuzz_index_segment` | `Segment::decode` | Position gaps, counts, re-encode identity |
 | `fuzz_index_head` | `IndexHead::decode` | Head framing, round-trip |
+| `fuzz_index_base_v2` | `validate_base_body`, `BaseWriter` | Fixed-width base body: counts against the length, sort order, pack slots, unreferenced packs; re-encode identity |
+| `fuzz_index_segment_v2` | `SegmentBody::decode` | Keyed segment: header counts before allocation, sections, kinds, pack table; re-encode identity |
 | `fuzz_index_base` | `index::base::decode_base_to_temp` | Sort order, pack table, varints, re-encode identity |
 | `fuzz_index_apply` | `apply_to_temp` over a decoded base and 1-3 segments | Streaming apply disagreeing with the reference model, wrong declared results |
-| `fuzz_index_object` | Store-level segment and base decode of `index.d/` objects | Name check, zstd streaming, error classification as damage |
+| `fuzz_index_object` | Store-level segment and base decode (body version 2) of `index.d/` objects | Name check, zstd streaming, decode bounds, error classification as damage |
 | `fuzz_full_index_cache` | `MmapFullIndexCache::open_verified`, `encode_base`, apply | Local cache framing, unsorted entries behind a valid trailer |
-| `fuzz_repo_config` | `RepoConfig` decode, `RepoConfig::validate`, pack-size targets, backup's chunker gate and both chunkers | Unauthenticated `config`: unknown versions, pack-size limits, chunker parameters reaching FastCDC, resumable chunker disagreeing with fastcdc |
+| `fuzz_repo_config` | `RepoConfig::decode` (map and positional), `DecodedConfig::validate`, re-encode of a v6 map, pack-size targets, backup's chunker gate and both chunkers | Unauthenticated `config`: unknown versions, pack-size limits, chunker parameters reaching FastCDC, resumable chunker disagreeing with fastcdc |
 | `fuzz_key_blob` | `inspect_key_blob` | Unauthenticated KDF parameters out of bounds (the KDF never runs) |
 | `fuzz_restore_paths` | `sanitize_item_into`, symlink target audit over an item stream | Path traversal on restore, raw (non-UTF-8) names, against an independent model |
 | `fuzz_pending_journal` | `decode_pending_journal`, recovery seeding | `sessions/<id>.index` from other clients, versioned and legacy shapes |

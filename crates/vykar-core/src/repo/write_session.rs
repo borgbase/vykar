@@ -4,8 +4,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::index::hasher::ChunkIdHashMap;
+use crate::index::table::{IndexState, IndexView};
 use crate::index::{
-    ChunkTable, IndexDelta, IndexDeltaCheckpoint, LiveIndex, PendingChunkEntry, RecoveredChunkEntry,
+    IndexDelta, IndexDeltaCheckpoint, LiveIndex, PendingChunkEntry, RecoveredChunkEntry,
 };
 use vykar_crypto::CryptoEngine;
 use vykar_storage::StorageBackend;
@@ -106,10 +107,13 @@ pub(crate) struct WriteSessionState {
     /// (`StorageBackend::begin_staged_put`; local repositories). A staged
     /// pack holds no heap, so it counts 0 against the upload byte cap.
     pub(crate) stream_data_packs: bool,
-    /// The table lookups and positional bumps resolve against: the
-    /// repository's table when the session began (`None`: not loaded, reads
-    /// as empty). Immutable for the session.
-    pub(crate) table: Option<Arc<ChunkTable>>,
+    /// What lookups and positional bumps resolve against: the repository's
+    /// index when the session began, unless it was edited or not loaded
+    /// (then every lookup goes through the live index by key). Immutable for
+    /// the session.
+    pub(crate) view: Option<SessionView>,
+    /// `trailer_len` of every pack this session sealed or recovered.
+    pub(crate) pack_trailers: StdHashMap<PackId, u32>,
     /// Chunks sealed or promoted in this session -> stored size.
     pub(crate) session_new: ChunkIdHashMap<u32>,
     /// Every index mutation of the session; `Some` from
@@ -138,6 +142,16 @@ pub(crate) struct WriteSessionState {
     pub(crate) metrics: WriteMetrics,
 }
 
+/// The index state a write session dedups against, captured at its begin
+/// (R3 of 05 step 9): the view, the objects it was built from and the
+/// head's `sweep.gen` then. The commit compares them with the latest head
+/// to decide whether reused chunks must be checked again.
+pub(crate) struct SessionView {
+    pub(crate) view: IndexView,
+    pub(crate) state: IndexState,
+    pub(crate) sweep_gen: u64,
+}
+
 /// Borrow the active write session from the `Repository::write_session` field.
 #[track_caller]
 pub(super) fn active(ws: &Option<WriteSessionState>) -> &WriteSessionState {
@@ -164,7 +178,8 @@ impl WriteSessionState {
             tree_pack_writer: PackWriter::new(PackType::Tree, tree_target, hash_algo),
             uploads: UploadQueue::new(max_in_flight_uploads),
             stream_data_packs: false,
-            table: None,
+            view: None,
+            pack_trailers: StdHashMap::new(),
             session_new: ChunkIdHashMap::default(),
             index_delta: None,
             recovered_chunks: StdHashMap::new(),
@@ -324,8 +339,21 @@ impl WriteSessionState {
     // --- Sealed entry dispatch ---
 
     /// Record the entries of a freshly sealed pack: in `session_new`, the
-    /// session's delta and the rollback tracker.
-    pub(crate) fn apply_sealed_entries(&mut self, pack_id: PackId, entries: Vec<PackedChunkEntry>) {
+    /// session's delta and the rollback tracker, and its trailer length
+    /// (`encrypting`: whether the repository's engine encrypts, which fixes
+    /// the trailer's size). `entries` holds every blob of the pack, the ones
+    /// a later rollback drops from the delta included: what the trailer
+    /// lists.
+    pub(crate) fn apply_sealed_entries(
+        &mut self,
+        pack_id: PackId,
+        entries: Vec<PackedChunkEntry>,
+        encrypting: bool,
+    ) {
+        self.pack_trailers.insert(
+            pack_id,
+            crate::repo::pack_trailer::trailer_frame_len(entries.len(), encrypting),
+        );
         for (chunk_id, stored_size, offset, refcount) in entries {
             self.session_new.insert(chunk_id, stored_size);
             if let Some(ref mut delta) = self.index_delta {
@@ -359,6 +387,7 @@ impl WriteSessionState {
                 recovered_chunks: &mut self.recovered_chunks,
                 recovered_index_keys: &mut self.recovered_index_keys,
                 journal: &mut self.journal.entries,
+                pack_trailers: &mut self.pack_trailers,
             },
         )
     }

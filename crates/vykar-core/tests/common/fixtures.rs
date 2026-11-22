@@ -203,11 +203,13 @@ fn cold_config(fx: &Fixture, name: &str) -> VykarConfig {
     config
 }
 
-/// The fixture's packs were written before pack trailers. After `vykar
-/// upgrade` and `commands::pack_maps::run`, losing the whole index and the
-/// cache loses nothing: `check --repair` on a cold machine takes every pack
-/// from a pack map and the latest snapshot restores byte-identical. Without
-/// the maps, every pack is uncovered and the plan removes every snapshot.
+/// The fixture's packs were written before pack trailers. `vykar upgrade`
+/// writes a pack map for every one of them (`commands::pack_maps::run` then
+/// finds nothing to map), so losing the whole index and the cache loses
+/// nothing (UPG-6): `check --repair` on a cold machine takes every pack
+/// from a pack map and the latest snapshot restores byte-identical. With
+/// the maps deleted too, every pack is uncovered and the plan removes every
+/// snapshot.
 pub fn assert_index_loss_is_recovered_from_pack_maps(prefix: &str, mode: &str, version: u64) {
     use vykar_core::commands;
     use vykar_core::commands::check::{IndexRecovery, RepairAction, RepairMode};
@@ -231,7 +233,11 @@ pub fn assert_index_loss_is_recovered_from_pack_maps(prefix: &str, mode: &str, v
     let packs = pack_count(&fx);
     let stats =
         commands::pack_maps::run(&fx.config(), fx.passphrase(), &CancelToken::new()).unwrap();
-    assert_eq!(stats.packs_mapped, packs, "{label}: {stats:?}");
+    assert_eq!(
+        (stats.packs_mapped, stats.packs_already_mapped),
+        (0, packs),
+        "{label}: {stats:?}"
+    );
     lose_index(&fx);
     let cold = cold_config(&fx, "cold");
     let result = repair(&cold, &fx, RepairMode::Apply);
@@ -272,6 +278,7 @@ pub fn assert_index_loss_is_recovered_from_pack_maps(prefix: &str, mode: &str, v
     let fx = extract(prefix, mode, version);
     commands::upgrade::run(&fx.config(), fx.passphrase()).unwrap();
     lose_index(&fx);
+    std::fs::remove_dir_all(fx.repo_dir().join("packmaps")).unwrap();
     let cold = cold_config(&fx, "cold");
     let plan = repair(&cold, &fx, RepairMode::PlanOnly).plan;
     let IndexRecovery::RebuiltFromPacks { counts, .. } = plan.index_recovery else {

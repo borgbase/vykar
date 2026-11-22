@@ -5,8 +5,8 @@ use crate::config::VykarConfig;
 use crate::repo::{OpenOptions, UpgradeOutcome};
 use vykar_types::error::Result;
 
-/// Upgrade the repository's index to the segmented layout (v2 → v7,
-/// v3 → v6) under the maintenance lock, or complete an interrupted upgrade.
+/// Upgrade a v2/v3 repository to format v6 (keeping its hash) under the
+/// maintenance lock, or complete an interrupted upgrade.
 /// The only command that opens a v2/v3 repository; it opens it without its
 /// index, and the upgrade reads the legacy index itself.
 pub fn run(config: &VykarConfig, passphrase: Option<&str>) -> Result<UpgradeOutcome> {

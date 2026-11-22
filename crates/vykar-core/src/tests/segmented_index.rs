@@ -1,9 +1,7 @@
-//! Opening and reading repositories in the segmented index formats (v6/v7).
+//! Opening and reading repositories in the segmented index formats (v6).
 
 use std::sync::{Arc, Mutex};
 
-use crate::index::dedup_cache::generation_for_state;
-use crate::index::head::empty_state_hash;
 use crate::repo::ChunkerParams;
 use crate::repo::format::ObjectType;
 use crate::repo::identity::{self, KeyProof};
@@ -112,18 +110,15 @@ fn index_d_gets(ops: &[String]) -> usize {
 
 #[test]
 fn init_writes_an_empty_head_and_no_sidecar() {
-    let env = init(RepoFormat::V6, EncryptionMode::None);
+    let env = init(RepoFormat::CURRENT, EncryptionMode::None);
     let index = env.inner.get("index.h/1").unwrap().unwrap();
     assert_eq!(index[0], ObjectType::IndexHead as u8);
     assert!(env.inner.get("index").unwrap().is_none());
     assert!(env.inner.get("index.gen").unwrap().is_none());
-    assert_eq!(
-        env.repo.index_generation(),
-        generation_for_state(&empty_state_hash())
-    );
+    assert_eq!(env.repo.index_generation(), 1);
 
     let (repo, _) = env.open_logged(OpenOptions::new().with_index());
-    assert_eq!(repo.format(), RepoFormat::V6);
+    assert_eq!(repo.format(), RepoFormat::CURRENT);
     assert!(repo.chunk_index().is_empty());
     assert_eq!(repo.index_generation(), env.repo.index_generation());
 }
@@ -132,7 +127,7 @@ fn init_writes_an_empty_head_and_no_sidecar() {
 /// with or without the index; `index` and `index.gen` are never read.
 #[test]
 fn open_lists_snapshots_before_the_single_head_get() {
-    let env = init(RepoFormat::V6, EncryptionMode::None);
+    let env = init(RepoFormat::CURRENT, EncryptionMode::None);
     let mut w = env.writer();
     w.commit(&index_with(0..20, 0));
     for opts in [OpenOptions::new(), OpenOptions::new().with_index()] {
@@ -154,16 +149,13 @@ fn open_lists_snapshots_before_the_single_head_get() {
             !ops.iter().any(|o| o == "get index.gen" || o == "get index"),
             "{ops:?}"
         );
-        assert_eq!(
-            repo.index_generation(),
-            generation_for_state(&w.head.state_hash)
-        );
+        assert_eq!(repo.index_generation(), w.head.generation);
     }
 }
 
 #[test]
 fn snapshot_reader_loads_the_head_captured_at_open() {
-    let env = init(RepoFormat::V6, EncryptionMode::None);
+    let env = init(RepoFormat::CURRENT, EncryptionMode::None);
     let mut writer = env.writer();
     let opened_index = index_with(0..20, 0);
     writer.commit(&opened_index);
@@ -189,7 +181,10 @@ fn snapshot_reader_loads_the_head_captured_at_open() {
 /// and catches up the local full cache on later opens.
 #[test]
 fn open_with_index_loads_and_catches_up_the_local_cache() {
-    for format in [RepoFormat::V7, RepoFormat::V6] {
+    for format in [
+        RepoFormat::V6(vykar_types::hash::HashAlgorithm::Blake2b),
+        RepoFormat::CURRENT,
+    ] {
         let env = init(format, EncryptionMode::None);
         let mut w = env.writer();
         w.commit(&index_with(0..100, 0));
@@ -202,8 +197,11 @@ fn open_with_index_loads_and_catches_up_the_local_cache() {
         assert_eq!(index_d_gets(&ops), 2);
         let dir =
             crate::cache_paths::repo_cache_dir(&repo.config.id, Some(env.cache.path())).unwrap();
-        let path = crate::index::table::table_path(&dir, &w.head.state_hash);
-        assert!(path.exists(), "the synced table is kept for the next open");
+        let path = crate::index::table::base_table_path(&dir, &w.head.base.as_ref().unwrap().name);
+        assert!(
+            path.exists(),
+            "the downloaded base is kept for the next open"
+        );
 
         let (repo, ops) = env.open_logged(OpenOptions::new().with_index());
         assert_eq!(entries(repo.chunk_index()), entries(&s2));
@@ -224,10 +222,7 @@ fn open_with_index_loads_and_catches_up_the_local_cache() {
         w.commit(&s5);
         repo.load_chunk_index_under_lock().unwrap();
         assert_eq!(entries(repo.chunk_index()), entries(&s5));
-        assert_eq!(
-            repo.index_generation(),
-            generation_for_state(&w.head.state_hash)
-        );
+        assert_eq!(repo.index_generation(), w.head.generation);
     }
 }
 
@@ -236,7 +231,7 @@ fn open_with_index_loads_and_catches_up_the_local_cache() {
 /// repository builds the same index.
 #[test]
 fn uncached_and_static_loads_fetch_the_whole_chain() {
-    let env = init(RepoFormat::V6, EncryptionMode::None);
+    let env = init(RepoFormat::CURRENT, EncryptionMode::None);
     let mut w = env.writer();
     w.commit(&index_with(0..30, 0));
     w.fold();
@@ -268,7 +263,7 @@ fn uncached_and_static_loads_fetch_the_whole_chain() {
 /// upgrade, or anything else) changes nothing.
 #[test]
 fn an_object_at_index_is_ignored() {
-    let env = init(RepoFormat::V6, EncryptionMode::None);
+    let env = init(RepoFormat::CURRENT, EncryptionMode::None);
     let legacy = crate::tests::helpers::legacy_index_blob(
         &crate::index::ChunkIndex::new(),
         7,
@@ -285,14 +280,14 @@ fn an_object_at_index_is_ignored() {
 /// still proves its key (R2).
 #[test]
 fn prove_key_accepts_an_index_head() {
-    let env = init(RepoFormat::V6, EncryptionMode::Aes256Gcm);
+    let env = init(RepoFormat::CURRENT, EncryptionMode::Aes256Gcm);
     let blob = env.inner.get(crate::repo::KEY_PRIMARY).unwrap().unwrap();
     let enc: EncryptedKey = rmp_serde::from_slice(&blob).unwrap();
     let key = MasterKey::from_encrypted(&enc, "pw").unwrap();
     let proof = identity::prove_key(
         env.inner.as_ref(),
         &env.repo.config,
-        RepoFormat::V6,
+        RepoFormat::CURRENT,
         None,
         None,
         &key,
@@ -304,7 +299,7 @@ fn prove_key_accepts_an_index_head() {
     let proof = identity::prove_key(
         env.inner.as_ref(),
         &env.repo.config,
-        RepoFormat::V6,
+        RepoFormat::CURRENT,
         None,
         None,
         &other,
@@ -322,16 +317,19 @@ fn prove_key_accepts_an_index_head() {
 }
 
 /// The plaintext chunk-ID key follows the chunk hash: a v2 repository keeps
-/// its key as v7, a v3 one as v6.
+/// its key as v6 with BLAKE2b, a v3 one as v6 with BLAKE3.
 #[test]
 fn plaintext_key_follows_the_chunk_hash() {
     let id = [0x42u8; 32];
     assert_eq!(
-        derive_plaintext_chunk_id_key(&id, RepoFormat::V7),
+        derive_plaintext_chunk_id_key(
+            &id,
+            RepoFormat::V6(vykar_types::hash::HashAlgorithm::Blake2b)
+        ),
         derive_plaintext_chunk_id_key(&id, RepoFormat::V2)
     );
     assert_eq!(
-        derive_plaintext_chunk_id_key(&id, RepoFormat::V6),
+        derive_plaintext_chunk_id_key(&id, RepoFormat::CURRENT),
         derive_plaintext_chunk_id_key(&id, RepoFormat::V3)
     );
 }
@@ -344,7 +342,10 @@ fn encrypted_writes_round_trip() {
     use crate::repo::WriteSessionOptions;
     use crate::repo::pack::PackType;
 
-    for format in [RepoFormat::V7, RepoFormat::V6] {
+    for format in [
+        RepoFormat::V6(vykar_types::hash::HashAlgorithm::Blake2b),
+        RepoFormat::CURRENT,
+    ] {
         let mut env = init(format, EncryptionMode::Aes256Gcm);
         for round in 0..3u8 {
             env.repo
@@ -358,7 +359,8 @@ fn encrypted_writes_round_trip() {
             env.repo.save_state().unwrap();
         }
         let head = env.repo.index_head().unwrap().clone();
-        assert_eq!(head.entries, 15);
+        assert_eq!(env.repo.chunk_index().len(), 15);
+        assert_eq!(head.segments.iter().map(|s| s.entries).sum::<u64>(), 15);
         let (repo, _) = env.open_logged(OpenOptions::new().with_index());
         assert_eq!(repo.index_head(), Some(&head));
         assert_eq!(entries(repo.chunk_index()), entries(env.repo.chunk_index()));

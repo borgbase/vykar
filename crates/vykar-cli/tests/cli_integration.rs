@@ -302,14 +302,19 @@ fn cli_init_writes_repository_format_v6() {
     fx.run_ok(&["--config", &cfg, "init"]);
 
     let config_bytes = std::fs::read(fx.repo_dir.join("config")).expect("repo config exists");
-    // RepoConfig is a positional msgpack array; the version is element 0.
-    // 0x97 = fixarray of 7 — the field count the format decision depends on.
+    // From v6 on `config` is a msgpack map (0x89 = fixmap of 9: the seven
+    // old fields, chunk_hash and features).
     assert_eq!(
         config_bytes.first(),
-        Some(&0x97),
-        "RepoConfig must stay a 7-element msgpack array"
+        Some(&0x89),
+        "RepoConfig must be a nine-entry msgpack map"
     );
-    assert_eq!(config_bytes.get(1), Some(&6), "init must write version 6");
+    let config = vykar_core::repo::RepoConfig::decode(&config_bytes)
+        .unwrap()
+        .into_repo_config();
+    assert_eq!(config.version, 6, "init must write version 6");
+    assert_eq!(config.chunk_hash, "blake3");
+    assert!(config.features.is_empty());
     assert!(fx.repo_dir.join("index.h").join("1").is_file());
     assert!(!fx.repo_dir.join("index").exists());
 }
@@ -364,10 +369,19 @@ fn init_empty_v3(repo_dir: &Path) {
     std::fs::remove_dir_all(repo_dir.join("index.d")).unwrap();
     std::fs::remove_dir_all(repo_dir.join("index.h")).unwrap();
     let path = repo_dir.join("config");
-    let mut config: vykar_core::repo::RepoConfig =
-        rmp_serde::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-    config.version = 3;
-    std::fs::write(path, rmp_serde::to_vec(&config).unwrap()).unwrap();
+    let config = vykar_core::repo::RepoConfig::decode(&std::fs::read(&path).unwrap())
+        .unwrap()
+        .into_repo_config();
+    let legacy = vykar_core::repo::LegacyRepoConfig {
+        version: 3,
+        id: config.id,
+        chunker_params: config.chunker_params,
+        encryption: config.encryption,
+        created: config.created,
+        min_pack_size: config.min_pack_size,
+        max_pack_size: config.max_pack_size,
+    };
+    std::fs::write(path, rmp_serde::to_vec(&legacy).unwrap()).unwrap();
 }
 
 /// `vykar upgrade` takes a v3 repository to v6. It refuses to run without a
@@ -390,11 +404,13 @@ fn cli_upgrade_moves_a_v3_repository_to_v6() {
     );
 
     let out = fx.run_ok(&["--config", &cfg, "upgrade", "--yes"]);
-    assert!(out.contains("from format v3 to v6"), "{out}");
-    assert_eq!(
-        std::fs::read(fx.repo_dir.join("config")).unwrap().get(1),
-        Some(&6)
-    );
+    assert!(out.contains("from format v3 to v6 (blake3)"), "{out}");
+    assert!(out.contains("packs mapped"), "{out}");
+    let config =
+        vykar_core::repo::RepoConfig::decode(&std::fs::read(fx.repo_dir.join("config")).unwrap())
+            .unwrap()
+            .into_repo_config();
+    assert_eq!((config.version, config.chunk_hash.as_str()), (6, "blake3"));
     assert!(!fx.repo_dir.join("index").exists());
     assert!(!fx.repo_dir.join("index.gen").exists());
 
@@ -1429,7 +1445,6 @@ fn cli_compact_report_unreferenced_prints_counts() {
         "Snapshots: 1 (",
         "Index entries: ",
         "Packs with unreferenced entries: 0 (",
-        "Stored refcounts that differ from the references counted: 0 (",
     ] {
         assert!(
             lines.iter().any(|l| l.starts_with(prefix)),
@@ -1437,6 +1452,7 @@ fn cli_compact_report_unreferenced_prints_counts() {
         );
     }
     assert!(out.contains(" 0 unreferenced,"), "{out}");
+    assert!(!out.contains("Stored refcounts"), "{out}");
 }
 
 #[test]
@@ -2936,7 +2952,9 @@ fn forget_pins(fx: &CliFixture) -> usize {
 
 fn repo_id_hex(repo_dir: &Path) -> String {
     let data = std::fs::read(repo_dir.join("config")).unwrap();
-    let config: vykar_core::repo::RepoConfig = rmp_serde::from_slice(&data).unwrap();
+    let config = vykar_core::repo::RepoConfig::decode(&data)
+        .unwrap()
+        .into_repo_config();
     hex::encode(&config.id)
 }
 

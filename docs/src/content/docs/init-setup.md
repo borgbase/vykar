@@ -117,7 +117,7 @@ complements an off-repository copy rather than replacing one.
 
 `vykar init` always creates a **format v6** repository, whose chunk and pack IDs use BLAKE3 and whose chunk index is segmented. There is no flag or config key to choose otherwise. `vykar info` reports the format and hash of any repository.
 
-Repositories created by vykar 0.24 and earlier (**format v2**, BLAKE2b, from 0.19 and earlier; **format v3**, BLAKE3) must be converted with [`vykar upgrade`](/maintenance#upgrade-the-repository-format) before any other command works on them: v2 becomes v7, v3 becomes v6. The hash is part of every chunk's dedup identity and every pack's storage key, so it never changes: a v2 repository stays BLAKE2b for life.
+Repositories created by vykar 0.24 and earlier (**format v2**, BLAKE2b, from 0.19 and earlier; **format v3**, BLAKE3) must be converted with [`vykar upgrade`](/maintenance#upgrade-the-repository-format) before any other command works on them: both become v6 (its `config` names the hash: `blake2b` for an upgraded v2 repository, `blake3` otherwise). The hash is part of every chunk's dedup identity and every pack's storage key, so it never changes: a v2 repository stays BLAKE2b for life.
 
 This matters in two situations:
 

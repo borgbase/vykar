@@ -4,16 +4,16 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use tempfile::TempPath;
 use vykar_crypto::CryptoEngine;
 use vykar_types::error::{Result, VykarError};
 
-use crate::index::dedup_cache::MmapFullIndexCache;
 use crate::index::head::{BaseRef, ObjectName, SegmentRef};
-use crate::index::segment::Segment;
+use crate::index::segment_v2::SegmentBody;
 use crate::repo::ChunkerParams;
 use crate::repo::index_store;
 use crate::snapshot::item::Item;
+use vykar_types::chunk_id::ChunkId;
+use vykar_types::pack_id::PackId;
 
 /// The byte-string type of `SweepRecord::snapshots`, for seeds.
 pub use serde_bytes::ByteBuf;
@@ -23,38 +23,52 @@ pub const BASE_CONTEXT: &[u8] = index_store::BASE_CONTEXT;
 /// AEAD context of a stored index segment.
 pub const SEGMENT_CONTEXT: &[u8] = index_store::SEGMENT_CONTEXT;
 
-/// `repo::index_store::decode_segment`.
-pub fn decode_segment(
+/// `repo::index_store::decode_segment_v2`.
+pub fn decode_segment_v2(
     seg: &SegmentRef,
     bytes: &[u8],
     crypto: &dyn CryptoEngine,
-) -> Result<Segment> {
-    index_store::decode_segment(seg, bytes, crypto)
+) -> Result<SegmentBody> {
+    index_store::decode_segment_v2(seg, bytes, crypto)
 }
 
-/// `repo::index_store::decode_base_to_temp`.
-pub fn decode_base_to_temp(
+/// `repo::index_store::decode_base_v2_to_temp`, then the verified install
+/// of the table file as a sync does it; the table's record count.
+pub fn decode_base_v2(
     base_ref: &BaseRef,
     bytes: Vec<u8>,
     crypto: &dyn CryptoEngine,
-    target: &Path,
-) -> Result<TempPath> {
-    index_store::decode_base_to_temp(base_ref, bytes, crypto, target)
+    anchor: &Path,
+) -> Result<u64> {
+    let tmp = index_store::decode_base_v2_to_temp(base_ref, bytes, crypto, anchor)?;
+    Ok(crate::index::ChunkTable::install(tmp, None, None)?.len() as u64)
 }
 
-/// `repo::index_store::pack_segment`: the object's name and stored bytes.
-pub fn pack_segment(seg: &Segment, crypto: &dyn CryptoEngine) -> Result<(ObjectName, Vec<u8>)> {
-    let packed = index_store::pack_segment(seg, crypto)?;
-    Ok((packed.name, packed.bytes))
-}
-
-/// `repo::index_store::pack_base`: the object's name and stored bytes.
-pub fn pack_base(
-    cache: &MmapFullIndexCache,
+/// `repo::index_store::pack_segment_v2`: the object's name and stored bytes.
+pub fn pack_segment_v2(
+    seg: &SegmentBody,
     crypto: &dyn CryptoEngine,
 ) -> Result<(ObjectName, Vec<u8>)> {
-    let packed = index_store::pack_base(cache, crypto)?;
+    let packed = index_store::pack_segment_v2(seg, crypto)?;
     Ok((packed.name, packed.bytes))
+}
+
+/// `repo::index_store::pack_base_body`: the object's name and stored bytes.
+pub fn pack_base_body(body: &[u8], crypto: &dyn CryptoEngine) -> Result<(ObjectName, Vec<u8>)> {
+    let packed = index_store::pack_base_body(body, crypto)?;
+    Ok((packed.name, packed.bytes))
+}
+
+/// The pack table and the records (chunk ID, pack slot, offset, stored
+/// size) of a valid base v2 body.
+#[allow(clippy::type_complexity)]
+pub fn base_v2_contents(
+    body: &[u8],
+) -> Result<(Vec<(PackId, u32)>, Vec<(ChunkId, u32, u32, u32)>)> {
+    let view = crate::index::base_v2::BaseView::new(body)?;
+    let packs = (0..view.pack_count()).map(|s| view.pack_at(s)).collect();
+    let records = (0..view.entry_count()).map(|p| view.record_at(p)).collect();
+    Ok((packs, records))
 }
 
 /// `repo::index_store::is_object_damage`.

@@ -649,13 +649,11 @@ mod merge {
     use std::sync::Arc;
 
     use super::*;
-    use crate::index::dedup_cache::full_cache_from_index_to_temp;
     use crate::index::{ChunkTable, IndexDelta, LiveIndex};
 
     /// `index` as a scratch table in `dir`.
-    fn table_of(index: &ChunkIndex, dir: &Path) -> Arc<ChunkTable> {
-        let tmp = full_cache_from_index_to_temp(index, &dir.join("chunk_table")).unwrap();
-        Arc::new(ChunkTable::scratch(tmp).unwrap())
+    fn table_of(index: &ChunkIndex, _dir: &Path) -> Arc<ChunkTable> {
+        crate::testutil::base_table_of(index)
     }
 
     /// A delta whose positional bumps index a table of `session_start`.

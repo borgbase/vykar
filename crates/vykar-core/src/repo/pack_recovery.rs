@@ -13,6 +13,8 @@
 //! Sizes come from `pack_lookup` (batch, else the cost model); every failure
 //! rejects the pack, none aborts.
 
+use std::collections::HashMap;
+#[cfg(test)]
 use std::collections::HashSet;
 
 use tracing::warn;
@@ -50,6 +52,7 @@ fn accepted_pack_lens(entry: &PendingPackEntry, encrypting: bool) -> Option<[u64
 /// trailer frame for the entry's chunk count. Every rejected pack is logged
 /// here. `persisted_packs` (packs in the loaded index) only steers the
 /// request pattern. Up to `width` lookups run at once.
+#[cfg(test)]
 pub(crate) fn verify_journal_packs(
     storage: &dyn StorageBackend,
     encrypting: bool,
@@ -57,6 +60,21 @@ pub(crate) fn verify_journal_packs(
     persisted_packs: usize,
     width: usize,
 ) -> HashSet<PackId> {
+    verify_journal_packs_with(storage, encrypting, entries, persisted_packs, width, None)
+        .into_keys()
+        .collect()
+}
+
+/// [`verify_journal_packs`], with each accepted pack's trailer frame length
+/// (0 when its length is the one without a trailer): the `trailer_len` the
+/// index records for it.
+pub(crate) fn verify_journal_packs_trailers(
+    storage: &dyn StorageBackend,
+    encrypting: bool,
+    entries: &[PendingPackEntry],
+    persisted_packs: usize,
+    width: usize,
+) -> HashMap<PackId, u32> {
     verify_journal_packs_with(storage, encrypting, entries, persisted_packs, width, None)
 }
 
@@ -68,7 +86,7 @@ fn verify_journal_packs_with(
     persisted_packs: usize,
     width: usize,
     force: Option<Strategy>,
-) -> HashSet<PackId> {
+) -> HashMap<PackId, u32> {
     let mut sized: Vec<(&PendingPackEntry, [u64; 2])> = Vec::with_capacity(entries.len());
     for entry in entries {
         match accepted_pack_lens(entry, encrypting) {
@@ -89,12 +107,17 @@ fn verify_journal_packs_with(
         force,
         OnFailure::Continue,
     );
-    let mut accepted = HashSet::with_capacity(sized.len());
+    let mut accepted = HashMap::with_capacity(sized.len());
     for (entry, expected) in sized {
         // `get`, not `remove`: duplicate entries for a pack see the same answer.
         match actual.get(&entry.pack_id) {
             Some(Ok(Some(size))) if expected.contains(size) => {
-                accepted.insert(entry.pack_id);
+                let trailer_len = if *size == expected[0] {
+                    0
+                } else {
+                    (expected[1] - expected[0]) as u32
+                };
+                accepted.insert(entry.pack_id, trailer_len);
             }
             Some(Ok(Some(size))) => warn!(
                 pack_id = %entry.pack_id,
@@ -210,7 +233,9 @@ mod tests {
                     let storage = make();
                     let (entries, exact) = fixture(&storage);
                     assert_eq!(
-                        verify_journal_packs_with(&storage, false, &entries, 0, width, force),
+                        verify_journal_packs_with(&storage, false, &entries, 0, width, force)
+                            .into_keys()
+                            .collect::<HashSet<_>>(),
                         exact,
                         "{name}/{force:?}/{width}"
                     );

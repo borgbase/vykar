@@ -6,7 +6,7 @@ use crate::snapshot::SnapshotStats;
 use crate::snapshot::item::{ChunkRef, Item};
 use vykar_types::error::{Result, VykarError};
 
-use super::chunk_process::WorkerChunk;
+use super::chunk_process::{ExistingAt, WorkerChunk};
 
 /// Commit worker chunks into a repository, updating item and stats.
 ///
@@ -23,7 +23,7 @@ pub(super) fn process_worker_chunks(
             WorkerChunk::Prepared(prepared) => {
                 let size = prepared.uncompressed_size;
                 // With a prefilter, the worker established the chunk is not
-                // in the session's table; it can only dedup against chunks
+                // in the session's view; it can only dedup against chunks
                 // added during this session.
                 let existing = if prefilter.is_some() {
                     repo.bump_ref_prefilter_miss(&prepared.chunk_id)
@@ -61,12 +61,19 @@ pub(super) fn process_worker_chunks(
                         existing.chunk_id
                     ))
                 })?;
-                repo.bump_ref_presession_hit(
-                    &existing.chunk_id,
-                    existing.stored_size,
-                    existing.cache_position,
-                    prefilter,
-                )?;
+                match existing.at {
+                    ExistingAt::Table(position) => repo.bump_ref_presession_hit(
+                        &existing.chunk_id,
+                        existing.stored_size,
+                        position,
+                        prefilter,
+                    )?,
+                    ExistingAt::Added => repo.bump_ref_presession_added(
+                        &existing.chunk_id,
+                        existing.stored_size,
+                        prefilter,
+                    )?,
+                }
                 let size = existing.uncompressed_size;
                 let csize = existing.stored_size;
                 stats.original_size += size as u64;
@@ -143,10 +150,9 @@ mod tests {
         use super::*;
         use crate::commands::backup::chunk_process::{WorkerChunk, classify_chunk};
         use crate::compress::Compression;
+        use crate::index::ChunkIndex;
         use crate::index::dedup_cache::chunk_id_to_u64;
-        use crate::index::{ChunkIndex, ChunkTable};
         use std::borrow::Cow;
-        use std::sync::Arc;
         use vykar_types::pack_id::PackId;
 
         /// An index holding `stored`.
@@ -195,6 +201,40 @@ mod tests {
             assert_eq!(repo.delta_refcount_bump(&id), 1);
         }
 
+        /// BK-2 (worker path): a chunk added by an applied segment is a
+        /// data-less hit recorded by key.
+        #[test]
+        fn presession_hit_on_an_applied_addition_records_a_keyed_bump() {
+            let mut repo = test_repo_plaintext();
+            let data = b"added by an earlier write".to_vec();
+            let (id, size, _) = repo
+                .store_chunk(&data, Compression::None, PackType::Data)
+                .unwrap();
+            repo.save_state().unwrap();
+            assert!(repo.chunk_index().table().unwrap().is_empty(), "no base");
+            repo.begin_write_session(&crate::repo::WriteSessionOptions::default())
+                .unwrap();
+            let prefilter = repo.dedup_prefilter().unwrap();
+
+            let chunk = classify(&repo, &prefilter, &data);
+            let WorkerChunk::Existing(existing) = &chunk else {
+                panic!("an applied addition must be a data-less hit");
+            };
+            assert_eq!(
+                existing.at,
+                crate::commands::backup::chunk_process::ExistingAt::Added
+            );
+            let mut item = empty_item();
+            let mut stats = SnapshotStats::default();
+            process_worker_chunks(&mut repo, &mut item, [chunk], &mut stats, Some(&prefilter))
+                .unwrap();
+            assert_eq!(item.chunks[0].csize, size);
+            assert_eq!(stats.deduplicated_size, 0);
+            let delta = repo.write_session_delta_for_test();
+            assert_eq!(delta.refcount_bumps.get(&id), Some(&1));
+            repo.flush_packs().unwrap();
+        }
+
         /// A data-less hit whose verdict came from a different table than
         /// the session's must fail loudly, not record a reference.
         #[test]
@@ -204,11 +244,7 @@ mod tests {
             let id = ChunkId::compute(repo.crypto.chunk_hasher(), &data);
             let index = index_of(&[(id, 77)]);
             repo.set_session_table_for_test(&index);
-            let anchor = crate::repo::index_store::cache_anchor(None);
-            let tmp =
-                crate::index::dedup_cache::full_cache_from_index_to_temp(&index, &anchor).unwrap();
-            let other = Arc::new(ChunkTable::scratch(tmp).unwrap());
-            let foreign = DedupPrefilter::new(&other).unwrap();
+            let foreign = crate::testutil::prefilter_of(&index);
 
             let chunk = classify(&repo, &foreign, &data);
             let mut item = empty_item();

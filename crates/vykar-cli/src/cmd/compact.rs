@@ -77,12 +77,6 @@ pub(crate) fn run_report_unreferenced(
         report.packs_only_unreferenced,
         format_bytes(report.packs_only_unreferenced_bytes),
     );
-    println!(
-        "Stored refcounts that differ from the references counted: {} ({} unreferenced with a refcount, {} referenced at refcount 0)",
-        report.refcount_mismatches,
-        report.unreferenced_with_refcount,
-        report.referenced_with_zero_refcount,
-    );
     Ok(())
 }
 

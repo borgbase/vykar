@@ -14,7 +14,7 @@ use vykar_types::error::Result;
 use super::format::{ObjectType, unpack_object_expect_with_context};
 use super::host_env::Clock;
 use super::lock::{SESSION_STALE_SECS, SESSIONS_PREFIX, SessionEntry, session_index_key};
-use super::pack_recovery::verify_journal_packs;
+use super::pack_recovery::verify_journal_packs_trailers;
 use super::session_journal::PENDING_INDEX_OBJECT_CONTEXT;
 
 /// Result of recovering pending index journals from interrupted sessions.
@@ -62,6 +62,9 @@ pub(crate) struct RecoveryTarget<'a> {
     pub(crate) recovered_index_keys: &'a mut Vec<String>,
     /// Seeded with every accepted pack so a re-interruption preserves it.
     pub(crate) journal: &'a mut PendingIndexJournal,
+    /// The trailer frame length of every accepted pack (0: none), for the
+    /// index entries of promoted chunks.
+    pub(crate) pack_trailers: &'a mut StdHashMap<vykar_types::pack_id::PackId, u32>,
 }
 
 /// Recover chunk→pack mappings from previous interrupted sessions'
@@ -259,7 +262,7 @@ fn recover_single_index(
         "found pending index from interrupted session, verifying packs\u{2026}"
     );
 
-    let accepted = verify_journal_packs(
+    let accepted = verify_journal_packs_trailers(
         storage,
         crypto.is_encrypting(),
         &wire,
@@ -272,9 +275,10 @@ fn recover_single_index(
     for pack_entry in wire {
         // Rejected packs were already logged by `verify_journal_packs`
         // and are not re-seeded into this session's journal.
-        if !accepted.contains(&pack_entry.pack_id) {
+        let Some(&trailer_len) = accepted.get(&pack_entry.pack_id) else {
             continue;
-        }
+        };
+        target.pack_trailers.insert(pack_entry.pack_id, trailer_len);
 
         for chunk in &pack_entry.chunks {
             // Only add if not already in the chunk index (e.g. from a

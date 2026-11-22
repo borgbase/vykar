@@ -144,6 +144,8 @@ fn apply_maintenance(repo: &mut Repository, op: &Op) -> bool {
             repo.chunk_index_mut().decrement(&ids[i % ids.len()]);
         }
         Op::Relocate(i, p, size) => {
+            repo.chunk_index_mut()
+                .set_pack_trailer(PackId::from_bytes([p; 32]), 0);
             let moved = repo.chunk_index_mut().update_location(
                 &ids[i % ids.len()],
                 PackId::from_bytes([p; 32]),
@@ -208,8 +210,8 @@ proptest! {
             let cold = cold(&t.repo_dir, &t.scratch);
             prop_assert_eq!(sorted_entries(&cold), sorted_entries(t.repo.chunk_index()));
             prop_assert_eq!(
-                t.repo.index_head().unwrap().entries,
-                t.repo.chunk_index().len() as u64
+                t.repo.chunk_index().state(),
+                &crate::index::table::IndexState::of_head(t.repo.index_head().unwrap())
             );
         }
 

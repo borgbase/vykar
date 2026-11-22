@@ -266,10 +266,12 @@ fn backup_rejects_stored_invalid_chunker_parameters_but_restore_still_works() {
         // The application config deliberately keeps even defaults, proving
         // that backup checks persisted values rather than just YAML values.
         let config_path = repo_dir.join("config");
-        let mut stored: vykar_core::repo::RepoConfig =
-            rmp_serde::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+        let mut stored =
+            vykar_core::repo::RepoConfig::decode(&std::fs::read(&config_path).unwrap())
+                .unwrap()
+                .into_repo_config();
         stored.chunker_params = chunker;
-        let config_bytes = rmp_serde::to_vec(&stored).unwrap();
+        let config_bytes = stored.encode().unwrap();
         std::fs::write(&config_path, &config_bytes).unwrap();
 
         let source_paths = vec![source_dir.to_string_lossy().into_owned()];

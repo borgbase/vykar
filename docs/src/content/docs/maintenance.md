@@ -75,7 +75,10 @@ and packs written before trailers are covered by pack maps under `packmaps/`
 or, failing both, by this machine's index cache. Nothing is lost for packs that
 are described this way. The plan says how the index was rebuilt and lists any
 pack that nothing describes; snapshots whose data lies only in such packs are
-removed by the plan. Run it with `--dry-run` first, and run
+removed by the plan. When this machine's index cache still holds intact copies
+of the missing or damaged `index.d/` objects, repair uses them instead of
+rebuilding, and uploads the index afresh. Run it with `--dry-run` first, and
+run
 `vykar check --verify-data` after a rebuild: the rebuild trusts what the packs
 say, and only a full verification finds chunks that rotted inside them.
 
@@ -85,7 +88,7 @@ map written by a newer vykar: repair refuses, names the object and asks for an
 upgrade. If no newer vykar has written to the repository, an object under
 `packmaps/` that this vykar cannot attribute does not belong there and may be
 removed by hand. Repair then describes the packs it named from their trailers
-or from this machine's chunk tables; a pack with neither becomes uncovered, and
+or from this machine's base tables; a pack with neither becomes uncovered, and
 the snapshots that need it are removed.
 `check --verify-data` also checks pack trailers; a damaged trailer is repaired
 by writing a pack map for its pack, which removes nothing.
@@ -131,7 +134,7 @@ vykar break-lock --sessions
 
 ## Upgrade the repository format
 
-Repositories created before 0.25 (format v2 or v3) store the chunk index as one object, which those releases rewrote on every backup, prune and compact. On a large repository that was hundreds of megabytes per write. This vykar opens them only to upgrade them: every other command refuses and names `vykar upgrade` (`key export`/`key import`, `delete-repo` and `break-lock` still work). `vykar upgrade` converts the repository in place to the segmented index (v2 → v7, v3 → v6), after which each write uploads only what changed. Chunk and pack hashes stay the same, so nothing is re-uploaded except the index itself, once.
+Repositories created before 0.25 (format v2 or v3) store the chunk index as one object, which those releases rewrote on every backup, prune and compact. On a large repository that was hundreds of megabytes per write. This vykar opens them only to upgrade them: every other command refuses and names `vykar upgrade` (`key export`/`key import`, `delete-repo` and `break-lock` still work). `vykar upgrade` converts the repository in place to format v6, the segmented index (a v2 repository keeps BLAKE2b, a v3 one BLAKE3), after which each write uploads only what changed. Chunk and pack hashes stay the same, so nothing is re-uploaded except the index itself, once. Before the switch it writes a pack map for every existing pack (those packs have no trailer), so the repository's index can always be rebuilt from the packs; it reports how many packs it mapped, and warns about any pack too large for a map.
 
 ```bash
 vykar upgrade -R <repo>          # asks for confirmation
@@ -140,8 +143,9 @@ vykar upgrade -R <repo> --yes    # for scripts
 
 - **One-way.** vykar releases before 0.25 can no longer read or write the repository afterwards. Upgrade vykar on every host that uses it, and stop all of them, before upgrading.
 - **No active backups.** The upgrade takes the maintenance lock and refuses while backup sessions are active, like `compact` and `prune`.
-- **Append-only servers.** The upgrade rewrites `config` and `index`, which an append-only `vykar-server` refuses; it fails before changing anything. Disable append-only for the upgrade.
+- **Append-only servers.** The upgrade rewrites `config` and deletes `index`, which an append-only `vykar-server` refuses; it fails before changing anything. The procedure: turn append-only off for the repository (restart `vykar-server` without `--append-only`), run `vykar upgrade`, then turn append-only on again.
 - **Interrupted upgrades** are completed by running `vykar upgrade` again; until then, every other command refuses and names `vykar upgrade`. If the interrupted upgrade left a damaged index, `vykar upgrade` still completes the switch to the new format and then reports the damage: run `vykar check --repair` (with `--dry-run` first to see what it would change). If `index` turns out to be a damaged pre-0.25 index instead, the upgrade changes nothing and says so; restore `index` from a copy of the repository.
+- **Before the switch, older clients still work.** An upgrade that stopped before switching `config` leaves the repository in its old format with extra directories beside it (`packmaps/`, and possibly `index.h/` and `index.d/`). Clients before 0.25 ignore them, but a `vykar-server` before 0.25 refuses to start on a data directory that contains them ("contains unexpected entries"). Run `vykar upgrade` again to finish; to stay on the old format instead, remove those directories while `config` is still the old one.
 - If a pre-0.25 client still wrote to the repository after the upgrade, commands refuse and name `vykar check --repair`, which rebuilds the index.
 
 New repositories are created in the current format; there is nothing to upgrade.

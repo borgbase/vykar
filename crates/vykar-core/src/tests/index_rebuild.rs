@@ -88,6 +88,18 @@ impl Fx {
         .unwrap()
     }
 
+    /// Fold the index into a base, so this machine holds its table
+    /// (`index_base.*`).
+    fn fold(&self) {
+        let mut repo = self.open();
+        commands::util::with_maintenance_lock(&mut repo, |repo| {
+            repo.request_index_fold();
+            repo.mark_index_dirty();
+            repo.save_state()
+        })
+        .unwrap();
+    }
+
     /// Delete every head and every object in `index.d/`.
     fn delete_index(&self) {
         super::helpers::remove_index_heads(&self.repo_dir);
@@ -463,13 +475,14 @@ fn verify_data_reports_a_trailer_that_disagrees_with_the_index() {
 }
 
 /// A pack without a trailer (one written before trailers) is taken from the
-/// chunk table of the machine that has one, and repair maps it, so a cold
-/// machine's later rebuild takes it from the map.
+/// base table of the machine that has one (REB-2), and repair maps it, so a
+/// cold machine's later rebuild takes it from the map.
 #[test]
 fn repair_maps_packs_recovered_from_a_local_table() {
     let mut fx = Fx::new();
     fx.write("a.bin", &data(1, 200_000));
     fx.backup("s1");
+    fx.fold();
     let pack = fx.pack_of_largest();
     cut_trailer(&pack);
     fx.delete_index();

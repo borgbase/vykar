@@ -85,8 +85,8 @@ pub(crate) fn downgrade_to_legacy(
     )
     .unwrap();
     let legacy = match repo.format() {
-        RepoFormat::V7 => RepoFormat::V2,
-        RepoFormat::V6 => RepoFormat::V3,
+        RepoFormat::V6(vykar_types::hash::HashAlgorithm::Blake2b) => RepoFormat::V2,
+        RepoFormat::CURRENT => RepoFormat::V3,
         other => panic!("not a segmented format: {other:?}"),
     };
     let blob = legacy_index_blob(
@@ -101,10 +101,23 @@ pub(crate) fn downgrade_to_legacy(
     std::fs::write(repo_dir.join("index.gen"), GENERATION.to_le_bytes()).unwrap();
     std::fs::remove_dir_all(repo_dir.join("index.d")).unwrap();
     std::fs::remove_dir_all(repo_dir.join("index.h")).unwrap();
-    let mut config: RepoConfig =
-        rmp_serde::from_slice(&std::fs::read(repo_dir.join("config")).unwrap()).unwrap();
-    config.version = legacy.version();
-    std::fs::write(repo_dir.join("config"), rmp_serde::to_vec(&config).unwrap()).unwrap();
+    let config = RepoConfig::decode(&std::fs::read(repo_dir.join("config")).unwrap())
+        .unwrap()
+        .into_repo_config();
+    let legacy_config = crate::repo::LegacyRepoConfig {
+        version: legacy.version(),
+        id: config.id,
+        chunker_params: config.chunker_params,
+        encryption: config.encryption,
+        created: config.created,
+        min_pack_size: config.min_pack_size,
+        max_pack_size: config.max_pack_size,
+    };
+    std::fs::write(
+        repo_dir.join("config"),
+        rmp_serde::to_vec(&legacy_config).unwrap(),
+    )
+    .unwrap();
     if let Some(dir) = crate::cache_paths::repo_cache_dir(&repo_id, Some(cache_dir))
         && dir.exists()
     {
@@ -178,13 +191,13 @@ pub fn clear_tree_cache(repo_dir: &Path) {
 pub fn load_snapshot_cache_from_disk(
     repo_dir: &Path,
 ) -> crate::repo::snapshot_cache::SnapshotListCache {
-    use crate::repo::RepoFormat;
     use vykar_types::chunk_id::ChunkHasher;
 
     init_test_environment();
     let config_data = std::fs::read(repo_dir.join("config")).unwrap();
-    let repo_config: crate::repo::RepoConfig = rmp_serde::from_slice(&config_data).unwrap();
-    let format = RepoFormat::from_version(repo_config.version).unwrap();
+    let decoded = crate::repo::RepoConfig::decode(&config_data).unwrap();
+    let format = decoded.validate().unwrap();
+    let repo_config = decoded.into_repo_config();
 
     // Unencrypted repo: the chunk-ID key is derived from repo_id by the same
     // format-dependent helper `open()` uses.

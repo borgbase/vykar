@@ -891,10 +891,11 @@ fn repair_reclaims_crash_orphan_index_entries() {
             repo.chunk_index().contains(&orphan_id),
             "orphan entry should be present before repair"
         );
+        // Refcounts are not persisted (05 step 9): the inflation is gone
+        // with the handle that made it.
         assert_eq!(
             repo.chunk_index().get(&existing_id).unwrap().refcount,
-            original_refcount + 3,
-            "refcount should be inflated before repair"
+            original_refcount,
         );
     }
 

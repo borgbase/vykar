@@ -1,14 +1,15 @@
-//! Write side of the index (formats v6/v7); see `index_store` for the
-//! objects and the read side.
+//! Write side of the index (format v6); see `index_store` for the objects
+//! and the read side.
 //!
 //! Every write runs under the repository lock: read the latest head, check
-//! it is the head the in-memory index was loaded from, produce the next
-//! state and its segment in one pass over the loaded table, then PUT the
-//! segment (and a sweep record, when a sweep is pending), check the lock
-//! fence and PUT the head of the next generation at `index.h/<gen>`. A
-//! chain past the hard limit, a write without a head (repair, upgrade) or an
-//! explicit request (compact, repair) writes a base instead: a *fold*. The
-//! new state becomes the repository's table.
+//! it is the head the in-memory index was loaded from, express the edits as
+//! one keyed segment ([`LiveIndex::pending_segment`], a walk over the
+//! overlay only), then PUT the segment (and a sweep record, when a sweep is
+//! pending), check the lock fence and PUT the head of the next generation at
+//! `index.h/<gen>`. The segment is then applied in memory; nothing local is
+//! rewritten. A chain past the hard limit, a write without a head (repair,
+//! upgrade) or an explicit request (compact, repair) writes a base instead:
+//! a *fold*, which also becomes the repository's local table file.
 //!
 //! Fold: PUT the new state as a base (none for the empty index), then the
 //! head with no segments and the previous live set as `retired`. Nothing is
@@ -20,7 +21,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use tempfile::TempPath;
 use tracing::{debug, warn};
 
 use super::Repository;
@@ -28,12 +28,11 @@ use super::control::CancelToken;
 use super::index_rebuild::{self, RebuildCounts, UncoveredPack};
 use super::index_store::{self, PackedObject, StoredHead};
 use crate::index::LiveIndex;
-use crate::index::dedup_cache::{MmapFullIndexCache, generation_for_state};
 use crate::index::head::{BaseRef, HEAD_LAYOUT_VERSION, IndexHead, SegmentRef};
 use crate::index::head::{SegmentKind, SweepState};
-use crate::index::segment::Diff;
+use crate::index::segment_v2::SegmentBody;
 use crate::index::sweep_record::SweepRecord;
-use crate::index::table::{self, ChunkTable};
+use crate::index::table::{self, ChunkTable, IndexState, TableFileWriter};
 use vykar_types::error::{Result, VykarError};
 use vykar_types::pack_id::PackId;
 
@@ -176,8 +175,8 @@ impl Repository {
     /// before it. Takes `self.pending_sweep`. With nothing pending: `prev`'s
     /// sweep when there is a `prev`, repair semantics when there is not (a
     /// write without a head may have removed anything). Also repair
-    /// semantics when the index has removed entries and nothing is pending,
-    /// so that no removal leaves `sweep.generation` unchanged.
+    /// semantics when the write removes entries (`removes`) and nothing is
+    /// pending, so that no removal leaves `sweep.generation` unchanged.
     ///
     /// The pending sweep is taken even when the write then fails (a PUT, the
     /// fence): it is not restored. The removals stay in the in-memory index,
@@ -189,12 +188,13 @@ impl Repository {
         &mut self,
         prev: Option<&IndexHead>,
         generation: u64,
+        removes: bool,
     ) -> Result<(SweepState, Option<PackedObject>)> {
         let prev_record = prev.and_then(|p| p.sweep.record);
         let pending = match self.pending_sweep.take() {
             Some(p) => Some(p),
             None if prev.is_none() => Some(PendingSweep::Repair),
-            None if self.chunk_index.has_removed_entries() => {
+            None if removes => {
                 debug!(
                     "index write removes entries with no sweep pending; recording it as a repair"
                 );
@@ -252,19 +252,26 @@ impl Repository {
         crate::cache_paths::repo_cache_dir(&self.config.id, self.cache_dir_override.as_deref())
     }
 
-    /// The local chunk table at `head`'s state: the repository's own, else
-    /// the table file of that state.
-    pub(super) fn local_table_at(&self, head: &IndexHead) -> Option<Arc<ChunkTable>> {
-        let target = (head.state_hash, head.entries);
-        if let Some(t) = self.chunk_index.table()
-            && t.state() == target
-        {
-            return Some(Arc::clone(t));
-        }
-        let dir = self.cache_dir()?;
-        ChunkTable::open_file(&table::table_path(&dir, &head.state_hash))
-            .filter(|t| t.state() == target)
-            .map(Arc::new)
+    /// Whether the in-memory index is loaded at `head`'s state (the same
+    /// base and segments).
+    pub(super) fn index_at(&self, head: &IndexHead) -> bool {
+        self.chunk_index.is_loaded() && *self.chunk_index.state() == IndexState::of_head(head)
+    }
+
+    /// Whether this machine's cache dir holds, verified, every object
+    /// `head` names live: its base's table (or no base) and each segment.
+    /// A sync to `head` then reads nothing from storage.
+    fn local_copies_cover(&self, head: &IndexHead) -> bool {
+        let Some(dir) = self.cache_dir() else {
+            return false;
+        };
+        head.base.as_ref().is_none_or(|b| {
+            ChunkTable::open_file(&table::base_table_path(&dir, &b.name))
+                .is_some_and(|t| t.len() as u64 == b.entries)
+        }) && head
+            .segments
+            .iter()
+            .all(|s| table::read_cached_segment(&dir, s).is_some())
     }
 
     /// Read the latest head and check it is the one the in-memory index was
@@ -282,59 +289,76 @@ impl Repository {
         Ok(Some(head))
     }
 
-    /// Persist the in-memory index (no write session): diff it against the
-    /// table it was loaded over, which must be at the loaded head's state,
-    /// and publish the segment, or a base without a head.
+    /// Persist the in-memory index (no write session): its edits as one
+    /// maintenance segment over the loaded head, which must be the latest, or
+    /// a base without a head (repair, upgrade).
     pub(super) fn persist_segmented_index(&mut self) -> Result<()> {
         let head = self.current_head_for_write()?;
-        let anchor = index_store::cache_anchor(self.cache_dir().as_deref());
-        let start = std::time::Instant::now();
-        let empty;
-        let prev = match self.chunk_index.table() {
-            Some(t) => t.cache(),
-            None if head.as_ref().is_some_and(|h| h.entries > 0) => {
+        let Some(head) = head else {
+            return self.publish_index_state(None, None, false);
+        };
+        if !self.chunk_index.is_loaded() {
+            if !head.is_empty() {
                 return Err(VykarError::Other(
                     "BUG: the chunk index was not loaded before it was written".into(),
                 ));
             }
-            None => {
-                empty = ChunkTable::empty(&anchor)?;
-                empty.cache()
-            }
-        };
-        if let Some(h) = head.as_ref()
-            && (prev.state_hash(), u64::from(prev.entry_count())) != (h.state_hash, h.entries)
-        {
+            // An index never loaded over the empty head is that head's.
+            self.chunk_index.load_empty();
+        }
+        if *self.chunk_index.state() != IndexState::of_head(&head) {
             return Err(stale_index_error());
         }
-        let (diff, next) = table::diff_live_to_temp(prev, &self.chunk_index, &anchor)?;
+        let start = std::time::Instant::now();
+        let seg = self.chunk_index.pending_segment(SegmentKind::Maintenance)?;
         debug!(
             elapsed_ms = start.elapsed().as_millis() as u64,
-            "index diffed against its predecessor"
+            additions = seg.additions.len(),
+            removals = seg.removals.len(),
+            relocations = seg.relocations.len(),
+            "index edits collected"
         );
-        // Without a head the state is written as a base; the diff is unused.
-        let diff = head.is_some().then_some(diff);
-        self.publish_index_state(head, diff, next, SegmentKind::Maintenance)
+        self.publish_index_state(Some(head), Some(seg), false)
     }
 
-    /// Publish the index state in `next` (a full cache in a temp file) as
-    /// the successor of `prev`: as `diff`'s segment, or as a base when there
-    /// is no diff, the hard limit is reached or a fold was requested. Then
-    /// install `next` as the repository's table, with no edits.
+    /// Publish `seg` as the successor of `prev`: as a segment, or as a base
+    /// (a fold) when there is no `prev`, the hard limit is reached, a fold
+    /// was requested or the packed segment's name is already named by
+    /// `prev` (plaintext repeat).
     ///
-    /// `kind` names the writer of the segment. An empty diff publishes
-    /// nothing, or only a head when a sweep is pending. On error nothing
-    /// local changes and at most an unreferenced object is left on storage.
+    /// `backup`: `seg` is a backup commit's additions over an unedited
+    /// index at `prev`; after the head PUT it is applied to the index (a
+    /// fold first adds them as edits, the base being written from the
+    /// index, and drops them again when the fold fails). Otherwise `seg` is
+    /// the index's pending edits, which become its applied state.
+    ///
+    /// An empty segment publishes nothing (refcount-only edits are
+    /// discarded), or only a head when a sweep is pending. On error nothing
+    /// local changes (a requested fold stays requested) and at most an
+    /// unreferenced object is left on storage.
     pub(super) fn publish_index_state(
         &mut self,
         prev: Option<IndexHead>,
-        diff: Option<Diff>,
-        next: TempPath,
-        kind: SegmentKind,
+        seg: Option<SegmentBody>,
+        backup: bool,
     ) -> Result<()> {
         let fold = std::mem::take(&mut self.fold_requested);
-        if let (Some(prev), Some(diff)) = (prev.as_ref(), diff.as_ref())
-            && diff.segment.is_empty()
+        let published = self.publish_index_state_inner(prev, seg, backup, fold);
+        if published.is_err() {
+            self.fold_requested |= fold;
+        }
+        published
+    }
+
+    fn publish_index_state_inner(
+        &mut self,
+        prev: Option<IndexHead>,
+        seg: Option<SegmentBody>,
+        backup: bool,
+        fold: bool,
+    ) -> Result<()> {
+        if let (Some(prev), Some(seg)) = (prev.as_ref(), seg.as_ref())
+            && seg.is_empty()
             && !fold
         {
             let head = if self.pending_sweep.is_some() {
@@ -343,83 +367,91 @@ impl Repository {
                 debug!("index unchanged, nothing to write");
                 prev.clone()
             };
-            let at_prev = |t: &Arc<ChunkTable>| t.state() == (prev.state_hash, prev.entries);
-            if self.chunk_index.table().is_some_and(at_prev) || !self.chunk_index.is_loaded() {
-                drop(next);
-                self.chunk_index.discard_edits();
-            } else {
-                self.install_written_table(next);
-            }
+            self.chunk_index.discard_edits();
+            self.index_generation = head.generation;
             self.index_head = Some(head);
             self.index_dirty = false;
             return Ok(());
         }
 
         let start = std::time::Instant::now();
-        let packed = diff
+        let removes = seg.as_ref().is_some_and(|s| !s.removals.is_empty());
+        let packed = seg
             .as_ref()
-            .map(|d| index_store::pack_segment(&d.segment, self.crypto.as_ref()))
+            .filter(|s| !s.is_empty())
+            .map(|s| index_store::pack_segment_v2(s, self.crypto.as_ref()))
             .transpose()?;
         // On a plaintext repository the same change from the same state
         // packs to the same bytes, so its name may already be in the head
         // (a state the chain returned to); an object is named only once.
-        let as_segment = match (prev.as_ref(), diff.as_ref(), packed) {
-            (Some(prev), Some(diff), Some(obj))
+        let as_segment = match (prev.as_ref(), seg, packed) {
+            (Some(prev), Some(seg), Some(obj))
                 if !fold
                     && !self.fold_policy.hard.reached(prev, 1, obj.size())
                     && !prev.named_objects().any(|n| n == obj.name) =>
             {
-                Some((prev, diff, obj))
+                Ok((prev, seg, obj))
             }
-            _ => None,
+            (_, seg, _) => Err(seg),
         };
 
         let head = match as_segment {
-            Some((prev, diff, obj)) => self.put_segment(prev, diff, obj, kind)?,
-            None => {
-                let cache = MmapFullIndexCache::open_verified(&next).ok_or_else(|| {
-                    VykarError::Other("new index state failed verification".into())
-                })?;
-                self.put_base(prev.as_ref(), &cache)?
+            Ok((prev, seg, obj)) => {
+                let name = obj.name;
+                let head = self.put_segment(prev, &seg, obj, removes)?;
+                if backup {
+                    if let Err(e) = self.chunk_index.apply_segment(name, &seg) {
+                        // The head is published; the next load syncs to it.
+                        warn!("cannot apply the index segment just written: {e}");
+                        self.chunk_index = LiveIndex::empty();
+                    }
+                } else {
+                    self.chunk_index.mark_written(name);
+                }
+                head
+            }
+            Err(seg) => {
+                let added = backup && seg.is_some();
+                if backup && let Some(seg) = seg.as_ref() {
+                    for (id, loc) in &seg.additions {
+                        self.chunk_index
+                            .add(*id, loc.stored_size, loc.pack_id, loc.pack_offset);
+                    }
+                    for (pack, trailer_len) in &seg.pack_trailers {
+                        self.chunk_index.set_pack_trailer(*pack, *trailer_len);
+                    }
+                }
+                match self.put_base(prev.as_ref(), removes) {
+                    Ok(head) => head,
+                    Err(e) => {
+                        // `put_base` replaces the index only after the head
+                        // PUT; the backup's additions were its only edits.
+                        if added {
+                            self.chunk_index.discard_edits();
+                        }
+                        return Err(e);
+                    }
+                }
             }
         };
         debug!(
             elapsed_ms = start.elapsed().as_millis() as u64,
+            generation = head.generation,
             segments = head.segments.len(),
-            entries = head.entries,
+            entries = self.chunk_index.len(),
             "index written"
         );
-
-        self.install_written_table(next);
-        self.index_generation = generation_for_state(&head.state_hash);
+        self.index_generation = head.generation;
         self.index_head = Some(head);
         self.index_dirty = false;
         Ok(())
-    }
-
-    /// Make the state an index write left in `next` the repository's table.
-    /// The head is already published, so a failure only logs: the old index
-    /// stays in place, and a later write from this handle is refused for its
-    /// state until the repository is opened again.
-    fn install_written_table(&mut self, next: TempPath) {
-        let dir = self.cache_dir();
-        match crate::index::table::ChunkTable::install(next, dir.as_deref()) {
-            Ok(table) => {
-                let table = Arc::new(table);
-                // Replace the index before pruning: the table it mapped until
-                // now is then unmapped and can be deleted once it is old enough.
-                self.chunk_index = LiveIndex::from_table(Arc::clone(&table));
-                index_store::prune_old_tables(&table, dir.as_deref());
-            }
-            Err(e) => warn!("cannot map the index state just written: {e}"),
-        }
     }
 
     /// A head-only write: the same state, a new generation and the pending
     /// sweep. PUT the record, check the fence, PUT the head.
     fn put_head_only(&mut self, prev: &IndexHead) -> Result<IndexHead> {
         let mut head = prev.successor();
-        let (sweep, record) = self.next_sweep(Some(prev), head.generation)?;
+        let (sweep, record) = self.next_sweep(Some(prev), head.generation, false)?;
         head.sweep = sweep;
         head.validate()?;
         if let Some(rec) = &record {
@@ -435,25 +467,22 @@ impl Repository {
     }
 
     /// PUT a segment (and the pending sweep record), then the head that
-    /// appends it.
+    /// appends it. The segment's bytes go to the local segment cache.
     fn put_segment(
         &mut self,
         prev: &IndexHead,
-        diff: &Diff,
+        seg: &SegmentBody,
         obj: PackedObject,
-        kind: SegmentKind,
+        removes: bool,
     ) -> Result<IndexHead> {
         let mut head = prev.successor();
         head.segments.push(SegmentRef {
             name: obj.name,
             size: obj.size(),
-            kind,
-            state_hash_after: diff.state_hash_after,
-            entries_after: diff.entries_after,
+            kind: seg.kind,
+            entries: seg.entries(),
         });
-        head.state_hash = diff.state_hash_after;
-        head.entries = diff.entries_after;
-        let (sweep, record) = self.next_sweep(Some(prev), head.generation)?;
+        let (sweep, record) = self.next_sweep(Some(prev), head.generation, removes)?;
         head.sweep = sweep;
         head.validate()?;
         let packed_head = index_store::pack_head(&head, self.crypto.as_ref())?;
@@ -462,6 +491,9 @@ impl Repository {
             self.storage.put(&rec.key(), &rec.bytes)?;
         }
         self.storage.put(&obj.key(), &obj.bytes)?;
+        if let Some(dir) = self.cache_dir() {
+            table::write_cached_segment(&dir, &obj.name, &obj.bytes);
+        }
         self.check_lock_fence()?;
         self.storage
             .put(&index_store::head_key(head.generation), &packed_head)?;
@@ -473,32 +505,36 @@ impl Repository {
         Ok(head)
     }
 
-    /// Fold: write `cache`'s state as a base (no object for the empty index)
-    /// and the head naming it alone, with `prev`'s live objects as retired.
-    /// Nothing is deleted before the head PUT; after it, the age-gated
-    /// garbage collection runs, best-effort.
+    /// Fold: write the index's current state as a base (no object for the
+    /// empty index) and the head naming it alone, with `prev`'s live objects
+    /// as retired. Nothing is deleted before the head PUT; after it, the
+    /// age-gated garbage collection runs, best-effort. The base's body
+    /// becomes the repository's table (`index_base.<name>`), with no
+    /// segments and no edits. `removes`: the new state lacks entries
+    /// `prev`'s has (for the sweep bookkeeping).
     pub(super) fn put_base(
         &mut self,
         prev: Option<&IndexHead>,
-        cache: &MmapFullIndexCache,
+        removes: bool,
     ) -> Result<IndexHead> {
-        let state_hash = cache.state_hash();
-        let entries = u64::from(cache.entry_count());
+        let dir = self.cache_dir();
+        let anchor = index_store::cache_anchor(dir.as_deref());
+        let (w, entries) = self
+            .chunk_index
+            .write_base_body(TableFileWriter::new_beside(&anchor)?)?;
+        let table = ChunkTable::install(w.finish()?, None, None)?;
         let obj = (entries > 0)
-            .then(|| index_store::pack_base(cache, self.crypto.as_ref()))
+            .then(|| index_store::pack_base_body(table.body(), self.crypto.as_ref()))
             .transpose()?;
         let generation = self.next_head_gen(prev)?;
-        let (sweep, record) = self.next_sweep(prev, generation)?;
+        let (sweep, record) = self.next_sweep(prev, generation, removes)?;
         let head = IndexHead {
             layout: HEAD_LAYOUT_VERSION,
             generation,
             features: Vec::new(),
-            state_hash,
-            entries,
             base: obj.as_ref().map(|obj| BaseRef {
                 name: obj.name,
                 size: obj.size(),
-                state_hash,
                 entries,
             }),
             segments: Vec::new(),
@@ -541,6 +577,15 @@ impl Repository {
             objects_deleted = gc.objects_deleted,
             "index folded into a new base"
         );
+        // The head is published: the new state becomes the repository's
+        // table. Replace the index before pruning, so the table it mapped
+        // until now is unmapped and can be deleted once it is old enough.
+        let table = match obj.as_ref() {
+            Some(obj) => table.publish(obj.name, dir.as_deref()),
+            None => ChunkTable::empty(),
+        };
+        self.chunk_index = LiveIndex::from_table(Arc::new(table));
+        index_store::prune_local_files(dir.as_deref(), &head);
         Ok(head)
     }
 
@@ -556,21 +601,13 @@ impl Repository {
             return Ok(());
         };
         let latest = if self.fold_policy.soft.reached(&head, 0, 0) {
-            let table = match self.local_table_at(&head) {
-                Some(table) => table,
-                None => {
-                    let synced = self.sync_index(Some(head.clone()), true)?;
-                    self.install_synced_index(synced);
-                    self.chunk_index
-                        .table()
-                        .cloned()
-                        .ok_or_else(|| VykarError::Other("BUG: no table after a sync".into()))?
-                }
-            };
-            // A fold writes the same state: the table stays the repository's.
-            let new_head = self.put_base(Some(&head), table.cache())?;
-            drop(table);
-            self.index_generation = generation_for_state(&new_head.state_hash);
+            if !self.index_at(&head) || self.chunk_index.is_modified() {
+                let synced = self.sync_index(Some(head.clone()), true)?;
+                self.install_synced_index(synced);
+            }
+            // A fold writes the same state as a base.
+            let new_head = self.put_base(Some(&head), false)?;
+            self.index_generation = new_head.generation;
             self.index_head = Some(new_head.clone());
             new_head
         } else {
@@ -594,15 +631,18 @@ impl Repository {
     }
 
     /// Load the chunk index for `check --repair`, accepting what other
-    /// commands refuse. A chain that cannot be
-    /// read is rebuilt from this machine's cache of the head's state when
-    /// there is one. Otherwise, when the chain is damaged (an object missing
-    /// or failing verification) or the head is missing or unreadable, the
-    /// index is rebuilt from the packs ([`index_rebuild`]): pack maps, then
-    /// trailers, then this machine's verified chunk tables. A storage or
-    /// local I/O error, an object of a newer vykar, a head of an unknown
-    /// layout or features, or a head of an unknown type is refused, never rebuilt
-    /// around. When the index is rebuilt, the head is dropped, so the
+    /// commands refuse. When the chain is damaged on storage (an object
+    /// missing or failing verification), the head's state is loaded from
+    /// this machine's copies of its objects (its local base table and
+    /// cached segments, each verified) when they cover it; the index is then
+    /// dirty and a fold is requested, so the repair's index write is a fresh
+    /// base and head naming only what it uploads. Otherwise a damaged chain,
+    /// or a missing or unreadable head, makes the index be rebuilt from the
+    /// packs ([`index_rebuild`]): pack maps, then trailers, then this
+    /// machine's verified chunk tables. A storage or local I/O error, an
+    /// object of a newer vykar, a head of an unknown layout or features, or
+    /// a head of an unknown type is refused, never repaired around, local
+    /// copies or not. When the index is rebuilt, the head is dropped, so the
     /// repair's index write is a fresh base. The rebuild only reads storage
     /// and writes a local temp file; `cancel` stops it.
     pub(crate) fn load_chunk_index_for_repair(
@@ -635,16 +675,23 @@ impl Repository {
                             }
                             Err(e) => e,
                         };
-                        if let Some(table) = self.local_table_at(&head) {
+                        let damaged = index_store::is_object_damage(&err);
+                        let local = (damaged && self.local_copies_cover(&head))
+                            .then(|| self.sync_index(Some(head.clone()), true).ok())
+                            .flatten();
+                        if let Some(synced) = local {
                             warn!(
-                                "the index chain cannot be read ({err}); rebuilding the index from \
-                             this machine's cache of its latest state"
+                                "the index chain is damaged on storage ({err}); using this \
+                                 machine's copies of its objects"
                             );
-                            (
-                                LiveIndex::from_table(table),
-                                RepairIndexLoad::read(IndexRecovery::Complete),
-                            )
-                        } else if index_store::is_object_damage(&err) {
+                            // Storage still holds the damaged chain: the
+                            // repair's index write is a fold, a fresh base
+                            // and a head that name only objects it uploads.
+                            self.install_synced_index(synced);
+                            self.index_dirty = true;
+                            self.request_index_fold();
+                            return Ok(RepairIndexLoad::read(IndexRecovery::Complete));
+                        } else if damaged {
                             warn!(
                                 "the index chain cannot be read ({err}); rebuilding the index from \
                              the packs"
@@ -653,6 +700,14 @@ impl Repository {
                         } else {
                             return Err(repair_load_refusal(err));
                         }
+                    }
+                    StoredHead::UnknownLayout(layout) if layout < HEAD_LAYOUT_VERSION => {
+                        return Err(VykarError::Other(format!(
+                            "unsupported index head layout {layout} (this version reads \
+                         {HEAD_LAYOUT_VERSION}); the index head was written by an older \
+                         development build of vykar, which this vykar cannot repair. Nothing \
+                         was changed. Recreate the repository"
+                        )));
                     }
                     StoredHead::UnknownLayout(layout) => {
                         return Err(VykarError::Other(format!(
@@ -699,9 +754,9 @@ impl Repository {
     }
 
     /// Rebuild the index from the packs ([`index_rebuild`]). The verified
-    /// chunk tables of this machine (the repository's own, if loaded, and
-    /// every table file in its cache dir) back packs that describe none of
-    /// their contents; they are opened only when such a pack exists.
+    /// base tables of this machine (the repository's own, if loaded, and
+    /// every `index_base.*` file in its cache dir) back packs that describe
+    /// none of their contents; they are opened only when such a pack exists.
     fn rebuild_for_repair(
         &self,
         cause: IndexLoss,
@@ -712,8 +767,8 @@ impl Repository {
         let local_tables = || {
             let mut tables: Vec<Arc<ChunkTable>> = own.into_iter().collect();
             if let Some(dir) = dir.as_deref() {
-                for (state, path) in table::list_tables(dir) {
-                    if tables.iter().any(|t| t.state().0 == state) {
+                for (name, path) in table::list_base_tables(dir) {
+                    if tables.iter().any(|t| t.base_name() == Some(name)) {
                         continue;
                     }
                     if let Some(t) = ChunkTable::open_file(&path) {
@@ -734,7 +789,7 @@ impl Repository {
             cancel,
         )
         .map_err(rebuild_refusal)?;
-        let index = scratch_index(rebuilt.cache)?;
+        let index = LiveIndex::from_table(Arc::new(ChunkTable::install(rebuilt.body, None, None)?));
         let load = RepairIndexLoad {
             recovery: IndexRecovery::RebuiltFromPacks {
                 cause,
@@ -752,11 +807,6 @@ fn stale_index_error() -> VykarError {
     VykarError::Other(
         "the index changed on storage after it was loaded; retry the operation".into(),
     )
-}
-
-/// `tmp` (a full cache in a temp file) as an index over a scratch table.
-fn scratch_index(tmp: TempPath) -> Result<LiveIndex> {
-    Ok(LiveIndex::from_table(Arc::new(ChunkTable::scratch(tmp)?)))
 }
 
 /// The error `check --repair` returns when reading the chain fails in a way

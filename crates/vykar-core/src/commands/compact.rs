@@ -16,8 +16,7 @@ use crate::repo::index_write::PendingSweep;
 use crate::repo::pack::PackWriter;
 use crate::repo::pack_listing::{ListedPack, list_packs};
 use crate::repo::pack_trailer::{
-    PackTrailer, TRAILER_FOOTER_LEN, TrailerPackType, framed_offsets, parse_footer,
-    trailer_blob_len, trailer_frame_start,
+    PackTrailer, TrailerPackType, framed_offsets, trailer_blob_len, trailer_frame_len,
 };
 use crate::repo::{Repository, TreeChunkSource};
 use vykar_crypto::CryptoEngine;
@@ -614,11 +613,11 @@ fn compact_packs(
     let mut written: HashSet<PackId> = HashSet::new();
 
     // Phase 1: Analyze live/dead space using the chunk index + pack sizes.
-    // The index does not record a pack's trailer, so a candidate's trailer
-    // frame is found from its 12-byte footer and counted as overhead, not as
-    // dead bytes: otherwise every repack of a small pack would leave a new
-    // trailer of the same relative size, and the next compact would repack
-    // it again.
+    // A pack's trailer frame (its `trailer_len` in the index) counts as
+    // overhead, not as dead bytes: otherwise every repack of a small pack
+    // would leave a new trailer of the same relative size, and the next
+    // compact would repack it again. A pack recorded without a trailer
+    // (`trailer_len` 0) whose bytes hold one is repacked at most once.
     //
     // Build a per-pack lookup from the chunk index, which the mark-and-sweep
     // before this has already swept: the swept entries' bytes count as dead,
@@ -632,6 +631,13 @@ fn compact_packs(
             entry.pack_offset,
         ));
     }
+    let trailer_lens: HashMap<PackId, u64> = per_pack_lookup
+        .keys()
+        .map(|p| {
+            let len = repo.chunk_index().pack_trailer_len(p).unwrap_or(0);
+            (*p, u64::from(len))
+        })
+        .collect();
 
     // Sweep upload debris once, from the root, before listing shards. Temp
     // files younger than this may belong to a live upload.
@@ -690,18 +696,22 @@ fn compact_packs(
                 .map(|(_, stored_size, _)| 4 + *stored_size as u64)
                 .sum();
 
-            // Sanity check: live bytes can't exceed pack payload.
-            if pack_size < pack_header_size || live_bytes > pack_size - pack_header_size {
+            let trailer = trailer_lens.get(pack_id).copied().unwrap_or(0);
+            // Sanity check: live bytes and the trailer can't exceed the
+            // pack payload.
+            if pack_size < pack_header_size
+                || live_bytes.saturating_add(trailer) > pack_size - pack_header_size
+            {
                 warn!(
-                    "Pack {} has inconsistent size (pack_size={}, live_bytes={}, header={}), marking corrupt",
-                    pack_id, pack_size, live_bytes, pack_header_size
+                    "Pack {} has inconsistent size (pack_size={}, live_bytes={}, header={}, trailer={}), marking corrupt",
+                    pack_id, pack_size, live_bytes, pack_header_size, trailer
                 );
                 packs_corrupt.fetch_add(1, Ordering::Relaxed);
                 return;
             }
 
             let payload = pack_size - pack_header_size;
-            let mut dead_bytes = payload - live_bytes;
+            let dead_bytes = payload - live_bytes - trailer;
 
             blobs_live.fetch_add(entries.len() as u64, Ordering::Relaxed);
 
@@ -710,10 +720,6 @@ fn compact_packs(
             }
 
             if unused_percent(dead_bytes, payload) >= threshold {
-                dead_bytes -= trailer_overhead(storage, key, pack_size, dead_bytes);
-                if dead_bytes == 0 || unused_percent(dead_bytes, payload) < threshold {
-                    return;
-                }
                 let mut live_entries: Vec<LiveEntry> = entries
                     .iter()
                     .map(|(chunk_id, stored_size, pack_offset)| LiveEntry {
@@ -932,6 +938,9 @@ fn compact_packs(
         let (new_pack_id, new_entries) =
             writer.flush(repo.storage.as_ref(), repo.crypto.as_ref())?;
         written.insert(new_pack_id);
+        let trailer_len = trailer_frame_len(new_entries.len(), repo.crypto.is_encrypting());
+        repo.chunk_index_mut()
+            .set_pack_trailer(new_pack_id, trailer_len);
 
         for (chunk_id, stored_size, offset, _refcount) in &new_entries {
             repo.chunk_index_mut()
@@ -993,40 +1002,6 @@ fn unused_percent(dead_bytes: u64, payload: u64) -> f64 {
     } else {
         0.0
     }
-}
-
-/// Bytes of the trailer frame of the pack at `key`, from its last 12 bytes,
-/// when they are a trailer footer whose frame fits inside `dead_bytes` and
-/// after the header. 0 otherwise, also on a failed read: the trailer then
-/// counts as dead, which only makes the pack more likely to be repacked.
-fn trailer_overhead(
-    storage: &dyn StorageBackend,
-    key: &str,
-    pack_size: u64,
-    dead_bytes: u64,
-) -> u64 {
-    let Some(start) = pack_size.checked_sub(TRAILER_FOOTER_LEN as u64) else {
-        return 0;
-    };
-    let footer = match storage.get_range(key, start, TRAILER_FOOTER_LEN as u64) {
-        Ok(Some(footer)) => footer,
-        Ok(None) => return 0,
-        Err(e) => {
-            tracing::debug!("compact: reading the trailer footer of {key} failed: {e}");
-            return 0;
-        }
-    };
-    let Some(len) = parse_footer(&footer) else {
-        return 0;
-    };
-    let frame = 4 + u64::from(len);
-    if footer.len() != TRAILER_FOOTER_LEN
-        || frame > dead_bytes
-        || trailer_frame_start(pack_size, len).is_none()
-    {
-        return 0;
-    }
-    frame
 }
 
 fn select_analyses_by_cap(
@@ -1288,6 +1263,10 @@ fn apply_repack_result(
         )));
     }
 
+    // The operation carried the trailer of its live blobs.
+    let trailer_len = trailer_frame_len(analysis.live_entries.len(), repo.crypto.is_encrypting());
+    repo.chunk_index_mut()
+        .set_pack_trailer(new_pack_id, trailer_len);
     for (entry, new_offset) in analysis.live_entries.iter().zip(result.new_offsets.iter()) {
         repo.chunk_index_mut().update_location(
             &entry.chunk_id,

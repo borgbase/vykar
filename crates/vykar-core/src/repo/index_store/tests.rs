@@ -1,11 +1,10 @@
 use std::sync::{Arc, Mutex};
 
 use super::*;
-use crate::index::dedup_cache::build_full_index_cache_to_path;
-use crate::index::head::{HEAD_LAYOUT_VERSION, SegmentKind, SweepState, empty_state_hash};
-use crate::index::segment::diff_to_temp;
+use crate::index::head::{HEAD_LAYOUT_VERSION, SegmentKind, SweepState};
+use crate::index::segment_v2::{Location, SegmentBody};
 use crate::index::table::{self, ChunkTable};
-use crate::index::{ChunkIndex, ChunkIndexEntry};
+use crate::index::{ChunkIndex, ChunkIndexEntry, LiveIndex};
 use crate::repo::{EncryptionMode, RepoFormat};
 use crate::testutil::MemoryBackend;
 use vykar_crypto::PlaintextEngine;
@@ -14,6 +13,8 @@ use vykar_storage::{InnerBackend, delegate_storage_backend};
 use vykar_types::chunk_id::{ChunkHasher, ChunkId};
 use vykar_types::hash::HashAlgorithm;
 use vykar_types::pack_id::PackId;
+
+use super::super::format::pack_object_with_context;
 
 /// Logs every `get` key in call order.
 struct GetLog {
@@ -59,7 +60,7 @@ fn plaintext() -> Arc<dyn CryptoEngine> {
 
 fn encrypted() -> Arc<dyn CryptoEngine> {
     let key = MasterKey::generate().unwrap();
-    crate::repo::key::build_engine(&EncryptionMode::Aes256Gcm, RepoFormat::V6, &key).unwrap()
+    crate::repo::key::build_engine(&EncryptionMode::Aes256Gcm, RepoFormat::CURRENT, &key).unwrap()
 }
 
 fn id(n: u32) -> ChunkId {
@@ -84,60 +85,97 @@ pub(crate) fn index_with(range: std::ops::Range<u32>, extra_refs: u32) -> ChunkI
     index
 }
 
+/// The entries of an index, sorted, refcounts read as 1 (refcounts are not
+/// persisted; every loaded entry has refcount 1).
 pub(crate) fn entries(index: &impl crate::testutil::EntryIter) -> Vec<(ChunkId, ChunkIndexEntry)> {
-    index.entry_vec()
+    index
+        .entry_vec()
+        .into_iter()
+        .map(|(id, e)| (id, ChunkIndexEntry { refcount: 1, ..e }))
+        .collect()
 }
 
-/// A minimal writer for the segmented layout, the way the write path will
-/// use it: segments by diffing against its own full cache, and folds that
-/// delete the previous fold's retired objects before writing the new base.
+/// The keyed segment that turns `prev` into `next` (every pack at
+/// `trailer_len` 0).
+pub(crate) fn keyed_diff(prev: &ChunkIndex, next: &ChunkIndex, kind: SegmentKind) -> SegmentBody {
+    let loc = |e: &ChunkIndexEntry| Location {
+        pack_id: e.pack_id,
+        pack_offset: e.pack_offset,
+        stored_size: e.stored_size,
+    };
+    let mut seg = SegmentBody::empty(kind);
+    for (id, e) in next.iter() {
+        match prev.get(id) {
+            None => seg.additions.push((*id, loc(e))),
+            Some(p) if loc(p) != loc(e) => seg.relocations.push((*id, loc(e))),
+            Some(_) => {}
+        }
+    }
+    for (id, _) in prev.iter() {
+        if !next.contains(id) {
+            seg.removals.push(*id);
+        }
+    }
+    seg.additions
+        .sort_unstable_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+    seg.removals
+        .sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    seg.relocations
+        .sort_unstable_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+    let mut packs: Vec<PackId> = seg
+        .additions
+        .iter()
+        .chain(seg.relocations.iter())
+        .map(|(_, l)| l.pack_id)
+        .collect();
+    packs.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    packs.dedup();
+    seg.pack_trailers = packs.into_iter().map(|p| (p, 0)).collect();
+    seg
+}
+
+/// A minimal writer for the v6 index, the way the write path uses it:
+/// keyed segments of the change from its own state, and folds that delete
+/// the previous fold's retired objects before writing the new base.
 pub(crate) struct Writer {
     storage: Arc<dyn StorageBackend>,
     crypto: Arc<dyn CryptoEngine>,
-    dir: tempfile::TempDir,
+    current: ChunkIndex,
     pub(crate) head: IndexHead,
 }
 
 impl Writer {
     pub(crate) fn new(storage: Arc<dyn StorageBackend>, crypto: Arc<dyn CryptoEngine>) -> Self {
-        let dir = tempfile::tempdir().unwrap();
-        build_full_index_cache_to_path(&ChunkIndex::new(), 1, &dir.path().join("cache")).unwrap();
         let w = Self {
             storage,
             crypto,
-            dir,
+            current: ChunkIndex::new(),
             head: IndexHead::initial(),
         };
         w.put_head();
         w
     }
 
-    fn cache_path(&self) -> PathBuf {
-        self.dir.path().join("cache")
-    }
-
     fn put_head(&self) {
         put_head(self.storage.as_ref(), &self.head, self.crypto.as_ref()).unwrap();
     }
 
-    /// Write `next` as a segment and publish the head.
+    /// Write the change to `next` as a segment and publish the head (a
+    /// head-only write when nothing changed).
     pub(crate) fn commit(&mut self, next: &ChunkIndex) {
-        let prev = MmapFullIndexCache::open_verified(&self.cache_path()).unwrap();
-        let (diff, tmp) = diff_to_temp(&prev, next, &self.cache_path()).unwrap();
-        drop(prev);
-        tmp.persist(self.cache_path()).unwrap();
-        let obj = pack_segment(&diff.segment, self.crypto.as_ref()).unwrap();
-        self.storage.put(&obj.key(), &obj.bytes).unwrap();
+        let seg = keyed_diff(&self.current, next, SegmentKind::Maintenance);
         self.head = self.head.successor();
-        self.head.segments.push(SegmentRef {
-            name: obj.name,
-            size: obj.size(),
-            kind: SegmentKind::Maintenance,
-            state_hash_after: diff.state_hash_after,
-            entries_after: diff.entries_after,
-        });
-        self.head.state_hash = diff.state_hash_after;
-        self.head.entries = diff.entries_after;
+        if !seg.is_empty() {
+            let obj = pack_segment_v2(&seg, self.crypto.as_ref()).unwrap();
+            self.storage.put(&obj.key(), &obj.bytes).unwrap();
+            self.head.segments.push(SegmentRef {
+                name: obj.name,
+                size: obj.size(),
+                kind: SegmentKind::Maintenance,
+                entries: seg.entries(),
+            });
+        }
+        self.current = next.clone();
         self.put_head();
     }
 
@@ -146,16 +184,19 @@ impl Writer {
         for name in self.head.retired.drain(..) {
             self.storage.delete(&object_key(&name)).unwrap();
         }
-        let cache = MmapFullIndexCache::open_verified(&self.cache_path()).unwrap();
-        let obj = pack_base(&cache, self.crypto.as_ref()).unwrap();
-        self.storage.put(&obj.key(), &obj.bytes).unwrap();
+        let anchor = cache_anchor(None);
+        let (body, entries) = table::base_body_from_chunk_index(&self.current, &anchor).unwrap();
+        let table = ChunkTable::install(body, None, None).unwrap();
         self.head = self.head.successor();
         self.head.retired = self.head.live_objects().collect();
-        self.head.base = Some(BaseRef {
-            name: obj.name,
-            size: obj.size(),
-            state_hash: cache.state_hash(),
-            entries: u64::from(cache.entry_count()),
+        self.head.base = (entries > 0).then(|| {
+            let obj = pack_base_body(table.body(), self.crypto.as_ref()).unwrap();
+            self.storage.put(&obj.key(), &obj.bytes).unwrap();
+            BaseRef {
+                name: obj.name,
+                size: obj.size(),
+                entries,
+            }
         });
         self.head.segments.clear();
         self.put_head();
@@ -167,10 +208,10 @@ fn sync(
     crypto: &dyn CryptoEngine,
     head: IndexHead,
     dir: Option<&Path>,
-    live: Option<Arc<ChunkTable>>,
+    live: Option<&LiveIndex>,
     use_local: bool,
 ) -> Result<SyncedIndex> {
-    sync_full_cache(
+    sync_index(
         storage,
         crypto,
         head,
@@ -183,30 +224,19 @@ fn sync(
     )
 }
 
-/// The full cache file `src` copied into `dir` as the table of its state.
-fn place_table(dir: &Path, src: &Path) -> PathBuf {
-    let state = MmapFullIndexCache::open_verified(src).unwrap().state_hash();
-    let path = table::table_path(dir, &state);
-    std::fs::copy(src, &path).unwrap();
-    path
-}
-
-/// `index` written into `dir` as the table of its state.
-fn write_table(dir: &Path, index: &ChunkIndex) -> PathBuf {
-    let src = dir.join("source");
-    build_full_index_cache_to_path(index, 1, &src).unwrap();
-    let path = place_table(dir, &src);
-    std::fs::remove_file(src).unwrap();
-    path
-}
-
-/// The states of the table files in `dir`, sorted.
-fn table_states(dir: &Path) -> Vec<StateHash> {
-    let mut v: Vec<StateHash> = table::list_tables(dir)
-        .into_iter()
-        .map(|(s, _)| s)
-        .collect();
-    v.sort_unstable();
+/// The local index files in `dir`, sorted by name.
+fn local_files(dir: &Path) -> Vec<String> {
+    let mut v: Vec<String> = std::fs::read_dir(dir)
+        .map(|r| {
+            r.flatten()
+                .filter_map(|e| e.file_name().to_str().map(str::to_string))
+                .filter(|n| {
+                    n.starts_with(table::BASE_PREFIX) || n.starts_with(table::SEGMENT_PREFIX)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    v.sort();
     v
 }
 
@@ -341,17 +371,18 @@ fn a_head_vanishing_after_the_listing_is_retried() {
     ));
 }
 
-/// Cold download, then catch-up from a local cache at an earlier state,
-/// then nothing to do.
+/// SYNC-1 and SYNC-2: a cold sync downloads the base once and the segment
+/// once and keeps both locally; a second sync reads no `index.d/` object;
+/// after three more commits a sync from the live index fetches only the
+/// three new segments.
 #[test]
-fn sync_downloads_catches_up_and_reuses() {
+fn sync_downloads_once_then_reads_local_files() {
     for crypto in [plaintext(), encrypted()] {
         let mem: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
         let log = GetLog::new(Arc::clone(&mem));
         let mut w = Writer::new(Arc::clone(&mem), Arc::clone(&crypto));
         let s1 = index_with(0..300, 0);
         let s2 = index_with(100..400, 1);
-        let s3 = index_with(150..420, 2);
         w.commit(&s1);
         w.fold();
         w.commit(&s2);
@@ -369,16 +400,17 @@ fn sync_downloads_catches_up_and_reuses() {
         )
         .unwrap();
         assert_eq!(synced.source, SyncSource::Downloaded { segments: 1 });
+        let base = w.head.base.as_ref().unwrap().name;
         assert_eq!(
-            synced.table.file_path(),
-            Some(table::table_path(&path, &w.head.state_hash).as_path()),
-            "published under its state"
+            synced.index.table().unwrap().file_path(),
+            Some(table::base_table_path(&path, &base).as_path()),
+            "published under its base's name"
         );
-        assert_eq!(entries(&*synced.table), entries(&s2));
+        assert!(table::segment_cache_path(&path, &w.head.segments[0].name).exists());
+        assert_eq!(entries(&synced.index), entries(&s2));
         assert_eq!(index_d_gets(&log.take()), 2, "base and one segment");
         drop(synced);
 
-        w.commit(&s3);
         let synced = sync(
             &log,
             crypto.as_ref(),
@@ -389,16 +421,35 @@ fn sync_downloads_catches_up_and_reuses() {
         )
         .unwrap();
         assert_eq!(synced.source, SyncSource::CaughtUp { segments: 1 });
-        assert_eq!(entries(&*synced.table), entries(&s3));
-        assert_eq!(index_d_gets(&log.take()), 1, "only the new segment");
-        drop(synced);
+        assert_eq!(entries(&synced.index), entries(&s2));
+        assert_eq!(index_d_gets(&log.take()), 0, "base and segment are local");
+
+        let live = synced.index;
+        let (mut last, mut k) = (s2, 2);
+        for _ in 0..3 {
+            last = index_with(100 + 10 * k..400 + 10 * k, 0);
+            w.commit(&last);
+            k += 1;
+        }
+        let synced = sync(
+            &log,
+            crypto.as_ref(),
+            w.head.clone(),
+            Some(&path),
+            Some(&live),
+            true,
+        )
+        .unwrap();
+        assert_eq!(synced.source, SyncSource::CaughtUp { segments: 3 });
+        assert_eq!(entries(&synced.index), entries(&last));
+        assert_eq!(index_d_gets(&log.take()), 3, "only the new segments");
 
         let synced = sync(
             &log,
             crypto.as_ref(),
             w.head.clone(),
             Some(&path),
-            None,
+            Some(&synced.index),
             true,
         )
         .unwrap();
@@ -407,50 +458,52 @@ fn sync_downloads_catches_up_and_reuses() {
     }
 }
 
-/// A local cache at the base state applies every segment in one pass.
+/// A head without a base: the segments over the empty table.
 #[test]
-fn sync_from_base_state_applies_the_whole_chain() {
+fn sync_of_segments_without_a_base() {
     let crypto = plaintext();
     let mem: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
     let mut w = Writer::new(Arc::clone(&mem), Arc::clone(&crypto));
-    w.commit(&index_with(0..50, 0));
-    w.fold();
-    let cache_dir = tempfile::tempdir().unwrap();
-    let path = cache_dir.path().to_path_buf();
-    place_table(&path, &w.cache_path());
     let last = index_with(20..90, 3);
     w.commit(&index_with(10..60, 1));
     w.commit(&index_with(15..80, 2));
     w.commit(&last);
-
+    assert!(w.head.base.is_none());
     let synced = sync(
         mem.as_ref(),
         crypto.as_ref(),
         w.head.clone(),
-        Some(&path),
+        None,
         None,
         true,
     )
     .unwrap();
     assert_eq!(synced.source, SyncSource::CaughtUp { segments: 3 });
-    assert_eq!(entries(&*synced.table), entries(&last));
+    assert_eq!(entries(&synced.index), entries(&last));
 }
 
-/// Tables at states outside the chain are not used, nor is a file whose
-/// name is a state of the chain but whose content is another state.
+/// A valid table file under the head's base name with another entry count
+/// is not used: the base is downloaded.
 #[test]
-fn local_start_ignores_tables_outside_the_chain() {
+fn a_local_table_with_another_entry_count_is_not_used() {
     let crypto = plaintext();
     let mem: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
     let mut w = Writer::new(Arc::clone(&mem), Arc::clone(&crypto));
-    let base_state = w.head.state_hash;
     let s1 = index_with(0..30, 0);
     w.commit(&s1);
+    w.fold();
     let cache_dir = tempfile::tempdir().unwrap();
     let path = cache_dir.path().to_path_buf();
-    let unrelated = write_table(&path, &index_with(500..510, 0));
-    // The chain's base state (the empty index) named over other content.
-    std::fs::copy(&unrelated, table::table_path(&path, &base_state)).unwrap();
+    let other = crate::testutil::base_table_of(&index_with(500..510, 0));
+    let mut tw = TableFileWriter::new_beside(&table::table_anchor(&path)).unwrap();
+    std::io::Write::write_all(&mut tw, other.body()).unwrap();
+    tw.finish()
+        .unwrap()
+        .persist(table::base_table_path(
+            &path,
+            &w.head.base.as_ref().unwrap().name,
+        ))
+        .unwrap();
 
     let synced = sync(
         mem.as_ref(),
@@ -461,11 +514,11 @@ fn local_start_ignores_tables_outside_the_chain() {
         true,
     )
     .unwrap();
-    assert_eq!(synced.source, SyncSource::Downloaded { segments: 1 });
-    assert_eq!(entries(&*synced.table), entries(&s1));
+    assert_eq!(synced.source, SyncSource::Downloaded { segments: 0 });
+    assert_eq!(entries(&synced.index), entries(&s1));
 }
 
-/// An empty base (`base: None`) with no segments is the empty index.
+/// An empty head is the empty index.
 #[test]
 fn sync_of_the_empty_head() {
     let crypto = plaintext();
@@ -479,16 +532,13 @@ fn sync_of_the_empty_head() {
         true,
     )
     .unwrap();
-    assert_eq!(synced.table.len(), 0);
-    assert_eq!(synced.table.state().0, empty_state_hash());
-    assert!(
-        synced.table.file_path().is_none(),
-        "no cache dir: a temp file"
-    );
+    assert_eq!(synced.index.len(), 0);
+    assert!(synced.index.is_loaded());
+    assert!(synced.index.table().unwrap().file_path().is_none());
 }
 
-/// Without a cache dir the result is a temp file, reused by the next sync
-/// of the same run as the live table.
+/// Without a cache dir the base is a temp file, reused by the next sync of
+/// the same run through the live index.
 #[test]
 fn sync_without_cache_dir_keeps_a_scratch_file() {
     let crypto = plaintext();
@@ -496,9 +546,13 @@ fn sync_without_cache_dir_keeps_a_scratch_file() {
     let log = GetLog::new(Arc::clone(&mem));
     let mut w = Writer::new(Arc::clone(&mem), Arc::clone(&crypto));
     w.commit(&index_with(0..40, 0));
+    w.fold();
     let synced = sync(&log, crypto.as_ref(), w.head.clone(), None, None, true).unwrap();
-    assert!(synced.table.file_path().is_none(), "temp table");
-    let live = synced.table;
+    assert!(
+        synced.index.table().unwrap().file_path().is_none(),
+        "temp table"
+    );
+    let live = synced.index;
     log.take();
 
     let s2 = index_with(5..45, 1);
@@ -508,18 +562,19 @@ fn sync_without_cache_dir_keeps_a_scratch_file() {
         crypto.as_ref(),
         w.head.clone(),
         None,
-        Some(live),
+        Some(&live),
         true,
     )
     .unwrap();
     assert_eq!(synced.source, SyncSource::CaughtUp { segments: 1 });
-    assert_eq!(entries(&*synced.table), entries(&s2));
+    assert_eq!(entries(&synced.index), entries(&s2));
     assert_eq!(index_d_gets(&log.take()), 1);
 }
 
-/// `use_local: false` downloads everything and leaves the local cache alone.
+/// SYNC-3: `use_local: false` downloads everything, reads no local file and
+/// writes none.
 #[test]
-fn sync_without_local_caches_verifies_the_whole_chain() {
+fn sync_without_local_files_verifies_every_object() {
     let crypto = plaintext();
     let mem: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
     let log = GetLog::new(Arc::clone(&mem));
@@ -529,24 +584,31 @@ fn sync_without_local_caches_verifies_the_whole_chain() {
     w.commit(&index_with(0..60, 0));
     let cache_dir = tempfile::tempdir().unwrap();
     let path = cache_dir.path().to_path_buf();
-    let local = place_table(&path, &w.cache_path());
-    let before = std::fs::read(&local).unwrap();
-    let live = Arc::new(ChunkTable::open_file(&local).unwrap());
+    let warm = sync(
+        mem.as_ref(),
+        crypto.as_ref(),
+        w.head.clone(),
+        Some(&path),
+        None,
+        true,
+    )
+    .unwrap();
+    let before = local_files(&path);
+    assert_eq!(before.len(), 2, "{before:?}");
 
     let synced = sync(
         &log,
         crypto.as_ref(),
         w.head.clone(),
         Some(&path),
-        Some(live),
+        Some(&warm.index),
         false,
     )
     .unwrap();
     assert_eq!(synced.source, SyncSource::Downloaded { segments: 1 });
-    assert!(synced.table.file_path().is_none());
+    assert!(synced.index.table().unwrap().file_path().is_none());
     assert_eq!(index_d_gets(&log.take()), 2);
-    assert_eq!(std::fs::read(&local).unwrap(), before);
-    assert_eq!(table_states(&path), vec![w.head.state_hash]);
+    assert_eq!(local_files(&path), before);
 }
 
 /// A modified object, or a valid object under another object's name, fails
@@ -593,19 +655,77 @@ fn tampered_or_swapped_objects_fail_the_name_check() {
     }
 }
 
-/// A head whose recorded state disagrees with what its objects produce is
-/// rejected even when every object is intact.
+/// A head whose recorded entry counts disagree with its objects is
+/// rejected even when every object is intact, and nothing is published.
 #[test]
-fn wrong_recorded_state_is_rejected() {
+fn wrong_recorded_entry_counts_are_rejected() {
     let crypto = plaintext();
     let mem: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
     let mut w = Writer::new(Arc::clone(&mem), Arc::clone(&crypto));
     w.commit(&index_with(0..40, 0));
     w.fold();
+    w.commit(&index_with(0..50, 0));
+    let cache_dir = tempfile::tempdir().unwrap();
+    let path = cache_dir.path().to_path_buf();
+
     let mut head = w.head.clone();
-    head.base.as_mut().unwrap().state_hash = [9; 32];
-    head.state_hash = [9; 32];
-    assert!(sync(mem.as_ref(), crypto.as_ref(), head, None, None, true).is_err());
+    head.base.as_mut().unwrap().entries += 1;
+    let err = sync(mem.as_ref(), crypto.as_ref(), head, Some(&path), None, true)
+        .err()
+        .expect("wrong base entries")
+        .to_string();
+    assert!(err.contains("entries"), "{err}");
+    assert!(local_files(&path).is_empty(), "nothing published");
+
+    let mut head = w.head.clone();
+    head.segments[0].entries += 1;
+    let err = sync(mem.as_ref(), crypto.as_ref(), head, None, None, true)
+        .err()
+        .expect("wrong segment entries")
+        .to_string();
+    assert!(err.contains("not the segment its head names"), "{err}");
+}
+
+/// SYNC-5: a cached segment file with flipped bytes is ignored, deleted and
+/// fetched again; the file is valid afterwards.
+#[test]
+fn a_damaged_cached_segment_is_fetched_again() {
+    let crypto = plaintext();
+    let mem: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+    let log = GetLog::new(Arc::clone(&mem));
+    let mut w = Writer::new(Arc::clone(&mem), Arc::clone(&crypto));
+    let s1 = index_with(0..60, 0);
+    w.commit(&s1);
+    let cache_dir = tempfile::tempdir().unwrap();
+    let path = cache_dir.path().to_path_buf();
+    drop(
+        sync(
+            mem.as_ref(),
+            crypto.as_ref(),
+            w.head.clone(),
+            Some(&path),
+            None,
+            true,
+        )
+        .unwrap(),
+    );
+    let file = table::segment_cache_path(&path, &w.head.segments[0].name);
+    let mut bytes = std::fs::read(&file).unwrap();
+    *bytes.last_mut().unwrap() ^= 1;
+    std::fs::write(&file, &bytes).unwrap();
+
+    let synced = sync(
+        &log,
+        crypto.as_ref(),
+        w.head.clone(),
+        Some(&path),
+        None,
+        true,
+    )
+    .unwrap();
+    assert_eq!(entries(&synced.index), entries(&s1));
+    assert_eq!(index_d_gets(&log.take()), 1);
+    assert!(table::read_cached_segment(&path, &w.head.segments[0]).is_some());
 }
 
 /// A reader holding a pre-fold head completes after one fold (its objects
@@ -639,7 +759,7 @@ fn reader_on_a_retired_head_survives_one_fold_and_recovers_after_two() {
     let old_base = object_key(&old_head.base.as_ref().unwrap().name);
     let synced = sync(&log, crypto.as_ref(), old_head, None, None, true).unwrap();
     assert_eq!(synced.head, w.head, "re-read the head");
-    assert_eq!(entries(&*synced.table), entries(&latest));
+    assert_eq!(entries(&synced.index), entries(&latest));
     let gets = log.take();
     assert_eq!(head_gets(&gets), 1);
     assert!(
@@ -1057,12 +1177,9 @@ fn gc_head(generation: u64) -> IndexHead {
         layout: HEAD_LAYOUT_VERSION,
         generation,
         features: Vec::new(),
-        state_hash: [b; 32],
-        entries: 1,
         base: Some(BaseRef {
             name: gc_name(b),
             size: 1,
-            state_hash: [b; 32],
             entries: 1,
         }),
         segments: vec![],
@@ -1317,38 +1434,38 @@ fn collect_index_garbage_with_nothing_to_delete_sends_no_request() {
     assert!(storage.deletes.lock().unwrap().is_empty());
 }
 
-/// STORE-8: a backup segment that changes existing entries is refused; the
-/// same segment labelled maintenance decodes.
+/// STORE-8: a backup segment that changes existing entries is refused; a
+/// segment whose kind differs from its head's is not the one it names.
 #[test]
-fn a_backup_segment_with_deltas_is_refused() {
+fn a_backup_segment_with_removals_is_refused() {
     let crypto = plaintext();
-    let seg = Segment {
-        prev_state_hash: [1; 32],
-        prev_entries: 3,
-        deltas: vec![crate::index::segment::RefcountDelta {
-            position: 0,
-            delta: -1,
-        }],
-        relocations: Vec::new(),
-        new_entries: Vec::new(),
-    };
-    let obj = pack_segment(&seg, crypto.as_ref()).unwrap();
-    let seg_ref = |kind| SegmentRef {
-        name: obj.name,
-        size: obj.size(),
-        kind,
-        state_hash_after: [2; 32],
-        entries_after: 3,
-    };
-    let err = decode_segment(&seg_ref(SegmentKind::Backup), &obj.bytes, crypto.as_ref())
-        .unwrap_err()
-        .to_string();
+    let mut seg = keyed_diff(
+        &index_with(0..3, 0),
+        &index_with(1..4, 0),
+        SegmentKind::Maintenance,
+    );
+    assert_eq!((seg.removals.len(), seg.additions.len()), (1, 1));
+    let mut body = seg.encode().unwrap();
+    body[1] = u8::from(SegmentKind::Backup);
+    let err = SegmentBody::decode(&body, 10).unwrap_err().to_string();
     assert!(
         err.contains("a backup segment changes existing entries"),
         "{err}"
     );
+
+    let obj = pack_segment_v2(&seg, crypto.as_ref()).unwrap();
+    let seg_ref = |kind| SegmentRef {
+        name: obj.name,
+        size: obj.size(),
+        kind,
+        entries: seg.entries(),
+    };
+    let err = decode_segment_v2(&seg_ref(SegmentKind::Backup), &obj.bytes, crypto.as_ref())
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("not the segment its head names"), "{err}");
     assert_eq!(
-        decode_segment(
+        decode_segment_v2(
             &seg_ref(SegmentKind::Maintenance),
             &obj.bytes,
             crypto.as_ref()
@@ -1356,6 +1473,8 @@ fn a_backup_segment_with_deltas_is_refused() {
         .unwrap(),
         seg
     );
+    seg.kind = SegmentKind::Backup;
+    assert!(seg.encode().is_err());
 }
 
 /// Sweep records round-trip through their storage encoding, checked
@@ -1391,59 +1510,17 @@ fn sweep_record_round_trips_through_storage() {
     }
 }
 
-/// A recorded head state that the objects do not produce is rejected before
-/// anything is installed: the cache dir keeps what it held. Covers both the
-/// segment branch and the base-only branch of the final state check.
-#[test]
-fn wrong_head_state_leaves_the_cache_dir_alone() {
-    let crypto = plaintext();
-    let mem: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
-    let mut w = Writer::new(Arc::clone(&mem), Arc::clone(&crypto));
-    w.commit(&index_with(0..40, 0));
-    w.fold();
-    let base_only = w.head.clone();
-    w.commit(&index_with(0..50, 1));
-    let with_segment = w.head.clone();
-
-    for mut head in [base_only, with_segment] {
-        head.state_hash = [9; 32];
-        let cache_dir = tempfile::tempdir().unwrap();
-        let path = cache_dir.path().to_path_buf();
-        let sync_err = || {
-            sync(
-                mem.as_ref(),
-                crypto.as_ref(),
-                head.clone(),
-                Some(&path),
-                None,
-                true,
-            )
-            .err()
-            .expect("wrong head state")
-            .to_string()
-        };
-
-        let err = sync_err();
-        assert!(err.contains("differs from the head"), "{err}");
-        assert!(table_states(&path).is_empty(), "nothing installed");
-
-        let other = write_table(&path, &index_with(500..510, 0));
-        let before = std::fs::read(&other).unwrap();
-        let err = sync_err();
-        assert!(err.contains("differs from the head"), "{err}");
-        assert_eq!(std::fs::read(&other).unwrap(), before, "table unchanged");
-        assert_eq!(table_states(&path).len(), 1);
-    }
-}
-
-/// Concurrent syncs into one cache dir: two readers on different heads and
-/// two on the same head. Every sync succeeds with its own head's state, and
-/// each state is published once (one file, never replaced while mapped).
+/// Concurrent syncs into one cache dir: readers on different heads over one
+/// base. Every sync succeeds with its own head's state; the base is
+/// published once and the segments once each.
 #[test]
 fn concurrent_syncs_over_one_cache_dir_succeed() {
     let crypto = plaintext();
     let mem: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
     let mut w = Writer::new(Arc::clone(&mem), Arc::clone(&crypto));
+    let s0 = index_with(0..200, 0);
+    w.commit(&s0);
+    w.fold();
     let s1 = index_with(0..300, 0);
     let s2 = index_with(100..400, 1);
     w.commit(&s1);
@@ -1468,18 +1545,16 @@ fn concurrent_syncs_over_one_cache_dir_succeed() {
                     )
                     .unwrap();
                     assert_eq!(synced.head, *head);
-                    assert_eq!(entries(&*synced.table), entries(want));
+                    assert_eq!(entries(&synced.index), entries(want));
                 }
             });
         }
     });
-    let mut want = vec![h1.state_hash, h2.state_hash];
-    want.sort_unstable();
-    assert_eq!(table_states(&path), want);
+    assert_eq!(local_files(&path).len(), 3, "one base, two segments");
 }
 
-/// A downloaded base with no segments to apply is the result as mapped, and
-/// is published in the cache dir while mapped.
+/// A downloaded base with no segments to apply is published in the cache
+/// dir while mapped.
 #[test]
 fn sync_downloads_a_base_without_segments_and_persists_it() {
     let crypto = plaintext();
@@ -1501,69 +1576,30 @@ fn sync_downloads_a_base_without_segments_and_persists_it() {
     )
     .unwrap();
     assert_eq!(synced.source, SyncSource::Downloaded { segments: 0 });
-    let file = table::table_path(&path, &w.head.state_hash);
-    assert_eq!(synced.table.file_path(), Some(file.as_path()));
-    let at_path = MmapFullIndexCache::open_verified(&file).expect("table in the cache dir");
+    let file = table::base_table_path(&path, &w.head.base.as_ref().unwrap().name);
     assert_eq!(
-        (at_path.state_hash(), u64::from(at_path.entry_count())),
-        (w.head.state_hash, w.head.entries)
+        synced.index.table().unwrap().file_path(),
+        Some(file.as_path())
     );
-    assert_eq!(entries(&*synced.table), entries(&s1));
+    let at_path = ChunkTable::open_file(&file).expect("table in the cache dir");
+    assert_eq!(at_path.len() as u64, w.head.base.as_ref().unwrap().entries);
+    assert_eq!(entries(&synced.index), entries(&s1));
 }
 
-/// A reader on an older head publishes its state beside the newer one
-/// instead of over it; a later sync to the newer head finds that table and
-/// downloads nothing.
+/// Garbage under the head's base name is replaced by the downloaded table,
+/// and the next sync finds it (a damaged table heals).
 #[test]
-fn a_late_reader_does_not_displace_the_newer_table() {
-    let crypto = plaintext();
-    let mem: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
-    let log = GetLog::new(Arc::clone(&mem));
-    let mut w = Writer::new(Arc::clone(&mem), Arc::clone(&crypto));
-    w.commit(&index_with(0..60, 0));
-    let h1 = w.head.clone();
-    let s2 = index_with(10..80, 1);
-    w.commit(&s2);
-    let h2 = w.head.clone();
-    let cache_dir = tempfile::tempdir().unwrap();
-    let path = cache_dir.path().to_path_buf();
-
-    let read = |head: &IndexHead| {
-        sync(
-            mem.as_ref(),
-            crypto.as_ref(),
-            head.clone(),
-            Some(&path),
-            None,
-            true,
-        )
-        .unwrap()
-    };
-    drop(read(&h2));
-    drop(read(&h1));
-    let mut want = vec![h1.state_hash, h2.state_hash];
-    want.sort_unstable();
-    assert_eq!(table_states(&path), want, "both states coexist");
-
-    let synced = sync(&log, crypto.as_ref(), h2, Some(&path), None, true).unwrap();
-    assert_eq!(synced.source, SyncSource::UpToDate);
-    assert_eq!(index_d_gets(&log.take()), 0);
-    assert_eq!(entries(&*synced.table), entries(&s2));
-}
-
-/// Garbage under the head's table name is replaced by the synced table, and
-/// the next sync finds it (R1: a damaged table under a state name heals).
-#[test]
-fn a_damaged_table_under_the_state_name_heals() {
+fn a_damaged_table_under_the_base_name_heals() {
     let crypto = plaintext();
     let mem: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
     let log = GetLog::new(Arc::clone(&mem));
     let mut w = Writer::new(Arc::clone(&mem), Arc::clone(&crypto));
     let s1 = index_with(0..60, 0);
     w.commit(&s1);
+    w.fold();
     let cache_dir = tempfile::tempdir().unwrap();
     let path = cache_dir.path().to_path_buf();
-    let file = table::table_path(&path, &w.head.state_hash);
+    let file = table::base_table_path(&path, &w.head.base.as_ref().unwrap().name);
     std::fs::write(&file, b"not a table").unwrap();
 
     let synced = sync(
@@ -1575,8 +1611,11 @@ fn a_damaged_table_under_the_state_name_heals() {
         true,
     )
     .unwrap();
-    assert_eq!(synced.source, SyncSource::Downloaded { segments: 1 });
-    assert_eq!(synced.table.file_path(), Some(file.as_path()));
+    assert_eq!(synced.source, SyncSource::Downloaded { segments: 0 });
+    assert_eq!(
+        synced.index.table().unwrap().file_path(),
+        Some(file.as_path())
+    );
     drop(synced);
     assert!(
         ChunkTable::open_file(&file).is_some(),
@@ -1595,7 +1634,69 @@ fn a_damaged_table_under_the_state_name_heals() {
     .unwrap();
     assert_eq!(synced.source, SyncSource::UpToDate);
     assert_eq!(index_d_gets(&log.take()), 0);
-    assert_eq!(entries(&*synced.table), entries(&s1));
+    assert_eq!(entries(&synced.index), entries(&s1));
+}
+
+/// After a sync that used the cache dir, local files the head does not name
+/// are pruned once old; young ones and the head's are kept.
+#[test]
+fn sync_prunes_old_local_files_the_head_does_not_name() {
+    let crypto = plaintext();
+    let mem: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+    let mut w = Writer::new(Arc::clone(&mem), Arc::clone(&crypto));
+    w.commit(&index_with(0..60, 0));
+    w.fold();
+    w.commit(&index_with(0..70, 0));
+    let cache_dir = tempfile::tempdir().unwrap();
+    let path = cache_dir.path().to_path_buf();
+    drop(
+        sync(
+            mem.as_ref(),
+            crypto.as_ref(),
+            w.head.clone(),
+            Some(&path),
+            None,
+            true,
+        )
+        .unwrap(),
+    );
+    let old_files = local_files(&path);
+    assert_eq!(old_files.len(), 2);
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 3600);
+    for f in &old_files {
+        std::fs::File::options()
+            .write(true)
+            .open(path.join(f))
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+    }
+    let legacy = path.join(format!("{}{}", table::LEGACY_TABLE_PREFIX, "ab".repeat(32)));
+    std::fs::File::create(&legacy)
+        .unwrap()
+        .set_modified(old)
+        .unwrap();
+
+    w.commit(&index_with(0..80, 0));
+    w.fold();
+    drop(
+        sync(
+            mem.as_ref(),
+            crypto.as_ref(),
+            w.head.clone(),
+            Some(&path),
+            None,
+            true,
+        )
+        .unwrap(),
+    );
+    let now = local_files(&path);
+    assert_eq!(now.len(), 1, "only the new base: {now:?}");
+    assert!(!old_files.iter().any(|f| now.contains(f)));
+    assert!(
+        !legacy.exists(),
+        "80-byte tables of earlier builds are pruned"
+    );
 }
 
 #[test]
@@ -1635,7 +1736,7 @@ fn classify_head_tells_damage_from_newer_heads() {
 
         let layout3 = pack_head(
             &IndexHead {
-                layout: 3,
+                layout: 4,
                 ..IndexHead::initial()
             },
             c,
@@ -1643,7 +1744,40 @@ fn classify_head_tells_damage_from_newer_heads() {
         .unwrap();
         assert!(matches!(
             classify_head(1, &layout3, c),
-            StoredHead::UnknownLayout(3)
+            StoredHead::UnknownLayout(4)
+        ));
+        // HEAD-8: a layout-2 head of 05 step 8 (v1 chain fields).
+        #[derive(serde::Serialize)]
+        struct Layout2 {
+            layout: u32,
+            #[serde(rename = "gen")]
+            generation: u64,
+            features: Vec<String>,
+            #[serde(with = "serde_bytes")]
+            state_hash: [u8; 32],
+            entries: u64,
+            base: Option<()>,
+            segments: Vec<()>,
+            retired: Vec<ObjectName>,
+            sweep: SweepState,
+        }
+        let layout2 = rmp_serde::to_vec_named(&Layout2 {
+            layout: 2,
+            generation: 1,
+            features: Vec::new(),
+            state_hash: *blake3::hash(b"").as_bytes(),
+            entries: 0,
+            base: None,
+            segments: Vec::new(),
+            retired: Vec::new(),
+            sweep: SweepState::default(),
+        })
+        .unwrap();
+        let layout2 =
+            pack_object_with_context(ObjectType::IndexHead, HEAD_CONTEXT, &layout2, c).unwrap();
+        assert!(matches!(
+            classify_head(1, &layout2, c),
+            StoredHead::UnknownLayout(2)
         ));
         // A positional (layout 1) body sealed under the new context.
         let positional =
@@ -1684,7 +1818,15 @@ fn classify_head_tells_damage_from_newer_heads() {
             .into_head()
             .unwrap_err()
             .to_string();
-        assert!(err.contains("unsupported index head layout 3"), "{err}");
+        assert!(err.contains("unsupported index head layout 4"), "{err}");
+        assert!(err.contains("newer vykar"), "{err}");
+        let err = classify_head(1, &layout2, c)
+            .into_head()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("older development build"), "{err}");
+        assert!(err.contains("recreate the repository"), "{err}");
+        assert!(!err.contains("newer vykar"), "{err}");
         assert!(matches!(
             classify_head(1, &unknown, c).into_head(),
             Err(VykarError::UnknownObjectType(200))
@@ -1692,61 +1834,55 @@ fn classify_head_tells_damage_from_newer_heads() {
     }
 }
 
-/// The full cache of `index_with(0..40, 0)`, in `dir`.
-fn base_cache(dir: &Path) -> MmapFullIndexCache {
-    let path = dir.join("cache");
-    build_full_index_cache_to_path(&index_with(0..40, 0), 1, &path).unwrap();
-    MmapFullIndexCache::open_verified(&path).unwrap()
+/// The base body of `index_with(0..40, 0)`.
+fn base_body() -> Vec<u8> {
+    crate::testutil::base_table_of(&index_with(0..40, 0))
+        .body()
+        .to_vec()
 }
 
-/// The zstd payload (codec tag included) of `cache`'s base.
-fn zstd_base_payload(cache: &MmapFullIndexCache) -> Vec<u8> {
+/// The zstd payload (codec tag included) of `body`.
+fn zstd_base_payload(body: &[u8]) -> Vec<u8> {
     let mut payload = Vec::new();
-    compress::compress_stream_zstd(&mut payload, 3, |w| base::encode_base(cache, w)).unwrap();
+    compress::compress_stream_zstd(&mut payload, 3, |w| {
+        std::io::Write::write_all(w, body)?;
+        Ok(())
+    })
+    .unwrap();
     payload
 }
 
 /// A named base object whose payload is `payload` (codec tag included), and its ref.
-fn base_object(
-    crypto: &dyn CryptoEngine,
-    payload: &[u8],
-    cache: &MmapFullIndexCache,
-) -> (BaseRef, Vec<u8>) {
+fn base_object(crypto: &dyn CryptoEngine, payload: &[u8], entries: u64) -> (BaseRef, Vec<u8>) {
     let bytes =
         pack_object_with_context(ObjectType::IndexBase, BASE_CONTEXT, payload, crypto).unwrap();
     let base_ref = BaseRef {
         name: ObjectName::of(&bytes),
         size: bytes.len() as u64,
-        state_hash: cache.state_hash(),
-        entries: u64::from(cache.entry_count()),
+        entries,
     };
     (base_ref, bytes)
 }
 
-/// Decode `payload` as a stored base in an empty dir; the error and whether
-/// the dir is still empty afterwards.
-fn decode_base_payload(
-    crypto: &dyn CryptoEngine,
-    payload: &[u8],
-    cache: &MmapFullIndexCache,
-) -> (Result<TempPath>, bool) {
+/// Decode `payload` as a stored base in an empty dir and install it; the
+/// error and whether the dir is still empty afterwards.
+fn decode_base_payload(crypto: &dyn CryptoEngine, payload: &[u8]) -> (Result<ChunkTable>, bool) {
     let dir = tempfile::tempdir().unwrap();
-    let (base_ref, bytes) = base_object(crypto, payload, cache);
-    let out = decode_base_to_temp(&base_ref, bytes, crypto, &dir.path().join("anchor"));
-    let empty = std::fs::read_dir(dir.path()).unwrap().next().is_none();
+    let (base_ref, bytes) = base_object(crypto, payload, 40);
+    let out = decode_base_v2_to_temp(&base_ref, bytes, crypto, &dir.path().join("anchor"))
+        .and_then(|tmp| ChunkTable::install(tmp, None, None));
+    let empty = out.is_ok() || std::fs::read_dir(dir.path()).unwrap().next().is_none();
     (out, empty)
 }
 
 #[test]
 fn base_with_a_truncated_zstd_frame_is_object_damage() {
-    let cache_dir = tempfile::tempdir().unwrap();
-    let cache = base_cache(cache_dir.path());
-    let payload = zstd_base_payload(&cache);
+    let payload = zstd_base_payload(&base_body());
     for crypto in [plaintext(), encrypted()] {
-        let (ok, _) = decode_base_payload(crypto.as_ref(), &payload, &cache);
-        ok.unwrap();
+        let (ok, _) = decode_base_payload(crypto.as_ref(), &payload);
+        assert_eq!(ok.unwrap().len(), 40);
         for cut in [payload.len() / 2, payload.len() - 1] {
-            let (out, empty) = decode_base_payload(crypto.as_ref(), &payload[..cut], &cache);
+            let (out, empty) = decode_base_payload(crypto.as_ref(), &payload[..cut]);
             let e = out.unwrap_err();
             assert!(is_object_damage(&e), "cut at {cut}: {e:?}");
             assert!(empty, "cut at {cut}: a temp file was left behind");
@@ -1756,14 +1892,32 @@ fn base_with_a_truncated_zstd_frame_is_object_damage() {
 
 #[test]
 fn base_with_bytes_after_its_zstd_frame_is_object_damage() {
-    let cache_dir = tempfile::tempdir().unwrap();
-    let cache = base_cache(cache_dir.path());
-    let mut payload = zstd_base_payload(&cache);
+    let mut payload = zstd_base_payload(&base_body());
     payload.push(0x00);
     for crypto in [plaintext(), encrypted()] {
-        let (out, empty) = decode_base_payload(crypto.as_ref(), &payload, &cache);
+        let (out, empty) = decode_base_payload(crypto.as_ref(), &payload);
         let e = out.unwrap_err();
         assert!(is_object_damage(&e), "{e:?}");
         assert!(empty, "a temp file was left behind");
     }
+}
+
+/// A v1 base body (version byte 1) is refused by version; a body longer
+/// than its head allows is damage.
+#[test]
+fn a_v1_or_oversized_base_body_is_refused() {
+    let crypto = plaintext();
+    let mut v1 = base_body();
+    v1[0] = 1;
+    let (out, _) = decode_base_payload(crypto.as_ref(), &zstd_base_payload(&v1));
+    assert!(
+        matches!(out, Err(VykarError::UnsupportedVersion(1))),
+        "{out:?}"
+    );
+
+    let (base_ref, bytes) = base_object(crypto.as_ref(), &zstd_base_payload(&base_body()), 2);
+    let dir = tempfile::tempdir().unwrap();
+    let e = decode_base_v2_to_temp(&base_ref, bytes, crypto.as_ref(), &dir.path().join("a"))
+        .unwrap_err();
+    assert!(is_object_damage(&e), "{e:?}");
 }

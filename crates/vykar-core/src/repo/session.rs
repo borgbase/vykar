@@ -4,8 +4,8 @@ use super::Repository;
 use super::journal_recovery::PendingIndexRecovery;
 use super::pack::{PackType, PackWriter, compute_data_pack_target, compute_tree_pack_target};
 use super::write_session::{
-    DEFAULT_SESSION_ID, RollbackTracker, WriteMetricsSnapshot, WriteSessionState, active,
-    active_mut,
+    DEFAULT_SESSION_ID, RollbackTracker, SessionView, WriteMetricsSnapshot, WriteSessionState,
+    active, active_mut,
 };
 use crate::index::IndexDelta;
 use crate::index::table::DedupPrefilter;
@@ -81,10 +81,12 @@ impl Repository {
     /// methods (`store_chunk`, `flush_packs`, etc.).
     ///
     /// Over an unedited index the session resolves existing chunks against
-    /// the repository's table as it is now, and records their bumps by table
-    /// position (see `CachedBumps`); backup workers get a prefilter over the
-    /// same table. Over an index with unsaved edits (repair) every lookup and
-    /// bump goes through the live index by key, and there is no prefilter.
+    /// the repository's index view as it is now (the table and the head's
+    /// segments applied over it), and records bumps of table chunks by table
+    /// position (see `CachedBumps`), of segment additions by key; backup
+    /// workers get a prefilter over the same view. Over an index with unsaved
+    /// edits (repair) every lookup and bump goes through the live index by
+    /// key, and there is no prefilter.
     ///
     /// Applies every field of `opts`.
     ///
@@ -111,13 +113,18 @@ impl Repository {
         ws.persisted_pack_count = num_packs;
         ws.session_id.clone_from(&opts.session_id);
         ws.stream_data_packs = opts.stream_data_packs;
-        ws.table = self
-            .chunk_index
-            .table()
-            .filter(|_| !self.chunk_index.is_modified())
-            .cloned();
-        ws.index_delta = Some(match &ws.table {
-            Some(table) => IndexDelta::with_cached_bumps(std::sync::Arc::clone(table)),
+        ws.view = self.chunk_index.view().map(|view| SessionView {
+            view,
+            state: self.chunk_index.state().clone(),
+            sweep_gen: self.index_head.as_ref().map_or(0, |h| h.sweep.generation),
+        });
+        // Without a head the view cannot be compared with the latest head
+        // at commit: the commit re-checks every reused chunk.
+        if self.index_head.is_none() {
+            ws.view = None;
+        }
+        ws.index_delta = Some(match &ws.view {
+            Some(v) => IndexDelta::with_cached_bumps(std::sync::Arc::clone(v.view.table())),
             None => IndexDelta::new(),
         });
         self.write_session = Some(ws);
@@ -179,11 +186,13 @@ impl Repository {
         self.write_session.as_ref().map(|ws| ws.metrics.snapshot())
     }
 
-    /// The worker-side prefilter over the session's table: `None` without a
-    /// write session, a table, or a filter (an empty table).
+    /// The worker-side prefilter over the session's view: `None` without a
+    /// write session or a view (an edited or unloaded index).
     pub(crate) fn dedup_prefilter(&self) -> Option<DedupPrefilter> {
         let ws = self.write_session.as_ref()?;
-        ws.table.as_ref().and_then(DedupPrefilter::new)
+        ws.view
+            .as_ref()
+            .map(|v| DedupPrefilter::new(v.view.clone()))
     }
 
     /// Check if a chunk exists: stored earlier in the active session, or in
@@ -390,13 +399,24 @@ impl Repository {
     /// loaded (for testing).
     pub(crate) fn set_session_table_for_test(&mut self, index: &crate::index::ChunkIndex) {
         use std::sync::Arc;
-        let anchor = super::index_store::cache_anchor(None);
-        let tmp = crate::index::dedup_cache::full_cache_from_index_to_temp(index, &anchor).unwrap();
-        let table = Arc::new(crate::index::ChunkTable::scratch(tmp).unwrap());
+        let table = crate::testutil::base_table_of(index);
         self.chunk_index = crate::index::LiveIndex::from_table(Arc::clone(&table));
+        let view = SessionView {
+            view: self
+                .chunk_index
+                .view()
+                .expect("an unedited index has a view"),
+            state: self.chunk_index.state().clone(),
+            sweep_gen: self.index_head.as_ref().map_or(0, |h| h.sweep.generation),
+        };
         let ws = self.ws_mut();
         ws.index_delta = Some(IndexDelta::with_cached_bumps(Arc::clone(&table)));
-        ws.table = Some(table);
+        ws.view = Some(view);
+    }
+
+    /// The active session's index delta (for testing).
+    pub(crate) fn write_session_delta_for_test(&self) -> &IndexDelta {
+        self.ws().index_delta.as_ref().unwrap()
     }
 
     /// Refcount bumps recorded in the index delta for `id`, by key or by
@@ -876,13 +896,16 @@ mod tests {
                 PackType::Data,
             )
             .unwrap();
+        // A fold, so that the chunk is in the table rather than in an
+        // applied segment.
+        repo.request_index_fold();
         repo.save_state().unwrap();
 
         repo.begin_write_session(&WriteSessionOptions::default())
             .unwrap();
         let prefilter = repo.dedup_prefilter().expect("prefilter over the table");
         assert!(Arc::ptr_eq(
-            prefilter.table(),
+            prefilter.view().table(),
             repo.chunk_index().table().unwrap()
         ));
         let (again, again_size, is_new) = repo

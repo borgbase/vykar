@@ -136,6 +136,13 @@ pub const fn trailer_blob_len(entries: usize, encrypting: bool) -> usize {
     TAG_BYTES + aead + BODY_HEADER_LEN + TRAILER_ENTRY_LEN * entries + TRAILER_FOOTER_LEN
 }
 
+/// Bytes of the trailer frame `PackWriter::seal` appends to a pack of
+/// `blobs` blobs (`4 + trailer_blob_len(blobs, encrypting)`): the
+/// `trailer_len` an index records for the pack.
+pub(crate) fn trailer_frame_len(blobs: usize, encrypting: bool) -> u32 {
+    (4 + trailer_blob_len(blobs, encrypting)) as u32
+}
+
 /// `4 + trailer_blob_len(entries, true)`: the frame a heap pack buffer
 /// reserves before the engine is known.
 pub const fn trailer_frame_len_upper(entries: usize) -> usize {

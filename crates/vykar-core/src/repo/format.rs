@@ -21,7 +21,7 @@ pub enum ObjectType {
     FileCache = 6,
     PendingIndex = 7,
     SnapshotCache = 8,
-    /// Index head at `index.h/<gen>` (formats v6/v7; v4/v5 kept it at `index`).
+    /// Index head at `index.h/<gen>` (format v6; v4/v5 kept it at `index`).
     IndexHead = 9,
     /// Segmented index base under `index.d/`.
     IndexBase = 10,

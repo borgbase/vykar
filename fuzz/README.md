@@ -21,11 +21,13 @@ Coverage-guided fuzz tests for vykar's parser, deserializer, and decrypt paths. 
 | `fuzz_unpack_object` | AEAD envelope parse + decrypt (legacy and context-bound paths, chunk/index/head/base/segment types, in-place variant) |
 | `fuzz_index_segment` | Index segment decode (`Segment::decode`), checked to re-encode identically |
 | `fuzz_index_head` | Index head decode (`IndexHead::decode`), checked to round-trip |
+| `fuzz_index_base_v2` | Index base body version 2 (`validate_base_body`), checked to re-encode identically through `BaseWriter` |
+| `fuzz_index_segment_v2` | Keyed index segment body version 2 (`SegmentBody::decode`), checked to re-encode identically |
 | `fuzz_index_base` | Index base decode (`decode_base_to_temp`), checked to re-encode identically |
 | `fuzz_index_apply` | Segment chain apply (`apply_to_temp`) over a decoded base, chained to it, checked against the reference model |
-| `fuzz_index_object` | Stored `index.d/` objects through the store-level segment and base decoders (name check, plaintext unpack, zstd, codec), against a buffered reference |
+| `fuzz_index_object` | Stored `index.d/` objects through the store-level segment and base decoders of body version 2 (name check, plaintext unpack, zstd, codec, table install), against a buffered reference |
 | `fuzz_full_index_cache` | Local full index cache file (`open_verified`) with a correct trailer, then `encode_base` and apply over it |
-| `fuzz_repo_config` | Repository `config` decode and `RepoConfig::validate`, pack-size targets, then backup's chunker gate and both chunkers (checked to cut identically) |
+| `fuzz_repo_config` | Repository `config` decode (map and positional, `RepoConfig::decode`) and `DecodedConfig::validate`, re-encode of a v6 map, pack-size targets, then backup's chunker gate and both chunkers (checked to cut identically) |
 | `fuzz_key_blob` | Key blob screening (`inspect_key_blob`), checked against the KDF bounds; never runs the KDF |
 | `fuzz_restore_paths` | Restore path sanitizer and symlink audit over an item stream, against an independent model |
 | `fuzz_pending_journal` | Session journal decode (`decode_pending_journal`), re-encode and recovery seeding |

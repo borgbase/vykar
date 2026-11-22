@@ -1,36 +1,48 @@
 //! The index head: the small object at `index.h/<gen>` that names the live
-//! base and segments of the index (formats v6/v7). One head per generation;
-//! the highest generation is the repository's index state.
+//! base and segments of the index (format v6). One head per generation; the
+//! highest generation is the repository's index state.
 //!
-//! Serialized as a msgpack **map** (layout 2) with the field names as keys.
+//! Serialized as a msgpack **map** (layout 3) with the field names as keys.
 //! Readers ignore unknown keys, so a field can be added later without a new
 //! layout: such a field must carry `#[serde(default)]`, and one whose
 //! meaning a reader must understand must also add a name to `features`,
 //! which this binary refuses when it does not know the name. Every field
 //! below is required on decode; a missing key is damage.
 //!
-//! The v1 chain fields (`state_hash`, `entries` and the per-segment state)
-//! exist while base and segments use their v1 encodings; 05 step 9 removes
-//! them.
+//! The head names objects only, no state hash: the index state is the base
+//! plus the segments applied in the head's order, and local files are
+//! matched by object name.
 
 use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 use vykar_types::error::{Result, VykarError};
 
-use super::dedup_cache::StateHash;
-
-/// The only head layout this binary reads and writes.
-pub const HEAD_LAYOUT_VERSION: u32 = 2;
+/// The only head layout this binary reads and writes. 2 was the
+/// development layout of 05 step 8 (with the v1 chain fields); 1 the
+/// positional head of v4/v5.
+pub const HEAD_LAYOUT_VERSION: u32 = 3;
 
 /// Head features this binary understands. A head that names any other is
 /// refused as written by a newer vykar. Written empty.
 pub const KNOWN_HEAD_FEATURES: &[&str] = &[];
 
+/// Who writes a head of `layout`, for a refusal: a layout below this
+/// binary's was only ever written by a development build, one above by a
+/// newer vykar.
+pub(crate) fn layout_writer(layout: u32) -> &'static str {
+    if layout < HEAD_LAYOUT_VERSION {
+        "it was written by an older development build of vykar; recreate the repository"
+    } else {
+        "it was written by a newer vykar. Upgrade vykar"
+    }
+}
+
 /// The error for a head whose layout this binary does not read.
 pub fn unsupported_layout(layout: u32) -> VykarError {
     VykarError::InvalidFormat(format!(
-        "unsupported index head layout {layout} (this version reads {HEAD_LAYOUT_VERSION})"
+        "unsupported index head layout {layout} (this version reads {HEAD_LAYOUT_VERSION}); {}",
+        layout_writer(layout)
     ))
 }
 
@@ -68,11 +80,6 @@ pub fn peek_layout(bytes: &[u8]) -> Option<u32> {
         }
         _ => None,
     }
-}
-
-/// The state hash of the empty index: BLAKE3 over no records.
-pub fn empty_state_hash() -> StateHash {
-    blake3::hash(b"").into()
 }
 
 /// Name of a write-once object under `index.d/`: BLAKE3 of its stored bytes.
@@ -142,20 +149,18 @@ pub struct SweepState {
 pub struct BaseRef {
     pub name: ObjectName,
     pub size: u64,
-    #[serde(with = "serde_bytes")]
-    pub state_hash: StateHash,
+    /// Records in the base; bounds the decode.
     pub entries: u64,
 }
 
-/// A segment object, who wrote it, and the state it produces.
+/// A segment object and who wrote it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SegmentRef {
     pub name: ObjectName,
     pub size: u64,
     pub kind: SegmentKind,
-    #[serde(with = "serde_bytes")]
-    pub state_hash_after: StateHash,
-    pub entries_after: u64,
+    /// Additions + removals + relocations; bounds the decode.
+    pub entries: u64,
 }
 
 /// The head. `base: None` means the base state is the empty index.
@@ -168,12 +173,8 @@ pub struct IndexHead {
     pub generation: u64,
     /// Features a reader must understand; this binary writes none.
     pub features: Vec<String>,
-    /// v1 chain: the state after the last segment (05 step 9 removes it).
-    #[serde(with = "serde_bytes")]
-    pub state_hash: StateHash,
-    /// v1 chain: the entry count of that state (05 step 9 removes it).
-    pub entries: u64,
     pub base: Option<BaseRef>,
+    /// Applied over the base in this order.
     pub segments: Vec<SegmentRef>,
     /// Objects of the last head before the most recent fold, kept so a
     /// reader that loaded that head can finish.
@@ -192,8 +193,6 @@ impl IndexHead {
             layout: HEAD_LAYOUT_VERSION,
             generation: 1,
             features: Vec::new(),
-            state_hash: empty_state_hash(),
-            entries: 0,
             base: None,
             segments: Vec::new(),
             retired: Vec::new(),
@@ -201,7 +200,7 @@ impl IndexHead {
         }
     }
 
-    /// A copy with the next generation; the caller then edits the chain
+    /// A copy with the next generation; the caller then edits the objects
     /// and the sweep.
     pub fn successor(&self) -> Self {
         Self {
@@ -210,26 +209,9 @@ impl IndexHead {
         }
     }
 
-    /// State hash and entry count of the base state.
-    pub fn base_state(&self) -> (StateHash, u64) {
-        match &self.base {
-            Some(b) => (b.state_hash, b.entries),
-            None => (empty_state_hash(), 0),
-        }
-    }
-
-    /// Every state in the chain, oldest first: the base state, then the
-    /// state after each segment. `chain_states()[k]` is the state from which
-    /// `segments[k..]` remain to be applied.
-    pub fn chain_states(&self) -> Vec<(StateHash, u64)> {
-        let mut states = Vec::with_capacity(self.segments.len() + 1);
-        states.push(self.base_state());
-        states.extend(
-            self.segments
-                .iter()
-                .map(|s| (s.state_hash_after, s.entries_after)),
-        );
-        states
+    /// No base and no segments: the empty index.
+    pub fn is_empty(&self) -> bool {
+        self.base.is_none() && self.segments.is_empty()
     }
 
     /// Names of the objects this head references as live: base and segments.
@@ -258,9 +240,8 @@ impl IndexHead {
     }
 
     /// Check the head's internal consistency: known layout and features, a
-    /// generation of at least 1 and not below the sweep's, the chain ends at
-    /// the head's state, entry counts fit a full index cache, and no object
-    /// is named twice.
+    /// generation of at least 1 and not below the sweep's, entry counts that
+    /// fit a u32, and no object named twice.
     pub fn validate(&self) -> Result<()> {
         if self.layout != HEAD_LAYOUT_VERSION {
             return Err(unsupported_layout(self.layout));
@@ -278,17 +259,12 @@ impl IndexHead {
                 self.sweep.generation, self.generation
             )));
         }
-        let last = *self
-            .chain_states()
-            .last()
-            .expect("chain_states holds the base state");
-        if last != (self.state_hash, self.entries) {
-            return Err(invalid("chain does not end at the head's state"));
-        }
         if self
-            .chain_states()
+            .base
             .iter()
-            .any(|&(_, n)| n > u64::from(u32::MAX))
+            .map(|b| b.entries)
+            .chain(self.segments.iter().map(|s| s.entries))
+            .any(|n| n > u64::from(u32::MAX))
         {
             return Err(invalid("entry count out of range"));
         }
@@ -332,12 +308,9 @@ mod tests {
             layout: HEAD_LAYOUT_VERSION,
             generation: 7,
             features: Vec::new(),
-            state_hash: [3; 32],
-            entries: 12,
             base: Some(BaseRef {
                 name: name(1),
                 size: 100,
-                state_hash: [1; 32],
                 entries: 10,
             }),
             segments: vec![
@@ -345,15 +318,13 @@ mod tests {
                     name: name(2),
                     size: 20,
                     kind: SegmentKind::Backup,
-                    state_hash_after: [2; 32],
-                    entries_after: 11,
+                    entries: 1,
                 },
                 SegmentRef {
                     name: name(3),
                     size: 30,
                     kind: SegmentKind::Maintenance,
-                    state_hash_after: [3; 32],
-                    entries_after: 12,
+                    entries: 2,
                 },
             ],
             retired: vec![name(9)],
@@ -378,11 +349,13 @@ mod tests {
             initial
         );
         assert_eq!(initial.generation, 1);
+        assert!(initial.is_empty());
+        assert!(!head.is_empty());
         assert_eq!(initial.sweep, SweepState::default());
         assert_eq!(initial.successor().generation, 2);
     }
 
-    /// HEAD-2: a map with named keys; hashes and names stay msgpack `bin`.
+    /// HEAD-2: a map with named keys; names stay msgpack `bin`.
     #[test]
     fn encoding_is_a_map() {
         let bytes = IndexHead::initial().encode().unwrap();
@@ -392,15 +365,26 @@ mod tests {
             bytes[0]
         );
         let full = sample().encode().unwrap();
-        for key in [&b"layout"[..], b"gen", b"sweep", b"features", b"kind"] {
+        for key in [
+            &b"layout"[..],
+            b"gen",
+            b"sweep",
+            b"features",
+            b"kind",
+            b"entries",
+        ] {
             assert!(
                 full.windows(key.len()).any(|w| w == key),
                 "key {}",
                 String::from_utf8_lossy(key)
             );
         }
+        assert!(
+            !full.windows(10).any(|w| w == b"state_hash"),
+            "no state hash"
+        );
         let bin32 = [0xc4, 32];
-        assert!(full.windows(2).any(|w| w == bin32), "hashes as bin8");
+        assert!(full.windows(2).any(|w| w == bin32), "names as bin8");
         assert!(full.len() < 600, "{} bytes", full.len());
     }
 
@@ -435,10 +419,10 @@ mod tests {
     /// HEAD-5: peek_layout on map and positional heads.
     #[test]
     fn peek_layout_reads_map_and_positional_heads() {
-        assert_eq!(peek_layout(&sample().encode().unwrap()), Some(2));
+        assert_eq!(peek_layout(&sample().encode().unwrap()), Some(3));
         let mut h = sample();
-        h.layout = 3;
-        assert_eq!(peek_layout(&h.encode().unwrap()), Some(3));
+        h.layout = 4;
+        assert_eq!(peek_layout(&h.encode().unwrap()), Some(4));
         assert!(IndexHead::decode(&h.encode().unwrap()).is_err());
 
         // A positional layout-1 head, as v4/v5 wrote it.
@@ -479,24 +463,17 @@ mod tests {
         assert!(bad(h), "the record named again as a segment");
 
         let mut h = sample();
-        h.state_hash = [7; 32];
-        assert!(bad(h));
-
-        let mut h = sample();
-        h.entries = 13;
-        assert!(bad(h));
-
-        let mut h = sample();
         h.retired.push(name(2));
         assert!(bad(h));
 
-        let mut h = IndexHead::initial();
-        h.state_hash = [0; 32];
+        let mut h = sample();
+        h.segments[1].entries = u64::from(u32::MAX) + 1;
         assert!(bad(h));
 
         let mut h = sample();
-        h.segments[1].entries_after = u64::from(u32::MAX) + 1;
-        h.entries = h.segments[1].entries_after;
+        if let Some(b) = h.base.as_mut() {
+            b.entries = u64::from(u32::MAX) + 1;
+        }
         assert!(bad(h));
 
         // Every field is required.
@@ -507,7 +484,7 @@ mod tests {
             generation: u64,
         }
         let bytes = rmp_serde::to_vec_named(&NoSweep {
-            layout: 2,
+            layout: HEAD_LAYOUT_VERSION,
             generation: 1,
         })
         .unwrap();
@@ -527,12 +504,8 @@ mod tests {
     }
 
     #[test]
-    fn chain_states_and_named_objects() {
+    fn named_objects() {
         let head = sample();
-        assert_eq!(
-            head.chain_states(),
-            vec![([1; 32], 10), ([2; 32], 11), ([3; 32], 12)]
-        );
         assert_eq!(
             head.live_objects().collect::<Vec<_>>(),
             vec![name(1), name(2), name(3)]
@@ -541,9 +514,42 @@ mod tests {
             head.named_objects().collect::<Vec<_>>(),
             vec![name(1), name(2), name(3), name(9), name(8)]
         );
-        assert_eq!(
-            IndexHead::initial().chain_states(),
-            vec![(empty_state_hash(), 0)]
-        );
+    }
+
+    /// A layout-2 head as 05 step 8 wrote it (map, v1 chain fields).
+    #[derive(Serialize)]
+    pub(crate) struct Layout2Head {
+        pub layout: u32,
+        #[serde(rename = "gen")]
+        pub generation: u64,
+        pub features: Vec<String>,
+        #[serde(with = "serde_bytes")]
+        pub state_hash: [u8; 32],
+        pub entries: u64,
+        pub base: Option<()>,
+        pub segments: Vec<()>,
+        pub retired: Vec<ObjectName>,
+        pub sweep: SweepState,
+    }
+
+    /// HEAD-8 (decode half; classify_head's is in repo::index_store's tests):
+    /// a layout-2 head is refused by its layout.
+    #[test]
+    fn a_layout_2_head_is_refused_by_layout() {
+        let bytes = rmp_serde::to_vec_named(&Layout2Head {
+            layout: 2,
+            generation: 1,
+            features: Vec::new(),
+            state_hash: *blake3::hash(b"").as_bytes(),
+            entries: 0,
+            base: None,
+            segments: Vec::new(),
+            retired: Vec::new(),
+            sweep: SweepState::default(),
+        })
+        .unwrap();
+        assert_eq!(peek_layout(&bytes), Some(2));
+        let err = IndexHead::decode(&bytes).unwrap_err().to_string();
+        assert!(err.contains("layout 2"), "{err}");
     }
 }

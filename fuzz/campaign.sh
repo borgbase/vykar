@@ -26,7 +26,7 @@ budget_for() {
       echo $((per * 4)) ;;
     # Coverage flat from minute 1.
     fuzz_pack_scan | fuzz_unpack_object | fuzz_protocol_keys | fuzz_index_base | \
-      fuzz_pack_trailer | fuzz_pack_map)
+      fuzz_pack_trailer | fuzz_pack_map | fuzz_index_base_v2 | fuzz_index_segment_v2)
       echo $((per / 3)) ;;
     *) echo "$per" ;;
   esac

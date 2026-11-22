@@ -7,11 +7,15 @@ use super::file_cache;
 use super::index_store::{self, CacheLocation, SyncedIndex};
 use super::manifest::{self, Manifest};
 use super::snapshot_cache;
-use crate::index::dedup_cache;
-use crate::index::head::IndexHead;
-use crate::index::segment;
+use super::write_session::SessionView;
+use crate::index::head::{IndexHead, SegmentKind};
+use crate::index::segment_v2::{Location, SegmentBody};
+use crate::index::table::IndexState;
 use crate::index::{IndexDelta, LiveIndex};
+#[cfg(test)]
+use std::sync::Arc;
 use vykar_crypto::CryptoEngine;
+use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
 use vykar_types::pack_id::PackId;
 
@@ -96,11 +100,11 @@ impl Repository {
         Ok(())
     }
 
-    /// Bring a local chunk table to `head`, or to a freshly read head: the
-    /// repository's own table first, then the table files of the cache dir.
-    /// `use_local: false` ignores and leaves alone the local tables (the
-    /// result lives in a temp file), so every object of the chain is fetched
-    /// and verified.
+    /// Bring an index to `head`, or to a freshly read head: the
+    /// repository's own index first, then the local files of the cache dir.
+    /// `use_local: false` ignores and leaves alone the local files (the
+    /// table lives in a temp file), so every object the head names is
+    /// fetched and verified.
     pub(super) fn sync_index(
         &mut self,
         head: Option<IndexHead>,
@@ -113,11 +117,11 @@ impl Repository {
         let dir = use_local.then(|| self.cache_dir()).flatten();
         let location = CacheLocation {
             dir: dir.as_deref(),
-            live: self.chunk_index.table().cloned().filter(|_| use_local),
+            live: use_local.then_some(&self.chunk_index),
             use_local,
         };
         let start = std::time::Instant::now();
-        let synced = index_store::sync_full_cache(
+        let synced = index_store::sync_index(
             self.storage.as_ref(),
             self.crypto.as_ref(),
             head,
@@ -134,7 +138,7 @@ impl Repository {
         })?;
         debug!(
             source = ?synced.source,
-            entries = synced.head.entries,
+            entries = synced.index.len(),
             segments = synced.head.segments.len(),
             elapsed_ms = start.elapsed().as_millis() as u64,
             "index cache synced to head"
@@ -142,18 +146,19 @@ impl Repository {
         Ok(synced)
     }
 
-    /// Make a synced table the in-memory index.
+    /// Make a synced index the in-memory index.
     pub(super) fn install_synced_index(&mut self, synced: SyncedIndex) {
-        self.chunk_index = LiveIndex::from_table(synced.table);
-        self.index_generation = dedup_cache::generation_for_state(&synced.head.state_hash);
+        self.chunk_index = synced.index;
+        self.index_generation = synced.head.generation;
         self.index_head = Some(synced.head);
         self.rebase_pack_target_from_index();
     }
 
     /// Flush pending packs and wait for uploads, then take the session's
-    /// `IndexDelta` out for processing and drop its lookup state. The
-    /// delta's positional bumps keep the session's table mapped until they
-    /// are applied.
+    /// `IndexDelta` (with the trailer lengths of the session's packs) and
+    /// its view out for processing, and drop its lookup state. The delta's
+    /// positional bumps keep the session's table mapped until they are
+    /// applied.
     ///
     /// On the concurrent backup path Phase 1 has normally drained uploads
     /// already, so the flush here is a no-op safety net; for
@@ -162,14 +167,19 @@ impl Repository {
     /// Must only be called when `write_session` is `Some`. The session itself
     /// stays active: on failure the caller can still run `flush_on_abort()`,
     /// which does not need the structures taken here.
-    fn flush_and_take_session_delta(&mut self) -> Result<Option<IndexDelta>> {
+    fn flush_and_take_session_delta(
+        &mut self,
+    ) -> Result<(Option<IndexDelta>, Option<SessionView>)> {
         self.flush_packs()?;
 
         let ws = self.ws_mut();
-        let delta = ws.index_delta.take();
-        ws.table = None;
+        let mut delta = ws.index_delta.take();
+        if let Some(delta) = delta.as_mut() {
+            delta.pack_trailers = std::mem::take(&mut ws.pack_trailers);
+        }
+        let view = ws.view.take();
         ws.session_new = Default::default();
-        Ok(delta)
+        Ok((delta, view))
     }
 
     /// Flush pending packs, wait for uploads, and apply the session's delta
@@ -182,7 +192,7 @@ impl Repository {
     /// best-effort journal persistence; the delta may already be taken out
     /// of the session at that point, which `flush_on_abort` does not need.
     fn apply_write_session(&mut self) -> Result<()> {
-        if let Some(delta) = self.flush_and_take_session_delta()?
+        if let (Some(delta), _) = self.flush_and_take_session_delta()?
             && !delta.is_empty()
         {
             delta.apply_to(&mut self.chunk_index);
@@ -221,7 +231,9 @@ impl Repository {
     /// 2. Take the delta from the write session.
     /// 3. Refresh snapshot list from storage.
     /// 4. Check snapshot name uniqueness against fresh list.
-    /// 5. GET the head, merge the delta into the index, persist it.
+    /// 5. GET the head, sync to it, write the session's additions as a
+    ///    backup segment (re-checking reused chunks when the head changed in
+    ///    a way that can have removed entries).
     /// 6. Write `snapshots/<id>` to storage — **commit point**.
     /// 7. Update local manifest + snapshot cache.
     /// 8. Save file cache and consume write session.
@@ -247,7 +259,7 @@ impl Repository {
         // in the old order: probe, flush, snapshot list and name check, index.
         let session_id = self.ws().session_id.clone();
         let taken = self.flush_and_take_session_delta();
-        let fetch_index = matches!(&taken, Ok(Some(delta)) if !delta.is_empty());
+        let fetch_index = matches!(&taken, Ok((Some(delta), _)) if !delta.is_empty());
         let marker_key =
             (session_id != "default").then(|| super::lock::session_marker_key(&session_id));
         let storage = self.storage.as_ref();
@@ -296,12 +308,12 @@ impl Repository {
             }
             Some(Ok(true)) | None => {}
         }
-        let delta = taken?;
+        let (delta, view) = taken?;
         if let Some(refresh) = refreshed {
             self.apply_snapshot_refresh(refresh?);
         }
 
-        self.commit_prepare(&snapshot_entry, delta, prefetched, events)?;
+        self.commit_prepare(&snapshot_entry, delta, view, prefetched, events)?;
 
         // ---- COMMIT POINT ----
         let ctx = emit_stage(events, "write snapshot");
@@ -337,11 +349,12 @@ impl Repository {
     /// that can't be decrypted cannot conflict with a valid name) and, for
     /// a non-empty delta, fetched the index head (`prefetched`):
     ///   4. Enforce snapshot name uniqueness against the fresh list.
-    ///   5. Merge the delta into the index at that head, persist it.
+    ///   5. Write the delta's additions at that head.
     fn commit_prepare(
         &mut self,
         snapshot_entry: &manifest::SnapshotEntry,
         delta: Option<IndexDelta>,
+        view: Option<SessionView>,
         prefetched: Option<Result<IndexHead>>,
         events: &dyn EventSink<CommitEvent>,
     ) -> Result<()> {
@@ -352,8 +365,8 @@ impl Repository {
             ));
         }
 
-        // 5. Merge the delta into the index at the head, persist it. The
-        // write installs the new state as the repository's table.
+        // 5. Write the delta's additions at the head. The repository's
+        // index becomes the head's, with the new segment applied.
         if let Some(delta) = delta
             && !delta.is_empty()
         {
@@ -361,7 +374,7 @@ impl Repository {
                 Some(head) => head?,
                 None => index_store::fetch_head(self.storage.as_ref(), self.crypto.as_ref())?,
             };
-            self.segmented_commit(head, delta, events)?;
+            self.segmented_commit(head, delta, view, events)?;
         }
 
         // Defensive: persist index if dirty but no delta (unreachable today
@@ -374,48 +387,83 @@ impl Repository {
         Ok(())
     }
 
-    /// Bring a local table to `head` (normally the repository's own, already
-    /// there), merge-walk the session's `delta` over it into the next
-    /// state and its segment while the session's packs are verified, and
-    /// publish. The snapshot PUT that follows remains the commit point.
+    /// Bring the index to `head` (normally the repository's own, already
+    /// there), check the reused chunks when the head moved in a way that
+    /// can have removed entries, and write the session's new chunks as one
+    /// backup segment while the session's packs are verified. The snapshot
+    /// PUT that follows remains the commit point.
     fn segmented_commit(
         &mut self,
         head: IndexHead,
         delta: IndexDelta,
+        view: Option<SessionView>,
         events: &dyn EventSink<CommitEvent>,
     ) -> Result<()> {
         let ctx = emit_stage(events, "fetch index");
         let synced = self.sync_index(Some(head), true)?;
         log_stage_elapsed(ctx);
-        let SyncedIndex { head, table, .. } = synced;
-        let anchor = index_store::cache_anchor(self.cache_dir().as_deref());
+        let recheck = needs_recheck(view.as_ref().map(|v| (&v.state, v.sweep_gen)), &synced.head);
+        // Nothing else may hold the view's applied layer when the segment
+        // is applied (`Arc::make_mut` would copy it).
+        drop(view);
 
         let ctx = emit_stage(events, "reconcile");
-        let pack_ids = Self::delta_pack_ids(&delta);
+        // The additions: one per chunk (its first location), minus chunks
+        // the synced index already holds (another session committed them
+        // first; this session's copies are dead bytes).
+        let additions = commit_additions(&delta, &synced.index);
+        let pack_ids: std::collections::HashSet<PackId> =
+            additions.iter().map(|(_, l)| l.pack_id).collect();
         let persisted_packs = self.persisted_pack_count();
         let width = self.request_width();
         let storage = self.storage.as_ref();
-        let (verified, merged) = std::thread::scope(|scope| {
+        let (verified, reused) = std::thread::scope(|scope| {
             let verify = scope.spawn(|| {
                 super::pack_verify::verify_packs_present(storage, &pack_ids, persisted_packs, width)
             });
-            let merged = segment::merge_delta_to_temp(table.cache(), &delta, &anchor);
-            (join_scoped(verify), merged)
+            let reused = if recheck {
+                check_reused_chunks(&delta, &synced.index)
+            } else {
+                debug!(
+                    "index head unchanged since the session began, except for backup segments; reused chunks not re-checked"
+                );
+                Ok(())
+            };
+            (join_scoped(verify), reused)
         });
-        drop(table);
-        drop(delta);
-        // A stale bump is the typed error callers retry on; report it first.
-        let (diff, next) = merged?;
+        // A stale chunk is the typed error callers retry on; report it first.
+        reused?;
         verified?;
+        let mut pack_trailers: Vec<(PackId, u32)> = Vec::with_capacity(pack_ids.len());
+        for pack in &pack_ids {
+            let trailer_len = delta.pack_trailers.get(pack).copied().ok_or_else(|| {
+                VykarError::Other(format!(
+                    "BUG: the backup commit does not know the trailer length of pack {pack}"
+                ))
+            })?;
+            pack_trailers.push((*pack, trailer_len));
+        }
+        pack_trailers.sort_unstable_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+        drop(delta);
         log_stage_elapsed(ctx);
 
         let ctx = emit_stage(events, "write index");
-        self.publish_index_state(
-            Some(head),
-            Some(diff),
-            next,
-            crate::index::head::SegmentKind::Backup,
-        )?;
+        let SyncedIndex { head, .. } = &synced;
+        let head = head.clone();
+        self.install_synced_index(synced);
+        if additions.is_empty() {
+            debug!("backup added no chunks; no index write");
+            log_stage_elapsed(ctx);
+            return Ok(());
+        }
+        let seg = SegmentBody {
+            kind: SegmentKind::Backup,
+            additions,
+            removals: Vec::new(),
+            relocations: Vec::new(),
+            pack_trailers,
+        };
+        self.publish_index_state(Some(head), Some(seg), true)?;
         log_stage_elapsed(ctx);
         Ok(())
     }
@@ -463,11 +511,6 @@ impl Repository {
 
         // Consume write session.
         self.write_session = None;
-    }
-
-    /// The packs a delta's new entries live in.
-    fn delta_pack_ids(delta: &IndexDelta) -> std::collections::HashSet<PackId> {
-        delta.new_entries.iter().map(|e| e.pack_id).collect()
     }
 
     /// Packs already in the repository, a cost hint for `pack_lookup`.
@@ -525,10 +568,10 @@ impl Repository {
         self.manifest = Manifest::from_snapshot_entries(refresh.entries);
     }
 
-    /// Download the index at a freshly read head into a temp-file table,
-    /// using only the storage and crypto handles, for readers that cannot
-    /// borrow the repository. Does not touch the repository's own index or
-    /// the local tables.
+    /// Download the index at a freshly read head (its base into a temp-file
+    /// table, its segments applied), using only the storage and crypto
+    /// handles, for readers that cannot borrow the repository. Does not touch
+    /// the repository's own index or the local files.
     pub(crate) fn fetch_full_index(
         storage: &dyn vykar_storage::StorageBackend,
         crypto: &dyn CryptoEngine,
@@ -540,7 +583,180 @@ impl Repository {
             use_local: false,
         };
         let width = storage.profile().request_width.max(1);
-        let synced = index_store::sync_full_cache(storage, crypto, head, location, width)?;
-        Ok(LiveIndex::from_table(synced.table))
+        let synced = index_store::sync_index(storage, crypto, head, location, width)?;
+        Ok(synced.index)
+    }
+}
+
+/// Whether entries a session reused can have been removed between the head
+/// its view was built from (`from`: the view's objects and that head's
+/// `sweep.gen`) and `now`: no view; another `sweep.gen`; another base; a
+/// segment list that does not start with the view's; or any later segment
+/// that is not a backup segment (backup segments only add).
+pub(crate) fn needs_recheck(from: Option<(&IndexState, u64)>, now: &IndexHead) -> bool {
+    let Some((state, sweep_gen)) = from else {
+        return true;
+    };
+    if now.sweep.generation != sweep_gen
+        || now.base.as_ref().map(|b| b.name) != state.base
+        || now.segments.len() < state.segments.len()
+    {
+        return true;
+    }
+    let (old, new) = now.segments.split_at(state.segments.len());
+    !old.iter()
+        .map(|s| s.name)
+        .eq(state.segments.iter().copied())
+        || new.iter().any(|s| s.kind != SegmentKind::Backup)
+}
+
+/// The delta's new entries in chunk-ID order, one per chunk (the first
+/// location recorded), without the chunks `index` already holds.
+fn commit_additions(delta: &IndexDelta, index: &LiveIndex) -> Vec<(ChunkId, Location)> {
+    let mut seen = std::collections::HashSet::with_capacity(delta.new_entries.len());
+    let mut out: Vec<(ChunkId, Location)> = delta
+        .new_entries
+        .iter()
+        .filter(|e| seen.insert(e.chunk_id))
+        .filter(|e| !index.contains(&e.chunk_id))
+        .map(|e| {
+            (
+                e.chunk_id,
+                Location {
+                    pack_id: e.pack_id,
+                    pack_offset: e.pack_offset,
+                    stored_size: e.stored_size,
+                },
+            )
+        })
+        .collect();
+    out.sort_unstable_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+    out
+}
+
+/// Every chunk the session reused (a bump with a count) must be in `index`
+/// or among the delta's new entries; else
+/// [`VykarError::StaleChunksDuringCommit`].
+fn check_reused_chunks(delta: &IndexDelta, index: &LiveIndex) -> Result<()> {
+    let new: std::collections::HashSet<ChunkId> =
+        delta.new_entries.iter().map(|e| e.chunk_id).collect();
+    let stale = |id: &ChunkId| !index.contains(id) && !new.contains(id);
+    if delta
+        .refcount_bumps
+        .iter()
+        .any(|(id, &n)| n > 0 && stale(id))
+    {
+        return Err(VykarError::StaleChunksDuringCommit);
+    }
+    if let Some(cached) = delta.cached_bumps.as_ref()
+        && cached.iter_nonzero().any(|(id, _)| stale(&id))
+    {
+        return Err(VykarError::StaleChunksDuringCommit);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::index::head::{BaseRef, ObjectName, SegmentRef};
+    use crate::index::table::IndexState;
+
+    fn name(b: u8) -> ObjectName {
+        ObjectName([b; 32])
+    }
+
+    fn seg(b: u8, kind: SegmentKind) -> SegmentRef {
+        SegmentRef {
+            name: name(b),
+            size: 1,
+            kind,
+            entries: 1,
+        }
+    }
+
+    fn head(base: Option<u8>, segments: Vec<SegmentRef>, sweep: u64) -> IndexHead {
+        let mut h = IndexHead::initial();
+        h.generation = 10;
+        h.base = base.map(|b| BaseRef {
+            name: name(b),
+            size: 1,
+            entries: 1,
+        });
+        h.segments = segments;
+        h.sweep.generation = sweep;
+        h
+    }
+
+    /// BK-3: when reused chunks are checked again at commit.
+    #[test]
+    fn needs_recheck_matrix() {
+        let from = head(Some(1), vec![seg(2, SegmentKind::Backup)], 3);
+        let state = IndexState::of_head(&from);
+        let view = Some((&state, 3));
+        assert!(!needs_recheck(view, &from), "same head");
+        let mut more = from.clone();
+        more.segments.push(seg(3, SegmentKind::Backup));
+        more.segments.push(seg(4, SegmentKind::Backup));
+        assert!(!needs_recheck(view, &more), "only new backup segments");
+        let mut swept = from.clone();
+        swept.sweep.generation = 9;
+        assert!(needs_recheck(view, &swept), "new sweep.gen");
+        let rebased = head(Some(7), vec![seg(2, SegmentKind::Backup)], 3);
+        assert!(needs_recheck(view, &rebased), "new base");
+        let mut maint = from.clone();
+        maint.segments.push(seg(3, SegmentKind::Maintenance));
+        assert!(needs_recheck(view, &maint), "a new maintenance segment");
+        let other = head(Some(1), vec![seg(5, SegmentKind::Backup)], 3);
+        assert!(needs_recheck(view, &other), "segments not a prefix");
+        let shorter = head(Some(1), vec![], 3);
+        assert!(needs_recheck(view, &shorter), "segments dropped");
+        assert!(needs_recheck(None, &from), "no view");
+    }
+
+    /// BK-4 (keyed and positional bumps): a reused chunk missing from the
+    /// synced index is stale unless the session added it itself.
+    #[test]
+    fn reused_chunks_missing_from_the_index_are_stale() {
+        let id = |b: u8| ChunkId::from_bytes([b; 32]);
+        let pack = PackId::from_bytes([9; 32]);
+        let mut session_start = crate::index::ChunkIndex::new();
+        session_start.add(id(1), 10, pack, 0);
+        session_start.add(id(2), 10, pack, 20);
+        let table = crate::testutil::base_table_of(&session_start);
+        let mut now = LiveIndex::from_table(Arc::clone(&table));
+
+        let mut keyed = IndexDelta::new();
+        keyed.bump_refcount(&id(1));
+        let mut positional = IndexDelta::with_cached_bumps(Arc::clone(&table));
+        let (p, _) = table.find(&id(2)).unwrap();
+        positional.bump_cached_refcount(&id(2), p);
+        assert!(check_reused_chunks(&keyed, &now).is_ok());
+        assert!(check_reused_chunks(&positional, &now).is_ok());
+
+        now.remove(&id(1));
+        now.remove(&id(2));
+        for delta in [&keyed, &positional] {
+            assert!(matches!(
+                check_reused_chunks(delta, &now),
+                Err(VykarError::StaleChunksDuringCommit)
+            ));
+        }
+        // A chunk the session itself stored again is not stale.
+        keyed.add_new_entry(id(1), 10, pack, 40, 1);
+        assert!(check_reused_chunks(&keyed, &now).is_ok());
+        // The additions leave out what the index holds.
+        let mut delta = IndexDelta::new();
+        delta.add_new_entry(id(2), 10, pack, 0, 1);
+        delta.add_new_entry(id(3), 10, pack, 60, 1);
+        delta.add_new_entry(id(3), 10, pack, 80, 1);
+        let fresh = LiveIndex::from_table(Arc::clone(&table));
+        let adds = commit_additions(&delta, &fresh);
+        assert_eq!(adds.len(), 1);
+        assert_eq!(
+            (adds[0].0, adds[0].1.pack_offset),
+            (id(3), 60),
+            "the first location"
+        );
     }
 }

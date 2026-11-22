@@ -1,56 +1,75 @@
-//! In-place upgrade from the monolithic index (formats v2/v3) to the
-//! numbered heads of v6/v7 (v2 → v7, v3 → v6). Runs under the maintenance
-//! lock, on a repository opened without its index.
+//! In-place upgrade from the monolithic index (formats v2/v3) to format v6
+//! (v2 keeps BLAKE2b IDs, v3 BLAKE3; the config names the hash). Runs under
+//! the maintenance lock, on a repository opened without its index.
 //!
 //! 1. Probe the server capabilities and PUT the stored `config` bytes back
 //!    unchanged: a server that refuses overwrites (append-only) fails here,
 //!    with the repository untouched.
-//! 2. GET `index` and decode the legacy index. While `config` is below 6,
-//!    this blob is the repository's index; heads already under `index.h/`
-//!    are debris of an earlier attempt.
-//! 3. Write it as a v1 base under `index.d/` and a head at
+//! 2. GET `index` and decode the legacy index. While `config` is
+//!    positional, this blob is the repository's index; heads and bases
+//!    already under `index.h/` and `index.d/` are debris of an earlier
+//!    attempt, pack maps under `packmaps/` are reused.
+//! 3. Write it as a base body into a local temp file (every pack at
+//!    `trailer_len` 0: releases that wrote v2/v3 wrote no trailers) and make
+//!    it the handle's index. Nothing is written to storage.
+//! 4. Write pack maps for every pack the index names that no readable map
+//!    covers (a pack with more entries than a map may hold is skipped and
+//!    reported; one the index describes inconsistently stops the upgrade).
+//! 5. Write the base under `index.d/` and a head at
 //!    `index.h/<highest listed + 1>`. `index` is not touched.
-//! 4. Rewrite `config` with the new version. From here every older binary
-//!    refuses the repository by version.
-//! 5. Delete `index`, `index.gen` and the local copy of the legacy index
+//! 6. Rewrite `config` as the v6 map. From here every older binary refuses
+//!    the repository by version.
+//! 7. Delete `index`, `index.gen` and the local copy of the legacy index
 //!    blob, best-effort.
 //!
-//! Why this order is safe: until the switch in step 4 an older binary keeps
+//! Why this order is safe: until the switch in step 6 an older binary keeps
 //! working on the repository, because the legacy index is untouched. A
 //! resume always rebuilds from the current legacy index, so writes an old
 //! client made in between (under a lock this upgrade lost) are not dropped.
-//! The debris of an interrupted attempt (heads, base) is collected by age.
-//! An upgrade interrupted after the switch finds a current format and only
-//! retries the deletions of step 5.
+//! Maps come before the switch, so a v6 repository never has a pre-upgrade
+//! pack a map could describe but does not (`check --repair` then rebuilds
+//! its entries without any local file). The debris of an interrupted
+//! attempt (heads, base) is collected by age. An upgrade interrupted after
+//! the switch finds a current format and only retries the deletions of
+//! step 7.
 
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
+use super::control::CancelToken;
 use super::format::{ObjectType, unpack_object_expect_with_context};
 use super::index_store;
 use super::index_write::PendingSweep;
-use super::{INDEX_OBJECT_CONTEXT, RepoConfig, RepoFormat, Repository};
+use super::{DecodedConfig, INDEX_OBJECT_CONTEXT, RepoConfig, RepoFormat, Repository};
 use crate::compress;
 use std::sync::Arc;
 
-use crate::index::dedup_cache::{self, generation_for_state};
-use crate::index::head::IndexHead;
-use crate::index::{ChunkIndex, ChunkTable, IndexBlob, LiveIndex};
+use crate::index::dedup_cache;
+use crate::index::table::{self, ChunkTable};
+use crate::index::{ChunkIndex, IndexBlob, LiveIndex};
 use vykar_crypto::CryptoEngine;
 use vykar_types::error::{Result, VykarError};
 
 /// What [`Repository::upgrade_index_layout`] did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpgradeOutcome {
-    /// The repository already uses the segmented index.
+    /// The repository already uses the current format.
     AlreadyCurrent { version: u32 },
     Upgraded {
         from: u32,
         to: u32,
+        /// The chunk and pack hash, which the repository keeps.
+        chunk_hash: vykar_types::hash::HashAlgorithm,
         /// Index entries written to the base.
         entries: u64,
         /// Stored size of the base (0 for an empty index).
         base_bytes: u64,
-        /// An interrupted upgrade was completed: the head was already in place.
+        /// Packs this run wrote maps for.
+        packs_mapped: usize,
+        /// Packs with more entries than a map may hold: described only by
+        /// the index (a repair that cannot read the index loses them).
+        packs_unmapped: usize,
+        /// An interrupted upgrade was completed: a head or a pack map was
+        /// already in place.
         resumed: bool,
     },
 }
@@ -93,7 +112,7 @@ pub(crate) fn is_index_head(data: &[u8]) -> bool {
 }
 
 impl Repository {
-    /// Upgrade a v2/v3 repository to v7/v6 in place; see the module docs.
+    /// Upgrade a v2/v3 repository to v6 in place; see the module docs.
     /// The caller holds the maintenance lock. One-way: older binaries cannot
     /// read the repository afterwards.
     pub fn upgrade_index_layout(&mut self) -> Result<UpgradeOutcome> {
@@ -123,8 +142,11 @@ impl Repository {
             .storage
             .get("config")?
             .ok_or_else(|| VykarError::RepoNotFound("config not found".into()))?;
-        let stored: RepoConfig = rmp_serde::from_slice(&config_bytes)?;
-        if stored.version != from.version() || stored.id != self.config.id {
+        let unchanged = matches!(
+            RepoConfig::decode(&config_bytes),
+            Ok(DecodedConfig::Positional(c)) if c.version == from.version() && c.id == self.config.id
+        );
+        if !unchanged {
             return Err(VykarError::Other(
                 "the repository config changed after it was opened; retry the upgrade".into(),
             ));
@@ -137,7 +159,7 @@ impl Repository {
             ))
         })?;
 
-        // 2. The legacy index: while `config` is below 6, the index.
+        // 2. The legacy index: while `config` is positional, the index.
         let data = self.storage.get("index")?;
         if data.as_deref().is_some_and(is_index_head) {
             return Err(VykarError::Other(
@@ -156,39 +178,66 @@ impl Repository {
             ))
         })?;
         debug!(entries = index.len(), "legacy index loaded");
-        let resumed = !index_store::list_head_generations(self.storage.as_ref())?.is_empty();
+        let had_head = !index_store::list_head_generations(self.storage.as_ref())?.is_empty();
+
+        // 3. The base body, locally; the legacy index is dropped before the
+        // maps are built from the table.
+        let anchor = index_store::cache_anchor(self.cache_dir().as_deref());
+        let (body, entries) = table::base_body_from_chunk_index(&index, &anchor).map_err(|e| {
+            VykarError::Other(format!(
+                "the v{} index cannot be written as a v6 base ({e}); nothing was changed",
+                from.version()
+            ))
+        })?;
+        drop(index);
+        self.chunk_index = LiveIndex::from_table(Arc::new(ChunkTable::install(body, None, None)?));
+
+        // 4. Pack maps for every pre-upgrade pack a map can describe.
+        let maps = self.write_pack_maps(None, &CancelToken::new())?;
+        if let Some((pack, why)) = maps.layout_violations.first() {
+            return Err(VykarError::Other(format!(
+                "the v{} index describes pack {pack} inconsistently ({why}); the upgrade \
+                 stopped before switching the format, so the repository is still v{} \
+                 (only pack maps were written). Run `vykar check --verify-data` with the \
+                 release that wrote the repository",
+                from.version(),
+                from.version()
+            )));
+        }
+        if maps.packs_skipped_too_many > 0 {
+            warn!(
+                packs = maps.packs_skipped_too_many,
+                "packs with more entries than a pack map holds are described only by the index"
+            );
+        }
+        let resumed = had_head || maps.packs_already_mapped > 0;
         if resumed {
             info!("resuming an interrupted upgrade from the current legacy index");
         }
 
-        // 3. Base and head.
-        let head = self.write_upgraded_index(&index)?;
-        drop(index);
-        // The state written above, as a scratch table: publish it.
-        let written = std::mem::take(&mut self.chunk_index);
-        if let Some(table) = written.table().cloned() {
-            drop(written);
-            if let Some(table) = Arc::into_inner(table) {
-                let table = index_store::publish_table(table, self.cache_dir().as_deref());
-                self.chunk_index = LiveIndex::from_table(Arc::new(table));
-            }
-        }
+        // 5. Base and head.
+        self.storage.create_dir(index_store::HEAD_PREFIX)?;
+        self.storage.create_dir(index_store::INDEX_OBJECT_DIR)?;
+        self.set_pending_sweep(PendingSweep::Initial);
+        let head = self.put_base(None, false)?;
 
-        // 4. The version switch.
-        self.switch_version(stored, target)?;
-        // 5. Leftovers.
+        // 6. The version switch.
+        self.switch_version(target)?;
+        // 7. Leftovers.
         self.remove_legacy_index();
 
-        let entries = head.entries;
         let base_bytes = head.base.as_ref().map_or(0, |b| b.size);
-        self.index_generation = generation_for_state(&head.state_hash);
+        self.index_generation = head.generation;
         self.index_head = Some(head);
         self.index_dirty = false;
         Ok(UpgradeOutcome::Upgraded {
             from: from.version(),
             to: target.version(),
+            chunk_hash: target.chunk_hash(),
             entries,
             base_bytes,
+            packs_mapped: maps.packs_mapped,
+            packs_unmapped: maps.packs_skipped_too_many,
             resumed,
         })
     }
@@ -215,12 +264,17 @@ impl Repository {
         Ok(decode_index_blob(data, self.crypto.as_ref())?.1)
     }
 
-    /// Step 4: the version switch. Fence check, then the `config` PUT.
-    fn switch_version(&mut self, mut stored: RepoConfig, target: RepoFormat) -> Result<()> {
-        stored.version = target.version();
+    /// Step 6: the version switch. Fence check, then the `config` PUT of
+    /// the handle's config as the v6 map (its hash is already the target's).
+    fn switch_version(&mut self, target: RepoFormat) -> Result<()> {
+        let mut config = self.config.clone();
+        config.version = target.version();
+        config.chunk_hash = target.chunk_hash().as_str().to_string();
+        config.features = Vec::new();
+        let bytes = config.encode()?;
         self.check_lock_fence()?;
-        self.storage.put("config", &rmp_serde::to_vec(&stored)?)?;
-        self.config.version = stored.version;
+        self.storage.put("config", &bytes)?;
+        self.config = config;
         self.format = target;
         Ok(())
     }
@@ -244,21 +298,5 @@ impl Repository {
         {
             let _ = std::fs::remove_file(blob);
         }
-    }
-
-    /// Write `index` as a base (none for an empty index) and the head naming
-    /// it, at the generation above every listed head. The new state is left
-    /// as the handle's index, in a scratch table.
-    fn write_upgraded_index(&mut self, index: &ChunkIndex) -> Result<IndexHead> {
-        self.storage.create_dir(index_store::HEAD_PREFIX)?;
-        self.storage.create_dir(index_store::INDEX_OBJECT_DIR)?;
-        let anchor = index_store::cache_anchor(self.cache_dir().as_deref());
-        let next = dedup_cache::full_cache_from_index_to_temp(index, &anchor)?;
-        let table = ChunkTable::scratch(next)
-            .map_err(|_| VykarError::Other("new index state failed verification".into()))?;
-        self.set_pending_sweep(PendingSweep::Initial);
-        let head = self.put_base(None, table.cache())?;
-        self.chunk_index = LiveIndex::from_table(Arc::new(table));
-        Ok(head)
     }
 }

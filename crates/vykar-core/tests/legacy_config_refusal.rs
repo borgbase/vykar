@@ -15,8 +15,11 @@
 //! are what the refusal depends on; `min_pack_size` and `max_pack_size` have a
 //! serde default in both releases.
 //!
-//! v6 does not exist yet: `v6_probe_fields` is a stand-in for its writer. When
-//! the real encoder lands, it replaces the probe and every assertion stays.
+//! The version refusals run on the real encoder (`RepoConfig::encode`) and on
+//! the configs of upgraded fixtures and fresh repositories. The hand-built
+//! probe (`v6_probe_fields`) remains for the mutation tests (a dropped or
+//! retyped field), and `the_probe_decodes_as_the_real_encoder_does` keeps it
+//! describing the real shape.
 //!
 //! `scripts/check-old-release-refusal.sh` runs the same bytes through the
 //! actual release binaries (`old_release_binaries_refuse_v6_map_by_version`).
@@ -35,11 +38,12 @@ mod v0_24_0;
 
 use chrono::{DateTime, TimeZone, Utc};
 use serde::ser::{SerializeMap, Serializer};
-use vykar_core::repo::{ChunkerParams, EncryptionMode};
+use vykar_core::repo::{ChunkerParams, EncryptionMode, LegacyRepoConfig, RepoConfig};
+use vykar_types::hash::HashAlgorithm;
 
 use crate::common::fixtures;
 
-/// Today's `RepoConfig` re-encodes every frozen fixture's `config` byte for
+/// `LegacyRepoConfig` re-encodes every frozen fixture's `config` byte for
 /// byte, so the type still reads and writes what released binaries wrote.
 #[test]
 fn repo_config_reencodes_every_fixture_config_byte_for_byte() {
@@ -47,7 +51,7 @@ fn repo_config_reencodes_every_fixture_config_byte_for_byte() {
         for mode in ["none", "aes256gcm", "chacha20poly1305"] {
             let fx = fixtures::extract(prefix, mode, version);
             let bytes = std::fs::read(fx.repo_dir().join("config")).unwrap();
-            let config: vykar_core::repo::RepoConfig =
+            let config: LegacyRepoConfig =
                 rmp_serde::from_slice(&bytes).unwrap_or_else(|e| panic!("{prefix}-{mode}: {e}"));
             assert_eq!(
                 rmp_serde::to_vec(&config).unwrap(),
@@ -58,12 +62,13 @@ fn repo_config_reencodes_every_fixture_config_byte_for_byte() {
     }
 }
 
-/// FMT-4: the positional 7-field `config` this binary writes for formats 6
-/// and 7 is refused by version by both old releases, and today's gate
-/// refuses the development versions 4 and 5 like any unknown version.
+/// FMT-4: the positional 7-field `config` that development builds of 05
+/// step 8 wrote for formats 6 and 7 is refused by version by both old
+/// releases; today's gate refuses it as a development build, and the
+/// development versions 4 and 5 like any unknown version.
 #[test]
 fn old_releases_refuse_positional_v6_and_v7_by_version() {
-    let config = |version: u32| vykar_core::repo::RepoConfig {
+    let config = |version: u32| LegacyRepoConfig {
         version,
         id: vec![0xA5; 32],
         chunker_params: ChunkerParams::default(),
@@ -80,17 +85,38 @@ fn old_releases_refuse_positional_v6_and_v7_by_version() {
                 other => panic!("{release}: v{version}: {other:?}"),
             }
         }
-        assert!(config(version).validate().is_ok(), "v{version}");
+        let err = RepoConfig::decode(&bytes)
+            .unwrap()
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("development build"), "v{version}: {err}");
     }
     for version in [4u32, 5] {
+        let bytes = rmp_serde::to_vec(&config(version)).unwrap();
         assert!(
             matches!(
-                config(version).validate(),
+                RepoConfig::decode(&bytes).unwrap().validate(),
                 Err(vykar_types::error::VykarError::UnsupportedVersion(v)) if v == version
             ),
             "v{version}"
         );
     }
+}
+
+/// The config the real encoder writes for the probe's values.
+fn real_v6(p: &Probe, hash: HashAlgorithm, features: &[&str]) -> Vec<u8> {
+    let mut config = RepoConfig::new_v6(
+        p.id.to_vec(),
+        p.chunker.clone(),
+        p.encryption.clone(),
+        p.created,
+        p.min_pack_size,
+        p.max_pack_size,
+        hash,
+    );
+    config.features = features.iter().map(|s| s.to_string()).collect();
+    config.encode().unwrap()
 }
 
 /// The two outcomes of an old release's `config` gate that this suite tells apart.
@@ -286,19 +312,91 @@ fn variant_name(mode: &EncryptionMode) -> &'static str {
 
 // ── Tests ──────────────────────────────────────────────────────────────────
 
+/// The real v6 encoder's config, both hashes and every encryption mode,
+/// with and without a feature, is refused by version by both releases.
 #[test]
 fn old_releases_refuse_a_v6_map_by_version() {
     for (release, gate) in RELEASES {
         for mode in MODES {
-            for features in [&[][..], &["some-future-feature"][..]] {
-                let bytes = encode_map(v6_probe_fields(&probe(6, mode.clone()), features));
-                expect_version_refusal(
-                    release,
-                    gate(&bytes),
-                    &format!("{mode:?}, features {features:?}"),
-                );
+            for hash in [HashAlgorithm::Blake2b, HashAlgorithm::Blake3] {
+                for features in [&[][..], &["some-future-feature"][..]] {
+                    let bytes = real_v6(&probe(6, mode.clone()), hash, features);
+                    expect_version_refusal(
+                        release,
+                        gate(&bytes),
+                        &format!("{mode:?}, {hash:?}, features {features:?}"),
+                    );
+                }
             }
         }
+    }
+}
+
+/// PROBE-EQ: the vendored v0.24.0 decode of the probe and of the real
+/// encoder's bytes for the same values are equal field by field, so the
+/// mutation tests on the probe describe the real shape.
+#[test]
+fn the_probe_decodes_as_the_real_encoder_does() {
+    for mode in MODES {
+        let p = probe(6, mode.clone());
+        let probe_bytes = encode_map(v6_probe_fields(&p, &[]));
+        let real_bytes = real_v6(&p, HashAlgorithm::Blake3, &[]);
+        assert_eq!(probe_bytes[0], real_bytes[0], "both are nine-entry maps");
+        let a: v0_24_0::RepoConfig = rmp_serde::from_slice(&probe_bytes).unwrap();
+        let b: v0_24_0::RepoConfig = rmp_serde::from_slice(&real_bytes).unwrap();
+        assert_eq!(a.version, b.version);
+        assert_eq!(a.id, b.id);
+        assert_eq!(
+            (
+                a.chunker_params.min_size,
+                a.chunker_params.avg_size,
+                a.chunker_params.max_size
+            ),
+            (
+                b.chunker_params.min_size,
+                b.chunker_params.avg_size,
+                b.chunker_params.max_size
+            )
+        );
+        assert_eq!(format!("{:?}", a.encryption), format!("{:?}", b.encryption));
+        assert_eq!(a.created, b.created);
+        assert_eq!(a.min_pack_size, b.min_pack_size);
+        assert_eq!(a.max_pack_size, b.max_pack_size);
+        // Today's decoder reads the probe as the same config.
+        assert_eq!(
+            RepoConfig::decode(&probe_bytes).unwrap().into_repo_config(),
+            RepoConfig::decode(&real_bytes).unwrap().into_repo_config()
+        );
+    }
+}
+
+/// OLD-1: every v2 and v3 fixture, upgraded, has a config both releases
+/// refuse by version.
+#[test]
+fn old_releases_refuse_upgraded_fixtures_by_version() {
+    for (prefix, version) in [("v2", 2u64), ("v3", 3)] {
+        for mode in ["none", "aes256gcm", "chacha20poly1305"] {
+            let fx = fixtures::extract(prefix, mode, version);
+            vykar_core::commands::upgrade::run(&fx.config(), fx.passphrase()).unwrap();
+            let bytes = std::fs::read(fx.repo_dir().join("config")).unwrap();
+            for (release, gate) in RELEASES {
+                expect_version_refusal(release, gate(&bytes), &format!("{prefix}-{mode}"));
+            }
+        }
+    }
+}
+
+/// OLD-2: the config `Repository::init` writes is refused by version.
+#[test]
+fn old_releases_refuse_a_new_repository_by_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo_dir = dir.path().join("repo");
+    let config = common::make_test_config(&repo_dir);
+    vykar_core::commands::init::run(&config, None).unwrap();
+    let bytes = std::fs::read(repo_dir.join("config")).unwrap();
+    assert_eq!(bytes[0], 0x89, "a nine-entry map");
+    for (release, gate) in RELEASES {
+        expect_version_refusal(release, gate(&bytes), "init");
     }
 }
 
@@ -540,14 +638,22 @@ fn vendored_decoders_use_the_release_rmp_serde() {
 /// Returns `(success, stderr)`.
 fn run_info(bin: &str, config_bytes: &[u8]) -> (bool, String) {
     let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join("config"), config_bytes).unwrap();
+    run_info_on(bin, &repo, "probe")
+}
+
+/// Runs `<bin> info` against the repository at `repo` (a copy is not made:
+/// the old binaries refuse before writing). Returns `(success, stderr)`.
+fn run_info_on(bin: &str, repo: &std::path::Path, passphrase: &str) -> (bool, String) {
+    let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
-    let repo = root.join("repo");
     let src = root.join("src");
     let home = root.join("home");
-    for dir in [&repo, &src, &home] {
+    for dir in [&src, &home] {
         std::fs::create_dir_all(dir).unwrap();
     }
-    std::fs::write(repo.join("config"), config_bytes).unwrap();
     // JSON is YAML; it also quotes Windows paths correctly.
     let yaml = serde_json::json!({
         "repositories": [{ "url": repo, "label": "main" }],
@@ -569,7 +675,7 @@ fn run_info(bin: &str, config_bytes: &[u8]) -> (bool, String) {
         .env("USERPROFILE", &home)
         .env("LOCALAPPDATA", home.join("AppData"))
         .env("NO_COLOR", "1")
-        .env("VYKAR_PASSPHRASE", "probe")
+        .env("VYKAR_PASSPHRASE", passphrase)
         .stdin(std::process::Stdio::null())
         .output()
         .unwrap_or_else(|e| panic!("run {bin}: {e}"));
@@ -611,23 +717,58 @@ fn old_release_binaries_refuse_v6_map_by_version() {
     }
 
     let p = probe(6, EncryptionMode::Aes256Gcm);
-    let map = encode_map(v6_probe_fields(&p, &[]));
+    let map = real_v6(&p, HashAlgorithm::Blake3, &[]);
     let positional = positional_v6(&p);
+
+    // An upgraded v3 (BLAKE3) and v2 (BLAKE2b) fixture, and a plaintext
+    // repository this build initialised and backed up into.
+    let upgraded: Vec<(&str, fixtures::Fixture)> =
+        [("v3", "aes256gcm", 3u64), ("v2", "aes256gcm", 2)]
+            .into_iter()
+            .map(|(prefix, mode, version)| {
+                let fx = fixtures::extract(prefix, mode, version);
+                vykar_core::commands::upgrade::run(&fx.config(), fx.passphrase()).unwrap();
+                (prefix, fx)
+            })
+            .collect();
+    let fresh = tempfile::tempdir().unwrap();
+    let fresh_repo = fresh.path().join("repo");
+    let fresh_src = fresh.path().join("src");
+    std::fs::create_dir_all(&fresh_src).unwrap();
+    std::fs::write(fresh_src.join("file.txt"), b"fresh").unwrap();
+    let fresh_config = common::make_test_config(&fresh_repo);
+    vykar_core::commands::init::run(&fresh_config, None).unwrap();
+    common::backup_source(&fresh_config, &fresh_src, "src", "s1", None, false);
+
+    let refused_by_version = |release: &str, what: &str, (ok, stderr): (bool, String)| {
+        eprintln!("{release} {what}: {}", stderr.trim());
+        assert!(!ok, "{release}: info succeeded on {what}");
+        assert!(
+            stderr.contains("unsupported repository version: 6"),
+            "{release} {what}: {stderr}"
+        );
+        assert!(
+            !stderr.contains("deserialization error"),
+            "{release} {what}: {stderr}"
+        );
+    };
     for (release, bin) in &bins {
         let Some(bin) = bin else {
             eprintln!("skipped {release}: no binary set");
             continue;
         };
-        let (ok, stderr) = run_info(bin, &map);
-        eprintln!("{release} map: {}", stderr.trim());
-        assert!(!ok, "{release}: info succeeded on a v6 config");
-        assert!(
-            stderr.contains("unsupported repository version: 6"),
-            "{release}: {stderr}"
-        );
-        assert!(
-            !stderr.contains("deserialization error"),
-            "{release}: {stderr}"
+        refused_by_version(release, "a v6 config", run_info(bin, &map));
+        for (prefix, fx) in &upgraded {
+            refused_by_version(
+                release,
+                &format!("an upgraded {prefix} fixture"),
+                run_info_on(bin, &fx.repo_dir(), fx.passphrase().unwrap_or("probe")),
+            );
+        }
+        refused_by_version(
+            release,
+            "a new repository",
+            run_info_on(bin, &fresh_repo, "probe"),
         );
 
         let (ok, stderr) = run_info(bin, &positional);

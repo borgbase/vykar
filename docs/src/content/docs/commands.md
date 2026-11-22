@@ -52,7 +52,7 @@ See [Maintain the Repository](/maintenance).
 | `vykar snapshot delete` | Delete one or more snapshots (the space is freed by the next `compact`) |
 | `vykar delete` | Delete an entire repository permanently |
 | `vykar break-lock` | Remove stale repository locks left by interrupted processes when lock conflicts block operations |
-| `vykar upgrade` | Upgrade a repository to the current format in place (one-way; see [Upgrade the repository format](/maintenance#upgrade-the-repository-format)) |
+| `vykar upgrade` | Upgrade a v2/v3 repository to format v6 in place, writing a pack map for every existing pack (one-way; see [Upgrade the repository format](/maintenance#upgrade-the-repository-format)) |
 
 ## Common flags
 

@@ -133,7 +133,7 @@ const MAX_SNAPSHOT_PROOF_ATTEMPTS: usize = 64;
 /// and the only evidence left when the index head is unreadable.
 ///
 /// Only without a pin is repository data consulted — the latest index head
-/// (`index.h/<gen>` for v6/v7, which `init` writes even for an empty
+/// (`index.h/<gen>` for v6, which `init` writes even for an empty
 /// repository; the `index` object for v2/v3), then a bounded number of
 /// snapshot blobs.
 ///

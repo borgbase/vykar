@@ -927,7 +927,7 @@ fn fail_after_the_index_write(
     let repo = crate::tests::helpers::open_local_repo(repo_dir);
     let head = repo.index_head().unwrap();
     assert_eq!(head.segments.len(), 1, "{head:?}");
-    assert!(head.entries > 0, "{head:?}");
+    assert!(head.segments[0].entries > 0, "{head:?}");
     drop(repo);
     assert!(repo_keys(config, "snapshots/").is_empty());
 
@@ -1086,13 +1086,16 @@ fn concurrent_commit_of_the_same_chunks_writes_nothing_for_them() {
 
 /// The session was reaped (its marker aged out, and maintenance deleted the
 /// snapshot it deduplicated against and compact swept that snapshot's
-/// chunks) while its marker probe was inconclusive, so the merge is the
-/// safety net: it finds reused chunks that are gone and fails the commit
-/// before any index write. Also when the session only reuses chunks (a
-/// delta of bumps only still runs the check, BK-2/R4).
+/// chunks) while its marker probe was inconclusive, so the commit's re-check
+/// of reused chunks is the safety net (the sweep moved `sweep.gen`): it
+/// finds reused chunks that are gone and fails the commit before any index
+/// write. Also when the session only reuses chunks (a delta of bumps only
+/// still runs the check, BK-2/R4), and (BK-4) whether the session found
+/// them in an applied segment (keyed bumps) or, after a fold, in the table
+/// (positional bumps).
 #[test]
 fn chunks_deleted_during_the_session_fail_the_commit_as_stale() {
-    for new_chunk in [true, false] {
+    for (new_chunk, fold_first) in [(true, false), (false, false), (true, true), (false, true)] {
         let (dir, config, src) = setup();
         // A snapshot that stays, so the sweep is not one to empty.
         let src0 = dir.path().join("src0");
@@ -1100,6 +1103,22 @@ fn chunks_deleted_during_the_session_fail_the_commit_as_stale() {
         fs::write(src0.join("z.bin"), vec![0x77u8; 16 * 1024]).unwrap();
         crate::tests::helpers::backup_single_source(&config, &src0, "test0", "s0");
         crate::tests::helpers::backup_single_source(&config, &src, "test", "s1");
+        if fold_first {
+            let mut repo = crate::commands::util::open_repo(
+                &config,
+                None,
+                crate::repo::OpenOptions::new().with_index(),
+                &CancelToken::new(),
+            )
+            .unwrap();
+            crate::commands::util::with_maintenance_lock(&mut repo, |repo| {
+                repo.request_index_fold();
+                repo.mark_index_dirty();
+                repo.save_state()
+            })
+            .unwrap();
+            assert!(repo.index_head().unwrap().segments.is_empty());
+        }
         if new_chunk {
             // A new chunk, so the session uploads a pack and journals it.
             fs::write(src.join("c.bin"), vec![0xc3u8; 32 * 1024]).unwrap();

@@ -487,7 +487,8 @@ fn backup_fails_when_repository_lock_is_held_by_another_process() {
 // Restore through the local chunk table
 // ---------------------------------------------------------------------------
 
-/// The chunk table files of `repo_id` in the default cache dir.
+/// The local index files (base tables and cached segments) of `repo_id` in
+/// the default cache dir.
 fn chunk_tables(repo_id: &[u8]) -> Vec<std::path::PathBuf> {
     let dir = filecache_path(repo_id)
         .parent()
@@ -502,7 +503,7 @@ fn chunk_tables(repo_id: &[u8]) -> Vec<std::path::PathBuf> {
         .filter(|p| {
             p.file_name()
                 .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with("chunk_table."))
+                .is_some_and(|n| n.starts_with("index_base.") || n.starts_with("index_segment."))
         })
         .collect()
 }

@@ -44,12 +44,14 @@ const LEGACY_CACHE_FILES: [&str; 3] = [DEDUP_CACHE_FILE, RESTORE_CACHE_FILE, FUL
 
 /// Targets `temp_file_beside` writes beside in the per-repo cache dir (the
 /// legacy names too, for temps an older binary left behind).
-const CACHE_FILE_NAMES: [&str; 5] = [
+const CACHE_FILE_NAMES: [&str; 7] = [
     DEDUP_CACHE_FILE,
     RESTORE_CACHE_FILE,
     FULL_INDEX_CACHE_FILE,
     INDEX_BLOB_CACHE_FILE,
     crate::index::table::TABLE_TEMP_TARGET,
+    crate::index::table::BASE_TEMP_TARGET,
+    crate::index::table::SEGMENT_TEMP_TARGET,
 ];
 
 /// Fixed temp names that binaries up to v0.24.0 wrote beside the caches
@@ -72,7 +74,7 @@ fn temp_prefix(target_name: &str) -> String {
 /// `target`. Unique names let concurrent writers of the same cache (two
 /// processes catching up one cache directory) never share a temp file; the
 /// last `persist` wins and every mapping keeps its own inode.
-fn temp_file_beside(target: &Path) -> Result<NamedTempFile> {
+pub(crate) fn temp_file_beside(target: &Path) -> Result<NamedTempFile> {
     let dir = match target.parent() {
         Some(p) if !p.as_os_str().is_empty() => p,
         _ => Path::new("."),
@@ -652,6 +654,7 @@ impl MmapFullIndexCache {
     }
 
     /// Get the ChunkId bytes for the i-th entry (for merge comparisons).
+    #[allow(dead_code, reason = "v1 index code, deleted in 05 step 10")]
     pub(crate) fn chunk_id_bytes_at(&self, i: usize) -> &[u8] {
         let offset = FULL_HEADER_SIZE + i * FULL_ENTRY_SIZE;
         &self.mmap[offset..offset + 32]
@@ -788,6 +791,7 @@ pub fn build_full_index_cache_to_path(
 /// `index` as a full index cache in a temp file beside `target`, generation
 /// derived from its state. Entries at refcount 0 are left out, as a segment
 /// diff treats them (see [`crate::index::segment::diff_to_temp`]).
+#[allow(dead_code, reason = "v1 index code, deleted in 05 step 10")]
 pub(crate) fn full_cache_from_index_to_temp(index: &ChunkIndex, target: &Path) -> Result<TempPath> {
     let mut entries: Vec<(&ChunkId, &crate::index::ChunkIndexEntry)> =
         index.iter().filter(|(_, e)| e.refcount > 0).collect();

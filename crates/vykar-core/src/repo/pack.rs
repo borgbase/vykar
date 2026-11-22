@@ -429,6 +429,14 @@ impl PackWriter {
         let mut frame = Vec::with_capacity(4 + blob.len());
         frame.extend_from_slice(&blob_len.to_le_bytes());
         frame.extend_from_slice(&blob);
+        debug_assert_eq!(
+            frame.len(),
+            crate::repo::pack_trailer::trailer_frame_len(
+                self.blob_meta.len(),
+                crypto.is_encrypting()
+            ) as usize,
+            "the trailer frame has the length the index records"
+        );
 
         let (pack_id, sealed_data, len) = match self.buffer.take().expect("buffer was initialized")
         {

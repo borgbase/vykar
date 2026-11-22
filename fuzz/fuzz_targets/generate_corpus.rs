@@ -15,14 +15,16 @@ use aes_gcm::Aes256Gcm;
 use aes_gcm::aead::{Aead, KeyInit};
 use vykar_core::compress::{Compression, compress};
 use vykar_core::index::base::encode_base;
+use vykar_core::index::base_v2::BaseWriter;
 use vykar_core::index::dedup_cache::{
     FullCacheEntry, MmapFullIndexCache, build_full_index_cache_to_path,
 };
 use vykar_core::index::head::{
     BaseRef, IndexHead, ObjectName, ObjectRef, SegmentKind, SegmentRef, SweepState,
 };
-use vykar_core::index::sweep_record::{SWEEP_RECORD_VERSION, SweepRecord};
 use vykar_core::index::segment::{RefcountDelta, Relocation, Segment, diff_to_temp};
+use vykar_core::index::segment_v2::{Location, SegmentBody};
+use vykar_core::index::sweep_record::{SWEEP_RECORD_VERSION, SweepRecord};
 use vykar_core::index::{
     ChunkIndex, IndexBlob, PendingChunkEntry, PendingPackEntry, encode_pending_journal,
 };
@@ -31,7 +33,7 @@ use vykar_core::repo::format::{ObjectType, pack_object_with_context};
 use vykar_core::repo::pack::{PackType, PackWriter};
 use vykar_core::repo::pack_map::{PackMap, PackMapEntry};
 use vykar_core::repo::pack_trailer::read_trailer_from_pack_bytes;
-use vykar_core::repo::{ChunkerParams, EncryptionMode, RepoConfig};
+use vykar_core::repo::{ChunkerParams, EncryptionMode, LegacyRepoConfig, RepoConfig};
 use vykar_core::snapshot::SnapshotMeta;
 use vykar_core::snapshot::item::{ChunkRef, Item, ItemRawNames, ItemType};
 use vykar_crypto::key::{EncryptedKey, KdfParams};
@@ -271,23 +273,19 @@ fn seed_index_head() {
         &IndexHead::initial().encode().unwrap(),
     );
     let head = IndexHead {
-        layout: 2,
+        layout: vykar_core::index::head::HEAD_LAYOUT_VERSION,
         generation: 7,
         features: Vec::new(),
-        state_hash: [3; 32],
-        entries: 12,
         base: Some(BaseRef {
             name: ObjectName([1; 32]),
             size: 100,
-            state_hash: [1; 32],
             entries: 10,
         }),
         segments: vec![SegmentRef {
             name: ObjectName([2; 32]),
             size: 20,
             kind: SegmentKind::Backup,
-            state_hash_after: [3; 32],
-            entries_after: 12,
+            entries: 2,
         }],
         retired: vec![ObjectName([9; 32])],
         sweep: SweepState {
@@ -429,19 +427,70 @@ fn seed_index_apply() {
     write_seed("fuzz_index_apply", "empty_base", &frame(0, &base, &add));
 }
 
+/// A keyed segment (body version 2) with an entry in every section.
+fn all_sections_segment_v2() -> SegmentBody {
+    let loc = |p: u8, off: u64, size: u32| Location {
+        pack_id: PackId::from_bytes([p; 32]),
+        pack_offset: off,
+        stored_size: size,
+    };
+    SegmentBody {
+        kind: SegmentKind::Maintenance,
+        additions: vec![(ChunkId::from_bytes([3; 32]), loc(9, 64, 777))],
+        removals: vec![ChunkId::from_bytes([4; 32]), ChunkId::from_bytes([5; 32])],
+        relocations: vec![(ChunkId::from_bytes([6; 32]), loc(8, 13, 4096))],
+        pack_trailers: vec![
+            (PackId::from_bytes([8; 32]), 0),
+            (PackId::from_bytes([9; 32]), 119),
+        ],
+    }
+}
+
+/// The base v2 body of `seed_chunk_index(n)`, every pack at trailer 0.
+fn base_v2_body(n: u8) -> Vec<u8> {
+    let index = seed_chunk_index(n);
+    let mut entries: Vec<_> = index.iter().map(|(id, e)| (*id, *e)).collect();
+    entries.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+    let mut packs: Vec<PackId> = entries.iter().map(|(_, e)| e.pack_id).collect();
+    packs.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    packs.dedup();
+    let table: Vec<(PackId, u32)> = packs.iter().map(|p| (*p, 77)).collect();
+    let mut w = BaseWriter::new(Vec::new(), &table, entries.len() as u32).unwrap();
+    for (id, e) in &entries {
+        let slot = packs.iter().position(|p| *p == e.pack_id).unwrap() as u32;
+        w.push(id, slot, e.pack_offset, e.stored_size).unwrap();
+    }
+    w.finish().unwrap()
+}
+
 fn seed_index_object() {
     let engine = PlaintextEngine::new(ChunkHasher::new(HashAlgorithm::Blake3, [7; 32]));
-    let (_, segment) = vykar_core::fuzzing::pack_segment(&all_sections_segment(), &engine).unwrap();
+    let (_, segment) =
+        vykar_core::fuzzing::pack_segment_v2(&all_sections_segment_v2(), &engine).unwrap();
     write_seed("fuzz_index_object", "segment", &segment);
-
-    let path = std::env::temp_dir().join("vykar-fuzz-corpus-index-object");
     for (name, n) in [("base_empty", 0u8), ("base_three_packs", 9)] {
-        build_full_index_cache_to_path(&seed_chunk_index(n), 1, &path).unwrap();
-        let cache = MmapFullIndexCache::open_verified(&path).unwrap();
-        let (_, base) = vykar_core::fuzzing::pack_base(&cache, &engine).unwrap();
+        let (_, base) = vykar_core::fuzzing::pack_base_body(&base_v2_body(n), &engine).unwrap();
         write_seed("fuzz_index_object", name, &base);
     }
-    let _ = fs::remove_file(&path);
+}
+
+fn seed_index_base_v2() {
+    write_seed("fuzz_index_base_v2", "empty", &base_v2_body(0));
+    write_seed("fuzz_index_base_v2", "three_packs", &base_v2_body(9));
+}
+
+fn seed_index_segment_v2() {
+    write_seed(
+        "fuzz_index_segment_v2",
+        "all_sections",
+        &all_sections_segment_v2().encode().unwrap(),
+    );
+    let mut backup = all_sections_segment_v2();
+    backup.kind = SegmentKind::Backup;
+    backup.removals.clear();
+    backup.relocations.clear();
+    backup.pack_trailers = vec![(PackId::from_bytes([9; 32]), 119)];
+    write_seed("fuzz_index_segment_v2", "backup", &backup.encode().unwrap());
 }
 
 fn seed_full_index_cache() {
@@ -756,8 +805,9 @@ fn seed_sweep_record() {
     write_seed("fuzz_sweep_record", "empty", &empty.encode().unwrap());
 }
 
+/// A positional (v2/v3, or a refused development version) config.
 fn repo_config(version: u32, chunker: ChunkerParams, min_pack: u32, max_pack: u32) -> Vec<u8> {
-    rmp_serde::to_vec(&RepoConfig {
+    rmp_serde::to_vec(&LegacyRepoConfig {
         version,
         id: vec![0x42; 32],
         chunker_params: chunker,
@@ -769,6 +819,26 @@ fn repo_config(version: u32, chunker: ChunkerParams, min_pack: u32, max_pack: u3
     .unwrap()
 }
 
+/// A v6 (map) config.
+fn repo_config_v6(
+    hash: HashAlgorithm,
+    chunker: ChunkerParams,
+    min_pack: u32,
+    max_pack: u32,
+) -> Vec<u8> {
+    RepoConfig::new_v6(
+        vec![0x42; 32],
+        chunker,
+        EncryptionMode::None,
+        fixed_time(),
+        min_pack,
+        max_pack,
+        hash,
+    )
+    .encode()
+    .unwrap()
+}
+
 fn seed_repo_config() {
     const MIB: u32 = 1024 * 1024;
     let small = ChunkerParams {
@@ -777,6 +847,19 @@ fn seed_repo_config() {
         max_size: 16384,
     };
     let seeds = [
+        (
+            "v6_default",
+            repo_config_v6(
+                HashAlgorithm::Blake3,
+                ChunkerParams::default(),
+                32 * MIB,
+                192 * MIB,
+            ),
+        ),
+        (
+            "v6_blake2b_small",
+            repo_config_v6(HashAlgorithm::Blake2b, small.clone(), MIB, 4 * MIB),
+        ),
         (
             "v5_default",
             repo_config(5, ChunkerParams::default(), 32 * MIB, 192 * MIB),
@@ -1043,6 +1126,12 @@ fn main() {
 
     seed_index_head();
     println!("  fuzz_index_head: done");
+
+    seed_index_base_v2();
+    println!("  fuzz_index_base_v2: done");
+
+    seed_index_segment_v2();
+    println!("  fuzz_index_segment_v2: done");
 
     seed_sweep_record();
     println!("  fuzz_sweep_record: done");

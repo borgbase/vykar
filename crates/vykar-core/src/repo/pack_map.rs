@@ -431,7 +431,7 @@ pub(crate) fn delete_dead_pack_maps(
 }
 
 /// What `Repository::write_pack_maps` did.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PackMapStats {
     pub maps_written: usize,
     pub packs_mapped: usize,
@@ -442,7 +442,30 @@ pub struct PackMapStats {
     /// over u32 or inside the pack header, too many entries); logged, not
     /// mapped.
     pub packs_skipped: usize,
+    /// Of `packs_skipped`: packs with more entries than a map may hold.
+    pub packs_skipped_too_many: usize,
+    /// Of `packs_skipped`: packs whose entries the index describes
+    /// inconsistently (overlap, an offset over u32 or inside the header),
+    /// with the reason, in pack ID order.
+    pub layout_violations: Vec<(PackId, String)>,
     pub bytes_written: u64,
+}
+
+/// The most entries a map may hold for one pack: [`MAX_PACK_MAP_ENTRIES`],
+/// or the value a test set.
+fn max_pack_map_entries() -> usize {
+    #[cfg(test)]
+    if let Some(n) = MAX_ENTRIES_FOR_TEST.with(std::cell::Cell::get) {
+        return n;
+    }
+    MAX_PACK_MAP_ENTRIES
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Lowers the per-pack entry limit of map writes on this thread (tests).
+    pub(crate) static MAX_ENTRIES_FOR_TEST: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// Whether `mapped` (a pack's map entries) lists every entry of `entries`.
@@ -500,7 +523,7 @@ impl Repository {
         target: usize,
         cancel: &CancelToken,
     ) -> Result<PackMapStats> {
-        if !self.chunk_index.is_loaded() && self.index_head().is_some_and(|h| h.entries > 0) {
+        if !self.chunk_index.is_loaded() && self.index_head().is_some_and(|h| !h.is_empty()) {
             return Err(VykarError::Other(
                 "BUG: the chunk index was not loaded before pack maps were written".into(),
             ));
@@ -560,26 +583,28 @@ impl Repository {
             ..PackMapStats::default()
         };
         let mut packs: Vec<(PackId, Vec<PackMapEntry>)> = Vec::with_capacity(by_pack.len());
+        let max_entries = max_pack_map_entries();
         for (pack_id, mut entries) in by_pack {
             entries.sort_by_key(|e| e.offset);
-            let why = unmappable.remove(&pack_id).or_else(|| {
-                if entries.len() > MAX_PACK_MAP_ENTRIES {
-                    Some(format!(
-                        "{} entries (max {MAX_PACK_MAP_ENTRIES})",
-                        entries.len()
-                    ))
-                } else {
-                    layout_violation(&entries)
-                }
-            });
-            match why {
-                Some(why) => {
-                    warn!(
-                        "pack map: pack {pack_id} has index entries a map cannot hold ({why}); not mapped"
-                    );
-                    stats.packs_skipped += 1;
-                }
-                None => packs.push((pack_id, entries)),
+            if let Some(why) = unmappable
+                .remove(&pack_id)
+                .or_else(|| layout_violation(&entries))
+            {
+                warn!(
+                    "pack map: pack {pack_id} has index entries a map cannot hold ({why}); not mapped"
+                );
+                stats.packs_skipped += 1;
+                stats.layout_violations.push((pack_id, why));
+            } else if entries.len() > max_entries {
+                warn!(
+                    "pack map: pack {pack_id} has index entries a map cannot hold ({} entries, \
+                     max {max_entries}); not mapped",
+                    entries.len()
+                );
+                stats.packs_skipped += 1;
+                stats.packs_skipped_too_many += 1;
+            } else {
+                packs.push((pack_id, entries));
             }
         }
         for (pack_id, why) in unmappable {
@@ -587,7 +612,11 @@ impl Repository {
                 "pack map: pack {pack_id} has index entries a map cannot hold ({why}); not mapped"
             );
             stats.packs_skipped += 1;
+            stats.layout_violations.push((pack_id, why));
         }
+        stats
+            .layout_violations
+            .sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
         packs.sort_by_key(|(id, _)| *id.as_bytes());
 
         let maps = group_into_maps(packs, target.max(1));

@@ -122,7 +122,7 @@ impl Client {
         std::fs::create_dir_all(&source).unwrap();
         let config = client(server, tmp.path(), "cache");
         let repo = commands::init::run(&config, None).unwrap();
-        assert_eq!(repo.format(), RepoFormat::V6);
+        assert_eq!(repo.format(), RepoFormat::CURRENT);
         Self {
             tmp,
             source,
@@ -242,10 +242,10 @@ fn v6_folds_at_the_hard_limit_on_an_append_only_server() {
 
     let mut counts = Vec::new();
     let mut last = None;
-    for round in 0..5u32 {
+    let mut toggled = None;
+    for _ in 0..5u32 {
         repo.load_chunk_index_under_lock().unwrap();
-        let id = repo.chunk_index().iter().next().unwrap().0;
-        repo.chunk_index_mut().increment_refcount_by(&id, round + 1);
+        crate::tests::segmented_writes::toggle_an_entry(&mut repo, &mut toggled);
         let live: Vec<_> = repo.index_head().unwrap().live_objects().collect();
         repo.save_state().unwrap();
         let head = repo.index_head().unwrap().clone();
@@ -256,7 +256,10 @@ fn v6_folds_at_the_hard_limit_on_an_append_only_server() {
         counts.push(head.segments.len());
         last = Some(head);
     }
-    assert_eq!(counts, vec![2, 0, 1, 2, 0]);
+    // Round 2 repeats round 0's removal after the fold retired it: on a
+    // plaintext repository the segment's name is already named (retired),
+    // so that write folds too.
+    assert_eq!(counts, vec![2, 0, 0, 1, 2]);
     let last = last.unwrap();
     assert!(last.named_objects().all(|n| {
         server
@@ -270,6 +273,10 @@ fn v6_folds_at_the_hard_limit_on_an_append_only_server() {
         c.cold_entries(&server, "cold"),
         sorted_entries(repo.chunk_index())
     );
+    // Put the removed entry back before the check.
+    repo.load_chunk_index_under_lock().unwrap();
+    crate::tests::segmented_writes::toggle_an_entry(&mut repo, &mut toggled);
+    repo.save_state().unwrap();
     drop(repo);
     check_clean(&c.config);
 }

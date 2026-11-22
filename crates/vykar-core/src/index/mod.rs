@@ -1,9 +1,11 @@
 pub mod base;
+pub mod base_v2;
 pub mod cached_bumps;
 pub mod dedup_cache;
 pub mod hasher;
 pub mod head;
 pub mod segment;
+pub mod segment_v2;
 pub mod sweep_record;
 pub mod table;
 
@@ -351,8 +353,8 @@ impl IndexDeltaCheckpoint {
 
 /// Records the index mutations of a write session.
 ///
-/// A backup commit merges it into the head's table (`segment::merge_delta_to_temp`);
-/// other writers apply it to the repository's `LiveIndex` at save time.
+/// A backup commit writes its new entries as a backup segment; other
+/// writers apply it to the repository's `LiveIndex` at save time.
 #[derive(Debug, Default)]
 pub struct IndexDelta {
     /// New chunk entries added during this session.
@@ -366,6 +368,9 @@ pub struct IndexDelta {
     /// bump for a chunk is its `refcount_bumps` value plus its count here;
     /// every consumer below adds both.
     pub cached_bumps: Option<CachedBumps>,
+    /// `trailer_len` of every pack the session sealed or recovered, filled
+    /// when the delta is taken from the session.
+    pub pack_trailers: HashMap<PackId, u32>,
     /// Undo log for the armed rollback checkpoint. `Some` ⟺ a checkpoint is
     /// armed. Maps each in-scope-mutated chunk to its `refcount_bumps` value at
     /// first touch (`None` = key was absent), so rollback replays exact prior
@@ -539,6 +544,9 @@ impl IndexDelta {
     /// only when the index does not hold the chunk. Bumps are not persisted
     /// (05 step 8), so `refcount_bumps` and `cached_bumps` are ignored.
     pub fn apply_to(self, index: &mut LiveIndex) {
+        for (pack, trailer_len) in self.pack_trailers {
+            index.set_pack_trailer(pack, trailer_len);
+        }
         for entry in self.new_entries {
             if !index.contains(&entry.chunk_id) {
                 index.add(

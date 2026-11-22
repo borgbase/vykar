@@ -726,13 +726,13 @@ impl EntryIter for crate::index::ChunkTable {
         vykar_types::chunk_id::ChunkId,
         crate::index::ChunkIndexEntry,
     )> {
-        self.cache()
-            .iter()
-            .map(|e| {
+        (0..self.len() as u32)
+            .map(|p| {
+                let e = self.entry_at(p);
                 (
                     e.chunk_id,
                     crate::index::ChunkIndexEntry {
-                        refcount: e.refcount,
+                        refcount: 1,
                         stored_size: e.stored_size,
                         pack_id: e.pack_id,
                         pack_offset: e.pack_offset,
@@ -741,6 +741,24 @@ impl EntryIter for crate::index::ChunkTable {
             })
             .collect()
     }
+}
+
+/// `index` as a scratch base table (every pack at `trailer_len` 0,
+/// refcount-0 entries left out), for tests that build a table by hand.
+pub(crate) fn base_table_of(
+    index: &crate::index::ChunkIndex,
+) -> std::sync::Arc<crate::index::ChunkTable> {
+    let anchor = crate::repo::index_store::cache_anchor(None);
+    let (tmp, _) = crate::index::table::base_body_from_chunk_index(index, &anchor).unwrap();
+    std::sync::Arc::new(crate::index::ChunkTable::install(tmp, None, None).unwrap())
+}
+
+/// A dedup prefilter over `index` as a base table with nothing applied.
+pub(crate) fn prefilter_of(
+    index: &crate::index::ChunkIndex,
+) -> crate::index::table::DedupPrefilter {
+    let live = crate::index::LiveIndex::from_table(base_table_of(index));
+    crate::index::table::DedupPrefilter::new(live.view().unwrap())
 }
 
 /// Save the active write session (its chunks enter the index) and begin a

@@ -16,7 +16,6 @@ use super::{
     default_min_pack_size,
 };
 use crate::index::LiveIndex;
-use crate::index::dedup_cache::generation_for_state;
 use crate::index::head::IndexHead;
 use vykar_crypto::key::{EncryptedKey, MasterKey};
 use vykar_crypto::{CryptoEngine, PlaintextEngine};
@@ -46,7 +45,7 @@ const PLAINTEXT_CHUNK_ID_KEY_CONTEXT: &str =
 /// resistance.
 pub(crate) fn derive_plaintext_chunk_id_key(repo_id: &[u8], format: RepoFormat) -> [u8; 32] {
     // Follows the chunk hash, not the version: a v2 repository keeps its key
-    // as v7.
+    // as v6 with BLAKE2b.
     match format.chunk_hash() {
         // Frozen: RustCrypto BLAKE2b-256, exactly as v2 repositories were
         // written. Do not "modernise" this to blake2b_simd without checking
@@ -146,15 +145,15 @@ impl Repository {
             )));
         }
 
-        let repo_config = RepoConfig {
-            version: format.version(),
-            id: repo_id,
-            chunker_params: chunker_params.clone(),
-            encryption: encryption.clone(),
-            created: Utc::now(),
+        let repo_config = RepoConfig::new_v6(
+            repo_id,
+            chunker_params.clone(),
+            encryption.clone(),
+            Utc::now(),
             min_pack_size,
             max_pack_size,
-        };
+            format.chunk_hash(),
+        );
 
         // Generate master key and crypto engine
         let (crypto, encrypted_key): (Arc<dyn CryptoEngine>, Option<EncryptedKey>) =
@@ -230,7 +229,7 @@ impl Repository {
         };
 
         // Store config (unencrypted)
-        let config_data = rmp_serde::to_vec(&repo_config)?;
+        let config_data = repo_config.encode()?;
         storage.put("config", &config_data)?;
 
         // Store encrypted key if applicable, in two copies.
@@ -258,7 +257,7 @@ impl Repository {
         storage.create_dir(index_store::HEAD_PREFIX)?;
         let head = IndexHead::initial();
         index_store::put_head(storage.as_ref(), &head, crypto.as_ref())?;
-        let index_generation = generation_for_state(&head.state_hash);
+        let index_generation = head.generation;
         let index_head = Some(head);
 
         // Create directory structure (skip if server already did it)
@@ -362,8 +361,8 @@ impl Repository {
         let config_data = storage
             .get("config")?
             .ok_or_else(|| VykarError::RepoNotFound("config not found".into()))?;
-        let repo_config: RepoConfig = rmp_serde::from_slice(&config_data)?;
-        let format = repo_config.validate()?;
+        let decoded = RepoConfig::decode(&config_data)?;
+        let format = decoded.validate()?;
         if format.is_upgrade_only() {
             if !opts.legacy_format {
                 return Err(super::upgrade::legacy_format_error(format));
@@ -374,6 +373,7 @@ impl Repository {
                 ));
             }
         }
+        let repo_config = decoded.into_repo_config();
 
         if opts.require_encryption && repo_config.encryption == EncryptionMode::None {
             return Err(VykarError::PlaintextRepository(
@@ -476,7 +476,7 @@ impl Repository {
         } else {
             match index_store::fetch_head(storage.as_ref(), crypto.as_ref()) {
                 Ok(head) => {
-                    index_generation = generation_for_state(&head.state_hash);
+                    index_generation = head.generation;
                     Some(head)
                 }
                 Err(e) if opts.tolerate_broken_index => {
@@ -524,8 +524,8 @@ mod tests {
     use vykar_types::chunk_id::ChunkId;
     use vykar_types::pack_id::PackId;
 
-    /// A plaintext repository whose index (refcounts 2, 1, 1) was persisted,
-    /// with its chunk table in `cache`.
+    /// A plaintext repository whose index was persisted as a base, with its
+    /// table file in `cache`.
     fn repo_with_caches(cache: &std::path::Path) -> (Arc<dyn StorageBackend>, Repository) {
         crate::testutil::init_test_environment();
         let inner: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
@@ -549,6 +549,9 @@ mod tests {
             );
         }
         index.increment_refcount(&ChunkId::from_bytes([0; 32]));
+        index.set_pack_trailer(pack, 0);
+        // A fold, so that the base's table file is in the cache dir.
+        repo.request_index_fold();
         repo.save_state().unwrap();
         (inner, repo)
     }
@@ -573,8 +576,8 @@ mod tests {
         }
         std::fs::write(&fresh_temp, b"fresh").unwrap();
         std::fs::write(&legacy_cache, b"legacy").unwrap();
-        let state = repo.index_head().unwrap().state_hash;
-        let table = crate::index::table::table_path(&dir, &state);
+        let base = repo.index_head().unwrap().base.as_ref().unwrap().name;
+        let table = crate::index::table::base_table_path(&dir, &base);
         std::fs::File::options()
             .write(true)
             .open(&table)
@@ -630,11 +633,11 @@ mod tests {
             "947392f5ba41ab94ef39cc84b74bbb5a0c578bf7841b6b6cf76b17ad4a9e5b67"
         );
         assert_eq!(
-            derive_plaintext_chunk_id_key(&repo_id, RepoFormat::V7),
+            derive_plaintext_chunk_id_key(&repo_id, RepoFormat::V6(HashAlgorithm::Blake2b)),
             derive_plaintext_chunk_id_key(&repo_id, RepoFormat::V2)
         );
         assert_eq!(
-            derive_plaintext_chunk_id_key(&repo_id, RepoFormat::V6),
+            derive_plaintext_chunk_id_key(&repo_id, RepoFormat::V6(HashAlgorithm::Blake3)),
             derive_plaintext_chunk_id_key(&repo_id, RepoFormat::V3)
         );
     }

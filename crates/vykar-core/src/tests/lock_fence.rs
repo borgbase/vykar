@@ -172,6 +172,8 @@ fn fence_blocks_persist_index_via_mark_dirty() {
         vykar_types::pack_id::PackId::from_bytes([8; 32]),
         0,
     );
+    repo.chunk_index_mut()
+        .set_pack_trailer(vykar_types::pack_id::PackId::from_bytes([8; 32]), 0);
 
     // Install an always-fail fence.
     let fail_fence: Arc<dyn Fn() -> vykar_types::error::Result<()> + Send + Sync> =

@@ -29,8 +29,9 @@ use super::control::CancelToken;
 use super::pack_listing::list_packs;
 use super::pack_map::read_pack_maps;
 use super::pack_trailer::{TrailerRead, read_pack_trailer};
-use crate::index::dedup_cache::{FullCacheEntry, FullCacheWriter};
-use crate::index::table::ChunkTable;
+use crate::index::base_v2::BaseWriter;
+use crate::index::table::{ChunkTable, TableFileWriter};
+use crate::repo::pack_trailer::trailer_frame_len;
 
 /// Lowest valid blob offset: the pack header plus one length prefix.
 const FIRST_BLOB_OFFSET: u64 = vykar_protocol::PACK_HEADER_SIZE as u64 + 4;
@@ -72,8 +73,10 @@ pub struct RebuildCounts {
 
 /// The result of [`rebuild_index_from_packs`].
 pub(crate) struct Rebuilt {
-    /// The rebuilt state as a full cache in a temp file (refcount 1 each).
-    pub cache: TempPath,
+    /// The rebuilt state as a base body in a table file (a temp file). A
+    /// pack described by its trailer records that trailer's frame length,
+    /// one described by a map 0, one from a local table that table's value.
+    pub body: TempPath,
     pub counts: RebuildCounts,
     /// In pack ID order.
     pub uncovered: Vec<UncoveredPack>,
@@ -131,6 +134,9 @@ pub(crate) fn rebuild_index_from_packs(
         .collect::<Result<_>>()?;
 
     let found: Mutex<Vec<Found>> = Mutex::new(Vec::new());
+    // trailer_len by pack slot, for packs described by their trailer.
+    let trailers: Mutex<HashMap<u32, u32>> = Mutex::new(HashMap::new());
+    let encrypting = crypto.is_encrypting();
     let outcomes: Mutex<Vec<(u32, Outcome)>> = Mutex::new(Vec::with_capacity(slots.len()));
     let record = |slot: u32, outcome: Outcome| {
         outcomes
@@ -182,6 +188,10 @@ pub(crate) fn rebuild_index_from_packs(
         }
         match read_pack_trailer(storage, &pack.key, len, crypto)? {
             TrailerRead::Found(t) => {
+                trailers
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(slot, trailer_frame_len(t.entries.len(), encrypting));
                 let mut found = found.lock().unwrap_or_else(PoisonError::into_inner);
                 found.extend(
                     t.entries
@@ -262,6 +272,9 @@ pub(crate) fn rebuild_index_from_packs(
     cancel.check()?;
 
     let mut found = found.into_inner().unwrap_or_else(PoisonError::into_inner);
+    let mut trailers = trailers
+        .into_inner()
+        .unwrap_or_else(PoisonError::into_inner);
     let mut outcomes = outcomes
         .into_inner()
         .unwrap_or_else(PoisonError::into_inner);
@@ -298,10 +311,14 @@ pub(crate) fn rebuild_index_from_packs(
         let mut covered: Vec<u32> = Vec::new();
         for table in local_tables() {
             cancel.check()?;
-            for e in table.cache().iter() {
+            for position in 0..table.len() as u32 {
+                let e = table.entry_at(position);
                 let Some(&slot) = by_id.get(&e.pack_id) else {
                     continue;
                 };
+                if let Some(t) = table.pack_trailer_len(&e.pack_id) {
+                    trailers.insert(slot, t);
+                }
                 let Some((len, _)) = undescribed.get(&slot) else {
                     continue;
                 };
@@ -345,23 +362,35 @@ pub(crate) fn rebuild_index_from_packs(
     // The lowest (pack ID, offset) of each chunk.
     found.sort_unstable_by_key(|&(id, slot, offset, _)| (*id.as_bytes(), slot, offset));
     found.dedup_by_key(|e| e.0);
-    let mut writer = FullCacheWriter::new_beside(anchor)?;
+    // The packs the entries use, in slot (= pack ID) order.
+    let mut used: Vec<u32> = found.iter().map(|f| f.1).collect();
+    used.sort_unstable();
+    used.dedup();
+    let pack_table: Vec<(PackId, u32)> = used
+        .iter()
+        .map(|slot| {
+            let pack_id = slots
+                .get(*slot as usize)
+                .map(|(_, p)| p.pack_id)
+                .ok_or_else(|| {
+                    VykarError::Other("BUG: rebuilt entry names no listed pack".into())
+                })?;
+            Ok((pack_id, trailers.get(slot).copied().unwrap_or(0)))
+        })
+        .collect::<Result<_>>()?;
+    let count = u32::try_from(found.len())
+        .map_err(|_| VykarError::Other("rebuilt index has more than u32::MAX entries".into()))?;
+    let mut writer = BaseWriter::new(TableFileWriter::new_beside(anchor)?, &pack_table, count)?;
     for &(chunk_id, slot, offset, stored_size) in &found {
-        let pack_id = slots
-            .get(slot as usize)
-            .map(|(_, p)| p.pack_id)
-            .ok_or_else(|| VykarError::Other("BUG: rebuilt entry names no listed pack".into()))?;
-        writer.push(&FullCacheEntry {
-            chunk_id,
-            refcount: 1,
-            stored_size,
-            pack_id,
-            pack_offset: u64::from(offset),
-        })?;
+        let base_slot = used
+            .binary_search(&slot)
+            .map_err(|_| VykarError::Other("BUG: rebuilt entry names no used pack".into()))?
+            as u32;
+        writer.push(&chunk_id, base_slot, u64::from(offset), stored_size)?;
     }
     drop(found);
-    let (tmp, _, entries) = writer.finish(None)?;
-    counts.entries = entries;
+    let tmp = writer.finish()?.finish()?;
+    counts.entries = u64::from(count);
     info!(
         packs = counts.packs,
         from_maps = counts.from_maps,
@@ -373,7 +402,7 @@ pub(crate) fn rebuild_index_from_packs(
         "rebuilt the chunk index from the packs"
     );
     Ok(Rebuilt {
-        cache: tmp.into_temp_path(),
+        body: tmp,
         counts,
         uncovered,
         from_local_tables,
@@ -383,7 +412,6 @@ pub(crate) fn rebuild_index_from_packs(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::dedup_cache::FullCacheEntry;
     use crate::repo::pack::{PackType, PackWriter};
     use crate::repo::pack_map::{PackMap, PackMapEntry, pack_map_key};
     use crate::repo::pack_trailer::{parse_footer, trailer_frame_start};
@@ -463,17 +491,15 @@ mod tests {
     /// The report of `rebuilt` and its entries, which all have refcount 1.
     fn summarize(rebuilt: Rebuilt) -> (Summary, Vec<Loc>) {
         let Rebuilt {
-            cache,
+            body,
             counts,
             uncovered,
             from_local_tables,
         } = rebuilt;
-        let table = ChunkTable::scratch(cache).unwrap();
-        let mut locs: Vec<Loc> = table
-            .cache()
-            .iter()
-            .map(|e| {
-                assert_eq!(e.refcount, 1);
+        let table = ChunkTable::install(body, None, None).unwrap();
+        let mut locs: Vec<Loc> = (0..table.len() as u32)
+            .map(|p| {
+                let e = table.entry_at(p);
                 (e.chunk_id, e.pack_id, e.pack_offset, e.stored_size)
             })
             .collect();
@@ -590,20 +616,42 @@ mod tests {
     }
 
     /// A verified table of `locs` (sorted by chunk ID), as a scratch file.
-    fn table_of(locs: &[Loc], dir: &Path) -> Arc<ChunkTable> {
-        let mut w = FullCacheWriter::new_beside(&dir.join("t")).unwrap();
-        for &(chunk_id, pack_id, pack_offset, stored_size) in &sorted(locs.to_vec()) {
-            w.push(&FullCacheEntry {
-                chunk_id,
-                refcount: 3,
-                stored_size,
-                pack_id,
-                pack_offset,
-            })
-            .unwrap();
+    fn table_of(locs: &[Loc], _dir: &Path) -> Arc<ChunkTable> {
+        let mut index = crate::index::ChunkIndex::new();
+        for &(chunk_id, pack_id, pack_offset, stored_size) in locs {
+            index.add(chunk_id, stored_size, pack_id, pack_offset);
         }
-        let tmp = w.finish(None).unwrap().0.into_temp_path();
-        Arc::new(ChunkTable::scratch(tmp).unwrap())
+        crate::testutil::base_table_of(&index)
+    }
+
+    /// REB-1: a rebuilt index records the trailer frame length of packs its
+    /// trailer described, 0 for packs a map described.
+    #[test]
+    fn rebuild_records_trailer_lengths() {
+        let storage = MemoryBackend::new();
+        let (by_trailer, _) = put_pack(&storage, &[1, 2, 3]);
+        let (by_map, mapped) = put_pack(&storage, &[4, 5]);
+        put_map(&storage, &map_of(&mapped));
+        let dir = tempfile::tempdir().unwrap();
+        let rebuilt = rebuild_index_from_packs(
+            &storage,
+            &plain(),
+            HashAlgorithm::Blake2b,
+            Vec::new,
+            &dir.path().join("anchor"),
+            2,
+            &CancelToken::new(),
+        )
+        .unwrap();
+        let table = ChunkTable::install(rebuilt.body, None, None).unwrap();
+        assert_eq!(
+            table.pack_trailer_len(&by_trailer),
+            Some(crate::repo::pack_trailer::trailer_frame_len(3, false))
+        );
+        assert_eq!(table.pack_trailer_len(&by_map), Some(0));
+        let bytes = storage.get(&by_trailer.storage_key()).unwrap().unwrap();
+        let blob_len = parse_footer(&bytes).unwrap();
+        assert_eq!(table.pack_trailer_len(&by_trailer), Some(4 + blob_len));
     }
 
     #[test]

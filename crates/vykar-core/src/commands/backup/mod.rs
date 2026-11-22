@@ -5,6 +5,7 @@ mod concurrency;
 mod drift;
 mod instrument;
 mod item_cut;
+mod listing;
 mod phases;
 pub(crate) mod pipeline;
 mod source;
@@ -32,17 +33,15 @@ use crate::platform::fs;
 use crate::repo::control::{CancelToken, CommitEvent};
 use crate::repo::file_cache::{CachedChunks, FileCache, ParentReuseIndex, RetainedHit};
 use crate::repo::lock;
-use crate::repo::pack::PackType;
 use crate::repo::{HostEnv, Repository, WriteSessionOptions};
 use crate::snapshot::SnapshotStats;
 use crate::snapshot::item::Item;
 use crate::storage;
 use vykar_common::display::{format_bytes, format_count};
 use vykar_storage::StorageBackend;
-use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
 
-pub(crate) use item_cut::ItemStreamCutter;
+pub(crate) use listing::ListingWriter;
 
 /// Normalize a relative path to always use `/` as the separator.
 ///
@@ -146,38 +145,6 @@ fn resolve_cache_hit(
         Some(chunks) => CacheResolution::Hit(chunks, None),
         None => CacheResolution::Miss,
     }
-}
-
-pub(crate) fn flush_item_stream_chunk(
-    repo: &mut Repository,
-    item_stream: &mut Vec<u8>,
-    item_ptrs: &mut Vec<ChunkId>,
-    compression: Compression,
-) -> Result<()> {
-    if item_stream.is_empty() {
-        return Ok(());
-    }
-    let chunk_data = std::mem::take(item_stream);
-    let (chunk_id, _csize, _is_new) = repo.store_chunk(&chunk_data, compression, PackType::Tree)?;
-    item_ptrs.push(chunk_id);
-    Ok(())
-}
-
-pub(crate) fn append_item_to_stream(
-    repo: &mut Repository,
-    item_stream: &mut Vec<u8>,
-    item_ptrs: &mut Vec<ChunkId>,
-    item: &Item,
-    cutter: &ItemStreamCutter,
-    compression: Compression,
-) -> Result<()> {
-    let start = item_stream.len();
-    rmp_serde::encode::write(item_stream, item)?;
-    let entry_len = item_stream.len() - start;
-    if cutter.should_cut(&item.path, entry_len, item_stream.len()) {
-        flush_item_stream_chunk(repo, item_stream, item_ptrs, compression)?;
-    }
-    Ok(())
 }
 
 /// Run-local tally of cloud-only (macOS `FileProvider`) content that could not

@@ -5,7 +5,8 @@
 //! and maximum chunk sizes. Because the decision depends on the entry and not
 //! on its stream offset, an inserted or removed entry only changes the chunks
 //! around it, and later chunks deduplicate against the previous snapshot.
-//! Backup and the `check --repair` listing rewriter both cut with this rule.
+//! Backup and the `check --repair` listing rewriter both cut with this rule,
+//! through `ListingWriter`.
 
 use vykar_types::chunk_id::ChunkHasher;
 use zeroize::{Zeroize, ZeroizeOnDrop};

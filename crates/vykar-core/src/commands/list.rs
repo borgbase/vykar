@@ -335,8 +335,9 @@ fn resolve_from_index(index: &crate::index::LiveIndex, ids: &[ChunkId]) -> Resul
 
 /// A snapshot's item stream read on demand: only the current range read
 /// (at most `LAZY_WINDOW_MAX`, 4 MiB) and the plaintext of the chunk being decoded
-/// are resident, instead of the whole decompressed stream. Items may straddle
-/// chunk boundaries; the [`BufRead`] impl hides them.
+/// are resident, instead of the whole decompressed stream. Every tree chunk
+/// holds whole entries (see `ListingWriter`); this reader does not rely on it
+/// and decodes across chunk boundaries through its [`BufRead`] impl.
 ///
 /// A chunk held by the local tree-chunk cache is decoded from there on its
 /// own, and windows stop before such a chunk, so it is not downloaded;
@@ -783,6 +784,9 @@ where
 }
 
 /// Decode item stream bytes and call `visit` for each item in stream order.
+///
+/// Applied to one tree chunk, an error includes a chunk that ends inside an
+/// entry; the mark and `check` decode each tree chunk on its own this way.
 pub fn for_each_decoded_item(
     items_stream: &[u8],
     mut visit: impl FnMut(Item) -> Result<()>,

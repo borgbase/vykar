@@ -26,14 +26,13 @@ use crate::repo::control::CancelToken;
 use crate::repo::file_cache::{CachedChunks, FileCache, ParentReuseIndex, RetainedHit};
 use crate::snapshot::SnapshotStats;
 use vykar_crypto::CryptoEngine;
-use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
 
 use super::concurrency::ByteBudget;
 use super::instrument::{PipelineClocks, PipelineTimings};
 use super::source::ResolvedSource;
 use super::walk::{DatalessKind, WalkEntry, build_walk_iter, reserve_budget};
-use super::{BackupProgressEvent, ItemStreamCutter};
+use super::{BackupProgressEvent, ListingWriter};
 
 mod consumer;
 mod segmentation;
@@ -253,7 +252,6 @@ pub(crate) struct PipelineCtx<'a> {
     pub num_workers: usize,
     pub readahead_depth: usize,
     pub segment_size: u64,
-    pub item_cutter: &'a ItemStreamCutter,
     pub pipeline_buffer_bytes: usize,
     pub prefilter: Option<&'a DedupPrefilter>,
     pub shutdown: &'a CancelToken,
@@ -263,8 +261,8 @@ pub(crate) struct PipelineCtx<'a> {
 
 /// Mutable output buffers written by the pipeline's consumer stage.
 pub(crate) struct PipelineBuffers<'a> {
-    pub item_stream: &'a mut Vec<u8>,
-    pub item_ptrs: &'a mut Vec<ChunkId>,
+    /// The snapshot's listing, written in walk order.
+    pub listing: &'a mut ListingWriter,
     pub stats: &'a mut SnapshotStats,
     pub new_file_cache: &'a mut FileCache,
     /// Run-level tally of unreachable cloud-only content, accumulated across
@@ -301,7 +299,6 @@ pub(crate) fn run_parallel_pipeline(
         num_workers,
         readahead_depth,
         segment_size,
-        item_cutter,
         pipeline_buffer_bytes,
         prefilter,
         shutdown,
@@ -309,8 +306,7 @@ pub(crate) fn run_parallel_pipeline(
         parent_reuse_index,
     } = *ctx;
     let PipelineBuffers {
-        item_stream,
-        item_ptrs,
+        listing,
         stats,
         new_file_cache,
         dataless,
@@ -642,10 +638,7 @@ pub(crate) fn run_parallel_pipeline(
                             repo,
                             stats,
                             new_file_cache,
-                            item_cutter,
-                            item_stream,
-                            item_ptrs,
-                            compression,
+                            listing,
                             progress,
                             &budget,
                             prefilter,

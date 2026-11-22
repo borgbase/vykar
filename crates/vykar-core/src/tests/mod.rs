@@ -20,6 +20,7 @@ mod index_rebuild;
 mod info;
 mod item;
 mod lazy_item_stream;
+mod listing_writer;
 mod lock;
 mod lock_fence;
 mod maintenance_index;

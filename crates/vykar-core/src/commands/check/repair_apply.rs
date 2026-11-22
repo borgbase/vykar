@@ -172,9 +172,7 @@ fn prepare_rewrite(
     item_indices: &[usize],
     action_idx: usize,
 ) -> Result<PreparedRewrite> {
-    use crate::commands::backup::{
-        ItemStreamCutter, append_item_to_stream, flush_item_stream_chunk,
-    };
+    use crate::commands::backup::ListingWriter;
 
     let drop: HashSet<usize> = item_indices.iter().copied().collect();
 
@@ -182,11 +180,7 @@ fn prepare_rewrite(
     let old_stream =
         load_snapshot_item_stream_from_storage(repo, snapshot_name, &CancelToken::new())?;
 
-    let cutter = ItemStreamCutter::new(repo.crypto.chunk_hasher());
-    let compression = Compression::default();
-
-    let mut new_item_ptrs: Vec<ChunkId> = Vec::new();
-    let mut buf: Vec<u8> = Vec::new();
+    let mut listing = ListingWriter::new(repo.crypto.chunk_hasher(), Compression::default());
     let mut nfiles: u64 = 0;
     let mut original_size: u64 = 0;
     let mut idx: usize = 0;
@@ -203,14 +197,7 @@ fn prepare_rewrite(
             nfiles += 1;
             original_size += item.size;
         }
-        append_item_to_stream(
-            repo,
-            &mut buf,
-            &mut new_item_ptrs,
-            &item,
-            &cutter,
-            compression,
-        )
+        listing.push(repo, &item)
     })?;
 
     if kept == 0 {
@@ -219,12 +206,12 @@ fn prepare_rewrite(
         )));
     }
 
-    flush_item_stream_chunk(repo, &mut buf, &mut new_item_ptrs, compression)?;
+    let listing = listing.finish(repo)?;
 
     // Build new SnapshotMeta. Time fields and source labels mirror the
     // original so users still see when the data was captured.
     let mut new_meta = old_meta.clone();
-    new_meta.item_ptrs = new_item_ptrs;
+    new_meta.item_ptrs = listing.item_ptrs;
     new_meta.stats.nfiles = nfiles;
     new_meta.stats.original_size = original_size;
     // Stamp the current format version on the rewritten snapshot — the

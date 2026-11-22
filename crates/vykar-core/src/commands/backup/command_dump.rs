@@ -19,8 +19,8 @@ use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
 
 use super::{
-    BackupProgressEvent, ItemStreamCutter, append_item_to_stream, emit_progress,
-    emit_stats_progress, with_rollback_checkpoint,
+    BackupProgressEvent, ListingWriter, emit_progress, emit_stats_progress,
+    with_rollback_checkpoint,
 };
 
 /// Default timeout for command_dump execution (1 hour).
@@ -234,14 +234,11 @@ fn stream_dump_command(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(super) fn process_command_dumps(
     repo: &mut Repository,
     command_dumps: &[CommandDump],
     compression: Compression,
-    item_cutter: &ItemStreamCutter,
-    item_stream: &mut Vec<u8>,
-    item_ptrs: &mut Vec<ChunkId>,
+    listing: &mut ListingWriter,
     stats: &mut SnapshotStats,
     progress: &mut Option<&mut dyn FnMut(BackupProgressEvent)>,
     time_start: chrono::DateTime<Utc>,
@@ -268,14 +265,7 @@ pub(super) fn process_command_dumps(
         raw_names: None,
         hardlink: None,
     };
-    append_item_to_stream(
-        repo,
-        item_stream,
-        item_ptrs,
-        &dumps_dir_item,
-        item_cutter,
-        compression,
-    )?;
+    listing.push(repo, &dumps_dir_item)?;
 
     for dump in command_dumps {
         info!(
@@ -320,14 +310,7 @@ pub(super) fn process_command_dumps(
             raw_names: None,
             hardlink: None,
         };
-        append_item_to_stream(
-            repo,
-            item_stream,
-            item_ptrs,
-            &dump_item,
-            item_cutter,
-            compression,
-        )?;
+        listing.push(repo, &dump_item)?;
 
         emit_stats_progress(progress, stats, Some(format!("vykar-dumps/{}", dump.name)));
     }

@@ -4,40 +4,36 @@
 //! `ProcessedEntry` has been restored to walk-order. For each entry this
 //! commits pack-bound chunks via `process_worker_chunks`, advances the
 //! segmented-file state machine (delegating to [`super::segmentation`]),
-//! updates stats / file-cache / item stream, and surfaces progress events.
+//! updates stats / file-cache, appends the entry to the listing, and
+//! surfaces progress events.
 //! Releases budget bytes once chunks are committed so the walker can
 //! proceed. Skip / rollback handling lives in the orchestrator, not here.
 
 use tracing::debug;
 
-use crate::compress::Compression;
 use crate::index::table::DedupPrefilter;
 use crate::repo::Repository;
 use crate::repo::file_cache::{CachedChunks, FileCache};
 use crate::snapshot::SnapshotStats;
-use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
 
 use super::super::commit::{commit_cache_hit, process_worker_chunks};
 use super::super::concurrency::ByteBudget;
 use super::super::{
-    BackupProgressEvent, FileStatus, ItemStreamCutter, append_item_to_stream, emit_progress,
-    emit_stats_progress, stamp_item_metadata,
+    BackupProgressEvent, FileStatus, ListingWriter, emit_progress, emit_stats_progress,
+    stamp_item_metadata,
 };
 use super::ProcessedEntry;
 use super::segmentation::{LargeFileAccum, validate_segment_accum};
 
-/// Consume a single processed entry: dedup check, pack commit, item stream, file cache.
+/// Consume a single processed entry: dedup check, pack commit, listing, file cache.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn consume_processed_entry(
     entry: ProcessedEntry,
     repo: &mut Repository,
     stats: &mut SnapshotStats,
     new_file_cache: &mut FileCache,
-    item_cutter: &ItemStreamCutter,
-    item_stream: &mut Vec<u8>,
-    item_ptrs: &mut Vec<ChunkId>,
-    compression: Compression,
+    listing: &mut ListingWriter,
     progress: &mut Option<&mut dyn FnMut(BackupProgressEvent)>,
     budget: &ByteBudget,
     prefilter: Option<&DedupPrefilter>,
@@ -87,14 +83,7 @@ pub(super) fn consume_processed_entry(
                 );
             }
 
-            append_item_to_stream(
-                repo,
-                item_stream,
-                item_ptrs,
-                &item,
-                item_cutter,
-                compression,
-            )?;
+            listing.push(repo, &item)?;
 
             new_file_cache.insert(
                 &abs_path,
@@ -190,14 +179,7 @@ pub(super) fn consume_processed_entry(
                     );
                 }
 
-                append_item_to_stream(
-                    repo,
-                    item_stream,
-                    item_ptrs,
-                    &accum.item,
-                    item_cutter,
-                    compression,
-                )?;
+                listing.push(repo, &accum.item)?;
 
                 new_file_cache.insert(
                     &accum.abs_path,
@@ -239,14 +221,7 @@ pub(super) fn consume_processed_entry(
                 );
             }
 
-            append_item_to_stream(
-                repo,
-                item_stream,
-                item_ptrs,
-                &item,
-                item_cutter,
-                compression,
-            )?;
+            listing.push(repo, &item)?;
 
             new_file_cache.insert_cache_hit(
                 &abs_path,
@@ -264,14 +239,7 @@ pub(super) fn consume_processed_entry(
         }
 
         ProcessedEntry::NonFile { item } => {
-            append_item_to_stream(
-                repo,
-                item_stream,
-                item_ptrs,
-                &item,
-                item_cutter,
-                compression,
-            )?;
+            listing.push(repo, &item)?;
         }
 
         ProcessedEntry::SourceStarted { path } => {

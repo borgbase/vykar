@@ -7,9 +7,8 @@ use tracing::{debug, info, warn};
 
 use super::instrument::{BackupInstrumentation, PipelineTimings};
 use super::{
-    BackupProgressEvent, BackupRequest, DatalessTally, ItemStreamCutter, Prepared, command_dump,
-    emit_post_commit_warning, emit_progress, flush_item_stream_chunk, pipeline, source,
-    source_paths_match,
+    BackupProgressEvent, BackupRequest, DatalessTally, ListingWriter, Prepared, command_dump,
+    emit_post_commit_warning, emit_progress, pipeline, source, source_paths_match,
 };
 use crate::config::VykarConfig;
 use crate::repo::control::{CancelToken, CommitEvent, FnMutSink};
@@ -20,7 +19,6 @@ use crate::repo::manifest::SnapshotEntry;
 use crate::repo::{HostEnv, Repository, WriteSessionOptions};
 use crate::snapshot::{SnapshotMeta, SnapshotStats};
 use vykar_storage::StorageBackend;
-use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
 use vykar_types::snapshot_id::SnapshotId;
 
@@ -235,9 +233,7 @@ pub(super) fn phase1_upload(
 
     let time_start = clock.now_utc();
     let mut stats = SnapshotStats::default();
-    let mut item_stream = Vec::new();
-    let mut item_ptrs: Vec<ChunkId> = Vec::new();
-    let item_cutter = ItemStreamCutter::new(repo.crypto.chunk_hasher());
+    let mut listing = ListingWriter::new(repo.crypto.chunk_hasher(), compression);
     let mut new_file_cache = FileCache::new();
 
     // Prepare write cache: the loaded sections' sizes pre-size the
@@ -256,9 +252,7 @@ pub(super) fn phase1_upload(
         repo,
         command_dumps,
         compression,
-        &item_cutter,
-        &mut item_stream,
-        &mut item_ptrs,
+        &mut listing,
         &mut stats,
         progress,
         time_start,
@@ -289,7 +283,6 @@ pub(super) fn phase1_upload(
             num_workers,
             readahead_depth: pipeline_depth,
             segment_size,
-            item_cutter: &item_cutter,
             pipeline_buffer_bytes,
             prefilter: prefilter.as_ref(),
             shutdown,
@@ -297,8 +290,7 @@ pub(super) fn phase1_upload(
             parent_reuse_index: parent_reuse_index.as_ref(),
         };
         let mut pipeline_bufs = pipeline::PipelineBuffers {
-            item_stream: &mut item_stream,
-            item_ptrs: &mut item_ptrs,
+            listing: &mut listing,
             stats: &mut stats,
             new_file_cache: &mut new_file_cache,
             dataless,
@@ -333,7 +325,7 @@ pub(super) fn phase1_upload(
     // Bail before committing if shutdown was requested during the walk.
     shutdown.check()?;
 
-    flush_item_stream_chunk(repo, &mut item_stream, &mut item_ptrs, compression)?;
+    let listing = listing.finish(repo)?;
 
     // Seal partial packs and wait for every upload here, without the lock,
     // so Phase 2 holds it only for the index/snapshot writes. The final
@@ -380,7 +372,7 @@ pub(super) fn phase1_upload(
         time_end,
         chunker_params: repo.config.chunker_params.clone(),
         comment: String::new(),
-        item_ptrs,
+        item_ptrs: listing.item_ptrs,
         stats: stats.clone(),
         source_label: source_label.to_string(),
         source_paths: source_paths.to_vec(),

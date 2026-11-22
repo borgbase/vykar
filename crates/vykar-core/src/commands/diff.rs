@@ -1,11 +1,21 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
-use super::list::ItemStreamReader;
+use super::backup::command_dump::DUMPS_ROOT;
+use super::list::{
+    ItemStreamReader, for_each_decoded_item, load_snapshot_meta, resolve_from_index,
+};
+use super::listing::ListingView;
+use super::mark::{
+    ChunkOutcome, OnChunkError, TreeChunkSet, default_decode_threads, walk_tree_chunks,
+};
 use crate::config::VykarConfig;
+use crate::index::hasher::{BuildChunkIdHasher, ChunkIdHashMap};
 use crate::repo::control::CancelToken;
 use crate::repo::manifest::SnapshotEntry;
-use crate::repo::{OpenOptions, Repository};
-use crate::snapshot::item::ItemType;
+use crate::repo::{OpenOptions, Repository, TreeChunkSource};
+use crate::snapshot::SnapshotMeta;
+use crate::snapshot::item::{Item, ItemType};
+use crate::snapshot::listing::rel_in;
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
 
@@ -32,10 +42,83 @@ pub struct DiffResult {
     pub entries: Vec<DiffEntry>,
 }
 
+/// One regular file of a side: its display path, size and chunk IDs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FileSig {
+    path: String,
     size: u64,
     chunk_ids: Vec<ChunkId>,
+}
+
+/// A regular file as decoded from a tree chunk; `raw` is
+/// `raw_names.path` when present, so [`Self::key`] is `Item::path_bytes()`.
+#[derive(Debug)]
+struct DecodedFile {
+    raw: Option<Vec<u8>>,
+    sig: FileSig,
+}
+
+impl DecodedFile {
+    fn from_item(item: Item) -> Self {
+        Self {
+            raw: item.raw_names.and_then(|r| r.path),
+            sig: FileSig {
+                path: item.path,
+                size: item.size,
+                chunk_ids: item.chunks.into_iter().map(|c| c.id).collect(),
+            },
+        }
+    }
+
+    /// The comparison key: the raw path bytes, else the display path's.
+    fn key(&self) -> &[u8] {
+        self.raw.as_deref().unwrap_or(self.sig.path.as_bytes())
+    }
+}
+
+/// A side of the diff: comparison key (`Item::path_bytes()`) -> the last
+/// regular file with it.
+type SideMap<'a> = BTreeMap<&'a [u8], &'a FileSig>;
+
+/// The decoded tree chunks of a diff: each chunk's regular files, in order.
+type DecodedChunks = ChunkIdHashMap<Vec<DecodedFile>>;
+
+/// Why the full diff ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FullDiffReason {
+    /// A tree chunk occurs more than once in one snapshot's `item_ptrs`.
+    RepeatedPointer,
+    /// A snapshot's key index has two segments whose roots are equal or
+    /// nested (an empty root contains every other), so one path can occur
+    /// in two segments.
+    NestedSegments,
+    /// Two regular files of one side have the same path among the decoded
+    /// chunks.
+    DuplicatePath,
+}
+
+impl FullDiffReason {
+    fn describe(self) -> &'static str {
+        match self {
+            Self::RepeatedPointer => "full: repeated pointer",
+            Self::NestedSegments => "full: nested segments",
+            Self::DuplicatePath => "full: duplicate path",
+        }
+    }
+}
+
+/// What a diff read, for the debug line and tests.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct DiffStats {
+    pub(crate) base_pointers: usize,
+    pub(crate) target_pointers: usize,
+    /// Distinct tree chunks both snapshots name.
+    pub(crate) shared: usize,
+    /// Distinct tree chunks decoded, over all walks.
+    pub(crate) decoded_chunks: usize,
+    pub(crate) stored_bytes: u64,
+    pub(crate) plaintext_bytes: u64,
+    pub(crate) full: Option<FullDiffReason>,
 }
 
 pub fn run(
@@ -57,15 +140,222 @@ pub fn run(
     ensure_distinct_snapshots(&entry_a, &entry_b)?;
 
     let (base, target) = order_snapshots(entry_a, entry_b);
-    let mut reader = ItemStreamReader::new(&repo);
-    let base_map = load_regular_file_map(&mut repo, &mut reader, &base.name)?;
-    let target_map = load_regular_file_map(&mut repo, &mut reader, &target.name)?;
+    let (entries, _stats) = diff_on_repo(&mut repo, &base, &target, &CancelToken::new())?;
 
     Ok(DiffResult {
         base_snapshot: base.name,
         target_snapshot: target.name,
-        entries: diff_maps(&base_map, &target_map),
+        entries,
     })
+}
+
+/// Diff `base` against `target` (already ordered) on an open repository.
+///
+/// A tree chunk both snapshots name holds the same entries in both, so only
+/// the chunks one of them names alone are decoded, and regular files are
+/// matched by their raw path bytes. When a snapshot names a tree chunk
+/// twice, has a key index with nested segment roots, or two decoded regular
+/// files of one side share a path, both listings are decoded in full and
+/// the last file with a path wins, as in a whole-stream diff. A duplicate
+/// with one copy in a shared tree chunk is not detected.
+pub(crate) fn diff_on_repo(
+    repo: &mut Repository,
+    base: &SnapshotEntry,
+    target: &SnapshotEntry,
+    shutdown: &CancelToken,
+) -> Result<(Vec<DiffEntry>, DiffStats)> {
+    let base_meta = load_snapshot_meta(repo, &base.name)?;
+    let target_meta = load_snapshot_meta(repo, &target.name)?;
+    ItemStreamReader::new(repo).ensure_index(repo)?;
+    // Every pointer resolves, also those of the shared chunks, which are not
+    // read: a dangling pointer fails the diff as a whole-stream read does.
+    resolve_from_index(repo.chunk_index(), &base_meta.item_ptrs)?;
+    resolve_from_index(repo.chunk_index(), &target_meta.item_ptrs)?;
+
+    let base_ptrs = &base_meta.item_ptrs;
+    let target_ptrs = &target_meta.item_ptrs;
+    let base_set = id_set(base_ptrs);
+    let target_set = id_set(target_ptrs);
+    let mut stats = DiffStats {
+        base_pointers: base_ptrs.len(),
+        target_pointers: target_ptrs.len(),
+        shared: base_set
+            .iter()
+            .filter(|id| target_set.contains(*id))
+            .count(),
+        ..DiffStats::default()
+    };
+    stats.full = if base_set.len() < base_ptrs.len() || target_set.len() < target_ptrs.len() {
+        Some(FullDiffReason::RepeatedPointer)
+    } else if has_nested_segments(&base_meta) || has_nested_segments(&target_meta) {
+        Some(FullDiffReason::NestedSegments)
+    } else {
+        None
+    };
+
+    let mut files = DecodedChunks::default();
+    let mut entries = None;
+    if stats.full.is_none() {
+        let base_only: Vec<ChunkId> = base_ptrs
+            .iter()
+            .filter(|id| !target_set.contains(*id))
+            .copied()
+            .collect();
+        let target_only: Vec<ChunkId> = target_ptrs
+            .iter()
+            .filter(|id| !base_set.contains(*id))
+            .copied()
+            .collect();
+        decode_into(
+            repo,
+            &[&base_only, &target_only],
+            &mut files,
+            &mut stats,
+            shutdown,
+        )?;
+        let (base_map, base_dup) = side_map(&base_only, &files)?;
+        let (target_map, target_dup) = side_map(&target_only, &files)?;
+        if base_dup || target_dup {
+            stats.full = Some(FullDiffReason::DuplicatePath);
+        } else {
+            entries = Some(diff_maps(&base_map, &target_map));
+        }
+    }
+    let entries = match entries {
+        Some(entries) => entries,
+        None => {
+            // The chunks decoded already are not decoded again.
+            let missing: Vec<ChunkId> = base_ptrs
+                .iter()
+                .chain(target_ptrs)
+                .filter(|id| !files.contains_key(*id))
+                .copied()
+                .collect();
+            decode_into(repo, &[&missing], &mut files, &mut stats, shutdown)?;
+            let (base_map, _) = side_map(base_ptrs, &files)?;
+            let (target_map, _) = side_map(target_ptrs, &files)?;
+            diff_maps(&base_map, &target_map)
+        }
+    };
+
+    tracing::debug!(
+        "diff: base {} pointers, target {} pointers, {} shared; decoded {} tree chunks ({} B stored, {} B plaintext); {}",
+        stats.base_pointers,
+        stats.target_pointers,
+        stats.shared,
+        stats.decoded_chunks,
+        stats.stored_bytes,
+        stats.plaintext_bytes,
+        stats.full.map_or("chunk-aware", FullDiffReason::describe)
+    );
+    Ok((entries, stats))
+}
+
+/// A set of tree chunk IDs.
+type IdSet = HashSet<ChunkId, BuildChunkIdHasher>;
+
+fn id_set(ptrs: &[ChunkId]) -> IdSet {
+    ptrs.iter().copied().collect()
+}
+
+/// Whether `meta`'s key index has two nested segment roots (see
+/// [`roots_nested`]). False without a usable index.
+fn has_nested_segments(meta: &SnapshotMeta) -> bool {
+    let view = ListingView::new(meta);
+    let Ok(index) = view.index() else {
+        return false;
+    };
+    let roots: Vec<&[u8]> = index.segments.iter().map(|s| s.root.as_slice()).collect();
+    roots_nested(&roots)
+}
+
+/// Whether two of `roots` are equal or one lies under the other (an empty
+/// root contains every path), except the pair of an empty root and
+/// [`DUMPS_ROOT`]: root "" only comes from a single-path directory source,
+/// and with command dumps active backup excludes `/vykar-dumps` from the
+/// walk (an explicit exclude, tested before the gitignore stack), so that
+/// segment holds no entry under `vykar-dumps/`. The snapshot does not
+/// record the exclusion; this exemption relies on it.
+fn roots_nested(roots: &[&[u8]]) -> bool {
+    roots.iter().enumerate().any(|(i, a)| {
+        roots.iter().skip(i + 1).any(|b| {
+            let dumps_pair =
+                (a.is_empty() && *b == DUMPS_ROOT) || (b.is_empty() && *a == DUMPS_ROOT);
+            !dumps_pair && (rel_in(a, b).is_some() || rel_in(b, a).is_some())
+        })
+    })
+}
+
+/// Decode every chunk of `ids` once into `files`: the regular files of
+/// each chunk, in chunk order. A chunk that does not decode on its own fails
+/// the diff; read errors are returned as the read returned them.
+fn decode_into(
+    repo: &Repository,
+    ids: &[&[ChunkId]],
+    files: &mut DecodedChunks,
+    stats: &mut DiffStats,
+    shutdown: &CancelToken,
+) -> Result<()> {
+    let set = TreeChunkSet::build(ids);
+    let decode = |_k: usize, plain: &[u8]| -> std::result::Result<Vec<DecodedFile>, VykarError> {
+        let mut out = Vec::new();
+        for_each_decoded_item(plain, |item| {
+            if shutdown.is_cancelled() {
+                return Err(VykarError::Interrupted);
+            }
+            if item.entry_type == ItemType::RegularFile {
+                out.push(DecodedFile::from_item(item));
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    };
+    let walk = walk_tree_chunks(
+        repo,
+        &set,
+        TreeChunkSource::CacheFirst,
+        OnChunkError::Abort,
+        default_decode_threads(),
+        shutdown,
+        decode,
+        |k, outcome| {
+            let id = *set.id(k);
+            match outcome {
+                ChunkOutcome::Decoded(Ok(decoded)) => {
+                    files.insert(id, decoded);
+                    Ok(())
+                }
+                ChunkOutcome::Decoded(Err(e @ VykarError::Interrupted)) => Err(e),
+                ChunkOutcome::Decoded(Err(e)) => Err(VykarError::Other(format!(
+                    "tree chunk {id} does not decode on its own: {e}"
+                ))),
+                // Abort mode hands `collect` decoded chunks only.
+                _ => Err(VykarError::Other(format!(
+                    "internal error: tree chunk {id} not decoded"
+                ))),
+            }
+        },
+    )?;
+    stats.decoded_chunks += walk.chunks;
+    stats.stored_bytes += walk.stored_bytes;
+    stats.plaintext_bytes += walk.plaintext_bytes;
+    Ok(())
+}
+
+/// The regular files of the chunks `ptrs`, in stream order, the last file
+/// with a key winning; and whether a key occurred twice.
+fn side_map<'a>(ptrs: &[ChunkId], files: &'a DecodedChunks) -> Result<(SideMap<'a>, bool)> {
+    let mut map = SideMap::new();
+    let mut dup = false;
+    for id in ptrs {
+        let decoded = files.get(id).ok_or_else(|| {
+            VykarError::Other(format!("internal error: tree chunk {id} not decoded"))
+        })?;
+        for f in decoded {
+            dup |= map.insert(f.key(), &f.sig).is_some();
+        }
+    }
+    Ok((map, dup))
 }
 
 fn order_snapshots(
@@ -89,39 +379,13 @@ fn ensure_distinct_snapshots(snapshot_a: &SnapshotEntry, snapshot_b: &SnapshotEn
     Ok(())
 }
 
-fn load_regular_file_map(
-    repo: &mut Repository,
-    reader: &mut ItemStreamReader,
-    snapshot_name: &str,
-) -> Result<BTreeMap<String, FileSig>> {
-    let stream = reader.load(repo, snapshot_name, &CancelToken::new())?;
-    let mut map = BTreeMap::new();
-    super::list::for_each_decoded_item(&stream, |item| {
-        if item.entry_type == ItemType::RegularFile {
-            let chunk_ids = item.chunks.into_iter().map(|chunk| chunk.id).collect();
-            map.insert(
-                item.path,
-                FileSig {
-                    size: item.size,
-                    chunk_ids,
-                },
-            );
-        }
-        Ok(())
-    })?;
-    Ok(map)
-}
-
-fn diff_maps(
-    base: &BTreeMap<String, FileSig>,
-    target: &BTreeMap<String, FileSig>,
-) -> Vec<DiffEntry> {
+fn diff_maps(base: &SideMap<'_>, target: &SideMap<'_>) -> Vec<DiffEntry> {
     let mut entries = Vec::new();
 
-    for (path, old) in base {
-        match target.get(path) {
+    for (key, old) in base {
+        match target.get(key) {
             None => entries.push(DiffEntry {
-                path: path.clone(),
+                path: old.path.clone(),
                 change: DiffChangeKind::Removed,
                 old_size: Some(old.size),
                 new_size: None,
@@ -129,7 +393,7 @@ fn diff_maps(
             }),
             Some(new) if old.size != new.size || old.chunk_ids != new.chunk_ids => {
                 entries.push(DiffEntry {
-                    path: path.clone(),
+                    path: old.path.clone(),
                     change: DiffChangeKind::Modified,
                     old_size: Some(old.size),
                     new_size: Some(new.size),
@@ -140,10 +404,10 @@ fn diff_maps(
         }
     }
 
-    for (path, new) in target {
-        if !base.contains_key(path) {
+    for (key, new) in target {
+        if !base.contains_key(key) {
             entries.push(DiffEntry {
-                path: path.clone(),
+                path: new.path.clone(),
                 change: DiffChangeKind::Added,
                 old_size: None,
                 new_size: Some(new.size),
@@ -171,25 +435,43 @@ mod tests {
     use super::*;
     use crate::snapshot::item::{ChunkRef, Item};
 
-    fn map_from(items: Vec<Item>) -> BTreeMap<String, FileSig> {
+    /// The regular files of `items`, as the diff decodes them.
+    fn files_from(items: Vec<Item>) -> Vec<DecodedFile> {
         items
             .into_iter()
             .filter(|item| item.entry_type == ItemType::RegularFile)
-            .map(|item| {
-                let chunk_ids = item.chunks.into_iter().map(|c| c.id).collect();
-                (
-                    item.path,
-                    FileSig {
-                        size: item.size,
-                        chunk_ids,
-                    },
-                )
-            })
+            .map(DecodedFile::from_item)
             .collect()
     }
 
+    /// A side map over `files`, the last file with a key winning.
+    fn map_of(files: &[DecodedFile]) -> SideMap<'_> {
+        files.iter().map(|f| (f.key(), &f.sig)).collect()
+    }
+
+    #[test]
+    fn roots_nested_exempts_only_the_dumps_pair() {
+        let nested = |roots: &[&str]| {
+            let roots: Vec<&[u8]> = roots.iter().map(|r| r.as_bytes()).collect();
+            roots_nested(&roots)
+        };
+        assert!(!nested(&["", "vykar-dumps"]));
+        assert!(!nested(&["vykar-dumps", ""]));
+        assert!(nested(&["", "a"]));
+        assert!(nested(&["a", "a/b"]));
+        assert!(nested(&["a", "a"]));
+        assert!(nested(&["", "vykar-dumps", "vykar-dumps"]));
+        assert!(nested(&["", "vykar-dumps", "x"]));
+        assert!(nested(&["vykar-dumps", "vykar-dumps/x"]));
+        assert!(nested(&["", "vykar-dumps/x"]));
+        assert!(!nested(&["a", "b"]));
+        assert!(!nested(&["a", "ab"]));
+        assert!(!nested(&["vykar-dumps", "a", "b"]));
+    }
+
     fn diff_items(base: Vec<Item>, target: Vec<Item>) -> Vec<DiffEntry> {
-        diff_maps(&map_from(base), &map_from(target))
+        let (base, target) = (files_from(base), files_from(target));
+        diff_maps(&map_of(&base), &map_of(&target))
     }
 
     fn file(path: &str, size: u64, chunk_bytes: &[u8]) -> Item {
@@ -340,9 +622,9 @@ mod tests {
         );
     }
 
-    /// Regression: streaming items through `for_each_decoded_item` into a
-    /// `FileSig` map must produce the same input that `diff_maps` operates
-    /// on as the previous eager `regular_file_map(Vec<Item>)` did.
+    /// Regression: streaming items through `for_each_decoded_item` into
+    /// decoded files must produce the same input that `diff_maps` operates
+    /// on as the eager conversion of a `Vec<Item>` does.
     #[test]
     fn diff_with_streaming_loader_matches_collected_loader() {
         let base_items = vec![
@@ -358,16 +640,16 @@ mod tests {
             non_file("link", ItemType::Symlink),
         ];
 
-        let eager_base = map_from(base_items.clone());
-        let eager_target = map_from(target_items.clone());
+        let eager_base = files_from(base_items.clone());
+        let eager_target = files_from(target_items.clone());
 
-        let streamed_base = stream_to_map(&base_items);
-        let streamed_target = stream_to_map(&target_items);
+        let streamed_base = stream_to_files(&base_items);
+        let streamed_target = stream_to_files(&target_items);
 
-        assert_eq!(streamed_base, eager_base);
-        assert_eq!(streamed_target, eager_target);
+        assert_eq!(map_of(&streamed_base), map_of(&eager_base));
+        assert_eq!(map_of(&streamed_target), map_of(&eager_target));
 
-        let entries = diff_maps(&streamed_base, &streamed_target);
+        let entries = diff_maps(&map_of(&streamed_base), &map_of(&streamed_target));
         assert_eq!(
             kinds(&entries),
             vec![
@@ -378,27 +660,20 @@ mod tests {
         );
     }
 
-    fn stream_to_map(items: &[Item]) -> BTreeMap<String, FileSig> {
+    fn stream_to_files(items: &[Item]) -> Vec<DecodedFile> {
         let mut bytes = Vec::new();
         for item in items {
             bytes.extend_from_slice(&rmp_serde::to_vec(item).unwrap());
         }
-        let mut map = BTreeMap::new();
-        super::super::list::for_each_decoded_item(&bytes, |item| {
+        let mut files = Vec::new();
+        for_each_decoded_item(&bytes, |item| {
             if item.entry_type == ItemType::RegularFile {
-                let chunk_ids = item.chunks.into_iter().map(|c| c.id).collect();
-                map.insert(
-                    item.path,
-                    FileSig {
-                        size: item.size,
-                        chunk_ids,
-                    },
-                );
+                files.push(DecodedFile::from_item(item));
             }
             Ok(())
         })
         .unwrap();
-        map
+        files
     }
 
     #[test]

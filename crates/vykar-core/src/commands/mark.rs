@@ -269,19 +269,23 @@ pub(crate) struct WalkStats {
     pub(crate) decode_time: Duration,
 }
 
-/// A resolved chunk of the set: (slot, location).
-type Located = (usize, (ChunkId, PackId, u64, u32));
+/// A resolved tree chunk: (slot or stream position, chunk location).
+pub(crate) type Located = (usize, (ChunkId, PackId, u64, u32));
 
-/// Cut `located` (sorted by pack and offset) into read batches of at most
-/// [`MARK_BATCH_CHUNKS`] chunks and [`MARK_BATCH_STORED_BYTES`] stored
-/// bytes; a batch holds at least one chunk.
-fn cut_batches(located: &[Located]) -> Vec<&[Located]> {
+/// Cut `located` into consecutive batches of at most `max_chunks` chunks
+/// and `max_stored` stored bytes, in the order given; a batch holds at
+/// least one chunk.
+pub(crate) fn cut_batches_with(
+    located: &[Located],
+    max_chunks: usize,
+    max_stored: u64,
+) -> Vec<&[Located]> {
     let mut batches = Vec::new();
     let mut start = 0;
     let mut bytes = 0u64;
     for (i, (_, loc)) in located.iter().enumerate() {
         let size = u64::from(loc.3);
-        if i > start && (i - start >= MARK_BATCH_CHUNKS || bytes + size > MARK_BATCH_STORED_BYTES) {
+        if i > start && (i - start >= max_chunks || bytes + size > max_stored) {
             batches.push(&located[start..i]);
             start = i;
             bytes = 0;
@@ -294,13 +298,19 @@ fn cut_batches(located: &[Located]) -> Vec<&[Located]> {
     batches
 }
 
+/// [`cut_batches_with`] at the mark's caps, [`MARK_BATCH_CHUNKS`] and
+/// [`MARK_BATCH_STORED_BYTES`] (`located` sorted by pack and offset).
+fn cut_batches(located: &[Located]) -> Vec<&[Located]> {
+    cut_batches_with(located, MARK_BATCH_CHUNKS, MARK_BATCH_STORED_BYTES)
+}
+
 /// Record the plaintext ranges of a split read of `expected` chunks that
 /// appended to the buffer from `from` on (now `buf_len` bytes long), the
 /// first chunk at batch position `first`. `ends` is what
 /// [`Repository::read_tree_chunks_split`] returned. An internal error
 /// unless there is one end per chunk, non-decreasing and inside
 /// `from..=buf_len`, so the ranges index the buffer safely.
-fn push_spans(
+pub(crate) fn push_spans(
     spans: &mut Vec<(usize, Range<usize>)>,
     first: usize,
     from: usize,

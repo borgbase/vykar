@@ -956,6 +956,37 @@ fn cli_snapshot_list_latest_alias() {
 }
 
 #[test]
+fn cli_snapshot_list_path_filter() {
+    let fx = CliFixture::new();
+    write_plain_config(&fx.config_path, &fx.repo_dir);
+
+    let cfg = fx.config_path.to_string_lossy().to_string();
+    let source = fx.source_a.to_string_lossy().to_string();
+
+    std::fs::create_dir_all(fx.source_a.join("sub/b")).unwrap();
+    std::fs::create_dir_all(fx.source_a.join("subx")).unwrap();
+    std::fs::write(fx.source_a.join("sub/a"), b"a\n").unwrap();
+    std::fs::write(fx.source_a.join("sub/b/c"), b"c\n").unwrap();
+    std::fs::write(fx.source_a.join("subx/d"), b"d\n").unwrap();
+    std::fs::write(fx.source_a.join("top"), b"top\n").unwrap();
+
+    fx.run_ok(&["--config", &cfg, "init"]);
+    fx.run_ok(&["--config", &cfg, "backup", &source]);
+
+    for filter in ["sub", "./sub/"] {
+        let out = fx.run_ok(&[
+            "--config", &cfg, "snapshot", "list", "latest", "--path", filter,
+        ]);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(
+            lines,
+            vec!["sub", "sub/a", "sub/b", "sub/b/c"],
+            "--path {filter}"
+        );
+    }
+}
+
+#[test]
 fn cli_snapshot_info_latest_alias() {
     let fx = CliFixture::new();
     write_plain_config(&fx.config_path, &fx.repo_dir);

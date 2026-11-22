@@ -4,13 +4,17 @@ use chrono::{DateTime, Utc};
 use globset::GlobMatcher;
 
 use crate::config::VykarConfig;
-use crate::repo::OpenOptions;
 use crate::repo::control::CancelToken;
+use crate::repo::manifest::SnapshotEntry;
+use crate::repo::{OpenOptions, Repository, TreeChunkSource};
 use crate::snapshot::item::{Item, ItemType};
 use vykar_types::chunk_id::ChunkId;
-use vykar_types::error::Result;
+use vykar_types::error::{Result, VykarError};
 
-use super::list;
+use super::list::{self, ItemStreamReader};
+use super::mark::{
+    ChunkOutcome, OnChunkError, TreeChunkSet, WalkStats, default_decode_threads, walk_tree_chunks,
+};
 
 /// Filter criteria (all fields are AND-combined).
 ///
@@ -125,7 +129,8 @@ pub struct PathTimeline {
 
 /// Run the find command: search for files across snapshots.
 /// Resolves item streams through the local chunk table where there is one,
-/// so no index download is needed.
+/// so no index download is needed. Each distinct tree chunk of the selected
+/// snapshots is read and decoded once.
 pub fn run(
     config: &VykarConfig,
     passphrase: Option<&str>,
@@ -139,8 +144,14 @@ pub fn run(
         &CancelToken::new(),
     )?;
 
-    // Select and sort snapshots chronologically
-    let mut entries: Vec<_> = repo.manifest().snapshots.clone();
+    let entries = select_snapshots(&repo.manifest().snapshots, scope);
+    let (timelines, _stats) = find_on_repo(&mut repo, &entries, filter, &CancelToken::new())?;
+    Ok(timelines)
+}
+
+/// The snapshots `scope` selects, chronologically.
+fn select_snapshots(snapshots: &[SnapshotEntry], scope: &FindScope) -> Vec<SnapshotEntry> {
+    let mut entries: Vec<_> = snapshots.to_vec();
 
     if let Some(ref source) = scope.source_label {
         entries.retain(|e| &e.source_label == source);
@@ -154,36 +165,149 @@ pub fn run(
             entries.drain(..len - n);
         }
     }
+    entries
+}
 
-    let mut reader = list::ItemStreamReader::new(&repo);
+/// What a find read, for the debug line and tests.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct FindStats {
+    pub(crate) snapshots: usize,
+    pub(crate) pointers: usize,
+    /// Distinct tree chunks over the selected snapshots; each decoded once.
+    pub(crate) distinct: usize,
+    pub(crate) walk: WalkStats,
+}
 
-    // Collect hits per path
-    let mut hits_by_path: BTreeMap<String, Vec<FindHit>> = BTreeMap::new();
+/// A matching item of one tree chunk; becomes one [`FindHit`] per snapshot
+/// occurrence of the chunk.
+#[derive(Clone)]
+struct SlotHit {
+    path: String,
+    size: u64,
+    mtime: i64,
+    entry_type: ItemType,
+    chunk_ids: Vec<ChunkId>,
+}
 
-    for entry in &entries {
-        let snapshot_name = entry.name.clone();
-        let snapshot_time = entry.time;
+/// Find over `entries` (chronological) on an open repository. Hits of a
+/// path come in snapshot order, then stream order, once per occurrence of
+/// their tree chunk. Holds the pointer lists of every selected snapshot for
+/// the run (32 bytes per pointer).
+pub(crate) fn find_on_repo(
+    repo: &mut Repository,
+    entries: &[SnapshotEntry],
+    filter: &FindFilter,
+    shutdown: &CancelToken,
+) -> Result<(Vec<PathTimeline>, FindStats)> {
+    let mut stats = FindStats {
+        snapshots: entries.len(),
+        ..FindStats::default()
+    };
+    if entries.is_empty() {
+        return Ok((Vec::new(), stats));
+    }
+    let ptrs: Vec<Vec<ChunkId>> = entries
+        .iter()
+        .map(|e| list::load_snapshot_meta(repo, &e.name).map(|m| m.item_ptrs))
+        .collect::<Result<_>>()?;
+    ItemStreamReader::new(repo).ensure_index(repo)?;
+    let lists: Vec<&[ChunkId]> = ptrs.iter().map(Vec::as_slice).collect();
+    let set = TreeChunkSet::build(&lists);
+    stats.pointers = ptrs.iter().map(Vec::len).sum();
+    stats.distinct = set.len();
 
-        let items_stream = reader.load(&mut repo, &snapshot_name, &CancelToken::new())?;
-
-        list::for_each_decoded_item(&items_stream, |item| {
+    let decode = |_k: usize, plain: &[u8]| -> std::result::Result<Vec<SlotHit>, VykarError> {
+        let mut hits = Vec::new();
+        list::for_each_decoded_item(plain, |item| {
+            if shutdown.is_cancelled() {
+                return Err(VykarError::Interrupted);
+            }
             if matches_filter(&item, filter) {
-                let chunk_ids: Vec<ChunkId> = item.chunks.iter().map(|c| c.id).collect();
-                hits_by_path
-                    .entry(item.path.clone())
-                    .or_default()
-                    .push(FindHit {
-                        snapshot_name: snapshot_name.clone(),
-                        snapshot_time,
-                        size: item.size,
-                        mtime: item.mtime,
-                        entry_type: item.entry_type,
-                        chunk_ids,
-                    });
+                hits.push(SlotHit {
+                    path: item.path,
+                    size: item.size,
+                    mtime: item.mtime,
+                    entry_type: item.entry_type,
+                    chunk_ids: item.chunks.iter().map(|c| c.id).collect(),
+                });
             }
             Ok(())
         })?;
+        Ok(hits)
+    };
+    let mut slots: Vec<Option<Vec<SlotHit>>> = (0..set.len()).map(|_| None).collect();
+    stats.walk = walk_tree_chunks(
+        repo,
+        &set,
+        TreeChunkSource::CacheFirst,
+        OnChunkError::Abort,
+        default_decode_threads(),
+        shutdown,
+        decode,
+        |k, outcome| {
+            let id = *set.id(k);
+            match outcome {
+                ChunkOutcome::Decoded(Ok(hits)) => {
+                    if let Some(slot) = slots.get_mut(k) {
+                        *slot = Some(hits);
+                    }
+                    Ok(())
+                }
+                ChunkOutcome::Decoded(Err(e @ VykarError::Interrupted)) => Err(e),
+                ChunkOutcome::Decoded(Err(e)) => Err(VykarError::Other(format!(
+                    "tree chunk {id} does not decode on its own: {e}"
+                ))),
+                // Abort mode hands `collect` decoded chunks only.
+                _ => Err(VykarError::Other(format!(
+                    "internal error: tree chunk {id} not decoded"
+                ))),
+            }
+        },
+    )?;
+
+    // Expand the hits per snapshot occurrence, in today's order: snapshots
+    // chronologically, each in stream order. A slot's hits move out on its
+    // last use.
+    let mut uses_left: Vec<u32> = (0..set.len()).map(|k| set.occurrences(k)).collect();
+    let mut hits_by_path: BTreeMap<String, Vec<FindHit>> = BTreeMap::new();
+    for (entry, list) in entries.iter().zip(&ptrs) {
+        for id in list {
+            let not_decoded =
+                || VykarError::Other(format!("internal error: tree chunk {id} not decoded"));
+            let k = set.slot(id).ok_or_else(not_decoded)?;
+            let left = uses_left.get_mut(k).ok_or_else(not_decoded)?;
+            *left = left.saturating_sub(1);
+            let slot = slots.get_mut(k).ok_or_else(not_decoded)?;
+            let hits = if *left == 0 {
+                slot.take()
+            } else {
+                slot.clone()
+            }
+            .ok_or_else(not_decoded)?;
+            for hit in hits {
+                hits_by_path.entry(hit.path).or_default().push(FindHit {
+                    snapshot_name: entry.name.clone(),
+                    snapshot_time: entry.time,
+                    size: hit.size,
+                    mtime: hit.mtime,
+                    entry_type: hit.entry_type,
+                    chunk_ids: hit.chunk_ids,
+                });
+            }
+        }
     }
+
+    tracing::debug!(
+        "find: {} snapshots, {} pointers, {} distinct tree chunks ({} B stored, {} B plaintext) in {} batches; decode {:?} on {} threads",
+        stats.snapshots,
+        stats.pointers,
+        stats.distinct,
+        stats.walk.stored_bytes,
+        stats.walk.plaintext_bytes,
+        stats.walk.batches,
+        stats.walk.decode_time,
+        stats.walk.decode_threads
+    );
 
     // Compute statuses and build timelines
     let timelines: Vec<PathTimeline> = hits_by_path
@@ -197,10 +321,10 @@ pub fn run(
         })
         .collect();
 
-    Ok(timelines)
+    Ok((timelines, stats))
 }
 
-fn matches_filter(item: &Item, filter: &FindFilter) -> bool {
+pub(crate) fn matches_filter(item: &Item, filter: &FindFilter) -> bool {
     // Type filter (cheapest)
     if let Some(ref t) = filter.item_type
         && &item.entry_type != t
@@ -269,7 +393,7 @@ fn matches_filter(item: &Item, filter: &FindFilter) -> bool {
     true
 }
 
-fn annotate_hits(hits: Vec<FindHit>) -> Vec<AnnotatedHit> {
+pub(crate) fn annotate_hits(hits: Vec<FindHit>) -> Vec<AnnotatedHit> {
     let mut annotated = Vec::with_capacity(hits.len());
     let mut prev_chunk_ids: Option<&[ChunkId]> = None;
     let mut prev_size: Option<u64> = None;

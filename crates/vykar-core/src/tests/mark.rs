@@ -27,6 +27,7 @@ use crate::repo::control::CancelToken;
 use crate::repo::format::{ObjectType, pack_object_with_context};
 use crate::repo::pack::PackType;
 use crate::repo::{OpenOptions, Repository, TreeChunkSource, WriteSessionOptions};
+use crate::snapshot::SnapshotMeta;
 use crate::snapshot::item::{Item, ItemType};
 
 use super::helpers::{backup_single_source_with, make_test_config, source_entry};
@@ -38,7 +39,7 @@ const PASS: &str = "mark-pass";
 // ---------------------------------------------------------------------------
 
 /// Range reads issued through a [`Probe`], by key and length.
-type Reads = Arc<Mutex<Vec<(String, u64)>>>;
+pub(super) type Reads = Arc<Mutex<Vec<(String, u64)>>>;
 
 /// Which range reads a [`Probe`] fails with an I/O error: those of `key`
 /// (only those covering byte `at` of it, when set), the first `times`
@@ -111,15 +112,15 @@ delegate_storage_backend! {
 }
 
 /// A local repository and its source directories.
-struct Fx {
+pub(super) struct Fx {
     tmp: tempfile::TempDir,
-    repo_dir: PathBuf,
-    config: VykarConfig,
-    pass: Option<&'static str>,
+    pub(super) repo_dir: PathBuf,
+    pub(super) config: VykarConfig,
+    pub(super) pass: Option<&'static str>,
 }
 
 impl Fx {
-    fn new(encrypted: bool) -> Self {
+    pub(super) fn new(encrypted: bool) -> Self {
         let tmp = tempfile::tempdir().unwrap();
         let repo_dir = tmp.path().join("repo");
         std::fs::create_dir_all(&repo_dir).unwrap();
@@ -139,19 +140,19 @@ impl Fx {
     }
 
     /// A source directory under the fixture, created if needed.
-    fn src(&self, name: &str) -> PathBuf {
+    pub(super) fn src(&self, name: &str) -> PathBuf {
         let dir = self.tmp.path().join(name);
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
 
-    fn backup(&self, src: &Path, name: &str) {
+    pub(super) fn backup(&self, src: &Path, name: &str) {
         backup_single_source_with(&self.config, self.pass, src, "src", name);
         // Distinct snapshot times.
         std::thread::sleep(Duration::from_millis(5));
     }
 
-    fn open_probe(&self, fail: Option<(String, usize)>) -> (Repository, Reads) {
+    pub(super) fn open_probe(&self, fail: Option<(String, usize)>) -> (Repository, Reads) {
         self.open_probe_with(fail.map(|(key, times)| Fail {
             key,
             at: None,
@@ -176,11 +177,11 @@ impl Fx {
         (repo, reads)
     }
 
-    fn open(&self) -> Repository {
+    pub(super) fn open(&self) -> Repository {
         self.open_probe(None).0
     }
 
-    fn item_ptrs(&self, name: &str) -> Vec<ChunkId> {
+    pub(super) fn item_ptrs(&self, name: &str) -> Vec<ChunkId> {
         load_snapshot_meta(&self.open(), name).unwrap().item_ptrs
     }
 
@@ -203,7 +204,7 @@ impl Fx {
             .to_path_buf()
     }
 
-    fn cached(&self) -> HashSet<ChunkId> {
+    pub(super) fn cached(&self) -> HashSet<ChunkId> {
         let mut ids = HashSet::new();
         let Ok(shards) = std::fs::read_dir(self.cache_root()) else {
             return ids;
@@ -235,7 +236,7 @@ impl Fx {
     }
 
     /// Edit the index under the maintenance lock and persist it.
-    fn edit_index(&self, f: impl FnOnce(&mut Repository)) {
+    pub(super) fn edit_index(&self, f: impl FnOnce(&mut Repository)) {
         let mut repo = self.open();
         commands::util::with_maintenance_lock(&mut repo, |repo| {
             repo.load_chunk_index_under_lock()?;
@@ -272,7 +273,7 @@ fn write_files(dir: &Path, prefix: &str, n: usize) {
 
 /// `dirs` × 600 small files with unique content: several tree chunks
 /// (each dir is roughly two).
-fn write_tree(dir: &Path, tag: &str, dirs: usize) {
+pub(super) fn write_tree(dir: &Path, tag: &str, dirs: usize) {
     for d in 0..dirs {
         let sub = dir.join(format!("{tag}-{d:02}"));
         std::fs::create_dir_all(&sub).unwrap();
@@ -290,7 +291,7 @@ const TREE_DIRS_MAX: usize = 32;
 /// from scratch with one more directory until it does, from 4. The count
 /// depends on the repository's random chunker key, so no fixed size
 /// guarantees it.
-fn with_four_tree_chunks(encrypted: bool, name: &str, build: impl Fn(&Fx, usize)) -> Fx {
+pub(super) fn with_four_tree_chunks(encrypted: bool, name: &str, build: impl Fn(&Fx, usize)) -> Fx {
     for dirs in 4..=TREE_DIRS_MAX {
         let fx = Fx::new(encrypted);
         build(&fx, dirs);
@@ -855,10 +856,15 @@ fn report_refuses_while_a_session_is_active() {
 // ---------------------------------------------------------------------------
 
 /// Re-seal snapshot `name`'s object with its `item_ptrs` edited by `f`.
-fn edit_item_ptrs(repo: &Repository, name: &str, f: impl FnOnce(&mut Vec<ChunkId>)) {
+pub(super) fn edit_item_ptrs(repo: &Repository, name: &str, f: impl FnOnce(&mut Vec<ChunkId>)) {
+    edit_meta(repo, name, |meta| f(&mut meta.item_ptrs));
+}
+
+/// Snapshot `name`'s object re-sealed after `f` edited its metadata.
+pub(super) fn edit_meta(repo: &Repository, name: &str, f: impl FnOnce(&mut SnapshotMeta)) {
     let entry = repo.manifest().find_snapshot(name).unwrap().clone();
     let mut meta = load_snapshot_meta(repo, name).unwrap();
-    f(&mut meta.item_ptrs);
+    f(&mut meta);
     let packed = pack_object_with_context(
         ObjectType::SnapshotMeta,
         entry.id.as_bytes(),
@@ -872,7 +878,7 @@ fn edit_item_ptrs(repo: &Repository, name: &str, f: impl FnOnce(&mut Vec<ChunkId
 /// Snapshot `name` with its tree chunk `k` replaced by `edit` of its
 /// plaintext: the result is stored as a new tree chunk and the snapshot
 /// object re-sealed with the new pointer, which is returned.
-fn replace_tree_chunk(
+pub(super) fn replace_tree_chunk(
     fx: &Fx,
     name: &str,
     k: usize,
@@ -891,7 +897,7 @@ fn replace_tree_chunk(
     id
 }
 
-fn decode_items(plain: &[u8]) -> Vec<Item> {
+pub(super) fn decode_items(plain: &[u8]) -> Vec<Item> {
     let mut items = Vec::new();
     for_each_decoded_item(plain, |item| {
         items.push(item);
@@ -901,7 +907,7 @@ fn decode_items(plain: &[u8]) -> Vec<Item> {
     items
 }
 
-fn encode_items(items: &[Item]) -> Vec<u8> {
+pub(super) fn encode_items(items: &[Item]) -> Vec<u8> {
     let mut chunk = Vec::new();
     for item in items {
         chunk.extend_from_slice(&rmp_serde::to_vec(item).unwrap());

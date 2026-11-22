@@ -1,5 +1,5 @@
 mod chunk_process;
-mod command_dump;
+pub(crate) mod command_dump;
 mod commit;
 mod concurrency;
 mod drift;
@@ -486,7 +486,10 @@ fn prepare<'a>(config: &VykarConfig, req: &BackupRequest<'a>) -> Result<Prepared
     }
 
     // When command dumps are active, exclude the vykar-dumps/ directory from
-    // the filesystem walk to prevent duplicate paths in the snapshot.
+    // the filesystem walk to prevent duplicate paths in the snapshot. diff
+    // relies on this exclusion: `commands::diff::roots_nested` treats the
+    // segment of a single-directory source (root "") next to the dumps
+    // segment as not nested. Keep the two in step.
     let exclude_patterns = if command_dumps.is_empty() {
         std::borrow::Cow::Borrowed(req.exclude_patterns)
     } else {

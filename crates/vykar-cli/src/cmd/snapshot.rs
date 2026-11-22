@@ -38,19 +38,30 @@ pub(crate) fn run_snapshot_command(
             sort,
             ..
         } => {
-            let mut items = with_repo_passphrase(config, label, |passphrase| {
-                Ok(commands::list::list_snapshot_items(
-                    config, passphrase, snapshot,
+            // Path filter (empty after normalization means "all items"),
+            // applied while the listing is decoded so only matching items
+            // are kept.
+            let filter = path
+                .as_deref()
+                .map(normalize_path_filter)
+                .filter(|f| !f.is_empty());
+            let mut items = Vec::new();
+            with_repo_passphrase(config, label, |passphrase| {
+                Ok(commands::list::for_each_listed_item(
+                    config,
+                    passphrase,
+                    snapshot,
+                    |item| {
+                        if filter
+                            .as_deref()
+                            .is_none_or(|f| path_matches_filter(&item.path, f))
+                        {
+                            items.push(item);
+                        }
+                        Ok(())
+                    },
                 )?)
             })?;
-
-            // Apply path filter (empty filter after normalization means "all items")
-            if let Some(raw_path) = path {
-                let filter = normalize_path_filter(raw_path);
-                if !filter.is_empty() {
-                    items.retain(|item| path_matches_filter(&item.path, &filter));
-                }
-            }
 
             // Apply sort
             match sort {

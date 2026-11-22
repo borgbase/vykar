@@ -21,6 +21,7 @@ use vykar_types::error::{Result, VykarError};
 use vykar_types::pack_id::PackId;
 use vykar_types::snapshot_id::SnapshotId;
 
+use super::mark::{Located, cut_batches_with, push_spans};
 use super::util::open_repo;
 use crate::repo::OpenOptions;
 
@@ -33,7 +34,8 @@ pub fn list_snapshots(
     Ok(repo.manifest().snapshots.clone())
 }
 
-/// List all items in a specific snapshot.
+/// List all items in a specific snapshot, reading the listing a batch of
+/// tree chunks at a time and decoding each tree chunk on its own.
 /// Resolves the item stream through the local chunk table where there is
 /// one, so no index download is needed.
 pub fn list_snapshot_items(
@@ -59,6 +61,34 @@ fn list_snapshot_items_inner(
     passphrase: Option<&str>,
     snapshot_name: &str,
 ) -> Result<(Vec<Item>, Vec<String>)> {
+    let mut items = Vec::new();
+    let source_paths = for_each_listed_item_inner(config, passphrase, snapshot_name, |item| {
+        items.push(item);
+        Ok(())
+    })?;
+    Ok((items, source_paths))
+}
+
+/// Call `visit` for each item of snapshot `snapshot_name`, in stream order,
+/// without holding the listing in memory: tree chunks are read in bounded
+/// batches (the local tree-chunk cache first) and each is decoded on its own.
+/// Resolves the item stream through the local chunk table where there is one.
+pub fn for_each_listed_item(
+    config: &VykarConfig,
+    passphrase: Option<&str>,
+    snapshot_name: &str,
+    visit: impl FnMut(Item) -> Result<()>,
+) -> Result<()> {
+    for_each_listed_item_inner(config, passphrase, snapshot_name, visit).map(|_| ())
+}
+
+/// [`for_each_listed_item`], also returning the snapshot's `source_paths`.
+fn for_each_listed_item_inner(
+    config: &VykarConfig,
+    passphrase: Option<&str>,
+    snapshot_name: &str,
+    visit: impl FnMut(Item) -> Result<()>,
+) -> Result<Vec<String>> {
     let (mut repo, _session_guard) = super::util::open_repo_with_read_session(
         config,
         passphrase,
@@ -72,11 +102,116 @@ fn list_snapshot_items_inner(
         .name
         .clone();
 
-    let source_paths = load_snapshot_meta(&repo, &resolved_name)?.source_paths;
-    let stream =
-        ItemStreamReader::new(&repo).load(&mut repo, &resolved_name, &CancelToken::new())?;
-    let items = decode_items_stream(&stream)?;
-    Ok((items, source_paths))
+    let meta = load_snapshot_meta(&repo, &resolved_name)?;
+    ItemStreamReader::new(&repo).ensure_index(&mut repo)?;
+    for_each_item_by_chunk(
+        &repo,
+        &meta.item_ptrs,
+        TreeChunkSource::CacheFirst,
+        LISTING_BATCH_CHUNKS,
+        LISTING_BATCH_STORED_BYTES,
+        &CancelToken::new(),
+        visit,
+    )?;
+    Ok(meta.source_paths)
+}
+
+/// Upper bound on tree chunks per read batch of [`for_each_item_by_chunk`].
+pub(crate) const LISTING_BATCH_CHUNKS: usize = 2_000;
+/// Upper bound on stored bytes per read batch of [`for_each_item_by_chunk`]:
+/// the batch's stored bytes and their plaintext are what is resident besides
+/// what the visitor keeps (about 2.5x this in total).
+pub(crate) const LISTING_BATCH_STORED_BYTES: u64 = 16 << 20;
+
+/// What [`for_each_item_by_chunk`] read, for debug lines and tests.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ChunkedListingStats {
+    pub(crate) chunks: usize,
+    pub(crate) batches: usize,
+    pub(crate) stored_bytes: u64,
+    pub(crate) plaintext_bytes: u64,
+    pub(crate) items: u64,
+}
+
+/// Call `visit` for every item of the listing `item_ptrs`, in stream
+/// order, reading it a batch of tree chunks at a time and decoding each
+/// tree chunk on its own.
+///
+/// Every pointer is resolved through `repo.chunk_index()` before any read,
+/// so a pointer the index lacks fails with [`VykarError::ChunkNotInIndex`]
+/// even when its chunk is cached (as [`load_item_stream_from_ptrs`]).
+/// A batch is at most `max_chunks` chunks and `max_stored` stored bytes
+/// ([`LISTING_BATCH_CHUNKS`], [`LISTING_BATCH_STORED_BYTES`] outside
+/// tests), read through [`Repository::read_tree_chunks_split`] from `source`.
+/// Read errors are returned as the read returned them. A tree chunk that
+/// does not decode on its own (one that ends inside an entry included) is
+/// an error naming the chunk; errors from `visit` are returned unchanged.
+pub(crate) fn for_each_item_by_chunk(
+    repo: &Repository,
+    item_ptrs: &[ChunkId],
+    source: TreeChunkSource,
+    max_chunks: usize,
+    max_stored: u64,
+    shutdown: &CancelToken,
+    mut visit: impl FnMut(Item) -> Result<()>,
+) -> Result<ChunkedListingStats> {
+    shutdown.check()?;
+    let located: Vec<Located> = resolve_from_index(repo.chunk_index(), item_ptrs)?
+        .into_iter()
+        .enumerate()
+        .collect();
+
+    let mut stats = ChunkedListingStats::default();
+    let mut buf: Vec<u8> = Vec::new();
+    let mut ends: Vec<usize> = Vec::new();
+    let mut spans: Vec<(usize, std::ops::Range<usize>)> = Vec::new();
+    let mut items: Vec<Item> = Vec::new();
+    for batch in cut_batches_with(&located, max_chunks, max_stored) {
+        shutdown.check()?;
+        buf.clear();
+        spans.clear();
+        let locs: Vec<ChunkLoc> = batch.iter().map(|(_, loc)| *loc).collect();
+        repo.read_tree_chunks_split(&locs, &mut buf, &mut ends, shutdown, source)?;
+        push_spans(&mut spans, 0, 0, &ends, batch.len(), buf.len())?;
+        stats.batches += 1;
+        stats.chunks += batch.len();
+        stats.stored_bytes += locs.iter().map(|loc| u64::from(loc.3)).sum::<u64>();
+        stats.plaintext_bytes += buf.len() as u64;
+
+        for (pos, range) in &spans {
+            let id = locs.get(*pos).map(|loc| loc.0).ok_or_else(|| {
+                VykarError::Other("internal error: tree chunk span outside its batch".into())
+            })?;
+            let plain = buf.get(range.clone()).ok_or_else(|| {
+                VykarError::Other(format!(
+                    "internal error: tree chunk {id} outside the read buffer"
+                ))
+            })?;
+            // Decode the whole chunk before visiting, so a decode error and
+            // an error of `visit` stay apart.
+            items.clear();
+            for_each_decoded_item(plain, |item| {
+                items.push(item);
+                Ok(())
+            })
+            .map_err(|e| {
+                VykarError::Other(format!("tree chunk {id} does not decode on its own: {e}"))
+            })?;
+            for item in items.drain(..) {
+                stats.items += 1;
+                visit(item)?;
+            }
+        }
+    }
+    tracing::debug!(
+        "listing by chunk: {} tree chunks in {} batches, {} B stored, {} B plaintext, {} items",
+        stats.chunks,
+        stats.batches,
+        stats.stored_bytes,
+        stats.plaintext_bytes,
+        stats.items
+    );
+    Ok(stats)
 }
 
 /// A snapshot listing, plus any snapshot this binary could not read.

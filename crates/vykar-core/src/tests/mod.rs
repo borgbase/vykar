@@ -21,6 +21,7 @@ mod info;
 mod item;
 mod lazy_item_stream;
 mod listing_index;
+mod listing_readers;
 mod listing_writer;
 mod lock;
 mod lock_fence;

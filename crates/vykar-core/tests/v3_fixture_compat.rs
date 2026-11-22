@@ -270,6 +270,7 @@ fn v3_fixtures_upgrade_to_v6() {
 
         assert_check_clean(&fx, mode);
         assert_restores_source(&fx, "restore-upgraded", mode);
+        assert_readers_match_whole_stream(&fx, mode);
 
         let stats = backup_source(
             &config,
@@ -346,6 +347,83 @@ fn assert_formats_list_identically(fx: &Fixture, fresh: &str, label: &str) {
     };
     assert_eq!(version(fx.latest_snapshot()), 1, "{label}");
     assert_eq!(version(fresh), 2, "{label}");
+}
+
+/// The chunk-aware diff and the find that decodes each distinct tree chunk
+/// once agree with whole-stream decodes on the fixture's format-1 snapshots.
+fn assert_readers_match_whole_stream(fx: &Fixture, label: &str) {
+    let config = fx.config();
+    let mut repo = fx.open();
+    let mut names: Vec<_> = repo.manifest().snapshots.clone();
+    names.sort_by_key(|e| e.time);
+    let mut items = |name: &str| {
+        commands::list::load_snapshot_items(&mut repo, name, &CancelToken::new()).unwrap()
+    };
+
+    // Today's diff: regular files by display path, the last one winning.
+    type Sig = (u64, Vec<vykar_types::chunk_id::ChunkId>);
+    let files = |items: Vec<vykar_core::snapshot::item::Item>| {
+        let mut map: std::collections::BTreeMap<String, Sig> = Default::default();
+        for i in items {
+            if i.entry_type == ItemType::RegularFile {
+                map.insert(i.path, (i.size, i.chunks.iter().map(|c| c.id).collect()));
+            }
+        }
+        map
+    };
+    let n = fx.snapshots.len();
+    let (a, b) = (&fx.snapshots[n - 2], &fx.snapshots[n - 1]);
+    let result = commands::diff::run(&config, fx.passphrase(), a, b).unwrap();
+    let base = files(items(&result.base_snapshot));
+    let target = files(items(&result.target_snapshot));
+    let mut expected: Vec<(String, commands::diff::DiffChangeKind)> = Vec::new();
+    for (path, sig) in &base {
+        match target.get(path) {
+            None => expected.push((path.clone(), commands::diff::DiffChangeKind::Removed)),
+            Some(new) if new != sig => {
+                expected.push((path.clone(), commands::diff::DiffChangeKind::Modified));
+            }
+            Some(_) => {}
+        }
+    }
+    for path in target.keys() {
+        if !base.contains_key(path) {
+            expected.push((path.clone(), commands::diff::DiffChangeKind::Added));
+        }
+    }
+    expected.sort_by(|x, y| x.0.cmp(&y.0));
+    let got: Vec<_> = result
+        .entries
+        .iter()
+        .map(|e| (e.path.clone(), e.change))
+        .collect();
+    assert_eq!(got, expected, "{label}: diff {a} {b}");
+
+    // Today's find with an empty filter: every item of every snapshot, by
+    // path, in snapshot time order.
+    let mut expected: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    for e in &names {
+        for i in items(&e.name) {
+            expected.entry(i.path).or_default().push(e.name.clone());
+        }
+    }
+    let filter =
+        commands::find::FindFilter::build(None, None, None, None, None, None, None).unwrap();
+    let scope = commands::find::FindScope {
+        source_label: None,
+        last_n: None,
+    };
+    let got: std::collections::BTreeMap<String, Vec<String>> =
+        commands::find::run(&config, fx.passphrase(), &scope, &filter)
+            .unwrap()
+            .into_iter()
+            .map(|t| {
+                let snaps = t.hits.into_iter().map(|h| h.hit.snapshot_name).collect();
+                (t.path, snaps)
+            })
+            .collect();
+    assert!(!got.is_empty(), "{label}");
+    assert_eq!(got, expected, "{label}: find");
 }
 
 /// After the upgrade, pack maps make the repository recoverable without its

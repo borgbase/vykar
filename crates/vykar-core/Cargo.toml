@@ -84,7 +84,7 @@ percent-encoding = { version = "2", optional = true }
 default = []
 backend-sftp = ["vykar-storage/backend-sftp"]
 mount = ["dav-server", "tokio/rt-multi-thread", "tokio/macros", "tokio/signal", "tokio/net", "tokio/sync", "hyper", "hyper-util", "lru", "bytes", "futures-util", "percent-encoding"]
-# Internal entry points for fuzz/ (src/fuzzing.rs, index::segment::model). Not API; never enable in a product build.
+# Internal entry points for fuzz/ (src/fuzzing.rs). Not API; never enable in a product build.
 fuzzing = []
 # Simulation harness for protocol tests (src/sim). Test support, not API;
 # never enable in a product build.

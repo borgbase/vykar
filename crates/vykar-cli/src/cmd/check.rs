@@ -231,7 +231,7 @@ pub(crate) fn print_check_summary(result: &commands::check::CheckResult) {
 fn is_safe_action(action: &RepairAction) -> bool {
     matches!(
         action,
-        RepairAction::RebuildRefcounts
+        RepairAction::RemoveUnreferencedEntries
             | RepairAction::RestoreKeyCopy { .. }
             | RepairAction::WritePackMaps { .. }
     )
@@ -389,7 +389,9 @@ fn format_repair_action(action: &RepairAction) -> String {
              themselves",
             pack_ids.len()
         ),
-        RepairAction::RebuildRefcounts => "Rebuild chunk refcounts from surviving snapshots".into(),
+        RepairAction::RemoveUnreferencedEntries => {
+            "Remove index entries that no surviving snapshot references".into()
+        }
     }
 }
 
@@ -426,7 +428,7 @@ mod tests {
             })
             .collect();
         RepairPlan {
-            actions: vec![RepairAction::RebuildRefcounts],
+            actions: vec![RepairAction::RemoveUnreferencedEntries],
             has_data_loss: uncovered > 0,
             index_recovery: IndexRecovery::RebuiltFromPacks {
                 cause: IndexLoss::HeadMissing,
@@ -487,7 +489,7 @@ mod tests {
                 },
             };
             let plan = RepairPlan {
-                actions: vec![RepairAction::RebuildRefcounts],
+                actions: vec![RepairAction::RemoveUnreferencedEntries],
                 has_data_loss,
                 index_recovery: recovery,
                 uncovered_packs: Vec::new(),

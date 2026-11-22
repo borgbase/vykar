@@ -22,10 +22,10 @@ budget_for() {
     # Still growing (+9% features or more).
     fuzz_plaintext_read | fuzz_restore_paths | fuzz_file_cache_decode | \
       fuzz_item_stream | fuzz_msgpack_snapshot_meta | fuzz_msgpack_index_blob | \
-      fuzz_metadata_msgpack | fuzz_full_index_cache)
+      fuzz_metadata_msgpack)
       echo $((per * 4)) ;;
     # Coverage flat from minute 1.
-    fuzz_pack_scan | fuzz_unpack_object | fuzz_protocol_keys | fuzz_index_base | \
+    fuzz_pack_scan | fuzz_unpack_object | fuzz_protocol_keys | \
       fuzz_pack_trailer | fuzz_pack_map | fuzz_index_base_v2 | fuzz_index_segment_v2)
       echo $((per / 3)) ;;
     *) echo "$per" ;;

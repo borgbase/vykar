@@ -157,8 +157,8 @@ impl Repository {
     /// Flush pending packs and wait for uploads, then take the session's
     /// `IndexDelta` (with the trailer lengths of the session's packs) and
     /// its view out for processing, and drop its lookup state. The delta's
-    /// positional bumps keep the session's table mapped until they are
-    /// applied.
+    /// positional reuse record keeps the session's table mapped until it is
+    /// checked.
     ///
     /// On the concurrent backup path Phase 1 has normally drained uploads
     /// already, so the flush here is a no-op safety net; for
@@ -291,10 +291,10 @@ impl Repository {
 
         // Session-existence probe. If the marker was reaped by maintenance
         // (e.g. because we missed too many heartbeats under extreme clock
-        // skew), surface the same typed error the later reconcile path
+        // skew), surface the same typed error the later reuse check
         // would produce, so callers matching on `StaleChunksDuringCommit`
         // catch this path too. Inconclusive storage errors fall through —
-        // the reconcile step is still a safety net.
+        // the reuse check is still a safety net.
         match marker {
             Some(Ok(false)) => {
                 warn!(
@@ -407,7 +407,7 @@ impl Repository {
         // is applied (`Arc::make_mut` would copy it).
         drop(view);
 
-        let ctx = emit_stage(events, "reconcile");
+        let ctx = emit_stage(events, "check reuse");
         // The additions: one per chunk (its first location), minus chunks
         // the synced index already holds (another session committed them
         // first; this session's copies are dead bytes).
@@ -634,22 +634,15 @@ fn commit_additions(delta: &IndexDelta, index: &LiveIndex) -> Vec<(ChunkId, Loca
     out
 }
 
-/// Every chunk the session reused (a bump with a count) must be in `index`
-/// or among the delta's new entries; else
-/// [`VykarError::StaleChunksDuringCommit`].
+/// Every chunk the session reused must be in `index` or among the delta's
+/// new entries; else [`VykarError::StaleChunksDuringCommit`].
 fn check_reused_chunks(delta: &IndexDelta, index: &LiveIndex) -> Result<()> {
     let new: std::collections::HashSet<ChunkId> =
         delta.new_entries.iter().map(|e| e.chunk_id).collect();
-    let stale = |id: &ChunkId| !index.contains(id) && !new.contains(id);
     if delta
-        .refcount_bumps
+        .reused
         .iter()
-        .any(|(id, &n)| n > 0 && stale(id))
-    {
-        return Err(VykarError::StaleChunksDuringCommit);
-    }
-    if let Some(cached) = delta.cached_bumps.as_ref()
-        && cached.iter_nonzero().any(|(id, _)| stale(&id))
+        .any(|id| !index.contains(&id) && !new.contains(&id))
     {
         return Err(VykarError::StaleChunksDuringCommit);
     }
@@ -714,7 +707,7 @@ mod tests {
         assert!(needs_recheck(None, &from), "no view");
     }
 
-    /// BK-4 (keyed and positional bumps): a reused chunk missing from the
+    /// BK-4 (keyed and positional reuse): a reused chunk missing from the
     /// synced index is stale unless the session added it itself.
     #[test]
     fn reused_chunks_missing_from_the_index_are_stale() {
@@ -727,10 +720,16 @@ mod tests {
         let mut now = LiveIndex::from_table(Arc::clone(&table));
 
         let mut keyed = IndexDelta::new();
-        keyed.bump_refcount(&id(1));
-        let mut positional = IndexDelta::with_cached_bumps(Arc::clone(&table));
+        keyed.reused.insert_key(&id(1));
+        let mut positional = IndexDelta::with_table(Arc::clone(&table));
         let (p, _) = table.find(&id(2)).unwrap();
-        positional.bump_cached_refcount(&id(2), p);
+        positional.reused.insert_position(&id(2), p);
+        assert!(
+            positional
+                .reused
+                .positional()
+                .is_some_and(|r| !r.is_empty())
+        );
         assert!(check_reused_chunks(&keyed, &now).is_ok());
         assert!(check_reused_chunks(&positional, &now).is_ok());
 
@@ -743,15 +742,26 @@ mod tests {
             ));
         }
         // A chunk the session itself stored again is not stale.
-        keyed.add_new_entry(id(1), 10, pack, 40, 1);
+        keyed.add_new_entry(id(1), 10, pack, 40);
         assert!(check_reused_chunks(&keyed, &now).is_ok());
         // The additions leave out what the index holds.
         let mut delta = IndexDelta::new();
-        delta.add_new_entry(id(2), 10, pack, 0, 1);
-        delta.add_new_entry(id(3), 10, pack, 60, 1);
-        delta.add_new_entry(id(3), 10, pack, 80, 1);
+        delta.add_new_entry(id(2), 10, pack, 0);
+        delta.add_new_entry(id(3), 10, pack, 60);
+        delta.add_new_entry(id(3), 10, pack, 80);
         let fresh = LiveIndex::from_table(Arc::clone(&table));
         let adds = commit_additions(&delta, &fresh);
+        // CM-2: reuse a rolled-back scope recorded is gone from the record,
+        // so a chunk removed since does not fail the commit.
+        let mut rolled = IndexDelta::with_table(Arc::clone(&table));
+        let cp = rolled.checkpoint();
+        rolled
+            .reused
+            .insert_position(&id(1), table.find(&id(1)).unwrap().0);
+        rolled.reused.insert_key(&id(2));
+        rolled.rollback(cp);
+        assert!(rolled.is_empty());
+        assert!(check_reused_chunks(&rolled, &now).is_ok());
         assert_eq!(adds.len(), 1);
         assert_eq!(
             (adds[0].0, adds[0].1.pack_offset),

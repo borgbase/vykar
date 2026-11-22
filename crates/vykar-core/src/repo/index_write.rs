@@ -332,8 +332,9 @@ impl Repository {
     /// index, and drops them again when the fold fails). Otherwise `seg` is
     /// the index's pending edits, which become its applied state.
     ///
-    /// An empty segment publishes nothing (refcount-only edits are
-    /// discarded), or only a head when a sweep is pending. On error nothing
+    /// An empty segment publishes nothing (edits that changed nothing, such
+    /// as an add of a present chunk, are discarded), or only a head when a
+    /// sweep is pending. On error nothing
     /// local changes (a requested fold stays requested) and at most an
     /// unreferenced object is left on storage.
     pub(super) fn publish_index_state(

@@ -26,7 +26,7 @@ pub enum Invariant {
     AcknowledgedCommitsDurable = 2,
     NoSilentRemoval = 3,
     IndexIntegrity = 4,
-    // 5 (no refcount deflation) is retired: stored refcounts mean nothing
+    // 5 (no reference-count deflation) is retired: no counts are stored
     // since 05 step 8. The numbers of the others stay.
     /// Every protected write lands while the store holds exactly one lock
     /// key, written by the same run.

@@ -47,7 +47,7 @@ use crate::common::fixtures;
 /// byte, so the type still reads and writes what released binaries wrote.
 #[test]
 fn repo_config_reencodes_every_fixture_config_byte_for_byte() {
-    for (prefix, version) in [("v2", 2), ("v3", 3), ("v4", 4), ("v5", 5)] {
+    for (prefix, version) in [("v2", 2), ("v3", 3)] {
         for mode in ["none", "aes256gcm", "chacha20poly1305"] {
             let fx = fixtures::extract(prefix, mode, version);
             let bytes = std::fs::read(fx.repo_dir().join("config")).unwrap();

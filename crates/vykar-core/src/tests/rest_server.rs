@@ -79,8 +79,7 @@ fn head(config: &VykarConfig) -> IndexHead {
     open(config).index_head().cloned().unwrap()
 }
 
-/// Entries without their refcounts: a repair writes multiplicity counts,
-/// every other writer 1 (05 step 8), and nothing decides on them.
+/// The entries, sorted, as strings.
 fn sorted_entries(index: &impl crate::testutil::EntryIter) -> Vec<String> {
     let mut v: Vec<String> = index
         .entry_vec()

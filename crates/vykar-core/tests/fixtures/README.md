@@ -22,46 +22,13 @@ not a stale expectation.
 `scripts/gen-v2-fixtures.sh` documents how they were produced and can build a
 fixture for a genuinely new scenario from the same pre-change commit.
 
-# Frozen repository-format-v4/v5 fixtures
-
-Each `v4-<mode>.tar.gz` and `v5-<mode>.tar.gz` is a segmented-index repository
-written by the binary of commit `d0a2c1b`, with the same four entries as above.
-Its index head names a base, exactly two segments over it, and a non-empty
-`retired` set: the objects the last fold replaced. `meta.json` also lists the
-`index.d/` object names, the expected segment count and, for v4, the v2
-archive it derives from.
-
-- **v5** starts from `vykar init`.
-- **v4** starts from `v2-<mode>.tar.gz` (its `repo/` and `source/`), upgraded
-  in place with `vykar upgrade`, which is the only way a v4 repository comes
-  to exist.
-
-Both then run 15 backups and one snapshot delete, `compact --threshold 0` (the
-16 segments reach the soft limit, so the chain folds into a base and the
-previous objects become `retired`), and two more backups.
-
-## Do not regenerate these either
-
-The reason is the same as for v2: `tests/segmented_fixture_compat.rs` must prove
-that today's binary reads and extends segmented repositories an older binary
-wrote. That suite pins the BLAKE3 digest of each archive, so a regenerated or
-replaced archive fails it; restore the committed file with `git checkout`.
-
-Since 05 step 8 no binary opens v4/v5; `segmented_fixture_compat.rs` only
-checks that they are refused by version and unchanged. They are deleted in
-05 step 10.
-
-`scripts/gen-segmented-fixtures.sh <commit>` documents how they were produced.
-It refuses to overwrite an existing archive; `--new-scenario NAME` writes a
-fixture for a new scenario as `v{4,5}-NAME-<mode>.tar.gz`.
-
 # Frozen repository-format-v3 fixtures
 
 Each `v3-<mode>.tar.gz` is a repository written by the binary of release tag
 `v0.24.0` (commit `cd6782db29bff6638581758af72efcfda1267985`), with the same
 four entries as above. Format v3 (BLAKE3 IDs, monolithic `index` and
 `index.gen`) is what vykar 0.20 to 0.24 write, so it is the format upgrading
-users arrive with, and the upgrade source for the segmented and later formats.
+users arrive with, and the upgrade source for format v6.
 
 Per mode: `init` and backup A; backup B, which adds a transient file and a
 file that stays in the source; backup C after removing the transient file and

@@ -50,18 +50,7 @@ fn sorted_entries(
     vykar_types::chunk_id::ChunkId,
     vykar_core::index::ChunkIndexEntry,
 )> {
-    // Refcounts are not persisted from v6 on (every loaded entry reads 1),
-    // and the upgrade leaves refcount-0 legacy entries out.
-    let mut out: Vec<_> = index
-        .iter()
-        .filter(|(_, e)| e.refcount > 0)
-        .map(|(id, e)| {
-            (
-                *id,
-                vykar_core::index::ChunkIndexEntry { refcount: 1, ..*e },
-            )
-        })
-        .collect();
+    let mut out: Vec<_> = index.iter().map(|(id, e)| (*id, *e)).collect();
     out.sort_by_key(|(id, _)| *id.as_bytes());
     out
 }
@@ -166,7 +155,9 @@ fn v2_fixtures_upgrade_to_v6_with_blake2b() {
     for mode in MODES {
         let fx = extract(mode);
         let config = fx.config();
-        let before = sorted_entries(&fx.open_legacy().legacy_index().unwrap());
+        // The upgrade carries over the live legacy entries (refcount above
+        // 0) at their locations.
+        let before = sorted_entries(&fx.open_legacy().legacy_index().unwrap().to_live_index());
 
         let outcome = commands::upgrade::run(&config, fx.passphrase()).unwrap();
         assert!(

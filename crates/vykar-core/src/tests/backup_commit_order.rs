@@ -826,13 +826,13 @@ fn segmented_commit_puts_segment_then_head_then_snapshot() {
     assert!(!storage.exists("index.gen").unwrap());
 }
 
-type Refcounts = std::collections::HashMap<vykar_types::chunk_id::ChunkId, u32>;
+type IndexIds = std::collections::HashSet<vykar_types::chunk_id::ChunkId>;
 
-fn refcounts(repo_dir: &Path) -> Refcounts {
+fn index_ids(repo_dir: &Path) -> IndexIds {
     crate::tests::helpers::open_local_repo(repo_dir)
         .chunk_index()
         .iter()
-        .map(|(id, e)| (id, e.refcount))
+        .map(|(id, _)| id)
         .collect()
 }
 
@@ -897,12 +897,12 @@ fn assert_restores(config: &crate::config::VykarConfig, snapshot: &str, dest: &P
 }
 
 /// A backup whose snapshot PUT fails after the index write: the head moved,
-/// no snapshot exists. Returns the packs and refcounts it left.
+/// no snapshot exists. Returns the packs and index entries it left.
 fn fail_after_the_index_write(
     config: &crate::config::VykarConfig,
     src: &Path,
     repo_dir: &Path,
-) -> (Vec<String>, Refcounts) {
+) -> (Vec<String>, IndexIds) {
     let storage =
         crate::storage::backend_from_config(&config.repository.storage_config(1)).unwrap();
     let index_before = latest_head(&*storage);
@@ -933,15 +933,14 @@ fn fail_after_the_index_write(
 
     let packs = repo_keys(config, "packs/");
     assert!(!packs.is_empty());
-    let r1 = refcounts(repo_dir);
-    assert!(!r1.is_empty());
-    assert!(r1.values().all(|&r| r > 0), "{r1:?}");
-    (packs, r1)
+    let ids = index_ids(repo_dir);
+    assert!(!ids.is_empty());
+    (packs, ids)
 }
 
 /// Compact right after a commit whose snapshot PUT failed keeps the packs
 /// the committed index names; the next backup dedups against them, and
-/// `check --repair` corrects the inflated refcounts without data loss.
+/// `check --repair` sweeps the index without data loss.
 #[test]
 fn snapshot_put_failure_after_the_index_write_keeps_its_packs() {
     use crate::commands::check::{IndexRecovery, RepairAction, RepairMode};
@@ -981,7 +980,10 @@ fn snapshot_put_failure_after_the_index_write_keeps_its_packs() {
     assert!(!plan.has_data_loss, "{:?}", plan.actions);
     assert_eq!(plan.index_recovery, IndexRecovery::Complete);
     assert!(
-        matches!(plan.actions.as_slice(), [RepairAction::RebuildRefcounts]),
+        matches!(
+            plan.actions.as_slice(),
+            [RepairAction::RemoveUnreferencedEntries]
+        ),
         "{:?}",
         plan.actions
     );
@@ -1069,7 +1071,6 @@ fn concurrent_commit_of_the_same_chunks_writes_nothing_for_them() {
 
     let repo = cold_repo(&config, &dir.path().join("cold-after"));
     assert_eq!(repo.index_head().unwrap(), &head_at_lock);
-    assert!(repo.chunk_index().iter().all(|(_, e)| e.refcount == 1));
     drop(repo);
     let events = shared.events.lock().unwrap().clone();
     assert!(
@@ -1089,10 +1090,10 @@ fn concurrent_commit_of_the_same_chunks_writes_nothing_for_them() {
 /// chunks) while its marker probe was inconclusive, so the commit's re-check
 /// of reused chunks is the safety net (the sweep moved `sweep.gen`): it
 /// finds reused chunks that are gone and fails the commit before any index
-/// write. Also when the session only reuses chunks (a delta of bumps only
-/// still runs the check, BK-2/R4), and (BK-4) whether the session found
-/// them in an applied segment (keyed bumps) or, after a fold, in the table
-/// (positional bumps).
+/// write. Also when the session only reuses chunks (a delta of reuse only
+/// still runs the check, BK-2/R4; CM-1), and (BK-4) whether the session
+/// found them in an applied segment (reuse by key) or, after a fold, in the
+/// table (reuse by position).
 #[test]
 fn chunks_deleted_during_the_session_fail_the_commit_as_stale() {
     for (new_chunk, fold_first) in [(true, false), (false, false), (true, true), (false, true)] {

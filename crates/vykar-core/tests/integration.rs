@@ -522,10 +522,9 @@ fn backup_deduplicates_identical_files_and_extracts_correctly() {
     assert!(!first_ids.is_empty());
     assert_eq!(first_ids, second_ids);
 
-    // Reuse is not counted (format v6): one entry at refcount 1.
+    // Every shared chunk has its entry.
     for chunk_id in first_ids {
-        let entry = repo.chunk_index().get(&chunk_id).unwrap();
-        assert_eq!(entry.refcount, 1);
+        assert!(repo.chunk_index().contains(&chunk_id));
     }
 
     let restore_dir = tmp.path().join("restore");
@@ -1629,11 +1628,10 @@ fn file_cache_persists_and_matches_snapshot_items() {
         );
     }
 
-    // Every chunk has one entry; reuse is not counted (format v6).
+    // Every chunk has its entry.
     for file_item in &files1 {
         for cr in &file_item.chunks {
-            let entry = repo.chunk_index().get(&cr.id).unwrap();
-            assert_eq!(entry.refcount, 1, "chunk {} refcount", cr.id);
+            assert!(repo.chunk_index().contains(&cr.id), "chunk {}", cr.id);
         }
     }
 }

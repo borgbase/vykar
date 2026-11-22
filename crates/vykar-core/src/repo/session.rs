@@ -82,11 +82,11 @@ impl Repository {
     ///
     /// Over an unedited index the session resolves existing chunks against
     /// the repository's index view as it is now (the table and the head's
-    /// segments applied over it), and records bumps of table chunks by table
-    /// position (see `CachedBumps`), of segment additions by key; backup
+    /// segments applied over it), and records reuse of table chunks by table
+    /// position (see `ReusedChunks`), of segment additions by key; backup
     /// workers get a prefilter over the same view. Over an index with unsaved
-    /// edits (repair) every lookup and bump goes through the live index by
-    /// key, and there is no prefilter.
+    /// edits (repair) every lookup and every reuse goes through the live index
+    /// by key, and there is no prefilter.
     ///
     /// Applies every field of `opts`.
     ///
@@ -124,7 +124,7 @@ impl Repository {
             ws.view = None;
         }
         ws.index_delta = Some(match &ws.view {
-            Some(v) => IndexDelta::with_cached_bumps(std::sync::Arc::clone(v.view.table())),
+            Some(v) => IndexDelta::with_table(std::sync::Arc::clone(v.view.table())),
             None => IndexDelta::new(),
         });
         self.write_session = Some(ws);
@@ -410,7 +410,7 @@ impl Repository {
             sweep_gen: self.index_head.as_ref().map_or(0, |h| h.sweep.generation),
         };
         let ws = self.ws_mut();
-        ws.index_delta = Some(IndexDelta::with_cached_bumps(Arc::clone(&table)));
+        ws.index_delta = Some(IndexDelta::with_table(Arc::clone(&table)));
         ws.view = Some(view);
     }
 
@@ -419,24 +419,13 @@ impl Repository {
         self.ws().index_delta.as_ref().unwrap()
     }
 
-    /// Refcount bumps recorded in the index delta for `id`, by key or by
+    /// Whether the session's delta records `id` as reused, by key or by
     /// table position (for testing).
-    pub(crate) fn delta_refcount_bump(&self, id: &ChunkId) -> u32 {
-        let Some(delta) = self
-            .write_session
+    pub(crate) fn delta_reuses(&self, id: &ChunkId) -> bool {
+        self.write_session
             .as_ref()
             .and_then(|ws| ws.index_delta.as_ref())
-        else {
-            return 0;
-        };
-        let keyed = delta.refcount_bumps.get(id).copied().unwrap_or(0);
-        let positional = delta.cached_bumps.as_ref().map_or(0, |cached| {
-            cached
-                .cache()
-                .find(id)
-                .map_or(0, |(position, _)| cached.count_at(position as usize))
-        });
-        keyed + positional
+            .is_some_and(|delta| delta.reused.contains(id))
     }
 
     /// True if a rollback checkpoint is currently armed (for testing).
@@ -881,7 +870,7 @@ mod tests {
     }
 
     /// Over an unedited index a session finds existing chunks in the table
-    /// and counts their bumps by table position, not by key; workers get a
+    /// and records their reuse by table position, not by key; workers get a
     /// prefilter over the same table.
     #[test]
     fn session_dedups_against_the_table_by_position() {
@@ -921,18 +910,19 @@ mod tests {
         let ws = repo.write_session.as_ref().unwrap();
         let delta = ws.index_delta.as_ref().unwrap();
         assert!(
-            delta.refcount_bumps.is_empty(),
-            "no keyed bump for a table hit"
+            !delta.reused.is_keyed(&id),
+            "no keyed record for a table hit"
         );
-        assert_eq!(repo.delta_refcount_bump(&id), 2);
+        assert!(repo.delta_reuses(&id));
 
         // Reuse is recorded in the delta but not persisted.
+        let before = repo.chunk_index().get(&id).unwrap();
         repo.save_state().unwrap();
-        assert_eq!(repo.chunk_index().get(&id).unwrap().refcount, 1);
+        assert_eq!(repo.chunk_index().get(&id).unwrap(), before);
     }
 
     /// Over an index with unsaved edits (repair) a session sees the edits:
-    /// lookups and bumps go through the live index by key, and there is no
+    /// lookups and reuse go through the live index by key, and there is no
     /// prefilter over the (outdated) table.
     #[test]
     fn session_over_an_edited_index_records_by_key() {
@@ -964,11 +954,11 @@ mod tests {
             .index_delta
             .as_ref()
             .unwrap();
-        assert_eq!(delta.refcount_bumps.get(&kept), Some(&1));
-        assert!(delta.cached_bumps.is_none());
+        assert!(delta.reused.is_keyed(&kept));
+        assert!(delta.reused.positional().is_none());
 
         repo.save_state().unwrap();
         assert!(!repo.chunk_index().contains(&removed));
-        assert_eq!(repo.chunk_index().get(&kept).unwrap().refcount, 1);
+        assert!(repo.chunk_index().contains(&kept));
     }
 }

@@ -118,10 +118,9 @@ fn upgrade_through(fx: &Fixture, fail_at: usize, applied: bool) -> (Result<()>, 
     (result, log)
 }
 
-/// Entries without refcounts, refcount-0 ones left out (what v6 keeps).
+/// The entries, sorted, as strings.
 fn entries(index: impl Iterator<Item = (ChunkId, ChunkIndexEntry)>) -> Vec<String> {
     let mut v: Vec<String> = index
-        .filter(|(_, e)| e.refcount > 0)
         .map(|(id, e)| format!("{id:?} {} {} {}", e.pack_id, e.pack_offset, e.stored_size))
         .collect();
     v.sort();
@@ -129,8 +128,9 @@ fn entries(index: impl Iterator<Item = (ChunkId, ChunkIndexEntry)>) -> Vec<Strin
 }
 
 fn legacy_entries(fx: &Fixture) -> Vec<String> {
+    // What v6 keeps: the live legacy entries (refcount above 0).
     let index = fx.open_legacy().legacy_index().unwrap();
-    entries(index.iter().map(|(id, e)| (*id, *e)))
+    entries(index.live())
 }
 
 /// UPG-1 on an upgraded fixture.

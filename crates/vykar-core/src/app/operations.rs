@@ -158,8 +158,8 @@ pub enum CycleEvent {
         scope: HookScope,
         warning: String,
     },
-    /// Non-fatal warning from a cycle step (e.g. prune post-commit refcount
-    /// cleanup failed). `tracing::warn!` has already fired — this is for GUI
+    /// Non-fatal warning from a cycle step (e.g. a post-commit cleanup of
+    /// prune failed). `tracing::warn!` has already fired — this is for GUI
     /// visibility since the GUI does not subscribe to tracing.
     StepWarning {
         step: CycleStep,

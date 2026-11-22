@@ -17,9 +17,9 @@ pub(crate) struct PreparedChunk {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ExistingAt {
     /// At this position of the view's table, so the consumer can record the
-    /// refcount bump without a second lookup.
+    /// reuse without a second lookup.
     Table(u32),
-    /// Among the additions of the view's segments: bumped by key.
+    /// Among the additions of the view's segments: reuse recorded by key.
     Added,
 }
 

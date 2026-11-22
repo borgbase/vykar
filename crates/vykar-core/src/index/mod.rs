@@ -1,10 +1,9 @@
-pub mod base;
 pub mod base_v2;
-pub mod cached_bumps;
 pub mod dedup_cache;
 pub mod hasher;
 pub mod head;
-pub mod segment;
+pub mod legacy;
+pub mod reused;
 pub mod segment_v2;
 pub mod sweep_record;
 pub mod table;
@@ -12,8 +11,9 @@ pub mod table;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-pub use cached_bumps::CachedBumps;
 use hasher::{BuildChunkIdHasher, ChunkIdHashMap};
+pub use legacy::{IndexBlob, LegacyChunkIndex, LegacyIndexEntry};
+pub use reused::{ReusedChunks, ReusedPositions};
 pub use table::{ChunkTable, LiveIndex};
 
 use serde::{Deserialize, Serialize};
@@ -21,38 +21,18 @@ use serde::{Deserialize, Serialize};
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::pack_id::PackId;
 
-/// Wire format of the monolithic index that formats v2/v3 store at `index`,
-/// encrypted with context `b"index"`. Read only by the upgrade, and by the
-/// repair of a v4/v5 `index` that an older binary overwrote; nothing writes
-/// it any more (`Serialize` stays for test and fuzz encoders).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IndexBlob {
-    pub generation: u64,
-    pub chunks: ChunkIndex,
-}
-
-/// In-memory index of all chunks in the repository.
-/// Maps chunk_id -> (refcount, stored_size, pack_id, pack_offset).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// An in-memory map of chunks to their locations (tests, oracles, the
+/// rebuild and the upgrade). Never serialized: the legacy wire type is
+/// [`LegacyChunkIndex`].
+#[derive(Debug, Clone, Default)]
 pub struct ChunkIndex {
-    #[serde(deserialize_with = "deserialize_entries")]
     entries: ChunkIdHashMap<ChunkIndexEntry>,
 }
 
-/// Pre-size the entry table from the msgpack length prefix so a large index
-/// is allocated once instead of grown by doubling (old and new table both
-/// live at each rehash). Every entry carries a distinct 32-byte chunk ID — a
-/// keyed digest, incompressible — so a genuine index costs at least 32 input
-/// bytes per entry; see [`crate::compress::presize`] for the bound.
-fn deserialize_entries<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> Result<ChunkIdHashMap<ChunkIndexEntry>, D::Error> {
-    crate::compress::presize::deserialize_hash_map(deserializer, std::mem::size_of::<ChunkId>())
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+/// Where a chunk is stored. In-memory only: never serialized (the legacy
+/// wire type is [`LegacyIndexEntry`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChunkIndexEntry {
-    pub refcount: u32,
     pub stored_size: u32,
     pub pack_id: PackId,
     pub pack_offset: u64,
@@ -79,38 +59,20 @@ impl ChunkIndex {
         self.entries.contains_key(id)
     }
 
-    /// Add a new chunk entry with its pack location.
+    /// Add a chunk with its pack location; a present chunk keeps its entry.
     pub fn add(&mut self, id: ChunkId, stored_size: u32, pack_id: PackId, pack_offset: u64) {
-        self.entries
-            .entry(id)
-            .and_modify(|e| e.refcount += 1)
-            .or_insert(ChunkIndexEntry {
-                refcount: 1,
-                stored_size,
-                pack_id,
-                pack_offset,
-            });
-    }
-
-    /// Increment the refcount for an existing chunk without changing its location.
-    pub fn increment_refcount(&mut self, id: &ChunkId) {
-        if let Some(entry) = self.entries.get_mut(id) {
-            entry.refcount += 1;
-        }
-    }
-
-    /// Increment the refcount for an existing chunk by a given amount.
-    pub fn increment_refcount_by(&mut self, id: &ChunkId, amount: u32) {
-        if let Some(entry) = self.entries.get_mut(id) {
-            entry.refcount += amount;
-        }
+        self.entries.entry(id).or_insert(ChunkIndexEntry {
+            stored_size,
+            pack_id,
+            pack_offset,
+        });
     }
 
     pub fn get(&self, id: &ChunkId) -> Option<&ChunkIndexEntry> {
         self.entries.get(id)
     }
 
-    /// Insert or replace the entry of `id` as given (refcount included).
+    /// Insert or replace the entry of `id` as given.
     pub(crate) fn insert_entry(&mut self, id: ChunkId, entry: ChunkIndexEntry) {
         self.entries.insert(id, entry);
     }
@@ -125,23 +87,6 @@ impl ChunkIndex {
 
     pub fn iter(&self) -> impl Iterator<Item = (&ChunkId, &ChunkIndexEntry)> {
         self.entries.iter()
-    }
-
-    /// Decrement refcount for a chunk. Returns the new refcount and stored_size.
-    /// If refcount reaches 0, the entry is removed from the index.
-    /// Returns None if the chunk is not in the index.
-    pub fn decrement(&mut self, id: &ChunkId) -> Option<(u32, u32)> {
-        if let Some(entry) = self.entries.get_mut(id) {
-            entry.refcount = entry.refcount.saturating_sub(1);
-            let rc = entry.refcount;
-            let size = entry.stored_size;
-            if rc == 0 {
-                self.entries.remove(id);
-            }
-            Some((rc, size))
-        } else {
-            None
-        }
     }
 
     /// Update the storage location of an existing chunk (used by compact).
@@ -185,19 +130,6 @@ impl ChunkIndex {
         let before = self.entries.len();
         self.entries.retain(|_, entry| entry.pack_id != *pack_id);
         before - self.entries.len()
-    }
-
-    /// Replace all refcounts from a snapshot-derived map.
-    /// Entries with zero refs (not in `new_refcounts`) are removed.
-    pub fn rebuild_refcounts(&mut self, new_refcounts: &HashMap<ChunkId, u32>) {
-        self.entries.retain(|id, entry| {
-            if let Some(&rc) = new_refcounts.get(id) {
-                entry.refcount = rc;
-                true
-            } else {
-                false
-            }
-        });
     }
 }
 
@@ -334,9 +266,9 @@ pub struct RecoveredChunkEntry {
 }
 
 /// Marker for a `IndexDelta` rollback checkpoint. Records only the length of
-/// `new_entries` at checkpoint time; refcount bumps are rolled back via the
-/// delta's undo log and the positional journal in `cached_bumps` (both armed
-/// by `checkpoint()`), so no map snapshot is stored.
+/// `new_entries` at checkpoint time; reuse is rolled back through the
+/// journals of `reused` (armed by `checkpoint()`), so no set snapshot is
+/// stored.
 ///
 /// Armed per streamed command dump and per segmented large file.
 #[derive(Debug)]
@@ -351,31 +283,21 @@ impl IndexDeltaCheckpoint {
     }
 }
 
-/// Records the index mutations of a write session.
+/// Records the index mutations of a write session: the entries it added and
+/// the chunks it reused.
 ///
-/// A backup commit writes its new entries as a backup segment; other
-/// writers apply it to the repository's `LiveIndex` at save time.
+/// A backup commit re-checks the reused chunks when needed and writes the
+/// additions as a backup segment; other writers apply the additions to the
+/// repository's `LiveIndex` at save time.
 #[derive(Debug, Default)]
 pub struct IndexDelta {
     /// New chunk entries added during this session.
     pub new_entries: Vec<NewChunkEntry>,
-    /// Refcount increments recorded by chunk ID: chunks created earlier in
-    /// this session, chunks found in an edited index, and bumps whose
-    /// position could not be used (see `bump_cached_refcount`).
-    pub refcount_bumps: HashMap<ChunkId, u32>,
-    /// Refcount increments for chunks of the session's table, by table
-    /// position (`None` when the session began without a table). The logical
-    /// bump for a chunk is its `refcount_bumps` value plus its count here;
-    /// every consumer below adds both.
-    pub cached_bumps: Option<CachedBumps>,
+    /// The chunks this session reused from the index (presence only).
+    pub reused: ReusedChunks,
     /// `trailer_len` of every pack the session sealed or recovered, filled
     /// when the delta is taken from the session.
     pub pack_trailers: HashMap<PackId, u32>,
-    /// Undo log for the armed rollback checkpoint. `Some` ⟺ a checkpoint is
-    /// armed. Maps each in-scope-mutated chunk to its `refcount_bumps` value at
-    /// first touch (`None` = key was absent), so rollback replays exact prior
-    /// state without cloning the whole map.
-    pub(crate) undo_log: Option<HashMap<ChunkId, Option<u32>>>,
 }
 
 /// A new chunk entry recorded during a write session.
@@ -385,7 +307,6 @@ pub struct NewChunkEntry {
     pub stored_size: u32,
     pub pack_id: PackId,
     pub pack_offset: u64,
-    pub refcount: u32,
 }
 
 impl IndexDelta {
@@ -393,33 +314,27 @@ impl IndexDelta {
         Self::default()
     }
 
-    /// A delta that records bumps for chunks of `table` by position.
-    pub fn with_cached_bumps(table: Arc<ChunkTable>) -> Self {
+    /// A delta that records reuse of `table` by position.
+    pub fn with_table(table: Arc<ChunkTable>) -> Self {
         Self {
-            cached_bumps: Some(CachedBumps::new(table)),
+            reused: ReusedChunks::with_table(table),
             ..Self::default()
         }
     }
 
-    /// Returns true if this delta contains no mutations.
+    /// Returns true if this delta records neither an addition nor a reuse.
     pub fn is_empty(&self) -> bool {
-        self.new_entries.is_empty()
-            && self.refcount_bumps.is_empty()
-            && self.cached_bumps.as_ref().is_none_or(CachedBumps::is_empty)
+        self.new_entries.is_empty() && self.reused.is_empty()
     }
 
-    /// Arm a rollback checkpoint. Subsequent `refcount_bumps` mutations are
-    /// recorded in an undo log so `rollback()` can restore exact prior state
-    /// without cloning the map.
+    /// Arm a rollback checkpoint: `rollback()` then restores the additions
+    /// and the reused set exactly as they are now.
     pub fn checkpoint(&mut self) -> IndexDeltaCheckpoint {
         assert!(
-            self.undo_log.is_none(),
+            !self.reused.is_armed(),
             "checkpoint() called while another checkpoint is armed"
         );
-        self.undo_log = Some(HashMap::new());
-        if let Some(cached) = self.cached_bumps.as_mut() {
-            cached.checkpoint();
-        }
+        self.reused.checkpoint();
         IndexDeltaCheckpoint {
             new_entries_len: self.new_entries.len(),
         }
@@ -429,58 +344,14 @@ impl IndexDelta {
     /// that occurred after it was taken.
     pub fn rollback(&mut self, cp: IndexDeltaCheckpoint) {
         self.new_entries.truncate(cp.new_entries_len);
-        // Replay the undo log (empty/absent when the checkpoint was never
-        // armed, e.g. `IndexDeltaCheckpoint::empty()`).
-        if let Some(undo) = self.undo_log.take() {
-            for (id, prev) in undo {
-                match prev {
-                    Some(v) => {
-                        self.refcount_bumps.insert(id, v);
-                    }
-                    None => {
-                        self.refcount_bumps.remove(&id);
-                    }
-                }
-            }
-        }
-        if let Some(cached) = self.cached_bumps.as_mut() {
-            cached.rollback();
-        }
+        self.reused.rollback();
     }
 
     /// Discard the armed checkpoint without rolling back (commit path). The
-    /// in-scope mutations are kept; the undo log is dropped so the next
-    /// `checkpoint()` can arm cleanly.
+    /// in-scope mutations are kept, and the next `checkpoint()` can arm
+    /// cleanly.
     pub fn discard_checkpoint(&mut self) {
-        self.undo_log = None;
-        if let Some(cached) = self.cached_bumps.as_mut() {
-            cached.discard_checkpoint();
-        }
-    }
-
-    /// Record a refcount bump for a chunk found at `position` in the
-    /// session's table. Falls back to the keyed map when this delta
-    /// has no positional table or the position does not hold `id`, so the
-    /// recorded logical bump is the same either way.
-    pub fn bump_cached_refcount(&mut self, id: &ChunkId, position: u32) {
-        if let Some(cached) = self.cached_bumps.as_mut()
-            && cached.bump(position, id)
-        {
-            return;
-        }
-        // Unreachable while positions come from lookups in the session's
-        // table, the one this delta counts by; the keyed fallback
-        // keeps the count exact if that ever stops holding.
-        self.bump_refcount(id);
-    }
-
-    /// Record a refcount bump for an existing chunk by key.
-    pub fn bump_refcount(&mut self, id: &ChunkId) {
-        if let Some(undo) = self.undo_log.as_mut() {
-            let prev = self.refcount_bumps.get(id).copied();
-            undo.entry(*id).or_insert(prev);
-        }
-        *self.refcount_bumps.entry(*id).or_insert(0) += 1;
+        self.reused.discard_checkpoint();
     }
 
     /// Record a new chunk entry.
@@ -490,59 +361,19 @@ impl IndexDelta {
         stored_size: u32,
         pack_id: PackId,
         pack_offset: u64,
-        refcount: u32,
     ) {
         self.new_entries.push(NewChunkEntry {
             chunk_id,
             stored_size,
             pack_id,
             pack_offset,
-            refcount,
         });
     }
 
-    /// Reconcile this delta against a fresh index loaded at commit time.
-    ///
-    /// - `new_entries` already present in `fresh_index` → converted to refcount bumps
-    ///   (another client uploaded the same chunk concurrently).
-    /// - For each `refcount_bumps` key: verify the chunk still exists in `fresh_index`.
-    ///   If missing → `Err(StaleChunksDuringCommit)` (chunk was deleted since session started).
-    pub fn reconcile(mut self, fresh_index: &ChunkIndex) -> vykar_types::error::Result<Self> {
-        // Partition new_entries: those already in fresh_index become refcount bumps.
-        let mut still_new = Vec::new();
-        for entry in self.new_entries {
-            if fresh_index.contains(&entry.chunk_id) {
-                // Another client already committed this chunk — convert to bumps.
-                *self.refcount_bumps.entry(entry.chunk_id).or_insert(0) += entry.refcount;
-            } else {
-                still_new.push(entry);
-            }
-        }
-        self.new_entries = still_new;
-
-        // Verify all bump targets still exist.
-        let new_entry_ids: HashSet<ChunkId> = self.new_entries.iter().map(|e| e.chunk_id).collect();
-        let is_stale = |chunk_id: &ChunkId| {
-            !fresh_index.contains(chunk_id) && !new_entry_ids.contains(chunk_id)
-        };
-        if self.refcount_bumps.keys().any(is_stale) {
-            return Err(vykar_types::error::VykarError::StaleChunksDuringCommit);
-        }
-        if let Some(cached) = self.cached_bumps.as_ref()
-            && cached
-                .iter_nonzero()
-                .any(|(chunk_id, _)| is_stale(&chunk_id))
-        {
-            return Err(vykar_types::error::VykarError::StaleChunksDuringCommit);
-        }
-
-        Ok(self)
-    }
-
     /// Apply this delta to the repository's index (the path of sessions
-    /// that are not a backup commit). A new entry is added, at refcount 1,
-    /// only when the index does not hold the chunk. Bumps are not persisted
-    /// (05 step 8), so `refcount_bumps` and `cached_bumps` are ignored.
+    /// that are not a backup commit). A new entry is added only when the
+    /// index does not hold the chunk. Reuse is not persisted, so `reused`
+    /// is ignored.
     pub fn apply_to(self, index: &mut LiveIndex) {
         for (pack, trailer_len) in self.pack_trailers {
             index.set_pack_trailer(pack, trailer_len);
@@ -724,77 +555,6 @@ mod tests {
         assert_eq!(wire.len(), 1);
     }
 
-    // --- IndexDelta::reconcile tests ---
-
-    #[test]
-    fn reconcile_new_entry_already_in_fresh_index_becomes_bump() {
-        let mut fresh = ChunkIndex::new();
-        let chunk_a = make_chunk_id(1);
-        let pack_a = make_pack_id(10);
-        fresh.add(chunk_a, 100, pack_a, 0);
-
-        let mut delta = IndexDelta::new();
-        delta.add_new_entry(chunk_a, 100, make_pack_id(20), 0, 1);
-
-        let reconciled = delta.reconcile(&fresh).unwrap();
-        // new_entries should be empty (converted to bump)
-        assert!(reconciled.new_entries.is_empty());
-        // refcount_bumps should have chunk_a with count=1
-        assert_eq!(reconciled.refcount_bumps.get(&chunk_a), Some(&1));
-    }
-
-    #[test]
-    fn reconcile_bump_target_missing_returns_error() {
-        let fresh = ChunkIndex::new(); // empty index
-
-        let mut delta = IndexDelta::new();
-        let chunk_a = make_chunk_id(1);
-        delta.bump_refcount(&chunk_a); // bump for a chunk not in index
-
-        let result = delta.reconcile(&fresh);
-        assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            vykar_types::error::VykarError::StaleChunksDuringCommit
-        ));
-    }
-
-    #[test]
-    fn reconcile_bump_target_exists_succeeds() {
-        let mut fresh = ChunkIndex::new();
-        let chunk_a = make_chunk_id(1);
-        let pack_a = make_pack_id(10);
-        fresh.add(chunk_a, 100, pack_a, 0);
-
-        let mut delta = IndexDelta::new();
-        delta.bump_refcount(&chunk_a);
-
-        let reconciled = delta.reconcile(&fresh).unwrap();
-        assert!(reconciled.new_entries.is_empty());
-        assert_eq!(reconciled.refcount_bumps.get(&chunk_a), Some(&1));
-    }
-
-    #[test]
-    fn reconcile_mixed_new_and_existing() {
-        let mut fresh = ChunkIndex::new();
-        let chunk_a = make_chunk_id(1);
-        let chunk_b = make_chunk_id(2);
-        let pack_a = make_pack_id(10);
-        fresh.add(chunk_a, 100, pack_a, 0);
-        // chunk_b is NOT in fresh index
-
-        let mut delta = IndexDelta::new();
-        // chunk_a already exists in fresh → becomes bump
-        delta.add_new_entry(chunk_a, 100, make_pack_id(20), 0, 2);
-        // chunk_b is truly new
-        delta.add_new_entry(chunk_b, 200, make_pack_id(30), 0, 1);
-
-        let reconciled = delta.reconcile(&fresh).unwrap();
-        assert_eq!(reconciled.new_entries.len(), 1);
-        assert_eq!(reconciled.new_entries[0].chunk_id, chunk_b);
-        assert_eq!(reconciled.refcount_bumps.get(&chunk_a), Some(&2));
-    }
-
     // --- IndexDelta checkpoint/rollback tests ---
 
     #[test]
@@ -806,35 +566,35 @@ mod tests {
         let pack = make_pack_id(10);
 
         // Add initial state
-        delta.add_new_entry(chunk_a, 100, pack, 0, 1);
-        delta.bump_refcount(&chunk_b);
+        delta.add_new_entry(chunk_a, 100, pack, 0);
+        delta.reused.insert_key(&chunk_b);
 
         // Checkpoint
         let cp = delta.checkpoint();
         assert_eq!(delta.new_entries.len(), 1);
 
         // Add more mutations after checkpoint
-        delta.add_new_entry(chunk_c, 200, pack, 100, 1);
-        delta.bump_refcount(&chunk_a);
+        delta.add_new_entry(chunk_c, 200, pack, 100);
+        delta.reused.insert_key(&chunk_a);
         assert_eq!(delta.new_entries.len(), 2);
-        assert_eq!(delta.refcount_bumps.get(&chunk_a), Some(&1));
+        assert!(delta.reused.contains(&chunk_a));
 
         // Rollback
         delta.rollback(cp);
         assert_eq!(delta.new_entries.len(), 1);
         assert_eq!(delta.new_entries[0].chunk_id, chunk_a);
-        assert_eq!(delta.refcount_bumps.get(&chunk_b), Some(&1));
-        assert!(!delta.refcount_bumps.contains_key(&chunk_a));
+        assert!(delta.reused.contains(&chunk_b));
+        assert!(!delta.reused.contains(&chunk_a));
     }
 
     #[test]
     fn index_delta_checkpoint_empty() {
         let cp = IndexDeltaCheckpoint::empty();
         let mut delta = IndexDelta::new();
-        delta.add_new_entry(make_chunk_id(1), 100, make_pack_id(1), 0, 1);
+        delta.add_new_entry(make_chunk_id(1), 100, make_pack_id(1), 0);
         delta.rollback(cp);
         assert!(delta.new_entries.is_empty());
-        assert!(delta.refcount_bumps.is_empty());
+        assert!(delta.reused.is_empty());
     }
 
     #[test]
@@ -846,75 +606,81 @@ mod tests {
     }
 
     #[test]
-    fn index_delta_rollback_restores_pre_checkpoint_count() {
-        // A key bumped before the checkpoint, then bumped again in scope, must
-        // roll back to its pre-checkpoint count — not vanish.
+    fn index_delta_rollback_keeps_reuse_recorded_before_the_checkpoint() {
+        // A key reused before the checkpoint, then again in scope, is still
+        // recorded after the rollback.
         let mut delta = IndexDelta::new();
         let chunk = make_chunk_id(1);
-        delta.bump_refcount(&chunk);
-        delta.bump_refcount(&chunk);
-        assert_eq!(delta.refcount_bumps.get(&chunk), Some(&2));
+        delta.reused.insert_key(&chunk);
 
         let cp = delta.checkpoint();
-        delta.bump_refcount(&chunk);
-        assert_eq!(delta.refcount_bumps.get(&chunk), Some(&3));
-
+        delta.reused.insert_key(&chunk);
         delta.rollback(cp);
-        assert_eq!(delta.refcount_bumps.get(&chunk), Some(&2));
-        assert!(delta.undo_log.is_none());
+        assert!(delta.reused.contains(&chunk));
+        assert!(!delta.reused.is_armed());
     }
 
     #[test]
-    fn index_delta_rollback_removes_key_first_bumped_in_scope() {
+    fn index_delta_rollback_removes_key_first_reused_in_scope() {
         let mut delta = IndexDelta::new();
         let chunk = make_chunk_id(1);
 
         let cp = delta.checkpoint();
-        delta.bump_refcount(&chunk);
-        assert_eq!(delta.refcount_bumps.get(&chunk), Some(&1));
+        delta.reused.insert_key(&chunk);
+        delta.reused.insert_key(&chunk);
+        assert!(delta.reused.contains(&chunk));
 
         delta.rollback(cp);
-        assert!(!delta.refcount_bumps.contains_key(&chunk));
-    }
-
-    #[test]
-    fn index_delta_rollback_single_undo_entry_for_repeated_bumps() {
-        // Same key bumped twice in scope records only one undo entry (first
-        // touch), and rollback still removes it cleanly.
-        let mut delta = IndexDelta::new();
-        let chunk = make_chunk_id(1);
-
-        let cp = delta.checkpoint();
-        delta.bump_refcount(&chunk);
-        delta.bump_refcount(&chunk);
-        assert_eq!(delta.refcount_bumps.get(&chunk), Some(&2));
-        assert_eq!(delta.undo_log.as_ref().unwrap().len(), 1);
-
-        delta.rollback(cp);
-        assert!(!delta.refcount_bumps.contains_key(&chunk));
+        assert!(!delta.reused.contains(&chunk));
+        assert!(delta.is_empty());
     }
 
     #[test]
     fn index_delta_commit_then_recheckpoint() {
-        // Commit path: discard_checkpoint keeps in-scope bumps and lets a
+        // Commit path: discard_checkpoint keeps in-scope reuse and lets a
         // second checkpoint arm without panicking.
         let mut delta = IndexDelta::new();
         let chunk_a = make_chunk_id(1);
         let chunk_b = make_chunk_id(2);
 
         let _cp1 = delta.checkpoint();
-        delta.bump_refcount(&chunk_a);
+        delta.reused.insert_key(&chunk_a);
         // Commit the first scope.
         delta.discard_checkpoint();
-        assert!(delta.undo_log.is_none());
-        assert_eq!(delta.refcount_bumps.get(&chunk_a), Some(&1));
+        assert!(!delta.reused.is_armed());
+        assert!(delta.reused.contains(&chunk_a));
 
-        // Second checkpoint arms cleanly; its bump survives commit too.
+        // Second checkpoint arms cleanly; its reuse survives commit too.
         let _cp2 = delta.checkpoint();
-        delta.bump_refcount(&chunk_b);
+        delta.reused.insert_key(&chunk_b);
         delta.discard_checkpoint();
-        assert_eq!(delta.refcount_bumps.get(&chunk_a), Some(&1));
-        assert_eq!(delta.refcount_bumps.get(&chunk_b), Some(&1));
+        assert!(delta.reused.contains(&chunk_a));
+        assert!(delta.reused.contains(&chunk_b));
+    }
+
+    /// DELTA-1: additions only, reuse only and both are non-empty; a delta
+    /// whose only reuse was rolled back is empty.
+    #[test]
+    fn index_delta_is_empty_matrix() {
+        let id = make_chunk_id(1);
+        let mut additions = IndexDelta::new();
+        additions.add_new_entry(id, 1, make_pack_id(1), 0);
+        assert!(!additions.is_empty());
+
+        let mut reuse = IndexDelta::new();
+        reuse.reused.insert_key(&id);
+        assert!(!reuse.is_empty());
+
+        let mut both = IndexDelta::new();
+        both.add_new_entry(id, 1, make_pack_id(1), 0);
+        both.reused.insert_key(&make_chunk_id(2));
+        assert!(!both.is_empty());
+
+        let mut rolled = IndexDelta::new();
+        let cp = rolled.checkpoint();
+        rolled.reused.insert_key(&id);
+        rolled.rollback(cp);
+        assert!(rolled.is_empty());
     }
 
     // --- PendingIndexJournal::remove_pack tests ---
@@ -968,60 +734,6 @@ mod tests {
         assert_eq!(journal.len(), 2);
     }
 
-    #[test]
-    fn index_blob_metadata_decode_presizes_entries() {
-        let mut chunks = ChunkIndex::new();
-        for i in 0..30_000u32 {
-            let mut id = [0u8; 32];
-            id[..4].copy_from_slice(&i.to_le_bytes());
-            id[31] = 0x5a;
-            chunks.add(ChunkId::from_bytes(id), i, make_pack_id(1), u64::from(i));
-        }
-        let blob = IndexBlob {
-            generation: 7,
-            chunks: chunks.clone(),
-        };
-        let encoded = rmp_serde::to_vec(&blob).unwrap();
-        let compressed =
-            crate::compress::compress(crate::compress::Compression::Zstd { level: 3 }, &encoded)
-                .unwrap();
-        let (restored, _): (IndexBlob, u64) =
-            crate::compress::decode_metadata_msgpack(&compressed).unwrap();
-        assert_eq!(restored.generation, 7);
-        assert_eq!(restored.chunks.len(), chunks.len());
-        // Allocated once at the exact size rather than grown by doubling.
-        assert_eq!(
-            restored.chunks.entries.capacity(),
-            ChunkIndex::with_capacity(chunks.len()).entries.capacity()
-        );
-    }
-
-    #[test]
-    fn index_blob_msgpack_round_trip() {
-        let mut chunks = ChunkIndex::new();
-        chunks.add(make_chunk_id(1), 100, make_pack_id(10), 0);
-        chunks.add(make_chunk_id(2), 200, make_pack_id(20), 100);
-        // Bump refcount on chunk 1
-        chunks.increment_refcount(&make_chunk_id(1));
-
-        let generation = 42u64;
-        let blob = IndexBlob {
-            generation,
-            chunks: chunks.clone(),
-        };
-
-        let serialized = rmp_serde::to_vec(&blob).unwrap();
-        let restored: IndexBlob = rmp_serde::from_slice(&serialized).unwrap();
-
-        assert_eq!(restored.generation, generation);
-        assert_eq!(restored.chunks.len(), 2);
-        assert_eq!(restored.chunks.get(&make_chunk_id(1)).unwrap().refcount, 2);
-        assert_eq!(
-            restored.chunks.get(&make_chunk_id(2)).unwrap().stored_size,
-            200
-        );
-    }
-
     // --- ChunkIndex mutation method tests ---
 
     #[test]
@@ -1064,64 +776,33 @@ mod tests {
         assert_eq!(index.remove_by_pack(&make_pack_id(99)), 0);
     }
 
+    /// A new entry the index already holds leaves the existing one as it is,
+    /// and reuse is not applied at all.
     #[test]
-    fn chunk_index_rebuild_refcounts() {
-        let mut index = ChunkIndex::new();
+    fn apply_to_adds_each_new_chunk_once_and_ignores_reuse() {
+        let mut index = LiveIndex::empty();
         let c1 = make_chunk_id(1);
         let c2 = make_chunk_id(2);
         let c3 = make_chunk_id(3);
         let pack = make_pack_id(10);
         index.add(c1, 100, pack, 0);
-        index.add(c2, 200, pack, 100);
-        index.add(c3, 300, pack, 300);
-
-        let mut new_refs = HashMap::new();
-        new_refs.insert(c1, 5);
-        new_refs.insert(c2, 1);
-        // c3 not in new_refs → should be removed
-
-        index.rebuild_refcounts(&new_refs);
-        assert_eq!(index.len(), 2);
-        assert_eq!(index.get(&c1).unwrap().refcount, 5);
-        assert_eq!(index.get(&c2).unwrap().refcount, 1);
-        assert!(!index.contains(&c3));
-    }
-
-    #[test]
-    fn increment_refcount_by_adds_amount() {
-        let mut index = ChunkIndex::new();
-        let c = make_chunk_id(1);
-        let pack = make_pack_id(10);
-        index.add(c, 100, pack, 0);
-        assert_eq!(index.get(&c).unwrap().refcount, 1);
-
-        index.increment_refcount_by(&c, 5);
-        assert_eq!(index.get(&c).unwrap().refcount, 6);
-
-        // No-op for missing chunk
-        index.increment_refcount_by(&make_chunk_id(99), 10);
-    }
-
-    /// Bumps are not persisted, new entries land at refcount 1, and a new
-    /// entry the index already holds leaves the existing one as it is.
-    #[test]
-    fn apply_to_adds_new_entries_at_one_and_ignores_bumps() {
-        let mut index = LiveIndex::empty();
-        let c1 = make_chunk_id(1);
-        let c2 = make_chunk_id(2);
-        let pack = make_pack_id(10);
-        index.add(c1, 100, pack, 0);
 
         let mut delta = IndexDelta::new();
-        delta.add_new_entry(c2, 200, pack, 100, 5);
-        delta.add_new_entry(c1, 300, make_pack_id(11), 7, 1);
-        delta.bump_refcount(&c1);
-        delta.bump_refcount(&c1);
-        delta.bump_refcount(&c1);
+        delta.add_new_entry(c2, 200, pack, 100);
+        delta.add_new_entry(c1, 300, make_pack_id(11), 7);
+        delta.add_new_entry(c2, 400, make_pack_id(12), 9);
+        delta.reused.insert_key(&c1);
+        delta.reused.insert_key(&c3);
 
         delta.apply_to(&mut index);
+        assert_eq!(index.len(), 2);
         let e1 = index.get(&c1).unwrap();
-        assert_eq!((e1.refcount, e1.stored_size, e1.pack_id), (1, 100, pack));
-        assert_eq!(index.get(&c2).unwrap().refcount, 1);
+        assert_eq!((e1.stored_size, e1.pack_id, e1.pack_offset), (100, pack, 0));
+        let e2 = index.get(&c2).unwrap();
+        assert_eq!(
+            (e2.stored_size, e2.pack_id, e2.pack_offset),
+            (200, pack, 100)
+        );
+        assert!(!index.contains(&c3));
     }
 }

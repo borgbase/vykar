@@ -75,7 +75,7 @@ pub(super) enum ProcessedEntry {
         segment_index: usize,
         num_segments: usize,
     },
-    /// File cache hit — consumer just bumps refcounts.
+    /// File cache hit — consumer just records the reuse.
     CacheHit {
         item: crate::snapshot::item::Item,
         abs_path: String,

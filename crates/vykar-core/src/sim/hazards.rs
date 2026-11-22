@@ -534,9 +534,9 @@ pub fn h5_with(late: LateHead) -> HazardOutcome {
 ///
 /// Observed on `f7181ea` plus this harness, three runs, all the same:
 /// repair applies `RemoveDanglingSnapshot { "b1", missing_chunks: 1 }` and
-/// `RebuildRefcounts`, so b1 is gone after the repair; the compact that
-/// follows deletes 4 orphan packs (b's two, and a's two, which no snapshot
-/// references once refcounts are rebuilt). Repair does not stop H5: it
+/// `RemoveUnreferencedEntries`, so b1 is gone after the repair; the compact
+/// that follows deletes 4 orphan packs (b's two, and a's two, which no
+/// snapshot references once the repair swept the index). Repair does not stop H5: it
 /// turns the lost update into a silent removal. Invariants 2 and 3 are
 /// violated for b1, invariants 1, 4 and 8 hold, and b's packs are gone.
 pub fn h5_repair_then_compact() -> HazardOutcome {

@@ -488,7 +488,7 @@ mod tests {
         .map(summarize)
     }
 
-    /// The report of `rebuilt` and its entries, which all have refcount 1.
+    /// The report of `rebuilt` and its entries.
     fn summarize(rebuilt: Rebuilt) -> (Summary, Vec<Loc>) {
         let Rebuilt {
             body,

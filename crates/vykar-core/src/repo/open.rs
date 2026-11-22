@@ -548,7 +548,6 @@ mod tests {
                 200 * u64::from(i),
             );
         }
-        index.increment_refcount(&ChunkId::from_bytes([0; 32]));
         index.set_pack_trailer(pack, 0);
         // A fold, so that the base's table file is in the cache dir.
         repo.request_index_fold();

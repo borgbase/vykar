@@ -2,7 +2,7 @@
 title: "Testing"
 ---
 
-A single bug in serialization, encryption, or refcount tracking can silently destroy data. vykar's testing strategy uses layered tiers so that each tier catches a different class of defect — from logic errors in individual functions through emergent failures in multi-step workflows across storage backends.
+A single bug in serialization, encryption, or reference tracking can silently destroy data. vykar's testing strategy uses layered tiers so that each tier catches a different class of defect — from logic errors in individual functions through emergent failures in multi-step workflows across storage backends.
 
 ## Unit Tests
 
@@ -11,7 +11,7 @@ Unit tests in `vykar-core` cover each subsystem in isolation. Fast feedback (sec
 | Category | Focus |
 |----------|-------|
 | Format & serialization | RepoObj envelope round-trips, pack header parsing, item serde |
-| Chunk index | Add/remove/refcount/generation, the mapped table and its edits |
+| Chunk index | Add/remove, the mapped base table, applied segments and edits |
 | Locking | Advisory lock acquire/release, stale cleanup, fence detection |
 | Prune & retention | Policy evaluation (keep-last, keep-daily/weekly/monthly/yearly) |
 | Repair | Plan-only vs apply modes, post-repair cleanliness assertions |
@@ -26,11 +26,11 @@ Unit tests in `vykar-core` cover each subsystem in isolation. Fast feedback (sec
 |----------|--------------------|
 | Encryption round-trip | `decrypt(encrypt(P, ctx), ctx) == P` for both AES-256-GCM and ChaCha20-Poly1305; wrong-context decryption fails |
 | Item serde round-trip | Arbitrary files, directories, and symlinks survive msgpack positional encode/decode |
-| ChunkIndex serde round-trip | Varying refcounts, pack offsets, and generation numbers survive encode/decode |
+| Legacy index blob round-trip | Legacy refcounts, pack offsets, and generation numbers survive encode/decode (the v2/v3 wire format) |
 | Chunker completeness & determinism | No gaps or overlaps; same input always produces same boundaries; size bounds respected; stream and slice APIs agree |
 | Backup-restore round-trip | Arbitrary nested file trees (empty, small, large files; nested directories) restore byte-identical |
 | Compression round-trip | `decompress(compress(codec, data)) == data` for all codecs (None, LZ4, ZSTD); output within size bound |
-| IndexDelta state-machine | Refcount conservation after apply and after reconcile-then-apply with concurrent overlaps |
+| IndexDelta state machine | Additions applied once; rollback restores the reused set and the additions exactly |
 
 ## Matrix Tests
 
@@ -63,14 +63,10 @@ Unit tests in `vykar-core` cover each subsystem in isolation. Fast feedback (sec
 | `fuzz_item_stream` | `for_each_decoded_item` | Streaming framing via `Deserializer::position()`, EOF handling |
 | `fuzz_file_cache_decode` | `FileCache::decode_from_plaintext` | Manual msgpack marker parsing, allocation cap, legacy fallback |
 | `fuzz_unpack_object` | `unpack_object` + `unpack_object_expect_with_context` (+ in-place) | AEAD envelope parse, nonce extraction, context/AAD wiring for chunk, index, head, base and segment objects, tag authentication |
-| `fuzz_index_segment` | `Segment::decode` | Position gaps, counts, re-encode identity |
 | `fuzz_index_head` | `IndexHead::decode` | Head framing, round-trip |
 | `fuzz_index_base_v2` | `validate_base_body`, `BaseWriter` | Fixed-width base body: counts against the length, sort order, pack slots, unreferenced packs; re-encode identity |
 | `fuzz_index_segment_v2` | `SegmentBody::decode` | Keyed segment: header counts before allocation, sections, kinds, pack table; re-encode identity |
-| `fuzz_index_base` | `index::base::decode_base_to_temp` | Sort order, pack table, varints, re-encode identity |
-| `fuzz_index_apply` | `apply_to_temp` over a decoded base and 1-3 segments | Streaming apply disagreeing with the reference model, wrong declared results |
 | `fuzz_index_object` | Store-level segment and base decode (body version 2) of `index.d/` objects | Name check, zstd streaming, decode bounds, error classification as damage |
-| `fuzz_full_index_cache` | `MmapFullIndexCache::open_verified`, `encode_base`, apply | Local cache framing, unsorted entries behind a valid trailer |
 | `fuzz_repo_config` | `RepoConfig::decode` (map and positional), `DecodedConfig::validate`, re-encode of a v6 map, pack-size targets, backup's chunker gate and both chunkers | Unauthenticated `config`: unknown versions, pack-size limits, chunker parameters reaching FastCDC, resumable chunker disagreeing with fastcdc |
 | `fuzz_key_blob` | `inspect_key_blob` | Unauthenticated KDF parameters out of bounds (the KDF never runs) |
 | `fuzz_restore_paths` | `sanitize_item_into`, symlink target audit over an item stream | Path traversal on restore, raw (non-UTF-8) names, against an independent model |
@@ -94,5 +90,5 @@ End-to-end tests at two levels:
 YAML-driven scenario runner (`scripts/testbench`) executes multi-phase workflows against all four storage backends (local, REST, S3/MinIO, SFTP).
 
 - **Scenarios**: configurable corpus (mixed file types, sizes up to 2 GB), phases including `init → backup → verify (restore + diff) → check → churn → prune → compact → cleanup`. Churn simulation applies configurable adds, deletes, and modifications with growth caps to test incremental backup and dedup correctness over time.
-- **Stress mode**: up to 1000 iterations of `backup → list → restore → verify → delete → compact → prune` with periodic `check` and optional `check --verify-data`. Catches state-accumulation bugs (leaking refcounts, index bloat, stale cache entries) that only manifest after many cycles.
+- **Stress mode**: up to 1000 iterations of `backup → list → restore → verify → delete → compact → prune` with periodic `check` and optional `check --verify-data`. Catches state-accumulation bugs (leaking index entries, index bloat, stale cache entries) that only manifest after many cycles.
 - **Multi-backend coverage**: ensures storage-abstraction bugs do not hide behind the local filesystem.

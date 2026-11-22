@@ -107,7 +107,7 @@ pub(crate) struct WriteSessionState {
     /// (`StorageBackend::begin_staged_put`; local repositories). A staged
     /// pack holds no heap, so it counts 0 against the upload byte cap.
     pub(crate) stream_data_packs: bool,
-    /// What lookups and positional bumps resolve against: the repository's
+    /// What lookups and positional reuse resolve against: the repository's
     /// index when the session began, unless it was edited or not loaded
     /// (then every lookup goes through the live index by key). Immutable for
     /// the session.
@@ -354,10 +354,10 @@ impl WriteSessionState {
             pack_id,
             crate::repo::pack_trailer::trailer_frame_len(entries.len(), encrypting),
         );
-        for (chunk_id, stored_size, offset, refcount) in entries {
+        for (chunk_id, stored_size, offset) in entries {
             self.session_new.insert(chunk_id, stored_size);
             if let Some(ref mut delta) = self.index_delta {
-                delta.add_new_entry(chunk_id, stored_size, pack_id, offset, refcount);
+                delta.add_new_entry(chunk_id, stored_size, pack_id, offset);
             }
             if let Some(ref mut tracker) = self.rollback_tracker {
                 tracker.dedup_inserts.push(chunk_id);
@@ -399,7 +399,7 @@ impl WriteSessionState {
     }
 
     /// Promote a recovered chunk into the session (`session_new` and the
-    /// delta, as a new entry with refcount 1). Returns the stored size if
+    /// delta, as a new entry). Returns the stored size if
     /// the chunk was in `recovered_chunks`, None otherwise.
     pub(crate) fn promote_recovered_chunk(&mut self, chunk_id: &ChunkId) -> Option<u32> {
         let entry = self.recovered_chunks.remove(chunk_id)?;
@@ -417,7 +417,6 @@ impl WriteSessionState {
                 entry.stored_size,
                 entry.pack_id,
                 entry.pack_offset,
-                1,
             );
         }
 
@@ -426,17 +425,13 @@ impl WriteSessionState {
 
     // --- Dedup query helpers ---
 
-    /// Check only pending pack writers for a dedup hit (shared helper).
+    /// Check only pending pack writers for a dedup hit (shared helper). A
+    /// pending chunk is among the session's own additions once its pack is
+    /// sealed, so no reuse is recorded.
     pub(crate) fn bump_ref_pending(&mut self, chunk_id: &ChunkId) -> Option<u32> {
-        if let Some(s) = self.data_pack_writer.get_pending_stored_size(chunk_id) {
-            self.data_pack_writer.increment_pending(chunk_id);
-            return Some(s);
-        }
-        if let Some(s) = self.tree_pack_writer.get_pending_stored_size(chunk_id) {
-            self.tree_pack_writer.increment_pending(chunk_id);
-            return Some(s);
-        }
-        None
+        self.data_pack_writer
+            .get_pending_stored_size(chunk_id)
+            .or_else(|| self.tree_pack_writer.get_pending_stored_size(chunk_id))
     }
 }
 

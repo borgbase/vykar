@@ -124,13 +124,13 @@ Rationale:
 
 ### Deduplication
 
-Content-addressed deduplication uses keyed `ChunkId` values (keyed BLAKE2b-256 in format v2 and in v6 repositories upgraded from it, keyed BLAKE3 in v3 and v6 otherwise). Identical plaintext produces the same `ChunkId`, so the second copy is not stored; only refcounts are incremented. Because the algorithm is part of the chunk's identity, **dedup never spans chunk hashes** — which is also why the hash cannot be changed in place (the index layout can, see [Repository Versions](#repository-versions)).
+Content-addressed deduplication uses keyed `ChunkId` values (keyed BLAKE2b-256 in format v2 and in v6 repositories upgraded from it, keyed BLAKE3 in v3 and v6 otherwise). Identical plaintext produces the same `ChunkId`, so the second copy is not stored; the reference is only recorded as reused. Because the algorithm is part of the chunk's identity, **dedup never spans chunk hashes** — which is also why the hash cannot be changed in place (the index layout can, see [Repository Versions](#repository-versions)).
 
 The repository's chunk index is one memory-mapped **chunk table** per base, the head's segments applied over it in memory, and this process's edits (`LiveIndex`, see [Local Optimization Caches](#local-optimization-caches-client-machine)). There is one lookup path for backup, restore, compact and check; no dedup mode is chosen.
 
 **Dedup check during a write session** (`Repository::bump_ref_if_exists` and the backup consumer):
 1. **Chunks stored earlier in this session** — a small `session_new` map
-2. **The session's table** — an xor filter (`xorf::Xor8`, built once per table) as probabilistic negative check, then a binary search of the mapped table. A hit is recorded as a refcount bump by *table position* (`CachedBumps`), resolved to chunk IDs in table order at commit. Backup workers run this check themselves (`DedupPrefilter`) and send a confirmed hit without its data. Over an index with unsaved edits (repair) the lookup goes through the live index by key instead, with no prefilter.
+2. **The session's view of the index** — first the additions of the head's segments applied over the table (found by key, and recorded as reused by key), then an xor filter (`xorf::Xor8`, built once per table) as probabilistic negative check and a binary search of the mapped table. A table hit is recorded as reused by *table position* (`ReusedChunks`: one bit per table entry, and a key set for everything outside the table); no count is kept. The commit checks the reused chunks again only when the head changed in a way that can have removed entries (see [Commit Check](#commit-check)). Backup workers run this check themselves (`DedupPrefilter`) and send a confirmed hit without its data. Over an index with unsaved edits (repair) the lookup goes through the live index by key instead, with no prefilter.
 3. **Chunks recovered** from an interrupted session's journal
 4. **Pending pack writers** — blobs buffered in data/tree `PackWriter`s that have not yet been flushed
 
@@ -180,7 +180,7 @@ The **item stream** evolves by an *expand → contract* rule. The rule does not 
 - **Expand:** append a field with `#[serde(default)]`. New binaries still read old snapshots; older binaries cannot read the new ones (see below), so an expansion is still a one-way step for a shared repository. Already done for `Item.link_target`, `Item.xattrs`, `Item.raw_names`, `Item.hardlink`, and `SnapshotMeta.{comment, source_paths, label, ext, format_version}`. `Item.hardlink` ships under format **v1** (no bump), alongside the `format_version` envelope field itself — both landed together in **0.17.0**, so there is a single "0.17 introduces format v1" story rather than two versions in the wild. That release took the `SnapshotMeta` envelope from 12 fields to 14, which is why a pre-0.17 binary reports `array had incorrect length, expected 12` against a 0.17+ snapshot.
 - **Contract (breaking, batched):** remove or retype a field — only when a larger forced break (crypto, chunking) already requires one; cleanups ride that train rather than justifying a break alone.
 
-Compatibility is **backward-readable, not forward-compatible**: a new binary reads old snapshots, but older binaries are **not** guaranteed to read newer item streams (rmp-serde rejects a longer-than-expected positional array, so an old reader hits a length mismatch on the first extended record). `SnapshotMeta.format_version` (absent/`0` = legacy) is the discriminator; current writers stamp the latest (`CURRENT_FORMAT_VERSION`) and readers reject anything newer than they support. `check` treats a newer snapshot as **unsupported, never corrupt**, and `check --repair` refuses to run while one is present (rebuilding refcounts requires decoding every surviving snapshot).
+Compatibility is **backward-readable, not forward-compatible**: a new binary reads old snapshots, but older binaries are **not** guaranteed to read newer item streams (rmp-serde rejects a longer-than-expected positional array, so an old reader hits a length mismatch on the first extended record). `SnapshotMeta.format_version` (absent/`0` = legacy) is the discriminator; current writers stamp the latest (`CURRENT_FORMAT_VERSION`) and readers reject anything newer than they support. `check` treats a newer snapshot as **unsupported, never corrupt**, and `check --repair` refuses to run while one is present (its sweep requires decoding every surviving snapshot).
 
 Two distinct signals mean "newer writer", and both are classified as unsupported rather than corrupt:
 
@@ -196,7 +196,7 @@ A snapshot this binary cannot read is **hidden, never damaged**. It is excluded 
 - **Paths → bytes.** `Item.path` / `Item.link_target` are UTF-8 `String`; non-UTF8 names are preserved out-of-band in the additive `Item.raw_names` byte field (`path` / `link_target` remain the lossy display strings, the raw bytes are authoritative at restore time on Unix). At the next item-stream version, collapse into one canonical byte field and drop the lossy String shadow.
 - **Xattr names → bytes.** `Item.xattrs` keys are `String`; non-UTF8 xattr names are dropped with a warning today. Retype keys to bytes (niche — names are usually ASCII).
 
-**Hard links** use a *content-on-every-node* representation (restic-style): a regular file with `nlink > 1` keeps its full chunk list and additionally records its source `(dev, ino)` in the optional `Item.hardlink` field. Restore regroups members by `(dev, ino)`, materializes the first member of each group from its chunks (the representative), and relinks the rest to it; a member is linked only when its **content** matches the representative — identity is a BLAKE2b-256 fingerprint over the ordered chunk-id list, which is authoritative because chunk ids are content-addressed. A mismatch (inode-number reuse handing the same `(dev, ino)` to different content) declines to link and materializes that member from its own chunks instead, so a member's own bytes are never silently replaced by the representative's. The relink stays inside the restore temp root (one filesystem, so links survive the final inode-preserving rename) and validates the link target's parent against the root unconditionally; a planted symlinked parent that escapes the root, or any failure to place a link's content (after a copy fallback), is fatal — restore never reports success with a requested path missing. Two properties fall out of this design: per-item chunk refcounts stay **symmetric** automatically (`+N` on backup, `-N` on delete) with no special-casing in `commit.rs`/`snapshot_ops.rs`, and restore is robust to partial views — *we never assume we see all N links*, so a single in-set member (filtered group, link outside the source) is just a normal file. The accepted cost is redundant chunk-lists in the item stream for extreme fan-out, which dedup makes free in storage.
+**Hard links** use a *content-on-every-node* representation (restic-style): a regular file with `nlink > 1` keeps its full chunk list and additionally records its source `(dev, ino)` in the optional `Item.hardlink` field. Restore regroups members by `(dev, ino)`, materializes the first member of each group from its chunks (the representative), and relinks the rest to it; a member is linked only when its **content** matches the representative — identity is a BLAKE2b-256 fingerprint over the ordered chunk-id list, which is authoritative because chunk ids are content-addressed. A mismatch (inode-number reuse handing the same `(dev, ino)` to different content) declines to link and materializes that member from its own chunks instead, so a member's own bytes are never silently replaced by the representative's. The relink stays inside the restore temp root (one filesystem, so links survive the final inode-preserving rename) and validates the link target's parent against the root unconditionally; a planted symlinked parent that escapes the root, or any failure to place a link's content (after a copy fallback), is fatal — restore never reports success with a requested path missing. Two properties fall out of this design: every member lists its own chunks, so the [mark](#mark) reaches them from any member and deleting some members needs no special-casing, and restore is robust to partial views — *we never assume we see all N links*, so a single in-set member (filtered group, link outside the source) is just a normal file. The accepted cost is redundant chunk-lists in the item stream for extreme fan-out, which dedup makes free in storage.
 
 Future snapshot-level metadata goes inside the reserved opaque `ext` blob (parsed per `format_version`) rather than as new outer fields, so the frozen envelope and its discriminator stay intact without a tolerant-envelope rework.
 
@@ -327,18 +327,19 @@ flowchart LR
 
 ### Key Data Structures
 
-**IndexBlob** — v2/v3: the encrypted object stored at the `index` key. It combines the current cache-validity token with the chunk index. v6 stores the same entries as a [segmented index](#segmented-index-v6).
+**IndexBlob** — v2/v3 only: the encrypted object stored at the `index` key, as vykar 0.19 to 0.24 wrote it (`index::legacy`). Read only by `vykar upgrade`; encoded only by tests and fuzz seeds. Its types (`IndexBlob`, `LegacyChunkIndex`, `LegacyIndexEntry`) are a frozen wire format.
 
 | Field | Type | Description |
 |-------|------|-------------|
 | generation | u64 | Authenticated cache-validity token rotated when the index changes |
-| chunks | ChunkIndex | Full chunk-to-pack mapping |
+| chunks | LegacyChunkIndex | `HashMap<ChunkId, LegacyIndexEntry>`: `refcount` (u32), `stored_size`, `pack_id`, `pack_offset` |
 
-**ChunkIndex** — `HashMap<ChunkId, ChunkIndexEntry>`, persisted inside `IndexBlob` (v2/v3); read by the upgrade. In v6 the same entries are a base plus segments on storage and a `LiveIndex` (mapped base table, the head's segments applied in memory, and edits) in memory, the central lookup table for deduplication, restore, and compaction.
+The legacy `refcount` is the only count left: the upgrade drops entries at 0 (garbage the old release had not removed yet) and discards the others.
+
+**ChunkIndexEntry** — where a chunk is stored; in memory only, never serialized. v6 stores the entries as a base plus segments ([segmented index](#segmented-index-v6)) and holds them in a `LiveIndex` (mapped base table, the head's segments applied in memory, and edits), the central lookup table for deduplication, restore, and compaction. `ChunkIndex`, a plain map of the same entries, serves the rebuild, oracles and tests.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| refcount | u32 | Not maintained since format v6: new entries are written with 1, reuse is not counted, and nothing decides on it (liveness comes from the mark). `check --repair` still writes multiplicity counts; 05 step 10 removes the column |
 | stored_size | u32 | Size in bytes as stored (compressed + encrypted) |
 | pack_id | PackId | Which pack file contains this chunk |
 | pack_offset | u64 | Byte offset within the pack file |
@@ -423,16 +424,16 @@ index.d/<64 hex>     # write-once: base, segment or sweep record, name = BLAKE3 
 
 - **The state is the head.** An index state is the head's base with its segments applied in the head's order; no state hash exists. Local files are matched by object name.
 - **Head** (`IndexHead`, a msgpack **map** with named keys, `layout` = 3, AEAD context `index.h`): `gen` (equal to its key's generation, checked), `features` (written empty; a head naming a feature this binary does not know is refused as written by a newer vykar; readers ignore unknown keys, so a later field is additive), `base: Option<{name, size, entries}>` (`None` = the empty table, which `init` writes at `index.h/1`), `segments: [{name, size, kind, entries}]` in order (`kind`: 0 = backup, which may only add entries, 1 = maintenance; `entries` bounds the decode), `retired`: the objects of the last head before the most recent fold, and `sweep: {gen, record}`: the generation of the last head a sweep or `check --repair` wrote, and the sweep record of the last sweep (an informational map of what the mark found; `info` reads it). A layout-2 head (05 step 8's development builds, with v1 chain fields) or layout 1 (v4/v5) is refused by layout.
-- **Base** (body version 2, then zstd, AEAD): `version u8 = 2 | reserved [3] | pack_count u32 | entry_count u32 | packs × {pack_id [32], trailer_len u32} | records × {chunk_id [32], pack_slot u32, pack_offset u32, stored_size u32}`, little-endian, fixed width, so the decoded body is the local table file. Canonical: packs and records strictly increasing, every pack referenced, length exact. No refcount is stored. `trailer_len` is the length of the pack's trailer frame (4 + its blob), 0 for a pack without one.
+- **Base** (body version 2, then zstd, AEAD): `version u8 = 2 | reserved [3] | pack_count u32 | entry_count u32 | packs × {pack_id [32], trailer_len u32} | records × {chunk_id [32], pack_slot u32, pack_offset u32, stored_size u32}`, little-endian, fixed width, so the decoded body is the local table file. Canonical: packs and records strictly increasing, every pack referenced, length exact. No reference count is stored. `trailer_len` is the length of the pack's trailer frame (4 + its blob), 0 for a pack without one.
 - **Segment** (body version 2, keyed): `version u8 = 2 | kind u8 | reserved [2] | counts u32 × 4 | packs × {pack_id, trailer_len} | additions × {chunk_id, slot, offset, size} | removals × {chunk_id} | relocations × {chunk_id, slot, offset, size}`. Each section is sorted, a chunk is in at most one, every pack is referenced, a backup segment only adds, and an empty segment is invalid. A segment names no predecessor. The header counts are checked against the head's `entries` before anything is allocated. A version other than 2 (a v1 base or segment included) is refused by version.
 - **Applying**, in the head's order: a removal or relocation of an absent chunk is damage; an addition of an absent chunk adds it; an addition of a present chunk keeps the lower (pack ID, offset), so additions are order-independent across segments; a pack named with two trailer lengths takes the larger.
 - **Every read of `index.d/<name>` checks `BLAKE3(bytes) == name` and the recorded size first.** The AEAD contexts are static because the name is the hash of the ciphertext; the binding to the head is this check. On a plaintext repository it is the only corruption check before decompression.
 
-**In memory** (`LiveIndex`): the mapped base table, an `applied` layer (what the head's segments did to it: removed and relocated table positions, entries added outside the table, trailer lengths), shared with write sessions and never edited in place, and the copy-on-write `edits` of this process. Refcounts are in memory only: every loaded entry reads 1.
+**In memory** (`LiveIndex`): the mapped base table, an `applied` layer (what the head's segments did to it: removed and relocated table positions, entries added outside the table, trailer lengths), shared with write sessions and never edited in place, and the copy-on-write `edits` of this process.
 
-**Write** (any writer, under the repository lock): read the latest head and check it is the one the index was loaded from; express the edits as one maintenance segment by comparing `edits` with `applied` (a walk over the overlay structures, never the table); PUT the segment (and a pending sweep record), check the lock fence, PUT the head of the next generation with a plain put (04 step 8 makes it create-if-absent); the edits become the applied layer and the segment's bytes are cached locally. Refcount-only edits write nothing. A write refuses when the head changed after the index was loaded.
+**Write** (any writer, under the repository lock): read the latest head and check it is the one the index was loaded from; express the edits as one maintenance segment by comparing `edits` with `applied` (a walk over the overlay structures, never the table); PUT the segment (and a pending sweep record), check the lock fence, PUT the head of the next generation with a plain put (04 step 8 makes it create-if-absent); the edits become the applied layer and the segment's bytes are cached locally. Edits that change nothing (such as an add of a chunk the index holds) write nothing. A write refuses when the head changed after the index was loaded.
 
-**Backup commit, by additions**: GET the latest head and bring the index to it (normally already there; another session's backup segments are applied). Reused chunks are checked again only when the head moved in a way that can have removed entries: another `sweep.gen`, another base, a segment list that does not extend the session's, or a non-backup segment since the session began; then every reused chunk must be in the index or among the session's new entries, else `StaleChunksDuringCommit` and nothing is written. The segment holds the session's new chunks the index does not hold yet (another session may have committed some first; its copies are dead bytes compact reclaims), with the trailer length of each of their packs. A session that adds nothing writes no segment and no head. Workers dedup against the session's view: its applied additions first, then the table's xor filter and the table.
+**Backup commit, by additions**: GET the latest head and bring the index to it (normally already there; another session's backup segments are applied). Reused chunks (the session's reuse record, see [Commit Check](#commit-check)) are checked again only when the head moved in a way that can have removed entries: another `sweep.gen`, another base, a segment list that does not extend the session's, or a non-backup segment since the session began; then every reused chunk must be in the index or among the session's new entries, else `StaleChunksDuringCommit` and nothing is written. The segment holds the session's new chunks the index does not hold yet (another session may have committed some first; its copies are dead bytes compact reclaims), with the trailer length of each of their packs. A session that adds nothing writes no segment and no head. Workers dedup against the session's view: its applied additions first, then the table's xor filter and the table.
 
 **Read**: open lists snapshots first, then lists `index.h/` and GETs the highest generation once (a writer PUTs the head before its snapshot, so this head covers every listed snapshot; a 404 on that GET re-lists, bounded). The repository's own index needs only the segments it lacks; otherwise the head's base comes from `index_base.<name>` or is downloaded once, and its segments from the segment cache or are downloaded (in parallel, before the base), and applied. Readers take no lock. A 404 on a named object makes the reader re-read the head: if the new head still names the object it is lost, and the read fails naming it (`vykar check --repair`); otherwise a fold moved the head and the reader retries on it (bounded retries).
 
@@ -442,7 +443,7 @@ index.d/<64 hex>     # write-once: base, segment or sweep record, name = BLAKE3 
 
 **Order against pack deletes**: no pack is deleted while the head on storage names a state that references it. Client-side compact saves once per batch of source packs (64 packs or 4 GiB), then deletes that batch's sources, empty packs included.
 
-**Damage**: a chain with missing or damaged objects, and a missing or unreadable latest head, are refused by every command except `check --repair`, which writes a fresh base. When an object of the chain is absent or fails verification or decoding, the head's state is loaded from this machine's copies of its objects (its base table and cached segments, each verified) when they cover it, and the repair writes that state as a fresh base under a new head, so storage again holds every object its head names. Without such copies, and when the head is missing or cannot be read, the index is **rebuilt from the packs** (`repo::index_rebuild`): every listed pack is described by a pack map naming it (no request to the pack), else by its trailer, else by this machine's verified base tables (`index_base.*`; only entries that lie inside the listed pack; a pack ID names the pack's bytes, so an entry that was ever true for it still is). A chunk stored in several packs resolves to the lowest (pack ID, offset). Packs that nothing describes are listed in the plan with the reason, and the snapshots that need them are removed by it; packs the rebuild took only from a local table get a `WritePackMaps` action, so the next rebuild does not need this machine. A storage error (a failed GET of a chain object, even when this machine's copies cover it, or a failed listing, map GET or trailer read), a pack map or trailer of a newer body version or codec, or an object of an unknown type under `packmaps/` aborts the repair with nothing changed, and the error names the object's key. A trailer of an unknown version counts as newer only when the pack still hashes to its ID (the pack ID covers the trailer): in a plaintext repository one flipped byte also produces an unknown version, and a pack that no longer matches its ID is damaged, so it is uncovered and the repair goes on. The rebuilt base records each trailer-described pack's trailer length (0 for packs a map or a local table described without one). The repair's refcount rebuild drops entries no snapshot references. The rebuild trusts what the packs say: chunks whose bytes rotted inside a described pack are found only by `check --verify-data`, so run it after a rebuild. An interactive repair refuses to apply a plan rebuilt under the lock that has data loss where the shown plan had none, or that read the index differently (including other rebuild counts). A head of an unknown layout or with unknown features, or of an unknown object type, is refused.
+**Damage**: a chain with missing or damaged objects, and a missing or unreadable latest head, are refused by every command except `check --repair`, which writes a fresh base. When an object of the chain is absent or fails verification or decoding, the head's state is loaded from this machine's copies of its objects (its base table and cached segments, each verified) when they cover it, and the repair writes that state as a fresh base under a new head, so storage again holds every object its head names. Without such copies, and when the head is missing or cannot be read, the index is **rebuilt from the packs** (`repo::index_rebuild`): every listed pack is described by a pack map naming it (no request to the pack), else by its trailer, else by this machine's verified base tables (`index_base.*`; only entries that lie inside the listed pack; a pack ID names the pack's bytes, so an entry that was ever true for it still is). A chunk stored in several packs resolves to the lowest (pack ID, offset). Packs that nothing describes are listed in the plan with the reason, and the snapshots that need them are removed by it; packs the rebuild took only from a local table get a `WritePackMaps` action, so the next rebuild does not need this machine. A storage error (a failed GET of a chain object, even when this machine's copies cover it, or a failed listing, map GET or trailer read), a pack map or trailer of a newer body version or codec, or an object of an unknown type under `packmaps/` aborts the repair with nothing changed, and the error names the object's key. A trailer of an unknown version counts as newer only when the pack still hashes to its ID (the pack ID covers the trailer): in a plaintext repository one flipped byte also produces an unknown version, and a pack that no longer matches its ID is damaged, so it is uncovered and the repair goes on. The rebuilt base records each trailer-described pack's trailer length (0 for packs a map or a local table described without one). The repair then removes the entries no surviving snapshot references. The rebuild trusts what the packs say: chunks whose bytes rotted inside a described pack are found only by `check --verify-data`, so run it after a rebuild. An interactive repair refuses to apply a plan rebuilt under the lock that has data loss where the shown plan had none, or that read the index differently (including other rebuild counts). A head of an unknown layout or with unknown features, or of an unknown object type, is refused.
 
 ### In-Place Upgrade
 
@@ -450,7 +451,7 @@ index.d/<64 hex>     # write-once: base, segment or sweep record, name = BLAKE3 
 
 1. Probe the server's `segmented_index` capability and its `index.h`/`packmaps` key directories, and PUT the stored `config` bytes back unchanged. A server that refuses overwrites (append-only) fails here, with the repository untouched: turn append-only off for the upgrade (see maintenance). The server-side repack's `repack_trailer` capability is not required; compact falls back to client-side repack without it.
 2. GET `index` and decode the legacy index. While `config` is positional this blob is the repository's index; heads and bases already under `index.h/` and `index.d/` are debris of an earlier attempt, and pack maps under `packmaps/` are reused. An index that cannot be decoded, or an `index` holding a segmented head (a development build's interrupted upgrade), fails the upgrade before anything is written.
-3. Write it as a base body in a local temp file (refcount-0 entries left out, every pack at `trailer_len` 0: the releases that wrote v2/v3 wrote no trailers; an offset beyond u32 aborts) and drop the legacy index.
+3. Write its live entries as a base body in a local temp file (an entry at legacy refcount 0 was garbage the old release had not removed yet and is left out; the other refcounts are discarded; every pack at `trailer_len` 0: the releases that wrote v2/v3 wrote no trailers; an offset beyond u32 aborts) and drop the legacy index.
 4. Write a pack map for every pack the index names that no readable map covers. A pack with more entries than a map may hold is skipped and reported (the index alone describes it); a pack the index describes inconsistently stops the upgrade here, before the switch.
 5. Write the base and a head at `index.h/<highest listed + 1>`. `index` is not touched.
 6. Rewrite `config` as the v6 map. From here every older binary refuses the repository by version.
@@ -570,14 +571,14 @@ open repo (full index loaded once)
 begin_write_session(session_id) → journal key = sessions/<session_id>.index
   → prune stale local file-cache entries
   → recover own sessions/<session_id>.index if present (batch-verify packs, promote into dedup structures)
-  → dedup against the session's view of the index: the head's applied additions (keyed bumps), then the table (xor filter + mmap, positional bumps)
+  → dedup against the session's view of the index: the head's applied additions (reuse recorded by key), then the table (xor filter + mmap, reuse recorded by table position)
   → derive upload/pipeline limits from `limits.connections` + `limits.threads`
   → execute `command_dumps` first:
     → stream each command's stdout directly into chunk storage
     → add virtual items under `vykar-dumps/` to the item stream
     → abort backup on non-zero exit or timeout
   → walk sources with excludes + one_file_system + exclude_if_present
-    → cache-hit path: reuse cached ChunkRefs and bump refs
+    → cache-hit path: reuse cached ChunkRefs and record their reuse
     → cache-miss path:
       → pipeline (N = effective worker threads, N ≥ 1):
         → walk emits regular files and segmented large files
@@ -604,8 +605,8 @@ begin_write_session(session_id) → journal key = sessions/<session_id>.index
 ```mermaid
 flowchart LR
     lock["Acquire lock"] --> refresh["Refresh snapshots"]
-    refresh --> reconcile["Reconcile delta"]
-    reconcile --> persist["Persist index"]
+    refresh --> check["Check reuse"]
+    check --> persist["Persist index"]
     persist --> commit["Write snapshot<br/>commit point"]
     commit --> cleanup["Cleanup + unlock"]
 ```
@@ -617,14 +618,15 @@ commit_concurrent_session_with_progress():
   → flush packs (no-op safety net: Phase 1 already drained uploads)
   → refresh snapshot list from snapshots/ (via local snapshot cache diff)
   → check snapshot name uniqueness against fresh list
-  → if delta is non-empty:
+  → if delta is non-empty (additions or reuse):
       → GET head, bring the index to it (normally the loaded one; another session's backup segments are applied)
-      → when the head moved by a sweep, a fold or a maintenance segment, check every reused chunk;
-        the additions are the new entries the index does not hold yet:
-        new entries already present → bumps; bump targets in neither → Err(StaleChunksDuringCommit)
-      → verify packs alongside
-      → PUT index.d/<segment> (or a base at the fold limit), fence check, PUT index (head)
-      → PUT one backup segment of the additions, then the head; apply it to the index in memory
+      → when the head moved by a sweep, a fold or a maintenance segment (needs_recheck), check every reused chunk:
+        one in neither the index nor the session's new entries → Err(StaleChunksDuringCommit), nothing written
+      → the additions: the first location of each new chunk the index does not hold yet
+      → verify their packs
+      → no additions: nothing is written
+      → else PUT one backup segment of the additions (a base at the fold limit), fence check,
+        PUT index.h/<gen+1>; apply it to the index in memory
   → write snapshots/<id> (commit point)
   → update in-memory manifest
   → persist local file cache
@@ -704,7 +706,7 @@ Command dumps participate in this same item stream. A source with `command_dumps
 Restore now also consumes item streams incrementally (streaming deserialization) instead of materializing full `Vec<Item>` state up front.
 Item-stream and file-data chunks are resolved through the chunk table of the open head. A lazily read item stream whose chunk cannot be read at its location (a compaction moved it after the index was loaded) re-resolves the rest once against the index at a freshly read head.
 
-Commands that load a whole item stream (delete, prune, check, list, diff, find, mount, and backup's parent-snapshot load) fetch its coalesced range reads in parallel at the backend's request width, derived from `limits.connections` (remote: `min(connections*3, 24)`, local: `min(connections, 8)`), and reassemble them in stream order; restore reads the stream lazily, one window at a time. All of them except check take tree chunks from the local [tree-chunk cache](#local-optimization-caches-client-machine) first and read only the misses from storage. `check` and the refcount rebuild of `check --repair` instead read and decode each distinct tree chunk once across all checked snapshots, from storage (see [Mark](#mark)), and attribute the results to every snapshot that names it. These loads and restore's file-data reads go through one fetch/decode loop (`repo::blob_read`): one range request per coalesced group, each blob decoded in place as it is read.
+Commands that load a whole item stream (delete, prune, check, list, diff, find, mount, and backup's parent-snapshot load) fetch its coalesced range reads in parallel at the backend's request width, derived from `limits.connections` (remote: `min(connections*3, 24)`, local: `min(connections, 8)`), and reassemble them in stream order; restore reads the stream lazily, one window at a time. All of them except check take tree chunks from the local [tree-chunk cache](#local-optimization-caches-client-machine) first and read only the misses from storage. `check` and the sweep of `check --repair` instead read and decode each distinct tree chunk once across all checked snapshots, from storage (see [Mark](#mark)), and attribute the results to every snapshot that names it. These loads and restore's file-data reads go through one fetch/decode loop (`repo::blob_read`): one range request per coalesced group, each blob decoded in place as it is read.
 
 ---
 
@@ -764,9 +766,9 @@ Two-stage signal handling applies to all commands:
 5. On backup abort: `flush_on_abort()` seals partial packs, joins upload threads, writes final `sessions/<id>.index` journal for recovery
 6. Advisory lock is released before exit; CLI exits with code 130
 
-### Refcount Lifecycle
+### Liveness
 
-Since format v6 stored refcounts are not maintained: new entries are written with refcount 1, reuse is not counted, and prune and delete only delete `snapshots/<id>` objects. Liveness comes from the mark that every compact runs (see [Mark](#mark)):
+No reference counts exist: an index entry is live when a live snapshot references it, and the mark that every compact runs decides that (see [Mark](#mark)). New chunks are added, reuse is checked at commit, prune and delete only delete `snapshots/<id>` objects, and compact marks and sweeps:
 
 ```mermaid
 flowchart TD
@@ -776,11 +778,12 @@ flowchart TD
     repack --> reclaimed["Space reclaimed"]
 ```
 
-1. **Backup** — a new chunk gets an entry with refcount 1; a reused chunk is only checked at commit (`StaleChunksDuringCommit` if the head no longer has it)
+1. **Backup** — a new chunk gets an entry; a reused chunk is only checked at commit (`StaleChunksDuringCommit` if the head no longer has it, see [Commit Check](#commit-check))
 2. **Delete / Prune** — delete `snapshots/<id>` (fenced by the maintenance lock); no index read or write. The space stays used until the next compact
 3. **Compact** — mark every live snapshot, remove the unmarked entries in one maintenance segment with a sweep record, then repack and delete packs over the swept index
+4. **Repair** — `check --repair` sweeps too: it marks every surviving snapshot from storage (a data reference missing from the index is skipped, an unreadable snapshot or tree chunk aborts before the sweep: no entry is removed and no sweep head is written), removes the entries the mark does not reach, and writes a fold whose head records the repair as a sweep
 
-`vykar compact --report-unreferenced` runs the same mark and reports what a sweep would remove; it changes nothing. Its refcount comparison is meaningful only on freshly upgraded repositories.
+`vykar compact --report-unreferenced` runs the same mark and reports what a sweep would remove; it changes nothing.
 
 ### Crash Recovery
 
@@ -808,15 +811,13 @@ Each session's crash-recovery journal is co-located at `sessions/<session_id>.in
 
 Two concurrent backups do not block each other during upload — each operates on a private `IndexDelta` and private `sessions/<id>.index` journal. Maintenance commands (`compact`, `delete`, `prune`) must block on active sessions because compaction can delete packs that upload-phase clients are still referencing. `with_maintenance_lock()` acquires the advisory lock, cleans stale sessions, then fails with `ActiveSessions` if any remain.
 
-#### IndexDelta Reconciliation
+#### Commit Check
 
-Each backup session accumulates index mutations in an `IndexDelta`: `new_entries` (newly uploaded chunks) and `refcount_bumps` (dedup hits on existing chunks). At commit time, the delta is reconciled against the current on-storage index. In v6 this is the commit by additions described under [Segmented Index](#segmented-index-v6); the steps below are v2/v3:
+Each backup session accumulates its index mutations in an `IndexDelta`: `new_entries` (newly uploaded chunks, with their locations) and `reused` (`ReusedChunks`: the existing chunks it referenced, presence only — a bit per position of the session's table, and a key set for chunks outside it). A rolled-back file or command dump (`checkpoint` / `rollback`) removes exactly what it recorded first, additions and reuse alike. At commit (see [Segmented Index](#segmented-index-v6)):
 
-- If the delta is non-empty, the full index is reloaded from storage and the delta is reconciled against it:
-  - `new_entries` for chunks already present in the fresh index (another client uploaded the same chunk) are converted to `refcount_bumps`
-  - `refcount_bumps` referencing chunks no longer in the index (deleted by a concurrent maintenance operation) cause `StaleChunksDuringCommit` — the backup must be retried
-- Pack verification (`verify_delta_packs`) runs after reconciliation to avoid false negatives when chunks were absorbed as refcount bumps.
-- If the delta is empty, no remote index write is needed.
+- A delta with neither additions nor reuse needs no head: nothing is fetched or written.
+- Otherwise the latest head is fetched and the index brought to it. The reused chunks are checked again only when the head moved in a way that can have removed entries (`needs_recheck`: another `sweep.gen`, another base, a segment list that does not extend the session's, or a non-backup segment since the session began). Then every reused chunk must be in the index or among the session's new entries, else `StaleChunksDuringCommit` (the backup must be retried) and nothing is written.
+- The additions are the session's new chunks the index does not hold yet (another client may have committed some first; its copies are dead bytes compact reclaims). Their packs are verified, then written as one backup segment; a session that adds nothing writes no segment and no head.
 
 #### Index Then Snapshot Commit Point
 
@@ -852,7 +853,7 @@ flowchart TB
 **Phase 1 — Analysis (read-only, no pack downloads):**
 1. Enumerate all pack files: one sized listing of `packs/` on a vykar-server, otherwise one sized listing per shard dir (`packs/00/` through `packs/ff/`), parallelized from `limits.connections` (remote: `min(connections*3, 24)`, local: `min(connections, 8)`)
 2. Sizes come from the listing; `HEAD`/stat only for packs it lists without one (servers before v0.22), parallelized the same way
-3. Compute live bytes per pack from the swept `ChunkIndex`: `live_bytes = Σ(4 + stored_size)` for each indexed blob in that pack; a pack left without entries is an orphan and deleted whole (a pack this run wrote as a repack output is never deleted)
+3. Compute live bytes per pack from the swept index: `live_bytes = Σ(4 + stored_size)` for each indexed blob in that pack; a pack left without entries is an orphan and deleted whole (a pack this run wrote as a repack output is never deleted)
 4. Derive `dead_bytes = (pack_size - PACK_HEADER_SIZE) - live_bytes - trailer_len`, `trailer_len` as the index records it for the pack (no read of the pack); packs where `live_bytes + trailer_len > pack_payload` are marked corrupt. The trailer counts as overhead, not as dead bytes, so a repack's own trailer never makes its output a candidate again. A pack recorded without a trailer (`trailer_len` 0, such as every pre-upgrade pack) whose bytes hold one counts it as dead and is repacked once; the repack records its output's exact length
 5. Compute `unused_ratio = dead_bytes / pack_size` per pack
 6. Track pack health counters (`packs_corrupt`, `packs_orphan`) in addition to live/dead bytes
@@ -881,9 +882,9 @@ The mark (`commands::mark`) answers which index entries the snapshots reference,
 1. **Strict listing.** Every object under `snapshots/` on storage is fetched at the backend's request width, authenticated and decoded; the local snapshot list is not used. It fails closed: a key that is not a snapshot ID, a listed object that is gone, an object that cannot be read, decrypted or decoded, a foreign envelope and a newer format version all fail the mark.
 2. **One read per distinct tree chunk.** The union of the snapshots' `item_ptrs` is resolved through the index before any read (a pointer the index lacks fails the mark, even when the chunk is cached), sorted by pack and offset and read in batches of at most 2 000 chunks or 64 MiB stored, from the tree-chunk cache first.
 3. **Parallel decode.** Each tree chunk is decoded on its own on up to `min(available_parallelism, 8)` threads; a chunk that does not decode alone, and a data reference the index lacks, fail the mark.
-4. **A bit per index position.** Every chunk reference of every item, and every tree chunk, sets the bit of its index position; optionally the references are counted with snapshot multiplicity (a tree chunk named by three snapshots counts its references three times), the semantics of the stored refcounts.
+4. **A bit per index position.** Every chunk reference of every item, and every tree chunk, sets the bit of its index position. Compact's sweep also counts the references with snapshot multiplicity (a tree chunk named by three snapshots counts its references three times), for the sweep record's referenced bytes; the report and the repair only mark.
 
-`vykar compact --report-unreferenced` runs the mark under the maintenance lock, so no backup can have committed index entries whose snapshot is not written yet, and refuses while backups run (`ActiveSessions`). It writes no index, pack or snapshot object; like every maintenance command, taking the lock cleans up stale session markers and orphaned session journals first. On success it deletes cached tree chunks no live snapshot uses. `check` and the refcount rebuild of `check --repair` use the same tree-chunk traversal, reading storage only.
+`vykar compact --report-unreferenced` runs the mark under the maintenance lock, so no backup can have committed index entries whose snapshot is not written yet, and refuses while backups run (`ActiveSessions`). It writes no index, pack or snapshot object; like every maintenance command, taking the lock cleans up stale session markers and orphaned session journals first. On success it deletes cached tree chunks no live snapshot uses. `check` and the sweep of `check --repair` use the same tree-chunk traversal, reading storage only.
 
 #### CLI
 

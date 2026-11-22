@@ -69,7 +69,7 @@ fn id(n: u32) -> ChunkId {
     ChunkId::from_bytes(b)
 }
 
-pub(crate) fn index_with(range: std::ops::Range<u32>, extra_refs: u32) -> ChunkIndex {
+pub(crate) fn index_with(range: std::ops::Range<u32>) -> ChunkIndex {
     let mut index = ChunkIndex::new();
     for n in range {
         index.add(
@@ -78,21 +78,13 @@ pub(crate) fn index_with(range: std::ops::Range<u32>, extra_refs: u32) -> ChunkI
             PackId::from_bytes([(n % 5) as u8 + 1; 32]),
             u64::from(n),
         );
-        if extra_refs > 0 {
-            index.increment_refcount_by(&id(n), extra_refs);
-        }
     }
     index
 }
 
-/// The entries of an index, sorted, refcounts read as 1 (refcounts are not
-/// persisted; every loaded entry has refcount 1).
+/// The entries of an index, sorted.
 pub(crate) fn entries(index: &impl crate::testutil::EntryIter) -> Vec<(ChunkId, ChunkIndexEntry)> {
-    index
-        .entry_vec()
-        .into_iter()
-        .map(|(id, e)| (id, ChunkIndexEntry { refcount: 1, ..e }))
-        .collect()
+    index.entry_vec()
 }
 
 /// The keyed segment that turns `prev` into `next` (every pack at
@@ -381,8 +373,8 @@ fn sync_downloads_once_then_reads_local_files() {
         let mem: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
         let log = GetLog::new(Arc::clone(&mem));
         let mut w = Writer::new(Arc::clone(&mem), Arc::clone(&crypto));
-        let s1 = index_with(0..300, 0);
-        let s2 = index_with(100..400, 1);
+        let s1 = index_with(0..300);
+        let s2 = index_with(100..400);
         w.commit(&s1);
         w.fold();
         w.commit(&s2);
@@ -427,7 +419,7 @@ fn sync_downloads_once_then_reads_local_files() {
         let live = synced.index;
         let (mut last, mut k) = (s2, 2);
         for _ in 0..3 {
-            last = index_with(100 + 10 * k..400 + 10 * k, 0);
+            last = index_with(100 + 10 * k..400 + 10 * k);
             w.commit(&last);
             k += 1;
         }
@@ -464,9 +456,9 @@ fn sync_of_segments_without_a_base() {
     let crypto = plaintext();
     let mem: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
     let mut w = Writer::new(Arc::clone(&mem), Arc::clone(&crypto));
-    let last = index_with(20..90, 3);
-    w.commit(&index_with(10..60, 1));
-    w.commit(&index_with(15..80, 2));
+    let last = index_with(20..90);
+    w.commit(&index_with(10..60));
+    w.commit(&index_with(15..80));
     w.commit(&last);
     assert!(w.head.base.is_none());
     let synced = sync(
@@ -489,12 +481,12 @@ fn a_local_table_with_another_entry_count_is_not_used() {
     let crypto = plaintext();
     let mem: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
     let mut w = Writer::new(Arc::clone(&mem), Arc::clone(&crypto));
-    let s1 = index_with(0..30, 0);
+    let s1 = index_with(0..30);
     w.commit(&s1);
     w.fold();
     let cache_dir = tempfile::tempdir().unwrap();
     let path = cache_dir.path().to_path_buf();
-    let other = crate::testutil::base_table_of(&index_with(500..510, 0));
+    let other = crate::testutil::base_table_of(&index_with(500..510));
     let mut tw = TableFileWriter::new_beside(&table::table_anchor(&path)).unwrap();
     std::io::Write::write_all(&mut tw, other.body()).unwrap();
     tw.finish()
@@ -545,7 +537,7 @@ fn sync_without_cache_dir_keeps_a_scratch_file() {
     let mem: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
     let log = GetLog::new(Arc::clone(&mem));
     let mut w = Writer::new(Arc::clone(&mem), Arc::clone(&crypto));
-    w.commit(&index_with(0..40, 0));
+    w.commit(&index_with(0..40));
     w.fold();
     let synced = sync(&log, crypto.as_ref(), w.head.clone(), None, None, true).unwrap();
     assert!(
@@ -555,7 +547,7 @@ fn sync_without_cache_dir_keeps_a_scratch_file() {
     let live = synced.index;
     log.take();
 
-    let s2 = index_with(5..45, 1);
+    let s2 = index_with(5..45);
     w.commit(&s2);
     let synced = sync(
         &log,
@@ -579,9 +571,9 @@ fn sync_without_local_files_verifies_every_object() {
     let mem: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
     let log = GetLog::new(Arc::clone(&mem));
     let mut w = Writer::new(Arc::clone(&mem), Arc::clone(&crypto));
-    w.commit(&index_with(0..40, 0));
+    w.commit(&index_with(0..40));
     w.fold();
-    w.commit(&index_with(0..60, 0));
+    w.commit(&index_with(0..60));
     let cache_dir = tempfile::tempdir().unwrap();
     let path = cache_dir.path().to_path_buf();
     let warm = sync(
@@ -618,8 +610,8 @@ fn tampered_or_swapped_objects_fail_the_name_check() {
     for crypto in [plaintext(), encrypted()] {
         let mem: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
         let mut w = Writer::new(Arc::clone(&mem), Arc::clone(&crypto));
-        w.commit(&index_with(0..40, 0));
-        w.commit(&index_with(0..50, 1));
+        w.commit(&index_with(0..40));
+        w.commit(&index_with(0..50));
         let [a, b] = [&w.head.segments[0], &w.head.segments[1]].map(|s| object_key(&s.name));
 
         let original = mem.get(&b).unwrap().unwrap();
@@ -662,9 +654,9 @@ fn wrong_recorded_entry_counts_are_rejected() {
     let crypto = plaintext();
     let mem: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
     let mut w = Writer::new(Arc::clone(&mem), Arc::clone(&crypto));
-    w.commit(&index_with(0..40, 0));
+    w.commit(&index_with(0..40));
     w.fold();
-    w.commit(&index_with(0..50, 0));
+    w.commit(&index_with(0..50));
     let cache_dir = tempfile::tempdir().unwrap();
     let path = cache_dir.path().to_path_buf();
 
@@ -694,7 +686,7 @@ fn a_damaged_cached_segment_is_fetched_again() {
     let mem: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
     let log = GetLog::new(Arc::clone(&mem));
     let mut w = Writer::new(Arc::clone(&mem), Arc::clone(&crypto));
-    let s1 = index_with(0..60, 0);
+    let s1 = index_with(0..60);
     w.commit(&s1);
     let cache_dir = tempfile::tempdir().unwrap();
     let path = cache_dir.path().to_path_buf();
@@ -737,18 +729,18 @@ fn reader_on_a_retired_head_survives_one_fold_and_recovers_after_two() {
     let mem: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
     let log = GetLog::new(Arc::clone(&mem));
     let mut w = Writer::new(Arc::clone(&mem), Arc::clone(&crypto));
-    w.commit(&index_with(0..40, 0));
+    w.commit(&index_with(0..40));
     w.fold();
-    w.commit(&index_with(0..50, 0));
+    w.commit(&index_with(0..50));
     let old_head = w.head.clone();
 
-    w.commit(&index_with(0..60, 1));
+    w.commit(&index_with(0..60));
     w.fold();
     let synced = sync(&log, crypto.as_ref(), old_head.clone(), None, None, true).unwrap();
     assert_eq!(synced.head, old_head, "finished on the retired head");
     assert_eq!(head_gets(&log.take()), 0);
 
-    let latest = index_with(0..70, 2);
+    let latest = index_with(0..70);
     w.commit(&latest);
     w.fold();
     assert!(
@@ -773,9 +765,9 @@ fn base_and_segment() -> (Arc<dyn StorageBackend>, Arc<dyn CryptoEngine>, Writer
     let crypto = plaintext();
     let mem: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
     let mut w = Writer::new(Arc::clone(&mem), Arc::clone(&crypto));
-    w.commit(&index_with(0..40, 0));
+    w.commit(&index_with(0..40));
     w.fold();
-    w.commit(&index_with(0..50, 1));
+    w.commit(&index_with(0..50));
     (mem, crypto, w)
 }
 
@@ -840,12 +832,12 @@ fn missing_object_still_named_by_a_moved_head_fails_at_once() {
     let mem: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
     let log = GetLog::new(Arc::clone(&mem));
     let mut w = Writer::new(Arc::clone(&mem), Arc::clone(&crypto));
-    w.commit(&index_with(0..40, 0));
-    w.commit(&index_with(0..50, 1));
+    w.commit(&index_with(0..40));
+    w.commit(&index_with(0..50));
     let old = w.head.clone();
     let seg = object_key(&old.segments[0].name);
     mem.delete(&seg).unwrap();
-    w.commit(&index_with(0..60, 2));
+    w.commit(&index_with(0..60));
     assert_ne!(w.head, old);
 
     let err = sync(&log, crypto.as_ref(), old, None, None, true)
@@ -866,8 +858,8 @@ fn missing_retired_object_is_retried_not_reported_lost() {
     let mem: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
     let log = GetLog::new(Arc::clone(&mem));
     let mut w = Writer::new(Arc::clone(&mem), Arc::clone(&crypto));
-    w.commit(&index_with(0..40, 0));
-    w.commit(&index_with(0..50, 1));
+    w.commit(&index_with(0..40));
+    w.commit(&index_with(0..50));
     let old = w.head.clone();
     w.fold();
     assert!(w.head.retired.contains(&old.segments[0].name));
@@ -943,7 +935,7 @@ fn moving_head_error() -> (VykarError, Vec<String>) {
     let mut w = Writer::new(Arc::clone(&mem), Arc::clone(&crypto));
     let mut heads = Vec::new();
     for i in 0..5u32 {
-        w.commit(&index_with(0..(40 + 10 * i), i));
+        w.commit(&index_with(0..(40 + 10 * i)));
         w.fold();
         heads.push(w.head.clone());
     }
@@ -1440,8 +1432,8 @@ fn collect_index_garbage_with_nothing_to_delete_sends_no_request() {
 fn a_backup_segment_with_removals_is_refused() {
     let crypto = plaintext();
     let mut seg = keyed_diff(
-        &index_with(0..3, 0),
-        &index_with(1..4, 0),
+        &index_with(0..3),
+        &index_with(1..4),
         SegmentKind::Maintenance,
     );
     assert_eq!((seg.removals.len(), seg.additions.len()), (1, 1));
@@ -1518,11 +1510,11 @@ fn concurrent_syncs_over_one_cache_dir_succeed() {
     let crypto = plaintext();
     let mem: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
     let mut w = Writer::new(Arc::clone(&mem), Arc::clone(&crypto));
-    let s0 = index_with(0..200, 0);
+    let s0 = index_with(0..200);
     w.commit(&s0);
     w.fold();
-    let s1 = index_with(0..300, 0);
-    let s2 = index_with(100..400, 1);
+    let s1 = index_with(0..300);
+    let s2 = index_with(100..400);
     w.commit(&s1);
     let h1 = w.head.clone();
     w.commit(&s2);
@@ -1560,7 +1552,7 @@ fn sync_downloads_a_base_without_segments_and_persists_it() {
     let crypto = plaintext();
     let mem: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
     let mut w = Writer::new(Arc::clone(&mem), Arc::clone(&crypto));
-    let s1 = index_with(0..120, 0);
+    let s1 = index_with(0..120);
     w.commit(&s1);
     w.fold();
     let cache_dir = tempfile::tempdir().unwrap();
@@ -1594,7 +1586,7 @@ fn a_damaged_table_under_the_base_name_heals() {
     let mem: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
     let log = GetLog::new(Arc::clone(&mem));
     let mut w = Writer::new(Arc::clone(&mem), Arc::clone(&crypto));
-    let s1 = index_with(0..60, 0);
+    let s1 = index_with(0..60);
     w.commit(&s1);
     w.fold();
     let cache_dir = tempfile::tempdir().unwrap();
@@ -1644,9 +1636,9 @@ fn sync_prunes_old_local_files_the_head_does_not_name() {
     let crypto = plaintext();
     let mem: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
     let mut w = Writer::new(Arc::clone(&mem), Arc::clone(&crypto));
-    w.commit(&index_with(0..60, 0));
+    w.commit(&index_with(0..60));
     w.fold();
-    w.commit(&index_with(0..70, 0));
+    w.commit(&index_with(0..70));
     let cache_dir = tempfile::tempdir().unwrap();
     let path = cache_dir.path().to_path_buf();
     drop(
@@ -1677,7 +1669,7 @@ fn sync_prunes_old_local_files_the_head_does_not_name() {
         .set_modified(old)
         .unwrap();
 
-    w.commit(&index_with(0..80, 0));
+    w.commit(&index_with(0..80));
     w.fold();
     drop(
         sync(
@@ -1834,9 +1826,9 @@ fn classify_head_tells_damage_from_newer_heads() {
     }
 }
 
-/// The base body of `index_with(0..40, 0)`.
+/// The base body of `index_with(0..40)`.
 fn base_body() -> Vec<u8> {
-    crate::testutil::base_table_of(&index_with(0..40, 0))
+    crate::testutil::base_table_of(&index_with(0..40))
         .body()
         .to_vec()
 }

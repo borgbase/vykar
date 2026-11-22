@@ -24,7 +24,7 @@ fn name(n: u8) -> ObjectName {
     ObjectName([n; 32])
 }
 
-/// An oracle index of chunks `ns` (refcount 1).
+/// An oracle index of chunks `ns`.
 fn oracle_of(ns: impl IntoIterator<Item = u8>) -> ChunkIndex {
     let mut index = ChunkIndex::new();
     for n in ns {
@@ -67,11 +67,7 @@ fn loc(p: u8, off: u64, size: u32) -> Location {
 }
 
 fn entries_of(index: &impl EntryIter) -> Vec<(ChunkId, ChunkIndexEntry)> {
-    index
-        .entry_vec()
-        .into_iter()
-        .map(|(id, e)| (id, ChunkIndexEntry { refcount: 1, ..e }))
-        .collect()
+    index.entry_vec().into_iter().collect()
 }
 
 /// TBL-1: install publishes `index_base.<name>`; a second install adopts
@@ -444,8 +440,8 @@ fn conflicting_trailer_lengths_take_the_larger() {
     assert_eq!(live.pack_trailer_len(&pack(4)), Some(300));
 }
 
-/// LIVE-2: the pending segment is exactly the keyed change; refcount-only
-/// edits give an empty segment; an unknown trailer length is an error.
+/// LIVE-2: the pending segment is exactly the keyed change; edits that
+/// changed nothing give an empty segment; an unknown trailer length is an error.
 #[test]
 fn pending_segment_is_the_keyed_difference() {
     let dir = tempfile::tempdir().unwrap();
@@ -464,7 +460,7 @@ fn pending_segment_is_the_keyed_difference() {
     )
     .unwrap();
 
-    live.increment_refcount(&id(1));
+    live.add(id(1), 999, pack(9), 999); // present: left as it is
     assert!(live.is_modified());
     assert!(
         live.pending_segment(SegmentKind::Maintenance)
@@ -593,14 +589,11 @@ fn index_positions_cover_table_and_added_entries() {
 #[derive(Debug, Clone)]
 enum Op {
     Add(u8, u8),
-    Increment(u8),
-    IncrementBy(u8, u32),
-    Decrement(u8),
     UpdateLocation(u8, u8),
     Remove(u8),
     RemoveByPack(u8),
-    /// Keep the chunks whose id byte is selected by the mask, at the given count.
-    Rebuild(u64, u32),
+    /// Keep only the chunks whose id byte is selected by the mask (a sweep).
+    Sweep(u64),
     /// Write the pending edits as a segment (a write).
     Write,
 }
@@ -608,13 +601,10 @@ enum Op {
 fn arb_op() -> impl Strategy<Value = Op> {
     prop_oneof![
         3 => (0..80u8, 1..4u8).prop_map(|(n, p)| Op::Add(n, p)),
-        2 => (0..80u8).prop_map(Op::Increment),
-        1 => (0..80u8, 0..5u32).prop_map(|(n, k)| Op::IncrementBy(n, k)),
-        4 => (0..80u8).prop_map(Op::Decrement),
         2 => (0..80u8, 1..5u8).prop_map(|(n, p)| Op::UpdateLocation(n, p)),
-        1 => (0..80u8).prop_map(Op::Remove),
+        5 => (0..80u8).prop_map(Op::Remove),
         1 => (1..5u8).prop_map(Op::RemoveByPack),
-        1 => (any::<u64>(), 0..4u32).prop_map(|(m, k)| Op::Rebuild(m, k)),
+        1 => any::<u64>().prop_map(Op::Sweep),
         2 => Just(Op::Write),
     ]
 }
@@ -625,22 +615,15 @@ fn apply_live(index: &mut LiveIndex, op: &Op) -> String {
             index.add(id(n), 7 + u32::from(p), pack(p), u64::from(p) * 3);
             String::new()
         }
-        Op::Increment(n) => {
-            index.increment_refcount(&id(n));
-            String::new()
-        }
-        Op::IncrementBy(n, k) => {
-            index.increment_refcount_by(&id(n), k);
-            String::new()
-        }
-        Op::Decrement(n) => format!("{:?}", index.decrement(&id(n))),
         Op::UpdateLocation(n, p) => {
             format!("{}", index.update_location(&id(n), pack(p), 99, 5))
         }
         Op::Remove(n) => format!("{:?}", index.remove(&id(n))),
         Op::RemoveByPack(p) => format!("{}", index.remove_by_pack(&pack(p))),
-        Op::Rebuild(mask, k) => {
-            index.rebuild_refcounts(&rebuild_map(mask, k));
+        Op::Sweep(mask) => {
+            for n in (0..80u8).filter(|n| !swept_keeps(mask, *n)) {
+                index.remove(&id(n));
+            }
             String::new()
         }
         Op::Write => String::new(),
@@ -653,33 +636,23 @@ fn apply_oracle(index: &mut ChunkIndex, op: &Op) -> String {
             index.add(id(n), 7 + u32::from(p), pack(p), u64::from(p) * 3);
             String::new()
         }
-        Op::Increment(n) => {
-            index.increment_refcount(&id(n));
-            String::new()
-        }
-        Op::IncrementBy(n, k) => {
-            index.increment_refcount_by(&id(n), k);
-            String::new()
-        }
-        Op::Decrement(n) => format!("{:?}", index.decrement(&id(n))),
         Op::UpdateLocation(n, p) => {
             format!("{}", index.update_location(&id(n), pack(p), 99, 5))
         }
         Op::Remove(n) => format!("{:?}", index.remove(&id(n))),
         Op::RemoveByPack(p) => format!("{}", index.remove_by_pack(&pack(p))),
-        Op::Rebuild(mask, k) => {
-            index.rebuild_refcounts(&rebuild_map(mask, k));
+        Op::Sweep(mask) => {
+            for n in (0..80u8).filter(|n| !swept_keeps(mask, *n)) {
+                index.remove(&id(n));
+            }
             String::new()
         }
         Op::Write => String::new(),
     }
 }
 
-fn rebuild_map(mask: u64, k: u32) -> HashMap<ChunkId, u32> {
-    (0..80u8)
-        .filter(|n| mask & (1 << (n % 64)) != 0)
-        .map(|n| (id(n), k + u32::from(n % 2)))
-        .collect()
+fn swept_keeps(mask: u64, n: u8) -> bool {
+    mask & (1 << (n % 64)) != 0
 }
 
 proptest! {
@@ -708,16 +681,13 @@ proptest! {
             if matches!(op, Op::Write) {
                 let seg = live.pending_segment(SegmentKind::Maintenance).unwrap();
                 if seg.is_empty() {
-                    // Refcount-only edits are discarded (not persisted).
+                    // Edits that changed nothing are discarded.
                     live.discard_edits();
                 } else {
                     seg.validate().unwrap();
                     live.mark_written(name(written.len() as u8));
                     written.push(seg);
                 }
-                // Either way every refcount reads 1 again, as after a load.
-                let ones: HashMap<ChunkId, u32> = oracle.iter().map(|(id, _)| (*id, 1)).collect();
-                oracle.rebuild_refcounts(&ones);
                 for p in 1..5u8 {
                     live.set_pack_trailer(pack(p), 0);
                 }

@@ -51,18 +51,21 @@ fn assert_clean_after_repair(config: &VykarConfig) {
     );
     assert!(
         result.plan.actions.len() == 1
-            && matches!(result.plan.actions[0], RepairAction::RebuildRefcounts),
-        "expected only RebuildRefcounts after repair, got: {:?}",
+            && matches!(
+                result.plan.actions[0],
+                RepairAction::RemoveUnreferencedEntries
+            ),
+        "expected only RemoveUnreferencedEntries after repair, got: {:?}",
         result.plan.actions
     );
 }
 
 // ---------------------------------------------------------------------------
-// 1. Healthy repo — plan should have only RebuildRefcounts
+// 1. Healthy repo — plan should have only RemoveUnreferencedEntries
 // ---------------------------------------------------------------------------
 
 #[test]
-fn plan_only_healthy_repo_refcount_only() {
+fn plan_only_healthy_repo_sweep_only() {
     let tmp = tempfile::tempdir().unwrap();
     let (_repo_dir, config) = setup_repo(tmp.path());
 
@@ -74,8 +77,11 @@ fn plan_only_healthy_repo_refcount_only() {
     );
     assert!(
         result.plan.actions.len() == 1
-            && matches!(result.plan.actions[0], RepairAction::RebuildRefcounts),
-        "expected only RebuildRefcounts, got: {:?}",
+            && matches!(
+                result.plan.actions[0],
+                RepairAction::RemoveUnreferencedEntries
+            ),
+        "expected only RemoveUnreferencedEntries, got: {:?}",
         result.plan.actions
     );
     assert!(
@@ -297,9 +303,9 @@ fn apply_corrupt_snapshot_then_clean() {
     assert!(
         has_action(&result.applied, |a| matches!(
             a,
-            RepairAction::RebuildRefcounts
+            RepairAction::RemoveUnreferencedEntries
         )),
-        "expected RebuildRefcounts in applied, got: {:?}",
+        "expected RemoveUnreferencedEntries in applied, got: {:?}",
         result.applied
     );
 
@@ -338,9 +344,9 @@ fn apply_delete_pack_then_clean() {
     assert!(
         has_action(&result.applied, |a| matches!(
             a,
-            RepairAction::RebuildRefcounts
+            RepairAction::RemoveUnreferencedEntries
         )),
-        "expected RebuildRefcounts in applied, got: {:?}",
+        "expected RemoveUnreferencedEntries in applied, got: {:?}",
         result.applied
     );
 
@@ -371,9 +377,9 @@ fn apply_bit_flip_pack_verify_data_then_clean() {
     assert!(
         has_action(&result.applied, |a| matches!(
             a,
-            RepairAction::RebuildRefcounts
+            RepairAction::RemoveUnreferencedEntries
         )),
-        "expected RebuildRefcounts in applied, got: {:?}",
+        "expected RemoveUnreferencedEntries in applied, got: {:?}",
         result.applied
     );
 
@@ -534,9 +540,9 @@ fn deleted_index_is_rebuilt_from_the_packs() {
     assert!(
         matches!(
             plan_result.plan.actions.as_slice(),
-            [RepairAction::RebuildRefcounts]
+            [RepairAction::RemoveUnreferencedEntries]
         ),
-        "expected only RebuildRefcounts in plan, got: {:?}",
+        "expected only RemoveUnreferencedEntries in plan, got: {:?}",
         plan_result.plan.actions
     );
 
@@ -554,11 +560,11 @@ fn deleted_index_is_rebuilt_from_the_packs() {
 }
 
 // ---------------------------------------------------------------------------
-// 15. Refcount rebuild excludes doomed snapshots
+// 15. The index sweep excludes doomed snapshots
 // ---------------------------------------------------------------------------
 
 #[test]
-fn refcount_rebuild_excludes_doomed_snapshots() {
+fn index_sweep_excludes_doomed_snapshots() {
     let tmp = tempfile::tempdir().unwrap();
     let repo_dir = tmp.path().join("repo");
     let source_a = tmp.path().join("source_a");
@@ -667,7 +673,7 @@ fn refcount_rebuild_excludes_doomed_snapshots() {
     let result = apply_repair(&config, false);
 
     // (1) applied either drops items from snap-A (preferred) or removes the
-    // whole snapshot — both branches must end with RebuildRefcounts.
+    // whole snapshot — both branches must end with RemoveUnreferencedEntries.
     let drop_items = has_action(&result.applied, |a| {
         matches!(
             a,
@@ -690,9 +696,9 @@ fn refcount_rebuild_excludes_doomed_snapshots() {
     assert!(
         has_action(&result.applied, |a| matches!(
             a,
-            RepairAction::RebuildRefcounts
+            RepairAction::RemoveUnreferencedEntries
         )),
-        "expected RebuildRefcounts in applied, got: {:?}",
+        "expected RemoveUnreferencedEntries in applied, got: {:?}",
         result.applied
     );
 
@@ -715,16 +721,13 @@ fn refcount_rebuild_excludes_doomed_snapshots() {
         );
     }
 
-    // (3) refcounts for snap-B chunks should be exactly 1 (non-overlapping
-    // content with snap-A by construction).
+    // (3) snap-B's chunks (non-overlapping content with snap-A by
+    // construction) are still in the index.
     for chunk_id in &snap_b_chunks {
-        if let Some(entry) = repo.chunk_index().get(chunk_id) {
-            assert_eq!(
-                entry.refcount, 1,
-                "snap-B chunk {chunk_id} should have refcount == 1, got {}",
-                entry.refcount
-            );
-        }
+        assert!(
+            repo.chunk_index().contains(chunk_id),
+            "snap-B chunk {chunk_id} should survive the repair"
+        );
     }
     drop(repo);
 
@@ -759,7 +762,7 @@ fn plan_only_does_not_take_maintenance_lock() {
     let result = plan_only(&config, false);
     assert!(
         !result.plan.actions.is_empty(),
-        "PlanOnly should produce at least RebuildRefcounts"
+        "PlanOnly should produce at least RemoveUnreferencedEntries"
     );
 
     // Session marker should still exist
@@ -810,15 +813,13 @@ fn apply_refuses_with_active_sessions() {
 }
 
 // ---------------------------------------------------------------------------
-// 18. F6: crash-orphan index entries / inflated refcounts are reclaimed by
-//     `check --repair` without data loss.
+// 18. F6: crash-orphan index entries are reclaimed by `check --repair`
+//     without data loss.
 //
 // Simulates the post-crash state of a backup interrupted between the index PUT
 // and the snapshot PUT: the committed index holds a brand-new chunk no snapshot
-// references (an orphan) plus an inflated refcount from a dedup-bump that landed
-// before the crash. The always-on refcount rebuild recomputes refcounts from the
-// surviving snapshots, dropping the orphan and correcting the inflation — and no
-// live reference is lost.
+// references (an orphan). The always-on sweep marks from the surviving
+// snapshots and drops the orphan — and no live reference is lost.
 // ---------------------------------------------------------------------------
 
 /// Recursively find a file by name under `root` (restore reproduces the source
@@ -844,21 +845,15 @@ fn repair_reclaims_crash_orphan_index_entries() {
     let tmp = tempfile::tempdir().unwrap();
     let (repo_dir, config) = setup_repo(tmp.path());
 
-    // Record a real, snapshot-referenced chunk and its committed refcount.
-    let (existing_id, existing_pack, existing_offset, existing_size, original_refcount) = {
+    // Record a real, snapshot-referenced chunk and its location.
+    let (existing_id, existing_pack, existing_offset, existing_size) = {
         let repo = open_local_repo(&repo_dir);
         let (id, entry) = repo
             .chunk_index()
             .iter()
             .next()
             .expect("backup should have produced at least one chunk");
-        (
-            id,
-            entry.pack_id,
-            entry.pack_offset,
-            entry.stored_size,
-            entry.refcount,
-        )
+        (id, entry.pack_id, entry.pack_offset, entry.stored_size)
     };
 
     // A brand-new chunk id no snapshot references: simulates a chunk an aborted
@@ -877,10 +872,6 @@ fn repair_reclaims_crash_orphan_index_entries() {
         // flags it — the only thing wrong is that no snapshot references it.
         repo.chunk_index_mut()
             .add(orphan_id, existing_size, existing_pack, existing_offset);
-        // Inflate a live chunk's refcount (a dedup-bump that committed before
-        // the crash).
-        repo.chunk_index_mut()
-            .increment_refcount_by(&existing_id, 3);
         repo.save_state().unwrap();
     }
 
@@ -891,24 +882,18 @@ fn repair_reclaims_crash_orphan_index_entries() {
             repo.chunk_index().contains(&orphan_id),
             "orphan entry should be present before repair"
         );
-        // Refcounts are not persisted (05 step 9): the inflation is gone
-        // with the handle that made it.
-        assert_eq!(
-            repo.chunk_index().get(&existing_id).unwrap().refcount,
-            original_refcount,
-        );
     }
 
     // `vykar check --repair` (Apply, no verify_data).
     let result = apply_repair(&config, false);
 
-    // The always-on refcount rebuild ran...
+    // The always-on sweep of the index ran...
     assert!(
         has_action(&result.applied, |a| matches!(
             a,
-            RepairAction::RebuildRefcounts
+            RepairAction::RemoveUnreferencedEntries
         )),
-        "expected RebuildRefcounts in applied, got: {:?}",
+        "expected RemoveUnreferencedEntries in applied, got: {:?}",
         result.applied
     );
     // ...and the orphan-only repair is non-destructive: no snapshot/pack/chunk
@@ -919,22 +904,24 @@ fn repair_reclaims_crash_orphan_index_entries() {
         result.plan.actions
     );
 
-    // Reopen: the orphan entry is gone and the inflated refcount is corrected.
+    // Reopen: the orphan entry is gone, the live chunk is where it was, and
+    // the head records the repair as a sweep.
     {
         let repo = open_local_repo(&repo_dir);
         assert!(
             !repo.chunk_index().contains(&orphan_id),
-            "rebuild_refcounts should have dropped the orphan index entry"
+            "the repair's sweep should have dropped the orphan index entry"
         );
         let entry = repo
             .chunk_index()
             .get(&existing_id)
-            .expect("live chunk must survive the rebuild");
+            .expect("live chunk must survive the sweep");
         assert_eq!(
-            entry.refcount, original_refcount,
-            "inflated refcount should be corrected to the snapshot-derived value"
+            (entry.pack_id, entry.pack_offset, entry.stored_size),
+            (existing_pack, existing_offset, existing_size)
         );
-        assert!(entry.refcount > 0, "live chunk refcount must stay > 0");
+        let head = repo.index_head().unwrap();
+        assert_eq!(head.sweep.generation, head.generation, "{head:?}");
     }
 
     // The repo is clean and snap-base still restores byte-identical — no live
@@ -959,4 +946,37 @@ fn repair_reclaims_crash_orphan_index_entries() {
     let got = std::fs::read(&restored).unwrap();
     let expected = vec![0u8; 4096]; // file_00 == (0).wrapping_mul(37) == 0
     assert_eq!(got, expected, "snap-base should restore byte-identical");
+}
+
+/// REP-1, no index action: a repair that removes no entry still writes a
+/// head recording itself as a sweep.
+#[test]
+fn repair_without_unreferenced_entries_writes_a_sweep_head() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (repo_dir, config) = setup_repo(tmp.path());
+    let (len_before, gen_before) = {
+        let repo = open_local_repo(&repo_dir);
+        (
+            repo.chunk_index().len(),
+            repo.index_head().unwrap().generation,
+        )
+    };
+
+    let result = apply_repair(&config, false);
+    assert!(
+        matches!(
+            result.applied.as_slice(),
+            [RepairAction::RemoveUnreferencedEntries]
+        ),
+        "{:?}",
+        result.applied
+    );
+
+    let repo = open_local_repo(&repo_dir);
+    assert_eq!(repo.chunk_index().len(), len_before);
+    let head = repo.index_head().unwrap();
+    assert!(head.generation > gen_before, "{head:?}");
+    assert_eq!(head.sweep.generation, head.generation, "{head:?}");
+    drop(repo);
+    assert_clean_after_repair(&config);
 }

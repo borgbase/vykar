@@ -206,13 +206,13 @@ impl Fixture {
             .is_ok_and(RepoFormat::is_upgrade_only)
         {
             let repo = self.open_legacy(&cache).unwrap();
-            return sorted_entries(&repo.legacy_index().unwrap());
+            return sorted_entries(&repo.legacy_index().unwrap().to_live_index());
         }
         sorted_entries(self.open(&cache, true).unwrap().chunk_index())
     }
 }
 
-/// The entries without their refcounts (not persisted from v6 on).
+/// The entries, sorted, as strings.
 fn sorted_entries(index: &impl crate::testutil::EntryIter) -> Vec<String> {
     let mut v: Vec<String> = index
         .entry_vec()
@@ -402,12 +402,46 @@ fn a_resume_keeps_what_an_old_client_wrote_in_between() {
     index.remove(&gone);
     let blob = super::helpers::legacy_index_blob(&index, 0x25, crypto.as_ref());
     std::fs::write(fx.repo_dir.join("index"), blob).unwrap();
-    let expected = sorted_entries(&index);
+    let expected = sorted_entries(&index.to_live_index());
 
     assert!(resumed(&commands::upgrade::run(&fx.config, None).unwrap()));
     let repo = fx.open(&fx.tmp.path().join("cold"), true).unwrap();
     assert_eq!(sorted_entries(repo.chunk_index()), expected);
     assert!(!repo.chunk_index().contains(&gone));
+}
+
+/// UPG-same: a legacy entry at refcount 0 (garbage the old release had not
+/// removed yet) is not carried over; every other entry is, at its location.
+#[test]
+fn upgrade_drops_legacy_entries_at_refcount_zero() {
+    let fx = fixture(RepoFormat::V3);
+    fx.write("a", "alpha");
+    fx.backup("s1");
+    fx.downgrade();
+    let repo = fx.open_legacy(&fx.cache()).unwrap();
+    let mut index = repo.legacy_index().unwrap();
+    let crypto = Arc::clone(&repo.crypto);
+    drop(repo);
+    let expected = sorted_entries(&index.to_live_index());
+    let (_, e) = index.iter().map(|(id, e)| (*id, *e)).next().unwrap();
+    let zero = vykar_types::chunk_id::ChunkId::from_bytes([0xEF; 32]);
+    index.insert(
+        zero,
+        crate::index::LegacyIndexEntry {
+            refcount: 0,
+            pack_offset: e.pack_offset + 1,
+            ..e
+        },
+    );
+    let blob = super::helpers::legacy_index_blob(&index, 0x26, crypto.as_ref());
+    std::fs::write(fx.repo_dir.join("index"), blob).unwrap();
+
+    commands::upgrade::run(&fx.config, None).unwrap();
+    let repo = fx.open(&fx.tmp.path().join("cold"), true).unwrap();
+    assert!(!repo.chunk_index().contains(&zero));
+    assert_eq!(sorted_entries(repo.chunk_index()), expected);
+    drop(repo);
+    fx.check_clean();
 }
 
 /// Both branches leave the handle's index at the upgraded state and its
@@ -1005,6 +1039,7 @@ fn development_versions_4_and_5_are_refused() {
             );
         };
         unsupported(fx.open(&fx.cache(), false).err().unwrap());
+        unsupported(fx.open(&fx.cache(), true).err().unwrap());
         unsupported(fx.open_legacy(&fx.cache()).err().unwrap());
         unsupported(commands::upgrade::run(&fx.config, None).err().unwrap());
         assert_eq!(fx.tree(), state, "{version}");
@@ -1249,7 +1284,13 @@ fn upgrade_stops_on_a_pack_the_legacy_index_describes_inconsistently() {
         .find(|(_, e)| index.iter().filter(|(_, o)| o.pack_id == e.pack_id).count() > 1)
         .expect("a pack with two chunks");
     let overlapping = vykar_types::chunk_id::ChunkId::from_bytes([0xEE; 32]);
-    index.add(overlapping, e.stored_size, e.pack_id, e.pack_offset + 1);
+    index.insert(
+        overlapping,
+        crate::index::LegacyIndexEntry {
+            pack_offset: e.pack_offset + 1,
+            ..e
+        },
+    );
     let _ = first;
     let blob = super::helpers::legacy_index_blob(&index, 0x24, repo.crypto.as_ref());
     drop(repo);

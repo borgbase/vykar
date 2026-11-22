@@ -194,10 +194,8 @@ impl TreeChunkCache {
     /// logged at debug, and skipped (a Windows sharing violation is retried at
     /// the next call). Logs one debug line with the stats.
     ///
-    /// Called today after a prune or delete has persisted its refcount
-    /// decrements, and after a backup commit, with "is in the persisted
-    /// index" as `keep`. The sweep replaces that call with the mark's
-    /// referenced set once prune stops decrementing; a size cap would be a
+    /// Called by compact (and `compact --report-unreferenced`) with the
+    /// mark's set of live tree chunks as `keep`; a size cap would be a
     /// second predicate here.
     pub(crate) fn retain(&self, keep: impl Fn(&ChunkId) -> bool) -> RetainStats {
         let mut stats = RetainStats::default();

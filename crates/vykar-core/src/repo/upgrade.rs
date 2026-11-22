@@ -45,7 +45,7 @@ use std::sync::Arc;
 
 use crate::index::dedup_cache;
 use crate::index::table::{self, ChunkTable};
-use crate::index::{ChunkIndex, IndexBlob, LiveIndex};
+use crate::index::{IndexBlob, LegacyChunkIndex, LiveIndex};
 use vykar_crypto::CryptoEngine;
 use vykar_types::error::{Result, VykarError};
 
@@ -89,9 +89,9 @@ pub(crate) fn legacy_format_error(format: RepoFormat) -> VykarError {
 pub(crate) fn decode_index_blob(
     data: Option<Vec<u8>>,
     crypto: &dyn CryptoEngine,
-) -> Result<(u64, ChunkIndex)> {
+) -> Result<(u64, LegacyChunkIndex)> {
     let Some(data) = data else {
-        return Ok((0, ChunkIndex::new()));
+        return Ok((0, LegacyChunkIndex::new()));
     };
     let compressed = unpack_object_expect_with_context(
         &data,
@@ -180,10 +180,12 @@ impl Repository {
         debug!(entries = index.len(), "legacy index loaded");
         let had_head = !index_store::list_head_generations(self.storage.as_ref())?.is_empty();
 
-        // 3. The base body, locally; the legacy index is dropped before the
-        // maps are built from the table.
+        // 3. The base body, locally, from the live legacy entries (an entry
+        // at refcount 0 was garbage the old release had not removed yet, and
+        // is dropped; the other refcounts are discarded); the legacy index is
+        // dropped before the maps are built from the table.
         let anchor = index_store::cache_anchor(self.cache_dir().as_deref());
-        let (body, entries) = table::base_body_from_chunk_index(&index, &anchor).map_err(|e| {
+        let (body, entries) = table::base_body_from_legacy(&index, &anchor).map_err(|e| {
             VykarError::Other(format!(
                 "the v{} index cannot be written as a v6 base ({e}); nothing was changed",
                 from.version()
@@ -246,7 +248,7 @@ impl Repository {
     /// [`super::OpenOptions::legacy_format`]. Errors on any other format, and
     /// on a segmented head at `index` (written by a development build).
     #[doc(hidden)]
-    pub fn legacy_index(&self) -> Result<ChunkIndex> {
+    pub fn legacy_index(&self) -> Result<LegacyChunkIndex> {
         if !self.format.is_upgrade_only() {
             return Err(VykarError::Other(format!(
                 "format v{} has no legacy index",

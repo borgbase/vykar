@@ -732,7 +732,6 @@ impl EntryIter for crate::index::ChunkTable {
                 (
                     e.chunk_id,
                     crate::index::ChunkIndexEntry {
-                        refcount: 1,
                         stored_size: e.stored_size,
                         pack_id: e.pack_id,
                         pack_offset: e.pack_offset,
@@ -743,8 +742,8 @@ impl EntryIter for crate::index::ChunkTable {
     }
 }
 
-/// `index` as a scratch base table (every pack at `trailer_len` 0,
-/// refcount-0 entries left out), for tests that build a table by hand.
+/// `index` as a scratch base table (every pack at `trailer_len` 0), for
+/// tests that build a table by hand.
 pub(crate) fn base_table_of(
     index: &crate::index::ChunkIndex,
 ) -> std::sync::Arc<crate::index::ChunkTable> {

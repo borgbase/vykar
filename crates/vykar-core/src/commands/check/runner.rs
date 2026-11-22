@@ -391,7 +391,7 @@ fn sample_packs_out(
 }
 
 /// Refuse to build or apply a repair plan when any snapshot is too new to
-/// decode safely. Repair rebuilds refcounts by decoding *every* surviving
+/// decode safely. Repair sweeps the index after decoding *every* surviving
 /// snapshot; an unsupported one we cannot interpret would drop live chunk
 /// references (mirrors the `SnapshotReadFailed` guard in `execute_repair`).
 /// Plain `check` (no repair) still *reports* the issue and is unaffected.
@@ -417,8 +417,8 @@ fn refuse_repair_if_unreadable_snapshots(scan: &ScanResult) -> Result<()> {
         return Err(VykarError::Other(format!(
             "aborting repair: {count} snapshot(s) were written by a newer vykar \
              (unsupported format version or incompatible metadata envelope); \
-             upgrade vykar — repair leaves them untouched and refuses to rebuild \
-             refcounts without decoding them"
+             upgrade vykar — repair leaves them untouched and refuses to sweep \
+             the index without decoding them"
         )));
     }
     Ok(())
@@ -493,7 +493,7 @@ pub(crate) fn run_with_repair_on_repo(
         let scan = integrity_scan(repo, config, &scan_opts, &mut progress, shutdown)?;
 
         // Refuse before building the plan so a dry-run never presents a
-        // misleading executable RebuildRefcounts plan for a too-new repo.
+        // misleading executable RemoveUnreferencedEntries plan for a too-new repo.
         refuse_repair_if_unreadable_snapshots(&scan)?;
 
         let plan = plan_repair(repo, &scan, &group_by_pack(repo.chunk_index()), &load)?;

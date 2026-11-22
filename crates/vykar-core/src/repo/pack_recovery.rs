@@ -406,13 +406,11 @@ mod tests {
             chunks: sealed
                 .entries
                 .iter()
-                .map(
-                    |&(chunk_id, stored_size, pack_offset, _)| PendingChunkEntry {
-                        chunk_id,
-                        stored_size,
-                        pack_offset,
-                    },
-                )
+                .map(|&(chunk_id, stored_size, pack_offset)| PendingChunkEntry {
+                    chunk_id,
+                    stored_size,
+                    pack_offset,
+                })
                 .collect(),
         };
         (entry, sealed.data.as_bytes().unwrap().to_vec())

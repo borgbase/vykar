@@ -14,19 +14,15 @@ use std::path::Path;
 use aes_gcm::Aes256Gcm;
 use aes_gcm::aead::{Aead, KeyInit};
 use vykar_core::compress::{Compression, compress};
-use vykar_core::index::base::encode_base;
 use vykar_core::index::base_v2::BaseWriter;
-use vykar_core::index::dedup_cache::{
-    FullCacheEntry, MmapFullIndexCache, build_full_index_cache_to_path,
-};
 use vykar_core::index::head::{
     BaseRef, IndexHead, ObjectName, ObjectRef, SegmentKind, SegmentRef, SweepState,
 };
-use vykar_core::index::segment::{RefcountDelta, Relocation, Segment, diff_to_temp};
 use vykar_core::index::segment_v2::{Location, SegmentBody};
 use vykar_core::index::sweep_record::{SWEEP_RECORD_VERSION, SweepRecord};
 use vykar_core::index::{
-    ChunkIndex, IndexBlob, PendingChunkEntry, PendingPackEntry, encode_pending_journal,
+    ChunkIndex, IndexBlob, LegacyChunkIndex, LegacyIndexEntry, PendingChunkEntry, PendingPackEntry,
+    encode_pending_journal,
 };
 use vykar_core::repo::file_cache::{CachedChunkRef, CachedChunks, FileCache};
 use vykar_core::repo::format::{ObjectType, pack_object_with_context};
@@ -218,54 +214,6 @@ fn seed_index_blob() {
     write_seed("fuzz_msgpack_index_blob", "empty_index", &encoded);
 }
 
-fn seed_index_segment() {
-    write_seed(
-        "fuzz_index_segment",
-        "empty",
-        &Segment::empty([0; 32], 0).encode(),
-    );
-    write_seed(
-        "fuzz_index_segment",
-        "all_sections",
-        &all_sections_segment().encode(),
-    );
-}
-
-/// A segment with an entry in every section.
-fn all_sections_segment() -> Segment {
-    Segment {
-        prev_state_hash: [7; 32],
-        prev_entries: 1000,
-        deltas: vec![
-            RefcountDelta {
-                position: 0,
-                delta: 1,
-            },
-            RefcountDelta {
-                position: 1,
-                delta: 1,
-            },
-            RefcountDelta {
-                position: 500,
-                delta: -3,
-            },
-        ],
-        relocations: vec![Relocation {
-            position: 42,
-            pack_id: PackId::from_bytes([9; 32]),
-            pack_offset: 123_456,
-            stored_size: 4096,
-        }],
-        new_entries: vec![FullCacheEntry {
-            chunk_id: ChunkId::from_bytes([3; 32]),
-            refcount: 2,
-            stored_size: 777,
-            pack_id: PackId::from_bytes([9; 32]),
-            pack_offset: 64,
-        }],
-    }
-}
-
 fn seed_index_head() {
     write_seed(
         "fuzz_index_head",
@@ -303,6 +251,26 @@ fn seed_index_head() {
     );
 }
 
+/// The chunks of `seed_chunk_index(n)` as a legacy index at refcount 1,
+/// inserted in the same order (so the seed bytes, which follow the map's
+/// iteration order, are the ones the old `ChunkIndex` encoded).
+fn seed_legacy_index(n: u8) -> LegacyChunkIndex {
+    let mut index = LegacyChunkIndex::new();
+    for i in 0..n {
+        let id = ChunkId::from_bytes([i.wrapping_mul(37); 32]);
+        index.insert(
+            id,
+            LegacyIndexEntry {
+                refcount: 1,
+                stored_size: 100 + u32::from(i),
+                pack_id: PackId::from_bytes([i % 3 + 1; 32]),
+                pack_offset: u64::from(i) * 4096,
+            },
+        );
+    }
+    index
+}
+
 /// `n` chunks spread over three packs.
 fn seed_chunk_index(n: u8) -> ChunkIndex {
     let mut index = ChunkIndex::new();
@@ -316,115 +284,6 @@ fn seed_chunk_index(n: u8) -> ChunkIndex {
         );
     }
     index
-}
-
-fn seed_index_base() {
-    let path = std::env::temp_dir().join("vykar-fuzz-corpus-full-cache");
-    for (name, n) in [("empty", 0u8), ("three_packs", 9)] {
-        let index = seed_chunk_index(n);
-        build_full_index_cache_to_path(&index, 1, &path).unwrap();
-        let cache = MmapFullIndexCache::open_verified(&path).unwrap();
-        let mut data = vec![n];
-        encode_base(&cache, &mut data).unwrap();
-        write_seed("fuzz_index_base", name, &data);
-    }
-    let _ = fs::remove_file(&path);
-}
-
-/// `fuzz_index_apply` input: control byte, framed base and segments, the
-/// last segment unframed.
-fn frame(control: u8, base: &[u8], segments: &[Vec<u8>]) -> Vec<u8> {
-    let mut out = vec![control];
-    let (last, framed) = segments.split_last().unwrap();
-    for body in std::iter::once(base).chain(framed.iter().map(Vec::as_slice)) {
-        out.extend_from_slice(&u16::try_from(body.len()).unwrap().to_le_bytes());
-        out.extend_from_slice(body);
-    }
-    out.extend_from_slice(last);
-    out
-}
-
-/// One round of changes: two refcount bumps, a removal, a relocation and
-/// two new chunks (`round` keeps the new IDs distinct).
-fn change_index(index: &mut ChunkIndex, round: u8) {
-    let mut ids: Vec<ChunkId> = index.iter().map(|(id, _)| *id).collect();
-    ids.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
-    index.increment_refcount_by(&ids[0], 2);
-    index.increment_refcount_by(&ids[1], 1);
-    index.remove(&ids[2]);
-    index.update_location(&ids[3], PackId::from_bytes([0xE0 + round; 32]), 8192, 333);
-    for k in 0..2 {
-        index.add(
-            ChunkId::from_bytes([0xF0 + 2 * round + k; 32]),
-            200 + u32::from(k),
-            PackId::from_bytes([0xE0 + round; 32]),
-            u64::from(k) * 512,
-        );
-    }
-}
-
-/// The base body of `index` and the bodies of the segments that take it
-/// through `rounds` (each `change` applied in turn).
-fn base_and_segments(
-    mut index: ChunkIndex,
-    rounds: usize,
-    change: impl Fn(&mut ChunkIndex, u8),
-) -> (Vec<u8>, Vec<Vec<u8>>) {
-    let path = std::env::temp_dir().join("vykar-fuzz-corpus-index-apply");
-    build_full_index_cache_to_path(&index, 1, &path).unwrap();
-    let mut cache = MmapFullIndexCache::open_verified(&path).unwrap();
-    let mut base = Vec::new();
-    encode_base(&cache, &mut base).unwrap();
-    let mut segments = Vec::new();
-    // Each state's file outlives its mapping.
-    let mut files = Vec::new();
-    for round in 0..rounds {
-        change(&mut index, u8::try_from(round).unwrap());
-        let (diff, tmp) = diff_to_temp(&cache, &index, &path).unwrap();
-        segments.push(diff.segment.encode());
-        cache = MmapFullIndexCache::open_verified(&tmp).unwrap();
-        files.push(tmp);
-    }
-    drop(cache);
-    drop(files);
-    let _ = fs::remove_file(&path);
-    (base, segments)
-}
-
-fn seed_index_apply() {
-    let (base, one) = base_and_segments(seed_chunk_index(9), 1, change_index);
-    write_seed("fuzz_index_apply", "one_segment", &frame(0, &base, &one));
-
-    let (base, three) = base_and_segments(seed_chunk_index(9), 3, change_index);
-    write_seed(
-        "fuzz_index_apply",
-        "three_segments",
-        &frame(2, &base, &three),
-    );
-    // Layer 1 declares a wrong hash, caught when it finishes.
-    write_seed(
-        "fuzz_index_apply",
-        "three_segments_lie",
-        &frame(2 | 1 << 3, &base, &three),
-    );
-    // Layer 1 declares one entry too few, caught by layer 2's input.
-    write_seed(
-        "fuzz_index_apply",
-        "three_segments_lie_fewer",
-        &frame(2 | 1 << 3 | 2 << 5, &base, &three),
-    );
-
-    let (base, add) = base_and_segments(ChunkIndex::new(), 1, |index, _| {
-        for k in 0..3u8 {
-            index.add(
-                ChunkId::from_bytes([0x10 + k; 32]),
-                64,
-                PackId::from_bytes([1; 32]),
-                u64::from(k) * 64,
-            );
-        }
-    });
-    write_seed("fuzz_index_apply", "empty_base", &frame(0, &base, &add));
 }
 
 /// A keyed segment (body version 2) with an entry in every section.
@@ -491,29 +350,6 @@ fn seed_index_segment_v2() {
     backup.relocations.clear();
     backup.pack_trailers = vec![(PackId::from_bytes([9; 32]), 119)];
     write_seed("fuzz_index_segment_v2", "backup", &backup.encode().unwrap());
-}
-
-fn seed_full_index_cache() {
-    let path = std::env::temp_dir().join("vykar-fuzz-corpus-full-index-cache");
-    build_full_index_cache_to_path(&seed_chunk_index(9), 1, &path).unwrap();
-    let file = fs::read(&path).unwrap();
-    let _ = fs::remove_file(&path);
-    let without_trailer = &file[..file.len() - 32];
-    let region = &without_trailer[28..];
-
-    let mut sorted = vec![0u8];
-    sorted.extend_from_slice(region);
-    write_seed("fuzz_full_index_cache", "sorted", &sorted);
-
-    let mut unsorted = vec![0u8];
-    unsorted.extend_from_slice(&region[80..160]);
-    unsorted.extend_from_slice(&region[..80]);
-    unsorted.extend_from_slice(&region[160..]);
-    write_seed("fuzz_full_index_cache", "unsorted", &unsorted);
-
-    let mut raw_header = vec![1u8];
-    raw_header.extend_from_slice(without_trailer);
-    write_seed("fuzz_full_index_cache", "raw_header", &raw_header);
 }
 
 fn seed_item_stream() {
@@ -763,7 +599,10 @@ fn seed_unpack_object() {
             "context_index_segment",
             ObjectType::IndexSegment,
             b"index.d/segment",
-            Segment::empty([0; 32], 0).encode(),
+            // Any payload will do; these are the bytes of the empty v1
+            // segment this seed was first generated from (version 1, a zero
+            // state hash, four zero counts), so the seed stays the same.
+            [&[1u8][..], &[0u8; 36]].concat(),
         ),
     ];
     for (name, obj_type, context, plaintext) in seeds {
@@ -1032,7 +871,7 @@ fn seed_protocol_keys() {
 fn seed_metadata_msgpack() {
     let blob = IndexBlob {
         generation: 7,
-        chunks: seed_chunk_index(9),
+        chunks: seed_legacy_index(9),
     };
     let raw = rmp_serde::to_vec(&blob).unwrap();
     for (name, compression) in [
@@ -1121,9 +960,6 @@ fn main() {
     seed_unpack_object();
     println!("  fuzz_unpack_object: done");
 
-    seed_index_segment();
-    println!("  fuzz_index_segment: done");
-
     seed_index_head();
     println!("  fuzz_index_head: done");
 
@@ -1136,17 +972,8 @@ fn main() {
     seed_sweep_record();
     println!("  fuzz_sweep_record: done");
 
-    seed_index_base();
-    println!("  fuzz_index_base: done");
-
-    seed_index_apply();
-    println!("  fuzz_index_apply: done");
-
     seed_index_object();
     println!("  fuzz_index_object: done");
-
-    seed_full_index_cache();
-    println!("  fuzz_full_index_cache: done");
 
     seed_repo_config();
     println!("  fuzz_repo_config: done");

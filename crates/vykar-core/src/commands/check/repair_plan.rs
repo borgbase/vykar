@@ -477,8 +477,8 @@ pub(super) fn build_repair_plan(
         .collect();
     add_pack_maps(&mut actions, &mut map_packs);
 
-    // Always include refcount rebuild
-    actions.push(RepairAction::RebuildRefcounts);
+    // Always end with the sweep of the index.
+    actions.push(RepairAction::RemoveUnreferencedEntries);
 
     RepairPlan {
         actions,
@@ -489,7 +489,7 @@ pub(super) fn build_repair_plan(
 }
 
 /// Add `packs` to the plan's one `WritePackMaps` action (sorted, without
-/// duplicates), creating it before `RebuildRefcounts` (or at the end) when
+/// duplicates), creating it before `RemoveUnreferencedEntries` (or at the end) when
 /// there is none. Nothing is added for an empty `packs`.
 pub(super) fn add_pack_maps(actions: &mut Vec<RepairAction>, packs: &mut Vec<PackId>) {
     if packs.is_empty() {
@@ -504,7 +504,7 @@ pub(super) fn add_pack_maps(actions: &mut Vec<RepairAction>, packs: &mut Vec<Pac
         None => {
             let at = actions
                 .iter()
-                .position(|a| matches!(a, RepairAction::RebuildRefcounts))
+                .position(|a| matches!(a, RepairAction::RemoveUnreferencedEntries))
                 .unwrap_or(actions.len());
             actions.insert(
                 at,

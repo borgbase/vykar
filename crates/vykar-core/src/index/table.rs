@@ -59,7 +59,7 @@ use super::dedup_cache::{self, chunk_id_to_u64};
 use super::hasher::ChunkIdHashMap;
 use super::head::{ObjectName, SegmentKind, SegmentRef};
 use super::segment_v2::{Location, SegmentBody};
-use super::{ChunkIndex, ChunkIndexEntry};
+use super::{ChunkIndex, ChunkIndexEntry, LegacyChunkIndex, LegacyIndexEntry};
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
 use vykar_types::pack_id::PackId;
@@ -687,17 +687,44 @@ pub(crate) fn prune_local_index_files(
     deleted
 }
 
-/// `index` (a legacy or test index) as a base body in a table file beside
-/// `anchor`, every pack at `trailer_len` 0. Entries at refcount 0 are left
-/// out. Returns the temp file and the record count.
+/// `index` (a test index) as a base body in a table file beside `anchor`,
+/// every pack at `trailer_len` 0. Returns the temp file and the record
+/// count.
+#[cfg(test)]
 pub(crate) fn base_body_from_chunk_index(
     index: &ChunkIndex,
     anchor: &Path,
 ) -> Result<(TempPath, u64)> {
-    let mut entries: Vec<(&ChunkId, &ChunkIndexEntry)> =
-        index.iter().filter(|(_, e)| e.refcount > 0).collect();
+    base_body_from_entries(index.iter().collect(), |e| *e, anchor)
+}
+
+/// The live entries of `legacy` (refcount above 0, see
+/// [`LegacyChunkIndex::live`]) as a base body, like
+/// [`base_body_from_chunk_index`]: what the upgrade writes.
+pub(crate) fn base_body_from_legacy(
+    legacy: &LegacyChunkIndex,
+    anchor: &Path,
+) -> Result<(TempPath, u64)> {
+    let entries = legacy.iter().filter(|(_, e)| e.refcount > 0).collect();
+    base_body_from_entries(
+        entries,
+        |e: &LegacyIndexEntry| ChunkIndexEntry {
+            stored_size: e.stored_size,
+            pack_id: e.pack_id,
+            pack_offset: e.pack_offset,
+        },
+        anchor,
+    )
+}
+
+/// `entries` (borrowed, so the caller's map is not copied) as a base body.
+fn base_body_from_entries<E>(
+    mut entries: Vec<(&ChunkId, &E)>,
+    entry: impl Fn(&E) -> ChunkIndexEntry,
+    anchor: &Path,
+) -> Result<(TempPath, u64)> {
     entries.sort_unstable_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
-    let mut packs: Vec<PackId> = entries.iter().map(|(_, e)| e.pack_id).collect();
+    let mut packs: Vec<PackId> = entries.iter().map(|(_, e)| entry(e).pack_id).collect();
     packs.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
     packs.dedup();
     let pack_table: Vec<(PackId, u32)> = packs.iter().map(|p| (*p, 0)).collect();
@@ -705,6 +732,7 @@ pub(crate) fn base_body_from_chunk_index(
         .map_err(|_| invalid("index has more entries than a base can hold"))?;
     let mut w = BaseWriter::new(TableFileWriter::new_beside(anchor)?, &pack_table, count)?;
     for (id, e) in entries {
+        let e = entry(e);
         let slot = packs
             .binary_search_by(|p| p.as_bytes().cmp(e.pack_id.as_bytes()))
             .map_err(|_| invalid("BUG: pack missing from the pack table"))?
@@ -760,14 +788,9 @@ pub(crate) fn write_cached_segment(dir: &Path, name: &ObjectName, bytes: &[u8]) 
 
 /// What the head's segments did to the base table, or this process's edits
 /// on top: removed and relocated table positions, entries absent from the
-/// table, trailer lengths of packs the table does not list, and (until 05
-/// step 10) refcounts, which are never persisted: every loaded entry has
-/// refcount 1.
+/// table, and trailer lengths of packs the table does not list.
 #[derive(Clone, Default)]
 struct Overlay {
-    /// Refcount per table position, filled with 1 on the first refcount edit
-    /// (4 B per entry).
-    refcounts: Option<Vec<u32>>,
     /// Bitset over table positions; set = removed.
     removed: Option<Vec<u64>>,
     removed_count: usize,
@@ -819,13 +842,8 @@ impl Overlay {
 
     /// The entry of a live table position.
     fn table_entry(&self, position: u32, record: &TableEntry) -> ChunkIndexEntry {
-        let refcount = self
-            .refcounts
-            .as_ref()
-            .map_or(1, |rc| rc[position as usize]);
         let (pack_id, pack_offset, stored_size) = self.location(position, record);
         ChunkIndexEntry {
-            refcount,
             stored_size,
             pack_id,
             pack_offset,
@@ -844,10 +862,6 @@ impl Overlay {
             return Some(t);
         }
         table.and_then(|t| t.pack_trailer_len(pack))
-    }
-
-    fn refcounts_mut(&mut self, table_len: usize) -> &mut Vec<u32> {
-        self.refcounts.get_or_insert_with(|| vec![1; table_len])
     }
 
     fn set_removed(&mut self, table_len: usize, position: u32, removed: bool) {
@@ -877,24 +891,20 @@ impl Overlay {
         }
     }
 
-    /// Insert an absent chunk at refcount 1 (a removed table position comes
-    /// back with the new location).
+    /// Insert an absent chunk (a removed table position comes back with the
+    /// new location).
     fn insert_absent(&mut self, table: Option<&ChunkTable>, id: ChunkId, loc: Location) {
         let tuple = (loc.pack_id, loc.pack_offset, loc.stored_size);
         if let Some(table) = table
             && let Some((position, record)) = table.find(&id)
         {
             self.set_removed(table.len(), position, false);
-            if let Some(rc) = self.refcounts.as_mut() {
-                rc[position as usize] = 1;
-            }
             self.set_location(position, &record, tuple);
             return;
         }
         self.added.insert(
             id,
             ChunkIndexEntry {
-                refcount: 1,
                 stored_size: loc.stored_size,
                 pack_id: loc.pack_id,
                 pack_offset: loc.pack_offset,
@@ -1006,7 +1016,7 @@ pub(crate) struct IndexView {
 }
 
 impl IndexView {
-    /// The table positional bumps refer to.
+    /// The table that positional reuse refers to.
     pub(crate) fn table(&self) -> &Arc<ChunkTable> {
         &self.table
     }
@@ -1177,88 +1187,22 @@ impl LiveIndex {
         layer.note_pack_trailer(table, pack, trailer_len);
     }
 
-    /// Add a chunk: a present chunk gets one more reference (location
-    /// unchanged), an absent one is inserted with refcount 1.
+    /// Add a chunk when it is absent; a present chunk is left as it is
+    /// (location unchanged). Either way the edit layer exists afterwards.
     pub fn add(&mut self, id: ChunkId, stored_size: u32, pack_id: PackId, pack_offset: u64) {
         let (table, layer) = self.edit_layer();
-        match layer.slot(table, &id) {
-            Some(Slot::Table(position, _)) => {
-                let len = table.map_or(0, ChunkTable::len);
-                layer.refcounts_mut(len)[position as usize] += 1;
-            }
-            Some(Slot::Added) => {
-                if let Some(e) = layer.added.get_mut(&id) {
-                    e.refcount += 1;
-                }
-            }
-            None => layer.insert_absent(
-                table,
-                id,
-                Location {
-                    pack_id,
-                    pack_offset,
-                    stored_size,
-                },
-            ),
-        }
-    }
-
-    /// Increment the refcount of a present chunk.
-    pub fn increment_refcount(&mut self, id: &ChunkId) {
-        self.increment_refcount_by(id, 1);
-    }
-
-    /// Increment the refcount of a present chunk by `amount`.
-    pub fn increment_refcount_by(&mut self, id: &ChunkId, amount: u32) {
-        if !self.contains(id) {
+        if layer.slot(table, &id).is_some() {
             return;
         }
-        let (table, layer) = self.edit_layer();
-        match layer.slot(table, id) {
-            Some(Slot::Table(position, _)) => {
-                let len = table.map_or(0, ChunkTable::len);
-                layer.refcounts_mut(len)[position as usize] += amount;
-            }
-            Some(Slot::Added) => {
-                if let Some(e) = layer.added.get_mut(id) {
-                    e.refcount += amount;
-                }
-            }
-            None => {}
-        }
-    }
-
-    /// Decrement a chunk's refcount; at 0 the chunk is removed. Returns the
-    /// new refcount and the stored size, `None` for an absent chunk.
-    pub fn decrement(&mut self, id: &ChunkId) -> Option<(u32, u32)> {
-        if !self.contains(id) {
-            return None;
-        }
-        let (table, layer) = self.edit_layer();
-        let len = table.map_or(0, ChunkTable::len);
-        match layer.slot(table, id)? {
-            Slot::Table(position, record) => {
-                let size = layer.table_entry(position, &record).stored_size;
-                let rc = {
-                    let rc = &mut layer.refcounts_mut(len)[position as usize];
-                    *rc = rc.saturating_sub(1);
-                    *rc
-                };
-                if rc == 0 {
-                    layer.set_removed(len, position, true);
-                }
-                Some((rc, size))
-            }
-            Slot::Added => {
-                let e = layer.added.get_mut(id)?;
-                e.refcount = e.refcount.saturating_sub(1);
-                let (rc, size) = (e.refcount, e.stored_size);
-                if rc == 0 {
-                    layer.added.remove(id);
-                }
-                Some((rc, size))
-            }
-        }
+        layer.insert_absent(
+            table,
+            id,
+            Location {
+                pack_id,
+                pack_offset,
+                stored_size,
+            },
+        );
     }
 
     /// Update the location of a present chunk (compact). `false` when absent.
@@ -1311,28 +1255,6 @@ impl LiveIndex {
         removed + before - layer.added.len()
     }
 
-    /// Replace every refcount from a snapshot-derived map; entries not in
-    /// `new_refcounts` are removed.
-    pub fn rebuild_refcounts(&mut self, new_refcounts: &HashMap<ChunkId, u32>) {
-        let positions = self.live_positions();
-        let (table, layer) = self.edit_layer();
-        if let Some(table) = table {
-            for position in positions {
-                match new_refcounts.get(&table.chunk_id_at(position)) {
-                    Some(&rc) => layer.refcounts_mut(table.len())[position as usize] = rc,
-                    None => layer.set_removed(table.len(), position, true),
-                }
-            }
-        }
-        layer.added.retain(|id, e| match new_refcounts.get(id) {
-            Some(&rc) => {
-                e.refcount = rc;
-                true
-            }
-            None => false,
-        });
-    }
-
     /// A `ChunkIndex` holding the same entries (tests, oracles).
     pub fn to_chunk_index(&self) -> ChunkIndex {
         let mut index = ChunkIndex::with_capacity(self.len());
@@ -1347,7 +1269,7 @@ impl LiveIndex {
     /// own. `Err("BUG ...")` when there are edits. Removals, then
     /// relocations, then additions:
     /// - removing or relocating an absent chunk is `InvalidFormat`;
-    /// - an absent chunk is added at refcount 1;
+    /// - an absent chunk is added;
     /// - adding a present chunk keeps the lower of the two locations by
     ///   (pack ID bytes, offset); the other copy's bytes are dead;
     /// - a pack known with another `trailer_len` takes the larger (logged).
@@ -1410,7 +1332,7 @@ impl LiveIndex {
     /// The keyed change from the applied layer to the edits (empty without
     /// edits): removals = present in applied, absent now; additions = absent
     /// in applied, present now; relocations = present in both, moved.
-    /// Refcounts are ignored. `pack_trailers` names every pack of an
+    /// `pack_trailers` names every pack of an
     /// addition or relocation; a pack whose trailer length this process does
     /// not know is a bug (an error), so a stored 0 always means "no
     /// trailer". Walks only the overlay structures (the removed bitsets word
@@ -1501,14 +1423,9 @@ impl LiveIndex {
     }
 
     /// After the head naming `segment` was written: the edits become the
-    /// applied layer, with every refcount back at 1 (refcounts are not
-    /// written, so the index equals one loaded from the head).
+    /// applied layer, so the index equals one loaded from the head.
     pub(crate) fn mark_written(&mut self, segment: ObjectName) {
-        if let Some(mut edits) = self.edits.take() {
-            edits.refcounts = None;
-            for e in edits.added.values_mut() {
-                e.refcount = 1;
-            }
+        if let Some(edits) = self.edits.take() {
             self.applied = Arc::new(edits);
         }
         self.state.segments.push(segment);
@@ -1696,9 +1613,10 @@ pub(crate) enum PrefilterVerdict {
     /// session.
     Absent,
     /// In the view's table at `position` and not removed by its segments
-    /// (what the consumer records the refcount bump by).
+    /// (what the consumer records the reuse by).
     Present { stored_size: u32, position: u32 },
-    /// Added by a segment of the view (not in the table): bumped by key.
+    /// Added by a segment of the view (not in the table): reuse is recorded
+    /// by key.
     PresentAdded { stored_size: u32 },
 }
 
@@ -1709,7 +1627,7 @@ pub(crate) enum PrefilterVerdict {
 /// Confirming a hit in the worker lets it drop the raw chunk bytes
 /// immediately instead of holding them until the consumer resolves the hit.
 /// Sound because the view is immutable: a chunk present here is still
-/// present when the consumer bumps its refcount (see
+/// present when the consumer records its reuse (see
 /// `Repository::bump_ref_presession_hit`).
 #[derive(Clone)]
 pub(crate) struct DedupPrefilter {

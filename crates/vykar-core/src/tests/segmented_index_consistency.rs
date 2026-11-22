@@ -22,23 +22,23 @@ use crate::testutil::init_test_environment;
 enum Op {
     /// A write session storing `payload(b)` for each b, then save_state.
     Store(Vec<u8>),
-    Decrement(usize),
+    Remove(usize),
     /// Relocate to the synthetic pack `[p; 32]`, with this stored size.
     Relocate(usize, u8, u32),
-    /// rebuild_refcounts: chunk k (sorted) gets 1 + (seed' >> 1) % 4, or is
-    /// dropped if seed' is odd, where seed' is the seed rotated by k.
-    Rebuild(u64),
-    /// request_index_fold, then bump chunk i.
-    FoldThenBump(usize),
+    /// A sweep: chunk k (sorted) is dropped if seed' is odd, where seed' is
+    /// the seed rotated by k.
+    Sweep(u64),
+    /// request_index_fold with no edit.
+    Fold,
 }
 
 fn arb_op() -> impl Strategy<Value = Op> {
     prop_oneof![
         4 => prop::collection::vec(0..12u8, 1..6).prop_map(Op::Store),
-        2 => any::<usize>().prop_map(Op::Decrement),
+        2 => any::<usize>().prop_map(Op::Remove),
         1 => (any::<usize>(), any::<u8>(), 1..1000u32).prop_map(|(i, p, s)| Op::Relocate(i, p, s)),
-        1 => any::<u64>().prop_map(Op::Rebuild),
-        1 => any::<usize>().prop_map(Op::FoldThenBump),
+        1 => any::<u64>().prop_map(Op::Sweep),
+        1 => Just(Op::Fold),
     ]
 }
 
@@ -140,8 +140,8 @@ fn apply_maintenance(repo: &mut Repository, op: &Op) -> bool {
     }
     match *op {
         Op::Store(..) => unreachable!(),
-        Op::Decrement(i) => {
-            repo.chunk_index_mut().decrement(&ids[i % ids.len()]);
+        Op::Remove(i) => {
+            repo.chunk_index_mut().remove(&ids[i % ids.len()]);
         }
         Op::Relocate(i, p, size) => {
             repo.chunk_index_mut()
@@ -154,21 +154,17 @@ fn apply_maintenance(repo: &mut Repository, op: &Op) -> bool {
             );
             assert!(moved);
         }
-        Op::Rebuild(seed) => {
-            let refcounts: HashMap<ChunkId, u32> = ids
-                .iter()
-                .enumerate()
-                .filter_map(|(k, id)| {
-                    let bits = seed.rotate_right((k % 64) as u32);
-                    (bits & 1 == 0).then(|| (*id, 1 + ((bits >> 1) % 4) as u32))
-                })
-                .collect();
-            repo.chunk_index_mut().rebuild_refcounts(&refcounts);
+        Op::Sweep(seed) => {
+            let index = repo.chunk_index_mut();
+            for (k, id) in ids.iter().enumerate() {
+                if seed.rotate_right((k % 64) as u32) & 1 != 0 {
+                    index.remove(id);
+                }
+            }
         }
-        Op::FoldThenBump(i) => {
+        Op::Fold => {
             repo.request_index_fold();
-            repo.chunk_index_mut()
-                .increment_refcount(&ids[i % ids.len()]);
+            repo.mark_index_dirty();
         }
     }
     repo.save_state().unwrap();

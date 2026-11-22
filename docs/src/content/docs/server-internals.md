@@ -127,7 +127,7 @@ The server holds no keys, so this proves each pack is the object the client uplo
 
 High-level flow:
 
-1. The client opens the repo and analyzes pack liveness from the index.
+1. The client opens the repo, marks the live snapshots, sweeps the index, then analyzes pack liveness from it.
 2. The client sends a repack plan describing source packs and live blob offsets.
 3. The server copies the referenced encrypted blobs into new pack files, preserving the pack wire format.
    An operation may carry a `trailer` (hex in the JSON plan): opaque bytes the server appends to that output pack as one more length-prefixed blob after the kept blobs and includes in the pack ID, the output cap and the quota. It requires `protocol_version: 3` (so a server from 0.8 through 0.24 refuses the plan by version instead of dropping the trailer) and is sent only to a server that advertises `repack_trailer`. Compact sends one with every repacked pack: the encrypted pack trailer (architecture.md, Pack File Format). Against a server without `repack_trailer` the client repacks itself.

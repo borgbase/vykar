@@ -10,7 +10,7 @@
 //!
 //! The mark ([`mark_live`]) sets one bit per referenced index position
 //! ([`IndexPositions`]) and can count references with snapshot multiplicity,
-//! the stored refcounts' semantics. It fails closed: a key under
+//! for the sweep record's referenced bytes. It fails closed: a key under
 //! `snapshots/` that is not a snapshot ID, a listed object that is gone, a
 //! snapshot object that cannot be read, decrypted or decoded, a foreign
 //! envelope, a newer format, a tree pointer missing from the index, a tree
@@ -20,7 +20,7 @@
 //!
 //! The tree-chunk source is the caller's: the report (`compact
 //! --report-unreferenced`) reads the local tree-chunk cache first
-//! ([`TreeChunkSource::CacheFirst`]); check and the repair refcount rebuild
+//! ([`TreeChunkSource::CacheFirst`]); check and the sweep of the repair
 //! read storage only ([`TreeChunkSource::Storage`]), since they verify what
 //! the repository holds. The cache never supplies locations.
 //!
@@ -242,7 +242,7 @@ impl TreeChunkSet {
 /// What the traversal does when a tree chunk cannot be resolved or read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OnChunkError {
-    /// Fail the walk (mark, repair rebuild).
+    /// Fail the walk (mark, the repair's sweep).
     Abort,
     /// Hand the failure to `collect` and go on (check).
     Record,
@@ -623,13 +623,14 @@ where
 pub(crate) enum MissingRefs {
     /// A data-chunk reference with no index entry fails the mark.
     Abort,
-    /// Such a reference is skipped (the repair rebuild's rule).
+    /// Such a reference is skipped (the repair sweep's rule).
     Ignore,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct MarkOptions {
-    /// Also count references with snapshot multiplicity (refcount semantics).
+    /// Also count references with snapshot multiplicity (reference
+    /// multiplicity, for the sweep record's referenced bytes).
     pub(crate) count: bool,
     pub(crate) missing_refs: MissingRefs,
     /// Decode threads ([`default_decode_threads`] for the callers here).
@@ -652,7 +653,7 @@ impl Mark {
             .is_some_and(|w| w & (1 << (position % 64)) != 0)
     }
 
-    /// Counted references (`count: true` only).
+    /// Counted references with snapshot multiplicity (`count: true` only).
     pub(crate) fn count(&self, position: u32) -> Option<u32> {
         self.counts
             .as_ref()
@@ -684,10 +685,10 @@ fn add_count(counts: Option<&[AtomicU32]>, position: u32, n: u32) {
 /// unreadable or unresolvable tree chunk and on a tree chunk that does not
 /// decode alone. `names[s]` names snapshot `s` of `set` in messages.
 ///
-/// Every chunk reference of every item is marked, whatever the item type;
-/// counting follows the stored refcounts: each tree chunk counts its
-/// occurrences in `item_ptrs`, and each `RegularFile` chunk reference
-/// counts as often as its tree chunk occurs.
+/// Every chunk reference of every item is marked, whatever the item type.
+/// Counting (reference multiplicity, for the sweep record's referenced
+/// bytes): each tree chunk counts its occurrences in `item_ptrs`, and each
+/// `RegularFile` chunk reference counts as often as its tree chunk occurs.
 pub(crate) fn mark_live(
     repo: &Repository,
     set: &TreeChunkSet,

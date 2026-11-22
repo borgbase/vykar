@@ -125,13 +125,6 @@ pub struct UnreferencedReport {
     /// Stored bytes (sum of `stored_size`) of the entries in the packs
     /// counted by `packs_only_unreferenced`.
     pub packs_only_unreferenced_bytes: u64,
-    /// Oracle while refcounts are stored: entries whose stored refcount
-    /// differs from the references counted.
-    pub refcount_mismatches: usize,
-    /// Unreferenced entries whose stored refcount is above 0 (leaks).
-    pub unreferenced_with_refcount: usize,
-    /// Referenced entries stored at refcount 0.
-    pub referenced_with_zero_refcount: usize,
 }
 
 /// Open the repository and run `report_unreferenced_on_repo`: the report of
@@ -187,7 +180,7 @@ fn report_under_lock(repo: &mut Repository, shutdown: &CancelToken) -> Result<Un
         &positions,
         TreeChunkSource::CacheFirst,
         mark::MarkOptions {
-            count: true,
+            count: false,
             missing_refs: mark::MissingRefs::Abort,
             decode_threads: mark::default_decode_threads(),
         },
@@ -212,19 +205,10 @@ fn report_under_lock(repo: &mut Repository, shutdown: &CancelToken) -> Result<Un
         if marked {
             report.referenced += 1;
             tally.1 += 1;
-            if e.refcount == 0 {
-                report.referenced_with_zero_refcount += 1;
-            }
         } else {
             report.unreferenced.push(id);
             report.unreferenced_bytes += u64::from(e.stored_size);
             tally.0 += 1;
-            if e.refcount > 0 {
-                report.unreferenced_with_refcount += 1;
-            }
-        }
-        if found.count(p) != Some(e.refcount) {
-            report.refcount_mismatches += 1;
         }
     });
     drop(positions);
@@ -942,7 +926,7 @@ fn compact_packs(
         repo.chunk_index_mut()
             .set_pack_trailer(new_pack_id, trailer_len);
 
-        for (chunk_id, stored_size, offset, _refcount) in &new_entries {
+        for (chunk_id, stored_size, offset) in &new_entries {
             repo.chunk_index_mut()
                 .update_location(chunk_id, new_pack_id, *offset, *stored_size);
         }

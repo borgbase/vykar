@@ -352,7 +352,7 @@ pub(crate) fn skip_reason(e: &VykarError) -> String {
 ///
 /// Arms a rollback checkpoint on the repo and snapshots the stats byte
 /// counters. On `Ok` the checkpoint is committed; on `Err` the checkpoint
-/// is rolled back (undoing refcount bumps, dedup inserts, recovered-chunk
+/// is rolled back (undoing recorded reuse, dedup inserts, recovered-chunk
 /// promotion, and partial pack writer state) and the stats byte counters
 /// are restored to their pre-scope values.
 ///

@@ -89,7 +89,7 @@ fn frame_len(repo: &Repository, pack: &vykar_types::pack_id::PackId) -> u32 {
 
 /// BK-2 and R7: a chunk that exists only in an applied segment (no base) is
 /// deduplicated by the next backup, through the prefilter (PresentAdded)
-/// and by key on the consumer path, and recorded as a keyed bump.
+/// and by key on the consumer path, and its reuse recorded by key.
 #[test]
 fn a_chunk_in_an_applied_segment_is_deduplicated() {
     let mem: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
@@ -123,7 +123,7 @@ fn a_chunk_in_an_applied_segment_is_deduplicated() {
         .unwrap(),
         (a, size, false)
     );
-    assert_eq!(repo.delta_refcount_bump(&a), 1);
+    assert!(repo.delta_reuses(&a));
     commit(&mut repo, "s2");
     assert_eq!(
         mem.list("packs/").unwrap().len(),

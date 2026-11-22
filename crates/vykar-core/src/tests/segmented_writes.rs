@@ -174,8 +174,7 @@ fn find(dir: &Path, name: &str) -> PathBuf {
     walk(dir, name).unwrap_or_else(|| panic!("{name} not found below {}", dir.display()))
 }
 
-/// Entries without their refcounts: a repair writes multiplicity counts,
-/// every other writer 1 (05 step 8), and nothing decides on them.
+/// The entries, sorted, as strings.
 fn sorted_entries(index: &impl crate::testutil::EntryIter) -> Vec<String> {
     let mut v: Vec<String> = index
         .entry_vec()
@@ -193,7 +192,7 @@ fn cold_index(fx: &Fixture, name: &str) -> Vec<String> {
 }
 
 /// Every backup that stores new chunks appends one backup segment of new
-/// entries at refcount 1 and uploads nothing else to `index.d/` (a small
+/// entries and uploads nothing else to `index.d/` (a small
 /// index stays below the fold limits); a backup that stores nothing new
 /// writes no index object and no head (BK-1). Clients with and without a
 /// local cache read the same index, and the snapshots restore.
@@ -454,7 +453,7 @@ fn reader_on_a_pre_fold_head_recovers_through_production_folds() {
 }
 
 /// An index edit that writes a segment: removes the first entry, or puts
-/// back the one `toggled` holds (a refcount change alone writes nothing).
+/// back the one `toggled` holds.
 pub(crate) fn toggle_an_entry(
     repo: &mut Repository,
     toggled: &mut Option<(
@@ -654,7 +653,10 @@ fn repair_rebuilds_a_broken_chain_from_the_packs() {
     assert!(shown.uncovered_packs.is_empty());
     assert!(!shown.has_data_loss, "{:?}", shown.actions);
     assert!(
-        matches!(shown.actions.as_slice(), [RepairAction::RebuildRefcounts]),
+        matches!(
+            shown.actions.as_slice(),
+            [RepairAction::RemoveUnreferencedEntries]
+        ),
         "{:?}",
         shown.actions
     );
@@ -1451,9 +1453,8 @@ fn loaded_after_two_backups() -> (Fixture, PathBuf, Repository, IndexHead) {
     (fx, dir, repo, first)
 }
 
-/// An index edit that writes a segment (a refcount change alone writes
-/// nothing: refcounts are not persisted).
-fn bump_one_refcount(repo: &mut Repository) {
+/// An index edit that writes a segment: removes one entry.
+fn remove_one_entry(repo: &mut Repository) {
     let id = repo.chunk_index().iter().next().unwrap().0;
     repo.chunk_index_mut().remove(&id);
 }
@@ -1483,7 +1484,7 @@ fn a_write_appends_a_segment_and_rewrites_no_local_file() {
     let objects = fx.index_objects();
     let files = local_files(&dir);
 
-    bump_one_refcount(&mut repo);
+    remove_one_entry(&mut repo);
     repo.save_state().unwrap();
 
     let head = repo.index_head().cloned().unwrap();
@@ -1512,7 +1513,7 @@ fn a_write_does_not_need_the_local_files() {
             }
         }
 
-        bump_one_refcount(&mut repo);
+        remove_one_entry(&mut repo);
         repo.save_state().unwrap();
 
         let head = fx.head();
@@ -1535,7 +1536,7 @@ fn a_write_after_another_writer_moved_the_head_is_refused() {
     let moved = fx.head();
     assert_ne!(moved, before);
 
-    bump_one_refcount(&mut repo);
+    remove_one_entry(&mut repo);
     let err = repo.save_state().unwrap_err().to_string();
     assert!(err.contains("index changed on storage"), "{err}");
     assert_eq!(fx.head(), moved);
@@ -1779,7 +1780,7 @@ fn rerun_after_a_failed_rebuild_write_succeeds() {
             ..
         }
     ));
-    bump_one_refcount(&mut repo);
+    remove_one_entry(&mut repo);
     repo.request_index_fold();
     assert!(repo.save_state().is_err());
     drop(repo);

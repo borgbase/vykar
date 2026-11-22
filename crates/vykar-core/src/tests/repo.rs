@@ -91,9 +91,9 @@ fn store_chunk_dedup() {
     // A session's chunks are in the index once it is saved.
     repo.save_state().unwrap();
 
-    // Reuse is not counted: refcount stays 1.
-    let entry = repo.chunk_index().get(&id1).unwrap();
-    assert_eq!(entry.refcount, 1);
+    // The chunk is in the index once.
+    assert!(repo.chunk_index().contains(&id1));
+    assert_eq!(repo.chunk_index().len(), 1);
 }
 
 #[test]
@@ -300,7 +300,7 @@ fn empty_session_writes_no_index() {
 
     assert_eq!(repo.chunk_index().len(), 1);
     let entry_after = repo.chunk_index().get(&id_a).unwrap();
-    assert_eq!(entry_before.refcount, entry_after.refcount);
+    assert_eq!(entry_before, entry_after);
 
     // No index write should have occurred (delta was empty)
     let entries = log.entries();
@@ -377,9 +377,11 @@ fn index_delta_is_empty() {
     let empty = IndexDelta::new();
     assert!(empty.is_empty());
 
-    let mut with_bump = IndexDelta::new();
-    with_bump.bump_refcount(&vykar_types::chunk_id::ChunkId::from_bytes([0xAA; 32]));
-    assert!(!with_bump.is_empty());
+    let mut with_reuse = IndexDelta::new();
+    with_reuse
+        .reused
+        .insert_key(&vykar_types::chunk_id::ChunkId::from_bytes([0xAA; 32]));
+    assert!(!with_reuse.is_empty());
 }
 
 /// Compute the file cache path the same way `FileCache::cache_path` does.

@@ -34,8 +34,9 @@ pub const MAX_BLOBS_PER_PACK: usize = 10_000;
 /// from sitting in memory indefinitely during long backups.
 pub const PACK_MAX_AGE_SECS: u64 = 300;
 
-/// Tuple describing one chunk's location and refcount in a sealed/flushed pack.
-pub type PackedChunkEntry = (ChunkId, u32, u64, u32);
+/// One chunk's location in a sealed or flushed pack:
+/// `(chunk_id, stored_size, offset)`.
+pub type PackedChunkEntry = (ChunkId, u32, u64);
 
 /// Result of flushing a pack to storage: (pack_id, chunk entries).
 pub type FlushedPackResult = (PackId, Vec<PackedChunkEntry>);
@@ -168,8 +169,8 @@ pub struct PackWriter {
     /// Lightweight metadata per blob (no data — data lives in the buffer).
     blob_meta: Vec<BlobMeta>,
     current_size: usize,
-    /// chunk_id -> (stored_size, refcount) for pending (not-yet-flushed) blobs.
-    pending: HashMap<ChunkId, (u32, u32)>,
+    /// chunk_id -> stored_size for pending (not-yet-flushed) blobs.
+    pending: HashMap<ChunkId, u32>,
     /// When the first blob was added to the current buffer.
     first_blob_time: Option<Instant>,
     /// What the trailer says this pack holds.
@@ -314,7 +315,7 @@ impl PackWriter {
         if self.first_blob_time.is_none() {
             self.first_blob_time = Some(Instant::now());
         }
-        self.pending.insert(chunk_id, (blob_len, 1));
+        self.pending.insert(chunk_id, blob_len);
         self.blob_meta.push(BlobMeta {
             chunk_id,
             stored_size: blob_len,
@@ -328,16 +329,9 @@ impl PackWriter {
         self.pending.contains_key(chunk_id)
     }
 
-    /// Increment refcount for a pending chunk (dedup hit within the same pack).
-    pub fn increment_pending(&mut self, chunk_id: &ChunkId) {
-        if let Some(entry) = self.pending.get_mut(chunk_id) {
-            entry.1 += 1;
-        }
-    }
-
     /// Get stored size for a pending chunk.
     pub fn get_pending_stored_size(&self, chunk_id: &ChunkId) -> Option<u32> {
-        self.pending.get(chunk_id).map(|(size, _)| *size)
+        self.pending.get(chunk_id).copied()
     }
 
     /// Whether the current buffer should be flushed.
@@ -414,8 +408,7 @@ impl PackWriter {
             let offset = running_offset as u64 + 4;
             running_offset += 4 + meta.stored_size as usize;
 
-            let refcount = self.pending.get(&meta.chunk_id).map_or(1, |(_, rc)| *rc);
-            results.push((meta.chunk_id, meta.stored_size, offset, refcount));
+            results.push((meta.chunk_id, meta.stored_size, offset));
         }
 
         let trailer = PackTrailer::for_blobs(
@@ -492,7 +485,7 @@ impl PackWriter {
 
     /// Flush the buffered blobs into a pack file (seal + upload), the
     /// trailer encrypted with `crypto`.
-    /// Returns (pack_id, vec of (chunk_id, stored_size, offset, refcount)).
+    /// Returns (pack_id, vec of (chunk_id, stored_size, offset)).
     pub fn flush(
         &mut self,
         storage: &dyn StorageBackend,

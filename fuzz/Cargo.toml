@@ -73,11 +73,6 @@ path = "fuzz_targets/fuzz_unpack_object.rs"
 doc = false
 
 [[bin]]
-name = "fuzz_index_segment"
-path = "fuzz_targets/fuzz_index_segment.rs"
-doc = false
-
-[[bin]]
 name = "fuzz_index_head"
 path = "fuzz_targets/fuzz_index_head.rs"
 doc = false
@@ -98,23 +93,8 @@ path = "fuzz_targets/fuzz_sweep_record.rs"
 doc = false
 
 [[bin]]
-name = "fuzz_index_base"
-path = "fuzz_targets/fuzz_index_base.rs"
-doc = false
-
-[[bin]]
-name = "fuzz_index_apply"
-path = "fuzz_targets/fuzz_index_apply.rs"
-doc = false
-
-[[bin]]
 name = "fuzz_index_object"
 path = "fuzz_targets/fuzz_index_object.rs"
-doc = false
-
-[[bin]]
-name = "fuzz_full_index_cache"
-path = "fuzz_targets/fuzz_full_index_cache.rs"
 doc = false
 
 [[bin]]

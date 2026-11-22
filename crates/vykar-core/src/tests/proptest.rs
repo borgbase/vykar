@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use proptest::prelude::*;
 
-use crate::index::{ChunkIndex, ChunkIndexEntry, IndexBlob};
+use crate::index::{IndexBlob, LegacyChunkIndex, LegacyIndexEntry};
 use crate::repo::format::{
     ObjectType, pack_object_streaming_with_context, unpack_object_expect_with_context_into,
 };
@@ -258,7 +258,7 @@ proptest! {
 }
 
 // ---------------------------------------------------------------------------
-// Step 4b: ChunkIndex serde round-trip
+// Step 4b: legacy index blob round-trip (the v2/v3 wire format)
 // ---------------------------------------------------------------------------
 
 fn arb_pack_id() -> impl Strategy<Value = PackId> {
@@ -268,23 +268,23 @@ fn arb_pack_id() -> impl Strategy<Value = PackId> {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(1000))]
     #[test]
-    fn chunk_index_serde_roundtrip(
+    fn legacy_index_blob_serde_roundtrip(
         entries in prop::collection::hash_map(
             prop::array::uniform32(any::<u8>()).prop_map(ChunkId::from_bytes),
-            (1..100u32, 1..16_777_216u32, arb_pack_id(), 0..u32::MAX as u64)
-                .prop_map(|(rc, ss, pid, po)| (rc, ChunkIndexEntry { refcount: 1, stored_size: ss, pack_id: pid, pack_offset: po })),
+            (0..100u32, 1..16_777_216u32, arb_pack_id(), 0..u32::MAX as u64)
+                .prop_map(|(refcount, stored_size, pack_id, pack_offset)| LegacyIndexEntry {
+                    refcount,
+                    stored_size,
+                    pack_id,
+                    pack_offset,
+                }),
             0..200,
         ),
         generation in any::<u64>(),
     ) {
-        let mut index = ChunkIndex::new();
-        for (id, (target_rc, entry)) in &entries {
-            // add() sets refcount=1 and records the location
-            index.add(*id, entry.stored_size, entry.pack_id, entry.pack_offset);
-            // Bump refcount to match the target
-            for _ in 1..*target_rc {
-                index.increment_refcount(id);
-            }
+        let mut index = LegacyChunkIndex::new();
+        for (id, entry) in &entries {
+            index.insert(*id, *entry);
         }
 
         let blob = IndexBlob { generation, chunks: index };
@@ -292,12 +292,9 @@ proptest! {
         let decoded: IndexBlob = rmp_serde::from_slice(&bytes).unwrap();
 
         prop_assert_eq!(decoded.generation, generation);
-        for (id, (target_rc, entry)) in &entries {
-            let actual = decoded.chunks.get(id).unwrap();
-            prop_assert_eq!(actual.refcount, *target_rc);
-            prop_assert_eq!(actual.stored_size, entry.stored_size);
-            prop_assert_eq!(actual.pack_id, entry.pack_id);
-            prop_assert_eq!(actual.pack_offset, entry.pack_offset);
+        prop_assert_eq!(decoded.chunks.len(), entries.len());
+        for (id, entry) in &entries {
+            prop_assert_eq!(decoded.chunks.get(id), Some(entry));
         }
     }
 }
@@ -589,190 +586,61 @@ mod compression {
 
 #[cfg(test)]
 mod index_delta {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     use proptest::prelude::*;
-    use proptest::strategy::ValueTree;
 
-    use crate::index::{ChunkIndex, IndexDelta, NewChunkEntry};
+    use crate::index::{IndexDelta, NewChunkEntry};
     use vykar_types::chunk_id::ChunkId;
 
     use super::{arb_chunk_id, arb_pack_id};
 
     fn arb_new_chunk_entry(chunk_id: ChunkId) -> impl Strategy<Value = NewChunkEntry> {
-        (1..100u32, arb_pack_id(), 0..u32::MAX as u64, 1..5u32).prop_map(
-            move |(stored_size, pack_id, pack_offset, refcount)| NewChunkEntry {
+        (1..100u32, arb_pack_id(), 0..u32::MAX as u64).prop_map(
+            move |(stored_size, pack_id, pack_offset)| NewChunkEntry {
                 chunk_id,
                 stored_size,
                 pack_id,
                 pack_offset,
-                refcount,
             },
         )
     }
 
-    /// Generate a fresh ChunkIndex with 0..30 entries, refcount 1..5 each.
-    fn arb_fresh_index() -> impl Strategy<Value = (ChunkIndex, Vec<(ChunkId, u32)>)> {
-        prop::collection::vec(
-            (
-                arb_chunk_id(),
-                1..5u32,
-                1..16_777_216u32,
-                arb_pack_id(),
-                0..u32::MAX as u64,
-            ),
-            0..30,
-        )
-        .prop_map(|entries| {
-            let mut index = ChunkIndex::new();
-            let mut id_rcs = Vec::new();
-            for (id, rc, stored_size, pack_id, pack_offset) in entries {
-                if index.contains(&id) {
-                    continue; // skip duplicates
-                }
-                index.add(id, stored_size, pack_id, pack_offset);
-                for _ in 1..rc {
-                    index.increment_refcount(&id);
-                }
-                id_rcs.push((id, rc));
-            }
-            (index, id_rcs)
-        })
-    }
-
-    /// Generate an IndexDelta with new_entries that may contain duplicate chunk_ids,
-    /// plus refcount_bumps targeting a subset of those new_entry IDs.
-    fn arb_index_delta_standalone()
-    -> impl Strategy<Value = (IndexDelta, Vec<NewChunkEntry>, HashMap<ChunkId, u32>)> {
+    /// An IndexDelta with new_entries that may contain duplicate chunk_ids,
+    /// plus reuse of a subset of those IDs and of other chunks.
+    fn arb_index_delta_standalone() -> impl Strategy<Value = (IndexDelta, Vec<NewChunkEntry>)> {
         prop::collection::vec(arb_chunk_id().prop_flat_map(arb_new_chunk_entry), 1..30)
             .prop_flat_map(|entries| {
                 let ids: Vec<ChunkId> = entries.iter().map(|e| e.chunk_id).collect();
                 let entries_clone = entries.clone();
-                let bumps = prop::collection::hash_map(
-                    (0..ids.len()).prop_map(move |idx| ids[idx % ids.len()]),
-                    1..5u32,
+                let reused = prop::collection::vec(
+                    prop_oneof![
+                        (0..ids.len()).prop_map(move |idx| ids[idx % ids.len()]),
+                        arb_chunk_id(),
+                    ],
                     0..10,
                 );
-                bumps.prop_map(move |bump_map| {
-                    let delta = IndexDelta {
-                        new_entries: entries_clone.clone(),
-                        refcount_bumps: bump_map.clone(),
-                        cached_bumps: None,
-                        pack_trailers: HashMap::new(),
-                        undo_log: None,
-                    };
-                    (delta, entries_clone.clone(), bump_map)
+                reused.prop_map(move |reused| {
+                    let mut delta = IndexDelta::new();
+                    delta.new_entries = entries_clone.clone();
+                    for id in &reused {
+                        delta.reused.insert_key(id);
+                    }
+                    (delta, entries_clone.clone())
                 })
             })
-    }
-
-    /// Generate an IndexDelta with intentional overlaps against fresh_ids.
-    fn arb_index_delta_with_overlaps(
-        fresh_ids: Vec<(ChunkId, u32)>,
-    ) -> impl Strategy<Value = (IndexDelta, Vec<NewChunkEntry>, HashMap<ChunkId, u32>)> {
-        let fresh_ids_for_overlap = fresh_ids.clone();
-        let fresh_ids_for_bumps = fresh_ids;
-
-        // Non-overlapping new entries (fresh IDs that don't exist in fresh index)
-        let non_overlap =
-            prop::collection::vec(arb_chunk_id().prop_flat_map(arb_new_chunk_entry), 0..10);
-
-        // Overlapping new entries (subset of fresh_ids)
-        let overlap = if fresh_ids_for_overlap.is_empty() {
-            Just(vec![]).boxed()
-        } else {
-            prop::collection::vec(
-                (
-                    0..fresh_ids_for_overlap.len(),
-                    1..5u32,
-                    arb_pack_id(),
-                    0..u32::MAX as u64,
-                )
-                    .prop_map(move |(idx, refcount, pack_id, pack_offset)| {
-                        let idx = idx % fresh_ids_for_overlap.len();
-                        NewChunkEntry {
-                            chunk_id: fresh_ids_for_overlap[idx].0,
-                            stored_size: 1024,
-                            pack_id,
-                            pack_offset,
-                            refcount,
-                        }
-                    }),
-                0..10,
-            )
-            .boxed()
-        };
-
-        // Bumps targeting fresh-index IDs
-        let fresh_bumps = if fresh_ids_for_bumps.is_empty() {
-            Just(HashMap::new()).boxed()
-        } else {
-            prop::collection::hash_map(
-                (0..fresh_ids_for_bumps.len()).prop_map(move |idx| {
-                    let idx = idx % fresh_ids_for_bumps.len();
-                    fresh_ids_for_bumps[idx].0
-                }),
-                1..5u32,
-                0..5,
-            )
-            .boxed()
-        };
-
-        (non_overlap, overlap, fresh_bumps).prop_flat_map(
-            |(non_overlap_entries, overlap_entries, fresh_bumps)| {
-                let mut all_new_entries = non_overlap_entries.clone();
-                all_new_entries.extend(overlap_entries.clone());
-                let all_entries_clone = all_new_entries.clone();
-
-                // Collect IDs of genuinely new entries (non-overlap) for session-new bumps
-                let non_overlap_ids: Vec<ChunkId> =
-                    non_overlap_entries.iter().map(|e| e.chunk_id).collect();
-
-                let session_bumps = if non_overlap_ids.is_empty() {
-                    Just(HashMap::new()).boxed()
-                } else {
-                    prop::collection::hash_map(
-                        (0..non_overlap_ids.len())
-                            .prop_map(move |idx| non_overlap_ids[idx % non_overlap_ids.len()]),
-                        1..5u32,
-                        0..5,
-                    )
-                    .boxed()
-                };
-
-                (
-                    Just(all_entries_clone),
-                    Just(fresh_bumps.clone()),
-                    session_bumps,
-                )
-                    .prop_map(move |(new_entries, fb, sb)| {
-                        let mut combined_bumps = fb;
-                        for (id, count) in &sb {
-                            *combined_bumps.entry(*id).or_insert(0) += count;
-                        }
-                        let delta = IndexDelta {
-                            new_entries: new_entries.clone(),
-                            refcount_bumps: combined_bumps.clone(),
-                            cached_bumps: None,
-                            pack_trailers: HashMap::new(),
-                            undo_log: None,
-                        };
-                        (delta, new_entries, combined_bumps)
-                    })
-            },
-        )
     }
 
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(500))]
 
         /// After applying a delta with possibly-duplicate chunk_ids and
-        /// refcount_bumps to an empty index, every new chunk is present once,
-        /// at refcount 1 and at its first entry's location: bumps are not
-        /// persisted (05 step 8).
+        /// reuse to an empty index, every new chunk is present once, at its
+        /// first entry's location, and nothing else is: reuse is not
+        /// persisted.
         #[test]
         fn apply_to_adds_each_new_chunk_once(
-            (delta, entries, _bumps) in arb_index_delta_standalone(),
+            (delta, entries) in arb_index_delta_standalone(),
         ) {
             let mut index = crate::index::LiveIndex::empty();
             delta.apply_to(&mut index);
@@ -784,114 +652,42 @@ mod index_delta {
             prop_assert_eq!(index.len(), first.len());
             for (id, entry) in &first {
                 let actual = index.get(id).unwrap();
-                prop_assert_eq!(actual.refcount, 1);
                 prop_assert_eq!(actual.pack_id, entry.pack_id);
                 prop_assert_eq!(actual.pack_offset, entry.pack_offset);
             }
         }
 
-        /// Undo-log rollback is equivalent to snapshotting the map by clone:
-        /// checkpoint → arbitrary in-scope bumps → rollback restores exactly the
-        /// map (and new_entries length) captured at checkpoint time.
+        /// Journal rollback is equivalent to snapshotting the reused set by
+        /// clone: checkpoint → arbitrary in-scope reuse → rollback restores
+        /// exactly the set (and new_entries length) captured at checkpoint
+        /// time.
         #[test]
         fn checkpoint_rollback_equivalent_to_clone(
-            (mut delta, _entries, _bumps) in arb_index_delta_standalone(),
-            in_scope_bumps in prop::collection::vec(arb_chunk_id(), 0..40),
+            (mut delta, _entries) in arb_index_delta_standalone(),
+            in_scope_reuse in prop::collection::vec(arb_chunk_id(), 0..40),
             extra_entry_id in arb_chunk_id(),
         ) {
+            let set = |d: &IndexDelta| -> HashSet<ChunkId> { d.reused.iter().collect() };
             // Model: what a clone-based checkpoint would restore.
-            let expected_bumps = delta.refcount_bumps.clone();
+            let expected_reused = set(&delta);
             let expected_new_len = delta.new_entries.len();
 
             let cp = delta.checkpoint();
 
-            // Arbitrary in-scope mutations: bumps (some overlapping pre-checkpoint
-            // keys, some brand new) plus a new entry.
-            for id in &in_scope_bumps {
-                delta.bump_refcount(id);
+            // Arbitrary in-scope mutations: reuse (some overlapping
+            // pre-checkpoint keys, some brand new) plus a new entry.
+            let pre: Vec<ChunkId> = expected_reused.iter().copied().collect();
+            for id in in_scope_reuse.iter().chain(pre.iter()) {
+                delta.reused.insert_key(id);
             }
             let pack_id = vykar_types::pack_id::PackId::from_bytes([0u8; 32]);
-            delta.add_new_entry(extra_entry_id, 100, pack_id, 0, 1);
+            delta.add_new_entry(extra_entry_id, 100, pack_id, 0);
 
             delta.rollback(cp);
 
             prop_assert_eq!(delta.new_entries.len(), expected_new_len);
-            prop_assert_eq!(&delta.refcount_bumps, &expected_bumps);
-            prop_assert!(delta.undo_log.is_none());
-        }
-
-        /// After reconcile + apply_to with intentional overlaps, the fresh
-        /// entries keep their refcounts and every other new chunk is added at
-        /// 1: overlaps and bumps are not counted (05 step 8).
-        #[test]
-        fn reconcile_then_apply_to_final_refcounts(
-            (fresh_index, fresh_ids) in arb_fresh_index(),
-            seed in any::<u64>(),
-        ) {
-            // Use fresh_ids to generate the delta with overlaps.
-            // We need a second proptest layer, so we use a TestRunner with the seed.
-            let mut runner = proptest::test_runner::TestRunner::new_with_rng(
-                proptest::test_runner::Config::default(),
-                proptest::test_runner::TestRng::from_seed(
-                    proptest::test_runner::RngAlgorithm::default(),
-                    &seed.to_le_bytes().repeat(4),  // 32-byte seed
-                ),
-            );
-
-            let delta_strategy = arb_index_delta_with_overlaps(fresh_ids.clone());
-            let delta_tree = delta_strategy.new_tree(&mut runner).unwrap();
-            let (delta, new_entries, pre_reconcile_bumps) = delta_tree.current();
-
-            // Track which new_entry chunk_ids overlap with fresh index
-            let fresh_id_set: HashMap<ChunkId, u32> =
-                fresh_ids.iter().cloned().collect();
-
-            // Expected refcounts after reconcile + apply_to:
-            let mut expected: HashMap<ChunkId, u32> = HashMap::new();
-
-            // Start with fresh index refcounts
-            for (id, rc) in &fresh_ids {
-                expected.insert(*id, *rc);
-            }
-
-            // Process new_entries: overlapping ones become bumps during reconcile,
-            // non-overlapping ones get added with aggregated refcounts.
-            let mut overlap_bumps: HashMap<ChunkId, u32> = HashMap::new();
-            let mut non_overlap_entries: Vec<&NewChunkEntry> = Vec::new();
-
-            for entry in &new_entries {
-                if fresh_id_set.contains_key(&entry.chunk_id) {
-                    *overlap_bumps.entry(entry.chunk_id).or_insert(0) += entry.refcount;
-                } else {
-                    non_overlap_entries.push(entry);
-                }
-            }
-
-            // Overlapping entries leave the fresh ones as they are.
-            let _ = (&overlap_bumps, &pre_reconcile_bumps);
-
-            // Non-overlapping new entries: once each, at refcount 1.
-            for entry in &non_overlap_entries {
-                expected.entry(entry.chunk_id).or_insert(1);
-            }
-
-            // Actually run reconcile + apply_to
-            let reconciled: IndexDelta = delta.reconcile(&fresh_index).unwrap();
-            let mut index = crate::index::LiveIndex::empty();
-            for (id, e) in fresh_index.iter() {
-                index.add(*id, e.stored_size, e.pack_id, e.pack_offset);
-                index.increment_refcount_by(id, e.refcount.saturating_sub(1));
-            }
-            reconciled.apply_to(&mut index);
-
-            for (id, expected_rc) in &expected {
-                let actual = index.get(id).unwrap();
-                prop_assert_eq!(
-                    actual.refcount, *expected_rc,
-                    "chunk {:?}: expected refcount {}, got {}",
-                    id, expected_rc, actual.refcount,
-                );
-            }
+            prop_assert_eq!(set(&delta), expected_reused);
+            prop_assert!(!delta.reused.is_armed());
         }
     }
 }

@@ -89,7 +89,7 @@ pub(super) fn process_worker_chunks(
     Ok(())
 }
 
-/// Resolve and bump refcounts for cache-hit chunks, update stats, populate item.chunks.
+/// Resolve cache-hit chunks and record their reuse, update stats, populate item.chunks.
 ///
 /// Uses `reuse_cached_chunk_ref` which correctly handles committed, recovered
 /// (with promotion), and pending chunks. Returns an error if any chunk is
@@ -198,13 +198,13 @@ mod tests {
             assert_eq!(stats.original_size, data.len() as u64);
             assert_eq!(stats.compressed_size, 77);
             assert_eq!(stats.deduplicated_size, 0);
-            assert_eq!(repo.delta_refcount_bump(&id), 1);
+            assert!(repo.delta_reuses(&id));
         }
 
         /// BK-2 (worker path): a chunk added by an applied segment is a
         /// data-less hit recorded by key.
         #[test]
-        fn presession_hit_on_an_applied_addition_records_a_keyed_bump() {
+        fn presession_hit_on_an_applied_addition_records_keyed_reuse() {
             let mut repo = test_repo_plaintext();
             let data = b"added by an earlier write".to_vec();
             let (id, size, _) = repo
@@ -231,7 +231,7 @@ mod tests {
             assert_eq!(item.chunks[0].csize, size);
             assert_eq!(stats.deduplicated_size, 0);
             let delta = repo.write_session_delta_for_test();
-            assert_eq!(delta.refcount_bumps.get(&id), Some(&1));
+            assert!(delta.reused.is_keyed(&id));
             repo.flush_packs().unwrap();
         }
 
@@ -255,7 +255,7 @@ mod tests {
             assert!(err.to_string().contains("pre-session dedup hit"), "{err}");
             assert!(item.chunks.is_empty());
             assert_eq!(stats.original_size, 0);
-            assert_eq!(repo.delta_refcount_bump(&id), 0);
+            assert!(!repo.delta_reuses(&id));
         }
 
         /// Filter false positives are packed in the worker; two copies of

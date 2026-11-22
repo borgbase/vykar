@@ -129,7 +129,7 @@ fn init_writes_an_empty_head_and_no_sidecar() {
 fn open_lists_snapshots_before_the_single_head_get() {
     let env = init(RepoFormat::CURRENT, EncryptionMode::None);
     let mut w = env.writer();
-    w.commit(&index_with(0..20, 0));
+    w.commit(&index_with(0..20));
     for opts in [OpenOptions::new(), OpenOptions::new().with_index()] {
         let (repo, ops) = env.open_logged(opts);
         let pos = |op: &str| {
@@ -157,10 +157,10 @@ fn open_lists_snapshots_before_the_single_head_get() {
 fn snapshot_reader_loads_the_head_captured_at_open() {
     let env = init(RepoFormat::CURRENT, EncryptionMode::None);
     let mut writer = env.writer();
-    let opened_index = index_with(0..20, 0);
+    let opened_index = index_with(0..20);
     writer.commit(&opened_index);
     let (mut repo, _) = env.open_logged(OpenOptions::new());
-    writer.commit(&index_with(0..30, 0));
+    writer.commit(&index_with(0..30));
 
     let ops = Arc::new(Mutex::new(Vec::new()));
     repo.storage = Arc::new(OpLog {
@@ -187,9 +187,9 @@ fn open_with_index_loads_and_catches_up_the_local_cache() {
     ] {
         let env = init(format, EncryptionMode::None);
         let mut w = env.writer();
-        w.commit(&index_with(0..100, 0));
+        w.commit(&index_with(0..100));
         w.fold();
-        let s2 = index_with(50..150, 1);
+        let s2 = index_with(50..150);
         w.commit(&s2);
 
         let (repo, ops) = env.open_logged(OpenOptions::new().with_index());
@@ -207,18 +207,18 @@ fn open_with_index_loads_and_catches_up_the_local_cache() {
         assert_eq!(entries(repo.chunk_index()), entries(&s2));
         assert_eq!(index_d_gets(&ops), 0);
 
-        let s3 = index_with(60..170, 2);
+        let s3 = index_with(60..170);
         w.commit(&s3);
         let (mut repo, ops) = env.open_logged(OpenOptions::new().with_index());
         assert_eq!(entries(repo.chunk_index()), entries(&s3));
         assert_eq!(index_d_gets(&ops), 1, "only the new segment");
 
         // Lazy load and the maintenance load see later heads too.
-        let s4 = index_with(70..180, 3);
+        let s4 = index_with(70..180);
         w.commit(&s4);
         repo.load_chunk_index().unwrap();
         assert_eq!(entries(repo.chunk_index()), entries(&s4));
-        let s5 = index_with(80..190, 4);
+        let s5 = index_with(80..190);
         w.commit(&s5);
         repo.load_chunk_index_under_lock().unwrap();
         assert_eq!(entries(repo.chunk_index()), entries(&s5));
@@ -233,9 +233,9 @@ fn open_with_index_loads_and_catches_up_the_local_cache() {
 fn uncached_and_static_loads_fetch_the_whole_chain() {
     let env = init(RepoFormat::CURRENT, EncryptionMode::None);
     let mut w = env.writer();
-    w.commit(&index_with(0..30, 0));
+    w.commit(&index_with(0..30));
     w.fold();
-    let s2 = index_with(10..40, 1);
+    let s2 = index_with(10..40);
     w.commit(&s2);
     let (_, _) = env.open_logged(OpenOptions::new().with_index());
 
@@ -265,7 +265,7 @@ fn uncached_and_static_loads_fetch_the_whole_chain() {
 fn an_object_at_index_is_ignored() {
     let env = init(RepoFormat::CURRENT, EncryptionMode::None);
     let legacy = crate::tests::helpers::legacy_index_blob(
-        &crate::index::ChunkIndex::new(),
+        &crate::index::LegacyChunkIndex::new(),
         7,
         env.repo.crypto.as_ref(),
     );
@@ -309,7 +309,7 @@ fn prove_key_accepts_an_index_head() {
 
     // Encrypted repositories read the segmented index as well.
     let mut w = env.writer();
-    let s1 = index_with(0..25, 0);
+    let s1 = index_with(0..25);
     w.commit(&s1);
     w.fold();
     let (repo, _) = env.open_logged(OpenOptions::new().with_index());

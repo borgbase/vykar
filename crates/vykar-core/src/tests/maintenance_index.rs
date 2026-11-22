@@ -554,8 +554,7 @@ fn lock_lost_before_save_leaves_caches_untouched() {
         let mut repo = env.open(env.local(), OpenOptions::new());
         let result = with_maintenance_lock(&mut repo, |repo| {
             repo.load_chunk_index_under_lock()?;
-            let first = repo.chunk_index().iter().next().unwrap().0;
-            repo.chunk_index_mut().increment_refcount(&first);
+            repo.mark_index_dirty();
             repo.request_index_fold();
             for key in repo.storage.list("locks/").unwrap() {
                 if key.ends_with(".json") {
@@ -580,12 +579,10 @@ fn lock_lost_before_save_leaves_caches_untouched() {
 }
 
 /// Persists the index as a fold (a new base and head); call under the
-/// maintenance lock. (A refcount change alone writes nothing: refcounts are
-/// not persisted.)
-fn bump_and_save(repo: &mut Repository) -> Result<()> {
+/// maintenance lock.
+fn fold_and_save(repo: &mut Repository) -> Result<()> {
     repo.load_chunk_index_under_lock()?;
-    let first = repo.chunk_index().iter().next().unwrap().0;
-    repo.chunk_index_mut().increment_refcount(&first);
+    repo.mark_index_dirty();
     repo.request_index_fold();
     repo.save_state()
 }
@@ -598,13 +595,13 @@ fn delete_locks(repo: &Repository) {
     }
 }
 
-/// Persists a refcount change under the maintenance lock, then loses the
+/// Persists a fold under the maintenance lock, then loses the
 /// lock before the action returns. Returns the generation before and after.
 fn save_then_lose_lock(env: &Env) -> (u64, u64) {
     let before = env.open_fresh().index_generation();
     let mut repo = env.open(env.local(), OpenOptions::new());
     with_maintenance_lock(&mut repo, |repo| {
-        bump_and_save(repo)?;
+        fold_and_save(repo)?;
         delete_locks(repo);
         Ok(())
     })
@@ -632,11 +629,11 @@ fn lock_lost_after_save_still_installs_the_table_segmented() {
 fn save_then_get_taken_over(env: &Env) -> IndexHead {
     let mut repo = env.open(env.local(), OpenOptions::new());
     let ours = with_maintenance_lock(&mut repo, |repo| {
-        bump_and_save(repo)?;
+        fold_and_save(repo)?;
         let ours = repo.index_head().unwrap().clone();
         delete_locks(repo);
         let mut other = env.open(env.local(), OpenOptions::new());
-        with_maintenance_lock(&mut other, bump_and_save)?;
+        with_maintenance_lock(&mut other, fold_and_save)?;
         Ok(ours)
     })
     .unwrap();
@@ -688,7 +685,7 @@ fn assert_present(env: &Env, chunks: &HashMap<ChunkId, ChunkIndexEntry>) {
     for (id, entry) in chunks {
         let found = after.get(id).unwrap_or_else(|| panic!("chunk {id} lost"));
         assert_eq!(found.pack_id, entry.pack_id, "chunk {id}");
-        assert_eq!(found.refcount, entry.refcount, "chunk {id}");
+        assert_eq!(found.pack_offset, entry.pack_offset, "chunk {id}");
     }
 }
 

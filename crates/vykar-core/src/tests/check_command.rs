@@ -421,7 +421,6 @@ fn test_server_fallback_no_stale_errors() {
     let pack_id = PackId::from_bytes([0u8; 32]);
     let chunk_id = ChunkId::from_bytes([1u8; 32]);
     let entry = ChunkIndexEntry {
-        refcount: 1,
         stored_size: 100,
         pack_id,
         pack_offset: 9,
@@ -463,7 +462,6 @@ fn test_verify_pack_full_overflow_offset() {
 
     let chunk_id = ChunkId::from_bytes([1u8; 32]);
     let entry = ChunkIndexEntry {
-        refcount: 1,
         stored_size: 10,
         pack_id,
         pack_offset: u64::MAX,
@@ -503,7 +501,6 @@ fn test_verify_pack_full_overflow_add() {
     let chunk_id = ChunkId::from_bytes([2u8; 32]);
     // offset + stored_size overflows usize on 64-bit: usize::MAX - 5 + 10 overflows
     let entry = ChunkIndexEntry {
-        refcount: 1,
         stored_size: 10,
         pack_id,
         pack_offset: (usize::MAX - 5) as u64,
@@ -990,10 +987,10 @@ fn repair_dry_run_emits_drop_items_from_snapshot() {
 }
 
 /// Two snapshots reference distinct file data; dropping items from one must
-/// leave the other's chunks untouched, and refcounts must reflect the
-/// rewritten snapshot's surviving items only.
+/// leave the other's chunks untouched, and the swept index must hold only
+/// what the surviving snapshots reference.
 #[test]
-fn repair_drops_items_rebuilds_refcounts() {
+fn repair_drops_items_and_sweeps_the_index() {
     let tmp = tempfile::tempdir().unwrap();
     let repo_dir = tmp.path().join("repo");
     let source_a = tmp.path().join("source_a");
@@ -1050,18 +1047,20 @@ fn repair_drops_items_rebuilds_refcounts() {
         result
             .applied
             .iter()
-            .any(|a| matches!(a, RepairAction::RebuildRefcounts))
+            .any(|a| matches!(a, RepairAction::RemoveUnreferencedEntries))
     );
 
-    // After repair, every chunk in the index must have refcount > 0; no
-    // ghost entries remain. snap-b's chunks are unchanged.
-    let repo = open_local_repo(&repo_dir);
-    for (_id, entry) in repo.chunk_index().iter() {
-        assert!(
-            entry.refcount > 0,
-            "rebuild_refcounts should leave no zero-refcount entries"
-        );
-    }
+    // After repair, every index entry is referenced by a surviving
+    // snapshot; no ghost entries remain. snap-b's chunks are unchanged.
+    let mut repo = open_local_repo(&repo_dir);
+    let report =
+        crate::commands::compact::report_unreferenced_on_repo(&mut repo, &CancelToken::new())
+            .unwrap();
+    assert!(
+        report.unreferenced.is_empty(),
+        "the repair's sweep should leave no unreferenced entries: {:?}",
+        report.unreferenced
+    );
     // snap-b must still restore byte-identical.
     let dest = tmp.path().join("restored_b");
     std::fs::create_dir_all(&dest).unwrap();

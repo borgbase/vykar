@@ -6,7 +6,7 @@ use crate::config::{
     EncryptionConfig, EncryptionModeConfig, HooksConfig, RepositoryConfig, ResolvedRepo,
     SourceEntry, SourceHooksConfig, VykarConfig,
 };
-use crate::index::{ChunkIndex, IndexBlob};
+use crate::index::{IndexBlob, LegacyChunkIndex};
 use crate::repo::format::{ObjectType, pack_object_streaming_with_context};
 use crate::repo::{OpenOptions, RepoConfig, RepoFormat, Repository};
 use crate::snapshot::SnapshotStats;
@@ -45,7 +45,7 @@ pub fn init_repo(repo_dir: &Path) -> VykarConfig {
 /// The `IndexBlob` a v2/v3 binary writes at `index`: zstd-compressed msgpack,
 /// packed as `ObjectType::ChunkIndex` with context `b"index"`.
 pub(crate) fn legacy_index_blob(
-    index: &ChunkIndex,
+    index: &LegacyChunkIndex,
     generation: u64,
     crypto: &dyn CryptoEngine,
 ) -> Vec<u8> {
@@ -62,12 +62,12 @@ pub(crate) fn legacy_index_blob(
     .unwrap()
 }
 
-/// Turn the v4/v5 repository at `repo_dir` into the v2/v3 repository 0.24
+/// Turn the v6 repository at `repo_dir` into the v2/v3 repository 0.24
 /// writes for the same data: `index` becomes the [`legacy_index_blob`] of its
 /// index, `index.gen` is written, `index.d/` removed, `config` set to the
 /// legacy version, and this repository's local cache directory under
-/// `cache_dir` deleted. Packs and snapshots are identical between v2/v4 and
-/// v3/v5 (see `RepoFormat`). Returns the legacy format.
+/// `cache_dir` deleted. Packs and snapshots are identical between v2 and
+/// v6 with BLAKE2b, and between v3 and v6 with BLAKE3 (see `RepoFormat`). Returns the legacy format.
 pub(crate) fn downgrade_to_legacy(
     repo_dir: &Path,
     passphrase: Option<&str>,
@@ -90,7 +90,7 @@ pub(crate) fn downgrade_to_legacy(
         other => panic!("not a segmented format: {other:?}"),
     };
     let blob = legacy_index_blob(
-        &repo.chunk_index().to_chunk_index(),
+        &(&repo.chunk_index().to_chunk_index()).into(),
         GENERATION,
         repo.crypto.as_ref(),
     );

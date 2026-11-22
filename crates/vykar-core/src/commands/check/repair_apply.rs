@@ -47,7 +47,7 @@ struct PreparedRewrite {
 /// `DropItemsFromSnapshot` action in the plan.
 ///
 /// The publish loop intentionally never returns `?`: a partial publication
-/// must not bypass the trailing whole-snapshot deletes or refcount rebuild
+/// must not bypass the trailing whole-snapshot deletes or index sweep
 /// in [`execute_repair`]. The only fatal case is "old DELETE failed AND
 /// rollback DELETE also failed" — that returns the typed duplicate-blobs
 /// error so the operator can manually intervene.
@@ -94,7 +94,7 @@ fn apply_item_level_rewrites(
 
     if prepared.is_empty() {
         // No work survived preparation — close the session via save_state so
-        // any pending state is consistent. The trailing rebuild handles any
+        // any pending state is consistent. The trailing sweep removes any
         // orphan chunks store_chunk may have produced.
         repo.flush_packs()?;
         repo.save_state()?;
@@ -145,7 +145,7 @@ fn apply_item_level_rewrites(
                         "repair partially applied: snapshot '{}' has duplicate \
                          blobs at IDs {} (old) and {} (new); cannot delete either. \
                          Manual cleanup required, then re-run `vykar check --repair` \
-                         to settle refcounts.",
+                         to sweep the index.",
                         rw.new_entry.name, rw.old_id, rw.new_id
                     )));
                 }
@@ -311,7 +311,7 @@ pub(super) fn execute_repair(
     _pack_chunks: &HashMap<PackId, Vec<(ChunkId, ChunkIndexEntry)>>,
 ) -> Result<(Vec<RepairAction>, Vec<String>)> {
     // Refuse to proceed if any snapshots had transient I/O failures during
-    // the scan — we can't safely rebuild refcounts without enumerating every
+    // the scan — we can't safely sweep the index without enumerating every
     // surviving snapshot's chunks.
     for issue in issues {
         if let IntegrityIssue::SnapshotReadFailed {
@@ -335,9 +335,9 @@ pub(super) fn execute_repair(
     restore_key_copies(repo, plan, &mut applied, &mut repair_errors);
 
     // Step 1: Remove corrupted snapshot blobs from storage.
-    // If any delete fails, abort before refcount rebuild — we cannot enumerate
-    // the corrupt snapshot's chunks, so persisting rebuilt refcounts would drop
-    // live references (matching delete.rs:46 "must succeed" pattern).
+    // If any delete fails, abort before the index sweep — we cannot enumerate
+    // the corrupt snapshot's chunks, so persisting a sweep would drop live
+    // references (matching delete.rs:46 "must succeed" pattern).
     for action in &plan.actions {
         if let RepairAction::RemoveCorruptSnapshot { snapshot_id, name } = action {
             let key = snapshot_id.storage_key();
@@ -352,7 +352,7 @@ pub(super) fn execute_repair(
                 Err(e) => {
                     return Err(VykarError::Other(format!(
                         "aborting repair: failed to remove corrupt snapshot \
-                         {snapshot_id}: {e} (cannot safely rebuild refcounts)"
+                         {snapshot_id}: {e} (cannot safely sweep the index)"
                     )));
                 }
             }
@@ -406,16 +406,16 @@ pub(super) fn execute_repair(
     // Mirrors `Repository::commit_concurrent_session_with_progress`:
     // begin_write_session → store_chunk per surviving item → flush_packs →
     // save_state (persists chunks BEFORE any snapshot blob references them).
-    // Per-action errors are logged and skipped; the trailing rebuild
+    // Per-action errors are logged and skipped; the trailing sweep
     // garbage-collects any orphan chunks. The publish loop deliberately
     // never short-circuits with `?`: a failed PUT/DELETE must not bypass
-    // Step 5 (whole-snapshot deletes) or Step 6 (refcount rebuild).
+    // Step 5 (whole-snapshot deletes) or Step 6 (the index sweep).
     apply_item_level_rewrites(repo, plan, &mut applied, &mut repair_errors)?;
 
     // Step 5: Delete doomed snapshot blobs FIRST (safe ordering: delete
-    // commit-point before adjusting refcounts, matching delete.rs:46-58).
-    // Only successfully-deleted doomed snapshots are excluded from refcount
-    // rebuild — if a delete fails, the snapshot's chunks must remain counted.
+    // commit-point before sweeping the index, matching delete.rs:46-58).
+    // Only successfully-deleted doomed snapshots are excluded from the
+    // sweep's mark — if a delete fails, the snapshot's chunks must stay.
     let mut successfully_deleted_doomed: HashSet<String> = HashSet::new();
     for action in &plan.actions {
         if let RepairAction::RemoveDanglingSnapshot { snapshot_name, .. } = action
@@ -437,8 +437,9 @@ pub(super) fn execute_repair(
         }
     }
 
-    // Step 6: Rebuild refcounts from all surviving snapshots (excludes only
-    // snapshots whose blobs were actually deleted above).
+    // Step 6: Sweep the index: mark from all surviving snapshots (excludes
+    // only snapshots whose blobs were actually deleted above) and remove
+    // every entry the mark does not reach.
     let doomed_names: HashSet<&str> = successfully_deleted_doomed
         .iter()
         .map(|s| s.as_str())
@@ -452,8 +453,8 @@ pub(super) fn execute_repair(
         .cloned()
         .collect();
 
-    // Every surviving snapshot must be counted: a snapshot left out would
-    // have its references dropped when the rebuilt counts are persisted.
+    // Every surviving snapshot must be marked: a snapshot left out would
+    // have its references dropped by the sweep.
     let mut names: Vec<String> = Vec::with_capacity(surviving_entries.len());
     let mut ptr_lists: Vec<Vec<ChunkId>> = Vec::with_capacity(surviving_entries.len());
     for entry in &surviving_entries {
@@ -461,8 +462,8 @@ pub(super) fn execute_repair(
             Ok(m) => m,
             Err(e) => {
                 return Err(VykarError::Other(format!(
-                    "aborting repair: cannot load snapshot '{}' during refcount \
-                     rebuild: {e} (persisting would drop live references)",
+                    "aborting repair: cannot load snapshot '{}' while sweeping \
+                     the index: {e} (sweeping would drop live references)",
                     entry.name
                 )));
             }
@@ -471,11 +472,10 @@ pub(super) fn execute_repair(
         ptr_lists.push(meta.item_ptrs);
     }
 
-    // Decoded once per distinct tree chunk; counts are multiplied by how
-    // often each tree chunk occurs. Tree chunks come from storage, never the
-    // local cache. A data reference missing from the index is skipped; a
-    // tree pointer missing from the index or unreadable aborts.
-    let new_refcounts: HashMap<ChunkId, u32> = {
+    // Decoded once per distinct tree chunk. Tree chunks come from storage,
+    // never the local cache. A data reference missing from the index is
+    // skipped; a tree pointer missing from the index or unreadable aborts.
+    let unreferenced: Vec<ChunkId> = {
         let ptrs: Vec<&[ChunkId]> = ptr_lists.iter().map(Vec::as_slice).collect();
         let set = TreeChunkSet::build(&ptrs);
         let positions = repo.chunk_index().positions();
@@ -486,7 +486,7 @@ pub(super) fn execute_repair(
             &positions,
             TreeChunkSource::Storage,
             MarkOptions {
-                count: true,
+                count: false,
                 missing_refs: MissingRefs::Ignore,
                 decode_threads: default_decode_threads(),
             },
@@ -494,27 +494,34 @@ pub(super) fn execute_repair(
         )
         .map_err(|e| {
             VykarError::Other(format!(
-                "aborting repair: cannot rebuild refcounts: {e} \
-                 (persisting would drop live references)"
+                "aborting repair: cannot mark the surviving snapshots: {e} \
+                 (sweeping would drop live references)"
             ))
         })?;
-        let mut map = HashMap::new();
+        let mut doomed = Vec::new();
         positions.for_each_live(|p, id, _| {
-            if let Some(n) = found.count(p)
-                && n > 0
-            {
-                map.insert(id, n);
+            if !found.is_marked(p) {
+                doomed.push(id);
             }
         });
-        map
+        doomed
     };
 
-    repo.chunk_index_mut().rebuild_refcounts(&new_refcounts);
-    applied.push(RepairAction::RebuildRefcounts);
+    let index = repo.chunk_index_mut();
+    for id in &unreferenced {
+        index.remove(id);
+    }
+    tracing::info!(
+        "removed {} index entries no surviving snapshot references",
+        unreferenced.len()
+    );
+    applied.push(RepairAction::RemoveUnreferencedEntries);
 
     // Step 7: Persist index. This is the one write that folds the index
     // into a new base; earlier persists stay segments. Its head records
     // the repair as a sweep (`sweep.gen`), keeping the last sweep record.
+    // Written also when the sweep removed nothing.
+    repo.mark_index_dirty();
     repo.request_index_fold();
     repo.set_pending_sweep(crate::repo::index_write::PendingSweep::Repair);
     repo.save_state()?;
@@ -622,6 +629,59 @@ mod tests {
             repo.storage.get(KEY_PRIMARY).unwrap().unwrap(),
             swapped,
             "the changed source must not be touched"
+        );
+    }
+
+    /// REP-2: a surviving snapshot that cannot be loaded when the index is
+    /// swept aborts the repair before any index write.
+    #[test]
+    fn repair_aborts_when_a_surviving_snapshot_cannot_be_loaded() {
+        use crate::tests::helpers::{backup_single_source, init_repo, open_local_repo};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_dir = tmp.path().join("repo");
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a.txt"), b"alpha").unwrap();
+        let config = init_repo(&repo_dir);
+        backup_single_source(&config, &src, "src", "s1");
+
+        let mut repo = open_local_repo(&repo_dir);
+        let opts = ScanOptions {
+            collect_chunk_refs: true,
+            detect_orphans: false,
+            verify_data: false,
+            skip_packs: None,
+            snapshot_sample_percent: None,
+        };
+        let scan =
+            integrity_scan(&mut repo, &config, &opts, &mut None, &CancelToken::new()).unwrap();
+        let plan = build_repair_plan(&scan, &HashMap::new(), &HashMap::new());
+        assert!(
+            matches!(
+                plan.actions.as_slice(),
+                [RepairAction::RemoveUnreferencedEntries]
+            ),
+            "{:?}",
+            plan.actions
+        );
+        let heads = crate::repo::index_store::list_head_generations(repo.storage.as_ref()).unwrap();
+
+        // Between scan and apply, the snapshot object goes away.
+        let id = repo.manifest().find_snapshot("s1").unwrap().id;
+        repo.storage.delete(&id.storage_key()).unwrap();
+
+        let err = execute_repair(&mut repo, &plan, &scan.issues, &HashMap::new())
+            .expect_err("the repair aborts");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cannot load snapshot 's1' while sweeping the index"),
+            "{msg}"
+        );
+        assert_eq!(
+            crate::repo::index_store::list_head_generations(repo.storage.as_ref()).unwrap(),
+            heads,
+            "no head written"
         );
     }
 

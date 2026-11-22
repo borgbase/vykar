@@ -1,6 +1,6 @@
 //! The mark engine against an independent sequential oracle: the report of
 //! `compact --report-unreferenced`, check's shared tree-chunk traversal and
-//! the repair refcount rebuild.
+//! the repair's sweep.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -308,9 +308,10 @@ fn with_four_tree_chunks(encrypted: bool, name: &str, build: impl Fn(&Fx, usize)
     panic!("no tree of up to {TREE_DIRS_MAX} directories gave 4 tree chunks in one pack");
 }
 
-/// The independent oracle: today's sequential refcount rebuild, per
-/// snapshot of the manifest, over the snapshot's whole item stream.
-fn sequential_refcounts(repo: &mut Repository) -> HashMap<ChunkId, u32> {
+/// The independent oracle: a sequential count of references with snapshot
+/// multiplicity (the mark's counting rule), per snapshot of the manifest,
+/// over the snapshot's whole item stream.
+fn sequential_counts(repo: &mut Repository) -> HashMap<ChunkId, u32> {
     let mut counts: HashMap<ChunkId, u32> = HashMap::new();
     let names: Vec<String> = repo
         .manifest()
@@ -431,11 +432,11 @@ fn tree_chunk_set_counts_occurrences_and_first_snapshot() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn report_matches_a_sequential_rebuild() {
+fn report_matches_a_sequential_walk() {
     for encrypted in [false, true] {
         let (fx, _) = leaky(encrypted);
         let mut repo = fx.open();
-        let oracle = sequential_refcounts(&mut repo);
+        let oracle = sequential_counts(&mut repo);
         let entries: Vec<_> = repo.chunk_index().iter().collect();
 
         let report = fx.report().unwrap();
@@ -458,17 +459,6 @@ fn report_matches_a_sequential_rebuild() {
             .map(|(_, e)| u64::from(e.stored_size))
             .sum();
         assert_eq!(report.unreferenced_bytes, zero_bytes);
-        let mismatches = entries
-            .iter()
-            .filter(|(id, e)| oracle.get(id).copied().unwrap_or(0) != e.refcount)
-            .count();
-        assert!(mismatches > 0, "the leak inflated refcounts");
-        assert_eq!(
-            report.refcount_mismatches, mismatches,
-            "encrypted={encrypted}"
-        );
-        assert_eq!(report.unreferenced_with_refcount, zero.len());
-        assert_eq!(report.referenced_with_zero_refcount, 0);
         assert_eq!(report.snapshots, 2);
         assert!(report.packs_with_unreferenced > 0);
 
@@ -551,7 +541,7 @@ fn report_with_no_snapshots_lists_every_entry() {
 }
 
 /// D7: the chunk references of a non-regular item are marked but not
-/// counted, as the stored refcounts do.
+/// counted (the mark's counting rule).
 #[test]
 fn references_of_non_regular_items_are_marked_not_counted() {
     let fx = Fx::new(false);
@@ -1395,10 +1385,10 @@ fn a_tree_chunk_that_does_not_decode_alone() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn repair_rebuild_matches_a_sequential_rebuild() {
+fn repair_sweep_matches_a_sequential_walk() {
     for encrypted in [false, true] {
         let (fx, _) = leaky(encrypted);
-        let oracle = sequential_refcounts(&mut fx.open());
+        let oracle = sequential_counts(&mut fx.open());
         let result = commands::check::run_with_repair(
             &fx.config,
             fx.pass,
@@ -1414,8 +1404,7 @@ fn repair_rebuild_matches_a_sequential_rebuild() {
             result.repair_errors
         );
 
-        // Refcounts are not persisted: the rebuilt index holds exactly the
-        // referenced chunks, each at refcount 1 when loaded.
+        // The swept index holds exactly the referenced chunks.
         let repo = fx.open();
         let after: std::collections::HashSet<ChunkId> =
             repo.chunk_index().iter().map(|(id, _)| id).collect();
@@ -1424,7 +1413,6 @@ fn repair_rebuild_matches_a_sequential_rebuild() {
             oracle.keys().copied().collect(),
             "encrypted={encrypted}"
         );
-        assert!(repo.chunk_index().iter().all(|(_, e)| e.refcount == 1));
         let report = fx.report().unwrap();
         assert!(report.unreferenced.is_empty());
     }
@@ -1953,12 +1941,11 @@ fn repair_records_itself_as_a_sweep_and_keeps_the_record() {
 fn compact_collects_old_heads_and_unnamed_objects() {
     let fx = two_snapshots(false);
     let mut repo = fx.open();
-    for round in 0..20u32 {
+    for _ in 0..20u32 {
         commands::util::with_maintenance_lock(&mut repo, |repo| {
             repo.load_chunk_index_under_lock()?;
-            let id = repo.chunk_index().iter().next().unwrap().0;
-            repo.chunk_index_mut().increment_refcount_by(&id, round + 1);
-            // Refcounts are not written: a fold makes each round a head.
+            // No edit: a requested fold makes each round a head.
+            repo.mark_index_dirty();
             repo.request_index_fold();
             repo.save_state()
         })

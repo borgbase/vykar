@@ -46,7 +46,7 @@ fn estimate_chunk_count(data_len: u64, avg_chunk_size: u32) -> usize {
 /// the previous wrapper needed.
 ///
 /// For segment N>0, the consumer performs a cross-segment rollback of the
-/// earlier segments' refcounts/dedup inserts before draining the rest, so
+/// earlier segments' recorded reuse/dedup inserts before draining the rest, so
 /// it is now safe to convert soft errors at any segment index.
 ///
 /// Budget bytes are pre-acquired by the walk thread; `pre_acquired_bytes`

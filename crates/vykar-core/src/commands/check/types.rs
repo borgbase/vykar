@@ -399,7 +399,10 @@ pub enum RepairAction {
     WritePackMaps {
         pack_ids: Vec<PackId>,
     },
-    RebuildRefcounts,
+    /// Remove the index entries that no surviving snapshot references
+    /// (a sweep, recorded as one in the head). Always the last index action
+    /// of a plan. Never data loss.
+    RemoveUnreferencedEntries,
 }
 
 pub use crate::repo::{IndexLoss, IndexRecovery, RebuildCounts, RepairIndexLoad, UncoveredPack};

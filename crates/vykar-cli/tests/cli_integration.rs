@@ -347,7 +347,7 @@ fn init_empty_v3(repo_dir: &Path) {
     .unwrap();
     let blob = vykar_core::index::IndexBlob {
         generation: 0,
-        chunks: vykar_core::index::ChunkIndex::new(),
+        chunks: vykar_core::index::LegacyChunkIndex::new(),
     };
     let index = pack_object_streaming_with_context(
         ObjectType::ChunkIndex,
@@ -1452,7 +1452,6 @@ fn cli_compact_report_unreferenced_prints_counts() {
         );
     }
     assert!(out.contains(" 0 unreferenced,"), "{out}");
-    assert!(!out.contains("Stored refcounts"), "{out}");
 }
 
 #[test]
@@ -1671,7 +1670,7 @@ fn cli_check_repair_safe_auto_apply() {
     fx.run_ok(&["--config", &cfg, "init"]);
     fx.run_ok(&["--config", &cfg, "backup", &source]);
 
-    // No corruption — safe plan (refcount rebuild only)
+    // No corruption — safe plan (the index sweep only)
     let output = fx.run(&["--config", &cfg, "check", "--repair"]);
     assert!(
         output.status.success(),
@@ -1690,8 +1689,8 @@ fn cli_check_repair_safe_auto_apply() {
         "expected 'Repair plan:' in stdout, got:\n{out}"
     );
     assert!(
-        out.contains("Rebuild chunk refcounts"),
-        "expected 'Rebuild chunk refcounts' in stdout, got:\n{out}"
+        out.contains("Remove index entries that no surviving snapshot references"),
+        "expected 'Remove index entries that no surviving snapshot references' in stdout, got:\n{out}"
     );
 }
 
@@ -1714,8 +1713,8 @@ fn cli_check_repair_yes_clean_repo() {
         "expected 'Repair plan:' in stdout, got:\n{out}"
     );
     assert!(
-        out.contains("Rebuild chunk refcounts"),
-        "expected 'Rebuild chunk refcounts' in stdout, got:\n{out}"
+        out.contains("Remove index entries that no surviving snapshot references"),
+        "expected 'Remove index entries that no surviving snapshot references' in stdout, got:\n{out}"
     );
 }
 

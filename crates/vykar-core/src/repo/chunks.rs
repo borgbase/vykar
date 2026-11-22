@@ -13,7 +13,7 @@ use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
 
 impl Repository {
-    /// Resolve a cache-hit chunk reference by bumping its refcount.
+    /// Resolve a cache-hit chunk reference, recording the reuse.
     /// Returns the stored size from the authoritative index/recovered entry.
     /// Errors if the chunk is not found in any state (committed, recovered,
     /// or pending pack writer) — this indicates storage corruption.
@@ -25,23 +25,12 @@ impl Repository {
         })
     }
 
-    /// Record a new reference to a chunk in the session's delta (the reused
-    /// set a commit checks). Without a session it does nothing: refcounts
-    /// are not persisted (05 step 8).
-    pub fn increment_chunk_ref(&mut self, id: &ChunkId) {
-        if let Some(ref mut ws) = self.write_session
-            && let Some(ref mut delta) = ws.index_delta
-        {
-            delta.bump_refcount(id);
-        }
-    }
-
     /// An existing chunk `id` for a new reference: stored earlier in the
     /// session, else (index unedited) in the session's view: an addition of
-    /// its segments (bumped by key), or its table, found through the filter
+    /// its segments (recorded by key), or its table, found through the filter
     /// (unless `skip_filter`) and recorded by table position; else (index
     /// edited after the session began: repair, tests) in the live index by
-    /// key. Records the bump in the session delta and returns the stored
+    /// key. Records the reuse in the session delta and returns the stored
     /// size; `None` when not found.
     fn bump_existing(&mut self, id: &ChunkId, skip_filter: bool) -> Option<u32> {
         let edited = self.chunk_index.is_modified();
@@ -53,17 +42,17 @@ impl Repository {
         let ws = self.ws_mut();
         let delta = ws.index_delta.as_mut()?;
         if let Some(&stored_size) = ws.session_new.get(id) {
-            delta.bump_refcount(id);
+            delta.reused.insert_key(id);
             return Some(stored_size);
         }
         if edited {
             let stored_size = keyed_hit?;
-            delta.bump_refcount(id);
+            delta.reused.insert_key(id);
             return Some(stored_size);
         }
         let view = &ws.view.as_ref()?.view;
         if let Some(stored_size) = view.find_added(id) {
-            delta.bump_refcount(id);
+            delta.reused.insert_key(id);
             return Some(stored_size);
         }
         let table = view.table();
@@ -78,15 +67,15 @@ impl Repository {
         }
         let (position, record) = table.find(id)?;
         let stored_size = view.table_hit(position, &record)?;
-        delta.bump_cached_refcount(id, position);
+        delta.reused.insert_position(id, position);
         Some(stored_size)
     }
 
-    /// Increment refcount if this chunk already exists in committed or pending state.
-    /// Returns stored size when found. Falls back to recovered chunks from a
-    /// previous interrupted session, then to the pending pack writers.
-    /// Without a write session, only looks the chunk up in the index:
-    /// refcounts are not persisted (05 step 8), so nothing is recorded.
+    /// Record the reuse of this chunk if it already exists in committed or
+    /// pending state. Returns stored size when found. Falls back to recovered
+    /// chunks from a previous interrupted session, then to the pending pack
+    /// writers. Without a write session, only looks the chunk up in the
+    /// index: there is no session to record the reuse in.
     pub fn bump_ref_if_exists(&mut self, chunk_id: &ChunkId) -> Option<u32> {
         if self.write_session.is_none() {
             return self.chunk_index.get(chunk_id).map(|e| e.stored_size);
@@ -104,9 +93,9 @@ impl Repository {
     /// `prefilter` (`PrefilterVerdict::Present`): record the reference.
     ///
     /// No second lookup is needed: `table_position` is where the worker found
-    /// the chunk, and the bump is recorded against it (the positional table
-    /// re-checks that the entry there is `chunk_id` and otherwise records the
-    /// bump by key). The verdict came from the very view the session
+    /// the chunk, and the reuse is recorded against it (the positional record
+    /// re-checks that the entry there is `chunk_id` and otherwise records it
+    /// by key). The verdict came from the very view the session
     /// resolves against (checked by identity), and that view is immutable —
     /// a chunk in it is never also in `session_new` or the recovered set,
     /// because every path consults the view before storing or promoting a
@@ -131,7 +120,7 @@ impl Repository {
             "pre-session hit must resolve to the worker's table entry"
         );
         let delta = self.session_delta_for(chunk_id, prefilter)?;
-        delta.bump_cached_refcount(chunk_id, table_position);
+        delta.reused.insert_position(chunk_id, table_position);
         Ok(())
     }
 
@@ -150,7 +139,7 @@ impl Repository {
             "pre-session hit must resolve to the worker's addition"
         );
         let delta = self.session_delta_for(chunk_id, prefilter)?;
-        delta.bump_refcount(chunk_id);
+        delta.reused.insert_key(chunk_id);
         Ok(())
     }
 
@@ -192,7 +181,7 @@ impl Repository {
             match ws.session_new.get(chunk_id).copied() {
                 Some(stored_size) => {
                     if let Some(ref mut delta) = ws.index_delta {
-                        delta.bump_refcount(chunk_id);
+                        delta.reused.insert_key(chunk_id);
                     }
                     Some(stored_size)
                 }
@@ -357,13 +346,11 @@ impl Repository {
         // Record journal entries before apply_sealed_entries consumes them.
         let journal_chunks: Vec<PendingChunkEntry> = entries
             .iter()
-            .map(
-                |&(chunk_id, stored_size, offset, _refcount)| PendingChunkEntry {
-                    chunk_id,
-                    stored_size,
-                    pack_offset: offset,
-                },
-            )
+            .map(|&(chunk_id, stored_size, offset)| PendingChunkEntry {
+                chunk_id,
+                stored_size,
+                pack_offset: offset,
+            })
             .collect();
         // Record pack ID for rollback tracking (dump / per-file backup). The
         // journal entry itself waits for the upload to be confirmed.
@@ -392,7 +379,7 @@ impl Repository {
     }
 
     /// Store a chunk in the repository. Returns (chunk_id, stored_size, was_new).
-    /// If the chunk already exists (dedup), just increments the refcount.
+    /// If the chunk already exists (dedup), only its reuse is recorded.
     pub fn store_chunk(
         &mut self,
         data: &[u8],

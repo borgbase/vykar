@@ -93,7 +93,7 @@ fn compact_ignores_trailer_only_overhead() {
 fn compact_is_idempotent_after_repack() {
     let mut repo = test_repo_plaintext();
     let (id_a, _id_b) = store_two_chunks(&mut repo);
-    repo.chunk_index_mut().decrement(&id_a);
+    repo.chunk_index_mut().remove(&id_a);
     repo.save_state().unwrap();
     let first =
         compact_repo_without_mark(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
@@ -112,7 +112,7 @@ fn compact_is_idempotent_after_repack() {
 fn client_repack_writes_a_trailer() {
     let mut repo = test_repo_plaintext();
     let (id_a, id_b) = store_two_chunks(&mut repo);
-    repo.chunk_index_mut().decrement(&id_a);
+    repo.chunk_index_mut().remove(&id_a);
     repo.save_state().unwrap();
     compact_repo_without_mark(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
 
@@ -184,7 +184,7 @@ fn compact_reads_no_pack_footer() {
 fn client_repack_records_the_output_trailer_length() {
     let mut repo = test_repo_plaintext();
     let (id_a, id_b) = store_two_chunks(&mut repo);
-    repo.chunk_index_mut().decrement(&id_a);
+    repo.chunk_index_mut().remove(&id_a);
     repo.save_state().unwrap();
     compact_repo_without_mark(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
     let pack = repo.chunk_index().get(&id_b).unwrap().pack_id;
@@ -213,7 +213,7 @@ fn client_repack_records_the_output_trailer_length() {
 fn compact_keeps_an_orphan_its_repack_rewrote() {
     let mut repo = test_repo_plaintext();
     let (id_a, id_b) = store_two_chunks(&mut repo);
-    repo.chunk_index_mut().decrement(&id_a);
+    repo.chunk_index_mut().remove(&id_a);
     repo.save_state().unwrap();
 
     // PUT the pack the repack of the source will write, as an orphan.
@@ -261,8 +261,8 @@ fn compact_after_delete_repacks() {
     let mut repo = test_repo_plaintext();
     let (id_a, id_b) = store_two_chunks(&mut repo);
 
-    // Remove chunk A from the index (simulates delete decrementing refcount to 0)
-    repo.chunk_index_mut().decrement(&id_a);
+    // Remove chunk A from the index (as a sweep does once nothing references it)
+    repo.chunk_index_mut().remove(&id_a);
     repo.save_state().unwrap();
 
     // Compact should detect the dead blob and repack
@@ -297,7 +297,7 @@ fn compact_threshold_filters() {
     repo.save_state().unwrap();
 
     // Remove one chunk
-    repo.chunk_index_mut().decrement(&ids[0]);
+    repo.chunk_index_mut().remove(&ids[0]);
     repo.save_state().unwrap();
 
     // With a very high threshold (90%), nothing should be repacked
@@ -313,7 +313,7 @@ fn compact_dry_run_does_not_modify() {
     let (id_a, id_b) = store_two_chunks(&mut repo);
 
     // Remove chunk A to create dead blobs
-    repo.chunk_index_mut().decrement(&id_a);
+    repo.chunk_index_mut().remove(&id_a);
     repo.save_state().unwrap();
 
     // Count packs before
@@ -350,7 +350,7 @@ fn compact_empty_pack_deleted() {
     repo.save_state().unwrap();
 
     // Remove it — the pack is now entirely dead
-    repo.chunk_index_mut().decrement(&id_a);
+    repo.chunk_index_mut().remove(&id_a);
     repo.save_state().unwrap();
 
     let stats =
@@ -447,7 +447,7 @@ fn compact_sizes_packs_from_the_listing() {
             .unwrap();
             repo.save_state().unwrap();
             if dead {
-                repo.chunk_index_mut().decrement(&data_id);
+                repo.chunk_index_mut().remove(&data_id);
                 repo.save_state().unwrap();
             }
             let packs = count_all_packs(&repo) as u64;
@@ -799,8 +799,8 @@ mod server_side {
         let empty = pack_of(repo, &id_c);
         assert_ne!(partial, empty, "c must land in its own pack");
 
-        repo.chunk_index_mut().decrement(&id_a);
-        repo.chunk_index_mut().decrement(&id_c);
+        repo.chunk_index_mut().remove(&id_a);
+        repo.chunk_index_mut().remove(&id_c);
         repo.save_state().unwrap();
         (id_b, partial, empty)
     }
@@ -827,8 +827,8 @@ mod server_side {
         assert_ne!(partial, empty, "c must land in its own pack");
         assert_eq!(repo.chunk_index().get(&id_a).unwrap().pack_offset, 13);
 
-        repo.chunk_index_mut().decrement(&id_b);
-        repo.chunk_index_mut().decrement(&id_c);
+        repo.chunk_index_mut().remove(&id_b);
+        repo.chunk_index_mut().remove(&id_c);
         repo.save_state().unwrap();
         (id_a, partial, empty)
     }

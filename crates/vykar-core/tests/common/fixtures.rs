@@ -173,3 +173,122 @@ pub fn read_tree(root: &Path) -> BTreeMap<PathBuf, (u64, String)> {
     }
     out
 }
+
+/// Pack files of the fixture's repository.
+fn pack_count(fx: &Fixture) -> usize {
+    read_tree(&fx.repo_dir())
+        .into_keys()
+        .filter(|p| p.starts_with("packs"))
+        .count()
+}
+
+/// Delete `index`, every object in `index.d/` and the fixture's cache dir.
+fn lose_index(fx: &Fixture) {
+    std::fs::remove_file(fx.repo_dir().join("index")).unwrap();
+    for entry in std::fs::read_dir(fx.repo_dir().join("index.d")).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_file() {
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+    std::fs::remove_dir_all(fx.cache_dir()).unwrap();
+}
+
+/// A config for the fixture's repository with a fresh cache dir `root/name`.
+fn cold_config(fx: &Fixture, name: &str) -> VykarConfig {
+    let mut config = fx.config();
+    config.cache_dir = Some(fx.root.join(name).to_string_lossy().into_owned());
+    config
+}
+
+/// The fixture's packs were written before pack trailers. After `vykar
+/// upgrade` and `commands::pack_maps::run`, losing the whole index and the
+/// cache loses nothing: `check --repair` on a cold machine takes every pack
+/// from a pack map and the latest snapshot restores byte-identical. Without
+/// the maps, every pack is uncovered and the plan removes every snapshot.
+pub fn assert_index_loss_is_recovered_from_pack_maps(prefix: &str, mode: &str, version: u64) {
+    use vykar_core::commands;
+    use vykar_core::commands::check::{IndexRecovery, RepairAction, RepairMode};
+    use vykar_core::repo::control::CancelToken;
+
+    let repair = |config: &VykarConfig, fx: &Fixture, mode: RepairMode| {
+        commands::check::run_with_repair(
+            config,
+            fx.passphrase(),
+            false,
+            mode,
+            None,
+            &CancelToken::new(),
+        )
+        .unwrap()
+    };
+
+    let fx = extract(prefix, mode, version);
+    let label = format!("{prefix}-{mode}");
+    commands::upgrade::run(&fx.config(), fx.passphrase()).unwrap();
+    let packs = pack_count(&fx);
+    let stats =
+        commands::pack_maps::run(&fx.config(), fx.passphrase(), &CancelToken::new()).unwrap();
+    assert_eq!(stats.packs_mapped, packs, "{label}: {stats:?}");
+    lose_index(&fx);
+    let cold = cold_config(&fx, "cold");
+    let result = repair(&cold, &fx, RepairMode::Apply);
+    let IndexRecovery::RebuiltFromPacks { counts, .. } = result.plan.index_recovery else {
+        panic!("{label}: {:?}", result.plan.index_recovery);
+    };
+    assert_eq!(
+        (counts.packs, counts.from_maps),
+        (packs, packs),
+        "{label}: {counts:?}"
+    );
+    assert!(
+        !result.plan.has_data_loss,
+        "{label}: {:?}",
+        result.plan.actions
+    );
+    assert!(
+        result.repair_errors.is_empty(),
+        "{label}: {:?}",
+        result.repair_errors
+    );
+    let check = commands::check::run(&cold, fx.passphrase(), true, false).unwrap();
+    assert!(check.errors.is_empty(), "{label}: {:?}", check.errors);
+    let dest = fx.root.join("restore-rebuilt");
+    commands::restore::run(
+        &cold,
+        fx.passphrase(),
+        fx.latest_snapshot(),
+        dest.to_str().unwrap(),
+        None,
+        cold.xattrs.enabled,
+        true,
+        &CancelToken::new(),
+    )
+    .unwrap();
+    assert_eq!(read_tree(&dest), read_tree(&fx.source_dir()), "{label}");
+
+    let fx = extract(prefix, mode, version);
+    commands::upgrade::run(&fx.config(), fx.passphrase()).unwrap();
+    lose_index(&fx);
+    let cold = cold_config(&fx, "cold");
+    let plan = repair(&cold, &fx, RepairMode::PlanOnly).plan;
+    let IndexRecovery::RebuiltFromPacks { counts, .. } = plan.index_recovery else {
+        panic!("{label}: {:?}", plan.index_recovery);
+    };
+    assert_eq!(
+        (counts.packs, counts.uncovered),
+        (packs, packs),
+        "{label}: {counts:?}"
+    );
+    assert!(plan.has_data_loss, "{label}");
+    for snapshot in &fx.snapshots {
+        assert!(
+            plan.actions.iter().any(|a| matches!(
+                a,
+                RepairAction::RemoveDanglingSnapshot { snapshot_name, .. } if snapshot_name == snapshot
+            )),
+            "{label}: {snapshot} is not removed: {:?}",
+            plan.actions
+        );
+    }
+}

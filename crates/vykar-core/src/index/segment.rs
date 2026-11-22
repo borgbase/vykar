@@ -646,35 +646,6 @@ pub fn apply_to_temp(
     Ok((tmp.into_temp_path(), hash, count))
 }
 
-/// Apply one segment to `prev` when no head records the state it produces
-/// (`check --repair` rebuilding the index without a head). Checks that the
-/// segment names `prev`'s state and consumes exactly its entries; returns
-/// the resulting state as computed.
-pub fn apply_unnamed_to_temp(
-    prev: &MmapFullIndexCache,
-    segment: &Segment,
-    target: &Path,
-) -> Result<(TempPath, StateHash, u64)> {
-    if segment.prev_state_hash != prev.state_hash()
-        || segment.prev_entries != u64::from(prev.entry_count())
-    {
-        return Err(invalid("segment does not follow the preceding state"));
-    }
-    let mut layers = [Layer::new(segment)];
-    let mut base = BaseSource {
-        cache: prev,
-        next: 0,
-    };
-    let mut w = FullCacheWriter::new_beside(target)?;
-    while let Some(entry) = pull(&mut layers, &mut base)? {
-        w.push(&entry)?;
-    }
-    let [layer] = layers;
-    layer.check_consumed()?;
-    let (tmp, hash, count) = w.finish(None)?;
-    Ok((tmp.into_temp_path(), hash, count))
-}
-
 /// [`apply_to_temp`], persisted over `target`. Returns the new state hash.
 pub fn apply(
     prev: &MmapFullIndexCache,

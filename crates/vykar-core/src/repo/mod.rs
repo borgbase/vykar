@@ -9,6 +9,7 @@ pub(crate) mod journal_recovery;
 pub mod lock;
 pub mod manifest;
 pub mod pack;
+pub mod pack_map;
 pub mod pack_trailer;
 pub(crate) mod session_journal;
 pub mod snapshot_cache;
@@ -17,14 +18,17 @@ pub(crate) mod write_session;
 
 mod chunks;
 mod commit;
+pub(crate) mod index_rebuild;
 pub(crate) mod index_store;
 pub(crate) mod index_write;
 mod key;
 mod open;
+pub(crate) mod pack_listing;
 mod pack_lookup;
 mod pack_recovery;
 mod pack_verify;
-pub use index_write::IndexRecovery;
+pub use index_rebuild::{RebuildCounts, UncoveredPack};
+pub use index_write::{IndexLoss, IndexRecovery, RepairIndexLoad};
 pub use key::{LoadedKey, select_repository_key};
 #[cfg(any(test, feature = "fuzzing"))]
 pub(crate) use open::derive_plaintext_chunk_id_key;

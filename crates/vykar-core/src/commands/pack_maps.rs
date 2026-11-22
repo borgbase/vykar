@@ -1,0 +1,25 @@
+//! Writing pack maps for the packs that carry no trailer.
+
+use super::util::{open_repo, with_maintenance_lock};
+use crate::config::VykarConfig;
+use crate::repo::OpenOptions;
+use crate::repo::control::CancelToken;
+use vykar_types::error::Result;
+
+pub use crate::repo::pack_map::PackMapStats;
+
+/// Write pack maps for every pack the index names that no readable map
+/// covers (packs written without a trailer, before format v6 support).
+/// Takes the maintenance lock. No CLI command runs it yet; `vykar upgrade`
+/// will.
+pub fn run(
+    config: &VykarConfig,
+    passphrase: Option<&str>,
+    shutdown: &CancelToken,
+) -> Result<PackMapStats> {
+    let mut repo = open_repo(config, passphrase, OpenOptions::new(), shutdown)?;
+    with_maintenance_lock(&mut repo, |repo| {
+        repo.load_chunk_index_under_lock()?;
+        repo.write_pack_maps(None, shutdown)
+    })
+}

@@ -186,9 +186,32 @@ pub fn backup_single_source(
         .stats
 }
 
+/// [`backup_single_source`] with a passphrase, for encrypted repositories.
+pub fn backup_single_source_with(
+    config: &VykarConfig,
+    passphrase: Option<&str>,
+    source_dir: &Path,
+    source_label: &str,
+    snapshot_name: &str,
+) -> SnapshotStats {
+    try_backup_with(config, passphrase, source_dir, source_label, snapshot_name)
+        .unwrap()
+        .stats
+}
+
 /// [`backup_single_source`], returning the backup's result.
 pub fn try_backup_single_source(
     config: &VykarConfig,
+    source_dir: &Path,
+    source_label: &str,
+    snapshot_name: &str,
+) -> vykar_types::error::Result<commands::backup::BackupOutcome> {
+    try_backup_with(config, None, source_dir, source_label, snapshot_name)
+}
+
+fn try_backup_with(
+    config: &VykarConfig,
+    passphrase: Option<&str>,
     source_dir: &Path,
     source_label: &str,
     snapshot_name: &str,
@@ -201,7 +224,7 @@ pub fn try_backup_single_source(
         config,
         commands::backup::BackupRequest {
             snapshot_name,
-            passphrase: None,
+            passphrase,
             source_paths: &source_paths,
             source_label,
             exclude_patterns: &exclude_patterns,

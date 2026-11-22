@@ -13,6 +13,9 @@ use crate::repo::format::{
     unpack_object_expect_with_context,
 };
 use crate::repo::pack::read_blob_from_pack;
+use crate::repo::pack_trailer::{
+    PackTrailer, TrailerRead, read_pack_trailer, read_trailer_from_pack_bytes,
+};
 use crate::snapshot::item::ItemType;
 use vykar_crypto::CryptoEngine;
 use vykar_protocol::validate_pack_header;
@@ -671,6 +674,13 @@ pub(super) fn integrity_scan(
         );
         shutdown.check()?;
         counters.chunks_data_verified = data_count;
+        let data_issues = drop_trailer_issues_covered_by_maps(
+            repo,
+            &packs_vec,
+            data_issues,
+            config.limits.verify_data_concurrency(),
+            shutdown,
+        )?;
         issues.extend(data_issues);
 
         emit_progress(
@@ -929,6 +939,12 @@ pub(crate) fn verify_pack_full(
         return 0;
     }
 
+    match read_trailer_from_pack_bytes(&pack_data, crypto) {
+        Ok(None) => {}
+        Ok(Some(trailer)) => check_trailer(pack_id, &trailer, chunks, issues),
+        Err(e) => trailer_damage(pack_id, e, issues),
+    }
+
     let mut count = 0;
     let mut raw = Vec::new();
     for (chunk_id, entry) in chunks {
@@ -1013,6 +1029,9 @@ fn verify_pack_individual(
     issues: &mut Vec<IntegrityIssue>,
     shutdown: &CancelToken,
 ) -> usize {
+    if !shutdown.is_cancelled() {
+        verify_trailer_by_range(storage, crypto, pack_id, chunks, issues);
+    }
     let mut count = 0;
     // One range read per chunk: without this poll a cancelled verify keeps
     // issuing storage requests for the rest of the pack. `break` rather than
@@ -1044,6 +1063,134 @@ fn verify_pack_individual(
         count += verify_single_chunk(crypto, at, &mut raw, issues);
     }
     count
+}
+
+/// Read a pack's trailer with range reads and check it against the pack's
+/// index entries. A pack that is gone or a failed request pushes nothing:
+/// the chunk reads that follow report it.
+fn verify_trailer_by_range(
+    storage: &dyn StorageBackend,
+    crypto: &dyn CryptoEngine,
+    pack_id: &PackId,
+    chunks: &[(ChunkId, ChunkIndexEntry)],
+    issues: &mut Vec<IntegrityIssue>,
+) {
+    let key = pack_id.storage_key();
+    let Ok(Some(len)) = storage.size(&key) else {
+        return;
+    };
+    match read_pack_trailer(storage, &key, len, crypto) {
+        Ok(TrailerRead::Found(trailer)) => check_trailer(pack_id, &trailer, chunks, issues),
+        Ok(TrailerRead::Damaged(e)) => trailer_damage(pack_id, e, issues),
+        Ok(TrailerRead::Absent | TrailerRead::PackMissing) | Err(_) => {}
+    }
+}
+
+/// Push a `CorruptPackTrailer` when `trailer` does not list every indexed
+/// chunk of the pack at its indexed location.
+fn check_trailer(
+    pack_id: &PackId,
+    trailer: &PackTrailer,
+    chunks: &[(ChunkId, ChunkIndexEntry)],
+    issues: &mut Vec<IntegrityIssue>,
+) {
+    if let Some(detail) = trailer_mismatch(trailer, chunks) {
+        issues.push(IntegrityIssue::CorruptPackTrailer {
+            pack_id: *pack_id,
+            detail,
+        });
+    }
+}
+
+/// Push a `CorruptPackTrailer` for a trailer that cannot be read. A trailer
+/// of a newer body version or codec is not damage: it is logged only.
+fn trailer_damage(pack_id: &PackId, e: VykarError, issues: &mut Vec<IntegrityIssue>) {
+    if let VykarError::UnsupportedVersion(_) = e {
+        tracing::warn!("the trailer of pack {pack_id} was written by a newer vykar ({e})");
+        return;
+    }
+    issues.push(IntegrityIssue::CorruptPackTrailer {
+        pack_id: *pack_id,
+        detail: e.to_string(),
+    });
+}
+
+/// The first way `trailer` disagrees with the pack's index entries: an
+/// indexed (chunk ID, offset, stored size) the trailer does not list. Extra
+/// trailer entries are fine (chunks the index dropped).
+fn trailer_mismatch(
+    trailer: &PackTrailer,
+    chunks: &[(ChunkId, ChunkIndexEntry)],
+) -> Option<String> {
+    let listed: HashSet<(ChunkId, u64, u32)> = trailer
+        .entries
+        .iter()
+        .map(|e| (e.chunk_id, u64::from(e.offset), e.stored_size))
+        .collect();
+    let mut missing = chunks
+        .iter()
+        .filter(|(id, e)| !listed.contains(&(*id, e.pack_offset, e.stored_size)));
+    let first = missing.next()?.0;
+    let n = 1 + missing.count();
+    Some(format!(
+        "lists {n} of {} indexed chunk(s) at other locations or not at all (first: {first})",
+        chunks.len()
+    ))
+}
+
+/// Drop the `CorruptPackTrailer` issues of packs a pack map describes in
+/// full (every indexed entry of the pack listed): such a pack does not
+/// depend on its trailer any more. Maps are read only when there is such an
+/// issue; a failure to read them keeps every issue.
+fn drop_trailer_issues_covered_by_maps(
+    repo: &Repository,
+    packs: &[(PackId, Vec<(ChunkId, ChunkIndexEntry)>)],
+    issues: Vec<IntegrityIssue>,
+    width: usize,
+    shutdown: &CancelToken,
+) -> Result<Vec<IntegrityIssue>> {
+    if !issues
+        .iter()
+        .any(|i| matches!(i, IntegrityIssue::CorruptPackTrailer { .. }))
+    {
+        return Ok(issues);
+    }
+    let maps = match crate::repo::pack_map::read_pack_maps(
+        repo.storage.as_ref(),
+        repo.crypto.as_ref(),
+        width,
+        true,
+        shutdown,
+    ) {
+        Ok(maps) => maps,
+        Err(VykarError::Interrupted) => return Err(VykarError::Interrupted),
+        Err(e) => {
+            tracing::warn!("cannot read the pack maps ({e}); trailer issues are kept");
+            return Ok(issues);
+        }
+    };
+    let chunks_of: HashMap<&PackId, &Vec<(ChunkId, ChunkIndexEntry)>> =
+        packs.iter().map(|(id, chunks)| (id, chunks)).collect();
+    let covered = |pack_id: &PackId| {
+        let (Some(entries), Some(chunks)) = (maps.by_pack.get(pack_id), chunks_of.get(pack_id))
+        else {
+            return false;
+        };
+        let listed: HashSet<(ChunkId, u64, u32)> = entries
+            .iter()
+            .map(|e| (e.chunk_id, u64::from(e.offset), e.stored_size))
+            .collect();
+        chunks
+            .iter()
+            .all(|(id, e)| listed.contains(&(*id, e.pack_offset, e.stored_size)))
+    };
+    Ok(issues
+        .into_iter()
+        .filter(|i| match i {
+            IntegrityIssue::CorruptPackTrailer { pack_id, .. } => !covered(pack_id),
+            _ => true,
+        })
+        .collect())
 }
 
 /// Decrypt, decompress, and recompute ChunkId for one blob, decoding in place

@@ -24,13 +24,16 @@ use tempfile::TempPath;
 use tracing::{debug, warn};
 
 use super::Repository;
-use super::index_store::{self, HeadlessOutcome, PackedObject, StoredHead};
+use super::control::CancelToken;
+use super::index_rebuild::{self, RebuildCounts, UncoveredPack};
+use super::index_store::{self, PackedObject, StoredHead};
 use crate::index::LiveIndex;
 use crate::index::dedup_cache::{self, MmapFullIndexCache, generation_for_state};
 use crate::index::head::{BaseRef, HEAD_LAYOUT_VERSION, IndexHead, SegmentRef};
 use crate::index::segment::Diff;
 use crate::index::table::{self, ChunkTable};
 use vykar_types::error::{Result, VykarError};
+use vykar_types::pack_id::PackId;
 
 /// How `check --repair` obtained the chunk index it repairs from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,30 +44,45 @@ pub enum IndexRecovery {
     /// `index` held a monolithic index written by an older vykar; the index
     /// is rebuilt from it.
     LegacyBlob,
-    /// `index` is absent; the index is rebuilt from nothing.
+    /// The index could not be read (`cause`) and was rebuilt from pack
+    /// maps, pack trailers and this machine's chunk tables. Snapshots whose
+    /// chunks lie in uncovered packs show up in the plan as removals.
+    RebuiltFromPacks {
+        cause: IndexLoss,
+        counts: RebuildCounts,
+    },
+}
+
+/// Why `check --repair` could not read the index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexLoss {
+    /// `index` is absent.
     HeadMissing,
-    /// `index` cannot be read; see `index_store::rebuild_without_head`.
-    /// `from_local_cache`: rebuilt from this machine's chunk table (the
-    /// counts are then 0). Else from `index.d/`: `bases` bases decoded,
-    /// `applied` segments applied (including ones discarded at a join),
-    /// `unplaced` decoded segments that follow no rebuilt state, `damaged`
-    /// objects skipped as damage.
-    HeadUnreadable {
-        from_local_cache: bool,
-        bases: usize,
-        applied: usize,
-        unplaced: usize,
-        damaged: usize,
-    },
-    /// Part of the chain is missing or damaged. The index is the state after
-    /// the base and the first `applied` of `total` segments, or the empty
-    /// index when `base_lost`. Snapshots whose chunks it lacks show up in
-    /// the plan as removals.
-    PartialChain {
-        base_lost: bool,
-        applied: usize,
-        total: usize,
-    },
+    /// `index` cannot be decrypted or decoded.
+    HeadUnreadable,
+    /// The head is readable, but an object of its chain is missing or
+    /// damaged.
+    ChainDamaged,
+}
+
+/// What `check --repair` loaded.
+#[derive(Debug, Clone)]
+pub struct RepairIndexLoad {
+    pub recovery: IndexRecovery,
+    /// Packs a rebuilt index has no entries for, in pack ID order.
+    pub uncovered_packs: Vec<UncoveredPack>,
+    /// Packs a rebuilt index took from this machine's chunk tables only.
+    pub packs_from_local_tables: Vec<PackId>,
+}
+
+impl RepairIndexLoad {
+    fn read(recovery: IndexRecovery) -> Self {
+        Self {
+            recovery,
+            uncovered_packs: Vec::new(),
+            packs_from_local_tables: Vec::new(),
+        }
+    }
 }
 
 /// When a chain is folded into a new base: at `segments` segments, or when
@@ -436,29 +454,37 @@ impl Repository {
     }
 
     /// Load the chunk index for `check --repair`, accepting what other
-    /// commands refuse: a monolithic blob at `index` (an older binary
-    /// overwrote the head) or a chain with missing or damaged objects, which
-    /// is read up to the last state that can be. A chain that cannot be read
-    /// is rebuilt from this machine's cache of the head's state when there
-    /// is one; otherwise a storage or local I/O error is returned, never
-    /// salvaged around. An unreadable head is rebuilt from this machine's
-    /// full cache, else from the objects in `index.d/` (see
-    /// [`index_store::rebuild_without_head`]); a head of an unknown layout or
-    /// an `index` of an unknown type is refused. When the index is rebuilt,
-    /// the head is dropped, so the repair's index write is a fresh base.
-    /// Returns how the index was read.
-    pub(crate) fn load_chunk_index_for_repair(&mut self) -> Result<IndexRecovery> {
+    /// commands refuse. A monolithic blob at `index` (an older binary
+    /// overwrote the head) is rebuilt from the blob. A chain that cannot be
+    /// read is rebuilt from this machine's cache of the head's state when
+    /// there is one. Otherwise, when the chain is damaged (an object missing
+    /// or failing verification) or the head is missing or unreadable, the
+    /// index is rebuilt from the packs ([`index_rebuild`]): pack maps, then
+    /// trailers, then this machine's verified chunk tables. A storage or
+    /// local I/O error, an object of a newer vykar, a head of an unknown
+    /// layout or an `index` of an unknown type is refused, never rebuilt
+    /// around. When the index is rebuilt, the head is dropped, so the
+    /// repair's index write is a fresh base. The rebuild only reads storage
+    /// and writes a local temp file; `cancel` stops it.
+    pub(crate) fn load_chunk_index_for_repair(
+        &mut self,
+        cancel: &CancelToken,
+    ) -> Result<RepairIndexLoad> {
         let data = self.storage.get("index")?;
-        self.load_segmented_index_for_repair(data)
+        self.load_segmented_index_for_repair(data, cancel)
     }
 
     /// [`Self::load_chunk_index_for_repair`], from the object fetched at
     /// `index`.
-    fn load_segmented_index_for_repair(&mut self, data: Option<Vec<u8>>) -> Result<IndexRecovery> {
-        let (index, recovery) = match data {
+    fn load_segmented_index_for_repair(
+        &mut self,
+        data: Option<Vec<u8>>,
+        cancel: &CancelToken,
+    ) -> Result<RepairIndexLoad> {
+        let (index, load) = match data {
             None => {
-                warn!("the index head is missing; rebuilding from an empty index");
-                (LiveIndex::empty(), IndexRecovery::HeadMissing)
+                warn!("the index head is missing; rebuilding the index from the packs");
+                self.rebuild_for_repair(IndexLoss::HeadMissing, cancel)?
             }
             Some(data) => match index_store::classify_head(&data, self.crypto.as_ref()) {
                 StoredHead::Legacy => {
@@ -470,13 +496,16 @@ impl Repository {
                     let anchor = index_store::cache_anchor(self.cache_dir().as_deref());
                     let tmp = dedup_cache::full_cache_from_index_to_temp(&blob, &anchor)?;
                     drop(blob);
-                    (scratch_index(tmp)?, IndexRecovery::LegacyBlob)
+                    (
+                        scratch_index(tmp)?,
+                        RepairIndexLoad::read(IndexRecovery::LegacyBlob),
+                    )
                 }
                 StoredHead::Head(head) => {
                     let err = match self.sync_index(Some(head.clone()), false) {
                         Ok(synced) => {
                             self.install_synced_index(synced);
-                            return Ok(IndexRecovery::Complete);
+                            return Ok(RepairIndexLoad::read(IndexRecovery::Complete));
                         }
                         Err(e) => e,
                     };
@@ -485,39 +514,16 @@ impl Repository {
                             "the index chain cannot be read ({err}); rebuilding the index from \
                              this machine's cache of its latest state"
                         );
-                        (LiveIndex::from_table(table), IndexRecovery::Complete)
-                    } else if index_store::is_object_damage(&err) {
-                        warn!("the index chain cannot be read ({err}); salvaging it");
-                        let anchor = index_store::cache_anchor(self.cache_dir().as_deref());
-                        let salvaged = index_store::salvage_chain(
-                            self.storage.as_ref(),
-                            self.crypto.as_ref(),
-                            &head,
-                            &anchor,
+                        (
+                            LiveIndex::from_table(table),
+                            RepairIndexLoad::read(IndexRecovery::Complete),
                         )
-                        .map_err(repair_load_refusal)?;
-                        let total = head.segments.len();
-                        let recovery = if salvaged.base_read && salvaged.applied == total {
-                            IndexRecovery::Complete
-                        } else {
-                            IndexRecovery::PartialChain {
-                                base_lost: !salvaged.base_read,
-                                applied: salvaged.applied,
-                                total,
-                            }
-                        };
+                    } else if index_store::is_object_damage(&err) {
                         warn!(
-                            applied = salvaged.applied,
-                            total,
-                            base_read = salvaged.base_read,
-                            "rebuilding the index from the readable part of its chain"
+                            "the index chain cannot be read ({err}); rebuilding the index from \
+                             the packs"
                         );
-                        let index = ChunkTable::scratch(salvaged.cache)
-                            .map(|t| LiveIndex::from_table(Arc::new(t)))
-                            .map_err(|_| {
-                                VykarError::Other("salvaged index state failed verification".into())
-                            })?;
-                        (index, recovery)
+                        self.rebuild_for_repair(IndexLoss::ChainDamaged, cancel)?
                     } else {
                         return Err(repair_load_refusal(err));
                     }
@@ -540,89 +546,67 @@ impl Repository {
                          copy of the repository"
                     )));
                 }
-                StoredHead::Unreadable(err) => self.chunk_index_without_head(&err)?,
+                StoredHead::Unreadable(err) => {
+                    warn!(
+                        "the index head cannot be read ({err}); rebuilding the index from the packs"
+                    );
+                    self.rebuild_for_repair(IndexLoss::HeadUnreadable, cancel)?
+                }
             },
         };
         self.chunk_index = index;
         self.index_head = None;
         self.index_dirty = true;
         self.rebase_pack_target_from_index();
-        Ok(recovery)
+        Ok(load)
     }
 
-    /// This machine's chunk table at any state: the repository's own, else
-    /// the verified table file written last (newest mtime).
-    fn local_table_any(&self) -> Option<Arc<ChunkTable>> {
-        if let Some(t) = self.chunk_index.table() {
-            return Some(Arc::clone(t));
-        }
-        let dir = self.cache_dir()?;
-        let mut files: Vec<(std::time::SystemTime, PathBuf)> = table::list_tables(&dir)
-            .into_iter()
-            .filter_map(|(_, path)| {
-                let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok()?;
-                Some((mtime, path))
-            })
-            .collect();
-        files.sort_by_key(|a| std::cmp::Reverse(a.0));
-        files
-            .iter()
-            .find_map(|(_, path)| ChunkTable::open_file(path))
-            .map(Arc::new)
-    }
-
-    /// The index for `check --repair` when `index` cannot be read (`err`):
-    /// this machine's chunk table, else rebuilt from `index.d/`.
-    fn chunk_index_without_head(&self, err: &VykarError) -> Result<(LiveIndex, IndexRecovery)> {
-        if let Some(table) = self.local_table_any() {
-            warn!(
-                "the index head cannot be read ({err}); rebuilding the index from this \
-                 machine's cache of it, which may be older than the repository's latest state"
-            );
-            let recovery = IndexRecovery::HeadUnreadable {
-                from_local_cache: true,
-                bases: 0,
-                applied: 0,
-                unplaced: 0,
-                damaged: 0,
-            };
-            return Ok((LiveIndex::from_table(table), recovery));
-        }
-        warn!(
-            "the index head cannot be read ({err}); rebuilding the index from the objects in \
-             index.d/"
-        );
-        let names = list_objects_for_repair(self.storage.as_ref())?;
+    /// Rebuild the index from the packs ([`index_rebuild`]). The verified
+    /// chunk tables of this machine (the repository's own, if loaded, and
+    /// every table file in its cache dir) back packs that describe none of
+    /// their contents; they are opened only when such a pack exists.
+    fn rebuild_for_repair(
+        &self,
+        cause: IndexLoss,
+        cancel: &CancelToken,
+    ) -> Result<(LiveIndex, RepairIndexLoad)> {
+        let dir = self.cache_dir();
+        let own = self.chunk_index.table().cloned();
+        let local_tables = || {
+            let mut tables: Vec<Arc<ChunkTable>> = own.into_iter().collect();
+            if let Some(dir) = dir.as_deref() {
+                for (state, path) in table::list_tables(dir) {
+                    if tables.iter().any(|t| t.state().0 == state) {
+                        continue;
+                    }
+                    if let Some(t) = ChunkTable::open_file(&path) {
+                        tables.push(Arc::new(t));
+                    }
+                }
+            }
+            tables
+        };
         let anchor = index_store::cache_anchor(self.cache_dir().as_deref());
-        let rebuilt = match index_store::rebuild_without_head(
+        let rebuilt = index_rebuild::rebuild_index_from_packs(
             self.storage.as_ref(),
             self.crypto.as_ref(),
-            names,
+            self.content_hash(),
+            local_tables,
             &anchor,
+            self.request_width(),
+            cancel,
         )
-        .map_err(repair_load_refusal)?
-        {
-            HeadlessOutcome::Refused(msg) => return Err(VykarError::Other(msg)),
-            HeadlessOutcome::Rebuilt(r) => r,
+        .map_err(rebuild_refusal)?;
+        let index = scratch_index(rebuilt.cache)?;
+        let load = RepairIndexLoad {
+            recovery: IndexRecovery::RebuiltFromPacks {
+                cause,
+                counts: rebuilt.counts,
+            },
+            uncovered_packs: rebuilt.uncovered,
+            packs_from_local_tables: rebuilt.from_local_tables,
         };
-        warn!(
-            bases = rebuilt.bases,
-            applied = rebuilt.applied,
-            unplaced = rebuilt.unplaced,
-            damaged = rebuilt.damaged,
-            "rebuilt the index from the objects in index.d/ without a head"
-        );
-        let index = ChunkTable::scratch(rebuilt.cache)
-            .map(|t| LiveIndex::from_table(Arc::new(t)))
-            .map_err(|_| VykarError::Other("rebuilt index state failed verification".into()))?;
-        let recovery = IndexRecovery::HeadUnreadable {
-            from_local_cache: false,
-            bases: rebuilt.bases,
-            applied: rebuilt.applied,
-            unplaced: rebuilt.unplaced,
-            damaged: rebuilt.damaged,
-        };
-        Ok((index, recovery))
+        Ok((index, load))
     }
 }
 
@@ -650,7 +634,7 @@ pub(super) fn list_objects_for_repair(
 }
 
 /// The error `check --repair` returns when reading the chain fails in a way
-/// that is not damage to an index object, so nothing is salvaged.
+/// that is not damage to an index object, so the index is not rebuilt.
 fn repair_load_refusal(e: VykarError) -> VykarError {
     match e {
         VykarError::Interrupted | VykarError::IndexHeadUnstable => e,
@@ -661,8 +645,19 @@ fn repair_load_refusal(e: VykarError) -> VykarError {
         e => VykarError::Other(format!(
             "{e}. Repair did not treat this as index damage and changed nothing; if the \
              error persists for one `index.d/` object, removing that object from the \
-             repository lets `vykar check --repair` rebuild the index from the rest, which \
-             may remove snapshots"
+             repository lets `vykar check --repair` rebuild the index from the packs"
+        )),
+    }
+}
+
+/// The error `check --repair` returns when the rebuild from the packs
+/// fails. It reads only storage, so nothing was changed. A pack map or
+/// trailer of a newer vykar is already an error naming its key.
+fn rebuild_refusal(e: VykarError) -> VykarError {
+    match e {
+        VykarError::Interrupted => e,
+        e => VykarError::Other(format!(
+            "rebuilding the index from the packs: {e}. Nothing was changed"
         )),
     }
 }

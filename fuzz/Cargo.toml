@@ -38,6 +38,11 @@ path = "fuzz_targets/fuzz_pack_trailer.rs"
 doc = false
 
 [[bin]]
+name = "fuzz_pack_map"
+path = "fuzz_targets/fuzz_pack_map.rs"
+doc = false
+
+[[bin]]
 name = "fuzz_decompress"
 path = "fuzz_targets/fuzz_decompress.rs"
 doc = false

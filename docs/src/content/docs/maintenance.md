@@ -57,24 +57,27 @@ vykar check --repair
 vykar check --repair --yes
 ```
 
-When index objects are missing or damaged, repair rebuilds the index from what
-can still be read and may remove snapshots whose data it then cannot locate; the
-plan says how much of the index could be read. Run it with `--dry-run` first.
-A storage error while reading the index is not treated as damage: repair changes
-nothing and reports the error. If the error persists for one `index.d/` object,
-removing that object from the repository lets `vykar check --repair` rebuild the
-index from the rest, which may remove snapshots.
+When the index cannot be read (its head is missing or damaged, or an object of
+`index.d/` is missing or damaged), repair rebuilds it from the packs, which
+describe their own contents: each pack ends in a trailer listing its chunks,
+and packs written before trailers are covered by pack maps under `packmaps/`
+or, failing both, by this machine's index cache. Nothing is lost for packs that
+are described this way. The plan says how the index was rebuilt and lists any
+pack that nothing describes; snapshots whose data lies only in such packs are
+removed by the plan. Run it with `--dry-run` first, and run
+`vykar check --verify-data` after a rebuild: the rebuild trusts what the packs
+say, and only a full verification finds chunks that rotted inside them.
 
-If the index head itself cannot be read, repair rebuilds the index from this
-machine's index cache, which may be older than the latest state, or else from
-the objects in `index.d/`. Without this machine's cache, that works only while
-those objects form a single chain. That is typically not the case after an
-index fold that changed the index state (until a fold that leaves the state
-unchanged, the one at the end of `compact`), or when an index
-state recurred (an unchanged source with rolling retention); repair then
-refuses, lists the objects and changes nothing. Run it on the machine that
-wrote to the repository last, whose cache is current. Do not delete a damaged
-`index`: without it, repair rebuilds the index from nothing.
+A storage error while reading the index or the packs is not treated as damage:
+repair changes nothing and reports the error. Neither is a pack trailer or pack
+map written by a newer vykar: repair refuses, names the object and asks for an
+upgrade. If no newer vykar has written to the repository, an object under
+`packmaps/` that this vykar cannot attribute does not belong there and may be
+removed by hand. Repair then describes the packs it named from their trailers
+or from this machine's chunk tables; a pack with neither becomes uncovered, and
+the snapshots that need it are removed.
+`check --verify-data` also checks pack trailers; a damaged trailer is repaired
+by writing a pack map for its pack, which removes nothing.
 
 The refcount rebuild also reclaims the space leak left by an **interrupted backup**.
 If a backup crashes after its index was committed but before its snapshot was

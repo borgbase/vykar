@@ -1438,10 +1438,10 @@ fn cli_check_repair_dry_run_prints_plan() {
     );
 }
 
-/// A lost index segment: the dry run says how much of the chain could be
-/// read and that the snapshots it no longer covers are removed.
+/// A lost index segment: the dry run says the index is rebuilt from the
+/// packs, whose trailers describe every chunk, so nothing is removed.
 #[test]
-fn cli_check_repair_dry_run_reports_a_partial_index_chain() {
+fn cli_check_repair_dry_run_reports_a_rebuild_of_a_damaged_chain() {
     let fx = CliFixture::new();
     write_plain_config(&fx.config_path, &fx.repo_dir);
     let cfg = fx.config_path.to_string_lossy().to_string();
@@ -1468,17 +1468,20 @@ fn cli_check_repair_dry_run_reports_a_partial_index_chain() {
         .path();
     std::fs::remove_file(segment).unwrap();
 
-    let (out, _) = fx.run_err(&["--config", &cfg, "check", "--repair", "--dry-run"]);
-    assert!(out.contains("index segment(s) can be read"), "{out}");
+    let out = stdout(&fx.run(&["--config", &cfg, "check", "--repair", "--dry-run"]));
     assert!(
-        out.contains("Snapshots whose data the rebuilt index cannot locate"),
+        out.contains("the index chain is damaged; the index is rebuilt from the packs"),
+        "{out}"
+    );
+    assert!(out.contains("from pack trailers"), "{out}");
+    assert!(
+        !out.contains("Snapshots whose data the rebuilt index cannot locate"),
         "{out}"
     );
 }
 
 /// An unreadable index head without a local cache: the dry run says the
-/// index is rebuilt from `index.d/` and that this cannot be confirmed to be
-/// the latest state.
+/// index is rebuilt from the packs.
 #[test]
 fn cli_check_repair_dry_run_reports_an_unreadable_head() {
     let fx = CliFixture::new();
@@ -1503,8 +1506,11 @@ fn cli_check_repair_dry_run_reports_an_unreadable_head() {
     std::fs::write(&index, &bytes[..bytes.len() / 2]).unwrap();
 
     let out = stdout(&fx.run(&["--config", &cfg, "check", "--repair", "--dry-run"]));
-    assert!(out.contains("the index head cannot be read"), "{out}");
-    assert!(out.contains("cannot be confirmed"), "{out}");
+    assert!(
+        out.contains("the index head cannot be read; the index is rebuilt from the packs"),
+        "{out}"
+    );
+    assert!(!out.contains("describe none of their contents"), "{out}");
 }
 
 #[test]

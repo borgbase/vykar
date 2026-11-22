@@ -503,3 +503,12 @@ fn v2_fixture_file_caches_are_dropped() {
         );
     }
 }
+
+/// After the upgrade, pack maps make the repository recoverable without its
+/// index: the fixture's packs carry no trailer.
+#[test]
+fn v2_fixtures_survive_index_loss_with_pack_maps() {
+    for mode in MODES {
+        fixtures::assert_index_loss_is_recovered_from_pack_maps("v2", mode, 2);
+    }
+}

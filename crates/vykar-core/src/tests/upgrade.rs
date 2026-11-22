@@ -9,7 +9,7 @@ use super::helpers::{
     make_test_config, try_backup_single_source,
 };
 use crate::commands;
-use crate::commands::check::{IndexRecovery, RepairAction, RepairMode};
+use crate::commands::check::{IndexLoss, IndexRecovery, RebuildCounts, RepairMode};
 use crate::config::VykarConfig;
 use crate::index::dedup_cache;
 use crate::index::table::{self, ChunkTable};
@@ -847,8 +847,7 @@ fn resumed(outcome: &UpgradeOutcome) -> bool {
 
 /// An interrupted upgrade whose chain lost a segment: `vykar upgrade`
 /// completes the version switch, deletes nothing and names `check --repair`,
-/// which repairs the index as v5 (dropping the snapshot that needs the
-/// segment).
+/// which rebuilds the index from the packs as v5 and keeps every snapshot.
 #[test]
 fn interrupted_upgrade_with_a_broken_chain_is_completed_then_repaired() {
     let fx = fixture(RepoFormat::V3);
@@ -884,22 +883,18 @@ fn interrupted_upgrade_with_a_broken_chain_is_completed_then_repaired() {
 
     let cold = fx.cold("cold");
     let plan = repair(&cold, RepairMode::PlanOnly).unwrap().plan;
-    assert_eq!(
-        plan.index_recovery,
-        IndexRecovery::PartialChain {
-            base_lost: false,
-            applied: 0,
-            total: 1
-        }
-    );
-    assert!(plan.has_data_loss, "{:?}", plan.actions);
-    let removes_s3 = |a: &RepairAction| matches!(a, RepairAction::RemoveDanglingSnapshot { snapshot_name, .. } if snapshot_name == "s3");
-    assert!(plan.actions.iter().any(removes_s3), "{:?}", plan.actions);
-    let names = format!("{:?}", plan.actions);
     assert!(
-        !names.contains("\"s1\"") && !names.contains("\"s2\""),
-        "{names}"
+        matches!(
+            plan.index_recovery,
+            IndexRecovery::RebuiltFromPacks {
+                cause: IndexLoss::ChainDamaged,
+                counts: RebuildCounts { uncovered: 0, .. },
+            }
+        ),
+        "{:?}",
+        plan.index_recovery
     );
+    assert!(!plan.has_data_loss, "{:?}", plan.actions);
     apply_shown(&cold, &plan).unwrap();
 
     let bytes = std::fs::read(fx.repo_dir.join("index")).unwrap();
@@ -907,7 +902,7 @@ fn interrupted_upgrade_with_a_broken_chain_is_completed_then_repaired() {
     let head = index_store::decode_head(&bytes, &crypto).unwrap();
     assert!(head.base.is_some() && head.segments.is_empty());
     fx.check_clean();
-    assert_eq!(fx.snapshot_names(), ["s1", "s2"]);
+    assert_eq!(fx.snapshot_names(), ["s1", "s2", "s3"]);
     assert_eq!(
         commands::upgrade::run(&fx.config, None).unwrap(),
         UpgradeOutcome::AlreadyCurrent { version: 5 }
@@ -916,7 +911,7 @@ fn interrupted_upgrade_with_a_broken_chain_is_completed_then_repaired() {
 
 /// An interrupted upgrade whose head is damaged: `vykar upgrade` completes
 /// the version switch and names `check --repair`, which rebuilds the index
-/// from this machine's cache, or on another machine from the upgrade's base.
+/// from the packs, on this machine as on another one.
 #[test]
 fn interrupted_upgrade_with_a_corrupt_head_is_completed_then_repaired() {
     let fx = fixture(RepoFormat::V3);
@@ -941,30 +936,20 @@ fn interrupted_upgrade_with_a_corrupt_head_is_completed_then_repaired() {
     assert!(index_gen.exists() && blob.exists());
 
     let warm = repair(&fx.config, RepairMode::PlanOnly).unwrap().plan;
-    assert!(
+    let rebuilt = |recovery: IndexRecovery| {
         matches!(
-            warm.index_recovery,
-            IndexRecovery::HeadUnreadable {
-                from_local_cache: true,
-                ..
+            recovery,
+            IndexRecovery::RebuiltFromPacks {
+                cause: IndexLoss::HeadUnreadable,
+                counts: RebuildCounts { uncovered: 0, .. },
             }
-        ),
-        "{:?}",
-        warm.index_recovery
-    );
+        )
+    };
+    assert!(rebuilt(warm.index_recovery), "{:?}", warm.index_recovery);
 
     let cold = fx.cold("cold");
     let plan = repair(&cold, RepairMode::PlanOnly).unwrap().plan;
-    assert_eq!(
-        plan.index_recovery,
-        IndexRecovery::HeadUnreadable {
-            from_local_cache: false,
-            bases: 1,
-            applied: 0,
-            unplaced: 0,
-            damaged: 0
-        }
-    );
+    assert!(rebuilt(plan.index_recovery), "{:?}", plan.index_recovery);
     assert!(!plan.has_data_loss, "{:?}", plan.actions);
     apply_shown(&cold, &plan).unwrap();
 

@@ -26,6 +26,7 @@ use vykar_core::index::{
 use vykar_core::repo::file_cache::{CachedChunkRef, CachedChunks, FileCache};
 use vykar_core::repo::format::{ObjectType, pack_object_with_context};
 use vykar_core::repo::pack::{PackType, PackWriter};
+use vykar_core::repo::pack_map::{PackMap, PackMapEntry};
 use vykar_core::repo::pack_trailer::read_trailer_from_pack_bytes;
 use vykar_core::repo::{ChunkerParams, EncryptionMode, RepoConfig};
 use vykar_core::snapshot::SnapshotMeta;
@@ -622,6 +623,31 @@ fn contextual_aad(obj_type: ObjectType, context: &[u8]) -> Vec<u8> {
     aad
 }
 
+fn seed_pack_map() {
+    let entry = |id: u8, offset: u32, stored_size: u32| PackMapEntry {
+        chunk_id: ChunkId::from_bytes([id; 32]),
+        offset,
+        stored_size,
+    };
+    let map = PackMap {
+        packs: vec![
+            (
+                PackId::from_bytes([1; 32]),
+                vec![entry(1, 13, 2), entry(2, 19, 3)],
+            ),
+            (PackId::from_bytes([2; 32]), vec![entry(3, 13, 256)]),
+        ],
+    };
+    let body = map.encode_body();
+    write_seed("fuzz_pack_map", "two_packs", &body);
+    let mut newer = body.clone();
+    newer[0] = 2;
+    write_seed("fuzz_pack_map", "body_version_2", &newer);
+    let mut empty = body[..5].to_vec();
+    empty[1..5].copy_from_slice(&0u32.to_le_bytes());
+    write_seed("fuzz_pack_map", "pack_count_0", &empty);
+}
+
 fn seed_unpack_object() {
     let plaintext = b"fuzz seed plaintext data";
 
@@ -939,6 +965,9 @@ fn main() {
 
     seed_pack_trailer();
     println!("  fuzz_pack_trailer: done");
+
+    seed_pack_map();
+    println!("  fuzz_pack_map: done");
 
     seed_decompress();
     println!("  fuzz_decompress: done");

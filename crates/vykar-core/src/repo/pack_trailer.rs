@@ -420,7 +420,9 @@ pub enum TrailerRead {
     /// A footer is present, but the frame, the AEAD, the body or the layout
     /// is wrong. A body of an unknown version or codec is
     /// `Damaged(VykarError::UnsupportedVersion(_))`: written by a newer
-    /// binary, not broken; callers must refuse rather than repair it.
+    /// binary, not broken; callers must refuse rather than repair it. (In a
+    /// plaintext repository rot can produce it too: the index rebuild tells
+    /// the two apart by hashing the pack against its ID.)
     ///
     /// Only the last 12 bytes decide between this and `Absent`. In a
     /// plaintext repository a pack from before trailers whose last blob ends

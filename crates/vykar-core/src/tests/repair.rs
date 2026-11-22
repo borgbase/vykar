@@ -499,53 +499,58 @@ fn per_chunk_corruption_preserves_siblings() {
             );
         }
     }
+
+    // The pack gets a map listing only the entries the index keeps, so a
+    // later rebuild from the packs does not bring the corrupt chunk back.
+    assert!(
+        has_action(&result.plan.actions, |a| matches!(
+            a,
+            RepairAction::WritePackMaps { pack_ids } if pack_ids.contains(&target_pack_id)
+        )),
+        "expected WritePackMaps for the pack, got: {:?}",
+        result.plan.actions
+    );
 }
 
 // ---------------------------------------------------------------------------
-// 14. Deleted index: plan includes doomed snapshots
+// 14. Deleted index: rebuilt from the packs, nothing lost
 // ---------------------------------------------------------------------------
 
 #[test]
-fn deleted_index_plan_includes_doomed_snapshots() {
+fn deleted_index_is_rebuilt_from_the_packs() {
     let tmp = tempfile::tempdir().unwrap();
     let (repo_dir, config) = setup_repo(tmp.path());
 
     apply_corruption(Corruption::DeleteIndex, &repo_dir);
 
-    // With an empty index, all snapshot chunk refs are dangling — the plan
-    // should include RemoveDanglingSnapshot so the user sees the full picture.
+    // Every pack ends in a trailer, so the rebuilt index locates every chunk
+    // and no snapshot is removed.
     let plan_result = plan_only(&config, false);
     assert!(
-        plan_result.plan.has_data_loss,
-        "PlanOnly with deleted index should show has_data_loss=true"
-    );
-    assert!(
-        has_action(&plan_result.plan.actions, |a| matches!(
-            a,
-            RepairAction::RemoveDanglingSnapshot { .. }
-        )),
-        "PlanOnly should include RemoveDanglingSnapshot, got: {:?}",
+        !plan_result.plan.has_data_loss,
+        "PlanOnly with deleted index should lose nothing, got: {:?}",
         plan_result.plan.actions
     );
     assert!(
-        has_action(&plan_result.plan.actions, |a| matches!(
-            a,
-            RepairAction::RebuildRefcounts
-        )),
-        "expected RebuildRefcounts in plan, got: {:?}",
+        matches!(
+            plan_result.plan.actions.as_slice(),
+            [RepairAction::RebuildRefcounts]
+        ),
+        "expected only RebuildRefcounts in plan, got: {:?}",
         plan_result.plan.actions
     );
 
-    // Apply should also produce RemoveDanglingSnapshot.
     let apply_result = apply_repair(&config, false);
     assert!(
-        has_action(&apply_result.applied, |a| matches!(
+        !has_action(&apply_result.applied, |a| matches!(
             a,
             RepairAction::RemoveDanglingSnapshot { .. }
         )),
-        "Apply with deleted index should produce RemoveDanglingSnapshot, got: {:?}",
+        "Apply with deleted index should remove nothing, got: {:?}",
         apply_result.applied
     );
+    let check = commands::check::run(&config, None, true, false).unwrap();
+    assert!(check.errors.is_empty(), "{:?}", check.errors);
 }
 
 // ---------------------------------------------------------------------------

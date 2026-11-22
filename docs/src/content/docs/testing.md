@@ -56,6 +56,7 @@ Unit tests in `vykar-core` cover each subsystem in isolation. Fast feedback (sec
 |--------|-------------------|--------------|
 | `fuzz_pack_scan` | `scan_pack_blobs_bytes` | Integer overflow in length fields, truncated frames |
 | `fuzz_pack_trailer` | `PackTrailer::decode_body`, `parse_footer`, `open_trailer_frame`, `read_trailer_from_pack_bytes` | Lying footer and frame lengths, entry counts, overlapping offsets; non-canonical bodies |
+| `fuzz_pack_map` | `PackMap::decode_body` | Lying pack and entry counts, unsorted or overlapping entries, oversized maps; non-canonical bodies |
 | `fuzz_decompress` | `decompress` + `decompress_metadata`, streaming zstd metadata reader | Decompression bombs, corrupt LZ4/Zstd frames, streaming vs buffered disagreement |
 | `fuzz_msgpack_snapshot_meta` | `from_slice::<SnapshotMeta>` | Large collection size declarations |
 | `fuzz_msgpack_index_blob` | `from_slice::<IndexBlob>` | Massive chunk index allocation |

@@ -9,7 +9,7 @@ use super::helpers::{
     FailGet, FaultyPut, backup_single_source, is_base_put, is_head_put, make_test_config,
 };
 use crate::commands;
-use crate::commands::check::{IndexRecovery, RepairAction, RepairMode};
+use crate::commands::check::{IndexLoss, IndexRecovery, RebuildCounts, RepairAction, RepairMode};
 use crate::config::VykarConfig;
 use crate::index::ChunkIndex;
 use crate::index::head::{IndexHead, ObjectName};
@@ -594,12 +594,12 @@ fn read_restored(dir: &Path, name: &str) -> String {
 }
 
 /// A segment object went missing. Loading the index fails and names
-/// `check --repair`. Repair rebuilds the chain up to the lost segment, so
-/// `s3`, which needs it, is removed; the plan says so, and an apply that
-/// was shown a plan without data loss, or with another index reading,
-/// refuses and changes nothing.
+/// `check --repair`. Repair rebuilds the index from the packs, whose
+/// trailers describe every chunk, so nothing is lost: every snapshot is kept
+/// and restores. An apply that was shown another index reading refuses and
+/// changes nothing.
 #[test]
-fn repair_salvages_a_broken_chain() {
+fn repair_rebuilds_a_broken_chain_from_the_packs() {
     let fx = three_backups();
     let head = fx.head();
     let lost = head.segments.last().unwrap().name;
@@ -617,51 +617,38 @@ fn repair_salvages_a_broken_chain() {
         commands::check::run_with_repair(&other, None, false, mode, None, &CancelToken::new())
     };
     let shown = repair(RepairMode::PlanOnly).unwrap().plan;
-    assert_eq!(
-        shown.index_recovery,
-        IndexRecovery::PartialChain {
-            base_lost: false,
-            applied: 2,
-            total: 3
-        }
-    );
-    assert!(shown.has_data_loss, "{:?}", shown.actions);
-    let removes_s3 = |a: &RepairAction| matches!(a, RepairAction::RemoveDanglingSnapshot { snapshot_name, .. } if snapshot_name == "s3");
-    assert!(shown.actions.iter().any(removes_s3), "{:?}", shown.actions);
-    let names = format!("{:?}", shown.actions);
+    let IndexRecovery::RebuiltFromPacks { cause, counts } = shown.index_recovery else {
+        panic!("{:?}", shown.index_recovery);
+    };
+    assert_eq!(cause, IndexLoss::ChainDamaged);
+    assert_eq!(counts.packs, pack_count(&fx));
+    assert_eq!(counts.from_trailers, counts.packs);
+    assert_eq!(counts.uncovered, 0);
+    assert!(shown.uncovered_packs.is_empty());
+    assert!(!shown.has_data_loss, "{:?}", shown.actions);
     assert!(
-        !names.contains("\"s1\"") && !names.contains("\"s2\""),
-        "{names}"
+        matches!(shown.actions.as_slice(), [RepairAction::RebuildRefcounts]),
+        "{:?}",
+        shown.actions
     );
 
     let before = repo_state(&fx);
-    for (has_data_loss, index_recovery, reason) in [
-        (false, IndexRecovery::Complete, "aborting repair"),
-        (false, shown.index_recovery, "removes data"),
-        (true, IndexRecovery::Complete, "read differently"),
-    ] {
-        let err = repair(RepairMode::ApplyShown {
-            has_data_loss,
-            index_recovery,
-        })
-        .err()
-        .unwrap()
-        .to_string();
-        assert!(err.contains("aborting repair"), "{err}");
-        assert!(err.contains(reason), "{err}");
-        assert_eq!(repo_state(&fx), before);
-    }
+    let err = repair(RepairMode::ApplyShown {
+        has_data_loss: false,
+        index_recovery: IndexRecovery::Complete,
+    })
+    .err()
+    .unwrap()
+    .to_string();
+    assert!(err.contains("aborting repair"), "{err}");
+    assert!(err.contains("read differently"), "{err}");
+    assert_eq!(repo_state(&fx), before);
 
-    let result = repair(RepairMode::ApplyShown {
+    repair(RepairMode::ApplyShown {
         has_data_loss: shown.has_data_loss,
         index_recovery: shown.index_recovery,
     })
     .unwrap();
-    assert!(
-        result.applied.iter().any(removes_s3),
-        "{:?}",
-        result.applied
-    );
     let repaired = fx.head();
     assert!(repaired.segments.is_empty());
     assert_eq!(fx.index_objects(), 1);
@@ -669,18 +656,7 @@ fn repair_salvages_a_broken_chain() {
 
     assert_eq!(read_restored(&fx.restore(&other, "s1"), "a"), "alpha");
     assert_eq!(read_restored(&fx.restore(&other, "s2"), "b"), "bravo");
-    let dest = fx.tmp.path().join("restore-s3");
-    let s3 = commands::restore::run(
-        &other,
-        None,
-        "s3",
-        dest.to_str().unwrap(),
-        None,
-        false,
-        true,
-        &CancelToken::new(),
-    );
-    assert!(s3.is_err());
+    assert_eq!(read_restored(&fx.restore(&other, "s3"), "c"), "charlie");
 
     let clean = repair(RepairMode::ApplyShown {
         has_data_loss: false,
@@ -689,6 +665,22 @@ fn repair_salvages_a_broken_chain() {
     .unwrap();
     assert!(!clean.plan.has_data_loss, "{:?}", clean.plan.actions);
     assert_eq!(clean.plan.index_recovery, IndexRecovery::Complete);
+}
+
+/// Packs on disk.
+fn pack_count(fx: &Fixture) -> usize {
+    fn walk(dir: &Path) -> usize {
+        std::fs::read_dir(dir).map_or(0, |entries| {
+            entries
+                .flatten()
+                .map(|e| {
+                    let path = e.path();
+                    if path.is_dir() { walk(&path) } else { 1 }
+                })
+                .sum()
+        })
+    }
+    walk(&fx.repo_dir.join("packs"))
 }
 
 /// A storage error while reading the chain is not damage: a client without
@@ -711,7 +703,7 @@ fn repair_load_refuses_on_a_storage_error() {
             )
             .unwrap();
         let err = repo
-            .load_chunk_index_for_repair()
+            .load_chunk_index_for_repair(&CancelToken::new())
             .err()
             .unwrap()
             .to_string();
@@ -767,7 +759,7 @@ fn repair_load_refuses_a_segment_from_a_newer_vykar() {
         )
         .unwrap();
     let err = repo
-        .load_chunk_index_for_repair()
+        .load_chunk_index_for_repair(&CancelToken::new())
         .err()
         .unwrap()
         .to_string();
@@ -792,15 +784,17 @@ fn repair_load_uses_the_local_cache_on_a_storage_error() {
         )
         .unwrap();
     assert_eq!(
-        repo.load_chunk_index_for_repair().unwrap(),
+        repo.load_chunk_index_for_repair(&CancelToken::new())
+            .unwrap()
+            .recovery,
         IndexRecovery::Complete
     );
     assert_eq!(sorted_entries(repo.chunk_index()), warm);
 }
 
-/// Without a head, the plan says the index is rebuilt from nothing.
+/// Without a head, the index is rebuilt from the packs and nothing is lost.
 #[test]
-fn repair_reports_a_missing_head() {
+fn repair_rebuilds_a_missing_head_from_the_packs() {
     let fx = fixture(RepoFormat::V5);
     fx.write("a", "alpha");
     fx.backup(&fx.config, "s1");
@@ -815,8 +809,28 @@ fn repair_reports_a_missing_head() {
     )
     .unwrap()
     .plan;
-    assert_eq!(plan.index_recovery, IndexRecovery::HeadMissing);
-    assert!(plan.has_data_loss, "{:?}", plan.actions);
+    assert!(
+        matches!(
+            plan.index_recovery,
+            IndexRecovery::RebuiltFromPacks {
+                cause: IndexLoss::HeadMissing,
+                counts: RebuildCounts { uncovered: 0, .. },
+            }
+        ),
+        "{:?}",
+        plan.index_recovery
+    );
+    assert!(!plan.has_data_loss, "{:?}", plan.actions);
+    commands::check::run_with_repair(
+        &fx.config,
+        None,
+        false,
+        RepairMode::Apply,
+        None,
+        &CancelToken::new(),
+    )
+    .unwrap();
+    assert_eq!(read_restored(&fx.restore(&fx.config, "s1"), "a"), "alpha");
 }
 
 /// Logs `put` and `delete` keys in call order.
@@ -975,7 +989,8 @@ fn open_for_repair(fx: &Fixture, storage: Box<dyn StorageBackend>, cache: &str) 
             OpenOptions::new().tolerate_broken_index(),
         )
         .unwrap();
-    repo.load_chunk_index_for_repair().unwrap();
+    repo.load_chunk_index_for_repair(&CancelToken::new())
+        .unwrap();
     repo
 }
 
@@ -1480,39 +1495,34 @@ fn removes(snapshot: &str) -> impl Fn(&RepairAction) -> bool + '_ {
     move |a| matches!(a, RepairAction::RemoveDanglingSnapshot { snapshot_name, .. } if snapshot_name == snapshot)
 }
 
-/// An unreadable head is rebuilt from this machine's cache, or on another
-/// machine from the chain in `index.d/`.
+/// An unreadable head is rebuilt from the packs, on this machine as on
+/// another one; the repaired index equals the one before the damage.
 #[test]
 fn repair_rebuilds_from_a_corrupt_head() {
     let fx = three_backups();
     let before = cold_index(&fx, "cold-before");
     truncate_head(&fx);
     assert!(fx.open(&fx.cache(), false).is_err());
+    let packs = pack_count(&fx);
+    let from_trailers = |recovery: IndexRecovery| match recovery {
+        IndexRecovery::RebuiltFromPacks {
+            cause: IndexLoss::HeadUnreadable,
+            counts,
+        } => {
+            assert_eq!(counts.packs, packs, "{counts:?}");
+            assert_eq!(counts.uncovered, 0, "{counts:?}");
+            counts.from_trailers
+        }
+        other => panic!("{other:?}"),
+    };
 
     let warm = plan_only(&fx.config).unwrap().plan;
-    assert_eq!(
-        warm.index_recovery,
-        IndexRecovery::HeadUnreadable {
-            from_local_cache: true,
-            bases: 0,
-            applied: 0,
-            unplaced: 0,
-            damaged: 0
-        }
-    );
+    assert_eq!(from_trailers(warm.index_recovery), packs);
+    assert!(!warm.has_data_loss, "{:?}", warm.actions);
 
     let other = fx.other_client("cache-b");
     let shown = plan_only(&other).unwrap().plan;
-    assert_eq!(
-        shown.index_recovery,
-        IndexRecovery::HeadUnreadable {
-            from_local_cache: false,
-            bases: 0,
-            applied: 3,
-            unplaced: 0,
-            damaged: 0
-        }
-    );
+    assert_eq!(from_trailers(shown.index_recovery), packs);
     assert!(!shown.has_data_loss, "{:?}", shown.actions);
     commands::check::run_with_repair(
         &other,
@@ -1539,28 +1549,29 @@ fn repair_rebuilds_from_a_corrupt_head() {
     assert_eq!(fx.head().segments.len(), 1);
 }
 
-/// Fails every listing of `index.d/`.
-struct FailIndexList {
+/// Fails every listing below `prefix`.
+struct FailList {
     inner: Arc<dyn StorageBackend>,
+    prefix: &'static str,
 }
 
-impl FailIndexList {
+impl FailList {
     fn check(&self, prefix: &str) -> Result<()> {
-        if prefix.starts_with(INDEX_OBJECT_DIR) {
+        if prefix.starts_with(self.prefix) {
             return Err(VykarError::Other("injected list failure".into()));
         }
         Ok(())
     }
 }
 
-impl InnerBackend for FailIndexList {
+impl InnerBackend for FailList {
     fn inner_backend(&self) -> &dyn StorageBackend {
         &*self.inner
     }
 }
 
 delegate_storage_backend! {
-    for FailIndexList;
+    for FailList;
     except [list, list_sized, list_meta, server_ops];
 
     fn list_meta(
@@ -1586,108 +1597,47 @@ delegate_storage_backend! {
     }
 }
 
-/// A failed `index.d/` listing on an unreadable head is named as such, without
-/// the advice to remove an index object.
+/// A failed listing of `packs/` or `packmaps/` on an unreadable head stops
+/// the rebuild; the error says so, without the advice to remove an index
+/// object, and nothing is changed.
 #[test]
 fn repair_without_a_head_names_a_failed_listing() {
     let fx = three_backups();
     truncate_head(&fx);
     let before = repo_state(&fx);
-    let storage = FailIndexList {
-        inner: Arc::from(fx.storage()),
-    };
-    let mut repo = fx
-        .open_with(
-            Box::new(storage),
-            &fx.tmp.path().join("cold"),
-            OpenOptions::new().tolerate_broken_index(),
-        )
-        .unwrap();
-    let err = repo
-        .load_chunk_index_for_repair()
-        .err()
-        .unwrap()
-        .to_string();
-    assert!(err.contains("listing index.d/"), "{err}");
-    assert!(err.contains("injected list failure"), "{err}");
-    assert!(!err.contains("removing that object"), "{err}");
-    assert_eq!(repo_state(&fx), before);
-}
-
-/// After a fold that changed the state, `index.d/` holds two chains that
-/// nothing links: a client without a current cache is refused and changes
-/// nothing; the client whose cache holds the latest state repairs.
-#[test]
-fn repair_after_a_state_changing_fold_needs_a_current_cache() {
-    let fx = fixture(RepoFormat::V5);
-    fx.write("a", "alpha");
-    fx.write("b", "bravo");
-    fx.backup(&fx.config, "s1");
-    let mut repo = fx.open(&fx.cache(), false).unwrap();
-    let mut policy = crate::repo::index_write::FoldPolicy::default();
-    policy.hard.segments = 3;
-    policy.hard.percent = 100_000;
-    repo.set_fold_policy(policy);
-    let mut counts = Vec::new();
-    for round in 0..3u32 {
-        repo.load_chunk_index_under_lock().unwrap();
-        let id = repo.chunk_index().iter().next().unwrap().0;
-        repo.chunk_index_mut().increment_refcount_by(&id, round + 1);
-        repo.save_state().unwrap();
-        counts.push(repo.index_head().unwrap().segments.len());
-    }
-    assert_eq!(counts, vec![2, 0, 1]);
-    let head = fx.head();
-    assert_eq!(head.retired.len(), 2);
-    let live_base = head.base.as_ref().unwrap().name.to_hex();
-    drop(repo);
-    truncate_head(&fx);
-
-    let cold = fx.other_client("cold");
-    let before = repo_state(&fx);
-    for mode in [RepairMode::PlanOnly, RepairMode::Apply] {
-        let err =
-            commands::check::run_with_repair(&cold, None, false, mode, None, &CancelToken::new())
-                .err()
-                .unwrap()
-                .to_string();
-        assert!(err.contains("2 different index states"), "{err}");
-        assert!(err.contains("the empty index"), "{err}");
-        assert!(err.contains(&live_base), "{err}");
+    for prefix in ["packs/", "packmaps/"] {
+        let storage = FailList {
+            inner: Arc::from(fx.storage()),
+            prefix,
+        };
+        let mut repo = fx
+            .open_with(
+                Box::new(storage),
+                &fx.tmp.path().join("cold"),
+                OpenOptions::new().tolerate_broken_index(),
+            )
+            .unwrap();
+        let err = repo
+            .load_chunk_index_for_repair(&CancelToken::new())
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            err.contains("rebuilding the index from the packs"),
+            "{prefix}: {err}"
+        );
+        assert!(err.contains("injected list failure"), "{prefix}: {err}");
+        assert!(err.contains("Nothing was changed"), "{prefix}: {err}");
+        assert!(!err.contains("removing that object"), "{prefix}: {err}");
         assert_eq!(repo_state(&fx), before);
     }
-
-    let shown = plan_only(&fx.config).unwrap().plan;
-    assert!(matches!(
-        shown.index_recovery,
-        IndexRecovery::HeadUnreadable {
-            from_local_cache: true,
-            ..
-        }
-    ));
-    assert!(!shown.has_data_loss, "{:?}", shown.actions);
-    commands::check::run_with_repair(
-        &fx.config,
-        None,
-        false,
-        RepairMode::ApplyShown {
-            has_data_loss: false,
-            index_recovery: shown.index_recovery,
-        },
-        None,
-        &CancelToken::new(),
-    )
-    .unwrap();
-    let head = fx.head();
-    assert!(head.base.is_some() && head.segments.is_empty());
-    fx.check_clean(&fx.config);
-    assert_eq!(read_restored(&fx.restore(&fx.config, "s1"), "a"), "alpha");
 }
 
-/// A cache older than the latest state is used as it is: the plan removes
-/// the snapshot committed after it.
+/// A cache older than the latest state does not matter: the index is
+/// rebuilt from the packs, and the snapshot committed after the cache's
+/// state is kept.
 #[test]
-fn repair_from_a_stale_local_cache_removes_later_snapshots() {
+fn repair_with_a_stale_local_cache_keeps_later_snapshots() {
     let fx = fixture(RepoFormat::V5);
     fx.write("a", "alpha");
     fx.backup(&fx.config, "s1");
@@ -1701,40 +1651,47 @@ fn repair_from_a_stale_local_cache_removes_later_snapshots() {
     truncate_head(&fx);
 
     let plan = plan_only(&b).unwrap().plan;
-    assert_eq!(
-        plan.index_recovery,
-        IndexRecovery::HeadUnreadable {
-            from_local_cache: true,
-            bases: 0,
-            applied: 0,
-            unplaced: 0,
-            damaged: 0
-        }
-    );
-    assert!(plan.has_data_loss, "{:?}", plan.actions);
-    assert!(plan.actions.iter().any(removes("s3")), "{:?}", plan.actions);
-    let names = format!("{:?}", plan.actions);
     assert!(
-        !names.contains("\"s1\"") && !names.contains("\"s2\""),
-        "{names}"
+        matches!(
+            plan.index_recovery,
+            IndexRecovery::RebuiltFromPacks {
+                cause: IndexLoss::HeadUnreadable,
+                counts: RebuildCounts {
+                    uncovered: 0,
+                    from_local_tables: 0,
+                    ..
+                },
+            }
+        ),
+        "{:?}",
+        plan.index_recovery
     );
+    assert!(!plan.has_data_loss, "{:?}", plan.actions);
+    assert!(
+        !plan.actions.iter().any(removes("s3")),
+        "{:?}",
+        plan.actions
+    );
+    commands::check::run_with_repair(
+        &b,
+        None,
+        false,
+        RepairMode::Apply,
+        None,
+        &CancelToken::new(),
+    )
+    .unwrap();
+    assert_eq!(read_restored(&fx.restore(&b, "s3"), "c"), "charlie");
 }
 
-/// A headless repair whose head PUT fails leaves its base behind; the next
-/// cold repair lists it as a second end state, and succeeds once it is gone.
+/// A repair whose head PUT fails leaves its base behind in `index.d/`; the
+/// next cold repair rebuilds from the packs anyway and is clean.
 #[test]
-fn rerun_after_a_failed_headless_repair_write_is_refused() {
+fn rerun_after_a_failed_rebuild_write_succeeds() {
     let fx = three_backups();
     truncate_head(&fx);
     let index_bytes = std::fs::read(fx.repo_dir.join("index")).unwrap();
-    let listing = |fx: &Fixture| -> std::collections::BTreeSet<String> {
-        fx.storage()
-            .list(INDEX_OBJECT_DIR)
-            .unwrap()
-            .into_iter()
-            .collect()
-    };
-    let before = listing(&fx);
+    let before = fx.index_objects();
 
     let (storage, _) = faulty(&fx, is_head_put);
     let mut repo = fx
@@ -1745,9 +1702,11 @@ fn rerun_after_a_failed_headless_repair_write_is_refused() {
         )
         .unwrap();
     assert!(matches!(
-        repo.load_chunk_index_for_repair().unwrap(),
-        IndexRecovery::HeadUnreadable {
-            from_local_cache: false,
+        repo.load_chunk_index_for_repair(&CancelToken::new())
+            .unwrap()
+            .recovery,
+        IndexRecovery::RebuiltFromPacks {
+            cause: IndexLoss::HeadUnreadable,
             ..
         }
     ));
@@ -1755,78 +1714,30 @@ fn rerun_after_a_failed_headless_repair_write_is_refused() {
     repo.request_index_fold();
     assert!(repo.save_state().is_err());
     drop(repo);
-
     assert_eq!(
         std::fs::read(fx.repo_dir.join("index")).unwrap(),
         index_bytes
     );
-    let after = listing(&fx);
-    let added: Vec<&String> = after.difference(&before).collect();
-    assert_eq!(added.len(), 1, "{added:?}");
-    assert!(before.is_subset(&after));
-    let debris = added[0].strip_prefix(INDEX_OBJECT_DIR).unwrap().to_string();
+    assert_eq!(fx.index_objects(), before + 1);
 
     let cold = fx.other_client("cold-b");
-    let err = plan_only(&cold).err().unwrap().to_string();
-    assert!(err.contains("different index states"), "{err}");
-    assert!(err.contains(&debris), "{err}");
-
-    std::fs::remove_file(fx.repo_dir.join(INDEX_OBJECT_DIR).join(&debris)).unwrap();
     let plan = plan_only(&cold).unwrap().plan;
-    assert!(
-        matches!(
-            plan.index_recovery,
-            IndexRecovery::HeadUnreadable {
-                from_local_cache: false,
-                bases: 0,
-                applied: 3,
-                ..
-            }
-        ),
-        "{:?}",
-        plan.index_recovery
-    );
-}
-
-/// A segment whose head PUT failed follows the latest state; without a head
-/// it is applied like a committed one, and the repair is clean.
-#[test]
-fn repair_without_a_head_applies_a_failed_write_s_segment() {
-    let fx = three_backups();
-    let mut repo = fx.open(&fx.cache(), false).unwrap();
-    repo.load_chunk_index_under_lock().unwrap();
-    bump_one_refcount(&mut repo);
-    repo.set_lock_fence(Arc::new(|| Err(VykarError::Other("lock lost".into()))));
-    assert!(repo.save_state().is_err());
-    drop(repo);
-    truncate_head(&fx);
-
-    let cold = fx.other_client("cold");
-    let shown = plan_only(&cold).unwrap().plan;
-    assert_eq!(
-        shown.index_recovery,
-        IndexRecovery::HeadUnreadable {
-            from_local_cache: false,
-            bases: 0,
-            applied: 4,
-            unplaced: 0,
-            damaged: 0
-        }
-    );
-    assert!(!shown.has_data_loss, "{:?}", shown.actions);
+    assert!(!plan.has_data_loss, "{:?}", plan.actions);
     commands::check::run_with_repair(
         &cold,
         None,
         false,
         RepairMode::ApplyShown {
             has_data_loss: false,
-            index_recovery: shown.index_recovery,
+            index_recovery: plan.index_recovery,
         },
         None,
         &CancelToken::new(),
     )
     .unwrap();
+    assert_eq!(fx.index_objects(), 1);
     fx.check_clean(&cold);
+    assert_eq!(read_restored(&fx.restore(&cold, "s3"), "c"), "charlie");
 }
 
 /// An `index` of a newer head layout or of an unknown type is refused, not

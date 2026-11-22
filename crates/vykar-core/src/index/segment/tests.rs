@@ -250,50 +250,6 @@ fn chain_mismatch_rejected() {
 }
 
 #[test]
-fn apply_unnamed_matches_apply_to_temp() {
-    let dir = tempfile::tempdir().unwrap();
-    let prev_entries = [
-        entry(id(1), 2, 1, 0),
-        entry(id(2), 1, 1, 100),
-        entry(id(3), 5, 2, 0),
-    ];
-    let prev = write_cache(&index_from(&prev_entries), dir.path(), "prev");
-    let mut next = index_from(&prev_entries);
-    next.decrement(&id(2));
-    next.update_location(&id(3), pack(9), 7, 42);
-    next.add(id(5), 10, pack(9), 99);
-    let diff = diff_checked(&prev, &next, dir.path());
-    let t = target(dir.path());
-
-    let (unnamed, hash, count) = apply_unnamed_to_temp(&prev, &diff.segment, &t).unwrap();
-    assert_eq!((hash, count), (diff.state_hash_after, diff.entries_after));
-    let (named, _, _) = apply_to_temp(&prev, &[diff.step()], &t).unwrap();
-    assert_eq!(
-        std::fs::read(&unnamed).unwrap(),
-        std::fs::read(&named).unwrap()
-    );
-
-    // A cache at another state.
-    let other = write_cache(&next, dir.path(), "other");
-    let err = apply_unnamed_to_temp(&other, &diff.segment, &t).unwrap_err();
-    assert!(
-        err.to_string()
-            .contains("does not follow the preceding state"),
-        "{err}"
-    );
-
-    // The right hash, another entry count.
-    let mut wrong_count = diff.segment.clone();
-    wrong_count.prev_entries += 1;
-    let err = apply_unnamed_to_temp(&prev, &wrong_count, &t).unwrap_err();
-    assert!(
-        err.to_string()
-            .contains("does not follow the preceding state"),
-        "{err}"
-    );
-}
-
-#[test]
 fn empty_chain_copies_the_predecessor() {
     let dir = tempfile::tempdir().unwrap();
     let prev = write_cache(&index_from(&[entry(id(1), 1, 1, 0)]), dir.path(), "prev");

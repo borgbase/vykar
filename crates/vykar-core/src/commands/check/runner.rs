@@ -1,12 +1,12 @@
 use std::collections::{HashMap, HashSet};
 
 use super::repair_apply::{execute_repair, probe_deletes_allowed};
-use super::repair_plan::build_repair_plan;
+use super::repair_plan::{add_pack_maps, build_repair_plan};
 use super::scan::{ScanOptions, ScanResult, integrity_scan};
 use super::server_verify::try_server_verify;
 use super::types::{
-    CheckError, CheckProgressEvent, CheckResult, IndexRecovery, IntegrityIssue, RepairMode,
-    RepairPlan, RepairResult, ServerVerifyOutcome,
+    CheckError, CheckProgressEvent, CheckResult, IntegrityIssue, RepairAction, RepairIndexLoad,
+    RepairMode, RepairPlan, RepairResult, ServerVerifyOutcome,
 };
 use crate::config::VykarConfig;
 use crate::index::{ChunkIndexEntry, LiveIndex};
@@ -34,13 +34,17 @@ fn group_by_pack(index: &LiveIndex) -> PackChunks {
 }
 
 /// Build the repair plan for a completed scan. The planner needs a snapshot
-/// name → id map, derived from the manifest the scan ran against.
+/// name → id map, derived from the manifest the scan ran against. `load`
+/// says how the index was read; packs a rebuilt index took from this
+/// machine's chunk tables get pack maps. Pack maps are left out of the plan,
+/// with a warning, when the storage cannot hold them (an older server); when
+/// asking the server fails, the error is returned (nothing has changed yet).
 fn plan_repair(
     repo: &Repository,
     scan: &ScanResult,
     pack_chunks: &PackChunks,
-    index_recovery: IndexRecovery,
-) -> RepairPlan {
+    load: &RepairIndexLoad,
+) -> Result<RepairPlan> {
     let name_to_id: HashMap<String, SnapshotId> = repo
         .manifest()
         .snapshots
@@ -48,8 +52,23 @@ fn plan_repair(
         .map(|e| (e.name.clone(), e.id))
         .collect();
     let mut plan = build_repair_plan(scan, pack_chunks, &name_to_id);
-    plan.index_recovery = index_recovery;
-    plan
+    plan.index_recovery = load.recovery;
+    plan.uncovered_packs = load.uncovered_packs.clone();
+    add_pack_maps(&mut plan.actions, &mut load.packs_from_local_tables.clone());
+    if plan
+        .actions
+        .iter()
+        .any(|a| matches!(a, RepairAction::WritePackMaps { .. }))
+        && !crate::repo::pack_map::pack_maps_supported(repo.storage.as_ref())?
+    {
+        tracing::warn!(
+            "the server does not accept pack maps (packmaps/); upgrade vykar-server. The repair \
+             writes none"
+        );
+        plan.actions
+            .retain(|a| !matches!(a, RepairAction::WritePackMaps { .. }));
+    }
+    Ok(plan)
 }
 
 /// For `RepairMode::ApplyShown`: refuse the plan rebuilt under the lock when
@@ -468,7 +487,7 @@ pub(crate) fn run_with_repair_on_repo(
     };
 
     if mode == RepairMode::PlanOnly {
-        let recovery = repo.load_chunk_index_for_repair()?;
+        let load = repo.load_chunk_index_for_repair(shutdown)?;
         repo.refresh_snapshot_list()?;
 
         let scan = integrity_scan(repo, config, &scan_opts, &mut progress, shutdown)?;
@@ -477,7 +496,7 @@ pub(crate) fn run_with_repair_on_repo(
         // misleading executable RebuildRefcounts plan for a too-new repo.
         refuse_repair_if_unreadable_snapshots(&scan)?;
 
-        let plan = plan_repair(repo, &scan, &group_by_pack(repo.chunk_index()), recovery);
+        let plan = plan_repair(repo, &scan, &group_by_pack(repo.chunk_index()), &load)?;
 
         // PlanOnly is cancellable end to end, and `plan_repair` is unguarded
         // CPU work over the scan; without this the CLI would print a plan built
@@ -493,7 +512,7 @@ pub(crate) fn run_with_repair_on_repo(
     } else {
         // Apply: maintenance lock, re-scan under lock, mutate state.
         crate::commands::util::with_maintenance_lock(repo, |repo| {
-            let recovery = repo.load_chunk_index_for_repair()?;
+            let load = repo.load_chunk_index_for_repair(shutdown)?;
             repo.refresh_snapshot_list()?;
 
             let scan = integrity_scan(repo, config, &scan_opts, &mut progress, shutdown)?;
@@ -504,7 +523,7 @@ pub(crate) fn run_with_repair_on_repo(
             refuse_repair_if_unreadable_snapshots(&scan)?;
 
             let pack_chunks = group_by_pack(repo.chunk_index());
-            let plan = plan_repair(repo, &scan, &pack_chunks, recovery);
+            let plan = plan_repair(repo, &scan, &pack_chunks, &load)?;
 
             // Before the delete probe.
             refuse_repair_if_plan_changed(mode, &plan)?;
@@ -536,5 +555,115 @@ pub(crate) fn run_with_repair_on_repo(
                 repair_errors,
             })
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::repo::{ChunkerParams, EncryptionMode, IndexRecovery};
+    use crate::testutil::{MemoryBackend, fake_server_caps};
+    use std::sync::Arc;
+    use vykar_protocol::ServerCapabilities;
+    use vykar_storage::{InnerBackend, StorageBackend, delegate_storage_backend};
+
+    /// A vykar-server whose `/health` answers `caps`, or fails without.
+    struct Server {
+        inner: MemoryBackend,
+        caps: Option<ServerCapabilities>,
+    }
+
+    impl InnerBackend for Server {
+        fn inner_backend(&self) -> &dyn StorageBackend {
+            &self.inner
+        }
+    }
+
+    delegate_storage_backend! {
+        for Server;
+        except [server_ops];
+
+        fn server_ops(&self) -> Option<&dyn vykar_storage::ServerOps> {
+            Some(self)
+        }
+    }
+
+    impl vykar_storage::ServerOps for Server {
+        fn offers(&self, _op: vykar_storage::ServerOp) -> bool {
+            false
+        }
+
+        fn capabilities(&self) -> Result<ServerCapabilities> {
+            self.caps
+                .clone()
+                .ok_or_else(|| VykarError::Other("injected /health failure".into()))
+        }
+
+        fn init(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The repair plan of a healthy repository whose rebuilt index took a
+    /// pack from a local table, against a server answering `caps`.
+    fn plan_against(caps: Option<ServerCapabilities>) -> Result<RepairPlan> {
+        let mut repo = Repository::init(
+            Box::new(MemoryBackend::new()),
+            EncryptionMode::None,
+            ChunkerParams::default(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let config = crate::tests::helpers::make_test_config(std::path::Path::new("/mem"));
+        let opts = ScanOptions {
+            collect_chunk_refs: true,
+            detect_orphans: false,
+            verify_data: false,
+            skip_packs: None,
+            snapshot_sample_percent: None,
+        };
+        let scan =
+            integrity_scan(&mut repo, &config, &opts, &mut None, &CancelToken::new()).unwrap();
+        repo.storage = Arc::new(Server {
+            inner: MemoryBackend::new(),
+            caps,
+        });
+        let load = RepairIndexLoad {
+            recovery: IndexRecovery::Complete,
+            uncovered_packs: Vec::new(),
+            packs_from_local_tables: vec![PackId::from_bytes([7; 32])],
+        };
+        plan_repair(&repo, &scan, &PackChunks::new(), &load)
+    }
+
+    fn writes_pack_maps(plan: &RepairPlan) -> bool {
+        plan.actions
+            .iter()
+            .any(|a| matches!(a, RepairAction::WritePackMaps { .. }))
+    }
+
+    #[test]
+    fn plan_keeps_pack_maps_for_a_server_that_accepts_them() {
+        assert!(writes_pack_maps(
+            &plan_against(Some(fake_server_caps())).unwrap()
+        ));
+    }
+
+    /// An older server: the plan writes no pack maps (and warns).
+    #[test]
+    fn plan_drops_pack_maps_for_a_server_without_packmaps() {
+        let mut caps = fake_server_caps();
+        caps.key_dirs.retain(|d| d != vykar_protocol::PACK_MAP_DIR);
+        let plan = plan_against(Some(caps)).unwrap();
+        assert!(!writes_pack_maps(&plan), "{:?}", plan.actions);
+    }
+
+    /// A failed `/health` fails the plan: nothing has changed yet.
+    #[test]
+    fn plan_fails_when_the_server_cannot_say() {
+        let err = plan_against(None).err().unwrap().to_string();
+        assert!(err.contains("injected /health failure"), "{err}");
     }
 }

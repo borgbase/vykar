@@ -10,8 +10,9 @@ mod types;
 pub(crate) use runner::{repair_open_options, run_on_repo, run_with_repair_on_repo};
 pub use runner::{run, run_with_progress, run_with_repair};
 pub use types::{
-    CheckError, CheckProgressEvent, CheckResult, IndexRecovery, IntegrityIssue, ItemImpact,
-    RepairAction, RepairMode, RepairPlan, RepairResult,
+    CheckError, CheckProgressEvent, CheckResult, IndexLoss, IndexRecovery, IntegrityIssue,
+    ItemImpact, RebuildCounts, RepairAction, RepairIndexLoad, RepairMode, RepairPlan, RepairResult,
+    UncoveredPack,
 };
 
 // Re-exported for the crate-level unit tests in `tests::check_command`, which

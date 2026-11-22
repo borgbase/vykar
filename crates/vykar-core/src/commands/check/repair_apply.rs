@@ -504,6 +504,26 @@ pub(super) fn execute_repair(
     repo.request_index_fold();
     repo.save_state()?;
 
+    // Step 8: pack maps for packs whose only description is the repaired
+    // index. A pack the repair removed from the index has no entries left
+    // and gets no map. A failure is a repair error: the index is written.
+    for action in &plan.actions {
+        if let RepairAction::WritePackMaps { pack_ids } = action {
+            let only: HashSet<PackId> = pack_ids.iter().copied().collect();
+            match repo.write_pack_maps(Some(&only), &CancelToken::new()) {
+                Ok(stats) => {
+                    tracing::info!(
+                        maps = stats.maps_written,
+                        packs = stats.packs_mapped,
+                        "wrote pack maps"
+                    );
+                    applied.push(action.clone());
+                }
+                Err(e) => repair_errors.push(format!("failed to write pack maps: {e}")),
+            }
+        }
+    }
+
     Ok((applied, repair_errors))
 }
 

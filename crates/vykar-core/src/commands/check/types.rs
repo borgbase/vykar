@@ -70,6 +70,10 @@ pub enum IntegrityIssue {
         pack_id: PackId,
         detail: String,
     },
+    /// A pack's trailer cannot be read, or does not list an indexed chunk at
+    /// its indexed location (--verify-data). The chunk data is not affected,
+    /// and a pack map describing the pack in full makes the trailer moot.
+    CorruptPackTrailer { pack_id: PackId, detail: String },
     /// Pack existence check returned an I/O error (not confirmed missing).
     PackExistenceCheckFailed { pack_id: PackId, detail: String },
     /// Snapshot items could not be loaded or decoded (proven corruption).
@@ -257,6 +261,10 @@ impl IntegrityIssue {
                      — run `vykar check --repair` to rewrite it"
                 ),
             },
+            IntegrityIssue::CorruptPackTrailer { pack_id, detail } => CheckError {
+                context: "verify-data".into(),
+                message: format!("pack {pack_id}: trailer: {detail}"),
+            },
             IntegrityIssue::MissingKeyCopy { storage_key } => CheckError {
                 context: "repository key".into(),
                 message: format!(
@@ -385,10 +393,16 @@ pub enum RepairAction {
         dropped_paths: Vec<String>,
         reasons: Vec<String>,
     },
+    /// Write pack maps for these packs from the repaired index, so a later
+    /// rebuild of the index does not depend on their trailers or on this
+    /// machine's cache. Never data loss.
+    WritePackMaps {
+        pack_ids: Vec<PackId>,
+    },
     RebuildRefcounts,
 }
 
-pub use crate::repo::IndexRecovery;
+pub use crate::repo::{IndexLoss, IndexRecovery, RebuildCounts, RepairIndexLoad, UncoveredPack};
 
 /// The computed plan for a repair operation.
 #[derive(Debug)]
@@ -397,6 +411,9 @@ pub struct RepairPlan {
     pub has_data_loss: bool,
     /// How the index the plan was built from was read.
     pub index_recovery: IndexRecovery,
+    /// Packs a rebuilt index has no entries for, and why. Empty unless
+    /// `index_recovery` is `RebuiltFromPacks`.
+    pub uncovered_packs: Vec<UncoveredPack>,
 }
 
 /// Whether to just show the plan or actually apply it.

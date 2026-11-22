@@ -547,3 +547,89 @@ fn trailer_packs_through_the_server() {
     );
     assert_eq!(std::fs::read_to_string(find(&dest, "b")).unwrap(), "bravo");
 }
+
+/// The rebuild of the index from the packs through the server: with
+/// `index` and `index.d/` gone, a cold client's repair takes every pack from
+/// its trailer and loses nothing; pack maps written through the server then
+/// describe every pack, and a second rebuild reads only them.
+#[test]
+fn repair_rebuilds_a_deleted_index_from_the_packs_through_the_server() {
+    let server = Server::start(false);
+    let c = Client::init(&server);
+    c.write("a", &"alpha".repeat(10_000));
+    c.backup("s1");
+    c.write("b", &"bravo".repeat(10_000));
+    c.backup("s2");
+    c.write("c", "charlie");
+    c.backup("s3");
+    commands::delete::run(&c.config, None, &["s1"], false, &CancelToken::new()).unwrap();
+    commands::compact::run(&c.config, None, 0.0, None, false, &CancelToken::new()).unwrap();
+    let before = entries(&c.config);
+    let packs = server_packs(&server).len();
+
+    let delete_index = || {
+        std::fs::remove_file(server.data.path().join("index")).unwrap();
+        for e in std::fs::read_dir(server.data.path().join(INDEX_OBJECT_DIR)).unwrap() {
+            let path = e.unwrap().path();
+            if path.is_file() {
+                std::fs::remove_file(path).unwrap();
+            }
+        }
+    };
+    let rebuild = |cache: &str| {
+        let cold = client(&server, c.tmp.path(), cache);
+        let result = commands::check::run_with_repair(
+            &cold,
+            None,
+            false,
+            commands::check::RepairMode::Apply,
+            None,
+            &CancelToken::new(),
+        )
+        .unwrap();
+        assert!(!result.plan.has_data_loss, "{:?}", result.plan.actions);
+        assert!(
+            result.repair_errors.is_empty(),
+            "{:?}",
+            result.repair_errors
+        );
+        let commands::check::IndexRecovery::RebuiltFromPacks { counts, .. } =
+            result.plan.index_recovery
+        else {
+            panic!("{:?}", result.plan.index_recovery);
+        };
+        assert_eq!((counts.packs, counts.uncovered), (packs, 0), "{counts:?}");
+        (cold, counts)
+    };
+
+    delete_index();
+    let (cold, counts) = rebuild("cold-1");
+    assert_eq!(counts.from_trailers, packs);
+    assert_eq!(entries(&cold), before);
+    check_clean(&cold);
+    let dest = c.tmp.path().join("restore-s2");
+    commands::restore::run(
+        &cold,
+        None,
+        "s2",
+        dest.to_str().unwrap(),
+        None,
+        false,
+        true,
+        &CancelToken::new(),
+    )
+    .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(find(&dest, "b")).unwrap(),
+        "bravo".repeat(10_000)
+    );
+
+    let stats = commands::pack_maps::run(&cold, None, &CancelToken::new()).unwrap();
+    assert_eq!(stats.packs_mapped, packs);
+    delete_index();
+    let (cold, counts) = rebuild("cold-2");
+    assert_eq!(counts.from_maps, packs);
+    assert_eq!(entries(&cold), before);
+    c.write("d", "delta");
+    backup_single_source(&cold, &c.source, "src", "s4");
+}

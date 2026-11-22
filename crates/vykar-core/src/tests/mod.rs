@@ -14,6 +14,7 @@ mod format;
 pub(crate) mod helpers;
 mod hostname;
 mod index;
+mod index_rebuild;
 mod info;
 mod item;
 mod lazy_item_stream;

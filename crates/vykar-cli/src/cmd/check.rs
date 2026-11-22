@@ -2,7 +2,7 @@ use std::io::{self, BufRead, Write};
 
 use vykar_core::commands;
 use vykar_core::commands::check::{
-    IndexRecovery, RepairAction, RepairMode, RepairPlan, RepairResult,
+    IndexLoss, IndexRecovery, RepairAction, RepairMode, RepairPlan, RepairResult,
 };
 use vykar_core::config::VykarConfig;
 use vykar_core::repo::control::CancelToken;
@@ -231,7 +231,9 @@ pub(crate) fn print_check_summary(result: &commands::check::CheckResult) {
 fn is_safe_action(action: &RepairAction) -> bool {
     matches!(
         action,
-        RepairAction::RebuildRefcounts | RepairAction::RestoreKeyCopy { .. }
+        RepairAction::RebuildRefcounts
+            | RepairAction::RestoreKeyCopy { .. }
+            | RepairAction::WritePackMaps { .. }
     )
 }
 
@@ -267,105 +269,69 @@ fn print_repair_plan(plan: &RepairPlan) {
 
 /// How the index was read, when not simply in full.
 fn print_index_recovery(plan: &RepairPlan) {
-    let lossy = match plan.index_recovery {
-        IndexRecovery::Complete => return,
-        IndexRecovery::LegacyBlob => {
-            println!(
-                "\nIndex: `index` held a monolithic index written by an older vykar; \
-                 the index is rebuilt from it."
-            );
-            return;
-        }
-        IndexRecovery::HeadMissing => {
-            println!("\nIndex: the index head is missing; the index is rebuilt from nothing.");
-            true
-        }
-        IndexRecovery::HeadUnreadable {
-            from_local_cache: true,
-            ..
-        } => {
-            println!(
-                "\nIndex: the index head cannot be read; the index is rebuilt from this \
-                 machine's cache of it, which may be older than the repository's latest \
-                 index state."
-            );
-            if plan.has_data_loss {
-                println!(
-                    "  To avoid the removals below, run the repair on the machine that wrote \
-                     to the repository last,\n  or move this machine's cache directory aside \
-                     so the repair reads the objects in index.d/."
-                );
-            }
-            true
-        }
-        IndexRecovery::HeadUnreadable {
-            bases: 0,
-            applied: 0,
-            unplaced,
-            damaged,
-            ..
-        } => {
-            println!(
-                "\nIndex: the index head cannot be read and no object in index.d/ can be \
-                 used; the index is rebuilt from nothing."
-            );
-            print_headless_counts(unplaced, damaged);
-            true
-        }
-        IndexRecovery::HeadUnreadable {
-            bases,
-            applied,
-            unplaced,
-            damaged,
-            ..
-        } => {
-            println!(
-                "\nIndex: the index head cannot be read; the index is rebuilt from the \
-                 objects in index.d/ ({bases} base(s), {applied} segment(s) read). \
-                 Without the head it cannot be confirmed that this is the repository's \
-                 latest index state."
-            );
-            print_headless_counts(unplaced, damaged);
-            true
-        }
-        IndexRecovery::PartialChain {
-            base_lost: true,
-            total,
-            ..
-        } => {
-            println!(
-                "\nIndex: the index base cannot be read; the index is rebuilt without it \
-                 and its {total} segment(s)."
-            );
-            true
-        }
-        IndexRecovery::PartialChain { applied, total, .. } => {
-            println!(
-                "\nIndex: only {applied} of {total} index segment(s) can be read; \
-                 the index is rebuilt from them."
-            );
-            true
-        }
-    };
-    if lossy && plan.has_data_loss {
-        println!(
-            "  Snapshots whose data the rebuilt index cannot locate are removed by this \
-             repair and listed below; packs only they used are deleted by the next \
-             `vykar compact`."
-        );
+    for line in index_recovery_lines(plan) {
+        println!("{line}");
     }
 }
 
-fn print_headless_counts(unplaced: usize, damaged: usize) {
-    if damaged > 0 {
-        println!("  {damaged} index object(s) in index.d/ cannot be read and are left out.");
+/// Uncovered packs listed one per line before the rest are counted.
+const MAX_UNCOVERED_LINES: usize = 20;
+
+/// The lines [`print_index_recovery`] prints.
+fn index_recovery_lines(plan: &RepairPlan) -> Vec<String> {
+    let mut lines = Vec::new();
+    let (cause, counts) = match plan.index_recovery {
+        IndexRecovery::Complete => return lines,
+        IndexRecovery::LegacyBlob => {
+            lines.push(
+                "\nIndex: `index` held a monolithic index written by an older vykar; \
+                 the index is rebuilt from it."
+                    .into(),
+            );
+            return lines;
+        }
+        IndexRecovery::RebuiltFromPacks { cause, counts } => (cause, counts),
+    };
+    let cause = match cause {
+        IndexLoss::HeadMissing => "the index head is missing",
+        IndexLoss::HeadUnreadable => "the index head cannot be read",
+        IndexLoss::ChainDamaged => "the index chain is damaged",
+    };
+    lines.push(format!(
+        "\nIndex: {cause}; the index is rebuilt from the packs: {} pack(s), {} from pack \
+         maps, {} from pack trailers, {} from this machine's index cache.",
+        counts.packs, counts.from_maps, counts.from_trailers, counts.from_local_tables
+    ));
+    if counts.damaged_maps > 0 {
+        lines.push(format!(
+            "  {} pack map(s) cannot be read and are left out.",
+            counts.damaged_maps
+        ));
     }
-    if unplaced > 0 {
-        println!(
-            "  {unplaced} index segment(s) follow no index state that can be rebuilt; \
-             their changes are missing from the rebuilt index."
+    if !plan.uncovered_packs.is_empty() {
+        lines.push(format!(
+            "  {} pack(s) describe none of their contents and are not in the rebuilt index:",
+            plan.uncovered_packs.len()
+        ));
+        for pack in plan.uncovered_packs.iter().take(MAX_UNCOVERED_LINES) {
+            lines.push(format!("    - {}: {}", pack.pack_id, pack.reason));
+        }
+        if plan.uncovered_packs.len() > MAX_UNCOVERED_LINES {
+            lines.push(format!(
+                "    ... and {} more",
+                plan.uncovered_packs.len() - MAX_UNCOVERED_LINES
+            ));
+        }
+    }
+    if plan.has_data_loss {
+        lines.push(
+            "  Snapshots whose data the rebuilt index cannot locate are removed by this \
+             repair and listed below; packs only they used are deleted by the next \
+             `vykar compact`."
+                .into(),
         );
     }
+    lines
 }
 
 fn format_repair_action(action: &RepairAction) -> String {
@@ -426,6 +392,11 @@ fn format_repair_action(action: &RepairAction) -> String {
             }
             out
         }
+        RepairAction::WritePackMaps { pack_ids } => format!(
+            "Write pack maps for {} pack(s) whose index entries are not described by the packs \
+             themselves",
+            pack_ids.len()
+        ),
         RepairAction::RebuildRefcounts => "Rebuild chunk refcounts from surviving snapshots".into(),
     }
 }
@@ -452,19 +423,82 @@ fn print_repair_result(result: &RepairResult) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vykar_core::commands::check::{RebuildCounts, UncoveredPack};
+    use vykar_types::pack_id::PackId;
+
+    fn rebuilt_plan(uncovered: usize) -> RepairPlan {
+        let uncovered_packs: Vec<UncoveredPack> = (0..uncovered)
+            .map(|i| UncoveredPack {
+                pack_id: PackId::from_bytes([i as u8; 32]),
+                reason: "no trailer and no pack map".into(),
+            })
+            .collect();
+        RepairPlan {
+            actions: vec![RepairAction::RebuildRefcounts],
+            has_data_loss: uncovered > 0,
+            index_recovery: IndexRecovery::RebuiltFromPacks {
+                cause: IndexLoss::HeadMissing,
+                counts: RebuildCounts {
+                    packs: 30,
+                    from_trailers: 30 - uncovered,
+                    uncovered,
+                    ..RebuildCounts::default()
+                },
+            },
+            uncovered_packs,
+        }
+    }
+
+    #[test]
+    fn index_recovery_lines_for_a_rebuild() {
+        let lines = index_recovery_lines(&rebuilt_plan(0));
+        assert_eq!(
+            lines,
+            vec![
+                "\nIndex: the index head is missing; the index is rebuilt from the packs: 30 \
+                 pack(s), 0 from pack maps, 30 from pack trailers, 0 from this machine's index \
+                 cache."
+                    .to_string()
+            ]
+        );
+
+        let lines = index_recovery_lines(&rebuilt_plan(25));
+        assert!(
+            lines[1].starts_with("  25 pack(s) describe none of their contents"),
+            "{lines:?}"
+        );
+        let listed = lines.iter().filter(|l| l.starts_with("    - ")).count();
+        assert_eq!(listed, MAX_UNCOVERED_LINES);
+        assert!(
+            lines[2].ends_with(": no trailer and no pack map"),
+            "{lines:?}"
+        );
+        assert!(
+            lines.contains(&"    ... and 5 more".to_string()),
+            "{lines:?}"
+        );
+        assert!(
+            lines.last().unwrap().contains("are removed by this repair"),
+            "{lines:?}"
+        );
+    }
 
     #[test]
     fn apply_mode_after_carries_the_shown_plan() {
         for has_data_loss in [false, true] {
-            let recovery = IndexRecovery::PartialChain {
-                base_lost: false,
-                applied: 1,
-                total: 2,
+            let recovery = IndexRecovery::RebuiltFromPacks {
+                cause: IndexLoss::ChainDamaged,
+                counts: RebuildCounts {
+                    packs: 3,
+                    from_trailers: 3,
+                    ..RebuildCounts::default()
+                },
             };
             let plan = RepairPlan {
                 actions: vec![RepairAction::RebuildRefcounts],
                 has_data_loss,
                 index_recovery: recovery,
+                uncovered_packs: Vec::new(),
             };
             assert_eq!(
                 apply_mode_after(&plan),

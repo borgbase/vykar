@@ -285,3 +285,12 @@ fn v3_fixtures_upgrade_to_v5() {
         );
     }
 }
+
+/// After the upgrade, pack maps make the repository recoverable without its
+/// index: the fixture's packs carry no trailer.
+#[test]
+fn v3_fixtures_survive_index_loss_with_pack_maps() {
+    for mode in MODES {
+        fixtures::assert_index_loss_is_recovered_from_pack_maps("v3", mode, 3);
+    }
+}

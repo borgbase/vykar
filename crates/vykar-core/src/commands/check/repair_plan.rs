@@ -459,6 +459,24 @@ pub(super) fn build_repair_plan(
         has_data_loss = true;
     }
 
+    // Pack maps for packs whose trailer cannot be trusted, and for packs
+    // that lose chunks, so a later rebuild of the index takes the entries the
+    // repaired index keeps (a map takes precedence over the trailer).
+    let mut map_packs: Vec<PackId> = scan
+        .issues
+        .iter()
+        .filter_map(|i| match i {
+            IntegrityIssue::CorruptPackTrailer { pack_id, .. }
+                if !missing_packs.contains(pack_id) && !corrupt_packs.contains(pack_id) =>
+            {
+                Some(*pack_id)
+            }
+            _ => None,
+        })
+        .chain(corrupt_chunks_by_pack.keys().copied())
+        .collect();
+    add_pack_maps(&mut actions, &mut map_packs);
+
     // Always include refcount rebuild
     actions.push(RepairAction::RebuildRefcounts);
 
@@ -466,7 +484,43 @@ pub(super) fn build_repair_plan(
         actions,
         has_data_loss,
         index_recovery: IndexRecovery::Complete,
+        uncovered_packs: Vec::new(),
     }
+}
+
+/// Add `packs` to the plan's one `WritePackMaps` action (sorted, without
+/// duplicates), creating it before `RebuildRefcounts` (or at the end) when
+/// there is none. Nothing is added for an empty `packs`.
+pub(super) fn add_pack_maps(actions: &mut Vec<RepairAction>, packs: &mut Vec<PackId>) {
+    if packs.is_empty() {
+        return;
+    }
+    let existing = actions.iter_mut().find_map(|a| match a {
+        RepairAction::WritePackMaps { pack_ids } => Some(pack_ids),
+        _ => None,
+    });
+    let pack_ids = match existing {
+        Some(pack_ids) => pack_ids,
+        None => {
+            let at = actions
+                .iter()
+                .position(|a| matches!(a, RepairAction::RebuildRefcounts))
+                .unwrap_or(actions.len());
+            actions.insert(
+                at,
+                RepairAction::WritePackMaps {
+                    pack_ids: Vec::new(),
+                },
+            );
+            match actions.get_mut(at) {
+                Some(RepairAction::WritePackMaps { pack_ids }) => pack_ids,
+                _ => return,
+            }
+        }
+    };
+    pack_ids.append(packs);
+    pack_ids.sort_by_key(|p| *p.as_bytes());
+    pack_ids.dedup();
 }
 
 #[cfg(test)]

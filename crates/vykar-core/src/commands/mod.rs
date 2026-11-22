@@ -11,6 +11,7 @@ pub mod key;
 pub mod list;
 #[cfg(feature = "mount")]
 pub mod mount;
+pub mod pack_maps;
 pub mod prune;
 pub mod restore;
 pub(crate) mod snapshot_ops;

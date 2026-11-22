@@ -2,7 +2,7 @@
 //! "unsupported" bodies for leaves.
 //!
 //! Every wrapper that holds an inner backend (rate limiter, test recorder, the
-//! `Arc<dyn StorageBackend>` coercion impl) has to forward all 26 trait methods,
+//! `Arc<dyn StorageBackend>` coercion impl) has to forward all 21 trait methods,
 //! and hand-written forwards rot — a forgotten one disabled server-side pack
 //! verification and server init on any throttled REST repo.
 //!
@@ -11,17 +11,20 @@
 //! * [`crate::delegate_storage_backend!`] holds the forwarding inventory in one
 //!   place. A wrapper implements [`InnerBackend`], names the methods it writes by
 //!   hand, and gets forwards for the rest.
-//! * The trait's eleven capability methods (`remove_stale_temp_files`,
-//!   `server_repack`, `batch_delete_keys`, `server_verify_packs`, `server_init`,
-//!   `bind_content_hash`, `server_capabilities`, `object_sizes`,
-//!   `list_tree_sized`, `conditional`, `profile`) have **no defaults**, so the
-//!   inventory cannot silently fall behind the trait: adding a twelfth breaks
-//!   every impl, this macro included, until it is handled. Leaves get bodies for
-//!   the ones they do not implement from [`crate::unsupported_server_ops!`] (all
-//!   but `profile`; `conditional` is `None` there).
+//! * The trait's six capability methods (`remove_stale_temp_files`,
+//!   `bind_content_hash`, `conditional`, `batch_delete`, `server_ops`,
+//!   `profile`) have **no defaults**, so the inventory cannot silently fall
+//!   behind the trait: adding a seventh breaks every impl, this macro included,
+//!   until it is handled. Leaves get bodies for the ones they do not implement
+//!   from [`crate::unsupported_server_ops!`] (all but `profile`; the three
+//!   accessors are `None` there).
 //!
 //! The defaulted `list_meta` is forwarded like every other method; a wrapper
 //! that overrides `list_sized` must override it too (a compile-time guard).
+//! Two more guards cover the accessors that hand out the inner backend's
+//! objects: a wrapper that overrides `list_sized` must override `server_ops`
+//! (its tree listing would bypass the override), and one that overrides
+//! `delete` must override `batch_delete` (its deletes would bypass it).
 //!
 //! What is *not* guarded: a new method with a default body. Wrappers would
 //! inherit it, which is safe by construction for the defaults that exist today
@@ -41,23 +44,19 @@ pub trait InnerBackend {
 }
 
 /// Types the macro expansion names. Re-exported so the macro works in any crate
-/// without requiring `vykar-types`/`vykar-protocol` to be in scope there.
+/// without requiring `vykar-types` to be in scope there.
 #[doc(hidden)]
 pub mod __macro_support {
-    pub use vykar_protocol::{
-        RepackPlanRequest, RepackResultResponse, ServerCapabilities, VerifyPacksPlanRequest,
-        VerifyPacksResponse,
-    };
     pub use vykar_types::error::{Result, VykarError};
     pub use vykar_types::hash::HashAlgorithm;
 }
 
 /// Implement the capability methods for a backend with no vykar-server behind
-/// it: `UnsupportedBackend` for the server-side APIs, a no-op for
-/// `bind_content_hash` (nothing to bind — only `RestBackend` sends a
-/// content-digest header), and `Ok(0)` for `remove_stale_temp_files` (for
+/// it: a no-op for `bind_content_hash` (nothing to bind — only `RestBackend`
+/// sends a content-digest header), `Ok(0)` for `remove_stale_temp_files` (for
 /// backends that leave no client-side temp files; Local and SFTP implement it),
-/// and `None` for `conditional` (no put-if-absent).
+/// and `None` for the three accessors `conditional` (no put-if-absent),
+/// `batch_delete` (delete key by key) and `server_ops` (no server).
 ///
 /// Used inside an `impl StorageBackend for _` block. `except [...]` names the
 /// ones the backend does implement itself, in trait-declaration order — same
@@ -78,9 +77,7 @@ macro_rules! unsupported_server_ops {
     };
     (except [$($except:ident),* $(,)?]) => {
         $crate::unsupported_server_ops!(@emit
-            [remove_stale_temp_files server_repack batch_delete_keys server_verify_packs
-             server_init bind_content_hash server_capabilities object_sizes list_tree_sized
-             conditional]
+            [remove_stale_temp_files bind_content_hash conditional batch_delete server_ops]
             [$($except)*]);
     };
 
@@ -105,64 +102,6 @@ macro_rules! unsupported_server_ops {
         $crate::unsupported_server_ops!(@emit [$($rest)*] [$($except)*]);
     };
 
-    (@emit [server_repack $($rest:ident)*] [server_repack $($except:ident)*]) => {
-        $crate::unsupported_server_ops!(@emit [$($rest)*] [$($except)*]);
-    };
-    (@emit [server_repack $($rest:ident)*] [$($except:ident)*]) => {
-        fn server_repack(
-            &self,
-            _plan: &$crate::__macro_support::RepackPlanRequest,
-        ) -> $crate::__macro_support::Result<$crate::__macro_support::RepackResultResponse> {
-            Err($crate::__macro_support::VykarError::UnsupportedBackend(
-                "server-side repack API".into(),
-            ))
-        }
-        $crate::unsupported_server_ops!(@emit [$($rest)*] [$($except)*]);
-    };
-
-    (@emit [batch_delete_keys $($rest:ident)*] [batch_delete_keys $($except:ident)*]) => {
-        $crate::unsupported_server_ops!(@emit [$($rest)*] [$($except)*]);
-    };
-    (@emit [batch_delete_keys $($rest:ident)*] [$($except:ident)*]) => {
-        fn batch_delete_keys(
-            &self,
-            _keys: &[String],
-            _scope: $crate::BatchDeleteScope,
-        ) -> $crate::__macro_support::Result<()> {
-            Err($crate::__macro_support::VykarError::UnsupportedBackend(
-                "batch delete API".into(),
-            ))
-        }
-        $crate::unsupported_server_ops!(@emit [$($rest)*] [$($except)*]);
-    };
-
-    (@emit [server_verify_packs $($rest:ident)*] [server_verify_packs $($except:ident)*]) => {
-        $crate::unsupported_server_ops!(@emit [$($rest)*] [$($except)*]);
-    };
-    (@emit [server_verify_packs $($rest:ident)*] [$($except:ident)*]) => {
-        fn server_verify_packs(
-            &self,
-            _plan: &$crate::__macro_support::VerifyPacksPlanRequest,
-        ) -> $crate::__macro_support::Result<$crate::__macro_support::VerifyPacksResponse> {
-            Err($crate::__macro_support::VykarError::UnsupportedBackend(
-                "server-side verify-packs API".into(),
-            ))
-        }
-        $crate::unsupported_server_ops!(@emit [$($rest)*] [$($except)*]);
-    };
-
-    (@emit [server_init $($rest:ident)*] [server_init $($except:ident)*]) => {
-        $crate::unsupported_server_ops!(@emit [$($rest)*] [$($except)*]);
-    };
-    (@emit [server_init $($rest:ident)*] [$($except:ident)*]) => {
-        fn server_init(&self) -> $crate::__macro_support::Result<()> {
-            Err($crate::__macro_support::VykarError::UnsupportedBackend(
-                "server-side init API".into(),
-            ))
-        }
-        $crate::unsupported_server_ops!(@emit [$($rest)*] [$($except)*]);
-    };
-
     (@emit [bind_content_hash $($rest:ident)*] [bind_content_hash $($except:ident)*]) => {
         $crate::unsupported_server_ops!(@emit [$($rest)*] [$($except)*]);
     };
@@ -179,55 +118,31 @@ macro_rules! unsupported_server_ops {
         $crate::unsupported_server_ops!(@emit [$($rest)*] [$($except)*]);
     };
 
-    (@emit [server_capabilities $($rest:ident)*] [server_capabilities $($except:ident)*]) => {
-        $crate::unsupported_server_ops!(@emit [$($rest)*] [$($except)*]);
-    };
-    (@emit [server_capabilities $($rest:ident)*] [$($except:ident)*]) => {
-        fn server_capabilities(
-            &self,
-        ) -> $crate::__macro_support::Result<$crate::__macro_support::ServerCapabilities> {
-            Err($crate::__macro_support::VykarError::UnsupportedBackend(
-                "server capability probe".into(),
-            ))
-        }
-        $crate::unsupported_server_ops!(@emit [$($rest)*] [$($except)*]);
-    };
-
-    (@emit [object_sizes $($rest:ident)*] [object_sizes $($except:ident)*]) => {
-        $crate::unsupported_server_ops!(@emit [$($rest)*] [$($except)*]);
-    };
-    (@emit [object_sizes $($rest:ident)*] [$($except:ident)*]) => {
-        fn object_sizes(
-            &self,
-            _keys: &[String],
-        ) -> $crate::__macro_support::Result<Vec<Option<u64>>> {
-            Err($crate::__macro_support::VykarError::UnsupportedBackend(
-                "batch object sizes API".into(),
-            ))
-        }
-        $crate::unsupported_server_ops!(@emit [$($rest)*] [$($except)*]);
-    };
-
-    (@emit [list_tree_sized $($rest:ident)*] [list_tree_sized $($except:ident)*]) => {
-        $crate::unsupported_server_ops!(@emit [$($rest)*] [$($except)*]);
-    };
-    (@emit [list_tree_sized $($rest:ident)*] [$($except:ident)*]) => {
-        fn list_tree_sized(
-            &self,
-            _prefix: &str,
-        ) -> $crate::__macro_support::Result<Vec<$crate::ListedObject>> {
-            Err($crate::__macro_support::VykarError::UnsupportedBackend(
-                "one-request tree listing".into(),
-            ))
-        }
-        $crate::unsupported_server_ops!(@emit [$($rest)*] [$($except)*]);
-    };
-
     (@emit [conditional $($rest:ident)*] [conditional $($except:ident)*]) => {
         $crate::unsupported_server_ops!(@emit [$($rest)*] [$($except)*]);
     };
     (@emit [conditional $($rest:ident)*] [$($except:ident)*]) => {
         fn conditional(&self) -> Option<&dyn $crate::ConditionalWrite> {
+            None
+        }
+        $crate::unsupported_server_ops!(@emit [$($rest)*] [$($except)*]);
+    };
+
+    (@emit [batch_delete $($rest:ident)*] [batch_delete $($except:ident)*]) => {
+        $crate::unsupported_server_ops!(@emit [$($rest)*] [$($except)*]);
+    };
+    (@emit [batch_delete $($rest:ident)*] [$($except:ident)*]) => {
+        fn batch_delete(&self) -> Option<&dyn $crate::BatchDelete> {
+            None
+        }
+        $crate::unsupported_server_ops!(@emit [$($rest)*] [$($except)*]);
+    };
+
+    (@emit [server_ops $($rest:ident)*] [server_ops $($except:ident)*]) => {
+        $crate::unsupported_server_ops!(@emit [$($rest)*] [$($except)*]);
+    };
+    (@emit [server_ops $($rest:ident)*] [$($except:ident)*]) => {
+        fn server_ops(&self) -> Option<&dyn $crate::ServerOps> {
             None
         }
         $crate::unsupported_server_ops!(@emit [$($rest)*] [$($except)*]);
@@ -264,9 +179,8 @@ macro_rules! delegate_storage_backend {
             $crate::delegate_storage_backend!(@forward
                 [get put delete exists list get_range get_range_into open_range create_dir
                  put_owned put_pack begin_staged_put size list_sized list_meta
-                 remove_stale_temp_files server_repack batch_delete_keys
-                 server_verify_packs server_init bind_content_hash
-                 server_capabilities object_sizes list_tree_sized conditional profile]
+                 remove_stale_temp_files bind_content_hash conditional batch_delete
+                 server_ops profile]
                 [$($except)*]);
         }
         $crate::delegate_storage_backend!(@check_list [$($except)*] [] []);
@@ -276,7 +190,8 @@ macro_rules! delegate_storage_backend {
         $crate::delegate_storage_backend!(@check_pack [$($except)*] [] []);
         $crate::delegate_storage_backend!(@check_range [$($except)*] [] []);
         $crate::delegate_storage_backend!(@check_staged [$($except)*] [] []);
-        $crate::delegate_storage_backend!(@check_tree [$($except)*] [] []);
+        $crate::delegate_storage_backend!(@check_server [$($except)*] [] []);
+        $crate::delegate_storage_backend!(@check_batch [$($except)*] [] []);
     };
 
     // ── Guard: overriding `begin_staged_put` requires `profile` ───────────
@@ -461,27 +376,52 @@ macro_rules! delegate_storage_backend {
         $crate::delegate_storage_backend!(@check_list [$($rest)*] $list $sized);
     };
 
-    // ── Guard: overriding `list_sized` requires `list_tree_sized` ─────────
+    // ── Guard: overriding `list_sized` requires `server_ops` ──────────────
     //
-    // Otherwise the generated `list_tree_sized` forwards straight to the inner
-    // backend, bypassing whatever the `list_sized` override intercepts.
+    // A forwarded `server_ops` hands out the inner backend's one-request tree
+    // listing, which bypasses whatever the `list_sized` override intercepts.
 
-    (@check_tree [] [] $tree:tt) => {};
-    (@check_tree [] [list_sized] [list_tree_sized]) => {};
-    (@check_tree [] [list_sized] []) => {
+    (@check_server [] [] $ops:tt) => {};
+    (@check_server [] [list_sized] [server_ops]) => {};
+    (@check_server [] [list_sized] []) => {
         compile_error!(
             "delegate_storage_backend!: a wrapper that overrides `list_sized` must also \
-             override `list_tree_sized`, or one-request listings bypass it"
+             override `server_ops`, or one-request tree listings bypass it; returning \
+             None keeps listings on `list_sized`"
         );
     };
-    (@check_tree [list_sized $($rest:ident)*] [] $tree:tt) => {
-        $crate::delegate_storage_backend!(@check_tree [$($rest)*] [list_sized] $tree);
+    (@check_server [list_sized $($rest:ident)*] [] $ops:tt) => {
+        $crate::delegate_storage_backend!(@check_server [$($rest)*] [list_sized] $ops);
     };
-    (@check_tree [list_tree_sized $($rest:ident)*] $sized:tt []) => {
-        $crate::delegate_storage_backend!(@check_tree [$($rest)*] $sized [list_tree_sized]);
+    (@check_server [server_ops $($rest:ident)*] $sized:tt []) => {
+        $crate::delegate_storage_backend!(@check_server [$($rest)*] $sized [server_ops]);
     };
-    (@check_tree [$other:ident $($rest:ident)*] $sized:tt $tree:tt) => {
-        $crate::delegate_storage_backend!(@check_tree [$($rest)*] $sized $tree);
+    (@check_server [$other:ident $($rest:ident)*] $sized:tt $ops:tt) => {
+        $crate::delegate_storage_backend!(@check_server [$($rest)*] $sized $ops);
+    };
+
+    // ── Guard: overriding `delete` requires `batch_delete` ─────────────────
+    //
+    // A forwarded `batch_delete` hands out the inner backend's deleter, whose
+    // deletes bypass the wrapper's `delete` override.
+
+    (@check_batch [] [] $batch:tt) => {};
+    (@check_batch [] [delete] [batch_delete]) => {};
+    (@check_batch [] [delete] []) => {
+        compile_error!(
+            "delegate_storage_backend!: a wrapper that overrides `delete` must also \
+             override `batch_delete`, or batch deletes bypass it; returning None keeps \
+             every delete on `delete`"
+        );
+    };
+    (@check_batch [delete $($rest:ident)*] [] $batch:tt) => {
+        $crate::delegate_storage_backend!(@check_batch [$($rest)*] [delete] $batch);
+    };
+    (@check_batch [batch_delete $($rest:ident)*] $del:tt []) => {
+        $crate::delegate_storage_backend!(@check_batch [$($rest)*] $del [batch_delete]);
+    };
+    (@check_batch [$other:ident $($rest:ident)*] $del:tt $batch:tt) => {
+        $crate::delegate_storage_backend!(@check_batch [$($rest)*] $del $batch);
     };
 
     // ── Muncher ────────────────────────────────────────────────────────────
@@ -694,56 +634,6 @@ macro_rules! delegate_storage_backend {
         $crate::delegate_storage_backend!(@forward [$($rest)*] [$($except)*]);
     };
 
-    (@forward [server_repack $($rest:ident)*] [server_repack $($except:ident)*]) => {
-        $crate::delegate_storage_backend!(@forward [$($rest)*] [$($except)*]);
-    };
-    (@forward [server_repack $($rest:ident)*] [$($except:ident)*]) => {
-        fn server_repack(
-            &self,
-            plan: &$crate::__macro_support::RepackPlanRequest,
-        ) -> $crate::__macro_support::Result<$crate::__macro_support::RepackResultResponse> {
-            $crate::InnerBackend::inner_backend(self).server_repack(plan)
-        }
-        $crate::delegate_storage_backend!(@forward [$($rest)*] [$($except)*]);
-    };
-
-    (@forward [batch_delete_keys $($rest:ident)*] [batch_delete_keys $($except:ident)*]) => {
-        $crate::delegate_storage_backend!(@forward [$($rest)*] [$($except)*]);
-    };
-    (@forward [batch_delete_keys $($rest:ident)*] [$($except:ident)*]) => {
-        fn batch_delete_keys(
-            &self,
-            keys: &[String],
-            scope: $crate::BatchDeleteScope,
-        ) -> $crate::__macro_support::Result<()> {
-            $crate::InnerBackend::inner_backend(self).batch_delete_keys(keys, scope)
-        }
-        $crate::delegate_storage_backend!(@forward [$($rest)*] [$($except)*]);
-    };
-
-    (@forward [server_verify_packs $($rest:ident)*] [server_verify_packs $($except:ident)*]) => {
-        $crate::delegate_storage_backend!(@forward [$($rest)*] [$($except)*]);
-    };
-    (@forward [server_verify_packs $($rest:ident)*] [$($except:ident)*]) => {
-        fn server_verify_packs(
-            &self,
-            plan: &$crate::__macro_support::VerifyPacksPlanRequest,
-        ) -> $crate::__macro_support::Result<$crate::__macro_support::VerifyPacksResponse> {
-            $crate::InnerBackend::inner_backend(self).server_verify_packs(plan)
-        }
-        $crate::delegate_storage_backend!(@forward [$($rest)*] [$($except)*]);
-    };
-
-    (@forward [server_init $($rest:ident)*] [server_init $($except:ident)*]) => {
-        $crate::delegate_storage_backend!(@forward [$($rest)*] [$($except)*]);
-    };
-    (@forward [server_init $($rest:ident)*] [$($except:ident)*]) => {
-        fn server_init(&self) -> $crate::__macro_support::Result<()> {
-            $crate::InnerBackend::inner_backend(self).server_init()
-        }
-        $crate::delegate_storage_backend!(@forward [$($rest)*] [$($except)*]);
-    };
-
     (@forward [bind_content_hash $($rest:ident)*] [bind_content_hash $($except:ident)*]) => {
         $crate::delegate_storage_backend!(@forward [$($rest)*] [$($except)*]);
     };
@@ -757,50 +647,32 @@ macro_rules! delegate_storage_backend {
         $crate::delegate_storage_backend!(@forward [$($rest)*] [$($except)*]);
     };
 
-    (@forward [server_capabilities $($rest:ident)*] [server_capabilities $($except:ident)*]) => {
-        $crate::delegate_storage_backend!(@forward [$($rest)*] [$($except)*]);
-    };
-    (@forward [server_capabilities $($rest:ident)*] [$($except:ident)*]) => {
-        fn server_capabilities(
-            &self,
-        ) -> $crate::__macro_support::Result<$crate::__macro_support::ServerCapabilities> {
-            $crate::InnerBackend::inner_backend(self).server_capabilities()
-        }
-        $crate::delegate_storage_backend!(@forward [$($rest)*] [$($except)*]);
-    };
-
-    (@forward [object_sizes $($rest:ident)*] [object_sizes $($except:ident)*]) => {
-        $crate::delegate_storage_backend!(@forward [$($rest)*] [$($except)*]);
-    };
-    (@forward [object_sizes $($rest:ident)*] [$($except:ident)*]) => {
-        fn object_sizes(
-            &self,
-            keys: &[String],
-        ) -> $crate::__macro_support::Result<Vec<Option<u64>>> {
-            $crate::InnerBackend::inner_backend(self).object_sizes(keys)
-        }
-        $crate::delegate_storage_backend!(@forward [$($rest)*] [$($except)*]);
-    };
-
-    (@forward [list_tree_sized $($rest:ident)*] [list_tree_sized $($except:ident)*]) => {
-        $crate::delegate_storage_backend!(@forward [$($rest)*] [$($except)*]);
-    };
-    (@forward [list_tree_sized $($rest:ident)*] [$($except:ident)*]) => {
-        fn list_tree_sized(
-            &self,
-            prefix: &str,
-        ) -> $crate::__macro_support::Result<Vec<$crate::ListedObject>> {
-            $crate::InnerBackend::inner_backend(self).list_tree_sized(prefix)
-        }
-        $crate::delegate_storage_backend!(@forward [$($rest)*] [$($except)*]);
-    };
-
     (@forward [conditional $($rest:ident)*] [conditional $($except:ident)*]) => {
         $crate::delegate_storage_backend!(@forward [$($rest)*] [$($except)*]);
     };
     (@forward [conditional $($rest:ident)*] [$($except:ident)*]) => {
         fn conditional(&self) -> Option<&dyn $crate::ConditionalWrite> {
             $crate::InnerBackend::inner_backend(self).conditional()
+        }
+        $crate::delegate_storage_backend!(@forward [$($rest)*] [$($except)*]);
+    };
+
+    (@forward [batch_delete $($rest:ident)*] [batch_delete $($except:ident)*]) => {
+        $crate::delegate_storage_backend!(@forward [$($rest)*] [$($except)*]);
+    };
+    (@forward [batch_delete $($rest:ident)*] [$($except:ident)*]) => {
+        fn batch_delete(&self) -> Option<&dyn $crate::BatchDelete> {
+            $crate::InnerBackend::inner_backend(self).batch_delete()
+        }
+        $crate::delegate_storage_backend!(@forward [$($rest)*] [$($except)*]);
+    };
+
+    (@forward [server_ops $($rest:ident)*] [server_ops $($except:ident)*]) => {
+        $crate::delegate_storage_backend!(@forward [$($rest)*] [$($except)*]);
+    };
+    (@forward [server_ops $($rest:ident)*] [$($except:ident)*]) => {
+        fn server_ops(&self) -> Option<&dyn $crate::ServerOps> {
+            $crate::InnerBackend::inner_backend(self).server_ops()
         }
         $crate::delegate_storage_backend!(@forward [$($rest)*] [$($except)*]);
     };
@@ -914,59 +786,19 @@ mod tests {
             self.hit();
             Ok(0)
         }
-        fn server_repack(
-            &self,
-            _plan: &vykar_protocol::RepackPlanRequest,
-        ) -> Result<vykar_protocol::RepackResultResponse> {
-            self.hit();
-            Ok(vykar_protocol::RepackResultResponse {
-                completed: Vec::new(),
-            })
-        }
-        fn batch_delete_keys(
-            &self,
-            _keys: &[String],
-            _scope: crate::BatchDeleteScope,
-        ) -> Result<()> {
-            self.hit();
-            Ok(())
-        }
-        fn server_verify_packs(
-            &self,
-            _plan: &vykar_protocol::VerifyPacksPlanRequest,
-        ) -> Result<vykar_protocol::VerifyPacksResponse> {
-            self.hit();
-            Ok(vykar_protocol::VerifyPacksResponse {
-                results: Vec::new(),
-                truncated: false,
-            })
-        }
-        fn server_init(&self) -> Result<()> {
-            self.hit();
-            Ok(())
-        }
         fn bind_content_hash(&self, _algo: vykar_types::hash::HashAlgorithm) -> Result<()> {
             self.hit();
             Ok(())
         }
-        fn server_capabilities(&self) -> Result<vykar_protocol::ServerCapabilities> {
-            self.hit();
-            Ok(vykar_protocol::ServerCapabilities {
-                status: "ok".into(),
-                version: "test".into(),
-                protocol_version: vykar_protocol::PROTOCOL_VERSION,
-                ..Default::default()
-            })
-        }
-        fn object_sizes(&self, keys: &[String]) -> Result<Vec<Option<u64>>> {
-            self.hit();
-            Ok(vec![None; keys.len()])
-        }
-        fn list_tree_sized(&self, _prefix: &str) -> Result<Vec<crate::ListedObject>> {
-            self.hit();
-            Ok(Vec::new())
-        }
         fn conditional(&self) -> Option<&dyn crate::ConditionalWrite> {
+            self.hit();
+            None
+        }
+        fn batch_delete(&self) -> Option<&dyn crate::BatchDelete> {
+            self.hit();
+            None
+        }
+        fn server_ops(&self) -> Option<&dyn crate::ServerOps> {
             self.hit();
             None
         }
@@ -1006,7 +838,7 @@ mod tests {
     ///
     /// This covers the methods that *have* trait defaults — for those a
     /// forgotten forward compiles, so only a call-count assertion catches it.
-    /// The eleven capability methods are covered by the compiler instead (no
+    /// The six capability methods are covered by the compiler instead (no
     /// default ⇒ a missing forward is an error), which is what keeps the
     /// inventory from drifting behind the trait.
     #[test]
@@ -1037,31 +869,115 @@ mod tests {
         w.list_sized("p").unwrap();
         w.remove_stale_temp_files(std::time::Duration::ZERO)
             .unwrap();
-        w.server_repack(&vykar_protocol::RepackPlanRequest::new(
-            Vec::new(),
-            vykar_types::hash::HashAlgorithm::Blake3,
-        ))
-        .unwrap();
-        w.batch_delete_keys(&[], crate::BatchDeleteScope::KeysOnly)
-            .unwrap();
-        w.server_verify_packs(&vykar_protocol::VerifyPacksPlanRequest::new(
-            Vec::new(),
-            vykar_types::hash::HashAlgorithm::Blake3,
-        ))
-        .unwrap();
-        w.server_init().unwrap();
         w.bind_content_hash(vykar_types::hash::HashAlgorithm::Blake3)
             .unwrap();
-        w.server_capabilities().unwrap();
-        w.object_sizes(&["packs/00/k".into()]).unwrap();
-        w.list_tree_sized("p").unwrap();
         w.list_meta("p").unwrap();
         assert!(w.conditional().is_none());
+        assert!(w.batch_delete().is_none());
+        assert!(w.server_ops().is_none());
         let p = w.profile();
         assert_eq!(p.request_width, 3);
         assert_eq!(p.transfer_width, 3);
 
-        // 26 trait methods, 25 of them forwarded.
-        assert_eq!(w.inner.calls.load(Ordering::SeqCst), 25);
+        // 21 trait methods, 20 of them forwarded.
+        assert_eq!(w.inner.calls.load(Ordering::SeqCst), 20);
+    }
+
+    /// A leaf with a batch delete and a server behind it, for
+    /// `forwards_the_accessors_objects`.
+    struct ServerLeaf {
+        deletes: AtomicUsize,
+        inits: AtomicUsize,
+    }
+
+    impl crate::BatchDelete for ServerLeaf {
+        fn delete_keys(&self, _keys: &[String], _scope: crate::BatchDeleteScope) -> Result<()> {
+            self.deletes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    impl crate::ServerOps for ServerLeaf {
+        fn offers(&self, _op: crate::ServerOp) -> bool {
+            false
+        }
+        fn capabilities(&self) -> Result<vykar_protocol::ServerCapabilities> {
+            Ok(vykar_protocol::ServerCapabilities::default())
+        }
+        fn init(&self) -> Result<()> {
+            self.inits.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    impl StorageBackend for ServerLeaf {
+        fn get(&self, _key: &str) -> Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+        fn put(&self, _key: &str, _data: &[u8]) -> Result<()> {
+            Ok(())
+        }
+        fn delete(&self, _key: &str) -> Result<()> {
+            Ok(())
+        }
+        fn exists(&self, _key: &str) -> Result<bool> {
+            Ok(false)
+        }
+        fn list(&self, _prefix: &str) -> Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+        fn get_range(&self, _key: &str, _offset: u64, _length: u64) -> Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+        fn create_dir(&self, _key: &str) -> Result<()> {
+            Ok(())
+        }
+        crate::unsupported_server_ops!(except[batch_delete, server_ops]);
+        fn batch_delete(&self) -> Option<&dyn crate::BatchDelete> {
+            Some(self)
+        }
+        fn server_ops(&self) -> Option<&dyn crate::ServerOps> {
+            Some(self)
+        }
+        fn profile(&self) -> crate::BackendProfile {
+            crate::BackendProfile {
+                local: false,
+                staged_put: false,
+                request_width: 1,
+                transfer_width: 1,
+            }
+        }
+    }
+
+    struct PlainWrapper(ServerLeaf);
+
+    impl InnerBackend for PlainWrapper {
+        fn inner_backend(&self) -> &dyn StorageBackend {
+            &self.0
+        }
+    }
+
+    delegate_storage_backend! {
+        for PlainWrapper;
+        except [];
+    }
+
+    /// The forwarded accessors hand out the leaf's own objects.
+    #[test]
+    fn forwards_the_accessors_objects() {
+        let w = PlainWrapper(ServerLeaf {
+            deletes: AtomicUsize::new(0),
+            inits: AtomicUsize::new(0),
+        });
+        w.batch_delete()
+            .expect("batch delete forwarded")
+            .delete_keys(&[], crate::BatchDeleteScope::KeysOnly)
+            .unwrap();
+        w.server_ops()
+            .expect("server ops forwarded")
+            .init()
+            .unwrap();
+        assert_eq!(w.0.deletes.load(Ordering::SeqCst), 1);
+        assert_eq!(w.0.inits.load(Ordering::SeqCst), 1);
     }
 }

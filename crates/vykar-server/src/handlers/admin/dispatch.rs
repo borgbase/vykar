@@ -109,7 +109,10 @@ pub async fn repo_action_dispatch(
 /// top-level key directories this server accepts, so a client can tell
 /// whether it serves the format-v6 ones. `conditional_put` says that a
 /// `PUT` with `If-None-Match: *` creates only (412 when the key exists),
-/// atomically; older servers ignore the header and overwrite.
+/// atomically; older servers ignore the header and overwrite. The four
+/// operation fields (`object_sizes`, `list_tree`, `verify_packs`, `repack`)
+/// let a client gate on them; `repack_trailer` arrives with the repack
+/// trailer.
 pub async fn health() -> impl IntoResponse {
     axum::Json(serde_json::json!({
         "status": "ok",
@@ -123,5 +126,9 @@ pub async fn health() -> impl IntoResponse {
         "segmented_index": true,
         "key_dirs": vykar_protocol::KNOWN_ROOT_DIRS,
         "conditional_put": true,
+        "object_sizes": true,
+        "list_tree": true,
+        "verify_packs": true,
+        "repack": true,
     }))
 }

@@ -4,10 +4,11 @@ use std::sync::atomic::Ordering;
 
 use rusty_s3::S3Action;
 use rusty_s3::actions::{DeleteObjectsResponse, ErrorObject, ObjectIdentifier};
-use vykar_types::error::{Result, VykarError};
+use vykar_types::error::Result;
 
 use super::multipart::{classify_s3_error, is_retryable_s3_code, parse_s3_error_code};
 use super::{PRESIGN_DURATION, S3Backend, s3_error};
+use crate::StorageBackend;
 use crate::retry::HttpRetryError;
 
 /// S3 refuses a DeleteObjects request naming more than 1000 keys.
@@ -27,34 +28,51 @@ enum ChunkOutcome {
 
 #[allow(clippy::result_large_err)]
 impl S3Backend {
-    /// `StorageBackend::batch_delete_keys` for S3: one quiet DeleteObjects
+    /// [`crate::BatchDelete::delete_keys`] for S3: one quiet DeleteObjects
     /// request per 1000 distinct keys, in order, stopping at the first
     /// request that fails.
+    ///
+    /// Under `s3_soft_delete`, or once the endpoint answered NotImplemented
+    /// (in this call or earlier), the remaining distinct keys are deleted one
+    /// by one with [`StorageBackend::delete`] (tombstones under soft delete),
+    /// stopping at the first error. A per-key error then surfaces as this
+    /// call's `Err`; compact answers that by warning and deleting every key
+    /// again, which costs extra DELETEs but reaches the same end state.
     pub(super) fn delete_objects(&self, keys: &[String]) -> Result<()> {
-        if self.soft_delete {
-            return Err(VykarError::UnsupportedBackend(
-                "S3 batch delete with s3_soft_delete (deletes are tombstone PUTs)".into(),
-            ));
-        }
-        if self.batch_delete_unsupported.load(Ordering::Relaxed) {
-            return Err(VykarError::UnsupportedBackend(
-                "S3 DeleteObjects (endpoint does not implement it)".into(),
-            ));
-        }
         let mut seen = HashSet::new();
         let unique: Vec<&str> = keys
             .iter()
             .map(String::as_str)
             .filter(|k| seen.insert(*k))
             .collect();
-        for chunk in unique.chunks(DELETE_OBJECTS_MAX_KEYS) {
-            self.delete_objects_chunk(chunk)?;
+        if self.soft_delete || self.batch_delete_unsupported.load(Ordering::Relaxed) {
+            return self.delete_one_by_one(&unique);
+        }
+        for (i, chunk) in unique.chunks(DELETE_OBJECTS_MAX_KEYS).enumerate() {
+            match self.delete_objects_chunk(chunk)? {
+                ChunkOutcome::Deleted => {}
+                ChunkOutcome::NotImplemented => {
+                    let rest = unique
+                        .get(i * DELETE_OBJECTS_MAX_KEYS..)
+                        .unwrap_or_default();
+                    return self.delete_one_by_one(rest);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Per-key deletes, stopping at the first error.
+    fn delete_one_by_one(&self, keys: &[&str]) -> Result<()> {
+        for key in keys {
+            StorageBackend::delete(self, key)?;
         }
         Ok(())
     }
 
     /// One DeleteObjects request for at most [`DELETE_OBJECTS_MAX_KEYS`] keys.
-    fn delete_objects_chunk(&self, chunk: &[&str]) -> Result<()> {
+    /// `NotImplemented` also sets `batch_delete_unsupported`.
+    fn delete_objects_chunk(&self, chunk: &[&str]) -> Result<ChunkOutcome> {
         let objects: Vec<ObjectIdentifier> = chunk
             .iter()
             .map(|k| ObjectIdentifier::new(self.full_key(k)))
@@ -99,15 +117,10 @@ impl S3Backend {
                 },
             )
             .map_err(|e| s3_error("DELETE_OBJECTS", &label, e))?;
-        match outcome {
-            ChunkOutcome::Deleted => Ok(()),
-            ChunkOutcome::NotImplemented => {
-                self.batch_delete_unsupported.store(true, Ordering::Relaxed);
-                Err(VykarError::UnsupportedBackend(
-                    "S3 DeleteObjects (endpoint answered NotImplemented)".into(),
-                ))
-            }
+        if outcome == ChunkOutcome::NotImplemented {
+            self.batch_delete_unsupported.store(true, Ordering::Relaxed);
         }
+        Ok(outcome)
     }
 }
 
@@ -190,11 +203,12 @@ mod tests {
         fast_retry, no_retry, s3_backend, s3_backend_rooted, s3_error_xml,
     };
     use crate::s3_backend::tests::mock_server_capture_bodies;
-    use crate::{BatchDeleteScope, StorageBackend};
+    use crate::{BatchDelete, BatchDeleteScope, StorageBackend};
     use base64::Engine;
     use md5::{Digest, Md5};
     use std::io::Write;
     use std::net::{TcpListener, TcpStream};
+    use vykar_types::error::VykarError;
 
     const NS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 
@@ -335,7 +349,7 @@ mod tests {
         assert!(msg.ends_with("; and 2 more"), "{msg}");
     }
 
-    // ── Mock-server tests, through StorageBackend::batch_delete_keys ──
+    // ── Mock-server tests, through BatchDelete::delete_keys ──
 
     fn http_response(status: &str, body: &str) -> String {
         format!(
@@ -353,7 +367,7 @@ mod tests {
     }
 
     fn batch_delete(backend: &S3Backend, keys: &[String]) -> Result<()> {
-        StorageBackend::batch_delete_keys(backend, keys, BatchDeleteScope::KeysOnly)
+        BatchDelete::delete_keys(backend, keys, BatchDeleteScope::KeysOnly)
     }
 
     fn object_count(body: &[u8]) -> usize {
@@ -466,40 +480,60 @@ mod tests {
         assert_eq!(captured[0].1, captured[1].1);
     }
 
-    #[test]
-    fn batch_delete_not_implemented_is_unsupported_and_sticky() {
-        let not_impl = http_response("501 Not Implemented", "");
-        let (port, captured, handle) = mock_server_capture_bodies(vec![not_impl, clean()]);
-        let backend = s3_backend(port, fast_retry(), false);
-        let err = batch_delete(&backend, &keys(3)).unwrap_err();
-        assert!(matches!(err, VykarError::UnsupportedBackend(_)), "{err:?}");
-        assert_eq!(captured.lock().unwrap().len(), 1, "501 must not be retried");
-        let err = batch_delete(&backend, &keys(3)).unwrap_err();
-        assert!(matches!(err, VykarError::UnsupportedBackend(_)), "{err:?}");
-        assert_eq!(
-            captured.lock().unwrap().len(),
-            1,
-            "flag must skip the request"
-        );
-        drain_mock(port, 1, handle);
+    fn deletes(captured: &[(Vec<String>, Vec<u8>)]) -> usize {
+        captured
+            .iter()
+            .filter(|(head, _)| head.first().is_some_and(|l| l.starts_with("DELETE ")))
+            .count()
+    }
+
+    fn posts(captured: &[(Vec<String>, Vec<u8>)]) -> usize {
+        captured
+            .iter()
+            .filter(|(head, _)| head.first().is_some_and(|l| l.starts_with("POST ")))
+            .count()
     }
 
     #[test]
-    fn batch_delete_not_implemented_on_second_chunk_is_unsupported() {
+    fn batch_delete_not_implemented_falls_back_to_per_key_deletes_and_is_sticky() {
         let not_impl = http_response("501 Not Implemented", "");
-        let (port, captured, handle) = mock_server_capture_bodies(vec![clean(), not_impl, clean()]);
-        let backend = s3_backend(port, no_retry(), false);
-        let err = batch_delete(&backend, &keys(1500)).unwrap_err();
-        assert!(matches!(err, VykarError::UnsupportedBackend(_)), "{err:?}");
-        assert_eq!(captured.lock().unwrap().len(), 2);
-        let err = batch_delete(&backend, &keys(1500)).unwrap_err();
-        assert!(matches!(err, VykarError::UnsupportedBackend(_)), "{err:?}");
-        assert_eq!(
-            captured.lock().unwrap().len(),
-            2,
-            "flag must skip the request"
+        let gone = || http_response("204 No Content", "");
+        let mut script = vec![not_impl];
+        script.extend((0..6).map(|_| gone()));
+        let (port, captured, handle) = mock_server_capture_bodies(script);
+        let backend = s3_backend(port, fast_retry(), false);
+        assert!(backend.batch_delete().is_some());
+        batch_delete(&backend, &keys(3)).unwrap();
+        {
+            let captured = captured.lock().unwrap();
+            assert_eq!(posts(&captured), 1, "501 must not be retried");
+            assert_eq!(deletes(&captured), 3);
+        }
+        assert!(
+            backend.batch_delete().is_none(),
+            "the refusal is remembered"
         );
-        drain_mock(port, 1, handle);
+        // A deleter already in hand deletes key by key without a POST.
+        batch_delete(&backend, &keys(3)).unwrap();
+        handle.join().unwrap();
+        let captured = captured.lock().unwrap();
+        assert_eq!(posts(&captured), 1, "flag must skip the request");
+        assert_eq!(deletes(&captured), 6);
+    }
+
+    #[test]
+    fn batch_delete_not_implemented_on_second_chunk_deletes_the_rest_per_key() {
+        let not_impl = http_response("501 Not Implemented", "");
+        let mut script = vec![clean(), not_impl];
+        script.extend((0..500).map(|_| http_response("204 No Content", "")));
+        let (port, captured, handle) = mock_server_capture_bodies(script);
+        let backend = s3_backend(port, no_retry(), false);
+        batch_delete(&backend, &keys(1500)).unwrap();
+        handle.join().unwrap();
+        let captured = captured.lock().unwrap();
+        assert_eq!(posts(&captured), 2);
+        assert_eq!(deletes(&captured), 500);
+        assert!(backend.batch_delete().is_none());
     }
 
     #[test]
@@ -521,16 +555,10 @@ mod tests {
     }
 
     #[test]
-    fn batch_delete_soft_delete_unsupported() {
+    fn soft_delete_offers_no_batch_delete() {
         let (port, listener) = idle_listener();
         let backend = s3_backend(port, no_retry(), true);
-        for scope in [
-            BatchDeleteScope::KeysOnly,
-            BatchDeleteScope::WholeRepository,
-        ] {
-            let err = StorageBackend::batch_delete_keys(&backend, &keys(3), scope).unwrap_err();
-            assert!(matches!(err, VykarError::UnsupportedBackend(_)), "{err:?}");
-        }
+        assert!(backend.batch_delete().is_none());
         assert!(listener.accept().is_err(), "no connection expected");
     }
 
@@ -542,7 +570,11 @@ mod tests {
             BatchDeleteScope::KeysOnly,
             BatchDeleteScope::WholeRepository,
         ] {
-            StorageBackend::batch_delete_keys(&backend, &[], scope).unwrap();
+            backend
+                .batch_delete()
+                .expect("batch delete offered")
+                .delete_keys(&[], scope)
+                .unwrap();
         }
         assert!(listener.accept().is_err(), "no connection expected");
     }

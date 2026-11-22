@@ -564,10 +564,24 @@ impl InnerBackend for ProbedServer {
 
 delegate_storage_backend! {
     for ProbedServer;
-    except [server_capabilities];
+    except [server_ops];
 
-    fn server_capabilities(&self) -> Result<vykar_protocol::ServerCapabilities> {
+    fn server_ops(&self) -> Option<&dyn vykar_storage::ServerOps> {
+        Some(self)
+    }
+}
+
+impl vykar_storage::ServerOps for ProbedServer {
+    fn offers(&self, _op: vykar_storage::ServerOp) -> bool {
+        false
+    }
+
+    fn capabilities(&self) -> Result<vykar_protocol::ServerCapabilities> {
         (self.answer)()
+    }
+
+    fn init(&self) -> Result<()> {
+        Err(VykarError::Other("ProbedServer: init not expected".into()))
     }
 }
 

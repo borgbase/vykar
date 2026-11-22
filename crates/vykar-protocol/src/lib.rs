@@ -196,6 +196,27 @@ pub struct ServerCapabilities {
     /// overwrite: a client must not send a conditional PUT without it.
     #[serde(default)]
     pub conditional_put: bool,
+    /// The server answers `POST /<dir>?sizes` (see [`MAX_OBJECT_SIZES_KEYS`]).
+    /// Absent on servers that predate the field; servers since 0.23 have the
+    /// endpoint, and a client falls back on a 400 from an older one.
+    #[serde(default)]
+    pub object_sizes: bool,
+    /// The server lists a whole tree in one `GET <prefix>?list&sized`. Absent on
+    /// servers that predate the field, which all serve the listing.
+    #[serde(default)]
+    pub list_tree: bool,
+    /// The server runs `POST /?verify-packs`. Absent on servers that predate the
+    /// field, which all serve it.
+    #[serde(default)]
+    pub verify_packs: bool,
+    /// The server runs `POST /?repack`. A client repacks server-side only when
+    /// this is advertised; older servers omit it and get a client-side repack.
+    #[serde(default)]
+    pub repack: bool,
+    /// The server accepts a client-prepared pack trailer on a repack request.
+    /// No server advertises it yet; it arrives with the repack trailer.
+    #[serde(default)]
+    pub repack_trailer: bool,
 }
 
 impl ServerCapabilities {
@@ -800,6 +821,22 @@ mod tests {
         let caps: ServerCapabilities =
             serde_json::from_str(r#"{"status":"ok","version":"0.24.0"}"#).unwrap();
         assert!(!caps.conditional_put);
+    }
+
+    #[test]
+    fn capabilities_without_operation_fields_read_as_false() {
+        let caps: ServerCapabilities = serde_json::from_str(
+            r#"{"status":"ok","version":"0.24.0","protocol_version":2,"hashes":["blake2b","blake3"]}"#,
+        )
+        .unwrap();
+        assert!(!caps.object_sizes && !caps.list_tree && !caps.verify_packs);
+        assert!(!caps.repack && !caps.repack_trailer);
+        let caps: ServerCapabilities = serde_json::from_str(
+            r#"{"status":"ok","version":"0.25.0","object_sizes":true,"list_tree":true,"verify_packs":true,"repack":true,"repack_trailer":true}"#,
+        )
+        .unwrap();
+        assert!(caps.object_sizes && caps.list_tree && caps.verify_packs);
+        assert!(caps.repack && caps.repack_trailer);
     }
 
     #[test]
@@ -1498,6 +1535,8 @@ mod tests {
         let caps = ServerCapabilities::default();
         assert!(caps.key_dirs.is_empty());
         assert!(!caps.pack_parts && !caps.segmented_index);
+        assert!(!caps.object_sizes && !caps.list_tree && !caps.verify_packs);
+        assert!(!caps.repack && !caps.repack_trailer);
         assert!(caps.supports_hash(HashAlgorithm::Blake2b));
         assert!(!caps.supports_hash(HashAlgorithm::Blake3));
     }

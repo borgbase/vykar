@@ -19,7 +19,7 @@ use super::helpers::{
     backup_single_source, init_repo, init_test_environment, make_test_config, open_local_repo,
 };
 
-/// Mock storage backend that returns a transient error from server_verify_packs.
+/// Mock storage backend whose server returns a transient error from verify-packs.
 struct TransientFailBackend;
 
 impl StorageBackend for TransientFailBackend {
@@ -44,8 +44,8 @@ impl StorageBackend for TransientFailBackend {
     fn create_dir(&self, _key: &str) -> Result<()> {
         Ok(())
     }
-    fn server_verify_packs(&self, _plan: &VerifyPacksPlanRequest) -> Result<VerifyPacksResponse> {
-        Err(VykarError::Other("transient failure".into()))
+    fn server_ops(&self) -> Option<&dyn vykar_storage::ServerOps> {
+        Some(self)
     }
 
     fn profile(&self) -> vykar_storage::BackendProfile {
@@ -57,7 +57,22 @@ impl StorageBackend for TransientFailBackend {
         }
     }
 
-    vykar_storage::unsupported_server_ops!(except[server_verify_packs]);
+    vykar_storage::unsupported_server_ops!(except[server_ops]);
+}
+
+impl vykar_storage::ServerOps for TransientFailBackend {
+    fn offers(&self, op: vykar_storage::ServerOp) -> bool {
+        op == vykar_storage::ServerOp::VerifyPacks
+    }
+    fn capabilities(&self) -> Result<vykar_protocol::ServerCapabilities> {
+        Ok(crate::testutil::fake_server_caps())
+    }
+    fn init(&self) -> Result<()> {
+        Ok(())
+    }
+    fn verify_packs(&self, _plan: &VerifyPacksPlanRequest) -> Result<VerifyPacksResponse> {
+        Err(VykarError::Other("transient failure".into()))
+    }
 }
 
 #[test]

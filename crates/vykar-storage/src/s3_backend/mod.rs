@@ -20,7 +20,10 @@ use vykar_types::cancel::CancelToken;
 use vykar_types::error::{Result, VykarError};
 
 use crate::conditional::Verifier;
-use crate::{ConditionalWrite, ListedObject, S3ConditionalWrites, StorageBackend};
+use crate::{
+    BatchDelete, BatchDeleteScope, ConditionalWrite, ListedObject, S3ConditionalWrites,
+    StorageBackend,
+};
 
 mod batch_delete;
 pub(crate) mod conditional;
@@ -49,7 +52,8 @@ pub struct S3Backend {
     /// parts but refuses completions still gets the second attempt.
     multipart_proven: std::sync::atomic::AtomicBool,
     /// Set once the endpoint answers DeleteObjects with NotImplemented; from
-    /// then on batch_delete_keys reports UnsupportedBackend without a request.
+    /// then on `batch_delete()` is None, and a `delete_keys` already in hand
+    /// deletes key by key.
     batch_delete_unsupported: std::sync::atomic::AtomicBool,
     request_width: usize,
     transfer_width: usize,
@@ -472,16 +476,28 @@ impl StorageBackend for S3Backend {
         }
     }
 
-    fn batch_delete_keys(&self, keys: &[String], _scope: crate::BatchDeleteScope) -> Result<()> {
-        self.delete_objects(keys)
-    }
-
     fn conditional(&self) -> Option<&dyn ConditionalWrite> {
         (self.conditional_offered() && !self.cond.refused())
             .then_some(self as &dyn ConditionalWrite)
     }
 
-    crate::unsupported_server_ops!(except[batch_delete_keys, conditional]);
+    /// DeleteObjects, unless deletes are tombstone PUTs (`s3_soft_delete`) or
+    /// the endpoint answered NotImplemented earlier on this instance.
+    fn batch_delete(&self) -> Option<&dyn BatchDelete> {
+        (!self.soft_delete
+            && !self
+                .batch_delete_unsupported
+                .load(std::sync::atomic::Ordering::Relaxed))
+        .then_some(self as &dyn BatchDelete)
+    }
+
+    crate::unsupported_server_ops!(except[conditional, batch_delete]);
+}
+
+impl BatchDelete for S3Backend {
+    fn delete_keys(&self, keys: &[String], _scope: BatchDeleteScope) -> Result<()> {
+        self.delete_objects(keys)
+    }
 }
 
 #[allow(clippy::result_large_err)]

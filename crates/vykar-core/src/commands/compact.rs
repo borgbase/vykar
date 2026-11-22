@@ -1,7 +1,7 @@
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use tracing::{info, warn};
 
@@ -15,7 +15,7 @@ use vykar_protocol::{
     MAX_REPACK_OUTPUT_BYTES, PACK_HEADER_SIZE, RepackBlobRef, RepackOperationRequest,
     RepackPlanRequest, repack_op_output_size, validate_pack_header,
 };
-use vykar_storage::StorageBackend;
+use vykar_storage::{ServerOp, StorageBackend};
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
 use vykar_types::pack_id::PackId;
@@ -499,7 +499,13 @@ const PACKS_PREFIX: &str = "packs/";
 /// reports it. One request where the backend lists a whole tree at once
 /// (vykar-server); otherwise, or if that request fails, one listing per shard.
 fn list_packs(storage: &dyn StorageBackend, concurrency: usize) -> Result<Vec<ListedPack>> {
-    match storage.list_tree_sized(PACKS_PREFIX) {
+    let Some(server) = storage
+        .server_ops()
+        .filter(|s| s.offers(ServerOp::ListTree))
+    else {
+        return parallel_list_packs(storage, concurrency);
+    };
+    match server.list_tree_sized(PACKS_PREFIX) {
         Ok(objects) => {
             let mut packs = Vec::with_capacity(objects.len());
             push_listed(
@@ -508,7 +514,6 @@ fn list_packs(storage: &dyn StorageBackend, concurrency: usize) -> Result<Vec<Li
             );
             Ok(packs)
         }
-        Err(VykarError::UnsupportedBackend(_)) => parallel_list_packs(storage, concurrency),
         // A cancelled listing is not a reason to list every shard instead.
         Err(e @ VykarError::Interrupted) => Err(e),
         Err(e) => {
@@ -622,6 +627,23 @@ fn try_server_side_repack(
         return Ok(true);
     }
 
+    // A server that does not advertise `repack` (one older than the field, or
+    // a failed `/health` probe) and a backend with no server behind it get a
+    // client-side repack. The repack trailer switches this gate to
+    // `ServerOp::RepackTrailer`. The clone lets `server` outlive the
+    // `&mut repo` borrows below.
+    let storage = Arc::clone(&repo.storage);
+    let Some(server) = storage.server_ops() else {
+        return Ok(false);
+    };
+    if !server.offers(ServerOp::Repack) {
+        warn!(
+            "compact: the server did not advertise server-side repack (an older \
+             vykar-server, or its /health probe failed); repacking on the client"
+        );
+        return Ok(false);
+    }
+
     let analysis_by_key: HashMap<&str, &PackAnalysis> = analyses
         .iter()
         .map(|analysis| (analysis.storage_key.as_str(), *analysis))
@@ -657,11 +679,10 @@ fn try_server_side_repack(
         return Ok(false);
     }
 
-    // Send one server_repack call per batch (batches stay within the server's
+    // Send one server repack call per batch (batches stay within the server's
     // output cap; client and server agree via MAX_REPACK_OUTPUT_BYTES). Each
     // batch is applied, persisted, and only then are its sources deleted, so a
     // crash at any point leaves the index consistent.
-    let mut first_batch = true;
     // Packs returned as some op's new pack carry live data and must never be
     // deleted as a source (the server may return the source itself).
     let mut result_packs: HashSet<String> = HashSet::new();
@@ -671,15 +692,7 @@ fn try_server_side_repack(
         // old server rejects a BLAKE3 plan outright instead of verifying the
         // packs under the wrong algorithm.
         let plan = RepackPlanRequest::new(batch, repo.content_hash());
-        let response = match repo.storage.server_repack(&plan) {
-            Ok(resp) => resp,
-            // Backend capability is stable, so only the first call can discover
-            // server-side repack is unsupported. After a successful batch a
-            // client-side fallback would redo work already applied.
-            Err(VykarError::UnsupportedBackend(_)) if first_batch => return Ok(false),
-            Err(err) => return Err(err),
-        };
-        first_batch = false;
+        let response = server.repack(&plan)?;
 
         result_packs.extend(
             response
@@ -751,18 +764,19 @@ fn delete_sources(
         return None;
     }
     let keys: Vec<String> = sources.iter().map(|a| a.storage_key.clone()).collect();
-    match storage.batch_delete_keys(&keys, vykar_storage::BatchDeleteScope::KeysOnly) {
-        Ok(()) => {
-            for analysis in sources {
-                record_deleted(analysis, stats);
+    if let Some(batch) = storage.batch_delete() {
+        match batch.delete_keys(&keys, vykar_storage::BatchDeleteScope::KeysOnly) {
+            Ok(()) => {
+                for analysis in sources {
+                    record_deleted(analysis, stats);
+                }
+                return None;
             }
-            return None;
+            Err(e) => warn!(
+                "compact: batch delete of {} source pack(s) failed ({e}); deleting one by one",
+                keys.len()
+            ),
         }
-        Err(VykarError::UnsupportedBackend(_)) => {}
-        Err(e) => warn!(
-            "compact: batch delete of {} source pack(s) failed ({e}); deleting one by one",
-            keys.len()
-        ),
     }
     let mut first_err = None;
     for analysis in sources {

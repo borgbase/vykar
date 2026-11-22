@@ -378,10 +378,15 @@ impl vykar_storage::InnerBackend for FaultyPut {
 
 vykar_storage::delegate_storage_backend! {
     for FaultyPut;
-    except [put, delete, put_pack, begin_staged_put, conditional, profile];
+    except [put, delete, put_pack, begin_staged_put, conditional, batch_delete, profile];
 
     // Test wrapper: keeps every write on `put`.
     fn conditional(&self) -> Option<&dyn vykar_storage::ConditionalWrite> {
+        None
+    }
+
+    // Keeps every delete on the logged `delete`.
+    fn batch_delete(&self) -> Option<&dyn vykar_storage::BatchDelete> {
         None
     }
 

@@ -21,9 +21,9 @@ use vykar_types::error::{Result, VykarError};
 
 use crate::conditional::{Verifier, after_verified, check_args};
 use crate::{
-    BatchDeleteScope, ConditionalSupport, ConditionalWrite, Created, ListedObject,
-    RepackPlanRequest, RepackResultResponse, ServerCapabilities, StorageBackend,
-    VerifyPacksPlanRequest, VerifyPacksResponse,
+    BatchDelete, BatchDeleteScope, ConditionalSupport, ConditionalWrite, Created, ListedObject,
+    RepackPlanRequest, RepackResultResponse, ServerCapabilities, ServerOp, ServerOps,
+    StorageBackend, VerifyPacksPlanRequest, VerifyPacksResponse,
 };
 use vykar_types::cancel::CancelToken;
 use vykar_types::hash::{HashAlgorithm, Hasher256};
@@ -92,7 +92,7 @@ pub struct RestBackend {
     sizes_unsupported: AtomicBool,
     /// What `/health` advertised. Probed on first need (a pack large enough
     /// to split, or a non-pack PUT on a backend not bound to BLAKE3), or
-    /// recorded by an explicit [`StorageBackend::server_capabilities`] call,
+    /// recorded by an explicit [`ServerOps::capabilities`] call,
     /// so a backup that uploads nothing pays no extra round trip.
     probed: OnceLock<ProbedCaps>,
     /// Set when the part path failed permanently; later packs use whole PUTs.
@@ -125,6 +125,8 @@ struct ProbedCaps {
     pack_parts: bool,
     blake3: bool,
     conditional_put: bool,
+    repack: bool,
+    repack_trailer: bool,
 }
 
 impl From<&ServerCapabilities> for ProbedCaps {
@@ -133,6 +135,8 @@ impl From<&ServerCapabilities> for ProbedCaps {
             pack_parts: caps.pack_parts,
             blake3: caps.supports_hash(HashAlgorithm::Blake3),
             conditional_put: caps.conditional_put,
+            repack: caps.repack,
+            repack_trailer: caps.repack_trailer,
         }
     }
 }
@@ -335,20 +339,14 @@ impl RestBackend {
         .map_err(|e| rest_error(format_args!("{op_name}"), e))
     }
 
-    /// Batch delete multiple keys in a single request.
-    pub fn batch_delete(&self, keys: &[String], cleanup_dirs: bool) -> Result<()> {
+    /// One `POST ?batch-delete` (with `cleanup-dirs` when asked) for `keys`.
+    fn post_batch_delete(&self, keys: &[String], cleanup_dirs: bool) -> Result<()> {
         let url = if cleanup_dirs {
             format!("{}?batch-delete&cleanup-dirs", self.base_url)
         } else {
             format!("{}?batch-delete", self.base_url)
         };
         self.post_no_content("batch-delete", &url, &keys, self.timeouts.admin)
-    }
-
-    /// Send a verify-packs plan to the server for server-side pack verification.
-    pub fn verify_packs(&self, plan: &VerifyPacksPlanRequest) -> Result<VerifyPacksResponse> {
-        let url = format!("{}?verify-packs", self.base_url);
-        self.post_json("verify-packs", &url, plan, self.timeouts.admin, &self.retry)
     }
 
     /// One `POST /<dir>?sizes` for keys that all lie below `dir`.
@@ -400,19 +398,6 @@ impl RestBackend {
             )));
         }
         Ok(Some(sizes))
-    }
-
-    /// Send a repack plan to the server for server-side compaction.
-    ///
-    /// Not retried: a retry after a timeout could stall the caller for hours.
-    /// The next compact run retries instead.
-    pub fn repack(&self, plan: &RepackPlanRequest) -> Result<RepackResultResponse> {
-        let url = format!("{}?repack", self.base_url);
-        let retry = RetryConfig {
-            max_retries: 0,
-            ..self.retry
-        };
-        self.post_json("repack", &url, plan, self.timeouts.repack, &retry)
     }
 }
 
@@ -1022,34 +1007,6 @@ impl StorageBackend for RestBackend {
         Ok(0)
     }
 
-    fn server_repack(&self, plan: &RepackPlanRequest) -> Result<RepackResultResponse> {
-        self.repack(plan)
-    }
-
-    fn batch_delete_keys(&self, keys: &[String], scope: BatchDeleteScope) -> Result<()> {
-        let cleanup = scope == BatchDeleteScope::WholeRepository;
-        if keys.is_empty() && !cleanup {
-            return Ok(());
-        }
-        // Chunk below the server's per-request key cap (200k). cleanup-dirs runs
-        // only on the final chunk, so empty directories are pruned once, after
-        // every key has been removed.
-        const CHUNK: usize = 100_000;
-        if keys.len() <= CHUNK {
-            return self.batch_delete(keys, cleanup);
-        }
-        let mut chunks = keys.chunks(CHUNK).peekable();
-        while let Some(chunk) = chunks.next() {
-            let is_last = chunks.peek().is_none();
-            self.batch_delete(chunk, cleanup && is_last)?;
-        }
-        Ok(())
-    }
-
-    fn server_verify_packs(&self, plan: &VerifyPacksPlanRequest) -> Result<VerifyPacksResponse> {
-        self.verify_packs(plan)
-    }
-
     fn bind_content_hash(&self, algo: HashAlgorithm) -> Result<()> {
         match self.content_hash.set(algo) {
             Ok(()) => Ok(()),
@@ -1065,14 +1022,115 @@ impl StorageBackend for RestBackend {
         }
     }
 
-    fn server_capabilities(&self) -> Result<ServerCapabilities> {
+    /// Offered when `/health` advertises `conditional_put` (probed on first
+    /// need; see [`StorageBackend::conditional`] for a failed probe) and no
+    /// check on this instance concluded `Unsupported`.
+    fn conditional(&self) -> Option<&dyn ConditionalWrite> {
+        (self.probed_caps().conditional_put && !self.cond.refused())
+            .then_some(self as &dyn ConditionalWrite)
+    }
+
+    /// Always: every supported vykar-server has `?batch-delete`.
+    fn batch_delete(&self) -> Option<&dyn BatchDelete> {
+        Some(self)
+    }
+
+    /// Always: a vykar-server is behind every `RestBackend`. No I/O; which
+    /// operations it serves is [`ServerOps::offers`].
+    fn server_ops(&self) -> Option<&dyn ServerOps> {
+        Some(self)
+    }
+
+    fn profile(&self) -> crate::BackendProfile {
+        crate::BackendProfile {
+            local: false,
+            staged_put: false,
+            request_width: self.request_width,
+            transfer_width: self.transfer_width,
+        }
+    }
+}
+
+impl BatchDelete for RestBackend {
+    fn delete_keys(&self, keys: &[String], scope: BatchDeleteScope) -> Result<()> {
+        let cleanup = scope == BatchDeleteScope::WholeRepository;
+        if keys.is_empty() && !cleanup {
+            return Ok(());
+        }
+        // Chunk below the server's per-request key cap (200k). cleanup-dirs runs
+        // only on the final chunk, so empty directories are pruned once, after
+        // every key has been removed.
+        const CHUNK: usize = 100_000;
+        if keys.len() <= CHUNK {
+            return self.post_batch_delete(keys, cleanup);
+        }
+        let mut chunks = keys.chunks(CHUNK).peekable();
+        while let Some(chunk) = chunks.next() {
+            let is_last = chunks.peek().is_none();
+            self.post_batch_delete(chunk, cleanup && is_last)?;
+        }
+        Ok(())
+    }
+}
+
+impl ServerOps for RestBackend {
+    /// Only the two repack operations need `/health` (probed once; a failed
+    /// probe offers neither). `?sizes` is offered until an old server has
+    /// refused it on this instance.
+    fn offers(&self, op: ServerOp) -> bool {
+        match op {
+            ServerOp::VerifyPacks | ServerOp::ListTree => true,
+            ServerOp::ObjectSizes => !self.sizes_unsupported.load(Ordering::Relaxed),
+            ServerOp::Repack => self.probed_caps().repack,
+            ServerOp::RepackTrailer => self.probed_caps().repack_trailer,
+        }
+    }
+
+    fn capabilities(&self) -> Result<ServerCapabilities> {
         let caps = self.fetch_server_capabilities()?;
         let _ = self.probed.set(ProbedCaps::from(&caps));
         Ok(caps)
     }
 
+    fn init(&self) -> Result<()> {
+        let url = format!("{}?init", self.base_url);
+        self.retry_call(
+            "INIT",
+            || {
+                let req = self.authed(self.agent.post(&url));
+                Self::recv_response_within(req, self.timeouts.admin).send(&[] as &[u8])
+            },
+            |resp| {
+                let status = resp.status().as_u16();
+                if status >= 400 {
+                    crate::retry::classify_status(status, format!("REST INIT: HTTP {status}"))?;
+                }
+                Ok(())
+            },
+        )
+        .map_err(|e| rest_error(format_args!("INIT"), e))?;
+        Ok(())
+    }
+
+    fn verify_packs(&self, plan: &VerifyPacksPlanRequest) -> Result<VerifyPacksResponse> {
+        let url = format!("{}?verify-packs", self.base_url);
+        self.post_json("verify-packs", &url, plan, self.timeouts.admin, &self.retry)
+    }
+
+    /// Not retried: a retry after a timeout could stall the caller for hours.
+    /// The next compact run retries instead.
+    fn repack(&self, plan: &RepackPlanRequest) -> Result<RepackResultResponse> {
+        let url = format!("{}?repack", self.base_url);
+        let retry = RetryConfig {
+            max_retries: 0,
+            ..self.retry
+        };
+        self.post_json("repack", &url, plan, self.timeouts.repack, &retry)
+    }
+
     fn object_sizes(&self, keys: &[String]) -> Result<Vec<Option<u64>>> {
-        let unsupported = || VykarError::UnsupportedBackend("batch object sizes API".into());
+        let unsupported =
+            || VykarError::Other("REST object sizes: the server predates POST ?sizes".into());
         if self.sizes_unsupported.load(Ordering::Relaxed) {
             return Err(unsupported());
         }
@@ -1115,43 +1173,6 @@ impl StorageBackend for RestBackend {
         };
         let body = self.fetch_listing(prefix, "list&sized", &retry)?;
         Self::parse_sized_listing(&body)
-    }
-
-    /// Offered when `/health` advertises `conditional_put` (probed on first
-    /// need; see [`StorageBackend::conditional`] for a failed probe) and no
-    /// check on this instance concluded `Unsupported`.
-    fn conditional(&self) -> Option<&dyn ConditionalWrite> {
-        (self.probed_caps().conditional_put && !self.cond.refused())
-            .then_some(self as &dyn ConditionalWrite)
-    }
-
-    fn profile(&self) -> crate::BackendProfile {
-        crate::BackendProfile {
-            local: false,
-            staged_put: false,
-            request_width: self.request_width,
-            transfer_width: self.transfer_width,
-        }
-    }
-
-    fn server_init(&self) -> Result<()> {
-        let url = format!("{}?init", self.base_url);
-        self.retry_call(
-            "INIT",
-            || {
-                let req = self.authed(self.agent.post(&url));
-                Self::recv_response_within(req, self.timeouts.admin).send(&[] as &[u8])
-            },
-            |resp| {
-                let status = resp.status().as_u16();
-                if status >= 400 {
-                    crate::retry::classify_status(status, format!("REST INIT: HTTP {status}"))?;
-                }
-                Ok(())
-            },
-        )
-        .map_err(|e| rest_error(format_args!("INIT"), e))?;
-        Ok(())
     }
 }
 
@@ -1254,7 +1275,7 @@ mod tests {
         let (url, handle) = mock_server(&json_response(r#"{"status":"ok","version":"0.19.1"}"#));
         let backend = RestBackend::new(&url, None, no_retry(), None).unwrap();
 
-        let caps = backend.server_capabilities().unwrap();
+        let caps = backend.capabilities().unwrap();
         assert_eq!(caps.version, "0.19.1");
         assert_eq!(caps.protocol_version, 0);
         assert!(caps.supports_hash(HashAlgorithm::Blake2b));
@@ -1272,7 +1293,7 @@ mod tests {
         ));
         let backend = RestBackend::new(&url, None, no_retry(), None).unwrap();
 
-        let caps = backend.server_capabilities().unwrap();
+        let caps = backend.capabilities().unwrap();
         assert_eq!(caps.protocol_version, 2);
         assert!(caps.supports_hash(HashAlgorithm::Blake3));
         handle.join().unwrap();
@@ -1287,7 +1308,7 @@ mod tests {
         ));
         let backend = RestBackend::new(&url, None, no_retry(), None).unwrap();
 
-        let caps = backend.server_capabilities().unwrap();
+        let caps = backend.capabilities().unwrap();
         assert!(caps.supports_hash(HashAlgorithm::Blake3));
         handle.join().unwrap();
     }
@@ -1533,7 +1554,7 @@ mod tests {
         let (url, request) = capture_request(&empty("204 No Content"));
         let backend = RestBackend::new(&url, None, no_retry(), None).unwrap();
         backend
-            .batch_delete_keys(&["packs/ab/x".into()], BatchDeleteScope::KeysOnly)
+            .delete_keys(&["packs/ab/x".into()], BatchDeleteScope::KeysOnly)
             .unwrap();
         let request = request.join().unwrap();
         assert!(
@@ -1547,7 +1568,7 @@ mod tests {
         let (url, request) = capture_request(&empty("204 No Content"));
         let backend = RestBackend::new(&url, None, no_retry(), None).unwrap();
         backend
-            .batch_delete_keys(&["packs/ab/x".into()], BatchDeleteScope::WholeRepository)
+            .delete_keys(&["packs/ab/x".into()], BatchDeleteScope::WholeRepository)
             .unwrap();
         let request = request.join().unwrap();
         assert!(
@@ -1560,7 +1581,7 @@ mod tests {
     fn batch_delete_keys_only_with_no_keys_sends_nothing() {
         let backend = RestBackend::new("http://127.0.0.1:1", None, no_retry(), None).unwrap();
         backend
-            .batch_delete_keys(&[], BatchDeleteScope::KeysOnly)
+            .delete_keys(&[], BatchDeleteScope::KeysOnly)
             .unwrap();
     }
 
@@ -1570,7 +1591,7 @@ mod tests {
         let lines = |scope| {
             let (url, seen) = routing_server(|_| empty("204 No Content"));
             let backend = RestBackend::new(&url, None, no_retry(), None).unwrap();
-            backend.batch_delete_keys(&keys, scope).unwrap();
+            backend.delete_keys(&keys, scope).unwrap();
             let lines: Vec<String> = seen
                 .lock()
                 .unwrap()
@@ -1599,18 +1620,60 @@ mod tests {
         assert!(request.starts_with("POST /packs?sizes "), "got:\n{request}");
     }
 
-    /// An old server answers the unknown `?sizes` POST with 400. That is
-    /// "unsupported" (the caller falls back), and it is remembered, so the
-    /// probe costs one request per process.
+    /// An old server answers the unknown `?sizes` POST with 400. That fails
+    /// the call (the caller falls back) and is remembered: `offers` turns
+    /// false and a second call sends no request, so the probe costs one
+    /// request per backend.
     #[test]
-    fn object_sizes_on_an_old_server_is_unsupported_and_remembered() {
+    fn object_sizes_on_an_old_server_fails_once_and_stops_offering() {
         let (url, server) = mock_server("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n");
         let backend = RestBackend::new(&url, None, no_retry(), None).unwrap();
         let keys = vec!["packs/ab/x".to_string()];
-        for _ in 0..2 {
-            let err = backend.object_sizes(&keys).unwrap_err();
-            assert!(matches!(err, VykarError::UnsupportedBackend(_)), "{err}");
-        }
+        assert!(backend.offers(ServerOp::ObjectSizes));
+        let err = backend.object_sizes(&keys).unwrap_err();
+        assert!(!matches!(err, VykarError::UnsupportedBackend(_)), "{err}");
+        assert!(!backend.offers(ServerOp::ObjectSizes));
+        // The mock serves one response; a second request would fail
+        // differently (connection refused) or hang the join below.
+        let again = backend.object_sizes(&keys).unwrap_err().to_string();
+        assert!(again.contains("predates"), "{again}");
+        server.join().unwrap();
+    }
+
+    /// The accessors and the offers that need no `/health` do no I/O.
+    #[test]
+    fn server_ops_and_batch_delete_need_no_request() {
+        let backend = RestBackend::new("http://127.0.0.1:1", None, no_retry(), None).unwrap();
+        assert!(backend.batch_delete().is_some());
+        let server = backend.server_ops().expect("a server is behind REST");
+        assert!(server.offers(ServerOp::VerifyPacks));
+        assert!(server.offers(ServerOp::ListTree));
+        assert!(server.offers(ServerOp::ObjectSizes));
+        assert!(backend.probed.get().is_none(), "no /health probe was made");
+    }
+
+    /// Server-side repack is offered only when `/health` advertises it: not
+    /// by a 0.24-style server, not after a failed probe.
+    #[test]
+    fn repack_is_offered_only_when_advertised() {
+        let (url, server) = mock_server(&json_response(
+            r#"{"status":"ok","version":"0.25.0","protocol_version":2,"repack":true}"#,
+        ));
+        let backend = RestBackend::new(&url, None, no_retry(), None).unwrap();
+        assert!(backend.offers(ServerOp::Repack));
+        assert!(!backend.offers(ServerOp::RepackTrailer));
+        server.join().unwrap();
+
+        let (url, server) = mock_server(&json_response(
+            r#"{"status":"ok","version":"0.24.0","protocol_version":2,"hashes":["blake2b","blake3"]}"#,
+        ));
+        let backend = RestBackend::new(&url, None, no_retry(), None).unwrap();
+        assert!(!backend.offers(ServerOp::Repack));
+        server.join().unwrap();
+
+        let (url, server) = mock_server(&empty("500 Internal Server Error"));
+        let backend = RestBackend::new(&url, None, no_retry(), None).unwrap();
+        assert!(!backend.offers(ServerOp::Repack));
         server.join().unwrap();
     }
 
@@ -1856,7 +1919,7 @@ mod tests {
             "201 Created",
         ));
         let backend = parts_backend(&url, no_retry());
-        assert!(backend.server_capabilities().unwrap().pack_parts);
+        assert!(backend.capabilities().unwrap().pack_parts);
         let (key, data) = test_pack(3000);
         backend.put(&key, &data).unwrap();
         let seen = seen.lock().unwrap().clone();

@@ -83,15 +83,14 @@ pub fn run(config: &VykarConfig) -> Result<DeleteRepoStats> {
 /// Delete every known repository key: one batch where the backend has one
 /// (with the whole-repository cleanup), else key by key.
 fn delete_known(backend: &dyn StorageBackend, known: &[String]) -> Result<()> {
-    match backend.batch_delete_keys(known, BatchDeleteScope::WholeRepository) {
-        Ok(()) => Ok(()),
-        Err(VykarError::UnsupportedBackend(_)) => {
+    match backend.batch_delete() {
+        Some(batch) => batch.delete_keys(known, BatchDeleteScope::WholeRepository),
+        None => {
             for key in known {
                 backend.delete(key)?;
             }
             Ok(())
         }
-        Err(e) => Err(e),
     }
 }
 
@@ -99,12 +98,13 @@ fn delete_known(backend: &dyn StorageBackend, known: &[String]) -> Result<()> {
 mod tests {
     use std::sync::Mutex;
 
-    use vykar_storage::{InnerBackend, delegate_storage_backend};
+    use vykar_storage::{BatchDelete, InnerBackend, delegate_storage_backend};
 
     use super::*;
     use crate::testutil::MemoryBackend;
 
-    /// Records the batch-delete scope and every per-key delete.
+    /// Records the batch-delete scope and every per-key delete. Offers a batch
+    /// delete only when `batch_supported`.
     struct ScopeRecorder {
         inner: MemoryBackend,
         batch_supported: bool,
@@ -131,18 +131,21 @@ mod tests {
 
     delegate_storage_backend! {
         for ScopeRecorder;
-        except [delete, batch_delete_keys];
+        except [delete, batch_delete];
 
         fn delete(&self, key: &str) -> Result<()> {
             self.deletes.lock().unwrap().push(key.to_string());
             self.inner.delete(key)
         }
 
-        fn batch_delete_keys(&self, keys: &[String], scope: BatchDeleteScope) -> Result<()> {
+        fn batch_delete(&self) -> Option<&dyn BatchDelete> {
+            self.batch_supported.then_some(self as &dyn BatchDelete)
+        }
+    }
+
+    impl BatchDelete for ScopeRecorder {
+        fn delete_keys(&self, keys: &[String], scope: BatchDeleteScope) -> Result<()> {
             self.scopes.lock().unwrap().push(scope);
-            if !self.batch_supported {
-                return self.inner.batch_delete_keys(keys, scope);
-            }
             for key in keys {
                 self.inner.delete(key)?;
             }
@@ -169,9 +172,9 @@ mod tests {
     fn delete_known_falls_back_to_per_key_deletes() {
         let backend = ScopeRecorder::new(false);
         delete_known(&backend, &known()).unwrap();
-        assert_eq!(
-            *backend.scopes.lock().unwrap(),
-            vec![BatchDeleteScope::WholeRepository]
+        assert!(
+            backend.scopes.lock().unwrap().is_empty(),
+            "no batch is attempted"
         );
         assert_eq!(*backend.deletes.lock().unwrap(), known());
     }

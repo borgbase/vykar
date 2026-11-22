@@ -455,6 +455,8 @@ mod tests {
         assert!(caps.serves_v6_key_dirs());
         assert_eq!(caps.key_dirs, vykar_protocol::KNOWN_ROOT_DIRS);
         assert!(caps.conditional_put);
+        assert!(caps.object_sizes && caps.list_tree && caps.verify_packs && caps.repack);
+        assert!(!caps.repack_trailer);
     }
 
     #[tokio::test]

@@ -863,7 +863,7 @@ impl InnerBackend for CountingBackend {
 
 vykar_storage::delegate_storage_backend! {
     for CountingBackend;
-    except [get, list, list_sized, list_meta, list_tree_sized];
+    except [get, list, list_sized, list_meta, server_ops];
 
     fn list_meta(
         &self,
@@ -890,12 +890,9 @@ vykar_storage::delegate_storage_backend! {
         self.inner.list_sized(prefix)
     }
 
-    fn list_tree_sized(
-        &self,
-        prefix: &str,
-    ) -> vykar_types::error::Result<Vec<vykar_storage::ListedObject>> {
-        self.reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.inner.list_tree_sized(prefix)
+    // No server behind the inner backend: listings stay on `list_sized`.
+    fn server_ops(&self) -> Option<&dyn vykar_storage::ServerOps> {
+        None
     }
 }
 

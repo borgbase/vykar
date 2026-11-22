@@ -743,13 +743,14 @@ pub(crate) fn collect_garbage(
         return Ok(0);
     }
     let keys: Vec<String> = garbage.iter().map(object_key).collect();
-    match storage.batch_delete_keys(&keys, vykar_storage::BatchDeleteScope::KeysOnly) {
-        Ok(()) => return Ok(keys.len()),
-        Err(VykarError::UnsupportedBackend(_)) => {}
-        Err(e) => tracing::warn!(
-            "batch delete of {} index object(s) failed ({e}); deleting one by one",
-            keys.len()
-        ),
+    if let Some(batch) = storage.batch_delete() {
+        match batch.delete_keys(&keys, vykar_storage::BatchDeleteScope::KeysOnly) {
+            Ok(()) => return Ok(keys.len()),
+            Err(e) => tracing::warn!(
+                "batch delete of {} index object(s) failed ({e}); deleting one by one",
+                keys.len()
+            ),
+        }
     }
     let mut deleted = 0;
     for (name, key) in garbage.iter().zip(&keys) {

@@ -123,7 +123,7 @@ The server holds no keys, so this proves each pack is the object the client uplo
 
 ## Server-Side Repack
 
-`vykar compact` can use `/?repack` to rewrite packs server-side without downloading encrypted blobs to the client.
+`vykar compact` can use `/?repack` to rewrite packs server-side without downloading encrypted blobs to the client, when the server advertises `repack` in `/health`.
 
 High-level flow:
 
@@ -147,21 +147,19 @@ This complements client-side `vykar check`, which still owns full cryptographic 
 
 ## RestBackend
 
-`crates/vykar-storage/src/rest_backend.rs` implements `StorageBackend` with `ureq`. In addition to the trait surface, it exposes helper methods used by client commands:
-
-- `batch_delete()`
-- `verify_packs()`
-- `repack()`
+`crates/vykar-storage/src/rest_backend.rs` implements `StorageBackend` with `ureq`. The server-side operations (batch delete, init, verify-packs, repack, object sizes, one-request tree listing, the `/health` probe) are the `BatchDelete` and `ServerOps` traits, reached through `StorageBackend::batch_delete()` and `server_ops()`; callers ask `ServerOps::offers` before using an optional one.
 
 It also sends the content-digest header on `PUT` requests — bound once to the repository's algorithm when the repository is opened — and validates `Content-Range` on ranged reads.
 
 `GET /health` is unauthenticated and advertises what the server supports:
 
 ```json
-{"status":"ok","version":"0.20.0","protocol_version":2,"hashes":["blake2b","blake3"],"pack_parts":true,"segmented_index":true,"key_dirs":["keys","snapshots","packs","locks","sessions","pending_index","index.d","index.h","packmaps"],"conditional_put":true}
+{"status":"ok","version":"0.20.0","protocol_version":2,"hashes":["blake2b","blake3"],"pack_parts":true,"segmented_index":true,"key_dirs":["keys","snapshots","packs","locks","sessions","pending_index","index.d","index.h","packmaps"],"conditional_put":true,"object_sizes":true,"list_tree":true,"verify_packs":true,"repack":true}
 ```
 
 `conditional_put` says the server honours `If-None-Match: *` on `PUT` (see the `PUT` row above). Older servers omit it and would ignore the header and overwrite, so a client sends a conditional PUT only to a server that advertises it.
+
+`object_sizes`, `list_tree`, `verify_packs` and `repack` name the operations a client may gate on. The client uses server-side repack only when `repack` is advertised: against an older server, or when the `/health` probe failed, compact repacks on the client and logs a warning naming both causes. The other three are served by every server the client supports, so the client does not wait for the field; an old server's `400` to `?sizes` is handled by the client. `repack_trailer` is not advertised yet; it arrives with the repack trailer.
 
 `key_dirs` lists the top-level key directories the server accepts. `index.h` and `packmaps` (format v6) are accepted only by servers that list them; older servers omit the field and answer `400` to those keys.
 

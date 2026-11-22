@@ -108,12 +108,12 @@ impl InnerBackend for ThrottledStorageBackend {
     }
 }
 
-// Only the byte-moving methods are throttled. Everything else — including the
-// server-side operations, whose bytes never cross the client's link — is
-// forwarded by the macro. The capability methods have no trait default, so
-// this impl cannot silently answer "unsupported" on behalf of a backend that
-// does support them, which is how `server_verify_packs` and `server_init` came
-// to be disabled on every throttled REST repo.
+// Only the byte-moving methods are throttled. Everything else is forwarded by
+// the macro. `server_ops()` and `batch_delete()` are forwarded, so the
+// server-side operations, whose bytes never cross the client's link, reach the
+// inner backend; the accessors have no default, so this impl cannot silently
+// answer None on behalf of a backend that has them, which is how server-side
+// verify and init once came to be disabled on every throttled REST repo.
 //
 // Tokens are charged per object (before an upload is sent, after a read
 // completes), so the caps bound the average rate, not the peak: each object
@@ -213,18 +213,17 @@ delegate_storage_backend! {
     }
 }
 
-impl ThrottledStorageBackend {
-    fn inner_conditional(&self) -> Result<&dyn vykar_storage::ConditionalWrite> {
-        self.inner.conditional().ok_or_else(|| {
-            vykar_types::error::VykarError::UnsupportedBackend("put-if-absent".into())
-        })
-    }
-}
+/// Why the throttle answers put-if-absent itself when the inner backend has
+/// stopped offering it (a check on the inner concluded `Unsupported`).
+const WITHDRAWN: &str = "the backend no longer offers it";
 
 impl vykar_storage::ConditionalWrite for ThrottledStorageBackend {
     fn put_if_absent(&self, key: &str, data: &[u8]) -> Result<vykar_storage::Created> {
         // Checked before charging, so a refused call costs no tokens.
-        let inner = self.inner_conditional()?;
+        let inner = self
+            .inner
+            .conditional()
+            .ok_or_else(|| vykar_storage::put_if_absent_unavailable(WITHDRAWN))?;
         if let Some(limiter) = self.write_limiter.as_ref() {
             limiter.consume(data.len());
         }
@@ -232,7 +231,12 @@ impl vykar_storage::ConditionalWrite for ThrottledStorageBackend {
     }
 
     fn verify(&self) -> Result<vykar_storage::ConditionalSupport> {
-        self.inner_conditional()?.verify()
+        match self.inner.conditional() {
+            Some(inner) => inner.verify(),
+            None => Ok(vykar_storage::ConditionalSupport::Unsupported {
+                reason: format!("put-if-absent: {WITHDRAWN}"),
+            }),
+        }
     }
 }
 
@@ -395,7 +399,8 @@ fn set_process_nice(value: i32) -> std::result::Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vykar_protocol::{VerifyPacksPlanRequest, VerifyPacksResponse};
+    use vykar_protocol::{ServerCapabilities, VerifyPacksPlanRequest, VerifyPacksResponse};
+    use vykar_storage::{BatchDelete, BatchDeleteScope, ServerOp, ServerOps};
 
     #[test]
     fn mib_conversion() {
@@ -405,8 +410,8 @@ mod tests {
     }
 
     /// Regression: `ThrottledStorageBackend` must forward the server-side ops.
-    /// Falling through to the trait defaults returns `UnsupportedBackend`, which
-    /// silently disables server-side pack verification and server-side init as
+    /// A wrapper answering None from the accessors would silently disable
+    /// server-side pack verification, server-side init and batch deletes as
     /// soon as a bandwidth cap is configured on a REST repo.
     #[test]
     fn throttled_backend_forwards_server_side_ops() {
@@ -416,6 +421,38 @@ mod tests {
             verify_calls: Arc<AtomicUsize>,
             init_calls: Arc<AtomicUsize>,
             sizes_calls: Arc<AtomicUsize>,
+            batch_calls: Arc<AtomicUsize>,
+        }
+
+        impl ServerOps for ServerOpRecorder {
+            fn offers(&self, op: ServerOp) -> bool {
+                matches!(op, ServerOp::VerifyPacks | ServerOp::ObjectSizes)
+            }
+            fn capabilities(&self) -> Result<ServerCapabilities> {
+                Ok(ServerCapabilities::default())
+            }
+            fn init(&self) -> Result<()> {
+                self.init_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+            fn verify_packs(&self, _plan: &VerifyPacksPlanRequest) -> Result<VerifyPacksResponse> {
+                self.verify_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(VerifyPacksResponse {
+                    results: Vec::new(),
+                    truncated: false,
+                })
+            }
+            fn object_sizes(&self, keys: &[String]) -> Result<Vec<Option<u64>>> {
+                self.sizes_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(vec![Some(1); keys.len()])
+            }
+        }
+
+        impl BatchDelete for ServerOpRecorder {
+            fn delete_keys(&self, _keys: &[String], _scope: BatchDeleteScope) -> Result<()> {
+                self.batch_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
         }
 
         impl StorageBackend for ServerOpRecorder {
@@ -440,23 +477,11 @@ mod tests {
             fn create_dir(&self, _key: &str) -> Result<()> {
                 Ok(())
             }
-            fn server_verify_packs(
-                &self,
-                _plan: &VerifyPacksPlanRequest,
-            ) -> Result<VerifyPacksResponse> {
-                self.verify_calls.fetch_add(1, Ordering::SeqCst);
-                Ok(VerifyPacksResponse {
-                    results: Vec::new(),
-                    truncated: false,
-                })
+            fn batch_delete(&self) -> Option<&dyn BatchDelete> {
+                Some(self)
             }
-            fn server_init(&self) -> Result<()> {
-                self.init_calls.fetch_add(1, Ordering::SeqCst);
-                Ok(())
-            }
-            fn object_sizes(&self, keys: &[String]) -> Result<Vec<Option<u64>>> {
-                self.sizes_calls.fetch_add(1, Ordering::SeqCst);
-                Ok(vec![Some(1); keys.len()])
+            fn server_ops(&self) -> Option<&dyn ServerOps> {
+                Some(self)
             }
 
             fn profile(&self) -> vykar_storage::BackendProfile {
@@ -468,20 +493,18 @@ mod tests {
                 }
             }
 
-            vykar_storage::unsupported_server_ops!(except [
-                server_verify_packs,
-                server_init,
-                object_sizes
-            ]);
+            vykar_storage::unsupported_server_ops!(except [batch_delete, server_ops]);
         }
 
         let verify_calls = Arc::new(AtomicUsize::new(0));
         let init_calls = Arc::new(AtomicUsize::new(0));
         let sizes_calls = Arc::new(AtomicUsize::new(0));
+        let batch_calls = Arc::new(AtomicUsize::new(0));
         let inner = Box::new(ServerOpRecorder {
             verify_calls: Arc::clone(&verify_calls),
             init_calls: Arc::clone(&init_calls),
             sizes_calls: Arc::clone(&sizes_calls),
+            batch_calls: Arc::clone(&batch_calls),
         });
 
         // Non-zero caps, so the wrapper is actually installed.
@@ -494,19 +517,24 @@ mod tests {
 
         let plan =
             VerifyPacksPlanRequest::new(Vec::new(), vykar_types::hash::HashAlgorithm::Blake3);
-        let response = wrapped
-            .server_verify_packs(&plan)
-            .expect("verify forwarded");
+        let server = wrapped.server_ops().expect("server ops forwarded");
+        let response = server.verify_packs(&plan).expect("verify forwarded");
         assert!(response.results.is_empty());
-        wrapped.server_init().expect("init forwarded");
-        let sizes = wrapped
+        server.init().expect("init forwarded");
+        let sizes = server
             .object_sizes(&["packs/00/x".to_string()])
             .expect("object_sizes forwarded");
         assert_eq!(sizes, vec![Some(1)]);
+        wrapped
+            .batch_delete()
+            .expect("batch delete forwarded")
+            .delete_keys(&[], BatchDeleteScope::KeysOnly)
+            .expect("batch delete reaches the inner backend");
 
         assert_eq!(verify_calls.load(Ordering::SeqCst), 1);
         assert_eq!(init_calls.load(Ordering::SeqCst), 1);
         assert_eq!(sizes_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(batch_calls.load(Ordering::SeqCst), 1);
     }
 
     /// Put-if-absent is offered exactly when the inner backend offers it,
@@ -595,6 +623,17 @@ mod tests {
             write_limiter: Some(Arc::new(ByteRateLimiter::new(u64::MAX))),
         };
         assert!(wrapped.conditional().is_none());
+        // A handle obtained before the inner withdrew answers conclusively,
+        // without charging the limiter.
+        assert!(matches!(
+            ConditionalWrite::verify(&wrapped).unwrap(),
+            ConditionalSupport::Unsupported { .. }
+        ));
+        let refused = ConditionalWrite::put_if_absent(&wrapped, "locks/k", &[0u8; 10]).unwrap_err();
+        assert!(
+            matches!(&refused, vykar_types::error::VykarError::UnsupportedBackend(m) if m.contains("put-if-absent unavailable")),
+            "{refused:?}"
+        );
     }
 
     /// Packs reach the inner `put_pack` (not `put`/`put_owned`), release

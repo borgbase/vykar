@@ -354,7 +354,7 @@ pub struct RecordingBackend {
 
 /// How [`RecordingBackend`] answers `list_tree_sized`.
 enum TreeListing {
-    /// The memory backend's `UnsupportedBackend`, uncounted.
+    /// No server: `server_ops()` is None, so nothing asks for a tree listing.
     Unsupported,
     /// One listing with sizes, as a vykar-server answers it.
     Answer,
@@ -436,6 +436,61 @@ impl RecordingBackend {
     }
 }
 
+/// The server behind a tree-listing [`RecordingBackend`]: tree listings only.
+impl vykar_storage::ServerOps for RecordingBackend {
+    fn offers(&self, op: vykar_storage::ServerOp) -> bool {
+        op == vykar_storage::ServerOp::ListTree
+    }
+
+    fn capabilities(&self) -> Result<vykar_protocol::ServerCapabilities> {
+        Ok(fake_server_caps())
+    }
+
+    fn init(&self) -> Result<()> {
+        Ok(())
+    }
+
+    fn list_tree_sized(&self, prefix: &str) -> Result<Vec<vykar_storage::ListedObject>> {
+        let answer = match self.tree_listing {
+            TreeListing::Unsupported => {
+                return Err(VykarError::Other("no tree listing without a server".into()));
+            }
+            TreeListing::Answer => self.sized_from_inner(prefix),
+            TreeListing::AnswerUnsized => self.inner.list_sized(prefix),
+            TreeListing::Fail => Err(VykarError::Other("injected tree listing failure".into())),
+        };
+        self.log.tree_lists.fetch_add(1, Ordering::Relaxed);
+        answer
+    }
+}
+
+/// `/health` of a current vykar-server, for test fakes that implement
+/// `ServerOps`: both hashes, the segmented index, every key directory and the
+/// four operation fields (not `repack_trailer`, not `conditional_put`).
+pub(crate) fn fake_server_caps() -> vykar_protocol::ServerCapabilities {
+    vykar_protocol::ServerCapabilities {
+        status: "ok".into(),
+        version: "test".into(),
+        protocol_version: vykar_protocol::PROTOCOL_VERSION,
+        hashes: vec![
+            HashAlgorithm::Blake2b.as_str().into(),
+            HashAlgorithm::Blake3.as_str().into(),
+        ],
+        pack_parts: true,
+        segmented_index: true,
+        key_dirs: vykar_protocol::KNOWN_ROOT_DIRS
+            .iter()
+            .map(|d| (*d).to_string())
+            .collect(),
+        conditional_put: false,
+        object_sizes: true,
+        list_tree: true,
+        verify_packs: true,
+        repack: true,
+        repack_trailer: false,
+    }
+}
+
 impl InnerBackend for RecordingBackend {
     fn inner_backend(&self) -> &dyn StorageBackend {
         &self.inner
@@ -446,7 +501,7 @@ delegate_storage_backend! {
     for RecordingBackend;
     except [
         put, list, get_range, get_range_into, open_range, put_owned, put_pack, begin_staged_put,
-        size, list_sized, list_meta, list_tree_sized, conditional, profile
+        size, list_sized, list_meta, conditional, server_ops, profile
     ];
 
     fn list_meta(
@@ -474,15 +529,12 @@ delegate_storage_backend! {
         self.sized_from_inner(prefix)
     }
 
-    fn list_tree_sized(&self, prefix: &str) -> Result<Vec<vykar_storage::ListedObject>> {
-        let answer = match self.tree_listing {
-            TreeListing::Unsupported => return self.inner.list_tree_sized(prefix),
-            TreeListing::Answer => self.sized_from_inner(prefix),
-            TreeListing::AnswerUnsized => self.inner.list_sized(prefix),
-            TreeListing::Fail => Err(VykarError::Other("injected tree listing failure".into())),
-        };
-        self.log.tree_lists.fetch_add(1, Ordering::Relaxed);
-        answer
+    /// A server that lists trees, in every mode but `Unsupported`.
+    fn server_ops(&self) -> Option<&dyn vykar_storage::ServerOps> {
+        match self.tree_listing {
+            TreeListing::Unsupported => None,
+            _ => Some(self),
+        }
     }
 
     fn size(&self, key: &str) -> Result<Option<u64>> {
@@ -684,7 +736,7 @@ delegate_storage_backend! {
     for HookBackend;
     except [
         put, delete, list, put_owned, put_pack, begin_staged_put, list_sized, list_meta,
-        list_tree_sized, conditional, profile
+        conditional, batch_delete, server_ops, profile
     ];
 
     fn list_meta(
@@ -696,6 +748,16 @@ delegate_storage_backend! {
 
     // Test wrapper: keeps every write on `put`.
     fn conditional(&self) -> Option<&dyn vykar_storage::ConditionalWrite> {
+        None
+    }
+
+    // Hooks fire on `delete` and `list_sized`: keep every delete and listing
+    // on them.
+    fn batch_delete(&self) -> Option<&dyn vykar_storage::BatchDelete> {
+        None
+    }
+
+    fn server_ops(&self) -> Option<&dyn vykar_storage::ServerOps> {
         None
     }
 
@@ -744,10 +806,6 @@ delegate_storage_backend! {
         self.inner.list_sized(prefix)
     }
 
-    fn list_tree_sized(&self, prefix: &str) -> Result<Vec<vykar_storage::ListedObject>> {
-        self.before(Op::List, prefix);
-        self.inner.list_tree_sized(prefix)
-    }
 }
 
 #[cfg(test)]

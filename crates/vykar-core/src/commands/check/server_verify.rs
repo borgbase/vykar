@@ -9,9 +9,8 @@ use crate::repo::control::CancelToken;
 use vykar_protocol::{
     PACK_HEADER_SIZE, VerifyBlobRef, VerifyPackRequest, VerifyPacksPlanRequest, VerifyPacksResponse,
 };
-use vykar_storage::StorageBackend;
+use vykar_storage::{ServerOp, StorageBackend};
 use vykar_types::chunk_id::ChunkId;
-use vykar_types::error::VykarError;
 use vykar_types::hash::HashAlgorithm;
 use vykar_types::pack_id::PackId;
 
@@ -58,6 +57,9 @@ pub(crate) fn try_server_verify(
             verified_packs: HashSet::new(),
         };
     }
+    let server = storage
+        .server_ops()
+        .filter(|s| s.offers(ServerOp::VerifyPacks));
 
     // Build verify requests from chunk index data
     let pack_list: Vec<(&PackId, &Vec<(ChunkId, ChunkIndexEntry)>)> = pack_chunks.iter().collect();
@@ -103,11 +105,13 @@ pub(crate) fn try_server_verify(
         let requested_refs: Vec<(&str, usize)> =
             requested.iter().map(|(k, c)| (k.as_str(), *c)).collect();
 
-        match storage.server_verify_packs(&batch) {
-            Err(VykarError::UnsupportedBackend(_)) => {
-                tracing::debug!("backend does not support server-side verify-packs");
-                return ServerVerifyOutcome::Fallback;
-            }
+        // Resolved here rather than before the loop, so an empty plan and a
+        // cancel before the first batch still end as before.
+        let Some(server) = server else {
+            tracing::debug!("backend does not support server-side verify-packs");
+            return ServerVerifyOutcome::Fallback;
+        };
+        match server.verify_packs(&batch) {
             Err(e) if is_first_batch => {
                 tracing::warn!("server verify-packs failed: {e}");
                 return ServerVerifyOutcome::Fallback;

@@ -183,13 +183,27 @@ impl InnerBackend for ObservingBackend {
 delegate_storage_backend! {
     for ObservingBackend;
     except [
-        put, delete, exists, put_owned, put_pack, begin_staged_put, object_sizes, conditional,
-        profile
+        put, delete, exists, put_owned, put_pack, begin_staged_put, conditional, batch_delete,
+        server_ops, profile
     ];
 
     // Test wrapper: keeps every write on `put`.
     fn conditional(&self) -> Option<&dyn vykar_storage::ConditionalWrite> {
         None
+    }
+
+    // Keeps every delete on the recorded `delete`.
+    fn batch_delete(&self) -> Option<&dyn vykar_storage::BatchDelete> {
+        None
+    }
+
+    // With `batch_sizes`, a server answering `?sizes` (counted).
+    fn server_ops(&self) -> Option<&dyn vykar_storage::ServerOps> {
+        if self.shared.batch_sizes {
+            Some(self)
+        } else {
+            self.inner.server_ops()
+        }
     }
 
     // Keep packs on the intercepted `put` path. The recorded order must include every pack write.
@@ -243,11 +257,22 @@ delegate_storage_backend! {
         }
         self.inner.exists(key)
     }
+}
+
+impl vykar_storage::ServerOps for ObservingBackend {
+    fn offers(&self, op: vykar_storage::ServerOp) -> bool {
+        op == vykar_storage::ServerOp::ObjectSizes
+    }
+
+    fn capabilities(&self) -> Result<vykar_protocol::ServerCapabilities> {
+        Ok(crate::testutil::fake_server_caps())
+    }
+
+    fn init(&self) -> Result<()> {
+        Ok(())
+    }
 
     fn object_sizes(&self, keys: &[String]) -> Result<Vec<Option<u64>>> {
-        if !self.shared.batch_sizes {
-            return self.inner.object_sizes(keys);
-        }
         *self.shared.batches.lock().unwrap() += 1;
         keys.iter().map(|k| self.inner.size(k)).collect()
     }

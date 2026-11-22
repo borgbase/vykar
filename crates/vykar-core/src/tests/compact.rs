@@ -307,7 +307,9 @@ mod server_side {
     use crate::repo::{EncryptionMode, OpenOptions, RepoFormat, Repository};
     use crate::testutil::{MemoryBackend, init_test_environment};
     use vykar_protocol::{RepackOperationResult, RepackPlanRequest, RepackResultResponse};
-    use vykar_storage::{InnerBackend, StorageBackend, delegate_storage_backend};
+    use vykar_storage::{
+        BatchDelete, InnerBackend, ServerOp, ServerOps, StorageBackend, delegate_storage_backend,
+    };
     use vykar_types::chunk_id::ChunkId;
     use vykar_types::error::{Result, VykarError};
     use vykar_types::pack_id::PackId;
@@ -324,6 +326,8 @@ mod server_side {
         FailPackDeletes,
         /// Repack succeeds and per-pack deletes succeed; the batch delete fails.
         FailBatchDelete,
+        /// The server does not advertise `repack` (one older than the field).
+        NotOffered,
     }
 
     #[derive(Clone, Default)]
@@ -345,8 +349,8 @@ mod server_side {
     struct ServerRepackBackend {
         inner: MemoryBackend,
         mode: Mode,
-        /// Answer `batch_delete_keys` (as a vykar-server does) instead of
-        /// reporting it unsupported.
+        /// Offer a batch delete (as a vykar-server does); otherwise
+        /// `batch_delete()` is None.
         batch: bool,
         log: Log,
     }
@@ -360,13 +364,21 @@ mod server_side {
     delegate_storage_backend! {
         for ServerRepackBackend;
         except [
-            put, delete, put_owned, put_pack, begin_staged_put, server_repack, batch_delete_keys,
-            conditional, profile
+            put, delete, put_owned, put_pack, begin_staged_put, conditional, batch_delete,
+            server_ops, profile
         ];
 
         // Test wrapper: keeps every write on `put`.
         fn conditional(&self) -> Option<&dyn vykar_storage::ConditionalWrite> {
             None
+        }
+
+        fn batch_delete(&self) -> Option<&dyn BatchDelete> {
+            self.batch.then_some(self as &dyn BatchDelete)
+        }
+
+        fn server_ops(&self) -> Option<&dyn ServerOps> {
+            Some(self)
         }
 
         // Keep packs on the intercepted `put` path.
@@ -404,8 +416,23 @@ mod server_side {
         fn put_pack(&self, key: &str, data: vykar_storage::PackData) -> Result<()> {
             self.put(key, data.as_slice())
         }
+    }
 
-        fn server_repack(&self, plan: &RepackPlanRequest) -> Result<RepackResultResponse> {
+    impl ServerOps for ServerRepackBackend {
+        fn offers(&self, op: ServerOp) -> bool {
+            op == ServerOp::Repack && !matches!(self.mode, Mode::NotOffered)
+        }
+
+        // The repository is created on this fake, so it must accept the format.
+        fn capabilities(&self) -> Result<vykar_protocol::ServerCapabilities> {
+            Ok(crate::testutil::fake_server_caps())
+        }
+
+        fn init(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn repack(&self, plan: &RepackPlanRequest) -> Result<RepackResultResponse> {
             self.log.plans.lock().unwrap().push(plan.clone());
             self.log.push("repack".into());
             if matches!(self.mode, Mode::FailRepack) {
@@ -434,15 +461,14 @@ mod server_side {
             }
             Ok(RepackResultResponse { completed })
         }
+    }
 
-        fn batch_delete_keys(
+    impl BatchDelete for ServerRepackBackend {
+        fn delete_keys(
             &self,
             keys: &[String],
             scope: vykar_storage::BatchDeleteScope,
         ) -> Result<()> {
-            if !self.batch {
-                return self.inner.batch_delete_keys(keys, scope);
-            }
             if matches!(self.mode, Mode::FailPackDeletes)
                 && keys.iter().any(|k| k.starts_with("packs/"))
             {
@@ -542,6 +568,30 @@ mod server_side {
         assert!(saved < pos(&format!("delete {partial}")));
         assert!(saved < pos(&format!("delete {empty}")));
 
+        assert!(!repo.storage.exists(&partial).unwrap());
+        assert!(!repo.storage.exists(&empty).unwrap());
+        assert_ne!(pack_of(&repo, &id_b), partial);
+        assert_eq!(
+            repo.read_chunk(&id_b).unwrap(),
+            b"chunk-b-data-for-compact-test"
+        );
+        assert_eq!(stats.packs_repacked, 1);
+        assert_eq!(stats.packs_deleted_empty, 1);
+        assert!(stats.space_freed > 0);
+    }
+
+    /// A server that does not advertise `repack` gets a client-side repack:
+    /// no plan is sent, and the dead space is still freed.
+    #[test]
+    fn server_repack_not_offered_repacks_on_the_client() {
+        let (mut repo, log) = server_repo(Mode::NotOffered, false, RepoFormat::V5);
+        let (id_b, partial, empty) = setup_dead_packs(&mut repo);
+        log.events.lock().unwrap().clear();
+
+        let stats = compact_repo(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
+
+        assert!(log.plans.lock().unwrap().is_empty());
+        assert!(!log.events().iter().any(|e| e == "repack"));
         assert!(!repo.storage.exists(&partial).unwrap());
         assert!(!repo.storage.exists(&empty).unwrap());
         assert_ne!(pack_of(&repo, &id_b), partial);

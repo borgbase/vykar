@@ -19,8 +19,8 @@ use std::sync::{Mutex, PoisonError};
 
 use super::control::CancelToken;
 use tracing::debug;
-use vykar_storage::StorageBackend;
-use vykar_types::error::{Result, VykarError};
+use vykar_storage::{ServerOp, StorageBackend};
+use vykar_types::error::Result;
 use vykar_types::pack_id::PackId;
 
 /// Keys per page of a paginated listing (the S3 ListObjectsV2 maximum).
@@ -146,12 +146,15 @@ pub(crate) fn lookup(
     out.into_inner().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// One `object_sizes` batch. `None` = no answer (unsupported, failed, wrong
+/// One `object_sizes` batch. `None` = no answer (not offered, failed, wrong
 /// count): the caller falls back, so a failed batch never counts as present.
 /// An answer is authoritative: `None` in it is absent, not re-checked.
 fn batch(storage: &dyn StorageBackend, ids: &[PackId]) -> Option<PackSizes> {
+    let server = storage
+        .server_ops()
+        .filter(|s| s.offers(ServerOp::ObjectSizes))?;
     let keys: Vec<String> = ids.iter().map(PackId::storage_key).collect();
-    match storage.object_sizes(&keys) {
+    match server.object_sizes(&keys) {
         Ok(sizes) if sizes.len() == ids.len() => Some(
             ids.iter()
                 .copied()
@@ -167,7 +170,6 @@ fn batch(storage: &dyn StorageBackend, ids: &[PackId]) -> Option<PackSizes> {
             );
             None
         }
-        Err(VykarError::UnsupportedBackend(_)) => None,
         Err(e) => {
             debug!(error = %e, "batch pack sizes failed, falling back");
             None
@@ -245,11 +247,12 @@ pub(crate) mod tests {
     use std::thread::ThreadId;
     use std::time::Duration;
     use vykar_storage::{InnerBackend, ListedObject, delegate_storage_backend};
+    use vykar_types::error::VykarError;
 
     /// Counts requests; flags pick the request path and inject failures.
     pub(crate) struct Probe {
         pub(crate) inner: MemoryBackend,
-        /// Answer `object_sizes`; otherwise report it unsupported.
+        /// Offer `object_sizes` (a server behind it); otherwise `server_ops()` is None.
         pub(crate) batch: bool,
         pub(crate) fail_batch: bool,
         /// Drop the batch's last answer.
@@ -318,7 +321,7 @@ pub(crate) mod tests {
 
     delegate_storage_backend! {
         for Probe;
-        except [exists, list, size, list_sized, list_meta, object_sizes, list_tree_sized];
+        except [exists, list, size, list_sized, list_meta, server_ops];
 
         fn list_meta(
             &self,
@@ -377,24 +380,34 @@ pub(crate) mod tests {
                 .collect()
         }
 
-        fn list_tree_sized(&self, prefix: &str) -> Result<Vec<ListedObject>> {
-            self.lists.fetch_add(1, Ordering::SeqCst);
-            if self.fail_list {
-                return Err(VykarError::Other("injected list failure".into()));
-            }
-            self.inner.list_tree_sized(prefix)
+        /// A server answering `?sizes` exactly when `batch`.
+        fn server_ops(&self) -> Option<&dyn vykar_storage::ServerOps> {
+            self.batch.then_some(self as &dyn vykar_storage::ServerOps)
+        }
+    }
+
+    impl vykar_storage::ServerOps for Probe {
+        fn offers(&self, op: vykar_storage::ServerOp) -> bool {
+            op == vykar_storage::ServerOp::ObjectSizes
+        }
+
+        fn capabilities(&self) -> Result<vykar_protocol::ServerCapabilities> {
+            Ok(vykar_protocol::ServerCapabilities::default())
+        }
+
+        fn init(&self) -> Result<()> {
+            Ok(())
         }
 
         fn object_sizes(&self, keys: &[String]) -> Result<Vec<Option<u64>>> {
-            if !self.batch {
-                return Err(VykarError::UnsupportedBackend("probe".into()));
-            }
             self.batches.fetch_add(1, Ordering::SeqCst);
             if self.fail_batch {
                 return Err(VykarError::Other("injected batch failure".into()));
             }
-            let mut sizes: Vec<Option<u64>> =
-                keys.iter().map(|k| self.inner.size(k)).collect::<Result<_>>()?;
+            let mut sizes: Vec<Option<u64>> = keys
+                .iter()
+                .map(|k| self.inner.size(k))
+                .collect::<Result<_>>()?;
             if self.short_batch {
                 sizes.pop();
             }

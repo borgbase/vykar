@@ -10,7 +10,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use chrono::{DateTime, Utc};
-use vykar_storage::{BackendProfile, BatchDeleteScope, ListedObject, PackData, StagedPut};
+use vykar_storage::{
+    BackendProfile, BatchDelete, BatchDeleteScope, ListedObject, PackData, StagedPut,
+};
 use vykar_types::error::{Result, VykarError};
 
 use super::fault::{
@@ -26,7 +28,7 @@ const TAMPER: ClientId = ClientId(1);
 pub struct SimConfig {
     pub profile: BackendProfile,
     pub append_only: bool,
-    /// `batch_delete_keys` supported (REST/S3-like) instead of `UnsupportedBackend`.
+    /// `batch_delete()` offered (REST/S3-like) instead of None.
     pub batch_delete: bool,
 }
 
@@ -802,14 +804,25 @@ impl vykar_storage::StorageBackend for SimClient {
         })))
     }
 
-    fn batch_delete_keys(&self, keys: &[String], _scope: BatchDeleteScope) -> Result<()> {
+    fn batch_delete(&self) -> Option<&dyn BatchDelete> {
+        self.store
+            .shared
+            .config
+            .batch_delete
+            .then_some(self as &dyn BatchDelete)
+    }
+
+    fn profile(&self) -> BackendProfile {
+        self.store.shared.config.profile
+    }
+
+    vykar_storage::unsupported_server_ops!(except[batch_delete]);
+}
+
+impl BatchDelete for SimClient {
+    fn delete_keys(&self, keys: &[String], _scope: BatchDeleteScope) -> Result<()> {
         // The scope only matters for directories and temp files, and the
         // store has neither.
-        if !self.store.shared.config.batch_delete {
-            return Err(VykarError::UnsupportedBackend(
-                "vykar-sim: batch delete disabled".into(),
-            ));
-        }
         let first = keys.first().map(String::as_str).unwrap_or("");
         self.store.mutate_op(
             self.client,
@@ -820,12 +833,6 @@ impl vykar_storage::StorageBackend for SimClient {
             Effect::Delete(keys.to_vec()),
         )
     }
-
-    fn profile(&self) -> BackendProfile {
-        self.store.shared.config.profile
-    }
-
-    vykar_storage::unsupported_server_ops!(except[batch_delete_keys]);
 }
 
 /// A staged upload: bytes stay in the buffer, invisible, until `commit`.
@@ -1143,7 +1150,9 @@ mod tests {
         // A batch fails as a whole on its first refused key.
         let keys = ["locks/a".to_string(), "snapshots/s".to_string()];
         let err = a
-            .batch_delete_keys(&keys, BatchDeleteScope::KeysOnly)
+            .batch_delete()
+            .expect("batch delete offered")
+            .delete_keys(&keys, BatchDeleteScope::KeysOnly)
             .unwrap_err()
             .to_string();
         assert!(err.contains("append-only"), "{err}");
@@ -1189,10 +1198,7 @@ mod tests {
     fn batch_delete() {
         let (store, a, _) = two_clients(SimConfig::default());
         let keys = vec!["a".to_string(), "b".to_string()];
-        assert!(matches!(
-            a.batch_delete_keys(&keys, BatchDeleteScope::KeysOnly),
-            Err(VykarError::UnsupportedBackend(_))
-        ));
+        assert!(a.batch_delete().is_none());
 
         let config = SimConfig {
             batch_delete: true,
@@ -1202,7 +1208,9 @@ mod tests {
         a2.put("a", b"1").unwrap();
         a2.put("c", b"3").unwrap();
         let before = store2.log().len();
-        a2.batch_delete_keys(&keys, BatchDeleteScope::KeysOnly)
+        a2.batch_delete()
+            .expect("batch delete offered")
+            .delete_keys(&keys, BatchDeleteScope::KeysOnly)
             .unwrap();
         assert_eq!(store2.keys(""), vec!["c"]);
         let log = store2.log();
@@ -1223,7 +1231,9 @@ mod tests {
         let (store, a, _) = two_clients(config);
         a.put("a", b"1").unwrap();
         let keys = vec!["a".to_string(), "a".to_string()];
-        a.batch_delete_keys(&keys, BatchDeleteScope::KeysOnly)
+        a.batch_delete()
+            .expect("batch delete offered")
+            .delete_keys(&keys, BatchDeleteScope::KeysOnly)
             .unwrap();
         assert!(store.object("a").is_none());
         let rec = last(&store);
@@ -1317,22 +1327,8 @@ mod tests {
     #[test]
     fn server_ops_unsupported() {
         let (_, a, _) = two_clients(SimConfig::default());
-        assert!(matches!(
-            a.server_init(),
-            Err(VykarError::UnsupportedBackend(_))
-        ));
-        assert!(matches!(
-            a.server_capabilities(),
-            Err(VykarError::UnsupportedBackend(_))
-        ));
-        assert!(matches!(
-            a.object_sizes(&[]),
-            Err(VykarError::UnsupportedBackend(_))
-        ));
-        assert!(matches!(
-            a.list_tree_sized(""),
-            Err(VykarError::UnsupportedBackend(_))
-        ));
+        assert!(a.server_ops().is_none());
+        assert!(a.batch_delete().is_none());
         assert_eq!(
             a.remove_stale_temp_files(std::time::Duration::ZERO)
                 .unwrap(),

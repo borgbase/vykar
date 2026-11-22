@@ -109,8 +109,9 @@ impl Repository {
         };
 
         // 1. Pre-flight.
-        match self.storage.server_capabilities() {
-            Ok(caps) if !caps.segmented_index => {
+        if let Some(server) = self.storage.server_ops() {
+            let caps = server.capabilities()?;
+            if !caps.segmented_index {
                 return Err(VykarError::Config(format!(
                     "vykar-server (version {}) does not support the segmented index of \
                      format v{}. Upgrade the server first.",
@@ -118,8 +119,6 @@ impl Repository {
                     target.version(),
                 )));
             }
-            Ok(_) | Err(VykarError::UnsupportedBackend(_)) => {}
-            Err(e) => return Err(e),
         }
         let config_bytes = self
             .storage

@@ -817,7 +817,7 @@ flowchart TB
 
 **Phase 2 — Repack:**
 For each candidate pack (most wasteful first, respecting `--max-repack-size` cap):
-1. If backend supports `server_repack`, send a repack plan and apply returned pack remaps
+1. If the backend's `server_ops()` offers repack (a vykar-server that advertises `repack`), send a repack plan and apply returned pack remaps
 2. Otherwise run client-side repack:
    - If all blobs are dead → delete the pack file directly
    - Else validate pack header (magic + version) via `get_range(0..9)` and cross-check each on-disk blob length prefix against the index's `stored_size`

@@ -850,7 +850,7 @@ impl InnerBackend for MutLog {
 
 delegate_storage_backend! {
     for MutLog;
-    except [put, delete, put_pack, begin_staged_put, batch_delete_keys, conditional, profile];
+    except [put, delete, put_pack, begin_staged_put, conditional, batch_delete, profile];
 
     // Test wrapper: keeps every write on `put`.
     fn conditional(&self) -> Option<&dyn vykar_storage::ConditionalWrite> {
@@ -880,9 +880,9 @@ delegate_storage_backend! {
         self.inner.delete(key)
     }
 
-    fn batch_delete_keys(&self, keys: &[String], scope: vykar_storage::BatchDeleteScope) -> Result<()> {
-        self.ops.lock().unwrap().extend(keys.iter().map(|k| format!("delete {k}")));
-        self.inner.batch_delete_keys(keys, scope)
+    // Every delete goes through the logged `delete` (the inner is local).
+    fn batch_delete(&self) -> Option<&dyn vykar_storage::BatchDelete> {
+        None
     }
 }
 
@@ -1185,7 +1185,7 @@ impl InnerBackend for FailListAfterHeadPut {
 
 delegate_storage_backend! {
     for FailListAfterHeadPut;
-    except [list, list_sized, list_meta, list_tree_sized];
+    except [list, list_sized, list_meta, server_ops];
 
     fn list_meta(
         &self,
@@ -1204,9 +1204,9 @@ delegate_storage_backend! {
         self.inner.list_sized(prefix)
     }
 
-    fn list_tree_sized(&self, prefix: &str) -> Result<Vec<vykar_storage::ListedObject>> {
-        self.check(prefix)?;
-        self.inner.list_tree_sized(prefix)
+    // No server behind the inner backend: listings stay on `list_sized`.
+    fn server_ops(&self) -> Option<&dyn vykar_storage::ServerOps> {
+        None
     }
 }
 
@@ -1608,7 +1608,7 @@ impl InnerBackend for FailIndexList {
 
 delegate_storage_backend! {
     for FailIndexList;
-    except [list, list_sized, list_meta, list_tree_sized];
+    except [list, list_sized, list_meta, server_ops];
 
     fn list_meta(
         &self,
@@ -1627,9 +1627,9 @@ delegate_storage_backend! {
         self.inner.list_sized(prefix)
     }
 
-    fn list_tree_sized(&self, prefix: &str) -> Result<Vec<vykar_storage::ListedObject>> {
-        self.check(prefix)?;
-        self.inner.list_tree_sized(prefix)
+    // No server behind the inner backend: listings stay on `list_sized`.
+    fn server_ops(&self) -> Option<&dyn vykar_storage::ServerOps> {
+        None
     }
 }
 

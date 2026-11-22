@@ -291,3 +291,27 @@ fn conditional_conformance_suite_passes() {
         .unwrap_or_else(|e| panic!("append_only={append_only}: {e}"));
     }
 }
+
+/// This server advertises `repack` but not `repack_trailer`, so compact
+/// keeps repacking server-side against it.
+#[test]
+fn server_offers_repack_but_not_the_repack_trailer() {
+    use vykar_storage::{ServerOp, StorageBackend};
+    let server = Server::start(false);
+    let backend = vykar_storage::rest_backend::RestBackend::new(
+        &server.url,
+        Some(TOKEN),
+        vykar_storage::RetryConfig {
+            max_retries: 0,
+            ..Default::default()
+        },
+        None,
+    )
+    .unwrap();
+    let ops = backend.server_ops().expect("a server is behind REST");
+    assert!(ops.offers(ServerOp::Repack));
+    assert!(!ops.offers(ServerOp::RepackTrailer));
+    assert!(ops.offers(ServerOp::VerifyPacks));
+    assert!(ops.offers(ServerOp::ListTree));
+    assert!(ops.offers(ServerOp::ObjectSizes));
+}

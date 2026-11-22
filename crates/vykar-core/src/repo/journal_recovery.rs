@@ -859,7 +859,7 @@ mod tests {
 
     vykar_storage::delegate_storage_backend! {
         for LookupCountingBackend;
-        except [list, size, list_sized, list_meta, list_tree_sized];
+        except [list, size, list_sized, list_meta, server_ops];
 
         fn list_meta(
             &self,
@@ -884,9 +884,9 @@ mod tests {
             self.inner.list_sized(prefix)
         }
 
-        fn list_tree_sized(&self, prefix: &str) -> Result<Vec<vykar_storage::ListedObject>> {
-            self.count_pack_list(prefix);
-            self.inner.list_tree_sized(prefix)
+        // No server behind the inner backend: listings stay on `list_sized`.
+        fn server_ops(&self) -> Option<&dyn vykar_storage::ServerOps> {
+            None
         }
     }
 

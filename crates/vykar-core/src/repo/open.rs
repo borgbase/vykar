@@ -181,32 +181,28 @@ impl Repository {
         // of them. Without this probe `vykar init` would *succeed* against an
         // old server and only the first `backup` would fail, leaving a repo
         // nobody can write to.
-        match storage.server_capabilities() {
-            Ok(caps) => {
-                if !caps.supports_hash(format.chunk_hash()) {
-                    return Err(VykarError::Config(format!(
-                        "vykar-server at {} (version {}) does not support {} repositories \
-                         (format v{}). Upgrade the server to 0.20 or later, or keep using \
-                         an existing repository.",
-                        storage_label(init_opts),
-                        caps.version,
-                        format.chunk_hash().as_str().to_uppercase(),
-                        format.version(),
-                    )));
-                }
-                if !caps.segmented_index {
-                    return Err(VykarError::Config(format!(
-                        "vykar-server at {} (version {}) does not support the segmented \
-                         index of format v{}. Upgrade the server first.",
-                        storage_label(init_opts),
-                        caps.version,
-                        format.version(),
-                    )));
-                }
+        if let Some(server) = storage.server_ops() {
+            let caps = server.capabilities()?;
+            if !caps.supports_hash(format.chunk_hash()) {
+                return Err(VykarError::Config(format!(
+                    "vykar-server at {} (version {}) does not support {} repositories \
+                     (format v{}). Upgrade the server to 0.20 or later, or keep using \
+                     an existing repository.",
+                    storage_label(init_opts),
+                    caps.version,
+                    format.chunk_hash().as_str().to_uppercase(),
+                    format.version(),
+                )));
             }
-            // No server behind this backend — nothing to probe.
-            Err(VykarError::UnsupportedBackend(_)) => {}
-            Err(err) => return Err(err),
+            if !caps.segmented_index {
+                return Err(VykarError::Config(format!(
+                    "vykar-server at {} (version {}) does not support the segmented \
+                     index of format v{}. Upgrade the server first.",
+                    storage_label(init_opts),
+                    caps.version,
+                    format.version(),
+                )));
+            }
         }
 
         storage.bind_content_hash(format.chunk_hash())?;
@@ -214,10 +210,12 @@ impl Repository {
         // Try server-side init (creates keys/, snapshots/, locks/, packs/* in one request).
         // Placed after all validation and crypto setup so a failure above doesn't
         // leave a partially scaffolded repo on the server.
-        let server_did_init = match storage.server_init() {
-            Ok(()) => true,
-            Err(VykarError::UnsupportedBackend(_)) => false,
-            Err(err) => return Err(err),
+        let server_did_init = match storage.server_ops() {
+            Some(server) => {
+                server.init()?;
+                true
+            }
+            None => false,
         };
 
         // Store config (unencrypted)
@@ -243,7 +241,7 @@ impl Repository {
 
         let manifest = Manifest::new();
         let chunk_index = ChunkIndex::new();
-        // `server_init` does not create `index.d/`: a server that predates
+        // Server-side init does not create `index.d/`: a server that predates
         // it refuses to start with the directory present.
         storage.create_dir(index_store::INDEX_OBJECT_DIR)?;
         let head = IndexHead::empty();

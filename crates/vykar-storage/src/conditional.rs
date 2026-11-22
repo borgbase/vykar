@@ -131,11 +131,18 @@ impl Verifier {
     ) -> Result<()> {
         match self.verify(store, raw)? {
             ConditionalSupport::Verified => Ok(()),
-            ConditionalSupport::Unsupported { reason } => Err(VykarError::UnsupportedBackend(
-                format!("{label}: put-if-absent unavailable: {reason}"),
-            )),
+            ConditionalSupport::Unsupported { reason } => {
+                Err(put_if_absent_unavailable(format_args!("{label}: {reason}")))
+            }
         }
     }
+}
+
+/// The error [`ConditionalWrite::put_if_absent`] returns once put-if-absent is
+/// no longer offered (its check concluded `Unsupported`). `detail` names the
+/// backend and the reason.
+pub fn put_if_absent_unavailable(detail: impl std::fmt::Display) -> VykarError {
+    VykarError::UnsupportedBackend(format!("put-if-absent unavailable: {detail}"))
 }
 
 /// Argument checks shared by every backend's `put_if_absent`.

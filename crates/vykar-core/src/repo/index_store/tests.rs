@@ -943,7 +943,7 @@ fn object_damage_classification() {
     }
 }
 
-/// Records `delete` and `batch_delete_keys` calls. A batch deletes every
+/// Records `delete` and batch-delete calls. A batch deletes every
 /// key, or with `fail` only the first one and then errors (a partial batch).
 struct BatchDeletes {
     inner: Arc<dyn StorageBackend>,
@@ -971,14 +971,20 @@ impl InnerBackend for BatchDeletes {
 
 delegate_storage_backend! {
     for BatchDeletes;
-    except [delete, batch_delete_keys];
+    except [delete, batch_delete];
 
     fn delete(&self, key: &str) -> Result<()> {
         self.deletes.lock().unwrap().push(key.to_string());
         self.inner.delete(key)
     }
 
-    fn batch_delete_keys(&self, keys: &[String], scope: vykar_storage::BatchDeleteScope) -> Result<()> {
+    fn batch_delete(&self) -> Option<&dyn vykar_storage::BatchDelete> {
+        Some(self)
+    }
+}
+
+impl vykar_storage::BatchDelete for BatchDeletes {
+    fn delete_keys(&self, keys: &[String], scope: vykar_storage::BatchDeleteScope) -> Result<()> {
         self.batches.lock().unwrap().push((keys.to_vec(), scope));
         if self.fail {
             if let Some(first) = keys.first() {
@@ -1096,13 +1102,17 @@ impl InnerBackend for FailOneDelete {
 
 delegate_storage_backend! {
     for FailOneDelete;
-    except [delete];
+    except [delete, batch_delete];
 
     fn delete(&self, key: &str) -> Result<()> {
         if key == self.key {
             return Err(VykarError::Other(format!("injected delete failure: {key}")));
         }
         self.inner.delete(key)
+    }
+
+    fn batch_delete(&self) -> Option<&dyn vykar_storage::BatchDelete> {
+        None
     }
 }
 

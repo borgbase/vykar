@@ -31,7 +31,10 @@ mod retry;
 pub use delegate::__macro_support;
 pub use delegate::InnerBackend;
 
-pub use conditional::{ConditionalSupport, ConditionalWrite, Created, MAX_PUT_IF_ABSENT_BYTES};
+pub use conditional::{
+    ConditionalSupport, ConditionalWrite, Created, MAX_PUT_IF_ABSENT_BYTES,
+    put_if_absent_unavailable,
+};
 // `S3ConditionalWrites` is defined below, next to `StorageConfig`.
 
 #[cfg(feature = "backend-sftp")]
@@ -277,10 +280,12 @@ pub trait StorageBackend: Send + Sync {
 
     // ── Capability methods: no defaults, deliberately ──────────────────────
     //
-    // Most of these report `UnsupportedBackend` on most backends, and callers
-    // treat that error as "fall back to the client-side path". A default body
-    // here would make a *wrapper* that forgets to forward silently answer
-    // "unsupported" on behalf of a backend that does support the operation —
+    // The capability methods are the accessors `conditional`, `batch_delete`
+    // and `server_ops`, plus `remove_stale_temp_files`, `bind_content_hash`
+    // and `profile`. Callers never infer a capability from an error: they ask
+    // the accessor, and `None` means "take the client-side path". A default
+    // body here would make a *wrapper* that forgets to forward silently answer
+    // "not offered" on behalf of a backend that does offer the operation —
     // exactly the bug that disabled server-side pack verification and server
     // init whenever a bandwidth cap was configured on a REST repo.
     //
@@ -297,8 +302,7 @@ pub trait StorageBackend: Send + Sync {
     // its own `list_sized` (losing only the mtime, which then reads "not
     // reported"). The one exception, `begin_staged_put`, defaults to
     // `Ok(None)` ("buffer and `put` instead"), which is likewise only ever
-    // less efficient. `conditional` is a capability method like the others
-    // below: a default `None` would let a wrapper silently disable it.
+    // less efficient.
 
     /// Delete temp files ([`vykar_protocol::is_repo_temp_file`]) last
     /// modified at least `older_than` ago (`Duration::ZERO` = all), in the
@@ -321,28 +325,6 @@ pub trait StorageBackend: Send + Sync {
     /// `batch-delete&cleanup-dirs`).
     fn remove_stale_temp_files(&self, older_than: std::time::Duration) -> Result<usize>;
 
-    /// Execute a server-side repack plan when supported by the backend.
-    fn server_repack(&self, plan: &RepackPlanRequest) -> Result<RepackResultResponse>;
-
-    /// Delete `keys` using a backend-native batch API. An absent key is not an
-    /// error. After `Err` an unknown subset may already be deleted; deleting a
-    /// key again is harmless.
-    ///
-    /// `scope` says whether the repository survives. Only
-    /// [`BatchDeleteScope::WholeRepository`] may touch anything not named in
-    /// `keys`; a caller in a live repository (compact) must pass
-    /// [`BatchDeleteScope::KeysOnly`].
-    ///
-    /// Reports `UnsupportedBackend` on every backend without a batch API;
-    /// callers then delete key by key.
-    fn batch_delete_keys(&self, keys: &[String], scope: BatchDeleteScope) -> Result<()>;
-
-    /// Server-side pack verification: hash check + header + blob boundary scan.
-    fn server_verify_packs(&self, plan: &VerifyPacksPlanRequest) -> Result<VerifyPacksResponse>;
-
-    /// Server-side repository directory scaffolding (keys/, snapshots/, locks/, packs/*).
-    fn server_init(&self) -> Result<()>;
-
     /// Bind this backend to the repository's content-digest algorithm.
     ///
     /// The backend is built by `backend_from_config` before the repository
@@ -360,38 +342,6 @@ pub trait StorageBackend: Send + Sync {
     /// the `Ok(())` body from `unsupported_server_ops!`.
     fn bind_content_hash(&self, algo: HashAlgorithm) -> Result<()>;
 
-    /// Ask a vykar-server what it supports, before writing anything.
-    ///
-    /// Reports `UnsupportedBackend` for every backend that has no server
-    /// behind it; callers treat that as "nothing to check".
-    fn server_capabilities(&self) -> Result<ServerCapabilities>;
-
-    /// The size of each of `keys` (`None` = absent), in order, from as few
-    /// requests as the backend can manage — one per directory on a
-    /// vykar-server instead of one `HEAD` per key. Every key must lie inside
-    /// a directory (`packs/ab/...`, not `index`).
-    ///
-    /// Reports `UnsupportedBackend` when the backend has no batch API (every
-    /// backend but REST) or the server predates it; callers then fall back to
-    /// per-key or per-directory requests. Required for the reason in the note
-    /// above: a wrapper inheriting an "unsupported" default would silently
-    /// cost a commit one request per pack shard.
-    fn object_sizes(&self, keys: &[String]) -> Result<Vec<Option<u64>>>;
-
-    /// [`Self::list_sized`] answered in **one** request for the whole tree
-    /// under `prefix`, for callers that would otherwise split a large tree into
-    /// per-directory listings (compact's 256 pack shards).
-    ///
-    /// Same result contract as `list_sized`, including `size: None` for "not
-    /// reported" (a vykar-server older than `?list&sized` returns bare keys).
-    ///
-    /// Reports `UnsupportedBackend` where a whole-tree listing is not one cheap
-    /// request: a serial directory walk on SFTP, sequential pagination on S3,
-    /// and local, which gains nothing. Only `RestBackend` implements it.
-    /// Required for the reason in the note above: a wrapper inheriting an
-    /// "unsupported" default would silently cost compact 255 extra requests.
-    fn list_tree_sized(&self, prefix: &str) -> Result<Vec<ListedObject>>;
-
     /// Atomic create-if-absent, when this backend offers it. `None`: never
     /// (the backend has no mechanism, the server does not advertise
     /// `conditional_put`, `s3_conditional_writes` says off or auto on a
@@ -401,10 +351,26 @@ pub trait StorageBackend: Send + Sync {
     ///
     /// Never writes. `RestBackend` may `GET /health` (read-only) on its
     /// first call, and a failed probe there caches "nothing supported" for
-    /// the process: call `server_capabilities()` first to see the error.
+    /// the process: call [`ServerOps::capabilities`] first to see the error.
     /// Required for the reason in the note above: a wrapper inheriting a
     /// `None` default would silently disable the capability.
     fn conditional(&self) -> Option<&dyn ConditionalWrite>;
+
+    /// The backend's native multi-key delete, when it has one. `None`: delete
+    /// key by key with [`Self::delete`] (local, SFTP, S3 with `s3_soft_delete`,
+    /// or an S3-compatible endpoint that answered DeleteObjects with
+    /// NotImplemented earlier on this instance). Never does I/O. Required for
+    /// the reason in the note above: a wrapper inheriting a `None` default
+    /// would silently cost compact one request per pack.
+    fn batch_delete(&self) -> Option<&dyn BatchDelete>;
+
+    /// The operations a vykar-server runs on the repository's behalf. `Some`
+    /// exactly when a vykar-server is behind this backend (only `RestBackend`);
+    /// which optional operations it serves is [`ServerOps::offers`]. Never does
+    /// I/O. Required for the reason in the note above: a wrapper inheriting a
+    /// `None` default would silently disable server-side verify, init and
+    /// repack, the bug the note describes.
+    fn server_ops(&self) -> Option<&dyn ServerOps>;
 
     /// What kind of backend this is. Required for the reason in the note above:
     /// a wrapper inheriting a default would report a guess instead of the
@@ -629,7 +595,7 @@ pub struct ListedObject {
     pub mtime: Option<std::time::SystemTime>,
 }
 
-/// What [`StorageBackend::batch_delete_keys`] removes besides the named keys.
+/// What [`BatchDelete::delete_keys`] removes besides the named keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BatchDeleteScope {
     /// Exactly the named keys. For a repository that stays live (compact).
@@ -638,6 +604,124 @@ pub enum BatchDeleteScope {
     /// also prunes now-empty directories and purges every temp file,
     /// including those of a backup still in flight (`cleanup-dirs`).
     WholeRepository,
+}
+
+/// A backend-native multi-key delete. Obtained from
+/// [`StorageBackend::batch_delete`].
+pub trait BatchDelete: Send + Sync {
+    /// Delete `keys`. An absent key is not an error. After `Err` an unknown
+    /// subset may already be deleted; deleting a key again is harmless.
+    ///
+    /// `scope` says whether the repository survives. Only
+    /// [`BatchDeleteScope::WholeRepository`] may touch anything not named in
+    /// `keys`; a caller in a live repository (compact) must pass
+    /// [`BatchDeleteScope::KeysOnly`].
+    ///
+    /// Never reports `UnsupportedBackend`: a backend that learns during the call
+    /// that its batch API is missing deletes the remaining keys one by one
+    /// before returning, and offers no `batch_delete()` from then on.
+    ///
+    /// # Errors
+    ///
+    /// The first failed request.
+    fn delete_keys(&self, keys: &[String], scope: BatchDeleteScope) -> Result<()>;
+}
+
+/// An optional operation of a [`ServerOps`], asked with [`ServerOps::offers`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerOp {
+    /// [`ServerOps::verify_packs`].
+    VerifyPacks,
+    /// [`ServerOps::repack`].
+    Repack,
+    /// [`ServerOps::repack`] of a plan carrying a pack trailer. Nothing sends
+    /// one yet and no server offers it yet.
+    RepackTrailer,
+    /// [`ServerOps::object_sizes`].
+    ObjectSizes,
+    /// [`ServerOps::list_tree_sized`].
+    ListTree,
+}
+
+/// What a vykar-server does on the repository's behalf. Obtained from
+/// [`StorageBackend::server_ops`]; only `RestBackend` (and test fakes)
+/// implement it. Wrappers forward the accessor and never implement this
+/// trait, so the defaults below cannot hide a forgotten forward.
+pub trait ServerOps: Send + Sync {
+    /// Whether this server serves `op`. Callers ask before calling the
+    /// matching method and never infer it from an error. May `GET /health`
+    /// (read-only) on its first call; a failed probe offers only what every
+    /// supported vykar-server serves.
+    fn offers(&self, op: ServerOp) -> bool;
+
+    /// `GET /health`, fetched now. Every vykar-server answers it.
+    ///
+    /// # Errors
+    ///
+    /// Transport or parse failure.
+    fn capabilities(&self) -> Result<ServerCapabilities>;
+
+    /// Server-side repository directory scaffolding (keys/, snapshots/,
+    /// locks/, packs/*). Every vykar-server answers it.
+    ///
+    /// # Errors
+    ///
+    /// The request failed.
+    fn init(&self) -> Result<()>;
+
+    /// Server-side pack verification: hash check + header + blob boundary
+    /// scan. Only after `offers(ServerOp::VerifyPacks)`.
+    ///
+    /// # Errors
+    ///
+    /// The request failed; `Other` when not offered.
+    fn verify_packs(&self, plan: &VerifyPacksPlanRequest) -> Result<VerifyPacksResponse> {
+        let _ = plan;
+        Err(not_offered("verify-packs"))
+    }
+
+    /// Execute a server-side repack plan. Only after `offers(ServerOp::Repack)`.
+    ///
+    /// # Errors
+    ///
+    /// The request failed; `Other` when not offered.
+    fn repack(&self, plan: &RepackPlanRequest) -> Result<RepackResultResponse> {
+        let _ = plan;
+        Err(not_offered("repack"))
+    }
+
+    /// The size of each of `keys` (`None` = absent), in order, from as few
+    /// requests as the server allows (one per top-level directory). Every key
+    /// must lie inside a directory. Only after `offers(ServerOp::ObjectSizes)`.
+    /// `RestBackend` against a server that predates `?sizes` returns `Err` once
+    /// and stops offering it.
+    ///
+    /// # Errors
+    ///
+    /// The request failed, or the server answered the wrong count.
+    fn object_sizes(&self, keys: &[String]) -> Result<Vec<Option<u64>>> {
+        let _ = keys;
+        Err(not_offered("object sizes"))
+    }
+
+    /// [`StorageBackend::list_sized`] of the whole tree under `prefix` in one
+    /// request (compact's 256 pack shards). Same result contract, including
+    /// `size: None` from a server older than `?list&sized`. Only after
+    /// `offers(ServerOp::ListTree)`.
+    ///
+    /// # Errors
+    ///
+    /// The request failed; `Other` when not offered.
+    fn list_tree_sized(&self, prefix: &str) -> Result<Vec<ListedObject>> {
+        let _ = prefix;
+        Err(not_offered("tree listing"))
+    }
+}
+
+/// The error of a [`ServerOps`] method called without its `offers()`: a
+/// programming error, deliberately not `UnsupportedBackend`.
+fn not_offered(op: &str) -> VykarError {
+    VykarError::Other(format!("server operation not offered: {op}"))
 }
 
 // Lets a `Box<Arc<dyn StorageBackend>>` coerce to `Box<dyn StorageBackend>`

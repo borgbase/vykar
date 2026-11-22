@@ -5,7 +5,7 @@ use crate::error::ServerError;
 use crate::state::AppState;
 
 /// Maximum keys accepted in one batch-delete request. Clients chunk larger
-/// deletes (see `delete_repo` / `rest_backend::batch_delete_keys`).
+/// deletes (see `delete_repo` / the `BatchDelete` impl in `rest_backend`).
 const MAX_BATCH_DELETE_KEYS: usize = 200_000;
 
 pub(super) async fn batch_delete(

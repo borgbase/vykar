@@ -5,11 +5,12 @@
 //! handle, but takes object presence and sizes from the store map and
 //! compares restore output with the harness's own record of each source.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 
 use vykar_types::chunk_id::ChunkId;
 
+use super::fault::ClientId;
 use super::history::{ClientOp, ErrorClass, History, ObservationCause, RunOutcome};
 use super::runner::SourceTree;
 use super::store::SimStore;
@@ -26,7 +27,13 @@ pub enum Invariant {
     NoSilentRemoval = 3,
     IndexIntegrity = 4,
     NoRefcountDeflation = 5,
+    /// Every protected write lands while the store holds exactly one lock
+    /// key, written by the same run.
+    LockExclusion = 7,
     AllowedErrors = 8,
+    /// Once every lock and marker has aged out, a new client can back up
+    /// and compact. Needs [`Sim::check_invariants`](super::runner::Sim::check_invariants).
+    NoPermanentWedge = 9,
 }
 
 impl Invariant {
@@ -38,6 +45,18 @@ impl Invariant {
         Invariant::IndexIntegrity,
         Invariant::NoRefcountDeflation,
         Invariant::AllowedErrors,
+    ];
+
+    /// STEP1 plus invariants 7 and 9 (08 step 3).
+    pub const STEP3: &'static [Invariant] = &[
+        Invariant::CommittedSnapshotsRestore,
+        Invariant::AcknowledgedCommitsDurable,
+        Invariant::NoSilentRemoval,
+        Invariant::IndexIntegrity,
+        Invariant::NoRefcountDeflation,
+        Invariant::AllowedErrors,
+        Invariant::LockExclusion,
+        Invariant::NoPermanentWedge,
     ];
 }
 
@@ -69,6 +88,16 @@ pub enum ViolationKind {
     SilentRemoval,
     // 8
     DisallowedError,
+    // 7
+    /// A protected write while the store held no lock key.
+    WriteWithoutLock,
+    /// A protected write while the one lock key was another run's.
+    WriteUnderOtherLock,
+    /// A protected write while the store held more than one lock key.
+    WriteUnderSeveralLocks,
+    // 9
+    WedgedBackup,
+    WedgedCompact,
 }
 
 impl ViolationKind {
@@ -92,6 +121,10 @@ impl ViolationKind {
             K::AcknowledgedCommitMissing => Invariant::AcknowledgedCommitsDurable,
             K::SilentRemoval => Invariant::NoSilentRemoval,
             K::DisallowedError => Invariant::AllowedErrors,
+            K::WriteWithoutLock | K::WriteUnderOtherLock | K::WriteUnderSeveralLocks => {
+                Invariant::LockExclusion
+            }
+            K::WedgedBackup | K::WedgedCompact => Invariant::NoPermanentWedge,
         }
     }
 }
@@ -157,7 +190,18 @@ impl Report {
         assert!(self.is_clean(), "invariant report not clean:\n{self}");
     }
 
-    fn add(&mut self, kind: ViolationKind, subject: impl Into<String>, detail: impl Into<String>) {
+    /// Append `other`'s violations and skips.
+    pub fn extend(&mut self, other: Report) {
+        self.violations.extend(other.violations);
+        self.not_evaluated.extend(other.not_evaluated);
+    }
+
+    pub(super) fn add(
+        &mut self,
+        kind: ViolationKind,
+        subject: impl Into<String>,
+        detail: impl Into<String>,
+    ) {
         self.violations.push(Violation {
             invariant: kind.invariant(),
             kind,
@@ -166,7 +210,7 @@ impl Report {
         });
     }
 
-    fn skip(
+    pub(super) fn skip(
         &mut self,
         invariant: Invariant,
         subject: impl Into<String>,
@@ -603,6 +647,94 @@ fn check_errors(history: &History, report: &mut Report) {
     }
 }
 
+/// Prefixes of keys whose deletion only a lock holder may do. 05 step 8
+/// adds `index.h/`.
+const PROTECTED_DELETE_PREFIXES: &[&str] = &["snapshots/", "packs/", "index.d/"];
+
+/// A write only a lock holder may do: the head, or an index object.
+fn protected_write(key: &str) -> bool {
+    key == "index" || key.starts_with("index.d/")
+}
+
+fn is_lock_key(key: &str) -> bool {
+    key.starts_with("locks/") && key.ends_with(".json")
+}
+
+/// Invariant 7, as the store sees it: replay the op log, tracking which
+/// lock keys exist and which (client, run) last wrote each, and judge every
+/// applied protected write against the keys present just before it. Late
+/// effects count at the step they land. The tamper client and the Init run
+/// (`Repository::init` writes `index` with no lock) are exempt.
+///
+/// Limit: a key counts as held from its PUT. `acquire_lock` publishes a
+/// tentative key that can coexist with the holder's until the loser deletes
+/// it, so a protected write by the rightful holder in that window reads as
+/// `WriteUnderSeveralLocks`. No scripted scenario holds a contender there;
+/// an ordering search (08 step 4) must count a key as held only once its
+/// writer's confirming LIST has returned.
+fn check_lock_exclusion(store: &SimStore, history: &History, report: &mut Report) {
+    let init_runs: BTreeSet<usize> = history
+        .runs
+        .iter()
+        .filter(|r| matches!(r.op, ClientOp::Init))
+        .map(|r| r.index)
+        .collect();
+    let mut held: BTreeMap<String, (ClientId, Option<usize>)> = BTreeMap::new();
+    for rec in store.log() {
+        if !rec.applied() {
+            continue;
+        }
+        let protected = if rec.op.is_write() {
+            protected_write(&rec.key)
+        } else if rec.op.is_delete() {
+            rec.all_keys()
+                .iter()
+                .any(|k| PROTECTED_DELETE_PREFIXES.iter().any(|p| k.starts_with(p)))
+        } else {
+            false
+        };
+        let exempt =
+            rec.client == store.tamper_id() || rec.run.is_some_and(|r| init_runs.contains(&r));
+        if protected && !exempt {
+            let mine = (rec.client, rec.run);
+            let kind = match held.len() {
+                0 => Some(ViolationKind::WriteWithoutLock),
+                1 if held.values().next() != Some(&mine) => {
+                    Some(ViolationKind::WriteUnderOtherLock)
+                }
+                1 => None,
+                _ => Some(ViolationKind::WriteUnderSeveralLocks),
+            };
+            if let Some(kind) = kind {
+                let subject = rec
+                    .run
+                    .map_or_else(|| "no run".to_string(), |r| format!("run {r}"));
+                let holders: Vec<String> = held
+                    .iter()
+                    .map(|(k, (c, r))| format!("{k} by {} run {r:?}", store.client_name(*c)))
+                    .collect();
+                report.add(
+                    kind,
+                    subject,
+                    format!(
+                        "step {} {:?} {} by {}; locks held: {holders:?}",
+                        rec.step,
+                        rec.op,
+                        rec.key,
+                        store.client_name(rec.client)
+                    ),
+                );
+            }
+        }
+        if rec.op.is_write() && is_lock_key(&rec.key) {
+            held.insert(rec.key.clone(), (rec.client, rec.run));
+        }
+        for k in rec.deleted_keys() {
+            held.remove(k);
+        }
+    }
+}
+
 pub fn check_invariants(store: &SimStore, history: &History, set: &[Invariant]) -> Report {
     let mut report = Report::default();
     let tmp = tempfile::tempdir().expect("checker scratch");
@@ -666,6 +798,16 @@ pub fn check_invariants(store: &SimStore, history: &History, set: &[Invariant]) 
     }
     if want(Invariant::AllowedErrors) {
         check_errors(history, &mut report);
+    }
+    if want(Invariant::LockExclusion) {
+        check_lock_exclusion(store, history, &mut report);
+    }
+    if want(Invariant::NoPermanentWedge) {
+        report.skip(
+            Invariant::NoPermanentWedge,
+            "repository",
+            "needs Sim::check_invariants",
+        );
     }
     report
 }

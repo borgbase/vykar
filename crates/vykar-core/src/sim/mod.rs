@@ -2,13 +2,17 @@
 //!
 //! - `store`: `SimStore`, the shared deterministic backend with an op log and
 //!   faults (`Fail`, `FailApplied`, `Delay`, `Duplicate`, `Crash`).
-//! - `runner`: `Sim`, which runs real client commands one after another, each
-//!   client with its own cache directory, and records a `History`.
+//! - `gate`: pause points, which hold one client operation before it takes
+//!   effect until the test resumes it.
+//! - `runner`: `Sim`, which runs real client commands, on the calling thread
+//!   or on their own thread, each client with its own cache directory, and
+//!   records a `History`.
 //! - `env`: virtual time (`SimTime`, `SimClock`) and per-client host identity
 //!   (`SimHosts`), from which each client gets its own `HostEnv`.
 //! - `checker`: `check_invariants`, which judges the store and the history
 //!   against the protocol invariants.
-//! - `hazards`: scenarios of known protocol hazards and their regressions.
+//! - `hazards`: scenarios of known protocol hazards and their regressions;
+//!   `interleavings` holds the ones that need two clients in flight at once.
 //!
 //! Test support, not API: a panic is a test failure. Compiled for this
 //! crate's tests and with the `sim` feature; never enable it in a product
@@ -26,8 +30,10 @@
 pub mod checker;
 pub mod env;
 pub mod fault;
+pub mod gate;
 pub mod hazards;
 pub mod history;
+pub mod interleavings;
 pub mod log;
 pub mod runner;
 pub mod store;
@@ -38,7 +44,8 @@ pub use fault::{
     ClientId, FaultAction, FaultRule, INJECTED_MARKER, KeyMatch, OpKind, OpMatch, ParkedEffect,
     ParkedId, RuleId,
 };
+pub use gate::{GateId, GateRule, Paused};
 pub use history::{AllowedError, ClientOp, ErrorClass, History, RunOutcome, RunRecord};
 pub use log::{OpOutcome, OpRecord};
-pub use runner::{Sim, SourceTree};
+pub use runner::{Call, CustomFn, Sim, SourceTree, Spawned};
 pub use store::{SimClient, SimConfig, SimStore, StoredObject};

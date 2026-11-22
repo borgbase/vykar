@@ -5,8 +5,10 @@ use crate::config::RetentionConfig;
 use crate::sim::checker::{self, Invariant, ViolationKind, head_object_keys};
 use crate::sim::hazards::{self, HazardOutcome, KNOWN_HAZARDS, LateHead, REGRESSIONS};
 use crate::sim::history::{AllowedError, ErrorClass, INDEX_CHANGED_TEXT, classify};
+use crate::sim::interleavings::{self, H2Reap, Hosts, MarkerReap, Order};
 use crate::sim::{
-    ClientId, FaultAction, FaultRule, KeyMatch, OpKind, OpMatch, OpOutcome, Sim, SourceTree,
+    Call, ClientId, FaultAction, FaultRule, GateRule, KeyMatch, OpKind, OpMatch, OpOutcome, Sim,
+    SourceTree,
 };
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{ActiveSessionList, LockHolder, VykarError};
@@ -679,7 +681,18 @@ fn neutralised_h3_compact_not_reproduced() {
 }
 
 /// The ids with a test above, hazards and regressions alike.
-const TESTED_IDS: &[&str] = &["H3", "H5", "H5-repair", "H3-compact"];
+const TESTED_IDS: &[&str] = &[
+    "H3",
+    "H5",
+    "H5-repair",
+    "H3-compact",
+    "H1",
+    "H1-session",
+    "H2",
+    "H2-marker",
+    "H4",
+    "H4-segment",
+];
 
 #[test]
 fn known_hazard_ids_unique_and_listed() {
@@ -697,5 +710,389 @@ fn known_hazard_ids_unique_and_listed() {
 fn regressions_hold() {
     for r in REGRESSIONS {
         hazards::assert_regression_holds(r.id);
+    }
+}
+
+// ── Scripted pause points (08 step 3) ───────────────────────────────────
+
+fn sessions_list(c: ClientId) -> GateRule {
+    GateRule::new(
+        c,
+        OpMatch::Kind(OpKind::List),
+        KeyMatch::Exact("sessions/".into()),
+    )
+}
+
+fn backup_call(name: &str) -> Call {
+    Call::Backup {
+        snapshot: name.into(),
+        tree: tree(name),
+    }
+}
+
+fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| payload.downcast_ref::<&str>().map(|run| run.to_string()))
+        .unwrap_or_default()
+}
+
+#[test]
+fn spawned_run_pauses_and_resumes() {
+    let mut sim = Sim::new();
+    let (a, c) = (sim.client("a"), sim.client("c"));
+    sim.backup(c, "t0", &tree("t0")).expect_ok();
+    let gate = sim.gate(sessions_list(a));
+    let run = sim.spawn(a, backup_call("a1"));
+    let held = sim.expect_paused(gate, "journal recovery");
+    assert!(held.thread.starts_with("sim-a-"), "{}", held.thread);
+    assert_eq!(held.run, Some(run.index()));
+    assert_eq!(sim.in_flight(), vec![a]);
+    sim.resume(gate);
+    let rec = sim.join(run);
+    rec.expect_ok();
+    assert_eq!(sim.history().runs[rec.index].index, rec.index);
+    assert!(sim.in_flight().is_empty());
+    sim.check_invariants(Invariant::STEP1).assert_clean();
+}
+
+#[test]
+fn runs_recorded_in_index_order() {
+    let mut sim = Sim::new();
+    let (a, b) = (sim.client("a"), sim.client("b"));
+    let gate = sim.gate(sessions_list(a));
+    let run = sim.spawn(a, backup_call("a1"));
+    sim.expect_paused(gate, "journal recovery");
+    let rb = sim.call(b, backup_call("b1"));
+    rb.expect_ok();
+    sim.resume(gate);
+    let ra = sim.join(run);
+    ra.expect_ok();
+    assert!(ra.index < rb.index);
+    let runs = &sim.history().runs;
+    assert!(runs.windows(2).all(|w| w[0].index < w[1].index));
+    let obs = &sim.history().observations;
+    assert!(obs.windows(2).all(|w| w[0].step <= w[1].step));
+    // Every record of a client's run carries that run's index.
+    for rec in sim.store().log() {
+        if rec.client == a || rec.client == b {
+            let run = rec.run.expect("client op outside a run");
+            assert_eq!(runs[run].client, rec.client, "{rec:?}");
+        }
+    }
+    sim.check_invariants(Invariant::STEP3).assert_clean();
+}
+
+#[test]
+fn wait_paused_none_when_run_ends_first() {
+    let mut sim = Sim::new();
+    let a = sim.client("a");
+    let gate = sim.gate(GateRule::new(
+        a,
+        OpMatch::AnyDelete,
+        KeyMatch::Prefix("snapshots/".into()),
+    ));
+    let run = sim.spawn(a, backup_call("a1"));
+    assert!(sim.wait_paused(gate).is_none());
+    sim.join(run).expect_ok();
+}
+
+#[test]
+fn inline_run_with_armed_gate_panics() {
+    let mut sim = Sim::new();
+    let a = sim.client("a");
+    sim.gate(sessions_list(a));
+    let held = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sim.compact(a)))
+        .expect_err("inline run with an armed gate");
+    assert!(
+        panic_text(held.as_ref()).contains("spawn"),
+        "{}",
+        panic_text(held.as_ref())
+    );
+}
+
+#[test]
+fn check_invariants_panics_while_in_flight() {
+    let mut sim = Sim::new();
+    let a = sim.client("a");
+    let gate = sim.gate(sessions_list(a));
+    let run = sim.spawn(a, backup_call("a1"));
+    sim.expect_paused(gate, "journal recovery");
+    let held = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        sim.check_invariants(Invariant::STEP1)
+    }));
+    assert!(held.is_err());
+    sim.resume(gate);
+    sim.join(run).expect_ok();
+}
+
+#[test]
+fn assert_settled_panics_on_unpaused_run() {
+    let mut sim = Sim::new();
+    let (a, b) = (sim.client("a"), sim.client("b"));
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    let run = sim.spawn(
+        a,
+        Call::Custom {
+            label: "blocked".into(),
+            f: Box::new(move |_| {
+                let _ = rx.recv();
+                Ok(())
+            }),
+        },
+    );
+    let held = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sim.compact(b)))
+        .expect_err("call while a runs unpaused");
+    assert!(
+        panic_text(held.as_ref()).contains("running unpaused"),
+        "{}",
+        panic_text(held.as_ref())
+    );
+    tx.send(()).unwrap();
+    sim.join(run).expect_ok();
+}
+
+#[test]
+fn drop_opens_gates() {
+    let mut sim = Sim::new();
+    let a = sim.client("a");
+    let gate = sim.gate(sessions_list(a));
+    let run = sim.spawn(a, backup_call("a1"));
+    sim.expect_paused(gate, "journal recovery");
+    let handle = run.into_handle();
+    drop(sim);
+    let start = Instant::now();
+    while !handle.is_finished() {
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "held run did not finish"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn step3_clean_on_sequential_flows() {
+    let mut sim = Sim::new();
+    let (c, d) = (sim.client("c"), sim.client("d"));
+    sim.backup(c, "t0", &tree("t0")).expect_ok();
+    sim.backup(d, "t1", &tree("t1")).expect_ok();
+    sim.backup(c, "t2", &tree("t2")).expect_ok();
+    sim.restore(c, "t0").expect_ok();
+    sim.check(c).expect_ok();
+    sim.delete(c, &["t0"]).expect_ok();
+    sim.prune(
+        d,
+        RetentionConfig {
+            keep_last: Some(1),
+            ..Default::default()
+        },
+    )
+    .expect_ok();
+    sim.compact(c).expect_ok();
+    sim.check_repair(c).expect_ok();
+    sim.break_lock(d, false).expect_ok();
+    sim.check_invariants(Invariant::STEP3).assert_clean();
+}
+
+/// `c` backs up t0; `a` deletes it and is held at its snapshot delete.
+fn held_delete() -> (
+    Sim,
+    ClientId,
+    crate::sim::Spawned,
+    crate::sim::GateId,
+    String,
+) {
+    let mut sim = Sim::new();
+    let (a, c) = (sim.client("a"), sim.client("c"));
+    sim.backup(c, "t0", &tree("t0")).expect_ok();
+    let gate = sim.gate(GateRule::new(
+        a,
+        OpMatch::AnyDelete,
+        KeyMatch::Prefix("snapshots/".into()),
+    ));
+    let run = sim.spawn(
+        a,
+        Call::Delete {
+            names: vec!["t0".into()],
+        },
+    );
+    sim.expect_paused(gate, "a's snapshot delete");
+    let key = sim
+        .store()
+        .keys_written_by(a, "locks/")
+        .pop()
+        .expect("a holds a lock");
+    (sim, a, run, gate, key)
+}
+
+const PLANTED_LOCK: &str = "locks/00000000000000000000-zz.json";
+const LOCK_BODY: &[u8] = br#"{"hostname":"elsewhere","pid":1,"time":"2026-01-01T00:00:00Z"}"#;
+
+#[test]
+fn lock_exclusion_without_lock() {
+    let (mut sim, _, run, gate, key) = held_delete();
+    assert!(sim.tamper_delete(&key));
+    sim.resume(gate);
+    let rec = sim.join(run);
+    let report = sim.check_invariants(&[Invariant::LockExclusion]);
+    assert!(
+        report.has_kind(
+            ViolationKind::WriteWithoutLock,
+            &format!("run {}", rec.index)
+        ),
+        "{report}"
+    );
+}
+
+#[test]
+fn lock_exclusion_other_and_several() {
+    let (mut sim, _, run, gate, _) = held_delete();
+    sim.tamper_put(PLANTED_LOCK, LOCK_BODY);
+    sim.resume(gate);
+    let rec = sim.join(run);
+    let report = sim.check_invariants(&[Invariant::LockExclusion]);
+    assert!(
+        report.has_kind(
+            ViolationKind::WriteUnderSeveralLocks,
+            &format!("run {}", rec.index)
+        ),
+        "{report}"
+    );
+
+    let (mut sim, _, run, gate, key) = held_delete();
+    assert!(sim.tamper_delete(&key));
+    sim.tamper_put(PLANTED_LOCK, LOCK_BODY);
+    sim.resume(gate);
+    let rec = sim.join(run);
+    let report = sim.check_invariants(&[Invariant::LockExclusion]);
+    assert!(
+        report.has_kind(
+            ViolationKind::WriteUnderOtherLock,
+            &format!("run {}", rec.index)
+        ),
+        "{report}"
+    );
+}
+
+#[test]
+fn wedge_on_unageable_lock() {
+    let mut sim = Sim::new();
+    let c = sim.client("c");
+    sim.backup(c, "t0", &tree("t0")).expect_ok();
+    sim.tamper_put("locks/planted.json", b"{}");
+    let (keys, log_len) = (sim.store().keys(""), sim.store().log().len());
+    let report = sim.check_invariants(&[Invariant::NoPermanentWedge]);
+    assert!(
+        report.has_kind(ViolationKind::WedgedBackup, "repository"),
+        "{report}"
+    );
+    assert_eq!(sim.store().keys(""), keys);
+    assert_eq!(sim.store().log().len(), log_len);
+}
+
+#[test]
+fn wedge_check_skips_malformed_marker() {
+    let mut sim = Sim::new();
+    let c = sim.client("c");
+    sim.backup(c, "t0", &tree("t0")).expect_ok();
+    sim.tamper_put("sessions/bad.json", b"not json");
+    let report = sim.check_invariants(&[Invariant::NoPermanentWedge]);
+    assert!(report.violations.is_empty(), "{report}");
+    assert!(
+        report.not_evaluated_for(Invariant::NoPermanentWedge, "sessions/bad.json"),
+        "{report}"
+    );
+}
+
+#[test]
+fn known_hazard_h1_live_lock_reaped() {
+    hazards::assert_reproduces("H1");
+}
+
+#[test]
+fn known_hazard_h1_session_reaped() {
+    hazards::assert_reproduces("H1-session");
+}
+
+#[test]
+fn known_hazard_h2_lock_refresh_resurrects() {
+    hazards::assert_reproduces("H2");
+}
+
+#[test]
+fn known_hazard_h2_marker_refresh_resurrects() {
+    hazards::assert_reproduces("H2-marker");
+}
+
+#[test]
+fn known_hazard_h4_compact_deletes_after_lost_lock() {
+    hazards::assert_reproduces("H4");
+}
+
+#[test]
+fn known_hazard_h4_segment_deleted() {
+    hazards::assert_reproduces("H4-segment");
+}
+
+#[test]
+fn neutralised_h1_not_reproduced() {
+    expect_not_reproduced("H1", interleavings::h1_with(Hosts::Distinct));
+}
+
+#[test]
+fn neutralised_h1_session_not_reproduced() {
+    expect_not_reproduced(
+        "H1-session",
+        interleavings::h1_session_with(Hosts::Distinct),
+    );
+}
+
+#[test]
+fn neutralised_h2_not_reproduced() {
+    expect_not_reproduced("H2", interleavings::h2_with(H2Reap::BeforeFence));
+}
+
+#[test]
+fn neutralised_h2_marker_not_reproduced() {
+    expect_not_reproduced(
+        "H2-marker",
+        interleavings::h2_marker_with(MarkerReap::BeforeGet),
+    );
+}
+
+#[test]
+fn neutralised_h4_not_reproduced() {
+    expect_not_reproduced(
+        "H4",
+        interleavings::h4_with(Hosts::SameHostname, Order::Sequential),
+    );
+}
+
+#[test]
+fn neutralised_h4_segment_not_reproduced() {
+    expect_not_reproduced(
+        "H4-segment",
+        interleavings::h4_segment_with(Hosts::SameHostname, Order::Sequential),
+    );
+}
+
+#[test]
+fn h4_without_h1_has_no_prerequisite() {
+    for outcome in [
+        interleavings::h4_with(Hosts::Distinct, Order::Interleaved),
+        interleavings::h4_segment_with(Hosts::Distinct, Order::Interleaved),
+    ] {
+        assert!(
+            matches!(
+                outcome,
+                HazardOutcome::PrerequisiteNotReproduced {
+                    prerequisite: "H1",
+                    ..
+                }
+            ),
+            "H4 on distinct hostnames should report the missing prerequisite: {outcome:?}"
+        );
     }
 }

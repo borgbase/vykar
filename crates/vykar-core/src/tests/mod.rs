@@ -37,6 +37,7 @@ mod segmented_index;
 mod segmented_index_consistency;
 mod segmented_writes;
 mod sim;
+mod sim_exclusion;
 pub(crate) mod tree_cache;
 pub(crate) mod tree_cut;
 mod two_openers;

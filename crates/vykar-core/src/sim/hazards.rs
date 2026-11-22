@@ -1,6 +1,9 @@
 //! Known protocol hazards, each as a scenario that reproduces it, and the
 //! regressions they turn into once fixed.
 //!
+//! The scenarios that need two clients in flight at once are in
+//! [`interleavings`](super::interleavings).
+//!
 //! A hazard's test asserts that it still reproduces. When a fix lands, the
 //! scenario reports `NotReproduced` and the entry moves from `KNOWN_HAZARDS`
 //! to `REGRESSIONS`, where the same scenario must then hold.
@@ -10,6 +13,7 @@ use std::collections::BTreeSet;
 use super::checker::{Invariant, Report, ViolationKind, head_object_keys};
 use super::fault::{ClientId, FaultAction, FaultRule};
 use super::history::{AllowedError, ErrorClass};
+use super::interleavings;
 use super::runner::{Sim, SourceTree};
 
 #[derive(Clone, Debug)]
@@ -72,6 +76,48 @@ pub const KNOWN_HAZARDS: &[KnownHazard] = &[
         fixed_by: "04-commit-protocol.md (conditional-create commit point)",
         run: h3_compact_then_late_head,
     },
+    KnownHazard {
+        id: "H1",
+        summary: "same hostname, other boot ID: a live lock is reaped and its holder \
+                  writes under the reaper's lock",
+        fixed_by: "04-commit-protocol.md step 1 (installation ID)",
+        run: interleavings::h1_live_lock_reaped,
+    },
+    KnownHazard {
+        id: "H1-session",
+        summary: "same hostname: a live backup's marker is reaped, compact deletes its \
+                  uploaded packs; its uploads are destroyed and the backup fails",
+        fixed_by: "04-commit-protocol.md step 1 (installation ID)",
+        run: interleavings::h1_session_reaped,
+    },
+    KnownHazard {
+        id: "H2",
+        summary: "lock refresh recreates a reaped key: two holders, both fences pass",
+        fixed_by: "04-commit-protocol.md step 2 (non-resurrecting lock refresh, fallback only)",
+        run: interleavings::h2_lock_refresh_resurrects,
+    },
+    KnownHazard {
+        id: "H2-marker",
+        summary: "session refresh recreates a reaped marker and the backup is never told",
+        fixed_by: "04-commit-protocol.md step 2 (non-resurrecting marker refresh)",
+        run: interleavings::h2_marker_refresh_resurrects,
+    },
+    KnownHazard {
+        id: "H4",
+        summary: "compact loses its lock, deletes sources with no fence after its head \
+                  PUT, and a stale head names the deleted packs",
+        fixed_by: "04-commit-protocol.md step 3 (fence before deletes; narrows) and \
+                   step 8 (create-if-absent heads)",
+        run: interleavings::h4_compact_deletes_after_lost_lock,
+    },
+    KnownHazard {
+        id: "H4-segment",
+        summary: "a compact whose lock was reaped deletes a concurrent writer's segment \
+                  as unreferenced",
+        fixed_by: "04-commit-protocol.md step 3 (fence before deletes, which must cover \
+                   compact's index-upkeep collect_garbage)",
+        run: interleavings::h4_segment_deleted,
+    },
 ];
 
 pub const REGRESSIONS: &[Regression] = &[];
@@ -133,7 +179,7 @@ pub enum LateHead {
     Never,
 }
 
-fn broken(reason: impl Into<String>) -> HazardOutcome {
+pub(super) fn broken(reason: impl Into<String>) -> HazardOutcome {
     HazardOutcome::ScenarioBroken {
         reason: reason.into(),
     }
@@ -229,7 +275,7 @@ fn h3_setup(late: LateHead) -> Result<Setup, String> {
 
 /// Controls that hold whether or not the hazard reproduces: `c0` intact, no
 /// acknowledged commit lost or silently removed, no disallowed error.
-fn base_controls(report: &Report) -> Result<(), String> {
+pub(super) fn base_controls(report: &Report) -> Result<(), String> {
     if report.violated_for(Invariant::CommittedSnapshotsRestore, "c0") {
         return Err(format!("control c0 damaged:\n{report}"));
     }
@@ -257,7 +303,7 @@ fn b1_healthy(report: &Report) -> bool {
 }
 
 /// Neither the expected signature nor healthy.
-fn different_damage(evidence: impl std::fmt::Display) -> HazardOutcome {
+pub(super) fn different_damage(evidence: impl std::fmt::Display) -> HazardOutcome {
     broken(format!("damage of a different shape:\n{evidence}"))
 }
 
@@ -339,7 +385,7 @@ fn b_packs_present(sim: &Sim, b: ClientId) -> Result<Vec<String>, String> {
 
 /// Keys `client` deleted during run `run`, from the op log. A delete of a
 /// key that was already absent does not count.
-fn deleted_in_run(sim: &Sim, client: ClientId, run: usize) -> BTreeSet<String> {
+pub(super) fn deleted_in_run(sim: &Sim, client: ClientId, run: usize) -> BTreeSet<String> {
     sim.store()
         .log()
         .iter()

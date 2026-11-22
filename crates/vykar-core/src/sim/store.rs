@@ -7,7 +7,7 @@
 //! times out at the client and lands later on the server is modelled.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 use chrono::{DateTime, Utc};
 use vykar_storage::{
@@ -19,6 +19,7 @@ use super::fault::{
     ClientId, Effect, FaultAction, FaultRule, INJECTED_MARKER, OpKind, ParkedEffect, ParkedId,
     RuleId,
 };
+use super::gate::{GateId, GatePhase, GateRule, GateState, Paused};
 use super::log::{OpOutcome, OpRecord, thread_label};
 
 const OBSERVER: ClientId = ClientId(0);
@@ -72,12 +73,17 @@ struct State {
     next_parked: u64,
     crashed: BTreeSet<ClientId>,
     names: Vec<String>,
-    current_run: Option<usize>,
+    /// The run each client is in, if any.
+    runs: BTreeMap<ClientId, usize>,
+    gates: Vec<GateState>,
+    next_gate: u32,
 }
 
 struct Shared {
     config: SimConfig,
     state: Mutex<State>,
+    /// Paired with `state`: signalled when a gate pauses or opens.
+    gate_cv: Condvar,
 }
 
 /// What the rule pass decided for one operation.
@@ -142,7 +148,8 @@ impl State {
         len: Option<u64>,
         outcome: OpOutcome,
     ) {
-        self.record_for_run(client, self.current_run, op, key, keys, len, outcome);
+        let run = self.runs.get(&client).copied();
+        self.record_for_run(client, run, op, key, keys, len, outcome);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -275,7 +282,7 @@ impl State {
             ParkedEffect {
                 id,
                 client,
-                run: self.current_run,
+                run: self.runs.get(&client).copied(),
                 op,
                 key: key.to_string(),
                 keys: keys.to_vec(),
@@ -291,12 +298,28 @@ impl State {
 impl SimStore {
     pub fn new(config: SimConfig) -> Self {
         let clock = DateTime::from_timestamp(1_767_225_600, 0).expect("valid epoch"); // 2026-01-01
+        Self::from_parts(
+            config,
+            BTreeMap::new(),
+            0,
+            clock,
+            vec!["observer".into(), "tamper".into()],
+        )
+    }
+
+    fn from_parts(
+        config: SimConfig,
+        objects: BTreeMap<String, StoredObject>,
+        step: u64,
+        clock: DateTime<Utc>,
+        names: Vec<String>,
+    ) -> Self {
         Self {
             shared: Arc::new(Shared {
                 config,
                 state: Mutex::new(State {
-                    objects: BTreeMap::new(),
-                    step: 0,
+                    objects,
+                    step,
                     clock,
                     log: Vec::new(),
                     rules: Vec::new(),
@@ -304,15 +327,37 @@ impl SimStore {
                     parked: BTreeMap::new(),
                     next_parked: 0,
                     crashed: BTreeSet::new(),
-                    names: vec!["observer".into(), "tamper".into()],
-                    current_run: None,
+                    names,
+                    runs: BTreeMap::new(),
+                    gates: Vec::new(),
+                    next_gate: 0,
                 }),
+                gate_cv: Condvar::new(),
             }),
         }
     }
 
+    /// A deep copy for invariant 9: same objects, clock, step counter,
+    /// client names and config; empty log; no rules, parked effects,
+    /// crashes, runs or gates (faults have stopped).
+    pub fn fork(&self) -> SimStore {
+        let st = self.state();
+        Self::from_parts(
+            self.shared.config.clone(),
+            st.objects.clone(),
+            st.step,
+            st.clock,
+            st.names.clone(),
+        )
+    }
+
     fn state(&self) -> MutexGuard<'_, State> {
         self.shared.state.lock().unwrap()
+    }
+
+    /// The client that `tamper_put` and `tamper_delete` log under.
+    pub fn tamper_id(&self) -> ClientId {
+        TAMPER
     }
 
     pub fn config(&self) -> &SimConfig {
@@ -532,8 +577,186 @@ impl SimStore {
         existed
     }
 
-    pub(crate) fn set_current_run(&self, run: Option<usize>) {
-        self.state().current_run = run;
+    /// Tag `client`'s operations with `run` until set to None.
+    pub(crate) fn set_current_run(&self, client: ClientId, run: Option<usize>) {
+        let mut st = self.state();
+        match run {
+            Some(r) => st.runs.insert(client, r),
+            None => st.runs.remove(&client),
+        };
+    }
+
+    /// Rejects `nth == 0` and the reserved observer/tamper ids.
+    pub fn add_gate(&self, rule: GateRule) -> Result<GateId> {
+        if rule.nth == 0 {
+            return Err(VykarError::Other("vykar-sim: gate nth is 1-based".into()));
+        }
+        if rule.client == OBSERVER || rule.client == TAMPER {
+            return Err(VykarError::Other(format!(
+                "vykar-sim: gate on reserved client id {:?}",
+                rule.client
+            )));
+        }
+        let mut st = self.state();
+        let id = GateId(st.next_gate);
+        st.next_gate += 1;
+        st.gates.push(GateState {
+            id,
+            rule,
+            phase: GatePhase::Armed { count: 0 },
+        });
+        Ok(id)
+    }
+
+    /// The client a gate names, if the gate exists.
+    pub fn gate_client(&self, id: GateId) -> Option<ClientId> {
+        self.state()
+            .gates
+            .iter()
+            .find(|g| g.id == id)
+            .map(|g| g.rule.client)
+    }
+
+    /// Whether the gate is still counting operations.
+    pub fn gate_armed(&self, id: GateId) -> bool {
+        self.state()
+            .gates
+            .iter()
+            .any(|g| g.id == id && matches!(g.phase, GatePhase::Armed { .. }))
+    }
+
+    /// The operation the gate holds now, if any.
+    pub fn gate_paused(&self, id: GateId) -> Option<Paused> {
+        gate_paused_in(&self.state(), id)
+    }
+
+    /// Block (real time, at most `timeout`) until the gate holds an operation.
+    /// None on timeout, or if the gate is Open or Missed.
+    pub fn wait_gate(&self, id: GateId, timeout: std::time::Duration) -> Option<Paused> {
+        let st = self.state();
+        let (st, _) = self
+            .shared
+            .gate_cv
+            .wait_timeout_while(st, timeout, |s| {
+                s.gates
+                    .iter()
+                    .any(|g| g.id == id && matches!(g.phase, GatePhase::Armed { .. }))
+            })
+            .unwrap();
+        gate_paused_in(&st, id)
+    }
+
+    /// Paused: let the operation proceed. Armed: disarm, so it never fires.
+    /// Err if unknown, Open or Missed.
+    pub fn resume_gate(&self, id: GateId) -> Result<()> {
+        let mut st = self.state();
+        let gate = st
+            .gates
+            .iter_mut()
+            .find(|g| g.id == id)
+            .ok_or_else(|| VykarError::Other(format!("vykar-sim: no gate {id:?}")))?;
+        match gate.phase {
+            GatePhase::Armed { .. } | GatePhase::Paused(_) => gate.phase = GatePhase::Open,
+            GatePhase::Open | GatePhase::Missed => {
+                return Err(VykarError::Other(format!(
+                    "vykar-sim: gate {id:?} is not armed or paused"
+                )));
+            }
+        }
+        self.shared.gate_cv.notify_all();
+        Ok(())
+    }
+
+    /// Every operation held by a gate now.
+    pub fn paused(&self) -> Vec<Paused> {
+        self.state()
+            .gates
+            .iter()
+            .filter_map(|g| match &g.phase {
+                GatePhase::Paused(p) => Some(p.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Whether any of `client`'s threads is held by a gate.
+    pub fn client_paused(&self, client: ClientId) -> bool {
+        self.state()
+            .gates
+            .iter()
+            .any(|g| matches!(&g.phase, GatePhase::Paused(p) if p.client == client))
+    }
+
+    /// Whether `client` has a gate still Armed.
+    pub fn has_armed_gate(&self, client: ClientId) -> bool {
+        self.state()
+            .gates
+            .iter()
+            .any(|g| g.rule.client == client && matches!(g.phase, GatePhase::Armed { .. }))
+    }
+
+    /// Open every gate (Sim's Drop), so blocked threads can finish.
+    pub fn open_all_gates(&self) {
+        let mut st = self.state();
+        for g in &mut st.gates {
+            g.phase = GatePhase::Open;
+        }
+        self.shared.gate_cv.notify_all();
+    }
+
+    /// Count `op` against `client`'s armed gates; if one reaches its `nth`,
+    /// hold the calling thread (state lock released) until it is opened.
+    fn pass_gates<'a>(
+        &'a self,
+        mut st: MutexGuard<'a, State>,
+        client: ClientId,
+        observer: bool,
+        op: OpKind,
+        keys: &[&str],
+    ) -> MutexGuard<'a, State> {
+        if observer || st.gates.is_empty() {
+            return st;
+        }
+        let run = st.runs.get(&client).copied();
+        let at_step = st.step;
+        let mut held = None;
+        for g in &mut st.gates {
+            let GatePhase::Armed { count } = &mut g.phase else {
+                continue;
+            };
+            if g.rule.client != client
+                || !g.rule.op.matches(op)
+                || !keys.iter().any(|k| g.rule.key.matches(k))
+            {
+                continue;
+            }
+            *count += 1;
+            if *count < g.rule.nth {
+                continue;
+            }
+            if held.is_some() {
+                g.phase = GatePhase::Missed;
+                continue;
+            }
+            held = Some(g.id);
+            g.phase = GatePhase::Paused(Paused {
+                gate: g.id,
+                client,
+                run,
+                thread: thread_label(),
+                op,
+                key: keys.first().map(|k| k.to_string()).unwrap_or_default(),
+                at_step,
+            });
+        }
+        let Some(id) = held else {
+            return st;
+        };
+        self.shared.gate_cv.notify_all();
+        self.shared
+            .gate_cv
+            .wait_while(st, |s| gate_paused_in(s, id).is_some())
+            .unwrap()
     }
 
     /// One read-like op (no effect): `f` computes the result, its outcome
@@ -546,7 +769,8 @@ impl SimStore {
         key: &str,
         f: impl FnOnce(&BTreeMap<String, StoredObject>) -> (Result<T>, OpOutcome, Option<u64>),
     ) -> Result<T> {
-        let mut st = self.state();
+        let st = self.state();
+        let mut st = self.pass_gates(st, client, observer, op, &[key]);
         match st.verdict(client, observer, op, &[key]) {
             Verdict::Observer => f(&st.objects).0,
             Verdict::Crashed => {
@@ -585,7 +809,8 @@ impl SimStore {
         } else {
             vec![key]
         };
-        let mut st = self.state();
+        let st = self.state();
+        let mut st = self.pass_gates(st, client, observer, op, &match_keys);
         match st.verdict(client, observer, op, &match_keys) {
             Verdict::Observer => Err(observer_refusal()),
             Verdict::Crashed => {
@@ -644,6 +869,16 @@ impl SimStore {
             },
         }
     }
+}
+
+fn gate_paused_in(st: &State, id: GateId) -> Option<Paused> {
+    st.gates
+        .iter()
+        .find(|g| g.id == id)
+        .and_then(|g| match &g.phase {
+            GatePhase::Paused(p) => Some(p.clone()),
+            _ => None,
+        })
 }
 
 /// One client's view of the store.
@@ -863,6 +1098,7 @@ impl StagedPut for SimStagedPut {
 mod tests {
     use super::*;
     use crate::sim::fault::{KeyMatch, OpMatch};
+    use crate::sim::gate::GateRule;
     use vykar_storage::StorageBackend;
 
     fn two_clients(config: SimConfig) -> (SimStore, SimClient, SimClient) {
@@ -1302,9 +1538,9 @@ mod tests {
     #[test]
     fn op_log_fields() {
         let (store, a, b) = two_clients(SimConfig::default());
-        store.set_current_run(Some(7));
+        store.set_current_run(a.client(), Some(7));
         a.put("k", b"abc").unwrap();
-        store.set_current_run(None);
+        store.set_current_run(a.client(), None);
         b.get("k").unwrap();
         b.get_range("k", 0, 2).unwrap();
         let log = store.log();
@@ -1334,5 +1570,132 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+
+    const WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    fn put_gate(store: &SimStore, client: ClientId, key: KeyMatch) -> GateId {
+        store
+            .add_gate(GateRule::new(client, OpMatch::AnyWrite, key))
+            .unwrap()
+    }
+
+    #[test]
+    fn gate_holds_op_before_it_applies() {
+        let (store, a, b) = two_clients(SimConfig::default());
+        let gate = put_gate(&store, a.client(), KeyMatch::Exact("k".into()));
+        let handle = std::thread::spawn({
+            let a = a.clone();
+            move || a.put("k", b"v")
+        });
+        let held = store.wait_gate(gate, WAIT).expect("gate reached");
+        assert_eq!(
+            (held.op, held.key.as_str(), held.client),
+            (OpKind::Put, "k", a.client())
+        );
+        let step = store.step();
+        assert!(store.object("k").is_none());
+        assert!(store.log().iter().all(|r| r.key != "k"));
+        assert_eq!(step, held.at_step);
+        b.put("j", b"w").unwrap();
+        assert_eq!(store.step(), step + 1);
+        store.resume_gate(gate).unwrap();
+        handle.join().unwrap().unwrap();
+        assert!(store.object("k").is_some());
+        assert_eq!(last(&store).key, "k");
+        assert!(store.gate_paused(gate).is_none());
+    }
+
+    #[test]
+    fn gate_counts_from_creation_and_fires_once() {
+        let (store, a, _) = two_clients(SimConfig::default());
+        a.put("x", b"0").unwrap();
+        let gate = store
+            .add_gate(
+                GateRule::new(a.client(), OpMatch::AnyWrite, KeyMatch::Prefix("x".into())).nth(2),
+            )
+            .unwrap();
+        a.put("x1", b"1").unwrap();
+        let handle = std::thread::spawn({
+            let a = a.clone();
+            move || a.put("x2", b"2")
+        });
+        assert_eq!(store.wait_gate(gate, WAIT).expect("held").key, "x2");
+        store.resume_gate(gate).unwrap();
+        handle.join().unwrap().unwrap();
+        a.put("x3", b"3").unwrap();
+        assert!(store.paused().is_empty());
+    }
+
+    #[test]
+    fn resume_before_reached_disarms() {
+        let (store, a, _) = two_clients(SimConfig::default());
+        let gate = put_gate(&store, a.client(), KeyMatch::Any);
+        assert!(store.has_armed_gate(a.client()));
+        store.resume_gate(gate).unwrap();
+        assert!(!store.has_armed_gate(a.client()));
+        a.put("k", b"v").unwrap();
+        assert!(store.resume_gate(gate).is_err());
+        assert!(store.wait_gate(gate, WAIT).is_none());
+    }
+
+    #[test]
+    fn crash_while_held_fails_on_resume() {
+        let (store, a, _) = two_clients(SimConfig::default());
+        let gate = put_gate(&store, a.client(), KeyMatch::Exact("k".into()));
+        let handle = std::thread::spawn({
+            let a = a.clone();
+            move || a.put("k", b"v")
+        });
+        store.wait_gate(gate, WAIT).expect("held");
+        assert!(store.client_paused(a.client()));
+        store.crash(a.client());
+        store.resume_gate(gate).unwrap();
+        let err = handle.join().unwrap().unwrap_err().to_string();
+        assert!(err.contains("crashed"), "{err}");
+        assert_eq!(last(&store).outcome, OpOutcome::Crashed);
+        assert!(store.object("k").is_none());
+    }
+
+    #[test]
+    fn gates_ignore_observer_and_other_clients() {
+        let (store, a, b) = two_clients(SimConfig::default());
+        b.put("k", b"v").unwrap();
+        let gate = store
+            .add_gate(GateRule::new(a.client(), OpMatch::Any, KeyMatch::Any))
+            .unwrap();
+        b.put("k", b"w").unwrap();
+        b.get("k").unwrap();
+        store.observer().get("k").unwrap();
+        assert!(store.gate_armed(gate));
+        assert!(store.paused().is_empty());
+        assert!(
+            store
+                .add_gate(GateRule::new(OBSERVER, OpMatch::Any, KeyMatch::Any))
+                .is_err()
+        );
+        assert!(
+            store
+                .add_gate(GateRule::new(a.client(), OpMatch::Any, KeyMatch::Any).nth(0))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn fork_is_independent() {
+        let (store, a, _) = two_clients(SimConfig::default());
+        a.put("k", b"v").unwrap();
+        store.advance_clock(std::time::Duration::from_secs(5));
+        let fork = store.fork();
+        assert!(fork.log().is_empty());
+        assert_eq!(fork.now(), store.now());
+        assert_eq!(fork.step(), store.step());
+        assert_eq!(fork.client_name(a.client()), "a");
+        let fa = fork.handle(a.client());
+        fa.put("only-fork", b"x").unwrap();
+        fa.delete("k").unwrap();
+        assert!(store.object("only-fork").is_none());
+        assert!(store.object("k").is_some());
+        assert_eq!(fork.keys(""), vec!["only-fork"]);
     }
 }

@@ -159,6 +159,9 @@ impl Observation {
     }
 }
 
+/// `runs` is in run-index order and `observations` in step order. A spawned
+/// run is recorded when it is joined, so while runs are in flight `runs`
+/// can have gaps.
 #[derive(Clone, Debug, Default)]
 pub struct History {
     pub runs: Vec<RunRecord>,

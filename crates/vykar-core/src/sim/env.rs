@@ -21,12 +21,14 @@ use crate::repo::host_env::{Clock, HostIdentity, StopSignal, Waker};
 /// How [`SimClock::sleep`] behaves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TimeMode {
-    /// `sleep(d)` advances the shared time by `d` and returns at once. For
-    /// the sequential runner, where one client runs at a time: with clients
-    /// running concurrently one client's backoff would age another's
-    /// markers, so concurrent scenarios use [`TimeMode::Manual`].
+    /// `sleep(d)` advances the shared time by `d` and returns at once.
+    /// Correct while at most one client is runnable: with two runnable
+    /// clients one client's backoff would age the other's markers. The
+    /// runner keeps that rule for spawned runs too (every other run in
+    /// flight is held at a gate), so its scripted scenarios use Auto.
     Auto,
-    /// Sleepers block until someone calls [`SimTime::advance`].
+    /// Sleepers block until someone calls [`SimTime::advance`]. For a
+    /// scenario with two clients that sleep at once.
     Manual,
 }
 
@@ -71,7 +73,8 @@ impl TimeState {
 
 /// Virtual time shared by every client of one simulation.
 ///
-/// [`TimeMode::Auto`] is for the sequential runner only (see its doc).
+/// [`TimeMode::Auto`] holds only while one client at a time is runnable
+/// (see its doc).
 /// [`SimClock::wait_timeout`] never advances time in either mode.
 pub struct SimTime {
     state: Mutex<TimeState>,

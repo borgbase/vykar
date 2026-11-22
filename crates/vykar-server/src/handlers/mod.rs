@@ -21,7 +21,11 @@ pub(crate) const MAX_OBJECT_BODY_BYTES: usize = 512 * 1024 * 1024; // 512 MiB
 /// Body limit for admin JSON requests (POST /?repack, verify-packs, etc.).
 /// Sized so the verify-packs byte-volume cap (`MAX_VERIFY_BYTES`) is always the
 /// binding constraint, even with very small chunk sizes (~4 KiB → ~24 MiB JSON).
-const MAX_ADMIN_BODY_BYTES: usize = 64 * 1024 * 1024; // 64 MiB
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "64 MiB fits usize on every supported target"
+)]
+const MAX_ADMIN_BODY_BYTES: usize = vykar_protocol::MAX_ADMIN_BODY_BYTES as usize; // 64 MiB
 
 pub fn router(state: AppState) -> Router {
     // Admin routes — small body limit for JSON payloads, plus a concurrency

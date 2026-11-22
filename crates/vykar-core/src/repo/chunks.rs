@@ -9,7 +9,6 @@ use super::write_session::{active_mut, duration_nanos};
 use crate::compress;
 use crate::index::PendingChunkEntry;
 use crate::index::table::DedupPrefilter;
-use vykar_protocol::PACK_HEADER_SIZE;
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
 
@@ -277,20 +276,20 @@ impl Repository {
         self.cap_pending_uploads(incoming)?;
         let cap_wait = cap_start.elapsed();
 
+        let crypto = Arc::clone(&self.crypto);
         let ws = active_mut(&mut self.write_session);
         let seal_start = Instant::now();
         let SealedPack {
             pack_id,
             entries,
             data,
+            len: pack_bytes,
         } = match pack_type {
-            PackType::Data => ws.data_pack_writer.seal()?,
-            PackType::Tree => ws.tree_pack_writer.seal()?,
+            PackType::Data => ws.data_pack_writer.seal(crypto.as_ref())?,
+            PackType::Tree => ws.tree_pack_writer.seal(crypto.as_ref())?,
         };
         let seal_time = seal_start.elapsed();
 
-        let pack_bytes =
-            PACK_HEADER_SIZE as u64 + entries.iter().map(|e| 4 + u64::from(e.1)).sum::<u64>();
         let counters = &mut ws.metrics.counters;
         counters.upload_cap_wait += cap_wait;
         counters.seal += seal_time;

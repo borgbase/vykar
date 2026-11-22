@@ -635,8 +635,8 @@ pub enum ServerOp {
     /// [`ServerOps::repack`].
     Repack,
     /// [`ServerOps::repack`] of a plan whose operations carry a
-    /// [`vykar_protocol::RepackOperationRequest::trailer`]. Nothing in vykar
-    /// sends one yet (05-index-gc-format.md step 4).
+    /// [`vykar_protocol::RepackOperationRequest::trailer`]. Compact sends one
+    /// with every repacked pack and repacks on the client without it.
     RepackTrailer,
     /// [`ServerOps::object_sizes`].
     ObjectSizes,

@@ -27,6 +27,8 @@ pub enum ObjectType {
     IndexBase = 10,
     /// Segmented index segment under `index.d/`.
     IndexSegment = 11,
+    /// Pack trailer: the last framed blob of a pack, listing its blobs.
+    PackTrailer = 12,
 }
 
 impl ObjectType {
@@ -44,6 +46,7 @@ impl ObjectType {
             9 => Ok(Self::IndexHead),
             10 => Ok(Self::IndexBase),
             11 => Ok(Self::IndexSegment),
+            12 => Ok(Self::PackTrailer),
             _ => Err(VykarError::UnknownObjectType(v)),
         }
     }

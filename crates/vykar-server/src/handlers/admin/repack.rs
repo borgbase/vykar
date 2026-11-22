@@ -2,16 +2,14 @@ use axum::response::{IntoResponse, Response};
 use vykar_types::hash::Hasher256;
 
 use vykar_protocol::{
-    MAX_REPACK_TRAILER_BYTES, PACK_HEADER_SIZE, PACK_MAGIC, PACK_VERSION_CURRENT,
-    RepackOperationResult, RepackPlanRequest, RepackResultResponse, check_protocol_version,
-    is_valid_pack_key, repack_op_output_size, validate_blob_ref,
+    MAX_KEEP_BLOBS_PER_OP, MAX_REPACK_OPS, MAX_REPACK_TRAILER_BYTES, PACK_HEADER_SIZE, PACK_MAGIC,
+    PACK_VERSION_CURRENT, RepackOperationResult, RepackPlanRequest, RepackResultResponse,
+    check_protocol_version, is_valid_pack_key, repack_op_output_size, validate_blob_ref,
 };
 
 use crate::error::ServerError;
 use crate::state::{AppState, QuotaReservation};
 
-const MAX_REPACK_OPS: usize = 10_000;
-const MAX_KEEP_BLOBS_PER_OP: usize = 200_000;
 /// Maximum total output bytes a single repack plan may produce. Shared with the
 /// client (which chunks larger plans) via `vykar_protocol`.
 const MAX_REPACK_BYTES: u64 = vykar_protocol::MAX_REPACK_OUTPUT_BYTES;

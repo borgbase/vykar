@@ -33,6 +33,11 @@ path = "fuzz_targets/fuzz_pack_scan.rs"
 doc = false
 
 [[bin]]
+name = "fuzz_pack_trailer"
+path = "fuzz_targets/fuzz_pack_trailer.rs"
+doc = false
+
+[[bin]]
 name = "fuzz_decompress"
 path = "fuzz_targets/fuzz_decompress.rs"
 doc = false

@@ -48,6 +48,12 @@ fuzz_target!(|data: &[u8]| {
         CONTEXT_INDEX_SEGMENT,
         &engine,
     );
+    let _ = vykar_core::repo::format::unpack_object_expect_with_context(
+        data,
+        vykar_core::repo::format::ObjectType::PackTrailer,
+        vykar_core::repo::pack_trailer::TRAILER_CONTEXT,
+        &engine,
+    );
     let mut buf = data.to_vec();
     let _ = vykar_core::repo::format::unpack_object_expect_with_context_in_place(
         &mut buf,

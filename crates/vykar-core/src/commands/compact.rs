@@ -10,10 +10,17 @@ use crate::config::VykarConfig;
 use crate::repo::OpenOptions;
 use crate::repo::Repository;
 use crate::repo::control::CancelToken;
-use crate::repo::pack::{PackType, PackWriter};
+use crate::repo::pack::PackWriter;
+use crate::repo::pack_trailer::{
+    PackTrailer, TRAILER_FOOTER_LEN, TrailerPackType, framed_offsets, parse_footer,
+    trailer_blob_len, trailer_frame_start,
+};
+use vykar_crypto::CryptoEngine;
 use vykar_protocol::{
-    MAX_REPACK_OUTPUT_BYTES, PACK_HEADER_SIZE, RepackBlobRef, RepackOperationRequest,
-    RepackPlanRequest, repack_op_output_size, validate_pack_header,
+    MAX_KEEP_BLOBS_PER_OP, MAX_REPACK_OPS, MAX_REPACK_OUTPUT_BYTES, MAX_REPACK_PLAN_JSON_BYTES,
+    MAX_REPACK_TRAILER_BYTES, PACK_HEADER_SIZE, RepackBlobRef, RepackOperationRequest,
+    RepackPlanRequest, repack_op_json_bound, repack_op_output_size, repack_trailer_json_len,
+    validate_pack_header,
 };
 use vykar_storage::{ServerOp, StorageBackend};
 use vykar_types::chunk_id::ChunkId;
@@ -147,6 +154,11 @@ fn compact_packs(
     let mut stats = CompactStats::default();
 
     // Phase 1: Analyze live/dead space using the chunk index + pack sizes.
+    // The index does not record a pack's trailer, so a candidate's trailer
+    // frame is found from its 12-byte footer and counted as overhead, not as
+    // dead bytes: otherwise every repack of a small pack would leave a new
+    // trailer of the same relative size, and the next compact would repack
+    // it again.
     //
     // Build a per-pack lookup from the chunk index:
     //   pack_id → Vec<(chunk_id, stored_size, pack_offset)>
@@ -226,7 +238,7 @@ fn compact_packs(
             }
 
             let payload = pack_size - pack_header_size;
-            let dead_bytes = payload - live_bytes;
+            let mut dead_bytes = payload - live_bytes;
 
             blobs_live.fetch_add(entries.len() as u64, Ordering::Relaxed);
 
@@ -234,17 +246,11 @@ fn compact_packs(
                 return;
             }
 
-            #[allow(
-                clippy::cast_precision_loss,
-                reason = "ratio for display, precision loss acceptable"
-            )]
-            let unused_ratio = if payload > 0 {
-                (dead_bytes as f64 / payload as f64) * 100.0
-            } else {
-                0.0
-            };
-
-            if unused_ratio >= threshold {
+            if unused_percent(dead_bytes, payload) >= threshold {
+                dead_bytes -= trailer_overhead(storage, key, pack_size, dead_bytes);
+                if dead_bytes == 0 || unused_percent(dead_bytes, payload) < threshold {
+                    return;
+                }
                 let mut live_entries: Vec<LiveEntry> = entries
                     .iter()
                     .map(|(chunk_id, stored_size, pack_offset)| LiveEntry {
@@ -404,7 +410,7 @@ fn compact_packs(
             continue;
         }
 
-        let mut writer = PackWriter::new(PackType::Data, pack_target, repo.content_hash());
+        let mut writer = PackWriter::new_repack(pack_target, repo.content_hash());
 
         for entry in &analysis.live_entries {
             // Read the 4-byte length prefix together with the blob data in a
@@ -451,7 +457,8 @@ fn compact_packs(
             writer.add_blob(entry.chunk_id, blob_data)?;
         }
 
-        let (new_pack_id, new_entries) = writer.flush(repo.storage.as_ref())?;
+        let (new_pack_id, new_entries) =
+            writer.flush(repo.storage.as_ref(), repo.crypto.as_ref())?;
 
         for (chunk_id, stored_size, offset, _refcount) in &new_entries {
             repo.chunk_index_mut()
@@ -598,6 +605,53 @@ fn parallel_list_packs(
         .expect("compact list-pack results lock not poisoned"))
 }
 
+/// Dead bytes as a percentage of `payload` (0 for an empty payload).
+fn unused_percent(dead_bytes: u64, payload: u64) -> f64 {
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "ratio for a threshold, precision loss acceptable"
+    )]
+    if payload > 0 {
+        (dead_bytes as f64 / payload as f64) * 100.0
+    } else {
+        0.0
+    }
+}
+
+/// Bytes of the trailer frame of the pack at `key`, from its last 12 bytes,
+/// when they are a trailer footer whose frame fits inside `dead_bytes` and
+/// after the header. 0 otherwise, also on a failed read: the trailer then
+/// counts as dead, which only makes the pack more likely to be repacked.
+fn trailer_overhead(
+    storage: &dyn StorageBackend,
+    key: &str,
+    pack_size: u64,
+    dead_bytes: u64,
+) -> u64 {
+    let Some(start) = pack_size.checked_sub(TRAILER_FOOTER_LEN as u64) else {
+        return 0;
+    };
+    let footer = match storage.get_range(key, start, TRAILER_FOOTER_LEN as u64) {
+        Ok(Some(footer)) => footer,
+        Ok(None) => return 0,
+        Err(e) => {
+            tracing::debug!("compact: reading the trailer footer of {key} failed: {e}");
+            return 0;
+        }
+    };
+    let Some(len) = parse_footer(&footer) else {
+        return 0;
+    };
+    let frame = 4 + u64::from(len);
+    if footer.len() != TRAILER_FOOTER_LEN
+        || frame > dead_bytes
+        || trailer_frame_start(pack_size, len).is_none()
+    {
+        return 0;
+    }
+    frame
+}
+
 fn select_analyses_by_cap(
     analyses: &[PackAnalysis],
     max_repack_size: Option<u64>,
@@ -629,10 +683,10 @@ fn try_server_side_repack(
 
     // A server that does not advertise `repack` (one older than the field, or
     // a failed `/health` probe) and a backend with no server behind it get a
-    // client-side repack. A plan carrying pack trailers (05-index-gc-format.md
-    // step 4) needs `ServerOp::RepackTrailer` instead; the REST backend
-    // refuses such a plan without it. The clone lets `server` outlive the
-    // `&mut repo` borrows below.
+    // client-side repack. So does a server without `repack_trailer`: every
+    // operation here carries the output pack's trailer, which such a server
+    // would refuse (0.8 to 0.24) or that the REST backend refuses to send.
+    // The clone lets `server` outlive the `&mut repo` borrows below.
     let storage = Arc::clone(&repo.storage);
     let Some(server) = storage.server_ops() else {
         return Ok(false);
@@ -644,58 +698,52 @@ fn try_server_side_repack(
         );
         return Ok(false);
     }
-
-    let analysis_by_key: HashMap<&str, &PackAnalysis> = analyses
-        .iter()
-        .map(|analysis| (analysis.storage_key.as_str(), *analysis))
-        .collect();
+    if !server.offers(ServerOp::RepackTrailer) {
+        warn!(
+            "compact: the server does not advertise repack_trailer (a vykar-server \
+             that would drop pack trailers); repacking on the client"
+        );
+        return Ok(false);
+    }
 
     // The server never deletes: sources are removed below, after the index
     // pointing at their replacements is persisted. A lost or timed-out
     // response therefore leaves only unreferenced new packs behind.
-    let mut operations = Vec::with_capacity(analyses.len());
-    for analysis in analyses {
-        operations.push(RepackOperationRequest {
-            source_pack: analysis.storage_key.clone(),
-            keep_blobs: analysis
-                .live_entries
-                .iter()
-                .map(|entry| RepackBlobRef {
-                    offset: entry.offset,
-                    length: entry.length as u64,
-                })
-                .collect(),
-            delete_after: false,
-            // Pack trailers come with 05-index-gc-format.md step 4; until then
-            // no plan carries one, so the `repack` gate above is enough.
-            trailer: None,
-        });
-    }
-
-    // A single operation over the server's output cap cannot be split further
-    // (one source pack = one op) and would be rejected with 400, so fall back
-    // to client-side repack instead of sending a doomed plan. Pack size limits
-    // keep this from happening in practice.
-    if operations
+    let encrypting = repo.crypto.is_encrypting();
+    let operations: Vec<PlannedOp<'_>> = analyses
         .iter()
-        .any(|op| repack_op_output_size(op) > MAX_REPACK_OUTPUT_BYTES)
-    {
+        .map(|analysis| PlannedOp::new(analysis, encrypting))
+        .collect();
+
+    // A single operation over one of the server's caps cannot be split
+    // further (one source pack = one op) and would be rejected with 400, so
+    // fall back to client-side repack instead of sending a doomed plan. Pack
+    // size limits keep this from happening in practice.
+    if operations.iter().any(PlannedOp::exceeds_server_caps) {
         return Ok(false);
     }
 
     // Send one server repack call per batch (batches stay within the server's
-    // output cap; client and server agree via MAX_REPACK_OUTPUT_BYTES). Each
-    // batch is applied, persisted, and only then are its sources deleted, so a
-    // crash at any point leaves the index consistent.
+    // output, body and operation caps; client and server share the
+    // constants). Each batch is applied, persisted, and only then are its
+    // sources deleted, so a crash at any point leaves the index consistent.
     // Packs returned as some op's new pack carry live data and must never be
     // deleted as a source (the server may return the source itself).
     let mut result_packs: HashSet<String> = HashSet::new();
 
     for batch in chunk_repack_operations(operations) {
-        // The constructor derives `protocol_version` from the algorithm, so an
-        // old server rejects a BLAKE3 plan outright instead of verifying the
-        // packs under the wrong algorithm.
-        let plan = RepackPlanRequest::new(batch, repo.content_hash());
+        // Trailers are built per batch, so a large selection never holds all
+        // of them at once.
+        let mut batch_analyses: Vec<&PackAnalysis> = Vec::with_capacity(batch.len());
+        let mut requests = Vec::with_capacity(batch.len());
+        for op in batch {
+            batch_analyses.push(op.analysis);
+            requests.push(op.into_request(repo.crypto.as_ref())?);
+        }
+        // The constructor derives `protocol_version` from the algorithm and
+        // the trailers, so an old server rejects a BLAKE3 or trailer plan
+        // outright instead of verifying the packs under the wrong algorithm.
+        let plan = RepackPlanRequest::new(requests, repo.content_hash());
         let response = server.repack(&plan)?;
 
         result_packs.extend(
@@ -713,7 +761,7 @@ fn try_server_side_repack(
 
         let mut applied: Vec<&PackAnalysis> = Vec::with_capacity(plan.operations.len());
         let mut batch_err: Option<VykarError> = None;
-        for op in &plan.operations {
+        for (op, analysis) in plan.operations.iter().zip(batch_analyses) {
             let Some(result) = completed_by_source.remove(&op.source_pack) else {
                 batch_err = Some(VykarError::Other(format!(
                     "server repack response missing operation for {}",
@@ -721,9 +769,6 @@ fn try_server_side_repack(
                 )));
                 break;
             };
-            let analysis = analysis_by_key
-                .get(op.source_pack.as_str())
-                .expect("operation was built from these analyses");
             if let Err(err) = apply_repack_result(repo, analysis, &result, stats) {
                 batch_err = Some(err);
                 break;
@@ -842,6 +887,18 @@ fn apply_repack_result(
         )));
     }
 
+    // The trailer sent with the operation describes this layout; a pack
+    // whose blobs sit elsewhere would contradict its own trailer.
+    let expected: Vec<u64> =
+        framed_offsets(analysis.live_entries.iter().map(|e| e.length)).collect();
+    if result.new_offsets != expected {
+        return Err(VykarError::Other(format!(
+            "server repack offsets for {} differ from the layout its trailer describes: \
+             expected {expected:?}, got {:?}",
+            analysis.storage_key, result.new_offsets
+        )));
+    }
+
     for (entry, new_offset) in analysis.live_entries.iter().zip(result.new_offsets.iter()) {
         repo.chunk_index_mut().update_location(
             &entry.chunk_id,
@@ -855,23 +912,122 @@ fn apply_repack_result(
     Ok(())
 }
 
-/// Split repack operations into batches whose summed output stays within
-/// [`MAX_REPACK_OUTPUT_BYTES`]. A single operation over the cap is caught
-/// before batching (client-side repack fallback in `try_server_side_repack`),
-/// so every batch produced here is within the server's limit.
-fn chunk_repack_operations(
-    operations: Vec<RepackOperationRequest>,
-) -> Vec<Vec<RepackOperationRequest>> {
+/// One server repack operation before its trailer is attached.
+struct PlannedOp<'a> {
+    analysis: &'a PackAnalysis,
+    /// `trailer: None` until the batch is sent.
+    request: RepackOperationRequest,
+    /// Exact trailer length; 0 for a delete-only operation (no trailer).
+    trailer_len: u64,
+}
+
+impl<'a> PlannedOp<'a> {
+    fn new(analysis: &'a PackAnalysis, encrypting: bool) -> Self {
+        let live = &analysis.live_entries;
+        let trailer_len = if live.is_empty() {
+            0
+        } else {
+            trailer_blob_len(live.len(), encrypting) as u64
+        };
+        Self {
+            analysis,
+            request: RepackOperationRequest {
+                source_pack: analysis.storage_key.clone(),
+                keep_blobs: live
+                    .iter()
+                    .map(|entry| RepackBlobRef {
+                        offset: entry.offset,
+                        length: u64::from(entry.length),
+                    })
+                    .collect(),
+                delete_after: false,
+                trailer: None,
+            },
+            trailer_len,
+        }
+    }
+
+    /// `repack_op_output_size` of the request once its trailer is attached.
+    fn output_size(&self) -> u64 {
+        let size = repack_op_output_size(&self.request);
+        if self.trailer_len > 0 {
+            size.saturating_add(4).saturating_add(self.trailer_len)
+        } else {
+            size
+        }
+    }
+
+    /// `repack_op_json_bound` of the request once its trailer is attached.
+    fn json_bound(&self) -> u64 {
+        let bound = repack_op_json_bound(&self.request);
+        if self.trailer_len > 0 {
+            bound.saturating_add(repack_trailer_json_len(self.trailer_len))
+        } else {
+            bound
+        }
+    }
+
+    /// Whether the server would refuse this operation even alone in a plan.
+    fn exceeds_server_caps(&self) -> bool {
+        self.output_size() > MAX_REPACK_OUTPUT_BYTES
+            || self.trailer_len > MAX_REPACK_TRAILER_BYTES
+            || self.json_bound() > MAX_REPACK_PLAN_JSON_BYTES
+            || self.request.keep_blobs.len() > MAX_KEEP_BLOBS_PER_OP
+    }
+
+    /// The request with its trailer: the live blobs at the offsets the server
+    /// writes them to ([`framed_offsets`]), encrypted with `crypto`.
+    fn into_request(self, crypto: &dyn CryptoEngine) -> Result<RepackOperationRequest> {
+        let mut request = self.request;
+        if self.trailer_len == 0 {
+            return Ok(request);
+        }
+        let trailer = PackTrailer::for_blobs(
+            TrailerPackType::Repacked,
+            self.analysis
+                .live_entries
+                .iter()
+                .map(|e| (e.chunk_id, e.length)),
+        )?;
+        let blob = trailer.seal_blob(crypto)?;
+        if blob.len() as u64 != self.trailer_len {
+            return Err(VykarError::Other(format!(
+                "pack trailer for {} is {} bytes, its estimate {}",
+                request.source_pack,
+                blob.len(),
+                self.trailer_len
+            )));
+        }
+        request.trailer = Some(blob);
+        Ok(request)
+    }
+}
+
+/// Split planned operations into batches whose summed output stays within
+/// [`MAX_REPACK_OUTPUT_BYTES`], whose summed JSON bound stays within
+/// [`MAX_REPACK_PLAN_JSON_BYTES`], and that hold at most [`MAX_REPACK_OPS`]
+/// operations. A single operation over a cap is caught before batching
+/// (client-side repack fallback in `try_server_side_repack`), so every batch
+/// produced here is within the server's limits.
+fn chunk_repack_operations(operations: Vec<PlannedOp<'_>>) -> Vec<Vec<PlannedOp<'_>>> {
     let mut batches = Vec::new();
     let mut current = Vec::new();
     let mut current_size = 0u64;
+    let mut current_json = 0u64;
     for op in operations {
-        let size = repack_op_output_size(&op);
-        if !current.is_empty() && current_size.saturating_add(size) > MAX_REPACK_OUTPUT_BYTES {
+        let size = op.output_size();
+        let json = op.json_bound();
+        if !current.is_empty()
+            && (current_size.saturating_add(size) > MAX_REPACK_OUTPUT_BYTES
+                || current_json.saturating_add(json) > MAX_REPACK_PLAN_JSON_BYTES
+                || current.len() >= MAX_REPACK_OPS)
+        {
             batches.push(std::mem::take(&mut current));
             current_size = 0;
+            current_json = 0;
         }
         current_size = current_size.saturating_add(size);
+        current_json = current_json.saturating_add(json);
         current.push(op);
     }
     if !current.is_empty() {
@@ -911,18 +1067,34 @@ mod listing_tests {
 
 #[cfg(test)]
 mod repack_chunk_tests {
-    use super::chunk_repack_operations;
+    use super::{LiveEntry, PackAnalysis, PlannedOp, chunk_repack_operations};
+    use crate::repo::pack_trailer::trailer_blob_len;
     use vykar_protocol::{
-        MAX_REPACK_OUTPUT_BYTES, RepackBlobRef, RepackOperationRequest, repack_op_output_size,
+        MAX_REPACK_OPS, MAX_REPACK_OUTPUT_BYTES, MAX_REPACK_PLAN_JSON_BYTES,
+        repack_trailer_json_len,
     };
+    use vykar_types::chunk_id::ChunkId;
+    use vykar_types::pack_id::PackId;
 
-    fn op_with_blob(length: u64) -> RepackOperationRequest {
-        RepackOperationRequest {
-            source_pack: format!("packs/ab/{}", "ab".repeat(32)),
-            keep_blobs: vec![RepackBlobRef { offset: 13, length }],
-            delete_after: false,
-            trailer: None,
+    /// A pack analysis keeping `blobs` live blobs of `length` bytes each.
+    fn analysis(blobs: usize, length: u32) -> PackAnalysis {
+        PackAnalysis {
+            pack_id: PackId::from_bytes([0xab; 32]),
+            storage_key: format!("packs/ab/{}", "ab".repeat(32)),
+            live_entries: (0..blobs)
+                .map(|i| LiveEntry {
+                    chunk_id: ChunkId::from_bytes([i as u8; 32]),
+                    offset: 13 + i as u64 * (4 + u64::from(length)),
+                    length,
+                })
+                .collect(),
+            total_bytes: 0,
+            dead_bytes: 0,
         }
+    }
+
+    fn planned(analyses: &[PackAnalysis]) -> Vec<PlannedOp<'_>> {
+        analyses.iter().map(|a| PlannedOp::new(a, true)).collect()
     }
 
     #[test]
@@ -932,8 +1104,8 @@ mod repack_chunk_tests {
 
     #[test]
     fn small_ops_stay_in_one_batch() {
-        let ops = vec![op_with_blob(100), op_with_blob(200), op_with_blob(300)];
-        let batches = chunk_repack_operations(ops);
+        let analyses = [analysis(1, 100), analysis(1, 200), analysis(1, 300)];
+        let batches = chunk_repack_operations(planned(&analyses));
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].len(), 3);
     }
@@ -941,28 +1113,109 @@ mod repack_chunk_tests {
     #[test]
     fn ops_straddling_cap_split_into_batches() {
         // Two ops each just over half the cap must not share a batch.
-        let half_plus = MAX_REPACK_OUTPUT_BYTES / 2 + 1;
-        let ops = vec![op_with_blob(half_plus), op_with_blob(half_plus)];
-        let batches = chunk_repack_operations(ops);
+        let half_plus = (MAX_REPACK_OUTPUT_BYTES / 2 + 1) as u32;
+        let analyses = [analysis(1, half_plus), analysis(1, half_plus)];
+        let batches = chunk_repack_operations(planned(&analyses));
         assert_eq!(
             batches.len(),
             2,
             "each op exceeds half the cap -> own batch"
         );
         for batch in &batches {
-            let total: u64 = batch.iter().map(repack_op_output_size).sum();
+            let total: u64 = batch.iter().map(PlannedOp::output_size).sum();
             assert!(total <= MAX_REPACK_OUTPUT_BYTES, "batch within cap");
         }
     }
 
     #[test]
     fn single_oversize_op_is_its_own_batch() {
-        let ops = vec![
-            op_with_blob(10),
-            op_with_blob(MAX_REPACK_OUTPUT_BYTES + 1),
-            op_with_blob(10),
+        let analyses = [
+            analysis(1, 10),
+            analysis(2, (MAX_REPACK_OUTPUT_BYTES / 2) as u32),
+            analysis(1, 10),
         ];
+        let ops = planned(&analyses);
+        assert!(ops[1].exceeds_server_caps());
         let batches = chunk_repack_operations(ops);
         assert_eq!(batches.len(), 3, "oversize op isolates the ops around it");
+    }
+
+    /// Two ops just under half the output cap without their trailers, but
+    /// over it with them, are split.
+    #[test]
+    fn output_budget_counts_trailers() {
+        let blobs = 1000usize;
+        let trailer_frame = 4 + trailer_blob_len(blobs, true) as u64;
+        let pack_overhead = 9 + 4 * blobs as u64;
+        // Payload per op so that 2 * (overhead + payload) == cap - 2.
+        let payload = MAX_REPACK_OUTPUT_BYTES / 2 - 1 - pack_overhead;
+        let length = (payload / blobs as u64) as u32;
+        let analyses = [analysis(blobs, length), analysis(blobs, length)];
+        let ops = planned(&analyses);
+        let without: u64 = ops
+            .iter()
+            .map(|op| vykar_protocol::repack_op_output_size(&op.request))
+            .sum();
+        assert!(without <= MAX_REPACK_OUTPUT_BYTES, "{without}");
+        assert!(without + 2 * trailer_frame > MAX_REPACK_OUTPUT_BYTES);
+        assert_eq!(
+            ops[0].output_size(),
+            vykar_protocol::repack_op_output_size(&ops[0].request) + trailer_frame
+        );
+        assert_eq!(chunk_repack_operations(ops).len(), 2);
+    }
+
+    /// Ops whose JSON bounds sum past the plan budget are split, and every
+    /// batch is within both caps.
+    #[test]
+    fn json_budget_splits_batches() {
+        // ~64 + 82 JSON bytes per blob (with the trailer's hex): 100 000
+        // blobs bound ~14 MiB per op, so five ops cannot share a plan.
+        let analyses: Vec<PackAnalysis> = (0..5).map(|_| analysis(100_000, 1)).collect();
+        let ops = planned(&analyses);
+        let per_op = ops[0].json_bound();
+        assert!(per_op > 100_000 * 64 + repack_trailer_json_len(0));
+        assert!(5 * per_op > MAX_REPACK_PLAN_JSON_BYTES);
+        let batches = chunk_repack_operations(ops);
+        assert!(batches.len() >= 2, "{}", batches.len());
+        for batch in &batches {
+            let json: u64 = batch.iter().map(PlannedOp::json_bound).sum();
+            let out: u64 = batch.iter().map(PlannedOp::output_size).sum();
+            assert!(json <= MAX_REPACK_PLAN_JSON_BYTES, "{json}");
+            assert!(out <= MAX_REPACK_OUTPUT_BYTES, "{out}");
+        }
+    }
+
+    /// No batch holds more operations than the server accepts in one plan.
+    #[test]
+    fn op_count_cap_splits_batches() {
+        let analyses: Vec<PackAnalysis> = (0..MAX_REPACK_OPS + 1).map(|_| analysis(0, 0)).collect();
+        let batches = chunk_repack_operations(planned(&analyses));
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].len(), MAX_REPACK_OPS);
+        assert_eq!(batches[1].len(), 1);
+    }
+
+    /// A delete-only operation carries no trailer and costs no output.
+    #[test]
+    fn delete_only_op_has_no_trailer() {
+        let empty = analysis(0, 0);
+        let op = PlannedOp::new(&empty, true);
+        assert_eq!(op.trailer_len, 0);
+        assert_eq!(op.output_size(), 0);
+        let engine = vykar_crypto::PlaintextEngine::new(crate::testutil::test_chunk_hasher());
+        assert!(op.into_request(&engine).unwrap().trailer.is_none());
+    }
+
+    /// The trailer attached to an operation has the predicted length under
+    /// either engine kind, and an engine of the other kind is refused.
+    #[test]
+    fn attached_trailer_matches_its_estimate() {
+        let a = analysis(3, 50);
+        let plain = vykar_crypto::PlaintextEngine::new(crate::testutil::test_chunk_hasher());
+        let request = PlannedOp::new(&a, false).into_request(&plain).unwrap();
+        assert_eq!(request.trailer.unwrap().len(), trailer_blob_len(3, false));
+        let err = PlannedOp::new(&a, true).into_request(&plain).unwrap_err();
+        assert!(err.to_string().contains("estimate"), "{err}");
     }
 }

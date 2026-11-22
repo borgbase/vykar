@@ -71,10 +71,46 @@ pub(super) fn find_snapshot_path(repo_dir: &Path, name: &str) -> PathBuf {
 // Corruption applicators
 // ---------------------------------------------------------------------------
 
+/// End of a pack's blobs: the start of its trailer frame, or the pack's
+/// length when it has none. The footer is readable without the key. Corrupting
+/// "the middle of a pack" aims below this, at indexed blobs: no reader checks
+/// the trailer yet.
+fn blobs_end(data: &[u8]) -> usize {
+    crate::repo::pack_trailer::parse_footer(data)
+        .and_then(|len| crate::repo::pack_trailer::trailer_frame_start(data.len() as u64, len))
+        .map_or(data.len(), |start| start as usize)
+}
+
+/// An offset near the middle of a pack's blobs, inside an indexed blob: the
+/// middle of the blob that reaches past the midpoint of `[header, blobs_end)`.
+/// Evenly sized blobs put that midpoint on a length prefix, which no reader
+/// checks on its own.
+fn blob_midpoint(repo_dir: &Path, data: &[u8]) -> usize {
+    let mid = usize::midpoint(PACK_HEADER_SIZE, blobs_end(data)) as u64;
+    let repo = open_local_repo(repo_dir);
+    let (_, first) = repo
+        .chunk_index()
+        .iter()
+        .next()
+        .expect("no chunks in index");
+    let mut spans: Vec<(u64, u64)> = repo
+        .chunk_index()
+        .iter()
+        .filter(|(_, e)| e.pack_id == first.pack_id)
+        .map(|(_, e)| (e.pack_offset, u64::from(e.stored_size)))
+        .collect();
+    spans.sort_unstable();
+    let (offset, size) = spans
+        .into_iter()
+        .find(|(offset, size)| offset + size > mid)
+        .expect("an indexed blob ends past the midpoint");
+    (offset + size / 2) as usize
+}
+
 fn apply_bit_flip_in_pack(repo_dir: &Path) {
     let path = find_first_pack_path(repo_dir);
     let mut data = std::fs::read(&path).unwrap();
-    let mid = data.len() / 2;
+    let mid = blob_midpoint(repo_dir, &data);
     data[mid] ^= 0xff;
     std::fs::write(&path, &data).unwrap();
 }
@@ -96,15 +132,15 @@ fn apply_bit_flip_in_blob(repo_dir: &Path) {
 fn apply_truncate_pack(repo_dir: &Path) {
     let path = find_first_pack_path(repo_dir);
     let data = std::fs::read(&path).unwrap();
-    let half = data.len() / 2;
+    let half = usize::midpoint(PACK_HEADER_SIZE, blobs_end(&data));
     std::fs::write(&path, &data[..half]).unwrap();
 }
 
 fn apply_zero_fill_region(repo_dir: &Path) {
     let path = find_first_pack_path(repo_dir);
     let mut data = std::fs::read(&path).unwrap();
-    let mid = data.len() / 2;
-    let end = (mid + 64).min(data.len());
+    let mid = blob_midpoint(repo_dir, &data);
+    let end = (mid + 64).min(blobs_end(&data));
     for byte in &mut data[mid..end] {
         *byte = 0;
     }

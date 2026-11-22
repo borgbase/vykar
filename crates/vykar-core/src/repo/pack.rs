@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
+use vykar_crypto::CryptoEngine;
 use vykar_storage::{PackData, StagedPut, StorageBackend};
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
@@ -8,6 +9,8 @@ use vykar_types::hash::{HashAlgorithm, Hasher256};
 use vykar_types::pack_id::PackId;
 
 use vykar_protocol::{PACK_HEADER_SIZE, PACK_MAGIC, PACK_VERSION_CURRENT, validate_pack_header};
+
+use super::pack_trailer::{PackTrailer, TrailerPackType, trailer_frame_len_upper};
 
 /// Distinguishes data packs (file content) from tree packs (item-stream metadata).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,6 +66,8 @@ pub struct SealedPack {
     pub pack_id: PackId,
     pub entries: Vec<PackedChunkEntry>,
     pub data: SealedData,
+    /// Exact length of the pack, trailer included.
+    pub len: u64,
 }
 
 /// Sealed pack data ready for upload.
@@ -138,6 +143,11 @@ fn staged_write_error(e: VykarError) -> VykarError {
 
 /// Accumulates encrypted blobs and flushes them as pack files.
 ///
+/// Every sealed pack ends in a trailer listing its blobs, encrypted with the
+/// engine passed to [`Self::seal`] (`repo::pack_trailer`). The trailer is
+/// one more length-framed blob after the last chunk, so the entries, their
+/// offsets and every reader of indexed ranges are unchanged by it.
+///
 /// By default the pack is assembled in a heap `Vec<u8>`. When the caller
 /// passes a backend to [`Self::add_blob_to`] that can stage writes (local
 /// repositories), the bytes are streamed to a temp file instead, so neither
@@ -162,12 +172,41 @@ pub struct PackWriter {
     pending: HashMap<ChunkId, (u32, u32)>,
     /// When the first blob was added to the current buffer.
     first_blob_time: Option<Instant>,
+    /// What the trailer says this pack holds.
+    trailer_type: TrailerPackType,
 }
 
 impl PackWriter {
+    /// A backup writer; the trailer's pack type follows `pack_type`.
     pub fn new(pack_type: PackType, target_size: usize, hash_algo: HashAlgorithm) -> Self {
+        let trailer_type = match pack_type {
+            PackType::Data => TrailerPackType::Data,
+            PackType::Tree => TrailerPackType::Tree,
+        };
+        Self::with_trailer_type(pack_type, trailer_type, target_size, hash_algo)
+    }
+
+    /// Compact's output writer: a data-sized pack whose trailer says
+    /// `Repacked`, because compact does not know whether its sources held
+    /// file or tree chunks.
+    pub fn new_repack(target_size: usize, hash_algo: HashAlgorithm) -> Self {
+        Self::with_trailer_type(
+            PackType::Data,
+            TrailerPackType::Repacked,
+            target_size,
+            hash_algo,
+        )
+    }
+
+    fn with_trailer_type(
+        pack_type: PackType,
+        trailer_type: TrailerPackType,
+        target_size: usize,
+        hash_algo: HashAlgorithm,
+    ) -> Self {
         Self {
             pack_type,
+            trailer_type,
             target_size,
             hash_algo,
             buffer: None,
@@ -244,10 +283,12 @@ impl PackWriter {
         match self.buffer.as_mut().expect("buffer initialized above") {
             PackBuffer::Memory(v) => {
                 // The blob crossing the target seals this pack. Reserve only
-                // its actual bytes rather than letting Vec double a large
-                // buffer that will immediately move to the upload queue.
+                // its actual bytes and the trailer's frame rather than
+                // letting Vec double a large buffer that will immediately
+                // move to the upload queue. The engine is not known here, so
+                // the frame is sized for an encrypting one.
                 if self.current_size + additional >= self.target_size {
-                    v.reserve_exact(additional);
+                    v.reserve_exact(additional + trailer_frame_len_upper(self.blob_meta.len() + 1));
                 }
                 v.extend_from_slice(&len_prefix);
                 v.extend_from_slice(&encrypted_blob);
@@ -351,9 +392,14 @@ impl PackWriter {
         self.target_size = target;
     }
 
-    /// Seal the pack: compute PackId, return a `SealedPack` that can be
-    /// destructured for upload.
-    pub fn seal(&mut self) -> Result<SealedPack> {
+    /// Seal the pack: append the trailer, encrypted with `crypto`, compute
+    /// the PackId over every byte including it, and return a `SealedPack`
+    /// that can be destructured for upload.
+    ///
+    /// A failure to build the trailer leaves the writer and its blobs as
+    /// they were; a failed staged append of it poisons the writer, as a
+    /// failed blob append does.
+    pub fn seal(&mut self, crypto: &dyn CryptoEngine) -> Result<SealedPack> {
         if matches!(self.buffer, Some(PackBuffer::Failed)) {
             return Err(failed_writer_error());
         }
@@ -372,12 +418,49 @@ impl PackWriter {
             results.push((meta.chunk_id, meta.stored_size, offset, refcount));
         }
 
-        let (pack_id, sealed_data) = match self.buffer.take().expect("buffer was initialized") {
-            PackBuffer::Memory(v) => (PackId::compute(&v, self.hash_algo), SealedData::Memory(v)),
-            PackBuffer::Staged { object, hasher } => (
-                PackId::from_bytes(hasher.finalize()),
-                SealedData::Staged(object),
-            ),
+        let trailer = PackTrailer::for_blobs(
+            self.trailer_type,
+            self.blob_meta.iter().map(|m| (m.chunk_id, m.stored_size)),
+        )?;
+        debug_assert!(trailer.offsets().eq(results.iter().map(|r| r.2)));
+        let blob = trailer.seal_blob(crypto)?;
+        let blob_len = u32::try_from(blob.len())
+            .map_err(|_| VykarError::Other("pack trailer does not fit u32".into()))?;
+        let mut frame = Vec::with_capacity(4 + blob.len());
+        frame.extend_from_slice(&blob_len.to_le_bytes());
+        frame.extend_from_slice(&blob);
+
+        let (pack_id, sealed_data, len) = match self.buffer.take().expect("buffer was initialized")
+        {
+            PackBuffer::Memory(mut v) => {
+                // A no-op after the crossing blob's reservation.
+                v.reserve_exact(frame.len());
+                v.extend_from_slice(&frame);
+                let len = v.len() as u64;
+                (
+                    PackId::compute(&v, self.hash_algo),
+                    SealedData::Memory(v),
+                    len,
+                )
+            }
+            PackBuffer::Staged {
+                mut object,
+                mut hasher,
+            } => {
+                if let Err(e) = object.append(&frame) {
+                    // Drops the staged object, which removes its temp file.
+                    drop(object);
+                    self.buffer = Some(PackBuffer::Failed);
+                    return Err(staged_write_error(e));
+                }
+                hasher.update(&frame);
+                let len = (PACK_HEADER_SIZE + self.current_size + frame.len()) as u64;
+                (
+                    PackId::from_bytes(hasher.finalize()),
+                    SealedData::Staged(object),
+                    len,
+                )
+            }
             // Rejected on entry; kept total rather than asserted.
             PackBuffer::Failed => {
                 self.buffer = Some(PackBuffer::Failed);
@@ -395,17 +478,24 @@ impl PackWriter {
             pack_id,
             entries: results,
             data: sealed_data,
+            len,
         })
     }
 
-    /// Flush the buffered blobs into a pack file (seal + upload).
+    /// Flush the buffered blobs into a pack file (seal + upload), the
+    /// trailer encrypted with `crypto`.
     /// Returns (pack_id, vec of (chunk_id, stored_size, offset, refcount)).
-    pub fn flush(&mut self, storage: &dyn StorageBackend) -> Result<FlushedPackResult> {
+    pub fn flush(
+        &mut self,
+        storage: &dyn StorageBackend,
+        crypto: &dyn CryptoEngine,
+    ) -> Result<FlushedPackResult> {
         let SealedPack {
             pack_id,
             entries,
             data,
-        } = self.seal()?;
+            len: _,
+        } = self.seal(crypto)?;
         let key = pack_id.storage_key();
         match data {
             SealedData::Memory(v) => storage.put(&key, &v)?,
@@ -507,9 +597,21 @@ pub fn compute_tree_pack_target(min_pack_size: u32) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::repo::pack_trailer::trailer_blob_len;
 
     fn dummy_chunk_id(byte: u8) -> ChunkId {
         ChunkId::from_bytes([byte; 32])
+    }
+
+    fn engine() -> vykar_crypto::PlaintextEngine {
+        vykar_crypto::PlaintextEngine::new(crate::testutil::chunk_hasher_for([0xAA; 32]))
+    }
+
+    fn aes_engine() -> vykar_crypto::aes_gcm::Aes256GcmEngine {
+        vykar_crypto::aes_gcm::Aes256GcmEngine::new(
+            &[0x11; 32],
+            crate::testutil::chunk_hasher_for([0x22; 32]),
+        )
     }
 
     fn memory_bytes(data: &SealedData) -> &[u8] {
@@ -558,8 +660,8 @@ mod tests {
                 assert!(matches!(staged.buffer, Some(PackBuffer::Staged { .. })));
                 assert_eq!(staged.buffer_capacity(), 0);
 
-                let heap = heap.seal().unwrap();
-                let staged = staged.seal().unwrap();
+                let heap = heap.seal(&engine()).unwrap();
+                let staged = staged.seal(&engine()).unwrap();
                 assert_eq!(heap.pack_id, staged.pack_id, "{algo:?}");
                 assert_eq!(heap.entries, staged.entries);
                 assert!(matches!(staged.data, SealedData::Staged(_)));
@@ -570,10 +672,19 @@ mod tests {
                 let key = staged.pack_id.storage_key();
                 staged.data.put_to(&local, &key, || {}).unwrap();
                 assert_eq!(local.get(&key).unwrap().unwrap(), bytes);
+                assert_eq!(heap.len, bytes.len() as u64);
+                assert_eq!(staged.len, bytes.len() as u64);
+                // The chunk blobs, then the trailer frame.
                 assert_eq!(
                     scan_pack_blobs(&local, &staged.pack_id).unwrap().len(),
-                    blobs.len()
+                    blobs.len() + 1
                 );
+                let trailer =
+                    crate::repo::pack_trailer::read_trailer_from_pack_bytes(&bytes, &engine())
+                        .unwrap()
+                        .expect("sealed pack has a trailer");
+                assert_eq!(trailer.entries.len(), blobs.len());
+                assert!(trailer.offsets().eq(heap.entries.iter().map(|e| e.2)));
             }
         }
     }
@@ -586,7 +697,10 @@ mod tests {
         w.add_blob_to(Some(&storage), dummy_chunk_id(1), vec![1; 10])
             .unwrap();
         assert!(matches!(w.buffer, Some(PackBuffer::Memory(_))));
-        assert!(matches!(w.seal().unwrap().data, SealedData::Memory(_)));
+        assert!(matches!(
+            w.seal(&engine()).unwrap().data,
+            SealedData::Memory(_)
+        ));
     }
 
     /// Stages into an object whose appends start failing after `ok_appends`.
@@ -702,10 +816,63 @@ mod tests {
                 // instead of producing a pack without them, and so does any
                 // later blob, even on the heap path.
                 assert!(w.has_pending());
-                assert!(w.seal().is_err());
+                assert!(w.seal(&engine()).is_err());
                 assert!(w.add_blob(dummy_chunk_id(3), vec![3]).is_err());
-                assert!(w.seal().is_err());
+                assert!(w.seal(&engine()).is_err());
             }
+        }
+    }
+
+    /// The trailer is the last append: when it fails, seal fails with a hard
+    /// error, the staged object is discarded and the writer stays poisoned.
+    #[test]
+    fn failed_trailer_append_poisons_writer() {
+        // Header, blob prefix and blob payload succeed; the trailer fails.
+        let backend = FailingStageBackend {
+            ok_appends: 3,
+            dropped: Default::default(),
+        };
+        let mut w = PackWriter::new(PackType::Data, usize::MAX, HashAlgorithm::Blake3);
+        w.add_blob_to(Some(&backend), dummy_chunk_id(1), vec![1; 10])
+            .unwrap();
+        let err = w.seal(&engine()).err().expect("trailer append fails");
+        assert!(!err.is_soft_file_error(), "{err}");
+        assert!(
+            err.to_string().contains("writing pack to repository"),
+            "{err}"
+        );
+        assert!(
+            backend.dropped.load(std::sync::atomic::Ordering::SeqCst),
+            "staged object is discarded on failure"
+        );
+        assert!(w.seal(&engine()).is_err());
+    }
+
+    /// Data and tree writers label their trailers as such; compact's writer
+    /// says `Repacked`.
+    #[test]
+    fn seal_trailer_type_follows_the_writer() {
+        use crate::repo::pack_trailer::{TrailerPackType, read_trailer_from_pack_bytes};
+        for (mut w, expected) in [
+            (
+                PackWriter::new(PackType::Data, 1024, HashAlgorithm::Blake2b),
+                TrailerPackType::Data,
+            ),
+            (
+                PackWriter::new(PackType::Tree, 1024, HashAlgorithm::Blake2b),
+                TrailerPackType::Tree,
+            ),
+            (
+                PackWriter::new_repack(1024, HashAlgorithm::Blake2b),
+                TrailerPackType::Repacked,
+            ),
+        ] {
+            w.add_blob(dummy_chunk_id(1), vec![1; 10]).unwrap();
+            let sealed = w.seal(&engine()).unwrap();
+            let trailer = read_trailer_from_pack_bytes(memory_bytes(&sealed.data), &engine())
+                .unwrap()
+                .unwrap();
+            assert_eq!(trailer.pack_type, expected);
         }
     }
 
@@ -728,18 +895,36 @@ mod tests {
                 w.add_blob(dummy_chunk_id(2), vec![2; last_size]).unwrap();
                 assert!(w.should_flush());
 
-                let sealed = w.seal().unwrap();
+                let sealed = w.seal(&aes_engine()).unwrap();
                 let SealedData::Memory(data) = sealed.data else {
                     panic!("no stage given, so the pack is heap-buffered");
                 };
-                assert_eq!(data.len(), PACK_HEADER_SIZE + target + last_size);
+                assert_eq!(
+                    data.len(),
+                    PACK_HEADER_SIZE + target + last_size + 4 + trailer_blob_len(2, true)
+                );
+                assert_eq!(sealed.len, data.len() as u64);
                 assert_eq!(data.capacity(), data.len());
-                assert_eq!(scan_pack_blobs_bytes(&data).unwrap().len(), 2);
+                assert_eq!(scan_pack_blobs_bytes(&data).unwrap().len(), 3);
                 // The sealed pack's name must be its own contents under the
                 // writer's algorithm — the invariant the server also relies on.
                 assert_eq!(PackId::compute(&data, algo), sealed.pack_id);
             }
         }
+    }
+
+    /// A plaintext trailer is smaller than the encrypting one the crossing
+    /// blob reserves room for: the AEAD's 28 bytes stay spare.
+    #[test]
+    fn crossing_target_plaintext_leaves_aead_room_spare() {
+        let target = 1024 * 1024;
+        let mut w = PackWriter::new(PackType::Data, target, HashAlgorithm::Blake3);
+        w.add_blob(dummy_chunk_id(1), vec![1; target - 8]).unwrap();
+        w.add_blob(dummy_chunk_id(2), vec![2; 128]).unwrap();
+        let SealedData::Memory(data) = w.seal(&engine()).unwrap().data else {
+            panic!("no stage given, so the pack is heap-buffered");
+        };
+        assert_eq!(data.capacity() - data.len(), 28);
     }
 
     #[test]
@@ -761,18 +946,20 @@ mod tests {
         w.add_blob(dummy_chunk_id(0), vec![0u8; 10]).unwrap();
         assert!(w.first_blob_time.is_some());
 
-        let _ = w.seal().unwrap();
+        let _ = w.seal(&engine()).unwrap();
         assert!(w.first_blob_time.is_none());
     }
 
-    /// Golden-byte regression test. No header trailer — just magic + blobs.
-    /// Any change to wire format or byte ordering will fail this.
+    /// Golden-byte regression test: magic, blobs, then the trailer frame
+    /// (plaintext engine, so deterministic). Any change to wire format or
+    /// byte ordering will fail this.
     #[test]
     fn seal_deterministic_bytes() {
         // Hard-coded expected output. Structure:
         //   [0..9]   VGERPACK\x01  — magic + version
         //   [9..15]  blob 0: 4B len LE (2) + 2B data (0xDE 0xAD)
         //   [15..22] blob 1: 4B len LE (3) + 3B data (0xBE 0xEF 0x42)
+        //   [22..128] trailer frame: 4B len LE (102) + trailer blob
         #[rustfmt::skip]
         const EXPECTED: &[u8] = &[
             // Pack header: VGERPACK + version 1
@@ -781,6 +968,27 @@ mod tests {
             0x02, 0x00, 0x00, 0x00, 0xde, 0xad,
             // Blob 1: len=3 LE, data=0xBE 0xEF 0x42
             0x03, 0x00, 0x00, 0x00, 0xbe, 0xef, 0x42,
+            // Trailer frame: len=102 LE
+            0x66, 0x00, 0x00, 0x00,
+            // Object tag 12 (PackTrailer), codec 0 (none)
+            0x0c, 0x00,
+            // Body: version 1, pack type 0 (data), count 2 LE
+            0x01, 0x00, 0x02, 0x00, 0x00, 0x00,
+            // Entry 0: chunk id 0xAA x32, offset 13, size 2, kind 0
+            0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
+            0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
+            0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
+            0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
+            0x0d, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00,
+            // Entry 1: chunk id 0xBB x32, offset 19, size 3, kind 0
+            0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb,
+            0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb,
+            0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb,
+            0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb,
+            0x13, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00,
+            // Footer: L=102 LE, "VYKTRLR1"
+            0x66, 0x00, 0x00, 0x00,
+            0x56, 0x59, 0x4b, 0x54, 0x52, 0x4c, 0x52, 0x31,
         ];
 
         let mut w = PackWriter::new(PackType::Data, usize::MAX, HashAlgorithm::Blake2b);
@@ -788,8 +996,9 @@ mod tests {
         w.add_blob(dummy_chunk_id(0xBB), vec![0xBE, 0xEF, 0x42])
             .unwrap();
 
-        let sealed = w.seal().unwrap();
+        let sealed = w.seal(&engine()).unwrap();
 
+        assert_eq!(EXPECTED.len(), 128);
         assert_eq!(
             memory_bytes(&sealed.data),
             EXPECTED,
@@ -815,7 +1024,7 @@ mod tests {
             w.add_blob(*chunk_id, data.clone()).unwrap();
         }
 
-        let sealed = w.seal().unwrap();
+        let sealed = w.seal(&engine()).unwrap();
 
         // Store the pack so scan_pack_blobs can access it.
         storage
@@ -824,8 +1033,14 @@ mod tests {
 
         // Verify scan_pack_blobs returns matching (offset, length) pairs.
         let scanned = scan_pack_blobs(&storage, &sealed.pack_id).unwrap();
-        assert_eq!(scanned.len(), blobs.len());
-        for (i, (offset, length)) in scanned.iter().enumerate() {
+        // The chunk blobs, then the trailer frame.
+        assert_eq!(scanned.len(), blobs.len() + 1);
+        let (trailer_offset, trailer_len) = scanned[blobs.len()];
+        assert_eq!(
+            trailer_offset + u64::from(trailer_len),
+            memory_bytes(&sealed.data).len() as u64
+        );
+        for (i, (offset, length)) in scanned.iter().take(blobs.len()).enumerate() {
             assert_eq!(*offset, sealed.entries[i].2, "scan offset mismatch at {i}");
             assert_eq!(*length, sealed.entries[i].1, "scan length mismatch at {i}");
         }
@@ -838,7 +1053,7 @@ mod tests {
         w.add_blob(dummy_chunk_id(1), vec![0xAA; 100]).unwrap();
         w.add_blob(dummy_chunk_id(2), vec![0xBB; 200]).unwrap();
 
-        let sealed = w.seal().unwrap();
+        let sealed = w.seal(&engine()).unwrap();
 
         assert_eq!(sealed.entries.len(), 2);
         assert!(!sealed.pack_id.as_bytes().iter().all(|&b| b == 0));
@@ -883,7 +1098,7 @@ mod tests {
         }
 
         // Successful seal clears everything.
-        let sealed = w.seal().unwrap();
+        let sealed = w.seal(&engine()).unwrap();
         assert_eq!(sealed.entries.len(), 2);
         assert!(w.buffer.is_none());
         assert_eq!(w.current_size, 0);
@@ -1108,7 +1323,7 @@ mod tests {
         w.add_blob(dummy_chunk_id(0), vec![0u8; 120]).unwrap();
         assert!(w.should_flush());
 
-        let _ = w.seal().unwrap();
+        let _ = w.seal(&engine()).unwrap();
 
         // Update target to a larger size
         w.set_target_size(10_000);

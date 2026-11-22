@@ -466,8 +466,8 @@ impl vykar_storage::ServerOps for RecordingBackend {
 
 /// `/health` as the test fakes that implement `ServerOps` answer it: both
 /// hashes, the segmented index, every key directory and the four operation
-/// fields. Not `repack_trailer` (no fake appends one) and not
-/// `conditional_put`.
+/// fields. Not `repack_trailer`: only the compact test fake appends one, and
+/// it overrides the field. Not `conditional_put`.
 pub(crate) fn fake_server_caps() -> vykar_protocol::ServerCapabilities {
     vykar_protocol::ServerCapabilities {
         status: "ok".into(),

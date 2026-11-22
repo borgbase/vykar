@@ -90,17 +90,36 @@ pub const PROTOCOL_VERSION: u32 = 3;
 /// one.
 pub const REPACK_TRAILER_PROTOCOL_VERSION: u32 = 3;
 
-/// Largest trailer one repack operation may carry. A trailer holds ~45 bytes
-/// per chunk (05-index-gc-format.md), so 16 MiB covers the server's
-/// 200 000 kept blobs per operation with room to spare; the hex encoding
-/// doubles it on the wire, which keeps one maximal trailer well inside the
-/// server's 64 MiB admin body limit.
+/// Largest trailer one repack operation may carry. A trailer holds 41 bytes
+/// per chunk plus a fixed overhead (05-index-gc-format.md), so 16 MiB covers
+/// the server's [`MAX_KEEP_BLOBS_PER_OP`] kept blobs per operation with room
+/// to spare; the hex encoding doubles it on the wire, which keeps one maximal
+/// trailer well inside [`MAX_ADMIN_BODY_BYTES`].
 ///
-/// A caller that sends trailers must also bound each plan's JSON size against
-/// that 64 MiB limit: plans are chunked by output bytes only
-/// ([`MAX_REPACK_OUTPUT_BYTES`]), and many trailers can exceed the body limit
-/// first.
+/// A caller that sends trailers must also bound each plan's JSON size: many
+/// trailers can exceed the body limit before the output cap
+/// ([`MAX_REPACK_OUTPUT_BYTES`]). [`repack_op_json_bound`] and
+/// [`MAX_REPACK_PLAN_JSON_BYTES`] are that bound.
 pub const MAX_REPACK_TRAILER_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Most operations one repack plan may hold. The server refuses a larger
+/// plan with 400; the client batches below it.
+pub const MAX_REPACK_OPS: usize = 10_000;
+
+/// Most kept blobs one repack operation may hold. The server refuses a
+/// larger operation with 400; the client repacks such a pack itself.
+pub const MAX_KEEP_BLOBS_PER_OP: usize = 200_000;
+
+/// Body limit of the server's admin JSON endpoints (repack, verify-packs).
+/// The server enforces it; a client sizes its plans below it.
+pub const MAX_ADMIN_BODY_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Room left in a repack plan's body for everything but its operations: the
+/// braces and the `hash` and `protocol_version` fields.
+pub const REPACK_PLAN_JSON_ENVELOPE: u64 = 4096;
+
+/// What a client may spend on one plan's operations.
+pub const MAX_REPACK_PLAN_JSON_BYTES: u64 = MAX_ADMIN_BODY_BYTES - REPACK_PLAN_JSON_ENVELOPE;
 
 /// Minimum protocol version the server accepts.
 ///
@@ -348,6 +367,38 @@ pub fn repack_op_output_size(op: &RepackOperationRequest) -> u64 {
             .saturating_add(u64::try_from(t.len()).unwrap_or(u64::MAX));
     }
     total
+}
+
+/// JSON bytes the keys, brackets and `delete_after` of one operation take,
+/// with the comma separating it from the next.
+const REPACK_OP_JSON_FIXED: u64 = 96;
+/// JSON bytes of one `{"offset":N,"length":N}` object with its comma, for
+/// any two u64 values.
+const REPACK_BLOB_JSON_MAX: u64 = 64;
+/// Worst-case JSON bytes of one key character (a `\u00XX` escape).
+const JSON_ESCAPED_CHAR_MAX: u64 = 6;
+
+/// Upper bound of the JSON bytes `op` adds to a plan's operations array,
+/// separating comma included, with its trailer if it carries one. Numbers
+/// count as 20 digits and key characters as 6 (worst-case escape), so the
+/// bound holds for any value. Saturating.
+pub fn repack_op_json_bound(op: &RepackOperationRequest) -> u64 {
+    let key = u64::try_from(op.source_pack.len()).unwrap_or(u64::MAX);
+    let blobs = u64::try_from(op.keep_blobs.len()).unwrap_or(u64::MAX);
+    let trailer = op.trailer.as_ref().map_or(0, |t| {
+        repack_trailer_json_len(u64::try_from(t.len()).unwrap_or(u64::MAX))
+    });
+    REPACK_OP_JSON_FIXED
+        .saturating_add(key.saturating_mul(JSON_ESCAPED_CHAR_MAX))
+        .saturating_add(blobs.saturating_mul(REPACK_BLOB_JSON_MAX))
+        .saturating_add(trailer)
+}
+
+/// JSON bytes a trailer of `len` bytes adds to an operation: the
+/// `,"trailer":` key and a quoted string of `2 * len` hex digits.
+/// Saturating.
+pub const fn repack_trailer_json_len(len: u64) -> u64 {
+    len.saturating_mul(2).saturating_add(16)
 }
 
 /// The protocol version a request must declare to be safe under `hash`.
@@ -907,6 +958,47 @@ pub fn validate_blob_ref(offset: u64, length: u64, context: &str) -> Result<(), 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `repack_op_json_bound` is never below the bytes an operation (with
+    /// its separating comma) really takes, and the envelope covers the rest.
+    #[test]
+    fn repack_op_json_bound_is_an_upper_bound() {
+        let keys = [
+            format!("packs/ab/{}", "ab".repeat(32)),
+            "packs/\"\\\u{1}/x".to_string(),
+        ];
+        for key in &keys {
+            for blobs in [0usize, 1, 1000] {
+                for trailer in [None, Some(vec![0xA5; 1]), Some(vec![0xFF; 5000])] {
+                    for extreme in [false, true] {
+                        let n = if extreme { u64::MAX } else { 13 };
+                        let op = RepackOperationRequest {
+                            source_pack: key.clone(),
+                            keep_blobs: (0..blobs)
+                                .map(|_| RepackBlobRef {
+                                    offset: n,
+                                    length: n,
+                                })
+                                .collect(),
+                            delete_after: extreme,
+                            trailer: trailer.clone(),
+                        };
+                        let json = serde_json::to_vec(&op).unwrap().len() as u64;
+                        assert!(
+                            json < repack_op_json_bound(&op),
+                            "{key:?}/{blobs}/{extreme}: {json} > {}",
+                            repack_op_json_bound(&op)
+                        );
+                    }
+                }
+            }
+        }
+        let empty = RepackPlanRequest::new(Vec::new(), HashAlgorithm::Blake3);
+        let mut with_trailer = empty.clone();
+        with_trailer.protocol_version = REPACK_TRAILER_PROTOCOL_VERSION;
+        let envelope = serde_json::to_vec(&with_trailer).unwrap().len() as u64;
+        assert!(envelope < REPACK_PLAN_JSON_ENVELOPE, "{envelope}");
+    }
 
     #[test]
     fn capabilities_without_conditional_put_read_as_false() {

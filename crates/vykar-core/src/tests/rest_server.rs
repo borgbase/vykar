@@ -409,3 +409,141 @@ fn server_repack_appends_a_trailer_end_to_end() {
     let r = verify.results.first().unwrap();
     assert!(r.hash_valid && r.header_valid && r.blobs_valid, "{r:?}");
 }
+
+/// Every pack on the server, with its length: `(key, len)`.
+fn server_packs(server: &Server) -> Vec<(String, u64)> {
+    let mut packs = Vec::new();
+    for shard in std::fs::read_dir(server.data.path().join("packs")).unwrap() {
+        let shard = shard.unwrap();
+        if !shard.file_type().unwrap().is_dir() {
+            continue;
+        }
+        for pack in std::fs::read_dir(shard.path()).unwrap() {
+            let pack = pack.unwrap();
+            let name = pack.file_name().to_string_lossy().into_owned();
+            if name.len() != 64 {
+                continue;
+            }
+            let key = format!("packs/{}/{name}", shard.file_name().to_string_lossy());
+            packs.push((key, pack.metadata().unwrap().len()));
+        }
+    }
+    packs.sort();
+    packs
+}
+
+/// Each pack's trailer, read through the REST backend with the repository's
+/// key, lists exactly the index entries naming that pack. Returns the pack
+/// types found, by key.
+fn assert_trailers_match_index(
+    server: &Server,
+    config: &VykarConfig,
+) -> std::collections::HashMap<String, crate::repo::pack_trailer::TrailerPackType> {
+    use crate::repo::pack_trailer::{TrailerRead, read_pack_trailer};
+    let repo = commands::util::open_repo(
+        config,
+        None,
+        OpenOptions::new().with_index(),
+        &CancelToken::new(),
+    )
+    .unwrap();
+    let mut types = std::collections::HashMap::new();
+    for (key, len) in server_packs(server) {
+        let trailer = match read_pack_trailer(
+            repo.storage.as_ref(),
+            &key,
+            len,
+            repo.crypto.as_ref(),
+        )
+        .unwrap()
+        {
+            TrailerRead::Found(t) => t,
+            other => panic!("{key}: {other:?}"),
+        };
+        let mut indexed: Vec<(String, u32, u64)> = repo
+            .chunk_index()
+            .iter()
+            .filter(|(_, e)| e.pack_id.storage_key() == key)
+            .map(|(id, e)| (format!("{id:?}"), e.stored_size, e.pack_offset))
+            .collect();
+        indexed.sort_by_key(|e| e.2);
+        let listed: Vec<(String, u32, u64)> = trailer
+            .entries
+            .iter()
+            .map(|e| {
+                (
+                    format!("{:?}", e.chunk_id),
+                    e.stored_size,
+                    u64::from(e.offset),
+                )
+            })
+            .collect();
+        assert_eq!(listed, indexed, "{key}");
+        types.insert(key, trailer.pack_type);
+    }
+    types
+}
+
+/// Backups and server-side compact write packs whose trailers match the
+/// index; check and restore read them.
+#[test]
+fn trailer_packs_through_the_server() {
+    use crate::repo::pack_trailer::TrailerPackType;
+    let server = Server::start(false);
+    let c = Client::init(&server);
+    // s1's data pack holds a and b; only b outlives s1, so deleting s1
+    // leaves that pack partly dead.
+    c.write("a", "alpha");
+    c.write("b", "bravo");
+    c.backup("s1");
+    std::fs::remove_file(c.source.join("a")).unwrap();
+    c.write("c", "charlie");
+    c.backup("s2");
+    c.write("d", "delta");
+    c.backup("s3");
+    let before = assert_trailers_match_index(&server, &c.config);
+    assert!(!before.is_empty());
+    assert!(
+        before
+            .values()
+            .all(|t| matches!(t, TrailerPackType::Data | TrailerPackType::Tree)),
+        "{before:?}"
+    );
+
+    commands::delete::run(&c.config, None, &["s1"], false, &CancelToken::new()).unwrap();
+    let mut repo = open(&c.config);
+    let stats =
+        commands::compact::run_on_repo(&mut repo, 1.0, None, false, &CancelToken::new()).unwrap();
+    drop(repo);
+    assert!(stats.packs_repacked > 0, "{stats:?}");
+
+    let after = assert_trailers_match_index(&server, &c.config);
+    let new: Vec<_> = after
+        .iter()
+        .filter(|(key, _)| !before.contains_key(*key))
+        .collect();
+    assert!(!new.is_empty(), "{after:?}");
+    assert!(
+        new.iter().all(|(_, t)| **t == TrailerPackType::Repacked),
+        "{new:?}"
+    );
+
+    check_clean(&c.config);
+    let dest = c.tmp.path().join("restore");
+    commands::restore::run(
+        &c.config,
+        None,
+        "s3",
+        dest.to_str().unwrap(),
+        None,
+        false,
+        true,
+        &CancelToken::new(),
+    )
+    .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(find(&dest, "c")).unwrap(),
+        "charlie"
+    );
+    assert_eq!(std::fs::read_to_string(find(&dest, "b")).unwrap(), "bravo");
+}

@@ -9,6 +9,7 @@ pub(crate) mod journal_recovery;
 pub mod lock;
 pub mod manifest;
 pub mod pack;
+pub mod pack_trailer;
 pub(crate) mod session_journal;
 pub mod snapshot_cache;
 mod upload_queue;

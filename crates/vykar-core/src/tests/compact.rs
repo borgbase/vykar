@@ -2,6 +2,7 @@ use crate::commands::compact::compact_repo;
 use crate::compress::Compression;
 use crate::repo::control::CancelToken;
 use crate::repo::pack::PackType;
+use crate::repo::pack_trailer::{TrailerPackType, parse_footer, read_trailer_from_pack_bytes};
 use crate::testutil::test_repo_plaintext;
 
 /// Helper: store two distinct chunks and flush, returning their chunk IDs.
@@ -40,6 +41,158 @@ fn compact_clean_repo_no_repacking() {
     assert_eq!(stats.packs_repacked, 0);
     assert_eq!(stats.packs_deleted_empty, 0);
     assert_eq!(stats.space_freed, 0);
+}
+
+/// The trailer of the pack at `key` lists exactly the index entries
+/// that name the pack, under `pack_type`.
+fn assert_trailer_matches_index(
+    repo: &crate::repo::Repository,
+    key: &str,
+    pack_type: TrailerPackType,
+) {
+    let bytes = repo.storage.get(key).unwrap().unwrap();
+    let trailer = read_trailer_from_pack_bytes(&bytes, repo.crypto.as_ref())
+        .unwrap()
+        .unwrap_or_else(|| panic!("{key} has no trailer"));
+    assert_eq!(trailer.pack_type, pack_type);
+    let mut indexed: Vec<(vykar_types::chunk_id::ChunkId, u32, u64)> = repo
+        .chunk_index()
+        .iter()
+        .filter(|(_, e)| e.pack_id.storage_key() == key)
+        .map(|(id, e)| (id, e.stored_size, e.pack_offset))
+        .collect();
+    indexed.sort_by_key(|e| e.2);
+    let listed: Vec<(vykar_types::chunk_id::ChunkId, u32, u64)> = trailer
+        .entries
+        .iter()
+        .map(|e| (e.chunk_id, e.stored_size, u64::from(e.offset)))
+        .collect();
+    assert_eq!(listed, indexed, "{key}");
+}
+
+/// A pack whose only unindexed bytes are its trailer is never a candidate,
+/// whatever the threshold.
+#[test]
+fn compact_ignores_trailer_only_overhead() {
+    let mut repo = test_repo_plaintext();
+    store_two_chunks(&mut repo);
+    for threshold in [0.0, 1.0, 10.0] {
+        let stats =
+            compact_repo(&mut repo, threshold, None, false, 4, &CancelToken::new()).unwrap();
+        assert_eq!(stats.packs_repacked, 0, "{threshold}");
+        assert_eq!(stats.packs_deleted_empty, 0, "{threshold}");
+        assert_eq!(stats.space_freed, 0, "{threshold}");
+    }
+}
+
+/// A repack's output, trailer included, is not a candidate for the next
+/// compact.
+#[test]
+fn compact_is_idempotent_after_repack() {
+    let mut repo = test_repo_plaintext();
+    let (id_a, _id_b) = store_two_chunks(&mut repo);
+    repo.chunk_index_mut().decrement(&id_a);
+    repo.save_state().unwrap();
+    let first = compact_repo(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
+    assert_eq!(first.packs_repacked, 1, "{first:?}");
+
+    let second = compact_repo(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
+    assert_eq!(second.packs_repacked, 0, "{second:?}");
+    assert_eq!(second.packs_deleted_empty, 0, "{second:?}");
+    assert_eq!(second.space_freed, 0, "{second:?}");
+}
+
+/// The client repack's output ends in a `Repacked` trailer that lists the
+/// pack's index entries.
+#[test]
+fn client_repack_writes_a_trailer() {
+    let mut repo = test_repo_plaintext();
+    let (id_a, id_b) = store_two_chunks(&mut repo);
+    repo.chunk_index_mut().decrement(&id_a);
+    repo.save_state().unwrap();
+    compact_repo(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
+
+    let key = repo.chunk_index().get(&id_b).unwrap().pack_id.storage_key();
+    assert_trailer_matches_index(&repo, &key, TrailerPackType::Repacked);
+}
+
+/// Fails every 12-byte range read: the trailer footer reads of compact.
+struct FailingFooterReads {
+    inner: std::sync::Arc<dyn vykar_storage::StorageBackend>,
+}
+
+impl vykar_storage::InnerBackend for FailingFooterReads {
+    fn inner_backend(&self) -> &dyn vykar_storage::StorageBackend {
+        &*self.inner
+    }
+}
+
+vykar_storage::delegate_storage_backend! {
+    for FailingFooterReads;
+    except [get_range];
+
+    fn get_range(
+        &self,
+        key: &str,
+        offset: u64,
+        length: u64,
+    ) -> vykar_types::error::Result<Option<Vec<u8>>> {
+        if length == 12 {
+            return Err(vykar_types::error::VykarError::Other("injected".into()));
+        }
+        self.inner.get_range(key, offset, length)
+    }
+}
+
+/// When the footer cannot be read, the trailer counts as dead bytes, as
+/// before trailers: compact repacks the pack and still completes.
+#[test]
+fn failed_footer_read_counts_the_trailer_as_dead() {
+    let mut repo = test_repo_plaintext();
+    let (id_a, id_b) = store_two_chunks(&mut repo);
+    repo.storage = std::sync::Arc::new(FailingFooterReads {
+        inner: std::sync::Arc::clone(&repo.storage),
+    });
+    let stats = compact_repo(&mut repo, 10.0, None, false, 4, &CancelToken::new()).unwrap();
+    assert_eq!(stats.packs_repacked, 1, "{stats:?}");
+    assert!(stats.space_freed > 0, "{stats:?}");
+    assert_eq!(
+        repo.read_chunk(&id_a).unwrap(),
+        b"chunk-a-data-for-compact-test"
+    );
+    assert_eq!(
+        repo.read_chunk(&id_b).unwrap(),
+        b"chunk-b-data-for-compact-test"
+    );
+}
+
+/// A footer that claims a frame larger than the pack's unindexed bytes is
+/// not trusted: those bytes stay dead and the pack is repacked.
+#[test]
+fn oversized_footer_is_not_trusted() {
+    let mut repo = test_repo_plaintext();
+    let (id_a, id_b) = store_two_chunks(&mut repo);
+    let key = repo.chunk_index().get(&id_a).unwrap().pack_id.storage_key();
+    let mut bytes = repo.storage.get(&key).unwrap().unwrap();
+    let n = bytes.len();
+    let real = parse_footer(&bytes).expect("pack has a trailer");
+    // Larger than the real frame, but still a frame that starts after the
+    // header.
+    let forged = real + 20;
+    assert!(n as u64 >= 9 + 4 + u64::from(forged));
+    bytes[n - 12..n - 8].copy_from_slice(&forged.to_le_bytes());
+    repo.storage.put(&key, &bytes).unwrap();
+
+    let stats = compact_repo(&mut repo, 10.0, None, false, 4, &CancelToken::new()).unwrap();
+    assert_eq!(stats.packs_repacked, 1, "{stats:?}");
+    assert_eq!(
+        repo.read_chunk(&id_a).unwrap(),
+        b"chunk-a-data-for-compact-test"
+    );
+    assert_eq!(
+        repo.read_chunk(&id_b).unwrap(),
+        b"chunk-b-data-for-compact-test"
+    );
 }
 
 #[test]
@@ -295,6 +448,7 @@ mod server_side {
     use crate::repo::control::CancelToken;
     use std::sync::{Arc, Mutex};
 
+    use super::assert_trailer_matches_index;
     use super::store_two_chunks;
     use crate::commands::compact::compact_repo;
     use crate::compress::Compression;
@@ -304,6 +458,9 @@ mod server_side {
     use crate::repo::index_store;
     use crate::repo::index_write::FoldPolicy;
     use crate::repo::pack::PackType;
+    use crate::repo::pack_trailer::{
+        TrailerPackType, framed_offsets, read_trailer_from_pack_bytes,
+    };
     use crate::repo::{EncryptionMode, OpenOptions, RepoFormat, Repository};
     use crate::testutil::{MemoryBackend, init_test_environment};
     use vykar_protocol::{RepackOperationResult, RepackPlanRequest, RepackResultResponse};
@@ -316,7 +473,8 @@ mod server_side {
 
     #[derive(Clone, Copy)]
     enum Mode {
-        /// Copy each source verbatim to a fresh pack key (offsets unchanged).
+        /// Repack as a vykar-server does: the kept blobs framed after a pack
+        /// header, then the operation's trailer, under the hash of the bytes.
         CopyToNewPack,
         /// Return the source itself as the new pack.
         ReturnSource,
@@ -328,6 +486,11 @@ mod server_side {
         FailBatchDelete,
         /// The server does not advertise `repack` (one older than the field).
         NotOffered,
+        /// The server advertises `repack` but not `repack_trailer` (0.8 to
+        /// 0.24).
+        NoTrailer,
+        /// As `CopyToNewPack`, but every returned offset is one too high.
+        WrongOffsets,
     }
 
     #[derive(Clone, Default)]
@@ -420,12 +583,18 @@ mod server_side {
 
     impl ServerOps for ServerRepackBackend {
         fn offers(&self, op: ServerOp) -> bool {
-            op == ServerOp::Repack && !matches!(self.mode, Mode::NotOffered)
+            match self.mode {
+                Mode::NotOffered => false,
+                Mode::NoTrailer => op == ServerOp::Repack,
+                _ => matches!(op, ServerOp::Repack | ServerOp::RepackTrailer),
+            }
         }
 
         // The repository is created on this fake, so it must accept the format.
         fn capabilities(&self) -> Result<vykar_protocol::ServerCapabilities> {
-            Ok(crate::testutil::fake_server_caps())
+            let mut caps = crate::testutil::fake_server_caps();
+            caps.repack_trailer = !matches!(self.mode, Mode::NotOffered | Mode::NoTrailer);
+            Ok(caps)
         }
 
         fn init(&self) -> Result<()> {
@@ -438,20 +607,50 @@ mod server_side {
             if matches!(self.mode, Mode::FailRepack) {
                 return Err(VykarError::Other("REST repack: timeout".into()));
             }
+            if plan.has_trailer()
+                && plan.protocol_version() < vykar_protocol::REPACK_TRAILER_PROTOCOL_VERSION
+            {
+                return Err(VykarError::Other(
+                    "test fake: a trailer plan must declare protocol 3".into(),
+                ));
+            }
             let mut completed = Vec::new();
             for op in &plan.operations {
-                let offsets: Vec<u64> = op.keep_blobs.iter().map(|b| b.offset).collect();
+                if op.trailer.is_some() == op.keep_blobs.is_empty() {
+                    return Err(VykarError::Other(
+                        "test fake: every op that keeps blobs carries a trailer, no other does"
+                            .into(),
+                    ));
+                }
+                let mut offsets: Vec<u64> =
+                    framed_offsets(op.keep_blobs.iter().map(|b| b.length as u32)).collect();
                 let new_pack = if op.keep_blobs.is_empty() {
                     None
                 } else if matches!(self.mode, Mode::ReturnSource) {
+                    // As a server whose output already exists: the predicted
+                    // offsets, and the existing pack.
                     Some(op.source_pack.clone())
                 } else {
                     let data = self.inner.get(&op.source_pack)?.expect("source exists");
-                    let key = PackId::compute(&[&data[..], b"repacked"].concat(), plan.hash())
-                        .storage_key();
-                    self.inner.put(&key, &data)?;
+                    let mut out = data[..vykar_protocol::PACK_HEADER_SIZE].to_vec();
+                    for blob in &op.keep_blobs {
+                        let (start, len) = (blob.offset as usize, blob.length as usize);
+                        out.extend_from_slice(&(len as u32).to_le_bytes());
+                        out.extend_from_slice(&data[start..start + len]);
+                    }
+                    if let Some(trailer) = &op.trailer {
+                        out.extend_from_slice(&(trailer.len() as u32).to_le_bytes());
+                        out.extend_from_slice(trailer);
+                    }
+                    let key = PackId::compute(&out, plan.hash()).storage_key();
+                    self.inner.put(&key, &out)?;
                     Some(key)
                 };
+                if matches!(self.mode, Mode::WrongOffsets) {
+                    for o in &mut offsets {
+                        *o += 1;
+                    }
+                }
                 completed.push(RepackOperationResult {
                     source_pack: op.source_pack.clone(),
                     new_pack,
@@ -535,6 +734,34 @@ mod server_side {
         (id_b, partial, empty)
     }
 
+    /// As [`setup_dead_packs`], but the first blob (a, at offset 13) stays
+    /// live and b dies, so the live blobs are a prefix of the source and a
+    /// server returning the source names their offsets correctly. Returns
+    /// (a, partly-dead source key, empty source key).
+    fn setup_dead_packs_live_first(repo: &mut Repository) -> (ChunkId, String, String) {
+        let (id_a, id_b) = store_two_chunks(repo);
+        repo.begin_write_session(&crate::repo::WriteSessionOptions::default())
+            .unwrap();
+        let (id_c, _, _) = repo
+            .store_chunk(
+                b"chunk-c-data-for-compact-test",
+                Compression::None,
+                PackType::Data,
+            )
+            .unwrap();
+        repo.save_state().unwrap();
+
+        let partial = pack_of(repo, &id_a);
+        let empty = pack_of(repo, &id_c);
+        assert_ne!(partial, empty, "c must land in its own pack");
+        assert_eq!(repo.chunk_index().get(&id_a).unwrap().pack_offset, 13);
+
+        repo.chunk_index_mut().decrement(&id_b);
+        repo.chunk_index_mut().decrement(&id_c);
+        repo.save_state().unwrap();
+        (id_a, partial, empty)
+    }
+
     fn pack_of(repo: &Repository, id: &ChunkId) -> String {
         repo.chunk_index().get(id).unwrap().pack_id.storage_key()
     }
@@ -607,7 +834,7 @@ mod server_side {
     #[test]
     fn source_returned_as_new_pack_is_kept() {
         let (mut repo, log) = server_repo(Mode::ReturnSource, false, RepoFormat::V5);
-        let (id_b, partial, empty) = setup_dead_packs(&mut repo);
+        let (id_a, partial, empty) = setup_dead_packs_live_first(&mut repo);
         log.events.lock().unwrap().clear();
 
         compact_repo(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
@@ -616,10 +843,10 @@ mod server_side {
         assert!(!events.contains(&format!("delete {partial}")), "{events:?}");
         assert!(events.contains(&format!("delete {empty}")), "{events:?}");
         assert!(repo.storage.exists(&partial).unwrap());
-        assert_eq!(pack_of(&repo, &id_b), partial);
+        assert_eq!(pack_of(&repo, &id_a), partial);
         assert_eq!(
-            repo.read_chunk(&id_b).unwrap(),
-            b"chunk-b-data-for-compact-test"
+            repo.read_chunk(&id_a).unwrap(),
+            b"chunk-a-data-for-compact-test"
         );
     }
 
@@ -706,7 +933,7 @@ mod server_side {
     #[test]
     fn batch_never_names_a_source_returned_as_new_pack() {
         let (mut repo, log) = server_repo(Mode::ReturnSource, true, RepoFormat::V5);
-        let (_id_b, partial, empty) = setup_dead_packs(&mut repo);
+        let (_id_a, partial, empty) = setup_dead_packs_live_first(&mut repo);
         log.events.lock().unwrap().clear();
 
         compact_repo(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
@@ -746,6 +973,102 @@ mod server_side {
                 stats.space_freed
             ),
             delete_stats(Mode::CopyToNewPack, false)
+        );
+    }
+
+    /// Every plan carries trailers at protocol 3; each trailer opens under the
+    /// repository's key and lists the kept chunks at the offsets the server
+    /// writes them to, and the new pack's trailer matches the index.
+    #[test]
+    fn server_repack_sends_trailers() {
+        let (mut repo, log) = server_repo(Mode::CopyToNewPack, true, RepoFormat::V5);
+        let (id_b, _partial, _empty) = setup_dead_packs(&mut repo);
+        compact_repo(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
+
+        let plans = log.plans.lock().unwrap().clone();
+        assert!(!plans.is_empty());
+        let mut kept_ops = 0;
+        for plan in &plans {
+            assert_eq!(plan.protocol_version(), 3);
+            for op in &plan.operations {
+                let Some(blob) = &op.trailer else {
+                    assert!(op.keep_blobs.is_empty());
+                    continue;
+                };
+                kept_ops += 1;
+                let trailer =
+                    crate::repo::pack_trailer::PackTrailer::open_blob(blob, repo.crypto.as_ref())
+                        .unwrap();
+                assert_eq!(trailer.pack_type, TrailerPackType::Repacked);
+                let lengths: Vec<u32> = op.keep_blobs.iter().map(|b| b.length as u32).collect();
+                let listed: Vec<u32> = trailer.entries.iter().map(|e| e.stored_size).collect();
+                assert_eq!(listed, lengths);
+                assert!(trailer.offsets().eq(framed_offsets(lengths)));
+                assert!(trailer.entries.iter().any(|e| e.chunk_id == id_b));
+            }
+        }
+        assert_eq!(kept_ops, 1);
+
+        let new_pack = pack_of(&repo, &id_b);
+        let bytes = repo.storage.get(&new_pack).unwrap().unwrap();
+        assert!(
+            read_trailer_from_pack_bytes(&bytes, repo.crypto.as_ref())
+                .unwrap()
+                .is_some()
+        );
+        assert_trailer_matches_index(&repo, &new_pack, TrailerPackType::Repacked);
+    }
+
+    /// A server with `repack` but without `repack_trailer` would drop the
+    /// trailers: the client repacks, with the client path's results.
+    #[test]
+    fn server_without_repack_trailer_repacks_on_the_client() {
+        let (mut repo, log) = server_repo(Mode::NoTrailer, false, RepoFormat::V5);
+        let (id_b, partial, empty) = setup_dead_packs(&mut repo);
+        log.events.lock().unwrap().clear();
+
+        let stats = compact_repo(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
+
+        assert!(log.plans.lock().unwrap().is_empty());
+        assert!(!repo.storage.exists(&partial).unwrap());
+        assert!(!repo.storage.exists(&empty).unwrap());
+        assert_eq!(
+            repo.read_chunk(&id_b).unwrap(),
+            b"chunk-b-data-for-compact-test"
+        );
+        assert_eq!(
+            (
+                stats.packs_repacked,
+                stats.packs_deleted_empty,
+                stats.space_freed
+            ),
+            delete_stats(Mode::NotOffered, false)
+        );
+        assert_trailer_matches_index(&repo, &pack_of(&repo, &id_b), TrailerPackType::Repacked);
+    }
+
+    /// Offsets that differ from the layout the trailer describes are refused:
+    /// the index keeps the source, which is not deleted. (The delete-only
+    /// operation ahead of it in the batch is applied, as any operation before
+    /// a failed one is.)
+    #[test]
+    fn wrong_server_offsets_are_refused() {
+        let (mut repo, log) = server_repo(Mode::WrongOffsets, true, RepoFormat::V5);
+        let (id_b, partial, _empty) = setup_dead_packs(&mut repo);
+        log.events.lock().unwrap().clear();
+
+        let err = compact_repo(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap_err();
+        assert!(err.to_string().contains("differ from the layout"), "{err}");
+        assert!(repo.storage.exists(&partial).unwrap());
+        assert_eq!(pack_of(&repo, &id_b), partial);
+        let (_dir, cold) = cold_open(&repo);
+        assert_eq!(pack_of(&cold, &id_b), partial);
+        assert!(
+            !log.events()
+                .iter()
+                .any(|e| e.contains(&partial) && is_pack_delete(e)),
+            "{:?}",
+            log.events()
         );
     }
 

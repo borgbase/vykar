@@ -255,7 +255,13 @@ fn recover_single_index(
         "found pending index from interrupted session, verifying packs\u{2026}"
     );
 
-    let accepted = verify_journal_packs(storage, &wire, persisted_packs, width);
+    let accepted = verify_journal_packs(
+        storage,
+        crypto.is_encrypting(),
+        &wire,
+        persisted_packs,
+        width,
+    );
 
     let mut recovered = 0usize;
     let pack_count = wire.len();
@@ -733,6 +739,51 @@ mod tests {
         assert_eq!(recovery.recovered_chunks, 1);
         assert_eq!(ws.recovered_chunks[&chunk_id].pack_id, pack_id);
         assert_eq!(ws.journal.entries.len(), 1, "recovered pack is re-seeded");
+    }
+
+    /// A pack sealed with a trailer is adopted by its length alone.
+    #[test]
+    fn recovered_trailer_pack_is_reseeded() {
+        use crate::index::PendingChunkEntry;
+        use crate::repo::pack::{PackType, PackWriter};
+        init_test_environment();
+        let storage = MemoryBackend::new();
+        let crypto = test_crypto();
+        let chunk_id = ChunkId::from_bytes([0x42; 32]);
+        let mut writer = PackWriter::new(PackType::Data, 1024, HashAlgorithm::Blake2b);
+        writer.add_blob(chunk_id, vec![7; 40]).unwrap();
+        let sealed = writer.seal(&crypto).unwrap();
+        let data = sealed.data.as_bytes().unwrap().to_vec();
+        assert!(
+            data.len() as u64 > sealed.entries[0].2 + 40,
+            "pack has a trailer"
+        );
+        storage.put(&sealed.pack_id.storage_key(), &data).unwrap();
+        let entry = PendingPackEntry {
+            pack_id: sealed.pack_id,
+            chunks: sealed
+                .entries
+                .iter()
+                .map(
+                    |&(chunk_id, stored_size, pack_offset, _)| PendingChunkEntry {
+                        chunk_id,
+                        stored_size,
+                        pack_offset,
+                    },
+                )
+                .collect(),
+        };
+        put_journal(
+            &storage,
+            &crypto,
+            &session_index_key("old"),
+            &[entry],
+            Wire::V2,
+        );
+
+        let (ws, recovery) = recover_from(&storage);
+        assert_eq!(recovery.recovered_chunks, 1);
+        assert_eq!(ws.recovered_chunks[&chunk_id].pack_id, sealed.pack_id);
     }
 
     #[test]

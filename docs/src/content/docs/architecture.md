@@ -160,15 +160,16 @@ The type tag identifies the object kind via the `ObjectType` enum:
 | 2 | SnapshotMeta | Per-snapshot metadata |
 | 3 | ChunkData | Compressed file/item-stream chunks |
 | 4 | ChunkIndex | Encrypted `IndexBlob` stored at `index` |
-| 5 | PackHeader | Reserved legacy tag (current pack files have no trailing header object) |
+| 5 | PackHeader | Reserved legacy tag; not used for trailers |
 | 6 | FileCache | Local file-level cache (inode/mtime skip) |
 | 7 | PendingIndex | Transient crash-recovery journal |
 | 8 | SnapshotCache | Local snapshot-list cache |
 | 9 | IndexHead | Segmented index head stored at `index` (v4/v5) |
 | 10 | IndexBase | Segmented index base under `index.d/` |
 | 11 | IndexSegment | Segmented index segment under `index.d/` |
+| 12 | PackTrailer | Last framed blob of a pack: its blob list |
 
-The type tag byte is always included in AAD (authenticated additional data). For identity-bound objects, AAD also includes a domain-separated object context, binding ciphertext to both object type and identity (for example, `ChunkData` to its `ChunkId`, `SnapshotMeta` to snapshot ID, `ChunkIndex` and `IndexHead` to `b"index"`, `IndexBase` and `IndexSegment` to the static `b"index.d/base"` and `b"index.d/segment"`, `FileCache` to `b"filecache"`, and `SnapshotCache` to `b"snapshot_cache"`).
+The type tag byte is always included in AAD (authenticated additional data). For identity-bound objects, AAD also includes a domain-separated object context, binding ciphertext to both object type and identity (for example, `ChunkData` to its `ChunkId`, `SnapshotMeta` to snapshot ID, `ChunkIndex` and `IndexHead` to `b"index"`, `IndexBase` and `IndexSegment` to the static `b"index.d/base"` and `b"index.d/segment"`, `FileCache` to `b"filecache"`, `SnapshotCache` to `b"snapshot_cache"`, and `PackTrailer` to the static `b"pack-trailer"`).
 
 ### Format Evolution
 
@@ -448,12 +449,28 @@ Chunks are grouped into **pack files** (~32 MiB) instead of being stored as indi
 [4B blob_1_len LE][blob_1_data]
 ...
 [4B blob_N_len LE][blob_N_data]
+[4B L LE][trailer blob, L bytes]
+```
+
+The trailer blob (written by every client since pack trailers were introduced; packs from before have none):
+
+```text
+trailer blob = object ++ footer                                     (L bytes)
+object       = [0x0C][nonce 12][AEAD(tagged_body)][tag 16]          (encrypting engines)
+             = [0x0C][tagged_body]                                  (plaintext repositories)
+               AAD: type tag 12 and the static context b"pack-trailer"
+tagged_body  = [codec tag u8][body]   written uncompressed (0x00); readers accept any codec
+body         = [version u8 = 1][pack_type u8][count u32 LE] then count x entry
+entry        = [chunk_id 32][offset u32 LE][stored_size u32 LE][kind u8]   (41 bytes)
+footer       = [L u32 LE][b"VYKTRLR1"]                                     (12 bytes)
+pack_type    = 0 data, 1 tree, 2 repacked (compact output: source types unknown)
+kind         = 0 chunk
 ```
 
 - **Per-blob length prefix** (4 bytes): enables forward scanning of all blobs from byte 9 to EOF
 - Each blob is a complete RepoObj envelope: `[1B type_tag][12B nonce][ciphertext+16B AEAD tag]`
 - Each blob is independently encrypted (can read one chunk without decrypting the whole pack)
-- No trailing per-pack header object — the chunk index already records which blobs reside in which pack at which offset, making a per-pack blob manifest redundant. Pack analysis for compaction enumerates blobs by forward-scanning length prefixes. Trade-off: if the index is lost, rebuilding requires a full sequential scan of all pack data (reading every byte); a trailing header would allow reading just the last N bytes per pack. In practice index loss is rare (single encrypted blob, written atomically) and `check --verify-data` already performs a full pack scan
+- **Pack trailer**: the last frame lists every blob of the pack (chunk ID, offset, stored size, kind), so a pack describes itself from its last bytes. It is an ordinary length-framed blob, so every reader of indexed ranges, the forward scan and the server's `verify-packs` ignore it, and the pack version stays 1. Its length is exact: `L = 1 + 28 (encrypting only) + 1 + 6 + 41 × count + 12`, so a pack grows by 52 bytes (24 in a plaintext repository) plus 41 per blob. A decoder refuses a body version or codec tag it does not know by version (`UnsupportedVersion`), and anything else malformed as damage. The pack ID covers the trailer. Binaries from before trailers read such packs normally; their journal recovery does not adopt a trailer pack (its length differs from the end of its last chunk) and uploads those chunks again, and their compact counts the trailer as dead bytes and writes output without one. The index does not record the trailer yet: compact reads a candidate's 12-byte footer to tell it from dead bytes, and rebuilding the index from trailers comes in a later step. Readers: `repo::pack_trailer`
 - Pack ID = unkeyed hash of the entire pack contents (BLAKE2b-256 in format v2, BLAKE3 in v3), stored at `packs/<shard>/<hex_pack_id>`
 
 #### Data Packs vs Tree Packs
@@ -735,7 +752,7 @@ This design means `delete` is fast (just index updates), while space reclamation
 If a backup is interrupted after packs have been flushed but before commit, those packs would be orphaned. The **pending index journal** prevents re-uploading their data on the next run:
 
 1. During backup, every 8 data-pack flushes, vykar writes a `sessions/<session_id>.index` blob to storage containing pack→chunk mappings for all flushed packs in this session
-2. The next backup — under its own, new session ID — scans `sessions/` for journals left by other sessions. A journal is recovered when its `.json` marker is missing (orphaned) or stale; journals of active sessions, and the backup's own, are skipped. Recovered packs are batch-verified by listing shard directories (avoiding per-pack HEAD requests on REST/S3 backends)
+2. The next backup — under its own, new session ID — scans `sessions/` for journals left by other sessions. A journal is recovered when its `.json` marker is missing (orphaned) or stale; journals of active sessions, and the backup's own, are skipped. Recovered packs are batch-verified by listing shard directories (avoiding per-pack HEAD requests on REST/S3 backends). A pack is adopted when its length is exactly the end of its last journaled chunk (a pack without a trailer) or that plus exactly the trailer frame for its chunk count; no pack content is read
 3. Verified chunks are promoted into the dedup structures so subsequent dedup checks find them
 4. After a successful commit, the `sessions/<session_id>.index` blob is deleted
 5. `flush_on_abort()` writes a final journal before exiting, maximizing recovery coverage
@@ -799,14 +816,14 @@ flowchart TB
 1. Enumerate all pack files: one sized listing of `packs/` on a vykar-server, otherwise one sized listing per shard dir (`packs/00/` through `packs/ff/`), parallelized from `limits.connections` (remote: `min(connections*3, 24)`, local: `min(connections, 8)`)
 2. Sizes come from the listing; `HEAD`/stat only for packs it lists without one (servers before v0.22), parallelized the same way
 3. Compute live bytes per pack from the `ChunkIndex`: `live_bytes = Σ(4 + stored_size)` for each indexed blob in that pack
-4. Derive `dead_bytes = (pack_size - PACK_HEADER_SIZE) - live_bytes`; packs where `live_bytes > pack_payload` are marked corrupt
+4. Derive `dead_bytes = (pack_size - PACK_HEADER_SIZE) - live_bytes`; packs where `live_bytes > pack_payload` are marked corrupt. For a pack that would be a candidate, the last 12 bytes are read: a trailer footer whose frame fits inside the dead bytes counts as pack overhead, not as dead bytes, so a repack's own trailer never makes its output a candidate again. A failed read counts the trailer as dead
 5. Compute `unused_ratio = dead_bytes / pack_size` per pack
 6. Track pack health counters (`packs_corrupt`, `packs_orphan`) in addition to live/dead bytes
 7. Filter packs where `unused_ratio >= threshold`
 
 **Phase 2 — Repack:**
 For each candidate pack (most wasteful first, respecting `--max-repack-size` cap):
-1. If the backend's `server_ops()` offers repack (a vykar-server that advertises `repack`), send a repack plan and apply returned pack remaps
+1. If the backend's `server_ops()` offers repack with trailers (a vykar-server that advertises both `repack` and `repack_trailer`), send repack plans and apply returned pack remaps. Each operation that keeps blobs carries the output pack's encrypted trailer (`pack_type` repacked), built by the client from the offsets the server will write (`9 + Σ(4 + len)`); a result whose offsets differ is refused before the index changes. Plans are batched within the server's output cap (2 GiB), its 10 000 operations per plan and a bound on the plan's JSON below the 64 MiB admin body limit; an operation over any per-operation cap (output, 16 MiB trailer, JSON, 200 000 kept blobs) sends the whole selection to client-side repack. A server without `repack_trailer` gets a client-side repack, which writes trailers itself
 2. Otherwise run client-side repack:
    - If all blobs are dead → delete the pack file directly
    - Else validate pack header (magic + version) via `get_range(0..9)` and cross-check each on-disk blob length prefix against the index's `stored_size`

@@ -26,6 +26,7 @@ use vykar_core::index::{
 use vykar_core::repo::file_cache::{CachedChunkRef, CachedChunks, FileCache};
 use vykar_core::repo::format::{ObjectType, pack_object_with_context};
 use vykar_core::repo::pack::{PackType, PackWriter};
+use vykar_core::repo::pack_trailer::read_trailer_from_pack_bytes;
 use vykar_core::repo::{ChunkerParams, EncryptionMode, RepoConfig};
 use vykar_core::snapshot::SnapshotMeta;
 use vykar_core::snapshot::item::{ChunkRef, Item, ItemRawNames, ItemType};
@@ -56,6 +57,12 @@ fn write_seed(target: &str, name: &str, data: &[u8]) {
     fs::write(dir.join(name), data).unwrap();
 }
 
+/// The engine every sealed seed pack's trailer is written with: plaintext,
+/// so the trailer (and the corpus) stays deterministic.
+fn seed_engine() -> PlaintextEngine {
+    PlaintextEngine::new(ChunkHasher::new(HashAlgorithm::Blake3, [7; 32]))
+}
+
 fn seed_pack_scan() {
     // Empty valid pack (header only, no blobs)
     let mut header = Vec::new();
@@ -69,7 +76,7 @@ fn seed_pack_scan() {
         .unwrap();
     pw.add_blob(ChunkId::from_bytes([2; 32]), vec![0xBE, 0xEF, 0x42])
         .unwrap();
-    let sealed = pw.seal().unwrap();
+    let sealed = pw.seal(&seed_engine()).unwrap();
     write_seed(
         "fuzz_pack_scan",
         "two_blobs",
@@ -80,12 +87,39 @@ fn seed_pack_scan() {
     let mut pw = PackWriter::new(PackType::Data, usize::MAX, HashAlgorithm::Blake2b);
     pw.add_blob(ChunkId::from_bytes([3; 32]), vec![0x42; 256])
         .unwrap();
-    let sealed = pw.seal().unwrap();
+    let sealed = pw.seal(&seed_engine()).unwrap();
     write_seed(
         "fuzz_pack_scan",
         "one_large_blob",
         sealed.data.as_bytes().expect("heap-buffered pack"),
     );
+}
+
+fn seed_pack_trailer() {
+    let mut pw = PackWriter::new(PackType::Data, usize::MAX, HashAlgorithm::Blake2b);
+    pw.add_blob(ChunkId::from_bytes([1; 32]), vec![0xDE, 0xAD])
+        .unwrap();
+    pw.add_blob(ChunkId::from_bytes([2; 32]), vec![0xBE, 0xEF, 0x42])
+        .unwrap();
+    let sealed = pw.seal(&seed_engine()).unwrap();
+    let pack = sealed.data.as_bytes().expect("heap-buffered pack");
+    let trailer = read_trailer_from_pack_bytes(pack, &seed_engine())
+        .unwrap()
+        .expect("sealed pack has a trailer");
+    let body = trailer.encode_body();
+    let blob = trailer.seal_blob(&seed_engine()).unwrap();
+    let mut frame = u32::try_from(blob.len()).unwrap().to_le_bytes().to_vec();
+    frame.extend_from_slice(&blob);
+
+    write_seed("fuzz_pack_trailer", "body", &body);
+    write_seed("fuzz_pack_trailer", "frame", &frame);
+    write_seed("fuzz_pack_trailer", "pack", pack);
+    let mut newer = body.clone();
+    newer[0] = 2;
+    write_seed("fuzz_pack_trailer", "body_version_2", &newer);
+    let mut empty = body[..6].to_vec();
+    empty[2..6].copy_from_slice(&0u32.to_le_bytes());
+    write_seed("fuzz_pack_trailer", "body_count_0", &empty);
 }
 
 fn seed_decompress() {
@@ -887,7 +921,7 @@ fn seed_plaintext_read() {
                 .unwrap();
         let mut pw = PackWriter::new(PackType::Data, usize::MAX, algorithm);
         pw.add_blob(id, blob).unwrap();
-        let sealed = pw.seal().unwrap();
+        let sealed = pw.seal(&engine).unwrap();
 
         let mut data = vec![u8::from(algorithm == HashAlgorithm::Blake3)];
         data.extend_from_slice(id.as_bytes());
@@ -902,6 +936,9 @@ fn main() {
 
     seed_pack_scan();
     println!("  fuzz_pack_scan: done");
+
+    seed_pack_trailer();
+    println!("  fuzz_pack_trailer: done");
 
     seed_decompress();
     println!("  fuzz_decompress: done");

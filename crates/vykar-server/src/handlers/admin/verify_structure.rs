@@ -22,11 +22,16 @@ fn check_structure(repo_dir: &std::path::Path) -> serde_json::Value {
     let mut temp_files = 0u64;
 
     // Check required files.
-    for required in &["config", "index", "keys/repokey"] {
+    for required in &["config", "keys/repokey"] {
         let path = repo_dir.join(required);
         if !path.exists() {
             errors.push(format!("missing required file: {required}"));
         }
+    }
+    // The index head: `index` (formats v2-v5) or a head under `index.h/`
+    // (v6 and later, which have no `index`).
+    if !repo_dir.join("index").exists() && !has_index_head(repo_dir) {
+        errors.push("missing required file: index (or a head under index.h/)".into());
     }
 
     // Check pack shard structure.
@@ -115,6 +120,18 @@ fn check_structure(repo_dir: &std::path::Path) -> serde_json::Value {
     })
 }
 
+/// Whether `index.h/` holds at least one head key (`index.h/<gen>`).
+fn has_index_head(repo_dir: &std::path::Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(repo_dir.join(vykar_protocol::HEAD_DIR)) else {
+        return false;
+    };
+    entries.flatten().any(|e| {
+        let name = e.file_name();
+        let key = format!("{}/{}", vykar_protocol::HEAD_DIR, name.to_string_lossy());
+        e.path().is_file() && vykar_protocol::head_generation(&key).is_some()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use axum::http::StatusCode;
@@ -143,5 +160,31 @@ mod tests {
         assert_eq!(json["pack_count"], 1);
         assert_eq!(json["total_size"], pack_bytes.len() as u64);
         assert_eq!(json["temp_files"], 1);
+    }
+
+    /// A v6 repository has no `index`: a head under `index.h/` satisfies
+    /// the check, an empty `index.h/` does not.
+    #[tokio::test]
+    async fn a_head_under_index_h_replaces_index() {
+        let (router, _state, tmp) = setup_app(0);
+        std::fs::write(tmp.path().join("config"), b"cfg").unwrap();
+        std::fs::write(tmp.path().join("keys/repokey"), b"key").unwrap();
+        std::fs::create_dir_all(tmp.path().join("index.h")).unwrap();
+
+        let resp = authed_get(router.clone(), "/?verify-structure").await;
+        assert_status(&resp, StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(json["ok"], false, "{json}");
+        assert!(
+            json["errors"][0].as_str().unwrap().contains("index.h/"),
+            "{json}"
+        );
+
+        std::fs::write(tmp.path().join("index.h/x"), b"foreign").unwrap();
+        std::fs::write(tmp.path().join("index.h/1"), b"head").unwrap();
+        let resp = authed_get(router, "/?verify-structure").await;
+        assert_status(&resp, StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(json["ok"], true, "{json}");
     }
 }

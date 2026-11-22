@@ -903,8 +903,9 @@ mod tests {
         );
         assert_eq!(repo.delta_refcount_bump(&id), 2);
 
+        // Reuse is recorded in the delta but not persisted.
         repo.save_state().unwrap();
-        assert_eq!(repo.chunk_index().get(&id).unwrap().refcount, 3);
+        assert_eq!(repo.chunk_index().get(&id).unwrap().refcount, 1);
     }
 
     /// Over an index with unsaved edits (repair) a session sees the edits:
@@ -945,6 +946,6 @@ mod tests {
 
         repo.save_state().unwrap();
         assert!(!repo.chunk_index().contains(&removed));
-        assert_eq!(repo.chunk_index().get(&kept).unwrap().refcount, 2);
+        assert_eq!(repo.chunk_index().get(&kept).unwrap().refcount, 1);
     }
 }

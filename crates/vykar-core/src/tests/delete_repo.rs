@@ -71,7 +71,7 @@ fn delete_repo_preserves_unknown_files() {
 
     // But vykar files should be gone
     assert!(!repo_dir.join("config").exists());
-    assert!(!repo_dir.join("index").exists());
+    assert!(!repo_dir.join("index.h").exists());
     assert!(!repo_dir.join("index.gen").exists());
     assert!(!repo_dir.join("keys").exists());
 }
@@ -92,7 +92,7 @@ fn delete_repo_handles_partial_repo() {
 
     // Remove the files that would have been deleted in a partial first attempt
     std::fs::remove_file(repo_dir.join("config")).unwrap();
-    std::fs::remove_file(repo_dir.join("index")).unwrap();
+    super::helpers::remove_index_heads(&repo_dir);
 
     // Verify config is gone (old code would fail here with RepoNotFound)
     assert!(!repo_dir.join("config").exists());

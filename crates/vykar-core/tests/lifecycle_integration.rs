@@ -70,10 +70,10 @@ fn lifecycle_delete_compact_check_and_restore() {
         .first()
         .expect("delete returned no stats");
     assert_eq!(stats.snapshot_name, "snap-v1");
-    assert!(stats.chunks_deleted > 0);
 
     let compact_stats =
         commands::compact::run(&config, None, 0.0, None, false, &CancelToken::new()).unwrap();
+    assert!(compact_stats.chunks_unreferenced > 0);
     assert!(compact_stats.space_freed > 0);
 
     let check = commands::check::run(&config, None, true, false).unwrap();
@@ -763,7 +763,7 @@ vykar_storage::delegate_storage_backend! {
     except [get];
 
     fn get(&self, key: &str) -> vykar_types::error::Result<Option<Vec<u8>>> {
-        if key == "index" {
+        if key.starts_with("index.h/") {
             self.index_gets.fetch_add(1, Ordering::Relaxed);
         }
         self.inner.get(key)

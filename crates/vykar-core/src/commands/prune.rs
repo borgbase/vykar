@@ -11,23 +11,12 @@ use crate::repo::{OpenOptions, Repository};
 
 /// Aggregate result of a prune operation.
 ///
-/// Phase 2 (deleting `snapshots/<id>` blobs) is the commit point. After that,
-/// per-snapshot refcount cleanup and `save_state()` are best-effort — failures
-/// are collected into `warnings` rather than propagated as errors, since the
-/// snapshot blobs are already durably removed from storage.
-///
-/// Stats accuracy caveats:
-/// - Partial per-snapshot failures contribute no impact to
-///   `chunks_deleted`/`space_freed`, so aggregate totals may under-report what
-///   was actually freed in-memory. If `save_state()` also fails, totals will
-///   over-report what was persisted remotely (the remote index still shows
-///   the pre-prune refcounts). `vykar check --repair` is the canonical
-///   recovery path for accurate refcount accounting.
+/// Prune only deletes `snapshots/<id>` objects (the commit point of each
+/// removal); it does not read or write the index. The space the pruned
+/// snapshots alone used is reclaimed by the next `vykar compact`.
 pub struct PruneStats {
     pub kept: usize,
     pub pruned: usize,
-    pub chunks_deleted: u64,
-    pub space_freed: u64,
     pub warnings: Vec<String>,
 }
 
@@ -63,8 +52,7 @@ pub fn run(
     )
 }
 
-/// [`run`] on an already opened repository. The chunk index is loaded under
-/// the maintenance lock, so any index loaded at open is replaced.
+/// [`run`] on an already opened repository, under the maintenance lock.
 pub(crate) fn run_on_repo(
     repo: &mut Repository,
     config: &VykarConfig,
@@ -148,8 +136,6 @@ pub(crate) fn run_on_repo(
                 PruneStats {
                     kept,
                     pruned: to_prune.len(),
-                    chunks_deleted: 0,
-                    space_freed: 0,
                     warnings: Vec::new(),
                 },
                 list_entries,
@@ -159,25 +145,14 @@ pub(crate) fn run_on_repo(
         // Process oldest first
         to_prune.reverse();
 
-        // Loaded only now, under the lock, and only when something is
-        // removed: dry runs and empty prunes never touch the index.
-        if !to_prune.is_empty() {
-            repo.load_chunk_index_under_lock()?;
-        }
-
-        let targets = prepare_removal_targets(repo, &to_prune, shutdown)?;
-        let mut warnings: Vec<String> = Vec::new();
-        let removed = remove_snapshots(repo, targets, "prune", shutdown, &mut warnings)?;
-        let total_chunks_deleted = removed.iter().map(|r| r.impact.chunks_deleted).sum();
-        let total_space_freed = removed.iter().map(|r| r.impact.space_freed).sum();
+        let targets = prepare_removal_targets(repo, &to_prune)?;
+        let removed = remove_snapshots(repo, targets, shutdown)?;
 
         Ok((
             PruneStats {
                 kept,
-                pruned: to_prune.len(),
-                chunks_deleted: total_chunks_deleted,
-                space_freed: total_space_freed,
-                warnings,
+                pruned: removed.len(),
+                warnings: Vec::new(),
             },
             list_entries,
         ))

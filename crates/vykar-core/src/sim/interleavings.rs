@@ -6,6 +6,9 @@
 //! virtual time stays in Auto mode. Gates select an operation by (client,
 //! nth matching operation), never by a key the run invents; the keys a
 //! verdict needs (lock keys, markers) are read back from the op log.
+//!
+//! H4-segment is a regression since 05 step 8 (index garbage is collected
+//! by age): [`h4_segment_regression`].
 
 use std::time::Duration;
 
@@ -33,7 +36,6 @@ pub const CHECKED: &[Invariant] = &[
     Invariant::AcknowledgedCommitsDurable,
     Invariant::NoSilentRemoval,
     Invariant::IndexIntegrity,
-    Invariant::NoRefcountDeflation,
     Invariant::AllowedErrors,
     Invariant::LockExclusion,
 ];
@@ -336,9 +338,11 @@ pub fn h2_lock_refresh_resurrects() -> HazardOutcome {
 
 /// H2 with the reap placed by `reap`; `BeforeFence` neutralises it.
 ///
-/// A deletes t0 and is held at its first fence check; time moves 3 h 1 min,
-/// so A's lock is due for refresh. B, its clock 3 h ahead, sees A's lock as
-/// older than 6 h and reaps it.
+/// A deletes t0 and t2 and is held at its first fence check; time moves
+/// 3 h 1 min, so A's lock is due for refresh. B, its clock 3 h ahead, sees
+/// A's lock as older than 6 h and reaps it. A's fence before the second
+/// snapshot delete is the one that passes after the refresh rewrote its key
+/// (a delete writes no index since 05 step 8, so it has no later fence).
 pub fn h2_with(reap: H2Reap) -> HazardOutcome {
     settle(h2_scenario(reap))
 }
@@ -348,6 +352,7 @@ fn h2_scenario(reap: H2Reap) -> Scenario {
     let c = sim.client("c");
     ok(&sim.backup(c, "t0", &seeded("t0")), "control backup t0")?;
     ok(&sim.backup(c, "t1", &seeded("t1")), "control backup t1")?;
+    ok(&sim.backup(c, "t2", &seeded("t2")), "control backup t2")?;
     let (a, b) = (sim.client("a"), sim.client("b"));
     sim.set_skew(b, chrono::Duration::hours(3));
     let locks = || KeyMatch::Prefix("locks/".into());
@@ -358,7 +363,7 @@ fn h2_scenario(reap: H2Reap) -> Scenario {
     let sa = sim.spawn(
         a,
         Call::Delete {
-            names: vec!["t0".into()],
+            names: vec!["t0".into(), "t2".into()],
         },
     );
     reach(&sim, g_fence, "a's first fence check")?;
@@ -601,28 +606,58 @@ pub fn h4_compact_deletes_after_lost_lock() -> HazardOutcome {
 /// H4 with the clients placed by `hosts` and ordered by `order`.
 /// `Sequential` neutralises it; `Distinct` removes its prerequisite (H1).
 ///
-/// Compact A is held at its head PUT, after its segment PUT. Backup B, whose
-/// registration probe reaps A's lock, is held after its head GET and before
-/// its segment PUT. A resumes, deletes t0's old pack and ends `Ok`; then B
-/// commits on the head it read.
+/// Compact A is held at its second head PUT (the first is its sweep's),
+/// after the repack batch's segment PUT. Backup B, whose registration probe
+/// reaps A's lock, is held after its head GET and before its segment PUT. A
+/// resumes, deletes t0's old pack and ends `Ok`; then B commits on the head
+/// it read.
 pub fn h4_with(hosts: Hosts, order: Order) -> HazardOutcome {
     settle(h4_scenario(hosts, order, BackupGate::Segment))
 }
 
-/// H4-segment: a compact whose lock was reaped deletes a concurrent
-/// writer's segment as unreferenced.
-pub fn h4_segment_deleted() -> HazardOutcome {
-    h4_segment_with(Hosts::SameHostname, Order::Interleaved)
-}
-
 /// H4-segment: as H4, but B is held at its head PUT, after its segment PUT.
-/// A's end-of-run index upkeep (`collect_garbage`, unfenced) deletes B's
-/// segment, and B's head then names it.
+/// Before 05 step 8, A's end-of-run index upkeep (`collect_garbage`,
+/// unfenced) deleted B's segment, and B's head then named it.
 pub fn h4_segment_with(hosts: Hosts, order: Order) -> HazardOutcome {
     settle(h4_scenario(hosts, order, BackupGate::Head))
 }
 
-fn h4_scenario(hosts: Hosts, order: Order, at: BackupGate) -> Scenario {
+/// H4-segment as a regression: `HeadObjectAbsent` for B's segment if it is
+/// absent, else a clean report. The H4 damage of the same run is not this
+/// regression's subject.
+pub fn h4_segment_regression() -> Report {
+    let mut out = Report::default();
+    let (sim, b) = match h4_run(Hosts::SameHostname, Order::Interleaved, BackupGate::Head) {
+        Ok(Ok(run)) => run,
+        Ok(Err(outcome)) | Err(outcome) => {
+            out.add(
+                ViolationKind::DisallowedError,
+                "scenario",
+                format!("{outcome:?}"),
+            );
+            return out;
+        }
+    };
+    let segments = sim.store().keys_written_by(b, "index.d/");
+    if segments.is_empty() {
+        out.add(ViolationKind::HeadObjectAbsent, "b", "b wrote no segment");
+    }
+    for k in segments {
+        if sim.store().object(&k).is_none() {
+            out.add(ViolationKind::HeadObjectAbsent, &k, "b's segment deleted");
+        }
+    }
+    out
+}
+
+/// The runs of H4 and H4-segment: A and B in flight as `order` says.
+/// `Ok(Err(o))`: an early outcome that is not a broken precondition.
+#[allow(clippy::type_complexity)]
+fn h4_runs(
+    hosts: Hosts,
+    order: Order,
+    at: BackupGate,
+) -> Result<Result<(Sim, ClientId, ClientId, RunRecord, RunRecord), HazardOutcome>, HazardOutcome> {
     let mut sim = Sim::new();
     let c = sim.client("c");
     let x = seeded("x");
@@ -632,8 +667,9 @@ fn h4_scenario(hosts: Hosts, order: Order, at: BackupGate) -> Scenario {
     ok(&sim.backup(c, "t1", &t1), "setup backup t1")?;
     ok(&sim.delete(c, &["t0"]), "setup delete t0")?;
     let (a, b) = pair(&mut sim, hosts);
-    let head = || KeyMatch::Exact("index".into());
-    let ga = sim.gate(GateRule::new(a, OpMatch::AnyWrite, head()));
+    let head = || KeyMatch::Prefix("index.h/".into());
+    // A's first head is its sweep's; the second follows the repack batch.
+    let ga = sim.gate(GateRule::new(a, OpMatch::AnyWrite, head()).nth(2));
     let gb = sim.gate(GateRule::new(
         b,
         OpMatch::AnyWrite,
@@ -643,10 +679,11 @@ fn h4_scenario(hosts: Hosts, order: Order, at: BackupGate) -> Scenario {
         },
     ));
     let sa = sim.spawn(a, Call::Compact);
-    reach(&sim, ga, "compact a's head PUT")?;
+    reach(&sim, ga, "compact a's second head PUT (nth 2)")?;
     if sim.store().keys_written_by(a, "packs/").is_empty() {
         return Err(broken(
-            "compact repacked nothing; adjust the setup or the threshold",
+            "compact repacked nothing before its second head PUT (nth 2); adjust the \
+             setup, the threshold or the gate's nth",
         ));
     }
     let backup_b1 = || Call::Backup {
@@ -666,10 +703,10 @@ fn h4_scenario(hosts: Hosts, order: Order, at: BackupGate) -> Scenario {
                         outcomes(&ra, &rb)
                     )));
                 }
-                return Ok(HazardOutcome::PrerequisiteNotReproduced {
+                return Ok(Err(HazardOutcome::PrerequisiteNotReproduced {
                     prerequisite: "H1",
                     evidence: format!("b could not reap a's lock\n{}", outcomes(&ra, &rb)),
-                });
+                }));
             }
             sim.resume(ga);
             let ra = sim.join(sa);
@@ -682,6 +719,23 @@ fn h4_scenario(hosts: Hosts, order: Order, at: BackupGate) -> Scenario {
             sim.resume(gb);
             (ra, sim.call(b, backup_b1()))
         }
+    };
+    Ok(Ok((sim, a, b, ra, rb)))
+}
+
+/// [`h4_runs`], keeping only the store and B.
+fn h4_run(
+    hosts: Hosts,
+    order: Order,
+    at: BackupGate,
+) -> Result<Result<(Sim, ClientId), HazardOutcome>, HazardOutcome> {
+    Ok(h4_runs(hosts, order, at)?.map(|(sim, _, b, _, _)| (sim, b)))
+}
+
+fn h4_scenario(hosts: Hosts, order: Order, at: BackupGate) -> Scenario {
+    let (sim, a, b, ra, rb) = match h4_runs(hosts, order, at)? {
+        Ok(run) => run,
+        Err(outcome) => return Ok(outcome),
     };
     let report = sim.check_invariants(CHECKED);
     controls(&report)?;

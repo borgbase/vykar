@@ -186,7 +186,12 @@ impl Fixture {
 
     /// Remove every object a candidate key could be proved against.
     fn strip_provable_data(&self) {
-        std::fs::remove_file(self.repo_dir.join("index")).unwrap();
+        for entry in std::fs::read_dir(self.repo_dir.join("index.h"))
+            .unwrap()
+            .flatten()
+        {
+            std::fs::remove_file(entry.path()).unwrap();
+        }
         let snapshots = self.repo_dir.join("snapshots");
         if snapshots.is_dir() {
             for entry in std::fs::read_dir(&snapshots).unwrap().flatten() {
@@ -985,7 +990,14 @@ fn export_works_on_a_repository_open_would_choke_on_and_writes_nothing() {
     let fx = Fixture::new();
     std::fs::remove_file(fx.secondary()).unwrap();
     let before = key_dir_snapshot(&fx.repo_dir);
-    make_unreadable_via_fs(&fx.repo_dir.join("index"));
+    // Every head: a listing skips the directory, so one left readable would
+    // be taken as the latest.
+    for entry in std::fs::read_dir(fx.repo_dir.join("index.h"))
+        .unwrap()
+        .flatten()
+    {
+        make_unreadable_via_fs(&entry.path());
+    }
 
     // Export first: `open` backfills the missing copy before it trips over
     // the index head, which would mask whether *export* wrote anything.

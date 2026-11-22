@@ -88,9 +88,9 @@ impl Fx {
         .unwrap()
     }
 
-    /// Delete `index` and every object in `index.d/`.
+    /// Delete every head and every object in `index.d/`.
     fn delete_index(&self) {
-        let _ = std::fs::remove_file(self.repo_dir.join("index"));
+        super::helpers::remove_index_heads(&self.repo_dir);
         for entry in std::fs::read_dir(self.repo_dir.join(INDEX_OBJECT_DIR)).unwrap() {
             let path = entry.unwrap().path();
             if path.is_file() {
@@ -547,7 +547,7 @@ fn rebuild_refuses_objects_of_a_newer_vykar() {
         fx.write("a.bin", &data(1, 100_000));
         fx.backup("s1");
         let key = if newer_map {
-            let mut object = vec![ObjectType::PackMap as u8 + 1];
+            let mut object = vec![ObjectType::SweepRecord as u8 + 1];
             object.extend_from_slice(b"from the future");
             let name = blake3::hash(&object).to_hex().to_string();
             let dir = fx.repo_dir.join("packmaps");
@@ -665,13 +665,21 @@ fn rebuild_after_removing_a_corrupt_chunk_leaves_it_out() {
     let entries = fx.entries_of(pack_id);
     assert!(entries.len() > 1, "{entries:?}");
     assert_eq!(fx.pack_maps(), 0);
-    let (corrupt, offset) = fx
-        .open()
+    // The chunk of a.bin: in the pack, and not referenced by `s2`.
+    let mut repo = fx.open();
+    let in_s2: std::collections::HashSet<ChunkId> =
+        commands::list::load_snapshot_items(&mut repo, "s2", &CancelToken::new())
+            .unwrap()
+            .iter()
+            .flat_map(|i| i.chunks.iter().map(|c| c.id))
+            .collect();
+    let (corrupt, offset) = repo
         .chunk_index()
         .iter()
-        .find(|(_, e)| e.pack_id == pack_id && e.refcount == 1)
+        .find(|(id, e)| e.pack_id == pack_id && !in_s2.contains(id))
         .map(|(id, e)| (id, e.pack_offset))
         .unwrap();
+    drop(repo);
     let mut bytes = std::fs::read(&pack).unwrap();
     bytes[offset as usize + 1] ^= 0xFF;
     std::fs::write(&pack, &bytes).unwrap();

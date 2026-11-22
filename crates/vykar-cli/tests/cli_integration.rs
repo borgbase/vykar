@@ -275,15 +275,15 @@ fn cli_init_backup_list_restore_info_roundtrip() {
     let info_out = fx.run_ok(&["--config", &cfg, "info"]);
     assert!(info_out.contains("Snapshots"));
     assert!(info_out.contains("Encryption"));
-    // Users hold a mix of v2 to v5 repositories; `info` has to say which.
+    // Users hold a mix of repository formats; `info` has to say which.
     let has_row = |label: &str, value: &str| {
         info_out
             .lines()
             .any(|l| l.contains(label) && l.contains(value))
     };
     assert!(
-        has_row("Format", "v5"),
-        "expected a Format row reading v5, got:\n{info_out}"
+        has_row("Format", "v6"),
+        "expected a Format row reading v6, got:\n{info_out}"
     );
     assert!(
         has_row("Hash", "blake3"),
@@ -291,10 +291,10 @@ fn cli_init_backup_list_restore_info_roundtrip() {
     );
 }
 
-/// `vykar init` must write format v5 to the repository `config`, read straight
+/// `vykar init` must write format v6 to the repository `config`, read straight
 /// off disk rather than through the library that produced it.
 #[test]
-fn cli_init_writes_repository_format_v5() {
+fn cli_init_writes_repository_format_v6() {
     let fx = CliFixture::new();
     write_plain_config(&fx.config_path, &fx.repo_dir);
     let cfg = fx.config_path.to_string_lossy().to_string();
@@ -309,13 +309,15 @@ fn cli_init_writes_repository_format_v5() {
         Some(&0x97),
         "RepoConfig must stay a 7-element msgpack array"
     );
-    assert_eq!(config_bytes.get(1), Some(&5), "init must write version 5");
+    assert_eq!(config_bytes.get(1), Some(&6), "init must write version 6");
+    assert!(fx.repo_dir.join("index.h").join("1").is_file());
+    assert!(!fx.repo_dir.join("index").exists());
 }
 
 /// The empty v3 repository 0.24 creates, at `repo_dir`: no binary writes
-/// v2/v3 any more, so a v5 one is rewritten into it. `index` becomes an empty
+/// v2/v3 any more, so a v6 one is rewritten into it. `index` becomes an empty
 /// `IndexBlob` (zstd msgpack, packed as `ChunkIndex` with context `index`),
-/// `index.gen` 0, `index.d/` goes and `config` says version 3.
+/// `index.gen` 0, `index.d/` and `index.h/` go and `config` says version 3.
 fn init_empty_v3(repo_dir: &Path) {
     use vykar_core::repo::format::{ObjectType, pack_object_streaming_with_context};
 
@@ -360,6 +362,7 @@ fn init_empty_v3(repo_dir: &Path) {
     std::fs::write(repo_dir.join("index"), index).unwrap();
     std::fs::write(repo_dir.join("index.gen"), 0u64.to_le_bytes()).unwrap();
     std::fs::remove_dir_all(repo_dir.join("index.d")).unwrap();
+    std::fs::remove_dir_all(repo_dir.join("index.h")).unwrap();
     let path = repo_dir.join("config");
     let mut config: vykar_core::repo::RepoConfig =
         rmp_serde::from_slice(&std::fs::read(&path).unwrap()).unwrap();
@@ -367,10 +370,10 @@ fn init_empty_v3(repo_dir: &Path) {
     std::fs::write(path, rmp_serde::to_vec(&config).unwrap()).unwrap();
 }
 
-/// `vykar upgrade` takes a v3 repository to v5. It refuses to run without a
+/// `vykar upgrade` takes a v3 repository to v6. It refuses to run without a
 /// terminal unless `--yes` is given, and a second run does nothing.
 #[test]
-fn cli_upgrade_moves_a_v3_repository_to_v5() {
+fn cli_upgrade_moves_a_v3_repository_to_v6() {
     let fx = CliFixture::new();
     write_plain_config(&fx.config_path, &fx.repo_dir);
     let cfg = fx.config_path.to_string_lossy().to_string();
@@ -387,15 +390,16 @@ fn cli_upgrade_moves_a_v3_repository_to_v5() {
     );
 
     let out = fx.run_ok(&["--config", &cfg, "upgrade", "--yes"]);
-    assert!(out.contains("from format v3 to v5"), "{out}");
+    assert!(out.contains("from format v3 to v6"), "{out}");
     assert_eq!(
         std::fs::read(fx.repo_dir.join("config")).unwrap().get(1),
-        Some(&5)
+        Some(&6)
     );
+    assert!(!fx.repo_dir.join("index").exists());
     assert!(!fx.repo_dir.join("index.gen").exists());
 
     let out = fx.run_ok(&["--config", &cfg, "upgrade", "--yes"]);
-    assert!(out.contains("already at format v5"), "{out}");
+    assert!(out.contains("already at format v6"), "{out}");
 }
 
 #[test]
@@ -1147,7 +1151,7 @@ fn cli_bulk_snapshot_delete() {
     let delete_out = fx.run_ok(&["--config", &cfg, "snapshot", "delete", &snap1, &snap2]);
     assert!(delete_out.contains(&format!("Deleted snapshot '{snap1}'")));
     assert!(delete_out.contains(&format!("Deleted snapshot '{snap2}'")));
-    assert!(delete_out.contains("Total:"));
+    assert!(delete_out.contains("Run `vykar compact` to reclaim their space."));
 
     // Third snapshot survives.
     let list_after = fx.run_ok(&["--config", &cfg, "list"]);
@@ -1542,7 +1546,7 @@ fn cli_check_repair_dry_run_reports_an_unreadable_head() {
     ] {
         let _ = std::fs::remove_dir_all(dir);
     }
-    let index = fx.repo_dir.join("index");
+    let index = latest_head(&fx.repo_dir);
     let bytes = std::fs::read(&index).unwrap();
     std::fs::write(&index, &bytes[..bytes.len() / 2]).unwrap();
 
@@ -3163,7 +3167,12 @@ fn cli_key_import_unproven_key_needs_force() {
     );
 
     // Remove every piece of evidence: the repository's own ciphertext...
-    std::fs::remove_file(fx.repo_dir.join("index")).unwrap();
+    for entry in std::fs::read_dir(fx.repo_dir.join("index.h"))
+        .unwrap()
+        .flatten()
+    {
+        std::fs::remove_file(entry.path()).unwrap();
+    }
     for entry in std::fs::read_dir(fx.repo_dir.join("snapshots"))
         .unwrap()
         .flatten()
@@ -3510,4 +3519,15 @@ fn cli_key_export_honours_trust_repo_when_copies_diverge() {
         exported, genuine,
         "--trust-repo must resolve the divergence, not export the planted copy"
     );
+}
+
+/// The file of the latest index head of the repository at `repo_dir`.
+fn latest_head(repo_dir: &Path) -> std::path::PathBuf {
+    std::fs::read_dir(repo_dir.join("index.h"))
+        .unwrap()
+        .flatten()
+        .filter_map(|e| Some((e.file_name().to_str()?.parse::<u64>().ok()?, e.path())))
+        .max_by_key(|(g, _)| *g)
+        .map(|(_, p)| p)
+        .expect("an index head")
 }

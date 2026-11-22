@@ -46,7 +46,7 @@ const PLAINTEXT_CHUNK_ID_KEY_CONTEXT: &str =
 /// resistance.
 pub(crate) fn derive_plaintext_chunk_id_key(repo_id: &[u8], format: RepoFormat) -> [u8; 32] {
     // Follows the chunk hash, not the version: a v2 repository keeps its key
-    // as v4.
+    // as v7.
     match format.chunk_hash() {
         // Frozen: RustCrypto BLAKE2b-256, exactly as v2 repositories were
         // written. Do not "modernise" this to blake2b_simd without checking
@@ -179,7 +179,7 @@ impl Repository {
         // Pre-flight: refuse to create a repository the server cannot serve.
         //
         // Load-bearing, because `init` writes only non-pack keys (config,
-        // keys/repokey, index) and an old server accepts every one
+        // keys/repokey, index.h/1) and an old server accepts every one
         // of them. Without this probe `vykar init` would *succeed* against an
         // old server and only the first `backup` would fail, leaving a repo
         // nobody can write to.
@@ -200,6 +200,15 @@ impl Repository {
                 return Err(VykarError::Config(format!(
                     "vykar-server at {} (version {}) does not support the segmented \
                      index of format v{}. Upgrade the server first.",
+                    storage_label(init_opts),
+                    caps.version,
+                    format.version(),
+                )));
+            }
+            if !caps.serves_v6_key_dirs() {
+                return Err(VykarError::Config(format!(
+                    "vykar-server at {} (version {}) does not accept the index.h/ and \
+                     packmaps/ keys of format v{}. Upgrade the server first.",
                     storage_label(init_opts),
                     caps.version,
                     format.version(),
@@ -243,11 +252,12 @@ impl Repository {
 
         let manifest = Manifest::new();
         let chunk_index = LiveIndex::empty();
-        // Server-side init does not create `index.d/`: a server that predates
-        // it refuses to start with the directory present.
+        // Server-side init does not create `index.d/` or `index.h/`: a server
+        // that predates them refuses to start with the directories present.
         storage.create_dir(index_store::INDEX_OBJECT_DIR)?;
-        let head = IndexHead::empty();
-        storage.put("index", &index_store::pack_head(&head, crypto.as_ref())?)?;
+        storage.create_dir(index_store::HEAD_PREFIX)?;
+        let head = IndexHead::initial();
+        index_store::put_head(storage.as_ref(), &head, crypto.as_ref())?;
         let index_generation = generation_for_state(&head.state_hash);
         let index_head = Some(head);
 
@@ -283,6 +293,8 @@ impl Repository {
             index_head,
             fold_policy: Default::default(),
             fold_requested: false,
+            pending_sweep: None,
+            index_gc_grace: index_store::INDEX_GC_GRACE,
         })
     }
 
@@ -498,6 +510,8 @@ impl Repository {
             index_head,
             fold_policy: Default::default(),
             fold_requested: false,
+            pending_sweep: None,
+            index_gc_grace: index_store::INDEX_GC_GRACE,
         };
         Ok((repo, file_cache_load))
     }
@@ -614,6 +628,14 @@ mod tests {
         assert_eq!(
             hex::encode(derive_plaintext_chunk_id_key(&repo_id, RepoFormat::V3)),
             "947392f5ba41ab94ef39cc84b74bbb5a0c578bf7841b6b6cf76b17ad4a9e5b67"
+        );
+        assert_eq!(
+            derive_plaintext_chunk_id_key(&repo_id, RepoFormat::V7),
+            derive_plaintext_chunk_id_key(&repo_id, RepoFormat::V2)
+        );
+        assert_eq!(
+            derive_plaintext_chunk_id_key(&repo_id, RepoFormat::V6),
+            derive_plaintext_chunk_id_key(&repo_id, RepoFormat::V3)
         );
     }
 }

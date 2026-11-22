@@ -1,11 +1,11 @@
-//! Compatibility tests against **frozen** segmented-index (v4/v5) fixtures.
+//! The **frozen** segmented-index (v4/v5) fixtures.
 //!
 //! The archives under `tests/fixtures/` were written by the binary named in
-//! `scripts/gen-segmented-fixtures.sh`: each holds a head with a base, two
-//! segments over it and a non-empty `retired` generation. v4 is the v2
-//! fixture upgraded in place. A failure here means today's binary can no
-//! longer read or extend segmented repositories that exist in the wild, so
-//! **do not regenerate them** (see `tests/fixtures/README.md`).
+//! `scripts/gen-segmented-fixtures.sh` (development builds of formats 4 and
+//! 5). Since 05 step 8 no binary opens v4/v5: these tests check that every
+//! open, the upgrade's included, refuses them by version and leaves them
+//! byte-identical. **Do not regenerate them** (see `tests/fixtures/README.md`);
+//! they are deleted in 05 step 10.
 
 #![allow(clippy::unwrap_used)]
 #![allow(clippy::pedantic)]
@@ -16,17 +16,12 @@
 
 mod common;
 
-use std::collections::BTreeSet;
-use std::path::Path;
-
 use vykar_core::commands;
-use vykar_core::index::head::IndexHead;
-use vykar_core::repo::Repository;
-use vykar_core::repo::control::CancelToken;
-use vykar_types::hash::HashAlgorithm;
+use vykar_core::repo::{OpenOptions, Repository};
+use vykar_storage::local_backend::LocalBackend;
+use vykar_types::error::VykarError;
 
 use crate::common::fixtures::{self, Fixture, archive_path, read_tree};
-use crate::common::{backup_source, exercise_pack_naming};
 
 /// `(prefix, mode)` of every segmented fixture.
 const FIXTURES: &[(&str, &str)] = &[
@@ -79,60 +74,6 @@ fn extract(prefix: &str, mode: &str) -> Fixture {
     fixtures::extract(prefix, mode, u64::from(format_version(prefix)))
 }
 
-fn head(repo: &Repository) -> IndexHead {
-    repo.index_head()
-        .expect("a segmented repository has a head")
-        .clone()
-}
-
-/// Hex names of the head's base, segments and retired objects.
-fn named_objects(head: &IndexHead) -> BTreeSet<String> {
-    head.live_objects()
-        .chain(head.retired.iter().copied())
-        .map(|n| n.to_hex())
-        .collect()
-}
-
-/// File names under `repo/index.d/`.
-fn index_files(repo_dir: &Path) -> BTreeSet<String> {
-    std::fs::read_dir(repo_dir.join("index.d"))
-        .unwrap()
-        .map(|e| e.unwrap().file_name().into_string().unwrap())
-        .collect()
-}
-
-fn sorted_entries(
-    repo: &Repository,
-) -> Vec<(
-    vykar_types::chunk_id::ChunkId,
-    vykar_core::index::ChunkIndexEntry,
-)> {
-    let mut out: Vec<_> = repo.chunk_index().iter().collect();
-    out.sort_by_key(|(id, _)| *id.as_bytes());
-    out
-}
-
-fn assert_cold_equals_warm(fx: &Fixture, cold_name: &str, label: &str) {
-    let warm = fx.open();
-    let cold = fx.open_cold(cold_name);
-    let entries = sorted_entries(&warm);
-    assert_eq!(
-        entries,
-        sorted_entries(&cold),
-        "{label}: a cold open differs from the warm one"
-    );
-    assert_eq!(entries.len() as u64, head(&cold).entries, "{label}");
-}
-
-fn assert_check_clean(fx: &Fixture, label: &str) {
-    let result = commands::check::run(&fx.config(), fx.passphrase(), true, false).unwrap();
-    assert!(
-        result.errors.is_empty(),
-        "{label}: check --verify-data reported {:?}",
-        result.errors
-    );
-}
-
 #[test]
 fn segmented_fixture_archives_are_frozen() {
     let mut mismatches = Vec::new();
@@ -158,164 +99,35 @@ fn segmented_fixture_archives_are_frozen() {
     );
 }
 
+/// FIX-1: every v4 and v5 fixture is refused by version, by a normal open,
+/// by the upgrade's open and by `vykar upgrade`, and its files are unchanged.
 #[test]
-fn segmented_fixtures_open_at_their_format() {
+fn segmented_fixtures_are_refused_by_version() {
     for (prefix, mode) in FIXTURES {
         let label = format!("{prefix}-{mode}");
         let fx = extract(prefix, mode);
-        let repo = fx.open();
-        assert_eq!(repo.config.version, format_version(prefix), "{label}");
-        assert_eq!(repo.config.encryption, fx.expected_encryption(), "{label}");
-        let mut listed: Vec<_> = repo
-            .manifest()
-            .snapshots
-            .iter()
-            .map(|s| s.name.clone())
-            .collect();
-        listed.sort();
-        let mut expected = fx.snapshots.clone();
-        expected.sort();
-        assert_eq!(listed, expected, "{label}: every snapshot must be listable");
-        assert!(repo.skipped_snapshots().is_empty(), "{label}");
-
-        let head = head(&repo);
-        assert!(head.base.is_some(), "{label}: head has no base");
-        assert_eq!(
-            Some(head.segments.len() as u64),
-            fx.meta["expected_segments"].as_u64(),
-            "{label}"
-        );
-        assert!(!head.retired.is_empty(), "{label}: head has no retired set");
-
-        let meta: BTreeSet<String> = fx.meta["index_objects"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_str().unwrap().to_string())
-            .collect();
-        assert_eq!(named_objects(&head), meta, "{label}: head names");
-        assert_eq!(index_files(&fx.repo_dir()), meta, "{label}: index.d/");
-    }
-}
-
-#[test]
-fn segmented_fixtures_cold_open_equals_warm() {
-    for (prefix, mode) in FIXTURES {
-        let fx = extract(prefix, mode);
-        assert_cold_equals_warm(&fx, "cold", &format!("{prefix}-{mode}"));
-    }
-}
-
-#[test]
-fn segmented_fixtures_restore_byte_identical() {
-    for (prefix, mode) in FIXTURES {
-        let fx = extract(prefix, mode);
-        let config = fx.config();
-        let dest = fx.root.join("restore-original");
-        commands::restore::run(
-            &config,
-            fx.passphrase(),
-            fx.latest_snapshot(),
-            dest.to_str().unwrap(),
-            None,
-            config.xattrs.enabled,
-            true, // verify chunk IDs
-            &CancelToken::new(),
-        )
-        .unwrap();
-        assert_eq!(
-            read_tree(&dest),
-            read_tree(&fx.source_dir()),
-            "{prefix}-{mode}: restored tree differs from the tree that was backed up"
-        );
-    }
-}
-
-#[test]
-fn segmented_fixtures_verify_data_is_clean() {
-    for (prefix, mode) in FIXTURES {
-        let fx = extract(prefix, mode);
-        assert_check_clean(&fx, &format!("{prefix}-{mode}"));
-    }
-}
-
-/// A backup extends the frozen chain by exactly one segment: no fold, and
-/// every object the old binary wrote stays named.
-#[test]
-fn segmented_fixtures_accept_a_backup_as_one_segment() {
-    for (prefix, mode) in FIXTURES {
-        let label = format!("{prefix}-{mode}");
-        let fx = extract(prefix, mode);
-        let config = fx.config();
-        let before = head(&fx.open());
-        let files_before = index_files(&fx.repo_dir());
-
-        let stats = backup_source(
-            &config,
-            &fx.source_dir(),
-            "fixture-src",
-            "post-fixture-snap",
-            fx.passphrase(),
-            config.xattrs.enabled,
-        );
-        assert!(
-            stats.deduplicated_size < stats.original_size / 8,
-            "{label}: {} of {} bytes were newly stored",
-            stats.deduplicated_size,
-            stats.original_size
-        );
-
-        let after = head(&fx.open());
-        let n = before.segments.len();
-        assert_eq!(after.base, before.base, "{label}: base changed");
-        assert_eq!(after.retired, before.retired, "{label}: retired changed");
-        assert_eq!(after.segments.len(), n + 1, "{label}");
-        assert_eq!(after.segments[..n], before.segments[..], "{label}");
-
-        let files_after = index_files(&fx.repo_dir());
-        assert!(files_after.is_superset(&files_before), "{label}");
-        assert_eq!(files_after.len(), files_before.len() + 1, "{label}");
-
-        assert_cold_equals_warm(&fx, "cold-after-backup", &label);
-        assert_check_clean(&fx, &label);
-    }
-}
-
-/// Compact's garbage collection keeps the retired generation of a head an
-/// older binary wrote.
-#[test]
-fn segmented_fixtures_compact_keeps_the_retired_generation() {
-    for (prefix, mode) in FIXTURES {
-        let label = format!("{prefix}-{mode}");
-        let fx = extract(prefix, mode);
-        let before = head(&fx.open());
-
-        commands::compact::run(
-            &fx.config(),
-            fx.passphrase(),
-            100.0,
-            None,
-            false,
-            &CancelToken::new(),
-        )
-        .unwrap();
-
-        let files = index_files(&fx.repo_dir());
-        for name in named_objects(&before) {
-            assert!(files.contains(&name), "{label}: {name} was deleted");
-        }
-        assert_eq!(head(&fx.open()).retired, before.retired, "{label}");
-    }
-}
-
-#[test]
-fn segmented_fixtures_name_new_packs_by_their_hash() {
-    for (prefix, mode) in FIXTURES {
-        let fx = extract(prefix, mode);
-        let algo = match *prefix {
-            "v4" => HashAlgorithm::Blake2b,
-            _ => HashAlgorithm::Blake3,
+        let version = format_version(prefix);
+        let before = read_tree(&fx.repo_dir());
+        let refused = |e: VykarError, what: &str| {
+            assert!(
+                matches!(e, VykarError::UnsupportedVersion(v) if v == version),
+                "{label} {what}: {e:?}"
+            );
         };
-        exercise_pack_naming(&fx.config(), fx.passphrase(), &fx.source_dir(), algo);
+        for opts in [
+            OpenOptions::new().with_index(),
+            OpenOptions::new().legacy_format(),
+        ] {
+            let storage = Box::new(LocalBackend::new(fx.repo_dir().to_str().unwrap()).unwrap());
+            let err = Repository::open(storage, fx.passphrase(), Some(fx.cache_dir()), opts)
+                .err()
+                .expect("refused");
+            refused(err, "open");
+        }
+        refused(
+            commands::upgrade::run(&fx.config(), fx.passphrase()).expect_err("refused"),
+            "upgrade",
+        );
+        assert_eq!(read_tree(&fx.repo_dir()), before, "{label}: files changed");
     }
 }

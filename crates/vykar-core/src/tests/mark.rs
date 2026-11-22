@@ -227,7 +227,7 @@ impl Fx {
     /// The index head and the names under `index.d/`: what a report must
     /// not change.
     fn state(&self) -> (Vec<u8>, Vec<String>) {
-        let head = std::fs::read(self.repo_dir.join("index")).unwrap();
+        let head = std::fs::read(super::helpers::latest_head_path(&self.repo_dir)).unwrap();
         let mut objects = Vec::new();
         collect_files(&self.repo_dir.join("index.d"), &mut objects);
         objects.sort();
@@ -280,6 +280,32 @@ fn write_tree(dir: &Path, tag: &str, dirs: usize) {
             std::fs::write(sub.join(format!("f-{f:04}.txt")), format!("{tag}/{d}/{f}")).unwrap();
         }
     }
+}
+
+/// The largest tree [`with_four_tree_chunks`] tries.
+const TREE_DIRS_MAX: usize = 32;
+
+/// A fixture from `build(fx, dirs)` (`dirs` for [`write_tree`]) whose
+/// snapshot `name` has at least 4 tree chunks, all in one pack: rebuilt
+/// from scratch with one more directory until it does, from 4. The count
+/// depends on the repository's random chunker key, so no fixed size
+/// guarantees it.
+fn with_four_tree_chunks(encrypted: bool, name: &str, build: impl Fn(&Fx, usize)) -> Fx {
+    for dirs in 4..=TREE_DIRS_MAX {
+        let fx = Fx::new(encrypted);
+        build(&fx, dirs);
+        let ptrs = fx.item_ptrs(name);
+        let repo = fx.open();
+        let packs: HashSet<String> = ptrs
+            .iter()
+            .map(|id| repo.chunk_index().get(id).unwrap().pack_id.storage_key())
+            .collect();
+        drop(repo);
+        if ptrs.len() >= 4 && packs.len() == 1 {
+            return fx;
+        }
+    }
+    panic!("no tree of up to {TREE_DIRS_MAX} directories gave 4 tree chunks in one pack");
 }
 
 /// The independent oracle: today's sequential refcount rebuild, per
@@ -486,10 +512,21 @@ fn report_on_a_healthy_repository_is_clean() {
         .unwrap();
         assert_eq!(stats.pruned, 2);
 
+        // Prune leaves the pruned snapshots' entries for compact to sweep.
+        let report = fx.report().unwrap();
+        assert_eq!(report.snapshots, 2);
+        assert!(!report.unreferenced.is_empty(), "encrypted={encrypted}");
+        let swept =
+            commands::compact::run(&fx.config, fx.pass, 10.0, None, false, &CancelToken::new())
+                .unwrap();
+        assert_eq!(
+            swept.chunks_unreferenced as usize,
+            report.unreferenced.len()
+        );
+
         let report = fx.report().unwrap();
         assert_eq!(report.snapshots, 2);
         assert!(report.unreferenced.is_empty(), "{:?}", report.unreferenced);
-        assert_eq!(report.refcount_mismatches, 0, "encrypted={encrypted}");
         assert_eq!(report.referenced, report.entries);
         assert_eq!(report.packs_with_unreferenced, 0);
         assert!(report.items > 0 && report.references > 0 && report.tree_chunks > 0);
@@ -563,12 +600,13 @@ fn bytes_read_from(reads: &Reads, repo: &Repository, ids: &[ChunkId]) -> (usize,
 
 #[test]
 fn mark_decodes_each_distinct_tree_chunk_once() {
-    let fx = Fx::new(false);
-    let src = fx.src("src");
-    write_tree(&src, "t", 6);
-    for name in ["s1", "s2", "s3"] {
-        fx.backup(&src, name);
-    }
+    let fx = with_four_tree_chunks(false, "s1", |fx, dirs| {
+        let src = fx.src("src");
+        write_tree(&src, "t", dirs);
+        for name in ["s1", "s2", "s3"] {
+            fx.backup(&src, name);
+        }
+    });
     let p1 = fx.item_ptrs("s1");
     assert!(p1.len() >= 4, "only {} tree chunks", p1.len());
     assert_eq!(fx.item_ptrs("s2"), p1);
@@ -1070,14 +1108,16 @@ fn flip_blob(fx: &Fx, id: &ChunkId) {
 }
 
 /// A and B back up the same unchanged source (same tree chunks), C another.
+/// A has at least 4 tree chunks, in one pack.
 fn shared_trees(encrypted: bool) -> Fx {
-    let fx = Fx::new(encrypted);
-    let (x, y) = (fx.src("x"), fx.src("y"));
-    write_tree(&x, "x", 3);
-    write_tree(&y, "y", 1);
-    fx.backup(&x, "A");
-    fx.backup(&x, "B");
-    fx.backup(&y, "C");
+    let fx = with_four_tree_chunks(encrypted, "A", |fx, dirs| {
+        let (x, y) = (fx.src("x"), fx.src("y"));
+        write_tree(&x, "x", dirs);
+        write_tree(&y, "y", 1);
+        fx.backup(&x, "A");
+        fx.backup(&x, "B");
+        fx.backup(&y, "C");
+    });
     assert_eq!(fx.item_ptrs("A"), fx.item_ptrs("B"));
     fx
 }
@@ -1208,12 +1248,13 @@ fn check_attributes_a_read_failure_only_when_it_recurs() {
 fn check_spreads_only_an_io_failure_to_the_rest_of_its_pack() {
     // A, B and D back up the same source; then B keeps only the pack's
     // first tree chunk and D only its last.
-    let fx = Fx::new(false);
-    let x = fx.src("x");
-    write_tree(&x, "x", 3);
-    for name in ["A", "B", "D"] {
-        fx.backup(&x, name);
-    }
+    let fx = with_four_tree_chunks(false, "A", |fx, dirs| {
+        let x = fx.src("x");
+        write_tree(&x, "x", dirs);
+        for name in ["A", "B", "D"] {
+            fx.backup(&x, name);
+        }
+    });
     let repo = fx.open();
     let mut ordered: Vec<(ChunkId, u64, u32)> = fx
         .item_ptrs("A")
@@ -1384,4 +1425,599 @@ fn repair_rebuild_matches_a_sequential_rebuild() {
         assert!(report.unreferenced.is_empty());
         assert_eq!(report.refcount_mismatches, 0);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Mark and sweep (05 step 8)
+// ---------------------------------------------------------------------------
+
+/// Every file of the repository by its relative path, without lock and
+/// session keys: what a refused or dry-run compact must leave as it was.
+fn repo_files(fx: &Fx) -> std::collections::BTreeMap<String, Vec<u8>> {
+    let mut files = Vec::new();
+    collect_files(&fx.repo_dir, &mut files);
+    files
+        .into_iter()
+        .filter_map(|p| {
+            let rel = Path::new(&p)
+                .strip_prefix(&fx.repo_dir)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            (!rel.starts_with("locks/") && !rel.starts_with("sessions/"))
+                .then(|| (rel, std::fs::read(&p).unwrap()))
+        })
+        .collect()
+}
+
+fn compact(fx: &Fx, dry_run: bool) -> Result<commands::compact::CompactStats> {
+    commands::compact::run(
+        &fx.config,
+        fx.pass,
+        10.0,
+        None,
+        dry_run,
+        &CancelToken::new(),
+    )
+}
+
+fn head(fx: &Fx) -> crate::index::head::IndexHead {
+    fx.open().index_head().unwrap().clone()
+}
+
+fn last_record(fx: &Fx) -> crate::index::sweep_record::SweepRecord {
+    let repo = fx.open();
+    crate::repo::index_store::fetch_sweep_record(
+        repo.storage.as_ref(),
+        repo.crypto.as_ref(),
+        repo.index_head().unwrap(),
+    )
+    .unwrap()
+    .expect("a sweep record")
+}
+
+/// Two snapshots that share nothing but some tree structure: deleting
+/// `s1` leaves its file chunks unreferenced.
+fn two_disjoint_snapshots(encrypted: bool) -> Fx {
+    let fx = Fx::new(encrypted);
+    let a = fx.src("a");
+    write_files(&a, "f", 20);
+    fx.backup(&a, "s1");
+    let b = fx.src("b");
+    write_files(&b, "g", 5);
+    backup_single_source_with(&fx.config, fx.pass, &b, "other", "s2");
+    fx
+}
+
+/// CP-1: compact on a clean repository removes nothing, writes no segment
+/// and one head that records the sweep.
+#[test]
+fn compact_on_a_clean_repository_records_the_sweep() {
+    for encrypted in [false, true] {
+        let fx = two_snapshots(encrypted);
+        let before = head(&fx);
+        let entries = fx.open().chunk_index().len();
+        let stats = compact(&fx, false).unwrap();
+        assert_eq!(stats.chunks_unreferenced, 0);
+        assert_eq!(stats.snapshots_marked, 2);
+        let after = head(&fx);
+        assert_eq!(after.generation, before.generation + 1);
+        assert_eq!(after.segments, before.segments, "no segment");
+        assert_eq!(after.sweep.generation, after.generation);
+        let record = last_record(&fx);
+        assert_eq!(record.generation, after.generation);
+        assert_eq!(record.entries_removed, 0);
+        assert_eq!(record.entries_live as usize, entries);
+        let repo = fx.open();
+        let mut ids: Vec<Vec<u8>> = repo
+            .manifest()
+            .snapshots
+            .iter()
+            .map(|s| s.id.as_bytes().to_vec())
+            .collect();
+        ids.sort();
+        let recorded: Vec<Vec<u8>> = record.snapshots.iter().map(|b| b.to_vec()).collect();
+        assert_eq!(recorded, ids);
+    }
+}
+
+/// CP-2 (and PD-2): after a delete, compact removes exactly the entries the
+/// report calls unreferenced, records them, and the rest restores.
+#[test]
+fn compact_after_a_delete_sweeps_what_the_report_names() {
+    for encrypted in [false, true] {
+        let fx = two_disjoint_snapshots(encrypted);
+        commands::delete::run(&fx.config, fx.pass, &["s1"], false, &CancelToken::new()).unwrap();
+        let report = fx.report().unwrap();
+        assert!(!report.unreferenced.is_empty());
+
+        let stats = compact(&fx, false).unwrap();
+        assert_eq!(
+            stats.chunks_unreferenced as usize,
+            report.unreferenced.len()
+        );
+        assert_eq!(stats.bytes_unreferenced, report.unreferenced_bytes);
+        let record = last_record(&fx);
+        assert_eq!(record.entries_removed as usize, report.unreferenced.len());
+        assert_eq!(record.bytes_removed, report.unreferenced_bytes);
+        let repo = fx.open();
+        assert!(
+            report
+                .unreferenced
+                .iter()
+                .all(|id| !repo.chunk_index().contains(id))
+        );
+        drop(repo);
+
+        let dest = fx.tmp.path().join(format!("restore-{encrypted}"));
+        commands::restore::run(
+            &fx.config,
+            fx.pass,
+            "s2",
+            dest.to_str().unwrap(),
+            None,
+            false,
+            true,
+            &CancelToken::new(),
+        )
+        .unwrap();
+        let after = fx.report().unwrap();
+        assert!(after.unreferenced.is_empty(), "{:?}", after.unreferenced);
+        let check = commands::check::run(&fx.config, fx.pass, true, false).unwrap();
+        assert!(check.errors.is_empty(), "{:?}", check.errors);
+    }
+}
+
+/// Damage `fx`, run compact and return its error. A refused compact
+/// changes nothing on storage, byte for byte (locks and sessions aside).
+fn compact_refused(fx: &Fx, damage: impl FnOnce(&Fx)) -> VykarError {
+    damage(fx);
+    let before = repo_files(fx);
+    let err = compact(fx, false).unwrap_err();
+    assert_eq!(
+        repo_files(fx),
+        before,
+        "a refused compact changed something: {err}"
+    );
+    err
+}
+
+fn assert_mark_refused(err: &VykarError, needle: &str) {
+    let msg = err.to_string();
+    assert!(
+        msg.starts_with(commands::compact::MARK_REFUSED)
+            && msg.contains("nothing was changed")
+            && msg.contains(needle),
+        "expected a mark refusal naming {needle:?}, got: {msg}"
+    );
+}
+
+/// CP-3 (a, b): an undecryptable object or a foreign key under snapshots/.
+#[test]
+fn compact_refuses_a_bad_object_under_snapshots() {
+    for encrypted in [false, true] {
+        let fx = two_snapshots(encrypted);
+        let key = format!("snapshots/{}", "ab".repeat(32));
+        let err = compact_refused(&fx, |fx| {
+            std::fs::write(fx.repo_dir.join(&key), rand::random::<[u8; 32]>()).unwrap();
+        });
+        assert_mark_refused(&err, &format!("snapshot object {key}"));
+    }
+    let fx = two_snapshots(false);
+    let err = compact_refused(&fx, |fx| {
+        std::fs::write(fx.repo_dir.join("snapshots/not-an-id"), b"x").unwrap();
+    });
+    assert_mark_refused(
+        &err,
+        "unexpected object snapshots/not-an-id under snapshots/",
+    );
+}
+
+/// CP-3 (c, d) and CP-7: an index that lost a live tree chunk or data
+/// chunk (a valid maintenance segment removed it) makes compact refuse and
+/// delete nothing.
+#[test]
+fn compact_refuses_an_index_missing_live_entries() {
+    let fx = two_snapshots(false);
+    let id = fx.item_ptrs("s2")[0];
+    let err = compact_refused(&fx, |fx| {
+        fx.edit_index(|repo| {
+            repo.chunk_index_mut().remove(&id).unwrap();
+        });
+    });
+    assert_mark_refused(
+        &err,
+        &format!("names tree chunk {id}, which is not in the index"),
+    );
+
+    for encrypted in [false, true] {
+        let fx = two_snapshots(encrypted);
+        let id = a_file_chunk(&fx, "s2");
+        let err = compact_refused(&fx, |fx| {
+            fx.edit_index(|repo| {
+                repo.chunk_index_mut().remove(&id).unwrap();
+            });
+        });
+        assert_mark_refused(
+            &err,
+            &format!("references chunk {id}, which is not in the index"),
+        );
+    }
+}
+
+/// CP-3 (e): a tree chunk whose pack is gone, with no cached copy.
+#[test]
+fn compact_refuses_an_unreadable_tree_chunk() {
+    let fx = two_snapshots(false);
+    let err = compact_refused(&fx, |fx| {
+        let repo = fx.open();
+        let id = fx.item_ptrs("s2")[0];
+        let pack = repo.chunk_index().get(&id).unwrap().pack_id;
+        std::fs::remove_file(fx.repo_dir.join(pack.storage_key())).unwrap();
+        std::fs::remove_dir_all(fx.cache_root()).unwrap();
+    });
+    assert_mark_refused(&err, "reading tree chunks:");
+}
+
+/// CP-3, R1a: no snapshot listed while the index has entries: compact
+/// does not sweep a repository to empty; the report still reports.
+#[test]
+fn compact_refuses_to_sweep_to_empty() {
+    let fx = two_snapshots(false);
+    let entries = fx.open().chunk_index().len();
+    let err = compact_refused(&fx, |fx| {
+        commands::delete::run(
+            &fx.config,
+            fx.pass,
+            &["s1", "s2"],
+            false,
+            &CancelToken::new(),
+        )
+        .unwrap();
+    });
+    assert_mark_refused(&err, "no snapshot was listed under snapshots/");
+    assert!(
+        err.to_string().contains(&format!("holds {entries} chunks")),
+        "{err}"
+    );
+    let report = fx.report().unwrap();
+    assert_eq!(report.unreferenced.len(), entries);
+}
+
+/// Hides one key from every listing of `snapshots/`; `exists` still sees it.
+struct HideFromListing {
+    inner: LocalBackend,
+    hidden: String,
+}
+
+impl HideFromListing {
+    fn filter(&self, keys: Vec<String>) -> Vec<String> {
+        keys.into_iter().filter(|k| *k != self.hidden).collect()
+    }
+}
+
+impl InnerBackend for HideFromListing {
+    fn inner_backend(&self) -> &dyn StorageBackend {
+        &self.inner
+    }
+}
+
+delegate_storage_backend! {
+    for HideFromListing;
+    except [list, list_sized, list_meta, server_ops];
+
+    fn list(&self, prefix: &str) -> Result<Vec<String>> {
+        Ok(self.filter(self.inner.list(prefix)?))
+    }
+
+    fn list_sized(&self, prefix: &str) -> Result<Vec<vykar_storage::ListedObject>> {
+        Ok(self
+            .inner
+            .list_sized(prefix)?
+            .into_iter()
+            .filter(|o| o.key != self.hidden)
+            .collect())
+    }
+
+    fn list_meta(&self, prefix: &str) -> Result<Vec<vykar_storage::ListedObject>> {
+        Ok(self
+            .inner
+            .list_meta(prefix)?
+            .into_iter()
+            .filter(|o| o.key != self.hidden)
+            .collect())
+    }
+
+    fn server_ops(&self) -> Option<&dyn vykar_storage::ServerOps> {
+        None
+    }
+}
+
+/// CP-3, R1b: a snapshot the last sweep marked, missing from the listing
+/// but still on storage: the listing is stale, and compact refuses.
+#[test]
+fn compact_refuses_a_listing_that_hides_a_marked_snapshot() {
+    let fx = two_disjoint_snapshots(false);
+    compact(&fx, false).unwrap();
+    let hidden = fx
+        .open()
+        .manifest()
+        .find_snapshot("s1")
+        .unwrap()
+        .id
+        .storage_key();
+    let before = repo_files(&fx);
+    let backend = HideFromListing {
+        inner: LocalBackend::new(fx.repo_dir.to_str().unwrap()).unwrap(),
+        hidden: hidden.clone(),
+    };
+    let mut repo = Repository::open(Box::new(backend), fx.pass, None, OpenOptions::new()).unwrap();
+    let err = commands::compact::run_on_repo(&mut repo, 10.0, None, false, &CancelToken::new())
+        .unwrap_err();
+    drop(repo);
+    assert_mark_refused(&err, &format!("{hidden} exists but the listing"));
+    assert_eq!(repo_files(&fx), before);
+}
+
+/// Fails every `get` of one key with an I/O error.
+struct FailGet {
+    inner: LocalBackend,
+    key: String,
+}
+
+impl InnerBackend for FailGet {
+    fn inner_backend(&self) -> &dyn StorageBackend {
+        &self.inner
+    }
+}
+
+delegate_storage_backend! {
+    for FailGet;
+    except [get];
+
+    fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        if key == self.key {
+            return Err(VykarError::Io(std::io::Error::other(format!(
+                "injected get failure: {key}"
+            ))));
+        }
+        self.inner.get(key)
+    }
+}
+
+/// The storage key of the sweep record the latest head names.
+fn record_key(fx: &Fx) -> String {
+    let r = head(fx).sweep.record.expect("a sweep record");
+    crate::repo::index_store::object_key(&r.name)
+}
+
+/// A lost or damaged sweep record only skips the listing check: compact
+/// proceeds and records a new sweep.
+#[test]
+fn compact_proceeds_past_a_lost_or_damaged_sweep_record() {
+    for lose in [false, true] {
+        let fx = two_disjoint_snapshots(false);
+        compact(&fx, false).unwrap();
+        let key = record_key(&fx);
+        let path = fx.repo_dir.join(&key);
+        if lose {
+            std::fs::remove_file(&path).unwrap();
+        } else {
+            std::fs::write(&path, rand::random::<[u8; 64]>()).unwrap();
+        }
+        compact(&fx, false).unwrap();
+        assert_ne!(record_key(&fx), key, "lose={lose}");
+        last_record(&fx);
+    }
+}
+
+/// A storage error on the sweep record's GET is not damage: compact
+/// refuses and changes nothing.
+#[test]
+fn compact_refuses_when_the_sweep_record_cannot_be_fetched() {
+    let fx = two_disjoint_snapshots(false);
+    compact(&fx, false).unwrap();
+    let key = record_key(&fx);
+    let before = repo_files(&fx);
+    let backend = FailGet {
+        inner: LocalBackend::new(fx.repo_dir.to_str().unwrap()).unwrap(),
+        key: key.clone(),
+    };
+    let mut repo = Repository::open(Box::new(backend), fx.pass, None, OpenOptions::new()).unwrap();
+    let err = commands::compact::run_on_repo(&mut repo, 10.0, None, false, &CancelToken::new())
+        .unwrap_err();
+    drop(repo);
+    assert_mark_refused(&err, &format!("injected get failure: {key}"));
+    assert_eq!(repo_files(&fx), before);
+}
+
+/// A sweep record of a newer version is not damage: compact refuses and
+/// changes nothing.
+#[test]
+fn compact_refuses_a_newer_sweep_record() {
+    let fx = two_disjoint_snapshots(false);
+    compact(&fx, false).unwrap();
+    let mut record = last_record(&fx);
+    record.version = crate::index::sweep_record::SWEEP_RECORD_VERSION + 1;
+    fx.edit_index(|repo| {
+        repo.set_pending_sweep(crate::repo::index_write::PendingSweep::Swept(record));
+        repo.mark_index_dirty();
+    });
+    let err = compact_refused(&fx, |_| {});
+    assert_mark_refused(
+        &err,
+        &format!(
+            "unsupported repository version: {}",
+            crate::index::sweep_record::SWEEP_RECORD_VERSION + 1
+        ),
+    );
+}
+
+/// CP-4: a dry run reports what the real run then removes, and changes
+/// nothing, the tree-chunk cache included.
+#[test]
+fn compact_dry_run_reports_the_sweep_and_writes_nothing() {
+    let fx = two_disjoint_snapshots(false);
+    commands::delete::run(&fx.config, fx.pass, &["s1"], false, &CancelToken::new()).unwrap();
+    let before = repo_files(&fx);
+    let cached = fx.cached();
+    let dry = compact(&fx, true).unwrap();
+    assert!(dry.chunks_unreferenced > 0);
+    assert_eq!(repo_files(&fx), before);
+    assert_eq!(fx.cached(), cached);
+    let real = compact(&fx, false).unwrap();
+    assert_eq!(real.chunks_unreferenced, dry.chunks_unreferenced);
+    assert_eq!(real.bytes_unreferenced, dry.bytes_unreferenced);
+}
+
+/// CP-6: compact deletes a pack map once every pack it names is gone, and
+/// keeps the maps of surviving packs and a damaged map.
+#[test]
+fn compact_deletes_the_maps_of_deleted_packs() {
+    let fx = two_disjoint_snapshots(false);
+    let mut repo = fx.open();
+    commands::util::with_maintenance_lock(&mut repo, |repo| {
+        repo.load_chunk_index_under_lock()?;
+        repo.write_pack_maps_grouped(None, 1, &CancelToken::new())
+            .map(|_| ())
+    })
+    .unwrap();
+    drop(repo);
+    let maps = |fx: &Fx| -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(fx.repo_dir.join("packmaps"))
+            .map(|d| {
+                d.map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        v.sort();
+        v
+    };
+    let all = maps(&fx);
+    assert!(all.len() >= 2, "{all:?}");
+    let damaged = blake3::hash(b"damaged map").to_hex().to_string();
+    std::fs::write(fx.repo_dir.join("packmaps").join(&damaged), b"not this").unwrap();
+
+    commands::delete::run(&fx.config, fx.pass, &["s1"], false, &CancelToken::new()).unwrap();
+    let stats = compact(&fx, false).unwrap();
+    assert!(stats.packs_deleted_empty > 0, "{stats:?}");
+
+    let left = maps(&fx);
+    assert!(left.contains(&damaged), "a damaged map is kept");
+    assert!(left.len() < all.len() + 1, "{left:?} vs {all:?}");
+    // Every pack a remaining (readable) map names still exists.
+    let scan = crate::repo::pack_map::read_pack_maps(
+        fx.open().storage.as_ref(),
+        fx.open().crypto.as_ref(),
+        2,
+        false,
+        &CancelToken::new(),
+    )
+    .unwrap();
+    for pack in scan.by_pack.keys() {
+        assert!(fx.repo_dir.join(pack.storage_key()).exists(), "{pack}");
+    }
+    assert!(!scan.by_pack.is_empty());
+}
+
+/// CP-8: `check --repair` sets `sweep.gen` to its own head and keeps the
+/// last sweep record.
+#[test]
+fn repair_records_itself_as_a_sweep_and_keeps_the_record() {
+    let fx = two_snapshots(false);
+    compact(&fx, false).unwrap();
+    let swept = head(&fx);
+    let record = swept.sweep.record.expect("a record");
+    commands::check::run_with_repair(
+        &fx.config,
+        fx.pass,
+        false,
+        RepairMode::Apply,
+        None,
+        &CancelToken::new(),
+    )
+    .unwrap();
+    let repaired = head(&fx);
+    assert!(repaired.generation > swept.generation);
+    assert_eq!(repaired.sweep.generation, repaired.generation);
+    assert_eq!(repaired.sweep.record, Some(record));
+}
+
+/// CP-9: index garbage is collected through compact: with no grace, the
+/// heads below latest − 16 and the objects no kept head names go; with the
+/// default grace nothing young is deleted.
+#[test]
+fn compact_collects_old_heads_and_unnamed_objects() {
+    let fx = two_snapshots(false);
+    let mut repo = fx.open();
+    for round in 0..20u32 {
+        commands::util::with_maintenance_lock(&mut repo, |repo| {
+            repo.load_chunk_index_under_lock()?;
+            let id = repo.chunk_index().iter().next().unwrap().0;
+            repo.chunk_index_mut().increment_refcount_by(&id, round + 1);
+            repo.save_state()
+        })
+        .unwrap();
+    }
+    drop(repo);
+    let heads = |fx: &Fx| {
+        crate::repo::index_store::list_head_generations(fx.open().storage.as_ref()).unwrap()
+    };
+    let objects = |fx: &Fx| {
+        let mut v = Vec::new();
+        collect_files(&fx.repo_dir.join("index.d"), &mut v);
+        v.len()
+    };
+    let (heads_before, objects_before) = (heads(&fx), objects(&fx));
+    assert!(heads_before.len() > 17);
+
+    // Default grace: everything is young, nothing is deleted (the compact
+    // adds its sweep head, and a fold at the soft limit).
+    compact(&fx, false).unwrap();
+    let after = heads(&fx);
+    assert!(heads_before.iter().all(|g| after.contains(g)), "{after:?}");
+    assert!(after.len() > heads_before.len());
+    assert!(objects(&fx) > objects_before);
+
+    let mut repo = fx.open();
+    repo.set_index_gc_grace(Duration::ZERO);
+    let mut policy = crate::repo::index_write::FoldPolicy::default();
+    policy.soft.segments = 1;
+    repo.set_fold_policy(policy);
+    commands::compact::run_on_repo(&mut repo, 10.0, None, false, &CancelToken::new()).unwrap();
+    let latest = repo.index_head().unwrap().clone();
+    drop(repo);
+    let kept = heads(&fx);
+    assert!(
+        kept.iter().all(|g| *g + 16 >= latest.generation),
+        "{kept:?}"
+    );
+    assert_eq!(kept.last(), Some(&latest.generation));
+    // Every remaining object is named by a kept head.
+    let repo = fx.open();
+    let mut named = HashSet::new();
+    for g in &kept {
+        let bytes = repo
+            .storage
+            .get(&crate::repo::index_store::head_key(*g))
+            .unwrap()
+            .unwrap();
+        let h = crate::repo::index_store::classify_head(*g, &bytes, repo.crypto.as_ref())
+            .into_head()
+            .unwrap();
+        named.extend(h.named_objects().map(|n| n.to_hex()));
+    }
+    let mut left = Vec::new();
+    collect_files(&fx.repo_dir.join("index.d"), &mut left);
+    for p in &left {
+        let name = Path::new(p)
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(named.contains(&name), "{name} is not named by a kept head");
+    }
+    drop(repo);
+    let check = commands::check::run(&fx.config, fx.pass, true, false).unwrap();
+    assert!(check.errors.is_empty(), "{:?}", check.errors);
 }

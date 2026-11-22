@@ -3,13 +3,16 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use super::mark;
 use super::util::{open_repo, with_maintenance_lock};
 use crate::config::VykarConfig;
+use crate::index::sweep_record::{SWEEP_RECORD_VERSION, SweepRecord};
 use crate::repo::OpenOptions;
 use crate::repo::control::CancelToken;
+use crate::repo::index_store;
+use crate::repo::index_write::PendingSweep;
 use crate::repo::pack::PackWriter;
 use crate::repo::pack_listing::{ListedPack, list_packs};
 use crate::repo::pack_trailer::{
@@ -41,7 +44,17 @@ pub struct CompactStats {
     pub packs_orphan: u64,
     /// Stale `.tmp.*` upload debris removed by the sweep.
     pub temp_files_removed: u64,
+    /// Snapshots the mark covered.
+    pub snapshots_marked: u64,
+    /// Index entries no live snapshot references, removed by the sweep
+    /// (dry run: that would be removed), and their stored bytes.
+    pub chunks_unreferenced: u64,
+    pub bytes_unreferenced: u64,
 }
+
+/// Prefix of the error a compact returns when the mark fails; matched by
+/// the simulator (`sim/history.rs`).
+pub(crate) const MARK_REFUSED: &str = "compact refused: the live snapshots could not be marked";
 
 const STALE_TEMP_FILE_AGE: std::time::Duration = std::time::Duration::from_secs(3600);
 
@@ -260,11 +273,19 @@ pub(crate) fn run_on_repo(
     })
 }
 
-/// Core compact logic operating on an already-opened repository.
+/// Core compact logic operating on an already-opened repository whose index
+/// was loaded under the maintenance lock, in this order:
 ///
-/// Ends, unless `dry_run`, with the segmented index's upkeep: a fold at the
-/// soft limit, otherwise removal of unreferenced index objects. That also
-/// runs when there was nothing to repack.
+/// 1. mark every live snapshot and sweep the unmarked entries from the
+///    index (a dry run removes them from the in-memory index only);
+/// 2. analyse, repack and delete packs over the swept index;
+/// 3. unless `dry_run`: the index upkeep (a fold at the soft limit, the
+///    age-gated garbage collection), then the deletion of pack maps whose
+///    packs are all gone.
+///
+/// Nothing is deleted or repacked without a completed mark of the same run,
+/// against the head loaded under the same lock. A dry run writes nothing
+/// and leaves the handle's index as it was loaded.
 pub fn compact_repo(
     repo: &mut Repository,
     threshold: f64,
@@ -273,7 +294,8 @@ pub fn compact_repo(
     concurrency: usize,
     shutdown: &CancelToken,
 ) -> Result<CompactStats> {
-    let stats = compact_packs(
+    let swept = mark_and_sweep(repo, dry_run, shutdown)?;
+    let mut stats = compact_after_mark(
         repo,
         threshold,
         max_repack_size,
@@ -281,10 +303,299 @@ pub fn compact_repo(
         concurrency,
         shutdown,
     )?;
+    stats.snapshots_marked = swept.snapshots;
+    stats.chunks_unreferenced = swept.entries_removed;
+    stats.bytes_unreferenced = swept.bytes_removed;
+    Ok(stats)
+}
+
+/// [`compact_repo`] without the mark, for unit tests of the pack analysis
+/// and repack over an index built by hand (no snapshot references it).
+/// Production code always marks first.
+#[cfg(test)]
+pub(crate) fn compact_repo_without_mark(
+    repo: &mut Repository,
+    threshold: f64,
+    max_repack_size: Option<u64>,
+    dry_run: bool,
+    concurrency: usize,
+    shutdown: &CancelToken,
+) -> Result<CompactStats> {
+    compact_after_mark(
+        repo,
+        threshold,
+        max_repack_size,
+        dry_run,
+        concurrency,
+        shutdown,
+    )
+}
+
+/// Everything [`compact_repo`] does after the mark-and-sweep.
+fn compact_after_mark(
+    repo: &mut Repository,
+    threshold: f64,
+    max_repack_size: Option<u64>,
+    dry_run: bool,
+    concurrency: usize,
+    shutdown: &CancelToken,
+) -> Result<CompactStats> {
+    let run = compact_packs(
+        repo,
+        threshold,
+        max_repack_size,
+        dry_run,
+        concurrency,
+        shutdown,
+    );
+    if dry_run {
+        repo.discard_index_edits();
+    }
+    let PackRun {
+        stats,
+        listed,
+        deleted,
+        written,
+    } = run?;
     if !dry_run {
         repo.maintain_segmented_index()?;
+        let alive =
+            |p: &PackId| (listed.contains(p) && !deleted.contains(p)) || written.contains(p);
+        match crate::repo::pack_map::delete_dead_pack_maps(
+            repo.storage.as_ref(),
+            repo.crypto.as_ref(),
+            concurrency,
+            &alive,
+            shutdown,
+        ) {
+            Ok(n) => debug!("deleted {n} pack maps"),
+            Err(e) => warn!("compact: pack maps were not cleaned up: {e}"),
+        }
     }
     Ok(stats)
+}
+
+/// What the mark found, before anything is written.
+struct SweepPlan {
+    snapshots: Vec<vykar_types::snapshot_id::SnapshotId>,
+    tree_set: mark::TreeChunkSet,
+    /// Unmarked entries, in chunk-ID order, with their stored sizes.
+    unreferenced: Vec<(ChunkId, u32)>,
+    entries_live: u64,
+    bytes_live: u64,
+    references: u64,
+    referenced_bytes: u64,
+}
+
+impl SweepPlan {
+    fn bytes_removed(&self) -> u64 {
+        self.unreferenced.iter().map(|(_, s)| u64::from(*s)).sum()
+    }
+}
+
+/// The figures of a mark-and-sweep, for the stats.
+struct Swept {
+    snapshots: u64,
+    entries_removed: u64,
+    bytes_removed: u64,
+}
+
+/// Strict listing, the guards on it, the tree-chunk set, then `mark_live`
+/// with `CacheFirst`, counts and `MissingRefs::Abort`. Read-only. Any error
+/// is framed as [`MARK_REFUSED`], unless [`mark::passes_through`] (cancel,
+/// newer vykar).
+fn plan_sweep(repo: &Repository, shutdown: &CancelToken) -> Result<SweepPlan> {
+    plan_sweep_inner(repo, shutdown).map_err(|e| {
+        if mark::passes_through(&e) {
+            e
+        } else {
+            VykarError::Other(format!(
+                "{MARK_REFUSED}, nothing was changed: {e}. Run `vykar check` for details"
+            ))
+        }
+    })
+}
+
+fn plan_sweep_inner(repo: &Repository, shutdown: &CancelToken) -> Result<SweepPlan> {
+    let snaps = mark::load_snapshots_strict(repo, shutdown)?;
+    let entries = repo.chunk_index().len();
+    // The storage contract allows a stale or empty listing; a sweep deletes
+    // by it, so a listing that looks incomplete refuses.
+    if snaps.is_empty() && entries > 0 {
+        return Err(VykarError::Other(format!(
+            "no snapshot was listed under snapshots/ while the index holds {entries} chunks; \
+             this vykar does not sweep a repository to empty (`vykar delete` removes a \
+             repository)"
+        )));
+    }
+    check_listing_against_last_sweep(repo, &snaps)?;
+
+    let names: Vec<String> = snaps.iter().map(mark::LiveSnapshot::label).collect();
+    let ptrs: Vec<&[ChunkId]> = snaps.iter().map(|s| s.meta.item_ptrs.as_slice()).collect();
+    let tree_set = mark::TreeChunkSet::build(&ptrs);
+    let positions = repo.chunk_index().positions();
+    let found = mark::mark_live(
+        repo,
+        &tree_set,
+        &names,
+        &positions,
+        TreeChunkSource::CacheFirst,
+        mark::MarkOptions {
+            count: true,
+            missing_refs: mark::MissingRefs::Abort,
+            decode_threads: mark::default_decode_threads(),
+        },
+        shutdown,
+    )?;
+    let mut plan = SweepPlan {
+        snapshots: snaps.iter().map(|s| s.id).collect(),
+        tree_set: mark::TreeChunkSet::build(&[]),
+        unreferenced: Vec::new(),
+        entries_live: 0,
+        bytes_live: 0,
+        references: found.references,
+        referenced_bytes: 0,
+    };
+    positions.for_each_live(|p, id, e| {
+        if found.is_marked(p) {
+            plan.entries_live += 1;
+            plan.bytes_live += u64::from(e.stored_size);
+            plan.referenced_bytes +=
+                u64::from(e.stored_size) * u64::from(found.count(p).unwrap_or(0));
+        } else {
+            plan.unreferenced.push((id, e.stored_size));
+        }
+    });
+    drop(positions);
+    plan.tree_set = tree_set;
+    plan.unreferenced
+        .sort_unstable_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+    plan.snapshots
+        .sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    Ok(plan)
+}
+
+/// Refuse when a snapshot the previous sweep marked is missing from the
+/// listing but still exists (the listing is stale or truncated). One
+/// `exists` per snapshot deleted since the last sweep. The record only
+/// feeds this refusal, never a deletion; a lost or damaged record
+/// ([`index_store::is_object_damage`]) skips the check with a warning (the
+/// check can only refuse more). Any other error on it (storage, a record of
+/// a newer version) is returned, and [`plan_sweep`] refuses.
+fn check_listing_against_last_sweep(repo: &Repository, snaps: &[mark::LiveSnapshot]) -> Result<()> {
+    let Some(head) = repo.index_head() else {
+        return Ok(());
+    };
+    let record = match index_store::fetch_sweep_record(
+        repo.storage.as_ref(),
+        repo.crypto.as_ref(),
+        head,
+    ) {
+        Ok(Some(r)) => r,
+        Ok(None) => return Ok(()),
+        Err(e) if index_store::is_object_damage(&e) => {
+            warn!(
+                "compact: the last sweep record is missing or damaged ({e}); not checking the listing against it"
+            );
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    };
+    let listed: HashSet<[u8; 32]> = snaps.iter().map(|s| *s.id.as_bytes()).collect();
+    for id in &record.snapshots {
+        let Ok(bytes) = <[u8; 32]>::try_from(id.as_slice()) else {
+            continue;
+        };
+        if listed.contains(&bytes) {
+            continue;
+        }
+        let key = vykar_types::snapshot_id::SnapshotId::from_bytes(bytes).storage_key();
+        if repo.storage.exists(&key)? {
+            return Err(VykarError::Other(format!(
+                "{key} exists but the listing of snapshots/ did not return it; the \
+                 listing is stale or incomplete"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Remove `plan.unreferenced` from the index and persist: one maintenance
+/// segment of removals plus the sweep record and a head with
+/// `sweep {gen: its own generation, record}`; with nothing to remove, the
+/// record and a head only. Then drop the tree-chunk cache entries the mark
+/// did not reach. Not called in a dry run.
+fn apply_sweep(repo: &mut Repository, plan: &SweepPlan) -> Result<()> {
+    let index = repo.chunk_index_mut();
+    for (id, _) in &plan.unreferenced {
+        index.remove(id);
+    }
+    let record = SweepRecord {
+        version: SWEEP_RECORD_VERSION,
+        generation: 0,
+        time: repo.host_env().now_utc(),
+        snapshots: plan
+            .snapshots
+            .iter()
+            .map(|id| serde_bytes::ByteBuf::from(id.as_bytes().to_vec()))
+            .collect(),
+        tree_chunks: plan.tree_set.len() as u64,
+        entries_live: plan.entries_live,
+        bytes_live: plan.bytes_live,
+        entries_removed: plan.unreferenced.len() as u64,
+        bytes_removed: plan.bytes_removed(),
+        references: plan.references,
+        referenced_bytes: plan.referenced_bytes,
+    };
+    repo.set_pending_sweep(PendingSweep::Swept(record));
+    repo.mark_index_dirty();
+    repo.save_state()?;
+    if let Some(cache) = repo.tree_cache() {
+        let kept = cache.retain(|id| plan.tree_set.contains(id));
+        debug!(?kept, "tree-chunk cache trimmed to the marked tree chunks");
+    }
+    Ok(())
+}
+
+/// Mark and sweep: [`plan_sweep`], then [`apply_sweep`] unless `dry_run`. A
+/// dry run removes the unreferenced entries from the in-memory index only,
+/// so that the analysis after it shows what a real run would free; the
+/// caller discards those edits.
+fn mark_and_sweep(repo: &mut Repository, dry_run: bool, shutdown: &CancelToken) -> Result<Swept> {
+    let plan = plan_sweep(repo, shutdown)?;
+    let swept = Swept {
+        snapshots: plan.snapshots.len() as u64,
+        entries_removed: plan.unreferenced.len() as u64,
+        bytes_removed: plan.bytes_removed(),
+    };
+    debug!(
+        snapshots = swept.snapshots,
+        removed = swept.entries_removed,
+        bytes = swept.bytes_removed,
+        dry_run,
+        "mark-and-sweep"
+    );
+    if dry_run {
+        let index = repo.chunk_index_mut();
+        for (id, _) in &plan.unreferenced {
+            index.remove(id);
+        }
+    } else {
+        apply_sweep(repo, &plan)?;
+    }
+    Ok(swept)
+}
+
+/// What [`compact_packs`] did, with the pack IDs the pack-map pass needs.
+struct PackRun {
+    stats: CompactStats,
+    /// Packs the listing returned.
+    listed: HashSet<PackId>,
+    /// Packs this run deleted.
+    deleted: HashSet<PackId>,
+    /// Packs this run wrote (repack outputs); never deleted, and alive for
+    /// the pack-map pass even when the listing did not return them.
+    written: HashSet<PackId>,
 }
 
 fn compact_packs(
@@ -294,8 +605,13 @@ fn compact_packs(
     dry_run: bool,
     concurrency: usize,
     shutdown: &CancelToken,
-) -> Result<CompactStats> {
+) -> Result<PackRun> {
     let mut stats = CompactStats::default();
+    let mut deleted: HashSet<PackId> = HashSet::new();
+    // Packs this run wrote. A repack's output can have the ID of a pack the
+    // listing showed as an orphan (the same blobs repacked by an earlier,
+    // interrupted run): that pack is live now and is never deleted.
+    let mut written: HashSet<PackId> = HashSet::new();
 
     // Phase 1: Analyze live/dead space using the chunk index + pack sizes.
     // The index does not record a pack's trailer, so a candidate's trailer
@@ -304,7 +620,9 @@ fn compact_packs(
     // trailer of the same relative size, and the next compact would repack
     // it again.
     //
-    // Build a per-pack lookup from the chunk index:
+    // Build a per-pack lookup from the chunk index, which the mark-and-sweep
+    // before this has already swept: the swept entries' bytes count as dead,
+    // and a pack left without entries is an orphan (Case B), deleted whole.
     //   pack_id → Vec<(chunk_id, stored_size, pack_offset)>
     let mut per_pack_lookup: HashMap<PackId, Vec<(ChunkId, u32, u64)>> = HashMap::new();
     for (chunk_id, entry) in repo.chunk_index().iter() {
@@ -327,6 +645,7 @@ fn compact_packs(
     // Discover all packs: one listing on a vykar-server, else 256 per-shard
     // listings in parallel.
     let discovered = list_packs(repo.storage.as_ref(), concurrency)?;
+    let listed: HashSet<PackId> = discovered.iter().map(|p| p.pack_id).collect();
 
     // For each discovered pack, compute live/dead space from its size and the
     // index. The size comes from the listing; `size()` only where it has none.
@@ -491,11 +810,21 @@ fn compact_packs(
             }
             stats.space_freed += a.dead_bytes;
         }
-        return Ok(stats);
+        return Ok(PackRun {
+            stats,
+            listed,
+            deleted,
+            written,
+        });
     }
 
-    if try_server_side_repack(repo, &selected, &mut stats)? {
-        return Ok(stats);
+    if try_server_side_repack(repo, &selected, &mut stats, &mut deleted, &mut written)? {
+        return Ok(PackRun {
+            stats,
+            listed,
+            deleted,
+            written,
+        });
     }
 
     // Proactive fence check at Phase 1→Phase 2 boundary.
@@ -508,7 +837,6 @@ fn compact_packs(
     let pack_target = repo.config.min_pack_size as usize;
     let mut batch: Vec<&PackAnalysis> = Vec::new();
     let mut batch_bytes: u64 = 0;
-
     for analysis in &selected {
         shutdown.check()?;
         if let Some(cap) = max_repack_size
@@ -518,7 +846,7 @@ fn compact_packs(
             break;
         }
         if batch.len() >= SAVE_BATCH_PACKS || batch_bytes >= SAVE_BATCH_BYTES {
-            persist_and_delete(repo, &mut batch, &mut stats)?;
+            persist_and_delete(repo, &mut batch, &written, &mut stats, &mut deleted)?;
             batch_bytes = 0;
         }
 
@@ -603,6 +931,7 @@ fn compact_packs(
 
         let (new_pack_id, new_entries) =
             writer.flush(repo.storage.as_ref(), repo.crypto.as_ref())?;
+        written.insert(new_pack_id);
 
         for (chunk_id, stored_size, offset, _refcount) in &new_entries {
             repo.chunk_index_mut()
@@ -614,23 +943,41 @@ fn compact_packs(
         batch_bytes += analysis.total_bytes;
         batch.push(analysis);
     }
-    persist_and_delete(repo, &mut batch, &mut stats)?;
+    persist_and_delete(repo, &mut batch, &written, &mut stats, &mut deleted)?;
 
-    Ok(stats)
+    Ok(PackRun {
+        stats,
+        listed,
+        deleted,
+        written,
+    })
 }
 
 /// Persist the index if it changed (crash safety), then delete `batch`'s
-/// source packs and empty the batch.
+/// source packs, except those this run wrote (`written`), and empty the
+/// batch.
 fn persist_and_delete(
     repo: &mut Repository,
     batch: &mut Vec<&PackAnalysis>,
+    written: &HashSet<PackId>,
     stats: &mut CompactStats,
+    deleted: &mut HashSet<PackId>,
 ) -> Result<()> {
     if batch.is_empty() {
         return Ok(());
     }
     repo.save_state()?;
-    let err = delete_sources(repo.storage.as_ref(), batch, stats);
+    batch.retain(|a| {
+        let keep = written.contains(&a.pack_id);
+        if keep {
+            info!(
+                "Keeping pack {}: this run wrote it as a repack output",
+                a.pack_id
+            );
+        }
+        !keep
+    });
+    let err = delete_sources(repo.storage.as_ref(), batch, stats, deleted);
     batch.clear();
     err.map_or(Ok(()), Err)
 }
@@ -706,6 +1053,8 @@ fn try_server_side_repack(
     repo: &mut Repository,
     analyses: &[&PackAnalysis],
     stats: &mut CompactStats,
+    deleted: &mut HashSet<PackId>,
+    written: &mut HashSet<PackId>,
 ) -> Result<bool> {
     if analyses.is_empty() {
         return Ok(true);
@@ -776,12 +1125,16 @@ fn try_server_side_repack(
         let plan = RepackPlanRequest::new(requests, repo.content_hash());
         let response = server.repack(&plan)?;
 
-        result_packs.extend(
-            response
-                .completed
-                .iter()
-                .filter_map(|op| op.new_pack.clone()),
-        );
+        for key in response
+            .completed
+            .iter()
+            .filter_map(|op| op.new_pack.as_ref())
+        {
+            if let Ok(id) = PackId::from_storage_key(key) {
+                written.insert(id);
+            }
+            result_packs.insert(key.clone());
+        }
         let mut completed_by_source: HashMap<String, vykar_protocol::RepackOperationResult> =
             response
                 .completed
@@ -821,7 +1174,7 @@ fn try_server_side_repack(
             .into_iter()
             .filter(|a| !result_packs.contains(&a.storage_key))
             .collect();
-        let delete_err = delete_sources(repo.storage.as_ref(), &sources, stats);
+        let delete_err = delete_sources(repo.storage.as_ref(), &sources, stats, deleted);
         if let Some(err) = batch_err.or(delete_err) {
             return Err(err);
         }
@@ -838,6 +1191,7 @@ fn delete_sources(
     storage: &dyn StorageBackend,
     sources: &[&PackAnalysis],
     stats: &mut CompactStats,
+    deleted: &mut HashSet<PackId>,
 ) -> Option<VykarError> {
     if sources.is_empty() {
         return None;
@@ -847,7 +1201,7 @@ fn delete_sources(
         match batch.delete_keys(&keys, vykar_storage::BatchDeleteScope::KeysOnly) {
             Ok(()) => {
                 for analysis in sources {
-                    record_deleted(analysis, stats);
+                    record_deleted(analysis, stats, deleted);
                 }
                 return None;
             }
@@ -860,7 +1214,7 @@ fn delete_sources(
     let mut first_err = None;
     for analysis in sources {
         match storage.delete(&analysis.storage_key) {
-            Ok(()) => record_deleted(analysis, stats),
+            Ok(()) => record_deleted(analysis, stats, deleted),
             Err(err) => {
                 warn!(
                     "Failed to delete repacked source pack {}: {err}",
@@ -874,7 +1228,12 @@ fn delete_sources(
 }
 
 /// Stats for one deleted source pack.
-fn record_deleted(analysis: &PackAnalysis, stats: &mut CompactStats) {
+fn record_deleted(
+    analysis: &PackAnalysis,
+    stats: &mut CompactStats,
+    deleted: &mut HashSet<PackId>,
+) {
+    deleted.insert(analysis.pack_id);
     if analysis.live_entries.is_empty() {
         stats.packs_deleted_empty += 1;
         stats.space_freed += analysis.total_bytes;

@@ -40,8 +40,8 @@ In `none` mode no passphrase or key file is needed. The `chunk_id_key` is determ
 
 | Format | Derivation |
 |---|---|
-| v2, v4 | `BLAKE2b-256(repo_id)` |
-| v3, v5 | `blake3::derive_key("vykar 2026-01-01 plaintext repository chunk-id key v1", repo_id)` |
+| v2, v7 | `BLAKE2b-256(repo_id)` |
+| v3, v6 | `blake3::derive_key("vykar 2026-01-01 plaintext repository chunk-id key v1", repo_id)` |
 
 `derive_key` rather than a plain `blake3::hash` for domain separation: it is a distinct BLAKE3 mode with its own flag bits, so this key lives in a different domain from chunk digests (keyed mode) and pack digests (unkeyed mode).
 
@@ -74,8 +74,8 @@ A **keyed** 256-bit hash of the chunk plaintext, using a `chunk_id_key` derived 
 
 | Format | Chunk ID | Pack ID |
 |---|---|---|
-| v2, v4 | keyed BLAKE2b-256 | unkeyed BLAKE2b-256 |
-| v3, v5 | keyed BLAKE3 | unkeyed BLAKE3 |
+| v2, v7 | keyed BLAKE2b-256 | unkeyed BLAKE2b-256 |
+| v3, v6 | keyed BLAKE3 | unkeyed BLAKE3 |
 
 Chunk IDs are **always keyed**, in both algorithms. `index/hasher.rs` takes the first eight bytes of the digest as a hash-map bucket key, which is only safe because an attacker who controls chunk content cannot predict the digest; an unkeyed hash here would be a hash-flooding hole. Pack IDs are **always unkeyed**, in both algorithms: a pack ID is a storage key the server must be able to recompute from the bytes alone, without any repository key.
 
@@ -88,7 +88,7 @@ Why not SHA-256:
 
 - Both BLAKE2b and BLAKE3 are faster than SHA-256 in pure software. On CPUs with hardware SHA-256 acceleration (SHA-NI on x86, SHA extensions on ARM) hardware SHA-256 can beat BLAKE2b, but the BLAKE family gives consistent performance across all architectures without depending on hardware-specific instruction sets.
 
-Why BLAKE3 for new repositories (formats v3 and v5):
+Why BLAKE3 for new repositories (formats v3 and v6):
 
 - Hashing is a first-order CPU cost on two paths where dedup skips everything downstream. On a **file-cache miss with mostly-unchanged content** (VM images, databases, mail files) the file is fully re-read, chunked and hashed; chunks that dedup out skip compression, encryption and upload entirely, so per-byte cost there is read + chunk + hash. In `check --verify-data` under `encryption: none`, hashing dominates outright, and under `none` every chunk read (restore, list, diff, mount) is hashed too.
 - Within a file (or a 64 MiB segment of a large file) hashing is single-threaded, so per-core hash throughput is the per-segment ceiling. BLAKE3's internal tree mode gives it a large per-core advantage even without multi-threading: measurements in [issue #177](https://github.com/borgbase/vykar/issues/177) show `blake3::keyed_hash` at ~2.15 GB/s against ~1.4 GB/s for keyed BLAKE2b-256 on Apple Silicon, with a wider gap on x86-64.
@@ -124,7 +124,7 @@ Rationale:
 
 ### Deduplication
 
-Content-addressed deduplication uses keyed `ChunkId` values (keyed BLAKE2b-256 in format v2, keyed BLAKE3 in v3). Identical plaintext produces the same `ChunkId`, so the second copy is not stored; only refcounts are incremented. Because the algorithm is part of the chunk's identity, **dedup never spans chunk hashes** — which is also why the hash cannot be changed in place (the index layout can, see [Repository Versions](#repository-versions)).
+Content-addressed deduplication uses keyed `ChunkId` values (keyed BLAKE2b-256 in formats v2 and v7, keyed BLAKE3 in v3 and v6). Identical plaintext produces the same `ChunkId`, so the second copy is not stored; only refcounts are incremented. Because the algorithm is part of the chunk's identity, **dedup never spans chunk hashes** — which is also why the hash cannot be changed in place (the index layout can, see [Repository Versions](#repository-versions)).
 
 The repository's chunk index is one memory-mapped **chunk table** per index state plus this process's edits (`LiveIndex`, see [Local Optimization Caches](#local-optimization-caches-client-machine)). There is one lookup path for backup, restore, compact and check; no dedup mode is chosen.
 
@@ -164,13 +164,14 @@ The type tag identifies the object kind via the `ObjectType` enum:
 | 6 | FileCache | Local file-level cache (inode/mtime skip) |
 | 7 | PendingIndex | Transient crash-recovery journal |
 | 8 | SnapshotCache | Local snapshot-list cache |
-| 9 | IndexHead | Segmented index head stored at `index` (v4/v5) |
+| 9 | IndexHead | Index head stored at `index.h/<gen>` (v6/v7; v4/v5 kept it at `index`) |
 | 10 | IndexBase | Segmented index base under `index.d/` |
 | 11 | IndexSegment | Segmented index segment under `index.d/` |
 | 12 | PackTrailer | Last framed blob of a pack: its blob list |
 | 13 | PackMap | Blob lists of packs without a trailer, under `packmaps/` |
+| 14 | SweepRecord | What one mark-and-sweep found, under `index.d/` (v6/v7) |
 
-The type tag byte is always included in AAD (authenticated additional data). For identity-bound objects, AAD also includes a domain-separated object context, binding ciphertext to both object type and identity (for example, `ChunkData` to its `ChunkId`, `SnapshotMeta` to snapshot ID, `ChunkIndex` and `IndexHead` to `b"index"`, `IndexBase` and `IndexSegment` to the static `b"index.d/base"` and `b"index.d/segment"`, `FileCache` to `b"filecache"`, `SnapshotCache` to `b"snapshot_cache"`, `PackTrailer` to the static `b"pack-trailer"`, and `PackMap` to the static `b"packmap"`; as for `index.d/`, a pack map's name is the BLAKE3 of its stored bytes and is checked first).
+The type tag byte is always included in AAD (authenticated additional data). For identity-bound objects, AAD also includes a domain-separated object context, binding ciphertext to both object type and identity (for example, `ChunkData` to its `ChunkId`, `SnapshotMeta` to snapshot ID, `ChunkIndex` to `b"index"`, `IndexHead` to `b"index.h"`, `IndexBase`, `IndexSegment` and `SweepRecord` to the static `b"index.d/base"`, `b"index.d/segment"` and `b"index.d/sweep"`, `FileCache` to `b"filecache"`, `SnapshotCache` to `b"snapshot_cache"`, `PackTrailer` to the static `b"pack-trailer"`, and `PackMap` to the static `b"packmap"`; as for `index.d/`, a pack map's name is the BLAKE3 of its stored bytes and is checked first).
 
 ### Format Evolution
 
@@ -207,14 +208,16 @@ Future snapshot-level metadata goes inside the reserved opaque `ext` blob (parse
 |---|---|---|---|---|
 | 2 | keyed BLAKE2b-256 | unkeyed BLAKE2b-256 | monolithic | `init` up to 0.19 |
 | 3 | keyed BLAKE3 | unkeyed BLAKE3 | monolithic | `init` 0.20 to 0.24 |
-| 4 | keyed BLAKE2b-256 | unkeyed BLAKE2b-256 | segmented | `vykar upgrade` of a v2 repository |
-| 5 | keyed BLAKE3 | unkeyed BLAKE3 | segmented | `init` 0.25 and later, `vykar upgrade` of v3 |
+| 4 | keyed BLAKE2b-256 | unkeyed BLAKE2b-256 | segmented, mutable head at `index` | development builds only; refused like any unknown version |
+| 5 | keyed BLAKE3 | unkeyed BLAKE3 | segmented, mutable head at `index` | development builds only; refused like any unknown version |
+| 6 | keyed BLAKE3 | unkeyed BLAKE3 | numbered heads at `index.h/<gen>`, mark-and-sweep | `init`, `vykar upgrade` of v3 |
+| 7 | keyed BLAKE2b-256 | unkeyed BLAKE2b-256 | as v6 | `vykar upgrade` of v2 (development-only until 05 step 9 folds 6 and 7 into one version with a `chunk_hash` field) |
 
-`RepoFormat::from_version` is the single gate; `chunk_hash()` derives the hash from it. The **hash never changes** for a repository: it is the dedup identity of every chunk and part of every pack's storage key, so a v2 repository is upgraded to v4 and stays BLAKE2b for life. v2 and v3 are **upgrade-only** (`is_upgrade_only()`): every open except the one `vykar upgrade` makes refuses them, right after reading `config` and before the key is loaded, with an error that names `vykar upgrade`; `init` can no longer create them. `key export`/`key import`, `delete-repo` and `break-lock` work on raw storage and keep working on them. The **index layout can change**, once and one way: `vykar upgrade` moves v2 to v4 and v3 to v5 in place (see [In-Place Upgrade](#in-place-upgrade)). It is never automatic, because it locks out older binaries on every other machine. `vykar info` reports the format, the hash, and for a segmented index the base and segment sizes.
+`RepoFormat::from_version` is the single gate; `chunk_hash()` derives the hash from it. The **hash never changes** for a repository: it is the dedup identity of every chunk and part of every pack's storage key, so a v2 repository is upgraded to v7 and stays BLAKE2b for life. v2 and v3 are **upgrade-only** (`is_upgrade_only()`): every open except the one `vykar upgrade` makes refuses them, right after reading `config` and before the key is loaded, with an error that names `vykar upgrade`; `init` can no longer create them. `key export`/`key import`, `delete-repo` and `break-lock` work on raw storage and keep working on them. The **index layout can change**, once and one way: `vykar upgrade` moves v2 to v7 and v3 to v6 in place (see [In-Place Upgrade](#in-place-upgrade)). It is never automatic, because it locks out older binaries on every other machine. `vykar info` reports the format, the hash, the base and segment sizes, and the last sweep.
 
-There is deliberately **no user-facing choice** at `init`: no `--hash` flag, no YAML key. `init` always creates the current format (v5). Two accepted consequences: older binaries cannot open a repository created by a newer release (`unsupported repository version: 5`), so a fleet sharing a new repository must upgrade together; and a self-hosted `vykar-server` must be upgraded before a new repository can be created against it (a pre-flight `/health` probe at `init` checks both BLAKE3 support and the `segmented_index` capability, so that fails cleanly rather than at the first backup).
+There is deliberately **no user-facing choice** at `init`: no `--hash` flag, no YAML key. `init` always creates the current format (v6). Two accepted consequences: older binaries cannot open a repository created by a newer release (`unsupported repository version: 6`), so a fleet sharing a new repository must upgrade together; and a self-hosted `vykar-server` must be upgraded before a new repository can be created against it (a pre-flight `/health` probe at `init` checks BLAKE3 support, the `segmented_index` capability and that `key_dirs` lists `index.h` and `packmaps`, so that fails cleanly rather than at the first backup).
 
-**Why there is no stored `hash` field.** `RepoConfig` is serialized as a *positional* msgpack array, and appending a field is not backward-safe in the way `#[serde(default)]` suggests: `#[serde(default)]` rescues *shorter* arrays, but rmp-serde **errors on longer ones** (`array had incorrect length, expected N`) — the same failure mode described for `SnapshotMeta` above. An old binary reading an 8-field config would therefore fail *before* reaching the version gate, turning a clear `unsupported repository version: 3` into a parse error that looks like corruption. So `RepoConfig` stays at exactly seven fields, and the version implies the algorithm. A unit test asserts the msgpack array length so this cannot be undone by accident. The segmented index followed the same rule: it is a version bump (4/5), not a field.
+**Why there is no stored `hash` field.** `RepoConfig` is serialized as a *positional* msgpack array, and appending a field is not backward-safe in the way `#[serde(default)]` suggests: `#[serde(default)]` rescues *shorter* arrays, but rmp-serde **errors on longer ones** (`array had incorrect length, expected N`) — the same failure mode described for `SnapshotMeta` above. An old binary reading an 8-field config would therefore fail *before* reaching the version gate, turning a clear `unsupported repository version: 3` into a parse error that looks like corruption. So `RepoConfig` stays at exactly seven fields, and the version implies the algorithm. A unit test asserts the msgpack array length so this cannot be undone by accident. The index layouts followed the same rule: each is a version bump (6/7), not a field.
 
 **Auxiliary hashes.** Only chunk IDs and pack IDs follow the format. Every other digest vykar computes is BLAKE3 for every version (BLAKE2b up to 0.23):
 
@@ -238,15 +241,16 @@ The single exception is the plaintext-mode `chunk_id_key` derivation, which *is*
 
 ### On-Disk Layout
 
-`RepoConfig.version = 5` is what `vykar init` writes; version 4 remains fully readable and writable, and versions 2 and 3 are opened only by `vykar upgrade`. See [Repository Versions](#repository-versions).
+`RepoConfig.version = 6` is what `vykar init` writes; version 7 is its BLAKE2b twin, versions 2 and 3 are opened only by `vykar upgrade`, and 4 and 5 are refused. See [Repository Versions](#repository-versions).
 
 ```text
 <repo>/
 |- config                    # Repository metadata (unencrypted msgpack)
 |- keys/repokey              # Encrypted master key (Argon2id-wrapped; absent in `none` mode)
 |- keys/repokey.2            # Byte-identical redundant copy (see Key Redundancy)
-|- index                     # v4/v5: encrypted IndexHead (small); v2/v3: encrypted IndexBlob { generation, chunks }
-|- index.d/<64 hex>          # v4/v5: write-once index base and segments, named by the BLAKE3 of their bytes
+|- index                     # v2/v3 only: encrypted IndexBlob { generation, chunks }; absent in v6/v7
+|- index.h/<gen>             # v6/v7: write-once encrypted IndexHead (msgpack map) per generation; the highest wins
+|- index.d/<64 hex>          # v6/v7: write-once index bases, segments and sweep records, named by the BLAKE3 of their bytes
 |- packmaps/<64 hex>         # Write-once pack maps (blob lists of packs without a trailer), named by the BLAKE3 of their bytes
 |- index.gen                 # v2/v3 only (written by 0.24 and earlier): unencrypted advisory u64 generation hint
 |- snapshots/<id>            # Encrypted snapshot metadata; source of truth for snapshot listing
@@ -276,11 +280,11 @@ A chunk table is the full index cache format (VGFULL v3) of one index state, nam
 - A table is deleted (when another one is installed) only if it is not the state just installed, no table of this process maps it, and its mtime is more than an hour old. On Unix a deleted table stays readable through every mapping; a process that later looks for it finds it gone and syncs again, which may download the index.
 - A sync starts from the repository's own table, else from a table file at a state of the head's chain; a write diffs against the table it loaded, so it needs no table file.
 
-The **tree-chunk cache** (`tree_chunks/<first id byte hex>/<chunk id hex>`) holds one file per tree chunk with the chunk's stored blob bytes, exactly as in its pack: compressed and, for an encrypted repository, encrypted with the chunk ID as AAD. Backup writes every new tree chunk it stores, and readers write what they download. List, diff, find, mount, restore, prune, delete and backup's parent-snapshot load read it first, decode an entry like a pack blob and download only the misses; the item pointers are still resolved through the index first, so a chunk the index lacks fails even when it is cached. `check`, `check --repair` and the simulator's checker never read it and their reads do not fill it, so they verify what storage holds (the listing chunks a repair rewrites are cached like any stored tree chunk); the other readers no longer notice a corrupt or missing tree blob in storage while the chunk is cached. After a prune or delete has persisted its refcount changes, and after a backup commit, entries whose chunk the index no longer holds are deleted (only against a loaded, unedited index). Entries are content-addressed and every failure is a miss: an entry that does not decode is deleted and the chunk downloaded, a failed write disables writing for the handle, and nothing is fsynced. Entries are written through unique `.tc-*` temp files renamed into place (temps older than an hour are deleted by the drop), so processes sharing the cache dir need no coordination; a drop in one process can delete entries a backup running in another has just written, which costs that backup's next reader a download. The cache has no size cap.
+The **tree-chunk cache** (`tree_chunks/<first id byte hex>/<chunk id hex>`) holds one file per tree chunk with the chunk's stored blob bytes, exactly as in its pack: compressed and, for an encrypted repository, encrypted with the chunk ID as AAD. Backup writes every new tree chunk it stores, and readers write what they download. List, diff, find, mount, restore, compact's mark and backup's parent-snapshot load read it first, decode an entry like a pack blob and download only the misses; the item pointers are still resolved through the index first, so a chunk the index lacks fails even when it is cached. `check`, `check --repair` and the simulator's checker never read it and their reads do not fill it, so they verify what storage holds (the listing chunks a repair rewrites are cached like any stored tree chunk); the other readers no longer notice a corrupt or missing tree blob in storage while the chunk is cached. After a compact's sweep is written, entries of tree chunks the mark did not reach are deleted; prune, delete and backup drop nothing, so cached tree chunks of deleted snapshots stay until the next compact. Entries are content-addressed and every failure is a miss: an entry that does not decode is deleted and the chunk downloaded, a failed write disables writing for the handle, and nothing is fsynced. Entries are written through unique `.tc-*` temp files renamed into place (temps older than an hour are deleted by the drop), so processes sharing the cache dir need no coordination; a drop in one process can delete entries a backup running in another has just written, which costs that backup's next reader a download. The cache has no size cap.
 
 The fixed-name caches of earlier binaries (`dedup_cache`, `restore_cache`, `full_index_cache`) are deleted at open. Without a cache dir, or for `check`'s verifying load, the table lives in a temp file kept by the repository handle.
 
-In v2/v3 the authenticated generation is `IndexBlob.generation` inside `index`, and `index.gen` is an advisory hint that only pre-0.25 binaries write and read. This vykar reads neither outside `vykar upgrade`, which GETs and decodes the `IndexBlob` once (`check --repair` also decodes an `IndexBlob` that a pre-0.25 client left at `index` of a v4/v5 repository). The client no longer sends `If-None-Match`; vykar-server still answers it (`304`) for 0.24 clients.
+In v2/v3 the authenticated generation is `IndexBlob.generation` inside `index`, and `index.gen` is an advisory hint that only pre-0.25 binaries write and read. This vykar reads neither outside `vykar upgrade`, which GETs and decodes the `IndexBlob` once. The client no longer sends `If-None-Match`; vykar-server still answers it (`304`) for 0.24 clients.
 
 The `snapshot_list` cache is separate: on open/refresh, the client lists `snapshots/`, removes stale local entries, loads only new snapshot blobs, and persists the resulting snapshot list locally. This avoids O(n) snapshot metadata GETs on every open.
 
@@ -294,7 +298,7 @@ flowchart LR
         direction TB
         config["config"]
         repokey["keys/repokey"]
-        index["index"]
+        index["index.h/‹gen›"]
         indexd["index.d/‹name›"]
         indexgen["index.gen (v2/v3)"]
         snapshots["snapshots/‹id›"]
@@ -323,18 +327,18 @@ flowchart LR
 
 ### Key Data Structures
 
-**IndexBlob** — v2/v3: the encrypted object stored at the `index` key. It combines the current cache-validity token with the chunk index. v4/v5 store the same `ChunkIndex` as a [segmented index](#segmented-index-v4v5).
+**IndexBlob** — v2/v3: the encrypted object stored at the `index` key. It combines the current cache-validity token with the chunk index. v6/v7 store the same `ChunkIndex` as a [segmented index](#segmented-index-v6v7).
 
 | Field | Type | Description |
 |-------|------|-------------|
 | generation | u64 | Authenticated cache-validity token rotated when the index changes |
 | chunks | ChunkIndex | Full chunk-to-pack mapping |
 
-**ChunkIndex** — `HashMap<ChunkId, ChunkIndexEntry>`, persisted inside `IndexBlob` (v2/v3); read by the upgrade and the repair of an overwritten head. In v4/v5 the same entries are a base plus segments on storage and a `LiveIndex` (mapped chunk table plus edits) in memory, the central lookup table for deduplication, restore, and compaction.
+**ChunkIndex** — `HashMap<ChunkId, ChunkIndexEntry>`, persisted inside `IndexBlob` (v2/v3); read by the upgrade. In v6/v7 the same entries are a base plus segments on storage and a `LiveIndex` (mapped chunk table plus edits) in memory, the central lookup table for deduplication, restore, and compaction.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| refcount | u32 | Number of references to this chunk across all snapshots. Every occurrence counts, including repeats within one snapshot |
+| refcount | u32 | Not maintained since format v6: new entries are written with 1, reuse is not counted, and nothing decides on it (liveness comes from the mark). `check --repair` still writes multiplicity counts; 05 step 10 removes the column |
 | stored_size | u32 | Size in bytes as stored (compressed + encrypted) |
 | pack_id | PackId | Which pack file contains this chunk |
 | pack_offset | u64 | Byte offset within the pack file |
@@ -408,41 +412,44 @@ Each `SnapshotEntry` contains: `name`, `id` (32-byte random), `time`, `source_la
 
 The uncompressed `size` is stored per-reference so the restore path can size its output buffers up front, pass it as a size hint to the ZSTD one-shot decompressor, and then validate the decoded length against it. The chunk index holds only the stored size; readers without this field (e.g. `check --verify-data`) use the same decompressor and take the size from the ZSTD frame header instead, so both paths accept and reject the same frames. Every chunk read (restore, `read_chunk`, coalesced reads, the item stream and `check --verify-data`) decodes through `repo::format::decode_chunk_into`, which takes the size hint as an optional argument.
 
-### Segmented Index (v4/v5)
+### Segmented Index (v6/v7)
 
-A monolithic index (v2/v3) is rewritten whole on every change: on a repository with millions of chunks that is hundreds of megabytes per backup, prune and compact. v4/v5 store the same `ChunkIndex` as a base plus a chain of segments, so a write uploads what it changed (`repo/index_store.rs`, `repo/index_write.rs`, `index/{head,base,segment}.rs`).
+A monolithic index (v2/v3) is rewritten whole on every change: on a repository with millions of chunks that is hundreds of megabytes per backup, prune and compact. v6/v7 store the same `ChunkIndex` as a base plus a chain of segments, so a write uploads what it changed (`repo/index_store.rs`, `repo/index_write.rs`, `index/{head,base,segment,sweep_record}.rs`).
 
 ```text
-index                # mutable, small: IndexHead
-index.d/<64 hex>     # write-once: base or segment, name = BLAKE3 of the stored bytes
+index.h/<gen>        # write-once, small: IndexHead of generation <gen>; the highest generation is the state
+index.d/<64 hex>     # write-once: base, segment or sweep record, name = BLAKE3 of the stored bytes
 ```
 
 - **State identity.** An index state is identified by `state_hash`, BLAKE3 over its canonical sorted 80-byte records — the checksum trailer of a chunk table, whose file is named after it. A local table is therefore matched to a state by content, and identical content keeps tables valid across a fold.
-- **Head** (`IndexHead`, positional msgpack, frozen; `layout` = 1): `state_hash`, `entries`, `base: Option<{name, size, state_hash, entries}>` (`None` = the empty index, which `init` writes), `segments: [{name, size, state_hash_after, entries_after}]` in order, and `retired`: the objects of the last head before the most recent fold.
+- **Head** (`IndexHead`, a msgpack **map** with named keys, `layout` = 2, AEAD context `index.h`): `gen` (equal to its key's generation, checked), `features` (written empty; a head naming a feature this binary does not know is refused as written by a newer vykar; readers ignore unknown keys, so a later field is additive), `state_hash` and `entries` (the v1 chain; 05 step 9 removes them), `base: Option<{name, size, state_hash, entries}>` (`None` = the empty index, which `init` writes at `index.h/1`), `segments: [{name, size, kind, state_hash_after, entries_after}]` in order (`kind`: 0 = backup, which may only add entries, 1 = maintenance), `retired`: the objects of the last head before the most recent fold, and `sweep: {gen, record}`: the generation of the last head a sweep or `check --repair` wrote, and the sweep record of the last sweep (an informational map of what the mark found: snapshots, live and removed entries and bytes, references; `info` reads it).
 - **Base**: a pack-ID table, then the sorted records referencing packs by table index; zstd; AEAD.
-- **Segment**: the change from its predecessor state, by *position* in the predecessor's sorted order — refcount deltas (position gaps and zigzag deltas as separate columns; a result of 0 removes the entry, a result outside `u32` is a decode error), relocations (position, pack, offset, size) for compact, and new entries as full sorted records. Nearly every backup bumps the refcount of most chunks; by position a bump costs a fraction of a bit, by chunk ID 33 bytes. All counts are bounded against the input length before allocating.
+- **Segment**: the change from its predecessor state, by *position* in the predecessor's sorted order — refcount deltas (position gaps and zigzag deltas as separate columns; a result of 0 removes the entry, a result outside `u32` is a decode error), relocations (position, pack, offset, size) for compact, and new entries as full sorted records. A backup segment holds new entries only (refcount 1); removals (the sweep's deltas to 0) and relocations come from maintenance. All counts are bounded against the input length before allocating.
 - **Every read of `index.d/<name>` checks `BLAKE3(bytes) == name` and the recorded size first.** The AEAD contexts are static because the name is the hash of the ciphertext; the binding to the head is this check. On a plaintext repository it is the only corruption check before decompression.
 
-**Write** (any writer, under the repository lock): GET the head; produce the next state and its segment in one sorted pass; PUT the segment, check the lock fence, PUT the head; install the new state as this machine's chunk table. The backup commit brings a local table to the head (normally the repository's own, already there) and merge-walks it with the session's positional bumps, its keyed bumps and its new entries: a new entry already present becomes a bump, a bump on a chunk in neither is `StaleChunksDuringCommit`. Maintenance writes (prune, delete, compact, repair) diff the in-memory index against the table it was loaded over, reading its edits by position; a write without a head (repair) writes a base. A write refuses when the head changed after the index was loaded.
+**Write** (any writer, under the repository lock): read the latest head; produce the next state and its segment in one sorted pass; PUT the segment (and a pending sweep record), check the lock fence, PUT the head of the next generation with a plain put (04 step 8 makes it create-if-absent); install the new state as this machine's chunk table. The backup commit brings a local table to the head (normally the repository's own, already there) and merge-walks it with the session's reused chunks (positional and keyed) and its new entries: reuse is checked, not counted; a new entry already present writes nothing (the existing entry stays); a reused chunk in neither is `StaleChunksDuringCommit`. A session that only reused chunks still runs this check and, when it passes, writes nothing. Maintenance writes (prune, delete, compact, repair) diff the in-memory index against the table it was loaded over, reading its edits by position; a write without a head (repair) writes a base. A write refuses when the head changed after the index was loaded.
 
-**Read**: open lists snapshots first, then GETs the head once (a writer PUTs the head before its snapshot, so this head covers every listed snapshot). The repository's own table or a local table file at the head's state needs nothing; one at a state in the chain gets the missing segments applied in one streaming pass; otherwise the segments are downloaded (in parallel), then the base, and applied. Readers take no lock. A 404 on a named object makes the reader re-read the head: if the new head still names the object it is lost, and the read fails naming it (`vykar check --repair`); otherwise a fold moved the head and the reader retries on it (bounded retries). Without a cache directory the table lives in a temp file kept on the `Repository`, so the base is downloaded once per run.
+**Read**: open lists snapshots first, then lists `index.h/` and GETs the highest generation once (a writer PUTs the head before its snapshot, so this head covers every listed snapshot; a 404 on that GET re-lists, bounded). The repository's own table or a local table file at the head's state needs nothing; one at a state in the chain gets the missing segments applied in one streaming pass; otherwise the segments are downloaded (in parallel), then the base, and applied. Readers take no lock. A 404 on a named object makes the reader re-read the head: if the new head still names the object it is lost, and the read fails naming it (`vykar check --repair`); otherwise a fold moved the head and the reader retries on it (bounded retries). Without a cache directory the table lives in a temp file kept on the `Repository`, so the base is downloaded once per run.
 
-**Fold** (writing a base instead of a segment), under the lock: delete every `index.d/` object the current head names neither as live nor as retired, and the retired ones; PUT the base (none for the empty index, which is `base: None` as `init` writes it); PUT the head with no segments and the previous live set as `retired`. A fold without a valid previous head (`check --repair`, `upgrade`) deletes the unreferenced objects only after the head PUT, since until then they may be the only copy of the index. A reader on the previous head finishes; one on the head before it gets a 404 and re-reads. Peak storage is two bases. Every writer folds at the hard limit (64 segments, or segments ≥ 20 % of the base and ≥ 4 MiB); compact folds at the soft limit (16, or 5 % and ≥ 1 MiB) and otherwise deletes unreferenced `index.d/` objects (debris of interrupted writes) — in one batch request where the backend has one (vykar-server, and S3 without `s3_soft_delete`), else one by one. A plaintext segment whose name the head already holds also folds.
+**Fold** (writing a base instead of a segment), under the lock: PUT the base (none for the empty index, which is `base: None` as `init` writes it); PUT the head with no segments and the previous live set as `retired`. A fold without a valid previous head (`check --repair`, `upgrade`) writes at the highest listed generation + 1. Nothing is deleted before a head PUT. Every writer folds at the hard limit (64 segments, or segments ≥ 20 % of the base and ≥ 4 MiB); compact folds at the soft limit (16, or 5 % and ≥ 1 MiB). A plaintext segment whose name the head already holds also folds.
+
+**Garbage collection, by age** (after every fold, and at the end of every compact): with "now" the newest mtime in the listings of `index.h/` and `index.d/` (the storage's clock, not the client's), heads below latest − 16 that are older than an hour are deleted, and so are `index.d/` objects that no kept head names and that are older than an hour — in one batch request where the backend has one, else one by one; best-effort. Entries without an mtime are never deleted. A kept head that cannot be read stops the object part. A concurrent writer's fresh segment is therefore not deleted, and a reader on a recent head finishes; one whose objects aged out gets a 404 and re-reads. A listed entry with an mtime in the future (a skewed storage clock) moves "now" forward and over-estimates every other age, so an object no kept head names can go early, a concurrent writer's segment not yet named by its head among them. The damage is bounded: the latest head and the 16 below it are kept whatever their age, and so is every object a kept head names. On an append-only server old heads cannot be deleted (`WriteOnce`) and accumulate, one per index write.
 
 **Order against pack deletes**: no pack is deleted while the head on storage names a state that references it. Client-side compact saves once per batch of source packs (64 packs or 4 GiB), then deletes that batch's sources, empty packs included.
 
-**Damage**: a `ChunkIndex` blob at `index` (an older binary overwrote the head), a chain with missing or damaged objects, and a missing or unreadable head are refused by every command except `check --repair`, which writes a fresh base. A blob is rebuilt from the blob. A chain that cannot be read is rebuilt from this machine's table of the head's state when there is one. Otherwise, when an object of the chain is absent or fails verification or decoding, or the head is missing or cannot be read, the index is **rebuilt from the packs** (`repo::index_rebuild`): every listed pack is described by a pack map naming it (no request to the pack), else by its trailer, else by this machine's verified chunk tables (only entries that lie inside the listed pack; a pack ID names the pack's bytes, so an entry that was ever true for it still is). A chunk stored in several packs resolves to the lowest (pack ID, offset). Packs that nothing describes are listed in the plan with the reason, and the snapshots that need them are removed by it; packs the rebuild took only from a local table get a `WritePackMaps` action, so the next rebuild does not need this machine. A storage error (a failed listing, map GET or trailer read), a pack map or trailer of a newer body version or codec, or an object of an unknown type under `packmaps/` aborts the repair with nothing changed, and the error names the object's key. A trailer of an unknown version counts as newer only when the pack still hashes to its ID (the pack ID covers the trailer): in a plaintext repository one flipped byte also produces an unknown version, and a pack that no longer matches its ID is damaged, so it is uncovered and the repair goes on. A rebuilt index starts with refcount 1 per entry; the repair's refcount rebuild sets the real counts and drops entries no snapshot references. The rebuild trusts what the packs say: chunks whose bytes rotted inside a described pack are found only by `check --verify-data`, so run it after a rebuild. An interactive repair refuses to apply a plan rebuilt under the lock that has data loss where the shown plan had none, or that read the index differently (including other rebuild counts). A head of an unknown layout, or an `index` of an unknown type, is refused.
+**Damage**: a chain with missing or damaged objects, and a missing or unreadable latest head, are refused by every command except `check --repair`, which writes a fresh base. A chain that cannot be read is rebuilt from this machine's table of the head's state when there is one. Otherwise, when an object of the chain is absent or fails verification or decoding, or the head is missing or cannot be read, the index is **rebuilt from the packs** (`repo::index_rebuild`): every listed pack is described by a pack map naming it (no request to the pack), else by its trailer, else by this machine's verified chunk tables (only entries that lie inside the listed pack; a pack ID names the pack's bytes, so an entry that was ever true for it still is). A chunk stored in several packs resolves to the lowest (pack ID, offset). Packs that nothing describes are listed in the plan with the reason, and the snapshots that need them are removed by it; packs the rebuild took only from a local table get a `WritePackMaps` action, so the next rebuild does not need this machine. A storage error (a failed listing, map GET or trailer read), a pack map or trailer of a newer body version or codec, or an object of an unknown type under `packmaps/` aborts the repair with nothing changed, and the error names the object's key. A trailer of an unknown version counts as newer only when the pack still hashes to its ID (the pack ID covers the trailer): in a plaintext repository one flipped byte also produces an unknown version, and a pack that no longer matches its ID is damaged, so it is uncovered and the repair goes on. A rebuilt index starts with refcount 1 per entry; the repair's refcount rebuild sets the real counts and drops entries no snapshot references. The rebuild trusts what the packs say: chunks whose bytes rotted inside a described pack are found only by `check --verify-data`, so run it after a rebuild. An interactive repair refuses to apply a plan rebuilt under the lock that has data loss where the shown plan had none, or that read the index differently (including other rebuild counts). A head of an unknown layout or with unknown features, or of an unknown object type, is refused.
 
 ### In-Place Upgrade
 
-`vykar upgrade` (`repo/upgrade.rs`) moves v2 to v4 and v3 to v5 under the maintenance lock, on a repository opened without its index:
+`vykar upgrade` (`repo/upgrade.rs`) moves v2 to v7 and v3 to v6 under the maintenance lock, on a repository opened without its index:
 
-1. Probe the server's `segmented_index` capability, and PUT the stored `config` bytes back unchanged. A server that refuses overwrites (append-only) fails here, with the repository untouched.
-2. GET `index` and decode the legacy index, then write it as a base (none for an empty index). An index that cannot be decoded fails the upgrade before anything is written. Anything an earlier attempt left in `index.d/` is deleted after step 3, or by the next compact if the upgrade is interrupted there.
-3. Overwrite `index` with the head. From here every older binary fails on its next index read (`UnknownObjectType`), rather than reading an empty index — compact deletes packs with no index entries, so an empty index would be dangerous, not just wrong.
-4. Rewrite `config` with the new version; delete `index.gen` and the local `index_blob`. The chunk table of the new state is installed in the local cache dir.
+1. Probe the server's `segmented_index` capability and its `index.h`/`packmaps` key directories, and PUT the stored `config` bytes back unchanged. A server that refuses overwrites (append-only) fails here, with the repository untouched.
+2. GET `index` and decode the legacy index. While `config` is below 6 this blob is the repository's index; heads already under `index.h/` are debris of an earlier attempt. An index that cannot be decoded, or an `index` holding a segmented head (a development build's interrupted upgrade), fails the upgrade before anything is written.
+3. Write it as a v1 base (none for an empty index) and a head at `index.h/<highest listed + 1>`. `index` is not touched.
+4. Rewrite `config` with the new version. From here every older binary refuses the repository by version.
+5. Delete `index`, `index.gen` and the local `index_blob`, best-effort. The chunk table of the new state is installed in the local cache dir.
 
-A v2/v3 `config` with a head at `index` is an upgrade interrupted after step 3: every other command refuses the repository and names `vykar upgrade`, which verifies the head and every object of its chain and completes step 4. `prove_key` accepts either object at `index`, so key-copy disagreement can be resolved in every state. Remaining hole: a pre-0.25 prune or delete that loaded the index before the upgrade and gets the lock after it can overwrite the head with a legacy blob; that is the damage case above, repaired by `check --repair`. Stop all other clients before upgrading. With a damaged chain or head, `vykar upgrade` still completes the version switch, without the deletions of step 4, and returns an error that names `check --repair`, which then repairs the repository as v4/v5. Every released binary already fails on such a repository, so the switch loses nothing. When the head cannot be read and `index.d/` holds no objects, `index` is more likely a damaged monolithic index: the upgrade refuses and changes nothing.
+Until the switch in step 4 an older binary keeps working on the repository, because the legacy index is untouched; a resume always rebuilds from the current legacy index, so writes an old client made in between are kept. Debris of an interrupted attempt is collected by age. An upgrade interrupted after the switch finds a current format: `vykar upgrade` reports it current and retries the deletions of step 5. `prove_key` reads `index` for v2/v3 and the latest head for v6/v7. Stop all other clients before upgrading.
 
 ### Pack Files
 
@@ -751,28 +758,21 @@ Two-stage signal handling applies to all commands:
 
 ### Refcount Lifecycle
 
-Chunk refcounts track how many snapshots reference each chunk, driving the dedup → delete → compact lifecycle:
+Since format v6 stored refcounts are not maintained: new entries are written with refcount 1, reuse is not counted, and prune and delete only delete `snapshots/<id>` objects. Liveness comes from the mark that every compact runs (see [Mark](#mark)):
 
 ```mermaid
 flowchart TD
-    backup["Backup<br/>new chunk or dedup hit"] --> refs["ChunkIndex refcount updated"]
-    refs --> delete["Delete / prune<br/>remove snapshot first"]
-    delete --> zero["Refcount reaches 0<br/>index entry removed"]
-    delete -. crash here .-> inflated["Inflated refcounts<br/>safe, space not reclaimed yet"]
-    zero --> orphan["Dead bytes remain in pack files"]
-    orphan --> compact["Compact rewrites or deletes packs"]
-    compact --> reclaimed["Space reclaimed"]
+    backup["Backup<br/>new chunks added, reuse checked"] --> delete["Delete / prune<br/>snapshot objects deleted"]
+    delete --> compact["Compact<br/>mark, sweep unmarked entries"]
+    compact --> repack["Repack or delete packs"]
+    repack --> reclaimed["Space reclaimed"]
 ```
 
-1. **Backup** — `store_chunk()` adds a new entry with refcount=1, or increments an existing entry's refcount on dedup hit
-2. **Delete / Prune** — delete `snapshots/<id>` first, then decrement chunk refs in the index and save it
-3. **Crash window** — if the process dies after snapshot deletion but before index save, refcounts stay inflated; this is safe and only keeps chunks live longer than necessary
-4. **Orphaned blobs** — after delete/prune commits, the encrypted blob data remains in pack files (the index no longer points to it, but the bytes are still on disk)
-5. **Compact** — rewrites packs to reclaim space from orphaned blobs
+1. **Backup** — a new chunk gets an entry with refcount 1; a reused chunk is only checked at commit (`StaleChunksDuringCommit` if the head no longer has it)
+2. **Delete / Prune** — delete `snapshots/<id>` (fenced by the maintenance lock); no index read or write. The space stays used until the next compact
+3. **Compact** — mark every live snapshot, remove the unmarked entries in one maintenance segment with a sweep record, then repack and delete packs over the swept index
 
-`vykar compact --report-unreferenced` marks the index from the snapshots (see [Mark](#mark)) and reports the entries no snapshot references, which is what a sweep would remove, and compares the stored refcounts with the references it counted. It changes nothing: the stored refcounts stay the source of truth until compact sweeps by the mark.
-
-This design means `delete` is fast (just index updates), while space reclamation is deferred to `compact`.
+`vykar compact --report-unreferenced` runs the same mark and reports what a sweep would remove; it changes nothing. Its refcount comparison is meaningful only on freshly upgraded repositories.
 
 ### Crash Recovery
 
@@ -802,7 +802,7 @@ Two concurrent backups do not block each other during upload — each operates o
 
 #### IndexDelta Reconciliation
 
-Each backup session accumulates index mutations in an `IndexDelta`: `new_entries` (newly uploaded chunks) and `refcount_bumps` (dedup hits on existing chunks). At commit time, the delta is reconciled against the current on-storage index. In v4/v5 this is the merge-walk described under [Segmented Index](#segmented-index-v4v5), with the same two rules; the steps below are v2/v3:
+Each backup session accumulates index mutations in an `IndexDelta`: `new_entries` (newly uploaded chunks) and `refcount_bumps` (dedup hits on existing chunks). At commit time, the delta is reconciled against the current on-storage index. In v6/v7 this is the merge-walk described under [Segmented Index](#segmented-index-v6v7); the steps below are v2/v3:
 
 - If the delta is non-empty, the full index is reloaded from storage and the delta is reconciled against it:
   - `new_entries` for chunks already present in the fresh index (another client uploaded the same chunk) are converted to `refcount_bumps`
@@ -812,11 +812,13 @@ Each backup session accumulates index mutations in an `IndexDelta`: `new_entries
 
 #### Index Then Snapshot Commit Point
 
-The index is always written before `snapshots/<id>`. A crash between these two writes leaves orphan entries in the index (no snapshot references them) — a bounded, never-data-loss space leak. `compact` alone does **not** reclaim these: it treats any in-index chunk as live, so an orphan still in the index counts toward `live_bytes`. `vykar compact --report-unreferenced` lists them as unreferenced entries (and as unreferenced entries with a refcount). They are reclaimed by `vykar check --repair`, whose always-on refcount rebuild recomputes refcounts from the surviving snapshots and drops index entries no snapshot references; a subsequent `vykar compact` then frees the orphaned pack bytes. Once `snapshots/<id>` is written, the backup is committed. Delete/prune intentionally invert this ordering: snapshot object first, then index save, so crashes leave inflated refcounts instead of visible snapshots whose chunks were already removed from the index.
+The index is always written before `snapshots/<id>`. A crash between these two writes leaves orphan entries in the index (no snapshot references them) — a bounded, never-data-loss space leak that the next compact's sweep removes. Once `snapshots/<id>` is written, the backup is committed. Delete/prune only delete snapshot objects.
 
 ### Compact
 
-After `delete` or `prune`, chunk refcounts are decremented and entries with refcount 0 are removed from the `ChunkIndex` — but the encrypted blob data remains in pack files. The `compact` command rewrites packs to reclaim this wasted space.
+`delete` and `prune` only delete snapshot objects. `compact` reclaims the space: on every run it first marks every live snapshot and sweeps the index entries none references, then rewrites and deletes packs.
+
+**Mark and sweep first, on every run, fail closed.** Under the maintenance lock, against the index loaded under it: the strict listing of `snapshots/` and the mark (tree-chunk cache first) must succeed, or compact refuses with `compact refused: the live snapshots could not be marked, nothing was changed` — an unreadable, undecodable or newer snapshot object, a foreign key under `snapshots/`, a tree chunk missing from the index or unreadable, or a data reference missing from the index. It also refuses when no snapshot is listed while the index has entries (it does not sweep a repository to empty; `vykar delete` removes a repository), and when a snapshot the last sweep marked is missing from the listing but still exists (a stale listing). On such a repository every compact refuses until `check --repair` removes the object. Then the unmarked entries are removed in one maintenance segment, with a sweep record and a head whose `sweep.gen` is its own generation (a run that removes nothing writes the record and a head only), and the tree-chunk cache drops the tree chunks the mark did not reach. A dry run marks too and writes nothing. After the pack phase, pack maps none of whose packs is left are deleted (a damaged map is kept).
 
 #### Algorithm
 
@@ -842,7 +844,7 @@ flowchart TB
 **Phase 1 — Analysis (read-only, no pack downloads):**
 1. Enumerate all pack files: one sized listing of `packs/` on a vykar-server, otherwise one sized listing per shard dir (`packs/00/` through `packs/ff/`), parallelized from `limits.connections` (remote: `min(connections*3, 24)`, local: `min(connections, 8)`)
 2. Sizes come from the listing; `HEAD`/stat only for packs it lists without one (servers before v0.22), parallelized the same way
-3. Compute live bytes per pack from the `ChunkIndex`: `live_bytes = Σ(4 + stored_size)` for each indexed blob in that pack
+3. Compute live bytes per pack from the swept `ChunkIndex`: `live_bytes = Σ(4 + stored_size)` for each indexed blob in that pack; a pack left without entries is an orphan and deleted whole (a pack this run wrote as a repack output is never deleted)
 4. Derive `dead_bytes = (pack_size - PACK_HEADER_SIZE) - live_bytes`; packs where `live_bytes > pack_payload` are marked corrupt. For a pack that would be a candidate, the last 12 bytes are read: a trailer footer whose frame fits inside the dead bytes counts as pack overhead, not as dead bytes, so a repack's own trailer never makes its output a candidate again. A failed read counts the trailer as dead
 5. Compute `unused_ratio = dead_bytes / pack_size` per pack
 6. Track pack health counters (`packs_corrupt`, `packs_orphan`) in addition to live/dead bytes
@@ -857,7 +859,8 @@ For each candidate pack (most wasteful first, respecting `--max-repack-size` cap
    - Read live blobs as encrypted passthrough (no decrypt/re-encrypt cycle), write a new pack, update index mappings
 3. Persist index updates before old pack deletion (`save_state()`); client-side repack saves once per batch of 64 source packs or 4 GiB
 4. Delete old pack(s)
-5. v4/v5: fold the index at the soft limit, otherwise delete unreferenced `index.d/` objects — also when nothing was repacked
+5. Fold the index at the soft limit, then collect old heads and unreferenced `index.d/` objects by age — also when nothing was repacked
+6. Delete the pack maps whose packs are all gone
 
 #### Crash Safety
 

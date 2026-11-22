@@ -1,132 +1,6 @@
-use tracing::warn;
-
-use crate::index::LiveIndex;
 use crate::repo::Repository;
 use crate::repo::control::CancelToken;
-use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
-
-use super::list;
-
-/// Append `msg` to `warnings` and emit `tracing::warn!` for it. Both actions
-/// always happen together: warnings are the surface-visible half, tracing is
-/// the log-file half — `warn_and_push` prevents drift.
-pub fn warn_and_push(warnings: &mut Vec<String>, msg: String) {
-    warn!("{msg}");
-    warnings.push(msg);
-}
-
-/// Attempt Phase 3 refcount cleanup for a single snapshot whose blob has
-/// already been deleted (the commit point has been crossed). On success
-/// returns the impact; on failure appends a warning referencing
-/// `vykar check --repair` as the recovery path and returns `None`.
-///
-/// Shared between `commands::delete` and `commands::prune` — they differ only
-/// in how they handle the returned impact (per-snapshot stats vs aggregate).
-pub fn try_cleanup_deleted_snapshot_refs(
-    repo: &mut Repository,
-    snapshot_name: &str,
-    item_ptrs: &[ChunkId],
-    warnings: &mut Vec<String>,
-) -> Option<SnapshotChunkImpact> {
-    let result = (|| -> Result<SnapshotChunkImpact> {
-        let items_stream = list::load_item_stream_from_ptrs(repo, item_ptrs, &CancelToken::new())?;
-        decrement_chunk_refs_on_index(repo.chunk_index_mut(), &items_stream, item_ptrs)
-    })();
-    match result {
-        Ok(impact) => Some(impact),
-        Err(e) => {
-            warn_and_push(
-                warnings,
-                format!(
-                    "snapshot '{snapshot_name}' was deleted from storage, but refcount \
-                     cleanup failed: {e}. Refcounts and space accounting will remain \
-                     inflated until `vykar check --repair` rebuilds them from surviving \
-                     snapshots."
-                ),
-            );
-            None
-        }
-    }
-}
-
-#[derive(Debug, Default, Clone, Copy)]
-pub struct SnapshotChunkImpact {
-    pub chunks_deleted: u64,
-    pub space_freed: u64,
-}
-
-/// Decrement all chunk refs for a snapshot's items against an arbitrary index.
-///
-/// Used by both the live delete path (operating on the repo's real index) and
-/// the dry-run path (operating on a cloned scratch index).
-pub fn decrement_chunk_refs_on_index(
-    index: &mut LiveIndex,
-    items_stream: &[u8],
-    item_ptrs: &[ChunkId],
-) -> Result<SnapshotChunkImpact> {
-    let mut impact = SnapshotChunkImpact::default();
-
-    list::for_each_decoded_item(items_stream, |item| {
-        for chunk_ref in &item.chunks {
-            if let Some((rc, size)) = index.decrement(&chunk_ref.id)
-                && rc == 0
-            {
-                impact.chunks_deleted += 1;
-                impact.space_freed += size as u64;
-            }
-        }
-        Ok(())
-    })?;
-
-    for chunk_id in item_ptrs {
-        if let Some((rc, size)) = index.decrement(chunk_id)
-            && rc == 0
-        {
-            impact.chunks_deleted += 1;
-            impact.space_freed += size as u64;
-        }
-    }
-
-    Ok(impact)
-}
-
-/// Persist the refcount decrements made after a batch of snapshot blobs was
-/// deleted, and re-sync the local snapshot list cache with the mutated
-/// manifest.
-///
-/// Both steps are past the commit point, so neither can fail the operation:
-/// a `save_state()` error becomes a warning that names `vykar check --repair`
-/// as the recovery path, and the cache refresh is best-effort (a stale cache
-/// only affects local listing freshness and self-heals on the next open).
-///
-/// After a successful save, local tree-chunk cache entries the persisted
-/// index no longer holds are deleted (best-effort, invisible to the result).
-///
-/// `op` names the operation in the warning ("delete" / "prune").
-pub fn commit_snapshot_removals(repo: &mut Repository, op: &str, warnings: &mut Vec<String>) {
-    match repo.save_state() {
-        // Tree chunks whose last reference went with these snapshots are no
-        // longer in the index; their local cache entries are useless now.
-        // Skipped (inside) when this run never loaded the index.
-        Ok(()) => {
-            let _ = repo.drop_unreferenced_tree_chunks();
-        }
-        Err(e) => warn_and_push(
-            warnings,
-            format!(
-                "snapshots were deleted from storage, but persisting refcount \
-                 changes failed: {e}. The chunks_deleted/space_freed totals \
-                 reported reflect intended cleanup that did NOT commit — the \
-                 remote index still shows the original refcounts and the next \
-                 operation will see the pre-{op} state. Run `vykar check \
-                 --repair` to recover accurate accounting."
-            ),
-        ),
-    }
-
-    repo.persist_snapshot_cache_from_manifest();
-}
 
 /// A snapshot resolved for removal. Only constructed by
 /// [`prepare_removal_targets`]; the storage key stays private so callers must
@@ -134,93 +8,55 @@ pub fn commit_snapshot_removals(repo: &mut Repository, op: &str, warnings: &mut 
 pub struct RemovalTarget {
     pub snapshot_name: String,
     snapshot_key: String,
-    pub item_ptrs: Vec<ChunkId>,
 }
 
-pub struct RemovedSnapshot {
-    pub snapshot_name: String,
-    pub impact: SnapshotChunkImpact,
-}
-
-/// Phase 1: resolve storage keys and `item_ptrs` for every name. No mutation.
-///
-/// All names are resolved against the manifest before any metadata GET, so an
-/// unknown name fails fast with `SnapshotNotFound`. Only metadata is retained —
-/// item streams are loaded lazily in Phase 3 to bound memory.
+/// Resolve every name against the manifest. No storage access, no mutation:
+/// an unknown name fails with `SnapshotNotFound` before anything is deleted.
 pub fn prepare_removal_targets<S: AsRef<str>>(
-    repo: &mut Repository,
+    repo: &Repository,
     names: &[S],
-    shutdown: &CancelToken,
 ) -> Result<Vec<RemovalTarget>> {
-    let keys = names
+    names
         .iter()
         .map(|name| {
             let name = name.as_ref();
             repo.manifest()
                 .find_snapshot(name)
-                .map(|e| e.id.storage_key())
+                .map(|e| RemovalTarget {
+                    snapshot_name: name.to_string(),
+                    snapshot_key: e.id.storage_key(),
+                })
                 .ok_or_else(|| VykarError::SnapshotNotFound(name.into()))
         })
-        .collect::<Result<Vec<_>>>()?;
-
-    let mut targets = Vec::with_capacity(names.len());
-    for (name, snapshot_key) in names.iter().zip(keys) {
-        shutdown.check()?;
-        let name = name.as_ref();
-        let snapshot_meta = list::load_snapshot_meta(repo, name)?;
-        targets.push(RemovalTarget {
-            snapshot_name: name.to_string(),
-            snapshot_key,
-            item_ptrs: snapshot_meta.item_ptrs,
-        });
-    }
-    Ok(targets)
+        .collect()
 }
 
-/// Delete the snapshot blobs, then decrement refcounts and persist.
-///
-/// Phase 2 deletes every `snapshots/<id>` blob (fenced by the maintenance
-/// lock) and is the commit point: any error aborts before refcounts change,
-/// leaving them inflated (safe). Phase 3 is best-effort — the blobs are
-/// already gone, so per-snapshot refcount failures are appended to
-/// `warnings` and the snapshot is left in the manifest. Only snapshots whose
-/// cleanup succeeded are returned.
-///
-/// `op` names the operation in warnings ("delete" / "prune").
+/// Delete the `snapshots/<id>` objects (each fenced by the maintenance lock),
+/// remove them from the manifest and re-sync the local snapshot list cache.
+/// Returns the removed names. The index is not read or written: the chunks
+/// only these snapshots referenced stay until `vykar compact` sweeps them.
 pub fn remove_snapshots(
     repo: &mut Repository,
     targets: Vec<RemovalTarget>,
-    op: &str,
     shutdown: &CancelToken,
-    warnings: &mut Vec<String>,
-) -> Result<Vec<RemovedSnapshot>> {
-    for target in &targets {
-        shutdown.check()?;
-        repo.check_lock_fence()?;
-        repo.storage.delete(&target.snapshot_key).map_err(|e| {
-            VykarError::Other(format!(
-                "failed to delete snapshot object {}: {e}",
-                target.snapshot_name
-            ))
-        })?;
-    }
-
+) -> Result<Vec<String>> {
     let mut removed = Vec::with_capacity(targets.len());
-    for target in targets {
-        if let Some(impact) = try_cleanup_deleted_snapshot_refs(
-            repo,
-            &target.snapshot_name,
-            &target.item_ptrs,
-            warnings,
-        ) {
+    let result = (|| {
+        for target in targets {
+            shutdown.check()?;
+            repo.check_lock_fence()?;
+            repo.storage.delete(&target.snapshot_key).map_err(|e| {
+                VykarError::Other(format!(
+                    "failed to delete snapshot object {}: {e}",
+                    target.snapshot_name
+                ))
+            })?;
             repo.manifest_mut().remove_snapshot(&target.snapshot_name);
-            removed.push(RemovedSnapshot {
-                snapshot_name: target.snapshot_name,
-                impact,
-            });
+            removed.push(target.snapshot_name);
         }
-    }
-
-    commit_snapshot_removals(repo, op, warnings);
-    Ok(removed)
+        Ok(())
+    })();
+    // The cache is best-effort; it follows the manifest whatever happened.
+    repo.persist_snapshot_cache_from_manifest();
+    result.map(|()| removed)
 }

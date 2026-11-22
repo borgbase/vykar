@@ -220,11 +220,12 @@ fn pack_files(fx: &Fixture) -> Vec<std::path::PathBuf> {
     packs
 }
 
-/// `vykar upgrade` takes each v3 fixture to v5 in place: the same index, every
+/// `vykar upgrade` takes each v3 fixture to v6 in place (UPG-1): the same
+/// index, a head at `index.h/1` and no `index` or `index.gen`, every
 /// check clean, the latest snapshot restores byte-identical, and a new backup
 /// dedups against the chunk IDs 0.24 wrote.
 #[test]
-fn v3_fixtures_upgrade_to_v5() {
+fn v3_fixtures_upgrade_to_v6() {
     for mode in MODES {
         let fx = extract(mode);
         let config = fx.config();
@@ -236,7 +237,7 @@ fn v3_fixtures_upgrade_to_v5() {
                 outcome,
                 UpgradeOutcome::Upgraded {
                     from: 3,
-                    to: 5,
+                    to: 6,
                     resumed: false,
                     ..
                 }
@@ -244,9 +245,11 @@ fn v3_fixtures_upgrade_to_v5() {
             "{mode}: {outcome:?}"
         );
         assert!(!fx.repo_dir().join("index.gen").exists(), "{mode}");
+        assert!(!fx.repo_dir().join("index").exists(), "{mode}");
+        assert!(fx.repo_dir().join("index.h/1").is_file(), "{mode}");
 
         let repo = fx.open();
-        assert_eq!(repo.config.version, 5, "{mode}");
+        assert_eq!(repo.config.version, 6, "{mode}");
         assert_eq!(
             before,
             sorted_entries(&repo.chunk_index().to_chunk_index()),
@@ -279,7 +282,7 @@ fn v3_fixtures_upgrade_to_v5() {
         assert!(
             matches!(
                 commands::upgrade::run(&config, fx.passphrase()).unwrap(),
-                UpgradeOutcome::AlreadyCurrent { version: 5 }
+                UpgradeOutcome::AlreadyCurrent { version: 6 }
             ),
             "{mode}"
         );

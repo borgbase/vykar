@@ -25,17 +25,15 @@ impl Repository {
         })
     }
 
-    /// Increment the refcount for a chunk: in the session's delta, or in the
-    /// index when no session is active.
+    /// Record a new reference to a chunk in the session's delta (the reused
+    /// set a commit checks). Without a session it does nothing: refcounts
+    /// are not persisted (05 step 8).
     pub fn increment_chunk_ref(&mut self, id: &ChunkId) {
         if let Some(ref mut ws) = self.write_session
             && let Some(ref mut delta) = ws.index_delta
         {
             delta.bump_refcount(id);
-            return;
         }
-        self.chunk_index.increment_refcount(id);
-        self.index_dirty = true;
     }
 
     /// An existing chunk `id` for a new reference: stored earlier in the
@@ -80,13 +78,11 @@ impl Repository {
     /// Increment refcount if this chunk already exists in committed or pending state.
     /// Returns stored size when found. Falls back to recovered chunks from a
     /// previous interrupted session, then to the pending pack writers.
-    /// Without a write session, bumps the refcount in the index.
+    /// Without a write session, only looks the chunk up in the index:
+    /// refcounts are not persisted (05 step 8), so nothing is recorded.
     pub fn bump_ref_if_exists(&mut self, chunk_id: &ChunkId) -> Option<u32> {
         if self.write_session.is_none() {
-            let stored_size = self.chunk_index.get(chunk_id)?.stored_size;
-            self.chunk_index.increment_refcount(chunk_id);
-            self.index_dirty = true;
-            return Some(stored_size);
+            return self.chunk_index.get(chunk_id).map(|e| e.stored_size);
         }
         if let Some(stored_size) = self.bump_existing(chunk_id, false) {
             return Some(stored_size);

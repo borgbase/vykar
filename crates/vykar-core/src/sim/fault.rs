@@ -15,6 +15,7 @@ pub enum OpKind {
     Size,
     List,
     ListSized,
+    ListMeta,
     Put,
     PutOwned,
     PutPack,

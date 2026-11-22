@@ -21,7 +21,7 @@ pub enum ObjectType {
     FileCache = 6,
     PendingIndex = 7,
     SnapshotCache = 8,
-    /// Segmented index head at `index` (formats v4/v5).
+    /// Index head at `index.h/<gen>` (formats v6/v7; v4/v5 kept it at `index`).
     IndexHead = 9,
     /// Segmented index base under `index.d/`.
     IndexBase = 10,
@@ -31,6 +31,8 @@ pub enum ObjectType {
     PackTrailer = 12,
     /// Pack map under `packmaps/`: blob lists of packs without a trailer.
     PackMap = 13,
+    /// Sweep record under `index.d/`: what one mark-and-sweep found.
+    SweepRecord = 14,
 }
 
 impl ObjectType {
@@ -50,6 +52,7 @@ impl ObjectType {
             11 => Ok(Self::IndexSegment),
             12 => Ok(Self::PackTrailer),
             13 => Ok(Self::PackMap),
+            14 => Ok(Self::SweepRecord),
             _ => Err(VykarError::UnknownObjectType(v)),
         }
     }

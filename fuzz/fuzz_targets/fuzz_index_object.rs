@@ -8,7 +8,7 @@ use vykar_core::compress::decompress_metadata;
 use vykar_core::fuzzing;
 use vykar_core::index::base;
 use vykar_core::index::dedup_cache::MmapFullIndexCache;
-use vykar_core::index::head::{BaseRef, ObjectName, SegmentRef};
+use vykar_core::index::head::{BaseRef, ObjectName, SegmentKind, SegmentRef};
 use vykar_core::index::segment::Segment;
 use vykar_core::repo::format::{ObjectType, unpack_object_expect_with_context};
 use vykar_crypto::PlaintextEngine;
@@ -33,6 +33,7 @@ fuzz_target!(|data: &[u8]| {
     let mut seg_ref = SegmentRef {
         name,
         size,
+        kind: SegmentKind::Maintenance,
         state_hash_after: [0; 32],
         entries_after: 0,
     };

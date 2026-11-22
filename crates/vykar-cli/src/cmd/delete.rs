@@ -5,7 +5,6 @@ use vykar_core::config::VykarConfig;
 use vykar_core::repo::control::CancelToken;
 
 use crate::error::{CliError, CliResult};
-use crate::format::format_bytes;
 use crate::passphrase::with_repo_passphrase;
 
 pub(crate) fn run_delete(
@@ -25,37 +24,12 @@ pub(crate) fn run_delete(
     for stats in &result.stats {
         if dry_run {
             println!("Dry run: would delete snapshot '{}'", stats.snapshot_name);
-            println!(
-                "  Would free: {} chunks, {}",
-                stats.chunks_deleted,
-                format_bytes(stats.space_freed),
-            );
         } else {
             println!("Deleted snapshot '{}'", stats.snapshot_name);
-            println!(
-                "  Freed: {} chunks, {}",
-                stats.chunks_deleted,
-                format_bytes(stats.space_freed),
-            );
         }
     }
-
-    if result.stats.len() > 1 {
-        let total_chunks: u64 = result.stats.iter().map(|s| s.chunks_deleted).sum();
-        let total_space: u64 = result.stats.iter().map(|s| s.space_freed).sum();
-        if dry_run {
-            println!(
-                "Total: would free {} chunks, {}",
-                total_chunks,
-                format_bytes(total_space),
-            );
-        } else {
-            println!(
-                "Total: freed {} chunks, {}",
-                total_chunks,
-                format_bytes(total_space),
-            );
-        }
+    if !dry_run && !result.stats.is_empty() {
+        println!("Run `vykar compact` to reclaim their space.");
     }
 
     for w in &result.warnings {

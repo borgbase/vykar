@@ -1,5 +1,5 @@
-//! The segmented index (v5) through `RestBackend` against an in-process
-//! vykar-server, in normal and append-only mode. Opening a v5 repository at
+//! The segmented index (v6) through `RestBackend` against an in-process
+//! vykar-server, in normal and append-only mode. Opening a v6 repository at
 //! all is the positive path of the `segmented_index` capability check.
 
 use std::path::{Path, PathBuf};
@@ -79,11 +79,13 @@ fn head(config: &VykarConfig) -> IndexHead {
     open(config).index_head().cloned().unwrap()
 }
 
+/// Entries without their refcounts: a repair writes multiplicity counts,
+/// every other writer 1 (05 step 8), and nothing decides on them.
 fn sorted_entries(index: &impl crate::testutil::EntryIter) -> Vec<String> {
     let mut v: Vec<String> = index
         .entry_vec()
         .iter()
-        .map(|(id, e)| format!("{id:?} {e:?}"))
+        .map(|(id, e)| format!("{id:?} {} {} {}", e.pack_id, e.pack_offset, e.stored_size))
         .collect();
     v.sort();
     v
@@ -120,7 +122,7 @@ impl Client {
         std::fs::create_dir_all(&source).unwrap();
         let config = client(server, tmp.path(), "cache");
         let repo = commands::init::run(&config, None).unwrap();
-        assert_eq!(repo.format(), RepoFormat::V5);
+        assert_eq!(repo.format(), RepoFormat::V6);
         Self {
             tmp,
             source,
@@ -143,7 +145,7 @@ impl Client {
 }
 
 #[test]
-fn v5_backup_fold_and_compact_through_the_server() {
+fn v6_backup_sweep_fold_and_compact_through_the_server() {
     let server = Server::start(false);
     let c = Client::init(&server);
     for (name, file, content) in [
@@ -159,25 +161,37 @@ fn v5_backup_fold_and_compact_through_the_server() {
 
     commands::delete::run(&c.config, None, &["s1"], false, &CancelToken::new()).unwrap();
     let after_delete = head(&c.config);
-    assert_eq!(after_delete.segments.len(), 4);
+    assert_eq!(after_delete.segments.len(), 3, "delete writes no index");
 
     let compact = || {
         let mut repo = open(&c.config);
         let mut policy = FoldPolicy::default();
         policy.soft.segments = 2;
         repo.set_fold_policy(policy);
+        repo.set_index_gc_grace(std::time::Duration::ZERO);
         commands::compact::run_on_repo(&mut repo, 0.0, None, false, &CancelToken::new()).unwrap();
+    };
+    let named_on_server = |h: &crate::index::head::IndexHead| {
+        h.named_objects().all(|n| {
+            server
+                .data
+                .path()
+                .join(INDEX_OBJECT_DIR)
+                .join(n.to_hex())
+                .exists()
+        })
     };
     compact();
     let folded = head(&c.config);
     assert!(folded.segments.is_empty(), "past the soft limit");
+    assert!(folded.sweep.record.is_some());
     assert!(
         after_delete
             .live_objects()
             .all(|n| folded.retired.contains(&n)),
         "{folded:?} vs {after_delete:?}"
     );
-    assert_eq!(server.index_objects(), 1 + folded.retired.len());
+    assert!(named_on_server(&folded));
 
     let debris = server
         .data
@@ -187,8 +201,9 @@ fn v5_backup_fold_and_compact_through_the_server() {
     std::fs::write(&debris, b"debris").unwrap();
     compact();
     assert!(!debris.exists(), "debris is collected");
-    assert_eq!(head(&c.config), folded);
-    assert_eq!(server.index_objects(), 1 + folded.retired.len());
+    let after = head(&c.config);
+    assert_eq!(after.base, folded.base);
+    assert!(named_on_server(&after) && named_on_server(&folded));
 
     check_clean(&c.config);
     assert_eq!(c.cold_entries(&server, "cold"), entries(&c.config));
@@ -209,9 +224,10 @@ fn v5_backup_fold_and_compact_through_the_server() {
     assert_eq!(std::fs::read_to_string(restored).unwrap(), "charlie");
 }
 
-/// The fold's `index.d/` deletes are accepted in append-only mode.
+/// Folds at the hard limit on an append-only server: every head is a new
+/// key, so nothing is overwritten.
 #[test]
-fn v5_folds_at_the_hard_limit_on_an_append_only_server() {
+fn v6_folds_at_the_hard_limit_on_an_append_only_server() {
     let server = Server::start(true);
     let c = Client::init(&server);
     c.write("a", "alpha");
@@ -241,7 +257,15 @@ fn v5_folds_at_the_hard_limit_on_an_append_only_server() {
         last = Some(head);
     }
     assert_eq!(counts, vec![2, 0, 1, 2, 0]);
-    assert_eq!(server.index_objects(), 1 + last.unwrap().retired.len());
+    let last = last.unwrap();
+    assert!(last.named_objects().all(|n| {
+        server
+            .data
+            .path()
+            .join(INDEX_OBJECT_DIR)
+            .join(n.to_hex())
+            .exists()
+    }));
     assert_eq!(
         c.cold_entries(&server, "cold"),
         sorted_entries(repo.chunk_index())
@@ -568,7 +592,7 @@ fn repair_rebuilds_a_deleted_index_from_the_packs_through_the_server() {
     let packs = server_packs(&server).len();
 
     let delete_index = || {
-        std::fs::remove_file(server.data.path().join("index")).unwrap();
+        super::helpers::remove_index_heads(server.data.path());
         for e in std::fs::read_dir(server.data.path().join(INDEX_OBJECT_DIR)).unwrap() {
             let path = e.unwrap().path();
             if path.is_file() {

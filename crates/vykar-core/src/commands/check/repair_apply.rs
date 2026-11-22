@@ -513,9 +513,10 @@ pub(super) fn execute_repair(
     applied.push(RepairAction::RebuildRefcounts);
 
     // Step 7: Persist index. This is the one write that folds the index
-    // into a new base and removes unreferenced index objects; earlier
-    // persists stay segments.
+    // into a new base; earlier persists stay segments. Its head records
+    // the repair as a sweep (`sweep.gen`), keeping the last sweep record.
     repo.request_index_fold();
+    repo.set_pending_sweep(crate::repo::index_write::PendingSweep::Repair);
     repo.save_state()?;
 
     // Step 8: pack maps for packs whose only description is the repaired

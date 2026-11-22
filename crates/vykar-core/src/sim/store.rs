@@ -978,6 +978,22 @@ impl vykar_storage::StorageBackend for SimClient {
         })
     }
 
+    fn list_meta(&self, prefix: &str) -> Result<Vec<ListedObject>> {
+        self.read(OpKind::ListMeta, prefix, |m| {
+            let listed: Vec<ListedObject> = m
+                .iter()
+                .filter(|(k, _)| k.starts_with(prefix))
+                .map(|(k, o)| ListedObject {
+                    key: k.clone(),
+                    size: Some(o.data.len() as u64),
+                    mtime: Some(o.mtime.into()),
+                })
+                .collect();
+            let n = listed.len() as u64;
+            (Ok(listed), OpOutcome::Ok, Some(n))
+        })
+    }
+
     fn size(&self, key: &str) -> Result<Option<u64>> {
         self.read(OpKind::Size, key, |m| {
             let v = m.get(key).map(|o| o.data.len() as u64);
@@ -1126,6 +1142,9 @@ mod tests {
         let sized = a.list_sized("k/").unwrap();
         assert_eq!(sized.len(), 2);
         assert_eq!(sized[0].size, Some(3));
+        let meta = a.list_meta("k/").unwrap();
+        assert_eq!(meta[0].mtime, Some(store.now().into()));
+        assert_eq!(last(&store).op, OpKind::ListMeta);
         assert_eq!(
             a.get_range("k/1", 1, 2).unwrap().as_deref(),
             Some(&b"ne"[..])

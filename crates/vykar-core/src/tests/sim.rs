@@ -10,7 +10,6 @@ use crate::sim::{
     Call, ClientId, FaultAction, FaultRule, GateRule, KeyMatch, OpKind, OpMatch, OpOutcome, Sim,
     SourceTree,
 };
-use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{ActiveSessionList, LockHolder, VykarError};
 
 const KIB: usize = 1024;
@@ -163,46 +162,6 @@ fn checker_detects_silent_snapshot_removal() {
     );
     assert!(
         report.violated_for(Invariant::NoSilentRemoval, "t0"),
-        "{report}"
-    );
-}
-
-#[test]
-fn checker_detects_refcount_deflation() {
-    let mut sim = Sim::new();
-    let c = sim.client("c");
-    // Two files with the same bytes: their chunk has two references.
-    let dup = crate::sim::runner::seeded_bytes("dup", 64 * KIB);
-    let t = SourceTree::new()
-        .file("a.bin", dup.clone())
-        .file("b.bin", dup);
-    sim.backup(c, "t0", &t).expect_ok();
-    sim.check_invariants(Invariant::STEP1).assert_clean();
-
-    let mut picked: Option<ChunkId> = None;
-    sim.custom(c, "deflate", |repo| {
-        repo.load_chunk_index_under_lock()?;
-        let id = repo
-            .chunk_index()
-            .iter()
-            .find(|(_, e)| e.refcount >= 2)
-            .map(|(id, _)| id)
-            .expect("a chunk with two references");
-        repo.chunk_index_mut().decrement(&id);
-        repo.mark_index_dirty();
-        picked = Some(id);
-        repo.save_state()
-    })
-    .expect_ok();
-    let id = picked.unwrap();
-
-    let report = sim.check_invariants(Invariant::STEP1);
-    assert!(
-        report.has_kind(ViolationKind::RefcountDeflated, &id.to_string()),
-        "{report}"
-    );
-    assert!(
-        !report.violated(Invariant::CommittedSnapshotsRestore),
         "{report}"
     );
 }
@@ -620,9 +579,11 @@ fn known_hazard_h3_late_head_put() {
     hazards::assert_reproduces("H3");
 }
 
+/// H5 is a regression: after the lost update compact refuses and every pack
+/// of b survives.
 #[test]
-fn known_hazard_h5_compact_after_lost_update() {
-    hazards::assert_reproduces("H5");
+fn h5_after_lost_update_compact_refuses() {
+    expect_not_reproduced("H5", hazards::h5_with(LateHead::AfterB));
 }
 
 #[test]
@@ -1032,11 +993,6 @@ fn known_hazard_h4_compact_deletes_after_lost_lock() {
 }
 
 #[test]
-fn known_hazard_h4_segment_deleted() {
-    hazards::assert_reproduces("H4-segment");
-}
-
-#[test]
 fn neutralised_h1_not_reproduced() {
     expect_not_reproduced("H1", interleavings::h1_with(Hosts::Distinct));
 }
@@ -1094,5 +1050,299 @@ fn h4_without_h1_has_no_prerequisite() {
             ),
             "H4 on distinct hostnames should report the missing prerequisite: {outcome:?}"
         );
+    }
+}
+
+// ── Mark and sweep (05 step 8) ──────────────────────────────────────────
+
+/// Mutations by `client` during run `run` under `prefixes`.
+fn mutations_under(sim: &Sim, client: ClientId, run: usize, prefixes: &[&str]) -> Vec<String> {
+    sim.store()
+        .log()
+        .iter()
+        .filter(|r| r.client == client && r.run == Some(run) && r.applied() && r.op.is_mutation())
+        .flat_map(|r| {
+            r.all_keys()
+                .into_iter()
+                .map(String::from)
+                .collect::<Vec<_>>()
+        })
+        .filter(|k| prefixes.iter().any(|p| k.starts_with(p)))
+        .collect()
+}
+
+fn allowed_as(run: &crate::sim::history::RunRecord, e: AllowedError) -> bool {
+    run.error_class() == Some(&ErrorClass::Allowed(e))
+}
+
+/// SIM-1: a compact while a backup is between its uploads and its commit
+/// refuses (the session is live) and touches no pack and no index object;
+/// the backup then commits.
+#[test]
+fn sweep_against_a_live_backup_refuses() {
+    let mut sim = Sim::new();
+    let (a, b, c) = (sim.client("a"), sim.client("b"), sim.client("c"));
+    sim.backup(c, "t0", &tree("t0")).expect_ok();
+    let gb = sim.gate(
+        GateRule::new(
+            b,
+            OpMatch::Kind(OpKind::List),
+            KeyMatch::Exact("locks/".into()),
+        )
+        .nth(2),
+    );
+    let sb = sim.spawn(
+        b,
+        Call::Backup {
+            snapshot: "b1".into(),
+            tree: tree("b1"),
+        },
+    );
+    sim.expect_paused(gb, "b's commit-lock sweep");
+    assert!(!sim.store().keys_written_by(b, "packs/").is_empty());
+    let ra = sim.compact(a);
+    assert!(
+        allowed_as(&ra, AllowedError::ActiveSessions),
+        "{:?}",
+        ra.outcome
+    );
+    assert!(
+        mutations_under(&sim, a, ra.index, &["packs/", "index.h/", "index.d/"]).is_empty(),
+        "compact mutated under a live session"
+    );
+    sim.resume(gb);
+    sim.join(sb).expect_ok();
+    sim.check_invariants(interleavings::CHECKED).assert_clean();
+}
+
+/// c0, t0 and t1 (t1 shares t0's first file), then t0 deleted: a compact
+/// has t0's other chunks to sweep.
+fn sweepable(sim: &mut Sim, c: ClientId) {
+    sim.backup(c, "c0", &tree("c0")).expect_ok();
+    let t0 = SourceTree::seeded("x", 3, 64 * KIB);
+    sim.backup(c, "t0", &t0).expect_ok();
+    let t1 = SourceTree::new().file(
+        "f000.bin",
+        crate::sim::runner::seeded_bytes("x/0", 64 * KIB),
+    );
+    sim.backup(c, "t1", &t1).expect_ok();
+    sim.delete(c, &["t0"]).expect_ok();
+}
+
+/// SIM-2: a backup that starts while a compact is between its sweep's
+/// first index write and its head is refused (the lock is held); the
+/// compact completes and the repository is consistent.
+#[test]
+fn backup_during_a_sweep_is_locked_out() {
+    for prefix in ["index.h/", "index.d/"] {
+        let mut sim = Sim::new();
+        let (a, b, c) = (sim.client("a"), sim.client("b"), sim.client("c"));
+        sweepable(&mut sim, c);
+        let ga = sim.gate(GateRule::new(
+            a,
+            OpMatch::AnyWrite,
+            KeyMatch::Prefix(prefix.into()),
+        ));
+        let sa = sim.spawn(a, Call::Compact);
+        sim.expect_paused(ga, "compact a's first index write");
+        let rb = sim.backup(b, "b1", &tree("b1"));
+        assert!(
+            allowed_as(&rb, AllowedError::Locked),
+            "{prefix}: {:?}",
+            rb.outcome
+        );
+        sim.resume(ga);
+        let ra = sim.join(sa);
+        ra.expect_ok();
+        assert!(ra.detail().contains("unreferenced"), "{}", ra.detail());
+        assert!(!ra.detail().contains("unreferenced 0"), "{}", ra.detail());
+        sim.check_invariants(interleavings::CHECKED).assert_clean();
+    }
+}
+
+/// SIM-3: a crash, or an applied write whose answer is lost, at every
+/// mutation of a sweeping compact leaves the repository consistent; once
+/// the lock is stale another client's compact completes the sweep.
+#[test]
+fn a_crash_at_every_write_of_the_sweep_is_recoverable() {
+    let probe = {
+        let mut sim = Sim::new();
+        let (a, c) = (sim.client("a"), sim.client("c"));
+        sweepable(&mut sim, c);
+        let run = sim.compact(a);
+        run.expect_ok();
+        sim.store()
+            .log()
+            .iter()
+            .filter(|r| {
+                r.client == a && r.run == Some(run.index) && r.applied() && r.op.is_mutation()
+            })
+            .count() as u32
+    };
+    assert!(probe > 3, "the probe compact made {probe} mutations");
+    for k in 1..=probe {
+        for action in [FaultAction::Crash, FaultAction::FailApplied] {
+            let case = format!("k={k} {action:?}");
+            let mut sim = Sim::new();
+            let (a, c) = (sim.client("a"), sim.client("c"));
+            sweepable(&mut sim, c);
+            sim.fault(
+                FaultRule::new(OpMatch::AnyMutation, KeyMatch::Any, action)
+                    .client(a)
+                    .nth(k),
+            );
+            let ra = sim.compact(a);
+            let faulted = sim
+                .store()
+                .log()
+                .iter()
+                .filter(|r| r.client == a && r.run == Some(ra.index) && r.op.is_mutation())
+                .nth(k as usize - 1)
+                .map(|r| r.key.clone());
+            let report = sim.check_invariants(Invariant::STEP1);
+            let trace: Vec<String> = sim
+                .store()
+                .log()
+                .iter()
+                .filter(|r| r.client == a && r.run == Some(ra.index) && r.op.is_mutation())
+                .map(|r| format!("{:?} {} {:?}", r.op, r.key, r.outcome))
+                .collect();
+            assert!(
+                report.is_clean(),
+                "{case} at {faulted:?}: {:?}\n{trace:#?}\n{report}",
+                ra.outcome
+            );
+            sim.advance(Duration::from_secs(6 * 3600 + 60));
+            let rc = sim.compact(c);
+            assert!(rc.is_ok(), "{case} at {faulted:?}: {}", rc.detail());
+            let report = sim.check_invariants(Invariant::STEP1);
+            assert!(report.is_clean(), "{case} at {faulted:?}: {report}");
+            let again = sim.compact(c);
+            assert!(
+                again.detail().ends_with("unreferenced 0"),
+                "{case} at {faulted:?}: {}",
+                again.detail()
+            );
+        }
+    }
+}
+
+/// SIM-4: a reaped session that commits afterwards (H2-marker's net
+/// effect, modelled with tamper). The sweep removed t0's entries it reused
+/// and compact deleted its uploaded pack, so its commit fails as stale and
+/// no snapshot is written.
+#[test]
+fn a_reaped_session_that_commits_afterwards_fails_as_stale() {
+    let mut sim = Sim::new();
+    let (a, b, c) = (sim.client("a"), sim.client("b"), sim.client("c"));
+    sim.backup(c, "c0", &tree("c0")).expect_ok();
+    let x = SourceTree::seeded("x", 3, 64 * KIB);
+    sim.backup(c, "t0", &x).expect_ok();
+    sim.delete(c, &["t0"]).expect_ok();
+
+    let ga = sim.gate(
+        GateRule::new(
+            a,
+            OpMatch::Kind(OpKind::List),
+            KeyMatch::Exact("locks/".into()),
+        )
+        .nth(2),
+    );
+    let sa = sim.spawn(
+        a,
+        Call::Backup {
+            snapshot: "a1".into(),
+            tree: x.file("new.bin", b"a file of its own".to_vec()),
+        },
+    );
+    sim.expect_paused(ga, "a's commit-lock sweep");
+    assert!(!sim.store().keys_written_by(a, "packs/").is_empty());
+    let marker = sim
+        .store()
+        .keys_written_by(a, "sessions/")
+        .into_iter()
+        .find(|k| k.ends_with(".json"))
+        .expect("a's marker");
+    let bytes = sim.store().object(&marker).expect("marker present").data;
+    assert!(sim.tamper_delete(&marker));
+
+    let rb = sim.compact(b);
+    rb.expect_ok();
+    assert!(!rb.detail().ends_with("unreferenced 0"), "{}", rb.detail());
+    let a_packs = sim.store().keys_written_by(a, "packs/");
+    assert!(
+        a_packs.iter().all(|k| sim.store().object(k).is_none()),
+        "orphans deleted"
+    );
+
+    sim.tamper_put(&marker, &bytes);
+    sim.resume(ga);
+    let ra = sim.join(sa);
+    assert!(
+        allowed_as(&ra, AllowedError::StaleChunksDuringCommit),
+        "{:?}",
+        ra.outcome
+    );
+    let names: Vec<String> = sim
+        .history()
+        .observations
+        .last()
+        .unwrap()
+        .names()
+        .map(String::from)
+        .collect();
+    assert!(!names.contains(&"a1".to_string()), "{names:?}");
+    sim.check_invariants(interleavings::CHECKED).assert_clean();
+}
+
+/// SIM-5 (the H5 regression is in `regressions_hold`): a head that drops a
+/// live snapshot's entries makes the next compact refuse, and no pack goes.
+#[test]
+fn a_head_that_drops_live_entries_makes_compact_refuse() {
+    let mut sim = Sim::new();
+    let c = sim.client("c");
+    sim.backup(c, "c0", &tree("c0")).expect_ok();
+    sim.backup(c, "t1", &tree("t1")).expect_ok();
+    sim.custom(c, "drop t1's entries", |repo| {
+        repo.load_chunk_index_under_lock()?;
+        let items = crate::commands::list::load_snapshot_items(
+            repo,
+            "t1",
+            &crate::repo::control::CancelToken::new(),
+        )?;
+        let ids: Vec<_> = items
+            .iter()
+            .flat_map(|i| i.chunks.iter().map(|c| c.id))
+            .collect();
+        for id in ids {
+            repo.chunk_index_mut().remove(&id);
+        }
+        repo.save_state()
+    })
+    .expect_ok();
+    let packs_before = sim.store().keys("packs/");
+    let run = sim.compact(c);
+    assert!(
+        allowed_as(&run, AllowedError::MarkRefused),
+        "{:?}",
+        run.outcome
+    );
+    assert_eq!(sim.store().keys("packs/"), packs_before, "no pack deleted");
+    let report = sim.check_invariants(Invariant::STEP1);
+    assert!(
+        report.violated_for(Invariant::CommittedSnapshotsRestore, "t1"),
+        "{report}"
+    );
+    assert!(
+        !report.violated_for(Invariant::CommittedSnapshotsRestore, "c0"),
+        "{report}"
+    );
+    for inv in [
+        Invariant::AcknowledgedCommitsDurable,
+        Invariant::NoSilentRemoval,
+        Invariant::IndexIntegrity,
+        Invariant::AllowedErrors,
+    ] {
+        assert!(!report.violated(inv), "{inv:?}: {report}");
     }
 }

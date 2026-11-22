@@ -168,30 +168,20 @@ pub(super) fn handle_delete_snapshots(
         Err(_) => return,
     };
 
-    let mut total_chunks = 0u64;
-    let mut total_freed = 0u64;
-    for stats in &result.stats {
-        total_chunks += stats.chunks_deleted;
-        total_freed += stats.space_freed;
-    }
     if let [s] = result.stats.as_slice() {
         send_log(
             &ctx.ui_tx,
             format!(
-                "[{repo_name}] Deleted snapshot '{}': {} chunks freed, {} reclaimed",
+                "[{repo_name}] Deleted snapshot '{}'; compact reclaims its space",
                 s.snapshot_name,
-                s.chunks_deleted,
-                format_bytes(s.space_freed),
             ),
         );
     } else {
         send_log(
             &ctx.ui_tx,
             format!(
-                "[{repo_name}] Deleted {} snapshots: {} chunks freed, {} reclaimed",
+                "[{repo_name}] Deleted {} snapshots; compact reclaims their space",
                 result.stats.len(),
-                total_chunks,
-                format_bytes(total_freed),
             ),
         );
     }
@@ -310,11 +300,8 @@ pub(super) fn handle_prune_repo(ctx: &mut WorkerContext, repo_name: String) {
     send_log(
         &ctx.ui_tx,
         format!(
-            "[{repo_name}] Pruned {} snapshots (kept {}), freed {} chunks ({})",
-            stats.pruned,
-            stats.kept,
-            stats.chunks_deleted,
-            format_bytes(stats.space_freed),
+            "[{repo_name}] Pruned {} snapshots (kept {}); compact reclaims their space",
+            stats.pruned, stats.kept,
         ),
     );
     for w in &stats.warnings {

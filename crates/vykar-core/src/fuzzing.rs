@@ -15,6 +15,9 @@ use crate::repo::ChunkerParams;
 use crate::repo::index_store;
 use crate::snapshot::item::Item;
 
+/// The byte-string type of `SweepRecord::snapshots`, for seeds.
+pub use serde_bytes::ByteBuf;
+
 /// AEAD context of a stored index base.
 pub const BASE_CONTEXT: &[u8] = index_store::BASE_CONTEXT;
 /// AEAD context of a stored index segment.

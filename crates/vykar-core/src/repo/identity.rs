@@ -130,10 +130,11 @@ const MAX_SNAPSHOT_PROOF_ATTEMPTS: usize = 64;
 /// matches this repository's contents*; only the pin establishes *that these
 /// contents are the ones you trusted*. Conversely a matching pin is accepted
 /// without touching storage: it is the strongest evidence this client has,
-/// and the only evidence left when `index` is unreadable.
+/// and the only evidence left when the index head is unreadable.
 ///
-/// Only without a pin is repository data consulted — the `index` object that
-/// `init` writes even for an empty repository, then a bounded number of
+/// Only without a pin is repository data consulted — the latest index head
+/// (`index.h/<gen>` for v6/v7, which `init` writes even for an empty
+/// repository; the `index` object for v2/v3), then a bounded number of
 /// snapshot blobs.
 ///
 /// `url` is optional because [`super::Repository::open`] does not always know
@@ -170,20 +171,32 @@ pub fn prove_key(
 
     let engine = build_engine(&repo_config.encryption, format, candidate)?;
 
-    // Either layout's object may be at `index` whatever the format says: an
-    // upgrade can be interrupted, and an old binary can overwrite a head.
-    if let Ok(Some(blob)) = storage.get("index")
-        && [ObjectType::ChunkIndex, ObjectType::IndexHead]
-            .into_iter()
-            .any(|expected| {
-                unpack_object_expect_with_context(
-                    &blob,
-                    expected,
-                    INDEX_OBJECT_CONTEXT,
-                    engine.as_ref(),
-                )
-                .is_ok()
-            })
+    if format.is_upgrade_only() {
+        // A v2/v3 `index` holds the monolithic index, or the segmented head
+        // a development build wrote there.
+        if let Ok(Some(blob)) = storage.get("index")
+            && [ObjectType::ChunkIndex, ObjectType::IndexHead]
+                .into_iter()
+                .any(|expected| {
+                    unpack_object_expect_with_context(
+                        &blob,
+                        expected,
+                        INDEX_OBJECT_CONTEXT,
+                        engine.as_ref(),
+                    )
+                    .is_ok()
+                })
+        {
+            return Ok(KeyProof::AuthenticatedData);
+        }
+    } else if let Ok(Some((_, blob))) = super::index_store::fetch_latest_head_bytes(storage)
+        && unpack_object_expect_with_context(
+            &blob,
+            ObjectType::IndexHead,
+            super::index_store::HEAD_CONTEXT,
+            engine.as_ref(),
+        )
+        .is_ok()
     {
         return Ok(KeyProof::AuthenticatedData);
     }

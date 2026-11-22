@@ -520,9 +520,10 @@ fn backup_deduplicates_identical_files_and_extracts_correctly() {
     assert!(!first_ids.is_empty());
     assert_eq!(first_ids, second_ids);
 
+    // Reuse is not counted (format v6): one entry at refcount 1.
     for chunk_id in first_ids {
         let entry = repo.chunk_index().get(&chunk_id).unwrap();
-        assert_eq!(entry.refcount, 2);
+        assert_eq!(entry.refcount, 1);
     }
 
     let restore_dir = tmp.path().join("restore");
@@ -1626,11 +1627,11 @@ fn file_cache_persists_and_matches_snapshot_items() {
         );
     }
 
-    // Every chunk should have refcount 2 (one per snapshot).
+    // Every chunk has one entry; reuse is not counted (format v6).
     for file_item in &files1 {
         for cr in &file_item.chunks {
             let entry = repo.chunk_index().get(&cr.id).unwrap();
-            assert_eq!(entry.refcount, 2, "chunk {} refcount", cr.id);
+            assert_eq!(entry.refcount, 1, "chunk {} refcount", cr.id);
         }
     }
 }
@@ -1794,7 +1795,7 @@ fn info_reports_repository_statistics() {
     assert_eq!(empty.compressed_size, 0);
     assert_eq!(empty.deduplicated_size, 0);
     assert_eq!(empty.unique_stored_size, 0);
-    assert_eq!(empty.referenced_stored_size, 0);
+    assert_eq!(empty.referenced_stored_size, None);
     assert_eq!(empty.unique_chunks, 0);
 
     let source_paths = vec![source_dir.to_string_lossy().to_string()];
@@ -1828,7 +1829,11 @@ fn info_reports_repository_statistics() {
     assert_eq!(info.deduplicated_size, backup_stats.deduplicated_size);
     assert!(info.unique_chunks > 0);
     assert!(info.unique_stored_size > 0);
-    assert!(info.referenced_stored_size >= info.unique_stored_size);
+    // Known only once a compact swept.
+    assert_eq!(info.referenced_stored_size, None);
+    commands::compact::run(&config, None, 10.0, None, false, &CancelToken::new()).unwrap();
+    let info = commands::info::run(&config, None).unwrap();
+    assert!(info.referenced_stored_size >= Some(info.unique_stored_size));
 }
 
 #[test]

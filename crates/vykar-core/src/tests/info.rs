@@ -18,7 +18,8 @@ fn info_empty_repo_reports_zero_sizes_and_no_last_snapshot() {
     assert_eq!(stats.compressed_size, 0);
     assert_eq!(stats.deduplicated_size, 0);
     assert_eq!(stats.unique_stored_size, 0);
-    assert_eq!(stats.referenced_stored_size, 0);
+    assert_eq!(stats.referenced_stored_size, None);
+    assert!(stats.last_sweep_time.is_none());
     assert_eq!(stats.unique_chunks, 0);
 }
 
@@ -37,11 +38,26 @@ fn info_reports_referenced_size_larger_than_unique_when_chunks_are_reused() {
     std::thread::sleep(Duration::from_millis(2));
     backup_single_source(&config, &source_dir, "src-a", "snap-info-2");
 
+    // "Referenced" is the last sweep's figure: none before a compact.
+    let stats = commands::info::run(&config, None).unwrap();
+    assert_eq!(stats.referenced_stored_size, None);
+    assert!(stats.last_sweep_time.is_none());
+
+    commands::compact::run(
+        &config,
+        None,
+        10.0,
+        None,
+        false,
+        &crate::repo::control::CancelToken::new(),
+    )
+    .unwrap();
     let stats = commands::info::run(&config, None).unwrap();
     assert_eq!(stats.snapshot_count, 2);
     assert!(stats.last_snapshot_time.is_some());
+    assert!(stats.last_sweep_time.is_some());
     assert!(stats.unique_chunks > 0);
     assert!(stats.unique_stored_size > 0);
-    assert!(stats.referenced_stored_size >= stats.unique_stored_size);
-    assert!(stats.referenced_stored_size > stats.unique_stored_size);
+    let referenced = stats.referenced_stored_size.expect("a sweep ran");
+    assert!(referenced > stats.unique_stored_size);
 }

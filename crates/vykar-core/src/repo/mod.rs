@@ -74,9 +74,15 @@ use self::manifest::Manifest;
 /// This is not really a conflation of two concepts: `version` answers "what
 /// must a reader understand to read this repository?", and a reader computing
 /// BLAKE2b chunk IDs *cannot* read a BLAKE3 repository — the storage keys and
-/// the entire dedup index differ. The same holds for the index layout: v4 and
-/// v5 are v2 and v3 with the segmented index. v2 and v3 are upgrade-only (see
-/// [`RepoFormat::is_upgrade_only`]).
+/// the entire dedup index differ. v6 and v7 have the same layout (numbered
+/// index heads at `index.h/<gen>`, mark-and-sweep) and differ only in the
+/// hash. v2 and v3 are upgrade-only (see [`RepoFormat::is_upgrade_only`]).
+/// v4 and v5 were development formats (a segmented index under a mutable
+/// `index` head) and are refused like any unknown version.
+///
+/// v7 is development-only: 05 step 9 folds 6 and 7 into one version with a
+/// `chunk_hash` field in a map-encoded config, and from then on every
+/// positional config other than 2 and 3 is refused.
 ///
 /// Only chunk IDs and pack IDs follow the format. Every other digest in the
 /// workspace is BLAKE3 for all versions — see the "Repository Versions"
@@ -89,15 +95,18 @@ pub enum RepoFormat {
     /// Keyed/unkeyed BLAKE3 chunk and pack IDs, monolithic index;
     /// upgrade-only.
     V3,
-    /// BLAKE2b-256 chunk and pack IDs, segmented index.
-    V4,
-    /// BLAKE3 chunk and pack IDs, segmented index.
-    V5,
+    /// BLAKE3 chunk and pack IDs; numbered index heads at `index.h/<gen>`,
+    /// mark-and-sweep.
+    V6,
+    /// V6 with BLAKE2b-256 chunk and pack IDs. Written only by
+    /// `vykar upgrade` from v2. Development-only: 05 step 9 folds 6 and 7
+    /// into one version with a `chunk_hash` field in a map-encoded config.
+    V7,
 }
 
 impl RepoFormat {
     /// The format `vykar init` creates. Existing repositories keep theirs.
-    pub const CURRENT: Self = Self::V5;
+    pub const CURRENT: Self = Self::V6;
 
     /// The single version gate: an unknown version is rejected here and never
     /// reaches hashing code.
@@ -108,13 +117,13 @@ impl RepoFormat {
     /// # Errors
     ///
     /// Returns [`vykar_types::error::VykarError::UnsupportedVersion`] for any
-    /// other version.
+    /// other version, including the development formats 4 and 5.
     pub fn from_version(version: u32) -> Result<Self> {
         match version {
             2 => Ok(Self::V2),
             3 => Ok(Self::V3),
-            4 => Ok(Self::V4),
-            5 => Ok(Self::V5),
+            6 => Ok(Self::V6),
+            7 => Ok(Self::V7),
             other => Err(vykar_types::error::VykarError::UnsupportedVersion(other)),
         }
     }
@@ -124,16 +133,16 @@ impl RepoFormat {
         match self {
             Self::V2 => 2,
             Self::V3 => 3,
-            Self::V4 => 4,
-            Self::V5 => 5,
+            Self::V6 => 6,
+            Self::V7 => 7,
         }
     }
 
     /// The algorithm this format uses for chunk IDs and pack IDs.
     pub fn chunk_hash(self) -> HashAlgorithm {
         match self {
-            Self::V2 | Self::V4 => HashAlgorithm::Blake2b,
-            Self::V3 | Self::V5 => HashAlgorithm::Blake3,
+            Self::V2 | Self::V7 => HashAlgorithm::Blake2b,
+            Self::V3 | Self::V6 => HashAlgorithm::Blake3,
         }
     }
 
@@ -141,6 +150,16 @@ impl RepoFormat {
     /// [`OpenOptions::legacy_format`]. Every other open refuses them.
     pub fn is_upgrade_only(self) -> bool {
         matches!(self, Self::V2 | Self::V3)
+    }
+
+    /// The format `vykar upgrade` converts this one to: v2 → v7, v3 → v6.
+    /// `None` for a current format.
+    pub fn upgrade_target(self) -> Option<Self> {
+        match self {
+            Self::V2 => Some(Self::V7),
+            Self::V3 => Some(Self::V6),
+            Self::V6 | Self::V7 => None,
+        }
     }
 }
 
@@ -405,6 +424,10 @@ pub struct Repository {
     fold_policy: index_write::FoldPolicy,
     /// Make the next index write a fold.
     fold_requested: bool,
+    /// What the next index write records in the head's `sweep`; consumed by it.
+    pending_sweep: Option<index_write::PendingSweep>,
+    /// Grace of `collect_index_garbage`: `INDEX_GC_GRACE`; tests lower it.
+    index_gc_grace: std::time::Duration,
 }
 
 impl Repository {
@@ -508,16 +531,11 @@ impl Repository {
         self.tree_cache = cache;
     }
 
-    /// Drop every cached tree chunk the persisted index no longer holds.
-    /// Only against a loaded index with no unpersisted edits: an unloaded
-    /// index would reject every entry, an edited one is not what storage
-    /// holds. Returns `None` when skipped. Never fails.
-    pub(crate) fn drop_unreferenced_tree_chunks(&self) -> Option<tree_cache::RetainStats> {
-        let cache = self.tree_cache.as_ref()?;
-        if !self.chunk_index.is_loaded() || self.index_dirty || self.chunk_index.is_modified() {
-            return None;
-        }
-        Some(cache.retain(|id| self.chunk_index.contains(id)))
+    /// Drop this process's unpersisted edits of the chunk index: it is its
+    /// loaded table again, and not dirty.
+    pub(crate) fn discard_index_edits(&mut self) {
+        self.chunk_index.discard_edits();
+        self.index_dirty = false;
     }
 
     /// Drop the chunk index (unmaps its table, frees its edits).
@@ -696,14 +714,14 @@ mod format_tests {
     fn from_version_maps_known_versions() {
         assert_eq!(RepoFormat::from_version(2).unwrap(), RepoFormat::V2);
         assert_eq!(RepoFormat::from_version(3).unwrap(), RepoFormat::V3);
-        assert_eq!(RepoFormat::from_version(4).unwrap(), RepoFormat::V4);
-        assert_eq!(RepoFormat::from_version(5).unwrap(), RepoFormat::V5);
+        assert_eq!(RepoFormat::from_version(6).unwrap(), RepoFormat::V6);
+        assert_eq!(RepoFormat::from_version(7).unwrap(), RepoFormat::V7);
     }
 
     /// A future version must be refused, not silently handed known semantics.
     #[test]
     fn from_version_rejects_unknown_versions() {
-        for version in [0u32, 1, 6, u32::MAX] {
+        for version in [0u32, 1, 4, 5, 8, u32::MAX] {
             match RepoFormat::from_version(version) {
                 Err(VykarError::UnsupportedVersion(v)) => assert_eq!(v, version),
                 other => panic!("version {version} should be unsupported, got {other:?}"),
@@ -716,8 +734,8 @@ mod format_tests {
         for format in [
             RepoFormat::V2,
             RepoFormat::V3,
-            RepoFormat::V4,
-            RepoFormat::V5,
+            RepoFormat::V6,
+            RepoFormat::V7,
         ] {
             assert_eq!(RepoFormat::from_version(format.version()).unwrap(), format);
         }
@@ -727,16 +745,20 @@ mod format_tests {
     fn format_selects_the_hash() {
         assert_eq!(RepoFormat::V2.chunk_hash(), HashAlgorithm::Blake2b);
         assert_eq!(RepoFormat::V3.chunk_hash(), HashAlgorithm::Blake3);
-        assert_eq!(RepoFormat::V4.chunk_hash(), HashAlgorithm::Blake2b);
-        assert_eq!(RepoFormat::V5.chunk_hash(), HashAlgorithm::Blake3);
-        assert_eq!(RepoFormat::CURRENT, RepoFormat::V5);
+        assert_eq!(RepoFormat::V6.chunk_hash(), HashAlgorithm::Blake3);
+        assert_eq!(RepoFormat::V7.chunk_hash(), HashAlgorithm::Blake2b);
+        assert_eq!(RepoFormat::CURRENT, RepoFormat::V6);
     }
 
     #[test]
     fn upgrade_only_formats() {
         assert!(RepoFormat::V2.is_upgrade_only());
         assert!(RepoFormat::V3.is_upgrade_only());
-        assert!(!RepoFormat::V4.is_upgrade_only());
-        assert!(!RepoFormat::V5.is_upgrade_only());
+        assert!(!RepoFormat::V6.is_upgrade_only());
+        assert!(!RepoFormat::V7.is_upgrade_only());
+        assert_eq!(RepoFormat::V2.upgrade_target(), Some(RepoFormat::V7));
+        assert_eq!(RepoFormat::V3.upgrade_target(), Some(RepoFormat::V6));
+        assert_eq!(RepoFormat::V6.upgrade_target(), None);
+        assert_eq!(RepoFormat::V7.upgrade_target(), None);
     }
 }

@@ -896,12 +896,14 @@ impl Sim {
                         Ok((
                             Vec::new(),
                             format!(
-                                "packs {} repacked {} deleted_empty {} orphan {} corrupt {}",
+                                "packs {} repacked {} deleted_empty {} orphan {} corrupt {} \
+                                 unreferenced {}",
                                 s.packs_total,
                                 s.packs_repacked,
                                 s.packs_deleted_empty,
                                 s.packs_orphan,
-                                s.packs_corrupt
+                                s.packs_corrupt,
+                                s.chunks_unreferenced
                             ),
                         ))
                     },

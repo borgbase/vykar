@@ -764,32 +764,27 @@ mod index_delta {
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(500))]
 
-        /// After applying a delta with possibly-duplicate chunk_ids and refcount_bumps
-        /// to an empty index, every chunk's final refcount matches the expected aggregation.
+        /// After applying a delta with possibly-duplicate chunk_ids and
+        /// refcount_bumps to an empty index, every new chunk is present once,
+        /// at refcount 1 and at its first entry's location: bumps are not
+        /// persisted (05 step 8).
         #[test]
-        fn apply_to_refcount_conservation(
-            (delta, entries, bumps) in arb_index_delta_standalone(),
+        fn apply_to_adds_each_new_chunk_once(
+            (delta, entries, _bumps) in arb_index_delta_standalone(),
         ) {
             let mut index = crate::index::LiveIndex::empty();
             delta.apply_to(&mut index);
 
-            // Expected: for each unique chunk_id, sum all entry.refcount values,
-            // then add any bump counts targeting that ID.
-            let mut expected: HashMap<ChunkId, u32> = HashMap::new();
+            let mut first: HashMap<ChunkId, &NewChunkEntry> = HashMap::new();
             for entry in &entries {
-                *expected.entry(entry.chunk_id).or_insert(0) += entry.refcount;
+                first.entry(entry.chunk_id).or_insert(entry);
             }
-            for (id, count) in &bumps {
-                *expected.entry(*id).or_insert(0) += count;
-            }
-
-            for (id, expected_rc) in &expected {
+            prop_assert_eq!(index.len(), first.len());
+            for (id, entry) in &first {
                 let actual = index.get(id).unwrap();
-                prop_assert_eq!(
-                    actual.refcount, *expected_rc,
-                    "chunk {:?}: expected refcount {}, got {}",
-                    id, expected_rc, actual.refcount,
-                );
+                prop_assert_eq!(actual.refcount, 1);
+                prop_assert_eq!(actual.pack_id, entry.pack_id);
+                prop_assert_eq!(actual.pack_offset, entry.pack_offset);
             }
         }
 
@@ -823,7 +818,9 @@ mod index_delta {
             prop_assert!(delta.undo_log.is_none());
         }
 
-        /// After reconcile + apply_to with intentional overlaps, final refcounts are correct.
+        /// After reconcile + apply_to with intentional overlaps, the fresh
+        /// entries keep their refcounts and every other new chunk is added at
+        /// 1: overlaps and bumps are not counted (05 step 8).
         #[test]
         fn reconcile_then_apply_to_final_refcounts(
             (fresh_index, fresh_ids) in arb_fresh_index(),
@@ -868,23 +865,12 @@ mod index_delta {
                 }
             }
 
-            // Overlap entries become bumps on existing fresh entries
-            for (id, bump_count) in &overlap_bumps {
-                *expected.entry(*id).or_insert(0) += bump_count;
-            }
+            // Overlapping entries leave the fresh ones as they are.
+            let _ = (&overlap_bumps, &pre_reconcile_bumps);
 
-            // Non-overlap new entries: aggregate refcounts for duplicate IDs
-            let mut non_overlap_agg: HashMap<ChunkId, u32> = HashMap::new();
+            // Non-overlapping new entries: once each, at refcount 1.
             for entry in &non_overlap_entries {
-                *non_overlap_agg.entry(entry.chunk_id).or_insert(0) += entry.refcount;
-            }
-            for (id, rc) in &non_overlap_agg {
-                *expected.entry(*id).or_insert(0) += rc;
-            }
-
-            // Pre-reconcile bumps (both fresh-targeting and session-new-targeting)
-            for (id, count) in &pre_reconcile_bumps {
-                *expected.entry(*id).or_insert(0) += count;
+                expected.entry(entry.chunk_id).or_insert(1);
             }
 
             // Actually run reconcile + apply_to

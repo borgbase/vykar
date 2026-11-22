@@ -3,7 +3,6 @@ use vykar_core::config::{SourceEntry, VykarConfig};
 use vykar_core::repo::control::CancelToken;
 
 use crate::error::CliResult;
-use crate::format::format_bytes;
 use crate::passphrase::with_repo_passphrase;
 
 pub(crate) fn run_prune(
@@ -50,6 +49,9 @@ pub(crate) fn run_prune(
         );
     } else {
         print_prune_summary(&stats);
+        if stats.pruned > 0 {
+            println!("Run `vykar compact` to reclaim their space.");
+        }
     }
 
     for w in &stats.warnings {
@@ -61,11 +63,5 @@ pub(crate) fn run_prune(
 
 /// The one-line prune result, shared with the full-cycle summary in `dispatch`.
 pub(crate) fn print_prune_summary(stats: &commands::prune::PruneStats) {
-    println!(
-        "Pruned {} snapshots (kept {}), freed {} chunks ({})",
-        stats.pruned,
-        stats.kept,
-        stats.chunks_deleted,
-        format_bytes(stats.space_freed),
-    );
+    println!("Pruned {} snapshots (kept {})", stats.pruned, stats.kept);
 }

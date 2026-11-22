@@ -58,6 +58,41 @@ fn repo_config_reencodes_every_fixture_config_byte_for_byte() {
     }
 }
 
+/// FMT-4: the positional 7-field `config` this binary writes for formats 6
+/// and 7 is refused by version by both old releases, and today's gate
+/// refuses the development versions 4 and 5 like any unknown version.
+#[test]
+fn old_releases_refuse_positional_v6_and_v7_by_version() {
+    let config = |version: u32| vykar_core::repo::RepoConfig {
+        version,
+        id: vec![0xA5; 32],
+        chunker_params: ChunkerParams::default(),
+        encryption: EncryptionMode::Aes256Gcm,
+        created: Utc.with_ymd_and_hms(2026, 11, 22, 0, 0, 0).unwrap(),
+        min_pack_size: 32 * 1024 * 1024,
+        max_pack_size: 192 * 1024 * 1024,
+    };
+    for version in [6u32, 7] {
+        let bytes = rmp_serde::to_vec(&config(version)).unwrap();
+        for (release, gate) in RELEASES {
+            match gate(&bytes) {
+                Err(Refusal::UnsupportedVersion(v)) if v == version => {}
+                other => panic!("{release}: v{version}: {other:?}"),
+            }
+        }
+        assert!(config(version).validate().is_ok(), "v{version}");
+    }
+    for version in [4u32, 5] {
+        assert!(
+            matches!(
+                config(version).validate(),
+                Err(vykar_types::error::VykarError::UnsupportedVersion(v)) if v == version
+            ),
+            "v{version}"
+        );
+    }
+}
+
 /// The two outcomes of an old release's `config` gate that this suite tells apart.
 #[derive(Debug)]
 pub enum Refusal {

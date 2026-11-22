@@ -1,23 +1,23 @@
-//! Writing repositories in the segmented index formats (v4/v5): backup
-//! commits, maintenance writes, folds, garbage collection and repair.
+//! Writing repositories in the index formats v6/v7: backup commits,
+//! maintenance writes, folds, garbage collection and repair.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use super::helpers::{
-    FailGet, FaultyPut, backup_single_source, is_base_put, is_head_put, make_test_config,
+    FailGet, FaultyPut, backup_single_source, is_base_put, is_head_put, latest_head_key,
+    make_test_config,
 };
 use crate::commands;
 use crate::commands::check::{IndexLoss, IndexRecovery, RebuildCounts, RepairAction, RepairMode};
 use crate::config::VykarConfig;
-use crate::index::ChunkIndex;
-use crate::index::head::{IndexHead, ObjectName};
+use crate::index::head::{IndexHead, ObjectName, SegmentKind};
 use crate::index::table::{self, ChunkTable};
 use crate::repo::control::CancelToken;
 use crate::repo::format::{ObjectType, pack_object_streaming_with_context};
 use crate::repo::index_store::{
-    INDEX_OBJECT_DIR, SEGMENT_CONTEXT, decode_segment, object_key, pack_head,
+    HEAD_PREFIX, INDEX_OBJECT_DIR, SEGMENT_CONTEXT, decode_segment, object_key, pack_head,
 };
 use crate::repo::{EncryptionMode, OpenOptions, RepoFormat, Repository, WriteSessionOptions};
 use vykar_storage::local_backend::LocalBackend;
@@ -100,6 +100,27 @@ impl Fixture {
             .unwrap()
     }
 
+    /// The file of the latest head.
+    fn head_path(&self) -> PathBuf {
+        self.repo_dir.join(latest_head_key(&*self.storage()))
+    }
+
+    /// Remove every head.
+    fn remove_heads(&self) {
+        std::fs::remove_dir_all(self.repo_dir.join(HEAD_PREFIX)).unwrap();
+        std::fs::create_dir_all(self.repo_dir.join(HEAD_PREFIX)).unwrap();
+    }
+
+    /// Whether every object `head` names is on disk.
+    fn named_objects_exist(&self, head: &IndexHead) -> bool {
+        head.named_objects().all(|n| {
+            self.repo_dir
+                .join(INDEX_OBJECT_DIR)
+                .join(n.to_hex())
+                .exists()
+        })
+    }
+
     /// Objects under `index.d/` on disk.
     fn index_objects(&self) -> usize {
         std::fs::read_dir(self.repo_dir.join(INDEX_OBJECT_DIR))
@@ -153,11 +174,13 @@ fn find(dir: &Path, name: &str) -> PathBuf {
     walk(dir, name).unwrap_or_else(|| panic!("{name} not found below {}", dir.display()))
 }
 
+/// Entries without their refcounts: a repair writes multiplicity counts,
+/// every other writer 1 (05 step 8), and nothing decides on them.
 fn sorted_entries(index: &impl crate::testutil::EntryIter) -> Vec<String> {
     let mut v: Vec<String> = index
         .entry_vec()
         .iter()
-        .map(|(id, e)| format!("{id:?} {e:?}"))
+        .map(|(id, e)| format!("{id:?} {} {} {}", e.pack_id, e.pack_offset, e.stored_size))
         .collect();
     v.sort();
     v
@@ -169,12 +192,14 @@ fn cold_index(fx: &Fixture, name: &str) -> Vec<String> {
     sorted_entries(fx.open(&cold, true).unwrap().chunk_index())
 }
 
-/// Every backup appends one segment and uploads nothing else to `index.d/`
-/// (a small index stays below the fold limits). Clients with and without a
+/// Every backup that stores new chunks appends one backup segment of new
+/// entries at refcount 1 and uploads nothing else to `index.d/` (a small
+/// index stays below the fold limits); a backup that stores nothing new
+/// writes no index object and no head (BK-1). Clients with and without a
 /// local cache read the same index, and the snapshots restore.
 #[test]
 fn backups_append_one_segment_each() {
-    for format in [RepoFormat::V4, RepoFormat::V5] {
+    for format in [RepoFormat::V7, RepoFormat::V6] {
         let fx = fixture(format);
         fx.write("a", "alpha");
         fx.backup(&fx.config, "s1");
@@ -188,17 +213,31 @@ fn backups_append_one_segment_each() {
         assert_eq!(fx.head().segments.len(), 2);
         assert_eq!(fx.index_objects(), 2);
 
-        // Unchanged files: refcount bumps only.
+        // Unchanged files: reuse only, which is not persisted.
+        let before = fx.head();
         fx.backup(&fx.config, "s3");
         let head = fx.head();
-        assert_eq!(head.segments.len(), 3);
-        assert_eq!(fx.index_objects(), 3);
-        assert!(head.segments[2].size < head.segments[1].size);
+        assert_eq!(head, before, "no head written");
+        assert_eq!(fx.index_objects(), 2);
+        let repo = fx.open(&fx.cache(), false).unwrap();
+        for seg_ref in &head.segments {
+            assert_eq!(seg_ref.kind, SegmentKind::Backup);
+            let bytes = fx
+                .storage()
+                .get(&object_key(&seg_ref.name))
+                .unwrap()
+                .unwrap();
+            let seg = decode_segment(seg_ref, &bytes, repo.crypto.as_ref()).unwrap();
+            assert!(seg.deltas.is_empty() && seg.relocations.is_empty());
+            assert!(!seg.new_entries.is_empty());
+            assert!(seg.new_entries.iter().all(|e| e.refcount == 1));
+        }
+        drop(repo);
         let info = commands::info::run(&fx.config, None)
             .unwrap()
             .index
             .unwrap();
-        assert_eq!(info.segments, 3);
+        assert_eq!(info.segments, 2);
         assert_eq!(info.base_bytes, 0);
         assert_eq!(
             info.segment_bytes,
@@ -217,7 +256,7 @@ fn backups_append_one_segment_each() {
 /// with the index a cold client builds.
 #[test]
 fn backup_leaves_the_table_at_the_new_state() {
-    for format in [RepoFormat::V4, RepoFormat::V5] {
+    for format in [RepoFormat::V7, RepoFormat::V6] {
         let fx = fixture(format);
         fx.write("a", "alpha");
         fx.backup(&fx.config, "s1");
@@ -238,7 +277,7 @@ fn backup_leaves_the_table_at_the_new_state() {
 /// index object: the loaded table stays the index, and its file as it was.
 #[test]
 fn an_empty_session_leaves_the_table_as_is() {
-    for format in [RepoFormat::V4, RepoFormat::V5] {
+    for format in [RepoFormat::V7, RepoFormat::V6] {
         let fx = fixture(format);
         fx.write("a", "alpha");
         fx.backup(&fx.config, "s1");
@@ -250,7 +289,8 @@ fn an_empty_session_leaves_the_table_as_is() {
         let storage = FailGet::new(
             Arc::from(fx.storage()),
             move |k| {
-                armed.load(Ordering::SeqCst) && (k == "index" || k.starts_with(INDEX_OBJECT_DIR))
+                armed.load(Ordering::SeqCst)
+                    && (k.starts_with(HEAD_PREFIX) || k.starts_with(INDEX_OBJECT_DIR))
             },
             usize::MAX,
         );
@@ -278,12 +318,13 @@ fn an_empty_session_leaves_the_table_as_is() {
     }
 }
 
-/// Delete writes a segment with negative deltas; compact past the soft
-/// limit folds into a new base and retires the old objects; a later
-/// compact removes debris but keeps the retired generation.
+/// Delete writes nothing to the index; compact sweeps the deleted
+/// snapshot's chunks in a maintenance segment and, past the soft limit,
+/// folds into a new base that retires the old objects. A later compact
+/// removes aged debris but keeps every object a kept head names.
 #[test]
-fn delete_and_compact_fold_and_collect_garbage() {
-    let fx = fixture(RepoFormat::V5);
+fn delete_and_compact_sweep_fold_and_collect_garbage() {
+    let fx = fixture(RepoFormat::V6);
     fx.write("a", "alpha");
     fx.backup(&fx.config, "s1");
     fx.write("b", "bravo");
@@ -294,64 +335,71 @@ fn delete_and_compact_fold_and_collect_garbage() {
     let chunks_before = fx.open(&fx.cache(), true).unwrap().chunk_index().len();
 
     commands::delete::run(&fx.config, None, &["s1"], false, &CancelToken::new()).unwrap();
-    let after_delete = fx.head();
-    assert_eq!(after_delete.segments.len(), before.segments.len() + 1);
-    assert!(fx.open(&fx.cache(), true).unwrap().chunk_index().len() < chunks_before);
+    assert_eq!(fx.head(), before, "delete writes no index object");
     assert_eq!(
-        cold_index(&fx, "cold1"),
-        sorted_entries(fx.open(&fx.cache(), true).unwrap().chunk_index())
+        fx.open(&fx.cache(), true).unwrap().chunk_index().len(),
+        chunks_before
     );
     fx.check_clean(&fx.config);
 
     compact(&fx, 4);
     let folded = fx.head();
     assert!(folded.segments.is_empty(), "past the soft limit");
-    assert_ne!(folded.base, after_delete.base);
-    // Everything live before the compact is retired (with the compact's
-    // own repack segment, if it wrote one).
+    assert!(folded.base.is_some());
+    assert!(folded.sweep.generation > before.generation);
     assert!(
-        after_delete
-            .live_objects()
-            .all(|n| folded.retired.contains(&n)),
-        "{folded:?} vs {after_delete:?}"
+        folded.sweep.generation < folded.generation,
+        "the fold carries it"
     );
-    assert_eq!(fx.index_objects(), 1 + folded.retired.len());
+    assert!(folded.sweep.record.is_some());
+    // Everything live before the compact is retired, with the sweep's
+    // maintenance segment.
+    assert!(
+        before.live_objects().all(|n| folded.retired.contains(&n)),
+        "{folded:?} vs {before:?}"
+    );
+    assert!(folded.retired.len() > before.segments.len());
+    assert!(fx.open(&fx.cache(), true).unwrap().chunk_index().len() < chunks_before);
+    assert!(fx.named_objects_exist(&folded));
     assert_eq!(
         cold_index(&fx, "cold2"),
         sorted_entries(fx.open(&fx.cache(), true).unwrap().chunk_index())
     );
     fx.check_clean(&fx.config);
 
-    // Debris of an interrupted write is removed; the retired generation
-    // stays for readers still on the previous head.
-    std::fs::write(
-        fx.repo_dir.join(INDEX_OBJECT_DIR).join("ab".repeat(32)),
-        b"debris",
-    )
-    .unwrap();
+    // Debris of an interrupted write is removed; what kept heads name stays.
+    let debris = fx.repo_dir.join(INDEX_OBJECT_DIR).join("ab".repeat(32));
+    std::fs::write(&debris, b"debris").unwrap();
     compact(&fx, 4);
-    assert_eq!(fx.head(), folded);
-    assert_eq!(fx.index_objects(), 1 + folded.retired.len());
+    let after = fx.head();
+    assert_eq!(after.base, folded.base);
+    assert!(after.segments.is_empty());
+    assert!(!debris.exists());
+    assert!(fx.named_objects_exist(&after));
+    assert!(fx.named_objects_exist(&folded));
     fx.restore(&fx.config, "s3");
 }
 
-/// Compact with the soft limit at `segments` segments.
+/// Compact with the soft limit at `segments` segments and no grace for
+/// index garbage.
 fn compact(fx: &Fixture, segments: usize) {
     let mut repo = fx.open(&fx.cache(), false).unwrap();
     let mut policy = crate::repo::index_write::FoldPolicy::default();
     policy.soft.segments = segments;
     repo.set_fold_policy(policy);
+    repo.set_index_gc_grace(std::time::Duration::ZERO);
     commands::compact::run_on_repo(&mut repo, 0.0, None, false, &CancelToken::new()).unwrap();
 }
 
 /// A reader holding a head from before two production folds: after the
-/// first its objects are retired and it completes on that head; after the
-/// second they are deleted, and it retries on the re-read head.
+/// first its objects are retired and it completes on that head; once they
+/// are deleted (the GC does so when they aged out), it retries on the
+/// re-read head.
 #[test]
 fn reader_on_a_pre_fold_head_recovers_through_production_folds() {
     use crate::repo::index_store::{self, CacheLocation};
 
-    let fx = fixture(RepoFormat::V5);
+    let fx = fixture(RepoFormat::V6);
     fx.write("a", "alpha");
     fx.backup(&fx.config, "s1");
     fx.write("b", "bravo");
@@ -384,14 +432,7 @@ fn reader_on_a_pre_fold_head_recovers_through_production_folds() {
     fx.backup(&fx.config, "s3");
     compact(&fx, 1);
     for name in h0.live_objects() {
-        assert!(
-            !fx.repo_dir
-                .join(INDEX_OBJECT_DIR)
-                .join(name.to_hex())
-                .exists(),
-            "{}",
-            name.to_hex()
-        );
+        std::fs::remove_file(fx.repo_dir.join(INDEX_OBJECT_DIR).join(name.to_hex())).unwrap();
     }
     let synced = sync(h0);
     assert_eq!(synced.head, fx.head(), "retried on the re-read head");
@@ -402,7 +443,7 @@ fn reader_on_a_pre_fold_head_recovers_through_production_folds() {
 /// compacted stays bounded.
 #[test]
 fn maintenance_writes_fold_at_the_hard_limit() {
-    let fx = fixture(RepoFormat::V5);
+    let fx = fixture(RepoFormat::V6);
     fx.write("a", "alpha");
     fx.write("b", "bravo");
     fx.backup(&fx.config, "s1");
@@ -430,8 +471,7 @@ fn maintenance_writes_fold_at_the_hard_limit() {
         last = Some(head);
     }
     assert_eq!(counts, vec![2, 0, 1, 2, 0]);
-    // The new base and the retired generation; the one before is gone.
-    assert_eq!(fx.index_objects(), 1 + last.unwrap().retired.len());
+    assert!(fx.named_objects_exist(&last.unwrap()));
     assert_eq!(cold_index(&fx, "cold"), sorted_entries(repo.chunk_index()));
 }
 
@@ -440,7 +480,7 @@ fn maintenance_writes_fold_at_the_hard_limit() {
 /// folds instead of naming it twice.
 #[test]
 fn repeated_plaintext_segment_folds() {
-    let fx = fixture(RepoFormat::V5);
+    let fx = fixture(RepoFormat::V6);
     fx.write("a", "alpha");
     fx.backup(&fx.config, "s1");
     let mut repo = fx.open(&fx.cache(), false).unwrap();
@@ -463,10 +503,11 @@ fn repeated_plaintext_segment_folds() {
 /// head is unchanged and the segment is unreferenced debris.
 #[test]
 fn fence_failure_publishes_nothing() {
-    let fx = fixture(RepoFormat::V5);
+    let fx = fixture(RepoFormat::V6);
     fx.write("a", "alpha");
     fx.backup(&fx.config, "s1");
-    let head_bytes = std::fs::read(fx.repo_dir.join("index")).unwrap();
+    let head_path = fx.head_path();
+    let head_bytes = std::fs::read(&head_path).unwrap();
     let objects = fx.index_objects();
 
     let mut repo = fx.open(&fx.cache(), false).unwrap();
@@ -478,10 +519,8 @@ fn fence_failure_publishes_nothing() {
     let err = repo.save_state().unwrap_err().to_string();
     assert!(err.contains("lock lost"), "{err}");
 
-    assert_eq!(
-        std::fs::read(fx.repo_dir.join("index")).unwrap(),
-        head_bytes
-    );
+    assert_eq!(fx.head_path(), head_path, "no new head");
+    assert_eq!(std::fs::read(&head_path).unwrap(), head_bytes);
     assert_eq!(fx.index_objects(), objects + 1);
     assert_eq!(
         sorted_entries(fx.open(&fx.cache(), true).unwrap().chunk_index()),
@@ -494,7 +533,7 @@ fn fence_failure_publishes_nothing() {
 /// the other's segments.
 #[test]
 fn two_clients_alternate_commits() {
-    let fx = fixture(RepoFormat::V4);
+    let fx = fixture(RepoFormat::V7);
     let other = fx.other_client("cache-b");
     fx.write("a", "alpha");
     fx.backup(&fx.config, "a1");
@@ -503,7 +542,7 @@ fn two_clients_alternate_commits() {
     fx.write("c", "charlie");
     fx.backup(&fx.config, "a2");
     fx.backup(&other, "b2");
-    assert_eq!(fx.head().segments.len(), 4);
+    assert_eq!(fx.head().segments.len(), 3, "b2 stored nothing new");
 
     let a = sorted_entries(fx.open(&fx.cache(), true).unwrap().chunk_index());
     let b_cache = PathBuf::from(other.cache_dir.as_ref().unwrap());
@@ -514,59 +553,9 @@ fn two_clients_alternate_commits() {
     fx.check_clean(&other);
 }
 
-/// The monolithic blob an older binary would write.
-fn legacy_blob(index: &ChunkIndex) -> Vec<u8> {
-    let crypto = vykar_crypto::PlaintextEngine::new(crate::testutil::test_chunk_hasher());
-    crate::tests::helpers::legacy_index_blob(index, 7, &crypto)
-}
-
-/// An older binary overwrote the head with a monolithic blob. Every command
-/// refuses and names `check --repair`, which rebuilds the segmented index
-/// from the blob with one base write and removes the stale objects.
-#[test]
-fn repair_rebuilds_an_overwritten_head() {
-    let fx = fixture(RepoFormat::V5);
-    fx.write("a", "alpha");
-    fx.backup(&fx.config, "s1");
-    fx.write("b", "bravo");
-    fx.backup(&fx.config, "s2");
-    let index = fx
-        .open(&fx.cache(), true)
-        .unwrap()
-        .chunk_index()
-        .to_chunk_index();
-    std::fs::write(fx.repo_dir.join("index"), legacy_blob(&index)).unwrap();
-
-    let err = fx.open(&fx.cache(), false).err().unwrap().to_string();
-    assert!(err.contains("check --repair"), "{err}");
-
-    let result = commands::check::run_with_repair(
-        &fx.config,
-        None,
-        false,
-        RepairMode::Apply,
-        None,
-        &CancelToken::new(),
-    )
-    .unwrap();
-    assert!(!result.plan.has_data_loss, "{:?}", result.plan.actions);
-    assert_eq!(result.plan.index_recovery, IndexRecovery::LegacyBlob);
-    let head = fx.head();
-    assert!(head.base.is_some());
-    assert!(head.segments.is_empty());
-    assert!(head.retired.is_empty());
-    assert_eq!(fx.index_objects(), 1);
-    assert_eq!(sorted_entries(&index), cold_index(&fx, "cold"));
-    fx.check_clean(&fx.config);
-
-    fx.write("c", "charlie");
-    fx.backup(&fx.config, "s3");
-    assert_eq!(fx.head().segments.len(), 1);
-}
-
 /// Three backups; the files hold `alpha`, `bravo`, `charlie`.
 fn three_backups() -> Fixture {
-    let fx = fixture(RepoFormat::V5);
+    let fx = fixture(RepoFormat::V6);
     fx.write("a", "alpha");
     fx.backup(&fx.config, "s1");
     fx.write("b", "bravo");
@@ -583,7 +572,7 @@ fn repo_state(fx: &Fixture) -> (Vec<u8>, usize, usize) {
         .unwrap()
         .count();
     (
-        std::fs::read(fx.repo_dir.join("index")).unwrap(),
+        std::fs::read(fx.head_path()).unwrap(),
         fx.index_objects(),
         snapshots,
     )
@@ -650,8 +639,13 @@ fn repair_rebuilds_a_broken_chain_from_the_packs() {
     })
     .unwrap();
     let repaired = fx.head();
-    assert!(repaired.segments.is_empty());
-    assert_eq!(fx.index_objects(), 1);
+    assert!(repaired.segments.is_empty() && repaired.retired.is_empty());
+    assert!(repaired.base.is_some());
+    assert_eq!(repaired.generation, head.generation + 1);
+    assert_eq!(
+        repaired.sweep.generation, repaired.generation,
+        "a repair sets sweep.gen"
+    );
     fx.check_clean(&other);
 
     assert_eq!(read_restored(&fx.restore(&other, "s1"), "a"), "alpha");
@@ -747,7 +741,10 @@ fn repair_load_refuses_a_segment_from_a_newer_vykar() {
     seg.size = packed.len() as u64;
     storage.put(&object_key(&seg.name), &packed).unwrap();
     storage
-        .put("index", &pack_head(&head, crypto.as_ref()).unwrap())
+        .put(
+            &latest_head_key(&*storage),
+            &pack_head(&head, crypto.as_ref()).unwrap(),
+        )
         .unwrap();
 
     let before = repo_state(&fx);
@@ -795,10 +792,10 @@ fn repair_load_uses_the_local_cache_on_a_storage_error() {
 /// Without a head, the index is rebuilt from the packs and nothing is lost.
 #[test]
 fn repair_rebuilds_a_missing_head_from_the_packs() {
-    let fx = fixture(RepoFormat::V5);
+    let fx = fixture(RepoFormat::V6);
     fx.write("a", "alpha");
     fx.backup(&fx.config, "s1");
-    std::fs::remove_file(fx.repo_dir.join("index")).unwrap();
+    fx.remove_heads();
     let plan = commands::check::run_with_repair(
         &fx.config,
         None,
@@ -883,12 +880,11 @@ delegate_storage_backend! {
     }
 }
 
-/// Client-side compact persists the index once for the whole batch, before
-/// deleting any pack, including empty ones whose entries were removed from
-/// the in-memory index without a save.
+/// Client-side compact persists the swept index before deleting any pack,
+/// including the packs the sweep left without entries.
 #[test]
 fn compact_deletes_packs_only_after_persisting_the_index() {
-    let fx = fixture(RepoFormat::V5);
+    let fx = fixture(RepoFormat::V6);
     fx.write("a", "alpha");
     fx.write("b", "bravo");
     fx.backup(&fx.config, "s1");
@@ -907,19 +903,13 @@ fn compact_deletes_packs_only_after_persisting_the_index() {
     let mut repo = fx
         .open_with(storage, &fx.cache(), OpenOptions::new())
         .unwrap();
-    commands::util::with_maintenance_lock(&mut repo, |repo| {
+    let stats = commands::util::with_maintenance_lock(&mut repo, |repo| {
         repo.load_chunk_index_under_lock()?;
-        // A pack whose entries leave only the in-memory index.
-        let (_, entry) = repo
-            .chunk_index()
-            .iter()
-            .max_by_key(|(_, e)| e.pack_offset)
-            .unwrap();
-        repo.chunk_index_mut().remove_by_pack(&entry.pack_id);
         ops.lock().unwrap().clear();
         commands::compact::compact_repo(repo, 0.0, None, false, 2, &CancelToken::new())
     })
     .unwrap();
+    assert!(stats.chunks_unreferenced > 0, "{stats:?}");
 
     let ops = ops.lock().unwrap().clone();
     let first_pack_delete = ops
@@ -929,41 +919,32 @@ fn compact_deletes_packs_only_after_persisting_the_index() {
     let head_puts: Vec<usize> = ops
         .iter()
         .enumerate()
-        .filter(|(_, o)| *o == "put index")
+        .filter(|(_, o)| o.starts_with("put index.h/"))
         .map(|(i, _)| i)
         .collect();
     assert!(
         head_puts.first().is_some_and(|&i| i < first_pack_delete),
         "{ops:?}"
     );
-    assert_eq!(
-        head_puts.iter().filter(|&&i| i < first_pack_delete).count(),
-        1,
-        "one index write for the batch: {ops:?}"
-    );
+    // The sweep's head, and at most the batch's one.
+    let before_deletes = head_puts.iter().filter(|&&i| i < first_pack_delete).count();
+    assert!((1..=2).contains(&before_deletes), "{ops:?}");
 }
 
 #[derive(Debug, Clone, Copy)]
 enum Damage {
-    /// An older binary overwrote the head with a monolithic blob.
-    LegacyBlob,
+    /// The latest head is truncated.
+    TruncatedHead,
     /// The last segment object is gone.
     LostSegment,
 }
 
 /// Three backups, then `damage`. Returns the keys under `index.d/` and the
-/// bytes at `index` after the damage.
+/// bytes of the latest head after the damage.
 fn damaged(damage: Damage) -> (Fixture, std::collections::BTreeSet<String>, Vec<u8>) {
     let fx = three_backups();
     match damage {
-        Damage::LegacyBlob => {
-            let index = fx
-                .open(&fx.cache(), true)
-                .unwrap()
-                .chunk_index()
-                .to_chunk_index();
-            std::fs::write(fx.repo_dir.join("index"), legacy_blob(&index)).unwrap();
-        }
+        Damage::TruncatedHead => truncate_head(&fx),
         Damage::LostSegment => {
             let lost = fx.head().segments.last().unwrap().name;
             std::fs::remove_file(fx.repo_dir.join(INDEX_OBJECT_DIR).join(lost.to_hex())).unwrap();
@@ -975,7 +956,7 @@ fn damaged(damage: Damage) -> (Fixture, std::collections::BTreeSet<String>, Vec<
         .unwrap()
         .into_iter()
         .collect();
-    let index = std::fs::read(fx.repo_dir.join("index")).unwrap();
+    let index = std::fs::read(fx.head_path()).unwrap();
     (fx, before, index)
 }
 
@@ -1008,7 +989,7 @@ fn faulty(
 }
 
 /// A fold without a previous head (repair) that fails at the base PUT, the
-/// head PUT or the fence between them leaves `index` and every object in
+/// head PUT or the fence between them leaves the heads and every object in
 /// `index.d/` as they were, so the next repair reads the same index.
 #[test]
 fn fold_without_a_head_keeps_old_objects_until_the_head_is_written() {
@@ -1018,7 +999,7 @@ fn fold_without_a_head_keeps_old_objects_until_the_head_is_written() {
         HeadPut,
         SecondFence,
     }
-    for damage in [Damage::LegacyBlob, Damage::LostSegment] {
+    for damage in [Damage::TruncatedHead, Damage::LostSegment] {
         for failure in [Failure::BasePut, Failure::HeadPut, Failure::SecondFence] {
             let case = format!("{damage:?}-{failure:?}");
             let (fx, before, index_before) = damaged(damage);
@@ -1046,11 +1027,13 @@ fn fold_without_a_head_keeps_old_objects_until_the_head_is_written() {
                 }));
             }
             repo.request_index_fold();
+            let heads_before = fx.storage().list(HEAD_PREFIX).unwrap().len();
             assert!(repo.save_state().is_err(), "{case}");
             drop(repo);
 
+            assert_eq!(fx.storage().list(HEAD_PREFIX).unwrap().len(), heads_before);
             assert_eq!(
-                std::fs::read(fx.repo_dir.join("index")).unwrap(),
+                std::fs::read(fx.head_path()).unwrap(),
                 index_before,
                 "{case}"
             );
@@ -1074,18 +1057,19 @@ fn fold_without_a_head_keeps_old_objects_until_the_head_is_written() {
                 head.segments.is_empty() && head.retired.is_empty(),
                 "{case}"
             );
-            assert_eq!(fx.index_objects(), 1, "{case}");
+            assert!(fx.named_objects_exist(&head), "{case}");
             assert_eq!(cold_index(&fx, &format!("{case}-after")), loaded, "{case}");
         }
     }
 }
 
-/// A fold without a previous head PUTs the base, then the head, and only
-/// then deletes the objects the new head does not name.
+/// A fold without a previous head PUTs the base, then the head, and
+/// deletes nothing in `index.d/` before the head PUT (the young objects of
+/// the damaged index are not deleted at all).
 #[test]
-fn fold_without_a_head_deletes_old_objects_after_the_head_put() {
-    for damage in [Damage::LegacyBlob, Damage::LostSegment] {
-        let (fx, _, _) = damaged(damage);
+fn fold_without_a_head_deletes_nothing_before_the_head_put() {
+    for damage in [Damage::TruncatedHead, Damage::LostSegment] {
+        let (fx, before, _) = damaged(damage);
         let (storage, ops) = faulty(&fx, |_, _| false);
         let mut repo = open_for_repair(&fx, storage, "cold");
         ops.lock().unwrap().clear();
@@ -1097,80 +1081,37 @@ fn fold_without_a_head_deletes_old_objects_after_the_head_put() {
         let base_key = format!("put {INDEX_OBJECT_DIR}{}", new.base.unwrap().name.to_hex());
         let ops = ops.lock().unwrap().clone();
         let base_put = ops.iter().position(|o| *o == base_key).unwrap();
-        let first_head_put = ops.iter().position(|o| o == "put index").unwrap();
-        let last_head_put = ops.iter().rposition(|o| o == "put index").unwrap();
-        assert!(base_put < first_head_put, "{damage:?}: {ops:?}");
-        let deletes: Vec<usize> = ops
+        let head_put = ops
             .iter()
-            .enumerate()
-            .filter(|(_, o)| o.starts_with(&format!("delete {INDEX_OBJECT_DIR}")))
-            .map(|(i, _)| i)
-            .collect();
-        assert!(!deletes.is_empty(), "{damage:?}: {ops:?}");
+            .position(|o| o.starts_with("put index.h/"))
+            .unwrap();
+        assert!(base_put < head_put, "{damage:?}: {ops:?}");
         assert!(
-            deletes.iter().all(|&i| i > last_head_put),
+            !ops.iter()
+                .any(|o| o.starts_with(&format!("delete {INDEX_OBJECT_DIR}"))),
             "{damage:?}: {ops:?}"
         );
-        assert_eq!(fx.index_objects(), 1, "{damage:?}");
-    }
-}
-
-/// A lock lost after the head PUT of a fold without a previous head is
-/// returned, and nothing is deleted; the new head is in place and valid.
-#[test]
-fn lost_lock_after_the_head_put_stops_the_fold_without_a_head() {
-    for damage in [Damage::LegacyBlob, Damage::LostSegment] {
-        let (fx, before, index_before) = damaged(damage);
-        let mut repo = open_for_repair(&fx, fx.storage(), "cold");
-        let loaded = sorted_entries(repo.chunk_index());
-        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let counter = Arc::clone(&calls);
-        repo.set_lock_fence(Arc::new(move || {
-            if counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 2 {
-                Err(VykarError::LockExpired("injected".into()))
-            } else {
-                Ok(())
-            }
-        }));
-        repo.request_index_fold();
-        let err = repo.save_state().unwrap_err();
-        assert!(
-            matches!(err, VykarError::LockExpired(_)),
-            "{damage:?}: {err}"
-        );
-        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
-        drop(repo);
-
-        assert_ne!(
-            std::fs::read(fx.repo_dir.join("index")).unwrap(),
-            index_before
-        );
-        let head = fx.head();
-        let base = head.base.as_ref().expect("the new head names a base");
-        assert!(head.segments.is_empty() && head.retired.is_empty());
         let after: std::collections::BTreeSet<String> = fx
             .storage()
             .list(INDEX_OBJECT_DIR)
             .unwrap()
             .into_iter()
             .collect();
-        assert!(before.is_subset(&after), "{damage:?}: {after:?}");
-        assert!(after.contains(&format!("{INDEX_OBJECT_DIR}{}", base.name.to_hex())));
-        assert_eq!(cold_index(&fx, "cold-after"), loaded, "{damage:?}");
+        assert!(before.is_subset(&after), "{damage:?}");
     }
 }
 
-/// Fails listings of `index.d/` once `index` no longer holds `head_before`,
-/// that is, once a new head has been PUT.
+/// Fails listings of `index.d/` once there are more than `heads_before`
+/// heads, that is, once a new head has been PUT.
 struct FailListAfterHeadPut {
     inner: Arc<dyn StorageBackend>,
-    head_before: Vec<u8>,
+    heads_before: usize,
 }
 
 impl FailListAfterHeadPut {
     fn check(&self, prefix: &str) -> Result<()> {
         if prefix.starts_with(INDEX_OBJECT_DIR)
-            && self.inner.get("index")?.as_ref() != Some(&self.head_before)
+            && self.inner.list(HEAD_PREFIX)?.len() != self.heads_before
         {
             return Err(VykarError::Other("injected list failure".into()));
         }
@@ -1216,11 +1157,11 @@ delegate_storage_backend! {
 /// objects stay as debris.
 #[test]
 fn failed_listing_after_the_head_put_of_a_fold_without_a_head_is_logged() {
-    for damage in [Damage::LegacyBlob, Damage::LostSegment] {
+    for damage in [Damage::TruncatedHead, Damage::LostSegment] {
         let (fx, before, index_before) = damaged(damage);
         let storage = FailListAfterHeadPut {
             inner: Arc::from(fx.storage()),
-            head_before: index_before.clone(),
+            heads_before: fx.storage().list(HEAD_PREFIX).unwrap().len(),
         };
         let mut repo = open_for_repair(&fx, Box::new(storage), "cold");
         let loaded = sorted_entries(repo.chunk_index());
@@ -1229,7 +1170,7 @@ fn failed_listing_after_the_head_put_of_a_fold_without_a_head_is_logged() {
         drop(repo);
 
         assert_ne!(
-            std::fs::read(fx.repo_dir.join("index")).unwrap(),
+            std::fs::read(fx.head_path()).unwrap(),
             index_before,
             "{damage:?}"
         );
@@ -1247,20 +1188,42 @@ fn failed_listing_after_the_head_put_of_a_fold_without_a_head_is_logged() {
     }
 }
 
-/// An index that became empty folds to a head without a base, as `init`
-/// writes it; later writes append to it and fold into a base again.
+/// With every snapshot deleted, compact refuses to sweep the index to
+/// empty (R1a) and changes nothing; `check --repair` removes the entries no
+/// snapshot references and folds to a head without a base, as `init`
+/// writes it. Later writes append to it and fold into a base again.
 #[test]
 fn empty_index_folds_to_a_head_without_base() {
-    let fx = fixture(RepoFormat::V5);
+    let fx = fixture(RepoFormat::V6);
     fx.write("a", "alpha");
     fx.backup(&fx.config, "s1");
     fx.write("b", "bravo");
     fx.backup(&fx.config, "s2");
     commands::delete::run(&fx.config, None, &["s1", "s2"], false, &CancelToken::new()).unwrap();
-    assert!(fx.open(&fx.cache(), true).unwrap().chunk_index().is_empty());
+    let entries = fx.open(&fx.cache(), true).unwrap().chunk_index().len();
+    assert!(entries > 0);
 
-    let live: Vec<_> = fx.head().live_objects().collect();
-    compact(&fx, 1);
+    let head = fx.head();
+    let mut repo = fx.open(&fx.cache(), false).unwrap();
+    let err = commands::compact::run_on_repo(&mut repo, 0.0, None, false, &CancelToken::new())
+        .unwrap_err()
+        .to_string();
+    drop(repo);
+    assert!(err.starts_with(commands::compact::MARK_REFUSED), "{err}");
+    assert!(err.contains("no snapshot was listed"), "{err}");
+    assert!(err.contains(&format!("holds {entries} chunks")), "{err}");
+    assert_eq!(fx.head(), head, "nothing written");
+
+    let live: Vec<_> = head.live_objects().collect();
+    commands::check::run_with_repair(
+        &fx.config,
+        None,
+        false,
+        RepairMode::Apply,
+        None,
+        &CancelToken::new(),
+    )
+    .unwrap();
     let folded = fx.head();
     assert!(folded.base.is_none(), "{folded:?}");
     assert!(folded.segments.is_empty(), "{folded:?}");
@@ -1270,15 +1233,10 @@ fn empty_index_folds_to_a_head_without_base() {
         live.iter().all(|n| folded.retired.contains(n)),
         "{folded:?} vs {live:?}"
     );
-    assert_eq!(fx.index_objects(), folded.retired.len());
     let info = commands::info::run(&fx.config, None).unwrap();
     assert_eq!(info.index.unwrap().base_bytes, 0);
     assert!(cold_index(&fx, "cold1").is_empty());
     fx.check_clean(&fx.config);
-
-    compact(&fx, 1);
-    assert_eq!(fx.head(), folded);
-    assert_eq!(fx.index_objects(), folded.retired.len());
 
     fx.write("c", "charlie");
     fx.backup(&fx.config, "s3");
@@ -1293,21 +1251,20 @@ fn empty_index_folds_to_a_head_without_base() {
     let head = fx.head();
     assert!(head.base.is_some());
     assert_eq!(head.retired, vec![s3_segment]);
-    assert_eq!(fx.index_objects(), 2);
+    assert!(fx.named_objects_exist(&head));
     assert_eq!(cold_index(&fx, "cold3"), warm);
     fx.check_clean(&fx.config);
     assert_eq!(read_restored(&fx.restore(&fx.config, "s3"), "c"), "charlie");
 }
 
-/// A fold with a previous head that fails at the base or head PUT leaves
-/// the head and every object it names in place; the next fold removes what
-/// the failed one left.
+/// A compact whose sweep head PUT fails, or whose fold fails at the base
+/// PUT, leaves the latest head naming the same live objects, all in place;
+/// the next compact folds.
 #[test]
 fn put_base_failures_with_a_previous_head_leave_it_intact() {
     type Fail = fn(&str, &[u8]) -> bool;
     for (name, fail) in [("base", is_base_put as Fail), ("head", is_head_put as Fail)] {
         let fx = three_backups();
-        let head_before = std::fs::read(fx.repo_dir.join("index")).unwrap();
         let live: Vec<_> = fx.head().live_objects().collect();
         let warm = sorted_entries(fx.open(&fx.cache(), true).unwrap().chunk_index());
 
@@ -1325,11 +1282,7 @@ fn put_base_failures_with_a_previous_head_leave_it_intact() {
         assert!(err.contains("injected failure"), "{name}: {err}");
         drop(repo);
 
-        assert_eq!(
-            std::fs::read(fx.repo_dir.join("index")).unwrap(),
-            head_before,
-            "{name}"
-        );
+        assert_eq!(fx.head().live_objects().collect::<Vec<_>>(), live, "{name}");
         for n in &live {
             assert!(
                 fx.repo_dir.join(INDEX_OBJECT_DIR).join(n.to_hex()).exists(),
@@ -1342,21 +1295,24 @@ fn put_base_failures_with_a_previous_head_leave_it_intact() {
         fx.write("d", "delta");
         fx.backup(&fx.config, "s4");
         compact(&fx, 1);
-        assert_eq!(fx.index_objects(), 1 + fx.head().retired.len(), "{name}");
+        let head = fx.head();
+        assert!(head.base.is_some() && head.segments.is_empty(), "{name}");
+        assert!(fx.named_objects_exist(&head), "{name}");
     }
 }
 
 /// Repair of a repository with no head and no snapshots writes the empty
-/// head, as `init` does, and removes the debris in `index.d/`.
+/// head at generation 1, recorded as a repair; the young debris in
+/// `index.d/` stays until it ages out.
 #[test]
 fn repair_of_an_empty_index_writes_the_empty_head() {
-    let fx = fixture(RepoFormat::V5);
+    let fx = fixture(RepoFormat::V6);
     std::fs::write(
         fx.repo_dir.join(INDEX_OBJECT_DIR).join("ab".repeat(32)),
         b"debris",
     )
     .unwrap();
-    std::fs::remove_file(fx.repo_dir.join("index")).unwrap();
+    fx.remove_heads();
     commands::check::run_with_repair(
         &fx.config,
         None,
@@ -1366,8 +1322,10 @@ fn repair_of_an_empty_index_writes_the_empty_head() {
         &CancelToken::new(),
     )
     .unwrap();
-    assert_eq!(fx.head(), IndexHead::empty());
-    assert_eq!(fx.index_objects(), 0);
+    let head = fx.head();
+    let mut expected = IndexHead::initial();
+    expected.sweep.generation = 1;
+    assert_eq!(head, expected);
     fx.check_clean(&fx.config);
 }
 
@@ -1375,7 +1333,7 @@ fn repair_of_an_empty_index_writes_the_empty_head() {
 /// loaded under the lock. Returns the fixture, the repo cache dir, the
 /// repository and the head after the first backup.
 fn loaded_after_two_backups() -> (Fixture, PathBuf, Repository, IndexHead) {
-    let fx = fixture(RepoFormat::V5);
+    let fx = fixture(RepoFormat::V6);
     fx.write("a", "alpha");
     fx.backup(&fx.config, "s1");
     let first = fx.head();
@@ -1475,7 +1433,7 @@ fn a_write_after_another_writer_moved_the_head_is_refused() {
 
 /// Damage the head: keep its first half.
 fn truncate_head(fx: &Fixture) {
-    let path = fx.repo_dir.join("index");
+    let path = fx.head_path();
     let bytes = std::fs::read(&path).unwrap();
     std::fs::write(&path, &bytes[..bytes.len() / 2]).unwrap();
 }
@@ -1540,7 +1498,7 @@ fn repair_rebuilds_from_a_corrupt_head() {
     let head = fx.head();
     assert!(head.base.is_some());
     assert!(head.segments.is_empty() && head.retired.is_empty());
-    assert_eq!(fx.index_objects(), 1);
+    assert!(fx.named_objects_exist(&head));
     assert_eq!(cold_index(&fx, "cold-after"), before);
     fx.check_clean(&other);
     assert_eq!(read_restored(&fx.restore(&other, "s3"), "c"), "charlie");
@@ -1638,7 +1596,7 @@ fn repair_without_a_head_names_a_failed_listing() {
 /// state is kept.
 #[test]
 fn repair_with_a_stale_local_cache_keeps_later_snapshots() {
-    let fx = fixture(RepoFormat::V5);
+    let fx = fixture(RepoFormat::V6);
     fx.write("a", "alpha");
     fx.backup(&fx.config, "s1");
     fx.write("b", "bravo");
@@ -1690,7 +1648,8 @@ fn repair_with_a_stale_local_cache_keeps_later_snapshots() {
 fn rerun_after_a_failed_rebuild_write_succeeds() {
     let fx = three_backups();
     truncate_head(&fx);
-    let index_bytes = std::fs::read(fx.repo_dir.join("index")).unwrap();
+    let head_path = fx.head_path();
+    let index_bytes = std::fs::read(&head_path).unwrap();
     let before = fx.index_objects();
 
     let (storage, _) = faulty(&fx, is_head_put);
@@ -1714,10 +1673,8 @@ fn rerun_after_a_failed_rebuild_write_succeeds() {
     repo.request_index_fold();
     assert!(repo.save_state().is_err());
     drop(repo);
-    assert_eq!(
-        std::fs::read(fx.repo_dir.join("index")).unwrap(),
-        index_bytes
-    );
+    assert_eq!(fx.head_path(), head_path);
+    assert_eq!(std::fs::read(&head_path).unwrap(), index_bytes);
     assert_eq!(fx.index_objects(), before + 1);
 
     let cold = fx.other_client("cold-b");
@@ -1735,32 +1692,42 @@ fn rerun_after_a_failed_rebuild_write_succeeds() {
         &CancelToken::new(),
     )
     .unwrap();
-    assert_eq!(fx.index_objects(), 1);
+    assert!(fx.named_objects_exist(&fx.head()));
     fx.check_clean(&cold);
     assert_eq!(read_restored(&fx.restore(&cold, "s3"), "c"), "charlie");
 }
 
-/// An `index` of a newer head layout or of an unknown type is refused, not
-/// rebuilt over.
+/// A latest head of a newer layout, with unknown features, or of an unknown
+/// type is refused, not rebuilt over.
 #[test]
 fn repair_refuses_a_newer_index() {
-    let fx = fixture(RepoFormat::V5);
+    let fx = fixture(RepoFormat::V6);
     fx.write("a", "alpha");
     fx.backup(&fx.config, "s1");
     let crypto = vykar_crypto::PlaintextEngine::new(crate::testutil::test_chunk_hasher());
     let newer = pack_head(
         &IndexHead {
-            layout: 2,
+            layout: 3,
             ..fx.head()
         },
         &crypto,
     )
     .unwrap();
+    let featured = pack_head(
+        &IndexHead {
+            features: vec!["later".into()],
+            ..fx.head()
+        },
+        &crypto,
+    )
+    .unwrap();
+    let head_path = fx.head_path();
     for (bytes, expected) in [
-        (newer, ["unsupported index head layout 2", "newer vykar"]),
+        (newer, ["unsupported index head layout 3", "newer vykar"]),
+        (featured, ["feature(s) later", "newer vykar"]),
         (vec![200u8; 16], ["type tag 200", "newer vykar"]),
     ] {
-        std::fs::write(fx.repo_dir.join("index"), &bytes).unwrap();
+        std::fs::write(&head_path, &bytes).unwrap();
         let before = repo_state(&fx);
         for mode in [RepairMode::PlanOnly, RepairMode::Apply] {
             let err = commands::check::run_with_repair(

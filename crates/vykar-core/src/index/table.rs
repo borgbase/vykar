@@ -572,6 +572,11 @@ impl LiveIndex {
         self.overlay.is_modified()
     }
 
+    /// Whether a table position was removed since the table was loaded.
+    pub(crate) fn has_removed_entries(&self) -> bool {
+        self.overlay.removed_count > 0
+    }
+
     /// Drop every edit: the index is its table again.
     pub(crate) fn discard_edits(&mut self) {
         self.overlay = Overlay::default();

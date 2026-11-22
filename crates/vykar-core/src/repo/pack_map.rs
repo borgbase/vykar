@@ -14,7 +14,8 @@
 //! offset order without overlap. A map is write-once: its name is the hash of
 //! its stored bytes, checked before anything else, as for `index.d/`. The
 //! rebuild of the index from the packs (`index_rebuild`) prefers a map over
-//! the pack's own trailer; compact does not delete maps yet.
+//! the pack's own trailer. Compact deletes a map once none of its packs is
+//! left (`delete_dead_pack_maps`).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, PoisonError};
@@ -373,6 +374,62 @@ pub(crate) fn read_pack_maps(
     Ok(scan)
 }
 
+/// Delete every pack map none of whose packs is `alive`. Best-effort: a
+/// damaged map is kept, a map from a newer vykar stops the pass (an error
+/// naming it), and a failed or refused delete is logged. Returns how many
+/// maps were deleted. Does nothing when the server does not accept
+/// `packmaps/` or none exist. Up to `width` GETs in flight.
+pub(crate) fn delete_dead_pack_maps(
+    storage: &dyn StorageBackend,
+    crypto: &dyn CryptoEngine,
+    width: usize,
+    alive: &(dyn Fn(&PackId) -> bool + Sync),
+    cancel: &CancelToken,
+) -> Result<usize> {
+    if !pack_maps_supported(storage)? {
+        return Ok(0);
+    }
+    let names = list_pack_maps(storage)?;
+    if names.is_empty() {
+        return Ok(0);
+    }
+    let dead = Mutex::new(Vec::new());
+    try_for_each_bounded(width, &names, |name| {
+        cancel.check()?;
+        let key = pack_map_key(name);
+        let opened = match storage.get(&key)? {
+            None => return Ok(()),
+            Some(stored) => PackMap::open(name, &stored, crypto),
+        };
+        match opened {
+            Ok(map) => {
+                if !map.packs.iter().any(|(p, _)| alive(p)) {
+                    dead.lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .push(key);
+                }
+                Ok(())
+            }
+            Err(e) if is_newer_object(&e) => Err(newer_pack_map(&key, &e)),
+            Err(e) if is_object_damage(&e) => {
+                debug!("pack map {key} cannot be read ({e}); kept");
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    })?;
+    let mut deleted = 0;
+    for key in dead.into_inner().unwrap_or_else(PoisonError::into_inner) {
+        cancel.check()?;
+        match storage.delete(&key) {
+            Ok(()) => deleted += 1,
+            Err(e) if e.is_write_refusal() => debug!("pack map {key} not deleted (refused): {e}"),
+            Err(e) => warn!("failed to delete pack map {key}: {e}"),
+        }
+    }
+    Ok(deleted)
+}
+
 /// What `Repository::write_pack_maps` did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PackMapStats {
@@ -721,7 +778,7 @@ mod tests {
         let err = PackMap::open(&n, &s, &crypto).unwrap_err();
         assert!(is_object_damage(&err) && !is_newer_object(&err), "{err}");
 
-        let mut newer = vec![14u8];
+        let mut newer = vec![15u8];
         newer.extend_from_slice(&s[1..]);
         let err = PackMap::open(&ObjectName::of(&newer), &newer, &crypto).unwrap_err();
         assert!(is_newer_object(&err), "{err}");

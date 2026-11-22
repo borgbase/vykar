@@ -25,7 +25,7 @@ use crate::repo::{OpenOptions, RepoFormat, Repository};
 
 use super::helpers::{backup_single_source, make_test_config, source_entry};
 
-/// GETs of `index` (the head) and of `index.d/` objects.
+/// GETs of heads (`index.h/`) and of `index.d/` objects.
 #[derive(Default)]
 struct IndexReads {
     head: AtomicUsize,
@@ -42,7 +42,7 @@ impl IndexReads {
     }
 
     fn count(&self, key: &str) {
-        if key == "index" {
+        if key.starts_with(crate::repo::index_store::HEAD_PREFIX) {
             self.head.fetch_add(1, Ordering::SeqCst);
         } else if key.starts_with(crate::repo::index_store::INDEX_OBJECT_DIR) {
             self.objects.fetch_add(1, Ordering::SeqCst);
@@ -50,7 +50,7 @@ impl IndexReads {
     }
 }
 
-/// Counts reads of `index`, conditional or not, and of `index.d/` objects.
+/// Counts reads of heads and of `index.d/` objects.
 struct CountIndexReads {
     inner: Box<dyn StorageBackend>,
     reads: Arc<IndexReads>,
@@ -72,7 +72,7 @@ delegate_storage_backend! {
     }
 }
 
-/// Fails every `index` PUT.
+/// Fails every head PUT.
 struct FailIndexPut {
     inner: Box<dyn StorageBackend>,
 }
@@ -97,13 +97,13 @@ delegate_storage_backend! {
     }
 
     fn put(&self, key: &str, data: &[u8]) -> Result<()> {
-        if key == "index" {
+        if key.starts_with(crate::repo::index_store::HEAD_PREFIX) {
             return Err(VykarError::Other("injected index PUT failure".into()));
         }
         self.inner.put(key, data)
     }
 
-    // Packs never take the `index` key.
+    // Packs never take a head key.
     fn put_pack(&self, key: &str, data: vykar_storage::PackData) -> Result<()> {
         self.inner.put_pack(key, data)
     }
@@ -243,9 +243,9 @@ impl Env {
         })
     }
 
-    /// The bytes at `index`.
+    /// The bytes of the latest head.
     fn index_bytes(&self) -> Vec<u8> {
-        fs::read(self.repo_dir.join("index")).unwrap()
+        fs::read(super::helpers::latest_head_path(&self.repo_dir)).unwrap()
     }
 
     /// Files under `index.d/` (0 when the directory does not exist).
@@ -329,7 +329,7 @@ fn find_file(dir: &Path, name: &str) -> Option<PathBuf> {
 
 // --- (A) the local table after a maintenance index write ---
 
-const FORMATS: [RepoFormat; 1] = [RepoFormat::V5];
+const FORMATS: [RepoFormat; 1] = [RepoFormat::V6];
 
 /// The next backup used the local table: no `index.d/` download.
 fn assert_backup_uses_caches(env: &Env, src: &Path, name: &str) {
@@ -340,8 +340,10 @@ fn assert_backup_uses_caches(env: &Env, src: &Path, name: &str) {
     assert_eq!(objects, 0, "backup downloaded index objects");
 }
 
+/// Prune writes no index; the compact after it leaves the table at the
+/// state it writes, so the next backup is fast.
 #[test]
-fn prune_leaves_the_table_at_the_new_state_so_next_backup_is_fast() {
+fn compact_after_prune_leaves_the_table_at_the_new_state_so_next_backup_is_fast() {
     for format in FORMATS {
         let env = Env::new(format);
         let src = env.source("a", &[("one.bin", 0x11)]);
@@ -361,8 +363,15 @@ fn prune_leaves_the_table_at_the_new_state_so_next_backup_is_fast() {
         .unwrap();
         assert_eq!(stats.pruned, 1);
         assert!(stats.warnings.is_empty(), "{:?}", stats.warnings);
+        let before = env.open_fresh().index_head().unwrap().clone();
+        commands::compact::run(&env.config, None, 100.0, None, false, &CancelToken::new()).unwrap();
 
         let remote = env.open_fresh();
+        assert_ne!(
+            remote.index_head().unwrap(),
+            &before,
+            "compact wrote a head"
+        );
         let id = remote.config.id.clone();
         assert!(
             table_at(&id, &env.cache_dir, remote.index_generation()),
@@ -408,22 +417,17 @@ fn compact_leaves_the_table_at_the_new_state() {
 }
 
 /// Maintenance on a host without a table of the repository writes a
-/// segment and leaves that host's cache dir with the table of the new state.
+/// segment (the sweep's) and leaves that host's cache dir with the table of
+/// the new state.
 #[test]
 fn maintenance_on_a_host_without_caches_segmented() {
-    let env = Env::new(RepoFormat::V5);
+    let env = Env::new(RepoFormat::V6);
     let src = env.source("a", &[("one.bin", 0x11)]);
     env.backup(&src, "a", "s1");
     fs::write(src.join("two.bin"), vec![0x22u8; 64 * 1024]).unwrap();
     env.backup(&src, "a", "s2");
-    let head_before = env.open_fresh().index_head().unwrap().clone();
-
-    let other_cache = env.dir.path().join("maintenance-only");
-    fs::create_dir_all(&other_cache).unwrap();
-    let mut config = env.config.clone();
-    config.cache_dir = Some(other_cache.to_string_lossy().into_owned());
     let (stats, _) = commands::prune::run(
-        &config,
+        &env.config,
         None,
         false,
         false,
@@ -433,6 +437,15 @@ fn maintenance_on_a_host_without_caches_segmented() {
     )
     .unwrap();
     assert_eq!(stats.pruned, 1);
+    let head_before = env.open_fresh().index_head().unwrap().clone();
+
+    let other_cache = env.dir.path().join("maintenance-only");
+    fs::create_dir_all(&other_cache).unwrap();
+    let mut config = env.config.clone();
+    config.cache_dir = Some(other_cache.to_string_lossy().into_owned());
+    let swept =
+        commands::compact::run(&config, None, 100.0, None, false, &CancelToken::new()).unwrap();
+    assert!(swept.chunks_unreferenced > 0, "{swept:?}");
 
     let remote = env.open_fresh();
     let head_after = remote.index_head().unwrap().clone();
@@ -444,27 +457,20 @@ fn maintenance_on_a_host_without_caches_segmented() {
     assert!(table_at(&id, &other_cache, generation));
 }
 
+/// A compact whose head PUT fails leaves this host's table and the
+/// remote index as they were; the segment and the sweep record it PUT first
+/// are unnamed debris.
 #[test]
-fn failed_index_write_in_prune_leaves_caches_untouched() {
+fn failed_index_write_in_compact_leaves_caches_untouched() {
     for format in FORMATS {
         let env = Env::new(format);
         let src = env.source("a", &[("one.bin", 0x11)]);
         env.backup(&src, "a", "s1");
         fs::write(src.join("two.bin"), vec![0x22u8; 64 * 1024]).unwrap();
         env.backup(&src, "a", "s2");
-        let remote = env.open_fresh();
-        let (id, generation) = (remote.config.id.clone(), remote.index_generation());
-        assert!(table_at(&id, &env.cache_dir, generation));
-        let index_before = env.index_bytes();
-        let objects_before = env.index_object_names();
-
-        let mut repo = env.open(
-            Box::new(FailIndexPut { inner: env.local() }),
-            OpenOptions::new(),
-        );
-        let (stats, _) = commands::prune::run_on_repo(
-            &mut repo,
+        let (stats, _) = commands::prune::run(
             &env.config,
+            None,
             false,
             false,
             &env.sources(&["a"]),
@@ -473,8 +479,22 @@ fn failed_index_write_in_prune_leaves_caches_untouched() {
         )
         .unwrap();
         assert_eq!(stats.pruned, 1);
-        assert_eq!(stats.warnings.len(), 1, "{:?}", stats.warnings);
-        assert!(stats.warnings[0].contains("persisting refcount changes failed"));
+        let remote = env.open_fresh();
+        let (id, generation) = (remote.config.id.clone(), remote.index_generation());
+        assert!(table_at(&id, &env.cache_dir, generation));
+        let index_before = env.index_bytes();
+        let objects_before = env.index_object_names();
+        drop(remote);
+
+        let mut repo = env.open(
+            Box::new(FailIndexPut { inner: env.local() }),
+            OpenOptions::new(),
+        );
+        let err =
+            commands::compact::run_on_repo(&mut repo, 100.0, None, false, &CancelToken::new())
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("injected index PUT failure"), "{err}");
         drop(repo);
 
         // The table still describes the remote index, which was not replaced.
@@ -487,26 +507,31 @@ fn failed_index_write_in_prune_leaves_caches_untouched() {
         assert_eq!(entries(&own), entries(&remote));
         drop(own);
 
-        // The segment PUT went through before the failed head PUT.
+        // The segment and the record PUTs went through before the head PUT.
         let objects = env.index_object_names();
         let debris: Vec<&String> = objects.difference(&objects_before).collect();
-        assert_eq!(debris.len(), 1, "{debris:?}");
-        assert_eq!(objects.len(), objects_before.len() + 1);
-        let bytes = fs::read(env.repo_dir.join("index.d").join(debris[0])).unwrap();
-        assert_eq!(bytes[0], ObjectType::IndexSegment as u8);
-        let head = remote.index_head().unwrap();
-        let named = head
-            .base
+        assert_eq!(debris.len(), 2, "{debris:?}");
+        let mut tags: Vec<u8> = debris
             .iter()
-            .map(|b| b.name)
-            .chain(head.segments.iter().map(|s| s.name))
-            .chain(head.retired.iter().copied())
-            .any(|n| n.to_hex() == *debris[0]);
-        assert!(!named, "debris is named by the head");
+            .map(|d| fs::read(env.repo_dir.join("index.d").join(d)).unwrap()[0])
+            .collect();
+        tags.sort_unstable();
+        assert_eq!(
+            tags,
+            vec![
+                ObjectType::IndexSegment as u8,
+                ObjectType::SweepRecord as u8
+            ]
+        );
+        let head = remote.index_head().unwrap();
+        assert!(
+            !head.named_objects().any(|n| debris.contains(&&n.to_hex())),
+            "debris is named by the head"
+        );
         drop(remote);
 
         commands::compact::run(&env.config, None, 100.0, None, false, &CancelToken::new()).unwrap();
-        assert_eq!(env.index_object_names(), objects_before);
+        env.assert_check_clean();
     }
 }
 
@@ -582,7 +607,7 @@ fn save_then_lose_lock(env: &Env) -> (u64, u64) {
 
 #[test]
 fn lock_lost_after_save_still_installs_the_table_segmented() {
-    let env = Env::new(RepoFormat::V5);
+    let env = Env::new(RepoFormat::V6);
     let src = env.source("a", &[("one.bin", 0x11)]);
     env.backup(&src, "a", "s1");
     let id = env.open_fresh().config.id.clone();
@@ -614,7 +639,7 @@ fn save_then_get_taken_over(env: &Env) -> u64 {
 /// and backup use the newer one.
 #[test]
 fn takeover_keeps_the_newer_table_segmented() {
-    let env = Env::new(RepoFormat::V5);
+    let env = Env::new(RepoFormat::V6);
     let src = env.source("a", &[("one.bin", 0x11)]);
     env.backup(&src, "a", "s1");
 

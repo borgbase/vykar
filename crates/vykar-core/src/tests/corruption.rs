@@ -153,13 +153,12 @@ fn apply_delete_pack(repo_dir: &Path) {
 }
 
 fn apply_truncate_index(repo_dir: &Path) {
-    let index_path = repo_dir.join("index");
+    let index_path = super::helpers::latest_head_path(repo_dir);
     std::fs::write(&index_path, [0u8; 10]).unwrap();
 }
 
 fn apply_delete_index(repo_dir: &Path) {
-    let index_path = repo_dir.join("index");
-    std::fs::remove_file(index_path).unwrap();
+    super::helpers::remove_index_heads(repo_dir);
 }
 
 fn apply_corrupt_snapshot(repo_dir: &Path) {

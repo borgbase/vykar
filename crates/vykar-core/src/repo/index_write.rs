@@ -1,21 +1,21 @@
-//! Write side of the segmented index (formats v4/v5); see `index_store` for
-//! the objects and the read side.
+//! Write side of the index (formats v6/v7); see `index_store` for the
+//! objects and the read side.
 //!
-//! Every write runs under the repository lock: GET the head, check it is the
-//! state the in-memory index was loaded from, produce the next state and its
-//! segment in one pass over the loaded table, then PUT the segment, check the
-//! lock fence and PUT the head. A chain past the hard limit, a write without
-//! a head (repair, upgrade) or an explicit request (compact, repair) writes a
-//! base instead: a *fold*. The new state becomes the repository's table.
+//! Every write runs under the repository lock: read the latest head, check
+//! it is the head the in-memory index was loaded from, produce the next
+//! state and its segment in one pass over the loaded table, then PUT the
+//! segment (and a sweep record, when a sweep is pending), check the lock
+//! fence and PUT the head of the next generation at `index.h/<gen>`. A
+//! chain past the hard limit, a write without a head (repair, upgrade) or an
+//! explicit request (compact, repair) writes a base instead: a *fold*. The
+//! new state becomes the repository's table.
 //!
 //! Fold: PUT the new state as a base (none for the empty index), then the
-//! head with no segments and the previous live set as `retired`. With a
-//! previous head, every `index.d/` object it names neither as live nor as
-//! retired, and the retired ones, are deleted first. Without one (repair,
-//! upgrade) the unreferenced objects are deleted only after the head PUT:
-//! until then they may be the only copy of the index. A reader still on the
-//! previous head can finish; one on the head before it gets a 404 and
-//! re-reads the head.
+//! head with no segments and the previous live set as `retired`. Nothing is
+//! deleted before the head PUT. After it, old heads and unreferenced
+//! `index.d/` objects are deleted by age
+//! ([`index_store::collect_index_garbage`]), so a reader still on a recent
+//! head can finish and a concurrent writer's fresh object survives.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -28,9 +28,11 @@ use super::control::CancelToken;
 use super::index_rebuild::{self, RebuildCounts, UncoveredPack};
 use super::index_store::{self, PackedObject, StoredHead};
 use crate::index::LiveIndex;
-use crate::index::dedup_cache::{self, MmapFullIndexCache, generation_for_state};
+use crate::index::dedup_cache::{MmapFullIndexCache, generation_for_state};
 use crate::index::head::{BaseRef, HEAD_LAYOUT_VERSION, IndexHead, SegmentRef};
+use crate::index::head::{SegmentKind, SweepState};
 use crate::index::segment::Diff;
+use crate::index::sweep_record::SweepRecord;
 use crate::index::table::{self, ChunkTable};
 use vykar_types::error::{Result, VykarError};
 use vykar_types::pack_id::PackId;
@@ -41,9 +43,6 @@ pub enum IndexRecovery {
     /// The index as storage holds it: every object of the chain read, or
     /// this machine's cache of the head's state.
     Complete,
-    /// `index` held a monolithic index written by an older vykar; the index
-    /// is rebuilt from it.
-    LegacyBlob,
     /// The index could not be read (`cause`) and was rebuilt from pack
     /// maps, pack trailers and this machine's chunk tables. Snapshots whose
     /// chunks lie in uncovered packs show up in the plan as removals.
@@ -56,9 +55,9 @@ pub enum IndexRecovery {
 /// Why `check --repair` could not read the index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IndexLoss {
-    /// `index` is absent.
+    /// No head is listed under `index.h/`.
     HeadMissing,
-    /// `index` cannot be decrypted or decoded.
+    /// The latest head cannot be decrypted or decoded.
     HeadUnreadable,
     /// The head is readable, but an object of its chain is missing or
     /// damaged.
@@ -136,7 +135,100 @@ impl Default for FoldPolicy {
     }
 }
 
+/// What the next index write records in the head's `sweep`.
+#[derive(Debug, Clone)]
+pub(crate) enum PendingSweep {
+    /// A sweep ran: write this record (its `generation` filled in at write time)
+    /// and set `sweep.generation` to the new head's generation.
+    Swept(SweepRecord),
+    /// `check --repair`: `sweep.generation` = the new head's generation; the
+    /// record carries over.
+    Repair,
+    /// The upgrade's first head: [`SweepState::default`].
+    Initial,
+}
+
 impl Repository {
+    /// Set what the next index write records in the head's `sweep`.
+    pub(crate) fn set_pending_sweep(&mut self, p: PendingSweep) {
+        self.pending_sweep = Some(p);
+    }
+
+    /// Set the grace of the index garbage collection (tests).
+    #[cfg(test)]
+    pub(crate) fn set_index_gc_grace(&mut self, grace: std::time::Duration) {
+        self.index_gc_grace = grace;
+    }
+
+    /// The next head's generation: `prev.generation + 1`; with no readable head
+    /// (repair, upgrade), the highest listed generation + 1, or 1, so a new
+    /// head never reuses a key.
+    fn next_head_gen(&self, prev: Option<&IndexHead>) -> Result<u64> {
+        match prev {
+            Some(p) => Ok(p.generation + 1),
+            None => Ok(index_store::list_head_generations(self.storage.as_ref())?
+                .last()
+                .map_or(1, |g| g + 1)),
+        }
+    }
+
+    /// The `sweep` of the head at `generation`, and the record object to PUT
+    /// before it. Takes `self.pending_sweep`. With nothing pending: `prev`'s
+    /// sweep when there is a `prev`, repair semantics when there is not (a
+    /// write without a head may have removed anything). Also repair
+    /// semantics when the index has removed entries and nothing is pending,
+    /// so that no removal leaves `sweep.generation` unchanged.
+    ///
+    /// The pending sweep is taken even when the write then fails (a PUT, the
+    /// fence): it is not restored. The removals stay in the in-memory index,
+    /// so a later write from this handle records them as a repair (a
+    /// `sweep.generation` of its own, the previous record kept), never as an
+    /// unchanged sweep. Compact returns the error and does not write again;
+    /// its next run marks and sweeps from scratch.
+    fn next_sweep(
+        &mut self,
+        prev: Option<&IndexHead>,
+        generation: u64,
+    ) -> Result<(SweepState, Option<PackedObject>)> {
+        let prev_record = prev.and_then(|p| p.sweep.record);
+        let pending = match self.pending_sweep.take() {
+            Some(p) => Some(p),
+            None if prev.is_none() => Some(PendingSweep::Repair),
+            None if self.chunk_index.has_removed_entries() => {
+                debug!(
+                    "index write removes entries with no sweep pending; recording it as a repair"
+                );
+                Some(PendingSweep::Repair)
+            }
+            None => None,
+        };
+        Ok(match pending {
+            None => (prev.map(|p| p.sweep).unwrap_or_default(), None),
+            Some(PendingSweep::Initial) => (SweepState::default(), None),
+            Some(PendingSweep::Repair) => (
+                SweepState {
+                    generation,
+                    record: prev_record,
+                },
+                None,
+            ),
+            Some(PendingSweep::Swept(mut record)) => {
+                record.generation = generation;
+                let obj = index_store::pack_sweep_record(&record, self.crypto.as_ref())?;
+                (
+                    SweepState {
+                        generation,
+                        record: Some(crate::index::head::ObjectRef {
+                            name: obj.name,
+                            size: obj.size(),
+                        }),
+                    },
+                    Some(obj),
+                )
+            }
+        })
+    }
+
     /// Set the fold limits (tests).
     #[cfg(test)]
     pub(crate) fn set_fold_policy(&mut self, policy: FoldPolicy) {
@@ -175,8 +267,9 @@ impl Repository {
             .map(Arc::new)
     }
 
-    /// GET the head and check it is the one the in-memory index was loaded
-    /// from: a write can only be expressed against that state.
+    /// Read the latest head and check it is the one the in-memory index was
+    /// loaded from (generation included): a write can only be expressed
+    /// against that state.
     fn current_head_for_write(&self) -> Result<Option<IndexHead>> {
         let Some(loaded) = self.index_head.as_ref() else {
             // No valid head (`check --repair` rebuilding the index).
@@ -221,7 +314,7 @@ impl Repository {
         );
         // Without a head the state is written as a base; the diff is unused.
         let diff = head.is_some().then_some(diff);
-        self.publish_index_state(head, diff, next)
+        self.publish_index_state(head, diff, next, SegmentKind::Maintenance)
     }
 
     /// Publish the index state in `next` (a full cache in a temp file) as
@@ -229,22 +322,27 @@ impl Repository {
     /// is no diff, the hard limit is reached or a fold was requested. Then
     /// install `next` as the repository's table, with no edits.
     ///
-    /// An empty diff publishes nothing. On error nothing local changes and
-    /// at most an unreferenced object is left on storage, with one
-    /// exception: a failed fence check after the head PUT of a fold without
-    /// a previous head returns an error although the head was written.
+    /// `kind` names the writer of the segment. An empty diff publishes
+    /// nothing, or only a head when a sweep is pending. On error nothing
+    /// local changes and at most an unreferenced object is left on storage.
     pub(super) fn publish_index_state(
         &mut self,
         prev: Option<IndexHead>,
         diff: Option<Diff>,
         next: TempPath,
+        kind: SegmentKind,
     ) -> Result<()> {
         let fold = std::mem::take(&mut self.fold_requested);
         if let (Some(prev), Some(diff)) = (prev.as_ref(), diff.as_ref())
             && diff.segment.is_empty()
             && !fold
         {
-            debug!("index unchanged, nothing to write");
+            let head = if self.pending_sweep.is_some() {
+                self.put_head_only(prev)?
+            } else {
+                debug!("index unchanged, nothing to write");
+                prev.clone()
+            };
             let at_prev = |t: &Arc<ChunkTable>| t.state() == (prev.state_hash, prev.entries);
             if self.chunk_index.table().is_some_and(at_prev) || !self.chunk_index.is_loaded() {
                 drop(next);
@@ -252,7 +350,7 @@ impl Repository {
             } else {
                 self.install_written_table(next);
             }
-            self.index_head = Some(prev.clone());
+            self.index_head = Some(head);
             self.index_dirty = false;
             return Ok(());
         }
@@ -269,10 +367,7 @@ impl Repository {
             (Some(prev), Some(diff), Some(obj))
                 if !fold
                     && !self.fold_policy.hard.reached(prev, 1, obj.size())
-                    && !prev
-                        .live_objects()
-                        .chain(prev.retired.iter().copied())
-                        .any(|n| n == obj.name) =>
+                    && !prev.named_objects().any(|n| n == obj.name) =>
             {
                 Some((prev, diff, obj))
             }
@@ -280,7 +375,7 @@ impl Repository {
         };
 
         let head = match as_segment {
-            Some((prev, diff, obj)) => self.put_segment(prev, diff, obj)?,
+            Some((prev, diff, obj)) => self.put_segment(prev, diff, obj, kind)?,
             None => {
                 let cache = MmapFullIndexCache::open_verified(&next).ok_or_else(|| {
                     VykarError::Other("new index state failed verification".into())
@@ -320,35 +415,68 @@ impl Repository {
         }
     }
 
-    /// PUT a segment, then the head that appends it.
+    /// A head-only write: the same state, a new generation and the pending
+    /// sweep. PUT the record, check the fence, PUT the head.
+    fn put_head_only(&mut self, prev: &IndexHead) -> Result<IndexHead> {
+        let mut head = prev.successor();
+        let (sweep, record) = self.next_sweep(Some(prev), head.generation)?;
+        head.sweep = sweep;
+        head.validate()?;
+        if let Some(rec) = &record {
+            self.storage.put(&rec.key(), &rec.bytes)?;
+        }
+        self.check_lock_fence()?;
+        index_store::put_head(self.storage.as_ref(), &head, self.crypto.as_ref())?;
+        debug!(
+            generation = head.generation,
+            "index head written (no change to the entries)"
+        );
+        Ok(head)
+    }
+
+    /// PUT a segment (and the pending sweep record), then the head that
+    /// appends it.
     fn put_segment(
         &mut self,
         prev: &IndexHead,
         diff: &Diff,
         obj: PackedObject,
+        kind: SegmentKind,
     ) -> Result<IndexHead> {
-        let mut head = prev.clone();
+        let mut head = prev.successor();
         head.segments.push(SegmentRef {
             name: obj.name,
             size: obj.size(),
+            kind,
             state_hash_after: diff.state_hash_after,
             entries_after: diff.entries_after,
         });
         head.state_hash = diff.state_hash_after;
         head.entries = diff.entries_after;
+        let (sweep, record) = self.next_sweep(Some(prev), head.generation)?;
+        head.sweep = sweep;
         head.validate()?;
         let packed_head = index_store::pack_head(&head, self.crypto.as_ref())?;
 
+        if let Some(rec) = &record {
+            self.storage.put(&rec.key(), &rec.bytes)?;
+        }
         self.storage.put(&obj.key(), &obj.bytes)?;
         self.check_lock_fence()?;
-        self.storage.put("index", &packed_head)?;
-        debug!(bytes = obj.size(), "index segment written");
+        self.storage
+            .put(&index_store::head_key(head.generation), &packed_head)?;
+        debug!(
+            bytes = obj.size(),
+            generation = head.generation,
+            "index segment written"
+        );
         Ok(head)
     }
 
     /// Fold: write `cache`'s state as a base (no object for the empty index)
     /// and the head naming it alone, with `prev`'s live objects as retired.
-    /// See the module doc for the order of garbage collection.
+    /// Nothing is deleted before the head PUT; after it, the age-gated
+    /// garbage collection runs, best-effort.
     pub(super) fn put_base(
         &mut self,
         prev: Option<&IndexHead>,
@@ -359,8 +487,12 @@ impl Repository {
         let obj = (entries > 0)
             .then(|| index_store::pack_base(cache, self.crypto.as_ref()))
             .transpose()?;
+        let generation = self.next_head_gen(prev)?;
+        let (sweep, record) = self.next_sweep(prev, generation)?;
         let head = IndexHead {
-            layout: crate::index::head::HEAD_LAYOUT_VERSION,
+            layout: HEAD_LAYOUT_VERSION,
+            generation,
+            features: Vec::new(),
             state_hash,
             entries,
             base: obj.as_ref().map(|obj| BaseRef {
@@ -378,48 +510,44 @@ impl Repository {
                         .collect()
                 })
                 .unwrap_or_default(),
+            sweep,
         };
         head.validate()?;
         let packed_head = index_store::pack_head(&head, self.crypto.as_ref())?;
 
-        self.check_lock_fence()?;
-        let mut deleted = match prev {
-            Some(prev) => index_store::collect_garbage(self.storage.as_ref(), prev, true)?,
-            None => 0,
-        };
         if let Some(obj) = &obj {
             self.storage.put(&obj.key(), &obj.bytes)?;
         }
-        self.check_lock_fence()?;
-        self.storage.put("index", &packed_head)?;
-        if prev.is_none() {
-            deleted = self.collect_garbage_after_head(&head)?;
+        if let Some(rec) = &record {
+            self.storage.put(&rec.key(), &rec.bytes)?;
         }
+        self.check_lock_fence()?;
+        self.storage
+            .put(&index_store::head_key(head.generation), &packed_head)?;
+        let gc = index_store::collect_index_garbage(
+            self.storage.as_ref(),
+            self.crypto.as_ref(),
+            &head,
+            self.index_gc_grace,
+        )
+        .unwrap_or_else(|e| {
+            warn!("failed to delete old index objects: {e}");
+            Default::default()
+        });
         debug!(
             bytes = obj.as_ref().map_or(0, PackedObject::size),
-            deleted, "index folded into a new base"
+            generation = head.generation,
+            heads_deleted = gc.heads_deleted,
+            objects_deleted = gc.objects_deleted,
+            "index folded into a new base"
         );
         Ok(head)
     }
 
-    /// After a fold without a previous head: delete every `index.d/` object
-    /// `head` does not name. The head is already published: a failed fence
-    /// check is returned (the caller must stop writing), but a listing or delete
-    /// failure is only logged and leaves debris for compact.
-    fn collect_garbage_after_head(&self, head: &IndexHead) -> Result<usize> {
-        self.check_lock_fence()?;
-        Ok(
-            index_store::collect_garbage(self.storage.as_ref(), head, true).unwrap_or_else(|e| {
-                warn!("failed to delete unreferenced index objects: {e}");
-                0
-            }),
-        )
-    }
-
     /// Index upkeep at the end of `compact`, under the lock: fold when the
-    /// chain reached the soft limit, otherwise delete unreferenced
-    /// `index.d/` objects (debris of interrupted writes). Safe without an
-    /// age check: no other writer can be between its segment and head PUTs.
+    /// chain reached the soft limit, then delete old heads and unreferenced
+    /// `index.d/` objects. The deletion is age-gated, so it never deletes a
+    /// concurrent writer's fresh segment (H4-segment).
     pub(crate) fn maintain_segmented_index(&mut self) -> Result<()> {
         if self.index_dirty {
             self.save_state()?;
@@ -427,42 +555,53 @@ impl Repository {
         let Some(head) = self.current_head_for_write()? else {
             return Ok(());
         };
-        if !self.fold_policy.soft.reached(&head, 0, 0) {
-            let deleted = index_store::collect_garbage(self.storage.as_ref(), &head, false)?;
-            if deleted > 0 {
-                debug!(deleted, "deleted unreferenced index objects");
-            }
-            return Ok(());
-        }
-        let table = match self.local_table_at(&head) {
-            Some(table) => table,
-            None => {
-                let synced = self.sync_index(Some(head.clone()), true)?;
-                self.install_synced_index(synced);
-                self.chunk_index
-                    .table()
-                    .cloned()
-                    .ok_or_else(|| VykarError::Other("BUG: no table after a sync".into()))?
-            }
+        let latest = if self.fold_policy.soft.reached(&head, 0, 0) {
+            let table = match self.local_table_at(&head) {
+                Some(table) => table,
+                None => {
+                    let synced = self.sync_index(Some(head.clone()), true)?;
+                    self.install_synced_index(synced);
+                    self.chunk_index
+                        .table()
+                        .cloned()
+                        .ok_or_else(|| VykarError::Other("BUG: no table after a sync".into()))?
+                }
+            };
+            // A fold writes the same state: the table stays the repository's.
+            let new_head = self.put_base(Some(&head), table.cache())?;
+            drop(table);
+            self.index_generation = generation_for_state(&new_head.state_hash);
+            self.index_head = Some(new_head.clone());
+            new_head
+        } else {
+            head
         };
-        // A fold writes the same state: the table stays the repository's.
-        let new_head = self.put_base(Some(&head), table.cache())?;
-        drop(table);
-        self.index_generation = generation_for_state(&new_head.state_hash);
-        self.index_head = Some(new_head);
+        let gc = index_store::collect_index_garbage(
+            self.storage.as_ref(),
+            self.crypto.as_ref(),
+            &latest,
+            self.index_gc_grace,
+        )?;
+        if gc.heads_deleted > 0 || gc.objects_deleted > 0 || gc.skipped.is_some() {
+            debug!(
+                heads_deleted = gc.heads_deleted,
+                objects_deleted = gc.objects_deleted,
+                skipped = gc.skipped,
+                "index garbage collected"
+            );
+        }
         Ok(())
     }
 
     /// Load the chunk index for `check --repair`, accepting what other
-    /// commands refuse. A monolithic blob at `index` (an older binary
-    /// overwrote the head) is rebuilt from the blob. A chain that cannot be
+    /// commands refuse. A chain that cannot be
     /// read is rebuilt from this machine's cache of the head's state when
     /// there is one. Otherwise, when the chain is damaged (an object missing
     /// or failing verification) or the head is missing or unreadable, the
     /// index is rebuilt from the packs ([`index_rebuild`]): pack maps, then
     /// trailers, then this machine's verified chunk tables. A storage or
     /// local I/O error, an object of a newer vykar, a head of an unknown
-    /// layout or an `index` of an unknown type is refused, never rebuilt
+    /// layout or features, or a head of an unknown type is refused, never rebuilt
     /// around. When the index is rebuilt, the head is dropped, so the
     /// repair's index write is a fresh base. The rebuild only reads storage
     /// and writes a local temp file; `cancel` stops it.
@@ -470,15 +609,15 @@ impl Repository {
         &mut self,
         cancel: &CancelToken,
     ) -> Result<RepairIndexLoad> {
-        let data = self.storage.get("index")?;
+        let data = index_store::fetch_latest_head_bytes(self.storage.as_ref())?;
         self.load_segmented_index_for_repair(data, cancel)
     }
 
-    /// [`Self::load_chunk_index_for_repair`], from the object fetched at
-    /// `index`.
+    /// [`Self::load_chunk_index_for_repair`], from the latest head fetched
+    /// (its generation and bytes).
     fn load_segmented_index_for_repair(
         &mut self,
-        data: Option<Vec<u8>>,
+        data: Option<(u64, Vec<u8>)>,
         cancel: &CancelToken,
     ) -> Result<RepairIndexLoad> {
         let (index, load) = match data {
@@ -486,73 +625,71 @@ impl Repository {
                 warn!("the index head is missing; rebuilding the index from the packs");
                 self.rebuild_for_repair(IndexLoss::HeadMissing, cancel)?
             }
-            Some(data) => match index_store::classify_head(&data, self.crypto.as_ref()) {
-                StoredHead::Legacy => {
-                    warn!(
-                        "`index` holds a monolithic index; rebuilding the segmented index from it"
-                    );
-                    let blob =
-                        super::upgrade::decode_index_blob(Some(data), self.crypto.as_ref())?.1;
-                    let anchor = index_store::cache_anchor(self.cache_dir().as_deref());
-                    let tmp = dedup_cache::full_cache_from_index_to_temp(&blob, &anchor)?;
-                    drop(blob);
-                    (
-                        scratch_index(tmp)?,
-                        RepairIndexLoad::read(IndexRecovery::LegacyBlob),
-                    )
-                }
-                StoredHead::Head(head) => {
-                    let err = match self.sync_index(Some(head.clone()), false) {
-                        Ok(synced) => {
-                            self.install_synced_index(synced);
-                            return Ok(RepairIndexLoad::read(IndexRecovery::Complete));
-                        }
-                        Err(e) => e,
-                    };
-                    if let Some(table) = self.local_table_at(&head) {
-                        warn!(
-                            "the index chain cannot be read ({err}); rebuilding the index from \
+            Some((generation, data)) => {
+                match index_store::classify_head(generation, &data, self.crypto.as_ref()) {
+                    StoredHead::Head(head) => {
+                        let err = match self.sync_index(Some(head.clone()), false) {
+                            Ok(synced) => {
+                                self.install_synced_index(synced);
+                                return Ok(RepairIndexLoad::read(IndexRecovery::Complete));
+                            }
+                            Err(e) => e,
+                        };
+                        if let Some(table) = self.local_table_at(&head) {
+                            warn!(
+                                "the index chain cannot be read ({err}); rebuilding the index from \
                              this machine's cache of its latest state"
-                        );
-                        (
-                            LiveIndex::from_table(table),
-                            RepairIndexLoad::read(IndexRecovery::Complete),
-                        )
-                    } else if index_store::is_object_damage(&err) {
-                        warn!(
-                            "the index chain cannot be read ({err}); rebuilding the index from \
+                            );
+                            (
+                                LiveIndex::from_table(table),
+                                RepairIndexLoad::read(IndexRecovery::Complete),
+                            )
+                        } else if index_store::is_object_damage(&err) {
+                            warn!(
+                                "the index chain cannot be read ({err}); rebuilding the index from \
                              the packs"
+                            );
+                            self.rebuild_for_repair(IndexLoss::ChainDamaged, cancel)?
+                        } else {
+                            return Err(repair_load_refusal(err));
+                        }
+                    }
+                    StoredHead::UnknownLayout(layout) => {
+                        return Err(VykarError::Other(format!(
+                            "unsupported index head layout {layout} (this version reads \
+                         {HEAD_LAYOUT_VERSION}); the index head was written by a newer vykar. \
+                         Upgrade vykar to repair this repository. Nothing was changed. If no \
+                         newer vykar has written to this repository, the index head is damaged; \
+                         restore it from a copy of the repository"
+                        )));
+                    }
+                    StoredHead::UnknownFeatures(names) => {
+                        return Err(VykarError::Other(format!(
+                            "the index head uses feature(s) {} that this vykar does not know; it \
+                         was written by a newer vykar. Upgrade vykar to repair this \
+                         repository. Nothing was changed. If no newer vykar has written to \
+                         this repository, the index head is damaged; restore it from a copy \
+                         of the repository",
+                            names.join(", ")
+                        )));
+                    }
+                    StoredHead::UnknownType(tag) => {
+                        return Err(VykarError::Other(format!(
+                            "the index head holds an object of a type this vykar does not know \
+                         (type tag {tag}); it was probably written by a newer vykar. Upgrade \
+                         vykar to repair this repository. Nothing was changed. If no newer \
+                         vykar has written to this repository, the index head is damaged; \
+                         restore it from a copy of the repository"
+                        )));
+                    }
+                    StoredHead::Unreadable(err) => {
+                        warn!(
+                            "the index head cannot be read ({err}); rebuilding the index from the packs"
                         );
-                        self.rebuild_for_repair(IndexLoss::ChainDamaged, cancel)?
-                    } else {
-                        return Err(repair_load_refusal(err));
+                        self.rebuild_for_repair(IndexLoss::HeadUnreadable, cancel)?
                     }
                 }
-                StoredHead::UnknownLayout(layout) => {
-                    return Err(VykarError::Other(format!(
-                        "unsupported index head layout {layout} (this version reads \
-                         {HEAD_LAYOUT_VERSION}); `index` was written by a newer vykar. Upgrade \
-                         vykar to repair this repository. Nothing was changed. If no newer \
-                         vykar has written to this repository, `index` is damaged; restore it \
-                         from a copy of the repository"
-                    )));
-                }
-                StoredHead::UnknownType(tag) => {
-                    return Err(VykarError::Other(format!(
-                        "`index` holds an object of a type this vykar does not know (type tag \
-                         {tag}); it was probably written by a newer vykar. Upgrade vykar to \
-                         repair this repository. Nothing was changed. If no newer vykar has \
-                         written to this repository, `index` is damaged; restore it from a \
-                         copy of the repository"
-                    )));
-                }
-                StoredHead::Unreadable(err) => {
-                    warn!(
-                        "the index head cannot be read ({err}); rebuilding the index from the packs"
-                    );
-                    self.rebuild_for_repair(IndexLoss::HeadUnreadable, cancel)?
-                }
-            },
+            }
         };
         self.chunk_index = index;
         self.index_head = None;
@@ -620,17 +757,6 @@ fn stale_index_error() -> VykarError {
 /// `tmp` (a full cache in a temp file) as an index over a scratch table.
 fn scratch_index(tmp: TempPath) -> Result<LiveIndex> {
     Ok(LiveIndex::from_table(Arc::new(ChunkTable::scratch(tmp)?)))
-}
-
-/// The `index.d/` listing for a repair without a head. A failure is named as
-/// such and gets none of [`repair_load_refusal`]'s advice about objects.
-pub(super) fn list_objects_for_repair(
-    storage: &dyn vykar_storage::StorageBackend,
-) -> Result<Vec<crate::index::head::ObjectName>> {
-    index_store::list_objects(storage).map_err(|e| match e {
-        VykarError::Interrupted => e,
-        e => VykarError::Other(format!("listing index.d/: {e}")),
-    })
 }
 
 /// The error `check --repair` returns when reading the chain fails in a way

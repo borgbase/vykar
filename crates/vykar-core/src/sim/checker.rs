@@ -26,7 +26,8 @@ pub enum Invariant {
     AcknowledgedCommitsDurable = 2,
     NoSilentRemoval = 3,
     IndexIntegrity = 4,
-    NoRefcountDeflation = 5,
+    // 5 (no refcount deflation) is retired: stored refcounts mean nothing
+    // since 05 step 8. The numbers of the others stay.
     /// Every protected write lands while the store holds exactly one lock
     /// key, written by the same run.
     LockExclusion = 7,
@@ -43,7 +44,6 @@ impl Invariant {
         Invariant::AcknowledgedCommitsDurable,
         Invariant::NoSilentRemoval,
         Invariant::IndexIntegrity,
-        Invariant::NoRefcountDeflation,
         Invariant::AllowedErrors,
     ];
 
@@ -53,7 +53,6 @@ impl Invariant {
         Invariant::AcknowledgedCommitsDurable,
         Invariant::NoSilentRemoval,
         Invariant::IndexIntegrity,
-        Invariant::NoRefcountDeflation,
         Invariant::AllowedErrors,
         Invariant::LockExclusion,
         Invariant::NoPermanentWedge,
@@ -80,8 +79,6 @@ pub enum ViolationKind {
     ItemStreamUnreadable,
     RestoreFailed,
     RestoreDiffers,
-    // 5
-    RefcountDeflated,
     // 2
     AcknowledgedCommitMissing,
     // 3
@@ -117,7 +114,6 @@ impl ViolationKind {
             | K::ItemStreamUnreadable
             | K::RestoreFailed
             | K::RestoreDiffers => Invariant::CommittedSnapshotsRestore,
-            K::RefcountDeflated => Invariant::NoRefcountDeflation,
             K::AcknowledgedCommitMissing => Invariant::AcknowledgedCommitsDurable,
             K::SilentRemoval => Invariant::NoSilentRemoval,
             K::DisallowedError => Invariant::AllowedErrors,
@@ -148,8 +144,7 @@ pub struct NotEvaluated {
 #[derive(Clone, Debug, Default)]
 pub struct Report {
     pub violations: Vec<Violation>,
-    /// E.g. the index unloadable for 1 and 5, or a snapshot whose item
-    /// stream does not load for 5.
+    /// E.g. the index unloadable for 1.
     pub not_evaluated: Vec<NotEvaluated>,
 }
 
@@ -262,17 +257,16 @@ pub(crate) fn open_observer(
     )
 }
 
-/// Storage keys of the base and segments the current head names.
+/// Storage keys of the base, segments and sweep record the current head
+/// names.
 pub fn head_object_keys(store: &SimStore) -> std::result::Result<BTreeSet<String>, String> {
     let tmp = tempfile::tempdir().map_err(|e| e.to_string())?;
     let repo = open_observer(store, tmp.path()).map_err(|e| e.to_string())?;
     let head = index_store::fetch_head(repo.storage.as_ref(), repo.crypto.as_ref())
         .map_err(|e| e.to_string())?;
     Ok(head
-        .base
-        .iter()
-        .map(|b| b.name)
-        .chain(head.segments.iter().map(|s| s.name))
+        .live_objects()
+        .chain(head.sweep.record.iter().map(|r| r.name))
         .map(|n| index_store::object_key(&n))
         .collect())
 }
@@ -358,7 +352,8 @@ fn check_index(store: &SimStore, repo: &mut Repository, report: &mut Report) -> 
                 .base
                 .iter()
                 .map(|b| (b.name, b.size))
-                .chain(head.segments.iter().map(|s| (s.name, s.size)));
+                .chain(head.segments.iter().map(|s| (s.name, s.size)))
+                .chain(head.sweep.record.iter().map(|r| (r.name, r.size)));
             for (name, size) in named {
                 let key = index_store::object_key(&name);
                 match store.object(&key) {
@@ -402,7 +397,7 @@ fn check_index(store: &SimStore, repo: &mut Repository, report: &mut Report) -> 
     true
 }
 
-/// Invariants 1 and 5 over every manifest snapshot.
+/// Invariant 1 over every manifest snapshot.
 fn check_snapshots(
     store: &SimStore,
     history: &History,
@@ -412,7 +407,6 @@ fn check_snapshots(
     report: &mut Report,
 ) {
     let mut memo: HashMap<ChunkId, Option<ChunkFault>> = HashMap::new();
-    let mut refs: HashMap<ChunkId, u32> = HashMap::new();
     // Snapshots without an index-level violation, restored at the end.
     let mut restorable: Vec<String> = Vec::new();
     let entries: Vec<String> = repo
@@ -431,22 +425,15 @@ fn check_snapshots(
                     name,
                     format!("meta unreadable: {e}"),
                 );
-                report.skip(Invariant::NoRefcountDeflation, name, "meta unreadable");
                 continue;
             }
         };
         for id in &meta.item_ptrs {
-            *refs.entry(*id).or_insert(0) += 1;
             if let Some(f) = chunk_fault(repo, store, &mut memo, id) {
                 report_chunk(report, name, id, f, true, "");
             }
         }
         if report.violations.len() > before {
-            report.skip(
-                Invariant::NoRefcountDeflation,
-                name,
-                "item stream not loadable: tree chunks faulty",
-            );
             continue;
         }
         let stream =
@@ -457,11 +444,6 @@ fn check_snapshots(
                         ViolationKind::ItemStreamUnreadable,
                         name,
                         format!("item stream unreadable: {e}"),
-                    );
-                    report.skip(
-                        Invariant::NoRefcountDeflation,
-                        name,
-                        "item stream unreadable",
                     );
                     continue;
                 }
@@ -481,11 +463,9 @@ fn check_snapshots(
                 name,
                 format!("items do not decode: {e}"),
             );
-            report.skip(Invariant::NoRefcountDeflation, name, "items do not decode");
             continue;
         }
         for (path, id) in &file_chunks {
-            *refs.entry(*id).or_insert(0) += 1;
             if let Some(f) = chunk_fault(repo, store, &mut memo, id) {
                 report_chunk(report, name, id, f, false, path);
             }
@@ -494,25 +474,6 @@ fn check_snapshots(
             restorable.push(name.clone());
         }
     }
-    // Chunks absent from the index are invariant 1's; a skipped snapshot
-    // only lowers the counts, so a deflation seen here is real.
-    let index = repo.chunk_index();
-    let mut deflated: Vec<(ChunkId, u32, u32)> = refs
-        .iter()
-        .filter_map(|(id, n)| {
-            let e = index.get(id)?;
-            (e.refcount < *n).then_some((*id, e.refcount, *n))
-        })
-        .collect();
-    deflated.sort_by_key(|(id, _, _)| *id.as_bytes());
-    for (id, r, n) in deflated {
-        report.add(
-            ViolationKind::RefcountDeflated,
-            id.to_string(),
-            format!("refcount {r} < references {n}"),
-        );
-    }
-
     // Last: restore clears the repository's chunk index when it finishes.
     for (i, name) in restorable.iter().enumerate() {
         let Some(expected) = history.trees.get(name) else {
@@ -647,13 +608,13 @@ fn check_errors(history: &History, report: &mut Report) {
     }
 }
 
-/// Prefixes of keys whose deletion only a lock holder may do. 05 step 8
-/// adds `index.h/`.
-const PROTECTED_DELETE_PREFIXES: &[&str] = &["snapshots/", "packs/", "index.d/"];
+/// Prefixes of keys whose deletion only a lock holder may do.
+const PROTECTED_DELETE_PREFIXES: &[&str] =
+    &["snapshots/", "packs/", "index.d/", "index.h/", "packmaps/"];
 
-/// A write only a lock holder may do: the head, or an index object.
+/// A write only a lock holder may do: a head, or an index object.
 fn protected_write(key: &str) -> bool {
-    key == "index" || key.starts_with("index.d/")
+    key.starts_with("index.h/") || key.starts_with("index.d/")
 }
 
 fn is_lock_key(key: &str) -> bool {
@@ -664,7 +625,7 @@ fn is_lock_key(key: &str) -> bool {
 /// lock keys exist and which (client, run) last wrote each, and judge every
 /// applied protected write against the keys present just before it. Late
 /// effects count at the step they land. The tamper client and the Init run
-/// (`Repository::init` writes `index` with no lock) are exempt.
+/// (`Repository::init` writes `index.h/1` with no lock) are exempt.
 ///
 /// Limit: a key counts as held from its PUT. `acquire_lock` publishes a
 /// tentative key that can coexist with the holder's until the loser deletes
@@ -756,7 +717,7 @@ pub fn check_invariants(store: &SimStore, history: &History, set: &[Invariant]) 
         report.violations.extend(index_report.violations);
     }
 
-    if want(Invariant::CommittedSnapshotsRestore) || want(Invariant::NoRefcountDeflation) {
+    if want(Invariant::CommittedSnapshotsRestore) {
         if index_ok {
             let mut snap_report = Report::default();
             check_snapshots(
@@ -780,14 +741,11 @@ pub fn check_invariants(store: &SimStore, history: &History, set: &[Invariant]) 
                     .filter(|n| want(n.invariant)),
             );
         } else {
-            for inv in [
+            report.skip(
                 Invariant::CommittedSnapshotsRestore,
-                Invariant::NoRefcountDeflation,
-            ] {
-                if want(inv) {
-                    report.skip(inv, "index", "chain does not load");
-                }
-            }
+                "index",
+                "chain does not load",
+            );
         }
     }
     if want(Invariant::AcknowledgedCommitsDurable) {

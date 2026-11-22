@@ -182,9 +182,11 @@ fn pack_count(fx: &Fixture) -> usize {
         .count()
 }
 
-/// Delete `index`, every object in `index.d/` and the fixture's cache dir.
+/// Delete every head, every object in `index.d/` and the fixture's cache dir.
 fn lose_index(fx: &Fixture) {
-    std::fs::remove_file(fx.repo_dir().join("index")).unwrap();
+    for entry in std::fs::read_dir(fx.repo_dir().join("index.h")).unwrap() {
+        std::fs::remove_file(entry.unwrap().path()).unwrap();
+    }
     for entry in std::fs::read_dir(fx.repo_dir().join("index.d")).unwrap() {
         let path = entry.unwrap().path();
         if path.is_file() {

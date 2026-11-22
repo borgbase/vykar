@@ -32,6 +32,8 @@ pub enum AllowedError {
     IndexChanged,
     Interrupted,
     Injected,
+    /// Compact refused because the live snapshots could not be marked.
+    MarkRefused,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -57,6 +59,9 @@ pub fn classify(err: &VykarError) -> ErrorClass {
         VykarError::LockExpired(_) => Some(AllowedError::LockExpired),
         VykarError::Interrupted => Some(AllowedError::Interrupted),
         VykarError::Other(m) if m.contains(INDEX_CHANGED_TEXT) => Some(AllowedError::IndexChanged),
+        VykarError::Other(m) if m.starts_with(crate::commands::compact::MARK_REFUSED) => {
+            Some(AllowedError::MarkRefused)
+        }
         _ => None,
     };
     if let Some(a) = allowed {

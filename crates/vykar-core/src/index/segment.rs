@@ -845,27 +845,23 @@ where
     }
 }
 
-/// A session's new entries in chunk-ID order, one per chunk: duplicates are
-/// summed into the first one's location.
+/// A session's new entries in chunk-ID order, one per chunk at the first
+/// one's location, each with refcount 1: counts are not maintained (05 step
+/// 8), and v1 requires at least 1.
 fn sorted_new_entries(entries: &[super::NewChunkEntry]) -> Vec<FullCacheEntry> {
     let mut v: Vec<FullCacheEntry> = entries
         .iter()
         .map(|e| FullCacheEntry {
             chunk_id: e.chunk_id,
-            refcount: e.refcount,
+            refcount: 1,
             stored_size: e.stored_size,
             pack_id: e.pack_id,
             pack_offset: e.pack_offset,
         })
         .collect();
+    // Stable: the first location of a chunk stays first.
     v.sort_by(|a, b| a.chunk_id.as_bytes().cmp(b.chunk_id.as_bytes()));
-    v.dedup_by(|later, kept| {
-        let same = later.chunk_id == kept.chunk_id;
-        if same {
-            kept.refcount = kept.refcount.saturating_add(later.refcount);
-        }
-        same
-    });
+    v.dedup_by(|later, kept| later.chunk_id == kept.chunk_id);
     v
 }
 
@@ -876,10 +872,14 @@ fn sorted_new_entries(entries: &[super::NewChunkEntry]) -> Vec<FullCacheEntry> {
 /// One merge-walk over four sorted inputs: `prev`, the positional bumps (in
 /// the session's table order, which is chunk-ID order), the keyed bumps, and
 /// the new entries. No map of bumps is built, so `prev` may be a later
-/// state than the one the session started from:
+/// state than the one the session started from. Refcounts are not
+/// persisted (05 step 8): the bumps are the session's reused set, and they
+/// are only checked. The segment holds new entries only:
 ///
 /// - a new entry already in `prev` (another client committed the chunk
-///   first) becomes a refcount bump,
+///   first) writes nothing: the existing entry stays, and this session's
+///   copy of the bytes is dead,
+/// - every other new entry is written with refcount 1,
 /// - a bump whose chunk is in neither `prev` nor the new entries is
 ///   [`VykarError::StaleChunksDuringCommit`].
 ///
@@ -945,14 +945,9 @@ fn merge_walk(
 ) -> Result<Option<(Diff, TempPath)>> {
     use std::cmp::Ordering;
 
-    let add_refs = |base: u32, add: u64| {
-        u32::try_from(u64::from(base) + add).map_err(|_| invalid("refcount exceeds u32"))
-    };
-
     let mut bumps = bumps.peekable();
     let mut last_bump: Option<ChunkId> = None;
     let mut last_old: Option<ChunkId> = None;
-    let mut deltas = Vec::new();
     let mut new_entries = Vec::new();
     let mut writer = FullCacheWriter::new_beside(target)?;
     let prev_count = prev.entry_count() as usize;
@@ -977,38 +972,31 @@ fn merge_walk(
         };
 
         // Bumps arrive in key order, so one below `key` targets a chunk in
-        // neither input.
-        let bump = match bumps.peek() {
+        // neither input. A matching bump is only consumed: reuse is checked,
+        // not counted.
+        match bumps.peek() {
             Some(&(id, _)) if last_bump.is_some_and(|l| l.as_bytes() >= id.as_bytes()) => {
                 return Ok(None);
             }
-            Some(&(id, count)) => match id.as_bytes().cmp(key.as_bytes()) {
+            Some(&(id, _)) => match id.as_bytes().cmp(key.as_bytes()) {
                 Ordering::Less => return Err(VykarError::StaleChunksDuringCommit),
                 Ordering::Equal => {
                     last_bump = Some(id);
                     bumps.next();
-                    count
                 }
-                Ordering::Greater => 0,
+                Ordering::Greater => {}
             },
-            None => 0,
-        };
+            None => {}
+        }
 
         match step {
-            MergeStep::Old(mut entry, same_new) => {
+            MergeStep::Old(entry, same_new) => {
                 if last_old.is_some_and(|l| l.as_bytes() >= entry.chunk_id.as_bytes()) {
                     return Err(invalid("predecessor not strictly sorted"));
                 }
                 last_old = Some(entry.chunk_id);
-                // A new entry another client committed first is a bump.
-                let add = bump + same_new.map_or(0, |n| u64::from(n.refcount));
-                if add > 0 {
-                    entry.refcount = add_refs(entry.refcount, add)?;
-                    deltas.push(RefcountDelta {
-                        position: pos as u32,
-                        delta: add as i64,
-                    });
-                }
+                // A new entry another client committed first: the existing
+                // entry stays as it is.
                 writer.push(&entry)?;
                 pos += 1;
                 if same_new.is_some() {
@@ -1016,12 +1004,8 @@ fn merge_walk(
                 }
             }
             MergeStep::New(new) => {
-                let mut entry = *new;
-                entry.refcount = add_refs(entry.refcount, bump)?;
-                if entry.refcount > 0 {
-                    writer.push(&entry)?;
-                    new_entries.push(entry);
-                }
+                writer.push(new)?;
+                new_entries.push(*new);
                 next_new += 1;
             }
         }
@@ -1038,7 +1022,7 @@ fn merge_walk(
         segment: Segment {
             prev_state_hash: prev.state_hash(),
             prev_entries: u64::from(prev.entry_count()),
-            deltas,
+            deltas: Vec::new(),
             relocations: Vec::new(),
             new_entries,
         },

@@ -89,8 +89,19 @@ pub(crate) fn run_info(config: &VykarConfig, label: Option<&str>) -> CliResult<(
         &mut t2,
         theme,
         "Referenced",
-        format_bytes(stats.referenced_stored_size),
+        stats
+            .referenced_stored_size
+            .map_or_else(|| "-".to_string(), format_bytes),
     );
+    let last_sweep = stats
+        .last_sweep_time
+        .map(|t| {
+            t.with_timezone(&Local)
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string()
+        })
+        .unwrap_or_else(|| "never".to_string());
+    add_kv_row(&mut t2, theme, "Last sweep", last_sweep);
     add_kv_row(&mut t2, theme, "Unique chunks", stats.unique_chunks);
     println!("{t2}");
     Ok(())

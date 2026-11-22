@@ -32,6 +32,13 @@ pub(crate) fn run_compact(
             stats.blobs_live,
             format_bytes(stats.space_freed),
         );
+        if stats.chunks_unreferenced > 0 {
+            println!(
+                "  {} unreferenced chunks ({}) would be removed from the index",
+                stats.chunks_unreferenced,
+                format_bytes(stats.bytes_unreferenced),
+            );
+        }
         print_compact_warnings(&stats);
     } else {
         print_compact_summary(&stats);
@@ -88,6 +95,13 @@ pub(crate) fn print_compact_summary(stats: &commands::compact::CompactStats) {
         stats.packs_deleted_empty,
         format_bytes(stats.space_freed),
     );
+    if stats.chunks_unreferenced > 0 {
+        println!(
+            "  {} unreferenced chunks ({}) removed from the index",
+            stats.chunks_unreferenced,
+            format_bytes(stats.bytes_unreferenced),
+        );
+    }
     print_compact_warnings(stats);
 }
 

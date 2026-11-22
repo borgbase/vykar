@@ -62,7 +62,7 @@ fn open(repo_dir: &Path, cache: &Path, opts: OpenOptions) -> Repository {
     Repository::open(Box::new(storage), None, Some(cache.to_path_buf()), opts).unwrap()
 }
 
-/// A v5 repository with the hard fold limit at `hard_segments` segments.
+/// A v6 repository with the hard fold limit at `hard_segments` segments.
 fn fixture(hard_segments: usize) -> Fixture {
     init_test_environment();
     let dir = tempfile::tempdir().unwrap();

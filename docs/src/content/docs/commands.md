@@ -46,10 +46,10 @@ See [Maintain the Repository](/maintenance).
 
 | Command | Description |
 |---------|-------------|
-| `vykar prune` | Prune snapshots according to retention policy |
-| `vykar compact` | Free space by repacking pack files after delete/prune |
+| `vykar prune` | Prune snapshots according to retention policy (the space is freed by the next `compact`) |
+| `vykar compact` | Free the space delete and prune leave: mark the live snapshots, sweep unreferenced index entries, repack and delete packs |
 | `vykar check` | Verify repository integrity (`--verify-data` for full content verification, `--repair` to fix problems) |
-| `vykar snapshot delete` | Delete one or more snapshots |
+| `vykar snapshot delete` | Delete one or more snapshots (the space is freed by the next `compact`) |
 | `vykar delete` | Delete an entire repository permanently |
 | `vykar break-lock` | Remove stale repository locks left by interrupted processes when lock conflicts block operations |
 | `vykar upgrade` | Upgrade a repository to the current format in place (one-way; see [Upgrade the repository format](/maintenance#upgrade-the-repository-format)) |

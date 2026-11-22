@@ -73,8 +73,6 @@ fn prune_dry_run_reports_without_mutating_state() {
 
     assert_eq!(stats.kept, 1);
     assert_eq!(stats.pruned, 1);
-    assert_eq!(stats.chunks_deleted, 0);
-    assert_eq!(stats.space_freed, 0);
     assert_eq!(list_entries.len(), 2);
 
     let after = open_local_repo(&repo_dir);
@@ -236,12 +234,11 @@ fn prune_errors_without_retention_rules_when_sources_empty() {
     );
 }
 
-/// When the snapshot blobs have been deleted from storage (commit point
-/// reached) but Phase 3 refcount cleanup fails, `prune::run` must return
-/// `Ok((stats, _))` with `stats.warnings` populated rather than propagating
-/// an error that would falsely suggest the prune failed.
+/// Prune reads no pack and writes no index (PD-1): with every pack gone it
+/// still deletes the pruned snapshot object and warns about nothing; no
+/// object under `index.h/` or `index.d/` changes.
 #[test]
-fn prune_phase3_refcount_failure_returns_warning_not_error() {
+fn prune_reads_no_pack_and_writes_no_index() {
     let tmp = tempfile::tempdir().unwrap();
     let repo_dir = tmp.path().join("repo");
     let source_dir = tmp.path().join("source");
@@ -259,8 +256,6 @@ fn prune_phase3_refcount_failure_returns_warning_not_error() {
     std::thread::sleep(Duration::from_millis(2));
     backup_single_source(&config, &source_dir, "src-a", "snap-a-2");
 
-    // Break Phase 3 by removing every pack file. Phase 2 only deletes
-    // `snapshots/<id>` and still succeeds.
     let packs_dir = repo_dir.join("packs");
     for shard in std::fs::read_dir(&packs_dir).unwrap() {
         let shard = shard.unwrap().path();
@@ -271,8 +266,16 @@ fn prune_phase3_refcount_failure_returns_warning_not_error() {
             std::fs::remove_file(entry.unwrap().path()).unwrap();
         }
     }
-    // The listing is cached locally since the backup; only storage fails.
     clear_tree_cache(&repo_dir);
+    let listing = |dir: &str| {
+        let mut names: Vec<String> = std::fs::read_dir(repo_dir.join(dir))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    };
+    let index_before = (listing("index.h"), listing("index.d"));
 
     let sources = vec![source_entry(&source_dir, "src-a")];
     let (stats, _) = commands::prune::run(
@@ -284,14 +287,9 @@ fn prune_phase3_refcount_failure_returns_warning_not_error() {
         &[],
         &CancelToken::new(),
     )
-    .expect("prune must not fail after commit point — Phase 3 errors become warnings");
-
-    // One snapshot was pruned (blob deleted) but its Phase 3 cleanup failed.
+    .unwrap();
     assert_eq!(stats.pruned, 1);
-    assert!(!stats.warnings.is_empty(), "expected a Phase 3 warning");
-    let combined = stats.warnings.join("\n");
-    assert!(
-        combined.contains("vykar check --repair"),
-        "warning should point operators at the recovery tool: {combined}"
-    );
+    assert!(stats.warnings.is_empty(), "{:?}", stats.warnings);
+    assert_eq!((listing("index.h"), listing("index.d")), index_before);
+    assert_eq!(listing("snapshots").len(), 1);
 }

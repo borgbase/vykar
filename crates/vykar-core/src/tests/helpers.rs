@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::commands;
 use crate::compress::Compression;
@@ -85,8 +85,8 @@ pub(crate) fn downgrade_to_legacy(
     )
     .unwrap();
     let legacy = match repo.format() {
-        RepoFormat::V4 => RepoFormat::V2,
-        RepoFormat::V5 => RepoFormat::V3,
+        RepoFormat::V7 => RepoFormat::V2,
+        RepoFormat::V6 => RepoFormat::V3,
         other => panic!("not a segmented format: {other:?}"),
     };
     let blob = legacy_index_blob(
@@ -100,6 +100,7 @@ pub(crate) fn downgrade_to_legacy(
     std::fs::write(repo_dir.join("index"), blob).unwrap();
     std::fs::write(repo_dir.join("index.gen"), GENERATION.to_le_bytes()).unwrap();
     std::fs::remove_dir_all(repo_dir.join("index.d")).unwrap();
+    std::fs::remove_dir_all(repo_dir.join("index.h")).unwrap();
     let mut config: RepoConfig =
         rmp_serde::from_slice(&std::fs::read(repo_dir.join("config")).unwrap()).unwrap();
     config.version = legacy.version();
@@ -404,9 +405,44 @@ pub(crate) struct FaultyPut {
     pub ops: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
 }
 
-/// A PUT of the segmented index head.
+/// A PUT of an index head.
 pub(crate) fn is_head_put(key: &str, data: &[u8]) -> bool {
-    key == "index" && data.first() == Some(&(crate::repo::format::ObjectType::IndexHead as u8))
+    key.starts_with(crate::repo::index_store::HEAD_PREFIX)
+        && data.first() == Some(&(crate::repo::format::ObjectType::IndexHead as u8))
+}
+
+/// The file of the latest index head of the local repository at `repo_dir`.
+pub(crate) fn latest_head_path(repo_dir: &Path) -> PathBuf {
+    std::fs::read_dir(repo_dir.join("index.h"))
+        .unwrap()
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().into_string().ok()?;
+            let generation = vykar_protocol::head_generation(&format!("index.h/{name}"))?;
+            Some((generation, e.path()))
+        })
+        .max_by_key(|(g, _)| *g)
+        .map(|(_, p)| p)
+        .expect("an index head")
+}
+
+/// Delete every index head of the local repository at `repo_dir`.
+pub(crate) fn remove_index_heads(repo_dir: &Path) {
+    for entry in std::fs::read_dir(repo_dir.join("index.h"))
+        .unwrap()
+        .flatten()
+    {
+        std::fs::remove_file(entry.path()).unwrap();
+    }
+}
+
+/// The key of the latest index head (`index.h/<gen>`).
+pub(crate) fn latest_head_key(storage: &dyn vykar_storage::StorageBackend) -> String {
+    let generation = *crate::repo::index_store::list_head_generations(storage)
+        .unwrap()
+        .last()
+        .expect("an index head");
+    crate::repo::index_store::head_key(generation)
 }
 
 /// A PUT of an index base object.

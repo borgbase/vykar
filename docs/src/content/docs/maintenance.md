@@ -6,7 +6,7 @@ Running `vykar` with no subcommand, the [daemon](/daemon), and the desktop GUI a
 
 ## Prune old snapshots
 
-Apply the [retention policy](/configuration#retention) defined in your configuration to remove expired snapshots. Optionally `compact` the repository after pruning. With `--compact`, the prune [hooks](/configuration#hooks) run around prune and the compact hooks then run around compact, as two separate runs; if prune fails or is skipped, compact does not run.
+Apply the [retention policy](/configuration#retention) defined in your configuration to remove expired snapshots. Prune only deletes the snapshot objects; the space their data uses is reclaimed by the next `compact`. Optionally `compact` the repository after pruning. With `--compact`, the prune [hooks](/configuration#hooks) run around prune and the compact hooks then run around compact, as two separate runs; if prune fails or is skipped, compact does not run.
 
 ```bash
 # Preview which snapshots would be kept and pruned, with reasons
@@ -18,7 +18,9 @@ vykar prune --compact
 
 ## Compact (reclaim space)
 
-After `delete` or `prune`, blob data remains in pack files. Run `compact` to rewrite packs and reclaim disk space.
+`delete` and `prune` free no space: they only delete snapshot objects. `compact` reclaims it. On every run it first marks every live snapshot and removes the index entries none of them references (the sweep), then rewrites and deletes packs.
+
+Compact fails closed: when a snapshot object cannot be read or decoded, an object under `snapshots/` is not a snapshot, or a listing chunk or a data reference is missing from the index, it refuses with "compact refused: the live snapshots could not be marked, nothing was changed". Every compact refuses until `vykar check --repair` removes the object. A snapshot written by a newer vykar also makes compact refuse, and repair deliberately does not remove it: upgrade vykar instead. Compact also refuses when no snapshot is listed while the index still holds chunks (it does not sweep a repository to empty; `vykar delete` removes a repository).
 
 ```bash
 # Preview what would be repacked
@@ -32,8 +34,8 @@ vykar compact --report-unreferenced
 ```
 
 `--report-unreferenced` reads every snapshot and prints how many index entries
-no snapshot references, their size, the packs that hold them, and how many
-stored refcounts differ from the references it counted. It takes the
+no snapshot references (what the next compact sweeps), their size and the packs
+that hold them. It takes the
 maintenance lock, so it refuses while backups run, and fails rather than
 reporting anything when a snapshot or a listing chunk cannot be read.
 
@@ -53,7 +55,7 @@ How much the scheduled cycle checks is set by the [`check`](/configuration#check
 
 `vykar check --repair` plans and applies fixes for the problems `check` detects:
 removing corrupt or dangling snapshots, dropping index entries for missing packs,
-and (always) rebuilding chunk refcounts from the surviving snapshots.
+and (always) dropping index entries no surviving snapshot references.
 
 ```bash
 # Preview the repair plan without changing anything
@@ -88,16 +90,13 @@ the snapshots that need it are removed.
 `check --verify-data` also checks pack trailers; a damaged trailer is repaired
 by writing a pack map for its pack, which removes nothing.
 
-The refcount rebuild also reclaims the space leak left by an **interrupted backup**.
 If a backup crashes after its index was committed but before its snapshot was
-written, the index keeps orphan chunk entries (and inflated refcounts) that no
-snapshot references. `compact` alone will not free these — it treats any in-index
-chunk as live. `vykar compact --report-unreferenced` counts them.
-`vykar check --repair` recomputes refcounts from the surviving
-snapshots and drops the orphan entries; a follow-up `vykar compact` then reclaims
-the disk space.
+written, the index keeps orphan chunk entries that no snapshot references; the
+next `compact` sweeps them and reclaims the space.
 
 ## Delete a snapshot
+
+Deleting a snapshot only deletes its snapshot object; run `compact` to reclaim its space.
 
 ```bash
 # Delete a specific snapshot by ID
@@ -132,7 +131,7 @@ vykar break-lock --sessions
 
 ## Upgrade the repository format
 
-Repositories created before 0.25 (format v2 or v3) store the chunk index as one object, which those releases rewrote on every backup, prune and compact. On a large repository that was hundreds of megabytes per write. This vykar opens them only to upgrade them: every other command refuses and names `vykar upgrade` (`key export`/`key import`, `delete-repo` and `break-lock` still work). `vykar upgrade` converts the repository in place to the segmented index (v2 → v4, v3 → v5), after which each write uploads only what changed. Chunk and pack hashes stay the same, so nothing is re-uploaded except the index itself, once.
+Repositories created before 0.25 (format v2 or v3) store the chunk index as one object, which those releases rewrote on every backup, prune and compact. On a large repository that was hundreds of megabytes per write. This vykar opens them only to upgrade them: every other command refuses and names `vykar upgrade` (`key export`/`key import`, `delete-repo` and `break-lock` still work). `vykar upgrade` converts the repository in place to the segmented index (v2 → v7, v3 → v6), after which each write uploads only what changed. Chunk and pack hashes stay the same, so nothing is re-uploaded except the index itself, once.
 
 ```bash
 vykar upgrade -R <repo>          # asks for confirmation

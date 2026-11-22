@@ -599,8 +599,15 @@ fn check_reads_tree_chunks_from_storage() {
     assert!(host.cached().is_empty());
 }
 
+fn compact(config: &crate::config::VykarConfig, pass: Option<&str>) {
+    commands::compact::run(config, pass, 10.0, None, false, &CancelToken::new()).unwrap();
+}
+
+/// CP-5: prune keeps the cache (it reads nothing); the compact after it
+/// drops the tree chunks only the pruned snapshot used, reading the live
+/// listings from the cache.
 #[test]
-fn prune_reads_the_removed_listing_from_the_cache_and_drops_its_unique_chunks() {
+fn compact_after_prune_drops_the_pruned_snapshots_unique_tree_chunks() {
     for encrypted in [false, true] {
         let host = Host::new(encrypted);
         for name in ["s1", "s2", "s3"] {
@@ -611,6 +618,7 @@ fn prune_reads_the_removed_listing_from_the_cache_and_drops_its_unique_chunks() 
         let unique: Vec<ChunkId> = p1.iter().filter(|id| !live.contains(id)).copied().collect();
         assert!(!unique.is_empty(), "s1 must have tree chunks of its own");
 
+        let before = host.cached();
         let (mut repo, reads) = host.open();
         reads.lock().unwrap().clear();
         let (stats, _) = commands::prune::run_on_repo(
@@ -625,9 +633,11 @@ fn prune_reads_the_removed_listing_from_the_cache_and_drops_its_unique_chunks() 
         .unwrap();
         assert_eq!(stats.pruned, 1, "encrypted={encrypted}");
         assert!(stats.warnings.is_empty(), "{:?}", stats.warnings);
-        // The removed listing came from the cache: no pack was read.
         assert_eq!(pack_reads(&reads), 0, "encrypted={encrypted}");
+        drop(repo);
+        assert_eq!(host.cached(), before, "prune keeps the cache");
 
+        compact(&host.config, host.pass);
         let cached = host.cached();
         assert!(
             unique.iter().all(|id| !cached.contains(id)),
@@ -665,20 +675,23 @@ fn prune_with_nothing_to_prune_keeps_the_cache() {
 }
 
 #[test]
-fn delete_drops_unreferenced_tree_chunks() {
+fn delete_keeps_the_cache_and_compact_drops_unreferenced_tree_chunks() {
     let host = Host::new(false);
     host.backup("s1");
     host.backup("s2");
     let (p1, p2) = (host.item_ptrs("s1"), host.item_ptrs("s2"));
+    let before = host.cached();
 
     let (mut repo, reads) = host.open();
     reads.lock().unwrap().clear();
     let result =
         commands::delete::run_on_repo(&mut repo, &["s1"], false, &CancelToken::new()).unwrap();
     assert!(result.warnings.is_empty(), "{:?}", result.warnings);
-    assert_eq!(pack_reads(&reads), 0, "the listing came from the cache");
+    assert_eq!(pack_reads(&reads), 0, "delete reads no pack");
     drop(repo);
+    assert_eq!(host.cached(), before, "delete keeps the cache");
 
+    compact(&host.config, host.pass);
     let cached = host.cached();
     let live = set([&p2]);
     assert!(
@@ -709,8 +722,10 @@ fn delete_dry_run_keeps_the_cache() {
     assert_eq!(host.cached(), before);
 }
 
+/// A backup drops nothing from the cache, even after another host pruned
+/// and compacted; this host's next compact does.
 #[test]
-fn backup_drops_chunks_another_host_pruned() {
+fn only_compact_drops_chunks_another_host_pruned() {
     let host = Host::new(false);
     host.backup("s1");
     host.backup("s2");
@@ -733,17 +748,29 @@ fn backup_drops_chunks_another_host_pruned() {
     .unwrap();
     assert_eq!(stats.pruned, 1);
     drop(other);
+    let mut other_config = host.config.clone();
+    other_config.cache_dir = Some(
+        host.tmp
+            .path()
+            .join("other-cache")
+            .to_string_lossy()
+            .into_owned(),
+    );
+    compact(&other_config, host.pass);
     assert!(p1.iter().all(|id| host.cached().contains(id)));
 
     host.backup("s3");
     let live = set([&host.item_ptrs("s2"), &host.item_ptrs("s3")]);
-    let cached = host.cached();
     let unique: Vec<&ChunkId> = p1.iter().filter(|id| !live.contains(id)).collect();
     assert!(!unique.is_empty());
     assert!(
-        unique.iter().all(|id| !cached.contains(id)),
-        "backup dropped s1's chunks"
+        unique.iter().all(|id| host.cached().contains(id)),
+        "a backup drops nothing"
     );
+
+    compact(&host.config, host.pass);
+    let cached = host.cached();
+    assert!(unique.iter().all(|id| !cached.contains(id)));
     assert!(live.is_subset(&cached));
 }
 

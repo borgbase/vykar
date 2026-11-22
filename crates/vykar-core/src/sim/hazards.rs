@@ -6,12 +6,14 @@
 //!
 //! A hazard's test asserts that it still reproduces. When a fix lands, the
 //! scenario reports `NotReproduced` and the entry moves from `KNOWN_HAZARDS`
-//! to `REGRESSIONS`, where the same scenario must then hold.
+//! to `REGRESSIONS`, where the same scenario must then hold. 05 step 8 moved
+//! H5 (the mark refuses) and H4-segment (index garbage is collected by age)
+//! there.
 
 use std::collections::BTreeSet;
 
 use super::checker::{Invariant, Report, ViolationKind, head_object_keys};
-use super::fault::{ClientId, FaultAction, FaultRule};
+use super::fault::{ClientId, FaultAction, FaultRule, KeyMatch, OpMatch};
 use super::history::{AllowedError, ErrorClass};
 use super::interleavings;
 use super::runner::{Sim, SourceTree};
@@ -57,12 +59,6 @@ pub const KNOWN_HAZARDS: &[KnownHazard] = &[
         run: h3_late_head_put,
     },
     KnownHazard {
-        id: "H5",
-        summary: "after a lost update, a legitimate compact deletes the unindexed packs",
-        fixed_by: "05-index-gc-format.md (mark before every deletion)",
-        run: h5_compact_after_lost_update,
-    },
-    KnownHazard {
         id: "H5-repair",
         summary: "check --repair between H3 and compact removes the snapshot \
                   instead of re-indexing it",
@@ -72,8 +68,9 @@ pub const KNOWN_HAZARDS: &[KnownHazard] = &[
     KnownHazard {
         id: "H3-compact",
         summary: "head PUT times out, a compact runs, then the stale head lands \
-                  and names objects compact deleted",
-        fixed_by: "04-commit-protocol.md (conditional-create commit point)",
+                  over compact's head and names the packs compact deleted as orphans",
+        fixed_by: "04-commit-protocol.md step 5 (orphan packs younger than T_pack are \
+                   kept) and step 8 (create-if-absent heads)",
         run: h3_compact_then_late_head,
     },
     KnownHazard {
@@ -110,17 +107,22 @@ pub const KNOWN_HAZARDS: &[KnownHazard] = &[
                    step 8 (create-if-absent heads)",
         run: interleavings::h4_compact_deletes_after_lost_lock,
     },
-    KnownHazard {
-        id: "H4-segment",
-        summary: "a compact whose lock was reaped deletes a concurrent writer's segment \
-                  as unreferenced",
-        fixed_by: "04-commit-protocol.md step 3 (fence before deletes, which must cover \
-                   compact's index-upkeep collect_garbage)",
-        run: interleavings::h4_segment_deleted,
-    },
 ];
 
-pub const REGRESSIONS: &[Regression] = &[];
+pub const REGRESSIONS: &[Regression] = &[
+    Regression {
+        id: "H5",
+        summary: "after a lost update, compact refuses (the mark fails) and deletes \
+                  none of the unindexed packs",
+        run: h5_regression,
+    },
+    Regression {
+        id: "H4-segment",
+        summary: "compact upkeep no longer deletes a concurrent writer's fresh segment \
+                  (age-gated GC)",
+        run: interleavings::h4_segment_regression,
+    },
+];
 
 /// Panics unless `id` is a known hazard that reproduces.
 pub fn assert_reproduces(id: &str) {
@@ -185,23 +187,40 @@ pub(super) fn broken(reason: impl Into<String>) -> HazardOutcome {
     }
 }
 
-/// `a` backs up `a1` with its head `index` PUT delayed, so the commit
-/// fails after `a` stored its segment and released the lock.
+/// The highest `index.h/<gen>` key in the store.
+pub(super) fn latest_head_key(sim: &Sim) -> Option<String> {
+    sim.store()
+        .keys("index.h/")
+        .into_iter()
+        .filter_map(|k| Some((vykar_protocol::head_generation(&k)?, k)))
+        .max_by_key(|(g, _)| *g)
+        .map(|(_, k)| k)
+}
+
+/// `a` backs up `a1` with its head PUT (under `index.h/`) delayed, so the
+/// commit fails after `a` stored its segment and released the lock.
 fn park_a_head(sim: &mut Sim, a: ClientId) -> Result<(), String> {
-    sim.fault(FaultRule::put("index", FaultAction::Delay).client(a));
+    sim.fault(
+        FaultRule::new(
+            OpMatch::AnyWrite,
+            KeyMatch::Prefix("index.h/".into()),
+            FaultAction::Delay,
+        )
+        .client(a),
+    );
     let r = sim.backup(a, "a1", &SourceTree::seeded("a1", 3, FILE_SIZE));
     if r.error_class() != Some(&ErrorClass::Allowed(AllowedError::Injected)) {
         return Err(format!(
             "a1 should fail with the injected fault, got {:?}: {}\n\
-             If the commit point no longer PUTs `index`, retarget the fault \
-             rule to the new commit key before reading anything into this \
-             outcome.",
+             If the commit point no longer PUTs a head under `index.h/`, \
+             retarget the fault rule to the new commit key before reading \
+             anything into this outcome.",
             r.outcome,
             r.detail()
         ));
     }
     let parked = sim.store().parked();
-    if parked.len() != 1 || parked[0].key != "index" || parked[0].client != a {
+    if parked.len() != 1 || !parked[0].key.starts_with("index.h/") || parked[0].client != a {
         return Err(format!("expected a's head PUT parked, got {parked:?}"));
     }
     let at = parked[0].issued_at_step;
@@ -235,7 +254,7 @@ fn land(sim: &mut Sim, late: LateHead) {
 /// H3 up to and including the late landing:
 ///
 /// 1. `c` backs up `c0` (the control snapshot).
-/// 2. `a`'s write of the head `index` is delayed, so `a1`'s commit fails
+/// 2. `a`'s write of its head under `index.h/` is delayed, so `a1`'s commit fails
 ///    after its segment is stored and the lock is released.
 /// 3. `b` backs up `b1` and commits on top of the old head.
 /// 4. The repository is consistent; then `a`'s head PUT lands.
@@ -338,13 +357,9 @@ pub fn h3_with(late: LateHead) -> HazardOutcome {
             "IndexIntegrity violated, expected to hold:\n{report}"
         ));
     }
-    if !report.not_evaluated_for(Invariant::NoRefcountDeflation, "b1") {
-        return broken(format!(
-            "invariant 5 should be not evaluated for b1 (its tree chunks are \
-             unindexed):\n{report}"
-        ));
-    }
-    let writer = sim.store().object("index").map(|o| o.writer);
+    let writer = latest_head_key(&sim)
+        .and_then(|k| sim.store().object(&k))
+        .map(|o| o.writer);
     if writer != Some(a) {
         return broken(format!("head last written by {writer:?}, expected a"));
     }
@@ -417,9 +432,55 @@ fn lost_update(sim: &Sim) -> Result<(), HazardOutcome> {
     Ok(())
 }
 
-/// H5: after H3, a legitimate compact deletes `b1`'s packs as orphans.
-pub fn h5_compact_after_lost_update() -> HazardOutcome {
-    h5_with(LateHead::AfterB)
+/// H5 as a regression: after H3, compact by `c` must refuse (the mark finds
+/// `b1`'s tree chunks missing from the index) and delete none of `b`'s
+/// packs. The report holds the controls (`c0`, invariants 2, 3 and 8), a
+/// `DisallowedError` unless the compact ended `Allowed(MarkRefused)`, and
+/// `PackAbsent` for every pack of `b` that is gone. `b1`'s invariant-1
+/// damage from H3 is deliberately not part of it.
+pub fn h5_regression() -> Report {
+    let mut out = Report::default();
+    let (mut sim, _, b, c) = match h3_setup(LateHead::AfterB) {
+        Ok(s) => s,
+        Err(e) => {
+            out.add(ViolationKind::DisallowedError, "setup", e);
+            return out;
+        }
+    };
+    let b_packs = sim.store().keys_written_by(b, "packs/");
+    let run = sim.compact(c);
+    let report = sim.check_invariants(Invariant::STEP1);
+    for v in report.violations {
+        let control = v.subject == "c0"
+            || matches!(
+                v.invariant,
+                Invariant::AcknowledgedCommitsDurable
+                    | Invariant::NoSilentRemoval
+                    | Invariant::AllowedErrors
+            );
+        if control {
+            out.add(v.kind, v.subject, v.detail);
+        }
+    }
+    if run.error_class() != Some(&ErrorClass::Allowed(AllowedError::MarkRefused)) {
+        out.add(
+            ViolationKind::DisallowedError,
+            format!("run {} compact", run.index),
+            format!(
+                "compact should refuse with the mark error: {:?}",
+                run.outcome
+            ),
+        );
+    }
+    if b_packs.is_empty() {
+        out.add(ViolationKind::PackAbsent, "b", "b wrote no packs");
+    }
+    for k in b_packs {
+        if sim.store().object(&k).is_none() {
+            out.add(ViolationKind::PackAbsent, "b", format!("pack {k} gone"));
+        }
+    }
+    out
 }
 
 /// H5 on an H3 setup whose landing is set by `late`.
@@ -436,7 +497,8 @@ pub fn h5_with(late: LateHead) -> HazardOutcome {
         Err(e) => return broken(e),
     };
     let run = sim.compact(c);
-    if !run.is_ok() {
+    let refused = run.error_class() == Some(&ErrorClass::Allowed(AllowedError::MarkRefused));
+    if !run.is_ok() && !refused {
         return broken(format!("compact failed: {}", run.detail()));
     }
     let report = sim.check_invariants(Invariant::STEP1);
@@ -461,7 +523,7 @@ pub fn h5_with(late: LateHead) -> HazardOutcome {
     );
     if b1_unindexed(&report) && gone.len() == b_packs.len() && by_compact {
         HazardOutcome::Reproduced { evidence }
-    } else if gone.is_empty() {
+    } else if refused && gone.is_empty() {
         HazardOutcome::NotReproduced { evidence }
     } else {
         different_damage(evidence)
@@ -549,12 +611,15 @@ pub fn h5_repair_with(late: LateHead) -> HazardOutcome {
 
 /// A's head PUT is parked, a compact runs alone, then the PUT lands.
 ///
-/// Observed on `f7181ea` plus this harness, three runs, all the same: the
-/// compact deletes a's two packs as orphans and a's unreferenced segment;
-/// the landed head names that segment. Invariant 4 is violated
-/// (`HeadObjectAbsent` for a's segment, `ChainUnloadable`), and with the
-/// chain unloadable invariants 1 and 5 cannot be evaluated for any
-/// snapshot, the control `c0` included.
+/// Since 05 step 8 compact writes a head of its own (the sweep record's)
+/// at the generation a's parked head names, and its index garbage
+/// collection is age-gated, so a's segment survives. The compact deletes
+/// a's packs as orphans; a's late head then overwrites compact's head and
+/// names those packs. Before 05 step 8 the landed head named a's segment,
+/// which compact had deleted: loud (every command refused until repair).
+/// Now the head is valid and names deleted packs: silent until `check` or
+/// a restore, and later backups can dedup against those entries. It needs
+/// a lost lock plus a late PUT; 04 step 8 (create-if-absent heads) fixes it.
 pub fn h3_compact_then_late_head() -> HazardOutcome {
     h3_compact_with(LateHead::AfterB)
 }
@@ -586,20 +651,24 @@ pub fn h3_compact_with(late: LateHead) -> HazardOutcome {
         land(&mut sim, late);
     }
     let report = sim.check_invariants(Invariant::STEP1);
-    let a_segments = sim.store().keys_written_by(a, "index.d/");
+    let a_packs = sim.store().keys_written_by(a, "packs/");
     let deleted = deleted_in_run(&sim, c, run.index);
-    let dangling: Vec<&String> = a_segments
+    let dangling: Vec<&String> = a_packs
         .iter()
-        .filter(|k| deleted.contains(*k) && report.has_kind(ViolationKind::HeadObjectAbsent, k))
+        .filter(|k| deleted.contains(*k) && report.has_kind(ViolationKind::IndexNamesAbsentPack, k))
         .collect();
+    let latest_by_a = latest_head_key(&sim)
+        .and_then(|k| sim.store().object(&k))
+        .is_some_and(|o| o.writer == a);
     let evidence = format!(
-        "compact: {}\nhead names a's segments deleted by compact: {dangling:?}\n{report}",
+        "compact: {}\nlatest head written by a: {latest_by_a}; the index names a's \
+         packs deleted by compact: {dangling:?}\n{report}",
         run.detail()
     );
     if let Err(e) = base_controls(&report) {
         return broken(e);
     }
-    if !dangling.is_empty() {
+    if latest_by_a && !dangling.is_empty() {
         HazardOutcome::Reproduced { evidence }
     } else if report.is_clean() {
         HazardOutcome::NotReproduced { evidence }

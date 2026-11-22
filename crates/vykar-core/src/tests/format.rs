@@ -89,11 +89,12 @@ fn object_type_from_u8_valid() {
     assert_eq!(ObjectType::from_u8(11).unwrap(), ObjectType::IndexSegment);
     assert_eq!(ObjectType::from_u8(12).unwrap(), ObjectType::PackTrailer);
     assert_eq!(ObjectType::from_u8(13).unwrap(), ObjectType::PackMap);
+    assert_eq!(ObjectType::from_u8(14).unwrap(), ObjectType::SweepRecord);
 }
 
 #[test]
 fn object_type_from_u8_invalid() {
-    assert!(ObjectType::from_u8(14).is_err());
+    assert!(ObjectType::from_u8(15).is_err());
     assert!(ObjectType::from_u8(255).is_err());
 }
 

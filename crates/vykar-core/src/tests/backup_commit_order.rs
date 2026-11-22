@@ -102,7 +102,9 @@ impl ObservingBackend {
     fn record_index_put(&self, key: &str, data: &[u8]) {
         use crate::repo::format::ObjectType;
         let tag = data.first().copied();
-        let event = if key == "index" && tag == Some(ObjectType::IndexHead as u8) {
+        let event = if key.starts_with(crate::repo::index_store::HEAD_PREFIX)
+            && tag == Some(ObjectType::IndexHead as u8)
+        {
             Event::HeadPut
         } else if key == "index.gen" {
             Event::IndexGenPut
@@ -448,7 +450,7 @@ fn assert_missing_pack_fails_commit_with(
     let packs_before = repo_keys(config, "packs/").len();
     let storage =
         crate::storage::backend_from_config(&config.repository.storage_config(1)).unwrap();
-    let index_before = storage.get("index").unwrap();
+    let index_before = latest_head(&*storage);
     let objects_before = repo_keys(config, "index.d/");
     let shared = Shared {
         delete_pack_at_lock: true,
@@ -467,7 +469,7 @@ fn assert_missing_pack_fails_commit_with(
     );
     assert!(repo_keys(config, "locks/").is_empty());
     assert_eq!(
-        storage.get("index").unwrap(),
+        latest_head(&*storage),
         index_before,
         "the head must not move"
     );
@@ -779,7 +781,7 @@ fn open_failure_deregisters_read_session() {
     assert!(session_markers(&config).is_empty());
 }
 
-/// A v5 commit writes one segment, then the head, then the snapshot, all
+/// A v6 commit writes one segment, then the head, then the snapshot, all
 /// under the commit lock, and never `index.gen`.
 #[test]
 fn segmented_commit_puts_segment_then_head_then_snapshot() {
@@ -903,7 +905,7 @@ fn fail_after_the_index_write(
 ) -> (Vec<String>, Refcounts) {
     let storage =
         crate::storage::backend_from_config(&config.repository.storage_config(1)).unwrap();
-    let index_before = storage.get("index").unwrap();
+    let index_before = latest_head(&*storage);
     let shared = Shared {
         fail_snapshot_put: true,
         ..Default::default()
@@ -921,7 +923,7 @@ fn fail_after_the_index_write(
     assert!(pos(Event::SegmentPut) < pos(Event::HeadPut), "{events:?}");
     assert!(pos(Event::HeadPut) < pos(Event::SnapshotPut), "{events:?}");
 
-    assert_ne!(storage.get("index").unwrap(), index_before);
+    assert_ne!(latest_head(&*storage), index_before);
     let repo = crate::tests::helpers::open_local_repo(repo_dir);
     let head = repo.index_head().unwrap();
     assert_eq!(head.segments.len(), 1, "{head:?}");
@@ -946,9 +948,16 @@ fn snapshot_put_failure_after_the_index_write_keeps_its_packs() {
 
     let (dir, config, src) = setup();
     let repo_dir = dir.path().join("repo");
-    let (packs, r1) = fail_after_the_index_write(&config, &src, &repo_dir);
+    let (packs, _) = fail_after_the_index_write(&config, &src, &repo_dir);
 
-    compact(&config);
+    // No snapshot names the entries: compact refuses to sweep to empty.
+    let err = crate::commands::compact::run(&config, None, 0.0, None, false, &CancelToken::new())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.starts_with(crate::commands::compact::MARK_REFUSED),
+        "{err}"
+    );
     assert_eq!(repo_keys(&config, "packs/"), packs);
 
     let out = run_backup(&config, &src, &Shared::default()).unwrap();
@@ -956,10 +965,6 @@ fn snapshot_put_failure_after_the_index_write_keeps_its_packs() {
     assert_superset(&packs, &config);
     assert_eq!(repo_keys(&config, "snapshots/").len(), 1);
     assert_check_clean(&config);
-
-    let r2 = refcounts(&repo_dir);
-    let sum = |r: &Refcounts| -> u64 { r1.keys().map(|k| u64::from(r[k])).sum() };
-    assert!(sum(&r2) > sum(&r1), "refcounts not inflated: {r1:?} {r2:?}");
 
     let repair = |mode| {
         crate::commands::check::run_with_repair(
@@ -982,14 +987,8 @@ fn snapshot_put_failure_after_the_index_write_keeps_its_packs() {
     );
     repair(RepairMode::Apply);
 
-    let r3 = refcounts(&repo_dir);
-    let shared: Vec<_> = r1.keys().filter(|k| r3.contains_key(k)).collect();
-    assert!(!shared.is_empty());
-    for k in shared {
-        assert_eq!(r3[k], r1[k], "{k:?}");
-    }
-
     compact(&config);
+    assert_superset(&packs, &config);
     assert_check_clean(&config);
     assert_restores_snap(&config, &dir.path().join("restore"));
 }
@@ -1038,50 +1037,26 @@ fn cold_repo(config: &crate::config::VykarConfig, cache: &Path) -> crate::repo::
     .unwrap()
 }
 
-/// The index as a client with an empty cache dir at `cache` reads it.
-fn cold_index(config: &crate::config::VykarConfig, cache: &Path) -> crate::index::LiveIndex {
-    cold_repo(config, cache).chunk_index().clone()
-}
-
-fn sorted_entries(
-    index: &impl crate::testutil::EntryIter,
-) -> Vec<(
-    vykar_types::chunk_id::ChunkId,
-    crate::index::ChunkIndexEntry,
-)> {
-    index.entry_vec()
-}
-
 /// Another client commits the same chunks while this session runs: the
-/// commit catches up on the moved head and turns its new entries into bumps.
+/// commit catches up on the moved head and writes nothing for them (the
+/// existing entries stay; reuse is not counted). Here every chunk of the
+/// session was committed first, so the commit writes no index object and
+/// no head, and both snapshots restore.
 #[test]
-fn concurrent_commit_of_the_same_chunks_becomes_bumps() {
-    use crate::commands::check::RepairMode;
+fn concurrent_commit_of_the_same_chunks_writes_nothing_for_them() {
     use crate::index::head::IndexHead;
 
     let (dir, config, src) = setup();
-    let repo_dir = dir.path().join("repo");
     let other = other_client(dir.path(), &config);
 
-    type AtLockState = (Refcounts, Vec<vykar_types::chunk_id::ChunkId>, IndexHead);
-    let seen: Arc<Mutex<Option<AtLockState>>> = Arc::default();
+    let seen: Arc<Mutex<Option<IndexHead>>> = Arc::default();
     let hook = {
         let (seen, config, src) = (Arc::clone(&seen), config.clone(), src.clone());
         let cold = dir.path().join("cold-at-lock");
         move || {
             crate::tests::helpers::backup_single_source(&other, &src, "test", "other");
             let repo = cold_repo(&config, &cold);
-            let refcounts: Refcounts = repo
-                .chunk_index()
-                .iter()
-                .map(|(id, e)| (id, e.refcount))
-                .collect();
-            let ids = sorted_entries(repo.chunk_index())
-                .into_iter()
-                .map(|(id, _)| id)
-                .collect();
-            let head = repo.index_head().unwrap().clone();
-            *seen.lock().unwrap() = Some((refcounts, ids, head));
+            *seen.lock().unwrap() = Some(repo.index_head().unwrap().clone());
         }
     };
     let shared = Shared {
@@ -1089,162 +1064,149 @@ fn concurrent_commit_of_the_same_chunks_becomes_bumps() {
         ..Default::default()
     };
     run_backup(&config, &src, &shared).unwrap();
-    let (at_lock_refcounts, other_ids, head_at_lock) =
-        seen.lock().unwrap().take().expect("the hook ran");
+    let head_at_lock = seen.lock().unwrap().take().expect("the hook ran");
     assert_eq!(head_at_lock.segments.len(), 1, "{head_at_lock:?}");
 
-    // One more segment over the moved head, not a base.
     let repo = cold_repo(&config, &dir.path().join("cold-after"));
-    let head = repo.index_head().unwrap().clone();
-    assert_eq!(head.base, head_at_lock.base, "{head:?}");
-    assert_eq!(head.segments.len(), 2, "{head:?}");
-    assert_eq!(head.segments[0], head_at_lock.segments[0], "{head:?}");
-    let seg_ref = &head.segments[1];
-    let bytes = repo
-        .storage
-        .get(&crate::repo::index_store::object_key(&seg_ref.name))
-        .unwrap()
-        .unwrap();
-    let seg =
-        crate::repo::index_store::decode_segment(seg_ref, &bytes, repo.crypto.as_ref()).unwrap();
-    assert_eq!(seg.prev_entries, other_ids.len() as u64);
-    assert!(
-        seg.new_entries.iter().all(|e| other_ids
-            .binary_search_by_key(e.chunk_id.as_bytes(), |id| *id.as_bytes())
-            .is_err()),
-        "a chunk the other client committed was written as a new entry: {seg:?}"
-    );
+    assert_eq!(repo.index_head().unwrap(), &head_at_lock);
+    assert!(repo.chunk_index().iter().all(|(_, e)| e.refcount == 1));
     drop(repo);
-
-    // Repair recounts references; its result is the oracle for the bumps.
-    let refs = refcounts(&repo_dir);
-    let plan = crate::commands::check::run_with_repair(
-        &config,
-        None,
-        false,
-        RepairMode::Apply,
-        None,
-        &CancelToken::new(),
-    )
-    .unwrap()
-    .plan;
-    assert!(!plan.has_data_loss, "{:?}", plan.actions);
-    let repaired = refcounts(&repo_dir);
-    assert_eq!(refs, repaired, "the merge lost or doubled a refcount");
-    for (pos, id) in other_ids.iter().enumerate() {
-        let delta = seg
-            .deltas
+    let events = shared.events.lock().unwrap().clone();
+    assert!(
+        !events
             .iter()
-            .find(|d| d.position as usize == pos)
-            .map_or(0, |d| d.delta);
-        let ours = i64::from(repaired[id]) - i64::from(at_lock_refcounts[id]);
-        assert_eq!(delta, ours, "chunk {id}");
-    }
-    assert!(seg.deltas.iter().all(|d| d.delta > 0), "{seg:?}");
-    assert!(!seg.deltas.is_empty(), "{seg:?}");
+            .any(|e| matches!(e, Event::SegmentPut | Event::HeadPut)),
+        "{events:?}"
+    );
 
     assert_check_clean_verified(&config);
-    let warm = crate::tests::helpers::open_local_repo(&repo_dir);
-    assert_eq!(
-        sorted_entries(&cold_index(&config, &dir.path().join("cold-end"))),
-        sorted_entries(warm.chunk_index())
-    );
-    drop(warm);
     assert_restores(&config, "snap", &dir.path().join("restore-snap"));
     assert_restores(&config, "other", &dir.path().join("restore-other"));
 }
 
-/// The session was reaped (its marker aged out and maintenance deleted the
-/// snapshot it deduplicated against) while its marker probe was
-/// inconclusive, so the merge is the safety net: it finds bumps on chunks
-/// that are gone and fails the commit before any index write.
+/// The session was reaped (its marker aged out, and maintenance deleted the
+/// snapshot it deduplicated against and compact swept that snapshot's
+/// chunks) while its marker probe was inconclusive, so the merge is the
+/// safety net: it finds reused chunks that are gone and fails the commit
+/// before any index write. Also when the session only reuses chunks (a
+/// delta of bumps only still runs the check, BK-2/R4).
 #[test]
 fn chunks_deleted_during_the_session_fail_the_commit_as_stale() {
-    let (dir, config, src) = setup();
-    crate::tests::helpers::backup_single_source(&config, &src, "test", "s1");
-    // A new chunk, so the session uploads a pack and journals it.
-    fs::write(src.join("c.bin"), vec![0xc3u8; 32 * 1024]).unwrap();
-    let other = other_client(dir.path(), &config);
-
-    type AtLockState = (Option<Vec<u8>>, Vec<String>);
-    let seen: Arc<Mutex<Option<AtLockState>>> = Arc::default();
-    let hook = {
-        let (seen, config) = (Arc::clone(&seen), config.clone());
-        move || {
-            let storage =
-                crate::storage::backend_from_config(&config.repository.storage_config(1)).unwrap();
-            let markers: Vec<String> = storage
-                .list("sessions/")
-                .unwrap()
-                .into_iter()
-                .filter(|k| k.ends_with(".json"))
-                .collect();
-            assert_eq!(markers.len(), 1, "{markers:?}");
-            let key = &markers[0];
-            let mut entry: serde_json::Value =
-                serde_json::from_slice(&storage.get(key).unwrap().unwrap()).unwrap();
-            let old = (chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
-            entry["registered_at"] = old.clone().into();
-            entry["last_refresh"] = old.into();
-            storage
-                .put(key, &serde_json::to_vec(&entry).unwrap())
-                .unwrap();
-
-            crate::commands::delete::run(&other, None, &["s1"], false, &CancelToken::new())
-                .unwrap();
-            assert!(
-                !storage.exists(key).unwrap(),
-                "maintenance reaped the marker"
-            );
-
-            let head = storage.get("index").unwrap();
-            *seen.lock().unwrap() = Some((head, repo_keys(&config, "index.d/")));
+    for new_chunk in [true, false] {
+        let (dir, config, src) = setup();
+        // A snapshot that stays, so the sweep is not one to empty.
+        let src0 = dir.path().join("src0");
+        fs::create_dir_all(&src0).unwrap();
+        fs::write(src0.join("z.bin"), vec![0x77u8; 16 * 1024]).unwrap();
+        crate::tests::helpers::backup_single_source(&config, &src0, "test0", "s0");
+        crate::tests::helpers::backup_single_source(&config, &src, "test", "s1");
+        if new_chunk {
+            // A new chunk, so the session uploads a pack and journals it.
+            fs::write(src.join("c.bin"), vec![0xc3u8; 32 * 1024]).unwrap();
         }
-    };
-    let shared = Shared {
-        at_lock: at_lock(hook),
-        fail_marker_probe: true,
-        ..Default::default()
-    };
-    let err = run_backup(&config, &src, &shared).unwrap_err();
-    assert!(
-        matches!(err, VykarError::StaleChunksDuringCommit),
-        "expected StaleChunksDuringCommit, got: {err}"
-    );
-    assert!(
-        *shared.marker_probe_failures.lock().unwrap() > 0,
-        "the marker probe never ran"
-    );
-    let (head_at_lock, objects_at_lock) = seen.lock().unwrap().take().expect("the hook ran");
+        let other = other_client(dir.path(), &config);
 
-    let storage =
-        crate::storage::backend_from_config(&config.repository.storage_config(1)).unwrap();
-    assert_eq!(
-        storage.get("index").unwrap(),
-        head_at_lock,
-        "the head moved"
-    );
-    assert_eq!(repo_keys(&config, "index.d/"), objects_at_lock);
-    let events = shared.events.lock().unwrap().clone();
-    let lock = events.iter().position(|e| *e == Event::LockPut).unwrap();
-    assert!(
-        !events[lock..]
-            .iter()
-            .any(|e| matches!(e, Event::SegmentPut | Event::BasePut | Event::HeadPut)),
-        "{events:?}"
-    );
-    assert!(repo_keys(&config, "snapshots/").is_empty());
-    assert!(repo_keys(&config, "locks/").is_empty());
-    let (marker, journal) = session_keys(&config);
-    assert!(!marker, "the reaped marker stays gone");
-    // The cleanup that reaped the marker gives its journal one run of
-    // grace, and the failed commit keeps it for recovery.
-    assert!(journal, "the journal must survive for recovery");
+        type AtLockState = (Option<(String, Vec<u8>)>, Vec<String>);
+        let seen: Arc<Mutex<Option<AtLockState>>> = Arc::default();
+        let hook = {
+            let (seen, config) = (Arc::clone(&seen), config.clone());
+            move || {
+                let storage =
+                    crate::storage::backend_from_config(&config.repository.storage_config(1))
+                        .unwrap();
+                let markers: Vec<String> = storage
+                    .list("sessions/")
+                    .unwrap()
+                    .into_iter()
+                    .filter(|k| k.ends_with(".json"))
+                    .collect();
+                assert_eq!(markers.len(), 1, "{markers:?}");
+                let key = &markers[0];
+                let mut entry: serde_json::Value =
+                    serde_json::from_slice(&storage.get(key).unwrap().unwrap()).unwrap();
+                let old = (chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
+                entry["registered_at"] = old.clone().into();
+                entry["last_refresh"] = old.into();
+                storage
+                    .put(key, &serde_json::to_vec(&entry).unwrap())
+                    .unwrap();
 
-    run_backup(&config, &src, &Shared::default()).unwrap();
-    assert_check_clean(&config);
-    let dest = dir.path().join("restore");
-    assert_restores_snap(&config, &dest);
-    let c = find_file(&dest, "c.bin").expect("c.bin restored");
-    assert_eq!(fs::read(c).unwrap(), vec![0xc3u8; 32 * 1024]);
+                crate::commands::delete::run(&other, None, &["s1"], false, &CancelToken::new())
+                    .unwrap();
+                assert!(
+                    !storage.exists(key).unwrap(),
+                    "maintenance reaped the marker"
+                );
+                let swept = crate::commands::compact::run(
+                    &other,
+                    None,
+                    10.0,
+                    None,
+                    false,
+                    &CancelToken::new(),
+                )
+                .unwrap();
+                assert!(swept.chunks_unreferenced > 0, "{swept:?}");
+
+                let head = latest_head(&*storage);
+                *seen.lock().unwrap() = Some((head, repo_keys(&config, "index.d/")));
+            }
+        };
+        let shared = Shared {
+            at_lock: at_lock(hook),
+            fail_marker_probe: true,
+            ..Default::default()
+        };
+        let err = run_backup(&config, &src, &shared).unwrap_err();
+        assert!(
+            matches!(err, VykarError::StaleChunksDuringCommit),
+            "{new_chunk}: expected StaleChunksDuringCommit, got: {err}"
+        );
+        assert!(
+            *shared.marker_probe_failures.lock().unwrap() > 0,
+            "the marker probe never ran"
+        );
+        let (head_at_lock, objects_at_lock) = seen.lock().unwrap().take().expect("the hook ran");
+
+        let storage =
+            crate::storage::backend_from_config(&config.repository.storage_config(1)).unwrap();
+        assert_eq!(latest_head(&*storage), head_at_lock, "the head moved");
+        assert_eq!(repo_keys(&config, "index.d/"), objects_at_lock);
+        let events = shared.events.lock().unwrap().clone();
+        let lock = events.iter().position(|e| *e == Event::LockPut).unwrap();
+        assert!(
+            !events[lock..]
+                .iter()
+                .any(|e| matches!(e, Event::SegmentPut | Event::BasePut | Event::HeadPut)),
+            "{events:?}"
+        );
+        assert!(repo_keys(&config, "snapshots/").len() == 1, "only s0");
+        assert!(repo_keys(&config, "locks/").is_empty());
+        let (marker, journal) = session_keys(&config);
+        assert!(!marker, "the reaped marker stays gone");
+        if new_chunk {
+            // The cleanup that reaped the marker gives its journal one run
+            // of grace, and the failed commit keeps it for recovery.
+            assert!(journal, "the journal must survive for recovery");
+        }
+
+        run_backup(&config, &src, &Shared::default()).unwrap();
+        assert_check_clean(&config);
+        let dest = dir.path().join("restore");
+        assert_restores_snap(&config, &dest);
+        if new_chunk {
+            let c = find_file(&dest, "c.bin").expect("c.bin restored");
+            assert_eq!(fs::read(c).unwrap(), vec![0xc3u8; 32 * 1024]);
+        }
+    }
+}
+
+/// The latest head's key and bytes.
+fn latest_head(storage: &dyn StorageBackend) -> Option<(String, Vec<u8>)> {
+    let generation = *crate::repo::index_store::list_head_generations(storage)
+        .unwrap()
+        .last()?;
+    let key = crate::repo::index_store::head_key(generation);
+    let bytes = storage.get(&key).unwrap()?;
+    Some((key, bytes))
 }

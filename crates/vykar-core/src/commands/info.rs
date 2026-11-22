@@ -16,15 +16,21 @@ pub struct InfoStats {
     pub raw_size: u64,
     pub compressed_size: u64,
     pub deduplicated_size: u64,
+    /// Stored bytes of every index entry, including entries no snapshot
+    /// references any more until the next compact sweeps them.
     pub unique_stored_size: u64,
-    pub referenced_stored_size: u64,
+    /// Stored bytes times references, counted with snapshot multiplicity,
+    /// as the last sweep found them. `None` before the first compact.
+    pub referenced_stored_size: Option<u64>,
+    /// When the last sweep ran (the client clock of that compact).
+    pub last_sweep_time: Option<DateTime<Utc>>,
     pub unique_chunks: usize,
     pub repo_created: DateTime<Utc>,
     pub encryption: EncryptionMode,
     /// Layout version. Worth showing because users will hold a mix of v2 and
     /// v3 repositories, and the format determines which binaries can read one.
     pub format: RepoFormat,
-    /// Segmented index layout (v4/v5) only.
+    /// Shape of the index (absent on a handle without a head).
     pub index: Option<IndexLayoutStats>,
 }
 
@@ -62,12 +68,21 @@ pub fn run(config: &VykarConfig, passphrase: Option<&str>) -> Result<InfoStats> 
     }
 
     let mut unique_stored_size = 0u64;
-    let mut referenced_stored_size = 0u64;
     for (_chunk_id, chunk) in repo.chunk_index().iter() {
         unique_stored_size = unique_stored_size.saturating_add(chunk.stored_size as u64);
-        referenced_stored_size =
-            referenced_stored_size.saturating_add(chunk.stored_size as u64 * chunk.refcount as u64);
     }
+    let record = match repo.index_head() {
+        Some(head) => crate::repo::index_store::fetch_sweep_record(
+            repo.storage.as_ref(),
+            repo.crypto.as_ref(),
+            head,
+        )
+        .unwrap_or_else(|e| {
+            tracing::warn!("the last sweep record cannot be read: {e}");
+            None
+        }),
+        None => None,
+    };
 
     Ok(InfoStats {
         snapshot_count: repo.manifest().snapshots.len(),
@@ -76,7 +91,8 @@ pub fn run(config: &VykarConfig, passphrase: Option<&str>) -> Result<InfoStats> 
         compressed_size,
         deduplicated_size,
         unique_stored_size,
-        referenced_stored_size,
+        referenced_stored_size: record.as_ref().map(|r| r.referenced_bytes),
+        last_sweep_time: record.as_ref().map(|r| r.time),
         unique_chunks: repo.chunk_index().len(),
         repo_created: repo.config.created,
         encryption: repo.config.encryption.clone(),

@@ -410,7 +410,12 @@ impl Repository {
         log_stage_elapsed(ctx);
 
         let ctx = emit_stage(events, "write index");
-        self.publish_index_state(Some(head), Some(diff), next)?;
+        self.publish_index_state(
+            Some(head),
+            Some(diff),
+            next,
+            crate::index::head::SegmentKind::Backup,
+        )?;
         log_stage_elapsed(ctx);
         Ok(())
     }

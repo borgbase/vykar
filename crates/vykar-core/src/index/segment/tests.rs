@@ -746,27 +746,16 @@ mod merge {
         // A keyed bump on a session-new chunk is not stale.
         delta.bump_refcount(&id(15));
 
+        // Reuse is checked, not counted: no deltas, new entries at 1.
         let diff = check(&prev, delta, dir.path());
-        assert_eq!(
-            diff.segment.deltas,
-            vec![
-                RefcountDelta {
-                    position: 0,
-                    delta: 2
-                },
-                RefcountDelta {
-                    position: 4,
-                    delta: 2
-                },
-            ]
-        );
+        assert!(diff.segment.deltas.is_empty());
         assert_eq!(diff.segment.new_entries.len(), 2);
-        assert_eq!(diff.segment.new_entries[0].refcount, 2);
+        assert!(diff.segment.new_entries.iter().all(|e| e.refcount == 1));
     }
 
     /// The head moved during the session: positions index the session's
     /// dedup cache, not `prev`, and a new entry another client committed
-    /// first becomes a bump.
+    /// first writes nothing (the existing entry stays).
     #[test]
     fn head_moved_during_the_session() {
         let dir = tempfile::tempdir().unwrap();
@@ -786,10 +775,10 @@ mod merge {
         let diff = check(&moved, delta, dir.path());
         assert_eq!(diff.segment.new_entries.len(), 1, "only id(5) is new");
         assert_eq!(diff.segment.new_entries[0].chunk_id, id(5));
-        assert_eq!(diff.segment.deltas.len(), 3);
+        assert!(diff.segment.deltas.is_empty());
     }
 
-    /// Duplicate new entries are summed into the first one's location.
+    /// Duplicate new entries keep the first one's location, at refcount 1.
     #[test]
     fn duplicate_new_entries() {
         let dir = tempfile::tempdir().unwrap();
@@ -799,7 +788,7 @@ mod merge {
         new_entry(&mut delta, entry(id(12), 2, 4, 50));
         let prev_cache = write_cache(&prev, dir.path(), "prev");
         let (diff, _) = merge_delta_to_temp(&prev_cache, &delta, &target(dir.path())).unwrap();
-        assert_eq!(diff.segment.new_entries, vec![entry(id(12), 3, 3, 0)]);
+        assert_eq!(diff.segment.new_entries, vec![entry(id(12), 1, 3, 0)]);
     }
 
     /// A bump whose chunk is in neither the index nor the new entries means
@@ -826,9 +815,9 @@ mod merge {
         }
     }
 
-    /// Refcounts beyond u32 are an error, not a wrap.
+    /// A bump never changes a refcount, so one at u32::MAX stays as it is.
     #[test]
-    fn refcount_overflow_is_rejected() {
+    fn bumps_do_not_change_refcounts() {
         let dir = tempfile::tempdir().unwrap();
         let prev = write_cache(
             &index_from(&[entry(id(1), u32::MAX, 1, 0)]),
@@ -837,7 +826,8 @@ mod merge {
         );
         let mut delta = IndexDelta::new();
         delta.bump_refcount(&id(1));
-        assert!(merge_delta_to_temp(&prev, &delta, &target(dir.path())).is_err());
+        let (diff, _) = merge_delta_to_temp(&prev, &delta, &target(dir.path())).unwrap();
+        assert!(diff.segment.is_empty());
     }
 
     /// An empty delta changes nothing.

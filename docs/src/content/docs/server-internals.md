@@ -140,7 +140,7 @@ This is encrypted passthrough: the server never decrypts chunk payloads.
 
 `GET /?verify-structure` validates repository shape without needing encryption keys. It checks:
 
-- required directories and expected key layout
+- required files (`config`, `keys/repokey`, and the index head: `index`, or for format v6 and later a head under `index.h/`) and expected key layout
 - pack shard naming and pack header magic/version
 - malformed or obviously invalid pack files
 

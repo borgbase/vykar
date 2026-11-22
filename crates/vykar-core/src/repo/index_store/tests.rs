@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use super::*;
 use crate::index::dedup_cache::build_full_index_cache_to_path;
-use crate::index::head::empty_state_hash;
+use crate::index::head::{HEAD_LAYOUT_VERSION, SegmentKind, SweepState, empty_state_hash};
 use crate::index::segment::diff_to_temp;
 use crate::index::table::{self, ChunkTable};
 use crate::index::{ChunkIndex, ChunkIndexEntry};
@@ -59,7 +59,7 @@ fn plaintext() -> Arc<dyn CryptoEngine> {
 
 fn encrypted() -> Arc<dyn CryptoEngine> {
     let key = MasterKey::generate().unwrap();
-    crate::repo::key::build_engine(&EncryptionMode::Aes256Gcm, RepoFormat::V5, &key).unwrap()
+    crate::repo::key::build_engine(&EncryptionMode::Aes256Gcm, RepoFormat::V6, &key).unwrap()
 }
 
 fn id(n: u32) -> ChunkId {
@@ -106,7 +106,7 @@ impl Writer {
             storage,
             crypto,
             dir,
-            head: IndexHead::empty(),
+            head: IndexHead::initial(),
         };
         w.put_head();
         w
@@ -117,12 +117,7 @@ impl Writer {
     }
 
     fn put_head(&self) {
-        self.storage
-            .put(
-                "index",
-                &pack_head(&self.head, self.crypto.as_ref()).unwrap(),
-            )
-            .unwrap();
+        put_head(self.storage.as_ref(), &self.head, self.crypto.as_ref()).unwrap();
     }
 
     /// Write `next` as a segment and publish the head.
@@ -133,9 +128,11 @@ impl Writer {
         tmp.persist(self.cache_path()).unwrap();
         let obj = pack_segment(&diff.segment, self.crypto.as_ref()).unwrap();
         self.storage.put(&obj.key(), &obj.bytes).unwrap();
+        self.head = self.head.successor();
         self.head.segments.push(SegmentRef {
             name: obj.name,
             size: obj.size(),
+            kind: SegmentKind::Maintenance,
             state_hash_after: diff.state_hash_after,
             entries_after: diff.entries_after,
         });
@@ -152,6 +149,7 @@ impl Writer {
         let cache = MmapFullIndexCache::open_verified(&self.cache_path()).unwrap();
         let obj = pack_base(&cache, self.crypto.as_ref()).unwrap();
         self.storage.put(&obj.key(), &obj.bytes).unwrap();
+        self.head = self.head.successor();
         self.head.retired = self.head.live_objects().collect();
         self.head.base = Some(BaseRef {
             name: obj.name,
@@ -221,27 +219,126 @@ fn index_d_gets(gets: &[String]) -> usize {
 #[test]
 fn head_round_trips_through_storage_encoding() {
     for crypto in [plaintext(), encrypted()] {
-        let head = IndexHead::empty();
+        let head = IndexHead::initial();
         let packed = pack_head(&head, crypto.as_ref()).unwrap();
         assert_eq!(packed[0], ObjectType::IndexHead as u8);
-        assert_eq!(decode_head(&packed, crypto.as_ref()).unwrap(), head);
+        let decoded = classify_head(1, &packed, crypto.as_ref()).into_head();
+        assert_eq!(decoded.unwrap(), head);
     }
 }
 
+/// STORE-1: the highest generation wins; keys that are not canonical
+/// generations are ignored.
 #[test]
-fn legacy_index_blob_is_named_in_the_error() {
+fn fetch_head_takes_the_highest_generation() {
     let crypto = plaintext();
-    let legacy = pack_object_with_context(
-        ObjectType::ChunkIndex,
-        INDEX_OBJECT_CONTEXT,
-        b"whatever",
-        crypto.as_ref(),
-    )
-    .unwrap();
-    let err = decode_head(&legacy, crypto.as_ref())
+    let mem: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+    let mut head = IndexHead::initial();
+    for _ in 0..3 {
+        put_head(mem.as_ref(), &head, crypto.as_ref()).unwrap();
+        head = head.successor();
+    }
+    mem.put("index.h/01", b"foreign").unwrap();
+    mem.put("index.h/x", b"foreign").unwrap();
+    mem.put("index.h/99", b"").unwrap();
+    mem.delete("index.h/99").unwrap();
+    assert_eq!(list_head_generations(mem.as_ref()).unwrap(), vec![1, 2, 3]);
+    assert_eq!(
+        fetch_head(mem.as_ref(), crypto.as_ref())
+            .unwrap()
+            .generation,
+        3
+    );
+}
+
+/// STORE-2: no head; a head under the wrong generation's key.
+#[test]
+fn missing_head_and_misplaced_head() {
+    let crypto = plaintext();
+    let mem: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+    let err = fetch_head(mem.as_ref(), crypto.as_ref())
         .unwrap_err()
         .to_string();
-    assert!(err.contains("monolithic index"), "{err}");
+    assert!(err.contains("index head missing"), "{err}");
+    assert!(fetch_latest_head_bytes(mem.as_ref()).unwrap().is_none());
+
+    let mut head = IndexHead::initial();
+    head.generation = 4;
+    mem.put(&head_key(5), &pack_head(&head, crypto.as_ref()).unwrap())
+        .unwrap();
+    let err = fetch_head(mem.as_ref(), crypto.as_ref())
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("index.h/5 names generation 4"), "{err}");
+    let data = mem.get(&head_key(5)).unwrap().unwrap();
+    assert!(matches!(
+        classify_head(5, &data, crypto.as_ref()),
+        StoredHead::Unreadable(_)
+    ));
+}
+
+/// Deletes the latest head on its first `n` GETs (another writer's GC
+/// between the LIST and the GET).
+struct VanishingHead {
+    inner: Arc<dyn StorageBackend>,
+    n: Mutex<usize>,
+    /// The head stays and answers 404 every time (true), or each vanished
+    /// head is deleted for good and the next one is found (false).
+    persistent: bool,
+}
+
+impl InnerBackend for VanishingHead {
+    fn inner_backend(&self) -> &dyn StorageBackend {
+        &*self.inner
+    }
+}
+
+delegate_storage_backend! {
+    for VanishingHead;
+    except [get];
+
+    fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        let mut n = self.n.lock().unwrap();
+        if key.starts_with(HEAD_PREFIX) && *n > 0 {
+            *n -= 1;
+            if !self.persistent {
+                self.inner.delete(key)?;
+            }
+            return Ok(None);
+        }
+        self.inner.get(key)
+    }
+}
+
+/// STORE-3: a 404 after the LIST re-lists; a persistent 404 gives up.
+#[test]
+fn a_head_vanishing_after_the_listing_is_retried() {
+    let crypto = plaintext();
+    let mem: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
+    let mut head = IndexHead::initial();
+    for _ in 0..3 {
+        put_head(mem.as_ref(), &head, crypto.as_ref()).unwrap();
+        head = head.successor();
+    }
+    let vanishing = VanishingHead {
+        inner: Arc::clone(&mem),
+        n: Mutex::new(1),
+        persistent: false,
+    };
+    assert_eq!(
+        fetch_head(&vanishing, crypto.as_ref()).unwrap().generation,
+        2
+    );
+
+    let stuck = VanishingHead {
+        inner: Arc::clone(&mem),
+        n: Mutex::new(usize::MAX),
+        persistent: true,
+    };
+    assert!(matches!(
+        fetch_head(&stuck, crypto.as_ref()),
+        Err(VykarError::IndexHeadUnstable)
+    ));
 }
 
 /// Cold download, then catch-up from a local cache at an earlier state,
@@ -376,7 +473,7 @@ fn sync_of_the_empty_head() {
     let synced = sync(
         mem.as_ref(),
         crypto.as_ref(),
-        IndexHead::empty(),
+        IndexHead::initial(),
         None,
         None,
         true,
@@ -529,7 +626,7 @@ fn reader_on_a_retired_head_survives_one_fold_and_recovers_after_two() {
     w.fold();
     let synced = sync(&log, crypto.as_ref(), old_head.clone(), None, None, true).unwrap();
     assert_eq!(synced.head, old_head, "finished on the retired head");
-    assert!(!log.take().contains(&"index".to_string()));
+    assert_eq!(head_gets(&log.take()), 0);
 
     let latest = index_with(0..70, 2);
     w.commit(&latest);
@@ -544,7 +641,7 @@ fn reader_on_a_retired_head_survives_one_fold_and_recovers_after_two() {
     assert_eq!(synced.head, w.head, "re-read the head");
     assert_eq!(entries(&*synced.table), entries(&latest));
     let gets = log.take();
-    assert_eq!(gets.iter().filter(|k| *k == "index").count(), 1);
+    assert_eq!(head_gets(&gets), 1);
     assert!(
         !gets.contains(&old_base),
         "the missing segment is found before any base download: {gets:?}"
@@ -563,7 +660,7 @@ fn base_and_segment() -> (Arc<dyn StorageBackend>, Arc<dyn CryptoEngine>, Writer
 }
 
 fn head_gets(gets: &[String]) -> usize {
-    gets.iter().filter(|k| *k == "index").count()
+    gets.iter().filter(|k| k.starts_with(HEAD_PREFIX)).count()
 }
 
 /// A segment the unchanged head still names is lost: one head re-read, no
@@ -661,11 +758,12 @@ fn missing_retired_object_is_retried_not_reported_lost() {
     assert_eq!(head_gets(&log.take()), 1);
 }
 
-/// Serves a queue of heads at `index`, one per GET, and has no `index.d/`
-/// objects at all: every re-read head moved and none names what is missing.
+/// Serves a queue of heads under `index.h/`, one per LIST and GET, and has
+/// no `index.d/` objects at all: every re-read head moved and none names
+/// what is missing.
 struct MovingHead {
     inner: Arc<dyn StorageBackend>,
-    heads: Mutex<std::collections::VecDeque<Vec<u8>>>,
+    heads: Mutex<std::collections::VecDeque<(u64, Vec<u8>)>>,
     gets: Mutex<Vec<String>>,
 }
 
@@ -677,17 +775,43 @@ impl InnerBackend for MovingHead {
 
 delegate_storage_backend! {
     for MovingHead;
-    except [get];
+    except [get, list, list_sized, list_meta, server_ops];
 
     fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
         self.gets.lock().unwrap().push(key.to_string());
-        if key == "index" {
-            return Ok(self.heads.lock().unwrap().pop_front());
+        if key.starts_with(HEAD_PREFIX) {
+            return Ok(self.heads.lock().unwrap().pop_front().map(|(_, b)| b));
         }
         if key.starts_with(INDEX_OBJECT_DIR) {
             return Ok(None);
         }
         self.inner.get(key)
+    }
+
+    fn list(&self, prefix: &str) -> Result<Vec<String>> {
+        if prefix == HEAD_PREFIX {
+            return Ok(self
+                .heads
+                .lock()
+                .unwrap()
+                .front()
+                .map(|(g, _)| head_key(*g))
+                .into_iter()
+                .collect());
+        }
+        self.inner.list(prefix)
+    }
+
+    fn list_sized(&self, prefix: &str) -> Result<Vec<vykar_storage::ListedObject>> {
+        self.inner.list_sized(prefix)
+    }
+
+    fn list_meta(&self, prefix: &str) -> Result<Vec<vykar_storage::ListedObject>> {
+        self.inner.list_meta(prefix)
+    }
+
+    fn server_ops(&self) -> Option<&dyn vykar_storage::ServerOps> {
+        None
     }
 }
 
@@ -708,7 +832,7 @@ fn moving_head_error() -> (VykarError, Vec<String>) {
         heads: Mutex::new(
             heads[1..]
                 .iter()
-                .map(|h| pack_head(h, crypto.as_ref()).unwrap())
+                .map(|h| (h.generation, pack_head(h, crypto.as_ref()).unwrap()))
                 .collect(),
         ),
         gets: Mutex::new(Vec::new()),
@@ -861,31 +985,113 @@ fn gc_name(b: u8) -> ObjectName {
 
 const FOREIGN_KEY: &str = "index.d/README";
 
-/// A memory backend holding the objects `names` and a foreign file.
-fn gc_storage(names: &[u8]) -> Arc<dyn StorageBackend> {
-    let mem: Arc<dyn StorageBackend> = Arc::new(MemoryBackend::new());
-    for &b in names {
-        mem.put(&object_key(&gc_name(b)), b"x").unwrap();
-    }
-    mem.put(FOREIGN_KEY, b"x").unwrap();
-    mem
+/// A memory backend whose `list_meta` reports mtimes: `now` for every key
+/// unless `age` set another; and that refuses deletes of `refused` keys as
+/// an append-only server does.
+struct Aged {
+    inner: Arc<dyn StorageBackend>,
+    now: std::time::SystemTime,
+    mtimes: Mutex<std::collections::HashMap<String, std::time::SystemTime>>,
+    refused: Vec<String>,
 }
 
-/// Live: object 1 (the base); retired: object 2.
-fn gc_head() -> IndexHead {
+impl Aged {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(MemoryBackend::new()),
+            now: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1 << 30),
+            mtimes: Mutex::new(Default::default()),
+            refused: Vec::new(),
+        }
+    }
+
+    /// Make `key` two hours old.
+    fn age(&self, key: &str) {
+        self.mtimes.lock().unwrap().insert(
+            key.to_string(),
+            self.now - std::time::Duration::from_secs(7200),
+        );
+    }
+}
+
+impl InnerBackend for Aged {
+    fn inner_backend(&self) -> &dyn StorageBackend {
+        &*self.inner
+    }
+}
+
+delegate_storage_backend! {
+    for Aged;
+    except [delete, list_meta, batch_delete];
+
+    fn delete(&self, key: &str) -> Result<()> {
+        if self.refused.iter().any(|k| k == key) {
+            return Err(VykarError::Other(format!("403 append-only: {key}")));
+        }
+        self.inner.delete(key)
+    }
+
+    fn list_meta(&self, prefix: &str) -> Result<Vec<vykar_storage::ListedObject>> {
+        let mtimes = self.mtimes.lock().unwrap();
+        Ok(self
+            .inner
+            .list_sized(prefix)?
+            .into_iter()
+            .map(|mut o| {
+                o.mtime = Some(mtimes.get(&o.key).copied().unwrap_or(self.now));
+                o
+            })
+            .collect())
+    }
+
+    fn batch_delete(&self) -> Option<&dyn vykar_storage::BatchDelete> {
+        None
+    }
+}
+
+/// The head of generation `generation`, naming the base object
+/// `gc_name(generation)`.
+fn gc_head(generation: u64) -> IndexHead {
+    let b = generation as u8;
     IndexHead {
-        layout: crate::index::head::HEAD_LAYOUT_VERSION,
-        state_hash: [1; 32],
+        layout: HEAD_LAYOUT_VERSION,
+        generation,
+        features: Vec::new(),
+        state_hash: [b; 32],
         entries: 1,
         base: Some(BaseRef {
-            name: gc_name(1),
+            name: gc_name(b),
             size: 1,
-            state_hash: [1; 32],
+            state_hash: [b; 32],
             entries: 1,
         }),
         segments: vec![],
-        retired: vec![gc_name(2)],
+        retired: vec![],
+        sweep: SweepState::default(),
     }
+}
+
+/// Heads 1..=20, each naming its own object; objects 200 (unnamed, old) and
+/// 201 (unnamed, young) and a foreign file. Everything is old except head
+/// 20, head 2 and object 201.
+fn gc_fixture(storage: &Aged) -> IndexHead {
+    let crypto = plaintext();
+    for g in 1..=20u64 {
+        let head = gc_head(g);
+        put_head(storage, &head, crypto.as_ref()).unwrap();
+        storage.put(&object_key(&gc_name(g as u8)), b"x").unwrap();
+        if g != 20 && g != 2 {
+            storage.age(&head_key(g));
+        }
+        storage.age(&object_key(&gc_name(g as u8)));
+    }
+    for b in [200u8, 201] {
+        storage.put(&object_key(&gc_name(b)), b"x").unwrap();
+    }
+    storage.age(&object_key(&gc_name(200)));
+    storage.put(FOREIGN_KEY, b"x").unwrap();
+    storage.age(FOREIGN_KEY);
+    gc_head(20)
 }
 
 fn keys_of(names: &[u8]) -> Vec<String> {
@@ -900,48 +1106,153 @@ fn remaining(storage: &dyn StorageBackend) -> Vec<String> {
     keys
 }
 
+/// What the fixture keeps: the objects of heads 2 and 4..=20, object 201
+/// and the foreign file.
 fn remaining_after_gc() -> Vec<String> {
-    let mut keys = keys_of(&[1]);
+    let mut names: Vec<u8> = (4..=20).collect();
+    names.extend([2, 201]);
+    let mut keys = keys_of(&names);
     keys.push(FOREIGN_KEY.to_string());
     keys.sort();
     keys
 }
 
-#[test]
-fn collect_garbage_deletes_in_one_batch() {
-    for (drop_retired, garbage) in [(true, &[2u8, 3, 4][..]), (false, &[3, 4][..])] {
-        let storage = BatchDeletes::new(gc_storage(&[1, 2, 3, 4]), false);
-        let deleted = collect_garbage(&storage, &gc_head(), drop_retired).unwrap();
-        assert_eq!(deleted, garbage.len());
-        let batches = storage.batches.lock().unwrap().clone();
-        assert_eq!(batches.len(), 1, "{drop_retired}");
-        let (mut keys, scope) = batches.into_iter().next().unwrap();
-        keys.sort();
-        assert_eq!(keys, keys_of(garbage));
-        assert_eq!(scope, vykar_storage::BatchDeleteScope::KeysOnly);
-        assert!(storage.deletes.lock().unwrap().is_empty());
-        if drop_retired {
-            assert_eq!(remaining(&storage), remaining_after_gc());
-        }
-    }
+/// The object garbage of the fixture: heads 1 and 3's objects and 200.
+fn gc_garbage() -> Vec<String> {
+    keys_of(&[1, 3, 200])
 }
 
+const GRACE: std::time::Duration = INDEX_GC_GRACE;
+
+/// STORE-4: heads below latest − 16 that are old go, with the objects no
+/// kept head names that are old.
 #[test]
-fn collect_garbage_falls_back_when_the_batch_fails() {
-    let storage = BatchDeletes::new(gc_storage(&[1, 2, 3, 4]), true);
-    assert_eq!(collect_garbage(&storage, &gc_head(), true).unwrap(), 3);
-    assert_eq!(storage.batches.lock().unwrap().len(), 1);
-    let mut deletes = storage.deletes.lock().unwrap().clone();
-    deletes.sort();
-    assert_eq!(deletes, keys_of(&[2, 3, 4]));
+fn collect_index_garbage_keeps_recent_young_and_named() {
+    let storage = Aged::new();
+    let latest = gc_fixture(&storage);
+    let stats = collect_index_garbage(&storage, plaintext().as_ref(), &latest, GRACE).unwrap();
+    assert_eq!(stats.skipped, None);
+    assert_eq!(stats.heads_deleted, 2);
+    assert_eq!(stats.objects_deleted, 3);
+    let mut want_heads: Vec<u64> = (4..=20).collect();
+    want_heads.insert(0, 2);
+    assert_eq!(list_head_generations(&storage).unwrap(), want_heads);
+    assert_eq!(remaining(&storage), remaining_after_gc());
+
+    // A second run finds nothing more.
+    let again = collect_index_garbage(&storage, plaintext().as_ref(), &latest, GRACE).unwrap();
+    assert_eq!((again.heads_deleted, again.objects_deleted), (0, 0));
+}
+
+/// The objects a kept head names as retired or as its sweep record stay.
+#[test]
+fn collect_index_garbage_keeps_retired_objects_and_records() {
+    let storage = Aged::new();
+    let crypto = plaintext();
+    let mut latest = gc_fixture(&storage);
+    latest.retired = vec![gc_name(200)];
+    put_head(&storage, &latest, crypto.as_ref()).unwrap();
+    let mut kept = gc_head(19);
+    kept.sweep = SweepState {
+        generation: 19,
+        record: Some(crate::index::head::ObjectRef {
+            name: gc_name(1),
+            size: 1,
+        }),
+    };
+    put_head(&storage, &kept, crypto.as_ref()).unwrap();
+    storage.age(&head_key(19));
+    let stats = collect_index_garbage(&storage, crypto.as_ref(), &latest, GRACE).unwrap();
+    assert_eq!(stats.objects_deleted, 1, "only object 3");
+    assert!(storage.exists(&object_key(&gc_name(200))).unwrap());
+    assert!(storage.exists(&object_key(&gc_name(1))).unwrap());
+    assert!(!storage.exists(&object_key(&gc_name(3))).unwrap());
+}
+
+/// STORE-5: without mtimes nothing is deleted.
+#[test]
+fn collect_index_garbage_without_mtimes_deletes_nothing() {
+    let mem = MemoryBackend::new();
+    let crypto = plaintext();
+    for g in 1..=20u64 {
+        put_head(&mem, &gc_head(g), crypto.as_ref()).unwrap();
+        mem.put(&object_key(&gc_name(g as u8)), b"x").unwrap();
+    }
+    let stats = collect_index_garbage(&mem, crypto.as_ref(), &gc_head(20), GRACE).unwrap();
+    assert_eq!(stats.skipped, Some("no mtimes"));
+    assert_eq!((stats.heads_deleted, stats.objects_deleted), (0, 0));
+    assert_eq!(list_head_generations(&mem).unwrap().len(), 20);
+}
+
+/// STORE-6: a kept head that does not decode stops the object part; the
+/// heads part has run.
+#[test]
+fn an_unreadable_retained_head_keeps_every_object() {
+    let storage = Aged::new();
+    let latest = gc_fixture(&storage);
+    storage.put(&head_key(5), b"garbage").unwrap();
+    storage.age(&head_key(5));
+    let stats = collect_index_garbage(&storage, plaintext().as_ref(), &latest, GRACE).unwrap();
+    assert_eq!(stats.skipped, Some("unreadable retained head"));
+    assert_eq!(stats.heads_deleted, 2);
+    assert_eq!(stats.objects_deleted, 0);
+    assert!(storage.exists(&object_key(&gc_name(200))).unwrap());
+}
+
+/// STORE-7: a refused head delete is logged; its objects still go.
+#[test]
+fn a_refused_head_delete_does_not_stop_the_run() {
+    let mut storage = Aged::new();
+    storage.refused = vec![head_key(1)];
+    let latest = gc_fixture(&storage);
+    let stats = collect_index_garbage(&storage, plaintext().as_ref(), &latest, GRACE).unwrap();
+    assert_eq!(stats.heads_deleted, 1);
+    assert!(storage.exists(&head_key(1)).unwrap());
+    assert_eq!(stats.objects_deleted, 3);
     assert_eq!(remaining(&storage), remaining_after_gc());
 }
 
 #[test]
-fn collect_garbage_without_batch_support() {
-    let storage = gc_storage(&[1, 2, 3, 4]);
-    assert_eq!(collect_garbage(&*storage, &gc_head(), true).unwrap(), 3);
-    assert_eq!(remaining(&*storage), remaining_after_gc());
+fn collect_index_garbage_deletes_objects_in_one_batch() {
+    let aged = Arc::new(Aged::new());
+    let latest = gc_fixture(&aged);
+    let storage = BatchDeletes::new(aged, false);
+    let stats = collect_index_garbage(&storage, plaintext().as_ref(), &latest, GRACE).unwrap();
+    assert_eq!(stats.objects_deleted, 3);
+    let batches = storage.batches.lock().unwrap().clone();
+    assert_eq!(batches.len(), 1);
+    let (mut keys, scope) = batches.into_iter().next().unwrap();
+    keys.sort();
+    assert_eq!(keys, gc_garbage());
+    assert_eq!(scope, vykar_storage::BatchDeleteScope::KeysOnly);
+    let deletes = storage.deletes.lock().unwrap().clone();
+    assert!(
+        deletes.iter().all(|k| k.starts_with(HEAD_PREFIX)),
+        "{deletes:?}"
+    );
+    assert_eq!(remaining(&storage), remaining_after_gc());
+}
+
+#[test]
+fn collect_index_garbage_falls_back_when_the_batch_fails() {
+    let aged = Arc::new(Aged::new());
+    let latest = gc_fixture(&aged);
+    let storage = BatchDeletes::new(aged, true);
+    let stats = collect_index_garbage(&storage, plaintext().as_ref(), &latest, GRACE).unwrap();
+    assert_eq!(storage.batches.lock().unwrap().len(), 1);
+    // The partial batch deleted the first key; its single delete is a no-op.
+    assert_eq!(stats.objects_deleted, 3);
+    let mut deletes: Vec<String> = storage
+        .deletes
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|k| k.starts_with(INDEX_OBJECT_DIR))
+        .cloned()
+        .collect();
+    deletes.sort();
+    assert_eq!(deletes, gc_garbage());
+    assert_eq!(remaining(&storage), remaining_after_gc());
 }
 
 /// Fails `delete` of one key; no batch support.
@@ -975,13 +1286,16 @@ delegate_storage_backend! {
 /// A failed single delete is logged, not counted, and does not stop the
 /// others.
 #[test]
-fn collect_garbage_skips_a_failed_delete() {
+fn collect_index_garbage_skips_a_failed_delete() {
+    let aged = Arc::new(Aged::new());
+    let latest = gc_fixture(&aged);
     let failing = object_key(&gc_name(3));
     let storage = FailOneDelete {
-        inner: gc_storage(&[1, 2, 3, 4]),
+        inner: aged,
         key: failing.clone(),
     };
-    assert_eq!(collect_garbage(&storage, &gc_head(), true).unwrap(), 2);
+    let stats = collect_index_garbage(&storage, plaintext().as_ref(), &latest, GRACE).unwrap();
+    assert_eq!(stats.objects_deleted, 2);
     let mut expected = remaining_after_gc();
     expected.push(failing);
     expected.sort();
@@ -989,11 +1303,92 @@ fn collect_garbage_skips_a_failed_delete() {
 }
 
 #[test]
-fn collect_garbage_with_nothing_to_delete_sends_no_request() {
-    let storage = BatchDeletes::new(gc_storage(&[1, 2]), false);
-    assert_eq!(collect_garbage(&storage, &gc_head(), false).unwrap(), 0);
+fn collect_index_garbage_with_nothing_to_delete_sends_no_request() {
+    let aged = Arc::new(Aged::new());
+    let crypto = plaintext();
+    let head = gc_head(1);
+    put_head(aged.as_ref(), &head, crypto.as_ref()).unwrap();
+    aged.put(&object_key(&gc_name(1)), b"x").unwrap();
+    aged.age(&object_key(&gc_name(1)));
+    let storage = BatchDeletes::new(aged, false);
+    let stats = collect_index_garbage(&storage, crypto.as_ref(), &head, GRACE).unwrap();
+    assert_eq!((stats.heads_deleted, stats.objects_deleted), (0, 0));
     assert!(storage.batches.lock().unwrap().is_empty());
     assert!(storage.deletes.lock().unwrap().is_empty());
+}
+
+/// STORE-8: a backup segment that changes existing entries is refused; the
+/// same segment labelled maintenance decodes.
+#[test]
+fn a_backup_segment_with_deltas_is_refused() {
+    let crypto = plaintext();
+    let seg = Segment {
+        prev_state_hash: [1; 32],
+        prev_entries: 3,
+        deltas: vec![crate::index::segment::RefcountDelta {
+            position: 0,
+            delta: -1,
+        }],
+        relocations: Vec::new(),
+        new_entries: Vec::new(),
+    };
+    let obj = pack_segment(&seg, crypto.as_ref()).unwrap();
+    let seg_ref = |kind| SegmentRef {
+        name: obj.name,
+        size: obj.size(),
+        kind,
+        state_hash_after: [2; 32],
+        entries_after: 3,
+    };
+    let err = decode_segment(&seg_ref(SegmentKind::Backup), &obj.bytes, crypto.as_ref())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("a backup segment changes existing entries"),
+        "{err}"
+    );
+    assert_eq!(
+        decode_segment(
+            &seg_ref(SegmentKind::Maintenance),
+            &obj.bytes,
+            crypto.as_ref()
+        )
+        .unwrap(),
+        seg
+    );
+}
+
+/// Sweep records round-trip through their storage encoding, checked
+/// against the head's reference.
+#[test]
+fn sweep_record_round_trips_through_storage() {
+    for crypto in [plaintext(), encrypted()] {
+        let rec = SweepRecord {
+            version: crate::index::sweep_record::SWEEP_RECORD_VERSION,
+            generation: 3,
+            time: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            snapshots: vec![serde_bytes::ByteBuf::from(vec![1; 32])],
+            tree_chunks: 1,
+            entries_live: 2,
+            bytes_live: 3,
+            entries_removed: 4,
+            bytes_removed: 5,
+            references: 6,
+            referenced_bytes: 7,
+        };
+        let obj = pack_sweep_record(&rec, crypto.as_ref()).unwrap();
+        let r = ObjectRef {
+            name: obj.name,
+            size: obj.size(),
+        };
+        assert_eq!(
+            decode_sweep_record(&r, &obj.bytes, crypto.as_ref()).unwrap(),
+            rec
+        );
+        let mut wrong = r;
+        wrong.size += 1;
+        assert!(decode_sweep_record(&wrong, &obj.bytes, crypto.as_ref()).is_err());
+    }
 }
 
 /// A recorded head state that the objects do not produce is rejected before
@@ -1204,70 +1599,94 @@ fn a_damaged_table_under_the_state_name_heals() {
 }
 
 #[test]
-fn classify_head_tells_damage_from_legacy_and_newer_heads() {
+fn classify_head_tells_damage_from_newer_heads() {
     for crypto in [plaintext(), encrypted()] {
         let c = crypto.as_ref();
-        let packed = pack_head(&IndexHead::empty(), c).unwrap();
-        assert!(
-            matches!(classify_head(&packed, c), StoredHead::Head(h) if h == IndexHead::empty())
-        );
-
-        let legacy =
-            pack_object_with_context(ObjectType::ChunkIndex, INDEX_OBJECT_CONTEXT, b"x", c)
-                .unwrap();
-        assert!(matches!(classify_head(&legacy, c), StoredHead::Legacy));
+        let initial = IndexHead::initial();
+        let packed = pack_head(&initial, c).unwrap();
+        assert!(matches!(classify_head(1, &packed, c), StoredHead::Head(h) if h == initial));
 
         let mut flipped = packed.clone();
         *flipped.last_mut().unwrap() ^= 1;
-        let nil = pack_object_with_context(ObjectType::IndexHead, INDEX_OBJECT_CONTEXT, b"\xc0", c)
-            .unwrap();
+        let nil =
+            pack_object_with_context(ObjectType::IndexHead, HEAD_CONTEXT, b"\xc0", c).unwrap();
         let half = packed[..packed.len() / 2].to_vec();
-        for damaged in [vec![0u8; 10], flipped, nil, half] {
+        let mut damaged_cases = vec![vec![0u8; 10], flipped, nil, half];
+        // A head under v4/v5's context does not authenticate under
+        // index.h's (a plaintext repository authenticates nothing).
+        if c.is_encrypting() {
+            damaged_cases.push(
+                pack_object_with_context(
+                    ObjectType::IndexHead,
+                    b"index",
+                    &initial.encode().unwrap(),
+                    c,
+                )
+                .unwrap(),
+            );
+        }
+        for damaged in damaged_cases {
             assert!(
-                matches!(classify_head(&damaged, c), StoredHead::Unreadable(_)),
+                matches!(classify_head(1, &damaged, c), StoredHead::Unreadable(_)),
                 "{:?}",
-                classify_head(&damaged, c)
+                classify_head(1, &damaged, c)
             );
         }
 
-        let layout2 = pack_head(
+        let layout3 = pack_head(
             &IndexHead {
-                layout: 2,
-                ..IndexHead::empty()
+                layout: 3,
+                ..IndexHead::initial()
             },
             c,
         )
         .unwrap();
         assert!(matches!(
-            classify_head(&layout2, c),
-            StoredHead::UnknownLayout(2)
+            classify_head(1, &layout3, c),
+            StoredHead::UnknownLayout(3)
         ));
-        let longer = |layout: u8| {
-            let mut body = IndexHead::empty().encode().unwrap();
-            body[0] = 0x97;
-            body[1] = layout;
-            body.push(0xc0);
-            pack_object_with_context(ObjectType::IndexHead, INDEX_OBJECT_CONTEXT, &body, c).unwrap()
-        };
+        // A positional (layout 1) body sealed under the new context.
+        let positional =
+            rmp_serde::to_vec(&(1u32, serde_bytes::Bytes::new(&[0; 32]), 0u64)).unwrap();
+        let positional =
+            pack_object_with_context(ObjectType::IndexHead, HEAD_CONTEXT, &positional, c).unwrap();
         assert!(matches!(
-            classify_head(&longer(2), c),
-            StoredHead::UnknownLayout(2)
+            classify_head(1, &positional, c),
+            StoredHead::UnknownLayout(1)
         ));
-        assert!(matches!(
-            classify_head(&longer(1), c),
-            StoredHead::Unreadable(_)
-        ));
+
+        // HEAD-4.
+        let featured = pack_head(
+            &IndexHead {
+                features: vec!["x".into()],
+                ..IndexHead::initial()
+            },
+            c,
+        )
+        .unwrap();
+        match classify_head(1, &featured, c) {
+            StoredHead::UnknownFeatures(names) => assert_eq!(names, vec!["x".to_string()]),
+            other => panic!("expected UnknownFeatures, got {other:?}"),
+        }
+        let err = classify_head(1, &featured, c)
+            .into_head()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("newer vykar"), "{err}");
 
         let unknown = [200u8, 1, 2, 3];
         assert!(matches!(
-            classify_head(&unknown, c),
+            classify_head(1, &unknown, c),
             StoredHead::UnknownType(200)
         ));
 
-        let err = decode_head(&longer(2), c).unwrap_err().to_string();
-        assert!(err.contains("unsupported index head layout 2"), "{err}");
+        let err = classify_head(1, &layout3, c)
+            .into_head()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unsupported index head layout 3"), "{err}");
         assert!(matches!(
-            decode_head(&unknown, c),
+            classify_head(1, &unknown, c).into_head(),
             Err(VykarError::UnknownObjectType(200))
         ));
     }

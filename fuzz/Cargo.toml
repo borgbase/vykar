@@ -83,6 +83,11 @@ path = "fuzz_targets/fuzz_index_head.rs"
 doc = false
 
 [[bin]]
+name = "fuzz_sweep_record"
+path = "fuzz_targets/fuzz_sweep_record.rs"
+doc = false
+
+[[bin]]
 name = "fuzz_index_base"
 path = "fuzz_targets/fuzz_index_base.rs"
 doc = false

@@ -1817,7 +1817,8 @@ fn repair_aborts_before_mutating() {
 
     // Apply mode: nothing about the repository may change.
     let snapshots_before = sorted_dir_listing(&repo_dir.join("snapshots"));
-    let index_before = std::fs::read(repo_dir.join("index")).unwrap();
+    let head_path = super::helpers::latest_head_path(&repo_dir);
+    let index_before = std::fs::read(&head_path).unwrap();
 
     assert_interrupted(commands::check::run_with_repair(
         &config,
@@ -1835,7 +1836,7 @@ fn repair_aborts_before_mutating() {
     );
     assert_eq!(
         index_before,
-        std::fs::read(repo_dir.join("index")).unwrap(),
+        std::fs::read(super::helpers::latest_head_path(&repo_dir)).unwrap(),
         "index must be byte-identical"
     );
 }

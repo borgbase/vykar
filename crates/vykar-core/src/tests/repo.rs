@@ -21,10 +21,12 @@ fn init_creates_required_keys() {
     )
     .unwrap();
 
-    // config and the index head exist; the segmented layout has no index.gen.
+    // config and the first index head exist; no `index` or `index.gen` (FMT-1).
     assert!(repo.storage.exists("config").unwrap());
-    assert!(repo.storage.exists("index").unwrap());
+    assert!(repo.storage.exists("index.h/1").unwrap());
+    assert!(!repo.storage.exists("index").unwrap());
     assert!(!repo.storage.exists("index.gen").unwrap());
+    assert_eq!(repo.index_head().unwrap().generation, 1);
 }
 
 #[test]
@@ -89,9 +91,9 @@ fn store_chunk_dedup() {
     // A session's chunks are in the index once it is saved.
     repo.save_state().unwrap();
 
-    // Refcount should be 2
+    // Reuse is not counted: refcount stays 1.
     let entry = repo.chunk_index().get(&id1).unwrap();
-    assert_eq!(entry.refcount, 2);
+    assert_eq!(entry.refcount, 1);
 }
 
 #[test]
@@ -120,8 +122,8 @@ fn save_state_persists_index() {
     repo.mark_index_dirty();
     repo.save_state().unwrap();
 
-    // Verify index is updated in storage
-    assert!(repo.storage.exists("index").unwrap());
+    // Verify a new head is in storage
+    assert!(repo.storage.exists("index.h/2").unwrap());
 
     // Index should have one entry
     assert_eq!(repo.chunk_index().len(), 1);
@@ -224,7 +226,7 @@ fn save_state_no_mutations_skips_writes() {
 
     let entries = log.entries();
     assert!(
-        !entries.contains(&"index".to_string()),
+        !entries.iter().any(|k| k.starts_with("index.h/")),
         "index should not be written when not dirty: {entries:?}"
     );
 }
@@ -245,7 +247,7 @@ fn save_state_writes_only_dirty_components() {
 
     let entries = log.entries();
     assert!(
-        entries.contains(&"index".to_string()),
+        entries.iter().any(|k| k.starts_with("index.h/")),
         "index should be written: {entries:?}"
     );
 }
@@ -262,7 +264,7 @@ fn store_chunk_marks_index_dirty() {
 
     let entries = log.entries();
     assert!(
-        entries.contains(&"index".to_string()),
+        entries.iter().any(|k| k.starts_with("index.h/")),
         "index should be written after store_chunk: {entries:?}"
     );
 }
@@ -301,7 +303,7 @@ fn empty_session_writes_no_index() {
     // No index write should have occurred (delta was empty)
     let entries = log.entries();
     assert!(
-        !entries.contains(&"index".to_string()),
+        !entries.iter().any(|k| k.starts_with("index.h/")),
         "index should NOT be rewritten for empty delta: {entries:?}"
     );
 }
@@ -332,7 +334,7 @@ fn session_with_new_chunks_writes_a_segment() {
     // The head and a segment are written because the delta had new entries
     let entries = log.entries();
     assert!(
-        entries.contains(&"index".to_string()),
+        entries.iter().any(|k| k.starts_with("index.h/")),
         "index should be written for non-empty delta: {entries:?}"
     );
     assert!(
@@ -361,7 +363,7 @@ fn dirty_flags_reset_after_save() {
 
     let entries = log.entries();
     assert!(
-        !entries.contains(&"index".to_string()),
+        !entries.iter().any(|k| k.starts_with("index.h/")),
         "index should not be rewritten: {entries:?}"
     );
 }
@@ -810,8 +812,8 @@ fn init_creates_the_current_repository_format() {
     )
     .unwrap();
 
-    assert_eq!(repo.config.version, 5);
-    assert_eq!(repo.format(), crate::repo::RepoFormat::V5);
+    assert_eq!(repo.config.version, 6);
+    assert_eq!(repo.format(), crate::repo::RepoFormat::V6);
     assert_eq!(
         repo.content_hash(),
         vykar_types::hash::HashAlgorithm::Blake3
@@ -839,7 +841,7 @@ fn open_rejects_an_unknown_repository_version() {
     .unwrap();
 
     let mut tampered_config = repo.config.clone();
-    tampered_config.version = 6;
+    tampered_config.version = 8;
     let tampered_data = rmp_serde::to_vec(&tampered_config).unwrap();
     repo.storage.put("config", &tampered_data).unwrap();
 
@@ -850,9 +852,9 @@ fn open_rejects_an_unknown_repository_version() {
         crate::repo::OpenOptions::new(),
     );
     match result {
-        Err(vykar_types::error::VykarError::UnsupportedVersion(v)) => assert_eq!(v, 6),
+        Err(vykar_types::error::VykarError::UnsupportedVersion(v)) => assert_eq!(v, 8),
         other => panic!(
-            "expected UnsupportedVersion(6), got {:?}",
+            "expected UnsupportedVersion(8), got {:?}",
             other.map(|_| ())
         ),
     }
@@ -1299,4 +1301,80 @@ fn writes_reuse_the_live_table_without_a_cache_dir() {
         let head = repo.index_head().unwrap();
         (head.state_hash, head.entries)
     });
+}
+
+/// Answers the capability probe with a server that serves the segmented
+/// index but not the v6 key directories.
+struct ServerWithoutV6Dirs {
+    inner: MemoryBackend,
+}
+
+impl vykar_storage::InnerBackend for ServerWithoutV6Dirs {
+    fn inner_backend(&self) -> &dyn vykar_storage::StorageBackend {
+        &self.inner
+    }
+}
+
+vykar_storage::delegate_storage_backend! {
+    for ServerWithoutV6Dirs;
+    except [server_ops];
+
+    fn server_ops(&self) -> Option<&dyn vykar_storage::ServerOps> {
+        Some(self)
+    }
+}
+
+impl vykar_storage::ServerOps for ServerWithoutV6Dirs {
+    fn offers(&self, _op: vykar_storage::ServerOp) -> bool {
+        false
+    }
+
+    fn capabilities(&self) -> vykar_types::error::Result<vykar_protocol::ServerCapabilities> {
+        Ok(vykar_protocol::ServerCapabilities {
+            status: "ok".into(),
+            version: "0.24.0".into(),
+            protocol_version: vykar_protocol::PROTOCOL_VERSION,
+            hashes: vec!["blake3".into()],
+            segmented_index: true,
+            key_dirs: vec!["index.d".into()],
+            ..Default::default()
+        })
+    }
+
+    fn init(&self) -> vykar_types::error::Result<()> {
+        Err(vykar_types::error::VykarError::Other(
+            "init must not be reached".into(),
+        ))
+    }
+}
+
+/// FMT-3: init refuses a vykar-server that does not accept the `index.h/`
+/// and `packmaps/` keys, before writing anything.
+#[test]
+fn init_refuses_a_server_without_the_v6_key_dirs() {
+    crate::testutil::init_test_environment();
+    let storage: std::sync::Arc<dyn vykar_storage::StorageBackend> =
+        std::sync::Arc::new(ServerWithoutV6Dirs {
+            inner: MemoryBackend::new(),
+        });
+    let err = Repository::init(
+        Box::new(std::sync::Arc::clone(&storage)),
+        EncryptionMode::None,
+        ChunkerParams::default(),
+        None,
+        None,
+        None,
+    )
+    .err()
+    .expect("init must refuse");
+    let msg = err.to_string();
+    assert!(
+        matches!(err, vykar_types::error::VykarError::Config(_)),
+        "{err:?}"
+    );
+    assert!(
+        msg.contains("index.h/") && msg.contains("Upgrade the server first"),
+        "{msg}"
+    );
+    assert!(storage.list("").unwrap().is_empty(), "nothing written");
 }

@@ -1,5 +1,6 @@
 //! "Unreferenced" by the mark equals "refcount 0 after a sequential rebuild"
-//! on every frozen fixture. The oracle uses public functions only; the
+//! on every frozen v2/v3 fixture after its upgrade (the upgraded base keeps
+//! the legacy counts; v4/v5 fixtures are refused since 05 step 8). The oracle uses public functions only; the
 //! archives are extracted to a temp dir and never written.
 
 #![allow(clippy::unwrap_used)]
@@ -83,9 +84,7 @@ fn assert_report_matches_the_oracle(fx: &Fixture) {
 fn check_fixtures(prefix: &str, version: u64) {
     for mode in MODES {
         let fx = fixtures::extract(prefix, mode, version);
-        if version < 4 {
-            commands::upgrade::run(&fx.config(), fx.passphrase()).unwrap();
-        }
+        commands::upgrade::run(&fx.config(), fx.passphrase()).unwrap();
         assert_report_matches_the_oracle(&fx);
     }
 }
@@ -98,14 +97,4 @@ fn v2_fixtures_unreferenced_equals_a_sequential_rebuild() {
 #[test]
 fn v3_fixtures_unreferenced_equals_a_sequential_rebuild() {
     check_fixtures("v3", 3);
-}
-
-#[test]
-fn v4_fixtures_unreferenced_equals_a_sequential_rebuild() {
-    check_fixtures("v4", 4);
-}
-
-#[test]
-fn v5_fixtures_unreferenced_equals_a_sequential_rebuild() {
-    check_fixtures("v5", 5);
 }

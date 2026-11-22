@@ -10,8 +10,12 @@ const CID_KEY: [u8; 32] = [0xBB; 32];
 
 /// Representative contexts used by production code.
 const CONTEXT_CHUNK_ID: &[u8; 32] = &[0xCC; 32];
-/// `repo/mod.rs` `INDEX_OBJECT_CONTEXT`; also the index head's context.
+/// `repo/mod.rs` `INDEX_OBJECT_CONTEXT` (the monolithic index of v2/v3).
 const CONTEXT_INDEX: &[u8] = b"index";
+/// `repo/index_store.rs` `HEAD_CONTEXT`.
+const CONTEXT_INDEX_HEAD: &[u8] = b"index.h";
+/// `repo/index_store.rs` `SWEEP_RECORD_CONTEXT`.
+const CONTEXT_SWEEP_RECORD: &[u8] = b"index.d/sweep";
 /// `repo/index_store.rs` `BASE_CONTEXT`.
 const CONTEXT_INDEX_BASE: &[u8] = b"index.d/base";
 /// `repo/index_store.rs` `SEGMENT_CONTEXT`.
@@ -39,7 +43,13 @@ fuzz_target!(|data: &[u8]| {
     let _ = vykar_core::repo::format::unpack_object_expect_with_context(
         data,
         vykar_core::repo::format::ObjectType::IndexHead,
-        CONTEXT_INDEX,
+        CONTEXT_INDEX_HEAD,
+        &engine,
+    );
+    let _ = vykar_core::repo::format::unpack_object_expect_with_context(
+        data,
+        vykar_core::repo::format::ObjectType::SweepRecord,
+        CONTEXT_SWEEP_RECORD,
         &engine,
     );
     let _ = vykar_core::repo::format::unpack_object_expect_with_context(

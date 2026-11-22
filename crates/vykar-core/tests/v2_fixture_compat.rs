@@ -36,7 +36,7 @@ fn extract(mode: &str) -> Fixture {
     fixtures::extract("v2", mode, 2)
 }
 
-/// [`extract`], then `vykar upgrade` to v4: every command but the upgrade
+/// [`extract`], then `vykar upgrade` to v7: every command but the upgrade
 /// refuses v2.
 fn extract_upgraded(mode: &str) -> Fixture {
     let fx = extract(mode);
@@ -143,12 +143,13 @@ fn v2_fixtures_verify_data_is_clean() {
 
 // ── Writing ────────────────────────────────────────────────────────────────
 
-/// `vykar upgrade` takes each v2 fixture to v4 in place: same chunk IDs (the
+/// `vykar upgrade` takes each v2 fixture to v7 in place (UPG-1; a head at
+/// `index.h/1`, no `index` or `index.gen`): same chunk IDs (the
 /// plaintext key follows the chunk hash), the same index, every snapshot
 /// still restores byte-identical, and a new backup dedups against the chunks
 /// the pre-change binary wrote.
 #[test]
-fn v2_fixtures_upgrade_to_v4() {
+fn v2_fixtures_upgrade_to_v7() {
     use vykar_core::repo::UpgradeOutcome;
     for mode in MODES {
         let fx = extract(mode);
@@ -161,7 +162,7 @@ fn v2_fixtures_upgrade_to_v4() {
                 outcome,
                 UpgradeOutcome::Upgraded {
                     from: 2,
-                    to: 4,
+                    to: 7,
                     resumed: false,
                     ..
                 }
@@ -169,9 +170,11 @@ fn v2_fixtures_upgrade_to_v4() {
             "{mode}: {outcome:?}"
         );
         assert!(!fx.repo_dir().join("index.gen").exists(), "{mode}");
+        assert!(!fx.repo_dir().join("index").exists(), "{mode}");
+        assert!(fx.repo_dir().join("index.h/1").is_file(), "{mode}");
 
         let repo = fx.open();
-        assert_eq!(repo.config.version, 4, "{mode}");
+        assert_eq!(repo.config.version, 7, "{mode}");
         assert_eq!(
             before,
             sorted_entries(&repo.chunk_index().to_chunk_index()),
@@ -228,7 +231,7 @@ fn v2_fixtures_upgrade_to_v4() {
         assert!(
             matches!(
                 commands::upgrade::run(&config, fx.passphrase()).unwrap(),
-                UpgradeOutcome::AlreadyCurrent { version: 4 }
+                UpgradeOutcome::AlreadyCurrent { version: 7 }
             ),
             "{mode}"
         );
@@ -236,7 +239,7 @@ fn v2_fixtures_upgrade_to_v4() {
 }
 
 /// Packs written into an upgraded v2 repository — by backup and by repack —
-/// must still be named by BLAKE2b: v4 keeps v2's chunk and pack hash.
+/// must still be named by BLAKE2b: v7 keeps v2's chunk and pack hash.
 #[test]
 fn v2_fixtures_name_new_packs_by_blake2b() {
     for mode in MODES {
@@ -336,7 +339,7 @@ fn v2_fixtures_survive_delete_prune_compact_and_restore() {
 }
 
 /// The v2 half of the `{none, aes256gcm} x {v2, v3}` lifecycle matrix that
-/// `lifecycle_integration.rs` covers for v5 (every repo it creates is v5 now).
+/// `lifecycle_integration.rs` covers for v6 (every repo it creates is v6 now).
 /// The encrypted fixtures must still reject a wrong passphrase the same way
 /// on the upgrade's open. Every other open refuses v2 before the key check.
 #[test]

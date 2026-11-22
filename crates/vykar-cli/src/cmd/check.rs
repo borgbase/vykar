@@ -282,14 +282,6 @@ fn index_recovery_lines(plan: &RepairPlan) -> Vec<String> {
     let mut lines = Vec::new();
     let (cause, counts) = match plan.index_recovery {
         IndexRecovery::Complete => return lines,
-        IndexRecovery::LegacyBlob => {
-            lines.push(
-                "\nIndex: `index` held a monolithic index written by an older vykar; \
-                 the index is rebuilt from it."
-                    .into(),
-            );
-            return lines;
-        }
         IndexRecovery::RebuiltFromPacks { cause, counts } => (cause, counts),
     };
     let cause = match cause {

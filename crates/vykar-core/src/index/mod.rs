@@ -4,6 +4,7 @@ pub mod dedup_cache;
 pub mod hasher;
 pub mod head;
 pub mod segment;
+pub mod sweep_record;
 pub mod table;
 
 use std::collections::{HashMap, HashSet};
@@ -533,29 +534,19 @@ impl IndexDelta {
         Ok(self)
     }
 
-    /// Apply this delta to the repository's index.
+    /// Apply this delta to the repository's index (the path of sessions
+    /// that are not a backup commit). A new entry is added, at refcount 1,
+    /// only when the index does not hold the chunk. Bumps are not persisted
+    /// (05 step 8), so `refcount_bumps` and `cached_bumps` are ignored.
     pub fn apply_to(self, index: &mut LiveIndex) {
-        // Apply new entries first
         for entry in self.new_entries {
-            index.add(
-                entry.chunk_id,
-                entry.stored_size,
-                entry.pack_id,
-                entry.pack_offset,
-            );
-            // add() sets refcount=1; apply remaining refs in bulk
-            if entry.refcount > 1 {
-                index.increment_refcount_by(&entry.chunk_id, entry.refcount - 1);
-            }
-        }
-
-        // Apply refcount bumps for pre-existing chunks
-        for (id, count) in self.refcount_bumps {
-            index.increment_refcount_by(&id, count);
-        }
-        if let Some(cached) = self.cached_bumps {
-            for (id, count) in cached.iter_nonzero() {
-                index.increment_refcount_by(&id, count);
+            if !index.contains(&entry.chunk_id) {
+                index.add(
+                    entry.chunk_id,
+                    entry.stored_size,
+                    entry.pack_id,
+                    entry.pack_offset,
+                );
             }
         }
     }
@@ -1103,8 +1094,10 @@ mod tests {
         index.increment_refcount_by(&make_chunk_id(99), 10);
     }
 
+    /// Bumps are not persisted, new entries land at refcount 1, and a new
+    /// entry the index already holds leaves the existing one as it is.
     #[test]
-    fn apply_to_bulk_refcount() {
+    fn apply_to_adds_new_entries_at_one_and_ignores_bumps() {
         let mut index = LiveIndex::empty();
         let c1 = make_chunk_id(1);
         let c2 = make_chunk_id(2);
@@ -1112,15 +1105,15 @@ mod tests {
         index.add(c1, 100, pack, 0);
 
         let mut delta = IndexDelta::new();
-        // New entry with refcount > 1
         delta.add_new_entry(c2, 200, pack, 100, 5);
-        // Bump existing entry multiple times
+        delta.add_new_entry(c1, 300, make_pack_id(11), 7, 1);
         delta.bump_refcount(&c1);
         delta.bump_refcount(&c1);
         delta.bump_refcount(&c1);
 
         delta.apply_to(&mut index);
-        assert_eq!(index.get(&c1).unwrap().refcount, 4); // 1 + 3 bumps
-        assert_eq!(index.get(&c2).unwrap().refcount, 5); // new entry with rc=5
+        let e1 = index.get(&c1).unwrap();
+        assert_eq!((e1.refcount, e1.stored_size, e1.pack_id), (1, 100, pack));
+        assert_eq!(index.get(&c2).unwrap().refcount, 1);
     }
 }

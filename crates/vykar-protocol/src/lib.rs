@@ -222,7 +222,7 @@ pub struct ServerCapabilities {
     /// as "whole-object PUT only".
     #[serde(default)]
     pub pack_parts: bool,
-    /// The server serves the segmented index of formats v4/v5: it accepts
+    /// The server serves the segmented index (formats v6/v7): it accepts
     /// `index.d/` keys and, in append-only mode, lets clients overwrite and
     /// delete them. Absent on older servers.
     #[serde(default)]
@@ -632,7 +632,7 @@ pub const KNOWN_ROOT_DIRS: &[&str] = &[
     PACK_MAP_DIR,
 ];
 
-/// Directory of the segmented index's write-once objects (formats v4/v5).
+/// Directory of the segmented index's write-once objects (formats v6/v7).
 pub const INDEX_OBJECT_DIR: &str = "index.d";
 
 /// Directory of the numbered index heads (format v6): `index.h/<gen>`.

@@ -47,6 +47,10 @@ that today's binary reads and extends segmented repositories an older binary
 wrote. That suite pins the BLAKE3 digest of each archive, so a regenerated or
 replaced archive fails it; restore the committed file with `git checkout`.
 
+Since 05 step 8 no binary opens v4/v5; `segmented_fixture_compat.rs` only
+checks that they are refused by version and unchanged. They are deleted in
+05 step 10.
+
 `scripts/gen-segmented-fixtures.sh <commit>` documents how they were produced.
 It refuses to overwrite an existing archive; `--new-scenario NAME` writes a
 fixture for a new scenario as `v{4,5}-NAME-<mode>.tar.gz`.

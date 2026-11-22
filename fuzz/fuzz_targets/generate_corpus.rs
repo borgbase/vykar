@@ -18,7 +18,10 @@ use vykar_core::index::base::encode_base;
 use vykar_core::index::dedup_cache::{
     FullCacheEntry, MmapFullIndexCache, build_full_index_cache_to_path,
 };
-use vykar_core::index::head::{BaseRef, IndexHead, ObjectName, SegmentRef};
+use vykar_core::index::head::{
+    BaseRef, IndexHead, ObjectName, ObjectRef, SegmentKind, SegmentRef, SweepState,
+};
+use vykar_core::index::sweep_record::{SWEEP_RECORD_VERSION, SweepRecord};
 use vykar_core::index::segment::{RefcountDelta, Relocation, Segment, diff_to_temp};
 use vykar_core::index::{
     ChunkIndex, IndexBlob, PendingChunkEntry, PendingPackEntry, encode_pending_journal,
@@ -265,10 +268,12 @@ fn seed_index_head() {
     write_seed(
         "fuzz_index_head",
         "empty",
-        &IndexHead::empty().encode().unwrap(),
+        &IndexHead::initial().encode().unwrap(),
     );
     let head = IndexHead {
-        layout: 1,
+        layout: 2,
+        generation: 7,
+        features: Vec::new(),
         state_hash: [3; 32],
         entries: 12,
         base: Some(BaseRef {
@@ -280,10 +285,18 @@ fn seed_index_head() {
         segments: vec![SegmentRef {
             name: ObjectName([2; 32]),
             size: 20,
+            kind: SegmentKind::Backup,
             state_hash_after: [3; 32],
             entries_after: 12,
         }],
         retired: vec![ObjectName([9; 32])],
+        sweep: SweepState {
+            generation: 6,
+            record: Some(ObjectRef {
+                name: ObjectName([8; 32]),
+                size: 40,
+            }),
+        },
     };
     write_seed(
         "fuzz_index_head",
@@ -678,12 +691,18 @@ fn seed_unpack_object() {
     write_seed("fuzz_unpack_object", "empty_config", &packed);
 
     // Index objects, each with its production context.
-    let seeds: [(&str, ObjectType, &[u8], Vec<u8>); 3] = [
+    let seeds: [(&str, ObjectType, &[u8], Vec<u8>); 4] = [
         (
             "context_index_head",
             ObjectType::IndexHead,
-            b"index",
-            IndexHead::empty().encode().unwrap(),
+            b"index.h",
+            IndexHead::initial().encode().unwrap(),
+        ),
+        (
+            "context_sweep_record",
+            ObjectType::SweepRecord,
+            b"index.d/sweep",
+            sweep_record().encode().unwrap(),
         ),
         (
             "context_index_base",
@@ -703,6 +722,38 @@ fn seed_unpack_object() {
         let packed = pack_object_deterministic(obj_type, &plaintext, &aad);
         write_seed("fuzz_unpack_object", name, &packed);
     }
+}
+
+fn sweep_record() -> SweepRecord {
+    SweepRecord {
+        version: SWEEP_RECORD_VERSION,
+        generation: 6,
+        time: fixed_time(),
+        snapshots: vec![
+            vykar_core::fuzzing::ByteBuf::from(vec![1; 32]),
+            vykar_core::fuzzing::ByteBuf::from(vec![2; 32]),
+        ],
+        tree_chunks: 3,
+        entries_live: 10,
+        bytes_live: 1000,
+        entries_removed: 2,
+        bytes_removed: 200,
+        references: 12,
+        referenced_bytes: 1500,
+    }
+}
+
+fn seed_sweep_record() {
+    write_seed(
+        "fuzz_sweep_record",
+        "two_snapshots",
+        &sweep_record().encode().unwrap(),
+    );
+    let empty = SweepRecord {
+        snapshots: Vec::new(),
+        ..sweep_record()
+    };
+    write_seed("fuzz_sweep_record", "empty", &empty.encode().unwrap());
 }
 
 fn repo_config(version: u32, chunker: ChunkerParams, min_pack: u32, max_pack: u32) -> Vec<u8> {
@@ -992,6 +1043,9 @@ fn main() {
 
     seed_index_head();
     println!("  fuzz_index_head: done");
+
+    seed_sweep_record();
+    println!("  fuzz_sweep_record: done");
 
     seed_index_base();
     println!("  fuzz_index_base: done");

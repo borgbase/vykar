@@ -1,9 +1,17 @@
-//! The index head: the small mutable object at `index` that names the live
-//! base and segments of a segmented index (formats v4/v5).
+//! The index head: the small object at `index.h/<gen>` that names the live
+//! base and segments of the index (formats v6/v7). One head per generation;
+//! the highest generation is the repository's index state.
 //!
-//! Serialized as a positional msgpack array. The layout is frozen: rmp-serde
-//! rejects an array longer than the struct, so a field can never be appended
-//! without a new `layout` value that old binaries refuse.
+//! Serialized as a msgpack **map** (layout 2) with the field names as keys.
+//! Readers ignore unknown keys, so a field can be added later without a new
+//! layout: such a field must carry `#[serde(default)]`, and one whose
+//! meaning a reader must understand must also add a name to `features`,
+//! which this binary refuses when it does not know the name. Every field
+//! below is required on decode; a missing key is damage.
+//!
+//! The v1 chain fields (`state_hash`, `entries` and the per-segment state)
+//! exist while base and segments use their v1 encodings; 05 step 9 removes
+//! them.
 
 use std::collections::HashSet;
 
@@ -13,7 +21,11 @@ use vykar_types::error::{Result, VykarError};
 use super::dedup_cache::StateHash;
 
 /// The only head layout this binary reads and writes.
-pub const HEAD_LAYOUT_VERSION: u32 = 1;
+pub const HEAD_LAYOUT_VERSION: u32 = 2;
+
+/// Head features this binary understands. A head that names any other is
+/// refused as written by a newer vykar. Written empty.
+pub const KNOWN_HEAD_FEATURES: &[&str] = &[];
 
 /// The error for a head whose layout this binary does not read.
 pub fn unsupported_layout(layout: u32) -> VykarError {
@@ -22,15 +34,40 @@ pub fn unsupported_layout(layout: u32) -> VykarError {
     ))
 }
 
-/// The `layout` field of an encoded head, read without decoding the rest:
-/// the first element of the positional array, when it is an integer that
-/// fits a `u32`. Tells a newer head layout (of any array length) from damage.
+/// The error for a head that names features this binary does not know.
+pub fn unknown_features(names: &[String]) -> VykarError {
+    VykarError::InvalidFormat(format!(
+        "index head uses feature(s) {} that this vykar does not know; \
+         it was written by a newer vykar. Upgrade vykar",
+        names.join(", ")
+    ))
+}
+
+/// The `layout` of an encoded head without decoding the rest. A map head
+/// is read through a struct with the single field `layout`, ignoring every
+/// other key; a positional (layout 1) head through its first array
+/// element. None when neither works.
 pub fn peek_layout(bytes: &[u8]) -> Option<u32> {
-    let mut rd = bytes;
-    if rmp::decode::read_array_len(&mut rd).ok()? == 0 {
-        return None;
+    #[derive(Deserialize)]
+    struct LayoutOnly {
+        layout: u32,
     }
-    rmp::decode::read_int::<u32, _>(&mut rd).ok()
+    let mut rd = bytes;
+    match rmp::decode::read_marker(&mut rd).ok()? {
+        rmp::Marker::FixArray(_) | rmp::Marker::Array16 | rmp::Marker::Array32 => {
+            let mut rd = bytes;
+            if rmp::decode::read_array_len(&mut rd).ok()? == 0 {
+                return None;
+            }
+            rmp::decode::read_int::<u32, _>(&mut rd).ok()
+        }
+        rmp::Marker::FixMap(_) | rmp::Marker::Map16 | rmp::Marker::Map32 => {
+            rmp_serde::from_slice::<LayoutOnly>(bytes)
+                .ok()
+                .map(|l| l.layout)
+        }
+        _ => None,
+    }
 }
 
 /// The state hash of the empty index: BLAKE3 over no records.
@@ -53,6 +90,53 @@ impl ObjectName {
     }
 }
 
+/// Who wrote a segment. On the wire a u8 (0 = backup, 1 = maintenance);
+/// any other value is a decode error. A backup segment only adds entries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(into = "u8", try_from = "u8")]
+pub enum SegmentKind {
+    Backup,
+    Maintenance,
+}
+
+impl From<SegmentKind> for u8 {
+    fn from(kind: SegmentKind) -> u8 {
+        match kind {
+            SegmentKind::Backup => 0,
+            SegmentKind::Maintenance => 1,
+        }
+    }
+}
+
+impl TryFrom<u8> for SegmentKind {
+    type Error = String;
+
+    fn try_from(v: u8) -> std::result::Result<Self, String> {
+        match v {
+            0 => Ok(SegmentKind::Backup),
+            1 => Ok(SegmentKind::Maintenance),
+            other => Err(format!("unknown index segment kind {other}")),
+        }
+    }
+}
+
+/// An `index.d/` object a head names that is not a base or a segment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectRef {
+    pub name: ObjectName,
+    pub size: u64,
+}
+
+/// `generation`: the generation of the last head written by a sweep or by
+/// `check --repair` (0: none since init or upgrade). `record`: the sweep
+/// record object of the last sweep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct SweepState {
+    #[serde(rename = "gen")]
+    pub generation: u64,
+    pub record: Option<ObjectRef>,
+}
+
 /// A base object: the full sorted records of one index state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BaseRef {
@@ -63,11 +147,12 @@ pub struct BaseRef {
     pub entries: u64,
 }
 
-/// A segment object and the state it produces.
+/// A segment object, who wrote it, and the state it produces.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SegmentRef {
     pub name: ObjectName,
     pub size: u64,
+    pub kind: SegmentKind,
     #[serde(with = "serde_bytes")]
     pub state_hash_after: StateHash,
     pub entries_after: u64,
@@ -77,14 +162,23 @@ pub struct SegmentRef {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexHead {
     pub layout: u32,
+    /// Its own generation: equal to the `<gen>` of its key. The wire key
+    /// is `gen`.
+    #[serde(rename = "gen")]
+    pub generation: u64,
+    /// Features a reader must understand; this binary writes none.
+    pub features: Vec<String>,
+    /// v1 chain: the state after the last segment (05 step 9 removes it).
     #[serde(with = "serde_bytes")]
     pub state_hash: StateHash,
+    /// v1 chain: the entry count of that state (05 step 9 removes it).
     pub entries: u64,
     pub base: Option<BaseRef>,
     pub segments: Vec<SegmentRef>,
     /// Objects of the last head before the most recent fold, kept so a
     /// reader that loaded that head can finish.
     pub retired: Vec<ObjectName>,
+    pub sweep: SweepState,
 }
 
 fn invalid(msg: impl Into<String>) -> VykarError {
@@ -92,15 +186,27 @@ fn invalid(msg: impl Into<String>) -> VykarError {
 }
 
 impl IndexHead {
-    /// The head of an empty index, as `init` writes it.
-    pub fn empty() -> Self {
+    /// The head `init` writes: generation 1, the empty state, no sweep.
+    pub fn initial() -> Self {
         Self {
             layout: HEAD_LAYOUT_VERSION,
+            generation: 1,
+            features: Vec::new(),
             state_hash: empty_state_hash(),
             entries: 0,
             base: None,
             segments: Vec::new(),
             retired: Vec::new(),
+            sweep: SweepState::default(),
+        }
+    }
+
+    /// A copy with the next generation; the caller then edits the chain
+    /// and the sweep.
+    pub fn successor(&self) -> Self {
+        Self {
+            generation: self.generation + 1,
+            ..self.clone()
         }
     }
 
@@ -126,7 +232,7 @@ impl IndexHead {
         states
     }
 
-    /// Names of the objects this head references as live.
+    /// Names of the objects this head references as live: base and segments.
     pub fn live_objects(&self) -> impl Iterator<Item = ObjectName> + '_ {
         self.base
             .iter()
@@ -134,12 +240,43 @@ impl IndexHead {
             .chain(self.segments.iter().map(|s| s.name))
     }
 
-    /// Check the head's internal consistency: known layout, the chain ends
-    /// at the head's state, entry counts fit a full index cache, and no
-    /// object is named twice.
+    /// Every `index.d/` object this head keeps alive: the live objects,
+    /// the retired ones and the sweep record.
+    pub fn named_objects(&self) -> impl Iterator<Item = ObjectName> + '_ {
+        self.live_objects()
+            .chain(self.retired.iter().copied())
+            .chain(self.sweep.record.iter().map(|r| r.name))
+    }
+
+    /// The features this head names that this binary does not know.
+    pub fn unknown_features(&self) -> Vec<String> {
+        self.features
+            .iter()
+            .filter(|f| !KNOWN_HEAD_FEATURES.contains(&f.as_str()))
+            .cloned()
+            .collect()
+    }
+
+    /// Check the head's internal consistency: known layout and features, a
+    /// generation of at least 1 and not below the sweep's, the chain ends at
+    /// the head's state, entry counts fit a full index cache, and no object
+    /// is named twice.
     pub fn validate(&self) -> Result<()> {
         if self.layout != HEAD_LAYOUT_VERSION {
             return Err(unsupported_layout(self.layout));
+        }
+        let unknown = self.unknown_features();
+        if !unknown.is_empty() {
+            return Err(unknown_features(&unknown));
+        }
+        if self.generation == 0 {
+            return Err(invalid("generation 0"));
+        }
+        if self.sweep.generation > self.generation {
+            return Err(invalid(format!(
+                "sweep generation {} after the head's {}",
+                self.sweep.generation, self.generation
+            )));
         }
         let last = *self
             .chain_states()
@@ -156,7 +293,7 @@ impl IndexHead {
             return Err(invalid("entry count out of range"));
         }
         let mut seen = HashSet::new();
-        for name in self.live_objects().chain(self.retired.iter().copied()) {
+        for name in self.named_objects() {
             if !seen.insert(name) {
                 return Err(invalid(format!("object {} named twice", name.to_hex())));
             }
@@ -164,14 +301,19 @@ impl IndexHead {
         Ok(())
     }
 
-    /// Serialize as a positional msgpack array.
+    /// Serialize as a msgpack map with the field names as keys.
     pub fn encode(&self) -> Result<Vec<u8>> {
-        Ok(rmp_serde::to_vec(self)?)
+        Ok(rmp_serde::to_vec_named(self)?)
+    }
+
+    /// Deserialize without validating.
+    pub fn decode_unchecked(bytes: &[u8]) -> Result<Self> {
+        Ok(rmp_serde::from_slice(bytes)?)
     }
 
     /// Deserialize and [`validate`](Self::validate).
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        let head: Self = rmp_serde::from_slice(bytes)?;
+        let head = Self::decode_unchecked(bytes)?;
         head.validate()?;
         Ok(head)
     }
@@ -188,6 +330,8 @@ mod tests {
     fn sample() -> IndexHead {
         IndexHead {
             layout: HEAD_LAYOUT_VERSION,
+            generation: 7,
+            features: Vec::new(),
             state_hash: [3; 32],
             entries: 12,
             base: Some(BaseRef {
@@ -200,41 +344,190 @@ mod tests {
                 SegmentRef {
                     name: name(2),
                     size: 20,
+                    kind: SegmentKind::Backup,
                     state_hash_after: [2; 32],
                     entries_after: 11,
                 },
                 SegmentRef {
                     name: name(3),
                     size: 30,
+                    kind: SegmentKind::Maintenance,
                     state_hash_after: [3; 32],
                     entries_after: 12,
                 },
             ],
             retired: vec![name(9)],
+            sweep: SweepState {
+                generation: 5,
+                record: Some(ObjectRef {
+                    name: name(8),
+                    size: 40,
+                }),
+            },
         }
     }
 
+    /// HEAD-1.
     #[test]
     fn round_trips() {
         let head = sample();
         assert_eq!(IndexHead::decode(&head.encode().unwrap()).unwrap(), head);
-        let empty = IndexHead::empty();
-        assert_eq!(IndexHead::decode(&empty.encode().unwrap()).unwrap(), empty);
+        let initial = IndexHead::initial();
+        assert_eq!(
+            IndexHead::decode(&initial.encode().unwrap()).unwrap(),
+            initial
+        );
+        assert_eq!(initial.generation, 1);
+        assert_eq!(initial.sweep, SweepState::default());
+        assert_eq!(initial.successor().generation, 2);
     }
 
-    /// Names and hashes are msgpack `bin`, not arrays of integers, and the
-    /// head is a 6-element positional array.
+    /// HEAD-2: a map with named keys; hashes and names stay msgpack `bin`.
     #[test]
-    fn encoding_is_compact_and_positional() {
-        let bytes = IndexHead::empty().encode().unwrap();
-        assert_eq!(bytes[0], 0x96);
-        assert_eq!(&bytes[2..4], &[0xc4, 32], "state_hash as bin8 of 32 bytes");
+    fn encoding_is_a_map() {
+        let bytes = IndexHead::initial().encode().unwrap();
+        assert!(
+            (0x80..=0x8f).contains(&bytes[0]) || bytes[0] == 0xde,
+            "map header, got {:#x}",
+            bytes[0]
+        );
         let full = sample().encode().unwrap();
-        assert!(full.len() < 300, "{} bytes", full.len());
+        for key in [&b"layout"[..], b"gen", b"sweep", b"features", b"kind"] {
+            assert!(
+                full.windows(key.len()).any(|w| w == key),
+                "key {}",
+                String::from_utf8_lossy(key)
+            );
+        }
+        let bin32 = [0xc4, 32];
+        assert!(full.windows(2).any(|w| w == bin32), "hashes as bin8");
+        assert!(full.len() < 600, "{} bytes", full.len());
+    }
+
+    /// HEAD-3: an unknown key is ignored.
+    #[test]
+    fn unknown_keys_are_ignored() {
+        #[derive(Serialize)]
+        struct Newer<'a> {
+            #[serde(flatten)]
+            head: &'a IndexHead,
+            later_field: u32,
+        }
+        let head = sample();
+        let bytes = rmp_serde::to_vec_named(&Newer {
+            head: &head,
+            later_field: 42,
+        })
+        .unwrap();
+        assert_eq!(IndexHead::decode(&bytes).unwrap(), head);
+    }
+
+    /// HEAD-4 (the classification half is in repo::index_store's tests).
+    #[test]
+    fn unknown_features_are_refused() {
+        let mut h = sample();
+        h.features = vec!["x".into()];
+        let err = IndexHead::decode(&h.encode().unwrap()).unwrap_err();
+        assert!(err.to_string().contains("newer vykar"), "{err}");
+        assert_eq!(h.unknown_features(), vec!["x".to_string()]);
+    }
+
+    /// HEAD-5: peek_layout on map and positional heads.
+    #[test]
+    fn peek_layout_reads_map_and_positional_heads() {
+        assert_eq!(peek_layout(&sample().encode().unwrap()), Some(2));
+        let mut h = sample();
+        h.layout = 3;
+        assert_eq!(peek_layout(&h.encode().unwrap()), Some(3));
+        assert!(IndexHead::decode(&h.encode().unwrap()).is_err());
+
+        // A positional layout-1 head, as v4/v5 wrote it.
+        let positional =
+            rmp_serde::to_vec(&(1u32, serde_bytes::Bytes::new(&[0; 32]), 0u64)).unwrap();
+        assert_eq!(peek_layout(&positional), Some(1));
+        assert!(IndexHead::decode(&positional).is_err());
+
+        assert_eq!(peek_layout(&[0xc0]), None);
+        assert_eq!(peek_layout(&[]), None);
+        assert_eq!(peek_layout(&[0x90]), None);
+        assert_eq!(peek_layout(&[0x80]), None);
+    }
+
+    /// HEAD-6.
+    #[test]
+    fn rejects_inconsistent_heads() {
+        let bad = |h: IndexHead| IndexHead::decode(&h.encode().unwrap()).is_err();
+
+        let mut h = sample();
+        h.generation = 0;
+        h.sweep.generation = 0;
+        assert!(bad(h));
+
+        let mut h = sample();
+        h.sweep.generation = h.generation + 1;
+        assert!(bad(h));
+
+        let mut h = sample();
+        h.retired.push(name(8));
+        assert!(bad(h), "the record named again as retired");
+
+        let mut h = sample();
+        h.sweep.record = Some(ObjectRef {
+            name: name(2),
+            size: 1,
+        });
+        assert!(bad(h), "the record named again as a segment");
+
+        let mut h = sample();
+        h.state_hash = [7; 32];
+        assert!(bad(h));
+
+        let mut h = sample();
+        h.entries = 13;
+        assert!(bad(h));
+
+        let mut h = sample();
+        h.retired.push(name(2));
+        assert!(bad(h));
+
+        let mut h = IndexHead::initial();
+        h.state_hash = [0; 32];
+        assert!(bad(h));
+
+        let mut h = sample();
+        h.segments[1].entries_after = u64::from(u32::MAX) + 1;
+        h.entries = h.segments[1].entries_after;
+        assert!(bad(h));
+
+        // Every field is required.
+        #[derive(Serialize)]
+        struct NoSweep {
+            layout: u32,
+            #[serde(rename = "gen")]
+            generation: u64,
+        }
+        let bytes = rmp_serde::to_vec_named(&NoSweep {
+            layout: 2,
+            generation: 1,
+        })
+        .unwrap();
+        assert!(IndexHead::decode(&bytes).is_err());
+    }
+
+    /// HEAD-7.
+    #[test]
+    fn segment_kind_wire_values() {
+        for (kind, v) in [(SegmentKind::Backup, 0u8), (SegmentKind::Maintenance, 1)] {
+            let bytes = rmp_serde::to_vec(&kind).unwrap();
+            assert_eq!(bytes, rmp_serde::to_vec(&v).unwrap());
+            assert_eq!(rmp_serde::from_slice::<SegmentKind>(&bytes).unwrap(), kind);
+        }
+        let two = rmp_serde::to_vec(&2u8).unwrap();
+        assert!(rmp_serde::from_slice::<SegmentKind>(&two).is_err());
     }
 
     #[test]
-    fn chain_states_and_live_objects() {
+    fn chain_states_and_named_objects() {
         let head = sample();
         assert_eq!(
             head.chain_states(),
@@ -245,58 +538,12 @@ mod tests {
             vec![name(1), name(2), name(3)]
         );
         assert_eq!(
-            IndexHead::empty().chain_states(),
+            head.named_objects().collect::<Vec<_>>(),
+            vec![name(1), name(2), name(3), name(9), name(8)]
+        );
+        assert_eq!(
+            IndexHead::initial().chain_states(),
             vec![(empty_state_hash(), 0)]
         );
-    }
-
-    #[test]
-    fn rejects_inconsistent_heads() {
-        let mut h = sample();
-        h.layout = 2;
-        assert!(IndexHead::decode(&h.encode().unwrap()).is_err());
-
-        let mut h = sample();
-        h.state_hash = [7; 32];
-        assert!(IndexHead::decode(&h.encode().unwrap()).is_err());
-
-        let mut h = sample();
-        h.entries = 13;
-        assert!(IndexHead::decode(&h.encode().unwrap()).is_err());
-
-        let mut h = sample();
-        h.retired.push(name(2));
-        assert!(IndexHead::decode(&h.encode().unwrap()).is_err());
-
-        let mut h = IndexHead::empty();
-        h.state_hash = [0; 32];
-        assert!(IndexHead::decode(&h.encode().unwrap()).is_err());
-
-        let mut h = sample();
-        h.segments[1].entries_after = u64::from(u32::MAX) + 1;
-        h.entries = h.segments[1].entries_after;
-        assert!(IndexHead::decode(&h.encode().unwrap()).is_err());
-    }
-
-    /// An appended field must not decode: the layout is frozen.
-    #[test]
-    fn longer_array_is_rejected() {
-        let mut bytes = IndexHead::empty().encode().unwrap();
-        bytes[0] = 0x97;
-        bytes.push(0x00);
-        assert!(IndexHead::decode(&bytes).is_err());
-    }
-
-    #[test]
-    fn peek_layout_reads_the_layout_of_any_length() {
-        assert_eq!(peek_layout(&IndexHead::empty().encode().unwrap()), Some(1));
-        let mut longer = sample().encode().unwrap();
-        longer[0] = 0x97;
-        longer[1] = 0x02;
-        longer.push(0xc0);
-        assert_eq!(peek_layout(&longer), Some(2));
-        assert_eq!(peek_layout(&[0xc0]), None);
-        assert_eq!(peek_layout(&[]), None);
-        assert_eq!(peek_layout(&[0x90]), None);
     }
 }

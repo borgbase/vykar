@@ -1,4 +1,4 @@
-use crate::commands::compact::compact_repo;
+use crate::commands::compact::compact_repo_without_mark;
 use crate::compress::Compression;
 use crate::repo::control::CancelToken;
 use crate::repo::pack::PackType;
@@ -37,7 +37,8 @@ fn compact_clean_repo_no_repacking() {
     // Store chunks — all live, no dead blobs
     store_two_chunks(&mut repo);
 
-    let stats = compact_repo(&mut repo, 10.0, None, false, 4, &CancelToken::new()).unwrap();
+    let stats =
+        compact_repo_without_mark(&mut repo, 10.0, None, false, 4, &CancelToken::new()).unwrap();
     assert_eq!(stats.packs_repacked, 0);
     assert_eq!(stats.packs_deleted_empty, 0);
     assert_eq!(stats.space_freed, 0);
@@ -78,7 +79,8 @@ fn compact_ignores_trailer_only_overhead() {
     store_two_chunks(&mut repo);
     for threshold in [0.0, 1.0, 10.0] {
         let stats =
-            compact_repo(&mut repo, threshold, None, false, 4, &CancelToken::new()).unwrap();
+            compact_repo_without_mark(&mut repo, threshold, None, false, 4, &CancelToken::new())
+                .unwrap();
         assert_eq!(stats.packs_repacked, 0, "{threshold}");
         assert_eq!(stats.packs_deleted_empty, 0, "{threshold}");
         assert_eq!(stats.space_freed, 0, "{threshold}");
@@ -93,10 +95,12 @@ fn compact_is_idempotent_after_repack() {
     let (id_a, _id_b) = store_two_chunks(&mut repo);
     repo.chunk_index_mut().decrement(&id_a);
     repo.save_state().unwrap();
-    let first = compact_repo(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
+    let first =
+        compact_repo_without_mark(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
     assert_eq!(first.packs_repacked, 1, "{first:?}");
 
-    let second = compact_repo(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
+    let second =
+        compact_repo_without_mark(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
     assert_eq!(second.packs_repacked, 0, "{second:?}");
     assert_eq!(second.packs_deleted_empty, 0, "{second:?}");
     assert_eq!(second.space_freed, 0, "{second:?}");
@@ -110,7 +114,7 @@ fn client_repack_writes_a_trailer() {
     let (id_a, id_b) = store_two_chunks(&mut repo);
     repo.chunk_index_mut().decrement(&id_a);
     repo.save_state().unwrap();
-    compact_repo(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
+    compact_repo_without_mark(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
 
     let key = repo.chunk_index().get(&id_b).unwrap().pack_id.storage_key();
     assert_trailer_matches_index(&repo, &key, TrailerPackType::Repacked);
@@ -153,7 +157,8 @@ fn failed_footer_read_counts_the_trailer_as_dead() {
     repo.storage = std::sync::Arc::new(FailingFooterReads {
         inner: std::sync::Arc::clone(&repo.storage),
     });
-    let stats = compact_repo(&mut repo, 10.0, None, false, 4, &CancelToken::new()).unwrap();
+    let stats =
+        compact_repo_without_mark(&mut repo, 10.0, None, false, 4, &CancelToken::new()).unwrap();
     assert_eq!(stats.packs_repacked, 1, "{stats:?}");
     assert!(stats.space_freed > 0, "{stats:?}");
     assert_eq!(
@@ -183,12 +188,63 @@ fn oversized_footer_is_not_trusted() {
     bytes[n - 12..n - 8].copy_from_slice(&forged.to_le_bytes());
     repo.storage.put(&key, &bytes).unwrap();
 
-    let stats = compact_repo(&mut repo, 10.0, None, false, 4, &CancelToken::new()).unwrap();
+    let stats =
+        compact_repo_without_mark(&mut repo, 10.0, None, false, 4, &CancelToken::new()).unwrap();
     assert_eq!(stats.packs_repacked, 1, "{stats:?}");
     assert_eq!(
         repo.read_chunk(&id_a).unwrap(),
         b"chunk-a-data-for-compact-test"
     );
+    assert_eq!(
+        repo.read_chunk(&id_b).unwrap(),
+        b"chunk-b-data-for-compact-test"
+    );
+}
+
+/// A repack's output with the ID of a pack the listing showed as an orphan
+/// (the same blobs repacked by an earlier, interrupted run) is live once the
+/// repack has written it: the compact that wrote it does not delete it.
+#[test]
+fn compact_keeps_an_orphan_its_repack_rewrote() {
+    let mut repo = test_repo_plaintext();
+    let (id_a, id_b) = store_two_chunks(&mut repo);
+    repo.chunk_index_mut().decrement(&id_a);
+    repo.save_state().unwrap();
+
+    // PUT the pack the repack of the source will write, as an orphan.
+    let src = repo.chunk_index().get(&id_b).unwrap();
+    let blob = repo
+        .storage
+        .get_range(
+            &src.pack_id.storage_key(),
+            src.pack_offset,
+            u64::from(src.stored_size),
+        )
+        .unwrap()
+        .unwrap();
+    let mut writer = crate::repo::pack::PackWriter::new_repack(
+        repo.config.min_pack_size as usize,
+        repo.content_hash(),
+    );
+    writer.add_blob(id_b, blob).unwrap();
+    let (orphan, _) = writer
+        .flush(repo.storage.as_ref(), repo.crypto.as_ref())
+        .unwrap();
+    assert_ne!(orphan, src.pack_id);
+    let key = orphan.storage_key();
+    assert!(repo.storage.exists(&key).unwrap());
+
+    let stats =
+        compact_repo_without_mark(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
+    assert_eq!(stats.packs_repacked, 1, "{stats:?}");
+    assert_eq!(stats.packs_orphan, 1, "{stats:?}");
+
+    assert_eq!(repo.chunk_index().get(&id_b).unwrap().pack_id, orphan);
+    assert!(
+        repo.storage.exists(&key).unwrap(),
+        "the repack output was deleted"
+    );
+    assert!(!repo.storage.exists(&src.pack_id.storage_key()).unwrap());
     assert_eq!(
         repo.read_chunk(&id_b).unwrap(),
         b"chunk-b-data-for-compact-test"
@@ -205,7 +261,8 @@ fn compact_after_delete_repacks() {
     repo.save_state().unwrap();
 
     // Compact should detect the dead blob and repack
-    let stats = compact_repo(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
+    let stats =
+        compact_repo_without_mark(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
 
     // Should have repacked (or deleted) at least one pack
     assert!(
@@ -239,7 +296,8 @@ fn compact_threshold_filters() {
     repo.save_state().unwrap();
 
     // With a very high threshold (90%), nothing should be repacked
-    let stats = compact_repo(&mut repo, 90.0, None, false, 4, &CancelToken::new()).unwrap();
+    let stats =
+        compact_repo_without_mark(&mut repo, 90.0, None, false, 4, &CancelToken::new()).unwrap();
     assert_eq!(stats.packs_repacked, 0);
     assert_eq!(stats.packs_deleted_empty, 0);
 }
@@ -256,7 +314,8 @@ fn compact_dry_run_does_not_modify() {
     // Count packs before
     let packs_before = count_all_packs(&repo);
 
-    let stats = compact_repo(&mut repo, 1.0, None, true, 4, &CancelToken::new()).unwrap();
+    let stats =
+        compact_repo_without_mark(&mut repo, 1.0, None, true, 4, &CancelToken::new()).unwrap();
 
     // Dry run should report activity
     assert!(stats.packs_repacked > 0 || stats.packs_deleted_empty > 0 || stats.space_freed > 0);
@@ -289,7 +348,8 @@ fn compact_empty_pack_deleted() {
     repo.chunk_index_mut().decrement(&id_a);
     repo.save_state().unwrap();
 
-    let stats = compact_repo(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
+    let stats =
+        compact_repo_without_mark(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
 
     assert_eq!(stats.packs_deleted_empty, 1);
     assert_eq!(stats.packs_repacked, 0);
@@ -342,7 +402,7 @@ fn repo_on_recording_backend(
         None,
         None,
         None,
-        crate::repo::RepoFormat::V5,
+        crate::repo::RepoFormat::V6,
     )
     .unwrap();
     repo.begin_write_session(&crate::repo::WriteSessionOptions::default())
@@ -389,7 +449,9 @@ fn compact_sizes_packs_from_the_listing() {
             assert!(packs >= 2, "packs {packs}");
 
             log.reset_metadata_counts();
-            let stats = compact_repo(&mut repo, 10.0, None, dead, 4, &CancelToken::new()).unwrap();
+            let stats =
+                compact_repo_without_mark(&mut repo, 10.0, None, dead, 4, &CancelToken::new())
+                    .unwrap();
             let ctx = format!("{listing:?} dead={dead}");
             let (tree_lists, sized_lists, sizes) = match listing {
                 Listing::Plain => (0, 256, packs),
@@ -398,11 +460,14 @@ fn compact_sizes_packs_from_the_listing() {
                 Listing::UnsizedTree => (1, 0, packs),
                 Listing::FailingTree => (1, 256, 0),
             };
+            // A compact that is not a dry run ends with the index upkeep and
+            // the pack-map pass: the latest head's listing and the
+            // `packmaps/` listing (plain), and the garbage collection's
+            // listings of `index.h/` and `index.d/` with mtimes (sized).
+            let upkeep = u64::from(!dead);
             assert_eq!(log.tree_list_count(), tree_lists, "{ctx}");
-            assert_eq!(log.sized_list_count(), sized_lists, "{ctx}");
-            // The one plain listing is the `index.d/` garbage scan that
-            // ends a compact that is not a dry run.
-            assert_eq!(log.list_count(), u64::from(!dead), "{ctx}");
+            assert_eq!(log.sized_list_count(), sized_lists + 2 * upkeep, "{ctx}");
+            assert_eq!(log.list_count(), 2 * upkeep, "{ctx}");
             assert_eq!(log.size_count(), sizes, "{ctx}");
             runs.push((
                 stats.packs_total,
@@ -437,7 +502,8 @@ fn compact_tree_listing_ignores_keys_outside_shards() {
             .put(&stray, &[0u8; vykar_protocol::PACK_HEADER_SIZE + 64])
             .unwrap();
 
-        let stats = compact_repo(&mut repo, 0.0, None, false, 4, &CancelToken::new()).unwrap();
+        let stats =
+            compact_repo_without_mark(&mut repo, 0.0, None, false, 4, &CancelToken::new()).unwrap();
         assert!(repo.storage.exists(&stray).unwrap(), "{listing:?}");
         runs.push((stats.packs_total, stats.packs_orphan));
     }
@@ -450,7 +516,7 @@ mod server_side {
 
     use super::assert_trailer_matches_index;
     use super::store_two_chunks;
-    use crate::commands::compact::compact_repo;
+    use crate::commands::compact::compact_repo_without_mark;
     use crate::compress::Compression;
     use crate::index::ChunkIndexEntry;
     use crate::index::segment::Segment;
@@ -768,11 +834,12 @@ mod server_side {
 
     #[test]
     fn sources_deleted_by_client_after_index_saved() {
-        let (mut repo, log) = server_repo(Mode::CopyToNewPack, false, RepoFormat::V5);
+        let (mut repo, log) = server_repo(Mode::CopyToNewPack, false, RepoFormat::V6);
         let (id_b, partial, empty) = setup_dead_packs(&mut repo);
         log.events.lock().unwrap().clear();
 
-        let stats = compact_repo(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
+        let stats =
+            compact_repo_without_mark(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
 
         let plans = log.plans.lock().unwrap().clone();
         assert!(!plans.is_empty());
@@ -787,10 +854,10 @@ mod server_side {
         let pos = |e: &str| {
             events
                 .iter()
-                .position(|x| x == e)
+                .position(|x| x == e || (e.ends_with('/') && x.starts_with(e)))
                 .unwrap_or_else(|| panic!("missing event {e:?} in {events:?}"))
         };
-        let saved = pos("put index");
+        let saved = pos("put index.h/");
         assert!(pos("repack") < saved);
         assert!(saved < pos(&format!("delete {partial}")));
         assert!(saved < pos(&format!("delete {empty}")));
@@ -811,11 +878,12 @@ mod server_side {
     /// no plan is sent, and the dead space is still freed.
     #[test]
     fn server_repack_not_offered_repacks_on_the_client() {
-        let (mut repo, log) = server_repo(Mode::NotOffered, false, RepoFormat::V5);
+        let (mut repo, log) = server_repo(Mode::NotOffered, false, RepoFormat::V6);
         let (id_b, partial, empty) = setup_dead_packs(&mut repo);
         log.events.lock().unwrap().clear();
 
-        let stats = compact_repo(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
+        let stats =
+            compact_repo_without_mark(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
 
         assert!(log.plans.lock().unwrap().is_empty());
         assert!(!log.events().iter().any(|e| e == "repack"));
@@ -833,11 +901,11 @@ mod server_side {
 
     #[test]
     fn source_returned_as_new_pack_is_kept() {
-        let (mut repo, log) = server_repo(Mode::ReturnSource, false, RepoFormat::V5);
+        let (mut repo, log) = server_repo(Mode::ReturnSource, false, RepoFormat::V6);
         let (id_a, partial, empty) = setup_dead_packs_live_first(&mut repo);
         log.events.lock().unwrap().clear();
 
-        compact_repo(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
+        compact_repo_without_mark(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
 
         let events = log.events();
         assert!(!events.contains(&format!("delete {partial}")), "{events:?}");
@@ -852,16 +920,18 @@ mod server_side {
 
     #[test]
     fn repack_error_leaves_sources_and_index() {
-        let (mut repo, log) = server_repo(Mode::FailRepack, false, RepoFormat::V5);
+        let (mut repo, log) = server_repo(Mode::FailRepack, false, RepoFormat::V6);
         let (id_b, partial, empty) = setup_dead_packs(&mut repo);
         log.events.lock().unwrap().clear();
 
-        assert!(compact_repo(&mut repo, 1.0, None, false, 4, &CancelToken::new()).is_err());
+        assert!(
+            compact_repo_without_mark(&mut repo, 1.0, None, false, 4, &CancelToken::new()).is_err()
+        );
 
         let events = log.events();
         assert!(
             events.iter().all(|e| !e.starts_with("delete ")
-                && e != "put index"
+                && !e.starts_with("put index.h/")
                 && !e.starts_with("put index.d/")),
             "{events:?}"
         );
@@ -873,9 +943,10 @@ mod server_side {
     /// `(packs_repacked, packs_deleted_empty, space_freed)` of a successful
     /// compact over [`setup_dead_packs`].
     fn delete_stats(mode: Mode, batch: bool) -> (u64, u64, u64) {
-        let (mut repo, _log) = server_repo(mode, batch, RepoFormat::V5);
+        let (mut repo, _log) = server_repo(mode, batch, RepoFormat::V6);
         setup_dead_packs(&mut repo);
-        let stats = compact_repo(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
+        let stats =
+            compact_repo_without_mark(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
         (
             stats.packs_repacked,
             stats.packs_deleted_empty,
@@ -892,11 +963,12 @@ mod server_side {
 
     #[test]
     fn sources_deleted_in_one_batch_after_index_saved() {
-        let (mut repo, log) = server_repo(Mode::CopyToNewPack, true, RepoFormat::V5);
+        let (mut repo, log) = server_repo(Mode::CopyToNewPack, true, RepoFormat::V6);
         let (id_b, partial, empty) = setup_dead_packs(&mut repo);
         log.events.lock().unwrap().clear();
 
-        let stats = compact_repo(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
+        let stats =
+            compact_repo_without_mark(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
 
         let events = log.events();
         let batches = batch_events(&events);
@@ -908,7 +980,7 @@ mod server_side {
             "{batch}"
         );
         let pos = |pred: &dyn Fn(&String) -> bool| events.iter().position(pred).unwrap();
-        assert!(pos(&|e| e == "put index") < pos(&|e| e == batch));
+        assert!(pos(&|e| e.starts_with("put index.h/")) < pos(&|e| e == batch));
         assert!(
             events.iter().all(|e| !e.starts_with("delete packs/")),
             "{events:?}"
@@ -932,11 +1004,11 @@ mod server_side {
 
     #[test]
     fn batch_never_names_a_source_returned_as_new_pack() {
-        let (mut repo, log) = server_repo(Mode::ReturnSource, true, RepoFormat::V5);
+        let (mut repo, log) = server_repo(Mode::ReturnSource, true, RepoFormat::V6);
         let (_id_a, partial, empty) = setup_dead_packs_live_first(&mut repo);
         log.events.lock().unwrap().clear();
 
-        compact_repo(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
+        compact_repo_without_mark(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
 
         let events = log.events();
         let batches = batch_events(&events);
@@ -948,20 +1020,21 @@ mod server_side {
 
     #[test]
     fn failed_batch_delete_falls_back_to_per_pack_deletes() {
-        let (mut repo, log) = server_repo(Mode::FailBatchDelete, true, RepoFormat::V5);
+        let (mut repo, log) = server_repo(Mode::FailBatchDelete, true, RepoFormat::V6);
         let (_id_b, partial, empty) = setup_dead_packs(&mut repo);
         log.events.lock().unwrap().clear();
 
-        let stats = compact_repo(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
+        let stats =
+            compact_repo_without_mark(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
 
         let events = log.events();
         let pos = |e: &str| {
             events
                 .iter()
-                .position(|x| x == e)
+                .position(|x| x == e || (e.ends_with('/') && x.starts_with(e)))
                 .unwrap_or_else(|| panic!("missing event {e:?} in {events:?}"))
         };
-        let saved = pos("put index");
+        let saved = pos("put index.h/");
         assert!(saved < pos(&format!("delete {partial}")));
         assert!(saved < pos(&format!("delete {empty}")));
         assert!(!repo.storage.exists(&partial).unwrap());
@@ -981,9 +1054,9 @@ mod server_side {
     /// writes them to, and the new pack's trailer matches the index.
     #[test]
     fn server_repack_sends_trailers() {
-        let (mut repo, log) = server_repo(Mode::CopyToNewPack, true, RepoFormat::V5);
+        let (mut repo, log) = server_repo(Mode::CopyToNewPack, true, RepoFormat::V6);
         let (id_b, _partial, _empty) = setup_dead_packs(&mut repo);
-        compact_repo(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
+        compact_repo_without_mark(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
 
         let plans = log.plans.lock().unwrap().clone();
         assert!(!plans.is_empty());
@@ -1023,11 +1096,12 @@ mod server_side {
     /// trailers: the client repacks, with the client path's results.
     #[test]
     fn server_without_repack_trailer_repacks_on_the_client() {
-        let (mut repo, log) = server_repo(Mode::NoTrailer, false, RepoFormat::V5);
+        let (mut repo, log) = server_repo(Mode::NoTrailer, false, RepoFormat::V6);
         let (id_b, partial, empty) = setup_dead_packs(&mut repo);
         log.events.lock().unwrap().clear();
 
-        let stats = compact_repo(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
+        let stats =
+            compact_repo_without_mark(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
 
         assert!(log.plans.lock().unwrap().is_empty());
         assert!(!repo.storage.exists(&partial).unwrap());
@@ -1053,11 +1127,12 @@ mod server_side {
     /// a failed one is.)
     #[test]
     fn wrong_server_offsets_are_refused() {
-        let (mut repo, log) = server_repo(Mode::WrongOffsets, true, RepoFormat::V5);
+        let (mut repo, log) = server_repo(Mode::WrongOffsets, true, RepoFormat::V6);
         let (id_b, partial, _empty) = setup_dead_packs(&mut repo);
         log.events.lock().unwrap().clear();
 
-        let err = compact_repo(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap_err();
+        let err = compact_repo_without_mark(&mut repo, 1.0, None, false, 4, &CancelToken::new())
+            .unwrap_err();
         assert!(err.to_string().contains("differ from the layout"), "{err}");
         assert!(repo.storage.exists(&partial).unwrap());
         assert_eq!(pack_of(&repo, &id_b), partial);
@@ -1133,11 +1208,11 @@ mod server_side {
     fn server_repack_persists_the_index_before_deleting_sources() {
         for batch in [false, true] {
             let ctx = format!("batch {batch}");
-            let (mut repo, log) = server_repo(Mode::CopyToNewPack, batch, RepoFormat::V5);
+            let (mut repo, log) = server_repo(Mode::CopyToNewPack, batch, RepoFormat::V6);
             let (id_b, partial, empty) = setup_dead_packs(&mut repo);
             log.events.lock().unwrap().clear();
 
-            compact_repo(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
+            compact_repo_without_mark(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
 
             let events = log.events();
             let first_delete = events
@@ -1146,7 +1221,7 @@ mod server_side {
                 .unwrap_or_else(|| panic!("{ctx}: no pack delete in {events:?}"));
             let before = &events[..first_delete];
             let heads: Vec<usize> = (0..before.len())
-                .filter(|&i| before[i] == "put index")
+                .filter(|&i| before[i].starts_with("put index.h/"))
                 .collect();
             assert_eq!(heads.len(), 1, "{ctx}: {events:?}");
             let segments: Vec<usize> = (0..before.len())
@@ -1172,12 +1247,13 @@ mod server_side {
     #[test]
     fn server_repack_delete_failure_keeps_the_index_on_new_packs_segmented() {
         for batch in [false, true] {
-            let (mut repo, log) = server_repo(Mode::FailPackDeletes, batch, RepoFormat::V5);
+            let (mut repo, log) = server_repo(Mode::FailPackDeletes, batch, RepoFormat::V6);
             let (id_b, partial, _empty) = setup_dead_packs(&mut repo);
             log.events.lock().unwrap().clear();
 
             let err =
-                compact_repo(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap_err();
+                compact_repo_without_mark(&mut repo, 1.0, None, false, 4, &CancelToken::new())
+                    .unwrap_err();
             assert!(err.to_string().contains("append-only"), "{err}");
             // The batch route reports the per-pack error, not its own wrapper.
             assert!(!err.to_string().contains("batch-delete"), "{err}");
@@ -1192,7 +1268,7 @@ mod server_side {
                 hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()),
                 "{events:?}"
             );
-            assert_eq!(events[2], "put index");
+            assert!(events[2].starts_with("put index.h/"), "{events:?}");
 
             let ctx = format!("batch {batch}");
             let (_dir, cold) = cold_open(&repo);
@@ -1210,14 +1286,14 @@ mod server_side {
 
     #[test]
     fn server_repack_then_fold_keeps_the_index_readable_segmented() {
-        let (mut repo, log) = server_repo(Mode::CopyToNewPack, true, RepoFormat::V5);
+        let (mut repo, log) = server_repo(Mode::CopyToNewPack, true, RepoFormat::V6);
         let (id_b, _partial, _empty) = setup_dead_packs(&mut repo);
         let mut policy = FoldPolicy::default();
         policy.soft.segments = 1;
         repo.set_fold_policy(policy);
         log.events.lock().unwrap().clear();
 
-        compact_repo(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
+        compact_repo_without_mark(&mut repo, 1.0, None, false, 4, &CancelToken::new()).unwrap();
 
         let events = log.events();
         let head = repo.index_head().unwrap().clone();
@@ -1287,7 +1363,9 @@ fn compact_sweeps_temp_files_once_and_never_on_dry_run() {
         });
         repo.storage = recorder.clone();
 
-        let stats = compact_repo(&mut repo, 10.0, None, dry_run, 4, &CancelToken::new()).unwrap();
+        let stats =
+            compact_repo_without_mark(&mut repo, 10.0, None, dry_run, 4, &CancelToken::new())
+                .unwrap();
         let calls = recorder.calls.lock().unwrap().clone();
         if dry_run {
             assert!(calls.is_empty(), "dry run must not sweep");
@@ -1338,7 +1416,7 @@ fn compact_honours_shutdown_during_analysis() {
 
     let shutdown = CancelToken::new();
     shutdown.cancel();
-    let err = compact_repo(&mut repo, 1.0, None, false, 4, &shutdown).unwrap_err();
+    let err = compact_repo_without_mark(&mut repo, 1.0, None, false, 4, &shutdown).unwrap_err();
     assert!(
         matches!(err, vykar_types::error::VykarError::Interrupted),
         "{err:?}"

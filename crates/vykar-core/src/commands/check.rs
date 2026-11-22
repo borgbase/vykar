@@ -18,7 +18,7 @@ pub use types::{
 // Re-exported for the crate-level unit tests in `tests::check_command`, which
 // reach these internals through `commands::check`.
 #[cfg(test)]
-pub(crate) use scan::verify_pack_full;
+pub(crate) use scan::{scan_for_test, verify_pack_full};
 #[cfg(test)]
 pub(crate) use server_verify::{process_verify_response, try_server_verify};
 #[cfg(test)]

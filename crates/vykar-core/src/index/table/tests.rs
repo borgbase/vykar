@@ -234,6 +234,53 @@ fn live_index_keeps_refcount_zero_entries() {
 }
 
 #[test]
+fn index_positions_cover_table_and_added_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let records: Vec<_> = (0..10).map(|n| record(n, 1)).collect();
+    let mut index = LiveIndex::from_table(scratch_of(dir.path(), &records));
+    index.remove(&id(2));
+    index.remove(&id(5));
+    for n in [20, 21, 22] {
+        index.add(id(n), 7, pack(9), u64::from(n));
+    }
+    index.add(id(5), 105, pack(4), 50);
+
+    let positions = index.positions();
+    assert_eq!(positions.len(), 13);
+    let mut seen = HashMap::new();
+    positions.for_each_live(|p, chunk, e| {
+        assert!((p as usize) < positions.len());
+        assert!(seen.insert(chunk, (p, e)).is_none(), "{chunk} twice");
+    });
+    let mut previous = None;
+    positions.for_each_live(|p, _, _| {
+        assert!(previous.is_none_or(|q| q < p), "not in position order");
+        previous = Some(p);
+    });
+    let distinct: std::collections::HashSet<u32> = seen.values().map(|(p, _)| *p).collect();
+    assert_eq!(distinct.len(), seen.len(), "positions are unique");
+
+    let expected: HashMap<ChunkId, ChunkIndexEntry> = index.iter().collect();
+    assert_eq!(seen.len(), expected.len());
+    for (chunk, (p, e)) in &seen {
+        assert_eq!(expected.get(chunk), Some(e), "{chunk}");
+        assert_eq!(positions.find(chunk), Some(*p));
+    }
+    for n in 0..30 {
+        assert_eq!(
+            positions.find(&id(n)).is_some(),
+            index.contains(&id(n)),
+            "find and contains disagree on {n}"
+        );
+    }
+    assert_eq!(
+        positions.find(&id(2)),
+        None,
+        "a removed table entry has no position"
+    );
+}
+
+#[test]
 fn diff_live_to_temp_refuses_a_table_at_another_state() {
     let dir = tempfile::tempdir().unwrap();
     let a = scratch_of(dir.path(), &[record(1, 1)]);

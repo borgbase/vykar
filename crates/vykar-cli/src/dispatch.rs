@@ -336,6 +336,10 @@ pub(crate) fn dispatch_command(
             cmd::break_lock::run_break_lock(cfg, label, *sessions).map(|()| false)
         }
         Commands::Compact {
+            report_unreferenced: true,
+            ..
+        } => cmd::compact::run_report_unreferenced(cfg, label, shutdown).map(|()| false),
+        Commands::Compact {
             threshold,
             max_repack_size,
             dry_run,

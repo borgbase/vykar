@@ -19,6 +19,7 @@ use vykar_storage::StorageBackend;
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
 use vykar_types::pack_id::PackId;
+use vykar_types::snapshot_id::SnapshotId;
 
 use super::util::open_repo;
 use crate::repo::OpenOptions;
@@ -136,13 +137,19 @@ pub fn load_snapshot_meta(repo: &Repository, snapshot_name: &str) -> Result<Snap
         .storage
         .get(&entry.id.storage_key())?
         .ok_or_else(|| VykarError::SnapshotNotFound(snapshot_name.into()))?;
+    decode_snapshot_meta(&entry.id, &meta_data, repo.crypto.as_ref())
+}
 
-    let meta_bytes = unpack_object_expect_with_context(
-        &meta_data,
-        ObjectType::SnapshotMeta,
-        entry.id.as_bytes(),
-        repo.crypto.as_ref(),
-    )?;
+/// Authenticate and decode the stored object of snapshot `id`, refusing a
+/// foreign envelope ([`VykarError::IncompatibleSnapshotEnvelope`]) and a
+/// format newer than this build ([`VykarError::UnsupportedSnapshotVersion`]).
+pub(crate) fn decode_snapshot_meta(
+    id: &SnapshotId,
+    blob: &[u8],
+    crypto: &dyn CryptoEngine,
+) -> Result<SnapshotMeta> {
+    let meta_bytes =
+        unpack_object_expect_with_context(blob, ObjectType::SnapshotMeta, id.as_bytes(), crypto)?;
     // A length mismatch here is a foreign envelope, not corruption: decryption
     // already authenticated the blob. Report it as such so the user gets the
     // remedy instead of a raw serde error.

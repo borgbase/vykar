@@ -6,18 +6,22 @@ use super::types::{CheckProgressEvent, IntegrityIssue, ItemImpact, emit_progress
 use crate::commands::list::{
     for_each_decoded_item, load_snapshot_item_stream_from_storage, load_snapshot_meta,
 };
+use crate::commands::mark::{
+    ChunkOutcome, OnChunkError, TreeChunkSet, default_decode_threads, walk_tree_chunks,
+};
 use crate::config::VykarConfig;
-use crate::index::ChunkIndexEntry;
-use crate::repo::Repository;
+use crate::index::{ChunkIndexEntry, LiveIndex};
 use crate::repo::control::CancelToken;
 use crate::repo::format::{
     BlobLocation, ChunkDecodeStage, ObjectType, decode_chunk_into,
     unpack_object_expect_with_context,
 };
+use crate::repo::manifest::SnapshotEntry;
 use crate::repo::pack::read_blob_from_pack;
 use crate::repo::pack_trailer::{
     PackTrailer, TrailerRead, read_pack_trailer, read_trailer_from_pack_bytes,
 };
+use crate::repo::{Repository, TreeChunkSource};
 use crate::snapshot::item::ItemType;
 use vykar_crypto::CryptoEngine;
 use vykar_protocol::validate_pack_header;
@@ -258,6 +262,140 @@ fn classify_meta_decode_issue(
     }
 }
 
+/// One snapshot of Phase 1 between its metadata load and the attribution
+/// of the tree-chunk results.
+struct SnapshotPass {
+    entry: SnapshotEntry,
+    /// Metadata and `DanglingItemPtr` issues, in today's order.
+    issues: Vec<IntegrityIssue>,
+    /// `None` when the metadata did not load.
+    item_ptrs: Option<Vec<ChunkId>>,
+}
+
+/// An item-level finding in one tree chunk, by the item's ordinal in the
+/// chunk; kept in item order, as the issues are reported.
+enum ItemFinding {
+    Invalid {
+        index: usize,
+        path: String,
+        reason: String,
+    },
+    Dangling {
+        index: usize,
+        path: String,
+        chunk_id: ChunkId,
+    },
+}
+
+/// What decoding one tree chunk on its own found.
+struct CheckedChunk {
+    items: usize,
+    issues: Vec<ItemFinding>,
+    /// Per item, its file chunk set (empty for non-regular items); collect
+    /// mode only.
+    per_item: Vec<HashSet<ChunkId>>,
+    /// Decoding stopped here, after `items` items.
+    error: Option<VykarError>,
+}
+
+/// Count down one use of slot `k`; true on the last.
+fn release_use(uses_left: &mut [u32], k: usize) -> bool {
+    match uses_left.get_mut(k) {
+        Some(n) => {
+            *n = n.saturating_sub(1);
+            *n == 0
+        }
+        None => true,
+    }
+}
+
+/// Decode one tree chunk and check its items: `validate()` and every
+/// `RegularFile` chunk reference against the index.
+fn check_tree_chunk(
+    plain: &[u8],
+    index: &LiveIndex,
+    collect_refs: bool,
+    shutdown: &CancelToken,
+) -> CheckedChunk {
+    let mut chunk = CheckedChunk {
+        items: 0,
+        issues: Vec::new(),
+        per_item: Vec::new(),
+        error: None,
+    };
+    let result = for_each_decoded_item(plain, |item| {
+        // Per-item poll: a single multi-million-item snapshot must stay
+        // responsive, not just the per-snapshot boundary.
+        shutdown.check()?;
+        let idx = chunk.items;
+        chunk.items += 1;
+        if let Err(e) = item.validate() {
+            chunk.issues.push(ItemFinding::Invalid {
+                index: idx,
+                path: item.path.clone(),
+                reason: e.to_string(),
+            });
+        }
+        let mut this_item: HashSet<ChunkId> = HashSet::new();
+        if item.entry_type == ItemType::RegularFile {
+            for chunk_ref in &item.chunks {
+                if collect_refs {
+                    this_item.insert(chunk_ref.id);
+                }
+                if !index.contains(&chunk_ref.id) {
+                    chunk.issues.push(ItemFinding::Dangling {
+                        index: idx,
+                        path: item.path.clone(),
+                        chunk_id: chunk_ref.id,
+                    });
+                }
+            }
+        }
+        if collect_refs {
+            chunk.per_item.push(this_item);
+        }
+        Ok(())
+    });
+    chunk.error = result.err();
+    chunk
+}
+
+/// What [`integrity_scan`] found, for the crate's unit tests.
+#[cfg(test)]
+pub(crate) struct ScanForTest {
+    pub(crate) issues: Vec<IntegrityIssue>,
+    pub(crate) snapshots_checked: usize,
+    pub(crate) items_checked: usize,
+    pub(crate) snapshot_per_item_chunks: HashMap<SnapshotId, Vec<HashSet<ChunkId>>>,
+    pub(crate) snapshot_item_counts: HashMap<SnapshotId, usize>,
+    pub(crate) snapshot_chunk_refs: HashMap<String, HashSet<ChunkId>>,
+}
+
+/// Run [`integrity_scan`] without orphan detection or data verification.
+#[cfg(test)]
+pub(crate) fn scan_for_test(
+    repo: &mut Repository,
+    config: &VykarConfig,
+    collect_chunk_refs: bool,
+) -> Result<ScanForTest> {
+    let opts = ScanOptions {
+        collect_chunk_refs,
+        detect_orphans: false,
+        verify_data: false,
+        skip_packs: None,
+        snapshot_sample_percent: None,
+    };
+    let scan = integrity_scan(repo, config, &opts, &mut None, &CancelToken::new())?;
+    Ok(ScanForTest {
+        issues: scan.issues,
+        snapshots_checked: scan.counters.snapshots_checked,
+        items_checked: scan.counters.items_checked,
+        snapshot_per_item_chunks: scan.snapshot_per_item_chunks,
+        snapshot_item_counts: scan.snapshot_item_counts,
+        snapshot_chunk_refs: scan.snapshot_chunk_refs,
+    })
+}
+
 /// Run the integrity scan, producing structured issues.
 ///
 /// `ScanOptions` controls which phases run and which packs are skipped.
@@ -393,7 +531,11 @@ pub(super) fn integrity_scan(
         all_snapshot_entries
     };
     let snapshot_count = snapshot_entries.len();
-    for (i, entry) in snapshot_entries.iter().enumerate() {
+
+    // Phase 1a: snapshot metadata, in sample order. Issues are kept per
+    // snapshot so the final order stays per snapshot.
+    let mut passes: Vec<SnapshotPass> = Vec::with_capacity(snapshot_count);
+    for (i, entry) in snapshot_entries.into_iter().enumerate() {
         shutdown.check()?;
         emit_progress(
             progress,
@@ -403,6 +545,12 @@ pub(super) fn integrity_scan(
                 name: entry.name.clone(),
             },
         );
+        let mut pass = SnapshotPass {
+            entry,
+            issues: Vec::new(),
+            item_ptrs: None,
+        };
+        let entry = &pass.entry;
 
         let meta = match load_snapshot_meta(repo, &entry.name) {
             Ok(m) => m,
@@ -410,38 +558,43 @@ pub(super) fn integrity_scan(
                 // The envelope decoded — the blob is intact, just too new.
                 // Classify as unsupported (never corrupt) and skip walking
                 // item_ptrs, since we can't trust a future item layout.
-                issues.push(IntegrityIssue::UnsupportedSnapshotVersion {
-                    snapshot_id: entry.id,
-                    snapshot_name: Some(entry.name.clone()),
-                    version,
-                });
+                pass.issues
+                    .push(IntegrityIssue::UnsupportedSnapshotVersion {
+                        snapshot_id: entry.id,
+                        snapshot_name: Some(entry.name.clone()),
+                        version,
+                    });
+                passes.push(pass);
                 continue;
             }
             Err(VykarError::IncompatibleSnapshotEnvelope { detail }) => {
                 // Decrypt succeeded and only the positional layout differs, so
                 // the blob is intact and was written by a newer vykar. Same
                 // treatment as a too-new format version: report, never repair.
-                issues.push(IntegrityIssue::IncompatibleSnapshotEnvelope {
-                    snapshot_id: entry.id,
-                    snapshot_name: Some(entry.name.clone()),
-                    detail,
-                });
+                pass.issues
+                    .push(IntegrityIssue::IncompatibleSnapshotEnvelope {
+                        snapshot_id: entry.id,
+                        snapshot_name: Some(entry.name.clone()),
+                        detail,
+                    });
+                passes.push(pass);
                 continue;
             }
             // A cancelled storage read is not corruption (see below).
             Err(e @ VykarError::Interrupted) => return Err(e),
             Err(e) => {
                 if is_transient_io(&e) {
-                    issues.push(IntegrityIssue::SnapshotReadFailed {
+                    pass.issues.push(IntegrityIssue::SnapshotReadFailed {
                         snapshot_name: entry.name.clone(),
                         detail: format!("load metadata: {e}"),
                     });
                 } else {
-                    issues.push(IntegrityIssue::CorruptSnapshot {
+                    pass.issues.push(IntegrityIssue::CorruptSnapshot {
                         snapshot_id: entry.id,
                         snapshot_name: Some(entry.name.clone()),
                     });
                 }
+                passes.push(pass);
                 continue;
             }
         };
@@ -462,95 +615,197 @@ pub(super) fn integrity_scan(
                     .insert(*chunk_id);
             }
             if !repo.chunk_index().contains(chunk_id) {
-                issues.push(IntegrityIssue::DanglingItemPtr {
+                pass.issues.push(IntegrityIssue::DanglingItemPtr {
                     snapshot_name: entry.name.clone(),
                     chunk_id: *chunk_id,
                 });
             }
         }
+        pass.item_ptrs = Some(meta.item_ptrs);
+        passes.push(pass);
+    }
 
-        // Load item stream, check file chunks
-        let items_stream = match load_snapshot_item_stream_from_storage(repo, &entry.name, shutdown)
-        {
-            Ok(s) => s,
-            // A cancellation is not corruption: re-raise it before the
-            // classification below can fabricate an issue that
-            // `check --repair` would then plan against.
-            Err(e @ VykarError::Interrupted) => return Err(e),
-            Err(e) => {
-                if is_transient_io(&e) {
-                    issues.push(IntegrityIssue::SnapshotReadFailed {
-                        snapshot_name: entry.name.clone(),
-                        detail: format!("load item stream: {e}"),
-                    });
-                } else {
-                    issues.push(IntegrityIssue::UnreadableSnapshot {
-                        snapshot_name: entry.name.clone(),
-                        detail: format!("load item stream: {e}"),
-                    });
+    // Phase 1b: read and decode every distinct tree chunk once, from storage.
+    let ptr_lists: Vec<&[ChunkId]> = passes
+        .iter()
+        .filter_map(|p| p.item_ptrs.as_deref())
+        .collect();
+    let set = TreeChunkSet::build(&ptr_lists);
+    drop(ptr_lists);
+    let collect_refs = opts.collect_chunk_refs;
+    let mut outcomes: Vec<Option<ChunkOutcome<CheckedChunk>>> =
+        std::iter::repeat_with(|| None).take(set.len()).collect();
+    {
+        let repo: &Repository = repo;
+        let index = repo.chunk_index();
+        walk_tree_chunks(
+            repo,
+            &set,
+            TreeChunkSource::Storage,
+            OnChunkError::Record,
+            default_decode_threads(),
+            shutdown,
+            |_, plain| check_tree_chunk(plain, index, collect_refs, shutdown),
+            |k, outcome| {
+                if let Some(slot) = outcomes.get_mut(k) {
+                    *slot = Some(outcome);
                 }
-                continue;
-            }
-        };
+                Ok(())
+            },
+        )?;
+    }
 
-        let mut per_snapshot_items = 0usize;
-        let mut item_index = 0usize;
-        let entry_name = entry.name.clone();
-        let entry_id = entry.id;
-        let collect_refs = opts.collect_chunk_refs;
+    // Phase 1c: attribute the results to the snapshots, in sample order.
+    // A snapshot's stream fails to load when one of its pointers is not in
+    // the index (resolution comes before any read) or its read failed.
+    let stream_failure = |ptrs: &[ChunkId]| -> Result<Option<IntegrityIssue>> {
+        let outcome = |id: &ChunkId| set.slot(id).and_then(|k| outcomes.get(k)?.as_ref());
+        for id in ptrs {
+            match outcome(id) {
+                Some(ChunkOutcome::NotInIndex) => {
+                    return Ok(Some(IntegrityIssue::UnreadableSnapshot {
+                        snapshot_name: String::new(),
+                        detail: format!("load item stream: {}", VykarError::ChunkNotInIndex(*id)),
+                    }));
+                }
+                Some(_) => {}
+                None => {
+                    return Err(VykarError::Other(format!(
+                        "internal error: tree chunk {id} was not walked"
+                    )));
+                }
+            }
+        }
+        for id in ptrs {
+            if let Some(ChunkOutcome::ReadFailed(e)) = outcome(id) {
+                let detail = format!("load item stream: {e}");
+                return Ok(Some(if is_transient_io(e) {
+                    IntegrityIssue::SnapshotReadFailed {
+                        snapshot_name: String::new(),
+                        detail,
+                    }
+                } else {
+                    IntegrityIssue::UnreadableSnapshot {
+                        snapshot_name: String::new(),
+                        detail,
+                    }
+                }));
+            }
+        }
+        Ok(None)
+    };
+    let mut stream_issues: Vec<Option<IntegrityIssue>> = Vec::with_capacity(passes.len());
+    // Per slot, how many pointer occurrences of walked snapshots remain; a
+    // chunk's per-item sets are moved out on the last one.
+    let mut uses_left: Vec<u32> = vec![0; set.len()];
+    for pass in &passes {
+        let issue = match &pass.item_ptrs {
+            Some(ptrs) => stream_failure(ptrs)?,
+            None => None,
+        };
+        if issue.is_none()
+            && let Some(ptrs) = &pass.item_ptrs
+        {
+            for id in ptrs {
+                if let Some(n) = set.slot(id).and_then(|k| uses_left.get_mut(k)) {
+                    *n += 1;
+                }
+            }
+        }
+        stream_issues.push(issue);
+    }
+
+    for (pass, stream_issue) in passes.into_iter().zip(stream_issues) {
+        issues.extend(pass.issues);
+        let entry = pass.entry;
+        let Some(ptrs) = pass.item_ptrs else {
+            continue;
+        };
+        if let Some(mut issue) = stream_issue {
+            match &mut issue {
+                IntegrityIssue::UnreadableSnapshot { snapshot_name, .. }
+                | IntegrityIssue::SnapshotReadFailed { snapshot_name, .. } => {
+                    *snapshot_name = entry.name.clone();
+                }
+                _ => {}
+            }
+            issues.push(issue);
+            continue;
+        }
+
+        let mut offset = 0usize;
         let mut item_issues: Vec<IntegrityIssue> = Vec::new();
-        let mut file_chunk_ids: Vec<ChunkId> = Vec::new();
+        let mut file_chunk_ids: HashSet<ChunkId> = HashSet::new();
         let mut per_item_chunks: Vec<HashSet<ChunkId>> = Vec::new();
-        let walk_result = for_each_decoded_item(&items_stream, |item| {
-            // Per-item poll: a single multi-million-item snapshot must stay
-            // responsive, not just the per-snapshot boundary.
-            shutdown.check()?;
-            let idx = item_index;
-            item_index += 1;
-            per_snapshot_items += 1;
-            if let Err(e) = item.validate() {
-                item_issues.push(IntegrityIssue::InvalidItem {
-                    snapshot_id: entry_id,
-                    snapshot_name: Some(entry_name.clone()),
-                    item_index: idx,
-                    item_path: item.path.clone(),
-                    reason: e.to_string(),
+        let mut walk_error: Option<String> = None;
+        let mut done = 0usize;
+        for id in &ptrs {
+            done += 1;
+            let Some(k) = set.slot(id) else {
+                continue;
+            };
+            let last_use = release_use(&mut uses_left, k);
+            let Some(Some(ChunkOutcome::Decoded(chunk))) = outcomes.get_mut(k) else {
+                continue;
+            };
+            for issue in &chunk.issues {
+                item_issues.push(match issue {
+                    ItemFinding::Invalid {
+                        index,
+                        path,
+                        reason,
+                    } => IntegrityIssue::InvalidItem {
+                        snapshot_id: entry.id,
+                        snapshot_name: Some(entry.name.clone()),
+                        item_index: offset + index,
+                        item_path: path.clone(),
+                        reason: reason.clone(),
+                    },
+                    ItemFinding::Dangling {
+                        index,
+                        path,
+                        chunk_id,
+                    } => IntegrityIssue::DanglingFileChunk {
+                        snapshot_name: entry.name.clone(),
+                        item_index: offset + index,
+                        path: path.clone(),
+                        chunk_id: *chunk_id,
+                    },
                 });
             }
-            let mut this_item: HashSet<ChunkId> = HashSet::new();
-            if item.entry_type == ItemType::RegularFile {
-                for chunk_ref in &item.chunks {
-                    if collect_refs {
-                        file_chunk_ids.push(chunk_ref.id);
-                        this_item.insert(chunk_ref.id);
-                    }
-                    if !repo.chunk_index().contains(&chunk_ref.id) {
-                        item_issues.push(IntegrityIssue::DanglingFileChunk {
-                            snapshot_name: entry_name.clone(),
-                            item_index: idx,
-                            path: item.path.clone(),
-                            chunk_id: chunk_ref.id,
-                        });
-                    }
-                }
-            }
             if collect_refs {
-                debug_assert_eq!(
-                    per_item_chunks.len(),
-                    idx,
-                    "per_item_chunks must mirror item ordinals"
-                );
-                per_item_chunks.push(this_item);
+                let sets = if last_use {
+                    std::mem::take(&mut chunk.per_item)
+                } else {
+                    chunk.per_item.clone()
+                };
+                for s in &sets {
+                    file_chunk_ids.extend(s.iter().copied());
+                }
+                per_item_chunks.extend(sets);
             }
-            Ok(())
-        });
-        let walk_ok = walk_result.is_ok();
-        if let Err(e) = walk_result {
-            // Same rule as the load above: a cancelled walk must not be
-            // reported as an unreadable snapshot.
-            if matches!(e, VykarError::Interrupted) {
-                return Err(e);
+            offset += chunk.items;
+            if let Some(e) = &chunk.error {
+                // A cancelled decode is not an unreadable snapshot.
+                if matches!(e, VykarError::Interrupted) {
+                    return Err(VykarError::Interrupted);
+                }
+                walk_error = Some(e.to_string());
+                break;
             }
+        }
+        // Pointers after a decode error are not walked: release them.
+        for id in ptrs.get(done..).unwrap_or_default() {
+            if let Some(k) = set.slot(id)
+                && release_use(&mut uses_left, k)
+                && let Some(Some(ChunkOutcome::Decoded(chunk))) = outcomes.get_mut(k)
+            {
+                chunk.per_item = Vec::new();
+            }
+        }
+
+        let walk_ok = walk_error.is_none();
+        if let Some(e) = walk_error {
             issues.push(IntegrityIssue::UnreadableSnapshot {
                 snapshot_name: entry.name.clone(),
                 detail: format!("decode items: {e}"),
@@ -567,20 +822,21 @@ pub(super) fn integrity_scan(
             // true item count, and the planner's data-presence gate must be
             // able to reject such snapshots from item-level repair.
             if walk_ok {
-                debug_assert_eq!(per_item_chunks.len(), per_snapshot_items);
-                snapshot_per_item_chunks.insert(entry_id, per_item_chunks);
-                snapshot_item_counts.insert(entry_id, per_snapshot_items);
+                debug_assert_eq!(per_item_chunks.len(), offset);
+                snapshot_per_item_chunks.insert(entry.id, per_item_chunks);
+                snapshot_item_counts.insert(entry.id, offset);
             }
         } else if walk_ok {
             // collect_chunk_refs disabled (read-only check): we don't need the
             // per-item chunk sets, but record the count so a future repair
             // pass can see this snapshot was successfully walked.
-            snapshot_item_counts.insert(entry_id, per_snapshot_items);
+            snapshot_item_counts.insert(entry.id, offset);
         }
 
-        counters.items_checked += per_snapshot_items;
+        counters.items_checked += offset;
         counters.snapshots_checked += 1;
     }
+    drop(outcomes);
 
     // Phase 2: Pack existence check
     let mut pack_chunks: HashMap<PackId, Vec<(ChunkId, ChunkIndexEntry)>> = HashMap::new();

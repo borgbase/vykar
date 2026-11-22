@@ -1410,6 +1410,47 @@ fn cli_empty_config_exits_with_error() {
 // ── check --repair tests ────────────────────────────────────────────────────
 
 #[test]
+fn cli_compact_report_unreferenced_prints_counts() {
+    let fx = CliFixture::new();
+    write_plain_config(&fx.config_path, &fx.repo_dir);
+    std::fs::write(fx.source_a.join("some.txt"), b"some data\n").unwrap();
+    let cfg = fx.config_path.to_string_lossy().to_string();
+    let source = fx.source_a.to_string_lossy().to_string();
+    fx.run_ok(&["--config", &cfg, "init"]);
+    fx.run_ok(&["--config", &cfg, "backup", &source]);
+
+    let out = fx.run_ok(&["--config", &cfg, "compact", "--report-unreferenced"]);
+    let lines: Vec<&str> = out.lines().collect();
+    for prefix in [
+        "Snapshots: 1 (",
+        "Index entries: ",
+        "Packs with unreferenced entries: 0 (",
+        "Stored refcounts that differ from the references counted: 0 (",
+    ] {
+        assert!(
+            lines.iter().any(|l| l.starts_with(prefix)),
+            "no line starting with {prefix:?}:\n{out}"
+        );
+    }
+    assert!(out.contains(" 0 unreferenced,"), "{out}");
+}
+
+#[test]
+fn cli_compact_report_unreferenced_conflicts_with_dry_run() {
+    let fx = CliFixture::new();
+    write_plain_config(&fx.config_path, &fx.repo_dir);
+    let cfg = fx.config_path.to_string_lossy().to_string();
+    let (_, err) = fx.run_err(&[
+        "--config",
+        &cfg,
+        "compact",
+        "--report-unreferenced",
+        "--dry-run",
+    ]);
+    assert!(err.contains("cannot be used with"), "{err}");
+}
+
+#[test]
 fn cli_check_repair_dry_run_prints_plan() {
     let fx = CliFixture::new();
     write_plain_config(&fx.config_path, &fx.repo_dir);

@@ -689,7 +689,7 @@ Command dumps participate in this same item stream. A source with `command_dumps
 Restore now also consumes item streams incrementally (streaming deserialization) instead of materializing full `Vec<Item>` state up front.
 Item-stream and file-data chunks are resolved through the chunk table of the open head. A lazily read item stream whose chunk cannot be read at its location (a compaction moved it after the index was loaded) re-resolves the rest once against the index at a freshly read head.
 
-Commands that load a whole item stream (delete, prune, check, list, diff, find, mount, and backup's parent-snapshot load) fetch its coalesced range reads in parallel at the backend's request width, derived from `limits.connections` (remote: `min(connections*3, 24)`, local: `min(connections, 8)`), and reassemble them in stream order; restore reads the stream lazily, one window at a time. All of them except check take tree chunks from the local [tree-chunk cache](#local-optimization-caches-client-machine) first and read only the misses from storage. These loads and restore's file-data reads go through one fetch/decode loop (`repo::blob_read`): one range request per coalesced group, each blob decoded in place as it is read.
+Commands that load a whole item stream (delete, prune, check, list, diff, find, mount, and backup's parent-snapshot load) fetch its coalesced range reads in parallel at the backend's request width, derived from `limits.connections` (remote: `min(connections*3, 24)`, local: `min(connections, 8)`), and reassemble them in stream order; restore reads the stream lazily, one window at a time. All of them except check take tree chunks from the local [tree-chunk cache](#local-optimization-caches-client-machine) first and read only the misses from storage. `check` and the refcount rebuild of `check --repair` instead read and decode each distinct tree chunk once across all checked snapshots, from storage (see [Mark](#mark)), and attribute the results to every snapshot that names it. These loads and restore's file-data reads go through one fetch/decode loop (`repo::blob_read`): one range request per coalesced group, each blob decoded in place as it is read.
 
 ---
 
@@ -768,6 +768,8 @@ flowchart TD
 4. **Orphaned blobs** — after delete/prune commits, the encrypted blob data remains in pack files (the index no longer points to it, but the bytes are still on disk)
 5. **Compact** — rewrites packs to reclaim space from orphaned blobs
 
+`vykar compact --report-unreferenced` marks the index from the snapshots (see [Mark](#mark)) and reports the entries no snapshot references, which is what a sweep would remove, and compares the stored refcounts with the references it counted. It changes nothing: the stored refcounts stay the source of truth until compact sweeps by the mark.
+
 This design means `delete` is fast (just index updates), while space reclamation is deferred to `compact`.
 
 ### Crash Recovery
@@ -808,7 +810,7 @@ Each backup session accumulates index mutations in an `IndexDelta`: `new_entries
 
 #### Index Then Snapshot Commit Point
 
-The index is always written before `snapshots/<id>`. A crash between these two writes leaves orphan entries in the index (no snapshot references them) — a bounded, never-data-loss space leak. `compact` alone does **not** reclaim these: it treats any in-index chunk as live, so an orphan still in the index counts toward `live_bytes`. They are reclaimed by `vykar check --repair`, whose always-on refcount rebuild recomputes refcounts from the surviving snapshots and drops index entries no snapshot references; a subsequent `vykar compact` then frees the orphaned pack bytes. Once `snapshots/<id>` is written, the backup is committed. Delete/prune intentionally invert this ordering: snapshot object first, then index save, so crashes leave inflated refcounts instead of visible snapshots whose chunks were already removed from the index.
+The index is always written before `snapshots/<id>`. A crash between these two writes leaves orphan entries in the index (no snapshot references them) — a bounded, never-data-loss space leak. `compact` alone does **not** reclaim these: it treats any in-index chunk as live, so an orphan still in the index counts toward `live_bytes`. `vykar compact --report-unreferenced` lists them as unreferenced entries (and as unreferenced entries with a refcount). They are reclaimed by `vykar check --repair`, whose always-on refcount rebuild recomputes refcounts from the surviving snapshots and drops index entries no snapshot references; a subsequent `vykar compact` then frees the orphaned pack bytes. Once `snapshots/<id>` is written, the backup is committed. Delete/prune intentionally invert this ordering: snapshot object first, then index save, so crashes leave inflated refcounts instead of visible snapshots whose chunks were already removed from the index.
 
 ### Compact
 
@@ -859,10 +861,22 @@ For each candidate pack (most wasteful first, respecting `--max-repack-size` cap
 
 The crash-safety invariant is visible in the Phase 2 ordering above: the index never points to a deleted pack. Sequence: write new pack → save index → delete old pack. A crash between steps leaves an orphan old pack (harmless, cleaned up on next compact).
 
+#### Mark
+
+The mark (`commands::mark`) answers which index entries the snapshots reference, reading each tree chunk once:
+
+1. **Strict listing.** Every object under `snapshots/` on storage is fetched at the backend's request width, authenticated and decoded; the local snapshot list is not used. It fails closed: a key that is not a snapshot ID, a listed object that is gone, an object that cannot be read, decrypted or decoded, a foreign envelope and a newer format version all fail the mark.
+2. **One read per distinct tree chunk.** The union of the snapshots' `item_ptrs` is resolved through the index before any read (a pointer the index lacks fails the mark, even when the chunk is cached), sorted by pack and offset and read in batches of at most 2 000 chunks or 64 MiB stored, from the tree-chunk cache first.
+3. **Parallel decode.** Each tree chunk is decoded on its own on up to `min(available_parallelism, 8)` threads; a chunk that does not decode alone, and a data reference the index lacks, fail the mark.
+4. **A bit per index position.** Every chunk reference of every item, and every tree chunk, sets the bit of its index position; optionally the references are counted with snapshot multiplicity (a tree chunk named by three snapshots counts its references three times), the semantics of the stored refcounts.
+
+`vykar compact --report-unreferenced` runs the mark under the maintenance lock, so no backup can have committed index entries whose snapshot is not written yet, and refuses while backups run (`ActiveSessions`). It writes no index, pack or snapshot object; like every maintenance command, taking the lock cleans up stale session markers and orphaned session journals first. On success it deletes cached tree chunks no live snapshot uses. `check` and the refcount rebuild of `check --repair` use the same tree-chunk traversal, reading storage only.
+
 #### CLI
 
 ```text
 vykar compact [--threshold N] [--max-repack-size 2G] [-n/--dry-run]
+vykar compact --report-unreferenced
 ```
 
 ---

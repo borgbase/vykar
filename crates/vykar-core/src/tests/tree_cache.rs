@@ -251,6 +251,69 @@ fn a_pointer_missing_from_the_index_fails_even_when_cached() {
     );
 }
 
+#[test]
+fn read_tree_chunks_split_bounds_match_per_chunk_reads() {
+    for mode in modes() {
+        let (mut repo, _log) = memory_repo(mode.clone());
+        // 20 tree chunks in 3 packs.
+        let mut locs: Vec<Loc> = Vec::new();
+        for pack in 0..3 {
+            for i in 0..7 {
+                if locs.len() == 20 {
+                    break;
+                }
+                let data = format!("split-{pack}-{i:02}-{}", "q".repeat(i * 31)).into_bytes();
+                let id = repo
+                    .store_chunk(&data, Compression::None, PackType::Tree)
+                    .unwrap()
+                    .0;
+                locs.push((id, PackId::from_bytes([0; 32]), 0, 0));
+            }
+            crate::testutil::save_and_resume(&mut repo);
+        }
+        for loc in &mut locs {
+            let e = repo.chunk_index().get(&loc.0).unwrap();
+            *loc = (loc.0, e.pack_id, e.pack_offset, e.stored_size);
+        }
+        let packs: HashSet<PackId> = locs.iter().map(|l| l.1).collect();
+        assert_eq!(packs.len(), 3, "{mode:?}");
+        // Interleave the packs and repeat one chunk.
+        let mut order: Vec<Loc> = (0..7)
+            .flat_map(|i| [i, 7 + i, 14 + i])
+            .filter_map(|i| locs.get(i).copied())
+            .collect();
+        order.insert(5, locs[3]);
+        let expected: Vec<Vec<u8>> = order
+            .iter()
+            .map(|l| repo.read_chunk_at(&l.0, &l.1, l.2, l.3).unwrap())
+            .collect();
+
+        let cache = cache_of(&repo);
+        for (i, loc) in locs.iter().enumerate() {
+            if i % 2 == 0 {
+                cache.remove(&loc.0);
+            }
+        }
+        for source in [TreeChunkSource::CacheFirst, TreeChunkSource::Storage] {
+            let mut out = b"prefix".to_vec();
+            let mut ends = vec![99];
+            repo.read_tree_chunks_split(&order, &mut out, &mut ends, &CancelToken::new(), source)
+                .unwrap();
+            assert_eq!(ends.len(), order.len(), "{mode:?} {source:?}");
+            let mut start = b"prefix".len();
+            for (i, &end) in ends.iter().enumerate() {
+                assert_eq!(
+                    out[start..end],
+                    expected[i][..],
+                    "{mode:?} {source:?} chunk {i}"
+                );
+                start = end;
+            }
+            assert_eq!(start, out.len());
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Lazy stream (restore)
 // ---------------------------------------------------------------------------

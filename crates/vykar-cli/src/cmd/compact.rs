@@ -40,6 +40,45 @@ pub(crate) fn run_compact(
     Ok(())
 }
 
+/// `vykar compact --report-unreferenced`: the counts of a mark, on stdout.
+pub(crate) fn run_report_unreferenced(
+    config: &VykarConfig,
+    label: Option<&str>,
+    shutdown: &CancelToken,
+) -> CliResult<()> {
+    let report = with_repo_passphrase(config, label, |passphrase| {
+        Ok(commands::compact::report_unreferenced(
+            config, passphrase, shutdown,
+        )?)
+    })?;
+    println!(
+        "Snapshots: {} ({} distinct tree chunks, {} stored)",
+        report.snapshots,
+        report.tree_chunks,
+        format_bytes(report.tree_stored_bytes),
+    );
+    println!(
+        "Index entries: {} ({} referenced, {} unreferenced, {})",
+        report.entries,
+        report.referenced,
+        report.unreferenced.len(),
+        format_bytes(report.unreferenced_bytes),
+    );
+    println!(
+        "Packs with unreferenced entries: {} ({} hold nothing referenced, {})",
+        report.packs_with_unreferenced,
+        report.packs_only_unreferenced,
+        format_bytes(report.packs_only_unreferenced_bytes),
+    );
+    println!(
+        "Stored refcounts that differ from the references counted: {} ({} unreferenced with a refcount, {} referenced at refcount 0)",
+        report.refcount_mismatches,
+        report.unreferenced_with_refcount,
+        report.referenced_with_zero_refcount,
+    );
+    Ok(())
+}
+
 /// The completion line plus any pack warnings, shared with the full-cycle
 /// summary in `dispatch`.
 pub(crate) fn print_compact_summary(stats: &commands::compact::CompactStats) {

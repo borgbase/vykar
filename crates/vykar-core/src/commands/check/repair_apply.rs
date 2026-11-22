@@ -4,12 +4,15 @@ use super::types::{IntegrityIssue, RepairAction, RepairPlan};
 use crate::commands::list::{
     for_each_decoded_item, load_snapshot_item_stream_from_storage, load_snapshot_meta,
 };
+use crate::commands::mark::{
+    MarkOptions, MissingRefs, TreeChunkSet, default_decode_threads, mark_live,
+};
 use crate::compress::Compression;
 use crate::index::ChunkIndexEntry;
 use crate::repo::control::CancelToken;
 use crate::repo::format::{ObjectType, pack_object_with_context};
 use crate::repo::manifest::SnapshotEntry;
-use crate::repo::{Repository, WriteSessionOptions};
+use crate::repo::{Repository, TreeChunkSource, WriteSessionOptions};
 use crate::snapshot::SnapshotMeta;
 use crate::snapshot::item::ItemType;
 use vykar_storage::StorageBackend;
@@ -441,7 +444,6 @@ pub(super) fn execute_repair(
         .map(|s| s.as_str())
         .collect();
 
-    let mut new_refcounts: HashMap<ChunkId, u32> = HashMap::new();
     let surviving_entries: Vec<_> = repo
         .manifest()
         .snapshots
@@ -450,6 +452,10 @@ pub(super) fn execute_repair(
         .cloned()
         .collect();
 
+    // Every surviving snapshot must be counted: a snapshot left out would
+    // have its references dropped when the rebuilt counts are persisted.
+    let mut names: Vec<String> = Vec::with_capacity(surviving_entries.len());
+    let mut ptr_lists: Vec<Vec<ChunkId>> = Vec::with_capacity(surviving_entries.len());
     for entry in &surviving_entries {
         let meta = match load_snapshot_meta(repo, &entry.name) {
             Ok(m) => m,
@@ -461,43 +467,47 @@ pub(super) fn execute_repair(
                 )));
             }
         };
-
-        // Count item_ptrs chunks
-        for chunk_id in &meta.item_ptrs {
-            if repo.chunk_index().contains(chunk_id) {
-                *new_refcounts.entry(*chunk_id).or_insert(0) += 1;
-            }
-        }
-
-        // Count file chunks
-        let items_stream =
-            match load_snapshot_item_stream_from_storage(repo, &entry.name, &CancelToken::new()) {
-                Ok(s) => s,
-                Err(e) => {
-                    return Err(VykarError::Other(format!(
-                        "aborting repair: cannot load item stream for '{}' during \
-                     refcount rebuild: {e} (persisting would drop live references)",
-                        entry.name
-                    )));
-                }
-            };
-        if let Err(e) = for_each_decoded_item(&items_stream, |item| {
-            if item.entry_type == ItemType::RegularFile {
-                for chunk_ref in &item.chunks {
-                    if repo.chunk_index().contains(&chunk_ref.id) {
-                        *new_refcounts.entry(chunk_ref.id).or_insert(0) += 1;
-                    }
-                }
-            }
-            Ok(())
-        }) {
-            return Err(VykarError::Other(format!(
-                "aborting repair: failed to decode items for '{}' during \
-                 refcount rebuild: {e} (persisting would drop live references)",
-                entry.name
-            )));
-        }
+        names.push(entry.name.clone());
+        ptr_lists.push(meta.item_ptrs);
     }
+
+    // Decoded once per distinct tree chunk; counts are multiplied by how
+    // often each tree chunk occurs. Tree chunks come from storage, never the
+    // local cache. A data reference missing from the index is skipped; a
+    // tree pointer missing from the index or unreadable aborts.
+    let new_refcounts: HashMap<ChunkId, u32> = {
+        let ptrs: Vec<&[ChunkId]> = ptr_lists.iter().map(Vec::as_slice).collect();
+        let set = TreeChunkSet::build(&ptrs);
+        let positions = repo.chunk_index().positions();
+        let found = mark_live(
+            repo,
+            &set,
+            &names,
+            &positions,
+            TreeChunkSource::Storage,
+            MarkOptions {
+                count: true,
+                missing_refs: MissingRefs::Ignore,
+                decode_threads: default_decode_threads(),
+            },
+            &CancelToken::new(),
+        )
+        .map_err(|e| {
+            VykarError::Other(format!(
+                "aborting repair: cannot rebuild refcounts: {e} \
+                 (persisting would drop live references)"
+            ))
+        })?;
+        let mut map = HashMap::new();
+        positions.for_each_live(|p, id, _| {
+            if let Some(n) = found.count(p)
+                && n > 0
+            {
+                map.insert(id, n);
+            }
+        });
+        map
+    };
 
     repo.chunk_index_mut().rebuild_refcounts(&new_refcounts);
     applied.push(RepairAction::RebuildRefcounts);

@@ -294,6 +294,10 @@ pub(crate) enum Commands {
         /// Only show what would be compacted, don't actually do it
         #[arg(short = 'n', long)]
         dry_run: bool,
+
+        /// Report index entries no snapshot references, without changing anything
+        #[arg(long, conflicts_with_all = ["threshold", "max_repack_size", "dry_run"])]
+        report_unreferenced: bool,
     },
 
     /// Upgrade the repository to the current format (one-way)

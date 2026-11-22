@@ -22,6 +22,7 @@ mod lock;
 mod lock_fence;
 mod maintenance_index;
 mod manifest;
+mod mark;
 mod measure;
 mod passphrase;
 mod proptest;

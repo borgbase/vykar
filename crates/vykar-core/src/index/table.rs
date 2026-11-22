@@ -899,6 +899,87 @@ impl Iterator for LiveIter<'_> {
 }
 
 // ---------------------------------------------------------------------------
+// Dense positions
+// ---------------------------------------------------------------------------
+
+/// Dense positions over the live entries of a [`LiveIndex`], for marks and
+/// counts kept in flat arrays. Table entries keep their table position;
+/// entries of the overlay's additions follow at `table_len + k`, `k` their
+/// rank in chunk-ID order. Valid for the index it borrows (no edit can
+/// happen while it is borrowed).
+pub(crate) struct IndexPositions<'a> {
+    index: &'a LiveIndex,
+    table_len: u32,
+    /// Chunk ID of an added entry -> its position (`table_len + k`).
+    added: ChunkIdHashMap<u32>,
+    /// The added entries' chunk IDs, sorted.
+    added_ids: Vec<ChunkId>,
+}
+
+impl LiveIndex {
+    /// Dense positions over this index's live entries.
+    pub(crate) fn positions(&self) -> IndexPositions<'_> {
+        let table_len = self.table.as_ref().map_or(0, |t| t.len()) as u32;
+        let mut added_ids: Vec<ChunkId> = self.overlay.added.keys().copied().collect();
+        added_ids.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        let mut added = ChunkIdHashMap::default();
+        added.reserve(added_ids.len());
+        for (k, id) in added_ids.iter().enumerate() {
+            added.insert(*id, table_len + k as u32);
+        }
+        IndexPositions {
+            index: self,
+            table_len,
+            added,
+            added_ids,
+        }
+    }
+}
+
+impl IndexPositions<'_> {
+    /// Size of the position space (removed table positions included; they are
+    /// never returned by `find` or `for_each_live`).
+    pub(crate) fn len(&self) -> usize {
+        self.table_len as usize + self.added_ids.len()
+    }
+
+    /// Position of a live entry; `None` when `id` is absent or removed. A
+    /// table hit at a removed position is `None`, as for
+    /// [`LiveIndex::contains`]: re-adding a removed chunk clears its removal.
+    pub(crate) fn find(&self, id: &ChunkId) -> Option<u32> {
+        if let Some(table) = &self.index.table
+            && let Some((position, _)) = table.find(id)
+        {
+            return (!self.index.overlay.is_removed(position)).then_some(position);
+        }
+        self.added.get(id).copied()
+    }
+
+    /// Every live entry with its position, in position order (table first,
+    /// then additions in chunk-ID order).
+    pub(crate) fn for_each_live(&self, mut f: impl FnMut(u32, ChunkId, ChunkIndexEntry)) {
+        if let Some(table) = &self.index.table {
+            for position in 0..self.table_len {
+                if self.index.overlay.is_removed(position) {
+                    continue;
+                }
+                let record = table.entry_at(position);
+                f(
+                    position,
+                    record.chunk_id,
+                    self.index.table_entry(position, &record),
+                );
+            }
+        }
+        for (k, id) in self.added_ids.iter().enumerate() {
+            if let Some(e) = self.index.overlay.added.get(id) {
+                f(self.table_len + k as u32, *id, *e);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Diff against the table
 // ---------------------------------------------------------------------------
 

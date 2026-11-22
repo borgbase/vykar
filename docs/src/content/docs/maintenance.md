@@ -26,7 +26,16 @@ vykar compact --dry-run
 
 # Repack to reclaim space
 vykar compact
+
+# Report index entries no snapshot references (changes nothing)
+vykar compact --report-unreferenced
 ```
+
+`--report-unreferenced` reads every snapshot and prints how many index entries
+no snapshot references, their size, the packs that hold them, and how many
+stored refcounts differ from the references it counted. It takes the
+maintenance lock, so it refuses while backups run, and fails rather than
+reporting anything when a snapshot or a listing chunk cannot be read.
 
 ## Verify repository integrity
 
@@ -83,7 +92,8 @@ The refcount rebuild also reclaims the space leak left by an **interrupted backu
 If a backup crashes after its index was committed but before its snapshot was
 written, the index keeps orphan chunk entries (and inflated refcounts) that no
 snapshot references. `compact` alone will not free these — it treats any in-index
-chunk as live. `vykar check --repair` recomputes refcounts from the surviving
+chunk as live. `vykar compact --report-unreferenced` counts them.
+`vykar check --repair` recomputes refcounts from the surviving
 snapshots and drops the orphan entries; a follow-up `vykar compact` then reclaims
 the disk space.
 

@@ -5,10 +5,10 @@ use std::sync::{Arc, Mutex};
 
 use tracing::{info, warn};
 
+use super::mark;
 use super::util::{open_repo, with_maintenance_lock};
 use crate::config::VykarConfig;
 use crate::repo::OpenOptions;
-use crate::repo::Repository;
 use crate::repo::control::CancelToken;
 use crate::repo::pack::PackWriter;
 use crate::repo::pack_listing::{ListedPack, list_packs};
@@ -16,6 +16,7 @@ use crate::repo::pack_trailer::{
     PackTrailer, TRAILER_FOOTER_LEN, TrailerPackType, framed_offsets, parse_footer,
     trailer_blob_len, trailer_frame_start,
 };
+use crate::repo::{Repository, TreeChunkSource};
 use vykar_crypto::CryptoEngine;
 use vykar_protocol::{
     MAX_KEEP_BLOBS_PER_OP, MAX_REPACK_OPS, MAX_REPACK_OUTPUT_BYTES, MAX_REPACK_PLAN_JSON_BYTES,
@@ -90,6 +91,148 @@ pub fn run(
     // crash-safe by design.
     let mut repo = open_repo(config, passphrase, OpenOptions::new(), shutdown)?;
     run_on_repo(&mut repo, threshold, max_repack_size, dry_run, shutdown)
+}
+
+/// What a mark found in the index (`vykar compact --report-unreferenced`).
+/// Nothing on storage changes to produce it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UnreferencedReport {
+    pub snapshots: usize,
+    pub tree_chunks: usize,
+    pub tree_stored_bytes: u64,
+    pub items: u64,
+    pub references: u64,
+    pub entries: usize,
+    pub referenced: usize,
+    /// Index entries no live snapshot references, sorted by chunk ID.
+    pub unreferenced: Vec<ChunkId>,
+    pub unreferenced_bytes: u64,
+    /// Packs holding at least one unreferenced entry / only unreferenced ones.
+    pub packs_with_unreferenced: usize,
+    pub packs_only_unreferenced: usize,
+    /// Stored bytes (sum of `stored_size`) of the entries in the packs
+    /// counted by `packs_only_unreferenced`.
+    pub packs_only_unreferenced_bytes: u64,
+    /// Oracle while refcounts are stored: entries whose stored refcount
+    /// differs from the references counted.
+    pub refcount_mismatches: usize,
+    /// Unreferenced entries whose stored refcount is above 0 (leaks).
+    pub unreferenced_with_refcount: usize,
+    /// Referenced entries stored at refcount 0.
+    pub referenced_with_zero_refcount: usize,
+}
+
+/// Open the repository and run `report_unreferenced_on_repo`: the report of
+/// `vykar compact --report-unreferenced`.
+pub fn report_unreferenced(
+    config: &VykarConfig,
+    passphrase: Option<&str>,
+    shutdown: &CancelToken,
+) -> Result<UnreferencedReport> {
+    let mut repo = open_repo(config, passphrase, OpenOptions::new(), shutdown)?;
+    report_unreferenced_on_repo(&mut repo, shutdown)
+}
+
+/// Under the maintenance lock: load the index, list snapshots strictly,
+/// mark from the tree-chunk cache first, and tally the index against the
+/// mark. Fails closed. On success, drops cached tree chunks no live snapshot
+/// uses.
+///
+/// Read-only for the repository's data: no index, pack or snapshot object is
+/// written. Taking the maintenance lock does run its stale-session cleanup,
+/// which can delete stale session markers and orphaned session journals,
+/// exactly as `compact --dry-run` does.
+pub(crate) fn report_unreferenced_on_repo(
+    repo: &mut Repository,
+    shutdown: &CancelToken,
+) -> Result<UnreferencedReport> {
+    with_maintenance_lock(repo, |repo| {
+        report_under_lock(repo, shutdown).map_err(|e| {
+            if mark::passes_through(&e) {
+                e
+            } else {
+                VykarError::Other(format!(
+                    "cannot report unreferenced chunks, nothing was changed: {e}. \
+                     Run `vykar check` for details"
+                ))
+            }
+        })
+    })
+}
+
+fn report_under_lock(repo: &mut Repository, shutdown: &CancelToken) -> Result<UnreferencedReport> {
+    repo.load_chunk_index_under_lock()?;
+    let snaps = mark::load_snapshots_strict(repo, shutdown)?;
+    let names: Vec<String> = snaps.iter().map(mark::LiveSnapshot::label).collect();
+    let ptrs: Vec<&[ChunkId]> = snaps.iter().map(|s| s.meta.item_ptrs.as_slice()).collect();
+    let set = mark::TreeChunkSet::build(&ptrs);
+
+    let positions = repo.chunk_index().positions();
+    let found = mark::mark_live(
+        repo,
+        &set,
+        &names,
+        &positions,
+        TreeChunkSource::CacheFirst,
+        mark::MarkOptions {
+            count: true,
+            missing_refs: mark::MissingRefs::Abort,
+            decode_threads: mark::default_decode_threads(),
+        },
+        shutdown,
+    )?;
+
+    let mut report = UnreferencedReport {
+        snapshots: snaps.len(),
+        tree_chunks: set.len(),
+        tree_stored_bytes: found.walk.stored_bytes,
+        items: found.items,
+        references: found.references,
+        ..UnreferencedReport::default()
+    };
+    // Per pack: (unreferenced entries, referenced entries, stored bytes).
+    let mut packs: HashMap<PackId, (u32, u32, u64)> = HashMap::new();
+    positions.for_each_live(|p, id, e| {
+        report.entries += 1;
+        let tally = packs.entry(e.pack_id).or_default();
+        tally.2 += u64::from(e.stored_size);
+        let marked = found.is_marked(p);
+        if marked {
+            report.referenced += 1;
+            tally.1 += 1;
+            if e.refcount == 0 {
+                report.referenced_with_zero_refcount += 1;
+            }
+        } else {
+            report.unreferenced.push(id);
+            report.unreferenced_bytes += u64::from(e.stored_size);
+            tally.0 += 1;
+            if e.refcount > 0 {
+                report.unreferenced_with_refcount += 1;
+            }
+        }
+        if found.count(p) != Some(e.refcount) {
+            report.refcount_mismatches += 1;
+        }
+    });
+    drop(positions);
+    for (unreferenced, referenced, bytes) in packs.values() {
+        if *unreferenced > 0 {
+            report.packs_with_unreferenced += 1;
+            if *referenced == 0 {
+                report.packs_only_unreferenced += 1;
+                report.packs_only_unreferenced_bytes += bytes;
+            }
+        }
+    }
+    report
+        .unreferenced
+        .sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+
+    if let Some(cache) = repo.tree_cache() {
+        cache.retain(|id| set.contains(id));
+    }
+    Ok(report)
 }
 
 /// [`run`] on an already opened repository, with a sanitised `threshold`.

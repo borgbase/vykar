@@ -147,15 +147,18 @@ struct Assembler<'a> {
     slots: Vec<Option<Vec<u8>>>,
     next_emit: usize,
     out: &'a mut Vec<u8>,
+    /// When set, `out.len()` is pushed after each emitted slot.
+    ends: Option<&'a mut Vec<usize>>,
 }
 
 impl<'a> Assembler<'a> {
     /// One empty slot per chunk of the read, emitting into `out`.
-    fn new(len: usize, out: &'a mut Vec<u8>) -> Self {
+    fn new(len: usize, out: &'a mut Vec<u8>, ends: Option<&'a mut Vec<usize>>) -> Self {
         Self {
             slots: vec![None; len],
             next_emit: 0,
             out,
+            ends,
         }
     }
 
@@ -175,6 +178,9 @@ impl<'a> Assembler<'a> {
         while let Some(slot) = self.slots.get_mut(self.next_emit) {
             if let Some(data) = slot.take() {
                 self.out.extend_from_slice(&data);
+                if let Some(ends) = self.ends.as_deref_mut() {
+                    ends.push(self.out.len());
+                }
                 self.next_emit += 1;
             } else {
                 break;
@@ -289,7 +295,7 @@ impl Repository {
         if chunks.is_empty() {
             return Ok(());
         }
-        let mut asm = Assembler::new(chunks.len(), out);
+        let mut asm = Assembler::new(chunks.len(), out, None);
         let all: Vec<usize> = (0..chunks.len()).collect();
         self.read_coalesced_slots(chunks, &all, &mut asm, None, shutdown)?;
         asm.finish();
@@ -315,16 +321,53 @@ impl Repository {
         shutdown: &CancelToken,
         source: TreeChunkSource,
     ) -> Result<()> {
-        let cache = match (source, self.tree_cache()) {
-            (TreeChunkSource::CacheFirst, Some(cache)) => cache,
-            _ => return self.read_chunks_coalesced_into(chunks, out, shutdown),
-        };
+        self.read_tree_chunks_impl(chunks, out, None, shutdown, source)
+    }
+
+    /// [`Self::read_tree_chunks_into`], also recording where each chunk ends:
+    /// after the call, chunk `i` is `out[start_i..ends[i]]` with
+    /// `start_0 = out.len()` on entry and `start_i = ends[i-1]`. `ends` is
+    /// cleared first. Same ordering, cancellation and error contract; on error
+    /// `out` and `ends` are unspecified.
+    pub(crate) fn read_tree_chunks_split(
+        &self,
+        chunks: &[(ChunkId, PackId, u64, u32)],
+        out: &mut Vec<u8>,
+        ends: &mut Vec<usize>,
+        shutdown: &CancelToken,
+        source: TreeChunkSource,
+    ) -> Result<()> {
+        ends.clear();
+        ends.reserve(chunks.len());
+        self.read_tree_chunks_impl(chunks, out, Some(ends), shutdown, source)
+    }
+
+    /// The body of [`Self::read_tree_chunks_into`] and
+    /// [`Self::read_tree_chunks_split`].
+    fn read_tree_chunks_impl(
+        &self,
+        chunks: &[(ChunkId, PackId, u64, u32)],
+        out: &mut Vec<u8>,
+        ends: Option<&mut Vec<usize>>,
+        shutdown: &CancelToken,
+        source: TreeChunkSource,
+    ) -> Result<()> {
         if chunks.is_empty() {
             return Ok(());
         }
+        let cache = match (source, self.tree_cache()) {
+            (TreeChunkSource::CacheFirst, Some(cache)) => cache,
+            _ => {
+                let mut asm = Assembler::new(chunks.len(), out, ends);
+                let all: Vec<usize> = (0..chunks.len()).collect();
+                self.read_coalesced_slots(chunks, &all, &mut asm, None, shutdown)?;
+                asm.finish();
+                return Ok(());
+            }
+        };
         shutdown.check()?;
         let started = Instant::now();
-        let mut asm = Assembler::new(chunks.len(), out);
+        let mut asm = Assembler::new(chunks.len(), out, ends);
 
         // Cache pass: decode what the cache holds, collect the misses.
         let all: Vec<usize> = (0..chunks.len()).collect();

@@ -3,7 +3,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use super::types::{CheckProgressEvent, IntegrityIssue, ItemImpact, emit_progress};
-use crate::commands::list::{for_each_decoded_item, load_snapshot_item_stream, load_snapshot_meta};
+use crate::commands::list::{
+    for_each_decoded_item, load_snapshot_item_stream_from_storage, load_snapshot_meta,
+};
 use crate::config::VykarConfig;
 use crate::index::ChunkIndexEntry;
 use crate::repo::Repository;
@@ -468,7 +470,8 @@ pub(super) fn integrity_scan(
         }
 
         // Load item stream, check file chunks
-        let items_stream = match load_snapshot_item_stream(repo, &entry.name, shutdown) {
+        let items_stream = match load_snapshot_item_stream_from_storage(repo, &entry.name, shutdown)
+        {
             Ok(s) => s,
             // A cancellation is not corruption: re-raise it before the
             // classification below can fabricate an issue that
@@ -744,7 +747,8 @@ fn locate_items_in_missing_packs(
 
     for entry in &entries {
         shutdown.check()?;
-        let items_stream = match load_snapshot_item_stream(repo, &entry.name, shutdown) {
+        let items_stream = match load_snapshot_item_stream_from_storage(repo, &entry.name, shutdown)
+        {
             Ok(s) => s,
             Err(e @ VykarError::Interrupted) => return Err(e),
             Err(_) => continue,

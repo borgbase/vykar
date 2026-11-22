@@ -9,6 +9,7 @@ use super::index_store;
 use super::key::{self, KeyProofCtx};
 use super::manifest::Manifest;
 use super::snapshot_cache;
+use super::tree_cache::TreeChunkCache;
 use super::{
     ChunkerParams, EncryptionMode, InitOptions, KEY_PRIMARY, KEY_SECONDARY, MAX_PACK_SIZE_LIMIT,
     OpenOptions, RepoConfig, RepoFormat, Repository, default_max_pack_size, default_min_pack_size,
@@ -258,6 +259,7 @@ impl Repository {
             }
         }
 
+        let tree_cache = TreeChunkCache::for_repo(&repo_config.id, cache_dir.as_deref());
         Ok(Repository {
             storage,
             crypto,
@@ -272,6 +274,7 @@ impl Repository {
             index_dirty: false,
             file_cache_dirty: false,
             cache_dir_override: cache_dir,
+            tree_cache,
             write_session: None,
             lock_fence: None,
             key_blob,
@@ -470,6 +473,7 @@ impl Repository {
             }
         };
 
+        let tree_cache = TreeChunkCache::for_repo(&repo_config.id, cache_dir.as_deref());
         let repo = Repository {
             storage,
             crypto,
@@ -484,6 +488,7 @@ impl Repository {
             index_dirty: false,
             file_cache_dirty: false,
             cache_dir_override: cache_dir,
+            tree_cache,
             write_session: None,
             lock_fence: None,
             key_blob,

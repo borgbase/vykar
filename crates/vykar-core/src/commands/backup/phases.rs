@@ -511,6 +511,10 @@ pub(super) fn phase2_commit(
     if !journal_cleared {
         repo.clear_pending_index(&session.id);
     }
+    // Local tree-chunk cache entries of chunks a prune elsewhere removed
+    // from the index since this host's last prune; skipped (inside) when the
+    // committed index is not loaded or not clean. Best-effort.
+    let _ = repo.drop_unreferenced_tree_chunks();
 
     Ok(())
 }

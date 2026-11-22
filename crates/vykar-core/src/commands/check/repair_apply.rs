@@ -1,7 +1,9 @@
 use std::collections::{HashMap, HashSet};
 
 use super::types::{IntegrityIssue, RepairAction, RepairPlan};
-use crate::commands::list::{for_each_decoded_item, load_snapshot_item_stream, load_snapshot_meta};
+use crate::commands::list::{
+    for_each_decoded_item, load_snapshot_item_stream_from_storage, load_snapshot_meta,
+};
 use crate::compress::Compression;
 use crate::index::ChunkIndexEntry;
 use crate::repo::control::CancelToken;
@@ -174,7 +176,8 @@ fn prepare_rewrite(
     let drop: HashSet<usize> = item_indices.iter().copied().collect();
 
     let old_meta: SnapshotMeta = load_snapshot_meta(repo, snapshot_name)?;
-    let old_stream = load_snapshot_item_stream(repo, snapshot_name, &CancelToken::new())?;
+    let old_stream =
+        load_snapshot_item_stream_from_storage(repo, snapshot_name, &CancelToken::new())?;
 
     let cutter = ItemStreamCutter::new(repo.crypto.chunk_hasher());
     let compression = Compression::default();
@@ -467,16 +470,17 @@ pub(super) fn execute_repair(
         }
 
         // Count file chunks
-        let items_stream = match load_snapshot_item_stream(repo, &entry.name, &CancelToken::new()) {
-            Ok(s) => s,
-            Err(e) => {
-                return Err(VykarError::Other(format!(
-                    "aborting repair: cannot load item stream for '{}' during \
+        let items_stream =
+            match load_snapshot_item_stream_from_storage(repo, &entry.name, &CancelToken::new()) {
+                Ok(s) => s,
+                Err(e) => {
+                    return Err(VykarError::Other(format!(
+                        "aborting repair: cannot load item stream for '{}' during \
                      refcount rebuild: {e} (persisting would drop live references)",
-                    entry.name
-                )));
-            }
-        };
+                        entry.name
+                    )));
+                }
+            };
         if let Err(e) = for_each_decoded_item(&items_stream, |item| {
             if item.entry_type == ItemType::RegularFile {
                 for chunk_ref in &item.chunks {
@@ -694,7 +698,9 @@ mod tests {
             old_meta.item_ptrs.len()
         );
         let mut nitems = 0usize;
-        let stream = load_snapshot_item_stream(&mut repo, "snap1", &CancelToken::new()).unwrap();
+        let stream =
+            load_snapshot_item_stream_from_storage(&mut repo, "snap1", &CancelToken::new())
+                .unwrap();
         for_each_decoded_item(&stream, |_| {
             nitems += 1;
             Ok(())

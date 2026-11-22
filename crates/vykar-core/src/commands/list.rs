@@ -5,12 +5,13 @@ use serde::Deserialize;
 use tracing::info;
 
 use crate::config::VykarConfig;
-use crate::repo::Repository;
 use crate::repo::control::CancelToken;
 use crate::repo::format::{
     BlobLocation, ObjectType, decode_chunk_into, unpack_object_expect_with_context,
 };
 use crate::repo::manifest::SnapshotEntry;
+use crate::repo::tree_cache::TreeChunkCache;
+use crate::repo::{Repository, TreeChunkSource};
 use crate::snapshot::SnapshotMeta;
 use crate::snapshot::item::Item;
 use vykar_crypto::CryptoEngine;
@@ -173,7 +174,8 @@ pub fn load_snapshot_items(
     decode_items_stream(&items_stream)
 }
 
-/// Load the raw concatenated item stream bytes for a snapshot.
+/// Load the raw concatenated item stream bytes for a snapshot, reading tree
+/// chunks from the local tree-chunk cache first.
 pub fn load_snapshot_item_stream(
     repo: &mut Repository,
     snapshot_name: &str,
@@ -181,6 +183,24 @@ pub fn load_snapshot_item_stream(
 ) -> Result<Vec<u8>> {
     let snapshot_meta = load_snapshot_meta(repo, snapshot_name)?;
     load_item_stream_from_ptrs(repo, &snapshot_meta.item_ptrs, shutdown)
+}
+
+/// [`load_snapshot_item_stream`], reading every tree chunk from storage (never
+/// the local tree-chunk cache, which is not filled either). For commands that
+/// verify the repository.
+pub fn load_snapshot_item_stream_from_storage(
+    repo: &mut Repository,
+    snapshot_name: &str,
+    shutdown: &CancelToken,
+) -> Result<Vec<u8>> {
+    let snapshot_meta = load_snapshot_meta(repo, snapshot_name)?;
+    resolve_and_read(
+        repo,
+        &snapshot_meta.item_ptrs,
+        resolve_through_index,
+        shutdown,
+        TreeChunkSource::Storage,
+    )
 }
 
 /// Item-stream reader for one read-only operation: resolves item-stream
@@ -232,6 +252,8 @@ impl ItemStreamReader {
             crypto: Arc::clone(&repo.crypto),
             shutdown,
             chunks,
+            cache: repo.tree_cache().cloned(),
+            cache_hits: 0,
             retried: false,
             window_max: LAZY_WINDOW_MAX,
             next: 0,
@@ -309,6 +331,10 @@ fn resolve_from_index(index: &crate::index::LiveIndex, ids: &[ChunkId]) -> Resul
 /// are resident, instead of the whole decompressed stream. Items may straddle
 /// chunk boundaries; the [`BufRead`] impl hides them.
 ///
+/// A chunk held by the local tree-chunk cache is decoded from there on its
+/// own, and windows stop before such a chunk, so it is not downloaded;
+/// downloaded chunks are written to the cache.
+///
 /// Holds its own storage and crypto handles so the caller can keep using the
 /// repository mutably while the stream is being consumed. Every chunk is
 /// authenticated (AEAD) or, for unencrypted repositories, checked against its
@@ -323,6 +349,11 @@ pub struct LazyItemStream<'a> {
     crypto: Arc<dyn CryptoEngine>,
     shutdown: &'a CancelToken,
     chunks: Vec<ChunkLoc>,
+    /// The local tree-chunk cache: read before a window is planned, filled
+    /// from every window. `None` reads storage only.
+    cache: Option<TreeChunkCache>,
+    /// Chunks decoded from the cache, for the end-of-stream debug line.
+    cache_hits: usize,
     /// Whether the locations were already re-resolved once.
     retried: bool,
     /// Range-read cap; [`LAZY_WINDOW_MAX`] outside tests.
@@ -362,6 +393,8 @@ impl<'a> LazyItemStream<'a> {
             crypto: Arc::clone(&repo.crypto),
             shutdown,
             chunks,
+            cache: None,
+            cache_hits: 0,
             retried: !retry,
             window_max,
             next: 0,
@@ -373,6 +406,21 @@ impl<'a> LazyItemStream<'a> {
             error: None,
             reads: 0,
             done: false,
+        }
+    }
+
+    /// [`Self::for_test`] reading through the repository's tree-chunk cache.
+    #[cfg(test)]
+    pub(crate) fn for_test_with_cache(
+        repo: &Repository,
+        chunks: Vec<ChunkLoc>,
+        retry: bool,
+        window_max: u64,
+        shutdown: &'a CancelToken,
+    ) -> Self {
+        Self {
+            cache: repo.tree_cache().cloned(),
+            ..Self::for_test(repo, chunks, retry, window_max, shutdown)
         }
     }
 
@@ -389,8 +437,9 @@ impl<'a> LazyItemStream<'a> {
     }
 
     /// Pick the range read that starts at chunk `first`: it extends over the
-    /// following stream chunks while they sit forward in the same pack, with
-    /// gaps of at most [`LAZY_WINDOW_GAP`], up to [`LAZY_WINDOW_MAX`] bytes.
+    /// following stream chunks while they sit forward in the same pack and
+    /// are not in the tree-chunk cache, with gaps of at most
+    /// [`LAZY_WINDOW_GAP`], up to [`LAZY_WINDOW_MAX`] bytes.
     /// Returns `(start, end, end_chunk)`.
     fn plan_window(&self, first: usize) -> Result<(PackId, u64, u64, usize)> {
         let overflow = |pack: &PackId| {
@@ -404,8 +453,12 @@ impl<'a> LazyItemStream<'a> {
             .checked_add(u64::from(size))
             .ok_or_else(|| overflow(&pack))?;
         let mut next = first + 1;
-        while let Some(&(_, p, offset, size)) = self.chunks.get(next) {
+        while let Some(&(id, p, offset, size)) = self.chunks.get(next) {
             if p != pack || offset < end {
+                break;
+            }
+            // A cached chunk is decoded from the cache, not downloaded.
+            if self.cache.as_ref().is_some_and(|c| c.contains(&id)) {
                 break;
             }
             let blob_end = offset
@@ -428,6 +481,9 @@ impl<'a> LazyItemStream<'a> {
             // Free the consumed window before fetching the next one.
             self.window = Vec::new();
             self.shutdown.check()?;
+            if self.load_cached(idx) {
+                return Ok(());
+            }
             let (pack, start, end, end_chunk) = self.plan_window(idx)?;
             self.window = self
                 .storage
@@ -469,10 +525,54 @@ impl<'a> LazyItemStream<'a> {
             false,
             &mut plaintext,
         )?;
+        if let Some(cache) = &self.cache {
+            cache.insert(&chunk_id, blob);
+        }
         self.cur = plaintext;
         self.pos = 0;
         self.next += 1;
         Ok(())
+    }
+
+    /// Decode `chunks[idx]` from the tree-chunk cache into `cur`. False when
+    /// there is no cache or no entry, or the entry does not decode (it is
+    /// deleted then); the caller downloads the chunk.
+    fn load_cached(&mut self, idx: usize) -> bool {
+        let Some(cache) = &self.cache else {
+            return false;
+        };
+        let Some(&(chunk_id, pack_id, pack_offset, stored_size)) = self.chunks.get(idx) else {
+            return false;
+        };
+        let Some(mut stored) = cache.get(&chunk_id) else {
+            return false;
+        };
+        let mut plaintext = Vec::new();
+        let at = BlobLocation {
+            chunk_id,
+            pack_id,
+            pack_offset,
+            stored_size,
+        };
+        if let Err(e) = decode_chunk_into(
+            &mut stored,
+            at,
+            self.crypto.as_ref(),
+            None,
+            false,
+            &mut plaintext,
+        ) {
+            tracing::debug!("tree-chunk cache: entry {chunk_id} does not decode: {e:?}");
+            cache.remove(&chunk_id);
+            return false;
+        }
+        self.cur = plaintext;
+        self.pos = 0;
+        self.next += 1;
+        // The next chunk plans a window afresh.
+        self.window_end = self.next;
+        self.cache_hits += 1;
+        true
     }
 
     fn load_next(&mut self) -> Result<()> {
@@ -519,8 +619,9 @@ impl BufRead for LazyItemStream<'_> {
                 if !self.done {
                     self.done = true;
                     tracing::debug!(
-                        "item stream: {} chunks in {} range reads",
+                        "item stream: {} chunks, {} from cache, in {} range reads",
                         self.chunks.len(),
+                        self.cache_hits,
                         self.reads
                     );
                 }
@@ -603,11 +704,13 @@ where
         &snapshot_meta.item_ptrs,
         |chunk_id, _repo| lookup(chunk_id).ok_or(VykarError::ChunkNotInIndex(*chunk_id)),
         shutdown,
+        TreeChunkSource::CacheFirst,
     )
 }
 
-/// Load the raw concatenated item stream bytes from chunk pointers using the chunk index.
-/// Returns ChunkNotInIndex if a chunk is missing from the chunk index.
+/// Load the raw concatenated item stream bytes from chunk pointers using the chunk index,
+/// reading tree chunks from the local tree-chunk cache first.
+/// Returns ChunkNotInIndex if a chunk is missing from the chunk index, cached or not.
 pub fn load_item_stream_from_ptrs(
     repo: &mut Repository,
     item_ptrs: &[ChunkId],
@@ -616,23 +719,30 @@ pub fn load_item_stream_from_ptrs(
     resolve_and_read(
         repo,
         item_ptrs,
-        |chunk_id, repo| {
-            let entry = repo
-                .chunk_index()
-                .get(chunk_id)
-                .ok_or(VykarError::ChunkNotInIndex(*chunk_id))?;
-            Ok((entry.pack_id, entry.pack_offset, entry.stored_size))
-        },
+        resolve_through_index,
         shutdown,
+        TreeChunkSource::CacheFirst,
     )
 }
 
-/// Resolve chunk locations and read them via coalesced range reads.
+/// The location of `chunk_id` in the repository's chunk index.
+fn resolve_through_index(chunk_id: &ChunkId, repo: &Repository) -> Result<(PackId, u64, u32)> {
+    let entry = repo
+        .chunk_index()
+        .get(chunk_id)
+        .ok_or(VykarError::ChunkNotInIndex(*chunk_id))?;
+    Ok((entry.pack_id, entry.pack_offset, entry.stored_size))
+}
+
+/// Resolve every chunk location first, then read them via coalesced range
+/// reads from `source`. Resolution comes before any read, so a pointer the
+/// index lacks fails even when its chunk is cached.
 fn resolve_and_read<R>(
     repo: &mut Repository,
     item_ptrs: &[ChunkId],
     resolve: R,
     shutdown: &CancelToken,
+    source: TreeChunkSource,
 ) -> Result<Vec<u8>>
 where
     R: Fn(&ChunkId, &Repository) -> Result<(PackId, u64, u32)>,
@@ -647,7 +757,7 @@ where
         .collect::<Result<_>>()?;
 
     let mut items_stream = Vec::new();
-    repo.read_chunks_coalesced_into(&chunks, &mut items_stream, shutdown)?;
+    repo.read_tree_chunks_into(&chunks, &mut items_stream, shutdown, source)?;
     Ok(items_stream)
 }
 

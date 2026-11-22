@@ -152,6 +152,24 @@ pub fn open_local_repo(repo_dir: &Path) -> Repository {
     .unwrap()
 }
 
+/// Delete the local tree-chunk cache of the repository at `repo_dir`, so the
+/// next item-stream read goes to storage (for tests whose point is a tree
+/// read that fails).
+pub fn clear_tree_cache(repo_dir: &Path) {
+    let repo = open_local_repo(repo_dir);
+    let root = repo
+        .tree_cache()
+        .expect("test repositories have a cache dir")
+        .root()
+        .to_path_buf();
+    drop(repo);
+    match std::fs::remove_dir_all(&root) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => panic!("cannot clear {}: {e}", root.display()),
+    }
+}
+
 /// Load the on-disk `SnapshotListCache` for an unencrypted local repo without
 /// going through `Repository::open` (which would heal the cache against the
 /// remote `snapshots/` listing). Lets tests observe what delete/prune persisted

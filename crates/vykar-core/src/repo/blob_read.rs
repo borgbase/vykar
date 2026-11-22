@@ -128,12 +128,18 @@ pub(crate) enum GroupEnd {
 /// plaintext buffer, or why the blob did not decode.
 pub(crate) type Decoded<'p> = std::result::Result<&'p mut Vec<u8>, ChunkDecodeError>;
 
-/// Storage, crypto and the verify flag a read decodes with.
+/// Receives the stored bytes of each blob that decoded successfully, before
+/// the visitor sees its plaintext. Called on the reading thread.
+pub(crate) type RawSink<'a> = &'a (dyn Fn(&ChunkId, &[u8]) + Sync);
+
+/// Storage, crypto and the verify flag a read decodes with, and an optional
+/// sink for the stored bytes of what it decoded.
 #[derive(Clone, Copy)]
 pub(crate) struct BlobReader<'a> {
     storage: &'a dyn StorageBackend,
     crypto: &'a dyn CryptoEngine,
     verify: bool,
+    raw_sink: Option<RawSink<'a>>,
 }
 
 impl<'a> BlobReader<'a> {
@@ -148,6 +154,16 @@ impl<'a> BlobReader<'a> {
             storage,
             crypto,
             verify,
+            raw_sink: None,
+        }
+    }
+
+    /// The same reader, handing each decoded blob's stored bytes to `sink`
+    /// (one copy per blob, taken before the in-place decode).
+    pub(crate) fn with_raw_sink(self, sink: RawSink<'a>) -> Self {
+        Self {
+            raw_sink: Some(sink),
+            ..self
         }
     }
 
@@ -201,9 +217,14 @@ impl<'a> BlobReader<'a> {
                 pack_offset: blob.pack_offset(),
                 stored_size: blob.stored_size(),
             };
+            // The decode below destroys the stored bytes; the sink gets a copy.
+            let kept = self.raw_sink.map(|_| raw.to_vec());
             let decoded =
                 decode_chunk_into(raw, at, self.crypto, blob.size_hint(), self.verify, plain)
                     .map(|()| &mut *plain);
+            if let (Some(sink), Some(kept), Ok(_)) = (self.raw_sink, &kept, &decoded) {
+                sink(&blob.chunk_id(), kept);
+            }
             visit(blob, decoded)?;
         }
         Ok(GroupEnd::Done)
@@ -514,6 +535,55 @@ mod tests {
                 );
             }
             assert_eq!(visited[2].1.as_ref().unwrap(), &payloads[2]);
+        }
+    }
+
+    #[test]
+    fn raw_sink_sees_stored_bytes_of_decoded_blobs_only() {
+        let plaintext = PlaintextEngine::new(test_chunk_hasher());
+        let aes = Aes256GcmEngine::new(&[0x11; 32], test_chunk_hasher());
+        let engines: [&dyn CryptoEngine; 2] = [&plaintext, &aes];
+        for crypto in engines {
+            let payloads = payloads(3);
+            let (mut data, blobs) = pack(crypto, &payloads);
+            let mid = &blobs[1];
+            // The middle blob's last byte: the AEAD tag, or plaintext payload
+            // bytes under the ID check.
+            data[(mid.offset + u64::from(mid.size) - 1) as usize] ^= 0x01;
+            let storage = store(&data);
+            let stored = |b: &Blob| data[b.offset as usize..][..b.size as usize].to_vec();
+
+            let sunk = std::sync::Mutex::new(Vec::new());
+            let sink = |id: &ChunkId, raw: &[u8]| sunk.lock().unwrap().push((*id, raw.to_vec()));
+            let mut visited = 0;
+            let (start, len) = span(&blobs);
+            let end = BlobReader::new(&storage, crypto, false)
+                .with_raw_sink(&sink)
+                .read_range(
+                    &pack_id(),
+                    start,
+                    len,
+                    &blobs,
+                    &mut ReadBuffers::default(),
+                    || false,
+                    |_, _| {
+                        visited += 1;
+                        Ok::<(), ()>(())
+                    },
+                )
+                .unwrap();
+            let enc = crypto.is_encrypting();
+            assert!(matches!(end, GroupEnd::Done), "encrypting={enc}: {end:?}");
+            assert_eq!(visited, 3);
+            let sunk = sunk.into_inner().unwrap();
+            assert_eq!(
+                sunk,
+                vec![
+                    (blobs[0].id, stored(&blobs[0])),
+                    (blobs[2].id, stored(&blobs[2]))
+                ],
+                "encrypting={enc}"
+            );
         }
     }
 

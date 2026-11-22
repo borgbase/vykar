@@ -827,6 +827,8 @@ fn parallel_read_returns_the_earliest_failing_group() {
 fn item_stream_bytes_identical_across_widths() {
     for mode in [EncryptionMode::None, EncryptionMode::Aes256Gcm] {
         let (mut repo, probe) = repo_on_tuned_backend(mode.clone());
+        // The point is the storage read at each width, not the local cache.
+        repo.set_tree_cache(None);
         let packs = store_packs(&mut repo, &[3, 1, 2, 3, 3]);
         let all: Vec<&(ChunkId, Vec<u8>)> = packs.iter().flatten().collect();
         // A fixed permutation that hops between packs, plus one repeat.

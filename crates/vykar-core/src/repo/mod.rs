@@ -13,6 +13,7 @@ pub mod pack_map;
 pub mod pack_trailer;
 pub(crate) mod session_journal;
 pub mod snapshot_cache;
+pub(crate) mod tree_cache;
 mod upload_queue;
 pub(crate) mod write_session;
 
@@ -33,6 +34,7 @@ pub use key::{LoadedKey, select_repository_key};
 #[cfg(any(test, feature = "fuzzing"))]
 pub(crate) use open::derive_plaintext_chunk_id_key;
 mod read;
+pub(crate) use read::TreeChunkSource;
 mod session;
 pub use session::WriteSessionOptions;
 mod upgrade;
@@ -371,6 +373,8 @@ pub struct Repository {
     file_cache_dirty: bool,
     /// Override for the cache directory root (from config `cache_dir`).
     cache_dir_override: Option<PathBuf>,
+    /// Local tree-chunk cache; None without a cache dir.
+    tree_cache: Option<tree_cache::TreeChunkCache>,
     /// Write-path state: pack writers, upload queue, dedup, journal, sizing.
     /// `None` when no write session is active (read-only operations, compact, delete, prune).
     /// Activated by `begin_write_session()` before backup.
@@ -470,6 +474,29 @@ impl Repository {
     pub fn chunk_index_mut(&mut self) -> &mut LiveIndex {
         self.index_dirty = true;
         &mut self.chunk_index
+    }
+
+    /// The local tree-chunk cache, if this host has a cache dir.
+    pub(crate) fn tree_cache(&self) -> Option<&tree_cache::TreeChunkCache> {
+        self.tree_cache.as_ref()
+    }
+
+    /// Tests: replace or disable the tree-chunk cache.
+    #[cfg(test)]
+    pub(crate) fn set_tree_cache(&mut self, cache: Option<tree_cache::TreeChunkCache>) {
+        self.tree_cache = cache;
+    }
+
+    /// Drop every cached tree chunk the persisted index no longer holds.
+    /// Only against a loaded index with no unpersisted edits: an unloaded
+    /// index would reject every entry, an edited one is not what storage
+    /// holds. Returns `None` when skipped. Never fails.
+    pub(crate) fn drop_unreferenced_tree_chunks(&self) -> Option<tree_cache::RetainStats> {
+        let cache = self.tree_cache.as_ref()?;
+        if !self.chunk_index.is_loaded() || self.index_dirty || self.chunk_index.is_modified() {
+            return None;
+        }
+        Some(cache.retain(|id| self.chunk_index.contains(id)))
     }
 
     /// Drop the chunk index (unmaps its table, frees its edits).

@@ -10,7 +10,8 @@ use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::VykarError;
 
 use super::helpers::{
-    backup_single_source, init_repo, load_snapshot_cache_from_disk, open_local_repo,
+    backup_single_source, clear_tree_cache, init_repo, load_snapshot_cache_from_disk,
+    open_local_repo,
 };
 
 #[test]
@@ -358,6 +359,8 @@ fn delete_phase3_refcount_failure_returns_warning_not_error() {
             std::fs::remove_file(entry.path()).unwrap();
         }
     }
+    // The listing is cached locally since the backup; only storage fails.
+    clear_tree_cache(&repo_dir);
 
     let result = commands::delete::run(&config, None, &["snap-fail"], false, &CancelToken::new())
         .expect("delete must not fail after the commit point — Phase 3 errors become warnings");
@@ -415,6 +418,7 @@ fn delete_single_snapshot_handles_empty_stats() {
             std::fs::remove_file(entry.unwrap().path()).unwrap();
         }
     }
+    clear_tree_cache(&repo_dir);
 
     let result =
         commands::delete::run(&config, None, &["snap-wrapper"], false, &CancelToken::new())
@@ -467,7 +471,10 @@ fn delete_with_parallel_tree_reads_matches_sequential_refcounts() {
         .unwrap()
     };
 
+    // Both loads and the delete read the stream from storage: the point
+    // is the parallel storage read, which the tree-chunk cache would skip.
     let mut sequential = open_with(1);
+    sequential.set_tree_cache(None);
     assert_eq!(sequential.storage.profile().request_width, 1);
     let item_ptrs = commands::list::load_snapshot_meta(&sequential, "snap2")
         .unwrap()
@@ -490,6 +497,7 @@ fn delete_with_parallel_tree_reads_matches_sequential_refcounts() {
     drop(sequential);
 
     let mut parallel = open_with(4);
+    parallel.set_tree_cache(None);
     assert_eq!(parallel.storage.profile().request_width, 4);
     let parallel_stream =
         commands::list::load_snapshot_item_stream(&mut parallel, "snap2", &CancelToken::new())
@@ -499,6 +507,7 @@ fn delete_with_parallel_tree_reads_matches_sequential_refcounts() {
         "parallel and sequential item streams differ"
     );
     drop(parallel);
+    clear_tree_cache(&repo_dir);
 
     let result =
         commands::delete::run(&config, None, &["snap2"], false, &CancelToken::new()).unwrap();

@@ -405,22 +405,23 @@ fn check_snapshots(
             );
             continue;
         }
-        let stream = match list::load_snapshot_item_stream(repo, name, &CancelToken::new()) {
-            Ok(s) => s,
-            Err(e) => {
-                report.add(
-                    ViolationKind::ItemStreamUnreadable,
-                    name,
-                    format!("item stream unreadable: {e}"),
-                );
-                report.skip(
-                    Invariant::NoRefcountDeflation,
-                    name,
-                    "item stream unreadable",
-                );
-                continue;
-            }
-        };
+        let stream =
+            match list::load_snapshot_item_stream_from_storage(repo, name, &CancelToken::new()) {
+                Ok(s) => s,
+                Err(e) => {
+                    report.add(
+                        ViolationKind::ItemStreamUnreadable,
+                        name,
+                        format!("item stream unreadable: {e}"),
+                    );
+                    report.skip(
+                        Invariant::NoRefcountDeflation,
+                        name,
+                        "item stream unreadable",
+                    );
+                    continue;
+                }
+            };
         let mut file_chunks: Vec<(String, ChunkId)> = Vec::new();
         let decoded = list::for_each_decoded_item(&stream, |item| {
             if item.entry_type == ItemType::RegularFile {

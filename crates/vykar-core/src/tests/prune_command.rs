@@ -6,8 +6,8 @@ use crate::repo::control::CancelToken;
 use vykar_types::error::VykarError;
 
 use super::helpers::{
-    backup_single_source, init_repo, load_snapshot_cache_from_disk, make_test_config,
-    open_local_repo, source_entry,
+    backup_single_source, clear_tree_cache, init_repo, load_snapshot_cache_from_disk,
+    make_test_config, open_local_repo, source_entry,
 };
 
 #[test]
@@ -271,6 +271,8 @@ fn prune_phase3_refcount_failure_returns_warning_not_error() {
             std::fs::remove_file(entry.unwrap().path()).unwrap();
         }
     }
+    // The listing is cached locally since the backup; only storage fails.
+    clear_tree_cache(&repo_dir);
 
     let sources = vec![source_entry(&source_dir, "src-a")];
     let (stats, _) = commands::prune::run(

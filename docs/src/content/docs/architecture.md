@@ -265,6 +265,7 @@ These files live under a per-repo local cache root. By default this is the platf
 |- filecache                 # File metadata -> cached ChunkRefs
 |- snapshot_list             # Snapshot ID -> SnapshotEntry cache
 |- chunk_table.<state hex>   # One index state: sorted 80-byte records + BLAKE3 trailer (mmap)
+|- tree_chunks/<xx>/<id>     # Tree (item-stream) chunks: stored blob bytes, one file each
 `- index_blob                # 0.24 and earlier only: the v2/v3 index blob this machine last wrote;
                              #   no longer read or written, deleted by `vykar upgrade`
 ```
@@ -274,6 +275,8 @@ A chunk table is the full index cache format (VGFULL v3) of one index state, nam
 - A table is written once, through a uniquely named temp file published with a no-clobber link; it is never modified, renamed over or replaced. A name that is already taken is adopted when its content verifies, and replaced only when it does not.
 - A table is deleted (when another one is installed) only if it is not the state just installed, no table of this process maps it, and its mtime is more than an hour old. On Unix a deleted table stays readable through every mapping; a process that later looks for it finds it gone and syncs again, which may download the index.
 - A sync starts from the repository's own table, else from a table file at a state of the head's chain; a write diffs against the table it loaded, so it needs no table file.
+
+The **tree-chunk cache** (`tree_chunks/<first id byte hex>/<chunk id hex>`) holds one file per tree chunk with the chunk's stored blob bytes, exactly as in its pack: compressed and, for an encrypted repository, encrypted with the chunk ID as AAD. Backup writes every new tree chunk it stores, and readers write what they download. List, diff, find, mount, restore, prune, delete and backup's parent-snapshot load read it first, decode an entry like a pack blob and download only the misses; the item pointers are still resolved through the index first, so a chunk the index lacks fails even when it is cached. `check`, `check --repair` and the simulator's checker never read it and their reads do not fill it, so they verify what storage holds (the listing chunks a repair rewrites are cached like any stored tree chunk); the other readers no longer notice a corrupt or missing tree blob in storage while the chunk is cached. After a prune or delete has persisted its refcount changes, and after a backup commit, entries whose chunk the index no longer holds are deleted (only against a loaded, unedited index). Entries are content-addressed and every failure is a miss: an entry that does not decode is deleted and the chunk downloaded, a failed write disables writing for the handle, and nothing is fsynced. Entries are written through unique `.tc-*` temp files renamed into place (temps older than an hour are deleted by the drop), so processes sharing the cache dir need no coordination; a drop in one process can delete entries a backup running in another has just written, which costs that backup's next reader a download. The cache has no size cap.
 
 The fixed-name caches of earlier binaries (`dedup_cache`, `restore_cache`, `full_index_cache`) are deleted at open. Without a cache dir, or for `check`'s verifying load, the table lives in a temp file kept by the repository handle.
 
@@ -306,6 +309,7 @@ flowchart LR
         filecache["filecache"]
         snapshotlist["snapshot_list"]
         chunktable["chunk_table.‹state›"]
+        treechunks["tree_chunks/‹xx›/‹id›"]
     end
 
     index --> chunktable
@@ -314,6 +318,7 @@ flowchart LR
     indexgen -. hint .-> index
     index -. names .-> indexd
     indexd --> chunktable
+    packs -. tree chunks .-> treechunks
 ```
 
 ### Key Data Structures
@@ -684,7 +689,7 @@ Command dumps participate in this same item stream. A source with `command_dumps
 Restore now also consumes item streams incrementally (streaming deserialization) instead of materializing full `Vec<Item>` state up front.
 Item-stream and file-data chunks are resolved through the chunk table of the open head. A lazily read item stream whose chunk cannot be read at its location (a compaction moved it after the index was loaded) re-resolves the rest once against the index at a freshly read head.
 
-Commands that load a whole item stream (delete, prune, check, list, diff, find, mount, and backup's parent-snapshot load) fetch its coalesced range reads in parallel at the backend's request width, derived from `limits.connections` (remote: `min(connections*3, 24)`, local: `min(connections, 8)`), and reassemble them in stream order; restore reads the stream lazily, one window at a time. These loads and restore's file-data reads go through one fetch/decode loop (`repo::blob_read`): one range request per coalesced group, each blob decoded in place as it is read.
+Commands that load a whole item stream (delete, prune, check, list, diff, find, mount, and backup's parent-snapshot load) fetch its coalesced range reads in parallel at the backend's request width, derived from `limits.connections` (remote: `min(connections*3, 24)`, local: `min(connections, 8)`), and reassemble them in stream order; restore reads the stream lazily, one window at a time. All of them except check take tree chunks from the local [tree-chunk cache](#local-optimization-caches-client-machine) first and read only the misses from storage. These loads and restore's file-data reads go through one fetch/decode loop (`repo::blob_read`): one range request per coalesced group, each blob decoded in place as it is read.
 
 ---
 

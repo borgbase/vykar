@@ -377,6 +377,13 @@ impl Repository {
             &compressed,
             self.crypto.as_ref(),
         )?;
+        // New tree chunks go to the local tree-chunk cache as they are
+        // written; dedup hits returned above and are not cached.
+        if pack_type == PackType::Tree
+            && let Some(cache) = &self.tree_cache
+        {
+            cache.insert(&chunk_id, &packed);
+        }
         let stored_size = self.commit_prepacked_chunk(chunk_id, packed, pack_type)?;
 
         Ok((chunk_id, stored_size, true))

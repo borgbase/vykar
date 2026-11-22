@@ -56,6 +56,18 @@ fn flip_byte_in_chunk(repo_dir: &Path, id: &ChunkId) {
     std::fs::write(&path, pack).unwrap();
 }
 
+/// Delete the local tree-chunk cache (`$XDG_CACHE_HOME/vykar/<repo id>/tree_chunks`)
+/// so the next listing read goes to storage.
+fn remove_tree_cache(repo_dir: &Path) {
+    let repo_id = open_local_repo(repo_dir, None).config.id.clone();
+    let root = std::path::PathBuf::from(std::env::var("XDG_CACHE_HOME").unwrap())
+        .join("vykar")
+        .join(hex::encode(repo_id))
+        .join("tree_chunks");
+    assert!(root.is_dir(), "the backup filled {}", root.display());
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
 #[test]
 fn plaintext_restore_rejects_corrupt_file_chunk_without_verify() {
     let tmp = tempfile::tempdir().unwrap();
@@ -107,6 +119,8 @@ fn plaintext_list_rejects_corrupt_item_stream_chunk() {
         meta.item_ptrs[0]
     };
     flip_byte_in_chunk(&repo_dir, &item_ptr);
+    // The listing is cached locally since the backup; corrupt only storage.
+    remove_tree_cache(&repo_dir);
 
     let err = commands::list::list_snapshot_items(&config, None, "snap")
         .unwrap_err()

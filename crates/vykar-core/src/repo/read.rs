@@ -5,15 +5,77 @@ use smallvec::SmallVec;
 
 use super::Repository;
 use super::blob_read::{
-    BlobReader, GroupEnd, PlannedRead, ReadBuffers, ReadGroup, coalesce_groups,
+    BlobReader, GroupEnd, PlannedRead, RawSink, ReadBuffers, ReadGroup, coalesce_groups,
     fetch_groups_bounded,
 };
 use super::control::CancelToken;
 use super::format::{BlobLocation, decode_chunk_into};
 use super::pack::read_blob_from_pack;
+use super::tree_cache::TreeChunkCache;
+use vykar_crypto::CryptoEngine;
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
 use vykar_types::pack_id::PackId;
+
+/// Where an item-stream read takes its tree chunks from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TreeChunkSource {
+    /// The local tree-chunk cache first, storage for misses; what is
+    /// downloaded is written to the cache.
+    CacheFirst,
+    /// Storage only, the cache neither read nor written (check, repair, the
+    /// simulator's checker: they verify what the repository holds).
+    Storage,
+}
+
+/// Chunks per unit of work of the cache pass of
+/// [`Repository::read_tree_chunks_into`].
+const CACHE_BATCH: usize = 256;
+
+/// Thread cap of that cache pass: it is local reads and decode, CPU work,
+/// independent of the backend's request width.
+const CACHE_PASS_MAX_WIDTH: usize = 8;
+
+/// Look up `batch` (indices into `chunks`) in `cache` and decode each hit
+/// like a pack read. Returns the decoded hits and the misses; an entry that
+/// does not decode is deleted and is a miss.
+fn probe_cache(
+    cache: &TreeChunkCache,
+    crypto: &dyn CryptoEngine,
+    chunks: &[(ChunkId, PackId, u64, u32)],
+    batch: &[usize],
+) -> (Vec<DecodedBlob>, Vec<usize>) {
+    let mut decoded = Vec::with_capacity(batch.len());
+    let mut misses = Vec::new();
+    for &i in batch {
+        let Some(&(chunk_id, pack_id, pack_offset, stored_size)) = chunks.get(i) else {
+            continue;
+        };
+        let Some(mut bytes) = cache.get(&chunk_id) else {
+            misses.push(i);
+            continue;
+        };
+        let mut plain = Vec::new();
+        let at = BlobLocation {
+            chunk_id,
+            pack_id,
+            pack_offset,
+            stored_size,
+        };
+        match decode_chunk_into(&mut bytes, at, crypto, None, false, &mut plain) {
+            Ok(()) => decoded.push(DecodedBlob {
+                result_idxs: smallvec::smallvec![i],
+                plaintext: plain,
+            }),
+            Err(e) => {
+                tracing::debug!("tree-chunk cache: entry {chunk_id} does not decode: {e:?}");
+                cache.remove(&chunk_id);
+                misses.push(i);
+            }
+        }
+    }
+    (decoded, misses)
+}
 
 /// A unique blob of a coalesced read: one stored location, and every slot in
 /// the caller's `chunks` that wants it.
@@ -87,7 +149,27 @@ struct Assembler<'a> {
     out: &'a mut Vec<u8>,
 }
 
-impl Assembler<'_> {
+impl<'a> Assembler<'a> {
+    /// One empty slot per chunk of the read, emitting into `out`.
+    fn new(len: usize, out: &'a mut Vec<u8>) -> Self {
+        Self {
+            slots: vec![None; len],
+            next_emit: 0,
+            out,
+        }
+    }
+
+    /// Final drain (safety net for groups not sorted by earliest slot);
+    /// every slot has been filled by now.
+    fn finish(&mut self) {
+        self.drain_ready();
+        debug_assert_eq!(
+            self.next_emit,
+            self.slots.len(),
+            "not all chunks were emitted"
+        );
+    }
+
     /// Append every completed slot at the cursor to `out`.
     fn drain_ready(&mut self) {
         while let Some(slot) = self.slots.get_mut(self.next_emit) {
@@ -207,7 +289,95 @@ impl Repository {
         if chunks.is_empty() {
             return Ok(());
         }
+        let mut asm = Assembler::new(chunks.len(), out);
+        let all: Vec<usize> = (0..chunks.len()).collect();
+        self.read_coalesced_slots(chunks, &all, &mut asm, None, shutdown)?;
+        asm.finish();
+        Ok(())
+    }
 
+    /// [`Self::read_chunks_coalesced_into`] for item-stream chunks, through
+    /// the local tree-chunk cache. Same output, ordering, cancellation and
+    /// error contract.
+    ///
+    /// With [`TreeChunkSource::CacheFirst`] every chunk is first looked up in
+    /// the cache (on up to `min(available_parallelism, 8)` threads, in
+    /// batches of [`CACHE_BATCH`]) and decoded like a pack read; an entry
+    /// that does not decode is deleted and counts as a miss. Misses are then
+    /// read from storage exactly as `read_chunks_coalesced_into` reads them,
+    /// and what was downloaded is written to the cache. With
+    /// [`TreeChunkSource::Storage`] the cache is neither read nor written.
+    /// A cache failure is never an error.
+    pub(crate) fn read_tree_chunks_into(
+        &self,
+        chunks: &[(ChunkId, PackId, u64, u32)],
+        out: &mut Vec<u8>,
+        shutdown: &CancelToken,
+        source: TreeChunkSource,
+    ) -> Result<()> {
+        let cache = match (source, self.tree_cache()) {
+            (TreeChunkSource::CacheFirst, Some(cache)) => cache,
+            _ => return self.read_chunks_coalesced_into(chunks, out, shutdown),
+        };
+        if chunks.is_empty() {
+            return Ok(());
+        }
+        shutdown.check()?;
+        let started = Instant::now();
+        let mut asm = Assembler::new(chunks.len(), out);
+
+        // Cache pass: decode what the cache holds, collect the misses.
+        let all: Vec<usize> = (0..chunks.len()).collect();
+        let batches: Vec<&[usize]> = all.chunks(CACHE_BATCH).collect();
+        let width = std::thread::available_parallelism()
+            .map_or(1, |n| n.get())
+            .min(CACHE_PASS_MAX_WIDTH);
+        let crypto = self.crypto.as_ref();
+        let mut misses: Vec<usize> = Vec::new();
+        fetch_groups_bounded(
+            width,
+            &batches,
+            shutdown,
+            |batch| Ok(probe_cache(cache, crypto, chunks, batch)),
+            |(decoded, missed)| {
+                misses.extend(missed);
+                asm.accept(decoded)
+            },
+        )?;
+        misses.sort_unstable();
+        let hits = chunks.len() - misses.len();
+
+        // Storage pass over the misses, filling the cache.
+        let (reads, bytes) = if misses.is_empty() {
+            (0, 0)
+        } else {
+            let sink: RawSink<'_> = &|id: &ChunkId, raw: &[u8]| cache.insert(id, raw);
+            self.read_coalesced_slots(chunks, &misses, &mut asm, Some(sink), shutdown)?
+        };
+        asm.finish();
+        tracing::debug!(
+            "tree chunk read: {} chunks, {} from cache, {} from storage in {} range reads of {} bytes, {:?}",
+            chunks.len(),
+            hits,
+            misses.len(),
+            reads,
+            bytes,
+            started.elapsed()
+        );
+        Ok(())
+    }
+
+    /// Phases 1-3 of a coalesced read over the slots in `todo` (ascending
+    /// indices into `chunks`), accepted into `asm`; `sink` receives the
+    /// stored bytes of every blob that decoded. Returns (range reads, bytes).
+    fn read_coalesced_slots(
+        &self,
+        chunks: &[(ChunkId, PackId, u64, u32)],
+        todo: &[usize],
+        asm: &mut Assembler<'_>,
+        sink: Option<RawSink<'_>>,
+        shutdown: &CancelToken,
+    ) -> Result<(usize, u64)> {
         // --- Phase 1: group by pack, one blob per distinct location ---
         // A repeated entry (the same chunk twice in a stream) is read and
         // decoded once: the storage range reader cannot go back over bytes it
@@ -216,7 +386,11 @@ impl Repository {
         // stay two blobs, and the second fails as an overlapping read.
         let mut pack_blobs: HashMap<PackId, Vec<CoalescedBlob>> = HashMap::new();
         let mut seen: HashMap<(ChunkId, PackId, u64, u32), usize> = HashMap::new();
-        for (idx, &(chunk_id, pack_id, pack_offset, stored_size)) in chunks.iter().enumerate() {
+        for &idx in todo {
+            let &(chunk_id, pack_id, pack_offset, stored_size) =
+                chunks.get(idx).ok_or_else(|| {
+                    VykarError::Other(format!("internal error: read slot {idx} out of range"))
+                })?;
             let blobs = pack_blobs.entry(pack_id).or_default();
             match seen.entry((chunk_id, pack_id, pack_offset, stored_size)) {
                 std::collections::hash_map::Entry::Occupied(e) => {
@@ -245,12 +419,6 @@ impl Repository {
         }
         drop(seen);
 
-        let mut asm = Assembler {
-            slots: vec![None; chunks.len()],
-            next_emit: 0,
-            out,
-        };
-
         // --- Phase 2: coalesce ---
         let mut groups = coalesce_groups(pack_blobs)?;
 
@@ -267,7 +435,10 @@ impl Repository {
         let started = Instant::now();
         let width = self.request_width();
         let threads = width.min(groups.len());
-        let reader = BlobReader::new(self.storage.as_ref(), self.crypto.as_ref(), false);
+        let mut reader = BlobReader::new(self.storage.as_ref(), self.crypto.as_ref(), false);
+        if let Some(sink) = sink {
+            reader = reader.with_raw_sink(sink);
+        }
         fetch_groups_bounded(
             width,
             &groups,
@@ -276,23 +447,15 @@ impl Repository {
             |blobs| asm.accept(blobs),
         )?;
 
-        // Final drain (safety net for groups not sorted by earliest slot).
-        asm.drain_ready();
-        debug_assert_eq!(
-            asm.next_emit,
-            asm.slots.len(),
-            "not all chunks were emitted"
-        );
-
         let bytes: u64 = groups.iter().map(|g| g.read_end - g.read_start).sum();
         tracing::debug!(
             "coalesced read: {} chunks in {} range reads of {} bytes, width {}, {:?}",
-            chunks.len(),
+            todo.len(),
             groups.len(),
             bytes,
             threads,
             started.elapsed()
         );
-        Ok(())
+        Ok((groups.len(), bytes))
     }
 }

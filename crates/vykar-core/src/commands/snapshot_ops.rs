@@ -100,10 +100,19 @@ pub fn decrement_chunk_refs_on_index(
 /// as the recovery path, and the cache refresh is best-effort (a stale cache
 /// only affects local listing freshness and self-heals on the next open).
 ///
+/// After a successful save, local tree-chunk cache entries the persisted
+/// index no longer holds are deleted (best-effort, invisible to the result).
+///
 /// `op` names the operation in the warning ("delete" / "prune").
 pub fn commit_snapshot_removals(repo: &mut Repository, op: &str, warnings: &mut Vec<String>) {
-    if let Err(e) = repo.save_state() {
-        warn_and_push(
+    match repo.save_state() {
+        // Tree chunks whose last reference went with these snapshots are no
+        // longer in the index; their local cache entries are useless now.
+        // Skipped (inside) when this run never loaded the index.
+        Ok(()) => {
+            let _ = repo.drop_unreferenced_tree_chunks();
+        }
+        Err(e) => warn_and_push(
             warnings,
             format!(
                 "snapshots were deleted from storage, but persisting refcount \
@@ -113,7 +122,7 @@ pub fn commit_snapshot_removals(repo: &mut Repository, op: &str, warnings: &mut 
                  operation will see the pre-{op} state. Run `vykar check \
                  --repair` to recover accurate accounting."
             ),
-        );
+        ),
     }
 
     repo.persist_snapshot_cache_from_manifest();

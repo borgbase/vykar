@@ -9,10 +9,16 @@ use std::path::{Path, PathBuf};
 
 use tracing::info;
 
+use crate::commands::list::{
+    ItemSource, LazyItemStream, narrowable_display_path, resolve_from_index,
+};
+use crate::commands::listing::{ListingRead, ListingView};
 use crate::config::VykarConfig;
 use crate::platform::fs;
 use crate::repo::Repository;
 use crate::repo::control::CancelToken;
+use crate::snapshot::SnapshotMeta;
+use crate::snapshot::item::Item;
 use vykar_common::display::{format_bytes, format_count};
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
@@ -206,6 +212,7 @@ pub fn run_with_options(
         snapshot_name,
         dest,
         opts,
+        pattern_scope(pattern),
         move |path| filter.as_ref().is_none_or(|matcher| matcher.is_match(path)),
         shutdown,
     )
@@ -241,9 +248,69 @@ pub(crate) fn run_on_repo(
         snapshot_name,
         dest,
         opts,
+        pattern_scope(pattern),
         move |path| filter.as_ref().is_none_or(|matcher| matcher.is_match(path)),
         shutdown,
     )
+    .map(|(stats, _)| stats)
+}
+
+/// What a test restores: selected paths (as [`run_selected`]) or a glob
+/// (as [`run_with_options`]).
+#[cfg(test)]
+pub(crate) enum TestSelection<'s> {
+    Paths(&'s HashSet<String>),
+    Pattern(Option<&'s str>),
+}
+
+/// Restore `selection` on an open repository, reading the scope it implies
+/// (or the whole listing when `whole`). Also returns what the subtree reads
+/// cost (`None`: the lazy whole-listing read).
+#[cfg(test)]
+pub(crate) fn restore_on_repo_for_test(
+    repo: &mut Repository,
+    snapshot_name: &str,
+    dest: &str,
+    selection: TestSelection<'_>,
+    whole: bool,
+    shutdown: &CancelToken,
+) -> Result<(RestoreStats, Option<ListingRead>)> {
+    let opts = RestoreOptions::default();
+    match selection {
+        TestSelection::Paths(selected) => {
+            let scope = if whole {
+                ReadScope::Whole
+            } else {
+                selection_scope(selected)
+            };
+            restore_on_repo_with_filter(
+                repo,
+                snapshot_name,
+                dest,
+                opts,
+                scope,
+                |path| path_matches_selection(path, selected),
+                shutdown,
+            )
+        }
+        TestSelection::Pattern(pattern) => {
+            let filter = compile_pattern(pattern)?;
+            let scope = if whole {
+                ReadScope::Whole
+            } else {
+                pattern_scope(pattern)
+            };
+            restore_on_repo_with_filter(
+                repo,
+                snapshot_name,
+                dest,
+                opts,
+                scope,
+                move |path| filter.as_ref().is_none_or(|matcher| matcher.is_match(path)),
+                shutdown,
+            )
+        }
+    }
 }
 
 /// Run `vykar restore` for a selected set of paths.
@@ -271,9 +338,192 @@ pub fn run_selected(
             verify_chunks,
             continue_on_error: false,
         },
+        selection_scope(selected_paths),
         |path| path_matches_selection(path, selected_paths),
         shutdown,
     )
+}
+
+// ---------------------------------------------------------------------------
+// Read scope
+// ---------------------------------------------------------------------------
+
+/// What restore reads of the listing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ReadScope {
+    /// The whole listing, lazily.
+    Whole,
+    /// Only the subtrees of these display paths: each clean, without
+    /// U+FFFD, none equal to or under another, sorted by bytes. Empty: read
+    /// nothing.
+    Subtrees(Vec<String>),
+}
+
+/// The scope of a selection restore: its paths without the ones under
+/// another selected path, or `Whole` when one of them is empty, not clean
+/// or holds U+FFFD (its subtree by raw bytes might miss an entry the
+/// display-path predicate matches).
+fn selection_scope(selected: &HashSet<String>) -> ReadScope {
+    if !selected.iter().all(|p| narrowable_display_path(p)) {
+        return ReadScope::Whole;
+    }
+    let mut by_len: Vec<&String> = selected.iter().collect();
+    by_len.sort_by_key(|p| p.len());
+    let mut kept: HashSet<&str> = HashSet::new();
+    for p in by_len {
+        if !path_matches_selection_set(p, &kept) {
+            kept.insert(p);
+        }
+    }
+    let mut dirs: Vec<String> = kept.into_iter().map(String::from).collect();
+    dirs.sort();
+    ReadScope::Subtrees(dirs)
+}
+
+/// Characters with a meaning in a glob (`globset` syntax).
+const GLOB_SYNTAX: &[char] = &['*', '?', '[', ']', '{', '}', '\\'];
+
+/// The scope of a glob restore: the glob's leading components up to the
+/// first one holding any of `*?[]{}\`, or the whole glob when none does.
+/// `Whole` when that prefix is empty, not clean or holds U+FFFD, and on
+/// non-Unix platforms (globset normalizes `\` in candidate paths there).
+fn pattern_scope(pattern: Option<&str>) -> ReadScope {
+    let Some(pattern) = pattern else {
+        return ReadScope::Whole;
+    };
+    if !cfg!(unix) {
+        return ReadScope::Whole;
+    }
+    let literal: Vec<&str> = pattern
+        .split('/')
+        .take_while(|c| !c.contains(GLOB_SYNTAX))
+        .collect();
+    let prefix = literal.join("/");
+    if prefix.is_empty() || !narrowable_display_path(&prefix) {
+        return ReadScope::Whole;
+    }
+    ReadScope::Subtrees(vec![prefix])
+}
+
+/// Whether reading `n` subtrees through an index of `stride` clearly pays
+/// against the whole listing of `n_ptrs` tree chunks: each subtree read
+/// costs up to two key searches of about `stride + 1` chunks, and the
+/// subtree reads must stay well below the listing (a factor of 4 on top).
+fn subtree_reads_pay(n: usize, stride: u32, n_ptrs: usize) -> bool {
+    n.saturating_mul(8).saturating_mul(stride as usize + 1) < n_ptrs
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Take the subtree read whenever the index is usable, whatever the cost.
+    static FORCE_SUBTREE_READS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Tests: force subtree reads while the guard lives (this thread).
+#[cfg(test)]
+pub(crate) fn force_subtree_reads() -> impl Drop {
+    struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            FORCE_SUBTREE_READS.with(|c| c.set(false));
+        }
+    }
+    FORCE_SUBTREE_READS.with(|c| c.set(true));
+    Guard
+}
+
+#[cfg(test)]
+fn forced() -> bool {
+    FORCE_SUBTREE_READS.with(std::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+fn forced() -> bool {
+    false
+}
+
+/// Where restore streams items from.
+enum RestoreSource<'a> {
+    Lazy(LazyItemStream<'a>),
+    Subtrees {
+        view: ListingView<'a>,
+        meta: &'a SnapshotMeta,
+        repo: &'a Repository,
+        dirs: Vec<String>,
+        shutdown: &'a CancelToken,
+        read: ListingRead,
+    },
+}
+
+impl ItemSource for &mut RestoreSource<'_> {
+    fn for_each_item(self, mut visit: impl FnMut(Item) -> Result<()>) -> Result<()> {
+        match self {
+            RestoreSource::Lazy(s) => s.for_each_item(visit),
+            RestoreSource::Subtrees {
+                view,
+                meta,
+                repo,
+                dirs,
+                shutdown,
+                read,
+            } => {
+                let mut rest = dirs.as_slice();
+                while let Some((dir, tail)) = rest.split_first() {
+                    let r = view.subtree(repo, dir.as_bytes(), shutdown, &mut visit)?;
+                    let fell_back = !r.via_index;
+                    read.absorb(r);
+                    rest = tail;
+                    if fell_back && !rest.is_empty() {
+                        // The index failed once: one scan for every remaining
+                        // directory instead of one per directory.
+                        let scan = scan_subtrees(repo, meta, rest, shutdown, &mut visit)?;
+                        read.absorb(scan);
+                        break;
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Every entry under one of `dirs` (raw paths, as `ListingView::subtree`
+/// matches them), by one lazy scan of the whole listing, in stream order.
+fn scan_subtrees(
+    repo: &Repository,
+    meta: &SnapshotMeta,
+    dirs: &[String],
+    shutdown: &CancelToken,
+    visit: &mut dyn FnMut(Item) -> Result<()>,
+) -> Result<ListingRead> {
+    let wanted: HashSet<&[u8]> = dirs.iter().map(|d| d.as_bytes()).collect();
+    let mut read = ListingRead {
+        fallback: Some("one scan after an index fallback".into()),
+        chunks_read: meta.item_ptrs.len(),
+        stored_bytes: meta
+            .item_ptrs
+            .iter()
+            .filter_map(|id| repo.chunk_index().get(id))
+            .map(|e| u64::from(e.stored_size))
+            .sum(),
+        queries: dirs.len(),
+        ..ListingRead::default()
+    };
+    let mut stream = LazyItemStream::open(repo, &meta.item_ptrs, shutdown)?;
+    stream.for_each_item(|item| {
+        let p = item.path_bytes();
+        let under = wanted.contains(p)
+            || p.iter()
+                .enumerate()
+                .filter(|(_, b)| **b == b'/')
+                .any(|(i, _)| p.get(..i).is_some_and(|a| wanted.contains(a)));
+        if !under {
+            return Ok(());
+        }
+        read.matches += 1;
+        visit(item)
+    })?;
+    Ok(read)
 }
 
 // ---------------------------------------------------------------------------
@@ -287,6 +537,7 @@ fn restore_with_filter<F>(
     snapshot_name: &str,
     dest: &str,
     opts: RestoreOptions,
+    scope: ReadScope,
     include_path: F,
     shutdown: &CancelToken,
 ) -> Result<RestoreStats>
@@ -300,17 +551,29 @@ where
         crate::repo::OpenOptions::new(),
         shutdown,
     )?;
-    restore_on_repo_with_filter(&mut repo, snapshot_name, dest, opts, include_path, shutdown)
+    restore_on_repo_with_filter(
+        &mut repo,
+        snapshot_name,
+        dest,
+        opts,
+        scope,
+        include_path,
+        shutdown,
+    )
+    .map(|(stats, _)| stats)
 }
 
+/// The restore. Also returns what the subtree reads cost (`None` for the
+/// lazy whole-listing read).
 fn restore_on_repo_with_filter<F>(
     repo: &mut Repository,
     snapshot_name: &str,
     dest: &str,
     opts: RestoreOptions,
+    scope: ReadScope,
     mut include_path: F,
     shutdown: &CancelToken,
-) -> Result<RestoreStats>
+) -> Result<(RestoreStats, Option<ListingRead>)>
 where
     F: FnMut(&str) -> bool,
 {
@@ -349,6 +612,13 @@ where
     // before anything is written (`temp_root` does not exist yet), leaving the
     // filesystem untouched. A failure further into the stream surfaces from
     // `stream_and_plan` and is cleaned up like any other mid-restore error.
+    //
+    // Selected paths and a glob with literal leading components read only
+    // their subtrees through the listing's key index when it is usable and
+    // that clearly pays. Every pointer is still resolved before `dest` is
+    // touched, but the first listing read then happens inside
+    // `stream_and_plan`: a read failure there leaves a `dest` that did not
+    // exist behind, empty.
     let mut items = super::list::ItemStreamReader::new(repo);
 
     // Byte-faithful restore of non-UTF8 names is Unix-only. On other platforms
@@ -373,7 +643,37 @@ where
             )));
         }
     }
-    let mut item_stream = items.open_lazy(repo, &resolved_name, shutdown)?;
+    shutdown.check()?;
+    let meta = super::list::load_snapshot_meta(repo, &resolved_name)?;
+    items.ensure_index(repo)?;
+    // Shared until the source is dropped.
+    let ro: &Repository = repo;
+    let view = ListingView::new(&meta);
+    let dirs = match (&scope, view.index()) {
+        (ReadScope::Subtrees(d), Ok(ix))
+            if forced() || subtree_reads_pay(d.len(), ix.stride, meta.item_ptrs.len()) =>
+        {
+            Some(d.clone())
+        }
+        _ => None,
+    };
+    let mut source = match dirs {
+        None => RestoreSource::Lazy(LazyItemStream::open(ro, &meta.item_ptrs, shutdown)?),
+        Some(dirs) => {
+            // A pointer the chunk index lacks is refused before anything is
+            // written, as the lazy read refuses it, even where the subtree
+            // reads would not reach it.
+            resolve_from_index(ro.chunk_index(), &meta.item_ptrs)?;
+            RestoreSource::Subtrees {
+                view,
+                meta: &meta,
+                repo: ro,
+                dirs,
+                shutdown,
+                read: ListingRead::default(),
+            }
+        }
+    };
 
     let dest_root = plan::validate_and_prepare_dest(dest)?;
 
@@ -422,8 +722,9 @@ where
     // publish, so a later entry at the same path still aborts as a conflict
     // exactly as in strict mode. Removed by `sweep_tombstones`.
     let mut tombstones: HashSet<PathBuf> = HashSet::new();
+    debug_assert!(items.index_loaded());
     let mut plan_out = plan::stream_and_plan(
-        &mut item_stream,
+        &mut source,
         &temp_root,
         &mut include_path,
         xattrs_enabled,
@@ -438,16 +739,13 @@ where
                 return Ok(());
             }
 
-            if !batch_chunks.is_empty() {
-                // Resolve through the chunk index (the local table at the
-                // open head, mapped once for the item stream).
-                items.ensure_resolvable(repo, batch_chunks.keys())?;
-            }
+            // Chunks resolve through the chunk index loaded above (the
+            // local table at the open head, mapped once for the item stream).
             let failures = continue_on_error.then(parallel::BatchFailures::default);
             let groups = if batch_chunks.is_empty() {
                 Vec::new()
             } else {
-                let (items, repo) = (&items, &*repo);
+                let (items, repo) = (&items, ro);
                 if let (true, Some(f)) = (continue_on_error, &failures) {
                     batch_chunks.retain(|id, ct| {
                         let present = items.lookup(repo, id).is_some();
@@ -473,8 +771,8 @@ where
             let bytes = parallel::execute_parallel_restore(
                 &batch_files,
                 groups,
-                &repo.storage,
-                repo.crypto.as_ref(),
+                &ro.storage,
+                ro.crypto.as_ref(),
                 &temp_root,
                 readers,
                 verify_chunks,
@@ -516,7 +814,24 @@ where
     )
     .map_err(cleanup)?;
 
-    drop(item_stream);
+    let listing_read = match source {
+        RestoreSource::Subtrees { dirs, read, .. } => {
+            tracing::debug!(
+                "restore read: {} subtrees, via index {}, fallback {:?}, {} tree chunks, {} B stored",
+                dirs.len(),
+                read.via_index,
+                read.fallback,
+                read.chunks_read,
+                read.stored_bytes
+            );
+            Some(read)
+        }
+        RestoreSource::Lazy(stream) => {
+            tracing::debug!("restore read: whole listing");
+            drop(stream);
+            None
+        }
+    };
     repo.clear_chunk_index();
 
     // Symlink metadata (F1/F5: lchown → xattrs → mtime) is applied while the
@@ -633,7 +948,7 @@ where
         );
     }
 
-    Ok(stats)
+    Ok((stats, listing_read))
 }
 
 /// Surface a worker-pass error: source failures are wrapped so the caller can
@@ -758,6 +1073,22 @@ pub(super) fn is_reserved_temp_dir_name(name: &OsStr) -> bool {
 /// Check if a path matches the selection set.
 /// A path matches if it's exactly in the set, or any prefix (ancestor) is in the set.
 fn path_matches_selection(path: &str, selected: &HashSet<String>) -> bool {
+    if selected.contains(path) {
+        return true;
+    }
+    // Check if any ancestor is selected
+    let mut current = path;
+    while let Some(slash_idx) = current.rfind('/') {
+        current = &current[..slash_idx];
+        if selected.contains(current) {
+            return true;
+        }
+    }
+    false
+}
+
+/// [`path_matches_selection`] over borrowed paths.
+fn path_matches_selection_set(path: &str, selected: &HashSet<&str>) -> bool {
     if selected.contains(path) {
         return true;
     }
@@ -977,6 +1308,74 @@ mod tests {
         assert!(!path_matches_selection("documents", &selected));
     }
 
+    fn subtrees(dirs: &[&str]) -> ReadScope {
+        ReadScope::Subtrees(dirs.iter().map(|d| d.to_string()).collect())
+    }
+
+    #[test]
+    fn pattern_scope_cases() {
+        for p in [
+            None,
+            Some(""),
+            Some("*.pdf"),
+            Some("reports*"),
+            Some("a\\*b"),
+            Some("/x/*"),
+            Some("a//b/*"),
+            Some("dir/"),
+            Some("n\u{FFFD}/*"),
+        ] {
+            assert_eq!(pattern_scope(p), ReadScope::Whole, "{p:?}");
+        }
+        let narrowed = [
+            (
+                "home/user/documents/reports*",
+                subtrees(&["home/user/documents"]),
+            ),
+            ("a/b/c", subtrees(&["a/b/c"])),
+            ("a/[bc]/d", subtrees(&["a"])),
+            ("a/{b,c}", subtrees(&["a"])),
+            ("é/x?", subtrees(&["é"])),
+        ];
+        for (p, want) in narrowed {
+            let want = if cfg!(unix) { want } else { ReadScope::Whole };
+            assert_eq!(pattern_scope(Some(p)), want, "{p:?}");
+        }
+    }
+
+    #[test]
+    fn selection_scope_cases() {
+        let set =
+            |paths: &[&str]| -> HashSet<String> { paths.iter().map(|p| p.to_string()).collect() };
+        assert_eq!(
+            selection_scope(&set(&["docs/notes", "docs", "docs-x", "docs/notes/a"])),
+            subtrees(&["docs", "docs-x"])
+        );
+        assert_eq!(selection_scope(&set(&[])), subtrees(&[]));
+        for bad in ["", "a//b", "n\u{FFFD}", "/a", "a/"] {
+            assert_eq!(
+                selection_scope(&set(&[bad, "x"])),
+                ReadScope::Whole,
+                "{bad:?}"
+            );
+        }
+        assert_eq!(selection_scope(&set(&["é/x"])), subtrees(&["é/x"]));
+        assert_eq!(
+            selection_scope(&set(&["b", "a/x", "a"])),
+            subtrees(&["a", "b"])
+        );
+    }
+
+    #[test]
+    fn subtree_reads_pay_bounds() {
+        assert!(!subtree_reads_pay(1, 32, 264));
+        assert!(subtree_reads_pay(1, 32, 265));
+        assert!(!subtree_reads_pay(0, 32, 0));
+        assert!(subtree_reads_pay(0, 32, 1));
+        assert!(!subtree_reads_pay(usize::MAX, 32, usize::MAX));
+        assert!(!subtree_reads_pay(usize::MAX / 4, 32, usize::MAX));
+    }
+
     #[test]
     fn is_reserved_temp_dir_name_strict_shape() {
         let ok = |s: &str| is_reserved_temp_dir_name(OsStr::new(s));
@@ -1127,6 +1526,7 @@ mod tests {
             "snap-cancel",
             dest.to_str().unwrap(),
             RestoreOptions::default(),
+            ReadScope::Whole,
             |_path| {
                 seen += 1;
                 if seen == 3 {
@@ -1175,6 +1575,7 @@ mod tests {
             "snap-cancel",
             dest.to_str().unwrap(),
             RestoreOptions::default(),
+            ReadScope::Whole,
             |_path| true,
             &flag,
         )
@@ -1211,6 +1612,7 @@ mod tests {
             "snap-cancel",
             dest.to_str().unwrap(),
             RestoreOptions::default(),
+            ReadScope::Whole,
             |_path| true,
             &flag,
         )
@@ -1332,6 +1734,7 @@ mod tests {
             "snap-cancel",
             dest.to_str().unwrap(),
             RestoreOptions::default(),
+            ReadScope::Whole,
             |_path| true,
             &CancelToken::new(),
         );

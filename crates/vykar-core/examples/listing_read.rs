@@ -96,12 +96,11 @@ fn lossy(p: &[u8]) -> String {
 
 /// One query through `view`: the paths, the read statistics and the wall ms.
 fn run(
-    repo: &mut Repository,
+    repo: &Repository,
     view: &ListingView<'_>,
     dir: &[u8],
     subtree: bool,
 ) -> Result<(Vec<Vec<u8>>, ListingRead, f64), Error> {
-    let mut reader = ItemStreamReader::new(repo);
     let shutdown = CancelToken::new();
     let mut paths = Vec::new();
     let visit = |i: vykar_core::snapshot::item::Item| {
@@ -110,9 +109,9 @@ fn run(
     };
     let t = Instant::now();
     let stats = if subtree {
-        view.subtree(repo, &mut reader, dir, &shutdown, visit)?
+        view.subtree(repo, dir, &shutdown, visit)?
     } else {
-        view.dir_entries(repo, &mut reader, dir, &shutdown, visit)?
+        view.dir_entries(repo, dir, &shutdown, visit)?
     };
     let ms = t.elapsed().as_secs_f64() * 1000.0;
     Ok((paths, stats, ms))
@@ -120,15 +119,10 @@ fn run(
 
 /// Up to `n` leaf directories (no directory child), evenly spaced in
 /// stream order, from one scan.
-fn sample_leaves(
-    repo: &mut Repository,
-    meta: &SnapshotMeta,
-    n: usize,
-) -> Result<Vec<Vec<u8>>, Error> {
-    let mut reader = ItemStreamReader::new(repo);
+fn sample_leaves(repo: &Repository, meta: &SnapshotMeta, n: usize) -> Result<Vec<Vec<u8>>, Error> {
     let mut dirs: Vec<Vec<u8>> = Vec::new();
     let mut has_dir_child: HashSet<Vec<u8>> = HashSet::new();
-    ListingView::ignore_index(meta).subtree(repo, &mut reader, b"", &CancelToken::new(), |i| {
+    ListingView::ignore_index(meta).subtree(repo, b"", &CancelToken::new(), |i| {
         if i.entry_type == ItemType::Directory {
             let p = i.path_bytes();
             if let Some(slash) = p.iter().rposition(|b| *b == b'/') {
@@ -174,6 +168,8 @@ fn main() -> Result<(), Error> {
         .name
         .clone();
     let meta = load_snapshot_meta(&repo, &name)?;
+    ItemStreamReader::new(&repo).ensure_index(&mut repo)?;
+    let repo = repo;
 
     let view = ListingView::new(&meta);
     let mut without_ext = meta.clone();
@@ -208,7 +204,7 @@ fn main() -> Result<(), Error> {
     let mut queries: Vec<(Vec<u8>, bool)> = Vec::new();
     queries.extend(args.dirs.iter().map(|d| (d.as_bytes().to_vec(), false)));
     queries.extend(
-        sample_leaves(&mut repo, &meta, args.sample_leaves)?
+        sample_leaves(&repo, &meta, args.sample_leaves)?
             .into_iter()
             .map(|d| (d, false)),
     );
@@ -218,9 +214,9 @@ fn main() -> Result<(), Error> {
     let (mut fallbacks, mut differing) = (0usize, 0usize);
     let (mut small_chunks, mut small_bytes) = (Vec::new(), Vec::new());
     for (dir, subtree) in &queries {
-        let (paths, stats, ms) = run(&mut repo, &view, dir, *subtree)?;
+        let (paths, stats, ms) = run(&repo, &view, dir, *subtree)?;
         let (identical, scan_ms) = if args.compare {
-            let (scanned, _, scan_ms) = run(&mut repo, &scan_view, dir, *subtree)?;
+            let (scanned, _, scan_ms) = run(&repo, &scan_view, dir, *subtree)?;
             (Some(scanned == paths), Some(scan_ms))
         } else {
             (None, None)

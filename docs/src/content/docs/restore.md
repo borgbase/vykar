@@ -96,6 +96,7 @@ vykar restore a1b2c3d4 /tmp/restored --pattern '*.pdf'
 - The glob must match the whole path. `--pattern 'reports'` restores only the directory itself, empty; use `reports*` to include its contents.
 - Quote the pattern, or your shell expands `*` against the current directory before vykar sees it.
 - Files land under the destination at their full stored path: restoring `home/user/documents/reports*` into `/tmp/restored` gives `/tmp/restored/home/user/documents/reports/`.
+- A pattern whose leading path components contain no glob characters (`home/user/documents/reports*`) reads only that part of the snapshot's listing; a pattern starting with a glob character (`*.pdf`, `reports*`) reads all of it.
 - A pattern that matches nothing is not an error — restore reports `Restored: 0 files, 0 dirs, 0 symlinks`. If you see that, re-check the paths with `vykar snapshot list`.
 
 > **Important:** patterns are matched against snapshot-relative paths, not absolute filesystem paths. `--pattern '/home/user/documents/reports/*'` silently matches nothing. Drop the leading `/` and use the form `vykar snapshot list` shows.
@@ -117,6 +118,8 @@ vykar mount --source docs
 # Custom listen address
 vykar mount --address 127.0.0.1:9090
 ```
+
+Snapshots and directories are loaded when first opened; with several snapshots, the server starts before any listing is read.
 
 ## Restore from a damaged repository
 

@@ -8,7 +8,8 @@ use std::convert::Infallible;
 use std::fmt;
 use std::io::SeekFrom;
 use std::num::NonZeroUsize;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
@@ -24,9 +25,11 @@ use percent_encoding::percent_decode_str;
 use tokio::net::TcpListener;
 
 use crate::commands::list as list_cmd;
+use crate::commands::listing::ListingView;
 use crate::config::VykarConfig;
-use crate::repo::Repository;
 use crate::repo::control::CancelToken;
+use crate::repo::{Repository, TreeChunkSource};
+use crate::snapshot::SnapshotMeta;
 use crate::snapshot::item::{ChunkRef, Item, ItemType};
 use vykar_types::chunk_id::ChunkId;
 use vykar_types::error::{Result, VykarError};
@@ -37,14 +40,13 @@ use super::util::open_repo;
 
 type ChunkCache = Arc<Mutex<LruCache<ChunkId, Arc<Vec<u8>>>>>;
 
-/// In-memory virtual filesystem node built from snapshot items.
+/// A node of the virtual filesystem. Directories are shared, so a node is
+/// cheap to clone.
+#[derive(Clone)]
 enum VfsNode {
-    Dir {
-        children: HashMap<String, VfsNode>,
-        meta: VfsMeta,
-    },
+    Dir(Arc<VfsDir>),
     File {
-        chunks: Vec<ChunkRef>,
+        chunks: Arc<Vec<ChunkRef>>,
         meta: VfsMeta,
     },
     Symlink {
@@ -53,8 +55,150 @@ enum VfsNode {
     },
 }
 
+/// A directory's children by name.
+type Children = Arc<HashMap<String, VfsNode>>;
+
+/// A directory: its metadata and its children, known up front or read on
+/// first use.
+struct VfsDir {
+    meta: VfsMeta,
+    children: DirChildren,
+}
+
+enum DirChildren {
+    /// Known up front (whole-built snapshots, the multi-snapshot root, tests).
+    Ready(Children),
+    /// Read on first use; a failed load is not cached.
+    Lazy {
+        loader: DirLoader,
+        loaded: LoadOnce<Children>,
+    },
+}
+
+/// What a lazy directory reads its children from.
+enum DirLoader {
+    /// The root of a snapshot not opened yet.
+    Snapshot { repo: Arc<Repository>, name: String },
+    /// A directory of a snapshot with a usable key index: its raw paths
+    /// (several when non-UTF-8 names share a display name; an empty path is
+    /// the snapshot root) and its display path from the snapshot root.
+    Indexed {
+        snap: Arc<IndexedSnapshot>,
+        raws: Vec<Vec<u8>>,
+        display: String,
+    },
+    /// Tests: blocks until the channel delivers, then has no children.
+    #[cfg(test)]
+    Gate(Mutex<std::sync::mpsc::Receiver<()>>),
+}
+
+/// A value loaded at most once. Readers of a loaded value take no lock; a
+/// load holds only this value's own lock, so concurrent requests for the
+/// same value wait while other values load in parallel. A failed load stores
+/// nothing.
+struct LoadOnce<T> {
+    value: OnceLock<T>,
+    loading: Mutex<()>,
+}
+
+impl<T> LoadOnce<T> {
+    fn new() -> Self {
+        Self {
+            value: OnceLock::new(),
+            loading: Mutex::new(()),
+        }
+    }
+
+    fn get(&self) -> Option<&T> {
+        self.value.get()
+    }
+
+    fn get_or_load(&self, load: impl FnOnce() -> Result<T>) -> Result<&T> {
+        if let Some(v) = self.value.get() {
+            return Ok(v);
+        }
+        let _loading = self.loading.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(v) = self.value.get() {
+            return Ok(v);
+        }
+        let v = load()?;
+        Ok(self.value.get_or_init(|| v))
+    }
+}
+
+/// An opened snapshot whose key index is usable.
+struct IndexedSnapshot {
+    repo: Arc<Repository>,
+    meta: SnapshotMeta,
+    /// Non-empty segment roots of the index (implicit ancestors come from
+    /// them).
+    roots: Vec<Vec<u8>>,
+    /// Set once a directory read fell back to a scan: further directories
+    /// come from the snapshot's tree built whole.
+    degraded: AtomicBool,
+    whole: LoadOnce<VfsNode>,
+}
+
+impl VfsDir {
+    fn ready(children: HashMap<String, VfsNode>, meta: VfsMeta) -> Self {
+        Self {
+            meta,
+            children: DirChildren::Ready(Arc::new(children)),
+        }
+    }
+
+    fn lazy(loader: DirLoader, meta: VfsMeta) -> Self {
+        Self {
+            meta,
+            children: DirChildren::Lazy {
+                loader,
+                loaded: LoadOnce::new(),
+            },
+        }
+    }
+
+    /// The children, loading them on first use (blocking I/O).
+    fn children(&self) -> Result<Children> {
+        match &self.children {
+            DirChildren::Ready(c) => Ok(c.clone()),
+            DirChildren::Lazy { loader, loaded } => loaded.get_or_load(|| loader.load()).cloned(),
+        }
+    }
+
+    /// The children if already known, without I/O or waiting.
+    fn children_if_loaded(&self) -> Option<Children> {
+        match &self.children {
+            DirChildren::Ready(c) => Some(c.clone()),
+            DirChildren::Lazy { loaded, .. } => loaded.get().cloned(),
+        }
+    }
+
+    #[cfg(test)]
+    fn is_loaded(&self) -> bool {
+        self.children_if_loaded().is_some()
+    }
+}
+
+impl DirLoader {
+    fn load(&self) -> Result<Children> {
+        match self {
+            DirLoader::Snapshot { repo, name } => load_snapshot_root(repo, name),
+            DirLoader::Indexed {
+                snap,
+                raws,
+                display,
+            } => load_indexed(snap, raws, display),
+            #[cfg(test)]
+            DirLoader::Gate(rx) => {
+                let _ = rx.lock().unwrap_or_else(|e| e.into_inner()).recv();
+                Ok(Arc::new(HashMap::new()))
+            }
+        }
+    }
+}
+
 /// Metadata for a VFS node, compatible with WebDAV metadata requirements.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 struct VfsMeta {
     size: u64,
     mtime: SystemTime,
@@ -89,32 +233,344 @@ impl VfsMeta {
 
 fn node_meta(node: &VfsNode) -> &VfsMeta {
     match node {
-        VfsNode::Dir { meta, .. } => meta,
+        VfsNode::Dir(d) => &d.meta,
         VfsNode::File { meta, .. } => meta,
         VfsNode::Symlink { meta, .. } => meta,
     }
 }
 
-/// Build a VFS tree from a list of snapshot items.
-fn build_vfs_tree(items: &[Item]) -> VfsNode {
-    let mut root_children = HashMap::new();
+/// The non-empty segment roots of `meta`'s key index, or `None` when it has
+/// no usable index.
+fn indexed_roots(meta: &SnapshotMeta) -> Option<Vec<Vec<u8>>> {
+    let view = ListingView::new(meta);
+    let index = view.index().ok()?;
+    Some(
+        index
+            .segments
+            .iter()
+            .filter(|s| !s.root.is_empty())
+            .map(|s| s.root.to_vec())
+            .collect(),
+    )
+}
 
-    for item in items {
-        let path = item.path.trim_start_matches('/');
-        if path.is_empty() {
-            continue;
+/// The root directory of snapshot `name`: read through its key index one
+/// directory at a time when it has a usable one (the root's children are
+/// read here), else its whole tree (built here); the item count is returned
+/// for a whole build. A pointer the chunk index lacks is refused up front.
+fn open_snapshot(repo: &Arc<Repository>, name: &str) -> Result<(VfsNode, Option<usize>)> {
+    let meta = list_cmd::load_snapshot_meta(repo, name)?;
+    list_cmd::resolve_from_index(repo.chunk_index(), &meta.item_ptrs)?;
+    match indexed_roots(&meta) {
+        Some(roots) => {
+            let snap = Arc::new(IndexedSnapshot {
+                repo: Arc::clone(repo),
+                meta,
+                roots,
+                degraded: AtomicBool::new(false),
+                whole: LoadOnce::new(),
+            });
+            let children = load_indexed(&snap, &[Vec::new()], "")?;
+            Ok((
+                VfsNode::Dir(Arc::new(VfsDir {
+                    meta: VfsMeta::dir_default(),
+                    children: DirChildren::Ready(children),
+                })),
+                None,
+            ))
         }
-        let components: Vec<&str> = path.split('/').collect();
-        insert_into_tree(&mut root_children, &components, item);
-    }
-
-    VfsNode::Dir {
-        children: root_children,
-        meta: VfsMeta::dir_default(),
+        None => {
+            let (root, count) = build_whole(repo, &meta)?;
+            Ok((root, Some(count)))
+        }
     }
 }
 
-fn insert_into_tree(children: &mut HashMap<String, VfsNode>, components: &[&str], item: &Item) {
+/// The children of snapshot `name`'s root directory.
+fn load_snapshot_root(repo: &Arc<Repository>, name: &str) -> Result<Children> {
+    match open_snapshot(repo, name)?.0 {
+        VfsNode::Dir(d) => Ok(d.children_if_loaded().unwrap_or_default()),
+        _ => Ok(Children::default()),
+    }
+}
+
+/// A child while a directory's children are collected.
+enum ChildBuild {
+    Dir {
+        meta: VfsMeta,
+        raws: Vec<Vec<u8>>,
+    },
+    File {
+        chunks: Vec<ChunkRef>,
+        meta: VfsMeta,
+    },
+    Symlink {
+        target: String,
+        meta: VfsMeta,
+    },
+}
+
+/// `a/b` (`b` when `a` is empty).
+fn join_path(a: &[u8], b: &[u8]) -> Vec<u8> {
+    let mut p = a.to_vec();
+    if !p.is_empty() {
+        p.push(b'/');
+    }
+    p.extend_from_slice(b);
+    p
+}
+
+/// Children of the directory whose raw paths are `raws` (display path
+/// `display`): the implicit ancestors of segment roots under it, then its
+/// entries through the key index (`dir_entries`), merged as
+/// `insert_into_tree` merges.
+fn load_indexed(
+    snap: &Arc<IndexedSnapshot>,
+    raws: &[Vec<u8>],
+    display_path: &str,
+) -> Result<Children> {
+    if snap.degraded.load(AtomicOrdering::Relaxed) {
+        return whole_children(snap, display_path);
+    }
+    let mut build: HashMap<String, ChildBuild> = HashMap::new();
+    let view = ListingView::new(&snap.meta);
+    let mut done: Vec<&[u8]> = Vec::new();
+    for raw in raws {
+        if done.contains(&raw.as_slice()) {
+            continue;
+        }
+        done.push(raw);
+        for root in &snap.roots {
+            let rest = if raw.is_empty() {
+                Some(root.as_slice())
+            } else {
+                root.strip_prefix(raw.as_slice())
+                    .and_then(|r| r.strip_prefix(b"/"))
+            };
+            let Some(c) = rest
+                .and_then(|r| r.split(|b| *b == b'/').next())
+                .filter(|c| !c.is_empty())
+            else {
+                continue;
+            };
+            let child_raw = join_path(raw, c);
+            let name = String::from_utf8_lossy(c).into_owned();
+            match build.get_mut(&name) {
+                Some(ChildBuild::Dir { raws, .. }) => {
+                    if !raws.contains(&child_raw) {
+                        raws.push(child_raw);
+                    }
+                }
+                Some(_) => {}
+                None => {
+                    build.insert(
+                        name,
+                        ChildBuild::Dir {
+                            meta: VfsMeta::dir_default(),
+                            raws: vec![child_raw],
+                        },
+                    );
+                }
+            }
+        }
+        let mut entries = 0usize;
+        let read = view.dir_entries(&snap.repo, raw, &CancelToken::new(), |item| {
+            entries += 1;
+            let Some(name) = item.path.rsplit('/').next().filter(|n| !n.is_empty()) else {
+                return Ok(());
+            };
+            let meta = VfsMeta::from_item(&item);
+            match item.entry_type {
+                ItemType::Directory => {
+                    if let Some(ChildBuild::Dir { meta: m, raws }) = build.get_mut(name) {
+                        *m = meta;
+                        if !raws.iter().any(|r| r.as_slice() == item.path_bytes()) {
+                            raws.push(item.path_bytes().to_vec());
+                        }
+                    } else {
+                        build.insert(
+                            name.to_string(),
+                            ChildBuild::Dir {
+                                meta,
+                                raws: vec![item.path_bytes().to_vec()],
+                            },
+                        );
+                    }
+                }
+                ItemType::RegularFile => {
+                    build.insert(
+                        name.to_string(),
+                        ChildBuild::File {
+                            chunks: item.chunks,
+                            meta,
+                        },
+                    );
+                }
+                ItemType::Symlink => {
+                    build.insert(
+                        name.to_string(),
+                        ChildBuild::Symlink {
+                            target: item.link_target.unwrap_or_default(),
+                            meta,
+                        },
+                    );
+                }
+            }
+            Ok(())
+        })?;
+        tracing::debug!(
+            "mount: snapshot {} dir {:?}: {} entries, via index {}, {} tree chunks",
+            snap.meta.name,
+            display_path,
+            entries,
+            read.via_index,
+            read.chunks_read
+        );
+        if !read.via_index {
+            tracing::warn!(
+                "mount: snapshot {}: a directory read fell back to a scan ({}); \
+                 reading its further directories from the whole listing",
+                snap.meta.name,
+                read.fallback.as_deref().unwrap_or("unknown reason")
+            );
+            snap.degraded.store(true, AtomicOrdering::Relaxed);
+        }
+    }
+    let children = build
+        .into_iter()
+        .map(|(name, child)| {
+            let node = match child {
+                ChildBuild::Dir { meta, raws } => {
+                    let display = if display_path.is_empty() {
+                        name.clone()
+                    } else {
+                        format!("{display_path}/{name}")
+                    };
+                    VfsNode::Dir(Arc::new(VfsDir::lazy(
+                        DirLoader::Indexed {
+                            snap: Arc::clone(snap),
+                            raws,
+                            display,
+                        },
+                        meta,
+                    )))
+                }
+                ChildBuild::File { chunks, meta } => VfsNode::File {
+                    chunks: Arc::new(chunks),
+                    meta,
+                },
+                ChildBuild::Symlink { target, meta } => VfsNode::Symlink {
+                    _target: target,
+                    meta,
+                },
+            };
+            (name, node)
+        })
+        .collect();
+    Ok(Arc::new(children))
+}
+
+/// The children of display path `display` in the snapshot's tree built
+/// whole (built on first use).
+fn whole_children(snap: &IndexedSnapshot, display: &str) -> Result<Children> {
+    let root = snap
+        .whole
+        .get_or_load(|| build_whole(&snap.repo, &snap.meta).map(|(root, _)| root))?;
+    Ok(match lookup_loaded(root, display.as_bytes()) {
+        Ok(Some(VfsNode::Dir(d))) => d.children_if_loaded().unwrap_or_default(),
+        _ => Children::default(),
+    })
+}
+
+/// A node of a tree under construction (the whole-built tree).
+enum BuildNode {
+    Dir {
+        children: HashMap<String, BuildNode>,
+        meta: VfsMeta,
+    },
+    File {
+        chunks: Vec<ChunkRef>,
+        meta: VfsMeta,
+    },
+    Symlink {
+        target: String,
+        meta: VfsMeta,
+    },
+}
+
+impl BuildNode {
+    fn finish(self) -> VfsNode {
+        match self {
+            BuildNode::Dir { children, meta } => VfsNode::Dir(Arc::new(VfsDir::ready(
+                children
+                    .into_iter()
+                    .map(|(name, child)| (name, child.finish()))
+                    .collect(),
+                meta,
+            ))),
+            BuildNode::File { chunks, meta } => VfsNode::File {
+                chunks: Arc::new(chunks),
+                meta,
+            },
+            BuildNode::Symlink { target, meta } => VfsNode::Symlink {
+                _target: target,
+                meta,
+            },
+        }
+    }
+}
+
+/// Insert `item` into a tree under construction.
+fn insert_item(root: &mut HashMap<String, BuildNode>, item: &Item) {
+    let path = item.path.trim_start_matches('/');
+    if path.is_empty() {
+        return;
+    }
+    let components: Vec<&str> = path.split('/').collect();
+    insert_into_tree(root, &components, item);
+}
+
+/// Snapshot `meta`'s whole tree with every directory known, read a batch of
+/// tree chunks at a time; also returns the item count.
+fn build_whole(repo: &Repository, meta: &SnapshotMeta) -> Result<(VfsNode, usize)> {
+    let mut root = HashMap::new();
+    let mut count = 0usize;
+    list_cmd::for_each_item_by_chunk(
+        repo,
+        &meta.item_ptrs,
+        TreeChunkSource::CacheFirst,
+        list_cmd::LISTING_BATCH_CHUNKS,
+        list_cmd::LISTING_BATCH_STORED_BYTES,
+        &CancelToken::new(),
+        |item| {
+            count += 1;
+            insert_item(&mut root, &item);
+            Ok(())
+        },
+    )?;
+    tracing::debug!("mount: snapshot {} built whole: {count} items", meta.name);
+    let tree = BuildNode::Dir {
+        children: root,
+        meta: VfsMeta::dir_default(),
+    };
+    Ok((tree.finish(), count))
+}
+
+/// Build a VFS tree from a list of snapshot items.
+#[cfg(test)]
+fn build_vfs_tree(items: &[Item]) -> VfsNode {
+    let mut root = HashMap::new();
+    for item in items {
+        insert_item(&mut root, item);
+    }
+    BuildNode::Dir {
+        children: root,
+        meta: VfsMeta::dir_default(),
+    }
+    .finish()
+}
+
+fn insert_into_tree(children: &mut HashMap<String, BuildNode>, components: &[&str], item: &Item) {
     let (head, tail) = match components.split_first() {
         Some(parts) => parts,
         None => return,
@@ -125,33 +581,33 @@ fn insert_into_tree(children: &mut HashMap<String, VfsNode>, components: &[&str]
         // If this is a directory and one already exists as an intermediate,
         // just update its metadata rather than replacing it (which would lose children).
         if item.entry_type == ItemType::Directory
-            && let Some(VfsNode::Dir { meta, .. }) = children.get_mut(&name)
+            && let Some(BuildNode::Dir { meta, .. }) = children.get_mut(&name)
         {
             *meta = VfsMeta::from_item(item);
             return;
         }
         let node = match item.entry_type {
-            ItemType::Directory => VfsNode::Dir {
+            ItemType::Directory => BuildNode::Dir {
                 children: HashMap::new(),
                 meta: VfsMeta::from_item(item),
             },
-            ItemType::RegularFile => VfsNode::File {
+            ItemType::RegularFile => BuildNode::File {
                 chunks: item.chunks.clone(),
                 meta: VfsMeta::from_item(item),
             },
-            ItemType::Symlink => VfsNode::Symlink {
-                _target: item.link_target.clone().unwrap_or_default(),
+            ItemType::Symlink => BuildNode::Symlink {
+                target: item.link_target.clone().unwrap_or_default(),
                 meta: VfsMeta::from_item(item),
             },
         };
         children.insert(name, node);
     } else {
         let dir_name = (*head).to_string();
-        let entry = children.entry(dir_name).or_insert_with(|| VfsNode::Dir {
+        let entry = children.entry(dir_name).or_insert_with(|| BuildNode::Dir {
             children: HashMap::new(),
             meta: VfsMeta::dir_default(),
         });
-        if let VfsNode::Dir {
+        if let BuildNode::Dir {
             children: dir_children,
             ..
         } = entry
@@ -161,29 +617,77 @@ fn insert_into_tree(children: &mut HashMap<String, VfsNode>, components: &[&str]
     }
 }
 
-/// Lookup a node by its path bytes (as returned by `DavPath::as_bytes()`).
-fn lookup<'a>(root: &'a VfsNode, path: &[u8]) -> Option<&'a VfsNode> {
-    let path_str = std::str::from_utf8(path).ok()?;
-    let path_str = path_str.trim_start_matches('/');
+/// The components of a node path (DavPath bytes): UTF-8 required, empty
+/// components skipped.
+fn path_components(path: &[u8]) -> Option<impl Iterator<Item = &str>> {
+    let s = std::str::from_utf8(path).ok()?;
+    Some(s.split('/').filter(|c| !c.is_empty()))
+}
 
-    if path_str.is_empty() {
-        return Some(root);
-    }
-
-    let mut current = root;
-    for component in path_str.split('/') {
-        if component.is_empty() {
-            continue;
+/// The node at `path` (DavPath bytes, UTF-8, empty components skipped),
+/// loading directories on the way (blocking I/O). The node itself is not
+/// loaded.
+fn lookup(root: &VfsNode, path: &[u8]) -> Result<Option<VfsNode>> {
+    let Some(components) = path_components(path) else {
+        return Ok(None);
+    };
+    let mut current = root.clone();
+    for component in components {
+        let next = match &current {
+            VfsNode::Dir(d) => d.children()?.get(component).cloned(),
+            _ => None,
+        };
+        match next {
+            Some(n) => current = n,
+            None => return Ok(None),
         }
-        match current {
-            VfsNode::Dir { children, .. } => {
-                current = children.get(component)?;
-            }
-            _ => return None,
+    }
+    Ok(Some(current))
+}
+
+/// A directory on the way of [`lookup_loaded`] is not loaded yet.
+struct NotLoaded;
+
+/// [`lookup`] without I/O: `Err(NotLoaded)` when a directory on the way is
+/// not loaded yet.
+fn lookup_loaded(root: &VfsNode, path: &[u8]) -> std::result::Result<Option<VfsNode>, NotLoaded> {
+    let Some(components) = path_components(path) else {
+        return Ok(None);
+    };
+    let mut current = root.clone();
+    for component in components {
+        let next = match &current {
+            VfsNode::Dir(d) => d
+                .children_if_loaded()
+                .ok_or(NotLoaded)?
+                .get(component)
+                .cloned(),
+            _ => None,
+        };
+        match next {
+            Some(n) => current = n,
+            None => return Ok(None),
         }
     }
+    Ok(Some(current))
+}
 
-    Some(current)
+/// [`lookup_loaded`], else [`lookup`] inside `tokio::task::block_in_place`
+/// (the server's multi-thread runtime; outside a runtime it just runs).
+fn lookup_in_runtime(root: &VfsNode, path: &[u8]) -> Result<Option<VfsNode>> {
+    if let Ok(found) = lookup_loaded(root, path) {
+        return Ok(found);
+    }
+    tokio::task::block_in_place(|| lookup(root, path))
+}
+
+/// A directory's children, loading them inside `block_in_place` when they
+/// are not known yet.
+fn children_in_runtime(dir: &VfsDir) -> Result<Children> {
+    match dir.children_if_loaded() {
+        Some(c) => Ok(c),
+        None => tokio::task::block_in_place(|| dir.children()),
+    }
 }
 
 // ─── HTML Web UI ──────────────────────────────────────────────────────────
@@ -255,7 +759,7 @@ enum BrowserAction {
     PassThrough,
 }
 
-fn classify_browser_request<B>(req: &hyper::Request<B>, tree: &VfsNode) -> BrowserAction {
+fn classify_browser_request<B>(req: &hyper::Request<B>, root: &VfsNode) -> BrowserAction {
     if req.method() != hyper::Method::GET {
         return BrowserAction::PassThrough;
     }
@@ -269,8 +773,8 @@ fn classify_browser_request<B>(req: &hyper::Request<B>, tree: &VfsNode) -> Brows
     }
     let raw_path = req.uri().path();
     let decoded = percent_decode_str(raw_path).decode_utf8_lossy();
-    match lookup(tree, decoded.as_bytes()) {
-        Some(VfsNode::Dir { .. }) => {
+    match lookup_in_runtime(root, decoded.as_bytes()) {
+        Ok(Some(VfsNode::Dir(_))) => {
             if raw_path == "/" || raw_path.ends_with('/') {
                 BrowserAction::ServeHtml
             } else {
@@ -281,19 +785,20 @@ fn classify_browser_request<B>(req: &hyper::Request<B>, tree: &VfsNode) -> Brows
     }
 }
 
-fn render_directory_html(path: &str, tree: &VfsNode, is_snapshot_root: bool) -> String {
-    let node = lookup(tree, path.as_bytes());
-    let children = match node {
-        Some(VfsNode::Dir { children, .. }) => children,
-        _ => return String::from("<html><body><h1>Not Found</h1></body></html>"),
+/// The HTML listing of directory `path`; `Err` when a directory on the way
+/// cannot be read.
+fn render_directory_html(path: &str, root: &VfsNode, is_snapshot_root: bool) -> Result<String> {
+    let children = match lookup_in_runtime(root, path.as_bytes())? {
+        Some(VfsNode::Dir(d)) => children_in_runtime(&d)?,
+        _ => return Ok(String::from("<html><body><h1>Not Found</h1></body></html>")),
     };
 
     // Collect and sort entries: dirs first, then files, alphabetical within each
     let mut dirs: Vec<(&String, &VfsNode)> = Vec::new();
     let mut files: Vec<(&String, &VfsNode)> = Vec::new();
-    for (name, child) in children {
+    for (name, child) in children.iter() {
         match child {
-            VfsNode::Dir { .. } => dirs.push((name, child)),
+            VfsNode::Dir(_) => dirs.push((name, child)),
             _ => files.push((name, child)),
         }
     }
@@ -394,7 +899,7 @@ fn render_directory_html(path: &str, tree: &VfsNode, is_snapshot_root: bool) -> 
         ("1", "asc")
     };
 
-    format!(
+    Ok(format!(
         r#"<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -505,7 +1010,7 @@ footer {{ margin-top: 2rem; font-size: 0.75rem; color: var(--muted); }}
 </script>
 </body>
 </html>"#
-    )
+    ))
 }
 
 // ─── DavMetaData ───────────────────────────────────────────────────────────
@@ -551,16 +1056,30 @@ impl DavDirEntry for VykarDirEntry {
 /// Read-only WebDAV filesystem backed by vykar snapshot data.
 #[derive(Clone)]
 struct VykarDavFs {
-    tree: Arc<VfsNode>,
+    root: VfsNode,
     repo: Arc<Repository>,
     cache: Arc<Mutex<LruCache<ChunkId, Arc<Vec<u8>>>>>,
+}
+
+impl VykarDavFs {
+    /// The node at `path`, loading directories on the way.
+    fn lookup(&self, path: &DavPath) -> FsResult<VfsNode> {
+        match lookup_in_runtime(&self.root, path.as_bytes()) {
+            Ok(Some(node)) => Ok(node),
+            Ok(None) => Err(FsError::NotFound),
+            Err(e) => {
+                tracing::warn!("mount: {path}: {e}");
+                Err(FsError::GeneralFailure)
+            }
+        }
+    }
 }
 
 impl DavFileSystem for VykarDavFs {
     fn metadata<'a>(&'a self, path: &'a DavPath) -> FsFuture<'a, Box<dyn DavMetaData>> {
         Box::pin(async move {
-            let node = lookup(&self.tree, path.as_bytes()).ok_or(FsError::NotFound)?;
-            Ok(Box::new(node_meta(node).clone()) as Box<dyn DavMetaData>)
+            let node = self.lookup(path)?;
+            Ok(Box::new(node_meta(&node).clone()) as Box<dyn DavMetaData>)
         })
     }
 
@@ -575,9 +1094,13 @@ impl DavFileSystem for VykarDavFs {
         _meta: ReadDirMeta,
     ) -> FsFuture<'a, FsStream<Box<dyn DavDirEntry>>> {
         Box::pin(async move {
-            let node = lookup(&self.tree, path.as_bytes()).ok_or(FsError::NotFound)?;
+            let node = self.lookup(path)?;
             match node {
-                VfsNode::Dir { children, .. } => {
+                VfsNode::Dir(d) => {
+                    let children = children_in_runtime(&d).map_err(|e| {
+                        tracing::warn!("mount: {path}: {e}");
+                        FsError::GeneralFailure
+                    })?;
                     let entries: Vec<_> = children
                         .iter()
                         .map(|(name, child)| {
@@ -604,11 +1127,11 @@ impl DavFileSystem for VykarDavFs {
                 return Err(FsError::Forbidden);
             }
 
-            let node = lookup(&self.tree, path.as_bytes()).ok_or(FsError::NotFound)?;
+            let node = self.lookup(path)?;
             match node {
                 VfsNode::File { chunks, meta } => Ok(Box::new(VykarDavFile {
-                    chunks: chunks.clone(),
-                    meta: meta.clone(),
+                    chunks,
+                    meta,
                     pos: 0,
                     repo: self.repo.clone(),
                     cache: self.cache.clone(),
@@ -622,7 +1145,7 @@ impl DavFileSystem for VykarDavFs {
 // ─── DavFile ───────────────────────────────────────────────────────────────
 
 struct VykarDavFile {
-    chunks: Vec<ChunkRef>,
+    chunks: Arc<Vec<ChunkRef>>,
     meta: VfsMeta,
     pos: u64,
     repo: Arc<Repository>,
@@ -696,7 +1219,7 @@ impl DavFile for VykarDavFile {
                 let mut offset = start_pos;
                 let mut chunk_start: u64 = 0;
 
-                for chunk_ref in &chunks {
+                for chunk_ref in chunks.iter() {
                     let chunk_end = chunk_start + chunk_ref.size as u64;
 
                     if offset >= chunk_end {
@@ -782,8 +1305,16 @@ impl DavFile for VykarDavFile {
 #[derive(Debug)]
 pub enum MountProgressEvent {
     LoadingSnapshots,
-    SnapshotLoaded { name: String, item_count: usize },
-    Serving { address: String },
+    /// Sent only for a single snapshot built whole before serving (one
+    /// without a usable listing key index); other snapshots and directories
+    /// are read on first access.
+    SnapshotLoaded {
+        name: String,
+        item_count: usize,
+    },
+    Serving {
+        address: String,
+    },
     ShuttingDown,
 }
 
@@ -823,67 +1354,46 @@ pub fn run_with_progress(
     shutdown: Option<Arc<tokio::sync::Notify>>,
 ) -> Result<()> {
     // Mount cancels through `shutdown` (a Notify), not a token.
-    let mut repo = open_repo(
+    let repo = open_repo(
         config,
         passphrase,
         crate::repo::OpenOptions::new().with_index(),
         &CancelToken::new(),
     )?;
 
-    // Build the VFS tree from snapshot items
     if let Some(ref mut cb) = progress {
         cb(MountProgressEvent::LoadingSnapshots);
     }
-    let tree = if let Some(name) = snapshot_name {
-        let items = list_cmd::load_snapshot_items(&mut repo, name, &CancelToken::new())?;
-        if let Some(ref mut cb) = progress {
+    let repo = Arc::new(repo);
+    let root = if let Some(name) = snapshot_name {
+        // One snapshot: its root directory (or its whole tree, without a
+        // usable key index) is read before serving, so a bad snapshot fails
+        // the mount.
+        let (root, item_count) = open_snapshot(&repo, name)?;
+        if let (Some(item_count), Some(cb)) = (item_count, progress.as_mut()) {
             cb(MountProgressEvent::SnapshotLoaded {
                 name: name.to_string(),
-                item_count: items.len(),
+                item_count,
             });
         }
-        build_vfs_tree(&items)
+        root
     } else {
-        let mut root_children = HashMap::new();
-        let entries: Vec<_> = if source_filter.is_empty() {
-            repo.manifest().snapshots.clone()
-        } else {
-            repo.manifest()
-                .snapshots
-                .iter()
-                .filter(|e| source_filter.contains(&e.source_label))
-                .cloned()
-                .collect()
-        };
-        for entry in &entries {
-            let items = list_cmd::load_snapshot_items(&mut repo, &entry.name, &CancelToken::new())?;
-            if let Some(ref mut cb) = progress {
-                cb(MountProgressEvent::SnapshotLoaded {
-                    name: entry.name.clone(),
-                    item_count: items.len(),
-                });
-            }
-            let mut snap_tree = build_vfs_tree(&items);
-            if let VfsNode::Dir { ref mut meta, .. } = snap_tree {
-                meta.mtime = SystemTime::from(entry.time);
-            }
-            root_children.insert(entry.name.clone(), snap_tree);
-        }
-        VfsNode::Dir {
-            children: root_children,
-            meta: VfsMeta::dir_default(),
-        }
+        let entries: Vec<_> = repo
+            .manifest()
+            .snapshots
+            .iter()
+            .filter(|e| source_filter.is_empty() || source_filter.contains(&e.source_label))
+            .cloned()
+            .collect();
+        multi_snapshot_root(&repo, &entries)
     };
 
-    let repo = Arc::new(repo);
     let cache_size = NonZeroUsize::new(cache_size)
         .unwrap_or_else(|| NonZeroUsize::new(256).expect("literal non-zero cache size"));
     let cache = Arc::new(Mutex::new(LruCache::new(cache_size)));
 
-    let tree = Arc::new(tree);
-
     let fs = VykarDavFs {
-        tree: tree.clone(),
+        root: root.clone(),
         repo,
         cache,
     };
@@ -899,7 +1409,7 @@ pub fn run_with_progress(
     rt.block_on(async {
         serve(
             handler,
-            tree,
+            root,
             address,
             is_multi_snapshot,
             &mut progress,
@@ -909,9 +1419,34 @@ pub fn run_with_progress(
     })
 }
 
+/// The root of a multi-snapshot mount: one directory per snapshot of
+/// `entries`, each read on first access. Reads nothing.
+fn multi_snapshot_root(
+    repo: &Arc<Repository>,
+    entries: &[crate::repo::manifest::SnapshotEntry],
+) -> VfsNode {
+    let children = entries
+        .iter()
+        .map(|entry| {
+            let dir = VfsDir::lazy(
+                DirLoader::Snapshot {
+                    repo: Arc::clone(repo),
+                    name: entry.name.clone(),
+                },
+                VfsMeta {
+                    mtime: SystemTime::from(entry.time),
+                    ..VfsMeta::dir_default()
+                },
+            );
+            (entry.name.clone(), VfsNode::Dir(Arc::new(dir)))
+        })
+        .collect();
+    VfsNode::Dir(Arc::new(VfsDir::ready(children, VfsMeta::dir_default())))
+}
+
 async fn serve(
     handler: DavHandler,
-    tree: Arc<VfsNode>,
+    root: VfsNode,
     address: &str,
     is_multi_snapshot: bool,
     progress: &mut Option<&mut dyn FnMut(MountProgressEvent)>,
@@ -946,7 +1481,7 @@ async fn serve(
                 }
                 let io = TokioIo::new(stream);
                 let handler = handler.clone();
-                let tree = tree.clone();
+                let root = root.clone();
 
                 tokio::spawn(async move {
                     if let Err(e) = http1::Builder::new()
@@ -954,17 +1489,26 @@ async fn serve(
                             io,
                             service_fn(move |req| {
                                 let handler = handler.clone();
-                                let tree = tree.clone();
+                                let root = root.clone();
                                 async move {
-                                    match classify_browser_request(&req, &tree) {
+                                    match classify_browser_request(&req, &root) {
                                         BrowserAction::ServeHtml => {
                                             let raw_path = req.uri().path().to_string();
                                             let decoded = percent_decode_str(&raw_path).decode_utf8_lossy();
                                             let is_snapshot_root = is_multi_snapshot
                                                 && decoded.trim_matches('/').is_empty();
-                                            let html = render_directory_html(&decoded, &tree, is_snapshot_root);
+                                            let (status, html) = match render_directory_html(&decoded, &root, is_snapshot_root) {
+                                                Ok(html) => (200, html),
+                                                Err(e) => {
+                                                    tracing::warn!("mount: {decoded}: {e}");
+                                                    (500, format!(
+                                                        "<html><body><h1>Error</h1><p>{}</p></body></html>",
+                                                        html_escape(&e.to_string())
+                                                    ))
+                                                }
+                                            };
                                             let resp = hyper::Response::builder()
-                                                .status(200)
+                                                .status(status)
                                                 .header("content-type", "text/html; charset=utf-8")
                                                 .body(dav_server::body::Body::from(html))
                                                 .expect("static HTML response is valid");
@@ -1023,15 +1567,12 @@ mod tests {
         let mut children = HashMap::new();
         children.insert(
             name.to_string(),
-            VfsNode::Dir {
-                children: HashMap::new(),
-                meta: VfsMeta::dir_default(),
-            },
+            VfsNode::Dir(Arc::new(VfsDir::ready(
+                HashMap::new(),
+                VfsMeta::dir_default(),
+            ))),
         );
-        VfsNode::Dir {
-            children,
-            meta: VfsMeta::dir_default(),
-        }
+        VfsNode::Dir(Arc::new(VfsDir::ready(children, VfsMeta::dir_default())))
     }
 
     /// Helper: build a hyper GET request with the given URI and Accept header.
@@ -1071,7 +1612,7 @@ mod tests {
         let tree = tree_with_dir("form c");
         // After decoding, render_directory_html should find the "form c" dir.
         let decoded = percent_decode_str("/form%20c/").decode_utf8_lossy();
-        let html = render_directory_html(&decoded, &tree, false);
+        let html = render_directory_html(&decoded, &tree, false).unwrap();
         assert!(
             !html.contains("Not Found"),
             "decoded path should resolve the directory"
@@ -1084,21 +1625,18 @@ mod tests {
         for (name, mtime) in snapshots {
             children.insert(
                 name.to_string(),
-                VfsNode::Dir {
-                    children: HashMap::new(),
-                    meta: VfsMeta {
+                VfsNode::Dir(Arc::new(VfsDir::ready(
+                    HashMap::new(),
+                    VfsMeta {
                         size: 0,
                         mtime: *mtime,
                         is_dir: true,
                         is_symlink: false,
                     },
-                },
+                ))),
             );
         }
-        VfsNode::Dir {
-            children,
-            meta: VfsMeta::dir_default(),
-        }
+        VfsNode::Dir(Arc::new(VfsDir::ready(children, VfsMeta::dir_default())))
     }
 
     /// Helper: build a VFS tree with files at root for testing data-sort attributes.
@@ -1108,7 +1646,7 @@ mod tests {
             children.insert(
                 name.to_string(),
                 VfsNode::File {
-                    chunks: vec![],
+                    chunks: Arc::new(vec![]),
                     meta: VfsMeta {
                         size: *size,
                         mtime: *mtime,
@@ -1118,10 +1656,7 @@ mod tests {
                 },
             );
         }
-        VfsNode::Dir {
-            children,
-            meta: VfsMeta::dir_default(),
-        }
+        VfsNode::Dir(Arc::new(VfsDir::ready(children, VfsMeta::dir_default())))
     }
 
     #[test]
@@ -1130,7 +1665,7 @@ mod tests {
         let t2 = UNIX_EPOCH + std::time::Duration::from_secs(2000);
         let t3 = UNIX_EPOCH + std::time::Duration::from_secs(3000);
         let tree = tree_with_snapshots(&[("snap-old", t1), ("snap-new", t3), ("snap-mid", t2)]);
-        let html = render_directory_html("/", &tree, true);
+        let html = render_directory_html("/", &tree, true).unwrap();
         // Newest first: snap-new before snap-mid before snap-old
         let pos_new = html.find("snap-new").expect("snap-new should appear");
         let pos_mid = html.find("snap-mid").expect("snap-mid should appear");
@@ -1145,7 +1680,7 @@ mod tests {
     fn test_data_sort_attributes() {
         let mtime = UNIX_EPOCH + std::time::Duration::from_secs(1_700_000);
         let tree = tree_with_files(&[("readme.txt", 4096, mtime)]);
-        let html = render_directory_html("/", &tree, false);
+        let html = render_directory_html("/", &tree, false).unwrap();
         // File size data-sort should be the raw byte count
         assert!(
             html.contains(r#"data-sort="4096""#),
@@ -1162,7 +1697,7 @@ mod tests {
     #[test]
     fn test_sortable_headers_present() {
         let tree = tree_with_dir("test");
-        let html = render_directory_html("/", &tree, false);
+        let html = render_directory_html("/", &tree, false).unwrap();
         assert!(
             html.contains(r#"class="sortable" data-col="1" data-type="text""#),
             "Name header should be sortable"
@@ -1181,17 +1716,241 @@ mod tests {
     fn test_initial_sort_attribute() {
         let tree = tree_with_dir("test");
         // Snapshot root: sort by modified descending
-        let html_root = render_directory_html("/", &tree, true);
+        let html_root = render_directory_html("/", &tree, true).unwrap();
         assert!(
             html_root.contains(r#"data-sort-col="3" data-sort-dir="desc""#),
             "snapshot root table should default to col 3 desc"
         );
         // Inner directory: sort by name ascending
-        let html_inner = render_directory_html("/", &tree, false);
+        let html_inner = render_directory_html("/", &tree, false).unwrap();
         assert!(
             html_inner.contains(r#"data-sort-col="1" data-sort-dir="asc""#),
             "inner directory table should default to col 1 asc"
         );
+    }
+
+    // ─── Lazy tree ──────────────────────────────────────────────────────
+
+    use crate::tests::helpers::open_local_repo;
+    use crate::tests::listing_index::{backup, make_awkward, multi_root_repo, reseal};
+
+    /// Every directory of `lazy` (loading it) has the children of `eager`
+    /// with the same kind, metadata, chunks and link targets.
+    fn assert_same_tree(lazy: &VfsNode, eager: &VfsNode, path: &str) {
+        assert_eq!(node_meta(lazy), node_meta(eager), "{path:?}");
+        match (lazy, eager) {
+            (VfsNode::Dir(l), VfsNode::Dir(e)) => {
+                let lc = l.children().unwrap();
+                let ec = e.children_if_loaded().unwrap();
+                let mut ln: Vec<&String> = lc.keys().collect();
+                let mut en: Vec<&String> = ec.keys().collect();
+                ln.sort();
+                en.sort();
+                assert_eq!(ln, en, "{path:?}");
+                for (name, child) in lc.iter() {
+                    assert_same_tree(child, &ec[name], &format!("{path}/{name}"));
+                }
+            }
+            (VfsNode::File { chunks: l, .. }, VfsNode::File { chunks: e, .. }) => {
+                assert_eq!(l, e, "{path:?}");
+            }
+            (VfsNode::Symlink { _target: l, .. }, VfsNode::Symlink { _target: e, .. }) => {
+                assert_eq!(l, e, "{path:?}");
+            }
+            _ => panic!("{path:?}: kinds differ"),
+        }
+    }
+
+    /// Directory `node`'s children (loading them) under a default root meta.
+    fn contents(node: &VfsNode) -> VfsNode {
+        VfsNode::Dir(Arc::new(VfsDir::ready(
+            (*dir_of(node).children().unwrap()).clone(),
+            VfsMeta::dir_default(),
+        )))
+    }
+
+    /// The eager tree of snapshot `name`, the oracle.
+    fn eager_tree(repo: &mut Repository, name: &str) -> VfsNode {
+        build_vfs_tree(&list_cmd::load_snapshot_items(repo, name, &CancelToken::new()).unwrap())
+    }
+
+    fn dir_of(node: &VfsNode) -> &Arc<VfsDir> {
+        match node {
+            VfsNode::Dir(d) => d,
+            _ => panic!("not a directory"),
+        }
+    }
+
+    /// The child directory `name` of `dir`, which must be loaded.
+    fn loaded_child(dir: &VfsDir, name: &str) -> VfsNode {
+        dir.children_if_loaded().unwrap()[name].clone()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lazy_tree_equals_the_eager_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        multi_root_repo(tmp.path(), "multi", make_awkward);
+        let mut repo = open_local_repo(&tmp.path().join("repo"));
+        let eager = eager_tree(&mut repo, "multi");
+        let repo = Arc::new(repo);
+        let (lazy, count) = open_snapshot(&repo, "multi").unwrap();
+        assert_eq!(count, None, "the snapshot has a key index");
+        assert_same_tree(&lazy, &eager, "");
+        // Through the multi-snapshot root too.
+        let entries = repo.manifest().snapshots.clone();
+        let root = multi_snapshot_root(&repo, &entries);
+        let snap = lookup(&root, b"/multi").unwrap().unwrap();
+        assert_same_tree(&contents(&snap), &eager, "");
+    }
+
+    /// Two snapshots of `a/b/c/f`, `a/x/g` and `top`.
+    fn two_snapshots() -> (tempfile::TempDir, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_dir = tmp.path().join("repo");
+        let source = tmp.path().join("src");
+        std::fs::create_dir_all(source.join("a/b/c")).unwrap();
+        std::fs::create_dir_all(source.join("a/x")).unwrap();
+        std::fs::write(source.join("a/b/c/f"), "f").unwrap();
+        std::fs::write(source.join("a/x/g"), "g").unwrap();
+        std::fs::write(source.join("top"), "t").unwrap();
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        let config = crate::tests::helpers::init_repo(&repo_dir);
+        let paths = [source.to_string_lossy().to_string()];
+        backup(&config, &paths, "s1", &[]);
+        backup(&config, &paths, "s2", &[]);
+        (tmp, repo_dir)
+    }
+
+    #[test]
+    fn multi_snapshot_root_reads_no_listing() {
+        let (_tmp, repo_dir) = two_snapshots();
+        let repo = Arc::new(open_local_repo(&repo_dir));
+        let entries = repo.manifest().snapshots.clone();
+        let root = multi_snapshot_root(&repo, &entries);
+        let rd = dir_of(&root);
+        let mut names: Vec<String> = rd.children().unwrap().keys().cloned().collect();
+        names.sort();
+        assert_eq!(names, vec!["s1".to_string(), "s2".to_string()]);
+        let snaps = rd.children().unwrap();
+        assert!(snaps.values().all(|s| !dir_of(s).is_loaded()));
+        // What WebDAV `metadata` does on the snapshot directory.
+        assert!(lookup(&root, b"/s1").unwrap().is_some());
+        assert!(!dir_of(&snaps["s1"]).is_loaded());
+
+        // A lookup three levels deep loads exactly the directories on the way.
+        let node = lookup(&root, b"/s1/a/b").unwrap().unwrap();
+        assert!(!dir_of(&node).is_loaded());
+        let s1 = dir_of(&snaps["s1"]);
+        assert!(s1.is_loaded());
+        let a = loaded_child(s1, "a");
+        assert!(dir_of(&a).is_loaded());
+        assert!(!dir_of(&loaded_child(dir_of(&a), "x")).is_loaded());
+        assert!(!dir_of(&snaps["s2"]).is_loaded());
+        assert!(lookup(&root, b"/s1/a/b/c/f").unwrap().is_some());
+        assert!(lookup(&root, b"/s1/a/nosuch").unwrap().is_none());
+    }
+
+    #[test]
+    fn snapshot_without_an_index_is_built_whole() {
+        let (_tmp, repo_dir) = two_snapshots();
+        reseal(&repo_dir, "s1", |m| m.ext = None);
+        let mut repo = open_local_repo(&repo_dir);
+        let eager = eager_tree(&mut repo, "s1");
+        let repo = Arc::new(repo);
+        let entries = repo.manifest().snapshots.clone();
+        let root = multi_snapshot_root(&repo, &entries);
+        let s1 = lookup(&root, b"/s1").unwrap().unwrap();
+        assert_same_tree(&contents(&s1), &eager, "");
+        // Every directory of the whole-built snapshot is known.
+        let a = lookup(&root, b"/s1/a").unwrap().unwrap();
+        assert!(dir_of(&a).is_loaded());
+        // The other snapshot still reads one directory at a time.
+        let a2 = lookup(&root, b"/s2/a").unwrap().unwrap();
+        assert!(!dir_of(&a2).is_loaded());
+        let (_, count) = open_snapshot(&repo, "s1").unwrap();
+        assert_eq!(count, Some(7));
+    }
+
+    #[test]
+    fn unreadable_snapshot_fails_only_its_directory() {
+        let (_tmp, repo_dir) = two_snapshots();
+        let repo = Arc::new(open_local_repo(&repo_dir));
+        let entries = repo.manifest().snapshots.clone();
+        let root = multi_snapshot_root(&repo, &entries);
+        let bad = repo.manifest().find_snapshot("s1").unwrap().id;
+        repo.storage.delete(&bad.storage_key()).unwrap();
+        assert!(lookup(&root, b"/s1/a").is_err());
+        assert!(lookup(&root, b"/s2/a/b/c/f").unwrap().is_some());
+        let mut names: Vec<String> = dir_of(&root).children().unwrap().keys().cloned().collect();
+        names.sort();
+        assert_eq!(names, vec!["s1".to_string(), "s2".to_string()]);
+        // A failed load is not cached.
+        assert!(!dir_of(&lookup(&root, b"/s1").unwrap().unwrap()).is_loaded());
+    }
+
+    /// A directory read that falls back to a scan switches the snapshot to
+    /// its whole tree for further directories; the results stay the same.
+    #[test]
+    fn a_fallback_switches_the_snapshot_to_the_whole_tree() {
+        let (_tmp, repo_dir) = two_snapshots();
+        let mut repo = open_local_repo(&repo_dir);
+        let eager = eager_tree(&mut repo, "s1");
+        let repo = Arc::new(repo);
+        let mut meta = list_cmd::load_snapshot_meta(&repo, "s1").unwrap();
+        let roots = indexed_roots(&meta).unwrap();
+        // The key index says nothing is wrong; a view ignoring it scans.
+        meta.ext = Some(b"garbage".to_vec());
+        let snap = Arc::new(IndexedSnapshot {
+            repo: Arc::clone(&repo),
+            meta,
+            roots,
+            degraded: AtomicBool::new(false),
+            whole: LoadOnce::new(),
+        });
+        let children = load_indexed(&snap, &[Vec::new()], "").unwrap();
+        assert!(snap.degraded.load(AtomicOrdering::Relaxed));
+        assert!(snap.whole.get().is_none());
+        let lazy = VfsNode::Dir(Arc::new(VfsDir::ready(
+            (*children).clone(),
+            VfsMeta::dir_default(),
+        )));
+        assert_same_tree(&lazy, &eager, "");
+        assert!(snap.whole.get().is_some());
+    }
+
+    /// Reading a directory's loaded children takes no lock: while another
+    /// thread loads that directory, `children_if_loaded` answers at once.
+    #[test]
+    fn a_loading_directory_does_not_block_readers() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let dir = Arc::new(VfsDir::lazy(
+            DirLoader::Gate(Mutex::new(rx)),
+            VfsMeta::dir_default(),
+        ));
+        let loader = {
+            let dir = Arc::clone(&dir);
+            std::thread::spawn(move || dir.children().map(|c| c.len()))
+        };
+        // Wait until the loader holds the directory's loading lock.
+        let DirChildren::Lazy { loaded, .. } = &dir.children else {
+            panic!("not lazy")
+        };
+        let t0 = std::time::Instant::now();
+        while loaded.loading.try_lock().is_ok() {
+            assert!(t0.elapsed() < std::time::Duration::from_secs(30));
+            std::thread::yield_now();
+        }
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        {
+            let dir = Arc::clone(&dir);
+            std::thread::spawn(move || done_tx.send(dir.children_if_loaded().is_none()));
+        }
+        let answered = done_rx.recv_timeout(std::time::Duration::from_secs(10));
+        tx.send(()).unwrap();
+        assert_eq!(answered, Ok(true), "children_if_loaded waited for the load");
+        assert_eq!(loader.join().unwrap().unwrap(), 0);
+        assert!(dir.is_loaded());
     }
 
     /// Shared state of a [`RendezvousBackend`]: (reads in flight, most at once).

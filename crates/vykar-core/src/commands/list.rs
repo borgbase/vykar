@@ -21,9 +21,11 @@ use vykar_types::error::{Result, VykarError};
 use vykar_types::pack_id::PackId;
 use vykar_types::snapshot_id::SnapshotId;
 
+use super::listing::{ListingRead, ListingView};
 use super::mark::{Located, cut_batches_with, push_spans};
 use super::util::open_repo;
 use crate::repo::OpenOptions;
+use crate::repo::lock::SessionGuard;
 
 /// List all snapshots in the repository.
 pub fn list_snapshots(
@@ -89,7 +91,27 @@ fn for_each_listed_item_inner(
     snapshot_name: &str,
     visit: impl FnMut(Item) -> Result<()>,
 ) -> Result<Vec<String>> {
-    let (mut repo, _session_guard) = super::util::open_repo_with_read_session(
+    let (repo, _session_guard, meta) = open_listing(config, passphrase, snapshot_name)?;
+    for_each_item_by_chunk(
+        &repo,
+        &meta.item_ptrs,
+        TreeChunkSource::CacheFirst,
+        LISTING_BATCH_CHUNKS,
+        LISTING_BATCH_STORED_BYTES,
+        &CancelToken::new(),
+        visit,
+    )?;
+    Ok(meta.source_paths)
+}
+
+/// Open the repository with a read session, resolve `snapshot_name`, load
+/// its meta and the chunk index. The guard must live until the read ends.
+fn open_listing(
+    config: &VykarConfig,
+    passphrase: Option<&str>,
+    snapshot_name: &str,
+) -> Result<(Repository, SessionGuard, SnapshotMeta)> {
+    let (mut repo, session_guard) = super::util::open_repo_with_read_session(
         config,
         passphrase,
         OpenOptions::new(),
@@ -104,16 +126,99 @@ fn for_each_listed_item_inner(
 
     let meta = load_snapshot_meta(&repo, &resolved_name)?;
     ItemStreamReader::new(&repo).ensure_index(&mut repo)?;
-    for_each_item_by_chunk(
-        &repo,
-        &meta.item_ptrs,
-        TreeChunkSource::CacheFirst,
-        LISTING_BATCH_CHUNKS,
-        LISTING_BATCH_STORED_BYTES,
-        &CancelToken::new(),
-        visit,
-    )?;
-    Ok(meta.source_paths)
+    Ok((repo, session_guard, meta))
+}
+
+/// Call `visit` for every item whose display path (`Item::path`) equals
+/// `dir` or starts with `dir + "/"`, in stream order: the filter of
+/// `vykar snapshot list --path`. An empty `dir` is every item
+/// ([`for_each_listed_item`]). Reads only the tree chunks of that subtree
+/// when the snapshot's key index is usable and `dir` is a clean path
+/// without U+FFFD; otherwise the whole listing, a batch of tree chunks at
+/// a time.
+pub fn for_each_listed_item_under(
+    config: &VykarConfig,
+    passphrase: Option<&str>,
+    snapshot_name: &str,
+    dir: &str,
+    visit: impl FnMut(Item) -> Result<()>,
+) -> Result<()> {
+    if dir.is_empty() {
+        return for_each_listed_item(config, passphrase, snapshot_name, visit);
+    }
+    let (repo, _session_guard, meta) = open_listing(config, passphrase, snapshot_name)?;
+    list_under_on_repo(&repo, &meta, dir, &CancelToken::new(), visit).map(|_| ())
+}
+
+/// How [`list_under_on_repo`] read, for the debug line and tests.
+#[derive(Debug)]
+#[cfg_attr(not(test), allow(dead_code))] // the counts are read by tests
+pub(crate) enum ListUnderRead {
+    Index(ListingRead),
+    Whole(ChunkedListingStats),
+}
+
+/// Whether a display path can be narrowed to the raw-byte subtree of the
+/// same bytes: it is clean (no empty component, no leading or trailing
+/// "/") and holds no U+FFFD, so every display path equal to it or under it
+/// has a raw path equal to it or under it.
+pub(crate) fn narrowable_display_path(path: &str) -> bool {
+    !path.contains('\u{FFFD}') && crate::snapshot::listing::is_clean(path.as_bytes())
+}
+
+/// Whether display path `path` is `dir` or under `dir + "/"`.
+pub(crate) fn display_path_under(path: &str, dir: &str) -> bool {
+    path.strip_prefix(dir)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+}
+
+/// [`for_each_listed_item_under`] on an open repository whose chunk index
+/// is loaded; `dir` non-empty.
+///
+/// Every pointer of the listing is resolved first, so a pointer the chunk
+/// index lacks fails with [`VykarError::ChunkNotInIndex`] even where the
+/// subtree read would not reach it.
+pub(crate) fn list_under_on_repo(
+    repo: &Repository,
+    meta: &SnapshotMeta,
+    dir: &str,
+    shutdown: &CancelToken,
+    mut visit: impl FnMut(Item) -> Result<()>,
+) -> Result<ListUnderRead> {
+    resolve_from_index(repo.chunk_index(), &meta.item_ptrs)?;
+    let mut keep = |item: Item| {
+        if display_path_under(&item.path, dir) {
+            visit(item)
+        } else {
+            Ok(())
+        }
+    };
+    let view = ListingView::new(meta);
+    let read = if narrowable_display_path(dir) && view.index().is_ok() {
+        let stats = view.subtree(repo, dir.as_bytes(), shutdown, &mut keep)?;
+        tracing::debug!(
+            "list under: index (via_index {}, fallback {:?}, {} tree chunks, {} B stored, {} matches)",
+            stats.via_index,
+            stats.fallback,
+            stats.chunks_read,
+            stats.stored_bytes,
+            stats.matches
+        );
+        ListUnderRead::Index(stats)
+    } else {
+        let stats = for_each_item_by_chunk(
+            repo,
+            &meta.item_ptrs,
+            TreeChunkSource::CacheFirst,
+            LISTING_BATCH_CHUNKS,
+            LISTING_BATCH_STORED_BYTES,
+            shutdown,
+            keep,
+        )?;
+        tracing::debug!("list under: whole listing ({} tree chunks)", stats.chunks);
+        ListUnderRead::Whole(stats)
+    };
+    Ok(read)
 }
 
 /// Upper bound on tree chunks per read batch of [`for_each_item_by_chunk`].
@@ -378,6 +483,10 @@ impl ItemStreamReader {
     /// Chunk locations are resolved up front through the chunk index (loaded
     /// at most once). The first range read happens here, so a cancellation or
     /// an unreadable stream head fails before the caller mutates anything.
+    /// (A restore of selected subtrees reads through
+    /// [`crate::commands::listing::ListingView`] instead: it resolves every
+    /// pointer up front, but its first listing read happens after the
+    /// destination is prepared.)
     pub fn open_lazy<'a>(
         &mut self,
         repo: &mut Repository,
@@ -399,31 +508,7 @@ impl ItemStreamReader {
     ) -> Result<LazyItemStream<'a>> {
         shutdown.check()?;
         self.ensure_index(repo)?;
-        let chunks = resolve_from_index(repo.chunk_index(), item_ptrs)?;
-
-        let mut stream = LazyItemStream {
-            storage: Arc::clone(&repo.storage),
-            crypto: Arc::clone(&repo.crypto),
-            shutdown,
-            chunks,
-            cache: repo.tree_cache().cloned(),
-            cache_hits: 0,
-            retried: false,
-            window_max: LAZY_WINDOW_MAX,
-            next: 0,
-            window: Vec::new(),
-            window_start: 0,
-            window_end: 0,
-            cur: Vec::new(),
-            pos: 0,
-            error: None,
-            reads: 0,
-            done: false,
-        };
-        if let Err(e) = stream.fill_buf() {
-            return Err(stream.error.take().unwrap_or(VykarError::Io(e)));
-        }
-        Ok(stream)
+        LazyItemStream::open(repo, item_ptrs, shutdown)
     }
 
     /// Load the full chunk index unless this reader already did.
@@ -435,17 +520,8 @@ impl ItemStreamReader {
         Ok(())
     }
 
-    /// Prepare [`Self::lookup`] for `ids`: load the chunk index (once).
-    pub fn ensure_resolvable<'a>(
-        &mut self,
-        repo: &mut Repository,
-        _ids: impl IntoIterator<Item = &'a ChunkId>,
-    ) -> Result<()> {
-        self.ensure_index(repo)
-    }
-
     /// Resolve a chunk to `(pack_id, pack_offset, stored_size)` through the
-    /// chunk index. Call [`Self::ensure_resolvable`] first.
+    /// chunk index, which must be loaded ([`Self::ensure_index`]).
     pub fn lookup(&self, repo: &Repository, id: &ChunkId) -> Option<(PackId, u64, u32)> {
         repo.chunk_index()
             .get(id)
@@ -535,6 +611,43 @@ pub struct LazyItemStream<'a> {
 }
 
 impl<'a> LazyItemStream<'a> {
+    /// Open the stream of `item_ptrs` on a repository whose chunk index is
+    /// already loaded ([`ItemStreamReader::ensure_index`], or a repository
+    /// opened with `OpenOptions::with_index`). Resolves every pointer, then
+    /// performs the first read, as [`ItemStreamReader::open_lazy_ptrs`].
+    pub(crate) fn open(
+        repo: &Repository,
+        item_ptrs: &[ChunkId],
+        shutdown: &'a CancelToken,
+    ) -> Result<LazyItemStream<'a>> {
+        shutdown.check()?;
+        let chunks = resolve_from_index(repo.chunk_index(), item_ptrs)?;
+
+        let mut stream = LazyItemStream {
+            storage: Arc::clone(&repo.storage),
+            crypto: Arc::clone(&repo.crypto),
+            shutdown,
+            chunks,
+            cache: repo.tree_cache().cloned(),
+            cache_hits: 0,
+            retried: false,
+            window_max: LAZY_WINDOW_MAX,
+            next: 0,
+            window: Vec::new(),
+            window_start: 0,
+            window_end: 0,
+            cur: Vec::new(),
+            pos: 0,
+            error: None,
+            reads: 0,
+            done: false,
+        };
+        if let Err(e) = stream.fill_buf() {
+            return Err(stream.error.take().unwrap_or(VykarError::Io(e)));
+        }
+        Ok(stream)
+    }
+
     /// A stream over explicit chunk locations with a custom range-read cap,
     /// for tests that exercise window and chunk boundaries.
     #[cfg(test)]

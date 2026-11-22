@@ -1,9 +1,12 @@
 //! Path-scoped reads of a snapshot listing (06 step 4): the entries of one
 //! directory ([`ListingView::dir_entries`]) or of one subtree
 //! ([`ListingView::subtree`]), read through the listing's key index (see
-//! [`crate::snapshot::listing`]) instead of the whole listing.
+//! [`crate::snapshot::listing`]) instead of the whole listing, on a
+//! repository whose chunk index is loaded.
 //!
-//! The index path reads tree chunks through
+//! The index path starts at the grid chunk of the last key below the
+//! queried range; for a directory's children and descendants the search
+//! takes the last key not greater than `dir/`. It reads tree chunks through
 //! `Repository::read_tree_chunks_split`, the local tree-chunk cache first,
 //! and verifies every chunk it decodes: each entry is clean, inside its
 //! segment root and not before the previous one; the first chunk it starts
@@ -25,7 +28,7 @@ use serde::Deserialize;
 use serde_bytes::ByteBuf;
 use tracing::debug;
 
-use crate::commands::list::{ItemStreamReader, resolve_from_index};
+use crate::commands::list::{LazyItemStream, resolve_from_index};
 use crate::repo::control::CancelToken;
 use crate::repo::{Repository, TreeChunkSource};
 use crate::snapshot::SnapshotMeta;
@@ -66,6 +69,26 @@ pub struct ListingRead {
     pub match_chunks: usize,
     /// Entries passed to the visitor.
     pub matches: usize,
+    /// Queries these counts cover (1 for one read; see [`Self::absorb`]).
+    pub queries: usize,
+}
+
+impl ListingRead {
+    /// Add `other`'s counts. `via_index` stays true only while every
+    /// absorbed query was answered by the index; `fallback` keeps the
+    /// first reason.
+    pub fn absorb(&mut self, other: ListingRead) {
+        self.via_index = (self.queries == 0 || self.via_index) && other.via_index;
+        if self.fallback.is_none() {
+            self.fallback = other.fallback;
+        }
+        self.chunks_read += other.chunks_read;
+        self.stored_bytes += other.stored_bytes;
+        self.plain_bytes += other.plain_bytes;
+        self.match_chunks += other.match_chunks;
+        self.matches += other.matches;
+        self.queries += other.queries;
+    }
 }
 
 impl<'m> ListingView<'m> {
@@ -95,62 +118,55 @@ impl<'m> ListingView<'m> {
     /// Entries whose parent is `dir` (snapshot path bytes as
     /// `Item::path_bytes()` stores them; leading and trailing "/" are
     /// ignored; empty = top level), in stream order.
+    ///
+    /// The repository's chunk index must be loaded; a pointer it lacks
+    /// fails the read, as every listing reader does.
     pub fn dir_entries(
         &self,
-        repo: &mut Repository,
-        reader: &mut ItemStreamReader,
+        repo: &Repository,
         dir: &[u8],
         shutdown: &CancelToken,
         mut visit: impl FnMut(Item) -> Result<()>,
     ) -> Result<ListingRead> {
-        self.read(
-            repo,
-            reader,
-            Query::DirEntries(trim_dir(dir)),
-            shutdown,
-            &mut visit,
-        )
+        self.read(repo, Query::DirEntries(trim_dir(dir)), shutdown, &mut visit)
     }
 
     /// `dir` itself (every entry whose path equals it) and every entry
     /// under `dir + "/"`, in stream order. An empty `dir` is the whole
     /// listing (a scan).
+    ///
+    /// The repository's chunk index must be loaded; a pointer it lacks
+    /// fails the read, as every listing reader does.
     pub fn subtree(
         &self,
-        repo: &mut Repository,
-        reader: &mut ItemStreamReader,
+        repo: &Repository,
         dir: &[u8],
         shutdown: &CancelToken,
         mut visit: impl FnMut(Item) -> Result<()>,
     ) -> Result<ListingRead> {
-        self.read(
-            repo,
-            reader,
-            Query::Subtree(trim_dir(dir)),
-            shutdown,
-            &mut visit,
-        )
+        self.read(repo, Query::Subtree(trim_dir(dir)), shutdown, &mut visit)
     }
 
     fn read(
         &self,
-        repo: &mut Repository,
-        reader: &mut ItemStreamReader,
+        repo: &Repository,
         q: Query<'_>,
         shutdown: &CancelToken,
         visit: &mut dyn FnMut(Item) -> Result<()>,
     ) -> Result<ListingRead> {
         let ptrs = &self.meta.item_ptrs;
-        let mut stats = ListingRead::default();
+        let mut stats = ListingRead {
+            queries: 1,
+            ..ListingRead::default()
+        };
         let mut delivered = Delivered::new();
         if !q.is_whole_listing() {
             match (self.ignore, &self.index) {
                 (true, _) => stats.fallback = Some("key index ignored".into()),
                 (false, Err(no)) => stats.fallback = Some(no.to_string()),
                 (false, Ok(index)) => {
-                    reader.ensure_index(repo)?;
                     let mut spans = RepoSpans {
-                        repo: &*repo,
+                        repo,
                         ptrs,
                         shutdown,
                     };
@@ -183,7 +199,7 @@ impl<'m> ListingView<'m> {
                 }
             }
         }
-        let mut stream = reader.open_lazy_ptrs(repo, ptrs, shutdown)?;
+        let mut stream = LazyItemStream::open(repo, ptrs, shutdown)?;
         stats.chunks_read += ptrs.len();
         stats.stored_bytes += ptrs
             .iter()
@@ -412,8 +428,13 @@ impl RangeReader<'_> {
         let (start, key_j) = if lo.is_empty() {
             (seg_start, None)
         } else {
-            // The last key strictly below the lower bound among the keys of
-            // chunks after the segment's first.
+            // The last key below the lower bound among the keys of chunks
+            // after the segment's first. A Children/Descendants bound ends
+            // in "/" and no clean entry equals it, so a key equal to it
+            // already separates the range from every earlier chunk; Exact
+            // keeps the strict search, because duplicates of its bound may
+            // straddle a chunk boundary.
+            let inclusive = matches!(range, Range::Children(_) | Range::Descendants(_));
             let j_lo = seg_start / stride + 1;
             let j_hi = (seg_end - 1) / stride;
             let candidates = if j_lo <= j_hi {
@@ -422,7 +443,13 @@ impl RangeReader<'_> {
                 None
             };
             let found = candidates
-                .map(|ks| ks.partition_point(|k| dfs_name_cmp(k, &lo) == Ordering::Less))
+                .map(|ks| {
+                    ks.partition_point(|k| match dfs_name_cmp(k, &lo) {
+                        Ordering::Less => true,
+                        Ordering::Equal => inclusive,
+                        Ordering::Greater => false,
+                    })
+                })
                 .filter(|p| *p > 0)
                 .map(|p| j_lo + p - 1);
             match found {
@@ -652,7 +679,10 @@ pub(crate) fn run_query(
     for_each: &mut ForEachItem<'_>,
     visit: &mut dyn FnMut(Item) -> Result<()>,
 ) -> Result<ListingRead> {
-    let mut stats = ListingRead::default();
+    let mut stats = ListingRead {
+        queries: 1,
+        ..ListingRead::default()
+    };
     let mut delivered = Delivered::new();
     match index {
         Err(no) => stats.fallback = Some(no.to_string()),
@@ -1209,6 +1239,90 @@ mod tests {
         assert_eq!(spans.max_width, 0);
         assert!(stats.fallback.is_some());
         assert_eq!(got, listing.oracle(Query::DirEntries(b"d")));
+    }
+
+    /// "a", "b", "a/x0".."a/x9", "b/y0".."b/y2", "c/z", one entry per
+    /// chunk, stride 4: "b/y0" is chunk 12, whose key is "b/".
+    fn b_listing() -> Listing {
+        let mut paths: Vec<Vec<u8>> = vec![b"a".to_vec(), b"b".to_vec()];
+        paths.extend((0..10).map(|i| format!("a/x{i}").into_bytes()));
+        paths.extend((0..3).map(|i| format!("b/y{i}").into_bytes()));
+        paths.push(b"c/z".to_vec());
+        lay_out(&[(Vec::new(), paths)], 4, &mut || true)
+    }
+
+    #[test]
+    fn children_starting_a_grid_chunk_read_one_span() {
+        let listing = b_listing();
+        assert_eq!(listing.index.keys[3].as_slice(), b"b/");
+        for q in [Query::DirEntries(b"b"), Query::Subtree(b"b")] {
+            let (outcome, got, stats, _) = listing.index_path(q);
+            assert_eq!(outcome, Outcome::Done, "{q:?}");
+            assert_eq!(got, listing.oracle(q), "{q:?}");
+            if let Query::DirEntries(_) = q {
+                // The predecessor (chunk 11) and the span from chunk 12 to
+                // the listing's end. The strict search started at chunk 8
+                // and read 9 chunks.
+                assert!(stats.chunks_read <= 4 + 1, "{} chunks", stats.chunks_read);
+            }
+        }
+    }
+
+    #[test]
+    fn a_key_equal_to_the_bound_is_still_checked() {
+        let q = Query::DirEntries(b"b");
+        // A key equal to the bound one grid span too early: chunk 8's first
+        // entry ("a/x6") sorts before it.
+        let mut listing = b_listing();
+        listing.index.keys[2] = ByteBuf::from(b"b/".to_vec());
+        listing.index.keys[3] = ByteBuf::from(b"c/".to_vec());
+        let (got, stats) = listing.run_paths(q);
+        assert_eq!(got, listing.oracle(q));
+        assert!(stats.fallback.is_some() && !stats.via_index);
+        // The right key, but the predecessor chunk holds an entry of the
+        // range.
+        let mut listing = b_listing();
+        listing.replace_chunk(11, b"b/y0");
+        let (outcome, _, _, _) = listing.index_path(q);
+        assert_eq!(
+            outcome,
+            Outcome::Fallback("predecessor chunk reaches the queried range".into())
+        );
+        let (got, stats) = listing.run_paths(q);
+        assert_eq!(got, listing.oracle(q));
+        assert_eq!(got.iter().filter(|p| p.as_slice() == b"b/y0").count(), 2);
+        assert!(stats.fallback.is_some() && !stats.via_index);
+    }
+
+    #[test]
+    fn absorb_sums_and_keeps_the_first_fallback() {
+        let mut total = ListingRead::default();
+        let one = |via_index: bool, fallback: Option<&str>| ListingRead {
+            via_index,
+            fallback: fallback.map(String::from),
+            chunks_read: 2,
+            stored_bytes: 10,
+            plain_bytes: 20,
+            match_chunks: 1,
+            matches: 3,
+            queries: 1,
+        };
+        total.absorb(one(true, None));
+        assert!(total.via_index);
+        total.absorb(one(false, Some("first")));
+        total.absorb(one(false, Some("second")));
+        total.absorb(one(true, None));
+        assert!(!total.via_index);
+        assert_eq!(total.fallback.as_deref(), Some("first"));
+        assert_eq!(
+            (
+                total.chunks_read,
+                total.stored_bytes,
+                total.queries,
+                total.matches
+            ),
+            (8, 40, 4, 12)
+        );
     }
 
     #[test]

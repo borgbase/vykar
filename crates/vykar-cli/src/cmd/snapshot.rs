@@ -20,10 +20,6 @@ fn normalize_path_filter(raw: &str) -> String {
     s.trim_end_matches('/').to_string()
 }
 
-fn path_matches_filter(item_path: &str, filter: &str) -> bool {
-    item_path == filter || item_path.starts_with(&format!("{filter}/"))
-}
-
 pub(crate) fn run_snapshot_command(
     command: &SnapshotCommand,
     config: &VykarConfig,
@@ -38,29 +34,27 @@ pub(crate) fn run_snapshot_command(
             sort,
             ..
         } => {
-            // Path filter (empty after normalization means "all items"),
-            // applied while the listing is decoded so only matching items
-            // are kept.
+            // Path filter (empty after normalization means "all items"):
+            // only that subtree is read where the snapshot allows it, and
+            // only matching items are kept.
             let filter = path
                 .as_deref()
                 .map(normalize_path_filter)
                 .filter(|f| !f.is_empty());
             let mut items = Vec::new();
             with_repo_passphrase(config, label, |passphrase| {
-                Ok(commands::list::for_each_listed_item(
-                    config,
-                    passphrase,
-                    snapshot,
-                    |item| {
-                        if filter
-                            .as_deref()
-                            .is_none_or(|f| path_matches_filter(&item.path, f))
-                        {
-                            items.push(item);
-                        }
-                        Ok(())
-                    },
-                )?)
+                let push = |item| {
+                    items.push(item);
+                    Ok(())
+                };
+                Ok(match filter.as_deref() {
+                    Some(f) => commands::list::for_each_listed_item_under(
+                        config, passphrase, snapshot, f, push,
+                    )?,
+                    None => {
+                        commands::list::for_each_listed_item(config, passphrase, snapshot, push)?
+                    }
+                })
             })?;
 
             // Apply sort

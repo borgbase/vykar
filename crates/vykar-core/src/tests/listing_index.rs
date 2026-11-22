@@ -6,7 +6,9 @@ use std::path::Path;
 
 use crate::commands;
 use crate::commands::check::scan_for_test;
-use crate::commands::list::{ItemStreamReader, load_snapshot_meta};
+use crate::commands::list::{
+    ItemStreamReader, ListUnderRead, display_path_under, list_under_on_repo, load_snapshot_meta,
+};
 use crate::commands::listing::{ListingRead, ListingView, Query, matches};
 use crate::compress::Compression;
 use crate::config::{CommandDump, VykarConfig};
@@ -21,8 +23,14 @@ use crate::snapshot::listing::{
 use crate::tests::helpers::{backup_single_source, init_repo, open_local_repo};
 use crate::tests::tree_cut::make_tree_cut_source;
 use serde_bytes::ByteBuf;
+use vykar_types::error::VykarError;
 
-fn backup(config: &VykarConfig, source_paths: &[String], snapshot: &str, dumps: &[CommandDump]) {
+pub(crate) fn backup(
+    config: &VykarConfig,
+    source_paths: &[String],
+    snapshot: &str,
+    dumps: &[CommandDump],
+) {
     commands::backup::run(
         config,
         commands::backup::BackupRequest {
@@ -44,7 +52,7 @@ fn backup(config: &VykarConfig, source_paths: &[String], snapshot: &str, dumps: 
 }
 
 /// A repository with one backup of `source` (created by `make`).
-fn repo_with(make: impl FnOnce(&Path)) -> (tempfile::TempDir, VykarConfig) {
+pub(crate) fn repo_with(make: impl FnOnce(&Path)) -> (tempfile::TempDir, VykarConfig) {
     let tmp = tempfile::tempdir().unwrap();
     let repo_dir = tmp.path().join("repo");
     let source = tmp.path().join("source");
@@ -59,7 +67,7 @@ fn repo_with(make: impl FnOnce(&Path)) -> (tempfile::TempDir, VykarConfig) {
 
 /// Names whose dfs-name order differs from the byte order of the joined
 /// path, non-UTF-8 names, a backslash name and a directory of 3,000 files.
-fn make_awkward(root: &Path) {
+pub(crate) fn make_awkward(root: &Path) {
     for top in [
         "z", "é", "b", "B", "C", "ab", "a b", "a-b", "a.b", "a", "Zeta", "0", "_x",
     ] {
@@ -95,17 +103,17 @@ fn make_awkward(root: &Path) {
     }
 }
 
-fn make_big(root: &Path) {
+pub(crate) fn make_big(root: &Path) {
     make_tree_cut_source(root);
     make_awkward(root);
 }
 
 /// Every entry of the snapshot, by a scan: (path, is a directory).
 fn scan_all(repo: &mut Repository, meta: &SnapshotMeta) -> Vec<(Vec<u8>, bool)> {
-    let mut reader = ItemStreamReader::new(repo);
+    ItemStreamReader::new(repo).ensure_index(repo).unwrap();
     let mut all = Vec::new();
     let stats = ListingView::ignore_index(meta)
-        .subtree(repo, &mut reader, b"", &CancelToken::new(), |i| {
+        .subtree(repo, b"", &CancelToken::new(), |i| {
             all.push((i.path_bytes().to_vec(), i.entry_type == ItemType::Directory));
             Ok(())
         })
@@ -120,7 +128,7 @@ fn read(
     dir: &[u8],
     subtree: bool,
 ) -> (Vec<Vec<u8>>, ListingRead) {
-    let mut reader = ItemStreamReader::new(repo);
+    ItemStreamReader::new(repo).ensure_index(repo).unwrap();
     let mut got = Vec::new();
     let visit = |i: crate::snapshot::item::Item| {
         got.push(i.path_bytes().to_vec());
@@ -128,9 +136,9 @@ fn read(
     };
     let shutdown = CancelToken::new();
     let stats = if subtree {
-        view.subtree(repo, &mut reader, dir, &shutdown, visit)
+        view.subtree(repo, dir, &shutdown, visit)
     } else {
-        view.dir_entries(repo, &mut reader, dir, &shutdown, visit)
+        view.dir_entries(repo, dir, &shutdown, visit)
     }
     .unwrap();
     (got, stats)
@@ -202,7 +210,7 @@ fn assert_reads_match_scan(
 }
 
 /// The paths of each tree chunk of `snap`.
-fn chunk_paths(repo_dir: &Path, snap: &str) -> Vec<Vec<Vec<u8>>> {
+pub(crate) fn chunk_paths(repo_dir: &Path, snap: &str) -> Vec<Vec<Vec<u8>>> {
     let repo = open_local_repo(repo_dir);
     let meta = load_snapshot_meta(&repo, snap).unwrap();
     meta.item_ptrs
@@ -221,7 +229,7 @@ fn chunk_paths(repo_dir: &Path, snap: &str) -> Vec<Vec<Vec<u8>>> {
 }
 
 /// Re-seal snapshot `name`'s object with its meta edited by `f`.
-fn reseal(repo_dir: &Path, name: &str, f: impl FnOnce(&mut SnapshotMeta)) {
+pub(crate) fn reseal(repo_dir: &Path, name: &str, f: impl FnOnce(&mut SnapshotMeta)) {
     let repo = open_local_repo(repo_dir);
     let entry = repo.manifest().find_snapshot(name).unwrap().clone();
     let mut meta = load_snapshot_meta(&repo, name).unwrap();
@@ -236,7 +244,7 @@ fn reseal(repo_dir: &Path, name: &str, f: impl FnOnce(&mut SnapshotMeta)) {
     repo.storage.put(&entry.id.storage_key(), &packed).unwrap();
 }
 
-fn index_of(repo_dir: &Path, snap: &str) -> (SnapshotMeta, ListingIndex) {
+pub(crate) fn index_of(repo_dir: &Path, snap: &str) -> (SnapshotMeta, ListingIndex) {
     let repo = open_local_repo(repo_dir);
     let meta = load_snapshot_meta(&repo, snap).unwrap();
     let index = decode_ext(meta.ext.as_deref(), meta.item_ptrs.len()).unwrap();
@@ -400,6 +408,108 @@ fn a_wrong_index_falls_back_and_check_warns() {
     assert!(listing_warnings(&repo_dir, &config).is_empty());
 }
 
+/// `list_under_on_repo` of `dir`: the display paths, in order, and how it read.
+fn list_under(repo: &Repository, meta: &SnapshotMeta, dir: &str) -> (Vec<String>, ListUnderRead) {
+    let mut got = Vec::new();
+    let read = list_under_on_repo(repo, meta, dir, &CancelToken::new(), |i| {
+        got.push(i.path);
+        Ok(())
+    })
+    .unwrap();
+    (got, read)
+}
+
+/// For every directory display path and a few odd filters, the listing
+/// under it equals the whole listing filtered by display path. With
+/// `indexed`, every clean filter without U+FFFD reads through the index.
+fn assert_list_under_equals_the_filter(repo_dir: &Path, indexed: bool) {
+    let repo = open_local_repo(repo_dir);
+    let meta = load_snapshot_meta(&repo, "snap").unwrap();
+    let mut all: Vec<(String, bool)> = Vec::new();
+    commands::list::for_each_item_by_chunk(
+        &repo,
+        &meta.item_ptrs,
+        crate::repo::TreeChunkSource::CacheFirst,
+        commands::list::LISTING_BATCH_CHUNKS,
+        commands::list::LISTING_BATCH_STORED_BYTES,
+        &CancelToken::new(),
+        |i| {
+            all.push((i.path.clone(), i.entry_type == ItemType::Directory));
+            Ok(())
+        },
+    )
+    .unwrap();
+    let mut dirs: Vec<String> = all
+        .iter()
+        .filter(|(_, d)| *d)
+        .map(|(p, _)| p.clone())
+        .collect();
+    dirs.push(all.iter().find(|(_, d)| !*d).unwrap().0.clone());
+    dirs.extend(
+        ["no/such", "n\u{FFFD}", "a//b", "/b", "big/"]
+            .iter()
+            .map(|s| s.to_string()),
+    );
+    for dir in &dirs {
+        let want: Vec<String> = all
+            .iter()
+            .filter(|(p, _)| display_path_under(p, dir))
+            .map(|(p, _)| p.clone())
+            .collect();
+        let (got, read) = list_under(&repo, &meta, dir);
+        assert_eq!(got, want, "{dir:?}");
+        let narrowable =
+            !dir.contains('\u{FFFD}') && crate::snapshot::listing::is_clean(dir.as_bytes());
+        match read {
+            ListUnderRead::Index(s) => {
+                assert!(indexed && narrowable, "{dir:?}");
+                assert!(s.via_index, "{dir:?}: {:?}", s.fallback);
+            }
+            ListUnderRead::Whole(s) => {
+                assert!(!(indexed && narrowable), "{dir:?}");
+                assert_eq!(s.chunks, meta.item_ptrs.len(), "{dir:?}");
+            }
+        }
+    }
+    #[cfg(unix)]
+    {
+        let (got, _) = list_under(&repo, &meta, "n\u{FFFD}");
+        assert_eq!(
+            got,
+            vec!["n\u{FFFD}".to_string(), "n\u{FFFD}/child".to_string()]
+        );
+    }
+}
+
+#[test]
+fn list_under_equals_the_display_filter() {
+    let (tmp, _config) = repo_with(make_awkward);
+    assert_list_under_equals_the_filter(&tmp.path().join("repo"), true);
+}
+
+#[test]
+fn list_under_without_an_index() {
+    let (tmp, _config) = repo_with(make_awkward);
+    let repo_dir = tmp.path().join("repo");
+    reseal(&repo_dir, "snap", |m| m.ext = None);
+    assert_list_under_equals_the_filter(&repo_dir, false);
+}
+
+#[test]
+fn list_under_refuses_a_dangling_pointer_outside_the_subtree() {
+    let (tmp, _config) = repo_with(make_big);
+    let repo_dir = tmp.path().join("repo");
+    let mut repo = open_local_repo(&repo_dir);
+    let meta = load_snapshot_meta(&repo, "snap").unwrap();
+    let id = *meta.item_ptrs.last().unwrap();
+    repo.chunk_index_mut().remove(&id).unwrap();
+    let err = list_under_on_repo(&repo, &meta, "0", &CancelToken::new(), |_| Ok(())).unwrap_err();
+    assert!(
+        matches!(err, VykarError::ChunkNotInIndex(missing) if missing == id),
+        "{err:?}"
+    );
+}
+
 /// Every ancestor of `root` ("a/b/c": "a", "a/b").
 fn ancestors(root: &[u8]) -> Vec<Vec<u8>> {
     root.iter()
@@ -409,7 +519,7 @@ fn ancestors(root: &[u8]) -> Vec<Vec<u8>> {
         .collect()
 }
 
-fn dumps() -> Vec<CommandDump> {
+pub(crate) fn dumps() -> Vec<CommandDump> {
     vec![
         CommandDump {
             name: "zeta".to_string(),
@@ -422,24 +532,36 @@ fn dumps() -> Vec<CommandDump> {
     ]
 }
 
-#[cfg(unix)]
-#[test]
-fn dumps_and_multi_path_roots_are_segments() {
-    let tmp = tempfile::tempdir().unwrap();
-    let repo_dir = tmp.path().join("repo");
+/// A repository with snapshot `name` of two roots (in non-name order),
+/// each filled by `make`, plus two command dumps. Returns the roots.
+pub(crate) fn multi_root_repo(
+    tmp: &Path,
+    name: &str,
+    make: impl Fn(&Path),
+) -> (VykarConfig, Vec<std::path::PathBuf>) {
+    let repo_dir = tmp.join("repo");
     std::fs::create_dir_all(&repo_dir).unwrap();
     let config = init_repo(&repo_dir);
-    // Config order is not name order.
-    let roots = [tmp.path().join("two"), tmp.path().join("one")];
+    let roots = vec![tmp.join("two"), tmp.join("one")];
     for r in &roots {
         std::fs::create_dir_all(r).unwrap();
-        make_awkward(r);
+        make(r);
     }
     let paths: Vec<String> = roots
         .iter()
         .map(|r| r.to_string_lossy().to_string())
         .collect();
-    backup(&config, &paths, "multi", &dumps());
+    backup(&config, &paths, name, &dumps());
+    (config, roots)
+}
+
+#[cfg(unix)]
+#[test]
+fn dumps_and_multi_path_roots_are_segments() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = tmp.path().join("repo");
+    // Config order is not name order.
+    let (config, roots) = multi_root_repo(tmp.path(), "multi", make_awkward);
 
     let (_, index) = index_of(&repo_dir, "multi");
     assert_eq!(index.order, ORDER_DFS_NAME);

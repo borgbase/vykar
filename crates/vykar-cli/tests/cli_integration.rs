@@ -984,6 +984,26 @@ fn cli_snapshot_list_path_filter() {
             "--path {filter}"
         );
     }
+
+    let out = fx.run_ok(&[
+        "--config", &cfg, "snapshot", "list", "latest", "--path", "nosuch",
+    ]);
+    assert_eq!(out, "", "--path nosuch");
+
+    // --long under --path: the --long lines of those paths.
+    let all = fx.run_ok(&["--config", &cfg, "snapshot", "list", "latest", "--long"]);
+    let want: Vec<&str> = all
+        .lines()
+        .filter(|l| {
+            let path = l.rsplit(' ').next().unwrap();
+            path == "sub" || path.starts_with("sub/")
+        })
+        .collect();
+    let out = fx.run_ok(&[
+        "--config", &cfg, "snapshot", "list", "latest", "--path", "sub", "--long",
+    ]);
+    assert_eq!(out.lines().collect::<Vec<_>>(), want);
+    assert_eq!(want.len(), 4);
 }
 
 #[test]

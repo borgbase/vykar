@@ -214,9 +214,10 @@ fn prepare_rewrite(
     new_meta.item_ptrs = listing.item_ptrs;
     new_meta.stats.nfiles = nfiles;
     new_meta.stats.original_size = original_size;
-    // Stamp the current format version on the rewritten snapshot — the
-    // rewriter never carries forward a legacy 0.
-    new_meta.format_version = crate::snapshot::CURRENT_FORMAT_VERSION;
+    // Stamp the version the rewritten listing is encoded in. The rewriter
+    // re-encodes every kept item, so a format-1 or legacy-0 snapshot comes
+    // out as the current format.
+    new_meta.format_version = listing.format_version;
     // deduplicated_size: preserved from the old meta (display-only; minor
     // inflation is acceptable per #123).
 
@@ -782,6 +783,8 @@ mod tests {
 
         let same = rewrite(&[]);
         assert_eq!(same.item_ptrs, old_meta.item_ptrs);
+        // The rewriter stamps the format its listing is encoded in.
+        assert_eq!(same.format_version, crate::snapshot::CURRENT_FORMAT_VERSION);
 
         let dropped = rewrite(&[nitems / 2]);
         let old: HashSet<&ChunkId> = old_meta.item_ptrs.iter().collect();

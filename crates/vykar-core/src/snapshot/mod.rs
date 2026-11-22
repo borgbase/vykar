@@ -1,3 +1,4 @@
+pub(crate) mod bin_id;
 pub mod item;
 
 use chrono::{DateTime, Utc};
@@ -11,7 +12,10 @@ use vykar_types::error::{Result, VykarError};
 /// legacy snapshot written before the discriminator existed. Readers refuse a
 /// version greater than this (see [`SnapshotMeta::supported`]). See the Format
 /// Evolution section of `architecture.md`.
-pub const CURRENT_FORMAT_VERSION: u32 = 1;
+///
+/// 2: chunk IDs in `Item.chunks` and `item_ptrs` are 32-byte msgpack bin
+/// (06 step 6a). 1 (0.17 to this change) and 0 decode with the same reader.
+pub const CURRENT_FORMAT_VERSION: u32 = 2;
 
 /// Number of fields in the frozen [`SnapshotMeta`] envelope, pinned by
 /// `snapshot_meta_layout_is_pinned`.
@@ -34,7 +38,9 @@ pub struct SnapshotMeta {
     pub chunker_params: ChunkerParams,
     #[serde(default)]
     pub comment: String,
-    /// Chunk IDs that contain the serialized item stream.
+    /// Chunk IDs that contain the serialized item stream. One bin of 32
+    /// bytes per pointer from format 2; format 1's int arrays decode too.
+    #[serde(with = "bin_id::seq")]
     pub item_ptrs: Vec<ChunkId>,
     #[serde(default)]
     pub stats: SnapshotStats,
@@ -175,7 +181,8 @@ mod tests {
     /// that mirrors each field's exact type, then re-serializes it and asserts
     /// byte-for-byte equality with the original — so any reorder, retype, add, or
     /// remove (which would break the frozen `format_version` discriminator)
-    /// fails here, not just a field-count change.
+    /// fails here, not just a field-count change. The element type of
+    /// `item_ptrs` is pinned as a 32-byte bin (snapshot format 2).
     #[test]
     fn snapshot_meta_layout_is_pinned() {
         use serde_bytes::ByteBuf;
@@ -231,7 +238,7 @@ mod tests {
             DateTime<Utc>,   // time_end
             (u32, u32, u32), // chunker_params
             String,          // comment
-            Vec<ChunkId>,    // item_ptrs
+            Vec<ByteBuf>,    // item_ptrs: one bin per pointer (format 2)
             SnapshotStats,   // stats
             String,          // source_label
             Vec<String>,     // source_paths
@@ -252,6 +259,16 @@ mod tests {
 
         // Spot-check the boundary fields by value/position.
         assert_eq!(decoded.0, "the-name", "position 0 must be `name`");
+        assert_eq!(
+            decoded.7.len(),
+            1,
+            "position 7 must be `item_ptrs` with one pointer"
+        );
+        assert_eq!(
+            decoded.7[0].as_slice(),
+            [7u8; 32],
+            "item_ptrs elements must be 32-byte bins"
+        );
         assert_eq!(decoded.11, "the-label", "position 11 must be `label`");
         assert_eq!(
             decoded.12.as_deref().map(|b| b.to_vec()),
@@ -317,5 +334,92 @@ mod tests {
         assert_eq!(decoded.ext.as_deref(), Some(&[1u8, 2, 3, 4][..]));
         assert_eq!(decoded.format_version, CURRENT_FORMAT_VERSION + 5);
         assert!(decoded.supported().is_err());
+    }
+
+    /// The envelope before 06 step 6a, all derived: `item_ptrs` as plain
+    /// `Vec<ChunkId>` (int arrays).
+    #[derive(Serialize, Deserialize)]
+    struct PreV2Meta {
+        name: String,
+        hostname: String,
+        username: String,
+        time: DateTime<Utc>,
+        time_end: DateTime<Utc>,
+        chunker_params: ChunkerParams,
+        comment: String,
+        item_ptrs: Vec<ChunkId>,
+        stats: SnapshotStats,
+        source_label: String,
+        source_paths: Vec<String>,
+        label: String,
+        #[serde(with = "serde_bytes")]
+        ext: Option<Vec<u8>>,
+        format_version: u32,
+    }
+
+    fn two_ptrs() -> Vec<ChunkId> {
+        vec![
+            ChunkId::from_bytes([1; 32]),
+            ChunkId::from_bytes([0xfe; 32]),
+        ]
+    }
+
+    /// A binary that knows only format 1 decodes a format-2 envelope (rmp-serde
+    /// reads a 32-byte bin into a derived `[u8; 32]`) and so refuses it by
+    /// version, not with a parse error that could read as corruption.
+    #[test]
+    fn format_1_reader_refuses_format_2_by_version() {
+        let mut m = sample_meta();
+        m.item_ptrs = two_ptrs();
+        assert_eq!(m.format_version, 2);
+        let bytes = rmp_serde::to_vec(&m).unwrap();
+        let old: PreV2Meta = rmp_serde::from_slice(&bytes)
+            .expect("a format-1 reader must decode the format-2 envelope");
+        assert_eq!(old.item_ptrs, two_ptrs());
+        assert_eq!(old.format_version, 2);
+        // What a format-1 binary's supported() compares against.
+        assert!(old.format_version > 1);
+    }
+
+    /// A format-1 envelope (int-array `item_ptrs`) decodes; re-encoding
+    /// writes bins and keeps the 14-field envelope.
+    #[test]
+    fn format_1_envelope_decodes() {
+        let now = Utc::now();
+        let old = PreV2Meta {
+            name: "snap".into(),
+            hostname: "h".into(),
+            username: "u".into(),
+            time: now,
+            time_end: now,
+            chunker_params: ChunkerParams::default(),
+            comment: String::new(),
+            item_ptrs: two_ptrs(),
+            stats: SnapshotStats::default(),
+            source_label: String::new(),
+            source_paths: vec![],
+            label: String::new(),
+            ext: None,
+            format_version: 1,
+        };
+        let bytes = rmp_serde::to_vec(&old).unwrap();
+        let decoded: SnapshotMeta = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(decoded.item_ptrs, two_ptrs());
+        assert_eq!(decoded.format_version, 1);
+        decoded.supported().unwrap();
+
+        let again = rmp_serde::to_vec(&decoded).unwrap();
+        assert_eq!(
+            again.first().copied(),
+            Some(0x90 | u8::try_from(SNAPSHOT_META_FIELD_COUNT).unwrap())
+        );
+        let mut ptrs = vec![0x92, 0xc4, 0x20];
+        ptrs.extend_from_slice(&[1; 32]);
+        ptrs.extend_from_slice(&[0xc4, 0x20]);
+        ptrs.extend_from_slice(&[0xfe; 32]);
+        assert!(
+            again.windows(ptrs.len()).any(|w| w == ptrs.as_slice()),
+            "re-encoded item_ptrs must be bins"
+        );
     }
 }

@@ -1,8 +1,9 @@
 //! `ListingWriter`: the listing bytes are pinned. A fixed item sequence and
 //! chunk-ID key give a fixed `item_ptrs`, so a change to the item
-//! encoding, the cut rule or the writer shows up here. Recorded on the
-//! writer that preceded `ListingWriter` (append_item_to_stream). Step 6a of
-//! the snapshot-listing plan changes the encoding and must re-record it on purpose.
+//! encoding, the cut rule or the writer shows up here. `KNOWN_V1` was
+//! recorded on the writer that preceded `ListingWriter` (append_item_to_stream)
+//! and is now reproduced through the format-1 mirror encoder. `KNOWN_V2` was
+//! recorded on purpose by 06 step 6a (chunk IDs as bin, snapshot format 2).
 
 use std::sync::Arc;
 
@@ -10,12 +11,13 @@ use crate::commands::backup::ListingWriter;
 use crate::commands::list::for_each_decoded_item;
 use crate::compress::Compression;
 use crate::repo::Repository;
-use crate::snapshot::item::{ChunkRef, Item, ItemType};
+use crate::snapshot::CURRENT_FORMAT_VERSION;
+use crate::snapshot::item::{ChunkRef, Item, ItemType, v1_wire};
 use crate::testutil::{test_chunk_hasher, test_repo_plaintext};
 use vykar_types::chunk_id::ChunkId;
 
-/// `item_ptrs` of [`fixed_items`] on [`fixed_key_repo`].
-const KNOWN: &[&str] = &[
+/// `item_ptrs` of [`fixed_items`] on [`fixed_key_repo`], format 1.
+const KNOWN_V1: &[&str] = &[
     "0a3db4199d4c60ca8a5a38ce4f9c5177c4657623194190e87aeac0acc94f08b2",
     "87ec4de225d350b1c3c7bbf6ff714b7e4b210f86323928a0971d890e045e2f8b",
     "b924f69ebe90bcd9f39b8ce07121e9661b1f9d8701e9a80b3edac82dfc429829",
@@ -115,11 +117,46 @@ fn fixed_items() -> Vec<Item> {
     items
 }
 
+/// `item_ptrs` of [`fixed_items`] on [`fixed_key_repo`], format 2.
+const KNOWN_V2: &[&str] = &[
+    "40b725ff9b71883e717e760f44212ce8da148f34674cf09be381c434b63e1186",
+    "e4314a52611cb4016f7c3b00e4729fcd3bc8c789e84d9c41af95f9189849a1dd",
+    "edd62ad09005f06143a4cb6818fec2677b9b5683eb96e935d0264114eaf3fb8e",
+    "0920ca7efa32bca44290300ba268e0efb6eb7a87c4fcc98cadfa329632cafca7",
+    "07a871f33d936f7c1113cf5729c17f866d175d14193566f59f1afbe0ec4fbdd5",
+    "8e026295664a61f979f121729fe3569b3ba652ced4108d05f642c2cdae673138",
+    "c79e49974abd4c94d5cac873a8983d2ef09530d4507d9362787ee7e75b0148e2",
+    "44ab13f6f711cd2c9be700163a18a171d4fd3d20eade5e910760fd9311bd3573",
+    "0c0cdf68f5be79e15b4eaf930b95ae6bebc69e32e50a71667fca216f8223c3ae",
+    "e839fc824cf132010765d77e68ce2cdf28f68373b9c8734d5d805ec97e7acf67",
+    "c517c8cd7b5f5ad82730177ff2779931a837799e3d06891e10035755a74e577a",
+    "0910a8c914b971fad40887b06481148a39d9e326ee100ef47ab2a8db0f6119c6",
+];
+
 /// The writer under test, applied to `items`.
 fn write_listing(repo: &mut Repository, items: &[Item], compression: Compression) -> Vec<ChunkId> {
     let mut listing = ListingWriter::new(repo.crypto.chunk_hasher(), compression);
     for item in items {
         listing.push(repo, item).unwrap();
+    }
+    let finished = listing.finish(repo).unwrap();
+    assert_eq!(finished.format_version, CURRENT_FORMAT_VERSION);
+    finished.item_ptrs
+}
+
+/// The writer fed format-1 entries (`v1_wire`): what the pre-6a writer
+/// produced.
+fn write_listing_v1(
+    repo: &mut Repository,
+    items: &[Item],
+    compression: Compression,
+) -> Vec<ChunkId> {
+    let mut listing = ListingWriter::new(repo.crypto.chunk_hasher(), compression);
+    let mut entry = Vec::new();
+    for item in items {
+        entry.clear();
+        v1_wire::encode_item(item, &mut entry).unwrap();
+        listing.push_encoded(repo, &item.path, &entry).unwrap();
     }
     listing.finish(repo).unwrap().item_ptrs
 }
@@ -129,7 +166,21 @@ fn hex(ptrs: &[ChunkId]) -> Vec<String> {
 }
 
 #[test]
+fn known_item_ptrs_v1() {
+    let items = fixed_items();
+    for compression in [Compression::None, Compression::default()] {
+        let ptrs = hex(&write_listing_v1(
+            &mut fixed_key_repo(),
+            &items,
+            compression,
+        ));
+        assert_eq!(ptrs, KNOWN_V1, "{compression:?}");
+    }
+}
+
+#[test]
 fn known_item_ptrs() {
+    assert_eq!(CURRENT_FORMAT_VERSION, 2);
     let items = fixed_items();
     let ptrs = hex(&write_listing(
         &mut fixed_key_repo(),
@@ -137,7 +188,7 @@ fn known_item_ptrs() {
         Compression::None,
     ));
     assert!(ptrs.len() >= 8, "only {} tree chunks", ptrs.len());
-    assert_eq!(ptrs, KNOWN);
+    assert_eq!(ptrs, KNOWN_V2);
     // The ID is over the plaintext. A fresh repository, because a dedup hit
     // returns before compressing.
     let compressed = hex(&write_listing(
@@ -200,4 +251,41 @@ fn one_small_entry_is_one_chunk() {
     let bytes = rmp_serde::to_vec(&items[0]).unwrap();
     let ptrs = write_listing(&mut fixed_key_repo(), items, Compression::None);
     assert_eq!(ptrs, [ChunkId::compute(&test_chunk_hasher(), &bytes)]);
+}
+
+/// Decode each chunk of `ptrs` alone; the items of all chunks in order and
+/// the plaintext bytes they took.
+fn read_listing(repo: &mut Repository, ptrs: &[ChunkId]) -> (Vec<Item>, usize) {
+    let mut items = Vec::new();
+    let mut bytes = 0;
+    for (i, id) in ptrs.iter().enumerate() {
+        let chunk = repo.read_chunk(id).unwrap();
+        bytes += chunk.len();
+        for_each_decoded_item(&chunk, |item| {
+            items.push(item);
+            Ok(())
+        })
+        .unwrap_or_else(|e| panic!("chunk {i} does not decode alone: {e}"));
+    }
+    (items, bytes)
+}
+
+#[test]
+fn v1_and_v2_listings_decode_to_the_same_items() {
+    let items = fixed_items();
+    let mut repo = fixed_key_repo();
+    let v1 = write_listing_v1(&mut repo, &items, Compression::None);
+    let v2 = write_listing(&mut repo, &items, Compression::None);
+    repo.flush_packs().unwrap();
+    repo.save_state().unwrap();
+    assert_ne!(v1, v2);
+
+    let (from_v1, v1_bytes) = read_listing(&mut repo, &v1);
+    let (from_v2, v2_bytes) = read_listing(&mut repo, &v2);
+    assert_eq!(from_v1, items);
+    assert_eq!(from_v2, items);
+    assert!(
+        v2_bytes < v1_bytes,
+        "format 2 ({v2_bytes} B) must be smaller than format 1 ({v1_bytes} B)"
+    );
 }

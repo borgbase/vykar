@@ -21,6 +21,7 @@ use vykar_core::commands;
 use vykar_core::index::ChunkIndex;
 use vykar_core::repo::control::CancelToken;
 use vykar_core::repo::{OpenOptions, Repository, UpgradeOutcome};
+use vykar_core::snapshot::item::ItemType;
 use vykar_storage::local_backend::LocalBackend;
 
 use crate::common::backup_source;
@@ -289,6 +290,7 @@ fn v3_fixtures_upgrade_to_v6() {
             stats.deduplicated_size,
             stats.original_size
         );
+        assert_formats_list_identically(&fx, "post-upgrade-snap", mode);
         assert!(
             matches!(
                 commands::upgrade::run(&config, fx.passphrase()).unwrap(),
@@ -297,6 +299,53 @@ fn v3_fixtures_upgrade_to_v6() {
             "{mode}"
         );
     }
+}
+
+/// The fixture's latest snapshot (snapshot format 1, written by 0.24) and
+/// `fresh`, a backup of the same tree by this binary (format 2), list the
+/// same entries. Times, ownership, mode, csize, xattrs and directory sizes
+/// are left out: tar extraction, the extracting user and the filesystem
+/// change them (a directory's size is its filesystem's st_size), and csize is
+/// a stored size, not content.
+fn assert_formats_list_identically(fx: &Fixture, fresh: &str, label: &str) {
+    type Entry = (
+        String,
+        ItemType,
+        u64,
+        Option<String>,
+        Vec<(vykar_types::chunk_id::ChunkId, u32)>,
+    );
+    let mut repo = fx.open();
+    let mut listing = |name: &str| -> Vec<Entry> {
+        let mut out: Vec<Entry> =
+            commands::list::load_snapshot_items(&mut repo, name, &CancelToken::new())
+                .unwrap()
+                .into_iter()
+                .map(|i| {
+                    let chunks = i.chunks.iter().map(|c| (c.id, c.size)).collect();
+                    let size = if i.entry_type == ItemType::Directory {
+                        0
+                    } else {
+                        i.size
+                    };
+                    (i.path, i.entry_type, size, i.link_target, chunks)
+                })
+                .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    };
+    let old = listing(fx.latest_snapshot());
+    let new = listing(fresh);
+    assert!(!old.is_empty(), "{label}: empty fixture listing");
+    assert_eq!(old, new, "{label}: format 1 and format 2 list differently");
+    drop(listing);
+    let version = |name: &str| {
+        commands::list::load_snapshot_meta(&repo, name)
+            .unwrap()
+            .format_version
+    };
+    assert_eq!(version(fx.latest_snapshot()), 1, "{label}");
+    assert_eq!(version(fresh), 2, "{label}");
 }
 
 /// After the upgrade, pack maps make the repository recoverable without its

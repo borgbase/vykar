@@ -127,6 +127,9 @@ pub enum ItemType {
 /// Reference to a chunk stored in the repository.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChunkRef {
+    /// msgpack bin of 32 bytes from snapshot format 2; format 1 wrote an
+    /// array of 32 integers, which decodes too (see `snapshot::bin_id`).
+    #[serde(with = "crate::snapshot::bin_id")]
     pub id: ChunkId,
     /// Uncompressed (original) size of this chunk.
     pub size: u32,
@@ -306,6 +309,91 @@ impl Item {
                 )));
             }
         }
+        Ok(())
+    }
+}
+
+/// Items as snapshot format 1 encoded them (chunk IDs as arrays of 32
+/// integers): the derived encoding before 06 step 6a. Tests and fuzz only.
+#[cfg(any(test, feature = "fuzzing"))]
+pub mod v1_wire {
+    use super::*;
+
+    /// `ChunkRef` with `ChunkId`'s derived encoding (an int array).
+    #[derive(Serialize)]
+    struct ChunkRefV1 {
+        id: ChunkId,
+        size: u32,
+        csize: u32,
+    }
+
+    #[derive(Serialize)]
+    struct ItemV1<'a> {
+        path: &'a str,
+        entry_type: ItemType,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+        user: Option<&'a str>,
+        group: Option<&'a str>,
+        mtime: i64,
+        atime: Option<i64>,
+        ctime: Option<i64>,
+        size: u64,
+        chunks: Vec<ChunkRefV1>,
+        link_target: Option<&'a str>,
+        xattrs: Option<&'a HashMap<String, Vec<u8>>>,
+        raw_names: Option<&'a ItemRawNames>,
+        hardlink: Option<&'a HardlinkId>,
+    }
+
+    /// Append `item` to `out` in the format-1 encoding.
+    pub fn encode_item(item: &Item, out: &mut Vec<u8>) -> Result<()> {
+        // Exhaustive on purpose: a new Item field must be added here too.
+        let Item {
+            path,
+            entry_type,
+            mode,
+            uid,
+            gid,
+            user,
+            group,
+            mtime,
+            atime,
+            ctime,
+            size,
+            chunks,
+            link_target,
+            xattrs,
+            raw_names,
+            hardlink,
+        } = item;
+        let v1 = ItemV1 {
+            path,
+            entry_type: *entry_type,
+            mode: *mode,
+            uid: *uid,
+            gid: *gid,
+            user: user.as_deref(),
+            group: group.as_deref(),
+            mtime: *mtime,
+            atime: *atime,
+            ctime: *ctime,
+            size: *size,
+            chunks: chunks
+                .iter()
+                .map(|c| ChunkRefV1 {
+                    id: c.id,
+                    size: c.size,
+                    csize: c.csize,
+                })
+                .collect(),
+            link_target: link_target.as_deref(),
+            xattrs: xattrs.as_ref(),
+            raw_names: raw_names.as_ref(),
+            hardlink: hardlink.as_ref(),
+        };
+        rmp_serde::encode::write(out, &v1)?;
         Ok(())
     }
 }
@@ -705,5 +793,146 @@ mod tests {
         let decoded: Item = rmp_serde::from_slice(&bytes).unwrap();
         assert_eq!(decoded.hardlink, None);
         assert_eq!(decoded.path, "a.txt");
+    }
+
+    /// The layout before 06 step 6a, all derived: `ChunkId` as an int array.
+    #[derive(Debug, PartialEq, Serialize, Deserialize)]
+    struct PreV2ChunkRef {
+        id: ChunkId,
+        size: u32,
+        csize: u32,
+    }
+
+    #[derive(Debug, PartialEq, Serialize, Deserialize)]
+    struct PreV2Item {
+        path: String,
+        entry_type: ItemType,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+        user: Option<String>,
+        group: Option<String>,
+        mtime: i64,
+        atime: Option<i64>,
+        ctime: Option<i64>,
+        size: u64,
+        chunks: Vec<PreV2ChunkRef>,
+        link_target: Option<String>,
+        xattrs: Option<HashMap<String, Vec<u8>>>,
+        raw_names: Option<ItemRawNames>,
+        hardlink: Option<HardlinkId>,
+    }
+
+    fn full_item() -> Item {
+        Item {
+            user: Some("u".into()),
+            group: Some("g".into()),
+            mtime: 1_700_000_000,
+            atime: Some(-5),
+            ctime: Some(7),
+            size: 30,
+            chunks: vec![
+                ChunkRef {
+                    id: ChunkId::from_bytes([0xab; 32]),
+                    size: 10,
+                    csize: 11,
+                },
+                ChunkRef {
+                    id: ChunkId::from_bytes(std::array::from_fn(|i| i as u8)),
+                    size: 20,
+                    csize: 21,
+                },
+            ],
+            xattrs: Some(HashMap::from([("user.k".to_string(), vec![1, 2, 3])])),
+            hardlink: Some(HardlinkId { dev: 3, ino: 4 }),
+            ..base_item(ItemType::RegularFile, "dir/f.bin")
+        }
+    }
+
+    fn pre_v2(item: &Item) -> PreV2Item {
+        PreV2Item {
+            path: item.path.clone(),
+            entry_type: item.entry_type,
+            mode: item.mode,
+            uid: item.uid,
+            gid: item.gid,
+            user: item.user.clone(),
+            group: item.group.clone(),
+            mtime: item.mtime,
+            atime: item.atime,
+            ctime: item.ctime,
+            size: item.size,
+            chunks: item
+                .chunks
+                .iter()
+                .map(|c| PreV2ChunkRef {
+                    id: c.id,
+                    size: c.size,
+                    csize: c.csize,
+                })
+                .collect(),
+            link_target: item.link_target.clone(),
+            xattrs: item.xattrs.clone(),
+            raw_names: item.raw_names.clone(),
+            hardlink: item.hardlink,
+        }
+    }
+
+    /// A format-1 reader (the derived layout) still decodes a format-2
+    /// item: rmp-serde reads a 32-byte bin into a derived `[u8; 32]`.
+    #[test]
+    fn format_1_reader_decodes_format_2_item() {
+        let item = full_item();
+        let bytes = rmp_serde::to_vec(&item).unwrap();
+        let old: PreV2Item = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(old, pre_v2(&item));
+    }
+
+    /// `v1_wire` reproduces the derived pre-6a encoding byte for byte, and
+    /// today's reader decodes it to the same item.
+    #[test]
+    fn v1_wire_matches_the_pre_v2_encoding() {
+        let item = full_item();
+        let mut v1 = Vec::new();
+        v1_wire::encode_item(&item, &mut v1).unwrap();
+        assert_eq!(v1, rmp_serde::to_vec(&pre_v2(&item)).unwrap());
+        let mut id_array = vec![0xdc, 0x00, 0x20];
+        id_array.extend(std::iter::repeat_n([0xcc, 0xab], 32).flatten());
+        assert!(
+            v1.windows(id_array.len()).any(|w| w == id_array.as_slice()),
+            "format 1 writes the chunk ID as an array16 of 32 integers"
+        );
+
+        let mut back = Vec::new();
+        crate::commands::list::for_each_decoded_item(&v1, |i| {
+            back.push(i);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(back, std::slice::from_ref(&item));
+        let v2 = rmp_serde::to_vec(&item).unwrap();
+        assert!(v2.len() < v1.len());
+    }
+
+    /// The committed format-1 fuzz seeds were written by the pre-6a
+    /// encoder; `v1_wire` re-encodes their items to the same bytes. The
+    /// seeds must stay byte-identical when the corpus is regenerated
+    /// (their lengths are pinned here), or this test proves nothing.
+    #[test]
+    fn v1_wire_reproduces_the_pre_v2_fuzz_seeds() {
+        let seeds: [&[u8]; 2] = [
+            include_bytes!("../../../../fuzz/corpus/fuzz_item_stream/three_items_v1"),
+            include_bytes!("../../../../fuzz/corpus/fuzz_item_stream/single_file_v1"),
+        ];
+        assert_eq!(seeds.map(<[u8]>::len), [281, 141]);
+        for seed in seeds {
+            let mut again = Vec::new();
+            crate::commands::list::for_each_decoded_item(seed, |item| {
+                assert!(!item.path.is_empty());
+                v1_wire::encode_item(&item, &mut again)
+            })
+            .unwrap();
+            assert_eq!(again, seed);
+        }
     }
 }

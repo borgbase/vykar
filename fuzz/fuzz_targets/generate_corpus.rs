@@ -30,8 +30,8 @@ use vykar_core::repo::pack::{PackType, PackWriter};
 use vykar_core::repo::pack_map::{PackMap, PackMapEntry};
 use vykar_core::repo::pack_trailer::read_trailer_from_pack_bytes;
 use vykar_core::repo::{ChunkerParams, EncryptionMode, LegacyRepoConfig, RepoConfig};
-use vykar_core::snapshot::SnapshotMeta;
 use vykar_core::snapshot::item::{ChunkRef, Item, ItemRawNames, ItemType};
+use vykar_core::snapshot::{SnapshotMeta, SnapshotStats};
 use vykar_crypto::key::{EncryptedKey, KdfParams};
 use vykar_crypto::{CryptoEngine, PlaintextEngine};
 use vykar_types::chunk_id::{ChunkHasher, ChunkId};
@@ -203,6 +203,43 @@ fn seed_snapshot_meta() {
     };
     let encoded = rmp_serde::to_vec(&minimal).unwrap();
     write_seed("fuzz_msgpack_snapshot_meta", "minimal", &encoded);
+
+    // Snapshot format 1: `valid` with item_ptrs as ChunkId's derived int
+    // arrays (positional, as SnapshotMeta encodes).
+    type MetaV1 = (
+        String,
+        String,
+        String,
+        chrono::DateTime<chrono::Utc>,
+        chrono::DateTime<chrono::Utc>,
+        ChunkerParams,
+        String,
+        Vec<ChunkId>,
+        SnapshotStats,
+        String,
+        Vec<String>,
+        String,
+        Option<vykar_core::fuzzing::ByteBuf>,
+        u32,
+    );
+    let v1: MetaV1 = (
+        meta.name,
+        meta.hostname,
+        meta.username,
+        meta.time,
+        meta.time_end,
+        meta.chunker_params,
+        meta.comment,
+        meta.item_ptrs,
+        meta.stats,
+        meta.source_label,
+        meta.source_paths,
+        meta.label,
+        None,
+        1,
+    );
+    let encoded = rmp_serde::to_vec(&v1).unwrap();
+    write_seed("fuzz_msgpack_snapshot_meta", "valid_v1", &encoded);
 }
 
 fn seed_index_blob() {
@@ -425,6 +462,19 @@ fn seed_item_stream() {
     let mut single = Vec::new();
     rmp_serde::encode::write(&mut single, &items[0]).unwrap();
     write_seed("fuzz_item_stream", "single_file", &single);
+
+    // The same in snapshot format 1 (chunk IDs as int arrays). These two
+    // seeds are the pre-format-2 `three_items` and `single_file` and must
+    // stay byte-identical: a vykar-core test checks the format-1 encoder
+    // against them.
+    let mut stream = Vec::new();
+    for item in &items {
+        vykar_core::fuzzing::encode_item_v1(item, &mut stream).unwrap();
+    }
+    write_seed("fuzz_item_stream", "three_items_v1", &stream);
+    let mut single = Vec::new();
+    vykar_core::fuzzing::encode_item_v1(&items[0], &mut single).unwrap();
+    write_seed("fuzz_item_stream", "single_file_v1", &single);
 }
 
 fn seed_file_cache_decode() {

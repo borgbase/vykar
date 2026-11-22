@@ -211,9 +211,9 @@ pub struct SnapshotSummary {
     pub source_label: String,
     pub source_paths: Vec<String>,
     pub pointers: u64,
-    /// `rmp_serde` size of today's `item_ptrs`.
+    /// `rmp_serde` size of `item_ptrs` as this snapshot stores it.
     pub ptrs_bytes_today: u64,
-    /// Step 6a estimate: `item_ptrs` as one bin32 per pointer.
+    /// `item_ptrs` as snapshot format 2 stores it: one bin32 per pointer.
     pub ptrs_bytes_bin: u64,
     pub ext_present: bool,
 }
@@ -344,6 +344,13 @@ fn separator_keys<'a>(
 
 fn summarize(entry: &SnapshotEntry, meta: &SnapshotMeta) -> Result<SnapshotSummary> {
     let n = meta.item_ptrs.len();
+    let bin_ptrs_bytes = (n * 34 + array_header_len(n)) as u64;
+    let stored_ptrs_bytes = if meta.format_version >= 2 {
+        bin_ptrs_bytes
+    } else {
+        // Format 1 and 0: ChunkId's derived encoding.
+        rmp_serde::to_vec(&meta.item_ptrs)?.len() as u64
+    };
     Ok(SnapshotSummary {
         name: entry.name.clone(),
         id: entry.id.to_hex(),
@@ -351,8 +358,8 @@ fn summarize(entry: &SnapshotEntry, meta: &SnapshotMeta) -> Result<SnapshotSumma
         source_label: entry.source_label.clone(),
         source_paths: meta.source_paths.clone(),
         pointers: n as u64,
-        ptrs_bytes_today: rmp_serde::to_vec(&meta.item_ptrs)?.len() as u64,
-        ptrs_bytes_bin: (n * 34 + array_header_len(n)) as u64,
+        ptrs_bytes_today: stored_ptrs_bytes,
+        ptrs_bytes_bin: bin_ptrs_bytes,
         ext_present: meta.ext.is_some(),
     })
 }

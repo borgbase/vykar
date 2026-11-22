@@ -120,6 +120,12 @@ pub fn restore_rel_path(item: &Item) -> Result<PathBuf> {
     Ok(out)
 }
 
+/// `snapshot::item::v1_wire::encode_item`: append `item` in the
+/// snapshot format-1 encoding.
+pub fn encode_item_v1(item: &Item, out: &mut Vec<u8>) -> Result<()> {
+    crate::snapshot::item::v1_wire::encode_item(item, out)
+}
+
 /// A symlink's target as restore builds it, and whether restore flags it
 /// as absolute or escaping its parent.
 pub fn symlink_target(item: &Item) -> (PathBuf, bool) {

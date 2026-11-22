@@ -3,6 +3,9 @@
 //! one at a time, the stream is cut into tree chunks after whole entries
 //! (see [`ItemStreamCutter`]), and each chunk is stored as it closes.
 //!
+//! Entries are encoded in snapshot format `CURRENT_FORMAT_VERSION`, which
+//! [`ListingWriter::finish`] reports.
+//!
 //! Invariant: a tree chunk holds whole entries, so it decodes on its own.
 //! The mark and `check` decode each distinct tree chunk once and rely
 //! on this; they reject a chunk that ends inside an entry.
@@ -30,6 +33,8 @@ pub(crate) struct ListingWriter {
 #[derive(Debug)]
 pub(crate) struct FinishedListing {
     pub(crate) item_ptrs: Vec<ChunkId>,
+    /// The snapshot format the tree chunks are encoded in.
+    pub(crate) format_version: u32,
 }
 
 impl ListingWriter {
@@ -47,11 +52,27 @@ impl ListingWriter {
     pub(crate) fn push(&mut self, repo: &mut Repository, item: &Item) -> Result<()> {
         let start = self.buf.len();
         rmp_serde::encode::write(&mut self.buf, item)?;
+        self.end_entry(repo, &item.path, start)
+    }
+
+    /// `push` for an entry already encoded, for tests that write
+    /// format-1 listings. `entry` must be exactly one encoded `Item`.
+    #[cfg(test)]
+    pub(crate) fn push_encoded(
+        &mut self,
+        repo: &mut Repository,
+        path: &str,
+        entry: &[u8],
+    ) -> Result<()> {
+        let start = self.buf.len();
+        self.buf.extend_from_slice(entry);
+        self.end_entry(repo, path, start)
+    }
+
+    /// Cut after the entry that starts at `start` when the rule says so.
+    fn end_entry(&mut self, repo: &mut Repository, path: &str, start: usize) -> Result<()> {
         let entry_len = self.buf.len() - start;
-        if self
-            .cutter
-            .should_cut(&item.path, entry_len, self.buf.len())
-        {
+        if self.cutter.should_cut(path, entry_len, self.buf.len()) {
             self.close_chunk(repo)?;
         }
         Ok(())
@@ -62,6 +83,7 @@ impl ListingWriter {
         self.close_chunk(repo)?;
         Ok(FinishedListing {
             item_ptrs: std::mem::take(&mut self.item_ptrs),
+            format_version: crate::snapshot::CURRENT_FORMAT_VERSION,
         })
     }
 

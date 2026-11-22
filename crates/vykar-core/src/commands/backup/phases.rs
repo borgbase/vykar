@@ -378,7 +378,7 @@ pub(super) fn phase1_upload(
         source_paths: source_paths.to_vec(),
         label: String::new(),
         ext: None,
-        format_version: crate::snapshot::CURRENT_FORMAT_VERSION,
+        format_version: listing.format_version,
     };
 
     // Generate snapshot ID and pack the blob (but DO NOT write to storage yet).

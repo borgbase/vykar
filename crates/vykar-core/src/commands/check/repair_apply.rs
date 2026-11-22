@@ -218,6 +218,10 @@ fn prepare_rewrite(
     // re-encodes every kept item, so a format-1 or legacy-0 snapshot comes
     // out as the current format.
     new_meta.format_version = listing.format_version;
+    // Replace, never keep, the old key index: it names the old tree chunks.
+    // Without segment starts the rewriter writes one implicit segment, so a
+    // listing with dumps or several roots comes out as order 0 (scanned).
+    new_meta.ext = listing.ext;
     // deduplicated_size: preserved from the old meta (display-only; minor
     // inflation is acceptable per #123).
 
@@ -783,6 +787,8 @@ mod tests {
 
         let same = rewrite(&[]);
         assert_eq!(same.item_ptrs, old_meta.item_ptrs);
+        // One implicit segment, as backup wrote it: the same index.
+        assert_eq!(same.ext, old_meta.ext);
         // The rewriter stamps the format its listing is encoded in.
         assert_eq!(same.format_version, crate::snapshot::CURRENT_FORMAT_VERSION);
 
@@ -797,6 +803,81 @@ mod tests {
             (1..=3).contains(&new),
             "{new} of {} tree chunks new after dropping one item",
             dropped.item_ptrs.len()
+        );
+        crate::snapshot::listing::decode_ext(dropped.ext.as_deref(), dropped.item_ptrs.len())
+            .unwrap();
+    }
+
+    /// The rewriter replaces the key index of a snapshot with dumps and two
+    /// roots: it writes no segment starts, so the new index is order 0
+    /// (readers scan), never the old index naming the old chunks.
+    #[cfg(unix)]
+    #[test]
+    fn repair_rewrite_replaces_the_key_index() {
+        use crate::config::CommandDump;
+        use crate::repo::format::unpack_object_expect_with_context;
+        use crate::snapshot::listing::{NoIndex, decode_ext};
+        use crate::tests::helpers::{init_repo, open_local_repo};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_dir = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        let config = init_repo(&repo_dir);
+        let roots = [tmp.path().join("b"), tmp.path().join("a")];
+        for r in &roots {
+            std::fs::create_dir_all(r.join("d")).unwrap();
+            for f in 0..20 {
+                std::fs::write(r.join(format!("d/f{f}")), "x").unwrap();
+            }
+        }
+        let paths: Vec<String> = roots
+            .iter()
+            .map(|r| r.to_string_lossy().to_string())
+            .collect();
+        let dumps = [CommandDump {
+            name: "dump".to_string(),
+            command: "echo dump".to_string(),
+        }];
+        crate::commands::backup::run(
+            &config,
+            crate::commands::backup::BackupRequest {
+                snapshot_name: "snap1",
+                passphrase: None,
+                source_paths: &paths,
+                source_label: "src",
+                exclude_patterns: &[],
+                exclude_if_present: &[],
+                one_file_system: true,
+                git_ignore: false,
+                xattrs_enabled: false,
+                compression: Compression::None,
+                command_dumps: &dumps,
+                verbose: false,
+            },
+        )
+        .unwrap();
+
+        let mut repo = open_local_repo(&repo_dir);
+        let old_meta = load_snapshot_meta(&repo, "snap1").unwrap();
+        let old_index = decode_ext(old_meta.ext.as_deref(), old_meta.item_ptrs.len()).unwrap();
+        assert_eq!(old_index.segments.len(), 3);
+
+        repo.begin_write_session(&WriteSessionOptions::default())
+            .unwrap();
+        let id = repo.manifest().find_snapshot("snap1").unwrap().id;
+        let rw = prepare_rewrite(&mut repo, id, "snap1", &[5], 0).unwrap();
+        let bytes = unpack_object_expect_with_context(
+            &rw.new_packed,
+            ObjectType::SnapshotMeta,
+            rw.new_id.as_bytes(),
+            repo.crypto.as_ref(),
+        )
+        .unwrap();
+        let new_meta: SnapshotMeta = rmp_serde::from_slice(&bytes).unwrap();
+        assert_ne!(new_meta.ext, old_meta.ext);
+        assert_eq!(
+            decode_ext(new_meta.ext.as_deref(), new_meta.item_ptrs.len()),
+            Err(NoIndex::Unordered)
         );
     }
 }

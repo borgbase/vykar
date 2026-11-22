@@ -377,7 +377,7 @@ pub(super) fn phase1_upload(
         source_label: source_label.to_string(),
         source_paths: source_paths.to_vec(),
         label: String::new(),
-        ext: None,
+        ext: listing.ext,
         format_version: listing.format_version,
     };
 

@@ -253,7 +253,7 @@ pub(super) fn into_processed_without_read(
             ProcessedEntry::UnsupportedSkipped { path, file_type }
         }
 
-        WalkEntry::SourceStarted { path } => ProcessedEntry::SourceStarted { path },
+        WalkEntry::SourceStarted { path, root } => ProcessedEntry::SourceStarted { path, root },
 
         WalkEntry::SourceFinished { path } => ProcessedEntry::SourceFinished { path },
     })

@@ -90,7 +90,8 @@ fuzzing = []
 # never enable in a product build.
 sim = []
 # Measurement entry points for examples/walk_order.rs and examples/listing_stats.rs (06 step 0;
-# walk_order keeps the pre-step-3 emission order for A/B). Not API.
+# walk_order keeps the pre-step-3 emission order for A/B), and the feature gate of
+# examples/listing_read.rs (06 step 4). Not API.
 measure = []
 
 [[example]]
@@ -99,6 +100,10 @@ required-features = ["measure"]
 
 [[example]]
 name = "listing_stats"
+required-features = ["measure"]
+
+[[example]]
+name = "listing_read"
 required-features = ["measure"]
 
 [dev-dependencies]

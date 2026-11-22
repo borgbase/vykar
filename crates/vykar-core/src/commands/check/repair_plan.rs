@@ -550,6 +550,7 @@ mod tests {
             item_impacts: Vec::new(),
             key_source: None,
             key_copies_to_restore: Vec::new(),
+            listing_index_warnings: Vec::new(),
         };
         let pack_chunks: HashMap<PackId, Vec<(ChunkId, ChunkIndexEntry)>> = HashMap::new();
         let mut name_to_id: HashMap<String, SnapshotId> = HashMap::new();
@@ -598,6 +599,7 @@ mod tests {
             item_impacts: Vec::new(),
             key_source: None,
             key_copies_to_restore: Vec::new(),
+            listing_index_warnings: Vec::new(),
         };
         let pack_chunks: HashMap<PackId, Vec<(ChunkId, ChunkIndexEntry)>> = HashMap::new();
         let mut name_to_id: HashMap<String, SnapshotId> = HashMap::new();

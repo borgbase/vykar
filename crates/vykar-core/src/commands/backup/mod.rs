@@ -4,7 +4,7 @@ mod commit;
 mod concurrency;
 mod drift;
 mod instrument;
-mod item_cut;
+pub(crate) mod item_cut;
 mod listing;
 mod phases;
 pub(crate) mod pipeline;

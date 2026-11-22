@@ -9,6 +9,7 @@ pub mod info;
 pub mod init;
 pub mod key;
 pub mod list;
+pub mod listing;
 pub(crate) mod mark;
 #[cfg(feature = "mount")]
 pub mod mount;

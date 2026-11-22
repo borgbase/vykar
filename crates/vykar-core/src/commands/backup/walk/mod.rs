@@ -371,6 +371,8 @@ pub(super) enum WalkEntry {
     },
     SourceStarted {
         path: String,
+        /// Listing segment root, [`ResolvedSource::segment_root`].
+        root: Vec<u8>,
     },
     SourceFinished {
         path: String,
@@ -417,6 +419,7 @@ pub(super) fn build_walk_iter<'a>(
     let iter = sources.iter().flat_map(move |source| {
         let source_started = std::iter::once(Ok(WalkEntry::SourceStarted {
             path: source.configured.clone(),
+            root: source.segment_root(),
         }));
 
         let entries = walk_source_inode_sorted(

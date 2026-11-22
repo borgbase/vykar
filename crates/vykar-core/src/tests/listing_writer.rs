@@ -289,3 +289,68 @@ fn v1_and_v2_listings_decode_to_the_same_items() {
         "format 2 ({v2_bytes} B) must be smaller than format 1 ({v1_bytes} B)"
     );
 }
+
+/// `begin_segment` closes a non-empty open chunk, so the segment starts at a
+/// chunk boundary; on an empty buffer it adds no chunk. The key index
+/// records the segments. Without a `begin_segment` the listing is one
+/// implicit segment (the pinned listings above).
+#[test]
+fn begin_segment_cuts_and_records_segments() {
+    use crate::commands::backup::item_cut::ItemStreamCutter;
+    use crate::snapshot::listing::{NoIndex, ORDER_DFS_NAME, decode_ext};
+
+    let mut repo = fixed_key_repo();
+    // Never cuts on its own.
+    let cutter = ItemStreamCutter::with_params([1; 32], usize::MAX, u64::MAX, usize::MAX);
+    let mut listing = ListingWriter::with_cutter(cutter, Compression::None);
+    let at = |path: &str| item(path.into(), ItemType::RegularFile, 0o644, Vec::new());
+    listing
+        .begin_segment(&mut repo, b"vykar-dumps".to_vec())
+        .unwrap();
+    listing.push(&mut repo, &at("vykar-dumps")).unwrap();
+    listing.push(&mut repo, &at("vykar-dumps/a")).unwrap();
+    listing.begin_segment(&mut repo, b"r".to_vec()).unwrap();
+    // A second start on the now empty buffer adds no chunk and replaces the root.
+    listing
+        .begin_segment(&mut repo, b"home/u".to_vec())
+        .unwrap();
+    listing.push(&mut repo, &at("home/u")).unwrap();
+    listing.push(&mut repo, &at("home/u/x")).unwrap();
+    let finished = listing.finish(&mut repo).unwrap();
+    assert_eq!(finished.item_ptrs.len(), 2);
+    let index = decode_ext(finished.ext.as_deref(), 2).unwrap();
+    assert_eq!(index.order, ORDER_DFS_NAME);
+    let segments: Vec<(&[u8], u32)> = index
+        .segments
+        .iter()
+        .map(|s| (s.root.as_slice(), s.first_ptr))
+        .collect();
+    assert_eq!(
+        segments,
+        vec![(&b"vykar-dumps"[..], 0), (&b"home/u"[..], 1)]
+    );
+
+    // No begin_segment: one implicit segment rooted at "".
+    let mut repo = fixed_key_repo();
+    let mut listing = ListingWriter::new(repo.crypto.chunk_hasher(), Compression::None);
+    for path in ["a", "b", "a/x"] {
+        listing.push(&mut repo, &at(path)).unwrap();
+    }
+    let finished = listing.finish(&mut repo).unwrap();
+    let index = decode_ext(finished.ext.as_deref(), finished.item_ptrs.len()).unwrap();
+    assert_eq!(index.segments.len(), 1);
+    assert!(index.segments[0].root.is_empty());
+
+    // The pinned listing is not in walker order ("dir-01" after
+    // "dir-00/..."): order 0.
+    let mut repo = fixed_key_repo();
+    let mut listing = ListingWriter::new(repo.crypto.chunk_hasher(), Compression::None);
+    for item in &fixed_items() {
+        listing.push(&mut repo, item).unwrap();
+    }
+    let finished = listing.finish(&mut repo).unwrap();
+    assert_eq!(
+        decode_ext(finished.ext.as_deref(), finished.item_ptrs.len()),
+        Err(NoIndex::Unordered)
+    );
+}

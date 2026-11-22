@@ -242,7 +242,8 @@ pub(super) fn consume_processed_entry(
             listing.push(repo, &item)?;
         }
 
-        ProcessedEntry::SourceStarted { path } => {
+        ProcessedEntry::SourceStarted { path, root } => {
+            listing.begin_segment(repo, root)?;
             emit_progress(
                 progress,
                 BackupProgressEvent::SourceStarted { source_path: path },

@@ -1,5 +1,6 @@
 pub(crate) mod bin_id;
 pub mod item;
+pub mod listing;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -54,10 +55,11 @@ pub struct SnapshotMeta {
     /// New snapshots always write `""`.
     #[serde(default)]
     pub label: String,
-    /// Reserved opaque extension blob — the escape hatch for future
-    /// snapshot-level metadata inside a frozen-field-count envelope. Always
-    /// written `None` in this release; never read or validated here. See the
-    /// Format Evolution section of `architecture.md`.
+    /// Snapshot extension blob, versioned on its own
+    /// ([`listing::EXT_VERSION`]): the listing key index of 06 step 4.
+    /// Advisory: a reader that ignores it, or cannot decode it, scans the
+    /// listing. Older binaries never read it. See the Format Evolution
+    /// section of `architecture.md`.
     #[serde(default, with = "serde_bytes")]
     pub ext: Option<Vec<u8>>,
     /// Snapshot format version. **Must remain the last field** — the envelope

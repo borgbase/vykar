@@ -23,6 +23,7 @@ use crate::repo::pack_trailer::{
 };
 use crate::repo::{Repository, TreeChunkSource};
 use crate::snapshot::item::ItemType;
+use crate::snapshot::listing::{ChunkPaths, ExtCheck, check_ext};
 use vykar_crypto::CryptoEngine;
 use vykar_protocol::validate_pack_header;
 use vykar_storage::StorageBackend;
@@ -105,6 +106,12 @@ pub(super) struct ScanResult {
     /// to repair *from*.
     pub(super) key_source: Option<String>,
     pub(super) key_copies_to_restore: Vec<String>,
+    /// `(snapshot name, reason)` of every snapshot whose listing key index
+    /// does not match its listing (06 step 4). A warning, not an issue:
+    /// readers then scan, and nothing is repaired. Each is logged where it
+    /// is found; only the unit tests read this list.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) listing_index_warnings: Vec<(String, String)>,
 }
 
 /// Outcome of the repository-key phase.
@@ -270,6 +277,8 @@ struct SnapshotPass {
     issues: Vec<IntegrityIssue>,
     /// `None` when the metadata did not load.
     item_ptrs: Option<Vec<ChunkId>>,
+    /// `SnapshotMeta.ext`, checked against the listing in Phase 1c.
+    ext: Option<Vec<u8>>,
 }
 
 /// An item-level finding in one tree chunk, by the item's ordinal in the
@@ -296,6 +305,8 @@ struct CheckedChunk {
     per_item: Vec<HashSet<ChunkId>>,
     /// Decoding stopped here, after `items` items.
     error: Option<VykarError>,
+    /// What the key-index check needs of the chunk's paths.
+    paths: ChunkPaths,
 }
 
 /// Count down one use of slot `k`; true on the last.
@@ -322,6 +333,7 @@ fn check_tree_chunk(
         issues: Vec::new(),
         per_item: Vec::new(),
         error: None,
+        paths: ChunkPaths::default(),
     };
     let result = for_each_decoded_item(plain, |item| {
         // Per-item poll: a single multi-million-item snapshot must stay
@@ -329,6 +341,7 @@ fn check_tree_chunk(
         shutdown.check()?;
         let idx = chunk.items;
         chunk.items += 1;
+        chunk.paths.observe(item.path_bytes());
         if let Err(e) = item.validate() {
             chunk.issues.push(ItemFinding::Invalid {
                 index: idx,
@@ -360,6 +373,39 @@ fn check_tree_chunk(
     chunk
 }
 
+/// Check snapshot `name`'s key index (`ext`) against the path summaries of
+/// its decoded tree chunks. A mismatch is logged and recorded in
+/// `warnings`; it is not an integrity issue (readers scan instead).
+fn check_listing_index(
+    name: &str,
+    ext: Option<&[u8]>,
+    ptrs: &[ChunkId],
+    set: &TreeChunkSet,
+    outcomes: &[Option<ChunkOutcome<CheckedChunk>>],
+    warnings: &mut Vec<(String, String)>,
+) {
+    let mut sums: Vec<&ChunkPaths> = Vec::with_capacity(ptrs.len());
+    for id in ptrs {
+        match set.slot(id).and_then(|k| outcomes.get(k)) {
+            Some(Some(ChunkOutcome::Decoded(c))) => sums.push(&c.paths),
+            _ => return,
+        }
+    }
+    match check_ext(ext, &sums) {
+        ExtCheck::Ok => {}
+        ExtCheck::NoIndex(no) => {
+            tracing::debug!(snapshot = %name, reason = %no, "no listing key index");
+        }
+        ExtCheck::Mismatch(reason) => {
+            tracing::warn!(
+                "snapshot '{name}': its listing index does not match the listing ({reason}); \
+                 reads of this snapshot scan the whole listing. Nothing is damaged."
+            );
+            warnings.push((name.to_string(), reason));
+        }
+    }
+}
+
 /// What [`integrity_scan`] found, for the crate's unit tests.
 #[cfg(test)]
 pub(crate) struct ScanForTest {
@@ -369,6 +415,7 @@ pub(crate) struct ScanForTest {
     pub(crate) snapshot_per_item_chunks: HashMap<SnapshotId, Vec<HashSet<ChunkId>>>,
     pub(crate) snapshot_item_counts: HashMap<SnapshotId, usize>,
     pub(crate) snapshot_chunk_refs: HashMap<String, HashSet<ChunkId>>,
+    pub(crate) listing_index_warnings: Vec<(String, String)>,
 }
 
 /// Run [`integrity_scan`] without orphan detection or data verification.
@@ -393,6 +440,7 @@ pub(crate) fn scan_for_test(
         snapshot_per_item_chunks: scan.snapshot_per_item_chunks,
         snapshot_item_counts: scan.snapshot_item_counts,
         snapshot_chunk_refs: scan.snapshot_chunk_refs,
+        listing_index_warnings: scan.listing_index_warnings,
     })
 }
 
@@ -414,6 +462,7 @@ pub(super) fn integrity_scan(
     let mut snapshot_item_ptrs: HashMap<SnapshotId, HashSet<ChunkId>> = HashMap::new();
     let mut snapshot_per_item_chunks: HashMap<SnapshotId, Vec<HashSet<ChunkId>>> = HashMap::new();
     let mut snapshot_item_counts: HashMap<SnapshotId, usize> = HashMap::new();
+    let mut listing_index_warnings: Vec<(String, String)> = Vec::new();
 
     let concurrency = repo.storage.profile().request_width;
 
@@ -549,6 +598,7 @@ pub(super) fn integrity_scan(
             entry,
             issues: Vec::new(),
             item_ptrs: None,
+            ext: None,
         };
         let entry = &pass.entry;
 
@@ -622,6 +672,7 @@ pub(super) fn integrity_scan(
             }
         }
         pass.item_ptrs = Some(meta.item_ptrs);
+        pass.ext = meta.ext;
         passes.push(pass);
     }
 
@@ -805,6 +856,16 @@ pub(super) fn integrity_scan(
         }
 
         let walk_ok = walk_error.is_none();
+        if walk_ok {
+            check_listing_index(
+                &entry.name,
+                pass.ext.as_deref(),
+                &ptrs,
+                &set,
+                &outcomes,
+                &mut listing_index_warnings,
+            );
+        }
         if let Some(e) = walk_error {
             issues.push(IntegrityIssue::UnreadableSnapshot {
                 snapshot_name: entry.name.clone(),
@@ -966,6 +1027,7 @@ pub(super) fn integrity_scan(
         item_impacts,
         key_source: key_scan.source,
         key_copies_to_restore: key_scan.to_restore,
+        listing_index_warnings,
     })
 }
 

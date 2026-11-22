@@ -139,6 +139,8 @@ pub(super) enum ProcessedEntry {
     },
     SourceStarted {
         path: String,
+        /// Listing segment root (see `WalkEntry::SourceStarted`).
+        root: Vec<u8>,
     },
     SourceFinished {
         path: String,
@@ -1126,12 +1128,13 @@ mod tests {
     fn source_marker(i: usize) -> ProcessedEntry {
         ProcessedEntry::SourceStarted {
             path: format!("e{i}"),
+            root: Vec::new(),
         }
     }
 
     fn marker_index(r: std::result::Result<ProcessedEntry, VykarError>) -> String {
         match r {
-            Ok(ProcessedEntry::SourceStarted { path }) => path,
+            Ok(ProcessedEntry::SourceStarted { path, .. }) => path,
             Ok(_) => panic!("unexpected entry"),
             Err(e) => format!("err:{e}"),
         }

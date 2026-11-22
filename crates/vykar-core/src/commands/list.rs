@@ -251,8 +251,20 @@ impl ItemStreamReader {
     ) -> Result<LazyItemStream<'a>> {
         shutdown.check()?;
         let meta = load_snapshot_meta(repo, snapshot_name)?;
+        self.open_lazy_ptrs(repo, &meta.item_ptrs, shutdown)
+    }
+
+    /// [`Self::open_lazy`] over explicit item pointers (a meta the caller
+    /// already holds).
+    pub fn open_lazy_ptrs<'a>(
+        &mut self,
+        repo: &mut Repository,
+        item_ptrs: &[ChunkId],
+        shutdown: &'a CancelToken,
+    ) -> Result<LazyItemStream<'a>> {
+        shutdown.check()?;
         self.ensure_index(repo)?;
-        let chunks = resolve_from_index(repo.chunk_index(), &meta.item_ptrs)?;
+        let chunks = resolve_from_index(repo.chunk_index(), item_ptrs)?;
 
         let mut stream = LazyItemStream {
             storage: Arc::clone(&repo.storage),
@@ -312,7 +324,7 @@ impl ItemStreamReader {
 }
 
 /// `(chunk_id, pack_id, pack_offset, stored_size)` of one item-stream chunk.
-type ChunkLoc = (ChunkId, PackId, u64, u32);
+pub(crate) type ChunkLoc = (ChunkId, PackId, u64, u32);
 
 /// Upper bound on one range read of [`LazyItemStream`]. Smaller than the
 /// eager reader's 16 MiB coalescing cap because the raw window stays resident
@@ -324,7 +336,10 @@ const LAZY_WINDOW_MAX: u64 = 4 * 1024 * 1024;
 /// still read through rather than split into two range reads.
 const LAZY_WINDOW_GAP: u64 = 256 * 1024;
 
-fn resolve_from_index(index: &crate::index::LiveIndex, ids: &[ChunkId]) -> Result<Vec<ChunkLoc>> {
+pub(crate) fn resolve_from_index(
+    index: &crate::index::LiveIndex,
+    ids: &[ChunkId],
+) -> Result<Vec<ChunkLoc>> {
     ids.iter()
         .map(|id| {
             let e = index.get(id).ok_or(VykarError::ChunkNotInIndex(*id))?;

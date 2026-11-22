@@ -121,6 +121,19 @@ impl ResolvedSource {
         })
     }
 
+    /// Root of this source's listing segment (06 step 4): the snapshot path
+    /// that every entry of this root equals or starts with + "/". Empty for
+    /// `SkipRoot`.
+    pub(crate) fn segment_root(&self) -> Vec<u8> {
+        match &self.policy {
+            RootEmission::SkipRoot => Vec::new(),
+            RootEmission::EmitRoot { prefix } => self
+                .prefix_raw
+                .clone()
+                .unwrap_or_else(|| prefix.as_bytes().to_vec()),
+        }
+    }
+
     /// Build the `ParentReuseRoot` corresponding to this source. Keeps the
     /// `RootEmission`→`ParentReusePolicy` mapping in one place so the two
     /// enums can't drift.

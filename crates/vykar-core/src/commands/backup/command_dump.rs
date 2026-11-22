@@ -234,6 +234,10 @@ fn stream_dump_command(
     })
 }
 
+/// Listing segment root of the command dumps (06 step 4): the path of the
+/// `vykar-dumps` directory item.
+pub(crate) const DUMPS_ROOT: &[u8] = b"vykar-dumps";
+
 pub(super) fn process_command_dumps(
     repo: &mut Repository,
     command_dumps: &[CommandDump],
@@ -265,6 +269,8 @@ pub(super) fn process_command_dumps(
         raw_names: None,
         hardlink: None,
     };
+    debug_assert_eq!(dumps_dir_item.path.as_bytes(), DUMPS_ROOT);
+    listing.begin_segment(repo, DUMPS_ROOT.to_vec())?;
     listing.push(repo, &dumps_dir_item)?;
 
     let mut dump_items: Vec<Item> = Vec::with_capacity(command_dumps.len());

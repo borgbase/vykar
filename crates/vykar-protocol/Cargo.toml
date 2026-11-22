@@ -10,6 +10,8 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+# Hex encoding of the repack trailer in the JSON plan.
+hex = { workspace = true }
 serde = { workspace = true }
 # `HashAlgorithm` for the repack / verify-packs DTOs. vykar-types is a leaf
 # crate, so depending on it introduces no cycle.

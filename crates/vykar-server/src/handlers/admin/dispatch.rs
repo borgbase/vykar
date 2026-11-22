@@ -111,8 +111,8 @@ pub async fn repo_action_dispatch(
 /// `PUT` with `If-None-Match: *` creates only (412 when the key exists),
 /// atomically; older servers ignore the header and overwrite. The four
 /// operation fields (`object_sizes`, `list_tree`, `verify_packs`, `repack`)
-/// let a client gate on them; `repack_trailer` arrives with the repack
-/// trailer.
+/// let a client gate on them; `repack_trailer` says a repack operation may
+/// carry a trailer (protocol version 3), which older servers would not append.
 pub async fn health() -> impl IntoResponse {
     axum::Json(serde_json::json!({
         "status": "ok",
@@ -130,5 +130,6 @@ pub async fn health() -> impl IntoResponse {
         "list_tree": true,
         "verify_packs": true,
         "repack": true,
+        "repack_trailer": true,
     }))
 }

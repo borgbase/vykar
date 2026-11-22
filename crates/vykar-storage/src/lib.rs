@@ -634,8 +634,9 @@ pub enum ServerOp {
     VerifyPacks,
     /// [`ServerOps::repack`].
     Repack,
-    /// [`ServerOps::repack`] of a plan carrying a pack trailer. Nothing sends
-    /// one yet and no server offers it yet.
+    /// [`ServerOps::repack`] of a plan whose operations carry a
+    /// [`vykar_protocol::RepackOperationRequest::trailer`]. Nothing in vykar
+    /// sends one yet (05-index-gc-format.md step 4).
     RepackTrailer,
     /// [`ServerOps::object_sizes`].
     ObjectSizes,
@@ -680,7 +681,9 @@ pub trait ServerOps: Send + Sync {
         Err(not_offered("verify-packs"))
     }
 
-    /// Execute a server-side repack plan. Only after `offers(ServerOp::Repack)`.
+    /// Execute a server-side repack plan. Only after `offers(ServerOp::Repack)`;
+    /// a plan that carries a trailer only after `offers(ServerOp::RepackTrailer)`
+    /// (`RestBackend` refuses it locally otherwise).
     ///
     /// # Errors
     ///

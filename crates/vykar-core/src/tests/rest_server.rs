@@ -292,10 +292,9 @@ fn conditional_conformance_suite_passes() {
     }
 }
 
-/// This server advertises `repack` but not `repack_trailer`, so compact
-/// keeps repacking server-side against it.
+/// This server advertises `repack` and `repack_trailer`.
 #[test]
-fn server_offers_repack_but_not_the_repack_trailer() {
+fn server_offers_repack_and_the_repack_trailer() {
     use vykar_storage::{ServerOp, StorageBackend};
     let server = Server::start(false);
     let backend = vykar_storage::rest_backend::RestBackend::new(
@@ -310,8 +309,103 @@ fn server_offers_repack_but_not_the_repack_trailer() {
     .unwrap();
     let ops = backend.server_ops().expect("a server is behind REST");
     assert!(ops.offers(ServerOp::Repack));
-    assert!(!ops.offers(ServerOp::RepackTrailer));
+    assert!(ops.offers(ServerOp::RepackTrailer));
     assert!(ops.offers(ServerOp::VerifyPacks));
     assert!(ops.offers(ServerOp::ListTree));
     assert!(ops.offers(ServerOp::ObjectSizes));
+}
+
+/// A repack plan with a trailer through `RestBackend` against the server: the
+/// trailer is the new pack's last frame, the pack ID covers it, and
+/// verify-packs accepts the pack.
+#[test]
+fn server_repack_appends_a_trailer_end_to_end() {
+    use vykar_protocol::{
+        RepackBlobRef, RepackOperationRequest, RepackPlanRequest, VerifyBlobRef, VerifyPackRequest,
+        VerifyPacksPlanRequest,
+    };
+    use vykar_storage::{ServerOp, StorageBackend};
+    use vykar_types::pack_id::PackId;
+
+    let server = Server::start(false);
+    let c = Client::init(&server);
+    c.write("a", "alpha");
+    c.backup("s1");
+    let hash = open(&c.config).content_hash();
+
+    let backend = vykar_storage::rest_backend::RestBackend::new(
+        &server.url,
+        Some(TOKEN),
+        vykar_storage::RetryConfig {
+            max_retries: 0,
+            ..Default::default()
+        },
+        None,
+    )
+    .unwrap();
+    let source = backend
+        .list("packs/")
+        .unwrap()
+        .into_iter()
+        .find(|k| k.starts_with("packs/"))
+        .expect("the backup wrote a pack");
+    let bytes = backend.get(&source).unwrap().unwrap();
+
+    // Every frame of the source pack, `[u32 LE len][blob]` from the header on.
+    let mut keep = Vec::new();
+    let mut pos = vykar_protocol::PACK_HEADER_SIZE;
+    while pos < bytes.len() {
+        let len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
+        keep.push(RepackBlobRef {
+            offset: (pos + 4) as u64,
+            length: u64::from(len),
+        });
+        pos += 4 + len as usize;
+    }
+    assert_eq!(pos, bytes.len(), "the source pack is whole frames");
+
+    let trailer = b"e2e-trailer";
+    let plan = RepackPlanRequest::new(
+        vec![RepackOperationRequest {
+            source_pack: source.clone(),
+            keep_blobs: keep.clone(),
+            delete_after: false,
+            trailer: Some(trailer.to_vec()),
+        }],
+        hash,
+    );
+    let ops = backend.server_ops().expect("a server is behind REST");
+    assert!(ops.offers(ServerOp::RepackTrailer));
+    let result = ops.repack(&plan).unwrap();
+    let op = result.completed.first().unwrap();
+    let new_key = op.new_pack.clone().unwrap();
+    assert_ne!(new_key, source);
+    let expected_offsets: Vec<u64> = keep.iter().map(|b| b.offset).collect();
+    assert_eq!(op.new_offsets, expected_offsets);
+
+    let new_bytes = backend.get(&new_key).unwrap().unwrap();
+    let mut tail = 11u32.to_le_bytes().to_vec();
+    tail.extend_from_slice(trailer);
+    assert!(new_bytes.ends_with(&tail));
+    assert_eq!(new_bytes.len(), bytes.len() + tail.len());
+    assert_eq!(new_key, PackId::compute(&new_bytes, hash).storage_key());
+
+    let verify = ops
+        .verify_packs(&VerifyPacksPlanRequest::new(
+            vec![VerifyPackRequest {
+                pack_key: new_key,
+                expected_size: new_bytes.len() as u64,
+                expected_blobs: keep
+                    .iter()
+                    .map(|b| VerifyBlobRef {
+                        offset: b.offset,
+                        length: b.length,
+                    })
+                    .collect(),
+            }],
+            hash,
+        ))
+        .unwrap();
+    let r = verify.results.first().unwrap();
+    assert!(r.hash_valid && r.header_valid && r.blobs_valid, "{r:?}");
 }

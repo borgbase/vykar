@@ -663,4 +663,17 @@ mod tests {
         assert!(result.header_valid);
         assert!(result.blobs_valid);
     }
+
+    /// A pack whose last frame is a repack trailer verifies whether or not the
+    /// trailer frame is among the expected blobs: it is an ordinary frame.
+    #[test]
+    fn verify_packs_accepts_a_trailer_pack() {
+        let (pack, refs) = build_pack(&[b"alpha", b"gamma", b"TRAILER-BYTES"]);
+        for expected in [refs[..2].to_vec(), refs.clone()] {
+            let req = verify_request(&pack, expected);
+            let result = verify_via_cursor(&pack, &req, 256 * 1024);
+            assert!(result.hash_valid && result.header_valid && result.blobs_valid);
+            assert!(result.error.is_none(), "{:?}", result.error);
+        }
+    }
 }

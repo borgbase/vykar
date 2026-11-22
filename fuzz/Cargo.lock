@@ -2112,6 +2112,7 @@ dependencies = [
 name = "vykar-protocol"
 version = "0.24.0"
 dependencies = [
+ "hex",
  "serde",
  "vykar-types",
 ]

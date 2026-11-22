@@ -77,7 +77,30 @@ pub const MAX_REPACK_OUTPUT_BYTES: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
 /// Bumped to 2 by BLAKE3 repositories. A new client talking about a *v2*
 /// repository still declares 1, so it keeps working against pre-BLAKE3
 /// servers; only BLAKE3 traffic requires the newer server.
-pub const PROTOCOL_VERSION: u32 = 2;
+///
+/// Bumped to 3 by repack plans that carry a pack trailer
+/// ([`RepackOperationRequest::trailer`]); a plan without one still declares
+/// 1 or 2, so it keeps working against older servers.
+pub const PROTOCOL_VERSION: u32 = 3;
+
+/// The protocol version a repack plan must declare when any of its operations
+/// carries a [`RepackOperationRequest::trailer`]. Servers 0.8 through 0.24
+/// refuse such a plan by version before reading any operation; older ones
+/// never advertise `repack_trailer`, so a client gated on it never sends them
+/// one.
+pub const REPACK_TRAILER_PROTOCOL_VERSION: u32 = 3;
+
+/// Largest trailer one repack operation may carry. A trailer holds ~45 bytes
+/// per chunk (05-index-gc-format.md), so 16 MiB covers the server's
+/// 200 000 kept blobs per operation with room to spare; the hex encoding
+/// doubles it on the wire, which keeps one maximal trailer well inside the
+/// server's 64 MiB admin body limit.
+///
+/// A caller that sends trailers must also bound each plan's JSON size against
+/// that 64 MiB limit: plans are chunked by output bytes only
+/// ([`MAX_REPACK_OUTPUT_BYTES`]), and many trailers can exceed the body limit
+/// first.
+pub const MAX_REPACK_TRAILER_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Minimum protocol version the server accepts.
 ///
@@ -213,8 +236,9 @@ pub struct ServerCapabilities {
     /// this is advertised; older servers omit it and get a client-side repack.
     #[serde(default)]
     pub repack: bool,
-    /// The server accepts a client-prepared pack trailer on a repack request.
-    /// No server advertises it yet; it arrives with the repack trailer.
+    /// The server accepts [`RepackOperationRequest::trailer`] (protocol
+    /// version 3). Servers that predate it omit the field; a client sends a
+    /// trailer only when it is advertised.
     #[serde(default)]
     pub repack_trailer: bool,
 }
@@ -269,10 +293,43 @@ pub struct RepackOperationRequest {
     pub source_pack: String,
     pub keep_blobs: Vec<RepackBlobRef>,
     pub delete_after: bool,
+    /// Bytes the server appends to this operation's output pack as one more
+    /// length-prefixed blob (`[u32 LE len][trailer]`) after the last kept blob.
+    /// The server treats them as opaque; their format is the client's (the pack
+    /// trailer, 05-index-gc-format.md). The pack ID covers them. Requires
+    /// protocol version [`REPACK_TRAILER_PROTOCOL_VERSION`]; send only to a
+    /// server that advertises `repack_trailer`. Non-empty, at most
+    /// [`MAX_REPACK_TRAILER_BYTES`], and only on an operation that keeps blobs.
+    /// JSON: a lowercase hex string; omitted when `None`, so a plan without
+    /// trailers serializes exactly as before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "opt_hex")]
+    pub trailer: Option<Vec<u8>>,
+}
+
+/// `Option<Vec<u8>>` as an optional hex string (JSON has no byte type, and a
+/// number array costs ~3.6 bytes per byte).
+mod opt_hex {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub(super) fn serialize<S: Serializer>(v: &Option<Vec<u8>>, s: S) -> Result<S::Ok, S::Error> {
+        match v {
+            Some(bytes) => s.serialize_str(&hex::encode(bytes)),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<Option<Vec<u8>>, D::Error> {
+        Option::<String>::deserialize(d)?
+            .map(|s| hex::decode(s).map_err(serde::de::Error::custom))
+            .transpose()
+    }
 }
 
 /// Exact on-disk output size of one repack operation: `PACK_HEADER_SIZE +
-/// Σ(4 + blob.length)`. Delete-only operations (empty `keep_blobs`) produce no
+/// Σ(4 + blob.length)`, plus `4 + trailer.len()` when the operation carries
+/// a trailer. Delete-only operations (empty `keep_blobs`) produce no
 /// pack, so they count as 0. Saturating.
 ///
 /// Shared by the server (plan validation against [`MAX_REPACK_OUTPUT_BYTES`])
@@ -284,6 +341,11 @@ pub fn repack_op_output_size(op: &RepackOperationRequest) -> u64 {
     let mut total = u64::try_from(PACK_HEADER_SIZE).unwrap_or(u64::MAX);
     for blob in &op.keep_blobs {
         total = total.saturating_add(4).saturating_add(blob.length);
+    }
+    if let Some(t) = &op.trailer {
+        total = total
+            .saturating_add(4)
+            .saturating_add(u64::try_from(t.len()).unwrap_or(u64::MAX));
     }
     total
 }
@@ -306,7 +368,8 @@ fn required_protocol_version(hash: HashAlgorithm) -> u32 {
 ///
 /// `hash` and `protocol_version` are **private with read-only accessors**, and
 /// the only way to build one is [`RepackPlanRequest::new`], which derives the
-/// version from the algorithm. That makes the dangerous pair — BLAKE3 declared
+/// version from the algorithm and from whether any operation carries a
+/// trailer. That makes the dangerous pair — BLAKE3 declared
 /// at protocol 1 — unrepresentable in Rust.
 ///
 /// `#[non_exhaustive]` would not be a substitute: it blocks external struct
@@ -327,11 +390,40 @@ pub struct RepackPlanRequest {
 
 impl RepackPlanRequest {
     pub fn new(operations: Vec<RepackOperationRequest>, hash: HashAlgorithm) -> Self {
+        let mut protocol_version = required_protocol_version(hash);
+        if operations.iter().any(|op| op.trailer.is_some()) {
+            protocol_version = protocol_version.max(REPACK_TRAILER_PROTOCOL_VERSION);
+        }
         Self {
             operations,
             hash,
-            protocol_version: required_protocol_version(hash),
+            protocol_version,
         }
+    }
+
+    /// Whether any operation carries a trailer.
+    pub fn has_trailer(&self) -> bool {
+        self.operations.iter().any(|op| op.trailer.is_some())
+    }
+
+    /// Whether the declared protocol version is high enough for the trailers
+    /// the plan carries. `operations` is public, so a trailer added after
+    /// [`Self::new`] can leave the version behind; the client checks this
+    /// before sending and the server before executing.
+    ///
+    /// # Errors
+    ///
+    /// A message when an operation carries a trailer and the declared version
+    /// is below [`REPACK_TRAILER_PROTOCOL_VERSION`].
+    pub fn validate_trailer_version(&self) -> Result<(), String> {
+        if self.has_trailer() && self.protocol_version < REPACK_TRAILER_PROTOCOL_VERSION {
+            return Err(format!(
+                "a repack trailer requires protocol version >= {REPACK_TRAILER_PROTOCOL_VERSION}, \
+                 but the plan declared {}",
+                self.protocol_version
+            ));
+        }
+        Ok(())
     }
 
     /// The algorithm the server must name output packs with.
@@ -1588,6 +1680,7 @@ mod tests {
             source_pack: "packs/ab/ab".to_string(),
             keep_blobs: blobs,
             delete_after: true,
+            trailer: None,
         };
         // Delete-only ops produce no pack.
         assert_eq!(repack_op_output_size(&op(vec![])), 0);
@@ -1606,5 +1699,186 @@ mod tests {
             repack_op_output_size(&op(blobs)),
             PACK_HEADER_SIZE as u64 + (4 + 100) + (4 + 25)
         );
+    }
+
+    // ── repack trailer ─────────────────────────────────────────────────
+
+    const TRAILER_TEST_PACK: &str =
+        "packs/ab/ab00000000000000000000000000000000000000000000000000000000000000";
+
+    fn trailer_test_op(trailer: Option<Vec<u8>>) -> RepackOperationRequest {
+        RepackOperationRequest {
+            source_pack: TRAILER_TEST_PACK.to_string(),
+            keep_blobs: vec![RepackBlobRef {
+                offset: 13,
+                length: 5,
+            }],
+            delete_after: false,
+            trailer,
+        }
+    }
+
+    /// A plan without trailers is byte-identical to what this binary sent
+    /// before the field existed, so it keeps working against old servers.
+    #[test]
+    fn plan_without_trailer_serializes_as_before() {
+        for (hash, name, version) in [
+            (HashAlgorithm::Blake3, "blake3", 2),
+            (HashAlgorithm::Blake2b, "blake2b", 1),
+        ] {
+            let plan = RepackPlanRequest::new(vec![trailer_test_op(None)], hash);
+            let expected = format!(
+                r#"{{"operations":[{{"source_pack":"{TRAILER_TEST_PACK}","keep_blobs":[{{"offset":13,"length":5}}],"delete_after":false}}],"hash":"{name}","protocol_version":{version}}}"#
+            );
+            assert_eq!(serde_json::to_string(&plan).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn old_shape_operation_decodes_without_trailer() {
+        let json = format!(
+            r#"{{"operations":[{{"source_pack":"{TRAILER_TEST_PACK}","keep_blobs":[{{"offset":13,"length":5}}],"delete_after":false}}],"hash":"blake3","protocol_version":2}}"#
+        );
+        let plan: RepackPlanRequest = serde_json::from_str(&json).unwrap();
+        assert!(plan.operations.first().unwrap().trailer.is_none());
+        assert!(!plan.has_trailer());
+    }
+
+    #[test]
+    fn trailer_round_trips_as_hex() {
+        let op = trailer_test_op(Some(vec![0x01, 0xab, 0xff]));
+        let json = serde_json::to_string(&op).unwrap();
+        assert!(json.ends_with(r#""trailer":"01abff"}"#), "got: {json}");
+        let back: RepackOperationRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.trailer, Some(vec![0x01, 0xab, 0xff]));
+
+        let json = format!(
+            r#"{{"source_pack":"{TRAILER_TEST_PACK}","keep_blobs":[],"delete_after":false,"trailer":null}}"#
+        );
+        let back: RepackOperationRequest = serde_json::from_str(&json).unwrap();
+        assert!(back.trailer.is_none());
+    }
+
+    #[test]
+    fn invalid_trailer_hex_fails_deserialization() {
+        for bad in ["abc", "zz"] {
+            let json = format!(
+                r#"{{"source_pack":"{TRAILER_TEST_PACK}","keep_blobs":[],"delete_after":false,"trailer":"{bad}"}}"#
+            );
+            assert!(
+                serde_json::from_str::<RepackOperationRequest>(&json).is_err(),
+                "{bad} decoded"
+            );
+        }
+    }
+
+    #[test]
+    fn trailer_plan_declares_protocol_3() {
+        for hash in [HashAlgorithm::Blake2b, HashAlgorithm::Blake3] {
+            let plan = RepackPlanRequest::new(vec![trailer_test_op(Some(b"T".to_vec()))], hash);
+            assert_eq!(plan.protocol_version(), REPACK_TRAILER_PROTOCOL_VERSION);
+            assert!(plan.has_trailer());
+            assert!(plan.validate_trailer_version().is_ok());
+            assert!(plan.validate_hash_pairing().is_ok());
+        }
+    }
+
+    #[test]
+    fn trailer_at_protocol_2_is_rejected() {
+        let json = format!(
+            r#"{{"operations":[{{"source_pack":"{TRAILER_TEST_PACK}","keep_blobs":[{{"offset":13,"length":5}}],"delete_after":false,"trailer":"01"}}],"hash":"blake3","protocol_version":2}}"#
+        );
+        let plan: RepackPlanRequest = serde_json::from_str(&json).unwrap();
+        let err = plan.validate_trailer_version().unwrap_err();
+        assert!(err.contains("requires protocol version >= 3"), "got: {err}");
+
+        // `operations` is public: a trailer added after `new` leaves the
+        // version behind, and the check catches it.
+        let mut plan = RepackPlanRequest::new(vec![trailer_test_op(None)], HashAlgorithm::Blake3);
+        plan.operations.first_mut().unwrap().trailer = Some(b"T".to_vec());
+        let err = plan.validate_trailer_version().unwrap_err();
+        assert!(err.contains("requires protocol version >= 3"), "got: {err}");
+    }
+
+    /// Frozen copy of v0.24.0's repack plan types and version check
+    /// (`git show v0.24.0:crates/vykar-protocol/src/lib.rs`). Never update it:
+    /// it stands for the released server.
+    mod v0_24 {
+        use serde::Deserialize;
+        use vykar_types::hash::HashAlgorithm;
+
+        pub const PROTOCOL_VERSION: u32 = 2;
+
+        #[derive(Debug, Deserialize)]
+        pub struct RepackBlobRef {
+            #[allow(dead_code)]
+            pub offset: u64,
+            #[allow(dead_code)]
+            pub length: u64,
+        }
+
+        #[derive(Debug, Deserialize)]
+        pub struct RepackOperationRequest {
+            #[allow(dead_code)]
+            pub source_pack: String,
+            pub keep_blobs: Vec<RepackBlobRef>,
+            #[allow(dead_code)]
+            pub delete_after: bool,
+        }
+
+        #[derive(Debug, Deserialize)]
+        pub struct RepackPlanRequest {
+            pub operations: Vec<RepackOperationRequest>,
+            #[serde(default)]
+            #[allow(dead_code)]
+            pub hash: HashAlgorithm,
+            #[serde(default)]
+            pub protocol_version: u32,
+        }
+
+        /// The comparison of 0.24's `check_protocol_version` for a version > 0.
+        pub fn check_protocol_version(version: u32) -> Result<(), String> {
+            if version > PROTOCOL_VERSION {
+                return Err(format!(
+                    "protocol version {version} not supported; server supports <= {PROTOCOL_VERSION}"
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    /// A 0.24 server ignores the unknown `trailer` field (so the capability
+    /// gate alone would let a trailer be dropped silently), but it checks the
+    /// declared version first and refuses the plan by version.
+    #[test]
+    fn a_0_24_server_refuses_a_trailer_plan_by_version() {
+        let plan = RepackPlanRequest::new(
+            vec![trailer_test_op(Some(b"TRAILER".to_vec()))],
+            HashAlgorithm::Blake3,
+        );
+        let json = serde_json::to_string(&plan).unwrap();
+        let old: v0_24::RepackPlanRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(old.operations.first().unwrap().keep_blobs.len(), 1);
+        assert_eq!(old.protocol_version, 3);
+        let err = v0_24::check_protocol_version(old.protocol_version).unwrap_err();
+        assert!(
+            err.contains("protocol version 3 not supported"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn repack_op_output_size_counts_the_trailer() {
+        let op = trailer_test_op(Some(b"abc".to_vec()));
+        assert_eq!(
+            repack_op_output_size(&op),
+            PACK_HEADER_SIZE as u64 + (4 + 5) + (4 + 3)
+        );
+        let delete_only = RepackOperationRequest {
+            keep_blobs: Vec::new(),
+            delete_after: true,
+            ..op
+        };
+        assert_eq!(repack_op_output_size(&delete_only), 0);
     }
 }

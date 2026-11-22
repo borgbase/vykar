@@ -51,6 +51,26 @@ pub(crate) fn repack_body(ops: &[serde_json::Value]) -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({ "operations": ops })).unwrap()
 }
 
+/// A repack plan body declaring `protocol_version` (and blake2b by default).
+pub(crate) fn repack_body_at(ops: &[serde_json::Value], protocol_version: u32) -> Vec<u8> {
+    serde_json::to_vec(
+        &serde_json::json!({ "operations": ops, "protocol_version": protocol_version }),
+    )
+    .unwrap()
+}
+
+/// `repack_op` with a trailer, hex-encoded as on the wire.
+pub(crate) fn repack_op_with_trailer(
+    source_pack: &str,
+    keep_blobs: &[(u64, u64)],
+    delete_after: bool,
+    trailer: &[u8],
+) -> serde_json::Value {
+    let mut op = repack_op(source_pack, keep_blobs, delete_after);
+    op["trailer"] = serde_json::Value::String(hex::encode(trailer));
+    op
+}
+
 pub(crate) fn repack_op(
     source_pack: &str,
     keep_blobs: &[(u64, u64)],

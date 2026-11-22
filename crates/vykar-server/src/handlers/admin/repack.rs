@@ -2,9 +2,9 @@ use axum::response::{IntoResponse, Response};
 use vykar_types::hash::Hasher256;
 
 use vykar_protocol::{
-    PACK_HEADER_SIZE, PACK_MAGIC, PACK_VERSION_CURRENT, RepackOperationResult, RepackPlanRequest,
-    RepackResultResponse, check_protocol_version, is_valid_pack_key, repack_op_output_size,
-    validate_blob_ref,
+    MAX_REPACK_TRAILER_BYTES, PACK_HEADER_SIZE, PACK_MAGIC, PACK_VERSION_CURRENT,
+    RepackOperationResult, RepackPlanRequest, RepackResultResponse, check_protocol_version,
+    is_valid_pack_key, repack_op_output_size, validate_blob_ref,
 };
 
 use crate::error::ServerError;
@@ -66,6 +66,8 @@ pub(super) async fn repack(
 /// clients avoid it by sending `delete_after: false` and deleting sources
 /// themselves after persisting the index; the server-side delete remains for
 /// older clients.
+///
+/// An operation's trailer is appended as the output pack's last framed blob.
 #[allow(clippy::too_many_lines)]
 fn execute_repack(
     state: &AppState,
@@ -219,6 +221,20 @@ fn execute_repack(
                     pack_offset += 4 + blob_ref.length;
                 }
 
+                // The client-prepared trailer is the pack's last framed blob:
+                // the same `[u32 len][bytes]` framing as every blob, so
+                // verify-packs' boundary scan and a later repack see an
+                // ordinary blob. Validation capped it at MAX_REPACK_TRAILER_BYTES.
+                if let Some(trailer) = &op.trailer {
+                    let len = u32::try_from(trailer.len())
+                        .map_err(|_| "repack trailer exceeds pack format max".to_string())?;
+                    write_and_hash(&mut writer, &mut hasher, &len.to_le_bytes())
+                        .map_err(|e| format!("write trailer len: {e}"))?;
+                    write_and_hash(&mut writer, &mut hasher, trailer)
+                        .map_err(|e| format!("write trailer: {e}"))?;
+                    pack_offset += 4 + u64::from(len);
+                }
+
                 writer.flush().map_err(|e| format!("flush: {e}"))?;
                 Ok(())
             })();
@@ -368,12 +384,15 @@ fn write_and_hash(
 /// Validate the plan and return its total output size in bytes.
 ///
 /// A single validation-layer cap suffices (unlike verify-packs' two layers):
-/// output size is exactly `PACK_HEADER_SIZE + Σ(4 + blob.length)` per op, and
+/// output size is exactly `PACK_HEADER_SIZE + Σ(4 + blob.length)` per op (plus
+/// `4 + trailer.len()` for an op with a trailer), and
 /// blob lengths are cross-checked against the on-disk length prefixes during
 /// execution, so a declared oversize plan is rejected before any file access.
 fn validate_repack_plan(plan: &RepackPlanRequest) -> Result<u64, ServerError> {
     check_protocol_version(plan.protocol_version()).map_err(ServerError::BadRequest)?;
     plan.validate_hash_pairing()
+        .map_err(ServerError::BadRequest)?;
+    plan.validate_trailer_version()
         .map_err(ServerError::BadRequest)?;
     if plan.operations.len() > MAX_REPACK_OPS {
         return Err(ServerError::BadRequest(format!(
@@ -402,6 +421,24 @@ fn validate_repack_plan(plan: &RepackPlanRequest) -> Result<u64, ServerError> {
                 &format!("operation {idx} blob {blob_idx}"),
             )
             .map_err(ServerError::BadRequest)?;
+        }
+        if let Some(trailer) = &op.trailer {
+            if op.keep_blobs.is_empty() {
+                return Err(ServerError::BadRequest(format!(
+                    "trailer on operation {idx}, which keeps no blobs and writes no pack"
+                )));
+            }
+            let len = u64::try_from(trailer.len()).unwrap_or(u64::MAX);
+            if len == 0 {
+                return Err(ServerError::BadRequest(format!(
+                    "trailer length must be > 0 at operation {idx}"
+                )));
+            }
+            if len > MAX_REPACK_TRAILER_BYTES {
+                return Err(ServerError::BadRequest(format!(
+                    "trailer too large at operation {idx}: {len} bytes (max {MAX_REPACK_TRAILER_BYTES})"
+                )));
+            }
         }
         total_output = total_output.saturating_add(repack_op_output_size(op));
     }
@@ -526,7 +563,8 @@ mod tests {
             let body = serde_json::to_vec(&serde_json::json!({
                 "operations": [repack_op(&source_key, &keep, false)],
                 "hash": algo.as_str(),
-                "protocol_version": vykar_protocol::PROTOCOL_VERSION,
+                // What clients send for BLAKE3 without a trailer.
+                "protocol_version": 2,
             }))
             .unwrap();
             let resp = authed_post(router, "/?repack", body).await;
@@ -831,5 +869,285 @@ mod tests {
             state.quota_used() < used_before,
             "quota should have decreased"
         );
+    }
+
+    // ── repack trailer ─────────────────────────────────────────────────
+
+    /// POST a repack body and return (new pack key, new_offsets) of op 0.
+    async fn repack_ok(router: axum::Router, body: Vec<u8>) -> (String, Vec<u64>) {
+        let resp = authed_post(router, "/?repack", body).await;
+        assert_status(&resp, StatusCode::OK);
+        let result: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        let op = &result["completed"][0];
+        let offsets = op["new_offsets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap())
+            .collect();
+        (op["new_pack"].as_str().unwrap().to_string(), offsets)
+    }
+
+    async fn repack_bad_request(router: axum::Router, body: Vec<u8>, needle: &str) {
+        let resp = authed_post(router, "/?repack", body).await;
+        assert_status(&resp, StatusCode::BAD_REQUEST);
+        let text = String::from_utf8_lossy(&body_bytes(resp).await).into_owned();
+        assert!(text.contains(needle), "expected {needle:?}, got: {text}");
+    }
+
+    const TRAILER: &[u8] = b"TRAILER-BYTES";
+
+    #[tokio::test]
+    async fn repack_appends_the_trailer_as_the_last_frame() {
+        use vykar_types::hash::HashAlgorithm;
+
+        for (algo, name) in [
+            (HashAlgorithm::Blake2b, "blake2b"),
+            (HashAlgorithm::Blake3, "blake3"),
+        ] {
+            let (router, _state, tmp) = setup_app(0);
+            let (pack_bytes, refs) = build_pack(&[b"alpha", b"beta", b"gamma"]);
+            let source_key = write_pack(tmp.path(), &pack_bytes);
+            let keep = [refs[0], refs[2]];
+            let body = serde_json::to_vec(&serde_json::json!({
+                "operations": [repack_op_with_trailer(&source_key, &keep, false, TRAILER)],
+                "hash": name,
+                "protocol_version": 3,
+            }))
+            .unwrap();
+            let (key, offsets) = repack_ok(router, body).await;
+
+            let data = std::fs::read(tmp.path().join(&key)).unwrap();
+            let (expected, expected_refs) = build_pack(&[b"alpha", b"gamma", TRAILER]);
+            assert_eq!(data, expected, "{name}: trailer is the last frame");
+            assert_eq!(
+                offsets,
+                vec![expected_refs[0].0, expected_refs[1].0],
+                "{name}: one offset per kept blob, none for the trailer"
+            );
+            assert_eq!(
+                key.split('/').next_back().unwrap(),
+                pack_id_hex(&data, algo),
+                "{name}: the pack ID covers the trailer"
+            );
+            assert_no_temp_files(tmp.path());
+        }
+    }
+
+    #[tokio::test]
+    async fn repack_trailer_quota_and_reservation() {
+        let (router, state, tmp) = setup_app(0);
+        let (pack_bytes, refs) = build_pack(&[b"alpha", b"beta", b"gamma"]);
+        let source_key = write_pack(tmp.path(), &pack_bytes);
+        state.add_quota_usage(pack_bytes.len() as u64);
+        let before = state.quota_used();
+        let keep = [refs[0], refs[2]];
+        let body = repack_body_at(
+            &[repack_op_with_trailer(&source_key, &keep, false, TRAILER)],
+            3,
+        );
+        repack_ok(router, body).await;
+        let out = 9 + (4 + 5) + (4 + 5) + (4 + TRAILER.len() as u64);
+        assert_eq!(state.quota_used(), before + out);
+        assert_eq!(state.quota_reserved(), 0);
+
+        // A quota that fits the output without the trailer, but not with it.
+        let (pack_bytes, refs) = build_pack(&[b"alpha", b"beta", b"gamma"]);
+        let used = pack_bytes.len() as u64;
+        let without_trailer = 9 + (4 + 5) + (4 + 5);
+        let (router, state, tmp) = setup_app(used + without_trailer);
+        let source_key = write_pack(tmp.path(), &pack_bytes);
+        state.add_quota_usage(used);
+        let keep = [refs[0], refs[2]];
+        let body = repack_body_at(
+            &[repack_op_with_trailer(&source_key, &keep, false, TRAILER)],
+            3,
+        );
+        let resp = authed_post(router, "/?repack", body).await;
+        assert_status(&resp, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            walk_file_paths(&tmp.path().join("packs")),
+            vec![tmp.path().join(&source_key)],
+            "nothing written"
+        );
+        assert_eq!(state.quota_reserved(), 0);
+        assert_no_temp_files(tmp.path());
+    }
+
+    #[tokio::test]
+    async fn repack_without_trailer_at_protocol_3_matches_protocol_1() {
+        let mut outputs = Vec::new();
+        for body_of in [
+            (|op| repack_body_at(&[op], 3)) as fn(serde_json::Value) -> Vec<u8>,
+            |op| repack_body_at(&[op], 1),
+            |op| repack_body(&[op]),
+        ] {
+            let (router, _state, tmp) = setup_app(0);
+            let (pack_bytes, refs) = build_pack(&[b"alpha", b"beta", b"gamma"]);
+            let source_key = write_pack(tmp.path(), &pack_bytes);
+            let (key, offsets) =
+                repack_ok(router, body_of(repack_op(&source_key, &refs[..2], false))).await;
+            let data = std::fs::read(tmp.path().join(&key)).unwrap();
+            outputs.push((key, offsets, data));
+        }
+        assert_eq!(outputs[0], outputs[1]);
+        assert_eq!(outputs[0], outputs[2]);
+    }
+
+    #[tokio::test]
+    async fn trailer_requires_protocol_3() {
+        for version in [None, Some(2)] {
+            let (router, state, tmp) = setup_app(0);
+            let (pack_bytes, refs) = build_pack(&[b"alpha", b"beta"]);
+            let source_key = write_pack(tmp.path(), &pack_bytes);
+            let op = repack_op_with_trailer(&source_key, &refs[..1], false, TRAILER);
+            let body = match version {
+                Some(v) => repack_body_at(&[op], v),
+                None => repack_body(&[op]),
+            };
+            repack_bad_request(router, body, "requires protocol version >= 3").await;
+            assert_eq!(
+                walk_file_paths(&tmp.path().join("packs")),
+                vec![tmp.path().join(&source_key)]
+            );
+            assert_eq!(state.quota_reserved(), 0);
+            assert_no_temp_files(tmp.path());
+        }
+    }
+
+    #[tokio::test]
+    async fn trailer_rejects_empty_delete_only_and_bad_hex() {
+        let (pack_bytes, refs) = build_pack(&[b"alpha", b"beta"]);
+        for needle in ["> 0", "keeps no blobs", "invalid repack plan"] {
+            let (router, state, tmp) = setup_app(0);
+            let source_key = write_pack(tmp.path(), &pack_bytes);
+            let op = match needle {
+                "> 0" => {
+                    let mut op = repack_op(&source_key, &refs[..1], false);
+                    op["trailer"] = serde_json::Value::String(String::new());
+                    op
+                }
+                "keeps no blobs" => repack_op_with_trailer(&source_key, &[], true, TRAILER),
+                _ => {
+                    let mut op = repack_op(&source_key, &refs[..1], false);
+                    op["trailer"] = serde_json::Value::String("xyz".into());
+                    op
+                }
+            };
+            repack_bad_request(router, repack_body_at(&[op], 3), needle).await;
+            assert!(tmp.path().join(&source_key).exists());
+            assert_eq!(
+                walk_file_paths(&tmp.path().join("packs")),
+                vec![tmp.path().join(&source_key)]
+            );
+            assert_eq!(state.quota_reserved(), 0);
+            assert_no_temp_files(tmp.path());
+        }
+    }
+
+    #[test]
+    fn trailer_size_caps() {
+        use vykar_protocol::{
+            MAX_REPACK_OUTPUT_BYTES, MAX_REPACK_TRAILER_BYTES, RepackBlobRef,
+            RepackOperationRequest, RepackPlanRequest,
+        };
+        use vykar_types::hash::HashAlgorithm;
+
+        let op = |length: u64, trailer_len: u64| RepackOperationRequest {
+            source_pack: format!("packs/ab/{}", "ab".repeat(32)),
+            keep_blobs: vec![RepackBlobRef { offset: 13, length }],
+            delete_after: false,
+            trailer: Some(vec![0u8; usize::try_from(trailer_len).unwrap()]),
+        };
+        let plan = |op| RepackPlanRequest::new(vec![op], HashAlgorithm::Blake3);
+
+        let err = super::validate_repack_plan(&plan(op(5, MAX_REPACK_TRAILER_BYTES + 1)))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("trailer too large"), "got: {err}");
+        assert!(super::validate_repack_plan(&plan(op(5, MAX_REPACK_TRAILER_BYTES))).is_ok());
+
+        // A blob that exactly fills the output cap alone, plus a 1-byte trailer.
+        let fits_alone = MAX_REPACK_OUTPUT_BYTES - 13;
+        let err = super::validate_repack_plan(&plan(op(fits_alone, 1)))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("repack output too large"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn trailer_repack_on_append_only() {
+        let (router, _state, tmp) = setup_app_append_only(0);
+        let (pack_bytes, refs) = build_pack(&[b"alpha", b"beta"]);
+        let source_key = write_pack(tmp.path(), &pack_bytes);
+        let body = repack_body_at(
+            &[repack_op_with_trailer(
+                &source_key,
+                &refs[..1],
+                false,
+                TRAILER,
+            )],
+            3,
+        );
+        let (key, _) = repack_ok(router, body).await;
+        let data = std::fs::read(tmp.path().join(&key)).unwrap();
+        assert_eq!(data, build_pack(&[b"alpha", TRAILER]).0);
+
+        let (router, _state, tmp) = setup_app_append_only(0);
+        let source_key = write_pack(tmp.path(), &pack_bytes);
+        let body = repack_body_at(
+            &[repack_op_with_trailer(
+                &source_key,
+                &refs[..1],
+                true,
+                TRAILER,
+            )],
+            3,
+        );
+        let resp = authed_post(router, "/?repack", body).await;
+        assert_status(&resp, StatusCode::FORBIDDEN);
+        assert_eq!(
+            walk_file_paths(&tmp.path().join("packs")),
+            vec![tmp.path().join(&source_key)]
+        );
+        assert_no_temp_files(tmp.path());
+    }
+
+    /// A trailer pack is an ordinary pack to a later repack: the old trailer
+    /// is a blob nobody references, so it is dropped, and a new one appended.
+    #[tokio::test]
+    async fn repack_of_a_trailer_pack() {
+        let (router, _state, tmp) = setup_app(0);
+        let (pack_bytes, refs) = build_pack(&[b"alpha", b"beta", b"gamma"]);
+        let source_key = write_pack(tmp.path(), &pack_bytes);
+        let keep = [refs[0], refs[2]];
+        let (trailer_key, offsets) = repack_ok(
+            router.clone(),
+            repack_body_at(
+                &[repack_op_with_trailer(&source_key, &keep, false, TRAILER)],
+                3,
+            ),
+        )
+        .await;
+        let alpha = (offsets[0], 5);
+
+        let (key, _) = repack_ok(
+            router.clone(),
+            repack_body_at(
+                &[repack_op_with_trailer(&trailer_key, &[alpha], false, b"T2")],
+                3,
+            ),
+        )
+        .await;
+        let data = std::fs::read(tmp.path().join(&key)).unwrap();
+        assert_eq!(data, build_pack(&[b"alpha", b"T2"]).0);
+
+        let (key, _) = repack_ok(
+            router,
+            repack_body(&[repack_op(&trailer_key, &[alpha], false)]),
+        )
+        .await;
+        let data = std::fs::read(tmp.path().join(&key)).unwrap();
+        assert_eq!(data, build_pack(&[b"alpha"]).0);
     }
 }

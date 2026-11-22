@@ -629,8 +629,9 @@ fn try_server_side_repack(
 
     // A server that does not advertise `repack` (one older than the field, or
     // a failed `/health` probe) and a backend with no server behind it get a
-    // client-side repack. The repack trailer switches this gate to
-    // `ServerOp::RepackTrailer`. The clone lets `server` outlive the
+    // client-side repack. A plan carrying pack trailers (05-index-gc-format.md
+    // step 4) needs `ServerOp::RepackTrailer` instead; the REST backend
+    // refuses such a plan without it. The clone lets `server` outlive the
     // `&mut repo` borrows below.
     let storage = Arc::clone(&repo.storage);
     let Some(server) = storage.server_ops() else {
@@ -665,6 +666,9 @@ fn try_server_side_repack(
                 })
                 .collect(),
             delete_after: false,
+            // Pack trailers come with 05-index-gc-format.md step 4; until then
+            // no plan carries one, so the `repack` gate above is enough.
+            trailer: None,
         });
     }
 
@@ -917,6 +921,7 @@ mod repack_chunk_tests {
             source_pack: format!("packs/ab/{}", "ab".repeat(32)),
             keep_blobs: vec![RepackBlobRef { offset: 13, length }],
             delete_after: false,
+            trailer: None,
         }
     }
 

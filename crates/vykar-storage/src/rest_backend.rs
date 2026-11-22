@@ -1119,7 +1119,22 @@ impl ServerOps for RestBackend {
 
     /// Not retried: a retry after a timeout could stall the caller for hours.
     /// The next compact run retries instead.
+    ///
+    /// A plan carrying a pack trailer is sent only to a server that advertises
+    /// `repack_trailer`; otherwise it is refused here, before any request, so a
+    /// trailer is never handed to a server that would drop it.
     fn repack(&self, plan: &RepackPlanRequest) -> Result<RepackResultResponse> {
+        if plan.has_trailer() {
+            plan.validate_trailer_version()
+                .map_err(|e| VykarError::Other(format!("REST repack: {e}")))?;
+            if !self.probed_caps().repack_trailer {
+                return Err(VykarError::Other(
+                    "REST repack: the server does not advertise repack_trailer; \
+                     refusing to send a pack trailer it would not append"
+                        .into(),
+                ));
+            }
+        }
         let url = format!("{}?repack", self.base_url);
         let retry = RetryConfig {
             max_retries: 0,
@@ -1675,6 +1690,89 @@ mod tests {
         let backend = RestBackend::new(&url, None, no_retry(), None).unwrap();
         assert!(!backend.offers(ServerOp::Repack));
         server.join().unwrap();
+    }
+
+    fn trailer_op(trailer: Option<Vec<u8>>) -> vykar_protocol::RepackOperationRequest {
+        vykar_protocol::RepackOperationRequest {
+            source_pack: format!("packs/ab/{}", "ab".repeat(32)),
+            keep_blobs: vec![vykar_protocol::RepackBlobRef {
+                offset: 13,
+                length: 5,
+            }],
+            delete_after: false,
+            trailer,
+        }
+    }
+
+    fn trailer_plan() -> RepackPlanRequest {
+        RepackPlanRequest::new(
+            vec![trailer_op(Some(b"TRAILER".to_vec()))],
+            HashAlgorithm::Blake3,
+        )
+    }
+
+    /// A trailer plan goes only to a server that advertises `repack_trailer`:
+    /// otherwise it is refused locally after the `/health` probe, and the
+    /// POST is never sent. The error is not `UnsupportedBackend`: callers ask
+    /// `offers(ServerOp::RepackTrailer)` instead of reading errors.
+    #[test]
+    fn repack_with_a_trailer_needs_repack_trailer() {
+        for health in [
+            json_response(
+                r#"{"status":"ok","version":"0.25.0","protocol_version":2,"repack":true}"#,
+            ),
+            json_response(
+                r#"{"status":"ok","version":"0.24.0","protocol_version":2,"hashes":["blake2b","blake3"]}"#,
+            ),
+            empty("500 Internal Server Error"),
+        ] {
+            let (url, server) = capture_request(&health);
+            let backend = RestBackend::new(&url, None, no_retry(), None).unwrap();
+            let err = backend.repack(&trailer_plan()).unwrap_err();
+            assert!(!matches!(err, VykarError::UnsupportedBackend(_)), "{err:?}");
+            assert!(err.to_string().contains("repack_trailer"), "got: {err}");
+            let request = server.join().unwrap();
+            assert!(request.starts_with("GET /health "), "got: {request}");
+        }
+    }
+
+    /// A plan without a trailer needs no probe: today's plans cost no extra
+    /// round trip.
+    #[test]
+    fn repack_without_a_trailer_needs_no_probe() {
+        let (url, server) = capture_request(&json_response(r#"{"completed":[]}"#));
+        let backend = RestBackend::new(&url, None, no_retry(), None).unwrap();
+        let resp = backend
+            .repack(&RepackPlanRequest::new(vec![], HashAlgorithm::Blake3))
+            .unwrap();
+        assert!(resp.completed.is_empty());
+        let request = server.join().unwrap();
+        assert!(request.starts_with("POST /?repack "), "got: {request}");
+    }
+
+    #[test]
+    fn repack_with_a_trailer_is_sent_when_advertised() {
+        let (url, server) = mock_server_multi(vec![
+            json_response(
+                r#"{"status":"ok","version":"0.25.0","protocol_version":3,"repack":true,"repack_trailer":true}"#,
+            ),
+            json_response(r#"{"completed":[]}"#),
+        ]);
+        let backend = RestBackend::new(&url, None, no_retry(), None).unwrap();
+        backend.repack(&trailer_plan()).unwrap();
+        server.join().unwrap();
+    }
+
+    /// A trailer added after `RepackPlanRequest::new` leaves the version at 2;
+    /// the client refuses before any connection (port 1 refuses them all).
+    #[test]
+    fn repack_refuses_a_trailer_below_protocol_3() {
+        let mut plan = RepackPlanRequest::new(vec![trailer_op(None)], HashAlgorithm::Blake3);
+        plan.operations.first_mut().unwrap().trailer = Some(b"T".to_vec());
+        let backend = RestBackend::new("http://127.0.0.1:1", None, no_retry(), None).unwrap();
+        let err = backend.repack(&plan).unwrap_err().to_string();
+        assert!(err.contains("requires protocol version >= 3"), "got: {err}");
+        assert!(backend.probed.get().is_none(), "no /health probe was made");
     }
 
     #[test]

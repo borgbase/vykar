@@ -130,6 +130,7 @@ High-level flow:
 1. The client opens the repo and analyzes pack liveness from the index.
 2. The client sends a repack plan describing source packs and live blob offsets.
 3. The server copies the referenced encrypted blobs into new pack files, preserving the pack wire format.
+   An operation may carry a `trailer` (hex in the JSON plan): opaque bytes the server appends to that output pack as one more length-prefixed blob after the kept blobs and includes in the pack ID, the output cap and the quota. It requires `protocol_version: 3` (so a server from 0.8 through 0.24 refuses the plan by version instead of dropping the trailer) and is sent only to a server that advertises `repack_trailer`. Nothing in vykar sends one yet; its contents are the pack trailer of the next repository format.
 4. The server returns new pack keys and offsets so the client can update the chunk index.
 5. After saving the index, the client deletes the source packs with one `POST /?batch-delete` (without `cleanup-dirs`), falling back to per-pack `DELETE`.
 
@@ -154,16 +155,16 @@ It also sends the content-digest header on `PUT` requests — bound once to the 
 `GET /health` is unauthenticated and advertises what the server supports:
 
 ```json
-{"status":"ok","version":"0.20.0","protocol_version":2,"hashes":["blake2b","blake3"],"pack_parts":true,"segmented_index":true,"key_dirs":["keys","snapshots","packs","locks","sessions","pending_index","index.d","index.h","packmaps"],"conditional_put":true,"object_sizes":true,"list_tree":true,"verify_packs":true,"repack":true}
+{"status":"ok","version":"0.20.0","protocol_version":3,"hashes":["blake2b","blake3"],"pack_parts":true,"segmented_index":true,"key_dirs":["keys","snapshots","packs","locks","sessions","pending_index","index.d","index.h","packmaps"],"conditional_put":true,"object_sizes":true,"list_tree":true,"verify_packs":true,"repack":true,"repack_trailer":true}
 ```
 
 `conditional_put` says the server honours `If-None-Match: *` on `PUT` (see the `PUT` row above). Older servers omit it and would ignore the header and overwrite, so a client sends a conditional PUT only to a server that advertises it.
 
-`object_sizes`, `list_tree`, `verify_packs` and `repack` name the operations a client may gate on. The client uses server-side repack only when `repack` is advertised: against an older server, or when the `/health` probe failed, compact repacks on the client and logs a warning naming both causes. The other three are served by every server the client supports, so the client does not wait for the field; an old server's `400` to `?sizes` is handled by the client. `repack_trailer` is not advertised yet; it arrives with the repack trailer.
+`object_sizes`, `list_tree`, `verify_packs` and `repack` name the operations a client may gate on. The client uses server-side repack only when `repack` is advertised: against an older server, or when the `/health` probe failed, compact repacks on the client and logs a warning naming both causes. The other three are served by every server the client supports, so the client does not wait for the field; an old server's `400` to `?sizes` is handled by the client. `repack_trailer` says a repack operation may carry a trailer (see [Server-Side Repack](#server-side-repack)).
 
 `key_dirs` lists the top-level key directories the server accepts. `index.h` and `packmaps` (format v6) are accepted only by servers that list them; older servers omit the field and answer `400` to those keys.
 
-`pack_parts` advertises [pack uploads in parts](#pack-uploads-in-parts); the client probes it lazily, on the first pack large enough to split (or the first non-pack upload when the repository is v2, to pick its digest header), so a backup that uploads nothing pays no extra round trip. All fields beyond `status` and `version` are additive: a pre-BLAKE3 server omits `protocol_version` and `hashes`, which a client reads as "blake2b only", a server without part support omits `pack_parts`, and a server without the segmented index omits `segmented_index`. `vykar init` probes this **before writing anything**, because `init` writes only non-pack keys that an old server happily accepts — without the probe, `init` would succeed and only the first `backup` would fail. Requests that declare `"hash": "blake3"` must also declare `protocol_version: 2`, so an old server rejects them outright rather than silently verifying every pack under the wrong algorithm.
+`pack_parts` advertises [pack uploads in parts](#pack-uploads-in-parts); the client probes it lazily, on the first pack large enough to split (or the first non-pack upload when the repository is v2, to pick its digest header), so a backup that uploads nothing pays no extra round trip. All fields beyond `status` and `version` are additive: a pre-BLAKE3 server omits `protocol_version` and `hashes`, which a client reads as "blake2b only", a server without part support omits `pack_parts`, and a server without the segmented index omits `segmented_index`. `vykar init` probes this **before writing anything**, because `init` writes only non-pack keys that an old server happily accepts — without the probe, `init` would succeed and only the first `backup` would fail. Requests that declare `"hash": "blake3"` must also declare `protocol_version: 2`, so an old server rejects them outright rather than silently verifying every pack under the wrong algorithm. Likewise a repack plan that carries a trailer declares `protocol_version: 3`.
 
 Client config:
 
